@@ -1741,6 +1741,9 @@ auto launch_worker(const std::string& program_path, const tracebench::Options& o
         ::close(command_fds[0]);
     }
     set_nonblocking(output_fds[0]);
+
+    auto reusable_buffer = std::move(out.buffer);
+    reusable_buffer.clear();
     out = {
         .pid = PID,
         .read_fd = output_fds[0],
@@ -1759,6 +1762,7 @@ auto launch_worker(const std::string& program_path, const tracebench::Options& o
         .command_stream = spec.command_stream,
         .ready_for_batch = spec.command_stream,
     };
+    out.buffer = std::move(reusable_buffer);
     out.buffer.reserve(WORKER_PIPE_BUFFER_RESERVE);
     return true;
 }

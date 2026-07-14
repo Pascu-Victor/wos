@@ -444,6 +444,49 @@ def test_renderbench_ipc_profile_separates_capacity_from_dynamic_runs() -> None:
     )
 
 
+def test_renderbench_dynamic_launch_reuses_receive_capacity() -> None:
+    source = RENDERBENCH_MAIN_CPP.read_text()
+    launch_body = function_body(source, "launch_worker")
+    require_order(
+        launch_body,
+        "auto reusable_buffer = std::move(out.buffer);",
+        "reusable_buffer.clear();",
+        "renderbench must retain capacity before discarding old receive bytes",
+    )
+    require_order(
+        launch_body,
+        "reusable_buffer.clear();",
+        "out = {",
+        "renderbench must clear old receive bytes before resetting worker state",
+    )
+    require_order(
+        launch_body,
+        ".buffer = {},",
+        "out.buffer = std::move(reusable_buffer);",
+        "renderbench must restore only cleared receive-buffer storage after reset",
+    )
+    require_order(
+        launch_body,
+        "out.buffer = std::move(reusable_buffer);",
+        "out.buffer.reserve(WORKER_PIPE_BUFFER_RESERVE);",
+        "renderbench must preserve the minimum receive-buffer reserve after reuse",
+    )
+    if "shrink_to_fit" in launch_body:
+        fail("renderbench launch must not discard reusable receive-buffer capacity")
+
+    run_body = function_body(source, "run_distributed_ipc")
+    reaped_worker = run_body.find("bool const CHILD_OK = wait_for_child(worker")
+    if reaped_worker < 0:
+        fail("renderbench dynamic relaunch lacks its child-reap gate")
+    relaunch_body = run_body[reaped_worker:]
+    require_order(
+        relaunch_body,
+        "note_process_ipc_profile(ipc_profile, worker, STARTED);",
+        "launch_next_worker_batch(",
+        "renderbench must profile the completed child before reusing its worker slot",
+    )
+
+
 def main() -> None:
     test_renderbench_worker_reap_is_deadline_bounded()
     test_renderbench_worker_cancellation_is_cooperative()
@@ -456,6 +499,7 @@ def main() -> None:
     test_renderbench_node_threads_avoid_persistent_command_stream()
     test_renderbench_live_mode_streams_worker_tiles()
     test_renderbench_ipc_profile_separates_capacity_from_dynamic_runs()
+    test_renderbench_dynamic_launch_reuses_receive_capacity()
     print("renderbench worker source invariants hold")
 
 
