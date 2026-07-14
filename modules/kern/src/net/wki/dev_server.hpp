@@ -337,6 +337,7 @@ auto wki_dev_server_block_has_remote_writer(const dev::BlockDevice* dev) -> bool
 // pivot_root() rebuilds the export table).
 
 #ifdef WOS_SELFTEST
+auto wki_dev_server_selftest_deferred_vfs_storage_is_coallocated() -> bool;
 auto wki_dev_server_selftest_retirement_ownership_guards() -> bool;
 auto wki_dev_server_selftest_binding_lifecycle_flags() -> bool;
 auto wki_dev_server_selftest_attach_ack_failure_defers_cleanup() -> bool;

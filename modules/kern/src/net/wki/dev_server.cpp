@@ -59,6 +59,28 @@ struct DeferredVfsOp {
     DeferredVfsOp* next = nullptr;
 };
 
+auto deferred_vfs_op_alloc(uint16_t req_data_len) -> DeferredVfsOp* {
+    void* const STORAGE = ::operator new(sizeof(DeferredVfsOp) + req_data_len, std::nothrow);
+    if (STORAGE == nullptr) {
+        return nullptr;
+    }
+
+    auto* op = new (STORAGE) DeferredVfsOp{};
+    op->req_data_len = req_data_len;
+    if (req_data_len != 0) {
+        op->req_data = reinterpret_cast<uint8_t*>(op + 1);
+    }
+    return op;
+}
+
+void deferred_vfs_op_release(DeferredVfsOp* op) {
+    if (op == nullptr) {
+        return;
+    }
+    op->~DeferredVfsOp();
+    ::operator delete(op);
+}
+
 constexpr size_t VFS_OP_WORKER_COUNT = 16;
 
 struct VfsOpWorkerShard {
@@ -333,8 +355,7 @@ void run_deferred_vfs_op(void* arg) {
     }
     release_binding(RETAINED_BINDING);
 
-    delete[] op->req_data;
-    delete op;
+    deferred_vfs_op_release(op);
 }
 
 auto vfs_worker_index(uint16_t src_node, uint16_t channel_id) -> size_t {
@@ -427,26 +448,19 @@ auto queue_vfs_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_identi
         return false;
     }
 
-    auto* op = new (std::nothrow) DeferredVfsOp{};
+    auto* op = deferred_vfs_op_alloc(req_data_len);
     if (op == nullptr) {
         release_binding(retained_binding);
         return false;
     }
 
     if (req_data_len > 0) {
-        op->req_data = new (std::nothrow) uint8_t[req_data_len];
-        if (op->req_data == nullptr) {
-            release_binding(retained_binding);
-            delete op;
-            return false;
-        }
         std::memcpy(op->req_data, req_data, req_data_len);
     }
 
     op->hdr = *hdr;
     op->channel_identity = channel_identity;
     op->op_id = op_id;
-    op->req_data_len = req_data_len;
     op->retained_binding = retained_binding;
     op->next = nullptr;
 
@@ -2887,6 +2901,27 @@ void wki_dev_server_poll_rings() {
 }
 
 #ifdef WOS_SELFTEST
+auto wki_dev_server_selftest_deferred_vfs_storage_is_coallocated() -> bool {
+    constexpr std::array<uint8_t, 5> REQUEST = {0x11, 0x22, 0x33, 0x44, 0x55};
+    DeferredVfsOp* op = deferred_vfs_op_alloc(static_cast<uint16_t>(REQUEST.size()));
+    if (op == nullptr) {
+        return false;
+    }
+
+    std::memcpy(op->req_data, REQUEST.data(), REQUEST.size());
+    bool const DATA_IS_TRAILING = op->req_data == reinterpret_cast<uint8_t*>(op + 1);
+    bool const DATA_PRESERVED = op->req_data_len == REQUEST.size() && std::memcmp(op->req_data, REQUEST.data(), REQUEST.size()) == 0;
+    deferred_vfs_op_release(op);
+
+    DeferredVfsOp* empty = deferred_vfs_op_alloc(0);
+    if (empty == nullptr) {
+        return false;
+    }
+    bool const EMPTY_IS_NULL = empty->req_data == nullptr && empty->req_data_len == 0;
+    deferred_vfs_op_release(empty);
+    return DATA_IS_TRAILING && DATA_PRESERVED && EMPTY_IS_NULL;
+}
+
 auto wki_dev_server_selftest_retirement_ownership_guards() -> bool {
     constexpr uint64_t TARGET_REVISION = 42;
 

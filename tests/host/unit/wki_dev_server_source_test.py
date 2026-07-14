@@ -645,8 +645,12 @@ def test_block_ring_binding_lifetime_is_retained_outside_server_lock() -> None:
 
 def test_deferred_vfs_ops_retain_their_binding_through_blocking_work() -> None:
     source = DEV_SERVER_CPP.read_text()
+    header = DEV_SERVER_HPP.read_text()
+    ktest = WKI_DEV_SERVER_KTEST.read_text()
     queue_body = function_body(source, "queue_vfs_op")
     run_body = function_body(source, "run_deferred_vfs_op")
+    alloc_body = function_body(source, "deferred_vfs_op_alloc")
+    release_body = function_body(source, "deferred_vfs_op_release")
     queue_required = [
         "DevServerBinding* retained_binding = nullptr",
         "find_binding_by_channel_identity(channel_identity)",
@@ -670,10 +674,34 @@ def test_deferred_vfs_ops_retain_their_binding_through_blocking_work() -> None:
     if missing:
         fail("deferred VFS worker must consume the retained binding: " + ", ".join(missing))
 
-    require_order(queue_body, "retain_binding_locked(binding)", "new (std::nothrow) DeferredVfsOp", "VFS retain before allocation/enqueue")
+    require_order(queue_body, "retain_binding_locked(binding)", "deferred_vfs_op_alloc(req_data_len)", "VFS retain before allocation/enqueue")
     require_order(queue_body, "retain_binding_locked(binding)", "op->retained_binding = retained_binding", "VFS retained pointer transfer")
+    require_order(queue_body, "deferred_vfs_op_alloc(req_data_len)", "std::memcpy(op->req_data", "VFS allocation before request copy")
+    require_order(queue_body, "std::memcpy(op->req_data", "shard->lock.lock_irqsave()", "VFS request copy before FIFO publication")
     require_order(run_body, "detail::handle_vfs_op", "release_binding(RETAINED_BINDING)", "deferred VFS release after handler")
-    require_order(run_body, "release_binding(RETAINED_BINDING)", "delete[] op->req_data", "deferred VFS release before request cleanup")
+    require_order(run_body, "release_binding(RETAINED_BINDING)", "deferred_vfs_op_release(op)", "deferred VFS release before request cleanup")
+
+    for token in [
+        "::operator new(sizeof(DeferredVfsOp) + req_data_len, std::nothrow)",
+        "new (STORAGE) DeferredVfsOp{}",
+        "op->req_data = reinterpret_cast<uint8_t*>(op + 1)",
+    ]:
+        if token not in alloc_body:
+            fail(f"deferred VFS coallocation helper is missing {token}")
+    require_order(release_body, "op->~DeferredVfsOp()", "::operator delete(op)", "deferred VFS placement destruction")
+    for forbidden in ["new (std::nothrow) DeferredVfsOp", "new (std::nothrow) uint8_t[req_data_len]"]:
+        if forbidden in queue_body:
+            fail(f"deferred VFS enqueue must use one exact coallocation: found {forbidden}")
+    for forbidden in ["delete[] op->req_data", "delete op"]:
+        if forbidden in run_body:
+            fail(f"deferred VFS worker must use the common coallocation release: found {forbidden}")
+
+    selftest_token = "wki_dev_server_selftest_deferred_vfs_storage_is_coallocated"
+    if f"auto {selftest_token}() -> bool" not in source or f"auto {selftest_token}() -> bool;" not in header:
+        fail("deferred VFS coallocation selftest must be implemented and declared")
+    for token in ["DeferredRequestStorageIsCoallocated", selftest_token]:
+        if token not in ktest:
+            fail(f"deferred VFS coallocation KTEST coverage is missing {token}")
 
 
 def test_detach_waits_for_binding_refs_before_cleanup_and_erase() -> None:

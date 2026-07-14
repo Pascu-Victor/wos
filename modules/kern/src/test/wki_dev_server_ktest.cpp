@@ -15,6 +15,10 @@ KTEST(WkiDevServerBinding, LifecycleFlagsAreAtomic) {
     KEXPECT_TRUE(RETIRING_ATOMIC);
 }
 
+KTEST(WkiDevServerVfs, DeferredRequestStorageIsCoallocated) {
+    KEXPECT_TRUE(ker::net::wki::wki_dev_server_selftest_deferred_vfs_storage_is_coallocated());
+}
+
 KTEST(WkiDevServerBinding, MovePreservesLifecycleFlags) { KEXPECT_TRUE(ker::net::wki::wki_dev_server_selftest_binding_lifecycle_flags()); }
 
 KTEST(WkiDevServerBinding, MoveTransfersBlockWriterLeaseExactlyOnce) {
