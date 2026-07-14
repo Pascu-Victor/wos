@@ -1466,7 +1466,9 @@ auto parse_worker_packets(ChildWorker& worker, tracebench::FilmView film, std::v
 
 auto drain_ready_worker_pipe(ChildWorker& worker, tracebench::FilmView film, std::vector<unsigned char>& tile_seen,
                              std::span<const int> tile_owner, uint64_t& tiles_done) -> bool {
-    std::array<unsigned char, 65536> chunk = {};
+    // read() initializes the exact positive prefix consumed below.
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
+    std::array<unsigned char, 65536> chunk __attribute__((uninitialized));
     size_t drained_bytes = 0;
     worker.drain_budget_hit = false;
     while (worker.read_fd >= 0 && drained_bytes < WORKER_PIPE_DRAIN_BYTE_BUDGET) {

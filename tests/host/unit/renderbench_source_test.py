@@ -122,6 +122,43 @@ def test_renderbench_worker_stream_corruption_is_fatal() -> None:
     )
 
 
+def test_renderbench_worker_pipe_read_uses_uninitialized_scratch() -> None:
+    source = RENDERBENCH_MAIN_CPP.read_text()
+    body = function_body(source, "drain_ready_worker_pipe")
+    declaration = (
+        "std::array<unsigned char, 65536> chunk "
+        "__attribute__((uninitialized));"
+    )
+    read_call = (
+        "ssize_t const READ = "
+        "::read(worker.read_fd, chunk.data(), chunk.size());"
+    )
+    insert_prefix = (
+        "worker.buffer.insert(worker.buffer.end(), chunk.begin(), "
+        "chunk.begin() + static_cast<ptrdiff_t>(READ));"
+    )
+    require_tokens(
+        body,
+        [declaration, read_call, "if (READ > 0) {", insert_prefix],
+        "renderbench worker pipe read scratch",
+    )
+    require_order(
+        body,
+        declaration,
+        read_call,
+        "renderbench must allocate pipe scratch before read",
+    )
+    require_order(
+        body,
+        "if (READ > 0) {",
+        insert_prefix,
+        "renderbench must consume only a positive read prefix",
+    )
+    for forbidden in ["chunk = {}", "chunk.fill(", "memset(chunk"]:
+        if forbidden in body:
+            fail("renderbench worker pipe read scratch must not be cleared")
+
+
 def test_renderbench_distributed_ipc_uses_chunk_safe_default_tiles() -> None:
     source = RENDERBENCH_MAIN_CPP.read_text()
     require_tokens(
@@ -491,6 +528,7 @@ def main() -> None:
     test_renderbench_worker_reap_is_deadline_bounded()
     test_renderbench_worker_cancellation_is_cooperative()
     test_renderbench_worker_stream_corruption_is_fatal()
+    test_renderbench_worker_pipe_read_uses_uninitialized_scratch()
     test_renderbench_distributed_ipc_uses_chunk_safe_default_tiles()
     test_renderbench_worker_child_closes_inherited_fds()
     test_renderbench_coordinator_stall_report_exposes_batch_state()
