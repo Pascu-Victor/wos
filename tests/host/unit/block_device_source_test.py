@@ -10,6 +10,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 BLOCK_DEVICE = ROOT / "modules/kern/src/dev/block_device.cpp"
+BLOCK_DEVICE_HPP = ROOT / "modules/kern/src/dev/block_device.hpp"
+BLOCK_DEVICE_KTEST = ROOT / "modules/kern/src/test/block_device_ktest.cpp"
 AHCI = ROOT / "modules/kern/src/dev/ahci.cpp"
 
 
@@ -59,7 +61,35 @@ def require_order(source: str, tokens: list[str], context: str) -> None:
 
 def main() -> None:
     block_source = BLOCK_DEVICE.read_text()
+    block_header = BLOCK_DEVICE_HPP.read_text()
+    block_ktest = BLOCK_DEVICE_KTEST.read_text()
     ahci_source = AHCI.read_text()
+
+    for token in [
+        "enum class BlockWriterLeaseOwner",
+        "class BlockWriterLease",
+        "BlockWriterLease(BlockWriterLease&& other) noexcept",
+        "auto try_acquire(const BlockDevice* device, BlockWriterLeaseOwner owner) -> bool",
+    ]:
+        require(block_header, token, "block writer lease API")
+
+    lease_acquire = function_body(block_source, "BlockWriterLease::try_acquire")
+    for token in [
+        "block_writer_lease_lock.lock_irqsave()",
+        "owner == BlockWriterLeaseOwner::REMOTE_BINDING",
+        "lease->owner_ == BlockWriterLeaseOwner::REMOTE_BINDING",
+        "block_devices_overlap(lease->device_, device)",
+        "block_writer_leases = this",
+    ]:
+        require(lease_acquire, token, "block writer lease acquisition")
+    for forbidden in ["new ", "delete", "kern_yield", "mount_lock", "s_server_lock"]:
+        require_absent(lease_acquire, forbidden, "block writer lease acquisition must remain allocation-free and lock-local")
+    require(block_source, "take_locked(other);", "block writer lease move must relink atomically")
+    require(
+        block_ktest,
+        "KTEST(BlockWriterLease, RemoteIsExclusiveWhileLocalMountsMayCoexist)",
+        "block writer lease policy KTEST",
+    )
 
     normalize_body = function_body(block_source, "normalize_io_result")
     require(normalize_body, "return -EIO;", "raw block driver -1 must normalize to EIO")

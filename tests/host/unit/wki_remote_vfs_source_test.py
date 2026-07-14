@@ -9,6 +9,8 @@ REMOTE_VFS_CPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "remote_vfs
 REMOTE_VFS_HPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "remote_vfs.hpp"
 WKI_CPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "wki.cpp"
 WKI_HPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "wki.hpp"
+DEV_SERVER_CPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "dev_server.cpp"
+VFS_CORE_CPP = ROOT / "modules" / "kern" / "src" / "vfs" / "core.cpp"
 WKI_DEV_PROXY_KTEST = ROOT / "modules" / "kern" / "src" / "test" / "wki_dev_proxy_ktest.cpp"
 
 
@@ -453,14 +455,15 @@ def test_server_open_reuses_the_open_file_stat_snapshot() -> None:
             "open_resp.has_stat = 1",
             "open_resp.stat = open_stat",
             "if (prefetch_rkey != 0",
-            "alloc_remote_fd(hdr->src_node, channel_id, file)",
+            "alloc_remote_fd(channel_identity, file)",
             "open_resp.fd = fd_id",
-            "int const SEND_RET = wki_send",
+            "int const SEND_RET = wki_send_on_channel_identity(channel_identity",
             "if (SEND_RET != WKI_OK)",
-            "RemoteVfsFd* rfd = find_remote_fd(hdr->src_node, channel_id, fd_id)",
+            "RemoteVfsFd* rfd = find_remote_fd(channel_identity, fd_id)",
             "rfd->file == file",
             "orphan = rfd->file",
             "rfd->file = nullptr",
+            "rfd->retiring = true",
             "rfd->active = false",
             "s_vfs_lock.unlock()",
             "ker::vfs::vfs_close_file(orphan)",
@@ -469,7 +472,7 @@ def test_server_open_reuses_the_open_file_stat_snapshot() -> None:
     )
     if "vfs_stat_resolved(full_path.data(), &open_stat)" in open_case:
         fail("remote VFS server open must not repeat path resolution for metadata")
-    published_file = open_case.find("alloc_remote_fd(hdr->src_node, channel_id, file)")
+    published_file = open_case.find("alloc_remote_fd(channel_identity, file)")
     if re.search(r"\bfile->", open_case[published_file:]):
         fail("remote VFS server open must not dereference a file after publishing it to peer cleanup")
 
@@ -826,7 +829,7 @@ def test_export_lookup_returns_locked_snapshot() -> None:
             "return false",
             "s_vfs_lock.lock()",
             "for (const auto& exp : g_vfs_exports)",
-            "if (exp.active && exp.resource_id == resource_id)",
+            "if (exp.active && exp.resource_id == resource_id && exp.publication_revision == REVISION)",
             "*out = exp",
             "s_vfs_lock.unlock()",
             "return true",
@@ -884,9 +887,9 @@ def test_vfs_attach_ack_requires_expected_cookie_before_completion() -> None:
         source,
         [
             "uint8_t g_vfs_attach_next_cookie = 1;",
-            "auto allocate_vfs_attach_cookie_locked() -> uint8_t",
-            "auto vfs_attach_ack_matches_pending_locked(ProxyVfsState const* state, const DevAttachAckPayload& ack) -> bool",
-            "state->attach_expected_cookie != 0",
+            "auto allocate_vfs_attach_cookie_locked(uint16_t owner_node, uint32_t resource_id,",
+            "auto vfs_attach_ack_matches_pending_locked(ProxyVfsState const* state, const DevAttachAckPayload& ack, const uint8_t* payload",
+            "state->attach_expected_cookie == 0",
             "wki_dev_attach_ack_matches_expected(state->attach_expected_cookie, ack)",
             "attach_req.attach_cookie = attach_cookie",
         ],
@@ -895,17 +898,18 @@ def test_vfs_attach_ack_requires_expected_cookie_before_completion() -> None:
     require_order(
         function_body(source, "wki_remote_vfs_mount"),
         [
-            "attach_cookie = allocate_vfs_attach_cookie_locked()",
+            "attach_cookie = allocate_vfs_attach_cookie_locked(owner_node, resource_id, owner_incarnation)",
             "state->attach_expected_cookie = attach_cookie",
             "attach_req.attach_cookie = attach_cookie",
-            "wki_send(owner_node, WKI_CHAN_RESOURCE, MsgType::DEV_ATTACH_REQ",
+            "wki_send_on_channel_identity(resource_channel_identity, MsgType::DEV_ATTACH_REQ",
         ],
         "remote VFS attach arms cookie before send",
     )
     require_order(
         function_body(source, "handle_vfs_attach_ack"),
         [
-            "if (!vfs_attach_ack_matches_pending_locked(state, *ack))",
+            "find_vfs_proxy_by_attach(hdr->src_node, ack->resource_id, ack->reserved)",
+            "if (!vfs_attach_ack_matches_pending_locked(state, *ack, payload, payload_len))",
             "wait_entry = claim_and_clear_waiter_locked(state->attach_wait_entry)",
             "state->attach_status = ack->status",
             "state->attach_expected_cookie = 0",
@@ -913,6 +917,29 @@ def test_vfs_attach_ack_requires_expected_cookie_before_completion() -> None:
         ],
         "remote VFS attach ACK validates cookie before completion",
     )
+    allocator = function_body(source, "allocate_vfs_attach_cookie_locked")
+    require_tokens(
+        allocator,
+        [
+            "attempt < UINT8_MAX",
+            "proxy->owner_node != owner_node",
+            "proxy->resource_id != resource_id",
+            "proxy->binding_attach_cookie != cookie",
+            "wki_resource_incarnation_equal(EXISTING_INCARNATION, owner_incarnation)",
+            "return 0",
+        ],
+        "remote VFS attach-cookie wrap exclusion",
+    )
+    mount_body = function_body(source, "wki_remote_vfs_mount")
+    require_order(
+        mount_body,
+        [
+            "attach_cookie = allocate_vfs_attach_cookie_locked(owner_node, resource_id, owner_incarnation)",
+            "state->binding_attach_cookie = attach_cookie",
+        ],
+        "remote VFS cookie reservation publishes under the registry lock",
+    )
+    require_tokens(mount_body, ["if (attach_cookie == 0)", "return -EBUSY"], "remote VFS cookie exhaustion")
     require_tokens(
         ktest,
         [
@@ -932,6 +959,10 @@ def test_remote_vfs_unmount_cancels_waiters_before_teardown() -> None:
         [
             "teardown.state = state",
             "teardown.owner_node = state->owner_node",
+            "teardown.assigned_channel_ref = state->assigned_channel_ref",
+            "teardown.assigned_channel_generation = state->assigned_channel_generation",
+            "teardown.binding_incarnation = vfs_detach_incarnation_snapshot_locked(state)",
+            "state->lifecycle_refs++",
             "state->lock.lock()",
             "state->active = false",
             "if (state->op_pending.load(std::memory_order_acquire))",
@@ -951,25 +982,125 @@ def test_remote_vfs_unmount_cancels_waiters_before_teardown() -> None:
         ],
         "remote VFS proxy deactivation",
     )
+    require_tokens(
+        function_body(source, "find_vfs_proxy_by_mount"),
+        ["p->active || p->epoch_reset_pending", "p->mount_configured"],
+        "path unmount lookup retains epoch-marked mount ownership",
+    )
 
-    unmount_body = function_body(source, "wki_remote_vfs_unmount")
+    claim_body = function_body(source, "claim_vfs_proxy_unmount_by_path")
+    require_order(
+        claim_body,
+        [
+            "deactivate_vfs_proxy_locked(state, teardown, true)",
+            "stage_vfs_detach_locked(state, teardown.owner_node, teardown.resource_id",
+            "invalidate_all_dir_caches(state)",
+            "s_vfs_lock.unlock()",
+        ],
+        "remote VFS unmount claim",
+    )
+
+    unmount_body = function_body(source, "finish_vfs_proxy_unmount")
     require_order(
         unmount_body,
         [
-            "deactivate_vfs_proxy_locked(state, teardown, true)",
-            "invalidate_all_dir_caches(state)",
-            "s_vfs_lock.unlock()",
             "finish_proxy_teardown_op_waiter(teardown, -1)",
             "vfs_stream_cache_invalidate_remote_scope(teardown.state)",
             "wake_proxy_slot_waiters(teardown)",
             "finish_claimed_waiter(teardown.attach_wait_entry, -1)",
-            "wki_send(teardown.owner_node, WKI_CHAN_RESOURCE, MsgType::DEV_DETACH",
-            "wki_channel_close(ch)",
-            "ker::vfs::unmount_filesystem(local_mount_path)",
+            "teardown.detach_staged",
+            "wki_deferred_work_notify()",
+            "wki_channel_close_generation(teardown.assigned_channel_ref",
+            "ker::vfs::unmount_filesystem_by_private_data",
             "mark_vfs_proxy_mount_released_and_maybe_destroy(teardown.state)",
+            "release_vfs_proxy_lifecycle_ref(teardown.state)",
         ],
         "remote VFS unmount teardown order",
     )
+
+    generation_claim = function_body(source, "claim_vfs_proxy_unmount_by_generation")
+    require_tokens(
+        generation_claim,
+        [
+            "proxy->mount_configured",
+            "!proxy->destroy_when_idle",
+            "!proxy->mount_released",
+            "proxy->resource_generation == resource_generation",
+        ],
+        "generation-bound remote VFS teardown selection",
+    )
+    require_order(
+        generation_claim,
+        [
+            "deactivate_vfs_proxy_locked(state, teardown, true)",
+            "stage_vfs_detach_locked(state, teardown.owner_node, teardown.resource_id",
+            "s_vfs_lock.unlock()",
+        ],
+        "generation-bound remote VFS unmount reserves before registry unlock",
+    )
+
+
+def test_vfs_detach_uses_exact_negotiated_incarnation_form() -> None:
+    source = REMOTE_VFS_CPP.read_text()
+    body = function_body(source, "send_vfs_detach")
+    require_tokens(
+        body,
+        [
+            "wki_dev_detach_payload_size(true)",
+            "det_buf.at(WKI_DEV_DETACH_COOKIE_OFFSET) = attach_cookie",
+            "wki_resource_incarnation_negotiated(owner_node, ResourceType::VFS)",
+            "wki_resource_incarnation_valid(resource_incarnation)",
+            "det_buf.data() + WKI_DEV_DETACH_INCARNATION_OFFSET",
+            "wki_dev_detach_payload_size(WITH_INCARNATION)",
+            "wki_send_tracked(owner_node, WKI_CHAN_RESOURCE, MsgType::DEV_DETACH, det_buf.data(), DETACH_SIZE, tx_token_out)",
+        ],
+        "negotiated VFS detach suffix",
+    )
+
+    discard = function_body(source, "discard_failed_attached_proxy")
+    require_tokens(
+        discard,
+        [
+            "binding_incarnation = vfs_detach_incarnation_snapshot_locked(state)",
+            "stage_vfs_detach_locked(state, owner_node, resource_id, attach_cookie, binding_incarnation, false)",
+        ],
+        "failed attached VFS detach binding snapshot",
+    )
+    snapshot = function_body(source, "vfs_detach_incarnation_snapshot_locked")
+    require_tokens(
+        snapshot,
+        [
+            "wki_resource_incarnation_valid(state->binding_incarnation)",
+            "state->binding_incarnation",
+            "state->attach_expected_incarnation",
+        ],
+        "epoch-marked in-progress attach retains its exact requested incarnation",
+    )
+    require_order(
+        discard,
+        [
+            "stage_vfs_detach_locked(state, owner_node, resource_id, attach_cookie, binding_incarnation, false)",
+            "state->active = false",
+            "s_vfs_lock.unlock()",
+            "wki_deferred_work_notify()",
+        ],
+        "failed attached VFS rollback reserves before inactive publication",
+    )
+    mount_body = function_body(source, "wki_remote_vfs_mount")
+    require_order(
+        mount_body,
+        [
+            "state->resource_generation = RESOURCE_GENERATION",
+            "state->mount_configured = true",
+            "wki_peer_lifecycle_acquire(final_peer)",
+            "wki_resource_observation_is_live",
+            "wki_remote_vfs_unmount_resource_generation",
+            "release_vfs_proxy_lifecycle_ref(state)",
+        ],
+        "mount publication must stay pinned through exact resource-generation validation and rollback",
+    )
+    if mount_body.find("release_vfs_proxy_lifecycle_ref(state)") < mount_body.find("wki_peer_lifecycle_acquire(final_peer)"):
+        fail("mount publication must not drop its construction pin before final peer/resource validation")
 
     cleanup_body = function_body(source, "wki_remote_vfs_cleanup_for_peer")
     require_order(
@@ -981,8 +1112,8 @@ def test_remote_vfs_unmount_cancels_waiters_before_teardown() -> None:
             "finish_proxy_teardown_op_waiter(cleanup, -1)",
             "wake_proxy_slot_waiters(cleanup)",
             "finish_claimed_waiter(cleanup.attach_wait_entry, -1)",
-            "wki_channel_close(ch)",
-            "release_and_maybe_destroy_idle_vfs_proxy(cleanup.state)",
+            "wki_channel_close_generation(cleanup.assigned_channel_ref",
+            "release_vfs_proxy_lifecycle_ref(cleanup.state)",
         ],
         "remote VFS peer cleanup teardown order",
     )
@@ -996,6 +1127,7 @@ def test_remote_vfs_teardown_releases_rdma_state_when_idle() -> None:
         header,
         [
             "std::atomic<uint32_t> open_file_refs{0};",
+            "uint32_t lifecycle_refs = 0;",
             "bool destroy_when_idle = false;",
             "bool mount_released = false;",
             "bool resources_releasing = false;",
@@ -1075,6 +1207,13 @@ def test_remote_open_refs_delay_proxy_destroy_until_close() -> None:
         "remote VFS proxy open ref release",
     )
 
+    idle_body = function_body(source, "proxy_is_idle_for_resource_release_locked")
+    require_tokens(
+        idle_body,
+        ["!state->active", "!state->epoch_reset_pending", "state->lifecycle_refs == 0"],
+        "epoch marker retains VFS proxy resources and storage",
+    )
+
     open_body = function_body(source, "wki_remote_vfs_open_path")
     require_order(
         open_body,
@@ -1100,6 +1239,574 @@ def test_remote_open_refs_delay_proxy_destroy_until_close() -> None:
     )
 
 
+def test_remote_vfs_channel_identity_survives_pool_slot_reuse() -> None:
+    header = WKI_HPP.read_text()
+    wki_source = WKI_CPP.read_text()
+    source = REMOTE_VFS_CPP.read_text()
+
+    require_tokens(
+        header,
+        [
+            "struct WkiChannelIdentity",
+            "WkiChannel* channel = nullptr;",
+            "uint16_t peer_node_id = WKI_NODE_INVALID;",
+            "uint16_t channel_id = 0;",
+            "uint32_t generation = 0;",
+            "WkiChannelIdentity* identity_out = nullptr",
+            "wki_send_on_channel_identity(const WkiChannelIdentity& identity",
+        ],
+        "immutable WKI channel allocation identity",
+    )
+    alloc_body = function_body(wki_source, "channel_pool_alloc")
+    require_order(
+        alloc_body,
+        [
+            "ch->lock.lock()",
+            "channel_init(ch, peer_node, chan_id, prio, credits)",
+            "*identity_out = {",
+            ".channel = ch",
+            ".peer_node_id = ch->peer_node_id",
+            ".channel_id = ch->channel_id",
+            ".generation = ch->generation",
+            "ch->lock.unlock()",
+        ],
+        "channel allocation token capture under the channel lock",
+    )
+
+    mount_body = function_body(source, "wki_remote_vfs_mount")
+    require_order(
+        mount_body,
+        [
+            "WkiChannelIdentity reserved_channel_identity{}",
+            "wki_channel_alloc(owner_node, PriorityClass::LATENCY, &reserved_channel_identity)",
+            "attach_req.requested_channel = reserved_channel_identity.channel_id",
+            "WkiChannelIdentity resource_channel_identity{}",
+            "capture_peer_channel_identity(owner_node, WKI_CHAN_RESOURCE, &resource_channel_identity)",
+            "wki_send_on_channel_identity(resource_channel_identity, MsgType::DEV_ATTACH_REQ",
+            "uint16_t const ATTACH_CHANNEL = state->attach_channel",
+            "if (WAIT_RC != 0)",
+            "cancel_proxy_attach_wait(state, wait, WAIT_RC)",
+                "send_or_defer_vfs_detach(state, owner_node, resource_id, attach_cookie, owner_incarnation)",
+            "close_reserved_channel()",
+            "wki_channel_reserve(owner_node, ATTACH_CHANNEL, PriorityClass::LATENCY, &reserved_channel_identity)",
+            "reserved_channel_identity.channel->lock.lock()",
+            "reserved_channel_identity.channel->generation == reserved_channel_identity.generation",
+            "s_vfs_lock.lock()",
+            "if (!state->epoch_reset_pending)",
+            "state->assigned_channel_ref = reserved_channel_identity.channel",
+            "state->assigned_channel_generation = reserved_channel_identity.generation",
+            "state->active = true",
+            "s_vfs_lock.unlock()",
+            "reserved_channel_identity.channel->lock.unlock()",
+            "wki_peer_lifecycle_acquire(final_peer)",
+            "!final_peer->vfs_reset_rebind_pending.load(std::memory_order_acquire)",
+            "wki_channel_generation_is_live(CHANNEL_REF, owner_node, CHANNEL_ID, CHANNEL_GENERATION)",
+            "wki_peer_lifecycle_release(final_peer)",
+        ],
+        "remote VFS channel validation and proxy publication",
+    )
+    if "wki_channel_close(" in mount_body:
+        fail("remote VFS attach rollback must never close a reusable channel by raw pointer")
+
+    discard_body = function_body(source, "discard_failed_attached_proxy")
+    require_order(
+        discard_body,
+        [
+            "state->active || state->epoch_reset_pending",
+            "assigned_channel_ref = state->assigned_channel_ref",
+            "assigned_channel_generation = state->assigned_channel_generation",
+            "stage_vfs_detach_locked",
+            "state->epoch_reset_pending = false",
+            "state->active = false",
+            "s_vfs_lock.unlock()",
+            "wki_channel_close_generation(assigned_channel_ref, owner_node, assigned_channel, assigned_channel_generation)",
+        ],
+        "failed attached proxy exact-generation rollback",
+    )
+    if "wki_channel_close(" in discard_body:
+        fail("failed attached proxy rollback must not close a reused channel generation")
+
+    marker_body = function_body(source, "wki_remote_vfs_mark_epoch_reset")
+    require_tokens(
+        marker_body,
+        ["state->attach_pending.load(std::memory_order_acquire)", "state->epoch_reset_pending = true"],
+        "epoch marker must include in-progress attaches",
+    )
+    require_order(
+        marker_body,
+        [
+            "s_vfs_lock.lock()",
+            "state->lock.lock()",
+            "state->active = false",
+            "state->epoch_reset_pending = true",
+            "state->lock.unlock()",
+            "s_vfs_lock.unlock()",
+        ],
+        "bounded remote VFS epoch marker",
+    )
+    for forbidden in ["stage_vfs_detach_locked", "wki_deferred_work_notify", "std::make_unique", "new (std::nothrow)", "push_back"]:
+        if forbidden in marker_body:
+            fail(f"remote VFS RX marker must remain allocation/send-free: found {forbidden}")
+
+    admission_body = function_body(source, "vfs_attach_blocked_by_retiring_binding_locked")
+    require_tokens(
+        admission_body,
+        [
+            "vfs_detach_pending_for_resource_locked(owner_node, resource_id)",
+            "proxy->owner_node == owner_node",
+            "proxy->resource_id == resource_id",
+            "proxy->epoch_reset_pending",
+        ],
+        "remote VFS mount admission includes epoch-marker ownership",
+    )
+    require_order(
+        mount_body,
+        [
+            "s_vfs_lock.lock()",
+            "vfs_attach_blocked_by_retiring_binding_locked(owner_node, resource_id)",
+            "return -EAGAIN",
+            "g_vfs_proxies.push_back",
+        ],
+        "remote VFS replacement mount cannot cross an epoch marker",
+    )
+    cleanup_body = function_body(source, "wki_remote_vfs_cleanup_for_peer")
+    require_tokens(
+        cleanup_body,
+        ["(!p->active && !p->epoch_reset_pending)", "deactivate_vfs_proxy_locked(p, cleanup, false)"],
+        "task-context epoch cleanup must consume pre-marked proxies",
+    )
+    require_order(
+        cleanup_body,
+        [
+            "if (!owner_reboot_proven)",
+            "stage_vfs_detach_locked",
+            "if (owner_reboot_proven || p->detach_pending)",
+            "p->epoch_reset_pending = false",
+            "s_vfs_lock.unlock()",
+            "wki_deferred_work_notify()",
+        ],
+        "task-context cleanup releases marker only after staging or reboot proof",
+    )
+    require_order(
+        cleanup_body,
+        [
+            "for (auto& rfd : g_remote_fds)",
+            "if (rfd.consumer_node != node_id)",
+            "if (rfd.file != nullptr)",
+            "files_to_close.push_back(rfd.file)",
+            "rfd.file = nullptr",
+            "rfd.retiring = true",
+            "rfd.active = false",
+            "std::erase_if(g_remote_fds",
+            "[node_id]",
+            "rfd.consumer_node == node_id && rfd.retiring && rfd.file == nullptr",
+            "s_vfs_lock.unlock()",
+            "for (auto* file : files_to_close)",
+        ],
+        "peer cleanup claims every exact-peer FD before erasing only claimed null rows",
+    )
+    if "return !rfd.active" in cleanup_body or "if (!rfd.active || rfd.consumer_node != node_id)" in cleanup_body:
+        fail("peer cleanup must not globally erase inactive FD markers or skip retiring rows with live files")
+    require_tokens(
+        source,
+        [
+            "entry.fd_id == fd_id && entry.retiring && entry.file == nullptr",
+            "rfd.consumer_node == NODE_ID && rfd.retiring && rfd.file == nullptr",
+            "rfd.consumer_node == node_id && rfd.retiring && rfd.file == nullptr",
+        ],
+        "every remote-FD retirement erases only an exact claimed null row",
+    )
+    for unsafe in [
+        "return !entry.active",
+        "return !r.active",
+        "return !rfd.active",
+    ]:
+        if unsafe in source:
+            fail(f"remote VFS must not globally erase inactive FD ownership markers: found {unsafe}")
+
+    send_identity_body = function_body(wki_source, "wki_send_on_channel_identity")
+    require_tokens(
+        send_identity_body,
+        [
+            "identity.peer_node_id",
+            "identity.channel_id",
+            "identity.channel",
+            "identity.generation",
+            "wki_send_impl",
+        ],
+        "generic exact-generation send",
+    )
+
+    for function_name in ["vfs_proxy_send_and_wait", "vfs_proxy_send_untracked", "vfs_proxy_write_rdma_and_wait"]:
+        body = function_body(source, function_name)
+        require_tokens(
+            body,
+            [
+                "WkiChannelIdentity const CHANNEL_IDENTITY = proxy_channel_identity_locked(state)",
+                "peek_channel_tx_seq16(CHANNEL_IDENTITY, &expected_seq)",
+                "wki_send_on_channel_identity(CHANNEL_IDENTITY, MsgType::DEV_OP_REQ",
+            ],
+            f"{function_name} exact channel generation",
+        )
+        if "wki_send(state->owner_node, state->assigned_channel" in body:
+            fail(f"{function_name} must not fall through to an ID-only replacement channel")
+
+    server_body = function_body(source, "handle_vfs_op")
+    require_tokens(
+        server_body,
+        [
+            "wki_send_on_channel_identity(channel_identity, MsgType::DEV_OP_RESP",
+            "wki_dev_server_get_vfs_write_region(channel_identity)",
+            "wki_dev_server_complete_vfs_write(channel_identity",
+        ],
+        "server VFS responses and binding lookups use exact generation",
+    )
+    if "wki_send(hdr->src_node, channel_id, MsgType::DEV_OP_RESP" in server_body:
+        fail("server VFS worker must not reply on an ID-only replacement channel")
+
+
+def test_stale_fd_gc_drains_binding_users_before_file_close() -> None:
+    body = function_body(REMOTE_VFS_CPP.read_text(), "wki_remote_vfs_gc_stale_fds")
+    require_tokens(
+        body,
+        [
+            "wki_peer_lifecycle_acquire(peer)",
+            "wki_dev_server_detach_all_for_peer(NODE_ID)",
+            "uint64_t const CHECK_NOW = wki_now_us()",
+            "CHECK_NOW < rfd.last_activity_us",
+            "NOW < rfd.last_activity_us",
+            "Peer slots live in g_wki.peers and are never",
+            "server FD",
+            "files_to_close.push_back(rfd.file)",
+            "rfd.file = nullptr",
+            "file->fops->vfs_close(file)",
+            "delete file",
+            "wki_peer_lifecycle_release(peer)",
+        ],
+        "stale RemoteVfsFd GC ownership transfer",
+    )
+    require_order(
+        body,
+        [
+            "wki_peer_lifecycle_acquire(peer)",
+            "wki_dev_server_detach_all_for_peer(NODE_ID)",
+            "uint64_t const CHECK_NOW = wki_now_us()",
+            "files_to_close.push_back(rfd.file)",
+            "file->fops->vfs_close(file)",
+            "delete file",
+            "wki_peer_lifecycle_release(peer)",
+        ],
+        "GC must drain deferred VFS binding refs before detaching and closing File",
+    )
+    if REMOTE_VFS_CPP.read_text().count("alloc_remote_fd(") != 2:
+        fail("RemoteVfsFd creation must remain confined to the reliable server VFS OPEN path")
+    require_tokens(
+        WKI_HPP.read_text(),
+        ["std::array<WkiPeer, WKI_MAX_PEERS> peers"],
+        "RemoteVfsFd peer rows use the fixed-lifetime peer table",
+    )
+
+
+def test_server_fd_and_consumer_rx_use_exact_channel_identity() -> None:
+    header = REMOTE_VFS_HPP.read_text()
+    source = REMOTE_VFS_CPP.read_text()
+    dev_server = DEV_SERVER_CPP.read_text()
+
+    require_tokens(
+        header,
+        [
+            "bool retiring = false;",
+            "WkiChannelIdentity channel_identity{};",
+            "void wki_remote_vfs_cleanup_server_fds_for_channel(const WkiChannelIdentity& channel_identity);",
+            "void wki_remote_vfs_mark_server_fds_for_channel(const WkiChannelIdentity& channel_identity);",
+            "void wki_remote_vfs_process_pending_server_fd_cleanup();",
+            "const WkiChannelIdentity& channel_identity",
+        ],
+        "remote VFS exact channel lifetime state",
+    )
+
+    lookup = function_body(source, "find_remote_fd")
+    require_tokens(
+        lookup,
+        [
+            "rfd.active",
+            "!rfd.retiring",
+            "rfd.fd_id == fd_id",
+            "vfs_channel_identity_matches(rfd.channel_identity, channel_identity)",
+        ],
+        "server FD exact-generation lookup",
+    )
+    allocate = function_body(source, "alloc_remote_fd")
+    require_order(
+        allocate,
+        [
+            "rfd.consumer_node = channel_identity.peer_node_id",
+            "rfd.channel_identity = channel_identity",
+            "rfd.fd_id = FD_ID",
+            "g_remote_fds.push_back(rfd)",
+        ],
+        "server FD exact-generation publication",
+    )
+
+    mark_cleanup = function_body(source, "wki_remote_vfs_mark_server_fds_for_channel")
+    require_order(
+        mark_cleanup,
+        [
+            "s_vfs_lock.lock()",
+            "vfs_channel_identity_matches(rfd.channel_identity, channel_identity)",
+            "rfd.retiring = true",
+            "rfd.active = false",
+            "s_vfs_lock.unlock()",
+            "wki_deferred_work_notify()",
+        ],
+        "exact binding FD retirement is allocation-free in reliable RX",
+    )
+    if "vfs_close_file" in mark_cleanup or "std::deque" in mark_cleanup:
+        fail("reliable RX server-FD retirement must not allocate or close files")
+    if "consumer_node == channel_identity.peer_node_id" in mark_cleanup:
+        fail("ordinary binding detach must not close sibling channel generations for the same peer")
+
+    drain_cleanup = function_body(source, "wki_remote_vfs_process_pending_server_fd_cleanup")
+    require_order(
+        drain_cleanup,
+        [
+            "std::array<ker::vfs::File*, CLOSE_BATCH> files_to_close{}",
+            "s_vfs_lock.lock()",
+            "rfd.retiring",
+            "rfd.file = nullptr",
+            "std::erase_if(g_remote_fds",
+            "s_vfs_lock.unlock()",
+            "ker::vfs::vfs_close_file(files_to_close.at(i))",
+        ],
+        "deferred exact binding FD close",
+    )
+    require_tokens(
+        function_body(WKI_CPP.read_text(), "process_deferred_blocking_work"),
+        ["wki_remote_vfs_process_pending_server_fd_cleanup()"],
+        "WKI task-context server-FD cleanup drain",
+    )
+
+    server = function_body(source, "handle_vfs_op")
+    require_tokens(
+        server,
+        [
+            "vfs_channel_identity_matches_header(hdr, channel_identity)",
+            "find_remote_fd(channel_identity, fd_id)",
+            "wki_send_on_channel_identity(channel_identity, MsgType::DEV_OP_RESP",
+            "Legacy DEV_OP_REQ has no binding nonce",
+        ],
+        "server VFS exact-generation dispatch",
+    )
+    for handler in ["handle_vfs_op_resp", "handle_vfs_invalidate_notify"]:
+        body = function_body(source, handler)
+        require_tokens(
+            body,
+            [
+                "vfs_channel_identity_matches_header(hdr, channel_identity)",
+                "channel_identity",
+            ],
+            f"{handler} exact-generation RX dispatch",
+        )
+    invalidate = function_body(source, "handle_vfs_invalidate_notify")
+    require_order(
+        invalidate,
+        [
+            "find_vfs_proxy_by_channel(channel_identity)",
+            "state->lifecycle_refs++",
+            "s_vfs_lock.unlock()",
+            "release_vfs_proxy_lifecycle_ref(state)",
+        ],
+        "invalidate notification pins proxy lifetime across unlocked VFS work",
+    )
+
+    require_tokens(
+        dev_server,
+        [
+            "wki_remote_vfs_cleanup_server_fds_for_channel(channel_identity)",
+            "wki_remote_vfs_mark_server_fds_for_channel(item.channel_identity)",
+        ],
+        "ordinary and reconciliation binding teardown close exact server FDs",
+    )
+
+
+def test_export_rebuild_is_revisioned_and_backing_mount_exact() -> None:
+    header = REMOTE_VFS_HPP.read_text()
+    source = REMOTE_VFS_CPP.read_text()
+    dev_server = DEV_SERVER_CPP.read_text()
+    core = VFS_CORE_CPP.read_text()
+
+    require_tokens(
+        header,
+        [
+            "uint64_t publication_revision = 0;",
+            "uint32_t backing_dev_id = 0;",
+            "ker::vfs::FSType backing_fs_type",
+            "auto wki_remote_vfs_export_snapshot_is_current(const VfsExport& expected) -> bool;",
+            "auto wki_remote_vfs_prepare_export_rebuild() -> bool;",
+            "void wki_remote_vfs_cancel_export_rebuild();",
+        ],
+        "revisioned VFS export identity",
+    )
+
+    preserve = function_body(source, "take_preserved_export_identity")
+    require_tokens(
+        preserve,
+        [
+            "it->name",
+            "it->export_path",
+            "export_backing_identity_matches(*it, backing)",
+            ".resource_incarnation = it->resource_incarnation",
+        ],
+        "export token preservation requires the same backing mount",
+    )
+    backing_match = function_body(source, "export_backing_identity_matches")
+    require_tokens(
+        backing_match,
+        [
+            "backing.dev_id != 0",
+            "export_entry.backing_dev_id == backing.dev_id",
+            "export_entry.backing_fs_type == backing.fs_type",
+        ],
+        "same visible path on a replacement mount receives a new export token",
+    )
+    backing_snapshot = function_body(source, "snapshot_export_backing_identity")
+    require_tokens(
+        backing_snapshot,
+        [
+            "snapshot.dev_id == 0",
+            "const char* const MOUNT_PATH = static_cast<const char*>(snapshot.path)",
+            "export_path_belongs_to_mount(export_path, MOUNT_PATH)",
+            "PATH_LEN > best_path_len",
+            ".dev_id = snapshot.dev_id",
+            ".fs_type = snapshot.fs_type",
+        ],
+        "explicit export captures the longest owning mount identity",
+    )
+    export_add = function_body(source, "wki_remote_vfs_export_add_internal")
+    require_tokens(
+        export_add,
+        [
+            "backing.dev_id == 0",
+            "g_vfs_export_revision > UINT64_MAX - 2",
+            "g_vfs_export_target_revision == 0",
+        ],
+        "export insertion rejects invalid backing and revision identities",
+    )
+
+    lookup = function_body(source, "wki_remote_vfs_find_export_snapshot")
+    require_order(
+        lookup,
+        [
+            "uint64_t const REVISION = g_vfs_export_revision",
+            "if ((REVISION & 1U) != 0)",
+            "return false",
+            "exp.publication_revision == REVISION",
+            "*out = exp",
+        ],
+        "attach snapshots reject an in-progress odd export table",
+    )
+    current = function_body(source, "wki_remote_vfs_export_snapshot_is_current")
+    require_tokens(
+        current,
+        [
+            "REVISION == expected.publication_revision",
+            "exp.resource_incarnation == expected.resource_incarnation",
+            "exp.backing_dev_id == expected.backing_dev_id",
+            "exp.backing_fs_type == expected.backing_fs_type",
+            "exp.export_path",
+            "exp.name",
+        ],
+        "final attach publication validates the full export identity",
+    )
+    advertise = function_body(source, "advertise_exports_to_peer")
+    require_tokens(
+        advertise,
+        [
+            "if ((PUBLICATION_REVISION & 1U) != 0)",
+            "g_vfs_export_revision != PUBLICATION_REVISION",
+            "EXP.publication_revision != PUBLICATION_REVISION",
+        ],
+        "partial odd export tables are not advertised",
+    )
+
+    prepare = function_body(source, "wki_remote_vfs_prepare_export_rebuild")
+    require_order(
+        prepare,
+        [
+            "g_vfs_export_target_revision = TARGET_REVISION",
+            "g_vfs_export_rebuild_prepared = true",
+            "s_vfs_lock.unlock()",
+            "wki_dev_server_begin_vfs_export_reconciliation(TARGET_REVISION)",
+            "g_vfs_export_revision++",
+        ],
+        "pre-gate attaches drain against the stable table before the export revision becomes odd",
+    )
+    if "exp.publication_revision = TARGET_REVISION" in prepare:
+        fail("failed VFS admission close must leave the old stable revision unchanged")
+    reconcile = function_body(source, "reconcile_and_publish_vfs_exports")
+    require_order(
+        reconcile,
+        [
+            "g_vfs_export_rebuild_accepting_entries = false",
+            "VfsExport const EXP =",
+            "s_vfs_lock.unlock()",
+            "wki_dev_server_reconcile_vfs_export(EXP.resource_id",
+            "wki_dev_server_finish_vfs_export_reconciliation(TARGET_REVISION)",
+            "g_vfs_export_revision = TARGET_REVISION",
+            "s_vfs_lock.unlock()",
+            "wki_dev_server_end_vfs_export_reconciliation(TARGET_REVISION)",
+            "g_vfs_export_target_revision = 0",
+            "g_vfs_export_rebuild_prepared = false",
+        ],
+        "binding reconciliation runs unlocked while the table stays odd until exact retirement finishes",
+    )
+    cancel = function_body(source, "wki_remote_vfs_cancel_export_rebuild")
+    require_tokens(cancel, ["reconcile_and_publish_vfs_exports()"], "failed pivot reopens the unchanged exact table")
+
+    rebuild = function_body(source, "wki_remote_vfs_rebuild_exports")
+    require_order(
+        rebuild,
+        [
+            "g_vfs_exports.clear()",
+            "g_vfs_export_rebuild_accepting_entries = true",
+            "wki_remote_vfs_auto_discover_internal(&stale_exports)",
+            "reconcile_and_publish_vfs_exports()",
+            "MsgType::RESOURCE_WITHDRAW",
+            "wki_remote_vfs_advertise_exports()",
+        ],
+        "new export table and bindings publish before stale-token withdrawal/advertisement",
+    )
+    if "wki_dev_server_refresh_vfs_binding" in source:
+        fail("export insertion must not mutate one binding before full-table reconciliation")
+
+    pivot = function_body(core, "vfs_pivot_root")
+    require_order(
+        pivot,
+        [
+            "snapshot_bounded_path_string(new_root",
+            "snapshot_bounded_path_string(put_old",
+            "wki_remote_vfs_prepare_export_rebuild()",
+            "remap_mounts_for_pivot(stable_new_root.data(), stable_put_old.data())",
+            "if (REMAP_RET != 0)",
+            "wki_remote_vfs_cancel_export_rebuild()",
+            "rebase_wki_mounts_for_new_root(stable_new_root.data())",
+            "wki_remote_vfs_rebuild_exports()",
+        ],
+        "pivot gates/drains VFS before remap and cancels or publishes on every outcome",
+    )
+
+    require_tokens(
+        dev_server,
+        [
+            "binding.vfs_export_dev_id = exp.backing_dev_id",
+            "binding.vfs_export_publication_revision = exp.publication_revision",
+            "if (wki_remote_vfs_export_snapshot_is_current(exp))",
+            "provisional_binding->active = true",
+        ],
+        "provisional VFS binding activates only after final exact snapshot validation",
+    )
+
+
 def main() -> None:
     test_proxy_op_slot_waits_are_bounded()
     test_proxy_operations_fail_before_setup_when_slot_wait_times_out()
@@ -1115,9 +1822,14 @@ def main() -> None:
     test_export_lookup_returns_locked_snapshot()
     test_rdma_retry_cooldowns_are_saturating()
     test_vfs_attach_ack_requires_expected_cookie_before_completion()
+    test_vfs_detach_uses_exact_negotiated_incarnation_form()
     test_remote_vfs_unmount_cancels_waiters_before_teardown()
     test_remote_vfs_teardown_releases_rdma_state_when_idle()
     test_remote_open_refs_delay_proxy_destroy_until_close()
+    test_remote_vfs_channel_identity_survives_pool_slot_reuse()
+    test_stale_fd_gc_drains_binding_users_before_file_close()
+    test_server_fd_and_consumer_rx_use_exact_channel_identity()
+    test_export_rebuild_is_revisioned_and_backing_mount_exact()
     print("WKI remote VFS source invariants hold")
 
 

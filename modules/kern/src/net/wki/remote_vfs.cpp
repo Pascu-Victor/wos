@@ -16,6 +16,7 @@
 #include <iterator>
 #include <memory>
 #include <net/wki/dev_server.hpp>
+#include <net/wki/remotable.hpp>
 #include <net/wki/timer_math.hpp>
 #include <net/wki/transport_roce.hpp>
 #include <net/wki/wire.hpp>
@@ -26,6 +27,7 @@
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
 #include <platform/sys/mutex.hpp>
+#include <util/hcf.hpp>
 #include <utility>
 #include <vfs/mount.hpp>
 #include <vfs/vfs.hpp>
@@ -182,20 +184,41 @@ auto perf_current_cpu() -> uint32_t {
     return task != nullptr ? static_cast<uint32_t>(task->cpu) : 0U;
 }
 
-auto take_preserved_export_id(std::deque<VfsExport>* stale_exports, const char* name) -> uint32_t {
-    if (stale_exports == nullptr || name == nullptr) {
-        return 0;
+struct PreservedExportIdentity {
+    uint32_t resource_id = 0;
+    uint32_t resource_incarnation = 0;
+};
+
+struct ExportBackingIdentity {
+    uint32_t dev_id = 0;
+    ker::vfs::FSType fs_type = ker::vfs::FSType::TMPFS;
+};
+
+auto export_backing_identity_matches(const VfsExport& export_entry, const ExportBackingIdentity& backing) -> bool {
+    return backing.dev_id != 0 && export_entry.backing_dev_id == backing.dev_id && export_entry.backing_fs_type == backing.fs_type;
+}
+
+auto take_preserved_export_identity(std::deque<VfsExport>* stale_exports, const char* name, const char* export_path,
+                                    const ExportBackingIdentity& backing) -> PreservedExportIdentity {
+    if (stale_exports == nullptr || name == nullptr || export_path == nullptr) {
+        return {};
     }
 
     for (auto it = stale_exports->begin(); it != stale_exports->end(); ++it) {
-        if (it->active && std::strncmp(static_cast<const char*>(it->name), name, VFS_EXPORT_NAME_LEN) == 0) {
-            uint32_t const RESOURCE_ID = it->resource_id;
-            stale_exports->erase(it);
-            return RESOURCE_ID;
+        if (!it->active || std::strncmp(static_cast<const char*>(it->name), name, VFS_EXPORT_NAME_LEN) != 0 ||
+            std::strncmp(static_cast<const char*>(it->export_path), export_path, VFS_EXPORT_PATH_LEN) != 0 ||
+            !export_backing_identity_matches(*it, backing)) {
+            continue;
         }
+        PreservedExportIdentity const IDENTITY = {
+            .resource_id = it->resource_id,
+            .resource_incarnation = it->resource_incarnation,
+        };
+        stale_exports->erase(it);
+        return IDENTITY;
     }
 
-    return 0;
+    return {};
 }
 
 auto max_preserved_export_id(const std::deque<VfsExport>& stale_exports) -> uint32_t {
@@ -406,27 +429,42 @@ void perf_record_vfs_server_end(uint8_t op, uint16_t peer, uint16_t channel, uin
 // Server side
 // -----------------------------------------------------------------------------
 
-std::deque<VfsExport> g_vfs_exports;       // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-std::deque<RemoteVfsFd> g_remote_fds;      // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-int32_t g_next_remote_fd = 1;              // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-uint32_t g_next_vfs_resource_id = 0x1000;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::deque<VfsExport> g_vfs_exports;                  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::deque<RemoteVfsFd> g_remote_fds;                 // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+int32_t g_next_remote_fd = 1;                         // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+uint32_t g_next_vfs_resource_id = 0x1000;             // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+uint32_t g_next_vfs_resource_incarnation = 1;         // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+uint64_t g_vfs_export_revision = 2;                   // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+uint64_t g_vfs_export_target_revision = 0;            // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+bool g_vfs_export_rebuild_prepared = false;           // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+bool g_vfs_export_rebuild_accepting_entries = false;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
-auto find_remote_fd(uint16_t consumer_node, uint16_t channel_id, int32_t fd_id) -> RemoteVfsFd* {
+auto vfs_channel_identity_matches(const WkiChannelIdentity& expected, const WkiChannelIdentity& actual) -> bool {
+    return expected.channel != nullptr && expected.channel == actual.channel && expected.peer_node_id == actual.peer_node_id &&
+           expected.channel_id == actual.channel_id && expected.generation != 0 && expected.generation == actual.generation;
+}
+
+auto vfs_channel_identity_matches_header(const WkiHeader* hdr, const WkiChannelIdentity& identity) -> bool {
+    return hdr != nullptr && identity.channel != nullptr && identity.generation != 0 && hdr->src_node == identity.peer_node_id &&
+           hdr->channel_id == identity.channel_id;
+}
+
+auto find_remote_fd(const WkiChannelIdentity& channel_identity, int32_t fd_id) -> RemoteVfsFd* {
     for (auto& rfd : g_remote_fds) {
-        if (rfd.active && rfd.consumer_node == consumer_node && rfd.channel_id == channel_id && rfd.fd_id == fd_id) {
+        if (rfd.active && !rfd.retiring && rfd.fd_id == fd_id && vfs_channel_identity_matches(rfd.channel_identity, channel_identity)) {
             return &rfd;
         }
     }
     return nullptr;
 }
 
-auto alloc_remote_fd(uint16_t consumer_node, uint16_t channel_id, ker::vfs::File* file) -> int32_t {
+auto alloc_remote_fd(const WkiChannelIdentity& channel_identity, ker::vfs::File* file) -> int32_t {
     int32_t const FD_ID = g_next_remote_fd++;
 
     RemoteVfsFd rfd;
     rfd.active = true;
-    rfd.consumer_node = consumer_node;
-    rfd.channel_id = channel_id;
+    rfd.consumer_node = channel_identity.peer_node_id;
+    rfd.channel_identity = channel_identity;
     rfd.fd_id = FD_ID;
     rfd.file = file;
     rfd.last_activity_us = wki_now_us();
@@ -559,6 +597,8 @@ auto dev_attach_status_to_errno(uint8_t status) -> int {
             return -EBUSY;
         case DevAttachStatus::NO_PASSTHROUGH:
             return -EOPNOTSUPP;
+        case DevAttachStatus::STALE_RESOURCE:
+            return -ESTALE;
     }
     return -EIO;
 }
@@ -707,8 +747,35 @@ void invalidate_all_dir_caches(ProxyVfsState* proxy) {
 std::deque<std::unique_ptr<ProxyVfsState>> g_vfs_proxies;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 bool g_remote_vfs_initialized = false;                     // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 uint8_t g_vfs_attach_next_cookie = 1;                      // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+ProxyVfsState* g_pending_vfs_detach_head = nullptr;        // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+ProxyVfsState* g_pending_vfs_detach_tail = nullptr;        // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
 ker::mod::sys::Spinlock s_vfs_lock;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+
+constexpr size_t VFS_DETACH_RETRY_BATCH = 32;
+constexpr size_t VFS_DETACH_RETRY_SCAN = VFS_DETACH_RETRY_BATCH * 2;
+
+// Caller must hold s_vfs_lock.
+auto vfs_detach_pending_for_resource_locked(uint16_t owner_node, uint32_t resource_id) -> bool {
+    for (auto* state = g_pending_vfs_detach_head; state != nullptr; state = state->detach_next) {
+        if (state->detach_owner_node == owner_node && state->detach_resource_id == resource_id) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Caller must hold s_vfs_lock. The HELLO/RX marker is deliberately limited to
+// fixed state mutation, but it still owns admission until task-context cleanup
+// either proves an owner reboot or stages the exact detach tuple.
+auto vfs_attach_blocked_by_retiring_binding_locked(uint16_t owner_node, uint32_t resource_id) -> bool {
+    if (vfs_detach_pending_for_resource_locked(owner_node, resource_id)) {
+        return true;
+    }
+    return std::ranges::any_of(g_vfs_proxies, [owner_node, resource_id](const std::unique_ptr<ProxyVfsState>& proxy) -> bool {
+        return proxy != nullptr && proxy->owner_node == owner_node && proxy->resource_id == resource_id && proxy->epoch_reset_pending;
+    });
+}
 
 struct VfsProxyResponseLookup {
     ProxyVfsState* matched_state = nullptr;
@@ -719,12 +786,18 @@ struct VfsProxyResponseLookup {
     bool saw_pending_candidate = false;
 };
 
-auto find_vfs_proxy_for_response_locked(uint16_t owner_node, uint16_t channel_id, uint16_t resp_op, uint16_t resp_seq)
+auto find_vfs_proxy_for_response_locked(const WkiChannelIdentity& channel_identity, uint16_t resp_op, uint16_t resp_seq)
     -> VfsProxyResponseLookup {
     VfsProxyResponseLookup lookup = {};
 
     for (auto& p : g_vfs_proxies) {
-        if (!p->active || p->owner_node != owner_node || p->assigned_channel != channel_id) {
+        WkiChannelIdentity const EXPECTED_IDENTITY = {
+            .channel = p->assigned_channel_ref,
+            .peer_node_id = p->owner_node,
+            .channel_id = p->assigned_channel,
+            .generation = p->assigned_channel_generation,
+        };
+        if (!p->active || !vfs_channel_identity_matches(EXPECTED_IDENTITY, channel_identity)) {
             continue;
         }
 
@@ -763,66 +836,170 @@ auto find_vfs_proxy_for_response_locked(uint16_t owner_node, uint16_t channel_id
     return lookup;
 }
 
-auto find_vfs_proxy_by_attach(uint16_t owner_node, uint32_t resource_id) -> ProxyVfsState* {
+auto find_vfs_proxy_by_attach(uint16_t owner_node, uint32_t resource_id, uint8_t attach_cookie) -> ProxyVfsState* {
     for (auto& p : g_vfs_proxies) {
-        if (p->attach_pending && p->owner_node == owner_node && p->resource_id == resource_id) {
+        if (p->attach_pending && p->owner_node == owner_node && p->resource_id == resource_id &&
+            p->binding_attach_cookie == attach_cookie) {
             return p.get();
         }
     }
     return nullptr;
 }
 
-// Caller must hold s_vfs_lock.
-auto allocate_vfs_attach_cookie_locked() -> uint8_t {
-    uint8_t cookie = g_vfs_attach_next_cookie;
-    if (cookie == 0) {
-        cookie = 1;
+// Caller must hold s_vfs_lock. The server treats an attach with the same
+// owner/resource/incarnation/cookie tuple as an idempotent retransmission.
+// Never wrap onto a tuple still represented by a local proxy, or a fresh mount
+// could accept the old binding's ACK and later detach that binding.
+auto allocate_vfs_attach_cookie_locked(uint16_t owner_node, uint32_t resource_id, const ResourceIncarnationToken& owner_incarnation)
+    -> uint8_t {
+    for (uint16_t attempt = 0; attempt < UINT8_MAX; ++attempt) {
+        uint8_t cookie = g_vfs_attach_next_cookie;
+        if (cookie == 0) {
+            cookie = 1;
+        }
+        g_vfs_attach_next_cookie = static_cast<uint8_t>(cookie + 1U);
+        if (g_vfs_attach_next_cookie == 0) {
+            g_vfs_attach_next_cookie = 1;
+        }
+
+        bool const RESERVED = std::ranges::any_of(g_vfs_proxies, [&](const std::unique_ptr<ProxyVfsState>& proxy) {
+            if (proxy == nullptr || proxy->owner_node != owner_node || proxy->resource_id != resource_id ||
+                proxy->binding_attach_cookie != cookie) {
+                return false;
+            }
+            ResourceIncarnationToken const& EXISTING_INCARNATION = wki_resource_incarnation_valid(proxy->binding_incarnation)
+                                                                       ? proxy->binding_incarnation
+                                                                       : proxy->attach_expected_incarnation;
+            return !wki_resource_incarnation_valid(owner_incarnation) || !wki_resource_incarnation_valid(EXISTING_INCARNATION) ||
+                   wki_resource_incarnation_equal(EXISTING_INCARNATION, owner_incarnation);
+        });
+        bool pending_reserved = false;
+        if (!RESERVED) {
+            for (auto* proxy = g_pending_vfs_detach_head; proxy != nullptr; proxy = proxy->detach_next) {
+                if (proxy->detach_owner_node != owner_node || proxy->detach_resource_id != resource_id ||
+                    proxy->detach_attach_cookie != cookie) {
+                    continue;
+                }
+                ResourceIncarnationToken const& PENDING_INCARNATION = proxy->detach_incarnation;
+                pending_reserved = !wki_resource_incarnation_valid(owner_incarnation) ||
+                                   !wki_resource_incarnation_valid(PENDING_INCARNATION) ||
+                                   wki_resource_incarnation_equal(PENDING_INCARNATION, owner_incarnation);
+                if (pending_reserved) {
+                    break;
+                }
+            }
+        }
+        if (!RESERVED && !pending_reserved) {
+            return cookie;
+        }
     }
-    g_vfs_attach_next_cookie = static_cast<uint8_t>(cookie + 1U);
-    if (g_vfs_attach_next_cookie == 0) {
-        g_vfs_attach_next_cookie = 1;
-    }
-    return cookie;
+    return 0;
 }
 
 // Caller must hold s_vfs_lock.
-auto vfs_attach_ack_matches_pending_locked(ProxyVfsState const* state, const DevAttachAckPayload& ack) -> bool {
-    return state != nullptr && state->attach_pending.load(std::memory_order_acquire) && state->attach_expected_cookie != 0 &&
-           wki_dev_attach_ack_matches_expected(state->attach_expected_cookie, ack);
+auto vfs_attach_ack_matches_pending_locked(ProxyVfsState const* state, const DevAttachAckPayload& ack, const uint8_t* payload,
+                                           uint16_t payload_len) -> bool {
+    if (state == nullptr || payload == nullptr || !state->attach_pending.load(std::memory_order_acquire) ||
+        state->attach_expected_cookie == 0 || !wki_dev_attach_ack_matches_expected(state->attach_expected_cookie, ack)) {
+        return false;
+    }
+    size_t const EXPECTED_SIZE = sizeof(DevAttachAckPayload) + (state->attach_expect_incarnation ? sizeof(ResourceIncarnationToken) : 0);
+    if (payload_len != EXPECTED_SIZE) {
+        return false;
+    }
+    if (!state->attach_expect_incarnation || ack.status != static_cast<uint8_t>(DevAttachStatus::OK)) {
+        return true;
+    }
+
+    ResourceIncarnationToken ack_incarnation = {};
+    std::memcpy(&ack_incarnation, payload + sizeof(DevAttachAckPayload), sizeof(ack_incarnation));
+    return wki_resource_incarnation_equal(ack_incarnation, state->attach_expected_incarnation);
 }
 
 auto find_vfs_proxy_by_mount(const char* mount_path) -> ProxyVfsState* {
     for (auto& p : g_vfs_proxies) {
-        if (p->active && strncmp(p->local_mount_path.data(), mount_path, p->local_mount_path.size()) == 0) {
+        if ((p->active || p->epoch_reset_pending) && p->mount_configured &&
+            strncmp(p->local_mount_path.data(), mount_path, p->local_mount_path.size()) == 0) {
             return p.get();
         }
     }
     return nullptr;
 }
 
-auto find_vfs_proxy_by_channel(uint16_t owner_node, uint16_t channel_id) -> ProxyVfsState* {
+auto find_vfs_proxy_by_channel(const WkiChannelIdentity& channel_identity) -> ProxyVfsState* {
     for (auto& p : g_vfs_proxies) {
-        if (p->active && p->owner_node == owner_node && p->assigned_channel == channel_id) {
+        WkiChannelIdentity const EXPECTED_IDENTITY = {
+            .channel = p->assigned_channel_ref,
+            .peer_node_id = p->owner_node,
+            .channel_id = p->assigned_channel,
+            .generation = p->assigned_channel_generation,
+        };
+        if (p->active && vfs_channel_identity_matches(EXPECTED_IDENTITY, channel_identity)) {
             return p.get();
         }
     }
     return nullptr;
 }
 
-auto peek_channel_tx_seq16(uint16_t owner_node, uint16_t channel_id, uint16_t* seq_out) -> bool {
-    if (seq_out == nullptr) {
+auto proxy_channel_identity_locked(const ProxyVfsState* state) -> WkiChannelIdentity {
+    if (state == nullptr) {
+        return {};
+    }
+    return {
+        .channel = state->assigned_channel_ref,
+        .peer_node_id = state->owner_node,
+        .channel_id = state->assigned_channel,
+        .generation = state->assigned_channel_generation,
+    };
+}
+
+auto peek_channel_tx_seq16(const WkiChannelIdentity& identity, uint16_t* seq_out) -> bool {
+    if (seq_out == nullptr || identity.channel == nullptr || identity.generation == 0) {
         return false;
     }
 
-    WkiChannel* ch = wki_channel_get(owner_node, channel_id);
-    if (ch == nullptr) {
-        return false;
-    }
-
+    WkiChannel* ch = identity.channel;
     ch->lock.lock();
+    if (!ch->active || ch->peer_node_id != identity.peer_node_id || ch->channel_id != identity.channel_id ||
+        ch->generation != identity.generation) {
+        ch->lock.unlock();
+        return false;
+    }
     *seq_out = static_cast<uint16_t>(ch->tx_seq & UINT16_MAX);
     ch->lock.unlock();
     return true;
+}
+
+auto capture_peer_channel_identity(uint16_t peer_node, uint16_t channel_id, WkiChannelIdentity* identity_out) -> bool {
+    if (identity_out == nullptr) {
+        return false;
+    }
+    *identity_out = {};
+
+    WkiPeer* peer = wki_peer_find(peer_node);
+    if (!wki_peer_lifecycle_acquire(peer)) {
+        return false;
+    }
+    if (peer->state != PeerState::CONNECTED || peer->vfs_reset_rebind_pending.load(std::memory_order_acquire)) {
+        wki_peer_lifecycle_release(peer);
+        return false;
+    }
+
+    WkiChannel* channel = wki_channel_get(peer_node, channel_id);
+    if (channel != nullptr) {
+        channel->lock.lock();
+        if (channel->active && channel->peer_node_id == peer_node && channel->channel_id == channel_id && channel->generation != 0) {
+            *identity_out = {
+                .channel = channel,
+                .peer_node_id = peer_node,
+                .channel_id = channel_id,
+                .generation = channel->generation,
+            };
+        }
+        channel->lock.unlock();
+    }
+    wki_peer_lifecycle_release(peer);
+    return identity_out->channel != nullptr;
 }
 
 // Successful symlink targets are typically stable for the lifetime of an
@@ -962,32 +1139,244 @@ void release_vfs_proxy_buffers(ProxyVfsState* state) {
     state->op_untracked_send_pending.store(false, std::memory_order_release);
 }
 
-void discard_failed_attached_proxy(ProxyVfsState* state, WkiChannel* reserved_channel) {
+void release_vfs_proxy_lifecycle_ref(ProxyVfsState* state);
+
+auto send_vfs_detach(uint16_t owner_node, uint32_t resource_id, uint8_t attach_cookie, const ResourceIncarnationToken& resource_incarnation,
+                     WkiReliableTxToken* tx_token_out) -> int {
+    constexpr size_t DETACH_MAX_SIZE = wki_dev_detach_payload_size(true);
+    std::array<uint8_t, DETACH_MAX_SIZE> det_buf{};
+    auto* det = reinterpret_cast<DevDetachPayload*>(det_buf.data());
+    det->target_node = owner_node;
+    det->resource_type = static_cast<uint16_t>(ResourceType::VFS);
+    det->resource_id = resource_id;
+    det_buf.at(WKI_DEV_DETACH_COOKIE_OFFSET) = attach_cookie;
+
+    bool const WITH_INCARNATION = wki_resource_incarnation_negotiated(owner_node, ResourceType::VFS);
+    if (WITH_INCARNATION) {
+        if (!wki_resource_incarnation_valid(resource_incarnation)) {
+            return WKI_ERR_INVALID;
+        }
+        std::memcpy(det_buf.data() + WKI_DEV_DETACH_INCARNATION_OFFSET, &resource_incarnation, sizeof(resource_incarnation));
+    }
+    uint16_t const DETACH_SIZE = wki_dev_detach_payload_size(WITH_INCARNATION);
+    return wki_send_tracked(owner_node, WKI_CHAN_RESOURCE, MsgType::DEV_DETACH, det_buf.data(), DETACH_SIZE, tx_token_out);
+}
+
+struct VfsDetachAttempt {
+    ProxyVfsState* state = nullptr;
+    uint16_t owner_node = WKI_NODE_INVALID;
+    uint32_t resource_id = 0;
+    uint8_t attach_cookie = 0;
+    ResourceIncarnationToken incarnation = {};
+    uint32_t peer_boot_epoch = 0;
+    WkiReliableTxToken tx_token = {};
+};
+
+auto vfs_detach_incarnation_equal(const ResourceIncarnationToken& lhs, const ResourceIncarnationToken& rhs) -> bool {
+    bool const LHS_VALID = wki_resource_incarnation_valid(lhs);
+    bool const RHS_VALID = wki_resource_incarnation_valid(rhs);
+    return LHS_VALID == RHS_VALID && (!LHS_VALID || wki_resource_incarnation_equal(lhs, rhs));
+}
+
+// Caller must hold s_vfs_lock. An epoch marker can race an in-progress attach
+// before its ACK publishes binding_incarnation, so retain the exact requested
+// incarnation as the possible server-binding identity in that interval.
+auto vfs_detach_incarnation_snapshot_locked(const ProxyVfsState* state) -> ResourceIncarnationToken {
+    return wki_resource_incarnation_valid(state->binding_incarnation) ? state->binding_incarnation : state->attach_expected_incarnation;
+}
+
+// Caller must hold s_vfs_lock.
+void link_pending_vfs_detach_locked(ProxyVfsState* state) {
+    state->detach_prev = g_pending_vfs_detach_tail;
+    state->detach_next = nullptr;
+    if (g_pending_vfs_detach_tail != nullptr) {
+        g_pending_vfs_detach_tail->detach_next = state;
+    } else {
+        g_pending_vfs_detach_head = state;
+    }
+    g_pending_vfs_detach_tail = state;
+}
+
+// Caller must hold s_vfs_lock.
+void unlink_pending_vfs_detach_locked(ProxyVfsState* state) {
+    if (state->detach_prev != nullptr) {
+        state->detach_prev->detach_next = state->detach_next;
+    } else {
+        g_pending_vfs_detach_head = state->detach_next;
+    }
+    if (state->detach_next != nullptr) {
+        state->detach_next->detach_prev = state->detach_prev;
+    } else {
+        g_pending_vfs_detach_tail = state->detach_prev;
+    }
+    state->detach_prev = nullptr;
+    state->detach_next = nullptr;
+}
+
+// Caller must hold s_vfs_lock.
+auto pending_vfs_detach_matches_locked(const ProxyVfsState* state, uint16_t owner_node, uint32_t resource_id, uint8_t attach_cookie,
+                                       const ResourceIncarnationToken& incarnation) -> bool {
+    return state->detach_pending && state->detach_owner_node == owner_node && state->detach_resource_id == resource_id &&
+           state->detach_attach_cookie == attach_cookie && vfs_detach_incarnation_equal(state->detach_incarnation, incarnation);
+}
+
+// Caller must hold s_vfs_lock. A deferred-only reservation starts idle so the
+// task-context retry worker can claim it after teardown releases locks.
+auto stage_vfs_detach_locked(ProxyVfsState* state, uint16_t owner_node, uint32_t resource_id, uint8_t attach_cookie,
+                             const ResourceIncarnationToken& incarnation, bool initial_attempt_in_progress) -> bool {
+    if (state == nullptr || attach_cookie == 0) {
+        return false;
+    }
+    if (state->detach_pending) {
+        bool const SAME = pending_vfs_detach_matches_locked(state, owner_node, resource_id, attach_cookie, incarnation);
+        if (!SAME) [[unlikely]] {
+            ker::mod::dbg::panic_handler("WKI VFS proxy: overlapping detach idempotence tuples");
+            hcf();
+        }
+        return false;
+    }
+
+    state->detach_pending = true;
+    state->detach_retry_in_progress = initial_attempt_in_progress;
+    state->detach_owner_node = owner_node;
+    state->detach_resource_id = resource_id;
+    state->detach_attach_cookie = attach_cookie;
+    state->detach_incarnation = incarnation;
+    state->detach_peer_boot_epoch =
+        wki_resource_incarnation_valid(incarnation) ? incarnation.owner_boot_epoch : state->binding_peer_boot_epoch;
+    state->detach_tx_token = {};
+    state->lifecycle_refs++;
+    link_pending_vfs_detach_locked(state);
+    return true;
+}
+
+auto stage_vfs_detach(ProxyVfsState* state, uint16_t owner_node, uint32_t resource_id, uint8_t attach_cookie,
+                      const ResourceIncarnationToken& incarnation) -> bool {
+    s_vfs_lock.lock();
+    bool const STAGED = stage_vfs_detach_locked(state, owner_node, resource_id, attach_cookie, incarnation, false);
+    s_vfs_lock.unlock();
+    return STAGED;
+}
+
+void finish_vfs_detach_attempt(const VfsDetachAttempt& attempt, WkiReliableTxStatus tx_status, int send_result,
+                               const WkiReliableTxToken& replacement_token, bool peer_epoch_invalidated = false) {
+    if (attempt.state == nullptr) {
+        return;
+    }
+
+    bool release_pending_ref = false;
+    s_vfs_lock.lock();
+    ProxyVfsState* const state = attempt.state;
+    if (!pending_vfs_detach_matches_locked(state, attempt.owner_node, attempt.resource_id, attempt.attach_cookie, attempt.incarnation) ||
+        !state->detach_retry_in_progress) {
+        s_vfs_lock.unlock();
+        return;
+    }
+
+    if (tx_status == WkiReliableTxStatus::ACKED || peer_epoch_invalidated) {
+        unlink_pending_vfs_detach_locked(state);
+        state->detach_pending = false;
+        state->detach_retry_in_progress = false;
+        state->detach_owner_node = WKI_NODE_INVALID;
+        state->detach_resource_id = 0;
+        state->detach_attach_cookie = 0;
+        state->detach_incarnation = {};
+        state->detach_peer_boot_epoch = 0;
+        state->detach_tx_token = {};
+        release_pending_ref = true;
+    } else if (tx_status == WkiReliableTxStatus::PENDING) {
+        state->detach_retry_in_progress = false;
+    } else {
+        state->detach_tx_token = send_result == WKI_OK ? replacement_token : WkiReliableTxToken{};
+        state->detach_retry_in_progress = false;
+    }
+    s_vfs_lock.unlock();
+
+    if (release_pending_ref) {
+        release_vfs_proxy_lifecycle_ref(state);
+    }
+}
+
+auto send_or_defer_vfs_detach(ProxyVfsState* state, uint16_t owner_node, uint32_t resource_id, uint8_t attach_cookie,
+                              const ResourceIncarnationToken& incarnation) -> int {
+    bool const STAGED = stage_vfs_detach(state, owner_node, resource_id, attach_cookie, incarnation);
+    wki_deferred_work_notify();
+    return STAGED ? WKI_OK : WKI_ERR_BUSY;
+}
+
+void discard_unpublished_proxy(ProxyVfsState* state) {
     if (state == nullptr) {
         return;
     }
 
-    uint16_t const OWNER_NODE = state->owner_node;
-    uint32_t const RESOURCE_ID = state->resource_id;
+    bool detach_staged = false;
     s_vfs_lock.lock();
-    state->active = false;
+    if (state->active || state->mount_configured || state->lifecycle_refs == 0) [[unlikely]] {
+        s_vfs_lock.unlock();
+        ker::mod::dbg::panic_handler("WKI remote VFS: invalid unpublished proxy teardown");
+        hcf();
+    }
+    if (state->epoch_reset_pending) {
+        detach_staged = stage_vfs_detach_locked(state, state->owner_node, state->resource_id, state->binding_attach_cookie,
+                                                vfs_detach_incarnation_snapshot_locked(state), false);
+        if (state->detach_pending) {
+            state->epoch_reset_pending = false;
+        }
+    }
+    state->destroy_when_idle = true;
+    state->mount_released = true;
     s_vfs_lock.unlock();
+    if (detach_staged) {
+        wki_deferred_work_notify();
+    }
+    release_vfs_proxy_lifecycle_ref(state);
+}
 
-    DevDetachPayload det = {};
-    det.target_node = OWNER_NODE;
-    det.resource_type = static_cast<uint16_t>(ResourceType::VFS);
-    det.resource_id = RESOURCE_ID;
-    wki_send(OWNER_NODE, WKI_CHAN_RESOURCE, MsgType::DEV_DETACH, &det, sizeof(det));
-
-    if (reserved_channel != nullptr) {
-        wki_channel_close(reserved_channel);
+void discard_failed_attached_proxy(ProxyVfsState* state) {
+    if (state == nullptr) {
+        return;
     }
 
-    release_vfs_proxy_buffers(state);
-
+    uint16_t owner_node = WKI_NODE_INVALID;
+    uint32_t resource_id = 0;
+    uint8_t attach_cookie = 0;
+    ResourceIncarnationToken binding_incarnation = {};
+    uint16_t assigned_channel = 0;
+    WkiChannel* assigned_channel_ref = nullptr;
+    uint32_t assigned_channel_generation = 0;
+    bool detach_staged = false;
     s_vfs_lock.lock();
-    std::erase_if(g_vfs_proxies, [state](const std::unique_ptr<ProxyVfsState>& proxy) { return proxy.get() == state; });
+    owner_node = state->owner_node;
+    resource_id = state->resource_id;
+    attach_cookie = state->binding_attach_cookie;
+    binding_incarnation = vfs_detach_incarnation_snapshot_locked(state);
+    bool const OWNS_REMOTE_DETACH = state->active || state->epoch_reset_pending;
+    assigned_channel = state->assigned_channel;
+    assigned_channel_ref = state->assigned_channel_ref;
+    assigned_channel_generation = state->assigned_channel_generation;
+    if (OWNS_REMOTE_DETACH) {
+        // The pending lifecycle reference and tuple become visible before the
+        // active row disappears from replacement-mount admission.
+        detach_staged = stage_vfs_detach_locked(state, owner_node, resource_id, attach_cookie, binding_incarnation, false);
+        if (state->detach_pending) {
+            state->epoch_reset_pending = false;
+        }
+    }
+    state->active = false;
+    state->destroy_when_idle = true;
+    state->mount_released = true;
     s_vfs_lock.unlock();
+
+    // Peer cleanup wins by clearing active under the same registry lock. In
+    // that case its retained teardown snapshot owns channel retirement.
+    if (OWNS_REMOTE_DETACH) {
+        if (detach_staged) {
+            wki_deferred_work_notify();
+        }
+        static_cast<void>(wki_channel_close_generation(assigned_channel_ref, owner_node, assigned_channel, assigned_channel_generation));
+    }
+
+    release_vfs_proxy_lifecycle_ref(state);
 }
 
 auto readlink_status_is_cacheable(int status) -> bool {
@@ -1499,11 +1888,7 @@ void finish_or_quiesce_waiter(WkiWaitEntry* wait, bool claimed, int result) {
         return;
     }
 
-    // Do not enter a scheduler wait here: this path also quiesces stack
-    // waiters while a kernel thread is already exiting for shutdown.
-    while (wait->state.load(std::memory_order_acquire) != static_cast<uint8_t>(WkiWaitEntry::DONE)) {
-        asm volatile("pause" ::: "memory");
-    }
+    wki_quiesce_claimed_op(wait);
 }
 
 void wait_for_waiter_retirement(WkiWaitEntry* wait) {
@@ -1512,7 +1897,7 @@ void wait_for_waiter_retirement(WkiWaitEntry* wait) {
     }
 
     while (wait->retirement_pending.load(std::memory_order_acquire)) {
-        asm volatile("pause" ::: "memory");
+        wki_wait_quiescence_point();
     }
 }
 
@@ -1577,7 +1962,12 @@ struct PendingProxyTeardown {
     ProxyVfsState* state = nullptr;
     uint16_t owner_node = WKI_NODE_INVALID;
     uint16_t assigned_channel = 0;
+    WkiChannel* assigned_channel_ref = nullptr;
+    uint32_t assigned_channel_generation = 0;
     uint32_t resource_id = 0;
+    uint8_t binding_attach_cookie = 0;
+    ResourceIncarnationToken binding_incarnation = {};
+    bool detach_staged = false;
     uint16_t op_expected_id = 0;
     uint16_t op_expected_seq = 0;
     bool had_op_pending = false;
@@ -1614,7 +2004,8 @@ void finish_proxy_teardown_op_waiter(const PendingProxyTeardown& teardown, int r
 }
 
 auto proxy_is_idle_for_resource_release_locked(ProxyVfsState* state) -> bool {
-    return state != nullptr && !state->active && state->open_file_refs.load(std::memory_order_acquire) == 0;
+    return state != nullptr && !state->active && !state->epoch_reset_pending &&
+           state->open_file_refs.load(std::memory_order_acquire) == 0 && state->lifecycle_refs == 0;
 }
 
 auto claim_idle_vfs_proxy_resource_release_locked(ProxyVfsState* state) -> bool {
@@ -1649,6 +2040,31 @@ void release_and_maybe_destroy_idle_vfs_proxy(ProxyVfsState* state) {
 
     bool release_resources = false;
     s_vfs_lock.lock();
+    release_resources = claim_idle_vfs_proxy_resource_release_locked(state);
+    if (!release_resources) {
+        erase_destroyed_idle_vfs_proxy_locked(state);
+    }
+    s_vfs_lock.unlock();
+
+    if (release_resources) {
+        release_vfs_proxy_buffers(state);
+        finish_idle_vfs_proxy_resource_release(state);
+    }
+}
+
+void release_vfs_proxy_lifecycle_ref(ProxyVfsState* state) {
+    if (state == nullptr) {
+        return;
+    }
+
+    bool release_resources = false;
+    s_vfs_lock.lock();
+    if (state->lifecycle_refs == 0) [[unlikely]] {
+        s_vfs_lock.unlock();
+        ker::mod::dbg::panic_handler("WKI remote VFS: lifecycle ref underflow");
+        hcf();
+    }
+    state->lifecycle_refs--;
     release_resources = claim_idle_vfs_proxy_resource_release_locked(state);
     if (!release_resources) {
         erase_destroyed_idle_vfs_proxy_locked(state);
@@ -1732,8 +2148,13 @@ void deactivate_vfs_proxy_locked(ProxyVfsState* state, PendingProxyTeardown& tea
     teardown.state = state;
     teardown.owner_node = state->owner_node;
     teardown.assigned_channel = state->assigned_channel;
+    teardown.assigned_channel_ref = state->assigned_channel_ref;
+    teardown.assigned_channel_generation = state->assigned_channel_generation;
     teardown.resource_id = state->resource_id;
+    teardown.binding_attach_cookie = state->binding_attach_cookie;
+    teardown.binding_incarnation = vfs_detach_incarnation_snapshot_locked(state);
     teardown.local_mount_path = state->local_mount_path;
+    state->lifecycle_refs++;
 
     state->lock.lock();
     // Publish inactivity before releasing tracked ownership or draining the
@@ -1807,8 +2228,9 @@ auto vfs_proxy_send_and_wait(ProxyVfsState* state, uint16_t op_id, const uint8_t
         return encode_proxy_wki_status(SLOT_RET);
     }
 
+    WkiChannelIdentity const CHANNEL_IDENTITY = proxy_channel_identity_locked(state);
     uint16_t expected_seq = 0;
-    if (!peek_channel_tx_seq16(state->owner_node, state->assigned_channel, &expected_seq)) {
+    if (!peek_channel_tx_seq16(CHANNEL_IDENTITY, &expected_seq)) {
         unlock_proxy_slot_and_wake_next(state);
         delete[] req_buf;
         return -EIO;
@@ -1844,7 +2266,7 @@ auto vfs_proxy_send_and_wait(ProxyVfsState* state, uint16_t op_id, const uint8_t
                                      ker::mod::perf::WkiPerfPhase::BEGIN, state->owner_node, state->assigned_channel, CORRELATION, 0,
                                      req_data_len, CALLSITE);
 
-    int const SEND_RET = wki_send(state->owner_node, state->assigned_channel, MsgType::DEV_OP_REQ, req_buf, req_total);
+    int const SEND_RET = wki_send_on_channel_identity(CHANNEL_IDENTITY, MsgType::DEV_OP_REQ, req_buf, req_total);
     delete[] req_buf;
 
     if (SEND_RET != WKI_OK) {
@@ -1946,8 +2368,9 @@ auto vfs_proxy_send_untracked(ProxyVfsState* state, uint16_t op_id, const uint8_
         return normalize_proxy_status_for_errno(encode_proxy_wki_status(SLOT_RET));
     }
 
+    WkiChannelIdentity const CHANNEL_IDENTITY = proxy_channel_identity_locked(state);
     uint16_t expected_seq = 0;
-    if (!peek_channel_tx_seq16(state->owner_node, state->assigned_channel, &expected_seq)) {
+    if (!peek_channel_tx_seq16(CHANNEL_IDENTITY, &expected_seq)) {
         state->op_untracked_send_pending.store(false, std::memory_order_release);
         unlock_proxy_slot_and_wake_next(state);
         delete[] req_buf;
@@ -1961,7 +2384,7 @@ auto vfs_proxy_send_untracked(ProxyVfsState* state, uint16_t op_id, const uint8_
                                      ker::mod::perf::WkiPerfPhase::BEGIN, state->owner_node, state->assigned_channel, CORRELATION, 0,
                                      req_data_len, CALLSITE);
 
-    int const SEND_RET = wki_send(state->owner_node, state->assigned_channel, MsgType::DEV_OP_REQ, req_buf, req_total);
+    int const SEND_RET = wki_send_on_channel_identity(CHANNEL_IDENTITY, MsgType::DEV_OP_REQ, req_buf, req_total);
     delete[] req_buf;
 
     state->lock.lock();
@@ -2005,8 +2428,9 @@ auto vfs_proxy_write_rdma_and_wait(ProxyVfsState* state, int32_t remote_fd, int6
         return normalize_proxy_status_for_errno(encode_proxy_wki_status(SLOT_RET));
     }
 
+    WkiChannelIdentity const CHANNEL_IDENTITY = proxy_channel_identity_locked(state);
     uint16_t expected_seq = 0;
-    if (!peek_channel_tx_seq16(state->owner_node, state->assigned_channel, &expected_seq)) {
+    if (!peek_channel_tx_seq16(CHANNEL_IDENTITY, &expected_seq)) {
         unlock_proxy_slot_and_wake_next(state);
         return -EIO;
     }
@@ -2073,7 +2497,7 @@ auto vfs_proxy_write_rdma_and_wait(ProxyVfsState* state, int32_t remote_fd, int6
         }
     }
 
-    int const SEND_RET = wki_send(state->owner_node, state->assigned_channel, MsgType::DEV_OP_REQ, req_buf, req_total);
+    int const SEND_RET = wki_send_on_channel_identity(CHANNEL_IDENTITY, MsgType::DEV_OP_REQ, req_buf, req_total);
     delete[] req_buf;
     if (SEND_RET != WKI_OK) {
         cancel_proxy_op_wait(state, wait, OP_GENERATION, SEND_RET);
@@ -3556,16 +3980,55 @@ void wki_remote_vfs_init() {
 
 namespace {
 
-auto wki_remote_vfs_export_add_internal(const char* export_path, const char* name, uint32_t preferred_resource_id) -> uint32_t {
-    if (export_path == nullptr || name == nullptr) {
+auto export_path_belongs_to_mount(const char* export_path, const char* mount_path) -> bool {
+    if (export_path == nullptr || mount_path == nullptr || export_path[0] != '/') {
+        return false;
+    }
+    size_t const MOUNT_LEN = std::strlen(mount_path);
+    if (MOUNT_LEN == 0 || std::strncmp(export_path, mount_path, MOUNT_LEN) != 0) {
+        return false;
+    }
+    return (MOUNT_LEN == 1 && mount_path[0] == '/') || export_path[MOUNT_LEN] == '\0' || export_path[MOUNT_LEN] == '/';
+}
+
+auto snapshot_export_backing_identity(const char* export_path) -> ExportBackingIdentity {
+    ExportBackingIdentity backing = {};
+    size_t best_path_len = 0;
+    size_t const MOUNT_COUNT = ker::vfs::get_mount_count();
+    for (size_t i = 0; i < MOUNT_COUNT; ++i) {
+        ker::vfs::MountSnapshot snapshot = {};
+        if (!ker::vfs::get_mount_snapshot_at(i, &snapshot) || snapshot.dev_id == 0) {
+            continue;
+        }
+        const char* const MOUNT_PATH = static_cast<const char*>(snapshot.path);
+        if (!export_path_belongs_to_mount(export_path, MOUNT_PATH)) {
+            continue;
+        }
+        size_t const PATH_LEN = std::strlen(MOUNT_PATH);
+        if (backing.dev_id == 0 || PATH_LEN > best_path_len) {
+            backing = {.dev_id = snapshot.dev_id, .fs_type = snapshot.fs_type};
+            best_path_len = PATH_LEN;
+        }
+    }
+    return backing;
+}
+
+auto wki_remote_vfs_export_add_internal(const char* export_path, const char* name, PreservedExportIdentity preferred_identity,
+                                        const ExportBackingIdentity& backing) -> uint32_t {
+    if (export_path == nullptr || name == nullptr || backing.dev_id == 0) {
         return 0;
     }
 
     s_vfs_lock.lock();
+    if (g_vfs_export_rebuild_prepared && !g_vfs_export_rebuild_accepting_entries) {
+        s_vfs_lock.unlock();
+        return 0;
+    }
 
     // Check if this path is already exported (prevent duplicates)
     for (const auto& existing : g_vfs_exports) {
-        if (existing.active && strcmp(raw_data(existing.export_path), export_path) == 0) {
+        if (existing.active && strcmp(raw_data(existing.export_path), export_path) == 0 &&
+            export_backing_identity_matches(existing, backing)) {
             // Already exported - return existing resource_id
             uint32_t const EXISTING_ID = existing.resource_id;
             s_vfs_lock.unlock();
@@ -3573,16 +4036,37 @@ auto wki_remote_vfs_export_add_internal(const char* export_path, const char* nam
         }
     }
 
+    bool const STANDALONE_MUTATION = !g_vfs_export_rebuild_prepared;
+    if ((STANDALONE_MUTATION && ((g_vfs_export_revision & 1U) != 0 || g_vfs_export_revision > UINT64_MAX - 2)) ||
+        (!STANDALONE_MUTATION && g_vfs_export_target_revision == 0)) {
+        s_vfs_lock.unlock();
+        return 0;
+    }
+    uint64_t const TARGET_REVISION = STANDALONE_MUTATION ? g_vfs_export_revision + 2 : g_vfs_export_target_revision;
+    if (STANDALONE_MUTATION) {
+        g_vfs_export_revision++;
+    }
+
     VfsExport exp;
-    exp.active = true;
-    if (preferred_resource_id != 0) {
-        exp.resource_id = preferred_resource_id;
-        if (g_next_vfs_resource_id <= preferred_resource_id) {
-            g_next_vfs_resource_id = preferred_resource_id + 1;
+    if (preferred_identity.resource_id != 0) {
+        exp.resource_id = preferred_identity.resource_id;
+        if (g_next_vfs_resource_id <= preferred_identity.resource_id) {
+            g_next_vfs_resource_id = preferred_identity.resource_id + 1;
         }
     } else {
         exp.resource_id = g_next_vfs_resource_id++;
     }
+    if (preferred_identity.resource_incarnation != 0) {
+        exp.resource_incarnation = preferred_identity.resource_incarnation;
+    } else {
+        exp.resource_incarnation = g_next_vfs_resource_incarnation++;
+        if (exp.resource_incarnation == 0) {
+            exp.resource_incarnation = g_next_vfs_resource_incarnation++;
+        }
+    }
+    exp.publication_revision = TARGET_REVISION;
+    exp.backing_dev_id = backing.dev_id;
+    exp.backing_fs_type = backing.fs_type;
 
     size_t path_len = strlen(export_path);
     if (path_len >= VFS_EXPORT_PATH_LEN) {
@@ -3598,7 +4082,14 @@ auto wki_remote_vfs_export_add_internal(const char* export_path, const char* nam
     memcpy(static_cast<void*>(raw_data(exp.name)), name, name_len);
     exp.name[name_len] = '\0';
 
+    exp.active = true;
     g_vfs_exports.push_back(exp);
+    if (STANDALONE_MUTATION) {
+        for (auto& published : g_vfs_exports) {
+            published.publication_revision = TARGET_REVISION;
+        }
+        g_vfs_export_revision = TARGET_REVISION;
+    }
     uint32_t const RESULT_ID = exp.resource_id;
     s_vfs_lock.unlock();
 
@@ -3609,7 +4100,11 @@ auto wki_remote_vfs_export_add_internal(const char* export_path, const char* nam
 }  // namespace
 
 auto wki_remote_vfs_export_add(const char* export_path, const char* name) -> uint32_t {
-    return wki_remote_vfs_export_add_internal(export_path, name, 0);
+    ExportBackingIdentity const BACKING = snapshot_export_backing_identity(export_path);
+    if (BACKING.dev_id == 0) {
+        return 0;
+    }
+    return wki_remote_vfs_export_add_internal(export_path, name, {}, BACKING);
 }
 
 auto wki_remote_vfs_find_export_snapshot(uint32_t resource_id, VfsExport* out) -> bool {
@@ -3618,8 +4113,13 @@ auto wki_remote_vfs_find_export_snapshot(uint32_t resource_id, VfsExport* out) -
     }
 
     s_vfs_lock.lock();
+    uint64_t const REVISION = g_vfs_export_revision;
+    if ((REVISION & 1U) != 0) {
+        s_vfs_lock.unlock();
+        return false;
+    }
     for (const auto& exp : g_vfs_exports) {
-        if (exp.active && exp.resource_id == resource_id) {
+        if (exp.active && exp.resource_id == resource_id && exp.publication_revision == REVISION) {
             *out = exp;
             s_vfs_lock.unlock();
             return true;
@@ -3629,39 +4129,77 @@ auto wki_remote_vfs_find_export_snapshot(uint32_t resource_id, VfsExport* out) -
     return false;
 }
 
+auto wki_remote_vfs_export_snapshot_is_current(const VfsExport& expected) -> bool {
+    if (!expected.active || expected.resource_id == 0 || expected.resource_incarnation == 0 || expected.publication_revision == 0 ||
+        expected.backing_dev_id == 0) {
+        return false;
+    }
+
+    s_vfs_lock.lock();
+    uint64_t const REVISION = g_vfs_export_revision;
+    bool current = (REVISION & 1U) == 0 && REVISION == expected.publication_revision;
+    if (current) {
+        current = false;
+        for (const auto& exp : g_vfs_exports) {
+            if (exp.active && exp.publication_revision == REVISION && exp.resource_id == expected.resource_id &&
+                exp.resource_incarnation == expected.resource_incarnation && exp.backing_dev_id == expected.backing_dev_id &&
+                exp.backing_fs_type == expected.backing_fs_type &&
+                std::strncmp(raw_data(exp.export_path), raw_data(expected.export_path), VFS_EXPORT_PATH_LEN) == 0 &&
+                std::strncmp(raw_data(exp.name), raw_data(expected.name), VFS_EXPORT_NAME_LEN) == 0) {
+                current = true;
+                break;
+            }
+        }
+    }
+    s_vfs_lock.unlock();
+    return current;
+}
+
 namespace {
 
 void advertise_exports_to_peer(uint16_t peer_node) {
     s_vfs_lock.lock();
+    uint64_t const PUBLICATION_REVISION = g_vfs_export_revision;
+    if ((PUBLICATION_REVISION & 1U) != 0) {
+        s_vfs_lock.unlock();
+        return;
+    }
     size_t const EXPORT_COUNT = g_vfs_exports.size();
     s_vfs_lock.unlock();
 
     for (size_t idx = 0; idx < EXPORT_COUNT; idx++) {
         s_vfs_lock.lock();
-        if (idx >= g_vfs_exports.size()) {
+        if (g_vfs_export_revision != PUBLICATION_REVISION || idx >= g_vfs_exports.size()) {
             s_vfs_lock.unlock();
-            break;
+            return;
         }
-        auto& exp = *std::next(g_vfs_exports.begin(), static_cast<ptrdiff_t>(idx));
-        if (!exp.active) {
-            s_vfs_lock.unlock();
+        VfsExport const EXP = *std::next(g_vfs_exports.begin(), static_cast<ptrdiff_t>(idx));
+        s_vfs_lock.unlock();
+        if (!EXP.active || EXP.publication_revision != PUBLICATION_REVISION) {
             continue;
         }
 
-        // Build ResourceAdvertPayload + name under lock
-        auto const NAME_LEN = static_cast<uint8_t>(std::min<size_t>(std::strlen(raw_data(exp.name)), 63U));
+        auto const NAME_LEN = static_cast<uint8_t>(std::min<size_t>(std::strlen(raw_data(EXP.name)), 63U));
 
-        auto total_len = static_cast<uint16_t>(sizeof(ResourceAdvertPayload) + NAME_LEN);
-        std::array<uint8_t, sizeof(ResourceAdvertPayload) + 64> buf{};
+        bool const WITH_INCARNATION = wki_resource_incarnation_negotiated(peer_node, ResourceType::VFS);
+        auto total_len =
+            static_cast<uint16_t>(sizeof(ResourceAdvertPayload) + NAME_LEN + (WITH_INCARNATION ? sizeof(ResourceIncarnationToken) : 0));
+        std::array<uint8_t, sizeof(ResourceAdvertPayload) + 64 + sizeof(ResourceIncarnationToken)> buf{};
 
         auto* adv = reinterpret_cast<ResourceAdvertPayload*>(buf.data());
         adv->node_id = g_wki.my_node_id;
         adv->resource_type = static_cast<uint16_t>(ResourceType::VFS);
-        adv->resource_id = exp.resource_id;
+        adv->resource_id = EXP.resource_id;
         adv->flags = 0;
         adv->name_len = NAME_LEN;
-        memcpy(buf.data() + sizeof(ResourceAdvertPayload), static_cast<const void*>(raw_data(exp.name)), NAME_LEN);
-        s_vfs_lock.unlock();
+        memcpy(buf.data() + sizeof(ResourceAdvertPayload), static_cast<const void*>(raw_data(EXP.name)), NAME_LEN);
+        if (WITH_INCARNATION) {
+            ResourceIncarnationToken const TOKEN = {
+                .owner_boot_epoch = g_wki.local_boot_epoch,
+                .resource_incarnation = EXP.resource_incarnation,
+            };
+            memcpy(buf.data() + sizeof(ResourceAdvertPayload) + NAME_LEN, &TOKEN, sizeof(TOKEN));
+        }
 
         wki_send(peer_node, WKI_CHAN_CONTROL, MsgType::RESOURCE_ADVERT, buf.data(), total_len);
     }
@@ -3703,8 +4241,16 @@ void wki_remote_vfs_advertise_exports() {
 namespace detail {
 
 // NOLINTNEXTLINE(readability-function-size): Protocol opcode dispatcher.
-void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export_path, const char* export_name, uint16_t op_id,
-                   const uint8_t* data, uint16_t data_len) {
+void handle_vfs_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_identity, const char* export_path, const char* export_name,
+                   uint16_t op_id, const uint8_t* data, uint16_t data_len) {
+    if (!vfs_channel_identity_matches_header(hdr, channel_identity) || export_path == nullptr || export_name == nullptr) {
+        return;
+    }
+
+    // This rejects work already associated with a retired local generation.
+    // Legacy DEV_OP_REQ has no binding nonce, so a frame delayed until after
+    // numeric channel re-reservation is still indistinguishable on the wire.
+    uint16_t const channel_id = channel_identity.channel_id;
     const auto REQ_COOKIE = static_cast<uint16_t>(hdr->seq_num & UINT16_MAX);
     uint32_t const CORRELATION = REQ_COOKIE;
     uint64_t const CALLSITE = WOS_PERF_CALLSITE();
@@ -3716,7 +4262,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
         resp.reserved = REQ_COOKIE;
         perf_record_vfs_server_point(static_cast<uint8_t>(ker::mod::perf::WkiPerfVfsServerOp::REPLY_SEND), hdr->src_node, channel_id,
                                      CORRELATION, resp.status, sizeof(resp), CALLSITE);
-        wki_send(hdr->src_node, channel_id, MsgType::DEV_OP_RESP, &resp, sizeof(resp));
+        static_cast<void>(wki_send_on_channel_identity(channel_identity, MsgType::DEV_OP_RESP, &resp, sizeof(resp)));
     };
     auto send_buffered_resp = [&](void* resp_buf, uint16_t resp_len) {
         if (resp_buf != nullptr && resp_len >= sizeof(DevOpRespPayload)) {
@@ -3725,7 +4271,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
             perf_record_vfs_server_point(static_cast<uint8_t>(ker::mod::perf::WkiPerfVfsServerOp::REPLY_SEND), hdr->src_node, channel_id,
                                          CORRELATION, resp->status, resp_len, CALLSITE);
         }
-        wki_send(hdr->src_node, channel_id, MsgType::DEV_OP_RESP, resp_buf, resp_len);
+        static_cast<void>(wki_send_on_channel_identity(channel_identity, MsgType::DEV_OP_RESP, resp_buf, resp_len));
     };
 
     switch (op_id) {
@@ -3737,7 +4283,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
                 resp.status = -1;
                 resp.data_len = 0;
                 resp.reserved = REQ_COOKIE;
-                wki_send(hdr->src_node, channel_id, MsgType::DEV_OP_RESP, &resp, sizeof(resp));
+                static_cast<void>(wki_send_on_channel_identity(channel_identity, MsgType::DEV_OP_RESP, &resp, sizeof(resp)));
                 break;
             }
 
@@ -3755,7 +4301,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
                 resp.status = -1;
                 resp.data_len = 0;
                 resp.reserved = REQ_COOKIE;
-                wki_send(hdr->src_node, channel_id, MsgType::DEV_OP_RESP, &resp, sizeof(resp));
+                static_cast<void>(wki_send_on_channel_identity(channel_identity, MsgType::DEV_OP_RESP, &resp, sizeof(resp)));
                 break;
             }
 
@@ -3781,7 +4327,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
                 resp.status = -EPERM;
                 resp.data_len = 0;
                 resp.reserved = REQ_COOKIE;
-                wki_send(hdr->src_node, channel_id, MsgType::DEV_OP_RESP, &resp, sizeof(resp));
+                static_cast<void>(wki_send_on_channel_identity(channel_identity, MsgType::DEV_OP_RESP, &resp, sizeof(resp)));
                 break;
             }
 
@@ -3798,7 +4344,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
                 resp.status = -1;
                 resp.data_len = 0;
                 resp.reserved = REQ_COOKIE;
-                wki_send(hdr->src_node, channel_id, MsgType::DEV_OP_RESP, &resp, sizeof(resp));
+                static_cast<void>(wki_send_on_channel_identity(channel_identity, MsgType::DEV_OP_RESP, &resp, sizeof(resp)));
                 break;
             }
 
@@ -3820,7 +4366,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
                     // VFS ops for one binding/channel are worker-serialized, so
                     // the per-binding bulk staging region is safe temporary
                     // scratch for open-prefetch before we send the response.
-                    uint8_t* prefetch_buf = wki_dev_server_get_vfs_bulk_staging_buf(hdr->src_node, channel_id);
+                    uint8_t* prefetch_buf = wki_dev_server_get_vfs_bulk_staging_buf(channel_identity);
                     if (prefetch_buf == nullptr) {
                         allocated_prefetch_buf = new (std::nothrow) uint8_t[prefetch_len];
                         prefetch_buf = allocated_prefetch_buf;
@@ -3852,7 +4398,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
             // Publish the opened file only after all metadata and prefetch work
             // is complete. Peer cleanup can detach and delete published files.
             s_vfs_lock.lock();
-            int32_t fd_id = alloc_remote_fd(hdr->src_node, channel_id, file);
+            int32_t fd_id = alloc_remote_fd(channel_identity, file);
             s_vfs_lock.unlock();
             open_resp.fd = fd_id;
 
@@ -3871,18 +4417,22 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
             perf_record_vfs_server_point(static_cast<uint8_t>(ker::mod::perf::WkiPerfVfsServerOp::REPLY_SEND), hdr->src_node, channel_id,
                                          CORRELATION, 0, static_cast<uint16_t>(sizeof(DevOpRespPayload) + OPEN_DATA_LEN), CALLSITE);
 
-            int const SEND_RET = wki_send(hdr->src_node, channel_id, MsgType::DEV_OP_RESP, resp_buf.data(),
-                                          static_cast<uint16_t>(sizeof(DevOpRespPayload) + OPEN_DATA_LEN));
+            int const SEND_RET = wki_send_on_channel_identity(channel_identity, MsgType::DEV_OP_RESP, resp_buf.data(),
+                                                              static_cast<uint16_t>(sizeof(DevOpRespPayload) + OPEN_DATA_LEN));
             if (SEND_RET != WKI_OK) {
                 ker::vfs::File* orphan = nullptr;
                 s_vfs_lock.lock();
-                RemoteVfsFd* rfd = find_remote_fd(hdr->src_node, channel_id, fd_id);
+                RemoteVfsFd* rfd = find_remote_fd(channel_identity, fd_id);
                 if (rfd != nullptr && rfd->file == file) {
                     orphan = rfd->file;
                     rfd->file = nullptr;
+                    rfd->retiring = true;
                     rfd->active = false;
                 }
-                std::erase_if(g_remote_fds, [](const RemoteVfsFd& entry) { return !entry.active; });
+                std::erase_if(g_remote_fds, [&channel_identity, fd_id](const RemoteVfsFd& entry) {
+                    return entry.fd_id == fd_id && entry.retiring && entry.file == nullptr &&
+                           vfs_channel_identity_matches(entry.channel_identity, channel_identity);
+                });
                 s_vfs_lock.unlock();
 
                 if (orphan != nullptr) {
@@ -3910,7 +4460,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
                 resp.status = -EINVAL;
                 resp.data_len = 0;
                 resp.reserved = REQ_COOKIE;
-                wki_send(hdr->src_node, channel_id, MsgType::DEV_OP_RESP, &resp, sizeof(resp));
+                static_cast<void>(wki_send_on_channel_identity(channel_identity, MsgType::DEV_OP_RESP, &resp, sizeof(resp)));
                 break;
             }
 
@@ -3922,7 +4472,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
             memcpy(&offset, data + 8, sizeof(int64_t));
 
             s_vfs_lock.lock();
-            RemoteVfsFd* rfd = find_remote_fd(hdr->src_node, channel_id, fd_id);
+            RemoteVfsFd* rfd = find_remote_fd(channel_identity, fd_id);
             if (rfd == nullptr || rfd->file == nullptr || rfd->file->fops == nullptr || rfd->file->fops->vfs_read == nullptr) {
                 s_vfs_lock.unlock();
                 DevOpRespPayload resp = {};
@@ -3930,7 +4480,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
                 resp.status = -EBADF;
                 resp.data_len = 0;
                 resp.reserved = REQ_COOKIE;
-                wki_send(hdr->src_node, channel_id, MsgType::DEV_OP_RESP, &resp, sizeof(resp));
+                static_cast<void>(wki_send_on_channel_identity(channel_identity, MsgType::DEV_OP_RESP, &resp, sizeof(resp)));
                 break;
             }
             touch_remote_fd(rfd);
@@ -3949,7 +4499,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
                 resp.status = -ENOMEM;
                 resp.data_len = 0;
                 resp.reserved = REQ_COOKIE;
-                wki_send(hdr->src_node, channel_id, MsgType::DEV_OP_RESP, &resp, sizeof(resp));
+                static_cast<void>(wki_send_on_channel_identity(channel_identity, MsgType::DEV_OP_RESP, &resp, sizeof(resp)));
                 break;
             }
 
@@ -4011,7 +4561,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
                                                        : static_cast<uint16_t>(sizeof(DevOpRespPayload));
             perf_record_vfs_server_point(static_cast<uint8_t>(ker::mod::perf::WkiPerfVfsServerOp::REPLY_SEND), hdr->src_node, channel_id,
                                          CORRELATION, resp->status, SEND_LEN, CALLSITE);
-            wki_send(hdr->src_node, channel_id, MsgType::DEV_OP_RESP, resp_buf, SEND_LEN);
+            static_cast<void>(wki_send_on_channel_identity(channel_identity, MsgType::DEV_OP_RESP, resp_buf, SEND_LEN));
             delete[] resp_buf;
             break;
         }
@@ -4036,7 +4586,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
             auto write_len = static_cast<uint16_t>(data_len - 12);
 
             s_vfs_lock.lock();
-            RemoteVfsFd* rfd = find_remote_fd(hdr->src_node, channel_id, fd_id);
+            RemoteVfsFd* rfd = find_remote_fd(channel_identity, fd_id);
             if (rfd == nullptr || rfd->file == nullptr || rfd->file->fops == nullptr || rfd->file->fops->vfs_write == nullptr) {
                 s_vfs_lock.unlock();
                 DevOpRespPayload resp = {};
@@ -4084,7 +4634,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
             memcpy(&fd_id, data, sizeof(int32_t));
 
             s_vfs_lock.lock();
-            RemoteVfsFd* rfd = find_remote_fd(hdr->src_node, channel_id, fd_id);
+            RemoteVfsFd* rfd = find_remote_fd(channel_identity, fd_id);
             touch_remote_fd(rfd);
             ker::vfs::File* close_file = nullptr;
             perf_record_vfs_server_begin(SERVER_OP, hdr->src_node, channel_id, CORRELATION, CALLSITE);
@@ -4093,10 +4643,14 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
             if (rfd != nullptr && rfd->file != nullptr) {
                 close_file = rfd->file;
                 rfd->file = nullptr;
+                rfd->retiring = true;
                 rfd->active = false;
                 status = 0;
             }
-            std::erase_if(g_remote_fds, [](const RemoteVfsFd& r) { return !r.active; });
+            std::erase_if(g_remote_fds, [&channel_identity, fd_id](const RemoteVfsFd& entry) {
+                return entry.fd_id == fd_id && entry.retiring && entry.file == nullptr &&
+                       vfs_channel_identity_matches(entry.channel_identity, channel_identity);
+            });
             s_vfs_lock.unlock();
 
             if (close_file != nullptr) {
@@ -4133,7 +4687,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
             memcpy(&index, data + 4, sizeof(uint32_t));
 
             s_vfs_lock.lock();
-            RemoteVfsFd* rfd = find_remote_fd(hdr->src_node, channel_id, fd_id);
+            RemoteVfsFd* rfd = find_remote_fd(channel_identity, fd_id);
             if (rfd == nullptr || rfd->file == nullptr || rfd->file->fops == nullptr || rfd->file->fops->vfs_readdir == nullptr) {
                 s_vfs_lock.unlock();
                 DevOpRespPayload resp = {};
@@ -4204,7 +4758,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
             }
 
             s_vfs_lock.lock();
-            RemoteVfsFd* rfd = find_remote_fd(hdr->src_node, channel_id, fd_id);
+            RemoteVfsFd* rfd = find_remote_fd(channel_identity, fd_id);
             if (rfd == nullptr || rfd->file == nullptr || rfd->file->fops == nullptr || rfd->file->fops->vfs_readdir == nullptr) {
                 s_vfs_lock.unlock();
                 DevOpRespPayload resp = {};
@@ -4394,7 +4948,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
                 resp.status = -1;
                 resp.data_len = 0;
                 resp.reserved = REQ_COOKIE;
-                wki_send(hdr->src_node, channel_id, MsgType::DEV_OP_RESP, &resp, sizeof(resp));
+                static_cast<void>(wki_send_on_channel_identity(channel_identity, MsgType::DEV_OP_RESP, &resp, sizeof(resp)));
                 break;
             }
 
@@ -4407,7 +4961,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
                 resp.status = -1;
                 resp.data_len = 0;
                 resp.reserved = REQ_COOKIE;
-                wki_send(hdr->src_node, channel_id, MsgType::DEV_OP_RESP, &resp, sizeof(resp));
+                static_cast<void>(wki_send_on_channel_identity(channel_identity, MsgType::DEV_OP_RESP, &resp, sizeof(resp)));
                 break;
             }
 
@@ -4423,7 +4977,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
                 resp.status = -EPERM;
                 resp.data_len = 0;
                 resp.reserved = REQ_COOKIE;
-                wki_send(hdr->src_node, channel_id, MsgType::DEV_OP_RESP, &resp, sizeof(resp));
+                static_cast<void>(wki_send_on_channel_identity(channel_identity, MsgType::DEV_OP_RESP, &resp, sizeof(resp)));
                 break;
             }
 
@@ -4442,7 +4996,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
                 resp.status = static_cast<int16_t>(TARGET_LEN);
                 resp.data_len = 0;
                 resp.reserved = REQ_COOKIE;
-                wki_send(hdr->src_node, channel_id, MsgType::DEV_OP_RESP, &resp, sizeof(resp));
+                static_cast<void>(wki_send_on_channel_identity(channel_identity, MsgType::DEV_OP_RESP, &resp, sizeof(resp)));
             } else {
                 // Response: {target_len:u16, target[]}
                 auto resp_data_len = static_cast<uint16_t>(2 + TARGET_LEN);
@@ -4454,7 +5008,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
                     resp.status = -1;
                     resp.data_len = 0;
                     resp.reserved = REQ_COOKIE;
-                    wki_send(hdr->src_node, channel_id, MsgType::DEV_OP_RESP, &resp, sizeof(resp));
+                    static_cast<void>(wki_send_on_channel_identity(channel_identity, MsgType::DEV_OP_RESP, &resp, sizeof(resp)));
                     break;
                 }
 
@@ -4470,7 +5024,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
 
                 perf_record_vfs_server_point(static_cast<uint8_t>(ker::mod::perf::WkiPerfVfsServerOp::REPLY_SEND), hdr->src_node,
                                              channel_id, CORRELATION, 0, resp_total, CALLSITE);
-                wki_send(hdr->src_node, channel_id, MsgType::DEV_OP_RESP, resp_buf, resp_total);
+                static_cast<void>(wki_send_on_channel_identity(channel_identity, MsgType::DEV_OP_RESP, resp_buf, resp_total));
                 delete[] resp_buf;
             }
             break;
@@ -4711,7 +5265,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
             memcpy(&fd_id, data, sizeof(int32_t));
 
             s_vfs_lock.lock();
-            RemoteVfsFd* rfd = find_remote_fd(hdr->src_node, channel_id, fd_id);
+            RemoteVfsFd* rfd = find_remote_fd(channel_identity, fd_id);
             ker::vfs::File* local_file = nullptr;
             int ret = -1;
             if (rfd != nullptr && rfd->file != nullptr) {
@@ -4749,7 +5303,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
             memcpy(&length, data + 4, sizeof(int64_t));
 
             s_vfs_lock.lock();
-            RemoteVfsFd* rfd = find_remote_fd(hdr->src_node, channel_id, fd_id);
+            RemoteVfsFd* rfd = find_remote_fd(channel_identity, fd_id);
             ker::vfs::File* local_file = nullptr;
             int ret = -1;
             if (rfd != nullptr && rfd->file != nullptr && rfd->file->fops != nullptr && rfd->file->fops->vfs_truncate != nullptr) {
@@ -4783,7 +5337,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
                 resp.status = -1;
                 resp.data_len = 0;
                 resp.reserved = REQ_COOKIE;
-                wki_send(hdr->src_node, channel_id, MsgType::DEV_OP_RESP, &resp, sizeof(resp));
+                static_cast<void>(wki_send_on_channel_identity(channel_identity, MsgType::DEV_OP_RESP, &resp, sizeof(resp)));
                 break;
             }
 
@@ -4793,7 +5347,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
             memcpy(&offset, data + 4, sizeof(int64_t));
 
             s_vfs_lock.lock();
-            RemoteVfsFd* rfd = find_remote_fd(hdr->src_node, channel_id, fd_id);
+            RemoteVfsFd* rfd = find_remote_fd(channel_identity, fd_id);
             int64_t new_pos = -1;
             int ret = -1;
             ker::vfs::File* local_file = nullptr;
@@ -4834,7 +5388,8 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
             resp->data_len = 8;
             resp->reserved = REQ_COOKIE;
             memcpy(resp_buf.data() + sizeof(DevOpRespPayload), &new_pos, sizeof(int64_t));
-            wki_send(hdr->src_node, channel_id, MsgType::DEV_OP_RESP, resp_buf.data(), static_cast<uint16_t>(sizeof(DevOpRespPayload) + 8));
+            static_cast<void>(wki_send_on_channel_identity(channel_identity, MsgType::DEV_OP_RESP, resp_buf.data(),
+                                                           static_cast<uint16_t>(sizeof(DevOpRespPayload) + 8)));
             break;
         }
 
@@ -4849,7 +5404,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
                 resp.status = status;
                 resp.data_len = 0;
                 resp.reserved = REQ_COOKIE;
-                wki_send(hdr->src_node, channel_id, MsgType::DEV_OP_RESP, &resp, sizeof(resp));
+                static_cast<void>(wki_send_on_channel_identity(channel_identity, MsgType::DEV_OP_RESP, &resp, sizeof(resp)));
             };
 
             if (data_len < 20) {
@@ -4872,7 +5427,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
             // pull path where the server stages data and the client rdma_reads
             // it; nonzero asks the server to push into the consumer region.
             bool const PULL_MODE = consumer_rkey == 0;
-            uint8_t* read_staging = PULL_MODE ? wki_dev_server_get_vfs_read_staging_buf(hdr->src_node, channel_id) : nullptr;
+            uint8_t* read_staging = PULL_MODE ? wki_dev_server_get_vfs_read_staging_buf(channel_identity) : nullptr;
             WkiPeer const* rdma_peer = nullptr;
             if (PULL_MODE && read_staging == nullptr) {
                 send_rdma_read_err(-EIO);
@@ -4888,7 +5443,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
             }
 
             s_vfs_lock.lock();
-            RemoteVfsFd* rfd = find_remote_fd(hdr->src_node, channel_id, fd_id);
+            RemoteVfsFd* rfd = find_remote_fd(channel_identity, fd_id);
             if (rfd == nullptr || rfd->file == nullptr || rfd->file->fops == nullptr || rfd->file->fops->vfs_read == nullptr) {
                 s_vfs_lock.unlock();
                 send_rdma_read_err(-EBADF);
@@ -4935,7 +5490,8 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
             resp->data_len = 4;
             resp->reserved = REQ_COOKIE;
             memcpy(resp_buf.data() + sizeof(DevOpRespPayload), &br, sizeof(uint32_t));
-            wki_send(hdr->src_node, channel_id, MsgType::DEV_OP_RESP, resp_buf.data(), static_cast<uint16_t>(resp_buf.size()));
+            static_cast<void>(wki_send_on_channel_identity(channel_identity, MsgType::DEV_OP_RESP, resp_buf.data(),
+                                                           static_cast<uint16_t>(resp_buf.size())));
             break;
         }
 
@@ -4951,7 +5507,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
                 resp.status = status;
                 resp.data_len = 0;
                 resp.reserved = REQ_COOKIE;
-                wki_send(hdr->src_node, channel_id, MsgType::DEV_OP_RESP, &resp, sizeof(resp));
+                static_cast<void>(wki_send_on_channel_identity(channel_identity, MsgType::DEV_OP_RESP, &resp, sizeof(resp)));
             };
 
             if (data_len < 20) {
@@ -4976,7 +5532,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
             // pull path where the server stages data and the client rdma_reads
             // it; nonzero asks the server to push into the consumer region.
             bool const PULL_MODE = consumer_rkey == 0;
-            uint8_t* bulk_staging = PULL_MODE ? wki_dev_server_get_vfs_bulk_staging_buf(hdr->src_node, channel_id) : nullptr;
+            uint8_t* bulk_staging = PULL_MODE ? wki_dev_server_get_vfs_bulk_staging_buf(channel_identity) : nullptr;
             WkiPeer const* bulk_peer = nullptr;
             if (bulk_staging != nullptr) {
                 len = std::min<uint32_t>(len, VFS_RDMA_ROCE_BULK_SIZE);
@@ -4994,7 +5550,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
             }
 
             s_vfs_lock.lock();
-            RemoteVfsFd* rfd = find_remote_fd(hdr->src_node, channel_id, fd_id);
+            RemoteVfsFd* rfd = find_remote_fd(channel_identity, fd_id);
             if (rfd == nullptr || rfd->file == nullptr || rfd->file->fops == nullptr || rfd->file->fops->vfs_read == nullptr) {
                 s_vfs_lock.unlock();
                 send_bulk_read_err(-EBADF);
@@ -5040,7 +5596,8 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
             bulk_resp->data_len = 4;
             bulk_resp->reserved = REQ_COOKIE;
             memcpy(bulk_resp_buf.data() + sizeof(DevOpRespPayload), &br, sizeof(uint32_t));
-            wki_send(hdr->src_node, channel_id, MsgType::DEV_OP_RESP, bulk_resp_buf.data(), static_cast<uint16_t>(bulk_resp_buf.size()));
+            static_cast<void>(wki_send_on_channel_identity(channel_identity, MsgType::DEV_OP_RESP, bulk_resp_buf.data(),
+                                                           static_cast<uint16_t>(bulk_resp_buf.size())));
             break;
         }
 
@@ -5058,7 +5615,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
                 resp.op_id = OP_VFS_WRITE_RDMA;
                 resp.status = status;
                 resp.data_len = 0;
-                wki_dev_server_complete_vfs_write(hdr->src_node, channel_id, REQ_COOKIE, status, 0);
+                wki_dev_server_complete_vfs_write(channel_identity, REQ_COOKIE, status, 0);
                 send_simple_resp(resp);
             };
 
@@ -5076,7 +5633,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
 
             len = std::min<uint32_t>(len, VFS_RDMA_WRITE_SIZE);
 
-            VfsWriteRegionInfo const WRITE_REGION = wki_dev_server_get_vfs_write_region(hdr->src_node, channel_id);
+            VfsWriteRegionInfo const WRITE_REGION = wki_dev_server_get_vfs_write_region(channel_identity);
             write_region_for_cleanup = WRITE_REGION;
             uint8_t const* write_src = WRITE_REGION.buf;
             if (write_src == nullptr) {
@@ -5092,7 +5649,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
             }
 
             s_vfs_lock.lock();
-            RemoteVfsFd* rfd = find_remote_fd(hdr->src_node, channel_id, fd_id);
+            RemoteVfsFd* rfd = find_remote_fd(channel_identity, fd_id);
             if (rfd == nullptr || rfd->file == nullptr || rfd->file->fops == nullptr || rfd->file->fops->vfs_write == nullptr) {
                 s_vfs_lock.unlock();
                 send_rdma_write_err(-EBADF);
@@ -5119,7 +5676,7 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
             resp->status = (BYTES_WRITTEN >= 0) ? 0 : static_cast<int16_t>(BYTES_WRITTEN);
             resp->data_len = 4;
             memcpy(resp_buf.data() + sizeof(DevOpRespPayload), &bw, sizeof(uint32_t));
-            wki_dev_server_complete_vfs_write(hdr->src_node, channel_id, REQ_COOKIE, resp->status, bw);
+            wki_dev_server_complete_vfs_write(channel_identity, REQ_COOKIE, resp->status, bw);
             send_buffered_resp(resp_buf.data(), static_cast<uint16_t>(resp_buf.size()));
             break;
         }
@@ -5141,19 +5698,39 @@ void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export
 // Consumer Side - Mount / Open / Response Handlers
 // -------------------------------------------------------------------------------
 
-auto wki_remote_vfs_mount(uint16_t owner_node, uint32_t resource_id, const char* local_mount_path) -> int {
+auto wki_remote_vfs_mount(uint16_t owner_node, uint32_t resource_id, const char* local_mount_path, uint64_t expected_resource_generation)
+    -> int {
     if (local_mount_path == nullptr) {
         return -EINVAL;
     }
 
+    uint64_t const RESOURCE_GENERATION = expected_resource_generation != 0
+                                             ? expected_resource_generation
+                                             : wki_resource_generation_snapshot(owner_node, ResourceType::VFS, resource_id);
+    ResourceIncarnationToken owner_incarnation = {};
+    if (!wki_resource_observation_snapshot(owner_node, ResourceType::VFS, resource_id, RESOURCE_GENERATION, &owner_incarnation)) {
+        return -ENOENT;
+    }
+    uint32_t const BINDING_PEER_BOOT_EPOCH = wki_resource_incarnation_valid(owner_incarnation)
+                                                 ? owner_incarnation.owner_boot_epoch
+                                                 : wki_peer_remote_boot_epoch_snapshot(owner_node);
+
     // Allocate proxy state
     uint8_t attach_cookie = 0;
     s_vfs_lock.lock();
+    if (vfs_attach_blocked_by_retiring_binding_locked(owner_node, resource_id)) {
+        s_vfs_lock.unlock();
+        return -EAGAIN;
+    }
     g_vfs_proxies.push_back(std::make_unique<ProxyVfsState>());
     auto* state = g_vfs_proxies.back().get();
 
     state->owner_node = owner_node;
     state->resource_id = resource_id;
+    state->resource_generation = RESOURCE_GENERATION;
+    state->owner_incarnation = owner_incarnation;
+    state->binding_peer_boot_epoch = BINDING_PEER_BOOT_EPOCH;
+    state->lifecycle_refs = 1;
 
     size_t path_len = strlen(local_mount_path);
     if (path_len >= VFS_EXPORT_PATH_LEN) {
@@ -5163,9 +5740,17 @@ auto wki_remote_vfs_mount(uint16_t owner_node, uint32_t resource_id, const char*
     *std::next(state->local_mount_path.begin(), static_cast<ptrdiff_t>(path_len)) = '\0';
 
     WkiWaitEntry wait = {};
-    attach_cookie = allocate_vfs_attach_cookie_locked();
+    attach_cookie = allocate_vfs_attach_cookie_locked(owner_node, resource_id, owner_incarnation);
+    if (attach_cookie == 0) {
+        s_vfs_lock.unlock();
+        discard_unpublished_proxy(state);
+        return -EBUSY;
+    }
+    state->binding_attach_cookie = attach_cookie;
     state->attach_wait_entry = &wait;
     state->attach_expected_cookie = attach_cookie;
+    state->attach_expect_incarnation = wki_resource_incarnation_negotiated(owner_node, ResourceType::VFS);
+    state->attach_expected_incarnation = owner_incarnation;
     state->attach_pending.store(true, std::memory_order_release);
     state->attach_status = 0;
     state->attach_channel = 0;
@@ -5179,32 +5764,51 @@ auto wki_remote_vfs_mount(uint16_t owner_node, uint32_t resource_id, const char*
     attach_req.attach_mode = static_cast<uint8_t>(AttachMode::PROXY);
     attach_req.attach_cookie = attach_cookie;
 
-    WkiChannel* reserved_channel = nullptr;
+    WkiChannelIdentity reserved_channel_identity{};
+    auto close_reserved_channel = [&reserved_channel_identity]() {
+        static_cast<void>(wki_channel_close_generation(reserved_channel_identity.channel, reserved_channel_identity.peer_node_id,
+                                                       reserved_channel_identity.channel_id, reserved_channel_identity.generation));
+    };
     if (wki_requester_controls_dynamic_channel(g_wki.my_node_id, owner_node)) {
         // Remote VFS RPCs are stop-and-wait. Use latency ACKs so a long server
         // write does not look like a lost control frame to the sender.
-        reserved_channel = wki_channel_alloc(owner_node, PriorityClass::LATENCY);
-        if (reserved_channel == nullptr) {
+        if (wki_channel_alloc(owner_node, PriorityClass::LATENCY, &reserved_channel_identity) == nullptr) {
             cancel_proxy_attach_wait(state, wait, -ENOMEM);
-            s_vfs_lock.lock();
-            g_vfs_proxies.pop_back();
-            s_vfs_lock.unlock();
+            discard_unpublished_proxy(state);
             return -ENOMEM;
         }
-        attach_req.requested_channel = reserved_channel->channel_id;
+        attach_req.requested_channel = reserved_channel_identity.channel_id;
     } else {
         attach_req.requested_channel = 0;
     }
 
-    int const SEND_RET = wki_send(owner_node, WKI_CHAN_RESOURCE, MsgType::DEV_ATTACH_REQ, &attach_req, sizeof(attach_req));
+    WkiChannelIdentity resource_channel_identity{};
+    if (!capture_peer_channel_identity(owner_node, WKI_CHAN_RESOURCE, &resource_channel_identity)) {
+        cancel_proxy_attach_wait(state, wait, WKI_ERR_PEER_FENCED);
+        close_reserved_channel();
+        discard_unpublished_proxy(state);
+        return WKI_ERR_PEER_FENCED;
+    }
+
+    std::array<uint8_t, sizeof(DevAttachReqPayload) + sizeof(ResourceIncarnationToken)> attach_buf{};
+    std::memcpy(attach_buf.data(), &attach_req, sizeof(attach_req));
+    uint16_t attach_len = sizeof(DevAttachReqPayload);
+    if (state->attach_expect_incarnation) {
+        if (!wki_resource_incarnation_valid(owner_incarnation)) {
+            cancel_proxy_attach_wait(state, wait, -ENOENT);
+            close_reserved_channel();
+            discard_unpublished_proxy(state);
+            return -ENOENT;
+        }
+        std::memcpy(attach_buf.data() + sizeof(DevAttachReqPayload), &owner_incarnation, sizeof(owner_incarnation));
+        attach_len = static_cast<uint16_t>(attach_len + sizeof(ResourceIncarnationToken));
+    }
+
+    int const SEND_RET = wki_send_on_channel_identity(resource_channel_identity, MsgType::DEV_ATTACH_REQ, attach_buf.data(), attach_len);
     if (SEND_RET != WKI_OK) {
         cancel_proxy_attach_wait(state, wait, SEND_RET);
-        if (reserved_channel != nullptr) {
-            wki_channel_close(reserved_channel);
-        }
-        s_vfs_lock.lock();
-        g_vfs_proxies.pop_back();
-        s_vfs_lock.unlock();
+        close_reserved_channel();
+        discard_unpublished_proxy(state);
         return SEND_RET;
     }
 
@@ -5216,17 +5820,19 @@ auto wki_remote_vfs_mount(uint16_t owner_node, uint32_t resource_id, const char*
         clear_proxy_attach_state_locked(state, static_cast<uint8_t>(DevAttachStatus::BUSY));
     }
     uint16_t const ATTACH_CHANNEL = state->attach_channel;
+    uint8_t const ATTACH_STATUS = state->attach_status;
     s_vfs_lock.unlock();
     perf_record_vfs_point(static_cast<uint8_t>(ker::mod::perf::WkiPerfVfsOp::ATTACH_WAIT), owner_node, ATTACH_CHANNEL, WAIT_RC,
                           static_cast<uint32_t>(wki_now_us() - ATTACH_STARTED_US), WOS_PERF_CALLSITE());
     if (WAIT_RC != 0) {
         cancel_proxy_attach_wait(state, wait, WAIT_RC);
-        if (reserved_channel != nullptr) {
-            wki_channel_close(reserved_channel);
-        }
-        s_vfs_lock.lock();
-        g_vfs_proxies.pop_back();
-        s_vfs_lock.unlock();
+        // SEND_RET succeeded, so retire any binding created by a delayed
+        // request/ACK before abandoning the exact local channel allocation.
+        // Stage the cookie-qualified DEV_DETACH before releasing local state;
+        // the task worker retains and retries the tuple until it is ACKed.
+        static_cast<void>(send_or_defer_vfs_detach(state, owner_node, resource_id, attach_cookie, owner_incarnation));
+        close_reserved_channel();
+        discard_unpublished_proxy(state);
         if (WAIT_RC == WKI_ERR_TIMEOUT) {
             ker::mod::dbg::log("[WKI] Remote VFS attach timeout: node=0x%04x res_id=%u", owner_node, resource_id);
         } else {
@@ -5235,56 +5841,60 @@ auto wki_remote_vfs_mount(uint16_t owner_node, uint32_t resource_id, const char*
         return WAIT_RC;
     }
 
-    if (state->attach_status != static_cast<uint8_t>(DevAttachStatus::OK)) {
-        int const ATTACH_ERRNO = dev_attach_status_to_errno(state->attach_status);
+    if (ATTACH_STATUS != static_cast<uint8_t>(DevAttachStatus::OK)) {
+        int const ATTACH_ERRNO = dev_attach_status_to_errno(ATTACH_STATUS);
         ker::mod::dbg::log("[WKI] Remote VFS attach rejected: node=0x%04x res_id=%u path=%s status=%u ret=%d", owner_node, resource_id,
-                           local_mount_path, state->attach_status, ATTACH_ERRNO);
-        if (reserved_channel != nullptr) {
-            wki_channel_close(reserved_channel);
-        }
-        s_vfs_lock.lock();
-        g_vfs_proxies.pop_back();
-        s_vfs_lock.unlock();
+                           local_mount_path, ATTACH_STATUS, ATTACH_ERRNO);
+        close_reserved_channel();
+        discard_unpublished_proxy(state);
         return ATTACH_ERRNO;
     }
 
-    if (reserved_channel != nullptr) {
-        if (state->attach_channel != reserved_channel->channel_id) {
+    if (reserved_channel_identity.channel != nullptr) {
+        if (ATTACH_CHANNEL != reserved_channel_identity.channel_id) {
             ker::mod::dbg::log("[WKI] Remote VFS attach channel mismatch: node=0x%04x res_id=%u requested=%u assigned=%u", owner_node,
-                               resource_id, reserved_channel->channel_id, state->attach_channel);
-            DevDetachPayload det = {};
-            det.target_node = owner_node;
-            det.resource_type = static_cast<uint16_t>(ResourceType::VFS);
-            det.resource_id = resource_id;
-            wki_send(owner_node, WKI_CHAN_RESOURCE, MsgType::DEV_DETACH, &det, sizeof(det));
-            wki_channel_close(reserved_channel);
-            s_vfs_lock.lock();
-            g_vfs_proxies.pop_back();
-            s_vfs_lock.unlock();
+                               resource_id, reserved_channel_identity.channel_id, ATTACH_CHANNEL);
+            static_cast<void>(send_or_defer_vfs_detach(state, owner_node, resource_id, attach_cookie, owner_incarnation));
+            close_reserved_channel();
+            discard_unpublished_proxy(state);
             return -EIO;
         }
     } else {
-        reserved_channel = wki_channel_reserve(owner_node, state->attach_channel, PriorityClass::LATENCY);
-        if (reserved_channel == nullptr) {
+        if (wki_channel_reserve(owner_node, ATTACH_CHANNEL, PriorityClass::LATENCY, &reserved_channel_identity) == nullptr) {
             ker::mod::dbg::log("[WKI] Remote VFS attach local reserve failed: node=0x%04x res_id=%u ch=%u", owner_node, resource_id,
-                               state->attach_channel);
-            DevDetachPayload det = {};
-            det.target_node = owner_node;
-            det.resource_type = static_cast<uint16_t>(ResourceType::VFS);
-            det.resource_id = resource_id;
-            wki_send(owner_node, WKI_CHAN_RESOURCE, MsgType::DEV_DETACH, &det, sizeof(det));
-            s_vfs_lock.lock();
-            g_vfs_proxies.pop_back();
-            s_vfs_lock.unlock();
+                               ATTACH_CHANNEL);
+            static_cast<void>(send_or_defer_vfs_detach(state, owner_node, resource_id, attach_cookie, owner_incarnation));
+            discard_unpublished_proxy(state);
             return -EIO;
         }
     }
 
-    s_vfs_lock.lock();
-    state->assigned_channel = reserved_channel->channel_id;
-    state->max_op_size = state->attach_max_op_size;
-    state->active = true;
-    s_vfs_lock.unlock();
+    bool assigned_channel_published = false;
+    reserved_channel_identity.channel->lock.lock();
+    if (reserved_channel_identity.channel->active &&
+        reserved_channel_identity.channel->peer_node_id == reserved_channel_identity.peer_node_id &&
+        reserved_channel_identity.channel->channel_id == reserved_channel_identity.channel_id &&
+        reserved_channel_identity.channel->generation == reserved_channel_identity.generation &&
+        reserved_channel_identity.peer_node_id == owner_node && reserved_channel_identity.channel_id == ATTACH_CHANNEL) {
+        // Publish proxy ownership while the channel lock still excludes close
+        // and reuse of this exact pool-slot generation.
+        s_vfs_lock.lock();
+        if (!state->epoch_reset_pending) {
+            state->assigned_channel = reserved_channel_identity.channel_id;
+            state->assigned_channel_ref = reserved_channel_identity.channel;
+            state->assigned_channel_generation = reserved_channel_identity.generation;
+            state->max_op_size = state->attach_max_op_size;
+            state->active = true;
+            assigned_channel_published = true;
+        }
+        s_vfs_lock.unlock();
+    }
+    reserved_channel_identity.channel->lock.unlock();
+    if (!assigned_channel_published) {
+        static_cast<void>(send_or_defer_vfs_detach(state, owner_node, resource_id, attach_cookie, owner_incarnation));
+        discard_unpublished_proxy(state);
+        return -EIO;
+    }
 
     // RDMA setup: bind the peer transport once, then enable read, write, and
     // bulk capabilities independently. Remote-root reads must not depend on the
@@ -5353,53 +5963,116 @@ auto wki_remote_vfs_mount(uint16_t owner_node, uint32_t resource_id, const char*
     }
 
     // Create the mount point with "remote" fstype
-    int const MOUNT_RET = ker::vfs::mount_filesystem(local_mount_path, "remote", nullptr);
+    int const MOUNT_RET = ker::vfs::mount_filesystem(local_mount_path, "remote", nullptr, 0, nullptr, state, &g_remote_vfs_fops);
     if (MOUNT_RET != 0) {
         ker::mod::dbg::log("[WKI] Remote VFS mount failed at %s", local_mount_path);
-        discard_failed_attached_proxy(state, reserved_channel);
+        discard_failed_attached_proxy(state);
         return MOUNT_RET;
     }
 
-    // Configure the exact REMOTE mount we just created.  During pivot_root(),
-    // mount_filesystem() and this lookup can observe different task roots, so
-    // try both the current-root-resolved path and the raw mount path.  Never use
-    // longest-prefix lookup here: if the exact mount is temporarily invisible,
-    // that can return the containing XFS root and corrupt its private_data.
-    std::array<char, 512> resolved_mount{};
-    bool configured = false;
-    if (ker::vfs::resolve_mount_path(local_mount_path, resolved_mount.data(), resolved_mount.size()) == 0) {
-        configured = ker::vfs::configure_mount_point_exact(resolved_mount.data(), ker::vfs::FSType::REMOTE, state, &g_remote_vfs_fops);
-    }
-    if (!configured) {
-        configured = ker::vfs::configure_mount_point_exact(local_mount_path, ker::vfs::FSType::REMOTE, state, &g_remote_vfs_fops);
-    }
-    if (!configured) {
-        ker::mod::dbg::log("[WKI] Remote VFS mount configuration failed at %s", local_mount_path);
-        ker::vfs::unmount_filesystem(local_mount_path);
-        discard_failed_attached_proxy(state, reserved_channel);
-        return -EIO;
+    s_vfs_lock.lock();
+    state->mount_configured = true;
+    uint16_t const ASSIGNED_CHANNEL = state->assigned_channel;
+    s_vfs_lock.unlock();
+
+    // The attach/mount handshake can block long enough for RESOURCE_WITHDRAW
+    // or peer epoch cleanup to retire this exact advertised/channel
+    // generation. Linearize final publication with peer teardown, then verify
+    // the immutable channel token as well as resource discovery. Keep the
+    // construction lifecycle pin until this validation and any exact rollback
+    // finish so concurrent withdrawal cannot erase state beneath this path.
+    WkiPeer* final_peer = wki_peer_find(owner_node);
+    bool const LIFECYCLE_ACQUIRED = wki_peer_lifecycle_acquire(final_peer);
+    bool binding_still_live = false;
+    bool resource_still_live = false;
+    if (LIFECYCLE_ACQUIRED) {
+        s_vfs_lock.lock();
+        bool const PROXY_STILL_ACTIVE = state->active;
+        WkiChannel* const CHANNEL_REF = state->assigned_channel_ref;
+        uint16_t const CHANNEL_ID = state->assigned_channel;
+        uint32_t const CHANNEL_GENERATION = state->assigned_channel_generation;
+        s_vfs_lock.unlock();
+
+        binding_still_live = final_peer->node_id == owner_node && final_peer->state == PeerState::CONNECTED &&
+                             !final_peer->vfs_reset_rebind_pending.load(std::memory_order_acquire) && PROXY_STILL_ACTIVE &&
+                             wki_channel_generation_is_live(CHANNEL_REF, owner_node, CHANNEL_ID, CHANNEL_GENERATION);
+        resource_still_live =
+            wki_resource_observation_is_live(owner_node, ResourceType::VFS, resource_id, RESOURCE_GENERATION, owner_incarnation);
+        wki_peer_lifecycle_release(final_peer);
     }
 
+    if (!resource_still_live) {
+        wki_remote_vfs_unmount_resource_generation(owner_node, resource_id, RESOURCE_GENERATION);
+        release_vfs_proxy_lifecycle_ref(state);
+        return -ENOENT;
+    }
+    if (!binding_still_live) {
+        wki_remote_vfs_unmount_resource_generation(owner_node, resource_id, RESOURCE_GENERATION);
+        release_vfs_proxy_lifecycle_ref(state);
+        return WKI_ERR_PEER_FENCED;
+    }
+
+    release_vfs_proxy_lifecycle_ref(state);
     ker::mod::dbg::log("[WKI] Remote VFS mounted: %s -> node=0x%04x res_id=%u ch=%u", local_mount_path, owner_node, resource_id,
-                       state->assigned_channel);
+                       ASSIGNED_CHANNEL);
     return 0;
 }
 
-void wki_remote_vfs_unmount(const char* local_mount_path) {
-    if (local_mount_path == nullptr) {
-        return;
-    }
-
-    PendingProxyTeardown teardown = {};
+namespace {
+auto claim_vfs_proxy_unmount_by_path(const char* local_mount_path, PendingProxyTeardown& teardown, bool& detach_remote) -> bool {
     s_vfs_lock.lock();
     auto* state = find_vfs_proxy_by_mount(local_mount_path);
-    if (state == nullptr) {
+    if (state == nullptr || state->destroy_when_idle) {
         s_vfs_lock.unlock();
-        return;
+        return false;
     }
+    detach_remote = state->active || state->epoch_reset_pending;
     deactivate_vfs_proxy_locked(state, teardown, true);
+    if (detach_remote) {
+        teardown.detach_staged = stage_vfs_detach_locked(state, teardown.owner_node, teardown.resource_id, teardown.binding_attach_cookie,
+                                                         teardown.binding_incarnation, false);
+        if (state->detach_pending) {
+            state->epoch_reset_pending = false;
+        }
+    }
     invalidate_all_dir_caches(state);
     s_vfs_lock.unlock();
+    return true;
+}
+
+auto claim_vfs_proxy_unmount_by_generation(uint16_t owner_node, uint32_t resource_id, uint64_t resource_generation,
+                                           PendingProxyTeardown& teardown, bool& detach_remote) -> bool {
+    s_vfs_lock.lock();
+    ProxyVfsState* state = nullptr;
+    for (auto& proxy : g_vfs_proxies) {
+        if (proxy != nullptr && proxy->mount_configured && !proxy->destroy_when_idle && !proxy->mount_released &&
+            proxy->owner_node == owner_node && proxy->resource_id == resource_id && proxy->resource_generation == resource_generation) {
+            state = proxy.get();
+            break;
+        }
+    }
+    if (state == nullptr) {
+        s_vfs_lock.unlock();
+        return false;
+    }
+    detach_remote = state->active || state->epoch_reset_pending;
+    deactivate_vfs_proxy_locked(state, teardown, true);
+    if (detach_remote) {
+        teardown.detach_staged = stage_vfs_detach_locked(state, teardown.owner_node, teardown.resource_id, teardown.binding_attach_cookie,
+                                                         teardown.binding_incarnation, false);
+        if (state->detach_pending) {
+            state->epoch_reset_pending = false;
+        }
+    }
+    invalidate_all_dir_caches(state);
+    s_vfs_lock.unlock();
+    return true;
+}
+
+void finish_vfs_proxy_unmount(const PendingProxyTeardown& teardown, bool detach_remote) {
+    if (teardown.state == nullptr) {
+        return;
+    }
 
     finish_proxy_teardown_op_waiter(teardown, -1);
     ker::vfs::vfs_stream_cache_invalidate_remote_scope(teardown.state);
@@ -5413,22 +6086,71 @@ void wki_remote_vfs_unmount(const char* local_mount_path) {
     wake_proxy_slot_waiters(teardown);
     finish_claimed_waiter(teardown.attach_wait_entry, -1);
 
-    // Send DEV_DETACH
-    DevDetachPayload det = {};
-    det.target_node = teardown.owner_node;
-    det.resource_type = static_cast<uint16_t>(ResourceType::VFS);
-    det.resource_id = teardown.resource_id;
-    wki_send(teardown.owner_node, WKI_CHAN_RESOURCE, MsgType::DEV_DETACH, &det, sizeof(det));
+    if (detach_remote) {
+        if (teardown.detach_staged) {
+            wki_deferred_work_notify();
+        }
 
-    // Close the dynamic channel
-    WkiChannel* ch = wki_channel_get(teardown.owner_node, teardown.assigned_channel);
-    if (ch != nullptr) {
-        wki_channel_close(ch);
+        static_cast<void>(wki_channel_close_generation(teardown.assigned_channel_ref, teardown.owner_node, teardown.assigned_channel,
+                                                       teardown.assigned_channel_generation));
     }
 
-    // Unmount
-    ker::vfs::unmount_filesystem(local_mount_path);
-    mark_vfs_proxy_mount_released_and_maybe_destroy(teardown.state);
+    int const UNMOUNT_RET = ker::vfs::unmount_filesystem_by_private_data(static_cast<const void*>(teardown.state));
+    if (UNMOUNT_RET != 0 && UNMOUNT_RET != -ENOENT) {
+        ker::mod::dbg::log("[WKI] Exact remote VFS unmount failed: node=0x%04x res_id=%u path=%s ret=%d", teardown.owner_node,
+                           teardown.resource_id, teardown.local_mount_path.data(), UNMOUNT_RET);
+    }
+    // Owner-only ENOENT proves no mount-table row still references this state.
+    if (UNMOUNT_RET == 0 || UNMOUNT_RET == -ENOENT) {
+        mark_vfs_proxy_mount_released_and_maybe_destroy(teardown.state);
+    }
+    release_vfs_proxy_lifecycle_ref(teardown.state);
+}
+}  // namespace
+
+void wki_remote_vfs_unmount(const char* local_mount_path) {
+    if (local_mount_path == nullptr) {
+        return;
+    }
+
+    PendingProxyTeardown teardown = {};
+    bool detach_remote = false;
+    if (claim_vfs_proxy_unmount_by_path(local_mount_path, teardown, detach_remote)) {
+        finish_vfs_proxy_unmount(teardown, detach_remote);
+    }
+}
+
+void wki_remote_vfs_unmount_resource_generation(uint16_t owner_node, uint32_t resource_id, uint64_t resource_generation) {
+    if (resource_generation == 0) {
+        return;
+    }
+
+    while (true) {
+        PendingProxyTeardown teardown = {};
+        bool detach_remote = false;
+        if (!claim_vfs_proxy_unmount_by_generation(owner_node, resource_id, resource_generation, teardown, detach_remote)) {
+            return;
+        }
+        finish_vfs_proxy_unmount(teardown, detach_remote);
+    }
+}
+
+auto wki_remote_vfs_has_mount_for_resource_generation(uint16_t owner_node, uint32_t resource_id, uint64_t resource_generation) -> bool {
+    if (resource_generation == 0) {
+        return false;
+    }
+
+    bool found = false;
+    s_vfs_lock.lock();
+    for (auto const& proxy : g_vfs_proxies) {
+        if (proxy != nullptr && proxy->active && proxy->mount_configured && proxy->owner_node == owner_node &&
+            proxy->resource_id == resource_id && proxy->resource_generation == resource_generation) {
+            found = true;
+            break;
+        }
+    }
+    s_vfs_lock.unlock();
+    return found;
 }
 
 auto wki_remote_vfs_proxy_diag_snapshot(WkiRemoteVfsProxyDiag* out, size_t max) -> size_t {
@@ -5468,7 +6190,7 @@ auto wki_remote_vfs_find_mount_for_resource(uint16_t owner_node, uint32_t resour
 
     s_vfs_lock.lock();
     for (auto& proxy : g_vfs_proxies) {
-        if (!proxy->active || proxy->owner_node != owner_node || proxy->resource_id != resource_id) {
+        if (!proxy->active || !proxy->mount_configured || proxy->owner_node != owner_node || proxy->resource_id != resource_id) {
             continue;
         }
 
@@ -5493,7 +6215,7 @@ auto wki_remote_vfs_find_resource_for_mount(uint16_t owner_node, const char* loc
 
     s_vfs_lock.lock();
     for (auto& proxy : g_vfs_proxies) {
-        if (!proxy->active || proxy->owner_node != owner_node) {
+        if (!proxy->active || !proxy->mount_configured || proxy->owner_node != owner_node) {
             continue;
         }
         if (std::strncmp(proxy->local_mount_path.data(), local_mount_path, proxy->local_mount_path.size()) != 0) {
@@ -6037,8 +6759,9 @@ void wki_remote_vfs_notify_path_changed(const char* old_local_vfs_path, const ch
 
 namespace detail {
 
-void handle_vfs_invalidate_notify(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len) {
-    if (hdr == nullptr || payload == nullptr || payload_len < 4) {
+void handle_vfs_invalidate_notify(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len,
+                                  const WkiChannelIdentity& channel_identity) {
+    if (!vfs_channel_identity_matches_header(hdr, channel_identity) || payload == nullptr || payload_len < 4) {
         return;
     }
 
@@ -6053,7 +6776,10 @@ void handle_vfs_invalidate_notify(const WkiHeader* hdr, const uint8_t* payload, 
     }
 
     s_vfs_lock.lock();
-    ProxyVfsState* state = find_vfs_proxy_by_channel(hdr->src_node, hdr->channel_id);
+    ProxyVfsState* state = find_vfs_proxy_by_channel(channel_identity);
+    if (state != nullptr) {
+        state->lifecycle_refs++;
+    }
     s_vfs_lock.unlock();
     if (state == nullptr) {
         return;
@@ -6079,6 +6805,7 @@ void handle_vfs_invalidate_notify(const WkiHeader* hdr, const uint8_t* payload, 
     invalidate_all_dir_caches(state);
     s_vfs_lock.unlock();
     invalidate_readlink_cache(state);
+    release_vfs_proxy_lifecycle_ref(state);
 }
 
 void handle_vfs_attach_ack(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len) {
@@ -6089,12 +6816,12 @@ void handle_vfs_attach_ack(const WkiHeader* hdr, const uint8_t* payload, uint16_
     const auto* ack = reinterpret_cast<const DevAttachAckPayload*>(payload);
 
     s_vfs_lock.lock();
-    ProxyVfsState* state = find_vfs_proxy_by_attach(hdr->src_node, ack->resource_id);
+    ProxyVfsState* state = find_vfs_proxy_by_attach(hdr->src_node, ack->resource_id, ack->reserved);
     if (state == nullptr) {
         s_vfs_lock.unlock();
         return;
     }
-    if (!vfs_attach_ack_matches_pending_locked(state, *ack)) {
+    if (!vfs_attach_ack_matches_pending_locked(state, *ack, payload, payload_len)) {
         s_vfs_lock.unlock();
         return;
     }
@@ -6105,6 +6832,9 @@ void handle_vfs_attach_ack(const WkiHeader* hdr, const uint8_t* payload, uint16_
         state->attach_status = ack->status;
         state->attach_channel = ack->assigned_channel;
         state->attach_max_op_size = ack->max_op_size;
+        if (ack->status == static_cast<uint8_t>(DevAttachStatus::OK)) {
+            state->binding_incarnation = state->attach_expected_incarnation;
+        }
 
         // Store server write-recv rkey if VFS RDMA is available
         if ((ack->rdma_flags & DEV_ATTACH_RDMA_VFS) != 0 && ack->blk_zone_id != 0) {
@@ -6134,29 +6864,29 @@ auto wki_remote_vfs_selftest_attach_ack_cookie_fences_stale_completion() -> bool
     state.attach_expected_cookie = 0x52;
 
     ack.reserved = 0x51;
-    if (vfs_attach_ack_matches_pending_locked(&state, ack)) {
+    if (vfs_attach_ack_matches_pending_locked(&state, ack, reinterpret_cast<const uint8_t*>(&ack), sizeof(ack))) {
         return false;
     }
 
     ack.reserved = 0x52;
-    if (!vfs_attach_ack_matches_pending_locked(&state, ack)) {
+    if (!vfs_attach_ack_matches_pending_locked(&state, ack, reinterpret_cast<const uint8_t*>(&ack), sizeof(ack))) {
         return false;
     }
 
     state.attach_expected_cookie = 0;
-    if (vfs_attach_ack_matches_pending_locked(&state, ack)) {
+    if (vfs_attach_ack_matches_pending_locked(&state, ack, reinterpret_cast<const uint8_t*>(&ack), sizeof(ack))) {
         return false;
     }
 
     state.attach_expected_cookie = 0x52;
     state.attach_pending.store(false, std::memory_order_release);
-    return !vfs_attach_ack_matches_pending_locked(&state, ack);
+    return !vfs_attach_ack_matches_pending_locked(&state, ack, reinterpret_cast<const uint8_t*>(&ack), sizeof(ack));
 }
 
 namespace detail {
 
-void handle_vfs_op_resp(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len) {
-    if (payload_len < sizeof(DevOpRespPayload)) {
+void handle_vfs_op_resp(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len, const WkiChannelIdentity& channel_identity) {
+    if (!vfs_channel_identity_matches_header(hdr, channel_identity) || payload_len < sizeof(DevOpRespPayload)) {
         return;
     }
 
@@ -6172,7 +6902,7 @@ void handle_vfs_op_resp(const WkiHeader* hdr, const uint8_t* payload, uint16_t p
     // Channel IDs can be reused, and under failure/recovery we can transiently
     // have more than one active proxy referencing the same channel.
     s_vfs_lock.lock();
-    VfsProxyResponseLookup const LOOKUP = find_vfs_proxy_for_response_locked(hdr->src_node, hdr->channel_id, resp->op_id, resp->reserved);
+    VfsProxyResponseLookup const LOOKUP = find_vfs_proxy_for_response_locked(channel_identity, resp->op_id, resp->reserved);
     ProxyVfsState* state = LOOKUP.matched_state;
     if (state == nullptr) {
         if (LOOKUP.saw_pending_candidate && resp->op_id != OP_VFS_CLOSE) {
@@ -6230,48 +6960,86 @@ constexpr uint64_t STALE_FD_TIMEOUT_US = 30000000;  // 30 seconds
 
 void wki_remote_vfs_gc_stale_fds() {
     uint64_t const NOW = wki_now_us();
-    bool any_removed = false;
-    std::deque<ker::vfs::File*> files_to_close;
+    std::array<uint16_t, WKI_MAX_PEERS> stale_peers{};
+    size_t stale_peer_count = 0;
 
     s_vfs_lock.lock();
-    for (auto& rfd : g_remote_fds) {
-        if (!rfd.active) {
+    for (const auto& rfd : g_remote_fds) {
+        if (!rfd.active || NOW < rfd.last_activity_us || NOW - rfd.last_activity_us < STALE_FD_TIMEOUT_US) {
             continue;
         }
 
-        // Only GC if the FD has been idle for a long time
-        if (NOW - rfd.last_activity_us < STALE_FD_TIMEOUT_US) {
-            continue;
-        }
-
-        // Only GC if the consumer peer is NOT connected (crashed/fenced without closing)
         WkiPeer const* peer = wki_peer_find(rfd.consumer_node);
-        if (peer != nullptr && peer->state == PeerState::CONNECTED) {
+        // RemoteVfsFd rows are created only while reliable DEV_OP admission has
+        // a CONNECTED peer. Peer slots live in g_wki.peers and are never
+        // invalidated after initialization, so that peer row outlives every
+        // server FD. Do not perform an unguarded File close if this invariant
+        // is ever violated.
+        if (peer == nullptr || peer->state == PeerState::CONNECTED) {
             continue;
         }
 
-        // Stale: detach the file under the VFS lock, then close it afterwards.
-        if (rfd.file != nullptr) {
-            files_to_close.push_back(rfd.file);
-            rfd.file = nullptr;
+        bool duplicate = false;
+        for (size_t i = 0; i < stale_peer_count; ++i) {
+            duplicate = duplicate || stale_peers.at(i) == rfd.consumer_node;
         }
-        rfd.active = false;
-        any_removed = true;
-        ker::mod::dbg::log("[WKI] GC stale remote FD %d (consumer 0x%04x)", rfd.fd_id, rfd.consumer_node);
-    }
-
-    if (any_removed) {
-        std::erase_if(g_remote_fds, [](const RemoteVfsFd& rfd) { return !rfd.active; });
+        if (!duplicate && stale_peer_count < stale_peers.size()) {
+            stale_peers.at(stale_peer_count++) = rfd.consumer_node;
+        }
     }
     s_vfs_lock.unlock();
 
-    for (auto* file : files_to_close) {
-        if (file != nullptr) {
-            if (file->fops != nullptr && file->fops->vfs_close != nullptr) {
-                file->fops->vfs_close(file);
-            }
-            delete file;
+    for (size_t i = 0; i < stale_peer_count; ++i) {
+        uint16_t const NODE_ID = stale_peers.at(i);
+        WkiPeer* peer = wki_peer_find(NODE_ID);
+        if (!wki_peer_lifecycle_acquire(peer)) {
+            continue;
         }
+        if (peer->state == PeerState::CONNECTED) {
+            wki_peer_lifecycle_release(peer);
+            continue;
+        }
+
+        // A deferred VFS op holds its DevServerBinding ref across every use of
+        // RemoteVfsFd::file. Drain those refs before transferring any File*
+        // out of the registry; peer lifecycle prevents a reconnect/reattach
+        // from crossing this cleanup.
+        wki_dev_server_detach_all_for_peer(NODE_ID);
+
+        bool any_removed = false;
+        std::deque<ker::vfs::File*> files_to_close;
+        uint64_t const CHECK_NOW = wki_now_us();
+        s_vfs_lock.lock();
+        for (auto& rfd : g_remote_fds) {
+            if (!rfd.active || rfd.consumer_node != NODE_ID || CHECK_NOW < rfd.last_activity_us ||
+                CHECK_NOW - rfd.last_activity_us < STALE_FD_TIMEOUT_US) {
+                continue;
+            }
+            if (rfd.file != nullptr) {
+                files_to_close.push_back(rfd.file);
+                rfd.file = nullptr;
+            }
+            rfd.retiring = true;
+            rfd.active = false;
+            any_removed = true;
+            ker::mod::dbg::log("[WKI] GC stale remote FD %d (consumer 0x%04x)", rfd.fd_id, rfd.consumer_node);
+        }
+        if (any_removed) {
+            std::erase_if(g_remote_fds, [NODE_ID](const RemoteVfsFd& rfd) {
+                return rfd.consumer_node == NODE_ID && rfd.retiring && rfd.file == nullptr;
+            });
+        }
+        s_vfs_lock.unlock();
+
+        for (auto* file : files_to_close) {
+            if (file != nullptr) {
+                if (file->fops != nullptr && file->fops->vfs_close != nullptr) {
+                    file->fops->vfs_close(file);
+                }
+                delete file;
+            }
+        }
+        wki_peer_lifecycle_release(peer);
     }
 }
 
@@ -6300,15 +7068,21 @@ void wki_remote_vfs_auto_discover_internal(std::deque<VfsExport>* stale_exports)
         const char* mount_path = static_cast<const char*>(mount_snapshot.path);
         std::array<char, VFS_EXPORT_NAME_LEN> export_name{};
         build_export_name(export_name.data(), export_name.size(), mount_path);
+        ExportBackingIdentity const BACKING = {
+            .dev_id = mount_snapshot.dev_id,
+            .fs_type = mount_snapshot.fs_type,
+        };
 
         // Check if this visible export name is already exported.
         bool already_exported = false;
+        s_vfs_lock.lock();
         for (const auto& exp : g_vfs_exports) {
             if (exp.active && strncmp(raw_data(exp.name), export_name.data(), export_name.size()) == 0) {
                 already_exported = true;
                 break;
             }
         }
+        s_vfs_lock.unlock();
         if (already_exported) {
             continue;
         }
@@ -6317,11 +7091,9 @@ void wki_remote_vfs_auto_discover_internal(std::deque<VfsExport>* stale_exports)
         // namespace. After pivot_root("/rootfs", ...), this yields "/",
         // "/boot", and "/oldroot", which resolve correctly for all tasks whose
         // root has been updated to "/rootfs".
-        uint32_t const PRESERVED_RESOURCE_ID = take_preserved_export_id(stale_exports, export_name.data());
-        uint32_t const RESOURCE_ID = wki_remote_vfs_export_add_internal(mount_path, export_name.data(), PRESERVED_RESOURCE_ID);
-        if (RESOURCE_ID != 0) {
-            wki_dev_server_refresh_vfs_binding(RESOURCE_ID, mount_path, export_name.data());
-        }
+        PreservedExportIdentity const PRESERVED_IDENTITY =
+            take_preserved_export_identity(stale_exports, export_name.data(), mount_path, BACKING);
+        static_cast<void>(wki_remote_vfs_export_add_internal(mount_path, export_name.data(), PRESERVED_IDENTITY, BACKING));
     }
 }
 
@@ -6345,8 +7117,124 @@ void wki_remote_vfs_refresh_exports() {
     wki_remote_vfs_auto_discover_internal(nullptr);
 }
 
+namespace {
+
+void reconcile_and_publish_vfs_exports() {
+    s_vfs_lock.lock();
+    uint64_t const TARGET_REVISION = g_vfs_export_target_revision;
+    g_vfs_export_rebuild_accepting_entries = false;
+    size_t const EXPORT_COUNT = g_vfs_exports.size();
+    s_vfs_lock.unlock();
+
+    // The prepared transition rejects every further table mutation once
+    // accepting_entries is cleared. Copy one stable row under the VFS lock,
+    // then reconcile it after unlocking so the dev-server lock is never
+    // nested under s_vfs_lock.
+    for (size_t index = 0; index < EXPORT_COUNT; ++index) {
+        s_vfs_lock.lock();
+        VfsExport const EXP = *std::next(g_vfs_exports.begin(), static_cast<ptrdiff_t>(index));
+        s_vfs_lock.unlock();
+        if (!EXP.active) {
+            continue;
+        }
+        ResourceIncarnationToken const TOKEN = {
+            .owner_boot_epoch = g_wki.local_boot_epoch,
+            .resource_incarnation = EXP.resource_incarnation,
+        };
+        wki_dev_server_reconcile_vfs_export(EXP.resource_id, TOKEN, raw_data(EXP.export_path), raw_data(EXP.name), EXP.backing_dev_id,
+                                            TARGET_REVISION);
+    }
+
+    // This drains/retire-closes every unstamped binding and its exact server
+    // FD generation, but deliberately leaves reliable VFS admission closed.
+    wki_dev_server_finish_vfs_export_reconciliation(TARGET_REVISION);
+
+    s_vfs_lock.lock();
+    for (auto& exp : g_vfs_exports) {
+        exp.publication_revision = TARGET_REVISION;
+    }
+    g_vfs_export_revision = TARGET_REVISION;
+    s_vfs_lock.unlock();
+
+    // Publish even before reopening. New attaches can now take a stable
+    // snapshot, while no pre-transition queued/running operation crossed the
+    // backing-mount remap.
+    wki_dev_server_end_vfs_export_reconciliation(TARGET_REVISION);
+
+    // Keep transition ownership published until the admission gate has
+    // actually reopened. Otherwise a concurrent pivot can observe an even,
+    // unowned table in the short window before end() and collide with the old
+    // dev-server reconciliation generation.
+    s_vfs_lock.lock();
+    g_vfs_export_target_revision = 0;
+    g_vfs_export_rebuild_prepared = false;
+    s_vfs_lock.unlock();
+}
+
+}  // namespace
+
+auto wki_remote_vfs_prepare_export_rebuild() -> bool {
+    if (!g_remote_vfs_initialized) {
+        return true;
+    }
+
+    s_vfs_lock.lock();
+    if (g_vfs_export_rebuild_prepared || (g_vfs_export_revision & 1U) != 0 || g_vfs_export_revision > UINT64_MAX - 2) {
+        s_vfs_lock.unlock();
+        return false;
+    }
+    uint64_t const TARGET_REVISION = g_vfs_export_revision + 2;
+    g_vfs_export_target_revision = TARGET_REVISION;
+    g_vfs_export_rebuild_prepared = true;
+    g_vfs_export_rebuild_accepting_entries = false;
+    s_vfs_lock.unlock();
+
+    // Keep the old revision stable while begin() closes admission and drains
+    // requests that already crossed the pre-sequence gate. Those requests may
+    // still complete against the old exact table instead of consuming a
+    // transient NOT_FOUND from an odd revision.
+    if (!wki_dev_server_begin_vfs_export_reconciliation(TARGET_REVISION)) {
+        s_vfs_lock.lock();
+        g_vfs_export_target_revision = 0;
+        g_vfs_export_rebuild_prepared = false;
+        s_vfs_lock.unlock();
+        return false;
+    }
+
+    // Admission is now closed and all pre-gate attach/op work is drained.
+    // Publish odd only at this point, immediately before the caller remaps
+    // backing mount paths.
+    s_vfs_lock.lock();
+    g_vfs_export_revision++;
+    s_vfs_lock.unlock();
+    return true;
+}
+
+void wki_remote_vfs_cancel_export_rebuild() {
+    if (!g_remote_vfs_initialized) {
+        return;
+    }
+
+    s_vfs_lock.lock();
+    bool const PREPARED = g_vfs_export_rebuild_prepared;
+    s_vfs_lock.unlock();
+    if (PREPARED) {
+        // The mount table did not change. Reconcile the unchanged exact table,
+        // advance to a new even revision (fencing pre-prepare snapshots), and
+        // reopen admission without retiring matching bindings or FDs.
+        reconcile_and_publish_vfs_exports();
+    }
+}
+
 void wki_remote_vfs_rebuild_exports() {
     if (!g_remote_vfs_initialized) {
+        return;
+    }
+
+    s_vfs_lock.lock();
+    bool const ALREADY_PREPARED = g_vfs_export_rebuild_prepared;
+    s_vfs_lock.unlock();
+    if (!ALREADY_PREPARED && !wki_remote_vfs_prepare_export_rebuild()) {
         return;
     }
 
@@ -6363,9 +7251,12 @@ void wki_remote_vfs_rebuild_exports() {
     if (g_next_vfs_resource_id <= MAX_STALE_RESOURCE_ID) {
         g_next_vfs_resource_id = MAX_STALE_RESOURCE_ID + 1;
     }
+    g_vfs_export_rebuild_accepting_entries = true;
     s_vfs_lock.unlock();
 
     wki_remote_vfs_auto_discover_internal(&stale_exports);
+
+    reconcile_and_publish_vfs_exports();
 
     for (const auto& exp : stale_exports) {
         ResourceAdvertPayload withdraw = {};
@@ -6380,7 +7271,18 @@ void wki_remote_vfs_rebuild_exports() {
             if (peer->node_id == WKI_NODE_INVALID || peer->state != PeerState::CONNECTED) {
                 continue;
             }
-            wki_send(peer->node_id, WKI_CHAN_CONTROL, MsgType::RESOURCE_WITHDRAW, &withdraw, sizeof(withdraw));
+            std::array<uint8_t, sizeof(ResourceAdvertPayload) + sizeof(ResourceIncarnationToken)> withdraw_buf{};
+            std::memcpy(withdraw_buf.data(), &withdraw, sizeof(withdraw));
+            uint16_t withdraw_len = sizeof(ResourceAdvertPayload);
+            if (wki_resource_incarnation_negotiated(peer->node_id, ResourceType::VFS)) {
+                ResourceIncarnationToken const TOKEN = {
+                    .owner_boot_epoch = g_wki.local_boot_epoch,
+                    .resource_incarnation = exp.resource_incarnation,
+                };
+                std::memcpy(withdraw_buf.data() + sizeof(ResourceAdvertPayload), &TOKEN, sizeof(TOKEN));
+                withdraw_len = static_cast<uint16_t>(withdraw_len + sizeof(ResourceIncarnationToken));
+            }
+            wki_send(peer->node_id, WKI_CHAN_CONTROL, MsgType::RESOURCE_WITHDRAW, withdraw_buf.data(), withdraw_len);
         }
     }
 
@@ -6391,35 +7293,173 @@ void wki_remote_vfs_rebuild_exports() {
 // Fencing Cleanup
 // -------------------------------------------------------------------------------
 
-void wki_remote_vfs_cleanup_for_peer(uint16_t node_id) {
+void wki_remote_vfs_mark_server_fds_for_channel(const WkiChannelIdentity& channel_identity) {
+    if (channel_identity.channel == nullptr || channel_identity.generation == 0) {
+        return;
+    }
+
+    bool marked = false;
+    s_vfs_lock.lock();
+    for (auto& rfd : g_remote_fds) {
+        if (!rfd.active || !vfs_channel_identity_matches(rfd.channel_identity, channel_identity)) {
+            continue;
+        }
+        rfd.retiring = true;
+        rfd.active = false;
+        marked = true;
+    }
+    s_vfs_lock.unlock();
+
+    if (marked) {
+        wki_deferred_work_notify();
+    }
+}
+
+auto wki_remote_vfs_detach_pending_for_resource(uint16_t owner_node, uint32_t resource_id) -> bool {
+    s_vfs_lock.lock();
+    bool const PENDING = vfs_attach_blocked_by_retiring_binding_locked(owner_node, resource_id);
+    s_vfs_lock.unlock();
+    return PENDING;
+}
+
+void wki_remote_vfs_process_pending_detaches() {
+    std::array<VfsDetachAttempt, VFS_DETACH_RETRY_BATCH> attempts{};
+    size_t attempt_count = 0;
+    size_t scanned = 0;
+
+    s_vfs_lock.lock();
+    ProxyVfsState* state = g_pending_vfs_detach_head;
+    while (state != nullptr && scanned < VFS_DETACH_RETRY_SCAN && attempt_count < attempts.size()) {
+        ProxyVfsState* const NEXT = state->detach_next;
+        scanned++;
+        if (!state->detach_retry_in_progress) {
+            state->detach_retry_in_progress = true;
+            attempts.at(attempt_count++) = {
+                .state = state,
+                .owner_node = state->detach_owner_node,
+                .resource_id = state->detach_resource_id,
+                .attach_cookie = state->detach_attach_cookie,
+                .incarnation = state->detach_incarnation,
+                .peer_boot_epoch = state->detach_peer_boot_epoch,
+                .tx_token = state->detach_tx_token,
+            };
+            if (state != g_pending_vfs_detach_tail) {
+                unlink_pending_vfs_detach_locked(state);
+                link_pending_vfs_detach_locked(state);
+            }
+        }
+        state = NEXT;
+    }
+    s_vfs_lock.unlock();
+
+    for (size_t i = 0; i < attempt_count; ++i) {
+        VfsDetachAttempt const& ATTEMPT = attempts.at(i);
+        bool const PEER_EPOCH_INVALIDATED = wki_peer_remote_boot_epoch_invalidated(ATTEMPT.owner_node, ATTEMPT.peer_boot_epoch);
+        WkiReliableTxStatus const TX_STATUS = wki_reliable_tx_status(ATTEMPT.tx_token);
+        WkiReliableTxToken replacement_token = {};
+        int send_ret = WKI_ERR_BUSY;
+        if (!PEER_EPOCH_INVALIDATED && (TX_STATUS == WkiReliableTxStatus::INVALID || TX_STATUS == WkiReliableTxStatus::RETIRED)) {
+            send_ret =
+                send_vfs_detach(ATTEMPT.owner_node, ATTEMPT.resource_id, ATTEMPT.attach_cookie, ATTEMPT.incarnation, &replacement_token);
+        }
+        finish_vfs_detach_attempt(ATTEMPT, TX_STATUS, send_ret, replacement_token, PEER_EPOCH_INVALIDATED);
+    }
+}
+
+void wki_remote_vfs_process_pending_server_fd_cleanup() {
+    constexpr size_t CLOSE_BATCH = 32;
+    while (true) {
+        std::array<ker::vfs::File*, CLOSE_BATCH> files_to_close{};
+        size_t close_count = 0;
+
+        s_vfs_lock.lock();
+        for (auto& rfd : g_remote_fds) {
+            if (!rfd.retiring || rfd.file == nullptr || close_count >= files_to_close.size()) {
+                continue;
+            }
+            files_to_close.at(close_count++) = rfd.file;
+            rfd.file = nullptr;
+        }
+        std::erase_if(g_remote_fds, [](const RemoteVfsFd& rfd) { return rfd.retiring && rfd.file == nullptr; });
+        s_vfs_lock.unlock();
+
+        for (size_t i = 0; i < close_count; ++i) {
+            static_cast<void>(ker::vfs::vfs_close_file(files_to_close.at(i)));
+        }
+        if (close_count < files_to_close.size()) {
+            return;
+        }
+    }
+}
+
+void wki_remote_vfs_cleanup_server_fds_for_channel(const WkiChannelIdentity& channel_identity) {
+    wki_remote_vfs_mark_server_fds_for_channel(channel_identity);
+    wki_remote_vfs_process_pending_server_fd_cleanup();
+}
+
+void wki_remote_vfs_mark_epoch_reset(uint16_t node_id) {
+    s_vfs_lock.lock();
+    for (auto& proxy : g_vfs_proxies) {
+        auto* state = proxy.get();
+        if (state == nullptr || state->owner_node != node_id ||
+            (!state->active && !state->attach_pending.load(std::memory_order_acquire))) {
+            continue;
+        }
+
+        // This phase runs from HELLO RX and therefore cannot allocate, close
+        // files, or quiesce waiters. Stop new ID-based operations before pool
+        // slots are reusable; task-context cleanup consumes the marker.
+        state->lock.lock();
+        if (state->active || state->attach_pending.load(std::memory_order_acquire)) {
+            state->active = false;
+            state->epoch_reset_pending = true;
+        }
+        state->lock.unlock();
+    }
+    s_vfs_lock.unlock();
+}
+
+void wki_remote_vfs_cleanup_for_peer(uint16_t node_id, bool owner_reboot_proven) {
     // Server side: close all remote FDs for this consumer
     std::deque<ker::vfs::File*> files_to_close;
     std::deque<PendingProxyTeardown> proxies_to_cleanup;
 
     s_vfs_lock.lock();
     for (auto& rfd : g_remote_fds) {
-        if (!rfd.active || rfd.consumer_node != node_id) {
+        if (rfd.consumer_node != node_id) {
             continue;
         }
         if (rfd.file != nullptr) {
             files_to_close.push_back(rfd.file);
             rfd.file = nullptr;
         }
+        rfd.retiring = true;
         rfd.active = false;
     }
-    std::erase_if(g_remote_fds, [](const RemoteVfsFd& rfd) { return !rfd.active; });
+    std::erase_if(g_remote_fds,
+                  [node_id](const RemoteVfsFd& rfd) { return rfd.consumer_node == node_id && rfd.retiring && rfd.file == nullptr; });
 
     // Consumer side: fail pending ops and deactivate proxies while the proxy
     // registry is locked.  Cache invalidation and channel close happen later
     // because they can take other subsystem locks.
     for (auto& proxy : g_vfs_proxies) {
         auto* p = proxy.get();
-        if (p == nullptr || !p->active || p->owner_node != node_id) {
+        if (p == nullptr || p->owner_node != node_id || (!p->active && !p->epoch_reset_pending)) {
             continue;
         }
 
         PendingProxyTeardown cleanup = {};
         deactivate_vfs_proxy_locked(p, cleanup, false);
+        // Deactivation is followed by withdrawal/unmount, which can erase the
+        // final local cookie representation. Pin and reserve the exact tuple
+        // first unless a concrete owner reboot proves it obsolete.
+        if (!owner_reboot_proven) {
+            cleanup.detach_staged = stage_vfs_detach_locked(p, cleanup.owner_node, cleanup.resource_id, cleanup.binding_attach_cookie,
+                                                            cleanup.binding_incarnation, false);
+        }
+        if (owner_reboot_proven || p->detach_pending) {
+            p->epoch_reset_pending = false;
+        }
         invalidate_all_dir_caches(p);
 
         proxies_to_cleanup.push_back(cleanup);
@@ -6451,14 +7491,15 @@ void wki_remote_vfs_cleanup_for_peer(uint16_t node_id) {
         wake_proxy_slot_waiters(cleanup);
         finish_claimed_waiter(cleanup.attach_wait_entry, -1);
 
-        WkiChannel* ch = wki_channel_get(cleanup.owner_node, cleanup.assigned_channel);
-        if (ch != nullptr) {
-            wki_channel_close(ch);
+        static_cast<void>(wki_channel_close_generation(cleanup.assigned_channel_ref, cleanup.owner_node, cleanup.assigned_channel,
+                                                       cleanup.assigned_channel_generation));
+
+        if (cleanup.detach_staged) {
+            wki_deferred_work_notify();
         }
 
-        release_and_maybe_destroy_idle_vfs_proxy(cleanup.state);
-
         ker::mod::dbg::log("[WKI] Remote VFS proxy cleanup: %s node=0x%04x", cleanup.local_mount_path.data(), node_id);
+        release_vfs_proxy_lifecycle_ref(cleanup.state);
     }
 }
 

@@ -60,13 +60,18 @@ struct SubmittedTask {
     uint64_t accepted_at_us = 0;
     uint64_t complete_received_at_us = 0;
 
-    // V2 A7: Proxy task pointer - kept alive in WAITING state until remote completes
+    // V2 A7: Proxy task pointer - kept alive in WAITING state until remote completes.
+    // A non-null slot owns exactly one Task lifetime reference. Completion
+    // transfers that reference to its out-of-lock finalizer; ordinary result
+    // cleanup releases it in place.
     ker::mod::sched::task::Task* local_task = nullptr;
     bool proxy_ready = false;
     // An accepted direct-submit ID remains a valid one-shot wait handle until
     // wki_try_remote_spawn transfers it to proxy ownership or wki_task_wait
-    // consumes the terminal result.
+    // consumes the terminal result. The owner is the submitting kernel task,
+    // which may differ from local_task when a parent is publishing a child.
     bool result_handle_owned = false;
+    ker::mod::sched::task::Task* result_owner_task = nullptr;
     bool reclaim_requested = false;
     // Completion can arrive before the exec handoff has parked the local
     // proxy. Keep an owned copy for wki_proxy_task_blocked() rather than a raw
@@ -78,7 +83,10 @@ struct SubmittedTask {
     uint16_t ipc_fd_count = 0;
 
     SubmittedTask() = default;
-    ~SubmittedTask() { delete[] pending_proxy_output; }
+    ~SubmittedTask() {
+        reset_local_task_ref();
+        delete[] pending_proxy_output;
+    }
     SubmittedTask(const SubmittedTask&) = delete;
     auto operator=(const SubmittedTask&) -> SubmittedTask& = delete;
     SubmittedTask(SubmittedTask&& o) noexcept
@@ -101,16 +109,19 @@ struct SubmittedTask {
           local_task(o.local_task),
           proxy_ready(o.proxy_ready),
           result_handle_owned(o.result_handle_owned),
+          result_owner_task(o.result_owner_task),
           reclaim_requested(o.reclaim_requested),
           pending_proxy_output(o.pending_proxy_output),
           pending_proxy_output_len(o.pending_proxy_output_len),
           ipc_fd_map(o.ipc_fd_map),
           ipc_fd_count(o.ipc_fd_count) {
+        o.local_task = nullptr;
         o.pending_proxy_output = nullptr;
         o.pending_proxy_output_len = 0;
     }
     auto operator=(SubmittedTask&& o) noexcept -> SubmittedTask& {
         if (this != &o) {
+            reset_local_task_ref();
             active = o.active;
             task_id = o.task_id;
             target_node = o.target_node;
@@ -128,8 +139,10 @@ struct SubmittedTask {
             accepted_at_us = o.accepted_at_us;
             complete_received_at_us = o.complete_received_at_us;
             local_task = o.local_task;
+            o.local_task = nullptr;
             proxy_ready = o.proxy_ready;
             result_handle_owned = o.result_handle_owned;
+            result_owner_task = o.result_owner_task;
             reclaim_requested = o.reclaim_requested;
             delete[] pending_proxy_output;
             pending_proxy_output = o.pending_proxy_output;
@@ -140,6 +153,31 @@ struct SubmittedTask {
             ipc_fd_count = o.ipc_fd_count;
         }
         return *this;
+    }
+
+    [[nodiscard]] auto set_local_task_ref(ker::mod::sched::task::Task* task) -> bool {
+        if (local_task == task) {
+            return true;
+        }
+        if (task != nullptr && !task->try_acquire_lifetime_ref()) {
+            return false;
+        }
+        reset_local_task_ref();
+        local_task = task;
+        return true;
+    }
+
+    [[nodiscard]] auto take_local_task_ref() -> ker::mod::sched::task::Task* {
+        auto* task = local_task;
+        local_task = nullptr;
+        return task;
+    }
+
+    void reset_local_task_ref() {
+        auto* task = take_local_task_ref();
+        if (task != nullptr) {
+            task->release();
+        }
     }
 };
 
@@ -274,6 +312,10 @@ void wki_proxy_task_blocked(ker::mod::sched::task::Task* task);
 // Returns 0 on success, -1 on timeout/error.
 auto wki_task_wait(uint32_t task_id, int32_t* exit_status, uint64_t timeout_us) -> int;
 
+// Retire stack-wait ownership after generic task-exit cleanup has claimed or
+// quiesced every still-linked WkiWaitEntry owned by this task.
+void wki_remote_compute_cleanup_for_task(ker::mod::sched::task::Task* task);
+
 // Submitter side: cancel a submitted task with the specified signal semantics.
 auto wki_task_cancel(uint32_t task_id, int signum) -> bool;
 
@@ -354,6 +396,7 @@ auto wki_remote_compute_selftest_cleanup_marks_unready_proxy_failure() -> bool;
 auto wki_remote_compute_selftest_proxy_wait_completion_respects_publish_fence() -> bool;
 auto wki_remote_compute_selftest_task_wait_consumes_completed_row() -> bool;
 auto wki_remote_compute_selftest_task_wait_timeout_preserves_successor() -> bool;
+auto wki_remote_compute_selftest_task_exit_retires_wait_owners() -> bool;
 auto wki_remote_compute_selftest_submitted_slots_reclaim_safely() -> bool;
 auto wki_remote_compute_selftest_task_id_wrap_is_safe() -> bool;
 auto wki_remote_compute_selftest_load_snapshot_survives_cleanup() -> bool;

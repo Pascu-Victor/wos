@@ -7,6 +7,7 @@
 #include <net/wki/remotable.hpp>
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
+#include <utility>
 
 namespace ker::net {
 struct NetDevice;
@@ -30,15 +31,27 @@ struct DevServerBinding {
     bool active = false;
     std::atomic<uint32_t> refs{0};
     std::atomic<bool> retiring{false};
+    bool epoch_reset_pending = false;
+    // Exact detach or attach-ACK-failure retirement was admitted in RX/NAPI.
+    // The task-context cleanup worker owns the binding while this remains set.
+    bool detach_cleanup_pending = false;
+    bool detach_cleanup_claimed = false;
     uint16_t consumer_node = WKI_NODE_INVALID;
     uint16_t assigned_channel = 0;
+    WkiChannelIdentity channel_identity{};
     ResourceType resource_type = ResourceType::BLOCK;
     uint32_t resource_id = 0;
+    ResourceIncarnationToken resource_incarnation = {};
     uint8_t attach_cookie = 0;
+    DevAttachAckPayload attach_ack = {};
     dev::BlockDevice* block_dev = nullptr;
     bool block_read_only = false;
+    dev::BlockWriterLease block_writer_lease{};
     char vfs_export_path[256] = {};  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
     char vfs_export_name[256] = {};  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
+    uint64_t vfs_export_dev_id = 0;
+    uint64_t vfs_export_publication_revision = 0;
+    uint64_t vfs_export_revision_seen = 0;
     net::NetDevice* net_dev = nullptr;
     NetRxFilter net_rx_filter;  // D12: per-binding RX filter
 
@@ -92,13 +105,23 @@ struct DevServerBinding {
         : active(o.active),
           refs(o.refs.load(std::memory_order_relaxed)),
           retiring(o.retiring.load(std::memory_order_relaxed)),
+          epoch_reset_pending(o.epoch_reset_pending),
+          detach_cleanup_pending(o.detach_cleanup_pending),
+          detach_cleanup_claimed(o.detach_cleanup_claimed),
           consumer_node(o.consumer_node),
           assigned_channel(o.assigned_channel),
+          channel_identity(o.channel_identity),
           resource_type(o.resource_type),
           resource_id(o.resource_id),
+          resource_incarnation(o.resource_incarnation),
           attach_cookie(o.attach_cookie),
+          attach_ack(o.attach_ack),
           block_dev(o.block_dev),
           block_read_only(o.block_read_only),
+          block_writer_lease(std::move(o.block_writer_lease)),
+          vfs_export_dev_id(o.vfs_export_dev_id),
+          vfs_export_publication_revision(o.vfs_export_publication_revision),
+          vfs_export_revision_seen(o.vfs_export_revision_seen),
           net_dev(o.net_dev),
           net_rx_filter(o.net_rx_filter),
           net_rx_credits(o.net_rx_credits),
@@ -146,13 +169,23 @@ struct DevServerBinding {
             active = o.active;
             refs.store(o.refs.load(std::memory_order_relaxed), std::memory_order_relaxed);
             retiring.store(o.retiring.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            epoch_reset_pending = o.epoch_reset_pending;
+            detach_cleanup_pending = o.detach_cleanup_pending;
+            detach_cleanup_claimed = o.detach_cleanup_claimed;
             consumer_node = o.consumer_node;
             assigned_channel = o.assigned_channel;
+            channel_identity = o.channel_identity;
             resource_type = o.resource_type;
             resource_id = o.resource_id;
+            resource_incarnation = o.resource_incarnation;
             attach_cookie = o.attach_cookie;
+            attach_ack = o.attach_ack;
             block_dev = o.block_dev;
             block_read_only = o.block_read_only;
+            block_writer_lease = std::move(o.block_writer_lease);
+            vfs_export_dev_id = o.vfs_export_dev_id;
+            vfs_export_publication_revision = o.vfs_export_publication_revision;
+            vfs_export_revision_seen = o.vfs_export_revision_seen;
             // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-array-to-pointer-decay)
             __builtin_memcpy(vfs_export_path, o.vfs_export_path, sizeof(vfs_export_path));
             // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-array-to-pointer-decay)
@@ -211,8 +244,44 @@ struct VfsWriteRegionInfo {
 // Initialize the device server subsystem. Called from wki_init().
 void wki_dev_server_init();
 
-// Detach all bindings for a fenced peer (called from wki_peer_fence).
+// Detach all bindings for a non-connected peer. The caller must hold that
+// peer's lifecycle lease; the function joins every other binding cleanup owner
+// and returns only after no same-peer binding row remains.
 void wki_dev_server_detach_all_for_peer(uint16_t node_id);
+
+// Connected epoch resets are split across RX and task context. The mark phase
+// is allocation-free/nonblocking; cleanup drains exact binding generations and
+// may yield while in-flight VFS workers release their references.
+void wki_dev_server_mark_epoch_reset(uint16_t node_id);
+void wki_dev_server_cleanup_epoch_reset_for_peer(uint16_t node_id);
+
+// Reliable DEV_DETACH admission. This fixed-storage phase is safe in NAPI/RX:
+// it validates the exact binding tuple and makes the binding unreachable, but
+// performs no waits, allocation, frees, callbacks, channel close, or zone work.
+// True means newly admitted cleanup work should wake the deferred worker.
+auto wki_dev_server_admit_detach_rx(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len) -> bool;
+
+// Refuse a replacement attach until an ACK-admitted explicit detach for the
+// same consumer/type/resource has completed its task-context cleanup.
+auto wki_dev_server_attach_blocked_by_pending_detach(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len) -> bool;
+
+// Drain ACK-admitted explicit detaches in task context.
+void wki_dev_server_process_pending_detaches();
+
+// Pre-ACK VFS transition admission. Reliable RX acquires this before sequence
+// advancement and releases only after inline handling has transferred any
+// queued VFS operation reference.
+auto wki_dev_server_vfs_rx_admission_try_acquire() -> bool;
+void wki_dev_server_vfs_rx_admission_release();
+
+// Pivot/export-table reconciliation. begin closes VFS reliable admission and
+// drains accepted attach/op work; end reopens only after the caller publishes
+// the new even export revision.
+auto wki_dev_server_begin_vfs_export_reconciliation(uint64_t target_even_revision) -> bool;
+void wki_dev_server_reconcile_vfs_export(uint32_t resource_id, const ResourceIncarnationToken& incarnation, const char* export_path,
+                                         const char* export_name, uint64_t dev_id, uint64_t target_even_revision);
+void wki_dev_server_finish_vfs_export_reconciliation(uint64_t target_even_revision);
+void wki_dev_server_end_vfs_export_reconciliation(uint64_t published_even_revision);
 
 // Poll all active block ring RDMA zones for pending SQ entries.
 // Called from wki_timer_tick() as a periodic fallback.
@@ -220,25 +289,24 @@ void wki_dev_server_poll_rings();
 
 // Look up the pre-registered VFS write-receive buffer for a given binding.
 // Returns nullptr if the binding has no RDMA write buffer (msg-only path).
-auto wki_dev_server_get_vfs_write_buf(uint16_t consumer_node, uint16_t channel_id) -> uint8_t*;
+auto wki_dev_server_get_vfs_write_buf(const WkiChannelIdentity& identity) -> uint8_t*;
 
 // Look up the full server-side VFS write RDMA receive region.
-auto wki_dev_server_get_vfs_write_region(uint16_t consumer_node, uint16_t channel_id) -> VfsWriteRegionInfo;
+auto wki_dev_server_get_vfs_write_region(const WkiChannelIdentity& identity) -> VfsWriteRegionInfo;
 
 // Mark an RDMA-backed VFS write request complete and cache the response for
 // duplicate control retransmits carrying the same request cookie.
-void wki_dev_server_complete_vfs_write(uint16_t consumer_node, uint16_t channel_id, uint16_t req_cookie, int16_t status,
-                                       uint32_t bytes_written);
+void wki_dev_server_complete_vfs_write(const WkiChannelIdentity& identity, uint16_t req_cookie, int16_t status, uint32_t bytes_written);
 
 void wki_dev_server_send_vfs_notify(uint32_t resource_id, uint16_t op_id, const uint8_t* data, uint16_t data_len);
 
 // Look up the server-side VFS read staging buffer (RoCE pull mode).
 // Returns nullptr if pull mode is not active for this binding.
-auto wki_dev_server_get_vfs_read_staging_buf(uint16_t consumer_node, uint16_t channel_id) -> uint8_t*;
+auto wki_dev_server_get_vfs_read_staging_buf(const WkiChannelIdentity& identity) -> uint8_t*;
 
 // Look up the server-side VFS bulk staging buffer (RoCE bulk pull mode).
 // Returns nullptr if bulk pull mode is not active for this binding.
-auto wki_dev_server_get_vfs_bulk_staging_buf(uint16_t consumer_node, uint16_t channel_id) -> uint8_t*;
+auto wki_dev_server_get_vfs_bulk_staging_buf(const WkiChannelIdentity& identity) -> uint8_t*;
 
 // Process deferred zone creations. Called from wki_timer_tick().
 // Zone creation is deferred from the RX handler because wki_zone_create()
@@ -256,21 +324,24 @@ void wki_dev_server_notify_net_changed(net::NetDevice* dev);
 // Update NET binding state from owner-side NET op handlers. These helpers
 // revalidate under the server lock so detach/fence erasure cannot race with a
 // raw DevServerBinding pointer captured in the RX handler.
-void wki_dev_server_mark_net_opened(uint16_t consumer_node, uint16_t channel_id, net::NetDevice* dev, bool opened);
-void wki_dev_server_add_net_rx_credits(uint16_t consumer_node, uint16_t channel_id, net::NetDevice* dev, uint16_t credits);
+void wki_dev_server_mark_net_opened(const WkiChannelIdentity& identity, net::NetDevice* dev, bool opened);
+void wki_dev_server_add_net_rx_credits(const WkiChannelIdentity& identity, net::NetDevice* dev, uint16_t credits);
 
-// True when an active remote BLOCK binding can write to this device or an
-// overlapping partition. Used to keep non-cluster filesystems single-writer.
+// True while a still-listed remote BLOCK binding can write to this device or
+// an overlapping partition. Retiring bindings keep the reservation until
+// their retained operations drain and their cleanup owner erases them.
 auto wki_dev_server_block_has_remote_writer(const dev::BlockDevice* dev) -> bool;
 
 // Refresh cached VFS export path/name for active bindings attached to a
 // resource whose advertised backing path changed (for example after
 // pivot_root() rebuilds the export table).
-void wki_dev_server_refresh_vfs_binding(uint32_t resource_id, const char* export_path, const char* export_name);
 
 #ifdef WOS_SELFTEST
+auto wki_dev_server_selftest_retirement_ownership_guards() -> bool;
 auto wki_dev_server_selftest_binding_lifecycle_flags() -> bool;
-auto wki_dev_server_selftest_attach_ack_failure_rolls_back_binding() -> bool;
+auto wki_dev_server_selftest_attach_ack_failure_defers_cleanup() -> bool;
+auto wki_dev_server_selftest_detach_admission_lifecycle() -> bool;
+auto wki_dev_server_selftest_block_writer_lease_transfer() -> bool;
 #endif
 
 // -----------------------------------------------------------------------------
@@ -280,8 +351,8 @@ auto wki_dev_server_selftest_attach_ack_failure_rolls_back_binding() -> bool;
 namespace detail {
 
 void handle_dev_attach_req(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len);
-void handle_dev_detach(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len);
-void handle_dev_op_req(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len);
+void handle_dev_op_req(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len, WkiChannel* rx_channel,
+                       uint32_t rx_channel_generation);
 
 }  // namespace detail
 

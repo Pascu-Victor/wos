@@ -47,6 +47,10 @@ static_assert(VFS_RDMA_ROCE_BULK_SIZE <= VFS_RDMA_BULK_SIZE);
 struct VfsExport {
     bool active = false;
     uint32_t resource_id = 0;
+    uint32_t resource_incarnation = 0;
+    uint64_t publication_revision = 0;
+    uint32_t backing_dev_id = 0;
+    ker::vfs::FSType backing_fs_type = ker::vfs::FSType::TMPFS;
     char export_path[VFS_EXPORT_PATH_LEN] = {};  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
     char name[VFS_EXPORT_NAME_LEN] = {};         // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
 };
@@ -57,8 +61,9 @@ struct VfsExport {
 
 struct RemoteVfsFd {
     bool active = false;
+    bool retiring = false;
     uint16_t consumer_node = WKI_NODE_INVALID;
-    uint16_t channel_id = 0;
+    WkiChannelIdentity channel_identity{};
     int32_t fd_id = -1;
     ker::vfs::File* file = nullptr;
     uint64_t last_activity_us = 0;  // D10: for stale FD garbage collection
@@ -79,9 +84,14 @@ struct ProxyVfsState {
     };
 
     bool active = false;
+    bool epoch_reset_pending = false;
     uint16_t owner_node = WKI_NODE_INVALID;
     uint16_t assigned_channel = 0;
+    WkiChannel* assigned_channel_ref = nullptr;
+    uint32_t assigned_channel_generation = 0;
     uint32_t resource_id = 0;
+    uint64_t resource_generation = 0;
+    ResourceIncarnationToken owner_incarnation = {};
     uint16_t max_op_size = 0;
     std::atomic<bool> readlink_unsupported{false};
 
@@ -106,7 +116,25 @@ struct ProxyVfsState {
     uint16_t attach_channel = 0;
     uint16_t attach_max_op_size = 0;
     uint8_t attach_expected_cookie = 0;
+    uint8_t binding_attach_cookie = 0;
+    bool attach_expect_incarnation = false;
+    ResourceIncarnationToken attach_expected_incarnation = {};
+    ResourceIncarnationToken binding_incarnation = {};
+    uint32_t binding_peer_boot_epoch = 0;
     WkiWaitEntry* attach_wait_entry = nullptr;  // V2 I-4: async wait for DEV_ATTACH_ACK
+
+    // Exact server idempotence tuple retained until DEV_DETACH is ACKed or the
+    // peer boot epoch proves it obsolete.
+    bool detach_pending = false;            // Protected by s_vfs_lock.
+    bool detach_retry_in_progress = false;  // Protected by s_vfs_lock.
+    uint16_t detach_owner_node = WKI_NODE_INVALID;
+    uint32_t detach_resource_id = 0;
+    uint8_t detach_attach_cookie = 0;
+    ResourceIncarnationToken detach_incarnation = {};
+    uint32_t detach_peer_boot_epoch = 0;
+    WkiReliableTxToken detach_tx_token = {};
+    ProxyVfsState* detach_prev = nullptr;
+    ProxyVfsState* detach_next = nullptr;
 
     std::array<char, VFS_EXPORT_PATH_LEN> local_mount_path = {};
     std::array<ReadlinkCacheEntry, VFS_READLINK_CACHE_ENTRIES> readlink_cache = {};
@@ -114,7 +142,11 @@ struct ProxyVfsState {
     // RemoteFileContext keeps a raw proxy pointer after the VFS mount is gone.
     // Unmount marks the proxy for destruction, then the final close releases it.
     std::atomic<uint32_t> open_file_refs{0};
+    // Constructor and teardown snapshots retain the registry object while
+    // operating outside s_vfs_lock. Protected by s_vfs_lock.
+    uint32_t lifecycle_refs = 0;
     bool destroy_when_idle = false;    // Protected by s_vfs_lock.
+    bool mount_configured = false;     // Protected by s_vfs_lock.
     bool mount_released = false;       // Protected by s_vfs_lock.
     bool resources_releasing = false;  // Protected by s_vfs_lock.
     bool resources_released = false;   // Protected by s_vfs_lock.
@@ -232,14 +264,21 @@ auto wki_remote_vfs_export_add(const char* export_path, const char* name) -> uin
 // Server side: copy an export snapshot by resource_id while holding the export lock.
 auto wki_remote_vfs_find_export_snapshot(uint32_t resource_id, VfsExport* out) -> bool;
 
+// Final attach validation after provisional owner-binding insertion. The
+// snapshot remains current only at the same stable even export revision and
+// for the same resource token, path/name, and backing mount identity.
+auto wki_remote_vfs_export_snapshot_is_current(const VfsExport& expected) -> bool;
+
 // Server side: advertise all VFS exports to all connected peers
 void wki_remote_vfs_advertise_exports();
 
 // Server side: advertise all VFS exports to one connected peer.
 void wki_remote_vfs_advertise_exports_to_peer(uint16_t peer_node);
 
-// Consumer side: mount a remote VFS at local_mount_path
-auto wki_remote_vfs_mount(uint16_t owner_node, uint32_t resource_id, const char* local_mount_path) -> int;
+// Consumer side: mount a remote VFS at local_mount_path. Automatic mounts pass
+// the exact observed generation; manual callers snapshot the current one.
+auto wki_remote_vfs_mount(uint16_t owner_node, uint32_t resource_id, const char* local_mount_path,
+                          uint64_t expected_resource_generation = 0) -> int;
 
 auto wki_remote_vfs_selftest_attach_ack_cookie_fences_stale_completion() -> bool;
 
@@ -264,6 +303,13 @@ auto wki_remote_vfs_proxy_diag_snapshot(WkiRemoteVfsProxyDiag* out, size_t max) 
 
 // Consumer side: unmount a remote VFS
 void wki_remote_vfs_unmount(const char* local_mount_path);
+
+// Unmount every proxy created for one exact locally observed resource
+// generation, including a proxy already deactivated by peer fencing.
+void wki_remote_vfs_unmount_resource_generation(uint16_t owner_node, uint32_t resource_id, uint64_t resource_generation);
+
+// True when this exact observed generation already has a published mount.
+auto wki_remote_vfs_has_mount_for_resource_generation(uint16_t owner_node, uint32_t resource_id, uint64_t resource_generation) -> bool;
 
 // Consumer side: find the current mount path for a mounted remote VFS resource.
 auto wki_remote_vfs_find_mount_for_resource(uint16_t owner_node, uint32_t resource_id, char* out, size_t out_size) -> bool;
@@ -320,8 +366,29 @@ void wki_remote_vfs_refresh_exports();
 // pivot_root(). Sends withdraws for stale exports before advertising the new set.
 void wki_remote_vfs_rebuild_exports();
 
+// Pivot split phase: close VFS server admission and drain binding workers
+// before mount paths/task roots are remapped. A failed remap must cancel;
+// successful callers finish through wki_remote_vfs_rebuild_exports().
+auto wki_remote_vfs_prepare_export_rebuild() -> bool;
+void wki_remote_vfs_cancel_export_rebuild();
+
 // Fencing cleanup - remove all state for a fenced peer
-void wki_remote_vfs_cleanup_for_peer(uint16_t node_id);
+void wki_remote_vfs_cleanup_for_peer(uint16_t node_id, bool owner_reboot_proven);
+// Owner-side exact binding teardown. The dev-server caller must first retire
+// the binding and drain every worker holding its generation.
+void wki_remote_vfs_cleanup_server_fds_for_channel(const WkiChannelIdentity& channel_identity);
+// Reliable RX may only mark exact server FDs terminal. File close is drained by
+// the WKI deferred worker because it can allocate or block in filesystem code.
+void wki_remote_vfs_mark_server_fds_for_channel(const WkiChannelIdentity& channel_identity);
+void wki_remote_vfs_process_pending_server_fd_cleanup();
+
+// Retry a bounded, rotating batch of detach frames from task context.
+void wki_remote_vfs_process_pending_detaches();
+// Read-only admission gate for deferred auto-mount scheduling.
+auto wki_remote_vfs_detach_pending_for_resource(uint16_t owner_node, uint32_t resource_id) -> bool;
+// RX-safe first phase of a connected channel-epoch reset. It only marks
+// bindings terminal under existing fixed locks; task-context cleanup follows.
+void wki_remote_vfs_mark_epoch_reset(uint16_t node_id);
 
 // D10: Garbage-collect server-side remote FDs that have been idle for too long
 // and whose consumer peer is no longer CONNECTED. Called from timer tick.
@@ -332,14 +399,15 @@ void wki_remote_vfs_gc_stale_fds();
 // -----------------------------------------------------------------------------
 
 namespace detail {
-void handle_vfs_invalidate_notify(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len);
+void handle_vfs_invalidate_notify(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len,
+                                  const WkiChannelIdentity& channel_identity);
 
 // Server side: handle VFS operations (called from dev_server handle_dev_op_req)
-void handle_vfs_op(const WkiHeader* hdr, uint16_t channel_id, const char* export_path, const char* export_name, uint16_t op_id,
-                   const uint8_t* data, uint16_t data_len);
+void handle_vfs_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_identity, const char* export_path, const char* export_name,
+                   uint16_t op_id, const uint8_t* data, uint16_t data_len);
 
 // Consumer side: handle DEV_OP_RESP for VFS proxy
-void handle_vfs_op_resp(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len);
+void handle_vfs_op_resp(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len, const WkiChannelIdentity& channel_identity);
 
 // Consumer side: handle DEV_ATTACH_ACK for VFS proxy
 void handle_vfs_attach_ack(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len);

@@ -463,8 +463,8 @@ auto handle_handoff_non_user_signal_action(Task* task, int signo, unsigned idx, 
 void exit_current_on_pending_fatal_default_signal() {
     auto* task = sched::get_current_task();
     if (task == nullptr || task->type != sched::task::TaskType::PROCESS || task->in_signal_handler || task->exit_in_progress ||
-        task->has_exited || task->state.load(std::memory_order_acquire) != sched::task::TaskState::ACTIVE ||
-        !task_owns_current_kernel_stack(task)) {
+        task->has_exited || task->unpublished_teardown_in_progress.load(std::memory_order_acquire) ||
+        task->state.load(std::memory_order_acquire) != sched::task::TaskState::ACTIVE || !task_owns_current_kernel_stack(task)) {
         return;
     }
 

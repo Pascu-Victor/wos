@@ -157,7 +157,7 @@ auto netdev_find_by_ifindex(uint32_t ifindex) -> NetDevice* {
 }
 
 auto first_ipv4_or_any(NetDevice* dev) -> IPv4Address {
-    auto* nif = netif_get(dev);
+    auto* nif = netif_find_by_dev(dev);
     if (nif == nullptr || nif->ipv4_addr_count == 0) {
         return IPv4Address::any();
     }

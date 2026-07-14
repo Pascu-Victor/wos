@@ -73,11 +73,12 @@ void tcp_diag_log_local_close(const char* op, Socket* sock, TcpCB* cb, TcpState 
         return;
     }
 
-    log::warn("tcp-close-local op=%s how=%d state=%u current=%u next=%u local=0x%08x:%u remote=0x%08x:%u send_fin=%u "
-              "rcv_nxt=%u rcv_wnd=%u snd_una=%u snd_nxt=%u snd_wnd=%u rcvbuf=%zu/%zu owner=%llu",
-              op, how, static_cast<unsigned>(old_state), static_cast<unsigned>(cb->state), static_cast<unsigned>(next_state), cb->local_ip,
-              cb->local_port, cb->remote_ip, cb->remote_port, send_fin ? 1U : 0U, cb->rcv_nxt, cb->rcv_wnd, cb->snd_una, cb->snd_nxt,
-              cb->snd_wnd, sock->rcvbuf.available(), sock->rcvbuf.capacity, static_cast<unsigned long long>(sock->owner_pid));
+    log::warn(
+        "tcp-close-local op=%s how=%d state=%u current=%u next=%u local=0x%08x:%u remote=0x%08x:%u send_fin=%u "
+        "rcv_nxt=%u rcv_wnd=%u snd_una=%u snd_nxt=%u snd_wnd=%u rcvbuf=%zu/%zu owner=%llu",
+        op, how, static_cast<unsigned>(old_state), static_cast<unsigned>(cb->state), static_cast<unsigned>(next_state), cb->local_ip,
+        cb->local_port, cb->remote_ip, cb->remote_port, send_fin ? 1U : 0U, cb->rcv_nxt, cb->rcv_wnd, cb->snd_una, cb->snd_nxt, cb->snd_wnd,
+        sock->rcvbuf.available(), sock->rcvbuf.capacity, static_cast<unsigned long long>(sock->owner_pid));
 }
 
 std::atomic<uint32_t> iss_counter{0x12345678};
@@ -390,7 +391,7 @@ int tcp_connect(Socket* sock, const void* addr_raw, size_t addr_len, int flags) 
     if (cb->local_ip == 0) {
         auto* route = ker::net::route_lookup(ip);
         if (route != nullptr && route->dev != nullptr) {
-            auto* nif = ker::net::netif_get(route->dev);
+            auto* nif = ker::net::netif_find_by_dev(route->dev);
             if (nif != nullptr && nif->ipv4_addr_count > 0) {
                 cb->local_ip = nif->ipv4_addrs.front().addr;
                 sock->local_v4.addr = cb->local_ip;

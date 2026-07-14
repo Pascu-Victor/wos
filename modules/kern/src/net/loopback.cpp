@@ -5,6 +5,7 @@
 #include <net/backlog.hpp>
 #include <net/netdevice.hpp>
 #include <net/netif.hpp>
+#include <new>  // IWYU pragma: keep
 #include <platform/asm/cpu.hpp>
 #include <platform/dbg/dbg.hpp>
 
@@ -57,7 +58,9 @@ NetDeviceOps lo_ops = {
 }  // namespace
 
 void loopback_init() {
-    lo_dev = {};
+    // NetDevice contains an atomic RX hook and is therefore intentionally
+    // non-assignable. Reconstruct this init-only singleton in place instead.
+    new (&lo_dev) NetDevice{};
     lo_dev.name = {'l', 'o'};
     lo_dev.mac.fill(0);
     lo_dev.mtu = ETHERNET_MTU_MAX;

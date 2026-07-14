@@ -8,6 +8,8 @@ ROOT = Path(__file__).resolve().parents[3]
 PEER_CPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "peer.cpp"
 WKI_CPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "wki.cpp"
 WKI_HPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "wki.hpp"
+REMOTABLE_CPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "remotable.cpp"
+REMOTE_VFS_CPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "remote_vfs.cpp"
 WIRE_HPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "wire.hpp"
 WKI_PEER_LIVENESS_KTEST = ROOT / "modules" / "kern" / "src" / "test" / "wki_peer_liveness_ktest.cpp"
 
@@ -68,7 +70,8 @@ def test_hello_ack_reconnects_fenced_peer_outside_peer_lock() -> None:
         "wki_channels_close_for_peer(peer_node);",
         "peer->state == PeerState::RECONNECTING",
         "peer->state = PeerState::CONNECTED;",
-        "wki_dev_proxy_resume_for_peer(peer_node);",
+        "peer->block_resume_pending.store(true, std::memory_order_release);",
+        "wki_timer_notify();",
         "wki_lsa_generate_and_flood();",
         "wki_resource_advertise_to_peer(peer_node);",
         "wki_event_publish(EVENT_CLASS_SYSTEM, EVENT_SYSTEM_NODE_JOIN",
@@ -79,8 +82,18 @@ def test_hello_ack_reconnects_fenced_peer_outside_peer_lock() -> None:
 
     require_order(body, "g_wki.peer_lock.unlock();", "wki_channels_close_for_peer(peer_node);", "HELLO_ACK channel reset lock boundary")
     require_order(body, "wki_channels_close_for_peer(peer_node);", "peer->state = PeerState::CONNECTED;", "HELLO_ACK reconnect connect")
-    require_order(body, "g_wki.peer_lock.unlock();", "wki_dev_proxy_resume_for_peer(peer_node);", "HELLO_ACK proxy resume lock boundary")
-    require_order(body, "wki_dev_proxy_resume_for_peer(peer_node);", "wki_lsa_generate_and_flood();", "HELLO_ACK topology refresh")
+    require_order(
+        body,
+        "g_wki.peer_lock.unlock();",
+        "peer->block_resume_pending.store(true, std::memory_order_release);",
+        "HELLO_ACK deferred proxy resume lock boundary",
+    )
+    require_order(
+        body,
+        "peer->block_resume_pending.store(true, std::memory_order_release);",
+        "wki_lsa_generate_and_flood();",
+        "HELLO_ACK queues proxy resume before topology refresh",
+    )
 
 
 def test_hello_boot_epoch_fences_connected_broadcast_restarts() -> None:
@@ -179,6 +192,145 @@ def test_hello_boot_epoch_fences_connected_broadcast_restarts() -> None:
     ]:
         if token not in ktest_source:
             fail(f"peer boot epoch KTEST is missing {token}")
+
+
+def test_connected_epoch_reset_retires_vfs_before_channel_reuse() -> None:
+    source = PEER_CPP.read_text()
+    for handler_name in ["handle_hello", "handle_hello_ack"]:
+        body = function_body(source, handler_name)
+        required = [
+            "!WAS_FENCED && (remote_boot_epoch_changed || remote_channel_epoch_changed)",
+            "wki_dev_server_mark_epoch_reset(peer_node)",
+            "wki_remote_vfs_mark_epoch_reset(peer_node)",
+            "peer->vfs_reset_invalidate_discovery.store(true, std::memory_order_release)",
+            "peer->vfs_reset_rebind_pending.store(true, std::memory_order_release)",
+            "wki_timer_notify()",
+            "wki_channels_close_for_peer(peer_node)",
+        ]
+        missing = [token for token in required if token not in body]
+        if missing:
+            fail(f"{handler_name} connected epoch reset is missing: " + ", ".join(missing))
+        require_order(
+            body,
+            "wki_dev_server_mark_epoch_reset(peer_node)",
+            "wki_remote_vfs_mark_epoch_reset(peer_node)",
+            f"{handler_name} must retire owner bindings before consumer proxies",
+        )
+        require_order(
+            body,
+            "wki_remote_vfs_mark_epoch_reset(peer_node)",
+            "wki_channels_close_for_peer(peer_node)",
+            f"{handler_name} must stop VFS operations before channel reuse",
+        )
+
+    drain_body = function_body(source, "drain_pending_epoch_reset_cleanups")
+    required_drain = [
+        "peer.vfs_reset_rebind_pending.load(std::memory_order_acquire)",
+        "lifecycle.acquire(&peer)",
+        "wki_dev_server_cleanup_epoch_reset_for_peer(peer.node_id)",
+        "wki_remote_vfs_cleanup_for_peer(peer.node_id, OWNER_REBOOT_PROVEN)",
+        "bool const CONNECTED = peer.state == PeerState::CONNECTED",
+        "peer.vfs_reset_invalidate_discovery.exchange(false, std::memory_order_acq_rel)",
+        "wki_resources_invalidate_for_peer(peer.node_id)",
+        "wki_resources_rebind_vfs_for_peer(peer.node_id)",
+        "peer.vfs_reset_rebind_pending.store(false, std::memory_order_release)",
+    ]
+    missing = [token for token in required_drain if token not in drain_body]
+    if missing:
+        fail("task-context VFS epoch cleanup/rebind is missing: " + ", ".join(missing))
+    require_order(
+        drain_body,
+        "wki_dev_server_cleanup_epoch_reset_for_peer(peer.node_id)",
+        "wki_remote_vfs_cleanup_for_peer(peer.node_id, OWNER_REBOOT_PROVEN)",
+        "server binding drain must precede RemoteVfsFd cleanup",
+    )
+    require_order(
+        drain_body,
+        "wki_resources_rebind_vfs_for_peer(peer.node_id)",
+        "peer.vfs_reset_rebind_pending.store(false, std::memory_order_release)",
+        "epoch admission must remain closed through reconciliation",
+    )
+
+    marker_body = function_body(REMOTE_VFS_CPP.read_text(), "wki_remote_vfs_mark_epoch_reset")
+    if "std::deque" in marker_body or "delete " in marker_body or "finish_" in marker_body:
+        fail("HELLO RX VFS epoch marker must remain bounded and nonblocking")
+    for token in ["s_vfs_lock.lock()", "state->active = false", "state->epoch_reset_pending = true"]:
+        if token not in marker_body:
+            fail(f"HELLO RX VFS epoch marker is missing {token}")
+
+    rebind_body = function_body(REMOTABLE_CPP.read_text(), "wki_resources_rebind_vfs_for_peer")
+    for token in [
+        "superseded.valid = false",
+        "resource.generation = next_resource_generation_locked()",
+        "queue_vfs_mount_locked(node_id, resource.resource_id, resource.generation",
+        "g_discovered.push_back(superseded)",
+    ]:
+        if token not in rebind_body:
+            fail(f"cached VFS epoch rebind is missing {token}")
+
+    wki_source = WKI_CPP.read_text()
+    lifecycle_body = function_body(wki_source, "message_uses_device_session_lifecycle")
+    for token in ["DEV_ATTACH_REQ", "DEV_ATTACH_ACK", "DEV_DETACH", "dev_op_uses_ipc_lifecycle(type, payload, payload_len)"]:
+        if token not in lifecycle_body:
+            fail(f"device session lifecycle admission is missing {token}")
+    gate_body = function_body(wki_source, "epoch_reset_blocks_message")
+    for token in ["message_uses_deferred_remotable_rx", "message_is_epoch_reset_sensitive", "vfs_reset_rebind_pending.load"]:
+        if token not in gate_body:
+            fail(f"epoch reset reliable admission gate is missing {token}")
+    rx_body = function_body(wki_source, "wki_rx")
+    require_order(
+        rx_body,
+        "if (epoch_reset_blocks_message(hdr->src_node, msg))",
+        "bool const RELIABLE_RX_ACCEPTED",
+        "epoch reset gate must drop before ACK advancement",
+    )
+
+
+def test_dev_op_lifecycle_is_payload_aware_but_epoch_gate_is_not() -> None:
+    source = WKI_CPP.read_text()
+    ipc_classifier = function_body(source, "dev_op_uses_ipc_lifecycle")
+    require_tokens = [
+        "type == MsgType::DEV_OP_REQ",
+        "payload_len < sizeof(DevOpReqPayload)",
+        "type == MsgType::DEV_OP_RESP",
+        "payload_len < sizeof(DevOpRespPayload)",
+        "op_id >= IPC_DEV_OP_MIN && op_id <= IPC_DEV_OP_MAX",
+    ]
+    missing = [token for token in require_tokens if token not in ipc_classifier]
+    if missing:
+        fail("payload-aware IPC DEV_OP lifecycle classifier is missing: " + ", ".join(missing))
+    for token in [
+        "type != MsgType::DEV_OP_REQ && type != MsgType::DEV_OP_RESP",
+        "if (payload == nullptr)",
+        "return true",
+    ]:
+        if token not in ipc_classifier:
+            fail(f"malformed DEV_OP lifecycle classification is not conservative: missing {token}")
+
+    lifecycle_body = function_body(source, "message_uses_device_session_lifecycle")
+    if "return dev_op_uses_ipc_lifecycle(type, payload, payload_len);" not in lifecycle_body:
+        fail("DEV_OP peer lifecycle must be limited to payload-classified IPC operations")
+
+    epoch_sensitive = function_body(source, "message_is_epoch_reset_sensitive")
+    for token in ["DEV_ATTACH_REQ", "DEV_ATTACH_ACK", "DEV_DETACH", "DEV_OP_REQ", "DEV_OP_RESP"]:
+        if token not in epoch_sensitive:
+            fail(f"epoch reset admission must remain type-wide for {token}")
+    if "dev_op_uses_ipc_lifecycle" in epoch_sensitive:
+        fail("epoch reset admission must not be narrowed to IPC DEV_OP")
+
+    rx_body = function_body(source, "wki_rx")
+    for token in [
+        "message_uses_rx_peer_lifecycle(msg, payload, PAYLOAD_LEN)",
+        "message_uses_rx_peer_lifecycle(RO_MSG, ch->reorder_head->data, ch->reorder_head->len)",
+    ]:
+        if token not in rx_body:
+            fail(f"reliable RX must use payload-aware lifecycle classification: missing {token}")
+    require_order(
+        rx_body,
+        "message_uses_rx_peer_lifecycle(msg, payload, PAYLOAD_LEN)",
+        "if (epoch_reset_blocks_message(hdr->src_node, msg))",
+        "DEV_OP lifecycle and epoch-reset admission order",
+    )
 
 
 def test_reliable_rx_rejects_fenced_peer_before_channel_lookup() -> None:
@@ -600,7 +752,7 @@ def test_fence_drains_deferred_vfs_bindings_before_remote_fd_cleanup() -> None:
     require_order(
         body,
         "wki_dev_server_detach_all_for_peer(fenced_id)",
-        "wki_remote_vfs_cleanup_for_peer(fenced_id)",
+        "wki_remote_vfs_cleanup_for_peer(fenced_id, false)",
         "peer fence must drain retained VFS handlers before closing their remote FDs",
     )
 
@@ -608,6 +760,8 @@ def test_fence_drains_deferred_vfs_bindings_before_remote_fd_cleanup() -> None:
 def main() -> None:
     test_hello_ack_reconnects_fenced_peer_outside_peer_lock()
     test_hello_boot_epoch_fences_connected_broadcast_restarts()
+    test_connected_epoch_reset_retires_vfs_before_channel_reuse()
+    test_dev_op_lifecycle_is_payload_aware_but_epoch_gate_is_not()
     test_reliable_rx_rejects_fenced_peer_before_channel_lookup()
     test_fence_notify_rejects_invalid_targets_before_routing()
     test_shutdown_uses_graceful_goodbye_not_fence()

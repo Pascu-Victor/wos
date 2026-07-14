@@ -262,6 +262,7 @@ struct Task {
     using SignalHandlerTable = std::array<SigHandler, MAX_SIGNALS>;
     using PathBuffer = std::array<char, CWD_MAX>;
     using ExePathBuffer = std::array<char, EXE_PATH_MAX>;
+    using InterpPathBuffer = std::array<char, 256>;
     using HostnameBuffer = std::array<char, WKI_TARGET_HOSTNAME_MAX>;
     using FdTable = FixedFdTable<FD_TABLE_SIZE>;
     static constexpr uint32_t WKI_TARGET_FLAG_STRICT = 1U << 0;
@@ -300,9 +301,12 @@ struct Task {
     // ELF buffer for cleanup and auxv metadata.
     uint8_t* elf_buffer{};
     size_t elf_buffer_size{};
-    uint64_t program_header_addr{};      // Virtual address of program headers (AT_PHDR)
-    uint64_t elf_header_addr{};          // Virtual address of ELF header (AT_EHDR)
-    uint64_t interp_base = 0;            // Load base of dynamic linker (AT_BASE), 0 if statically linked
+    uint64_t program_header_addr{};  // Virtual address of program headers (AT_PHDR)
+    uint64_t elf_header_addr{};      // Virtual address of ELF header (AT_EHDR)
+    uint64_t interp_base = 0;        // Load base of dynamic linker (AT_BASE), 0 if statically linked
+    // Task construction records PT_INTERP without doing VFS I/O. Runtime
+    // process creators load it only after publishing fatal-exit ownership.
+    InterpPathBuffer pending_interp_path{};
     std::atomic<uint64_t> mmap_next{0};  // Next preferred mmap search address; zero means use syscall default.
     LazyVmemRangeVec lazy_vmem_ranges;
     mod::sys::Spinlock lazy_vmem_lock;
@@ -535,6 +539,10 @@ struct Task {
     uint32_t last_sleep_us = 0;
 
     alignas(4) std::atomic<uint32_t> ref_count{1};  // Scheduler owns initial reference
+    // Monotonic publication fence for teardown decisions. Once true, the Task
+    // has been visible through scheduler registries/runqueues and must never
+    // use an unpublished-process destruction path, even after it is detached.
+    std::atomic<bool> scheduler_published{false};
     mod::sys::Spinlock fd_table_lock;
     mod::sys::Spinlock exit_waiters_lock;
 
@@ -561,6 +569,17 @@ struct Task {
     // It keeps its task PID for waitpid, signals, ptrace, and WKI routing, but is
     // not a user-visible process row in /proc root.
     bool wki_proxy_task = false;
+
+    // A process-creation syscall keeps its not-yet-published child here while
+    // kernel waits may reschedule the creator. Fatal exit does not unwind the
+    // syscall stack, so exit cleanup must be able to recover this ownership.
+    // The slot owns one lifetime reference in addition to the creator's initial
+    // reference until publication or explicit destruction clears the slot.
+    std::atomic<Task*> owned_unpublished_process{nullptr};
+    // Synchronous child teardown can block in VFS/address-space cleanup. Fatal
+    // and group-exit handoffs defer while this is set, leaving their pending
+    // request intact until the owner slot and child are fully retired.
+    std::atomic<bool> unpublished_teardown_in_progress{false};
 
     bool exit_in_progress{};
     bool has_exited{};
@@ -718,6 +737,19 @@ struct Task {
 
 auto get_next_pid() -> uint64_t;
 void destroy_unpublished_user_thread(Task* task);
+[[nodiscard]] auto claim_unpublished_process(Task* owner, Task* child) -> bool;
+[[nodiscard]] auto release_unpublished_process(Task* owner, Task* child) -> bool;
+// Transfers the slot-owned lifetime reference to the caller. The returned
+// pointer must be passed to destroy_unpublished_process(), which consumes it.
+[[nodiscard]] auto take_unpublished_process(Task* owner) -> Task*;
+[[nodiscard]] auto destroy_unpublished_process(Task* task) -> bool;
+// Destroy an exclusively owned child while keeping it discoverable through
+// owner until all potentially blocking cleanup has completed.
+[[nodiscard]] auto destroy_owned_unpublished_process(Task* owner, Task* child) -> bool;
+// Complete the PT_INTERP stage deliberately omitted from Task's constructor.
+// Runtime callers must first transfer the ELF/kernel stack to the Task and
+// claim an unpublished-process owner that survives any voluntary VFS wait.
+[[nodiscard]] auto complete_unpublished_process_construction(Task* task) -> bool;
 [[nodiscard]] auto clone_lazy_vmem_ranges(Task& dst, Task& src) -> bool;
 void release_lazy_vmem_ranges(Task& task);
 
@@ -771,6 +803,9 @@ inline void task_release_waitpid_completion_claim(Task& task) { task.waitpid_com
 #ifdef WOS_SELFTEST
 auto task_selftest_fd_clone_failure_releases_refs() -> bool;
 auto task_selftest_destroy_unpublished_user_thread_releases_refs() -> bool;
+auto task_selftest_unpublished_process_owner_releases_resources() -> bool;
+auto task_selftest_owned_unpublished_process_teardown_releases_resources() -> bool;
+auto task_selftest_published_process_refuses_unpublished_teardown() -> bool;
 auto task_selftest_waited_on_claim_is_single_winner() -> bool;
 auto task_selftest_waitpid_block_state_clear_resets_fields() -> bool;
 #endif

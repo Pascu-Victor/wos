@@ -4,10 +4,10 @@
 #include <atomic>
 #include <cerrno>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <dev/block_device.hpp>
 #include <dev/gpt.hpp>
-#include <net/wki/dev_server.hpp>
 #include <net/wki/event.hpp>
 #include <net/wki/remotable.hpp>
 #include <net/wki/wire.hpp>
@@ -36,6 +36,10 @@ namespace {
 ker::util::SmallVec<MountPoint*, 8> mounts;
 mod::sys::Spinlock mount_lock;  // Protects mounts and mount_count
 std::atomic<uint64_t> mount_generation{1};
+// Even values admit mount-table publication. remap_mounts_for_pivot() makes
+// this odd until task roots are updated and rebase_wki_mounts_for_new_root()
+// completes the namespace transition.
+std::atomic<uint64_t> mount_pivot_epoch{2};
 uint32_t next_dev_id = 1;
 using log = ker::mod::dbg::logger<"vfs_mount">;
 
@@ -49,6 +53,43 @@ constexpr size_t MOUNT_ROOT_FALLBACK_CACHE_WAYS = 2;
 constexpr size_t MOUNT_ROOT_COMPONENT_CACHE_MAX = 64;
 static_assert((MOUNT_LOOKUP_CACHE_SET_COUNT & (MOUNT_LOOKUP_CACHE_SET_COUNT - 1)) == 0);
 static_assert((MOUNT_ROOT_FALLBACK_CACHE_SET_COUNT & (MOUNT_ROOT_FALLBACK_CACHE_SET_COUNT - 1)) == 0);
+
+struct PivotMountReplacement {
+    MountPoint* mount = nullptr;
+    char* path = nullptr;
+    size_t path_len = 0;
+};
+
+auto wait_for_stable_mount_pivot_epoch() -> uint64_t {
+    while (true) {
+        uint64_t const EPOCH = mount_pivot_epoch.load(std::memory_order_acquire);
+        if ((EPOCH & 1U) == 0) {
+            return EPOCH;
+        }
+        if (ker::mod::sched::can_query_current_task() && ker::mod::sched::preemptible() && ker::mod::sched::interrupts_enabled()) {
+            ker::mod::sched::kern_yield();
+        } else {
+            asm volatile("pause" ::: "memory");
+        }
+    }
+}
+
+void release_pivot_replacements(ker::util::SmallVec<PivotMountReplacement, 8>& replacements) {
+    for (auto& replacement : replacements) {
+        delete[] replacement.path;
+        replacement.path = nullptr;
+    }
+    replacements.clear();
+}
+
+auto abort_mount_pivot(uint64_t odd_epoch, int error) -> int {
+    mount_lock.lock();
+    if (mount_pivot_epoch.load(std::memory_order_acquire) == odd_epoch) {
+        mount_pivot_epoch.store(odd_epoch + 1, std::memory_order_release);
+    }
+    mount_lock.unlock();
+    return error;
+}
 
 struct MountLookupCacheEntry {
     std::array<char, MOUNT_PATH_MAX> path{};
@@ -360,7 +401,7 @@ auto mount_path_matches(const MountPoint* mount, const char* path, size_t path_l
     return std::strncmp(path, mount->path, MOUNT_LEN) == 0 && (path[MOUNT_LEN] == '\0' || path[MOUNT_LEN] == '/');
 }
 
-auto mount_lookup_cache_get_retained(const char* path, size_t path_len) -> MountPoint* {
+auto mount_lookup_cache_get_retained(const char* path, size_t path_len, uint64_t pivot_epoch) -> MountPoint* {
     if (path == nullptr || path_len == 0 || path_len >= MOUNT_PATH_MAX) {
         return nullptr;
     }
@@ -390,7 +431,8 @@ auto mount_lookup_cache_get_retained(const char* path, size_t path_len) -> Mount
 
     MountPoint* retained = nullptr;
     mount_lock.lock();
-    if (mount_generation.load(std::memory_order_acquire) == GENERATION && mount_path_matches(candidate, path, path_len, true) &&
+    if (mount_pivot_epoch.load(std::memory_order_acquire) == pivot_epoch &&
+        mount_generation.load(std::memory_order_acquire) == GENERATION && mount_path_matches(candidate, path, path_len, true) &&
         retain_mount_locked(candidate)) {
         retained = candidate;
     }
@@ -405,7 +447,7 @@ auto mount_lookup_cache_get_retained(const char* path, size_t path_len) -> Mount
     return retained;
 }
 
-auto mount_root_fallback_cache_get_retained(const char* path, size_t component_len) -> MountPoint* {
+auto mount_root_fallback_cache_get_retained(const char* path, size_t component_len, uint64_t pivot_epoch) -> MountPoint* {
     if (path == nullptr || component_len == 0 || component_len >= MOUNT_ROOT_COMPONENT_CACHE_MAX || path[0] != '/') {
         return nullptr;
     }
@@ -435,7 +477,8 @@ auto mount_root_fallback_cache_get_retained(const char* path, size_t component_l
 
     MountPoint* retained = nullptr;
     mount_lock.lock();
-    if (mount_generation.load(std::memory_order_acquire) == GENERATION && mount_is_root(candidate) && retain_mount_locked(candidate)) {
+    if (mount_pivot_epoch.load(std::memory_order_acquire) == pivot_epoch &&
+        mount_generation.load(std::memory_order_acquire) == GENERATION && mount_is_root(candidate) && retain_mount_locked(candidate)) {
         retained = candidate;
     }
     mount_lock.unlock();
@@ -529,21 +572,6 @@ void mount_root_fallback_cache_store(const char* path, size_t component_len, Mou
     victim->component_len = component_len;
     victim->valid = true;
     set.lock.unlock();
-}
-
-auto replace_mount_path_locked(MountPoint* mount, const char* new_path, size_t new_path_len) -> int {
-    if (mount_has_active_refs_locked(mount)) {
-        return -EBUSY;
-    }
-    auto* replacement = new char[new_path_len + 1];
-    if (replacement == nullptr) {
-        return -ENOMEM;
-    }
-    std::memcpy(replacement, new_path, new_path_len + 1);
-    delete[] mount->path;
-    mount->path = replacement;
-    mount->path_len = new_path_len;
-    return 0;
 }
 
 void destroy_mount_private_data(MountPoint* mount) {
@@ -797,18 +825,26 @@ auto mounted_block_device_overlaps(const ker::dev::BlockDevice* device) -> bool 
         return false;
     }
 
-    mount_lock.lock();
-    for (auto* mount : mounts) {
-        if (mount != nullptr && mount->device != nullptr && ker::dev::block_devices_overlap(mount->device, device)) {
+    while (true) {
+        uint64_t const PIVOT_EPOCH = wait_for_stable_mount_pivot_epoch();
+        mount_lock.lock();
+        if (mount_pivot_epoch.load(std::memory_order_acquire) != PIVOT_EPOCH) {
             mount_lock.unlock();
-            return true;
+            continue;
         }
+        for (auto* mount : mounts) {
+            if (mount != nullptr && mount->device != nullptr && ker::dev::block_devices_overlap(mount->device, device)) {
+                mount_lock.unlock();
+                return true;
+            }
+        }
+        mount_lock.unlock();
+        return false;
     }
-    mount_lock.unlock();
-    return false;
 }
 
-auto mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevice* device, unsigned long flags, const char* data) -> int {
+auto mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevice* device, unsigned long flags, const char* data,
+                      void* initial_private_data, FileOperations* initial_fops) -> int {
     (void)flags;
     if (path == nullptr || fstype == nullptr) {
         vfs_debug_log("mount_filesystem: invalid arguments\n");
@@ -818,6 +854,8 @@ auto mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevic
         vfs_debug_log("mount_filesystem: shutdown in progress\n");
         return -ESHUTDOWN;
     }
+
+    uint64_t const PIVOT_EPOCH = wait_for_stable_mount_pivot_epoch();
 
     // Resolve through task root prefix so the stored path matches what
     // find_mount_point receives after resolve_task_path_raw.
@@ -858,8 +896,8 @@ auto mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevic
 
     bool const BLOCK_RW_FS = mount->fs_type == FSType::FAT32 || mount->fs_type == FSType::XFS;
     if (BLOCK_RW_FS && device != nullptr && !ker::dev::block_device_is_read_only(device) &&
-        ker::net::wki::wki_dev_server_block_has_remote_writer(device)) {
-        vfs_debug_log("mount_filesystem: block device has a remote writer\n");
+        !mount->block_writer_lease.try_acquire(device, ker::dev::BlockWriterLeaseOwner::LOCAL_MOUNT)) {
+        vfs_debug_log("mount_filesystem: block device has a remote writer lease\n");
         destroy_mount(mount);
         return -EBUSY;
     }
@@ -918,8 +956,11 @@ auto mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevic
         // devfs filesystem
         mount->fops = ker::vfs::devfs::get_devfs_fops();
     } else if (std::strcmp(fstype, "remote") == 0) {
-        // Remote VFS - fops and private_data set by caller after mount_filesystem returns
-        mount->fops = nullptr;
+        // Publish remote ownership together with the mount-table row. A
+        // deferred withdrawal can otherwise configure or retire a different
+        // same-path mount in the gap after this function returns.
+        mount->private_data = initial_private_data;
+        mount->fops = initial_fops;
     } else if (std::strcmp(fstype, "procfs") == 0) {
         mount->fops = ker::vfs::procfs::get_procfs_fops();
     } else if (std::strcmp(fstype, "xfs") == 0) {
@@ -945,6 +986,22 @@ auto mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevic
 
     size_t mount_count_after_insert = 0;
     mount_lock.lock();
+    if (mount_pivot_epoch.load(std::memory_order_acquire) != PIVOT_EPOCH) {
+        mount_lock.unlock();
+        vfs_debug_log("mount_filesystem: pivot namespace changed before publication\n");
+        destroy_mount(mount);
+        return -EBUSY;
+    }
+    if (mount->fs_type == FSType::REMOTE) {
+        for (auto* existing : mounts) {
+            if (existing != nullptr && existing->path != nullptr && std::strcmp(existing->path, mount->path) == 0) {
+                mount_lock.unlock();
+                vfs_debug_log("mount_filesystem: remote mount path already occupied\n");
+                destroy_mount(mount);
+                return -EBUSY;
+            }
+        }
+    }
     mount->dev_id = next_dev_id++;
     if (mount->fs_type == FSType::XFS && mount->private_data != nullptr) {
         static_cast<ker::vfs::xfs::XfsMountContext*>(mount->private_data)->dev_id = mount->dev_id;
@@ -978,50 +1035,128 @@ auto mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevic
     return 0;
 }
 
-auto unmount_filesystem(const char* path) -> int {
+namespace {
+auto unmount_filesystem_impl(const char* path, const void* expected_private_data, bool require_private_data_match) -> int {
     if (path == nullptr) {
         return -EINVAL;
     }
 
-    // Resolve through task root prefix to match stored mount paths.
-    std::array<char, MAX_MOUNT_PATH> resolved{};
-    int const PATH_RET = resolve_mount_path(path, resolved.data(), resolved.size());
-    if (PATH_RET < 0) {
-        return PATH_RET;
-    }
+    MountPoint* removed_mount = nullptr;
+    size_t mount_count_after_remove = 0;
+    while (removed_mount == nullptr) {
+        uint64_t const PIVOT_EPOCH = wait_for_stable_mount_pivot_epoch();
 
-    mount_lock.lock();
-    for (size_t i = 0; i < mounts.size(); ++i) {
-        MountPoint* mp = mounts.at(i);
-        if (mp != nullptr && mp->path != nullptr && std::strcmp(resolved.data(), mp->path) == 0) {
+        // Resolve again after every pivot retry so the task-root prefix and
+        // stored mount namespace stay in the same publication epoch.
+        std::array<char, MAX_MOUNT_PATH> resolved{};
+        int const PATH_RET = resolve_mount_path(path, resolved.data(), resolved.size());
+        if (PATH_RET < 0) {
+            return PATH_RET;
+        }
+
+        mount_lock.lock();
+        if (mount_pivot_epoch.load(std::memory_order_acquire) != PIVOT_EPOCH) {
+            mount_lock.unlock();
+            continue;
+        }
+        for (size_t i = 0; i < mounts.size(); ++i) {
+            MountPoint* mp = mounts.at(i);
+            bool const PATH_MATCHES = mp != nullptr && mp->path != nullptr && std::strcmp(resolved.data(), mp->path) == 0;
+            bool const OWNER_MATCHES = !require_private_data_match || (mp != nullptr && mp->private_data == expected_private_data);
+            if (!PATH_MATCHES || !OWNER_MATCHES) {
+                continue;
+            }
             mp->retiring.store(true, std::memory_order_release);
             bump_mount_generation_locked();
             mounts.remove_at(i);
-            size_t const MOUNT_COUNT_AFTER_REMOVE = mounts.size();
-            mount_lock.unlock();
-
-            wait_for_mount_refs_to_drain(mp);
-            destroy_mount(mp);
-
-            ker::mod::perf::record_container_stat(0, 0, ker::mod::perf::PerfSubsystem::MOUNT_TABLE, 0, ker::mod::perf::PERF_FLAG_CT_REMOVE,
-                                                  static_cast<int64_t>(MOUNT_COUNT_AFTER_REMOVE), 0, 0);
-
-            vfs_debug_log("unmount_filesystem: unmounted ");
-            vfs_debug_log(path);
-            vfs_debug_log("\n");
-
-            // Emit WKI storage unmount event (if WKI is active)
-            if (ker::net::wki::g_wki.initialized) {
-                ker::net::wki::wki_event_publish(ker::net::wki::EVENT_CLASS_STORAGE, ker::net::wki::EVENT_STORAGE_UNMOUNT, path,
-                                                 static_cast<uint16_t>(std::strlen(path) + 1));
-                ker::net::wki::wki_resource_advertise_all();
-            }
-
-            return 0;
+            mount_count_after_remove = mounts.size();
+            removed_mount = mp;
+            break;
+        }
+        mount_lock.unlock();
+        if (removed_mount == nullptr) {
+            return -ENOENT;
         }
     }
-    mount_lock.unlock();
-    return -ENOENT;
+
+    wait_for_mount_refs_to_drain(removed_mount);
+    destroy_mount(removed_mount);
+
+    ker::mod::perf::record_container_stat(0, 0, ker::mod::perf::PerfSubsystem::MOUNT_TABLE, 0, ker::mod::perf::PERF_FLAG_CT_REMOVE,
+                                          static_cast<int64_t>(mount_count_after_remove), 0, 0);
+
+    vfs_debug_log("unmount_filesystem: unmounted ");
+    vfs_debug_log(path);
+    vfs_debug_log("\n");
+
+    // Emit WKI storage unmount event (if WKI is active)
+    if (ker::net::wki::g_wki.initialized) {
+        ker::net::wki::wki_event_publish(ker::net::wki::EVENT_CLASS_STORAGE, ker::net::wki::EVENT_STORAGE_UNMOUNT, path,
+                                         static_cast<uint16_t>(std::strlen(path) + 1));
+        ker::net::wki::wki_resource_advertise_all();
+    }
+
+    return 0;
+}
+}  // namespace
+
+auto unmount_filesystem(const char* path) -> int { return unmount_filesystem_impl(path, nullptr, false); }
+
+auto unmount_filesystem_if_private_data(const char* path, const void* expected_private_data) -> int {
+    if (expected_private_data == nullptr) {
+        return -EINVAL;
+    }
+    return unmount_filesystem_impl(path, expected_private_data, true);
+}
+
+auto unmount_filesystem_by_private_data(const void* expected_private_data) -> int {
+    if (expected_private_data == nullptr) {
+        return -EINVAL;
+    }
+
+    std::array<char, MAX_MOUNT_PATH> mounted_path{};
+    MountPoint* owned_mount = nullptr;
+    size_t mount_count_after_remove = 0;
+    while (owned_mount == nullptr) {
+        uint64_t const PIVOT_EPOCH = wait_for_stable_mount_pivot_epoch();
+        mount_lock.lock();
+        if (mount_pivot_epoch.load(std::memory_order_acquire) != PIVOT_EPOCH) {
+            mount_lock.unlock();
+            continue;
+        }
+        for (size_t i = 0; i < mounts.size(); ++i) {
+            MountPoint* const MP = mounts.at(i);
+            if (MP == nullptr || MP->private_data != expected_private_data) {
+                continue;
+            }
+            if (MP->path != nullptr) {
+                std::snprintf(mounted_path.data(), mounted_path.size(), "%s", MP->path);
+            }
+            MP->retiring.store(true, std::memory_order_release);
+            bump_mount_generation_locked();
+            mounts.remove_at(i);
+            mount_count_after_remove = mounts.size();
+            owned_mount = MP;
+            break;
+        }
+        mount_lock.unlock();
+        if (owned_mount == nullptr) {
+            return -ENOENT;
+        }
+    }
+
+    wait_for_mount_refs_to_drain(owned_mount);
+    destroy_mount(owned_mount);
+    ker::mod::perf::record_container_stat(0, 0, ker::mod::perf::PerfSubsystem::MOUNT_TABLE, 0, ker::mod::perf::PERF_FLAG_CT_REMOVE,
+                                          static_cast<int64_t>(mount_count_after_remove), 0, 0);
+
+    vfs_debug_log("unmount_filesystem: unmounted owned mount\n");
+    if (ker::net::wki::g_wki.initialized) {
+        ker::net::wki::wki_event_publish(ker::net::wki::EVENT_CLASS_STORAGE, ker::net::wki::EVENT_STORAGE_UNMOUNT, mounted_path.data(),
+                                         static_cast<uint16_t>(std::strlen(mounted_path.data()) + 1));
+        ker::net::wki::wki_resource_advertise_all();
+    }
+    return 0;
 }
 
 auto shutdown_unmount_all_exact(const char* root_path) -> int {
@@ -1029,7 +1164,12 @@ auto shutdown_unmount_all_exact(const char* root_path) -> int {
         return -EINVAL;
     }
 
+    uint64_t const PIVOT_EPOCH = wait_for_stable_mount_pivot_epoch();
     mount_lock.lock();
+    if (mount_pivot_epoch.load(std::memory_order_acquire) != PIVOT_EPOCH) {
+        mount_lock.unlock();
+        return -EBUSY;
+    }
     size_t const COUNT = mounts.size();
     mount_lock.unlock();
     if (COUNT == 0) {
@@ -1044,6 +1184,11 @@ auto shutdown_unmount_all_exact(const char* root_path) -> int {
     int result = 0;
     size_t pending_count = 0;
     mount_lock.lock();
+    if (mount_pivot_epoch.load(std::memory_order_acquire) != PIVOT_EPOCH) {
+        mount_lock.unlock();
+        delete[] pending;
+        return -EBUSY;
+    }
     while (!mounts.empty() && pending_count < COUNT) {
         auto* mp = mounts.at(0);
         if (mp != nullptr) {
@@ -1098,81 +1243,110 @@ auto find_mount_point(const char* path, size_t known_path_len) -> MountRef {
     bool const PATH_LEN_KNOWN = PATH_LEN != UNKNOWN_MOUNT_PATH_LEN;
     size_t const FIRST_COMPONENT_LEN = PATH_LEN_KNOWN ? mount_first_component_len(path, PATH_LEN) : 0;
     bool const ROOT_FALLBACK_CACHEABLE = FIRST_COMPONENT_LEN > 0 && FIRST_COMPONENT_LEN < MOUNT_ROOT_COMPONENT_CACHE_MAX && path[0] == '/';
-    if (PATH_LEN_KNOWN) {
-        if (ROOT_FALLBACK_CACHEABLE) {
-            if (auto* cached_root = mount_root_fallback_cache_get_retained(path, FIRST_COMPONENT_LEN); cached_root != nullptr) {
-                return MountRef{cached_root};
+    while (true) {
+        uint64_t const PIVOT_EPOCH = wait_for_stable_mount_pivot_epoch();
+        if (PATH_LEN_KNOWN) {
+            if (ROOT_FALLBACK_CACHEABLE) {
+                if (auto* cached_root = mount_root_fallback_cache_get_retained(path, FIRST_COMPONENT_LEN, PIVOT_EPOCH);
+                    cached_root != nullptr) {
+                    return MountRef{cached_root};
+                }
+                if (mount_pivot_epoch.load(std::memory_order_acquire) != PIVOT_EPOCH) {
+                    continue;
+                }
+            }
+            if (auto* cached = mount_lookup_cache_get_retained(path, PATH_LEN, PIVOT_EPOCH); cached != nullptr) {
+                return MountRef{cached};
+            }
+            if (mount_pivot_epoch.load(std::memory_order_acquire) != PIVOT_EPOCH) {
+                continue;
             }
         }
-        if (auto* cached = mount_lookup_cache_get_retained(path, PATH_LEN); cached != nullptr) {
-            return MountRef{cached};
-        }
-    }
 
-    // Find the longest matching mount point
-    MountPoint* best_match = nullptr;
-    size_t best_length = 0;
-    uint64_t generation = 0;
-    bool first_component_has_nonroot_mount = false;
+        // Find the longest matching mount point.
+        MountPoint* best_match = nullptr;
+        size_t best_length = 0;
+        uint64_t generation = 0;
+        bool first_component_has_nonroot_mount = false;
 
-    mount_lock.lock();
-    for (auto* mount : mounts) {
-        if (mount == nullptr || mount->path == nullptr) {
+        mount_lock.lock();
+        if (mount_pivot_epoch.load(std::memory_order_acquire) != PIVOT_EPOCH) {
+            mount_lock.unlock();
             continue;
         }
+        for (auto* mount : mounts) {
+            if (mount == nullptr || mount->path == nullptr) {
+                continue;
+            }
 
-        if (ROOT_FALLBACK_CACHEABLE && mount_first_component_matches(mount, path, FIRST_COMPONENT_LEN)) {
-            first_component_has_nonroot_mount = true;
+            if (ROOT_FALLBACK_CACHEABLE && mount_first_component_matches(mount, path, FIRST_COMPONENT_LEN)) {
+                first_component_has_nonroot_mount = true;
+            }
+
+            size_t const MOUNT_LEN = mount->path_len;
+            if (mount_path_matches(mount, path, PATH_LEN, PATH_LEN_KNOWN) && MOUNT_LEN > best_length) {
+                best_match = mount;
+                best_length = MOUNT_LEN;
+            }
+        }
+        if (best_match != nullptr && !retain_mount_locked(best_match)) {
+            best_match = nullptr;
+        }
+        generation = mount_generation.load(std::memory_order_acquire);
+        mount_lock.unlock();
+
+        if (best_match != nullptr && PATH_LEN_KNOWN) {
+            mount_lookup_cache_store(path, PATH_LEN, best_match, generation);
+            if (ROOT_FALLBACK_CACHEABLE && mount_is_root(best_match) && !first_component_has_nonroot_mount) {
+                mount_root_fallback_cache_store(path, FIRST_COMPONENT_LEN, best_match, generation);
+            }
         }
 
-        size_t const MOUNT_LEN = mount->path_len;
-        if (mount_path_matches(mount, path, PATH_LEN, PATH_LEN_KNOWN) && MOUNT_LEN > best_length) {
-            best_match = mount;
-            best_length = MOUNT_LEN;
-        }
+        return MountRef{best_match};
     }
-    if (best_match != nullptr && !retain_mount_locked(best_match)) {
-        best_match = nullptr;
-    }
-    generation = mount_generation.load(std::memory_order_acquire);
-    mount_lock.unlock();
-
-    if (best_match != nullptr && PATH_LEN_KNOWN) {
-        mount_lookup_cache_store(path, PATH_LEN, best_match, generation);
-        if (ROOT_FALLBACK_CACHEABLE && mount_is_root(best_match) && !first_component_has_nonroot_mount) {
-            mount_root_fallback_cache_store(path, FIRST_COMPONENT_LEN, best_match, generation);
-        }
-    }
-
-    return MountRef{best_match};
 }
 
-auto mount_table_generation_snapshot() -> uint64_t { return mount_generation.load(std::memory_order_acquire); }
+auto mount_table_generation_snapshot() -> uint64_t {
+    while (true) {
+        uint64_t const PIVOT_EPOCH = wait_for_stable_mount_pivot_epoch();
+        uint64_t const GENERATION = mount_generation.load(std::memory_order_acquire);
+        if (mount_pivot_epoch.load(std::memory_order_acquire) == PIVOT_EPOCH) {
+            return GENERATION;
+        }
+    }
+}
 
 auto configure_mount_point_exact(const char* path, FSType expected_type, void* private_data, FileOperations* fops) -> bool {
     if (path == nullptr) {
         return false;
     }
 
-    mount_lock.lock();
-    for (auto* mp : mounts) {
-        if (mp == nullptr || mp->path == nullptr) {
+    while (true) {
+        uint64_t const PIVOT_EPOCH = wait_for_stable_mount_pivot_epoch();
+        mount_lock.lock();
+        if (mount_pivot_epoch.load(std::memory_order_acquire) != PIVOT_EPOCH) {
+            mount_lock.unlock();
             continue;
         }
-        if (mp->fs_type != expected_type) {
-            continue;
-        }
-        if (std::strcmp(mp->path, path) != 0) {
-            continue;
-        }
+        for (auto* mp : mounts) {
+            if (mp == nullptr || mp->path == nullptr) {
+                continue;
+            }
+            if (mp->fs_type != expected_type) {
+                continue;
+            }
+            if (std::strcmp(mp->path, path) != 0) {
+                continue;
+            }
 
-        mp->private_data = private_data;
-        mp->fops = fops;
+            mp->private_data = private_data;
+            mp->fops = fops;
+            mount_lock.unlock();
+            return true;
+        }
         mount_lock.unlock();
-        return true;
+        return false;
     }
-    mount_lock.unlock();
-    return false;
 }
 
 auto remap_mounts_for_pivot(const char* new_root, const char* put_old) -> int {
@@ -1182,8 +1356,22 @@ auto remap_mounts_for_pivot(const char* new_root, const char* put_old) -> int {
 
     size_t const NEW_ROOT_LEN = std::strlen(new_root);
     size_t const PUT_OLD_LEN = std::strlen(put_old);
+    if (NEW_ROOT_LEN == 0 || PUT_OLD_LEN == 0) {
+        return -EINVAL;
+    }
+    if (NEW_ROOT_LEN >= MAX_MOUNT_PATH || PUT_OLD_LEN >= MAX_MOUNT_PATH) {
+        return -ENAMETOOLONG;
+    }
 
     mount_lock.lock();
+
+    uint64_t const STABLE_EPOCH = mount_pivot_epoch.load(std::memory_order_acquire);
+    if ((STABLE_EPOCH & 1U) != 0 || STABLE_EPOCH > UINT64_MAX - 2) {
+        mount_lock.unlock();
+        return -EBUSY;
+    }
+    uint64_t const ODD_EPOCH = STABLE_EPOCH + 1;
+    mount_pivot_epoch.store(ODD_EPOCH, std::memory_order_release);
 
     MountPoint const* new_mount = nullptr;
     MountPoint* old_root_mount = nullptr;
@@ -1200,60 +1388,157 @@ auto remap_mounts_for_pivot(const char* new_root, const char* put_old) -> int {
     }
 
     if (new_mount == nullptr) {
+        mount_pivot_epoch.store(ODD_EPOCH + 1, std::memory_order_release);
+        mount_lock.unlock();
+        return -EINVAL;
+    }
+    if (new_mount == old_root_mount) {
+        mount_pivot_epoch.store(ODD_EPOCH + 1, std::memory_order_release);
         mount_lock.unlock();
         return -EINVAL;
     }
 
     if (old_root_mount != nullptr && mount_has_active_refs_locked(old_root_mount)) {
+        mount_pivot_epoch.store(ODD_EPOCH + 1, std::memory_order_release);
         mount_lock.unlock();
         return -EBUSY;
     }
+
     for (auto* mp : mounts) {
-        if (mp == nullptr || mp->path == nullptr || mp == new_mount) {
+        if (mp == nullptr || mp->path == nullptr || mp == new_mount || mp == old_root_mount) {
             continue;
         }
         if (path_is_under_root(mp->path, new_root, NEW_ROOT_LEN)) {
             continue;
         }
         if (mount_has_active_refs_locked(mp)) {
+            mount_pivot_epoch.store(ODD_EPOCH + 1, std::memory_order_release);
             mount_lock.unlock();
+            return -EBUSY;
+        }
+        if (mp->path_len >= MAX_MOUNT_PATH - NEW_ROOT_LEN) {
+            mount_pivot_epoch.store(ODD_EPOCH + 1, std::memory_order_release);
+            mount_lock.unlock();
+            return -ENAMETOOLONG;
+        }
+    }
+
+    uint64_t const TABLE_GENERATION = mount_generation.load(std::memory_order_acquire);
+    size_t const MOUNT_COUNT = mounts.size();
+    mount_lock.unlock();
+
+    // Snapshot one pointer at a time under mount_lock, but grow the temporary
+    // vectors only after unlocking. The odd epoch keeps table publishers and
+    // removers out while all potentially blocking allocations take place.
+    ker::util::SmallVec<MountPoint*, 8> replacement_mounts;
+    for (size_t i = 0; i < MOUNT_COUNT; ++i) {
+        mount_lock.lock();
+        if (mount_pivot_epoch.load(std::memory_order_acquire) != ODD_EPOCH ||
+            mount_generation.load(std::memory_order_acquire) != TABLE_GENERATION || i >= mounts.size()) {
+            mount_lock.unlock();
+            return abort_mount_pivot(ODD_EPOCH, -EBUSY);
+        }
+        MountPoint* const MP = mounts.at(i);
+        mount_lock.unlock();
+
+        if (MP == nullptr || MP->path == nullptr || MP == new_mount ||
+            (MP != old_root_mount && path_is_under_root(MP->path, new_root, NEW_ROOT_LEN))) {
+            continue;
+        }
+        if (!replacement_mounts.push_back(MP)) {
+            return abort_mount_pivot(ODD_EPOCH, -ENOMEM);
+        }
+    }
+
+    ker::util::SmallVec<PivotMountReplacement, 8> replacements;
+    for (auto* mp : replacement_mounts) {
+        size_t const TARGET_LEN = mp == old_root_mount ? PUT_OLD_LEN : NEW_ROOT_LEN + mp->path_len;
+        auto* target = new char[TARGET_LEN + 1];
+        if (target == nullptr) {
+            release_pivot_replacements(replacements);
+            return abort_mount_pivot(ODD_EPOCH, -ENOMEM);
+        }
+        if (mp == old_root_mount) {
+            std::memcpy(target, put_old, PUT_OLD_LEN + 1);
+        } else {
+            std::snprintf(target, TARGET_LEN + 1, "%s%s", new_root, mp->path);
+        }
+        PivotMountReplacement const REPLACEMENT = {.mount = mp, .path = target, .path_len = TARGET_LEN};
+        if (!replacements.push_back(REPLACEMENT)) {
+            delete[] target;
+            release_pivot_replacements(replacements);
+            return abort_mount_pivot(ODD_EPOCH, -ENOMEM);
+        }
+    }
+
+    // Reader/ref acquisition and every mount-table writer validate the even
+    // pivot epoch under mount_lock. While this transition owns the odd epoch,
+    // the table and all path strings are therefore stable without holding the
+    // spinlock through the potentially quadratic collision analysis.
+    if (mount_pivot_epoch.load(std::memory_order_acquire) != ODD_EPOCH ||
+        mount_generation.load(std::memory_order_acquire) != TABLE_GENERATION) {
+        release_pivot_replacements(replacements);
+        return abort_mount_pivot(ODD_EPOCH, -EBUSY);
+    }
+    bool target_collision = false;
+    for (size_t i = 0; i < replacements.size() && !target_collision; ++i) {
+        for (size_t j = i + 1; j < replacements.size(); ++j) {
+            if (std::strcmp(replacements.at(i).path, replacements.at(j).path) == 0) {
+                target_collision = true;
+                break;
+            }
+        }
+        if (target_collision) {
+            break;
+        }
+        for (auto* existing : mounts) {
+            bool existing_is_replaced = false;
+            for (const auto& replacement : replacements) {
+                if (replacement.mount == existing) {
+                    existing_is_replaced = true;
+                    break;
+                }
+            }
+            if (!existing_is_replaced && existing != nullptr && existing->path != nullptr &&
+                std::strcmp(replacements.at(i).path, existing->path) == 0) {
+                target_collision = true;
+                break;
+            }
+        }
+    }
+    if (target_collision) {
+        release_pivot_replacements(replacements);
+        return abort_mount_pivot(ODD_EPOCH, -EBUSY);
+    }
+
+    mount_lock.lock();
+    if (mount_pivot_epoch.load(std::memory_order_acquire) != ODD_EPOCH ||
+        mount_generation.load(std::memory_order_acquire) != TABLE_GENERATION) {
+        mount_lock.unlock();
+        release_pivot_replacements(replacements);
+        return abort_mount_pivot(ODD_EPOCH, -EBUSY);
+    }
+    for (const auto& replacement : replacements) {
+        if (mount_has_active_refs_locked(replacement.mount)) {
+            mount_pivot_epoch.store(ODD_EPOCH + 1, std::memory_order_release);
+            mount_lock.unlock();
+            release_pivot_replacements(replacements);
             return -EBUSY;
         }
     }
 
     bump_mount_generation_locked();
-
-    if (old_root_mount != nullptr) {
-        int const REPLACE_RET = replace_mount_path_locked(old_root_mount, put_old, PUT_OLD_LEN);
-        if (REPLACE_RET < 0) {
-            mount_lock.unlock();
-            return REPLACE_RET;
-        }
-    }
-
-    for (auto* mp : mounts) {
-        if (mp == nullptr || mp->path == nullptr || mp == new_mount) {
-            continue;
-        }
-        if (path_is_under_root(mp->path, new_root, NEW_ROOT_LEN)) {
-            continue;
-        }
-
-        size_t const MP_LEN = mp->path_len;
-        auto* remapped = new char[NEW_ROOT_LEN + MP_LEN + 1];
-        if (remapped == nullptr) {
-            continue;
-        }
-
-        std::memcpy(remapped, new_root, NEW_ROOT_LEN + 1);
-        std::memcpy(remapped + NEW_ROOT_LEN, mp->path, MP_LEN + 1);
-        log::info("pivot_root remapped mount '%s' -> '%s'", mp->path, remapped);
+    for (auto& replacement : replacements) {
+        auto* mp = replacement.mount;
+        log::info("pivot_root remapped mount '%s' -> '%s'", mp->path, replacement.path);
         delete[] mp->path;
-        mp->path = remapped;
-        mp->path_len = NEW_ROOT_LEN + MP_LEN;
+        mp->path = replacement.path;
+        mp->path_len = replacement.path_len;
+        replacement.path = nullptr;
     }
-
     mount_lock.unlock();
+
+    release_pivot_replacements(replacements);
     return 0;
 }
 
@@ -1262,10 +1547,14 @@ void rebase_wki_mounts_for_new_root(const char* new_root) {
         return;
     }
 
-    size_t const NEW_ROOT_LEN = std::strlen(new_root);
-
     mount_lock.lock();
-    bump_mount_generation_locked();
+    uint64_t const ODD_EPOCH = mount_pivot_epoch.load(std::memory_order_acquire);
+    if ((ODD_EPOCH & 1U) == 0) {
+        mount_lock.unlock();
+        return;
+    }
+
+    size_t const NEW_ROOT_LEN = std::strlen(new_root);
     for (auto* mp : mounts) {
         if (mp == nullptr || mp->path == nullptr) {
             continue;
@@ -1276,45 +1565,48 @@ void rebase_wki_mounts_for_new_root(const char* new_root) {
         if (path_is_under_root(mp->path, new_root, NEW_ROOT_LEN)) {
             continue;
         }
-        if (mount_has_active_refs_locked(mp)) {
-            continue;
-        }
-
-        size_t const MP_LEN = mp->path_len;
-        auto* remapped = new char[NEW_ROOT_LEN + MP_LEN + 1];
-        if (remapped == nullptr) {
-            continue;
-        }
-
-        std::memcpy(remapped, new_root, NEW_ROOT_LEN + 1);
-        std::memcpy(remapped + NEW_ROOT_LEN, mp->path, MP_LEN + 1);
-        log::info("pivot_root rebased late WKI mount '%s' -> '%s'", mp->path, remapped);
-        delete[] mp->path;
-        mp->path = remapped;
-        mp->path_len = NEW_ROOT_LEN + MP_LEN;
+        // Mount publication is closed for the entire odd epoch, and the
+        // transactional remap included every pre-existing /wki mount. This is
+        // therefore an invariant diagnostic rather than a best-effort repair.
+        log::warn("pivot_root found an unremapped WKI mount '%s'", mp->path);
     }
+    mount_pivot_epoch.store(ODD_EPOCH + 1, std::memory_order_release);
     mount_lock.unlock();
 }
 
 auto get_mount_count() -> size_t {
-    mount_lock.lock();
-    size_t const COUNT = mounts.size();
-    mount_lock.unlock();
-    return COUNT;
+    while (true) {
+        uint64_t const PIVOT_EPOCH = wait_for_stable_mount_pivot_epoch();
+        mount_lock.lock();
+        if (mount_pivot_epoch.load(std::memory_order_acquire) != PIVOT_EPOCH) {
+            mount_lock.unlock();
+            continue;
+        }
+        size_t const COUNT = mounts.size();
+        mount_lock.unlock();
+        return COUNT;
+    }
 }
 
 auto get_mount_at(size_t index) -> MountRef {
-    mount_lock.lock();
-    if (index >= mounts.size()) {
+    while (true) {
+        uint64_t const PIVOT_EPOCH = wait_for_stable_mount_pivot_epoch();
+        mount_lock.lock();
+        if (mount_pivot_epoch.load(std::memory_order_acquire) != PIVOT_EPOCH) {
+            mount_lock.unlock();
+            continue;
+        }
+        if (index >= mounts.size()) {
+            mount_lock.unlock();
+            return MountRef{};
+        }
+        MountPoint* mp = mounts.at(index);
+        if (!retain_mount_locked(mp)) {
+            mp = nullptr;
+        }
         mount_lock.unlock();
-        return MountRef{};
+        return MountRef{mp};
     }
-    MountPoint* mp = mounts.at(index);
-    if (!retain_mount_locked(mp)) {
-        mp = nullptr;
-    }
-    mount_lock.unlock();
-    return MountRef{mp};
 }
 
 auto get_mount_snapshot_at(size_t index, MountSnapshot* out) -> bool {
@@ -1322,37 +1614,44 @@ auto get_mount_snapshot_at(size_t index, MountSnapshot* out) -> bool {
         return false;
     }
 
-    mount_lock.lock();
-    if (index >= mounts.size()) {
+    while (true) {
+        uint64_t const PIVOT_EPOCH = wait_for_stable_mount_pivot_epoch();
+        mount_lock.lock();
+        if (mount_pivot_epoch.load(std::memory_order_acquire) != PIVOT_EPOCH) {
+            mount_lock.unlock();
+            continue;
+        }
+        if (index >= mounts.size()) {
+            mount_lock.unlock();
+            return false;
+        }
+
+        MountPoint const* mp = mounts.at(index);
+        if (mp == nullptr || mp->path == nullptr) {
+            mount_lock.unlock();
+            return false;
+        }
+
+        size_t const PATH_LEN = mp->path_len;
+        if (PATH_LEN >= MOUNT_PATH_MAX) {
+            mount_lock.unlock();
+            return false;
+        }
+
+        std::memcpy(static_cast<void*>(out->path), mp->path, PATH_LEN + 1);
+        out->fs_type = mp->fs_type;
+        out->dev_id = mp->dev_id;
+        out->read_only = mp->read_only;
+        if (mp->fstype != nullptr) {
+            size_t const FSTYPE_LEN = std::strlen(mp->fstype);
+            size_t const COPY_LEN = (FSTYPE_LEN < MOUNT_FSTYPE_MAX) ? FSTYPE_LEN : MOUNT_FSTYPE_MAX - 1;
+            std::memcpy(static_cast<void*>(out->fstype), mp->fstype, COPY_LEN);
+            out->fstype[COPY_LEN] = '\0';
+        }
+
         mount_lock.unlock();
-        return false;
+        return true;
     }
-
-    MountPoint const* mp = mounts.at(index);
-    if (mp == nullptr || mp->path == nullptr) {
-        mount_lock.unlock();
-        return false;
-    }
-
-    size_t const PATH_LEN = mp->path_len;
-    if (PATH_LEN >= MOUNT_PATH_MAX) {
-        mount_lock.unlock();
-        return false;
-    }
-
-    std::memcpy(static_cast<void*>(out->path), mp->path, PATH_LEN + 1);
-    out->fs_type = mp->fs_type;
-    out->dev_id = mp->dev_id;
-    out->read_only = mp->read_only;
-    if (mp->fstype != nullptr) {
-        size_t const FSTYPE_LEN = std::strlen(mp->fstype);
-        size_t const COPY_LEN = (FSTYPE_LEN < MOUNT_FSTYPE_MAX) ? FSTYPE_LEN : MOUNT_FSTYPE_MAX - 1;
-        std::memcpy(static_cast<void*>(out->fstype), mp->fstype, COPY_LEN);
-        out->fstype[COPY_LEN] = '\0';
-    }
-
-    mount_lock.unlock();
-    return true;
 }
 
 }  // namespace ker::vfs

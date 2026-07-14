@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <net/address.hpp>
@@ -18,6 +19,9 @@ constexpr size_t MAX_NET_DEVICES = 16;
 constexpr size_t NETDEV_NAME_LEN = 16;
 
 struct NetDevice;
+using WkiRxForwardHook = void (*)(NetDevice* dev, PacketBuffer* pkt);
+
+static_assert(std::atomic<WkiRxForwardHook>::is_always_lock_free, "WKI RX forward hook must stay lock-free");
 
 struct NetDeviceOps {
     int (*open)(NetDevice* dev);
@@ -45,7 +49,7 @@ struct NetDevice {
 
     // D11: WKI RX forward hook - set by dev_server when a remote consumer is attached.
     // Called from netdev_rx() to forward received packets to remote consumers.
-    void (*wki_rx_forward)(NetDevice* dev, PacketBuffer* pkt) = nullptr;
+    std::atomic<WkiRxForwardHook> wki_rx_forward{nullptr};
 
     // Set by wki_eth_transport_init() when this NIC is claimed as the WKI transport.
     // Prevents the NIC from being advertised as a remotable NET resource to peers.
@@ -79,6 +83,25 @@ struct NetDeviceSnapshot {
     uint64_t tx_dropped = 0;
 };
 
+// Coordinates registry membership with publication into dependent registries.
+// Callers may acquire other registry locks while this lease is held, but the
+// global order must remain netdevice registry before the dependent registry.
+class NetDeviceRegistryLease {
+   public:
+    NetDeviceRegistryLease();
+    ~NetDeviceRegistryLease();
+
+    NetDeviceRegistryLease(const NetDeviceRegistryLease&) = delete;
+    auto operator=(const NetDeviceRegistryLease&) -> NetDeviceRegistryLease& = delete;
+    NetDeviceRegistryLease(NetDeviceRegistryLease&&) = delete;
+    auto operator=(NetDeviceRegistryLease&&) -> NetDeviceRegistryLease& = delete;
+
+    [[nodiscard]] auto contains(const NetDevice* dev) const -> bool;
+
+   private:
+    uint64_t irq_flags_ = 0;
+};
+
 // Register a new network device (assigns ifindex, auto-names "ethN" if name is empty)
 auto netdev_register(NetDevice* dev) -> int;
 
@@ -88,6 +111,7 @@ auto netdev_unregister(NetDevice* dev) -> int;
 
 // Lookup
 auto netdev_find_by_name(std::string_view name) -> NetDevice*;
+auto netdev_is_registered(const NetDevice* dev) -> bool;
 auto netdev_count() -> size_t;
 auto netdev_at(size_t i) -> NetDevice*;
 auto netdev_snapshot(NetDeviceSnapshot* out, size_t max) -> size_t;

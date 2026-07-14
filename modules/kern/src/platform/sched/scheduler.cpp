@@ -66,7 +66,8 @@ extern "C" [[noreturn]] void wos_kernel_thread_returned() {  // NOLINT(readabili
 namespace ker::mod::sched {
 
 // D17: WKI remote placement hook (nullptr when WKI not active)
-bool (*wki_try_remote_placement_fn)(task::Task* task) = nullptr;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+RemotePlacementResult (*wki_try_remote_placement_fn)(task::Task* task) =
+    nullptr;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
 // ============================================================================
 // Global state
@@ -1193,6 +1194,63 @@ inline auto pid_hash(uint64_t pid) -> uint32_t {
     // NOLINTEND(readability-magic-numbers, cppcoreguidelines-avoid-magic-numbers)
 }
 
+// Publish a fresh task to both global registries as one visibility event.
+// Callers may hold the task's runqueue lock; keep this helper allocation-free
+// and do not call back into scheduler/runqueue code while the registry lock is
+// held. Any PID or active-list collision means the task was not fresh.
+auto register_fresh_task_visibility(task::Task* task) -> bool {
+    if (task == nullptr || task->pid == 0) {
+        return false;
+    }
+
+    uint64_t const FLAGS = global_task_registry_lock.lock_irqsave();
+    for (uint32_t i = 0; i < active_task_count; ++i) {
+        task::Task* const EXISTING = active_task_slot(i);
+        if (EXISTING == task) [[unlikely]] {
+            global_task_registry_lock.unlock_irqrestore(FLAGS);
+            dbg::panic_handler("scheduler: fresh task already present in active registry");
+            hcf();
+        }
+        if (EXISTING != nullptr && EXISTING->pid == task->pid) {
+            global_task_registry_lock.unlock_irqrestore(FLAGS);
+            return false;
+        }
+    }
+
+    uint32_t pid_index = MAX_PIDS;
+    uint32_t const SLOT = pid_hash(task->pid);
+    for (uint32_t i = 0; i < MAX_PIDS; ++i) {
+        uint32_t const INDEX = (SLOT + i) & (MAX_PIDS - 1);
+        auto& entry = pid_slot(INDEX);
+        if (entry.pid == task->pid) {
+            if (entry.task == task) [[unlikely]] {
+                global_task_registry_lock.unlock_irqrestore(FLAGS);
+                dbg::panic_handler("scheduler: fresh task already present in PID registry");
+                hcf();
+            }
+            global_task_registry_lock.unlock_irqrestore(FLAGS);
+            return false;
+        }
+        if (entry.pid == 0) {
+            pid_index = INDEX;
+            break;
+        }
+    }
+    if (pid_index == MAX_PIDS || active_task_count >= MAX_ACTIVE_TASKS) {
+        global_task_registry_lock.unlock_irqrestore(FLAGS);
+        return false;
+    }
+
+    // Readers use this same lock, so neither registry can expose the task
+    // until both fixed-capacity commits are complete.
+    pid_slot(pid_index).task = task;
+    pid_slot(pid_index).pid = task->pid;
+    active_task_slot(active_task_count) = task;
+    active_task_count++;
+    global_task_registry_lock.unlock_irqrestore(FLAGS);
+    return true;
+}
+
 auto pid_table_insert(task::Task* t) -> bool {
     uint64_t const FLAGS = global_task_registry_lock.lock_irqsave();
     uint32_t const SLOT = pid_hash(t->pid);
@@ -2136,6 +2194,7 @@ inline void repair_stale_wait_membership_locked(RunQueue* rq, task::Task* t) {
         if (rq->current_task == t) {
             update_current_load_cache(rq, t);
         }
+        t->scheduler_published.store(true, std::memory_order_release);
         return true;
     }
 
@@ -2160,6 +2219,7 @@ inline void repair_stale_wait_membership_locked(RunQueue* rq, task::Task* t) {
     if (rq->current_task == t) {
         update_current_load_cache(rq, t);
     }
+    t->scheduler_published.store(true, std::memory_order_release);
     return true;
 }
 
@@ -2960,6 +3020,7 @@ bool post_task_for_cpu_impl(uint64_t cpu_no, task::Task* task, bool release_rese
             if (existing_idle == nullptr || existing_idle == task) {
                 rq->idle_task = task;
                 task->sched_queue = task::Task::sched_queue::NONE;
+                task->scheduler_published.store(true, std::memory_order_release);
             }
         });
 
@@ -3519,7 +3580,8 @@ auto post_task_pinned_cpu(uint64_t cpu_no, task::Task* task) -> bool {
 }
 
 auto post_task_waiting(task::Task* task) -> bool {
-    if (task == nullptr) {
+    if (task == nullptr || run_queues == nullptr || task->pid == 0 || task->sched_queue != task::Task::sched_queue::NONE ||
+        task->heap_index >= 0 || task->sched_next != nullptr || task == get_current_task()) {
         return false;
     }
     auto task_state = task->state.load(std::memory_order_acquire);
@@ -3527,8 +3589,13 @@ auto post_task_waiting(task::Task* task) -> bool {
         return false;
     }
 
+    uint64_t const CORE_COUNT = smt::get_core_count();
+    if (CORE_COUNT == 0) {
+        return false;
+    }
+
     uint64_t target_cpu = task->cpu;
-    if (target_cpu >= smt::get_core_count()) {
+    if (target_cpu >= CORE_COUNT) {
         target_cpu = cpu::current_cpu();
     }
     task->cpu = target_cpu;
@@ -3537,57 +3604,41 @@ auto post_task_waiting(task::Task* task) -> bool {
         task->start_time_us = time::get_us();
     }
 
-    bool const NEEDS_REGISTRATION = task->sched_queue == task::Task::sched_queue::NONE;
-    __atomic_thread_fence(__ATOMIC_RELEASE);
-
-    if (NEEDS_REGISTRATION && task->pid > 0) {
-        if (!pid_table_insert(task)) {
-            return false;
-        }
-        if (!active_list_insert(task)) {
-            pid_table_remove(task->pid);
-            return false;
-        }
-    }
-
-    bool parked = false;
-    run_queues->with_lock_void(target_cpu, [task, &parked, target_cpu](RunQueue* rq) {
-        uint64_t const NOW_US = time::get_us();
-        if (task->sched_queue == task::Task::sched_queue::WAITING) {
-            parked = true;
+    bool published = false;
+    run_queues->with_lock_void(target_cpu, [task, &published](RunQueue* rq) {
+        // This API is deliberately narrower than ordinary wake/repark paths:
+        // only its creating task can own this fresh, globally invisible child.
+        if (task->sched_queue != task::Task::sched_queue::NONE || task->heap_index >= 0 || task->sched_next != nullptr ||
+            runqueue_task_is_reserved_locked(rq, task) || rq->runnable_heap.contains(task) || wait_list_contains_locked(rq, task)) {
             return;
         }
 
-        if (task->sched_queue == task::Task::sched_queue::NONE) {
-            task->last_sleep_start_us = NOW_US;
-            task->sched_queue = task::Task::sched_queue::WAITING;
-            wait_list_push_locked(rq, task);
-            parked = true;
-            return;
-        }
-
-        // Remote exec proxy setup can hand us a task that is already runnable
-        // but has not actually run its deferred wait path yet. Parking that
-        // task here avoids waiting for it to get a full timeslice just to
-        // enter wki_execve_proxy.
-        if (!rq->runnable_heap.contains(task) || runqueue_task_is_reserved_locked(rq, task)) {
-            return;
-        }
-
-        task->last_run_us = task->slice_used_ns / 1000U;
-        note_perf_wait_callsite(task, task->context.frame.rip);
-        task->last_sleep_start_us = NOW_US;
-        uint64_t const WAKE_AT_US = task->wake_at_us;
-        remove_from_sums(rq, task);
-        rq->runnable_heap.remove(task);
+        task->last_sleep_start_us = time::get_us();
         task->sched_queue = task::Task::sched_queue::WAITING;
         wait_list_push_locked(rq, task);
-        perf::record_sleep(static_cast<uint32_t>(target_cpu), task->pid, WAKE_AT_US, perf_sleep_flags(WAKE_AT_US), task->last_run_us,
-                           perf_wait_callsite(task), task->wait_channel);
-        parked = true;
+
+        // Proxy identity and all constructed Task state must become visible
+        // before PID/active lookups can acquire this pointer. Keep the
+        // runqueue lock through registry commit so a signal wake cannot move
+        // the parked task until the transaction has succeeded.
+        __atomic_thread_fence(__ATOMIC_RELEASE);
+        published = register_fresh_task_visibility(task);
+        if (published) {
+            task->scheduler_published.store(true, std::memory_order_release);
+            return;
+        }
+
+        // Registration made no global writes on failure. The runqueue lock
+        // has remained held since insertion, so removal must succeed and false
+        // once again means a completely unpublished NONE task.
+        if (!wait_list_remove_locked(rq, task)) [[unlikely]] {
+            dbg::panic_handler("scheduler: fresh waiting publication rollback lost task");
+        }
+        task->sched_queue = task::Task::sched_queue::NONE;
+        task->last_sleep_start_us = 0;
     });
 
-    return parked;
+    return published;
 }
 
 auto post_task_balanced(task::Task* task) -> bool {
@@ -3598,8 +3649,13 @@ auto post_task_balanced(task::Task* task) -> bool {
 
     // D17: Try remote placement if WKI is active and task is a user process
     if (wki_try_remote_placement_fn != nullptr && task->type == task::TaskType::PROCESS) {
-        if (wki_try_remote_placement_fn(task)) {
-            return true;  // Successfully submitted remotely
+        RemotePlacementResult const RESULT = wki_try_remote_placement_fn(task);
+        if (RESULT == RemotePlacementResult::REMOTE) {
+            return true;
+        }
+        if (RESULT == RemotePlacementResult::FAILED) {
+            log_rejected_task_publication("remote placement failed", cpu::current_cpu(), task);
+            return false;
         }
     }
 
@@ -3991,11 +4047,16 @@ void maybe_exit_current_kernel_thread_for_shutdown() {
     }
 
     auto* task = get_current_task();
-    if (task == nullptr || task->type != task::TaskType::DAEMON || !task->kernel_shutdown_requested.load(std::memory_order_acquire)) {
+    if (task == nullptr || task->type != task::TaskType::DAEMON || task->exit_in_progress ||
+        !task->kernel_shutdown_requested.load(std::memory_order_acquire)) {
         return;
     }
 
-    if (task->preempt_disable_depth != 0 || !interrupts_enabled()) {
+    // A receiver worker may own a fully constructed but unpublished PROCESS
+    // plus pre-publication output/monitor locals on this stack. Preserve the
+    // cooperative shutdown request until that ownership is released.
+    if (task->preempt_disable_depth != 0 || !interrupts_enabled() ||
+        task->owned_unpublished_process.load(std::memory_order_acquire) != nullptr) {
         task->preempt_pending = true;
         return;
     }
@@ -4139,7 +4200,7 @@ inline auto event_wake_can_rebalance_process(task::Task const* task) -> bool {
     if (task->sched_queue != task::Task::sched_queue::WAITING) {
         return false;
     }
-    return !task->wait_channel_is(task::WaitChannelKind::WKI_EXECVE_PROXY);
+    return task->wki_proxy_task_id == 0 && !task->wait_channel_is(task::WaitChannelKind::WKI_EXECVE_PROXY);
 }
 
 inline auto event_wake_rebalance_target_cpu(task::Task const* task, uint64_t preferred_cpu) -> uint64_t {
@@ -5626,6 +5687,15 @@ void reschedule_task_for_cpu(uint64_t cpu_no, task::Task* task) {
         return;
     }
 
+    // A WKI proxy is only a local lifecycle/wait-status representative. Its
+    // saved user frame belongs to the pre-handoff process and must never be
+    // queued to execute again, even when signal forwarding fails or an
+    // unrelated event attempts a wake. Proxy finalization clears the ID before
+    // moving the task to the dead list; it never needs a runnable transition.
+    if (task->wki_proxy_task_id != 0) {
+        return;
+    }
+
     // Remove from whatever queue the task is in.
     // Optimization: check the task's last known CPU first (O(1) common case).
     // Only fall back to scanning all CPUs if not found there (handles races).
@@ -5762,7 +5832,9 @@ void reschedule_task_for_cpu(uint64_t cpu_no, task::Task* task) {
                 owner_cpu = task->cpu < NCPUS_RESCHED ? task->cpu : cpu_no;
             }
             run_queues->with_lock_void(owner_cpu, [task](RunQueue* rq) {
-                if (runqueue_task_is_reserved_locked(rq, task) || rq->runnable_heap.contains(task) || wait_list_contains_locked(rq, task)) {
+                if (task->state.load(std::memory_order_acquire) != task::TaskState::ACTIVE ||
+                    task->gc_queued.load(std::memory_order_acquire) || task->wki_proxy_task_id != 0 ||
+                    runqueue_task_is_reserved_locked(rq, task) || rq->runnable_heap.contains(task) || wait_list_contains_locked(rq, task)) {
                     return;
                 }
                 task->sched_queue = task::Task::sched_queue::WAITING;
@@ -5786,12 +5858,25 @@ void reschedule_task_for_cpu(uint64_t cpu_no, task::Task* task) {
     // double-insert. Just poke the CPU it landed on.
     if (task->heap_index >= 0) {
         uint64_t const LANDED_CPU = task->cpu;
+        bool landed_runnable = false;
         if (LANDED_CPU < smt::get_core_count()) {
-            run_queues->with_lock_void(LANDED_CPU, [task](RunQueue* rq) { repair_stale_wait_membership_locked(rq, task); });
-            if (LANDED_CPU == cpu::current_cpu()) {
-                request_local_reschedule();
-            } else {
-                wake_cpu(LANDED_CPU);
+            run_queues->with_lock_void(LANDED_CPU, [task, &landed_runnable](RunQueue* rq) {
+                // DEAD publication removes queues under this same lock. A
+                // final locked lifecycle check therefore closes the window
+                // between the optimistic checks above and this wake.
+                if (task->state.load(std::memory_order_acquire) != task::TaskState::ACTIVE ||
+                    task->gc_queued.load(std::memory_order_acquire) || task->wki_proxy_task_id != 0) {
+                    return;
+                }
+                repair_stale_wait_membership_locked(rq, task);
+                landed_runnable = rq->runnable_heap.contains(task);
+            });
+            if (landed_runnable) {
+                if (LANDED_CPU == cpu::current_cpu()) {
+                    request_local_reschedule();
+                } else {
+                    wake_cpu(LANDED_CPU);
+                }
             }
         }
         return;
@@ -5807,11 +5892,22 @@ void reschedule_task_for_cpu(uint64_t cpu_no, task::Task* task) {
     } else {
         task->cpu = cpu_no;
     }
-    run_queues->with_lock_void(cpu_no, [task, cpu_no](RunQueue* rq) {
+    bool published_runnable = false;
+    run_queues->with_lock_void(cpu_no, [task, cpu_no, &published_runnable](RunQueue* rq) {
+        // insert_into_dead_list() detaches under every runqueue lock after
+        // publishing DEAD. Revalidate while holding the final target lock so
+        // a stale waker cannot resurrect a DEAD/GC task after that scan, or a
+        // proxy after its unlocked identity check above.
+        if (task->state.load(std::memory_order_acquire) != task::TaskState::ACTIVE || task->gc_queued.load(std::memory_order_acquire) ||
+            task->wki_proxy_task_id != 0) {
+            return;
+        }
+
         // Double-check under lock: another waker may have inserted between
         // the unlocked heapIndex check and acquiring this lock.
         if (task->heap_index >= 0) {
             repair_stale_wait_membership_locked(rq, task);
+            published_runnable = rq->runnable_heap.contains(task);
             return;
         }
 
@@ -5851,8 +5947,12 @@ void reschedule_task_for_cpu(uint64_t cpu_no, task::Task* task) {
         task->wants_block = false;
         task->wake_at_us = 0;
 
-        (void)publish_runnable_task_locked(rq, task, "reschedule");
+        published_runnable = publish_runnable_task_locked(rq, task, "reschedule");
     });
+
+    if (!published_runnable) {
+        return;
+    }
 
     // Poke the target CPU so the newly-rescheduled task runs promptly.
     // wake_cpu() is a no-op for the current CPU (can't self-IPI), so use

@@ -199,20 +199,41 @@ TEST(WkiWire, DevDetachMatchesBindingIdentity) {
     EXPECT_FALSE(wki_dev_detach_matches_binding(0x2002, ResourceType::VFS, 43, 0x2002, detach));
 }
 
-TEST(WkiWire, DevDetachOptionalCookieMatchesBinding) {
-    uint8_t payload[sizeof(DevDetachPayload) + WKI_DEV_DETACH_COOKIE_BYTES] = {};
+TEST(WkiWire, DevDetachExactCookieAndIncarnationFormsMatchBinding) {
+    uint8_t payload[wki_dev_detach_payload_size(true)] = {};
     auto* detach = reinterpret_cast<DevDetachPayload*>(payload);
     detach->target_node = 0x1001;
-    detach->resource_type = static_cast<uint16_t>(ResourceType::NET);
+    detach->resource_type = static_cast<uint16_t>(ResourceType::VFS);
     detach->resource_id = 42;
-    payload[sizeof(DevDetachPayload)] = 0x5C;
+    payload[WKI_DEV_DETACH_COOKIE_OFFSET] = 0x5C;
+    ResourceIncarnationToken const BINDING_INCARNATION = {
+        .owner_boot_epoch = 0x12345678,
+        .resource_incarnation = 0x9ABCDEF0,
+    };
+    ResourceIncarnationToken const STALE_INCARNATION = {
+        .owner_boot_epoch = BINDING_INCARNATION.owner_boot_epoch,
+        .resource_incarnation = BINDING_INCARNATION.resource_incarnation - 1,
+    };
+    std::memcpy(payload + WKI_DEV_DETACH_INCARNATION_OFFSET, &BINDING_INCARNATION, sizeof(BINDING_INCARNATION));
 
-    EXPECT_EQ(wki_dev_detach_cookie_from_payload(payload, sizeof(payload)), 0x5C);
+    EXPECT_EQ(sizeof(DevDetachPayload), 8u);
+    EXPECT_EQ(wki_dev_detach_payload_size(false), 9u);
+    EXPECT_EQ(wki_dev_detach_payload_size(true), 17u);
+    EXPECT_TRUE(wki_dev_detach_payload_size_matches(wki_dev_detach_payload_size(false), false));
+    EXPECT_TRUE(wki_dev_detach_payload_size_matches(wki_dev_detach_payload_size(true), true));
+    EXPECT_FALSE(wki_dev_detach_payload_size_matches(sizeof(DevDetachPayload), false));
+    EXPECT_FALSE(wki_dev_detach_payload_size_matches(wki_dev_detach_payload_size(true), false));
+    EXPECT_FALSE(wki_dev_detach_payload_size_matches(wki_dev_detach_payload_size(false), true));
+    EXPECT_EQ(wki_dev_detach_cookie_from_payload(payload, wki_dev_detach_payload_size(false)), 0x5C);
     EXPECT_EQ(wki_dev_detach_cookie_from_payload(payload, sizeof(DevDetachPayload)), 0);
     EXPECT_TRUE(wki_dev_detach_cookie_matches_binding(0x5C, 0x5C));
     EXPECT_FALSE(wki_dev_detach_cookie_matches_binding(0x5C, 0));
     EXPECT_TRUE(wki_dev_detach_cookie_matches_binding(0, 0));
     EXPECT_FALSE(wki_dev_detach_cookie_matches_binding(0x5C, 0x5D));
+    EXPECT_TRUE(wki_dev_detach_incarnation_matches_binding(BINDING_INCARNATION, BINDING_INCARNATION, true));
+    EXPECT_FALSE(wki_dev_detach_incarnation_matches_binding(BINDING_INCARNATION, STALE_INCARNATION, true));
+    EXPECT_FALSE(wki_dev_detach_incarnation_matches_binding(BINDING_INCARNATION, {}, true));
+    EXPECT_TRUE(wki_dev_detach_incarnation_matches_binding(BINDING_INCARNATION, {}, false));
 }
 
 TEST(WkiWire, DevOpResponseMatchesExpectedIdentity) {

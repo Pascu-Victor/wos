@@ -10,8 +10,10 @@
 #include <cstring>
 #include <deque>
 #include <iterator>
+#include <net/wki/remote_compute.hpp>
 #include <platform/loader/debug_info.hpp>
 #include <platform/loader/elf_loader.hpp>
+#include <platform/loader/gdb_interface.hpp>
 #include <platform/mm/addr.hpp>
 #include <platform/mm/mm.hpp>
 #include <platform/mm/paging.hpp>
@@ -19,6 +21,7 @@
 #include <platform/mm/virt.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sys/mutex.hpp>
+#include <syscalls_impl/vmem/sys_vmem.hpp>
 #include <utility>
 #include <vfs/file.hpp>
 #include <vfs/stat.hpp>
@@ -400,6 +403,191 @@ void destroy_unpublished_user_thread(Task* task) {
     delete task;
 }
 
+auto claim_unpublished_process(Task* owner, Task* child) -> bool {
+    if (owner == nullptr || child == nullptr || owner == child) {
+        return false;
+    }
+    if (!child->try_acquire_lifetime_ref()) {
+        return false;
+    }
+    Task* expected = nullptr;
+    if (owner->owned_unpublished_process.compare_exchange_strong(expected, child, std::memory_order_acq_rel, std::memory_order_acquire)) {
+        return true;
+    }
+    child->release();
+    return false;
+}
+
+auto release_unpublished_process(Task* owner, Task* child) -> bool {
+    if (owner == nullptr || child == nullptr) {
+        return false;
+    }
+    Task* expected = child;
+    if (!owner->owned_unpublished_process.compare_exchange_strong(expected, nullptr, std::memory_order_acq_rel,
+                                                                  std::memory_order_acquire)) {
+        return false;
+    }
+    child->release();
+    return true;
+}
+
+auto take_unpublished_process(Task* owner) -> Task* {
+    if (owner == nullptr) {
+        return nullptr;
+    }
+    // Transfer, rather than drop, the slot's lifetime reference. Exit cleanup
+    // must keep the child alive from the atomic detach through the final
+    // published-state/refcount validation and teardown.
+    return owner->owned_unpublished_process.exchange(nullptr, std::memory_order_acq_rel);
+}
+
+namespace {
+auto unpublished_process_is_exclusively_owned(Task* task) -> bool {
+    // Scheduler publication transfers the creator's initial reference. Never
+    // turn this recovery helper into an alternate teardown path for a task
+    // that another CPU can already find or run.
+    if (task == nullptr || task->scheduler_published.load(std::memory_order_acquire) ||
+        task->state.load(std::memory_order_acquire) != TaskState::ACTIVE || task->gc_queued.load(std::memory_order_acquire) ||
+        task->ref_count.load(std::memory_order_acquire) != 2) {
+        if (task != nullptr) {
+            ker::mod::dbg::log("Refusing to destroy published/shared task PID %x as an unpublished process", task->pid);
+        }
+        return false;
+    }
+    return true;
+}
+
+void teardown_unpublished_process_resources(Task* task) {
+    loader::debug::unregister_process(task->pid);
+    loader::debug::remove_gdb_debug_info(task->pid);
+    release_lazy_vmem_ranges(*task);
+    for (unsigned fd = 0; fd < Task::FD_TABLE_SIZE; ++fd) {
+        auto* file = static_cast<ker::vfs::File*>(task->fd_table.lookup(fd));
+        if (file == nullptr) {
+            continue;
+        }
+        task->fd_table.remove(fd);
+        task->clear_fd_cloexec(fd);
+        ker::vfs::vfs_put_file(file);
+    }
+
+    if (task->is_elf_buffer_shared) {
+        static_cast<void>(ker::net::wki::wki_remote_compute_release_elf_buffer(task->elf_buffer));
+    } else {
+        delete[] task->elf_buffer;
+    }
+    task->elf_buffer = nullptr;
+    task->elf_buffer_size = 0;
+    task->is_elf_buffer_shared = false;
+
+    if (task->thread != nullptr) {
+        // User pages belong to the pagemap destroyed below. The Thread row
+        // still has to be retired without independently freeing those pages.
+        task->thread->tls_phys_ptr = 0;
+        task->thread->stack_phys_ptr = 0;
+        threading::destroy_thread(task->thread);
+        task->thread = nullptr;
+    }
+
+    delete reinterpret_cast<cpu::PerCpu*>(task->context.syscall_scratch_area);
+    task->context.syscall_scratch_area = 0;
+
+    if (task->pagemap != nullptr && task->pagemap != mm::virt::get_kernel_pagemap()) {
+        ker::syscall::vmem::release_file_mmap_ranges_for_pagemap(task->pagemap);
+        mm::virt::destroy_user_space(task->pagemap, task->pid, task->name, "unpublished-process");
+        mm::virt::release_pagemap(task->pagemap);
+        task->pagemap = nullptr;
+    }
+
+    delete[] task->name;
+    task->name = nullptr;
+    if (task->context.syscall_kernel_stack >= ker::mod::mm::KERNEL_STACK_SIZE) {
+        mm::phys::page_free(reinterpret_cast<void*>(task->context.syscall_kernel_stack - ker::mod::mm::KERNEL_STACK_SIZE));
+        task->context.syscall_kernel_stack = 0;
+    }
+}
+}  // namespace
+
+auto destroy_unpublished_process(Task* task) -> bool {
+    if (task == nullptr) {
+        return true;
+    }
+    if (!unpublished_process_is_exclusively_owned(task)) {
+        // take_unpublished_process() transferred one reference to this caller.
+        // A refusal must still return that reference to the published owner.
+        task->release();
+        return false;
+    }
+
+    teardown_unpublished_process_resources(task);
+    task->release();  // Consume the transferred owner-slot reference.
+    delete task;
+    return true;
+}
+
+auto destroy_owned_unpublished_process(Task* owner, Task* child) -> bool {
+    if (owner == nullptr || child == nullptr || owner == child) {
+        return false;
+    }
+
+    bool expected_teardown = false;
+    if (!owner->unpublished_teardown_in_progress.compare_exchange_strong(expected_teardown, true, std::memory_order_acq_rel,
+                                                                         std::memory_order_acquire)) {
+        return false;
+    }
+
+    // Keep the slot and its reference published throughout every operation
+    // that may enter a voluntary VFS wait. Scheduler/group-exit handoffs see
+    // the flag above and leave fatal exit pending until this section finishes.
+    bool const OWNED = owner->owned_unpublished_process.load(std::memory_order_acquire) == child;
+    if (!OWNED || !unpublished_process_is_exclusively_owned(child)) {
+        owner->unpublished_teardown_in_progress.store(false, std::memory_order_release);
+        return false;
+    }
+
+    teardown_unpublished_process_resources(child);
+
+    Task* const TAKEN = owner->owned_unpublished_process.exchange(nullptr, std::memory_order_acq_rel);
+    if (TAKEN != child) [[unlikely]] {
+        dbg::panic_handler("unpublished process owner changed during deferred-exit teardown");
+        hcf();
+    }
+    child->release();  // Consume the owner-slot reference.
+    delete child;
+    owner->unpublished_teardown_in_progress.store(false, std::memory_order_release);
+    return true;
+}
+
+auto complete_unpublished_process_construction(Task* task) -> bool {
+    if (task == nullptr || task->type != TaskType::PROCESS || task->thread == nullptr || task->pagemap == nullptr) {
+        return false;
+    }
+    if (task->pending_interp_path.front() == '\0') {
+        return true;
+    }
+
+    uint8_t* interp_buf = nullptr;
+    if (!read_boot_file_fully(task->pending_interp_path.data(), &interp_buf)) {
+        dbg::log("Failed to open interpreter '%s' for task %s", task->pending_interp_path.data(), task->name);
+        return false;
+    }
+
+    constexpr uint64_t INTERP_BASE = 0x40000000ULL;
+    loader::elf::ElfLoadResult const INTERP_RESULT =
+        loader::elf::load_elf(reinterpret_cast<loader::elf::ElfFile*>(interp_buf), task->pagemap, task->pid, "ld.so",
+                              false /* don't register debug symbols for interp */, INTERP_BASE);
+    delete[] interp_buf;
+    if (INTERP_RESULT.entry_point == 0) {
+        dbg::log("Failed to load interpreter ELF '%s'", task->pending_interp_path.data());
+        return false;
+    }
+
+    task->context.frame.rip = INTERP_RESULT.entry_point;
+    task->interp_base = INTERP_BASE;
+    task->pending_interp_path.fill('\0');
+    return true;
+}
+
 auto clone_lazy_vmem_ranges(Task& dst, Task& src) -> bool {
     uint64_t const IRQF = src.lazy_vmem_lock.lock_irqsave();
     bool const OK = dst.lazy_vmem_ranges.clone_from(src.lazy_vmem_ranges);
@@ -466,6 +654,82 @@ auto task_selftest_destroy_unpublished_user_thread_releases_refs() -> bool {
 
     destroy_unpublished_user_thread(task);
     return file.refcount.load(std::memory_order_relaxed) == 1;
+}
+
+auto task_selftest_unpublished_process_owner_releases_resources() -> bool {
+    Task owner{};
+    auto* child = new Task{};
+    if (child == nullptr) {
+        return false;
+    }
+
+    ker::vfs::File file{};
+    file.refcount.store(2, std::memory_order_relaxed);
+    constexpr uint64_t FD = 29;
+    if (!child->fd_table.insert(FD, &file)) {
+        delete child;
+        return false;
+    }
+    child->elf_buffer = new uint8_t[4];
+    child->elf_buffer_size = 4;
+    if (child->elf_buffer == nullptr) {
+        child->fd_table.remove(FD);
+        delete child;
+        return false;
+    }
+
+    bool const CLAIMED = claim_unpublished_process(&owner, child);
+    bool const OWNER_REF_HELD = child->ref_count.load(std::memory_order_acquire) == 2;
+    bool const DUPLICATE_REJECTED = !claim_unpublished_process(&owner, child);
+    bool const WRONG_RELEASE_REJECTED = !release_unpublished_process(&owner, &owner);
+    Task* const TAKEN = take_unpublished_process(&owner);
+    bool const OWNER_CLEARED = owner.owned_unpublished_process.load(std::memory_order_acquire) == nullptr;
+    bool const TRANSFERRED_REF_HELD = TAKEN == child && child->ref_count.load(std::memory_order_acquire) == 2;
+    bool const DESTROYED = destroy_unpublished_process(TAKEN);
+    return CLAIMED && OWNER_REF_HELD && DUPLICATE_REJECTED && WRONG_RELEASE_REJECTED && OWNER_CLEARED && TRANSFERRED_REF_HELD &&
+           DESTROYED && file.refcount.load(std::memory_order_relaxed) == 1;
+}
+
+auto task_selftest_owned_unpublished_process_teardown_releases_resources() -> bool {
+    Task owner{};
+    auto* child = new Task{};
+    if (child == nullptr) {
+        return false;
+    }
+
+    ker::vfs::File file{};
+    file.refcount.store(2, std::memory_order_relaxed);
+    constexpr uint64_t FD = 31;
+    if (!child->fd_table.insert(FD, &file)) {
+        delete child;
+        return false;
+    }
+    if (!claim_unpublished_process(&owner, child)) {
+        child->fd_table.remove(FD);
+        delete child;
+        return false;
+    }
+
+    bool const DESTROYED = destroy_owned_unpublished_process(&owner, child);
+    return DESTROYED && owner.owned_unpublished_process.load(std::memory_order_acquire) == nullptr &&
+           !owner.unpublished_teardown_in_progress.load(std::memory_order_acquire) && file.refcount.load(std::memory_order_relaxed) == 1;
+}
+
+auto task_selftest_published_process_refuses_unpublished_teardown() -> bool {
+    Task owner{};
+    auto* child = new Task{};
+    if (child == nullptr || !claim_unpublished_process(&owner, child)) {
+        delete child;
+        return false;
+    }
+
+    child->scheduler_published.store(true, std::memory_order_release);
+    Task* const TAKEN = take_unpublished_process(&owner);
+    bool const REFUSED = !destroy_unpublished_process(TAKEN);
+    bool const INITIAL_REF_REMAINS = child->ref_count.load(std::memory_order_acquire) == 1;
+    bool const OWNER_CLEARED = owner.owned_unpublished_process.load(std::memory_order_acquire) == nullptr;
+    delete child;
+    return REFUSED && INITIAL_REF_REMAINS && OWNER_CLEARED;
 }
 
 auto task_selftest_waited_on_claim_is_single_winner() -> bool {
@@ -658,13 +922,11 @@ Task::Task(const char* name, uint64_t elf_start, uint64_t kernel_rsp, TaskType t
     this->context.syscall_kernel_stack = kernel_rsp;
 
     auto fail_process_construction = [&]() {
-        // Match the existing create_thread() failure contract so higher layers
-        // can reject the exec without freezing the whole kernel on a remote
-        // loader miss or malformed interpreter image.
-        this->type = TaskType::IDLE;
-        this->thread = nullptr;
-        this->pagemap = nullptr;
+        // Leave every acquired resource attached to the now fully constructed
+        // Task. The creator's unpublished-owner path can then tear it down
+        // without guessing which constructor stage succeeded.
         this->entry = 0;
+        this->context.frame.rip = 0;
     };
 
     this->pid = sched::task::get_next_pid();
@@ -702,10 +964,8 @@ Task::Task(const char* name, uint64_t elf_start, uint64_t kernel_rsp, TaskType t
         threading::create_thread(ker::mod::mm::USER_STACK_SIZE, ACTUAL_TLS_INFO.tls_size, this->pagemap, this->pid, ACTUAL_TLS_INFO);
     if (this->thread == nullptr) {
         dbg::log("Failed to create thread for task %s - OOM", name);
-        // Can't continue without a thread - this is a fatal error for the task
-        // Mark task as invalid so it won't be scheduled
-        this->type = TaskType::IDLE;  // Abuse IDLE type to prevent scheduling
-        this->pagemap = nullptr;
+        // Preserve the pagemap for unpublished-process cleanup.
+        this->entry = 0;
         return;
     }
 
@@ -733,38 +993,18 @@ Task::Task(const char* name, uint64_t elf_start, uint64_t kernel_rsp, TaskType t
     this->program_header_count = elf_result.program_header_count;
     this->program_header_ent_size = elf_result.program_header_ent_size;
 
-    // If the binary requests a dynamic linker (PT_INTERP), load it now.
-    // The interpreter (ld.so) is loaded at a high base address to avoid
-    // conflicting with the main binary's address space.
+    // Record PT_INTERP without entering the VFS from a constructor. Runtime
+    // process creators complete this stage only after a persistent owner slot
+    // can recover the fully constructed Task across a fatal signal handoff.
     if (elf_result.has_interp) {
-        constexpr uint64_t INTERP_BASE = 0x40000000ULL;
         const char* const INTERP_PATH = std::begin(elf_result.interp_path);
-
-        uint8_t* interp_buf = nullptr;
-        if (!read_boot_file_fully(INTERP_PATH, &interp_buf)) {
-            dbg::log("Failed to open interpreter '%s' for task %s", INTERP_PATH, name);
+        size_t const INTERP_LEN = std::strlen(INTERP_PATH);
+        if (INTERP_LEN >= this->pending_interp_path.size()) {
+            dbg::log("Interpreter path is too long for task %s", name);
             fail_process_construction();
             return;
         }
-
-        loader::elf::ElfLoadResult const INTERP_RESULT =
-            loader::elf::load_elf(reinterpret_cast<loader::elf::ElfFile*>(interp_buf), this->pagemap, this->pid, "ld.so",
-                                  false /* don't register debug symbols for interp */, INTERP_BASE);
-
-        if (INTERP_RESULT.entry_point == 0) {
-            delete[] interp_buf;
-            dbg::log("Failed to load interpreter ELF '%s'", INTERP_PATH);
-            fail_process_construction();
-            return;
-        }
-
-        // Entry point becomes the interpreter's entry (ld.so _start).
-        // ld.so reads AT_ENTRY and AT_PHDR from auxv to find the real binary.
-        this->context.frame.rip = INTERP_RESULT.entry_point;
-        // Store interp_base for AT_BASE in auxv (set by exec.cpp)
-        this->interp_base = INTERP_BASE;
-
-        delete[] interp_buf;
+        std::memcpy(this->pending_interp_path.data(), INTERP_PATH, INTERP_LEN + 1);
     }
 
     // Initialize interrupt frame fields for usermode

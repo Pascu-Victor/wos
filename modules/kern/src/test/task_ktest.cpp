@@ -44,6 +44,18 @@ KTEST(TaskThreadCleanup, DestroyUnpublishedUserThreadReleasesFileRefs) {
     KEXPECT_TRUE(ker::mod::sched::task::task_selftest_destroy_unpublished_user_thread_releases_refs());
 }
 
+KTEST(TaskProcessCleanup, UnpublishedOwnerReleasesResources) {
+    KEXPECT_TRUE(ker::mod::sched::task::task_selftest_unpublished_process_owner_releases_resources());
+}
+
+KTEST(TaskProcessCleanup, OwnedUnpublishedTeardownReleasesResources) {
+    KEXPECT_TRUE(ker::mod::sched::task::task_selftest_owned_unpublished_process_teardown_releases_resources());
+}
+
+KTEST(TaskProcessCleanup, PublishedProcessRefusesUnpublishedTeardown) {
+    KEXPECT_TRUE(ker::mod::sched::task::task_selftest_published_process_refuses_unpublished_teardown());
+}
+
 KTEST(TaskWaitedOn, ClaimIsSingleWinner) { KEXPECT_TRUE(ker::mod::sched::task::task_selftest_waited_on_claim_is_single_winner()); }
 
 KTEST(TaskWaitpid, ClearBlockStateResetsFields) {

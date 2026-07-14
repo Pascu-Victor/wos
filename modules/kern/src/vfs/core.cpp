@@ -4748,6 +4748,28 @@ auto copy_path_string(const char* src, char* dst, size_t dst_size, size_t known_
     return 0;
 }
 
+auto snapshot_bounded_path_string(const char* src, char* dst, size_t dst_size, size_t* copied_len_out) -> int {
+    if (src == nullptr || dst == nullptr || dst_size == 0) {
+        return -EINVAL;
+    }
+
+    for (size_t pos = 0; pos < dst_size; ++pos) {
+        char const VALUE = src[pos];
+        dst[pos] = VALUE;
+        if (VALUE != '\0') {
+            continue;
+        }
+        if (pos == 0) {
+            return -EINVAL;
+        }
+        if (copied_len_out != nullptr) {
+            *copied_len_out = pos;
+        }
+        return 0;
+    }
+    return -ENAMETOOLONG;
+}
+
 auto path_text_equal(const char* left, size_t left_len, const char* right, size_t right_len) -> bool {
     if (left == nullptr || right == nullptr) {
         return false;
@@ -5852,32 +5874,35 @@ auto ensure_wki_host_root_mount(const char* path) -> int {
     }
 
     struct RootExportFindCtx {
-        uint16_t node_id;
-        ker::net::wki::DiscoveredResource* result;
+        uint16_t node_id{};
+        ker::net::wki::DiscoveredResource result = {};
+        bool found = false;
     };
-    RootExportFindCtx find_ctx = {.node_id = NODE_ID, .result = nullptr};
+    RootExportFindCtx find_ctx = {.node_id = NODE_ID};
     ker::net::wki::wki_resource_foreach(
         [](const ker::net::wki::DiscoveredResource& res, void* ctx_ptr) {
             auto* ctx = static_cast<RootExportFindCtx*>(ctx_ptr);
-            if (ctx == nullptr || ctx->result != nullptr) {
+            if (ctx == nullptr || ctx->found) {
                 return;
             }
             bool const IS_ROOT_EXPORT =
                 std::strncmp(static_cast<const char*>(res.name), "/", ker::net::wki::DISCOVERED_RESOURCE_NAME_LEN) == 0;
             if (res.node_id == ctx->node_id && res.resource_type == ker::net::wki::ResourceType::VFS && IS_ROOT_EXPORT) {
-                ctx->result = const_cast<ker::net::wki::DiscoveredResource*>(&res);
+                ctx->result = res;
+                ctx->found = true;
             }
         },
         &find_ctx);
 
-    if (find_ctx.result == nullptr) {
+    if (!find_ctx.found) {
         return 0;
     }
 
     vfs_mkdir("/wki", 0755);
     vfs_mkdir(mount_root.data(), 0755);
 
-    int const RET = ker::net::wki::wki_remote_vfs_mount(NODE_ID, find_ctx.result->resource_id, mount_root.data());
+    int const RET =
+        ker::net::wki::wki_remote_vfs_mount(NODE_ID, find_ctx.result.resource_id, mount_root.data(), find_ctx.result.generation);
     if (RET == 0) {
         log::info("auto-mounted WKI host root %s for path %s", mount_root.data(), logical.data());
     }
@@ -10455,7 +10480,8 @@ static auto vfs_stat_impl(const char* path, ker::vfs::Stat* statbuf, bool resolv
         }
         case FSType::DEVFS: {
             // Walk devfs tree to determine if directory or device
-            auto* node = ker::vfs::devfs::devfs_walk_path(fs_path);
+            auto node_ref = ker::vfs::devfs::devfs_acquire_path(fs_path);
+            auto* node = node_ref.get();
             if (node == nullptr) {
                 return -ENOENT;
             }
@@ -11248,13 +11274,38 @@ auto vfs_pivot_root(const char* new_root, const char* put_old) -> int {
         return -ESRCH;
     }
 
+    // Snapshot both syscall strings before the split-phase WKI drain. Every
+    // later phase must use these bounded kernel-owned copies so another thread
+    // cannot change path length/content between allocation, mount commit, and
+    // task-root publication.
+    std::array<char, ker::mod::sched::task::Task::CWD_MAX> stable_new_root{};
+    std::array<char, MOUNT_PATH_MAX> stable_put_old{};
+    size_t new_root_len = 0;
+    int const NEW_ROOT_COPY = snapshot_bounded_path_string(new_root, stable_new_root.data(), stable_new_root.size(), &new_root_len);
+    if (NEW_ROOT_COPY != 0) {
+        return NEW_ROOT_COPY;
+    }
+    int const PUT_OLD_COPY = snapshot_bounded_path_string(put_old, stable_put_old.data(), stable_put_old.size(), nullptr);
+    if (PUT_OLD_COPY != 0) {
+        return PUT_OLD_COPY;
+    }
+
+    // Stop new owner-side VFS attaches/operations and drain existing binding
+    // users before mount paths can change underneath an advertised export.
+    bool const WKI_REBUILD_REQUIRED = ker::net::wki::g_wki.initialized;
+    if (WKI_REBUILD_REQUIRED && !ker::net::wki::wki_remote_vfs_prepare_export_rebuild()) {
+        return -EBUSY;
+    }
+
     // Rewrite mount paths under the mount-table lock so concurrent WKI
     // auto-mounts cannot race a path free/update in find_mount_point().
-    size_t const NEW_ROOT_LEN = std::strlen(new_root);
-    int const REMAP_RET = remap_mounts_for_pivot(new_root, put_old);
+    int const REMAP_RET = remap_mounts_for_pivot(stable_new_root.data(), stable_put_old.data());
     if (REMAP_RET != 0) {
+        if (WKI_REBUILD_REQUIRED) {
+            ker::net::wki::wki_remote_vfs_cancel_export_rebuild();
+        }
         if (REMAP_RET == -EINVAL) {
-            log::warn("pivot_root: new_root '%s' is not an exact mount point", new_root);
+            log::warn("pivot_root: new_root '%s' is not an exact mount point", stable_new_root.data());
         }
         return REMAP_RET;
     }
@@ -11263,9 +11314,6 @@ auto vfs_pivot_root(const char* new_root, const char* put_old) -> int {
     // Kernel threads (TCP timer, WKI timer, netpoll workers, backlog handlers)
     // must see the same root so that VFS paths like /wki/... resolve through
     // the correct mount hierarchy after the root has moved.
-    if (NEW_ROOT_LEN >= ker::mod::sched::task::Task::CWD_MAX) {
-        return -ENAMETOOLONG;
-    }
     {
         uint32_t const COUNT = ker::mod::sched::get_active_task_count();
         for (uint32_t i = 0; i < COUNT; ++i) {
@@ -11275,8 +11323,8 @@ auto vfs_pivot_root(const char* new_root, const char* put_old) -> int {
             }
             // Only update tasks that still have the old root "/"
             if (t->root[0] == '/' && t->root[1] == '\0') {
-                std::memcpy(t->root.data(), new_root, NEW_ROOT_LEN + 1);
-                t->root_len = static_cast<uint16_t>(NEW_ROOT_LEN);
+                std::memcpy(t->root.data(), stable_new_root.data(), new_root_len + 1);
+                t->root_len = static_cast<uint16_t>(new_root_len);
             }
             t->release();
         }
@@ -11285,11 +11333,11 @@ auto vfs_pivot_root(const char* new_root, const char* put_old) -> int {
     // WKI auto-mounts are driven by deferred work and can land after the
     // initial mount snapshot above, while this pivot is still in progress.
     // Rebase any stale /wki mounts once task roots now point at new_root.
-    rebase_wki_mounts_for_new_root(new_root);
+    rebase_wki_mounts_for_new_root(stable_new_root.data());
 
-    log::info("pivot_root: task '%s' (pid %x) root set to '%s'", task->name, task->pid, new_root);
+    log::info("pivot_root: task '%s' (pid %x) root set to '%s'", task->name, task->pid, stable_new_root.data());
 
-    if (ker::net::wki::g_wki.initialized) {
+    if (WKI_REBUILD_REQUIRED) {
         ker::net::wki::wki_remote_vfs_rebuild_exports();
     }
 
@@ -11709,7 +11757,8 @@ auto vfs_access_f_ok_resolved(const char* resolved_path, bool require_directory,
             break;
         }
         case FSType::DEVFS: {
-            auto* node = ker::vfs::devfs::devfs_walk_path(fs_path);
+            auto node_ref = ker::vfs::devfs::devfs_acquire_path(fs_path);
+            auto* node = node_ref.get();
             if (node == nullptr) {
                 result = -ENOENT;
             } else if (require_directory && node->type != ker::vfs::devfs::DevFSNodeType::DIRECTORY) {
@@ -12763,7 +12812,8 @@ auto vfs_chmod_resolved_path(const char* resolved_path, int mode, bool follow_fi
             return 0;
         }
         case FSType::DEVFS: {
-            auto* node = ker::vfs::devfs::devfs_walk_path(fs_path);
+            auto node_ref = ker::vfs::devfs::devfs_acquire_path(fs_path);
+            auto* node = node_ref.get();
             if (node == nullptr) {
                 return -ENOENT;
             }
@@ -12921,7 +12971,8 @@ auto vfs_chown_resolved_path(const char* path, uint32_t owner, uint32_t group, s
             return 0;
         }
         case FSType::DEVFS: {
-            auto* node = ker::vfs::devfs::devfs_walk_path(fs_path);
+            auto node_ref = ker::vfs::devfs::devfs_acquire_path(fs_path);
+            auto* node = node_ref.get();
             if (node == nullptr) {
                 return -ENOENT;
             }
@@ -13187,7 +13238,8 @@ auto vfs_apply_utimens_to_resolved_path(const char* resolved_path, const Timespe
             break;
         }
         case FSType::DEVFS: {
-            auto* node = ker::vfs::devfs::devfs_walk_path(fs_path);
+            auto node_ref = ker::vfs::devfs::devfs_acquire_path(fs_path);
+            auto* node = node_ref.get();
             ret = apply_devfs_utimens(node, resolved_times);
             break;
         }
@@ -18287,33 +18339,35 @@ auto vfs_mount(const char* source, const char* target, const char* fstype, unsig
 
             // Find matching VFS resource from discovered table
             struct VfsFindCtx {
-                uint16_t node_id;
-                const char* export_name;
-                ker::net::wki::DiscoveredResource* result;
+                uint16_t node_id{};
+                const char* export_name = nullptr;
+                ker::net::wki::DiscoveredResource result = {};
+                bool found = false;
             };
-            VfsFindCtx find_ctx = {.node_id = NODE_ID, .export_name = export_name, .result = nullptr};
+            VfsFindCtx find_ctx = {.node_id = NODE_ID, .export_name = export_name};
             ker::net::wki::wki_resource_foreach(
                 [](const ker::net::wki::DiscoveredResource& r, void* ctx_ptr) {
                     auto* fc = static_cast<VfsFindCtx*>(ctx_ptr);
-                    if (fc->result != nullptr) {
+                    if (fc->found) {
                         return;
                     }
                     bool const NAME_MATCH =
                         std::strncmp(static_cast<const char*>(r.name), fc->export_name, ker::net::wki::DISCOVERED_RESOURCE_NAME_LEN) == 0;
                     if (r.node_id == fc->node_id && r.resource_type == ker::net::wki::ResourceType::VFS && NAME_MATCH) {
-                        fc->result = const_cast<ker::net::wki::DiscoveredResource*>(&r);
+                        fc->result = r;
+                        fc->found = true;
                     }
                 },
                 &find_ctx);
 
-            if (find_ctx.result == nullptr) {
+            if (!find_ctx.found) {
                 return -ENXIO;
             }
 
             // Create mount target directory
             vfs_mkdir(target, 0755);
 
-            return ker::net::wki::wki_remote_vfs_mount(NODE_ID, find_ctx.result->resource_id, target);
+            return ker::net::wki::wki_remote_vfs_mount(NODE_ID, find_ctx.result.resource_id, target, find_ctx.result.generation);
         }
 
         // Check for PARTUUID= prefix

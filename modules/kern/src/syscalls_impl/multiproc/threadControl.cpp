@@ -6,6 +6,8 @@
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
+#include <net/wki/remote_compute.hpp>
+#include <net/wki/wki.hpp>
 #include <platform/mm/addr.hpp>
 #include <platform/mm/virt.hpp>
 #include <platform/sched/epoch.hpp>
@@ -112,6 +114,13 @@ auto publish_thread_tid_to_tcb(mod::sched::task::Task* parent, uint64_t tcb_va, 
     task->exit_in_progress = true;
     ker::syscall::log::sys_log_cleanup_for_task(task);
     release_thread_fd_refs(task);
+    // A thread can create a process too. Detach WKI's raw subject pointer
+    // before reclaiming a child whose creator was interrupted in submission.
+    ker::net::wki::wki_remote_compute_cleanup_for_task(task);
+    static_cast<void>(mod::sched::task::destroy_unpublished_process(mod::sched::task::take_unpublished_process(task)));
+    // Retire any stack-backed waiters created by descriptor/child teardown
+    // before the thread becomes DEAD and its kernel stack enters reclamation.
+    ker::net::wki::wki_wait_cleanup_for_task(task);
     task->has_exited = true;
     task->exit_status = 0;
     task->exit_notify_ready.store(true, std::memory_order_release);

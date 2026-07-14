@@ -8,6 +8,7 @@
 #include <net/address.hpp>
 #include <net/endian.hpp>
 #include <net/net_trace.hpp>
+#include <net/netdevice.hpp>
 #include <net/packet.hpp>
 #include <net/proto/ethernet.hpp>
 #include <net/proto/ipv4.hpp>
@@ -165,8 +166,11 @@ void process_backlog_packet(PacketBuffer* pkt) {
         pkt_free(pkt);
         return;
     }
-    if (pkt->dev != nullptr && pkt->dev->wki_rx_forward != nullptr) {
-        pkt->dev->wki_rx_forward(pkt->dev, pkt);
+    if (pkt->dev != nullptr) {
+        WkiRxForwardHook const RX_FORWARD = pkt->dev->wki_rx_forward.load(std::memory_order_acquire);
+        if (RX_FORWARD != nullptr) {
+            RX_FORWARD(pkt->dev, pkt);
+        }
     }
     proto::eth_rx(pkt->dev, pkt);
 }

@@ -97,9 +97,9 @@ def test_net_dispatch_does_not_pass_server_binding_pointer() -> None:
 
     if "binding_ptr" in remote_header or "binding_ptr" in remote_source:
         fail("remote NET handler must not accept an erasable DevServerBinding pointer")
-    expected_call = "detail::handle_net_op(hdr, hdr->channel_id, binding_net_dev, req->op_id, req_data, REQ_DATA_LEN);"
+    expected_call = "detail::handle_net_op(hdr, CHANNEL_IDENTITY, binding_net_dev, req->op_id, req_data, REQ_DATA_LEN);"
     if expected_call not in server_body:
-        fail("handle_dev_op_req() must dispatch NET ops with the snapshotted net_dev only")
+        fail("handle_dev_op_req() must dispatch NET ops with the exact channel identity and snapshotted net_dev")
 
 
 def test_vfs_attach_uses_export_snapshot_not_unlocked_pointer() -> None:
@@ -135,7 +135,7 @@ def test_vfs_attach_uses_export_snapshot_not_unlocked_pointer() -> None:
     require_order(
         attach_body,
         "if (!wki_remote_vfs_find_export_snapshot(req->resource_id, &exp))",
-        "WkiChannel const* ch = reserve_attach_channel",
+        "reserve_attach_channel(hdr->src_node, req->requested_channel, PriorityClass::LATENCY",
         "VFS attach validates export before reserving channel",
     )
     require_order(
@@ -149,10 +149,12 @@ def test_vfs_attach_uses_export_snapshot_not_unlocked_pointer() -> None:
 def test_duplicate_net_attach_does_not_rewrite_binding_cookie() -> None:
     helper = function_body(DEV_SERVER_CPP.read_text(), "find_existing_net_binding")
     server_body = function_body(DEV_SERVER_CPP.read_text(), "handle_dev_attach_req")
-    if "binding->attach_cookie =" in helper:
+    if "binding.attach_cookie =" in helper:
         fail("duplicate NET attach lookup must not rewrite the existing binding cookie")
     required = [
-        "info.attach_cookie = binding->attach_cookie",
+        "binding.attach_cookie != attach_cookie",
+        "info.attach_cookie = binding.attach_cookie",
+        "find_existing_net_binding(hdr->src_node, req->resource_id, req->attach_cookie)",
         "existing_ack.attach_cookie = existing.attach_cookie",
     ]
     missing = [token for token in required if token not in helper + server_body]
@@ -163,9 +165,9 @@ def test_duplicate_net_attach_does_not_rewrite_binding_cookie() -> None:
 def test_net_binding_state_mutation_revalidates_under_server_lock() -> None:
     body = function_body(REMOTE_NET_CPP.read_text(), "handle_net_op")
     required = [
-        "wki_dev_server_mark_net_opened(hdr->src_node, channel_id, net_dev, true)",
-        "wki_dev_server_mark_net_opened(hdr->src_node, channel_id, net_dev, false)",
-        "wki_dev_server_add_net_rx_credits(hdr->src_node, channel_id, net_dev, credits)",
+        "wki_dev_server_mark_net_opened(channel_identity, net_dev, true)",
+        "wki_dev_server_mark_net_opened(channel_identity, net_dev, false)",
+        "wki_dev_server_add_net_rx_credits(channel_identity, net_dev, credits)",
     ]
     missing = [token for token in required if token not in body]
     if missing:
@@ -254,7 +256,7 @@ def test_proxy_net_xmit_rejects_oversize_before_uint16_truncation() -> None:
         "if (!REQ_SIZE.ok)",
         "uint16_t const REQ_TOTAL = REQ_SIZE.total_len",
         "new (std::nothrow) uint8_t[REQ_TOTAL]",
-        "wki_send(state->owner_node, state->assigned_channel, MsgType::DEV_OP_REQ, req_buf, REQ_TOTAL)",
+        "wki_send_on_channel_identity(state->channel_identity, MsgType::DEV_OP_REQ, req_buf, REQ_TOTAL)",
     ]
     missing = [token for token in required_xmit_tokens if token not in xmit_body]
     if missing:
@@ -264,10 +266,267 @@ def test_proxy_net_xmit_rejects_oversize_before_uint16_truncation() -> None:
     require_order(xmit_body, "if (!REQ_SIZE.ok)", "new (std::nothrow) uint8_t[REQ_TOTAL]", "remote NET xmit size gate")
 
 
-def test_detach_cookie_is_exact_match() -> None:
-    body = function_body(WIRE_HPP.read_text(), "wki_dev_detach_cookie_matches_binding")
-    if "return binding_attach_cookie == request_cookie;" not in body:
+def test_detach_cookie_and_incarnation_are_exact_matches() -> None:
+    wire = WIRE_HPP.read_text()
+    cookie_match = function_body(wire, "wki_dev_detach_cookie_matches_binding")
+    incarnation_match = function_body(wire, "wki_dev_detach_incarnation_matches_binding")
+    source = DEV_SERVER_CPP.read_text()
+    decode = function_body(source, "decode_detach_request")
+    admit = function_body(source, "wki_dev_server_admit_detach_rx")
+
+    if "return binding_attach_cookie == request_cookie;" not in cookie_match:
         fail("detach cookie matching must not treat zero as a wildcard for nonzero-cookie bindings")
+    for token in [
+        "type == ResourceType::BLOCK || type == ResourceType::VFS",
+        "wki_resource_incarnation_valid(request_incarnation)",
+        "wki_resource_incarnation_equal(binding_incarnation, request_incarnation)",
+    ]:
+        if token not in wire + incarnation_match:
+            fail(f"detach incarnation matching is missing {token!r}")
+
+    required = [
+        "request.detach.target_node != g_wki.my_node_id",
+        "auto const DETACH_TYPE = static_cast<ResourceType>(request.detach.resource_type)",
+        "wki_resource_incarnation_negotiated(hdr->src_node, DETACH_TYPE)",
+        "wki_dev_detach_payload_size_matches(payload_len, WITH_INCARNATION)",
+        "payload + WKI_DEV_DETACH_INCARNATION_OFFSET",
+        "wki_dev_detach_cookie_matches_binding(binding.attach_cookie, request.attach_cookie)",
+        "wki_dev_detach_incarnation_matches_binding(binding.resource_incarnation, request.incarnation",
+    ]
+    missing = [token for token in required if token not in decode + admit]
+    if missing:
+        fail("DEV_DETACH must validate its exact negotiated form and binding identity: " + ", ".join(missing))
+    require_order(decode, "wki_dev_detach_payload_size_matches", "*request_out = request", "detach length gate before admission")
+    require_order(
+        admit,
+        "wki_dev_detach_incarnation_matches_binding",
+        "mark_binding_retiring_locked(binding)",
+        "detach incarnation gate before retirement",
+    )
+
+
+def test_detach_admission_is_napi_safe_and_cleanup_is_deferred() -> None:
+    source = DEV_SERVER_CPP.read_text()
+    header = DEV_SERVER_HPP.read_text()
+    admit = function_body(source, "wki_dev_server_admit_detach_rx")
+    worker = function_body(source, "wki_dev_server_process_pending_detaches")
+
+    for token in [
+        "mark_binding_retiring_locked(binding)",
+        "binding.detach_cleanup_pending = true",
+        "binding.detach_cleanup_claimed = false",
+    ]:
+        if token not in admit:
+            fail(f"DEV_DETACH admission is missing {token!r}")
+    for forbidden in [
+        "new ",
+        "delete",
+        "kern_yield",
+        "wait_for_binding_refs_to_drain",
+        "wki_remote_vfs_mark_server_fds_for_channel",
+        "wki_zone_destroy",
+        "on_remote_detach",
+        "wki_channel_close",
+        "wki_resource_advertise_all",
+        "dbg::log",
+    ]:
+        if forbidden in admit:
+            fail(f"DEV_DETACH admission must remain NAPI-safe: found {forbidden!r}")
+
+    for token in [
+        "binding.detach_cleanup_pending",
+        "binding.detach_cleanup_claimed",
+        "wait_for_binding_refs_to_drain(item.binding)",
+        "wki_remote_vfs_mark_server_fds_for_channel(item.channel_identity)",
+        "delete[] item.vfs_rdma_write_buf",
+        "wki_zone_destroy(item.blk_zone_id)",
+        "item.block_dev->remotable->on_remote_detach(item.consumer_node)",
+        "item.net_dev->remotable->on_remote_detach(item.consumer_node)",
+        "wki_channel_close_generation(item.channel_identity.channel",
+        "erase_retired_binding_locked(item.binding)",
+        "wki_resource_advertise_all()",
+    ]:
+        if token not in worker:
+            fail(f"task-context DEV_DETACH cleanup is missing {token!r}")
+    require_order(worker, "binding.detach_cleanup_claimed = true", "wait_for_binding_refs_to_drain(item.binding)", "detach claim")
+    require_order(worker, "wait_for_binding_refs_to_drain(item.binding)", "delete[] item.vfs_rdma_write_buf", "detach ref drain")
+    require_order(worker, "wki_channel_close_generation(item.channel_identity.channel", "erase_retired_binding_locked(item.binding)", "detach erase")
+
+    if "handle_dev_detach" in source or "handle_dev_detach" in header:
+        fail("DEV_DETACH must not retain a later blocking inline dispatch handler")
+    for token in [
+        "auto wki_dev_server_admit_detach_rx(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len) -> bool;",
+        "void wki_dev_server_process_pending_detaches();",
+    ]:
+        if token not in header:
+            fail(f"dev-server detach API declaration is missing {token!r}")
+
+
+def test_replacement_attach_waits_for_pending_detach_cleanup() -> None:
+    source = DEV_SERVER_CPP.read_text()
+    header = DEV_SERVER_HPP.read_text()
+    gate = function_body(source, "wki_dev_server_attach_blocked_by_pending_detach")
+
+    required = [
+        "request.target_node != g_wki.my_node_id",
+        "decode_attach_resource_incarnation(hdr->src_node, RESOURCE_TYPE, payload, payload_len",
+        "s_server_lock.lock_irqsave()",
+        "!binding.active",
+        "binding.retiring.load(std::memory_order_acquire)",
+        "binding.detach_cleanup_pending",
+        "binding.consumer_node == hdr->src_node",
+        "binding.resource_type == RESOURCE_TYPE",
+        "binding.resource_id == request.resource_id",
+    ]
+    missing = [token for token in required if token not in gate]
+    if missing:
+        fail("replacement attach gate is missing pending-detach identity checks: " + ", ".join(missing))
+    for forbidden in ["new ", "delete", "kern_yield", "wki_send", "wki_channel_close", "wki_zone_destroy"]:
+        if forbidden in gate:
+            fail(f"replacement attach gate must remain fixed-lock/nonblocking: found {forbidden!r}")
+    if "wki_dev_server_attach_blocked_by_pending_detach" not in header:
+        fail("replacement attach gate must be public for reliable RX pre-ACK admission")
+
+
+def test_retirement_has_one_cleanup_owner_and_preserves_block_writer_exclusion() -> None:
+    source = DEV_SERVER_CPP.read_text()
+    header = DEV_SERVER_HPP.read_text()
+    ktest = WKI_DEV_SERVER_KTEST.read_text()
+    vfs_claim = function_body(source, "vfs_reconciliation_may_claim_binding")
+    vfs_finish = function_body(source, "wki_dev_server_finish_vfs_export_reconciliation")
+    writer_reservation = function_body(source, "binding_reserves_block_writer")
+    writer_scan = function_body(source, "block_has_remote_writer_locked")
+    detach_claim = function_body(source, "detach_all_may_claim_binding")
+    detach_all = function_body(source, "wki_dev_server_detach_all_for_peer")
+
+    for token in [
+        "binding.resource_type == ResourceType::VFS",
+        "binding.active",
+        "!binding.retiring.load(std::memory_order_acquire)",
+        "binding.vfs_export_revision_seen != target_even_revision",
+    ]:
+        if token not in vfs_claim:
+            fail(f"VFS reconciliation cleanup claim is missing {token!r}")
+    if "vfs_reconciliation_may_claim_binding(binding, target_even_revision)" not in vfs_finish:
+        fail("VFS export reconciliation must not claim a binding already owned by retirement cleanup")
+
+    for token in ["binding.resource_type == ResourceType::BLOCK", "!binding.block_read_only"]:
+        if token not in writer_reservation:
+            fail(f"BLOCK writer reservation is missing {token!r}")
+    for forbidden in ["binding.active", "binding.retiring"]:
+        if forbidden in writer_reservation:
+            fail(f"BLOCK writer reservation must persist through retirement: found {forbidden!r}")
+    if "binding_reserves_block_writer(binding)" not in writer_scan:
+        fail("BLOCK overlap scan must use the through-erasure writer reservation")
+
+    for token in ["binding.detach_cleanup_pending", "binding.epoch_reset_pending", "binding.active", "binding.retiring.load"]:
+        if token not in detach_claim:
+            fail(f"peer detach-all cleanup-owner classifier is missing {token!r}")
+
+    for token in [
+        "wki_dev_server_process_pending_detaches()",
+        "peer_has_binding_locked(node_id)",
+        "peer_binding_remains",
+        "detach_all_may_claim_binding(b, node_id)",
+        "ker::mod::sched::kern_yield()",
+        "wki_remote_vfs_process_pending_server_fd_cleanup()",
+    ]:
+        if token not in detach_all:
+            fail(f"peer detach-all must join every same-peer cleanup owner: missing {token!r}")
+    require_order(
+        detach_all,
+        "wki_dev_server_process_pending_detaches()",
+        "// Collect work items and cleanup info under the lock",
+        "drive pending cleanup before peer-owned work",
+    )
+    require_order(
+        detach_all,
+        "erase_retired_binding_locked(work.at(i).binding)",
+        "wki_remote_vfs_process_pending_server_fd_cleanup()",
+        "all binding owners must finish before marked VFS FD drain",
+    )
+    if "RECONCILIATION_OWNER_JOINED" not in source:
+        fail("retirement selftest must cover reconciliation-owned peer rows")
+
+    if "auto wki_dev_server_selftest_retirement_ownership_guards() -> bool;" not in header:
+        fail("retirement ownership selftest must be declared")
+    for token in [
+        "KTEST(WkiDevServerBinding, RetirementOwnershipAndWriterReservationPersistUntilErase)",
+        "wki_dev_server_selftest_retirement_ownership_guards()",
+    ]:
+        if token not in ktest:
+            fail(f"retirement ownership KTEST coverage is missing {token!r}")
+
+
+def test_block_attach_transfers_persistent_writer_lease() -> None:
+    source = DEV_SERVER_CPP.read_text()
+    header = DEV_SERVER_HPP.read_text()
+    ktest = WKI_DEV_SERVER_KTEST.read_text()
+    attach = function_body(source, "handle_dev_attach_req")
+
+    for token in [
+        "dev::BlockWriterLease block_writer_lease{}",
+        "block_writer_lease(std::move(o.block_writer_lease))",
+        "block_writer_lease = std::move(o.block_writer_lease)",
+    ]:
+        if token not in header:
+            fail(f"DevServerBinding writer lease move lifecycle is missing {token!r}")
+    for token in [
+        "ker::dev::BlockWriterLease block_writer_lease",
+        "block_writer_lease.try_acquire(bdev, ker::dev::BlockWriterLeaseOwner::REMOTE_BINDING)",
+        "binding.block_writer_lease = std::move(block_writer_lease)",
+        "g_bindings.push_back(std::move(binding))",
+    ]:
+        if token not in attach:
+            fail(f"BLOCK attach writer lease publication is missing {token!r}")
+    require_order(attach, "block_writer_lease.try_acquire", "reserve_attach_channel", "writer lease before channel/callback setup")
+    require_order(attach, "binding.block_writer_lease = std::move(block_writer_lease)", "g_bindings.push_back(std::move(binding))", "lease transfer before binding publication")
+    if "mounted_block_device_overlaps(bdev)" in attach:
+        fail("BLOCK attach must not retain the split mount-table TOCTOU check")
+    for token in [
+        "KTEST(WkiDevServerBinding, MoveTransfersBlockWriterLeaseExactlyOnce)",
+        "wki_dev_server_selftest_block_writer_lease_transfer()",
+    ]:
+        if token not in ktest:
+            fail(f"DevServerBinding writer lease transfer KTEST is missing {token!r}")
+
+
+def test_net_forward_hook_removal_revalidates_after_cleanup() -> None:
+    source = DEV_SERVER_CPP.read_text()
+    helper = function_body(source, "uninstall_net_rx_forward_if_unused")
+    worker = function_body(source, "wki_dev_server_process_pending_detaches")
+    attach = function_body(source, "handle_dev_attach_req")
+
+    for token in [
+        "s_server_lock.lock_irqsave()",
+        "!has_net_binding_for_dev(dev)",
+        "dev->wki_rx_forward.load(std::memory_order_acquire) == wki_dev_server_forward_net_rx",
+        "dev->wki_rx_forward.store(nullptr, std::memory_order_release)",
+    ]:
+        if token not in helper:
+            fail(f"NET hook revalidation helper is missing {token!r}")
+    require_order(worker, "erase_retired_binding_locked(item.binding)", "uninstall_net_rx_forward_if_unused(item.net_dev)", "NET hook apply")
+
+    net_publication = attach[attach.find("binding.net_dev = ndev;") :]
+    require_order(
+        net_publication,
+        "g_bindings.push_back(std::move(binding))",
+        "ndev->wki_rx_forward.store(wki_dev_server_forward_net_rx, std::memory_order_release)",
+        "NET hook publication after binding publication",
+    )
+    require_order(
+        net_publication,
+        "ndev->wki_rx_forward.store(wki_dev_server_forward_net_rx, std::memory_order_release)",
+        "s_server_lock.unlock_irqrestore(SRV_FLAGS)",
+        "NET hook publication under server lock",
+    )
+
+    for name in ("wki_dev_server_cleanup_epoch_reset_for_peer", "wki_dev_server_detach_all_for_peer"):
+        body = function_body(source, name)
+        if "uninstall_net_rx_forward_if_unused(work.at(i).net_dev)" not in body:
+            fail(f"{name} must revalidate NET hook removal after cleanup")
+        if "->wki_rx_forward.store(nullptr" in body or "->wki_rx_forward = nullptr" in body:
+            fail(f"{name} must not apply a stale pre-cleanup NET hook decision")
 
 
 def test_channel_close_serializes_pool_reuse_until_reset_complete() -> None:
@@ -322,18 +581,19 @@ def test_channel_reuse_generation_guards_unlock_tx_relock_paths() -> None:
         fail("ACK snapshots must capture the channel generation")
     if "ch->generation == ack.generation" not in source:
         fail("post-unlock ACK completion must reject stale channel generations")
-    if "fast_retransmit_generation = ch->generation;" not in source:
-        fail("fast retransmit snapshots must capture the channel generation")
-    if "ch->generation == fast_retransmit_generation" not in source:
+    if "capture_retransmit_head_snapshot(ch, wki_now_us(), false, true, fast_retransmit_expected_seq, fast_retransmit)" not in source:
+        fail("fast retransmit must capture a stable retransmit snapshot")
+    if "ch->generation == fast_retransmit.generation" not in source:
         fail("fast retransmit completion must reject stale channel generations")
 
     for name, body in (("wki_timer_tick_single", timer_single_body), ("wki_timer_tick", timer_body)):
         missing = [
             token
             for token in (
-                "retransmit_generation = ch->generation;",
+                "RetransmitSnapshot retransmit = {};",
+                "capture_retransmit_head_snapshot(ch, now_us, true, false, 0, retransmit)",
+                "ch->generation == retransmit.generation",
                 "ack_generation = ch->generation;",
-                "ch->generation == retransmit_generation",
                 "complete_ack_transmit_for_generation_locked(ch, ack_generation",
             )
             if token not in body
@@ -359,8 +619,16 @@ def test_block_ring_binding_lifetime_is_retained_outside_server_lock() -> None:
     missing = [token for token in required if token not in source]
     if missing:
         fail("dev-server bindings need stable storage and retain/release helpers: " + ", ".join(missing))
-    if "std::atomic<uint32_t> refs" not in header or "std::atomic<bool> retiring" not in header:
-        fail("DevServerBinding must carry atomic refs and retiring lifecycle state")
+    for token in [
+        "std::atomic<uint32_t> refs",
+        "std::atomic<bool> retiring",
+        "bool epoch_reset_pending = false",
+        "bool detach_cleanup_pending = false",
+        "bool detach_cleanup_claimed = false",
+        "WkiChannelIdentity channel_identity{}",
+    ]:
+        if token not in header:
+            fail(f"DevServerBinding lifecycle state is missing {token}")
 
     require_order(post_body, "binding = find_binding_by_zone_id(zone_id);", "retain_binding_locked(binding)", "zone post retain")
     require_order(post_body, "retain_binding_locked(binding)", "blk_ring_server_poll(binding);", "zone post poll")
@@ -376,122 +644,278 @@ def test_block_ring_binding_lifetime_is_retained_outside_server_lock() -> None:
 
 
 def test_deferred_vfs_ops_retain_their_binding_through_blocking_work() -> None:
-    body = function_body(DEV_SERVER_CPP.read_text(), "run_deferred_vfs_op")
-    required = [
+    source = DEV_SERVER_CPP.read_text()
+    queue_body = function_body(source, "queue_vfs_op")
+    run_body = function_body(source, "run_deferred_vfs_op")
+    queue_required = [
         "DevServerBinding* retained_binding = nullptr",
+        "find_binding_by_channel_identity(channel_identity)",
         "retain_binding_locked(binding)",
         "retained_binding = binding",
-        "if (retained_binding != nullptr)",
-        "detail::handle_vfs_op",
-        "release_binding(retained_binding)",
+        "if (retained_binding == nullptr)",
+        "op->retained_binding = retained_binding",
     ]
-    missing = [token for token in required if token not in body]
+    missing = [token for token in queue_required if token not in queue_body]
     if missing:
-        fail("deferred VFS operations must retain their binding: " + ", ".join(missing))
+        fail("deferred VFS enqueue must retain its exact binding: " + ", ".join(missing))
 
-    require_order(body, "retain_binding_locked(binding)", "detail::handle_vfs_op", "deferred VFS retain before handler")
-    require_order(body, "detail::handle_vfs_op", "release_binding(retained_binding)", "deferred VFS release after handler")
-    require_order(body, "release_binding(retained_binding)", "delete[] op->req_data", "deferred VFS release before request cleanup")
+    run_required = [
+        "DevServerBinding* const RETAINED_BINDING = op->retained_binding",
+        "if (RETAINED_BINDING != nullptr)",
+        "detail::handle_vfs_op",
+        "op->channel_identity",
+        "release_binding(RETAINED_BINDING)",
+    ]
+    missing = [token for token in run_required if token not in run_body]
+    if missing:
+        fail("deferred VFS worker must consume the retained binding: " + ", ".join(missing))
+
+    require_order(queue_body, "retain_binding_locked(binding)", "new (std::nothrow) DeferredVfsOp", "VFS retain before allocation/enqueue")
+    require_order(queue_body, "retain_binding_locked(binding)", "op->retained_binding = retained_binding", "VFS retained pointer transfer")
+    require_order(run_body, "detail::handle_vfs_op", "release_binding(RETAINED_BINDING)", "deferred VFS release after handler")
+    require_order(run_body, "release_binding(RETAINED_BINDING)", "delete[] op->req_data", "deferred VFS release before request cleanup")
 
 
 def test_detach_waits_for_binding_refs_before_cleanup_and_erase() -> None:
     detach_all_body = function_body(DEV_SERVER_CPP.read_text(), "wki_dev_server_detach_all_for_peer")
-    detach_body = function_body(DEV_SERVER_CPP.read_text(), "handle_dev_detach")
+    detach_body = function_body(DEV_SERVER_CPP.read_text(), "wki_dev_server_process_pending_detaches")
 
     require_order(detach_all_body, "mark_binding_retiring_locked(b);", "wait_for_binding_refs_to_drain(item.binding);", "fence retire wait")
     require_order(detach_all_body, "wait_for_binding_refs_to_drain(item.binding);", "delete[] item.vfs_rdma_write_buf;", "fence wait before free")
     require_order(detach_all_body, "wait_for_binding_refs_to_drain(item.binding);", "wki_zone_destroy(item.blk_zone_id);", "fence wait before zone destroy")
     require_order(detach_all_body, "wki_zone_destroy(item.blk_zone_id);", "erase_retired_binding_locked(work.at(i).binding);", "fence erase after cleanup")
 
-    require_order(detach_body, "mark_binding_retiring_locked(binding);", "wait_for_binding_refs_to_drain(info.binding);", "detach retire wait")
-    require_order(detach_body, "wait_for_binding_refs_to_drain(info.binding);", "delete[] info.vfs_rdma_write_buf;", "detach wait before free")
-    require_order(detach_body, "wait_for_binding_refs_to_drain(info.binding);", "wki_zone_destroy(info.blk_zone_id);", "detach wait before zone destroy")
-    require_order(detach_body, "wki_zone_destroy(info.blk_zone_id);", "erase_retired_binding_locked(info.binding);", "detach erase after cleanup")
+    require_order(
+        detach_body,
+        "binding.detach_cleanup_claimed = true;",
+        "wait_for_binding_refs_to_drain(item.binding);",
+        "detach claim before wait",
+    )
+    require_order(detach_body, "wait_for_binding_refs_to_drain(item.binding);", "delete[] item.vfs_rdma_write_buf;", "detach wait before free")
+    require_order(
+        detach_body,
+        "wait_for_binding_refs_to_drain(item.binding);",
+        "wki_zone_destroy(item.blk_zone_id);",
+        "detach wait before zone destroy",
+    )
+    require_order(
+        detach_body,
+        "wki_zone_destroy(item.blk_zone_id);",
+        "erase_retired_binding_locked(item.binding);",
+        "detach erase after cleanup",
+    )
 
 
-def test_attach_ack_failure_rolls_back_block_and_vfs_bindings() -> None:
+def test_epoch_cleanup_and_deferred_vfs_are_channel_generation_fenced() -> None:
+    source = DEV_SERVER_CPP.read_text()
+    header = DEV_SERVER_HPP.read_text()
+    wki_source = WKI_CPP.read_text()
+    marker = function_body(source, "wki_dev_server_mark_epoch_reset")
+    cleanup = function_body(source, "wki_dev_server_cleanup_epoch_reset_for_peer")
+    handler = function_body(source, "handle_dev_op_req")
+    queue = function_body(source, "queue_vfs_op")
+    worker = function_body(source, "run_deferred_vfs_op")
+    worker_index = function_body(source, "vfs_worker_index")
+    worker_dequeue = function_body(source, "vfs_worker_dequeue")
+    detach_all = function_body(source, "wki_dev_server_detach_all_for_peer")
+
+    for token in ["binding.detach_cleanup_pending", "binding.epoch_reset_pending = true", "mark_binding_retiring_locked(binding)"]:
+        if token not in marker:
+            fail(f"nonblocking server epoch marker is missing {token}")
+    for forbidden in ["new ", "delete ", "kern_yield", "wki_channel_close"]:
+        if forbidden in marker:
+            fail(f"server epoch marker must remain nonblocking: found {forbidden}")
+
+    for token in [
+        "binding.epoch_reset_pending",
+        ".channel_identity = binding.channel_identity",
+        "wait_for_binding_refs_to_drain(item.binding)",
+        "wki_channel_close_generation(item.channel_identity.channel",
+        "erase_retired_binding_locked(work.at(i).binding)",
+    ]:
+        if token not in cleanup:
+            fail(f"task-context server epoch cleanup is missing {token}")
+    require_order(
+        cleanup,
+        "wait_for_binding_refs_to_drain(item.binding)",
+        "delete[] item.vfs_rdma_write_buf",
+        "epoch cleanup must drain workers before freeing VFS staging",
+    )
+    require_order(
+        cleanup,
+        "wki_channel_close_generation(item.channel_identity.channel",
+        "erase_retired_binding_locked(work.at(i).binding)",
+        "epoch cleanup exact close before erase",
+    )
+
+    if source.count("binding.channel_identity = channel_identity") < 3:
+        fail("BLOCK, VFS, and NET server bindings must capture their allocation identity")
+    if source.count("reserve_attach_channel(hdr->src_node, req->requested_channel") < 3 or source.count("&channel_identity") < 3:
+        fail("all attach branches must reserve channels with an immutable identity output")
+
+    for token in [
+        "WkiChannelIdentity const CHANNEL_IDENTITY",
+        ".channel = rx_channel",
+        ".generation = rx_channel_generation",
+        "find_binding_by_channel_identity(CHANNEL_IDENTITY)",
+        "queue_vfs_op(hdr, CHANNEL_IDENTITY",
+    ]:
+        if token not in handler:
+            fail(f"DEV_OP_REQ generation admission is missing {token}")
+    for token in ["op->channel_identity = channel_identity", "DeferredVfsOp"]:
+        if token not in queue and token not in source:
+            fail(f"deferred VFS queue token capture is missing {token}")
+    for token in ["src_node", "channel_id", "VFS_OP_WORKER_COUNT"]:
+        if token not in worker_index:
+            fail(f"VFS worker shard identity is missing {token}")
+    require_order(queue, "auto* shard = vfs_worker_for(hdr)", "shard->tail->next = op", "VFS per-channel FIFO enqueue")
+    require_order(worker_dequeue, "DeferredVfsOp* op = shard.head", "shard.head = op->next", "VFS FIFO dequeue")
+    if "op_id >= OP_VFS_OPEN && op_id <= OP_VFS_READ_BULK" not in source or "constexpr uint16_t OP_VFS_CLOSE" not in WIRE_HPP.read_text():
+        fail("OP_VFS_CLOSE must share the per-channel deferred VFS FIFO with read/write operations")
+    for token in [
+        "DevServerBinding* const RETAINED_BINDING = op->retained_binding",
+        "channel_identity_matches(RETAINED_BINDING->channel_identity, op->channel_identity)",
+        "detail::handle_vfs_op(&op->hdr, op->channel_identity",
+        "send_vfs_error_response(op->channel_identity",
+    ]:
+        if token not in worker:
+            fail(f"deferred VFS worker generation validation is missing {token}")
+
+    if "detail::handle_dev_op_req(hdr, payload, payload_len, rx_channel, rx_channel_generation)" not in wki_source:
+        fail("reliable dispatch must pass the captured RX channel generation to DEV_OP_REQ")
+    if "wki_channel_get(item.consumer_node, item.assigned_channel)" in detach_all:
+        fail("peer detach cleanup must never allocate a replacement channel")
+    detach_claim = function_body(source, "detach_all_may_claim_binding")
+    if "binding.detach_cleanup_pending" not in detach_claim or "detach_all_may_claim_binding(b, node_id)" not in detach_all:
+        fail("peer detach cleanup must not double-consume an explicitly admitted detach")
+    if "wki_channel_close_generation(item.channel_identity.channel" not in detach_all:
+        fail("peer detach cleanup must close only the captured channel generation")
+    for token in [
+        "void wki_dev_server_mark_epoch_reset(uint16_t node_id);",
+        "void wki_dev_server_cleanup_epoch_reset_for_peer(uint16_t node_id);",
+    ]:
+        if token not in header:
+            fail(f"dev-server epoch API declaration is missing {token}")
+
+
+def test_attach_ack_failure_defers_exact_cleanup_outside_rx() -> None:
     source = DEV_SERVER_CPP.read_text()
     header = DEV_SERVER_HPP.read_text()
     ktest = WKI_DEV_SERVER_KTEST.read_text()
     attach_body = function_body(source, "handle_dev_attach_req")
-    rollback_body = function_body(source, "rollback_attach_ack_failure")
+    staging = function_body(source, "stage_attach_ack_failure_cleanup_locked")
+    admission = function_body(source, "defer_attach_ack_failure_cleanup")
+    worker = function_body(source, "wki_dev_server_process_pending_detaches")
+    selftest = function_body(source, "wki_dev_server_selftest_attach_ack_failure_defers_cleanup")
 
     required = [
-        "void rollback_attach_ack_failure(uint16_t consumer_node, ResourceType resource_type, uint32_t resource_id, uint16_t assigned_channel)",
-        "rollback_attach_ack_failure(hdr->src_node, ResourceType::BLOCK, req->resource_id, ch->channel_id);",
-        "rollback_attach_ack_failure(hdr->src_node, ResourceType::VFS, req->resource_id, ch->channel_id);",
-        "auto wki_dev_server_selftest_attach_ack_failure_rolls_back_binding() -> bool",
+        "auto defer_attach_ack_failure_cleanup(uint16_t consumer_node, ResourceType resource_type, uint32_t resource_id,",
+        "defer_attach_ack_failure_cleanup(hdr->src_node, ResourceType::BLOCK, req->resource_id, channel_identity)",
+        "defer_attach_ack_failure_cleanup(hdr->src_node, ResourceType::VFS, req->resource_id, channel_identity)",
+        "defer_attach_ack_failure_cleanup(hdr->src_node, ResourceType::NET, req->resource_id, channel_identity)",
+        "auto wki_dev_server_selftest_attach_ack_failure_defers_cleanup() -> bool",
     ]
     missing = [token for token in required if token not in source]
     if missing:
-        fail("attach ACK failure rollback scaffolding is missing: " + ", ".join(missing))
+        fail("attach ACK failure deferred-cleanup scaffolding is missing: " + ", ".join(missing))
 
     for token in [
+        "binding.active",
+        "binding.retiring.load(std::memory_order_acquire)",
         "binding.consumer_node != consumer_node",
         "binding.resource_type != resource_type",
         "binding.resource_id != resource_id",
-        "binding.assigned_channel != assigned_channel",
+        "channel_identity_matches(binding.channel_identity, channel_identity)",
         "mark_binding_retiring_locked(binding)",
-        "wait_for_binding_refs_to_drain(info.binding)",
-        "delete[] info.vfs_rdma_write_buf",
-        "delete[] info.vfs_rdma_read_staging_buf",
-        "delete[] info.vfs_rdma_bulk_staging_buf",
-        "wki_zone_destroy(info.blk_zone_id)",
-        "info.block_dev->remotable->on_remote_detach(info.consumer_node)",
-        "wki_channel_lookup(info.consumer_node, info.assigned_channel)",
-        "wki_channel_close(ch)",
-        "erase_retired_binding_locked(info.binding)",
+        "binding.detach_cleanup_pending = true",
+        "binding.detach_cleanup_claimed = false",
     ]:
-        if token not in rollback_body:
-            fail(f"attach ACK failure rollback helper is missing {token!r}")
-    if "wki_channel_get(info.consumer_node, info.assigned_channel)" in rollback_body:
-        fail("attach ACK rollback must not allocate a channel while cleaning up a failed attach")
-
-    require_order(
-        attach_body,
-        "int const ACK_RET = wki_send(hdr->src_node, WKI_CHAN_RESOURCE, MsgType::DEV_ATTACH_ACK, &ack, sizeof(ack));",
-        "rollback_attach_ack_failure(hdr->src_node, ResourceType::BLOCK, req->resource_id, ch->channel_id);",
-        "BLOCK attach ACK rollback",
-    )
-    require_order(
-        attach_body,
-        "int const ACK_RET = wki_send(hdr->src_node, WKI_CHAN_RESOURCE, MsgType::DEV_ATTACH_ACK, &ack, sizeof(ack));",
-        "rollback_attach_ack_failure(hdr->src_node, ResourceType::VFS, req->resource_id, ch->channel_id);",
-        "VFS attach ACK rollback",
-    )
-    require_order(
-        rollback_body,
-        "mark_binding_retiring_locked(binding)",
-        "wait_for_binding_refs_to_drain(info.binding)",
-        "rollback retires before waiting",
-    )
-    require_order(
-        rollback_body,
-        "wait_for_binding_refs_to_drain(info.binding)",
-        "delete[] info.vfs_rdma_write_buf",
-        "rollback waits before freeing VFS buffers",
-    )
-    require_order(
-        rollback_body,
-        "wait_for_binding_refs_to_drain(info.binding)",
-        "wki_zone_destroy(info.blk_zone_id)",
-        "rollback waits before destroying block zone",
-    )
-    require_order(
-        rollback_body,
-        "wki_channel_close(ch)",
-        "erase_retired_binding_locked(info.binding)",
-        "rollback erases after channel close",
-    )
-
-    if "auto wki_dev_server_selftest_attach_ack_failure_rolls_back_binding() -> bool;" not in header:
-        fail("dev-server attach ACK rollback selftest must be declared")
+        if token not in staging:
+            fail(f"attach ACK failure locked staging is missing {token!r}")
     for token in [
-        "KTEST(WkiDevServerAttachAckFailure, RollsBackBlockAndVfsBindings)",
-        "wki_dev_server_selftest_attach_ack_failure_rolls_back_binding()",
+        "s_server_lock.lock_irqsave()",
+        "stage_attach_ack_failure_cleanup_locked(consumer_node, resource_type, resource_id, channel_identity)",
+        "s_server_lock.unlock_irqrestore(SRV_FLAGS)",
+        "wki_deferred_work_notify()",
+    ]:
+        if token not in admission:
+            fail(f"attach ACK failure admission wrapper is missing {token!r}")
+    for forbidden in [
+        "wait_for_binding_refs_to_drain",
+        "delete",
+        "wki_zone_destroy",
+        "on_remote_detach",
+        "wki_channel_close",
+        "erase_retired_binding_locked",
+        "uninstall_net_rx_forward_if_unused",
+    ]:
+        if forbidden in staging or forbidden in admission:
+            fail(f"attach ACK failure RX admission must not perform cleanup: found {forbidden!r}")
+
+    for token in [
+        "wait_for_binding_refs_to_drain(item.binding)",
+        "item.resource_type == ResourceType::VFS",
+        "item.block_dev->remotable->on_remote_detach(item.consumer_node)",
+        "item.net_dev->remotable->on_remote_detach(item.consumer_node)",
+        "wki_channel_close_generation(item.channel_identity.channel",
+        "erase_retired_binding_locked(item.binding)",
+        "uninstall_net_rx_forward_if_unused(item.net_dev)",
+    ]:
+        if token not in worker:
+            fail(f"deferred detach worker must own ACK-failure cleanup: missing {token!r}")
+
+    if "rollback_attach_ack_failure" in source or "rollback_net_binding" in source:
+        fail("attach ACK failure must not retain inline cleanup helpers")
+    for token in [
+        "s_server_lock.lock_irqsave()",
+        "stage_attach_ack_failure_cleanup_locked(BLOCK_NODE",
+        "stage_attach_ack_failure_cleanup_locked(VFS_NODE",
+        "stage_attach_ack_failure_cleanup_locked(NET_NODE",
+        "g_bindings.erase(it)",
+        "s_server_lock.unlock_irqrestore(flags)",
+    ]:
+        if token not in selftest:
+            fail(f"attach ACK failure selftest must stage and inspect under one server-lock span: missing {token!r}")
+    require_order(selftest, "s_server_lock.lock_irqsave()", "stage_attach_ack_failure_cleanup_locked(BLOCK_NODE", "selftest lock before staging")
+    require_order(selftest, "stage_attach_ack_failure_cleanup_locked(NET_NODE", "g_bindings.erase(it)", "selftest staging before erase")
+    require_order(selftest, "g_bindings.erase(it)", "s_server_lock.unlock_irqrestore(flags)", "selftest erase before unlock")
+    for forbidden in ["defer_attach_ack_failure_cleanup(", "wki_deferred_work_notify()"]:
+        if forbidden in selftest:
+            fail(f"attach ACK failure selftest must not wake the production worker: found {forbidden!r}")
+    if "auto wki_dev_server_selftest_attach_ack_failure_defers_cleanup() -> bool;" not in header:
+        fail("dev-server deferred attach ACK failure selftest must be declared")
+    for token in [
+        "KTEST(WkiDevServerAttachAckFailure, DefersExactBlockVfsAndNetCleanupOutsideRx)",
+        "wki_dev_server_selftest_attach_ack_failure_defers_cleanup()",
+        "WRONG_GENERATION_REJECTED",
+        "NET_DEFERRED",
+    ]:
+        if token not in ktest and token not in source:
+            fail(f"dev-server deferred attach ACK cleanup coverage is missing {token!r}")
+
+
+def test_detach_admission_has_ktest_coverage() -> None:
+    source = DEV_SERVER_CPP.read_text()
+    header = DEV_SERVER_HPP.read_text()
+    ktest = WKI_DEV_SERVER_KTEST.read_text()
+    for token in [
+        "auto wki_dev_server_selftest_detach_admission_lifecycle() -> bool",
+        "WRONG_COOKIE_REJECTED",
+        "FIRST_ADMITTED",
+        "DUPLICATE_IDEMPOTENT",
+        "REPLACEMENT_BLOCKED",
+        "UNRELATED_ATTACH_ALLOWED",
+    ]:
+        if token not in source:
+            fail(f"detach admission selftest is missing {token!r}")
+    if "auto wki_dev_server_selftest_detach_admission_lifecycle() -> bool;" not in header:
+        fail("detach admission selftest must be declared")
+    for token in [
+        "KTEST(WkiDevServerDetach, AdmissionIsExactIdempotentAndBlocksReplacement)",
+        "wki_dev_server_selftest_detach_admission_lifecycle()",
     ]:
         if token not in ktest:
-            fail(f"dev-server attach ACK rollback KTEST coverage is missing {token!r}")
+            fail(f"detach admission KTEST coverage is missing {token!r}")
 
 
 def main() -> None:
@@ -506,7 +930,12 @@ def main() -> None:
     test_net_rx_credit_accounting_uses_proxy_lock()
     test_net_error_responses_echo_payload_cookie()
     test_proxy_net_xmit_rejects_oversize_before_uint16_truncation()
-    test_detach_cookie_is_exact_match()
+    test_detach_cookie_and_incarnation_are_exact_matches()
+    test_detach_admission_is_napi_safe_and_cleanup_is_deferred()
+    test_replacement_attach_waits_for_pending_detach_cleanup()
+    test_retirement_has_one_cleanup_owner_and_preserves_block_writer_exclusion()
+    test_block_attach_transfers_persistent_writer_lease()
+    test_net_forward_hook_removal_revalidates_after_cleanup()
     test_channel_close_serializes_pool_reuse_until_reset_complete()
     test_peer_channel_close_clears_index_before_unlocking_pool()
     test_reliable_rx_does_not_autocreate_allocated_dynamic_channels()
@@ -514,7 +943,9 @@ def main() -> None:
     test_block_ring_binding_lifetime_is_retained_outside_server_lock()
     test_deferred_vfs_ops_retain_their_binding_through_blocking_work()
     test_detach_waits_for_binding_refs_before_cleanup_and_erase()
-    test_attach_ack_failure_rolls_back_block_and_vfs_bindings()
+    test_epoch_cleanup_and_deferred_vfs_are_channel_generation_fenced()
+    test_attach_ack_failure_defers_exact_cleanup_outside_rx()
+    test_detach_admission_has_ktest_coverage()
     print("WKI dev server source invariants hold")
 
 

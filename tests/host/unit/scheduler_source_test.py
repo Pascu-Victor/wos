@@ -387,23 +387,24 @@ def test_wait_channel_policy_uses_typed_kinds() -> None:
 def test_higher_priority_wakeup_bypasses_only_priority_holdoff_guards() -> None:
     source = SCHEDULER_CPP.read_text()
     net_latency_sources = "\n".join([NET_BACKLOG_CPP.read_text(), NETPOLL_CPP.read_text(), WKI_REMOTE_IPC_CPP.read_text()])
-    helper_body = function_body(source, "is_higher_priority_process_contender")
+    helper_body = function_body(source, "is_higher_priority_contender")
 
     require_tokens(
         helper_body,
         [
-            "current != nullptr",
-            "contender != nullptr",
+            "current == nullptr",
+            "contender == nullptr",
             "current->type == task::TaskType::PROCESS",
-            "contender->type == task::TaskType::PROCESS",
             "contender->sched_nice < current->sched_nice",
+            "contender->type == task::TaskType::PROCESS || contender->type == task::TaskType::DAEMON",
+            "current->type == task::TaskType::DAEMON && contender->type == task::TaskType::DAEMON",
         ],
-        "higher-priority process contender helper",
+        "higher-priority contender helper",
     )
     require_tokens(
         source,
         [
-            "bool const HIGHER_PRIORITY_PREEMPT = is_higher_priority_process_contender(current_task, next);",
+            "bool const HIGHER_PRIORITY_PREEMPT = is_higher_priority_contender(current_task, next);",
             "next->vdeadline >= current_task->vdeadline && !HIGHER_PRIORITY_PREEMPT",
             "next->just_woke && !HIGHER_PRIORITY_PREEMPT && RUN_DURATION_US < SCHED_MIN_GRANULARITY_US",
             "!HIGHER_PRIORITY_PREEMPT &&",
@@ -869,7 +870,8 @@ def test_scheduler_cpu_dump_is_cmdline_gated_and_reports_reschedule_state() -> N
     enabled_body = function_body(context_source, "scheduler_cpu_dump_enabled")
     timer_body = function_body(context_source, "wos_sched_timer")
     state_body = function_body(scheduler_source, "get_scheduler_cpu_state")
-    dump_body = function_body(scheduler_source, "dump_scheduler_cpu_states")
+    dump_body = function_body(scheduler_source, "log_scheduler_cpu_state")
+    dump_all_body = function_body(scheduler_source, "dump_scheduler_cpu_states")
 
     require_tokens(
         context_source,
@@ -951,6 +953,11 @@ def test_scheduler_cpu_dump_is_cmdline_gated_and_reports_reschedule_state() -> N
             "wait_deadline=%lu",
         ],
         "scheduler CPU dump diagnostic fields",
+    )
+    require_tokens(
+        dump_all_body,
+        ["get_scheduler_cpu_state(cpu_no)", "log_scheduler_cpu_state(state)"],
+        "scheduler CPU dump snapshot/format delegation",
     )
 
 
@@ -1595,7 +1602,8 @@ def test_voluntary_blocked_current_cannot_hide_runnable_peer() -> None:
         timer_body,
         [
             "int64_t const PICK_AVG = compute_avg_vruntime(rq)",
-            "auto* next = pick_best_eligible_for_switch_locked(rq, PICK_AVG, current_task)",
+            "auto* next = DAEMON_PREEMPT_INFLATE ? pick_best_daemon_eligible_for_switch_locked",
+            ": pick_best_eligible_for_switch_locked(rq, PICK_AVG, current_task)",
             "if (next == nullptr || next == current_task)",
             "perf_lag_out = PICK_AVG - current_task->vruntime",
         ],
@@ -1605,8 +1613,16 @@ def test_voluntary_blocked_current_cannot_hide_runnable_peer() -> None:
 
 def test_runnable_publication_requires_successful_heap_insert() -> None:
     source = SCHEDULER_CPP.read_text()
+    task_header = TASK_HPP.read_text()
     publish_body = function_body(source, "publish_runnable_task_locked")
     post_body = function_body(source, "post_task_for_cpu_impl")
+    post_waiting_body = function_body(source, "post_task_waiting")
+
+    require_tokens(
+        task_header,
+        ["std::atomic<bool> scheduler_published{false}"],
+        "monotonic scheduler publication marker",
+    )
 
     require_tokens(
         publish_body,
@@ -1634,6 +1650,10 @@ def test_runnable_publication_requires_successful_heap_insert() -> None:
         "t->sched_queue = task::Task::sched_queue::RUNNABLE;",
         "runnable state must be published after heap accounting",
     )
+    runnable_state_pos = publish_body.rfind("t->sched_queue = task::Task::sched_queue::RUNNABLE;")
+    fresh_marker_pos = publish_body.find("t->scheduler_published.store(true, std::memory_order_release)", runnable_state_pos)
+    if runnable_state_pos < 0 or fresh_marker_pos <= runnable_state_pos:
+        fail("fresh runnable marker must publish after heap accounting and before releasing the runqueue lock")
     if source.count("runnable_heap.insert(") != 1:
         fail("runqueue insertion must go through publish_runnable_task_locked")
     require_tokens(
@@ -1663,6 +1683,12 @@ def test_runnable_publication_requires_successful_heap_insert() -> None:
             "return false;",
         ],
         "new task publication failure rollback",
+    )
+    require_order(
+        post_waiting_body,
+        "published = register_fresh_task_visibility(task)",
+        "task->scheduler_published.store(true, std::memory_order_release)",
+        "fresh waiting publication marker",
     )
 
 

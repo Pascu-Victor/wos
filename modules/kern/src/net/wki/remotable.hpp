@@ -41,6 +41,13 @@ struct DiscoveredResource {
     uint16_t node_id = WKI_NODE_INVALID;
     ResourceType resource_type = ResourceType::BLOCK;
     uint32_t resource_id = 0;
+    // Monotonic local observation generation. Deferred mount teardown uses it
+    // to distinguish a withdrawn resource from a later replacement that
+    // reuses the same node/resource ID.
+    uint64_t generation = 0;
+    // Owner-provided identity. Zero denotes non-negotiated legacy ID-only
+    // discovery; nonzero values are compared together with generation.
+    ResourceIncarnationToken owner_incarnation = {};
     uint8_t flags = 0;
     uint32_t net_ipv4_addr = 0;
     uint32_t net_ipv4_mask = 0;
@@ -49,6 +56,12 @@ struct DiscoveredResource {
     uint32_t net_mtu = 1500;
     char name[DISCOVERED_RESOURCE_NAME_LEN] = {};  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
     bool valid = false;
+};
+
+enum class WkiRemotableRxAdmission : uint8_t {
+    DEFERRED,
+    DISCARD,
+    RETRY,
 };
 
 // -----------------------------------------------------------------------------
@@ -64,22 +77,47 @@ void wki_resource_advertise_all();
 // Advertise all local remotable resources to one connected peer.
 void wki_resource_advertise_to_peer(uint16_t peer_node);
 
-// Look up a discovered (remote) resource by node, type, and ID.
-auto wki_resource_find(uint16_t node_id, ResourceType type, uint32_t resource_id) -> DiscoveredResource*;
+// Snapshot whether this exact locally observed resource generation is still
+// advertised. Generation 0 is never live.
+auto wki_resource_generation_snapshot(uint16_t node_id, ResourceType type, uint32_t resource_id) -> uint64_t;
+auto wki_resource_generation_is_live(uint16_t node_id, ResourceType type, uint32_t resource_id, uint64_t generation) -> bool;
+auto wki_resource_observation_snapshot(uint16_t node_id, ResourceType type, uint32_t resource_id, uint64_t generation,
+                                       ResourceIncarnationToken* owner_incarnation_out) -> bool;
+auto wki_resource_observation_is_live(uint16_t node_id, ResourceType type, uint32_t resource_id, uint64_t generation,
+                                      const ResourceIncarnationToken& owner_incarnation) -> bool;
 
-// Look up a discovered (remote) resource by name.
-auto wki_resource_find_by_name(const char* name) -> DiscoveredResource*;
+// Capability/type gate shared by discovery and attach paths.
+auto wki_resource_incarnation_negotiated(uint16_t peer_node, ResourceType type) -> bool;
+
+// BLOCK resource IDs are immutable block-registry indices for the lifetime of
+// one WOS boot; this derives their owner token without a runtime registry lock.
+auto wki_block_resource_incarnation_token(uint32_t resource_id) -> ResourceIncarnationToken;
 
 // Remove all discovered resources for a fenced peer.
 void wki_resources_invalidate_for_peer(uint16_t node_id);
+
+// Retire live VFS observations after a connected peer changes channel epoch,
+// then queue cached-identity replacement generations for task-context remount.
+void wki_resources_rebind_vfs_for_peer(uint16_t node_id);
+
+// Queue fresh NET proxy attachments from still-live observations after a
+// channel-only epoch reset. Actual attaches run after the peer admission gate
+// has reopened in the normal deferred NET worker.
+void wki_resources_rebind_net_for_peer(uint16_t node_id);
 
 // Iterate all valid discovered resources via callback.
 using ResourceVisitor = void (*)(const DiscoveredResource& res, void* ctx);
 void wki_resource_foreach(ResourceVisitor visitor, void* ctx);
 
-// Process deferred VFS auto-mounts. Called from timer tick (outside NAPI context)
-// because wki_remote_vfs_mount() spin-waits for an attach ACK, and inline NAPI
-// draining cannot re-enter the current NAPI poll handler.
+// Admit reliable resource control traffic into bounded storage before ACK.
+// The caller holds the channel lock; this path cannot allocate or block.
+auto wki_remotable_admit_rx(MsgType type, const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len, WkiChannel* rx_channel,
+                            uint32_t rx_channel_generation) -> WkiRemotableRxAdmission;
+void wki_remotable_process_pending_rx();
+
+// Process deferred VFS auto-mounts and withdrawn-resource unmounts from the WKI
+// deferred worker. Mount waits cannot re-enter their NAPI poll handler, and
+// unmount may yield while an in-flight remote-VFS completion retires.
 void wki_remotable_process_pending_mounts();
 
 // V2: Process deferred NET auto-attaches. Called from timer tick (outside NAPI context).

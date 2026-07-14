@@ -166,6 +166,7 @@ inline auto wki_ack_reserved(uint16_t channel_id) -> uint32_t { return static_ca
 
 constexpr uint16_t WKI_CAP_RDMA_SUPPORT = 0x0001;
 constexpr uint16_t WKI_CAP_ZONE_SUPPORT = 0x0002;
+constexpr uint16_t WKI_CAP_RESOURCE_INCARNATION = 0x0004;
 
 // Hostname constants
 constexpr size_t WKI_HOSTNAME_MAX = 64;  // Matches Linux HOST_NAME_MAX (including NUL)
@@ -284,6 +285,28 @@ enum class ResourceType : uint16_t {  // NOLINT(performance-enum-size)
     IPC_SOCKET = 12,
 };
 
+// Optional suffix for resource discovery and attach messages. The suffix is
+// present only for BLOCK/VFS traffic when both peers negotiated
+// WKI_CAP_RESOURCE_INCARNATION; all base payload layouts remain unchanged.
+struct ResourceIncarnationToken {
+    uint32_t owner_boot_epoch{};
+    uint32_t resource_incarnation{};
+} __attribute__((packed));
+
+static_assert(sizeof(ResourceIncarnationToken) == 8, "ResourceIncarnationToken must be 8 bytes");
+
+constexpr auto wki_resource_type_uses_incarnation(ResourceType type) -> bool {
+    return type == ResourceType::BLOCK || type == ResourceType::VFS;
+}
+
+constexpr auto wki_resource_incarnation_valid(const ResourceIncarnationToken& token) -> bool {
+    return token.owner_boot_epoch != 0 && token.resource_incarnation != 0;
+}
+
+constexpr auto wki_resource_incarnation_equal(const ResourceIncarnationToken& lhs, const ResourceIncarnationToken& rhs) -> bool {
+    return lhs.owner_boot_epoch == rhs.owner_boot_epoch && lhs.resource_incarnation == rhs.resource_incarnation;
+}
+
 constexpr uint8_t RESOURCE_FLAG_SHAREABLE = 0x01;
 constexpr uint8_t RESOURCE_FLAG_PASSTHROUGH_CAPABLE = 0x02;
 constexpr uint8_t RESOURCE_FLAG_READABLE = 0x04;
@@ -298,6 +321,9 @@ struct ResourceAdvertPayload {
     uint8_t name_len;
     // Followed by name_len bytes of name (e.g., "sda", "eth0")
 } __attribute__((packed));
+
+static_assert(sizeof(ResourceAdvertPayload) == 10, "ResourceAdvertPayload base must stay 10 bytes");
+static_assert(offsetof(ResourceAdvertPayload, name_len) == 9, "ResourceAdvertPayload base offsets must stay wire-compatible");
 
 struct ResourceAdvertNetPayload {
     uint16_t node_id{};        // owner node
@@ -563,6 +589,7 @@ enum class DevAttachStatus : uint8_t {
     NOT_REMOTABLE = 2,
     BUSY = 3,
     NO_PASSTHROUGH = 4,
+    STALE_RESOURCE = 5,
 };
 
 struct DevAttachAckPayload {
@@ -653,10 +680,21 @@ struct DevDetachPayload {
 static_assert(sizeof(DevDetachPayload) == 8, "DevDetachPayload must be 8 bytes");
 
 constexpr uint16_t WKI_DEV_DETACH_COOKIE_BYTES = sizeof(uint8_t);
+constexpr uint16_t WKI_DEV_DETACH_INCARNATION_BYTES = sizeof(ResourceIncarnationToken);
+constexpr size_t WKI_DEV_DETACH_COOKIE_OFFSET = sizeof(DevDetachPayload);
+constexpr size_t WKI_DEV_DETACH_INCARNATION_OFFSET = WKI_DEV_DETACH_COOKIE_OFFSET + WKI_DEV_DETACH_COOKIE_BYTES;
+
+constexpr auto wki_dev_detach_payload_size(bool with_incarnation) -> uint16_t {
+    return static_cast<uint16_t>(sizeof(DevDetachPayload) + WKI_DEV_DETACH_COOKIE_BYTES +
+                                 (with_incarnation ? WKI_DEV_DETACH_INCARNATION_BYTES : 0));
+}
+
+constexpr auto wki_dev_detach_payload_size_matches(uint16_t payload_len, bool with_incarnation) -> bool {
+    return payload_len == wki_dev_detach_payload_size(with_incarnation);
+}
 
 constexpr auto wki_dev_detach_cookie_from_payload(const uint8_t* payload, uint16_t payload_len) -> uint8_t {
-    return (payload != nullptr && payload_len >= sizeof(DevDetachPayload) + WKI_DEV_DETACH_COOKIE_BYTES) ? payload[sizeof(DevDetachPayload)]
-                                                                                                         : 0;
+    return (payload != nullptr && payload_len >= wki_dev_detach_payload_size(false)) ? payload[WKI_DEV_DETACH_COOKIE_OFFSET] : 0;
 }
 
 constexpr auto wki_dev_detach_matches_binding(uint16_t binding_consumer_node, ResourceType binding_resource_type,
@@ -668,6 +706,13 @@ constexpr auto wki_dev_detach_matches_binding(uint16_t binding_consumer_node, Re
 
 constexpr auto wki_dev_detach_cookie_matches_binding(uint8_t binding_attach_cookie, uint8_t request_cookie) -> bool {
     return binding_attach_cookie == request_cookie;
+}
+
+constexpr auto wki_dev_detach_incarnation_matches_binding(const ResourceIncarnationToken& binding_incarnation,
+                                                          const ResourceIncarnationToken& request_incarnation, bool incarnation_required)
+    -> bool {
+    return !incarnation_required || (wki_resource_incarnation_valid(request_incarnation) &&
+                                     wki_resource_incarnation_equal(binding_incarnation, request_incarnation));
 }
 
 // -----------------------------------------------------------------------------

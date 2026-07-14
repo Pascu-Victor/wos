@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <net/backlog.hpp>
@@ -125,6 +126,29 @@ auto netdev_find_by_name(const std::string_view NAME) -> NetDevice* {
     return nullptr;
 }
 
+NetDeviceRegistryLease::NetDeviceRegistryLease() : irq_flags_(devices_lock.lock_irqsave()) {}
+
+NetDeviceRegistryLease::~NetDeviceRegistryLease() { devices_lock.unlock_irqrestore(irq_flags_); }
+
+// Membership is intentionally a member operation: the lease object proves the
+// registry lock is held for the entire check/publication transaction.
+auto NetDeviceRegistryLease::contains(const NetDevice* dev) const -> bool {  // NOLINT(readability-convert-member-functions-to-static)
+    if (dev == nullptr) {
+        return false;
+    }
+    for (size_t i = 0; i < device_count; ++i) {
+        if (devices.at(i) == dev) {
+            return true;
+        }
+    }
+    return false;
+}
+
+auto netdev_is_registered(const NetDevice* dev) -> bool {
+    NetDeviceRegistryLease const REGISTRATION;
+    return REGISTRATION.contains(dev);
+}
+
 auto netdev_count() -> size_t {
     devices_lock.lock();
     size_t const COUNT = device_count;
@@ -164,7 +188,7 @@ auto netdev_snapshot(NetDeviceSnapshot* out, size_t max) -> size_t {
         row.ifindex = dev->ifindex;
         row.state = dev->state;
         row.remotable = dev->remotable != nullptr;
-        row.wki_rx_forward = dev->wki_rx_forward != nullptr;
+        row.wki_rx_forward = dev->wki_rx_forward.load(std::memory_order_acquire) != nullptr;
         row.wki_transport = dev->wki_transport;
         row.rx_packets = dev->rx_packets;
         row.tx_packets = dev->tx_packets;
@@ -228,8 +252,9 @@ void netdev_rx(NetDevice* dev, PacketBuffer* pkt) {
     }
 
     // Inline processing: same-CPU fast path, early boot, or single CPU.
-    if (dev->wki_rx_forward != nullptr) {
-        dev->wki_rx_forward(dev, pkt);
+    WkiRxForwardHook const RX_FORWARD = dev->wki_rx_forward.load(std::memory_order_acquire);
+    if (RX_FORWARD != nullptr) {
+        RX_FORWARD(dev, pkt);
     }
     NET_TRACE_TICK();
     proto::eth_rx(dev, pkt);

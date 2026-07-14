@@ -1305,7 +1305,7 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                             if (d == nullptr || d->state != 1 || std::strcmp(d->name.data(), "lo") == 0) {
                                 continue;
                             }
-                            auto* nif = ker::net::netif_get(d);
+                            auto* nif = ker::net::netif_find_by_dev(d);
                             if (nif != nullptr && nif->ipv4_addr_count > 0) {
                                 uint32_t const DEV_IP = nif->ipv4_addrs[0].addr;
                                 uint32_t const DEV_MASK = nif->ipv4_addrs[0].netmask;
@@ -1321,7 +1321,7 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                             if (d == nullptr || d->state != 1 || std::strcmp(d->name.data(), "lo") == 0) {
                                 continue;
                             }
-                            auto* nif = ker::net::netif_get(d);
+                            auto* nif = ker::net::netif_find_by_dev(d);
                             if (nif == nullptr || nif->ipv4_addr_count == 0) {
                                 continue;
                             }
@@ -1379,7 +1379,7 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                     return 0;
                 }
                 case SIOC_GIFADDR: {
-                    auto* nif = ker::net::netif_get(dev);
+                    auto* nif = ker::net::netif_find_by_dev(dev);
                     if (nif == nullptr || nif->ipv4_addr_count == 0) {
                         return static_cast<uint64_t>(-EADDRNOTAVAIL);
                     }
@@ -1405,7 +1405,7 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                     return 0;
                 }
                 case SIOC_GIFNETMASK: {
-                    auto* nif = ker::net::netif_get(dev);
+                    auto* nif = ker::net::netif_find_by_dev(dev);
                     if (nif == nullptr || nif->ipv4_addr_count == 0) {
                         return static_cast<uint64_t>(-EADDRNOTAVAIL);
                     }
@@ -1533,7 +1533,7 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             size_t written = 0;
             for (size_t i = 0; i < ker::net::netdev_count(); i++) {
                 auto* dev = ker::net::netdev_at(i);
-                auto* nif = ker::net::netif_get(dev);
+                auto* nif = ker::net::netif_find_by_dev(dev);
                 if (dev == nullptr || nif == nullptr) {
                     continue;
                 }

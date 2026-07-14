@@ -28,6 +28,10 @@ struct DevFSNode {
     DevFSNode** children = nullptr;
     size_t children_count = 0;
     size_t children_capacity = 0;
+    // WKI entries can be unlinked/replaced while an opened devfs File still
+    // references the node. These counters are protected by devfs's WKI lock.
+    uint32_t wki_open_refs = 0;
+    bool wki_unlinked = false;
 
     // POSIX permission model
     uint32_t mode = 0755;  // Permission bits (default: rwxr-xr-x for dirs)
@@ -36,6 +40,33 @@ struct DevFSNode {
     Timespec atime{};
     Timespec mtime{};
     Timespec ctime{};
+};
+
+// Pins a dynamically removable WKI node for the lifetime of the reference.
+// Non-WKI paths retain their existing devfs lifetime behavior.
+class DevFSNodeRef {
+   public:
+    DevFSNodeRef() = default;
+    DevFSNodeRef(const DevFSNodeRef&) = delete;
+    auto operator=(const DevFSNodeRef&) -> DevFSNodeRef& = delete;
+    DevFSNodeRef(DevFSNodeRef&& other) noexcept : node_(other.node_), owns_wki_node_ref_(other.owns_wki_node_ref_) {
+        other.node_ = nullptr;
+        other.owns_wki_node_ref_ = false;
+    }
+    auto operator=(DevFSNodeRef&& other) noexcept -> DevFSNodeRef&;
+    ~DevFSNodeRef();
+
+    auto get() const -> DevFSNode* { return node_; }
+    auto operator->() const -> DevFSNode* { return node_; }
+    explicit operator bool() const { return node_ != nullptr; }
+    void reset();
+
+   private:
+    friend auto devfs_acquire_path(const char* path) -> DevFSNodeRef;
+    DevFSNodeRef(DevFSNode* node, bool owns_wki_node_ref) : node_(node), owns_wki_node_ref_(owns_wki_node_ref) {}
+
+    DevFSNode* node_ = nullptr;
+    bool owns_wki_node_ref_ = false;
 };
 
 // Register devfs as a virtual filesystem
@@ -63,8 +94,10 @@ auto devfs_add_device_node(const std::array<char, DEVFS_NAME_MAX>& name, ker::de
 // Remove a node at path (relative to /dev root). Returns true if removed.
 auto devfs_remove_node(const char* path) -> bool;
 
-// Walk a path and return the DevFSNode (for stat operations)
-auto devfs_walk_path(const char* path) -> DevFSNode*;
+// Resolve a path and retain dynamically removable WKI nodes until the returned
+// reference is destroyed. Callers must keep the reference alive while using
+// its raw node pointer.
+auto devfs_acquire_path(const char* path) -> DevFSNodeRef;
 
 // Return the DevFSNode stored behind an opened devfs File wrapper.
 auto devfs_file_node(File* file) -> DevFSNode*;
@@ -85,11 +118,12 @@ void devfs_populate_wki();
 
 // Dynamically add a single WKI remotable resource to /dev/wki/.
 // Called from remotable RX handler on RESOURCE_ADVERT.
-void devfs_wki_add_resource(uint16_t node_id, uint16_t resource_type, uint32_t resource_id, uint8_t flags, const char* name);
+void devfs_wki_add_resource(uint16_t node_id, uint16_t resource_type, uint32_t resource_id, uint64_t resource_generation, uint8_t flags,
+                            const char* name);
 
 // Remove a single WKI remotable resource from /dev/wki/.
 // Called from remotable RX handler on RESOURCE_WITHDRAW.
-void devfs_wki_remove_resource(uint16_t node_id, uint16_t resource_type, uint32_t resource_id);
+void devfs_wki_remove_resource(uint16_t node_id, uint16_t resource_type, uint32_t resource_id, uint64_t expected_generation = 0);
 
 // Remove all WKI resources for a fenced peer from /dev/wki/.
 // Called from wki_resources_invalidate_for_peer().

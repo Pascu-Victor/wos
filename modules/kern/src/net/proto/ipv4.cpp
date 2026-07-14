@@ -249,7 +249,7 @@ auto ipv4_tx_auto(PacketBuffer* pkt, IPv4Address dst, uint8_t proto) -> int {
 #endif
 
     // Get the first IPv4 address on the outgoing interface
-    auto* nif = netif_get(route->dev);
+    auto* nif = netif_find_by_dev(route->dev);
     if (nif == nullptr || nif->ipv4_addr_count == 0) {
         // Broadcast fallback: no address configured yet (e.g. pre-DHCP)
         if (dst.is_broadcast()) {

@@ -30,8 +30,13 @@ struct NetInterface {
     size_t ipv6_addr_count = 0;
 };
 
-// Get or create interface config for a device
+// Get or create interface config for a device. Returned interfaces remain at a
+// permanent address after registry deletion and are never reused.
 auto netif_get(NetDevice* dev) -> NetInterface*;
+// Find existing interface config without allocating or publishing a new row.
+// Packet/RX and read-only inspection paths must use this form.
+auto netif_find_by_dev(NetDevice* dev) -> NetInterface*;
+auto netif_del_for_dev(NetDevice* dev) -> bool;
 
 // Add addresses
 auto netif_add_ipv4(NetDevice* dev, proto::IPv4Address addr, proto::IPv4Address mask) -> int;

@@ -13,6 +13,36 @@ namespace ker::dev {
 // Forward declaration for function pointer types
 struct BlockDevice;
 
+// Writable-owner arbitration shared by local filesystem mounts and WKI
+// server bindings. Local mounts may coexist with other local mounts; a remote
+// writer is exclusive against every overlapping writer lease.
+enum class BlockWriterLeaseOwner : uint8_t { LOCAL_MOUNT, REMOTE_BINDING };
+
+class BlockWriterLease {
+   public:
+    BlockWriterLease() = default;
+    BlockWriterLease(const BlockWriterLease&) = delete;
+    auto operator=(const BlockWriterLease&) -> BlockWriterLease& = delete;
+    BlockWriterLease(BlockWriterLease&& other) noexcept;
+    auto operator=(BlockWriterLease&& other) noexcept -> BlockWriterLease&;
+    ~BlockWriterLease();
+
+    // Allocation-free and safe in IRQ/NAPI context. The lease remains active
+    // until release(), destruction, or an atomic move transfer.
+    auto try_acquire(const BlockDevice* device, BlockWriterLeaseOwner owner) -> bool;
+    void release();
+    auto active() const -> bool { return device_ != nullptr; }
+
+   private:
+    void unlink_locked();
+    void take_locked(BlockWriterLease& other);
+
+    const BlockDevice* device_ = nullptr;
+    BlockWriterLeaseOwner owner_ = BlockWriterLeaseOwner::LOCAL_MOUNT;
+    BlockWriterLease* prev_ = nullptr;
+    BlockWriterLease* next_ = nullptr;
+};
+
 // Function pointer types for block device operations
 // Note: device parameter allows drivers to access device-specific data (io_base, etc)
 using block_read_fn = int (*)(BlockDevice* dev, uint64_t block, size_t count, void* buffer);

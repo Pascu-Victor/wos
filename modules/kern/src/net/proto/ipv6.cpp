@@ -76,7 +76,7 @@ auto is_our_address(NetDevice* dev, const IPv6Address& addr) -> bool {
     // Check solicited-node multicast for our link-local
     if (addr.is_link_local_multicast()) {
         // This is a multicast - check if it's our solicited-node
-        auto* iface = netif_get(dev);
+        auto* iface = netif_find_by_dev(dev);
         if (iface != nullptr) {
             for (size_t i = 0; i < iface->ipv6_addr_count; i++) {
                 IPv6Address const SN = ipv6_make_solicited_node(iface->ipv6_addrs.at(i).addr);

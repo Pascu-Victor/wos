@@ -17,6 +17,10 @@ KTEST(WkiRemoteCompute, TaskWaitTimeoutPreservesSuccessor) {
     KEXPECT_TRUE(ker::net::wki::wki_remote_compute_selftest_task_wait_timeout_preserves_successor());
 }
 
+KTEST(WkiRemoteCompute, TaskExitRetiresWaitOwners) {
+    KEXPECT_TRUE(ker::net::wki::wki_remote_compute_selftest_task_exit_retires_wait_owners());
+}
+
 KTEST(WkiRemoteCompute, SubmittedSlotsReclaimSafely) {
     KEXPECT_TRUE(ker::net::wki::wki_remote_compute_selftest_submitted_slots_reclaim_safely());
 }

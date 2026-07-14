@@ -3,12 +3,9 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <dev/block_device.hpp>
 #include <vfs/file.hpp>
 #include <vfs/file_operations.hpp>
-
-namespace ker::dev {
-struct BlockDevice;
-}
 
 namespace ker::vfs {
 
@@ -19,11 +16,12 @@ struct MountPoint {
     const char* fstype{};             // Filesystem type (e.g., "fat32", "tmpfs")
     FSType fs_type{};                 // Filesystem type enum
     ker::dev::BlockDevice* device{};  // Associated block device
-    FileOperations* fops{};           // Filesystem operations
-    void* private_data{};             // Filesystem-specific data
-    uint32_t dev_id{};                // Unique synthetic st_dev for this mount
-    bool read_only{};                 // True when this mount must reject filesystem mutations
-    std::atomic<uint32_t> refs{0};    // Active users that outlive mount_lock
+    ker::dev::BlockWriterLease block_writer_lease{};
+    FileOperations* fops{};         // Filesystem operations
+    void* private_data{};           // Filesystem-specific data
+    uint32_t dev_id{};              // Unique synthetic st_dev for this mount
+    bool read_only{};               // True when this mount must reject filesystem mutations
+    std::atomic<uint32_t> refs{0};  // Active users that outlive mount_lock
     std::atomic<bool> retiring{false};
 };
 
@@ -63,8 +61,15 @@ class MountRef {
 
 // Mount point management
 auto mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevice* device, unsigned long flags = 0,
-                      const char* data = nullptr) -> int;
+                      const char* data = nullptr, void* initial_private_data = nullptr, FileOperations* initial_fops = nullptr) -> int;
 auto unmount_filesystem(const char* path) -> int;
+// Unmount only the exact mount whose private_data still matches the expected
+// owner. This prevents deferred teardown from removing a replacement mounted
+// later at the same path.
+auto unmount_filesystem_if_private_data(const char* path, const void* expected_private_data) -> int;
+// Unmount the mount owned by private_data without re-resolving a path. This is
+// stable across pivot/rebase and is the preferred deferred-teardown identity.
+auto unmount_filesystem_by_private_data(const void* expected_private_data) -> int;
 auto shutdown_unmount_all_exact(const char* root_path) -> int;
 auto find_mount_point(const char* path, size_t known_path_len = UNKNOWN_MOUNT_PATH_LEN) -> MountRef;
 auto mount_table_generation_snapshot() -> uint64_t;

@@ -17,6 +17,18 @@ KTEST(WkiDevServerBinding, LifecycleFlagsAreAtomic) {
 
 KTEST(WkiDevServerBinding, MovePreservesLifecycleFlags) { KEXPECT_TRUE(ker::net::wki::wki_dev_server_selftest_binding_lifecycle_flags()); }
 
-KTEST(WkiDevServerAttachAckFailure, RollsBackBlockAndVfsBindings) {
-    KEXPECT_TRUE(ker::net::wki::wki_dev_server_selftest_attach_ack_failure_rolls_back_binding());
+KTEST(WkiDevServerBinding, MoveTransfersBlockWriterLeaseExactlyOnce) {
+    KEXPECT_TRUE(ker::net::wki::wki_dev_server_selftest_block_writer_lease_transfer());
+}
+
+KTEST(WkiDevServerBinding, RetirementOwnershipAndWriterReservationPersistUntilErase) {
+    KEXPECT_TRUE(ker::net::wki::wki_dev_server_selftest_retirement_ownership_guards());
+}
+
+KTEST(WkiDevServerDetach, AdmissionIsExactIdempotentAndBlocksReplacement) {
+    KEXPECT_TRUE(ker::net::wki::wki_dev_server_selftest_detach_admission_lifecycle());
+}
+
+KTEST(WkiDevServerAttachAckFailure, DefersExactBlockVfsAndNetCleanupOutsideRx) {
+    KEXPECT_TRUE(ker::net::wki::wki_dev_server_selftest_attach_ack_failure_defers_cleanup());
 }

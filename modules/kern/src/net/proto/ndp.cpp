@@ -281,7 +281,7 @@ bool ndp_resolve(NetDevice* dev, const IPv6Address& ip, MacAddress& dst_mac, Pac
     ndp_lock.unlock();
 
     // Find our source address on this interface
-    auto* nif = netif_get(dev);
+    auto* nif = netif_find_by_dev(dev);
     if (nif != nullptr && nif->ipv6_addr_count > 0) {
         send_ns(dev, ip, nif->ipv6_addrs.front().addr);
     }

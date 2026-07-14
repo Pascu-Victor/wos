@@ -4,6 +4,7 @@
 #include <dev/block_device.hpp>
 #include <platform/mm/phys.hpp>
 #include <test/ktest.hpp>
+#include <utility>
 
 namespace {
 
@@ -87,4 +88,41 @@ KTEST(BlockDevice, SixteenMiBWriteStaysSingleDriverRequest) {
     KEXPECT_EQ(state.max_count, IO_BLOCKS);
 
     phys::page_free(buffer);
+}
+
+KTEST(BlockWriterLease, RemoteIsExclusiveWhileLocalMountsMayCoexist) {
+    ker::dev::BlockDevice disk{};
+    disk.total_blocks = 1024;
+
+    ker::dev::BlockDevice first_partition{};
+    first_partition.is_partition = true;
+    first_partition.parent_disk = &disk;
+    first_partition.partition_start_lba = 0;
+    first_partition.partition_end_lba = 255;
+
+    ker::dev::BlockDevice second_partition{};
+    second_partition.is_partition = true;
+    second_partition.parent_disk = &disk;
+    second_partition.partition_start_lba = 256;
+    second_partition.partition_end_lba = 511;
+
+    ker::dev::BlockWriterLease first_local;
+    ker::dev::BlockWriterLease second_local;
+    ker::dev::BlockWriterLease overlapping_remote;
+    ker::dev::BlockWriterLease disjoint_remote;
+    ker::dev::BlockWriterLease remote_contender;
+
+    KREQUIRE_TRUE(first_local.try_acquire(&first_partition, ker::dev::BlockWriterLeaseOwner::LOCAL_MOUNT));
+    KEXPECT_TRUE(second_local.try_acquire(&first_partition, ker::dev::BlockWriterLeaseOwner::LOCAL_MOUNT));
+    KEXPECT_FALSE(overlapping_remote.try_acquire(&first_partition, ker::dev::BlockWriterLeaseOwner::REMOTE_BINDING));
+    KREQUIRE_TRUE(disjoint_remote.try_acquire(&second_partition, ker::dev::BlockWriterLeaseOwner::REMOTE_BINDING));
+    KEXPECT_FALSE(remote_contender.try_acquire(&second_partition, ker::dev::BlockWriterLeaseOwner::REMOTE_BINDING));
+
+    ker::dev::BlockWriterLease moved_remote(std::move(disjoint_remote));
+    KEXPECT_FALSE(disjoint_remote.active());
+    KEXPECT_TRUE(moved_remote.active());
+    KEXPECT_FALSE(remote_contender.try_acquire(&second_partition, ker::dev::BlockWriterLeaseOwner::REMOTE_BINDING));
+
+    moved_remote.release();
+    KEXPECT_TRUE(remote_contender.try_acquire(&second_partition, ker::dev::BlockWriterLeaseOwner::REMOTE_BINDING));
 }

@@ -269,6 +269,22 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/wki_dev_proxy_source_test.py
 )
 add_test(
+    NAME wki_detach_retry_source_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/wki_detach_retry_source_test.py
+)
+add_test(
+    NAME wki_reliable_tx_tracking_source_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/wki_reliable_tx_tracking_source_test.py
+)
+add_test(
+    NAME net_table_lifetime_source_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/net_table_lifetime_source_test.py
+)
+add_test(
+    NAME devfs_wki_lifetime_source_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/devfs_wki_lifetime_source_test.py
+)
+add_test(
     NAME wki_remote_ipc_source_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/wki_remote_ipc_source_test.py
 )
@@ -439,6 +455,10 @@ set_tests_properties(
     wki_ivshmem_source_test
     wki_dev_server_source_test
     wki_dev_proxy_source_test
+    wki_detach_retry_source_test
+    wki_reliable_tx_tracking_source_test
+    net_table_lifetime_source_test
+    devfs_wki_lifetime_source_test
     wki_remote_ipc_source_test
     wki_remote_net_source_test
     wki_roce_source_test

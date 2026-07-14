@@ -361,7 +361,10 @@ auto post_task_for_cpu(uint64_t cpu_no, task::Task* task) -> bool;
 // Like post_task_for_cpu but marks the task as CPU-pinned: the scheduler will
 // never migrate it to another CPU via load-balancing.
 auto post_task_pinned_cpu(uint64_t cpu_no, task::Task* task) -> bool;
-auto post_task_waiting(task::Task* task) -> bool;                // Register a blocked task without making it runnable
+// Transactionally publish an exclusively owned, non-current task whose queue
+// is NONE and which has no registry/runqueue membership. Under that freshness
+// precondition, false guarantees no PID/active or runqueue membership remains.
+auto post_task_waiting(task::Task* task) -> bool;
 auto post_task_balanced(task::Task* task) -> bool;               // Post to least loaded CPU
 auto get_least_loaded_cpu() -> uint64_t;                         // Get CPU with least tasks
 auto get_least_loaded_cpu_in_mask(uint64_t mask) -> uint64_t;    // Get least-loaded CPU within mask
@@ -523,11 +526,15 @@ auto find_dead_task_lifetime_ref_if(DeadTaskPredicate predicate, void* context) 
 // starting at `startIndex` into the dead list. Returns the number of entries written.
 size_t get_expired_task_refcounts(uint64_t cpu_no, uint64_t* pids, uint32_t* refcounts, size_t max_entries, size_t start_index = 0);
 
-// D17: Function pointer for WKI remote task placement.
-// When non-null, postTaskBalanced() calls this before local placement.
-// If it returns true, the task was submitted remotely and will not be scheduled locally.
-// Set by WKI subsystem init; nullptr when WKI is not active.
-extern bool (*wki_try_remote_placement_fn)(task::Task* task);  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+// D17: Function pointer for WKI remote task placement. FAILED is distinct from
+// LOCAL because accepted remote work must never fall back and execute twice.
+enum class RemotePlacementResult : uint8_t {
+    LOCAL,
+    REMOTE,
+    FAILED,
+};
+extern RemotePlacementResult (*wki_try_remote_placement_fn)(
+    task::Task* task);  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
 // ============================================================================
 // kern_yield() - voluntary preemption point for kernel blocking loops

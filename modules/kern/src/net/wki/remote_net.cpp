@@ -8,15 +8,19 @@
 #include <deque>
 #include <memory>
 #include <net/netdevice.hpp>
+#include <net/netif.hpp>
 #include <net/packet.hpp>
+#include <net/route.hpp>
 #include <net/wki/dev_proxy.hpp>
 #include <net/wki/dev_server.hpp>
+#include <net/wki/remotable.hpp>
 #include <net/wki/timer_math.hpp>
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
 #include <new>
 #include <platform/dbg/dbg.hpp>
 #include <platform/sched/scheduler.hpp>
+#include <util/hcf.hpp>
 
 #include "platform/sys/spinlock.hpp"
 
@@ -28,32 +32,95 @@ namespace ker::net::wki {
 
 namespace {
 
-// unique_ptr indirection: ProxyNetState contains Spinlock with deleted move-assignment
-std::deque<std::unique_ptr<ProxyNetState>> g_net_proxies;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-bool g_remote_net_initialized = false;                     // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-ker::mod::sys::Spinlock s_net_proxy_lock;                  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-uint8_t g_net_attach_next_cookie = 1;                      // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-uint64_t g_last_net_stats_poll_us = 0;                     // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+// unique_ptr indirection: ProxyNetState contains Spinlock with deleted move-assignment.
+// Published rows remain in storage as raw-NetDevice lifetime tombstones, while
+// the pointer-only live index is pruned on every terminal retirement so normal
+// lookups do not grow with historical proxy churn.
+std::deque<std::unique_ptr<ProxyNetState>> g_net_proxy_storage;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::deque<ProxyNetState*> g_net_proxies;                        // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+bool g_remote_net_initialized = false;                           // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+ker::mod::sys::Spinlock s_net_proxy_lock;                        // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+uint8_t g_net_attach_next_cookie = 1;                            // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+uint64_t g_last_net_stats_poll_us = 0;                           // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+ProxyNetState* g_pending_net_detach_head = nullptr;              // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+ProxyNetState* g_pending_net_detach_tail = nullptr;              // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
 constexpr uint64_t NET_PROXY_CONTENTION_SLEEP_US = 1000;
 constexpr uint64_t NET_PROXY_SLOT_WAIT_TIMEOUT_US = WKI_OP_TIMEOUT_US;
 constexpr uint16_t NET_OP_COOKIE_BYTES = sizeof(uint16_t);
+constexpr size_t NET_DETACH_RETRY_BATCH = 32;
+constexpr size_t NET_DETACH_RETRY_SCAN = NET_DETACH_RETRY_BATCH * 2;
+
+// Caller must hold s_net_proxy_lock.
+auto net_detach_pending_for_resource_locked(uint16_t owner_node, uint32_t resource_id) -> bool {
+    for (auto* state = g_pending_net_detach_head; state != nullptr; state = state->detach_next) {
+        if (state->detach_owner_node == owner_node && state->detach_resource_id == resource_id) {
+            return true;
+        }
+    }
+    return false;
+}
+
+class NetPeerLifecycleLease {
+   public:
+    NetPeerLifecycleLease() = default;
+    explicit NetPeerLifecycleLease(WkiPeer* peer_ref) : peer(peer_ref) {
+        if (!wki_peer_lifecycle_acquire(peer)) {
+            peer = nullptr;
+        }
+    }
+    NetPeerLifecycleLease(const NetPeerLifecycleLease&) = delete;
+    auto operator=(const NetPeerLifecycleLease&) -> NetPeerLifecycleLease& = delete;
+    ~NetPeerLifecycleLease() { wki_peer_lifecycle_release(peer); }
+
+    [[nodiscard]] auto acquired() const -> bool { return peer != nullptr; }
+    [[nodiscard]] auto try_acquire(WkiPeer* peer_ref) -> bool {
+        if (peer != nullptr || !wki_peer_lifecycle_try_acquire(peer_ref)) {
+            return false;
+        }
+        peer = peer_ref;
+        return true;
+    }
+    void release() {
+        wki_peer_lifecycle_release(peer);
+        peer = nullptr;
+    }
+
+   private:
+    WkiPeer* peer = nullptr;
+};
+
+auto net_channel_identity_matches(const WkiChannelIdentity& expected, const WkiChannelIdentity& actual) -> bool {
+    return expected.channel != nullptr && expected.channel == actual.channel && expected.peer_node_id == actual.peer_node_id &&
+           expected.channel_id == actual.channel_id && expected.generation != 0 && expected.generation == actual.generation;
+}
+
+auto net_channel_identity_matches_header(const WkiHeader* hdr, const WkiChannelIdentity& identity) -> bool {
+    return hdr != nullptr && identity.channel != nullptr && identity.generation != 0 && hdr->src_node == identity.peer_node_id &&
+           hdr->channel_id == identity.channel_id;
+}
+
+void close_net_channel_identity(const WkiChannelIdentity& identity) {
+    static_cast<void>(wki_channel_close_generation(identity.channel, identity.peer_node_id, identity.channel_id, identity.generation));
+}
 
 // s_net_proxy_lock must be held by caller
-auto find_net_proxy_by_channel(uint16_t owner_node, uint16_t channel_id) -> ProxyNetState* {
+auto find_net_proxy_by_channel(const WkiChannelIdentity& channel_identity) -> ProxyNetState* {
     for (auto& p : g_net_proxies) {
-        if (p->active && p->owner_node == owner_node && p->assigned_channel == channel_id) {
-            return p.get();
+        if (p->active && net_channel_identity_matches(p->channel_identity, channel_identity)) {
+            return p;
         }
     }
     return nullptr;
 }
 
-// s_net_proxy_lock must be held by caller
-auto find_net_proxy_by_attach(uint16_t owner_node, uint32_t resource_id) -> ProxyNetState* {
+// s_net_proxy_lock must be held by caller.  The cookie is part of lookup, not
+// merely post-lookup validation: two overlapping attempts for the same
+// resource must not let the first row consume and discard the second ACK.
+auto find_net_proxy_by_attach(uint16_t owner_node, uint32_t resource_id, uint8_t attach_cookie) -> ProxyNetState* {
     for (auto& p : g_net_proxies) {
-        if (p->attach_pending && p->owner_node == owner_node && p->resource_id == resource_id) {
-            return p.get();
+        if (p->attach_pending && p->owner_node == owner_node && p->resource_id == resource_id && p->attach_cookie == attach_cookie) {
+            return p;
         }
     }
     return nullptr;
@@ -63,7 +130,7 @@ auto find_net_proxy_by_attach(uint16_t owner_node, uint32_t resource_id) -> Prox
 auto find_net_proxy_by_dev(ker::net::NetDevice* dev) -> ProxyNetState* {
     for (auto& p : g_net_proxies) {
         if (p->active && &p->netdev == dev) {
-            return p.get();
+            return p;
         }
     }
     return nullptr;
@@ -73,8 +140,8 @@ auto find_net_proxy_by_dev(ker::net::NetDevice* dev) -> ProxyNetState* {
 auto find_net_proxy_by_resource(uint16_t owner_node, uint32_t resource_id) -> ProxyNetState* {
     for (auto& p : g_net_proxies) {
         if (!p->retiring.load(std::memory_order_acquire) && p->owner_node == owner_node && p->resource_id == resource_id &&
-            (p->active || p->attach_pending.load(std::memory_order_acquire))) {
-            return p.get();
+            (p->active || p->attaching || p->attach_pending.load(std::memory_order_acquire))) {
+            return p;
         }
     }
     return nullptr;
@@ -143,17 +210,36 @@ auto allocate_net_op_cookie_locked(ProxyNetState* state) -> uint16_t {
     return cookie;
 }
 
-// s_net_proxy_lock must be held by caller.
-auto allocate_net_attach_cookie_locked() -> uint8_t {
-    uint8_t cookie = g_net_attach_next_cookie;
-    if (cookie == 0) {
-        cookie = 1;
+// s_net_proxy_lock must be held by caller. NET has no incarnation token on the
+// wire, so the active local owner/resource tuple reserves its cookie directly.
+auto allocate_net_attach_cookie_locked(uint16_t owner_node, uint32_t resource_id) -> uint8_t {
+    for (uint16_t attempt = 0; attempt < UINT8_MAX; ++attempt) {
+        uint8_t cookie = g_net_attach_next_cookie;
+        if (cookie == 0) {
+            cookie = 1;
+        }
+        g_net_attach_next_cookie = static_cast<uint8_t>(cookie + 1U);
+        if (g_net_attach_next_cookie == 0) {
+            g_net_attach_next_cookie = 1;
+        }
+
+        bool const RESERVED = std::ranges::any_of(g_net_proxies, [=](const ProxyNetState* proxy) {
+            return proxy != nullptr && proxy->owner_node == owner_node && proxy->resource_id == resource_id &&
+                   proxy->attach_cookie == cookie;
+        });
+        bool pending_reserved = false;
+        for (auto* proxy = g_pending_net_detach_head; proxy != nullptr; proxy = proxy->detach_next) {
+            if (proxy->detach_owner_node == owner_node && proxy->detach_resource_id == resource_id &&
+                proxy->detach_attach_cookie == cookie) {
+                pending_reserved = true;
+                break;
+            }
+        }
+        if (!RESERVED && !pending_reserved) {
+            return cookie;
+        }
     }
-    g_net_attach_next_cookie = static_cast<uint8_t>(cookie + 1U);
-    if (g_net_attach_next_cookie == 0) {
-        g_net_attach_next_cookie = 1;
-    }
-    return cookie;
+    return 0;
 }
 
 void write_net_op_cookie(uint8_t* dst, uint16_t cookie) {
@@ -197,9 +283,9 @@ auto acquire_net_proxy_by_dev(ker::net::NetDevice* dev) -> ProxyNetState* {
     return state;
 }
 
-auto acquire_net_proxy_by_channel(uint16_t owner_node, uint16_t channel_id) -> ProxyNetState* {
+auto acquire_net_proxy_by_channel(const WkiChannelIdentity& channel_identity) -> ProxyNetState* {
     s_net_proxy_lock.lock();
-    ProxyNetState* state = find_net_proxy_by_channel(owner_node, channel_id);
+    ProxyNetState* state = find_net_proxy_by_channel(channel_identity);
     if (state != nullptr && !state->retiring.load(std::memory_order_acquire)) {
         retain_net_proxy(state);
     } else {
@@ -209,9 +295,9 @@ auto acquire_net_proxy_by_channel(uint16_t owner_node, uint16_t channel_id) -> P
     return state;
 }
 
-auto acquire_net_proxy_by_attach(uint16_t owner_node, uint32_t resource_id) -> ProxyNetState* {
+auto acquire_net_proxy_by_attach(uint16_t owner_node, uint32_t resource_id, uint8_t attach_cookie) -> ProxyNetState* {
     s_net_proxy_lock.lock();
-    ProxyNetState* state = find_net_proxy_by_attach(owner_node, resource_id);
+    ProxyNetState* state = find_net_proxy_by_attach(owner_node, resource_id, attach_cookie);
     if (state != nullptr && !state->retiring.load(std::memory_order_acquire)) {
         retain_net_proxy(state);
     } else {
@@ -226,6 +312,9 @@ auto try_retire_net_proxy_locked(ProxyNetState* state) -> bool {
         return false;
     }
     state->active = false;
+    state->attaching = false;
+    state->cleanup_started = true;
+    state->netdev.state = 0;
     return true;
 }
 
@@ -235,23 +324,48 @@ void wait_for_net_proxy_refs_to_drain(ProxyNetState* state) {
     }
 }
 
+// Caller must hold s_net_proxy_lock.
+void erase_unpublished_net_proxy_storage_locked(ProxyNetState* state) {
+    if (state == nullptr || state->ever_published || state->detach_pending || !state->cleanup_complete) {
+        return;
+    }
+    for (auto it = g_net_proxy_storage.begin(); it != g_net_proxy_storage.end(); ++it) {
+        if (it->get() == state) {
+            g_net_proxy_storage.erase(it);
+            return;
+        }
+    }
+}
+
 void erase_net_proxy(ProxyNetState* state) {
     if (state == nullptr) {
         return;
     }
 
     s_net_proxy_lock.lock();
-    for (auto it = g_net_proxies.begin(); it != g_net_proxies.end(); ++it) {
-        if (it->get() == state) {
-            g_net_proxies.erase(it);
-            break;
-        }
-    }
+    std::erase(g_net_proxies, state);
+    state->cleanup_complete = true;
+    erase_unpublished_net_proxy_storage_locked(state);
     s_net_proxy_lock.unlock();
 }
 
-void retire_unregistered_net_proxy(ProxyNetState* state, WkiChannel* channel_to_close) {
+void unpublish_proxy_netdev(ProxyNetState* state) {
     if (state == nullptr) {
+        return;
+    }
+
+    // Route and interface tables retain raw NetDevice pointers. Remove every
+    // exact publication before taking the device out of the registry so a
+    // replacement proxy cannot be shadowed by stale forwarding/local-address
+    // state. Published proxy storage itself remains a lifetime tombstone.
+    static_cast<void>(ker::net::route_del_for_dev(&state->netdev));
+    ker::net::netdev_unregister(&state->netdev);
+    static_cast<void>(ker::net::netif_del_for_dev(&state->netdev));
+}
+
+void retire_unregistered_net_proxy(ProxyNetState* state, const WkiChannelIdentity& channel_to_close) {
+    if (state == nullptr) {
+        close_net_channel_identity(channel_to_close);
         return;
     }
 
@@ -261,6 +375,10 @@ void retire_unregistered_net_proxy(ProxyNetState* state, WkiChannel* channel_to_
     release_net_proxy(state);
 
     if (!RETIRE_OWNER) {
+        // A connected-epoch marker may already own deferred state teardown.
+        // The attach path still owns this exact local channel identity, and an
+        // exact close is safe even if deferred cleanup captured it too.
+        close_net_channel_identity(channel_to_close);
         return;
     }
 
@@ -271,9 +389,7 @@ void retire_unregistered_net_proxy(ProxyNetState* state, WkiChannel* channel_to_
     state->lock.unlock();
 
     wait_for_net_proxy_refs_to_drain(state);
-    if (channel_to_close != nullptr) {
-        wki_channel_close(channel_to_close);
-    }
+    close_net_channel_identity(channel_to_close);
     erase_net_proxy(state);
 }
 
@@ -381,18 +497,132 @@ void clear_attach_waiter_after_wait(ProxyNetState* state, WkiWaitEntry& wait) {
     state->lock.unlock();
 }
 
-void send_net_detach(uint16_t owner_node, uint32_t resource_id, uint8_t attach_cookie) {
-    std::array<uint8_t, sizeof(DevDetachPayload) + WKI_DEV_DETACH_COOKIE_BYTES> det_buf{};
+auto send_net_detach(uint16_t owner_node, uint32_t resource_id, uint8_t attach_cookie, WkiReliableTxToken* tx_token_out) -> int {
+    std::array<uint8_t, wki_dev_detach_payload_size(false)> det_buf{};
     auto* det = reinterpret_cast<DevDetachPayload*>(det_buf.data());
     det->target_node = owner_node;
     det->resource_type = static_cast<uint16_t>(ResourceType::NET);
     det->resource_id = resource_id;
-    auto send_len = static_cast<uint16_t>(sizeof(DevDetachPayload));
-    if (attach_cookie != 0) {
-        det_buf.at(sizeof(DevDetachPayload)) = attach_cookie;
-        send_len = static_cast<uint16_t>(det_buf.size());
+    det_buf.at(WKI_DEV_DETACH_COOKIE_OFFSET) = attach_cookie;
+    return wki_send_tracked(owner_node, WKI_CHAN_RESOURCE, MsgType::DEV_DETACH, det_buf.data(), static_cast<uint16_t>(det_buf.size()),
+                            tx_token_out);
+}
+
+struct NetDetachAttempt {
+    ProxyNetState* state = nullptr;
+    uint16_t owner_node = WKI_NODE_INVALID;
+    uint32_t resource_id = 0;
+    uint8_t attach_cookie = 0;
+    uint32_t peer_boot_epoch = 0;
+    WkiReliableTxToken tx_token = {};
+};
+
+// Caller must hold s_net_proxy_lock.
+void link_pending_net_detach_locked(ProxyNetState* state) {
+    state->detach_prev = g_pending_net_detach_tail;
+    state->detach_next = nullptr;
+    if (g_pending_net_detach_tail != nullptr) {
+        g_pending_net_detach_tail->detach_next = state;
+    } else {
+        g_pending_net_detach_head = state;
     }
-    wki_send(owner_node, WKI_CHAN_RESOURCE, MsgType::DEV_DETACH, det_buf.data(), send_len);
+    g_pending_net_detach_tail = state;
+}
+
+// Caller must hold s_net_proxy_lock.
+void unlink_pending_net_detach_locked(ProxyNetState* state) {
+    if (state->detach_prev != nullptr) {
+        state->detach_prev->detach_next = state->detach_next;
+    } else {
+        g_pending_net_detach_head = state->detach_next;
+    }
+    if (state->detach_next != nullptr) {
+        state->detach_next->detach_prev = state->detach_prev;
+    } else {
+        g_pending_net_detach_tail = state->detach_prev;
+    }
+    state->detach_prev = nullptr;
+    state->detach_next = nullptr;
+}
+
+// Caller must hold s_net_proxy_lock.
+auto pending_net_detach_matches_locked(const ProxyNetState* state, uint16_t owner_node, uint32_t resource_id, uint8_t attach_cookie)
+    -> bool {
+    return state->detach_pending && state->detach_owner_node == owner_node && state->detach_resource_id == resource_id &&
+           state->detach_attach_cookie == attach_cookie;
+}
+
+// Caller must hold s_net_proxy_lock. A deferred-only reservation starts idle
+// so task context can claim it after teardown releases registry locks.
+auto stage_net_detach_locked(ProxyNetState* state, uint16_t owner_node, uint32_t resource_id, uint8_t attach_cookie,
+                             bool initial_attempt_in_progress) -> bool {
+    if (state == nullptr || attach_cookie == 0) {
+        return false;
+    }
+    if (state->detach_pending) {
+        bool const SAME = pending_net_detach_matches_locked(state, owner_node, resource_id, attach_cookie);
+        if (!SAME) [[unlikely]] {
+            ker::mod::dbg::panic_handler("WKI NET proxy: overlapping detach idempotence tuples");
+            hcf();
+        }
+        return false;
+    }
+
+    state->detach_pending = true;
+    state->detach_retry_in_progress = initial_attempt_in_progress;
+    state->detach_owner_node = owner_node;
+    state->detach_resource_id = resource_id;
+    state->detach_attach_cookie = attach_cookie;
+    state->detach_peer_boot_epoch = state->binding_peer_boot_epoch;
+    state->detach_tx_token = {};
+    link_pending_net_detach_locked(state);
+    return true;
+}
+
+auto stage_net_detach(ProxyNetState* state, uint16_t owner_node, uint32_t resource_id, uint8_t attach_cookie) -> bool {
+    s_net_proxy_lock.lock();
+    bool const STAGED = stage_net_detach_locked(state, owner_node, resource_id, attach_cookie, false);
+    s_net_proxy_lock.unlock();
+    return STAGED;
+}
+
+void finish_net_detach_attempt(const NetDetachAttempt& attempt, WkiReliableTxStatus tx_status, int send_result,
+                               const WkiReliableTxToken& replacement_token, bool peer_epoch_invalidated = false) {
+    if (attempt.state == nullptr) {
+        return;
+    }
+
+    s_net_proxy_lock.lock();
+    ProxyNetState* const state = attempt.state;
+    if (!pending_net_detach_matches_locked(state, attempt.owner_node, attempt.resource_id, attempt.attach_cookie) ||
+        !state->detach_retry_in_progress) {
+        s_net_proxy_lock.unlock();
+        return;
+    }
+
+    if (tx_status == WkiReliableTxStatus::ACKED || peer_epoch_invalidated) {
+        unlink_pending_net_detach_locked(state);
+        state->detach_pending = false;
+        state->detach_retry_in_progress = false;
+        state->detach_owner_node = WKI_NODE_INVALID;
+        state->detach_resource_id = 0;
+        state->detach_attach_cookie = 0;
+        state->detach_peer_boot_epoch = 0;
+        state->detach_tx_token = {};
+        erase_unpublished_net_proxy_storage_locked(state);
+    } else if (tx_status == WkiReliableTxStatus::PENDING) {
+        state->detach_retry_in_progress = false;
+    } else {
+        state->detach_tx_token = send_result == WKI_OK ? replacement_token : WkiReliableTxToken{};
+        state->detach_retry_in_progress = false;
+    }
+    s_net_proxy_lock.unlock();
+}
+
+auto send_or_defer_net_detach(ProxyNetState* state, uint16_t owner_node, uint32_t resource_id, uint8_t attach_cookie) -> int {
+    bool const STAGED = stage_net_detach(state, owner_node, resource_id, attach_cookie);
+    wki_deferred_work_notify();
+    return STAGED ? WKI_OK : WKI_ERR_BUSY;
 }
 
 void apply_owner_net_state(ProxyNetState* state, const NetStateNotifyPayload& notify) {
@@ -465,7 +695,7 @@ auto proxy_net_open(ker::net::NetDevice* dev) -> int {
     write_net_op_cookie(req_buf.data() + sizeof(DevOpReqPayload), op_cookie);
 
     int const SEND_RET =
-        wki_send(state->owner_node, state->assigned_channel, MsgType::DEV_OP_REQ, req_buf.data(), static_cast<uint16_t>(req_buf.size()));
+        wki_send_on_channel_identity(state->channel_identity, MsgType::DEV_OP_REQ, req_buf.data(), static_cast<uint16_t>(req_buf.size()));
     if (SEND_RET != WKI_OK) {
         cancel_op_waiter(state, wait, SEND_RET);
         release_net_proxy(state);
@@ -498,8 +728,8 @@ auto proxy_net_open(ker::net::NetDevice* dev) -> int {
         credit_req->op_id = OP_NET_RX_CREDIT;
         credit_req->data_len = sizeof(uint16_t);
         memcpy(credit_buf.data() + sizeof(DevOpReqPayload), &INITIAL_CREDITS, sizeof(uint16_t));
-        wki_send(state->owner_node, state->assigned_channel, MsgType::DEV_OP_REQ, credit_buf.data(),
-                 static_cast<uint16_t>(sizeof(DevOpReqPayload) + sizeof(uint16_t)));
+        static_cast<void>(wki_send_on_channel_identity(state->channel_identity, MsgType::DEV_OP_REQ, credit_buf.data(),
+                                                       static_cast<uint16_t>(sizeof(DevOpReqPayload) + sizeof(uint16_t))));
 
         ker::mod::dbg::log("[WKI] proxy_net_open success: %s", dev->name.data());
     }
@@ -529,7 +759,7 @@ void proxy_net_close(ker::net::NetDevice* dev) {
     write_net_op_cookie(req_buf.data() + sizeof(DevOpReqPayload), op_cookie);
 
     int const SEND_RET =
-        wki_send(state->owner_node, state->assigned_channel, MsgType::DEV_OP_REQ, req_buf.data(), static_cast<uint16_t>(req_buf.size()));
+        wki_send_on_channel_identity(state->channel_identity, MsgType::DEV_OP_REQ, req_buf.data(), static_cast<uint16_t>(req_buf.size()));
     if (SEND_RET != WKI_OK) {
         cancel_op_waiter(state, wait, SEND_RET);
         dev->state = 0;
@@ -588,7 +818,7 @@ auto proxy_net_xmit(ker::net::NetDevice* dev, ker::net::PacketBuffer* pkt) -> in
     req->data_len = static_cast<uint16_t>(pkt->len);
     memcpy(req_buf + sizeof(DevOpReqPayload), pkt->data, pkt->len);
 
-    int const SEND_RET = wki_send(state->owner_node, state->assigned_channel, MsgType::DEV_OP_REQ, req_buf, REQ_TOTAL);
+    int const SEND_RET = wki_send_on_channel_identity(state->channel_identity, MsgType::DEV_OP_REQ, req_buf, REQ_TOTAL);
     delete[] req_buf;
 
     if (SEND_RET == WKI_OK) {
@@ -629,7 +859,7 @@ void proxy_net_set_mac(ker::net::NetDevice* dev, const uint8_t* mac) {
     write_net_op_cookie(req_buf.data() + sizeof(DevOpReqPayload), op_cookie);
     memcpy(req_buf.data() + sizeof(DevOpReqPayload) + NET_OP_COOKIE_BYTES, mac, MAC_LEN);
 
-    int const SEND_RET = wki_send(state->owner_node, state->assigned_channel, MsgType::DEV_OP_REQ, req_buf.data(), req_total);
+    int const SEND_RET = wki_send_on_channel_identity(state->channel_identity, MsgType::DEV_OP_REQ, req_buf.data(), req_total);
 
     if (SEND_RET != WKI_OK) {
         cancel_op_waiter(state, wait, SEND_RET);
@@ -682,14 +912,71 @@ void wki_remote_net_init() {
     ker::mod::dbg::log("[WKI] Remote NIC subsystem initialized");
 }
 
+auto wki_remote_net_detach_pending_for_resource(uint16_t owner_node, uint32_t resource_id) -> bool {
+    s_net_proxy_lock.lock();
+    bool const PENDING = net_detach_pending_for_resource_locked(owner_node, resource_id);
+    s_net_proxy_lock.unlock();
+    return PENDING;
+}
+
+void wki_remote_net_process_pending_detaches() {
+    std::array<NetDetachAttempt, NET_DETACH_RETRY_BATCH> attempts{};
+    size_t attempt_count = 0;
+    size_t scanned = 0;
+
+    s_net_proxy_lock.lock();
+    ProxyNetState* state = g_pending_net_detach_head;
+    while (state != nullptr && scanned < NET_DETACH_RETRY_SCAN && attempt_count < attempts.size()) {
+        ProxyNetState* const NEXT = state->detach_next;
+        scanned++;
+        if (!state->detach_retry_in_progress) {
+            state->detach_retry_in_progress = true;
+            attempts.at(attempt_count++) = {
+                .state = state,
+                .owner_node = state->detach_owner_node,
+                .resource_id = state->detach_resource_id,
+                .attach_cookie = state->detach_attach_cookie,
+                .peer_boot_epoch = state->detach_peer_boot_epoch,
+                .tx_token = state->detach_tx_token,
+            };
+            if (state != g_pending_net_detach_tail) {
+                unlink_pending_net_detach_locked(state);
+                link_pending_net_detach_locked(state);
+            }
+        }
+        state = NEXT;
+    }
+    s_net_proxy_lock.unlock();
+
+    for (size_t i = 0; i < attempt_count; ++i) {
+        NetDetachAttempt const& ATTEMPT = attempts.at(i);
+        bool const PEER_EPOCH_INVALIDATED = wki_peer_remote_boot_epoch_invalidated(ATTEMPT.owner_node, ATTEMPT.peer_boot_epoch);
+        WkiReliableTxStatus const TX_STATUS = wki_reliable_tx_status(ATTEMPT.tx_token);
+        WkiReliableTxToken replacement_token = {};
+        int send_ret = WKI_ERR_BUSY;
+        if (!PEER_EPOCH_INVALIDATED && (TX_STATUS == WkiReliableTxStatus::INVALID || TX_STATUS == WkiReliableTxStatus::RETIRED)) {
+            send_ret = send_net_detach(ATTEMPT.owner_node, ATTEMPT.resource_id, ATTEMPT.attach_cookie, &replacement_token);
+        }
+        finish_net_detach_attempt(ATTEMPT, TX_STATUS, send_ret, replacement_token, PEER_EPOCH_INVALIDATED);
+    }
+}
+
 // -------------------------------------------------------------------------------
 // Server Side - NET Operation Handlers
 // -------------------------------------------------------------------------------
 
 namespace detail {
 
-void handle_net_op(const WkiHeader* hdr, uint16_t channel_id, ker::net::NetDevice* net_dev, uint16_t op_id, const uint8_t* data,
-                   uint16_t data_len) {
+void handle_net_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_identity, ker::net::NetDevice* net_dev, uint16_t op_id,
+                   const uint8_t* data, uint16_t data_len) {
+    if (net_dev == nullptr || !net_channel_identity_matches_header(hdr, channel_identity)) {
+        return;
+    }
+
+    // Exact local generation matching fences work that was dispatched before
+    // a slot was retired.  The legacy DEV_OP_REQ wire format has no binding
+    // nonce, so a frame delayed on the wire until after the same numeric ID is
+    // re-reserved remains protocol-level indistinguishable here.
     uint16_t const REQUEST_COOKIE = net_req_cookie_from_header(hdr);
 
     switch (op_id) {
@@ -734,7 +1021,7 @@ void handle_net_op(const WkiHeader* hdr, uint16_t channel_id, ker::net::NetDevic
                 resp.status = -1;
                 resp.data_len = 0;
                 resp.reserved = RESPONSE_COOKIE;
-                wki_send(hdr->src_node, channel_id, MsgType::DEV_OP_RESP, &resp, sizeof(resp));
+                static_cast<void>(wki_send_on_channel_identity(channel_identity, MsgType::DEV_OP_RESP, &resp, sizeof(resp)));
                 break;
             }
 
@@ -748,7 +1035,7 @@ void handle_net_op(const WkiHeader* hdr, uint16_t channel_id, ker::net::NetDevic
             resp.status = 0;
             resp.data_len = 0;
             resp.reserved = RESPONSE_COOKIE;
-            wki_send(hdr->src_node, channel_id, MsgType::DEV_OP_RESP, &resp, sizeof(resp));
+            static_cast<void>(wki_send_on_channel_identity(channel_identity, MsgType::DEV_OP_RESP, &resp, sizeof(resp)));
             break;
         }
 
@@ -779,8 +1066,8 @@ void handle_net_op(const WkiHeader* hdr, uint16_t channel_id, ker::net::NetDevic
             memcpy(stats_data + 32, &net_dev->rx_dropped, sizeof(uint64_t));
             memcpy(stats_data + 40, &net_dev->tx_dropped, sizeof(uint64_t));
 
-            wki_send(hdr->src_node, channel_id, MsgType::DEV_OP_RESP, resp_buf.data(),
-                     static_cast<uint16_t>(sizeof(DevOpRespPayload) + STATS_DATA_LEN));
+            static_cast<void>(wki_send_on_channel_identity(channel_identity, MsgType::DEV_OP_RESP, resp_buf.data(),
+                                                           static_cast<uint16_t>(sizeof(DevOpRespPayload) + STATS_DATA_LEN)));
             break;
         }
 
@@ -793,7 +1080,7 @@ void handle_net_op(const WkiHeader* hdr, uint16_t channel_id, ker::net::NetDevic
             }
 
             if (status == 0) {
-                wki_dev_server_mark_net_opened(hdr->src_node, channel_id, net_dev, true);
+                wki_dev_server_mark_net_opened(channel_identity, net_dev, true);
             }
             wki_dev_server_notify_net_changed(net_dev);
 
@@ -802,7 +1089,7 @@ void handle_net_op(const WkiHeader* hdr, uint16_t channel_id, ker::net::NetDevic
             resp.status = static_cast<int16_t>(status);
             resp.data_len = 0;
             resp.reserved = RESPONSE_COOKIE;
-            wki_send(hdr->src_node, channel_id, MsgType::DEV_OP_RESP, &resp, sizeof(resp));
+            static_cast<void>(wki_send_on_channel_identity(channel_identity, MsgType::DEV_OP_RESP, &resp, sizeof(resp)));
             break;
         }
 
@@ -813,7 +1100,7 @@ void handle_net_op(const WkiHeader* hdr, uint16_t channel_id, ker::net::NetDevic
                 net_dev->ops->close(net_dev);
             }
 
-            wki_dev_server_mark_net_opened(hdr->src_node, channel_id, net_dev, false);
+            wki_dev_server_mark_net_opened(channel_identity, net_dev, false);
             wki_dev_server_notify_net_changed(net_dev);
 
             DevOpRespPayload resp = {};
@@ -821,7 +1108,7 @@ void handle_net_op(const WkiHeader* hdr, uint16_t channel_id, ker::net::NetDevic
             resp.status = 0;
             resp.data_len = 0;
             resp.reserved = RESPONSE_COOKIE;
-            wki_send(hdr->src_node, channel_id, MsgType::DEV_OP_RESP, &resp, sizeof(resp));
+            static_cast<void>(wki_send_on_channel_identity(channel_identity, MsgType::DEV_OP_RESP, &resp, sizeof(resp)));
             break;
         }
 
@@ -830,7 +1117,7 @@ void handle_net_op(const WkiHeader* hdr, uint16_t channel_id, ker::net::NetDevic
             if (data_len >= sizeof(uint16_t)) {
                 uint16_t credits = 0;
                 memcpy(&credits, data, sizeof(uint16_t));
-                wki_dev_server_add_net_rx_credits(hdr->src_node, channel_id, net_dev, credits);
+                wki_dev_server_add_net_rx_credits(channel_identity, net_dev, credits);
             }
             // No response - fire-and-forget credit replenishment
             break;
@@ -842,7 +1129,7 @@ void handle_net_op(const WkiHeader* hdr, uint16_t channel_id, ker::net::NetDevic
             resp.status = -1;
             resp.data_len = 0;
             resp.reserved = REQUEST_COOKIE;
-            wki_send(hdr->src_node, channel_id, MsgType::DEV_OP_RESP, &resp, sizeof(resp));
+            static_cast<void>(wki_send_on_channel_identity(channel_identity, MsgType::DEV_OP_RESP, &resp, sizeof(resp)));
             break;
         }
     }
@@ -854,8 +1141,24 @@ void handle_net_op(const WkiHeader* hdr, uint16_t channel_id, ker::net::NetDevic
 // Consumer Side - Attach / Response Handlers
 // -------------------------------------------------------------------------------
 
-auto wki_remote_net_attach(uint16_t owner_node, uint32_t resource_id, const char* local_name) -> ker::net::NetDevice* {
+auto wki_remote_net_attach(uint16_t owner_node, uint32_t resource_id, const char* local_name, uint64_t expected_resource_generation)
+    -> ker::net::NetDevice* {
     if (local_name == nullptr) {
+        return nullptr;
+    }
+
+    WkiPeer* const PEER = wki_peer_find(owner_node);
+    NetPeerLifecycleLease ATTACH_PEER_LIFECYCLE(PEER);
+    if (!ATTACH_PEER_LIFECYCLE.acquired() || PEER->node_id != owner_node || PEER->state != PeerState::CONNECTED ||
+        PEER->vfs_reset_rebind_pending.load(std::memory_order_acquire)) {
+        return nullptr;
+    }
+
+    uint64_t const RESOURCE_GENERATION = expected_resource_generation != 0
+                                             ? expected_resource_generation
+                                             : wki_resource_generation_snapshot(owner_node, ResourceType::NET, resource_id);
+    ResourceIncarnationToken owner_incarnation = {};
+    if (!wki_resource_observation_snapshot(owner_node, ResourceType::NET, resource_id, RESOURCE_GENERATION, &owner_incarnation)) {
         return nullptr;
     }
 
@@ -863,6 +1166,10 @@ auto wki_remote_net_attach(uint16_t owner_node, uint32_t resource_id, const char
 
     // Allocate proxy state (lock protects deque mutation)
     s_net_proxy_lock.lock();
+    if (net_detach_pending_for_resource_locked(owner_node, resource_id)) {
+        s_net_proxy_lock.unlock();
+        return nullptr;
+    }
     if (auto* existing = find_net_proxy_by_resource(owner_node, resource_id); existing != nullptr) {
         auto* dev = existing->active ? &existing->netdev : nullptr;
         s_net_proxy_lock.unlock();
@@ -872,12 +1179,23 @@ auto wki_remote_net_attach(uint16_t owner_node, uint32_t resource_id, const char
         s_net_proxy_lock.unlock();
         return nullptr;
     }
-    g_net_proxies.push_back(std::make_unique<ProxyNetState>());
-    auto* state = g_net_proxies.back().get();
+    attach_cookie = allocate_net_attach_cookie_locked(owner_node, resource_id);
+    if (attach_cookie == 0) {
+        s_net_proxy_lock.unlock();
+        return nullptr;
+    }
+    g_net_proxy_storage.push_back(std::make_unique<ProxyNetState>());
+    auto* state = g_net_proxy_storage.back().get();
+    g_net_proxies.push_back(state);
+    state->attaching = true;
     state->owner_node = owner_node;
     state->resource_id = resource_id;
-    attach_cookie = allocate_net_attach_cookie_locked();
+    state->resource_generation = RESOURCE_GENERATION;
     state->attach_cookie = attach_cookie;
+    // The peer lifecycle lease excludes HELLO epoch mutation here. Persist the
+    // binding epoch so later terminal teardown never inverts peer_lock against
+    // that lifecycle gate merely to stage a retry reservation.
+    state->binding_peer_boot_epoch = PEER->remote_boot_epoch;
     retain_net_proxy(state);
     s_net_proxy_lock.unlock();
 
@@ -889,18 +1207,22 @@ auto wki_remote_net_attach(uint16_t owner_node, uint32_t resource_id, const char
     attach_req.attach_mode = static_cast<uint8_t>(AttachMode::PROXY);
     attach_req.attach_cookie = attach_cookie;
 
-    WkiChannel* reserved_channel = nullptr;
+    WkiChannelIdentity reserved_channel_identity{};
     if (wki_requester_controls_dynamic_channel(g_wki.my_node_id, owner_node)) {
-        reserved_channel = wki_channel_alloc(owner_node, PriorityClass::THROUGHPUT);
-        if (reserved_channel == nullptr) {
-            retire_unregistered_net_proxy(state, nullptr);
+        if (wki_channel_alloc(owner_node, PriorityClass::THROUGHPUT, &reserved_channel_identity) == nullptr) {
+            retire_unregistered_net_proxy(state, reserved_channel_identity);
             return nullptr;
         }
-        attach_req.requested_channel = reserved_channel->channel_id;
-        state->attach_channel = reserved_channel->channel_id;
+        attach_req.requested_channel = reserved_channel_identity.channel_id;
+        state->lock.lock();
+        state->attach_channel = reserved_channel_identity.channel_id;
+        state->channel_identity = reserved_channel_identity;
+        state->lock.unlock();
     } else {
         attach_req.requested_channel = 0;
+        state->lock.lock();
         state->attach_channel = 0;
+        state->lock.unlock();
     }
 
     WkiWaitEntry wait = {};
@@ -911,55 +1233,102 @@ auto wki_remote_net_attach(uint16_t owner_node, uint32_t resource_id, const char
     state->attach_status = 0;
     state->lock.unlock();
 
+    if (state->retiring.load(std::memory_order_acquire)) {
+        cancel_attach_waiter(state, wait, WKI_ERR_PEER_FENCED);
+        retire_unregistered_net_proxy(state, reserved_channel_identity);
+        return nullptr;
+    }
+
     int const SEND_RET = wki_send(owner_node, WKI_CHAN_RESOURCE, MsgType::DEV_ATTACH_REQ, &attach_req, sizeof(attach_req));
+    // Reliable RX needs this same peer gate to dispatch DEV_ATTACH_ACK. Keep
+    // the gate through request publication, then release it before waiting.
+    ATTACH_PEER_LIFECYCLE.release();
     if (SEND_RET != WKI_OK) {
         cancel_attach_waiter(state, wait, SEND_RET);
-        retire_unregistered_net_proxy(state, reserved_channel);
+        retire_unregistered_net_proxy(state, reserved_channel_identity);
         return nullptr;
     }
 
     int const WAIT_RC = wki_wait_for_op(&wait, WKI_DEV_PROXY_TIMEOUT_US);
     clear_attach_waiter_after_wait(state, wait);
     if (WAIT_RC != 0) {
-        if (WAIT_RC == WKI_ERR_TIMEOUT) {
-            send_net_detach(owner_node, resource_id, attach_cookie);
-        }
+        // The request is already in the reliable stream. Any local wait
+        // cancellation can race an accepted owner binding, not just timeout.
+        static_cast<void>(send_or_defer_net_detach(state, owner_node, resource_id, attach_cookie));
         if (WAIT_RC == WKI_ERR_TIMEOUT) {
             ker::mod::dbg::log("[WKI] Remote NIC attach timeout: node=0x%04x res_id=%u", owner_node, resource_id);
         } else {
             ker::mod::dbg::log("[WKI] Remote NIC attach aborted: node=0x%04x res_id=%u err=%d", owner_node, resource_id, WAIT_RC);
         }
-        retire_unregistered_net_proxy(state, reserved_channel);
+        retire_unregistered_net_proxy(state, reserved_channel_identity);
         return nullptr;
     }
 
-    if (state->attach_status != static_cast<uint8_t>(DevAttachStatus::OK)) {
-        ker::mod::dbg::log("[WKI] Remote NIC attach rejected: status=%u", state->attach_status);
-        retire_unregistered_net_proxy(state, reserved_channel);
+    state->lock.lock();
+    uint8_t const ATTACH_STATUS = state->attach_status;
+    uint16_t const ATTACH_CHANNEL = state->attach_channel;
+    state->lock.unlock();
+    if (ATTACH_STATUS != static_cast<uint8_t>(DevAttachStatus::OK)) {
+        ker::mod::dbg::log("[WKI] Remote NIC attach rejected: status=%u", ATTACH_STATUS);
+        retire_unregistered_net_proxy(state, reserved_channel_identity);
         return nullptr;
     }
 
-    if (reserved_channel != nullptr) {
-        if (state->attach_channel != reserved_channel->channel_id) {
+    // Do not use the blocking lifecycle acquire here: peer cleanup owns this
+    // gate while waiting for our retained proxy reference to drain. A retrying
+    // try-acquire lets that cleanup mark the state retiring, at which point the
+    // attach path releases its reference instead of deadlocking with it.
+    NetPeerLifecycleLease PUBLICATION_PEER_LIFECYCLE;
+    while (!PUBLICATION_PEER_LIFECYCLE.try_acquire(PEER)) {
+        if (state->retiring.load(std::memory_order_acquire)) {
+            static_cast<void>(send_or_defer_net_detach(state, owner_node, resource_id, attach_cookie));
+            retire_unregistered_net_proxy(state, reserved_channel_identity);
+            return nullptr;
+        }
+        ker::mod::sched::kern_yield();
+    }
+    if (PEER->node_id != owner_node || PEER->state != PeerState::CONNECTED ||
+        PEER->vfs_reset_rebind_pending.load(std::memory_order_acquire) || state->retiring.load(std::memory_order_acquire) ||
+        !wki_resource_observation_is_live(owner_node, ResourceType::NET, resource_id, RESOURCE_GENERATION, owner_incarnation)) {
+        static_cast<void>(send_or_defer_net_detach(state, owner_node, resource_id, attach_cookie));
+        retire_unregistered_net_proxy(state, reserved_channel_identity);
+        return nullptr;
+    }
+
+    if (reserved_channel_identity.channel != nullptr) {
+        if (ATTACH_CHANNEL != reserved_channel_identity.channel_id) {
             ker::mod::dbg::log("[WKI] Remote NIC attach channel mismatch: node=0x%04x res_id=%u requested=%u assigned=%u", owner_node,
-                               resource_id, reserved_channel->channel_id, state->attach_channel);
-            send_net_detach(owner_node, resource_id, attach_cookie);
-            retire_unregistered_net_proxy(state, reserved_channel);
+                               resource_id, reserved_channel_identity.channel_id, ATTACH_CHANNEL);
+            static_cast<void>(send_or_defer_net_detach(state, owner_node, resource_id, attach_cookie));
+            retire_unregistered_net_proxy(state, reserved_channel_identity);
             return nullptr;
         }
     } else {
-        reserved_channel = wki_channel_reserve(owner_node, state->attach_channel, PriorityClass::THROUGHPUT);
-        if (reserved_channel == nullptr) {
+        if (wki_channel_reserve(owner_node, ATTACH_CHANNEL, PriorityClass::THROUGHPUT, &reserved_channel_identity) == nullptr) {
             ker::mod::dbg::log("[WKI] Remote NIC attach local reserve failed: node=0x%04x res_id=%u ch=%u", owner_node, resource_id,
-                               state->attach_channel);
-            send_net_detach(owner_node, resource_id, attach_cookie);
-            retire_unregistered_net_proxy(state, nullptr);
+                               ATTACH_CHANNEL);
+            static_cast<void>(send_or_defer_net_detach(state, owner_node, resource_id, attach_cookie));
+            retire_unregistered_net_proxy(state, reserved_channel_identity);
             return nullptr;
         }
+        state->lock.lock();
+        state->channel_identity = reserved_channel_identity;
+        state->lock.unlock();
     }
 
-    state->assigned_channel = reserved_channel->channel_id;
+    if (state->retiring.load(std::memory_order_acquire) ||
+        !wki_channel_generation_is_live(reserved_channel_identity.channel, owner_node, reserved_channel_identity.channel_id,
+                                        reserved_channel_identity.generation)) {
+        static_cast<void>(send_or_defer_net_detach(state, owner_node, resource_id, attach_cookie));
+        retire_unregistered_net_proxy(state, reserved_channel_identity);
+        return nullptr;
+    }
+
+    state->lock.lock();
+    state->assigned_channel = reserved_channel_identity.channel_id;
+    state->channel_identity = reserved_channel_identity;
     state->max_op_size = state->attach_max_op_size;
+    state->lock.unlock();
 
     // V2: Populate proxy NetDevice with proper name and MAC
     // Name: "wki-<hostname>" truncated to NETDEV_NAME_LEN-1
@@ -991,15 +1360,66 @@ auto wki_remote_net_attach(uint16_t owner_node, uint32_t resource_id, const char
     set_net_rx_credits_locked(state, WKI_NET_RX_CREDITS);
     state->lock.unlock();
 
-    // Register in the netdev subsystem
-    if (ker::net::netdev_register(&state->netdev) != 0) {
-        send_net_detach(owner_node, resource_id, attach_cookie);
-        retire_unregistered_net_proxy(state, reserved_channel);
+    // The publication lifecycle lease serializes this final publication with HELLO
+    // reconciliation. Resource replacement/withdrawal is generation-qualified
+    // and can still race independently, so validate the exact observation and
+    // channel again immediately before entering the netdev registry.
+    if (PEER->node_id != owner_node || PEER->state != PeerState::CONNECTED ||
+        PEER->vfs_reset_rebind_pending.load(std::memory_order_acquire) || state->retiring.load(std::memory_order_acquire) ||
+        !wki_resource_observation_is_live(owner_node, ResourceType::NET, resource_id, RESOURCE_GENERATION, owner_incarnation) ||
+        !wki_channel_generation_is_live(reserved_channel_identity.channel, owner_node, reserved_channel_identity.channel_id,
+                                        reserved_channel_identity.generation)) {
+        static_cast<void>(send_or_defer_net_detach(state, owner_node, resource_id, attach_cookie));
+        retire_unregistered_net_proxy(state, reserved_channel_identity);
         return nullptr;
     }
+
+    // netdev_register() publishes a raw NetDevice pointer before returning.
+    // Permanently pin the containing proxy first so an epoch-reset race cannot
+    // unregister and free storage in that publication window. Retaining a
+    // failed-registration tombstone is an intentional safety tradeoff.
     s_net_proxy_lock.lock();
-    state->active = true;
+    state->ever_published = true;
     s_net_proxy_lock.unlock();
+
+    // Register in the netdev subsystem
+    if (ker::net::netdev_register(&state->netdev) != 0) {
+        static_cast<void>(send_or_defer_net_detach(state, owner_node, resource_id, attach_cookie));
+        retire_unregistered_net_proxy(state, reserved_channel_identity);
+        return nullptr;
+    }
+
+    bool publish_proxy = false;
+    s_net_proxy_lock.lock();
+    if (!state->retiring.load(std::memory_order_acquire) && !state->cleanup_started && !state->epoch_reset_pending) {
+        state->netdev_registered = true;
+        state->active = true;
+        state->attaching = false;
+        publish_proxy = true;
+    } else {
+        // This attach path registered the device, so it also unregisters it.
+        // Publishing false here prevents deferred cleanup from doing so twice.
+        state->netdev_registered = false;
+    }
+    s_net_proxy_lock.unlock();
+    if (!publish_proxy) {
+        unpublish_proxy_netdev(state);
+        static_cast<void>(send_or_defer_net_detach(state, owner_node, resource_id, attach_cookie));
+        retire_unregistered_net_proxy(state, reserved_channel_identity);
+        return nullptr;
+    }
+
+    bool const RESOURCE_STILL_LIVE =
+        wki_resource_observation_is_live(owner_node, ResourceType::NET, resource_id, RESOURCE_GENERATION, owner_incarnation);
+    s_net_proxy_lock.lock();
+    bool const PROXY_STILL_PUBLISHED =
+        state->active && state->netdev_registered && !state->cleanup_started && !state->retiring.load(std::memory_order_acquire);
+    s_net_proxy_lock.unlock();
+    if (!RESOURCE_STILL_LIVE || !PROXY_STILL_PUBLISHED) {
+        release_net_proxy(state);
+        wki_remote_net_detach_resource_generation(owner_node, resource_id, RESOURCE_GENERATION);
+        return nullptr;
+    }
 
     ker::mod::dbg::log("[WKI] Remote NIC attached: %s -> node=0x%04x res_id=%u ch=%u mac=%02x:%02x:%02x:%02x:%02x:%02x", local_name,
                        owner_node, resource_id, state->assigned_channel, state->netdev.mac.at(0), state->netdev.mac.at(1),
@@ -1019,11 +1439,12 @@ auto wki_remote_net_has_proxy(uint16_t owner_node, uint32_t resource_id) -> bool
 void wki_remote_net_detach(ker::net::NetDevice* proxy_dev) {
     uint16_t owner_node{};
     uint32_t resource_id{};
-    uint16_t assigned_channel{};
+    WkiChannelIdentity channel_identity{};
     uint8_t attach_cookie{};
     ProxyNetState* state = nullptr;
     WkiWaitEntry* op_waiter = nullptr;
     WkiWaitEntry* attach_waiter = nullptr;
+    bool detach_staged = false;
 
     // Lock: find proxy, copy info, mark inactive, erase from deque
     s_net_proxy_lock.lock();
@@ -1036,12 +1457,16 @@ void wki_remote_net_detach(ker::net::NetDevice* proxy_dev) {
         s_net_proxy_lock.unlock();
         return;
     }
+    state->netdev_registered = false;
 
     owner_node = state->owner_node;
     resource_id = state->resource_id;
-    assigned_channel = state->assigned_channel;
     attach_cookie = state->attach_cookie;
+    // Reserve the legacy owner/resource/cookie tuple before the retiring row
+    // becomes invisible to replacement attach lookup.
+    detach_staged = stage_net_detach_locked(state, owner_node, resource_id, attach_cookie, false);
     state->lock.lock();
+    channel_identity = state->channel_identity;
     if (state->op_pending.load(std::memory_order_acquire)) {
         op_waiter = claim_and_clear_waiter_locked(state->op_wait_entry);
         clear_net_op_state_locked(state, -1);
@@ -1059,16 +1484,83 @@ void wki_remote_net_detach(ker::net::NetDevice* proxy_dev) {
     finish_claimed_waiter(attach_waiter, -1);
     wait_for_net_proxy_refs_to_drain(state);
 
-    ker::net::netdev_unregister(&state->netdev);
+    unpublish_proxy_netdev(state);
 
-    // Send DEV_DETACH outside lock
-    send_net_detach(owner_node, resource_id, attach_cookie);
-
-    // Close the dynamic channel outside lock
-    WkiChannel* ch = wki_channel_lookup(owner_node, assigned_channel);
-    if (ch != nullptr) {
-        wki_channel_close(ch);
+    if (detach_staged) {
+        wki_deferred_work_notify();
     }
+
+    // Close only the dynamic-channel allocation owned by this proxy.
+    close_net_channel_identity(channel_identity);
+    erase_net_proxy(state);
+}
+
+void wki_remote_net_detach_resource_generation(uint16_t owner_node, uint32_t resource_id, uint64_t resource_generation) {
+    if (resource_generation == 0) {
+        return;
+    }
+
+    ProxyNetState* state = nullptr;
+    WkiChannelIdentity channel_identity = {};
+    uint8_t attach_cookie = 0;
+    bool unregister_netdev = false;
+    bool detach_staged = false;
+    WkiWaitEntry* op_waiter = nullptr;
+    WkiWaitEntry* attach_waiter = nullptr;
+
+    s_net_proxy_lock.lock();
+    for (auto& proxy : g_net_proxies) {
+        if (proxy == nullptr || proxy->owner_node != owner_node || proxy->resource_id != resource_id ||
+            proxy->resource_generation != resource_generation || proxy->cleanup_started ||
+            (!proxy->active && !proxy->attaching && !proxy->attach_pending.load(std::memory_order_acquire) &&
+             !proxy->epoch_reset_pending)) {
+            continue;
+        }
+        state = proxy;
+        state->retiring.store(true, std::memory_order_release);
+        state->active = false;
+        state->attaching = false;
+        state->epoch_reset_pending = false;
+        state->cleanup_started = true;
+        state->netdev.state = 0;
+        unregister_netdev = state->netdev_registered;
+        state->netdev_registered = false;
+        attach_cookie = state->attach_cookie;
+        // Make the exact retirement reservation part of the same registry
+        // transition that hides this generation from replacement lookup.
+        detach_staged = stage_net_detach_locked(state, owner_node, resource_id, attach_cookie, false);
+
+        state->lock.lock();
+        channel_identity = state->channel_identity;
+        if (state->op_pending.load(std::memory_order_acquire)) {
+            op_waiter = claim_and_clear_waiter_locked(state->op_wait_entry);
+            clear_net_op_state_locked(state, WKI_ERR_PEER_FENCED);
+        }
+        if (state->attach_pending.load(std::memory_order_acquire)) {
+            state->attach_status = static_cast<uint8_t>(DevAttachStatus::STALE_RESOURCE);
+            attach_waiter = claim_and_clear_waiter_locked(state->attach_wait_entry);
+            state->attach_expected_cookie = 0;
+            state->attach_pending.store(false, std::memory_order_release);
+        }
+        state->lock.unlock();
+        break;
+    }
+    s_net_proxy_lock.unlock();
+
+    if (state == nullptr) {
+        return;
+    }
+
+    finish_claimed_waiter(op_waiter, WKI_ERR_PEER_FENCED);
+    finish_claimed_waiter(attach_waiter, WKI_ERR_PEER_FENCED);
+    wait_for_net_proxy_refs_to_drain(state);
+    if (unregister_netdev) {
+        unpublish_proxy_netdev(state);
+    }
+    if (detach_staged) {
+        wki_deferred_work_notify();
+    }
+    close_net_channel_identity(channel_identity);
     erase_net_proxy(state);
 }
 
@@ -1085,7 +1577,7 @@ void handle_net_attach_ack(const WkiHeader* hdr, const uint8_t* payload, uint16_
 
     const auto* ack = reinterpret_cast<const DevAttachAckPayload*>(payload);
 
-    ProxyNetState* state = acquire_net_proxy_by_attach(hdr->src_node, ack->resource_id);
+    ProxyNetState* state = acquire_net_proxy_by_attach(hdr->src_node, ack->resource_id, ack->reserved);
     if (state == nullptr) {
         return;
     }
@@ -1121,8 +1613,8 @@ void handle_net_attach_ack(const WkiHeader* hdr, const uint8_t* payload, uint16_
     release_net_proxy(state);
 }
 
-void handle_net_op_resp(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len) {
-    if (payload_len < sizeof(DevOpRespPayload)) {
+void handle_net_op_resp(const WkiHeader* hdr, const WkiChannelIdentity& channel_identity, const uint8_t* payload, uint16_t payload_len) {
+    if (!net_channel_identity_matches_header(hdr, channel_identity) || payload_len < sizeof(DevOpRespPayload)) {
         return;
     }
 
@@ -1134,7 +1626,7 @@ void handle_net_op_resp(const WkiHeader* hdr, const uint8_t* payload, uint16_t p
         return;
     }
 
-    ProxyNetState* state = acquire_net_proxy_by_channel(hdr->src_node, hdr->channel_id);
+    ProxyNetState* state = acquire_net_proxy_by_channel(channel_identity);
     if (state == nullptr) {
         return;
     }
@@ -1194,12 +1686,12 @@ void handle_net_op_resp(const WkiHeader* hdr, const uint8_t* payload, uint16_t p
 }
 
 // D11: Consumer receives forwarded packets from the owner NIC
-void handle_net_rx_notify(const WkiHeader* hdr, const uint8_t* data, uint16_t data_len) {
-    if (data_len < sizeof(NetNotifyHeader)) {
+void handle_net_rx_notify(const WkiHeader* hdr, const WkiChannelIdentity& channel_identity, const uint8_t* data, uint16_t data_len) {
+    if (!net_channel_identity_matches_header(hdr, channel_identity) || data_len < sizeof(NetNotifyHeader)) {
         return;
     }
 
-    ProxyNetState* state = acquire_net_proxy_by_channel(hdr->src_node, hdr->channel_id);
+    ProxyNetState* state = acquire_net_proxy_by_channel(channel_identity);
     if (state == nullptr) {
         release_net_proxy(state);
         return;
@@ -1247,18 +1739,18 @@ void handle_net_rx_notify(const WkiHeader* hdr, const uint8_t* data, uint16_t da
         credit_req->op_id = OP_NET_RX_CREDIT;
         credit_req->data_len = sizeof(uint16_t);
         memcpy(credit_buf.data() + sizeof(DevOpReqPayload), &REPLENISH, sizeof(uint16_t));
-        wki_send(state->owner_node, state->assigned_channel, MsgType::DEV_OP_REQ, credit_buf.data(),
-                 static_cast<uint16_t>(sizeof(DevOpReqPayload) + sizeof(uint16_t)));
+        static_cast<void>(wki_send_on_channel_identity(state->channel_identity, MsgType::DEV_OP_REQ, credit_buf.data(),
+                                                       static_cast<uint16_t>(sizeof(DevOpReqPayload) + sizeof(uint16_t))));
     }
     release_net_proxy(state);
 }
 
-void handle_net_state_notify(const WkiHeader* hdr, const uint8_t* data, uint16_t data_len) {
-    if (data_len < sizeof(NetNotifyHeader) + sizeof(NetStateNotifyPayload)) {
+void handle_net_state_notify(const WkiHeader* hdr, const WkiChannelIdentity& channel_identity, const uint8_t* data, uint16_t data_len) {
+    if (!net_channel_identity_matches_header(hdr, channel_identity) || data_len < sizeof(NetNotifyHeader) + sizeof(NetStateNotifyPayload)) {
         return;
     }
 
-    ProxyNetState* state = acquire_net_proxy_by_channel(hdr->src_node, hdr->channel_id);
+    ProxyNetState* state = acquire_net_proxy_by_channel(channel_identity);
     if (state == nullptr) {
         release_net_proxy(state);
         return;
@@ -1298,8 +1790,7 @@ void wki_remote_net_poll_stats() {
     // Collect proxies to poll under lock
     struct PollTarget {
         ProxyNetState* state = nullptr;
-        uint16_t owner_node = 0;
-        uint16_t channel = 0;
+        WkiChannelIdentity channel_identity{};
     };
     constexpr size_t MAX_POLL_TARGETS = 32;
     std::array<PollTarget, MAX_POLL_TARGETS> targets{};
@@ -1311,8 +1802,8 @@ void wki_remote_net_poll_stats() {
             continue;
         }
         if (target_count < MAX_POLL_TARGETS) {
-            retain_net_proxy(p.get());
-            targets.at(target_count++) = {.state = p.get(), .owner_node = p->owner_node, .channel = p->assigned_channel};
+            retain_net_proxy(p);
+            targets.at(target_count++) = {.state = p, .channel_identity = p->channel_identity};
         }
     }
     s_net_proxy_lock.unlock();
@@ -1353,8 +1844,8 @@ void wki_remote_net_poll_stats() {
         req->data_len = NET_OP_COOKIE_BYTES;
         write_net_op_cookie(req_buf.data() + sizeof(DevOpReqPayload), EXPECTED_COOKIE);
 
-        int const SEND_RET =
-            wki_send(target.owner_node, target.channel, MsgType::DEV_OP_REQ, req_buf.data(), static_cast<uint16_t>(req_buf.size()));
+        int const SEND_RET = wki_send_on_channel_identity(target.channel_identity, MsgType::DEV_OP_REQ, req_buf.data(),
+                                                          static_cast<uint16_t>(req_buf.size()));
         if (SEND_RET != WKI_OK) {
             st->lock.lock();
             if (net_stats_poll_owns_slot(st) && st->op_expected_seq == EXPECTED_COOKIE) {
@@ -1370,12 +1861,39 @@ void wki_remote_net_poll_stats() {
 // Fencing Cleanup
 // -------------------------------------------------------------------------------
 
-void wki_remote_net_cleanup_for_peer(uint16_t node_id) {
+void wki_remote_net_mark_epoch_reset(uint16_t node_id) {
+    s_net_proxy_lock.lock();
+    for (auto& proxy : g_net_proxies) {
+        auto* state = proxy;
+        if (state == nullptr || state->owner_node != node_id || state->cleanup_started ||
+            (!state->active && !state->attaching && !state->attach_pending.load(std::memory_order_acquire))) {
+            continue;
+        }
+
+        // HELLO RX may neither allocate nor wait for device/channel teardown.
+        // Retiring fences new operations immediately; task-context cleanup
+        // consumes epoch_reset_pending after the channel pool reset.
+        state->active = false;
+        state->epoch_reset_pending = true;
+        state->retiring.store(true, std::memory_order_release);
+        state->netdev.state = 0;
+    }
+    s_net_proxy_lock.unlock();
+}
+
+namespace {
+
+enum class NetProxyCleanupScope : uint8_t {
+    ALL_FOR_PEER,
+    EPOCH_MARKED_ONLY,
+};
+
+void cleanup_net_proxies_for_peer(uint16_t node_id, NetProxyCleanupScope scope, bool owner_reboot_proven) {
     struct CleanupEntry {
         ProxyNetState* state = nullptr;
-        uint16_t owner_node = 0;
-        uint16_t channel = 0;
+        WkiChannelIdentity channel_identity{};
         bool unregister_netdev = false;
+        bool detach_staged = false;
         WkiWaitEntry* op_wait_entry = nullptr;
         WkiWaitEntry* attach_wait_entry = nullptr;
     };
@@ -1387,23 +1905,30 @@ void wki_remote_net_cleanup_for_peer(uint16_t node_id) {
 
         s_net_proxy_lock.lock();
         for (auto& p : g_net_proxies) {
-            if (p->owner_node != node_id || (!p->active && !p->attach_pending.load(std::memory_order_acquire))) {
+            bool const EPOCH_ONLY = scope == NetProxyCleanupScope::EPOCH_MARKED_ONLY;
+            bool const LIVE_OR_MARKED =
+                p->active || p->attaching || p->attach_pending.load(std::memory_order_acquire) || p->epoch_reset_pending;
+            if (p->owner_node != node_id || p->cleanup_started || !LIVE_OR_MARKED || (EPOCH_ONLY && !p->epoch_reset_pending)) {
                 continue;
             }
             if (cleanup_count >= cleanup_entries.size()) {
                 break;
             }
-            bool const WAS_ACTIVE = p->active;
-            if (!try_retire_net_proxy_locked(p.get())) {
-                continue;
-            }
+
+            p->retiring.store(true, std::memory_order_release);
+            p->active = false;
+            p->attaching = false;
+            p->epoch_reset_pending = false;
+            p->cleanup_started = true;
+            p->netdev.state = 0;
 
             WkiWaitEntry* op_waiter = nullptr;
             WkiWaitEntry* attach_waiter = nullptr;
             p->lock.lock();
+            WkiChannelIdentity const CHANNEL_IDENTITY = p->channel_identity;
             if (p->op_pending.load(std::memory_order_acquire)) {
                 op_waiter = claim_and_clear_waiter_locked(p->op_wait_entry);
-                clear_net_op_state_locked(p.get(), -1);
+                clear_net_op_state_locked(p, WKI_ERR_PEER_FENCED);
             }
 
             if (p->attach_pending.load(std::memory_order_acquire)) {
@@ -1414,12 +1939,17 @@ void wki_remote_net_cleanup_for_peer(uint16_t node_id) {
             }
             p->lock.unlock();
 
-            uint16_t const CHANNEL = p->assigned_channel != 0 ? p->assigned_channel : p->attach_channel;
             auto& entry = cleanup_entries.at(cleanup_count++);
-            entry.state = p.get();
-            entry.owner_node = p->owner_node;
-            entry.channel = CHANNEL;
-            entry.unregister_netdev = WAS_ACTIVE;
+            entry.state = p;
+            entry.channel_identity = CHANNEL_IDENTITY;
+            // The proxy leaves the cookie-allocation registry at the end of
+            // cleanup. Reserve the exact legacy tuple first unless a known
+            // owner reboot proves that no server binding can survive.
+            if (!owner_reboot_proven) {
+                entry.detach_staged = stage_net_detach_locked(p, p->owner_node, p->resource_id, p->attach_cookie, false);
+            }
+            entry.unregister_netdev = p->netdev_registered;
+            p->netdev_registered = false;
             entry.op_wait_entry = op_waiter;
             entry.attach_wait_entry = attach_waiter;
         }
@@ -1431,23 +1961,31 @@ void wki_remote_net_cleanup_for_peer(uint16_t node_id) {
 
         for (size_t i = 0; i < cleanup_count; i++) {
             const auto& entry = cleanup_entries.at(i);
-            finish_claimed_waiter(entry.op_wait_entry, -1);
-            finish_claimed_waiter(entry.attach_wait_entry, -1);
+            finish_claimed_waiter(entry.op_wait_entry, WKI_ERR_PEER_FENCED);
+            finish_claimed_waiter(entry.attach_wait_entry, WKI_ERR_PEER_FENCED);
             wait_for_net_proxy_refs_to_drain(entry.state);
 
             if (entry.unregister_netdev && entry.state != nullptr) {
-                ker::net::netdev_unregister(&entry.state->netdev);
+                unpublish_proxy_netdev(entry.state);
             }
-            if (entry.channel != 0) {
-                WkiChannel* ch = wki_channel_lookup(entry.owner_node, entry.channel);
-                if (ch != nullptr) {
-                    wki_channel_close(ch);
-                }
-            }
+            close_net_channel_identity(entry.channel_identity);
             erase_net_proxy(entry.state);
+            if (entry.detach_staged) {
+                wki_deferred_work_notify();
+            }
             ker::mod::dbg::log("[WKI] Remote NIC proxy cleanup: node=0x%04x", node_id);
         }
     }
+}
+
+}  // namespace
+
+void wki_remote_net_cleanup_for_peer(uint16_t node_id, bool owner_reboot_proven) {
+    cleanup_net_proxies_for_peer(node_id, NetProxyCleanupScope::ALL_FOR_PEER, owner_reboot_proven);
+}
+
+void wki_remote_net_cleanup_epoch_reset_for_peer(uint16_t node_id, bool owner_reboot_proven) {
+    cleanup_net_proxies_for_peer(node_id, NetProxyCleanupScope::EPOCH_MARKED_ONLY, owner_reboot_proven);
 }
 
 auto wki_remote_net_selftest_cancel_preserves_successor_op() -> bool {

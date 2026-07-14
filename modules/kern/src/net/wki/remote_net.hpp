@@ -42,9 +42,20 @@ auto wki_remote_net_selftest_cancel_preserves_successor_op() -> bool;
 
 struct ProxyNetState {
     bool active = false;
+    // Registry lifecycle flags are protected by s_net_proxy_lock.  A HELLO
+    // epoch reset marks a proxy retiring in RX context; task-context cleanup
+    // later claims cleanup_started and performs the blocking teardown.
+    bool attaching = false;
+    bool netdev_registered = false;
+    bool ever_published = false;
+    bool epoch_reset_pending = false;
+    bool cleanup_started = false;
+    bool cleanup_complete = false;
     uint16_t owner_node = WKI_NODE_INVALID;
     uint16_t assigned_channel = 0;
+    WkiChannelIdentity channel_identity{};
     uint32_t resource_id = 0;
+    uint64_t resource_generation = 0;
     uint16_t max_op_size = 0;
 
     std::atomic<bool> op_pending{false};
@@ -64,7 +75,21 @@ struct ProxyNetState {
     uint16_t attach_max_op_size = 0;
     uint8_t attach_cookie = 0;
     uint8_t attach_expected_cookie = 0;
+    uint32_t binding_peer_boot_epoch = 0;
     WkiWaitEntry* attach_wait_entry = nullptr;  // V2 I-4: async wait for DEV_ATTACH_ACK
+
+    // NET has no wire incarnation token. Keep its exact owner/resource/cookie
+    // tuple reserved until detach is ACKed or a new peer boot epoch proves the
+    // old server binding cannot survive.
+    bool detach_pending = false;            // Protected by s_net_proxy_lock.
+    bool detach_retry_in_progress = false;  // Protected by s_net_proxy_lock.
+    uint16_t detach_owner_node = WKI_NODE_INVALID;
+    uint32_t detach_resource_id = 0;
+    uint8_t detach_attach_cookie = 0;
+    uint32_t detach_peer_boot_epoch = 0;
+    WkiReliableTxToken detach_tx_token = {};
+    ProxyNetState* detach_prev = nullptr;
+    ProxyNetState* detach_next = nullptr;
 
     // V2: Extended attach info from NET ACK [V2 A5.3]
     uint32_t owner_ipv4_addr = 0;
@@ -89,8 +114,10 @@ struct ProxyNetState {
 // Initialize the remote NIC subsystem. Called from wki_init().
 void wki_remote_net_init();
 
-// Consumer side: attach to a remote NIC and register a proxy NetDevice
-auto wki_remote_net_attach(uint16_t owner_node, uint32_t resource_id, const char* local_name) -> net::NetDevice*;
+// Consumer side: attach one exact discovered NIC observation. A zero expected
+// generation snapshots the current observation for manual callers.
+auto wki_remote_net_attach(uint16_t owner_node, uint32_t resource_id, const char* local_name, uint64_t expected_resource_generation = 0)
+    -> net::NetDevice*;
 
 // Consumer side: true if a proxy for this remote NIC is already active.
 auto wki_remote_net_has_proxy(uint16_t owner_node, uint32_t resource_id) -> bool;
@@ -98,11 +125,25 @@ auto wki_remote_net_has_proxy(uint16_t owner_node, uint32_t resource_id) -> bool
 // Consumer side: detach from a remote NIC
 void wki_remote_net_detach(net::NetDevice* proxy_dev);
 
+// Retire only the proxy created from this exact discovered generation. A NET
+// withdrawal/replacement may reuse the same numeric resource ID.
+void wki_remote_net_detach_resource_generation(uint16_t owner_node, uint32_t resource_id, uint64_t resource_generation);
+
 // Fencing cleanup - remove all state for a fenced peer
-void wki_remote_net_cleanup_for_peer(uint16_t node_id);
+void wki_remote_net_cleanup_for_peer(uint16_t node_id, bool owner_reboot_proven);
+
+// Connected-epoch reset split phase.  The marker is allocation-free and does
+// not wait or close channels; cleanup must run later from task context.
+void wki_remote_net_mark_epoch_reset(uint16_t node_id);
+void wki_remote_net_cleanup_epoch_reset_for_peer(uint16_t node_id, bool owner_reboot_proven);
 
 // D13: Poll stats from real NIC and update proxy counters (called from timer tick)
 void wki_remote_net_poll_stats();
+
+// Retry a bounded, rotating batch of detach frames from task context.
+void wki_remote_net_process_pending_detaches();
+// Read-only admission gate for deferred auto-attach scheduling.
+auto wki_remote_net_detach_pending_for_resource(uint16_t owner_node, uint32_t resource_id) -> bool;
 
 // -----------------------------------------------------------------------------
 // Internal - RX message handlers
@@ -111,17 +152,17 @@ void wki_remote_net_poll_stats();
 namespace detail {
 
 // Server side: handle NET operations (called from dev_server handle_dev_op_req)
-void handle_net_op(const WkiHeader* hdr, uint16_t channel_id, net::NetDevice* net_dev, uint16_t op_id, const uint8_t* data,
-                   uint16_t data_len);
+void handle_net_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_identity, net::NetDevice* net_dev, uint16_t op_id,
+                   const uint8_t* data, uint16_t data_len);
 
 // Consumer side: handle DEV_OP_RESP for NET proxy (SET_MAC, GET_STATS)
-void handle_net_op_resp(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len);
+void handle_net_op_resp(const WkiHeader* hdr, const WkiChannelIdentity& channel_identity, const uint8_t* payload, uint16_t payload_len);
 
 // D11: Consumer side: handle OP_NET_RX_NOTIFY (owner forwarding received packets)
-void handle_net_rx_notify(const WkiHeader* hdr, const uint8_t* data, uint16_t data_len);
+void handle_net_rx_notify(const WkiHeader* hdr, const WkiChannelIdentity& channel_identity, const uint8_t* data, uint16_t data_len);
 
 // Consumer side: handle owner-pushed NIC state updates for an attached proxy.
-void handle_net_state_notify(const WkiHeader* hdr, const uint8_t* data, uint16_t data_len);
+void handle_net_state_notify(const WkiHeader* hdr, const WkiChannelIdentity& channel_identity, const uint8_t* data, uint16_t data_len);
 
 // Consumer side: handle DEV_ATTACH_ACK for NET proxy
 void handle_net_attach_ack(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len);

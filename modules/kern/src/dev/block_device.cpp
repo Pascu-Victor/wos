@@ -9,6 +9,7 @@
 #include <new>
 #include <platform/dbg/dbg.hpp>
 #include <platform/perf/perf_events.hpp>
+#include <platform/sys/spinlock.hpp>
 #include <span>
 #include <util/smallvec.hpp>
 
@@ -25,6 +26,8 @@ constexpr auto BDEV_INLINE_ALLOC_COUNT = 8;
 constexpr size_t MAX_BLOCK_IO_BYTES = size_t{16} * 1024 * 1024;
 ker::util::SmallVec<BlockDevice*, BDEV_INLINE_ALLOC_COUNT> block_devices;
 ker::util::SmallVec<Device*, BDEV_INLINE_ALLOC_COUNT> block_dev_nodes;
+ker::mod::sys::Spinlock block_writer_lease_lock;
+BlockWriterLease* block_writer_leases = nullptr;
 
 auto max_io_blocks(BlockDevice const* bdev) -> size_t {
     if (bdev == nullptr || bdev->block_size == 0) {
@@ -425,6 +428,99 @@ auto block_devices_overlap(const BlockDevice* lhs, const BlockDevice* rhs) -> bo
     uint64_t const RHS_START = block_range_start(rhs);
     uint64_t const RHS_END = block_range_end(rhs);
     return LHS_START <= RHS_END && RHS_START <= LHS_END;
+}
+
+void BlockWriterLease::unlink_locked() {
+    if (device_ == nullptr) {
+        return;
+    }
+    if (prev_ != nullptr) {
+        prev_->next_ = next_;
+    } else {
+        block_writer_leases = next_;
+    }
+    if (next_ != nullptr) {
+        next_->prev_ = prev_;
+    }
+    device_ = nullptr;
+    prev_ = nullptr;
+    next_ = nullptr;
+}
+
+void BlockWriterLease::take_locked(BlockWriterLease& other) {
+    if (!other.active()) {
+        return;
+    }
+    device_ = other.device_;
+    owner_ = other.owner_;
+    prev_ = other.prev_;
+    next_ = other.next_;
+    if (prev_ != nullptr) {
+        prev_->next_ = this;
+    } else {
+        block_writer_leases = this;
+    }
+    if (next_ != nullptr) {
+        next_->prev_ = this;
+    }
+    other.device_ = nullptr;
+    other.prev_ = nullptr;
+    other.next_ = nullptr;
+}
+
+BlockWriterLease::BlockWriterLease(BlockWriterLease&& other) noexcept {
+    uint64_t const FLAGS = block_writer_lease_lock.lock_irqsave();
+    take_locked(other);
+    block_writer_lease_lock.unlock_irqrestore(FLAGS);
+}
+
+auto BlockWriterLease::operator=(BlockWriterLease&& other) noexcept -> BlockWriterLease& {
+    if (this == &other) {
+        return *this;
+    }
+    uint64_t const FLAGS = block_writer_lease_lock.lock_irqsave();
+    unlink_locked();
+    take_locked(other);
+    block_writer_lease_lock.unlock_irqrestore(FLAGS);
+    return *this;
+}
+
+BlockWriterLease::~BlockWriterLease() { release(); }
+
+auto BlockWriterLease::try_acquire(const BlockDevice* device, BlockWriterLeaseOwner owner) -> bool {
+    if (device == nullptr) {
+        return false;
+    }
+
+    uint64_t const FLAGS = block_writer_lease_lock.lock_irqsave();
+    if (active()) {
+        block_writer_lease_lock.unlock_irqrestore(FLAGS);
+        return false;
+    }
+    for (BlockWriterLease* lease = block_writer_leases; lease != nullptr; lease = lease->next_) {
+        bool const EXCLUSIVE = owner == BlockWriterLeaseOwner::REMOTE_BINDING || lease->owner_ == BlockWriterLeaseOwner::REMOTE_BINDING;
+        if (EXCLUSIVE && block_devices_overlap(lease->device_, device)) {
+            block_writer_lease_lock.unlock_irqrestore(FLAGS);
+            return false;
+        }
+    }
+
+    device_ = device;
+    owner_ = owner;
+    prev_ = nullptr;
+    next_ = block_writer_leases;
+    if (next_ != nullptr) {
+        next_->prev_ = this;
+    }
+    block_writer_leases = this;
+    block_writer_lease_lock.unlock_irqrestore(FLAGS);
+    return true;
+}
+
+void BlockWriterLease::release() {
+    uint64_t const FLAGS = block_writer_lease_lock.lock_irqsave();
+    unlink_locked();
+    block_writer_lease_lock.unlock_irqrestore(FLAGS);
 }
 
 auto block_device_set_read_only(BlockDevice* bdev, bool read_only) -> void {

@@ -305,6 +305,10 @@ auto peer_note_remote_boot_epoch_locked(WkiPeer* peer, uint32_t remote_epoch) ->
     return true;
 }
 
+auto peer_remote_boot_epoch_change_is_proven_locked(const WkiPeer* peer, uint32_t remote_epoch) -> bool {
+    return peer != nullptr && peer->remote_boot_epoch != 0 && remote_epoch != 0 && peer->remote_boot_epoch != remote_epoch;
+}
+
 auto hello_boot_epoch_matches_peer(const WkiPeer* peer, uint32_t remote_epoch) -> bool {
     return peer != nullptr && (remote_epoch == 0 || peer->remote_boot_epoch == remote_epoch);
 }
@@ -536,6 +540,7 @@ void handle_hello(WkiTransport* transport, const WkiHeader* hdr, const uint8_t* 
     bool log_reconnecting = false;
     bool log_connected = false;
     bool remote_boot_epoch_changed = false;
+    bool remote_boot_epoch_change_proven = false;
     bool remote_channel_epoch_changed = false;
     bool resync_connected_peer = false;
     uint32_t const REMOTE_BOOT_EPOCH = hello_boot_epoch(hello);
@@ -600,6 +605,7 @@ void handle_hello(WkiTransport* transport, const WkiHeader* hdr, const uint8_t* 
     peer->last_rx_activity = peer->last_heartbeat;
     peer->missed_beats = 0;
     peer->fence_defer_until_us = 0;
+    remote_boot_epoch_change_proven = peer_remote_boot_epoch_change_is_proven_locked(peer, REMOTE_BOOT_EPOCH);
     remote_boot_epoch_changed = peer_note_remote_boot_epoch_locked(peer, REMOTE_BOOT_EPOCH);
     remote_channel_epoch_changed = peer_note_remote_channel_epoch_locked(peer, REMOTE_CHANNEL_EPOCH);
 
@@ -687,6 +693,27 @@ void handle_hello(WkiTransport* transport, const WkiHeader* hdr, const uint8_t* 
         peer->compute_reset_cleanup_pending.store(true, std::memory_order_release);
         wki_timer_notify();
     }
+    bool const CONNECTED_EPOCH_RESET = !WAS_FENCED && (remote_boot_epoch_changed || remote_channel_epoch_changed);
+    if (CONNECTED_EPOCH_RESET) {
+        // Dynamic channel generations are part of both consumer proxies and
+        // owner-side bindings. Mark both terminal before the reusable pool is
+        // reset; the timer worker performs blocking drain/teardown.
+        if (remote_boot_epoch_changed) {
+            peer->vfs_reset_invalidate_discovery.store(true, std::memory_order_release);
+        }
+        if (remote_boot_epoch_change_proven) {
+            peer->vfs_reset_owner_reboot_proven.store(true, std::memory_order_release);
+        }
+        // Close reliable RESOURCE/DEV admission before any marker scan. A
+        // frame rejected here remains unacknowledged and retransmits after
+        // deferred reconciliation reopens the gate.
+        peer->vfs_reset_rebind_pending.store(true, std::memory_order_release);
+        wki_dev_server_mark_epoch_reset(peer_node);
+        wki_dev_proxy_mark_epoch_reset(peer_node);
+        wki_remote_vfs_mark_epoch_reset(peer_node);
+        wki_remote_net_mark_epoch_reset(peer_node);
+        wki_timer_notify();
+    }
     if (remote_boot_epoch_changed) {
         log::info("Peer 0x%04x boot epoch changed to %u; resetting stale channel state", peer_node, REMOTE_BOOT_EPOCH);
         wki_channels_close_for_peer(peer_node);
@@ -714,7 +741,8 @@ void handle_hello(WkiTransport* transport, const WkiHeader* hdr, const uint8_t* 
 
         // Resume any suspended block device proxies - re-attach channels
         // so that blocked I/O can proceed.
-        wki_dev_proxy_resume_for_peer(peer_node);
+        peer->block_resume_pending.store(true, std::memory_order_release);
+        wki_timer_notify();
     }
 
     // Only run topology updates and resource discovery on actual state transitions
@@ -752,6 +780,7 @@ void handle_hello_ack(WkiTransport* transport, const WkiHeader* /*hdr*/, const u
     std::array<char, WKI_HOSTNAME_MAX> log_hostname{};
     bool remote_channel_epoch_changed = false;
     bool remote_boot_epoch_changed = false;
+    bool remote_boot_epoch_change_proven = false;
     bool resync_connected_peer = false;
     uint32_t const REMOTE_CHANNEL_EPOCH = hello_channel_epoch(ack);
     uint32_t const REMOTE_BOOT_EPOCH = hello_boot_epoch(ack);
@@ -803,6 +832,7 @@ void handle_hello_ack(WkiTransport* transport, const WkiHeader* /*hdr*/, const u
     peer->last_rx_activity = peer->last_heartbeat;
     peer->missed_beats = 0;
     peer->fence_defer_until_us = 0;
+    remote_boot_epoch_change_proven = peer_remote_boot_epoch_change_is_proven_locked(peer, REMOTE_BOOT_EPOCH);
     remote_boot_epoch_changed = peer_note_remote_boot_epoch_locked(peer, REMOTE_BOOT_EPOCH);
     remote_channel_epoch_changed = peer_note_remote_channel_epoch_locked(peer, REMOTE_CHANNEL_EPOCH);
 
@@ -843,6 +873,24 @@ void handle_hello_ack(WkiTransport* transport, const WkiHeader* /*hdr*/, const u
         wki_timer_notify();
     }
 
+    bool const CONNECTED_EPOCH_RESET = !WAS_FENCED && (remote_boot_epoch_changed || remote_channel_epoch_changed);
+    if (CONNECTED_EPOCH_RESET) {
+        // See handle_hello(): stop new operations before channel slots can be
+        // reused, then leave blocking teardown to the timer worker.
+        if (remote_boot_epoch_changed) {
+            peer->vfs_reset_invalidate_discovery.store(true, std::memory_order_release);
+        }
+        if (remote_boot_epoch_change_proven) {
+            peer->vfs_reset_owner_reboot_proven.store(true, std::memory_order_release);
+        }
+        peer->vfs_reset_rebind_pending.store(true, std::memory_order_release);
+        wki_dev_server_mark_epoch_reset(peer_node);
+        wki_dev_proxy_mark_epoch_reset(peer_node);
+        wki_remote_vfs_mark_epoch_reset(peer_node);
+        wki_remote_net_mark_epoch_reset(peer_node);
+        wki_timer_notify();
+    }
+
     if (remote_boot_epoch_changed && !WAS_FENCED) {
         log::info("Peer 0x%04x boot epoch changed to %u; resetting stale channel state", peer_node, REMOTE_BOOT_EPOCH);
         wki_channels_close_for_peer(peer_node);
@@ -868,7 +916,8 @@ void handle_hello_ack(WkiTransport* transport, const WkiHeader* /*hdr*/, const u
 
         if (reconnected) {
             log::info("Peer 0x%04x '%s' reconnected from HELLO_ACK, reconciling", peer_node, log_hostname.data());
-            wki_dev_proxy_resume_for_peer(peer_node);
+            peer->block_resume_pending.store(true, std::memory_order_release);
+            wki_timer_notify();
         }
     }
 
@@ -1244,10 +1293,10 @@ void wki_peer_disconnect_impl(WkiPeer* peer, PeerDisconnectKind kind, bool notif
     wki_dev_proxy_suspend_for_peer(fenced_id);
 
     // Clean up remote VFS proxies and server FDs for this peer
-    wki_remote_vfs_cleanup_for_peer(fenced_id);
+    wki_remote_vfs_cleanup_for_peer(fenced_id, false);
 
     // Clean up remote NIC proxies for this peer
-    wki_remote_net_cleanup_for_peer(fenced_id);
+    wki_remote_net_cleanup_for_peer(fenced_id, false);
 
     // Clean up remote compute tasks and load cache for this peer
     wki_remote_compute_cleanup_for_peer(fenced_id);
@@ -1511,18 +1560,63 @@ auto local_observation_confirms_fence(const WkiPeer* peer, uint64_t now_us) -> b
     return wki_peer_local_observation_confirms_fence(peer, now_us, wki_eth_recent_tx_pressure(now_us));
 }
 
-void drain_pending_compute_reset_cleanups() {
+void drain_pending_epoch_reset_cleanups() {
     for (auto& peer : g_wki.peers) {
-        if (peer.node_id == WKI_NODE_INVALID || !peer.compute_reset_cleanup_pending.exchange(false, std::memory_order_acq_rel)) {
+        if (peer.node_id == WKI_NODE_INVALID) {
             continue;
         }
 
-        // This is the task-context half of HELLO epoch handling. The lifecycle
-        // lease prevents a new TASK_* dispatch/publication from changing the
-        // current generation while stale rows are selected and terminalized.
-        PeerLifecycleGuard lifecycle;
-        lifecycle.acquire(&peer);
-        wki_remote_compute_cleanup_retired_for_peer(peer.node_id);
+        bool const COMPUTE_PENDING = peer.compute_reset_cleanup_pending.exchange(false, std::memory_order_acq_rel);
+        bool const VFS_PENDING = peer.vfs_reset_rebind_pending.load(std::memory_order_acquire);
+        bool const BLOCK_RESUME_PENDING = peer.block_resume_pending.exchange(false, std::memory_order_acq_rel);
+        if (!COMPUTE_PENDING && !VFS_PENDING && !BLOCK_RESUME_PENDING) {
+            continue;
+        }
+
+        bool resume_block_after_gate = false;
+        {
+            // This is the task-context half of HELLO epoch handling. The
+            // lifecycle lease prevents publication from crossing teardown and
+            // cached-identity reconciliation.
+            PeerLifecycleGuard lifecycle;
+            lifecycle.acquire(&peer);
+            if (COMPUTE_PENDING) {
+                wki_remote_compute_cleanup_retired_for_peer(peer.node_id);
+            }
+            if (VFS_PENDING) {
+                // Owner bindings drain first. Admission remains closed while
+                // consumer sessions and discovery are reconciled.
+                wki_dev_server_cleanup_epoch_reset_for_peer(peer.node_id);
+                bool const CONNECTED = peer.state == PeerState::CONNECTED;
+                bool const INVALIDATE_DISCOVERY = peer.vfs_reset_invalidate_discovery.exchange(false, std::memory_order_acq_rel);
+                bool const OWNER_REBOOT_PROVEN = peer.vfs_reset_owner_reboot_proven.exchange(false, std::memory_order_acq_rel);
+                if (CONNECTED && INVALIDATE_DISCOVERY) {
+                    // Old BLOCK/NET generations and incarnation tokens must be
+                    // gone before any consumer reattach decision.
+                    wki_resources_invalidate_for_peer(peer.node_id);
+                }
+
+                wki_dev_proxy_cleanup_epoch_reset_for_peer(peer.node_id, INVALIDATE_DISCOVERY || !CONNECTED, OWNER_REBOOT_PROVEN);
+                wki_remote_net_cleanup_epoch_reset_for_peer(peer.node_id, OWNER_REBOOT_PROVEN);
+                wki_remote_vfs_cleanup_for_peer(peer.node_id, OWNER_REBOOT_PROVEN);
+
+                if (CONNECTED && !INVALIDATE_DISCOVERY) {
+                    wki_resources_rebind_vfs_for_peer(peer.node_id);
+                    wki_resources_rebind_net_for_peer(peer.node_id);
+                    resume_block_after_gate = true;
+                }
+                // Reliable RESOURCE/DEV frames remain unacknowledged while
+                // this flag is set and are replayed after reconciliation.
+                peer.vfs_reset_rebind_pending.store(false, std::memory_order_release);
+            }
+        }
+        if (resume_block_after_gate) {
+            // DEV_ATTACH_ACK admission and the peer lifecycle gate must be
+            // open while this synchronous channel-only rebind waits.
+            wki_dev_proxy_resume_for_peer(peer.node_id);
+        } else if (BLOCK_RESUME_PENDING && peer.state == PeerState::CONNECTED) {
+            wki_dev_proxy_resume_for_peer(peer.node_id);
+        }
     }
 }
 
@@ -1533,7 +1627,7 @@ void wki_peer_timer_tick(uint64_t now_us) {
         return;
     }
 
-    drain_pending_compute_reset_cleanups();
+    drain_pending_epoch_reset_cleanups();
     drain_pending_fence_notifies();
     drain_pending_peer_goodbyes();
 

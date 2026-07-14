@@ -14,6 +14,14 @@ CHANNEL_CPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "channel.cpp"
 PEER_CPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "peer.cpp"
 SMT_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "smt" / "smt.cpp"
 PROCFS_CPP = ROOT / "modules" / "kern" / "src" / "vfs" / "fs" / "procfs.cpp"
+THREAD_CONTROL_CPP = ROOT / "modules" / "kern" / "src" / "syscalls_impl" / "multiproc" / "threadControl.cpp"
+PROCESS_EXIT_CPP = ROOT / "modules" / "kern" / "src" / "syscalls_impl" / "process" / "exit.cpp"
+PROCESS_EXEC_CPP = ROOT / "modules" / "kern" / "src" / "syscalls_impl" / "process" / "exec.cpp"
+TASK_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "sched" / "task.cpp"
+TASK_HPP = ROOT / "modules" / "kern" / "src" / "platform" / "sched" / "task.hpp"
+SCHEDULER_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "sched" / "scheduler.cpp"
+SCHEDULER_HPP = ROOT / "modules" / "kern" / "src" / "platform" / "sched" / "scheduler.hpp"
+SIGNAL_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "sys" / "signal.cpp"
 
 
 def fail(message: str) -> None:
@@ -170,7 +178,7 @@ def test_task_wait_consumes_completed_submitted_row() -> None:
         consume_body,
         [
             "task->pending_proxy_output = nullptr",
-            "task->local_task = nullptr",
+            "task->reset_local_task_ref()",
             "task->result_handle_owned = false",
             "request_submitted_task_reclaim_locked(task)",
         ],
@@ -363,6 +371,7 @@ def test_submitted_task_slots_are_indexed_and_reclaimed() -> None:
             "task.response_consumer_wait_entry == nullptr",
             "task.complete_consumer_wait_entry == nullptr",
             "!task.result_handle_owned",
+            "task.result_owner_task == nullptr",
             "task.local_task == nullptr",
             "task.pending_proxy_output == nullptr",
         ],
@@ -385,6 +394,7 @@ def test_submitted_task_slots_are_indexed_and_reclaimed() -> None:
             [
                 "allocate_submitted_task_id_locked()",
                 "st.result_handle_owned = true",
+                "st.result_owner_task = ker::mod::sched::get_current_task()",
                 "publish_submitted_task_locked(std::move(st))",
                 "task_ptr->response_consumer_wait_entry = &wait",
                 "discarded_output = consume_submitted_task_result_locked(task_ptr)",
@@ -399,6 +409,7 @@ def test_submitted_task_slots_are_indexed_and_reclaimed() -> None:
         function_body(source, "wki_try_remote_spawn"),
         [
             "st->result_handle_owned = false",
+            "st->result_owner_task = nullptr",
             "st->complete_pending.store(false, std::memory_order_release)",
             "request_submitted_task_reclaim(tid)",
         ],
@@ -419,6 +430,7 @@ def test_submitted_task_slots_are_indexed_and_reclaimed() -> None:
             "WkiWaitEntry* response_consumer_wait_entry = nullptr",
             "WkiWaitEntry* complete_consumer_wait_entry = nullptr",
             "bool result_handle_owned = false",
+            "ker::mod::sched::task::Task* result_owner_task = nullptr",
             "bool reclaim_requested = false",
             "wki_remote_compute_selftest_submitted_slots_reclaim_safely",
             "wki_remote_compute_selftest_task_id_wrap_is_safe",
@@ -434,6 +446,588 @@ def test_submitted_task_slots_are_indexed_and_reclaimed() -> None:
             "wki_remote_compute_selftest_task_id_wrap_is_safe",
         ],
         "submitted-slot KTEST registration",
+    )
+
+
+def test_task_exit_retires_remote_compute_wait_owners() -> None:
+    source = REMOTE_COMPUTE_CPP.read_text()
+    header = REMOTE_COMPUTE_HPP.read_text()
+    wki_source = WKI_CPP.read_text()
+    ktest = REMOTE_COMPUTE_KTEST.read_text()
+    thread_control = THREAD_CONTROL_CPP.read_text()
+    process_exit = PROCESS_EXIT_CPP.read_text()
+    process_exec = PROCESS_EXEC_CPP.read_text()
+    task_source = TASK_CPP.read_text()
+    task_header = TASK_HPP.read_text()
+    scheduler_source = SCHEDULER_CPP.read_text()
+    scheduler_header = SCHEDULER_HPP.read_text()
+    signal_source = SIGNAL_CPP.read_text()
+
+    cleanup = function_body(source, "wki_remote_compute_cleanup_for_task")
+    require_tokens(
+        cleanup,
+        [
+            "submitted.result_owner_task != exiting_task",
+            "remember_waiter(submitted.response_wait_entry)",
+            "remember_waiter(submitted.response_consumer_wait_entry)",
+            "remember_waiter(submitted.complete_wait_entry)",
+            "remember_waiter(submitted.complete_consumer_wait_entry)",
+            "submitted.response_wait_entry = nullptr",
+            "submitted.response_consumer_wait_entry = nullptr",
+            "submitted.response_pending.store(false",
+            "submitted.complete_wait_entry = nullptr",
+            "submitted.complete_consumer_wait_entry = nullptr",
+            "submitted.complete_pending.store(false",
+            "submitted_ipc_cleanup_snapshot_locked(&submitted)",
+            "submitted.ipc_fd_count = 0",
+            "submitted.active = false",
+            "consume_submitted_task_result_locked(&submitted)",
+            "wki_claim_op(waiter)",
+            "wki_finish_claimed_op(waiter, WKI_ERR_PEER_FENCED)",
+            "wki_quiesce_claimed_op(waiter)",
+            "send_task_cancel_request",
+            "cleanup_submitted_ipc_exports(ipc_cleanup)",
+            "delete[] discarded_output",
+        ],
+        "task-exit remote-compute ownership retirement",
+    )
+    unlock_pos = cleanup.find("s_compute_lock.unlock()")
+    for unlocked_action in [
+        "wki_claim_op(waiter)",
+        "send_task_cancel_request",
+        "cleanup_submitted_ipc_exports(ipc_cleanup)",
+        "delete[] discarded_output",
+    ]:
+        if unlock_pos < 0 or cleanup.find(unlocked_action) <= unlock_pos:
+            fail(f"task-exit cleanup must perform {unlocked_action} after releasing s_compute_lock")
+
+    wait_cleanup = function_body(wki_source, "wki_wait_cleanup_for_task")
+    require_order(
+        wait_cleanup,
+        "s_wait_lock.unlock()",
+        "wki_remote_compute_cleanup_for_task(task)",
+        "generic wait cleanup must release s_wait_lock before remote-compute ownership cleanup",
+    )
+    require_order(
+        wait_cleanup,
+        "wki_remote_compute_cleanup_for_task(task)",
+        "wki_remote_vfs_cleanup_for_task(task->pid)",
+        "task-exit WKI subsystem cleanup order",
+    )
+
+    task_wait = function_body(source, "wki_task_wait")
+    require_tokens(
+        task_wait,
+        [
+            "CURRENT_TASK = ker::mod::sched::get_current_task()",
+            "task->result_owner_task != nullptr && task->result_owner_task != CURRENT_TASK",
+            "task->result_owner_task = CURRENT_TASK",
+        ],
+        "owner-bound one-shot task wait",
+    )
+    require_tokens(
+        header,
+        [
+            "ker::mod::sched::task::Task* result_owner_task = nullptr",
+            "void wki_remote_compute_cleanup_for_task(ker::mod::sched::task::Task* task)",
+            "wki_remote_compute_selftest_task_exit_retires_wait_owners",
+        ],
+        "remote-compute task-exit ownership API",
+    )
+    require_tokens(
+        function_body(source, "wki_remote_compute_selftest_task_exit_retires_wait_owners"),
+        [
+            "ExitCase::RESPONSE",
+            "ExitCase::COMPLETE",
+            "ExitCase::DONE_UNLINKED",
+            "wki_wait_cleanup_for_task(&exiting_task)",
+            "PUBLISHED_WAITER_RETIRED = !wki_claim_op(&wait)",
+            "ROW_RETIRED",
+        ],
+        "remote-compute task-exit regression cases",
+    )
+    require_tokens(
+        ktest,
+        [
+            "TaskExitRetiresWaitOwners",
+            "wki_remote_compute_selftest_task_exit_retires_wait_owners",
+        ],
+        "remote-compute task-exit KTEST registration",
+    )
+    thread_exit = function_body(thread_control, "wos_thread_exit_current")
+    require_order(
+        thread_exit,
+        "release_thread_fd_refs(task)",
+        "wki_remote_compute_cleanup_for_task(task)",
+        "thread exit must close inherited refs before retiring compute ownership",
+    )
+    require_order(
+        thread_exit,
+        "wki_remote_compute_cleanup_for_task(task)",
+        "destroy_unpublished_process(mod::sched::task::take_unpublished_process(task))",
+        "thread exit must detach WKI subject pointers before destroying an unpublished child",
+    )
+    require_order(
+        thread_exit,
+        "destroy_unpublished_process(mod::sched::task::take_unpublished_process(task))",
+        "wki_wait_cleanup_for_task(task)",
+        "thread exit must clean waits created by child teardown",
+    )
+    require_order(
+        thread_exit,
+        "wki_wait_cleanup_for_task(task)",
+        "task->state.store(mod::sched::task::TaskState::DEAD",
+        "thread exit must retire WKI stack ownership before DEAD publication",
+    )
+    cleanup_pos = thread_exit.find("wki_wait_cleanup_for_task(task)")
+    final_handoff_pos = thread_exit.rfind("jump_to_next_task_no_save()")
+    if cleanup_pos < 0 or final_handoff_pos < 0 or cleanup_pos >= final_handoff_pos:
+        fail("thread exit must retire WKI stack ownership before its final stack handoff")
+
+    process_exit_body = function_body(process_exit, "wos_proc_exit_with_wait_status")
+    require_order(
+        process_exit_body,
+        "wki_remote_compute_cleanup_for_task(current_task)",
+        "destroy_unpublished_process(sched_task::take_unpublished_process(current_task))",
+        "process exit must detach WKI subject pointers before destroying an unpublished child",
+    )
+    require_order(
+        process_exit_body,
+        "destroy_unpublished_process(sched_task::take_unpublished_process(current_task))",
+        "wki_wait_cleanup_for_task(current_task)",
+        "process exit must clean waits created by child teardown",
+    )
+    require_order(
+        process_exit_body,
+        "wki_wait_cleanup_for_task(current_task)",
+        "transition_state(ker::mod::sched::task::TaskState::ACTIVE",
+        "blocking WKI cleanup must finish while process exit remains ACTIVE",
+    )
+
+    require_tokens(
+        task_header,
+        [
+            "std::atomic<Task*> owned_unpublished_process{nullptr}",
+            "claim_unpublished_process(Task* owner, Task* child)",
+            "release_unpublished_process(Task* owner, Task* child)",
+            "take_unpublished_process(Task* owner)",
+            "destroy_unpublished_process(Task* task)",
+            "destroy_owned_unpublished_process(Task* owner, Task* child)",
+            "complete_unpublished_process_construction(Task* task)",
+            "std::atomic<bool> unpublished_teardown_in_progress{false}",
+        ],
+        "persistent unpublished-process owner API",
+    )
+    require_tokens(
+        function_body(task_source, "claim_unpublished_process"),
+        ["child->try_acquire_lifetime_ref()", "compare_exchange_strong", "child->release()"],
+        "unpublished-process owner reference claim",
+    )
+    take_unpublished = function_body(task_source, "take_unpublished_process")
+    require_tokens(
+        take_unpublished,
+        ["owned_unpublished_process.exchange(nullptr, std::memory_order_acq_rel)"],
+        "unpublished-process owner reference transfer",
+    )
+    if "->release()" in take_unpublished:
+        fail("taking an unpublished child must transfer, not drop, the owner-slot reference")
+
+    destroy_unpublished = function_body(task_source, "destroy_unpublished_process")
+    require_tokens(
+        destroy_unpublished,
+        [
+            "unpublished_process_is_exclusively_owned(task)",
+            "teardown_unpublished_process_resources(task)",
+            "task->release()",
+            "delete task",
+        ],
+        "transferred unpublished-process teardown",
+    )
+    teardown_resources = function_body(task_source, "teardown_unpublished_process_resources")
+    require_tokens(
+        teardown_resources,
+        [
+            "loader::debug::unregister_process(task->pid)",
+            "task->fd_table.remove(fd)",
+            "ker::vfs::vfs_put_file(file)",
+            "delete[] task->elf_buffer",
+            "threading::destroy_thread(task->thread)",
+            "release_file_mmap_ranges_for_pagemap(task->pagemap)",
+            "mm::virt::destroy_user_space",
+            "mm::virt::release_pagemap",
+            "mm::phys::page_free",
+        ],
+        "complete unpublished-process teardown",
+    )
+    exclusive_check = function_body(task_source, "unpublished_process_is_exclusively_owned")
+    require_tokens(
+        exclusive_check,
+        [
+            "task->scheduler_published.load(std::memory_order_acquire)",
+            "task->state.load(std::memory_order_acquire) != TaskState::ACTIVE",
+            "task->gc_queued.load(std::memory_order_acquire)",
+            "task->ref_count.load(std::memory_order_acquire) != 2",
+        ],
+        "unpublished-process exclusive lifetime validation",
+    )
+    for racy_scheduler_field in ["sched_queue", "heap_index", "sched_next"]:
+        if racy_scheduler_field in exclusive_check:
+            fail(f"unpublished teardown must not inspect unlocked scheduler field {racy_scheduler_field}")
+    require_tokens(
+        task_header,
+        ["std::atomic<bool> scheduler_published{false}"],
+        "monotonic scheduler-publication marker",
+    )
+    runnable_post = function_body(scheduler_source, "publish_runnable_task_locked")
+    require_order(
+        runnable_post[runnable_post.find("rq->runnable_heap.insert(t)") :],
+        "t->sched_queue = task::Task::sched_queue::RUNNABLE",
+        "t->scheduler_published.store(true, std::memory_order_release)",
+        "runnable publication must set the monotonic teardown guard under its runqueue lock",
+    )
+    waiting_post = function_body(scheduler_source, "post_task_waiting")
+    require_order(
+        waiting_post,
+        "published = register_fresh_task_visibility(task)",
+        "task->scheduler_published.store(true, std::memory_order_release)",
+        "waiting publication must set the monotonic teardown guard before releasing its runqueue lock",
+    )
+    if "scheduler_published.store(false" in scheduler_source or "scheduler_published.store(false" in task_source:
+        fail("scheduler publication marker must never be cleared")
+    owned_destroy = function_body(task_source, "destroy_owned_unpublished_process")
+    require_order(
+        owned_destroy,
+        "unpublished_teardown_in_progress.compare_exchange_strong",
+        "teardown_unpublished_process_resources(child)",
+        "fatal-exit deferral must publish before blocking child teardown",
+    )
+    require_order(
+        owned_destroy,
+        "teardown_unpublished_process_resources(child)",
+        "owned_unpublished_process.exchange(nullptr",
+        "owner slot must remain discoverable throughout blocking child teardown",
+    )
+    delete_child_pos = owned_destroy.find("delete child")
+    final_deferral_clear_pos = owned_destroy.rfind("unpublished_teardown_in_progress.store(false, std::memory_order_release)")
+    if delete_child_pos < 0 or final_deferral_clear_pos <= delete_child_pos:
+        fail("fatal exit may resume only after child destruction")
+
+    constructor_start = task_source.find("Task::Task(")
+    constructor_end = task_source.find("Task* Task::create_kernel_thread", constructor_start)
+    if constructor_start < 0 or constructor_end < 0:
+        fail("missing Task PROCESS constructor interval")
+    constructor = task_source[constructor_start:constructor_end]
+    if "read_boot_file_fully(" in constructor:
+        fail("Task constructor must not perform blocking PT_INTERP VFS I/O")
+    require_tokens(
+        constructor,
+        ["this->pending_interp_path.data()", "std::memcpy", "INTERP_LEN + 1"],
+        "Task constructor PT_INTERP deferral",
+    )
+    complete_construction = function_body(task_source, "complete_unpublished_process_construction")
+    require_tokens(
+        complete_construction,
+        [
+            "task->pending_interp_path.front() == '\\0'",
+            "read_boot_file_fully(task->pending_interp_path.data(), &interp_buf)",
+            "loader::elf::load_elf",
+            "task->context.frame.rip = INTERP_RESULT.entry_point",
+            "task->interp_base = INTERP_BASE",
+        ],
+        "post-construction PT_INTERP stage",
+    )
+
+    exec_body = function_body(process_exec, "wos_proc_exec_impl")
+    require_order(
+        exec_body,
+        "new_task->elf_buffer = elf_buffer",
+        "claim_unpublished_process(parent_task, new_task)",
+        "exec must transfer ELF ownership before publishing fatal-exit recovery",
+    )
+    require_order(
+        exec_body,
+        "claim_unpublished_process(parent_task, new_task)",
+        "complete_unpublished_process_construction(new_task)",
+        "exec must claim fatal-exit ownership before PT_INTERP VFS I/O",
+    )
+    require_order(
+        exec_body,
+        "complete_unpublished_process_construction(new_task)",
+        "wki_try_remote_spawn(new_task, REMOTE_SPAWN)",
+        "exec must finish PT_INTERP before remote submission",
+    )
+    require_tokens(
+        exec_body,
+        ["destroy_owned_unpublished_process(parent_task, new_task)"],
+        "exec failure teardown must retain persistent child ownership",
+    )
+    local_post_pos = exec_body.find("post_task_balanced(new_task)")
+    final_owner_release_pos = exec_body.rfind("release_unpublished_process(parent_task, new_task)")
+    if local_post_pos < 0 or final_owner_release_pos <= local_post_pos:
+        fail("local publication must precede the final owner-slot release")
+
+    require_tokens(
+        SMT_CPP.read_text(),
+        ["complete_unpublished_process_construction(new_task)"],
+        "pre-scheduler init PT_INTERP completion",
+    )
+    require_tokens(
+        function_body(signal_source, "exit_current_on_pending_fatal_default_signal"),
+        ["unpublished_teardown_in_progress.load(std::memory_order_acquire)"],
+        "fatal-signal handoff deferral during unpublished teardown",
+    )
+    requested_exit = function_body(process_exit, "exit_current_if_process_exit_requested")
+    require_order(
+        requested_exit,
+        "unpublished_teardown_in_progress.load(std::memory_order_acquire)",
+        "process_exit_requested.load(std::memory_order_acquire)",
+        "group-exit request must remain pending during unpublished teardown",
+    )
+
+    reschedule = function_body(scheduler_source, "reschedule_task_for_cpu")
+    waitpid_repair_start = reschedule.find("if (is_waitpid_wait_channel")
+    final_insert_start = reschedule.find("// Insert into target CPU's heap", waitpid_repair_start)
+    waitpid_repair = reschedule[waitpid_repair_start:final_insert_start]
+    require_order(
+        waitpid_repair,
+        "task->state.load(std::memory_order_acquire) != task::TaskState::ACTIVE",
+        "wait_list_push_locked(rq, task)",
+        "waitpid repair must revalidate lifecycle under the owner runqueue lock",
+    )
+    final_lock_start = reschedule.rfind("run_queues->with_lock_void(cpu_no")
+    final_lock_end = reschedule.find("if (!published_runnable)", final_lock_start)
+    final_publication = reschedule[final_lock_start:final_lock_end]
+    require_tokens(
+        final_publication,
+        [
+            "task->state.load(std::memory_order_acquire) != task::TaskState::ACTIVE",
+            "task->gc_queued.load(std::memory_order_acquire)",
+            "task->wki_proxy_task_id != 0",
+            "published_runnable = publish_runnable_task_locked",
+        ],
+        "locked reschedule anti-resurrection gate",
+    )
+    require_order(
+        final_publication,
+        "task->wki_proxy_task_id != 0",
+        "published_runnable = publish_runnable_task_locked",
+        "lifecycle/proxy revalidation must precede runnable publication",
+    )
+    shutdown_handoff = function_body(scheduler_source, "maybe_exit_current_kernel_thread_for_shutdown")
+    require_order(
+        shutdown_handoff,
+        "task->owned_unpublished_process.load(std::memory_order_acquire) != nullptr",
+        "task->preempt_pending = true",
+        "daemon shutdown must defer while its unpublished child and stack locals are owned",
+    )
+
+    spawn = function_body(source, "wki_try_remote_spawn")
+    require_order(
+        spawn,
+        "task->wki_proxy_task_id = tid",
+        "post_task_waiting(task)",
+        "proxy identity must be visible before scheduler publication",
+    )
+    require_order(
+        spawn,
+        "task->wki_proxy_task = true",
+        "post_task_waiting(task)",
+        "proxy marker must be visible before scheduler publication",
+    )
+    require_order(
+        spawn,
+        "task->set_wait_channel(\"wki_execve_proxy\"",
+        "post_task_waiting(task)",
+        "fresh proxy wait identity must be visible before scheduler publication",
+    )
+    require_order(
+        spawn,
+        "post_task_waiting(task)",
+        "delete[] task->elf_buffer",
+        "proxy publication must succeed before local ELF ownership is released",
+    )
+    require_tokens(
+        spawn,
+        [
+            "task->clear_wait_channel()",
+            "task->wki_proxy_task = false",
+            "task->wki_proxy_task_id = 0",
+            "abandon_submitted_task_after_proxy_publish_failure(tid)",
+            '"proxy-publication-failed"',
+            "(STRICT_TARGET || STRICT_REMOTE) ? WkiRemoteSpawnResult::FAILED : WkiRemoteSpawnResult::LOCAL",
+        ],
+        "proxy publication failure retirement",
+    )
+    require_tokens(
+        function_body(source, "abandon_submitted_task_after_proxy_publish_failure"),
+        [
+            "submitted_ipc_cleanup_snapshot_locked(submitted)",
+            "consume_submitted_task_result_locked(submitted)",
+            "send_task_cancel_request",
+            "cleanup_submitted_ipc_exports(ipc_cleanup)",
+        ],
+        "failed proxy publication cleanup",
+    )
+    require_tokens(
+        scheduler_header,
+        [
+            "enum class RemotePlacementResult : uint8_t",
+            "LOCAL",
+            "REMOTE",
+            "FAILED",
+            "RemotePlacementResult (*wki_try_remote_placement_fn)",
+        ],
+        "tri-state scheduler remote-placement contract",
+    )
+    require_tokens(
+        function_body(scheduler_source, "post_task_balanced"),
+        [
+            "RESULT == RemotePlacementResult::REMOTE",
+            "RESULT == RemotePlacementResult::FAILED",
+            'log_rejected_task_publication("remote placement failed"',
+        ],
+        "scheduler must not locally execute terminal remote-placement failures",
+    )
+    require_tokens(
+        function_body(source, "try_remote_placement"),
+        [
+            "case WkiRemoteSpawnResult::REMOTE",
+            "case WkiRemoteSpawnResult::FAILED",
+            "case WkiRemoteSpawnResult::LOCAL",
+        ],
+        "WKI-to-scheduler placement result mapping",
+    )
+
+
+def test_submit_send_failure_keeps_stack_waiter_exit_discoverable() -> None:
+    source = REMOTE_COMPUTE_CPP.read_text()
+    function_bounds = [
+        ("wki_task_submit_inline", "auto wki_task_submit_vfs_ref"),
+        ("wki_task_submit_vfs_ref", "auto wki_task_wait"),
+    ]
+    for function_name, next_function in function_bounds:
+        body_start = source.find(f"auto {function_name}(")
+        body_end = source.find(next_function, body_start + 1)
+        if body_start < 0 or body_end < 0:
+            fail(f"missing function interval for {function_name}")
+        body = source[body_start:body_end]
+        failure_start = body.find("if (SEND_RET != WKI_OK)")
+        failure_end = body.find("int const WAIT_RC", failure_start)
+        if failure_start < 0 or failure_end < 0:
+            fail(f"{function_name}: missing submit-send failure interval")
+        failure = body[failure_start:failure_end]
+
+        require_order(
+            failure,
+            "task_ptr->response_pending.store(false, std::memory_order_release)",
+            "finish_or_wait_for_cancelled_waiter(wait, claimed_waiter, SEND_RET)",
+            f"{function_name} send failure must make the row terminal before quiescence",
+        )
+        require_order(
+            failure,
+            "finish_or_wait_for_cancelled_waiter(wait, claimed_waiter, SEND_RET)",
+            "task_ptr->response_consumer_wait_entry = nullptr",
+            f"{function_name} send failure must retain the task-visible consumer through quiescence",
+        )
+        require_order(
+            failure,
+            "task_ptr->response_consumer_wait_entry = nullptr",
+            "consume_submitted_task_result_locked(task_ptr)",
+            f"{function_name} send failure must not drop result ownership before waiter retirement",
+        )
+
+
+def test_proxy_waiting_publication_is_transactional() -> None:
+    scheduler_source = SCHEDULER_CPP.read_text()
+    scheduler_header = SCHEDULER_HPP.read_text()
+
+    registration = function_body(scheduler_source, "register_fresh_task_visibility")
+    require_tokens(
+        registration,
+        [
+            "global_task_registry_lock.lock_irqsave()",
+            "active_task_count >= MAX_ACTIVE_TASKS",
+            "EXISTING == task",
+            "EXISTING->pid == task->pid",
+            'panic_handler("scheduler: fresh task already present in active registry")',
+            "entry.pid == task->pid",
+            "entry.task == task",
+            'panic_handler("scheduler: fresh task already present in PID registry")',
+            "pid_index == MAX_PIDS",
+            "pid_slot(pid_index).task = task",
+            "pid_slot(pid_index).pid = task->pid",
+            "active_task_slot(active_task_count) = task",
+            "active_task_count++",
+            "global_task_registry_lock.unlock_irqrestore(FLAGS)",
+        ],
+        "atomic fresh-task registry publication",
+    )
+    require_order(
+        registration,
+        "entry.pid == task->pid",
+        "pid_slot(pid_index).task = task",
+        "fresh-task PID collision check before registry commit",
+    )
+    require_order(
+        registration,
+        "EXISTING->pid == task->pid",
+        "active_task_slot(active_task_count) = task",
+        "fresh-task active collision check before registry commit",
+    )
+    commit = registration[registration.find("pid_slot(pid_index).task = task") :]
+    require_order(commit, "pid_slot(pid_index).task = task", "pid_slot(pid_index).pid = task->pid", "fresh PID entry commit")
+    require_order(
+        commit,
+        "pid_slot(pid_index).pid = task->pid",
+        "active_task_slot(active_task_count) = task",
+        "PID commit before active-list commit under one lock",
+    )
+    require_order(
+        commit,
+        "active_task_count++",
+        "global_task_registry_lock.unlock_irqrestore(FLAGS)",
+        "both fresh-task registries committed before visibility unlock",
+    )
+
+    publication = function_body(scheduler_source, "post_task_waiting")
+    require_tokens(
+        publication,
+        [
+            "task->sched_queue != task::Task::sched_queue::NONE",
+            "task->heap_index >= 0",
+            "task->sched_next != nullptr",
+            "task == get_current_task()",
+            "wait_list_push_locked(rq, task)",
+            "published = register_fresh_task_visibility(task)",
+            "if (!wait_list_remove_locked(rq, task))",
+            "task->sched_queue = task::Task::sched_queue::NONE",
+            "return published",
+        ],
+        "transactional fresh WAITING publication",
+    )
+    require_order(
+        publication,
+        "wait_list_push_locked(rq, task)",
+        "published = register_fresh_task_visibility(task)",
+        "wait-list park before global task visibility",
+    )
+    require_order(
+        publication,
+        "published = register_fresh_task_visibility(task)",
+        "if (!wait_list_remove_locked(rq, task))",
+        "failed registration before wait-list rollback",
+    )
+    if "pid_table_insert(task)" in publication or "active_list_insert(task)" in publication:
+        fail("fresh WAITING publication must not expose PID and active registries separately")
+
+    require_tokens(
+        scheduler_header,
+        [
+            "Transactionally publish an exclusively owned, non-current task",
+            "no registry/runqueue membership",
+            "false guarantees no PID/active or runqueue membership remains",
+        ],
+        "fresh WAITING scheduler API contract",
     )
 
 
@@ -653,6 +1247,63 @@ def test_submitted_vfs_policy_is_active_during_elf_construction() -> None:
     require_tokens(source, [f"auto {token}() -> bool"], "submitted policy scope selftest implementation")
     require_tokens(header, [f"auto {token}() -> bool;"], "submitted policy scope selftest declaration")
     require_tokens(ktest, ["SubmitPolicyScopeRestoresWorker", token], "submitted policy scope KTEST coverage")
+
+
+def test_receiver_child_owner_spans_interpreter_output_and_publication() -> None:
+    source = REMOTE_COMPUTE_CPP.read_text()
+    exec_body = function_body(source, "exec_elf_buffer")
+    require_order(
+        exec_body,
+        "new_task->elf_buffer = elf_buffer",
+        "claim_unpublished_process(OWNER, new_task)",
+        "receiver must attach its ELF before publishing fatal-exit recovery ownership",
+    )
+    require_order(
+        exec_body,
+        "claim_unpublished_process(OWNER, new_task)",
+        "complete_unpublished_process_construction(new_task)",
+        "receiver must publish child ownership before blocking PT_INTERP loading",
+    )
+    require_order(
+        exec_body,
+        "complete_unpublished_process_construction(new_task)",
+        "new TaskOutputCapture()",
+        "receiver must finish the owned interpreter stage before output setup",
+    )
+    require_tokens(
+        exec_body,
+        [
+            "new_task->thread == nullptr || new_task->pagemap == nullptr || new_task->entry == 0",
+            'panic_handler("WKI remote compute: cannot publish receiver child recovery ownership")',
+            'destroy_unpublished_remote_process(OWNER, new_task, nullptr, "wki-exec-construction")',
+            'destroy_unpublished_remote_process(OWNER, new_task, nullptr, "wki-exec-interpreter")',
+        ],
+        "receiver construction failure ownership",
+    )
+    if "release_unpublished_process(" in exec_body:
+        fail("exec_elf_buffer must return with the receiver child owner slot intact")
+
+    work_body = function_body(source, "handle_task_submit_work")
+    require_order(
+        work_body,
+        "exec_elf_buffer(elf_buffer, binary_len, elf_buffer_shared)",
+        "g_running_remote_tasks.push_back(rt)",
+        "receiver child ownership must cover output and prepublication monitor setup",
+    )
+    require_order(
+        work_body,
+        "bool const POSTED = ker::mod::sched::post_task_balanced(new_task)",
+        "release_unpublished_process(current_task, new_task)",
+        "receiver may release child recovery ownership only after scheduler publication",
+    )
+    require_tokens(
+        work_body,
+        [
+            "POSTED && !ker::mod::sched::task::release_unpublished_process(current_task, new_task)",
+            "destroy_unpublished_remote_process(current_task, new_task,",
+        ],
+        "receiver publication and failure ownership split",
+    )
 
 
 def test_receiver_vfs_ref_submit_uses_bounded_worker_pool() -> None:
@@ -897,25 +1548,19 @@ def test_receiver_vfs_ref_submit_uses_bounded_worker_pool() -> None:
     )
 
     destroy_process_body = function_body(source, "destroy_unpublished_remote_process")
+    require_order(
+        destroy_process_body,
+        "destroy_owned_unpublished_process(owner, task)",
+        "delete output",
+        "remote output may be released only after child fd teardown is complete",
+    )
     require_tokens(
         destroy_process_body,
         [
-            "loader::debug::unregister_process(task->pid)",
-            "loader::debug::remove_gdb_debug_info(task->pid)",
-            "close_proxy_fd_table(task)",
-            "task::release_lazy_vmem_ranges(*task)",
-            "release_loaded_elf_buffer(task->elf_buffer, task->is_elf_buffer_shared)",
-            "task->thread->tls_phys_ptr = 0",
-            "task->thread->stack_phys_ptr = 0",
-            "threading::destroy_thread(task->thread)",
-            "delete reinterpret_cast<ker::mod::cpu::PerCpu*>(task->context.syscall_scratch_area)",
-            "virt::destroy_user_space(task->pagemap, task->pid, task->name, reason)",
-            "virt::release_pagemap(task->pagemap)",
-            "delete[] task->name",
-            "task->context.syscall_kernel_stack - ker::mod::mm::KERNEL_STACK_SIZE",
-            "delete output",
+            'dbg::log("[WKI] Retiring unpublished remote process',
+            'panic_handler("WKI remote compute: lost unpublished-process teardown ownership")',
         ],
-        "expired unpublished remote-process cleanup",
+        "receiver child teardown ownership enforcement",
     )
     for reason in [
         "wki-submit-parse",
@@ -928,7 +1573,7 @@ def test_receiver_vfs_ref_submit_uses_bounded_worker_pool() -> None:
     ]:
         require_tokens(
             work_body,
-            [f'destroy_unpublished_remote_process(new_task,'],
+            ["destroy_unpublished_remote_process(current_task, new_task,"],
             f"{reason} rejection uses complete unpublished-process cleanup",
         )
         if reason not in work_body:
@@ -1064,10 +1709,10 @@ def test_receiver_vfs_ref_submit_uses_bounded_worker_pool() -> None:
         wki,
         [
             "class PeerLifecycleTryLease",
-            "message_uses_compute_lifecycle(msg)",
-            "compute_lifecycle.try_acquire(hdr->src_node)",
-            "message_uses_compute_lifecycle(RO_MSG)",
-            "!compute_lifecycle.owns(hdr->src_node)",
+            "message_uses_rx_peer_lifecycle(msg, payload, PAYLOAD_LEN)",
+            "peer_lifecycle.try_acquire(hdr->src_node)",
+            "message_uses_rx_peer_lifecycle(RO_MSG, ch->reorder_head->data, ch->reorder_head->len)",
+            "!peer_lifecycle.owns(hdr->src_node)",
         ],
         "TASK message admission serialized with peer cleanup",
     )
@@ -1081,7 +1726,7 @@ def test_receiver_vfs_ref_submit_uses_bounded_worker_pool() -> None:
         fail("deferred COMPLETE/CANCEL admission must not stall behind a task-context lifecycle holder")
     require_order(
         function_body(wki, "wki_rx"),
-        "message_uses_compute_lifecycle(RO_MSG)",
+        "message_uses_rx_peer_lifecycle(RO_MSG, ch->reorder_head->data, ch->reorder_head->len)",
         "WkiReorderEntry* ro = ch->reorder_head",
         "reordered TASK admission must precede consuming the buffered frame",
     )
@@ -1157,7 +1802,7 @@ def test_receiver_vfs_ref_submit_uses_bounded_worker_pool() -> None:
         [
             "completed_output = submitted->pending_proxy_output",
             "submitted->pending_proxy_output = nullptr",
-            "finalize_proxy_task(task, completed_exit_status, completed_output, completed_output_len",
+            "finalize_proxy_task(completed_proxy_ref, completed_exit_status, completed_output, completed_output_len",
             "delete[] completed_output",
         ],
         "proxy-block handoff consumes owned early output",
@@ -1166,12 +1811,19 @@ def test_receiver_vfs_ref_submit_uses_bounded_worker_pool() -> None:
     require_tokens(
         spawn_body,
         [
+            "if (proxy_ready && !st->active)",
             "completed_output = st->pending_proxy_output",
             "st->pending_proxy_output = nullptr",
-            "finalize_proxy_task(task, completed_exit_status, completed_output, completed_output_len, tid)",
+            "finalize_proxy_task(completed_proxy_ref, completed_exit_status, completed_output, completed_output_len, tid)",
             "delete[] completed_output",
         ],
         "spawn-side immediate completion consumes owned early output",
+    )
+    require_order(
+        spawn_body,
+        "st->proxy_ready = proxy_ready",
+        "if (proxy_ready && !st->active)",
+        "spawn-side completion may finalize only an already parked proxy",
     )
 
     token = "wki_remote_compute_selftest_submit_worker_count_is_bounded"
@@ -1210,12 +1862,137 @@ def test_receiver_vfs_ref_submit_uses_bounded_worker_pool() -> None:
     require_tokens(ktest, ["SubmitCancelIsSessionScoped", cancel_token], "session-scoped cancel KTEST coverage")
 
 
+def test_remote_proxy_signals_never_make_the_local_frame_runnable() -> None:
+    source = REMOTE_COMPUTE_CPP.read_text()
+    scheduler = SCHEDULER_CPP.read_text()
+
+    forward_body = function_body(source, "wki_proxy_task_forward_signal")
+    require_tokens(
+        forward_body,
+        [
+            "signum <= 0",
+            "ker::mod::sched::task::Task::MAX_SIGNALS",
+            "return wki_task_cancel(PROXY_TID, signum)",
+        ],
+        "all valid proxy signals must be owned by the remote task",
+    )
+    if "signum != WKI_SIGINT_NUM" in forward_body:
+        fail("proxy signal forwarding must not fall back to local execution for non-INT/KILL/TERM signals")
+
+    reschedule_body = function_body(scheduler, "reschedule_task_for_cpu")
+    require_order(
+        reschedule_body,
+        "if (task->wki_proxy_task_id != 0)",
+        "// Remove from whatever queue the task is in.",
+        "proxy park guard must precede every runqueue removal/publication",
+    )
+    require_tokens(
+        function_body(scheduler, "event_wake_can_rebalance_process"),
+        ["task->wki_proxy_task_id == 0", "WaitChannelKind::WKI_EXECVE_PROXY"],
+        "event wakes must exclude both fresh and execve proxy representations",
+    )
+
+
+def test_submitted_proxy_rows_hold_task_lifetime_until_finalization() -> None:
+    source = REMOTE_COMPUTE_CPP.read_text()
+    header = REMOTE_COMPUTE_HPP.read_text()
+
+    require_tokens(
+        header,
+        [
+            "A non-null slot owns exactly one Task lifetime reference",
+            "~SubmittedTask()",
+            "reset_local_task_ref()",
+            "o.local_task = nullptr",
+            "task->try_acquire_lifetime_ref()",
+            "auto take_local_task_ref()",
+            "task->release()",
+        ],
+        "SubmittedTask local proxy lifetime ownership",
+    )
+    if re.search(r"(?:\.|->)local_task\s*=(?!=)", source):
+        fail("remote-compute code must mutate SubmittedTask::local_task only through its ownership helpers")
+
+    require_order(
+        function_body(source, "consume_submitted_task_result_locked"),
+        "task->reset_local_task_ref()",
+        "request_submitted_task_reclaim_locked(task)",
+        "ordinary result cleanup must drop the proxy task ref before recycling",
+    )
+
+    complete_body = function_body(source, "handle_task_complete")
+    require_order(
+        complete_body,
+        "task->take_local_task_ref()",
+        "finalize_proxy_task(proxy",
+        "TASK_COMPLETE must transfer the row ref before out-of-lock finalization",
+    )
+    require_order(
+        complete_body,
+        "finalize_proxy_task(proxy",
+        "proxy->release()",
+        "TASK_COMPLETE must retain the proxy through finalization and logging",
+    )
+
+    peer_cleanup = function_body(source, "fail_submitted_tasks_for_peer")
+    require_order(
+        peer_cleanup,
+        "t.take_local_task_ref()",
+        "finalize_proxy_task(proxy",
+        "peer cleanup must transfer each proxy ref into its finalizer batch",
+    )
+    require_order(
+        peer_cleanup,
+        'ker::mod::dbg::log("[WKI] Proxy task cleanup',
+        "proxy->release()",
+        "peer cleanup must keep each proxy alive through its last diagnostic access",
+    )
+
+    blocked = function_body(source, "wki_proxy_task_blocked")
+    require_order(
+        blocked,
+        "submitted->take_local_task_ref()",
+        "finalize_proxy_task(completed_proxy_ref",
+        "early completion must transfer the row ref to the blocking task finalizer",
+    )
+    require_order(
+        blocked,
+        "finalize_proxy_task(completed_proxy_ref",
+        "completed_proxy_ref->release()",
+        "early completion must release only after finalization and reclamation request",
+    )
+
+    exit_cleanup = function_body(source, "wki_remote_compute_cleanup_for_task")
+    require_tokens(
+        exit_cleanup,
+        [
+            "submitted.result_owner_task != exiting_task && submitted.local_task != exiting_task",
+            "consume_submitted_task_result_locked(&submitted)",
+        ],
+        "task exit must retire both direct handles and published proxy rows",
+    )
+
+    require_tokens(
+        function_body(source, "wki_remote_compute_selftest_submitted_slots_reclaim_safely"),
+        [
+            "proxy.ref_count.load(std::memory_order_acquire) == 2",
+            "proxy.ref_count.load(std::memory_order_acquire) == 1",
+            "proxy_lifetime_ref_held",
+            "proxy_lifetime_ref_released",
+        ],
+        "submitted-slot KTEST must observe the exact row-owned proxy reference",
+    )
+
+
 def main() -> None:
     test_peer_cleanup_marks_all_targeted_submits_terminal_failure()
     test_proxy_wait_completion_respects_waitpid_publish_fence()
     test_task_wait_consumes_completed_submitted_row()
     test_task_wait_completion_slot_is_single_owner()
     test_submitted_task_slots_are_indexed_and_reclaimed()
+    test_task_exit_retires_remote_compute_wait_owners()
+    test_submit_send_failure_keeps_stack_waiter_exit_discoverable()
+    test_proxy_waiting_publication_is_transactional()
     test_remote_load_procfs_uses_locked_snapshot()
     test_load_report_uses_cpu_accounting_and_shared_local_cache()
     test_receiver_path_localization_bounds_suffix_scan()
@@ -1224,7 +2001,10 @@ def main() -> None:
     test_shared_elf_cache_preserves_inflight_load_markers()
     test_remote_stdio_capture_is_write_only_and_non_tty()
     test_submitted_vfs_policy_is_active_during_elf_construction()
+    test_receiver_child_owner_spans_interpreter_output_and_publication()
     test_receiver_vfs_ref_submit_uses_bounded_worker_pool()
+    test_remote_proxy_signals_never_make_the_local_frame_runnable()
+    test_submitted_proxy_rows_hold_task_lifetime_until_finalization()
     print("WKI remote compute source invariants hold")
 
 

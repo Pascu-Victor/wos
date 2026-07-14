@@ -7,6 +7,7 @@
 #include <net/wki/blk_ring.hpp>
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
+#include <platform/sys/mutex.hpp>
 #include <platform/sys/spinlock.hpp>
 
 namespace ker::net::wki {
@@ -27,11 +28,28 @@ constexpr uint32_t WKI_DEV_PROXY_MAX_BATCH = 32;            // max SQEs per batc
 struct ProxyBlockState {
     std::atomic<bool> active{false};
     std::atomic<bool> fenced{false};  // peer is fenced - ops should block and wait for reconnection
+    mod::sys::Mutex io_lock;          // exclusive lifetime + RDMA/message state admission
     uint64_t fence_time_us = 0;       // timestamp when fenced (for timeout-based teardown)
     uint16_t owner_node = WKI_NODE_INVALID;
     uint16_t assigned_channel = 0;
+    WkiChannelIdentity assigned_channel_identity = {};
     uint32_t resource_id = 0;
+    uint64_t resource_generation = 0;
     uint16_t max_op_size = 0;
+    // Once the bdev is published, external holders may retain bdev/private_data
+    // indefinitely. Published state is therefore retired in place, never erased.
+    bool ever_published = false;
+    bool epoch_reset_pending = false;
+    bool cleanup_in_progress = false;
+    bool resume_pending = false;
+    bool resume_in_progress = false;
+    // Same-boot reconnect must receive an ACK for the old exact detach before
+    // replacing binding_attach_cookie. Protected by the proxy registry lock.
+    bool resume_after_detach = false;
+    bool resume_detach_confirmed = false;
+    WkiWaitEntry* epoch_op_waiter_to_wake = nullptr;
+    WkiWaitEntry* epoch_attach_waiter_to_wake = nullptr;
+    ProxyBlockState* epoch_wake_next = nullptr;
 
     // Synchronous blocking for DEV_OP_RESP
     std::atomic<bool> op_pending{false};
@@ -50,7 +68,26 @@ struct ProxyBlockState {
     uint16_t attach_max_op_size = 0;
     bool attach_read_only = false;
     uint8_t attach_expected_cookie = 0;
+    uint8_t binding_attach_cookie = 0;
+    bool attach_expect_incarnation = false;
+    ResourceIncarnationToken attach_expected_incarnation = {};
+    ResourceIncarnationToken binding_incarnation = {};
+    uint32_t binding_peer_boot_epoch = 0;
     WkiWaitEntry* attach_wait_entry = nullptr;  // V2 I-4: async wait for DEV_ATTACH_ACK
+
+    // Keep the server idempotence tuple reserved until its exact DEV_DETACH is
+    // ACKed or a new peer boot epoch proves it obsolete. Protected by the
+    // proxy registry lock; the intrusive links avoid teardown allocation.
+    bool detach_pending = false;
+    bool detach_retry_in_progress = false;
+    uint16_t detach_owner_node = WKI_NODE_INVALID;
+    uint32_t detach_resource_id = 0;
+    uint8_t detach_attach_cookie = 0;
+    ResourceIncarnationToken detach_incarnation = {};
+    uint32_t detach_peer_boot_epoch = 0;
+    WkiReliableTxToken detach_tx_token = {};
+    ProxyBlockState* detach_prev = nullptr;
+    ProxyBlockState* detach_next = nullptr;
 
     // RDMA block ring state (Phase 3: shared memory SQ/CQ for block I/O)
     bool rdma_attached = false;
@@ -107,7 +144,8 @@ void wki_dev_proxy_init();
 // Attach to a remote block device. Sends DEV_ATTACH_REQ and blocks until ACK.
 // On success, registers a proxy BlockDevice and returns a pointer to it.
 // On failure, returns nullptr.
-auto wki_dev_proxy_attach_block(uint16_t owner_node, uint32_t resource_id, const char* local_name) -> dev::BlockDevice*;
+auto wki_dev_proxy_attach_block(uint16_t owner_node, uint32_t resource_id, uint64_t expected_resource_generation,
+                                const ResourceIncarnationToken& expected_owner_incarnation, const char* local_name) -> dev::BlockDevice*;
 
 // Detach a proxy block device. Sends DEV_DETACH to the owner.
 void wki_dev_proxy_detach_block(dev::BlockDevice* proxy_bdev);
@@ -122,6 +160,17 @@ void wki_dev_proxy_suspend_for_peer(uint16_t node_id);
 // on the FENCED -> RECONNECTING -> CONNECTED path.
 void wki_dev_proxy_resume_for_peer(uint16_t node_id);
 
+// Requeue exact active/fenced proxies after discovery revives the same BLOCK
+// observation. The caller owns peer-level scheduling and timer notification.
+auto wki_dev_proxy_reactivate_resource_observation(uint16_t owner_node, uint32_t resource_id, uint64_t resource_generation,
+                                                   const ResourceIncarnationToken& owner_incarnation) -> bool;
+
+// Connected-channel epoch reset split: the RX-side marker is bounded and
+// nonblocking; task context later either rebinds the retained published bdev
+// (channel-only reset) or retires it (owner boot changed).
+void wki_dev_proxy_mark_epoch_reset(uint16_t node_id);
+void wki_dev_proxy_cleanup_epoch_reset_for_peer(uint16_t node_id, bool retire_proxy, bool owner_reboot_proven);
+
 // Hard-detach all proxies for a peer (final teardown after fence timeout).
 // Unregisters block devices and unmounts dependent filesystems.
 void wki_dev_proxy_detach_all_for_peer(uint16_t node_id);
@@ -129,6 +178,9 @@ void wki_dev_proxy_detach_all_for_peer(uint16_t node_id);
 // Periodic check: tear down proxies that have been fenced longer than
 // WKI_DEV_PROXY_FENCE_WAIT_US.  Called from wki_peer_timer_tick().
 void wki_dev_proxy_fence_timeout_tick(uint64_t now_us);
+
+// Retry a bounded, rotating batch of detach frames from task context.
+void wki_dev_proxy_process_pending_detaches();
 
 // Block range descriptor for batch I/O operations
 struct BlockRange {
@@ -169,7 +221,7 @@ auto wki_dev_proxy_selftest_rdma_sq_wait_stops_on_fence() -> bool;
 namespace detail {
 
 void handle_dev_attach_ack(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len);
-void handle_dev_op_resp(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len);
+void handle_dev_op_resp(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len, const WkiChannelIdentity& rx_channel_identity);
 
 }  // namespace detail
 

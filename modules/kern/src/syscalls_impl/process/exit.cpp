@@ -494,6 +494,16 @@ namespace {
         }
     }
 
+    // Retire direct-submit pointers before destroying a child whose creator
+    // was fatally interrupted inside remote placement. Full Task teardown can
+    // close files and block, so all of this remains in the ACTIVE exit phase.
+    ker::net::wki::wki_remote_compute_cleanup_for_task(current_task);
+    static_cast<void>(sched_task::destroy_unpublished_process(sched_task::take_unpublished_process(current_task)));
+
+    // Child teardown and ordinary descriptor close may themselves have used
+    // WKI. Quiesce the complete task-owned wait/VFS surface before EXITING.
+    ker::net::wki::wki_wait_cleanup_for_task(current_task);
+
     // From this point forward the task must not block or return to userspace:
     // user address-space teardown, waiter notification, and final GC handoff all
     // assume it has left the ordinary ACTIVE scheduling domain.
@@ -587,10 +597,6 @@ namespace {
     // They will be cleaned up by jumpToNextTask when it moves the task to expiredTasks,
     // and eventually by a garbage collection mechanism.
 
-    // Unlink any WKI wait entries belonging to this task so the timer scan
-    // doesn't dereference freed stack memory after this task's stack is reclaimed.
-    ker::net::wki::wki_wait_cleanup_for_task(current_task);
-
     // Remove any futex waiter node still owned by this task. Otherwise a later
     // futex_wake() can target a DEAD task and keep stale 64-byte wait nodes alive.
     ker::syscall::futex::futex_wait_cleanup_for_task(current_task);
@@ -625,7 +631,8 @@ namespace {
 
 void exit_current_if_process_exit_requested() {
     auto* task = ker::mod::sched::get_current_task();
-    if (!task_alive_for_group_exit_request(task) || !task->process_exit_requested.load(std::memory_order_acquire)) {
+    if (!task_alive_for_group_exit_request(task) || task->unpublished_teardown_in_progress.load(std::memory_order_acquire) ||
+        !task->process_exit_requested.load(std::memory_order_acquire)) {
         return;
     }
 

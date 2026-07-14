@@ -218,6 +218,15 @@ struct WkiPeer {
     // task-context timer worker to terminalize work bound to that retired
     // generation.
     std::atomic<bool> compute_reset_cleanup_pending{false};
+    std::atomic<bool> vfs_reset_rebind_pending{false};
+    std::atomic<bool> block_resume_pending{false};
+    // A boot-epoch change invalidates remote discovery.  A channel-only epoch
+    // may reuse the still-live resource observation and rebind it locally.
+    std::atomic<bool> vfs_reset_invalidate_discovery{false};
+    // Only a transition between two known nonzero boot epochs proves that old
+    // remote bindings cannot survive. Kept separate from discovery invalidation
+    // so an unknown-to-known observation still tears down fail-closed.
+    std::atomic<bool> vfs_reset_owner_reboot_proven{false};
 
     // HELLO retry
     uint64_t hello_sent_time = 0;
@@ -335,6 +344,31 @@ struct WkiChannel {
     bool tx_rt_entry_in_use = false;  // true while inline entry is in the retransmit queue
 
     ker::mod::sys::Spinlock lock;
+};
+
+// Immutable identity of one allocation of a reusable channel-pool slot.
+// Capture this while the pool and channel locks still protect publication;
+// consumers must not recover identity later from the reusable raw pointer.
+struct WkiChannelIdentity {
+    WkiChannel* channel = nullptr;
+    uint16_t peer_node_id = WKI_NODE_INVALID;
+    uint16_t channel_id = 0;
+    uint32_t generation = 0;
+};
+
+// Immutable receipt for one recoverably published reliable frame.  The
+// channel identity prevents a recycled pool slot or a reset sequence space
+// from being mistaken for acknowledgement of the original frame.
+struct WkiReliableTxToken {
+    WkiChannelIdentity channel_identity = {};
+    uint32_t sequence = 0;
+};
+
+enum class WkiReliableTxStatus : uint8_t {
+    INVALID = 0,
+    PENDING = 1,
+    ACKED = 2,
+    RETIRED = 3,
 };
 
 constexpr size_t WKI_CHANNEL_DIAG_MAX = 256;
@@ -467,10 +501,26 @@ void wki_peer_lifecycle_release(WkiPeer* peer);
 // Send a message on a specific channel (handles reliability, credits, routing)
 auto wki_send(uint16_t dst_node, uint16_t channel_id, MsgType msg_type, const void* payload, uint16_t payload_len) -> int;
 
+// Task-context reliable send that serializes token capture with peer/channel
+// reset. WKI_OK means the frame is recoverably enqueued; callers must poll the
+// returned token to distinguish acknowledgement from channel retirement.
+auto wki_send_tracked(uint16_t dst_node, uint16_t channel_id, MsgType msg_type, const void* payload, uint16_t payload_len,
+                      WkiReliableTxToken* token_out) -> int;
+
+// Inspect a tracked reliable send without allocating or waiting. A structurally
+// valid token becomes RETIRED, never ACKED, when its exact channel allocation is
+// reset or reused before cumulative acknowledgement reaches its sequence.
+auto wki_reliable_tx_status(const WkiReliableTxToken& token) -> WkiReliableTxStatus;
+
 // Send only if a stable pool slot still names the exact resource-channel
 // generation captured by deferred compute work.
 auto wki_send_on_channel_generation(uint16_t dst_node, WkiChannel* expected_channel, uint32_t expected_generation, MsgType msg_type,
                                     const void* payload, uint16_t payload_len) -> int;
+
+// Send only if the exact dynamic-channel allocation captured by the caller is
+// still live. Unlike wki_send(), this never allocates or falls through to a
+// replacement channel that happens to reuse the same numeric ID.
+auto wki_send_on_channel_identity(const WkiChannelIdentity& identity, MsgType msg_type, const void* payload, uint16_t payload_len) -> int;
 
 // Send a raw frame (bypasses reliability - used for HELLO, HEARTBEAT)
 auto wki_send_raw(uint16_t dst_node, MsgType msg_type, const void* payload, uint16_t payload_len, uint8_t flags = 0) -> int;
@@ -492,16 +542,20 @@ auto wki_channel_get(uint16_t peer_node, uint16_t channel_id) -> WkiChannel*;
 // Find an existing channel to a peer without allocating a pool slot.
 auto wki_channel_lookup(uint16_t peer_node, uint16_t channel_id) -> WkiChannel*;
 
-// Allocate a dynamic channel to a peer
-auto wki_channel_alloc(uint16_t peer_node, PriorityClass priority) -> WkiChannel*;
+// Allocate a dynamic channel to a peer. When requested, identity_out is
+// populated atomically with publication of the reusable pool slot.
+auto wki_channel_alloc(uint16_t peer_node, PriorityClass priority, WkiChannelIdentity* identity_out = nullptr) -> WkiChannel*;
 
 // Reserve a specific dynamic channel ID to a peer. Returns nullptr if the
 // requested channel is already in use.
-auto wki_channel_reserve(uint16_t peer_node, uint16_t channel_id, PriorityClass priority) -> WkiChannel*;
+auto wki_channel_reserve(uint16_t peer_node, uint16_t channel_id, PriorityClass priority, WkiChannelIdentity* identity_out = nullptr)
+    -> WkiChannel*;
 
 // Close and free a channel
 void wki_channel_close(WkiChannel* ch);
 auto wki_channel_close_generation(WkiChannel* ch, uint16_t expected_peer, uint16_t expected_channel_id, uint32_t expected_generation)
+    -> bool;
+auto wki_channel_generation_is_live(WkiChannel* ch, uint16_t expected_peer, uint16_t expected_channel_id, uint32_t expected_generation)
     -> bool;
 
 // Close all channels to a specific peer (used during fencing)
@@ -520,6 +574,15 @@ void wki_timer_tick(uint64_t now_us);
 // Worker for blocking WKI deferred tasks such as auto-mounts and remote device
 // attaches. Timer ticks only wake this worker so peer liveness remains timely.
 void wki_deferred_work_thread_start();
+
+// Wake the task-context WKI worker. Safe for RX-side producers; the worker
+// coalesces notifications and the periodic timer supplies retry pacing.
+void wki_deferred_work_notify();
+
+// Snapshot and validate the remote boot epoch under the peer lock. A missing
+// peer or an as-yet unknown replacement epoch is not proof of invalidation.
+auto wki_peer_remote_boot_epoch_snapshot(uint16_t node_id) -> uint32_t;
+auto wki_peer_remote_boot_epoch_invalidated(uint16_t node_id, uint32_t expected_epoch) -> bool;
 
 // Returns true when channel retransmits/ACKs or async wait deadlines require
 // the WKI timer thread to stay on its fast cadence.
@@ -544,6 +607,7 @@ void wki_spin_yield();
 // deadlines for the single channel the caller is waiting on, avoiding the
 // O(CHANNEL_POOL_SIZE) scan of wki_timer_tick().
 void wki_spin_yield_channel(WkiChannel* ch);
+void wki_spin_yield_channel_identity(const WkiChannelIdentity& identity);
 
 // CRC32 checksum (used for WKI header + payload integrity)
 auto wki_crc32(const void* data, size_t len) -> uint32_t;
@@ -612,6 +676,12 @@ void wki_wake_op(WkiWaitEntry* entry, int result);
 // owning object lock, publish side-band response data, then wake outside.
 auto wki_claim_op(WkiWaitEntry* entry) -> bool;
 void wki_finish_claimed_op(WkiWaitEntry* entry, int result);
+// Allow a preempted completion claimant to reach its final DONE publication.
+// Eligible ACTIVE process/daemon task contexts yield; non-schedulable contexts
+// use a CPU pause. Blocking RX resource teardown is deferred before reaching
+// this helper.
+void wki_wait_quiescence_point();
+void wki_quiesce_claimed_op(WkiWaitEntry* entry);
 
 // Scan pending waits for timeouts. Called from timer thread.
 void wki_wait_timeout_scan(uint64_t now_us);

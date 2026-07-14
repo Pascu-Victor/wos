@@ -1,6 +1,7 @@
 #include "cdc_ether.hpp"
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <net/netdevice.hpp>
@@ -339,7 +340,7 @@ void cdc_detach(UsbDevice* dev) {
         cdc.active = false;
         cdc.netdev.state = 0;
         cdc.netdev.remotable = nullptr;
-        cdc.netdev.wki_rx_forward = nullptr;
+        cdc.netdev.wki_rx_forward.store(nullptr, std::memory_order_release);
         ker::net::netdev_unregister(&cdc.netdev);
 
         // TODO: Add xHCI stop/drop-endpoint or disable-slot support before freeing

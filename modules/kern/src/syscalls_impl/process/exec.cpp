@@ -30,6 +30,7 @@
 #include <platform/sys/context_switch.hpp>
 #include <platform/sys/signal.hpp>
 #include <string_view>
+#include <util/hcf.hpp>
 #include <util/smallvec.hpp>
 #include <utility>
 #include <vfs/file.hpp>
@@ -215,6 +216,7 @@ auto fixed_slot(std::array<T, N>& values, size_t index) -> T& {
     return values[index];
 }
 
+#ifdef WOS_SELFTEST
 void release_task_fd_table_files(ker::mod::sched::task::Task* task) {
     if (task == nullptr) {
         return;
@@ -225,6 +227,7 @@ void release_task_fd_table_files(ker::mod::sched::task::Task* task) {
         }
     });
 }
+#endif
 
 auto clone_exec_fd_table_checked(ker::mod::sched::task::Task* parent, ker::mod::sched::task::Task* child) -> bool {
     if (parent == nullptr || child == nullptr) {
@@ -1213,6 +1216,12 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
     dbg::log("wos_proc_exec: Creating task for '%s', parent PID: %x", process_name, PARENT_PID);
 #endif
 
+    if (parent_task->owned_unpublished_process.load(std::memory_order_acquire) != nullptr) {
+        dbg::log("wos_proc_exec: parent PID %x already owns an unpublished process", PARENT_PID);
+        delete[] elf_buffer;
+        return 0;
+    }
+
     uint64_t const KERNEL_RSP = allocate_kernel_stack();
     if (KERNEL_RSP == 0) {
         dbg::log("wos_proc_exec: Failed to allocate kernel stack");
@@ -1247,23 +1256,39 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
         return 0;
     }
 
-    if (new_task == nullptr || new_task->thread == nullptr || new_task->pagemap == nullptr) {
-        dbg::log("wos_proc_exec: Failed to create task (OOM during thread/pagemap allocation)");
-
+    if (new_task == nullptr) {
         ker::mod::mm::phys::page_free(reinterpret_cast<void*>(KERNEL_RSP - ker::mod::mm::KERNEL_STACK_SIZE));
-        if (new_task != nullptr) {
-            new_task->context.syscall_kernel_stack = 0;
-        }
-        delete new_task;
-
         delete[] elf_buffer;
         return 0;
     }
+
+    // The constructor deliberately performs no PT_INTERP VFS I/O. Transfer
+    // every caller-owned resource and publish fatal-exit recovery before the
+    // post-construction interpreter stage can enter a voluntary wait.
+    new_task->elf_buffer = elf_buffer;
+    new_task->elf_buffer_size = FILE_SIZE;
+    new_task->is_elf_buffer_shared = false;
+    if (!sched::task::claim_unpublished_process(parent_task, new_task)) {
+        dbg::panic_handler("wos_proc_exec: current task already owns an unpublished process");
+        hcf();
+    }
+    uint64_t const CHILD_PID = new_task->pid;
     auto cleanup_unpublished_task = [&]() {
-        release_task_fd_table_files(new_task);
-        delete new_task;
-        delete[] elf_buffer;
+        if (!sched::task::destroy_owned_unpublished_process(parent_task, new_task)) {
+            dbg::panic_handler("wos_proc_exec: lost unpublished child ownership during teardown");
+            hcf();
+        }
     };
+
+    if (new_task->thread == nullptr || new_task->pagemap == nullptr || new_task->entry == 0) {
+        dbg::log("wos_proc_exec: Failed to create task (OOM or ELF load failure)");
+        cleanup_unpublished_task();
+        return 0;
+    }
+    if (!sched::task::complete_unpublished_process_construction(new_task)) {
+        cleanup_unpublished_task();
+        return 0;
+    }
 
 #ifdef EXEC_DEBUG
     dbg::log("wos_proc_exec: Task constructor completed successfully");
@@ -1323,10 +1348,6 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
         cleanup_unpublished_task();
         return 0;
     }
-
-    new_task->elf_buffer = elf_buffer;
-    new_task->elf_buffer_size = FILE_SIZE;
-    new_task->is_elf_buffer_shared = false;
 
     // Store executable path for /proc/self/exe
     {
@@ -1545,7 +1566,11 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
     };
     auto remote_result = ker::net::wki::wki_try_remote_spawn(new_task, REMOTE_SPAWN);
     if (remote_result == ker::net::wki::WkiRemoteSpawnResult::REMOTE) {
-        return new_task->pid;
+        if (!sched::task::release_unpublished_process(parent_task, new_task)) {
+            dbg::log("wos_proc_exec: remote publication lost child ownership for PID %x", CHILD_PID);
+            return 0;
+        }
+        return CHILD_PID;
     }
     if (remote_result == ker::net::wki::WkiRemoteSpawnResult::FAILED) {
         cleanup_unpublished_task();
@@ -1569,7 +1594,11 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
     dbg::log("wos_proc_exec: Successfully posted task '%s' to CPU %d", process_name, new_task->cpu);
 #endif
 
-    return new_task->pid;
+    if (!sched::task::release_unpublished_process(parent_task, new_task)) {
+        dbg::log("wos_proc_exec: local publication lost child ownership for PID %x", CHILD_PID);
+        return 0;
+    }
+    return CHILD_PID;
 
     // Note: elfBuffer is now owned by the task and will be cleaned up when the task exits
 }
