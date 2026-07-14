@@ -1043,6 +1043,43 @@ def test_task_submit_envelopes_use_bounded_stack_storage() -> None:
     )
 
 
+def test_task_completion_uses_bounded_stack_storage() -> None:
+    source = REMOTE_COMPUTE_CPP.read_text()
+
+    completion = function_body(source, "wki_remote_compute_check_completions")
+    require_tokens(
+        source,
+        ["static_assert(WKI_COMPUTE_RX_PAYLOAD_MAX <= WKI_ETH_MAX_PAYLOAD);"],
+        "bounded TASK_COMPLETE frame",
+    )
+    require_tokens(
+        completion,
+        [
+            "std::min<uint16_t>(info.output->len, WKI_TASK_MAX_OUTPUT)",
+            "std::array<uint8_t, WKI_COMPUTE_RX_PAYLOAD_MAX> buf __attribute__((uninitialized));",
+            "reinterpret_cast<TaskCompletePayload*>(buf.data())",
+            "complete->task_id = info.task_id",
+            "complete->exit_status = info.exit_status",
+            "complete->output_len = OUT_LEN",
+            "complete->reserved = 0",
+            "memcpy(buf.data() + sizeof(TaskCompletePayload), info.output->data.data(), OUT_LEN)",
+            "MsgType::TASK_COMPLETE, buf.data(), MSG_LEN",
+        ],
+        "stack-backed TASK_COMPLETE frame",
+    )
+    require_order(completion, "complete->reserved = 0", "memcpy(buf.data()", "completion header before output")
+    require_order(completion, "memcpy(buf.data()", "MsgType::TASK_COMPLETE, buf.data(), MSG_LEN", "completion build before send")
+    require_order(
+        completion,
+        "MsgType::TASK_COMPLETE, buf.data(), MSG_LEN",
+        "if (SEND_RESULT != WKI_OK)",
+        "completion send before requeue",
+    )
+    for forbidden in ["new (std::nothrow) uint8_t[msg_len]", "delete[] buf"]:
+        if forbidden in completion:
+            fail(f"TASK_COMPLETE must not heap-own its bounded envelope: found {forbidden}")
+
+
 def test_proxy_waiting_publication_is_transactional() -> None:
     scheduler_source = SCHEDULER_CPP.read_text()
     scheduler_header = SCHEDULER_HPP.read_text()
@@ -1760,7 +1797,8 @@ def test_receiver_vfs_ref_submit_uses_bounded_worker_pool() -> None:
             "if (rt.discard_completion)",
             "retry_pending_task_accepts()",
             "rt.accept_pending && !rt.discard_completion",
-            "wki_send_on_channel_generation(info.submitter_node, info.submit_rx_channel, info.submit_rx_channel_generation",
+            "wki_send_on_channel_generation(",
+            "info.submitter_node, info.submit_rx_channel, info.submit_rx_channel_generation, MsgType::TASK_COMPLETE",
             "g_pending_task_completions.push_back(info)",
             "delete rt.output",
             "rt.task->release()",
@@ -2135,6 +2173,7 @@ def main() -> None:
     test_task_exit_retires_remote_compute_wait_owners()
     test_submit_send_failure_keeps_stack_waiter_exit_discoverable()
     test_task_submit_envelopes_use_bounded_stack_storage()
+    test_task_completion_uses_bounded_stack_storage()
     test_proxy_waiting_publication_is_transactional()
     test_remote_load_procfs_uses_locked_snapshot()
     test_load_report_uses_cpu_accounting_and_shared_local_cache()

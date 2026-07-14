@@ -68,6 +68,7 @@ constexpr size_t WKI_COMPUTE_RX_WORKER_MAX = 4;
 constexpr size_t WKI_COMPUTE_RX_QUEUE_MAX = WKI_CREDITS_RESOURCE * WKI_COMPUTE_RX_WORKER_MAX;
 constexpr size_t WKI_COMPUTE_RX_PAYLOAD_MAX = sizeof(TaskCompletePayload) + WKI_TASK_MAX_OUTPUT;
 static_assert(WKI_COMPUTE_RX_QUEUE_MAX <= UINT16_MAX);
+static_assert(WKI_COMPUTE_RX_PAYLOAD_MAX <= WKI_ETH_MAX_PAYLOAD);
 constexpr size_t WKI_SUBMITTED_TASK_INDEX_BUCKETS = 1024;
 static_assert((WKI_SUBMITTED_TASK_INDEX_BUCKETS & (WKI_SUBMITTED_TASK_INDEX_BUCKETS - 1)) == 0);
 constexpr uint64_t WKI_TASK_SUBMIT_VFS_TIMEOUT_US = 60'000'000;  // Remote binary fetch + launch.
@@ -4669,27 +4670,26 @@ void wki_remote_compute_check_completions() {
             continue;
         }
 
-        int send_result = WKI_ERR_NO_MEM;
         // D19: Build TASK_COMPLETE with captured output
-        uint16_t const OUT_LEN = (info.output != nullptr) ? info.output->len : static_cast<uint16_t>(0);
-        auto msg_len = static_cast<uint16_t>(sizeof(TaskCompletePayload) + OUT_LEN);
-        auto* buf = new (std::nothrow) uint8_t[msg_len];
-        if (buf != nullptr) {
-            auto* complete = reinterpret_cast<TaskCompletePayload*>(buf);
-            complete->task_id = info.task_id;
-            complete->exit_status = info.exit_status;
-            complete->output_len = OUT_LEN;
+        uint16_t const OUT_LEN =
+            (info.output != nullptr) ? std::min<uint16_t>(info.output->len, WKI_TASK_MAX_OUTPUT) : static_cast<uint16_t>(0);
+        auto const MSG_LEN = static_cast<uint16_t>(sizeof(TaskCompletePayload) + OUT_LEN);
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init): only the exact initialized prefix is transmitted.
+        std::array<uint8_t, WKI_COMPUTE_RX_PAYLOAD_MAX> buf __attribute__((uninitialized));
+        auto* complete = reinterpret_cast<TaskCompletePayload*>(buf.data());
+        complete->task_id = info.task_id;
+        complete->exit_status = info.exit_status;
+        complete->output_len = OUT_LEN;
+        complete->reserved = 0;
 
-            if (OUT_LEN > 0 && info.output != nullptr) {
-                memcpy(buf + sizeof(TaskCompletePayload), info.output->data.data(), OUT_LEN);
-            }
-
-            send_result = wki_send_on_channel_generation(info.submitter_node, info.submit_rx_channel, info.submit_rx_channel_generation,
-                                                         MsgType::TASK_COMPLETE, buf, msg_len);
-            delete[] buf;
+        if (OUT_LEN > 0 && info.output != nullptr) {
+            memcpy(buf.data() + sizeof(TaskCompletePayload), info.output->data.data(), OUT_LEN);
         }
 
-        if (send_result != WKI_OK) {
+        int const SEND_RESULT = wki_send_on_channel_generation(
+            info.submitter_node, info.submit_rx_channel, info.submit_rx_channel_generation, MsgType::TASK_COMPLETE, buf.data(), MSG_LEN);
+
+        if (SEND_RESULT != WKI_OK) {
             s_compute_lock.lock();
             session_current = compute_submit_session_is_current_locked(SESSION);
             if (session_current) {
@@ -4702,7 +4702,7 @@ void wki_remote_compute_check_completions() {
             }
 #if WKI_DEBUG
             ker::mod::dbg::log("[WKI] TASK_COMPLETE send deferred: task_id=%u pid=0x%lx submitter=0x%04x status=%d", info.task_id,
-                               info.local_pid, info.submitter_node, send_result);
+                               info.local_pid, info.submitter_node, SEND_RESULT);
 #endif
             continue;
         }
