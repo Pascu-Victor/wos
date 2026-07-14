@@ -143,6 +143,8 @@ KTEST(VFS, FcntlSetflPreservesOpenPolicyFlags) { KEXPECT_TRUE(ker::vfs::vfs_self
 
 KTEST(VFS, StreamCacheReadEligibility) { KEXPECT_TRUE(ker::vfs::vfs_selftest_stream_cache_read_eligibility()); }
 
+KTEST(VFS, RemoteReadBounceMatchesBulkWindow) { KEXPECT_TRUE(ker::vfs::vfs_selftest_remote_read_bounce_window()); }
+
 KTEST(VFS, StreamCacheLocalDetachedTtl) { KEXPECT_TRUE(ker::vfs::vfs_selftest_stream_cache_local_detached_ttl()); }
 
 KTEST(VFS, FdAllocationCapsCloexecRange) { KEXPECT_TRUE(ker::vfs::vfs_selftest_fd_allocation_caps_cloexec_range()); }

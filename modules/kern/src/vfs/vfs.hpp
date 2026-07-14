@@ -331,6 +331,7 @@ auto vfs_selftest_procfs_fd_link_probe_gate() -> bool;
 auto vfs_selftest_packed_dirent_records() -> bool;
 auto vfs_selftest_fcntl_setfl_preserves_open_policy_flags() -> bool;
 auto vfs_selftest_stream_cache_read_eligibility() -> bool;
+auto vfs_selftest_remote_read_bounce_window() -> bool;
 auto vfs_selftest_stream_cache_local_detached_ttl() -> bool;
 auto vfs_selftest_fd_allocation_caps_cloexec_range() -> bool;
 #endif

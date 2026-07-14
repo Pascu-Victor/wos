@@ -106,7 +106,7 @@ def test_vfs_fd_access_modes_gate_io_before_backend_dispatch() -> None:
         "vfs_read access gating",
     )
 
-    write_file_body = function_body(source, "vfs_write_file")
+    write_file_body = function_body(source, "vfs_write_file_direct")
     require_order(
         write_file_body,
         [
@@ -115,7 +115,7 @@ def test_vfs_fd_access_modes_gate_io_before_backend_dispatch() -> None:
             "if ((f->fops == nullptr) || (f->fops->vfs_write == nullptr))",
             "f->fops->vfs_write(f, buf, count, static_cast<size_t>(f->pos))",
         ],
-        "vfs_write_file access gating",
+        "vfs_write_file_direct access gating",
     )
 
     for name in ("vfs_pread", "vfs_pwrite"):
@@ -231,6 +231,65 @@ def test_local_xfs_reads_bypass_stream_cache() -> None:
         fail("stream-cache eligibility selftest is missing expected assertions: " + ", ".join(missing))
 
 
+def test_remote_read_bounce_matches_bulk_window_with_fallback() -> None:
+    source = CORE_CPP.read_text()
+    required = [
+        "constexpr size_t USER_IO_BOUNCE_MAX_CHUNK = size_t{1} * 1024 * 1024;",
+        "constexpr size_t USER_IO_REMOTE_READ_BOUNCE_MAX_CHUNK = size_t{2} * 1024 * 1024;",
+        "static_assert(USER_IO_REMOTE_READ_BOUNCE_MAX_CHUNK == ker::net::wki::VFS_RDMA_BULK_SIZE);",
+    ]
+    missing = [token for token in required if token not in source]
+    if missing:
+        fail("remote user-I/O bounce constants are missing: " + ", ".join(missing))
+
+    sizing = function_body(source, "user_io_read_bounce_size_for")
+    require_order(
+        sizing,
+        [
+            "file->fs_type == FSType::REMOTE",
+            "USER_IO_REMOTE_READ_BOUNCE_MAX_CHUNK",
+            "USER_IO_BOUNCE_MAX_CHUNK",
+            "return std::min(count, MAX_CHUNK)",
+        ],
+        "remote user-I/O bounce sizing",
+    )
+
+    allocation = function_body(source, "vfs_read_user_bounced")
+    require_order(
+        allocation,
+        [
+            "size_t bounce_size = user_io_read_bounce_size_for(file, count)",
+            "new (std::nothrow) uint8_t[bounce_size]",
+            "if (heap_bounce == nullptr && bounce_size > USER_IO_BOUNCE_MAX_CHUNK)",
+            "bounce_size = std::min(count, USER_IO_BOUNCE_MAX_CHUNK)",
+            "size_t const BOUNCE_CAPACITY = heap_bounce != nullptr ? bounce_size : stack_bounce.size()",
+        ],
+        "remote user-I/O allocation fallback",
+    )
+
+    for name in ("vfs_write_user_bounced", "vfs_pwrite_user_bounced"):
+        body = function_body(source, name)
+        require_order(
+            body,
+            [
+                "size_t const BOUNCE_SIZE = std::min(count, USER_IO_BOUNCE_MAX_CHUNK)",
+                "new (std::nothrow) uint8_t[BOUNCE_SIZE]",
+                "std::min(count - total, BOUNCE_CAPACITY)",
+            ],
+            name,
+        )
+
+    selftest = function_body(source, "vfs_selftest_remote_read_bounce_window")
+    for token in [
+        "local.fs_type = FSType::XFS",
+        "remote.fs_type = FSType::REMOTE",
+        "user_io_read_bounce_size_for(&local, LARGE_IO) == USER_IO_BOUNCE_MAX_CHUNK",
+        "user_io_read_bounce_size_for(&remote, LARGE_IO) == USER_IO_REMOTE_READ_BOUNCE_MAX_CHUNK",
+    ]:
+        if token not in selftest:
+            fail(f"remote user-I/O bounce selftest is missing {token!r}")
+
+
 def test_loader_path_trace_is_compile_time_disabled_by_default() -> None:
     source = CORE_CPP.read_text()
     required = [
@@ -256,6 +315,7 @@ def main() -> None:
     test_positional_io_rejects_negative_offsets_before_unsigned_conversion()
     test_ktest_covers_pread_contract()
     test_local_xfs_reads_bypass_stream_cache()
+    test_remote_read_bounce_matches_bulk_window_with_fallback()
     test_loader_path_trace_is_compile_time_disabled_by_default()
     print("VFS pread source invariants hold")
 

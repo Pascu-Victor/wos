@@ -122,6 +122,10 @@ constexpr size_t PIPE_DEFAULT_CAPACITY = 256UL * 1024UL;
 constexpr size_t PIPE_DIRECT_MAX_CAPACITY = 256UL * 1024UL;
 constexpr size_t USER_IO_BOUNCE_STACK_CHUNK = size_t{16} * 1024;
 constexpr size_t USER_IO_BOUNCE_MAX_CHUNK = size_t{1} * 1024 * 1024;
+// Remote reads can consume one complete bulk-RDMA window. Writes intentionally
+// retain the generic cap so write-behind can fall back through smaller classes.
+constexpr size_t USER_IO_REMOTE_READ_BOUNCE_MAX_CHUNK = size_t{2} * 1024 * 1024;
+static_assert(USER_IO_REMOTE_READ_BOUNCE_MAX_CHUNK == ker::net::wki::VFS_RDMA_BULK_SIZE);
 constexpr uint64_t ADVISORY_RANGE_EOF = UINT64_MAX;
 // CMake/Ninja tree scans touch enough distinct paths that small metadata caches
 // thrash mostly on set conflicts. Keep this static and bounded: 131072 entries
@@ -7982,6 +7986,12 @@ auto vfs_file_can_write(const File* file) -> bool {
     return ACCMODE == O_WRONLY_MODE || ACCMODE == O_RDWR_MODE;
 }
 
+auto user_io_read_bounce_size_for(const File* file, size_t count) -> size_t {
+    size_t const MAX_CHUNK =
+        file != nullptr && file->fs_type == FSType::REMOTE ? USER_IO_REMOTE_READ_BOUNCE_MAX_CHUNK : USER_IO_BOUNCE_MAX_CHUNK;
+    return std::min(count, MAX_CHUNK);
+}
+
 auto vfs_user_read_bounce_applies(const File* file, void* buf, size_t count, const ker::mod::sched::task::Task* task) -> bool {
     if (file == nullptr || buf == nullptr || count == 0) {
         return false;
@@ -7995,13 +8005,19 @@ auto vfs_user_read_bounce_applies(const File* file, void* buf, size_t count, con
 auto vfs_read_user_bounced(ker::mod::sched::task::Task& task, File* file, void* user_buf, size_t count, size_t offset, size_t* actual_size)
     -> ssize_t {
     std::array<uint8_t, USER_IO_BOUNCE_STACK_CHUNK> stack_bounce{};
-    size_t const BOUNCE_SIZE = std::min(count, USER_IO_BOUNCE_MAX_CHUNK);
+    size_t bounce_size = user_io_read_bounce_size_for(file, count);
     std::unique_ptr<uint8_t[]> heap_bounce{};
-    if (BOUNCE_SIZE > stack_bounce.size()) {
-        heap_bounce.reset(new (std::nothrow) uint8_t[BOUNCE_SIZE]);
+    if (bounce_size > stack_bounce.size()) {
+        heap_bounce.reset(new (std::nothrow) uint8_t[bounce_size]);
+        if (heap_bounce == nullptr && bounce_size > USER_IO_BOUNCE_MAX_CHUNK) {
+            // Preserve the old-sized heap attempt before falling all the way
+            // back to the bounded stack buffer under memory pressure.
+            bounce_size = std::min(count, USER_IO_BOUNCE_MAX_CHUNK);
+            heap_bounce.reset(new (std::nothrow) uint8_t[bounce_size]);
+        }
     }
     uint8_t* const BOUNCE_BUFFER = heap_bounce != nullptr ? heap_bounce.get() : stack_bounce.data();
-    size_t const BOUNCE_CAPACITY = heap_bounce != nullptr ? BOUNCE_SIZE : stack_bounce.size();
+    size_t const BOUNCE_CAPACITY = heap_bounce != nullptr ? bounce_size : stack_bounce.size();
     auto const USER_BASE = reinterpret_cast<uint64_t>(user_buf);
     size_t total = 0;
 
@@ -18179,6 +18195,22 @@ auto vfs_selftest_stream_cache_read_eligibility() -> bool {
     bool const DEVFS_REJECTED = !stream_cache_read_eligible(&devfs_read);
     bool const REMOTE_ALLOWED = stream_cache_read_eligible(&remote_read);
     return LOCAL_REGULAR_REJECTED && WRITABLE_REJECTED && NO_CACHE_REJECTED && ANONYMOUS_REJECTED && DEVFS_REJECTED && REMOTE_ALLOWED;
+}
+
+auto vfs_selftest_remote_read_bounce_window() -> bool {
+    File local{};
+    local.fs_type = FSType::XFS;
+
+    File remote{};
+    remote.fs_type = FSType::REMOTE;
+
+    constexpr size_t SMALL_IO = 32U * 1024U;
+    constexpr size_t LARGE_IO = 4U * 1024U * 1024U;
+    return user_io_read_bounce_size_for(&local, SMALL_IO) == SMALL_IO &&
+           user_io_read_bounce_size_for(&local, LARGE_IO) == USER_IO_BOUNCE_MAX_CHUNK &&
+           user_io_read_bounce_size_for(nullptr, LARGE_IO) == USER_IO_BOUNCE_MAX_CHUNK &&
+           user_io_read_bounce_size_for(&remote, USER_IO_REMOTE_READ_BOUNCE_MAX_CHUNK) == USER_IO_REMOTE_READ_BOUNCE_MAX_CHUNK &&
+           user_io_read_bounce_size_for(&remote, LARGE_IO) == USER_IO_REMOTE_READ_BOUNCE_MAX_CHUNK;
 }
 
 auto vfs_selftest_stream_cache_local_detached_ttl() -> bool {
