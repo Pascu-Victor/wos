@@ -368,7 +368,7 @@ def test_write_only_pipe_proxy_omits_receive_ring() -> None:
         "bool drop = false",
         "should_defer_ipc_dev_op(req.op_id, resource_id, hdr->src_node, &drop)",
         "if (drop)",
-        "handle_ipc_dev_op_req_inline(hdr, payload, payload_len)",
+        "handle_ipc_dev_op_req_inline(hdr, payload, payload_len, nullptr)",
     ]
     missing = [token for token in dispatch_required if token not in dispatch_body]
     if missing:
@@ -559,7 +559,7 @@ def test_peer_cleanup_drains_deferred_dev_op_work() -> None:
     require_order(
         worker_body,
         "bool const FENCED = ipc_dev_op_work_is_fenced_locked(work)",
-        "handle_ipc_dev_op_req_inline(&work->hdr, work->payload, work->payload_len)",
+        "handle_ipc_dev_op_req_inline(&work->hdr, work->payload, work->payload_len, &work)",
         "worker stale work check",
     )
     if "free_ipc_dev_op_work(work);" not in worker_body[worker_body.find("bool const FENCED") :]:
@@ -644,6 +644,97 @@ def test_large_deferred_dev_op_payloads_are_coallocated() -> None:
         fail("deferred IPC DEV_OP enqueue must not allocate the descriptor and large payload separately")
 
 
+def test_large_deferred_dev_op_payloads_transfer_to_export_backlog() -> None:
+    remote_ipc = REMOTE_IPC_CPP.read_text()
+    for snippet in [
+        "IpcDevOpWork* dev_op_owner = nullptr",
+        "static_assert(sizeof(PendingPipeChunk) == 24)",
+        "WKI_IPC_DEV_OP_TRANSFER_MIN_DATA",
+        "len < WKI_IPC_DEV_OP_TRANSFER_MIN_DATA",
+        "len <= work->payload_len - OFFSET",
+        "queue_export_pipe_write_data(uint32_t resource_id, const uint8_t* data, uint16_t len, IpcDevOpWork** work_owner)",
+    ]:
+        if snippet not in remote_ipc:
+            fail(f"large deferred IPC backlog ownership is missing {snippet!r}")
+
+    release_body = function_body(remote_ipc, "release_pending_pipe_chunk")
+    for snippet in [
+        "auto* const OWNER = chunk.dev_op_owner",
+        "const auto* const DATA = chunk.data",
+        "chunk = {}",
+        "free_ipc_dev_op_work(OWNER)",
+        "delete[] DATA",
+    ]:
+        if snippet not in release_body:
+            fail(f"pipe chunk release must handle both backing kinds: {snippet!r}")
+    if "delete[] chunk.data" in remote_ipc:
+        fail("pipe chunks must be released through the ownership-aware helper")
+    for name in [
+        "free_pending_pipe_delivery",
+        "free_export_pipe_write_backlog",
+        "export_pipe_write_flush_thread_loop",
+        "drain_pending_pipe_data",
+    ]:
+        body = function_body(remote_ipc, name)
+        if "release_pending_pipe_chunk(chunk)" not in body:
+            fail(f"{name} must release chunks through the ownership-aware helper")
+
+    publish_body = function_body(remote_ipc, "publish_export_pipe_write_chunk_locked")
+    for snippet in [
+        ".dev_op_owner = transfer_owner",
+        "*work_owner = nullptr",
+    ]:
+        if snippet not in publish_body:
+            fail(f"export backlog owner publication is missing {snippet!r}")
+    require_order(publish_body, "backlog->chunks.push_back", "*work_owner = nullptr", "export backlog owner publication")
+
+    queue_body = function_body(remote_ipc, "queue_export_pipe_write_data")
+    for snippet in [
+        "ipc_dev_op_work_can_back_pipe_chunk(work_owner != nullptr ? *work_owner : nullptr, data, len)",
+        "if (TRANSFER_OWNER == nullptr)",
+        "new (std::nothrow) uint8_t[len]",
+        "publish_export_pipe_write_chunk_locked(backlog",
+    ]:
+        if snippet not in queue_body:
+            fail(f"export backlog ownership transfer is missing {snippet!r}")
+    publish_pos = queue_body.find("publish_export_pipe_write_chunk_locked(backlog")
+    unlock_pos = queue_body.find("s_ipc_lock.unlock_irqrestore(IRQF)", publish_pos)
+    if publish_pos < 0 or unlock_pos < publish_pos:
+        fail("export backlog owner publication must complete before releasing s_ipc_lock")
+
+    worker_body = function_body(remote_ipc, "ipc_dev_op_worker_thread_fn")
+    worker_call = "handle_ipc_dev_op_req_inline(&work->hdr, work->payload, work->payload_len, &work)"
+    worker_call_pos = worker_body.find(worker_call)
+    if worker_call_pos < 0:
+        fail("deferred IPC worker must offer its work item to the inline handler")
+    if "work->" in worker_body[worker_call_pos + len(worker_call) :]:
+        fail("deferred IPC worker must not dereference work after ownership can transfer")
+    dispatch_body = function_body(remote_ipc, "handle_ipc_dev_op_req")
+    if "handle_ipc_dev_op_req_inline(hdr, payload, payload_len, nullptr)" not in dispatch_body:
+        fail("immediate IPC RX dispatch must not transfer non-owned payload storage")
+    handler_body = function_body(remote_ipc, "handle_ipc_dev_op_req_inline")
+    queue_marker = "queue_export_pipe_write_data("
+    queue_positions = []
+    search_from = 0
+    while True:
+        position = handler_body.find(queue_marker, search_from)
+        if position < 0:
+            break
+        queue_positions.append(position)
+        search_from = position + len(queue_marker)
+    if len(queue_positions) != 2:
+        fail("both PTY-tail and normal export backlog paths must offer deferred work ownership")
+    for position in queue_positions:
+        line_end = handler_body.find("\n", position)
+        return_pos = handler_body.find("return;", line_end)
+        if line_end < 0 or return_pos < 0:
+            fail("export backlog queue calls must return on their current control-flow branch")
+        suffix = handler_body[line_end:return_pos]
+        forbidden = [token for token in ["hdr->", "payload", "op_data"] if token in suffix]
+        if forbidden:
+            fail("handler dereferences transferred storage after queue publication: " + ", ".join(forbidden))
+
+
 def test_futex_dev_op_preserves_broadcast_wake_count() -> None:
     remote_ipc = REMOTE_IPC_CPP.read_text()
     for snippet in [
@@ -676,6 +767,7 @@ def test_ipc_selftests_are_declared_and_registered() -> None:
     required = [
         "wki_ipc_selftest_cleanup_for_peer_drains_deferred_dev_ops",
         "wki_ipc_selftest_large_dev_op_work_coallocates_payload",
+        "wki_ipc_selftest_large_dev_op_work_backs_pipe_chunk",
         "wki_ipc_selftest_poll_wake_drains_over_capacity",
         "wki_ipc_selftest_inactive_proxy_poll_is_terminal",
         "wki_ipc_selftest_epoll_close_releases_lookup_ref",
@@ -708,6 +800,7 @@ def main() -> None:
     test_dev_op_response_cookies_fence_stale_waiters()
     test_peer_cleanup_drains_deferred_dev_op_work()
     test_large_deferred_dev_op_payloads_are_coallocated()
+    test_large_deferred_dev_op_payloads_transfer_to_export_backlog()
     test_futex_dev_op_preserves_broadcast_wake_count()
     test_ipc_send_retry_backpressure_sleeps_without_yield_livelock()
     test_ipc_selftests_are_declared_and_registered()

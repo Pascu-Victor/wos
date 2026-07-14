@@ -340,11 +340,16 @@ ker::vfs::FileOperations g_ipc_selftest_file_ops = {
 };
 #endif
 
+struct IpcDevOpWork;
+void free_ipc_dev_op_work(IpcDevOpWork* work);
+
 struct PendingPipeChunk {
-    uint8_t* data = nullptr;
+    const uint8_t* data = nullptr;
     uint16_t len = 0;
     uint16_t offset = 0;
+    IpcDevOpWork* dev_op_owner = nullptr;
 };
+static_assert(sizeof(PendingPipeChunk) == 24);
 
 struct PendingPipeDelivery {
     uint16_t home_node = WKI_NODE_INVALID;
@@ -415,9 +420,42 @@ constexpr size_t WKI_IPC_PROXY_CLOSE_MSG_MAX = sizeof(DevOpReqPayload) + sizeof(
 constexpr size_t WKI_IPC_PROXY_CLOSE_CLEANUP_BATCH = WKI_IPC_MAX_EXPORTS * 8;
 constexpr size_t WKI_IPC_PIPE_DATA_HEADER_SIZE = sizeof(DevOpReqPayload) + sizeof(uint32_t);
 constexpr size_t WKI_IPC_PIPE_DATA_MAX_CHUNK = WKI_ETH_MAX_PAYLOAD - WKI_IPC_PIPE_DATA_HEADER_SIZE;
+// Use the conservative data span implied by the payload coallocation floor.
+// This keeps the retained work and the standalone tail copy in the same
+// allocator order without coupling WKI to the allocator's private header size.
+constexpr uint16_t WKI_IPC_DEV_OP_TRANSFER_MIN_DATA =
+    static_cast<uint16_t>(WKI_IPC_DEV_OP_COALLOC_MIN_PAYLOAD - WKI_IPC_PIPE_DATA_HEADER_SIZE);
 constexpr size_t WKI_IPC_EXPORT_PIPE_CAPACITY = 4UL * 1024UL * 1024UL;
 static_assert(WKI_IPC_PIPE_DATA_HEADER_SIZE < WKI_ETH_MAX_PAYLOAD);
 static_assert(WKI_IPC_PIPE_DATA_MAX_CHUNK <= UINT16_MAX);
+static_assert(WKI_IPC_PIPE_DATA_HEADER_SIZE < WKI_IPC_DEV_OP_COALLOC_MIN_PAYLOAD);
+static_assert(WKI_IPC_DEV_OP_TRANSFER_MIN_DATA > 0);
+
+auto ipc_dev_op_work_can_back_pipe_chunk(const IpcDevOpWork* work, const uint8_t* data, uint16_t len) -> bool {
+    if (work == nullptr || data == nullptr || !work->payload_coallocated || work->payload != reinterpret_cast<const uint8_t*>(work + 1) ||
+        len < WKI_IPC_DEV_OP_TRANSFER_MIN_DATA) {
+        return false;
+    }
+
+    auto const PAYLOAD_BEGIN = reinterpret_cast<uintptr_t>(work->payload);
+    auto const DATA_BEGIN = reinterpret_cast<uintptr_t>(data);
+    if (DATA_BEGIN < PAYLOAD_BEGIN) {
+        return false;
+    }
+    size_t const OFFSET = DATA_BEGIN - PAYLOAD_BEGIN;
+    return OFFSET <= work->payload_len && len <= work->payload_len - OFFSET;
+}
+
+void release_pending_pipe_chunk(PendingPipeChunk& chunk) {
+    auto* const OWNER = chunk.dev_op_owner;
+    const auto* const DATA = chunk.data;
+    chunk = {};
+    if (OWNER != nullptr) {
+        free_ipc_dev_op_work(OWNER);
+        return;
+    }
+    delete[] DATA;
+}
 
 #ifndef WKI_IPC_PIPE_RDMA_DOORBELL
 #define WKI_IPC_PIPE_RDMA_DOORBELL 0  // NOLINT(cppcoreguidelines-macro-usage)
@@ -500,7 +538,7 @@ std::deque<PendingProxyPipeClose*> g_pending_proxy_pipe_closes;
 ker::mod::sched::task::Task* g_proxy_pipe_close_tx_task = nullptr;
 
 auto register_poll_write_waiter(ker::vfs::File* file, bool* ready_now) -> bool;
-void handle_ipc_dev_op_req_inline(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len);
+void handle_ipc_dev_op_req_inline(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len, IpcDevOpWork** work_owner);
 auto stop_pipe_pump_locked(WkiIpcExport* exp) -> ker::mod::sched::task::Task*;
 void wake_pipe_pump(ker::mod::sched::task::Task* task);
 auto export_has_pipe_pump_slot_locked(const WkiIpcExport* exp) -> bool;
@@ -789,7 +827,7 @@ void free_pending_pipe_delivery(PendingPipeDelivery* pending) {
         return;
     }
     for (auto& chunk : pending->chunks) {
-        delete[] chunk.data;
+        release_pending_pipe_chunk(chunk);
     }
 #ifdef WOS_SELFTEST
     g_ipc_pending_delivery_selftest_frees.fetch_add(1, std::memory_order_relaxed);
@@ -868,7 +906,7 @@ void free_export_pipe_write_backlog(ExportPipeWriteBacklog* backlog) {
     }
 
     for (auto& chunk : backlog->chunks) {
-        delete[] chunk.data;
+        release_pending_pipe_chunk(chunk);
     }
     delete backlog;
 }
@@ -910,16 +948,32 @@ void note_export_pipe_data_received_locked(WkiIpcExport* exp, uint16_t len) {
     }
 }
 
-auto queue_export_pipe_write_data(uint32_t resource_id, const uint8_t* data, uint16_t len) -> bool {
+void publish_export_pipe_write_chunk_locked(ExportPipeWriteBacklog* backlog, const uint8_t* data, uint16_t len,
+                                            IpcDevOpWork* transfer_owner, IpcDevOpWork** work_owner) {
+    backlog->chunks.push_back(PendingPipeChunk{.data = data, .len = len, .dev_op_owner = transfer_owner});
+    if (transfer_owner != nullptr) {
+        // Publication is the ownership handoff. The flush worker may release
+        // the work as soon as s_ipc_lock is dropped, so the deferred worker
+        // must stop dereferencing its header and payload after this call.
+        *work_owner = nullptr;
+    }
+}
+
+auto queue_export_pipe_write_data(uint32_t resource_id, const uint8_t* data, uint16_t len, IpcDevOpWork** work_owner) -> bool {
     if (data == nullptr || len == 0) {
         return true;
     }
 
-    auto* copy = new (std::nothrow) uint8_t[len];
-    if (copy == nullptr) {
-        return false;
+    IpcDevOpWork* const TRANSFER_OWNER =
+        ipc_dev_op_work_can_back_pipe_chunk(work_owner != nullptr ? *work_owner : nullptr, data, len) ? *work_owner : nullptr;
+    uint8_t* copy = nullptr;
+    if (TRANSFER_OWNER == nullptr) {
+        copy = new (std::nothrow) uint8_t[len];
+        if (copy == nullptr) {
+            return false;
+        }
+        std::memcpy(copy, data, len);
     }
-    std::memcpy(copy, data, len);
 
     uint64_t const IRQF = s_ipc_lock.lock_irqsave();
     auto* exp = find_export_by_resource_id(resource_id);
@@ -936,7 +990,7 @@ auto queue_export_pipe_write_data(uint32_t resource_id, const uint8_t* data, uin
         return false;
     }
 
-    backlog->chunks.push_back(PendingPipeChunk{.data = copy, .len = len});
+    publish_export_pipe_write_chunk_locked(backlog, TRANSFER_OWNER != nullptr ? data : copy, len, TRANSFER_OWNER, work_owner);
     backlog->buffered_bytes += len;
     note_export_pipe_data_received_locked(exp, len);
     queue_export_pipe_write_flush_locked(backlog);
@@ -1129,7 +1183,7 @@ auto mark_export_pipe_write_closed(uint32_t resource_id, uint64_t expected_bytes
                 chunk.offset = static_cast<uint16_t>(chunk.offset + ADVANCED);
                 backlog->buffered_bytes -= ADVANCED;
                 if (chunk.offset == chunk.len) {
-                    delete[] chunk.data;
+                    release_pending_pipe_chunk(chunk);
                     backlog->chunks.pop_front();
                 }
             }
@@ -1271,7 +1325,7 @@ auto drain_pending_pipe_data(uint16_t home_node, uint32_t resource_id, void* buf
     pending->buffered_bytes -= static_cast<uint32_t>(TO_COPY);
 
     if (chunk.offset == chunk.len) {
-        delete[] chunk.data;
+        release_pending_pipe_chunk(chunk);
         pending->chunks.pop_front();
     }
 
@@ -3043,7 +3097,9 @@ auto enqueue_ipc_dev_op_work(const WkiHeader* hdr, const uint8_t* payload, uint1
         auto const CORRELATION = static_cast<uint32_t>(work->hdr.seq_num & UINT16_MAX);
         IpcPerfTrace trace(ker::mod::perf::WkiPerfIpcOp::DEV_OP_HANDLE, work->hdr.src_node, work->hdr.channel_id, WOS_PERF_CALLSITE(), 0,
                            CORRELATION);
-        handle_ipc_dev_op_req_inline(&work->hdr, work->payload, work->payload_len);
+        // The handler may publish the coallocated payload and clear work.
+        // Keep all post-handler bookkeeping independent of the work object.
+        handle_ipc_dev_op_req_inline(&work->hdr, work->payload, work->payload_len, &work);
         trace.finish(0);
         free_ipc_dev_op_work(work);
     }
@@ -4436,6 +4492,49 @@ auto wki_ipc_selftest_large_dev_op_work_coallocates_payload() -> int {
     return VALID ? 0 : -EIO;
 }
 
+auto wki_ipc_selftest_large_dev_op_work_backs_pipe_chunk() -> int {
+    constexpr uint16_t FULL_PAYLOAD_LEN = static_cast<uint16_t>(WKI_IPC_PIPE_DATA_HEADER_SIZE + WKI_IPC_PIPE_DATA_MAX_CHUNK);
+    auto* work = alloc_ipc_dev_op_work(FULL_PAYLOAD_LEN);
+    auto* split_work = alloc_ipc_dev_op_work(WKI_IPC_DEV_OP_TRANSFER_MIN_DATA);
+    if (work == nullptr || split_work == nullptr) {
+        free_ipc_dev_op_work(work);
+        free_ipc_dev_op_work(split_work);
+        return -ENOMEM;
+    }
+
+    auto* const DATA = work->payload + WKI_IPC_PIPE_DATA_HEADER_SIZE;
+    constexpr uint16_t BELOW_TRANSFER_FLOOR = WKI_IPC_DEV_OP_TRANSFER_MIN_DATA - 1;
+    size_t const OVERRUN_OFFSET = work->payload_len - WKI_IPC_DEV_OP_TRANSFER_MIN_DATA + 1;
+    bool const ELIGIBILITY_VALID =
+        ipc_dev_op_work_can_back_pipe_chunk(work, DATA, static_cast<uint16_t>(WKI_IPC_PIPE_DATA_MAX_CHUNK)) &&
+        ipc_dev_op_work_can_back_pipe_chunk(work, DATA, 8192) &&
+        ipc_dev_op_work_can_back_pipe_chunk(work, DATA, WKI_IPC_DEV_OP_TRANSFER_MIN_DATA) &&
+        !ipc_dev_op_work_can_back_pipe_chunk(work, DATA, BELOW_TRANSFER_FLOOR) &&
+        !ipc_dev_op_work_can_back_pipe_chunk(split_work, split_work->payload, WKI_IPC_DEV_OP_TRANSFER_MIN_DATA) &&
+        !ipc_dev_op_work_can_back_pipe_chunk(work, work->payload + OVERRUN_OFFSET, WKI_IPC_DEV_OP_TRANSFER_MIN_DATA);
+    free_ipc_dev_op_work(split_work);
+
+    auto* const ORIGINAL_WORK = work;
+    bool const FAILURE_RETAINS_OWNER =
+        !queue_export_pipe_write_data(UINT32_MAX, DATA, static_cast<uint16_t>(WKI_IPC_PIPE_DATA_MAX_CHUNK), &work) && work == ORIGINAL_WORK;
+
+    ExportPipeWriteBacklog backlog{};
+    publish_export_pipe_write_chunk_locked(&backlog, DATA, static_cast<uint16_t>(WKI_IPC_PIPE_DATA_MAX_CHUNK), work, &work);
+    bool const PUBLICATION_VALID = work == nullptr && backlog.chunks.size() == 1 && backlog.chunks.front().data == DATA &&
+                                   backlog.chunks.front().len == WKI_IPC_PIPE_DATA_MAX_CHUNK &&
+                                   backlog.chunks.front().dev_op_owner == ORIGINAL_WORK;
+
+    int const FREES_BEFORE = g_ipc_dev_op_work_selftest_frees.load(std::memory_order_acquire);
+    auto& chunk = backlog.chunks.front();
+    release_pending_pipe_chunk(chunk);
+    bool const CHUNK_RESET = chunk.data == nullptr && chunk.len == 0 && chunk.offset == 0 && chunk.dev_op_owner == nullptr;
+    backlog.chunks.pop_front();
+    int const FREES_AFTER = g_ipc_dev_op_work_selftest_frees.load(std::memory_order_acquire);
+
+    bool const RELEASE_VALID = work == nullptr && FREES_AFTER - FREES_BEFORE == 1 && CHUNK_RESET && backlog.chunks.empty();
+    return ELIGIBILITY_VALID && FAILURE_RETAINS_OWNER && PUBLICATION_VALID && RELEASE_VALID ? 0 : -EIO;
+}
+
 auto wki_ipc_selftest_poll_wake_drains_over_capacity() -> int {
     ProxyIpcState proxy{};
     constexpr size_t WAITER_COUNT = WKI_IPC_MAX_POLL_WAKE_WAITERS + 5;
@@ -5474,7 +5573,7 @@ void handle_ipc_attach_ack(const WkiHeader* /*hdr*/, const uint8_t* /*payload*/,
 
 namespace {
 
-void handle_ipc_dev_op_req_inline(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len) {
+void handle_ipc_dev_op_req_inline(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len, IpcDevOpWork** work_owner) {
     if (payload_len < sizeof(DevOpReqPayload)) {
         return;
     }
@@ -5694,14 +5793,14 @@ void handle_ipc_dev_op_req_inline(const WkiHeader* hdr, const uint8_t* payload, 
                 pipe_trace.finish(0, OP_DATA_LEN);
                 return;
             }
-            if (!queue_export_pipe_write_data(resource_id, op_data + written, static_cast<uint16_t>(OP_DATA_LEN - written))) {
+            if (!queue_export_pipe_write_data(resource_id, op_data + written, static_cast<uint16_t>(OP_DATA_LEN - written), work_owner)) {
                 ker::mod::dbg::log("[WKI] IPC PTY export backlog queue failed: resource_id=%u written=%u total=%u", resource_id, written,
                                    OP_DATA_LEN);
             }
             pipe_trace.finish(0, OP_DATA_LEN);
             return;
         }
-        if (!queue_export_pipe_write_data(resource_id, op_data, OP_DATA_LEN)) {
+        if (!queue_export_pipe_write_data(resource_id, op_data, OP_DATA_LEN, work_owner)) {
             ker::mod::dbg::log("[WKI] IPC export pipe backlog queue failed: resource_id=%u len=%u", resource_id, OP_DATA_LEN);
         }
         pipe_trace.finish(0, OP_DATA_LEN);
@@ -6183,7 +6282,7 @@ void handle_ipc_dev_op_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
         return;
     }
 
-    handle_ipc_dev_op_req_inline(hdr, payload, payload_len);
+    handle_ipc_dev_op_req_inline(hdr, payload, payload_len, nullptr);
 }
 
 void handle_ipc_dev_op_resp(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len) {

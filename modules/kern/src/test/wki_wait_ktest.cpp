@@ -189,6 +189,10 @@ KTEST(WkiIpcDevOpWork, LargePayloadUsesCoallocatedStorage) {
     KEXPECT_EQ(ker::net::wki::wki_ipc_selftest_large_dev_op_work_coallocates_payload(), 0);
 }
 
+KTEST(WkiIpcDevOpWork, LargePayloadBacksExportPipeChunk) {
+    KEXPECT_EQ(ker::net::wki::wki_ipc_selftest_large_dev_op_work_backs_pipe_chunk(), 0);
+}
+
 KTEST(WkiIpcPollWake, WakeDrainsMoreThanOneFixedBatch) { KEXPECT_EQ(ker::net::wki::wki_ipc_selftest_poll_wake_drains_over_capacity(), 0); }
 
 KTEST(WkiIpcPoll, InactiveProxyReportsTerminalReadiness) {

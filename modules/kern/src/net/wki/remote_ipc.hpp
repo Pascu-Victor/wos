@@ -349,6 +349,7 @@ auto wki_ipc_selftest_export_compaction_frees() -> int;
 auto wki_ipc_selftest_cleanup_for_peer_drains_over_capacity() -> int;
 auto wki_ipc_selftest_cleanup_for_peer_drains_deferred_dev_ops() -> int;
 auto wki_ipc_selftest_large_dev_op_work_coallocates_payload() -> int;
+auto wki_ipc_selftest_large_dev_op_work_backs_pipe_chunk() -> int;
 auto wki_ipc_selftest_poll_wake_drains_over_capacity() -> int;
 auto wki_ipc_selftest_inactive_proxy_poll_is_terminal() -> int;
 auto wki_ipc_selftest_pty_proxy_poll_is_bidirectional() -> int;
