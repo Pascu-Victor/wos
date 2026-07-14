@@ -2603,6 +2603,193 @@ def test_create_remove_path_scratch_is_initialized_by_task_resolver() -> None:
             fail(f"{function} resolver scratch flow must not bypass its failure gate")
 
 
+def test_link_path_scratch_is_initialized_by_its_producers() -> None:
+    core = VFS_CORE_CPP.read_text()
+    link = function_body(core, "vfs_link")
+    linkat = function_body(core, "vfs_linkat")
+    raw_resolver = function_body(core, "resolve_task_path_raw")
+    dirfd_resolver = function_body(core, "resolve_dirfd_task_path_raw")
+    dirfd_fast_wrapper = function_body(core, "resolve_dirfd_task_path_raw_with_absolute_local_fast_path")
+    if raw_resolver.strip() != "return resolve_task_path_raw_impl(path, out, outsize, true);":
+        fail("link task resolver wrapper changed; re-audit positive fast-path decline handling")
+    dirfd_direct_fast_header = "if (apply_task_route && task_absolute_local_path_fast_path_allowed(task, pathname, &scan))"
+    dirfd_direct_fast_pos = dirfd_fast_wrapper.find(dirfd_direct_fast_header)
+    if dirfd_direct_fast_pos < 0:
+        fail("linkat direct dirfd path producer is missing")
+    dirfd_direct_fast = block_body_after(dirfd_fast_wrapper, dirfd_direct_fast_header)
+    dirfd_direct_fast_end = dirfd_direct_fast_pos + block_end_after(
+        dirfd_fast_wrapper[dirfd_direct_fast_pos:], dirfd_direct_fast_header
+    )
+    require_order(
+        dirfd_direct_fast,
+        [
+            "if (out == nullptr || outsize == 0)",
+            "return -EINVAL;",
+            "if (scan.path_len + 1 > outsize)",
+            "return -ENAMETOOLONG;",
+            "std::memcpy(out, pathname, scan.path_len + 1);",
+            "if (resolved_len_out != nullptr)",
+            "*resolved_len_out = scan.path_len;",
+            "return 0;",
+        ],
+        "linkat direct dirfd path production",
+    )
+    direct_fast_returns = [" ".join(value.split()) for value in re.findall(r"\breturn\s+([^;]+);", dirfd_direct_fast)]
+    if direct_fast_returns != ["-EINVAL", "-ENAMETOOLONG", "0"]:
+        fail("linkat direct dirfd path producer must only return failure before its copy and success after it")
+
+    dirfd_wrapper_tail = """return resolve_dirfd_task_path_raw(task, dirfd, pathname, out, outsize, apply_task_route, path_requires_directory_out, resolved_len_out,
+                                       nullptr, resolved_hash_out);"""
+    dirfd_wrapper_tail_pos = dirfd_fast_wrapper.find(dirfd_wrapper_tail, dirfd_direct_fast_end)
+    wrapper_returns = [" ".join(value.split()) for value in re.findall(r"\breturn\s+([^;]+);", dirfd_fast_wrapper)]
+    expected_wrapper_returns = [
+        "-EINVAL",
+        "-ENAMETOOLONG",
+        "0",
+        "resolve_dirfd_task_path_raw(task, dirfd, pathname, out, outsize, apply_task_route, path_requires_directory_out, resolved_len_out, nullptr, resolved_hash_out)",
+    ]
+    if (
+        dirfd_wrapper_tail_pos < 0
+        or dirfd_fast_wrapper[dirfd_direct_fast_end:dirfd_wrapper_tail_pos].strip()
+        or dirfd_fast_wrapper[dirfd_wrapper_tail_pos:].strip() != dirfd_wrapper_tail
+        or wrapper_returns != expected_wrapper_returns
+    ):
+        fail("linkat dirfd resolver wrapper must fall through from direct production to the complete raw resolver")
+
+    dirfd_fast_call = """int const FAST_RET = resolve_dirfd_task_path_raw_common_local_fast_path(
+        task, dirfd, pathname, PATH_SCAN, out, outsize, apply_task_route, resolved_len_out, resolved_hash_out, &trusted_dirfd_parent);"""
+    dirfd_fast_success = "if (FAST_RET == 0)"
+    dirfd_fast_failure = "if (FAST_RET < 0)"
+    dirfd_fallback = "bool const needs_canonicalize = PATH_SCAN.needs_canonicalize;"
+    dirfd_fast_call_pos = dirfd_resolver.find(dirfd_fast_call)
+    dirfd_fast_success_pos = dirfd_resolver.find(dirfd_fast_success, dirfd_fast_call_pos + len(dirfd_fast_call))
+    dirfd_fast_failure_pos = dirfd_resolver.find(dirfd_fast_failure, dirfd_fast_success_pos + len(dirfd_fast_success))
+    dirfd_fallback_pos = dirfd_resolver.find(dirfd_fallback, dirfd_fast_failure_pos + len(dirfd_fast_failure))
+    if (
+        dirfd_fast_call_pos < 0
+        or dirfd_fast_success_pos < 0
+        or dirfd_fast_failure_pos < 0
+        or dirfd_fallback_pos < 0
+        or dirfd_resolver[dirfd_fast_call_pos + len(dirfd_fast_call) : dirfd_fast_success_pos].strip()
+        or [" ".join(value.split()) for value in re.findall(r"\breturn\s+([^;]+);", block_body_after(dirfd_resolver[dirfd_fast_success_pos:], dirfd_fast_success))]
+        != ["0"]
+        or dirfd_resolver[
+            dirfd_fast_success_pos + block_end_after(dirfd_resolver[dirfd_fast_success_pos:], dirfd_fast_success) : dirfd_fast_failure_pos
+        ].strip()
+        or block_body_after(dirfd_resolver[dirfd_fast_failure_pos:], dirfd_fast_failure).strip() != "return FAST_RET;"
+        or dirfd_resolver[
+            dirfd_fast_failure_pos + block_end_after(dirfd_resolver[dirfd_fast_failure_pos:], dirfd_fast_failure) : dirfd_fallback_pos
+        ].strip()
+        or dirfd_resolver.count("return FAST_RET;") != 1
+    ):
+        fail("linkat dirfd resolver must absorb a positive fast-path decline before the complete fallback producer")
+
+    link_declarations = {
+        "old_buf": "std::array<char, MAX_PATH_LEN> old_buf __attribute__((uninitialized));",
+        "new_buf": "std::array<char, MAX_PATH_LEN> new_buf __attribute__((uninitialized));",
+    }
+    for scratch, declaration in link_declarations.items():
+        require_only_uninitialized_array(link, scratch, declaration, f"link {scratch} scratch")
+        if (
+            len(re.findall(rf"\b{re.escape(scratch)}\b", link)) != 6
+            or link.count(f"{scratch}.data()") != 3
+            or link.count(f"{scratch}.size()") != 2
+            or f"{scratch}[" in link
+        ):
+            fail(f"link {scratch} scratch has an unexpected producer or consumer")
+
+    old_fast_header = "if (task_absolute_local_path_fast_path_allowed(task, oldpath, nullptr))"
+    new_fast_header = "if (task_absolute_local_path_fast_path_allowed(task, newpath, nullptr))"
+    old_slow_header = "else if (resolve_task_path_raw(oldpath, old_buf.data(), old_buf.size()) < 0)"
+    new_slow_header = "else if (resolve_task_path_raw(newpath, new_buf.data(), new_buf.size()) < 0)"
+    require_order(
+        link,
+        [
+            link_declarations["old_buf"],
+            link_declarations["new_buf"],
+            "auto* task = ker::mod::sched::get_current_task();",
+            old_fast_header,
+            "int const COPY_RET = copy_path_string(oldpath, old_buf.data(), old_buf.size());",
+            old_slow_header,
+            "return -ENAMETOOLONG;",
+            new_fast_header,
+            "int const COPY_RET = copy_path_string(newpath, new_buf.data(), new_buf.size());",
+            new_slow_header,
+            "return -ENAMETOOLONG;",
+            "return vfs_link_resolved_paths(old_buf.data(), new_buf.data());",
+        ],
+        "link scratch producer, failure gate, and consumer ordering",
+    )
+    expected_old_fast = """int const COPY_RET = copy_path_string(oldpath, old_buf.data(), old_buf.size());
+        if (COPY_RET < 0) {
+            return COPY_RET;
+        }"""
+    expected_new_fast = """int const COPY_RET = copy_path_string(newpath, new_buf.data(), new_buf.size());
+        if (COPY_RET < 0) {
+            return COPY_RET;
+        }"""
+    if (
+        block_body_after(link, old_fast_header).strip() != expected_old_fast
+        or block_body_after(link, new_fast_header).strip() != expected_new_fast
+        or block_body_after(link, old_slow_header).strip() != "return -ENAMETOOLONG;"
+        or block_body_after(link, new_slow_header).strip() != "return -ENAMETOOLONG;"
+        or "goto" in link
+    ):
+        fail("link path scratch producer failures must return before the final consumer")
+
+    linkat_declarations = {
+        "old_resolved": "std::array<char, MAX_PATH_LEN> old_resolved __attribute__((uninitialized));",
+        "new_resolved": "std::array<char, MAX_PATH_LEN> new_resolved __attribute__((uninitialized));",
+    }
+    for scratch, declaration in linkat_declarations.items():
+        require_only_uninitialized_array(linkat, scratch, declaration, f"linkat {scratch} scratch")
+        if (
+            len(re.findall(rf"\b{re.escape(scratch)}\b", linkat)) != 4
+            or linkat.count(f"{scratch}.data()") != 2
+            or linkat.count(f"{scratch}.size()") != 1
+            or f"{scratch}[" in linkat
+        ):
+            fail(f"linkat {scratch} scratch has an unexpected producer or consumer")
+
+    old_resolver_call = """int result = resolve_dirfd_task_path_raw_with_absolute_local_fast_path(task, olddirfd, oldpath, old_resolved.data(),
+                                                                           old_resolved.size(), true, nullptr);"""
+    new_resolver_call = """result = resolve_dirfd_task_path_raw_with_absolute_local_fast_path(task, newdirfd, newpath, new_resolved.data(), new_resolved.size(),
+                                                                       true, nullptr);"""
+    result_failure_gate = "if (result < 0)"
+    result_failure = "return result;"
+    require_order(
+        linkat,
+        [
+            linkat_declarations["old_resolved"],
+            linkat_declarations["new_resolved"],
+            old_resolver_call,
+            result_failure_gate,
+            result_failure,
+            new_resolver_call,
+            result_failure_gate,
+            result_failure,
+            "return vfs_link_resolved_paths(old_resolved.data(), new_resolved.data());",
+        ],
+        "linkat scratch producer, failure gate, and consumer ordering",
+    )
+    old_call_pos = linkat.find(old_resolver_call)
+    old_gate_pos = linkat.find(result_failure_gate, old_call_pos + len(old_resolver_call))
+    new_call_pos = linkat.find(new_resolver_call, old_gate_pos + len(result_failure_gate))
+    new_gate_pos = linkat.find(result_failure_gate, new_call_pos + len(new_resolver_call))
+    if (
+        old_call_pos < 0
+        or old_gate_pos < 0
+        or new_call_pos < 0
+        or new_gate_pos < 0
+        or linkat[old_call_pos + len(old_resolver_call) : old_gate_pos].strip()
+        or linkat[new_call_pos + len(new_resolver_call) : new_gate_pos].strip()
+        or block_body_after(linkat[old_gate_pos:], result_failure_gate).strip() != result_failure
+        or block_body_after(linkat[new_gate_pos:], result_failure_gate).strip() != result_failure
+        or "goto" in linkat
+    ):
+        fail("linkat resolver failures must return before consuming either scratch path")
+
+
 if __name__ == "__main__":
     test_dirfd_visible_scratch_is_initialized_by_root_strip()
     test_absolute_visible_scratch_is_initialized_by_dot_clean_producer()
@@ -2618,4 +2805,5 @@ if __name__ == "__main__":
     test_statat_scratch_is_initialized_by_dirfd_resolver()
     test_open_path_scratch_is_initialized_by_its_producers()
     test_create_remove_path_scratch_is_initialized_by_task_resolver()
+    test_link_path_scratch_is_initialized_by_its_producers()
     print("VFS open path scratch invariants hold")

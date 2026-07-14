@@ -19561,8 +19561,11 @@ auto vfs_link(const char* oldpath, const char* newpath) -> int {
         return -EINVAL;
     }
 
-    std::array<char, MAX_PATH_LEN> old_buf;  // NOLINT(cppcoreguidelines-pro-type-member-init)
-    std::array<char, MAX_PATH_LEN> new_buf;  // NOLINT(cppcoreguidelines-pro-type-member-init)
+    // The fast copy and task resolver both initialize complete NUL-terminated paths before success.
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
+    std::array<char, MAX_PATH_LEN> old_buf __attribute__((uninitialized));
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
+    std::array<char, MAX_PATH_LEN> new_buf __attribute__((uninitialized));
     auto* task = ker::mod::sched::get_current_task();
     if (task_absolute_local_path_fast_path_allowed(task, oldpath, nullptr)) {
         int const COPY_RET = copy_path_string(oldpath, old_buf.data(), old_buf.size());
@@ -19598,8 +19601,11 @@ auto vfs_linkat(ker::mod::sched::task::Task* task, int olddirfd, const char* old
         return -EINVAL;
     }
 
-    std::array<char, MAX_PATH_LEN> old_resolved;  // NOLINT(cppcoreguidelines-pro-type-member-init)
-    std::array<char, MAX_PATH_LEN> new_resolved;  // NOLINT(cppcoreguidelines-pro-type-member-init)
+    // The dirfd resolver initializes complete NUL-terminated paths before success.
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
+    std::array<char, MAX_PATH_LEN> old_resolved __attribute__((uninitialized));
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
+    std::array<char, MAX_PATH_LEN> new_resolved __attribute__((uninitialized));
     int result = resolve_dirfd_task_path_raw_with_absolute_local_fast_path(task, olddirfd, oldpath, old_resolved.data(),
                                                                            old_resolved.size(), true, nullptr);
     if (result < 0) {
