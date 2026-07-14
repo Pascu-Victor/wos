@@ -9814,7 +9814,9 @@ auto copy_common_local_dirfd_relative_path(ker::mod::sched::task::Task* task, in
                                                          file_vfs_path_len(base_file), out_hash);
             trusted_dirfd_parent = result == 0 && path_text_is_simple_relative_basename(pathname, scan);
         } else {
-            std::array<char, MAX_PATH_LEN> visible{};
+            // strip_task_root_prefix initializes the complete NUL-terminated string on success.
+            // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
+            std::array<char, MAX_PATH_LEN> visible __attribute__((uninitialized));
             int const STRIP_RET = strip_task_root_prefix(task, base_file->vfs_path, visible.data(), visible.size(), nullptr);
             result = STRIP_RET < 0 ? STRIP_RET : copy_simple_relative_path_from_base(visible.data(), pathname, scan, out, outsize, out_len);
         }
@@ -9931,7 +9933,9 @@ auto resolve_dirfd_task_path_raw(ker::mod::sched::task::Task* task, int dirfd, c
         std::memcpy(out, pathname, PATH_LEN + 1);
         out_len = PATH_LEN;
     } else {
-        std::array<char, MAX_PATH_LEN> visible;  // NOLINT(cppcoreguidelines-pro-type-member-init)
+        // strip_task_root_prefix initializes the complete NUL-terminated string on success.
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
+        std::array<char, MAX_PATH_LEN> visible __attribute__((uninitialized));
         const char* base = nullptr;
         auto* base_file = static_cast<File*>(nullptr);
         size_t known_base_len = UNKNOWN_PATH_LEN;
@@ -10226,6 +10230,9 @@ auto common_local_relative_resolver_fast_path_selftest_impl() -> bool {
 
     constexpr const char* DIR_PATH = "/tmp/ktest_common_local_relative_resolver";
     constexpr const char* FILE_PATH = "/tmp/ktest_common_local_relative_resolver/file";
+    if (copy_path_string(DIR_PATH, rooted_task.root.data(), rooted_task.root.size()) < 0) {
+        return false;
+    }
     vfs_unlink(FILE_PATH);
     vfs_rmdir(DIR_PATH);
     ok = (vfs_mkdir(DIR_PATH, 0755) == 0) && ok;
@@ -10257,6 +10264,24 @@ auto common_local_relative_resolver_fast_path_selftest_impl() -> bool {
         ok = ok && ret == 0 && std::strcmp(resolved.data(), "/tmp/sibling") == 0;
         ok = (vfs_release_fd(&task, DIRFD) == 0) && ok;
     }
+
+    int const ROOTED_DIRFD = vfs_alloc_fd(&rooted_task, dir);
+    ok = ok && ROOTED_DIRFD >= 0;
+    if (ROOTED_DIRFD >= 0) {
+        resolved_len = UNKNOWN_PATH_LEN;
+        ret = resolve_dirfd_task_path_raw_common_local_fast_path(&rooted_task, ROOTED_DIRFD, ".", scan_path_text("."), resolved.data(),
+                                                                 resolved.size(), true, &resolved_len);
+        constexpr const char* FAST_ROOTED_DOT_PATH = "/tmp/ktest_common_local_relative_resolver/";
+        ok = ok && ret == 0 && resolved_len == std::strlen(FAST_ROOTED_DOT_PATH) && resolved.at(resolved_len) == '\0' &&
+             std::strcmp(resolved.data(), FAST_ROOTED_DOT_PATH) == 0;
+
+        resolved_len = UNKNOWN_PATH_LEN;
+        ret = resolve_dirfd_task_path_raw(&rooted_task, ROOTED_DIRFD, ".", resolved.data(), resolved.size(), false, nullptr, &resolved_len);
+        constexpr const char* SLOW_ROOTED_DOT_PATH = "/tmp/ktest_common_local_relative_resolver/";
+        ok = ok && ret == 0 && resolved_len == std::strlen(SLOW_ROOTED_DOT_PATH) && resolved.at(resolved_len) == '\0' &&
+             std::strcmp(resolved.data(), SLOW_ROOTED_DOT_PATH) == 0;
+        ok = (vfs_release_fd(&rooted_task, ROOTED_DIRFD) == 0) && ok;
+    }
     vfs_put_file(dir);
 
     auto* file = vfs_open_file(FILE_PATH, ker::vfs::O_CREAT | 1, 0644);
@@ -10275,7 +10300,7 @@ auto common_local_relative_resolver_fast_path_selftest_impl() -> bool {
     vfs_put_file(file);
     ok = (vfs_unlink(FILE_PATH) == 0) && ok;
     ok = (vfs_rmdir(DIR_PATH) == 0) && ok;
-    ok = task.fd_table.empty() && ok;
+    ok = task.fd_table.empty() && rooted_task.fd_table.empty() && ok;
     return ok;
 }
 #endif

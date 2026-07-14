@@ -45,6 +45,132 @@ def forbid(source: str, tokens: list[str], context: str) -> None:
         fail(f"{context}: forbidden {', '.join(present)}")
 
 
+def block_body_after(source: str, header: str) -> str:
+    header_pos = source.find(header)
+    if header_pos < 0:
+        fail(f"missing block header {header!r}")
+    body_start = source.find("{", header_pos + len(header))
+    if body_start < 0:
+        fail(f"missing block body for {header!r}")
+
+    depth = 1
+    pos = body_start + 1
+    while pos < len(source) and depth > 0:
+        if source[pos] == "{":
+            depth += 1
+        elif source[pos] == "}":
+            depth -= 1
+        pos += 1
+    if depth != 0:
+        fail(f"unterminated block for {header!r}")
+    return source[body_start + 1 : pos - 1]
+
+
+def require_only_uninitialized_array(body: str, name: str, expected: str, context: str) -> None:
+    declarations = re.findall(rf"\bstd::array<[^;\n]+>\s+{re.escape(name)}\b[^;\n]*;", body)
+    if declarations != [expected]:
+        fail(f"{context}: unexpected {name} declarations: {declarations!r}")
+    forbidden = [
+        rf"\b{re.escape(name)}\s*=\s*\{{\s*\}}\s*;",
+        rf"\b{re.escape(name)}\.fill\s*\(",
+        rf"\b(?:std::)?memset\s*\(\s*{re.escape(name)}\.data\s*\(",
+        rf"\bstd::fill\s*\(\s*{re.escape(name)}\.",
+    ]
+    if any(re.search(pattern, body) for pattern in forbidden):
+        fail(f"{context}: {name} must not be cleared after declaration")
+
+
+def test_dirfd_visible_scratch_is_initialized_by_root_strip() -> None:
+    core = VFS_CORE_CPP.read_text()
+    copy_path = function_body(core, "copy_path_string")
+    strip_root = function_body(core, "strip_task_root_prefix")
+    fast = function_body(core, "copy_common_local_dirfd_relative_path")
+    slow = function_body(core, "resolve_dirfd_task_path_raw")
+    selftest = function_body(core, "common_local_relative_resolver_fast_path_selftest_impl")
+
+    declaration = "std::array<char, MAX_PATH_LEN> visible __attribute__((uninitialized));"
+    require_only_uninitialized_array(fast, "visible", declaration, "fast dirfd visible scratch")
+    require_only_uninitialized_array(slow, "visible", declaration, "fallback dirfd visible scratch")
+
+    require_order(
+        copy_path,
+        [
+            "size_t const LEN = known_src_len != UNKNOWN_PATH_LEN ? known_src_len : std::strlen(src)",
+            "if (LEN + 1 > dst_size)",
+            "std::memcpy(dst, src, LEN + 1)",
+            "return 0",
+        ],
+        "bounded path string production",
+    )
+    if strip_root.count("return copy_path_string(") != 5:
+        fail("task-root stripping must produce every successful output through copy_path_string")
+    require_order(
+        strip_root,
+        [
+            "const char* logical_path = path + ROOT_LEN",
+            "if (*logical_path == '\\0')",
+            'return copy_path_string("/", out, out_size)',
+            "return copy_path_string(logical_path, out, out_size)",
+        ],
+        "exact-root visible path production",
+    )
+
+    require_order(
+        fast,
+        [
+            "table_task->fd_table_lock.lock_irqsave()",
+            declaration,
+            "int const STRIP_RET = strip_task_root_prefix(task, base_file->vfs_path, visible.data(), visible.size(), nullptr)",
+            "result = STRIP_RET < 0 ? STRIP_RET : copy_simple_relative_path_from_base(visible.data(), pathname, scan, out, outsize, out_len)",
+            "table_task->fd_table_lock.unlock_irqrestore(IRQF)",
+        ],
+        "locked fast dirfd visible path production",
+    )
+    if fast.count("visible.data()") != 2 or fast.count("visible.size()") != 1 or "visible[" in fast:
+        fail("fast dirfd visible scratch has an unexpected producer or consumer")
+
+    require_order(
+        slow,
+        [
+            declaration,
+            "auto* file = vfs_get_file_retain(task, dirfd)",
+            "int const STRIP_RET = strip_task_root_prefix(task, file->vfs_path, visible.data(), visible.size(), nullptr)",
+            "vfs_put_file(file)",
+            "if (STRIP_RET < 0)",
+            "return STRIP_RET",
+            "base = visible.data()",
+            "std::strlen(base)",
+        ],
+        "fallback dirfd visible path production",
+    )
+    strip_failure = block_body_after(slow[slow.find("if (STRIP_RET < 0)") :], "if (STRIP_RET < 0)")
+    if strip_failure.strip() != "return STRIP_RET;":
+        fail("fallback dirfd resolution must return before consuming failed root-strip output")
+    if slow.count("visible.data()") != 2 or slow.count("visible.size()") != 1 or "visible[" in slow:
+        fail("fallback dirfd visible scratch has an unexpected producer or consumer")
+
+    require_order(
+        selftest,
+        [
+            "copy_path_string(DIR_PATH, rooted_task.root.data(), rooted_task.root.size())",
+            "int const ROOTED_DIRFD = vfs_alloc_fd(&rooted_task, dir)",
+            'ROOTED_DIRFD, ".", scan_path_text(".")',
+            'FAST_ROOTED_DOT_PATH = "/tmp/ktest_common_local_relative_resolver/"',
+            "resolved_len == std::strlen(FAST_ROOTED_DOT_PATH)",
+            "resolved.at(resolved_len) == '\\0'",
+            "std::strcmp(resolved.data(), FAST_ROOTED_DOT_PATH) == 0",
+            'ROOTED_DIRFD, ".", resolved.data(), resolved.size(), false',
+            'SLOW_ROOTED_DOT_PATH = "/tmp/ktest_common_local_relative_resolver/"',
+            "resolved_len == std::strlen(SLOW_ROOTED_DOT_PATH)",
+            "resolved.at(resolved_len) == '\\0'",
+            "std::strcmp(resolved.data(), SLOW_ROOTED_DOT_PATH) == 0",
+            "vfs_release_fd(&rooted_task, ROOTED_DIRFD)",
+            "rooted_task.fd_table.empty()",
+        ],
+        "rooted real-dirfd exact-root KTEST coverage",
+    )
+
+
 def test_open_path_scratch_is_initialized_by_its_producers() -> None:
     core = VFS_CORE_CPP.read_text()
 
@@ -155,5 +281,6 @@ def test_open_path_scratch_is_initialized_by_its_producers() -> None:
 
 
 if __name__ == "__main__":
+    test_dirfd_visible_scratch_is_initialized_by_root_strip()
     test_open_path_scratch_is_initialized_by_its_producers()
     print("VFS open path scratch invariants hold")
