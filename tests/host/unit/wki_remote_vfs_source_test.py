@@ -39,6 +39,29 @@ def function_body(source: str, name: str) -> str:
     return source[match.end() : pos - 1]
 
 
+def block_body_after(source: str, marker: str) -> str:
+    marker_pos = source.find(marker)
+    if marker_pos < 0:
+        fail(f"missing block marker {marker}")
+    brace_pos = marker_pos + len(marker)
+    while brace_pos < len(source) and source[brace_pos].isspace():
+        brace_pos += 1
+    if brace_pos >= len(source) or source[brace_pos] != "{":
+        fail(f"missing block after {marker}")
+
+    depth = 1
+    pos = brace_pos + 1
+    while pos < len(source) and depth > 0:
+        if source[pos] == "{":
+            depth += 1
+        elif source[pos] == "}":
+            depth -= 1
+        pos += 1
+    if depth != 0:
+        fail(f"unterminated block after {marker}")
+    return source[brace_pos + 1 : pos - 1]
+
+
 def require_tokens(source: str, tokens: list[str], context: str) -> None:
     missing = [token for token in tokens if token not in source]
     if missing:
@@ -196,6 +219,101 @@ def test_vfs_route_scratch_is_initialized_by_its_producer() -> None:
     ]:
         if legacy in rewrite or legacy in route:
             fail(f"route scratch must not retain redundant value initialization: {legacy}")
+
+
+def test_wki_host_mount_scratch_is_initialized_by_its_producers() -> None:
+    core = VFS_CORE_CPP.read_text()
+    mount = function_body(core, "ensure_wki_host_root_mount")
+
+    for failure_gate in [
+        "if (STRIP_RET < 0)",
+        "if (host_len >= hostname.size())",
+        "if (MOUNT_PATH_RET <= 0 || static_cast<size_t>(MOUNT_PATH_RET) >= mount_root.size())",
+    ]:
+        if block_body_after(mount, failure_gate).strip() != "return 0;":
+            fail(f"{failure_gate} must return before consuming uninitialized scratch")
+
+    require_order(
+        mount,
+        [
+            "std::array<char, MAX_PATH_LEN> logical __attribute__((uninitialized));",
+            "int const STRIP_RET =",
+            "ROOT_IS_GLOBAL ? copy_path_string(path, logical.data(), logical.size())",
+            "strip_task_root_prefix(task, path, logical.data(), logical.size(), nullptr)",
+            "if (STRIP_RET < 0)",
+            "std::strncmp(logical.data(), WKI_PREFIX.data(), WKI_PREFIX.size())",
+            "const char* host_part = logical.data() + WKI_PREFIX.size()",
+            "const char* host_end = host_part",
+            "while (*host_end != '\\0' && *host_end != '/')",
+            "if (host_end == host_part)",
+            "std::array<char, ker::net::wki::WKI_HOSTNAME_MAX> hostname __attribute__((uninitialized));",
+            "auto host_len = static_cast<size_t>(host_end - host_part)",
+        ],
+        "WKI host mount logical-path producer ordering",
+    )
+    require_order(
+        mount,
+        [
+            "std::array<char, ker::net::wki::WKI_HOSTNAME_MAX> hostname __attribute__((uninitialized));",
+            "if (host_len >= hostname.size())",
+            "std::memcpy(hostname.data(), host_part, host_len)",
+            "hostname[host_len] = '\\0'",
+            "std::strcmp(hostname.data(), ker::net::wki::g_wki.local_hostname.data())",
+            "std::snprintf(mount_root.data(), mount_root.size(), \"/wki/%s\", hostname.data())",
+            "wki_peer_find_by_hostname(hostname.data())",
+        ],
+        "WKI host mount hostname producer ordering",
+    )
+    require_order(
+        mount,
+        [
+            "std::array<char, MAX_PATH_LEN> mount_root __attribute__((uninitialized));",
+            "int const MOUNT_PATH_RET =",
+            "std::snprintf(mount_root.data(), mount_root.size(), \"/wki/%s\", hostname.data())",
+            "if (MOUNT_PATH_RET <= 0 || static_cast<size_t>(MOUNT_PATH_RET) >= mount_root.size())",
+            "std::array<char, MAX_PATH_LEN> resolved_mount_root __attribute__((uninitialized));",
+            "resolve_mount_path(mount_root.data(), resolved_mount_root.data(), resolved_mount_root.size()) == 0",
+            "vfs_mkdir(mount_root.data(), 0755)",
+            "wki_remote_vfs_mount(NODE_ID, find_ctx.result.resource_id, mount_root.data(), find_ctx.result.generation)",
+            "log::info(\"auto-mounted WKI host root %s for path %s\", mount_root.data(), logical.data())",
+        ],
+        "WKI host mount root-path producer ordering",
+    )
+
+    resolved_success = block_body_after(
+        mount, "if (resolve_mount_path(mount_root.data(), resolved_mount_root.data(), resolved_mount_root.size()) == 0)"
+    )
+    require_order(
+        resolved_success,
+        [
+            "find_mount_point(resolved_mount_root.data())",
+            "std::strcmp(existing->path, resolved_mount_root.data())",
+        ],
+        "WKI host mount resolved-path success consumers",
+    )
+    require_tokens(
+        mount,
+        [
+            "RootExportFindCtx find_ctx = {.node_id = NODE_ID};",
+        ],
+        "WKI host mount state initialization",
+    )
+    for legacy in [
+        "std::array<char, MAX_PATH_LEN> logical{};",
+        "std::array<char, ker::net::wki::WKI_HOSTNAME_MAX> hostname{};",
+        "std::array<char, MAX_PATH_LEN> mount_root{};",
+        "std::array<char, MAX_PATH_LEN> resolved_mount_root{};",
+        "logical.fill(",
+        "hostname.fill(",
+        "mount_root.fill(",
+        "resolved_mount_root.fill(",
+        "std::memset(logical.data()",
+        "std::memset(hostname.data()",
+        "std::memset(mount_root.data()",
+        "std::memset(resolved_mount_root.data()",
+    ]:
+        if legacy in mount:
+            fail(f"WKI host mount scratch must not retain a redundant clear: {legacy}")
 
 
 def test_proxy_op_slot_waits_are_bounded() -> None:
@@ -2700,6 +2818,7 @@ def test_export_rebuild_is_revisioned_and_backing_mount_exact() -> None:
 def main() -> None:
     test_vfs_host_alias_rewrite_is_overlap_safe()
     test_vfs_route_scratch_is_initialized_by_its_producer()
+    test_wki_host_mount_scratch_is_initialized_by_its_producers()
     test_proxy_op_slot_waits_are_bounded()
     test_proxy_operations_fail_before_setup_when_slot_wait_times_out()
     test_proxy_request_envelopes_use_stack_storage()

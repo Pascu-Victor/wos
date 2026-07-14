@@ -5823,7 +5823,9 @@ auto ensure_wki_host_root_mount(const char* path) -> int {
         return 0;
     }
 
-    std::array<char, MAX_PATH_LEN> logical{};
+    // Each path stage initializes its complete NUL-terminated string before use.
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
+    std::array<char, MAX_PATH_LEN> logical __attribute__((uninitialized));
     int const STRIP_RET = ROOT_IS_GLOBAL ? copy_path_string(path, logical.data(), logical.size())
                                          : strip_task_root_prefix(task, path, logical.data(), logical.size(), nullptr);
     if (STRIP_RET < 0) {
@@ -5843,7 +5845,9 @@ auto ensure_wki_host_root_mount(const char* path) -> int {
         return 0;
     }
 
-    std::array<char, ker::net::wki::WKI_HOSTNAME_MAX> hostname{};
+    // The bounded hostname copy and explicit terminator initialize the consumed string.
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
+    std::array<char, ker::net::wki::WKI_HOSTNAME_MAX> hostname __attribute__((uninitialized));
     auto host_len = static_cast<size_t>(host_end - host_part);
     if (host_len >= hostname.size()) {
         return 0;
@@ -5855,13 +5859,17 @@ auto ensure_wki_host_root_mount(const char* path) -> int {
         return 0;
     }
 
-    std::array<char, MAX_PATH_LEN> mount_root{};
+    // snprintf initializes a complete string whenever its checked result is accepted.
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
+    std::array<char, MAX_PATH_LEN> mount_root __attribute__((uninitialized));
     int const MOUNT_PATH_RET = std::snprintf(mount_root.data(), mount_root.size(), "/wki/%s", hostname.data());
     if (MOUNT_PATH_RET <= 0 || static_cast<size_t>(MOUNT_PATH_RET) >= mount_root.size()) {
         return 0;
     }
 
-    std::array<char, MAX_PATH_LEN> resolved_mount_root{};
+    // resolve_mount_path output is consumed only after successful return.
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
+    std::array<char, MAX_PATH_LEN> resolved_mount_root __attribute__((uninitialized));
     if (resolve_mount_path(mount_root.data(), resolved_mount_root.data(), resolved_mount_root.size()) == 0) {
         auto existing_ref = find_mount_point(resolved_mount_root.data());
         MountPoint const* existing = existing_ref.get();
