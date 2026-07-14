@@ -2474,6 +2474,135 @@ def test_open_path_scratch_is_initialized_by_its_producers() -> None:
     )
 
 
+def test_create_remove_path_scratch_is_initialized_by_task_resolver() -> None:
+    core = VFS_CORE_CPP.read_text()
+    raw_resolver = function_body(core, "resolve_task_path_raw_impl")
+    fast_producer = (
+        "int const FAST_RET =\n"
+        "        resolve_task_path_raw_common_local_fast_path(path, out, outsize, apply_task_route, resolved_len_out, resolved_hash_out);"
+    )
+    fast_gates = """if (FAST_RET == 0) {
+        return 0;
+    }
+    if (FAST_RET < 0) {
+        return FAST_RET;
+    }"""
+    fallback_prelude = "size_t out_len = UNKNOWN_PATH_LEN;"
+    fallback_producer = "int const ABSOLUTE = make_absolute(path, out, outsize, &out_len);"
+    fast_producer_pos = raw_resolver.find(fast_producer)
+    fast_gates_pos = raw_resolver.find(fast_gates, fast_producer_pos + len(fast_producer))
+    fallback_producer_pos = raw_resolver.find(fallback_producer, fast_gates_pos + len(fast_gates))
+    if (
+        fast_producer_pos < 0
+        or fast_gates_pos < 0
+        or fallback_producer_pos < 0
+        or raw_resolver[fast_producer_pos + len(fast_producer) : fast_gates_pos].strip()
+        or raw_resolver[fast_gates_pos + len(fast_gates) : fallback_producer_pos].strip() != fallback_prelude
+        or raw_resolver.count("return FAST_RET;") != 1
+    ):
+        fail("task path resolver must absorb a positive fast-path decline before the complete fallback producer")
+    resolver_returns = [" ".join(value.split()) for value in re.findall(r"\breturn\s+([^;]+);", raw_resolver)]
+    if resolver_returns != [
+        "0",
+        "FAST_RET",
+        "ABSOLUTE",
+        "CANONICAL",
+        "finish_canonical_task_path_raw(out, outsize, apply_task_route, out_len, resolved_len_out, resolved_hash_out)",
+    ]:
+        fail("task path resolver return topology changed; re-audit complete path production before callers consume scratch")
+
+    cases = [
+        (
+            "vfs_mkdir",
+            "abs_path",
+            "std::array<char, MAX_PATH_LEN> abs_path __attribute__((uninitialized));",
+            "size_t abs_path_len = UNKNOWN_PATH_LEN;",
+            "uint64_t abs_path_hash = UNKNOWN_PATH_HASH;",
+            "if (resolve_task_path_raw_impl(path, abs_path.data(), abs_path.size(), true, &abs_path_len, &abs_path_hash) < 0)",
+            "return -ENOENT;",
+            "return vfs_mkdir_resolved_path(abs_path.data(), mode, abs_path_len, abs_path_hash);",
+        ),
+        (
+            "vfs_unlink",
+            "path_buf",
+            "std::array<char, MAX_PATH_LEN> path_buf __attribute__((uninitialized));",
+            "size_t path_buf_len = UNKNOWN_PATH_LEN;",
+            "uint64_t path_buf_hash = UNKNOWN_PATH_HASH;",
+            "if (resolve_task_path_raw_impl(path, path_buf.data(), MAX_PATH_LEN, true, &path_buf_len, &path_buf_hash) < 0)",
+            "return -ENAMETOOLONG;",
+            "return vfs_unlink_resolved_path(path_buf.data(), path_buf_len, path_buf_hash);",
+        ),
+        (
+            "vfs_rmdir",
+            "path_buf",
+            "std::array<char, MAX_PATH_LEN> path_buf __attribute__((uninitialized));",
+            "size_t path_buf_len = UNKNOWN_PATH_LEN;",
+            "uint64_t path_buf_hash = UNKNOWN_PATH_HASH;",
+            "if (resolve_task_path_raw_impl(path, path_buf.data(), path_buf.size(), true, &path_buf_len, &path_buf_hash) < 0)",
+            "return -ENAMETOOLONG;",
+            "return vfs_rmdir_resolved_path(path_buf.data(), path_buf_len, path_buf_hash);",
+        ),
+    ]
+    expected_scratch_uses = {"vfs_mkdir": 4, "vfs_unlink": 3, "vfs_rmdir": 4}
+
+    for function, scratch, declaration, length_init, hash_init, producer_gate, failure_return, consumer in cases:
+        body = function_body(core, function)
+        require_only_uninitialized_array(body, scratch, declaration, f"{function} resolver scratch")
+        require_order(
+            body,
+            [
+                "if (path == nullptr)",
+                "return -EINVAL",
+                "auto* task = ker::mod::sched::get_current_task();",
+                "PathTextScan scan{};",
+                "if (task_absolute_local_path_fast_path_allowed(task, path, &scan))",
+                declaration,
+                length_init,
+                hash_init,
+                producer_gate,
+                failure_return,
+                consumer,
+            ],
+            f"{function} resolver scratch producer, failure gate, and consumer ordering",
+        )
+
+        declaration_pos = body.find(declaration)
+        producer_pos = body.find(producer_gate, declaration_pos + len(declaration))
+        expected_setup = f"{length_init}\n    {hash_init}"
+        if (
+            declaration_pos < 0
+            or brace_depth_at(body, declaration_pos) != 0
+            or producer_pos < 0
+            or body[declaration_pos + len(declaration) : producer_pos].strip() != expected_setup
+        ):
+            fail(f"{function} scratch must only receive length/hash setup before its resolver producer")
+
+        failure = block_body_after(body[producer_pos:], producer_gate)
+        if failure.strip() != failure_return:
+            fail(f"{function} resolver failure must return before consuming scratch output")
+        failure_end = producer_pos + block_end_after(body[producer_pos:], producer_gate)
+        consumer_pos = body.find(consumer, failure_end)
+        if consumer_pos < 0 or body[failure_end:consumer_pos].strip():
+            fail(f"{function} must consume scratch only after the successful resolver gate")
+        length_name = length_init.split()[1]
+        hash_name = hash_init.split()[1]
+        expected_uses = {scratch: expected_scratch_uses[function], length_name: 3, hash_name: 3}
+        if any(len(re.findall(rf"\b{re.escape(name)}\b", body)) != count for name, count in expected_uses.items()):
+            fail(f"{function} scratch, length, or hash has an unexpected use")
+        forbidden_scratch_clears = [
+            rf"\b(?:std::)?memset\s*\(\s*(?:&\s*)?{re.escape(scratch)}\b",
+            rf"\bbzero\s*\(\s*(?:&\s*)?{re.escape(scratch)}\b",
+            rf"\bstd::(?:ranges::)?fill(?:_n)?\s*\(\s*{re.escape(scratch)}\.(?:begin|data)\s*\(",
+            rf"\bstd::ranges::fill\s*\(\s*{re.escape(scratch)}\b",
+        ]
+        if any(re.search(pattern, body) for pattern in forbidden_scratch_clears):
+            fail(f"{function} scratch must not be cleared or prewritten")
+        if body.count("resolve_task_path_raw_impl") != 1 or body.count(f"{scratch}.data()") != 2 or f"{scratch}[" in body:
+            fail(f"{function} scratch has an unexpected producer or consumer")
+        if "goto" in body:
+            fail(f"{function} resolver scratch flow must not bypass its failure gate")
+
+
 if __name__ == "__main__":
     test_dirfd_visible_scratch_is_initialized_by_root_strip()
     test_absolute_visible_scratch_is_initialized_by_dot_clean_producer()
@@ -2488,4 +2617,5 @@ if __name__ == "__main__":
     test_f_ok_access_scratch_is_initialized_by_its_producers()
     test_statat_scratch_is_initialized_by_dirfd_resolver()
     test_open_path_scratch_is_initialized_by_its_producers()
+    test_create_remove_path_scratch_is_initialized_by_task_resolver()
     print("VFS open path scratch invariants hold")

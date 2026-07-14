@@ -9798,7 +9798,9 @@ auto vfs_mkdir(const char* path, int mode) -> int {
         return vfs_mkdir_resolved_path(path, mode, scan.path_len, scan.path_hash);
     }
 
-    std::array<char, MAX_PATH_LEN> abs_path;  // NOLINT(cppcoreguidelines-pro-type-member-init)
+    // The task path resolver initializes a complete NUL-terminated path before success.
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
+    std::array<char, MAX_PATH_LEN> abs_path __attribute__((uninitialized));
     size_t abs_path_len = UNKNOWN_PATH_LEN;
     uint64_t abs_path_hash = UNKNOWN_PATH_HASH;
     if (resolve_task_path_raw_impl(path, abs_path.data(), abs_path.size(), true, &abs_path_len, &abs_path_hash) < 0) {
@@ -12502,7 +12504,9 @@ auto vfs_unlink(const char* path) -> int {
         return vfs_unlink_resolved_path(path, scan.path_len, scan.path_hash);
     }
 
-    std::array<char, MAX_PATH_LEN> path_buf;  // NOLINT(cppcoreguidelines-pro-type-member-init)
+    // The task path resolver initializes a complete NUL-terminated path before success.
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
+    std::array<char, MAX_PATH_LEN> path_buf __attribute__((uninitialized));
     size_t path_buf_len = UNKNOWN_PATH_LEN;
     uint64_t path_buf_hash = UNKNOWN_PATH_HASH;
     if (resolve_task_path_raw_impl(path, path_buf.data(), MAX_PATH_LEN, true, &path_buf_len, &path_buf_hash) < 0) {
@@ -12636,7 +12640,9 @@ auto vfs_rmdir(const char* path) -> int {
         return vfs_rmdir_resolved_path(path, scan.path_len, scan.path_hash);
     }
 
-    std::array<char, MAX_PATH_LEN> path_buf;  // NOLINT(cppcoreguidelines-pro-type-member-init)
+    // The task path resolver initializes a complete NUL-terminated path before success.
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
+    std::array<char, MAX_PATH_LEN> path_buf __attribute__((uninitialized));
     size_t path_buf_len = UNKNOWN_PATH_LEN;
     uint64_t path_buf_hash = UNKNOWN_PATH_HASH;
     if (resolve_task_path_raw_impl(path, path_buf.data(), path_buf.size(), true, &path_buf_len, &path_buf_hash) < 0) {
