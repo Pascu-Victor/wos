@@ -193,7 +193,8 @@ constexpr size_t VFS_WRITE_BEHIND_SIZE = VFS_RDMA_WRITE_SIZE;
 struct ReadAheadCache {
     int64_t cached_offset = -1;  // Start offset of cached region (-1 = empty)
     uint16_t cached_len = 0;     // Bytes valid in cache
-    std::array<uint8_t, VFS_CACHE_SIZE> data = {};
+    // A response initializes cached_len bytes before any cache lookup can read them.
+    std::array<uint8_t, VFS_CACHE_SIZE> data;
 };
 
 struct WriteBehindBuffer {

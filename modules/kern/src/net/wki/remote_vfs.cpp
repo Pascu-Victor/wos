@@ -3326,12 +3326,14 @@ auto remote_vfs_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) 
     // Max data per response
     auto max_resp_data = static_cast<uint32_t>(WKI_ETH_MAX_PAYLOAD - sizeof(DevOpRespPayload));
 
-    std::array<uint8_t, VFS_DIRECT_READ_STACK_SIZE> direct_read_buf{};
+    // The response path initializes the exact resp_len prefix consumed below.
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
+    std::array<uint8_t, VFS_DIRECT_READ_STACK_SIZE> direct_read_buf __attribute__((uninitialized));
 
     while (remaining > 0) {
         bool const SHOULD_READ_AHEAD = ALLOW_READ_CACHES && !POSITIONAL_READ && remaining < VFS_CACHE_SIZE;
         if (SHOULD_READ_AHEAD && ctx->read_cache == nullptr) {
-            ctx->read_cache = new (std::nothrow) ReadAheadCache();  // NOLINT(cppcoreguidelines-owning-memory)
+            ctx->read_cache = new (std::nothrow) ReadAheadCache;  // NOLINT(cppcoreguidelines-owning-memory)
         }
         bool const USING_CACHE = SHOULD_READ_AHEAD && ctx->read_cache != nullptr;
         auto fetch_size = USING_CACHE ? static_cast<uint32_t>(VFS_CACHE_SIZE) : std::min(remaining, VFS_DIRECT_READ_STACK_SIZE);

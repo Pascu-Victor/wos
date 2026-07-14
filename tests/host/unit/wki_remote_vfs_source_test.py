@@ -733,25 +733,79 @@ def test_shared_io_callers_timeout_or_fallback() -> None:
 
 def test_message_fallback_readahead_targets_small_sequential_reads() -> None:
     source = REMOTE_VFS_CPP.read_text()
+    header = REMOTE_VFS_HPP.read_text()
     read_body = function_body(source, "remote_vfs_read")
 
     require_order(
         read_body,
         [
+            "std::array<uint8_t, VFS_DIRECT_READ_STACK_SIZE> direct_read_buf __attribute__((uninitialized))",
             "bool const SHOULD_READ_AHEAD = ALLOW_READ_CACHES && !POSITIONAL_READ && remaining < VFS_CACHE_SIZE",
             "if (SHOULD_READ_AHEAD && ctx->read_cache == nullptr)",
-            "ctx->read_cache = new (std::nothrow) ReadAheadCache()",
+            "ctx->read_cache = new (std::nothrow) ReadAheadCache;",
             "bool const USING_CACHE = SHOULD_READ_AHEAD && ctx->read_cache != nullptr",
             "auto fetch_size = USING_CACHE ? static_cast<uint32_t>(VFS_CACHE_SIZE) : std::min(remaining, VFS_DIRECT_READ_STACK_SIZE)",
             "uint8_t* fetch_dest = direct_read_buf.data()",
             "if (USING_CACHE)",
             "fetch_dest = ctx->read_cache->data.data()",
+            "uint16_t resp_len = 0",
+            "vfs_proxy_read_with_retry",
+            "if (STATUS != 0)",
+            "uint16_t const BYTES_READ = resp_len",
+            "if (BYTES_READ == 0)",
             "ctx->read_cache->cached_offset = cur_offset",
             "ctx->read_cache->cached_len = BYTES_READ",
             "auto to_copy = static_cast<uint16_t>(std::min(static_cast<uint32_t>(BYTES_READ), remaining))",
             "remaining -= to_copy",
         ],
         "message fallback small-read read-ahead",
+    )
+    require_tokens(
+        read_body,
+        [
+            "memcpy(dest, ctx->read_cache->data.data(), to_copy)",
+            "memcpy(dest, fetch_dest, BYTES_READ)",
+        ],
+        "message fallback bounded response consumers",
+    )
+    require_tokens(
+        header,
+        [
+            "uint16_t cached_len = 0;",
+            "std::array<uint8_t, VFS_CACHE_SIZE> data;",
+        ],
+        "read-ahead cache validity boundary",
+    )
+    if "std::array<uint8_t, VFS_DIRECT_READ_STACK_SIZE> direct_read_buf{};" in read_body:
+        fail("message fallback must not clear response-owned direct-read scratch")
+    if "new (std::nothrow) ReadAheadCache()" in read_body:
+        fail("read-ahead allocation must use default initialization so cache data is not pre-cleared")
+    if "std::array<uint8_t, VFS_CACHE_SIZE> data = {};" in header:
+        fail("read-ahead cache data must remain response-initialized")
+
+    send_body = function_body(source, "vfs_proxy_send_and_wait")
+    require_order(
+        send_body,
+        [
+            "state->op_resp_buf = resp_buf",
+            "state->op_resp_max = resp_buf_max",
+            "state->op_resp_len = 0",
+            "consume_proxy_op_result_locked(state, OP_GENERATION)",
+            "uint16_t const RESP_LEN = RESULT.response_len",
+            "*resp_len_out = RESP_LEN",
+        ],
+        "message response length publication",
+    )
+    response_body = function_body(source, "handle_vfs_op_resp")
+    require_order(
+        response_body,
+        [
+            "if (sizeof(DevOpRespPayload) + RESP_DATA_LEN > payload_len)",
+            "copy_len = (RESP_DATA_LEN > state->op_resp_max) ? state->op_resp_max : RESP_DATA_LEN",
+            "memcpy(state->op_resp_buf, resp_data, copy_len)",
+            "state->op_resp_len = copy_len",
+        ],
+        "message response prefix initialization",
     )
     if "remaining >= VFS_CACHE_SIZE" in read_body:
         fail("message fallback must not reserve read-ahead for already-full cache-sized reads")
