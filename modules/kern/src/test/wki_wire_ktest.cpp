@@ -1,3 +1,4 @@
+#include <array>
 #include <cstdint>
 #include <net/wki/wire.hpp>
 #include <test/ktest.hpp>
@@ -49,6 +50,27 @@ KTEST(WkiWire, DevOpResponseMatchesExpectedIdentity) {
     resp.reserved = 0xBEEF;
     KEXPECT_TRUE(ker::net::wki::wki_dev_op_response_matches_expected(ker::net::wki::OP_NET_GET_STATS, 0xBEEF, resp));
     KEXPECT_FALSE(ker::net::wki::wki_dev_op_response_matches_expected(ker::net::wki::OP_NET_GET_STATS, 0xBEEE, resp));
+}
+
+KTEST(WkiWire, VfsCloseNoSuccessResponseExtensionIsLengthGated) {
+    std::array<uint8_t, ker::net::wki::WKI_VFS_CLOSE_EXTENDED_DATA_LEN> request{};
+
+    KEXPECT_EQ(ker::net::wki::WKI_VFS_CLOSE_LEGACY_DATA_LEN, 4);
+    KEXPECT_EQ(ker::net::wki::WKI_VFS_CLOSE_EXTENDED_DATA_LEN, 5);
+    KEXPECT_FALSE(ker::net::wki::wki_vfs_close_no_success_response_requested(nullptr, 0));
+    KEXPECT_FALSE(ker::net::wki::wki_vfs_close_no_success_response_requested(
+        request.data(), static_cast<uint16_t>(ker::net::wki::WKI_VFS_CLOSE_LEGACY_DATA_LEN)));
+    KEXPECT_FALSE(ker::net::wki::wki_vfs_close_no_success_response_requested(request.data(), static_cast<uint16_t>(request.size())));
+
+    request.at(ker::net::wki::WKI_VFS_CLOSE_FLAGS_OFFSET) = ker::net::wki::WKI_VFS_CLOSE_FLAG_NO_SUCCESS_RESPONSE;
+    KEXPECT_TRUE(ker::net::wki::wki_vfs_close_no_success_response_requested(request.data(), static_cast<uint16_t>(request.size())));
+    KEXPECT_FALSE(ker::net::wki::wki_vfs_close_no_success_response_requested(
+        request.data(), static_cast<uint16_t>(ker::net::wki::WKI_VFS_CLOSE_LEGACY_DATA_LEN)));
+
+    request.at(ker::net::wki::WKI_VFS_CLOSE_FLAGS_OFFSET) = 0x80;
+    KEXPECT_FALSE(ker::net::wki::wki_vfs_close_no_success_response_requested(request.data(), static_cast<uint16_t>(request.size())));
+    request.at(ker::net::wki::WKI_VFS_CLOSE_FLAGS_OFFSET) |= ker::net::wki::WKI_VFS_CLOSE_FLAG_NO_SUCCESS_RESPONSE;
+    KEXPECT_TRUE(ker::net::wki::wki_vfs_close_no_success_response_requested(request.data(), static_cast<uint16_t>(request.size())));
 }
 
 KTEST(WkiWire, DevAttachAckMatchesExpectedCookie) {

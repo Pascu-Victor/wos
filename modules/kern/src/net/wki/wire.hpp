@@ -762,6 +762,19 @@ constexpr uint16_t OP_VFS_OPEN = 0x0400;
 constexpr uint16_t OP_VFS_READ = 0x0401;
 constexpr uint16_t OP_VFS_WRITE = 0x0402;
 constexpr uint16_t OP_VFS_CLOSE = 0x0403;
+// The optional fifth byte extends the legacy fd-only body without changing its
+// prefix. Receivers ignore unknown flag bits; an absent marker requires a reply.
+constexpr size_t WKI_VFS_CLOSE_LEGACY_DATA_LEN = sizeof(int32_t);
+constexpr size_t WKI_VFS_CLOSE_FLAGS_OFFSET = WKI_VFS_CLOSE_LEGACY_DATA_LEN;
+constexpr size_t WKI_VFS_CLOSE_EXTENDED_DATA_LEN = WKI_VFS_CLOSE_FLAGS_OFFSET + sizeof(uint8_t);
+constexpr uint8_t WKI_VFS_CLOSE_FLAG_NO_SUCCESS_RESPONSE = 0x01;
+static_assert(WKI_VFS_CLOSE_LEGACY_DATA_LEN == 4 && WKI_VFS_CLOSE_EXTENDED_DATA_LEN == 5);
+
+constexpr auto wki_vfs_close_no_success_response_requested(const uint8_t* data, uint16_t data_len) -> bool {
+    return data != nullptr && data_len >= WKI_VFS_CLOSE_EXTENDED_DATA_LEN &&
+           (data[WKI_VFS_CLOSE_FLAGS_OFFSET] & WKI_VFS_CLOSE_FLAG_NO_SUCCESS_RESPONSE) != 0;
+}
+
 constexpr uint16_t OP_VFS_READDIR = 0x0404;
 constexpr uint16_t OP_VFS_STAT = 0x0405;
 constexpr uint16_t OP_VFS_MKDIR = 0x0406;

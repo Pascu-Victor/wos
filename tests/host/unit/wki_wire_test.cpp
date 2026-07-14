@@ -4,6 +4,7 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <cstring>
 #include <net/wki/wire.hpp>
 
@@ -255,6 +256,25 @@ TEST(WkiWire, DevOpResponseMatchesExpectedIdentity) {
     resp.reserved = 0xBEEF;
     EXPECT_TRUE(wki_dev_op_response_matches_expected(OP_NET_GET_STATS, 0xBEEF, resp));
     EXPECT_FALSE(wki_dev_op_response_matches_expected(OP_NET_GET_STATS, 0xBEEE, resp));
+}
+
+TEST(WkiWire, VfsCloseNoSuccessResponseExtensionIsLengthGated) {
+    std::array<uint8_t, WKI_VFS_CLOSE_EXTENDED_DATA_LEN> request{};
+
+    EXPECT_EQ(WKI_VFS_CLOSE_LEGACY_DATA_LEN, 4u);
+    EXPECT_EQ(WKI_VFS_CLOSE_EXTENDED_DATA_LEN, 5u);
+    EXPECT_FALSE(wki_vfs_close_no_success_response_requested(nullptr, 0));
+    EXPECT_FALSE(wki_vfs_close_no_success_response_requested(request.data(), static_cast<uint16_t>(WKI_VFS_CLOSE_LEGACY_DATA_LEN)));
+    EXPECT_FALSE(wki_vfs_close_no_success_response_requested(request.data(), static_cast<uint16_t>(request.size())));
+
+    request.at(WKI_VFS_CLOSE_FLAGS_OFFSET) = WKI_VFS_CLOSE_FLAG_NO_SUCCESS_RESPONSE;
+    EXPECT_TRUE(wki_vfs_close_no_success_response_requested(request.data(), static_cast<uint16_t>(request.size())));
+    EXPECT_FALSE(wki_vfs_close_no_success_response_requested(request.data(), static_cast<uint16_t>(WKI_VFS_CLOSE_LEGACY_DATA_LEN)));
+
+    request.at(WKI_VFS_CLOSE_FLAGS_OFFSET) = 0x80;
+    EXPECT_FALSE(wki_vfs_close_no_success_response_requested(request.data(), static_cast<uint16_t>(request.size())));
+    request.at(WKI_VFS_CLOSE_FLAGS_OFFSET) |= WKI_VFS_CLOSE_FLAG_NO_SUCCESS_RESPONSE;
+    EXPECT_TRUE(wki_vfs_close_no_success_response_requested(request.data(), static_cast<uint16_t>(request.size())));
 }
 
 TEST(WkiWire, DevAttachAckMatchesExpectedCookie) {

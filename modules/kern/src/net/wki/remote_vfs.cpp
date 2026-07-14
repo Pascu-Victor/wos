@@ -2831,17 +2831,18 @@ auto remote_vfs_close(ker::vfs::File* f) -> int {
         invalidate_dir_cache(ctx->proxy, ctx->remote_fd);
         s_vfs_lock.unlock();
 
-        // Send OP_VFS_CLOSE: {remote_fd:i32} = 4 bytes. Pending writes were flushed
-        // synchronously above, and the close request remains ordered on the reliable
-        // per-mount channel. The owner response only reports whether the remote fd
-        // existed, which is not observable after the local descriptor is gone, so
-        // normal closes do not need to pay another request/response RTT.
-        int32_t remote_fd = ctx->remote_fd;
-        int const SEND_STATUS =
-            vfs_proxy_send_untracked(ctx->proxy, OP_VFS_CLOSE, reinterpret_cast<const uint8_t*>(&remote_fd), sizeof(int32_t));
+        // Pending writes were flushed synchronously above, and this close remains
+        // ordered on the reliable per-mount channel. Legacy four-byte closes need
+        // a response; ordinary closes opt out of the success response because the
+        // local descriptor is gone.
+        std::array<uint8_t, WKI_VFS_CLOSE_EXTENDED_DATA_LEN> close_req{};
+        int32_t const REMOTE_FD = ctx->remote_fd;
+        memcpy(close_req.data(), &REMOTE_FD, sizeof(REMOTE_FD));
+        close_req.at(WKI_VFS_CLOSE_FLAGS_OFFSET) = WKI_VFS_CLOSE_FLAG_NO_SUCCESS_RESPONSE;
+        int const SEND_STATUS = vfs_proxy_send_untracked(ctx->proxy, OP_VFS_CLOSE, close_req.data(), close_req.size());
         if (SEND_STATUS != 0) {
             ker::mod::dbg::log("[WKI] async remote close send failed: node=0x%04x ch=%u fd=%d rc=%d", ctx->proxy->owner_node,
-                               ctx->proxy->assigned_channel, remote_fd, SEND_STATUS);
+                               ctx->proxy->assigned_channel, REMOTE_FD, SEND_STATUS);
         }
 
         // D6: Free caches
@@ -4615,8 +4616,8 @@ void handle_vfs_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_ident
         }
 
         case OP_VFS_CLOSE: {
-            // Request: {remote_fd:i32} = 4 bytes
-            if (data_len < 4) {
+            // Legacy request: {remote_fd:i32}; extended request appends flags:u8.
+            if (data_len < WKI_VFS_CLOSE_LEGACY_DATA_LEN) {
                 DevOpRespPayload resp = {};
                 resp.op_id = OP_VFS_CLOSE;
                 resp.status = -1;
@@ -4627,6 +4628,7 @@ void handle_vfs_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_ident
 
             int32_t fd_id = 0;
             memcpy(&fd_id, data, sizeof(int32_t));
+            bool const NO_SUCCESS_RESPONSE = wki_vfs_close_no_success_response_requested(data, data_len);
 
             s_vfs_lock.lock();
             RemoteVfsFd* rfd = find_remote_fd(channel_identity, fd_id);
@@ -4657,11 +4659,13 @@ void handle_vfs_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_ident
             perf_record_vfs_server_end(SERVER_OP, hdr->src_node, channel_id, CORRELATION, status,
                                        static_cast<uint32_t>(wki_now_us() - LOCAL_STARTED_US), 0, CALLSITE);
 
-            DevOpRespPayload resp = {};
-            resp.op_id = OP_VFS_CLOSE;
-            resp.status = status;
-            resp.data_len = 0;
-            send_simple_resp(resp);
+            if (status != 0 || !NO_SUCCESS_RESPONSE) {
+                DevOpRespPayload resp = {};
+                resp.op_id = OP_VFS_CLOSE;
+                resp.status = status;
+                resp.data_len = 0;
+                send_simple_resp(resp);
+            }
             break;
         }
 

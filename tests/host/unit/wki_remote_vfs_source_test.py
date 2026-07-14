@@ -9,6 +9,7 @@ REMOTE_VFS_CPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "remote_vfs
 REMOTE_VFS_HPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "remote_vfs.hpp"
 WKI_CPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "wki.cpp"
 WKI_HPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "wki.hpp"
+WIRE_HPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "wire.hpp"
 DEV_SERVER_CPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "dev_server.cpp"
 VFS_CORE_CPP = ROOT / "modules" / "kern" / "src" / "vfs" / "core.cpp"
 WKI_DEV_PROXY_KTEST = ROOT / "modules" / "kern" / "src" / "test" / "wki_dev_proxy_ktest.cpp"
@@ -877,6 +878,7 @@ def test_remote_open_closes_server_fd_on_local_allocation_failure() -> None:
 
 def test_normal_remote_close_flushes_then_sends_without_response_wait() -> None:
     source = REMOTE_VFS_CPP.read_text()
+    wire = WIRE_HPP.read_text()
     close_body = function_body(source, "remote_vfs_close")
 
     require_order(
@@ -884,8 +886,12 @@ def test_normal_remote_close_flushes_then_sends_without_response_wait() -> None:
         [
             "ker::mod::sys::MutexGuard io_guard(ctx->io_lock)",
             "flush_status = flush_write_behind(ctx)",
-            "int32_t remote_fd = ctx->remote_fd",
+            "std::array<uint8_t, WKI_VFS_CLOSE_EXTENDED_DATA_LEN> close_req{}",
+            "int32_t const REMOTE_FD = ctx->remote_fd",
+            "memcpy(close_req.data(), &REMOTE_FD, sizeof(REMOTE_FD))",
+            "close_req.at(WKI_VFS_CLOSE_FLAGS_OFFSET) = WKI_VFS_CLOSE_FLAG_NO_SUCCESS_RESPONSE",
             "vfs_proxy_send_untracked(ctx->proxy, OP_VFS_CLOSE",
+            "close_req.data(), close_req.size()",
             "delete ctx->write_buf",
             "delete ctx;",
             "release_vfs_proxy_open_ref(PROXY)",
@@ -899,6 +905,38 @@ def test_normal_remote_close_flushes_then_sends_without_response_wait() -> None:
         fail("normal remote close must not wait for the owner close response")
     if "NEEDS_CLOSE_STATUS" in close_body:
         fail("normal remote close must not branch on access mode for response waiting")
+
+    require_tokens(
+        wire,
+        [
+            "WKI_VFS_CLOSE_LEGACY_DATA_LEN = sizeof(int32_t)",
+            "WKI_VFS_CLOSE_FLAGS_OFFSET = WKI_VFS_CLOSE_LEGACY_DATA_LEN",
+            "WKI_VFS_CLOSE_EXTENDED_DATA_LEN = WKI_VFS_CLOSE_FLAGS_OFFSET + sizeof(uint8_t)",
+            "WKI_VFS_CLOSE_FLAG_NO_SUCCESS_RESPONSE = 0x01",
+            "wki_vfs_close_no_success_response_requested",
+        ],
+        "backward-compatible remote close request extension",
+    )
+
+    server_body = function_body(source, "handle_vfs_op")
+    close_case_start = server_body.index("case OP_VFS_CLOSE:")
+    close_case = server_body[close_case_start : server_body.index("case OP_VFS_READDIR:", close_case_start)]
+    require_order(
+        close_case,
+        [
+            "if (data_len < WKI_VFS_CLOSE_LEGACY_DATA_LEN)",
+            "send_simple_resp(resp)",
+            "memcpy(&fd_id, data, sizeof(int32_t))",
+            "wki_vfs_close_no_success_response_requested(data, data_len)",
+            "rfd->file = nullptr",
+            "s_vfs_lock.unlock()",
+            "close_file->fops->vfs_close(close_file)",
+            "perf_record_vfs_server_end",
+            "if (status != 0 || !NO_SUCCESS_RESPONSE)",
+            "send_simple_resp(resp)",
+        ],
+        "owner close completes before suppressing only a successful opted-in response",
+    )
 
 
 def test_export_lookup_returns_locked_snapshot() -> None:
