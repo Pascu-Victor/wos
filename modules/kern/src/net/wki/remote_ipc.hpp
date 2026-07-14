@@ -357,6 +357,7 @@ auto wki_ipc_selftest_pty_close_without_export_queues_pending() -> int;
 auto wki_ipc_selftest_pending_close_promotes_on_poll() -> int;
 auto wki_ipc_selftest_epoll_close_releases_lookup_ref() -> int;
 auto wki_ipc_selftest_nonblocking_pipe_write_view_preserves_source_flags() -> int;
+auto wki_ipc_selftest_export_pipe_write_burst_is_bounded() -> int;
 auto wki_ipc_selftest_pipe_fd_flags_preserve_nonblocking_access_mode() -> int;
 auto wki_ipc_selftest_write_only_pipe_omits_receive_ring() -> int;
 auto wki_ipc_selftest_attach_insert_failure_preserves_existing_fd() -> int;

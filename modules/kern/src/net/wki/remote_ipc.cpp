@@ -319,6 +319,31 @@ std::atomic<int> g_ipc_dev_op_work_selftest_frees{0};
 std::atomic<int> g_ipc_file_selftest_closes{0};
 std::atomic<bool> g_ipc_selftest_force_attach_insert_failure{false};
 
+struct IpcPipeWriteSelftestScript {
+    std::array<ssize_t, 4> results{};
+    std::array<const void*, 4> buffers{};
+    std::array<size_t, 4> counts{};
+    std::array<size_t, 4> offsets{};
+    size_t result_count = 0;
+    size_t calls = 0;
+};
+
+auto ipc_selftest_scripted_write(ker::vfs::File* file, const void* buf, size_t count, size_t offset) -> ssize_t {
+    auto* script = file != nullptr ? static_cast<IpcPipeWriteSelftestScript*>(file->private_data) : nullptr;
+    if (script == nullptr) {
+        return -EIO;
+    }
+
+    size_t const CALL = script->calls++;
+    if (CALL >= script->result_count || CALL >= script->results.size()) {
+        return -EIO;
+    }
+    script->buffers.at(CALL) = buf;
+    script->counts.at(CALL) = count;
+    script->offsets.at(CALL) = offset;
+    return script->results.at(CALL);
+}
+
 auto ipc_selftest_file_close(ker::vfs::File* /*file*/) -> int {
     g_ipc_file_selftest_closes.fetch_add(1, std::memory_order_relaxed);
     return 0;
@@ -329,6 +354,21 @@ ker::vfs::FileOperations g_ipc_selftest_file_ops = {
     .vfs_close = ipc_selftest_file_close,
     .vfs_read = nullptr,
     .vfs_write = nullptr,
+    .vfs_lseek = nullptr,
+    .vfs_isatty = nullptr,
+    .vfs_readdir = nullptr,
+    .vfs_readlink = nullptr,
+    .vfs_truncate = nullptr,
+    .vfs_poll_check = nullptr,
+    .vfs_poll_register_waiter = nullptr,
+    .vfs_ioctl = nullptr,
+};
+
+ker::vfs::FileOperations g_ipc_pipe_write_selftest_ops = {
+    .vfs_open = nullptr,
+    .vfs_close = nullptr,
+    .vfs_read = nullptr,
+    .vfs_write = ipc_selftest_scripted_write,
     .vfs_lseek = nullptr,
     .vfs_isatty = nullptr,
     .vfs_readdir = nullptr,
@@ -375,6 +415,7 @@ struct ExportPipeWriteBacklog {
 
 std::deque<ExportPipeWriteBacklog*> g_export_pipe_write_backlogs;
 constexpr size_t WKI_IPC_EXPORT_PIPE_FLUSH_WORKER_COUNT = 4;
+constexpr size_t WKI_IPC_EXPORT_PIPE_WRITE_BURST_CALLS = 3;
 std::array<std::deque<ExportPipeWriteBacklog*>, WKI_IPC_EXPORT_PIPE_FLUSH_WORKER_COUNT> g_export_pipe_write_flush_queues;
 std::array<ker::mod::sched::task::Task*, WKI_IPC_EXPORT_PIPE_FLUSH_WORKER_COUNT> g_export_pipe_write_flush_tasks = {};
 constexpr std::array<const char*, WKI_IPC_EXPORT_PIPE_FLUSH_WORKER_COUNT> WKI_IPC_EXPORT_PIPE_FLUSH_WORKER_NAMES = {
@@ -430,6 +471,7 @@ static_assert(WKI_IPC_PIPE_DATA_HEADER_SIZE < WKI_ETH_MAX_PAYLOAD);
 static_assert(WKI_IPC_PIPE_DATA_MAX_CHUNK <= UINT16_MAX);
 static_assert(WKI_IPC_PIPE_DATA_HEADER_SIZE < WKI_IPC_DEV_OP_COALLOC_MIN_PAYLOAD);
 static_assert(WKI_IPC_DEV_OP_TRANSFER_MIN_DATA > 0);
+static_assert(WKI_IPC_EXPORT_PIPE_WRITE_BURST_CALLS > 0);
 
 auto ipc_dev_op_work_can_back_pipe_chunk(const IpcDevOpWork* work, const uint8_t* data, uint16_t len) -> bool {
     if (work == nullptr || data == nullptr || !work->payload_coallocated || work->payload != reinterpret_cast<const uint8_t*>(work + 1) ||
@@ -1018,6 +1060,21 @@ void init_nonblocking_pipe_write_view(ker::vfs::File& view, const ker::vfs::File
     view.positional_read_depth.store(source.positional_read_depth.load(std::memory_order_acquire), std::memory_order_release);
 }
 
+auto export_pipe_write_bounded(ker::vfs::File* write_file, const uint8_t* data, uint16_t len, size_t max_calls) -> ssize_t {
+    size_t written = 0;
+    ssize_t result = 0;
+    for (size_t call = 0; call < max_calls && written < len; ++call) {
+        size_t const REMAINING = len - written;
+        result = clamp_io_count(write_file->fops->vfs_write(write_file, data + written, REMAINING, static_cast<size_t>(write_file->pos)),
+                                REMAINING);
+        if (result <= 0) {
+            break;
+        }
+        written += static_cast<size_t>(result);
+    }
+    return written != 0 ? static_cast<ssize_t>(written) : result;
+}
+
 auto export_pipe_write_nonblocking(ker::vfs::File* file, const uint8_t* data, uint16_t len) -> ssize_t {
     if (len == 0) {
         return 0;
@@ -1035,7 +1092,9 @@ auto export_pipe_write_nonblocking(ker::vfs::File* file, const uint8_t* data, ui
     }
 
     clear_current_daemon_sigpipe();
-    ssize_t const RET = clamp_io_count(write_file->fops->vfs_write(write_file, data, len, static_cast<size_t>(write_file->pos)), len);
+    bool const BURST = IS_PIPE && len <= WKI_IPC_PIPE_DATA_MAX_CHUNK;
+    size_t const MAX_CALLS = BURST ? WKI_IPC_EXPORT_PIPE_WRITE_BURST_CALLS : 1;
+    ssize_t const RET = export_pipe_write_bounded(write_file, data, len, MAX_CALLS);
     clear_current_daemon_sigpipe();
 
     return RET;
@@ -4783,6 +4842,65 @@ auto wki_ipc_selftest_nonblocking_pipe_write_view_preserves_source_flags() -> in
         view.dir_fs_count == source.dir_fs_count && view.stream_cache_attachment == source.stream_cache_attachment &&
         view.cache_notify_attachment == source.cache_notify_attachment && view.positional_read_depth.load(std::memory_order_acquire) == 5;
     return VIEW_OK ? 0 : -EIO;
+}
+
+auto wki_ipc_selftest_export_pipe_write_burst_is_bounded() -> int {
+    std::array<uint8_t, WKI_IPC_PIPE_DATA_MAX_CHUNK> data{};
+    IpcPipeWriteSelftestScript script{};
+    ker::vfs::File file{};
+    file.private_data = &script;
+    file.fops = &g_ipc_pipe_write_selftest_ops;
+    file.pos = 23;
+
+    auto reset_script = [&](std::array<ssize_t, 4> results, size_t result_count) {
+        script = {};
+        script.results = results;
+        script.result_count = result_count;
+    };
+
+    reset_script({4096, 4096, 754, -EIO}, 3);
+    ssize_t const FULL_RET =
+        export_pipe_write_bounded(&file, data.data(), static_cast<uint16_t>(data.size()), WKI_IPC_EXPORT_PIPE_WRITE_BURST_CALLS);
+    bool const FULL_VALID = FULL_RET == static_cast<ssize_t>(data.size()) && script.calls == 3 && script.buffers.at(0) == data.data() &&
+                            script.buffers.at(1) == data.data() + 4096 && script.buffers.at(2) == data.data() + 8192 &&
+                            script.counts.at(0) == data.size() && script.counts.at(1) == data.size() - 4096 && script.counts.at(2) == 754 &&
+                            script.offsets.at(0) == 23 && script.offsets.at(1) == 23 && script.offsets.at(2) == 23;
+
+    reset_script({4096, 904, -EAGAIN, -EIO}, 3);
+    ssize_t const PARTIAL_RET =
+        export_pipe_write_bounded(&file, data.data(), static_cast<uint16_t>(data.size()), WKI_IPC_EXPORT_PIPE_WRITE_BURST_CALLS);
+    bool const PARTIAL_VALID = PARTIAL_RET == 5000 && script.calls == 3 && script.buffers.at(1) == data.data() + 4096 &&
+                               script.buffers.at(2) == data.data() + 5000 && script.counts.at(1) == data.size() - 4096 &&
+                               script.counts.at(2) == data.size() - 5000;
+
+    reset_script({4096, 0, -EIO, -EIO}, 2);
+    ssize_t const ZERO_RET =
+        export_pipe_write_bounded(&file, data.data(), static_cast<uint16_t>(data.size()), WKI_IPC_EXPORT_PIPE_WRITE_BURST_CALLS);
+    bool const ZERO_VALID = ZERO_RET == 4096 && script.calls == 2;
+
+    reset_script({0, -EIO, -EIO, -EIO}, 1);
+    ssize_t const FIRST_ZERO_RET = export_pipe_write_bounded(&file, data.data(), 10, WKI_IPC_EXPORT_PIPE_WRITE_BURST_CALLS);
+    bool const FIRST_ZERO_VALID = FIRST_ZERO_RET == 0 && script.calls == 1;
+
+    reset_script({20, -EIO, -EIO, -EIO}, 1);
+    ssize_t const CLAMPED_RET = export_pipe_write_bounded(&file, data.data(), 10, WKI_IPC_EXPORT_PIPE_WRITE_BURST_CALLS);
+    bool const CLAMP_VALID = CLAMPED_RET == 10 && script.calls == 1;
+
+    reset_script({1, 1, 1, 1}, 4);
+    ssize_t const CAPPED_RET = export_pipe_write_bounded(&file, data.data(), 10, WKI_IPC_EXPORT_PIPE_WRITE_BURST_CALLS);
+    bool const CAPPED_VALID = CAPPED_RET == 3 && script.calls == WKI_IPC_EXPORT_PIPE_WRITE_BURST_CALLS;
+
+    reset_script({-EPIPE, -EIO, -EIO, -EIO}, 1);
+    ssize_t const ERROR_RET = export_pipe_write_bounded(&file, data.data(), 10, WKI_IPC_EXPORT_PIPE_WRITE_BURST_CALLS);
+    bool const ERROR_VALID = ERROR_RET == -EPIPE && script.calls == 1;
+
+    reset_script({1, 1, -EIO, -EIO}, 2);
+    ssize_t const NONPIPE_RET = export_pipe_write_nonblocking(&file, data.data(), 10);
+    bool const NONPIPE_VALID = NONPIPE_RET == 1 && script.calls == 1;
+
+    return FULL_VALID && PARTIAL_VALID && ZERO_VALID && FIRST_ZERO_VALID && CLAMP_VALID && CAPPED_VALID && ERROR_VALID && NONPIPE_VALID
+               ? 0
+               : -EIO;
 }
 
 auto wki_ipc_selftest_pipe_fd_flags_preserve_nonblocking_access_mode() -> int {

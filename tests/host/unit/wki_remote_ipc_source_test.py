@@ -171,13 +171,31 @@ def test_export_pipe_write_uses_nonmutating_nonblocking_view() -> None:
         "ker::vfs::File* write_file = file",
         "init_nonblocking_pipe_write_view(pipe_write_view, *file)",
         "write_file = &pipe_write_view",
-        "write_file->fops->vfs_write(write_file, data, len, static_cast<size_t>(write_file->pos))",
+        "IS_PIPE && len <= WKI_IPC_PIPE_DATA_MAX_CHUNK",
+        "BURST ? WKI_IPC_EXPORT_PIPE_WRITE_BURST_CALLS : 1",
+        "export_pipe_write_bounded(write_file, data, len, MAX_CALLS)",
     ]
     missing = [token for token in write_required if token not in write_body]
     if missing:
         fail("export pipe writes must use a local nonblocking file view: " + ", ".join(missing))
     if "file->open_flags =" in write_body:
         fail("export pipe writes must not mutate shared File::open_flags")
+
+    bounded_body = function_body(remote_ipc, "export_pipe_write_bounded")
+    bounded_required = [
+        "call < max_calls && written < len",
+        "data + written",
+        "len - written",
+        "clamp_io_count",
+        "if (result <= 0)",
+        "written += static_cast<size_t>(result)",
+        "written != 0 ? static_cast<ssize_t>(written) : result",
+    ]
+    missing = [token for token in bounded_required if token not in bounded_body]
+    if missing:
+        fail("export pipe write bursts must stay bounded and preserve positive progress: " + ", ".join(missing))
+    if "WKI_IPC_EXPORT_PIPE_WRITE_BURST_CALLS = 3" not in remote_ipc:
+        fail("export pipe write burst must stay capped at one three-write wire-frame turn")
 
 
 def test_pipe_fd_open_flags_preserve_nonblocking_access_mode() -> None:
@@ -772,6 +790,7 @@ def test_ipc_selftests_are_declared_and_registered() -> None:
         "wki_ipc_selftest_inactive_proxy_poll_is_terminal",
         "wki_ipc_selftest_epoll_close_releases_lookup_ref",
         "wki_ipc_selftest_nonblocking_pipe_write_view_preserves_source_flags",
+        "wki_ipc_selftest_export_pipe_write_burst_is_bounded",
         "wki_ipc_selftest_pipe_fd_flags_preserve_nonblocking_access_mode",
         "wki_ipc_selftest_write_only_pipe_omits_receive_ring",
         "wki_ipc_selftest_attach_insert_failure_preserves_existing_fd",

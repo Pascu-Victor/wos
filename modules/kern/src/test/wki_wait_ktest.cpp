@@ -215,6 +215,8 @@ KTEST(WkiIpcExportPipe, NonblockingWriteViewPreservesSourceFlags) {
     KEXPECT_EQ(ker::net::wki::wki_ipc_selftest_nonblocking_pipe_write_view_preserves_source_flags(), 0);
 }
 
+KTEST(WkiIpcExportPipe, LocalWritesUseBoundedBurst) { KEXPECT_EQ(ker::net::wki::wki_ipc_selftest_export_pipe_write_burst_is_bounded(), 0); }
+
 KTEST(WkiIpcExportPipe, PreservesNonblockingFlagAndAccessMode) {
     KEXPECT_EQ(ker::net::wki::wki_ipc_selftest_pipe_fd_flags_preserve_nonblocking_access_mode(), 0);
 }
