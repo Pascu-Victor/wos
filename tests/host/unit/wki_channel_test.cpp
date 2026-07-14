@@ -97,8 +97,8 @@ TEST(WkiChannel, ResetClearsPostFenceReliabilityState) {
     ch.perf_last_stall_report_us = 444;
     ch.perf_last_stall_status = 555;
 
-    auto* rt = new WkiRetransmitEntry{};
-    rt->data = new uint8_t[4]{};
+    auto* rt = wki_retransmit_entry_alloc(4);
+    ASSERT_NE(rt, nullptr);
     rt->len = 4;
     rt->seq = 41;
     ch.retransmit_head = rt;
@@ -218,6 +218,20 @@ TEST(WkiChannel, InlineRetransmitStorageRequiresCapacityAndIdleSlot) {
     ch.tx_rt_entry_in_use = true;
     EXPECT_FALSE(wki_channel_has_inline_retransmit_storage(&ch, 1));
     EXPECT_FALSE(wki_channel_has_inline_retransmit_storage(nullptr, 1));
+}
+
+TEST(WkiChannel, HeapRetransmitEntryOwnsContiguousExactFrameStorage) {
+    auto* entry = wki_retransmit_entry_alloc(WKI_MAX_FRAME_SIZE);
+    ASSERT_NE(entry, nullptr);
+    EXPECT_EQ(entry->data, reinterpret_cast<uint8_t*>(entry + 1));
+
+    entry->data[0] = 0x12;
+    entry->data[WKI_MAX_FRAME_SIZE - 1] = 0x34;
+    EXPECT_EQ(entry->data[0], 0x12);
+    EXPECT_EQ(entry->data[WKI_MAX_FRAME_SIZE - 1], 0x34);
+
+    wki_retransmit_entry_release(nullptr, entry);
+    EXPECT_EQ(wki_retransmit_entry_alloc(WKI_MAX_FRAME_SIZE + 1), nullptr);
 }
 
 // =============================================================================

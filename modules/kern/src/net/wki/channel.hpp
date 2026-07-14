@@ -21,6 +21,14 @@ void wki_channel_update_rtt(WkiChannel* ch, uint32_t sample_us);
 // Retransmit the oldest unACKed message on a channel
 auto wki_channel_retransmit(WkiChannel* ch) -> int;
 
+// Allocate one heap retransmit record with its exact frame bytes stored
+// contiguously after the record. Allocation must remain outside channel locks.
+auto wki_retransmit_entry_alloc(size_t frame_len) -> WkiRetransmitEntry*;
+
+// Release either the channel's embedded retransmit record or one returned by
+// wki_retransmit_entry_alloc().
+void wki_retransmit_entry_release(WkiChannel* ch, WkiRetransmitEntry* entry);
+
 // Reset a channel to initial state (used during reconnection)
 void wki_channel_reset(WkiChannel* ch);
 

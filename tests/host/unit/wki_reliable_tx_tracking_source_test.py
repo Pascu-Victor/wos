@@ -101,6 +101,28 @@ def test_token_is_published_only_after_retransmit_recovery_exists() -> None:
     require_tokens(identity, ["identity.generation", "nullptr"], "identity send remains untracked")
 
 
+def test_heap_retransmit_storage_is_prepared_once_outside_channel_lock() -> None:
+    source = WKI_CPP.read_text()
+    send_impl = function_body(source, "wki_send_impl")
+    require_order(
+        send_impl,
+        [
+            "for (;;)",
+            "ch->generation != heap_rt_channel_generation",
+            "ch->tx_credits == 0",
+            "heap_rt_channel_generation = ch->generation",
+            "ch->lock.unlock()",
+            "heap_rt_entry = wki_retransmit_entry_alloc(FRAME_LEN)",
+            "ch->lock.lock()",
+            "rt_data = heap_rt_entry->data",
+            "memcpy(rt_data, frame, FRAME_LEN)",
+        ],
+        "single-allocation retransmit preparation and revalidation",
+    )
+    assert "new (std::nothrow) WkiRetransmitEntry" not in send_impl
+    assert "new (std::nothrow) uint8_t[FRAME_LEN]" not in send_impl
+
+
 def test_status_is_generation_qualified_and_uses_wrap_safe_cumulative_ack() -> None:
     source = WKI_CPP.read_text()
     status = function_body(source, "wki_reliable_tx_status")

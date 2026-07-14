@@ -32,8 +32,8 @@ KTEST(WkiChannel, ResetClearsPostFenceReliabilityState) {
     ch.perf_last_stall_report_us = 444;
     ch.perf_last_stall_status = 555;
 
-    auto* rt = new ker::net::wki::WkiRetransmitEntry{};
-    rt->data = new uint8_t[4]{};
+    auto* rt = ker::net::wki::wki_retransmit_entry_alloc(4);
+    KREQUIRE_NE(rt, nullptr);
     rt->len = 4;
     rt->seq = 41;
     ch.retransmit_head = rt;
@@ -122,8 +122,8 @@ KTEST(WkiChannel, CloseRetiresChannelAndClearsQueuedState) {
     ch.rx_credits = 2;
     ch.retransmit_deadline = std::numeric_limits<uint64_t>::max();
 
-    auto* rt = new ker::net::wki::WkiRetransmitEntry{};
-    rt->data = new uint8_t[4]{};
+    auto* rt = ker::net::wki::wki_retransmit_entry_alloc(4);
+    KREQUIRE_NE(rt, nullptr);
     rt->len = 4;
     rt->seq = 12;
     ch.retransmit_head = rt;
@@ -180,4 +180,18 @@ KTEST(WkiChannel, InlineRetransmitStorageRequiresCapacityAndIdleSlot) {
     ch.tx_rt_entry_in_use = true;
     KEXPECT_FALSE(ker::net::wki::wki_channel_has_inline_retransmit_storage(&ch, 1));
     KEXPECT_FALSE(ker::net::wki::wki_channel_has_inline_retransmit_storage(nullptr, 1));
+}
+
+KTEST(WkiChannel, HeapRetransmitEntryOwnsContiguousExactFrameStorage) {
+    auto* entry = ker::net::wki::wki_retransmit_entry_alloc(ker::net::wki::WKI_MAX_FRAME_SIZE);
+    KREQUIRE_NE(entry, nullptr);
+    KEXPECT_EQ(entry->data, reinterpret_cast<uint8_t*>(entry + 1));
+
+    entry->data[0] = 0x12;
+    entry->data[ker::net::wki::WKI_MAX_FRAME_SIZE - 1] = 0x34;
+    KEXPECT_EQ(entry->data[0], 0x12);
+    KEXPECT_EQ(entry->data[ker::net::wki::WKI_MAX_FRAME_SIZE - 1], 0x34);
+
+    ker::net::wki::wki_retransmit_entry_release(nullptr, entry);
+    KEXPECT_EQ(ker::net::wki::wki_retransmit_entry_alloc(ker::net::wki::WKI_MAX_FRAME_SIZE + 1), nullptr);
 }

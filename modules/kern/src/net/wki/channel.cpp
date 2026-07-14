@@ -5,23 +5,38 @@
 #include <net/wki/timer_math.hpp>
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
+#include <new>
 
 namespace ker::net::wki {
 
-namespace {
+auto wki_retransmit_entry_alloc(size_t frame_len) -> WkiRetransmitEntry* {
+    if (frame_len > WKI_MAX_FRAME_SIZE) {
+        return nullptr;
+    }
 
-void reset_retransmit_entry_storage(WkiChannel* ch, WkiRetransmitEntry* rt) {
-    if (rt == &ch->tx_rt_entry) {
+    void* const STORAGE = ::operator new(sizeof(WkiRetransmitEntry) + frame_len, std::nothrow);
+    if (STORAGE == nullptr) {
+        return nullptr;
+    }
+
+    auto* entry = new (STORAGE) WkiRetransmitEntry{};
+    entry->data = reinterpret_cast<uint8_t*>(entry + 1);
+    return entry;
+}
+
+void wki_retransmit_entry_release(WkiChannel* ch, WkiRetransmitEntry* entry) {
+    if (entry == nullptr) {
+        return;
+    }
+    if (ch != nullptr && entry == &ch->tx_rt_entry) {
         ch->tx_rt_entry_in_use = false;
         ch->tx_rt_entry = {};
         return;
     }
 
-    delete[] rt->data;
-    delete rt;
+    entry->~WkiRetransmitEntry();
+    ::operator delete(entry);
 }
-
-}  // namespace
 
 // -----------------------------------------------------------------------------
 // Standalone ACK
@@ -135,7 +150,7 @@ void wki_channel_reset(WkiChannel* ch) {
     WkiRetransmitEntry* rt = ch->retransmit_head;
     while (rt != nullptr) {
         WkiRetransmitEntry* next = rt->next;
-        reset_retransmit_entry_storage(ch, rt);
+        wki_retransmit_entry_release(ch, rt);
         rt = next;
     }
 

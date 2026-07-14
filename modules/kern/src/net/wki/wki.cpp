@@ -1340,19 +1340,6 @@ auto channel_pool_timer_slots() -> std::span<WkiChannel> {
     return {s_channel_pool.data(), LIMIT};
 }
 
-// Free a retransmit entry - checks whether it's the inline pre-allocated entry
-// (part of the channel struct) or a heap-allocated fallback, and acts accordingly.
-void rt_entry_free(WkiChannel* ch, WkiRetransmitEntry* rt) {
-    if (rt == &ch->tx_rt_entry) {
-        // Inline entry: just mark as available, don't free memory
-        ch->tx_rt_entry_in_use = false;
-    } else {
-        // Heap-allocated fallback
-        delete[] rt->data;
-        delete rt;
-    }
-}
-
 // Initialize a freshly allocated channel with default values
 void channel_init(WkiChannel* ch, uint16_t peer_node, uint16_t chan_id, PriorityClass prio, uint16_t credits) {
     ch->channel_id = chan_id;
@@ -2288,7 +2275,6 @@ auto wki_send_impl(uint16_t dst_node, uint16_t channel_id, MsgType msg_type, con
     uint8_t* frame = pkt->data;
 
     WkiRetransmitEntry* heap_rt_entry = nullptr;
-    uint8_t* heap_rt_data = nullptr;
     bool heap_rt_prepare_attempted = false;
     uint32_t heap_rt_channel_generation = 0;
     bool use_inline_retransmit = false;
@@ -2301,8 +2287,7 @@ auto wki_send_impl(uint16_t dst_node, uint16_t channel_id, MsgType msg_type, con
             expected_channel != nullptr && (ch != expected_channel || ch->generation != expected_generation);
         if (!ch->active || ch->peer_node_id != dst_node || ch->channel_id != channel_id || CHANNEL_REUSED || EXPECTED_CHANNEL_RETIRED) {
             ch->lock.unlock();
-            delete[] heap_rt_data;
-            delete heap_rt_entry;
+            wki_retransmit_entry_release(ch, heap_rt_entry);
             net::pkt_free(pkt);
             return WKI_ERR_NOT_FOUND;
         }
@@ -2313,8 +2298,7 @@ auto wki_send_impl(uint16_t dst_node, uint16_t channel_id, MsgType msg_type, con
         if (ch->tx_credits == 0) {
             uint32_t const TRACE_CORRELATION = ch->tx_seq;
             ch->lock.unlock();
-            delete[] heap_rt_data;
-            delete heap_rt_entry;
+            wki_retransmit_entry_release(ch, heap_rt_entry);
             net::pkt_free(pkt);
             perf_record_transport_point(mod::perf::WkiPerfTransportOp::NO_CREDITS, dst_node, channel_id, WKI_ERR_NO_CREDITS, 0,
                                         TRACE_CORRELATION, TRACE_CALLSITE);
@@ -2337,14 +2321,7 @@ auto wki_send_impl(uint16_t dst_node, uint16_t channel_id, MsgType msg_type, con
         heap_rt_channel_generation = ch->generation;
         ch->lock.unlock();
         heap_rt_prepare_attempted = true;
-        heap_rt_entry = new (std::nothrow) WkiRetransmitEntry{};
-        if (heap_rt_entry != nullptr) {
-            heap_rt_data = new (std::nothrow) uint8_t[FRAME_LEN];
-            if (heap_rt_data == nullptr) {
-                delete heap_rt_entry;
-                heap_rt_entry = nullptr;
-            }
-        }
+        heap_rt_entry = wki_retransmit_entry_alloc(FRAME_LEN);
         ch->lock.lock();
     }
 
@@ -2411,9 +2388,8 @@ auto wki_send_impl(uint16_t dst_node, uint16_t channel_id, MsgType msg_type, con
         // The slow path already paid for fallback storage. Keep the inline slot
         // free for another small frame that may arrive before this one is ACKed.
         rt_entry = heap_rt_entry;
-        rt_data = heap_rt_data;
+        rt_data = heap_rt_entry->data;
         heap_rt_entry = nullptr;
-        heap_rt_data = nullptr;
     } else if (use_inline_retransmit) {
         // Fast path: use pre-allocated inline buffers (fits small frames)
         rt_entry = &ch->tx_rt_entry;
@@ -2440,8 +2416,7 @@ auto wki_send_impl(uint16_t dst_node, uint16_t channel_id, MsgType msg_type, con
         // recoverable. Sending without a retransmit copy can permanently wedge
         // the receiver behind a missing head-of-line packet.
         ch->lock.unlock();
-        delete[] heap_rt_data;
-        delete heap_rt_entry;
+        wki_retransmit_entry_release(ch, heap_rt_entry);
         net::pkt_free(pkt);
         perf_record_transport_end(dst_node, channel_id, TRACE_CORRELATION, WKI_ERR_NO_MEM, payload_len, TRACE_CALLSITE);
         return WKI_ERR_NO_MEM;
@@ -2513,8 +2488,7 @@ auto wki_send_impl(uint16_t dst_node, uint16_t channel_id, MsgType msg_type, con
     ch->bytes_sent += payload_len;
 
     ch->lock.unlock();
-    delete[] heap_rt_data;
-    delete heap_rt_entry;
+    wki_retransmit_entry_release(ch, heap_rt_entry);
 
     if (ack_snapshot_present(post_unlock_ack)) {
         bool ack_notify_timer = false;
@@ -2940,7 +2914,7 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
                             perf_record_transport_rtt(ch->peer_node_id, ch->channel_id, rt->seq, sample, rt->retries);
                         }
 
-                        rt_entry_free(ch, rt);
+                        wki_retransmit_entry_release(ch, rt);
                     }
                 } else if (ACK_IN_SENT_WINDOW && hdr->ack_num + 1 == ch->tx_ack && ch->retransmit_head != nullptr) {
                     // Duplicate ACK for the current head-of-line gap.
