@@ -402,7 +402,7 @@ def test_submitted_task_slots_are_indexed_and_reclaimed() -> None:
             ],
             f"{submit_name} indexed publication and terminal retirement",
         )
-        if submit_body.count("consume_submitted_task_result_locked(task_ptr)") < 4:
+        if submit_body.count("consume_submitted_task_result_locked(task_ptr)") < 3:
             fail(f"{submit_name} must detach captured output on every terminal submit-failure path")
 
     require_tokens(
@@ -935,6 +935,112 @@ def test_submit_send_failure_keeps_stack_waiter_exit_discoverable() -> None:
             "consume_submitted_task_result_locked(task_ptr)",
             f"{function_name} send failure must not drop result ownership before waiter retirement",
         )
+
+
+def test_task_submit_envelopes_use_bounded_stack_storage() -> None:
+    source = REMOTE_COMPUTE_CPP.read_text()
+    header = REMOTE_COMPUTE_HPP.read_text()
+    ktest = REMOTE_COMPUTE_KTEST.read_text()
+
+    submitters = {
+        "wki_task_submit_inline": (
+            "auto wki_task_submit_vfs_ref(",
+            "if (TOTAL > WKI_ETH_MAX_PAYLOAD)",
+            "auto msg_len = static_cast<uint16_t>(TOTAL)",
+        ),
+        "wki_task_submit_vfs_ref": (
+            "auto wki_task_wait(",
+            "if (total > WKI_ETH_MAX_PAYLOAD)",
+            "auto msg_len = static_cast<uint16_t>(total)",
+        ),
+    }
+    for function_name, (next_function, size_guard, length_assignment) in submitters.items():
+        body_start = source.index(f"auto {function_name}(")
+        body = source[body_start : source.index(next_function, body_start + 1)]
+        require_tokens(
+            body,
+            [
+                size_guard,
+                length_assignment,
+                "ipc_fd_count != 0 && ipc_fd_map == nullptr",
+                "std::array<uint8_t, WKI_ETH_MAX_PAYLOAD> buf __attribute__((uninitialized));",
+                "reinterpret_cast<TaskSubmitPayload*>(buf.data())",
+                "uint8_t* cursor = buf.data() + sizeof(TaskSubmitPayload)",
+                "MsgType::TASK_SUBMIT, buf.data(),",
+            ],
+            f"{function_name} bounded stack envelope",
+        )
+        require_order(
+            body,
+            size_guard,
+            "std::array<uint8_t, WKI_ETH_MAX_PAYLOAD> buf",
+            f"{function_name} size check before stack use",
+        )
+        require_order(
+            body,
+            "std::array<uint8_t, WKI_ETH_MAX_PAYLOAD> buf",
+            "MsgType::TASK_SUBMIT, buf.data(),",
+            f"{function_name} build before send",
+        )
+        for forbidden in ["new (std::nothrow) uint8_t[msg_len]", "delete[] buf"]:
+            if forbidden in body:
+                fail(f"{function_name} must not heap-own its bounded TASK_SUBMIT envelope: found {forbidden}")
+        if re.search(r"std::array<uint8_t,\s*WKI_ETH_MAX_PAYLOAD>\s+buf\s*(?:\{\}|=\s*\{\})", body):
+            fail(f"{function_name} must not explicitly initialize the unused stack-envelope tail")
+        if re.search(r"MsgType::TASK_SUBMIT,\s*buf\.data\(\),\s*msg_len\)", body) is None:
+            fail(f"{function_name} must send exactly the initialized msg_len prefix")
+
+    require_tokens(
+        source,
+        [
+            "static_assert(WKI_ETH_MAX_PAYLOAD <= ker::mod::mm::KERNEL_STACK_SIZE / 16)",
+        ],
+        "TASK_SUBMIT stack headroom and pre-narrowing context bounds",
+    )
+    require_tokens(
+        function_body(source, "checked_submit_args_len"),
+        [
+            "static_cast<uint32_t>(argv_bytes)",
+            "static_cast<uint32_t>(envp_bytes)",
+            "static_cast<uint32_t>(cwd_len)",
+            "if (TOTAL > UINT16_MAX)",
+            "*args_len_out = static_cast<uint16_t>(TOTAL)",
+        ],
+        "checked submit argument length",
+    )
+    require_tokens(
+        function_body(source, "build_submit_context_info"),
+        ["checked_submit_args_len(argv_bytes, envp_bytes, info->cwd_len, &info->args_len)"],
+        "submit context validates combined arguments before narrowing",
+    )
+    selftest_token = "wki_remote_compute_selftest_submit_context_lengths_are_checked"
+    require_tokens(source, [f"auto {selftest_token}() -> bool"], "submit context length selftest implementation")
+    require_tokens(header, [f"auto {selftest_token}() -> bool;"], "submit context length selftest declaration")
+    require_tokens(
+        ktest,
+        ["SubmitContextLengthsAreCheckedBeforeNarrowing", selftest_token],
+        "submit context length KTEST coverage",
+    )
+
+    wki = WKI_CPP.read_text()
+    send_impl = function_body(wki, "wki_send_impl")
+    require_order(
+        send_impl,
+        "memcpy(frame + WKI_HEADER_SIZE, payload, payload_len)",
+        "memcpy(rt_data, frame, FRAME_LEN)",
+        "TASK_SUBMIT borrow copied into frame before retransmit ownership",
+    )
+    require_order(
+        send_impl,
+        "memcpy(rt_data, frame, FRAME_LEN)",
+        "return WKI_OK",
+        "TASK_SUBMIT borrow retained synchronously before send returns",
+    )
+    require_tokens(
+        function_body(wki, "wki_send_on_channel_generation"),
+        ["return wki_send_impl("],
+        "generation-qualified sender synchronous delegation",
+    )
 
 
 def test_proxy_waiting_publication_is_transactional() -> None:
@@ -2028,6 +2134,7 @@ def main() -> None:
     test_submitted_task_slots_are_indexed_and_reclaimed()
     test_task_exit_retires_remote_compute_wait_owners()
     test_submit_send_failure_keeps_stack_waiter_exit_discoverable()
+    test_task_submit_envelopes_use_bounded_stack_storage()
     test_proxy_waiting_publication_is_transactional()
     test_remote_load_procfs_uses_locked_snapshot()
     test_load_report_uses_cpu_accounting_and_shared_local_cache()

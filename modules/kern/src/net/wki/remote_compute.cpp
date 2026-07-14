@@ -74,6 +74,7 @@ constexpr uint64_t WKI_TASK_SUBMIT_VFS_TIMEOUT_US = 60'000'000;  // Remote binar
 constexpr uint64_t WKI_TASK_SUBMIT_INLINE_RECEIVER_TIMEOUT_US = WKI_OP_TIMEOUT_US - 1'000'000;
 constexpr uint64_t WKI_TASK_SUBMIT_VFS_RECEIVER_TIMEOUT_US = WKI_TASK_SUBMIT_VFS_TIMEOUT_US - 5'000'000;
 static_assert(WKI_TASK_SUBMIT_INLINE_RECEIVER_TIMEOUT_US > 0);
+static_assert(WKI_ETH_MAX_PAYLOAD <= ker::mod::mm::KERNEL_STACK_SIZE / 16);
 
 class PeerLifecycleLease {
    public:
@@ -1742,6 +1743,18 @@ auto accumulate_string_block(const char* const* strings, uint16_t* count_out, ui
     return true;
 }
 
+auto checked_submit_args_len(uint16_t argv_bytes, uint16_t envp_bytes, uint16_t cwd_len, uint16_t* args_len_out) -> bool {
+    if (args_len_out == nullptr) {
+        return false;
+    }
+    uint32_t const TOTAL = static_cast<uint32_t>(argv_bytes) + static_cast<uint32_t>(envp_bytes) + static_cast<uint32_t>(cwd_len);
+    if (TOTAL > UINT16_MAX) {
+        return false;
+    }
+    *args_len_out = static_cast<uint16_t>(TOTAL);
+    return true;
+}
+
 auto build_submit_context_info(const ker::mod::sched::task::Task* task, const char* const* argv, const char* const* envp, const char* cwd,
                                SubmitContextInfo* info) -> bool {
     uint16_t argv_bytes = 0;
@@ -1758,7 +1771,9 @@ auto build_submit_context_info(const ker::mod::sched::task::Task* task, const ch
         info->cwd_len = static_cast<uint16_t>(CWD_LEN);
     }
 
-    info->args_len = static_cast<uint16_t>(argv_bytes + envp_bytes + info->cwd_len);
+    if (!checked_submit_args_len(argv_bytes, envp_bytes, info->cwd_len, &info->args_len)) {
+        return false;
+    }
     info->identity_len = task != nullptr ? static_cast<uint16_t>(sizeof(WkiTaskIdentityContext)) : 0;
     info->policy_len = serialized_task_vfs_rules_size(task);
 
@@ -2549,7 +2564,7 @@ auto wki_task_submit_inline(uint16_t target_node, const void* binary, uint32_t b
                             const char* cwd, ker::mod::sched::task::Task* local_task, const WkiIpcFdEntry* ipc_fd_map,
                             uint16_t ipc_fd_count) -> uint32_t {
     auto cleanup_ipc_exports = [&]() { wki_ipc_cleanup_exported_fds(ipc_fd_map, ipc_fd_count, target_node); };
-    if (binary == nullptr || binary_len == 0) {
+    if (binary == nullptr || binary_len == 0 || (ipc_fd_count != 0 && ipc_fd_map == nullptr)) {
         cleanup_ipc_exports();
         return 0;
     }
@@ -2613,23 +2628,13 @@ auto wki_task_submit_inline(uint16_t target_node, const void* binary, uint32_t b
     uint64_t const CALLSITE = WOS_PERF_CALLSITE();
     perf_record_compute_begin(ker::mod::perf::WkiPerfComputeOp::SUBMIT_INLINE, target_node, TASK_ID, binary_len, CALLSITE);
 
-    // Build TASK_SUBMIT message
+    // Build TASK_SUBMIT message. Every byte in the transmitted prefix is
+    // assigned below; do not pattern-initialize the unused bounded tail.
     auto msg_len = static_cast<uint16_t>(TOTAL);
-    auto* buf = new (std::nothrow) uint8_t[msg_len];
-    if (buf == nullptr) {
-        uint8_t* discarded_output = nullptr;
-        s_compute_lock.lock();
-        if (auto* task_ptr = find_submitted_task_any(TASK_ID); task_ptr != nullptr) {
-            task_ptr->active = false;
-            discarded_output = consume_submitted_task_result_locked(task_ptr);
-        }
-        s_compute_lock.unlock();
-        delete[] discarded_output;
-        cleanup_ipc_exports();
-        return 0;
-    }
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
+    std::array<uint8_t, WKI_ETH_MAX_PAYLOAD> buf __attribute__((uninitialized));
 
-    auto* submit = reinterpret_cast<TaskSubmitPayload*>(buf);
+    auto* submit = reinterpret_cast<TaskSubmitPayload*>(buf.data());
     submit->task_id = TASK_ID;
     submit->delivery_mode = static_cast<uint8_t>(TaskDeliveryMode::INLINE);
     submit->prefer_inline = 1;
@@ -2642,7 +2647,7 @@ auto wki_task_submit_inline(uint16_t target_node, const void* binary, uint32_t b
     submit->reserved = 0;
 
     // INLINE format: {binary_len:u32, binary[binary_len], argv/envp/cwd, identity, policy, ipc_fd_entries[]}
-    uint8_t* cursor = buf + sizeof(TaskSubmitPayload);
+    uint8_t* cursor = buf.data() + sizeof(TaskSubmitPayload);
     memcpy(cursor, &binary_len, sizeof(uint32_t));
     cursor += sizeof(uint32_t);
     memcpy(cursor, binary, binary_len);
@@ -2673,9 +2678,8 @@ auto wki_task_submit_inline(uint16_t target_node, const void* binary, uint32_t b
     }
     s_compute_lock.unlock();
 
-    int const SEND_RET =
-        wki_send_on_channel_generation(target_node, SUBMIT_CHANNEL.channel, SUBMIT_CHANNEL.generation, MsgType::TASK_SUBMIT, buf, msg_len);
-    delete[] buf;
+    int const SEND_RET = wki_send_on_channel_generation(target_node, SUBMIT_CHANNEL.channel, SUBMIT_CHANNEL.generation,
+                                                        MsgType::TASK_SUBMIT, buf.data(), msg_len);
 
     if (SEND_RET != WKI_OK) {
         bool claimed_waiter = false;
@@ -2775,7 +2779,7 @@ auto wki_task_submit_vfs_ref(uint16_t target_node, const char* vfs_path,
                              const char* cwd, ker::mod::sched::task::Task* local_task, const WkiIpcFdEntry* ipc_fd_map,
                              uint16_t ipc_fd_count) -> uint32_t {
     auto cleanup_ipc_exports = [&]() { wki_ipc_cleanup_exported_fds(ipc_fd_map, ipc_fd_count, target_node); };
-    if (vfs_path == nullptr || vfs_path[0] == '\0') {
+    if (vfs_path == nullptr || vfs_path[0] == '\0' || (ipc_fd_count != 0 && ipc_fd_map == nullptr)) {
         cleanup_ipc_exports();
         return 0;
     }
@@ -2843,22 +2847,13 @@ auto wki_task_submit_vfs_ref(uint16_t target_node, const char* vfs_path,
     uint64_t const CALLSITE = WOS_PERF_CALLSITE();
     perf_record_compute_begin(ker::mod::perf::WkiPerfComputeOp::SUBMIT_VFS_REF, target_node, TASK_ID, PATH_LEN_WIRE, CALLSITE);
 
+    // Every byte in the transmitted prefix is assigned below; do not
+    // pattern-initialize the unused bounded tail.
     auto msg_len = static_cast<uint16_t>(total);
-    auto* buf = new (std::nothrow) uint8_t[msg_len];
-    if (buf == nullptr) {
-        uint8_t* discarded_output = nullptr;
-        s_compute_lock.lock();
-        if (auto* task_ptr = find_submitted_task_any(TASK_ID); task_ptr != nullptr) {
-            task_ptr->active = false;
-            discarded_output = consume_submitted_task_result_locked(task_ptr);
-        }
-        s_compute_lock.unlock();
-        delete[] discarded_output;
-        cleanup_ipc_exports();
-        return 0;
-    }
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
+    std::array<uint8_t, WKI_ETH_MAX_PAYLOAD> buf __attribute__((uninitialized));
 
-    auto* submit = reinterpret_cast<TaskSubmitPayload*>(buf);
+    auto* submit = reinterpret_cast<TaskSubmitPayload*>(buf.data());
     submit->task_id = TASK_ID;
     submit->delivery_mode = static_cast<uint8_t>(TaskDeliveryMode::VFS_REF);
     submit->prefer_inline = 0;
@@ -2871,7 +2866,7 @@ auto wki_task_submit_vfs_ref(uint16_t target_node, const char* vfs_path,
     submit->reserved = 0;
 
     // VFS_REF format: {path_len:u16, path[path_len], argv/envp/cwd, identity, policy, ipc_fd_entries[]}
-    uint8_t* cursor = buf + sizeof(TaskSubmitPayload);
+    uint8_t* cursor = buf.data() + sizeof(TaskSubmitPayload);
     memcpy(cursor, &PATH_LEN_WIRE, sizeof(uint16_t));
     cursor += sizeof(uint16_t);
     memcpy(cursor, vfs_path, PATH_LEN_WIRE);
@@ -2902,9 +2897,8 @@ auto wki_task_submit_vfs_ref(uint16_t target_node, const char* vfs_path,
     }
     s_compute_lock.unlock();
 
-    int const SEND_RET =
-        wki_send_on_channel_generation(target_node, SUBMIT_CHANNEL.channel, SUBMIT_CHANNEL.generation, MsgType::TASK_SUBMIT, buf, msg_len);
-    delete[] buf;
+    int const SEND_RET = wki_send_on_channel_generation(target_node, SUBMIT_CHANNEL.channel, SUBMIT_CHANNEL.generation,
+                                                        MsgType::TASK_SUBMIT, buf.data(), msg_len);
 
     if (SEND_RET != WKI_OK) {
         bool claimed_waiter = false;
@@ -6440,6 +6434,16 @@ void wki_remote_compute_notify_pending_submit() {
 void wki_remote_compute_process_pending_submits() { drain_pending_task_submits(); }
 
 #ifdef WOS_SELFTEST
+auto wki_remote_compute_selftest_submit_context_lengths_are_checked() -> bool {
+    uint16_t exact = 0;
+    uint16_t untouched = 0xA55AU;
+    bool const EXACT_MAX = checked_submit_args_len(UINT16_MAX - 2, 1, 1, &exact) && exact == UINT16_MAX;
+    bool const COMBINED_OVERFLOW = !checked_submit_args_len(UINT16_MAX, 1, 0, &untouched) && untouched == 0xA55AU;
+    bool const THREE_WAY_OVERFLOW = !checked_submit_args_len(0x8000U, 0x4000U, 0x4000U, &untouched) && untouched == 0xA55AU;
+    bool const NULL_OUTPUT_REJECTED = !checked_submit_args_len(1, 2, 3, nullptr);
+    return EXACT_MAX && COMBINED_OVERFLOW && THREE_WAY_OVERFLOW && NULL_OUTPUT_REJECTED;
+}
+
 auto wki_remote_compute_selftest_submit_worker_count_is_bounded() -> bool {
     return compute_submit_worker_target(0) == 1 && compute_submit_worker_target(1) == 1 && compute_submit_worker_target(2) == 2 &&
            compute_submit_worker_target(WKI_COMPUTE_SUBMIT_WORKER_MAX) == WKI_COMPUTE_SUBMIT_WORKER_MAX &&

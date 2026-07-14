@@ -401,6 +401,7 @@ auto wki_remote_compute_selftest_submitted_slots_reclaim_safely() -> bool;
 auto wki_remote_compute_selftest_task_id_wrap_is_safe() -> bool;
 auto wki_remote_compute_selftest_load_snapshot_survives_cleanup() -> bool;
 auto wki_remote_compute_selftest_submit_policy_scope_restores_worker() -> bool;
+auto wki_remote_compute_selftest_submit_context_lengths_are_checked() -> bool;
 auto wki_remote_compute_selftest_submit_worker_count_is_bounded() -> bool;
 auto wki_remote_compute_selftest_accept_retry_is_fair() -> bool;
 auto wki_remote_compute_selftest_submit_cancel_is_session_scoped() -> bool;
