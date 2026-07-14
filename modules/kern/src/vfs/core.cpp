@@ -10804,7 +10804,9 @@ auto vfs_stat_absolute_local_fast_path(ker::mod::sched::task::Task* task, const 
         return true;
     }
     if (task_absolute_local_trailing_slash_direct_allowed(task, path, SCAN)) {
-        std::array<char, MAX_PATH_LEN> trimmed{};  // NOLINT(cppcoreguidelines-pro-type-member-init)
+        // copy_trailing_slash_trimmed_path initializes the complete NUL-terminated string on success.
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
+        std::array<char, MAX_PATH_LEN> trimmed __attribute__((uninitialized));
         if (!copy_trailing_slash_trimmed_path(path, SCAN, trimmed)) {
             *result_out = -ENAMETOOLONG;
             return true;
@@ -10882,6 +10884,12 @@ auto vfs_selftest_absolute_local_stat_fast_path_gate() -> bool {
     PathTextScan const trailing_scan = scan_path_text("/tmp/file/");
     ok = ok && trailing_scan.normalized_len == std::strlen("/tmp/file") &&
          trailing_scan.normalized_path_hash == metadata_path_hash_raw("/tmp/file", trailing_scan.normalized_len);
+    std::array<char, MAX_PATH_LEN> trimmed{};
+    trimmed.fill('x');
+    if (!copy_trailing_slash_trimmed_path("/tmp/file/", trailing_scan, trimmed) || std::strcmp(trimmed.data(), "/tmp/file") != 0 ||
+        trimmed.at(trailing_scan.normalized_len) != '\0') {
+        return false;
+    }
     ok = ok && !task_absolute_local_path_direct_result_allowed(&task, "/tmp/", scan_path_text("/tmp/"));
     ok = ok && task_absolute_local_trailing_slash_direct_allowed(&task, "/tmp/", scan_path_text("/tmp/"));
     ok = ok && !task_absolute_local_path_fast_path_allowed(&task, "/tmp/../file", nullptr);

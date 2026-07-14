@@ -754,6 +754,80 @@ def test_synthetic_readdir_visible_paths_are_initialized_by_root_strip() -> None
         cursor = verification_pos + len(verification)
 
 
+def test_stat_trailing_slash_scratch_is_initialized_by_trim_producer() -> None:
+    core = VFS_CORE_CPP.read_text()
+    producer = function_body(core, "copy_trailing_slash_trimmed_path")
+    fast_path = function_body(core, "vfs_stat_absolute_local_fast_path")
+    selftest = function_body(core, "vfs_selftest_absolute_local_stat_fast_path_gate")
+
+    declaration = "std::array<char, MAX_PATH_LEN> trimmed __attribute__((uninitialized));"
+    require_only_uninitialized_array(fast_path, "trimmed", declaration, "trailing-slash stat scratch")
+    require_order(
+        fast_path,
+        [
+            "task_absolute_local_trailing_slash_direct_allowed(task, path, SCAN)",
+            declaration,
+            "if (!copy_trailing_slash_trimmed_path",
+            "*result_out = -ENAMETOOLONG",
+            "return true",
+            "vfs_stat_resolved_cache_or_impl(trimmed.data()",
+        ],
+        "trailing-slash stat scratch producer and consumer ordering",
+    )
+    failure = block_body_after(
+        fast_path[fast_path.find("if (!copy_trailing_slash_trimmed_path") :],
+        "if (!copy_trailing_slash_trimmed_path",
+    )
+    if failure.strip() != "*result_out = -ENAMETOOLONG;\n            return true;":
+        fail("trailing-slash stat fast path must return before consuming failed scratch output")
+    if len(re.findall(r"\btrimmed\b", fast_path)) != 3:
+        fail("trailing-slash stat scratch has an unexpected producer or consumer")
+
+    require_order(
+        producer,
+        [
+            "if (path == nullptr || scan.normalized_len == 0 || scan.normalized_len >= out.size())",
+            "return false",
+            "std::memcpy(out.data(), path, scan.normalized_len)",
+            "out.at(scan.normalized_len) = '\\0'",
+            "return true",
+        ],
+        "bounded trailing-slash path production",
+    )
+    if len(re.findall(r"\bout\b", producer)) != 3:
+        fail("trailing-slash path producer destination flow changed; re-audit complete initialization")
+    if producer.count("return false;") != 1 or producer.count("return true;") != 1 or len(re.findall(r"\breturn\b", producer)) != 2:
+        fail("trailing-slash path producer must have no success exit before complete production")
+    forbid(
+        producer,
+        [
+            "out.fill(",
+            "std::memset(out.data()",
+            "memset(out.data()",
+            "std::fill(out.",
+            "std::ranges::fill(out.",
+        ],
+        "trailing-slash path producer redundant destination clearing",
+    )
+
+    poison = "trimmed.fill('x');"
+    if selftest.count("\n    trimmed.fill('x');\n") != 1:
+        fail("trailing-slash stat destination poison must be one unconditional complete statement")
+    verification = (
+        'if (!copy_trailing_slash_trimmed_path("/tmp/file/", trailing_scan, trimmed) || '
+        'std::strcmp(trimmed.data(), "/tmp/file") != 0 ||\n'
+        "        trimmed.at(trailing_scan.normalized_len) != '\\0') {\n"
+        "        return false;\n"
+        "    }"
+    )
+    poison_pos = selftest.find(poison)
+    verification_pos = selftest.find(verification, poison_pos + len(poison))
+    if poison_pos < 0 or verification_pos < 0 or selftest[poison_pos + len(poison) : verification_pos].strip():
+        fail("trailing-slash stat poison must immediately precede exact content and terminator verification")
+    if len(re.findall(r"\btrimmed\b", selftest)) != 5:
+        fail("trailing-slash stat KTEST has unexpected scratch use")
+
+
 def test_statat_scratch_is_initialized_by_dirfd_resolver() -> None:
     core = VFS_CORE_CPP.read_text()
     statat = function_body(core, "vfs_statat")
@@ -985,6 +1059,7 @@ if __name__ == "__main__":
     test_prefix_symlink_scratch_is_initialized_by_its_producers()
     test_readdir_child_path_scratch_is_initialized_by_its_producer()
     test_synthetic_readdir_visible_paths_are_initialized_by_root_strip()
+    test_stat_trailing_slash_scratch_is_initialized_by_trim_producer()
     test_statat_scratch_is_initialized_by_dirfd_resolver()
     test_open_path_scratch_is_initialized_by_its_producers()
     print("VFS open path scratch invariants hold")
