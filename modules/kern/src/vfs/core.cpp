@@ -10816,7 +10816,9 @@ auto vfs_stat_absolute_local_fast_path(ker::mod::sched::task::Task* task, const 
         return true;
     }
 
-    std::array<char, MAX_PATH_LEN> resolved;  // NOLINT(cppcoreguidelines-pro-type-member-init)
+    // copy_common_local_visible_absolute_path_fast_path initializes the complete NUL-terminated string on success.
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
+    std::array<char, MAX_PATH_LEN> resolved __attribute__((uninitialized));
     size_t resolved_len = UNKNOWN_PATH_LEN;
     uint64_t resolved_hash = UNKNOWN_PATH_HASH;
     int const FAST_RET = copy_common_local_visible_absolute_path_fast_path(task, path, SCAN, resolved.data(), resolved.size(),

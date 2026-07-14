@@ -66,6 +66,16 @@ def block_body_after(source: str, header: str) -> str:
     return source[body_start + 1 : pos - 1]
 
 
+def brace_depth_at(source: str, pos: int) -> int:
+    depth = 0
+    for char in source[:pos]:
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+    return depth
+
+
 def require_only_uninitialized_array(body: str, name: str, expected: str, context: str) -> None:
     declarations = re.findall(rf"\bstd::array<[^;\n]+>\s+{re.escape(name)}\b[^;\n]*;", body)
     if declarations != [expected]:
@@ -261,11 +271,27 @@ def test_absolute_visible_scratch_is_initialized_by_dot_clean_producer() -> None
         "canonicalize-to-root KTEST coverage",
     )
     poison = "resolved.fill('x');"
-    root_call = 'ret = copy_common_local_visible_absolute_path_fast_path(&task, "/..", scan_path_text("/..")'
-    poison_end = selftest.find(poison) + len(poison)
+    if selftest.count("\n    resolved.fill('x');\n") != 1 or "if (false)" in selftest or "if(false)" in selftest or "goto" in selftest:
+        fail("canonicalize-to-root destination poison must be one unconditional complete statement")
+    poison_pos = selftest.find(poison)
+    if poison_pos < 0 or brace_depth_at(selftest, poison_pos) != 0:
+        fail("canonicalize-to-root destination poison must remain on the unconditional function path")
+    root_call = (
+        'ret = copy_common_local_visible_absolute_path_fast_path(&task, "/..", scan_path_text("/.."), resolved.data(), resolved.size(),\n'
+        "                                                            &resolved_len, &resolved_hash);"
+    )
+    root_verification = (
+        "ok = ok && ret == 0 && resolved_len == 1 && resolved.at(resolved_len) == '\\0' && "
+        'std::strcmp(resolved.data(), "/") == 0 &&\n'
+        '         resolved_hash == metadata_path_hash_raw("/", 1);'
+    )
+    poison_end = poison_pos + len(poison)
     root_call_pos = selftest.find(root_call, poison_end)
     if poison_end < len(poison) or root_call_pos < 0 or selftest[poison_end:root_call_pos].strip():
         fail("canonicalize-to-root destination poison must immediately precede the producer call")
+    root_verification_pos = selftest.find(root_verification, root_call_pos + len(root_call))
+    if root_verification_pos < 0 or selftest[root_call_pos + len(root_call) : root_verification_pos].strip():
+        fail("canonicalize-to-root output must be verified immediately after the exact producer call")
 
 
 def test_prefix_symlink_scratch_is_initialized_by_its_producers() -> None:
@@ -823,12 +849,76 @@ def test_stat_trailing_slash_scratch_is_initialized_by_trim_producer() -> None:
     )
     poison_pos = selftest.find(poison)
     verification_pos = selftest.find(verification, poison_pos + len(poison))
-    if poison_pos < 0 or verification_pos < 0 or selftest[poison_pos + len(poison) : verification_pos].strip():
+    if (
+        poison_pos < 0
+        or brace_depth_at(selftest, poison_pos) != 0
+        or verification_pos < 0
+        or selftest[poison_pos + len(poison) : verification_pos].strip()
+    ):
         fail("trailing-slash stat poison must immediately precede exact content and terminator verification")
     if len(re.findall(r"\btrimmed\b", selftest)) != 5:
         fail("trailing-slash stat KTEST has unexpected scratch use")
     if "goto" in selftest:
         fail("trailing-slash stat KTEST verification must not be bypassed")
+
+
+def test_absolute_stat_scratch_is_initialized_by_visible_path_producer() -> None:
+    core = VFS_CORE_CPP.read_text()
+    fast_path = function_body(core, "vfs_stat_absolute_local_fast_path")
+
+    declaration = "std::array<char, MAX_PATH_LEN> resolved __attribute__((uninitialized));"
+    require_only_uninitialized_array(fast_path, "resolved", declaration, "absolute stat resolved scratch")
+    producer_call = (
+        "int const FAST_RET = copy_common_local_visible_absolute_path_fast_path(task, path, SCAN, resolved.data(), resolved.size(),\n"
+        "                                                                           &resolved_len, &resolved_hash);"
+    )
+    producer_setup = (
+        "size_t resolved_len = UNKNOWN_PATH_LEN;\n"
+        "    uint64_t resolved_hash = UNKNOWN_PATH_HASH;\n"
+        f"    {producer_call}"
+    )
+    gate_sequence = (
+        "if (FAST_RET == RESOLVE_FAST_PATH_DECLINED) {\n"
+        "        return false;\n"
+        "    }\n"
+        "    if (FAST_RET < 0) {\n"
+        "        *result_out = FAST_RET;\n"
+        "        return true;\n"
+        "    }"
+    )
+    require_order(
+        fast_path,
+        [
+            "vfs_stat_resolved_cache_or_impl(trimmed.data()",
+            "return true",
+            declaration,
+            producer_setup,
+            gate_sequence,
+            "vfs_stat_resolved_cache_or_impl(resolved.data()",
+        ],
+        "absolute stat resolved scratch producer and consumer ordering",
+    )
+    declaration_pos = fast_path.find(declaration)
+    setup_pos = fast_path.find(producer_setup, declaration_pos + len(declaration))
+    if declaration_pos < 0 or setup_pos < 0 or fast_path[declaration_pos + len(declaration) : setup_pos].strip():
+        fail("absolute stat producer setup must immediately follow the scratch declaration")
+    if brace_depth_at(fast_path, declaration_pos) != 0:
+        fail("absolute stat resolved scratch and producer must remain on the unconditional function path")
+    call_pos = fast_path.find(producer_call, setup_pos)
+    gates_pos = fast_path.find(gate_sequence, call_pos + len(producer_call))
+    if call_pos < 0 or gates_pos < 0 or fast_path[call_pos + len(producer_call) : gates_pos].strip():
+        fail("absolute stat decline and failure gates must immediately follow the exact producer call")
+    if fast_path.count("copy_common_local_visible_absolute_path_fast_path") != 2 or "goto" in fast_path:
+        fail("absolute stat must call the namespace producer without control-flow bypass or local shadowing")
+    expected_uses = {
+        "resolved": 4,
+        "FAST_RET": 4,
+        "resolved_len": 3,
+        "resolved_hash": 3,
+    }
+    for name, count in expected_uses.items():
+        if len(re.findall(rf"\b{re.escape(name)}\b", fast_path)) != count:
+            fail(f"absolute stat fast path has unexpected {name} use")
 
 
 def test_current_task_stat_scratch_is_initialized_by_dirfd_resolver() -> None:
@@ -939,18 +1029,72 @@ def test_statat_scratch_is_initialized_by_dirfd_resolver() -> None:
         fail("fast dirfd resolver must not clear its complete destination before bounded production")
 
     fast_producer_flows = {
-        "copy_common_local_dirfd_relative_path": (4, 4),
-        "copy_common_local_visible_absolute_path_fast_path": (5, 3),
-        "copy_task_visible_absolute_path_with_root": (5, 3),
-        "copy_simple_relative_path_from_base": (9, 4),
-        "copy_dot_clean_visible_absolute_path": (4, 2),
-        "append_dot_clean_path_components": (5, 4),
+        "copy_common_local_dirfd_relative_path": (4, 4, 4, 0),
+        "copy_common_local_visible_absolute_path_fast_path": (5, 3, 7, 0),
+        "copy_task_visible_absolute_path_with_root": (5, 3, 6, 2),
+        "copy_simple_relative_path_from_base": (9, 4, 6, 1),
+        "copy_dot_clean_visible_absolute_path": (4, 2, 2, 0),
+        "append_dot_clean_path_components": (5, 4, 5, 1),
+    }
+    fast_producer_returns = {
+        "copy_common_local_dirfd_relative_path": [
+            "-EINVAL",
+            "copy_simple_relative_path_from_base(task->cwd.data(), pathname, scan, out, outsize, out_len, "
+            "task_cached_cwd_len(task), out_hash)",
+            "-EBADF",
+            "result",
+        ],
+        "copy_common_local_visible_absolute_path_fast_path": [
+            "RESOLVE_FAST_PATH_DECLINED",
+            "RESOLVE_FAST_PATH_DECLINED",
+            "DOT_CLEAN_RET",
+            "RESOLVE_FAST_PATH_DECLINED",
+            "ROOT_COPY_RET",
+            "RESOLVE_FAST_PATH_DECLINED",
+            "COPY_RET",
+        ],
+        "copy_task_visible_absolute_path_with_root": [
+            "-EINVAL",
+            "-ENAMETOOLONG",
+            "-ENAMETOOLONG",
+            "0",
+            "-ENAMETOOLONG",
+            "0",
+        ],
+        "copy_simple_relative_path_from_base": [
+            "-EINVAL",
+            "RESOLVE_FAST_PATH_DECLINED",
+            "-ENAMETOOLONG",
+            "RET",
+            "-ENAMETOOLONG",
+            "0",
+        ],
+        "copy_dot_clean_visible_absolute_path": ["RESOLVE_FAST_PATH_DECLINED", "RET"],
+        "append_dot_clean_path_components": [
+            "RESOLVE_FAST_PATH_DECLINED",
+            "RESOLVE_FAST_PATH_DECLINED",
+            "-ENAMETOOLONG",
+            "-ENAMETOOLONG",
+            "0",
+        ],
     }
     bulk_clear_patterns = resolver_clear_patterns[:2]
-    for producer, (out_count, outsize_count) in fast_producer_flows.items():
+    for producer, (out_count, outsize_count, return_count, zero_return_count) in fast_producer_flows.items():
         body = function_body(core, producer)
+        return_types = re.findall(
+            rf"\bauto\s+{re.escape(producer)}\([^;{{]*\)\s*->\s*([A-Za-z0-9_:<>*]+)\s*\{{",
+            core,
+            flags=re.DOTALL,
+        )
+        if return_types != ["int"]:
+            fail(f"{producer} must preserve its signed integer result domain")
+        return_expressions = [" ".join(expression.split()) for expression in re.findall(r"\breturn\s+([^;]+);", body)]
+        if return_expressions != fast_producer_returns[producer]:
+            fail(f"{producer} return expressions changed; re-audit complete-production success semantics")
         if len(re.findall(r"\bout\b", body)) != out_count or len(re.findall(r"\boutsize\b", body)) != outsize_count:
             fail(f"{producer} destination flow changed; re-audit for redundant whole-buffer clearing")
+        if len(re.findall(r"\breturn\b", body)) != return_count or body.count("return 0;") != zero_return_count:
+            fail(f"{producer} return topology changed; re-audit for success before complete production")
         if any(re.search(pattern, body) for pattern in bulk_clear_patterns):
             fail(f"{producer} must not bulk-clear its destination before bounded production")
 
@@ -974,7 +1118,12 @@ def test_statat_scratch_is_initialized_by_dirfd_resolver() -> None:
         "                                                        &requires_directory, &resolved_len);"
     poison_pos = selftest.find(poison)
     call_pos = selftest.find(call, poison_pos + len(poison))
-    if poison_pos < 0 or call_pos < 0 or selftest[poison_pos + len(poison) : call_pos].strip():
+    if (
+        poison_pos < 0
+        or brace_depth_at(selftest, poison_pos) != 0
+        or call_pos < 0
+        or selftest[poison_pos + len(poison) : call_pos].strip()
+    ):
         fail("statat resolver destination poison must immediately precede the producer call")
     verification = (
         "bool ok = RESOLVE_RET == 0 && !requires_directory && resolved_len == std::strlen(FILE_PATH) &&\n"
@@ -1126,6 +1275,7 @@ if __name__ == "__main__":
     test_readdir_child_path_scratch_is_initialized_by_its_producer()
     test_synthetic_readdir_visible_paths_are_initialized_by_root_strip()
     test_stat_trailing_slash_scratch_is_initialized_by_trim_producer()
+    test_absolute_stat_scratch_is_initialized_by_visible_path_producer()
     test_current_task_stat_scratch_is_initialized_by_dirfd_resolver()
     test_statat_scratch_is_initialized_by_dirfd_resolver()
     test_open_path_scratch_is_initialized_by_its_producers()
