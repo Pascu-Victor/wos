@@ -11854,7 +11854,9 @@ auto vfs_access_f_ok_resolved(const char* resolved_path, bool require_directory,
                                   resolved_path_len == known_resolved_path_len)
                                      ? known_resolved_path_hash
                                      : UNKNOWN_PATH_HASH;
-    std::array<char, MAX_PATH_LEN> path_buffer;  // NOLINT(cppcoreguidelines-pro-type-member-init)
+    // The changed-symlink copy below initializes the complete NUL-terminated string before adoption.
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
+    std::array<char, MAX_PATH_LEN> path_buffer __attribute__((uninitialized));
     auto mount_ref = find_mount_point(current_path, current_path_len);
     MountPoint const* mount = mount_ref.get();
     bool const EFFECTIVE_FOLLOW_FINAL_SYMLINK = follow_final_symlink || require_directory;
@@ -11909,7 +11911,9 @@ auto vfs_access_f_ok_resolved(const char* resolved_path, bool require_directory,
     }
 
     if (mount != nullptr && mount->fs_type != FSType::REMOTE && !SYMLINK_RESOLUTION_KNOWN_NOOP) {
-        std::array<char, MAX_PATH_LEN> symlink_resolved;  // NOLINT(cppcoreguidelines-pro-type-member-init)
+        // resolve_symlinks initializes the complete NUL-terminated string on success.
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
+        std::array<char, MAX_PATH_LEN> symlink_resolved __attribute__((uninitialized));
         uint64_t const OBSERVATION_EPOCH_BEFORE_SYMLINK = g_metadata_observation_epoch.load(std::memory_order_acquire);
         size_t symlink_resolved_len = current_path_len;
         bool const RESOLVE_FINAL_SYMLINK = EFFECTIVE_FOLLOW_FINAL_SYMLINK && !SKIP_FINAL_SYMLINK_PROBE;
@@ -17558,6 +17562,7 @@ auto vfs_selftest_stat_lstat_share_non_symlink_cache() -> bool {
     constexpr const char* EXISTENCE_ONLY_MISSING_PATH = "/tmp/ktest_stat_lstat_shared_cache_existence_only_missing";
     constexpr const char* CACHE_ONLY_PATH = "/tmp/ktest_stat_lstat_shared_cache_only";
     constexpr size_t CACHE_ONLY_PATH_LEN = sizeof("/tmp/ktest_stat_lstat_shared_cache_only") - 1;
+    constexpr char POLICY_PATH[] = "/tmp//ktest_stat_lstat_shared_cache/.";
 
     vfs_unlink(PATH);
     vfs_unlink(MISSING_PATH);
@@ -17574,10 +17579,11 @@ auto vfs_selftest_stat_lstat_share_non_symlink_cache() -> bool {
     std::array<char, MAX_PATH_LEN> symlink_resolved{};
     size_t symlink_resolved_len = UNKNOWN_PATH_LEN;
     symlink_resolved.fill('x');
-    int const SYMLINK_RESOLVE_RET =
-        resolve_symlinks(PATH, symlink_resolved.data(), symlink_resolved.size(), false, true, std::strlen(PATH), &symlink_resolved_len);
+    symlink_resolved.back() = '\0';
+    int const SYMLINK_RESOLVE_RET = resolve_symlinks(POLICY_PATH, symlink_resolved.data(), symlink_resolved.size(), true, true,
+                                                     sizeof(POLICY_PATH) - 1, &symlink_resolved_len);
     bool const RESOLVER_OUTPUT_OK = SYMLINK_RESOLVE_RET == 0 && symlink_resolved_len == std::strlen(PATH) &&
-                                    std::strcmp(symlink_resolved.data(), PATH) == 0 && symlink_resolved.at(symlink_resolved_len) == '\0';
+                                    std::memcmp(symlink_resolved.data(), PATH, std::strlen(PATH) + 1) == 0;
 
     vfs_cache_notify_path_changed(PATH, nullptr);
 

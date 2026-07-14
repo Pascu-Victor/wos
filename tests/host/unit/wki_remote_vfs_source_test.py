@@ -211,6 +211,25 @@ def test_vfs_route_scratch_is_initialized_by_its_producer() -> None:
         if "std::array<char, MAX_PATH_LEN> routed{};" in body:
             fail(f"{function_name} must not value-initialize fully produced route scratch")
 
+    normalizer = function_body(core, "normalize_task_path_inplace_with_route")
+    normalizer_producer = "int const ROUTE_RESULT = apply_task_vfs_route(current_task, path, routed.data(), routed.size());"
+    normalizer_gate = "if (ROUTE_RESULT < 0) {\n        return ROUTE_RESULT;\n    }"
+    normalizer_consumer = "return copy_path_string(routed.data(), path, bufsize);"
+    normalizer_producer_pos = normalizer.find(normalizer_producer)
+    normalizer_gate_pos = normalizer.find(normalizer_gate, normalizer_producer_pos + len(normalizer_producer))
+    normalizer_consumer_pos = normalizer.find(normalizer_consumer, normalizer_gate_pos + len(normalizer_gate))
+    if (
+        normalizer.count(normalizer_producer) != 1
+        or normalizer.count(normalizer_gate) != 1
+        or normalizer.count(normalizer_consumer) != 1
+        or normalizer_producer_pos < 0
+        or normalizer_gate_pos < 0
+        or normalizer_consumer_pos < 0
+        or normalizer[normalizer_producer_pos + len(normalizer_producer) : normalizer_gate_pos].strip()
+        or normalizer[normalizer_gate_pos + len(normalizer_gate) : normalizer_consumer_pos].strip()
+    ):
+        fail("task-route normalization must return producer failures before consuming routed scratch")
+
     for legacy in [
         "std::array<char, MAX_PATH_LEN> current{};",
         "std::array<char, MAX_PATH_LEN> self_prefix{};",
