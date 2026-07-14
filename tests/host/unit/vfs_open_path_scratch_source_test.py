@@ -171,6 +171,103 @@ def test_dirfd_visible_scratch_is_initialized_by_root_strip() -> None:
     )
 
 
+def test_absolute_visible_scratch_is_initialized_by_dot_clean_producer() -> None:
+    core = VFS_CORE_CPP.read_text()
+    append = function_body(core, "append_dot_clean_path_components")
+    pop = function_body(core, "pop_dot_clean_path_component")
+    producer = function_body(core, "copy_dot_clean_visible_absolute_path")
+    fast = function_body(core, "copy_common_local_visible_absolute_path_fast_path")
+    selftest = function_body(core, "common_local_relative_resolver_fast_path_selftest_impl")
+
+    declaration = "std::array<char, MAX_PATH_LEN> visible __attribute__((uninitialized));"
+    require_only_uninitialized_array(fast, "visible", declaration, "absolute visible path scratch")
+    require_order(
+        producer,
+        [
+            "if (path == nullptr || out == nullptr || outsize < 2 || path[0] != '/')",
+            "return RESOLVE_FAST_PATH_DECLINED",
+            "out[0] = '/'",
+            "out[1] = '\\0'",
+            "size_t len = 1",
+            "int const RET = append_dot_clean_path_components(path, scan, 1, out, &len, outsize)",
+            "if (RET == 0 && out_len != nullptr)",
+            "*out_len = len",
+            "return RET",
+        ],
+        "dot-clean absolute path production",
+    )
+    require_order(
+        append,
+        [
+            "size_t cursor = start_pos",
+            "while (cursor < scan.path_len)",
+            "if (COMPONENT_LEN == 2 && path[COMPONENT_START] == '.' && path[COMPONENT_START + 1] == '.')",
+            "pop_dot_clean_path_component(out, out_len)",
+            "size_t pos = *out_len",
+            "std::memcpy(out + pos, path + COMPONENT_START, COMPONENT_LEN)",
+            "pos += COMPONENT_LEN",
+            "out[pos] = '\\0'",
+            "*out_len = pos",
+            "return 0",
+        ],
+        "dot-clean component append maintains a terminated initialized prefix",
+    )
+    require_order(
+        pop,
+        [
+            "if (out == nullptr || out_len == nullptr || *out_len <= 1)",
+            "out[0] = '/'",
+            "out[1] = '\\0'",
+            "*out_len = 1",
+            "size_t pos = *out_len",
+            "while (pos > 1 && out[pos - 1] == '/')",
+            "while (pos > 1 && out[pos - 1] != '/')",
+            "out[pos - 1] = '\\0'",
+            "*out_len = pos - 1",
+        ],
+        "dot-clean parent traversal stays within the initialized prefix",
+    )
+    require_order(
+        fast,
+        [
+            "if (scan.needs_canonicalize)",
+            declaration,
+            "size_t visible_len = UNKNOWN_PATH_LEN",
+            "int const DOT_CLEAN_RET = copy_dot_clean_visible_absolute_path(path, scan, visible.data(), visible.size(), &visible_len)",
+            "if (DOT_CLEAN_RET != 0)",
+            "return DOT_CLEAN_RET",
+            "if (!common_local_visible_path_is_noop(visible.data()))",
+            "copy_task_visible_absolute_path_with_root(task, visible.data(), visible_len, out, outsize, RESOLVED_LEN_OUT)",
+        ],
+        "absolute visible path producer and consumer ordering",
+    )
+    producer_failure = block_body_after(fast[fast.find("if (DOT_CLEAN_RET != 0)") :], "if (DOT_CLEAN_RET != 0)")
+    if producer_failure.strip() != "return DOT_CLEAN_RET;":
+        fail("absolute visible path production must return before consuming failed output")
+    if fast.count("visible.data()") != 3 or fast.count("visible.size()") != 1 or "visible[" in fast:
+        fail("absolute visible path scratch has an unexpected producer or consumer")
+    if len(re.findall(r"\bvisible\b", fast)) != 5:
+        fail("absolute visible path scratch must only appear in its declaration, producer, and two consumers")
+    require_order(
+        selftest,
+        [
+            "resolved.fill('x')",
+            'copy_common_local_visible_absolute_path_fast_path(&task, "/..", scan_path_text("/..")',
+            "resolved_len == 1",
+            "resolved.at(resolved_len) == '\\0'",
+            'std::strcmp(resolved.data(), "/") == 0',
+            'metadata_path_hash_raw("/", 1)',
+        ],
+        "canonicalize-to-root KTEST coverage",
+    )
+    poison = "resolved.fill('x');"
+    root_call = 'ret = copy_common_local_visible_absolute_path_fast_path(&task, "/..", scan_path_text("/..")'
+    poison_end = selftest.find(poison) + len(poison)
+    root_call_pos = selftest.find(root_call, poison_end)
+    if poison_end < len(poison) or root_call_pos < 0 or selftest[poison_end:root_call_pos].strip():
+        fail("canonicalize-to-root destination poison must immediately precede the producer call")
+
+
 def test_open_path_scratch_is_initialized_by_its_producers() -> None:
     core = VFS_CORE_CPP.read_text()
 
@@ -282,5 +379,6 @@ def test_open_path_scratch_is_initialized_by_its_producers() -> None:
 
 if __name__ == "__main__":
     test_dirfd_visible_scratch_is_initialized_by_root_strip()
+    test_absolute_visible_scratch_is_initialized_by_dot_clean_producer()
     test_open_path_scratch_is_initialized_by_its_producers()
     print("VFS open path scratch invariants hold")

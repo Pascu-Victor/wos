@@ -5283,7 +5283,9 @@ auto copy_common_local_visible_absolute_path_fast_path(const ker::mod::sched::ta
         return RESOLVE_FAST_PATH_DECLINED;
     }
     if (scan.needs_canonicalize) {
-        std::array<char, MAX_PATH_LEN> visible{};
+        // copy_dot_clean_visible_absolute_path initializes the complete NUL-terminated string on success.
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
+        std::array<char, MAX_PATH_LEN> visible __attribute__((uninitialized));
         size_t visible_len = UNKNOWN_PATH_LEN;
         int const DOT_CLEAN_RET = copy_dot_clean_visible_absolute_path(path, scan, visible.data(), visible.size(), &visible_len);
         if (DOT_CLEAN_RET != 0) {
@@ -10096,6 +10098,14 @@ auto common_local_relative_resolver_fast_path_selftest_impl() -> bool {
                                                             resolved.size(), &resolved_len, &resolved_hash);
     ok = ok && ret == 0 && resolved_len == std::strlen("/tmp/file") && std::strcmp(resolved.data(), "/tmp/file") == 0 &&
          resolved_hash == metadata_path_hash_raw("/tmp/file", std::strlen("/tmp/file"));
+
+    resolved_len = UNKNOWN_PATH_LEN;
+    resolved_hash = UNKNOWN_PATH_HASH;
+    resolved.fill('x');
+    ret = copy_common_local_visible_absolute_path_fast_path(&task, "/..", scan_path_text("/.."), resolved.data(), resolved.size(),
+                                                            &resolved_len, &resolved_hash);
+    ok = ok && ret == 0 && resolved_len == 1 && resolved.at(resolved_len) == '\0' && std::strcmp(resolved.data(), "/") == 0 &&
+         resolved_hash == metadata_path_hash_raw("/", 1);
 
     resolved_len = UNKNOWN_PATH_LEN;
     resolved_hash = UNKNOWN_PATH_HASH;
