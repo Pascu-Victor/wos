@@ -175,6 +175,7 @@ UNIT_TESTS=(
     wki_routing_source_test
     wki_remote_compute_source_test
     wki_remote_vfs_source_test
+    vfs_open_path_scratch_source_test
     vfs_mount_lifetime_source_test
     vfs_advisory_lock_source_test
     xfs_metadata_lock_source_test

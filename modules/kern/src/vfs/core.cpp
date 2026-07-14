@@ -7564,7 +7564,9 @@ auto vfs_open_resolved_for_task(ker::mod::sched::task::Task* task, const char* r
     }
 
     if (!REMOTE_MOUNT && !SYMLINK_RESOLUTION_KNOWN_NOOP) {
-        std::array<char, MAX_PATH_LEN> resolved;  // NOLINT(cppcoreguidelines-pro-type-member-init)
+        // resolve_symlinks initializes the complete NUL-terminated path before successful return.
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
+        std::array<char, MAX_PATH_LEN> resolved __attribute__((uninitialized));
         size_t resolved_len = path_buffer_len;
         int const RESOLVE_RET = resolve_symlinks(path_buffer.data(), resolved.data(), resolved.size(), !open_local,
                                                  !FINAL_SYMLINK_PROBE_NOT_NEEDED, path_buffer_len, &resolved_len);
@@ -7799,7 +7801,9 @@ auto vfs_open(std::string_view path, int flags, int mode) -> int {
     if (path.empty()) {
         return -ENOENT;
     }
-    std::array<char, MAX_PATH_LEN> raw_path;  // NOLINT(cppcoreguidelines-pro-type-member-init)
+    // The copied view and explicit terminator initialize the complete string before its first read.
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
+    std::array<char, MAX_PATH_LEN> raw_path __attribute__((uninitialized));
     if (path.size() >= MAX_PATH_LEN) {
         return -ENAMETOOLONG;
     }
@@ -7816,7 +7820,9 @@ auto vfs_open(std::string_view path, int flags, int mode) -> int {
         backend_flags &= ~ker::vfs::O_CREAT;
     }
 
-    std::array<char, MAX_PATH_LEN> path_buffer;  // NOLINT(cppcoreguidelines-pro-type-member-init)
+    // Both path resolvers initialize a complete NUL-terminated string before successful return.
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
+    std::array<char, MAX_PATH_LEN> path_buffer __attribute__((uninitialized));
     bool fast_path_requires_directory = false;
     size_t path_buffer_len = UNKNOWN_PATH_LEN;
     uint64_t path_buffer_hash = UNKNOWN_PATH_HASH;
@@ -7862,7 +7868,9 @@ auto vfs_openat(ker::mod::sched::task::Task* task, int dirfd, const char* pathna
     bool path_requires_directory = false;
     size_t resolved_len = UNKNOWN_PATH_LEN;
     uint64_t resolved_hash = UNKNOWN_PATH_HASH;
-    std::array<char, MAX_PATH_LEN> resolved;  // NOLINT(cppcoreguidelines-pro-type-member-init)
+    // Both path resolvers initialize a complete NUL-terminated string before successful return.
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
+    std::array<char, MAX_PATH_LEN> resolved __attribute__((uninitialized));
     int const FAST_RET = !OPEN_LOCAL ? vfs_open_absolute_common_local_fast_path(task, pathname, resolved, &path_requires_directory,
                                                                                 &resolved_len, &resolved_hash)
                                      : RESOLVE_FAST_PATH_DECLINED;
