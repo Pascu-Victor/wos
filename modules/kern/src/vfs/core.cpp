@@ -8004,7 +8004,9 @@ auto vfs_user_read_bounce_applies(const File* file, void* buf, size_t count, con
 
 auto vfs_read_user_bounced(ker::mod::sched::task::Task& task, File* file, void* user_buf, size_t count, size_t offset, size_t* actual_size)
     -> ssize_t {
-    std::array<uint8_t, USER_IO_BOUNCE_STACK_CHUNK> stack_bounce{};
+    // Backends initialize the exact positive prefix copied to userspace below.
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
+    std::array<uint8_t, USER_IO_BOUNCE_STACK_CHUNK> stack_bounce __attribute__((uninitialized));
     size_t bounce_size = user_io_read_bounce_size_for(file, count);
     std::unique_ptr<uint8_t[]> heap_bounce{};
     if (bounce_size > stack_bounce.size()) {
@@ -8186,7 +8188,9 @@ auto vfs_write_user_bounced(ker::mod::sched::task::Task& task, File* file, const
         return -EINVAL;
     }
 
-    std::array<uint8_t, USER_IO_BOUNCE_STACK_CHUNK> stack_bounce{};
+    // copy_from_task initializes every byte offered to a backend below.
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
+    std::array<uint8_t, USER_IO_BOUNCE_STACK_CHUNK> stack_bounce __attribute__((uninitialized));
     size_t const BOUNCE_SIZE = std::min(count, USER_IO_BOUNCE_MAX_CHUNK);
     std::unique_ptr<uint8_t[]> heap_bounce{};
     if (BOUNCE_SIZE > stack_bounce.size()) {
@@ -12025,7 +12029,9 @@ auto vfs_pwrite_user_bounced(ker::mod::sched::task::Task& task, File* file, cons
         return -ENOSYS;
     }
 
-    std::array<uint8_t, USER_IO_BOUNCE_STACK_CHUNK> stack_bounce{};
+    // copy_from_task initializes every byte offered to a backend below.
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
+    std::array<uint8_t, USER_IO_BOUNCE_STACK_CHUNK> stack_bounce __attribute__((uninitialized));
     size_t const BOUNCE_SIZE = std::min(count, USER_IO_BOUNCE_MAX_CHUNK);
     std::unique_ptr<uint8_t[]> heap_bounce{};
     if (BOUNCE_SIZE > stack_bounce.size()) {

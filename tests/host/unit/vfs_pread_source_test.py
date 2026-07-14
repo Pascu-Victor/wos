@@ -231,6 +231,59 @@ def test_local_xfs_reads_bypass_stream_cache() -> None:
         fail("stream-cache eligibility selftest is missing expected assertions: " + ", ".join(missing))
 
 
+def test_user_io_stack_bounces_are_producer_initialized() -> None:
+    source = CORE_CPP.read_text()
+    declaration = (
+        "std::array<uint8_t, USER_IO_BOUNCE_STACK_CHUNK> stack_bounce "
+        "__attribute__((uninitialized));"
+    )
+    if source.count(declaration) != 3:
+        fail("read, write, and pwrite must each use uninitialized stack bounce scratch")
+
+    read_body = function_body(source, "vfs_read_user_bounced")
+    bounded_read = (
+        "ssize_t const READ_RET = clamp_io_count("
+        "file->fops->vfs_read(file, BOUNCE_BUFFER, TO_READ, offset + total), "
+        "TO_READ)"
+    )
+    require_order(
+        read_body,
+        [
+            declaration,
+            bounded_read,
+            "if (READ_RET < 0)",
+            "if (READ_RET == 0)",
+            "auto const BYTES_READ = static_cast<size_t>(READ_RET)",
+            "copy_to_task(task, USER_BASE + total, BOUNCE_BUFFER, BYTES_READ)",
+        ],
+        "user read bounce initialization",
+    )
+
+    write_calls = {
+        "vfs_write_user_bounced": (
+            "vfs_write_file_direct(file, BOUNCE_BUFFER, TO_WRITE, nullptr)"
+        ),
+        "vfs_pwrite_user_bounced": (
+            "file->fops->vfs_write(file, BOUNCE_BUFFER, TO_WRITE, offset + total)"
+        ),
+    }
+    for name, backend_call in write_calls.items():
+        body = function_body(source, name)
+        require_order(
+            body,
+            [
+                declaration,
+                "copy_from_task(task, USER_BASE + total, BOUNCE_BUFFER, TO_WRITE)",
+                "return total > 0",
+                backend_call,
+            ],
+            f"{name} stack bounce initialization",
+        )
+
+    if "stack_bounce{}" in source or "stack_bounce = {}" in source:
+        fail("user-I/O stack bounce scratch must not be cleared before its producer")
+
+
 def test_remote_read_bounce_matches_bulk_window_with_fallback() -> None:
     source = CORE_CPP.read_text()
     required = [
@@ -315,6 +368,7 @@ def main() -> None:
     test_positional_io_rejects_negative_offsets_before_unsigned_conversion()
     test_ktest_covers_pread_contract()
     test_local_xfs_reads_bypass_stream_cache()
+    test_user_io_stack_bounces_are_producer_initialized()
     test_remote_read_bounce_matches_bulk_window_with_fallback()
     test_loader_path_trace_is_compile_time_disabled_by_default()
     print("VFS pread source invariants hold")
