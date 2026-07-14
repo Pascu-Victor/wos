@@ -109,6 +109,28 @@ constexpr uint64_t VFS_PROXY_SLOT_WAIT_TIMEOUT_US = VFS_PROXY_OP_TIMEOUT_US;
 static_assert(sizeof(DevOpReqPayload) <= WKI_ETH_MAX_PAYLOAD);
 static_assert(WKI_ETH_MAX_PAYLOAD <= UINT16_MAX);
 
+constexpr uint32_t VFS_READDIR_BATCH_MAX_ENTRIES =
+    static_cast<uint32_t>((WKI_ETH_MAX_PAYLOAD - sizeof(DevOpRespPayload) - sizeof(uint32_t)) / sizeof(ker::vfs::DirEntry));
+constexpr size_t VFS_READDIR_BATCH_DATA_CAPACITY =
+    sizeof(uint32_t) + (static_cast<size_t>(VFS_READDIR_BATCH_MAX_ENTRIES) * sizeof(ker::vfs::DirEntry));
+constexpr size_t VFS_READDIR_BATCH_RESPONSE_CAPACITY = sizeof(DevOpRespPayload) + VFS_READDIR_BATCH_DATA_CAPACITY;
+static_assert(VFS_READDIR_BATCH_MAX_ENTRIES > 0);
+static_assert(VFS_READDIR_BATCH_RESPONSE_CAPACITY <= WKI_ETH_MAX_PAYLOAD);
+static_assert(VFS_READDIR_BATCH_DATA_CAPACITY <= UINT16_MAX);
+
+constexpr auto vfs_readdir_batch_payload_is_valid(uint16_t payload_len, uint32_t count) -> bool {
+    if (count > VFS_READDIR_BATCH_MAX_ENTRIES) {
+        return false;
+    }
+    size_t const REQUIRED_LEN = sizeof(uint32_t) + (static_cast<size_t>(count) * sizeof(ker::vfs::DirEntry));
+    return REQUIRED_LEN <= payload_len;
+}
+static_assert(vfs_readdir_batch_payload_is_valid(sizeof(uint32_t), 0));
+static_assert(vfs_readdir_batch_payload_is_valid(static_cast<uint16_t>(VFS_READDIR_BATCH_DATA_CAPACITY), VFS_READDIR_BATCH_MAX_ENTRIES));
+static_assert(!vfs_readdir_batch_payload_is_valid(static_cast<uint16_t>(VFS_READDIR_BATCH_DATA_CAPACITY - 1),
+                                                  VFS_READDIR_BATCH_MAX_ENTRIES));
+static_assert(!vfs_readdir_batch_payload_is_valid(UINT16_MAX, VFS_READDIR_BATCH_MAX_ENTRIES + 1));
+
 auto remote_vfs_strip_mount_prefix(const ker::vfs::MountPoint* mount, const char* path) -> const char* {
     if (mount == nullptr || path == nullptr) {
         return path;
@@ -3575,33 +3597,24 @@ auto remote_vfs_readdir(ker::vfs::File* f, ker::vfs::DirEntry* entry, size_t ind
     s_vfs_lock.unlock();
 
     // Fetch entries from server in batches.
-    // One OP_VFS_READDIR_BATCH request returns up to MAX_BATCH_ENTRIES entries,
+    // One OP_VFS_READDIR_BATCH request returns up to VFS_READDIR_BATCH_MAX_ENTRIES entries,
     // filling the full jumbo frame - typically the entire directory in one round-trip.
-    constexpr auto MAX_BATCH_ENTRIES =
-        static_cast<uint32_t>((WKI_ETH_MAX_PAYLOAD - sizeof(DevOpRespPayload) - sizeof(uint32_t)) / sizeof(ker::vfs::DirEntry));
-    constexpr size_t BATCH_RESP_SIZE = sizeof(uint32_t) + (MAX_BATCH_ENTRIES * sizeof(ker::vfs::DirEntry));
-
-    auto* batch_buf = new (std::nothrow) uint8_t[BATCH_RESP_SIZE];
-    if (batch_buf == nullptr) {
-        return -ENOMEM;
-    }
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init): RX fills every byte read below before publishing the response length.
+    std::array<uint8_t, VFS_READDIR_BATCH_DATA_CAPACITY> batch_buf __attribute__((uninitialized));
 
     while (true) {
         s_vfs_lock.lock();
         cache = find_dir_cache(ctx->proxy, ctx->remote_fd);
         if (cache == nullptr) {
             s_vfs_lock.unlock();
-            delete[] batch_buf;
             return -EIO;
         }
         if (try_get_visible_cached_dirent(cache, ctx, index, entry)) {
             s_vfs_lock.unlock();
-            delete[] batch_buf;
             return 0;
         }
         if (cache->complete) {
             s_vfs_lock.unlock();
-            delete[] batch_buf;
             return -1;
         }
         auto fetch_idx = static_cast<uint32_t>(cache->entries.size());
@@ -3611,12 +3624,11 @@ auto remote_vfs_readdir(ker::vfs::File* f, ker::vfs::DirEntry* entry, size_t ind
         std::array<uint8_t, 12> req_data{};
         memcpy(req_data.data(), &ctx->remote_fd, sizeof(int32_t));
         memcpy(req_data.data() + 4, &fetch_idx, sizeof(uint32_t));
-        memcpy(req_data.data() + 8, &MAX_BATCH_ENTRIES, sizeof(uint32_t));
+        memcpy(req_data.data() + 8, &VFS_READDIR_BATCH_MAX_ENTRIES, sizeof(uint32_t));
 
-        memset(batch_buf, 0, BATCH_RESP_SIZE);
         uint16_t resp_len = 0;
-        int const STATUS = vfs_proxy_send_and_wait(ctx->proxy, OP_VFS_READDIR_BATCH, req_data.data(), 12, batch_buf,
-                                                   static_cast<uint16_t>(BATCH_RESP_SIZE), &resp_len);
+        int const STATUS = vfs_proxy_send_and_wait(ctx->proxy, OP_VFS_READDIR_BATCH, req_data.data(), 12, batch_buf.data(),
+                                                   static_cast<uint16_t>(batch_buf.size()), &resp_len);
         if (STATUS != 0 || resp_len < sizeof(uint32_t)) {
             s_vfs_lock.lock();
             cache = find_dir_cache(ctx->proxy, ctx->remote_fd);
@@ -3624,22 +3636,24 @@ auto remote_vfs_readdir(ker::vfs::File* f, ker::vfs::DirEntry* entry, size_t ind
                 cache->complete = true;
             }
             s_vfs_lock.unlock();
-            delete[] batch_buf;
             return (STATUS != 0) ? STATUS : -EIO;
         }
 
         uint32_t count = 0;
-        memcpy(&count, batch_buf, sizeof(uint32_t));
+        memcpy(&count, batch_buf.data(), sizeof(uint32_t));
+        if (!vfs_readdir_batch_payload_is_valid(resp_len, count)) {
+            return -EIO;
+        }
 
         s_vfs_lock.lock();
         cache = find_dir_cache(ctx->proxy, ctx->remote_fd);
         if (cache != nullptr) {
-            for (uint32_t i = 0; i < count && i < MAX_BATCH_ENTRIES; i++) {
+            for (uint32_t i = 0; i < count; i++) {
                 ker::vfs::DirEntry fetched = {};
-                memcpy(&fetched, batch_buf + sizeof(uint32_t) + (i * sizeof(ker::vfs::DirEntry)), sizeof(ker::vfs::DirEntry));
+                memcpy(&fetched, batch_buf.data() + sizeof(uint32_t) + (i * sizeof(ker::vfs::DirEntry)), sizeof(ker::vfs::DirEntry));
                 cache->entries.push_back(fetched);
             }
-            if (count < MAX_BATCH_ENTRIES) {
+            if (count < VFS_READDIR_BATCH_MAX_ENTRIES) {
                 cache->complete = true;  // Server returned fewer than asked -> end of directory
             }
         }
@@ -4750,10 +4764,8 @@ void handle_vfs_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_ident
             memcpy(&max_count, data + 8, sizeof(uint32_t));
 
             // Clamp to what fits in one frame
-            constexpr auto HARD_MAX =
-                static_cast<uint32_t>((WKI_ETH_MAX_PAYLOAD - sizeof(DevOpRespPayload) - sizeof(uint32_t)) / sizeof(ker::vfs::DirEntry));
-            if (max_count == 0 || max_count > HARD_MAX) {
-                max_count = HARD_MAX;
+            if (max_count == 0 || max_count > VFS_READDIR_BATCH_MAX_ENTRIES) {
+                max_count = VFS_READDIR_BATCH_MAX_ENTRIES;
             }
 
             s_vfs_lock.lock();
@@ -4771,23 +4783,12 @@ void handle_vfs_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_ident
             ker::vfs::File* local_file = rfd->file;
             s_vfs_lock.unlock();
 
-            // Allocate response: DevOpRespPayload + {count:u32} + max_count×DirEntry
-            auto data_size = static_cast<uint32_t>(sizeof(uint32_t) + (max_count * sizeof(ker::vfs::DirEntry)));
-            auto resp_total = static_cast<uint32_t>(sizeof(DevOpRespPayload) + data_size);
-            auto* resp_buf = new (std::nothrow) uint8_t[resp_total];
-            if (resp_buf == nullptr) {
-                DevOpRespPayload resp = {};
-                resp.op_id = OP_VFS_READDIR_BATCH;
-                resp.status = -1;
-                resp.data_len = 0;
-                send_simple_resp(resp);
-                break;
-            }
-            memset(resp_buf, 0, resp_total);
+            // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init): only the exact initialized prefix is transmitted.
+            std::array<uint8_t, VFS_READDIR_BATCH_RESPONSE_CAPACITY> resp_buf __attribute__((uninitialized));
 
             perf_record_vfs_server_begin(SERVER_OP, hdr->src_node, channel_id, CORRELATION, CALLSITE);
             uint64_t const LOCAL_STARTED_US = wki_now_us();
-            uint8_t* entries_base = resp_buf + sizeof(DevOpRespPayload) + sizeof(uint32_t);
+            uint8_t* entries_base = resp_buf.data() + sizeof(DevOpRespPayload) + sizeof(uint32_t);
             uint32_t count = 0;
             for (uint32_t i = 0; i < max_count; i++) {
                 ker::vfs::DirEntry entry = {};
@@ -4799,18 +4800,17 @@ void handle_vfs_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_ident
                 count++;
             }
 
-            auto* resp = reinterpret_cast<DevOpRespPayload*>(resp_buf);
+            auto* resp = reinterpret_cast<DevOpRespPayload*>(resp_buf.data());
             resp->op_id = OP_VFS_READDIR_BATCH;
             resp->status = 0;
             resp->data_len = static_cast<uint16_t>(sizeof(uint32_t) + (count * sizeof(ker::vfs::DirEntry)));
-            memcpy(resp_buf + sizeof(DevOpRespPayload), &count, sizeof(uint32_t));
+            memcpy(resp_buf.data() + sizeof(DevOpRespPayload), &count, sizeof(uint32_t));
             perf_record_vfs_server_end(SERVER_OP, hdr->src_node, channel_id, CORRELATION, 0,
                                        static_cast<uint32_t>(wki_now_us() - LOCAL_STARTED_US),
                                        sizeof(uint32_t) + (count * sizeof(ker::vfs::DirEntry)), CALLSITE);
 
             auto send_len = static_cast<uint16_t>(sizeof(DevOpRespPayload) + sizeof(uint32_t) + (count * sizeof(ker::vfs::DirEntry)));
-            send_buffered_resp(resp_buf, send_len);
-            delete[] resp_buf;
+            send_buffered_resp(resp_buf.data(), send_len);
             break;
         }
 

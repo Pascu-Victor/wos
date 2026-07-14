@@ -277,6 +277,68 @@ def test_proxy_request_envelopes_use_stack_storage() -> None:
         fail("remote open zero-initializes its inline request storage")
 
 
+def test_readdir_batch_buffers_use_bounded_stack_storage() -> None:
+    source = REMOTE_VFS_CPP.read_text()
+    require_tokens(
+        source,
+        [
+            "constexpr uint32_t VFS_READDIR_BATCH_MAX_ENTRIES =",
+            "constexpr size_t VFS_READDIR_BATCH_DATA_CAPACITY =",
+            "constexpr size_t VFS_READDIR_BATCH_RESPONSE_CAPACITY =",
+            "static_assert(VFS_READDIR_BATCH_RESPONSE_CAPACITY <= WKI_ETH_MAX_PAYLOAD)",
+            "constexpr auto vfs_readdir_batch_payload_is_valid(uint16_t payload_len, uint32_t count) -> bool",
+            "count > VFS_READDIR_BATCH_MAX_ENTRIES",
+            "REQUIRED_LEN <= payload_len",
+            "static_assert(vfs_readdir_batch_payload_is_valid(sizeof(uint32_t), 0))",
+            "static_assert(!vfs_readdir_batch_payload_is_valid(UINT16_MAX, VFS_READDIR_BATCH_MAX_ENTRIES + 1))",
+        ],
+        "remote readdir wire-derived stack capacities",
+    )
+
+    client_body = function_body(source, "remote_vfs_readdir")
+    require_order(
+        client_body,
+        [
+            "std::array<uint8_t, VFS_READDIR_BATCH_DATA_CAPACITY> batch_buf __attribute__((uninitialized))",
+            "memcpy(req_data.data() + 8, &VFS_READDIR_BATCH_MAX_ENTRIES",
+            "vfs_proxy_send_and_wait(ctx->proxy, OP_VFS_READDIR_BATCH",
+            "batch_buf.data()",
+            "static_cast<uint16_t>(batch_buf.size())",
+            "memcpy(&count, batch_buf.data(), sizeof(uint32_t))",
+            "vfs_readdir_batch_payload_is_valid(resp_len, count)",
+            "for (uint32_t i = 0; i < count; i++)",
+        ],
+        "consumer readdir batch stack storage and length validation",
+    )
+    if re.search(r"\bnew\b|delete\s*\[\s*\]|\bmemset\s*\(", client_body):
+        fail("consumer readdir batch retained heap allocation or full-buffer clearing")
+    if re.search(r"\bbatch_buf\s*(?:\{\}|=\s*\{\})", client_body):
+        fail("consumer readdir batch zero-initializes its full stack buffer")
+
+    handler_body = function_body(source, "handle_vfs_op")
+    batch_start = handler_body.find("case OP_VFS_READDIR_BATCH:")
+    stat_start = handler_body.find("case OP_VFS_STAT:", batch_start)
+    if batch_start < 0 or stat_start < 0:
+        fail("remote VFS readdir-batch opcode case must remain present")
+    server_case = handler_body[batch_start:stat_start]
+    require_order(
+        server_case,
+        [
+            "max_count > VFS_READDIR_BATCH_MAX_ENTRIES",
+            "max_count = VFS_READDIR_BATCH_MAX_ENTRIES",
+            "std::array<uint8_t, VFS_READDIR_BATCH_RESPONSE_CAPACITY> resp_buf __attribute__((uninitialized))",
+            "uint8_t* entries_base = resp_buf.data()",
+            "reinterpret_cast<DevOpRespPayload*>(resp_buf.data())",
+            "send_buffered_resp(resp_buf.data(), send_len)",
+        ],
+        "server readdir batch bounded stack response",
+    )
+    if re.search(r"\bnew\b|delete\s*\[\s*\]|\bmemset\s*\(", server_case):
+        fail("server readdir batch retained heap allocation or full-buffer clearing")
+    if re.search(r"\bresp_buf\s*(?:\{\}|=\s*\{\})", server_case):
+        fail("server readdir batch zero-initializes its full stack buffer")
+
+
 def test_proxy_slot_release_paths_handoff_after_unlock() -> None:
     source = REMOTE_VFS_CPP.read_text()
     ktest = WKI_DEV_PROXY_KTEST.read_text()
@@ -1986,6 +2048,7 @@ def main() -> None:
     test_proxy_op_slot_waits_are_bounded()
     test_proxy_operations_fail_before_setup_when_slot_wait_times_out()
     test_proxy_request_envelopes_use_stack_storage()
+    test_readdir_batch_buffers_use_bounded_stack_storage()
     test_proxy_slot_release_paths_handoff_after_unlock()
     test_shared_io_slot_waits_are_bounded()
     test_shared_io_callers_timeout_or_fallback()
