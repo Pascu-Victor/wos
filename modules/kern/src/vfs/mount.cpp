@@ -197,7 +197,7 @@ auto canonicalize_mount_path(char* path, size_t bufsize) -> int {
         return -EINVAL;
     }
 
-    std::array<const char*, MAX_MOUNT_COMPONENTS> components{};
+    std::array<const char*, MAX_MOUNT_COMPONENTS> components __attribute__((uninitialized));
     size_t num_components = 0;
 
     char* p = path + 1;
@@ -235,7 +235,7 @@ auto canonicalize_mount_path(char* path, size_t bufsize) -> int {
         }
     }
 
-    std::array<char, MAX_MOUNT_PATH> result{};
+    std::array<char, MAX_MOUNT_PATH> result __attribute__((uninitialized));
     size_t pos = 0;
     result[pos++] = '/';
 
@@ -784,7 +784,7 @@ auto resolve_mount_path(const char* path, char* out, size_t outsize) -> int {
         return -EINVAL;
     }
 
-    std::array<char, MAX_MOUNT_PATH> logical{};
+    std::array<char, MAX_MOUNT_PATH> logical __attribute__((uninitialized));
     int result = make_mount_path_absolute(path, logical.data(), logical.size());
     if (result < 0) {
         return result;
@@ -859,7 +859,7 @@ auto mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevic
 
     // Resolve through task root prefix so the stored path matches what
     // find_mount_point receives after resolve_task_path_raw.
-    std::array<char, MAX_MOUNT_PATH> resolved{};
+    std::array<char, MAX_MOUNT_PATH> resolved __attribute__((uninitialized));
     int const PATH_RET = resolve_mount_path(path, resolved.data(), resolved.size());
     if (PATH_RET < 0) {
         vfs_debug_log("mount_filesystem: path resolution failed\n");
@@ -1048,7 +1048,7 @@ auto unmount_filesystem_impl(const char* path, const void* expected_private_data
 
         // Resolve again after every pivot retry so the task-root prefix and
         // stored mount namespace stay in the same publication epoch.
-        std::array<char, MAX_MOUNT_PATH> resolved{};
+        std::array<char, MAX_MOUNT_PATH> resolved __attribute__((uninitialized));
         int const PATH_RET = resolve_mount_path(path, resolved.data(), resolved.size());
         if (PATH_RET < 0) {
             return PATH_RET;

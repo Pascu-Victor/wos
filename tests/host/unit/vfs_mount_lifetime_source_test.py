@@ -41,6 +41,191 @@ def require_order(body: str, before: str, after: str, context: str) -> None:
         fail(f"{context}: expected {before!r} before {after!r}")
 
 
+def block_body_after(source: str, header: str) -> str:
+    header_pos = source.find(header)
+    if header_pos < 0:
+        fail(f"missing block header {header!r}")
+    body_start = source.find("{", header_pos + len(header))
+    if body_start < 0:
+        fail(f"missing block body for {header!r}")
+
+    depth = 1
+    pos = body_start + 1
+    while pos < len(source) and depth > 0:
+        if source[pos] == "{":
+            depth += 1
+        elif source[pos] == "}":
+            depth -= 1
+        pos += 1
+    if depth != 0:
+        fail(f"unterminated block for {header!r}")
+    return source[body_start + 1 : pos - 1]
+
+
+def require_sequence(body: str, tokens: list[str], context: str) -> None:
+    cursor = 0
+    for token in tokens:
+        found = body.find(token, cursor)
+        if found < 0:
+            fail(f"{context}: missing ordered token {token!r}")
+        cursor = found + len(token)
+
+
+def require_only_uninitialized_array(body: str, name: str, expected: str, context: str) -> None:
+    declarations = re.findall(rf"\bstd::array<[^;\n]+>\s+{re.escape(name)}\b[^;\n]*;", body)
+    if declarations != [expected]:
+        fail(f"{context}: unexpected {name} declarations: {declarations!r}")
+    forbidden = [
+        rf"\b{re.escape(name)}\s*=\s*\{{\s*\}}\s*;",
+        rf"\b{re.escape(name)}\.fill\s*\(",
+        rf"\bmemset\s*\(\s*{re.escape(name)}\.data\s*\(",
+    ]
+    if any(re.search(pattern, body) for pattern in forbidden):
+        fail(f"{context}: {name} must not be cleared after declaration")
+
+
+def normalized_body(body: str) -> str:
+    return " ".join(body.split())
+
+
+def test_mount_path_scratch_is_fully_produced_before_use() -> None:
+    source = MOUNT_CPP.read_text()
+    copy_path = function_body(source, "copy_mount_path_string")
+    make_absolute = function_body(source, "make_mount_path_absolute")
+    canonicalize = function_body(source, "canonicalize_mount_path")
+    apply_root = function_body(source, "apply_current_task_root_prefix")
+    resolve = function_body(source, "resolve_mount_path")
+    mount = function_body(source, "mount_filesystem")
+    unmount = function_body(source, "unmount_filesystem_impl")
+
+    components_decl = "std::array<const char*, MAX_MOUNT_COMPONENTS> components __attribute__((uninitialized));"
+    result_decl = "std::array<char, MAX_MOUNT_PATH> result __attribute__((uninitialized));"
+    logical_decl = "std::array<char, MAX_MOUNT_PATH> logical __attribute__((uninitialized));"
+    resolved_decl = "std::array<char, MAX_MOUNT_PATH> resolved __attribute__((uninitialized));"
+
+    require_only_uninitialized_array(canonicalize, "components", components_decl, "canonical component scratch")
+    require_only_uninitialized_array(canonicalize, "result", result_decl, "canonical result scratch")
+    require_only_uninitialized_array(resolve, "logical", logical_decl, "logical mount scratch")
+    require_only_uninitialized_array(mount, "resolved", resolved_decl, "mount resolver output")
+    require_only_uninitialized_array(unmount, "resolved", resolved_decl, "unmount resolver output")
+
+    require_sequence(
+        copy_path,
+        [
+            "size_t const PATH_LEN = std::strlen(path);",
+            "if (PATH_LEN + 1 > outsize)",
+            "std::memcpy(out, path, PATH_LEN + 1);",
+            "return 0;",
+        ],
+        "bounded mount path copy",
+    )
+    require_sequence(
+        make_absolute,
+        [
+            "size_t const PATH_LEN = std::strlen(path);",
+            "if (path[0] == '/')",
+            "return copy_mount_path_string(path, out, outsize);",
+            "size_t const TOTAL = CWD_LEN + (NEED_SEP ? 1 : 0) + PATH_LEN + 1;",
+            "if (TOTAL > outsize)",
+            "std::memcpy(out, task->cwd.data(), CWD_LEN);",
+            "std::memcpy(out + CWD_LEN + 1, path, PATH_LEN + 1);",
+            "std::memcpy(out + CWD_LEN, path, PATH_LEN + 1);",
+            "return 0;",
+        ],
+        "absolute mount path production",
+    )
+    need_sep_pos = make_absolute.find("if (NEED_SEP)")
+    need_sep_else_pos = make_absolute.find("else", need_sep_pos)
+    need_sep_body = block_body_after(make_absolute[need_sep_pos:], "if (NEED_SEP)")
+    no_sep_body = block_body_after(make_absolute[need_sep_else_pos:], "else")
+    if normalized_body(need_sep_body) != "out[CWD_LEN] = '/'; std::memcpy(out + CWD_LEN + 1, path, PATH_LEN + 1);":
+        fail("relative mount paths must initialize their separator and NUL-terminated path")
+    if normalized_body(no_sep_body) != "std::memcpy(out + CWD_LEN, path, PATH_LEN + 1);":
+        fail("root-relative mount paths must initialize their complete NUL-terminated output")
+    require_sequence(
+        canonicalize,
+        [
+            components_decl,
+            "size_t num_components = 0;",
+            "if (num_components >= components.size())",
+            "components[num_components++] = comp_start;",
+            result_decl,
+            "size_t pos = 0;",
+            "result[pos++] = '/';",
+            "for (size_t i = 0; i < num_components; ++i)",
+            "std::strlen(components[i])",
+            "std::memcpy(result.data() + pos, components[i], COMP_LEN);",
+            "pos += COMP_LEN;",
+            "result[pos] = '\\0';",
+            "if (pos >= bufsize)",
+            "std::memcpy(path, result.data(), pos + 1);",
+            "return 0;",
+        ],
+        "canonical mount path prefix production",
+    )
+    component_loop = block_body_after(canonicalize, "for (size_t i = 0; i < num_components; ++i)")
+    if component_loop.count("components[i]") != 2 or canonicalize.count("components[i]") != 2:
+        fail("canonicalization must only read component slots inside the bounded component loop")
+    if canonicalize.count("components[num_components++]") != 1:
+        fail("canonicalization must admit each component through num_components")
+    if canonicalize.count("result.data()") != 2 or canonicalize.count("result[") != 3:
+        fail("canonicalization must only write the result prefix and copy its initialized length")
+
+    require_sequence(
+        apply_root,
+        [
+            "size_t const ROOT_LEN = std::strlen(task->root.data());",
+            "size_t const PATH_LEN = std::strlen(path);",
+            "if (ROOT_LEN + PATH_LEN + 1 > outsize)",
+            "std::memmove(out + ROOT_LEN, out, PATH_LEN + 1);",
+            "std::memcpy(out + ROOT_LEN, path, PATH_LEN + 1);",
+            "std::memcpy(out, task->root.data(), ROOT_LEN);",
+            "return 0;",
+            "return copy_mount_path_string(path, out, outsize);",
+        ],
+        "task-root-prefixed mount path production",
+    )
+    in_place_pos = apply_root.find("if (out == path)")
+    distinct_pos = apply_root.find("else", in_place_pos)
+    in_place_body = block_body_after(apply_root[in_place_pos:], "if (out == path)")
+    distinct_body = block_body_after(apply_root[distinct_pos:], "else")
+    if normalized_body(in_place_body) != "std::memmove(out + ROOT_LEN, out, PATH_LEN + 1);":
+        fail("in-place task-root prefixing must move the complete NUL-terminated path")
+    if normalized_body(distinct_body) != "std::memcpy(out + ROOT_LEN, path, PATH_LEN + 1);":
+        fail("distinct task-root prefixing must copy the complete NUL-terminated path")
+
+    make_call = "int result = make_mount_path_absolute(path, logical.data(), logical.size());"
+    canonical_call = "result = canonicalize_mount_path(logical.data(), logical.size());"
+    apply_call = "return apply_current_task_root_prefix(logical.data(), out, outsize);"
+    require_sequence(resolve, [logical_decl, make_call, "if (result < 0)", canonical_call, "if (result < 0)", apply_call], "mount resolution")
+    first_gate = resolve.find("if (result < 0)", resolve.find(make_call) + len(make_call))
+    second_gate = resolve.find("if (result < 0)", resolve.find(canonical_call) + len(canonical_call))
+    if first_gate < 0 or second_gate < 0:
+        fail("mount resolution must gate both fallible scratch producers")
+    for label, gate_pos in (("absolute path", first_gate), ("canonical path", second_gate)):
+        failure = block_body_after(resolve[gate_pos:], "if (result < 0)")
+        if failure.strip() != "return result;":
+            fail(f"{label} failure must return before consuming logical scratch")
+    if resolve.count("logical.data()") != 3 or resolve.count("logical.size()") != 2:
+        fail("logical mount scratch has an unexpected producer or consumer")
+
+    for name, body, first_consumer in (
+        ("mount_filesystem", mount, "std::strlen(resolved.data())"),
+        ("unmount_filesystem_impl", unmount, "std::strcmp(resolved.data(), mp->path)"),
+    ):
+        producer = "int const PATH_RET = resolve_mount_path(path, resolved.data(), resolved.size());"
+        gate = "if (PATH_RET < 0)"
+        require_order(body, resolved_decl, producer, f"{name} resolver output")
+        require_order(body, producer, gate, f"{name} resolver failure gate")
+        require_order(body, gate, first_consumer, f"{name} consume only after success")
+        before_gate = body[: body.find(gate)]
+        if before_gate.count("resolved.data()") != 1 or before_gate.count("resolved.size()") != 1:
+            fail(f"{name} must not inspect resolver output before its failure gate")
+        failure = block_body_after(body, gate)
+        if not failure.rstrip().endswith("return PATH_RET;") or failure.count("return PATH_RET;") != 1 or "resolved" in failure:
+            fail(f"{name} must return without consuming resolver output on failure")
+
+
 def test_mount_lookup_returns_raii_refs() -> None:
     header = MOUNT_HPP.read_text()
     required = [
@@ -327,6 +512,7 @@ def test_iteration_users_use_snapshots_when_possible() -> None:
 
 
 def main() -> None:
+    test_mount_path_scratch_is_fully_produced_before_use()
     test_mount_lookup_returns_raii_refs()
     test_unmount_retires_removes_then_waits_before_destroy()
     test_remote_mount_is_configured_atomically()
