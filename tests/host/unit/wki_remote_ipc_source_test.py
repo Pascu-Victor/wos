@@ -294,6 +294,122 @@ def test_pipe_fd_open_flags_preserve_nonblocking_access_mode() -> None:
     require_order(write_body, "if (NONBLOCKING)", "pause_for_ipc_send_retry(ret, ATTEMPT)", "message nonblocking send check")
 
 
+def test_write_only_pipe_proxy_omits_receive_ring() -> None:
+    remote_ipc = REMOTE_IPC_CPP.read_text()
+    header = REMOTE_IPC_HPP.read_text()
+
+    if "bool can_receive_data = false" not in header:
+        fail("IPC proxy state must distinguish intentional non-receivers from ring allocation failure")
+
+    capability_body = function_body(remote_ipc, "ipc_proxy_can_receive_data")
+    capability_required = [
+        "res_type == ResourceType::IPC_SOCKET",
+        "res_type == ResourceType::IPC_PTY",
+        "res_type == ResourceType::IPC_PIPE && access_mode == 0",
+    ]
+    missing = [token for token in capability_required if token not in capability_body]
+    if missing:
+        fail("IPC receive-ring eligibility must preserve pipe-read, socket, and PTY receivers: " + ", ".join(missing))
+
+    attach_body = function_body(remote_ipc, "wki_ipc_attach_task_fds")
+    attach_required = [
+        "int const OPEN_FLAGS = ipc_fd_import_open_flags(entry.reserved1)",
+        "uint16_t const ACCESS_MODE = ipc_fd_access_mode(OPEN_FLAGS)",
+        "proxy->can_receive_data = ipc_proxy_can_receive_data(RES_TYPE, ACCESS_MODE)",
+        "if (proxy->can_receive_data)",
+        "new uint8_t[PIPE_RING_CAPACITY]",
+        "else if (!proxy->can_receive_data)",
+        "take_pending_pipe_delivery_locked(entry.home_node, entry.resource_id)",
+        "free_pending_pipe_delivery(dropped_pending)",
+    ]
+    missing = [token for token in attach_required if token not in attach_body]
+    if missing:
+        fail("IPC attach must allocate only usable receive rings and discard unreachable early data: " + ", ".join(missing))
+    require_order(attach_body, "uint16_t const ACCESS_MODE", "auto* proxy = new ProxyIpcState", "IPC proxy access classification")
+    require_order(attach_body, "take_pending_pipe_delivery_locked", "free_pending_pipe_delivery(dropped_pending)", "pending data cleanup")
+    if "std::fill_n(rb, PIPE_RING_CAPACITY" in attach_body:
+        fail("IPC receive rings must not zero free capacity that remains unpublished")
+
+    queue_body = function_body(remote_ipc, "queue_pending_pipe_data")
+    queue_required = [
+        "s_ipc_lock.lock_irqsave()",
+        "proxy_endpoint_rejects_received_data_locked(home_node, resource_id)",
+        "s_ipc_lock.unlock_irqrestore(IRQF)",
+        "delete[] copy",
+        "find_pending_pipe_delivery_locked(home_node, resource_id)",
+    ]
+    missing = [token for token in queue_required if token not in queue_body]
+    if missing:
+        fail("pending DATA insertion must atomically reject a published nonreceiver: " + ", ".join(missing))
+    require_order(queue_body, "proxy_endpoint_rejects_received_data_locked", "find_pending_pipe_delivery_locked", "pending DATA attach race")
+
+    close_body = function_body(remote_ipc, "mark_pending_pipe_write_closed")
+    require_order(
+        close_body,
+        "proxy_endpoint_rejects_received_data_locked(home_node, resource_id)",
+        "find_pending_pipe_delivery_locked(home_node, resource_id)",
+        "pending CLOSE attach race",
+    )
+
+    defer_body = function_body(remote_ipc, "should_defer_ipc_dev_op")
+    defer_required = [
+        "has_receiving_proxy = proxy->can_receive_data",
+        "exp->consumer_node == src_node",
+        "if (has_proxy && !has_receiving_proxy && !has_matching_export)",
+        "*drop_out = true",
+        "return !has_receiving_proxy",
+    ]
+    missing = [token for token in defer_required if token not in defer_body]
+    if missing:
+        fail("IPC DATA admission must inline receivers, defer exports/pre-attach data, and drop invalid nonreceivers: " + ", ".join(missing))
+
+    dispatch_body = function_body(remote_ipc, "handle_ipc_dev_op_req")
+    dispatch_required = [
+        "bool drop = false",
+        "should_defer_ipc_dev_op(req.op_id, resource_id, hdr->src_node, &drop)",
+        "if (drop)",
+        "handle_ipc_dev_op_req_inline(hdr, payload, payload_len)",
+    ]
+    missing = [token for token in dispatch_required if token not in dispatch_body]
+    if missing:
+        fail("IPC DEV_OP dispatch must apply the no-allocation DATA drop decision: " + ", ".join(missing))
+    require_order(dispatch_body, "if (drop)", "handle_ipc_dev_op_req_inline", "invalid IPC DATA admission")
+
+    data_body = function_body(remote_ipc, "handle_ipc_dev_op_req_inline")
+    data_required = [
+        "if (proxy != nullptr && !proxy->can_receive_data)",
+        "nonreceiving_proxy = proxy",
+        "proxy = nullptr",
+        "find_export_by_resource_id(resource_id)",
+        "bool const HAD_NONRECEIVING_PROXY = nonreceiving_proxy != nullptr",
+        "proxy_release(nonreceiving_proxy)",
+        "if (HAD_NONRECEIVING_PROXY)",
+        "pipe_trace.finish(-EBADF)",
+    ]
+    missing = [token for token in data_required if token not in data_body]
+    if missing:
+        fail("write-only IPC DATA must fall through to colliding exports, then reject without pending allocation: " + ", ".join(missing))
+    if data_body.count("exp->consumer_node == hdr->src_node") < 2:
+        fail("DATA/CLOSE_WRITE collision fallback must only select exports consumed by the source peer")
+    require_order(data_body, "proxy = nullptr", "find_export_by_resource_id(resource_id)", "opposite-direction resource collision")
+    no_export_start = data_body.find("if (!export_exists)")
+    no_export_end = data_body.find("if (OP_DATA_LEN == 0)", no_export_start)
+    no_export_body = data_body[no_export_start:no_export_end]
+    require_order(no_export_body, "if (HAD_NONRECEIVING_PROXY)", "queue_pending_pipe_data(hdr->src_node", "write-only pending allocation guard")
+
+    close_write_start = data_body.find("if (OP_ID == OP_PIPE_CLOSE_WRITE)")
+    close_read_start = data_body.find("if (OP_ID == OP_PIPE_CLOSE_READ)", close_write_start)
+    close_write_body = data_body[close_write_start:close_read_start]
+    for token in [
+        "if (proxy != nullptr && !proxy->can_receive_data)",
+        "nonreceiving_proxy = proxy",
+        "auto* exp = find_export_by_resource_id(resource_id)",
+        "if (HAD_NONRECEIVING_PROXY)",
+    ]:
+        if token not in close_write_body:
+            fail(f"pipe CLOSE_WRITE collision handling must contain {token!r}")
+
+
 def test_pty_export_data_can_write_from_deferred_worker_without_backlog() -> None:
     remote_ipc = REMOTE_IPC_CPP.read_text()
     handler_body = function_body(remote_ipc, "handle_ipc_dev_op_req_inline")
@@ -524,6 +640,7 @@ def test_ipc_selftests_are_declared_and_registered() -> None:
         "wki_ipc_selftest_epoll_close_releases_lookup_ref",
         "wki_ipc_selftest_nonblocking_pipe_write_view_preserves_source_flags",
         "wki_ipc_selftest_pipe_fd_flags_preserve_nonblocking_access_mode",
+        "wki_ipc_selftest_write_only_pipe_omits_receive_ring",
         "wki_ipc_selftest_attach_insert_failure_preserves_existing_fd",
         "wki_ipc_selftest_dev_op_response_cookie_fences_stale_completion",
         "wki_ipc_selftest_dev_op_response_uses_home_node_identity",
@@ -544,6 +661,7 @@ def main() -> None:
     test_proxy_lookup_is_peer_scoped()
     test_export_pipe_write_uses_nonmutating_nonblocking_view()
     test_pipe_fd_open_flags_preserve_nonblocking_access_mode()
+    test_write_only_pipe_proxy_omits_receive_ring()
     test_pty_export_data_can_write_from_deferred_worker_without_backlog()
     test_attach_fd_install_is_transactional()
     test_dev_op_response_cookies_fence_stale_waiters()

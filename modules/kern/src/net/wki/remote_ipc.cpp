@@ -287,6 +287,11 @@ auto ipc_fd_export_open_flags(int open_flags) -> uint16_t { return static_cast<u
 
 auto ipc_fd_import_open_flags(uint16_t flags) -> int { return static_cast<int>(flags & WKI_IPC_FD_OPEN_FLAG_MASK); }
 
+constexpr auto ipc_proxy_can_receive_data(ResourceType res_type, uint16_t access_mode) -> bool {
+    return res_type == ResourceType::IPC_SOCKET || res_type == ResourceType::IPC_PTY ||
+           (res_type == ResourceType::IPC_PIPE && access_mode == 0);
+}
+
 bool g_ipc_initialized = false;
 ker::mod::sys::Spinlock s_ipc_lock;
 
@@ -655,6 +660,16 @@ auto find_proxy_by_endpoint_locked(uint16_t home_node, uint32_t resource_id) -> 
         }
     }
     return nullptr;
+}
+
+auto proxy_endpoint_rejects_received_data_locked(uint16_t home_node, uint32_t resource_id) -> bool {
+    for (const auto* proxy : g_ipc_proxies) {
+        if (proxy != nullptr && proxy->active.load(std::memory_order_acquire) && proxy->home_node == home_node &&
+            proxy->resource_id == resource_id) {
+            return !proxy->can_receive_data;
+        }
+    }
+    return false;
 }
 
 auto ipc_acquire_export_file_locked(uint32_t resource_id) -> ker::vfs::File* {
@@ -1185,6 +1200,11 @@ auto queue_pending_pipe_data(uint16_t home_node, uint32_t resource_id, const uin
     std::memcpy(copy, data, len);
 
     uint64_t const IRQF = s_ipc_lock.lock_irqsave();
+    if (proxy_endpoint_rejects_received_data_locked(home_node, resource_id)) {
+        s_ipc_lock.unlock_irqrestore(IRQF);
+        delete[] copy;
+        return true;
+    }
     auto* pending = find_pending_pipe_delivery_locked(home_node, resource_id);
     if (pending == nullptr) {
         pending = new PendingPipeDelivery();
@@ -1206,6 +1226,10 @@ auto queue_pending_pipe_data(uint16_t home_node, uint32_t resource_id, const uin
 
 auto mark_pending_pipe_write_closed(uint16_t home_node, uint32_t resource_id) -> bool {
     uint64_t const IRQF = s_ipc_lock.lock_irqsave();
+    if (proxy_endpoint_rejects_received_data_locked(home_node, resource_id)) {
+        s_ipc_lock.unlock_irqrestore(IRQF);
+        return true;
+    }
     auto* pending = find_pending_pipe_delivery_locked(home_node, resource_id);
     if (pending == nullptr) {
         pending = new (std::nothrow) PendingPipeDelivery();
@@ -2778,23 +2802,41 @@ void send_ipc_dev_op_error_response(const WkiHeader* hdr, uint16_t op_id, uint32
     wki_send(hdr->src_node, hdr->channel_id, MsgType::DEV_OP_RESP, resp_buf.data(), static_cast<uint16_t>(resp_buf.size()));
 }
 
-auto should_defer_ipc_dev_op(uint16_t op_id, uint32_t resource_id, uint16_t src_node) -> bool {
+auto should_defer_ipc_dev_op(uint16_t op_id, uint32_t resource_id, uint16_t src_node, bool* drop_out) -> bool {
+    if (drop_out != nullptr) {
+        *drop_out = false;
+    }
     if (op_id == OP_PIPE_DATA) {
         bool has_proxy = false;
+        bool has_receiving_proxy = false;
+        bool has_matching_export = false;
         ProxyIpcState* proxy = nullptr;
         uint64_t const IRQF = s_ipc_lock.lock_irqsave();
         proxy = find_proxy_by_endpoint_locked(src_node, resource_id);
         if (proxy != nullptr) {
             has_proxy = true;
+            has_receiving_proxy = proxy->can_receive_data;
+            if (!has_receiving_proxy) {
+                auto* exp = find_export_by_resource_id(resource_id);
+                has_matching_export = exp != nullptr && exp->active && exp->file != nullptr && exp->consumer_node == src_node;
+            }
         }
         s_ipc_lock.unlock_irqrestore(IRQF);
         if (proxy != nullptr) {
             proxy_release(proxy);
         }
 
+        if (has_proxy && !has_receiving_proxy && !has_matching_export) {
+            if (drop_out != nullptr) {
+                *drop_out = true;
+            }
+            return false;
+        }
+
         // Proxy ring delivery is bounded and wakes local readers. Export-side
-        // writes can enter arbitrary file/socket/PTY ops, so defer them.
-        return !has_proxy;
+        // writes can enter arbitrary file/socket/PTY ops, so defer them. With
+        // no proxy, preserve pre-attachment delivery through the worker queue.
+        return !has_receiving_proxy;
     }
 
     if (op_id == OP_PIPE_POLL_STATE || op_id == OP_FUTEX_WAKE || op_id == OP_PTY_IOCTL || op_id == OP_PTY_CLOSE ||
@@ -3614,20 +3656,25 @@ void wki_ipc_attach_task_fds(ker::mod::sched::task::Task* task, const WkiIpcFdEn
             continue;
         }
 
+        auto const RES_TYPE = static_cast<ResourceType>(entry.res_type);
+        int const OPEN_FLAGS = ipc_fd_import_open_flags(entry.reserved1);
+        uint16_t const ACCESS_MODE = ipc_fd_access_mode(OPEN_FLAGS);
+
         auto* proxy = new ProxyIpcState();
         proxy->active = true;
-        proxy->res_type = static_cast<ResourceType>(entry.res_type);
+        proxy->res_type = RES_TYPE;
         proxy->home_node = entry.home_node;
         proxy->resource_id = entry.resource_id;
         proxy->assigned_channel = WKI_CHAN_RESOURCE;
+        proxy->can_receive_data = ipc_proxy_can_receive_data(RES_TYPE, ACCESS_MODE);
 
-        // Allocate local ring buffer for pipe read proxies, sockets, and PTY files (recv data)
-        if (proxy->res_type == ResourceType::IPC_PIPE || proxy->res_type == ResourceType::IPC_SOCKET ||
-            proxy->res_type == ResourceType::IPC_PTY) {
+        // Allocate receive storage only for endpoints whose fops can consume it.
+        if (proxy->can_receive_data) {
             constexpr uint32_t PIPE_RING_CAPACITY = WKI_PROXY_PIPE_RING_SIZE;
             auto* rb = new uint8_t[PIPE_RING_CAPACITY];
             if (rb != nullptr) {
-                std::fill_n(rb, PIPE_RING_CAPACITY, uint8_t{0});
+                // RX copies every readable byte before publishing ring_head, so
+                // free ring capacity does not need eager initialization.
                 proxy->ring_buf = rb;
                 proxy->ring_capacity = PIPE_RING_CAPACITY;
             } else {
@@ -3651,8 +3698,6 @@ void wki_ipc_attach_task_fds(ker::mod::sched::task::Task* task, const WkiIpcFdEn
         proxy_file->fd_flags = 0;
         proxy_file->vfs_path = nullptr;
         proxy_file->dir_fs_count = 0;
-        int const OPEN_FLAGS = ipc_fd_import_open_flags(entry.reserved1);
-        uint16_t const ACCESS_MODE = ipc_fd_access_mode(OPEN_FLAGS);
         proxy_file->open_flags = OPEN_FLAGS;
 
         if (proxy->res_type == ResourceType::IPC_PIPE) {
@@ -3706,18 +3751,24 @@ void wki_ipc_attach_task_fds(ker::mod::sched::task::Task* task, const WkiIpcFdEn
         }
 
         bool pending_write_closed = false;
+        PendingPipeDelivery* dropped_pending = nullptr;
         uint64_t const IRQF = s_ipc_lock.lock_irqsave();
         proxy->refcount.fetch_add(1, std::memory_order_acq_rel);
         g_ipc_proxies.push_back(proxy);
-        if (proxy->ring_buf != nullptr) {
+        if (proxy->can_receive_data && proxy->ring_buf != nullptr) {
             auto* pending = find_pending_pipe_delivery_locked(entry.home_node, entry.resource_id);
             pending_write_closed = pending != nullptr && pending->write_closed;
             if (pending != nullptr && pending->write_closed && pending->chunks.empty()) {
                 erase_pending_pipe_delivery_locked(pending);
                 free_pending_pipe_delivery(pending);
             }
+        } else if (!proxy->can_receive_data) {
+            // A write-only endpoint cannot consume DATA that raced ahead of
+            // TASK_SUBMIT attachment. Do not leave unreachable pending bytes.
+            dropped_pending = take_pending_pipe_delivery_locked(entry.home_node, entry.resource_id);
         }
         s_ipc_lock.unlock_irqrestore(IRQF);
+        free_pending_pipe_delivery(dropped_pending);
 
         if (pending_write_closed) {
             proxy_mark_pipe_closed(proxy, entry.resource_id);
@@ -4623,6 +4674,79 @@ auto wki_ipc_selftest_pipe_fd_flags_preserve_nonblocking_access_mode() -> int {
     return 0;
 }
 
+auto wki_ipc_selftest_write_only_pipe_omits_receive_ring() -> int {
+    constexpr uint16_t READ_FD = 5;
+    constexpr uint16_t WRITE_FD = 6;
+    constexpr uint32_t READ_RESOURCE_ID = 0x7D70;
+    constexpr uint32_t WRITE_RESOURCE_ID = 0x7D71;
+
+    if (!ipc_proxy_can_receive_data(ResourceType::IPC_PIPE, 0) || ipc_proxy_can_receive_data(ResourceType::IPC_PIPE, 1) ||
+        ipc_proxy_can_receive_data(ResourceType::IPC_PIPE, 2) || ipc_proxy_can_receive_data(ResourceType::IPC_PIPE, 3) ||
+        !ipc_proxy_can_receive_data(ResourceType::IPC_SOCKET, 0) || !ipc_proxy_can_receive_data(ResourceType::IPC_PTY, 0) ||
+        ipc_proxy_can_receive_data(ResourceType::IPC_EPOLL, 0)) {
+        return -EIO;
+    }
+
+    ker::mod::sched::task::Task task{};
+    std::array<WkiIpcFdEntry, 2> entries = {};
+    entries.at(0).local_fd = READ_FD;
+    entries.at(0).res_type = static_cast<uint16_t>(ResourceType::IPC_PIPE);
+    entries.at(0).resource_id = READ_RESOURCE_ID;
+    entries.at(0).home_node = WKI_NODE_INVALID;
+    entries.at(0).reserved1 = ipc_fd_export_open_flags(WKI_IPC_O_NONBLOCK);
+    entries.at(1).local_fd = WRITE_FD;
+    entries.at(1).res_type = static_cast<uint16_t>(ResourceType::IPC_PIPE);
+    entries.at(1).resource_id = WRITE_RESOURCE_ID;
+    entries.at(1).home_node = WKI_NODE_INVALID;
+    entries.at(1).reserved1 = ipc_fd_export_open_flags(1 | WKI_IPC_O_NONBLOCK);
+
+    int const PROXY_FREES_BEFORE = g_ipc_proxy_selftest_frees.load(std::memory_order_acquire);
+    wki_ipc_attach_task_fds(&task, entries.data(), static_cast<uint16_t>(entries.size()));
+
+    auto* read_file = static_cast<ker::vfs::File*>(task.fd_table.lookup(READ_FD));
+    auto* write_file = static_cast<ker::vfs::File*>(task.fd_table.lookup(WRITE_FD));
+    auto* read_proxy = read_file != nullptr ? static_cast<ProxyIpcState*>(read_file->private_data) : nullptr;
+    auto* write_proxy = write_file != nullptr ? static_cast<ProxyIpcState*>(write_file->private_data) : nullptr;
+
+    bool read_drop = true;
+    bool write_drop = false;
+    bool const READ_DEFERRED = should_defer_ipc_dev_op(OP_PIPE_DATA, READ_RESOURCE_ID, WKI_NODE_INVALID, &read_drop);
+    bool const WRITE_DEFERRED = should_defer_ipc_dev_op(OP_PIPE_DATA, WRITE_RESOURCE_ID, WKI_NODE_INVALID, &write_drop);
+
+    constexpr uint8_t INVALID_DATA = 0xA5;
+    bool const PENDING_DATA_REJECTED = queue_pending_pipe_data(WKI_NODE_INVALID, WRITE_RESOURCE_ID, &INVALID_DATA, sizeof(INVALID_DATA));
+    bool const PENDING_CLOSE_REJECTED = mark_pending_pipe_write_closed(WKI_NODE_INVALID, WRITE_RESOURCE_ID);
+    bool pending_left = false;
+    {
+        uint64_t const IRQF = s_ipc_lock.lock_irqsave();
+        pending_left = find_pending_pipe_delivery_locked(WKI_NODE_INVALID, WRITE_RESOURCE_ID) != nullptr;
+        s_ipc_lock.unlock_irqrestore(IRQF);
+    }
+
+    bool const ATTACH_OK = read_file != nullptr && write_file != nullptr && read_proxy != nullptr && write_proxy != nullptr &&
+                           read_file->fops == &g_proxy_pipe_read_fops && write_file->fops == &g_proxy_pipe_write_fops &&
+                           read_file->open_flags == WKI_IPC_O_NONBLOCK && write_file->open_flags == (1 | WKI_IPC_O_NONBLOCK) &&
+                           read_proxy->can_receive_data && read_proxy->ring_buf != nullptr &&
+                           read_proxy->ring_capacity == WKI_PROXY_PIPE_RING_SIZE && !write_proxy->can_receive_data &&
+                           write_proxy->ring_buf == nullptr && write_proxy->ring_capacity == 0 && !READ_DEFERRED && !read_drop &&
+                           !WRITE_DEFERRED && write_drop && PENDING_DATA_REJECTED && PENDING_CLOSE_REJECTED && !pending_left;
+
+    auto detach = [&](uint16_t fd) {
+        auto* removed = static_cast<ker::vfs::File*>(task.fd_table.remove(fd));
+        if (removed == nullptr) {
+            return;
+        }
+        auto* proxy = static_cast<ProxyIpcState*>(removed->private_data);
+        wki_ipc_detach_proxy_file(removed, proxy);
+        ker::vfs::vfs_put_file(removed);
+    };
+    detach(READ_FD);
+    detach(WRITE_FD);
+
+    int const PROXY_FREES_AFTER = g_ipc_proxy_selftest_frees.load(std::memory_order_acquire);
+    return ATTACH_OK && PROXY_FREES_AFTER - PROXY_FREES_BEFORE == 2 ? 0 : -EIO;
+}
+
 auto wki_ipc_selftest_attach_insert_failure_preserves_existing_fd() -> int {
     constexpr uint16_t FD = 5;
     constexpr uint32_t RESOURCE_ID = 0x7D7D;
@@ -5356,11 +5480,19 @@ void handle_ipc_dev_op_req_inline(const WkiHeader* hdr, const uint8_t* payload, 
         bool export_pty_immediate = false;
         uint64_t const IRQF = s_ipc_lock.lock_irqsave();
         auto* proxy = find_proxy_by_endpoint_locked(hdr->src_node, resource_id);
+        ProxyIpcState* nonreceiving_proxy = nullptr;
+        if (proxy != nullptr && !proxy->can_receive_data) {
+            // Node-local resource IDs can collide in opposite directions.
+            // A write-only proxy is not a receive target, so keep looking for
+            // a same-ID home-side export before treating the DATA as invalid.
+            nonreceiving_proxy = proxy;
+            proxy = nullptr;
+        }
         bool const PENDING_BUFFERED = find_pending_pipe_delivery_locked(hdr->src_node, resource_id) != nullptr;
         bool export_exists = false;
         if (proxy == nullptr) {
             auto* exp = find_export_by_resource_id(resource_id);
-            if (exp != nullptr && exp->active && exp->file != nullptr) {
+            if (exp != nullptr && exp->active && exp->file != nullptr && exp->consumer_node == hdr->src_node) {
                 export_exists = true;
                 bool const HAS_BACKLOG = find_export_pipe_write_backlog_locked(exp) != nullptr;
                 if (exp->res_type == ResourceType::IPC_PTY && !HAS_BACKLOG && exp->file->fops != nullptr &&
@@ -5372,6 +5504,8 @@ void handle_ipc_dev_op_req_inline(const WkiHeader* hdr, const uint8_t* payload, 
             }
         }
         s_ipc_lock.unlock_irqrestore(IRQF);
+        bool const HAD_NONRECEIVING_PROXY = nonreceiving_proxy != nullptr;
+        proxy_release(nonreceiving_proxy);
 
         if (proxy != nullptr) {
             if (OP_DATA_LEN == 0) {
@@ -5469,6 +5603,12 @@ void handle_ipc_dev_op_req_inline(const WkiHeader* hdr, const uint8_t* payload, 
         }
 
         if (!export_exists) {
+            if (HAD_NONRECEIVING_PROXY) {
+                // Do not turn impossible/stale DATA for a write-only proxy
+                // into unbounded pending allocations in RX context.
+                pipe_trace.finish(-EBADF);
+                return;
+            }
             if (OP_DATA_LEN > 0 && !queue_pending_pipe_data(hdr->src_node, resource_id, op_data, OP_DATA_LEN)) {
                 ker::mod::dbg::log("[WKI] IPC pending pipe DATA queue failed: resource_id=%u len=%u", resource_id, OP_DATA_LEN);
             }
@@ -5758,6 +5898,11 @@ void handle_ipc_dev_op_req_inline(const WkiHeader* hdr, const uint8_t* payload, 
 
         // Check consumer-side proxy first
         auto* proxy = find_proxy_by_endpoint_locked(hdr->src_node, resource_id);
+        ProxyIpcState* nonreceiving_proxy = nullptr;
+        if (proxy != nullptr && !proxy->can_receive_data) {
+            nonreceiving_proxy = proxy;
+            proxy = nullptr;
+        }
         if (proxy != nullptr) {
             s_ipc_lock.unlock_irqrestore(IRQF);
 
@@ -5768,14 +5913,21 @@ void handle_ipc_dev_op_req_inline(const WkiHeader* hdr, const uint8_t* payload, 
 
         // Check server-side export
         auto* exp = find_export_by_resource_id(resource_id);
-        if (exp != nullptr && exp->active && exp->file != nullptr) {
+        if (exp != nullptr && exp->active && exp->file != nullptr && exp->consumer_node == hdr->src_node) {
             s_ipc_lock.unlock_irqrestore(IRQF);
+            proxy_release(nonreceiving_proxy);
             if (!mark_export_pipe_write_closed(resource_id, expected_bytes, has_expected_bytes)) {
                 ker::mod::dbg::log("[WKI] IPC export pipe close queue failed: resource_id=%u", resource_id);
             }
             return;
         }
         s_ipc_lock.unlock_irqrestore(IRQF);
+        bool const HAD_NONRECEIVING_PROXY = nonreceiving_proxy != nullptr;
+        proxy_release(nonreceiving_proxy);
+
+        if (HAD_NONRECEIVING_PROXY) {
+            return;
+        }
 
         if (!mark_pending_pipe_write_closed(hdr->src_node, resource_id)) {
             ker::mod::dbg::log("[WKI] IPC pending pipe CLOSE queue failed: resource_id=%u", resource_id);
@@ -5977,8 +6129,12 @@ void handle_ipc_dev_op_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
     uint32_t resource_id = 0;
     std::memcpy(&resource_id, payload + sizeof(DevOpReqPayload), sizeof(uint32_t));
 
-    if (should_defer_ipc_dev_op(req.op_id, resource_id, hdr->src_node)) {
+    bool drop = false;
+    if (should_defer_ipc_dev_op(req.op_id, resource_id, hdr->src_node, &drop)) {
         enqueue_ipc_dev_op_work(hdr, payload, payload_len, req.op_id, resource_id);
+        return;
+    }
+    if (drop) {
         return;
     }
 
