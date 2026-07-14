@@ -101,6 +101,103 @@ def test_vfs_host_alias_rewrite_is_overlap_safe() -> None:
     )
 
 
+def test_vfs_route_scratch_is_initialized_by_its_producer() -> None:
+    core = VFS_CORE_CPP.read_text()
+
+    rewrite = function_body(core, "rewrite_wki_host_alias")
+    require_order(
+        rewrite,
+        [
+            "std::array<char, MAX_PATH_LEN> current __attribute__((uninitialized));",
+            "copy_path_string(path, current.data(), current.size())",
+            "if (copy_result < 0)",
+            "std::array<char, MAX_PATH_LEN> self_prefix __attribute__((uninitialized));",
+            "build_wki_host_path(ker::net::wki::g_wki.local_hostname.data(), \"\", self_prefix.data(), self_prefix.size())",
+            "if (copy_result < 0)",
+            "self_prefix_len = std::strlen(self_prefix.data())",
+        ],
+        "WKI alias scratch producer ordering",
+    )
+    require_tokens(
+        rewrite,
+        [
+            "return copy_path_string(current.data(), out, out_size);",
+            "self_prefix_len > WKI_PATH_PREFIX_LEN",
+        ],
+        "WKI alias scratch consumers",
+    )
+
+    route = function_body(core, "apply_task_vfs_route")
+    require_order(
+        route,
+        [
+            "std::array<char, MAX_PATH_LEN> logical_path __attribute__((uninitialized));",
+            "strip_task_root_prefix(task, path, logical_path.data(), logical_path.size(), &had_root_prefix)",
+            "if (LOGICAL_RESULT < 0)",
+            "std::array<char, MAX_PATH_LEN> aliased __attribute__((uninitialized));",
+            "rewrite_wki_host_alias(task, logical_path.data(), aliased.data(), aliased.size())",
+            "if (alias_result < 0)",
+            "choose_task_route(task, aliased.data())",
+            "std::array<char, MAX_PATH_LEN> routed __attribute__((uninitialized));",
+            "if (alias_result < 0)",
+            "copy_path_string(routed.data(), out, out_size)",
+        ],
+        "task route scratch producer ordering",
+    )
+    require_tokens(
+        route,
+        [
+            "alias_result = copy_path_string(aliased.data(), routed.data(), routed.size());",
+            "alias_result = build_wki_host_path(submitter, aliased.data(), routed.data(), routed.size());",
+        ],
+        "task route scratch branch producers",
+    )
+
+    caller_specs = [
+        (
+            "normalize_task_path_inplace_with_route",
+            "int const ROUTE_RESULT = apply_task_vfs_route",
+            "if (ROUTE_RESULT < 0)",
+            "copy_path_string(routed.data(), path, bufsize)",
+        ),
+        (
+            "finish_canonical_task_path_raw",
+            "int const ROUTE_RESULT = apply_task_vfs_route",
+            "if (ROUTE_RESULT < 0)",
+            "copy_path_string(routed.data(), out, outsize",
+        ),
+        (
+            "resolve_dirfd_task_path_raw",
+            "result = apply_task_vfs_route",
+            "if (result < 0)",
+            "copy_path_string(routed.data(), out, outsize",
+        ),
+    ]
+    for function_name, producer, error_check, consumer in caller_specs:
+        body = function_body(core, function_name)
+        require_order(
+            body,
+            [
+                "std::array<char, MAX_PATH_LEN> routed __attribute__((uninitialized));",
+                producer,
+                error_check,
+                consumer,
+            ],
+            f"{function_name} route scratch producer ordering",
+        )
+        if "std::array<char, MAX_PATH_LEN> routed{};" in body:
+            fail(f"{function_name} must not value-initialize fully produced route scratch")
+
+    for legacy in [
+        "std::array<char, MAX_PATH_LEN> current{};",
+        "std::array<char, MAX_PATH_LEN> self_prefix{};",
+        "std::array<char, MAX_PATH_LEN> logical_path{};",
+        "std::array<char, MAX_PATH_LEN> aliased{};",
+    ]:
+        if legacy in rewrite or legacy in route:
+            fail(f"route scratch must not retain redundant value initialization: {legacy}")
+
+
 def test_proxy_op_slot_waits_are_bounded() -> None:
     header = REMOTE_VFS_HPP.read_text()
     source = REMOTE_VFS_CPP.read_text()
@@ -2548,6 +2645,7 @@ def test_export_rebuild_is_revisioned_and_backing_mount_exact() -> None:
 
 def main() -> None:
     test_vfs_host_alias_rewrite_is_overlap_safe()
+    test_vfs_route_scratch_is_initialized_by_its_producer()
     test_proxy_op_slot_waits_are_bounded()
     test_proxy_operations_fail_before_setup_when_slot_wait_times_out()
     test_proxy_request_envelopes_use_stack_storage()

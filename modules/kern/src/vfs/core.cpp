@@ -5927,13 +5927,17 @@ auto rewrite_wki_host_alias(const ker::mod::sched::task::Task* task, const char*
         return copy_path_string(path, out, out_size);
     }
 
-    std::array<char, MAX_PATH_LEN> current{};
+    // The bounded copy below initializes the complete NUL-terminated string before use.
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
+    std::array<char, MAX_PATH_LEN> current __attribute__((uninitialized));
     int copy_result = copy_path_string(path, current.data(), current.size());
     if (copy_result < 0) {
         return copy_result;
     }
 
-    std::array<char, MAX_PATH_LEN> self_prefix{};
+    // The prefix is read only after its builder succeeds.
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
+    std::array<char, MAX_PATH_LEN> self_prefix __attribute__((uninitialized));
     size_t self_prefix_len = 0;
     if (ker::net::wki::g_wki.local_hostname[0] != '\0') {
         copy_result = build_wki_host_path(ker::net::wki::g_wki.local_hostname.data(), "", self_prefix.data(), self_prefix.size());
@@ -6419,21 +6423,25 @@ auto apply_task_vfs_route(const ker::mod::sched::task::Task* task, const char* p
         return copy_path_string(path, out, out_size);
     }
 
-    std::array<char, MAX_PATH_LEN> logical_path{};
+    // Each route stage initializes its complete NUL-terminated string before the next stage.
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
+    std::array<char, MAX_PATH_LEN> logical_path __attribute__((uninitialized));
     bool had_root_prefix = false;
     int const LOGICAL_RESULT = strip_task_root_prefix(task, path, logical_path.data(), logical_path.size(), &had_root_prefix);
     if (LOGICAL_RESULT < 0) {
         return LOGICAL_RESULT;
     }
 
-    std::array<char, MAX_PATH_LEN> aliased{};
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
+    std::array<char, MAX_PATH_LEN> aliased __attribute__((uninitialized));
     int alias_result = rewrite_wki_host_alias(task, logical_path.data(), aliased.data(), aliased.size());
     if (alias_result < 0) {
         return alias_result;
     }
 
     VfsRouteDecision const DECISION = choose_task_route(task, aliased.data());
-    std::array<char, MAX_PATH_LEN> routed{};
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
+    std::array<char, MAX_PATH_LEN> routed __attribute__((uninitialized));
     if (DECISION.route != static_cast<uint8_t>(ker::mod::sched::task::WkiVfsRoute::HOST)) {
         alias_result = copy_path_string(aliased.data(), routed.data(), routed.size());
     } else {
@@ -6496,7 +6504,9 @@ auto normalize_task_path_inplace_with_route(char* path, size_t bufsize, bool app
         return 0;
     }
 
-    std::array<char, MAX_PATH_LEN> routed{};
+    // apply_task_vfs_route initializes the complete NUL-terminated string on success.
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
+    std::array<char, MAX_PATH_LEN> routed __attribute__((uninitialized));
     int const ROUTE_RESULT = apply_task_vfs_route(current_task, path, routed.data(), routed.size());
     if (ROUTE_RESULT < 0) {
         return ROUTE_RESULT;
@@ -6564,7 +6574,9 @@ auto finish_canonical_task_path_raw(char* out, size_t outsize, bool apply_task_r
         return 0;
     }
 
-    std::array<char, MAX_PATH_LEN> routed{};
+    // apply_task_vfs_route initializes the complete NUL-terminated string on success.
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
+    std::array<char, MAX_PATH_LEN> routed __attribute__((uninitialized));
     int const ROUTE_RESULT = apply_task_vfs_route(current_task, out, routed.data(), routed.size());
     if (ROUTE_RESULT < 0) {
         return ROUTE_RESULT;
@@ -9997,7 +10009,9 @@ auto resolve_dirfd_task_path_raw(ker::mod::sched::task::Task* task, int dirfd, c
         return 0;
     }
 
-    std::array<char, MAX_PATH_LEN> routed{};
+    // apply_task_vfs_route initializes the complete NUL-terminated string on success.
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
+    std::array<char, MAX_PATH_LEN> routed __attribute__((uninitialized));
     result = apply_task_vfs_route(task, out, routed.data(), routed.size());
     if (result < 0) {
         return result;
