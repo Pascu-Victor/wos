@@ -632,6 +632,43 @@ def test_server_open_reuses_the_open_file_stat_snapshot() -> None:
         fail("remote VFS server open must not dereference a file after publishing it to peer cleanup")
 
 
+def test_server_message_read_uses_bounded_stack_response() -> None:
+    source = REMOTE_VFS_CPP.read_text()
+    handler_body = function_body(source, "handle_vfs_op")
+    read_start = handler_body.find("case OP_VFS_READ:")
+    write_start = handler_body.find("case OP_VFS_WRITE:", read_start)
+    if read_start < 0 or write_start < 0:
+        fail("remote VFS server read/write opcode cases must remain present")
+    read_case = handler_body[read_start:write_start]
+
+    require_order(
+        read_case,
+        [
+            "len = std::min<uint32_t>(len, max_resp_data)",
+            "std::array<uint8_t, WKI_ETH_MAX_PAYLOAD> resp_buf __attribute__((uninitialized))",
+            "reinterpret_cast<DevOpRespPayload*>(resp_buf.data())",
+            "uint8_t* read_buf = resp_buf.data() + sizeof(DevOpRespPayload)",
+            "read_local_file_windowed(local_file, read_buf, len",
+            "resp->op_id = OP_VFS_READ",
+            "resp->status = 0",
+            "resp->data_len = static_cast<uint16_t>(BYTES_READ)",
+            "resp->status = static_cast<int16_t>(BYTES_READ)",
+            "resp->data_len = 0",
+            "resp->reserved = REQ_COOKIE",
+            "uint16_t const SEND_LEN = (BYTES_READ > 0) ? static_cast<uint16_t>(sizeof(DevOpRespPayload) + BYTES_READ)",
+            ": static_cast<uint16_t>(sizeof(DevOpRespPayload))",
+            "wki_send_on_channel_identity(channel_identity, MsgType::DEV_OP_RESP, resp_buf.data(), SEND_LEN)",
+        ],
+        "server message-read bounded stack response",
+    )
+    if re.search(r"\bnew\b|delete\s*\[\s*\]", read_case) or "std::memset(read_buf" in read_case:
+        fail("server message read retained heap allocation or redundant full-span clearing")
+    if re.search(r"\bresp_buf\s*(?:\{\}|=\s*\{\})", read_case):
+        fail("server message read zero-initializes unused response capacity")
+    if "WKI_ETH_MAX_PAYLOAD <= ker::mod::mm::KERNEL_STACK_SIZE / 16" not in source:
+        fail("server message-read stack response lacks a kernel-stack headroom bound")
+
+
 def test_server_roce_push_reads_reuse_registered_staging() -> None:
     source = REMOTE_VFS_CPP.read_text()
     handler = function_body(source, "handle_vfs_op")
@@ -2283,6 +2320,7 @@ def main() -> None:
     test_shared_io_callers_timeout_or_fallback()
     test_message_fallback_readahead_targets_small_sequential_reads()
     test_server_open_reuses_the_open_file_stat_snapshot()
+    test_server_message_read_uses_bounded_stack_response()
     test_server_roce_push_reads_reuse_registered_staging()
     test_remote_metadata_scratch_initializes_only_consumed_prefix()
     test_write_behind_storage_grows_in_allocator_shaped_classes()

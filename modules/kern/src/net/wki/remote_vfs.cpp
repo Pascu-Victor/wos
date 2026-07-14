@@ -23,6 +23,7 @@
 #include <net/wki/wki.hpp>
 #include <new>
 #include <platform/dbg/dbg.hpp>
+#include <platform/mm/mm.hpp>
 #include <platform/perf/perf_events.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
@@ -108,6 +109,7 @@ constexpr uint64_t VFS_PROXY_OP_TIMEOUT_US = 60'000'000;
 constexpr uint64_t VFS_PROXY_SLOT_WAIT_TIMEOUT_US = VFS_PROXY_OP_TIMEOUT_US;
 static_assert(sizeof(DevOpReqPayload) <= WKI_ETH_MAX_PAYLOAD);
 static_assert(WKI_ETH_MAX_PAYLOAD <= UINT16_MAX);
+static_assert(WKI_ETH_MAX_PAYLOAD <= ker::mod::mm::KERNEL_STACK_SIZE / 16);
 
 constexpr uint32_t VFS_READDIR_BATCH_MAX_ENTRIES =
     static_cast<uint32_t>((WKI_ETH_MAX_PAYLOAD - sizeof(DevOpRespPayload) - sizeof(uint32_t)) / sizeof(ker::vfs::DirEntry));
@@ -4501,23 +4503,13 @@ void handle_vfs_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_ident
             auto max_resp_data = static_cast<uint16_t>(WKI_ETH_MAX_PAYLOAD - sizeof(DevOpRespPayload));
             len = std::min<uint32_t>(len, max_resp_data);
 
-            auto resp_total = static_cast<uint16_t>(sizeof(DevOpRespPayload) + len);
-            auto* resp_buf = new (std::nothrow) uint8_t[resp_total];
-            if (resp_buf == nullptr) {
-                DevOpRespPayload resp = {};
-                resp.op_id = OP_VFS_READ;
-                resp.status = -ENOMEM;
-                resp.data_len = 0;
-                resp.reserved = REQ_COOKIE;
-                static_cast<void>(wki_send_on_channel_identity(channel_identity, MsgType::DEV_OP_RESP, &resp, sizeof(resp)));
-                break;
-            }
-
-            auto* resp = reinterpret_cast<DevOpRespPayload*>(resp_buf);
-            uint8_t* read_buf = resp_buf + sizeof(DevOpRespPayload);
-
-            // Pre-fill buffer with a sentinel pattern to detect whether vfs_read actually writes
-            std::memset(read_buf, 0xAA, len);
+            // A positive VFS read result owns an initialized prefix of exactly
+            // that length. Transmit only that prefix and leave unused bounded
+            // response capacity untouched.
+            // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
+            std::array<uint8_t, WKI_ETH_MAX_PAYLOAD> resp_buf __attribute__((uninitialized));
+            auto* resp = reinterpret_cast<DevOpRespPayload*>(resp_buf.data());
+            uint8_t* read_buf = resp_buf.data() + sizeof(DevOpRespPayload);
 
             perf_record_vfs_server_begin(SERVER_OP, hdr->src_node, channel_id, CORRELATION, CALLSITE);
             uint64_t const LOCAL_STARTED_US = wki_now_us();
@@ -4571,8 +4563,7 @@ void handle_vfs_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_ident
                                                        : static_cast<uint16_t>(sizeof(DevOpRespPayload));
             perf_record_vfs_server_point(static_cast<uint8_t>(ker::mod::perf::WkiPerfVfsServerOp::REPLY_SEND), hdr->src_node, channel_id,
                                          CORRELATION, resp->status, SEND_LEN, CALLSITE);
-            static_cast<void>(wki_send_on_channel_identity(channel_identity, MsgType::DEV_OP_RESP, resp_buf, SEND_LEN));
-            delete[] resp_buf;
+            static_cast<void>(wki_send_on_channel_identity(channel_identity, MsgType::DEV_OP_RESP, resp_buf.data(), SEND_LEN));
             break;
         }
 
