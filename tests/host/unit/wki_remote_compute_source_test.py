@@ -1026,7 +1026,7 @@ def test_task_submit_envelopes_use_bounded_stack_storage() -> None:
     send_impl = function_body(wki, "wki_send_impl")
     require_order(
         send_impl,
-        "memcpy(frame + WKI_HEADER_SIZE, payload, payload_len)",
+        "copy_wki_payload_segments(frame + WKI_HEADER_SIZE, payload, payload_len, payload_tail, payload_tail_len)",
         "memcpy(rt_data, frame, FRAME_LEN)",
         "TASK_SUBMIT borrow copied into frame before retransmit ownership",
     )

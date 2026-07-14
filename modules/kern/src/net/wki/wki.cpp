@@ -2229,8 +2229,37 @@ auto wki_send_raw(uint16_t dst_node, MsgType msg_type, const void* payload, uint
 
 namespace {
 
+auto wki_payload_segments_total_len(const void* payload, uint16_t payload_len, const void* payload_tail, uint16_t payload_tail_len,
+                                    uint16_t* total_len_out) -> bool {
+    if (total_len_out == nullptr || (payload_len != 0 && payload == nullptr) || (payload_tail_len != 0 && payload_tail == nullptr)) {
+        return false;
+    }
+
+    size_t const TOTAL_LEN = static_cast<size_t>(payload_len) + payload_tail_len;
+    if (TOTAL_LEN > WKI_ETH_MAX_PAYLOAD) {
+        return false;
+    }
+    *total_len_out = static_cast<uint16_t>(TOTAL_LEN);
+    return true;
+}
+
+void copy_wki_payload_segments(uint8_t* dest, const void* payload, uint16_t payload_len, const void* payload_tail,
+                               uint16_t payload_tail_len) {
+    if (payload_len != 0) {
+        memcpy(dest, payload, payload_len);
+    }
+    if (payload_tail_len != 0) {
+        memcpy(dest + payload_len, payload_tail, payload_tail_len);
+    }
+}
+
 auto wki_send_impl(uint16_t dst_node, uint16_t channel_id, MsgType msg_type, const void* payload, uint16_t payload_len,
-                   WkiChannel* expected_channel, uint32_t expected_generation, WkiReliableTxToken* tx_token_out) -> int {
+                   WkiChannel* expected_channel, uint32_t expected_generation, WkiReliableTxToken* tx_token_out,
+                   const void* payload_tail = nullptr, uint16_t payload_tail_len = 0) -> int {
+    uint16_t wire_payload_len = 0;
+    if (!wki_payload_segments_total_len(payload, payload_len, payload_tail, payload_tail_len, &wire_payload_len)) {
+        return WKI_ERR_INVALID;
+    }
     if (!g_wki.initialized) {
         return WKI_ERR_INVALID;
     }
@@ -2265,7 +2294,7 @@ auto wki_send_impl(uint16_t dst_node, uint16_t channel_id, MsgType msg_type, con
     // directly in pkt->data, avoiding the extra memcpy in eth_wki_tx().
     // Use pkt_alloc_tx() to preserve an RX reserve and avoid TX exhausting
     // the global pool, which can starve ACK/heartbeat receive progress.
-    uint16_t const FRAME_LEN = WKI_HEADER_SIZE + payload_len;
+    uint16_t const FRAME_LEN = WKI_HEADER_SIZE + wire_payload_len;
     net::PacketBuffer* pkt = net::pkt_alloc_tx();
     if (pkt == nullptr) {
         return WKI_ERR_NO_MEM;
@@ -2327,7 +2356,7 @@ auto wki_send_impl(uint16_t dst_node, uint16_t channel_id, MsgType msg_type, con
 
     uint32_t const TRACE_CORRELATION = ch->tx_seq;
 
-    perf_record_transport_begin(dst_node, channel_id, TRACE_CORRELATION, payload_len, TRACE_CALLSITE);
+    perf_record_transport_begin(dst_node, channel_id, TRACE_CORRELATION, wire_payload_len, TRACE_CALLSITE);
 
     // Give pending ACK state a chance to ride on this reliable frame. Prefer
     // the carrier channel's cumulative ACK; otherwise borrow one pending ACK
@@ -2358,7 +2387,7 @@ auto wki_send_impl(uint16_t dst_node, uint16_t channel_id, MsgType msg_type, con
     hdr->channel_id = channel_id;
     hdr->seq_num = ch->tx_seq;
     hdr->ack_num = ack_snapshot_present(piggyback_ack) ? piggyback_ack.ack_num : 0;
-    hdr->payload_len = payload_len;
+    hdr->payload_len = wire_payload_len;
     auto const LOCAL_RX_CREDITS = static_cast<uint8_t>(ch->rx_credits > 255 ? 255 : ch->rx_credits);
     hdr->credits = ack_snapshot_present(piggyback_ack) ? piggyback_ack.hdr.credits : LOCAL_RX_CREDITS;
     hdr->hop_ttl = WKI_DEFAULT_TTL;
@@ -2367,9 +2396,7 @@ auto wki_send_impl(uint16_t dst_node, uint16_t channel_id, MsgType msg_type, con
     hdr->checksum = 0;
     hdr->reserved = ((flags & WKI_FLAG_ACK_CHANNEL) != 0) ? wki_ack_reserved(piggyback_ack.channel_id) : 0;
 
-    if ((payload != nullptr) && payload_len > 0) {
-        memcpy(frame + WKI_HEADER_SIZE, payload, payload_len);
-    }
+    copy_wki_payload_segments(frame + WKI_HEADER_SIZE, payload, payload_len, payload_tail, payload_tail_len);
 
     pkt->len = FRAME_LEN;
 
@@ -2418,7 +2445,7 @@ auto wki_send_impl(uint16_t dst_node, uint16_t channel_id, MsgType msg_type, con
         ch->lock.unlock();
         wki_retransmit_entry_release(ch, heap_rt_entry);
         net::pkt_free(pkt);
-        perf_record_transport_end(dst_node, channel_id, TRACE_CORRELATION, WKI_ERR_NO_MEM, payload_len, TRACE_CALLSITE);
+        perf_record_transport_end(dst_node, channel_id, TRACE_CORRELATION, WKI_ERR_NO_MEM, wire_payload_len, TRACE_CALLSITE);
         return WKI_ERR_NO_MEM;
     }
 
@@ -2485,7 +2512,7 @@ auto wki_send_impl(uint16_t dst_node, uint16_t channel_id, MsgType msg_type, con
             post_unlock_ack = piggyback_ack;
         }
     }
-    ch->bytes_sent += payload_len;
+    ch->bytes_sent += wire_payload_len;
 
     ch->lock.unlock();
     wki_retransmit_entry_release(ch, heap_rt_entry);
@@ -2584,6 +2611,41 @@ auto wki_send_on_channel_identity(const WkiChannelIdentity& identity, MsgType ms
     return wki_send_impl(identity.peer_node_id, identity.channel_id, msg_type, payload, payload_len, identity.channel, identity.generation,
                          nullptr);
 }
+
+auto wki_send_on_channel_identity_split(const WkiChannelIdentity& identity, MsgType msg_type, const void* payload, uint16_t payload_len,
+                                        const void* payload_tail, uint16_t payload_tail_len) -> int {
+    if (identity.channel == nullptr || identity.peer_node_id == WKI_NODE_INVALID || identity.generation == 0) {
+        return WKI_ERR_INVALID;
+    }
+    return wki_send_impl(identity.peer_node_id, identity.channel_id, msg_type, payload, payload_len, identity.channel, identity.generation,
+                         nullptr, payload_tail, payload_tail_len);
+}
+
+#ifdef WOS_SELFTEST
+auto wki_selftest_split_payload_validation_and_copy() -> bool {
+    constexpr std::array<uint8_t, 3> HEAD = {0x11, 0x22, 0x33};
+    constexpr std::array<uint8_t, 2> TAIL = {0x44, 0x55};
+    constexpr std::array<uint8_t, 5> EXPECTED = {0x11, 0x22, 0x33, 0x44, 0x55};
+    std::array<uint8_t, EXPECTED.size()> flattened{};
+    uint16_t total_len = 0;
+    if (!wki_payload_segments_total_len(HEAD.data(), HEAD.size(), TAIL.data(), TAIL.size(), &total_len) || total_len != EXPECTED.size()) {
+        return false;
+    }
+    copy_wki_payload_segments(flattened.data(), HEAD.data(), HEAD.size(), TAIL.data(), TAIL.size());
+    if (std::memcmp(flattened.data(), EXPECTED.data(), EXPECTED.size()) != 0) {
+        return false;
+    }
+
+    uint8_t byte = 0;
+    uint16_t checked_len = 0;
+    uint16_t const MAX_PAYLOAD = static_cast<uint16_t>(WKI_ETH_MAX_PAYLOAD);
+    return wki_payload_segments_total_len(nullptr, 0, nullptr, 0, &checked_len) && checked_len == 0 &&
+           !wki_payload_segments_total_len(nullptr, 1, nullptr, 0, &checked_len) &&
+           !wki_payload_segments_total_len(&byte, 1, nullptr, 1, &checked_len) &&
+           wki_payload_segments_total_len(&byte, MAX_PAYLOAD - 1, &byte, 1, &checked_len) && checked_len == MAX_PAYLOAD &&
+           !wki_payload_segments_total_len(&byte, MAX_PAYLOAD, &byte, 1, &checked_len);
+}
+#endif
 
 // -----------------------------------------------------------------------------
 // RX Dispatch

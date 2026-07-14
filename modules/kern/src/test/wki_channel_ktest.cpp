@@ -195,3 +195,5 @@ KTEST(WkiChannel, HeapRetransmitEntryOwnsContiguousExactFrameStorage) {
     ker::net::wki::wki_retransmit_entry_release(nullptr, entry);
     KEXPECT_EQ(ker::net::wki::wki_retransmit_entry_alloc(ker::net::wki::WKI_MAX_FRAME_SIZE + 1), nullptr);
 }
+
+KTEST(WkiSend, SplitPayloadValidatesAndFlattensInOrder) { KEXPECT_TRUE(ker::net::wki::wki_selftest_split_payload_validation_and_copy()); }

@@ -522,6 +522,12 @@ auto wki_send_on_channel_generation(uint16_t dst_node, WkiChannel* expected_chan
 // replacement channel that happens to reuse the same numeric ID.
 auto wki_send_on_channel_identity(const WkiChannelIdentity& identity, MsgType msg_type, const void* payload, uint16_t payload_len) -> int;
 
+// Send two logical payload segments on an exact channel allocation. Both
+// segments are copied into the reliable frame before this function returns;
+// no caller-owned pointer is retained.
+auto wki_send_on_channel_identity_split(const WkiChannelIdentity& identity, MsgType msg_type, const void* payload, uint16_t payload_len,
+                                        const void* payload_tail, uint16_t payload_tail_len) -> int;
+
 // Send a raw frame (bypasses reliability - used for HELLO, HEARTBEAT)
 auto wki_send_raw(uint16_t dst_node, MsgType msg_type, const void* payload, uint16_t payload_len, uint8_t flags = 0) -> int;
 
@@ -693,6 +699,7 @@ void wki_wait_cleanup_for_task(ker::mod::sched::task::Task* task);
 void wki_selftest_wait_list_link(WkiWaitEntry* entry);
 auto wki_selftest_wait_list_contains(WkiWaitEntry const* entry) -> bool;
 auto wki_selftest_reliable_rx_peer_state_accepts(PeerState state) -> bool;
+auto wki_selftest_split_payload_validation_and_copy() -> bool;
 #endif
 
 // -----------------------------------------------------------------------------

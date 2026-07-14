@@ -2233,7 +2233,8 @@ void deactivate_vfs_proxy_locked(ProxyVfsState* state, PendingProxyTeardown& tea
 // Helper: send DEV_OP_REQ and wait for response
 auto vfs_proxy_send_and_wait(ProxyVfsState* state, uint16_t op_id, const uint8_t* req_data, size_t req_data_len, void* resp_buf,
                              uint16_t resp_buf_max, uint16_t* resp_len_out = nullptr, uint64_t wait_timeout_us = VFS_PROXY_OP_TIMEOUT_US,
-                             RoceTaggedReceive* tagged_receive = nullptr) -> int {
+                             RoceTaggedReceive* tagged_receive = nullptr, const uint8_t* req_tail = nullptr, size_t req_tail_len = 0)
+    -> int {
     uint64_t const CALLSITE = WOS_PERF_CALLSITE();
     uint64_t const PROXY_WAIT_START = wki_now_us();
 
@@ -2241,17 +2242,20 @@ auto vfs_proxy_send_and_wait(ProxyVfsState* state, uint16_t op_id, const uint8_t
         *resp_len_out = 0;
     }
 
-    if (req_data_len > WKI_ETH_MAX_PAYLOAD - sizeof(DevOpReqPayload)) {
+    constexpr size_t MAX_REQ_DATA_LEN = WKI_ETH_MAX_PAYLOAD - sizeof(DevOpReqPayload);
+    if (req_data_len > MAX_REQ_DATA_LEN || req_tail_len > MAX_REQ_DATA_LEN - req_data_len) {
         return -EMSGSIZE;
     }
-    if (req_data_len > 0 && req_data == nullptr) {
+    if ((req_data_len > 0 && req_data == nullptr) || (req_tail_len > 0 && req_tail == nullptr)) {
         return -EINVAL;
     }
-    auto const REQ_DATA_LEN = static_cast<uint16_t>(req_data_len);
-    size_t const REQ_TOTAL = sizeof(DevOpReqPayload) + req_data_len;
+    auto const REQ_DATA_LEN = static_cast<uint16_t>(req_data_len + req_tail_len);
+    size_t const REQ_PREFIX_TOTAL = sizeof(DevOpReqPayload) + req_data_len;
 
-    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init): every transmitted byte is initialized below.
-    std::array<uint8_t, WKI_ETH_MAX_PAYLOAD> req_buf;
+    // The request prefix and optional tail initialize every transmitted byte;
+    // do not pattern-fill unused bounded stack capacity.
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
+    std::array<uint8_t, WKI_ETH_MAX_PAYLOAD> req_buf __attribute__((uninitialized));
     auto* req = reinterpret_cast<DevOpReqPayload*>(req_buf.data());
     req->op_id = op_id;
     req->data_len = REQ_DATA_LEN;
@@ -2308,8 +2312,16 @@ auto vfs_proxy_send_and_wait(ProxyVfsState* state, uint16_t op_id, const uint8_t
                                      ker::mod::perf::WkiPerfPhase::BEGIN, state->owner_node, state->assigned_channel, CORRELATION, 0,
                                      REQ_DATA_LEN, CALLSITE);
 
-    int const SEND_RET =
-        wki_send_on_channel_identity(CHANNEL_IDENTITY, MsgType::DEV_OP_REQ, req_buf.data(), static_cast<uint16_t>(REQ_TOTAL));
+    int send_ret = WKI_ERR_INVALID;
+    if (req_tail_len == 0) {
+        send_ret =
+            wki_send_on_channel_identity(CHANNEL_IDENTITY, MsgType::DEV_OP_REQ, req_buf.data(), static_cast<uint16_t>(REQ_PREFIX_TOTAL));
+    } else {
+        send_ret =
+            wki_send_on_channel_identity_split(CHANNEL_IDENTITY, MsgType::DEV_OP_REQ, req_buf.data(),
+                                               static_cast<uint16_t>(REQ_PREFIX_TOTAL), req_tail, static_cast<uint16_t>(req_tail_len));
+    }
+    int const SEND_RET = send_ret;
 
     if (SEND_RET != WKI_OK) {
         cancel_proxy_op_wait(state, wait, OP_GENERATION, SEND_RET);
@@ -2366,6 +2378,12 @@ auto vfs_proxy_send_and_wait(ProxyVfsState* state, uint16_t op_id, const uint8_t
     }
 
     return normalize_proxy_status_for_errno(STATUS);
+}
+
+auto vfs_proxy_send_split_and_wait(ProxyVfsState* state, uint16_t op_id, const uint8_t* req_prefix, size_t req_prefix_len,
+                                   const uint8_t* req_tail, size_t req_tail_len, void* resp_buf, uint16_t resp_buf_max) -> int {
+    return vfs_proxy_send_and_wait(state, op_id, req_prefix, req_prefix_len, resp_buf, resp_buf_max, nullptr, VFS_PROXY_OP_TIMEOUT_US,
+                                   nullptr, req_tail, req_tail_len);
 }
 
 void remote_vfs_close_remote_fd_best_effort(ProxyVfsState* state, int32_t remote_fd) {
@@ -2797,21 +2815,14 @@ auto flush_write_behind(RemoteFileContext* ctx) -> int {
         while (remaining > 0) {
             uint32_t const CHUNK = (remaining > max_data) ? max_data : remaining;
 
-            auto req_data_len = static_cast<uint16_t>(12 + CHUNK);
-            auto* req_data = new (std::nothrow) uint8_t[req_data_len];
-            if (req_data == nullptr) {
-                keep_pending_tail(src, remaining, cur_offset);
-                return -ENOMEM;
-            }
-
+            std::array<uint8_t, 12> req_prefix{};
             int32_t remote_fd = ctx->remote_fd;
-            memcpy(req_data, &remote_fd, sizeof(int32_t));
-            memcpy(req_data + 4, &cur_offset, sizeof(int64_t));
-            memcpy(req_data + 12, src, CHUNK);
+            memcpy(req_prefix.data(), &remote_fd, sizeof(int32_t));
+            memcpy(req_prefix.data() + 4, &cur_offset, sizeof(int64_t));
 
             uint32_t written = 0;
-            int const STATUS = vfs_proxy_send_and_wait(ctx->proxy, OP_VFS_WRITE, req_data, req_data_len, &written, sizeof(uint32_t));
-            delete[] req_data;
+            int const STATUS = vfs_proxy_send_split_and_wait(ctx->proxy, OP_VFS_WRITE, req_prefix.data(), req_prefix.size(), src, CHUNK,
+                                                             &written, sizeof(uint32_t));
             if (STATUS != 0) {
                 keep_pending_tail(src, remaining, cur_offset);
                 return STATUS;

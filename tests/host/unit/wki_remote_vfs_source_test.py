@@ -199,9 +199,26 @@ def test_proxy_request_envelopes_use_stack_storage() -> None:
 
     for function_name in ["vfs_proxy_send_and_wait", "vfs_proxy_send_untracked"]:
         body = function_body(source, function_name)
-        require_order(
-            body,
-            [
+        if function_name == "vfs_proxy_send_and_wait":
+            envelope_tokens = [
+                "constexpr size_t MAX_REQ_DATA_LEN = WKI_ETH_MAX_PAYLOAD - sizeof(DevOpReqPayload)",
+                "req_data_len > MAX_REQ_DATA_LEN",
+                "req_tail_len > MAX_REQ_DATA_LEN - req_data_len",
+                "return -EMSGSIZE",
+                "req_data_len > 0 && req_data == nullptr",
+                "req_tail_len > 0 && req_tail == nullptr",
+                "return -EINVAL",
+                "auto const REQ_DATA_LEN = static_cast<uint16_t>(req_data_len + req_tail_len)",
+                "size_t const REQ_PREFIX_TOTAL = sizeof(DevOpReqPayload) + req_data_len",
+                "std::array<uint8_t, WKI_ETH_MAX_PAYLOAD> req_buf __attribute__((uninitialized))",
+                "reinterpret_cast<DevOpReqPayload*>(req_buf.data())",
+                "memcpy(req_buf.data() + sizeof(DevOpReqPayload), req_data, req_data_len)",
+                "if (req_tail_len == 0)",
+                "wki_send_on_channel_identity(CHANNEL_IDENTITY, MsgType::DEV_OP_REQ, req_buf.data()",
+                "static_cast<uint16_t>(REQ_PREFIX_TOTAL)",
+            ]
+        else:
+            envelope_tokens = [
                 "req_data_len > WKI_ETH_MAX_PAYLOAD - sizeof(DevOpReqPayload)",
                 "return -EMSGSIZE",
                 "req_data_len > 0 && req_data == nullptr",
@@ -213,7 +230,10 @@ def test_proxy_request_envelopes_use_stack_storage() -> None:
                 "memcpy(req_buf.data() + sizeof(DevOpReqPayload), req_data, req_data_len)",
                 "wki_send_on_channel_identity(CHANNEL_IDENTITY, MsgType::DEV_OP_REQ, req_buf.data()",
                 "static_cast<uint16_t>(REQ_TOTAL)",
-            ],
+            ]
+        require_order(
+            body,
+            envelope_tokens,
             f"{function_name} stack-backed request envelope",
         )
         if re.search(r"\bnew\b|delete\s*\[\s*\]", body):
@@ -1248,7 +1268,7 @@ def test_write_behind_storage_grows_in_allocator_shaped_classes() -> None:
     )
 
 
-def test_message_write_flush_retains_tail_on_request_allocation_failure() -> None:
+def test_message_write_flush_uses_split_send_and_retains_tail() -> None:
     source = REMOTE_VFS_CPP.read_text()
     flush_body = function_body(source, "flush_write_behind")
     require_order(
@@ -1259,20 +1279,61 @@ def test_message_write_flush_retains_tail_on_request_allocation_failure() -> Non
             "constexpr uint32_t WRITE_HDR_OVERHEAD = sizeof(DevOpReqPayload) + 12",
             "auto max_data = static_cast<uint32_t>(WKI_ETH_MAX_PAYLOAD - WRITE_HDR_OVERHEAD)",
             "uint32_t const CHUNK = (remaining > max_data) ? max_data : remaining",
-            "auto req_data_len = static_cast<uint16_t>(12 + CHUNK)",
-            "vfs_proxy_send_and_wait(ctx->proxy, OP_VFS_WRITE, req_data, req_data_len",
+            "std::array<uint8_t, 12> req_prefix{}",
+            "memcpy(req_prefix.data(), &remote_fd, sizeof(int32_t))",
+            "memcpy(req_prefix.data() + 4, &cur_offset, sizeof(int64_t))",
+            "vfs_proxy_send_split_and_wait(ctx->proxy, OP_VFS_WRITE, req_prefix.data(), req_prefix.size(), src, CHUNK",
         ],
         "RDMA and message write-behind chunk bounds",
     )
+    for forbidden in [
+        "new (std::nothrow) uint8_t[req_data_len]",
+        "delete[] req_data",
+        "memcpy(req_data + 12, src, CHUNK)",
+    ]:
+        if forbidden in flush_body:
+            fail(f"message write flush retained request allocation/copy: {forbidden}")
     require_order(
         flush_body,
         [
-            "auto* req_data = new (std::nothrow) uint8_t[req_data_len]",
-            "if (req_data == nullptr)",
+            "vfs_proxy_send_split_and_wait(",
+            "if (STATUS != 0)",
             "keep_pending_tail(src, remaining, cur_offset)",
-            "return -ENOMEM",
+            "return STATUS",
+            "written == 0 || written > CHUNK",
+            "keep_pending_tail(src, remaining, cur_offset)",
+            "return -EIO",
         ],
-        "message-mode write-behind allocation failure",
+        "message-mode write-behind failure tail retention",
+    )
+
+    send_body = function_body(source, "vfs_proxy_send_and_wait")
+    require_order(
+        send_body,
+        [
+            "req_data_len > MAX_REQ_DATA_LEN",
+            "req_tail_len > MAX_REQ_DATA_LEN - req_data_len",
+            "req_tail_len > 0 && req_tail == nullptr",
+            "static_cast<uint16_t>(req_data_len + req_tail_len)",
+            "size_t const REQ_PREFIX_TOTAL = sizeof(DevOpReqPayload) + req_data_len",
+            "std::array<uint8_t, WKI_ETH_MAX_PAYLOAD> req_buf __attribute__((uninitialized))",
+            "memcpy(req_buf.data() + sizeof(DevOpReqPayload), req_data, req_data_len)",
+            "if (req_tail_len == 0)",
+            "wki_send_on_channel_identity(",
+            "wki_send_on_channel_identity_split(",
+        ],
+        "generic proxy RPC split request assembly",
+    )
+    split_body = function_body(source, "vfs_proxy_send_split_and_wait")
+    require_order(
+        split_body,
+        [
+            "vfs_proxy_send_and_wait(",
+            "req_prefix, req_prefix_len",
+            "VFS_PROXY_OP_TIMEOUT_US",
+            "req_tail, req_tail_len",
+        ],
+        "write-only split RPC wrapper",
     )
     require_tokens(
         flush_body,
@@ -2451,7 +2512,7 @@ def main() -> None:
     test_server_roce_push_reads_reuse_registered_staging()
     test_remote_metadata_scratch_initializes_only_consumed_prefix()
     test_write_behind_storage_grows_in_allocator_shaped_classes()
-    test_message_write_flush_retains_tail_on_request_allocation_failure()
+    test_message_write_flush_uses_split_send_and_retains_tail()
     test_remote_open_closes_server_fd_on_local_allocation_failure()
     test_normal_remote_close_flushes_then_sends_without_response_wait()
     test_export_lookup_returns_locked_snapshot()
