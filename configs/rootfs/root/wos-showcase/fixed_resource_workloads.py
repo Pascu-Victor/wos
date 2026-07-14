@@ -958,7 +958,6 @@ def run_job(args: argparse.Namespace) -> dict[str, Any]:
 
 def inner_job_command(args: argparse.Namespace, job_id: int) -> list[str]:
     command = [
-        WOS_LOCALLY,
         WOS_PYTHON,
         WOS_HELPER,
         "job",

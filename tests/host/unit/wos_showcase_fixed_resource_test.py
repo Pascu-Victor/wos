@@ -185,6 +185,32 @@ def test_partition_and_commands(module) -> None:
     if module.child_timeout_seconds(25.0) != 20.0:
         fail("nested worker timeout does not reserve cleanup grace")
 
+    for phase in (
+        "file-move",
+        "git-clone",
+        "git-checkout",
+        "python-sha256",
+        "python-json",
+    ):
+        inner_command = module.inner_job_command(
+            SimpleNamespace(
+                phase=phase,
+                target_host=hosts[1],
+                launcher_host=hosts[0],
+                timeout_seconds=30.0,
+                work_root="/tmp/work",
+                file_bytes=module.FILE_MOVE_BYTES["quick"],
+                repository_uri=fixture["repository_uri"],
+                commit=fixture["commit"],
+                rounds=20_000,
+            ),
+            7,
+        )
+        if inner_command[:3] != [module.WOS_PYTHON, module.WOS_HELPER, "job"]:
+            fail(f"{phase} inner job is not launched directly by Python: {inner_command}")
+        if module.WOS_LOCALLY in inner_command:
+            fail(f"{phase} inner job retained a redundant local-placement wrapper")
+
     python_provenance = module.python_workload_provenance()
     if set(python_provenance) != {
         "python_hashlib_runtime_sha256",

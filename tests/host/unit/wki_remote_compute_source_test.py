@@ -1249,6 +1249,42 @@ def test_submitted_vfs_policy_is_active_during_elf_construction() -> None:
     require_tokens(ktest, ["SubmitPolicyScopeRestoresWorker", token], "submitted policy scope KTEST coverage")
 
 
+def test_controller_descendants_default_to_local_placement() -> None:
+    source = REMOTE_COMPUTE_CPP.read_text()
+    body = function_body(source, "handle_task_submit_work")
+
+    require_order(
+        body,
+        "apply_submitted_task_identity(new_task, submitted_identity)",
+        "new_task->wki_target_hostname.front() = '\\0'",
+        "receiver placement must override inherited submitter targeting",
+    )
+    require_tokens(
+        body,
+        [
+            "new_task->wki_target_hostname.front() = '\\0'",
+            "new_task->wki_target_flags = ker::mod::sched::task::Task::WKI_TARGET_FLAG_LOCAL",
+            "new_task->wki_skip_legacy_placement = true",
+        ],
+        "receiver-created task local placement",
+    )
+
+    spawn_body = function_body(source, "wki_try_remote_spawn")
+    explicit_start = spawn_body.find("if (EXPLICIT_TARGET) {")
+    peer_lookup = spawn_body.find("wki_peer_find_by_hostname", explicit_start)
+    if explicit_start < 0 or peer_lookup < 0:
+        fail("explicit-target spawn branch is missing")
+    require_tokens(
+        spawn_body[explicit_start:peer_lookup],
+        [
+            "std::strncmp(task->wki_target_hostname.data(), wki_local_hostname()",
+            'log_spawn_diag(task, WkiRemoteSpawnResult::LOCAL, "explicit-local-target")',
+            "return WkiRemoteSpawnResult::LOCAL",
+        ],
+        "launcher-self controller local placement",
+    )
+
+
 def test_receiver_child_owner_spans_interpreter_output_and_publication() -> None:
     source = REMOTE_COMPUTE_CPP.read_text()
     exec_body = function_body(source, "exec_elf_buffer")
@@ -2001,6 +2037,7 @@ def main() -> None:
     test_shared_elf_cache_preserves_inflight_load_markers()
     test_remote_stdio_capture_is_write_only_and_non_tty()
     test_submitted_vfs_policy_is_active_during_elf_construction()
+    test_controller_descendants_default_to_local_placement()
     test_receiver_child_owner_spans_interpreter_output_and_publication()
     test_receiver_vfs_ref_submit_uses_bounded_worker_pool()
     test_remote_proxy_signals_never_make_the_local_frame_runnable()
