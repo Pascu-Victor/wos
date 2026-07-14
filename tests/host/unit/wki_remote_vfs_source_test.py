@@ -77,6 +77,16 @@ def require_order(source: str, tokens: list[str], context: str) -> None:
         cursor = found + len(token)
 
 
+def brace_depth_at(source: str, pos: int) -> int:
+    depth = 0
+    for char in source[:pos]:
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+    return depth
+
+
 def test_vfs_host_alias_rewrite_is_overlap_safe() -> None:
     core = VFS_CORE_CPP.read_text()
     build = function_body(core, "build_wki_host_path")
@@ -1094,6 +1104,30 @@ def test_server_open_reuses_the_open_file_stat_snapshot() -> None:
         fail("remote VFS server open/read opcode cases must remain present")
     open_case = handler_body[open_start:read_start]
 
+    require_order(
+        open_case,
+        [
+            "std::array<char, 512> full_path __attribute__((uninitialized));",
+            "std::array<char, 512> full_visible_path __attribute__((uninitialized));",
+            "build_full_path(full_path.data(), full_path.size(), export_path",
+            "build_full_path(full_visible_path.data(), full_visible_path.size(), export_name",
+            "path_crosses_recursive_wki_boundary_direct(full_path.data(), full_visible_path.data())",
+            "ker::vfs::vfs_open_file_resolved(full_path.data()",
+        ],
+        "remote VFS server open full-path production before resolved-open consumption",
+    )
+    direct_open_path_tokens = [
+        "std::array<char, 512> full_path __attribute__((uninitialized));",
+        "std::array<char, 512> full_visible_path __attribute__((uninitialized));",
+        "build_full_path(full_path.data(), full_path.size(), export_path",
+        "build_full_path(full_visible_path.data(), full_visible_path.size(), export_name",
+        "path_crosses_recursive_wki_boundary_direct(full_path.data(), full_visible_path.data())",
+        "ker::vfs::vfs_open_file_resolved(full_path.data()",
+    ]
+    for token in direct_open_path_tokens:
+        token_pos = open_case.find(token)
+        if token_pos < 0 or brace_depth_at(open_case, token_pos) != 1:
+            fail("remote VFS server open full-path production and consumption must be unconditional case statements")
     require_order(
         open_case,
         [

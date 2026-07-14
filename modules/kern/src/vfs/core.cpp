@@ -18919,7 +18919,9 @@ static auto vfs_open_file_impl(const char* path, int flags, int mode, bool resol
         backend_flags &= ~ker::vfs::O_CREAT;
     }
 
-    char pathBuffer[MAX_PATH_LEN];  // NOLINT
+    // Both path producers initialize the complete NUL-terminated string before any consumer.
+    // NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays,cppcoreguidelines-pro-type-member-init)
+    char pathBuffer[MAX_PATH_LEN] __attribute__((uninitialized));
     size_t path_buffer_len = UNKNOWN_PATH_LEN;
     uint64_t path_buffer_hash = UNKNOWN_PATH_HASH;
     if (resolve_task_path) {
@@ -18980,7 +18982,9 @@ static auto vfs_open_file_impl(const char* path, int flags, int mode, bool resol
         }
     }
     if (!REMOTE_MOUNT && !SYMLINK_RESOLUTION_KNOWN_NOOP) {
-        char resolved[MAX_PATH_LEN];  // NOLINT
+        // resolve_symlinks initializes the complete NUL-terminated string before success.
+        // NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays,cppcoreguidelines-pro-type-member-init)
+        char resolved[MAX_PATH_LEN] __attribute__((uninitialized));
         size_t resolved_len = path_buffer_len;
         int const RESOLVE_RET = resolve_symlinks(pathBuffer, resolved, sizeof(resolved), apply_task_policy && !OPEN_LOCAL,
                                                  !FINAL_SYMLINK_PROBE_NOT_NEEDED, path_buffer_len, &resolved_len);

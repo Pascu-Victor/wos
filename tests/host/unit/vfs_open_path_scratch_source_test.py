@@ -111,6 +111,21 @@ def require_only_uninitialized_array(body: str, name: str, expected: str, contex
         fail(f"{context}: {name} must not be cleared after declaration")
 
 
+def require_only_uninitialized_c_path_array(body: str, name: str, expected: str, context: str) -> None:
+    declarations = re.findall(rf"\bchar\s+{re.escape(name)}\s*\[\s*MAX_PATH_LEN\s*\][^;\n]*;", body)
+    if declarations != [expected]:
+        fail(f"{context}: unexpected {name} declarations: {declarations!r}")
+    forbidden = [
+        rf"\bchar\s+{re.escape(name)}\s*\[\s*MAX_PATH_LEN\s*\]\s*(?:=\s*\{{\s*\}})?\s*;",
+        rf"\b{re.escape(name)}\s*\[\s*(?!MAX_PATH_LEN\s*\])",
+        rf"\b(?:std::)?memset\s*\(\s*{re.escape(name)}\s*,",
+        rf"\bbzero\s*\(\s*{re.escape(name)}\s*,",
+        rf"\bstd::fill\s*\(\s*std::begin\(\s*{re.escape(name)}\s*\)",
+    ]
+    if any(re.search(pattern, body) for pattern in forbidden):
+        fail(f"{context}: {name} must not be cleared or prewritten")
+
+
 def test_dirfd_visible_scratch_is_initialized_by_root_strip() -> None:
     core = VFS_CORE_CPP.read_text()
     copy_path = function_body(core, "copy_path_string")
@@ -2474,6 +2489,135 @@ def test_open_path_scratch_is_initialized_by_its_producers() -> None:
     )
 
 
+def test_open_file_path_scratch_is_initialized_by_its_producers() -> None:
+    core = VFS_CORE_CPP.read_text()
+    open_file = function_body(core, "vfs_open_file_impl")
+    raw_resolver = function_body(core, "resolve_task_path_raw_impl")
+    copy_path = function_body(core, "copy_path_string")
+    resolve_symlinks_body = function_body(core, "resolve_symlinks")
+
+    path_declaration = "char pathBuffer[MAX_PATH_LEN] __attribute__((uninitialized));"
+    resolved_declaration = "char resolved[MAX_PATH_LEN] __attribute__((uninitialized));"
+    require_only_uninitialized_c_path_array(open_file, "pathBuffer", path_declaration, "open-file path scratch")
+    require_only_uninitialized_c_path_array(open_file, "resolved", resolved_declaration, "open-file symlink scratch")
+
+    raw_resolver_returns = [" ".join(value.split()) for value in re.findall(r"\breturn\s+([^;]+);", raw_resolver)]
+    if raw_resolver_returns != [
+        "0",
+        "FAST_RET",
+        "ABSOLUTE",
+        "CANONICAL",
+        "finish_canonical_task_path_raw(out, outsize, apply_task_route, out_len, resolved_len_out, resolved_hash_out)",
+    ]:
+        fail("open-file task path resolver return topology changed; re-audit successful path production")
+    require_order(
+        raw_resolver,
+        [
+            "resolve_task_path_raw_common_local_fast_path(path, out, outsize, apply_task_route, resolved_len_out, resolved_hash_out)",
+            "if (FAST_RET == 0)",
+            "return 0;",
+            "if (FAST_RET < 0)",
+            "return FAST_RET;",
+            "int const ABSOLUTE = make_absolute(path, out, outsize, &out_len);",
+        ],
+        "open-file task path resolver fast-path decline handling",
+    )
+    require_order(
+        copy_path,
+        [
+            "size_t const LEN = known_src_len != UNKNOWN_PATH_LEN ? known_src_len : std::strlen(src)",
+            "if (LEN + 1 > dst_size)",
+            "std::memcpy(dst, src, LEN + 1)",
+            "return 0;",
+        ],
+        "open-file bounded path copy production",
+    )
+    copy_returns = [" ".join(value.split()) for value in re.findall(r"\breturn\s+([^;]+);", copy_path)]
+    if copy_returns != ["-EINVAL", "-ENAMETOOLONG", "0"]:
+        fail("open-file bounded path copy return topology changed; re-audit complete path production")
+
+    task_path_header = "if (resolve_task_path)"
+    copy_path_header = "else if (copy_path_string(path, pathBuffer, sizeof(pathBuffer), UNKNOWN_PATH_LEN, &path_buffer_len) < 0)"
+    path_hash_consumer = "if (path_buffer_hash == UNKNOWN_PATH_HASH && vfs_open_missing_metadata_cacheable(flags))"
+    path_declaration_pos = open_file.find(path_declaration)
+    task_path_pos = open_file.find(task_path_header, path_declaration_pos + len(path_declaration))
+    copy_path_pos = open_file.find(copy_path_header, task_path_pos + len(task_path_header))
+    path_hash_consumer_pos = open_file.find(path_hash_consumer, copy_path_pos + len(copy_path_header))
+    expected_path_setup = """size_t path_buffer_len = UNKNOWN_PATH_LEN;
+    uint64_t path_buffer_hash = UNKNOWN_PATH_HASH;"""
+    expected_task_path_branch = """if (resolve_task_path_raw_impl(path, pathBuffer, MAX_PATH_LEN, !OPEN_LOCAL, &path_buffer_len, &path_buffer_hash) < 0) {
+            return nullptr;
+        }
+
+        // attach before the backend open can find a mount point.
+        ensure_wki_host_root_mount(pathBuffer);"""
+    if (
+        path_declaration_pos < 0
+        or task_path_pos < 0
+        or copy_path_pos < 0
+        or path_hash_consumer_pos < 0
+        or open_file[path_declaration_pos + len(path_declaration) : task_path_pos].strip() != expected_path_setup
+        or block_body_after(open_file, task_path_header).strip() != expected_task_path_branch
+        or block_body_after(open_file[copy_path_pos:], copy_path_header).strip() != "return nullptr;"
+        or path_hash_consumer_pos
+        < copy_path_pos + block_end_after(open_file[copy_path_pos:], copy_path_header)
+    ):
+        fail("open-file path scratch must be fully produced on both branches before any shared consumer")
+
+    symlink_header = "if (!REMOTE_MOUNT && !SYMLINK_RESOLUTION_KNOWN_NOOP)"
+    symlink_block = block_body_after(open_file, symlink_header)
+    resolved_declaration_pos = symlink_block.find(resolved_declaration)
+    resolve_call = """int const RESOLVE_RET = resolve_symlinks(pathBuffer, resolved, sizeof(resolved), apply_task_policy && !OPEN_LOCAL,
+                                                 !FINAL_SYMLINK_PROBE_NOT_NEEDED, path_buffer_len, &resolved_len);"""
+    resolve_call_pos = symlink_block.find(resolve_call, resolved_declaration_pos + len(resolved_declaration))
+    resolve_failure_header = "if (RESOLVE_RET < 0)"
+    resolve_failure_pos = symlink_block.find(resolve_failure_header, resolve_call_pos + len(resolve_call))
+    resolve_success_header = "if (RESOLVE_RET == 0)"
+    resolve_success_pos = symlink_block.find(resolve_success_header, resolve_failure_pos + len(resolve_failure_header))
+    expected_resolved_setup = "size_t resolved_len = path_buffer_len;"
+    resolved_success_body = block_body_after(symlink_block[resolve_success_pos:], resolve_success_header)
+    resolved_success_end = resolve_success_pos + block_end_after(symlink_block[resolve_success_pos:], resolve_success_header)
+    resolved_mentions_before_success = len(re.findall(r"\bresolved\b", symlink_block[:resolve_success_pos]))
+    if (
+        resolved_declaration_pos < 0
+        or resolve_call_pos < 0
+        or resolve_failure_pos < 0
+        or resolve_success_pos < 0
+        or symlink_block[resolved_declaration_pos + len(resolved_declaration) : resolve_call_pos].strip() != expected_resolved_setup
+        or block_body_after(symlink_block[resolve_failure_pos:], resolve_failure_header).strip() != "return nullptr;"
+        or symlink_block[
+            resolve_failure_pos
+            + block_end_after(symlink_block[resolve_failure_pos:], resolve_failure_header) : resolve_success_pos
+        ].strip()
+        or resolved_mentions_before_success != 3
+        or not all(token in resolved_success_body for token in ["path_text_equal(pathBuffer, path_buffer_len, resolved, resolved_len)", "copy_path_string(resolved, pathBuffer, sizeof(pathBuffer), resolved_len)"])
+        or re.search(r"\bresolved\b", symlink_block[resolved_success_end:]) is not None
+        or "goto" in symlink_block
+    ):
+        fail("open-file symlink scratch must be consumed only after successful complete resolution")
+
+    finish_success = block_body_after(resolve_symlinks_body, "auto finish_success = [&]() -> int")
+    require_order(
+        resolve_symlinks_body,
+        [
+            "std::memcpy(resolved_buf, path, known_path_len)",
+            "while (path[path_len] != '\\0' && path_len < bufsize - 1)",
+            "resolved_buf[path_len] = path[path_len]",
+            "resolved_buf[path_len] = '\\0'",
+            "if (apply_task_policy)",
+        ],
+        "open-file symlink initial complete-string production",
+    )
+    if (
+        finish_success.strip()
+        != """if (resolved_len_out != nullptr) {
+            *resolved_len_out = path_len_known ? path_len : std::strlen(resolved_buf);
+        }
+        return 0;"""
+    ):
+        fail("open-file symlink success must publish the initialized output length")
+
+
 def test_create_remove_path_scratch_is_initialized_by_task_resolver() -> None:
     core = VFS_CORE_CPP.read_text()
     raw_resolver = function_body(core, "resolve_task_path_raw_impl")
@@ -2804,6 +2948,7 @@ if __name__ == "__main__":
     test_f_ok_access_scratch_is_initialized_by_its_producers()
     test_statat_scratch_is_initialized_by_dirfd_resolver()
     test_open_path_scratch_is_initialized_by_its_producers()
+    test_open_file_path_scratch_is_initialized_by_its_producers()
     test_create_remove_path_scratch_is_initialized_by_task_resolver()
     test_link_path_scratch_is_initialized_by_its_producers()
     print("VFS open path scratch invariants hold")
