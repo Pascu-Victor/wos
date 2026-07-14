@@ -10551,7 +10551,9 @@ static auto vfs_stat_impl(const char* path, ker::vfs::Stat* statbuf, bool resolv
     }
 
     if (!REMOTE_MOUNT && !SYMLINK_RESOLUTION_KNOWN_NOOP) {
-        char resolved[MAX_PATH_LEN];  // NOLINT
+        // resolve_symlinks initializes the complete NUL-terminated string on success.
+        // NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays,cppcoreguidelines-pro-type-member-init)
+        char resolved[MAX_PATH_LEN] __attribute__((uninitialized));
         size_t resolved_len = current_path_len;
         bool const RESOLVE_FINAL_SYMLINK = EFFECTIVE_FOLLOW_FINAL_SYMLINK && !SKIP_FINAL_SYMLINK_PROBE;
         int const RESOLVE_RET = resolve_symlinks(current_path, resolved, MAX_PATH_LEN, apply_task_policy, RESOLVE_FINAL_SYMLINK,
@@ -17549,6 +17551,14 @@ auto vfs_selftest_stat_lstat_share_non_symlink_cache() -> bool {
     }
     vfs_put_file(created);
 
+    std::array<char, MAX_PATH_LEN> symlink_resolved{};
+    size_t symlink_resolved_len = UNKNOWN_PATH_LEN;
+    symlink_resolved.fill('x');
+    int const SYMLINK_RESOLVE_RET =
+        resolve_symlinks(PATH, symlink_resolved.data(), symlink_resolved.size(), false, true, std::strlen(PATH), &symlink_resolved_len);
+    bool const RESOLVER_OUTPUT_OK = SYMLINK_RESOLVE_RET == 0 && symlink_resolved_len == std::strlen(PATH) &&
+                                    std::strcmp(symlink_resolved.data(), PATH) == 0 && symlink_resolved.at(symlink_resolved_len) == '\0';
+
     vfs_cache_notify_path_changed(PATH, nullptr);
 
     VfsCachePerfSnapshot before{};
@@ -17556,7 +17566,7 @@ auto vfs_selftest_stat_lstat_share_non_symlink_cache() -> bool {
     VfsCachePerfSnapshot after_stat{};
     Stat st{};
     vfs_get_cache_perf_snapshot(before);
-    bool ok = vfs_lstat(PATH, &st) == 0 && (st.st_mode & static_cast<mode_t>(S_IFMT)) == S_IFREG;
+    bool ok = RESOLVER_OUTPUT_OK && vfs_lstat(PATH, &st) == 0 && (st.st_mode & static_cast<mode_t>(S_IFMT)) == S_IFREG;
     vfs_get_cache_perf_snapshot(after_lstat);
     if (ok) {
         ok = vfs_stat(PATH, &st) == 0 && (st.st_mode & static_cast<mode_t>(S_IFMT)) == S_IFREG;

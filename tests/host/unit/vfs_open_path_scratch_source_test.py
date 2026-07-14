@@ -984,6 +984,337 @@ def test_current_task_stat_scratch_is_initialized_by_dirfd_resolver() -> None:
             fail(f"current-task stat fast path has unexpected {name} use")
 
 
+def test_stat_impl_symlink_scratch_is_initialized_by_resolver() -> None:
+    core = VFS_CORE_CPP.read_text()
+    stat_impl = function_body(core, "vfs_stat_impl")
+    resolver = function_body(core, "resolve_symlinks")
+    selftest = function_body(core, "vfs_selftest_stat_lstat_share_non_symlink_cache")
+
+    branch_header = "if (!REMOTE_MOUNT && !SYMLINK_RESOLUTION_KNOWN_NOOP) {"
+    if stat_impl.count(branch_header) != 1:
+        fail("stat symlink resolution must remain on its exact local non-cached branch")
+    symlink_block = block_body_after(stat_impl, "if (!REMOTE_MOUNT && !SYMLINK_RESOLUTION_KNOWN_NOOP)")
+    declaration = "char resolved[MAX_PATH_LEN] __attribute__((uninitialized));"
+    declarations = re.findall(r"\bchar\s+resolved\s*\[\s*MAX_PATH_LEN\s*\][^;\n]*;", symlink_block)
+    if declarations != [declaration]:
+        fail(f"stat symlink scratch has unexpected declarations: {declarations!r}")
+
+    producer_call = (
+        "int const RESOLVE_RET = resolve_symlinks(current_path, resolved, MAX_PATH_LEN, apply_task_policy, "
+        "RESOLVE_FINAL_SYMLINK,\n"
+        "                                                 current_path_len, &resolved_len);"
+    )
+    producer_setup = (
+        "size_t resolved_len = current_path_len;\n"
+        "        bool const RESOLVE_FINAL_SYMLINK = EFFECTIVE_FOLLOW_FINAL_SYMLINK && !SKIP_FINAL_SYMLINK_PROBE;\n"
+        f"        {producer_call}"
+    )
+    failure_gates = (
+        "if (RESOLVE_RET == -ELOOP) {\n"
+        "            return -ELOOP;\n"
+        "        }\n"
+        "        if (RESOLVE_RET < 0) {\n"
+        '            log_loader_path_event("stat-symlink-failed", path, current_path, nullptr, RESOLVE_RET);\n'
+        "            return RESOLVE_RET;\n"
+        "        }"
+    )
+    require_order(
+        symlink_block,
+        [
+            declaration,
+            producer_setup,
+            failure_gates,
+            "path_changed_by_symlink = !path_text_equal(current_path, current_path_len, resolved, resolved_len)",
+            "if (path_changed_by_symlink)",
+            "int const COPY_RET = copy_path_string(resolved, pathBuffer, sizeof(pathBuffer), resolved_len)",
+            "if (COPY_RET < 0)",
+            "return COPY_RET",
+            "current_path = pathBuffer",
+            "current_path_hash = UNKNOWN_PATH_HASH",
+            "current_path_len = resolved_len",
+            'log_loader_path_event("stat-symlink-resolved", path, current_path, nullptr, RESOLVE_RET)',
+        ],
+        "stat symlink scratch producer, failure gates, and consumers",
+    )
+    declaration_pos = stat_impl.find(declaration)
+    setup_pos = stat_impl.find(producer_setup, declaration_pos + len(declaration))
+    if (
+        declaration_pos < 0
+        or brace_depth_at(stat_impl, declaration_pos) != 1
+        or setup_pos < 0
+        or stat_impl[declaration_pos + len(declaration) : setup_pos].strip()
+    ):
+        fail("stat symlink scratch and exact producer setup must remain directly inside the local resolution branch")
+    call_pos = symlink_block.find(producer_call)
+    gates_pos = symlink_block.find(failure_gates, call_pos + len(producer_call))
+    if call_pos < 0 or gates_pos < 0 or symlink_block[call_pos + len(producer_call) : gates_pos].strip():
+        fail("stat symlink resolver failures must return immediately before any scratch read")
+    changed_assignment = "path_changed_by_symlink = !path_text_equal(current_path, current_path_len, resolved, resolved_len);"
+    changed_assignment_pos = symlink_block.find(changed_assignment, gates_pos + len(failure_gates))
+    if (
+        changed_assignment_pos < 0
+        or symlink_block.count(changed_assignment) != 1
+        or symlink_block[gates_pos + len(failure_gates) : changed_assignment_pos].strip()
+    ):
+        fail("stat symlink changed-path decision must exactly and immediately consume successful resolver output")
+    if [" ".join(value.split()) for value in re.findall(r"\breturn\s+([^;]+);", symlink_block)] != [
+        "-ELOOP",
+        "RESOLVE_RET",
+        "COPY_RET",
+    ]:
+        fail("stat symlink branch return topology changed; re-audit scratch consumers")
+    expected_branch_uses = {
+        "resolved": 5,
+        "resolved_len": 5,
+        "RESOLVE_RET": 6,
+        "path_changed_by_symlink": 2,
+        "resolve_symlinks": 2,
+    }
+    for name, count in expected_branch_uses.items():
+        if len(re.findall(rf"\b{re.escape(name)}\b", symlink_block)) != count:
+            fail(f"stat symlink branch has unexpected {name} use")
+    if len(re.findall(r"\bresolve_symlinks\b", stat_impl)) != 2:
+        fail("stat implementation must call the namespace resolver without a local shadow")
+    if len(re.findall(r"\bcopy_path_string\b", stat_impl)) != 1:
+        fail("stat implementation must call the namespace path copier without a local shadow")
+    if len(re.findall(r"\bpath_text_equal\b", stat_impl)) != 1:
+        fail("stat implementation must call the namespace path comparator without a local shadow")
+    changed_path_pos = symlink_block.find("if (path_changed_by_symlink) {")
+    if changed_path_pos < 0 or brace_depth_at(symlink_block, changed_path_pos) != 0:
+        fail("stat symlink changed-path adoption must remain directly on the successful resolver path")
+    copy_call = "int const COPY_RET = copy_path_string(resolved, pathBuffer, sizeof(pathBuffer), resolved_len);"
+    copy_call_pos = symlink_block.find(copy_call)
+    copy_gate = "if (COPY_RET < 0) {\n                return COPY_RET;\n            }"
+    copy_gate_pos = symlink_block.find(copy_gate, copy_call_pos + len(copy_call))
+    if (
+        copy_call_pos < 0
+        or symlink_block.count(copy_call) != 1
+        or copy_gate_pos < 0
+        or symlink_block[copy_call_pos + len(copy_call) : copy_gate_pos].strip()
+    ):
+        fail("stat symlink copy result must be preserved and gated before pathBuffer is consumed")
+    forbidden_caller_patterns = [
+        r"\bresolved\s*\[\s*MAX_PATH_LEN\s*\]\s*(?:=\s*)?\{",
+        r"\bresolved\s*\[[^]]+\]\s*=",
+        r"\b(?:std::)?memset\s*\(\s*resolved\b",
+        r"\bbzero\s*\(\s*resolved\b",
+        r"\bstd::(?:ranges::)?fill(?:_n)?\s*\([^;]*\bresolved\b",
+    ]
+    if any(re.search(pattern, symlink_block) for pattern in forbidden_caller_patterns) or "goto" in symlink_block:
+        fail("stat symlink caller must not clear, prewrite, or bypass its resolver-produced scratch")
+
+    return_types = re.findall(
+        r"\bauto\s+resolve_symlinks\([^;{]*\)\s*->\s*([A-Za-z0-9_:<>*]+)\s*\{",
+        core,
+        flags=re.DOTALL,
+    )
+    if return_types != ["int"]:
+        fail("resolve_symlinks must preserve its signed integer result domain")
+    initial_production = """if (known_path_len != UNKNOWN_PATH_LEN) {
+        if (known_path_len >= bufsize) {
+            return -ENAMETOOLONG;
+        }
+        std::memcpy(resolved_buf, path, known_path_len);
+        path_len = known_path_len;
+        path_len_known = true;
+    } else {
+        while (path[path_len] != '\\0' && path_len < bufsize - 1) {
+            resolved_buf[path_len] = path[path_len];
+            path_len++;
+        }
+        path_len_known = true;
+    }
+    resolved_buf[path_len] = '\\0';"""
+    finish_success = """if (resolved_len_out != nullptr) {
+            *resolved_len_out = path_len_known ? path_len : std::strlen(resolved_buf);
+        }
+        return 0;"""
+    initial_production_pos = resolver.find(initial_production)
+    if initial_production_pos < 0:
+        fail("resolve_symlinks must completely copy and terminate its initial destination")
+    if brace_depth_at(resolver, initial_production_pos) != 0:
+        fail("resolve_symlinks initial destination production must remain unconditional")
+    policy_pos = resolver.find("if (apply_task_policy)", initial_production_pos + len(initial_production))
+    if policy_pos < 0 or resolver[initial_production_pos + len(initial_production) : policy_pos].strip():
+        fail("resolve_symlinks must not mutate its length between initial termination and policy handling")
+    if block_body_after(resolver, "auto finish_success = [&]() -> int").strip() != finish_success:
+        fail("resolve_symlinks success must publish length only after complete string production")
+    require_order(
+        resolver,
+        [
+            initial_production,
+            "if (apply_task_policy)",
+            "for (int depth = 0; depth < MAX_SYMLINK_DEPTH; ++depth)",
+            "resolve_prefix_symlink_once(resolved_buf, bufsize",
+            "return finish_success()",
+        ],
+        "resolve_symlinks complete initial production before every success exit",
+    )
+    prefix_call = (
+        "int const PREFIX_RESULT = resolve_prefix_symlink_once(resolved_buf, bufsize, apply_task_policy, follow_final_symlink, "
+        "mount,\n"
+        "                                                              path_len_known ? path_len : UNKNOWN_PATH_LEN);"
+    )
+    prefix_gates = (
+        "if (PREFIX_RESULT < 0) {\n"
+        "            return PREFIX_RESULT;\n"
+        "        }\n"
+        "        if (PREFIX_RESULT > 0) {\n"
+        "            path_len = std::strlen(resolved_buf);\n"
+        "            path_len_known = true;\n"
+        "            continue;\n"
+        "        }"
+    )
+    prefix_call_pos = resolver.find(prefix_call)
+    prefix_gates_pos = resolver.find(prefix_gates, prefix_call_pos + len(prefix_call))
+    if (
+        prefix_call_pos < 0
+        or resolver.count(prefix_call) != 1
+        or prefix_gates_pos < 0
+        or resolver[prefix_call_pos + len(prefix_call) : prefix_gates_pos].strip()
+        or len(re.findall(r"\bPREFIX_RESULT\b", resolver)) != 4
+        or len(re.findall(r"\bresolve_prefix_symlink_once\b", resolver)) != 1
+    ):
+        fail("resolve_symlinks must preserve and immediately gate every prefix-resolution result")
+    resolver_returns = [" ".join(value.split()) for value in re.findall(r"\breturn\s+([^;]+);", resolver)]
+    if resolver_returns != [
+        "-EINVAL",
+        "0",
+        "-ENAMETOOLONG",
+        "NORMALIZE",
+        "PREFIX_RESULT",
+        "finish_success()",
+        "finish_success()",
+        "finish_success()",
+        "finish_success()",
+        "finish_success()",
+        "-ENAMETOOLONG",
+        "RR",
+        "-ENAMETOOLONG",
+        "NORMALIZE",
+        "finish_success()",
+        "finish_success()",
+        "-ENAMETOOLONG",
+        "RR",
+        "-ENAMETOOLONG",
+        "NORMALIZE",
+        "finish_success()",
+        "finish_success()",
+        "finish_success()",
+        "finish_success()",
+        "finish_success()",
+        "-EIO",
+        "-ENAMETOOLONG",
+        "RR",
+        "-ENAMETOOLONG",
+        "NORMALIZE",
+        "-ELOOP",
+    ]:
+        fail("resolve_symlinks return topology changed; re-audit complete-production success semantics")
+    if (
+        len(re.findall(r"\bresolved_buf\b", resolver)) != 34
+        or len(re.findall(r"\bbufsize\b", resolver)) != 17
+        or len(re.findall(r"\bresolved_len_out\b", resolver)) != 2
+        or len(re.findall(r"\bpath_len\b", resolver)) != 19
+        or len(re.findall(r"\bpath_len_known\b", resolver)) != 20
+        or resolver.count("return finish_success();") != 12
+        or resolver.count("return 0;") != 1
+    ):
+        fail("resolve_symlinks destination or success flow changed; re-audit complete initialization")
+    forbid(
+        resolver,
+        [
+            "memset(resolved_buf",
+            "std::memset(resolved_buf",
+            "bzero(resolved_buf",
+            "std::fill(resolved_buf",
+            "std::ranges::fill(resolved_buf",
+            "return {};",
+            "return false;",
+            "return true;",
+            "goto",
+        ],
+        "resolve_symlinks complete destination production",
+    )
+
+    poison = "symlink_resolved.fill('x');"
+    producer_call = (
+        "int const SYMLINK_RESOLVE_RET =\n"
+        "        resolve_symlinks(PATH, symlink_resolved.data(), symlink_resolved.size(), false, true, std::strlen(PATH), "
+        "&symlink_resolved_len);"
+    )
+    verification = (
+        "bool const RESOLVER_OUTPUT_OK = SYMLINK_RESOLVE_RET == 0 && symlink_resolved_len == std::strlen(PATH) &&\n"
+        "                                    std::strcmp(symlink_resolved.data(), PATH) == 0 && "
+        "symlink_resolved.at(symlink_resolved_len) == '\\0';"
+    )
+    if selftest.count("\n    symlink_resolved.fill('x');\n") != 1:
+        fail("stat symlink resolver destination poison must be one unconditional complete statement")
+    poison_pos = selftest.find(poison)
+    call_pos = selftest.find(producer_call, poison_pos + len(poison))
+    verification_pos = selftest.find(verification, call_pos + len(producer_call))
+    if (
+        poison_pos < 0
+        or brace_depth_at(selftest, poison_pos) != 0
+        or call_pos < 0
+        or selftest[poison_pos + len(poison) : call_pos].strip()
+        or verification_pos < 0
+        or selftest[call_pos + len(producer_call) : verification_pos].strip()
+    ):
+        fail("stat symlink poison, exact producer call, and output verification must remain adjacent")
+    sticky_use = (
+        "bool ok = RESOLVER_OUTPUT_OK && vfs_lstat(PATH, &st) == 0 && "
+        "(st.st_mode & static_cast<mode_t>(S_IFMT)) == S_IFREG;"
+    )
+    require_order(selftest, [verification, sticky_use, "return ok;"], "sticky poisoned stat symlink resolver KTEST result")
+    expected_selftest_uses = {
+        "symlink_resolved": 6,
+        "symlink_resolved_len": 4,
+        "SYMLINK_RESOLVE_RET": 2,
+        "RESOLVER_OUTPUT_OK": 2,
+    }
+    for name, count in expected_selftest_uses.items():
+        if len(re.findall(rf"\b{re.escape(name)}\b", selftest)) != count:
+            fail(f"stat symlink resolver KTEST has unexpected {name} use")
+    selftest_returns = [" ".join(value.split()) for value in re.findall(r"\breturn\s+([^;]+);", selftest)]
+    if selftest_returns != ["false", "ok"]:
+        fail("stat symlink resolver KTEST must not return before its poisoned result is observed")
+    ok_assignments = [" ".join(value.split()) for value in re.findall(r"\bok\s*=\s*([^;]+);", selftest)]
+    if ok_assignments != [
+        "RESOLVER_OUTPUT_OK && vfs_lstat(PATH, &st) == 0 && (st.st_mode & static_cast<mode_t>(S_IFMT)) == S_IFREG",
+        "vfs_stat(PATH, &st) == 0 && (st.st_mode & static_cast<mode_t>(S_IFMT)) == S_IFREG",
+        "ok && after_lstat.metadata_stores > before.metadata_stores && after_stat.metadata_hits > after_lstat.metadata_hits",
+        'ok && vfs_stat("/tmp/ktest_stat_lstat_shared_cache/", &st) == -ENOTDIR',
+        "ok && after_require_dir.metadata_hits > before_require_dir.metadata_hits",
+        "ok && cache_only_mount != nullptr",
+        "ok && vfs_access_f_ok_resolved(CACHE_ONLY_PATH, false, true, CACHE_ONLY_PATH_LEN, CACHE_ONLY_HASH) == 0",
+        "ok && after_cache_only_access.metadata_hits > before_cache_only_access.metadata_hits",
+        "ok && vfs_stat_resolved_cache_or_impl(CACHE_ONLY_PATH, true, false, true, &cache_only_out, CACHE_ONLY_PATH_LEN, "
+        "CACHE_ONLY_HASH) == 0 && cache_only_out.st_size == cache_only_stat.st_size",
+        "ok && after_cache_only_resolved_stat.metadata_hits > before_cache_only_resolved_stat.metadata_hits",
+        "(vfs_lstat(MISSING_PATH, &st) == -ENOENT) && ok",
+        "(vfs_stat(MISSING_PATH, &st) == -ENOENT) && ok",
+        "ok && after_missing_lstat.metadata_stores > before_missing.metadata_stores && after_missing_stat.metadata_hits > "
+        "after_missing_lstat.metadata_hits",
+        "ok && missing_mount != nullptr",
+        "ok && existence_cache_lookup_mount(MISSING_PATH, missing_mount, false) == -ENOENT",
+        "ok && existence_cache_lookup_mount(MISSING_PATH, missing_mount, true) == -ENOENT",
+        "ok && after_missing_existence_lookup.existence_hits > before_missing_existence_lookup.existence_hits",
+        "(vfs_stat(FIRST_STAT_MISSING_PATH, &st) == -ENOENT) && ok",
+        "ok && after_first_missing_stat.metadata_stores > before_first_missing_stat.metadata_stores && "
+        "after_first_missing_stat.metadata_hits > before_first_missing_stat.metadata_hits",
+        "ok && existence_only_mount != nullptr",
+        "(vfs_stat(EXISTENCE_ONLY_MISSING_PATH, &st) == -ENOENT) && ok",
+        "ok && after_existence_only_missing_stat.existence_hits > before_existence_only_missing_stat.existence_hits",
+        "ok && after_existence_only_missing_stat.symlink_hits == before_existence_only_missing_stat.symlink_hits && "
+        "after_existence_only_missing_stat.symlink_misses == before_existence_only_missing_stat.symlink_misses",
+        "(vfs_unlink(PATH) == 0) && ok",
+    ]:
+        fail("stat symlink resolver KTEST result propagation changed; preserve sticky failures through cleanup")
+    if "goto" in selftest:
+        fail("stat symlink resolver KTEST result must not be bypassed")
+
+
 def test_statat_scratch_is_initialized_by_dirfd_resolver() -> None:
     core = VFS_CORE_CPP.read_text()
     statat = function_body(core, "vfs_statat")
@@ -1277,6 +1608,7 @@ if __name__ == "__main__":
     test_stat_trailing_slash_scratch_is_initialized_by_trim_producer()
     test_absolute_stat_scratch_is_initialized_by_visible_path_producer()
     test_current_task_stat_scratch_is_initialized_by_dirfd_resolver()
+    test_stat_impl_symlink_scratch_is_initialized_by_resolver()
     test_statat_scratch_is_initialized_by_dirfd_resolver()
     test_open_path_scratch_is_initialized_by_its_producers()
     print("VFS open path scratch invariants hold")
