@@ -17,6 +17,7 @@
 #include <new>
 #include <platform/dbg/dbg.hpp>
 #include <platform/init/limine_requests.hpp>
+#include <platform/mm/mm.hpp>
 #include <platform/perf/perf_events.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
@@ -469,6 +470,8 @@ constexpr uint16_t WKI_IPC_DEV_OP_TRANSFER_MIN_DATA =
 constexpr size_t WKI_IPC_EXPORT_PIPE_CAPACITY = 4UL * 1024UL * 1024UL;
 static_assert(WKI_IPC_PIPE_DATA_HEADER_SIZE < WKI_ETH_MAX_PAYLOAD);
 static_assert(WKI_IPC_PIPE_DATA_MAX_CHUNK <= UINT16_MAX);
+static_assert(WKI_IPC_PIPE_DATA_HEADER_SIZE + WKI_IPC_PIPE_DATA_MAX_CHUNK == WKI_ETH_MAX_PAYLOAD);
+static_assert(WKI_ETH_MAX_PAYLOAD <= ker::mod::mm::KERNEL_STACK_SIZE / 16);
 static_assert(WKI_IPC_PIPE_DATA_HEADER_SIZE < WKI_IPC_DEV_OP_COALLOC_MIN_PAYLOAD);
 static_assert(WKI_IPC_DEV_OP_TRANSFER_MIN_DATA > 0);
 static_assert(WKI_IPC_EXPORT_PIPE_WRITE_BURST_CALLS > 0);
@@ -1787,38 +1790,36 @@ auto proxy_pipe_write(ker::vfs::File* f, const void* buf, size_t count, size_t /
     // Message format: [DevOpReqPayload(4B)] [resource_id:u32] [data...]
     constexpr size_t HEADER_SIZE = WKI_IPC_PIPE_DATA_HEADER_SIZE;
     constexpr size_t MAX_CHUNK = WKI_IPC_PIPE_DATA_MAX_CHUNK;
-    size_t const MSG_SIZE = HEADER_SIZE + MAX_CHUNK;
-    auto* msg = new (std::nothrow) uint8_t[MSG_SIZE];
-    if (msg == nullptr) {
-        return finish(-ENOMEM);
-    }
+    // Every byte in the transmitted prefix is assigned below; do not
+    // pattern-initialize the unused bounded tail.
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
+    std::array<uint8_t, WKI_ETH_MAX_PAYLOAD> msg __attribute__((uninitialized));
 
     size_t sent = 0;
     const auto* src = static_cast<const uint8_t*>(buf);
-    auto* req = reinterpret_cast<DevOpReqPayload*>(msg);
+    auto* req = reinterpret_cast<DevOpReqPayload*>(msg.data());
     req->op_id = OP_PIPE_DATA;
-    std::memcpy(msg + sizeof(DevOpReqPayload), &proxy->resource_id, sizeof(uint32_t));
+    std::memcpy(msg.data() + sizeof(DevOpReqPayload), &proxy->resource_id, sizeof(uint32_t));
 
     uint64_t const SEND_STARTED_US = wki_now_us();
     uint64_t last_send_diag_us = 0;
     while (sent < count) {
         size_t const TO_SEND = std::min(count - sent, MAX_CHUNK);
         req->data_len = static_cast<uint16_t>(sizeof(uint32_t) + TO_SEND);
-        std::memcpy(msg + HEADER_SIZE, src + sent, TO_SEND);
+        std::memcpy(msg.data() + HEADER_SIZE, src + sent, TO_SEND);
 
         int ret = WKI_ERR_TX_FAILED;
         uint32_t attempts = 0;
         while (proxy->active.load(std::memory_order_acquire)) {
-            ret = wki_send(proxy->home_node, WKI_CHAN_IPC_DATA, MsgType::DEV_OP_REQ, msg, static_cast<uint16_t>(HEADER_SIZE + TO_SEND));
+            ret = wki_send(proxy->home_node, WKI_CHAN_IPC_DATA, MsgType::DEV_OP_REQ, msg.data(),
+                           static_cast<uint16_t>(HEADER_SIZE + TO_SEND));
             if (ret == WKI_OK) {
                 break;
             }
             if (NONBLOCKING) {
-                delete[] msg;
                 return finish(sent != 0 ? static_cast<ssize_t>(sent) : ipc_pipe_nonblocking_send_status(ret), sent);
             }
             if (current_task_has_deliverable_signal()) {
-                delete[] msg;
                 return finish(sent != 0 ? static_cast<ssize_t>(sent) : static_cast<ssize_t>(-EINTR), sent);
             }
             uint32_t const ATTEMPT = attempts++;
@@ -1835,7 +1836,6 @@ auto proxy_pipe_write(ker::vfs::File* f, const void* buf, size_t count, size_t /
         }
 
         if (ret != WKI_OK) {
-            delete[] msg;
             return finish(sent != 0 ? static_cast<ssize_t>(sent) : static_cast<ssize_t>(-EIO), sent);
         }
 
@@ -1844,7 +1844,6 @@ auto proxy_pipe_write(ker::vfs::File* f, const void* buf, size_t count, size_t /
         g_proxy_write_payload_bytes.fetch_add(TO_SEND, std::memory_order_relaxed);
     }
 
-    delete[] msg;
     return finish(static_cast<ssize_t>(sent), sent);
 }
 

@@ -198,6 +198,35 @@ def test_export_pipe_write_uses_nonmutating_nonblocking_view() -> None:
         fail("export pipe write burst must stay capped at one three-write wire-frame turn")
 
 
+def test_proxy_pipe_write_reuses_bounded_stack_frame() -> None:
+    remote_ipc = REMOTE_IPC_CPP.read_text()
+    body = function_body(remote_ipc, "proxy_pipe_write")
+    required = [
+        "std::array<uint8_t, WKI_ETH_MAX_PAYLOAD> msg __attribute__((uninitialized))",
+        "reinterpret_cast<DevOpReqPayload*>(msg.data())",
+        "std::memcpy(msg.data() + sizeof(DevOpReqPayload), &proxy->resource_id, sizeof(uint32_t))",
+        "std::memcpy(msg.data() + HEADER_SIZE, src + sent, TO_SEND)",
+        "msg.data(),",
+        "static_cast<uint16_t>(HEADER_SIZE + TO_SEND)",
+    ]
+    missing = [token for token in required if token not in body]
+    if missing:
+        fail("proxy pipe writes must reuse one bounded stack frame with an exact transmitted prefix: " + ", ".join(missing))
+    for forbidden in ["new (std::nothrow) uint8_t[MSG_SIZE]", "delete[] msg"]:
+        if forbidden in body:
+            fail(f"proxy pipe writes must not allocate their reusable wire frame: {forbidden}")
+    require_order(body, "req->op_id =", "wki_send(", "proxy pipe frame operation")
+    require_order(body, "&proxy->resource_id", "wki_send(", "proxy pipe frame resource")
+    require_order(body, "req->data_len =", "wki_send(", "proxy pipe frame length")
+    require_order(body, "std::memcpy(msg.data() + HEADER_SIZE", "wki_send(", "proxy pipe frame payload")
+    for assertion in [
+        "WKI_IPC_PIPE_DATA_HEADER_SIZE + WKI_IPC_PIPE_DATA_MAX_CHUNK == WKI_ETH_MAX_PAYLOAD",
+        "WKI_ETH_MAX_PAYLOAD <= ker::mod::mm::KERNEL_STACK_SIZE / 16",
+    ]:
+        if assertion not in remote_ipc:
+            fail(f"proxy pipe stack frame bound is missing {assertion!r}")
+
+
 def test_pipe_fd_open_flags_preserve_nonblocking_access_mode() -> None:
     remote_ipc = REMOTE_IPC_CPP.read_text()
 
@@ -812,6 +841,7 @@ def main() -> None:
     test_epoll_close_releases_lookup_ref_after_detach()
     test_proxy_lookup_is_peer_scoped()
     test_export_pipe_write_uses_nonmutating_nonblocking_view()
+    test_proxy_pipe_write_reuses_bounded_stack_frame()
     test_pipe_fd_open_flags_preserve_nonblocking_access_mode()
     test_write_only_pipe_proxy_omits_receive_ring()
     test_pty_export_data_can_write_from_deferred_worker_without_backlog()
