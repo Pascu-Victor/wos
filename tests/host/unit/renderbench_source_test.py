@@ -199,6 +199,25 @@ def test_renderbench_distributed_ipc_uses_chunk_safe_default_tiles() -> None:
     )
 
 
+def test_renderbench_single_node_node_threads_use_ipc_coordinator() -> None:
+    source = RENDERBENCH_MAIN_CPP.read_text()
+    main_body = function_body(source, "main")
+    if "peers.size() <= 1" in main_body:
+        fail("single-node node-thread renders must use the IPC coordinator")
+    require_order(
+        main_body,
+        "auto peers = read_wki_peers();",
+        "apply_distributed_ipc_defaults(options);",
+        "renderbench must discover the local peer before IPC setup",
+    )
+    require_order(
+        main_body,
+        "apply_distributed_ipc_defaults(options);",
+        "return run_distributed_ipc(options, peers, argv[0]);",
+        "renderbench must route single-node node-thread renders through IPC",
+    )
+
+
 def test_renderbench_worker_child_closes_inherited_fds() -> None:
     source = RENDERBENCH_MAIN_CPP.read_text()
     require_tokens(
@@ -548,6 +567,7 @@ def main() -> None:
     test_renderbench_worker_stream_corruption_is_fatal()
     test_renderbench_worker_pipe_read_uses_uninitialized_scratch()
     test_renderbench_distributed_ipc_uses_chunk_safe_default_tiles()
+    test_renderbench_single_node_node_threads_use_ipc_coordinator()
     test_renderbench_worker_child_closes_inherited_fds()
     test_renderbench_coordinator_stall_report_exposes_batch_state()
     test_renderbench_command_stream_uses_per_batch_thread_join()

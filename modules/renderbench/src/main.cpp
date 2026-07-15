@@ -3266,9 +3266,6 @@ auto main(int argc, char** argv) -> int {
     }
 
     auto peers = read_wki_peers();
-    if (peers.size() <= 1 && options.placement == tracebench::Placement::NodeThreads) {
-        return run_node_threads(options);
-    }
     apply_distributed_ipc_defaults(options);
     return run_distributed_ipc(options, peers, argv[0]);
 }
