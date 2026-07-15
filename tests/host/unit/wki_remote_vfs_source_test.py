@@ -1550,7 +1550,7 @@ def test_remote_metadata_scratch_initializes_only_consumed_prefix() -> None:
         "memcpy(req_data + 2, fs_relative_path, path_len)",
     ]
     request_specs = {
-        "wki_remote_vfs_stat": (
+        "remote_vfs_stat_on_proxy": (
             "std::array<uint8_t, 514> req_stack __attribute__((uninitialized));",
             "auto req_data_len = static_cast<uint16_t>(2 + path_len)",
             path_request + ["vfs_proxy_send_and_wait(state, OP_VFS_STAT, req_data, req_data_len"],
@@ -2160,7 +2160,7 @@ def test_vfs_attach_ack_requires_expected_cookie_before_completion() -> None:
         "remote VFS attach-cookie scaffolding",
     )
     require_order(
-        function_body(source, "wki_remote_vfs_mount"),
+        function_body(source, "mount_vfs_proxy_lane"),
         [
             "attach_cookie = allocate_vfs_attach_cookie_locked(owner_node, resource_id, owner_incarnation)",
             "state->attach_expected_cookie = attach_cookie",
@@ -2194,7 +2194,7 @@ def test_vfs_attach_ack_requires_expected_cookie_before_completion() -> None:
         ],
         "remote VFS attach-cookie wrap exclusion",
     )
-    mount_body = function_body(source, "wki_remote_vfs_mount")
+    mount_body = function_body(source, "mount_vfs_proxy_lane")
     require_order(
         mount_body,
         [
@@ -2237,6 +2237,7 @@ def test_remote_vfs_unmount_cancels_waiters_before_teardown() -> None:
             "state->op_retiring_wait_entry = teardown.op_wait_entry",
             "state->op_retiring_waiter_pid = OP_WAITER_PID",
             "if (state->attach_pending.load(std::memory_order_acquire))",
+            "teardown.had_attach_pending = true",
             "teardown.attach_wait_entry = claim_and_clear_waiter_locked(state->attach_wait_entry)",
             "clear_proxy_attach_state_locked(state, static_cast<uint8_t>(DevAttachStatus::BUSY))",
             "teardown.op_slot_waiter_pids = state->op_slot_waiter_pids",
@@ -2248,25 +2249,38 @@ def test_remote_vfs_unmount_cancels_waiters_before_teardown() -> None:
     )
     require_tokens(
         function_body(source, "find_vfs_proxy_by_mount"),
-        ["p->active || p->epoch_reset_pending", "p->mount_configured"],
-        "path unmount lookup retains epoch-marked mount ownership",
+        ["p->lane_anchor", "p->mount_configured", "!p->destroy_when_idle", "!p->mount_released"],
+        "path unmount lookup retains the physical mount anchor",
     )
 
-    claim_body = function_body(source, "claim_vfs_proxy_unmount_by_path")
+    group_claim = function_body(source, "claim_vfs_proxy_group_unmount_locked")
     require_order(
-        claim_body,
+        group_claim,
         [
+            "mark_vfs_proxy_group_unavailable_locked(anchor)",
+            "for (auto& proxy : g_vfs_proxies)",
+            "state->mount_group_id != anchor->mount_group_id",
             "deactivate_vfs_proxy_locked(state, teardown, true)",
             "stage_vfs_detach_locked(state, teardown.owner_node, teardown.resource_id",
+            "state->mount_released = true",
             "invalidate_all_dir_caches(state)",
-            "s_vfs_lock.unlock()",
         ],
-        "remote VFS unmount claim",
+        "remote VFS group unmount claim",
     )
+    require_tokens(
+        group_claim,
+        [
+            "group.count >= group.lanes.size()",
+            "state->attach_pending.load(std::memory_order_acquire)",
+            "teardown.had_attach_pending",
+        ],
+        "remote VFS group teardown includes every bounded lane",
+    )
+    require_tokens(source, ["struct PendingVfsProxyGroupTeardown"], "remote VFS fixed group teardown storage")
 
-    unmount_body = function_body(source, "finish_vfs_proxy_unmount")
+    lane_finish = function_body(source, "finish_vfs_proxy_lane_teardown")
     require_order(
-        unmount_body,
+        lane_finish,
         [
             "finish_proxy_teardown_op_waiter(teardown, -1)",
             "vfs_stream_cache_invalidate_remote_scope(teardown.state)",
@@ -2275,32 +2289,44 @@ def test_remote_vfs_unmount_cancels_waiters_before_teardown() -> None:
             "teardown.detach_staged",
             "wki_deferred_work_notify()",
             "wki_channel_close_generation(teardown.assigned_channel_ref",
-            "ker::vfs::unmount_filesystem_by_private_data",
-            "mark_vfs_proxy_mount_released_and_maybe_destroy(teardown.state)",
-            "release_vfs_proxy_lifecycle_ref(teardown.state)",
         ],
-        "remote VFS unmount teardown order",
+        "remote VFS per-lane teardown order",
+    )
+
+    unmount_body = function_body(source, "finish_vfs_proxy_group_unmount")
+    require_order(
+        unmount_body,
+        [
+            "for (size_t i = 0; i < group.count; ++i)",
+            "finish_vfs_proxy_lane_teardown(group.lanes.at(i), group.detach_remote.at(i))",
+            "ker::vfs::unmount_filesystem_by_private_data(static_cast<const void*>(group.anchor))",
+            "mark_vfs_proxy_mount_released_and_maybe_destroy(state)",
+            "mark_vfs_proxy_mount_released_and_maybe_destroy(group.anchor)",
+            "release_vfs_proxy_lifecycle_ref(state)",
+            "release_vfs_proxy_lifecycle_ref(group.anchor)",
+        ],
+        "remote VFS group teardown unmounts exactly its anchor",
     )
 
     generation_claim = function_body(source, "claim_vfs_proxy_unmount_by_generation")
     require_tokens(
         generation_claim,
         [
-            "proxy->mount_configured",
-            "!proxy->destroy_when_idle",
-            "!proxy->mount_released",
-            "proxy->resource_generation == resource_generation",
+            "state->lane_anchor",
+            "state->mount_configured",
+            "state->destroy_when_idle",
+            "state->mount_released",
+            "state->resource_generation != resource_generation",
         ],
         "generation-bound remote VFS teardown selection",
     )
     require_order(
         generation_claim,
         [
-            "deactivate_vfs_proxy_locked(state, teardown, true)",
-            "stage_vfs_detach_locked(state, teardown.owner_node, teardown.resource_id",
+            "claim_vfs_proxy_group_unmount_locked(anchor, group)",
             "s_vfs_lock.unlock()",
         ],
-        "generation-bound remote VFS unmount reserves before registry unlock",
+        "generation-bound remote VFS unmount reserves its whole group before registry unlock",
     )
 
 
@@ -2350,11 +2376,14 @@ def test_vfs_detach_uses_exact_negotiated_incarnation_form() -> None:
         ],
         "failed attached VFS rollback reserves before inactive publication",
     )
-    mount_body = function_body(source, "wki_remote_vfs_mount")
+    mount_body = function_body(source, "mount_vfs_proxy_lane")
     require_order(
         mount_body,
         [
-            "state->resource_generation = RESOURCE_GENERATION",
+            "create_vfs_proxy_state_locked(owner_node, resource_id, RESOURCE_GENERATION",
+            "state->lanes.fill(nullptr)",
+            "state->lanes_ready = ANCHOR_READY",
+            'ker::vfs::mount_filesystem(local_mount_path, "remote"',
             "state->mount_configured = true",
             "wki_peer_lifecycle_acquire(final_peer)",
             "wki_resource_observation_is_live",
@@ -2363,7 +2392,13 @@ def test_vfs_detach_uses_exact_negotiated_incarnation_form() -> None:
         ],
         "mount publication must stay pinned through exact resource-generation validation and rollback",
     )
-    if mount_body.find("release_vfs_proxy_lifecycle_ref(state)") < mount_body.find("wki_peer_lifecycle_acquire(final_peer)"):
+    MOUNT_CALL = 'ker::vfs::mount_filesystem(local_mount_path, "remote"'
+    if mount_body.find("state->lanes_ready = ANCHOR_READY") > mount_body.find(MOUNT_CALL):
+        fail("remote VFS lane zero must be ready before its VFS row is published")
+    if mount_body.find("state->mount_configured = true") < mount_body.find(MOUNT_CALL):
+        fail("mount_configured must not expose an anchor before mount_filesystem returns")
+    validation_start = mount_body.find("wki_peer_lifecycle_acquire(final_peer)")
+    if mount_body.find("release_vfs_proxy_lifecycle_ref(state)", validation_start) < validation_start:
         fail("mount publication must not drop its construction pin before final peer/resource validation")
 
     cleanup_body = function_body(source, "wki_remote_vfs_cleanup_for_peer")
@@ -2537,7 +2572,7 @@ def test_remote_vfs_channel_identity_survives_pool_slot_reuse() -> None:
         "channel allocation token capture under the channel lock",
     )
 
-    mount_body = function_body(source, "wki_remote_vfs_mount")
+    mount_body = function_body(source, "mount_vfs_proxy_lane")
     require_order(
         mount_body,
         [
@@ -2623,13 +2658,15 @@ def test_remote_vfs_channel_identity_survives_pool_slot_reuse() -> None:
         ],
         "remote VFS mount admission includes epoch-marker ownership",
     )
+    public_mount_body = function_body(source, "wki_remote_vfs_mount")
     require_order(
-        mount_body,
+        public_mount_body,
         [
             "s_vfs_lock.lock()",
             "vfs_attach_blocked_by_retiring_binding_locked(owner_node, resource_id)",
             "return -EAGAIN",
-            "g_vfs_proxies.push_back",
+            "mount_group_id = allocate_vfs_mount_group_id_locked()",
+            "return mount_vfs_proxy_lane(owner_node, resource_id, local_mount_path, RESOURCE_GENERATION, owner_incarnation",
         ],
         "remote VFS replacement mount cannot cross an epoch marker",
     )
@@ -3116,6 +3153,196 @@ def test_export_rebuild_is_revisioned_and_backing_mount_exact() -> None:
     )
 
 
+def test_remote_vfs_mount_lanes_preserve_channel_and_lifetime_affinity() -> None:
+    header = REMOTE_VFS_HPP.read_text()
+    source = REMOTE_VFS_CPP.read_text()
+
+    require_tokens(
+        header,
+        [
+            "constexpr size_t VFS_PROXY_LANE_COUNT = 4;",
+            "uint64_t mount_group_id = 0;",
+            "uint8_t lane_index = 0;",
+            "bool lane_anchor = false;",
+            "std::array<ProxyVfsState*, VFS_PROXY_LANE_COUNT> lanes = {};",
+            "uint8_t lane_count = 0;",
+            "bool lanes_ready = false;",
+        ],
+        "bounded remote VFS lane metadata",
+    )
+
+    selector = function_body(source, "acquire_vfs_proxy_lane")
+    require_order(
+        selector,
+        [
+            "s_vfs_lock.lock()",
+            "anchor->lanes_ready",
+            "anchor->lane_count > 0",
+            "anchor->lane_count <= anchor->lanes.size()",
+            "uint64_t const PID = perf_current_pid()",
+            "PID % anchor->lane_count",
+            "auto* candidate = anchor->lanes.at(LANE_INDEX)",
+            "candidate->lifecycle_refs++",
+            "s_vfs_lock.unlock()",
+        ],
+        "lane selection retains one task-affine lane through the operation",
+    )
+    if "anchor->mount_configured" in selector:
+        fail("lane selection must remain available while mount_filesystem is publishing the ready anchor")
+
+    lane_mount = function_body(source, "mount_vfs_proxy_lane")
+    require_order(
+        lane_mount,
+        [
+            "VFS_PROXY_AUX_ATTACH_TIMEOUT_US",
+            "if (!lane_anchor)",
+            "anchor->lanes.at(lane_index) = state",
+            "anchor->lane_count = static_cast<uint8_t>(lane_index + 1U)",
+            "release_vfs_proxy_lifecycle_ref(state)",
+            "state->lanes.fill(nullptr)",
+            "state->lanes.at(0) = state",
+            "state->lane_count = 1",
+            "state->lanes_ready = ANCHOR_READY",
+            'ker::vfs::mount_filesystem(local_mount_path, "remote"',
+            "if (MOUNT_RET != 0)",
+            "state->mount_configured = true",
+            "for (uint8_t lane_index = 1; lane_index < VFS_PROXY_LANE_COUNT; ++lane_index)",
+            "mount_vfs_proxy_lane(owner_node, resource_id, local_mount_path, RESOURCE_GENERATION",
+        ],
+        "mount publishes a ready lane zero before auxiliary lanes are attached",
+    )
+    MOUNT_CALL = 'ker::vfs::mount_filesystem(local_mount_path, "remote"'
+    ready_at = lane_mount.find("state->lanes_ready = ANCHOR_READY")
+    mount_at = lane_mount.find(MOUNT_CALL)
+    configured_at = lane_mount.find("state->mount_configured = true")
+    if ready_at < 0 or mount_at < 0 or configured_at < 0:
+        fail("remote VFS mount publication markers are missing")
+    if mount_at < ready_at:
+        fail("remote VFS mount row must not become visible before lane zero is selectable")
+    if configured_at < mount_at:
+        fail("mount_configured must commit only after mount_filesystem returns")
+    if lane_mount.count(MOUNT_CALL) != 1:
+        fail("remote VFS lane mount must have one physical VFS mount publication")
+
+    aux_publish = block_body_after(lane_mount, "if (!lane_anchor)")
+    require_tokens(
+        aux_publish,
+        [
+            "s_vfs_lock.lock()",
+            "anchor->mount_configured",
+            "anchor->lane_count == lane_index",
+            "anchor->lanes.at(lane_index) = state",
+        ],
+        "auxiliary lane publication remains serialized and contiguous after anchor publication",
+    )
+    require_order(
+        lane_mount,
+        [
+            "int const PRE_AUX_VALIDATION = validate_mount_binding()",
+            "for (uint8_t lane_index = 1; lane_index < VFS_PROXY_LANE_COUNT; ++lane_index)",
+            "int const POST_AUX_VALIDATION = validate_mount_binding()",
+            "wki_remote_vfs_unmount_resource_generation(owner_node, resource_id, RESOURCE_GENERATION)",
+        ],
+        "auxiliary attachment is followed by exact binding/resource revalidation before success",
+    )
+    post_aux = lane_mount[lane_mount.find("for (uint8_t lane_index = 1; lane_index < VFS_PROXY_LANE_COUNT;") :]
+    require_order(
+        post_aux,
+        [
+            "state->lanes_ready",
+            "wki_remote_vfs_unmount_resource_generation",
+            "release_vfs_proxy_lifecycle_ref(state)",
+        ],
+        "post-aux peer cleanup unmounts the exact configured group before dropping its construction pin",
+    )
+
+    for function_name in [
+        "wki_remote_vfs_open_path",
+        "wki_remote_vfs_stat",
+        "wki_remote_vfs_mkdir",
+        "wki_remote_vfs_chmod",
+        "wki_remote_vfs_symlink",
+        "wki_remote_vfs_unlink",
+        "wki_remote_vfs_rmdir",
+        "wki_remote_vfs_rename",
+        "wki_remote_vfs_readlink_path",
+    ]:
+        body = function_body(source, function_name)
+        require_order(
+            body,
+            ["auto* state = acquire_vfs_proxy_lane(anchor)", "ProxyLifecycleRefGuard lane_ref_guard(state)"],
+            f"{function_name} selects and pins a mount lane",
+        )
+
+    open_body = function_body(source, "wki_remote_vfs_open_path")
+    require_order(
+        open_body,
+        [
+            "auto* state = acquire_vfs_proxy_lane(anchor)",
+            "ProxyLifecycleRefGuard lane_ref_guard(state)",
+            "if (!acquire_vfs_proxy_open_ref(state))",
+            "ctx->proxy = state",
+        ],
+        "open transfers selected-lane ownership to the file context",
+    )
+    fstat_body = function_body(source, "wki_remote_vfs_fstat")
+    require_tokens(fstat_body, ["remote_vfs_stat_on_proxy(ctx->proxy"], "fstat keeps its FD lane")
+    if "wki_remote_vfs_stat(mount->private_data" in fstat_body:
+        fail("fstat must not reselect a lane for an existing remote FD")
+
+    for function_name in [
+        "remote_vfs_close",
+        "remote_vfs_read",
+        "remote_vfs_write",
+        "remote_vfs_lseek",
+        "remote_vfs_readdir",
+        "remote_vfs_truncate",
+        "remote_vfs_fsync_file",
+    ]:
+        body = function_body(source, function_name)
+        if "acquire_vfs_proxy_lane(" in body:
+            fail(f"{function_name} must use its RemoteFileContext lane directly")
+
+    for function_name in [
+        "wki_remote_vfs_mkdir",
+        "wki_remote_vfs_symlink",
+        "wki_remote_vfs_unlink",
+        "wki_remote_vfs_rmdir",
+        "wki_remote_vfs_rename",
+    ]:
+        require_tokens(
+            function_body(source, function_name),
+            ["invalidate_readlink_cache_group(state)"],
+            f"{function_name} invalidates every lane's readlink cache",
+        )
+    require_tokens(
+        function_body(source, "handle_vfs_invalidate_notify"),
+        ["invalidate_readlink_cache_group(state)"],
+        "server invalidation clears sibling-lane readlink caches",
+    )
+
+    group_claim = function_body(source, "claim_vfs_proxy_group_unmount_locked")
+    require_order(
+        group_claim,
+        [
+            "mark_vfs_proxy_group_unavailable_locked(anchor)",
+            "for (auto& proxy : g_vfs_proxies)",
+            "deactivate_vfs_proxy_locked(state, teardown, true)",
+        ],
+        "group teardown unpublishes lanes before retiring them",
+    )
+    require_tokens(
+        function_body(source, "mark_vfs_proxy_group_unavailable_locked"),
+        ["proxy->lane_count = 0", "proxy->lanes_ready = false"],
+        "unavailable lane group cannot be selected",
+    )
+    for function_name, marker in [
+        ("wki_remote_vfs_mark_epoch_reset", "mark_vfs_proxy_group_unavailable_locked(state)"),
+        ("wki_remote_vfs_cleanup_for_peer", "mark_vfs_proxy_group_unavailable_locked(p)"),
+    ]:
+        require_tokens(function_body(source, function_name), [marker], f"{function_name} unpublishes lane groups")
+
+
 def main() -> None:
     test_vfs_host_alias_rewrite_is_overlap_safe()
     test_vfs_route_scratch_is_initialized_by_its_producer()
@@ -3151,6 +3378,7 @@ def main() -> None:
     test_stale_fd_gc_drains_binding_users_before_file_close()
     test_server_fd_and_consumer_rx_use_exact_channel_identity()
     test_export_rebuild_is_revisioned_and_backing_mount_exact()
+    test_remote_vfs_mount_lanes_preserve_channel_and_lifetime_affinity()
     print("WKI remote VFS source invariants hold")
 
 

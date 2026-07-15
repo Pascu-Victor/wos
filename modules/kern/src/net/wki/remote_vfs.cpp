@@ -107,6 +107,10 @@ constexpr uint64_t VFS_PROXY_CONTENTION_SLEEP_US = 1000;
 // smaller interactive timeout schedule below.
 constexpr uint64_t VFS_PROXY_OP_TIMEOUT_US = 60'000'000;
 constexpr uint64_t VFS_PROXY_SLOT_WAIT_TIMEOUT_US = VFS_PROXY_OP_TIMEOUT_US;
+// Extra mount lanes improve aggregate throughput but are not required for a
+// usable mount.  Do not let one unavailable auxiliary binding turn mount
+// startup into several full RPC timeout windows.
+constexpr uint64_t VFS_PROXY_AUX_ATTACH_TIMEOUT_US = 5'000'000;
 static_assert(sizeof(DevOpReqPayload) <= WKI_ETH_MAX_PAYLOAD);
 static_assert(WKI_ETH_MAX_PAYLOAD <= UINT16_MAX);
 static_assert(WKI_ETH_MAX_PAYLOAD <= ker::mod::mm::KERNEL_STACK_SIZE / 16);
@@ -779,6 +783,7 @@ void invalidate_all_dir_caches(ProxyVfsState* proxy) {
 std::deque<std::unique_ptr<ProxyVfsState>> g_vfs_proxies;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 bool g_remote_vfs_initialized = false;                     // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 uint8_t g_vfs_attach_next_cookie = 1;                      // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+uint64_t g_vfs_next_mount_group_id = 1;                    // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 ProxyVfsState* g_pending_vfs_detach_head = nullptr;        // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 ProxyVfsState* g_pending_vfs_detach_tail = nullptr;        // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
@@ -786,6 +791,92 @@ ker::mod::sys::Spinlock s_vfs_lock;  // NOLINT(cppcoreguidelines-avoid-non-const
 
 constexpr size_t VFS_DETACH_RETRY_BATCH = 32;
 constexpr size_t VFS_DETACH_RETRY_SCAN = VFS_DETACH_RETRY_BATCH * 2;
+
+// Caller must hold s_vfs_lock.
+auto allocate_vfs_mount_group_id_locked() -> uint64_t {
+    uint64_t group_id = g_vfs_next_mount_group_id++;
+    if (group_id == 0) {
+        group_id = g_vfs_next_mount_group_id++;
+    }
+    if (group_id == 0) [[unlikely]] {
+        ker::mod::dbg::panic_handler("WKI remote VFS: mount group id exhausted");
+        hcf();
+    }
+    return group_id;
+}
+
+// Caller must hold s_vfs_lock.
+auto create_vfs_proxy_state_locked(uint16_t owner_node, uint32_t resource_id, uint64_t resource_generation,
+                                   const ResourceIncarnationToken& owner_incarnation, uint32_t binding_peer_boot_epoch,
+                                   const char* local_mount_path, uint64_t mount_group_id, uint8_t lane_index, bool lane_anchor)
+    -> ProxyVfsState* {
+    g_vfs_proxies.push_back(std::make_unique<ProxyVfsState>());
+    auto* state = g_vfs_proxies.back().get();
+
+    state->owner_node = owner_node;
+    state->resource_id = resource_id;
+    state->resource_generation = resource_generation;
+    state->owner_incarnation = owner_incarnation;
+    state->binding_peer_boot_epoch = binding_peer_boot_epoch;
+    state->mount_group_id = mount_group_id;
+    state->lane_index = lane_index;
+    state->lane_anchor = lane_anchor;
+    state->lifecycle_refs = 1;
+
+    size_t path_len = std::strlen(local_mount_path);
+    if (path_len >= VFS_EXPORT_PATH_LEN) {
+        path_len = VFS_EXPORT_PATH_LEN - 1;
+    }
+    std::memcpy(state->local_mount_path.data(), local_mount_path, path_len);
+    state->local_mount_path.at(path_len) = '\0';
+    return state;
+}
+
+// Caller must hold s_vfs_lock.
+void mark_vfs_proxy_group_unavailable_locked(ProxyVfsState* state) {
+    if (state == nullptr || state->mount_group_id == 0) {
+        return;
+    }
+
+    for (auto& proxy : g_vfs_proxies) {
+        if (proxy == nullptr || proxy->mount_group_id != state->mount_group_id || !proxy->lane_anchor) {
+            continue;
+        }
+        proxy->lanes.fill(nullptr);
+        proxy->lane_count = 0;
+        proxy->lanes_ready = false;
+        return;
+    }
+}
+
+// Returns a lane with a temporary lifecycle reference.  A hidden lane may be
+// retired and erased after the registry lock drops, while its anchor mount is
+// still alive, so callers must release the reference after their operation (or
+// after transferring to an open-file reference).
+auto acquire_vfs_proxy_lane(ProxyVfsState* anchor) -> ProxyVfsState* {
+    if (anchor == nullptr) {
+        return nullptr;
+    }
+
+    s_vfs_lock.lock();
+    ProxyVfsState* selected = nullptr;
+    // A remote fops call can only obtain this anchor from a published VFS
+    // mount row.  Prepare lane zero before that row is inserted, so do not
+    // make selection wait for the post-insert mount bookkeeping bit.
+    if (anchor->lane_anchor && anchor->lanes_ready && anchor->active && !anchor->destroy_when_idle && !anchor->resources_releasing &&
+        !anchor->resources_released && anchor->lane_count > 0 && anchor->lane_count <= anchor->lanes.size()) {
+        uint64_t const PID = perf_current_pid();
+        size_t const LANE_INDEX = PID == 0 ? 0 : static_cast<size_t>(PID % anchor->lane_count);
+        auto* candidate = anchor->lanes.at(LANE_INDEX);
+        if (candidate != nullptr && candidate->active && !candidate->destroy_when_idle && !candidate->resources_releasing &&
+            !candidate->resources_released && candidate->mount_group_id == anchor->mount_group_id && candidate->lane_index == LANE_INDEX) {
+            candidate->lifecycle_refs++;
+            selected = candidate;
+        }
+    }
+    s_vfs_lock.unlock();
+    return selected;
+}
 
 // Caller must hold s_vfs_lock.
 auto vfs_detach_pending_for_resource_locked(uint16_t owner_node, uint32_t resource_id) -> bool {
@@ -950,7 +1041,7 @@ auto vfs_attach_ack_matches_pending_locked(ProxyVfsState const* state, const Dev
 
 auto find_vfs_proxy_by_mount(const char* mount_path) -> ProxyVfsState* {
     for (auto& p : g_vfs_proxies) {
-        if ((p->active || p->epoch_reset_pending) && p->mount_configured &&
+        if (p->lane_anchor && p->mount_configured && !p->destroy_when_idle && !p->mount_released &&
             strncmp(p->local_mount_path.data(), mount_path, p->local_mount_path.size()) == 0) {
             return p.get();
         }
@@ -1075,6 +1166,28 @@ void invalidate_readlink_cache(ProxyVfsState* state) {
     state->lock.lock();
     invalidate_readlink_cache_locked(state);
     state->lock.unlock();
+}
+
+// A successful namespace mutation on one lane must invalidate lookups cached
+// by every sibling lane before another task is routed there.  The registry
+// lock keeps group members alive while their per-lane cache locks are held.
+void invalidate_readlink_cache_group(ProxyVfsState* state) {
+    if (state == nullptr || state->mount_group_id == 0) {
+        invalidate_readlink_cache(state);
+        return;
+    }
+
+    s_vfs_lock.lock();
+    for (auto& proxy : g_vfs_proxies) {
+        auto* member = proxy.get();
+        if (member == nullptr || member->mount_group_id != state->mount_group_id) {
+            continue;
+        }
+        member->lock.lock();
+        invalidate_readlink_cache_locked(member);
+        member->lock.unlock();
+    }
+    s_vfs_lock.unlock();
 }
 
 void clear_remote_file_open_prefetch(RemoteFileContext* ctx) {
@@ -2015,6 +2128,7 @@ struct PendingProxyTeardown {
     uint16_t op_expected_id = 0;
     uint16_t op_expected_seq = 0;
     bool had_op_pending = false;
+    bool had_attach_pending = false;
     WkiWaitEntry* op_wait_entry = nullptr;
     bool op_wait_claimed = false;
     WkiWaitEntry* attach_wait_entry = nullptr;
@@ -2121,6 +2235,18 @@ void release_vfs_proxy_lifecycle_ref(ProxyVfsState* state) {
     }
 }
 
+struct ProxyLifecycleRefGuard {
+    explicit ProxyLifecycleRefGuard(ProxyVfsState* state_ref) : state(state_ref) {}
+    ~ProxyLifecycleRefGuard() { release_vfs_proxy_lifecycle_ref(state); }
+
+    ProxyLifecycleRefGuard(const ProxyLifecycleRefGuard&) = delete;
+    auto operator=(const ProxyLifecycleRefGuard&) -> ProxyLifecycleRefGuard& = delete;
+
+    void disarm() { state = nullptr; }
+
+    ProxyVfsState* state;
+};
+
 void mark_vfs_proxy_mount_released_and_maybe_destroy(ProxyVfsState* state) {
     if (state == nullptr) {
         return;
@@ -2221,6 +2347,7 @@ void deactivate_vfs_proxy_locked(ProxyVfsState* state, PendingProxyTeardown& tea
         state->op_retiring_waiter_pid = OP_WAITER_PID;
     }
     if (state->attach_pending.load(std::memory_order_acquire)) {
+        teardown.had_attach_pending = true;
         teardown.attach_wait_entry = claim_and_clear_waiter_locked(state->attach_wait_entry);
         clear_proxy_attach_state_locked(state, static_cast<uint8_t>(DevAttachStatus::BUSY));
     }
@@ -5873,46 +6000,23 @@ void handle_vfs_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_ident
 // Consumer Side - Mount / Open / Response Handlers
 // -------------------------------------------------------------------------------
 
-auto wki_remote_vfs_mount(uint16_t owner_node, uint32_t resource_id, const char* local_mount_path, uint64_t expected_resource_generation)
-    -> int {
+namespace {
+
+auto mount_vfs_proxy_lane(uint16_t owner_node, uint32_t resource_id, const char* local_mount_path, uint64_t resource_generation,
+                          const ResourceIncarnationToken& owner_incarnation, uint32_t binding_peer_boot_epoch, uint64_t mount_group_id,
+                          uint8_t lane_index, bool lane_anchor) -> int {
     if (local_mount_path == nullptr) {
         return -EINVAL;
     }
 
-    uint64_t const RESOURCE_GENERATION = expected_resource_generation != 0
-                                             ? expected_resource_generation
-                                             : wki_resource_generation_snapshot(owner_node, ResourceType::VFS, resource_id);
-    ResourceIncarnationToken owner_incarnation = {};
-    if (!wki_resource_observation_snapshot(owner_node, ResourceType::VFS, resource_id, RESOURCE_GENERATION, &owner_incarnation)) {
-        return -ENOENT;
-    }
-    uint32_t const BINDING_PEER_BOOT_EPOCH = wki_resource_incarnation_valid(owner_incarnation)
-                                                 ? owner_incarnation.owner_boot_epoch
-                                                 : wki_peer_remote_boot_epoch_snapshot(owner_node);
+    uint64_t const RESOURCE_GENERATION = resource_generation;
+    uint32_t const BINDING_PEER_BOOT_EPOCH = binding_peer_boot_epoch;
 
     // Allocate proxy state
     uint8_t attach_cookie = 0;
     s_vfs_lock.lock();
-    if (vfs_attach_blocked_by_retiring_binding_locked(owner_node, resource_id)) {
-        s_vfs_lock.unlock();
-        return -EAGAIN;
-    }
-    g_vfs_proxies.push_back(std::make_unique<ProxyVfsState>());
-    auto* state = g_vfs_proxies.back().get();
-
-    state->owner_node = owner_node;
-    state->resource_id = resource_id;
-    state->resource_generation = RESOURCE_GENERATION;
-    state->owner_incarnation = owner_incarnation;
-    state->binding_peer_boot_epoch = BINDING_PEER_BOOT_EPOCH;
-    state->lifecycle_refs = 1;
-
-    size_t path_len = strlen(local_mount_path);
-    if (path_len >= VFS_EXPORT_PATH_LEN) {
-        path_len = VFS_EXPORT_PATH_LEN - 1;
-    }
-    memcpy(static_cast<void*>(state->local_mount_path.data()), local_mount_path, path_len);
-    *std::next(state->local_mount_path.begin(), static_cast<ptrdiff_t>(path_len)) = '\0';
+    auto* state = create_vfs_proxy_state_locked(owner_node, resource_id, RESOURCE_GENERATION, owner_incarnation, BINDING_PEER_BOOT_EPOCH,
+                                                local_mount_path, mount_group_id, lane_index, lane_anchor);
 
     WkiWaitEntry wait = {};
     attach_cookie = allocate_vfs_attach_cookie_locked(owner_node, resource_id, owner_incarnation);
@@ -5988,7 +6092,8 @@ auto wki_remote_vfs_mount(uint16_t owner_node, uint32_t resource_id, const char*
     }
 
     uint64_t const ATTACH_STARTED_US = wki_now_us();
-    int const WAIT_RC = wki_wait_for_op(&wait, VFS_PROXY_OP_TIMEOUT_US);
+    uint64_t const ATTACH_TIMEOUT_US = lane_anchor ? VFS_PROXY_OP_TIMEOUT_US : VFS_PROXY_AUX_ATTACH_TIMEOUT_US;
+    int const WAIT_RC = wki_wait_for_op(&wait, ATTACH_TIMEOUT_US);
     s_vfs_lock.lock();
     if (WAIT_RC == 0 && state->attach_wait_entry == &wait) {
         state->attach_wait_entry = nullptr;
@@ -6137,7 +6242,58 @@ auto wki_remote_vfs_mount(uint16_t owner_node, uint32_t resource_id, const char*
         }
     }
 
-    // Create the mount point with "remote" fstype
+    if (!lane_anchor) {
+        bool published = false;
+        uint16_t assigned_channel = 0;
+        s_vfs_lock.lock();
+        for (auto& proxy : g_vfs_proxies) {
+            auto* anchor = proxy.get();
+            if (anchor == nullptr || !anchor->lane_anchor || anchor->mount_group_id != mount_group_id) {
+                continue;
+            }
+            if (anchor->active && anchor->mount_configured && !anchor->destroy_when_idle && !anchor->resources_releasing &&
+                !anchor->resources_released && state->active && !state->destroy_when_idle && state->lane_index == lane_index &&
+                anchor->lane_count == lane_index && lane_index < anchor->lanes.size()) {
+                anchor->lanes.at(lane_index) = state;
+                anchor->lane_count = static_cast<uint8_t>(lane_index + 1U);
+                assigned_channel = state->assigned_channel;
+                published = true;
+            }
+            break;
+        }
+        s_vfs_lock.unlock();
+
+        if (!published) {
+            discard_failed_attached_proxy(state);
+            return WKI_ERR_PEER_FENCED;
+        }
+
+        release_vfs_proxy_lifecycle_ref(state);
+        ker::mod::dbg::log("[WKI] Remote VFS auxiliary lane mounted: %s -> node=0x%04x res_id=%u lane=%u ch=%u", local_mount_path,
+                           owner_node, resource_id, lane_index, assigned_channel);
+        return 0;
+    }
+
+    // Stage lane zero before publishing the VFS row.  mount_configured stays
+    // false until mount_filesystem() returns, so withdrawal still treats this
+    // state as private; fops selection is safe because the row is its only
+    // external source of the anchor pointer.
+    s_vfs_lock.lock();
+    state->lanes.fill(nullptr);
+    state->lanes.at(0) = state;
+    state->lane_count = 1;
+    bool const ANCHOR_READY = state->active && !state->destroy_when_idle && !state->resources_releasing && !state->resources_released;
+    state->lanes_ready = ANCHOR_READY;
+    uint16_t const ASSIGNED_CHANNEL = state->assigned_channel;
+    s_vfs_lock.unlock();
+    if (!ANCHOR_READY) {
+        discard_failed_attached_proxy(state);
+        return WKI_ERR_PEER_FENCED;
+    }
+
+    // Create the mount point with "remote" fstype.  Lane zero is already
+    // selectable, so a task that resolves the just-published row cannot wait
+    // behind the bounded auxiliary attach sequence below.
     int const MOUNT_RET = ker::vfs::mount_filesystem(local_mount_path, "remote", nullptr, 0, nullptr, state, &g_remote_vfs_fops);
     if (MOUNT_RET != 0) {
         ker::mod::dbg::log("[WKI] Remote VFS mount failed at %s", local_mount_path);
@@ -6147,104 +6303,196 @@ auto wki_remote_vfs_mount(uint16_t owner_node, uint32_t resource_id, const char*
 
     s_vfs_lock.lock();
     state->mount_configured = true;
-    uint16_t const ASSIGNED_CHANNEL = state->assigned_channel;
     s_vfs_lock.unlock();
 
     // The attach/mount handshake can block long enough for RESOURCE_WITHDRAW
     // or peer epoch cleanup to retire this exact advertised/channel
-    // generation. Linearize final publication with peer teardown, then verify
-    // the immutable channel token as well as resource discovery. Keep the
-    // construction lifecycle pin until this validation and any exact rollback
-    // finish so concurrent withdrawal cannot erase state beneath this path.
-    WkiPeer* final_peer = wki_peer_find(owner_node);
-    bool const LIFECYCLE_ACQUIRED = wki_peer_lifecycle_acquire(final_peer);
-    bool binding_still_live = false;
-    bool resource_still_live = false;
-    if (LIFECYCLE_ACQUIRED) {
-        s_vfs_lock.lock();
-        bool const PROXY_STILL_ACTIVE = state->active;
-        WkiChannel* const CHANNEL_REF = state->assigned_channel_ref;
-        uint16_t const CHANNEL_ID = state->assigned_channel;
-        uint32_t const CHANNEL_GENERATION = state->assigned_channel_generation;
-        s_vfs_lock.unlock();
+    // generation. Validate both before and after the bounded auxiliary-lane
+    // sequence while retaining the construction pin through any rollback.
+    auto validate_mount_binding = [&]() -> int {
+        WkiPeer* final_peer = wki_peer_find(owner_node);
+        bool const LIFECYCLE_ACQUIRED = wki_peer_lifecycle_acquire(final_peer);
+        bool binding_still_live = false;
+        bool resource_still_live = false;
+        if (LIFECYCLE_ACQUIRED) {
+            s_vfs_lock.lock();
+            bool const PROXY_STILL_ACTIVE = state->active;
+            WkiChannel* const CHANNEL_REF = state->assigned_channel_ref;
+            uint16_t const CHANNEL_ID = state->assigned_channel;
+            uint32_t const CHANNEL_GENERATION = state->assigned_channel_generation;
+            s_vfs_lock.unlock();
 
-        binding_still_live = final_peer->node_id == owner_node && final_peer->state == PeerState::CONNECTED &&
-                             !final_peer->vfs_reset_rebind_pending.load(std::memory_order_acquire) && PROXY_STILL_ACTIVE &&
-                             wki_channel_generation_is_live(CHANNEL_REF, owner_node, CHANNEL_ID, CHANNEL_GENERATION);
-        resource_still_live =
-            wki_resource_observation_is_live(owner_node, ResourceType::VFS, resource_id, RESOURCE_GENERATION, owner_incarnation);
-        wki_peer_lifecycle_release(final_peer);
-    }
+            binding_still_live = final_peer->node_id == owner_node && final_peer->state == PeerState::CONNECTED &&
+                                 !final_peer->vfs_reset_rebind_pending.load(std::memory_order_acquire) && PROXY_STILL_ACTIVE &&
+                                 wki_channel_generation_is_live(CHANNEL_REF, owner_node, CHANNEL_ID, CHANNEL_GENERATION);
+            resource_still_live =
+                wki_resource_observation_is_live(owner_node, ResourceType::VFS, resource_id, RESOURCE_GENERATION, owner_incarnation);
+            wki_peer_lifecycle_release(final_peer);
+        }
 
-    if (!resource_still_live) {
+        if (!resource_still_live) {
+            return -ENOENT;
+        }
+        return binding_still_live ? 0 : WKI_ERR_PEER_FENCED;
+    };
+
+    int const PRE_AUX_VALIDATION = validate_mount_binding();
+    if (PRE_AUX_VALIDATION != 0) {
         wki_remote_vfs_unmount_resource_generation(owner_node, resource_id, RESOURCE_GENERATION);
         release_vfs_proxy_lifecycle_ref(state);
-        return -ENOENT;
+        return PRE_AUX_VALIDATION;
     }
-    if (!binding_still_live) {
+
+    for (uint8_t lane_index = 1; lane_index < VFS_PROXY_LANE_COUNT; ++lane_index) {
+        int const LANE_RET = mount_vfs_proxy_lane(owner_node, resource_id, local_mount_path, RESOURCE_GENERATION, owner_incarnation,
+                                                  BINDING_PEER_BOOT_EPOCH, mount_group_id, lane_index, false);
+        if (LANE_RET != 0) {
+            ker::mod::dbg::log("[WKI] Remote VFS auxiliary lane unavailable: node=0x%04x res_id=%u lane=%u ret=%d", owner_node, resource_id,
+                               lane_index, LANE_RET);
+            break;
+        }
+    }
+
+    int const POST_AUX_VALIDATION = validate_mount_binding();
+    if (POST_AUX_VALIDATION != 0) {
+        wki_remote_vfs_unmount_resource_generation(owner_node, resource_id, RESOURCE_GENERATION);
+        release_vfs_proxy_lifecycle_ref(state);
+        return POST_AUX_VALIDATION;
+    }
+
+    s_vfs_lock.lock();
+    bool const ANCHOR_STILL_ACTIVE = state->active && state->mount_configured && state->lanes_ready && state->lane_count > 0;
+    uint8_t const LANE_COUNT = state->lane_count;
+    s_vfs_lock.unlock();
+    if (!ANCHOR_STILL_ACTIVE) {
         wki_remote_vfs_unmount_resource_generation(owner_node, resource_id, RESOURCE_GENERATION);
         release_vfs_proxy_lifecycle_ref(state);
         return WKI_ERR_PEER_FENCED;
     }
 
     release_vfs_proxy_lifecycle_ref(state);
-    ker::mod::dbg::log("[WKI] Remote VFS mounted: %s -> node=0x%04x res_id=%u ch=%u", local_mount_path, owner_node, resource_id,
-                       ASSIGNED_CHANNEL);
+    ker::mod::dbg::log("[WKI] Remote VFS mounted: %s -> node=0x%04x res_id=%u ch=%u lanes=%u", local_mount_path, owner_node, resource_id,
+                       ASSIGNED_CHANNEL, LANE_COUNT);
     return 0;
 }
 
-namespace {
-auto claim_vfs_proxy_unmount_by_path(const char* local_mount_path, PendingProxyTeardown& teardown, bool& detach_remote) -> bool {
+}  // namespace
+
+auto wki_remote_vfs_mount(uint16_t owner_node, uint32_t resource_id, const char* local_mount_path, uint64_t expected_resource_generation)
+    -> int {
+    if (local_mount_path == nullptr) {
+        return -EINVAL;
+    }
+
+    uint64_t const RESOURCE_GENERATION = expected_resource_generation != 0
+                                             ? expected_resource_generation
+                                             : wki_resource_generation_snapshot(owner_node, ResourceType::VFS, resource_id);
+    ResourceIncarnationToken owner_incarnation = {};
+    if (!wki_resource_observation_snapshot(owner_node, ResourceType::VFS, resource_id, RESOURCE_GENERATION, &owner_incarnation)) {
+        return -ENOENT;
+    }
+    uint32_t const BINDING_PEER_BOOT_EPOCH = wki_resource_incarnation_valid(owner_incarnation)
+                                                 ? owner_incarnation.owner_boot_epoch
+                                                 : wki_peer_remote_boot_epoch_snapshot(owner_node);
+
+    uint64_t mount_group_id = 0;
     s_vfs_lock.lock();
-    auto* state = find_vfs_proxy_by_mount(local_mount_path);
-    if (state == nullptr || state->destroy_when_idle) {
+    if (vfs_attach_blocked_by_retiring_binding_locked(owner_node, resource_id)) {
+        s_vfs_lock.unlock();
+        return -EAGAIN;
+    }
+    mount_group_id = allocate_vfs_mount_group_id_locked();
+    s_vfs_lock.unlock();
+
+    return mount_vfs_proxy_lane(owner_node, resource_id, local_mount_path, RESOURCE_GENERATION, owner_incarnation, BINDING_PEER_BOOT_EPOCH,
+                                mount_group_id, 0, true);
+}
+
+namespace {
+struct PendingVfsProxyGroupTeardown {
+    std::array<PendingProxyTeardown, VFS_PROXY_LANE_COUNT> lanes = {};
+    std::array<bool, VFS_PROXY_LANE_COUNT> detach_remote = {};
+    size_t count = 0;
+    ProxyVfsState* anchor = nullptr;
+};
+
+// Caller must hold s_vfs_lock.  Clear the public anchor table before any
+// lane is deactivated, then snapshot every group member (including a child
+// whose attach is still in flight) for task-context teardown.
+void claim_vfs_proxy_group_unmount_locked(ProxyVfsState* anchor, PendingVfsProxyGroupTeardown& group) {
+    if (anchor == nullptr || !anchor->lane_anchor || anchor->mount_group_id == 0) [[unlikely]] {
+        ker::mod::dbg::panic_handler("WKI remote VFS: invalid lane-group unmount anchor");
+        hcf();
+    }
+
+    group.anchor = anchor;
+    mark_vfs_proxy_group_unavailable_locked(anchor);
+    for (auto& proxy : g_vfs_proxies) {
+        auto* state = proxy.get();
+        if (state == nullptr || state->mount_group_id != anchor->mount_group_id) {
+            continue;
+        }
+        if (group.count >= group.lanes.size()) [[unlikely]] {
+            ker::mod::dbg::panic_handler("WKI remote VFS: lane group exceeds fixed bound");
+            hcf();
+        }
+
+        auto& teardown = group.lanes.at(group.count);
+        bool const DETACH_REMOTE = state->active || state->epoch_reset_pending || state->attach_pending.load(std::memory_order_acquire);
+        deactivate_vfs_proxy_locked(state, teardown, true);
+        group.detach_remote.at(group.count) = DETACH_REMOTE || teardown.had_attach_pending;
+        if (group.detach_remote.at(group.count)) {
+            teardown.detach_staged = stage_vfs_detach_locked(state, teardown.owner_node, teardown.resource_id,
+                                                             teardown.binding_attach_cookie, teardown.binding_incarnation, false);
+            if (state->detach_pending) {
+                state->epoch_reset_pending = false;
+            }
+        }
+        // Hidden lanes have no VFS mount-table row.  They can be released as
+        // soon as the group table is unpublished and their waiters quiesce.
+        if (state != anchor) {
+            state->mount_released = true;
+        }
+        invalidate_all_dir_caches(state);
+        group.count++;
+    }
+}
+
+auto claim_vfs_proxy_unmount_by_path(const char* local_mount_path, PendingVfsProxyGroupTeardown& group) -> bool {
+    s_vfs_lock.lock();
+    ProxyVfsState* const anchor = find_vfs_proxy_by_mount(local_mount_path);
+    if (anchor == nullptr) {
         s_vfs_lock.unlock();
         return false;
     }
-    detach_remote = state->active || state->epoch_reset_pending;
-    deactivate_vfs_proxy_locked(state, teardown, true);
-    if (detach_remote) {
-        teardown.detach_staged = stage_vfs_detach_locked(state, teardown.owner_node, teardown.resource_id, teardown.binding_attach_cookie,
-                                                         teardown.binding_incarnation, false);
-        if (state->detach_pending) {
-            state->epoch_reset_pending = false;
-        }
-    }
-    invalidate_all_dir_caches(state);
+    claim_vfs_proxy_group_unmount_locked(anchor, group);
     s_vfs_lock.unlock();
     return true;
 }
 
 auto claim_vfs_proxy_unmount_by_generation(uint16_t owner_node, uint32_t resource_id, uint64_t resource_generation,
-                                           PendingProxyTeardown& teardown, bool& detach_remote) -> bool {
+                                           PendingVfsProxyGroupTeardown& group) -> bool {
     s_vfs_lock.lock();
-    ProxyVfsState* state = nullptr;
+    ProxyVfsState* anchor = nullptr;
     for (auto& proxy : g_vfs_proxies) {
-        if (proxy != nullptr && proxy->mount_configured && !proxy->destroy_when_idle && !proxy->mount_released &&
-            proxy->owner_node == owner_node && proxy->resource_id == resource_id && proxy->resource_generation == resource_generation) {
-            state = proxy.get();
-            break;
+        auto* state = proxy.get();
+        if (state == nullptr || !state->lane_anchor || !state->mount_configured || state->destroy_when_idle || state->mount_released ||
+            state->owner_node != owner_node || state->resource_id != resource_id || state->resource_generation != resource_generation) {
+            continue;
         }
+        anchor = state;
+        break;
     }
-    if (state == nullptr) {
+    if (anchor == nullptr) {
         s_vfs_lock.unlock();
         return false;
     }
-    detach_remote = state->active || state->epoch_reset_pending;
-    deactivate_vfs_proxy_locked(state, teardown, true);
-    if (detach_remote) {
-        teardown.detach_staged = stage_vfs_detach_locked(state, teardown.owner_node, teardown.resource_id, teardown.binding_attach_cookie,
-                                                         teardown.binding_incarnation, false);
-        if (state->detach_pending) {
-            state->epoch_reset_pending = false;
-        }
-    }
-    invalidate_all_dir_caches(state);
+    claim_vfs_proxy_group_unmount_locked(anchor, group);
     s_vfs_lock.unlock();
     return true;
 }
 
-void finish_vfs_proxy_unmount(const PendingProxyTeardown& teardown, bool detach_remote) {
+void finish_vfs_proxy_lane_teardown(const PendingProxyTeardown& teardown, bool detach_remote) {
     if (teardown.state == nullptr) {
         return;
     }
@@ -6265,21 +6513,45 @@ void finish_vfs_proxy_unmount(const PendingProxyTeardown& teardown, bool detach_
         if (teardown.detach_staged) {
             wki_deferred_work_notify();
         }
-
         static_cast<void>(wki_channel_close_generation(teardown.assigned_channel_ref, teardown.owner_node, teardown.assigned_channel,
                                                        teardown.assigned_channel_generation));
     }
+}
 
-    int const UNMOUNT_RET = ker::vfs::unmount_filesystem_by_private_data(static_cast<const void*>(teardown.state));
+void finish_vfs_proxy_group_unmount(const PendingVfsProxyGroupTeardown& group) {
+    if (group.anchor == nullptr || group.count == 0) {
+        return;
+    }
+
+    for (size_t i = 0; i < group.count; ++i) {
+        finish_vfs_proxy_lane_teardown(group.lanes.at(i), group.detach_remote.at(i));
+    }
+
+    int const UNMOUNT_RET = ker::vfs::unmount_filesystem_by_private_data(static_cast<const void*>(group.anchor));
     if (UNMOUNT_RET != 0 && UNMOUNT_RET != -ENOENT) {
-        ker::mod::dbg::log("[WKI] Exact remote VFS unmount failed: node=0x%04x res_id=%u path=%s ret=%d", teardown.owner_node,
-                           teardown.resource_id, teardown.local_mount_path.data(), UNMOUNT_RET);
+        ker::mod::dbg::log("[WKI] Exact remote VFS unmount failed: node=0x%04x res_id=%u path=%s ret=%d", group.anchor->owner_node,
+                           group.anchor->resource_id, group.anchor->local_mount_path.data(), UNMOUNT_RET);
     }
-    // Owner-only ENOENT proves no mount-table row still references this state.
+
+    for (size_t i = 0; i < group.count; ++i) {
+        auto* state = group.lanes.at(i).state;
+        if (state == nullptr || state == group.anchor) {
+            continue;
+        }
+        mark_vfs_proxy_mount_released_and_maybe_destroy(state);
+    }
+    // Owner-only ENOENT proves no mount-table row still references the anchor.
     if (UNMOUNT_RET == 0 || UNMOUNT_RET == -ENOENT) {
-        mark_vfs_proxy_mount_released_and_maybe_destroy(teardown.state);
+        mark_vfs_proxy_mount_released_and_maybe_destroy(group.anchor);
     }
-    release_vfs_proxy_lifecycle_ref(teardown.state);
+
+    for (size_t i = 0; i < group.count; ++i) {
+        auto* state = group.lanes.at(i).state;
+        if (state != nullptr && state != group.anchor) {
+            release_vfs_proxy_lifecycle_ref(state);
+        }
+    }
+    release_vfs_proxy_lifecycle_ref(group.anchor);
 }
 }  // namespace
 
@@ -6288,10 +6560,9 @@ void wki_remote_vfs_unmount(const char* local_mount_path) {
         return;
     }
 
-    PendingProxyTeardown teardown = {};
-    bool detach_remote = false;
-    if (claim_vfs_proxy_unmount_by_path(local_mount_path, teardown, detach_remote)) {
-        finish_vfs_proxy_unmount(teardown, detach_remote);
+    PendingVfsProxyGroupTeardown group = {};
+    if (claim_vfs_proxy_unmount_by_path(local_mount_path, group)) {
+        finish_vfs_proxy_group_unmount(group);
     }
 }
 
@@ -6301,12 +6572,11 @@ void wki_remote_vfs_unmount_resource_generation(uint16_t owner_node, uint32_t re
     }
 
     while (true) {
-        PendingProxyTeardown teardown = {};
-        bool detach_remote = false;
-        if (!claim_vfs_proxy_unmount_by_generation(owner_node, resource_id, resource_generation, teardown, detach_remote)) {
+        PendingVfsProxyGroupTeardown group = {};
+        if (!claim_vfs_proxy_unmount_by_generation(owner_node, resource_id, resource_generation, group)) {
             return;
         }
-        finish_vfs_proxy_unmount(teardown, detach_remote);
+        finish_vfs_proxy_group_unmount(group);
     }
 }
 
@@ -6318,7 +6588,7 @@ auto wki_remote_vfs_has_mount_for_resource_generation(uint16_t owner_node, uint3
     bool found = false;
     s_vfs_lock.lock();
     for (auto const& proxy : g_vfs_proxies) {
-        if (proxy != nullptr && proxy->active && proxy->mount_configured && proxy->owner_node == owner_node &&
+        if (proxy != nullptr && proxy->lane_anchor && proxy->active && proxy->mount_configured && proxy->owner_node == owner_node &&
             proxy->resource_id == resource_id && proxy->resource_generation == resource_generation) {
             found = true;
             break;
@@ -6336,7 +6606,7 @@ auto wki_remote_vfs_proxy_diag_snapshot(WkiRemoteVfsProxyDiag* out, size_t max) 
     size_t count = 0;
     s_vfs_lock.lock();
     for (const auto& proxy : g_vfs_proxies) {
-        if (proxy == nullptr || !proxy->active || count >= max) {
+        if (proxy == nullptr || !proxy->lane_anchor || !proxy->active || count >= max) {
             continue;
         }
 
@@ -6365,7 +6635,8 @@ auto wki_remote_vfs_find_mount_for_resource(uint16_t owner_node, uint32_t resour
 
     s_vfs_lock.lock();
     for (auto& proxy : g_vfs_proxies) {
-        if (!proxy->active || !proxy->mount_configured || proxy->owner_node != owner_node || proxy->resource_id != resource_id) {
+        if (!proxy->lane_anchor || !proxy->active || !proxy->mount_configured || proxy->owner_node != owner_node ||
+            proxy->resource_id != resource_id) {
             continue;
         }
 
@@ -6390,7 +6661,7 @@ auto wki_remote_vfs_find_resource_for_mount(uint16_t owner_node, const char* loc
 
     s_vfs_lock.lock();
     for (auto& proxy : g_vfs_proxies) {
-        if (!proxy->active || !proxy->mount_configured || proxy->owner_node != owner_node) {
+        if (!proxy->lane_anchor || !proxy->active || !proxy->mount_configured || proxy->owner_node != owner_node) {
             continue;
         }
         if (std::strncmp(proxy->local_mount_path.data(), local_mount_path, proxy->local_mount_path.size()) != 0) {
@@ -6407,10 +6678,15 @@ auto wki_remote_vfs_find_resource_for_mount(uint16_t owner_node, const char* loc
 }
 
 auto wki_remote_vfs_open_path(const char* fs_relative_path, int flags, int mode, void* mount_private_data) -> ker::vfs::File* {
-    auto* state = static_cast<ProxyVfsState*>(mount_private_data);
-    if (state == nullptr || fs_relative_path == nullptr) {
+    auto* anchor = static_cast<ProxyVfsState*>(mount_private_data);
+    if (anchor == nullptr || fs_relative_path == nullptr) {
         return nullptr;
     }
+    auto* state = acquire_vfs_proxy_lane(anchor);
+    if (state == nullptr) {
+        return nullptr;
+    }
+    ProxyLifecycleRefGuard lane_ref_guard(state);
     if (!acquire_vfs_proxy_open_ref(state)) {
         return nullptr;
     }
@@ -6556,8 +6832,9 @@ auto wki_remote_vfs_open_path(const char* fs_relative_path, int flags, int mode,
     return file;
 }
 
-auto wki_remote_vfs_stat(void* mount_private_data, const char* fs_relative_path, ker::vfs::Stat* statbuf) -> int {
-    auto* state = static_cast<ProxyVfsState*>(mount_private_data);
+namespace {
+
+auto remote_vfs_stat_on_proxy(ProxyVfsState* state, const char* fs_relative_path, ker::vfs::Stat* statbuf) -> int {
     if (state == nullptr || !state->active || fs_relative_path == nullptr || statbuf == nullptr) {
         return -EINVAL;
     }
@@ -6586,6 +6863,21 @@ auto wki_remote_vfs_stat(void* mount_private_data, const char* fs_relative_path,
         memcpy(statbuf, &kernel_buf, sizeof(ker::vfs::Stat));
     }
     return STATUS;
+}
+
+}  // namespace
+
+auto wki_remote_vfs_stat(void* mount_private_data, const char* fs_relative_path, ker::vfs::Stat* statbuf) -> int {
+    auto* anchor = static_cast<ProxyVfsState*>(mount_private_data);
+    if (anchor == nullptr || fs_relative_path == nullptr || statbuf == nullptr) {
+        return -EINVAL;
+    }
+    auto* state = acquire_vfs_proxy_lane(anchor);
+    if (state == nullptr) {
+        return -EINVAL;
+    }
+    ProxyLifecycleRefGuard lane_ref_guard(state);
+    return remote_vfs_stat_on_proxy(state, fs_relative_path, statbuf);
 }
 
 auto wki_remote_vfs_fstat(ker::vfs::File* file, ker::vfs::Stat* statbuf) -> int {
@@ -6618,7 +6910,7 @@ auto wki_remote_vfs_fstat(ker::vfs::File* file, ker::vfs::Stat* statbuf) -> int 
     }
 
     ker::vfs::Stat fresh = {};
-    int const STATUS = wki_remote_vfs_stat(mount->private_data, remote_vfs_strip_mount_prefix(mount, file->vfs_path), &fresh);
+    int const STATUS = remote_vfs_stat_on_proxy(ctx->proxy, remote_vfs_strip_mount_prefix(mount, file->vfs_path), &fresh);
     if (STATUS == 0) {
         fresh.st_dev = mount->dev_id;
         if (USE_STAT_CACHE) {
@@ -6630,8 +6922,16 @@ auto wki_remote_vfs_fstat(ker::vfs::File* file, ker::vfs::Stat* statbuf) -> int 
 }
 
 auto wki_remote_vfs_mkdir(void* mount_private_data, const char* fs_relative_path, int mode) -> int {
-    auto* state = static_cast<ProxyVfsState*>(mount_private_data);
-    if (state == nullptr || !state->active || fs_relative_path == nullptr) {
+    auto* anchor = static_cast<ProxyVfsState*>(mount_private_data);
+    if (anchor == nullptr || fs_relative_path == nullptr) {
+        return -EINVAL;
+    }
+    auto* state = acquire_vfs_proxy_lane(anchor);
+    if (state == nullptr) {
+        return -EINVAL;
+    }
+    ProxyLifecycleRefGuard lane_ref_guard(state);
+    if (!state->active) {
         return -EINVAL;
     }
 
@@ -6654,14 +6954,22 @@ auto wki_remote_vfs_mkdir(void* mount_private_data, const char* fs_relative_path
 
     int const STATUS = vfs_proxy_send_and_wait(state, OP_VFS_MKDIR, req_data, req_data_len, nullptr, 0);
     if (STATUS == 0) {
-        invalidate_readlink_cache(state);
+        invalidate_readlink_cache_group(state);
     }
     return STATUS;
 }
 
 auto wki_remote_vfs_chmod(void* mount_private_data, const char* fs_relative_path, int mode, bool follow_final_symlink) -> int {
-    auto* state = static_cast<ProxyVfsState*>(mount_private_data);
-    if (state == nullptr || !state->active || fs_relative_path == nullptr) {
+    auto* anchor = static_cast<ProxyVfsState*>(mount_private_data);
+    if (anchor == nullptr || fs_relative_path == nullptr) {
+        return -EINVAL;
+    }
+    auto* state = acquire_vfs_proxy_lane(anchor);
+    if (state == nullptr) {
+        return -EINVAL;
+    }
+    ProxyLifecycleRefGuard lane_ref_guard(state);
+    if (!state->active) {
         return -EINVAL;
     }
 
@@ -6689,8 +6997,16 @@ auto wki_remote_vfs_chmod(void* mount_private_data, const char* fs_relative_path
 
 // Consumer side: create a symlink on the remote server
 auto wki_remote_vfs_symlink(void* mount_private_data, const char* target, const char* fs_relative_path) -> int {
-    auto* state = static_cast<ProxyVfsState*>(mount_private_data);
-    if (state == nullptr || !state->active || target == nullptr || fs_relative_path == nullptr) {
+    auto* anchor = static_cast<ProxyVfsState*>(mount_private_data);
+    if (anchor == nullptr || target == nullptr || fs_relative_path == nullptr) {
+        return -EINVAL;
+    }
+    auto* state = acquire_vfs_proxy_lane(anchor);
+    if (state == nullptr) {
+        return -EINVAL;
+    }
+    ProxyLifecycleRefGuard lane_ref_guard(state);
+    if (!state->active) {
         return -EINVAL;
     }
 
@@ -6719,15 +7035,23 @@ auto wki_remote_vfs_symlink(void* mount_private_data, const char* target, const 
 
     int const STATUS = vfs_proxy_send_and_wait(state, OP_VFS_SYMLINK, req_data, req_data_len, nullptr, 0);
     if (STATUS == 0) {
-        invalidate_readlink_cache(state);
+        invalidate_readlink_cache_group(state);
     }
     return STATUS;
 }
 
 // Consumer side: unlink a file on the remote server
 auto wki_remote_vfs_unlink(void* mount_private_data, const char* fs_relative_path) -> int {
-    auto* state = static_cast<ProxyVfsState*>(mount_private_data);
-    if (state == nullptr || !state->active || fs_relative_path == nullptr) {
+    auto* anchor = static_cast<ProxyVfsState*>(mount_private_data);
+    if (anchor == nullptr || fs_relative_path == nullptr) {
+        return -EINVAL;
+    }
+    auto* state = acquire_vfs_proxy_lane(anchor);
+    if (state == nullptr) {
+        return -EINVAL;
+    }
+    ProxyLifecycleRefGuard lane_ref_guard(state);
+    if (!state->active) {
         return -EINVAL;
     }
 
@@ -6747,15 +7071,23 @@ auto wki_remote_vfs_unlink(void* mount_private_data, const char* fs_relative_pat
 
     int const STATUS = vfs_proxy_send_and_wait(state, OP_VFS_UNLINK, req_data, req_data_len, nullptr, 0);
     if (STATUS == 0) {
-        invalidate_readlink_cache(state);
+        invalidate_readlink_cache_group(state);
     }
     return STATUS;
 }
 
 // Consumer side: remove a directory on the remote server
 auto wki_remote_vfs_rmdir(void* mount_private_data, const char* fs_relative_path) -> int {
-    auto* state = static_cast<ProxyVfsState*>(mount_private_data);
-    if (state == nullptr || !state->active || fs_relative_path == nullptr) {
+    auto* anchor = static_cast<ProxyVfsState*>(mount_private_data);
+    if (anchor == nullptr || fs_relative_path == nullptr) {
+        return -EINVAL;
+    }
+    auto* state = acquire_vfs_proxy_lane(anchor);
+    if (state == nullptr) {
+        return -EINVAL;
+    }
+    ProxyLifecycleRefGuard lane_ref_guard(state);
+    if (!state->active) {
         return -EINVAL;
     }
 
@@ -6775,15 +7107,23 @@ auto wki_remote_vfs_rmdir(void* mount_private_data, const char* fs_relative_path
 
     int const STATUS = vfs_proxy_send_and_wait(state, OP_VFS_RMDIR, req_data, req_data_len, nullptr, 0);
     if (STATUS == 0) {
-        invalidate_readlink_cache(state);
+        invalidate_readlink_cache_group(state);
     }
     return STATUS;
 }
 
 // Consumer side: rename a file/directory on the remote server
 auto wki_remote_vfs_rename(void* mount_private_data, const char* old_fs_path, const char* new_fs_path) -> int {
-    auto* state = static_cast<ProxyVfsState*>(mount_private_data);
-    if (state == nullptr || !state->active || old_fs_path == nullptr || new_fs_path == nullptr) {
+    auto* anchor = static_cast<ProxyVfsState*>(mount_private_data);
+    if (anchor == nullptr || old_fs_path == nullptr || new_fs_path == nullptr) {
+        return -EINVAL;
+    }
+    auto* state = acquire_vfs_proxy_lane(anchor);
+    if (state == nullptr) {
+        return -EINVAL;
+    }
+    ProxyLifecycleRefGuard lane_ref_guard(state);
+    if (!state->active) {
         return -EINVAL;
     }
 
@@ -6809,15 +7149,23 @@ auto wki_remote_vfs_rename(void* mount_private_data, const char* old_fs_path, co
 
     int const STATUS = vfs_proxy_send_and_wait(state, OP_VFS_RENAME, req_data, req_data_len, nullptr, 0);
     if (STATUS == 0) {
-        invalidate_readlink_cache(state);
+        invalidate_readlink_cache_group(state);
     }
     return STATUS;
 }
 
 // Consumer side: readlink on a remote path (for vfs_readlink / resolve_symlinks)
 auto wki_remote_vfs_readlink_path(void* mount_private_data, const char* fs_relative_path, char* buf, size_t bufsize) -> ssize_t {
-    auto* state = static_cast<ProxyVfsState*>(mount_private_data);
-    if (state == nullptr || !state->active || fs_relative_path == nullptr || buf == nullptr || bufsize == 0) {
+    auto* anchor = static_cast<ProxyVfsState*>(mount_private_data);
+    if (anchor == nullptr || fs_relative_path == nullptr || buf == nullptr || bufsize == 0) {
+        return -EINVAL;
+    }
+    auto* state = acquire_vfs_proxy_lane(anchor);
+    if (state == nullptr) {
+        return -EINVAL;
+    }
+    ProxyLifecycleRefGuard lane_ref_guard(state);
+    if (!state->active) {
         return -EINVAL;
     }
 
@@ -7015,7 +7363,7 @@ void handle_vfs_invalidate_notify(const WkiHeader* hdr, const uint8_t* payload, 
     s_vfs_lock.lock();
     invalidate_all_dir_caches(state);
     s_vfs_lock.unlock();
-    invalidate_readlink_cache(state);
+    invalidate_readlink_cache_group(state);
     release_vfs_proxy_lifecycle_ref(state);
 }
 
@@ -7617,6 +7965,8 @@ void wki_remote_vfs_mark_epoch_reset(uint16_t node_id) {
             continue;
         }
 
+        mark_vfs_proxy_group_unavailable_locked(state);
+
         // This phase runs from HELLO RX and therefore cannot allocate, close
         // files, or quiesce waiters. Stop new ID-based operations before pool
         // slots are reusable; task-context cleanup consumes the marker.
@@ -7659,6 +8009,7 @@ void wki_remote_vfs_cleanup_for_peer(uint16_t node_id, bool owner_reboot_proven)
             continue;
         }
 
+        mark_vfs_proxy_group_unavailable_locked(p);
         PendingProxyTeardown cleanup = {};
         deactivate_vfs_proxy_locked(p, cleanup, false);
         // Deactivation is followed by withdrawal/unmount, which can erase the

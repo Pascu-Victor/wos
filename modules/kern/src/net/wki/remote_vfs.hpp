@@ -24,6 +24,10 @@ constexpr size_t VFS_EXPORT_NAME_LEN = 64;
 constexpr size_t VFS_READLINK_CACHE_ENTRIES = 128;
 constexpr size_t VFS_READLINK_CACHE_TEXT_MAX = 512;
 constexpr size_t VFS_PROXY_SLOT_WAITER_CAPACITY = 64;
+// A mount keeps a small fixed set of independent stop-and-wait bindings.  The
+// bound makes the extra memory, channels, and server worker admission explicit
+// while allowing unrelated tasks to avoid one mount-wide RPC queue.
+constexpr size_t VFS_PROXY_LANE_COUNT = 4;
 
 // Bounce buffer sizes for RDMA-backed VFS I/O.
 constexpr uint32_t VFS_RDMA_BOUNCE_SIZE = 65536;
@@ -86,6 +90,15 @@ struct ProxyVfsState {
 
     bool active = false;
     bool epoch_reset_pending = false;
+    // One public remote mount is represented by an anchor (lane zero) plus a
+    // bounded set of hidden bindings.  These fields are protected by
+    // s_vfs_lock.  Only the anchor owns the VFS mount row.
+    uint64_t mount_group_id = 0;
+    uint8_t lane_index = 0;
+    bool lane_anchor = false;
+    std::array<ProxyVfsState*, VFS_PROXY_LANE_COUNT> lanes = {};
+    uint8_t lane_count = 0;
+    bool lanes_ready = false;
     uint16_t owner_node = WKI_NODE_INVALID;
     uint16_t assigned_channel = 0;
     WkiChannel* assigned_channel_ref = nullptr;
