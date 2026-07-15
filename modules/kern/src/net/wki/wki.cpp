@@ -1078,7 +1078,7 @@ void wki_init() {
     g_wki.transports = nullptr;
     g_wki.transport_count = 0;
     g_wki.my_lsa_seq = 0;
-    g_wki.capabilities = WKI_CAP_RESOURCE_INCARNATION;
+    g_wki.capabilities = WKI_CAP_RESOURCE_INCARNATION | WKI_CAP_VFS_MULTI_RDMA_LANES;
     g_wki.initialized = true;
 
     // Init routing subsystem (LSDB, routing table)
@@ -1139,6 +1139,14 @@ void wki_init() {
     ker::vfs::devfs::devfs_nodes_add_peer(local_hostname_data(), g_wki.my_node_id);
 
     ker::mod::dbg::log("[WKI] Initialized, node_id=0x%04x hostname='%s'", g_wki.my_node_id, local_hostname_data());
+}
+
+auto wki_peer_capability_negotiated(uint16_t peer_node, uint16_t capabilities) -> bool {
+    if (capabilities == 0 || (g_wki.capabilities & capabilities) != capabilities) {
+        return false;
+    }
+    WkiPeer const* peer = wki_peer_find(peer_node);
+    return peer != nullptr && (peer->capabilities & capabilities) == capabilities;
 }
 
 void wki_shutdown() {

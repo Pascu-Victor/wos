@@ -853,6 +853,20 @@ void mark_vfs_proxy_group_unavailable_locked(ProxyVfsState* state) {
 // retired and erased after the registry lock drops, while its anchor mount is
 // still alive, so callers must release the reference after their operation (or
 // after transferring to an open-file reference).
+auto remote_vfs_rdma_retry_ready(const std::atomic<uint64_t>& retry_after_us, uint64_t now_us) -> bool;
+
+auto vfs_proxy_lane_has_requested_rdma(const ProxyVfsState* candidate, bool require_read, bool require_write, uint64_t now_us) -> bool {
+    if (candidate == nullptr) {
+        return false;
+    }
+    bool const HAS_READ_RDMA = (candidate->rdma_capable && !candidate->rdma_read_disabled.load(std::memory_order_acquire) &&
+                                remote_vfs_rdma_retry_ready(candidate->rdma_read_retry_after_us, now_us)) ||
+                               (candidate->bulk_rdma_capable && !candidate->bulk_rdma_disabled.load(std::memory_order_acquire) &&
+                                remote_vfs_rdma_retry_ready(candidate->bulk_rdma_retry_after_us, now_us));
+    bool const HAS_WRITE_RDMA = transport_supports_vfs_write_push_rdma(candidate->rdma_transport) && candidate->rdma_server_write_rkey != 0;
+    return (!require_read || HAS_READ_RDMA) && (!require_write || HAS_WRITE_RDMA);
+}
+
 auto acquire_vfs_proxy_lane(ProxyVfsState* anchor, bool prefer_rdma_read_anchor = false, bool prefer_rdma_write_anchor = false)
     -> ProxyVfsState* {
     if (anchor == nullptr) {
@@ -866,25 +880,44 @@ auto acquire_vfs_proxy_lane(ProxyVfsState* anchor, bool prefer_rdma_read_anchor 
     // make selection wait for the post-insert mount bookkeeping bit.
     if (anchor->lane_anchor && anchor->lanes_ready && anchor->active && !anchor->destroy_when_idle && !anchor->resources_releasing &&
         !anchor->resources_released && anchor->lane_count > 0 && anchor->lane_count <= anchor->lanes.size()) {
-        // Lane zero owns the mount group's registered data regions.  Keep the
-        // capability check inside the same lifetime boundary as selection.
-        bool const ANCHOR_HAS_READ_RDMA = (anchor->rdma_capable && !anchor->rdma_read_disabled.load(std::memory_order_acquire)) ||
-                                          (anchor->bulk_rdma_capable && !anchor->bulk_rdma_disabled.load(std::memory_order_acquire));
-        bool const ANCHOR_HAS_WRITE_RDMA =
-            transport_supports_vfs_write_push_rdma(anchor->rdma_transport) && anchor->rdma_server_write_rkey != 0;
-        bool const ANCHOR_HAS_REQUESTED_RDMA =
-            (prefer_rdma_read_anchor && ANCHOR_HAS_READ_RDMA) || (prefer_rdma_write_anchor && ANCHOR_HAS_WRITE_RDMA);
-        uint64_t const PID = perf_current_pid();
-        size_t lane_index = 0;
-        if (!ANCHOR_HAS_REQUESTED_RDMA && PID != 0) {
-            lane_index = static_cast<size_t>(PID % anchor->lane_count);
+        std::array<ProxyVfsState*, VFS_PROXY_LANE_COUNT> live_lanes{};
+        std::array<ProxyVfsState*, VFS_PROXY_RDMA_LANE_COUNT> rdma_lanes{};
+        size_t live_lane_count = 0;
+        size_t rdma_lane_count = 0;
+        bool const PREFER_RDMA = prefer_rdma_read_anchor || prefer_rdma_write_anchor;
+        uint64_t const NOW_US = PREFER_RDMA ? wki_now_us() : 0;
+
+        // Inspect data capability inside the same lifetime boundary as lane
+        // selection. O_RDWR requires both directions; a partial registration
+        // remains eligible only for the direction it can actually service.
+        for (size_t lane_index = 0; lane_index < anchor->lane_count; ++lane_index) {
+            auto* candidate = anchor->lanes.at(lane_index);
+            if (candidate == nullptr || !candidate->active || candidate->destroy_when_idle || candidate->resources_releasing ||
+                candidate->resources_released || candidate->mount_group_id != anchor->mount_group_id ||
+                candidate->lane_index != lane_index) {
+                continue;
+            }
+            live_lanes.at(live_lane_count++) = candidate;
+
+            bool const HAS_REQUESTED_RDMA =
+                PREFER_RDMA && vfs_proxy_lane_has_requested_rdma(candidate, prefer_rdma_read_anchor, prefer_rdma_write_anchor, NOW_US);
+            if (PREFER_RDMA && HAS_REQUESTED_RDMA && rdma_lane_count < rdma_lanes.size()) {
+                rdma_lanes.at(rdma_lane_count++) = candidate;
+            }
         }
-        size_t const LANE_INDEX = lane_index;
-        auto* candidate = anchor->lanes.at(LANE_INDEX);
-        if (candidate != nullptr && candidate->active && !candidate->destroy_when_idle && !candidate->resources_releasing &&
-            !candidate->resources_released && candidate->mount_group_id == anchor->mount_group_id && candidate->lane_index == LANE_INDEX) {
-            candidate->lifecycle_refs++;
-            selected = candidate;
+
+        uint64_t const PID = perf_current_pid();
+        if (PREFER_RDMA && rdma_lane_count > 0) {
+            size_t const INDEX = PID != 0 ? static_cast<size_t>(PID % rdma_lane_count) : 0;
+            selected = rdma_lanes.at(INDEX);
+        } else if (live_lane_count > 0) {
+            // Allocation failure and transport cooldown preserve a usable,
+            // task-striped message path instead of failing the open.
+            size_t const INDEX = PID != 0 ? static_cast<size_t>(PID % live_lane_count) : 0;
+            selected = live_lanes.at(INDEX);
+        }
+        if (selected != nullptr) {
+            selected->lifecycle_refs++;
         }
     }
     s_vfs_lock.unlock();
@@ -3958,6 +3991,73 @@ void wki_remote_vfs_cleanup_for_task(uint64_t pid) {
 auto wki_remote_vfs_fsync(ker::vfs::File* file) -> int { return remote_vfs_fsync_file(file); }
 
 #ifdef WOS_SELFTEST
+auto wki_remote_vfs_selftest_multi_rdma_lane_selection() -> bool {
+    WkiTransport transport{};
+    transport.name = "wki-roce";
+
+    ProxyVfsState anchor{};
+    ProxyVfsState auxiliary{};
+    anchor.active = true;
+    anchor.lane_anchor = true;
+    anchor.lanes_ready = true;
+    anchor.mount_group_id = 1;
+    anchor.lane_index = 0;
+    anchor.lanes.at(0) = &anchor;
+    anchor.lanes.at(1) = &auxiliary;
+    anchor.lane_count = 2;
+    auxiliary.active = true;
+    auxiliary.mount_group_id = 1;
+    auxiliary.lane_index = 1;
+
+    anchor.rdma_transport = &transport;
+    anchor.rdma_capable = true;
+    anchor.rdma_server_write_rkey = 1;
+    auxiliary.rdma_transport = &transport;
+    auxiliary.rdma_capable = true;
+    auxiliary.rdma_server_write_rkey = 0;
+
+    // O_RDWR cannot select a read-only partial registration.
+    ProxyVfsState* selected = acquire_vfs_proxy_lane(&anchor, true, true);
+    if (selected != &anchor || anchor.lifecycle_refs != 1 || auxiliary.lifecycle_refs != 0) {
+        return false;
+    }
+
+    // Make only the auxiliary lane fully capable: selection must no longer
+    // collapse onto the logical mount anchor.
+    anchor.rdma_server_write_rkey = 0;
+    auxiliary.rdma_server_write_rkey = 2;
+    selected = acquire_vfs_proxy_lane(&anchor, true, true);
+    if (selected != &auxiliary || auxiliary.lifecycle_refs != 1) {
+        return false;
+    }
+
+    // A lane in transient read-side cooldown is excluded while another
+    // capable lane is available.
+    auxiliary.rdma_read_retry_after_us.store(UINT64_MAX, std::memory_order_release);
+    selected = acquire_vfs_proxy_lane(&anchor, true, false);
+    if (selected != &anchor || anchor.lifecycle_refs != 2) {
+        return false;
+    }
+
+    // Once only the auxiliary cooldown has elapsed, it becomes eligible
+    // again. Complete RDMA cooldown then falls back to a live message lane.
+    auxiliary.rdma_read_retry_after_us.store(0, std::memory_order_release);
+    anchor.rdma_read_retry_after_us.store(UINT64_MAX, std::memory_order_release);
+    selected = acquire_vfs_proxy_lane(&anchor, true, false);
+    if (selected != &auxiliary || auxiliary.lifecycle_refs != 2) {
+        return false;
+    }
+    auxiliary.rdma_read_retry_after_us.store(UINT64_MAX, std::memory_order_release);
+    selected = acquire_vfs_proxy_lane(&anchor, true, false);
+    if (selected == nullptr || (selected != &anchor && selected != &auxiliary)) {
+        return false;
+    }
+
+    ProxyVfsState* const METADATA_LANE = acquire_vfs_proxy_lane(&anchor);
+    return METADATA_LANE != nullptr && (METADATA_LANE == &anchor || METADATA_LANE == &auxiliary) &&
+           anchor.lifecycle_refs + auxiliary.lifecycle_refs == 6;
+}
+
 auto wki_remote_vfs_selftest_slot_waiter_fifo() -> bool {
     ProxyVfsState state{};
     state.active = true;
@@ -6069,13 +6169,9 @@ auto mount_vfs_proxy_lane(uint16_t owner_node, uint32_t resource_id, const char*
     attach_req.target_node = owner_node;
     attach_req.resource_type = static_cast<uint16_t>(ResourceType::VFS);
     attach_req.resource_id = resource_id;
-    attach_req.attach_mode = static_cast<uint8_t>(AttachMode::PROXY);
-    if (!lane_anchor) {
-        // Auxiliary lanes preserve independent RPC serialization but use the
-        // established message fallback instead of duplicating RDMA staging
-        // buffers on both peers.
-        attach_req.attach_mode |= DEV_ATTACH_DISABLE_RDMA;
-    }
+    bool const MULTI_RDMA_LANES = wki_peer_capability_negotiated(owner_node, WKI_CAP_VFS_MULTI_RDMA_LANES);
+    bool const RDMA_LANE = lane_anchor || (MULTI_RDMA_LANES && lane_index < VFS_PROXY_RDMA_LANE_COUNT);
+    attach_req.attach_mode = wki_vfs_proxy_attach_mode(lane_anchor, RDMA_LANE);
     attach_req.attach_cookie = attach_cookie;
 
     WkiChannelIdentity reserved_channel_identity{};
@@ -6215,7 +6311,7 @@ auto mount_vfs_proxy_lane(uint16_t owner_node, uint32_t resource_id, const char*
     // bulk capabilities independently. Remote-root reads must not depend on the
     // server also having a write-receive buffer.
     WkiPeer const* peer = wki_peer_find(owner_node);
-    if (lane_anchor && peer != nullptr && peer->rdma_transport != nullptr && peer->rdma_transport->rdma_register_region != nullptr) {
+    if (RDMA_LANE && peer != nullptr && peer->rdma_transport != nullptr && peer->rdma_transport->rdma_register_region != nullptr) {
         state->rdma_transport = peer->rdma_transport;
 
         bool const NEED_READ_BOUNCE =

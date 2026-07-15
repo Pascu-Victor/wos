@@ -1727,10 +1727,11 @@ void handle_dev_attach_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
         binding.attach_cookie = req->attach_cookie;
         binding.vfs_export_dev_id = exp.backing_dev_id;
         binding.vfs_export_publication_revision = exp.publication_revision;
-        // The current consumer sets DISABLE_RDMA only on auxiliary mount
-        // lanes, so this bit also classifies the notification anchor. A future
-        // no-RDMA anchor needs an explicit lane marker instead of setting it.
-        binding.vfs_lane_anchor = (req->attach_mode & DEV_ATTACH_DISABLE_RDMA) == 0;
+        bool const MULTI_RDMA_LANES = wki_peer_capability_negotiated(hdr->src_node, WKI_CAP_VFS_MULTI_RDMA_LANES);
+        // New peers classify logical notification ownership independently of
+        // RDMA staging. Legacy peers retain the established DISABLE_RDMA
+        // inference, so mixed-version attachments still have one anchor.
+        binding.vfs_lane_anchor = wki_vfs_attach_lane_is_anchor(req->attach_mode, MULTI_RDMA_LANES);
         memcpy(static_cast<void*>(binding.vfs_export_path), static_cast<const void*>(exp.export_path),
                std::min(sizeof(binding.vfs_export_path), sizeof(exp.export_path)));
         memcpy(static_cast<void*>(binding.vfs_export_name), static_cast<const void*>(exp.name),
@@ -1739,9 +1740,8 @@ void handle_dev_attach_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
         binding.vfs_export_name[sizeof(binding.vfs_export_name) - 1] = '\0';
 
         // RDMA-backed VFS I/O: pre-register server-side buffers for the
-        // anchor lane. Auxiliary lanes retain their dedicated RPC channel but
-        // deliberately use the message fallback to avoid multiplying staging
-        // memory on both peers.
+        // bounded set of data lanes. Logical notification-anchor identity is
+        // carried independently above.
         // rdma_register_region is a local-only operation - safe to call in NAPI context.
         if ((req->attach_mode & DEV_ATTACH_DISABLE_RDMA) == 0) {
             WkiPeer const* peer = wki_peer_find(hdr->src_node);

@@ -68,3 +68,7 @@ KTEST(WkiRemoteVfsWriteBehind, GrowthPreservesPendingData) { KEXPECT_TRUE(ker::n
 KTEST(WkiRemoteVfsReadlinkCache, GenerationInvalidationAndWrap) {
     KEXPECT_TRUE(ker::net::wki::wki_remote_vfs_selftest_readlink_cache_generation_invalidation());
 }
+
+KTEST(WkiRemoteVfsLanes, MultiRdmaSelectionRequiresRequestedDirections) {
+    KEXPECT_TRUE(ker::net::wki::wki_remote_vfs_selftest_multi_rdma_lane_selection());
+}

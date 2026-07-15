@@ -167,6 +167,10 @@ inline auto wki_ack_reserved(uint16_t channel_id) -> uint32_t { return static_ca
 constexpr uint16_t WKI_CAP_RDMA_SUPPORT = 0x0001;
 constexpr uint16_t WKI_CAP_ZONE_SUPPORT = 0x0002;
 constexpr uint16_t WKI_CAP_RESOURCE_INCARNATION = 0x0004;
+// Both peers understand explicit auxiliary VFS-lane identity and may reserve
+// RDMA staging for more than the mount anchor without creating extra logical
+// invalidation anchors.
+constexpr uint16_t WKI_CAP_VFS_MULTI_RDMA_LANES = 0x0008;
 
 // Hostname constants
 constexpr size_t WKI_HOSTNAME_MAX = 64;  // Matches Linux HOST_NAME_MAX (including NUL)
@@ -560,6 +564,27 @@ constexpr uint8_t DEV_ATTACH_ACCESS_MASK = DEV_ATTACH_ACCESS_READ | DEV_ATTACH_A
 // payload layout and leaves the request usable by older peers, which simply
 // ignore unknown high bits.
 constexpr uint8_t DEV_ATTACH_DISABLE_RDMA = 0x40;
+// Capability-gated auxiliary VFS-lane identity. Older peers ignore this high
+// bit and continue to infer the anchor from DEV_ATTACH_DISABLE_RDMA.
+constexpr uint8_t DEV_ATTACH_VFS_AUX_LANE = 0x80;
+
+constexpr auto wki_vfs_proxy_attach_mode(bool lane_anchor, bool request_rdma) -> uint8_t {
+    uint8_t mode = static_cast<uint8_t>(AttachMode::PROXY);
+    if (!lane_anchor) {
+        mode |= DEV_ATTACH_VFS_AUX_LANE;
+    }
+    if (!request_rdma) {
+        mode |= DEV_ATTACH_DISABLE_RDMA;
+    }
+    return mode;
+}
+
+constexpr auto wki_vfs_attach_lane_is_anchor(uint8_t mode, bool explicit_aux_lane_negotiated) -> bool {
+    if (explicit_aux_lane_negotiated) {
+        return (mode & DEV_ATTACH_VFS_AUX_LANE) == 0;
+    }
+    return (mode & DEV_ATTACH_DISABLE_RDMA) == 0;
+}
 
 constexpr auto dev_attach_mode_kind(uint8_t mode) -> AttachMode { return static_cast<AttachMode>(mode & DEV_ATTACH_MODE_KIND_MASK); }
 

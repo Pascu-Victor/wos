@@ -493,6 +493,10 @@ auto wki_peer_alloc(uint16_t node_id) -> WkiPeer*;
 // Get the peer count
 auto wki_peer_count() -> uint16_t;
 
+// True only when both this node and the connected peer advertise every bit in
+// the requested capability mask.
+auto wki_peer_capability_negotiated(uint16_t peer_node, uint16_t capabilities) -> bool;
+
 // Serialize peer/channel teardown with deferred work that is about to become
 // externally visible. The blocking form is task-context only.
 auto wki_peer_lifecycle_try_acquire(WkiPeer* peer) -> bool;

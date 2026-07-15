@@ -22,6 +22,29 @@ TEST(WkiWire, HeartbeatPayloadIs16Bytes) { EXPECT_EQ(sizeof(HeartbeatPayload), 1
 
 TEST(WkiWire, PeerGoodbyePayloadIs8Bytes) { EXPECT_EQ(sizeof(PeerGoodbyePayload), 8u); }
 
+TEST(WkiWire, VfsMultiRdmaCapabilityAndAuxFlagPreserveLayouts) {
+    EXPECT_EQ(WKI_CAP_VFS_MULTI_RDMA_LANES, 0x0008u);
+    EXPECT_EQ(DEV_ATTACH_VFS_AUX_LANE, 0x80u);
+    EXPECT_EQ(DEV_ATTACH_VFS_AUX_LANE & (DEV_ATTACH_MODE_KIND_MASK | DEV_ATTACH_ACCESS_MASK | DEV_ATTACH_DISABLE_RDMA), 0);
+    EXPECT_EQ(sizeof(HelloPayload), 96u);
+    EXPECT_EQ(sizeof(DevAttachReqPayload), 12u);
+
+    uint8_t const ANCHOR_RDMA = wki_vfs_proxy_attach_mode(true, true);
+    uint8_t const AUX_RDMA = wki_vfs_proxy_attach_mode(false, true);
+    uint8_t const AUX_MESSAGE = wki_vfs_proxy_attach_mode(false, false);
+    EXPECT_EQ(ANCHOR_RDMA, static_cast<uint8_t>(AttachMode::PROXY));
+    EXPECT_EQ(AUX_RDMA, static_cast<uint8_t>(static_cast<uint8_t>(AttachMode::PROXY) | DEV_ATTACH_VFS_AUX_LANE));
+    EXPECT_EQ(AUX_MESSAGE,
+              static_cast<uint8_t>(static_cast<uint8_t>(AttachMode::PROXY) | DEV_ATTACH_VFS_AUX_LANE | DEV_ATTACH_DISABLE_RDMA));
+
+    EXPECT_TRUE(wki_vfs_attach_lane_is_anchor(ANCHOR_RDMA, true));
+    EXPECT_FALSE(wki_vfs_attach_lane_is_anchor(AUX_RDMA, true));
+    EXPECT_FALSE(wki_vfs_attach_lane_is_anchor(AUX_MESSAGE, true));
+    EXPECT_TRUE(wki_vfs_attach_lane_is_anchor(ANCHOR_RDMA, false));
+    EXPECT_TRUE(wki_vfs_attach_lane_is_anchor(AUX_RDMA, false));
+    EXPECT_FALSE(wki_vfs_attach_lane_is_anchor(AUX_MESSAGE, false));
+}
+
 // ---------------------------------------------------------------------------
 // Version/flags byte helpers
 // ---------------------------------------------------------------------------

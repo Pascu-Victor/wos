@@ -3,6 +3,33 @@
 #include <net/wki/wire.hpp>
 #include <test/ktest.hpp>
 
+KTEST(WkiWire, VfsMultiRdmaCapabilityAndAuxFlagPreserveLayouts) {
+    using namespace ker::net::wki;
+
+    KEXPECT_EQ(WKI_CAP_VFS_MULTI_RDMA_LANES, static_cast<uint16_t>(0x0008));
+    KEXPECT_EQ(DEV_ATTACH_VFS_AUX_LANE, static_cast<uint8_t>(0x80));
+    KEXPECT_EQ(
+        static_cast<uint8_t>(DEV_ATTACH_VFS_AUX_LANE & (DEV_ATTACH_MODE_KIND_MASK | DEV_ATTACH_ACCESS_MASK | DEV_ATTACH_DISABLE_RDMA)),
+        static_cast<uint8_t>(0));
+    KEXPECT_EQ(sizeof(HelloPayload), static_cast<size_t>(96));
+    KEXPECT_EQ(sizeof(DevAttachReqPayload), static_cast<size_t>(12));
+
+    uint8_t const ANCHOR_RDMA = wki_vfs_proxy_attach_mode(true, true);
+    uint8_t const AUX_RDMA = wki_vfs_proxy_attach_mode(false, true);
+    uint8_t const AUX_MESSAGE = wki_vfs_proxy_attach_mode(false, false);
+    KEXPECT_EQ(ANCHOR_RDMA, static_cast<uint8_t>(AttachMode::PROXY));
+    KEXPECT_EQ(AUX_RDMA, static_cast<uint8_t>(static_cast<uint8_t>(AttachMode::PROXY) | DEV_ATTACH_VFS_AUX_LANE));
+    KEXPECT_EQ(AUX_MESSAGE,
+               static_cast<uint8_t>(static_cast<uint8_t>(AttachMode::PROXY) | DEV_ATTACH_VFS_AUX_LANE | DEV_ATTACH_DISABLE_RDMA));
+
+    KEXPECT_TRUE(wki_vfs_attach_lane_is_anchor(ANCHOR_RDMA, true));
+    KEXPECT_FALSE(wki_vfs_attach_lane_is_anchor(AUX_RDMA, true));
+    KEXPECT_FALSE(wki_vfs_attach_lane_is_anchor(AUX_MESSAGE, true));
+    KEXPECT_TRUE(wki_vfs_attach_lane_is_anchor(ANCHOR_RDMA, false));
+    KEXPECT_TRUE(wki_vfs_attach_lane_is_anchor(AUX_RDMA, false));
+    KEXPECT_FALSE(wki_vfs_attach_lane_is_anchor(AUX_MESSAGE, false));
+}
+
 KTEST(WkiWire, DevDetachMatchesBindingIdentity) {
     ker::net::wki::DevDetachPayload detach = {};
     detach.target_node = 0x1001;

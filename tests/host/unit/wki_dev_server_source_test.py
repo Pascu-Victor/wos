@@ -185,8 +185,12 @@ def test_vfs_notify_coalesces_by_mount_anchor_with_conservative_fallback() -> No
     missing = [token for token in header_tokens if token not in header]
     if missing:
         fail("VFS binding anchor identity must survive binding moves: " + ", ".join(missing))
-    if "binding.vfs_lane_anchor = (req->attach_mode & DEV_ATTACH_DISABLE_RDMA) == 0;" not in attach:
-        fail("VFS attach must mark exactly the RDMA-capable mount lane as its server-side anchor")
+    require_order(
+        attach,
+        "wki_peer_capability_negotiated(hdr->src_node, WKI_CAP_VFS_MULTI_RDMA_LANES)",
+        "binding.vfs_lane_anchor = wki_vfs_attach_lane_is_anchor(req->attach_mode, MULTI_RDMA_LANES)",
+        "VFS attach classifies the logical notification anchor through negotiated wire semantics",
+    )
 
     required = [
         "uint16_t consumer_node",
@@ -1110,7 +1114,7 @@ def test_detach_admission_has_ktest_coverage() -> None:
             fail(f"detach admission KTEST coverage is missing {token!r}")
 
 
-def test_vfs_auxiliary_attach_disables_rdma_and_teardown_unregisters_regions() -> None:
+def test_vfs_two_lane_rdma_keeps_anchor_identity_independent_and_tears_down_regions() -> None:
     source = DEV_SERVER_CPP.read_text()
     header = DEV_SERVER_HPP.read_text()
     wire = WIRE_HPP.read_text()
@@ -1118,11 +1122,16 @@ def test_vfs_auxiliary_attach_disables_rdma_and_teardown_unregisters_regions() -
     release = function_body(source, "release_vfs_rdma_buffers")
 
     for token in [
+        "constexpr uint16_t WKI_CAP_VFS_MULTI_RDMA_LANES = 0x0008;",
         "constexpr uint8_t DEV_ATTACH_DISABLE_RDMA = 0x40;",
+        "constexpr uint8_t DEV_ATTACH_VFS_AUX_LANE = 0x80;",
+        "auto wki_vfs_proxy_attach_mode(",
+        "auto wki_vfs_attach_lane_is_anchor(",
         "static_assert(sizeof(DevAttachReqPayload) == 12",
+        "static_assert(sizeof(HelloPayload) == 96",
     ]:
         if token not in wire:
-            fail(f"VFS auxiliary RDMA opt-out must preserve the attach ABI: missing {token!r}")
+            fail(f"VFS two-lane RDMA must preserve the attach ABI: missing {token!r}")
     for token in [
         "WkiTransport* vfs_rdma_transport = nullptr;",
         "vfs_rdma_transport(o.vfs_rdma_transport)",
@@ -1130,6 +1139,18 @@ def test_vfs_auxiliary_attach_disables_rdma_and_teardown_unregisters_regions() -
     ]:
         if token not in header:
             fail(f"VFS binding must retain the provider that owns every registered region: missing {token!r}")
+    require_order(
+        attach,
+        "wki_peer_capability_negotiated(hdr->src_node, WKI_CAP_VFS_MULTI_RDMA_LANES)",
+        "binding.vfs_lane_anchor = wki_vfs_attach_lane_is_anchor(req->attach_mode, MULTI_RDMA_LANES)",
+        "explicit auxiliary identity is interpreted only after capability negotiation",
+    )
+    require_order(
+        attach,
+        "binding.vfs_lane_anchor = wki_vfs_attach_lane_is_anchor(req->attach_mode, MULTI_RDMA_LANES)",
+        "if ((req->attach_mode & DEV_ATTACH_DISABLE_RDMA) == 0)",
+        "notification-anchor identity is independent from RDMA buffer allocation",
+    )
     require_order(
         attach,
         "if ((req->attach_mode & DEV_ATTACH_DISABLE_RDMA) == 0)",
@@ -1225,7 +1246,7 @@ def main() -> None:
     test_epoch_cleanup_and_deferred_vfs_are_channel_generation_fenced()
     test_attach_ack_failure_defers_exact_cleanup_outside_rx()
     test_detach_admission_has_ktest_coverage()
-    test_vfs_auxiliary_attach_disables_rdma_and_teardown_unregisters_regions()
+    test_vfs_two_lane_rdma_keeps_anchor_identity_independent_and_tears_down_regions()
     print("WKI dev server source invariants hold")
 
 

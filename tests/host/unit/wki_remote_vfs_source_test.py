@@ -15,6 +15,8 @@ VFS_CORE_CPP = ROOT / "modules" / "kern" / "src" / "vfs" / "core.cpp"
 VFS_HPP = ROOT / "modules" / "kern" / "src" / "vfs" / "vfs.hpp"
 VFS_KTEST = ROOT / "modules" / "kern" / "src" / "test" / "vfs_ktest.cpp"
 WKI_DEV_PROXY_KTEST = ROOT / "modules" / "kern" / "src" / "test" / "wki_dev_proxy_ktest.cpp"
+WKI_WIRE_KTEST = ROOT / "modules" / "kern" / "src" / "test" / "wki_wire_ktest.cpp"
+WKI_WIRE_HOST_TEST = ROOT / "tests" / "host" / "unit" / "wki_wire_test.cpp"
 
 
 def fail(message: str) -> None:
@@ -3257,6 +3259,8 @@ def test_remote_vfs_mount_lanes_preserve_channel_and_lifetime_affinity() -> None
         header,
         [
             "constexpr size_t VFS_PROXY_LANE_COUNT = 4;",
+            "constexpr size_t VFS_PROXY_RDMA_LANE_COUNT = 2;",
+            "static_assert(VFS_PROXY_RDMA_LANE_COUNT > 1 && VFS_PROXY_RDMA_LANE_COUNT <= VFS_PROXY_LANE_COUNT);",
             "uint64_t mount_group_id = 0;",
             "uint8_t lane_index = 0;",
             "bool lane_anchor = false;",
@@ -3268,6 +3272,22 @@ def test_remote_vfs_mount_lanes_preserve_channel_and_lifetime_affinity() -> None
     )
 
     selector = function_body(source, "acquire_vfs_proxy_lane")
+    rdma_matcher = function_body(source, "vfs_proxy_lane_has_requested_rdma")
+    require_order(
+        rdma_matcher,
+        [
+            "bool const HAS_READ_RDMA",
+            "candidate->rdma_capable && !candidate->rdma_read_disabled.load(std::memory_order_acquire)",
+            "remote_vfs_rdma_retry_ready(candidate->rdma_read_retry_after_us, now_us)",
+            "candidate->bulk_rdma_capable && !candidate->bulk_rdma_disabled.load(std::memory_order_acquire)",
+            "remote_vfs_rdma_retry_ready(candidate->bulk_rdma_retry_after_us, now_us)",
+            "bool const HAS_WRITE_RDMA",
+            "transport_supports_vfs_write_push_rdma(candidate->rdma_transport)",
+            "candidate->rdma_server_write_rkey != 0",
+            "(!require_read || HAS_READ_RDMA) && (!require_write || HAS_WRITE_RDMA)",
+        ],
+        "per-lane RDMA matching requires every requested data direction",
+    )
     require_tokens(
         source,
         [
@@ -3283,26 +3303,28 @@ def test_remote_vfs_mount_lanes_preserve_channel_and_lifetime_affinity() -> None
             "anchor->lanes_ready",
             "anchor->lane_count > 0",
             "anchor->lane_count <= anchor->lanes.size()",
-            "bool const ANCHOR_HAS_READ_RDMA",
-            "anchor->rdma_capable && !anchor->rdma_read_disabled.load(std::memory_order_acquire)",
-            "anchor->bulk_rdma_capable && !anchor->bulk_rdma_disabled.load(std::memory_order_acquire)",
-            "bool const ANCHOR_HAS_WRITE_RDMA",
-            "transport_supports_vfs_write_push_rdma(anchor->rdma_transport)",
-            "anchor->rdma_server_write_rkey != 0",
-            "bool const ANCHOR_HAS_REQUESTED_RDMA",
-            "prefer_rdma_read_anchor && ANCHOR_HAS_READ_RDMA",
-            "prefer_rdma_write_anchor && ANCHOR_HAS_WRITE_RDMA",
+            "std::array<ProxyVfsState*, VFS_PROXY_LANE_COUNT> live_lanes{}",
+            "std::array<ProxyVfsState*, VFS_PROXY_RDMA_LANE_COUNT> rdma_lanes{}",
+            "bool const PREFER_RDMA = prefer_rdma_read_anchor || prefer_rdma_write_anchor",
+            "uint64_t const NOW_US = PREFER_RDMA ? wki_now_us() : 0",
+            "for (size_t lane_index = 0; lane_index < anchor->lane_count; ++lane_index)",
+            "auto* candidate = anchor->lanes.at(lane_index)",
+            "live_lanes.at(live_lane_count++) = candidate",
+            "bool const HAS_REQUESTED_RDMA",
+            "vfs_proxy_lane_has_requested_rdma(candidate, prefer_rdma_read_anchor, prefer_rdma_write_anchor, NOW_US)",
+            "rdma_lanes.at(rdma_lane_count++) = candidate",
             "uint64_t const PID = perf_current_pid()",
-            "size_t lane_index = 0",
-            "if (!ANCHOR_HAS_REQUESTED_RDMA && PID != 0)",
-            "PID % anchor->lane_count",
-            "size_t const LANE_INDEX = lane_index",
-            "auto* candidate = anchor->lanes.at(LANE_INDEX)",
-            "candidate->lifecycle_refs++",
+            "if (PREFER_RDMA && rdma_lane_count > 0)",
+            "PID % rdma_lane_count",
+            "else if (live_lane_count > 0)",
+            "PID % live_lane_count",
+            "selected->lifecycle_refs++",
             "s_vfs_lock.unlock()",
         ],
-        "lane selection retains one task-affine lane through the operation",
+        "lane selection retains a direction-capable data lane with task-striped message fallback",
     )
+    if "(require_read && HAS_READ_RDMA) || (require_write && HAS_WRITE_RDMA)" in rdma_matcher:
+        fail("O_RDWR lane selection must require both requested RDMA directions, not either direction")
     if "anchor->mount_configured" in selector:
         fail("lane selection must remain available while mount_filesystem is publishing the ready anchor")
 
@@ -3407,7 +3429,7 @@ def test_remote_vfs_mount_lanes_preserve_channel_and_lifetime_affinity() -> None
             "if (!acquire_vfs_proxy_open_ref(state))",
             "ctx->proxy = state",
         ],
-        "data-oriented open selects a direction-capable RDMA anchor and transfers its ownership to the file context",
+        "data-oriented open selects a direction-capable RDMA lane and transfers its ownership to the file context",
     )
     if source.count("acquire_vfs_proxy_lane(anchor,") != 1:
         fail("only data-oriented open may request RDMA-anchor lane selection")
@@ -3469,32 +3491,156 @@ def test_remote_vfs_mount_lanes_preserve_channel_and_lifetime_affinity() -> None
         require_tokens(function_body(source, function_name), [marker], f"{function_name} unpublishes lane groups")
 
 
-def test_auxiliary_vfs_lanes_keep_rpc_concurrency_without_rdma_buffers() -> None:
+def test_capability_gated_two_vfs_data_lanes_bound_rdma_buffers() -> None:
     source = REMOTE_VFS_CPP.read_text()
+    header = REMOTE_VFS_HPP.read_text()
     wire = WIRE_HPP.read_text()
+    wki = WKI_CPP.read_text()
+    wki_header = WKI_HPP.read_text()
     lane_mount = function_body(source, "mount_vfs_proxy_lane")
+    capability = function_body(wki, "wki_peer_capability_negotiated")
+    lane_selftest = function_body(source, "wki_remote_vfs_selftest_multi_rdma_lane_selection")
 
     require_tokens(
         wire,
         [
+            "constexpr uint16_t WKI_CAP_VFS_MULTI_RDMA_LANES = 0x0008;",
             "constexpr uint8_t DEV_ATTACH_DISABLE_RDMA = 0x40;",
+            "constexpr uint8_t DEV_ATTACH_VFS_AUX_LANE = 0x80;",
+            "auto wki_vfs_proxy_attach_mode(",
+            "auto wki_vfs_attach_lane_is_anchor(",
             "static_assert(sizeof(DevAttachReqPayload) == 12",
+            "static_assert(sizeof(HelloPayload) == 96",
         ],
-        "auxiliary lane RDMA opt-out preserves attach wire layout",
+        "multi-lane VFS RDMA preserves the existing wire layouts",
+    )
+    require_order(
+        function_body(wire, "wki_vfs_proxy_attach_mode"),
+        [
+            "static_cast<uint8_t>(AttachMode::PROXY)",
+            "if (!lane_anchor)",
+            "mode |= DEV_ATTACH_VFS_AUX_LANE",
+            "if (!request_rdma)",
+            "mode |= DEV_ATTACH_DISABLE_RDMA",
+            "return mode",
+        ],
+        "consumer attach helper keeps auxiliary identity independent from RDMA request state",
+    )
+    require_order(
+        function_body(wire, "wki_vfs_attach_lane_is_anchor"),
+        [
+            "if (explicit_aux_lane_negotiated)",
+            "(mode & DEV_ATTACH_VFS_AUX_LANE) == 0",
+            "(mode & DEV_ATTACH_DISABLE_RDMA) == 0",
+        ],
+        "server attach helper uses explicit identity only when negotiated and preserves legacy fallback",
+    )
+    require_tokens(
+        header,
+        [
+            "constexpr size_t VFS_PROXY_LANE_COUNT = 4;",
+            "constexpr size_t VFS_PROXY_RDMA_LANE_COUNT = 2;",
+            "VFS_PROXY_RDMA_LANE_COUNT <= VFS_PROXY_LANE_COUNT",
+        ],
+        "two data lanes retain the four-lane metadata bound",
+    )
+    require_tokens(
+        wki_header,
+        ["auto wki_peer_capability_negotiated(uint16_t peer_node, uint16_t capabilities) -> bool;"],
+        "generic peer capability negotiation API",
+    )
+    require_tokens(
+        capability,
+        [
+            "capabilities == 0",
+            "(g_wki.capabilities & capabilities) != capabilities",
+            "WkiPeer const* peer = wki_peer_find(peer_node)",
+            "(peer->capabilities & capabilities) == capabilities",
+        ],
+        "capability negotiation requires every requested bit from both peers",
+    )
+    require_tokens(
+        function_body(wki, "wki_init"),
+        ["WKI_CAP_RESOURCE_INCARNATION | WKI_CAP_VFS_MULTI_RDMA_LANES"],
+        "local HELLO capability advertisement",
     )
     require_order(
         lane_mount,
         [
-            "attach_req.attach_mode = static_cast<uint8_t>(AttachMode::PROXY)",
-            "if (!lane_anchor)",
-            "attach_req.attach_mode |= DEV_ATTACH_DISABLE_RDMA",
+            "wki_peer_capability_negotiated(owner_node, WKI_CAP_VFS_MULTI_RDMA_LANES)",
+            "bool const RDMA_LANE = lane_anchor || (MULTI_RDMA_LANES && lane_index < VFS_PROXY_RDMA_LANE_COUNT)",
+            "wki_vfs_proxy_attach_mode(lane_anchor, RDMA_LANE)",
             "WkiPeer const* peer = wki_peer_find(owner_node)",
-            "if (lane_anchor && peer != nullptr",
+            "if (RDMA_LANE && peer != nullptr",
         ],
-        "only the anchor lane requests and allocates VFS RDMA state",
+        "only the negotiated bounded data-lane set requests and allocates VFS RDMA state",
     )
-    if "if (!lane_anchor)" not in lane_mount or "attach_req.attach_mode |= DEV_ATTACH_DISABLE_RDMA" not in lane_mount:
-        fail("auxiliary VFS lanes must explicitly opt out of owner-side RDMA allocation")
+    if "if (lane_anchor && peer != nullptr" in lane_mount:
+        fail("VFS RDMA allocation must not remain restricted to the notification anchor")
+
+    require_tokens(
+        header,
+        ["auto wki_remote_vfs_selftest_multi_rdma_lane_selection() -> bool;"],
+        "multi-lane selector selftest declaration",
+    )
+    require_order(
+        lane_selftest,
+        [
+            "anchor.rdma_server_write_rkey = 1",
+            "auxiliary.rdma_server_write_rkey = 0",
+            "acquire_vfs_proxy_lane(&anchor, true, true)",
+            "selected != &anchor",
+            "anchor.rdma_server_write_rkey = 0",
+            "auxiliary.rdma_server_write_rkey = 2",
+            "selected != &auxiliary",
+            "auxiliary.rdma_read_retry_after_us.store(UINT64_MAX, std::memory_order_release)",
+            "selected != &anchor",
+            "auxiliary.rdma_read_retry_after_us.store(0, std::memory_order_release)",
+            "anchor.rdma_read_retry_after_us.store(UINT64_MAX, std::memory_order_release)",
+            "selected != &auxiliary",
+            "auxiliary.rdma_read_retry_after_us.store(UINT64_MAX, std::memory_order_release)",
+            "selected == nullptr",
+            "acquire_vfs_proxy_lane(&anchor)",
+        ],
+        "selector selftest covers O_RDWR direction matching, auxiliary selection, cooldown, and message fallback",
+    )
+    require_tokens(
+        WKI_DEV_PROXY_KTEST.read_text(),
+        [
+            "KTEST(WkiRemoteVfsLanes, MultiRdmaSelectionRequiresRequestedDirections)",
+            "wki_remote_vfs_selftest_multi_rdma_lane_selection()",
+        ],
+        "multi-lane selector KTEST hook",
+    )
+    require_tokens(
+        WKI_WIRE_KTEST.read_text(),
+        [
+            "KTEST(WkiWire, VfsMultiRdmaCapabilityAndAuxFlagPreserveLayouts)",
+            "WKI_CAP_VFS_MULTI_RDMA_LANES",
+            "DEV_ATTACH_VFS_AUX_LANE",
+            "sizeof(HelloPayload)",
+            "sizeof(DevAttachReqPayload)",
+            "wki_vfs_proxy_attach_mode(true, true)",
+            "wki_vfs_proxy_attach_mode(false, true)",
+            "wki_vfs_proxy_attach_mode(false, false)",
+            "wki_vfs_attach_lane_is_anchor(ANCHOR_RDMA, true)",
+            "wki_vfs_attach_lane_is_anchor(AUX_RDMA, true)",
+            "wki_vfs_attach_lane_is_anchor(AUX_MESSAGE, false)",
+        ],
+        "wire helper compatibility matrix KTEST hook",
+    )
+    require_tokens(
+        WKI_WIRE_HOST_TEST.read_text(),
+        [
+            "TEST(WkiWire, VfsMultiRdmaCapabilityAndAuxFlagPreserveLayouts)",
+            "wki_vfs_proxy_attach_mode(true, true)",
+            "wki_vfs_proxy_attach_mode(false, true)",
+            "wki_vfs_proxy_attach_mode(false, false)",
+            "wki_vfs_attach_lane_is_anchor(AUX_RDMA, true)",
+            "wki_vfs_attach_lane_is_anchor(AUX_MESSAGE, false)",
+        ],
+        "wire helper compatibility matrix host-unit hook",
+    )
 
 
 def main() -> None:
@@ -3526,7 +3672,7 @@ def main() -> None:
     test_vfs_detach_uses_exact_negotiated_incarnation_form()
     test_remote_vfs_unmount_cancels_waiters_before_teardown()
     test_remote_vfs_teardown_releases_rdma_state_when_idle()
-    test_auxiliary_vfs_lanes_keep_rpc_concurrency_without_rdma_buffers()
+    test_capability_gated_two_vfs_data_lanes_bound_rdma_buffers()
     test_remote_open_refs_delay_proxy_destroy_until_close()
     test_remote_vfs_channel_identity_survives_pool_slot_reuse()
     test_server_bounded_metadata_responses_use_stack_storage()

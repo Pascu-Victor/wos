@@ -28,6 +28,10 @@ constexpr size_t VFS_PROXY_SLOT_WAITER_CAPACITY = 64;
 // bound makes the extra memory, channels, and server worker admission explicit
 // while allowing unrelated tasks to avoid one mount-wide RPC queue.
 constexpr size_t VFS_PROXY_LANE_COUNT = 4;
+// Keep metadata RPC concurrency on all four lanes, but bound the staging cost
+// to the anchor and one additional data lane per remote mount.
+constexpr size_t VFS_PROXY_RDMA_LANE_COUNT = 2;
+static_assert(VFS_PROXY_RDMA_LANE_COUNT > 1 && VFS_PROXY_RDMA_LANE_COUNT <= VFS_PROXY_LANE_COUNT);
 
 // Bounce buffer sizes for RDMA-backed VFS I/O.
 constexpr uint32_t VFS_RDMA_BOUNCE_SIZE = 65536;
@@ -310,6 +314,7 @@ auto wki_remote_vfs_selftest_inactive_slot_rejected() -> bool;
 auto wki_remote_vfs_selftest_write_behind_capacity_classes() -> bool;
 auto wki_remote_vfs_selftest_write_behind_growth() -> bool;
 auto wki_remote_vfs_selftest_readlink_cache_generation_invalidation() -> bool;
+auto wki_remote_vfs_selftest_multi_rdma_lane_selection() -> bool;
 #endif
 
 // Task-exit hook: release a task's active proxy operation or queued slot wait.
