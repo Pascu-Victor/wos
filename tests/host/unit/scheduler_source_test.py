@@ -1348,6 +1348,7 @@ def test_handoff_waitpid_wake_queues_out_of_lock_repair() -> None:
     source = SCHEDULER_CPP.read_text()
     requeue_body = function_body(source, "requeue_woken_outgoing_task_locked")
     commit_body = function_body(source, "commit_handoff_task_at_return_boundary")
+    ktest_source = SCHEDULER_KTEST.read_text()
 
     require_tokens(
         source,
@@ -1363,6 +1364,12 @@ def test_handoff_waitpid_wake_queues_out_of_lock_repair() -> None:
             "waitpid_repair_task = outgoing",
         ],
         "handoff waitpid wake must preserve a repair reference",
+    )
+    require_order(
+        requeue_body,
+        "outgoing->sched_queue != task::Task::sched_queue::WAITING",
+        "outgoing->wakeup_pending.exchange(false, std::memory_order_acquire)",
+        "runnable handoff tasks must retain event-before-park wake tokens",
     )
     require_tokens(
         commit_body,
@@ -1380,6 +1387,19 @@ def test_handoff_waitpid_wake_queues_out_of_lock_repair() -> None:
         "run_queues->this_cpu_locked_void",
         "if (waitpid_repair_task != nullptr)",
         "waitpid handoff repair must run outside the runqueue lock callback",
+    )
+    require_tokens(
+        source,
+        ["scheduler_selftest_handoff_preserves_runnable_event_token"],
+        "runnable handoff event-token kernel selftest implementation",
+    )
+    require_tokens(
+        ktest_source,
+        [
+            "KTEST(SchedulerHandoff, RunnableEventTokenSurvivesCommit)",
+            "scheduler_selftest_handoff_preserves_runnable_event_token",
+        ],
+        "runnable handoff event-token KTEST wiring",
     )
 
 

@@ -16,6 +16,7 @@ static constexpr uint32_t WEIGHT_NICE_P5 = 335;   // nice=+5 (lower prio)
 static constexpr uint32_t WEIGHT_NICE_N5 = 3121;  // nice=-5 (higher prio)
 
 namespace ker::mod::sched {
+auto scheduler_selftest_handoff_preserves_runnable_event_token() -> bool;
 auto scheduler_selftest_runtime_delta_saturates() -> bool;
 auto scheduler_selftest_migration_policy_preserves_hot_process_migration() -> bool;
 auto scheduler_selftest_heap_scan_removal_repairs_stale_index() -> bool;
@@ -96,6 +97,10 @@ KTEST(Sched, SchedulerWaitCancellationState) {
     task.process_exit_requested.store(true, std::memory_order_release);
     KEXPECT_TRUE(scheduler_wait_should_cancel(&task, SchedulerHaltWaitKind::PROCESS_PARK));
     task.process_exit_requested.store(false, std::memory_order_relaxed);
+}
+
+KTEST(SchedulerHandoff, RunnableEventTokenSurvivesCommit) {
+    KEXPECT_TRUE(ker::mod::sched::scheduler_selftest_handoff_preserves_runnable_event_token());
 }
 
 KTEST(SchedulerRuntime, RuntimeDeltaSaturates) { KEXPECT_TRUE(ker::mod::sched::scheduler_selftest_runtime_delta_saturates()); }

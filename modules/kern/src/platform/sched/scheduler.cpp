@@ -2245,10 +2245,13 @@ void requeue_woken_outgoing_task_locked(RunQueue* rq, task::Task* outgoing, uint
     if (rq == nullptr || outgoing == nullptr || outgoing->state.load(std::memory_order_acquire) != task::TaskState::ACTIVE) {
         return;
     }
-    if (!outgoing->wakeup_pending.exchange(false, std::memory_order_acquire)) {
+    // A wake observed while the outgoing task is still runnable is an
+    // event-before-park token. Leave it for the task's wait loop; only a task
+    // that was actually published as WAITING may consume it here.
+    if (outgoing->sched_queue != task::Task::sched_queue::WAITING) {
         return;
     }
-    if (outgoing->sched_queue != task::Task::sched_queue::WAITING) {
+    if (!outgoing->wakeup_pending.exchange(false, std::memory_order_acquire)) {
         return;
     }
 
@@ -8056,6 +8059,19 @@ auto get_expired_task_refcounts(uint64_t cpu_no, uint64_t* pids, uint32_t* refco
 }
 
 #ifdef WOS_SELFTEST
+auto scheduler_selftest_handoff_preserves_runnable_event_token() -> bool {
+    RunQueue rq{};
+    task::Task outgoing{};
+    task::Task* waitpid_repair_task = nullptr;
+
+    outgoing.sched_queue = task::Task::sched_queue::RUNNABLE;
+    outgoing.wakeup_pending.store(true, std::memory_order_release);
+    requeue_woken_outgoing_task_locked(&rq, &outgoing, 1, waitpid_repair_task);
+
+    return outgoing.sched_queue == task::Task::sched_queue::RUNNABLE && outgoing.wakeup_pending.load(std::memory_order_acquire) &&
+           waitpid_repair_task == nullptr;
+}
+
 auto scheduler_selftest_runtime_delta_saturates() -> bool {
     bool const REGULAR_US_TO_NS = runtime_delta_ns_from_us(1234) == 1'234'000ULL;
     bool const HUGE_US_TO_NS_SATURATES = runtime_delta_ns_from_us(UINT64_MAX) == UINT64_MAX;
