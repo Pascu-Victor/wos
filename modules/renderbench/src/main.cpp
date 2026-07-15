@@ -2654,7 +2654,7 @@ auto run_ipc_worker(const tracebench::Options& options, const WorkerInvocation& 
     std::vector<unsigned char> tile_write_batch;
     (void)send_worker_phase_packet(WORKER_STDOUT_FD, worker.worker_id, WorkerPhase::SCENE_LOADED, worker.batch_start, worker.batch_count,
                                    all_tiles.size(), static_cast<uint32_t>(options.tile_size));
-    if (options.placement == tracebench::Placement::NodeThreads || options.placement == tracebench::Placement::ProcessPerCore) {
+    if (options.placement == tracebench::Placement::ProcessPerCore) {
         scramble_process_tiles(all_tiles);
     }
     if (worker.command_stream) {
@@ -2961,7 +2961,7 @@ auto run_distributed_ipc(const tracebench::Options& options, const std::vector<W
     bool const USE_DYNAMIC_BATCHES = !USE_PERSISTENT_PROCESS_BATCHES && (options.placement == tracebench::Placement::NodeThreads ||
                                                                          options.placement == tracebench::Placement::ProcessPerCore);
     bool const USE_DYNAMIC_ASSIGNMENT = USE_DYNAMIC_BATCHES || USE_PERSISTENT_PROCESS_BATCHES;
-    if (options.placement == tracebench::Placement::NodeThreads || options.placement == tracebench::Placement::ProcessPerCore) {
+    if (options.placement == tracebench::Placement::ProcessPerCore) {
         scramble_process_tiles(tiles);
     }
     std::vector<int> tile_owner = USE_DYNAMIC_ASSIGNMENT
