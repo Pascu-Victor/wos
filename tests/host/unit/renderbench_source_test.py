@@ -422,6 +422,32 @@ def test_renderbench_node_threads_avoid_persistent_command_stream() -> None:
     )
 
 
+def test_renderbench_node_threads_balance_and_scramble_dynamic_batches() -> None:
+    source = RENDERBENCH_MAIN_CPP.read_text()
+    batch_body = function_body(source, "dynamic_batch_size")
+    require_tokens(
+        batch_body,
+        ["size_t const MIN_BATCH = THREADS * 4U;"],
+        "renderbench node-thread minimum batch size",
+    )
+    if "THREADS * 16U" in batch_body:
+        fail("renderbench node-thread batching must not restore the coarse sixteen-tiles-per-thread minimum")
+
+    placement_pattern = (
+        r"if\s*\(\s*options\.placement\s*==\s*tracebench::Placement::NodeThreads\s*\|\|\s*"
+        r"options\.placement\s*==\s*tracebench::Placement::ProcessPerCore\s*\)\s*\{\s*"
+        r"scramble_process_tiles\((?P<tiles>all_tiles|tiles)\);\s*\}"
+    )
+    worker_body = function_body(source, "run_ipc_worker")
+    coordinator_body = function_body(source, "run_distributed_ipc")
+    worker_match = re.search(placement_pattern, worker_body)
+    coordinator_match = re.search(placement_pattern, coordinator_body)
+    if worker_match is None or worker_match.group("tiles") != "all_tiles":
+        fail("renderbench node-thread workers must reconstruct the coordinator's deterministic tile scramble")
+    if coordinator_match is None or coordinator_match.group("tiles") != "tiles":
+        fail("renderbench node-thread coordinator must scramble tiles before dynamic batch assignment")
+
+
 def test_renderbench_live_mode_streams_worker_tiles() -> None:
     source = RENDERBENCH_MAIN_CPP.read_text()
     require_tokens(
@@ -573,6 +599,7 @@ def main() -> None:
     test_renderbench_command_stream_uses_per_batch_thread_join()
     test_renderbench_non_live_tiles_use_bounded_write_batches()
     test_renderbench_node_threads_avoid_persistent_command_stream()
+    test_renderbench_node_threads_balance_and_scramble_dynamic_batches()
     test_renderbench_live_mode_streams_worker_tiles()
     test_renderbench_ipc_profile_separates_capacity_from_dynamic_runs()
     test_renderbench_dynamic_launch_reuses_receive_capacity()
