@@ -178,6 +178,7 @@ def test_scheduler_wait_check_arm_halt_is_irq_atomic() -> None:
 def test_event_wake_cancel_preserves_current_task_wakeup_token() -> None:
     source = SCHEDULER_CPP.read_text()
     wake_body = function_body(source, "wake_task_from_event_on_cpu")
+    reserved_wake_body = function_body(source, "publish_reserved_task_wakeup_locked")
     reschedule_body = function_body(source, "reschedule_task_for_cpu")
 
     require_tokens(
@@ -210,10 +211,15 @@ def test_event_wake_cancel_preserves_current_task_wakeup_token() -> None:
     require_tokens(
         current_task_branch,
         [
-            "task->wakeup_pending.store(true, std::memory_order_release)",
+            "reserved_wake.was_blocking",
             "wake_cpu(current_cpu_of_task, WakeCpuMode::FORCE)",
         ],
         "reschedule current-task wake token handling",
+    )
+    require_tokens(
+        reserved_wake_body,
+        ["task->wakeup_pending.store(true, std::memory_order_release)"],
+        "reschedule must publish the current-task wake token while ownership is locked",
     )
     if "task->wakeup_pending.store(false" in current_task_branch:
         fail("current-task event wakes must preserve wakeup_pending, even when deferred switch is cancelled")
@@ -1348,6 +1354,8 @@ def test_handoff_waitpid_wake_queues_out_of_lock_repair() -> None:
     source = SCHEDULER_CPP.read_text()
     requeue_body = function_body(source, "requeue_woken_outgoing_task_locked")
     commit_body = function_body(source, "commit_handoff_task_at_return_boundary")
+    reserved_wake_body = function_body(source, "publish_reserved_task_wakeup_locked")
+    reschedule_body = function_body(source, "reschedule_task_for_cpu")
     ktest_source = SCHEDULER_KTEST.read_text()
 
     require_tokens(
@@ -1389,17 +1397,45 @@ def test_handoff_waitpid_wake_queues_out_of_lock_repair() -> None:
         "waitpid handoff repair must run outside the runqueue lock callback",
     )
     require_tokens(
+        reserved_wake_body,
+        [
+            "task->wakeup_pending.store(true, std::memory_order_release)",
+            "task->wants_block = false",
+            "task->wake_at_us = 0",
+        ],
+        "reserved-task wake publication under the owner runqueue lock",
+    )
+    reserved_checks = list(re.finditer(r"if \(runqueue_task_is_reserved_locked\(rq, task\)\)", reschedule_body))
+    if len(reserved_checks) != 2:
+        fail("reschedule must have exactly fast-owner and fallback reserved-task checks")
+    for check in reserved_checks:
+        branch = reschedule_body[check.end() : reschedule_body.find("return;", check.end())]
+        require_tokens(
+            branch,
+            ["reserved_wake = publish_reserved_task_wakeup_locked(rq, task)"],
+            "reserved-task wake must be published before releasing the owner runqueue lock",
+        )
+    current_branch = reschedule_body[reschedule_body.find("if (is_current_on_some_cpu)") :]
+    current_branch = current_branch[: current_branch.find("if (is_waitpid_wait_channel")]
+    if "task->wakeup_pending.store(true" in current_branch:
+        fail("reserved-task wake token must not be delayed until after the owner runqueue lock is released")
+    require_tokens(
         source,
-        ["scheduler_selftest_handoff_preserves_runnable_event_token"],
-        "runnable handoff event-token kernel selftest implementation",
+        [
+            "scheduler_selftest_handoff_preserves_runnable_event_token",
+            "scheduler_selftest_reserved_wake_precedes_handoff_commit",
+        ],
+        "handoff event-token kernel selftest implementation",
     )
     require_tokens(
         ktest_source,
         [
             "KTEST(SchedulerHandoff, RunnableEventTokenSurvivesCommit)",
             "scheduler_selftest_handoff_preserves_runnable_event_token",
+            "KTEST(SchedulerHandoff, ReservedWakePrecedesCommit)",
+            "scheduler_selftest_reserved_wake_precedes_handoff_commit",
         ],
-        "runnable handoff event-token KTEST wiring",
+        "handoff event-token KTEST wiring",
     )
 
 

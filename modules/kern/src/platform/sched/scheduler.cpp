@@ -2227,6 +2227,30 @@ inline auto runqueue_task_is_reserved_locked(RunQueue* rq, task::Task const* tas
     return rq != nullptr && task != nullptr && (rq->current_task == task || rq->handoff_task == task);
 }
 
+struct ReservedTaskWake {
+    uint64_t wake_at_us{};
+    bool was_blocking{};
+};
+
+inline auto publish_reserved_task_wakeup_locked(RunQueue* rq, task::Task* task) -> ReservedTaskWake {
+    ReservedTaskWake const WAKE{
+        .wake_at_us = task->wake_at_us,
+        .was_blocking = task->is_voluntary_blocked() || task->wants_block || task->last_sleep_start_us != 0,
+    };
+
+    // Publish the event-before-park token while the same runqueue lock still
+    // proves that the task is current or reserved for handoff.  Otherwise the
+    // handoff commit can miss the token, publish a successor, and leave this
+    // task WAITING after the stale current-task observation returns.
+    task->wakeup_pending.store(true, std::memory_order_release);
+    task->wants_block = false;
+    task->wake_at_us = 0;
+    if (rq != nullptr && WAKE.wake_at_us != 0 && WAKE.wake_at_us <= rq->next_wait_deadline_us) {
+        recompute_wait_deadline_locked(rq);
+    }
+    return WAKE;
+}
+
 inline auto runqueue_owns_task_locked(RunQueue* rq, task::Task* task) -> bool {
     return runqueue_task_is_reserved_locked(rq, task) || (rq != nullptr && rq->runnable_heap.contains(task)) ||
            wait_list_contains_locked(rq, task);
@@ -5708,31 +5732,33 @@ void reschedule_task_for_cpu(uint64_t cpu_no, task::Task* task) {
     uint64_t current_cpu_of_task = UINT64_MAX;
     uint64_t found_owner_cpu = UINT64_MAX;
     bool found_and_removed = false;
+    ReservedTaskWake reserved_wake{};
 
     // Fast path: task's last CPU
     uint64_t const LAST_CPU = task->cpu;
     if (LAST_CPU < NCPUS_RESCHED) {
-        run_queues->with_lock_void(
-            LAST_CPU, [task, &is_current_on_some_cpu, &current_cpu_of_task, &found_owner_cpu, &found_and_removed, LAST_CPU](RunQueue* rq) {
-                if (runqueue_task_is_reserved_locked(rq, task)) {
-                    is_current_on_some_cpu = true;
-                    current_cpu_of_task = LAST_CPU;
-                    found_owner_cpu = LAST_CPU;
-                    task->cpu = LAST_CPU;
-                    found_and_removed = true;
-                    return;
-                }
-                if (wait_list_remove_locked(rq, task)) {
-                    found_owner_cpu = LAST_CPU;
-                    found_and_removed = true;
-                }
-                if (rq->runnable_heap.contains(task)) {
-                    remove_from_sums(rq, task);
-                    rq->runnable_heap.remove(task);
-                    found_owner_cpu = LAST_CPU;
-                    found_and_removed = true;
-                }
-            });
+        run_queues->with_lock_void(LAST_CPU, [task, &is_current_on_some_cpu, &current_cpu_of_task, &found_owner_cpu, &found_and_removed,
+                                              &reserved_wake, LAST_CPU](RunQueue* rq) {
+            if (runqueue_task_is_reserved_locked(rq, task)) {
+                reserved_wake = publish_reserved_task_wakeup_locked(rq, task);
+                is_current_on_some_cpu = true;
+                current_cpu_of_task = LAST_CPU;
+                found_owner_cpu = LAST_CPU;
+                task->cpu = LAST_CPU;
+                found_and_removed = true;
+                return;
+            }
+            if (wait_list_remove_locked(rq, task)) {
+                found_owner_cpu = LAST_CPU;
+                found_and_removed = true;
+            }
+            if (rq->runnable_heap.contains(task)) {
+                remove_from_sums(rq, task);
+                rq->runnable_heap.remove(task);
+                found_owner_cpu = LAST_CPU;
+                found_and_removed = true;
+            }
+        });
     }
 
     // Rare recovery path: task->cpu is the authoritative owner for runnable,
@@ -5747,11 +5773,12 @@ void reschedule_task_for_cpu(uint64_t cpu_no, task::Task* task) {
                     continue;  // already checked
                 }
                 run_queues->with_lock_void(search_cpu, [task, &is_current_on_some_cpu, &current_cpu_of_task, &found_owner_cpu,
-                                                        &found_and_removed, search_cpu](RunQueue* rq) {
+                                                        &found_and_removed, &reserved_wake, search_cpu](RunQueue* rq) {
                     if (found_and_removed || is_current_on_some_cpu) {
                         return;
                     }
                     if (runqueue_task_is_reserved_locked(rq, task)) {
+                        reserved_wake = publish_reserved_task_wakeup_locked(rq, task);
                         is_current_on_some_cpu = true;
                         current_cpu_of_task = search_cpu;
                         found_owner_cpu = search_cpu;
@@ -5790,25 +5817,15 @@ void reschedule_task_for_cpu(uint64_t cpu_no, task::Task* task) {
 #ifdef SCHED_DEBUG
         dbg::log("RESCHED: PID %x ABORT - is currentTask somewhere", task->pid);
 #endif
-        // Signal to deferred_task_switch that a wakeup was attempted while the
-        // task is still currentTask.  This remains required for CANCEL wakes:
-        // syscall.asm may already have observed deferred_task_switch before the
-        // waker cleared it, and deferred_task_switch must see a wake token
-        // instead of parking after the event owner has removed its waiter.
-        task->wakeup_pending.store(true, std::memory_order_release);
-
         uint64_t const NOW_US = time::get_us();
-        uint64_t const WAKE_AT_US = task->wake_at_us;
-        bool const WAKE_CURRENT = task->is_voluntary_blocked() || task->wants_block || task->last_sleep_start_us != 0;
-        // If a wake races a deferred kern_block()/kern_sleep_us() request,
-        // cancel the pending sleep/block before nudging the CPU. Otherwise the
-        // next scheduler pass can still move the task to WAITING after the
-        // event already arrived, effectively losing the wake.
-        task->wants_block = false;
-        task->wake_at_us = 0;
-        if (WAKE_CURRENT && current_cpu_of_task < perf::get_num_perf_cpus()) {
-            perf::record_wake(static_cast<uint32_t>(current_cpu_of_task), task->pid, WAKE_AT_US, perf_wake_flags(WAKE_AT_US, true, true),
-                              observed_sleep_us(task, NOW_US), perf_wait_callsite(task), task->wait_channel);
+        // The wake token and deferred block cancellation were committed under
+        // the owner runqueue lock.  A concurrent handoff therefore either
+        // consumes the token while requeueing this outgoing task or leaves it
+        // for the still-current task's wait loop.
+        if (reserved_wake.was_blocking && current_cpu_of_task < perf::get_num_perf_cpus()) {
+            perf::record_wake(static_cast<uint32_t>(current_cpu_of_task), task->pid, reserved_wake.wake_at_us,
+                              perf_wake_flags(reserved_wake.wake_at_us, true, true), observed_sleep_us(task, NOW_US),
+                              perf_wait_callsite(task), task->wait_channel);
         }
 
         // A wake can race with the task entering a preemptible syscall park:
@@ -8069,6 +8086,41 @@ auto scheduler_selftest_handoff_preserves_runnable_event_token() -> bool {
     requeue_woken_outgoing_task_locked(&rq, &outgoing, 1, waitpid_repair_task);
 
     return outgoing.sched_queue == task::Task::sched_queue::RUNNABLE && outgoing.wakeup_pending.load(std::memory_order_acquire) &&
+           waitpid_repair_task == nullptr;
+}
+
+auto scheduler_selftest_reserved_wake_precedes_handoff_commit() -> bool {
+    RunQueue rq{};
+    task::Task outgoing{};
+    task::Task successor{};
+    task::Task* waitpid_repair_task = nullptr;
+
+    outgoing.heap_index = -1;
+    outgoing.sched_weight = 1024;
+    outgoing.slice_ns = 10'000'000;
+    outgoing.sched_queue = task::Task::sched_queue::WAITING;
+    outgoing.wants_block = true;
+    outgoing.wake_at_us = 10;
+    outgoing.set_voluntary_blocked(true);
+    outgoing.set_wait_channel("kern_sleep", task::WaitChannelKind::GENERIC);
+    wait_list_push_locked(&rq, &outgoing);
+    rq.current_task = &outgoing;
+    rq.handoff_task = &successor;
+
+    if (!runqueue_task_is_reserved_locked(&rq, &outgoing)) {
+        return false;
+    }
+    ReservedTaskWake const WAKE = publish_reserved_task_wakeup_locked(&rq, &outgoing);
+
+    // Model the locked portion of commit_handoff_task_at_return_boundary().
+    rq.current_task = &successor;
+    rq.handoff_task = nullptr;
+    requeue_woken_outgoing_task_locked(&rq, &outgoing, 11, waitpid_repair_task);
+
+    return WAKE.was_blocking && WAKE.wake_at_us == 10 && outgoing.sched_queue == task::Task::sched_queue::RUNNABLE &&
+           rq.runnable_heap.contains(&outgoing) && !wait_list_contains_locked(&rq, &outgoing) && !outgoing.wants_block &&
+           outgoing.wake_at_us == 0 && rq.next_wait_deadline_us == 0 && !outgoing.is_voluntary_blocked() &&
+           outgoing.wait_channel_kind == task::WaitChannelKind::NONE && !outgoing.wakeup_pending.load(std::memory_order_acquire) &&
            waitpid_repair_task == nullptr;
 }
 
