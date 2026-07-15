@@ -19,8 +19,8 @@
 #include <net/wki/zone.hpp>
 #include <new>
 #include <platform/dbg/dbg.hpp>
-#include <platform/perf/perf_events.hpp>
 #include <platform/init/limine_requests.hpp>
+#include <platform/perf/perf_events.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sys/spinlock.hpp>
 
@@ -82,11 +82,6 @@ struct RoceRegion {
     bool tagged_receive_prepared = false;
     uint16_t received_cookie = 0;
     RoceRegion* next = nullptr;
-};
-
-struct RoceRegionSnapshot {
-    void* vaddr = nullptr;
-    uint32_t size = 0;
 };
 
 std::array<RoceRegion*, ROCE_REGION_BUCKETS> s_region_buckets{};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
@@ -353,16 +348,30 @@ auto region_mark_write_complete(uint32_t rkey) -> bool {
     return true;
 }
 
-auto region_snapshot(uint32_t rkey, RoceRegionSnapshot& out) -> bool {
+auto region_read_range_valid(uint32_t rkey, uint64_t offset, uint32_t len) -> bool {
     uint64_t const FLAGS = s_region_lock.lock_irqsave();
     RoceRegion* region = region_find_locked(rkey);
-    if (region == nullptr) {
+    bool const VALID =
+        region != nullptr && !region->temporary && offset <= region->size && len <= (static_cast<uint64_t>(region->size) - offset);
+    s_region_lock.unlock_irqrestore(FLAGS);
+    return VALID;
+}
+
+auto region_copy_read_chunk(uint32_t rkey, uint64_t offset, void* dst, uint32_t len) -> bool {
+    if (len != 0 && dst == nullptr) {
+        return false;
+    }
+
+    uint64_t const FLAGS = s_region_lock.lock_irqsave();
+    RoceRegion* region = region_find_locked(rkey);
+    if (region == nullptr || region->temporary || offset > region->size || len > (static_cast<uint64_t>(region->size) - offset)) {
         s_region_lock.unlock_irqrestore(FLAGS);
         return false;
     }
 
-    out.vaddr = region->vaddr;
-    out.size = region->size;
+    if (len != 0) {
+        memcpy(dst, static_cast<const uint8_t*>(region->vaddr) + offset, len);
+    }
     s_region_lock.unlock_irqrestore(FLAGS);
     return true;
 }
@@ -472,12 +481,54 @@ auto roce_eth_tx(uint16_t neighbor_id, const RoceHeader& hdr, const void* payloa
     return roce_eth_tx_resolved(netdev, peer->mac, hdr, payload, payload_len);
 }
 
+// Allocate the response packet before taking s_region_lock, then copy one
+// bounded chunk directly into that packet while the region remains protected.
+// This prevents a later region unregister from racing a raw backing-pointer
+// read during packet transmission.
+auto roce_eth_tx_region_read_chunk(uint16_t neighbor_id, const RoceHeader& hdr, uint32_t source_rkey, uint64_t source_offset,
+                                   uint32_t payload_len) -> int {
+    auto* netdev = wki_eth_get_netdev();
+    if (netdev == nullptr) {
+        return WKI_ERR_NO_ROUTE;
+    }
+
+    WkiPeer const* peer = wki_peer_find(neighbor_id);
+    if (peer == nullptr) {
+        return WKI_ERR_NO_ROUTE;
+    }
+
+    uint32_t const TOTAL = sizeof(RoceHeader) + payload_len;
+    if (TOTAL > PKT_BUF_SIZE - PKT_HEADROOM - proto::ETH_HLEN) {
+        return WKI_ERR_INVALID;
+    }
+
+    PacketBuffer* pkt = pkt_alloc_tx();
+    if (pkt == nullptr) {
+        return WKI_ERR_NO_MEM;
+    }
+    if (!region_copy_read_chunk(source_rkey, source_offset, pkt->data + sizeof(RoceHeader), payload_len)) {
+        pkt_free(pkt);
+        return WKI_ERR_INVALID;
+    }
+
+    memcpy(pkt->data, &hdr, sizeof(RoceHeader));
+    pkt->len = static_cast<uint16_t>(TOTAL);
+    pkt->dev = netdev;
+
+    int const RET = proto::eth_tx(netdev, pkt, peer->mac, WKI_ETHERTYPE_ROCE);
+    return (RET == 0) ? WKI_OK : WKI_ERR_TX_FAILED;
+}
+
 // -----------------------------------------------------------------------------
 // RDMA operations - WkiTransport function pointers
 // -----------------------------------------------------------------------------
 
 int roce_rdma_register_region(WkiTransport* /*self*/, uint64_t phys_addr, uint32_t size, uint32_t* rkey) {
     return region_register(phys_addr, size, false, rkey);
+}
+
+auto roce_rdma_unregister_region(WkiTransport* /*self*/, uint32_t rkey, uint32_t /*size*/) -> int {
+    return region_unregister(rkey) ? WKI_OK : WKI_ERR_INVALID;
 }
 
 auto roce_rdma_write_impl(uint16_t neighbor_id, uint32_t rkey, uint64_t remote_offset, const void* local_buf, uint32_t len,
@@ -677,19 +728,14 @@ void roce_rx(ker::net::NetDevice* /*dev*/, ker::net::PacketBuffer* pkt) {
 
         case RoceOpcode::RDMA_READ_REQ: {
             // Peer wants to read from our registered region - send data back as RDMA_WRITE
-            RoceRegionSnapshot region = {};
-            if (!region_snapshot(hdr->rkey, region)) {
-                break;
-            }
-
-            if (hdr->offset > region.size || hdr->length > (static_cast<uint64_t>(region.size) - hdr->offset)) {
+            if (!region_read_range_valid(hdr->rkey, hdr->offset, hdr->length)) {
                 break;
             }
 
             // Send the data back to the requestor using RDMA_WRITE to their local_rkey
             uint32_t const RESP_RKEY = hdr->doorbell_val;  // requestor's local region key
-            const auto* src_data = static_cast<const uint8_t*>(region.vaddr) + hdr->offset;
             uint32_t remaining = hdr->length;
+            uint64_t source_offset = hdr->offset;
             uint64_t write_offset = 0;
             bool send_ok = true;
 
@@ -705,12 +751,12 @@ void roce_rx(ker::net::NetDevice* /*dev*/, ker::net::PacketBuffer* pkt) {
                 resp_hdr.length = CHUNK;
                 resp_hdr.doorbell_val = 0;
 
-                if (roce_eth_tx(hdr->src_node, resp_hdr, src_data, CHUNK) != 0) {
+                if (roce_eth_tx_region_read_chunk(hdr->src_node, resp_hdr, hdr->rkey, source_offset, CHUNK) != 0) {
                     send_ok = false;
                     break;
                 }
 
-                src_data += CHUNK;
+                source_offset += CHUNK;
                 write_offset += CHUNK;
                 remaining -= CHUNK;
             }
@@ -803,6 +849,7 @@ void wki_roce_transport_init() {
     s_roce_transport.tx_pkt = nullptr;  // not a message transport
     s_roce_transport.set_rx_handler = nullptr;
     s_roce_transport.rdma_register_region = roce_rdma_register_region;
+    s_roce_transport.rdma_unregister_region = roce_rdma_unregister_region;
     s_roce_transport.rdma_read = roce_rdma_read;
     s_roce_transport.rdma_write = roce_rdma_write;
     s_roce_transport.doorbell = roce_doorbell;

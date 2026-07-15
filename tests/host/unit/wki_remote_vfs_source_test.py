@@ -2439,6 +2439,9 @@ def test_remote_vfs_teardown_releases_rdma_state_when_idle() -> None:
     require_tokens(
         release_body,
         [
+            "RDMA_TRANSPORT->rdma_unregister_region",
+            "state->rdma_read_rkey, VFS_RDMA_BOUNCE_SIZE",
+            "state->rdma_bulk_rkey, state->rdma_bulk_size",
             "state->rdma_transport = nullptr",
             "state->rdma_server_write_rkey = 0",
             "state->rdma_server_read_staging_rkey = 0",
@@ -2448,6 +2451,15 @@ def test_remote_vfs_teardown_releases_rdma_state_when_idle() -> None:
             "state->op_untracked_send_pending.store(false, std::memory_order_release)",
         ],
         "remote VFS RDMA resource release",
+    )
+    require_order(
+        release_body,
+        [
+            "RDMA_TRANSPORT->rdma_unregister_region",
+            "delete[] state->rdma_bounce_buf",
+            "delete[] state->rdma_bulk_buf",
+        ],
+        "remote VFS unregisters local RDMA regions before freeing their buffers",
     )
 
     erase_body = function_body(source, "erase_destroyed_idle_vfs_proxy_locked")
@@ -3224,7 +3236,10 @@ def test_remote_vfs_mount_lanes_preserve_channel_and_lifetime_affinity() -> None
     if lane_mount.count(MOUNT_CALL) != 1:
         fail("remote VFS lane mount must have one physical VFS mount publication")
 
-    aux_publish = block_body_after(lane_mount, "if (!lane_anchor)")
+    aux_publish_marker = lane_mount.rfind("if (!lane_anchor)")
+    if aux_publish_marker < 0:
+        fail("auxiliary VFS lane publication branch is missing")
+    aux_publish = block_body_after(lane_mount[aux_publish_marker:], "if (!lane_anchor)")
     require_tokens(
         aux_publish,
         [
@@ -3343,6 +3358,34 @@ def test_remote_vfs_mount_lanes_preserve_channel_and_lifetime_affinity() -> None
         require_tokens(function_body(source, function_name), [marker], f"{function_name} unpublishes lane groups")
 
 
+def test_auxiliary_vfs_lanes_keep_rpc_concurrency_without_rdma_buffers() -> None:
+    source = REMOTE_VFS_CPP.read_text()
+    wire = WIRE_HPP.read_text()
+    lane_mount = function_body(source, "mount_vfs_proxy_lane")
+
+    require_tokens(
+        wire,
+        [
+            "constexpr uint8_t DEV_ATTACH_DISABLE_RDMA = 0x40;",
+            "static_assert(sizeof(DevAttachReqPayload) == 12",
+        ],
+        "auxiliary lane RDMA opt-out preserves attach wire layout",
+    )
+    require_order(
+        lane_mount,
+        [
+            "attach_req.attach_mode = static_cast<uint8_t>(AttachMode::PROXY)",
+            "if (!lane_anchor)",
+            "attach_req.attach_mode |= DEV_ATTACH_DISABLE_RDMA",
+            "WkiPeer const* peer = wki_peer_find(owner_node)",
+            "if (lane_anchor && peer != nullptr",
+        ],
+        "only the anchor lane requests and allocates VFS RDMA state",
+    )
+    if "if (!lane_anchor)" not in lane_mount or "attach_req.attach_mode |= DEV_ATTACH_DISABLE_RDMA" not in lane_mount:
+        fail("auxiliary VFS lanes must explicitly opt out of owner-side RDMA allocation")
+
+
 def main() -> None:
     test_vfs_host_alias_rewrite_is_overlap_safe()
     test_vfs_route_scratch_is_initialized_by_its_producer()
@@ -3372,6 +3415,7 @@ def main() -> None:
     test_vfs_detach_uses_exact_negotiated_incarnation_form()
     test_remote_vfs_unmount_cancels_waiters_before_teardown()
     test_remote_vfs_teardown_releases_rdma_state_when_idle()
+    test_auxiliary_vfs_lanes_keep_rpc_concurrency_without_rdma_buffers()
     test_remote_open_refs_delay_proxy_destroy_until_close()
     test_remote_vfs_channel_identity_survives_pool_slot_reuse()
     test_server_bounded_metadata_responses_use_stack_storage()

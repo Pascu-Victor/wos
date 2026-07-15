@@ -103,10 +103,51 @@ def test_registered_region_waits_use_shared_deadline_helper() -> None:
         )
 
 
+def test_read_response_copies_each_chunk_while_region_lock_is_held() -> None:
+    source = TRANSPORT_ROCE_CPP.read_text()
+    copy_chunk = function_body(source, "region_copy_read_chunk")
+    packet_chunk = function_body(source, "roce_eth_tx_region_read_chunk")
+    rx = function_body(source, "roce_rx")
+
+    require_order(
+        copy_chunk,
+        [
+            "s_region_lock.lock_irqsave()",
+            "region_find_locked(rkey)",
+            "region->temporary",
+            "memcpy(dst, static_cast<const uint8_t*>(region->vaddr) + offset, len)",
+            "s_region_lock.unlock_irqrestore(FLAGS)",
+        ],
+        "RoCE read chunk must copy from a live region under the registry lock",
+    )
+    require_order(
+        packet_chunk,
+        [
+            "PacketBuffer* pkt = pkt_alloc_tx()",
+            "region_copy_read_chunk(source_rkey, source_offset, pkt->data + sizeof(RoceHeader), payload_len)",
+            "proto::eth_tx(netdev, pkt, peer->mac, WKI_ETHERTYPE_ROCE)",
+        ],
+        "RoCE read response must own copied packet bytes before transmit",
+    )
+    require_order(
+        rx,
+        [
+            "case RoceOpcode::RDMA_READ_REQ",
+            "region_read_range_valid(hdr->rkey, hdr->offset, hdr->length)",
+            "while (remaining > 0)",
+            "roce_eth_tx_region_read_chunk(hdr->src_node, resp_hdr, hdr->rkey, source_offset, CHUNK)",
+        ],
+        "RoCE read request validates the full range then sends copied chunks",
+    )
+    if "region_snapshot(" in source or "RoceRegionSnapshot" in source:
+        fail("RoCE must not lend raw registered backing pointers past s_region_lock")
+
+
 def main() -> None:
     test_roce_wait_deadlines_are_saturating()
     test_temporary_read_completion_wait_is_deadline_bounded()
     test_registered_region_waits_use_shared_deadline_helper()
+    test_read_response_copies_each_chunk_while_region_lock_is_held()
     print("WKI RoCE source invariants hold")
 
 

@@ -1262,6 +1262,22 @@ void release_vfs_proxy_buffers(ProxyVfsState* state) {
         return;
     }
 
+    // Transports that provide a revocation callback own registration metadata
+    // independently of the backing allocation. Drop their local registrations
+    // before returning either buffer to kmalloc. Raw ivshmem intentionally
+    // provides no callback: its offset keys remain pinned until ivshmem
+    // transport/VM reset so an in-flight peer write cannot land in a recycled
+    // region.
+    WkiTransport* const RDMA_TRANSPORT = state->rdma_transport;
+    if (RDMA_TRANSPORT != nullptr && RDMA_TRANSPORT->rdma_unregister_region != nullptr) {
+        if (state->rdma_read_rkey != 0) {
+            static_cast<void>(RDMA_TRANSPORT->rdma_unregister_region(RDMA_TRANSPORT, state->rdma_read_rkey, VFS_RDMA_BOUNCE_SIZE));
+        }
+        if (state->rdma_bulk_rkey != 0 && state->rdma_bulk_size != 0) {
+            static_cast<void>(RDMA_TRANSPORT->rdma_unregister_region(RDMA_TRANSPORT, state->rdma_bulk_rkey, state->rdma_bulk_size));
+        }
+    }
+
     delete[] state->rdma_bounce_buf;
     state->rdma_bounce_buf = nullptr;
     state->rdma_read_rkey = 0;
@@ -6041,6 +6057,12 @@ auto mount_vfs_proxy_lane(uint16_t owner_node, uint32_t resource_id, const char*
     attach_req.resource_type = static_cast<uint16_t>(ResourceType::VFS);
     attach_req.resource_id = resource_id;
     attach_req.attach_mode = static_cast<uint8_t>(AttachMode::PROXY);
+    if (!lane_anchor) {
+        // Auxiliary lanes preserve independent RPC serialization but use the
+        // established message fallback instead of duplicating RDMA staging
+        // buffers on both peers.
+        attach_req.attach_mode |= DEV_ATTACH_DISABLE_RDMA;
+    }
     attach_req.attach_cookie = attach_cookie;
 
     WkiChannelIdentity reserved_channel_identity{};
@@ -6180,7 +6202,7 @@ auto mount_vfs_proxy_lane(uint16_t owner_node, uint32_t resource_id, const char*
     // bulk capabilities independently. Remote-root reads must not depend on the
     // server also having a write-receive buffer.
     WkiPeer const* peer = wki_peer_find(owner_node);
-    if (peer != nullptr && peer->rdma_transport != nullptr && peer->rdma_transport->rdma_register_region != nullptr) {
+    if (lane_anchor && peer != nullptr && peer->rdma_transport != nullptr && peer->rdma_transport->rdma_register_region != nullptr) {
         state->rdma_transport = peer->rdma_transport;
 
         bool const NEED_READ_BOUNCE =
@@ -6200,6 +6222,9 @@ auto mount_vfs_proxy_lane(uint16_t owner_node, uint32_t resource_id, const char*
                         owner_node, rkey, state->rdma_server_write_rkey, state->rdma_server_read_staging_rkey,
                         state->rdma_server_bulk_staging_rkey);
                 } else {
+                    if (REG_RET == 0 && state->rdma_transport->rdma_unregister_region != nullptr) {
+                        static_cast<void>(state->rdma_transport->rdma_unregister_region(state->rdma_transport, rkey, VFS_RDMA_BOUNCE_SIZE));
+                    }
                     delete[] bbuf;
                     ker::mod::dbg::log("[WKI] VFS RDMA read-bounce region reg failed: node=0x%04x ret=%d", owner_node, REG_RET);
                 }
@@ -6234,6 +6259,9 @@ auto mount_vfs_proxy_lane(uint16_t owner_node, uint32_t resource_id, const char*
                 ker::mod::dbg::log("[WKI] VFS bulk RDMA enabled: node=0x%04x mode=%s bulk_rkey=%u size=%u", owner_node,
                                    BULK_PULL_REQUESTED ? "pull" : "push", bulk_rkey, BULK_SIZE);
             } else {
+                if (REG_RET == 0 && state->rdma_transport->rdma_unregister_region != nullptr) {
+                    static_cast<void>(state->rdma_transport->rdma_unregister_region(state->rdma_transport, bulk_rkey, BULK_SIZE));
+                }
                 delete[] bulk_buf;
                 ker::mod::dbg::log("[WKI] VFS bulk RDMA region reg failed: node=0x%04x ret=%d size=%u", owner_node, REG_RET, BULK_SIZE);
             }

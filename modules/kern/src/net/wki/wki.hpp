@@ -148,6 +148,11 @@ struct WkiTransport {
 
     // RDMA operations (NULL if !rdma_capable)
     int (*rdma_register_region)(WkiTransport* self, uint64_t phys_addr, uint32_t size, uint32_t* rkey);
+    // Optionally drop a locally registered region before its backing storage
+    // is freed. Only transports with a quiescent remote-revocation guarantee
+    // provide this; size is required by bitmap-backed transports and ignored
+    // by RoCE.
+    int (*rdma_unregister_region)(WkiTransport* self, uint32_t rkey, uint32_t size);
     int (*rdma_read)(WkiTransport* self, uint16_t neighbor_id, uint32_t rkey, uint64_t remote_offset, void* local_buf, uint32_t len);
     int (*rdma_write)(WkiTransport* self, uint16_t neighbor_id, uint32_t rkey, uint64_t remote_offset, const void* local_buf, uint32_t len);
     int (*doorbell)(WkiTransport* self, uint16_t neighbor_id, uint32_t value);

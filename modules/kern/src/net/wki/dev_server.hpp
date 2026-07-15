@@ -78,6 +78,9 @@ struct DevServerBinding {
 
     // VFS RDMA: pre-registered server-side receive buffer the consumer can rdma_write into.
     // Allocated at DEV_ATTACH time when the peer has an RDMA-capable transport.
+    // All three VFS regions are registered through this same provider, including
+    // partial-registration cases where the write region is unavailable.
+    WkiTransport* vfs_rdma_transport = nullptr;
     uint8_t* vfs_rdma_write_buf = nullptr;  // server-side receive region for RDMA-backed writes
     uint32_t vfs_rdma_write_rkey = 0;       // rkey identifying this region to the remote consumer
     WkiTransport* vfs_rdma_write_transport = nullptr;
@@ -141,6 +144,7 @@ struct DevServerBinding {
           blk_poll_active(o.blk_poll_active.load(std::memory_order_relaxed)),
           blk_remote_rkey(o.blk_remote_rkey),
           blk_rdma_transport(o.blk_rdma_transport),
+          vfs_rdma_transport(o.vfs_rdma_transport),
           vfs_rdma_write_buf(o.vfs_rdma_write_buf),
           vfs_rdma_write_rkey(o.vfs_rdma_write_rkey),
           vfs_rdma_write_transport(o.vfs_rdma_write_transport),
@@ -159,6 +163,7 @@ struct DevServerBinding {
         __builtin_memcpy(vfs_export_path, o.vfs_export_path, sizeof(vfs_export_path));
         // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-array-to-pointer-decay)
         __builtin_memcpy(vfs_export_name, o.vfs_export_name, sizeof(vfs_export_name));
+        o.vfs_rdma_transport = nullptr;
         o.vfs_rdma_write_buf = nullptr;  // ownership transfer
         o.vfs_rdma_write_transport = nullptr;
         o.vfs_rdma_read_staging_buf = nullptr;
@@ -209,6 +214,7 @@ struct DevServerBinding {
             blk_poll_active.store(o.blk_poll_active.load(std::memory_order_relaxed), std::memory_order_relaxed);
             blk_remote_rkey = o.blk_remote_rkey;
             blk_rdma_transport = o.blk_rdma_transport;
+            vfs_rdma_transport = o.vfs_rdma_transport;
             vfs_rdma_write_buf = o.vfs_rdma_write_buf;
             vfs_rdma_write_rkey = o.vfs_rdma_write_rkey;
             vfs_rdma_write_transport = o.vfs_rdma_write_transport;
@@ -222,6 +228,7 @@ struct DevServerBinding {
             vfs_rdma_read_staging_rkey = o.vfs_rdma_read_staging_rkey;
             vfs_rdma_bulk_staging_buf = o.vfs_rdma_bulk_staging_buf;
             vfs_rdma_bulk_staging_rkey = o.vfs_rdma_bulk_staging_rkey;
+            o.vfs_rdma_transport = nullptr;
             o.vfs_rdma_write_buf = nullptr;  // ownership transfer
             o.vfs_rdma_write_transport = nullptr;
             o.vfs_rdma_read_staging_buf = nullptr;

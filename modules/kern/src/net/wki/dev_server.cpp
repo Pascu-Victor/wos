@@ -173,6 +173,72 @@ void wait_for_binding_refs_to_drain(DevServerBinding* binding) {
     }
 }
 
+struct VfsRdmaBuffers {
+    WkiTransport* transport = nullptr;
+    uint8_t* write_buf = nullptr;
+    uint32_t write_rkey = 0;
+    uint8_t* read_staging_buf = nullptr;
+    uint32_t read_staging_rkey = 0;
+    uint8_t* bulk_staging_buf = nullptr;
+    uint32_t bulk_staging_rkey = 0;
+};
+
+// s_server_lock must be held by caller. The binding cannot accept new traffic,
+// so this only transfers ownership to task-context cleanup; it never
+// unregisters or frees memory under the server registry lock.
+void take_vfs_rdma_buffers_locked(DevServerBinding& binding, VfsRdmaBuffers* out) {
+    if (out == nullptr) {
+        return;
+    }
+
+    *out = {
+        .transport = binding.vfs_rdma_transport,
+        .write_buf = binding.vfs_rdma_write_buf,
+        .write_rkey = binding.vfs_rdma_write_rkey,
+        .read_staging_buf = binding.vfs_rdma_read_staging_buf,
+        .read_staging_rkey = binding.vfs_rdma_read_staging_rkey,
+        .bulk_staging_buf = binding.vfs_rdma_bulk_staging_buf,
+        .bulk_staging_rkey = binding.vfs_rdma_bulk_staging_rkey,
+    };
+    binding.vfs_rdma_transport = nullptr;
+    binding.vfs_rdma_write_buf = nullptr;
+    binding.vfs_rdma_write_rkey = 0;
+    binding.vfs_rdma_write_transport = nullptr;
+    binding.vfs_rdma_read_staging_buf = nullptr;
+    binding.vfs_rdma_read_staging_rkey = 0;
+    binding.vfs_rdma_bulk_staging_buf = nullptr;
+    binding.vfs_rdma_bulk_staging_rkey = 0;
+}
+
+void release_vfs_rdma_buffers(VfsRdmaBuffers* buffers) {
+    if (buffers == nullptr) {
+        return;
+    }
+
+    // Invalidate transport metadata before returning backing storage to
+    // kmalloc when the transport has a remote-revocation guarantee. This runs
+    // after binding refs drain and outside s_server_lock; raw ivshmem leaves
+    // its offset allocation pinned until ivshmem transport/VM reset.
+    if (buffers->transport != nullptr && buffers->transport->rdma_unregister_region != nullptr) {
+        if (buffers->write_rkey != 0) {
+            static_cast<void>(buffers->transport->rdma_unregister_region(buffers->transport, buffers->write_rkey, VFS_RDMA_WRITE_SIZE));
+        }
+        if (buffers->read_staging_rkey != 0) {
+            static_cast<void>(
+                buffers->transport->rdma_unregister_region(buffers->transport, buffers->read_staging_rkey, VFS_RDMA_BOUNCE_SIZE));
+        }
+        if (buffers->bulk_staging_rkey != 0) {
+            static_cast<void>(
+                buffers->transport->rdma_unregister_region(buffers->transport, buffers->bulk_staging_rkey, VFS_RDMA_ROCE_BULK_SIZE));
+        }
+    }
+
+    delete[] buffers->write_buf;
+    delete[] buffers->read_staging_buf;
+    delete[] buffers->bulk_staging_buf;
+    *buffers = {};
+}
+
 // s_server_lock must be held by caller
 void mark_binding_retiring_locked(DevServerBinding& binding) {
     binding.active = false;
@@ -762,9 +828,7 @@ void wki_dev_server_finish_vfs_export_reconciliation(uint64_t target_even_revisi
     while (true) {
         DevServerBinding* retired = nullptr;
         WkiChannelIdentity channel_identity = {};
-        uint8_t* write_buf = nullptr;
-        uint8_t* read_buf = nullptr;
-        uint8_t* bulk_buf = nullptr;
+        VfsRdmaBuffers vfs_rdma_buffers = {};
 
         uint64_t const SRV_FLAGS = s_server_lock.lock_irqsave();
         for (auto& binding : g_bindings) {
@@ -773,12 +837,7 @@ void wki_dev_server_finish_vfs_export_reconciliation(uint64_t target_even_revisi
             }
             retired = &binding;
             channel_identity = binding.channel_identity;
-            write_buf = binding.vfs_rdma_write_buf;
-            read_buf = binding.vfs_rdma_read_staging_buf;
-            bulk_buf = binding.vfs_rdma_bulk_staging_buf;
-            binding.vfs_rdma_write_buf = nullptr;
-            binding.vfs_rdma_read_staging_buf = nullptr;
-            binding.vfs_rdma_bulk_staging_buf = nullptr;
+            take_vfs_rdma_buffers_locked(binding, &vfs_rdma_buffers);
             mark_binding_retiring_locked(binding);
             break;
         }
@@ -789,9 +848,7 @@ void wki_dev_server_finish_vfs_export_reconciliation(uint64_t target_even_revisi
         }
         wait_for_binding_refs_to_drain(retired);
         wki_remote_vfs_cleanup_server_fds_for_channel(channel_identity);
-        delete[] write_buf;
-        delete[] read_buf;
-        delete[] bulk_buf;
+        release_vfs_rdma_buffers(&vfs_rdma_buffers);
         static_cast<void>(wki_channel_close_generation(channel_identity.channel, channel_identity.peer_node_id, channel_identity.channel_id,
                                                        channel_identity.generation));
 
@@ -983,9 +1040,7 @@ void wki_dev_server_process_pending_detaches() {
         uint32_t resource_id = 0;
         uint16_t consumer_node = WKI_NODE_INVALID;
         WkiChannelIdentity channel_identity{};
-        uint8_t* vfs_rdma_write_buf = nullptr;
-        uint8_t* vfs_rdma_read_staging_buf = nullptr;
-        uint8_t* vfs_rdma_bulk_staging_buf = nullptr;
+        VfsRdmaBuffers vfs_rdma_buffers{};
     };
     constexpr size_t MAX_CLEANUP = 32;
     bool cleaned_any = false;
@@ -1002,7 +1057,8 @@ void wki_dev_server_process_pending_detaches() {
             }
 
             binding.detach_cleanup_claimed = true;
-            work.at(work_count++) = {
+            auto& item = work.at(work_count++);
+            item = {
                 .binding = &binding,
                 .blk_zone_id = binding.blk_zone_id,
                 .blk_rdma_active = binding.blk_rdma_active,
@@ -1012,13 +1068,8 @@ void wki_dev_server_process_pending_detaches() {
                 .resource_id = binding.resource_id,
                 .consumer_node = binding.consumer_node,
                 .channel_identity = binding.channel_identity,
-                .vfs_rdma_write_buf = binding.vfs_rdma_write_buf,
-                .vfs_rdma_read_staging_buf = binding.vfs_rdma_read_staging_buf,
-                .vfs_rdma_bulk_staging_buf = binding.vfs_rdma_bulk_staging_buf,
             };
-            binding.vfs_rdma_write_buf = nullptr;
-            binding.vfs_rdma_read_staging_buf = nullptr;
-            binding.vfs_rdma_bulk_staging_buf = nullptr;
+            take_vfs_rdma_buffers_locked(binding, &item.vfs_rdma_buffers);
         }
         s_server_lock.unlock_irqrestore(SRV_FLAGS);
 
@@ -1028,14 +1079,12 @@ void wki_dev_server_process_pending_detaches() {
         cleaned_any = true;
 
         for (size_t i = 0; i < work_count; ++i) {
-            const auto& item = work.at(i);
+            auto& item = work.at(i);
             wait_for_binding_refs_to_drain(item.binding);
             if (item.resource_type == ResourceType::VFS) {
                 wki_remote_vfs_mark_server_fds_for_channel(item.channel_identity);
             }
-            delete[] item.vfs_rdma_write_buf;
-            delete[] item.vfs_rdma_read_staging_buf;
-            delete[] item.vfs_rdma_bulk_staging_buf;
+            release_vfs_rdma_buffers(&item.vfs_rdma_buffers);
             if (item.blk_rdma_active && item.blk_zone_id != 0) {
                 wki_zone_destroy(item.blk_zone_id);
             }
@@ -1268,9 +1317,7 @@ void wki_dev_server_cleanup_epoch_reset_for_peer(uint16_t node_id) {
         ker::dev::BlockDevice* block_dev = nullptr;
         ker::net::NetDevice* net_dev = nullptr;
         WkiChannelIdentity channel_identity{};
-        uint8_t* vfs_rdma_write_buf = nullptr;
-        uint8_t* vfs_rdma_read_staging_buf = nullptr;
-        uint8_t* vfs_rdma_bulk_staging_buf = nullptr;
+        VfsRdmaBuffers vfs_rdma_buffers{};
     };
     constexpr size_t MAX_CLEANUP = 32;
     bool cleaned_any = false;
@@ -1285,20 +1332,16 @@ void wki_dev_server_cleanup_epoch_reset_for_peer(uint16_t node_id) {
                 continue;
             }
 
-            work.at(work_count++) = {
+            auto& item = work.at(work_count++);
+            item = {
                 .binding = &binding,
                 .blk_zone_id = binding.blk_zone_id,
                 .blk_rdma_active = binding.blk_rdma_active,
                 .block_dev = binding.block_dev,
                 .net_dev = binding.net_dev,
                 .channel_identity = binding.channel_identity,
-                .vfs_rdma_write_buf = binding.vfs_rdma_write_buf,
-                .vfs_rdma_read_staging_buf = binding.vfs_rdma_read_staging_buf,
-                .vfs_rdma_bulk_staging_buf = binding.vfs_rdma_bulk_staging_buf,
             };
-            binding.vfs_rdma_write_buf = nullptr;
-            binding.vfs_rdma_read_staging_buf = nullptr;
-            binding.vfs_rdma_bulk_staging_buf = nullptr;
+            take_vfs_rdma_buffers_locked(binding, &item.vfs_rdma_buffers);
             binding.epoch_reset_pending = false;
         }
 
@@ -1310,11 +1353,9 @@ void wki_dev_server_cleanup_epoch_reset_for_peer(uint16_t node_id) {
         cleaned_any = true;
 
         for (size_t i = 0; i < work_count; ++i) {
-            const auto& item = work.at(i);
+            auto& item = work.at(i);
             wait_for_binding_refs_to_drain(item.binding);
-            delete[] item.vfs_rdma_write_buf;
-            delete[] item.vfs_rdma_read_staging_buf;
-            delete[] item.vfs_rdma_bulk_staging_buf;
+            release_vfs_rdma_buffers(&item.vfs_rdma_buffers);
             if (item.blk_rdma_active && item.blk_zone_id != 0) {
                 wki_zone_destroy(item.blk_zone_id);
             }
@@ -1364,9 +1405,7 @@ void wki_dev_server_detach_all_for_peer(uint16_t node_id) {
         uint16_t consumer_node = WKI_NODE_INVALID;
         uint16_t assigned_channel = 0;
         WkiChannelIdentity channel_identity{};
-        uint8_t* vfs_rdma_write_buf = nullptr;
-        uint8_t* vfs_rdma_read_staging_buf = nullptr;
-        uint8_t* vfs_rdma_bulk_staging_buf = nullptr;
+        VfsRdmaBuffers vfs_rdma_buffers{};
     };
     constexpr size_t MAX_DETACH = 32;
 
@@ -1389,20 +1428,16 @@ void wki_dev_server_detach_all_for_peer(uint16_t node_id) {
             if (work_count >= MAX_DETACH) {
                 continue;
             }
-            work.at(work_count++) = {.binding = &b,
-                                     .blk_zone_id = b.blk_zone_id,
-                                     .blk_rdma_active = b.blk_rdma_active,
-                                     .block_dev = b.block_dev,
-                                     .net_dev = b.net_dev,
-                                     .consumer_node = b.consumer_node,
-                                     .assigned_channel = b.assigned_channel,
-                                     .channel_identity = b.channel_identity,
-                                     .vfs_rdma_write_buf = b.vfs_rdma_write_buf,
-                                     .vfs_rdma_read_staging_buf = b.vfs_rdma_read_staging_buf,
-                                     .vfs_rdma_bulk_staging_buf = b.vfs_rdma_bulk_staging_buf};
-            b.vfs_rdma_write_buf = nullptr;
-            b.vfs_rdma_read_staging_buf = nullptr;
-            b.vfs_rdma_bulk_staging_buf = nullptr;
+            auto& item = work.at(work_count++);
+            item = {.binding = &b,
+                    .blk_zone_id = b.blk_zone_id,
+                    .blk_rdma_active = b.blk_rdma_active,
+                    .block_dev = b.block_dev,
+                    .net_dev = b.net_dev,
+                    .consumer_node = b.consumer_node,
+                    .assigned_channel = b.assigned_channel,
+                    .channel_identity = b.channel_identity};
+            take_vfs_rdma_buffers_locked(b, &item.vfs_rdma_buffers);
             b.epoch_reset_pending = false;
             mark_binding_retiring_locked(b);
         }
@@ -1423,11 +1458,9 @@ void wki_dev_server_detach_all_for_peer(uint16_t node_id) {
 
         // Perform cleanup outside the lock.
         for (size_t i = 0; i < work_count; i++) {
-            const auto& item = work.at(i);
+            auto& item = work.at(i);
             wait_for_binding_refs_to_drain(item.binding);
-            delete[] item.vfs_rdma_write_buf;
-            delete[] item.vfs_rdma_read_staging_buf;
-            delete[] item.vfs_rdma_bulk_staging_buf;
+            release_vfs_rdma_buffers(&item.vfs_rdma_buffers);
             if (item.blk_rdma_active && item.blk_zone_id != 0) {
                 wki_zone_destroy(item.blk_zone_id);
             }
@@ -1687,11 +1720,15 @@ void handle_dev_attach_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
         binding.vfs_export_path[sizeof(binding.vfs_export_path) - 1] = '\0';
         binding.vfs_export_name[sizeof(binding.vfs_export_name) - 1] = '\0';
 
-        // RDMA-backed VFS I/O: pre-register server-side buffers.
+        // RDMA-backed VFS I/O: pre-register server-side buffers for the
+        // anchor lane. Auxiliary lanes retain their dedicated RPC channel but
+        // deliberately use the message fallback to avoid multiplying staging
+        // memory on both peers.
         // rdma_register_region is a local-only operation - safe to call in NAPI context.
-        {
+        if ((req->attach_mode & DEV_ATTACH_DISABLE_RDMA) == 0) {
             WkiPeer const* peer = wki_peer_find(hdr->src_node);
             if (peer != nullptr && peer->rdma_transport != nullptr && peer->rdma_transport->rdma_register_region != nullptr) {
+                binding.vfs_rdma_transport = peer->rdma_transport;
                 // Write receive buffer: consumer rdma_writes file data here.
                 constexpr uint32_t VFS_WRITE_BUF = VFS_RDMA_WRITE_SIZE;
                 auto* wbuf = new (std::nothrow) uint8_t[VFS_WRITE_BUF];
@@ -1706,6 +1743,9 @@ void handle_dev_attach_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
                         ack.rdma_flags |= DEV_ATTACH_RDMA_VFS;
                         ack.blk_zone_id = rkey;  // carry server write-recv rkey to consumer
                     } else {
+                        if (REG_RET == 0 && peer->rdma_transport->rdma_unregister_region != nullptr) {
+                            static_cast<void>(peer->rdma_transport->rdma_unregister_region(peer->rdma_transport, rkey, VFS_WRITE_BUF));
+                        }
                         delete[] wbuf;
                     }
                 }
@@ -1726,6 +1766,10 @@ void handle_dev_attach_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
                             ack.rdma_flags |= DEV_ATTACH_RDMA_VFS_READ;
                             ack.rdma_read_staging_rkey = rrkey;
                         } else {
+                            if (REG_RET == 0 && peer->rdma_transport->rdma_unregister_region != nullptr) {
+                                static_cast<void>(
+                                    peer->rdma_transport->rdma_unregister_region(peer->rdma_transport, rrkey, VFS_RDMA_BOUNCE_SIZE));
+                            }
                             delete[] rbuf;
                         }
                     }
@@ -1745,6 +1789,10 @@ void handle_dev_attach_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
                             ack.rdma_flags |= DEV_ATTACH_RDMA_BULK_PULL;
                             ack.rdma_bulk_staging_rkey = brkey;
                         } else {
+                            if (BREG_RET == 0 && peer->rdma_transport->rdma_unregister_region != nullptr) {
+                                static_cast<void>(
+                                    peer->rdma_transport->rdma_unregister_region(peer->rdma_transport, brkey, VFS_RDMA_ROCE_BULK_SIZE));
+                            }
                             delete[] bbuf;
                             ker::mod::dbg::log("[WKI] VFS attach: bulk staging registration failed node=0x%04x ret=%d", hdr->src_node,
                                                BREG_RET);
@@ -1785,24 +1833,15 @@ void handle_dev_attach_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
             s_server_lock.unlock_irqrestore(SRV_FLAGS);
         }
         if (!activated) {
-            uint8_t* write_buf = nullptr;
-            uint8_t* read_buf = nullptr;
-            uint8_t* bulk_buf = nullptr;
+            VfsRdmaBuffers vfs_rdma_buffers = {};
             uint64_t const SRV_FLAGS = s_server_lock.lock_irqsave();
             if (provisional_binding != nullptr) {
-                write_buf = provisional_binding->vfs_rdma_write_buf;
-                read_buf = provisional_binding->vfs_rdma_read_staging_buf;
-                bulk_buf = provisional_binding->vfs_rdma_bulk_staging_buf;
-                provisional_binding->vfs_rdma_write_buf = nullptr;
-                provisional_binding->vfs_rdma_read_staging_buf = nullptr;
-                provisional_binding->vfs_rdma_bulk_staging_buf = nullptr;
+                take_vfs_rdma_buffers_locked(*provisional_binding, &vfs_rdma_buffers);
                 mark_binding_retiring_locked(*provisional_binding);
                 erase_retired_binding_locked(provisional_binding);
             }
             s_server_lock.unlock_irqrestore(SRV_FLAGS);
-            delete[] write_buf;
-            delete[] read_buf;
-            delete[] bulk_buf;
+            release_vfs_rdma_buffers(&vfs_rdma_buffers);
             static_cast<void>(wki_channel_close_generation(channel_identity.channel, channel_identity.peer_node_id,
                                                            channel_identity.channel_id, channel_identity.generation));
             ack = {};

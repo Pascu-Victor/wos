@@ -296,6 +296,7 @@ auto get_or_create_eth_transport(net::NetDevice* dev) -> WkiTransport* {
             slot.transport.tx_pkt = eth_wki_tx_pkt;
             slot.transport.set_rx_handler = eth_wki_set_rx_handler;
             slot.transport.rdma_register_region = nullptr;
+            slot.transport.rdma_unregister_region = nullptr;
             slot.transport.rdma_read = nullptr;
             slot.transport.rdma_write = nullptr;
             slot.transport.doorbell = nullptr;
@@ -409,6 +410,7 @@ void wki_eth_transport_init(net::NetDevice* netdev) {
     s_eth_transport.tx_pkt = eth_wki_tx_pkt;
     s_eth_transport.set_rx_handler = eth_wki_set_rx_handler;
     s_eth_transport.rdma_register_region = nullptr;
+    s_eth_transport.rdma_unregister_region = nullptr;
     s_eth_transport.rdma_read = nullptr;
     s_eth_transport.rdma_write = nullptr;
     s_eth_transport.doorbell = nullptr;

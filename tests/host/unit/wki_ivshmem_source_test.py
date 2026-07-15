@@ -60,8 +60,40 @@ def test_peer_ready_wait_deadline_is_saturating() -> None:
         fail("ivshmem peer-ready wait must not use wrapping deadline arithmetic")
 
 
+def test_rdma_bitmap_allocation_and_free_are_irq_safe() -> None:
+    source = IVSHMEM_CPP.read_text()
+    alloc = function_body(source, "rdma_bitmap_alloc")
+    free = function_body(source, "rdma_bitmap_free")
+
+    if "#include <platform/sys/spinlock.hpp>" not in source or "s_rdma_bitmap_lock" not in source:
+        fail("ivshmem RDMA bitmap must have an explicit IRQ-safe lock")
+    require_order(
+        alloc,
+        [
+            "s_rdma_bitmap_lock.lock_irqsave()",
+            "page zero permanently reserved",
+            "uint32_t start_page = 1",
+            "for (uint32_t page = 1",
+            "s_rdma_bitmap_lock.unlock_irqrestore(FLAGS)",
+        ],
+        "ivshmem RDMA bitmap allocation lock lifetime",
+    )
+    if "offset <= 0" not in free:
+        fail("ivshmem RDMA bitmap free must retain page zero as the invalid-rkey sentinel")
+    require_order(
+        free,
+        [
+            "s_rdma_bitmap_lock.lock_irqsave()",
+            "for (uint32_t p = start_page",
+            "s_rdma_bitmap_lock.unlock_irqrestore(FLAGS)",
+        ],
+        "ivshmem RDMA bitmap free lock lifetime",
+    )
+
+
 def main() -> None:
     test_peer_ready_wait_deadline_is_saturating()
+    test_rdma_bitmap_allocation_and_free_are_irq_safe()
     print("WKI ivshmem source invariants hold")
 
 

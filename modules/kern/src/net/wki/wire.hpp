@@ -555,6 +555,11 @@ constexpr uint8_t DEV_ATTACH_MODE_KIND_MASK = 0x0F;
 constexpr uint8_t DEV_ATTACH_ACCESS_READ = 0x10;
 constexpr uint8_t DEV_ATTACH_ACCESS_WRITE = 0x20;
 constexpr uint8_t DEV_ATTACH_ACCESS_MASK = DEV_ATTACH_ACCESS_READ | DEV_ATTACH_ACCESS_WRITE;
+// The consumer can keep a dedicated RPC attachment without asking the owner to
+// reserve per-binding RDMA staging regions. This preserves the fixed attach
+// payload layout and leaves the request usable by older peers, which simply
+// ignore unknown high bits.
+constexpr uint8_t DEV_ATTACH_DISABLE_RDMA = 0x40;
 
 constexpr auto dev_attach_mode_kind(uint8_t mode) -> AttachMode { return static_cast<AttachMode>(mode & DEV_ATTACH_MODE_KIND_MASK); }
 

@@ -12,6 +12,10 @@ REMOTE_NET_HPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "remote_net
 REMOTE_VFS_HPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "remote_vfs.hpp"
 WIRE_HPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "wire.hpp"
 WKI_CPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "wki.cpp"
+WKI_HPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "wki.hpp"
+TRANSPORT_ETH_CPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "transport_eth.cpp"
+TRANSPORT_IVSHMEM_CPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "transport_ivshmem.cpp"
+TRANSPORT_ROCE_CPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "transport_roce.cpp"
 WKI_DEV_SERVER_KTEST = ROOT / "modules" / "kern" / "src" / "test" / "wki_dev_server_ktest.cpp"
 
 
@@ -338,7 +342,7 @@ def test_detach_admission_is_napi_safe_and_cleanup_is_deferred() -> None:
         "binding.detach_cleanup_claimed",
         "wait_for_binding_refs_to_drain(item.binding)",
         "wki_remote_vfs_mark_server_fds_for_channel(item.channel_identity)",
-        "delete[] item.vfs_rdma_write_buf",
+        "release_vfs_rdma_buffers(&item.vfs_rdma_buffers)",
         "wki_zone_destroy(item.blk_zone_id)",
         "item.block_dev->remotable->on_remote_detach(item.consumer_node)",
         "item.net_dev->remotable->on_remote_detach(item.consumer_node)",
@@ -349,7 +353,12 @@ def test_detach_admission_is_napi_safe_and_cleanup_is_deferred() -> None:
         if token not in worker:
             fail(f"task-context DEV_DETACH cleanup is missing {token!r}")
     require_order(worker, "binding.detach_cleanup_claimed = true", "wait_for_binding_refs_to_drain(item.binding)", "detach claim")
-    require_order(worker, "wait_for_binding_refs_to_drain(item.binding)", "delete[] item.vfs_rdma_write_buf", "detach ref drain")
+    require_order(
+        worker,
+        "wait_for_binding_refs_to_drain(item.binding)",
+        "release_vfs_rdma_buffers(&item.vfs_rdma_buffers)",
+        "detach VFS RDMA ref drain",
+    )
     require_order(worker, "wki_channel_close_generation(item.channel_identity.channel", "erase_retired_binding_locked(item.binding)", "detach erase")
 
     if "handle_dev_detach" in source or "handle_dev_detach" in header:
@@ -727,7 +736,12 @@ def test_detach_waits_for_binding_refs_before_cleanup_and_erase() -> None:
     detach_body = function_body(DEV_SERVER_CPP.read_text(), "wki_dev_server_process_pending_detaches")
 
     require_order(detach_all_body, "mark_binding_retiring_locked(b);", "wait_for_binding_refs_to_drain(item.binding);", "fence retire wait")
-    require_order(detach_all_body, "wait_for_binding_refs_to_drain(item.binding);", "delete[] item.vfs_rdma_write_buf;", "fence wait before free")
+    require_order(
+        detach_all_body,
+        "wait_for_binding_refs_to_drain(item.binding);",
+        "release_vfs_rdma_buffers(&item.vfs_rdma_buffers);",
+        "fence wait before VFS RDMA unregister/free",
+    )
     require_order(detach_all_body, "wait_for_binding_refs_to_drain(item.binding);", "wki_zone_destroy(item.blk_zone_id);", "fence wait before zone destroy")
     require_order(detach_all_body, "wki_zone_destroy(item.blk_zone_id);", "erase_retired_binding_locked(work.at(i).binding);", "fence erase after cleanup")
 
@@ -737,7 +751,12 @@ def test_detach_waits_for_binding_refs_before_cleanup_and_erase() -> None:
         "wait_for_binding_refs_to_drain(item.binding);",
         "detach claim before wait",
     )
-    require_order(detach_body, "wait_for_binding_refs_to_drain(item.binding);", "delete[] item.vfs_rdma_write_buf;", "detach wait before free")
+    require_order(
+        detach_body,
+        "wait_for_binding_refs_to_drain(item.binding);",
+        "release_vfs_rdma_buffers(&item.vfs_rdma_buffers);",
+        "detach wait before VFS RDMA unregister/free",
+    )
     require_order(
         detach_body,
         "wait_for_binding_refs_to_drain(item.binding);",
@@ -784,8 +803,8 @@ def test_epoch_cleanup_and_deferred_vfs_are_channel_generation_fenced() -> None:
     require_order(
         cleanup,
         "wait_for_binding_refs_to_drain(item.binding)",
-        "delete[] item.vfs_rdma_write_buf",
-        "epoch cleanup must drain workers before freeing VFS staging",
+        "release_vfs_rdma_buffers(&item.vfs_rdma_buffers)",
+        "epoch cleanup must drain workers before releasing VFS staging",
     )
     require_order(
         cleanup,
@@ -964,6 +983,92 @@ def test_detach_admission_has_ktest_coverage() -> None:
             fail(f"detach admission KTEST coverage is missing {token!r}")
 
 
+def test_vfs_auxiliary_attach_disables_rdma_and_teardown_unregisters_regions() -> None:
+    source = DEV_SERVER_CPP.read_text()
+    header = DEV_SERVER_HPP.read_text()
+    wire = WIRE_HPP.read_text()
+    attach = function_body(source, "handle_dev_attach_req")
+    release = function_body(source, "release_vfs_rdma_buffers")
+
+    for token in [
+        "constexpr uint8_t DEV_ATTACH_DISABLE_RDMA = 0x40;",
+        "static_assert(sizeof(DevAttachReqPayload) == 12",
+    ]:
+        if token not in wire:
+            fail(f"VFS auxiliary RDMA opt-out must preserve the attach ABI: missing {token!r}")
+    for token in [
+        "WkiTransport* vfs_rdma_transport = nullptr;",
+        "vfs_rdma_transport(o.vfs_rdma_transport)",
+        "vfs_rdma_transport = o.vfs_rdma_transport;",
+    ]:
+        if token not in header:
+            fail(f"VFS binding must retain the provider that owns every registered region: missing {token!r}")
+    require_order(
+        attach,
+        "if ((req->attach_mode & DEV_ATTACH_DISABLE_RDMA) == 0)",
+        "binding.vfs_rdma_transport = peer->rdma_transport;",
+        "owner RDMA setup remains inside the opt-in attach branch",
+    )
+    vfs_rdm_attach = attach[attach.find("if ((req->attach_mode & DEV_ATTACH_DISABLE_RDMA) == 0)") :]
+    require_order(
+        vfs_rdm_attach,
+        "binding.vfs_rdma_transport = peer->rdma_transport;",
+        "->rdma_register_region(",
+        "owner selects the provider before registering VFS buffers",
+    )
+
+    for token in [
+        "buffers->transport->rdma_unregister_region",
+        "buffers->write_rkey, VFS_RDMA_WRITE_SIZE",
+        "buffers->read_staging_rkey,",
+        "buffers->bulk_staging_rkey,",
+        "delete[] buffers->write_buf",
+        "delete[] buffers->read_staging_buf",
+        "delete[] buffers->bulk_staging_buf",
+    ]:
+        if token not in release:
+            fail(f"VFS RDMA teardown is missing {token!r}")
+    require_order(
+        release,
+        "buffers->transport->rdma_unregister_region",
+        "delete[] buffers->write_buf",
+        "VFS region metadata must be removed before backing memory is freed",
+    )
+
+    for name in [
+        "wki_dev_server_finish_vfs_export_reconciliation",
+        "wki_dev_server_process_pending_detaches",
+        "wki_dev_server_cleanup_epoch_reset_for_peer",
+        "wki_dev_server_detach_all_for_peer",
+    ]:
+        body = function_body(source, name)
+        require_order(
+            body,
+            "wait_for_binding_refs_to_drain",
+            "release_vfs_rdma_buffers",
+            f"{name} releases VFS regions only after binding refs drain",
+        )
+    require_order(
+        attach,
+        "take_vfs_rdma_buffers_locked(*provisional_binding, &vfs_rdma_buffers);",
+        "release_vfs_rdma_buffers(&vfs_rdma_buffers);",
+        "failed provisional VFS attaches release registered regions",
+    )
+
+    wki = WKI_HPP.read_text()
+    for token in [
+        "int (*rdma_unregister_region)(WkiTransport* self, uint32_t rkey, uint32_t size);",
+        "rdma_unregister_region = nullptr;",
+    ]:
+        if token not in wki and token not in TRANSPORT_ETH_CPP.read_text():
+            fail(f"transport region teardown API is missing {token!r}")
+    if "roce_rdma_unregister_region" not in TRANSPORT_ROCE_CPP.read_text():
+        fail("RoCE must remove persistent VFS regions from its rkey registry")
+    ivshmem = TRANSPORT_IVSHMEM_CPP.read_text()
+    if "rdma_unregister_region = nullptr;" not in ivshmem or "no remote revocation" not in ivshmem:
+        fail("ivshmem must keep raw RDMA offset keys pinned without a remote-revocation protocol")
+
+
 def main() -> None:
     test_rx_forward_does_not_spend_credits_before_delivery_is_possible()
     test_rx_forward_sends_notify_cookie_envelope()
@@ -992,6 +1097,7 @@ def main() -> None:
     test_epoch_cleanup_and_deferred_vfs_are_channel_generation_fenced()
     test_attach_ack_failure_defers_exact_cleanup_outside_rx()
     test_detach_admission_has_ktest_coverage()
+    test_vfs_auxiliary_attach_disables_rdma_and_teardown_unregisters_regions()
     print("WKI dev server source invariants hold")
 
 

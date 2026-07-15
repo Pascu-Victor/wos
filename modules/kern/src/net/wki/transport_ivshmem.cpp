@@ -12,6 +12,7 @@
 #include <net/wki/wki.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/interrupt/gates.hpp>
+#include <platform/sys/spinlock.hpp>
 
 #include "platform/ktime/ktime.hpp"
 
@@ -118,9 +119,10 @@ struct IvshmemTransportPrivate {
     WkiRxHandler rx_handler;
 };
 
-WkiTransport s_ivshmem_transport;        // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-IvshmemTransportPrivate s_ivshmem_priv;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-bool s_ivshmem_initialized = false;      // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+WkiTransport s_ivshmem_transport;            // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+IvshmemTransportPrivate s_ivshmem_priv;      // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+bool s_ivshmem_initialized = false;          // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+ker::mod::sys::Spinlock s_rdma_bitmap_lock;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
 // -----------------------------------------------------------------------------
 // Ring operations
@@ -189,16 +191,22 @@ auto ring_read(WkiRing* ring, uint8_t* buf, uint16_t buf_size) -> uint16_t {
 // -----------------------------------------------------------------------------
 
 auto rdma_bitmap_alloc(IvshmemTransportPrivate* priv, uint32_t size) -> int64_t {
+    if (priv == nullptr) {
+        return -1;
+    }
     uint32_t const PAGES_NEEDED = (size + RDMA_PAGE_SIZE - 1) / RDMA_PAGE_SIZE;
     if (PAGES_NEEDED == 0) {
         return -1;
     }
 
-    // Simple first-fit scan
+    int64_t allocated_offset = -1;
+    uint64_t const FLAGS = s_rdma_bitmap_lock.lock_irqsave();
+    // Offset zero is the invalid rkey sentinel used by WKI callers, so keep
+    // page zero permanently reserved and allocate only nonzero offsets.
     uint32_t consecutive = 0;
-    uint32_t start_page = 0;
+    uint32_t start_page = 1;
 
-    for (uint32_t page = 0; page < RDMA_MAX_PAGES; page++) {
+    for (uint32_t page = 1; page < RDMA_MAX_PAGES; page++) {
         uint32_t const BYTE_IDX = page / 8;
         uint32_t const BIT_IDX = page % 8;
 
@@ -214,23 +222,30 @@ auto rdma_bitmap_alloc(IvshmemTransportPrivate* priv, uint32_t size) -> int64_t 
                     uint32_t const BT = p % 8;
                     priv->rdma_bitmap.at(BI) |= static_cast<uint8_t>(1U << BT);
                 }
-                return static_cast<int64_t>(start_page) * static_cast<int64_t>(RDMA_PAGE_SIZE);
+                allocated_offset = static_cast<int64_t>(start_page) * static_cast<int64_t>(RDMA_PAGE_SIZE);
+                break;
             }
         }
     }
 
-    return -1;  // no space
+    s_rdma_bitmap_lock.unlock_irqrestore(FLAGS);
+    return allocated_offset;
 }
 
 void rdma_bitmap_free(IvshmemTransportPrivate* priv, int64_t offset, uint32_t size) {
+    if (priv == nullptr || offset <= 0 || size == 0) {
+        return;
+    }
     auto start_page = static_cast<uint32_t>(offset / RDMA_PAGE_SIZE);
     uint32_t const PAGES = (size + RDMA_PAGE_SIZE - 1) / RDMA_PAGE_SIZE;
 
+    uint64_t const FLAGS = s_rdma_bitmap_lock.lock_irqsave();
     for (uint32_t p = start_page; p < start_page + PAGES && p < RDMA_MAX_PAGES; p++) {
         uint32_t const BI = p / 8;
         uint32_t const BT = p % 8;
         priv->rdma_bitmap.at(BI) &= static_cast<uint8_t>(~(1U << BT));
     }
+    s_rdma_bitmap_lock.unlock_irqrestore(FLAGS);
 }
 
 // -----------------------------------------------------------------------------
@@ -573,6 +588,11 @@ void wki_ivshmem_transport_init() {
     s_ivshmem_transport.tx_pkt = ivshmem_wki_tx_pkt;
     s_ivshmem_transport.set_rx_handler = ivshmem_wki_set_rx_handler;
     s_ivshmem_transport.rdma_register_region = ivshmem_wki_rdma_register_region;
+    // Raw ivshmem writes carry only an offset and have no remote revocation
+    // handshake. Keep allocations pinned until ivshmem transport/VM reset
+    // rather than recycling an rkey while an already-issued peer write can
+    // still target it.
+    s_ivshmem_transport.rdma_unregister_region = nullptr;
     s_ivshmem_transport.rdma_read = ivshmem_wki_rdma_read;
     s_ivshmem_transport.rdma_write = ivshmem_wki_rdma_write;
     s_ivshmem_transport.doorbell = ivshmem_wki_doorbell;
