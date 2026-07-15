@@ -54,6 +54,10 @@ struct VirtIONetQueuePair {
     uint8_t index{};
     uint8_t irq_vector{};
     uint8_t rx_empty_pending_rearms{};
+
+    // Serializes the short IRQ/NAPI notification handoff.  Poll processing
+    // itself runs without this lock.
+    ker::mod::sys::Spinlock notification_lock;
 };
 
 struct VirtIONetDevice {
@@ -73,9 +77,6 @@ struct VirtIONetDevice {
     volatile uint8_t* notify_base{};
     uint32_t notify_off_multiplier{};
     volatile uint8_t* device_cfg_base{};
-
-    // Serializes QUEUE_SELECT + MSI_QUEUE_VECTOR programming.
-    ker::mod::sys::Spinlock irq_lock;
 };
 
 auto virtio_net_init() -> int;

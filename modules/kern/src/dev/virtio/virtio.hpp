@@ -92,6 +92,10 @@ constexpr uint16_t VRING_DESC_F_NEXT = 1;
 constexpr uint16_t VRING_DESC_F_WRITE = 2;
 constexpr uint16_t VRING_DESC_F_INDIRECT = 4;
 
+// Split-ring available flags.  WOS deliberately does not negotiate
+// VIRTIO_RING_F_EVENT_IDX, so bit 0 controls device-to-driver notifications.
+constexpr uint16_t VIRTQ_AVAIL_F_NO_INTERRUPT = 1;
+
 // VirtIO net header (prepended to every packet)
 struct VirtIONetHeader {
     uint8_t flags;
@@ -172,9 +176,9 @@ auto virtq_add_buf(Virtqueue* vq, uint64_t phys, uint32_t len, uint16_t flags, k
 auto virtq_get_buf(Virtqueue* vq, uint32_t* out_len) -> uint16_t;  // returns desc idx, VIRTQ_NO_BUF, or VIRTQ_BAD_BUF
 void virtq_kick(Virtqueue* vq);
 
-// Check if device has added buffers to the used ring that the driver
-// hasn't consumed yet.  Used after re-enabling notifications to detect
-// the missed-notification race (device posted while vectors were NO_VECTOR).
+// Check if the device has added buffers to the used ring that the driver has
+// not consumed yet.  Used after clearing VIRTQ_AVAIL_F_NO_INTERRUPT to close
+// the split-ring missed-notification race.
 inline bool virtq_has_pending(const Virtqueue* vq) {
     __atomic_thread_fence(__ATOMIC_ACQUIRE);
     return vq->last_used_idx != vq->used->idx;

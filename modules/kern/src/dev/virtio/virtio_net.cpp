@@ -450,15 +450,35 @@ void fill_virtqueue_diag(Virtqueue* vq, VirtqueueDiagSnapshot& out) {
     vq->lock.unlock_irqrestore(FLAGS);
 }
 
-// Per-queue-pair MSI-X vector control. The MSI-X entry index matches the
-// queue-pair index.
-void virtio_net_irq_disable_pair(VirtIONetDevice* dev, uint8_t pair) {
+// The available-ring flags are DMA-visible and may be updated concurrently by
+// IRQ and poll contexts on different CPUs.  Store the whole aligned flags word
+// atomically; EVENT_IDX is not negotiated, so bit 0 is the only active flag.
+void virtio_net_set_queue_notifications(Virtqueue* vq, bool enabled) {
+    if (vq == nullptr || vq->avail == nullptr) {
+        return;
+    }
+
+    auto* flags = reinterpret_cast<uint16_t*>(vq->avail);
+    uint16_t const VALUE = enabled ? uint16_t{0} : VIRTQ_AVAIL_F_NO_INTERRUPT;
+    __atomic_store_n(flags, VALUE, __ATOMIC_RELEASE);
+}
+
+void virtio_net_set_pair_notifications(VirtIONetQueuePair* pair, bool enabled) {
+    if (pair == nullptr) {
+        return;
+    }
+    virtio_net_set_queue_notifications(pair->rxq, enabled);
+    virtio_net_set_queue_notifications(pair->txq, enabled);
+}
+
+// Queue-vector mappings remain fixed for active pairs.  This helper is only
+// used to permanently detach pairs left inactive by an MQ activation failure.
+void virtio_net_unassign_pair_vectors(VirtIONetDevice* dev, uint8_t pair) {
     if (!dev->msix_enabled) {
         return;
     }
-    auto const RX_Q = static_cast<uint16_t>(pair * 2);
-    auto const TX_Q = static_cast<uint16_t>((pair * 2) + 1);
-    uint64_t const FLAGS = dev->irq_lock.lock_irqsave();
+    auto const RX_Q = static_cast<uint16_t>(pair * 2U);
+    auto const TX_Q = static_cast<uint16_t>((pair * 2U) + 1U);
     if (dev->modern_cfg != nullptr) {
         dev->modern_cfg->queue_select = RX_Q;
         dev->modern_cfg->queue_msix_vector = VIRTIO_MSI_NO_VECTOR;
@@ -470,62 +490,58 @@ void virtio_net_irq_disable_pair(VirtIONetDevice* dev, uint8_t pair) {
         ::outw(dev->io_base + VIRTIO_REG_QUEUE_SELECT, TX_Q);
         ::outw(dev->io_base + VIRTIO_MSI_QUEUE_VECTOR, VIRTIO_MSI_NO_VECTOR);
     }
-    dev->irq_lock.unlock_irqrestore(FLAGS);
 }
 
-void virtio_net_irq_enable_pair(VirtIONetDevice* dev, uint8_t pair) {
-    if (!dev->msix_enabled) {
-        return;
-    }
-    auto const RX_Q = static_cast<uint16_t>(pair * 2);
-    auto const TX_Q = static_cast<uint16_t>((pair * 2) + 1);
-    uint16_t const ENTRY = pair;
-    uint64_t const FLAGS = dev->irq_lock.lock_irqsave();
-    if (dev->modern_cfg != nullptr) {
-        dev->modern_cfg->queue_select = RX_Q;
-        dev->modern_cfg->queue_msix_vector = ENTRY;
-        dev->modern_cfg->queue_select = TX_Q;
-        dev->modern_cfg->queue_msix_vector = ENTRY;
-    } else {
-        ::outw(dev->io_base + VIRTIO_REG_QUEUE_SELECT, RX_Q);
-        ::outw(dev->io_base + VIRTIO_MSI_QUEUE_VECTOR, ENTRY);
-        ::outw(dev->io_base + VIRTIO_REG_QUEUE_SELECT, TX_Q);
-        ::outw(dev->io_base + VIRTIO_MSI_QUEUE_VECTOR, ENTRY);
-    }
-    dev->irq_lock.unlock_irqrestore(FLAGS);
-}
+struct VirtIONetPending {
+    bool rx{};
+    bool tx{};
+};
 
-auto rx_pending_after_irq_enable(VirtIONetDevice* dev, VirtIONetQueuePair* pair) -> bool {
+auto virtio_net_pair_pending(VirtIONetDevice* dev, VirtIONetQueuePair* pair) -> VirtIONetPending {
     if (dev == nullptr || pair == nullptr || pair->rxq == nullptr) {
-        return false;
+        return {};
     }
 
-    bool has_pending = virtq_has_pending(pair->rxq);
-    if (pair->index == 0 && !has_pending && dev->configured_queue_pairs > dev->num_queue_pairs) {
+    VirtIONetPending pending{.rx = virtq_has_pending(pair->rxq)};
+    if (pair->txq != nullptr) {
+        uint64_t const TX_FLAGS = pair->txq->lock.lock_irqsave();
+        pending.tx = virtq_has_pending(pair->txq);
+        pair->txq->lock.unlock_irqrestore(TX_FLAGS);
+    }
+    if (pair->index == 0 && !pending.rx && dev->configured_queue_pairs > dev->num_queue_pairs) {
         for (uint8_t i = dev->num_queue_pairs; i < dev->configured_queue_pairs; i++) {
             auto* rxq = dev->queue_pairs.at(i).rxq;
             if (rxq != nullptr && virtq_has_pending(rxq)) {
-                has_pending = true;
+                pending.rx = true;
                 break;
             }
         }
     }
-    return has_pending;
+    return pending;
 }
 
-auto should_rearm_rx_after_complete(VirtIONetDevice* dev, VirtIONetQueuePair* pair, int processed) -> bool {
+auto should_reschedule_after_notification_rearm(VirtIONetDevice* dev, VirtIONetQueuePair* pair, int rx_processed) -> bool {
     if (pair == nullptr) {
         return false;
     }
 
-    bool const HAS_PENDING = rx_pending_after_irq_enable(dev, pair);
-    if (!HAS_PENDING) {
+    VirtIONetPending const PENDING = virtio_net_pair_pending(dev, pair);
+    if (rx_processed != 0) {
+        pair->rx_empty_pending_rearms = 0;
+    }
+
+    // TX used entries are always consumable under txq->lock.  Reschedule them
+    // without the defensive RX no-progress bound so transmit-side reclamation
+    // cannot strand a completion posted while notifications were suppressed.
+    if (PENDING.tx) {
+        return true;
+    }
+    if (!PENDING.rx) {
         pair->rx_empty_pending_rearms = 0;
         return false;
     }
 
-    if (processed != 0) {
-        pair->rx_empty_pending_rearms = 0;
+    if (rx_processed != 0) {
         return true;
     }
 
@@ -537,6 +553,43 @@ auto should_rearm_rx_after_complete(VirtIONetDevice* dev, VirtIONetQueuePair* pa
     return false;
 }
 
+// Caller holds pair->notification_lock.
+auto virtio_net_rearm_pair_notifications_locked(VirtIONetDevice* dev, VirtIONetQueuePair* pair, int rx_processed) -> bool {
+    virtio_net_set_pair_notifications(pair, true);
+
+    // A full store->load barrier is required between making notifications
+    // visible to the device and checking whether it posted work meanwhile.
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    bool const SHOULD_RESCHEDULE = should_reschedule_after_notification_rearm(dev, pair, rx_processed);
+    bool const NAPI_IDLE = pair->napi.state.load(std::memory_order_acquire) == ker::net::NapiState::IDLE;
+
+    // A duplicate IRQ or inline rescue poll may already own this pair.  Keep
+    // notifications suppressed until that owner completes its own handshake.
+    if (SHOULD_RESCHEDULE || !NAPI_IDLE) {
+        virtio_net_set_pair_notifications(pair, false);
+    }
+    return SHOULD_RESCHEDULE;
+}
+
+void virtio_net_begin_poll(VirtIONetQueuePair* pair) {
+    uint64_t const FLAGS = pair->notification_lock.lock_irqsave();
+    virtio_net_set_pair_notifications(pair, false);
+    pair->notification_lock.unlock_irqrestore(FLAGS);
+}
+
+void virtio_net_complete_poll(VirtIONetDevice* dev, VirtIONetQueuePair* pair, ker::net::NapiStruct* napi, int rx_processed) {
+    uint64_t const FLAGS = pair->notification_lock.lock_irqsave();
+    ker::net::napi_complete(napi);
+
+    // Handle missed notification races across notification re-enable without
+    // letting a stale/non-consumable pending bit spin an idle queue forever.
+    bool const SHOULD_RESCHEDULE = virtio_net_rearm_pair_notifications_locked(dev, pair, rx_processed);
+    pair->notification_lock.unlock_irqrestore(FLAGS);
+    if (SHOULD_RESCHEDULE) {
+        ker::net::napi_schedule(napi);
+    }
+}
+
 int virtio_net_poll(ker::net::NapiStruct* napi, int budget) {
     NET_TRACE_SPAN(SPAN_NAPI_POLL);
     auto* dev = static_cast<VirtIONetDevice*>(napi->dev->private_data);
@@ -546,6 +599,10 @@ int virtio_net_poll(ker::net::NapiStruct* napi, int budget) {
         ker::net::napi_complete(napi);
         return 0;
     }
+    // An inline rescue poll can claim POLLING while the prior owner is still
+    // completing.  This short gate keeps it away from queue state until the
+    // prior notification handshake has finished.
+    virtio_net_begin_poll(pair);
     int processed = 0;
 
     // Reclaim TX buffers early to return PacketBuffers to the pool.
@@ -576,15 +633,7 @@ int virtio_net_poll(ker::net::NapiStruct* napi, int budget) {
     }
 
     if (processed < budget) {
-        ker::net::napi_complete(napi);
-        virtio_net_irq_enable_pair(dev, pair->index);
-
-        // Handle missed notification races across IRQ re-enable without
-        // letting a stale/non-consumable pending bit spin an idle queue forever.
-        if (should_rearm_rx_after_complete(dev, pair, processed)) {
-            virtio_net_irq_disable_pair(dev, pair->index);
-            ker::net::napi_schedule(napi);
-        }
+        virtio_net_complete_poll(dev, pair, napi, processed);
     }
 
     return processed;
@@ -607,7 +656,9 @@ void virtio_net_irq(uint8_t vector, void* private_data) {
     }
 
     // Always defer packet processing to NAPI worker context.
-    virtio_net_irq_disable_pair(dev, pair->index);
+    uint64_t const FLAGS = pair->notification_lock.lock_irqsave();
+    virtio_net_set_pair_notifications(pair, false);
+    pair->notification_lock.unlock_irqrestore(FLAGS);
     ker::net::napi_schedule(&pair->napi);
 }
 
@@ -983,6 +1034,7 @@ auto init_device_modern(ker::dev::pci::PCIDevice* pci_dev) -> int {
             return nullptr;
         }
         vq->queue_index = q_idx;
+        virtio_net_set_queue_notifications(vq, false);
         uint16_t const NOTIFY_OFF = cfg->queue_notify_off;
         vq->notify_addr = reinterpret_cast<volatile uint16_t*>(notify_va + (static_cast<size_t>(NOTIFY_OFF) * notify_off_mult));
 
@@ -1156,6 +1208,7 @@ auto init_device_modern(ker::dev::pci::PCIDevice* pci_dev) -> int {
 
     for (uint8_t pair_idx = 0; pair_idx < dev->num_queue_pairs; pair_idx++) {
         auto& pair = dev->queue_pairs.at(pair_idx);
+        ker::net::napi_init(&pair.napi, &dev->netdev, virtio_net_poll, 64);
         if (pair.irq_vector != 0) {
             ker::mod::gates::request_irq(pair.irq_vector, virtio_net_irq, &pair, pair_idx == 0 ? "virtio-net" : "virtio-net-mq");
         }
@@ -1175,7 +1228,8 @@ auto init_device_modern(ker::dev::pci::PCIDevice* pci_dev) -> int {
         if (!send_mq_ctrl_cmd(dev, dev->num_queue_pairs)) {
             net_log::warn("MQ activation failed, downgrading to single-queue");
             for (uint8_t pair_idx = 1; pair_idx < dev->num_queue_pairs; pair_idx++) {
-                virtio_net_irq_disable_pair(dev, pair_idx);
+                virtio_net_set_pair_notifications(&dev->queue_pairs.at(pair_idx), false);
+                virtio_net_unassign_pair_vectors(dev, pair_idx);
             }
             dev->num_queue_pairs = SINGLE_QUEUE_PAIRS;
         }
@@ -1191,14 +1245,12 @@ auto init_device_modern(ker::dev::pci::PCIDevice* pci_dev) -> int {
     ker::net::netdev_register(&dev->netdev);
     for (uint8_t pair_idx = 0; pair_idx < dev->num_queue_pairs; pair_idx++) {
         auto& pair = dev->queue_pairs.at(pair_idx);
-        ker::net::napi_init(&pair.napi, &dev->netdev, virtio_net_poll, 64);
         ker::net::napi_enable(&pair.napi, net_cpu_for_pair(CORE_COUNT, pair_idx));
-
-        // Re-arm MSI-X vectors in case an interrupt fired between requestIrq
-        // and napi_enable (e.g. during the ctrl-queue spin).  virtio_net_irq
-        // disables the pair on entry but napi_schedule silently fails while
-        // NAPI is DISABLED, so vectors stay at NO_VECTOR unless restored here.
-        virtio_net_irq_enable_pair(dev, pair_idx);
+        if (pair.napi.worker != nullptr) {
+            // Keep notifications suppressed until the NAPI owner drains any
+            // startup completions and performs the normal rearm handshake.
+            ker::net::napi_schedule(&pair.napi);
+        }
     }
 
     devices.at(device_count++) = dev;
@@ -1285,6 +1337,7 @@ auto init_device(ker::dev::pci::PCIDevice* pci_dev) -> int {
     }
     pair0.rxq->io_base = io_base;
     pair0.rxq->queue_index = rx_queue_index(0);
+    virtio_net_set_queue_notifications(pair0.rxq, false);
 
     uint64_t const RXQ_PHYS = virt_to_phys(pair0.rxq->desc);
     ::outl(io_base + VIRTIO_REG_QUEUE_ADDR, static_cast<uint32_t>(RXQ_PHYS / 4096));
@@ -1308,6 +1361,7 @@ auto init_device(ker::dev::pci::PCIDevice* pci_dev) -> int {
     }
     pair0.txq->io_base = io_base;
     pair0.txq->queue_index = tx_queue_index(0);
+    virtio_net_set_queue_notifications(pair0.txq, false);
 
     uint64_t const TXQ_PHYS = virt_to_phys(pair0.txq->desc);
     ::outl(io_base + VIRTIO_REG_QUEUE_ADDR, static_cast<uint32_t>(TXQ_PHYS / 4096));
@@ -1369,6 +1423,7 @@ auto init_device(ker::dev::pci::PCIDevice* pci_dev) -> int {
 
     for (uint8_t pair_idx = 0; pair_idx < dev->num_queue_pairs; pair_idx++) {
         auto& pair = dev->queue_pairs.at(pair_idx);
+        ker::net::napi_init(&pair.napi, &dev->netdev, virtio_net_poll, 64);
         if (pair.irq_vector != 0) {
             ker::mod::gates::request_irq(pair.irq_vector, virtio_net_irq, &pair, pair_idx == 0 ? "virtio-net" : "virtio-net-mq");
         }
@@ -1389,9 +1444,12 @@ auto init_device(ker::dev::pci::PCIDevice* pci_dev) -> int {
 
     for (uint8_t pair_idx = 0; pair_idx < dev->num_queue_pairs; pair_idx++) {
         auto& pair = dev->queue_pairs.at(pair_idx);
-        ker::net::napi_init(&pair.napi, &dev->netdev, virtio_net_poll, 64);
         ker::net::napi_enable(&pair.napi, net_cpu_for_pair(CORE_COUNT, pair_idx));
-        virtio_net_irq_enable_pair(dev, pair_idx);
+        if (pair.napi.worker != nullptr) {
+            // Keep notifications suppressed until the NAPI owner drains any
+            // startup completions and performs the normal rearm handshake.
+            ker::net::napi_schedule(&pair.napi);
+        }
     }
 
     devices.at(device_count++) = dev;
