@@ -1039,6 +1039,8 @@ def collect_wos_cpustat(
                 cwd=ROOT,
                 check=False,
                 text=True,
+                encoding="utf-8",
+                errors="backslashreplace",
                 capture_output=True,
                 timeout=args.wos_preflight_timeout,
             )
@@ -1104,6 +1106,8 @@ def collect_wos_perf_command(
                 cwd=ROOT,
                 check=False,
                 text=True,
+                encoding="utf-8",
+                errors="backslashreplace",
                 capture_output=True,
                 timeout=args.wos_preflight_timeout,
             )

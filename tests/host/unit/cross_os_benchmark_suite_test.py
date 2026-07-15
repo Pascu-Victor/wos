@@ -1197,6 +1197,56 @@ def test_runtime_collection_failure_aborts_before_benchmarks(runner) -> None:
         runner.run_wos_showcase = original_showcase
 
 
+def test_optional_perf_diagnostics_preserve_invalid_utf8(runner) -> None:
+    parser = runner.build_parser()
+    args = parser.parse_args(["--num-vms", "1"])
+    original_remote_scripts = runner.REMOTE_SCRIPTS
+
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            step_dir = Path(tmp) / "step"
+            remote_scripts = Path(tmp) / "remote"
+            remote_scripts.mkdir()
+            remote_command = remote_scripts / "wos_ssh.sh"
+            remote_command.write_text(
+                "#!/bin/sh\n"
+                "printf 'stdout:\\264\\n'\n"
+                "printf 'stderr:\\265\\n' >&2\n",
+                encoding="utf-8",
+            )
+            remote_command.chmod(0o755)
+            runner.REMOTE_SCRIPTS = remote_scripts
+
+            cpustat_entries = runner.collect_wos_cpustat(args, step_dir, ["wos-0.wos"], "before")
+            report_entries = runner.collect_wos_perf_command(
+                args,
+                step_dir,
+                ["wos-0.wos"],
+                "before",
+                "wki-report",
+                ["wki-report"],
+            )
+
+            for entry in [*cpustat_entries, *report_entries]:
+                assert_equal(entry["status"], "ok", "diagnostic capture status")
+                assert_equal(entry["returncode"], 0, "diagnostic capture return code")
+                assert_equal(
+                    Path(entry["stdout_file"]).read_text(encoding="utf-8"),
+                    "stdout:\\xb4\n",
+                    "diagnostic stdout preserves invalid UTF-8",
+                )
+                assert_equal(
+                    Path(entry["stderr_file"]).read_text(encoding="utf-8"),
+                    "stderr:\\xb5\n",
+                    "diagnostic stderr preserves invalid UTF-8",
+                )
+                metadata = json.loads(Path(entry["metadata_file"]).read_text(encoding="utf-8"))
+                assert_equal(metadata["status"], "ok", "diagnostic metadata status")
+                assert_equal(metadata["artifacts"], entry["artifacts"], "diagnostic metadata artifacts")
+    finally:
+        runner.REMOTE_SCRIPTS = original_remote_scripts
+
+
 def main() -> None:
     runner = load_runner()
     tests = [
@@ -1218,6 +1268,7 @@ def main() -> None:
         test_manifest_snapshots_validated_config,
         test_linux_only_manifest_preserves_config_only_evidence,
         test_runtime_collection_failure_aborts_before_benchmarks,
+        test_optional_perf_diagnostics_preserve_invalid_utf8,
     ]
     for test in tests:
         test(runner)
