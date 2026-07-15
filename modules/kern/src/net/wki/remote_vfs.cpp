@@ -6486,6 +6486,15 @@ auto mount_vfs_proxy_lane(uint16_t owner_node, uint32_t resource_id, const char*
         if (LANE_RET != 0) {
             ker::mod::dbg::log("[WKI] Remote VFS auxiliary lane unavailable: node=0x%04x res_id=%u lane=%u ret=%d", owner_node, resource_id,
                                lane_index, LANE_RET);
+            // Capacity and transport failures may still leave a useful
+            // partial group. NOT_FOUND and STALE_RESOURCE are definitive:
+            // the server proved that lane zero's advertised identity is no
+            // longer attachable, so do not publish that stale anchor.
+            if (LANE_RET == -ENOENT || LANE_RET == -ESTALE) {
+                wki_remote_vfs_unmount_resource_generation(owner_node, resource_id, RESOURCE_GENERATION);
+                release_vfs_proxy_lifecycle_ref(state);
+                return LANE_RET;
+            }
             break;
         }
     }

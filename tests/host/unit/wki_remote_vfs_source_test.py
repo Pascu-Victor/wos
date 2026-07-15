@@ -3381,10 +3381,14 @@ def test_remote_vfs_mount_lanes_preserve_channel_and_lifetime_affinity() -> None
         [
             "int const PRE_AUX_VALIDATION = validate_mount_binding()",
             "for (uint8_t lane_index = 1; lane_index < VFS_PROXY_LANE_COUNT; ++lane_index)",
+            "if (LANE_RET == -ENOENT || LANE_RET == -ESTALE)",
+            "wki_remote_vfs_unmount_resource_generation(owner_node, resource_id, RESOURCE_GENERATION)",
+            "release_vfs_proxy_lifecycle_ref(state)",
+            "return LANE_RET",
             "int const POST_AUX_VALIDATION = validate_mount_binding()",
             "wki_remote_vfs_unmount_resource_generation(owner_node, resource_id, RESOURCE_GENERATION)",
         ],
-        "auxiliary attachment is followed by exact binding/resource revalidation before success",
+        "definitive auxiliary rejection rolls back before final binding/resource revalidation",
     )
     post_aux = lane_mount[lane_mount.find("for (uint8_t lane_index = 1; lane_index < VFS_PROXY_LANE_COUNT;") :]
     require_order(
