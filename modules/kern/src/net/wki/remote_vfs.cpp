@@ -269,6 +269,8 @@ auto perf_vfs_op(uint16_t op_id) -> uint8_t {
             return static_cast<uint8_t>(ker::mod::perf::WkiPerfVfsOp::CLOSE);
         case OP_VFS_MKDIR:
             return static_cast<uint8_t>(ker::mod::perf::WkiPerfVfsOp::MKDIR);
+        case OP_VFS_CHMOD:
+            return static_cast<uint8_t>(ker::mod::perf::WkiPerfVfsOp::CHMOD);
         case OP_VFS_WRITE:
         case OP_VFS_WRITE_RDMA:
             return static_cast<uint8_t>(ker::mod::perf::WkiPerfVfsOp::WRITE);
@@ -322,6 +324,8 @@ auto perf_vfs_server_op(uint16_t op_id) -> uint8_t {
             return static_cast<uint8_t>(ker::mod::perf::WkiPerfVfsServerOp::CLOSE);
         case OP_VFS_MKDIR:
             return static_cast<uint8_t>(ker::mod::perf::WkiPerfVfsServerOp::MKDIR);
+        case OP_VFS_CHMOD:
+            return static_cast<uint8_t>(ker::mod::perf::WkiPerfVfsServerOp::CHMOD);
         case OP_VFS_WRITE:
         case OP_VFS_WRITE_RDMA:
             return static_cast<uint8_t>(ker::mod::perf::WkiPerfVfsServerOp::WRITE);
@@ -5201,7 +5205,7 @@ void handle_vfs_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_ident
                 break;
             }
 
-            int const RET = ker::vfs::vfs_symlink(target_str.data(), full_link.data());
+            int const RET = ker::vfs::vfs_symlink_resolved(target_str.data(), full_link.data());
 
             DevOpRespPayload resp = {};
             resp.op_id = OP_VFS_SYMLINK;
@@ -5357,10 +5361,66 @@ void handle_vfs_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_ident
                 break;
             }
 
-            int const RET = ker::vfs::vfs_rename(old_full.data(), new_full.data());
+            int const RET = ker::vfs::vfs_rename_resolved(old_full.data(), new_full.data());
 
             DevOpRespPayload resp = {};
             resp.op_id = OP_VFS_RENAME;
+            resp.status = static_cast<int16_t>(RET);
+            resp.data_len = 0;
+            send_simple_resp(resp);
+            break;
+        }
+
+        case OP_VFS_CHMOD: {
+            // Request: {mode:u32, flags:u8, path_len:u16, path[path_len]}
+            if (data_len < 7) {
+                DevOpRespPayload resp = {};
+                resp.op_id = OP_VFS_CHMOD;
+                resp.status = -1;
+                resp.data_len = 0;
+                send_simple_resp(resp);
+                break;
+            }
+
+            uint32_t mode = 0;
+            uint8_t flags = 0;
+            uint16_t path_len = 0;
+            memcpy(&mode, data, sizeof(uint32_t));
+            memcpy(&flags, data + 4, sizeof(uint8_t));
+            memcpy(&path_len, data + 5, sizeof(uint16_t));
+            if ((flags & ~WKI_VFS_CHMOD_FLAG_FOLLOW_FINAL_SYMLINK) != 0 || data_len < 7 + path_len) {
+                DevOpRespPayload resp = {};
+                resp.op_id = OP_VFS_CHMOD;
+                resp.status = -1;
+                resp.data_len = 0;
+                send_simple_resp(resp);
+                break;
+            }
+
+            std::array<char, 512> full_path __attribute__((uninitialized));          // NOLINT(cppcoreguidelines-pro-type-member-init)
+            std::array<char, 512> full_visible_path __attribute__((uninitialized));  // NOLINT(cppcoreguidelines-pro-type-member-init)
+            build_full_path(full_path.data(), full_path.size(), export_path, reinterpret_cast<const char*>(data + 7), path_len);
+            build_full_path(full_visible_path.data(), full_visible_path.size(), export_name, reinterpret_cast<const char*>(data + 7),
+                            path_len);
+
+            if (path_crosses_recursive_wki_boundary_direct(full_path.data(), full_visible_path.data())) {
+                DevOpRespPayload resp = {};
+                resp.op_id = OP_VFS_CHMOD;
+                resp.status = -EPERM;
+                resp.data_len = 0;
+                send_simple_resp(resp);
+                break;
+            }
+
+            perf_record_vfs_server_begin(SERVER_OP, hdr->src_node, channel_id, CORRELATION, CALLSITE);
+            uint64_t const LOCAL_STARTED_US = wki_now_us();
+            int const RET = ker::vfs::vfs_chmod_resolved(full_path.data(), static_cast<int>(mode),
+                                                         (flags & WKI_VFS_CHMOD_FLAG_FOLLOW_FINAL_SYMLINK) != 0);
+            perf_record_vfs_server_end(SERVER_OP, hdr->src_node, channel_id, CORRELATION, RET,
+                                       static_cast<uint32_t>(wki_now_us() - LOCAL_STARTED_US), 0, CALLSITE);
+
+            DevOpRespPayload resp = {};
+            resp.op_id = OP_VFS_CHMOD;
             resp.status = static_cast<int16_t>(RET);
             resp.data_len = 0;
             send_simple_resp(resp);
@@ -6597,6 +6657,34 @@ auto wki_remote_vfs_mkdir(void* mount_private_data, const char* fs_relative_path
         invalidate_readlink_cache(state);
     }
     return STATUS;
+}
+
+auto wki_remote_vfs_chmod(void* mount_private_data, const char* fs_relative_path, int mode, bool follow_final_symlink) -> int {
+    auto* state = static_cast<ProxyVfsState*>(mount_private_data);
+    if (state == nullptr || !state->active || fs_relative_path == nullptr) {
+        return -EINVAL;
+    }
+
+    // Build request: {mode:u32, flags:u8, path_len:u16, path[N]}
+    std::array<uint8_t, 519> req_stack __attribute__((uninitialized));  // NOLINT(cppcoreguidelines-pro-type-member-init)
+    size_t const PATH_LEN = strlen(fs_relative_path);
+    if (PATH_LEN > req_stack.size() - 7U) {
+        return -ENAMETOOLONG;
+    }
+    auto path_len = static_cast<uint16_t>(PATH_LEN);
+    auto req_data_len = static_cast<uint16_t>(7 + path_len);
+    uint8_t* req_data = req_stack.data();
+
+    auto u_mode = static_cast<uint32_t>(mode);
+    uint8_t const FLAGS = follow_final_symlink ? WKI_VFS_CHMOD_FLAG_FOLLOW_FINAL_SYMLINK : 0;
+    memcpy(req_data, &u_mode, sizeof(uint32_t));
+    memcpy(req_data + 4, &FLAGS, sizeof(uint8_t));
+    memcpy(req_data + 5, &path_len, sizeof(uint16_t));
+    if (path_len > 0) {
+        memcpy(req_data + 7, fs_relative_path, path_len);
+    }
+
+    return vfs_proxy_send_and_wait(state, OP_VFS_CHMOD, req_data, req_data_len, nullptr, 0);
 }
 
 // Consumer side: create a symlink on the remote server

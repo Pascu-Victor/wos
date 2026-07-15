@@ -67,6 +67,9 @@ auto vfs_sendfile(int outfd, int infd, off_t* offset, size_t count) -> ssize_t;
 
 // Symlink operations
 auto vfs_symlink(const char* target, const char* linkpath) -> int;
+// Create a symlink at an already-resolved absolute backing path without
+// consulting the current task's root or WKI routing policy.
+auto vfs_symlink_resolved(const char* target, const char* linkpath) -> int;
 auto vfs_symlinkat(ker::mod::sched::task::Task* task, const char* target, int dirfd, const char* linkpath) -> int;
 auto vfs_readlink(const char* path, char* buf, size_t bufsize) -> ssize_t;
 auto vfs_readlinkat(ker::mod::sched::task::Task* task, int dirfd, const char* pathname, char* buf, size_t bufsize) -> ssize_t;
@@ -135,10 +138,16 @@ auto vfs_unlink(const char* path) -> int;
 auto vfs_rmdir(const char* path) -> int;
 auto vfs_unlinkat(ker::mod::sched::task::Task* task, int dirfd, const char* pathname, int flags) -> int;
 auto vfs_rename(const char* oldpath, const char* newpath) -> int;
+// Rename between already-resolved absolute backing paths without consulting
+// the current task's root or WKI routing policy.
+auto vfs_rename_resolved(const char* oldpath, const char* newpath) -> int;
 auto vfs_renameat(ker::mod::sched::task::Task* task, int olddirfd, const char* oldpath, int newdirfd, const char* newpath) -> int;
 
 // Permissions
 auto vfs_chmod(const char* path, int mode) -> int;
+// Change permissions on an already-resolved absolute backing path without
+// consulting the current task's root or WKI routing policy.
+auto vfs_chmod_resolved(const char* path, int mode, bool follow_final_symlink) -> int;
 auto vfs_fchmod(int fd, int mode) -> int;
 auto vfs_fchmodat(ker::mod::sched::task::Task* task, int dirfd, const char* pathname, int mode, int flags) -> int;
 auto vfs_chown(const char* path, uint32_t owner, uint32_t group) -> int;

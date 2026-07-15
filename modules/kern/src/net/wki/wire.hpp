@@ -786,6 +786,8 @@ constexpr uint16_t OP_VFS_RENAME = 0x040B;    // V2: rename/move [V2 A9.1]
 constexpr uint16_t OP_VFS_FSYNC = 0x040C;     // V2: flush to disk [V2 A9.1]
 constexpr uint16_t OP_VFS_TRUNCATE = 0x040D;  // V2: truncate file [V2 A9.1]
 constexpr uint16_t OP_VFS_SEEK_END = 0x040E;  // V2: seek from end [V2 A9.1]
+constexpr uint16_t OP_VFS_CHMOD = 0x040F;     // Request: {mode:u32, flags:u8, path_len:u16, path[path_len]}
+constexpr uint8_t WKI_VFS_CHMOD_FLAG_FOLLOW_FINAL_SYMLINK = 0x01;
 constexpr uint16_t OP_VFS_READ_RDMA =
     0x0410;  // RDMA read:  req={fd:i32,len:u32,off:i64,rkey:u32}(20B) resp={bytes:u32}(4B), data pushed via rdma_write
 constexpr uint16_t OP_VFS_WRITE_RDMA =

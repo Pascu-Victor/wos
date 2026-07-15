@@ -1158,6 +1158,106 @@ def test_server_open_reuses_the_open_file_stat_snapshot() -> None:
         fail("remote VFS server open must not dereference a file after publishing it to peer cleanup")
 
 
+def test_server_backing_path_mutations_bypass_worker_task_root() -> None:
+    source = REMOTE_VFS_CPP.read_text()
+    header = VFS_HPP.read_text()
+    core = VFS_CORE_CPP.read_text()
+    wire = WIRE_HPP.read_text()
+    handler_body = function_body(source, "handle_vfs_op")
+
+    symlink_start = handler_body.find("case OP_VFS_SYMLINK:")
+    unlink_start = handler_body.find("case OP_VFS_UNLINK:", symlink_start)
+    rename_start = handler_body.find("case OP_VFS_RENAME:")
+    chmod_start = handler_body.find("case OP_VFS_CHMOD:", rename_start)
+    fsync_start = handler_body.find("case OP_VFS_FSYNC:", chmod_start)
+    if min(symlink_start, unlink_start, rename_start, chmod_start, fsync_start) < 0:
+        fail("remote VFS server mutation opcode cases must remain present")
+
+    symlink_case = handler_body[symlink_start:unlink_start]
+    require_order(
+        symlink_case,
+        [
+            "build_full_path(full_link.data(), full_link.size(), export_path",
+            "path_crosses_recursive_wki_boundary(full_link.data())",
+            "ker::vfs::vfs_symlink_resolved(target_str.data(), full_link.data())",
+        ],
+        "server symlink uses its export backing path without worker-root resolution",
+    )
+    if "ker::vfs::vfs_symlink(target_str.data(), full_link.data())" in symlink_case:
+        fail("server symlink must not re-resolve an export backing path against the worker root")
+
+    rename_case = handler_body[rename_start:chmod_start]
+    require_order(
+        rename_case,
+        [
+            "build_full_path(old_full.data(), old_full.size(), export_path",
+            "build_full_path(new_full.data(), new_full.size(), export_path",
+            "path_crosses_recursive_wki_boundary(old_full.data())",
+            "ker::vfs::vfs_rename_resolved(old_full.data(), new_full.data())",
+        ],
+        "server rename uses export backing paths without worker-root resolution",
+    )
+    if "ker::vfs::vfs_rename(old_full.data(), new_full.data())" in rename_case:
+        fail("server rename must not re-resolve export backing paths against the worker root")
+
+    chmod_case = handler_body[chmod_start:fsync_start]
+    require_order(
+        chmod_case,
+        [
+            "build_full_path(full_path.data(), full_path.size(), export_path",
+            "build_full_path(full_visible_path.data(), full_visible_path.size(), export_name",
+            "path_crosses_recursive_wki_boundary_direct(full_path.data(), full_visible_path.data())",
+            "ker::vfs::vfs_chmod_resolved(full_path.data(), static_cast<int>(mode),",
+            "(flags & WKI_VFS_CHMOD_FLAG_FOLLOW_FINAL_SYMLINK) != 0",
+        ],
+        "server chmod uses its export backing path without worker-root resolution",
+    )
+    if "ker::vfs::vfs_chmod(full_path.data(), static_cast<int>(mode)," in chmod_case:
+        fail("server chmod must not re-resolve an export backing path against the worker root")
+
+    require_tokens(
+        header,
+        [
+            "auto vfs_symlink_resolved(const char* target, const char* linkpath) -> int;",
+            "auto vfs_rename_resolved(const char* oldpath, const char* newpath) -> int;",
+            "auto vfs_chmod_resolved(const char* path, int mode, bool follow_final_symlink) -> int;",
+        ],
+        "resolved VFS mutation API declarations",
+    )
+    require_tokens(
+        function_body(core, "vfs_symlink_resolved"),
+        ["return vfs_symlink_resolved_linkpath(target, linkpath);"],
+        "resolved symlink backing-path implementation",
+    )
+    require_tokens(
+        function_body(core, "vfs_rename_resolved"),
+        ["vfs_rename_resolved_paths(oldpath, newpath, path_requires_directory(oldpath), path_requires_directory(newpath))"],
+        "resolved rename backing-path implementation",
+    )
+    require_tokens(
+        function_body(core, "vfs_chmod_resolved"),
+        ["return vfs_chmod_resolved_path(path, mode, follow_final_symlink);"],
+        "resolved chmod backing-path implementation",
+    )
+    require_tokens(
+        wire,
+        [
+            "constexpr uint16_t OP_VFS_CHMOD = 0x040F;",
+            "constexpr uint8_t WKI_VFS_CHMOD_FLAG_FOLLOW_FINAL_SYMLINK = 0x01;",
+        ],
+        "remote chmod wire contract",
+    )
+    require_order(
+        function_body(core, "vfs_chmod_resolved_path"),
+        [
+            "case FSType::REMOTE:",
+            "wki_remote_vfs_chmod(mount->private_data, fs_path, mode, follow_final_symlink)",
+            "cache_notify_path_data_changed_impl(path_buffer.data(), mount->fs_type)",
+        ],
+        "remote chmod dispatch preserves final-symlink and cache semantics",
+    )
+
+
 def test_server_message_read_uses_bounded_stack_response() -> None:
     source = REMOTE_VFS_CPP.read_text()
     handler_body = function_body(source, "handle_vfs_op")
@@ -1387,8 +1487,8 @@ def test_remote_metadata_scratch_initializes_only_consumed_prefix() -> None:
     source = REMOTE_VFS_CPP.read_text()
 
     build_calls = list(re.finditer(r"build_full_path\((\w+)\.data\(\)", source))
-    if len(build_calls) != 16:
-        fail(f"expected 16 bounded build_full_path outputs, found {len(build_calls)}")
+    if len(build_calls) != 18:
+        fail(f"expected 18 bounded build_full_path outputs, found {len(build_calls)}")
     for call in build_calls:
         name = call.group(1)
         declaration = f"std::array<char, 512> {name} __attribute__((uninitialized));"
@@ -1397,13 +1497,14 @@ def test_remote_metadata_scratch_initializes_only_consumed_prefix() -> None:
             fail(f"build_full_path output {name} must be a nearby explicitly uninitialized local")
     declaration_counts = {
         "std::array<char, 512> resolved_path __attribute__((uninitialized));": 1,
-        "std::array<char, 512> full_path __attribute__((uninitialized));": 7,
-        "std::array<char, 512> full_visible_path __attribute__((uninitialized));": 6,
+        "std::array<char, 512> full_path __attribute__((uninitialized));": 8,
+        "std::array<char, 512> full_visible_path __attribute__((uninitialized));": 7,
         "std::array<char, 512> full_link __attribute__((uninitialized));": 1,
         "std::array<char, 512> old_full __attribute__((uninitialized));": 1,
         "std::array<char, 512> new_full __attribute__((uninitialized));": 1,
         "std::array<uint8_t, 514> req_stack __attribute__((uninitialized));": 4,
         "std::array<uint8_t, 518> req_stack __attribute__((uninitialized));": 1,
+        "std::array<uint8_t, 519> req_stack __attribute__((uninitialized));": 1,
         "std::array<uint8_t, 1028> req_stack __attribute__((uninitialized));": 2,
         "std::array<uint8_t, 514> resp_buf __attribute__((uninitialized));": 1,
     }
@@ -1465,6 +1566,18 @@ def test_remote_metadata_scratch_initializes_only_consumed_prefix() -> None:
                 "vfs_proxy_send_and_wait(state, OP_VFS_MKDIR, req_data, req_data_len",
             ],
         ),
+        "wki_remote_vfs_chmod": (
+            "std::array<uint8_t, 519> req_stack __attribute__((uninitialized));",
+            "auto req_data_len = static_cast<uint16_t>(7 + path_len)",
+            [
+                "memcpy(req_data, &u_mode, sizeof(uint32_t))",
+                "memcpy(req_data + 4, &FLAGS, sizeof(uint8_t))",
+                "memcpy(req_data + 5, &path_len, sizeof(uint16_t))",
+                "if (path_len > 0)",
+                "memcpy(req_data + 7, fs_relative_path, path_len)",
+                "vfs_proxy_send_and_wait(state, OP_VFS_CHMOD, req_data, req_data_len",
+            ],
+        ),
         "wki_remote_vfs_symlink": (
             "std::array<uint8_t, 1028> req_stack __attribute__((uninitialized));",
             "auto req_data_len = static_cast<uint16_t>(4 + target_len + link_len)",
@@ -1519,7 +1632,7 @@ def test_remote_metadata_scratch_initializes_only_consumed_prefix() -> None:
             [declaration, length_assignment, "uint8_t* req_data = req_stack.data()"] + encoding,
             f"{function_name} exact-prefix request encoding",
         )
-        if re.search(r"std::array<uint8_t,\s*(?:514|518|1028)>\s+req_stack\s*(?:\{\}|=\s*\{\})", body):
+        if re.search(r"std::array<uint8_t,\s*(?:514|518|519|1028)>\s+req_stack\s*(?:\{\}|=\s*\{\})", body):
             fail(f"{function_name} must not initialize an unused request tail")
 
     readlink = function_body(source, "wki_remote_vfs_readlink_path")
@@ -3017,6 +3130,7 @@ def main() -> None:
     test_shared_io_callers_timeout_or_fallback()
     test_message_fallback_readahead_targets_small_sequential_reads()
     test_server_open_reuses_the_open_file_stat_snapshot()
+    test_server_backing_path_mutations_bypass_worker_task_root()
     test_server_message_read_uses_bounded_stack_response()
     test_readlink_cache_invalidation_is_generation_based()
     test_server_roce_push_reads_reuse_registered_staging()

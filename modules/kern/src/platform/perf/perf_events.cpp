@@ -423,6 +423,8 @@ const char* wki_op_name(WkiPerfScope scope, uint8_t op) {
                     return "rename";
                 case WkiPerfVfsOp::RETRY:
                     return "retry";
+                case WkiPerfVfsOp::CHMOD:
+                    return "chmod";
                 default:
                     return "unknown";
             }
@@ -458,6 +460,8 @@ const char* wki_op_name(WkiPerfScope scope, uint8_t op) {
                     return "rmdir";
                 case WkiPerfVfsServerOp::RENAME:
                     return "rename";
+                case WkiPerfVfsServerOp::CHMOD:
+                    return "chmod";
                 default:
                     return "unknown";
             }

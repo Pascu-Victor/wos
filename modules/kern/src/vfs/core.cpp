@@ -9001,6 +9001,8 @@ auto vfs_symlink_resolved_linkpath(const char* target, const char* abs_linkpath,
 }
 }  // namespace
 
+auto vfs_symlink_resolved(const char* target, const char* linkpath) -> int { return vfs_symlink_resolved_linkpath(target, linkpath); }
+
 auto vfs_symlink(const char* target, const char* linkpath) -> int {
     if (target == nullptr || linkpath == nullptr) {
         return -EINVAL;
@@ -12899,6 +12901,14 @@ auto vfs_rename_resolved_paths(const char* old_resolved_path, const char* new_re
 }  // namespace
 
 // --- rename ---
+auto vfs_rename_resolved(const char* oldpath, const char* newpath) -> int {
+    if (oldpath == nullptr || newpath == nullptr) {
+        return -EINVAL;
+    }
+
+    return vfs_rename_resolved_paths(oldpath, newpath, path_requires_directory(oldpath), path_requires_directory(newpath));
+}
+
 auto vfs_rename(const char* oldpath, const char* newpath) -> int {
     if (oldpath == nullptr || newpath == nullptr) {
         return -EINVAL;
@@ -13061,6 +13071,13 @@ auto vfs_chmod_resolved_path(const char* resolved_path, int mode, bool follow_fi
             }
             return RET;
         }
+        case FSType::REMOTE: {
+            int const RET = ker::net::wki::wki_remote_vfs_chmod(mount->private_data, fs_path, mode, follow_final_symlink);
+            if (RET == 0) {
+                cache_notify_path_data_changed_impl(path_buffer.data(), mount->fs_type);
+            }
+            return RET;
+        }
         default:
             return -ENOSYS;
     }
@@ -13116,7 +13133,11 @@ auto vfs_fchmod_for_task(ker::mod::sched::task::Task* task, int fd, int mode) ->
 }
 }  // namespace
 
-// --- chmod (stub) ---
+auto vfs_chmod_resolved(const char* path, int mode, bool follow_final_symlink) -> int {
+    return vfs_chmod_resolved_path(path, mode, follow_final_symlink);
+}
+
+// --- chmod ---
 auto vfs_chmod(const char* path, int mode) -> int {
     if (path == nullptr) {
         return -EINVAL;
