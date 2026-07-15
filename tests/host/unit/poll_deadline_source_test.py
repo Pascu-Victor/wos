@@ -173,31 +173,29 @@ def require_select_is_implemented_on_poll_core() -> None:
 
 def require_preemptible_parking_rechecks_signals() -> None:
     scheduler_source = SCHEDULER_HPP.read_text()
+    cancel_body = body_after_marker(scheduler_source, "inline auto scheduler_wait_should_cancel")
     park_body = body_after_marker(
         scheduler_source,
         "inline void preemptible_syscall_park_impl(const char* wait_channel, task::WaitChannelKind wait_kind, uint64_t deadline_us",
     )
     require_order(
+        cancel_body,
+        "if (task->wakeup_pending.exchange(false, std::memory_order_acquire))",
+        "wait_kind != SchedulerHaltWaitKind::YIELD",
+        "task->has_interrupting_signal_pending()",
+    )
+    require_order(
         park_body,
         "task->set_wait_channel(wait_channel, wait_kind)",
-        "if (task->wakeup_pending.exchange(false, std::memory_order_acquire))",
-        "if (task->has_interrupting_signal_pending())",
-        "request_local_timer_recheck()",
-    )
-    signal_check = park_body.find("if (task->has_interrupting_signal_pending())")
-    recheck = park_body.find("request_local_timer_recheck()", signal_check)
-    if signal_check < 0 or recheck < 0:
-        fail("preemptible park signal recheck not found")
-    signal_block = park_body[signal_check:recheck]
-    for snippet in [
+        "scheduler_wait_halt_once(task, SchedulerHaltWaitKind::PROCESS_PARK, INTERRUPTS_WERE_ENABLED)",
         "task->wake_at_us = 0",
         "task->wants_block = false",
         "task->set_voluntary_blocked(false)",
         "task->clear_wait_channel()",
-        "return",
-    ]:
-        if snippet not in signal_block:
-            fail(f"preemptible park signal recheck does not clear wait state: {snippet}")
+        "restore_interrupts_after_scheduler_wait(INTERRUPTS_WERE_ENABLED)",
+    )
+    if "request_local_timer_recheck()" in park_body:
+        fail("preemptible park must arm its timer only inside scheduler_wait_halt_once")
 
 
 def require_sigchld_wakes_interruptible_waits() -> None:

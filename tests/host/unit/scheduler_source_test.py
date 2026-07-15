@@ -69,6 +69,112 @@ def require_order(source: str, first: str, second: str, context: str) -> None:
         fail(f"{context}: expected {first} before {second}")
 
 
+def test_scheduler_wait_check_arm_halt_is_irq_atomic() -> None:
+    source = SCHEDULER_HPP.read_text()
+    cancel_body = function_body(source, "scheduler_wait_should_cancel")
+    halt_body = function_body(source, "scheduler_wait_halt_once")
+    halt_primitive_body = function_body(source, "halt_once_preserving_interrupt_state")
+
+    require_order(
+        cancel_body,
+        "task->wakeup_pending.exchange(false, std::memory_order_acquire)",
+        "wait_kind != SchedulerHaltWaitKind::YIELD",
+        "scheduler wait cancellation must consume event wakes before checking completed waits",
+    )
+    require_order(
+        cancel_body,
+        "wait_kind != SchedulerHaltWaitKind::YIELD",
+        "wait_kind == SchedulerHaltWaitKind::PROCESS_PARK",
+        "scheduler wait cancellation must check completed waits before signals",
+    )
+    require_tokens(
+        cancel_body,
+        [
+            "!task->wants_block && task->wake_at_us == 0",
+            "task->has_interrupting_signal_pending()",
+        ],
+        "scheduler wait cancellation conditions",
+    )
+    require_order(
+        halt_body,
+        'asm volatile("cli" ::: "memory")',
+        "scheduler_wait_should_cancel(task, wait_kind)",
+        "scheduler halt wait must mask interrupts before its final cancellation check",
+    )
+    require_order(
+        halt_body,
+        "scheduler_wait_should_cancel(task, wait_kind)",
+        "request_local_timer_recheck()",
+        "scheduler halt wait must check cancellation before its timer arm",
+    )
+    require_order(
+        halt_body,
+        "request_local_timer_recheck()",
+        "halt_once_preserving_interrupt_state(INTERRUPTS_WERE_ENABLED)",
+        "scheduler halt wait must keep the timer arm adjacent to STI/HLT",
+    )
+    require_tokens(
+        halt_primitive_body,
+        [
+            'asm volatile("sti\\n\\thlt" ::: "memory")',
+            'asm volatile("sti\\n\\thlt\\n\\tcli" ::: "memory")',
+        ],
+        "scheduler halt primitive must preserve the x86 STI interrupt shadow",
+    )
+    cancel_pos = halt_body.find("scheduler_wait_should_cancel(task, wait_kind)")
+    arm_pos = halt_body.find("request_local_timer_recheck()", cancel_pos)
+    halt_pos = halt_body.find("halt_once_preserving_interrupt_state(INTERRUPTS_WERE_ENABLED)", arm_pos)
+    cancel_to_arm = halt_body[cancel_pos:arm_pos]
+    arm_to_halt = halt_body[arm_pos:halt_pos]
+    if "restore_interrupts_after_scheduler_wait" in cancel_to_arm:
+        fail("scheduler wait cancellation must return with IF masked until caller cleanup")
+    for forbidden in ["return", 'asm volatile("sti"', "restore_interrupts_after_scheduler_wait"]:
+        if forbidden in arm_to_halt:
+            fail(f"scheduler wait timer arm must remain adjacent to STI/HLT: found {forbidden}")
+
+    wait_callers = {
+        "kern_yield_impl": "SchedulerHaltWaitKind::YIELD",
+        "kern_block_impl": "SchedulerHaltWaitKind::BLOCK",
+        "kern_sleep_us_impl": "SchedulerHaltWaitKind::BLOCK",
+        "preemptible_syscall_park_impl": "SchedulerHaltWaitKind::PROCESS_PARK",
+    }
+    for function_name, wait_kind in wait_callers.items():
+        body = function_body(source, function_name)
+        require_tokens(
+            body,
+            [
+                "pause_syscall_accounting()",
+                f"scheduler_wait_halt_once(task, {wait_kind}, INTERRUPTS_WERE_ENABLED)",
+                "restore_interrupts_after_scheduler_wait(INTERRUPTS_WERE_ENABLED)",
+            ],
+            f"{function_name} atomic scheduler wait",
+        )
+        if "request_local_timer_recheck()" in body:
+            fail(f"{function_name} must arm its timer only inside scheduler_wait_halt_once")
+        if "halt_once_preserving_interrupt_state(" in body:
+            fail(f"{function_name} must halt only inside scheduler_wait_halt_once")
+        require_order(
+            body,
+            "pause_syscall_accounting()",
+            f"scheduler_wait_halt_once(task, {wait_kind}, INTERRUPTS_WERE_ENABLED)",
+            f"{function_name} must pause syscall accounting before it can halt",
+        )
+        require_order(
+            body,
+            "task->clear_wait_channel()",
+            "restore_interrupts_after_scheduler_wait(INTERRUPTS_WERE_ENABLED)",
+            f"{function_name} must clear wait metadata before restoring IF after cancellation",
+        )
+
+    park_body = function_body(source, "preemptible_syscall_park_impl")
+    require_order(
+        park_body,
+        "restore_interrupts_after_scheduler_wait(INTERRUPTS_WERE_ENABLED)",
+        "restore_process_syscall_park_interrupts(INTERRUPTS_WERE_ENABLED, task)",
+        "process park must retain its syscall-specific IF policy after generic wait cleanup",
+    )
+
+
 def test_event_wake_cancel_preserves_current_task_wakeup_token() -> None:
     source = SCHEDULER_CPP.read_text()
     wake_body = function_body(source, "wake_task_from_event_on_cpu")
@@ -1693,6 +1799,7 @@ def test_runnable_publication_requires_successful_heap_insert() -> None:
 
 
 def main() -> None:
+    test_scheduler_wait_check_arm_halt_is_irq_atomic()
     test_event_wake_cancel_preserves_current_task_wakeup_token()
     test_event_wake_rebalances_normal_process_waiters()
     test_idle_steal_can_migrate_normal_process_work()

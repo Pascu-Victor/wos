@@ -67,6 +67,37 @@ KTEST(Sched, SaturatingDeadlineUs) {
     KEXPECT_EQ(saturating_deadline_us(UINT64_MAX, 1), UINT64_MAX);
 }
 
+// The real CLI -> APIC arm -> STI/HLT boundary cannot run during boot KTEST,
+// before the scheduler is started. Exercise its cancellation state machine
+// separately; host source tests enforce the hardware-operation ordering.
+static ker::mod::sched::task::Task g_scheduler_wait_cancel_task;  // NOLINT
+
+KTEST(Sched, SchedulerWaitCancellationState) {
+    using ker::mod::sched::scheduler_wait_should_cancel;
+    using ker::mod::sched::SchedulerHaltWaitKind;
+
+    auto& task = g_scheduler_wait_cancel_task;
+    task.wakeup_pending.store(false, std::memory_order_relaxed);
+    task.process_exit_requested.store(false, std::memory_order_relaxed);
+    task.wants_block = true;
+    task.wake_at_us = 0;
+
+    KEXPECT_FALSE(scheduler_wait_should_cancel(&task, SchedulerHaltWaitKind::YIELD));
+    KEXPECT_FALSE(scheduler_wait_should_cancel(&task, SchedulerHaltWaitKind::BLOCK));
+
+    task.wants_block = false;
+    KEXPECT_TRUE(scheduler_wait_should_cancel(&task, SchedulerHaltWaitKind::BLOCK));
+
+    task.wants_block = true;
+    task.wakeup_pending.store(true, std::memory_order_release);
+    KEXPECT_TRUE(scheduler_wait_should_cancel(&task, SchedulerHaltWaitKind::YIELD));
+    KEXPECT_FALSE(task.wakeup_pending.load(std::memory_order_acquire));
+
+    task.process_exit_requested.store(true, std::memory_order_release);
+    KEXPECT_TRUE(scheduler_wait_should_cancel(&task, SchedulerHaltWaitKind::PROCESS_PARK));
+    task.process_exit_requested.store(false, std::memory_order_relaxed);
+}
+
 KTEST(SchedulerRuntime, RuntimeDeltaSaturates) { KEXPECT_TRUE(ker::mod::sched::scheduler_selftest_runtime_delta_saturates()); }
 
 KTEST(SchedulerMigration, PreservesHotProcessMigrationPolicy) {

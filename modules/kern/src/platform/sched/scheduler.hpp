@@ -484,6 +484,49 @@ inline void halt_once_preserving_interrupt_state(bool const INTERRUPTS_WERE_ENAB
     }
 }
 
+enum class SchedulerHaltWaitKind : uint8_t {
+    YIELD,
+    BLOCK,
+    PROCESS_PARK,
+};
+
+inline auto scheduler_wait_should_cancel(task::Task* task, SchedulerHaltWaitKind wait_kind) -> bool {
+    if (task == nullptr) {
+        return false;
+    }
+    if (task->wakeup_pending.exchange(false, std::memory_order_acquire)) {
+        return true;
+    }
+    if (wait_kind != SchedulerHaltWaitKind::YIELD && !task->wants_block && task->wake_at_us == 0) {
+        return true;
+    }
+    return wait_kind == SchedulerHaltWaitKind::PROCESS_PARK && task->has_interrupting_signal_pending();
+}
+
+// Close the final check-to-halt lost-wake window. A wake racing after the
+// cancellation check leaves its timer/IPI pending while IF is clear; x86's STI
+// interrupt shadow then guarantees that the adjacent HLT executes before the
+// pending interrupt is delivered. A cancellation returns with IF clear so the
+// caller can disarm its wait metadata before restoring the entry interrupt
+// state.
+inline auto scheduler_wait_halt_once(task::Task* task, SchedulerHaltWaitKind wait_kind, bool const INTERRUPTS_WERE_ENABLED) -> bool {
+    asm volatile("cli" ::: "memory");
+    if (scheduler_wait_should_cancel(task, wait_kind)) {
+        return false;
+    }
+    if (task != nullptr) {
+        request_local_timer_recheck();
+    }
+    halt_once_preserving_interrupt_state(INTERRUPTS_WERE_ENABLED);
+    return true;
+}
+
+inline void restore_interrupts_after_scheduler_wait(bool const INTERRUPTS_WERE_ENABLED) {
+    if (INTERRUPTS_WERE_ENABLED) {
+        asm volatile("sti" ::: "memory");
+    }
+}
+
 inline void restore_process_syscall_park_interrupts(bool const INTERRUPTS_WERE_ENABLED, task::Task* task) {
     if (INTERRUPTS_WERE_ENABLED || task == nullptr || task->type != task::TaskType::PROCESS) {
         return;
@@ -560,24 +603,19 @@ inline void kern_yield_impl(uint64_t perf_callsite) {
     }
     bool const INTERRUPTS_WERE_ENABLED = interrupts_enabled();
     auto* task = get_current_task();
+    bool const PAUSED_SYSCALL_ACCOUNTING = pause_syscall_accounting();
     if (task != nullptr) {
         task->perf_wait_callsite = perf_callsite;
         task->set_wait_channel("kern_yield");
         task->set_voluntary_blocked(true);
-        if (task->wakeup_pending.exchange(false, std::memory_order_acquire)) {
-            task->set_voluntary_blocked(false);
-            task->clear_wait_channel();
-            return;
-        }
-        request_local_timer_recheck();
     }
-    bool const PAUSED_SYSCALL_ACCOUNTING = pause_syscall_accounting();
-    halt_once_preserving_interrupt_state(INTERRUPTS_WERE_ENABLED);
+    (void)scheduler_wait_halt_once(task, SchedulerHaltWaitKind::YIELD, INTERRUPTS_WERE_ENABLED);
     if (task != nullptr) {
         (void)task->wakeup_pending.exchange(false, std::memory_order_acquire);
         task->set_voluntary_blocked(false);
         task->clear_wait_channel();
     }
+    restore_interrupts_after_scheduler_wait(INTERRUPTS_WERE_ENABLED);
     if (PAUSED_SYSCALL_ACCOUNTING) {
         resume_syscall_accounting();
     }
@@ -597,31 +635,15 @@ inline void kern_block_impl(uint64_t perf_callsite) {
     }
     bool const INTERRUPTS_WERE_ENABLED = interrupts_enabled();
     auto* task = get_current_task();
+    bool const PAUSED_SYSCALL_ACCOUNTING = pause_syscall_accounting();
     if (task != nullptr) {
         task->perf_wait_callsite = perf_callsite;
         task->set_wait_channel("kern_block");
         task->wants_block = true;
         task->set_voluntary_blocked(true);
-        if (task->wakeup_pending.exchange(false, std::memory_order_acquire)) {
-            task->wants_block = false;
-            task->set_voluntary_blocked(false);
-            task->clear_wait_channel();
-            return;
-        }
-        request_local_timer_recheck();
     }
-    bool const PAUSED_SYSCALL_ACCOUNTING = pause_syscall_accounting();
     for (;;) {
-        halt_once_preserving_interrupt_state(INTERRUPTS_WERE_ENABLED);
-        if (task == nullptr) {
-            break;
-        }
-        if (task->wakeup_pending.exchange(false, std::memory_order_acquire)) {
-            task->wake_at_us = 0;
-            task->wants_block = false;
-            break;
-        }
-        if (!task->wants_block && task->wake_at_us == 0) {
+        if (!scheduler_wait_halt_once(task, SchedulerHaltWaitKind::BLOCK, INTERRUPTS_WERE_ENABLED) || task == nullptr) {
             break;
         }
     }
@@ -631,6 +653,7 @@ inline void kern_block_impl(uint64_t perf_callsite) {
         task->set_voluntary_blocked(false);
         task->clear_wait_channel();
     }
+    restore_interrupts_after_scheduler_wait(INTERRUPTS_WERE_ENABLED);
     if (PAUSED_SYSCALL_ACCOUNTING) {
         resume_syscall_accounting();
     }
@@ -652,33 +675,16 @@ inline void kern_sleep_us_impl(uint64_t sleep_us, uint64_t perf_callsite) {
     }
     bool const INTERRUPTS_WERE_ENABLED = interrupts_enabled();
     auto* task = get_current_task();
+    bool const PAUSED_SYSCALL_ACCOUNTING = pause_syscall_accounting();
     if (task != nullptr) {
         task->perf_wait_callsite = perf_callsite;
         task->set_wait_channel("kern_sleep");
         task->wake_at_us = saturating_deadline_us(ker::mod::time::get_us(), sleep_us);
         task->wants_block = true;
         task->set_voluntary_blocked(true);
-        if (task->wakeup_pending.exchange(false, std::memory_order_acquire)) {
-            task->wake_at_us = 0;
-            task->wants_block = false;
-            task->set_voluntary_blocked(false);
-            task->clear_wait_channel();
-            return;
-        }
-        request_local_timer_recheck();
     }
-    bool const PAUSED_SYSCALL_ACCOUNTING = pause_syscall_accounting();
     for (;;) {
-        halt_once_preserving_interrupt_state(INTERRUPTS_WERE_ENABLED);
-        if (task == nullptr) {
-            break;
-        }
-        if (task->wakeup_pending.exchange(false, std::memory_order_acquire)) {
-            task->wake_at_us = 0;
-            task->wants_block = false;
-            break;
-        }
-        if (!task->wants_block && task->wake_at_us == 0) {
+        if (!scheduler_wait_halt_once(task, SchedulerHaltWaitKind::BLOCK, INTERRUPTS_WERE_ENABLED) || task == nullptr) {
             break;
         }
     }
@@ -688,6 +694,7 @@ inline void kern_sleep_us_impl(uint64_t sleep_us, uint64_t perf_callsite) {
         task->set_voluntary_blocked(false);
         task->clear_wait_channel();
     }
+    restore_interrupts_after_scheduler_wait(INTERRUPTS_WERE_ENABLED);
     if (PAUSED_SYSCALL_ACCOUNTING) {
         resume_syscall_accounting();
     }
@@ -705,42 +712,16 @@ inline void preemptible_syscall_park_impl(const char* wait_channel, task::WaitCh
     }
     bool const INTERRUPTS_WERE_ENABLED = interrupts_enabled();
     auto* task = get_current_task();
+    bool const PAUSED_SYSCALL_ACCOUNTING = pause_syscall_accounting();
     if (task != nullptr) {
         task->perf_wait_callsite = perf_callsite;
         task->set_wait_channel(wait_channel, wait_kind);
         task->wake_at_us = deadline_us;
         task->wants_block = true;
         task->set_voluntary_blocked(true);
-        if (task->wakeup_pending.exchange(false, std::memory_order_acquire)) {
-            task->wake_at_us = 0;
-            task->wants_block = false;
-            task->set_voluntary_blocked(false);
-            task->clear_wait_channel();
-            restore_process_syscall_park_interrupts(INTERRUPTS_WERE_ENABLED, task);
-            return;
-        }
-        if (task->has_interrupting_signal_pending()) {
-            task->wake_at_us = 0;
-            task->wants_block = false;
-            task->set_voluntary_blocked(false);
-            task->clear_wait_channel();
-            restore_process_syscall_park_interrupts(INTERRUPTS_WERE_ENABLED, task);
-            return;
-        }
-        request_local_timer_recheck();
     }
-    bool const PAUSED_SYSCALL_ACCOUNTING = pause_syscall_accounting();
     for (;;) {
-        halt_once_preserving_interrupt_state(INTERRUPTS_WERE_ENABLED);
-        if (task == nullptr) {
-            break;
-        }
-        if (task->wakeup_pending.exchange(false, std::memory_order_acquire)) {
-            task->wake_at_us = 0;
-            task->wants_block = false;
-            break;
-        }
-        if (!task->wants_block && task->wake_at_us == 0) {
+        if (!scheduler_wait_halt_once(task, SchedulerHaltWaitKind::PROCESS_PARK, INTERRUPTS_WERE_ENABLED) || task == nullptr) {
             break;
         }
     }
@@ -750,6 +731,7 @@ inline void preemptible_syscall_park_impl(const char* wait_channel, task::WaitCh
         task->set_voluntary_blocked(false);
         task->clear_wait_channel();
     }
+    restore_interrupts_after_scheduler_wait(INTERRUPTS_WERE_ENABLED);
     if (PAUSED_SYSCALL_ACCOUNTING) {
         resume_syscall_accounting();
     }
