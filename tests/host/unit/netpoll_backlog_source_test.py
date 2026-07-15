@@ -174,13 +174,25 @@ def test_backlog_handler_and_enqueue_lost_wake_guards() -> None:
     require_tokens(
         wake_body,
         [
-            "ker::mod::sched::kern_wake(q.handler)",
+            "ker::mod::sched::wake_task_from_event(q.handler, ker::mod::sched::EventWakeDeferredSwitch::PRESERVE)",
             "q.handler->cpu == ker::mod::cpu::current_cpu()",
             "ker::mod::sys::context_switch::request_reschedule()",
             "ker::mod::sched::wake_cpu(q.handler->cpu,",
             "cpu_wake_mode",
         ],
         "backlog handler wake helper",
+    )
+    if "kern_wake(q.handler)" in wake_body:
+        fail("backlog handler wake helper: generic wake can lose an event-before-park token")
+    require_order(
+        wake_body,
+        [
+            "ker::mod::sched::wake_task_from_event(q.handler, ker::mod::sched::EventWakeDeferredSwitch::PRESERVE)",
+            "q.handler->cpu == ker::mod::cpu::current_cpu()",
+            "ker::mod::sys::context_switch::request_reschedule()",
+            "ker::mod::sched::wake_cpu(q.handler->cpu,",
+        ],
+        "backlog event token precedes local/remote CPU pokes",
     )
 
     handler_body = function_body(source, "backlog_handler_loop")

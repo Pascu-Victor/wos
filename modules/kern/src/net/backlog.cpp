@@ -233,7 +233,11 @@ void wake_backlog_handler(BacklogQueue& q, ker::mod::sched::WakeCpuMode cpu_wake
         return;
     }
 
-    ker::mod::sched::kern_wake(q.handler);
+    // Preserve an enqueue that races the handler's final empty check before
+    // kern_block().  A plain kern_wake() can observe a fully preempted but
+    // runnable handler and return without leaving a token; the handler could
+    // then resume and park over the newly published packet.
+    ker::mod::sched::wake_task_from_event(q.handler, ker::mod::sched::EventWakeDeferredSwitch::PRESERVE);
     if (q.handler->cpu == ker::mod::cpu::current_cpu()) {
         ker::mod::sys::context_switch::request_reschedule();
     } else {
