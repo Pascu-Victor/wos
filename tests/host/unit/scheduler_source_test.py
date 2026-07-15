@@ -179,7 +179,7 @@ def test_event_wake_cancel_preserves_current_task_wakeup_token() -> None:
     source = SCHEDULER_CPP.read_text()
     wake_body = function_body(source, "wake_task_from_event_on_cpu")
     reserved_wake_body = function_body(source, "publish_reserved_task_wakeup_locked")
-    reschedule_body = function_body(source, "reschedule_task_for_cpu")
+    reschedule_body = function_body(source, "reschedule_task_for_cpu_once")
 
     require_tokens(
         wake_body,
@@ -223,6 +223,131 @@ def test_event_wake_cancel_preserves_current_task_wakeup_token() -> None:
     )
     if "task->wakeup_pending.store(false" in current_task_branch:
         fail("current-task event wakes must preserve wakeup_pending, even when deferred switch is cancelled")
+
+
+def test_concurrent_reschedule_requests_have_one_queue_transition_leader() -> None:
+    source = SCHEDULER_CPP.read_text()
+    task_header = TASK_HPP.read_text()
+    ktest_source = SCHEDULER_KTEST.read_text()
+    queue_body = function_body(source, "queue_reschedule_request")
+    consume_body = function_body(source, "consume_reschedule_request")
+    retain_body = function_body(source, "retain_or_reacquire_reschedule_leader")
+    once_body = function_body(source, "reschedule_task_for_cpu_once")
+    wrapper_body = function_body(source, "reschedule_task_for_cpu")
+
+    require_tokens(
+        task_header,
+        [
+            "std::atomic<uint64_t> reschedule_requested_cpu{0};",
+            "std::atomic<bool> reschedule_pending{false};",
+            "std::atomic<bool> reschedule_in_progress{false};",
+        ],
+        "per-task reschedule serialization state",
+    )
+    require_order(
+        queue_body,
+        "task->reschedule_requested_cpu.store(cpu_no, std::memory_order_relaxed)",
+        "task->reschedule_pending.exchange(true, std::memory_order_acq_rel)",
+        "reschedule target must be written before the pending request is published",
+    )
+    require_order(
+        queue_body,
+        "task->reschedule_pending.exchange(true, std::memory_order_acq_rel)",
+        "task->reschedule_in_progress.exchange(true, std::memory_order_acq_rel)",
+        "reschedule work must be published before attempting to become its leader",
+    )
+    require_order(
+        consume_body,
+        "task->reschedule_pending.exchange(false, std::memory_order_acq_rel)",
+        "task->reschedule_requested_cpu.load(std::memory_order_acquire)",
+        "the leader must consume pending work before sampling its placement hint",
+    )
+    require_tokens(
+        consume_body,
+        [
+            "if (!task->reschedule_pending.exchange(false, std::memory_order_acq_rel))",
+            "return false",
+            "cpu_no = task->reschedule_requested_cpu.load(std::memory_order_acquire)",
+            "return true",
+        ],
+        "late leader election must not dispatch an already-consumed request",
+    )
+    require_tokens(
+        retain_body,
+        [
+            "while (true)",
+            "if (task->reschedule_pending.load(std::memory_order_acquire))",
+            "task->reschedule_in_progress.exchange(false, std::memory_order_acq_rel)",
+            "if (!task->reschedule_pending.load(std::memory_order_acquire))",
+            "task->reschedule_in_progress.exchange(true, std::memory_order_acq_rel)",
+        ],
+        "reschedule leader relinquish handshake",
+    )
+    require_order(
+        retain_body,
+        "task->reschedule_in_progress.exchange(false, std::memory_order_acq_rel)",
+        "if (!task->reschedule_pending.load(std::memory_order_acquire))",
+        "the leader must acquire losing producers before its final pending recheck",
+    )
+    require_order(
+        retain_body,
+        "if (!task->reschedule_pending.load(std::memory_order_acquire))",
+        "task->reschedule_in_progress.exchange(true, std::memory_order_acq_rel)",
+        "the old leader may reacquire only after observing work published across release",
+    )
+    reacquire_pos = retain_body.find("task->reschedule_in_progress.exchange(true, std::memory_order_acq_rel)")
+    if reacquire_pos < 0 or "return true" in retain_body[reacquire_pos:]:
+        fail("reacquired leadership must recheck pending work instead of dispatching an ABA-stale request")
+    require_tokens(
+        wrapper_body,
+        [
+            "task == nullptr || run_queues == nullptr",
+            "if (!queue_reschedule_request(task, cpu_no))",
+            "if (consume_reschedule_request(task, requested_cpu))",
+            "reschedule_task_for_cpu_once(requested_cpu, task)",
+            "retain_or_reacquire_reschedule_leader(task)",
+        ],
+        "serialized reschedule wrapper",
+    )
+    require_order(
+        wrapper_body,
+        "queue_reschedule_request(task, cpu_no)",
+        "consume_reschedule_request(task, requested_cpu)",
+        "the winning producer must enter the leader drain loop",
+    )
+    require_order(
+        wrapper_body,
+        "if (consume_reschedule_request(task, requested_cpu))",
+        "reschedule_task_for_cpu_once(requested_cpu, task)",
+        "each coalesced request must precede its queue transition",
+    )
+    for forbidden in ["with_lock_void", "wait_list_", "runnable_heap", "publish_runnable_task_locked"]:
+        if forbidden in wrapper_body:
+            fail(f"serialized reschedule wrapper must delegate queue mutation to its leader: found {forbidden}")
+    if source.count("reschedule_task_for_cpu_once(") != 2:
+        fail("all reschedule queue transitions must pass through the single-leader public wrapper")
+    require_tokens(
+        once_body,
+        ['publish_runnable_task_locked(rq, task, "reschedule")'],
+        "reschedule leader queue transition",
+    )
+    require_tokens(
+        source,
+        [
+            "scheduler_selftest_concurrent_reschedule_requests_are_serialized",
+            "ABA_EMPTY_REQUEST_REFUSED",
+            "ABA_EMPTY_REACQUIRE_RELEASED",
+        ],
+        "concurrent reschedule kernel selftest implementation",
+    )
+    require_tokens(
+        ktest_source,
+        [
+            "KTEST(SchedulerWake, ConcurrentRescheduleRequestsAreSerialized)",
+            "scheduler_selftest_concurrent_reschedule_requests_are_serialized",
+        ],
+        "concurrent reschedule KTEST wiring",
+    )
 
 
 def test_event_wake_rebalances_normal_process_waiters() -> None:
@@ -1355,7 +1480,7 @@ def test_handoff_waitpid_wake_queues_out_of_lock_repair() -> None:
     requeue_body = function_body(source, "requeue_woken_outgoing_task_locked")
     commit_body = function_body(source, "commit_handoff_task_at_return_boundary")
     reserved_wake_body = function_body(source, "publish_reserved_task_wakeup_locked")
-    reschedule_body = function_body(source, "reschedule_task_for_cpu")
+    reschedule_body = function_body(source, "reschedule_task_for_cpu_once")
     ktest_source = SCHEDULER_KTEST.read_text()
 
     require_tokens(
@@ -1405,6 +1530,18 @@ def test_handoff_waitpid_wake_queues_out_of_lock_repair() -> None:
         ],
         "reserved-task wake publication under the owner runqueue lock",
     )
+    require_order(
+        reserved_wake_body,
+        "task->wants_block = false",
+        "task->wakeup_pending.store(true, std::memory_order_release)",
+        "reserved wakes must clear blocking intent before publishing the handoff token",
+    )
+    require_order(
+        reserved_wake_body,
+        "task->wake_at_us = 0",
+        "task->wakeup_pending.store(true, std::memory_order_release)",
+        "reserved wakes must clear their stale deadline before publishing the handoff token",
+    )
     reserved_checks = list(re.finditer(r"if \(runqueue_task_is_reserved_locked\(rq, task\)\)", reschedule_body))
     if len(reserved_checks) != 2:
         fail("reschedule must have exactly fast-owner and fallback reserved-task checks")
@@ -1444,7 +1581,7 @@ def test_timer_waitpid_repair_rechecks_stranded_waiters_without_sigchld() -> Non
     repair_due_body = function_body(source, "waitpid_repair_due")
     wait_deadline_body = function_body(source, "task_wait_deadline_us")
     timer_body = function_body(source, "process_tasks")
-    reschedule_body = function_body(source, "reschedule_task_for_cpu")
+    reschedule_body = function_body(source, "reschedule_task_for_cpu_once")
 
     require_tokens(
         source,
@@ -1857,6 +1994,7 @@ def test_runnable_publication_requires_successful_heap_insert() -> None:
 def main() -> None:
     test_scheduler_wait_check_arm_halt_is_irq_atomic()
     test_event_wake_cancel_preserves_current_task_wakeup_token()
+    test_concurrent_reschedule_requests_have_one_queue_transition_leader()
     test_event_wake_rebalances_normal_process_waiters()
     test_idle_steal_can_migrate_normal_process_work()
     test_busy_cpus_nudge_idle_peers_to_steal_process_backlog()

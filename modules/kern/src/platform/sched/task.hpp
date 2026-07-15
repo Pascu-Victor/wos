@@ -610,6 +610,14 @@ struct Task {
     // under the RQ lock in deferred_task_switch to avoid lost wakeups.
     std::atomic<bool> wakeup_pending{false};
 
+    // Coalesce concurrent cross-CPU reschedule requests behind one queue
+    // transition leader. A task may be woken simultaneously by unrelated
+    // event producers targeting different CPUs; distinct target runqueue
+    // locks alone cannot serialize that ownerless remove/insert window.
+    std::atomic<uint64_t> reschedule_requested_cpu{0};
+    std::atomic<bool> reschedule_pending{false};
+    std::atomic<bool> reschedule_in_progress{false};
+
     // When true, a PROCESS task is at a safe voluntary blocking point (e.g. sti;hlt
     // in a syscall wait loop). The scheduler may preempt it as if it were a
     // DAEMON, saving and restoring kernel-mode context. Set before hlt, cleared after wake.

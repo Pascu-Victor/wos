@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <new>  // NOLINT(misc-include-cleaner): placement new declares the RunQueue selftest storage lifetime.
 #include <platform/perf/perf_events.hpp>
 #include <platform/sys/spinlock.hpp>
 #include <platform/sys/usercopy.hpp>
@@ -2242,12 +2243,12 @@ inline auto publish_reserved_task_wakeup_locked(RunQueue* rq, task::Task* task) 
     // proves that the task is current or reserved for handoff.  Otherwise the
     // handoff commit can miss the token, publish a successor, and leave this
     // task WAITING after the stale current-task observation returns.
-    task->wakeup_pending.store(true, std::memory_order_release);
     task->wants_block = false;
     task->wake_at_us = 0;
     if (rq != nullptr && WAKE.wake_at_us != 0 && WAKE.wake_at_us <= rq->next_wait_deadline_us) {
         recompute_wait_deadline_locked(rq);
     }
+    task->wakeup_pending.store(true, std::memory_order_release);
     return WAKE;
 }
 
@@ -5676,7 +5677,50 @@ void place_task_in_wait_queue(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::Inter
 // rescheduleTaskForCpu - wake task from wait queue onto target CPU
 // ============================================================================
 
-void reschedule_task_for_cpu(uint64_t cpu_no, task::Task* task) {
+namespace {
+inline auto queue_reschedule_request(task::Task* task, uint64_t cpu_no) -> bool {
+    task->reschedule_requested_cpu.store(cpu_no, std::memory_order_relaxed);
+    (void)task->reschedule_pending.exchange(true, std::memory_order_acq_rel);
+    return !task->reschedule_in_progress.exchange(true, std::memory_order_acq_rel);
+}
+
+inline auto consume_reschedule_request(task::Task* task, uint64_t& cpu_no) -> bool {
+    if (!task->reschedule_pending.exchange(false, std::memory_order_acq_rel)) {
+        return false;
+    }
+    cpu_no = task->reschedule_requested_cpu.load(std::memory_order_acquire);
+    return true;
+}
+
+inline auto retain_or_reacquire_reschedule_leader(task::Task* task) -> bool {
+    while (true) {
+        if (task->reschedule_pending.load(std::memory_order_acquire)) {
+            return true;
+        }
+
+        // Every producer performs an RMW on in_progress, even when it loses
+        // leadership. This exchange therefore acquires the cumulative chain
+        // of requests that raced with the preceding pending load.
+        (void)task->reschedule_in_progress.exchange(false, std::memory_order_acq_rel);
+        if (!task->reschedule_pending.load(std::memory_order_acquire)) {
+            return false;
+        }
+
+        // A producer may have published pending immediately before leadership
+        // was released and then returned after its exchange observed the old
+        // leader. Reacquire unless a newer producer won leadership.
+        if (task->reschedule_in_progress.exchange(true, std::memory_order_acq_rel)) {
+            return false;
+        }
+
+        // A different leader can win, drain, and release between our pending
+        // recheck and stale exchange. Reacquisition alone is not proof of
+        // work; loop until a still-pending request is observed or leadership
+        // is released.
+    }
+}
+
+void reschedule_task_for_cpu_once(uint64_t cpu_no, task::Task* task) {
     if (task == nullptr || run_queues == nullptr) {
         return;
     }
@@ -5986,6 +6030,28 @@ void reschedule_task_for_cpu(uint64_t cpu_no, task::Task* task) {
 #ifdef SCHED_DEBUG
     dbg::log("RESCHED: PID %x DONE -> CPU %d (heapIdx=%d)", task->pid, static_cast<int>(cpu_no), task->heap_index);
 #endif
+}
+}  // namespace
+
+void reschedule_task_for_cpu(uint64_t cpu_no, task::Task* task) {
+    if (task == nullptr || run_queues == nullptr) {
+        return;
+    }
+    if (!queue_reschedule_request(task, cpu_no)) {
+        return;
+    }
+
+    // Losing producers return immediately, so the leader must drain until a
+    // quiescent handoff. Each pass services real coalesced work; a finite cap
+    // would strand the last request without a deferred executor.
+    bool keep_leadership = true;
+    while (keep_leadership) {
+        uint64_t requested_cpu = 0;
+        if (consume_reschedule_request(task, requested_cpu)) {
+            reschedule_task_for_cpu_once(requested_cpu, task);
+        }
+        keep_leadership = retain_or_reacquire_reschedule_leader(task);
+    }
 }
 
 // ============================================================================
@@ -8076,6 +8142,15 @@ auto get_expired_task_refcounts(uint64_t cpu_no, uint64_t* pids, uint32_t* refco
 }
 
 #ifdef WOS_SELFTEST
+namespace {
+using SchedulerRunQueueStorage = std::array<std::byte, sizeof(RunQueue)>;
+alignas(RunQueue) SchedulerRunQueueStorage scheduler_reschedule_selftest_first_storage{};   // NOLINT
+alignas(RunQueue) SchedulerRunQueueStorage scheduler_reschedule_selftest_second_storage{};  // NOLINT
+RunQueue* scheduler_reschedule_selftest_first_rq{};                                         // NOLINT
+RunQueue* scheduler_reschedule_selftest_second_rq{};                                        // NOLINT
+task::Task scheduler_reschedule_selftest_target;                                            // NOLINT
+}  // namespace
+
 auto scheduler_selftest_handoff_preserves_runnable_event_token() -> bool {
     RunQueue rq{};
     task::Task outgoing{};
@@ -8122,6 +8197,109 @@ auto scheduler_selftest_reserved_wake_precedes_handoff_commit() -> bool {
            outgoing.wake_at_us == 0 && rq.next_wait_deadline_us == 0 && !outgoing.is_voluntary_blocked() &&
            outgoing.wait_channel_kind == task::WaitChannelKind::NONE && !outgoing.wakeup_pending.load(std::memory_order_acquire) &&
            waitpid_repair_task == nullptr;
+}
+
+auto scheduler_selftest_concurrent_reschedule_requests_are_serialized() -> bool {
+    // RunQueue embeds a 64 KiB heap. Construct this one-shot KTEST state in
+    // aligned BSS storage to avoid both kernel-stack pressure and freestanding
+    // global/static initialization guards.
+    if (scheduler_reschedule_selftest_first_rq == nullptr) {
+        scheduler_reschedule_selftest_first_rq = ::new (static_cast<void*>(scheduler_reschedule_selftest_first_storage.data())) RunQueue{};
+        scheduler_reschedule_selftest_second_rq =
+            ::new (static_cast<void*>(scheduler_reschedule_selftest_second_storage.data())) RunQueue{};
+    }
+
+    auto& first_rq = *scheduler_reschedule_selftest_first_rq;
+    auto& second_rq = *scheduler_reschedule_selftest_second_rq;
+    auto& target = scheduler_reschedule_selftest_target;
+
+    auto reset_runqueue = [](RunQueue& rq) {
+        rq.runnable_heap.init();
+        rq.wait_list.init();
+        rq.dead_list.init();
+        rq.current_task = nullptr;
+        rq.handoff_task = nullptr;
+        rq.idle_task = nullptr;
+        rq.total_weighted_vruntime = 0;
+        rq.total_weight = 0;
+        rq.min_vruntime = 0;
+        rq.next_wait_deadline_us = 0;
+        rq.cached_load_default.store(0, std::memory_order_relaxed);
+        rq.cached_load_process.store(0, std::memory_order_relaxed);
+        rq.cached_current_load_default.store(0, std::memory_order_relaxed);
+        rq.cached_current_load_process.store(0, std::memory_order_relaxed);
+    };
+    reset_runqueue(first_rq);
+    reset_runqueue(second_rq);
+
+    target.state.store(task::TaskState::ACTIVE, std::memory_order_relaxed);
+    target.gc_queued.store(false, std::memory_order_relaxed);
+    target.scheduler_published.store(false, std::memory_order_relaxed);
+    target.reschedule_requested_cpu.store(0, std::memory_order_relaxed);
+    target.reschedule_pending.store(false, std::memory_order_relaxed);
+    target.reschedule_in_progress.store(false, std::memory_order_relaxed);
+    target.type = task::TaskType::DAEMON;
+    target.cpu = 2;
+    target.cpu_pinned = false;
+    target.wki_proxy_task_id = 0;
+    target.heap_index = -1;
+    target.sched_queue = task::Task::sched_queue::WAITING;
+    target.sched_next = nullptr;
+    target.sched_weight = 1024;
+    target.slice_ns = 10'000'000;
+    target.slice_used_ns = 0;
+    target.vruntime = 1;
+    target.vdeadline = 2;
+    target.wants_block = false;
+    target.wake_at_us = 0;
+    target.clear_wait_channel();
+
+    bool const FIRST_LEADER = queue_reschedule_request(&target, 2);
+    uint64_t first_cpu = UINT64_MAX;
+    bool const FIRST_CONSUMED = consume_reschedule_request(&target, first_cpu);
+
+    // Model a second backlog CPU waking the same ownerless task before the
+    // first waker publishes it. It must leave work for the existing leader,
+    // never start a second remove/insert transaction of its own.
+    bool const SECOND_LEADER = queue_reschedule_request(&target, 6);
+    target.cpu = first_cpu;
+    bool const FIRST_PUBLISHED = publish_runnable_task_locked(&first_rq, &target, "reschedule-selftest-first");
+    bool const LEADER_RETAINED = retain_or_reacquire_reschedule_leader(&target);
+    uint64_t second_cpu = UINT64_MAX;
+    bool const SECOND_CONSUMED = consume_reschedule_request(&target, second_cpu);
+
+    remove_from_sums(&first_rq, &target);
+    bool const REMOVED_FIRST = first_rq.runnable_heap.remove(&target);
+    target.cpu = second_cpu;
+    bool const SECOND_PUBLISHED = publish_runnable_task_locked(&second_rq, &target, "reschedule-selftest-second");
+    bool const LEADER_RELEASED = !retain_or_reacquire_reschedule_leader(&target);
+
+    // Model the state after a producer publishes, stalls before election, and
+    // wins only after another leader has drained its request. Consumption must
+    // refuse the empty dispatch, then the post-exchange loop must relinquish.
+    target.reschedule_in_progress.store(true, std::memory_order_relaxed);
+    uint64_t empty_cpu = UINT64_MAX;
+    bool const ABA_EMPTY_REQUEST_REFUSED = !consume_reschedule_request(&target, empty_cpu) && empty_cpu == UINT64_MAX;
+    bool const ABA_EMPTY_REACQUIRE_RELEASED = !retain_or_reacquire_reschedule_leader(&target);
+
+    auto pointer_count = [](RunQueue& rq, task::Task* expected) {
+        uint32_t count = 0;
+        for (uint32_t index = 0; index < rq.runnable_heap.size; ++index) {
+            if (run_heap_entry(rq.runnable_heap, index) == expected) {
+                ++count;
+            }
+        }
+        return count;
+    };
+    uint32_t const PHYSICAL_POINTER_COUNT = pointer_count(first_rq, &target) + pointer_count(second_rq, &target);
+
+    return FIRST_LEADER && FIRST_CONSUMED && first_cpu == 2 && !SECOND_LEADER && FIRST_PUBLISHED && LEADER_RETAINED && SECOND_CONSUMED &&
+           second_cpu == 6 && REMOVED_FIRST && SECOND_PUBLISHED && LEADER_RELEASED && ABA_EMPTY_REQUEST_REFUSED &&
+           ABA_EMPTY_REACQUIRE_RELEASED && PHYSICAL_POINTER_COUNT == 1 && first_rq.runnable_heap.size == 0 &&
+           second_rq.runnable_heap.size == 1 && target.cpu == 6 && target.heap_index == 0 &&
+           target.sched_queue == task::Task::sched_queue::RUNNABLE && first_rq.total_weight == 0 && second_rq.total_weight == 1024 &&
+           target.scheduler_published.load(std::memory_order_acquire) && !target.reschedule_pending.load(std::memory_order_acquire) &&
+           !target.reschedule_in_progress.load(std::memory_order_acquire);
 }
 
 auto scheduler_selftest_runtime_delta_saturates() -> bool {
