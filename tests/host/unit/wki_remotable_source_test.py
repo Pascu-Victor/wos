@@ -187,6 +187,24 @@ def test_pending_vfs_mount_waits_for_detach_ack_without_spending_retries() -> No
     )
 
 
+def test_pending_vfs_mount_prepares_only_the_local_host_directory() -> None:
+    source = REMOTABLE_CPP.read_text()
+    process = function_body(source, "wki_remotable_process_pending_mounts")
+
+    if "vfs_mkdir(pending.mount_path.data()" in process:
+        fail("nested VFS auto-mount preparation must not recurse through an existing remote host root")
+
+    require_order(
+        process,
+        [
+            "std::copy_n(mount_path, host_dir_len, host_dir.data())",
+            "ker::vfs::vfs_mkdir(host_dir.data(), 0755)",
+            "wki_remote_vfs_mount(pending.node_id, pending.resource_id, pending.mount_path.data(), pending.resource_generation)",
+        ],
+        "local host directory preparation before mount-table publication",
+    )
+
+
 def test_same_incarnation_block_advert_revives_exact_generation() -> None:
     source = REMOTABLE_CPP.read_text()
 
@@ -233,6 +251,7 @@ def main() -> None:
     test_deferred_retry_deadlines_are_saturating()
     test_pending_net_attach_is_generation_and_epoch_fenced()
     test_pending_vfs_mount_waits_for_detach_ack_without_spending_retries()
+    test_pending_vfs_mount_prepares_only_the_local_host_directory()
     test_same_incarnation_block_advert_revives_exact_generation()
     print("WKI remotable source invariants hold")
 

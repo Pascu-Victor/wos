@@ -1448,8 +1448,12 @@ void wki_remotable_process_pending_mounts() {
                 ker::vfs::vfs_mkdir(host_dir.data(), 0755);
             }
 
-            // Create the full mount path directory
-            ker::vfs::vfs_mkdir(pending.mount_path.data(), 0755);
+            // Do not create nested export paths here. Once the host root is
+            // mounted, vfs_mkdir() would route through that remote mount. A
+            // stale root can then block this sole deferred worker while the
+            // withdrawal needed to replace it is still queued behind us.
+            // mount_filesystem() publishes nested mounts directly, and VFS
+            // readdir synthesizes their mount-table children.
 
             int const RET =
                 wki_remote_vfs_mount(pending.node_id, pending.resource_id, pending.mount_path.data(), pending.resource_generation);
