@@ -853,7 +853,8 @@ void mark_vfs_proxy_group_unavailable_locked(ProxyVfsState* state) {
 // retired and erased after the registry lock drops, while its anchor mount is
 // still alive, so callers must release the reference after their operation (or
 // after transferring to an open-file reference).
-auto acquire_vfs_proxy_lane(ProxyVfsState* anchor) -> ProxyVfsState* {
+auto acquire_vfs_proxy_lane(ProxyVfsState* anchor, bool prefer_rdma_read_anchor = false, bool prefer_rdma_write_anchor = false)
+    -> ProxyVfsState* {
     if (anchor == nullptr) {
         return nullptr;
     }
@@ -865,8 +866,20 @@ auto acquire_vfs_proxy_lane(ProxyVfsState* anchor) -> ProxyVfsState* {
     // make selection wait for the post-insert mount bookkeeping bit.
     if (anchor->lane_anchor && anchor->lanes_ready && anchor->active && !anchor->destroy_when_idle && !anchor->resources_releasing &&
         !anchor->resources_released && anchor->lane_count > 0 && anchor->lane_count <= anchor->lanes.size()) {
+        // Lane zero owns the mount group's registered data regions.  Keep the
+        // capability check inside the same lifetime boundary as selection.
+        bool const ANCHOR_HAS_READ_RDMA = (anchor->rdma_capable && !anchor->rdma_read_disabled.load(std::memory_order_acquire)) ||
+                                          (anchor->bulk_rdma_capable && !anchor->bulk_rdma_disabled.load(std::memory_order_acquire));
+        bool const ANCHOR_HAS_WRITE_RDMA =
+            transport_supports_vfs_write_push_rdma(anchor->rdma_transport) && anchor->rdma_server_write_rkey != 0;
+        bool const ANCHOR_HAS_REQUESTED_RDMA =
+            (prefer_rdma_read_anchor && ANCHOR_HAS_READ_RDMA) || (prefer_rdma_write_anchor && ANCHOR_HAS_WRITE_RDMA);
         uint64_t const PID = perf_current_pid();
-        size_t const LANE_INDEX = PID == 0 ? 0 : static_cast<size_t>(PID % anchor->lane_count);
+        size_t lane_index = 0;
+        if (!ANCHOR_HAS_REQUESTED_RDMA && PID != 0) {
+            lane_index = static_cast<size_t>(PID % anchor->lane_count);
+        }
+        size_t const LANE_INDEX = lane_index;
         auto* candidate = anchor->lanes.at(LANE_INDEX);
         if (candidate != nullptr && candidate->active && !candidate->destroy_when_idle && !candidate->resources_releasing &&
             !candidate->resources_released && candidate->mount_group_id == anchor->mount_group_id && candidate->lane_index == LANE_INDEX) {
@@ -6706,11 +6719,22 @@ auto wki_remote_vfs_find_resource_for_mount(uint16_t owner_node, const char* loc
 }
 
 auto wki_remote_vfs_open_path(const char* fs_relative_path, int flags, int mode, void* mount_private_data) -> ker::vfs::File* {
+    constexpr int OPEN_ACCMODE = 0x3;
+    constexpr int OPEN_RDONLY = 0x0;
+    constexpr int OPEN_WRONLY = 0x1;
+    constexpr int OPEN_RDWR = 0x2;
+
     auto* anchor = static_cast<ProxyVfsState*>(mount_private_data);
     if (anchor == nullptr || fs_relative_path == nullptr) {
         return nullptr;
     }
-    auto* state = acquire_vfs_proxy_lane(anchor);
+    int const ACCESS_MODE = flags & OPEN_ACCMODE;
+    // A remote FD is channel-scoped, so choose its data lane before OP_VFS_OPEN.
+    // WOS opendir supplies O_DIRECTORY and therefore remains PID-striped.
+    bool const NON_DIRECTORY_OPEN = (flags & ker::vfs::O_DIRECTORY) == 0;
+    bool const PREFER_RDMA_READ_ANCHOR = NON_DIRECTORY_OPEN && (ACCESS_MODE == OPEN_RDONLY || ACCESS_MODE == OPEN_RDWR);
+    bool const PREFER_RDMA_WRITE_ANCHOR = NON_DIRECTORY_OPEN && (ACCESS_MODE == OPEN_WRONLY || ACCESS_MODE == OPEN_RDWR);
+    auto* state = acquire_vfs_proxy_lane(anchor, PREFER_RDMA_READ_ANCHOR, PREFER_RDMA_WRITE_ANCHOR);
     if (state == nullptr) {
         return nullptr;
     }

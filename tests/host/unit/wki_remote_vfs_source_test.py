@@ -3268,6 +3268,14 @@ def test_remote_vfs_mount_lanes_preserve_channel_and_lifetime_affinity() -> None
     )
 
     selector = function_body(source, "acquire_vfs_proxy_lane")
+    require_tokens(
+        source,
+        [
+            "auto acquire_vfs_proxy_lane(ProxyVfsState* anchor, bool prefer_rdma_read_anchor = false,",
+            "bool prefer_rdma_write_anchor = false)",
+        ],
+        "lane selector exposes optional data-RDMA preferences",
+    )
     require_order(
         selector,
         [
@@ -3275,8 +3283,20 @@ def test_remote_vfs_mount_lanes_preserve_channel_and_lifetime_affinity() -> None
             "anchor->lanes_ready",
             "anchor->lane_count > 0",
             "anchor->lane_count <= anchor->lanes.size()",
+            "bool const ANCHOR_HAS_READ_RDMA",
+            "anchor->rdma_capable && !anchor->rdma_read_disabled.load(std::memory_order_acquire)",
+            "anchor->bulk_rdma_capable && !anchor->bulk_rdma_disabled.load(std::memory_order_acquire)",
+            "bool const ANCHOR_HAS_WRITE_RDMA",
+            "transport_supports_vfs_write_push_rdma(anchor->rdma_transport)",
+            "anchor->rdma_server_write_rkey != 0",
+            "bool const ANCHOR_HAS_REQUESTED_RDMA",
+            "prefer_rdma_read_anchor && ANCHOR_HAS_READ_RDMA",
+            "prefer_rdma_write_anchor && ANCHOR_HAS_WRITE_RDMA",
             "uint64_t const PID = perf_current_pid()",
+            "size_t lane_index = 0",
+            "if (!ANCHOR_HAS_REQUESTED_RDMA && PID != 0)",
             "PID % anchor->lane_count",
+            "size_t const LANE_INDEX = lane_index",
             "auto* candidate = anchor->lanes.at(LANE_INDEX)",
             "candidate->lifecycle_refs++",
             "s_vfs_lock.unlock()",
@@ -3356,7 +3376,6 @@ def test_remote_vfs_mount_lanes_preserve_channel_and_lifetime_affinity() -> None
     )
 
     for function_name in [
-        "wki_remote_vfs_open_path",
         "wki_remote_vfs_stat",
         "wki_remote_vfs_mkdir",
         "wki_remote_vfs_chmod",
@@ -3377,13 +3396,21 @@ def test_remote_vfs_mount_lanes_preserve_channel_and_lifetime_affinity() -> None
     require_order(
         open_body,
         [
-            "auto* state = acquire_vfs_proxy_lane(anchor)",
+            "int const ACCESS_MODE = flags & OPEN_ACCMODE",
+            "bool const NON_DIRECTORY_OPEN = (flags & ker::vfs::O_DIRECTORY) == 0",
+            "bool const PREFER_RDMA_READ_ANCHOR =",
+            "NON_DIRECTORY_OPEN && (ACCESS_MODE == OPEN_RDONLY || ACCESS_MODE == OPEN_RDWR)",
+            "bool const PREFER_RDMA_WRITE_ANCHOR =",
+            "NON_DIRECTORY_OPEN && (ACCESS_MODE == OPEN_WRONLY || ACCESS_MODE == OPEN_RDWR)",
+            "auto* state = acquire_vfs_proxy_lane(anchor, PREFER_RDMA_READ_ANCHOR, PREFER_RDMA_WRITE_ANCHOR)",
             "ProxyLifecycleRefGuard lane_ref_guard(state)",
             "if (!acquire_vfs_proxy_open_ref(state))",
             "ctx->proxy = state",
         ],
-        "open transfers selected-lane ownership to the file context",
+        "data-oriented open selects a direction-capable RDMA anchor and transfers its ownership to the file context",
     )
+    if source.count("acquire_vfs_proxy_lane(anchor,") != 1:
+        fail("only data-oriented open may request RDMA-anchor lane selection")
     fstat_body = function_body(source, "wki_remote_vfs_fstat")
     require_tokens(fstat_body, ["remote_vfs_stat_on_proxy(ctx->proxy"], "fstat keeps its FD lane")
     if "wki_remote_vfs_stat(mount->private_data" in fstat_body:
