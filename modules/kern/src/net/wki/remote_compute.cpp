@@ -2328,26 +2328,37 @@ auto wki_try_remote_spawn(ker::mod::sched::task::Task* task, const WkiRemoteSpaw
 
     uint16_t best_node = WKI_NODE_INVALID;
     if (EXPLICIT_TARGET) {
-        if (std::strncmp(task->wki_target_hostname.data(), wki_local_hostname(), task->wki_target_hostname.size()) == 0) {
+        const char* const TARGET_HOSTNAME = task->wki_target_hostname.data();
+        uint16_t node_id = wki_peer_find_by_hostname(TARGET_HOSTNAME);
+        if (node_id == WKI_NODE_INVALID) {
+            constexpr std::string_view WOS_DOMAIN_SUFFIX = ".wos";
+            size_t const TARGET_LEN = std::strlen(TARGET_HOSTNAME);
+            if (TARGET_LEN > WOS_DOMAIN_SUFFIX.size() && std::strncmp(TARGET_HOSTNAME + TARGET_LEN - WOS_DOMAIN_SUFFIX.size(),
+                                                                      WOS_DOMAIN_SUFFIX.data(), WOS_DOMAIN_SUFFIX.size()) == 0) {
+                std::array<char, ker::mod::sched::task::Task::WKI_TARGET_HOSTNAME_MAX> short_target{};
+                size_t const SHORT_TARGET_LEN = TARGET_LEN - WOS_DOMAIN_SUFFIX.size();
+                std::memcpy(short_target.data(), TARGET_HOSTNAME, SHORT_TARGET_LEN);
+                node_id = wki_peer_find_by_hostname(short_target.data());
+            }
+        }
+        if (node_id == g_wki.my_node_id) {
             log_spawn_diag(task, WkiRemoteSpawnResult::LOCAL, "explicit-local-target");
             return WkiRemoteSpawnResult::LOCAL;
         }
-
-        uint16_t const NODE_ID = wki_peer_find_by_hostname(task->wki_target_hostname.data());
-        if (NODE_ID == WKI_NODE_INVALID) {
+        if (node_id == WKI_NODE_INVALID) {
             WkiRemoteSpawnResult const RESULT = STRICT_TARGET ? WkiRemoteSpawnResult::FAILED : WkiRemoteSpawnResult::LOCAL;
             log_spawn_diag(task, RESULT, "target-not-found");
             return RESULT;
         }
 
-        auto* peer = wki_peer_find(NODE_ID);
+        auto* peer = wki_peer_find(node_id);
         if (peer == nullptr || peer->state != PeerState::CONNECTED) {
             WkiRemoteSpawnResult const RESULT = STRICT_TARGET ? WkiRemoteSpawnResult::FAILED : WkiRemoteSpawnResult::LOCAL;
-            log_spawn_diag(task, RESULT, "target-not-connected", NODE_ID);
+            log_spawn_diag(task, RESULT, "target-not-connected", node_id);
             return RESULT;
         }
 
-        best_node = NODE_ID;
+        best_node = node_id;
     } else if (PREFER_REMOTE) {
         if (!wki_ipc_find_pipe_affinity_node(task, &best_node)) {
             s_compute_lock.lock();

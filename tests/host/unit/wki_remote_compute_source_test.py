@@ -1414,17 +1414,34 @@ def test_controller_descendants_default_to_local_placement() -> None:
 
     spawn_body = function_body(source, "wki_try_remote_spawn")
     explicit_start = spawn_body.find("if (EXPLICIT_TARGET) {")
-    peer_lookup = spawn_body.find("wki_peer_find_by_hostname", explicit_start)
-    if explicit_start < 0 or peer_lookup < 0:
+    peer_state_check = spawn_body.find("auto* peer = wki_peer_find(node_id)", explicit_start)
+    if explicit_start < 0 or peer_state_check < 0:
         fail("explicit-target spawn branch is missing")
+    explicit_body = spawn_body[explicit_start:peer_state_check]
     require_tokens(
-        spawn_body[explicit_start:peer_lookup],
+        explicit_body,
         [
-            "std::strncmp(task->wki_target_hostname.data(), wki_local_hostname()",
+            "const char* const TARGET_HOSTNAME = task->wki_target_hostname.data()",
+            "uint16_t node_id = wki_peer_find_by_hostname(TARGET_HOSTNAME)",
+            'constexpr std::string_view WOS_DOMAIN_SUFFIX = ".wos"',
+            "node_id = wki_peer_find_by_hostname(short_target.data())",
+            "if (node_id == g_wki.my_node_id)",
             'log_spawn_diag(task, WkiRemoteSpawnResult::LOCAL, "explicit-local-target")',
             "return WkiRemoteSpawnResult::LOCAL",
         ],
-        "launcher-self controller local placement",
+        "exact-first .wos target fallback and launcher-self local placement",
+    )
+    require_order(
+        explicit_body,
+        "uint16_t node_id = wki_peer_find_by_hostname(TARGET_HOSTNAME)",
+        'constexpr std::string_view WOS_DOMAIN_SUFFIX = ".wos"',
+        "exact hostname lookup before .wos fallback",
+    )
+    require_order(
+        explicit_body,
+        "node_id = wki_peer_find_by_hostname(short_target.data())",
+        "if (node_id == g_wki.my_node_id)",
+        "self target check after .wos fallback",
     )
 
 
