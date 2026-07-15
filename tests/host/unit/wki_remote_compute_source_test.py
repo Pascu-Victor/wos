@@ -692,7 +692,8 @@ def test_task_exit_retires_remote_compute_wait_owners() -> None:
         "task->scheduler_published.store(true, std::memory_order_release)",
         "waiting publication must set the monotonic teardown guard before releasing its runqueue lock",
     )
-    if "scheduler_published.store(false" in scheduler_source or "scheduler_published.store(false" in task_source:
+    production_scheduler_source = scheduler_source.split("#ifdef WOS_SELFTEST", maxsplit=1)[0]
+    if "scheduler_published.store(false" in production_scheduler_source or "scheduler_published.store(false" in task_source:
         fail("scheduler publication marker must never be cleared")
     owned_destroy = function_body(task_source, "destroy_owned_unpublished_process")
     require_order(
@@ -784,7 +785,7 @@ def test_task_exit_retires_remote_compute_wait_owners() -> None:
         "group-exit request must remain pending during unpublished teardown",
     )
 
-    reschedule = function_body(scheduler_source, "reschedule_task_for_cpu")
+    reschedule = function_body(scheduler_source, "reschedule_task_for_cpu_once")
     waitpid_repair_start = reschedule.find("if (is_waitpid_wait_channel")
     final_insert_start = reschedule.find("// Insert into target CPU's heap", waitpid_repair_start)
     waitpid_repair = reschedule[waitpid_repair_start:final_insert_start]
@@ -1813,7 +1814,7 @@ def test_receiver_vfs_ref_submit_uses_bounded_worker_pool() -> None:
         [
             "if (rt.discard_completion)",
             "retry_pending_task_accepts()",
-            "rt.accept_pending && !rt.discard_completion",
+            "running_remote_task_completion_eligible(rt)",
             "wki_send_on_channel_generation(",
             "info.submitter_node, info.submit_rx_channel, info.submit_rx_channel_generation, MsgType::TASK_COMPLETE",
             "g_pending_task_completions.push_back(info)",
@@ -2076,7 +2077,7 @@ def test_remote_proxy_signals_never_make_the_local_frame_runnable() -> None:
     if "signum != WKI_SIGINT_NUM" in forward_body:
         fail("proxy signal forwarding must not fall back to local execution for non-INT/KILL/TERM signals")
 
-    reschedule_body = function_body(scheduler, "reschedule_task_for_cpu")
+    reschedule_body = function_body(scheduler, "reschedule_task_for_cpu_once")
     require_order(
         reschedule_body,
         "if (task->wki_proxy_task_id != 0)",
@@ -2181,6 +2182,66 @@ def test_submitted_proxy_rows_hold_task_lifetime_until_finalization() -> None:
     )
 
 
+def test_remote_task_exit_wakes_exact_completion_monitor() -> None:
+    source = REMOTE_COMPUTE_CPP.read_text()
+    header = REMOTE_COMPUTE_HPP.read_text()
+    exit_source = PROCESS_EXIT_CPP.read_text()
+    ktest = REMOTE_COMPUTE_KTEST.read_text()
+
+    api = "wki_remote_compute_notify_task_exit_ready"
+    require_tokens(header, [f"void {api}(ker::mod::sched::task::Task* task);"], "exit-ready notification API")
+
+    exit_body = function_body(exit_source, "wos_proc_exit_with_wait_status")
+    require_order(
+        exit_body,
+        "current_task->exit_notify_ready.store(true, std::memory_order_release)",
+        f"ker::net::wki::{api}(current_task)",
+        "remote completion wake must observe the released exit publication",
+    )
+    if "wki_remote_compute_check_completions" in exit_body:
+        fail("process exit must only notify the WKI timer, never send TASK_COMPLETE inline")
+
+    notify_body = function_body(source, api)
+    require_tokens(
+        notify_body,
+        [
+            "task->wki_remote_pid == 0",
+            "task->exit_notify_ready.load(std::memory_order_acquire)",
+            "running_remote_task_matches_exit_ready(running, task)",
+            "s_compute_lock.lock()",
+            "s_compute_lock.unlock()",
+            "wki_timer_notify()",
+        ],
+        "bounded exact exit-ready notification",
+    )
+    require_order(notify_body, "s_compute_lock.unlock()", "wki_timer_notify()", "timer wake must not nest the compute lock")
+    for forbidden in ["new ", "wki_send", "wki_remote_compute_check_completions()"]:
+        if forbidden in notify_body:
+            fail(f"exit-ready notification must not allocate, send, or scan completions inline: {forbidden}")
+
+    submit_body = function_body(source, "handle_task_submit_work")
+    notify_pos = submit_body.find(f"{api}(new_task)")
+    final_worker_release_pos = submit_body.rfind("worker_task_ref->release()")
+    if notify_pos < 0 or final_worker_release_pos <= notify_pos:
+        fail("post-accept exit recheck must retain the receiver child")
+    require_tokens(
+        source,
+        [
+            "running_remote_task_completion_eligible(rt)",
+            "wki_remote_compute_selftest_exit_ready_completion_wake_is_exact",
+        ],
+        "completion wake race coverage",
+    )
+    require_tokens(
+        ktest,
+        [
+            "ExitReadyCompletionWakeIsExact",
+            "wki_remote_compute_selftest_exit_ready_completion_wake_is_exact",
+        ],
+        "exit-ready completion KTEST registration",
+    )
+
+
 def main() -> None:
     test_peer_cleanup_marks_all_targeted_submits_terminal_failure()
     test_proxy_wait_completion_respects_waitpid_publish_fence()
@@ -2205,6 +2266,7 @@ def main() -> None:
     test_receiver_vfs_ref_submit_uses_bounded_worker_pool()
     test_remote_proxy_signals_never_make_the_local_frame_runnable()
     test_submitted_proxy_rows_hold_task_lifetime_until_finalization()
+    test_remote_task_exit_wakes_exact_completion_monitor()
     print("WKI remote compute source invariants hold")
 
 

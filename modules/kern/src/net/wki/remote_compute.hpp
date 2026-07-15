@@ -368,6 +368,10 @@ auto wki_remote_compute_diag_snapshot(WkiRemoteComputeDiagRow* rows, size_t capa
 // When a task exits, sends TASK_COMPLETE back to the submitter.
 void wki_remote_compute_check_completions();
 
+// Wake completion monitoring when an exact receiver-side remote task reaches
+// the same exit-ready publication point observed by local waiters.
+void wki_remote_compute_notify_task_exit_ready(ker::mod::sched::task::Task* task);
+
 // Process deferred TASK_SUBMIT messages. Drains the pending queue inline as a
 // fallback; the primary path is the bounded compute-submit worker pool started
 // by wki_remote_compute_start_submit_thread().
@@ -406,6 +410,7 @@ auto wki_remote_compute_selftest_submit_worker_count_is_bounded() -> bool;
 auto wki_remote_compute_selftest_accept_retry_is_fair() -> bool;
 auto wki_remote_compute_selftest_submit_cancel_is_session_scoped() -> bool;
 auto wki_remote_compute_selftest_rx_admission_is_bounded() -> bool;
+auto wki_remote_compute_selftest_exit_ready_completion_wake_is_exact() -> bool;
 #endif
 
 // -----------------------------------------------------------------------------

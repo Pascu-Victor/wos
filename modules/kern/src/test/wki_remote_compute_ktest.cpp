@@ -50,3 +50,7 @@ KTEST(WkiRemoteCompute, AcceptRetryIsFair) { KEXPECT_TRUE(ker::net::wki::wki_rem
 KTEST(WkiRemoteCompute, SubmitCancelIsSessionScoped) {
     KEXPECT_TRUE(ker::net::wki::wki_remote_compute_selftest_submit_cancel_is_session_scoped());
 }
+
+KTEST(WkiRemoteCompute, ExitReadyCompletionWakeIsExact) {
+    KEXPECT_TRUE(ker::net::wki::wki_remote_compute_selftest_exit_ready_completion_wake_is_exact());
+}

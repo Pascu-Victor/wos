@@ -14,6 +14,7 @@
 #include <cstring>
 #include <deque>
 #include <iterator>
+#include <net/wki/peer.hpp>
 #include <net/wki/remote_ipc.hpp>
 #include <net/wki/timer_math.hpp>
 #include <net/wki/wire.hpp>
@@ -4511,6 +4512,15 @@ auto wki_shared_elf_cache_stats() -> WkiSharedElfCacheStats {
 
 namespace {
 
+auto running_remote_task_matches_exit_ready(const RunningRemoteTask& running, const ker::mod::sched::task::Task* task) -> bool {
+    return task != nullptr && running.active && running.task == task && running.local_pid == task->pid &&
+           task->exit_notify_ready.load(std::memory_order_acquire) && task->has_exited;
+}
+
+auto running_remote_task_completion_eligible(const RunningRemoteTask& running) -> bool {
+    return running.active && running.published && (!running.accept_pending || running.discard_completion);
+}
+
 struct PendingTaskAcceptAttempt {
     uint32_t task_id = 0;
     uint16_t submitter_node = WKI_NODE_INVALID;
@@ -4584,6 +4594,22 @@ void retry_pending_task_accepts() {
 
 }  // namespace
 
+void wki_remote_compute_notify_task_exit_ready(ker::mod::sched::task::Task* task) {
+    if (!g_remote_compute_initialized || task == nullptr || task->wki_remote_pid == 0 ||
+        !task->exit_notify_ready.load(std::memory_order_acquire) || !task->has_exited) {
+        return;
+    }
+
+    s_compute_lock.lock();
+    bool const TRACKED = std::ranges::any_of(
+        g_running_remote_tasks, [task](const RunningRemoteTask& running) { return running_remote_task_matches_exit_ready(running, task); });
+    s_compute_lock.unlock();
+
+    if (TRACKED) {
+        wki_timer_notify();
+    }
+}
+
 void wki_remote_compute_check_completions() {
     if (!g_remote_compute_initialized) {
         return;
@@ -4594,7 +4620,7 @@ void wki_remote_compute_check_completions() {
     s_compute_lock.lock();
 
     for (auto& rt : g_running_remote_tasks) {
-        if (!rt.active || !rt.published || (rt.accept_pending && !rt.discard_completion)) {
+        if (!running_remote_task_completion_eligible(rt)) {
             continue;
         }
 
@@ -6088,6 +6114,10 @@ void handle_task_submit_work(uint16_t src_node, const uint8_t* payload, uint16_t
         }
         s_compute_lock.unlock();
     }
+    // A short-lived child can publish exit readiness before its monitor row or
+    // TASK_ACCEPT state becomes visible. Recheck after both publication steps;
+    // the worker reference keeps new_task alive through this notification.
+    wki_remote_compute_notify_task_exit_ready(new_task);
     handle_measure.finish(0, binary_len);
 #ifdef DEBUG_WKI_COMPUTE
     ker::mod::dbg::log("[WKI] Remote task launched: task_id=%u pid=0x%lx on CPU %d mode=%u", submit->task_id, launched_pid, launched_cpu,
@@ -6535,6 +6565,51 @@ auto wki_remote_compute_selftest_accept_retry_is_fair() -> bool {
         later_peer_seen = later_peer_seen || second.at(i).submitter_node == 0x7A32;
     }
     return FIRST_COUNT == WKI_COMPUTE_SUBMIT_QUEUE_MAX && SECOND_COUNT != 0 && later_peer_seen;
+}
+
+auto wki_remote_compute_selftest_exit_ready_completion_wake_is_exact() -> bool {
+    ker::mod::sched::task::Task exact_task{};
+    ker::mod::sched::task::Task other_task{};
+    exact_task.pid = 0x7A41;
+    exact_task.wki_remote_pid = exact_task.pid;
+    exact_task.has_exited = true;
+    exact_task.exit_notify_ready.store(true, std::memory_order_release);
+    other_task.pid = exact_task.pid;
+    other_task.has_exited = true;
+    other_task.exit_notify_ready.store(true, std::memory_order_release);
+
+    RunningRemoteTask row{};
+    row.active = true;
+    row.task = &exact_task;
+    row.local_pid = exact_task.pid;
+
+    bool const EXACT_MATCH = running_remote_task_matches_exit_ready(row, &exact_task);
+    row.active = false;
+    bool const INACTIVE_REJECTED = !running_remote_task_matches_exit_ready(row, &exact_task);
+    row.active = true;
+    bool const OTHER_TASK_REJECTED = !running_remote_task_matches_exit_ready(row, &other_task);
+    row.local_pid++;
+    bool const OTHER_PID_REJECTED = !running_remote_task_matches_exit_ready(row, &exact_task);
+    row.local_pid = exact_task.pid;
+    exact_task.exit_notify_ready.store(false, std::memory_order_release);
+    bool const UNREADY_REJECTED = !running_remote_task_matches_exit_ready(row, &exact_task);
+    exact_task.exit_notify_ready.store(true, std::memory_order_release);
+
+    row.published = false;
+    row.accept_pending = false;
+    row.discard_completion = false;
+    bool const UNPUBLISHED_INELIGIBLE = !running_remote_task_completion_eligible(row);
+    row.published = true;
+    row.accept_pending = true;
+    bool const ACCEPT_PENDING_INELIGIBLE = !running_remote_task_completion_eligible(row);
+    row.accept_pending = false;
+    bool const ACCEPTED_ELIGIBLE = running_remote_task_completion_eligible(row);
+    row.accept_pending = true;
+    row.discard_completion = true;
+    bool const DISCARD_ELIGIBLE = running_remote_task_completion_eligible(row);
+
+    return EXACT_MATCH && INACTIVE_REJECTED && OTHER_TASK_REJECTED && OTHER_PID_REJECTED && UNREADY_REJECTED && UNPUBLISHED_INELIGIBLE &&
+           ACCEPT_PENDING_INELIGIBLE && ACCEPTED_ELIGIBLE && DISCARD_ELIGIBLE;
 }
 
 auto wki_remote_compute_selftest_submit_cancel_is_session_scoped() -> bool {

@@ -519,6 +519,7 @@ namespace {
     ker::mod::sched::finish_syscall_accounting();
     current_task->has_exited = true;
     current_task->exit_notify_ready.store(true, std::memory_order_release);
+    ker::net::wki::wki_remote_compute_notify_task_exit_ready(current_task);
 
     // Publish waitability after descriptor teardown but before address-space
     // reclamation. waitpid must not observe the child until files/pipes are
