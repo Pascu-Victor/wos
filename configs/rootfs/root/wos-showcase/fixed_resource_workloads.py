@@ -1029,10 +1029,18 @@ def controller_command(
     timeout_seconds: float,
     file_bytes: int = 0,
 ) -> list[str]:
-    command = [WOS_ON, host, WOS_FORWARD]
+    command = [WOS_FORWARD]
     if phase_uses_host_workspace(phase):
         command.append(f"+{work_root}")
-    command += [*local_route_operands(), "--", WOS_PYTHON, WOS_HELPER, "host-worker"]
+    command += [
+        *local_route_operands(),
+        "--",
+        WOS_ON,
+        host,
+        WOS_PYTHON,
+        WOS_HELPER,
+        "host-worker",
+    ]
     command += [
         "--phase",
         phase,
@@ -1067,10 +1075,18 @@ def preflight_command(
     work_root_owner: str,
     timeout_seconds: float,
 ) -> list[str]:
-    command = [WOS_ON, host, WOS_FORWARD]
+    command = [WOS_FORWARD]
     if profile == "host-workspace":
         command.append(f"+{work_root}")
-    command += [*local_route_operands(), "--", WOS_PYTHON, WOS_HELPER, "preflight-host"]
+    command += [
+        *local_route_operands(),
+        "--",
+        WOS_ON,
+        host,
+        WOS_PYTHON,
+        WOS_HELPER,
+        "preflight-host",
+    ]
     command += [
         "--profile",
         profile,
@@ -1582,11 +1598,11 @@ def cleanup_host_command(
     timeout_seconds: float,
 ) -> list[str]:
     return [
-        WOS_ON,
-        host,
         WOS_FORWARD,
         *local_route_operands(),
         "--",
+        WOS_ON,
+        host,
         WOS_PYTHON,
         WOS_HELPER,
         "cleanup-host",

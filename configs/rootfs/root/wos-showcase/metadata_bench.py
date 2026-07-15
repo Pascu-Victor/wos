@@ -39,6 +39,7 @@ WKI_HOSTNAME_MAX_BYTES = 63
 TERMINATE_GRACE_SECONDS = 1.0
 KILL_GRACE_SECONDS = 1.0
 POLL_SECONDS = 0.01
+LOCAL_RUNTIME_PATHS = ("/usr", "/bin", "/lib", "/lib64", "/libexec", "/share")
 
 
 class BenchmarkError(RuntimeError):
@@ -141,11 +142,12 @@ def make_jobs(config: Config) -> list[Job]:
 
 def worker_command(job: Job) -> Sequence[str]:
     return (
-        "on",
-        job.host,
         "forward",
         "+/tmp",
+        *(f"-{path}" for path in LOCAL_RUNTIME_PATHS),
         "--",
+        "on",
+        job.host,
         "sh",
         "-c",
         WORKER_SHELL,
@@ -576,12 +578,18 @@ def run_self_test() -> int:
         ]
         elapsed_seconds = float(payload["elapsed_seconds"])
         assert 0.08 <= elapsed_seconds < 0.30, elapsed_seconds
-        assert worker_command(jobs[0])[:8] == (
-            "on",
-            "wos-0",
+        assert worker_command(jobs[0])[:14] == (
             "forward",
             "+/tmp",
+            "-/usr",
+            "-/bin",
+            "-/lib",
+            "-/lib64",
+            "-/libexec",
+            "-/share",
             "--",
+            "on",
+            "wos-0",
             "sh",
             "-c",
             WORKER_SHELL,

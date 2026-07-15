@@ -818,6 +818,8 @@ def test_vfsbench_metadata_timing_excludes_setup_and_cleanup() -> None:
             '"on",',
             '"forward",',
             '"+/tmp",',
+            'LOCAL_RUNTIME_PATHS = ("/usr", "/bin", "/lib", "/lib64", "/libexec", "/share")',
+            '*(f"-{path}" for path in LOCAL_RUNTIME_PATHS)',
             '"spawner_host": worker_evidence.spawner_host',
             '"remote_pid": worker_evidence.remote_pid',
             '"placement": "local-baseline" if len(jobs) == 1 else "strict-on"',

@@ -107,12 +107,14 @@ def test_partition_and_commands(module) -> None:
         30.0,
     )
     expected_prefix = [
-        "/usr/bin/on",
-        hosts[1],
         "/usr/bin/forward",
         "+/tmp/work",
+        *module.local_route_operands(),
+        "--",
+        "/usr/bin/on",
+        hosts[1],
     ]
-    if command[:4] != expected_prefix:
+    if command[: len(expected_prefix)] != expected_prefix:
         fail(f"Git controller is not strict/HOST-routed: {command}")
     for path in module.LOCAL_ROUTE_PATHS:
         if f"-{path}" not in command:
@@ -133,7 +135,7 @@ def test_partition_and_commands(module) -> None:
         30.0,
         module.FILE_MOVE_BYTES["quick"],
     )
-    if file_move_command[:4] != expected_prefix:
+    if file_move_command[: len(expected_prefix)] != expected_prefix:
         fail(f"file-move controller is not strict/HOST-routed: {file_move_command}")
     if any(f"-{path}" not in file_move_command for path in module.LOCAL_ROUTE_PATHS):
         fail("file-move controller lacks explicit LOCAL runtime routes")
@@ -154,6 +156,17 @@ def test_partition_and_commands(module) -> None:
     )
     if any(operand.startswith("+/tmp/") for operand in python_command):
         fail(f"Python controller unexpectedly HOST-routes data: {python_command}")
+    python_prefix = [
+        module.WOS_FORWARD,
+        *module.local_route_operands(),
+        "--",
+        module.WOS_ON,
+        hosts[1],
+    ]
+    if python_command[: len(python_prefix)] != python_prefix:
+        fail(
+            f"Python controller installs runtime routes after placement: {python_command}"
+        )
     rotated_hosts = ["wos-2.wos", "wos-0.wos", "wos-1.wos"]
     parsed = module.parse_hosts(",".join(rotated_hosts), "wos-2.wos")
     canonical = sorted(parsed, key=module.normalize_host)
@@ -236,6 +249,33 @@ def test_partition_and_commands(module) -> None:
         fail("HOST workspace preflight lacks its exact positive route")
     if any(f"-{path}" not in preflight for path in module.LOCAL_ROUTE_PATHS):
         fail("HOST workspace preflight lacks explicit LOCAL runtime routes")
+    preflight_prefix = [
+        module.WOS_FORWARD,
+        "+/tmp/wos-showcase-fixed-0123456789abcdef",
+        *module.local_route_operands(),
+        "--",
+        module.WOS_ON,
+        hosts[1],
+    ]
+    if preflight[: len(preflight_prefix)] != preflight_prefix:
+        fail(f"preflight installs runtime routes after placement: {preflight}")
+
+    cleanup = module.cleanup_host_command(
+        hosts[1],
+        hosts[0],
+        Path("/tmp/wos-showcase-fixed-0123456789abcdef"),
+        "0123456789abcdef0123456789abcdef",
+        30.0,
+    )
+    cleanup_prefix = [
+        module.WOS_FORWARD,
+        *module.local_route_operands(),
+        "--",
+        module.WOS_ON,
+        hosts[1],
+    ]
+    if cleanup[: len(cleanup_prefix)] != cleanup_prefix:
+        fail(f"cleanup installs runtime routes after placement: {cleanup}")
 
 
 def test_job_map_validation(module) -> None:
