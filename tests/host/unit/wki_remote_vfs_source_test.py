@@ -2970,11 +2970,12 @@ def test_server_fd_and_consumer_rx_use_exact_channel_identity() -> None:
         invalidate,
         [
             "find_vfs_proxy_by_channel(channel_identity)",
-            "state->lifecycle_refs++",
+            "anchor->lanes",
+            "member->lifecycle_refs++",
             "s_vfs_lock.unlock()",
-            "release_vfs_proxy_lifecycle_ref(state)",
+            "release_vfs_proxy_lifecycle_ref(group.members",
         ],
-        "invalidate notification pins proxy lifetime across unlocked VFS work",
+        "invalidate notification pins the mount group across unlocked VFS work",
     )
 
     require_tokens(
@@ -2985,6 +2986,89 @@ def test_server_fd_and_consumer_rx_use_exact_channel_identity() -> None:
         ],
         "ordinary and reconciliation binding teardown close exact server FDs",
     )
+
+
+def test_invalidate_notify_retains_and_invalidates_complete_mount_group() -> None:
+    body = function_body(REMOTE_VFS_CPP.read_text(), "handle_vfs_invalidate_notify")
+
+    require_tokens(
+        body,
+        [
+            "std::array<ProxyVfsState*, VFS_PROXY_LANE_COUNT> members",
+            "find_vfs_proxy_by_channel(channel_identity)",
+            "anchor->lanes",
+            "member->lifecycle_refs++",
+            "group.members",
+            "group.count++",
+            "invalidate_all_dir_caches(member)",
+            "state->lifecycle_refs++",
+            "invalidate_all_dir_caches(state)",
+        ],
+        "whole-group invalidate retention",
+    )
+
+    unlock_pos = body.find("s_vfs_lock.unlock()")
+    if unlock_pos < 0 or body.find("s_vfs_lock.unlock()", unlock_pos + 1) >= 0:
+        fail("invalidate notify must have one explicit transition from locked retention to unlocked invalidation")
+    locked = body[:unlock_pos]
+    unlocked = body[unlock_pos + len("s_vfs_lock.unlock()") :]
+
+    require_order(
+        locked,
+        [
+            "s_vfs_lock.lock()",
+            "find_vfs_proxy_by_channel(channel_identity)",
+            "anchor->lanes",
+            "member->lifecycle_refs++",
+            "group.count++",
+            "invalidate_all_dir_caches(member)",
+        ],
+        "mount-group retention under the VFS lock",
+    )
+    if "release_vfs_proxy_lifecycle_ref" in locked:
+        fail("retained invalidate group must not be released while s_vfs_lock is held")
+    for token in [
+        "vfs_cache_notify_invalidate_path",
+        "invalidate_readlink_cache_group",
+        "vfs_stream_cache_invalidate_remote_scope",
+    ]:
+        if token in locked:
+            fail(f"invalidate notify must perform {token} after dropping s_vfs_lock")
+    if "s_vfs_lock.lock()" in unlocked:
+        fail("invalidate notify must not reacquire s_vfs_lock around retained-group cache invalidation")
+
+    require_order(
+        unlocked,
+        [
+            "if (group.count == 0)",
+            "vfs_cache_notify_invalidate_path",
+            "invalidate_readlink_cache_group(group.members",
+            "vfs_stream_cache_invalidate_remote_scope(group.members",
+            "release_vfs_proxy_lifecycle_ref(group.members",
+        ],
+        "unlocked whole-group invalidation and release",
+    )
+
+    group_loops = []
+    loop_pattern = re.compile(
+        r"for\s*\(\s*size_t\s+(?P<index>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*0\s*;\s*"
+        r"(?P=index)\s*<\s*group\.count\s*;\s*\+\+(?P=index)\s*\)\s*\{(?P<body>.*?)\}",
+        re.DOTALL,
+    )
+    for match in loop_pattern.finditer(unlocked):
+        group_loops.append((match.group("index"), match.group("body")))
+
+    def loop_applies(call: str) -> bool:
+        for index, loop_body in group_loops:
+            member_access = rf"group\.members(?:\.at\(\s*{re.escape(index)}\s*\)|\[\s*{re.escape(index)}\s*\])"
+            if call in loop_body and re.search(member_access, loop_body):
+                return True
+        return False
+
+    if not loop_applies("vfs_stream_cache_invalidate_remote_scope"):
+        fail("invalidate notify must clear the stream-cache scope of every retained group member")
+    if not loop_applies("release_vfs_proxy_lifecycle_ref"):
+        fail("invalidate notify must release exactly the retained group span after unlocked work")
 
 
 def test_export_rebuild_is_revisioned_and_backing_mount_exact() -> None:
@@ -3332,7 +3416,7 @@ def test_remote_vfs_mount_lanes_preserve_channel_and_lifetime_affinity() -> None
         )
     require_tokens(
         function_body(source, "handle_vfs_invalidate_notify"),
-        ["invalidate_readlink_cache_group(state)"],
+        ["invalidate_readlink_cache_group(group.members"],
         "server invalidation clears sibling-lane readlink caches",
     )
 
@@ -3421,6 +3505,7 @@ def main() -> None:
     test_server_bounded_metadata_responses_use_stack_storage()
     test_stale_fd_gc_drains_binding_users_before_file_close()
     test_server_fd_and_consumer_rx_use_exact_channel_identity()
+    test_invalidate_notify_retains_and_invalidates_complete_mount_group()
     test_export_rebuild_is_revisioned_and_backing_mount_exact()
     test_remote_vfs_mount_lanes_preserve_channel_and_lifetime_affinity()
     print("WKI remote VFS source invariants hold")

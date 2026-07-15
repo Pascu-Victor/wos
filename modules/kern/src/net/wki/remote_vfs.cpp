@@ -7362,19 +7362,60 @@ void handle_vfs_invalidate_notify(const WkiHeader* hdr, const uint8_t* payload, 
         return;
     }
 
+    struct RetainedGroup {
+        std::array<ProxyVfsState*, VFS_PROXY_LANE_COUNT> members{};
+        size_t count = 0;
+        std::array<char, VFS_EXPORT_PATH_LEN> local_mount_path{};
+    } group;
+
     s_vfs_lock.lock();
     ProxyVfsState* state = find_vfs_proxy_by_channel(channel_identity);
+    ProxyVfsState* anchor = state;
+    if (state != nullptr && !state->lane_anchor) {
+        anchor = nullptr;
+        for (auto& proxy : g_vfs_proxies) {
+            if (proxy != nullptr && proxy->lane_anchor && proxy->mount_group_id == state->mount_group_id) {
+                anchor = proxy.get();
+                break;
+            }
+        }
+    }
     if (state != nullptr) {
-        state->lifecycle_refs++;
+        group.local_mount_path = state->local_mount_path;
+        if (anchor != nullptr && anchor->lane_anchor) {
+            for (auto* member : anchor->lanes) {
+                if (member == nullptr || group.count >= group.members.size()) {
+                    continue;
+                }
+                bool already_retained = false;
+                for (size_t retained_index = 0; retained_index < group.count; ++retained_index) {
+                    if (group.members.at(retained_index) == member) {
+                        already_retained = true;
+                        break;
+                    }
+                }
+                if (already_retained) {
+                    continue;
+                }
+                member->lifecycle_refs++;
+                group.members.at(group.count++) = member;
+                invalidate_all_dir_caches(member);
+            }
+        }
+        if (group.count == 0) {
+            state->lifecycle_refs++;
+            group.members.at(group.count++) = state;
+            invalidate_all_dir_caches(state);
+        }
     }
     s_vfs_lock.unlock();
-    if (state == nullptr) {
+    if (group.count == 0) {
         return;
     }
 
     auto invalidate_path = [&](const char* rel_path, uint16_t rel_len) {
         std::array<char, 512> full_path __attribute__((uninitialized));  // NOLINT(cppcoreguidelines-pro-type-member-init)
-        build_full_path(full_path.data(), full_path.size(), state->local_mount_path.data(), rel_path, rel_len);
+        build_full_path(full_path.data(), full_path.size(), group.local_mount_path.data(), rel_path, rel_len);
         ker::vfs::vfs_cache_notify_invalidate_path(full_path.data());
     };
 
@@ -7387,12 +7428,16 @@ void handle_vfs_invalidate_notify(const WkiHeader* hdr, const uint8_t* payload, 
         invalidate_path(new_rel, new_len);
     }
 
-    ker::vfs::vfs_stream_cache_invalidate_remote_scope(state);
-    s_vfs_lock.lock();
-    invalidate_all_dir_caches(state);
-    s_vfs_lock.unlock();
-    invalidate_readlink_cache_group(state);
-    release_vfs_proxy_lifecycle_ref(state);
+    // The owner sends one logical notification per mount anchor even though
+    // the mount has several RPC lanes. Clear every lane-local cache before
+    // any retained member can be selected for the next operation.
+    invalidate_readlink_cache_group(group.members.at(0));
+    for (size_t member_index = 0; member_index < group.count; ++member_index) {
+        ker::vfs::vfs_stream_cache_invalidate_remote_scope(group.members.at(member_index));
+    }
+    for (size_t member_index = 0; member_index < group.count; ++member_index) {
+        release_vfs_proxy_lifecycle_ref(group.members.at(member_index));
+    }
 }
 
 void handle_vfs_attach_ack(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len) {

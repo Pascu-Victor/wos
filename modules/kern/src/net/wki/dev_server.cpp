@@ -831,15 +831,29 @@ void wki_dev_server_finish_vfs_export_reconciliation(uint64_t target_even_revisi
         VfsRdmaBuffers vfs_rdma_buffers = {};
 
         uint64_t const SRV_FLAGS = s_server_lock.lock_irqsave();
+        // Keep each mount group's anchor reachable until its auxiliary rows
+        // have retired. Invalidation coalescing uses that anchor as the one
+        // reliable delivery path for the complete group.
         for (auto& binding : g_bindings) {
-            if (!vfs_reconciliation_may_claim_binding(binding, target_even_revision)) {
+            if (!vfs_reconciliation_may_claim_binding(binding, target_even_revision) || binding.vfs_lane_anchor) {
                 continue;
             }
             retired = &binding;
-            channel_identity = binding.channel_identity;
-            take_vfs_rdma_buffers_locked(binding, &vfs_rdma_buffers);
-            mark_binding_retiring_locked(binding);
             break;
+        }
+        if (retired == nullptr) {
+            for (auto& binding : g_bindings) {
+                if (!vfs_reconciliation_may_claim_binding(binding, target_even_revision)) {
+                    continue;
+                }
+                retired = &binding;
+                break;
+            }
+        }
+        if (retired != nullptr) {
+            channel_identity = retired->channel_identity;
+            take_vfs_rdma_buffers_locked(*retired, &vfs_rdma_buffers);
+            mark_binding_retiring_locked(*retired);
         }
         s_server_lock.unlock_irqrestore(SRV_FLAGS);
 
@@ -1713,6 +1727,10 @@ void handle_dev_attach_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
         binding.attach_cookie = req->attach_cookie;
         binding.vfs_export_dev_id = exp.backing_dev_id;
         binding.vfs_export_publication_revision = exp.publication_revision;
+        // The current consumer sets DISABLE_RDMA only on auxiliary mount
+        // lanes, so this bit also classifies the notification anchor. A future
+        // no-RDMA anchor needs an explicit lane marker instead of setting it.
+        binding.vfs_lane_anchor = (req->attach_mode & DEV_ATTACH_DISABLE_RDMA) == 0;
         memcpy(static_cast<void*>(binding.vfs_export_path), static_cast<const void*>(exp.export_path),
                std::min(sizeof(binding.vfs_export_path), sizeof(exp.export_path)));
         memcpy(static_cast<void*>(binding.vfs_export_name), static_cast<const void*>(exp.name),
@@ -2848,7 +2866,9 @@ void wki_dev_server_send_vfs_notify(uint32_t resource_id, uint16_t op_id, const 
     std::memcpy(req.data() + sizeof(DevOpReqPayload), data, data_len);
 
     struct Target {
+        uint16_t consumer_node = WKI_NODE_INVALID;
         WkiChannelIdentity channel_identity{};
+        bool lane_anchor = false;
     };
     std::deque<Target> targets;
 
@@ -2857,13 +2877,50 @@ void wki_dev_server_send_vfs_notify(uint32_t resource_id, uint16_t op_id, const 
         if (!binding.active || binding.resource_type != ResourceType::VFS || binding.resource_id != resource_id) {
             continue;
         }
-        targets.push_back({.channel_identity = binding.channel_identity});
+        targets.push_back({
+            .consumer_node = binding.consumer_node,
+            .channel_identity = binding.channel_identity,
+            .lane_anchor = binding.vfs_lane_anchor,
+        });
     }
     s_server_lock.unlock_irqrestore(SRV_FLAGS);
 
+    auto consumer_has_anchor = [&](uint16_t consumer_node) {
+        return std::ranges::any_of(targets, [consumer_node](const Target& candidate) {
+            return candidate.consumer_node == consumer_node && candidate.lane_anchor;
+        });
+    };
+
     for (const auto& target : targets) {
-        static_cast<void>(
-            wki_send_on_channel_identity(target.channel_identity, MsgType::DEV_OP_REQ, req.data(), static_cast<uint16_t>(TOTAL)));
+        if (!target.lane_anchor) {
+            // Preserve the old all-lane behavior for a legacy or transitional
+            // aux-only snapshot. Current reconciliation keeps anchors until
+            // every auxiliary row has retired.
+            if (!consumer_has_anchor(target.consumer_node)) {
+                static_cast<void>(
+                    wki_send_on_channel_identity(target.channel_identity, MsgType::DEV_OP_REQ, req.data(), static_cast<uint16_t>(TOTAL)));
+            }
+            continue;
+        }
+
+        // The receiver invalidates the anchor's complete mount group, so one
+        // successful send replaces the usual four lane-local notifications.
+        if (wki_send_on_channel_identity(target.channel_identity, MsgType::DEV_OP_REQ, req.data(), static_cast<uint16_t>(TOTAL)) ==
+            WKI_OK) {
+            continue;
+        }
+
+        // A snapshotted anchor can retire before the unlocked send. The owner
+        // cannot identify its auxiliary siblings without extending the wire
+        // protocol, so conservatively notify every auxiliary binding for this
+        // consumer. That preserves every mount group on the rare failure path.
+        for (const auto& fallback : targets) {
+            if (fallback.lane_anchor || fallback.consumer_node != target.consumer_node) {
+                continue;
+            }
+            static_cast<void>(
+                wki_send_on_channel_identity(fallback.channel_identity, MsgType::DEV_OP_REQ, req.data(), static_cast<uint16_t>(TOTAL)));
+        }
     }
 }
 

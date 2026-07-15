@@ -52,6 +52,9 @@ struct DevServerBinding {
     uint64_t vfs_export_dev_id = 0;
     uint64_t vfs_export_publication_revision = 0;
     uint64_t vfs_export_revision_seen = 0;
+    // One logical remote mount has one anchor binding and may have several
+    // auxiliary RPC bindings. This is local server state, not a wire field.
+    bool vfs_lane_anchor = true;
     net::NetDevice* net_dev = nullptr;
     NetRxFilter net_rx_filter;  // D12: per-binding RX filter
 
@@ -125,6 +128,7 @@ struct DevServerBinding {
           vfs_export_dev_id(o.vfs_export_dev_id),
           vfs_export_publication_revision(o.vfs_export_publication_revision),
           vfs_export_revision_seen(o.vfs_export_revision_seen),
+          vfs_lane_anchor(o.vfs_lane_anchor),
           net_dev(o.net_dev),
           net_rx_filter(o.net_rx_filter),
           net_rx_credits(o.net_rx_credits),
@@ -191,6 +195,7 @@ struct DevServerBinding {
             vfs_export_dev_id = o.vfs_export_dev_id;
             vfs_export_publication_revision = o.vfs_export_publication_revision;
             vfs_export_revision_seen = o.vfs_export_revision_seen;
+            vfs_lane_anchor = o.vfs_lane_anchor;
             // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-array-to-pointer-decay)
             __builtin_memcpy(vfs_export_path, o.vfs_export_path, sizeof(vfs_export_path));
             // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-array-to-pointer-decay)

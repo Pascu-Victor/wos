@@ -41,6 +41,27 @@ def function_body(source: str, name: str) -> str:
     return source[match.end() : pos - 1]
 
 
+def block_body_after(source: str, marker: str) -> str:
+    marker_pos = source.find(marker)
+    if marker_pos < 0:
+        fail(f"missing block marker {marker}")
+    brace_pos = source.find("{", marker_pos + len(marker))
+    if brace_pos < 0:
+        fail(f"missing block after {marker}")
+
+    depth = 1
+    pos = brace_pos + 1
+    while pos < len(source) and depth > 0:
+        if source[pos] == "{":
+            depth += 1
+        elif source[pos] == "}":
+            depth -= 1
+        pos += 1
+    if depth != 0:
+        fail(f"unterminated block after {marker}")
+    return source[brace_pos + 1 : pos - 1]
+
+
 def require_order(body: str, before: str, after: str, context: str) -> None:
     before_pos = body.find(before)
     after_pos = body.find(after)
@@ -148,6 +169,100 @@ def test_vfs_attach_uses_export_snapshot_not_unlocked_pointer() -> None:
         "memcpy(static_cast<void*>(binding.vfs_export_path), static_cast<const void*>(exp.export_path),",
         "VFS attach copies from snapshot",
     )
+
+
+def test_vfs_notify_coalesces_by_mount_anchor_with_conservative_fallback() -> None:
+    source = DEV_SERVER_CPP.read_text()
+    body = function_body(source, "wki_dev_server_send_vfs_notify")
+    attach = function_body(source, "handle_dev_attach_req")
+    header = DEV_SERVER_HPP.read_text()
+
+    header_tokens = [
+        "bool vfs_lane_anchor = true;",
+        "vfs_lane_anchor(o.vfs_lane_anchor)",
+        "vfs_lane_anchor = o.vfs_lane_anchor;",
+    ]
+    missing = [token for token in header_tokens if token not in header]
+    if missing:
+        fail("VFS binding anchor identity must survive binding moves: " + ", ".join(missing))
+    if "binding.vfs_lane_anchor = (req->attach_mode & DEV_ATTACH_DISABLE_RDMA) == 0;" not in attach:
+        fail("VFS attach must mark exactly the RDMA-capable mount lane as its server-side anchor")
+
+    required = [
+        "uint16_t consumer_node",
+        "WkiChannelIdentity channel_identity",
+        "bool lane_anchor",
+        ".consumer_node = binding.consumer_node",
+        ".channel_identity = binding.channel_identity",
+        ".lane_anchor = binding.vfs_lane_anchor",
+        "auto consumer_has_anchor",
+        "std::ranges::any_of(targets",
+        "candidate.consumer_node == consumer_node && candidate.lane_anchor",
+        "!target.lane_anchor",
+        "!consumer_has_anchor(target.consumer_node)",
+        "fallback.lane_anchor",
+        "fallback.consumer_node != target.consumer_node",
+    ]
+    missing = [token for token in required if token not in body]
+    if missing:
+        fail("VFS invalidation targets must retain anchor and conservative fallback identity: " + ", ".join(missing))
+
+    require_order(body, "s_server_lock.lock_irqsave", "for (const auto& binding : g_bindings)", "VFS notify snapshot lock")
+    require_order(body, ".lane_anchor = binding.vfs_lane_anchor", "s_server_lock.unlock_irqrestore", "VFS notify snapshot unlock")
+    require_order(body, "s_server_lock.unlock_irqrestore", "auto consumer_has_anchor", "anchor lookup uses the unlocked snapshot")
+    require_order(body, "auto consumer_has_anchor", "for (const auto& target : targets)", "VFS notify sends after anchor lookup")
+    require_order(
+        body,
+        "if (!consumer_has_anchor(target.consumer_node))",
+        "wki_send_on_channel_identity(target.channel_identity",
+        "orphaned auxiliary lane notification",
+    )
+    require_order(
+        body,
+        "wki_send_on_channel_identity(target.channel_identity",
+        "for (const auto& fallback : targets)",
+        "fallback only after the primary anchor send",
+    )
+    require_order(
+        body,
+        "fallback.consumer_node != target.consumer_node",
+        "wki_send_on_channel_identity(fallback.channel_identity",
+        "same-consumer auxiliary fallback",
+    )
+
+    if body.count("wki_send_on_channel_identity(") != 3:
+        fail("VFS invalidation must send from orphaned auxiliaries, anchors, and failed-anchor fallback sites")
+    anchor_lookup = re.search(
+        r"auto\s+consumer_has_anchor\s*=.*?std::ranges::any_of\(\s*targets\s*,.*?"
+        r"return\s+candidate\.consumer_node\s*==\s*consumer_node\s*&&\s*candidate\.lane_anchor\s*;",
+        body,
+        re.DOTALL,
+    )
+    if anchor_lookup is None:
+        fail("auxiliary teardown handling must find a surviving same-consumer anchor in the target snapshot")
+    auxiliary_branch = block_body_after(body, "if (!target.lane_anchor)")
+    orphaned_auxiliary = block_body_after(auxiliary_branch, "if (!consumer_has_anchor(target.consumer_node))")
+    direct_send = "wki_send_on_channel_identity(target.channel_identity"
+    if direct_send not in orphaned_auxiliary or auxiliary_branch.count(direct_send) != 1:
+        fail("an auxiliary lane must notify directly only when its consumer has no surviving anchor")
+    if not auxiliary_branch.strip().endswith("continue;"):
+        fail("auxiliary notification handling must not fall through to the anchor send path")
+    successful_anchor = re.search(
+        r"if\s*\(\s*wki_send_on_channel_identity\(\s*target\.channel_identity.*?==\s*WKI_OK\s*\)\s*\{\s*continue\s*;\s*\}",
+        body,
+        re.DOTALL,
+    )
+    if successful_anchor is None:
+        fail("a successful VFS anchor notification must suppress auxiliary fallback notifications")
+    fallback_filter = re.search(
+        r"for\s*\(\s*const auto& fallback\s*:\s*targets\s*\)\s*\{\s*"
+        r"if\s*\(\s*fallback\.lane_anchor\s*\|\|\s*fallback\.consumer_node\s*!=\s*target\.consumer_node\s*\)\s*"
+        r"\{\s*continue\s*;\s*\}.*?wki_send_on_channel_identity\(\s*fallback\.channel_identity",
+        body,
+        re.DOTALL,
+    )
+    if fallback_filter is None:
+        fail("failed anchor notifications must fan out to every auxiliary lane of the same consumer")
 
 
 def test_duplicate_net_attach_does_not_rewrite_binding_cookie() -> None:
@@ -418,6 +533,18 @@ def test_retirement_has_one_cleanup_owner_and_preserves_block_writer_exclusion()
             fail(f"VFS reconciliation cleanup claim is missing {token!r}")
     if "vfs_reconciliation_may_claim_binding(binding, target_even_revision)" not in vfs_finish:
         fail("VFS export reconciliation must not claim a binding already owned by retirement cleanup")
+    require_order(
+        vfs_finish,
+        "vfs_reconciliation_may_claim_binding(binding, target_even_revision) || binding.vfs_lane_anchor",
+        "if (retired == nullptr)",
+        "VFS reconciliation scans auxiliary bindings before anchors",
+    )
+    require_order(
+        vfs_finish,
+        "if (retired == nullptr)",
+        "mark_binding_retiring_locked(*retired)",
+        "VFS reconciliation preserves an anchor until auxiliary rows retire",
+    )
 
     for token in ["binding.resource_type == ResourceType::BLOCK", "!binding.block_read_only"]:
         if token not in writer_reservation:
@@ -1075,6 +1202,7 @@ def main() -> None:
     test_state_notify_sends_notify_cookie_envelope()
     test_net_dispatch_does_not_pass_server_binding_pointer()
     test_vfs_attach_uses_export_snapshot_not_unlocked_pointer()
+    test_vfs_notify_coalesces_by_mount_anchor_with_conservative_fallback()
     test_duplicate_net_attach_does_not_rewrite_binding_cookie()
     test_net_binding_state_mutation_revalidates_under_server_lock()
     test_net_notify_handlers_validate_cookie_envelope()
