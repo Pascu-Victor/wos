@@ -738,6 +738,19 @@ void publish_claimed_wait_entry(WkiWaitEntry* entry, int result) {
     entry->state.store(WkiWaitEntry::DONE, std::memory_order_release);
 }
 
+[[nodiscard]] auto process_wait_can_park(mod::sched::task::Task* waiter_task) -> bool {
+    // Remote exec publishes its proxy/deferred handoff only after its
+    // synchronous acceptance wait. Exclude both markers defensively so a
+    // future caller cannot turn that one-way handoff into an in-kernel park.
+    // Syscall entry masks IF; preemptible_syscall_park() deliberately handles
+    // and restores that state, so IF is not an eligibility condition here.
+    return waiter_task != nullptr && waiter_task == mod::sched::get_current_task() &&
+           waiter_task->type == mod::sched::task::TaskType::PROCESS && waiter_task->syscall_account_start_us != 0 &&
+           !waiter_task->deferred_task_switch && !waiter_task->wants_block && !waiter_task->is_voluntary_blocked() &&
+           waiter_task->wki_proxy_task_id == 0 && !waiter_task->wait_channel_is(mod::sched::task::WaitChannelKind::WKI_EXECVE_PROXY) &&
+           !is_timer_deferred_waiter(waiter_task) && mod::sched::preempt_count() == 0 && !waiter_task->has_interrupting_signal_pending();
+}
+
 }  // namespace
 
 auto wki_wait_for_op(WkiWaitEntry* entry, uint64_t timeout_us) -> int {
@@ -760,11 +773,9 @@ auto wki_wait_for_op(WkiWaitEntry* entry, uint64_t timeout_us) -> int {
 
     // Sleep until RX/timer completion.
     //
-    // DAEMON waiters can use a true block. PROCESS waiters must stay on the
-    // existing voluntary-yield path for now: proxy exec handoff intentionally
-    // suppresses one class of concurrent wake in deferred_task_switch(), and
-    // using kern_block() here can therefore lose a wake and strand the task
-    // until an unrelated signal arrives.
+    // DAEMON waiters can use a true block. Ordinary PROCESS syscall waiters can
+    // park at an in-kernel safe point; exception/page-fault callers and the
+    // proxy-exec deferred handoff retain the voluntary-yield path.
     uint64_t next_diag_us = wait_diag_enabled() ? wki_future_deadline_us(STARTED_US, WKI_WAIT_DIAG_FIRST_US) : 0;
     while (!wait_done(entry)) {
         uint64_t const NOW_US = wki_now_us();
@@ -791,7 +802,10 @@ auto wki_wait_for_op(WkiWaitEntry* entry, uint64_t timeout_us) -> int {
             next_diag_us = wki_future_deadline_us(NOW_US, WKI_WAIT_DIAG_INTERVAL_US);
         }
         auto* waiter_task = entry->task.load(std::memory_order_acquire);
-        if (waiter_task != nullptr) {
+        bool const PROCESS_CAN_PARK = process_wait_can_park(waiter_task);
+        if (PROCESS_CAN_PARK) {
+            mod::sched::preemptible_syscall_park("wki_wait", entry->deadline_us);
+        } else if (waiter_task != nullptr) {
             waiter_task->set_wait_channel("wki_wait");
             if (waiter_task->type == mod::sched::task::TaskType::DAEMON && !is_timer_deferred_waiter(waiter_task)) {
                 mod::sched::kern_block();
@@ -846,7 +860,7 @@ void wki_finish_claimed_op(WkiWaitEntry* entry, int result) {
     // Wake the waiter whether it has already moved to WAITING or is still at
     // the current-task voluntary block point.
     if (RETAINED_WAITER_TASK) {
-        mod::sched::kern_wake(waiter_task);
+        mod::sched::wake_task_from_event(waiter_task, mod::sched::EventWakeDeferredSwitch::PRESERVE);
         waiter_task->release();
     }
 }

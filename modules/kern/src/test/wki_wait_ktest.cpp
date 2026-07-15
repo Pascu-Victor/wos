@@ -29,6 +29,17 @@ KTEST(WkiWaitEntry, WakeDoesNotOverwriteCompletedWaiter) {
     KEXPECT_FALSE(ker::net::wki::wki_claim_op(&wait));
 }
 
+KTEST(WkiWaitEntry, CompletionBeforeWaitReturnsWithoutLinking) {
+    ker::net::wki::WkiWaitEntry wait{};
+
+    ker::net::wki::wki_wake_op(&wait, 42);
+
+    KEXPECT_EQ(ker::net::wki::wki_wait_for_op(&wait, ker::net::wki::WKI_OP_TIMEOUT_US), 42);
+    KEXPECT_FALSE(ker::net::wki::wki_selftest_wait_list_contains(&wait));
+    KEXPECT_EQ(wait.result, 42);
+    KEXPECT_EQ(wait.state.load(std::memory_order_acquire), static_cast<uint8_t>(ker::net::wki::WkiWaitEntry::DONE));
+}
+
 KTEST(WkiWaitEntry, ClaimedWaiterIgnoresCompetingWakeUntilFinished) {
     ker::net::wki::WkiWaitEntry wait{};
 

@@ -115,7 +115,9 @@ def test_done_is_the_final_stack_waiter_access() -> None:
     task_load = finish_body.find("entry->task.load(std::memory_order_acquire)")
     task_retain = finish_body.find("waiter_task->try_acquire()")
     done_publish = finish_body.find("publish_claimed_wait_entry(entry, result)")
-    task_wake = finish_body.find("mod::sched::kern_wake(waiter_task)")
+    task_wake = finish_body.find(
+        "mod::sched::wake_task_from_event(waiter_task, mod::sched::EventWakeDeferredSwitch::PRESERVE)"
+    )
     task_release = finish_body.find("waiter_task->release()")
     if min(task_load, task_retain, done_publish, task_wake, task_release) < 0:
         fail("wki_finish_claimed_op must retain and release its scheduler task around DONE")
@@ -123,6 +125,58 @@ def test_done_is_the_final_stack_waiter_access() -> None:
         fail("wki_finish_claimed_op must pin task, publish DONE, then wake and release")
     if "entry->" in finish_body[done_publish + len("publish_claimed_wait_entry(entry, result)") :]:
         fail("wki_finish_claimed_op must not dereference a stack waiter after publishing DONE")
+
+
+def test_process_wait_parks_only_at_safe_syscall_points() -> None:
+    source = WKI_CPP.read_text()
+    guard_body = function_body(source, "process_wait_can_park")
+    require_tokens(
+        guard_body,
+        [
+            "waiter_task == mod::sched::get_current_task()",
+            "TaskType::PROCESS",
+            "waiter_task->syscall_account_start_us != 0",
+            "!waiter_task->deferred_task_switch",
+            "!waiter_task->wants_block",
+            "!waiter_task->is_voluntary_blocked()",
+            "waiter_task->wki_proxy_task_id == 0",
+            "WaitChannelKind::WKI_EXECVE_PROXY",
+            "!is_timer_deferred_waiter(waiter_task)",
+            "mod::sched::preempt_count() == 0",
+            "!waiter_task->has_interrupting_signal_pending()",
+        ],
+        "WKI PROCESS park eligibility",
+    )
+    if "interrupts_enabled()" in guard_body:
+        fail("WKI PROCESS park must accept the IF-masked syscall entry state")
+
+    wait_body = function_body(source, "wki_wait_for_op")
+    require_tokens(
+        wait_body,
+        [
+            "bool const PROCESS_CAN_PARK = process_wait_can_park(waiter_task)",
+            'mod::sched::preemptible_syscall_park("wki_wait", entry->deadline_us)',
+            "TaskType::DAEMON",
+            "mod::sched::kern_block()",
+            "wki_spin_yield()",
+            "mod::sched::kern_yield()",
+        ],
+        "WKI wait park and unsafe-context fallbacks",
+    )
+    park_branch_start = wait_body.find("if (PROCESS_CAN_PARK)")
+    park_call = wait_body.find('mod::sched::preemptible_syscall_park("wki_wait", entry->deadline_us)')
+    park_branch_end = wait_body.find("else if (waiter_task != nullptr)", park_call)
+    if min(park_branch_start, park_call, park_branch_end) < 0 or not park_branch_start < park_call < park_branch_end:
+        fail("WKI PROCESS park must remain confined to its guarded branch")
+    park_branch = wait_body[park_branch_start:park_branch_end]
+    if "kern_yield" in park_branch or "kern_block" in park_branch:
+        fail("WKI PROCESS park branch must not append a scheduler yield or block")
+    require_order(
+        wait_body,
+        "process_wait_can_park(waiter_task)",
+        'waiter_task->set_wait_channel("wki_wait")',
+        "proxy-exec park exclusion must be checked before replacing the typed wait channel",
+    )
 
 
 def test_ktest_covers_completed_claimed_cleanup() -> None:
@@ -138,6 +192,17 @@ def test_ktest_covers_completed_claimed_cleanup() -> None:
             "WkiWaitEntry::DONE",
         ],
         "WKI wait cleanup completed-claim KTEST",
+    )
+    require_tokens(
+        source,
+        [
+            "CompletionBeforeWaitReturnsWithoutLinking",
+            "wki_wake_op(&wait, 42)",
+            "KEXPECT_EQ(ker::net::wki::wki_wait_for_op(&wait, ker::net::wki::WKI_OP_TIMEOUT_US), 42)",
+            "KEXPECT_FALSE(ker::net::wki::wki_selftest_wait_list_contains(&wait))",
+            "WkiWaitEntry::DONE",
+        ],
+        "WKI completion-before-wait KTEST",
     )
 
 
@@ -294,9 +359,10 @@ def test_resource_withdraw_defers_blocking_unmount() -> None:
 def main() -> None:
     test_cleanup_publishes_only_when_it_claims_waiter()
     test_done_is_the_final_stack_waiter_access()
+    test_process_wait_parks_only_at_safe_syscall_points()
     test_ktest_covers_completed_claimed_cleanup()
     test_resource_withdraw_defers_blocking_unmount()
-    print("WKI wait cleanup source invariants hold")
+    print("WKI wait source invariants hold")
 
 
 if __name__ == "__main__":
