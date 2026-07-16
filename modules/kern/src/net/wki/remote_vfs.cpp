@@ -275,6 +275,8 @@ auto perf_vfs_op(uint16_t op_id) -> uint8_t {
             return static_cast<uint8_t>(ker::mod::perf::WkiPerfVfsOp::MKDIR);
         case OP_VFS_CHMOD:
             return static_cast<uint8_t>(ker::mod::perf::WkiPerfVfsOp::CHMOD);
+        case OP_VFS_UTIMENS:
+            return static_cast<uint8_t>(ker::mod::perf::WkiPerfVfsOp::UTIMENS);
         case OP_VFS_WRITE:
         case OP_VFS_WRITE_RDMA:
             return static_cast<uint8_t>(ker::mod::perf::WkiPerfVfsOp::WRITE);
@@ -330,6 +332,8 @@ auto perf_vfs_server_op(uint16_t op_id) -> uint8_t {
             return static_cast<uint8_t>(ker::mod::perf::WkiPerfVfsServerOp::MKDIR);
         case OP_VFS_CHMOD:
             return static_cast<uint8_t>(ker::mod::perf::WkiPerfVfsServerOp::CHMOD);
+        case OP_VFS_UTIMENS:
+            return static_cast<uint8_t>(ker::mod::perf::WkiPerfVfsServerOp::UTIMENS);
         case OP_VFS_WRITE:
         case OP_VFS_WRITE_RDMA:
             return static_cast<uint8_t>(ker::mod::perf::WkiPerfVfsServerOp::WRITE);
@@ -514,6 +518,30 @@ void touch_remote_fd(RemoteVfsFd* rfd) {
     if (rfd != nullptr) {
         rfd->last_activity_us = wki_now_us();
     }
+}
+
+auto relative_wire_path_has_safe_components(const uint8_t* path, size_t path_len) -> bool {
+    if (path_len == 0) {
+        return true;
+    }
+    if (path == nullptr || path[0] == '/' || std::memchr(path, '\0', path_len) != nullptr) {
+        return false;
+    }
+
+    size_t component_start = 0;
+    for (size_t pos = 0; pos <= path_len; ++pos) {
+        if (pos != path_len && path[pos] != '/') {
+            continue;
+        }
+        size_t const COMPONENT_LEN = pos - component_start;
+        bool const DOT = COMPONENT_LEN == 1 && path[component_start] == '.';
+        bool const DOT_DOT = COMPONENT_LEN == 2 && path[component_start] == '.' && path[component_start + 1] == '.';
+        if (DOT || DOT_DOT) {
+            return false;
+        }
+        component_start = pos + 1;
+    }
+    return true;
 }
 
 // Build full absolute path from export_path + relative_path
@@ -3991,6 +4019,21 @@ void wki_remote_vfs_cleanup_for_task(uint64_t pid) {
 auto wki_remote_vfs_fsync(ker::vfs::File* file) -> int { return remote_vfs_fsync_file(file); }
 
 #ifdef WOS_SELFTEST
+auto wki_remote_vfs_selftest_utimens_wire_path_validation() -> bool {
+    constexpr std::array<uint8_t, 8> SAFE_PATH = {'d', 'i', 'r', '/', '.', '.', 'x', 'x'};
+    constexpr std::array<uint8_t, 5> ABSOLUTE_PATH = {'/', 'f', 'i', 'l', 'e'};
+    constexpr std::array<uint8_t, 8> DOT_PATH = {'d', 'i', 'r', '/', '.', '/', 'f', 'x'};
+    constexpr std::array<uint8_t, 11> DOT_DOT_PATH = {'d', 'i', 'r', '/', '.', '.', '/', 'f', 'i', 'l', 'e'};
+    constexpr std::array<uint8_t, 8> NUL_PATH = {'d', 'i', 'r', '/', '\0', 'f', 'i', 'l'};
+
+    return relative_wire_path_has_safe_components(nullptr, 0) &&
+           relative_wire_path_has_safe_components(SAFE_PATH.data(), SAFE_PATH.size()) &&
+           !relative_wire_path_has_safe_components(ABSOLUTE_PATH.data(), ABSOLUTE_PATH.size()) &&
+           !relative_wire_path_has_safe_components(DOT_PATH.data(), DOT_PATH.size()) &&
+           !relative_wire_path_has_safe_components(DOT_DOT_PATH.data(), DOT_DOT_PATH.size()) &&
+           !relative_wire_path_has_safe_components(NUL_PATH.data(), NUL_PATH.size());
+}
+
 auto wki_remote_vfs_selftest_multi_rdma_lane_selection() -> bool {
     WkiTransport transport{};
     transport.name = "wki-roce";
@@ -5683,6 +5726,74 @@ void handle_vfs_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_ident
             break;
         }
 
+        case OP_VFS_UTIMENS: {
+            if (data_len < sizeof(VfsUtimensReqPrefix)) {
+                DevOpRespPayload resp = {};
+                resp.op_id = OP_VFS_UTIMENS;
+                resp.status = -EINVAL;
+                resp.data_len = 0;
+                send_simple_resp(resp);
+                break;
+            }
+
+            VfsUtimensReqPrefix prefix{};
+            memcpy(&prefix, data, sizeof(prefix));
+            constexpr uint8_t KNOWN_FLAGS = WKI_VFS_UTIMENS_FLAG_FOLLOW_FINAL_SYMLINK | WKI_VFS_UTIMENS_FLAG_TIMES_PRESENT;
+            size_t const EXPECTED_DATA_LEN = sizeof(prefix) + static_cast<size_t>(prefix.path_len);
+            const uint8_t* const PATH_DATA = data + sizeof(prefix);
+            auto full_path_fits = [&prefix](const char* base) {
+                size_t const BASE_LEN = strlen(base);
+                size_t const SEPARATOR_LEN = BASE_LEN > 0 && base[BASE_LEN - 1] != '/' && prefix.path_len > 0 ? 1U : 0U;
+                return BASE_LEN + SEPARATOR_LEN + static_cast<size_t>(prefix.path_len) < 512U;
+            };
+            if ((prefix.flags & ~KNOWN_FLAGS) != 0 || prefix.reserved != 0 || EXPECTED_DATA_LEN != data_len ||
+                !relative_wire_path_has_safe_components(PATH_DATA, prefix.path_len) || !full_path_fits(export_path) ||
+                !full_path_fits(export_name)) {
+                DevOpRespPayload resp = {};
+                resp.op_id = OP_VFS_UTIMENS;
+                resp.status = -EINVAL;
+                resp.data_len = 0;
+                send_simple_resp(resp);
+                break;
+            }
+
+            std::array<char, 512> full_path __attribute__((uninitialized));          // NOLINT(cppcoreguidelines-pro-type-member-init)
+            std::array<char, 512> full_visible_path __attribute__((uninitialized));  // NOLINT(cppcoreguidelines-pro-type-member-init)
+            build_full_path(full_path.data(), full_path.size(), export_path, reinterpret_cast<const char*>(PATH_DATA), prefix.path_len);
+            build_full_path(full_visible_path.data(), full_visible_path.size(), export_name, reinterpret_cast<const char*>(PATH_DATA),
+                            prefix.path_len);
+
+            if (path_crosses_recursive_wki_boundary_direct(full_path.data(), full_visible_path.data())) {
+                DevOpRespPayload resp = {};
+                resp.op_id = OP_VFS_UTIMENS;
+                resp.status = -EPERM;
+                resp.data_len = 0;
+                send_simple_resp(resp);
+                break;
+            }
+
+            std::array<ker::vfs::Timespec, 2> request_times = {
+                ker::vfs::Timespec{.tv_sec = prefix.atime_sec, .tv_nsec = prefix.atime_nsec},
+                ker::vfs::Timespec{.tv_sec = prefix.mtime_sec, .tv_nsec = prefix.mtime_nsec},
+            };
+            const ker::vfs::Timespec* const TIMES =
+                (prefix.flags & WKI_VFS_UTIMENS_FLAG_TIMES_PRESENT) != 0 ? request_times.data() : nullptr;
+
+            perf_record_vfs_server_begin(SERVER_OP, hdr->src_node, channel_id, CORRELATION, CALLSITE);
+            uint64_t const LOCAL_STARTED_US = wki_now_us();
+            int const RET = ker::vfs::vfs_utimens_resolved_beneath(export_path, full_path.data(), TIMES,
+                                                                   (prefix.flags & WKI_VFS_UTIMENS_FLAG_FOLLOW_FINAL_SYMLINK) != 0);
+            perf_record_vfs_server_end(SERVER_OP, hdr->src_node, channel_id, CORRELATION, RET,
+                                       static_cast<uint32_t>(wki_now_us() - LOCAL_STARTED_US), 0, CALLSITE);
+
+            DevOpRespPayload resp = {};
+            resp.op_id = OP_VFS_UTIMENS;
+            resp.status = static_cast<int16_t>(RET);
+            resp.data_len = 0;
+            send_simple_resp(resp);
+            break;
+        }
+
         case OP_VFS_FSYNC: {
             // Request: {remote_fd:i32}
             if (data_len < 4) {
@@ -7150,6 +7261,46 @@ auto wki_remote_vfs_chmod(void* mount_private_data, const char* fs_relative_path
     }
 
     return vfs_proxy_send_and_wait(state, OP_VFS_CHMOD, req_data, req_data_len, nullptr, 0);
+}
+
+auto wki_remote_vfs_utimens(void* mount_private_data, const char* fs_relative_path, const ker::vfs::Timespec* times,
+                            bool follow_final_symlink) -> int {
+    auto* anchor = static_cast<ProxyVfsState*>(mount_private_data);
+    if (anchor == nullptr || fs_relative_path == nullptr) {
+        return -EINVAL;
+    }
+    auto* state = acquire_vfs_proxy_lane(anchor);
+    if (state == nullptr) {
+        return -EINVAL;
+    }
+    ProxyLifecycleRefGuard lane_ref_guard(state);
+    if (!state->active) {
+        return -EINVAL;
+    }
+
+    std::array<uint8_t, sizeof(VfsUtimensReqPrefix) + 512> req_stack{};
+    size_t const PATH_LEN = strlen(fs_relative_path);
+    if (PATH_LEN > req_stack.size() - sizeof(VfsUtimensReqPrefix)) {
+        return -ENAMETOOLONG;
+    }
+
+    VfsUtimensReqPrefix prefix{};
+    prefix.path_len = static_cast<uint16_t>(PATH_LEN);
+    prefix.flags = follow_final_symlink ? WKI_VFS_UTIMENS_FLAG_FOLLOW_FINAL_SYMLINK : 0;
+    if (times != nullptr) {
+        prefix.atime_sec = times[0].tv_sec;
+        prefix.atime_nsec = times[0].tv_nsec;
+        prefix.mtime_sec = times[1].tv_sec;
+        prefix.mtime_nsec = times[1].tv_nsec;
+        prefix.flags |= WKI_VFS_UTIMENS_FLAG_TIMES_PRESENT;
+    }
+
+    auto const REQ_DATA_LEN = static_cast<uint16_t>(sizeof(prefix) + PATH_LEN);
+    memcpy(req_stack.data(), &prefix, sizeof(prefix));
+    if (PATH_LEN > 0) {
+        memcpy(req_stack.data() + sizeof(prefix), fs_relative_path, PATH_LEN);
+    }
+    return vfs_proxy_send_and_wait(state, OP_VFS_UTIMENS, req_stack.data(), REQ_DATA_LEN, nullptr, 0);
 }
 
 // Consumer side: create a symlink on the remote server

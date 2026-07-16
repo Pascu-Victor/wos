@@ -133,6 +133,7 @@ enum class WkiPerfVfsOp : uint8_t {
     RENAME = 15,
     RETRY = 16,
     CHMOD = 17,
+    UTIMENS = 18,
 };
 
 enum class WkiPerfVfsServerOp : uint8_t {
@@ -152,6 +153,7 @@ enum class WkiPerfVfsServerOp : uint8_t {
     RMDIR = 14,
     RENAME = 15,
     CHMOD = 16,
+    UTIMENS = 17,
 };
 
 enum class WkiPerfComputeOp : uint8_t {

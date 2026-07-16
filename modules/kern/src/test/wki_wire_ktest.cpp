@@ -100,6 +100,24 @@ KTEST(WkiWire, VfsCloseNoSuccessResponseExtensionIsLengthGated) {
     KEXPECT_TRUE(ker::net::wki::wki_vfs_close_no_success_response_requested(request.data(), static_cast<uint16_t>(request.size())));
 }
 
+KTEST(WkiWire, VfsUtimensUsesAnAdditiveFixedPrefix) {
+    using namespace ker::net::wki;
+
+    KEXPECT_EQ(OP_VFS_UTIMENS, static_cast<uint16_t>(0x0415));
+    KEXPECT_EQ(WKI_VFS_UTIMENS_FLAG_FOLLOW_FINAL_SYMLINK, static_cast<uint8_t>(0x01));
+    KEXPECT_EQ(WKI_VFS_UTIMENS_FLAG_TIMES_PRESENT, static_cast<uint8_t>(0x02));
+    KEXPECT_EQ(sizeof(VfsUtimensReqPrefix), static_cast<size_t>(36));
+    KEXPECT_EQ(offsetof(VfsUtimensReqPrefix, atime_sec), static_cast<size_t>(0));
+    KEXPECT_EQ(offsetof(VfsUtimensReqPrefix, atime_nsec), static_cast<size_t>(8));
+    KEXPECT_EQ(offsetof(VfsUtimensReqPrefix, mtime_sec), static_cast<size_t>(16));
+    KEXPECT_EQ(offsetof(VfsUtimensReqPrefix, mtime_nsec), static_cast<size_t>(24));
+    KEXPECT_EQ(offsetof(VfsUtimensReqPrefix, path_len), static_cast<size_t>(32));
+    KEXPECT_EQ(offsetof(VfsUtimensReqPrefix, flags), static_cast<size_t>(34));
+    KEXPECT_EQ(offsetof(VfsUtimensReqPrefix, reserved), static_cast<size_t>(35));
+    KEXPECT_EQ(sizeof(DevOpReqPayload), static_cast<size_t>(4));
+    KEXPECT_EQ(sizeof(DevOpRespPayload), static_cast<size_t>(8));
+}
+
 KTEST(WkiWire, DevAttachAckMatchesExpectedCookie) {
     ker::net::wki::DevAttachAckPayload ack = {};
     ack.resource_id = 55;

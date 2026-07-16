@@ -425,6 +425,8 @@ const char* wki_op_name(WkiPerfScope scope, uint8_t op) {
                     return "retry";
                 case WkiPerfVfsOp::CHMOD:
                     return "chmod";
+                case WkiPerfVfsOp::UTIMENS:
+                    return "utimens";
                 default:
                     return "unknown";
             }
@@ -462,6 +464,8 @@ const char* wki_op_name(WkiPerfScope scope, uint8_t op) {
                     return "rename";
                 case WkiPerfVfsServerOp::CHMOD:
                     return "chmod";
+                case WkiPerfVfsServerOp::UTIMENS:
+                    return "utimens";
                 default:
                     return "unknown";
             }

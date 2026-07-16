@@ -344,7 +344,7 @@ auto detach_all_may_claim_binding(const DevServerBinding& binding, uint16_t node
     return binding.active && !binding.retiring.load(std::memory_order_acquire);
 }
 
-auto is_vfs_op(uint16_t op_id) -> bool { return op_id >= OP_VFS_OPEN && op_id <= OP_VFS_READ_BULK; }
+auto is_vfs_op(uint16_t op_id) -> bool { return (op_id >= OP_VFS_OPEN && op_id <= OP_VFS_READ_BULK) || op_id == OP_VFS_UTIMENS; }
 
 auto transport_is_roce(const WkiTransport* transport) -> bool {
     return transport != nullptr && transport->name != nullptr && std::strcmp(transport->name, "wki-roce") == 0;
@@ -2077,10 +2077,11 @@ void handle_dev_op_req(const WkiHeader* hdr, const uint8_t* payload, uint16_t pa
     // Dispatch VFS operations to a worker thread. Local VFS/XFS operations can
     // block for milliseconds or longer; keeping them out of RX preserves ACK,
     // heartbeat, and fence progress for the peer set.
-    // Upper bound is OP_VFS_READ_BULK (0x0413), the highest VFS op code.
+    // The contiguous request range ends at OP_VFS_READ_BULK (0x0413).
     // OP_VFS_READ_RDMA (0x0410), OP_VFS_WRITE_RDMA (0x0411),
     // OP_VFS_READDIR_BATCH (0x0412), and OP_VFS_READ_BULK (0x0413) all
-    // sit above OP_VFS_SEEK_END (0x040E).
+    // sit above OP_VFS_SEEK_END (0x040E). OP_VFS_UTIMENS (0x0415) is
+    // admitted separately so OP_VFS_INVALIDATE (0x0414) remains a notification.
     if (IS_VFS_OP) {
         if (req->op_id == OP_VFS_WRITE_RDMA) {
             uint16_t const REQ_COOKIE = req_cookie_from_header(hdr);

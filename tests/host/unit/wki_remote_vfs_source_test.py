@@ -1260,6 +1260,186 @@ def test_server_backing_path_mutations_bypass_worker_task_root() -> None:
     )
 
 
+def test_remote_path_utimens_preserves_owner_time_and_routing() -> None:
+    source = REMOTE_VFS_CPP.read_text()
+    header = REMOTE_VFS_HPP.read_text()
+    core = VFS_CORE_CPP.read_text()
+    vfs_header = VFS_HPP.read_text()
+    wire = WIRE_HPP.read_text()
+    handler = function_body(source, "handle_vfs_op")
+    utimens_start = handler.find("case OP_VFS_UTIMENS:")
+    fsync_start = handler.find("case OP_VFS_FSYNC:", utimens_start)
+    if min(utimens_start, fsync_start) < 0:
+        fail("remote VFS path utimens opcode case must remain present")
+    utimens_case = handler[utimens_start:fsync_start]
+
+    require_tokens(
+        wire,
+        [
+            "constexpr uint16_t OP_VFS_UTIMENS = 0x0415;",
+            "constexpr uint8_t WKI_VFS_UTIMENS_FLAG_FOLLOW_FINAL_SYMLINK = 0x01;",
+            "constexpr uint8_t WKI_VFS_UTIMENS_FLAG_TIMES_PRESENT = 0x02;",
+            "struct VfsUtimensReqPrefix",
+            "static_assert(sizeof(VfsUtimensReqPrefix) == 36);",
+        ],
+        "remote utimens additive wire contract",
+    )
+    require_tokens(
+        header,
+        ["auto wki_remote_vfs_utimens(void* mount_private_data, const char* fs_relative_path, const ker::vfs::Timespec* times,"],
+        "remote utimens client declaration",
+    )
+    require_tokens(
+        vfs_header,
+        [
+            "auto vfs_utimens_resolved_beneath(const char* confinement_root, const char* path, const Timespec* times,",
+            "bool follow_final_symlink) -> int;",
+        ],
+        "confined resolved utimens owner declaration",
+    )
+
+    client = function_body(source, "wki_remote_vfs_utimens")
+    require_order(
+        client,
+        [
+            "auto* state = acquire_vfs_proxy_lane(anchor)",
+            "ProxyLifecycleRefGuard lane_ref_guard(state)",
+            "VfsUtimensReqPrefix prefix{}",
+            "prefix.flags = follow_final_symlink ? WKI_VFS_UTIMENS_FLAG_FOLLOW_FINAL_SYMLINK : 0",
+            "if (times != nullptr)",
+            "prefix.atime_sec = times[0].tv_sec",
+            "prefix.mtime_nsec = times[1].tv_nsec",
+            "prefix.flags |= WKI_VFS_UTIMENS_FLAG_TIMES_PRESENT",
+            "memcpy(req_stack.data(), &prefix, sizeof(prefix))",
+            "memcpy(req_stack.data() + sizeof(prefix), fs_relative_path, PATH_LEN)",
+            "vfs_proxy_send_and_wait(state, OP_VFS_UTIMENS",
+        ],
+        "remote utimens client preserves raw timestamp markers and lane lifetime",
+    )
+
+    require_order(
+        utimens_case,
+        [
+            "data_len < sizeof(VfsUtimensReqPrefix)",
+            "memcpy(&prefix, data, sizeof(prefix))",
+            "(prefix.flags & ~KNOWN_FLAGS) != 0",
+            "prefix.reserved != 0",
+            "EXPECTED_DATA_LEN != data_len",
+            "relative_wire_path_has_safe_components(PATH_DATA, prefix.path_len)",
+            "full_path_fits(export_path)",
+            "build_full_path(full_path.data(), full_path.size(), export_path",
+            "build_full_path(full_visible_path.data(), full_visible_path.size(), export_name",
+            "path_crosses_recursive_wki_boundary_direct(full_path.data(), full_visible_path.data())",
+            "ker::vfs::Timespec{.tv_sec = prefix.atime_sec, .tv_nsec = prefix.atime_nsec}",
+            "(prefix.flags & WKI_VFS_UTIMENS_FLAG_TIMES_PRESENT) != 0 ? request_times.data() : nullptr",
+            "ker::vfs::vfs_utimens_resolved_beneath(",
+            "export_path, full_path.data(), TIMES",
+            "(prefix.flags & WKI_VFS_UTIMENS_FLAG_FOLLOW_FINAL_SYMLINK) != 0",
+        ],
+        "remote utimens server validates before resolved owner-side mutation",
+    )
+    if "ker::vfs::vfs_utimensat(" in utimens_case:
+        fail("remote utimens server must not route an export backing path through worker task state")
+
+    validation = function_body(source, "relative_wire_path_has_safe_components")
+    require_tokens(
+        validation,
+        [
+            "path[0] == '/'",
+            "std::memchr(path, '\\0', path_len) != nullptr",
+            "bool const DOT =",
+            "bool const DOT_DOT =",
+        ],
+        "wire path validation rejects truncation, absolute paths, and traversal components",
+    )
+
+    owner = function_body(core, "vfs_utimens_resolved_beneath")
+    require_order(
+        owner,
+        [
+            "copy_path_string(confinement_root",
+            "canonicalize_path(canonical_root.data()",
+            "find_mount_point(canonical_root.data(), canonical_root_len)",
+            "confinement_mount->fs_type == FSType::REMOTE",
+            "copy_path_string(path",
+            "canonicalize_path(canonical_path.data()",
+            "path_prefix_matches(canonical_path.data(), canonical_root.data(), canonical_root_len)",
+            ".reject_remote_mounts = true",
+            ".reapply_task_root = false",
+            "vfs_apply_utimens_to_resolved_path(canonical_path.data(), times, follow_final_symlink, canonical_path_len, false, &POLICY)",
+        ],
+        "owner canonicalizes and confines before local-only resolution",
+    )
+    if "resolve_mount_path(" in owner:
+        fail("owner backing-path confinement must not reapply worker task root through resolve_mount_path")
+
+    apply = function_body(core, "vfs_apply_utimens_to_resolved_path")
+    require_order(
+        apply,
+        [
+            "resolve_policy->reject_remote_mounts && REMOTE_MOUNT",
+            "if (!REMOTE_MOUNT)",
+            "bool const RESOLVE_FINAL_SYMLINK = follow_final_symlink && !skip_final_symlink_probe",
+            "resolve_symlinks(path_buffer.data(), resolved_path.data()",
+            "mount_ref = find_mount_point(path_buffer.data(), resolved_len)",
+            "if (!allow_remote_backend && mount->fs_type == FSType::REMOTE)",
+            "case FSType::REMOTE:",
+            "wki_remote_vfs_utimens(mount->private_data, fs_path, times, follow_final_symlink)",
+            "cache_notify_path_data_changed_impl(path_buffer.data(), mount->fs_type)",
+            "cache_notify_path_data_changed_impl(requested_path.data(), REQUESTED_FS_TYPE, true)",
+        ],
+        "utimens resolves intermediates for both final-follow modes and invalidates target plus alias",
+    )
+
+    resolver = function_body(core, "resolve_symlinks")
+    require_order(
+        resolver,
+        [
+            "symlink_resolve_path_is_confined(resolved_buf, policy)",
+            "find_mount_point(resolved_buf",
+            "policy->reject_remote_mounts && mount != nullptr && mount->fs_type == FSType::REMOTE",
+            "resolve_prefix_symlink_once(resolved_buf",
+        ],
+        "confined resolver rejects a final REMOTE mount before prefix probing",
+    )
+    prefix_resolver = function_body(core, "resolve_prefix_symlink_once")
+    require_order(
+        prefix_resolver,
+        [
+            "if (policy == nullptr)",
+            "symlink_prefix_cache_lookup",
+            "prefix_mount_ref = find_mount_point(path, end)",
+            "policy->reject_remote_mounts && prefix_mount != nullptr && prefix_mount->fs_type == FSType::REMOTE",
+            "readlink_resolved_on_mount(path",
+            "splice_symlink_target(path",
+            "policy == nullptr || policy->reapply_task_root",
+            "symlink_resolve_path_is_confined(path, policy)",
+        ],
+        "confined prefix resolver bypasses cached skips and checks every mount before readlink",
+    )
+
+    require_tokens(
+        header + WKI_DEV_PROXY_KTEST.read_text(),
+        [
+            "wki_remote_vfs_selftest_utimens_wire_path_validation()",
+            "KTEST(WkiRemoteVfsUtimens, WirePathValidationRejectsEscapes)",
+        ],
+        "remote utimens malformed-path KTEST coverage",
+    )
+
+    perf_header = (ROOT / "modules" / "kern" / "src" / "platform" / "perf" / "perf_events.hpp").read_text()
+    perf_source = (ROOT / "modules" / "kern" / "src" / "platform" / "perf" / "perf_events.cpp").read_text()
+    require_tokens(
+        source + perf_header + perf_source,
+        [
+            "WkiPerfVfsOp::UTIMENS",
+            "WkiPerfVfsServerOp::UTIMENS",
+            'return "utimens";',
+        ],
+        "remote utimens explicit perf classification",
+    )
+
+
 def test_server_message_read_uses_bounded_stack_response() -> None:
     source = REMOTE_VFS_CPP.read_text()
     handler_body = function_body(source, "handle_vfs_op")
@@ -1489,8 +1669,8 @@ def test_remote_metadata_scratch_initializes_only_consumed_prefix() -> None:
     source = REMOTE_VFS_CPP.read_text()
 
     build_calls = list(re.finditer(r"build_full_path\((\w+)\.data\(\)", source))
-    if len(build_calls) != 18:
-        fail(f"expected 18 bounded build_full_path outputs, found {len(build_calls)}")
+    if len(build_calls) != 20:
+        fail(f"expected 20 bounded build_full_path outputs, found {len(build_calls)}")
     for call in build_calls:
         name = call.group(1)
         declaration = f"std::array<char, 512> {name} __attribute__((uninitialized));"
@@ -1499,8 +1679,8 @@ def test_remote_metadata_scratch_initializes_only_consumed_prefix() -> None:
             fail(f"build_full_path output {name} must be a nearby explicitly uninitialized local")
     declaration_counts = {
         "std::array<char, 512> resolved_path __attribute__((uninitialized));": 1,
-        "std::array<char, 512> full_path __attribute__((uninitialized));": 8,
-        "std::array<char, 512> full_visible_path __attribute__((uninitialized));": 7,
+        "std::array<char, 512> full_path __attribute__((uninitialized));": 9,
+        "std::array<char, 512> full_visible_path __attribute__((uninitialized));": 8,
         "std::array<char, 512> full_link __attribute__((uninitialized));": 1,
         "std::array<char, 512> old_full __attribute__((uninitialized));": 1,
         "std::array<char, 512> new_full __attribute__((uninitialized));": 1,
@@ -3405,6 +3585,7 @@ def test_remote_vfs_mount_lanes_preserve_channel_and_lifetime_affinity() -> None
         "wki_remote_vfs_stat",
         "wki_remote_vfs_mkdir",
         "wki_remote_vfs_chmod",
+        "wki_remote_vfs_utimens",
         "wki_remote_vfs_symlink",
         "wki_remote_vfs_unlink",
         "wki_remote_vfs_rmdir",
@@ -3662,6 +3843,7 @@ def main() -> None:
     test_message_fallback_readahead_targets_small_sequential_reads()
     test_server_open_reuses_the_open_file_stat_snapshot()
     test_server_backing_path_mutations_bypass_worker_task_root()
+    test_remote_path_utimens_preserves_owner_time_and_routing()
     test_server_message_read_uses_bounded_stack_response()
     test_readlink_cache_invalidation_is_generation_based()
     test_server_roce_push_reads_reuse_registered_staging()

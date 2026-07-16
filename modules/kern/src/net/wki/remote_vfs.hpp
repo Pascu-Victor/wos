@@ -303,6 +303,7 @@ auto wki_remote_vfs_mount(uint16_t owner_node, uint32_t resource_id, const char*
 auto wki_remote_vfs_selftest_attach_ack_cookie_fences_stale_completion() -> bool;
 
 #ifdef WOS_SELFTEST
+auto wki_remote_vfs_selftest_utimens_wire_path_validation() -> bool;
 auto wki_remote_vfs_selftest_slot_waiter_fifo() -> bool;
 auto wki_remote_vfs_selftest_stale_cancel_preserves_successor() -> bool;
 auto wki_remote_vfs_selftest_response_claim_retains_waiter_slot() -> bool;
@@ -356,6 +357,10 @@ auto wki_remote_vfs_mkdir(void* mount_private_data, const char* fs_relative_path
 
 // Consumer side: called from vfs_chmod() for FSType::REMOTE mounts
 auto wki_remote_vfs_chmod(void* mount_private_data, const char* fs_relative_path, int mode, bool follow_final_symlink) -> int;
+
+// Consumer side: called from vfs_utimensat() for FSType::REMOTE mounts
+auto wki_remote_vfs_utimens(void* mount_private_data, const char* fs_relative_path, const ker::vfs::Timespec* times,
+                            bool follow_final_symlink) -> int;
 
 // Consumer side: called from vfs_symlink() for FSType::REMOTE mounts
 auto wki_remote_vfs_symlink(void* mount_private_data, const char* target, const char* fs_relative_path) -> int;

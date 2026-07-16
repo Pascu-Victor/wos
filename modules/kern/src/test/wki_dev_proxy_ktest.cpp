@@ -29,6 +29,10 @@ KTEST(WkiRemoteVfsAttachAck, CookieFencesStaleMountCompletion) {
     KEXPECT_TRUE(ker::net::wki::wki_remote_vfs_selftest_attach_ack_cookie_fences_stale_completion());
 }
 
+KTEST(WkiRemoteVfsUtimens, WirePathValidationRejectsEscapes) {
+    KEXPECT_TRUE(ker::net::wki::wki_remote_vfs_selftest_utimens_wire_path_validation());
+}
+
 KTEST(WkiRemoteVfsProxySlot, WaitersRemainFifo) { KEXPECT_TRUE(ker::net::wki::wki_remote_vfs_selftest_slot_waiter_fifo()); }
 
 KTEST(WkiRemoteVfsProxySlot, StaleCancelPreservesSuccessor) {

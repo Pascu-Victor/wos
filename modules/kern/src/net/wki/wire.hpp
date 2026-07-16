@@ -828,6 +828,21 @@ constexpr uint16_t OP_VFS_READ_BULK =
     0x0413;  // Bulk RDMA read: req={fd:i32,len:u32,off:i64,bulk_rkey:u32}(20B) resp={bytes:u32}(4B), up to 2 MB via rdma_write
 constexpr uint16_t OP_VFS_INVALIDATE =
     0x0414;  // Owner->consumer notify: req={old_len:u16,new_len:u16,paths...}; no DEV_OP_RESP is expected
+constexpr uint16_t OP_VFS_UTIMENS = 0x0415;
+constexpr uint8_t WKI_VFS_UTIMENS_FLAG_FOLLOW_FINAL_SYMLINK = 0x01;
+constexpr uint8_t WKI_VFS_UTIMENS_FLAG_TIMES_PRESENT = 0x02;
+
+struct VfsUtimensReqPrefix {
+    int64_t atime_sec;
+    int64_t atime_nsec;
+    int64_t mtime_sec;
+    int64_t mtime_nsec;
+    uint16_t path_len;
+    uint8_t flags;
+    uint8_t reserved;
+} __attribute__((packed));
+
+static_assert(sizeof(VfsUtimensReqPrefix) == 36);
 
 // IPC Pipe (0x0700–0x070F) — data moves via wire messages
 constexpr uint16_t OP_PIPE_CLOSE_READ = 0x0700;

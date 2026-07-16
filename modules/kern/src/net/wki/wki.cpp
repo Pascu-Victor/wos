@@ -376,14 +376,14 @@ auto message_uses_vfs_export_admission(MsgType type, const uint8_t* payload, uin
                 return false;
             }
             auto const* req = reinterpret_cast<const DevOpReqPayload*>(payload);
-            return req->op_id >= OP_VFS_OPEN && req->op_id <= OP_VFS_INVALIDATE;
+            return req->op_id >= OP_VFS_OPEN && req->op_id <= OP_VFS_UTIMENS;
         }
         case MsgType::DEV_OP_RESP: {
             if (payload_len < sizeof(DevOpRespPayload)) {
                 return false;
             }
             auto const* resp = reinterpret_cast<const DevOpRespPayload*>(payload);
-            return resp->op_id >= OP_VFS_OPEN && resp->op_id <= OP_VFS_INVALIDATE;
+            return resp->op_id >= OP_VFS_OPEN && resp->op_id <= OP_VFS_UTIMENS;
         }
         default:
             return false;

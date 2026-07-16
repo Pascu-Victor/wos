@@ -492,7 +492,7 @@ def test_utimensat_reaches_real_vfs_timestamp_updates() -> None:
 
     path_body = function_body(
         vfs_core,
-        r"auto\s+vfs_apply_utimens_to_resolved_path\(const\s+char\*\s+resolved_path,\s*const\s+Timespec\*\s+times,\s*bool\s+follow_final_symlink,\s*size_t\s+known_resolved_path_len\s*=\s*UNKNOWN_PATH_LEN\)\s*->\s*int",
+        r"auto\s+vfs_apply_utimens_to_resolved_path\(const\s+char\*\s+resolved_path,\s*const\s+Timespec\*\s+times,\s*bool\s+follow_final_symlink,\s*size_t\s+known_resolved_path_len\s*=\s*UNKNOWN_PATH_LEN,\s*bool\s+allow_remote_backend\s*=\s*true,\s*const\s+SymlinkResolvePolicy\*\s+resolve_policy\s*=\s*nullptr\)\s*->\s*int",
     )
     require_tokens(
         path_body,
@@ -504,6 +504,9 @@ def test_utimensat_reaches_real_vfs_timestamp_updates() -> None:
             "fs_path, resolved_times.atime, resolved_times.mtime",
             "case FSType::FAT32:",
             "changed = false;",
+            "if (!REMOTE_MOUNT)",
+            "bool const RESOLVE_FINAL_SYMLINK = follow_final_symlink && !skip_final_symlink_probe;",
+            "resolve_symlinks(path_buffer.data(), resolved_path.data()",
             "cache_notify_path_data_changed_impl(path_buffer.data(), mount->fs_type)",
         ],
         "kernel vfs utimensat path backend updates",

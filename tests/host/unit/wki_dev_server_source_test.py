@@ -862,6 +862,41 @@ def test_deferred_vfs_ops_retain_their_binding_through_blocking_work() -> None:
             fail(f"deferred VFS coallocation KTEST coverage is missing {token}")
 
 
+def test_path_utimens_is_deferred_without_reclassifying_invalidate() -> None:
+    source = DEV_SERVER_CPP.read_text()
+    wire = WIRE_HPP.read_text()
+    wki_source = WKI_CPP.read_text()
+    classifier = function_body(source, "is_vfs_op")
+    handler = function_body(source, "handle_dev_op_req")
+    admission = function_body(wki_source, "message_uses_vfs_export_admission")
+
+    if "constexpr uint16_t OP_VFS_UTIMENS = 0x0415;" not in wire:
+        fail("path utimens must use its additive WKI opcode")
+    for token in [
+        "op_id >= OP_VFS_OPEN && op_id <= OP_VFS_READ_BULK",
+        "op_id == OP_VFS_UTIMENS",
+    ]:
+        if token not in classifier:
+            fail(f"deferred VFS classifier is missing {token}")
+    if "OP_VFS_INVALIDATE" in classifier:
+        fail("owner invalidation notification must not enter the deferred VFS request queue")
+
+    dispatch_pos = handler.rfind("if (IS_VFS_OP)")
+    if dispatch_pos < 0:
+        fail("deferred VFS dispatch branch is missing")
+    dispatch = block_body_after(handler[dispatch_pos:], "if (IS_VFS_OP)")
+    classifier_pos = handler.find("bool const IS_VFS_OP = is_vfs_op(req->op_id)")
+    if classifier_pos < 0 or classifier_pos >= dispatch_pos:
+        fail("VFS opcode classification must precede deferred dispatch")
+    queue_pos = dispatch.find("queue_vfs_op(hdr, CHANNEL_IDENTITY")
+    return_pos = dispatch.rfind("return;")
+    if queue_pos < 0 or return_pos <= queue_pos:
+        fail("deferred VFS dispatch must return from RX after queue admission")
+
+    if admission.count("op_id <= OP_VFS_UTIMENS") != 2:
+        fail("VFS request and response admission must include path utimens during export rebuild/drain")
+
+
 def test_detach_waits_for_binding_refs_before_cleanup_and_erase() -> None:
     detach_all_body = function_body(DEV_SERVER_CPP.read_text(), "wki_dev_server_detach_all_for_peer")
     detach_body = function_body(DEV_SERVER_CPP.read_text(), "wki_dev_server_process_pending_detaches")
@@ -1242,6 +1277,7 @@ def main() -> None:
     test_channel_reuse_generation_guards_unlock_tx_relock_paths()
     test_block_ring_binding_lifetime_is_retained_outside_server_lock()
     test_deferred_vfs_ops_retain_their_binding_through_blocking_work()
+    test_path_utimens_is_deferred_without_reclassifying_invalidate()
     test_detach_waits_for_binding_refs_before_cleanup_and_erase()
     test_epoch_cleanup_and_deferred_vfs_are_channel_generation_fenced()
     test_attach_ack_failure_defers_exact_cleanup_outside_rx()

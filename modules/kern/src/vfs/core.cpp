@@ -4486,9 +4486,9 @@ void cache_notify_path_changed_impl(const char* old_vfs_path, const char* new_vf
     }
 }
 
-void cache_notify_path_data_changed_impl(const char* vfs_path, FSType fs_type) {
+void cache_notify_path_data_changed_impl(const char* vfs_path, FSType fs_type, bool force_remote_notification = false) {
     metadata_cache_note_path_data_changed(vfs_path, fs_type);
-    if (cache_notify_invalidate_path_local(vfs_path)) {
+    if (cache_notify_invalidate_path_local(vfs_path) || force_remote_notification) {
         ker::net::wki::wki_remote_vfs_notify_path_changed(vfs_path, nullptr);
     }
 }
@@ -6308,18 +6308,42 @@ void vfs_seed_readdir_entry_cache_hints(const File* dir, MountPoint const* mount
 auto readlink_resolved_on_mount(const char* abs_path, char* buf, size_t bufsize, MountPoint const* mount,
                                 size_t known_abs_path_len = UNKNOWN_PATH_LEN, uint64_t known_abs_path_hash = UNKNOWN_PATH_HASH) -> ssize_t;
 
+struct SymlinkResolvePolicy {
+    const char* confinement_root = nullptr;
+    size_t confinement_root_len = 0;
+    bool reject_remote_mounts = false;
+    bool reapply_task_root = true;
+};
+
+auto symlink_resolve_path_is_confined(const char* path, const SymlinkResolvePolicy* policy) -> bool {
+    return policy == nullptr || policy->confinement_root == nullptr || policy->confinement_root_len == 0 ||
+           path_prefix_matches(path, policy->confinement_root, policy->confinement_root_len);
+}
+
 auto resolve_prefix_symlink_once(char* path, size_t bufsize, bool apply_task_policy, bool follow_final_symlink,
-                                 MountPoint const* current_path_mount, size_t known_path_len = UNKNOWN_PATH_LEN) -> int {
+                                 MountPoint const* current_path_mount, size_t known_path_len = UNKNOWN_PATH_LEN,
+                                 const SymlinkResolvePolicy* policy = nullptr) -> int {
     if (path == nullptr || bufsize == 0) {
         return -EINVAL;
+    }
+    if (!symlink_resolve_path_is_confined(path, policy)) {
+        return -EPERM;
+    }
+    if (policy != nullptr && policy->confinement_root != nullptr && policy->confinement_root_len != 0 &&
+        path[policy->confinement_root_len] == '\0') {
+        return 0;
     }
 
     size_t clean_prefix_len = 0;
     size_t scan_start = 1;
-    size_t const CACHED_PREFIX_LEN = symlink_prefix_cache_lookup(path, known_path_len, current_path_mount);
-    if (CACHED_PREFIX_LEN > 1 && CACHED_PREFIX_LEN < known_path_len && path[CACHED_PREFIX_LEN] == '/') {
-        clean_prefix_len = CACHED_PREFIX_LEN;
-        scan_start = CACHED_PREFIX_LEN + 1;
+    if (policy == nullptr) {
+        size_t const CACHED_PREFIX_LEN = symlink_prefix_cache_lookup(path, known_path_len, current_path_mount);
+        if (CACHED_PREFIX_LEN > 1 && CACHED_PREFIX_LEN < known_path_len && path[CACHED_PREFIX_LEN] == '/') {
+            clean_prefix_len = CACHED_PREFIX_LEN;
+            scan_start = CACHED_PREFIX_LEN + 1;
+        }
+    } else if (policy->confinement_root != nullptr && policy->confinement_root_len > 1) {
+        scan_start = policy->confinement_root_len + 1;
     }
 
     // A positive readlink result initializes every returned byte; the caller appends the terminator below.
@@ -6345,9 +6369,18 @@ auto resolve_prefix_symlink_once(char* path, size_t bufsize, bool apply_task_pol
         }
 
         path[end] = '\0';
-        ssize_t const LINK_LEN = path_is_under_mount(current_path_mount, path, end)
-                                     ? readlink_resolved_on_mount(path, linkbuf.data(), linkbuf.size() - 1, current_path_mount, end)
-                                     : readlink_resolved(path, linkbuf.data(), linkbuf.size() - 1, end);
+        MountRef prefix_mount_ref{};
+        MountPoint const* prefix_mount = current_path_mount;
+        if (!path_is_under_mount(current_path_mount, path, end)) {
+            prefix_mount_ref = find_mount_point(path, end);
+            prefix_mount = prefix_mount_ref.get();
+        }
+        if (!symlink_resolve_path_is_confined(path, policy) ||
+            (policy != nullptr && policy->reject_remote_mounts && prefix_mount != nullptr && prefix_mount->fs_type == FSType::REMOTE)) {
+            path[end] = CH;
+            return -EPERM;
+        }
+        ssize_t const LINK_LEN = readlink_resolved_on_mount(path, linkbuf.data(), linkbuf.size() - 1, prefix_mount, end);
         path[end] = CH;
         if (LINK_LEN > 0) {
             if (static_cast<size_t>(LINK_LEN) >= linkbuf.size()) {
@@ -6370,7 +6403,7 @@ auto resolve_prefix_symlink_once(char* path, size_t bufsize, bool apply_task_pol
             }
 
             // Absolute symlink targets must stay within the task's root.
-            if (linkbuf[0] == '/') {
+            if (linkbuf[0] == '/' && (policy == nullptr || policy->reapply_task_root)) {
                 int const RR = reapply_root_prefix(path, bufsize);
                 if (RR < 0) {
                     return RR;
@@ -6382,6 +6415,10 @@ auto resolve_prefix_symlink_once(char* path, size_t bufsize, bool apply_task_pol
                 if (NORMALIZE < 0) {
                     return NORMALIZE;
                 }
+            }
+
+            if (!symlink_resolve_path_is_confined(path, policy)) {
+                return -EPERM;
             }
 
             return 1;
@@ -6963,8 +7000,8 @@ auto canonicalize_path(char* path, size_t bufsize) -> int {
 // Resolve symlinks in a path. The resolved path is written to resolved_buf.
 // Returns 0 on success, -ELOOP on too many symlinks, or another negative errno.
 auto resolve_symlinks(const char* path, char* resolved_buf, size_t bufsize, bool apply_task_policy = false,
-                      bool follow_final_symlink = true, size_t known_path_len = UNKNOWN_PATH_LEN, size_t* resolved_len_out = nullptr)
-    -> int {
+                      bool follow_final_symlink = true, size_t known_path_len = UNKNOWN_PATH_LEN, size_t* resolved_len_out = nullptr,
+                      const SymlinkResolvePolicy* policy = nullptr) -> int {
     if (path == nullptr || resolved_buf == nullptr || bufsize == 0) {
         return -EINVAL;
     }
@@ -7003,12 +7040,21 @@ auto resolve_symlinks(const char* path, char* resolved_buf, size_t bufsize, bool
         path_len = std::strlen(resolved_buf);
         path_len_known = true;
     }
+    if (!symlink_resolve_path_is_confined(resolved_buf, policy)) {
+        return -EPERM;
+    }
 
     for (int depth = 0; depth < MAX_SYMLINK_DEPTH; ++depth) {
+        if (!symlink_resolve_path_is_confined(resolved_buf, policy)) {
+            return -EPERM;
+        }
         auto mount_ref = find_mount_point(resolved_buf, path_len_known ? path_len : UNKNOWN_PATH_LEN);
         MountPoint const* mount = mount_ref.get();
+        if (policy != nullptr && policy->reject_remote_mounts && mount != nullptr && mount->fs_type == FSType::REMOTE) {
+            return -EPERM;
+        }
         int const PREFIX_RESULT = resolve_prefix_symlink_once(resolved_buf, bufsize, apply_task_policy, follow_final_symlink, mount,
-                                                              path_len_known ? path_len : UNKNOWN_PATH_LEN);
+                                                              path_len_known ? path_len : UNKNOWN_PATH_LEN, policy);
         if (PREFIX_RESULT < 0) {
             return PREFIX_RESULT;
         }
@@ -7059,9 +7105,11 @@ auto resolve_symlinks(const char* path, char* resolved_buf, size_t bufsize, bool
                 std::memcpy(resolved_buf, linkbuf.data(), static_cast<size_t>(LINK_LEN) + 1);
                 path_len = static_cast<size_t>(LINK_LEN);
                 path_len_known = true;
-                int const RR = reapply_root_prefix(resolved_buf, bufsize);
-                if (RR < 0) {
-                    return RR;
+                if (policy == nullptr || policy->reapply_task_root) {
+                    int const RR = reapply_root_prefix(resolved_buf, bufsize);
+                    if (RR < 0) {
+                        return RR;
+                    }
                 }
                 path_len_known = false;
             } else {
@@ -7092,6 +7140,17 @@ auto resolve_symlinks(const char* path, char* resolved_buf, size_t bufsize, bool
                 }
                 path_len_known = false;
             }
+            if (policy != nullptr) {
+                int const CANONICAL = canonicalize_path(resolved_buf, bufsize);
+                if (CANONICAL < 0) {
+                    return CANONICAL;
+                }
+                path_len = std::strlen(resolved_buf);
+                path_len_known = true;
+                if (!symlink_resolve_path_is_confined(resolved_buf, policy)) {
+                    return -EPERM;
+                }
+            }
             continue;  // re-resolve after substitution
         }
 
@@ -7119,9 +7178,11 @@ auto resolve_symlinks(const char* path, char* resolved_buf, size_t bufsize, bool
                 std::memcpy(resolved_buf, linkbuf.data(), static_cast<size_t>(LINK_LEN) + 1);
                 path_len = static_cast<size_t>(LINK_LEN);
                 path_len_known = true;
-                int const RR = reapply_root_prefix(resolved_buf, bufsize);
-                if (RR < 0) {
-                    return RR;
+                if (policy == nullptr || policy->reapply_task_root) {
+                    int const RR = reapply_root_prefix(resolved_buf, bufsize);
+                    if (RR < 0) {
+                        return RR;
+                    }
                 }
                 path_len_known = false;
             } else {
@@ -7152,6 +7213,17 @@ auto resolve_symlinks(const char* path, char* resolved_buf, size_t bufsize, bool
                     return NORMALIZE;
                 }
                 path_len_known = false;
+            }
+            if (policy != nullptr) {
+                int const CANONICAL = canonicalize_path(resolved_buf, bufsize);
+                if (CANONICAL < 0) {
+                    return CANONICAL;
+                }
+                path_len = std::strlen(resolved_buf);
+                path_len_known = true;
+                if (!symlink_resolve_path_is_confined(resolved_buf, policy)) {
+                    return -EPERM;
+                }
             }
             continue;  // Re-resolve after substitution
         }
@@ -7204,9 +7276,11 @@ auto resolve_symlinks(const char* path, char* resolved_buf, size_t bufsize, bool
             std::memcpy(resolved_buf, node->symlink_target, target_len + 1);
             path_len = target_len;
             path_len_known = true;
-            int const RR = reapply_root_prefix(resolved_buf, bufsize);
-            if (RR < 0) {
-                return RR;
+            if (policy == nullptr || policy->reapply_task_root) {
+                int const RR = reapply_root_prefix(resolved_buf, bufsize);
+                if (RR < 0) {
+                    return RR;
+                }
             }
             path_len_known = false;
         } else {
@@ -7238,6 +7312,17 @@ auto resolve_symlinks(const char* path, char* resolved_buf, size_t bufsize, bool
                 return NORMALIZE;
             }
             path_len_known = false;
+        }
+        if (policy != nullptr) {
+            int const CANONICAL = canonicalize_path(resolved_buf, bufsize);
+            if (CANONICAL < 0) {
+                return CANONICAL;
+            }
+            path_len = std::strlen(resolved_buf);
+            path_len_known = true;
+            if (!symlink_resolve_path_is_confined(resolved_buf, policy)) {
+                return -EPERM;
+            }
         }
     }
 
@@ -13421,7 +13506,8 @@ auto apply_devfs_utimens(ker::vfs::devfs::DevFSNode* node, const VfsResolvedTime
 }
 
 auto vfs_apply_utimens_to_resolved_path(const char* resolved_path, const Timespec* times, bool follow_final_symlink,
-                                        size_t known_resolved_path_len = UNKNOWN_PATH_LEN) -> int {
+                                        size_t known_resolved_path_len = UNKNOWN_PATH_LEN, bool allow_remote_backend = true,
+                                        const SymlinkResolvePolicy* resolve_policy = nullptr) -> int {
     if (resolved_path == nullptr) {
         return -EINVAL;
     }
@@ -13437,19 +13523,34 @@ auto vfs_apply_utimens_to_resolved_path(const char* resolved_path, const Timespe
     if (COPY_RET < 0) {
         return COPY_RET;
     }
+    std::array<char, MAX_PATH_LEN> requested_path;  // NOLINT(cppcoreguidelines-pro-type-member-init)
+    if (resolve_policy != nullptr) {
+        std::memcpy(requested_path.data(), path_buffer.data(), path_buffer_len + 1);
+    }
 
     auto mount_ref = find_mount_point(path_buffer.data(), path_buffer_len);
     auto* mount = mount_ref.get();
     bool const REMOTE_MOUNT = mount != nullptr && mount->fs_type == FSType::REMOTE;
-    if (follow_final_symlink && !REMOTE_MOUNT) {
+    if (resolve_policy != nullptr && resolve_policy->reject_remote_mounts && REMOTE_MOUNT) {
+        return -EPERM;
+    }
+    FSType const REQUESTED_FS_TYPE = mount != nullptr ? mount->fs_type : FSType::TMPFS;
+    if (!REMOTE_MOUNT) {
         bool skip_final_symlink_probe = false;
-        bool const SYMLINK_RESOLUTION_KNOWN_NOOP =
-            local_symlink_resolution_known_noop(path_buffer.data(), mount, &path_buffer_len, &skip_final_symlink_probe);
-        if (!SYMLINK_RESOLUTION_KNOWN_NOOP) {
+        bool symlink_resolution_known_noop = false;
+        if (resolve_policy == nullptr && follow_final_symlink) {
+            symlink_resolution_known_noop =
+                local_symlink_resolution_known_noop(path_buffer.data(), mount, &path_buffer_len, &skip_final_symlink_probe);
+        } else if (resolve_policy == nullptr && mount != nullptr) {
+            symlink_resolution_known_noop = symlink_prefix_cache_covers_parent(path_buffer.data(), path_buffer_len, mount);
+        }
+        if (!symlink_resolution_known_noop) {
             std::array<char, MAX_PATH_LEN> resolved_path;  // NOLINT(cppcoreguidelines-pro-type-member-init)
             size_t resolved_len = path_buffer_len;
-            int const RESOLVE_RET = resolve_symlinks(path_buffer.data(), resolved_path.data(), resolved_path.size(), true,
-                                                     !skip_final_symlink_probe, path_buffer_len, &resolved_len);
+            bool const APPLY_TASK_POLICY = resolve_policy == nullptr;
+            bool const RESOLVE_FINAL_SYMLINK = follow_final_symlink && !skip_final_symlink_probe;
+            int const RESOLVE_RET = resolve_symlinks(path_buffer.data(), resolved_path.data(), resolved_path.size(), APPLY_TASK_POLICY,
+                                                     RESOLVE_FINAL_SYMLINK, path_buffer_len, &resolved_len, resolve_policy);
             if (RESOLVE_RET < 0) {
                 return RESOLVE_RET;
             }
@@ -13465,6 +13566,9 @@ auto vfs_apply_utimens_to_resolved_path(const char* resolved_path, const Timespe
 
     if (mount == nullptr) {
         return -ENOENT;
+    }
+    if (!allow_remote_backend && mount->fs_type == FSType::REMOTE) {
+        return -EPERM;
     }
     const char* fs_path = strip_mount_prefix(mount, path_buffer.data());
 
@@ -13504,6 +13608,8 @@ auto vfs_apply_utimens_to_resolved_path(const char* resolved_path, const Timespe
             ret = 0;
             break;
         case FSType::REMOTE:
+            ret = ker::net::wki::wki_remote_vfs_utimens(mount->private_data, fs_path, times, follow_final_symlink);
+            break;
         case FSType::PROCFS:
         case FSType::SOCKET:
         default:
@@ -13513,6 +13619,10 @@ auto vfs_apply_utimens_to_resolved_path(const char* resolved_path, const Timespe
 
     if (ret == 0 && changed) {
         cache_notify_path_data_changed_impl(path_buffer.data(), mount->fs_type);
+        if (resolve_policy != nullptr &&
+            !path_text_equal(requested_path.data(), std::strlen(requested_path.data()), path_buffer.data(), path_buffer_len)) {
+            cache_notify_path_data_changed_impl(requested_path.data(), REQUESTED_FS_TYPE, true);
+        }
         if (have_updated_stat) {
             metadata_cache_store_known_path_stat_on_current_mount(path_buffer.data(), mount, updated_stat, path_buffer_len);
         }
@@ -13541,6 +13651,55 @@ auto vfs_apply_utimens_to_path(const char* path, const Timespec* times, bool fol
 }
 
 }  // namespace
+
+auto vfs_utimens_resolved_beneath(const char* confinement_root, const char* path, const Timespec* times, bool follow_final_symlink) -> int {
+    if (confinement_root == nullptr || path == nullptr) {
+        return -EINVAL;
+    }
+
+    std::array<char, MAX_PATH_LEN> canonical_root;  // NOLINT(cppcoreguidelines-pro-type-member-init)
+    size_t canonical_root_len = UNKNOWN_PATH_LEN;
+    int ret = copy_path_string(confinement_root, canonical_root.data(), canonical_root.size(), UNKNOWN_PATH_LEN, &canonical_root_len);
+    if (ret < 0) {
+        return ret;
+    }
+    ret = canonicalize_path(canonical_root.data(), canonical_root.size());
+    if (ret < 0) {
+        return ret;
+    }
+    canonical_root_len = std::strlen(canonical_root.data());
+    auto confinement_mount_ref = find_mount_point(canonical_root.data(), canonical_root_len);
+    MountPoint const* confinement_mount = confinement_mount_ref.get();
+    if (confinement_mount == nullptr) {
+        return -ENOENT;
+    }
+    if (confinement_mount->fs_type == FSType::REMOTE) {
+        return -EPERM;
+    }
+
+    std::array<char, MAX_PATH_LEN> canonical_path;  // NOLINT(cppcoreguidelines-pro-type-member-init)
+    size_t canonical_path_len = UNKNOWN_PATH_LEN;
+    ret = copy_path_string(path, canonical_path.data(), canonical_path.size(), UNKNOWN_PATH_LEN, &canonical_path_len);
+    if (ret < 0) {
+        return ret;
+    }
+    ret = canonicalize_path(canonical_path.data(), canonical_path.size());
+    if (ret < 0) {
+        return ret;
+    }
+    canonical_path_len = std::strlen(canonical_path.data());
+    if (!path_prefix_matches(canonical_path.data(), canonical_root.data(), canonical_root_len)) {
+        return -EPERM;
+    }
+
+    SymlinkResolvePolicy const POLICY = {
+        .confinement_root = canonical_root.data(),
+        .confinement_root_len = canonical_root_len,
+        .reject_remote_mounts = true,
+        .reapply_task_root = false,
+    };
+    return vfs_apply_utimens_to_resolved_path(canonical_path.data(), times, follow_final_symlink, canonical_path_len, false, &POLICY);
+}
 
 auto vfs_utimensat(int dirfd, const char* pathname, const Timespec* times, int flags) -> int {
     constexpr int ALLOWED_FLAGS = AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH;

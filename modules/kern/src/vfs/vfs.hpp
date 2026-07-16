@@ -153,6 +153,10 @@ auto vfs_fchmodat(ker::mod::sched::task::Task* task, int dirfd, const char* path
 auto vfs_chown(const char* path, uint32_t owner, uint32_t group) -> int;
 auto vfs_fchown(int fd, uint32_t owner, uint32_t group) -> int;
 auto vfs_fchownat(ker::mod::sched::task::Task* task, int dirfd, const char* pathname, uint32_t owner, uint32_t group, int flags) -> int;
+// Change timestamps on an already-resolved absolute backing path while keeping
+// every symlink and mount traversal beneath a local export root. This bypasses
+// the current task's root and WKI routing policy.
+auto vfs_utimens_resolved_beneath(const char* confinement_root, const char* path, const Timespec* times, bool follow_final_symlink) -> int;
 auto vfs_utimensat(int dirfd, const char* pathname, const Timespec* times, int flags) -> int;
 auto vfs_futimens(int fd, const Timespec* times) -> int;
 

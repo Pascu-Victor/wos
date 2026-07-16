@@ -300,6 +300,22 @@ TEST(WkiWire, VfsCloseNoSuccessResponseExtensionIsLengthGated) {
     EXPECT_TRUE(wki_vfs_close_no_success_response_requested(request.data(), static_cast<uint16_t>(request.size())));
 }
 
+TEST(WkiWire, VfsUtimensUsesAnAdditiveFixedPrefix) {
+    EXPECT_EQ(OP_VFS_UTIMENS, 0x0415u);
+    EXPECT_EQ(WKI_VFS_UTIMENS_FLAG_FOLLOW_FINAL_SYMLINK, 0x01u);
+    EXPECT_EQ(WKI_VFS_UTIMENS_FLAG_TIMES_PRESENT, 0x02u);
+    EXPECT_EQ(sizeof(VfsUtimensReqPrefix), 36u);
+    EXPECT_EQ(offsetof(VfsUtimensReqPrefix, atime_sec), 0u);
+    EXPECT_EQ(offsetof(VfsUtimensReqPrefix, atime_nsec), 8u);
+    EXPECT_EQ(offsetof(VfsUtimensReqPrefix, mtime_sec), 16u);
+    EXPECT_EQ(offsetof(VfsUtimensReqPrefix, mtime_nsec), 24u);
+    EXPECT_EQ(offsetof(VfsUtimensReqPrefix, path_len), 32u);
+    EXPECT_EQ(offsetof(VfsUtimensReqPrefix, flags), 34u);
+    EXPECT_EQ(offsetof(VfsUtimensReqPrefix, reserved), 35u);
+    EXPECT_EQ(sizeof(DevOpReqPayload), 4u);
+    EXPECT_EQ(sizeof(DevOpRespPayload), 8u);
+}
+
 TEST(WkiWire, DevAttachAckMatchesExpectedCookie) {
     DevAttachAckPayload ack = {};
     ack.resource_id = 55;
