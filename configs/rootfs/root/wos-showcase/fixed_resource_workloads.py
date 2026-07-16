@@ -300,6 +300,15 @@ def deterministic_environment() -> dict[str, str]:
     return env
 
 
+def fresh_git_checkout_environment() -> dict[str, str]:
+    env = deterministic_environment()
+    # The WOS Git fork uses this narrowly scoped signal for a checkout whose
+    # worktree and index were proved empty before dispatch.  Keep it out of the
+    # general worker environment so ordinary Git operations retain full checks.
+    env["GIT_WOS_CLONE_CHECKOUT"] = "1"
+    return env
+
+
 def child_timeout_seconds(parent_timeout_seconds: float) -> float:
     if parent_timeout_seconds > 10.0:
         return parent_timeout_seconds - 5.0
@@ -1036,7 +1045,7 @@ def execute_job(
                 force=bool(getattr(args, "force_checkout", False)),
             ),
             timeout_seconds=args.timeout_seconds,
-            env=env,
+            env=fresh_git_checkout_environment(),
             context=f"git checkout job {args.job_id}",
         )
     elif args.phase == "python-sha256":
@@ -1169,7 +1178,7 @@ def run_git_prewarm(args: argparse.Namespace) -> dict[str, Any]:
                 force=True,
             ),
             timeout_seconds=args.timeout_seconds,
-            env=env,
+            env=fresh_git_checkout_environment(),
             context=f"Git checkout runtime prewarm on {args.target_host}",
         )
         observed_commit = git_output(
@@ -3381,7 +3390,7 @@ def self_test(args: argparse.Namespace) -> None:
                 force=True,
             ),
             timeout_seconds=args.timeout_seconds,
-            env=deterministic_environment(),
+            env=fresh_git_checkout_environment(),
             context="self-test forced checkout",
         )
         file_count, byte_count, digest = tree_manifest(destination)

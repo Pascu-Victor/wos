@@ -193,6 +193,11 @@ def test_partition_and_commands(module) -> None:
         name.startswith("PYTHON") and name not in allowed_python for name in environment
     ):
         fail("fixed-resource worker environment is not isolated")
+    if "GIT_WOS_CLONE_CHECKOUT" in environment:
+        fail("fresh-checkout authorization leaked into the general worker environment")
+    checkout_environment = module.fresh_git_checkout_environment()
+    if checkout_environment.get("GIT_WOS_CLONE_CHECKOUT") != "1":
+        fail("fresh checkout does not enable the WOS Git metadata fast path")
     expected_git_config = {
         "pack.threads=1",
         "index.threads=1",
