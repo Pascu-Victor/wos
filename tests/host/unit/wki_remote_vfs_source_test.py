@@ -3253,6 +3253,25 @@ def test_invalidate_notify_retains_and_invalidates_complete_mount_group() -> Non
         fail("invalidate notify must release exactly the retained group span after unlocked work")
 
 
+def test_path_change_notifies_each_matching_export_once() -> None:
+    body = function_body(REMOTE_VFS_CPP.read_text(), "wki_remote_vfs_notify_path_changed")
+    require_order(
+        body,
+        [
+            "for (const auto& exp : g_vfs_exports)",
+            "trim_export_prefix(EXPORT_PATH, old_local_vfs_path)",
+            "trim_export_prefix(EXPORT_PATH, new_local_vfs_path)",
+            "if (OLD_REL_SRC == nullptr && NEW_REL_SRC == nullptr)",
+            "send_notify(exp, old_rel.data(), new_rel.data())",
+        ],
+        "single-pass old/new export invalidation",
+    )
+    if body.count("for (const auto& exp : g_vfs_exports)") != 1:
+        fail("path change must visit each export exactly once")
+    if body.count("send_notify(exp, old_rel.data(), new_rel.data())") != 1:
+        fail("path change must have one send site per matching export")
+
+
 def test_export_rebuild_is_revisioned_and_backing_mount_exact() -> None:
     header = REMOTE_VFS_HPP.read_text()
     source = REMOTE_VFS_CPP.read_text()
@@ -3864,6 +3883,7 @@ def main() -> None:
     test_server_bounded_metadata_responses_use_stack_storage()
     test_stale_fd_gc_drains_binding_users_before_file_close()
     test_server_fd_and_consumer_rx_use_exact_channel_identity()
+    test_path_change_notifies_each_matching_export_once()
     test_invalidate_notify_retains_and_invalidates_complete_mount_group()
     test_export_rebuild_is_revisioned_and_backing_mount_exact()
     test_remote_vfs_mount_lanes_preserve_channel_and_lifetime_affinity()

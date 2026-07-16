@@ -7583,40 +7583,30 @@ void wki_remote_vfs_notify_path_changed(const char* old_local_vfs_path, const ch
                                        req_hdr->data_len);
     };
 
-    auto notify_one = [&](const char* local_path, const char* other_local_path, bool include_other) {
-        if (local_path == nullptr || local_path[0] == '\0') {
-            return;
+    // Visit each export once. A same-export rename carries both paths in one
+    // notification; a cross-export rename naturally emits one old-only and
+    // one new-only notification for the two distinct exports.
+    for (const auto& exp : g_vfs_exports) {
+        if (!exp.active) {
+            continue;
         }
 
-        for (const auto& exp : g_vfs_exports) {
-            if (!exp.active || !path_matches_export(raw_data(exp.export_path), local_path)) {
-                continue;
-            }
-
-            const char* old_rel_src = trim_export_prefix(raw_data(exp.export_path), local_path);
-            if (old_rel_src == nullptr) {
-                continue;
-            }
-
-            std::array<char, VFS_EXPORT_PATH_LEN> old_rel{};
-            std::array<char, VFS_EXPORT_PATH_LEN> new_rel{};
-            std::snprintf(old_rel.data(), old_rel.size(), "%s", old_rel_src);
-
-            if (include_other && other_local_path != nullptr && path_matches_export(raw_data(exp.export_path), other_local_path)) {
-                if (const char* new_rel_src = trim_export_prefix(raw_data(exp.export_path), other_local_path); new_rel_src != nullptr) {
-                    std::snprintf(new_rel.data(), new_rel.size(), "%s", new_rel_src);
-                }
-            }
-
-            send_notify(exp, old_rel.data(), new_rel.data());
+        const char* const EXPORT_PATH = raw_data(exp.export_path);
+        const char* const OLD_REL_SRC = trim_export_prefix(EXPORT_PATH, old_local_vfs_path);
+        const char* const NEW_REL_SRC = trim_export_prefix(EXPORT_PATH, new_local_vfs_path);
+        if (OLD_REL_SRC == nullptr && NEW_REL_SRC == nullptr) {
+            continue;
         }
-    };
 
-    if (old_local_vfs_path != nullptr) {
-        notify_one(old_local_vfs_path, new_local_vfs_path, true);
-    }
-    if (new_local_vfs_path != nullptr && (old_local_vfs_path == nullptr || std::strcmp(old_local_vfs_path, new_local_vfs_path) != 0)) {
-        notify_one(new_local_vfs_path, nullptr, false);
+        std::array<char, VFS_EXPORT_PATH_LEN> old_rel{};
+        std::array<char, VFS_EXPORT_PATH_LEN> new_rel{};
+        if (OLD_REL_SRC != nullptr) {
+            std::snprintf(old_rel.data(), old_rel.size(), "%s", OLD_REL_SRC);
+        }
+        if (NEW_REL_SRC != nullptr) {
+            std::snprintf(new_rel.data(), new_rel.size(), "%s", NEW_REL_SRC);
+        }
+        send_notify(exp, old_rel.data(), new_rel.data());
     }
 }
 
