@@ -20,7 +20,6 @@ KERNEL_XFS_VFS_CPP = ROOT / "modules" / "kern" / "src" / "vfs" / "fs" / "xfs" / 
 KERNEL_VFS_KTEST_CPP = ROOT / "modules" / "kern" / "src" / "test" / "vfs_ktest.cpp"
 MLIBC_DIRENT_H = ROOT / "toolchain" / "src" / "mlibc" / "options" / "posix" / "include" / "dirent.h"
 GIT_RUN_COMMAND = ROOT / "toolchain" / "src" / "git" / "run-command.c"
-GIT_PARALLEL_CHECKOUT = ROOT / "toolchain" / "src" / "git" / "parallel-checkout.c"
 STRACE_DECODE_CPP = ROOT / "modules" / "strace" / "src" / "decode.cpp"
 SYZKALLER_FS = ROOT / "tests" / "vm" / "syzkaller" / "sys" / "wos" / "fs.txt"
 
@@ -241,17 +240,6 @@ def test_wos_fstat_close_abi_consumes_each_fd_once() -> None:
     )
     require_tokens(WOS_OPTIONS_MESON.read_text(), ["'generic/fd.cpp'", "'include/wos/fd.h'"], "WOS fd API installation")
 
-    git_checkout = GIT_PARALLEL_CHECKOUT.read_text()
-    require_order(
-        git_checkout,
-        [
-            "wos_fstat_close(fd, &pc_item->st, &fstat_error)",
-            "fd = -1",
-            "fstat_done = !fstat_error",
-            "if (close_result)",
-        ],
-        "Git combined fstat-close ownership transfer",
-    )
     require_tokens(
         KERNEL_VFS_KTEST_CPP.read_text(),
         ["KTEST(VFS, FstatCloseCombinesFdRemoval)"],

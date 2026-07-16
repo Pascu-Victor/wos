@@ -117,6 +117,15 @@ def require_tokens(source: str, tokens: list[str], context: str) -> None:
         fail(f"{context}: missing {', '.join(missing)}")
 
 
+def require_order(source: str, tokens: list[str], context: str) -> None:
+    cursor = -1
+    for token in tokens:
+        index = source.find(token, cursor + 1)
+        if index < 0:
+            fail(f"{context}: missing ordered token {token}")
+        cursor = index
+
+
 def compiler_rt_cmake_block(source: str) -> str:
     match = re.search(
         r"build_compiler_rt\(\)\s*\{(?P<body>.*?)\n\}",
@@ -2437,18 +2446,75 @@ def test_wos_git_build_uses_the_pinned_fork_without_source_rewriting() -> None:
         ['case "$command" in', "cmd_set_branch", "cmd_set_url", '"cmd_$command" "$@"'],
         "WOS Git submodule shell dispatch",
     )
+    parallel_checkout = (WOS_GIT_SOURCE / "parallel-checkout.c").read_text()
     require_tokens(
-        (WOS_GIT_SOURCE / "parallel-checkout.c").read_text(),
+        parallel_checkout,
         [
             "leading_dirs_prevalidated = state->clone && !state->base_dir_len",
             "dir_sep && !leading_dirs_prevalidated",
             "if (leading_dirs_prevalidated)",
-            "HAVE_WOS_FSTAT_CLOSE",
-            "wos_fstat_close(fd, &pc_item->st, &fstat_error)",
-            "fd = -1",
-            "fstat_done = !fstat_error",
+            "fstat_done = fstat_checkout_output(fd, state, &pc_item->st)",
+            "if (close_and_clear(&fd))",
         ],
         "WOS Git clone checkout metadata suppression",
+    )
+    if "wos_fstat_close(" in parallel_checkout:
+        fail("fresh WOS checkout must close without a pre-flush remote fstat")
+
+    checkout_entry = (WOS_GIT_SOURCE / "entry.c").read_text()
+    require_order(
+        checkout_entry,
+        [
+            "static int checkout_output_stat_deferred(const struct checkout *state)",
+            "checkout_is_clone_like(state)",
+            "state->refresh_cache && !state->base_dir_len",
+            "int fstat_checkout_output(int fd, const struct checkout *state, struct stat *st)",
+            "if (checkout_output_stat_deferred(state))",
+            "memset(st, 0, sizeof(*st))",
+            "return 1",
+            "fstat_is_reliable()",
+            "return !fstat(fd, st)",
+        ],
+        "fresh WOS checkout leaves stat data deliberately untrusted before close",
+    )
+    require_order(
+        checkout_entry,
+        [
+            "void update_ce_after_write(const struct checkout *state, struct cache_entry *ce,",
+            "if (!st->st_mode)",
+            "memset(&ce->ce_stat_data, 0, sizeof(ce->ce_stat_data))",
+            "ce->ce_flags &= ~(CE_VALID | CE_UPTODATE)",
+            "fill_stat_cache_info(state->istate, ce, st)",
+            "ce->ce_flags |= CE_UPDATE_IN_BASE",
+            "mark_fsmonitor_invalid(state->istate, ce)",
+            "state->istate->cache_changed |= CE_ENTRY_CHANGED",
+        ],
+        "deferred checkout stat remains an explicitly untrusted index sentinel",
+    )
+    require_order(
+        checkout_entry,
+        [
+            "wrote = write_in_full(fd, new_blob, size)",
+            "fstat_done = fstat_checkout_output(fd, state, &st)",
+            "ret = close(fd)",
+            "if (wrote < 0)",
+            "if (ret)",
+            'return error_errno("unable to close file %s", path)',
+            "if (!fstat_done && checkout_output_stat_deferred(state))",
+            "memset(&st, 0, sizeof(st))",
+            "if (!fstat_done && lstat(ce->name, &st) < 0)",
+        ],
+        "fresh sequential checkout checks close and avoids fallback path stats",
+    )
+    require_order(
+        (WOS_GIT_SOURCE / "read-cache.c").read_text(),
+        [
+            "ce->ce_stat_data.sd_size != 0",
+            "changed_fs = ce_modified_check_fs(istate, ce, st)",
+            "if (changed_fs)",
+            "return 0",
+        ],
+        "zero stat data forces a content check before Git reports an entry modified",
     )
     require_tokens(
         (WOS_GIT_SOURCE / "builtin" / "checkout--worker.c").read_text(),
