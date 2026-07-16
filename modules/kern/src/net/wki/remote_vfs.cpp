@@ -263,6 +263,25 @@ auto max_preserved_export_id(const std::deque<VfsExport>& stale_exports) -> uint
     return max_resource_id;
 }
 
+auto vfs_op_uses_completion_assist(uint16_t op_id, bool has_tagged_receive) -> bool {
+    switch (op_id) {
+        case OP_VFS_OPEN:
+            return !has_tagged_receive;
+        case OP_VFS_STAT:
+        case OP_VFS_MKDIR:
+        case OP_VFS_READLINK:
+        case OP_VFS_SYMLINK:
+        case OP_VFS_UNLINK:
+        case OP_VFS_RMDIR:
+        case OP_VFS_RENAME:
+        case OP_VFS_CHMOD:
+        case OP_VFS_UTIMENS:
+            return true;
+        default:
+            return false;
+    }
+}
+
 auto perf_vfs_op(uint16_t op_id) -> uint8_t {
     switch (op_id) {
         case OP_VFS_OPEN:
@@ -423,12 +442,11 @@ void perf_record_vfs_point(uint8_t op, uint16_t peer, uint16_t channel, int32_t 
     uint32_t const CORRELATION = ker::mod::perf::next_wki_trace_correlation();
     ker::mod::perf::record_wki_event(perf_current_cpu(), perf_current_pid(), ker::mod::perf::WkiPerfScope::REMOTE_VFS, op,
                                      ker::mod::perf::WkiPerfPhase::POINT, peer, channel, CORRELATION, status, aux, callsite);
-    uint32_t const LATENCY_US = (op == static_cast<uint8_t>(ker::mod::perf::WkiPerfVfsOp::ATTACH_WAIT) ||
-                                 op == static_cast<uint8_t>(ker::mod::perf::WkiPerfVfsOp::PROXY_WAIT))
-                                    ? aux
-                                    : 0U;
     bool const HAS_LATENCY = op == static_cast<uint8_t>(ker::mod::perf::WkiPerfVfsOp::ATTACH_WAIT) ||
-                             op == static_cast<uint8_t>(ker::mod::perf::WkiPerfVfsOp::PROXY_WAIT);
+                             op == static_cast<uint8_t>(ker::mod::perf::WkiPerfVfsOp::PROXY_WAIT) ||
+                             op == static_cast<uint8_t>(ker::mod::perf::WkiPerfVfsOp::COMPLETION_ASSIST_HIT) ||
+                             op == static_cast<uint8_t>(ker::mod::perf::WkiPerfVfsOp::COMPLETION_ASSIST_EXHAUSTED);
+    uint32_t const LATENCY_US = HAS_LATENCY ? aux : 0U;
     uint32_t const RETRIES = (op == static_cast<uint8_t>(ker::mod::perf::WkiPerfVfsOp::RETRY)) ? 1U : 0U;
     ker::mod::perf::record_wki_summary(ker::mod::perf::WkiPerfScope::REMOTE_VFS, op, peer, channel, status, LATENCY_US, HAS_LATENCY,
                                        RETRIES, 0);
@@ -2557,7 +2575,27 @@ auto vfs_proxy_send_and_wait(ProxyVfsState* state, uint16_t op_id, const uint8_t
         return encode_proxy_wki_status(SEND_RET);
     }
 
-    int const WAIT_RC = wki_wait_for_op(&wait, wait_timeout_us);
+    WkiWaitHint wait_hint = {
+        .completion_channel = CHANNEL_IDENTITY,
+    };
+    WkiWaitHint* const WAIT_HINT = vfs_op_uses_completion_assist(op_id, tagged_receive != nullptr) ? &wait_hint : nullptr;
+    int const WAIT_RC = wki_wait_for_op(&wait, wait_timeout_us, WAIT_HINT);
+    if (WAIT_HINT != nullptr) {
+        switch (wait_hint.completion_assist_outcome) {
+            case WkiWaitAssistOutcome::HIT:
+                perf_record_vfs_point(static_cast<uint8_t>(ker::mod::perf::WkiPerfVfsOp::COMPLETION_ASSIST_HIT),
+                                      CHANNEL_IDENTITY.peer_node_id, CHANNEL_IDENTITY.channel_id, 0, wait_hint.completion_assist_elapsed_us,
+                                      CALLSITE);
+                break;
+            case WkiWaitAssistOutcome::EXHAUSTED:
+                perf_record_vfs_point(static_cast<uint8_t>(ker::mod::perf::WkiPerfVfsOp::COMPLETION_ASSIST_EXHAUSTED),
+                                      CHANNEL_IDENTITY.peer_node_id, CHANNEL_IDENTITY.channel_id, 0, wait_hint.completion_assist_elapsed_us,
+                                      CALLSITE);
+                break;
+            case WkiWaitAssistOutcome::SKIPPED:
+                break;
+        }
+    }
     if (WAIT_RC != 0) {
         cancel_proxy_op_wait(state, wait, OP_GENERATION, WAIT_RC);
         auto const ELAPSED_US = static_cast<uint32_t>(wki_now_us() - STARTED_US);
@@ -4032,6 +4070,32 @@ auto wki_remote_vfs_selftest_utimens_wire_path_validation() -> bool {
            !relative_wire_path_has_safe_components(DOT_PATH.data(), DOT_PATH.size()) &&
            !relative_wire_path_has_safe_components(DOT_DOT_PATH.data(), DOT_DOT_PATH.size()) &&
            !relative_wire_path_has_safe_components(NUL_PATH.data(), NUL_PATH.size());
+}
+
+auto wki_remote_vfs_selftest_completion_assist_scope() -> bool {
+    constexpr std::array<uint16_t, 9> ELIGIBLE = {
+        OP_VFS_STAT,  OP_VFS_MKDIR,  OP_VFS_READLINK, OP_VFS_SYMLINK, OP_VFS_UNLINK,
+        OP_VFS_RMDIR, OP_VFS_RENAME, OP_VFS_CHMOD,    OP_VFS_UTIMENS,
+    };
+    for (uint16_t const OP_ID : ELIGIBLE) {
+        if (!vfs_op_uses_completion_assist(OP_ID, false) || !vfs_op_uses_completion_assist(OP_ID, true)) {
+            return false;
+        }
+    }
+    if (!vfs_op_uses_completion_assist(OP_VFS_OPEN, false) || vfs_op_uses_completion_assist(OP_VFS_OPEN, true)) {
+        return false;
+    }
+
+    constexpr std::array<uint16_t, 11> EXCLUDED = {
+        OP_VFS_READ,     OP_VFS_WRITE,     OP_VFS_CLOSE,      OP_VFS_READDIR,       OP_VFS_FSYNC,     OP_VFS_TRUNCATE,
+        OP_VFS_SEEK_END, OP_VFS_READ_RDMA, OP_VFS_WRITE_RDMA, OP_VFS_READDIR_BATCH, OP_VFS_READ_BULK,
+    };
+    for (uint16_t const OP_ID : EXCLUDED) {
+        if (vfs_op_uses_completion_assist(OP_ID, false) || vfs_op_uses_completion_assist(OP_ID, true)) {
+            return false;
+        }
+    }
+    return !vfs_op_uses_completion_assist(OP_VFS_INVALIDATE, false) && !vfs_op_uses_completion_assist(OP_VFS_INVALIDATE, true);
 }
 
 auto wki_remote_vfs_selftest_multi_rdma_lane_selection() -> bool {

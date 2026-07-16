@@ -134,6 +134,8 @@ enum class WkiPerfVfsOp : uint8_t {
     RETRY = 16,
     CHMOD = 17,
     UTIMENS = 18,
+    COMPLETION_ASSIST_HIT = 19,
+    COMPLETION_ASSIST_EXHAUSTED = 20,
 };
 
 enum class WkiPerfVfsServerOp : uint8_t {

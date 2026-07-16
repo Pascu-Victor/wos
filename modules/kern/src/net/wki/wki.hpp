@@ -677,13 +677,33 @@ struct WkiWaitEntry {
     uint16_t diag_cookie = 0;
 };
 
+enum class WkiWaitAssistOutcome : uint8_t {
+    SKIPPED = 0,
+    HIT = 1,
+    EXHAUSTED = 2,
+};
+
+// Optional latency hint for callers whose completion arrives on one exact
+// channel allocation. Passing a hint requests a bounded passive completion
+// observation window before the normal wait-list/park path. The wait core
+// publishes the outcome for scoped caller diagnostics; it never drives
+// transport progress, changes the operation result, or bypasses normal wait
+// consumption.
+struct WkiWaitHint {
+    WkiChannelIdentity completion_channel = {};
+    WkiWaitAssistOutcome completion_assist_outcome = WkiWaitAssistOutcome::SKIPPED;
+    uint32_t completion_assist_elapsed_us = 0;
+    uint16_t completion_assist_pauses = 0;
+    uint8_t completion_assist_batches = 0;
+};
+
 // Default operation timeout: 15 seconds (allows for CPU-loaded VFS servers)
 constexpr uint64_t WKI_OP_TIMEOUT_US = 15'000'000;
 
 // Put the calling task to sleep until woken or timeout.
 // Returns: 0 on success, WKI_ERR_TIMEOUT on timeout, WKI_ERR_PEER_FENCED on fencing.
 // Caller allocates WkiWaitEntry on kernel stack (no heap allocation needed).
-auto wki_wait_for_op(WkiWaitEntry* entry, uint64_t timeout_us) -> int;
+auto wki_wait_for_op(WkiWaitEntry* entry, uint64_t timeout_us, WkiWaitHint* hint = nullptr) -> int;
 
 // True while the current WKI deferred worker must keep polling transport work
 // instead of entering a long scheduler park.
@@ -712,6 +732,7 @@ void wki_wait_cleanup_for_task(ker::mod::sched::task::Task* task);
 #ifdef WOS_SELFTEST
 void wki_selftest_wait_list_link(WkiWaitEntry* entry);
 auto wki_selftest_wait_list_contains(WkiWaitEntry const* entry) -> bool;
+auto wki_selftest_wait_completion_assist_policy() -> bool;
 auto wki_selftest_reliable_rx_peer_state_accepts(PeerState state) -> bool;
 auto wki_selftest_split_payload_validation_and_copy() -> bool;
 #endif

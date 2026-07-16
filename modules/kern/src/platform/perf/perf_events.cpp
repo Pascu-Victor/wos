@@ -427,6 +427,10 @@ const char* wki_op_name(WkiPerfScope scope, uint8_t op) {
                     return "chmod";
                 case WkiPerfVfsOp::UTIMENS:
                     return "utimens";
+                case WkiPerfVfsOp::COMPLETION_ASSIST_HIT:
+                    return "completion_assist_hit";
+                case WkiPerfVfsOp::COMPLETION_ASSIST_EXHAUSTED:
+                    return "completion_assist_exhausted";
                 default:
                     return "unknown";
             }

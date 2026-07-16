@@ -6,6 +6,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 WKI_CPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "wki.cpp"
+WKI_HPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "wki.hpp"
 WKI_WAIT_KTEST = ROOT / "modules" / "kern" / "src" / "test" / "wki_wait_ktest.cpp"
 SCHEDULER_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "sched" / "scheduler.cpp"
 REMOTABLE_CPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "remotable.cpp"
@@ -179,6 +180,142 @@ def test_process_wait_parks_only_at_safe_syscall_points() -> None:
     )
 
 
+def test_completion_assist_is_bounded_before_wait_linkage() -> None:
+    source = WKI_CPP.read_text()
+    header = WKI_HPP.read_text()
+    assist_body = function_body(source, "run_wait_completion_assist")
+    wait_body = function_body(source, "wki_wait_for_op")
+
+    require_tokens(
+        header,
+        [
+            "enum class WkiWaitAssistOutcome",
+            "SKIPPED = 0",
+            "HIT = 1",
+            "EXHAUSTED = 2",
+            "WkiChannelIdentity completion_channel = {}",
+            "uint32_t completion_assist_elapsed_us = 0",
+            "uint16_t completion_assist_pauses = 0",
+            "uint8_t completion_assist_batches = 0",
+            "WkiWaitHint* hint = nullptr",
+        ],
+        "optional exact-channel WKI wait hint",
+    )
+    require_tokens(
+        source,
+        [
+            "WKI_WAIT_COMPLETION_ASSIST_BUDGET_US = 32",
+            "WKI_WAIT_COMPLETION_ASSIST_MAX_BATCHES = 64",
+            "WKI_WAIT_COMPLETION_ASSIST_PAUSES_PER_BATCH = 32",
+            "WKI_WAIT_COMPLETION_ASSIST_MAX_PAUSES",
+            "static_assert(WKI_WAIT_COMPLETION_ASSIST_MAX_PAUSES == 2048)",
+        ],
+        "completion-assist work bounds",
+    )
+    require_tokens(
+        assist_body,
+        [
+            "hint->completion_assist_outcome = WkiWaitAssistOutcome::SKIPPED",
+            "hint->completion_assist_elapsed_us = 0",
+            "hint->completion_assist_pauses = 0",
+            "hint->completion_assist_batches = 0",
+            "entry->deadline_us <= assist_deadline_us",
+            "assist_deadline_us = entry->deadline_us",
+            "while (true)",
+            "entry->task.load(std::memory_order_acquire)",
+            "process_wait_can_park(waiter_task)",
+            "wait_completion_channel_is_live_nonblocking(hint->completion_channel)",
+            "wait_completion_assist_decision(",
+            "wait_done(entry)",
+            'asm volatile("pause" ::: "memory")',
+            "hint->completion_assist_batches++",
+            "hint->completion_assist_pauses += WKI_WAIT_COMPLETION_ASSIST_PAUSES_PER_BATCH",
+            "WkiWaitAssistOutcome::HIT",
+            "WkiWaitAssistOutcome::EXHAUSTED",
+        ],
+        "bounded exact-channel completion assist",
+    )
+    finish_body = function_body(source, "finish_wait_completion_assist")
+    require_tokens(
+        finish_body,
+        [
+            "hint->completion_assist_outcome = outcome",
+            "hint->completion_assist_batches == 0",
+            "hint->completion_assist_elapsed_us = 0",
+            "wki_now_us() - started_us",
+            "std::min<uint64_t>(ELAPSED_US, UINT32_MAX)",
+        ],
+        "attempted completion-assist elapsed-time finalization",
+    )
+    if assist_body.count("finish_wait_completion_assist(") != 4:
+        fail("every post-start completion-assist exit must finalize elapsed time")
+    forbidden_progress = [
+        "wki_spin_yield",
+        "napi_poll",
+        "backlog",
+        "wki_timer_tick",
+        "kern_yield",
+        "kern_block",
+        "kmalloc",
+        "new ",
+    ]
+    retained = [token for token in forbidden_progress if token in assist_body]
+    if retained:
+        fail("passive completion assist retains active/blocking progress: " + ", ".join(retained))
+    liveness_body = function_body(source, "wait_completion_channel_is_live_nonblocking")
+    require_tokens(
+        liveness_body,
+        [
+            "identity.channel->lock.try_lock()",
+            "identity.channel->active",
+            "identity.channel->peer_node_id == identity.peer_node_id",
+            "identity.channel->channel_id == identity.channel_id",
+            "identity.channel->generation == identity.generation",
+            "identity.channel->lock.unlock()",
+        ],
+        "nonblocking exact-channel generation fence",
+    )
+    if "identity.channel->lock.lock()" in liveness_body or "wki_channel_generation_is_live(" in liveness_body:
+        fail("completion assist channel fence must not wait for a contended lock")
+    policy_selftest = function_body(source, "wki_selftest_wait_completion_assist_policy")
+    require_tokens(
+        policy_selftest,
+        [
+            "WKI_WAIT_COMPLETION_ASSIST_MAX_BATCHES == 64",
+            "WKI_WAIT_COMPLETION_ASSIST_MAX_PAUSES == 2048",
+            "wait_completion_assist_decision(false, true, true, true, 0) == WaitCompletionAssistDecision::SKIPPED",
+            "wait_completion_assist_decision(false, true, true, true, 1) == WaitCompletionAssistDecision::EXHAUSTED",
+            "wait_completion_assist_decision(false, true, true, false, 64) == WaitCompletionAssistDecision::EXHAUSTED",
+            "wait_completion_assist_decision(true, true, true, false, 1) == WaitCompletionAssistDecision::HIT",
+            "wait_completion_assist_decision(false, false, true, false, 1) == WaitCompletionAssistDecision::SKIPPED",
+            "wait_completion_assist_decision(false, true, false, false, 1) == WaitCompletionAssistDecision::SKIPPED",
+            "wait_completion_channel_is_live_nonblocking(STALE_IDENTITY)",
+            "CONTENDED_CHANNEL_REJECTED",
+        ],
+        "completion-assist outcome and hard-cap selftest matrix",
+    )
+    if "interrupts_enabled()" in assist_body:
+        fail("completion assist must accept the IF-masked syscall entry state")
+    require_order(
+        wait_body,
+        "entry->task.store(mod::sched::get_current_task(), std::memory_order_release)",
+        "run_wait_completion_assist(entry, hint)",
+        "completion assist must run after waiter task publication",
+    )
+    require_order(
+        wait_body,
+        "entry->deadline_us =",
+        "run_wait_completion_assist(entry, hint)",
+        "completion assist must run after deadline publication",
+    )
+    require_order(
+        wait_body,
+        "run_wait_completion_assist(entry, hint)",
+        "wait_list_link(entry)",
+        "completion assist must finish before wait-list linkage",
+    )
+
+
 def test_ktest_covers_completed_claimed_cleanup() -> None:
     source = WKI_WAIT_KTEST.read_text()
     require_tokens(
@@ -198,9 +335,16 @@ def test_ktest_covers_completed_claimed_cleanup() -> None:
         [
             "CompletionBeforeWaitReturnsWithoutLinking",
             "wki_wake_op(&wait, 42)",
-            "KEXPECT_EQ(ker::net::wki::wki_wait_for_op(&wait, ker::net::wki::WKI_OP_TIMEOUT_US), 42)",
+            "WkiWaitHint hint{}",
+            "KEXPECT_EQ(ker::net::wki::wki_wait_for_op(&wait, ker::net::wki::WKI_OP_TIMEOUT_US, &hint), 42)",
             "KEXPECT_FALSE(ker::net::wki::wki_selftest_wait_list_contains(&wait))",
             "WkiWaitEntry::DONE",
+            "WkiWaitAssistOutcome::SKIPPED",
+            "hint.completion_assist_elapsed_us, 0U",
+            "hint.completion_assist_pauses, 0U",
+            "hint.completion_assist_batches, 0U",
+            "CompletionAssistPolicyBoundsOutcomesAndContextSkips",
+            "wki_selftest_wait_completion_assist_policy()",
         ],
         "WKI completion-before-wait KTEST",
     )
@@ -237,7 +381,8 @@ def test_resource_withdraw_defers_blocking_unmount() -> None:
         wki_source,
         [
             "message_uses_rx_peer_lifecycle(msg, payload, PAYLOAD_LEN)",
-            "peer_lifecycle.try_acquire(hdr->src_node)",
+            "peer_lifecycle.try_acquire(hdr->src_node, SHARED_RX_LIFECYCLE)",
+            "peer_lifecycle.try_acquire(hdr->src_node, RO_SHARED_RX_LIFECYCLE)",
             "wki_remotable_admit_rx(msg, hdr, payload, PAYLOAD_LEN, ch, ch->generation)",
             "message_uses_rx_peer_lifecycle(RO_MSG, ch->reorder_head->data, ch->reorder_head->len)",
             "wki_remotable_admit_rx(RO_MSG, &ch->reorder_head->hdr",
@@ -360,6 +505,7 @@ def main() -> None:
     test_cleanup_publishes_only_when_it_claims_waiter()
     test_done_is_the_final_stack_waiter_access()
     test_process_wait_parks_only_at_safe_syscall_points()
+    test_completion_assist_is_bounded_before_wait_linkage()
     test_ktest_covers_completed_claimed_cleanup()
     test_resource_withdraw_defers_blocking_unmount()
     print("WKI wait source invariants hold")

@@ -304,6 +304,7 @@ auto wki_remote_vfs_selftest_attach_ack_cookie_fences_stale_completion() -> bool
 
 #ifdef WOS_SELFTEST
 auto wki_remote_vfs_selftest_utimens_wire_path_validation() -> bool;
+auto wki_remote_vfs_selftest_completion_assist_scope() -> bool;
 auto wki_remote_vfs_selftest_slot_waiter_fifo() -> bool;
 auto wki_remote_vfs_selftest_stale_cancel_preserves_successor() -> bool;
 auto wki_remote_vfs_selftest_response_claim_retains_waiter_slot() -> bool;
