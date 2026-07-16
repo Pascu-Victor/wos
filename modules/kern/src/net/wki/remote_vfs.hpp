@@ -30,14 +30,18 @@ constexpr size_t VFS_EXPORT_NAME_LEN = 64;
 constexpr size_t VFS_READLINK_CACHE_ENTRIES = 128;
 constexpr size_t VFS_READLINK_CACHE_TEXT_MAX = 512;
 constexpr size_t VFS_PROXY_SLOT_WAITER_CAPACITY = 64;
-// A mount keeps a small fixed set of independent stop-and-wait bindings.  The
-// bound makes the extra memory, channels, and server worker admission explicit
-// while allowing unrelated tasks to avoid one mount-wide RPC queue.
-constexpr size_t VFS_PROXY_LANE_COUNT = 4;
-// Write-heavy distributed workloads already stripe across all four bindings.
-// Keep every existing lane data-capable so those opens do not collapse back
-// onto only half of the server's stop-and-wait queues. Registration remains
-// independently fallible per lane, with the message path as the fallback.
+// A mount keeps a bounded set of independent stop-and-wait bindings. Ordinary
+// exports retain four active bindings and their RDMA registrations, while
+// automatically mounted dedicated /tmp exports can use the full capacity.
+constexpr size_t VFS_PROXY_LANE_COUNT = 8;
+constexpr size_t VFS_PROXY_DEFAULT_LANE_COUNT = 4;
+static_assert(VFS_PROXY_DEFAULT_LANE_COUNT > 0 && VFS_PROXY_DEFAULT_LANE_COUNT <= VFS_PROXY_LANE_COUNT);
+static_assert(VFS_PROXY_LANE_COUNT <= UINT8_MAX);
+// Write-heavy distributed workloads stripe across every binding selected for
+// their mount. Keep every existing lane data-capable so those opens do not
+// collapse back onto only half of the server's stop-and-wait queues.
+// Registration remains independently fallible per lane, with the message path
+// as the fallback.
 constexpr size_t VFS_PROXY_RDMA_LANE_COUNT = VFS_PROXY_LANE_COUNT;
 static_assert(VFS_PROXY_RDMA_LANE_COUNT > 1 && VFS_PROXY_RDMA_LANE_COUNT <= VFS_PROXY_LANE_COUNT);
 

@@ -3457,7 +3457,9 @@ def test_remote_vfs_mount_lanes_preserve_channel_and_lifetime_affinity() -> None
     require_tokens(
         header,
         [
-            "constexpr size_t VFS_PROXY_LANE_COUNT = 4;",
+            "constexpr size_t VFS_PROXY_LANE_COUNT = 8;",
+            "constexpr size_t VFS_PROXY_DEFAULT_LANE_COUNT = 4;",
+            "VFS_PROXY_DEFAULT_LANE_COUNT <= VFS_PROXY_LANE_COUNT",
             "constexpr size_t VFS_PROXY_RDMA_LANE_COUNT = VFS_PROXY_LANE_COUNT;",
             "static_assert(VFS_PROXY_RDMA_LANE_COUNT > 1 && VFS_PROXY_RDMA_LANE_COUNT <= VFS_PROXY_LANE_COUNT);",
             "uint64_t mount_group_id = 0;",
@@ -3528,6 +3530,35 @@ def test_remote_vfs_mount_lanes_preserve_channel_and_lifetime_affinity() -> None
         fail("lane selection must remain available while mount_filesystem is publishing the ready anchor")
 
     lane_mount = function_body(source, "mount_vfs_proxy_lane")
+    lane_policy = function_body(source, "vfs_proxy_lane_count_for_mount")
+    require_order(
+        lane_policy,
+        [
+            'constexpr std::string_view AUTO_MOUNT_PREFIX = "/wki/"',
+            'constexpr std::string_view TMP_EXPORT_SUFFIX = "/tmp"',
+            "local_mount_path.starts_with(AUTO_MOUNT_PREFIX)",
+            "local_mount_path.remove_prefix(AUTO_MOUNT_PREFIX.size())",
+            "size_t const HOST_END = local_mount_path.find('/')",
+            "HOST_END != std::string_view::npos && HOST_END > 0",
+            "local_mount_path.substr(HOST_END) == TMP_EXPORT_SUFFIX",
+            "return static_cast<uint8_t>(VFS_PROXY_LANE_COUNT)",
+            "return static_cast<uint8_t>(VFS_PROXY_DEFAULT_LANE_COUNT)",
+        ],
+        "only temporary-data mounts opt into the bounded eight-lane capacity",
+    )
+    require_tokens(
+        source,
+        [
+            'static_assert(vfs_proxy_lane_count_for_mount("/wki/wos-1/tmp") == VFS_PROXY_LANE_COUNT);',
+            'static_assert(vfs_proxy_lane_count_for_mount("/wki/wos-1/tmp/work") == VFS_PROXY_DEFAULT_LANE_COUNT);',
+            'static_assert(vfs_proxy_lane_count_for_mount("/wki/wos-1/cache/tmp") == VFS_PROXY_DEFAULT_LANE_COUNT);',
+            'static_assert(vfs_proxy_lane_count_for_mount("/mnt/tmp") == VFS_PROXY_DEFAULT_LANE_COUNT);',
+            'static_assert(vfs_proxy_lane_count_for_mount("/wki/tmp") == VFS_PROXY_DEFAULT_LANE_COUNT);',
+            'static_assert(vfs_proxy_lane_count_for_mount("/wki//tmp") == VFS_PROXY_DEFAULT_LANE_COUNT);',
+            'static_assert(vfs_proxy_lane_count_for_mount("/wki/wos-1/tmp/") == VFS_PROXY_DEFAULT_LANE_COUNT);',
+        ],
+        "lane policy admits only the dedicated automatic temporary-data mount shape",
+    )
     require_order(
         lane_mount,
         [
@@ -3543,7 +3574,8 @@ def test_remote_vfs_mount_lanes_preserve_channel_and_lifetime_affinity() -> None
             'ker::vfs::mount_filesystem(local_mount_path, "remote"',
             "if (MOUNT_RET != 0)",
             "state->mount_configured = true",
-            "for (uint8_t lane_index = 1; lane_index < VFS_PROXY_LANE_COUNT; ++lane_index)",
+            "uint8_t const TARGET_LANE_COUNT = vfs_proxy_lane_count_for_mount(local_mount_path)",
+            "for (uint8_t lane_index = 1; lane_index < TARGET_LANE_COUNT; ++lane_index)",
             "mount_vfs_proxy_lane(owner_node, resource_id, local_mount_path, RESOURCE_GENERATION",
         ],
         "mount publishes a ready lane zero before auxiliary lanes are attached",
@@ -3579,7 +3611,8 @@ def test_remote_vfs_mount_lanes_preserve_channel_and_lifetime_affinity() -> None
         lane_mount,
         [
             "int const PRE_AUX_VALIDATION = validate_mount_binding()",
-            "for (uint8_t lane_index = 1; lane_index < VFS_PROXY_LANE_COUNT; ++lane_index)",
+            "uint8_t const TARGET_LANE_COUNT = vfs_proxy_lane_count_for_mount(local_mount_path)",
+            "for (uint8_t lane_index = 1; lane_index < TARGET_LANE_COUNT; ++lane_index)",
             "if (LANE_RET == -ENOENT || LANE_RET == -ESTALE)",
             "wki_remote_vfs_unmount_resource_generation(owner_node, resource_id, RESOURCE_GENERATION)",
             "release_vfs_proxy_lifecycle_ref(state)",
@@ -3589,7 +3622,7 @@ def test_remote_vfs_mount_lanes_preserve_channel_and_lifetime_affinity() -> None
         ],
         "definitive auxiliary rejection rolls back before final binding/resource revalidation",
     )
-    post_aux = lane_mount[lane_mount.find("for (uint8_t lane_index = 1; lane_index < VFS_PROXY_LANE_COUNT;") :]
+    post_aux = lane_mount[lane_mount.find("for (uint8_t lane_index = 1; lane_index < TARGET_LANE_COUNT;") :]
     require_order(
         post_aux,
         [
@@ -3742,7 +3775,8 @@ def test_capability_gated_vfs_data_lanes_bound_rdma_buffers() -> None:
     require_tokens(
         header,
         [
-            "constexpr size_t VFS_PROXY_LANE_COUNT = 4;",
+            "constexpr size_t VFS_PROXY_LANE_COUNT = 8;",
+            "constexpr size_t VFS_PROXY_DEFAULT_LANE_COUNT = 4;",
             "constexpr size_t VFS_PROXY_RDMA_LANE_COUNT = VFS_PROXY_LANE_COUNT;",
             "VFS_PROXY_RDMA_LANE_COUNT <= VFS_PROXY_LANE_COUNT",
         ],

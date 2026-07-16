@@ -28,6 +28,7 @@
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
 #include <platform/sys/mutex.hpp>
+#include <string_view>
 #include <util/hcf.hpp>
 #include <utility>
 #include <vfs/mount.hpp>
@@ -6242,6 +6243,26 @@ void handle_vfs_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_ident
 
 namespace {
 
+constexpr auto vfs_proxy_lane_count_for_mount(std::string_view local_mount_path) -> uint8_t {
+    constexpr std::string_view AUTO_MOUNT_PREFIX = "/wki/";
+    constexpr std::string_view TMP_EXPORT_SUFFIX = "/tmp";
+    if (local_mount_path.starts_with(AUTO_MOUNT_PREFIX)) {
+        local_mount_path.remove_prefix(AUTO_MOUNT_PREFIX.size());
+        size_t const HOST_END = local_mount_path.find('/');
+        if (HOST_END != std::string_view::npos && HOST_END > 0 && local_mount_path.substr(HOST_END) == TMP_EXPORT_SUFFIX) {
+            return static_cast<uint8_t>(VFS_PROXY_LANE_COUNT);
+        }
+    }
+    return static_cast<uint8_t>(VFS_PROXY_DEFAULT_LANE_COUNT);
+}
+static_assert(vfs_proxy_lane_count_for_mount("/wki/wos-1/tmp") == VFS_PROXY_LANE_COUNT);
+static_assert(vfs_proxy_lane_count_for_mount("/wki/wos-1/tmp/work") == VFS_PROXY_DEFAULT_LANE_COUNT);
+static_assert(vfs_proxy_lane_count_for_mount("/wki/wos-1/cache/tmp") == VFS_PROXY_DEFAULT_LANE_COUNT);
+static_assert(vfs_proxy_lane_count_for_mount("/mnt/tmp") == VFS_PROXY_DEFAULT_LANE_COUNT);
+static_assert(vfs_proxy_lane_count_for_mount("/wki/tmp") == VFS_PROXY_DEFAULT_LANE_COUNT);
+static_assert(vfs_proxy_lane_count_for_mount("/wki//tmp") == VFS_PROXY_DEFAULT_LANE_COUNT);
+static_assert(vfs_proxy_lane_count_for_mount("/wki/wos-1/tmp/") == VFS_PROXY_DEFAULT_LANE_COUNT);
+
 auto mount_vfs_proxy_lane(uint16_t owner_node, uint32_t resource_id, const char* local_mount_path, uint64_t resource_generation,
                           const ResourceIncarnationToken& owner_incarnation, uint32_t binding_peer_boot_epoch, uint64_t mount_group_id,
                           uint8_t lane_index, bool lane_anchor) -> int {
@@ -6591,7 +6612,8 @@ auto mount_vfs_proxy_lane(uint16_t owner_node, uint32_t resource_id, const char*
         return PRE_AUX_VALIDATION;
     }
 
-    for (uint8_t lane_index = 1; lane_index < VFS_PROXY_LANE_COUNT; ++lane_index) {
+    uint8_t const TARGET_LANE_COUNT = vfs_proxy_lane_count_for_mount(local_mount_path);
+    for (uint8_t lane_index = 1; lane_index < TARGET_LANE_COUNT; ++lane_index) {
         int const LANE_RET = mount_vfs_proxy_lane(owner_node, resource_id, local_mount_path, RESOURCE_GENERATION, owner_incarnation,
                                                   BINDING_PEER_BOOT_EPOCH, mount_group_id, lane_index, false);
         if (LANE_RET != 0) {
