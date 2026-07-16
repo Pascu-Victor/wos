@@ -237,7 +237,8 @@ def test_resource_withdraw_defers_blocking_unmount() -> None:
         wki_source,
         [
             "message_uses_rx_peer_lifecycle(msg, payload, PAYLOAD_LEN)",
-            "peer_lifecycle.try_acquire(hdr->src_node)",
+            "peer_lifecycle.try_acquire(hdr->src_node, SHARED_RX_LIFECYCLE)",
+            "peer_lifecycle.try_acquire(hdr->src_node, RO_SHARED_RX_LIFECYCLE)",
             "wki_remotable_admit_rx(msg, hdr, payload, PAYLOAD_LEN, ch, ch->generation)",
             "message_uses_rx_peer_lifecycle(RO_MSG, ch->reorder_head->data, ch->reorder_head->len)",
             "wki_remotable_admit_rx(RO_MSG, &ch->reorder_head->hdr",
