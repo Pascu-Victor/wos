@@ -3458,7 +3458,7 @@ def test_remote_vfs_mount_lanes_preserve_channel_and_lifetime_affinity() -> None
         header,
         [
             "constexpr size_t VFS_PROXY_LANE_COUNT = 4;",
-            "constexpr size_t VFS_PROXY_RDMA_LANE_COUNT = 2;",
+            "constexpr size_t VFS_PROXY_RDMA_LANE_COUNT = VFS_PROXY_LANE_COUNT;",
             "static_assert(VFS_PROXY_RDMA_LANE_COUNT > 1 && VFS_PROXY_RDMA_LANE_COUNT <= VFS_PROXY_LANE_COUNT);",
             "uint64_t mount_group_id = 0;",
             "uint8_t lane_index = 0;",
@@ -3695,7 +3695,7 @@ def test_remote_vfs_mount_lanes_preserve_channel_and_lifetime_affinity() -> None
         require_tokens(function_body(source, function_name), [marker], f"{function_name} unpublishes lane groups")
 
 
-def test_capability_gated_two_vfs_data_lanes_bound_rdma_buffers() -> None:
+def test_capability_gated_vfs_data_lanes_bound_rdma_buffers() -> None:
     source = REMOTE_VFS_CPP.read_text()
     header = REMOTE_VFS_HPP.read_text()
     wire = WIRE_HPP.read_text()
@@ -3743,10 +3743,10 @@ def test_capability_gated_two_vfs_data_lanes_bound_rdma_buffers() -> None:
         header,
         [
             "constexpr size_t VFS_PROXY_LANE_COUNT = 4;",
-            "constexpr size_t VFS_PROXY_RDMA_LANE_COUNT = 2;",
+            "constexpr size_t VFS_PROXY_RDMA_LANE_COUNT = VFS_PROXY_LANE_COUNT;",
             "VFS_PROXY_RDMA_LANE_COUNT <= VFS_PROXY_LANE_COUNT",
         ],
-        "two data lanes retain the four-lane metadata bound",
+        "all bounded VFS lanes retain data-path capability",
     )
     require_tokens(
         wki_header,
@@ -3937,7 +3937,7 @@ def main() -> None:
     test_vfs_detach_uses_exact_negotiated_incarnation_form()
     test_remote_vfs_unmount_cancels_waiters_before_teardown()
     test_remote_vfs_teardown_releases_rdma_state_when_idle()
-    test_capability_gated_two_vfs_data_lanes_bound_rdma_buffers()
+    test_capability_gated_vfs_data_lanes_bound_rdma_buffers()
     test_metadata_batch_never_replays_after_a_send_attempt()
     test_remote_open_refs_delay_proxy_destroy_until_close()
     test_remote_vfs_channel_identity_survives_pool_slot_reuse()

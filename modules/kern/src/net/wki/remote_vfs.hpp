@@ -34,9 +34,11 @@ constexpr size_t VFS_PROXY_SLOT_WAITER_CAPACITY = 64;
 // bound makes the extra memory, channels, and server worker admission explicit
 // while allowing unrelated tasks to avoid one mount-wide RPC queue.
 constexpr size_t VFS_PROXY_LANE_COUNT = 4;
-// Keep metadata RPC concurrency on all four lanes, but bound the staging cost
-// to the anchor and one additional data lane per remote mount.
-constexpr size_t VFS_PROXY_RDMA_LANE_COUNT = 2;
+// Write-heavy distributed workloads already stripe across all four bindings.
+// Keep every existing lane data-capable so those opens do not collapse back
+// onto only half of the server's stop-and-wait queues. Registration remains
+// independently fallible per lane, with the message path as the fallback.
+constexpr size_t VFS_PROXY_RDMA_LANE_COUNT = VFS_PROXY_LANE_COUNT;
 static_assert(VFS_PROXY_RDMA_LANE_COUNT > 1 && VFS_PROXY_RDMA_LANE_COUNT <= VFS_PROXY_LANE_COUNT);
 
 // Bounce buffer sizes for RDMA-backed VFS I/O.
