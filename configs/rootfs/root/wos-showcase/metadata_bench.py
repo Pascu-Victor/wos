@@ -26,11 +26,12 @@ BENCHMARKS = {
 }
 READY_RECORD = "metadata-worker-ready-v1"
 DONE_RECORD_PREFIX = "metadata-worker-done-v1"
+MAX_TOTAL_WORKERS = 32
 WORKER_SHELL = f"""\
 set -eu
 /usr/bin/wosid
 exec /usr/bin/testprog vfsbench-metadata-worker \
-    --create-path "$1" --rename-path "$2" --iterations "$3"
+    --create-path "$1" --rename-path "$2" --iterations "$3" --workers "$4"
 """
 WOSID_PATTERN = re.compile(
     r"spawner=(?P<spawner>\S+) host=(?P<runner>\S+) "
@@ -70,6 +71,7 @@ class Job:
     host: str
     path: str
     work_units: int
+    workers: int
     log_path: Path
 
     def worker_path(self, operation: str) -> str:
@@ -145,16 +147,24 @@ def make_jobs(config: Config) -> list[Job]:
         raise BenchmarkError(
             "--total-work-units must assign at least one operation to every host"
         )
+    total_workers = min(MAX_TOTAL_WORKERS, config.total_work_units)
     quotient, remainder = divmod(config.total_work_units, host_count)
+    worker_quotient, worker_remainder = divmod(total_workers, host_count)
     jobs = []
     for index, host in enumerate(canonical_hosts):
         work_units = quotient + (1 if index < remainder else 0)
+        workers = worker_quotient + (1 if index < worker_remainder else 0)
+        if not 1 <= workers <= work_units:
+            raise BenchmarkError(
+                f"internal worker partition for {host} exceeds its canonical work"
+            )
         jobs.append(
             Job(
                 index=index,
                 host=host,
                 path=config.path,
                 work_units=work_units,
+                workers=workers,
                 log_path=config.log_dir / f"metadata-worker-{index}.log",
             )
         )
@@ -176,6 +186,7 @@ def worker_command(job: Job) -> Sequence[str]:
         job.worker_path("create"),
         job.worker_path("rename"),
         str(job.work_units),
+        str(job.workers),
     )
 
 
@@ -461,6 +472,13 @@ def parse_phase_payload(job: Job, operation: str, line: str) -> dict[str, object
         or iterations != job.work_units
     ):
         raise BenchmarkError(f"{job.host} reported the wrong iteration count")
+    workers = payload.get("workers")
+    if (
+        isinstance(workers, bool)
+        or not isinstance(workers, int)
+        or workers != job.workers
+    ):
+        raise BenchmarkError(f"{job.host} reported the wrong worker count")
     positive_finite(payload.get("elapsed_seconds"), f"{job.host} elapsed_seconds")
     return payload
 
@@ -655,6 +673,7 @@ def execute_benchmarks(
                     else "wki"
                 ),
                 "work_units": job.work_units,
+                "workers": job.workers,
             }
         )
 
@@ -668,6 +687,7 @@ def execute_benchmarks(
                 "elapsed_seconds": elapsed_by_operation[operation]
                 / 1_000_000_000.0,
                 "total_work_units": config.total_work_units,
+                "total_workers": sum(job.workers for job in jobs),
                 "placement": "local-baseline" if len(jobs) == 1 else "strict-on",
                 "wki_route": "host-path",
                 "launcher_host": config.launcher,
@@ -742,6 +762,7 @@ def fake_worker_main(argv: Sequence[str]) -> int:
     parser.add_argument("--create-path", required=True)
     parser.add_argument("--rename-path", required=True)
     parser.add_argument("--iterations", required=True, type=int)
+    parser.add_argument("--workers", required=True, type=int)
     parser.add_argument("--ready-sleep-seconds", required=True, type=float)
     parser.add_argument("--phase-sleep-seconds", required=True, type=float)
     parser.add_argument("--shutdown-sleep-seconds", type=float, default=0.0)
@@ -780,6 +801,7 @@ def fake_worker_main(argv: Sequence[str]) -> int:
                         "benchmark": BENCHMARKS[operation],
                         "path": paths[operation],
                         "iterations": arguments.iterations,
+                        "workers": arguments.workers,
                         "elapsed_seconds": max(
                             arguments.phase_sleep_seconds, 0.000001
                         ),
@@ -810,7 +832,7 @@ def assert_worker_shell_execs_worker(directory: Path) -> None:
         "while [ \"$#\" -gt 0 ]; do\n"
         "    case \"$1\" in\n"
         "        --create-path) create_path=$2; shift 2 ;;\n"
-        "        --rename-path|--iterations) shift 2 ;;\n"
+        "        --rename-path|--iterations|--workers) shift 2 ;;\n"
         "        *) exit 64 ;;\n"
         "    esac\n"
         "done\n"
@@ -837,6 +859,7 @@ def assert_worker_shell_execs_worker(directory: Path) -> None:
             "metadata-worker",
             str(worker_path),
             f"{worker_path}.rename",
+            "1",
             "1",
         ),
         stdin=subprocess.PIPE,
@@ -918,6 +941,7 @@ def run_self_test() -> int:
             launcher: str | None = None,
             exit_code: int = 0,
             malformed_json: bool = False,
+            reported_workers: int | None = None,
         ) -> Sequence[str]:
             nonlocal launch_count
             launch_count += 1
@@ -935,6 +959,8 @@ def run_self_test() -> int:
                 job.worker_path("rename"),
                 "--iterations",
                 str(job.work_units),
+                "--workers",
+                str(job.workers if reported_workers is None else reported_workers),
                 "--ready-sleep-seconds",
                 str(ready_sleep_seconds),
                 "--phase-sleep-seconds",
@@ -951,11 +977,13 @@ def run_self_test() -> int:
         payloads, jobs = execute_benchmarks(config, fake_command)
         assert launch_count == len(config.hosts)
         assert [job.work_units for job in jobs] == [4, 3, 3]
+        assert [job.workers for job in jobs] == [4, 3, 3]
         assert [payload["benchmark"] for payload in payloads] == [
             BENCHMARKS["create"],
             BENCHMARKS["rename"],
         ]
         assert all(payload["total_work_units"] == 10 for payload in payloads)
+        assert all(payload["total_workers"] == 10 for payload in payloads)
         assert all(payload["placement"] == "strict-on" for payload in payloads)
         assert [
             participant["remote_pid"]
@@ -992,6 +1020,28 @@ def run_self_test() -> int:
             WORKER_SHELL,
         )
 
+        expected_worker_splits = {
+            1: [32],
+            2: [16, 16],
+            3: [11, 11, 10],
+            4: [8, 8, 8, 8],
+        }
+        for total_work_units in (32, 256, 1000):
+            for host_count, expected_workers in expected_worker_splits.items():
+                split_config = Config(
+                    operations=("create",),
+                    hosts=tuple(f"wos-{index}" for index in range(host_count)),
+                    launcher="wos-0",
+                    path=config.path,
+                    total_work_units=total_work_units,
+                    timeout_seconds=2.0,
+                    log_dir=Path(directory),
+                )
+                split_jobs = make_jobs(split_config)
+                assert [job.workers for job in split_jobs] == expected_workers
+                assert sum(job.workers for job in split_jobs) == MAX_TOTAL_WORKERS
+                assert all(job.workers <= job.work_units for job in split_jobs)
+
         rotated_config = Config(
             operations=("create",),
             hosts=("wos-2.wos", "wos-0.wos", "wos-1.wos"),
@@ -1020,6 +1070,7 @@ def run_self_test() -> int:
             "wos-2.wos",
         ]
         assert [job.work_units for job in rotated_jobs] == [4, 3, 3]
+        assert [job.workers for job in rotated_jobs] == [4, 3, 3]
         assert rotated_payload["launcher_host"] == "wos-2.wos"
         assert [
             participant["transport"] for participant in rotated_payload["participants"]
@@ -1100,6 +1151,21 @@ def run_self_test() -> int:
             assert "rc=7" in str(error)
         else:
             raise AssertionError("accepted a nonzero worker exit")
+
+        def wrong_worker_count_command(job: Job) -> Sequence[str]:
+            return fake_command(
+                job,
+                ready_sleep_seconds=0.001,
+                phase_sleep_seconds=0.001,
+                reported_workers=job.workers + 1,
+            )
+
+        try:
+            execute_benchmarks(single_config, wrong_worker_count_command)
+        except BenchmarkError as error:
+            assert "wrong worker count" in str(error)
+        else:
+            raise AssertionError("accepted an incorrect worker-count report")
         diagnostics = io.StringIO()
         with contextlib.redirect_stderr(diagnostics):
             emit_worker_diagnostics("create", make_jobs(single_config))

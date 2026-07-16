@@ -438,6 +438,14 @@ def showcase_measurement(
             result["artifact_digest"] = aggregate
         else:
             result["digest"] = aggregate
+    if benchmark in ("wos_vfsbench_create", "wos_vfsbench_rename"):
+        total_workers = min(32, total_work_units)
+        worker_base, worker_extra = divmod(total_workers, node_count)
+        result["total_workers"] = total_workers
+        for index, participant in enumerate(result["participants"]):
+            participant["workers"] = worker_base + (
+                1 if index < worker_extra else 0
+            )
     return result
 
 
@@ -1253,6 +1261,56 @@ def test_showcase_routing_participant_coverage_and_python_rows(comparator) -> No
             bad_compile_workspace,
             "invalid compile route evidence",
             required_workloads=("distributed-compilation",),
+        )
+
+        bad_metadata_total_workers = complete_matrix(
+            root / "bad-metadata-total-workers"
+        )
+        candidate = result_path_for(
+            bad_metadata_total_workers[-1], "wos-showcase"
+        )
+        payload = read_json(candidate)
+        measurement_for(payload, "wos_vfsbench_create")["total_workers"] = 31
+        write_json(candidate, payload)
+        expect_error(
+            comparator,
+            bad_metadata_total_workers,
+            "invalid fixed metadata worker evidence",
+            required_workloads=("file-create",),
+        )
+
+        bad_metadata_worker_sum = complete_matrix(root / "bad-metadata-worker-sum")
+        candidate = result_path_for(bad_metadata_worker_sum[-1], "wos-showcase")
+        payload = read_json(candidate)
+        rename = measurement_for(payload, "wos_vfsbench_rename")
+        for participant, workers in zip(
+            rename["participants"], (7, 8, 8, 8), strict=True
+        ):
+            participant["workers"] = workers
+        write_json(candidate, payload)
+        expect_error(
+            comparator,
+            bad_metadata_worker_sum,
+            "canonical fixed worker partition",
+            required_workloads=("file-rename",),
+        )
+
+        excessive_metadata_worker = complete_matrix(
+            root / "excessive-metadata-worker"
+        )
+        candidate = result_path_for(excessive_metadata_worker[-1], "wos-showcase")
+        payload = read_json(candidate)
+        create = measurement_for(payload, "wos_vfsbench_create")
+        for participant, workers in zip(
+            create["participants"], (9, 7, 8, 8), strict=True
+        ):
+            participant["workers"] = workers
+        write_json(candidate, payload)
+        expect_error(
+            comparator,
+            excessive_metadata_worker,
+            "invalid fixed metadata worker evidence",
+            required_workloads=("file-create",),
         )
 
         for benchmark, workload in (

@@ -190,6 +190,7 @@ SHOWCASE_METADATA_COUNTS = {
     "full": 256,
     "stress": 1000,
 }
+SHOWCASE_METADATA_MAX_WORKERS = 32
 JOB_MAP_WORK_ROOT_PREFIX = "/tmp/wos-showcase-fixed-"
 JOB_MAP_RUNTIME_PATHS = {
     "/root/wos-showcase",
@@ -263,7 +264,7 @@ SHOWCASE_METRICS = {
         "file-create",
         "file-create",
         "elapsed_seconds",
-        ("path", "iterations", "total_work_units"),
+        ("path", "iterations", "total_work_units", "total_workers"),
         "host-path",
         count_field="iterations",
         process_identity=True,
@@ -272,7 +273,7 @@ SHOWCASE_METRICS = {
         "file-rename",
         "file-rename",
         "elapsed_seconds",
-        ("path", "iterations", "total_work_units"),
+        ("path", "iterations", "total_work_units", "total_workers"),
         "host-path",
         count_field="iterations",
         process_identity=True,
@@ -1204,11 +1205,23 @@ def validate_showcase_participants(
             raise ComparisonError(
                 f"{manifest_path}: {benchmark} has invalid compile route evidence"
             )
-    elif benchmark in ("wos_vfsbench_create", "wos_vfsbench_rename"):
+    metadata_total_workers: int | None = None
+    if benchmark in ("wos_vfsbench_create", "wos_vfsbench_rename"):
         if payload.get("path") != "/tmp/wos-showcase-vfsbench":
             raise ComparisonError(
                 f"{manifest_path}: {benchmark} has invalid HOST path evidence"
             )
+        raw_total_workers = payload.get("total_workers")
+        expected_total_workers = min(SHOWCASE_METADATA_MAX_WORKERS, total_work_units)
+        if (
+            isinstance(raw_total_workers, bool)
+            or not isinstance(raw_total_workers, int)
+            or raw_total_workers != expected_total_workers
+        ):
+            raise ComparisonError(
+                f"{manifest_path}: {benchmark} has invalid fixed metadata worker evidence"
+            )
+        metadata_total_workers = raw_total_workers
     raw_participants = payload.get("participants")
     if not isinstance(raw_participants, list) or len(raw_participants) != len(
         expected_hosts
@@ -1219,6 +1232,7 @@ def validate_showcase_participants(
     actual_hosts: set[str] = set()
     assigned_work = 0
     work_by_host: dict[str, int] = {}
+    workers_by_host: dict[str, object] = {}
     for index, participant in enumerate(raw_participants):
         if not isinstance(participant, dict):
             raise ComparisonError(
@@ -1227,6 +1241,9 @@ def validate_showcase_participants(
         raw_host = participant.get("host")
         raw_runner = participant.get("runner_host")
         work_units = participant.get("work_units")
+        workers = (
+            participant.get("workers") if metadata_total_workers is not None else None
+        )
         if not isinstance(raw_host, str) or not isinstance(raw_runner, str):
             raise ComparisonError(
                 f"{manifest_path}: {benchmark} participant {index} has no host identity"
@@ -1249,6 +1266,8 @@ def validate_showcase_participants(
         actual_hosts.add(host)
         work_by_host[host] = work_units
         assigned_work += work_units
+        if metadata_total_workers is not None:
+            workers_by_host[host] = workers
     if actual_hosts != expected_hosts or assigned_work != total_work_units:
         raise ComparisonError(
             f"{manifest_path}: {benchmark} participant coverage/work does not match the fixed topology"
@@ -1262,6 +1281,34 @@ def validate_showcase_participants(
         raise ComparisonError(
             f"{manifest_path}: {benchmark} participants do not use the canonical fixed partition"
         )
+    if metadata_total_workers is not None:
+        assigned_workers = 0
+        for index, participant in enumerate(raw_participants):
+            workers = participant.get("workers")
+            work_units = participant["work_units"]
+            if (
+                isinstance(workers, bool)
+                or not isinstance(workers, int)
+                or not 1 <= workers <= work_units
+            ):
+                raise ComparisonError(
+                    f"{manifest_path}: {benchmark} participant {index} has invalid fixed metadata worker evidence"
+                )
+            assigned_workers += workers
+        worker_base, worker_extra = divmod(
+            metadata_total_workers, len(expected_hosts)
+        )
+        expected_workers_by_host = {
+            host: worker_base + (1 if index < worker_extra else 0)
+            for index, host in enumerate(sorted(expected_hosts))
+        }
+        if (
+            assigned_workers != metadata_total_workers
+            or workers_by_host != expected_workers_by_host
+        ):
+            raise ComparisonError(
+                f"{manifest_path}: {benchmark} participants do not use the canonical fixed worker partition"
+            )
     if spec.process_identity:
         for index, participant in enumerate(raw_participants):
             host = normalize_wos_hostname(participant["host"])

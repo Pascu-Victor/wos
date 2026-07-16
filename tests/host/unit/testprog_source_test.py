@@ -759,9 +759,9 @@ def test_vfsbench_metadata_timing_excludes_setup_and_cleanup() -> None:
             '"benchmark":"wos_vfsbench_rename"',
             "O_CREAT | O_EXCL | O_WRONLY",
             "PARSED > std::numeric_limits<uint32_t>::max()",
-            "paths_are_absent(source_paths)",
-            "bool const SOURCES_CLEAN = cleanup_paths(source_paths)",
-            "bool const DESTINATIONS_CLEAN = cleanup_paths(destination_paths)",
+            "enum class MetadataPathAction",
+            "MetadataPathAction::VERIFY_ABSENT",
+            "MetadataPathAction::VERIFY_EMPTY",
             "metadata-worker-ready-v1",
             "metadata-worker-done-v1 {}",
         ],
@@ -769,44 +769,95 @@ def test_vfsbench_metadata_timing_excludes_setup_and_cleanup() -> None:
     )
 
     create_body = function_body(source, "run_create")
-    require_order(create_body, "iteration_paths(", "uint64_t const STARTED_NS", "create path setup")
-    require_order(create_body, "uint64_t const STARTED_NS", "open(path.c_str()", "create timing start")
-    require_order(create_body, "uint64_t const ELAPSED_NS", "verify_empty_files(paths)", "create verification timing boundary")
+    require_order(create_body, "iteration_paths(", "MetadataPathAction::CLEANUP", "create path setup")
+    require_order(create_body, "MetadataPathAction::CLEANUP", "uint64_t const STARTED_NS", "create stale cleanup")
+    require_order(create_body, "uint64_t const STARTED_NS", "MetadataPathAction::CREATE", "create timing start")
+    require_order(
+        create_body,
+        "uint64_t const ELAPSED_NS",
+        "MetadataPathAction::VERIFY_EMPTY",
+        "create verification timing boundary",
+    )
     create_timed = create_body[
         create_body.index("uint64_t const STARTED_NS") : create_body.index("uint64_t const ELAPSED_NS")
     ]
-    if "unlink(" in create_timed or "stat(" in create_timed:
+    if "CLEANUP" in create_timed or "VERIFY" in create_timed:
         fail("VFS create timing must exclude verification and cleanup syscalls")
 
     rename_body = function_body(source, "run_rename")
-    require_order(rename_body, "for (const auto& path : source_paths)", "uint64_t const STARTED_NS", "rename setup")
-    require_order(rename_body, "uint64_t const STARTED_NS", "rename(source_paths.at(index)", "rename timing start")
+    require_order(rename_body, "MetadataPathAction::CREATE", "uint64_t const STARTED_NS", "rename setup")
+    require_order(rename_body, "uint64_t const STARTED_NS", "MetadataPathAction::RENAME", "rename timing start")
     require_order(
         rename_body,
         "uint64_t const ELAPSED_NS",
-        "verify_empty_files(destination_paths)",
+        "MetadataPathAction::VERIFY_EMPTY",
         "rename verification timing boundary",
     )
     rename_timed = rename_body[
         rename_body.index("uint64_t const STARTED_NS") : rename_body.index("uint64_t const ELAPSED_NS")
     ]
-    if "open(" in rename_timed or "unlink(" in rename_timed or "stat(" in rename_timed:
+    if "CREATE" in rename_timed or "CLEANUP" in rename_timed or "VERIFY" in rename_timed:
         fail("VFS rename timing must exclude fixture setup, verification, and cleanup syscalls")
+
+    range_body = function_body(source, "execute_metadata_path_range")
+    require_tokens(
+        range_body,
+        [
+            "PATH_COUNT / pool.worker_count",
+            "PATH_COUNT % pool.worker_count",
+            "std::min(static_cast<size_t>(worker_index), EXTRA)",
+            "for (size_t index = BEGIN; index < BEGIN + COUNT; ++index)",
+            "apply_metadata_path_action(pool, index)",
+        ],
+        "deterministic disjoint metadata path partition",
+    )
+    initialize_body = function_body(source, "initialize_metadata_path_workers")
+    require_tokens(
+        initialize_body,
+        [
+            "worker_count - 1",
+            "arg.worker_index = static_cast<uint32_t>(created + 1)",
+            "thrd_create(&pool.threads.at(created), metadata_path_worker_main, &arg)",
+            "while (pool.started != BACKGROUND_COUNT)",
+            "pool.initialized = true",
+        ],
+        "persistent metadata path pool startup",
+    )
+    action_body = function_body(source, "run_metadata_path_action")
+    require_tokens(
+        action_body,
+        [
+            "pool.worker_count > primary_paths.size()",
+            "++pool.generation",
+            "execute_metadata_path_range(pool, 0)",
+            "while (pool.completed != pool.threads.size())",
+            "success = arg.success && success",
+        ],
+        "caller-participating fixed metadata pool",
+    )
 
     worker_body = function_body(source, "run_metadata_worker")
     require_tokens(
         worker_body,
         [
             "parse_metadata_worker_options(argc, argv, &options)",
+            "initialize_metadata_path_workers(workers, options.workers)",
             'std::println("metadata-worker-ready-v1")',
             "std::fflush(stdout)",
             "std::fgets(command.data(), static_cast<int>(command.size()), stdin)",
             'std::strcmp(command.data(), "create") == 0',
             'std::strcmp(command.data(), "rename") == 0',
-            "run_metadata_worker_operation(command.data(), path, options.iterations)",
+            "run_metadata_worker_operation(command.data(), path, options.iterations, workers)",
+            "stop_metadata_path_workers(workers)",
             "std::ferror(stdin)",
         ],
         "persistent VFS metadata worker",
+    )
+    require_order(
+        worker_body,
+        "initialize_metadata_path_workers(workers, options.workers)",
+        'std::println("metadata-worker-ready-v1")',
+        "persistent metadata pool starts before readiness",
     )
     require_order(
         worker_body,
@@ -818,9 +869,9 @@ def test_vfsbench_metadata_timing_excludes_setup_and_cleanup() -> None:
     require_tokens(
         operation_body,
         [
-            "MetadataOptions const OPTIONS{.path = path, .iterations = iterations}",
-            "run_create(OPTIONS)",
-            "run_rename(OPTIONS)",
+            "MetadataOptions const OPTIONS{.path = path, .iterations = iterations, .workers = workers.worker_count}",
+            "run_create(OPTIONS, workers)",
+            "run_rename(OPTIONS, workers)",
             'std::println("metadata-worker-done-v1 {}", operation)',
             "std::fflush(stdout)",
         ],
@@ -866,8 +917,9 @@ def test_vfsbench_metadata_timing_excludes_setup_and_cleanup() -> None:
             '*(f"-{path}" for path in LOCAL_RUNTIME_PATHS)',
             'READY_RECORD = "metadata-worker-ready-v1"',
             'DONE_RECORD_PREFIX = "metadata-worker-done-v1"',
+            "MAX_TOTAL_WORKERS = 32",
             "exec /usr/bin/testprog vfsbench-metadata-worker",
-            '--create-path "$1" --rename-path "$2" --iterations "$3"',
+            '--create-path "$1" --rename-path "$2" --iterations "$3" --workers "$4"',
             "stdin=subprocess.PIPE",
             "wait_for_ready_workers(",
             "for operation in config.operations:",
@@ -875,15 +927,22 @@ def test_vfsbench_metadata_timing_excludes_setup_and_cleanup() -> None:
             'print(json.dumps(payload, separators=(",", ":"), sort_keys=True))',
             '"spawner_host": worker_evidence.spawner_host',
             '"remote_pid": worker_evidence.remote_pid',
+            '"workers": job.workers',
             '"placement": "local-baseline" if len(jobs) == 1 else "strict-on"',
             '"wki_route": "host-path"',
             '"total_work_units": config.total_work_units',
+            '"total_workers": sum(job.workers for job in jobs)',
+            "total_workers = min(MAX_TOTAL_WORKERS, config.total_work_units)",
+            "worker_quotient, worker_remainder = divmod(total_workers, host_count)",
+            "if not 1 <= workers <= work_units",
             "GRACEFUL_SHUTDOWN_FRACTION = 0.1",
             "GRACEFUL_SHUTDOWN_MAX_SECONDS = 10.0",
             "def graceful_shutdown_seconds(timeout_seconds: float)",
             "shutdown_seconds = graceful_shutdown_seconds(timeout_seconds)",
             "stop_worker_pool(runtimes, config.timeout_seconds, signal_guard)",
             "assert_worker_shell_execs_worker(Path(directory))",
+            "expected_worker_splits",
+            "reported_workers=job.workers + 1",
             "shutdown_sleep_seconds=1.2",
         ],
         "fixed-total WKI metadata coordinator",
