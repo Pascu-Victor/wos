@@ -1891,7 +1891,7 @@ def test_receiver_vfs_ref_submit_uses_bounded_worker_pool() -> None:
         peer,
         [
             "class PeerLifecycleGuard",
-            "disconnect_cleanup_in_progress.compare_exchange_strong",
+            "lifecycle_state.compare_exchange_strong",
             "PeerLifecycleGuard lifecycle",
             "lifecycle.try_acquire(peer)",
             "lifecycle.acquire(peer)",
@@ -1908,11 +1908,16 @@ def test_receiver_vfs_ref_submit_uses_bounded_worker_pool() -> None:
         [
             "class PeerLifecycleTryLease",
             "message_uses_rx_peer_lifecycle(msg, payload, PAYLOAD_LEN)",
-            "peer_lifecycle.try_acquire(hdr->src_node)",
+            "peer_lifecycle.try_acquire(hdr->src_node, SHARED_RX_LIFECYCLE)",
             "message_uses_rx_peer_lifecycle(RO_MSG, ch->reorder_head->data, ch->reorder_head->len)",
-            "!peer_lifecycle.owns(hdr->src_node)",
+            "!peer_lifecycle.owns(hdr->src_node, RO_SHARED_RX_LIFECYCLE)",
         ],
         "TASK message admission serialized with peer cleanup",
+    )
+    require_tokens(
+        function_body(wki, "message_allows_shared_rx_peer_lifecycle"),
+        ["channel_id == WKI_CHAN_IPC_DATA", "dev_op_uses_ipc_lifecycle(type, payload, payload_len)"],
+        "shared lifecycle admission is restricted to ordered IPC data",
     )
     lifecycle_body = function_body(wki, "message_uses_compute_lifecycle")
     require_tokens(

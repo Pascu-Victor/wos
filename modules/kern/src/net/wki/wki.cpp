@@ -323,6 +323,14 @@ auto message_uses_rx_peer_lifecycle(MsgType type, const uint8_t* payload, uint16
            message_uses_device_session_lifecycle(type, payload, payload_len);
 }
 
+auto message_allows_shared_rx_peer_lifecycle(uint16_t channel_id, MsgType type, const uint8_t* payload, uint16_t payload_len) -> bool {
+    // IPC_DATA has an explicit sequence dispatch turn below. Its DEV_OP
+    // handlers may therefore share the teardown admission lease without
+    // weakening per-stream order. Other lifecycle-sensitive channels retain
+    // their existing exclusive handler serialization.
+    return channel_id == WKI_CHAN_IPC_DATA && dev_op_uses_ipc_lifecycle(type, payload, payload_len);
+}
+
 auto message_is_epoch_reset_sensitive(MsgType type) -> bool {
     switch (type) {
         case MsgType::DEV_ATTACH_REQ:
@@ -411,24 +419,35 @@ class PeerLifecycleTryLease {
     PeerLifecycleTryLease(const PeerLifecycleTryLease&) = delete;
     auto operator=(const PeerLifecycleTryLease&) -> PeerLifecycleTryLease& = delete;
 
-    ~PeerLifecycleTryLease() { wki_peer_lifecycle_release(claimed_peer); }
+    ~PeerLifecycleTryLease() {
+        if (shared_rx) {
+            wki_peer_lifecycle_rx_release(claimed_peer);
+        } else {
+            wki_peer_lifecycle_release(claimed_peer);
+        }
+    }
 
-    auto try_acquire(uint16_t node_id) -> bool {
+    auto try_acquire(uint16_t node_id, bool shared) -> bool {
         if (claimed_peer != nullptr) {
             return false;
         }
         WkiPeer* peer = wki_peer_find(node_id);
-        if (!wki_peer_lifecycle_try_acquire(peer)) {
+        bool const ACQUIRED = shared ? wki_peer_lifecycle_rx_try_acquire(peer) : wki_peer_lifecycle_try_acquire(peer);
+        if (!ACQUIRED) {
             return false;
         }
         claimed_peer = peer;
+        shared_rx = shared;
         return true;
     }
 
-    [[nodiscard]] auto owns(uint16_t node_id) const -> bool { return claimed_peer != nullptr && claimed_peer->node_id == node_id; }
+    [[nodiscard]] auto owns(uint16_t node_id, bool shared) const -> bool {
+        return claimed_peer != nullptr && claimed_peer->node_id == node_id && (shared || !shared_rx);
+    }
 
    private:
     WkiPeer* claimed_peer = nullptr;
+    bool shared_rx = false;
 };
 
 void perf_record_transport_point(mod::perf::WkiPerfTransportOp op, uint16_t peer, uint16_t channel, int32_t status, uint32_t aux,
@@ -2926,11 +2945,14 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
     // DEV_OP uses exact channel generations and retained object references;
     // the epoch-reset flag below rejects those operations during cleanup
     // without serializing their normal fast path through the peer gate.
-    // RX cannot wait here, so contention drops the reliable frame before ACK
-    // advancement for retry. Deferred COMPLETE/CANCEL reacquires the lifecycle
-    // gate in its task-context worker.
+    // RX cannot wait here. Shared admission lets parallel transport queues
+    // process one peer concurrently, while an exclusive teardown owner closes
+    // admission and drains existing readers before changing session state.
+    // Deferred COMPLETE/CANCEL reacquires the exclusive lifecycle gate in its
+    // task-context worker before final publication.
     PeerLifecycleTryLease peer_lifecycle;
-    if (message_uses_rx_peer_lifecycle(msg, payload, PAYLOAD_LEN) && !peer_lifecycle.try_acquire(hdr->src_node)) {
+    bool const SHARED_RX_LIFECYCLE = message_allows_shared_rx_peer_lifecycle(hdr->channel_id, msg, payload, PAYLOAD_LEN);
+    if (message_uses_rx_peer_lifecycle(msg, payload, PAYLOAD_LEN) && !peer_lifecycle.try_acquire(hdr->src_node, SHARED_RX_LIFECYCLE)) {
         return;
     }
     VfsExportRxAdmissionLease vfs_export_admission;
@@ -3264,8 +3286,11 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
                     // the session gate before consuming it. Deferred
                     // COMPLETE/CANCEL admission only needs the channel and
                     // fixed queue locks here.
+                    bool const RO_SHARED_RX_LIFECYCLE =
+                        message_allows_shared_rx_peer_lifecycle(ch->channel_id, RO_MSG, ch->reorder_head->data, ch->reorder_head->len);
                     if (message_uses_rx_peer_lifecycle(RO_MSG, ch->reorder_head->data, ch->reorder_head->len) &&
-                        !peer_lifecycle.owns(hdr->src_node) && !peer_lifecycle.try_acquire(hdr->src_node)) {
+                        !peer_lifecycle.owns(hdr->src_node, RO_SHARED_RX_LIFECYCLE) &&
+                        !peer_lifecycle.try_acquire(hdr->src_node, RO_SHARED_RX_LIFECYCLE)) {
                         break;
                     }
                     if (epoch_reset_blocks_message(hdr->src_node, RO_MSG)) {

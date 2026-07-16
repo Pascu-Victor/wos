@@ -44,20 +44,35 @@ namespace ker::net::wki {
 
 using log = ker::mod::dbg::logger<"wki">;
 
+namespace {
+constexpr uint32_t WKI_PEER_LIFECYCLE_WRITER = uint32_t{1} << 31U;
+constexpr uint32_t WKI_PEER_LIFECYCLE_READERS = WKI_PEER_LIFECYCLE_WRITER - 1U;
+}  // namespace
+
 auto wki_peer_lifecycle_try_acquire(WkiPeer* peer) -> bool {
     if (peer == nullptr) {
         return false;
     }
-    bool expected = false;
-    return peer->disconnect_cleanup_in_progress.compare_exchange_strong(expected, true, std::memory_order_acq_rel,
-                                                                        std::memory_order_acquire);
+    uint32_t expected = 0;
+    return peer->lifecycle_state.compare_exchange_strong(expected, WKI_PEER_LIFECYCLE_WRITER, std::memory_order_acq_rel,
+                                                         std::memory_order_acquire);
 }
 
 auto wki_peer_lifecycle_acquire(WkiPeer* peer) -> bool {
     if (peer == nullptr) {
         return false;
     }
-    while (!wki_peer_lifecycle_try_acquire(peer)) {
+    uint32_t observed = peer->lifecycle_state.load(std::memory_order_acquire);
+    for (;;) {
+        if ((observed & WKI_PEER_LIFECYCLE_WRITER) == 0 &&
+            peer->lifecycle_state.compare_exchange_weak(observed, observed | WKI_PEER_LIFECYCLE_WRITER, std::memory_order_acq_rel,
+                                                        std::memory_order_acquire)) {
+            break;
+        }
+        ker::mod::sched::kern_yield();
+        observed = peer->lifecycle_state.load(std::memory_order_acquire);
+    }
+    while ((peer->lifecycle_state.load(std::memory_order_acquire) & WKI_PEER_LIFECYCLE_READERS) != 0) {
         ker::mod::sched::kern_yield();
     }
     return true;
@@ -65,7 +80,27 @@ auto wki_peer_lifecycle_acquire(WkiPeer* peer) -> bool {
 
 void wki_peer_lifecycle_release(WkiPeer* peer) {
     if (peer != nullptr) {
-        peer->disconnect_cleanup_in_progress.store(false, std::memory_order_release);
+        peer->lifecycle_state.store(0, std::memory_order_release);
+    }
+}
+
+auto wki_peer_lifecycle_rx_try_acquire(WkiPeer* peer) -> bool {
+    if (peer == nullptr) {
+        return false;
+    }
+
+    uint32_t observed = peer->lifecycle_state.load(std::memory_order_acquire);
+    while ((observed & WKI_PEER_LIFECYCLE_WRITER) == 0 && (observed & WKI_PEER_LIFECYCLE_READERS) != WKI_PEER_LIFECYCLE_READERS) {
+        if (peer->lifecycle_state.compare_exchange_weak(observed, observed + 1U, std::memory_order_acq_rel, std::memory_order_acquire)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void wki_peer_lifecycle_rx_release(WkiPeer* peer) {
+    if (peer != nullptr) {
+        peer->lifecycle_state.fetch_sub(1, std::memory_order_release);
     }
 }
 

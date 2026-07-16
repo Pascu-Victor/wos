@@ -12,6 +12,7 @@ constexpr uint64_t DEFAULT_TIMEOUT_US = static_cast<uint64_t>(WKI_DEFAULT_HEARTB
 constexpr uint64_t DEFAULT_CONFIRM_GRACE_US = static_cast<uint64_t>(WKI_PEER_FENCE_CONFIRM_GRACE_MS) * 1000;
 constexpr uint64_t DEFAULT_STARTUP_GRACE_US = static_cast<uint64_t>(WKI_PEER_GRACE_PERIOD_MS) * 1000;
 constexpr uint64_t DEFAULT_FENCE_CONFIRMATION_WINDOW_US = DEFAULT_CONFIRM_GRACE_US * WKI_PEER_FENCE_PROBE_ROUNDS;
+constexpr uint32_t WKI_PEER_LIFECYCLE_TEST_WRITER = uint32_t{1} << 31U;
 
 void init_connected_direct_peer(WkiPeer& peer) {
     peer.node_id = 0x1234;
@@ -204,6 +205,61 @@ KTEST(WkiPeerRxFence, ReliableRxAcceptsOnlyConnectedPeers) {
     KEXPECT_TRUE(ker::net::wki::wki_selftest_reliable_rx_peer_state_accepts(ker::net::wki::PeerState::CONNECTED));
     KEXPECT_FALSE(ker::net::wki::wki_selftest_reliable_rx_peer_state_accepts(ker::net::wki::PeerState::FENCED));
     KEXPECT_FALSE(ker::net::wki::wki_selftest_reliable_rx_peer_state_accepts(ker::net::wki::PeerState::RECONNECTING));
+}
+
+KTEST(WkiPeerLifecycle, ParallelRxReadersRemainExclusiveWithTeardown) {
+    ker::net::wki::WkiPeer peer{};
+
+    KEXPECT_TRUE(ker::net::wki::wki_peer_lifecycle_rx_try_acquire(&peer));
+    KEXPECT_TRUE(ker::net::wki::wki_peer_lifecycle_rx_try_acquire(&peer));
+    KEXPECT_EQ(peer.lifecycle_state.load(std::memory_order_acquire), 2U);
+    KEXPECT_FALSE(ker::net::wki::wki_peer_lifecycle_try_acquire(&peer));
+    KEXPECT_EQ(peer.lifecycle_state.load(std::memory_order_acquire), 2U);
+
+    ker::net::wki::wki_peer_lifecycle_rx_release(&peer);
+    KEXPECT_FALSE(ker::net::wki::wki_peer_lifecycle_try_acquire(&peer));
+    ker::net::wki::wki_peer_lifecycle_rx_release(&peer);
+
+    KEXPECT_TRUE(ker::net::wki::wki_peer_lifecycle_try_acquire(&peer));
+    KEXPECT_FALSE(ker::net::wki::wki_peer_lifecycle_rx_try_acquire(&peer));
+    KEXPECT_NE(peer.lifecycle_state.load(std::memory_order_acquire), 0U);
+    ker::net::wki::wki_peer_lifecycle_release(&peer);
+
+    KEXPECT_TRUE(ker::net::wki::wki_peer_lifecycle_rx_try_acquire(&peer));
+    ker::net::wki::wki_peer_lifecycle_rx_release(&peer);
+}
+
+KTEST(WkiPeerLifecycle, WriterIntentSurvivesAdmittedReaderDrain) {
+    ker::net::wki::WkiPeer peer{};
+
+    // Boot KTEST runs before the scheduler starts and parks secondary CPUs, so
+    // model the exact state immediately after the blocking writer atomically
+    // publishes intent over two already-admitted readers. This deterministically
+    // exercises the drain side without a timing race or a boot-time yield loop.
+    peer.lifecycle_state.store(WKI_PEER_LIFECYCLE_TEST_WRITER | 2U, std::memory_order_release);
+
+    KEXPECT_FALSE(ker::net::wki::wki_peer_lifecycle_rx_try_acquire(&peer));
+    KEXPECT_EQ(peer.lifecycle_state.load(std::memory_order_acquire), WKI_PEER_LIFECYCLE_TEST_WRITER | 2U);
+
+    ker::net::wki::wki_peer_lifecycle_rx_release(&peer);
+    KEXPECT_EQ(peer.lifecycle_state.load(std::memory_order_acquire), WKI_PEER_LIFECYCLE_TEST_WRITER | 1U);
+    KEXPECT_FALSE(ker::net::wki::wki_peer_lifecycle_rx_try_acquire(&peer));
+    KEXPECT_EQ(peer.lifecycle_state.load(std::memory_order_acquire), WKI_PEER_LIFECYCLE_TEST_WRITER | 1U);
+
+    ker::net::wki::wki_peer_lifecycle_rx_release(&peer);
+    KEXPECT_EQ(peer.lifecycle_state.load(std::memory_order_acquire), WKI_PEER_LIFECYCLE_TEST_WRITER);
+    KEXPECT_FALSE(ker::net::wki::wki_peer_lifecycle_rx_try_acquire(&peer));
+    KEXPECT_EQ(peer.lifecycle_state.load(std::memory_order_acquire), WKI_PEER_LIFECYCLE_TEST_WRITER);
+
+    ker::net::wki::wki_peer_lifecycle_release(&peer);
+    KEXPECT_EQ(peer.lifecycle_state.load(std::memory_order_acquire), 0U);
+
+    // The blocking acquisition path is safe to exercise once no readers are
+    // present: it must publish writer intent and release it exactly.
+    KEXPECT_TRUE(ker::net::wki::wki_peer_lifecycle_acquire(&peer));
+    KEXPECT_EQ(peer.lifecycle_state.load(std::memory_order_acquire), WKI_PEER_LIFECYCLE_TEST_WRITER);
+    ker::net::wki::wki_peer_lifecycle_release(&peer);
+    KEXPECT_EQ(peer.lifecycle_state.load(std::memory_order_acquire), 0U);
 }
 
 KTEST(WkiPeerHandshake, HelloAckReconnectsFencedPeerState) { KEXPECT_TRUE(ker::net::wki::wki_peer_selftest_hello_ack_state_transition()); }

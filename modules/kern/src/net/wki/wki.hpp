@@ -216,9 +216,10 @@ struct WkiPeer {
     uint32_t local_channel_epoch = 0;
     uint32_t remote_channel_epoch = 0;
     uint32_t remote_boot_epoch = 0;
-    // Serializes peer/channel teardown with the final scheduler publication
-    // of receiver-side remote compute work.
-    std::atomic<bool> disconnect_cleanup_in_progress{false};
+    // Packed lifecycle admission: the high bit is exclusive writer intent and
+    // the low bits count admitted RX readers. A single atomic modification
+    // order prevents teardown and a new RX handler from both entering.
+    std::atomic<uint32_t> lifecycle_state{0};
     // HELLO RX retires exact channel/session state synchronously, then asks the
     // task-context timer worker to terminalize work bound to that retired
     // generation.
@@ -502,6 +503,10 @@ auto wki_peer_capability_negotiated(uint16_t peer_node, uint16_t capabilities) -
 auto wki_peer_lifecycle_try_acquire(WkiPeer* peer) -> bool;
 auto wki_peer_lifecycle_acquire(WkiPeer* peer) -> bool;
 void wki_peer_lifecycle_release(WkiPeer* peer);
+// Shared non-blocking admission for lifecycle-sensitive RX handlers. New RX
+// readers fail while an exclusive owner is pending or active.
+auto wki_peer_lifecycle_rx_try_acquire(WkiPeer* peer) -> bool;
+void wki_peer_lifecycle_rx_release(WkiPeer* peer);
 
 // -----------------------------------------------------------------------------
 // Public API - Sending
