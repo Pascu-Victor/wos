@@ -51,6 +51,7 @@ WORKLOAD_PHASES = (
     "python-sha256",
     "python-json",
 )
+GIT_PHASES = frozenset(("git-clone", "git-checkout"))
 HOST_WORKSPACE_PHASES = frozenset(("file-move", "git-clone", "git-checkout"))
 CONTROLLER_PROFILES = ("local-runtime", "host-workspace")
 FIXTURE_ID = "wos-showcase-git-fixture-v1"
@@ -701,6 +702,90 @@ def git_output(
     ).strip()
 
 
+def git_checkout_command(
+    git: str, destination: Path, commit: str, *, force: bool
+) -> tuple[str, ...]:
+    if OID_RE.fullmatch(commit) is None:
+        raise WorkloadError("Git checkout requires an exact SHA-1 commit")
+    force_arguments = ("--force",) if force else ()
+    return (
+        git,
+        *GIT_FIXED_CONFIG,
+        "-C",
+        str(destination),
+        "checkout",
+        "--quiet",
+        *force_arguments,
+        "--detach",
+        commit,
+    )
+
+
+def validate_force_checkout_destination(
+    destination: Path,
+    git: str,
+    timeout_seconds: float,
+    *,
+    context: str,
+) -> None:
+    git_directory = destination / ".git"
+    try:
+        if (
+            destination.is_symlink()
+            or not destination.is_dir()
+            or git_directory.is_symlink()
+            or not git_directory.is_dir()
+        ):
+            raise WorkloadError(f"{context} is not an ordinary cloned worktree")
+        visible = sorted(
+            path.name for path in destination.iterdir() if path.name != ".git"
+        )
+    except WorkloadError:
+        raise
+    except OSError as exc:
+        raise WorkloadError(f"cannot inspect {context}: {exc}") from exc
+    if visible:
+        raise WorkloadError(
+            f"{context} is not empty before forced checkout: {', '.join(visible)}"
+        )
+
+    index_path = git_directory / "index"
+    try:
+        if index_path.is_symlink():
+            raise WorkloadError(f"{context} has a symlinked Git index")
+        index_exists = index_path.exists()
+        if index_exists and not index_path.is_file():
+            raise WorkloadError(f"{context} has a non-file Git index")
+    except WorkloadError:
+        raise
+    except OSError as exc:
+        raise WorkloadError(f"cannot inspect {context} index: {exc}") from exc
+    if index_exists:
+        tracked = git_output(
+            git,
+            ("-C", str(destination), "ls-files", "--cached"),
+            timeout_seconds=timeout_seconds,
+            context=f"validate empty index for {context}",
+        )
+        if tracked:
+            raise WorkloadError(f"{context} has a non-empty Git index")
+
+
+def validate_force_checkout_preconditions(
+    work_root: Path,
+    git: str,
+    timeout_seconds: float,
+    total_jobs: int = TOTAL_JOBS,
+) -> None:
+    for job_id in range(total_jobs):
+        validate_force_checkout_destination(
+            job_destination(work_root, job_id),
+            git,
+            timeout_seconds,
+            context=f"checkout job {job_id}",
+        )
+
+
 def pin_repository_pack_threads(
     root: Path, git: str, timeout_seconds: float, *, bare: bool
 ) -> None:
@@ -891,15 +976,17 @@ def file_move_destination(work_root: Path, job_id: int) -> Path:
     return work_root / FILE_MOVE_DESTINATION_RELATIVE_PATH / f"file-{job_id:03d}.bin"
 
 
-def run_job(args: argparse.Namespace) -> dict[str, Any]:
+def execute_job(
+    args: argparse.Namespace,
+    identity: dict[str, Any],
+    route_evidence: dict[str, Any],
+) -> dict[str, Any]:
     os.chdir(args.work_root)
-    identity = read_proc_identity()
-    validate_identity(identity, args.target_host, args.launcher_host)
     result: dict[str, Any] = {
         "phase": args.phase,
         "job_id": args.job_id,
         **identity,
-        **inherited_route_evidence(args.phase, args.work_root),
+        **route_evidence,
     }
     env = deterministic_environment()
     if args.phase == "file-move":
@@ -942,15 +1029,11 @@ def run_job(args: argparse.Namespace) -> dict[str, Any]:
     elif args.phase == "git-checkout":
         destination = job_destination(Path(args.work_root), args.job_id)
         run_checked(
-            (
+            git_checkout_command(
                 WOS_GIT,
-                *GIT_FIXED_CONFIG,
-                "-C",
-                str(destination),
-                "checkout",
-                "--quiet",
-                "--detach",
+                destination,
                 args.commit,
+                force=bool(getattr(args, "force_checkout", False)),
             ),
             timeout_seconds=args.timeout_seconds,
             env=env,
@@ -965,6 +1048,16 @@ def run_job(args: argparse.Namespace) -> dict[str, Any]:
     else:
         raise WorkloadError(f"unknown job phase: {args.phase}")
     return result
+
+
+def run_job(args: argparse.Namespace) -> dict[str, Any]:
+    identity = read_proc_identity()
+    validate_identity(identity, args.target_host, args.launcher_host)
+    return execute_job(
+        args,
+        identity,
+        inherited_route_evidence(args.phase, args.work_root),
+    )
 
 
 def inner_job_command(args: argparse.Namespace, job_id: int) -> list[str]:
@@ -1062,16 +1155,18 @@ def run_git_prewarm(args: argparse.Namespace) -> dict[str, Any]:
             env=env,
             context=f"Git clone runtime prewarm on {args.target_host}",
         )
+        validate_force_checkout_destination(
+            destination,
+            WOS_GIT,
+            args.timeout_seconds,
+            context=f"Git runtime prewarm on {args.target_host}",
+        )
         run_checked(
-            (
+            git_checkout_command(
                 WOS_GIT,
-                *GIT_FIXED_CONFIG,
-                "-C",
-                str(destination),
-                "checkout",
-                "--quiet",
-                "--detach",
+                destination,
                 args.commit,
+                force=True,
             ),
             timeout_seconds=args.timeout_seconds,
             env=env,
@@ -1127,6 +1222,13 @@ def request_nonnegative_int(request: dict[str, Any], field: str) -> int:
     return value
 
 
+def request_boolean(request: dict[str, Any], field: str) -> bool:
+    value = request.get(field)
+    if not isinstance(value, bool):
+        raise WorkloadError(f"controller request has invalid {field}")
+    return value
+
+
 def request_positive_timeout(request: dict[str, Any]) -> float:
     value = request.get("timeout_seconds")
     if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -1159,45 +1261,101 @@ def controller_request_args(
         commit=request_string(request, "commit", allow_empty=True),
         rounds=request_positive_int(request, "rounds"),
         file_bytes=request_nonnegative_int(request, "file_bytes"),
+        force_checkout=request_boolean(request, "force_checkout"),
         timeout_seconds=request_positive_timeout(request),
     )
     validate_worker_arguments(worker_args)
+    if worker_args.force_checkout != (phase == "git-checkout"):
+        raise WorkloadError(
+            "controller request has invalid forced-checkout authorization"
+        )
     return worker_args
 
 
-def run_controller(args: argparse.Namespace) -> int:
-    identity = read_proc_identity()
-    validate_identity(identity, args.target_host, args.launcher_host)
+def git_job_worker_command(args: argparse.Namespace, job_id: int) -> list[str]:
+    return [
+        WOS_PYTHON,
+        WOS_HELPER,
+        "git-job-worker",
+        "--target-host",
+        args.target_host,
+        "--launcher-host",
+        args.launcher_host,
+        "--job-id",
+        str(job_id),
+        "--work-root",
+        args.work_root,
+        "--work-root-owner",
+        args.work_root_owner,
+        "--timeout-seconds",
+        str(child_timeout_seconds(args.timeout_seconds)),
+    ]
+
+
+def git_worker_request_args(
+    args: argparse.Namespace, request: dict[str, Any]
+) -> argparse.Namespace:
+    phase = request_string(request, "phase")
+    if phase not in GIT_PHASES:
+        raise WorkloadError(f"Git job worker cannot execute phase {phase!r}")
+    worker_args = argparse.Namespace(
+        mode="job",
+        phase=phase,
+        target_host=args.target_host,
+        launcher_host=args.launcher_host,
+        job_id=args.job_id,
+        work_root=args.work_root,
+        repository_uri=request_string(
+            request, "repository_uri", allow_empty=True
+        ),
+        commit=request_string(request, "commit", allow_empty=True),
+        rounds=request_positive_int(request, "rounds"),
+        file_bytes=request_nonnegative_int(request, "file_bytes"),
+        force_checkout=request_boolean(request, "force_checkout"),
+        timeout_seconds=request_positive_timeout(request),
+    )
+    validate_worker_arguments(worker_args)
+    if worker_args.force_checkout != (phase == "git-checkout"):
+        raise WorkloadError(
+            "Git worker request has invalid forced-checkout authorization"
+        )
+    return worker_args
+
+
+def run_git_job_worker(args: argparse.Namespace) -> int:
     work_root = Path(args.work_root)
     verify_work_root_owner(work_root, args.work_root_owner)
     os.chdir(work_root)
-    routed_work_root = str(work_root) if args.profile == "host-workspace" else None
-    routes = verify_routes(routed_work_root, args.timeout_seconds)
+    identity = {
+        **read_proc_identity(),
+        "process_pid": os.getpid(),
+    }
+    validate_identity(identity, args.target_host, args.launcher_host)
+    routes = verify_routes(str(work_root), args.timeout_seconds)
     print(
         compact_json(
             {
                 "status": "ready",
-                "profile": args.profile,
                 "target_host": args.target_host,
-                "job_start": args.job_start,
-                "job_count": args.job_count,
+                "job_id": args.job_id,
                 **identity,
                 **routes,
             }
         ),
         flush=True,
     )
+    completed_phase: str | None = None
     for line in sys.stdin:
         request_id: int | None = None
         try:
-            request = parse_json_object(line.strip(), "controller request")
+            request = parse_json_object(line.strip(), "Git worker request")
             raw_request_id = request.get("request_id")
             if (
                 isinstance(raw_request_id, bool)
                 or not isinstance(raw_request_id, int)
                 or raw_request_id <= 0
             ):
-                raise WorkloadError("controller request has invalid request_id")
+                raise WorkloadError("Git worker request has invalid request_id")
             request_id = raw_request_id
             action = request_string(request, "action")
             if action == "shutdown":
@@ -1206,38 +1364,30 @@ def run_controller(args: argparse.Namespace) -> int:
                         {
                             "status": "ok",
                             "request_id": request_id,
-                            "result": {"stopped": True},
+                            "result": {
+                                "stopped": True,
+                                "job_id": args.job_id,
+                                "process_pid": identity["process_pid"],
+                            },
                         }
                     ),
                     flush=True,
                 )
                 return 0
-            if action == "phase":
-                result = run_host_worker(controller_request_args(args, request))
-            elif action == "git-prewarm":
-                if args.profile != "host-workspace":
+            if action != "phase":
+                raise WorkloadError(f"unknown Git worker action: {action}")
+            worker_args = git_worker_request_args(args, request)
+            if worker_args.phase == "git-clone":
+                if completed_phase is not None:
                     raise WorkloadError(
-                        "Git runtime prewarm requires a HOST-workspace controller"
+                        f"Git job {args.job_id} received duplicate clone dispatch"
                     )
-                prewarm_args = argparse.Namespace(
-                    target_host=args.target_host,
-                    launcher_host=args.launcher_host,
-                    job_start=args.job_start,
-                    work_root=args.work_root,
-                    repository_uri=request_string(request, "repository_uri"),
-                    commit=request_string(request, "commit"),
-                    timeout_seconds=request_positive_timeout(request),
+            elif completed_phase != "git-clone":
+                raise WorkloadError(
+                    f"Git job {args.job_id} received checkout before clone"
                 )
-                if (
-                    not prewarm_args.repository_uri.startswith("file://")
-                    or OID_RE.fullmatch(prewarm_args.commit) is None
-                ):
-                    raise WorkloadError(
-                        "Git runtime prewarm requires the fixed repository and commit"
-                    )
-                result = run_git_prewarm(prewarm_args)
-            else:
-                raise WorkloadError(f"unknown controller action: {action}")
+            result = execute_job(worker_args, identity, routes)
+            completed_phase = worker_args.phase
             print(
                 compact_json(
                     {
@@ -1260,7 +1410,444 @@ def run_controller(args: argparse.Namespace) -> int:
                 flush=True,
             )
             return 1
-    raise WorkloadError("controller command pipe closed without shutdown")
+    raise WorkloadError("Git worker command pipe closed without shutdown")
+
+
+class GitJobWorkerClient:
+    def __init__(self, job_id: int, process: subprocess.Popen[str]) -> None:
+        self.job_id = job_id
+        self.process = process
+        self.readiness: dict[str, Any] | None = None
+
+
+class GitJobWorkerPool:
+    def __init__(
+        self, args: argparse.Namespace, controller_identity: dict[str, Any]
+    ) -> None:
+        self.args = args
+        self.controller_identity = controller_identity
+        self.clients: list[GitJobWorkerClient] = []
+        self.next_request_id = 1
+        self.completed_phase: str | None = None
+        self.ready = False
+
+    @staticmethod
+    def worker_diagnostic(client: GitJobWorkerClient) -> str:
+        process = client.process
+        if process.poll() is None or process.stderr is None:
+            return ""
+        try:
+            return summarize_output(process.stderr.read())
+        except OSError:
+            return ""
+
+    def read_responses(
+        self,
+        clients: Sequence[GitJobWorkerClient],
+        timeout_seconds: float,
+        context: str,
+    ) -> list[dict[str, Any]]:
+        selector = selectors.DefaultSelector()
+        pending = set(range(len(clients)))
+        responses: dict[int, dict[str, Any]] = {}
+        try:
+            for index, client in enumerate(clients):
+                if client.process.stdout is None:
+                    raise WorkloadError(
+                        f"{context} Git worker {client.job_id} has no response pipe"
+                    )
+                selector.register(client.process.stdout, selectors.EVENT_READ, index)
+            deadline = time.monotonic() + timeout_seconds
+            while pending:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise WorkloadError(
+                        f"{context} Git workers exceeded {timeout_seconds:g} seconds"
+                    )
+                events = selector.select(remaining)
+                if not events:
+                    raise WorkloadError(
+                        f"{context} Git workers exceeded {timeout_seconds:g} seconds"
+                    )
+                for key, _mask in events:
+                    index = int(key.data)
+                    if index not in pending:
+                        continue
+                    client = clients[index]
+                    line = key.fileobj.readline()
+                    selector.unregister(key.fileobj)
+                    pending.remove(index)
+                    if not line:
+                        diagnostic = self.worker_diagnostic(client)
+                        detail = f": {diagnostic}" if diagnostic else ""
+                        raise WorkloadError(
+                            f"{context} Git worker {client.job_id} stopped without a response{detail}"
+                        )
+                    responses[index] = parse_json_object(
+                        line.strip(), f"{context} Git worker {client.job_id}"
+                    )
+        finally:
+            selector.close()
+        return [responses[index] for index in range(len(clients))]
+
+    def start(self) -> None:
+        if self.clients:
+            raise WorkloadError("Git worker pool was started more than once")
+        try:
+            for job_id in range(
+                self.args.job_start, self.args.job_start + self.args.job_count
+            ):
+                self.clients.append(
+                    GitJobWorkerClient(
+                        job_id,
+                        spawn(
+                            git_job_worker_command(self.args, job_id),
+                            env=deterministic_environment(),
+                            pipe_stdin=True,
+                        ),
+                    )
+                )
+            responses = self.read_responses(
+                self.clients, self.args.timeout_seconds, "Git worker readiness"
+            )
+            process_pids: list[int] = []
+            remote_pids: list[int] = []
+            for client, response in zip(self.clients, responses, strict=True):
+                process_pid = response.get("process_pid")
+                if (
+                    response.get("status") != "ready"
+                    or response.get("target_host") != self.args.target_host
+                    or response.get("job_id") != client.job_id
+                    or response.get("runtime_route") != "local"
+                    or response.get("runtime_paths") != list(LOCAL_ROUTE_PATHS)
+                    or response.get("workspace_route") != "host"
+                    or response.get("workspace_path") != self.args.work_root
+                    or isinstance(process_pid, bool)
+                    or not isinstance(process_pid, int)
+                    or process_pid <= 0
+                ):
+                    raise WorkloadError(
+                        f"Git worker {client.job_id} returned invalid readiness evidence"
+                    )
+                validate_identity(
+                    response, self.args.target_host, self.args.launcher_host
+                )
+                client.readiness = response
+                process_pids.append(process_pid)
+                remote_pids.append(int(response["remote_pid"]))
+            controller_process_pid = int(self.controller_identity["process_pid"])
+            if (
+                len(set(process_pids)) != len(process_pids)
+                or controller_process_pid in process_pids
+            ):
+                raise WorkloadError(
+                    f"Git workers on {self.args.target_host} lack unique process identities"
+                )
+            controller_remote_pid = int(self.controller_identity["remote_pid"])
+            remote_target = normalize_host(self.args.target_host) != normalize_host(
+                self.args.launcher_host
+            )
+            if remote_target and (
+                len(set(remote_pids)) != len(remote_pids)
+                or controller_remote_pid in remote_pids
+            ):
+                raise WorkloadError(
+                    f"Git workers on {self.args.target_host} lack unique remote identities"
+                )
+            self.ready = True
+        except BaseException:
+            self.close()
+            raise
+
+    def request(
+        self,
+        payload: dict[str, Any],
+        timeout_seconds: float,
+        context: str,
+    ) -> list[dict[str, Any]]:
+        if not self.ready:
+            raise WorkloadError("Git worker pool is not ready")
+        request_id = self.next_request_id
+        self.next_request_id += 1
+        request = compact_json({**payload, "request_id": request_id}) + "\n"
+        for client in self.clients:
+            stream = client.process.stdin
+            if stream is None:
+                raise WorkloadError(
+                    f"{context} Git worker {client.job_id} has no command pipe"
+                )
+            try:
+                stream.write(request)
+                stream.flush()
+            except (BrokenPipeError, OSError) as exc:
+                diagnostic = self.worker_diagnostic(client)
+                detail = f": {diagnostic}" if diagnostic else ""
+                raise WorkloadError(
+                    f"{context} Git worker {client.job_id} rejected dispatch{detail}"
+                ) from exc
+        responses = self.read_responses(self.clients, timeout_seconds, context)
+        results: list[dict[str, Any]] = []
+        for client, response in zip(self.clients, responses, strict=True):
+            if response.get("request_id") != request_id:
+                raise WorkloadError(
+                    f"{context} Git worker {client.job_id} returned the wrong request id"
+                )
+            if response.get("status") != "ok":
+                error = summarize_output(str(response.get("error", "unknown error")))
+                raise WorkloadError(
+                    f"{context} Git worker {client.job_id} failed: {error}"
+                )
+            result = response.get("result")
+            readiness = client.readiness
+            if not isinstance(result, dict) or readiness is None:
+                raise WorkloadError(
+                    f"{context} Git worker {client.job_id} returned no result object"
+                )
+            if (
+                result.get("job_id") != client.job_id
+                or result.get("process_pid") != readiness.get("process_pid")
+                or result.get("remote_pid") != readiness.get("remote_pid")
+                or result.get("runner_host") != readiness.get("runner_host")
+                or result.get("launcher_host") != readiness.get("launcher_host")
+                or result.get("runtime_route") != "local"
+                or result.get("runtime_paths") != list(LOCAL_ROUTE_PATHS)
+                or result.get("workspace_route") != "host"
+                or result.get("workspace_path") != self.args.work_root
+            ):
+                raise WorkloadError(
+                    f"{context} Git worker {client.job_id} changed identity or routes"
+                )
+            results.append(result)
+        return results
+
+    def run_phase(self, worker_args: argparse.Namespace) -> dict[str, Any]:
+        phase = worker_args.phase
+        if phase == "git-clone":
+            if self.completed_phase is not None:
+                raise WorkloadError("persistent Git workers received duplicate clone")
+        elif phase == "git-checkout":
+            if self.completed_phase != "git-clone":
+                raise WorkloadError("persistent Git workers received checkout before clone")
+            if not worker_args.force_checkout:
+                raise WorkloadError(
+                    "persistent Git checkout lacks cold-worktree authorization"
+                )
+        else:
+            raise WorkloadError(f"persistent Git workers cannot execute {phase}")
+        jobs = self.request(
+            {
+                "action": "phase",
+                "phase": phase,
+                "repository_uri": worker_args.repository_uri,
+                "commit": worker_args.commit,
+                "rounds": worker_args.rounds,
+                "file_bytes": worker_args.file_bytes,
+                "force_checkout": worker_args.force_checkout,
+                "timeout_seconds": child_timeout_seconds(
+                    worker_args.timeout_seconds
+                ),
+            },
+            worker_args.timeout_seconds,
+            phase,
+        )
+        self.completed_phase = phase
+        return {
+            "phase": phase,
+            "target_host": self.args.target_host,
+            "job_start": self.args.job_start,
+            "job_count": self.args.job_count,
+            **self.controller_identity,
+            **inherited_route_evidence(phase, self.args.work_root),
+            "jobs": jobs,
+        }
+
+    def close(self) -> bool:
+        clients = list(self.clients)
+        self.clients.clear()
+        was_ready = self.ready
+        self.ready = False
+        if not clients:
+            return True
+        if was_ready:
+            request_id = self.next_request_id
+            self.next_request_id += 1
+            request = compact_json(
+                {"action": "shutdown", "request_id": request_id}
+            ) + "\n"
+            alive: list[GitJobWorkerClient] = []
+            for client in clients:
+                if client.process.poll() is not None or client.process.stdin is None:
+                    continue
+                try:
+                    client.process.stdin.write(request)
+                    client.process.stdin.flush()
+                    alive.append(client)
+                except (BrokenPipeError, OSError):
+                    pass
+            if alive:
+                try:
+                    self.read_responses(
+                        alive,
+                        min(5.0, self.args.timeout_seconds),
+                        "Git worker shutdown",
+                    )
+                except WorkloadError:
+                    pass
+        stopped = terminate_processes(client.process for client in clients)
+        for client in clients:
+            for stream in (
+                client.process.stdin,
+                client.process.stdout,
+                client.process.stderr,
+            ):
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except OSError:
+                        pass
+        return stopped
+
+
+def run_controller(args: argparse.Namespace) -> int:
+    identity = {
+        **read_proc_identity(),
+        "process_pid": os.getpid(),
+    }
+    validate_identity(identity, args.target_host, args.launcher_host)
+    work_root = Path(args.work_root)
+    verify_work_root_owner(work_root, args.work_root_owner)
+    os.chdir(work_root)
+    routed_work_root = str(work_root) if args.profile == "host-workspace" else None
+    routes = verify_routes(routed_work_root, args.timeout_seconds)
+    git_workers: GitJobWorkerPool | None = None
+    try:
+        if args.profile == "host-workspace":
+            git_workers = GitJobWorkerPool(args, identity)
+            git_workers.start()
+        print(
+            compact_json(
+                {
+                    "status": "ready",
+                    "profile": args.profile,
+                    "target_host": args.target_host,
+                    "job_start": args.job_start,
+                    "job_count": args.job_count,
+                    **identity,
+                    **routes,
+                }
+            ),
+            flush=True,
+        )
+        for line in sys.stdin:
+            request_id: int | None = None
+            try:
+                request = parse_json_object(line.strip(), "controller request")
+                raw_request_id = request.get("request_id")
+                if (
+                    isinstance(raw_request_id, bool)
+                    or not isinstance(raw_request_id, int)
+                    or raw_request_id <= 0
+                ):
+                    raise WorkloadError("controller request has invalid request_id")
+                request_id = raw_request_id
+                action = request_string(request, "action")
+                if action == "shutdown":
+                    if git_workers is not None:
+                        if not git_workers.close():
+                            raise WorkloadError("persistent Git workers did not stop")
+                        git_workers = None
+                    print(
+                        compact_json(
+                            {
+                                "status": "ok",
+                                "request_id": request_id,
+                                "result": {"stopped": True},
+                            }
+                        ),
+                        flush=True,
+                    )
+                    return 0
+                if action == "phase":
+                    worker_args = controller_request_args(args, request)
+                    if worker_args.phase in GIT_PHASES:
+                        if git_workers is None:
+                            raise WorkloadError(
+                                "Git phase requires persistent HOST-workspace workers"
+                            )
+                        result = git_workers.run_phase(worker_args)
+                    else:
+                        result = run_host_worker(worker_args)
+                elif action == "git-workers-retire":
+                    if args.profile != "host-workspace" or git_workers is None:
+                        raise WorkloadError(
+                            "Git worker retirement requires an active HOST-workspace pool"
+                        )
+                    if git_workers.completed_phase != "git-checkout":
+                        raise WorkloadError(
+                            "Git workers cannot retire before checkout completion"
+                        )
+                    worker_count = len(git_workers.clients)
+                    if worker_count != args.job_count or not git_workers.close():
+                        raise WorkloadError("persistent Git workers did not stop")
+                    git_workers = None
+                    result = {
+                        "action": "git-workers-retire",
+                        "target_host": args.target_host,
+                        "job_start": args.job_start,
+                        "job_count": args.job_count,
+                        "workers_stopped": worker_count,
+                        **identity,
+                    }
+                elif action == "git-prewarm":
+                    if args.profile != "host-workspace":
+                        raise WorkloadError(
+                            "Git runtime prewarm requires a HOST-workspace controller"
+                        )
+                    prewarm_args = argparse.Namespace(
+                        target_host=args.target_host,
+                        launcher_host=args.launcher_host,
+                        job_start=args.job_start,
+                        work_root=args.work_root,
+                        repository_uri=request_string(request, "repository_uri"),
+                        commit=request_string(request, "commit"),
+                        timeout_seconds=request_positive_timeout(request),
+                    )
+                    if (
+                        not prewarm_args.repository_uri.startswith("file://")
+                        or OID_RE.fullmatch(prewarm_args.commit) is None
+                    ):
+                        raise WorkloadError(
+                            "Git runtime prewarm requires the fixed repository and commit"
+                        )
+                    result = run_git_prewarm(prewarm_args)
+                else:
+                    raise WorkloadError(f"unknown controller action: {action}")
+                print(
+                    compact_json(
+                        {
+                            "status": "ok",
+                            "request_id": request_id,
+                            "result": result,
+                        }
+                    ),
+                    flush=True,
+                )
+            except WorkloadError as exc:
+                print(
+                    compact_json(
+                        {
+                            "status": "error",
+                            "request_id": request_id,
+                            "error": str(exc),
+                        }
+                    ),
+                    flush=True,
+                )
+                return 1
+        raise WorkloadError("controller command pipe closed without shutdown")
+    finally:
+        if git_workers is not None and not git_workers.close():
+            raise WorkloadError("persistent Git workers did not stop")
 
 
 def local_route_operands() -> list[str]:
@@ -1430,6 +2017,7 @@ class ControllerClient:
         self.job_start = job_start
         self.job_count = job_count
         self.process = process
+        self.process_pid: int | None = None
 
 
 class ControllerPool:
@@ -1448,6 +2036,7 @@ class ControllerPool:
         self.timeout_seconds = timeout_seconds
         self.clients: list[ControllerClient] = []
         self.next_request_id = 1
+        self.force_checkout_ready = False
 
     @staticmethod
     def controller_diagnostic(client: ControllerClient) -> str:
@@ -1535,6 +2124,7 @@ class ControllerPool:
                 self.clients, self.timeout_seconds, "controller readiness"
             )
             for client, response in zip(self.clients, responses, strict=True):
+                process_pid = response.get("process_pid")
                 expected_workspace_route = (
                     "host" if client.profile == "host-workspace" else None
                 )
@@ -1554,11 +2144,15 @@ class ControllerPool:
                     or response.get("workspace_route")
                     != expected_workspace_route
                     or response.get("workspace_path") != expected_workspace_path
+                    or isinstance(process_pid, bool)
+                    or not isinstance(process_pid, int)
+                    or process_pid <= 0
                 ):
                     raise WorkloadError(
                         f"controller on {client.host} returned invalid {client.profile} readiness evidence"
                     )
                 validate_identity(response, client.host, self.launcher)
+                client.process_pid = process_pid
         except BaseException:
             self.close()
             raise
@@ -1623,7 +2217,11 @@ class ControllerPool:
         timeout_seconds: float,
         file_bytes: int,
     ) -> list[dict[str, Any]]:
-        return self.request(
+        if phase == "git-checkout" and not self.force_checkout_ready:
+            raise WorkloadError(
+                "forced Git checkout was not guarded by cold-worktree validation"
+            )
+        results = self.request(
             controller_profile(phase),
             {
                 "action": "phase",
@@ -1632,11 +2230,57 @@ class ControllerPool:
                 "commit": str(fixture.get("commit", "")),
                 "rounds": rounds,
                 "file_bytes": file_bytes,
+                "force_checkout": phase == "git-checkout",
                 "timeout_seconds": child_timeout_seconds(timeout_seconds),
             },
             timeout_seconds,
             phase,
         )
+        if phase == "git-checkout":
+            self.force_checkout_ready = False
+        if phase in GIT_PHASES:
+            for client, result in zip(
+                self.profile_clients("host-workspace"), results, strict=True
+            ):
+                if result.get("process_pid") != client.process_pid:
+                    raise WorkloadError(
+                        f"{phase} controller on {client.host} changed process identity"
+                    )
+        return results
+
+    def prepare_force_checkout(self, git: str, timeout_seconds: float) -> None:
+        if self.force_checkout_ready:
+            raise WorkloadError("forced Git checkout was prepared more than once")
+        validate_force_checkout_preconditions(
+            self.work_root, git, timeout_seconds
+        )
+        self.force_checkout_ready = True
+
+    def retire_git_workers(self, timeout_seconds: float) -> None:
+        clients = self.profile_clients("host-workspace")
+        results = self.request(
+            "host-workspace",
+            {"action": "git-workers-retire"},
+            timeout_seconds,
+            "Git worker retirement",
+        )
+        retired = 0
+        for client, result in zip(clients, results, strict=True):
+            if (
+                result.get("action") != "git-workers-retire"
+                or result.get("target_host") != client.host
+                or result.get("job_start") != client.job_start
+                or result.get("job_count") != client.job_count
+                or result.get("workers_stopped") != client.job_count
+                or result.get("process_pid") != client.process_pid
+            ):
+                raise WorkloadError(
+                    f"Git worker retirement on {client.host} returned invalid evidence"
+                )
+            validate_identity(result, client.host, self.launcher)
+            retired += client.job_count
+        if retired != TOTAL_JOBS:
+            raise WorkloadError("Git worker retirement did not reap exactly 32 workers")
 
     def prewarm_git(
         self, fixture: dict[str, Any], timeout_seconds: float
@@ -1721,6 +2365,7 @@ def validate_controller_results(
         raise WorkloadError(f"{phase} did not return one controller per host")
     jobs_by_id: dict[int, dict[str, Any]] = {}
     participants: list[dict[str, Any]] = []
+    git_worker_processes: set[tuple[str, int]] = set()
     for controller, (host, start, count) in zip(controllers, partitions, strict=True):
         if controller.get("phase") != phase or controller.get("target_host") != host:
             raise WorkloadError(
@@ -1756,6 +2401,19 @@ def validate_controller_results(
         expected_ids = list(range(start, start + count))
         observed_ids: list[int] = []
         job_remote_pids: list[int] = []
+        job_process_pids: list[int] = []
+        controller_process_pid: int | None = None
+        if phase in GIT_PHASES:
+            raw_controller_process_pid = controller.get("process_pid")
+            if (
+                isinstance(raw_controller_process_pid, bool)
+                or not isinstance(raw_controller_process_pid, int)
+                or raw_controller_process_pid <= 0
+            ):
+                raise WorkloadError(
+                    f"{phase} controller on {host} lacks a process identity"
+                )
+            controller_process_pid = raw_controller_process_pid
         for job in raw_jobs:
             if not isinstance(job, dict) or job.get("phase") != phase:
                 raise WorkloadError(
@@ -1783,9 +2441,34 @@ def validate_controller_results(
             observed_ids.append(job_id)
             jobs_by_id[job_id] = job
             job_remote_pids.append(int(job["remote_pid"]))
+            if phase in GIT_PHASES:
+                process_pid = job.get("process_pid")
+                if (
+                    isinstance(process_pid, bool)
+                    or not isinstance(process_pid, int)
+                    or process_pid <= 0
+                ):
+                    raise WorkloadError(
+                        f"{phase} job {job_id} lacks a process identity"
+                    )
+                process_identity = (normalize_host(host), process_pid)
+                if process_identity in git_worker_processes:
+                    raise WorkloadError(
+                        f"{phase} jobs reused a worker process on {host}"
+                    )
+                git_worker_processes.add(process_identity)
+                job_process_pids.append(process_pid)
         if sorted(observed_ids) != expected_ids:
             raise WorkloadError(
                 f"{phase} controller on {host} did not execute its assigned job range"
+            )
+        if phase in GIT_PHASES and (
+            len(job_process_pids) != count
+            or len(set(job_process_pids)) != count
+            or controller_process_pid in job_process_pids
+        ):
+            raise WorkloadError(
+                f"{phase} controller on {host} returned invalid worker process identities"
             )
         transport = (
             "local" if normalize_host(host) == normalize_host(launcher) else "wki"
@@ -1817,6 +2500,9 @@ def validate_controller_results(
             "workspace_route": expected_workspace_route,
             "workspace_path": expected_workspace_path,
         }
+        if phase in GIT_PHASES:
+            participant["process_pid"] = controller_process_pid
+            participant["job_process_pids"] = job_process_pids
         if phase == "file-move":
             byte_counts = [job.get("bytes_moved") for job in raw_jobs]
             if any(
@@ -1830,7 +2516,53 @@ def validate_controller_results(
         participants.append(participant)
     if sorted(jobs_by_id) != list(range(TOTAL_JOBS)):
         raise WorkloadError(f"{phase} did not cover exactly 32 unique jobs")
+    if phase in GIT_PHASES and len(git_worker_processes) != TOTAL_JOBS:
+        raise WorkloadError(f"{phase} did not use exactly 32 persistent Git workers")
     return participants, jobs_by_id
+
+
+def git_job_identity_map(
+    phase: str, jobs: dict[int, dict[str, Any]]
+) -> dict[int, tuple[str, int, int]]:
+    if phase not in GIT_PHASES or sorted(jobs) != list(range(TOTAL_JOBS)):
+        raise WorkloadError(f"{phase} lacks the exact persistent Git job set")
+    identities: dict[int, tuple[str, int, int]] = {}
+    for job_id, job in jobs.items():
+        process_pid = job.get("process_pid")
+        remote_pid = job.get("remote_pid")
+        runner_host = str(job.get("runner_host", ""))
+        if (
+            not runner_host
+            or isinstance(process_pid, bool)
+            or not isinstance(process_pid, int)
+            or process_pid <= 0
+            or isinstance(remote_pid, bool)
+            or not isinstance(remote_pid, int)
+            or remote_pid < 0
+        ):
+            raise WorkloadError(
+                f"{phase} job {job_id} lacks a persistent worker identity"
+            )
+        identities[job_id] = (runner_host, process_pid, remote_pid)
+    return identities
+
+
+def validate_persistent_git_job_identities(
+    clone_jobs: dict[int, dict[str, Any]],
+    checkout_jobs: dict[int, dict[str, Any]],
+) -> None:
+    clone_identities = git_job_identity_map("git-clone", clone_jobs)
+    checkout_identities = git_job_identity_map("git-checkout", checkout_jobs)
+    if clone_identities != checkout_identities:
+        changed = [
+            job_id
+            for job_id in range(TOTAL_JOBS)
+            if clone_identities[job_id] != checkout_identities[job_id]
+        ]
+        raise WorkloadError(
+            "Git checkout did not reuse clone worker(s): "
+            + ", ".join(str(job_id) for job_id in changed)
+        )
 
 
 def validate_clone_outputs(
@@ -2241,7 +2973,7 @@ def run_coordinator(args: argparse.Namespace) -> list[dict[str, Any]]:
             rounds,
             args.timeout_seconds,
         )
-        clone_participants, _ = validate_controller_results(
+        clone_participants, clone_jobs = validate_controller_results(
             "git-clone", controllers, partitions, launcher, work_root
         )
         clone_digests = validate_clone_outputs(
@@ -2274,6 +3006,8 @@ def run_coordinator(args: argparse.Namespace) -> list[dict[str, Any]]:
         )
         measurements.append(clone_measurement)
 
+        log("validating empty worktrees and indexes before forced checkout")
+        controller_pool.prepare_force_checkout(WOS_GIT, args.timeout_seconds)
         log("running 32 concurrent exact detached Git checkout jobs")
         elapsed, controllers = run_timed_phase(
             "git-checkout",
@@ -2282,12 +3016,15 @@ def run_coordinator(args: argparse.Namespace) -> list[dict[str, Any]]:
             rounds,
             args.timeout_seconds,
         )
-        checkout_participants, _ = validate_controller_results(
+        checkout_participants, checkout_jobs = validate_controller_results(
             "git-checkout", controllers, partitions, launcher, work_root
         )
+        validate_persistent_git_job_identities(clone_jobs, checkout_jobs)
         checkout_digests = validate_checkout_outputs(
             work_root, fixture, WOS_GIT, args.timeout_seconds
         )
+        log("retiring persistent Git workers outside timed phases")
+        controller_pool.retire_git_workers(args.timeout_seconds)
         attach_participant_digests(checkout_participants, checkout_digests)
         checkout_measurement = common_measurement(
             "wos_git_checkout",
@@ -2630,18 +3367,22 @@ def self_test(args: argparse.Namespace) -> None:
         )
         if sorted(path.name for path in destination.iterdir() if path.name != ".git"):
             raise WorkloadError("self-test no-checkout clone materialized files")
-        git_output(
+        validate_force_checkout_destination(
+            destination,
             git,
-            (
-                "-C",
-                str(destination),
-                "checkout",
-                "--quiet",
-                "--detach",
+            args.timeout_seconds,
+            context="self-test checkout",
+        )
+        run_checked(
+            git_checkout_command(
+                git,
+                destination,
                 str(first["commit"]),
+                force=True,
             ),
             timeout_seconds=args.timeout_seconds,
-            context="self-test checkout",
+            env=deterministic_environment(),
+            context="self-test forced checkout",
         )
         file_count, byte_count, digest = tree_manifest(destination)
         if (file_count, byte_count, digest) != (
@@ -2712,6 +3453,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--timeout-seconds", type=positive_timeout, default=1800.0
     )
 
+    git_job_worker = subparsers.add_parser("git-job-worker")
+    git_job_worker.add_argument("--target-host", required=True)
+    git_job_worker.add_argument("--launcher-host", required=True)
+    git_job_worker.add_argument("--job-id", type=int, required=True)
+    git_job_worker.add_argument("--work-root", required=True)
+    git_job_worker.add_argument("--work-root-owner", required=True)
+    git_job_worker.add_argument(
+        "--timeout-seconds", type=positive_timeout, default=1800.0
+    )
+
     job = subparsers.add_parser("job")
     job.add_argument(
         "--phase",
@@ -2765,7 +3516,9 @@ def validate_worker_arguments(args: argparse.Namespace) -> None:
             raise WorkloadError("host worker job range is outside 0..31")
     if args.mode == "job" and not 0 <= args.job_id < TOTAL_JOBS:
         raise WorkloadError("job id is outside 0..31")
-    if args.mode == "controller":
+    if args.mode == "git-job-worker" and not 0 <= args.job_id < TOTAL_JOBS:
+        raise WorkloadError("Git worker job id is outside 0..31")
+    if args.mode in ("controller", "git-job-worker"):
         require_safe_work_root(Path(args.work_root), args.work_root_owner)
     if args.mode in ("host-worker", "job"):
         if not args.work_root:
@@ -2792,6 +3545,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(compact_json(run_host_worker(args)), flush=True)
         elif args.mode == "controller":
             return run_controller(args)
+        elif args.mode == "git-job-worker":
+            return run_git_job_worker(args)
         elif args.mode == "job":
             print(compact_json(run_job(args)), flush=True)
         elif args.mode == "preflight-host":

@@ -70,6 +70,8 @@ def controller_fixture(module, phase: str, hosts: list[str]):
                 "workspace_route": workspace_route,
                 "workspace_path": workspace_path,
             }
+            if phase in module.GIT_PHASES:
+                job["process_pid"] = 1000 + job_id
             if phase == "file-move":
                 job["bytes_moved"] = module.FILE_MOVE_BYTES["quick"]
             jobs.append(job)
@@ -85,6 +87,8 @@ def controller_fixture(module, phase: str, hosts: list[str]):
                 "jobs": jobs,
             }
         )
+        if phase in module.GIT_PHASES:
+            controllers[-1]["process_pid"] = 100 + host_index
     return launcher, partitions, workspace, controllers
 
 
@@ -123,6 +127,22 @@ def test_partition_and_commands(module) -> None:
         fail(f"HOST controller is not a persistent protocol worker: {command}")
     if command[command.index("--profile") + 1] != "host-workspace":
         fail(f"HOST controller lost its immutable route profile: {command}")
+    git_worker = module.git_job_worker_command(
+        SimpleNamespace(
+            target_host=hosts[1],
+            launcher_host=hosts[0],
+            work_root="/tmp/wos-showcase-fixed-0123456789abcdef",
+            work_root_owner=owner,
+            timeout_seconds=25.0,
+        ),
+        17,
+    )
+    if git_worker[:3] != [module.WOS_PYTHON, module.WOS_HELPER, "git-job-worker"]:
+        fail(f"persistent Git job worker retained a placement wrapper: {git_worker}")
+    if git_worker[git_worker.index("--job-id") + 1] != "17":
+        fail(f"persistent Git job worker lost canonical ownership: {git_worker}")
+    if module.WOS_ON in git_worker or module.WOS_FORWARD in git_worker:
+        fail(f"persistent Git job worker did not inherit controller routes: {git_worker}")
 
     python_command = module.controller_command(
         "local-runtime",
@@ -181,6 +201,15 @@ def test_partition_and_commands(module) -> None:
     }
     if not expected_git_config.issubset(module.GIT_FIXED_CONFIG):
         fail("Git fixed-resource thread controls are incomplete")
+    checkout_command = module.git_checkout_command(
+        module.WOS_GIT,
+        Path("/tmp/checkout"),
+        "1" * 40,
+        force=True,
+    )
+    checkout_arguments = checkout_command[checkout_command.index("checkout") + 1 :]
+    if checkout_arguments != ("--quiet", "--force", "--detach", "1" * 40):
+        fail(f"forced checkout command is not exact/detached: {checkout_command}")
     if module.child_timeout_seconds(25.0) != 20.0:
         fail("nested worker timeout does not reserve cleanup grace")
 
@@ -276,6 +305,35 @@ def test_job_map_validation(module) -> None:
         fail("validated job map does not cover exactly 0..31")
     if [participant["work_units"] for participant in participants] != [11, 11, 10]:
         fail("participant work map differs from the fixed partition")
+    worker_processes = {
+        (participant["host"], process_pid)
+        for participant in participants
+        for process_pid in participant["job_process_pids"]
+    }
+    if len(worker_processes) != module.TOTAL_JOBS:
+        fail("Git job map does not expose 32 unique persistent worker processes")
+    (
+        checkout_launcher,
+        checkout_partitions,
+        checkout_workspace,
+        checkout_controllers,
+    ) = controller_fixture(module, "git-checkout", hosts)
+    _, checkout_jobs = module.validate_controller_results(
+        "git-checkout",
+        checkout_controllers,
+        checkout_partitions,
+        checkout_launcher,
+        checkout_workspace,
+    )
+    module.validate_persistent_git_job_identities(jobs, checkout_jobs)
+    changed_checkout_jobs = copy.deepcopy(checkout_jobs)
+    changed_checkout_jobs[17]["process_pid"] += 100
+    try:
+        module.validate_persistent_git_job_identities(jobs, changed_checkout_jobs)
+    except module.WorkloadError:
+        pass
+    else:
+        fail("checkout accepted a different worker than the corresponding clone")
     job_digests = {
         job_id: module.sha256_job(job_id, 1) for job_id in range(module.TOTAL_JOBS)
     }
@@ -327,6 +385,11 @@ def test_job_map_validation(module) -> None:
     missing_runtime_path = copy.deepcopy(controllers)
     missing_runtime_path[2]["runtime_paths"].pop()
     mutations.append(missing_runtime_path)
+    duplicate_process = copy.deepcopy(controllers)
+    duplicate_process[1]["jobs"][1]["process_pid"] = duplicate_process[1]["jobs"][0][
+        "process_pid"
+    ]
+    mutations.append(duplicate_process)
     for mutation in mutations:
         try:
             module.validate_controller_results(
@@ -522,6 +585,7 @@ def test_timed_job_uses_preflight_evidence(module) -> None:
 def test_persistent_controller_pool_timing_and_cleanup(module) -> None:
     fake_controller = r"""
 import json
+import os
 import sys
 import time
 
@@ -536,6 +600,7 @@ print(json.dumps({
     "launcher_host": launcher,
     "runner_host": host,
     "remote_pid": 0,
+    "process_pid": os.getpid(),
     "runtime_route": "local",
     "runtime_paths": %s,
     "workspace_route": "host" if profile == "host-workspace" else None,
@@ -600,6 +665,128 @@ for line in sys.stdin:
         fail("persistent controllers were not shut down and reaped")
 
 
+def test_persistent_git_workers_reuse_identity(module) -> None:
+    fake_worker = r"""
+import json
+import os
+import sys
+import time
+
+host, launcher, job_id, work_root = sys.argv[1:5]
+job_id = int(job_id)
+process_pid = os.getpid()
+time.sleep(0.12)
+evidence = {
+    "target_host": host,
+    "job_id": job_id,
+    "launcher_host": launcher,
+    "runner_host": host,
+    "remote_pid": 0,
+    "process_pid": process_pid,
+    "runtime_route": "local",
+    "runtime_paths": %s,
+    "workspace_route": "host",
+    "workspace_path": work_root,
+}
+print(json.dumps({"status": "ready", **evidence}), flush=True)
+completed = None
+for line in sys.stdin:
+    request = json.loads(line)
+    if request["action"] == "shutdown":
+        result = {"stopped": True, "job_id": job_id, "process_pid": process_pid}
+    else:
+        phase = request["phase"]
+        if phase == "git-clone" and completed is not None:
+            raise RuntimeError("duplicate clone")
+        if phase == "git-checkout" and completed != "git-clone":
+            raise RuntimeError("checkout before clone")
+        if phase == "git-checkout" and request["force_checkout"] is not True:
+            raise RuntimeError("checkout lacks force authorization")
+        time.sleep(0.02)
+        completed = phase
+        result = {"phase": phase, **evidence}
+    print(json.dumps({
+        "status": "ok",
+        "request_id": request["request_id"],
+        "result": result,
+    }), flush=True)
+    if request["action"] == "shutdown":
+        break
+""" % json.dumps(list(module.LOCAL_ROUTE_PATHS))
+    original_command = module.git_job_worker_command
+    work_root = "/tmp/wos-showcase-fixed-0123456789abcdef"
+    owner = "0123456789abcdef0123456789abcdef"
+
+    def fake_command(args, job_id):
+        return [
+            sys.executable,
+            "-u",
+            "-c",
+            fake_worker,
+            args.target_host,
+            args.launcher_host,
+            str(job_id),
+            args.work_root,
+        ]
+
+    module.git_job_worker_command = fake_command
+    args = SimpleNamespace(
+        target_host="wos-0.wos",
+        launcher_host="wos-0.wos",
+        job_start=0,
+        job_count=module.TOTAL_JOBS,
+        work_root=work_root,
+        work_root_owner=owner,
+        timeout_seconds=5.0,
+    )
+    pool = module.GitJobWorkerPool(
+        args,
+        {
+            "launcher_host": "wos-0.wos",
+            "runner_host": "wos-0.wos",
+            "remote_pid": 0,
+            "process_pid": os.getpid(),
+        },
+    )
+    try:
+        pool.start()
+        ready_pids = [client.readiness["process_pid"] for client in pool.clients]
+        if len(set(ready_pids)) != module.TOTAL_JOBS:
+            fail("persistent Git pool did not prestart 32 unique job workers")
+        common = dict(
+            mode="host-worker",
+            target_host=args.target_host,
+            launcher_host=args.launcher_host,
+            job_start=0,
+            job_count=module.TOTAL_JOBS,
+            work_root=work_root,
+            repository_uri="file:///tmp/fixture.git",
+            commit="1" * 40,
+            rounds=1,
+            file_bytes=0,
+            timeout_seconds=5.0,
+        )
+        clone = pool.run_phase(
+            SimpleNamespace(
+                phase="git-clone", force_checkout=False, **common
+            )
+        )
+        checkout = pool.run_phase(
+            SimpleNamespace(
+                phase="git-checkout", force_checkout=True, **common
+            )
+        )
+        clone_pids = [job["process_pid"] for job in clone["jobs"]]
+        checkout_pids = [job["process_pid"] for job in checkout["jobs"]]
+        if clone_pids != ready_pids or checkout_pids != ready_pids:
+            fail("clone and checkout did not reuse the prestarted per-job workers")
+    finally:
+        stopped = pool.close()
+        module.git_job_worker_command = original_command
+    if not stopped or module._ACTIVE_PROCESSES:
+        fail("persistent Git job workers were not shut down and reaped")
+
+
 def test_git_prewarm_preserves_cold_destinations(module) -> None:
     original_cwd = Path.cwd()
     original_identity = module.read_proc_identity
@@ -637,6 +824,116 @@ def test_git_prewarm_preserves_cold_destinations(module) -> None:
         module.remove_work_root(work_root, owner)
 
 
+def test_forced_checkout_requires_cold_worktree(module) -> None:
+    with tempfile.TemporaryDirectory(prefix="wos-force-checkout-") as temporary:
+        destination = Path(temporary) / "clone"
+        (destination / ".git").mkdir(parents=True)
+        module.validate_force_checkout_destination(
+            destination,
+            module.WOS_GIT,
+            30.0,
+            context="cold checkout test",
+        )
+
+        visible = destination / "unexpected"
+        visible.write_text("not cold", encoding="ascii")
+        try:
+            module.validate_force_checkout_destination(
+                destination,
+                module.WOS_GIT,
+                30.0,
+                context="visible checkout test",
+            )
+        except module.WorkloadError:
+            pass
+        else:
+            fail("forced checkout accepted a visible worktree file")
+        visible.unlink()
+
+        (destination / ".git" / "index").mkdir()
+        try:
+            module.validate_force_checkout_destination(
+                destination,
+                module.WOS_GIT,
+                30.0,
+                context="index checkout test",
+            )
+        except module.WorkloadError:
+            pass
+        else:
+            fail("forced checkout accepted a non-file Git index")
+
+
+def test_forced_checkout_authorization_is_consumed(module) -> None:
+    original_validate = module.validate_force_checkout_preconditions
+    pool = module.ControllerPool(
+        [("wos-0.wos", 0, module.TOTAL_JOBS)],
+        "wos-0.wos",
+        Path("/tmp/wos-showcase-fixed-0123456789abcdef"),
+        "0123456789abcdef0123456789abcdef",
+        30.0,
+    )
+    pool.clients = [
+        SimpleNamespace(
+            profile="host-workspace",
+            host="wos-0.wos",
+            job_start=0,
+            job_count=module.TOTAL_JOBS,
+            process_pid=77,
+        )
+    ]
+    captured = {}
+
+    def fake_validate(work_root, git, timeout_seconds):
+        captured["validation"] = (work_root, git, timeout_seconds)
+
+    def fake_request(profile, payload, timeout_seconds, context):
+        captured["request"] = (profile, payload, timeout_seconds, context)
+        if payload["action"] == "git-workers-retire":
+            return [
+                {
+                    "action": "git-workers-retire",
+                    "target_host": "wos-0.wos",
+                    "job_start": 0,
+                    "job_count": module.TOTAL_JOBS,
+                    "workers_stopped": module.TOTAL_JOBS,
+                    "launcher_host": "wos-0.wos",
+                    "runner_host": "wos-0.wos",
+                    "remote_pid": 0,
+                    "process_pid": 77,
+                }
+            ]
+        return [{"process_pid": 77}]
+
+    module.validate_force_checkout_preconditions = fake_validate
+    pool.request = fake_request
+    try:
+        try:
+            pool.run_phase(
+                "git-checkout", {"commit": "1" * 40}, 1, 30.0, 0
+            )
+        except module.WorkloadError:
+            pass
+        else:
+            fail("timed checkout ran without cold-worktree authorization")
+        pool.prepare_force_checkout(module.WOS_GIT, 30.0)
+        pool.run_phase("git-checkout", {"commit": "1" * 40}, 1, 30.0, 0)
+        request = captured.get("request")
+        if (
+            captured.get("validation") is None
+            or request is None
+            or request[1].get("force_checkout") is not True
+            or pool.force_checkout_ready
+        ):
+            fail("forced-checkout validation was not coupled to one timed dispatch")
+        pool.retire_git_workers(30.0)
+        if captured["request"][1].get("action") != "git-workers-retire":
+            fail("persistent Git worker retirement handshake was not dispatched")
+    finally:
+        module.validate_force_checkout_preconditions = original_validate
+        pool.clients.clear()
+
+
 def main() -> None:
     module = load_helper()
     test_partition_and_commands(module)
@@ -646,8 +943,11 @@ def main() -> None:
     test_timeout_cleanup(module)
     test_timed_job_uses_preflight_evidence(module)
     test_persistent_controller_pool_timing_and_cleanup(module)
+    test_persistent_git_workers_reuse_identity(module)
     test_git_prewarm_preserves_cold_destinations(module)
-    print("8 WOS fixed-resource showcase tests passed")
+    test_forced_checkout_requires_cold_worktree(module)
+    test_forced_checkout_authorization_is_consumed(module)
+    print("11 WOS fixed-resource showcase tests passed")
 
 
 if __name__ == "__main__":
