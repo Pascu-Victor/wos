@@ -452,6 +452,56 @@ def test_renderbench_persistent_command_stream_retains_ephemeral_batch_threads()
     )
 
 
+def test_renderbench_multinode_process_tail_uses_single_tile_grants() -> None:
+    source = RENDERBENCH_MAIN_CPP.read_text()
+    assign_body = function_body(source, "assign_worker_batch")
+    require_tokens(
+        assign_body,
+        [
+            "fine_grained_tail_threshold > 0U && REMAINING <= fine_grained_tail_threshold",
+            "tracebench::persistent_batch_tile_count(",
+            "++worker.fine_grained_tail_batches",
+            "worker.fine_grained_tail_tiles += COUNT",
+        ],
+        "renderbench fine-grained persistent tail assignment",
+    )
+
+    run_body = function_body(source, "run_distributed_ipc")
+    require_tokens(
+        run_body,
+        [
+            "spec.hostname != specs.front().hostname",
+            "options.placement == tracebench::Placement::ProcessPerCore && HAS_MULTIPLE_WORKER_HOSTS",
+            "FINE_GRAINED_PROCESS_TAIL_THRESHOLD > 0U",
+            "ipc_profile.fine_grained_process_tail_enabled",
+        ],
+        "renderbench multi-node process tail policy",
+    )
+    if run_body.count("FINE_GRAINED_PROCESS_TAIL_THRESHOLD);") != 2:
+        fail("renderbench must pass its fine-grained tail threshold to both persistent assignment sites")
+
+    note_body = function_body(source, "note_process_ipc_profile")
+    require_tokens(
+        note_body,
+        [
+            "profile.fine_grained_tail_batches += worker.fine_grained_tail_batches",
+            "profile.fine_grained_tail_tiles += worker.fine_grained_tail_tiles",
+        ],
+        "renderbench completed-worker tail profile accounting",
+    )
+
+    write_body = function_body(source, "write_process_ipc_profile_json")
+    require_tokens(
+        write_body,
+        [
+            '\\"fine_grained_process_tail_enabled\\"',
+            '\\"fine_grained_tail_batches\\"',
+            '\\"fine_grained_tail_tiles\\"',
+        ],
+        "renderbench fine-grained tail profile provenance",
+    )
+
+
 def test_renderbench_node_threads_balance_without_discarding_tile_locality() -> None:
     source = RENDERBENCH_MAIN_CPP.read_text()
     batch_body = function_body(source, "dynamic_batch_size")
@@ -666,6 +716,7 @@ def main() -> None:
     test_renderbench_command_stream_uses_per_batch_thread_join()
     test_renderbench_non_live_tiles_use_bounded_write_batches()
     test_renderbench_persistent_command_stream_retains_ephemeral_batch_threads()
+    test_renderbench_multinode_process_tail_uses_single_tile_grants()
     test_renderbench_node_threads_balance_without_discarding_tile_locality()
     test_renderbench_live_mode_streams_worker_tiles()
     test_renderbench_ipc_profile_separates_capacity_from_dynamic_runs()

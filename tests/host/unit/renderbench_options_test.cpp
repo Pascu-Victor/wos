@@ -172,3 +172,12 @@ TEST(RenderbenchProtocol, RejectsForeignAndOutOfRangeTilesWithoutMarkingSeen) {
     EXPECT_EQ(tracebench::decide_worker_tile(9, 1, tile_seen, tile_owner), tracebench::WorkerTileDecision::OutOfRange);
     EXPECT_EQ(tile_seen, std::vector<unsigned char>({0, 0, 0, 0}));
 }
+
+TEST(RenderbenchProtocol, PersistentBatchCountReservesFineGrainedTail) {
+    EXPECT_EQ(tracebench::persistent_batch_tile_count(0, 8, 32), 0U);
+    EXPECT_EQ(tracebench::persistent_batch_tile_count(256, 8, 32), 8U);
+    EXPECT_EQ(tracebench::persistent_batch_tile_count(36, 8, 32), 4U);
+    EXPECT_EQ(tracebench::persistent_batch_tile_count(32, 8, 32), 1U);
+    EXPECT_EQ(tracebench::persistent_batch_tile_count(49, 64, 32), 17U);
+    EXPECT_EQ(tracebench::persistent_batch_tile_count(49, 64, 0), 49U);
+}

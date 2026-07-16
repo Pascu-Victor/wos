@@ -885,6 +885,9 @@ def validate_render_completion(
     if not isinstance(profile, dict):
         raise ComparisonError(f"{manifest_path}: {step_name} has no IPC profile")
     persistent_batch_size = profile.get("persistent_batch_size")
+    expected_fine_grained_process_tail_enabled = (
+        placement == "process-per-core" and len(expected_hosts) > 1
+    )
     if (
         profile.get("tiles_done") != total_tiles
         or profile.get("total_tiles") != total_tiles
@@ -895,6 +898,8 @@ def validate_render_completion(
         or profile.get("single_thread_worker_queue_disabled")
         != result.get("single_thread_worker_queue_disabled")
         or profile.get("process_persistent_workers") is not True
+        or profile.get("fine_grained_process_tail_enabled")
+        is not expected_fine_grained_process_tail_enabled
         or isinstance(persistent_batch_size, bool)
         or not isinstance(persistent_batch_size, int)
         or persistent_batch_size <= 0
@@ -921,6 +926,19 @@ def validate_render_completion(
         raise ComparisonError(
             f"{manifest_path}: {step_name} has incomplete worker slots"
         )
+    expected_fine_grained_tail_count = (
+        worker_slots if expected_fine_grained_process_tail_enabled else 0
+    )
+    for field in ("fine_grained_tail_batches", "fine_grained_tail_tiles"):
+        value = profile.get(field)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value != expected_fine_grained_tail_count
+        ):
+            raise ComparisonError(
+                f"{manifest_path}: {step_name} IPC profile disagrees with the fixed workload"
+            )
     if profile.get("effective_reserve_cpus") != 0:
         raise ComparisonError(
             f"{manifest_path}: {step_name} did not use the full fixed CPU budget"

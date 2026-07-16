@@ -194,6 +194,14 @@ def render_result(elapsed: float, node_count: int, step_name: str) -> dict[str, 
             "single_thread_worker_queue_disabled": True,
             "process_persistent_workers": True,
             "persistent_batch_size": 8,
+            "fine_grained_process_tail_enabled": placement == "process-per-core"
+            and node_count > 1,
+            "fine_grained_tail_batches": worker_slots
+            if placement == "process-per-core" and node_count > 1
+            else 0,
+            "fine_grained_tail_tiles": worker_slots
+            if placement == "process-per-core" and node_count > 1
+            else 0,
             "read_bytes": total_tiles * 4096,
             "read_calls": total_tiles,
             "worker_slots": worker_slots,
@@ -1097,6 +1105,48 @@ def test_render_matrix_and_per_host_work_are_enforced(comparator) -> None:
         expect_error(
             comparator,
             zero_batch,
+            "IPC profile disagrees with the fixed workload",
+            required_workloads=("rendering",),
+        )
+
+        wrong_tail = complete_matrix(root / "wrong-fine-grained-tail")
+        candidate = result_path_for(
+            wrong_tail[-1], "wos-render-duck-process-per-core"
+        )
+        payload = read_json(candidate)
+        payload["ipc_profile"]["fine_grained_process_tail_enabled"] = False
+        write_json(candidate, payload)
+        expect_error(
+            comparator,
+            wrong_tail,
+            "IPC profile disagrees with the fixed workload",
+            required_workloads=("rendering",),
+        )
+
+        wrong_tail_enable = complete_matrix(root / "wrong-fine-grained-tail-enable")
+        candidate = result_path_for(
+            wrong_tail_enable[0], "wos-render-duck-process-per-core"
+        )
+        payload = read_json(candidate)
+        payload["ipc_profile"]["fine_grained_process_tail_enabled"] = True
+        write_json(candidate, payload)
+        expect_error(
+            comparator,
+            wrong_tail_enable,
+            "IPC profile disagrees with the fixed workload",
+            required_workloads=("rendering",),
+        )
+
+        wrong_tail_count = complete_matrix(root / "wrong-fine-grained-tail-count")
+        candidate = result_path_for(
+            wrong_tail_count[-1], "wos-render-duck-process-per-core"
+        )
+        payload = read_json(candidate)
+        payload["ipc_profile"]["fine_grained_tail_batches"] -= 1
+        write_json(candidate, payload)
+        expect_error(
+            comparator,
+            wrong_tail_count,
             "IPC profile disagrees with the fixed workload",
             required_workloads=("rendering",),
         )

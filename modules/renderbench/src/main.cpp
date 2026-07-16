@@ -228,6 +228,8 @@ struct ChildWorker {
     uint64_t read_bytes = 0;
     uint64_t read_calls = 0;
     uint64_t assigned_batches = 0;
+    uint64_t fine_grained_tail_batches = 0;
+    uint64_t fine_grained_tail_tiles = 0;
     uint64_t batch_done_packets = 0;
     uint64_t phase_packets = 0;
     uint32_t last_phase = 0;
@@ -315,6 +317,9 @@ struct ProcessIpcProfile {
     int last_batch_count = 0;
     double last_closed_seconds = 0.0;
     int persistent_batch_size = 0;
+    bool fine_grained_process_tail_enabled = false;
+    uint64_t fine_grained_tail_batches = 0;
+    uint64_t fine_grained_tail_tiles = 0;
     int effective_reserve_cpus = 0;
     std::vector<HostIpcProfile> hosts;
 };
@@ -2059,7 +2064,7 @@ auto local_coordinator_reserve_cpus(const tracebench::Options& options, size_t p
 }
 
 auto assign_worker_batch(ChildWorker& worker, std::span<const tracebench::Tile> tiles, std::vector<int>& tile_owner,
-                         size_t& next_tile_position, int batch_size) -> int {
+                         size_t& next_tile_position, int batch_size, size_t fine_grained_tail_threshold) -> int {
     if (!worker.command_stream || worker.write_fd < 0 || worker.stop_sent || !worker.ready_for_batch) {
         return 0;
     }
@@ -2077,7 +2082,10 @@ auto assign_worker_batch(ChildWorker& worker, std::span<const tracebench::Tile> 
     }
 
     size_t const START = next_tile_position;
-    size_t const COUNT = std::min(static_cast<size_t>(std::max(1, batch_size)), tiles.size() - START);
+    size_t const REMAINING = tiles.size() - START;
+    bool const FINE_GRAINED_TAIL = fine_grained_tail_threshold > 0U && REMAINING <= fine_grained_tail_threshold;
+    size_t const COUNT =
+        tracebench::persistent_batch_tile_count(REMAINING, static_cast<size_t>(std::max(1, batch_size)), fine_grained_tail_threshold);
     next_tile_position += COUNT;
 
     for (size_t position = START; position < START + COUNT; ++position) {
@@ -2095,6 +2103,10 @@ auto assign_worker_batch(ChildWorker& worker, std::span<const tracebench::Tile> 
     worker.batch_count = static_cast<int>(COUNT);
     worker.expected_tiles += COUNT;
     ++worker.assigned_batches;
+    if (FINE_GRAINED_TAIL) {
+        ++worker.fine_grained_tail_batches;
+        worker.fine_grained_tail_tiles += COUNT;
+    }
     worker.last_assignment_at = tracebench::monotonic_seconds();
     worker.ready_for_batch = false;
     return 1;
@@ -2210,6 +2222,8 @@ void note_process_ipc_profile(ProcessIpcProfile& profile, const ChildWorker& wor
     ++profile.completed_runs;
     profile.total_read_bytes += worker.read_bytes;
     profile.total_read_calls += worker.read_calls;
+    profile.fine_grained_tail_batches += worker.fine_grained_tail_batches;
+    profile.fine_grained_tail_tiles += worker.fine_grained_tail_tiles;
     auto const WORKER_MS = static_cast<uint32_t>(std::min<uint64_t>(worker.done_elapsed_ms, UINT32_MAX));
     auto const RENDER_MS = static_cast<uint32_t>(std::min<uint64_t>(worker.done_render_ms, UINT32_MAX));
     auto const SEND_MS = static_cast<uint32_t>(std::min<uint64_t>(worker.done_send_ms, UINT32_MAX));
@@ -2298,10 +2312,10 @@ void print_process_ipc_profile(const ProcessIpcProfile& profile, double started,
     double const AVG_WORKER_MS = static_cast<double>(profile.worker_elapsed_total_ms) / static_cast<double>(profile.completed_runs);
     std::println(stderr,
                  "renderbench: ipc profile slots={} runs={} tiles={}/{} launch={:.3f}s first_packet={:.3f}s last_close={:.3f}s "
-                 "worker_ms min/avg/max={}/{:.1f}/{} read={}B/{} calls",
+                 "worker_ms min/avg/max={}/{:.1f}/{} read={}B/{} calls tail_batches/tiles={}/{}",
                  profile.worker_slots, profile.completed_runs, tiles_done, total_tiles, launch_finished - started,
                  profile.first_packet_seconds, profile.last_close_seconds, MIN_WORKER_MS, AVG_WORKER_MS, profile.max_worker_ms,
-                 profile.total_read_bytes, profile.total_read_calls);
+                 profile.total_read_bytes, profile.total_read_calls, profile.fine_grained_tail_batches, profile.fine_grained_tail_tiles);
     if (profile.slowest_worker_id >= 0) {
         std::println(stderr,
                      "renderbench: ipc slowest worker={} host={} batch={}+{} expected={} unique={} packets={} bytes={} calls={} "
@@ -2403,6 +2417,9 @@ auto write_process_ipc_profile_json(const tracebench::Options& options, const Pr
         << "  \"worker_slots\": " << profile.worker_slots << ",\n"
         << "  \"completed_runs\": " << profile.completed_runs << ",\n"
         << "  \"persistent_batch_size\": " << profile.persistent_batch_size << ",\n"
+        << "  \"fine_grained_process_tail_enabled\": " << (profile.fine_grained_process_tail_enabled ? "true" : "false") << ",\n"
+        << "  \"fine_grained_tail_batches\": " << profile.fine_grained_tail_batches << ",\n"
+        << "  \"fine_grained_tail_tiles\": " << profile.fine_grained_tail_tiles << ",\n"
         << "  \"effective_reserve_cpus\": " << profile.effective_reserve_cpus << ",\n"
         << "  \"node_worker_reserve_cpus\": " << options.node_worker_reserve_cpus << ",\n"
         << "  \"worker_output_queue_disabled\": " << (options.disable_worker_output_queue ? "true" : "false") << ",\n"
@@ -2985,15 +3002,21 @@ auto run_distributed_ipc(const tracebench::Options& options, const std::vector<W
         persistent_batch_worker_threads(options, std::span<const IpcWorkerSpec>(specs.data(), specs.size()));
     int const PERSISTENT_BATCH_SIZE =
         USE_PERSISTENT_WORKER_PROCESSES ? dynamic_batch_size(options, tiles.size(), specs.size(), PERSISTENT_BATCH_THREADS, false) : 0;
+    bool const HAS_MULTIPLE_WORKER_HOSTS =
+        std::ranges::any_of(specs, [&](const IpcWorkerSpec& spec) { return spec.hostname != specs.front().hostname; });
+    size_t const FINE_GRAINED_PROCESS_TAIL_THRESHOLD =
+        USE_PERSISTENT_WORKER_PROCESSES && options.placement == tracebench::Placement::ProcessPerCore && HAS_MULTIPLE_WORKER_HOSTS
+            ? specs.size()
+            : 0U;
     if (options.placement == tracebench::Placement::NodeThreads || options.placement == tracebench::Placement::ProcessPerCore) {
         int const EFFECTIVE_LOCAL_RESERVE_CPUS = local_coordinator_reserve_cpus(options, peers.size());
         std::println(stderr,
-                     "renderbench: ipc config placement={} workers={} persistent_workers={} batch_size={} coordinator_reserve_cpus={} "
-                     "effective_reserve_cpus={} node_worker_reserve_cpus={} coordinator_skip_local_worker={} "
+                     "renderbench: ipc config placement={} workers={} persistent_workers={} batch_size={} fine_grained_tail_enabled={} "
+                     "coordinator_reserve_cpus={} effective_reserve_cpus={} node_worker_reserve_cpus={} coordinator_skip_local_worker={} "
                      "worker_output_queue_disabled={} single_thread_worker_queue_disabled={} tile_size={}",
                      tracebench::placement_name(options.placement), specs.size(), USE_PERSISTENT_WORKER_PROCESSES ? 1 : 0,
-                     PERSISTENT_BATCH_SIZE, options.coordinator_reserve_cpus, EFFECTIVE_LOCAL_RESERVE_CPUS,
-                     options.node_worker_reserve_cpus, options.coordinator_skip_local_worker ? 1 : 0,
+                     PERSISTENT_BATCH_SIZE, FINE_GRAINED_PROCESS_TAIL_THRESHOLD > 0U ? 1 : 0, options.coordinator_reserve_cpus,
+                     EFFECTIVE_LOCAL_RESERVE_CPUS, options.node_worker_reserve_cpus, options.coordinator_skip_local_worker ? 1 : 0,
                      options.disable_worker_output_queue ? 1 : 0, options.disable_single_thread_worker_queue ? 1 : 0, options.tile_size);
     }
 
@@ -3009,6 +3032,7 @@ auto run_distributed_ipc(const tracebench::Options& options, const std::vector<W
     ProcessIpcProfile ipc_profile{};
     initialize_process_ipc_profile(ipc_profile, std::span<const IpcWorkerSpec>(specs.data(), specs.size()));
     ipc_profile.persistent_batch_size = PERSISTENT_BATCH_SIZE;
+    ipc_profile.fine_grained_process_tail_enabled = FINE_GRAINED_PROCESS_TAIL_THRESHOLD > 0U;
     ipc_profile.effective_reserve_cpus = local_coordinator_reserve_cpus(options, peers.size());
     size_t open_pipes = 0;
     for (size_t i = 0; i < specs.size(); ++i) {
@@ -3019,7 +3043,7 @@ auto run_distributed_ipc(const tracebench::Options& options, const std::vector<W
             }
             ++open_pipes;
             int const ASSIGNED = assign_worker_batch(workers[i], std::span<const tracebench::Tile>(tiles.data(), tiles.size()), tile_owner,
-                                                     next_tile_position, PERSISTENT_BATCH_SIZE);
+                                                     next_tile_position, PERSISTENT_BATCH_SIZE, FINE_GRAINED_PROCESS_TAIL_THRESHOLD);
             if (ASSIGNED < 0) {
                 ok = false;
                 break;
@@ -3121,7 +3145,7 @@ auto run_distributed_ipc(const tracebench::Options& options, const std::vector<W
             } else if (ok && USE_PERSISTENT_WORKER_PROCESSES && !worker_termination_expected && worker.ready_for_batch &&
                        !worker.stop_sent) {
                 int const ASSIGNED = assign_worker_batch(worker, std::span<const tracebench::Tile>(tiles.data(), tiles.size()), tile_owner,
-                                                         next_tile_position, PERSISTENT_BATCH_SIZE);
+                                                         next_tile_position, PERSISTENT_BATCH_SIZE, FINE_GRAINED_PROCESS_TAIL_THRESHOLD);
                 if (ASSIGNED < 0) {
                     ok = false;
                 }
