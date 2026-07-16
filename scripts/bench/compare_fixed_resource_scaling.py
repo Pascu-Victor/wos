@@ -884,6 +884,7 @@ def validate_render_completion(
     profile = result.get("ipc_profile")
     if not isinstance(profile, dict):
         raise ComparisonError(f"{manifest_path}: {step_name} has no IPC profile")
+    persistent_batch_size = profile.get("persistent_batch_size")
     if (
         profile.get("tiles_done") != total_tiles
         or profile.get("total_tiles") != total_tiles
@@ -893,8 +894,10 @@ def validate_render_completion(
         != result.get("worker_output_queue_disabled")
         or profile.get("single_thread_worker_queue_disabled")
         != result.get("single_thread_worker_queue_disabled")
-        or profile.get("process_persistent_workers") is not False
-        or profile.get("persistent_batch_size") != 0
+        or profile.get("process_persistent_workers") is not True
+        or isinstance(persistent_batch_size, bool)
+        or not isinstance(persistent_batch_size, int)
+        or persistent_batch_size <= 0
     ):
         raise ComparisonError(
             f"{manifest_path}: {step_name} IPC profile disagrees with the fixed workload"
@@ -913,7 +916,7 @@ def validate_render_completion(
         or worker_slots <= 0
         or isinstance(completed_runs, bool)
         or not isinstance(completed_runs, int)
-        or completed_runs < worker_slots
+        or completed_runs != worker_slots
     ):
         raise ComparisonError(
             f"{manifest_path}: {step_name} has incomplete worker slots"
@@ -921,10 +924,6 @@ def validate_render_completion(
     if profile.get("effective_reserve_cpus") != 0:
         raise ComparisonError(
             f"{manifest_path}: {step_name} did not use the full fixed CPU budget"
-        )
-    if not isinstance(profile.get("process_persistent_workers"), bool):
-        raise ComparisonError(
-            f"{manifest_path}: {step_name} has no persistent-worker provenance"
         )
     raw_hosts = profile.get("hosts")
     if not isinstance(raw_hosts, list):
@@ -1005,6 +1004,11 @@ def validate_render_completion(
         raise ComparisonError(
             f"{manifest_path}: {step_name} per-host configured slots do not match worker slots"
         )
+    for host in expected_hosts:
+        if runs_by_host[host] != configured_slots_by_host[host]:
+            raise ComparisonError(
+                f"{manifest_path}: {step_name} host {host} did not complete exactly one persistent process per configured slot"
+            )
     if placement == "node-threads":
         if worker_slots != len(expected_hosts):
             raise ComparisonError(

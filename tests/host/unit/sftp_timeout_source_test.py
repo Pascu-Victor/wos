@@ -122,7 +122,7 @@ def test_cross_os_artifact_fetches_are_bounded() -> None:
     )
 
 
-def test_cross_os_process_persistent_workers_are_explicit() -> None:
+def test_cross_os_optimal_render_uses_rollbackable_persistent_workers() -> None:
     source = BENCH_SUITE.read_text()
     module = ast.parse(source, filename=str(BENCH_SUITE))
 
@@ -131,18 +131,24 @@ def test_cross_os_process_persistent_workers_are_explicit() -> None:
     if body is None:
         fail("missing run_wos_renderbench source segment")
 
-    if 'args.wos_render_tuning in {"optimal", "safe"}' in body:
-        fail("WOS render tuning must not implicitly enable persistent process-per-core workers")
-    if 'elif args.wos_enable_process_persistent_workers:' not in body:
-        fail("WOS persistent process workers must remain an explicit opt-in")
-    if 'command += ["--enable-process-persistent-workers"]' not in body:
-        fail("WOS renderbench process worker opt-in no longer passes the renderbench flag")
+    disable_branch = "if args.wos_disable_process_persistent_workers:"
+    enable_branch = 'elif args.wos_enable_process_persistent_workers or args.wos_render_tuning == "optimal":'
+    if disable_branch not in body or enable_branch not in body:
+        fail("WOS optimal render persistence policy or explicit rollback is missing")
+    if body.index(disable_branch) >= body.index(enable_branch):
+        fail("WOS explicit persistent-worker rollback must take precedence over optimal tuning")
+    for flag in (
+        'command += ["--disable-process-persistent-workers"]',
+        'command += ["--enable-process-persistent-workers"]',
+    ):
+        if flag not in body:
+            fail(f"WOS renderbench persistence policy no longer passes {flag}")
 
 
 def main() -> None:
     test_cluster_live_sync_sftp_batches_are_bounded()
     test_cross_os_artifact_fetches_are_bounded()
-    test_cross_os_process_persistent_workers_are_explicit()
+    test_cross_os_optimal_render_uses_rollbackable_persistent_workers()
     print("SFTP automation paths are timeout bounded")
 
 

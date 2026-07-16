@@ -129,11 +129,11 @@ def render_result(elapsed: float, node_count: int, step_name: str) -> dict[str, 
     for hostname, vcpus, _ in layout:
         if placement == "node-threads":
             configured_slots = 1
-            runs = 2
+            runs = configured_slots
             effective_threads = vcpus
         else:
             configured_slots = vcpus
-            runs = vcpus + 1
+            runs = configured_slots
             effective_threads = 1
         host_records.append(
             {
@@ -192,8 +192,8 @@ def render_result(elapsed: float, node_count: int, step_name: str) -> dict[str, 
             "node_worker_reserve_cpus": 0,
             "worker_output_queue_disabled": True,
             "single_thread_worker_queue_disabled": True,
-            "process_persistent_workers": False,
-            "persistent_batch_size": 0,
+            "process_persistent_workers": True,
+            "persistent_batch_size": 8,
             "read_bytes": total_tiles * 4096,
             "read_calls": total_tiles,
             "worker_slots": worker_slots,
@@ -984,17 +984,20 @@ def test_render_matrix_and_per_host_work_are_enforced(comparator) -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
 
-        dynamic_runs = complete_matrix(root / "dynamic-runs")
-        dynamic_candidate = result_path_for(
-            dynamic_runs[-1], "wos-render-duck-node-threads"
+        persistent_runs = complete_matrix(root / "persistent-runs")
+        persistent_candidate = result_path_for(
+            persistent_runs[-1], "wos-render-duck-node-threads"
         )
-        dynamic_profile = read_json(dynamic_candidate)["ipc_profile"]
-        if dynamic_profile["completed_runs"] <= dynamic_profile["worker_slots"]:
-            fail("synthetic render profile does not exercise repeated dynamic runs")
-        dynamic_result = comparator.compare_runs(
-            dynamic_runs, required_workloads=("rendering",)
+        persistent_profile = read_json(persistent_candidate)["ipc_profile"]
+        assert_equal(
+            persistent_profile["completed_runs"],
+            persistent_profile["worker_slots"],
+            "persistent render process cardinality",
         )
-        assert_equal(dynamic_result["pass"], True, "dynamic render runs comparison")
+        persistent_result = comparator.compare_runs(
+            persistent_runs, required_workloads=("rendering",)
+        )
+        assert_equal(persistent_result["pass"], True, "persistent render comparison")
 
         incomplete = complete_matrix(root / "incomplete")
         payload = read_json(incomplete[-1])
@@ -1052,6 +1055,64 @@ def test_render_matrix_and_per_host_work_are_enforced(comparator) -> None:
             comparator,
             incomplete_runs,
             "incomplete worker slots",
+            required_workloads=("rendering",),
+        )
+
+        repeated_runs = complete_matrix(root / "repeated-runs")
+        candidate = result_path_for(
+            repeated_runs[-1], "wos-render-duck-process-per-core"
+        )
+        payload = read_json(candidate)
+        payload["ipc_profile"]["completed_runs"] += 1
+        payload["ipc_profile"]["hosts"][-1]["runs"] += 1
+        write_json(candidate, payload)
+        expect_error(
+            comparator,
+            repeated_runs,
+            "incomplete worker slots",
+            required_workloads=("rendering",),
+        )
+
+        nonpersistent = complete_matrix(root / "nonpersistent")
+        candidate = result_path_for(
+            nonpersistent[-1], "wos-render-duck-node-threads"
+        )
+        payload = read_json(candidate)
+        payload["ipc_profile"]["process_persistent_workers"] = False
+        write_json(candidate, payload)
+        expect_error(
+            comparator,
+            nonpersistent,
+            "IPC profile disagrees with the fixed workload",
+            required_workloads=("rendering",),
+        )
+
+        zero_batch = complete_matrix(root / "zero-persistent-batch")
+        candidate = result_path_for(
+            zero_batch[-1], "wos-render-duck-node-threads"
+        )
+        payload = read_json(candidate)
+        payload["ipc_profile"]["persistent_batch_size"] = 0
+        write_json(candidate, payload)
+        expect_error(
+            comparator,
+            zero_batch,
+            "IPC profile disagrees with the fixed workload",
+            required_workloads=("rendering",),
+        )
+
+        wrong_host_runs = complete_matrix(root / "wrong-host-runs")
+        candidate = result_path_for(
+            wrong_host_runs[-1], "wos-render-duck-process-per-core"
+        )
+        payload = read_json(candidate)
+        payload["ipc_profile"]["hosts"][0]["runs"] -= 1
+        payload["ipc_profile"]["hosts"][-1]["runs"] += 1
+        write_json(candidate, payload)
+        expect_error(
+            comparator,
+            wrong_host_runs,
+            "exactly one persistent process per configured slot",
             required_workloads=("rendering",),
         )
 

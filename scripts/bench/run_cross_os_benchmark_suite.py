@@ -1551,11 +1551,10 @@ def run_wos_renderbench(
         command += ["--enable-single-thread-worker-queue"]
     elif args.wos_disable_single_thread_worker_queue:
         command += ["--disable-single-thread-worker-queue"]
-    if placement == "process-per-core":
-        if args.wos_disable_process_persistent_workers:
-            command += ["--disable-process-persistent-workers"]
-        elif args.wos_enable_process_persistent_workers:
-            command += ["--enable-process-persistent-workers"]
+    if args.wos_disable_process_persistent_workers:
+        command += ["--disable-process-persistent-workers"]
+    elif args.wos_enable_process_persistent_workers or args.wos_render_tuning == "optimal":
+        command += ["--enable-process-persistent-workers"]
 
     host_command = [str(REMOTE_SCRIPTS / "wos_ssh.sh"), host, *command]
     write_text(step_dir / "command.log", "=== command ===\n" + shlex.join(host_command) + "\n")
@@ -2020,9 +2019,8 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("manual", "optimal", "safe"),
         default="manual",
         help=(
-            "Category-specific WOS renderbench tuning. 'optimal' explicitly uses coordinator reserve 0 "
-            "and 'safe' also reserves one node-thread CPU per host. Persistent process-per-core workers remain "
-            "explicitly opt-in."
+            "Category-specific WOS renderbench tuning. 'optimal' uses coordinator reserve 0 and persistent "
+            "command-stream worker processes; 'safe' reserves one node-thread CPU per host."
         ),
     )
     parser.add_argument(
@@ -2059,12 +2057,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--wos-disable-process-persistent-workers",
         action="store_true",
-        help="Use dynamic short-lived WOS process-per-core workers instead of persistent command-stream workers.",
+        help="Use dynamic short-lived WOS render workers instead of persistent command-stream processes.",
     )
     parser.add_argument(
         "--wos-enable-process-persistent-workers",
         action="store_true",
-        help="Force persistent command-stream workers for WOS process-per-core renderbench.",
+        help="Force persistent command-stream worker processes for both WOS render placements.",
     )
     parser.add_argument("--linux-render-threads", type=int)
     parser.add_argument("--linux-use-host-binary", action="store_true")

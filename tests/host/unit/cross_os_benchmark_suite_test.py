@@ -930,6 +930,11 @@ def test_wos_render_command_and_scene_evidence(runner) -> None:
                 1,
                 "optimal node-thread reserve count",
             )
+            assert_equal(
+                builtin_command.count("--enable-process-persistent-workers"),
+                1,
+                "optimal node-thread persistent process count",
+            )
             if "--scene" in builtin_command:
                 fail(f"builtin render unexpectedly supplied a scene: {builtin_command}")
             builtin_result = json.loads(
@@ -953,6 +958,11 @@ def test_wos_render_command_and_scene_evidence(runner) -> None:
             reserve_index = duck_command.index("--coordinator-reserve-cpus")
             assert_equal(
                 duck_command[reserve_index + 1], "0", "optimal process reserve"
+            )
+            assert_equal(
+                duck_command.count("--enable-process-persistent-workers"),
+                1,
+                "optimal process-per-core persistent process count",
             )
             scene_index = duck_command.index("--scene")
             assert_equal(duck_command[scene_index + 1], "/srv/Duck.glb", "Duck scene path")
@@ -981,6 +991,35 @@ def test_wos_render_command_and_scene_evidence(runner) -> None:
             )
             if "--coordinator-reserve-cpus" in manual_step["command"]:
                 fail(f"manual render unexpectedly forced coordinator reserve: {manual_step['command']}")
+            if "--enable-process-persistent-workers" in manual_step["command"]:
+                fail(f"manual render unexpectedly enabled persistent workers: {manual_step['command']}")
+
+        rollback_args = parser.parse_args(
+            [
+                "--num-vms",
+                "2",
+                "--wos-render-tuning",
+                "optimal",
+                "--wos-disable-process-persistent-workers",
+            ]
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            rollback_step = runner.run_wos_renderbench(
+                rollback_args,
+                Path(tmp),
+                "/tmp/render-rollback",
+                host,
+                hosts,
+                runner.render_cases(rollback_args)[0],
+                "node-threads",
+            )
+            assert_equal(
+                rollback_step["command"].count("--disable-process-persistent-workers"),
+                1,
+                "optimal persistent process rollback count",
+            )
+            if "--enable-process-persistent-workers" in rollback_step["command"]:
+                fail(f"optimal rollback also enabled persistent workers: {rollback_step['command']}")
 
         runner.wos_remote_command = lambda remote_host, command, *, timeout=None: subprocess.CompletedProcess(
             [remote_host, command], 0, f"{'A' * 64}  /srv/Duck.glb\n", ""

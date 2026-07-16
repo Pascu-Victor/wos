@@ -1311,24 +1311,33 @@ void note_worker_done_packet(ChildWorker& worker, const WorkerDonePacket& packet
     }
 }
 
-void note_worker_batch_done_packet(ChildWorker& worker, const WorkerBatchDonePacket& packet) {
+auto note_worker_batch_done_packet(ChildWorker& worker, const WorkerBatchDonePacket& packet) -> bool {
     ++worker.batch_done_packets;
     worker.last_batch_done_at = tracebench::monotonic_seconds();
     worker.last_batch_rendered_tiles = packet.rendered_tiles;
     worker.last_batch_sent_tiles = packet.sent_tiles;
     worker.last_batch_failed = packet.failed != 0;
     worker.last_batch_elapsed_ms = packet.elapsed_ms;
+    bool batch_ok = worker.command_stream && !worker.ready_for_batch;
     if (packet.worker_id != static_cast<uint32_t>(worker.worker_id)) {
         std::println(stderr, "renderbench: batch-done packet from {} reported worker {} expected {}", worker.hostname, packet.worker_id,
                      worker.worker_id);
-        worker.done_failed = true;
+        batch_ok = false;
+    }
+    if (worker.batch_start < 0 || worker.batch_count <= 0 || packet.batch_start != static_cast<uint32_t>(worker.batch_start) ||
+        packet.batch_count != static_cast<uint32_t>(worker.batch_count)) {
+        std::println(stderr, "renderbench: worker {} batch-done range mismatch host={} expected={}+{} reported={}+{}", worker.worker_id,
+                     worker.hostname, worker.batch_start, worker.batch_count, packet.batch_start, packet.batch_count);
+        batch_ok = false;
     }
     if (packet.failed != 0 || packet.rendered_tiles != packet.batch_count || packet.sent_tiles != packet.batch_count) {
         std::println(stderr, "renderbench: worker {} batch mismatch host={} batch={}+{} rendered={} sent={} failed={}", worker.worker_id,
                      worker.hostname, packet.batch_start, packet.batch_count, packet.rendered_tiles, packet.sent_tiles, packet.failed);
-        worker.done_failed = true;
+        batch_ok = false;
     }
-    worker.ready_for_batch = true;
+    worker.done_failed = worker.done_failed || !batch_ok;
+    worker.ready_for_batch = batch_ok && !worker.done_failed;
+    return worker.ready_for_batch;
 }
 
 auto note_worker_tile_packet(ChildWorker& worker, const TilePacketHeader& header, std::vector<unsigned char>& tile_seen,
@@ -1399,7 +1408,9 @@ auto parse_worker_packets(ChildWorker& worker, tracebench::FilmView film, std::v
             }
             WorkerBatchDonePacket packet = {};
             std::memcpy(&packet, worker.buffer.data() + consumed, sizeof(packet));
-            note_worker_batch_done_packet(worker, packet);
+            if (!note_worker_batch_done_packet(worker, packet)) {
+                return false;
+            }
             consumed += sizeof(packet);
             continue;
         }
@@ -2614,7 +2625,7 @@ auto run_node_threads(const tracebench::Options& options) -> int {
         }
         bool const LIVE_PROGRESS_PREVIEW =
             options.live_preview && CURRENT_TILES_DONE != last_preview_tiles_done && (last_preview_tiles_done == 0 || NOW >= next_preview);
-        if (NOW >= next_preview || !running || LIVE_PROGRESS_PREVIEW) {
+        if (options.live_preview && (NOW >= next_preview || !running || LIVE_PROGRESS_PREVIEW)) {
             (void)tracebench::write_preview_png(options, film);
             last_preview_tiles_done = CURRENT_TILES_DONE;
             next_preview = NOW + options.preview_update_interval_seconds;
@@ -2947,10 +2958,11 @@ auto run_distributed_ipc(const tracebench::Options& options, const std::vector<W
         return run_node_threads(options);
     }
 
-    bool const USE_PERSISTENT_PROCESS_BATCHES =
-        options.placement == tracebench::Placement::ProcessPerCore && options.process_persistent_workers;
+    // The command stream retains only the process and loaded scene. Each
+    // batch still creates and joins its render threads in run_ipc_worker().
+    bool const USE_PERSISTENT_WORKER_PROCESSES = options.process_persistent_workers;
     for (auto& spec : specs) {
-        spec.command_stream = USE_PERSISTENT_PROCESS_BATCHES;
+        spec.command_stream = USE_PERSISTENT_WORKER_PROCESSES;
     }
 
     auto tiles = tracebench::make_tiles(options.width, options.height, options.tile_size);
@@ -2958,9 +2970,9 @@ auto run_distributed_ipc(const tracebench::Options& options, const std::vector<W
     tracebench::FilmView film{.width = options.width, .height = options.height, .rgb = std::span<float>(storage.data(), storage.size())};
     std::vector<ChildWorker> workers(specs.size());
     std::vector<unsigned char> tile_seen(tiles.size(), 0);
-    bool const USE_DYNAMIC_BATCHES = !USE_PERSISTENT_PROCESS_BATCHES && (options.placement == tracebench::Placement::NodeThreads ||
-                                                                         options.placement == tracebench::Placement::ProcessPerCore);
-    bool const USE_DYNAMIC_ASSIGNMENT = USE_DYNAMIC_BATCHES || USE_PERSISTENT_PROCESS_BATCHES;
+    bool const USE_DYNAMIC_BATCHES = !USE_PERSISTENT_WORKER_PROCESSES && (options.placement == tracebench::Placement::NodeThreads ||
+                                                                          options.placement == tracebench::Placement::ProcessPerCore);
+    bool const USE_DYNAMIC_ASSIGNMENT = USE_DYNAMIC_BATCHES || USE_PERSISTENT_WORKER_PROCESSES;
     if (options.placement == tracebench::Placement::ProcessPerCore) {
         scramble_process_tiles(tiles);
     }
@@ -2972,14 +2984,14 @@ auto run_distributed_ipc(const tracebench::Options& options, const std::vector<W
     int const PERSISTENT_BATCH_THREADS =
         persistent_batch_worker_threads(options, std::span<const IpcWorkerSpec>(specs.data(), specs.size()));
     int const PERSISTENT_BATCH_SIZE =
-        USE_PERSISTENT_PROCESS_BATCHES ? dynamic_batch_size(options, tiles.size(), specs.size(), PERSISTENT_BATCH_THREADS, false) : 0;
+        USE_PERSISTENT_WORKER_PROCESSES ? dynamic_batch_size(options, tiles.size(), specs.size(), PERSISTENT_BATCH_THREADS, false) : 0;
     if (options.placement == tracebench::Placement::NodeThreads || options.placement == tracebench::Placement::ProcessPerCore) {
         int const EFFECTIVE_LOCAL_RESERVE_CPUS = local_coordinator_reserve_cpus(options, peers.size());
         std::println(stderr,
                      "renderbench: ipc config placement={} workers={} persistent_workers={} batch_size={} coordinator_reserve_cpus={} "
                      "effective_reserve_cpus={} node_worker_reserve_cpus={} coordinator_skip_local_worker={} "
                      "worker_output_queue_disabled={} single_thread_worker_queue_disabled={} tile_size={}",
-                     tracebench::placement_name(options.placement), specs.size(), USE_PERSISTENT_PROCESS_BATCHES ? 1 : 0,
+                     tracebench::placement_name(options.placement), specs.size(), USE_PERSISTENT_WORKER_PROCESSES ? 1 : 0,
                      PERSISTENT_BATCH_SIZE, options.coordinator_reserve_cpus, EFFECTIVE_LOCAL_RESERVE_CPUS,
                      options.node_worker_reserve_cpus, options.coordinator_skip_local_worker ? 1 : 0,
                      options.disable_worker_output_queue ? 1 : 0, options.disable_single_thread_worker_queue ? 1 : 0, options.tile_size);
@@ -3000,7 +3012,7 @@ auto run_distributed_ipc(const tracebench::Options& options, const std::vector<W
     ipc_profile.effective_reserve_cpus = local_coordinator_reserve_cpus(options, peers.size());
     size_t open_pipes = 0;
     for (size_t i = 0; i < specs.size(); ++i) {
-        if (USE_PERSISTENT_PROCESS_BATCHES) {
+        if (USE_PERSISTENT_WORKER_PROCESSES) {
             if (!launch_worker(PROGRAM_PATH, options, specs[i], workers[i])) {
                 ok = false;
                 break;
@@ -3031,12 +3043,12 @@ auto run_distributed_ipc(const tracebench::Options& options, const std::vector<W
             workers[i].expected_tiles =
                 expected_tile_count_for_slots(tiles.size(), specs[i].first_slot, specs[i].slot_count, specs[i].total_slots);
         }
-        if (!USE_PERSISTENT_PROCESS_BATCHES) {
+        if (!USE_PERSISTENT_WORKER_PROCESSES) {
             ++open_pipes;
         }
         if (cancel_requested()) {
             signal_workers(std::span<ChildWorker>(workers.data(), workers.size()), static_cast<int>(g_cancel_signal));
-            (void)wait_for_children(std::span<ChildWorker>(workers.data(), workers.size()), true);
+            (void)wait_for_children_after_cancel(std::span<ChildWorker>(workers.data(), workers.size()), true);
             return cancel_exit_code();
         }
     }
@@ -3106,7 +3118,7 @@ auto run_distributed_ipc(const tracebench::Options& options, const std::vector<W
                         ++open_pipes;
                     }
                 }
-            } else if (ok && USE_PERSISTENT_PROCESS_BATCHES && !worker_termination_expected && worker.ready_for_batch &&
+            } else if (ok && USE_PERSISTENT_WORKER_PROCESSES && !worker_termination_expected && worker.ready_for_batch &&
                        !worker.stop_sent) {
                 int const ASSIGNED = assign_worker_batch(worker, std::span<const tracebench::Tile>(tiles.data(), tiles.size()), tile_owner,
                                                          next_tile_position, PERSISTENT_BATCH_SIZE);
@@ -3137,7 +3149,7 @@ auto run_distributed_ipc(const tracebench::Options& options, const std::vector<W
         }
         bool const LIVE_PROGRESS_PREVIEW =
             options.live_preview && tiles_done != last_preview_tiles_done && (last_preview_tiles_done == 0 || NOW >= next_preview);
-        if (NOW >= next_preview || open_pipes == 0 || LIVE_PROGRESS_PREVIEW) {
+        if (options.live_preview && (NOW >= next_preview || open_pipes == 0 || LIVE_PROGRESS_PREVIEW)) {
             (void)tracebench::write_preview_png(options, film);
             last_preview_tiles_done = tiles_done;
             next_preview = NOW + options.preview_update_interval_seconds;

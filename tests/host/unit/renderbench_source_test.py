@@ -106,6 +106,17 @@ def test_renderbench_worker_cancellation_is_cooperative() -> None:
         if "cancel_requested()" not in body:
             fail(f"{name} must observe cooperative cancellation")
 
+    coordinator_body = function_body(source, "run_distributed_ipc")
+    require_tokens(
+        coordinator_body,
+        [
+            "wait_for_children_after_cancel(std::span<ChildWorker>(workers.data(), workers.size()), true)",
+        ],
+        "renderbench parallel initial-launch cancellation",
+    )
+    if "wait_for_children(std::span<ChildWorker>(workers.data(), workers.size()), true)" in coordinator_body:
+        fail("renderbench initial-launch cancellation must not wait for children sequentially")
+
 
 def test_renderbench_worker_stream_corruption_is_fatal() -> None:
     source = RENDERBENCH_MAIN_CPP.read_text()
@@ -120,6 +131,25 @@ def test_renderbench_worker_stream_corruption_is_fatal() -> None:
             "return false;",
         ],
         "renderbench corrupt worker stream handling",
+    )
+
+    batch_done_body = function_body(source, "note_worker_batch_done_packet")
+    require_tokens(
+        batch_done_body,
+        [
+            "worker.command_stream && !worker.ready_for_batch",
+            "packet.batch_start != static_cast<uint32_t>(worker.batch_start)",
+            "packet.batch_count != static_cast<uint32_t>(worker.batch_count)",
+            "worker.done_failed = worker.done_failed || !batch_ok",
+            "worker.ready_for_batch = batch_ok && !worker.done_failed",
+            "return worker.ready_for_batch",
+        ],
+        "renderbench batch completion validation",
+    )
+    require_tokens(
+        body,
+        ["if (!note_worker_batch_done_packet(worker, packet))", "return false;"],
+        "renderbench invalid batch completion propagation",
     )
 
 
@@ -397,17 +427,17 @@ def test_renderbench_non_live_tiles_use_bounded_write_batches() -> None:
     )
 
 
-def test_renderbench_node_threads_avoid_persistent_command_stream() -> None:
+def test_renderbench_persistent_command_stream_retains_ephemeral_batch_threads() -> None:
     source = RENDERBENCH_MAIN_CPP.read_text()
     run_body = function_body(source, "run_distributed_ipc")
     require_tokens(
         run_body,
         [
-            "USE_PERSISTENT_PROCESS_BATCHES =\n        options.placement == tracebench::Placement::ProcessPerCore && options.process_persistent_workers",
-            "USE_DYNAMIC_BATCHES = !USE_PERSISTENT_PROCESS_BATCHES && (options.placement == tracebench::Placement::NodeThreads",
-            "spec.command_stream = USE_PERSISTENT_PROCESS_BATCHES",
+            "USE_PERSISTENT_WORKER_PROCESSES = options.process_persistent_workers",
+            "USE_DYNAMIC_BATCHES = !USE_PERSISTENT_WORKER_PROCESSES && (options.placement == tracebench::Placement::NodeThreads",
+            "spec.command_stream = USE_PERSISTENT_WORKER_PROCESSES",
         ],
-        "renderbench node-thread command-stream policy",
+        "renderbench persistent command-stream policy",
     )
 
     worker_body = function_body(source, "run_ipc_worker")
@@ -489,6 +519,41 @@ def test_renderbench_live_mode_streams_worker_tiles() -> None:
             "++queue->sent",
         ],
         "renderbench live output writer accounting",
+    )
+
+    node_body = function_body(source, "run_node_threads")
+    distributed_body = function_body(source, "run_distributed_ipc")
+    require_tokens(
+        node_body,
+        [
+            "if (options.live_preview && (NOW >= next_preview || !running || LIVE_PROGRESS_PREVIEW))",
+            "write_metrics(options, progress, RAYS_PER_SECOND)",
+            "write_preview_png(options, film)",
+        ],
+        "renderbench local preview gating",
+    )
+    require_tokens(
+        distributed_body,
+        [
+            "if (options.live_preview && (NOW >= next_preview || open_pipes == 0 || LIVE_PROGRESS_PREVIEW))",
+            "write_metrics(options, progress, RAYS_PER_SECOND)",
+            "write_preview_png(options, film)",
+        ],
+        "renderbench distributed preview gating",
+    )
+    require_order(
+        node_body[node_body.rfind("write_metrics(options, progress, RAYS_PER_SECOND)") :],
+        "write_metrics(options, progress, RAYS_PER_SECOND)",
+        "write_preview_png(options, film)",
+        "renderbench local final preview must remain outside timed metrics",
+    )
+    require_order(
+        distributed_body[
+            distributed_body.rfind("write_metrics(options, progress, RAYS_PER_SECOND)") :
+        ],
+        "write_metrics(options, progress, RAYS_PER_SECOND)",
+        "write_preview_png(options, film)",
+        "renderbench distributed final preview must remain outside timed metrics",
     )
 
 
@@ -600,7 +665,7 @@ def main() -> None:
     test_renderbench_coordinator_stall_report_exposes_batch_state()
     test_renderbench_command_stream_uses_per_batch_thread_join()
     test_renderbench_non_live_tiles_use_bounded_write_batches()
-    test_renderbench_node_threads_avoid_persistent_command_stream()
+    test_renderbench_persistent_command_stream_retains_ephemeral_batch_threads()
     test_renderbench_node_threads_balance_without_discarding_tile_locality()
     test_renderbench_live_mode_streams_worker_tiles()
     test_renderbench_ipc_profile_separates_capacity_from_dynamic_runs()
