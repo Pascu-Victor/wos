@@ -33,10 +33,6 @@ KTEST(WkiRemoteVfsUtimens, WirePathValidationRejectsEscapes) {
     KEXPECT_TRUE(ker::net::wki::wki_remote_vfs_selftest_utimens_wire_path_validation());
 }
 
-KTEST(WkiRemoteVfsCompletionAssist, IncludesOnlyLatencyMetadataOperations) {
-    KEXPECT_TRUE(ker::net::wki::wki_remote_vfs_selftest_completion_assist_scope());
-}
-
 KTEST(WkiRemoteVfsProxySlot, WaitersRemainFifo) { KEXPECT_TRUE(ker::net::wki::wki_remote_vfs_selftest_slot_waiter_fifo()); }
 
 KTEST(WkiRemoteVfsProxySlot, StaleCancelPreservesSuccessor) {

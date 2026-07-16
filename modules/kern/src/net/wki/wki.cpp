@@ -770,133 +770,15 @@ void publish_claimed_wait_entry(WkiWaitEntry* entry, int result) {
            !is_timer_deferred_waiter(waiter_task) && mod::sched::preempt_count() == 0 && !waiter_task->has_interrupting_signal_pending();
 }
 
-constexpr uint64_t WKI_WAIT_COMPLETION_ASSIST_BUDGET_US = 32;
-constexpr uint8_t WKI_WAIT_COMPLETION_ASSIST_MAX_BATCHES = 64;
-constexpr uint8_t WKI_WAIT_COMPLETION_ASSIST_PAUSES_PER_BATCH = 32;
-constexpr uint16_t WKI_WAIT_COMPLETION_ASSIST_MAX_PAUSES =
-    static_cast<uint16_t>(WKI_WAIT_COMPLETION_ASSIST_MAX_BATCHES) * WKI_WAIT_COMPLETION_ASSIST_PAUSES_PER_BATCH;
-static_assert(WKI_WAIT_COMPLETION_ASSIST_MAX_PAUSES == 2048);
-
-enum class WaitCompletionAssistDecision : uint8_t {
-    CONTINUE = 0,
-    SKIPPED = 1,
-    HIT = 2,
-    EXHAUSTED = 3,
-};
-
-constexpr auto wait_completion_assist_decision(bool done, bool can_assist, bool channel_live, bool deadline_expired, uint8_t batches)
-    -> WaitCompletionAssistDecision {
-    if (done) {
-        return batches == 0 ? WaitCompletionAssistDecision::SKIPPED : WaitCompletionAssistDecision::HIT;
-    }
-    if (batches >= WKI_WAIT_COMPLETION_ASSIST_MAX_BATCHES) {
-        return WaitCompletionAssistDecision::EXHAUSTED;
-    }
-    if (deadline_expired) {
-        // Reaching either the soft budget or the clamped operation deadline is
-        // exhaustion once any progress work ran; zero-work deadline skips are
-        // not reported as failed assists.
-        return batches == 0 ? WaitCompletionAssistDecision::SKIPPED : WaitCompletionAssistDecision::EXHAUSTED;
-    }
-    if (!can_assist || !channel_live) {
-        return WaitCompletionAssistDecision::SKIPPED;
-    }
-    return WaitCompletionAssistDecision::CONTINUE;
-}
-
-auto wait_completion_channel_is_live_nonblocking(const WkiChannelIdentity& identity) -> bool {
-    if (identity.channel == nullptr || identity.peer_node_id == WKI_NODE_INVALID || identity.generation == 0) {
-        return false;
-    }
-    if (!identity.channel->lock.try_lock()) {
-        return false;
-    }
-    bool const LIVE = identity.channel->active && identity.channel->peer_node_id == identity.peer_node_id &&
-                      identity.channel->channel_id == identity.channel_id && identity.channel->generation == identity.generation;
-    identity.channel->lock.unlock();
-    return LIVE;
-}
-
-void finish_wait_completion_assist(WkiWaitHint* hint, WkiWaitAssistOutcome outcome, uint64_t started_us) {
-    hint->completion_assist_outcome = outcome;
-    if (hint->completion_assist_batches == 0) {
-        hint->completion_assist_elapsed_us = 0;
-        return;
-    }
-    uint64_t const ELAPSED_US = wki_now_us() - started_us;
-    hint->completion_assist_elapsed_us = static_cast<uint32_t>(std::min<uint64_t>(ELAPSED_US, UINT32_MAX));
-}
-
-void run_wait_completion_assist(WkiWaitEntry* entry, WkiWaitHint* hint) {
-    if (hint == nullptr) {
-        return;
-    }
-
-    hint->completion_assist_outcome = WkiWaitAssistOutcome::SKIPPED;
-    hint->completion_assist_elapsed_us = 0;
-    hint->completion_assist_pauses = 0;
-    hint->completion_assist_batches = 0;
-    if (entry == nullptr || hint->completion_channel.channel == nullptr || hint->completion_channel.generation == 0 || wait_done(entry)) {
-        return;
-    }
-
-    uint64_t const ASSIST_STARTED_US = wki_now_us();
-    uint64_t assist_deadline_us = wki_future_deadline_us(ASSIST_STARTED_US, WKI_WAIT_COMPLETION_ASSIST_BUDGET_US);
-    if (entry->deadline_us != 0 && entry->deadline_us <= assist_deadline_us) {
-        assist_deadline_us = entry->deadline_us;
-    }
-
-    // Passive spinning never drives transport, timer, scheduler, or allocation
-    // work from the IF-masked syscall context. The deadline is checked before
-    // every fixed pause batch; the explicit batch/pause caps also bound work if
-    // the platform clock stalls. Any exact-channel contention or reuse falls
-    // through to the ordinary wait path.
-    while (true) {
-        bool const DONE = wait_done(entry);
-        uint64_t const NOW_US = wki_now_us();
-        auto* waiter_task = entry->task.load(std::memory_order_acquire);
-        bool const CAN_ASSIST = process_wait_can_park(waiter_task);
-        bool const CHANNEL_LIVE = CAN_ASSIST && wait_completion_channel_is_live_nonblocking(hint->completion_channel);
-        WaitCompletionAssistDecision const DECISION =
-            wait_completion_assist_decision(DONE, CAN_ASSIST, CHANNEL_LIVE, NOW_US >= assist_deadline_us, hint->completion_assist_batches);
-        switch (DECISION) {
-            case WaitCompletionAssistDecision::SKIPPED:
-                finish_wait_completion_assist(hint, WkiWaitAssistOutcome::SKIPPED, ASSIST_STARTED_US);
-                return;
-            case WaitCompletionAssistDecision::HIT:
-                finish_wait_completion_assist(hint, WkiWaitAssistOutcome::HIT, ASSIST_STARTED_US);
-                return;
-            case WaitCompletionAssistDecision::EXHAUSTED:
-                finish_wait_completion_assist(hint, WkiWaitAssistOutcome::EXHAUSTED, ASSIST_STARTED_US);
-                return;
-            case WaitCompletionAssistDecision::CONTINUE:
-                break;
-        }
-
-        if (wait_done(entry)) {
-            finish_wait_completion_assist(
-                hint, hint->completion_assist_batches == 0 ? WkiWaitAssistOutcome::SKIPPED : WkiWaitAssistOutcome::HIT, ASSIST_STARTED_US);
-            return;
-        }
-        for (uint8_t pause_count = 0; pause_count < WKI_WAIT_COMPLETION_ASSIST_PAUSES_PER_BATCH; ++pause_count) {
-            asm volatile("pause" ::: "memory");
-        }
-        hint->completion_assist_batches++;
-        hint->completion_assist_pauses += WKI_WAIT_COMPLETION_ASSIST_PAUSES_PER_BATCH;
-    }
-}
-
 }  // namespace
 
-auto wki_wait_for_op(WkiWaitEntry* entry, uint64_t timeout_us, WkiWaitHint* hint) -> int {
+auto wki_wait_for_op(WkiWaitEntry* entry, uint64_t timeout_us) -> int {
     // Record the calling task so wake_op can send an IPI. Do not reset
     // state/result here: many callers publish the stack wait entry before
     // sending, and a fast response may complete it before we enter this helper.
     uint64_t const STARTED_US = wki_now_us();
     entry->task.store(mod::sched::get_current_task(), std::memory_order_release);
     entry->deadline_us = (timeout_us > 0) ? wki_future_deadline_us(STARTED_US, timeout_us) : 0;
-
-    run_wait_completion_assist(entry, hint);
 
     bool linked = false;
     if (!wait_done(entry)) {
@@ -1143,43 +1025,6 @@ auto wki_selftest_wait_list_contains(WkiWaitEntry const* entry) -> bool {
     }
     s_wait_lock.unlock();
     return found;
-}
-
-auto wki_selftest_wait_completion_assist_policy() -> bool {
-    WkiChannel channel{};
-    channel.active = true;
-    channel.peer_node_id = 7;
-    channel.channel_id = 19;
-    channel.generation = 23;
-    WkiChannelIdentity const LIVE_IDENTITY = {
-        .channel = &channel,
-        .peer_node_id = 7,
-        .channel_id = 19,
-        .generation = 23,
-    };
-    WkiChannelIdentity const STALE_IDENTITY = {
-        .channel = &channel,
-        .peer_node_id = 7,
-        .channel_id = 19,
-        .generation = 22,
-    };
-    if (!wait_completion_channel_is_live_nonblocking(LIVE_IDENTITY) || wait_completion_channel_is_live_nonblocking(STALE_IDENTITY)) {
-        return false;
-    }
-    channel.lock.lock();
-    bool const CONTENDED_CHANNEL_REJECTED = !wait_completion_channel_is_live_nonblocking(LIVE_IDENTITY);
-    channel.lock.unlock();
-
-    return CONTENDED_CHANNEL_REJECTED && WKI_WAIT_COMPLETION_ASSIST_BUDGET_US == 32 && WKI_WAIT_COMPLETION_ASSIST_MAX_BATCHES == 64 &&
-           WKI_WAIT_COMPLETION_ASSIST_PAUSES_PER_BATCH == 32 && WKI_WAIT_COMPLETION_ASSIST_MAX_PAUSES == 2048 &&
-           wait_completion_assist_decision(false, true, true, false, 0) == WaitCompletionAssistDecision::CONTINUE &&
-           wait_completion_assist_decision(true, true, true, false, 0) == WaitCompletionAssistDecision::SKIPPED &&
-           wait_completion_assist_decision(true, true, true, false, 1) == WaitCompletionAssistDecision::HIT &&
-           wait_completion_assist_decision(false, true, true, false, 64) == WaitCompletionAssistDecision::EXHAUSTED &&
-           wait_completion_assist_decision(false, true, true, true, 0) == WaitCompletionAssistDecision::SKIPPED &&
-           wait_completion_assist_decision(false, true, true, true, 1) == WaitCompletionAssistDecision::EXHAUSTED &&
-           wait_completion_assist_decision(false, false, true, false, 1) == WaitCompletionAssistDecision::SKIPPED &&
-           wait_completion_assist_decision(false, true, false, false, 1) == WaitCompletionAssistDecision::SKIPPED;
 }
 #endif
 

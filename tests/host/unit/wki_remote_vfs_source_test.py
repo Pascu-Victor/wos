@@ -1440,103 +1440,6 @@ def test_remote_path_utimens_preserves_owner_time_and_routing() -> None:
     )
 
 
-def test_metadata_completion_assist_is_narrow_and_observable() -> None:
-    source = REMOTE_VFS_CPP.read_text()
-    header = REMOTE_VFS_HPP.read_text()
-    policy = function_body(source, "vfs_op_uses_completion_assist")
-    send_wait = function_body(source, "vfs_proxy_send_and_wait")
-    scope_selftest = function_body(source, "wki_remote_vfs_selftest_completion_assist_scope")
-
-    require_tokens(
-        policy,
-        [
-            "case OP_VFS_OPEN:",
-            "return !has_tagged_receive",
-            "case OP_VFS_STAT:",
-            "case OP_VFS_MKDIR:",
-            "case OP_VFS_READLINK:",
-            "case OP_VFS_SYMLINK:",
-            "case OP_VFS_UNLINK:",
-            "case OP_VFS_RMDIR:",
-            "case OP_VFS_RENAME:",
-            "case OP_VFS_CHMOD:",
-            "case OP_VFS_UTIMENS:",
-            "default:",
-            "return false",
-        ],
-        "metadata completion-assist opcode policy",
-    )
-    require_order(
-        send_wait,
-        [
-            "WkiChannelIdentity const CHANNEL_IDENTITY = proxy_channel_identity_locked(state)",
-            "wki_send_on_channel_identity(CHANNEL_IDENTITY",
-            "WkiWaitHint wait_hint",
-            "vfs_op_uses_completion_assist(op_id, tagged_receive != nullptr)",
-            "wki_wait_for_op(&wait, wait_timeout_us, WAIT_HINT)",
-            "WkiWaitAssistOutcome::HIT",
-            "WkiPerfVfsOp::COMPLETION_ASSIST_HIT",
-            "wait_hint.completion_assist_elapsed_us",
-            "WkiWaitAssistOutcome::EXHAUSTED",
-            "WkiPerfVfsOp::COMPLETION_ASSIST_EXHAUSTED",
-            "WkiWaitAssistOutcome::SKIPPED",
-            "if (WAIT_RC != 0)",
-            "consume_proxy_op_result_locked",
-        ],
-        "completion assist preserves send/wait/consume ordering",
-    )
-    require_tokens(
-        scope_selftest,
-        [
-            "OP_VFS_OPEN, false",
-            "OP_VFS_OPEN, true",
-            "OP_VFS_READ",
-            "OP_VFS_WRITE",
-            "OP_VFS_CLOSE",
-            "OP_VFS_READDIR",
-            "OP_VFS_FSYNC",
-            "OP_VFS_TRUNCATE",
-            "OP_VFS_SEEK_END",
-            "OP_VFS_READ_RDMA",
-            "OP_VFS_WRITE_RDMA",
-            "OP_VFS_READDIR_BATCH",
-            "OP_VFS_READ_BULK",
-            "OP_VFS_INVALIDATE",
-        ],
-        "completion-assist exclusion matrix",
-    )
-    require_tokens(
-        header + WKI_DEV_PROXY_KTEST.read_text(),
-        [
-            "wki_remote_vfs_selftest_completion_assist_scope()",
-            "KTEST(WkiRemoteVfsCompletionAssist, IncludesOnlyLatencyMetadataOperations)",
-        ],
-        "metadata completion-assist KTEST coverage",
-    )
-    perf_header = (ROOT / "modules" / "kern" / "src" / "platform" / "perf" / "perf_events.hpp").read_text()
-    perf_source = (ROOT / "modules" / "kern" / "src" / "platform" / "perf" / "perf_events.cpp").read_text()
-    require_tokens(
-        perf_header + perf_source,
-        [
-            "COMPLETION_ASSIST_HIT = 19",
-            "COMPLETION_ASSIST_EXHAUSTED = 20",
-            'return "completion_assist_hit";',
-            'return "completion_assist_exhausted";',
-        ],
-        "completion-assist perf counters",
-    )
-    perf_point = function_body(source, "perf_record_vfs_point")
-    require_tokens(
-        perf_point,
-        [
-            "WkiPerfVfsOp::COMPLETION_ASSIST_HIT",
-            "WkiPerfVfsOp::COMPLETION_ASSIST_EXHAUSTED",
-            "uint32_t const LATENCY_US = HAS_LATENCY ? aux : 0U",
-        ],
-        "completion-assist perf summaries retain latency",
-    )
-
-
 def test_server_message_read_uses_bounded_stack_response() -> None:
     source = REMOTE_VFS_CPP.read_text()
     handler_body = function_body(source, "handle_vfs_op")
@@ -3941,7 +3844,6 @@ def main() -> None:
     test_server_open_reuses_the_open_file_stat_snapshot()
     test_server_backing_path_mutations_bypass_worker_task_root()
     test_remote_path_utimens_preserves_owner_time_and_routing()
-    test_metadata_completion_assist_is_narrow_and_observable()
     test_server_message_read_uses_bounded_stack_response()
     test_readlink_cache_invalidation_is_generation_based()
     test_server_roce_push_reads_reuse_registered_staging()

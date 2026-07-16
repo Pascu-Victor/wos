@@ -31,22 +31,13 @@ KTEST(WkiWaitEntry, WakeDoesNotOverwriteCompletedWaiter) {
 
 KTEST(WkiWaitEntry, CompletionBeforeWaitReturnsWithoutLinking) {
     ker::net::wki::WkiWaitEntry wait{};
-    ker::net::wki::WkiWaitHint hint{};
 
     ker::net::wki::wki_wake_op(&wait, 42);
 
-    KEXPECT_EQ(ker::net::wki::wki_wait_for_op(&wait, ker::net::wki::WKI_OP_TIMEOUT_US, &hint), 42);
+    KEXPECT_EQ(ker::net::wki::wki_wait_for_op(&wait, ker::net::wki::WKI_OP_TIMEOUT_US), 42);
     KEXPECT_FALSE(ker::net::wki::wki_selftest_wait_list_contains(&wait));
     KEXPECT_EQ(wait.result, 42);
     KEXPECT_EQ(wait.state.load(std::memory_order_acquire), static_cast<uint8_t>(ker::net::wki::WkiWaitEntry::DONE));
-    KEXPECT_EQ(hint.completion_assist_outcome, ker::net::wki::WkiWaitAssistOutcome::SKIPPED);
-    KEXPECT_EQ(hint.completion_assist_elapsed_us, 0U);
-    KEXPECT_EQ(hint.completion_assist_pauses, 0U);
-    KEXPECT_EQ(hint.completion_assist_batches, 0U);
-}
-
-KTEST(WkiWaitEntry, CompletionAssistPolicyBoundsOutcomesAndContextSkips) {
-    KEXPECT_TRUE(ker::net::wki::wki_selftest_wait_completion_assist_policy());
 }
 
 KTEST(WkiWaitEntry, ClaimedWaiterIgnoresCompetingWakeUntilFinished) {
