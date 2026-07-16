@@ -1,4 +1,5 @@
 #pragma once
+#include <cstddef>
 #include <cstdint>
 
 namespace ker::abi::vfs {
@@ -67,6 +68,28 @@ enum class ops : uint64_t {
     FCHDIR,                // 59
     FCHOWNAT,              // 60
     FSTAT_CLOSE,           // 61
+    METADATA_BATCH,        // 62
 };
+
+constexpr uint16_t METADATA_BATCH_VERSION = 1;
+constexpr uint8_t METADATA_BATCH_MAX_ITEMS = 64;
+constexpr size_t METADATA_BATCH_MAX_PATH_CHARS = 511;
+
+enum class metadata_batch_operation : uint8_t {
+    INVALID = 0,
+    CREATE_CLOSE = 1,
+    STAT_FOLLOW = 2,
+    UNLINK = 3,
+    RENAME = 4,
+};
+
+struct metadata_batch_header {
+    uint16_t version;
+    metadata_batch_operation operation;
+    uint8_t count;
+    uint32_t mode;
+};
+
+static_assert(sizeof(metadata_batch_header) == 8);
 
 }  // namespace ker::abi::vfs

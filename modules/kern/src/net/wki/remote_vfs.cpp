@@ -7148,6 +7148,210 @@ auto wki_remote_vfs_stat(void* mount_private_data, const char* fs_relative_path,
     return remote_vfs_stat_on_proxy(state, fs_relative_path, statbuf);
 }
 
+auto wki_remote_vfs_metadata_batch(void* mount_private_data, ker::vfs::MetadataBatchOperation operation, uint32_t mode,
+                                   const ker::vfs::MetadataBatchEntry* entries, size_t count, ker::vfs::MetadataBatchResult* results,
+                                   bool* mutation_request_attempted) -> int {
+    constexpr size_t MAX_REQUEST_DATA = WKI_ETH_MAX_PAYLOAD - sizeof(DevOpReqPayload);
+    constexpr size_t MAX_RESPONSE_DATA = WKI_ETH_MAX_PAYLOAD - sizeof(DevOpRespPayload);
+    constexpr size_t STAT_RESULT_SIZE = sizeof(int32_t) + sizeof(ker::vfs::Stat);
+    static_assert(VFS_METADATA_BATCH_MAX_STAT_ITEMS == (MAX_RESPONSE_DATA - sizeof(VfsMetadataBatchHeader)) / STAT_RESULT_SIZE);
+
+    if (mutation_request_attempted != nullptr) {
+        *mutation_request_attempted = false;
+    }
+
+    auto* anchor = static_cast<ProxyVfsState*>(mount_private_data);
+    if (anchor == nullptr || entries == nullptr || results == nullptr || mutation_request_attempted == nullptr || count == 0 ||
+        count > VFS_METADATA_BATCH_MAX_ITEMS) {
+        return -EINVAL;
+    }
+
+    VfsMetadataBatchOperation wire_operation{};
+    switch (operation) {
+        case ker::vfs::MetadataBatchOperation::INVALID:
+            return -EINVAL;
+        case ker::vfs::MetadataBatchOperation::CREATE_CLOSE:
+            wire_operation = VfsMetadataBatchOperation::CREATE_CLOSE;
+            break;
+        case ker::vfs::MetadataBatchOperation::STAT_FOLLOW:
+            wire_operation = VfsMetadataBatchOperation::STAT_FOLLOW;
+            break;
+        case ker::vfs::MetadataBatchOperation::UNLINK:
+            wire_operation = VfsMetadataBatchOperation::UNLINK;
+            break;
+        case ker::vfs::MetadataBatchOperation::RENAME:
+            wire_operation = VfsMetadataBatchOperation::RENAME;
+            break;
+        default:
+            return -EINVAL;
+    }
+    if (operation != ker::vfs::MetadataBatchOperation::CREATE_CLOSE && mode != 0) {
+        return -EINVAL;
+    }
+
+    bool const READ_ONLY = operation == ker::vfs::MetadataBatchOperation::STAT_FOLLOW;
+    bool const RENAME = operation == ker::vfs::MetadataBatchOperation::RENAME;
+    size_t mutation_request_len = sizeof(VfsMetadataBatchHeader);
+    for (size_t index = 0; index < count; ++index) {
+        results[index].status = -EINPROGRESS;  // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
+        results[index].stat = {};              // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
+
+        auto const& entry = entries[index];  // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
+        if (entry.path == nullptr || (!RENAME && entry.second_path != nullptr) || (RENAME && entry.second_path == nullptr)) {
+            return -EINVAL;
+        }
+        size_t const PATH_LEN = std::strlen(entry.path);
+        if (PATH_LEN > VFS_METADATA_BATCH_MAX_PATH_LEN ||
+            !relative_wire_path_has_safe_components(reinterpret_cast<const uint8_t*>(entry.path), PATH_LEN)) {
+            return PATH_LEN > VFS_METADATA_BATCH_MAX_PATH_LEN ? -ENAMETOOLONG : -EINVAL;
+        }
+        size_t item_size = sizeof(uint16_t) + PATH_LEN;
+        if (RENAME) {
+            size_t const SECOND_PATH_LEN = std::strlen(entry.second_path);
+            if (SECOND_PATH_LEN > VFS_METADATA_BATCH_MAX_PATH_LEN ||
+                !relative_wire_path_has_safe_components(reinterpret_cast<const uint8_t*>(entry.second_path), SECOND_PATH_LEN)) {
+                return SECOND_PATH_LEN > VFS_METADATA_BATCH_MAX_PATH_LEN ? -ENAMETOOLONG : -EINVAL;
+            }
+            item_size = (sizeof(uint16_t) * 2) + PATH_LEN + SECOND_PATH_LEN;
+        }
+        if (item_size > MAX_REQUEST_DATA - sizeof(VfsMetadataBatchHeader)) {
+            return -EMSGSIZE;
+        }
+        if (!READ_ONLY) {
+            if (item_size > MAX_REQUEST_DATA - mutation_request_len) {
+                // The server must preflight the complete mutation set before
+                // item zero can have an effect. Let callers scalar-fallback
+                // while no request has been attempted.
+                return -EOPNOTSUPP;
+            }
+            mutation_request_len += item_size;
+        }
+    }
+
+    // EOPNOTSUPP is reserved for this pre-send negotiation check. Once a
+    // request is attempted, callers must never scalar-replay a mutation.
+    if (!wki_peer_capability_negotiated(anchor->owner_node, WKI_CAP_VFS_METADATA_BATCH)) {
+        return -EOPNOTSUPP;
+    }
+
+    auto* state = acquire_vfs_proxy_lane(anchor);
+    if (state == nullptr) {
+        return -EIO;
+    }
+    ProxyLifecycleRefGuard lane_ref_guard(state);
+    if (!state->active) {
+        return -EIO;
+    }
+
+    std::array<uint8_t, MAX_REQUEST_DATA> request{};
+    std::array<uint8_t, MAX_RESPONSE_DATA> response{};
+    bool mutation_attempted = false;
+    auto finish = [&](int status) -> int {
+        if (mutation_attempted) {
+            // A malformed/lost response is completion-ambiguous. Conservatively
+            // discard proxy readlink state; the attempted flag makes VFS
+            // invalidate pathname metadata even when no status was parsed.
+            invalidate_readlink_cache_group(state);
+        }
+        return status;
+    };
+
+    size_t first = 0;
+    while (first < count) {
+        size_t request_len = sizeof(VfsMetadataBatchHeader);
+        size_t chunk_count = 0;
+        size_t const CHUNK_LIMIT = operation == ker::vfs::MetadataBatchOperation::STAT_FOLLOW
+                                       ? std::min(count - first, static_cast<size_t>(VFS_METADATA_BATCH_MAX_STAT_ITEMS))
+                                       : std::min(count - first, static_cast<size_t>(VFS_METADATA_BATCH_MAX_ITEMS));
+
+        while (chunk_count < CHUNK_LIMIT) {
+            auto const& entry = entries[first + chunk_count];  // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
+            size_t const PATH_LEN = std::strlen(entry.path);
+            size_t const SECOND_PATH_LEN = RENAME ? std::strlen(entry.second_path) : 0;
+            size_t const ITEM_SIZE = RENAME ? (sizeof(uint16_t) * 2) + PATH_LEN + SECOND_PATH_LEN : sizeof(uint16_t) + PATH_LEN;
+            if (request_len + ITEM_SIZE > request.size()) {
+                break;
+            }
+
+            auto const PATH_LEN_WIRE = static_cast<uint16_t>(PATH_LEN);
+            if (RENAME) {
+                auto const SECOND_PATH_LEN_WIRE = static_cast<uint16_t>(SECOND_PATH_LEN);
+                std::memcpy(request.data() + request_len, &PATH_LEN_WIRE, sizeof(PATH_LEN_WIRE));
+                std::memcpy(request.data() + request_len + sizeof(PATH_LEN_WIRE), &SECOND_PATH_LEN_WIRE, sizeof(SECOND_PATH_LEN_WIRE));
+                request_len += sizeof(PATH_LEN_WIRE) + sizeof(SECOND_PATH_LEN_WIRE);
+                if (PATH_LEN > 0) {
+                    std::memcpy(request.data() + request_len, entry.path, PATH_LEN);
+                    request_len += PATH_LEN;
+                }
+                if (SECOND_PATH_LEN > 0) {
+                    std::memcpy(request.data() + request_len, entry.second_path, SECOND_PATH_LEN);
+                    request_len += SECOND_PATH_LEN;
+                }
+            } else {
+                std::memcpy(request.data() + request_len, &PATH_LEN_WIRE, sizeof(PATH_LEN_WIRE));
+                request_len += sizeof(PATH_LEN_WIRE);
+                if (PATH_LEN > 0) {
+                    std::memcpy(request.data() + request_len, entry.path, PATH_LEN);
+                    request_len += PATH_LEN;
+                }
+            }
+            ++chunk_count;
+        }
+        if (chunk_count == 0) {
+            return finish(-EMSGSIZE);
+        }
+
+        VfsMetadataBatchHeader const REQUEST_HEADER{
+            .version = VFS_METADATA_BATCH_VERSION,
+            .operation = wire_operation,
+            .count = static_cast<uint8_t>(chunk_count),
+            .mode = mode,
+        };
+        std::memcpy(request.data(), &REQUEST_HEADER, sizeof(REQUEST_HEADER));
+
+        size_t const ITEM_RESPONSE_SIZE = operation == ker::vfs::MetadataBatchOperation::STAT_FOLLOW ? STAT_RESULT_SIZE : sizeof(int32_t);
+        size_t const EXPECTED_RESPONSE_LEN = sizeof(VfsMetadataBatchHeader) + (chunk_count * ITEM_RESPONSE_SIZE);
+        if (EXPECTED_RESPONSE_LEN > response.size()) {
+            return finish(-EMSGSIZE);
+        }
+
+        uint16_t response_len = 0;
+        if (!READ_ONLY) {
+            mutation_attempted = true;
+            *mutation_request_attempted = true;
+        }
+        int const STATUS = vfs_proxy_send_and_wait(state, OP_VFS_METADATA_BATCH, request.data(), request_len, response.data(),
+                                                   static_cast<uint16_t>(response.size()), &response_len);
+        if (STATUS < 0) {
+            return finish(STATUS == -EOPNOTSUPP ? -EPROTO : STATUS);
+        }
+        if (response_len != EXPECTED_RESPONSE_LEN) {
+            return finish(-EPROTO);
+        }
+
+        VfsMetadataBatchHeader response_header{};
+        std::memcpy(&response_header, response.data(), sizeof(response_header));
+        if (response_header.version != REQUEST_HEADER.version || response_header.operation != REQUEST_HEADER.operation ||
+            response_header.count != REQUEST_HEADER.count || response_header.mode != REQUEST_HEADER.mode) {
+            return finish(-EPROTO);
+        }
+
+        size_t response_pos = sizeof(VfsMetadataBatchHeader);
+        for (size_t item = 0; item < chunk_count; ++item) {
+            auto& result = results[first + item];  // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
+            std::memcpy(&result.status, response.data() + response_pos, sizeof(result.status));
+            response_pos += sizeof(result.status);
+            if (operation == ker::vfs::MetadataBatchOperation::STAT_FOLLOW) {
+                std::memcpy(&result.stat, response.data() + response_pos, sizeof(result.stat));
+                response_pos += sizeof(result.stat);
+            }
+        }
+        first += chunk_count;
+    }
+
+    return finish(0);
+}
+
 auto wki_remote_vfs_fstat(ker::vfs::File* file, ker::vfs::Stat* statbuf) -> int {
     if (file == nullptr || file->private_data == nullptr || statbuf == nullptr) {
         return -EINVAL;

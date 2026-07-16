@@ -32,6 +32,44 @@ constexpr size_t READ_DIR_STACK_BUFFER_SIZE = size_t{16} * 1024;
 constexpr size_t READLINK_STACK_BUFFER_SIZE = 512;
 constexpr size_t REALPATH_STACK_BUFFER_SIZE = 512;
 
+struct MetadataBatchUserEntry {
+    const char* path;
+    const char* second_path;
+};
+
+struct MetadataBatchUserResult {
+    int32_t status;
+    uint32_t reserved;
+    ker::vfs::Stat stat;
+};
+
+static_assert(sizeof(MetadataBatchUserEntry) == 16);
+static_assert(offsetof(MetadataBatchUserResult, stat) == 8);
+static_assert(sizeof(MetadataBatchUserResult) == 152);
+
+auto metadata_batch_operation_to_vfs(ker::abi::vfs::metadata_batch_operation operation, ker::vfs::MetadataBatchOperation* out) -> bool {
+    if (out == nullptr) {
+        return false;
+    }
+    switch (operation) {
+        case ker::abi::vfs::metadata_batch_operation::INVALID:
+            return false;
+        case ker::abi::vfs::metadata_batch_operation::CREATE_CLOSE:
+            *out = ker::vfs::MetadataBatchOperation::CREATE_CLOSE;
+            return true;
+        case ker::abi::vfs::metadata_batch_operation::STAT_FOLLOW:
+            *out = ker::vfs::MetadataBatchOperation::STAT_FOLLOW;
+            return true;
+        case ker::abi::vfs::metadata_batch_operation::UNLINK:
+            *out = ker::vfs::MetadataBatchOperation::UNLINK;
+            return true;
+        case ker::abi::vfs::metadata_batch_operation::RENAME:
+            *out = ker::vfs::MetadataBatchOperation::RENAME;
+            return true;
+    }
+    return false;
+}
+
 template <typename T>
 auto copy_value_to_user_for_task(ker::mod::sched::task::Task* task, T* user_ptr, const T& value) -> int {
     if (user_ptr == nullptr) {
@@ -449,6 +487,101 @@ auto sys_vfs(uint64_t op_raw, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                 return COPY_RET;
             }
             return static_cast<int64_t>(CLOSE_RESULT);
+        }
+        case ops::METADATA_BATCH: {
+            auto const* user_header = reinterpret_cast<const ker::abi::vfs::metadata_batch_header*>(a1);
+            auto const* user_entries = reinterpret_cast<const MetadataBatchUserEntry*>(a2);
+            auto* user_results = reinterpret_cast<MetadataBatchUserResult*>(a3);
+            auto* task = ker::mod::sched::get_current_task();
+            if (task == nullptr) {
+                return -ESRCH;
+            }
+
+            ker::abi::vfs::metadata_batch_header header{};
+            if (copy_value_from_user(user_header, &header) < 0) {
+                return -EFAULT;
+            }
+            if (header.version != ker::abi::vfs::METADATA_BATCH_VERSION || header.count == 0 ||
+                header.count > ker::abi::vfs::METADATA_BATCH_MAX_ITEMS) {
+                return -EINVAL;
+            }
+
+            ker::vfs::MetadataBatchOperation operation{};
+            if (!metadata_batch_operation_to_vfs(header.operation, &operation) ||
+                (operation != ker::vfs::MetadataBatchOperation::CREATE_CLOSE && header.mode != 0)) {
+                return -EINVAL;
+            }
+            if (user_entries == nullptr || user_results == nullptr) {
+                return -EFAULT;
+            }
+
+            size_t const ENTRY_BYTES = sizeof(MetadataBatchUserEntry) * header.count;
+            size_t const RESULT_BYTES = sizeof(MetadataBatchUserResult) * header.count;
+            if (!ker::mod::sys::usercopy::ensure_writable(*task, a3, RESULT_BYTES)) {
+                return -EFAULT;
+            }
+
+            std::array<MetadataBatchUserEntry, ker::abi::vfs::METADATA_BATCH_MAX_ITEMS> copied_entries{};
+            if (!ker::mod::sys::usercopy::copy_from_task(*task, a2, copied_entries.data(), ENTRY_BYTES)) {
+                return -EFAULT;
+            }
+
+            constexpr size_t PATH_SCRATCH_SIZE = ker::abi::vfs::METADATA_BATCH_MAX_PATH_CHARS + 2;
+            std::array<std::array<char, PATH_SCRATCH_SIZE>, ker::abi::vfs::METADATA_BATCH_MAX_ITEMS> primary_paths{};
+            std::array<std::array<char, PATH_SCRATCH_SIZE>, ker::abi::vfs::METADATA_BATCH_MAX_ITEMS> secondary_paths{};
+            std::array<ker::vfs::MetadataBatchEntry, ker::abi::vfs::METADATA_BATCH_MAX_ITEMS> kernel_entries{};
+            std::array<ker::vfs::MetadataBatchResult, ker::abi::vfs::METADATA_BATCH_MAX_ITEMS> kernel_results{};
+
+            for (size_t index = 0; index < header.count; ++index) {
+                auto const& copied = copied_entries.at(index);
+                if (copied.path == nullptr ||
+                    !ker::mod::sys::usercopy::copy_cstring_from_task(*task, reinterpret_cast<uint64_t>(copied.path),
+                                                                     primary_paths.at(index).data(), PATH_SCRATCH_SIZE)) {
+                    return -EFAULT;
+                }
+                size_t const PRIMARY_LEN = std::strlen(primary_paths.at(index).data());
+                if (PRIMARY_LEN > ker::abi::vfs::METADATA_BATCH_MAX_PATH_CHARS) {
+                    return -ENAMETOOLONG;
+                }
+                if (PRIMARY_LEN == 0) {
+                    return -ENOENT;
+                }
+
+                bool const RENAME = operation == ker::vfs::MetadataBatchOperation::RENAME;
+                if ((!RENAME && copied.second_path != nullptr) || (RENAME && copied.second_path == nullptr)) {
+                    return -EINVAL;
+                }
+                if (RENAME) {
+                    if (!ker::mod::sys::usercopy::copy_cstring_from_task(*task, reinterpret_cast<uint64_t>(copied.second_path),
+                                                                         secondary_paths.at(index).data(), PATH_SCRATCH_SIZE)) {
+                        return -EFAULT;
+                    }
+                    size_t const SECONDARY_LEN = std::strlen(secondary_paths.at(index).data());
+                    if (SECONDARY_LEN > ker::abi::vfs::METADATA_BATCH_MAX_PATH_CHARS) {
+                        return -ENAMETOOLONG;
+                    }
+                    if (SECONDARY_LEN == 0) {
+                        return -ENOENT;
+                    }
+                }
+
+                kernel_entries.at(index) = {.path = primary_paths.at(index).data(),
+                                            .second_path = RENAME ? secondary_paths.at(index).data() : nullptr};
+                kernel_results.at(index).status = -EINPROGRESS;
+            }
+
+            int const BATCH_RESULT =
+                ker::vfs::vfs_metadata_batch(task, operation, header.mode, kernel_entries.data(), header.count, kernel_results.data());
+
+            std::array<MetadataBatchUserResult, ker::abi::vfs::METADATA_BATCH_MAX_ITEMS> copied_results{};
+            for (size_t index = 0; index < header.count; ++index) {
+                copied_results.at(index).status = kernel_results.at(index).status;
+                copied_results.at(index).stat = kernel_results.at(index).stat;
+            }
+            if (!ker::mod::sys::usercopy::copy_to_task(*task, a3, copied_results.data(), RESULT_BYTES)) {
+                return -EFAULT;
+            }
+            return static_cast<int64_t>(BATCH_RESULT);
         }
         case ops::STATAT: {
             int const DIRFD = static_cast<int>(a1);

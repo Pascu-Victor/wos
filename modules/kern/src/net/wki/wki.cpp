@@ -376,14 +376,14 @@ auto message_uses_vfs_export_admission(MsgType type, const uint8_t* payload, uin
                 return false;
             }
             auto const* req = reinterpret_cast<const DevOpReqPayload*>(payload);
-            return req->op_id >= OP_VFS_OPEN && req->op_id <= OP_VFS_UTIMENS;
+            return req->op_id >= OP_VFS_OPEN && req->op_id <= OP_VFS_METADATA_BATCH;
         }
         case MsgType::DEV_OP_RESP: {
             if (payload_len < sizeof(DevOpRespPayload)) {
                 return false;
             }
             auto const* resp = reinterpret_cast<const DevOpRespPayload*>(payload);
-            return resp->op_id >= OP_VFS_OPEN && resp->op_id <= OP_VFS_UTIMENS;
+            return resp->op_id >= OP_VFS_OPEN && resp->op_id <= OP_VFS_METADATA_BATCH;
         }
         default:
             return false;
@@ -1097,7 +1097,7 @@ void wki_init() {
     g_wki.transports = nullptr;
     g_wki.transport_count = 0;
     g_wki.my_lsa_seq = 0;
-    g_wki.capabilities = WKI_CAP_RESOURCE_INCARNATION | WKI_CAP_VFS_MULTI_RDMA_LANES;
+    g_wki.capabilities = WKI_CAP_RESOURCE_INCARNATION | WKI_CAP_VFS_MULTI_RDMA_LANES | WKI_CAP_VFS_METADATA_BATCH;
     g_wki.initialized = true;
 
     // Init routing subsystem (LSDB, routing table)

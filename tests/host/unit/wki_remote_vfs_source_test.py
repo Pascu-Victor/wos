@@ -3765,7 +3765,7 @@ def test_capability_gated_two_vfs_data_lanes_bound_rdma_buffers() -> None:
     )
     require_tokens(
         function_body(wki, "wki_init"),
-        ["WKI_CAP_RESOURCE_INCARNATION | WKI_CAP_VFS_MULTI_RDMA_LANES"],
+        ["WKI_CAP_RESOURCE_INCARNATION | WKI_CAP_VFS_MULTI_RDMA_LANES | WKI_CAP_VFS_METADATA_BATCH"],
         "local HELLO capability advertisement",
     )
     require_order(
@@ -3847,6 +3847,66 @@ def test_capability_gated_two_vfs_data_lanes_bound_rdma_buffers() -> None:
     )
 
 
+def test_metadata_batch_never_replays_after_a_send_attempt() -> None:
+    source = REMOTE_VFS_CPP.read_text()
+    header = REMOTE_VFS_HPP.read_text()
+    batch = function_body(source, "wki_remote_vfs_metadata_batch")
+
+    require_tokens(
+        header,
+        [
+            "auto wki_remote_vfs_metadata_batch(",
+            "EOPNOTSUPP is returned only before any request send",
+        ],
+        "metadata batch public no-replay contract",
+    )
+    require_order(
+        batch,
+        [
+            "results[index].status = -EINPROGRESS",
+            "relative_wire_path_has_safe_components",
+            "item_size > MAX_REQUEST_DATA - mutation_request_len",
+            "return -EOPNOTSUPP",
+            "wki_peer_capability_negotiated(anchor->owner_node, WKI_CAP_VFS_METADATA_BATCH)",
+            "return -EOPNOTSUPP",
+            "acquire_vfs_proxy_lane(anchor)",
+            "mutation_attempted = true",
+            "*mutation_request_attempted = true",
+            "vfs_proxy_send_and_wait(state, OP_VFS_METADATA_BATCH",
+            "STATUS == -EOPNOTSUPP ? -EPROTO : STATUS",
+        ],
+        "metadata batch validates and negotiates before its first send and never exposes replayable EOPNOTSUPP afterwards",
+    )
+    acquire_pos = batch.find("acquire_vfs_proxy_lane(anchor)")
+    if acquire_pos < 0 or batch.rfind("return -EOPNOTSUPP") >= acquire_pos:
+        fail("metadata batch may expose EOPNOTSUPP only before lane acquisition and a possible send")
+    require_tokens(
+        batch,
+        [
+            "VFS_METADATA_BATCH_MAX_STAT_ITEMS",
+            "response_len != EXPECTED_RESPONSE_LEN",
+            "response_header.version != REQUEST_HEADER.version",
+            "response_header.operation != REQUEST_HEADER.operation",
+            "response_header.count != REQUEST_HEADER.count",
+            "response_header.mode != REQUEST_HEADER.mode",
+            "invalidate_readlink_cache_group(state)",
+        ],
+        "metadata batch bounded chunking, exact response framing, and ambiguous completion invalidation",
+    )
+
+    core_batch = function_body(VFS_CORE_CPP.read_text(), "vfs_metadata_batch")
+    require_tokens(
+        core_batch,
+        [
+            "mutation_request_attempted",
+            "COMPLETION_AMBIGUOUS",
+            "CREATE_MAY_HAVE_TAKEN_EFFECT",
+            "vfs_cache_notify_path_changed",
+        ],
+        "metadata batch invalidates pathname caches after ambiguous or effectful create completion",
+    )
+
+
 def main() -> None:
     test_vfs_host_alias_rewrite_is_overlap_safe()
     test_vfs_route_scratch_is_initialized_by_its_producer()
@@ -3878,6 +3938,7 @@ def main() -> None:
     test_remote_vfs_unmount_cancels_waiters_before_teardown()
     test_remote_vfs_teardown_releases_rdma_state_when_idle()
     test_capability_gated_two_vfs_data_lanes_bound_rdma_buffers()
+    test_metadata_batch_never_replays_after_a_send_attempt()
     test_remote_open_refs_delay_proxy_destroy_until_close()
     test_remote_vfs_channel_identity_survives_pool_slot_reuse()
     test_server_bounded_metadata_responses_use_stack_storage()

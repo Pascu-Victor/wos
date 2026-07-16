@@ -811,6 +811,22 @@ def test_vfsbench_metadata_timing_excludes_setup_and_cleanup() -> None:
         ],
         "deterministic disjoint metadata path partition",
     )
+    require_tokens(
+        range_body,
+        [
+            "ker::abi::vfs::METADATA_BATCH_MAX_ITEMS",
+            "ker::abi::vfs::metadata_batch_header const HEADER",
+            "ker::abi::vfs::metadata_batch(&HEADER, entries.data(), results.data())",
+            "BATCH_STATUS == -EOPNOTSUPP && chunk_begin == BEGIN",
+            "metadata_batch_result_succeeded",
+        ],
+        "vfsbench uniform metadata batching",
+    )
+    require_order(range_body, "ker::abi::vfs::metadata_batch(&HEADER", "BATCH_STATUS == -EOPNOTSUPP", "batch before safe fallback")
+    require_order(range_body, "BATCH_STATUS == -EOPNOTSUPP", "apply_metadata_path_action", "fallback only after pre-send unsupported")
+    require_order(range_body, "apply_metadata_path_action", "if (BATCH_STATUS != 0)", "no scalar replay for other batch failures")
+    if range_body.count("apply_metadata_path_action") != 1:
+        fail("vfsbench metadata worker may contain only one scalar fallback path")
     initialize_body = function_body(source, "initialize_metadata_path_workers")
     require_tokens(
         initialize_body,

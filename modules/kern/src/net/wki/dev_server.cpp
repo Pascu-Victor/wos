@@ -28,7 +28,12 @@
 #include <platform/dbg/dbg.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
+#include <string_view>
 #include <utility>
+#include <vfs/file.hpp>
+#include <vfs/mount.hpp>
+#include <vfs/stat.hpp>
+#include <vfs/vfs.hpp>
 
 #include "platform/sys/spinlock.hpp"
 
@@ -344,7 +349,9 @@ auto detach_all_may_claim_binding(const DevServerBinding& binding, uint16_t node
     return binding.active && !binding.retiring.load(std::memory_order_acquire);
 }
 
-auto is_vfs_op(uint16_t op_id) -> bool { return (op_id >= OP_VFS_OPEN && op_id <= OP_VFS_READ_BULK) || op_id == OP_VFS_UTIMENS; }
+auto is_vfs_op(uint16_t op_id) -> bool {
+    return (op_id >= OP_VFS_OPEN && op_id <= OP_VFS_READ_BULK) || op_id == OP_VFS_UTIMENS || op_id == OP_VFS_METADATA_BATCH;
+}
 
 auto transport_is_roce(const WkiTransport* transport) -> bool {
     return transport != nullptr && transport->name != nullptr && std::strcmp(transport->name, "wki-roce") == 0;
@@ -361,6 +368,324 @@ void send_vfs_error_response(const WkiChannelIdentity& identity, uint16_t op_id,
     resp.data_len = 0;
     resp.reserved = req_cookie;
     static_cast<void>(wki_send_on_channel_identity(identity, MsgType::DEV_OP_RESP, &resp, sizeof(resp)));
+}
+
+constexpr size_t VFS_METADATA_BATCH_PATH_BUFFER_SIZE = 512;
+constexpr size_t VFS_METADATA_BATCH_STATUS_SIZE = sizeof(int32_t);
+constexpr size_t VFS_METADATA_BATCH_STAT_RECORD_SIZE = VFS_METADATA_BATCH_STATUS_SIZE + sizeof(ker::vfs::Stat);
+
+static_assert(sizeof(DevOpRespPayload) + sizeof(VfsMetadataBatchHeader) +
+                  (VFS_METADATA_BATCH_MAX_STAT_ITEMS * VFS_METADATA_BATCH_STAT_RECORD_SIZE) <=
+              WKI_ETH_MAX_PAYLOAD);
+static_assert(sizeof(DevOpRespPayload) + sizeof(VfsMetadataBatchHeader) +
+                  ((VFS_METADATA_BATCH_MAX_STAT_ITEMS + 1) * VFS_METADATA_BATCH_STAT_RECORD_SIZE) >
+              WKI_ETH_MAX_PAYLOAD);
+static_assert(sizeof(DevOpRespPayload) + sizeof(VfsMetadataBatchHeader) + (VFS_METADATA_BATCH_MAX_ITEMS * VFS_METADATA_BATCH_STATUS_SIZE) <=
+              WKI_ETH_MAX_PAYLOAD);
+
+struct VfsMetadataBatchEntryView {
+    size_t first_offset = 0;
+    size_t first_len = 0;
+    size_t second_offset = 0;
+    size_t second_len = 0;
+};
+
+auto vfs_metadata_batch_relative_path_is_safe(const uint8_t* path, size_t path_len) -> bool {
+    if (path_len == 0) {
+        return true;
+    }
+    if (path == nullptr || path[0] == '/' || std::memchr(path, '\0', path_len) != nullptr) {
+        return false;
+    }
+
+    size_t component_start = 0;
+    for (size_t pos = 0; pos <= path_len; ++pos) {
+        if (pos != path_len && path[pos] != '/') {
+            continue;
+        }
+        size_t const COMPONENT_LEN = pos - component_start;
+        bool const DOT = COMPONENT_LEN == 1 && path[component_start] == '.';
+        bool const DOT_DOT = COMPONENT_LEN == 2 && path[component_start] == '.' && path[component_start + 1] == '.';
+        if (DOT || DOT_DOT) {
+            return false;
+        }
+        component_start = pos + 1;
+    }
+    return true;
+}
+
+auto vfs_metadata_batch_build_full_path(char* out, size_t out_size, const char* export_path, const uint8_t* relative_path,
+                                        size_t relative_len) -> bool {
+    if (out == nullptr || out_size == 0 || export_path == nullptr || (relative_path == nullptr && relative_len != 0)) {
+        return false;
+    }
+
+    size_t const EXPORT_LEN = std::strlen(export_path);
+    bool const NEED_SEPARATOR = EXPORT_LEN != 0 && export_path[EXPORT_LEN - 1] != '/';
+    size_t const SEPARATOR_LEN = NEED_SEPARATOR ? 1 : 0;
+    if (EXPORT_LEN >= out_size || SEPARATOR_LEN > out_size - EXPORT_LEN - 1 || relative_len > out_size - EXPORT_LEN - SEPARATOR_LEN - 1) {
+        return false;
+    }
+
+    size_t cursor = 0;
+    if (EXPORT_LEN != 0) {
+        std::memcpy(out, export_path, EXPORT_LEN);
+        cursor = EXPORT_LEN;
+    }
+    if (NEED_SEPARATOR) {
+        out[cursor++] = '/';
+    }
+    if (relative_len != 0) {
+        std::memcpy(out + cursor, relative_path, relative_len);
+        cursor += relative_len;
+    }
+    out[cursor] = '\0';
+    return true;
+}
+
+auto vfs_metadata_batch_path_has_prefix(const char* path, const char* prefix, size_t prefix_len) -> bool {
+    return path != nullptr && prefix != nullptr && std::strncmp(path, prefix, prefix_len) == 0 &&
+           (path[prefix_len] == '\0' || path[prefix_len] == '/');
+}
+
+auto vfs_metadata_batch_crosses_recursive_boundary(const char* backing_path, const char* visible_path) -> bool {
+    if (backing_path == nullptr || visible_path == nullptr) {
+        return false;
+    }
+
+    auto mount_ref = ker::vfs::find_mount_point(backing_path);
+    auto* mount = mount_ref.get();
+    if (mount != nullptr && mount->fs_type == ker::vfs::FSType::REMOTE) {
+        return true;
+    }
+
+    constexpr std::string_view HOST_PREFIX = "/wki/host";
+    if (vfs_metadata_batch_path_has_prefix(visible_path, HOST_PREFIX.data(), HOST_PREFIX.size())) {
+        return true;
+    }
+
+    constexpr std::string_view SELF_ROOT = "/wki/";
+    std::array<char, SELF_ROOT.size() + WKI_HOSTNAME_MAX> self_prefix{};
+    std::memcpy(self_prefix.data(), SELF_ROOT.data(), SELF_ROOT.size());
+    size_t hostname_len = 0;
+    while (hostname_len < g_wki.local_hostname.size() && g_wki.local_hostname.at(hostname_len) != '\0') {
+        ++hostname_len;
+    }
+    if (hostname_len == 0 || hostname_len == g_wki.local_hostname.size()) {
+        return false;
+    }
+    std::memcpy(self_prefix.data() + SELF_ROOT.size(), g_wki.local_hostname.data(), hostname_len);
+    size_t const SELF_PREFIX_LEN = SELF_ROOT.size() + hostname_len;
+    return vfs_metadata_batch_path_has_prefix(visible_path, self_prefix.data(), SELF_PREFIX_LEN);
+}
+
+auto vfs_metadata_batch_operation_is_valid(VfsMetadataBatchOperation operation) -> bool {
+    switch (operation) {
+        case VfsMetadataBatchOperation::INVALID:
+            return false;
+        case VfsMetadataBatchOperation::CREATE_CLOSE:
+        case VfsMetadataBatchOperation::STAT_FOLLOW:
+        case VfsMetadataBatchOperation::UNLINK:
+        case VfsMetadataBatchOperation::RENAME:
+            return true;
+    }
+    return false;
+}
+
+auto vfs_metadata_batch_validate_path(const uint8_t* data, const VfsMetadataBatchEntryView& view, bool second_path, const char* export_path,
+                                      const char* export_name) -> int {
+    size_t const OFFSET = second_path ? view.second_offset : view.first_offset;
+    size_t const PATH_LEN = second_path ? view.second_len : view.first_len;
+    const uint8_t* path = data + OFFSET;
+    if (!vfs_metadata_batch_relative_path_is_safe(path, PATH_LEN)) {
+        return -EINVAL;
+    }
+
+    std::array<char, VFS_METADATA_BATCH_PATH_BUFFER_SIZE> backing{};
+    std::array<char, VFS_METADATA_BATCH_PATH_BUFFER_SIZE> visible{};
+    if (!vfs_metadata_batch_build_full_path(backing.data(), backing.size(), export_path, path, PATH_LEN) ||
+        !vfs_metadata_batch_build_full_path(visible.data(), visible.size(), export_name, path, PATH_LEN)) {
+        return -ENAMETOOLONG;
+    }
+    if (vfs_metadata_batch_crosses_recursive_boundary(backing.data(), visible.data())) {
+        return -EPERM;
+    }
+    return 0;
+}
+
+auto vfs_metadata_batch_preflight(const uint8_t* data, uint16_t data_len, const char* export_path, const char* export_name,
+                                  VfsMetadataBatchHeader* header_out,
+                                  std::array<VfsMetadataBatchEntryView, VFS_METADATA_BATCH_MAX_ITEMS>* entries_out,
+                                  size_t* response_data_len_out) -> int {
+    if (data == nullptr || export_path == nullptr || export_name == nullptr || header_out == nullptr || entries_out == nullptr ||
+        response_data_len_out == nullptr || data_len < sizeof(VfsMetadataBatchHeader)) {
+        return -EINVAL;
+    }
+
+    VfsMetadataBatchHeader header{};
+    std::memcpy(&header, data, sizeof(header));
+    if (header.version != VFS_METADATA_BATCH_VERSION || !vfs_metadata_batch_operation_is_valid(header.operation) || header.count == 0 ||
+        header.count > VFS_METADATA_BATCH_MAX_ITEMS || (header.operation != VfsMetadataBatchOperation::CREATE_CLOSE && header.mode != 0)) {
+        return -EINVAL;
+    }
+    if (header.operation == VfsMetadataBatchOperation::STAT_FOLLOW && header.count > VFS_METADATA_BATCH_MAX_STAT_ITEMS) {
+        return -EMSGSIZE;
+    }
+
+    size_t const RECORD_SIZE =
+        header.operation == VfsMetadataBatchOperation::STAT_FOLLOW ? VFS_METADATA_BATCH_STAT_RECORD_SIZE : VFS_METADATA_BATCH_STATUS_SIZE;
+    size_t const RESPONSE_DATA_LEN = sizeof(VfsMetadataBatchHeader) + (static_cast<size_t>(header.count) * RECORD_SIZE);
+    if (sizeof(DevOpRespPayload) + RESPONSE_DATA_LEN > WKI_ETH_MAX_PAYLOAD || RESPONSE_DATA_LEN > UINT16_MAX) {
+        return -EMSGSIZE;
+    }
+
+    size_t cursor = sizeof(VfsMetadataBatchHeader);
+    auto parse_path = [&](size_t* offset_out, size_t* length_out) -> bool {
+        if (cursor > data_len || data_len - cursor < sizeof(uint16_t)) {
+            return false;
+        }
+        uint16_t path_len = 0;
+        std::memcpy(&path_len, data + cursor, sizeof(path_len));
+        cursor += sizeof(path_len);
+        if (path_len > VFS_METADATA_BATCH_MAX_PATH_LEN || static_cast<size_t>(path_len) > data_len - cursor) {
+            return false;
+        }
+        *offset_out = cursor;
+        *length_out = path_len;
+        cursor += path_len;
+        return true;
+    };
+
+    for (size_t index = 0; index < header.count; ++index) {
+        auto& entry = entries_out->at(index);
+        if (header.operation != VfsMetadataBatchOperation::RENAME) {
+            if (!parse_path(&entry.first_offset, &entry.first_len)) {
+                return -EINVAL;
+            }
+            continue;
+        }
+
+        if (cursor > data_len || data_len - cursor < 2 * sizeof(uint16_t)) {
+            return -EINVAL;
+        }
+        uint16_t old_len = 0;
+        uint16_t new_len = 0;
+        std::memcpy(&old_len, data + cursor, sizeof(old_len));
+        std::memcpy(&new_len, data + cursor + sizeof(old_len), sizeof(new_len));
+        cursor += 2 * sizeof(uint16_t);
+        if (old_len > VFS_METADATA_BATCH_MAX_PATH_LEN || new_len > VFS_METADATA_BATCH_MAX_PATH_LEN ||
+            static_cast<size_t>(old_len) > data_len - cursor) {
+            return -EINVAL;
+        }
+        entry.first_offset = cursor;
+        entry.first_len = old_len;
+        cursor += old_len;
+        if (static_cast<size_t>(new_len) > data_len - cursor) {
+            return -EINVAL;
+        }
+        entry.second_offset = cursor;
+        entry.second_len = new_len;
+        cursor += new_len;
+    }
+    if (cursor != data_len) {
+        return -EINVAL;
+    }
+
+    for (size_t index = 0; index < header.count; ++index) {
+        auto const& entry = entries_out->at(index);
+        int const FIRST_RET = vfs_metadata_batch_validate_path(data, entry, false, export_path, export_name);
+        if (FIRST_RET < 0) {
+            return FIRST_RET;
+        }
+        if (header.operation == VfsMetadataBatchOperation::RENAME) {
+            int const SECOND_RET = vfs_metadata_batch_validate_path(data, entry, true, export_path, export_name);
+            if (SECOND_RET < 0) {
+                return SECOND_RET;
+            }
+        }
+    }
+
+    *header_out = header;
+    *response_data_len_out = RESPONSE_DATA_LEN;
+    return 0;
+}
+
+void handle_vfs_metadata_batch_op(const WkiHeader* hdr, const WkiChannelIdentity& identity, const char* export_path,
+                                  const char* export_name, const uint8_t* data, uint16_t data_len) {
+    uint16_t const REQ_COOKIE = req_cookie_from_header(hdr);
+    uint64_t const PREFLIGHT_MOUNT_GENERATION = ker::vfs::mount_table_generation_snapshot();
+    VfsMetadataBatchHeader batch_header{};
+    std::array<VfsMetadataBatchEntryView, VFS_METADATA_BATCH_MAX_ITEMS> entries{};
+    size_t response_data_len = 0;
+    int const PREFLIGHT_RET =
+        vfs_metadata_batch_preflight(data, data_len, export_path, export_name, &batch_header, &entries, &response_data_len);
+    if (PREFLIGHT_RET < 0) {
+        send_vfs_error_response(identity, OP_VFS_METADATA_BATCH, static_cast<int16_t>(PREFLIGHT_RET), REQ_COOKIE);
+        return;
+    }
+    if (ker::vfs::mount_table_generation_snapshot() != PREFLIGHT_MOUNT_GENERATION) {
+        send_vfs_error_response(identity, OP_VFS_METADATA_BATCH, -EAGAIN, REQ_COOKIE);
+        return;
+    }
+
+    std::array<uint8_t, WKI_ETH_MAX_PAYLOAD> response{};
+    DevOpRespPayload response_prefix{};
+    response_prefix.op_id = OP_VFS_METADATA_BATCH;
+    response_prefix.status = 0;
+    response_prefix.data_len = static_cast<uint16_t>(response_data_len);
+    response_prefix.reserved = REQ_COOKIE;
+    std::memcpy(response.data(), &response_prefix, sizeof(response_prefix));
+    std::memcpy(response.data() + sizeof(response_prefix), &batch_header, sizeof(batch_header));
+
+    size_t result_offset = sizeof(DevOpRespPayload) + sizeof(VfsMetadataBatchHeader);
+    for (size_t index = 0; index < batch_header.count; ++index) {
+        auto const& entry = entries.at(index);
+        std::array<char, VFS_METADATA_BATCH_PATH_BUFFER_SIZE> first_backing{};
+        static_cast<void>(vfs_metadata_batch_build_full_path(first_backing.data(), first_backing.size(), export_path,
+                                                             data + entry.first_offset, entry.first_len));
+
+        int32_t item_status = -EINVAL;
+        ker::vfs::Stat statbuf{};
+        if (ker::vfs::mount_table_generation_snapshot() != PREFLIGHT_MOUNT_GENERATION) {
+            item_status = -EAGAIN;
+        } else {
+            switch (batch_header.operation) {
+                case VfsMetadataBatchOperation::INVALID:
+                    item_status = -EINVAL;
+                    break;
+                case VfsMetadataBatchOperation::CREATE_CLOSE: {
+                    constexpr int OPEN_WRONLY = 1;
+                    ker::vfs::File* file = ker::vfs::vfs_open_file_resolved(
+                        first_backing.data(), OPEN_WRONLY | ker::vfs::O_CREAT | ker::vfs::O_EXCL, static_cast<int>(batch_header.mode));
+                    item_status = file != nullptr ? static_cast<int32_t>(ker::vfs::vfs_close_file(file)) : -ENOENT;
+                    break;
+                }
+                case VfsMetadataBatchOperation::STAT_FOLLOW:
+                    item_status = static_cast<int32_t>(ker::vfs::vfs_stat_resolved(first_backing.data(), &statbuf));
+                    break;
+                case VfsMetadataBatchOperation::UNLINK:
+                    item_status = static_cast<int32_t>(ker::vfs::vfs_unlink_resolved(first_backing.data()));
+                    break;
+                case VfsMetadataBatchOperation::RENAME: {
+                    std::array<char, VFS_METADATA_BATCH_PATH_BUFFER_SIZE> second_backing{};
+                    static_cast<void>(vfs_metadata_batch_build_full_path(second_backing.data(), second_backing.size(), export_path,
+                                                                         data + entry.second_offset, entry.second_len));
+                    item_status = static_cast<int32_t>(ker::vfs::vfs_rename_resolved(first_backing.data(), second_backing.data()));
+                    break;
+                }
+            }
+        }
+
+        std::memcpy(response.data() + result_offset, &item_status, sizeof(item_status));
+        result_offset += sizeof(item_status);
+        if (batch_header.operation == VfsMetadataBatchOperation::STAT_FOLLOW) {
+            std::memcpy(response.data() + result_offset, &statbuf, sizeof(statbuf));
+            result_offset += sizeof(statbuf);
+        }
+    }
+
+    size_t const RESPONSE_LEN = sizeof(DevOpRespPayload) + response_data_len;
+    static_cast<void>(wki_send_on_channel_identity(identity, MsgType::DEV_OP_RESP, response.data(), static_cast<uint16_t>(RESPONSE_LEN)));
 }
 
 void send_cached_vfs_write_response(const WkiChannelIdentity& identity, const CachedVfsWriteResponse& cached) {
@@ -404,8 +729,13 @@ void run_deferred_vfs_op(void* arg) {
     // cannot erase the node until this reference is released.
     if (RETAINED_BINDING != nullptr && RETAINED_BINDING->resource_type == ResourceType::VFS &&
         channel_identity_matches(RETAINED_BINDING->channel_identity, op->channel_identity)) {
-        detail::handle_vfs_op(&op->hdr, op->channel_identity, static_cast<const char*>(RETAINED_BINDING->vfs_export_path),
-                              static_cast<const char*>(RETAINED_BINDING->vfs_export_name), op->op_id, op->req_data, op->req_data_len);
+        if (op->op_id == OP_VFS_METADATA_BATCH) {
+            handle_vfs_metadata_batch_op(&op->hdr, op->channel_identity, static_cast<const char*>(RETAINED_BINDING->vfs_export_path),
+                                         static_cast<const char*>(RETAINED_BINDING->vfs_export_name), op->req_data, op->req_data_len);
+        } else {
+            detail::handle_vfs_op(&op->hdr, op->channel_identity, static_cast<const char*>(RETAINED_BINDING->vfs_export_path),
+                                  static_cast<const char*>(RETAINED_BINDING->vfs_export_name), op->op_id, op->req_data, op->req_data_len);
+        }
     } else {
         send_vfs_error_response(op->channel_identity, op->op_id, -ENOTCONN, req_cookie_from_header(&op->hdr));
     }
@@ -2080,9 +2410,14 @@ void handle_dev_op_req(const WkiHeader* hdr, const uint8_t* payload, uint16_t pa
     // The contiguous request range ends at OP_VFS_READ_BULK (0x0413).
     // OP_VFS_READ_RDMA (0x0410), OP_VFS_WRITE_RDMA (0x0411),
     // OP_VFS_READDIR_BATCH (0x0412), and OP_VFS_READ_BULK (0x0413) all
-    // sit above OP_VFS_SEEK_END (0x040E). OP_VFS_UTIMENS (0x0415) is
-    // admitted separately so OP_VFS_INVALIDATE (0x0414) remains a notification.
+    // sit above OP_VFS_SEEK_END (0x040E). OP_VFS_UTIMENS (0x0415) and
+    // OP_VFS_METADATA_BATCH (0x0416) are admitted separately so
+    // OP_VFS_INVALIDATE (0x0414) remains a notification.
     if (IS_VFS_OP) {
+        if (req->op_id == OP_VFS_METADATA_BATCH && !wki_peer_capability_negotiated(hdr->src_node, WKI_CAP_VFS_METADATA_BATCH)) {
+            send_vfs_error_response(CHANNEL_IDENTITY, req->op_id, -EOPNOTSUPP, REQUEST_COOKIE);
+            return;
+        }
         if (req->op_id == OP_VFS_WRITE_RDMA) {
             uint16_t const REQ_COOKIE = req_cookie_from_header(hdr);
             CachedVfsWriteResponse cached = {};

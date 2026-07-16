@@ -251,6 +251,8 @@ auto subop_name(uint64_t callnum, uint64_t op) -> std::string_view {
                     return "fstat";
                 case ker::abi::vfs::ops::FSTAT_CLOSE:
                     return "fstat_close";
+                case ker::abi::vfs::ops::METADATA_BATCH:
+                    return "metadata_batch";
                 case ker::abi::vfs::ops::UMOUNT:
                     return "umount";
                 case ker::abi::vfs::ops::DUP:

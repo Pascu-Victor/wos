@@ -265,6 +265,68 @@ def test_wos_fstat_close_abi_consumes_each_fd_once() -> None:
     )
 
 
+def test_wos_metadata_batch_abi_preflights_before_effects() -> None:
+    kernel_ops = KERNEL_VFS_CALLNUMS.read_text()
+    require_order(
+        kernel_ops,
+        ["FSTAT_CLOSE,           // 61", "METADATA_BATCH,        // 62"],
+        "append-only kernel metadata-batch operation",
+    )
+    require_tokens(
+        kernel_ops,
+        [
+            "METADATA_BATCH_VERSION = 1",
+            "METADATA_BATCH_MAX_ITEMS = 64",
+            "METADATA_BATCH_MAX_PATH_CHARS = 511",
+            "static_assert(sizeof(metadata_batch_header) == 8)",
+        ],
+        "kernel metadata-batch ABI",
+    )
+
+    mlibc_vfs = WOS_VFS_H.read_text()
+    require_tokens(
+        mlibc_vfs,
+        [
+            "static_assert(static_cast<uint64_t>(ops::metadata_batch) == 62)",
+            "static_assert(sizeof(metadata_batch_entry) == 16)",
+            "static_assert(offsetof(metadata_batch_result, statbuf) == 8)",
+            "static_assert(sizeof(metadata_batch_result) == 152)",
+            "callers must not replay mutating entries",
+            "static_cast<uint64_t>(ops::metadata_batch)",
+        ],
+        "mlibc metadata-batch ABI mirror",
+    )
+
+    dispatch = function_body(KERNEL_SYS_VFS_CPP.read_text(), r"case\s+ops::METADATA_BATCH:")
+    require_order(
+        dispatch,
+        [
+            "copy_value_from_user(user_header, &header)",
+            "ensure_writable(*task, a3, RESULT_BYTES)",
+            "copy_from_task(*task, a2, copied_entries.data(), ENTRY_BYTES)",
+            "copy_cstring_from_task(*task",
+            "vfs_metadata_batch(task, operation, header.mode",
+            "copy_to_task(*task, a3, copied_results.data(), RESULT_BYTES)",
+        ],
+        "metadata-batch syscall usercopy/effect ordering",
+    )
+
+    vfs_batch = function_body(
+        KERNEL_VFS_CORE_CPP.read_text(),
+        r"auto\s+vfs_metadata_batch\(ker::mod::sched::task::Task\*\s+task,[^{}]*\)\s*->\s*int",
+    )
+    require_order(
+        vfs_batch,
+        [
+            "resolve_remote_path(entry.path",
+            "resolve_remote_path(entry.second_path",
+            "wki_remote_vfs_metadata_batch(batch_mount->private_data",
+        ],
+        "metadata-batch whole-path preflight",
+    )
+    require_tokens(STRACE_DECODE_CPP.read_text(), ["ops::METADATA_BATCH", 'return "metadata_batch"'], "strace metadata-batch decoder")
+
+
 def test_pselect_uses_dense_pollfds_and_handles_empty_sets() -> None:
     sysdeps = WOS_SYSDEPS_CPP.read_text()
     pselect_body = function_body(
@@ -761,6 +823,7 @@ if __name__ == "__main__":
     test_git_helper_pipe_cloexec_support_is_preserved_by_mlibc()
     test_mlibc_vfs_wrappers_pass_fd_creation_flags_to_kernel()
     test_wos_fstat_close_abi_consumes_each_fd_once()
+    test_wos_metadata_batch_abi_preflights_before_effects()
     test_pselect_uses_dense_pollfds_and_handles_empty_sets()
     test_pselect_and_epoll_pwait_honor_temporary_signal_masks()
     test_kernel_vfs_syscalls_accept_the_flags_mlibc_forwards()

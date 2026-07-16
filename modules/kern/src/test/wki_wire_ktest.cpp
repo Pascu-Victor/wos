@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <net/wki/wire.hpp>
 #include <test/ktest.hpp>
+#include <vfs/stat.hpp>
 
 KTEST(WkiWire, VfsMultiRdmaCapabilityAndAuxFlagPreserveLayouts) {
     using namespace ker::net::wki;
@@ -116,6 +117,35 @@ KTEST(WkiWire, VfsUtimensUsesAnAdditiveFixedPrefix) {
     KEXPECT_EQ(offsetof(VfsUtimensReqPrefix, reserved), static_cast<size_t>(35));
     KEXPECT_EQ(sizeof(DevOpReqPayload), static_cast<size_t>(4));
     KEXPECT_EQ(sizeof(DevOpRespPayload), static_cast<size_t>(8));
+}
+
+KTEST(WkiWire, VfsMetadataBatchUsesAdditiveBoundedFraming) {
+    using namespace ker::net::wki;
+
+    KEXPECT_EQ(WKI_CAP_VFS_METADATA_BATCH, static_cast<uint16_t>(0x0010));
+    KEXPECT_EQ(OP_VFS_METADATA_BATCH, static_cast<uint16_t>(0x0416));
+    KEXPECT_EQ(VFS_METADATA_BATCH_VERSION, static_cast<uint16_t>(1));
+    KEXPECT_EQ(VFS_METADATA_BATCH_MAX_ITEMS, static_cast<uint8_t>(64));
+    KEXPECT_EQ(VFS_METADATA_BATCH_MAX_STAT_ITEMS, static_cast<uint8_t>(60));
+    KEXPECT_EQ(VFS_METADATA_BATCH_MAX_PATH_LEN, static_cast<uint16_t>(511));
+    KEXPECT_EQ(static_cast<uint8_t>(VfsMetadataBatchOperation::CREATE_CLOSE), static_cast<uint8_t>(1));
+    KEXPECT_EQ(static_cast<uint8_t>(VfsMetadataBatchOperation::STAT_FOLLOW), static_cast<uint8_t>(2));
+    KEXPECT_EQ(static_cast<uint8_t>(VfsMetadataBatchOperation::UNLINK), static_cast<uint8_t>(3));
+    KEXPECT_EQ(static_cast<uint8_t>(VfsMetadataBatchOperation::RENAME), static_cast<uint8_t>(4));
+    KEXPECT_EQ(sizeof(VfsMetadataBatchHeader), static_cast<size_t>(8));
+    KEXPECT_EQ(offsetof(VfsMetadataBatchHeader, version), static_cast<size_t>(0));
+    KEXPECT_EQ(offsetof(VfsMetadataBatchHeader, operation), static_cast<size_t>(2));
+    KEXPECT_EQ(offsetof(VfsMetadataBatchHeader, count), static_cast<size_t>(3));
+    KEXPECT_EQ(offsetof(VfsMetadataBatchHeader, mode), static_cast<size_t>(4));
+
+    constexpr size_t STAT_RECORD_SIZE = sizeof(int32_t) + sizeof(ker::vfs::Stat);
+    KEXPECT_TRUE(sizeof(DevOpRespPayload) + sizeof(VfsMetadataBatchHeader) + VFS_METADATA_BATCH_MAX_STAT_ITEMS * STAT_RECORD_SIZE <=
+                 WKI_ETH_MAX_PAYLOAD);
+    KEXPECT_TRUE(sizeof(DevOpRespPayload) + sizeof(VfsMetadataBatchHeader) + (VFS_METADATA_BATCH_MAX_STAT_ITEMS + 1) * STAT_RECORD_SIZE >
+                 WKI_ETH_MAX_PAYLOAD);
+    KEXPECT_TRUE(sizeof(DevOpRespPayload) + sizeof(VfsMetadataBatchHeader) + VFS_METADATA_BATCH_MAX_ITEMS * sizeof(int32_t) <=
+                 WKI_ETH_MAX_PAYLOAD);
+    KEXPECT_EQ(sizeof(HelloPayload), static_cast<size_t>(96));
 }
 
 KTEST(WkiWire, DevAttachAckMatchesExpectedCookie) {

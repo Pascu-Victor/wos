@@ -12580,6 +12580,8 @@ auto vfs_unlink_resolved_path(const char* resolved_path, size_t known_resolved_p
 }  // namespace
 
 // --- unlink ---
+auto vfs_unlink_resolved(const char* path) -> int { return vfs_unlink_resolved_path(path); }
+
 auto vfs_unlink(const char* path) -> int {
     if (path == nullptr) {
         return -EINVAL;
@@ -13068,6 +13070,152 @@ auto vfs_renameat(ker::mod::sched::task::Task* task, int olddirfd, const char* o
 
     return vfs_rename_resolved_paths(old_resolved.data(), new_resolved.data(), old_path_requires_directory, new_path_requires_directory,
                                      old_resolved_len, new_resolved_len, old_resolved_hash, new_resolved_hash);
+}
+
+auto vfs_metadata_batch(ker::mod::sched::task::Task* task, MetadataBatchOperation operation, uint32_t mode,
+                        const MetadataBatchEntry* entries, size_t count, MetadataBatchResult* results) -> int {
+    constexpr size_t MAX_BATCH_ITEMS = 64;
+    constexpr size_t MAX_BATCH_PATH_CHARS = 511;
+    if (task == nullptr) {
+        return -ESRCH;
+    }
+    if (entries == nullptr || results == nullptr || count == 0 || count > MAX_BATCH_ITEMS) {
+        return -EINVAL;
+    }
+
+    switch (operation) {
+        case MetadataBatchOperation::INVALID:
+            return -EINVAL;
+        case MetadataBatchOperation::CREATE_CLOSE:
+            mode &= ~task->umask;
+            break;
+        case MetadataBatchOperation::STAT_FOLLOW:
+        case MetadataBatchOperation::UNLINK:
+        case MetadataBatchOperation::RENAME:
+            if (mode != 0) {
+                return -EINVAL;
+            }
+            break;
+        default:
+            return -EINVAL;
+    }
+
+    for (size_t index = 0; index < count; ++index) {
+        results[index].status = -EINPROGRESS;  // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
+        results[index].stat = {};              // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
+    }
+
+    // Path buffers remain live through the remote call so the stripped views in
+    // remote_entries never point at temporary resolver storage.
+    std::array<std::array<char, MAX_PATH_LEN>, MAX_BATCH_ITEMS> primary_resolved{};
+    std::array<std::array<char, MAX_PATH_LEN>, MAX_BATCH_ITEMS> secondary_resolved{};
+    std::array<size_t, MAX_BATCH_ITEMS> primary_lengths{};
+    std::array<size_t, MAX_BATCH_ITEMS> secondary_lengths{};
+    std::array<MetadataBatchEntry, MAX_BATCH_ITEMS> remote_entries{};
+    MountRef retained_mount{};
+    MountPoint* batch_mount = nullptr;
+
+    auto resolve_remote_path = [&](const char* raw_path, std::array<char, MAX_PATH_LEN>& resolved, size_t* resolved_len,
+                                   const char** relative_path) -> int {
+        if (raw_path == nullptr || resolved_len == nullptr || relative_path == nullptr) {
+            return -EINVAL;
+        }
+        bool requires_directory = false;
+        uint64_t resolved_hash = UNKNOWN_PATH_HASH;
+        int const RESOLVE_RET = resolve_dirfd_task_path_raw_with_absolute_local_fast_path(
+            task, AT_FDCWD, raw_path, resolved.data(), resolved.size(), true, &requires_directory, resolved_len, &resolved_hash);
+        if (RESOLVE_RET < 0) {
+            return RESOLVE_RET;
+        }
+        // The batch operations intentionally cover ordinary file metadata.
+        // Preserve less common trailing-slash semantics through the scalar path.
+        if (requires_directory) {
+            return -EOPNOTSUPP;
+        }
+
+        static_cast<void>(ensure_wki_host_root_mount(resolved.data()));
+        auto path_mount_ref = find_mount_point(resolved.data(), *resolved_len);
+        MountPoint* const PATH_MOUNT = path_mount_ref.get();
+        if (PATH_MOUNT == nullptr) {
+            return -ENOENT;
+        }
+        if (PATH_MOUNT->fs_type != FSType::REMOTE) {
+            return -EOPNOTSUPP;
+        }
+        if (batch_mount == nullptr) {
+            batch_mount = PATH_MOUNT;
+            retained_mount = std::move(path_mount_ref);
+        } else if (PATH_MOUNT != batch_mount) {
+            return -EOPNOTSUPP;
+        }
+
+        size_t const RELATIVE_LEN = strip_mount_prefix_len(PATH_MOUNT, resolved.data(), *resolved_len);
+        if (RELATIVE_LEN > MAX_BATCH_PATH_CHARS) {
+            return -ENAMETOOLONG;
+        }
+        *relative_path = strip_mount_prefix(PATH_MOUNT, resolved.data());
+        return 0;
+    };
+
+    for (size_t index = 0; index < count; ++index) {
+        auto const& entry = entries[index];  // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
+        int const PRIMARY_RET =
+            resolve_remote_path(entry.path, primary_resolved.at(index), &primary_lengths.at(index), &remote_entries.at(index).path);
+        if (PRIMARY_RET < 0) {
+            return PRIMARY_RET;
+        }
+
+        bool const RENAME = operation == MetadataBatchOperation::RENAME;
+        if ((!RENAME && entry.second_path != nullptr) || (RENAME && entry.second_path == nullptr)) {
+            return -EINVAL;
+        }
+        if (RENAME) {
+            int const SECONDARY_RET = resolve_remote_path(entry.second_path, secondary_resolved.at(index), &secondary_lengths.at(index),
+                                                          &remote_entries.at(index).second_path);
+            if (SECONDARY_RET < 0) {
+                return SECONDARY_RET;
+            }
+        }
+    }
+
+    if (batch_mount == nullptr || batch_mount->private_data == nullptr) {
+        return -EOPNOTSUPP;
+    }
+
+    bool mutation_request_attempted = false;
+    int const BATCH_RET = ker::net::wki::wki_remote_vfs_metadata_batch(batch_mount->private_data, operation, mode, remote_entries.data(),
+                                                                       count, results, &mutation_request_attempted);
+    for (size_t index = 0; index < count; ++index) {
+        auto& result = results[index];  // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
+        if (operation == MetadataBatchOperation::STAT_FOLLOW) {
+            if (result.status == 0) {
+                result.stat.st_dev = batch_mount->dev_id;
+            } else if (result.status == -ENOENT) {
+                metadata_cache_store_missing_path_on_current_mount(primary_resolved.at(index).data(), batch_mount,
+                                                                   primary_lengths.at(index));
+            }
+            continue;
+        }
+        bool const COMPLETION_AMBIGUOUS = mutation_request_attempted && result.status == -EINPROGRESS;
+        bool const CREATE_MAY_HAVE_TAKEN_EFFECT = mutation_request_attempted && operation == MetadataBatchOperation::CREATE_CLOSE;
+        if (result.status != 0 && !COMPLETION_AMBIGUOUS && !CREATE_MAY_HAVE_TAKEN_EFFECT) {
+            continue;
+        }
+        if (operation == MetadataBatchOperation::RENAME) {
+            vfs_cache_notify_path_changed(primary_resolved.at(index).data(), secondary_resolved.at(index).data());
+            if (result.status == 0) {
+                metadata_cache_store_missing_path_on_current_mount(primary_resolved.at(index).data(), batch_mount,
+                                                                   primary_lengths.at(index));
+            }
+        } else {
+            vfs_cache_notify_path_changed(primary_resolved.at(index).data(), nullptr);
+            if (operation == MetadataBatchOperation::UNLINK && result.status == 0) {
+                metadata_cache_store_missing_path_on_current_mount(primary_resolved.at(index).data(), batch_mount,
+                                                                   primary_lengths.at(index));
+            }
+        }
+    }
+    return BATCH_RET;
 }
 
 namespace {

@@ -37,6 +37,24 @@ enum class vfs_node_type : uint8_t { FILE, DIRECTORY, DEVICE, SOCKET, SYMLINK };
 
 struct File;
 
+enum class MetadataBatchOperation : uint8_t {
+    INVALID = 0,
+    CREATE_CLOSE = 1,
+    STAT_FOLLOW = 2,
+    UNLINK = 3,
+    RENAME = 4,
+};
+
+struct MetadataBatchEntry {
+    const char* path{};
+    const char* second_path{};
+};
+
+struct MetadataBatchResult {
+    int32_t status{};
+    Stat stat{};
+};
+
 struct VNode {
     const char* name{};
     vfs_node_type type{};
@@ -141,7 +159,19 @@ auto vfs_rename(const char* oldpath, const char* newpath) -> int;
 // Rename between already-resolved absolute backing paths without consulting
 // the current task's root or WKI routing policy.
 auto vfs_rename_resolved(const char* oldpath, const char* newpath) -> int;
+// Unlink an already-resolved absolute backing path without consulting the
+// current task's root or WKI routing policy.
+auto vfs_unlink_resolved(const char* path) -> int;
 auto vfs_renameat(ker::mod::sched::task::Task* task, int olddirfd, const char* oldpath, int newdirfd, const char* newpath) -> int;
+
+// Execute one uniform metadata operation over an already bounded item set.
+// The implementation preflights every path onto one negotiated REMOTE mount
+// and sends every mutation in one server-preflighted request before any item
+// can have an effect. On other negative returns, completed results and
+// EINPROGRESS entries describe partial or ambiguous completion and must not be
+// replayed. EOPNOTSUPP is reserved for a no-request-attempt fallback.
+auto vfs_metadata_batch(ker::mod::sched::task::Task* task, MetadataBatchOperation operation, uint32_t mode,
+                        const MetadataBatchEntry* entries, size_t count, MetadataBatchResult* results) -> int;
 
 // Permissions
 auto vfs_chmod(const char* path, int mode) -> int;

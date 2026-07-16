@@ -5,6 +5,7 @@
 #include <bits/ssize_t.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/vfs.h>
 #include <time.h>  // NOLINT(modernize-deprecated-headers): WOS POSIX clock declarations live here.
 #include <unistd.h>
 
@@ -208,6 +209,43 @@ auto apply_metadata_path_action(const MetadataPathWorkers& pool, size_t index) -
     return false;
 }
 
+auto metadata_batch_operation_for_action(MetadataPathAction action, ker::abi::vfs::metadata_batch_operation* operation) -> bool {
+    if (operation == nullptr) {
+        return false;
+    }
+    switch (action) {
+        case MetadataPathAction::CLEANUP:
+            *operation = ker::abi::vfs::metadata_batch_operation::unlink;
+            return true;
+        case MetadataPathAction::VERIFY_EMPTY:
+        case MetadataPathAction::VERIFY_ABSENT:
+            *operation = ker::abi::vfs::metadata_batch_operation::stat_follow;
+            return true;
+        case MetadataPathAction::CREATE:
+            *operation = ker::abi::vfs::metadata_batch_operation::create_close;
+            return true;
+        case MetadataPathAction::RENAME:
+            *operation = ker::abi::vfs::metadata_batch_operation::rename;
+            return true;
+    }
+    return false;
+}
+
+auto metadata_batch_result_succeeded(MetadataPathAction action, const ker::abi::vfs::metadata_batch_result& result) -> bool {
+    switch (action) {
+        case MetadataPathAction::CLEANUP:
+            return result.status == 0 || result.status == -ENOENT;
+        case MetadataPathAction::VERIFY_EMPTY:
+            return result.status == 0 && result.statbuf.st_size == 0;
+        case MetadataPathAction::VERIFY_ABSENT:
+            return result.status == -ENOENT;
+        case MetadataPathAction::CREATE:
+        case MetadataPathAction::RENAME:
+            return result.status == 0;
+    }
+    return false;
+}
+
 auto execute_metadata_path_range(const MetadataPathWorkers& pool, uint32_t worker_index) -> bool {
     size_t const PATH_COUNT = pool.primary_paths->size();
     size_t const BASE = PATH_COUNT / pool.worker_count;
@@ -215,10 +253,49 @@ auto execute_metadata_path_range(const MetadataPathWorkers& pool, uint32_t worke
     size_t const BEGIN = (static_cast<size_t>(worker_index) * BASE) + std::min(static_cast<size_t>(worker_index), EXTRA);
     size_t const COUNT = BASE + (static_cast<size_t>(worker_index) < EXTRA ? 1 : 0);
 
+    auto operation = ker::abi::vfs::metadata_batch_operation::create_close;
+    if (!metadata_batch_operation_for_action(pool.action, &operation)) {
+        return false;
+    }
+
+    std::array<ker::abi::vfs::metadata_batch_entry, ker::abi::vfs::METADATA_BATCH_MAX_ITEMS> entries{};
+    std::array<ker::abi::vfs::metadata_batch_result, ker::abi::vfs::METADATA_BATCH_MAX_ITEMS> results{};
     bool success = true;
-    for (size_t index = BEGIN; index < BEGIN + COUNT; ++index) {
-        bool const ITEM_SUCCEEDED = apply_metadata_path_action(pool, index);
-        success = ITEM_SUCCEEDED && success;
+    for (size_t chunk_begin = BEGIN; chunk_begin < BEGIN + COUNT; chunk_begin += ker::abi::vfs::METADATA_BATCH_MAX_ITEMS) {
+        size_t const CHUNK_COUNT = std::min(static_cast<size_t>(ker::abi::vfs::METADATA_BATCH_MAX_ITEMS), (BEGIN + COUNT) - chunk_begin);
+        for (size_t offset = 0; offset < CHUNK_COUNT; ++offset) {
+            size_t const INDEX = chunk_begin + offset;
+            entries.at(offset) = {
+                .path = pool.primary_paths->at(INDEX).c_str(),
+                .second_path = pool.secondary_paths == nullptr ? nullptr : pool.secondary_paths->at(INDEX).c_str(),
+            };
+            results.at(offset) = {};
+            results.at(offset).status = -EIO;
+        }
+
+        ker::abi::vfs::metadata_batch_header const HEADER{
+            .version = ker::abi::vfs::METADATA_BATCH_VERSION,
+            .operation = operation,
+            .count = static_cast<uint8_t>(CHUNK_COUNT),
+            .mode = pool.action == MetadataPathAction::CREATE ? 0600U : 0U,
+        };
+        int const BATCH_STATUS = ker::abi::vfs::metadata_batch(&HEADER, entries.data(), results.data());
+        if (BATCH_STATUS == -EOPNOTSUPP && chunk_begin == BEGIN) {
+            bool scalar_success = true;
+            for (size_t index = BEGIN; index < BEGIN + COUNT; ++index) {
+                bool const ITEM_SUCCEEDED = apply_metadata_path_action(pool, index);
+                scalar_success = ITEM_SUCCEEDED && scalar_success;
+            }
+            return scalar_success;
+        }
+        if (BATCH_STATUS != 0) {
+            return false;
+        }
+
+        for (size_t offset = 0; offset < CHUNK_COUNT; ++offset) {
+            bool const ITEM_SUCCEEDED = metadata_batch_result_succeeded(pool.action, results.at(offset));
+            success = ITEM_SUCCEEDED && success;
+        }
     }
     return success;
 }

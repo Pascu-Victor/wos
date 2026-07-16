@@ -7,6 +7,7 @@
 #include <array>
 #include <cstring>
 #include <net/wki/wire.hpp>
+#include <vfs/stat.hpp>
 
 using namespace ker::net::wki;
 
@@ -314,6 +315,33 @@ TEST(WkiWire, VfsUtimensUsesAnAdditiveFixedPrefix) {
     EXPECT_EQ(offsetof(VfsUtimensReqPrefix, reserved), 35u);
     EXPECT_EQ(sizeof(DevOpReqPayload), 4u);
     EXPECT_EQ(sizeof(DevOpRespPayload), 8u);
+}
+
+TEST(WkiWire, VfsMetadataBatchUsesAdditiveBoundedFraming) {
+    EXPECT_EQ(WKI_CAP_VFS_METADATA_BATCH, 0x0010u);
+    EXPECT_EQ(OP_VFS_METADATA_BATCH, 0x0416u);
+    EXPECT_EQ(VFS_METADATA_BATCH_VERSION, 1u);
+    EXPECT_EQ(VFS_METADATA_BATCH_MAX_ITEMS, 64u);
+    EXPECT_EQ(VFS_METADATA_BATCH_MAX_STAT_ITEMS, 60u);
+    EXPECT_EQ(VFS_METADATA_BATCH_MAX_PATH_LEN, 511u);
+    EXPECT_EQ(static_cast<uint8_t>(VfsMetadataBatchOperation::CREATE_CLOSE), 1u);
+    EXPECT_EQ(static_cast<uint8_t>(VfsMetadataBatchOperation::STAT_FOLLOW), 2u);
+    EXPECT_EQ(static_cast<uint8_t>(VfsMetadataBatchOperation::UNLINK), 3u);
+    EXPECT_EQ(static_cast<uint8_t>(VfsMetadataBatchOperation::RENAME), 4u);
+    EXPECT_EQ(sizeof(VfsMetadataBatchHeader), 8u);
+    EXPECT_EQ(offsetof(VfsMetadataBatchHeader, version), 0u);
+    EXPECT_EQ(offsetof(VfsMetadataBatchHeader, operation), 2u);
+    EXPECT_EQ(offsetof(VfsMetadataBatchHeader, count), 3u);
+    EXPECT_EQ(offsetof(VfsMetadataBatchHeader, mode), 4u);
+
+    constexpr size_t STAT_RECORD_SIZE = sizeof(int32_t) + sizeof(ker::vfs::Stat);
+    EXPECT_LE(sizeof(DevOpRespPayload) + sizeof(VfsMetadataBatchHeader) + VFS_METADATA_BATCH_MAX_STAT_ITEMS * STAT_RECORD_SIZE,
+              WKI_ETH_MAX_PAYLOAD);
+    EXPECT_GT(sizeof(DevOpRespPayload) + sizeof(VfsMetadataBatchHeader) + (VFS_METADATA_BATCH_MAX_STAT_ITEMS + 1) * STAT_RECORD_SIZE,
+              WKI_ETH_MAX_PAYLOAD);
+    EXPECT_LE(sizeof(DevOpRespPayload) + sizeof(VfsMetadataBatchHeader) + VFS_METADATA_BATCH_MAX_ITEMS * sizeof(int32_t),
+              WKI_ETH_MAX_PAYLOAD);
+    EXPECT_EQ(sizeof(HelloPayload), 96u);
 }
 
 TEST(WkiWire, DevAttachAckMatchesExpectedCookie) {

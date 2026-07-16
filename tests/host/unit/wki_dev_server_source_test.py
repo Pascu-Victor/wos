@@ -893,8 +893,94 @@ def test_path_utimens_is_deferred_without_reclassifying_invalidate() -> None:
     if queue_pos < 0 or return_pos <= queue_pos:
         fail("deferred VFS dispatch must return from RX after queue admission")
 
-    if admission.count("op_id <= OP_VFS_UTIMENS") != 2:
+    if admission.count("op_id <= OP_VFS_METADATA_BATCH") != 2:
         fail("VFS request and response admission must include path utimens during export rebuild/drain")
+
+
+def test_metadata_batch_is_capability_gated_preflighted_and_worker_executed() -> None:
+    source = DEV_SERVER_CPP.read_text()
+    wire = WIRE_HPP.read_text()
+    wki_source = WKI_CPP.read_text()
+    classifier = function_body(source, "is_vfs_op")
+    rx_handler = function_body(source, "handle_dev_op_req")
+    worker = function_body(source, "run_deferred_vfs_op")
+    preflight = function_body(source, "vfs_metadata_batch_preflight")
+    executor = function_body(source, "handle_vfs_metadata_batch_op")
+
+    for token in [
+        "constexpr uint16_t WKI_CAP_VFS_METADATA_BATCH = 0x0010;",
+        "constexpr uint16_t OP_VFS_METADATA_BATCH = 0x0416;",
+        "constexpr uint16_t VFS_METADATA_BATCH_VERSION = 1;",
+        "constexpr uint8_t VFS_METADATA_BATCH_MAX_ITEMS = 64;",
+        "struct VfsMetadataBatchHeader",
+        "static_assert(sizeof(VfsMetadataBatchHeader) == 8);",
+    ]:
+        if token not in wire:
+            fail(f"metadata batch wire contract is missing {token!r}")
+
+    if "op_id == OP_VFS_METADATA_BATCH" not in classifier or "OP_VFS_INVALIDATE" in classifier:
+        fail("metadata batch must be deferred without classifying invalidation notifications as requests")
+    admission = function_body(wki_source, "message_uses_vfs_export_admission")
+    if admission.count("op_id <= OP_VFS_METADATA_BATCH") != 2:
+        fail("metadata batch requests and responses must participate in VFS export admission")
+    if "WKI_CAP_VFS_METADATA_BATCH" not in function_body(wki_source, "wki_init"):
+        fail("metadata batch capability must be advertised in HELLO")
+
+    capability_pos = rx_handler.find("wki_peer_capability_negotiated(hdr->src_node, WKI_CAP_VFS_METADATA_BATCH)")
+    unsupported_pos = rx_handler.find("-EOPNOTSUPP", capability_pos)
+    queue_pos = rx_handler.find("queue_vfs_op(hdr, CHANNEL_IDENTITY")
+    if min(capability_pos, unsupported_pos, queue_pos) < 0 or not capability_pos < unsupported_pos < queue_pos:
+        fail("metadata batch must reject unnegotiated peers before deferred queue admission")
+
+    if "if (op->op_id == OP_VFS_METADATA_BATCH)" not in worker or "handle_vfs_metadata_batch_op" not in worker:
+        fail("metadata batch must execute only from the deferred VFS worker")
+    for token in [
+        "header.version != VFS_METADATA_BATCH_VERSION",
+        "header.count == 0",
+        "header.count > VFS_METADATA_BATCH_MAX_ITEMS",
+        "header.mode != 0",
+        "header.count > VFS_METADATA_BATCH_MAX_STAT_ITEMS",
+        "std::memcpy(&new_len, data + cursor + sizeof(old_len), sizeof(new_len))",
+        "cursor != data_len",
+        "vfs_metadata_batch_validate_path",
+        "sizeof(DevOpRespPayload) + RESPONSE_DATA_LEN > WKI_ETH_MAX_PAYLOAD",
+    ]:
+        if token not in preflight:
+            fail(f"metadata batch whole-request preflight is missing {token!r}")
+
+    preflight_pos = executor.find("vfs_metadata_batch_preflight")
+    execution_positions = [
+        executor.find("vfs_open_file_resolved"),
+        executor.find("vfs_stat_resolved"),
+        executor.find("vfs_unlink_resolved"),
+        executor.find("vfs_rename_resolved"),
+    ]
+    if preflight_pos < 0 or min(execution_positions) <= preflight_pos:
+        fail("metadata batch must finish whole-request preflight before any item effect")
+    for token in [
+        "PREFLIGHT_MOUNT_GENERATION",
+        "response_prefix.status = 0",
+        "response_prefix.data_len = static_cast<uint16_t>(response_data_len)",
+        "std::memcpy(response.data() + sizeof(response_prefix), &batch_header, sizeof(batch_header))",
+        "std::memcpy(response.data() + result_offset, &item_status, sizeof(item_status))",
+        "std::memcpy(response.data() + result_offset, &statbuf, sizeof(statbuf))",
+        "wki_send_on_channel_identity(identity, MsgType::DEV_OP_RESP, response.data()",
+    ]:
+        if token not in executor:
+            fail(f"metadata batch exact response framing is missing {token!r}")
+    cursor = 0
+    for token in [
+        "PREFLIGHT_MOUNT_GENERATION = ker::vfs::mount_table_generation_snapshot()",
+        "vfs_metadata_batch_preflight",
+        "mount_table_generation_snapshot() != PREFLIGHT_MOUNT_GENERATION",
+        "response_prefix.status = 0",
+        "mount_table_generation_snapshot() != PREFLIGHT_MOUNT_GENERATION",
+        "item_status = -EAGAIN",
+    ]:
+        token_pos = executor.find(token, cursor)
+        if token_pos < 0:
+            fail("metadata batch must reject mount-topology races before execution and before each later item")
+        cursor = token_pos + len(token)
 
 
 def test_detach_waits_for_binding_refs_before_cleanup_and_erase() -> None:
@@ -1278,6 +1364,7 @@ def main() -> None:
     test_block_ring_binding_lifetime_is_retained_outside_server_lock()
     test_deferred_vfs_ops_retain_their_binding_through_blocking_work()
     test_path_utimens_is_deferred_without_reclassifying_invalidate()
+    test_metadata_batch_is_capability_gated_preflighted_and_worker_executed()
     test_detach_waits_for_binding_refs_before_cleanup_and_erase()
     test_epoch_cleanup_and_deferred_vfs_are_channel_generation_fenced()
     test_attach_ack_failure_defers_exact_cleanup_outside_rx()

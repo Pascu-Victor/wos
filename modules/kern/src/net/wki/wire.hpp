@@ -171,6 +171,9 @@ constexpr uint16_t WKI_CAP_RESOURCE_INCARNATION = 0x0004;
 // RDMA staging for more than the mount anchor without creating extra logical
 // invalidation anchors.
 constexpr uint16_t WKI_CAP_VFS_MULTI_RDMA_LANES = 0x0008;
+// Both peers understand the bounded metadata-batch request/response framing.
+// The HELLO payload layout is unchanged; this is an additive capability bit.
+constexpr uint16_t WKI_CAP_VFS_METADATA_BATCH = 0x0010;
 
 // Hostname constants
 constexpr size_t WKI_HOSTNAME_MAX = 64;  // Matches Linux HOST_NAME_MAX (including NUL)
@@ -843,6 +846,31 @@ struct VfsUtimensReqPrefix {
 } __attribute__((packed));
 
 static_assert(sizeof(VfsUtimensReqPrefix) == 36);
+
+constexpr uint16_t OP_VFS_METADATA_BATCH = 0x0416;
+constexpr uint16_t VFS_METADATA_BATCH_VERSION = 1;
+constexpr uint8_t VFS_METADATA_BATCH_MAX_ITEMS = 64;
+// A stat response carries {status:i32, Stat:144} per item. Sixty such records,
+// the batch header, and DevOpRespPayload fit in one WKI Ethernet payload.
+constexpr uint8_t VFS_METADATA_BATCH_MAX_STAT_ITEMS = 60;
+constexpr uint16_t VFS_METADATA_BATCH_MAX_PATH_LEN = 511;
+
+enum class VfsMetadataBatchOperation : uint8_t {
+    INVALID = 0,
+    CREATE_CLOSE = 1,
+    STAT_FOLLOW = 2,
+    UNLINK = 3,
+    RENAME = 4,
+};
+
+struct VfsMetadataBatchHeader {
+    uint16_t version;
+    VfsMetadataBatchOperation operation;
+    uint8_t count;
+    uint32_t mode;
+} __attribute__((packed));
+
+static_assert(sizeof(VfsMetadataBatchHeader) == 8);
 
 // IPC Pipe (0x0700–0x070F) — data moves via wire messages
 constexpr uint16_t OP_PIPE_CLOSE_READ = 0x0700;

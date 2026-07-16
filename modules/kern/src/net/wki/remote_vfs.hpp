@@ -13,6 +13,12 @@
 #include <vfs/file_operations.hpp>
 #include <vfs/stat.hpp>
 
+namespace ker::vfs {
+enum class MetadataBatchOperation : uint8_t;
+struct MetadataBatchEntry;
+struct MetadataBatchResult;
+}  // namespace ker::vfs
+
 namespace ker::net::wki {
 
 // -----------------------------------------------------------------------------
@@ -345,6 +351,13 @@ auto wki_remote_vfs_open_path(const char* fs_relative_path, int flags, int mode,
 
 // Consumer side: called from vfs_stat() for FSType::REMOTE mounts
 auto wki_remote_vfs_stat(void* mount_private_data, const char* fs_relative_path, ker::vfs::Stat* statbuf) -> int;
+
+// Consumer side: execute one uniform, ordered metadata batch on a single
+// negotiated remote mount. Mutations are sent as one fully preflighted wire
+// request. EOPNOTSUPP is returned only before any request send.
+auto wki_remote_vfs_metadata_batch(void* mount_private_data, ker::vfs::MetadataBatchOperation operation, uint32_t mode,
+                                   const ker::vfs::MetadataBatchEntry* entries, size_t count, ker::vfs::MetadataBatchResult* results,
+                                   bool* mutation_request_attempted) -> int;
 
 // Consumer side: cached metadata lookup for an already-open remote file.
 auto wki_remote_vfs_fstat(ker::vfs::File* file, ker::vfs::Stat* statbuf) -> int;
