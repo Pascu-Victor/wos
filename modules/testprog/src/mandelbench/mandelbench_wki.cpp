@@ -60,7 +60,7 @@ constexpr size_t WORKER_OUTPUT_RGBA_BYTES = 4;
 constexpr size_t WORKER_OUTPUT_RLE_RECORD_SIZE = sizeof(uint16_t) + WORKER_OUTPUT_RGBA_BYTES;
 constexpr unsigned char WORKER_CONTROL_START = 1;
 constexpr unsigned char WORKER_CONTROL_RELEASE_PAYLOAD = 2;
-constexpr int MANDELBENCH_ROW_BAND_ROWS = 8;
+constexpr int MANDELBENCH_ROW_BAND_ROWS = 4;
 constexpr size_t MANDELBENCH_PROFILE_WORKER_LIMIT = 8;
 constexpr uint64_t USEC_PER_SEC = 1'000'000;
 constexpr int64_t NSEC_PER_SEC = 1'000'000'000;
@@ -469,6 +469,7 @@ struct WorkerLaunch {
     int release_read_fd;
     int release_write_fd;
     bool read_ok;
+    bool output_scattered;
     bool wait_done;
     bool wait_ok;
     int32_t wait_status;
@@ -602,6 +603,7 @@ auto make_worker_launch(int output_slot, std::string target_node, int thread_cou
         .release_read_fd = -1,
         .release_write_fd = -1,
         .read_ok = false,
+        .output_scattered = false,
         .wait_done = false,
         .wait_ok = false,
         .wait_status = 0,
@@ -1040,6 +1042,7 @@ void reset_worker_transfer(WorkerLaunch& launch, unsigned char* read_dest, size_
     launch.header.fill(0);
     launch.header_offset = 0;
     launch.read_ok = false;
+    launch.output_scattered = false;
     launch.read_begin_us = 0;
     launch.read_end_us = 0;
     launch.read_last_progress_us = 0;
@@ -1049,7 +1052,10 @@ void reset_worker_transfer(WorkerLaunch& launch, unsigned char* read_dest, size_
 void configure_worker_read_targets(std::span<WorkerLaunch> launches, unsigned char* /*image*/, size_t row_size) {
     for (auto& launch : launches) {
         size_t const PAYLOAD_SIZE = worker_chunks_bytes(launch.chunks, row_size);
-        launch.read_buffer.assign(PAYLOAD_SIZE, 0);
+        // Every accepted payload byte is overwritten before it is decoded.
+        // Keep the allocation and its cache contents across repeats instead of
+        // clearing the full raw-size receive buffer before each timed run.
+        launch.read_buffer.resize(PAYLOAD_SIZE);
         reset_worker_transfer(launch, launch.read_buffer.data(), PAYLOAD_SIZE);
     }
 }
@@ -1146,44 +1152,55 @@ auto decode_worker_rgba_rle(const WorkerLaunch& launch, unsigned char* image, si
     return true;
 }
 
-auto scatter_worker_outputs(std::span<const WorkerLaunch> launches, unsigned char* image, size_t row_size) -> bool {
-    for (const auto& launch : launches) {
-        if (!launch.read_ok || launch.read_offset != launch.read_target) {
-            std::println(stderr, "mandelbench: remote worker {} output incomplete read={}/{}", launch.output_slot, launch.read_offset,
-                         launch.read_target);
+auto scatter_worker_output(WorkerLaunch& launch, unsigned char* image, size_t row_size) -> bool {
+    if (launch.output_scattered) {
+        return true;
+    }
+    if (!launch.read_ok || launch.read_offset != launch.read_target) {
+        std::println(stderr, "mandelbench: remote worker {} output incomplete read={}/{}", launch.output_slot, launch.read_offset,
+                     launch.read_target);
+        return false;
+    }
+
+    if (launch.payload_flags == WORKER_OUTPUT_FLAG_PAYLOAD_RLE) {
+        if (!decode_worker_rgba_rle(launch, image, row_size)) {
             return false;
         }
+        launch.output_scattered = true;
+        return true;
+    }
+    if (launch.payload_flags != WORKER_OUTPUT_FLAG_PAYLOAD || launch.read_target != launch.expected_payload_size ||
+        launch.read_target > launch.read_buffer.size()) {
+        std::println(stderr, "mandelbench: remote worker {} has invalid raw payload flags={} bytes={} expected={} buffer={}",
+                     launch.output_slot, launch.payload_flags, launch.read_target, launch.expected_payload_size,
+                     launch.read_buffer.size());
+        return false;
+    }
 
-        if (launch.payload_flags == WORKER_OUTPUT_FLAG_PAYLOAD_RLE) {
-            if (!decode_worker_rgba_rle(launch, image, row_size)) {
-                return false;
-            }
-            continue;
-        }
-        if (launch.payload_flags != WORKER_OUTPUT_FLAG_PAYLOAD || launch.read_target != launch.expected_payload_size ||
-            launch.read_target > launch.read_buffer.size()) {
-            std::println(stderr,
-                         "mandelbench: remote worker {} has invalid raw payload flags={} bytes={} expected={} buffer={}",
-                         launch.output_slot, launch.payload_flags, launch.read_target, launch.expected_payload_size,
-                         launch.read_buffer.size());
+    size_t payload_offset = 0;
+    for (const auto& chunk : launch.chunks) {
+        size_t const BYTES = worker_chunk_bytes(chunk, row_size);
+        size_t const IMAGE_OFFSET = static_cast<size_t>(chunk.start_row) * row_size;
+        if (payload_offset > launch.read_target || BYTES > launch.read_target - payload_offset) {
+            std::println(stderr, "mandelbench: remote worker {} chunk {} overruns payload offset={} bytes={} payload={}",
+                         launch.output_slot, chunk.worker_id, payload_offset, BYTES, launch.read_target);
             return false;
         }
+        std::memcpy(image + IMAGE_OFFSET, launch.read_buffer.data() + payload_offset, BYTES);
+        payload_offset += BYTES;
+    }
+    if (payload_offset != launch.expected_payload_size) {
+        std::println(stderr, "mandelbench: remote worker {} payload size mismatch scattered={} payload={}", launch.output_slot,
+                     payload_offset, launch.expected_payload_size);
+        return false;
+    }
+    launch.output_scattered = true;
+    return true;
+}
 
-        size_t payload_offset = 0;
-        for (const auto& chunk : launch.chunks) {
-            size_t const BYTES = worker_chunk_bytes(chunk, row_size);
-            size_t const IMAGE_OFFSET = static_cast<size_t>(chunk.start_row) * row_size;
-            if (payload_offset > launch.read_target || BYTES > launch.read_target - payload_offset) {
-                std::println(stderr, "mandelbench: remote worker {} chunk {} overruns payload offset={} bytes={} payload={}",
-                             launch.output_slot, chunk.worker_id, payload_offset, BYTES, launch.read_target);
-                return false;
-            }
-            std::memcpy(image + IMAGE_OFFSET, launch.read_buffer.data() + payload_offset, BYTES);
-            payload_offset += BYTES;
-        }
-        if (payload_offset != launch.expected_payload_size) {
-            std::println(stderr, "mandelbench: remote worker {} payload size mismatch scattered={} payload={}", launch.output_slot,
-                         payload_offset, launch.expected_payload_size);
+auto scatter_worker_outputs(std::span<WorkerLaunch> launches, unsigned char* image, size_t row_size) -> bool {
+    for (auto& launch : launches) {
+        if (!scatter_worker_output(launch, image, row_size)) {
             return false;
         }
     }
@@ -1586,7 +1603,7 @@ auto complete_workers_and_outputs(std::span<WorkerLaunch> launches, bool require
 }
 
 auto complete_worker_payloads_streaming(std::span<WorkerLaunch> launches, uint16_t expected_flags, int repeat_index,
-                                        bool payload_release_enabled) -> WorkerPayloadResult {
+                                        bool payload_release_enabled, unsigned char* image, size_t row_size) -> WorkerPayloadResult {
     uint64_t const START_US = now_us();
     uint64_t header_end_us = START_US;
     uint64_t release_end_us = START_US;
@@ -1641,6 +1658,13 @@ auto complete_worker_payloads_streaming(std::span<WorkerLaunch> launches, uint16
             }
             if (READ_WAS_PENDING && !read_is_pending(launch)) {
                 read_end_us = std::max(read_end_us, launch.read_end_us);
+                // The planner assigns every row band to exactly one local or
+                // remote launch. Scatter a completed remote result while the
+                // remaining workers run; concurrent local writes target
+                // disjoint bytes in the final image.
+                if (launch.read_ok && !scatter_worker_output(launch, image, row_size)) {
+                    ok = false;
+                }
             }
         }
 
@@ -1981,8 +2005,8 @@ auto mandelbench_wki(int width, int height, int max_iteration, int workers, int 
         }
 
         uint64_t const PAYLOAD_DRAIN_START_US = now_us();
-        WorkerPayloadResult const WORKER_RESULT =
-            complete_worker_payloads_streaming(remote_launches, WORKER_OUTPUT_FLAG_PAYLOAD, repeat_index, PAYLOAD_RELEASE);
+        WorkerPayloadResult const WORKER_RESULT = complete_worker_payloads_streaming(
+            remote_launches, WORKER_OUTPUT_FLAG_PAYLOAD, repeat_index, PAYLOAD_RELEASE, image.data(), ROW_SIZE);
         if (local_compute_started) {
             local_compute_ok = join_local_compute_task(local_compute_thread, local_compute_task);
         }

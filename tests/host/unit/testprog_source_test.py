@@ -926,7 +926,7 @@ def test_mandelbench_coalesces_remote_workers_and_keeps_local_compute_local() ->
         [
             "constexpr uint64_t PIPE_PAYLOAD_IDLE_TIMEOUT_US = 300'000'000;",
             "constexpr unsigned char WORKER_CONTROL_RELEASE_PAYLOAD = 2;",
-            "constexpr int MANDELBENCH_ROW_BAND_ROWS = 8;",
+            "constexpr int MANDELBENCH_ROW_BAND_ROWS = 4;",
             "MANDELBENCH_SAVE_IMAGES",
             "MANDELBENCH_PAYLOAD_RELEASE",
             "return value == nullptr || value[0] == '\\0' || value[0] != '0';",
@@ -974,7 +974,7 @@ def test_mandelbench_coalesces_remote_workers_and_keeps_local_compute_local() ->
             "bool const SAVE_IMAGES = mandelbench_save_images_enabled();",
             "bool const PAYLOAD_RELEASE = mandelbench_payload_release_enabled();",
             "LocalComputeTask local_compute_task{",
-            "complete_worker_payloads_streaming(remote_launches, WORKER_OUTPUT_FLAG_PAYLOAD, repeat_index, PAYLOAD_RELEASE)",
+            "PAYLOAD_RELEASE, image.data(), ROW_SIZE)",
             "print_slowest_worker_profiles(remote_launches, repeat_index, START_US);",
             "if (SAVE_IMAGES)",
             "save_skipped=1",
@@ -1183,18 +1183,26 @@ def test_mandelbench_worker_payload_rle_is_bounded_and_exact() -> None:
         "mandelbench exact RLE decoder",
     )
 
-    scatter_body = function_body(source, "scatter_worker_outputs")
+    scatter_body = function_body(source, "scatter_worker_output")
     require_tokens(
         scatter_body,
         [
+            "if (launch.output_scattered)",
             "launch.payload_flags == WORKER_OUTPUT_FLAG_PAYLOAD_RLE",
             "decode_worker_rgba_rle(launch, image, row_size)",
             "launch.payload_flags != WORKER_OUTPUT_FLAG_PAYLOAD",
             "launch.read_target != launch.expected_payload_size",
             "BYTES > launch.read_target - payload_offset",
             "payload_offset != launch.expected_payload_size",
+            "launch.output_scattered = true;",
         ],
-        "mandelbench raw and RLE scatter dispatch",
+        "mandelbench idempotent raw and RLE scatter dispatch",
+    )
+    scatter_all_body = function_body(source, "scatter_worker_outputs")
+    require_tokens(
+        scatter_all_body,
+        ["for (auto& launch : launches)", "scatter_worker_output(launch, image, row_size)"],
+        "mandelbench final scatter validation",
     )
 
     worker_body = function_body(source, "mandelbench_worker")
@@ -1292,7 +1300,7 @@ def test_mandelbench_overlaps_local_compute_with_remote_payload_drain() -> None:
             "thrd_create(&local_compute_thread, run_local_compute_task, &local_compute_task)",
             "using synchronous fallback",
             "execute_local_compute_task(local_compute_task)",
-            "complete_worker_payloads_streaming(remote_launches, WORKER_OUTPUT_FLAG_PAYLOAD, repeat_index, PAYLOAD_RELEASE)",
+            "PAYLOAD_RELEASE, image.data(), ROW_SIZE)",
             "join_local_compute_task(local_compute_thread, local_compute_task)",
             "if (!local_compute_ok || !WORKER_RESULT.ok)",
             "scatter_worker_outputs(remote_launches, image.data(), ROW_SIZE)",
@@ -1302,20 +1310,31 @@ def test_mandelbench_overlaps_local_compute_with_remote_payload_drain() -> None:
     require_order(
         coordinator_body,
         "thrd_create(&local_compute_thread, run_local_compute_task, &local_compute_task)",
-        "complete_worker_payloads_streaming(remote_launches, WORKER_OUTPUT_FLAG_PAYLOAD, repeat_index, PAYLOAD_RELEASE)",
+        "complete_worker_payloads_streaming(",
         "mandelbench starts local compute before draining remote payloads",
     )
     require_order(
         coordinator_body,
-        "complete_worker_payloads_streaming(remote_launches, WORKER_OUTPUT_FLAG_PAYLOAD, repeat_index, PAYLOAD_RELEASE)",
+        "complete_worker_payloads_streaming(",
         "join_local_compute_task(local_compute_thread, local_compute_task)",
         "mandelbench keeps remote child polling on the coordinator before joining local compute",
     )
+    streaming_body = function_body(source, "complete_worker_payloads_streaming")
+    require_tokens(
+        streaming_body,
+        [
+            "if (READ_WAS_PENDING && !read_is_pending(launch))",
+            "launch.read_ok && !scatter_worker_output(launch, image, row_size)",
+            "concurrent local writes target",
+            "disjoint bytes in the final image",
+        ],
+        "mandelbench per-worker result scatter overlap",
+    )
     require_order(
-        coordinator_body,
-        "join_local_compute_task(local_compute_thread, local_compute_task)",
-        "scatter_worker_outputs(remote_launches, image.data(), ROW_SIZE)",
-        "mandelbench joins local row writers before scattering remote rows",
+        streaming_body,
+        "if (READ_WAS_PENDING && !read_is_pending(launch))",
+        "scatter_worker_output(launch, image, row_size)",
+        "mandelbench scatters only after a complete worker read",
     )
     if "complete_worker_payloads_streaming" in thread_body:
         fail("mandelbench remote waitpid/payload draining must stay on the original fork-parent task")
