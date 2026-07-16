@@ -37,13 +37,6 @@ metadata_timeout="${WOS_SHOWCASE_METADATA_TIMEOUT_SECONDS:-120}"
 
 showcase_cmd locally /usr/bin/python3 "$DIR/metadata_bench.py" \
     --operation create \
-    --hosts "$metadata_hosts" \
-    --launcher "$metadata_launcher" \
-    --path "$metadata_prefix" \
-    --total-work-units "$metadata_iterations" \
-    --timeout-seconds "$metadata_timeout" \
-    --log-dir "$metadata_log_dir"
-showcase_cmd locally /usr/bin/python3 "$DIR/metadata_bench.py" \
     --operation rename \
     --hosts "$metadata_hosts" \
     --launcher "$metadata_launcher" \

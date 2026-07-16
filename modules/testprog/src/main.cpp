@@ -601,7 +601,8 @@ auto main(int argc, char** argv, char** envp) -> int {
     }
 
     if (command != nullptr && (std::strcmp(command, "vfsbench-read") == 0 || std::strcmp(command, "vfsbench-stat") == 0 ||
-                               std::strcmp(command, "vfsbench-create") == 0 || std::strcmp(command, "vfsbench-rename") == 0)) {
+                               std::strcmp(command, "vfsbench-create") == 0 || std::strcmp(command, "vfsbench-rename") == 0 ||
+                               std::strcmp(command, "vfsbench-metadata-worker") == 0)) {
         return run_fsbench(argc - 1, argv + 1);
     }
 

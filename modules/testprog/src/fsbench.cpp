@@ -8,6 +8,7 @@
 #include <time.h>  // NOLINT(modernize-deprecated-headers): WOS POSIX clock declarations live here.
 #include <unistd.h>
 
+#include <array>
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
@@ -36,6 +37,12 @@ struct StatOptions {
 struct MetadataOptions {
     const char* path = nullptr;
     uint32_t iterations = 1000;
+};
+
+struct MetadataWorkerOptions {
+    const char* create_path = nullptr;
+    const char* rename_path = nullptr;
+    uint32_t iterations = 0;
 };
 
 auto monotonic_ns() -> uint64_t {
@@ -77,6 +84,7 @@ void print_usage() {
     std::println("  testprog vfsbench-stat --path <path> [--iterations N]");
     std::println("  testprog vfsbench-create --path <prefix> [--iterations N]");
     std::println("  testprog vfsbench-rename --path <prefix> [--iterations N]");
+    std::println("  testprog vfsbench-metadata-worker --create-path <prefix> --rename-path <prefix> --iterations N");
 }
 
 auto parse_metadata_options(int argc, char** argv, MetadataOptions* options) -> bool {
@@ -95,6 +103,26 @@ auto parse_metadata_options(int argc, char** argv, MetadataOptions* options) -> 
         }
     }
     return options->path != nullptr;
+}
+
+auto parse_metadata_worker_options(int argc, char** argv, MetadataWorkerOptions* options) -> bool {
+    if (options == nullptr) {
+        return false;
+    }
+    for (int i = 0; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--create-path") == 0 && i + 1 < argc) {
+            options->create_path = argv[++i];
+        } else if (std::strcmp(argv[i], "--rename-path") == 0 && i + 1 < argc) {
+            options->rename_path = argv[++i];
+        } else if (std::strcmp(argv[i], "--iterations") == 0 && i + 1 < argc) {
+            if (!parse_u32(argv[++i], &options->iterations) || options->iterations == 0) {
+                return false;
+            }
+        } else {
+            return false;
+        }
+    }
+    return options->create_path != nullptr && options->rename_path != nullptr && options->iterations != 0;
 }
 
 auto iteration_paths(const char* prefix, const char* suffix, uint32_t iterations) -> std::vector<std::string> {
@@ -244,13 +272,7 @@ auto run_stat(int argc, char** argv) -> int {
     return 0;
 }
 
-auto run_create(int argc, char** argv) -> int {
-    MetadataOptions options;
-    if (!parse_metadata_options(argc, argv, &options)) {
-        print_usage();
-        return 1;
-    }
-
+auto run_create(const MetadataOptions& options) -> int {
     auto paths = iteration_paths(options.path, ".create.", options.iterations);
     if (!cleanup_paths(paths)) {
         std::println("vfsbench-create: failed to remove stale files for '{}'", options.path);
@@ -286,13 +308,16 @@ auto run_create(int argc, char** argv) -> int {
     return 0;
 }
 
-auto run_rename(int argc, char** argv) -> int {
+auto run_create(int argc, char** argv) -> int {
     MetadataOptions options;
     if (!parse_metadata_options(argc, argv, &options)) {
         print_usage();
         return 1;
     }
+    return run_create(options);
+}
 
+auto run_rename(const MetadataOptions& options) -> int {
     auto source_paths = iteration_paths(options.path, ".rename-source.", options.iterations);
     auto destination_paths = iteration_paths(options.path, ".rename-destination.", options.iterations);
     bool const SOURCES_CLEAN = cleanup_paths(source_paths);
@@ -341,6 +366,76 @@ auto run_rename(int argc, char** argv) -> int {
     return 0;
 }
 
+auto run_rename(int argc, char** argv) -> int {
+    MetadataOptions options;
+    if (!parse_metadata_options(argc, argv, &options)) {
+        print_usage();
+        return 1;
+    }
+    return run_rename(options);
+}
+
+auto run_metadata_worker_operation(const char* operation, const char* path, uint32_t iterations) -> int {
+    MetadataOptions const OPTIONS{.path = path, .iterations = iterations};
+    int result = 1;
+    if (std::strcmp(operation, "create") == 0) {
+        result = run_create(OPTIONS);
+    } else if (std::strcmp(operation, "rename") == 0) {
+        result = run_rename(OPTIONS);
+    }
+    if (result != 0) {
+        return result;
+    }
+    std::println("metadata-worker-done-v1 {}", operation);
+    if (std::fflush(stdout) != 0) {
+        std::println(stderr, "vfsbench-metadata-worker: failed to flush {} completion", operation);
+        return 1;
+    }
+    return 0;
+}
+
+auto run_metadata_worker(int argc, char** argv) -> int {
+    MetadataWorkerOptions options;
+    if (!parse_metadata_worker_options(argc, argv, &options)) {
+        print_usage();
+        return 1;
+    }
+
+    std::println("metadata-worker-ready-v1");
+    if (std::fflush(stdout) != 0) {
+        std::println(stderr, "vfsbench-metadata-worker: failed to flush readiness");
+        return 1;
+    }
+
+    std::array<char, 32> command{};
+    while (std::fgets(command.data(), static_cast<int>(command.size()), stdin) != nullptr) {
+        size_t length = std::strlen(command.data());
+        while (length > 0 && (command.at(length - 1) == '\n' || command.at(length - 1) == '\r')) {
+            command.at(--length) = '\0';
+        }
+
+        const char* path = nullptr;
+        if (std::strcmp(command.data(), "create") == 0) {
+            path = options.create_path;
+        } else if (std::strcmp(command.data(), "rename") == 0) {
+            path = options.rename_path;
+        } else {
+            std::println(stderr, "vfsbench-metadata-worker: invalid operation '{}'", command.data());
+            return 1;
+        }
+        int const RESULT = run_metadata_worker_operation(command.data(), path, options.iterations);
+        if (RESULT != 0) {
+            return RESULT;
+        }
+        command.fill('\0');
+    }
+    if (std::ferror(stdin) != 0) {
+        std::println(stderr, "vfsbench-metadata-worker: failed to read control input");
+        return 1;
+    }
+    return 0;
+}
+
 }  // namespace
 
 int run_fsbench(int argc, char** argv) {
@@ -360,6 +455,9 @@ int run_fsbench(int argc, char** argv) {
     }
     if (std::strcmp(argv[0], "vfsbench-rename") == 0) {
         return run_rename(argc - 1, argv + 1);
+    }
+    if (std::strcmp(argv[0], "vfsbench-metadata-worker") == 0) {
+        return run_metadata_worker(argc - 1, argv + 1);
     }
 
     print_usage();

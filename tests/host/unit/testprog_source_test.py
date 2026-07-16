@@ -744,7 +744,11 @@ def test_vfsbench_metadata_timing_excludes_setup_and_cleanup() -> None:
     main_source = TESTPROG_MAIN_CPP.read_text()
     require_tokens(
         main_source,
-        ['std::strcmp(command, "vfsbench-create") == 0', 'std::strcmp(command, "vfsbench-rename") == 0'],
+        [
+            'std::strcmp(command, "vfsbench-create") == 0',
+            'std::strcmp(command, "vfsbench-rename") == 0',
+            'std::strcmp(command, "vfsbench-metadata-worker") == 0',
+        ],
         "testprog metadata benchmark dispatch",
     )
     require_tokens(
@@ -758,6 +762,8 @@ def test_vfsbench_metadata_timing_excludes_setup_and_cleanup() -> None:
             "paths_are_absent(source_paths)",
             "bool const SOURCES_CLEAN = cleanup_paths(source_paths)",
             "bool const DESTINATIONS_CLEAN = cleanup_paths(destination_paths)",
+            "metadata-worker-ready-v1",
+            "metadata-worker-done-v1 {}",
         ],
         "VFS metadata benchmark",
     )
@@ -787,6 +793,40 @@ def test_vfsbench_metadata_timing_excludes_setup_and_cleanup() -> None:
     if "open(" in rename_timed or "unlink(" in rename_timed or "stat(" in rename_timed:
         fail("VFS rename timing must exclude fixture setup, verification, and cleanup syscalls")
 
+    worker_body = function_body(source, "run_metadata_worker")
+    require_tokens(
+        worker_body,
+        [
+            "parse_metadata_worker_options(argc, argv, &options)",
+            'std::println("metadata-worker-ready-v1")',
+            "std::fflush(stdout)",
+            "std::fgets(command.data(), static_cast<int>(command.size()), stdin)",
+            'std::strcmp(command.data(), "create") == 0',
+            'std::strcmp(command.data(), "rename") == 0',
+            "run_metadata_worker_operation(command.data(), path, options.iterations)",
+            "std::ferror(stdin)",
+        ],
+        "persistent VFS metadata worker",
+    )
+    require_order(
+        worker_body,
+        'std::println("metadata-worker-ready-v1")',
+        "std::fgets(command.data()",
+        "persistent metadata worker readiness precedes phase input",
+    )
+    operation_body = function_body(source, "run_metadata_worker_operation")
+    require_tokens(
+        operation_body,
+        [
+            "MetadataOptions const OPTIONS{.path = path, .iterations = iterations}",
+            "run_create(OPTIONS)",
+            "run_rename(OPTIONS)",
+            'std::println("metadata-worker-done-v1 {}", operation)',
+            "std::fflush(stdout)",
+        ],
+        "persistent metadata worker exact operation reuse",
+    )
+
     showcase = WOS_SHOWCASE_BENCH.read_text()
     require_tokens(
         showcase,
@@ -803,6 +843,10 @@ def test_vfsbench_metadata_timing_excludes_setup_and_cleanup() -> None:
         ],
         "WKI metadata showcase",
     )
+    if showcase.count(
+        'showcase_cmd locally /usr/bin/python3 "$DIR/metadata_bench.py"'
+    ) != 1:
+        fail("WKI metadata showcase must share one ready worker pool across phases")
     require_tokens(
         WOS_SHOWCASE_COMMON.read_text(),
         ["quick:metadata_iterations", "full:metadata_iterations", "stress:metadata_iterations"],
@@ -820,14 +864,62 @@ def test_vfsbench_metadata_timing_excludes_setup_and_cleanup() -> None:
             '"+/tmp",',
             'LOCAL_RUNTIME_PATHS = ("/usr", "/bin", "/lib", "/lib64", "/libexec", "/share")',
             '*(f"-{path}" for path in LOCAL_RUNTIME_PATHS)',
+            'READY_RECORD = "metadata-worker-ready-v1"',
+            'DONE_RECORD_PREFIX = "metadata-worker-done-v1"',
+            "exec /usr/bin/testprog vfsbench-metadata-worker",
+            '--create-path "$1" --rename-path "$2" --iterations "$3"',
+            "stdin=subprocess.PIPE",
+            "wait_for_ready_workers(",
+            "for operation in config.operations:",
+            "elapsed_by_operation[operation] = run_phase(",
+            'print(json.dumps(payload, separators=(",", ":"), sort_keys=True))',
             '"spawner_host": worker_evidence.spawner_host',
             '"remote_pid": worker_evidence.remote_pid',
             '"placement": "local-baseline" if len(jobs) == 1 else "strict-on"',
             '"wki_route": "host-path"',
             '"total_work_units": config.total_work_units',
+            "GRACEFUL_SHUTDOWN_FRACTION = 0.1",
+            "GRACEFUL_SHUTDOWN_MAX_SECONDS = 10.0",
+            "def graceful_shutdown_seconds(timeout_seconds: float)",
+            "shutdown_seconds = graceful_shutdown_seconds(timeout_seconds)",
+            "stop_worker_pool(runtimes, config.timeout_seconds, signal_guard)",
+            "assert_worker_shell_execs_worker(Path(directory))",
+            "shutdown_sleep_seconds=1.2",
         ],
         "fixed-total WKI metadata coordinator",
     )
+    execute_body = metadata_helper[
+        metadata_helper.index("def execute_benchmarks(") : metadata_helper.index(
+            "def emit_worker_diagnostics("
+        )
+    ]
+    require_order(
+        execute_body,
+        "wait_for_ready_workers(",
+        "for operation in config.operations:",
+        "metadata workers ready before either timed phase",
+    )
+    phase_body = metadata_helper[
+        metadata_helper.index("def run_phase(") : metadata_helper.index(
+            "def stop_worker_pool("
+        )
+    ]
+    require_order(
+        phase_body,
+        "started_ns = time.monotonic_ns()",
+        "runtime.process.stdin.write(trigger)",
+        "metadata phase timer covers every trigger",
+    )
+    require_order(
+        phase_body,
+        "completed.add(runtime.job.index)",
+        "elapsed_ns = time.monotonic_ns() - started_ns",
+        "metadata phase timer ends after every worker completion",
+    )
+    if "worker_evidence.elapsed_seconds" in metadata_helper:
+        fail("metadata coordinator must report its phase timer, not maximum inner time")
+    if "worker_child" in metadata_helper or "/usr/bin/testprog \"$benchmark\"" in metadata_helper:
+        fail("metadata ready shell must exec one persistent testprog worker")
     result = subprocess.run(
         [sys.executable, str(WOS_METADATA_BENCH), "--self-test"],
         cwd=ROOT,
