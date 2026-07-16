@@ -1085,6 +1085,150 @@ def test_mandelbench_coalesces_remote_workers_and_keeps_local_compute_local() ->
         fail("mandelbench local compute must not join one local chunk before starting the next")
 
 
+def test_mandelbench_worker_payload_rle_is_bounded_and_exact() -> None:
+    source = MANDELBENCH_WKI_CPP.read_text()
+    require_tokens(
+        source,
+        [
+            "constexpr uint16_t WORKER_OUTPUT_VERSION = 2;",
+            "constexpr uint16_t WORKER_OUTPUT_FLAG_PAYLOAD_RLE = 1U << 0U;",
+            "constexpr size_t WORKER_OUTPUT_RGBA_BYTES = 4;",
+            "sizeof(uint16_t) + WORKER_OUTPUT_RGBA_BYTES",
+        ],
+        "mandelbench RLE protocol",
+    )
+
+    rle_config_body = function_body(source, "mandelbench_rle_enabled")
+    require_tokens(
+        rle_config_body,
+        [
+            'std::getenv("MANDELBENCH_RLE")',
+            "return value == nullptr || value[0] == '\\0' || value[0] != '0';",
+        ],
+        "mandelbench default-on RLE configuration",
+    )
+
+    worst_case_body = function_body(source, "worker_rgba_rle_worst_case_size")
+    require_tokens(
+        worst_case_body,
+        [
+            "(raw_size % WORKER_OUTPUT_RGBA_BYTES) != 0",
+            "PIXEL_COUNT > std::numeric_limits<size_t>::max() / WORKER_OUTPUT_RLE_RECORD_SIZE",
+            "encoded_size = PIXEL_COUNT * WORKER_OUTPUT_RLE_RECORD_SIZE;",
+        ],
+        "mandelbench RLE worst-case allocation bound",
+    )
+
+    encode_body = function_body(source, "encode_worker_rgba_rle")
+    require_tokens(
+        encode_body,
+        [
+            "encoded.clear();",
+            "run_length < std::numeric_limits<uint16_t>::max()",
+            "static_cast<size_t>(run_length) < PIXEL_COUNT - pixel_index",
+            "WORKER_OUTPUT_RGBA_BYTES) == 0",
+            "RECORD_OFFSET > std::numeric_limits<size_t>::max() - WORKER_OUTPUT_RLE_RECORD_SIZE",
+            "std::memcpy(encoded.data() + RECORD_OFFSET, &run_length, sizeof(run_length));",
+            "std::memcpy(encoded.data() + RECORD_OFFSET + sizeof(run_length), color, WORKER_OUTPUT_RGBA_BYTES);",
+        ],
+        "mandelbench RLE encoder bounds",
+    )
+
+    header_body = function_body(source, "validate_worker_output_header")
+    require_tokens(
+        header_body,
+        [
+            "FLAGS == WORKER_OUTPUT_FLAG_PAYLOAD",
+            "static_cast<size_t>(PAYLOAD_SIZE) == launch.expected_payload_size",
+            "FLAGS == WORKER_OUTPUT_FLAG_PAYLOAD_RLE",
+            "PAYLOAD_SIZE != 0",
+            "static_cast<size_t>(PAYLOAD_SIZE) % WORKER_OUTPUT_RLE_RECORD_SIZE",
+            "static_cast<size_t>(PAYLOAD_SIZE) < launch.expected_payload_size",
+            "static_cast<size_t>(PAYLOAD_SIZE) <= launch.read_buffer.size()",
+            "(!RAW_PAYLOAD && !RLE_PAYLOAD)",
+            "launch.payload_flags = FLAGS;",
+            "launch.read_target = static_cast<size_t>(PAYLOAD_SIZE);",
+        ],
+        "mandelbench RLE header validation",
+    )
+
+    fill_body = function_body(source, "fill_rgba_pixels")
+    require_tokens(
+        fill_body,
+        [
+            "size_t filled_pixels = 1;",
+            "std::min(filled_pixels, pixel_count - filled_pixels)",
+            "filled_pixels += COPY_PIXELS;",
+        ],
+        "mandelbench bounded RGBA run fill",
+    )
+
+    decode_body = function_body(source, "decode_worker_rgba_rle")
+    require_tokens(
+        decode_body,
+        [
+            "launch.payload_flags != WORKER_OUTPUT_FLAG_PAYLOAD_RLE",
+            "launch.read_offset != launch.read_target",
+            "launch.read_target > launch.read_buffer.size()",
+            "(launch.expected_payload_size % WORKER_OUTPUT_RGBA_BYTES) != 0",
+            "if (RUN_PIXELS == 0)",
+            "RUN_PIXELS > EXPECTED_PIXELS - decoded_pixels",
+            "while (remaining_run_pixels > 0)",
+            "chunk_index >= launch.chunks.size()",
+            "COPY_PIXELS = std::min(remaining_run_pixels, AVAILABLE_PIXELS)",
+            "fill_rgba_pixels(image + IMAGE_OFFSET, COPY_PIXELS, COLOR);",
+            "decoded_pixels != EXPECTED_PIXELS",
+            "chunk_index != launch.chunks.size()",
+        ],
+        "mandelbench exact RLE decoder",
+    )
+
+    scatter_body = function_body(source, "scatter_worker_outputs")
+    require_tokens(
+        scatter_body,
+        [
+            "launch.payload_flags == WORKER_OUTPUT_FLAG_PAYLOAD_RLE",
+            "decode_worker_rgba_rle(launch, image, row_size)",
+            "launch.payload_flags != WORKER_OUTPUT_FLAG_PAYLOAD",
+            "launch.read_target != launch.expected_payload_size",
+            "BYTES > launch.read_target - payload_offset",
+            "payload_offset != launch.expected_payload_size",
+        ],
+        "mandelbench raw and RLE scatter dispatch",
+    )
+
+    worker_body = function_body(source, "mandelbench_worker")
+    require_tokens(
+        worker_body,
+        [
+            "bool const RLE_ENABLED = output_fd >= 0 && mandelbench_rle_enabled();",
+            "worker_rgba_rle_worst_case_size(image.size(), rle_worst_case_size)",
+            "rle_payload.reserve(rle_worst_case_size);",
+            "std::span<const unsigned char> payload(image.data(), image.size());",
+            "encode_worker_rgba_rle(image, rle_payload)",
+            "if (rle_payload.size() < image.size())",
+            "payload_flags = WORKER_OUTPUT_FLAG_PAYLOAD_RLE;",
+            "make_worker_output_header(id, payload.size(), payload_flags, header)",
+            "write_all(FD, payload, &write_fail_ret, &write_fail_errno)",
+            "raw_bytes={} wire_bytes={}",
+            "encode_ms={:.3f}",
+        ],
+        "mandelbench stream-only RLE worker",
+    )
+    require_order(worker_body, "rle_payload.reserve", "for (int repeat_offset", "mandelbench RLE reserve before timed repeats")
+    require_order(worker_body, "COMPUTE_END_US = now_us();", "ENCODE_START_US = now_us();", "mandelbench compute before RLE encode")
+    require_order(worker_body, "ENCODE_END_US = now_us();", "make_worker_output_header", "mandelbench encode before output header")
+    require_order(worker_body, "make_worker_output_header", "write_all(FD, payload", "mandelbench header before selected payload")
+
+    coordinator_body = function_body(source, "mandelbench_wki")
+    require_order(
+        coordinator_body,
+        "scatter_worker_outputs(remote_launches, image.data(), ROW_SIZE)",
+        "AFTER_MERGE_US = now_us();",
+        "mandelbench RLE decode remains in timed interval",
+    )
+
+
 def test_mandelbench_overlaps_local_compute_with_remote_payload_drain() -> None:
     source = MANDELBENCH_WKI_CPP.read_text()
     execute_body = function_body(source, "execute_local_compute_task")
@@ -1191,6 +1335,7 @@ def main() -> None:
     test_mandelbench_worker_waits_use_monotonic_elapsed_time()
     test_mandelbench_auto_nodes_request_remote_wki_placement()
     test_mandelbench_coalesces_remote_workers_and_keeps_local_compute_local()
+    test_mandelbench_worker_payload_rle_is_bounded_and_exact()
     test_mandelbench_overlaps_local_compute_with_remote_payload_drain()
     print("testprog ping, netbench, suite, perfbench, cowbench, and mandelbench waits are deadline bounded")
 

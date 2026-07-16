@@ -52,9 +52,12 @@ constexpr int WORKER_EVENT_POLL_TIMEOUT_MS = 10;
 constexpr int WORKER_OUTPUT_FD = 3;
 constexpr int WORKER_RELEASE_FD = 4;
 constexpr uint32_t WORKER_OUTPUT_MAGIC = 0x31424D57;  // WMB1
-constexpr uint16_t WORKER_OUTPUT_VERSION = 1;
+constexpr uint16_t WORKER_OUTPUT_VERSION = 2;
 constexpr uint16_t WORKER_OUTPUT_FLAG_PAYLOAD = 0;
+constexpr uint16_t WORKER_OUTPUT_FLAG_PAYLOAD_RLE = 1U << 0U;
 constexpr size_t WORKER_OUTPUT_HEADER_SIZE = 16;
+constexpr size_t WORKER_OUTPUT_RGBA_BYTES = 4;
+constexpr size_t WORKER_OUTPUT_RLE_RECORD_SIZE = sizeof(uint16_t) + WORKER_OUTPUT_RGBA_BYTES;
 constexpr unsigned char WORKER_CONTROL_START = 1;
 constexpr unsigned char WORKER_CONTROL_RELEASE_PAYLOAD = 2;
 constexpr int MANDELBENCH_ROW_BAND_ROWS = 8;
@@ -110,6 +113,11 @@ auto mandelbench_save_images_enabled() -> bool {
 auto mandelbench_payload_release_enabled() -> bool {
     const char* value = std::getenv("MANDELBENCH_PAYLOAD_RELEASE");
     return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
+
+auto mandelbench_rle_enabled() -> bool {
+    const char* value = std::getenv("MANDELBENCH_RLE");
+    return value == nullptr || value[0] == '\0' || value[0] != '0';
 }
 
 auto normalize_node_name(std::string_view node) -> std::string_view {
@@ -269,8 +277,52 @@ auto make_worker_header(int worker_id, size_t payload_size, uint16_t flags, std:
     return true;
 }
 
-auto make_worker_output_header(int worker_id, size_t payload_size, std::array<unsigned char, WORKER_OUTPUT_HEADER_SIZE>& out) -> bool {
-    return make_worker_header(worker_id, payload_size, WORKER_OUTPUT_FLAG_PAYLOAD, out);
+auto make_worker_output_header(int worker_id, size_t payload_size, uint16_t flags,
+                               std::array<unsigned char, WORKER_OUTPUT_HEADER_SIZE>& out) -> bool {
+    return make_worker_header(worker_id, payload_size, flags, out);
+}
+
+auto worker_rgba_rle_worst_case_size(size_t raw_size, size_t& encoded_size) -> bool {
+    if ((raw_size % WORKER_OUTPUT_RGBA_BYTES) != 0) {
+        return false;
+    }
+    size_t const PIXEL_COUNT = raw_size / WORKER_OUTPUT_RGBA_BYTES;
+    if (PIXEL_COUNT > std::numeric_limits<size_t>::max() / WORKER_OUTPUT_RLE_RECORD_SIZE) {
+        return false;
+    }
+    encoded_size = PIXEL_COUNT * WORKER_OUTPUT_RLE_RECORD_SIZE;
+    return true;
+}
+
+auto encode_worker_rgba_rle(std::span<const unsigned char> raw, std::vector<unsigned char>& encoded) -> bool {
+    encoded.clear();
+    if ((raw.size() % WORKER_OUTPUT_RGBA_BYTES) != 0) {
+        return false;
+    }
+
+    size_t const PIXEL_COUNT = raw.size() / WORKER_OUTPUT_RGBA_BYTES;
+    size_t pixel_index = 0;
+    while (pixel_index < PIXEL_COUNT) {
+        auto const* color = raw.data() + (pixel_index * WORKER_OUTPUT_RGBA_BYTES);
+        uint16_t run_length = 1;
+        while (run_length < std::numeric_limits<uint16_t>::max() &&
+               static_cast<size_t>(run_length) < PIXEL_COUNT - pixel_index &&
+               std::memcmp(color, raw.data() + ((pixel_index + static_cast<size_t>(run_length)) * WORKER_OUTPUT_RGBA_BYTES),
+                           WORKER_OUTPUT_RGBA_BYTES) == 0) {
+            ++run_length;
+        }
+
+        size_t const RECORD_OFFSET = encoded.size();
+        if (RECORD_OFFSET > std::numeric_limits<size_t>::max() - WORKER_OUTPUT_RLE_RECORD_SIZE) {
+            encoded.clear();
+            return false;
+        }
+        encoded.resize(RECORD_OFFSET + WORKER_OUTPUT_RLE_RECORD_SIZE);
+        std::memcpy(encoded.data() + RECORD_OFFSET, &run_length, sizeof(run_length));
+        std::memcpy(encoded.data() + RECORD_OFFSET + sizeof(run_length), color, WORKER_OUTPUT_RGBA_BYTES);
+        pixel_index += run_length;
+    }
+    return true;
 }
 
 auto get_testprog_path() -> const char* { return "/usr/bin/testprog"; }
@@ -434,6 +486,8 @@ struct WorkerLaunch {
     uint64_t read_last_progress_us;
     uint64_t read_last_status_us;
     unsigned char* read_dest;
+    uint16_t payload_flags;
+    size_t expected_payload_size;
     size_t read_target;
     size_t read_offset;
     std::vector<unsigned char> read_buffer;
@@ -565,6 +619,8 @@ auto make_worker_launch(int output_slot, std::string target_node, int thread_cou
         .read_last_progress_us = 0,
         .read_last_status_us = 0,
         .read_dest = nullptr,
+        .payload_flags = WORKER_OUTPUT_FLAG_PAYLOAD,
+        .expected_payload_size = 0,
         .read_target = 0,
         .read_offset = 0,
         .read_buffer = {},
@@ -732,14 +788,23 @@ auto validate_worker_output_header(WorkerLaunch& launch, uint16_t expected_flags
     uint32_t const WORKER_ID = load_u32(HEADER, 8);
     uint32_t const PAYLOAD_SIZE = load_u32(HEADER, 12);
     auto const EXPECTED_WORKER_ID = static_cast<uint32_t>(launch.output_slot);
-    if (MAGIC != WORKER_OUTPUT_MAGIC || VERSION != WORKER_OUTPUT_VERSION || FLAGS != expected_flags || WORKER_ID != EXPECTED_WORKER_ID ||
-        static_cast<size_t>(PAYLOAD_SIZE) != launch.read_target) {
+    bool const RAW_PAYLOAD = FLAGS == expected_flags && FLAGS == WORKER_OUTPUT_FLAG_PAYLOAD &&
+                             static_cast<size_t>(PAYLOAD_SIZE) == launch.expected_payload_size;
+    bool const RLE_PAYLOAD =
+        expected_flags == WORKER_OUTPUT_FLAG_PAYLOAD && FLAGS == WORKER_OUTPUT_FLAG_PAYLOAD_RLE && PAYLOAD_SIZE != 0 &&
+        (static_cast<size_t>(PAYLOAD_SIZE) % WORKER_OUTPUT_RLE_RECORD_SIZE) == 0 &&
+        static_cast<size_t>(PAYLOAD_SIZE) < launch.expected_payload_size;
+    bool const PAYLOAD_FITS = static_cast<size_t>(PAYLOAD_SIZE) <= launch.read_buffer.size();
+    if (MAGIC != WORKER_OUTPUT_MAGIC || VERSION != WORKER_OUTPUT_VERSION || WORKER_ID != EXPECTED_WORKER_ID ||
+        (!RAW_PAYLOAD && !RLE_PAYLOAD) || !PAYLOAD_FITS) {
         std::println(stderr,
                      "mandelbench: bad output header for worker {} magic=0x{:08x} version={} flags={} expected_flags={} id={} "
                      "payload={} expected_payload={}",
-                     launch.output_slot, MAGIC, VERSION, FLAGS, expected_flags, WORKER_ID, PAYLOAD_SIZE, launch.read_target);
+                     launch.output_slot, MAGIC, VERSION, FLAGS, expected_flags, WORKER_ID, PAYLOAD_SIZE, launch.expected_payload_size);
         return false;
     }
+    launch.payload_flags = FLAGS;
+    launch.read_target = static_cast<size_t>(PAYLOAD_SIZE);
     return true;
 }
 
@@ -962,6 +1027,8 @@ auto set_child_target(const std::string& target_node, int worker_id) -> bool {
 
 void reset_worker_transfer(WorkerLaunch& launch, unsigned char* read_dest, size_t read_target) {
     launch.read_dest = read_dest;
+    launch.payload_flags = WORKER_OUTPUT_FLAG_PAYLOAD;
+    launch.expected_payload_size = read_target;
     launch.read_target = read_target;
     launch.read_offset = 0;
     launch.header_ok = false;
@@ -987,6 +1054,98 @@ void configure_worker_read_targets(std::span<WorkerLaunch> launches, unsigned ch
     }
 }
 
+void fill_rgba_pixels(unsigned char* destination, size_t pixel_count, const unsigned char* color) {
+    if (pixel_count == 0) {
+        return;
+    }
+
+    std::memcpy(destination, color, WORKER_OUTPUT_RGBA_BYTES);
+    size_t filled_pixels = 1;
+    while (filled_pixels < pixel_count) {
+        size_t const COPY_PIXELS = std::min(filled_pixels, pixel_count - filled_pixels);
+        std::memcpy(destination + (filled_pixels * WORKER_OUTPUT_RGBA_BYTES), destination,
+                    COPY_PIXELS * WORKER_OUTPUT_RGBA_BYTES);
+        filled_pixels += COPY_PIXELS;
+    }
+}
+
+auto decode_worker_rgba_rle(const WorkerLaunch& launch, unsigned char* image, size_t row_size) -> bool {
+    if (launch.payload_flags != WORKER_OUTPUT_FLAG_PAYLOAD_RLE || !launch.read_ok || launch.read_offset != launch.read_target ||
+        launch.read_target == 0 || (launch.read_target % WORKER_OUTPUT_RLE_RECORD_SIZE) != 0 ||
+        launch.read_target > launch.read_buffer.size() ||
+        (launch.expected_payload_size % WORKER_OUTPUT_RGBA_BYTES) != 0) {
+        std::println(stderr,
+                     "mandelbench: remote worker {} has invalid RLE payload flags={} read={}/{} raw={} buffer={}",
+                     launch.output_slot, launch.payload_flags, launch.read_offset, launch.read_target,
+                     launch.expected_payload_size, launch.read_buffer.size());
+        return false;
+    }
+
+    size_t const EXPECTED_PIXELS = launch.expected_payload_size / WORKER_OUTPUT_RGBA_BYTES;
+    size_t decoded_pixels = 0;
+    size_t chunk_index = 0;
+    size_t chunk_offset = 0;
+    std::span<const unsigned char> const PAYLOAD(launch.read_buffer.data(), launch.read_target);
+    for (size_t record_offset = 0; record_offset < PAYLOAD.size(); record_offset += WORKER_OUTPUT_RLE_RECORD_SIZE) {
+        size_t const RUN_PIXELS = load_u16(PAYLOAD, record_offset);
+        if (RUN_PIXELS == 0) {
+            std::println(stderr, "mandelbench: remote worker {} RLE payload contains a zero-length run at byte {}",
+                         launch.output_slot, record_offset);
+            return false;
+        }
+        if (decoded_pixels > EXPECTED_PIXELS || RUN_PIXELS > EXPECTED_PIXELS - decoded_pixels) {
+            std::println(stderr,
+                         "mandelbench: remote worker {} RLE payload overfills output decoded_pixels={} run_pixels={} expected_pixels={}",
+                         launch.output_slot, decoded_pixels, RUN_PIXELS, EXPECTED_PIXELS);
+            return false;
+        }
+
+        const unsigned char* const COLOR = PAYLOAD.data() + record_offset + sizeof(uint16_t);
+        size_t remaining_run_pixels = RUN_PIXELS;
+        while (remaining_run_pixels > 0) {
+            if (chunk_index >= launch.chunks.size()) {
+                std::println(stderr, "mandelbench: remote worker {} RLE run exceeds its chunk map", launch.output_slot);
+                return false;
+            }
+
+            const auto& chunk = launch.chunks.at(chunk_index);
+            size_t const CHUNK_BYTES = worker_chunk_bytes(chunk, row_size);
+            if (CHUNK_BYTES == 0 || (CHUNK_BYTES % WORKER_OUTPUT_RGBA_BYTES) != 0 || chunk_offset > CHUNK_BYTES) {
+                std::println(stderr, "mandelbench: remote worker {} has invalid RLE chunk {} bytes={} offset={}",
+                             launch.output_slot, chunk.worker_id, CHUNK_BYTES, chunk_offset);
+                return false;
+            }
+            if (chunk_offset == CHUNK_BYTES) {
+                ++chunk_index;
+                chunk_offset = 0;
+                continue;
+            }
+
+            size_t const AVAILABLE_PIXELS = (CHUNK_BYTES - chunk_offset) / WORKER_OUTPUT_RGBA_BYTES;
+            size_t const COPY_PIXELS = std::min(remaining_run_pixels, AVAILABLE_PIXELS);
+            size_t const IMAGE_OFFSET = (static_cast<size_t>(chunk.start_row) * row_size) + chunk_offset;
+            fill_rgba_pixels(image + IMAGE_OFFSET, COPY_PIXELS, COLOR);
+            size_t const COPY_BYTES = COPY_PIXELS * WORKER_OUTPUT_RGBA_BYTES;
+            chunk_offset += COPY_BYTES;
+            decoded_pixels += COPY_PIXELS;
+            remaining_run_pixels -= COPY_PIXELS;
+            if (chunk_offset == CHUNK_BYTES) {
+                ++chunk_index;
+                chunk_offset = 0;
+            }
+        }
+    }
+
+    if (decoded_pixels != EXPECTED_PIXELS || chunk_index != launch.chunks.size() || chunk_offset != 0) {
+        std::println(stderr,
+                     "mandelbench: remote worker {} RLE payload underfills output decoded_pixels={} expected_pixels={} chunks={}/{} "
+                     "chunk_offset={}",
+                     launch.output_slot, decoded_pixels, EXPECTED_PIXELS, chunk_index, launch.chunks.size(), chunk_offset);
+        return false;
+    }
+    return true;
+}
+
 auto scatter_worker_outputs(std::span<const WorkerLaunch> launches, unsigned char* image, size_t row_size) -> bool {
     for (const auto& launch : launches) {
         if (!launch.read_ok || launch.read_offset != launch.read_target) {
@@ -995,21 +1154,36 @@ auto scatter_worker_outputs(std::span<const WorkerLaunch> launches, unsigned cha
             return false;
         }
 
+        if (launch.payload_flags == WORKER_OUTPUT_FLAG_PAYLOAD_RLE) {
+            if (!decode_worker_rgba_rle(launch, image, row_size)) {
+                return false;
+            }
+            continue;
+        }
+        if (launch.payload_flags != WORKER_OUTPUT_FLAG_PAYLOAD || launch.read_target != launch.expected_payload_size ||
+            launch.read_target > launch.read_buffer.size()) {
+            std::println(stderr,
+                         "mandelbench: remote worker {} has invalid raw payload flags={} bytes={} expected={} buffer={}",
+                         launch.output_slot, launch.payload_flags, launch.read_target, launch.expected_payload_size,
+                         launch.read_buffer.size());
+            return false;
+        }
+
         size_t payload_offset = 0;
         for (const auto& chunk : launch.chunks) {
             size_t const BYTES = worker_chunk_bytes(chunk, row_size);
             size_t const IMAGE_OFFSET = static_cast<size_t>(chunk.start_row) * row_size;
-            if (payload_offset + BYTES > launch.read_buffer.size()) {
+            if (payload_offset > launch.read_target || BYTES > launch.read_target - payload_offset) {
                 std::println(stderr, "mandelbench: remote worker {} chunk {} overruns payload offset={} bytes={} payload={}",
-                             launch.output_slot, chunk.worker_id, payload_offset, BYTES, launch.read_buffer.size());
+                             launch.output_slot, chunk.worker_id, payload_offset, BYTES, launch.read_target);
                 return false;
             }
             std::memcpy(image + IMAGE_OFFSET, launch.read_buffer.data() + payload_offset, BYTES);
             payload_offset += BYTES;
         }
-        if (payload_offset != launch.read_buffer.size()) {
+        if (payload_offset != launch.expected_payload_size) {
             std::println(stderr, "mandelbench: remote worker {} payload size mismatch scattered={} payload={}", launch.output_slot,
-                         payload_offset, launch.read_buffer.size());
+                         payload_offset, launch.expected_payload_size);
             return false;
         }
     }
@@ -1035,11 +1209,11 @@ void print_slowest_worker_profiles(std::span<const WorkerLaunch> launches, int r
         uint64_t const READ_END_US = std::max(launch.read_end_us, HEADER_END_US);
         std::println(stderr,
                      "mandelbench-profile-worker repeat={} rank={} worker={} target='{}' pid={} total_ms={:.3f} header_ms={:.3f} "
-                     "payload_ms={:.3f} bytes={} read={}/{} header_ok={} read_ok={} chunks='{}'",
+                     "payload_ms={:.3f} wire_bytes={} raw_bytes={} flags={} read={}/{} header_ok={} read_ok={} chunks='{}'",
                      repeat_index, rank, launch.output_slot, launch.target_node, launch.child_pid,
                      elapsed_ms(repeat_start_us, READ_END_US), elapsed_ms(repeat_start_us, HEADER_END_US),
-                     elapsed_ms(HEADER_END_US, READ_END_US), launch.read_target, launch.read_offset, launch.read_target,
-                     launch.header_ok, launch.read_ok, format_worker_chunks(launch.chunks));
+                     elapsed_ms(HEADER_END_US, READ_END_US), launch.read_target, launch.expected_payload_size, launch.payload_flags,
+                     launch.read_offset, launch.read_target, launch.header_ok, launch.read_ok, format_worker_chunks(launch.chunks));
     }
 }
 
@@ -1974,6 +2148,16 @@ auto mandelbench_worker(int argc, char** argv) -> int {
 
     size_t const ROW_SIZE = static_cast<size_t>(width) * 4;
     std::vector<unsigned char> image(static_cast<size_t>(total_rows) * ROW_SIZE);
+    bool const RLE_ENABLED = output_fd >= 0 && mandelbench_rle_enabled();
+    std::vector<unsigned char> rle_payload;
+    if (RLE_ENABLED) {
+        size_t rle_worst_case_size = 0;
+        if (!worker_rgba_rle_worst_case_size(image.size(), rle_worst_case_size)) {
+            std::println(stderr, "mandelbench-worker[{}]: invalid raw payload size {} for RLE", id, image.size());
+            return 1;
+        }
+        rle_payload.reserve(rle_worst_case_size);
+    }
     struct WorkerThread {
         WorkerThreadArg arg{};
         WorkerBandThreadArg band_arg{};
@@ -2102,6 +2286,23 @@ auto mandelbench_worker(int argc, char** argv) -> int {
         MANDELBENCH_TRACE("mandelbench-worker[{}]: repeat {} compute end rows_done={} expected_rows={} ms={:.3f}", id, CURRENT_REPEAT,
                           rows_done, total_rows, elapsed_ms(COMPUTE_START_US, COMPUTE_END_US));
 
+        uint64_t const ENCODE_START_US = now_us();
+        uint16_t payload_flags = WORKER_OUTPUT_FLAG_PAYLOAD;
+        std::span<const unsigned char> payload(image.data(), image.size());
+        if (RLE_ENABLED) {
+            if (!encode_worker_rgba_rle(image, rle_payload)) {
+                close(OUTPUT_STREAM_FD);
+                close(CONTROL_FD);
+                std::println(stderr, "mandelbench-worker[{}]: failed to encode {} raw payload bytes", id, image.size());
+                return 1;
+            }
+            if (rle_payload.size() < image.size()) {
+                payload = std::span<const unsigned char>(rle_payload.data(), rle_payload.size());
+                payload_flags = WORKER_OUTPUT_FLAG_PAYLOAD_RLE;
+            }
+        }
+        uint64_t const ENCODE_END_US = now_us();
+
         uint64_t const WRITE_START_US = now_us();
         MANDELBENCH_TRACE("mandelbench-worker[{}]: repeat {} open/write begin output_fd={} output='{}'", id, CURRENT_REPEAT,
                           OUTPUT_STREAM_FD, output != nullptr ? output : "");
@@ -2116,10 +2317,11 @@ auto mandelbench_worker(int argc, char** argv) -> int {
 
         if (OUTPUT_STREAM_FD >= 0) {
             std::array<unsigned char, WORKER_OUTPUT_HEADER_SIZE> header{};
-            if (!make_worker_output_header(id, image.size(), header)) {
+            if (!make_worker_output_header(id, payload.size(), payload_flags, header)) {
                 close(FD);
                 close(CONTROL_FD);
-                std::println(stderr, "mandelbench-worker[{}]: failed to build output header bytes={}", id, image.size());
+                std::println(stderr, "mandelbench-worker[{}]: failed to build output header bytes={} flags={}", id, payload.size(),
+                             payload_flags);
                 return 1;
             }
             MANDELBENCH_TRACE("mandelbench-worker[{}]: repeat {} header write begin fd={} bytes={}", id, CURRENT_REPEAT, FD,
@@ -2141,8 +2343,9 @@ auto mandelbench_worker(int argc, char** argv) -> int {
         }
 
         uint64_t const WRITE_BODY_START_US = now_us();
-        MANDELBENCH_TRACE("mandelbench-worker[{}]: repeat {} payload write begin fd={} bytes={}", id, CURRENT_REPEAT, FD, image.size());
-        if (!write_all(FD, image, &write_fail_ret, &write_fail_errno)) {
+        MANDELBENCH_TRACE("mandelbench-worker[{}]: repeat {} payload write begin fd={} bytes={} raw_bytes={} flags={}", id,
+                          CURRENT_REPEAT, FD, payload.size(), image.size(), payload_flags);
+        if (!write_all(FD, payload, &write_fail_ret, &write_fail_errno)) {
             close(FD);
             close(CONTROL_FD);
             std::println(stderr, "mandelbench-worker[{}]: failed while writing output ret={} errno={} ({})", id, write_fail_ret,
@@ -2150,8 +2353,9 @@ auto mandelbench_worker(int argc, char** argv) -> int {
             return 1;
         }
         uint64_t const WRITE_BODY_END_US = now_us();
-        MANDELBENCH_TRACE("mandelbench-worker[{}]: repeat {} payload write end fd={} bytes={} ms={:.3f}", id, CURRENT_REPEAT, FD,
-                          image.size(), elapsed_ms(WRITE_BODY_START_US, WRITE_BODY_END_US));
+        MANDELBENCH_TRACE("mandelbench-worker[{}]: repeat {} payload write end fd={} bytes={} raw_bytes={} flags={} ms={:.3f}", id,
+                          CURRENT_REPEAT, FD, payload.size(), image.size(), payload_flags,
+                          elapsed_ms(WRITE_BODY_START_US, WRITE_BODY_END_US));
 
         if (OUTPUT_STREAM_FD < 0 && close(FD) != 0) {
             std::println(stderr, "mandelbench-worker[{}]: close failed for output", id);
@@ -2163,16 +2367,17 @@ auto mandelbench_worker(int argc, char** argv) -> int {
         if (PROFILE) {
             std::string const LAUNCHER = wki_launcher_node();
             std::string const RUNNER = wki_runner_node();
-            size_t const BYTES = image.size();
             std::string const PROFILE_LINE = std::format(
-                "repeat={} id={} pid={} launcher={} runner={} start_row={} row_count={} rows_done={} bytes={} parse_ms={:.3f} "
-                "alloc_ms={:.3f} start_wait_ms={:.3f} compute_ms={:.3f} open_ms={:.3f} write_body_ms={:.3f} write_ms={:.3f} "
-                "total_ms={:.3f}\n",
-                CURRENT_REPEAT, id, static_cast<int>(ker::process::getpid()), LAUNCHER, RUNNER, start_row, row_count, rows_done, BYTES,
+                "repeat={} id={} pid={} launcher={} runner={} start_row={} row_count={} rows_done={} raw_bytes={} wire_bytes={} "
+                "payload_flags={} parse_ms={:.3f} alloc_ms={:.3f} start_wait_ms={:.3f} compute_ms={:.3f} encode_ms={:.3f} "
+                "open_ms={:.3f} write_body_ms={:.3f} write_ms={:.3f} total_ms={:.3f}\n",
+                CURRENT_REPEAT, id, static_cast<int>(ker::process::getpid()), LAUNCHER, RUNNER, start_row, row_count, rows_done,
+                image.size(), payload.size(), payload_flags,
                 elapsed_ms(ENTRY_US, AFTER_PARSE_US), elapsed_ms(AFTER_PARSE_US, AFTER_ALLOC_US),
                 elapsed_ms(REPEAT_ENTRY_US, AFTER_START_US), elapsed_ms(COMPUTE_START_US, COMPUTE_END_US),
-                elapsed_ms(WRITE_START_US, OPEN_END_US), elapsed_ms(WRITE_BODY_START_US, WRITE_BODY_END_US),
-                elapsed_ms(WRITE_START_US, WRITE_END_US), elapsed_ms(REPEAT_ENTRY_US, WRITE_END_US));
+                elapsed_ms(ENCODE_START_US, ENCODE_END_US), elapsed_ms(WRITE_START_US, OPEN_END_US),
+                elapsed_ms(WRITE_BODY_START_US, WRITE_BODY_END_US), elapsed_ms(WRITE_START_US, WRITE_END_US),
+                elapsed_ms(REPEAT_ENTRY_US, WRITE_END_US));
             if (!write_text_fd(STDERR_FILENO, PROFILE_LINE)) {
                 std::println(stderr, "mandelbench-worker[{}]: failed to write profile line", id);
             }
