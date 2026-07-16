@@ -3,6 +3,7 @@
 import copy
 import hashlib
 import importlib.util
+import json
 import os
 import subprocess
 import sys
@@ -91,24 +92,20 @@ def test_partition_and_commands(module) -> None:
     hosts = ["wos-0.wos", "wos-1.wos", "wos-2.wos"]
     if [count for _, _, count in module.partition_jobs(hosts)] != [11, 11, 10]:
         fail("three-node fixed-resource partition changed")
-    fixture = {
-        "repository_uri": "file:///tmp/work/git-fixture.git",
-        "commit": "1" * 40,
-    }
+    owner = "0123456789abcdef0123456789abcdef"
     command = module.controller_command(
-        "git-clone",
+        "host-workspace",
         hosts[1],
         hosts[0],
         11,
         11,
-        Path("/tmp/work"),
-        fixture,
-        20_000,
+        Path("/tmp/wos-showcase-fixed-0123456789abcdef"),
+        owner,
         30.0,
     )
     expected_prefix = [
         "/usr/bin/forward",
-        "+/tmp/work",
+        "+/tmp/wos-showcase-fixed-0123456789abcdef",
         *module.local_route_operands(),
         "--",
         "/usr/bin/on",
@@ -122,36 +119,19 @@ def test_partition_and_commands(module) -> None:
     timeout_index = command.index("--timeout-seconds")
     if float(command[timeout_index + 1]) != 25.0:
         fail(f"controller timeout does not reserve cleanup grace: {command}")
-
-    file_move_command = module.controller_command(
-        "file-move",
-        hosts[1],
-        hosts[0],
-        11,
-        11,
-        Path("/tmp/work"),
-        {},
-        20_000,
-        30.0,
-        module.FILE_MOVE_BYTES["quick"],
-    )
-    if file_move_command[: len(expected_prefix)] != expected_prefix:
-        fail(f"file-move controller is not strict/HOST-routed: {file_move_command}")
-    if any(f"-{path}" not in file_move_command for path in module.LOCAL_ROUTE_PATHS):
-        fail("file-move controller lacks explicit LOCAL runtime routes")
-    file_bytes_index = file_move_command.index("--file-bytes")
-    if int(file_move_command[file_bytes_index + 1]) != module.FILE_MOVE_BYTES["quick"]:
-        fail("file-move controller did not preserve its scale-fixed byte count")
+    if command[command.index(module.WOS_HELPER) + 1] != "controller":
+        fail(f"HOST controller is not a persistent protocol worker: {command}")
+    if command[command.index("--profile") + 1] != "host-workspace":
+        fail(f"HOST controller lost its immutable route profile: {command}")
 
     python_command = module.controller_command(
-        "python-sha256",
+        "local-runtime",
         hosts[1],
         hosts[0],
         11,
         11,
-        Path("/tmp/work"),
-        fixture,
-        20_000,
+        Path("/tmp/wos-showcase-fixed-0123456789abcdef"),
+        owner,
         30.0,
     )
     if any(operand.startswith("+/tmp/") for operand in python_command):
@@ -167,6 +147,12 @@ def test_partition_and_commands(module) -> None:
         fail(
             f"Python controller installs runtime routes after placement: {python_command}"
         )
+    if python_command[python_command.index("--profile") + 1] != "local-runtime":
+        fail(f"Python controller lost its immutable route profile: {python_command}")
+    fixture = {
+        "repository_uri": "file:///tmp/work/git-fixture.git",
+        "commit": "1" * 40,
+    }
     rotated_hosts = ["wos-2.wos", "wos-0.wos", "wos-1.wos"]
     parsed = module.parse_hosts(",".join(rotated_hosts), "wos-2.wos")
     canonical = sorted(parsed, key=module.normalize_host)
@@ -533,6 +519,124 @@ def test_timed_job_uses_preflight_evidence(module) -> None:
         module.remove_work_root(work_root, owner)
 
 
+def test_persistent_controller_pool_timing_and_cleanup(module) -> None:
+    fake_controller = r"""
+import json
+import sys
+import time
+
+profile, host, launcher, start, count, work_root = sys.argv[1:7]
+time.sleep(0.12)
+print(json.dumps({
+    "status": "ready",
+    "profile": profile,
+    "target_host": host,
+    "job_start": int(start),
+    "job_count": int(count),
+    "launcher_host": launcher,
+    "runner_host": host,
+    "remote_pid": 0,
+    "runtime_route": "local",
+    "runtime_paths": %s,
+    "workspace_route": "host" if profile == "host-workspace" else None,
+    "workspace_path": work_root if profile == "host-workspace" else None,
+}), flush=True)
+for line in sys.stdin:
+    request = json.loads(line)
+    if request["action"] == "shutdown":
+        result = {"stopped": True}
+    else:
+        time.sleep(0.02)
+        result = {"phase": request["phase"], "dispatched": True}
+    print(json.dumps({
+        "status": "ok",
+        "request_id": request["request_id"],
+        "result": result,
+    }), flush=True)
+    if request["action"] == "shutdown":
+        break
+""" % json.dumps(list(module.LOCAL_ROUTE_PATHS))
+    original_command = module.controller_command
+    work_root = Path("/tmp/wos-showcase-fixed-0123456789abcdef")
+    owner = "0123456789abcdef0123456789abcdef"
+
+    def fake_command(
+        profile, host, launcher, start, count, root, _owner, _timeout
+    ):
+        return [
+            sys.executable,
+            "-u",
+            "-c",
+            fake_controller,
+            profile,
+            host,
+            launcher,
+            str(start),
+            str(count),
+            str(root),
+        ]
+
+    module.controller_command = fake_command
+    pool = module.ControllerPool(
+        [("wos-0.wos", 0, module.TOTAL_JOBS)],
+        "wos-0.wos",
+        work_root,
+        owner,
+        2.0,
+    )
+    try:
+        pool.start()
+        elapsed, results = module.run_timed_phase(
+            "python-json", pool, {}, 1, 2.0
+        )
+        if not 0.01 <= elapsed < 0.10:
+            fail(f"timed phase included controller readiness: {elapsed}")
+        if results != [{"phase": "python-json", "dispatched": True}]:
+            fail(f"persistent controller returned the wrong phase result: {results}")
+    finally:
+        stopped = pool.close()
+        module.controller_command = original_command
+    if not stopped or module._ACTIVE_PROCESSES:
+        fail("persistent controllers were not shut down and reaped")
+
+
+def test_git_prewarm_preserves_cold_destinations(module) -> None:
+    original_cwd = Path.cwd()
+    original_identity = module.read_proc_identity
+    work_root, owner = module.create_work_root()
+    module.read_proc_identity = lambda: {
+        "launcher_host": "wos-0.wos",
+        "runner_host": "wos-0.wos",
+        "remote_pid": 0,
+    }
+    try:
+        (work_root / "clones").mkdir()
+        fixture = module.create_git_fixture(work_root, module.WOS_GIT, 120.0)
+        result = module.run_git_prewarm(
+            SimpleNamespace(
+                target_host="wos-0.wos",
+                launcher_host="wos-0.wos",
+                job_start=0,
+                work_root=str(work_root),
+                repository_uri=fixture["repository_uri"],
+                commit=fixture["commit"],
+                timeout_seconds=120.0,
+            )
+        )
+        prewarm_path = work_root / "git-prewarm" / "controller-000"
+        if (
+            result.get("destination_removed") is not True
+            or prewarm_path.exists()
+            or prewarm_path.is_symlink()
+            or any((work_root / "clones").iterdir())
+        ):
+            fail("Git runtime prewarm polluted a timed clone destination")
+    finally:
+        os.chdir(original_cwd)
+        module.read_proc_identity = original_identity
+        module.remove_work_root(work_root, owner)
+
+
 def main() -> None:
     module = load_helper()
     test_partition_and_commands(module)
@@ -541,7 +645,9 @@ def main() -> None:
     test_entrypoint_and_self_test(module)
     test_timeout_cleanup(module)
     test_timed_job_uses_preflight_evidence(module)
-    print("6 WOS fixed-resource showcase tests passed")
+    test_persistent_controller_pool_timing_and_cleanup(module)
+    test_git_prewarm_preserves_cold_destinations(module)
+    print("8 WOS fixed-resource showcase tests passed")
 
 
 if __name__ == "__main__":

@@ -10,6 +10,7 @@ import json
 import os
 import re
 import secrets
+import selectors
 import shutil
 import signal
 import subprocess
@@ -51,6 +52,7 @@ WORKLOAD_PHASES = (
     "python-json",
 )
 HOST_WORKSPACE_PHASES = frozenset(("file-move", "git-clone", "git-checkout"))
+CONTROLLER_PROFILES = ("local-runtime", "host-workspace")
 FIXTURE_ID = "wos-showcase-git-fixture-v1"
 FIXTURE_FILES = 100
 FIXTURE_FILE_BYTES = 16 * 1024
@@ -373,13 +375,16 @@ def python_workload_provenance() -> dict[str, str]:
 
 
 def spawn(
-    command: Sequence[str], *, env: dict[str, str] | None = None
+    command: Sequence[str],
+    *,
+    env: dict[str, str] | None = None,
+    pipe_stdin: bool = False,
 ) -> subprocess.Popen[str]:
     try:
         return register_process(
             subprocess.Popen(
                 list(command),
-                stdin=subprocess.DEVNULL,
+                stdin=subprocess.PIPE if pipe_stdin else subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -502,6 +507,12 @@ def verify_routes(work_root: str | None, timeout_seconds: float) -> dict[str, An
 
 def phase_uses_host_workspace(phase: str) -> bool:
     return phase in HOST_WORKSPACE_PHASES
+
+
+def controller_profile(phase: str) -> str:
+    if phase not in WORKLOAD_PHASES:
+        raise WorkloadError(f"unknown job phase: {phase}")
+    return "host-workspace" if phase_uses_host_workspace(phase) else "local-runtime"
 
 
 def inherited_route_evidence(phase: str, work_root: str) -> dict[str, Any]:
@@ -1013,24 +1024,263 @@ def run_host_worker(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def run_git_prewarm(args: argparse.Namespace) -> dict[str, Any]:
+    os.chdir(args.work_root)
+    identity = read_proc_identity()
+    validate_identity(identity, args.target_host, args.launcher_host)
+    destination = (
+        Path(args.work_root)
+        / "git-prewarm"
+        / f"controller-{args.job_start:03d}"
+    )
+    if destination.exists() or destination.is_symlink():
+        raise WorkloadError(f"Git prewarm destination is not cold: {destination}")
+    try:
+        destination.parent.mkdir(exist_ok=True)
+    except OSError as exc:
+        raise WorkloadError(f"cannot prepare Git prewarm root: {exc}") from exc
+    env = deterministic_environment()
+    try:
+        run_checked(
+            (
+                WOS_GIT,
+                *GIT_FIXED_CONFIG,
+                "-c",
+                "protocol.file.allow=always",
+                "clone",
+                "--quiet",
+                "--no-local",
+                "--no-checkout",
+                "--no-tags",
+                "--single-branch",
+                "--branch",
+                "main",
+                args.repository_uri,
+                str(destination),
+            ),
+            timeout_seconds=args.timeout_seconds,
+            env=env,
+            context=f"Git clone runtime prewarm on {args.target_host}",
+        )
+        run_checked(
+            (
+                WOS_GIT,
+                *GIT_FIXED_CONFIG,
+                "-C",
+                str(destination),
+                "checkout",
+                "--quiet",
+                "--detach",
+                args.commit,
+            ),
+            timeout_seconds=args.timeout_seconds,
+            env=env,
+            context=f"Git checkout runtime prewarm on {args.target_host}",
+        )
+        observed_commit = git_output(
+            WOS_GIT,
+            ("-C", str(destination), "rev-parse", "HEAD^{commit}"),
+            timeout_seconds=args.timeout_seconds,
+            context=f"validate Git runtime prewarm on {args.target_host}",
+        )
+        if observed_commit != args.commit:
+            raise WorkloadError(
+                f"Git runtime prewarm on {args.target_host} checked out the wrong commit"
+            )
+    finally:
+        if destination.exists() and not destination.is_symlink():
+            shutil.rmtree(destination)
+    if destination.exists() or destination.is_symlink():
+        raise WorkloadError(
+            f"Git prewarm destination remained visible on {args.target_host}"
+        )
+    return {
+        "action": "git-prewarm",
+        "target_host": args.target_host,
+        "prewarm_path": str(destination),
+        "destination_removed": True,
+        **identity,
+        **inherited_route_evidence("git-clone", args.work_root),
+    }
+
+
+def request_string(
+    request: dict[str, Any], field: str, *, allow_empty: bool = False
+) -> str:
+    value = request.get(field)
+    if not isinstance(value, str) or (not value and not allow_empty):
+        raise WorkloadError(f"controller request has invalid {field}")
+    return value
+
+
+def request_positive_int(request: dict[str, Any], field: str) -> int:
+    value = request.get(field)
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise WorkloadError(f"controller request has invalid {field}")
+    return value
+
+
+def request_nonnegative_int(request: dict[str, Any], field: str) -> int:
+    value = request.get(field)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise WorkloadError(f"controller request has invalid {field}")
+    return value
+
+
+def request_positive_timeout(request: dict[str, Any]) -> float:
+    value = request.get("timeout_seconds")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise WorkloadError("controller request has invalid timeout_seconds")
+    timeout_seconds = float(value)
+    if not 0.0 < timeout_seconds <= 86_400.0:
+        raise WorkloadError("controller request has invalid timeout_seconds")
+    return timeout_seconds
+
+
+def controller_request_args(
+    args: argparse.Namespace, request: dict[str, Any]
+) -> argparse.Namespace:
+    phase = request_string(request, "phase")
+    if phase not in WORKLOAD_PHASES or controller_profile(phase) != args.profile:
+        raise WorkloadError(
+            f"{args.profile} controller cannot execute phase {phase!r}"
+        )
+    worker_args = argparse.Namespace(
+        mode="host-worker",
+        phase=phase,
+        target_host=args.target_host,
+        launcher_host=args.launcher_host,
+        job_start=args.job_start,
+        job_count=args.job_count,
+        work_root=args.work_root,
+        repository_uri=request_string(
+            request, "repository_uri", allow_empty=True
+        ),
+        commit=request_string(request, "commit", allow_empty=True),
+        rounds=request_positive_int(request, "rounds"),
+        file_bytes=request_nonnegative_int(request, "file_bytes"),
+        timeout_seconds=request_positive_timeout(request),
+    )
+    validate_worker_arguments(worker_args)
+    return worker_args
+
+
+def run_controller(args: argparse.Namespace) -> int:
+    identity = read_proc_identity()
+    validate_identity(identity, args.target_host, args.launcher_host)
+    work_root = Path(args.work_root)
+    verify_work_root_owner(work_root, args.work_root_owner)
+    os.chdir(work_root)
+    routed_work_root = str(work_root) if args.profile == "host-workspace" else None
+    routes = verify_routes(routed_work_root, args.timeout_seconds)
+    print(
+        compact_json(
+            {
+                "status": "ready",
+                "profile": args.profile,
+                "target_host": args.target_host,
+                "job_start": args.job_start,
+                "job_count": args.job_count,
+                **identity,
+                **routes,
+            }
+        ),
+        flush=True,
+    )
+    for line in sys.stdin:
+        request_id: int | None = None
+        try:
+            request = parse_json_object(line.strip(), "controller request")
+            raw_request_id = request.get("request_id")
+            if (
+                isinstance(raw_request_id, bool)
+                or not isinstance(raw_request_id, int)
+                or raw_request_id <= 0
+            ):
+                raise WorkloadError("controller request has invalid request_id")
+            request_id = raw_request_id
+            action = request_string(request, "action")
+            if action == "shutdown":
+                print(
+                    compact_json(
+                        {
+                            "status": "ok",
+                            "request_id": request_id,
+                            "result": {"stopped": True},
+                        }
+                    ),
+                    flush=True,
+                )
+                return 0
+            if action == "phase":
+                result = run_host_worker(controller_request_args(args, request))
+            elif action == "git-prewarm":
+                if args.profile != "host-workspace":
+                    raise WorkloadError(
+                        "Git runtime prewarm requires a HOST-workspace controller"
+                    )
+                prewarm_args = argparse.Namespace(
+                    target_host=args.target_host,
+                    launcher_host=args.launcher_host,
+                    job_start=args.job_start,
+                    work_root=args.work_root,
+                    repository_uri=request_string(request, "repository_uri"),
+                    commit=request_string(request, "commit"),
+                    timeout_seconds=request_positive_timeout(request),
+                )
+                if (
+                    not prewarm_args.repository_uri.startswith("file://")
+                    or OID_RE.fullmatch(prewarm_args.commit) is None
+                ):
+                    raise WorkloadError(
+                        "Git runtime prewarm requires the fixed repository and commit"
+                    )
+                result = run_git_prewarm(prewarm_args)
+            else:
+                raise WorkloadError(f"unknown controller action: {action}")
+            print(
+                compact_json(
+                    {
+                        "status": "ok",
+                        "request_id": request_id,
+                        "result": result,
+                    }
+                ),
+                flush=True,
+            )
+        except WorkloadError as exc:
+            print(
+                compact_json(
+                    {
+                        "status": "error",
+                        "request_id": request_id,
+                        "error": str(exc),
+                    }
+                ),
+                flush=True,
+            )
+            return 1
+    raise WorkloadError("controller command pipe closed without shutdown")
+
+
 def local_route_operands() -> list[str]:
     return [f"-{path}" for path in LOCAL_ROUTE_PATHS]
 
 
 def controller_command(
-    phase: str,
+    profile: str,
     host: str,
     launcher: str,
     start: int,
     count: int,
     work_root: Path,
-    fixture: dict[str, Any],
-    rounds: int,
+    work_root_owner: str,
     timeout_seconds: float,
-    file_bytes: int = 0,
 ) -> list[str]:
+    if profile not in CONTROLLER_PROFILES:
+        raise WorkloadError(f"unknown controller profile: {profile}")
     command = [WOS_FORWARD]
-    if phase_uses_host_workspace(phase):
+    if profile == "host-workspace":
         command.append(f"+{work_root}")
     command += [
         *local_route_operands(),
@@ -1039,11 +1289,11 @@ def controller_command(
         host,
         WOS_PYTHON,
         WOS_HELPER,
-        "host-worker",
+        "controller",
     ]
     command += [
-        "--phase",
-        phase,
+        "--profile",
+        profile,
         "--target-host",
         host,
         "--launcher-host",
@@ -1052,18 +1302,13 @@ def controller_command(
         str(start),
         "--job-count",
         str(count),
+        "--work-root",
+        str(work_root),
+        "--work-root-owner",
+        work_root_owner,
         "--timeout-seconds",
         str(child_timeout_seconds(timeout_seconds)),
     ]
-    command += ["--work-root", str(work_root)]
-    if phase == "file-move":
-        command += ["--file-bytes", str(file_bytes)]
-    if phase == "git-clone":
-        command += ["--repository-uri", str(fixture["repository_uri"])]
-    if phase == "git-checkout":
-        command += ["--commit", str(fixture["commit"])]
-    if phase in ("python-sha256", "python-json"):
-        command += ["--rounds", str(rounds)]
     return command
 
 
@@ -1171,46 +1416,298 @@ def run_route_preflight(
     return expected_provenance
 
 
+class ControllerClient:
+    def __init__(
+        self,
+        profile: str,
+        host: str,
+        job_start: int,
+        job_count: int,
+        process: subprocess.Popen[str],
+    ) -> None:
+        self.profile = profile
+        self.host = host
+        self.job_start = job_start
+        self.job_count = job_count
+        self.process = process
+
+
+class ControllerPool:
+    def __init__(
+        self,
+        partitions: Sequence[tuple[str, int, int]],
+        launcher: str,
+        work_root: Path,
+        work_root_owner: str,
+        timeout_seconds: float,
+    ) -> None:
+        self.partitions = list(partitions)
+        self.launcher = launcher
+        self.work_root = work_root
+        self.work_root_owner = work_root_owner
+        self.timeout_seconds = timeout_seconds
+        self.clients: list[ControllerClient] = []
+        self.next_request_id = 1
+
+    @staticmethod
+    def controller_diagnostic(client: ControllerClient) -> str:
+        process = client.process
+        if process.poll() is None or process.stderr is None:
+            return ""
+        try:
+            return summarize_output(process.stderr.read())
+        except OSError:
+            return ""
+
+    def read_responses(
+        self,
+        clients: Sequence[ControllerClient],
+        timeout_seconds: float,
+        context: str,
+    ) -> list[dict[str, Any]]:
+        selector = selectors.DefaultSelector()
+        pending = set(range(len(clients)))
+        responses: dict[int, dict[str, Any]] = {}
+        try:
+            for index, client in enumerate(clients):
+                if client.process.stdout is None:
+                    raise WorkloadError(
+                        f"{context} controller on {client.host} has no response pipe"
+                    )
+                selector.register(client.process.stdout, selectors.EVENT_READ, index)
+            deadline = time.monotonic() + timeout_seconds
+            while pending:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise WorkloadError(
+                        f"{context} controllers exceeded {timeout_seconds:g} seconds"
+                    )
+                events = selector.select(remaining)
+                if not events:
+                    raise WorkloadError(
+                        f"{context} controllers exceeded {timeout_seconds:g} seconds"
+                    )
+                for key, _mask in events:
+                    index = int(key.data)
+                    if index not in pending:
+                        continue
+                    client = clients[index]
+                    line = key.fileobj.readline()
+                    selector.unregister(key.fileobj)
+                    pending.remove(index)
+                    if not line:
+                        diagnostic = self.controller_diagnostic(client)
+                        detail = f": {diagnostic}" if diagnostic else ""
+                        raise WorkloadError(
+                            f"{context} controller on {client.host} stopped without a response{detail}"
+                        )
+                    responses[index] = parse_json_object(
+                        line.strip(), f"{context} controller {client.host}"
+                    )
+        finally:
+            selector.close()
+        return [responses[index] for index in range(len(clients))]
+
+    def start(self) -> None:
+        if self.clients:
+            raise WorkloadError("controller pool was started more than once")
+        try:
+            for profile in CONTROLLER_PROFILES:
+                for host, start, count in self.partitions:
+                    process = spawn(
+                        controller_command(
+                            profile,
+                            host,
+                            self.launcher,
+                            start,
+                            count,
+                            self.work_root,
+                            self.work_root_owner,
+                            self.timeout_seconds,
+                        ),
+                        env=deterministic_environment(),
+                        pipe_stdin=True,
+                    )
+                    self.clients.append(
+                        ControllerClient(profile, host, start, count, process)
+                    )
+            responses = self.read_responses(
+                self.clients, self.timeout_seconds, "controller readiness"
+            )
+            for client, response in zip(self.clients, responses, strict=True):
+                expected_workspace_route = (
+                    "host" if client.profile == "host-workspace" else None
+                )
+                expected_workspace_path = (
+                    str(self.work_root)
+                    if expected_workspace_route == "host"
+                    else None
+                )
+                if (
+                    response.get("status") != "ready"
+                    or response.get("profile") != client.profile
+                    or response.get("target_host") != client.host
+                    or response.get("job_start") != client.job_start
+                    or response.get("job_count") != client.job_count
+                    or response.get("runtime_route") != "local"
+                    or response.get("runtime_paths") != list(LOCAL_ROUTE_PATHS)
+                    or response.get("workspace_route")
+                    != expected_workspace_route
+                    or response.get("workspace_path") != expected_workspace_path
+                ):
+                    raise WorkloadError(
+                        f"controller on {client.host} returned invalid {client.profile} readiness evidence"
+                    )
+                validate_identity(response, client.host, self.launcher)
+        except BaseException:
+            self.close()
+            raise
+
+    def profile_clients(self, profile: str) -> list[ControllerClient]:
+        selected = [client for client in self.clients if client.profile == profile]
+        if len(selected) != len(self.partitions):
+            raise WorkloadError(f"controller pool lacks the {profile} host set")
+        return selected
+
+    def request(
+        self,
+        profile: str,
+        payload: dict[str, Any],
+        timeout_seconds: float,
+        context: str,
+    ) -> list[dict[str, Any]]:
+        clients = self.profile_clients(profile)
+        request_id = self.next_request_id
+        self.next_request_id += 1
+        request = compact_json({**payload, "request_id": request_id}) + "\n"
+        for client in clients:
+            stream = client.process.stdin
+            if stream is None:
+                raise WorkloadError(
+                    f"{context} controller on {client.host} has no command pipe"
+                )
+            try:
+                stream.write(request)
+                stream.flush()
+            except (BrokenPipeError, OSError) as exc:
+                diagnostic = self.controller_diagnostic(client)
+                detail = f": {diagnostic}" if diagnostic else ""
+                raise WorkloadError(
+                    f"{context} controller on {client.host} rejected dispatch{detail}"
+                ) from exc
+        responses = self.read_responses(clients, timeout_seconds, context)
+        results: list[dict[str, Any]] = []
+        for client, response in zip(clients, responses, strict=True):
+            if response.get("request_id") != request_id:
+                raise WorkloadError(
+                    f"{context} controller on {client.host} returned the wrong request id"
+                )
+            if response.get("status") != "ok":
+                error = summarize_output(str(response.get("error", "unknown error")))
+                raise WorkloadError(
+                    f"{context} controller on {client.host} failed: {error}"
+                )
+            result = response.get("result")
+            if not isinstance(result, dict):
+                raise WorkloadError(
+                    f"{context} controller on {client.host} returned no result object"
+                )
+            results.append(result)
+        return results
+
+    def run_phase(
+        self,
+        phase: str,
+        fixture: dict[str, Any],
+        rounds: int,
+        timeout_seconds: float,
+        file_bytes: int,
+    ) -> list[dict[str, Any]]:
+        return self.request(
+            controller_profile(phase),
+            {
+                "action": "phase",
+                "phase": phase,
+                "repository_uri": str(fixture.get("repository_uri", "")),
+                "commit": str(fixture.get("commit", "")),
+                "rounds": rounds,
+                "file_bytes": file_bytes,
+                "timeout_seconds": child_timeout_seconds(timeout_seconds),
+            },
+            timeout_seconds,
+            phase,
+        )
+
+    def prewarm_git(
+        self, fixture: dict[str, Any], timeout_seconds: float
+    ) -> list[dict[str, Any]]:
+        return self.request(
+            "host-workspace",
+            {
+                "action": "git-prewarm",
+                "repository_uri": str(fixture["repository_uri"]),
+                "commit": str(fixture["commit"]),
+                "timeout_seconds": child_timeout_seconds(timeout_seconds),
+            },
+            timeout_seconds,
+            "Git runtime prewarm",
+        )
+
+    def close(self) -> bool:
+        clients = list(self.clients)
+        self.clients.clear()
+        if not clients:
+            return True
+        alive: list[ControllerClient] = []
+        request_id = self.next_request_id
+        self.next_request_id += 1
+        request = compact_json({"action": "shutdown", "request_id": request_id}) + "\n"
+        for client in clients:
+            if client.process.poll() is not None or client.process.stdin is None:
+                continue
+            try:
+                client.process.stdin.write(request)
+                client.process.stdin.flush()
+                alive.append(client)
+            except (BrokenPipeError, OSError):
+                pass
+        if alive:
+            try:
+                self.read_responses(alive, min(5.0, self.timeout_seconds), "shutdown")
+            except WorkloadError:
+                pass
+        stopped = terminate_processes(client.process for client in clients)
+        for client in clients:
+            for stream in (
+                client.process.stdin,
+                client.process.stdout,
+                client.process.stderr,
+            ):
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except OSError:
+                        pass
+        return stopped
+
+
 def run_timed_phase(
     phase: str,
-    partitions: Sequence[tuple[str, int, int]],
-    launcher: str,
-    work_root: Path,
+    controllers: ControllerPool,
     fixture: dict[str, Any],
     rounds: int,
     timeout_seconds: float,
     file_bytes: int = 0,
 ) -> tuple[float, list[dict[str, Any]]]:
-    processes: list[tuple[str, subprocess.Popen[str]]] = []
     started_ns = time.monotonic_ns()
-    for host, start, count in partitions:
-        command = controller_command(
-            phase,
-            host,
-            launcher,
-            start,
-            count,
-            work_root,
-            fixture,
-            rounds,
-            timeout_seconds,
-            file_bytes,
-        )
-        processes.append(
-            (
-                f"{phase} controller {host}",
-                spawn(command, env=deterministic_environment()),
-            )
-        )
-    outputs = communicate_many(processes, timeout_seconds)
+    results = controllers.run_phase(
+        phase, fixture, rounds, timeout_seconds, file_bytes
+    )
     finished_ns = time.monotonic_ns()
     elapsed = (finished_ns - started_ns) / 1_000_000_000.0
     if elapsed <= 0.0:
         raise WorkloadError(f"{phase} produced a non-positive monotonic duration")
-    controllers = [
-        parse_json_object(stdout.strip(), context) for context, stdout, _ in outputs
-    ]
-    return elapsed, controllers
+    return elapsed, results
 
 
 def validate_controller_results(
@@ -1675,6 +2172,7 @@ def run_coordinator(args: argparse.Namespace) -> list[dict[str, Any]]:
     original_cwd = Path.cwd()
     os.chdir(work_root)
     measurements: list[dict[str, Any]] = []
+    controller_pool: ControllerPool | None = None
     try:
         log("validating node-local runtime and HOST workspace routes before timing")
         provenance = run_route_preflight(
@@ -1691,13 +2189,54 @@ def run_coordinator(args: argparse.Namespace) -> list[dict[str, Any]]:
 
         log("preparing deterministic offline Git fixture outside the timed phases")
         fixture = create_git_fixture(work_root, WOS_GIT, args.timeout_seconds)
+        log("starting reusable per-host controllers outside the timed phases")
+        controller_pool = ControllerPool(
+            partitions,
+            launcher,
+            work_root,
+            work_root_owner,
+            args.timeout_seconds,
+        )
+        controller_pool.start()
+
+        log("prewarming equivalent Git clone/checkout runtimes on every host")
+        prewarm_results = controller_pool.prewarm_git(
+            fixture, args.timeout_seconds
+        )
+        for result, (host, start, _count) in zip(
+            prewarm_results, partitions, strict=True
+        ):
+            expected_path = work_root / "git-prewarm" / f"controller-{start:03d}"
+            validate_identity(result, host, launcher)
+            if (
+                result.get("action") != "git-prewarm"
+                or result.get("target_host") != host
+                or result.get("runtime_route") != "local"
+                or result.get("runtime_paths") != list(LOCAL_ROUTE_PATHS)
+                or result.get("workspace_route") != "host"
+                or result.get("workspace_path") != str(work_root)
+                or result.get("prewarm_path") != str(expected_path)
+                or result.get("destination_removed") is not True
+                or expected_path.exists()
+                or expected_path.is_symlink()
+            ):
+                raise WorkloadError(
+                    f"Git runtime prewarm on {host} returned invalid cold-destination evidence"
+                )
+        prewarm_root = work_root / "git-prewarm"
+        if prewarm_root.is_symlink():
+            raise WorkloadError("Git runtime prewarm root changed into a symlink")
+        if prewarm_root.exists():
+            shutil.rmtree(prewarm_root)
+        if prewarm_root.exists() or prewarm_root.is_symlink() or any(
+            (work_root / "clones").iterdir()
+        ):
+            raise WorkloadError("Git timed clone destinations are not cold")
 
         log("running 32 concurrent no-checkout Git clone jobs")
         elapsed, controllers = run_timed_phase(
             "git-clone",
-            partitions,
-            launcher,
-            work_root,
+            controller_pool,
             fixture,
             rounds,
             args.timeout_seconds,
@@ -1738,9 +2277,7 @@ def run_coordinator(args: argparse.Namespace) -> list[dict[str, Any]]:
         log("running 32 concurrent exact detached Git checkout jobs")
         elapsed, controllers = run_timed_phase(
             "git-checkout",
-            partitions,
-            launcher,
-            work_root,
+            controller_pool,
             fixture,
             rounds,
             args.timeout_seconds,
@@ -1783,9 +2320,7 @@ def run_coordinator(args: argparse.Namespace) -> list[dict[str, Any]]:
             log(f"running {TOTAL_JOBS} concurrent {phase} jobs rounds={rounds}")
             elapsed, controllers = run_timed_phase(
                 phase,
-                partitions,
-                launcher,
-                work_root,
+                controller_pool,
                 fixture,
                 rounds,
                 args.timeout_seconds,
@@ -1842,9 +2377,7 @@ def run_coordinator(args: argparse.Namespace) -> list[dict[str, Any]]:
         )
         elapsed, controllers = run_timed_phase(
             "file-move",
-            partitions,
-            launcher,
-            work_root,
+            controller_pool,
             file_move_fixture,
             rounds,
             args.timeout_seconds,
@@ -1906,7 +2439,10 @@ def run_coordinator(args: argparse.Namespace) -> list[dict[str, Any]]:
         )
         measurements.append(file_move_measurement)
     finally:
-        if not terminate_processes():
+        controllers_stopped = (
+            True if controller_pool is None else controller_pool.close()
+        )
+        if not controllers_stopped or not terminate_processes():
             os.chdir(original_cwd)
             raise WorkloadError(
                 f"worker processes did not stop; preserving private workspace {work_root}"
@@ -2164,6 +2700,18 @@ def build_parser() -> argparse.ArgumentParser:
     host_worker.add_argument("--file-bytes", type=positive_int, default=0)
     host_worker.add_argument("--timeout-seconds", type=positive_timeout, default=1800.0)
 
+    controller = subparsers.add_parser("controller")
+    controller.add_argument("--profile", choices=CONTROLLER_PROFILES, required=True)
+    controller.add_argument("--target-host", required=True)
+    controller.add_argument("--launcher-host", required=True)
+    controller.add_argument("--job-start", type=int, required=True)
+    controller.add_argument("--job-count", type=positive_int, required=True)
+    controller.add_argument("--work-root", required=True)
+    controller.add_argument("--work-root-owner", required=True)
+    controller.add_argument(
+        "--timeout-seconds", type=positive_timeout, default=1800.0
+    )
+
     job = subparsers.add_parser("job")
     job.add_argument(
         "--phase",
@@ -2208,7 +2756,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def validate_worker_arguments(args: argparse.Namespace) -> None:
-    if args.mode == "host-worker":
+    if args.mode in ("host-worker", "controller"):
         if (
             args.job_start < 0
             or args.job_count > TOTAL_JOBS
@@ -2217,6 +2765,8 @@ def validate_worker_arguments(args: argparse.Namespace) -> None:
             raise WorkloadError("host worker job range is outside 0..31")
     if args.mode == "job" and not 0 <= args.job_id < TOTAL_JOBS:
         raise WorkloadError("job id is outside 0..31")
+    if args.mode == "controller":
+        require_safe_work_root(Path(args.work_root), args.work_root_owner)
     if args.mode in ("host-worker", "job"):
         if not args.work_root:
             raise WorkloadError(f"{args.phase} requires --work-root")
@@ -2240,6 +2790,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(compact_json(measurement), flush=True)
         elif args.mode == "host-worker":
             print(compact_json(run_host_worker(args)), flush=True)
+        elif args.mode == "controller":
+            return run_controller(args)
         elif args.mode == "job":
             print(compact_json(run_job(args)), flush=True)
         elif args.mode == "preflight-host":
