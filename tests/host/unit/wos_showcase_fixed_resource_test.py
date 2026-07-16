@@ -212,6 +212,8 @@ def test_partition_and_commands(module) -> None:
         "1" * 40,
         force=True,
     )
+    if "core.warnAmbiguousRefs=false" not in checkout_command:
+        fail("exact checkout does not suppress redundant ref ambiguity scans")
     checkout_arguments = checkout_command[checkout_command.index("checkout") + 1 :]
     if checkout_arguments != ("--quiet", "--force", "--detach", "1" * 40):
         fail(f"forced checkout command is not exact/detached: {checkout_command}")

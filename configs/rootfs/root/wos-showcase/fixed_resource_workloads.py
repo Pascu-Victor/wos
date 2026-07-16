@@ -720,6 +720,10 @@ def git_checkout_command(
     return (
         git,
         *GIT_FIXED_CONFIG,
+        # The exact object ID is validated above. Disable only Git's
+        # ambiguity-warning ref scans; object lookup remains exact.
+        "-c",
+        "core.warnAmbiguousRefs=false",
         "-C",
         str(destination),
         "checkout",
