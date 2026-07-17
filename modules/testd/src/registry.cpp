@@ -36,6 +36,7 @@
     X(test_epoll_pipe_hup_on_writer_close)                \
     X(test_pty_blocking_read_wake)                        \
     X(test_pty_cr_progress_write_coalesced)               \
+    X(test_pty_ansi_escape_transparency)                  \
     X(test_getpid_getppid)                                \
     X(test_getcwd_chdir)                                  \
     X(test_fork_exit)                                     \

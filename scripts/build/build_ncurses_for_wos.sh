@@ -316,7 +316,7 @@ wos_timed_step "configure" "ncurses" \
     --with-pkg-config-libdir=/lib/pkgconfig \
     --with-default-terminfo-dir=/usr/share/terminfo \
     --with-terminfo-dirs=/usr/share/terminfo \
-    --with-fallbacks=xterm,xterm-256color,vt100,ansi,dumb
+    --with-fallbacks=xterm,xterm-256color,screen,screen-256color,tmux,tmux-256color,rxvt,rxvt-256color,linux,vt100,vt220,ansi,dumb
 
 wos_make "$WOS_MAKE_JOBS" -C "$NCURSES_WORK"
 wos_make "$WOS_MAKE_JOBS" -C "$NCURSES_WORK" \

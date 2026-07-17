@@ -358,125 +358,6 @@ auto pty_poll_register_waiter(ker::vfs::File* file, uint64_t pid) -> bool {
 
 auto pty_poll_wait_kind(ker::vfs::File* /*file*/) -> WaitChannelKind { return WaitChannelKind::LOCAL_PTY; }
 
-enum class CprPrefixMatch : uint8_t {
-    PREFIX,
-    COMPLETE,
-    INVALID,
-};
-
-enum class CprFeedAction : uint8_t {
-    PASS_THROUGH,
-    HOLD,
-    DROP,
-    REPLAY,
-};
-
-constexpr auto is_dec_digit(uint8_t ch) -> bool { return ch >= '0' && ch <= '9'; }
-
-auto classify_cpr_prefix(const uint8_t* seq, size_t len) -> CprPrefixMatch {
-    if (seq == nullptr || len == 0) {
-        return CprPrefixMatch::INVALID;
-    }
-
-    if (seq[0] != 0x1B) {
-        return CprPrefixMatch::INVALID;
-    }
-    if (len == 1) {
-        return CprPrefixMatch::PREFIX;
-    }
-
-    if (seq[1] != '[') {
-        return CprPrefixMatch::INVALID;
-    }
-    if (len == 2) {
-        return CprPrefixMatch::PREFIX;
-    }
-
-    size_t pos = 2;
-    size_t row_digits = 0;
-    while (pos < len && is_dec_digit(seq[pos])) {
-        row_digits++;
-        pos++;
-    }
-    if (row_digits == 0) {
-        return CprPrefixMatch::INVALID;
-    }
-    if (pos == len) {
-        return CprPrefixMatch::PREFIX;
-    }
-
-    if (seq[pos] != ';') {
-        return CprPrefixMatch::INVALID;
-    }
-    pos++;
-    if (pos == len) {
-        return CprPrefixMatch::PREFIX;
-    }
-
-    size_t col_digits = 0;
-    while (pos < len && is_dec_digit(seq[pos])) {
-        col_digits++;
-        pos++;
-    }
-    if (col_digits == 0) {
-        return CprPrefixMatch::INVALID;
-    }
-    if (pos == len) {
-        return CprPrefixMatch::PREFIX;
-    }
-
-    if (seq[pos] == 'R' && (pos + 1) == len) {
-        return CprPrefixMatch::COMPLETE;
-    }
-    return CprPrefixMatch::INVALID;
-}
-
-auto cpr_filter_feed(PtyPair* pair, uint8_t ch, uint8_t* replay_out, size_t* replay_len_out) -> CprFeedAction {
-    if (pair == nullptr || replay_out == nullptr || replay_len_out == nullptr) {
-        return CprFeedAction::PASS_THROUGH;
-    }
-
-    *replay_len_out = 0;
-
-    if (!pair->cpr_filter_active) {
-        if (ch != 0x1B) {
-            return CprFeedAction::PASS_THROUGH;
-        }
-        pair->cpr_filter_active = true;
-        pair->cpr_filter_len = 0;
-    }
-
-    if (pair->cpr_filter_len < CPR_FILTER_BUF_SIZE) {
-        pair->cpr_filter_buf.at(pair->cpr_filter_len++) = ch;
-    } else {
-        for (size_t i = 0; i < pair->cpr_filter_len; i++) {
-            replay_out[i] = pair->cpr_filter_buf.at(i);
-        }
-        *replay_len_out = pair->cpr_filter_len;
-        pair->cpr_filter_active = false;
-        pair->cpr_filter_len = 0;
-        return CprFeedAction::REPLAY;
-    }
-
-    switch (classify_cpr_prefix(pair->cpr_filter_buf.data(), pair->cpr_filter_len)) {
-        case CprPrefixMatch::PREFIX:
-            return CprFeedAction::HOLD;
-        case CprPrefixMatch::COMPLETE:
-            pair->cpr_filter_active = false;
-            pair->cpr_filter_len = 0;
-            return CprFeedAction::DROP;
-        case CprPrefixMatch::INVALID:
-        default:
-            for (size_t i = 0; i < pair->cpr_filter_len; i++) {
-                replay_out[i] = pair->cpr_filter_buf.at(i);
-            }
-            *replay_len_out = pair->cpr_filter_len;
-            pair->cpr_filter_active = false;
-            pair->cpr_filter_len = 0;
-            return CprFeedAction::REPLAY;
-    }
-}
-
 ker::util::RadixTree<PtyPair*> pty_tree;
 ker::mod::sys::Spinlock pty_tree_lock;
 bool pty_initialized = false;
@@ -705,55 +586,18 @@ ssize_t master_write(ker::vfs::File* file, const void* buf, size_t count) {
     const auto* bytes = static_cast<const uint8_t*>(buf);
     size_t processed = 0;
 
-    std::array<uint8_t, CPR_FILTER_BUF_SIZE> replay_buf{};
-    size_t replay_pos = 0;
-    size_t replay_len = 0;
-
-    for (size_t i = 0; (i < count) || (replay_pos < replay_len);) {
-        bool from_replay = false;
-        uint8_t ch = 0;
-
-        if (replay_pos < replay_len) {
-            ch = replay_buf.at(replay_pos++);
-            from_replay = true;
-            if (replay_pos == replay_len) {
-                replay_pos = 0;
-                replay_len = 0;
-            }
-        } else {
-            ch = bytes[i++];
-        }
+    // ANSI/VT sequences are an application-to-terminal protocol.  The line
+    // discipline applies only termios input rules; it must not buffer, parse,
+    // or consume ESC/CSI/OSC bytes, including cursor-position reports.
+    for (size_t i = 0; i < count; i++) {
+        uint8_t ch = bytes[i];
 
         // Input processing (c_iflag)
         uint64_t const IRQF = pair->lock.lock_irqsave();
 
-        if (!from_replay) {
-            std::array<uint8_t, CPR_FILTER_BUF_SIZE> filter_replay{};
-            size_t filter_replay_len = 0;
-            CprFeedAction const FILTER_ACTION = cpr_filter_feed(pair, ch, filter_replay.data(), &filter_replay_len);
-
-            if (FILTER_ACTION == CprFeedAction::HOLD || FILTER_ACTION == CprFeedAction::DROP) {
-                pair->lock.unlock_irqrestore(IRQF);
-                processed++;
-                continue;
-            }
-            if (FILTER_ACTION == CprFeedAction::REPLAY) {
-                pair->lock.unlock_irqrestore(IRQF);
-                processed++;
-                if (filter_replay_len > 0) {
-                    std::copy_n(filter_replay.data(), filter_replay_len, replay_buf.data());
-                    replay_pos = 0;
-                    replay_len = filter_replay_len;
-                }
-                continue;
-            }
-        }
-
         if (((pair->termios.c_iflag & TIOS_IGNCR) != 0U) && ch == '\r') {
             pair->lock.unlock_irqrestore(IRQF);
-            if (!from_replay) {
-                processed++;
-            }
+            processed++;
             continue;  // Discard CR
         }
         if (((pair->termios.c_iflag & TIOS_ICRNL) != 0U) && ch == '\r') {
@@ -781,9 +625,7 @@ ssize_t master_write(ker::vfs::File* file, const void* buf, size_t count) {
                 }
                 pair->lock.unlock_irqrestore(IRQF);
                 pty_signal_pgrp(SIGNAL_TTY, SIGNAL_PGRP, SIG_INT);
-                if (!from_replay) {
-                    processed++;
-                }
+                processed++;
                 continue;
             }
             if (ch == pair->termios.c_cc[CC_VQUIT] && pair->termios.c_cc[CC_VQUIT] != 0) {
@@ -799,9 +641,7 @@ ssize_t master_write(ker::vfs::File* file, const void* buf, size_t count) {
                 }
                 pair->lock.unlock_irqrestore(IRQF);
                 pty_signal_pgrp(SIGNAL_TTY, SIGNAL_PGRP, SIG_QUIT);
-                if (!from_replay) {
-                    processed++;
-                }
+                processed++;
                 continue;
             }
             if (ch == pair->termios.c_cc[CC_VSUSP] && pair->termios.c_cc[CC_VSUSP] != 0) {
@@ -813,9 +653,7 @@ ssize_t master_write(ker::vfs::File* file, const void* buf, size_t count) {
                 }
                 pair->lock.unlock_irqrestore(IRQF);
                 pty_signal_pgrp(SIGNAL_TTY, SIGNAL_PGRP, SIG_TSTP);
-                if (!from_replay) {
-                    processed++;
-                }
+                processed++;
                 continue;
             }
         }
@@ -834,9 +672,7 @@ ssize_t master_write(ker::vfs::File* file, const void* buf, size_t count) {
                     }
                 }
                 pair->lock.unlock_irqrestore(IRQF);
-                if (!from_replay) {
-                    processed++;
-                }
+                processed++;
                 continue;
             }
 
@@ -849,9 +685,7 @@ ssize_t master_write(ker::vfs::File* file, const void* buf, size_t count) {
                 }
                 pair->canon_len = 0;
                 pair->lock.unlock_irqrestore(IRQF);
-                if (!from_replay) {
-                    processed++;
-                }
+                processed++;
                 continue;
             }
 
@@ -861,9 +695,7 @@ ssize_t master_write(ker::vfs::File* file, const void* buf, size_t count) {
                     pair->canon_len = 0;
                 }
                 pair->lock.unlock_irqrestore(IRQF);
-                if (!from_replay) {
-                    processed++;
-                }
+                processed++;
                 continue;
             }
 
@@ -885,9 +717,7 @@ ssize_t master_write(ker::vfs::File* file, const void* buf, size_t count) {
             }
 
             pair->lock.unlock_irqrestore(IRQF);
-            if (!from_replay) {
-                processed++;
-            }
+            processed++;
         } else {
             if ((pair->termios.c_lflag & TIOS_ECHO) != 0U) {
                 pty_echo_byte(pair, ch);
@@ -940,9 +770,7 @@ ssize_t master_write(ker::vfs::File* file, const void* buf, size_t count) {
                     }
                 }
             }
-            if (!from_replay) {
-                processed++;
-            }
+            processed++;
         }
 
         if ((processed != 0) && ((processed % PTY_WRITE_FAIR_YIELD_INTERVAL) == 0)) {
@@ -1614,8 +1442,6 @@ auto pty_alloc() -> int {
     pair->winsize = {.ws_row = 24, .ws_col = 80, .ws_xpixel = 0, .ws_ypixel = 0};
     pair->termios = default_termios();
     pair->canon_len = 0;
-    pair->cpr_filter_len = 0;
-    pair->cpr_filter_active = false;
     pair->foreground_pgrp = 0;
 
     // Build the slave name: "N" (e.g., "0", "12")

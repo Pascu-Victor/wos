@@ -134,7 +134,6 @@ struct PtyRingBuf {
 
 // Canonical line buffer size
 static constexpr size_t CANON_BUF_SIZE = 256;
-static constexpr size_t CPR_FILTER_BUF_SIZE = 32;
 static constexpr size_t SLAVE_NAME_BUF_SIZE = 8;
 
 // A single PTY pair (master + slave)
@@ -161,13 +160,6 @@ struct PtyPair {
     // Canonical mode line editing buffer
     std::array<uint8_t, CANON_BUF_SIZE> canon_buf{};
     size_t canon_len = 0;
-
-    // Tracks potential terminal cursor-position reports (ESC[row;colR)
-    // across fragmented master writes so stale ASK_TERMINAL replies can be
-    // consumed in-kernel without leaking into userspace input.
-    std::array<uint8_t, CPR_FILTER_BUF_SIZE> cpr_filter_buf{};
-    size_t cpr_filter_len = 0;
-    bool cpr_filter_active = false;
 
     ker::util::SmallVec<uint64_t, 2> master_poll_waiters;
     ker::util::SmallVec<uint64_t, 2> slave_poll_waiters;

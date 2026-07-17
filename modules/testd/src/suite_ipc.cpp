@@ -690,3 +690,105 @@ TESTD_RUN(test_pty_cr_progress_write_coalesced) {
     TESTD_PASS("pty_cr_progress_write_coalesced");
 }
 TESTD_RUN_END(test_pty_cr_progress_write_coalesced)
+
+TESTD_RUN(test_pty_ansi_escape_transparency) {
+    int const MASTER_FD = open("/dev/ptmx", O_RDWR);
+    if (MASTER_FD < 0) {
+        fail("pty_ansi_open_master", "open /dev/ptmx failed");
+        return;
+    }
+
+    unsigned int pty_num = 0;
+    if (ioctl(MASTER_FD, TIOCGPTN, &pty_num) != 0) {
+        close(MASTER_FD);
+        fail("pty_ansi_tiocgptn", "TIOCGPTN failed");
+        return;
+    }
+
+    int unlock = 0;
+    if (ioctl(MASTER_FD, TIOCSPTLCK, &unlock) != 0) {
+        close(MASTER_FD);
+        fail("pty_ansi_unlock", "TIOCSPTLCK failed");
+        return;
+    }
+
+    std::array<char, 32> slave_path{};
+    (void)testd_format_to_array(slave_path, "/dev/pts/%u", pty_num);
+    int const SLAVE_FD = open(slave_path.data(), O_RDWR);
+    if (SLAVE_FD < 0) {
+        close(MASTER_FD);
+        fail("pty_ansi_open_slave", "open slave failed");
+        return;
+    }
+    if (!make_pty_raw(SLAVE_FD)) {
+        close(SLAVE_FD);
+        close(MASTER_FD);
+        fail("pty_ansi_raw", "failed to set raw PTY mode");
+        return;
+    }
+
+    constexpr std::string_view OUTPUT =
+        "\x1B[32mgreen\x1B[0m"
+        "\x1B[1;4;38;5;208;48;2;1;2;3mstyled\x1B[0m"
+        "\x1B[2J\x1B[3J\x1B[H\x1B[12;34H\x1B[4A\x1B[5B\x1B[6C\x1B[7D"
+        "\x1B[K\x1B[1K\x1B[2K\x1B[J\x1B[1J\x1B[2J"
+        "\x1B[2;20r\x1B[S\x1B[T\x1B[s\x1B[u\x1B"
+        "7\x1B"
+        "8"
+        "\x1B[?25l\x1B[?25h\x1B[?1049h\x1B[?1049l\x1B[?2004h\x1B[?2004l"
+        "\x1B]0;WOS terminal\x07";
+    ssize_t const OUTPUT_WRITTEN = write(SLAVE_FD, OUTPUT.data(), OUTPUT.size());
+    std::array<char, OUTPUT.size()> output_buf{};
+    ssize_t const OUTPUT_READ = read_expected_bytes_timeout(MASTER_FD, output_buf.data(), OUTPUT.size(), REMOTE_IPC_TIMEOUT_MS);
+    if (std::cmp_not_equal(OUTPUT_WRITTEN, OUTPUT.size()) || std::cmp_not_equal(OUTPUT_READ, OUTPUT.size()) ||
+        std::string_view(output_buf.data(), output_buf.size()) != OUTPUT) {
+        close(SLAVE_FD);
+        close(MASTER_FD);
+        fail("pty_ansi_output", "slave output escape sequence was modified");
+        return;
+    }
+    TESTD_PASS("pty_ansi_output");
+
+    constexpr char ESCAPE = '\x1B';
+    if (write(MASTER_FD, &ESCAPE, 1) != 1) {
+        close(SLAVE_FD);
+        close(MASTER_FD);
+        fail("pty_ansi_escape_key_write", "master Escape key write failed");
+        return;
+    }
+    char escape_buf = 0;
+    if (read_expected_bytes_timeout(SLAVE_FD, &escape_buf, 1, REMOTE_IPC_TIMEOUT_MS) != 1 || escape_buf != ESCAPE) {
+        close(SLAVE_FD);
+        close(MASTER_FD);
+        fail("pty_ansi_escape_key", "standalone Escape key was buffered or modified");
+        return;
+    }
+    TESTD_PASS("pty_ansi_escape_key");
+
+    constexpr std::string_view INPUT =
+        "\x1B[A\x1B[B\x1B[C\x1B[D\x1B[1;5C\x1B[3~"
+        "\x1B[200~pasted text\x1B[201~\x1B[I\x1B[O\x1B[<0;12;8M\x1B[32;120R";
+    constexpr std::array<size_t, 7> CHUNKS = {1, 2, 5, 11, 19, 37, INPUT.size()};
+    size_t input_pos = 0;
+    for (size_t end : CHUNKS) {
+        size_t const CHUNK_LEN = end - input_pos;
+        if (write(MASTER_FD, INPUT.data() + input_pos, CHUNK_LEN) != static_cast<ssize_t>(CHUNK_LEN)) {
+            close(SLAVE_FD);
+            close(MASTER_FD);
+            fail("pty_ansi_input_write", "fragmented master input write failed");
+            return;
+        }
+        input_pos = end;
+    }
+
+    std::array<char, INPUT.size()> input_buf{};
+    ssize_t const INPUT_READ = read_expected_bytes_timeout(SLAVE_FD, input_buf.data(), INPUT.size(), REMOTE_IPC_TIMEOUT_MS);
+    close(SLAVE_FD);
+    close(MASTER_FD);
+    if (std::cmp_not_equal(INPUT_READ, INPUT.size()) || std::string_view(input_buf.data(), input_buf.size()) != INPUT) {
+        fail("pty_ansi_input", "terminal input escape sequence was buffered, dropped, or modified");
+        return;
+    }
+    TESTD_PASS("pty_ansi_input");
+}
+TESTD_RUN_END(test_pty_ansi_escape_transparency)

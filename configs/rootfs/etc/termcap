@@ -1,0 +1,64 @@
+# ANSI/VT terminal capabilities used by WOS Bash/Readline and other
+# termcap consumers.  The PTY transports these byte sequences unchanged;
+# the terminal named by TERM interprets them.
+
+xterm-256color|xterm with 256 colors:\
+	:am:bs:km:mi:ms:xn:AX:Co#256:co#80:it#8:li#24:pa#32767:\
+	:AL=\E[%dL:DC=\E[%dP:DL=\E[%dM:DO=\E[%dB:IC=\E[%d@:LE=\E[%dD:\
+	:RI=\E[%dC:SF=\E[%dS:SR=\E[%dT:UP=\E[%dA:\
+	:AB=\E[48;5;%dm:AF=\E[38;5;%dm:op=\E[39;49m:\
+	:ae=\E(B:al=\E[L:as=\E(0:bl=^G:bt=\E[Z:cd=\E[J:ce=\E[K:\
+	:cl=\E[H\E[2J:cm=\E[%i%d;%dH:cr=\r:cs=\E[%i%d;%dr:ct=\E[3g:\
+	:dc=\E[P:dl=\E[M:do=\n:ec=\E[%dX:ei=\E[4l:ho=\E[H:im=\E[4h:\
+	:is=\E[!p\E[?3;4l\E[4l\E>:k1=\EOP:k2=\EOQ:k3=\EOR:k4=\EOS:\
+	:k5=\E[15~:k6=\E[17~:k7=\E[18~:k8=\E[19~:k9=\E[20~:\
+	:k;=\E[21~:F1=\E[23~:F2=\E[24~:kD=\E[3~:kI=\E[2~:\
+	:kN=\E[6~:kP=\E[5~:kb=\177:kd=\EOB:ke=\E[?1l\E>:\
+	:kh=\EOH:kl=\EOD:kr=\EOC:ks=\E[?1h\E=:ku=\EOA:@7=\EOF:\
+	:le=^H:mb=\E[5m:md=\E[1m:me=\E[0m:mh=\E[2m:mk=\E[8m:\
+	:mm=\E[?1034h:mo=\E[?1034l:mr=\E[7m:nd=\E[C:nw=\EE:\
+	:rc=\E8:sc=\E7:se=\E[27m:sf=\n:so=\E[7m:sr=\EM:st=\EH:ta=^I:\
+	:te=\E[?1049l\E[23;0;0t:ti=\E[?1049h\E[22;0;0t:\
+	:ue=\E[24m:up=\E[A:us=\E[4m:vb=\E[?5h\E[?5l:\
+	:ve=\E[?12l\E[?25h:vi=\E[?25l:vs=\E[?12;25h:\
+	:BD=\E[?2004l:BE=\E[?2004h:PE=\E[201~:PS=\E[200~:E3=\E[3J:
+
+xterm|xterm-color|xterm terminal emulator:\
+	:Co#8:AB=\E[4%dm:AF=\E[3%dm:tc=xterm-256color:
+
+screen-256color|tmux-256color|GNU Screen or tmux with 256 colors:\
+	:tc=xterm-256color:
+
+screen|tmux|GNU Screen or tmux:\
+	:Co#8:AB=\E[4%dm:AF=\E[3%dm:tc=xterm-256color:
+
+rxvt-unicode-256color|rxvt-256color|rxvt with 256 colors:\
+	:tc=xterm-256color:
+
+rxvt|rxvt-unicode|rxvt terminal emulator:\
+	:Co#8:AB=\E[4%dm:AF=\E[3%dm:tc=xterm-256color:
+
+ansi|linux|ansi/ECMA-48 terminal with color:\
+	:am:bs:mi:ms:Co#8:co#80:it#8:li#24:\
+	:AB=\E[4%dm:AF=\E[3%dm:op=\E[39;49m:bl=^G:cd=\E[J:ce=\E[K:\
+	:cl=\E[H\E[2J:cm=\E[%i%d;%dH:cr=\r:dc=\E[P:dl=\E[M:do=\n:\
+	:ho=\E[H:kD=\E[3~:kI=\E[2~:kN=\E[6~:kP=\E[5~:\
+	:kd=\E[B:kh=\E[H:kl=\E[D:kr=\E[C:ku=\E[A:@7=\E[F:le=^H:\
+	:mb=\E[5m:md=\E[1m:me=\E[0m:mh=\E[2m:mk=\E[8m:mr=\E[7m:\
+	:nd=\E[C:rc=\E8:sc=\E7:se=\E[27m:sf=\n:so=\E[7m:sr=\EM:\
+	:ue=\E[24m:up=\E[A:us=\E[4m:ve=\E[?25h:vi=\E[?25l:
+
+vt100|vt102|dec vt100 compatible:\
+	:am:bs:km:ms:xn:co#80:it#8:li#24:\
+	:ae=^O:al=\E[L:as=^N:bl=^G:cd=\E[J:ce=\E[K:cl=\E[H\E[2J:\
+	:cm=\E[%i%d;%dH:cr=\r:cs=\E[%i%d;%dr:dc=\E[P:dl=\E[M:do=\n:\
+	:ho=\E[H:kd=\EOB:ke=\E[?1l\E>:kh=\EOH:kl=\EOD:kr=\EOC:\
+	:ks=\E[?1h\E=:ku=\EOA:le=^H:mb=\E[5m:md=\E[1m:me=\E[0m:\
+	:mr=\E[7m:nd=\E[C:rc=\E8:sc=\E7:se=\E[m:sf=\n:so=\E[7m:\
+	:sr=\EM:ue=\E[m:up=\E[A:us=\E[4m:ve=\E[?25h:vi=\E[?25l:
+
+vt220|vt320|dec vt200/vt300 compatible:\
+	:tc=vt100:
+
+dumb|80-column dumb tty:\
+	:am:co#80:li#24:cr=\r:do=\n:
