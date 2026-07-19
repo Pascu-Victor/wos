@@ -133,9 +133,12 @@ wos_asm_syscall_handler:
     jz .sysret_bad_target_flags
     or r10, 0x202
     mov [gs:0x30], r10
-    mov [rsp + 32], r10
     test r12b, r12b
     jne .signal_iret_return
+
+    ; SYSRET exposes the return flags in userspace r11.  The signal IRET path,
+    ; however, must preserve the r11 restored from the signal frame.
+    mov [rsp + 32], r10
 
     ; restore usermode segment ds and es
     mov ds, [gs:0x18]
