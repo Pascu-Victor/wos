@@ -1941,6 +1941,19 @@ def test_wos_cmake_metadata_fast_paths_preserve_filesystem_validation() -> None:
         "WOS CMake immutable directory-content reuse",
     )
 
+    for source_name in ("cmSourceFile.cxx", "cmSourceFileLocation.cxx"):
+        source = (WOS_CMAKE_SOURCE / source_name).read_text()
+        require_tokens(
+            source,
+            [
+                "GetHomeOutputDirectory()",
+                "dir == binaryRoot || cmSystemTools::IsSubDirectory(dir, binaryRoot)",
+                "return true;",
+                "GetDirectoryContent(dir)",
+            ],
+            f"WOS CMake mutable build-tree source lookup in {source_name}",
+        )
+
     find_library = (WOS_CMAKE_SOURCE / "cmFindLibraryCommand.cxx").read_text()
     find_program = (WOS_CMAKE_SOURCE / "cmFindProgramCommand.cxx").read_text()
     find_path = (WOS_CMAKE_SOURCE / "cmFindPathCommand.cxx").read_text()
