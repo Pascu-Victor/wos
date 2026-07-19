@@ -16,13 +16,37 @@ wos_setup_ccache
 wos_setup_ccache_cmake_args
 WOS_BUILD_JOBS="$(wos_build_jobs)"
 WOS_NINJA_JOBS="$(wos_ninja_jobs)"
-WOS_LLVM_PARALLEL_LINK_JOBS="${WOS_LLVM_PARALLEL_LINK_JOBS:-$WOS_NINJA_JOBS}"
-case "$WOS_LLVM_PARALLEL_LINK_JOBS" in
-    ''|*[!0-9]*|0)
-        echo "ERROR: WOS_LLVM_PARALLEL_LINK_JOBS must be a positive integer, got '$WOS_LLVM_PARALLEL_LINK_JOBS'" >&2
-        exit 1
-        ;;
-esac
+WOS_CLANG_HOST_SYSTEM="$(uname -s 2>/dev/null || printf unknown)"
+
+# LLVM's cross build launches a nested native-tools Ninja graph.  On WOS that
+# child graph cannot inherit the outer Ninja's explicit -j limit, and using all
+# vCPUs can exhaust kernel memory while several large clang/lld processes are
+# resident.  Keep the self-host defaults conservative while preserving explicit
+# overrides and full parallelism on development hosts.
+if [ -z "${WOS_LLVM_NINJA_JOBS:-}" ]; then
+    WOS_LLVM_NINJA_JOBS="$WOS_NINJA_JOBS"
+    if [ "$WOS_CLANG_HOST_SYSTEM" = "WOS" ] && [ "$WOS_LLVM_NINJA_JOBS" -gt 8 ]; then
+        WOS_LLVM_NINJA_JOBS=8
+    fi
+fi
+if [ -z "${WOS_LLVM_PARALLEL_LINK_JOBS:-}" ]; then
+    WOS_LLVM_PARALLEL_LINK_JOBS="$WOS_LLVM_NINJA_JOBS"
+    if [ "$WOS_CLANG_HOST_SYSTEM" = "WOS" ] && [ "$WOS_LLVM_PARALLEL_LINK_JOBS" -gt 2 ]; then
+        WOS_LLVM_PARALLEL_LINK_JOBS=2
+    fi
+fi
+for jobs_setting in WOS_LLVM_NINJA_JOBS WOS_LLVM_PARALLEL_LINK_JOBS; do
+    jobs_value="${!jobs_setting}"
+    case "$jobs_value" in
+        ''|*[!0-9]*|0)
+            echo "ERROR: $jobs_setting must be a positive integer, got '$jobs_value'" >&2
+            exit 1
+            ;;
+    esac
+done
+
+# CMake's nested native-tools build does not see the outer Ninja -j argument.
+export CMAKE_BUILD_PARALLEL_LEVEL="$WOS_LLVM_NINJA_JOBS"
 
 B="$WORKSPACE_ROOT/toolchain"
 HOST="${WOS_HOST_TOOLCHAIN_ROOT:-$B/host}"
@@ -239,7 +263,7 @@ if [ "${#WOS_LLVM_BIN_OUTPUTS[@]}" -eq 0 ]; then
 fi
 
 wos_timed_step "build" "clang_for_wos" \
-    ninja -C "$CLANG_BUILD" -j"$WOS_NINJA_JOBS" "${WOS_LLVM_BIN_OUTPUTS[@]}"
+    ninja -C "$CLANG_BUILD" -j"$WOS_LLVM_NINJA_JOBS" "${WOS_LLVM_BIN_OUTPUTS[@]}"
 
 should_stage_wos_llvm_tool() {
     local name="$1"

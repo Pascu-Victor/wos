@@ -21,6 +21,21 @@ HOST="${WOS_HOST_TOOLCHAIN_ROOT:-$B/host}"
 TARGET_ARCH="${WOS_TARGET_ARCH:-x86_64-pc-wos}"
 TARGET_SYSROOT="${WOS_SYSROOT_PATH:-$B/sysroot}"
 HOST_SYSTEM="$(uname -s 2>/dev/null || printf unknown)"
+if [ -z "${WOS_TLS_BUILD_JOBS:-}" ]; then
+    WOS_TLS_BUILD_JOBS="$WOS_MAKE_JOBS"
+    # Native WOS can occasionally acknowledge a concurrent compiler output
+    # write while leaving a zero-length object behind.  LibreSSL's build then
+    # archives that object and fails much later with missing SSL symbols.
+    if [ "$HOST_SYSTEM" = "WOS" ]; then
+        WOS_TLS_BUILD_JOBS=1
+    fi
+fi
+case "$WOS_TLS_BUILD_JOBS" in
+    ''|*[!0-9]*|0)
+        echo "ERROR: WOS_TLS_BUILD_JOBS must be a positive integer, got '$WOS_TLS_BUILD_JOBS'" >&2
+        exit 1
+        ;;
+esac
 TLS_BUILD="${WOS_OPENSSL_BUILD_DIR:-$B/openssl-build}"
 TLS_SRC="${WOS_OPENSSL_SOURCE_DIR:-$B/src/openssl}"
 TLS_WORK="$TLS_BUILD/work"
@@ -391,8 +406,8 @@ wos_timed_step "configure" "libressl" \
     --disable-asm
 disable_libressl_man_install
 
-wos_make "$WOS_MAKE_JOBS" -C "$TLS_WORK"
-wos_make "$WOS_MAKE_JOBS" -C "$TLS_WORK" \
+wos_make "$WOS_TLS_BUILD_JOBS" -C "$TLS_WORK"
+wos_make "$WOS_TLS_BUILD_JOBS" -C "$TLS_WORK" \
     prefix= \
     exec_prefix= \
     libdir=/lib \

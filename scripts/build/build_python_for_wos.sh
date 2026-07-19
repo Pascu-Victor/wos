@@ -14,6 +14,13 @@ WOS_CCACHE_PREFIX="$(wos_ccache_prefix)"
 WOS_BUILD_JOBS="$(wos_build_jobs)"
 WOS_MAKE_JOBS="$(wos_make_jobs)"
 WOS_MAKE_JOBSERVER_ARG="$(wos_make_jobserver_arg "$WOS_MAKE_JOBS")"
+WOS_PYTHON_INSTALL_JOBS="${WOS_PYTHON_INSTALL_JOBS:-1}"
+case "$WOS_PYTHON_INSTALL_JOBS" in
+    ''|*[!0-9]*|0)
+        echo "ERROR: WOS_PYTHON_INSTALL_JOBS must be a positive integer, got '$WOS_PYTHON_INSTALL_JOBS'" >&2
+        exit 1
+        ;;
+esac
 
 B="$WORKSPACE_ROOT/toolchain"
 HOST="${WOS_HOST_TOOLCHAIN_ROOT:-$B/host}"
@@ -928,8 +935,8 @@ wos_make "$WOS_MAKE_JOBS" -C "$PYTHON_TARGET_BUILD" \
     STRIP="$TARGET_STRIP" \
     READELF="$TARGET_READELF" \
     python
-echo "Installing target CPython with WOS_MAKE_JOBS=$WOS_MAKE_JOBS..."
-wos_make "$WOS_MAKE_JOBS" -C "$PYTHON_TARGET_BUILD" \
+echo "Installing target CPython with WOS_PYTHON_INSTALL_JOBS=$WOS_PYTHON_INSTALL_JOBS..."
+wos_make "$WOS_PYTHON_INSTALL_JOBS" -C "$PYTHON_TARGET_BUILD" \
     CC="$TARGET_CC" \
     CXX="$TARGET_CXX" \
     AR="$TARGET_AR" \

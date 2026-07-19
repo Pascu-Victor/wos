@@ -14,6 +14,13 @@ wos_setup_ccache
 WOS_CCACHE_PREFIX="$(wos_ccache_prefix)"
 WOS_BUILD_JOBS="$(wos_build_jobs)"
 WOS_MAKE_JOBS="$(wos_make_jobs)"
+WOS_GNU_MAKE_BUILD_JOBS="${WOS_GNU_MAKE_BUILD_JOBS:-1}"
+case "$WOS_GNU_MAKE_BUILD_JOBS" in
+    ''|*[!0-9]*|0)
+        echo "ERROR: WOS_GNU_MAKE_BUILD_JOBS must be a positive integer, got '$WOS_GNU_MAKE_BUILD_JOBS'" >&2
+        exit 1
+        ;;
+esac
 
 B="$WORKSPACE_ROOT/toolchain"
 HOST="${WOS_HOST_TOOLCHAIN_ROOT:-$B/host}"
@@ -205,6 +212,19 @@ refresh_make_build_generated_files() {
     for file in "${generated_files[@]}"; do
         rewrite_file_for_mtime "$build_dir/$file"
     done
+}
+
+patch_make_build_rm_force() {
+    local build_makefile="$1/lib/Makefile"
+
+    require_file "$build_makefile" "GNU make configure did not generate lib/Makefile."
+    if grep -Fq 'rm -f $@-t $@ && \' "$build_makefile"; then
+        sed -i 's/rm -f \$@-t \$@ && \\/rm -f \$@-t \$@ || true; \\/g' "$build_makefile"
+    fi
+    if ! grep -Fq 'rm -f $@-t $@ || true; \' "$build_makefile"; then
+        echo "ERROR: failed to make GNU make generated-header cleanup tolerant of absent files." >&2
+        exit 1
+    fi
 }
 
 write_make_config_site() {
@@ -433,6 +453,7 @@ fi
 
 if [ "$HOST_SYSTEM" = "WOS" ]; then
     refresh_make_build_generated_files "$MAKE_BUILD"
+    patch_make_build_rm_force "$MAKE_BUILD"
 fi
 
 GNU_MAKE_BUILD_ARGS=()
@@ -451,7 +472,7 @@ if [ -f "$MAKE_BUILD/make" ]; then
     done
 fi
 
-wos_make "$WOS_MAKE_JOBS" -C "$MAKE_BUILD" "${GNU_MAKE_BUILD_ARGS[@]}"
+wos_make "$WOS_GNU_MAKE_BUILD_JOBS" -C "$MAKE_BUILD" "${GNU_MAKE_BUILD_ARGS[@]}"
 
 install -m 755 "$MAKE_BUILD/make" "$TARGET_SYSROOT/bin/make"
 ln -sfn make "$TARGET_SYSROOT/bin/gmake"

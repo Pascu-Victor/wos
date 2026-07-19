@@ -810,7 +810,13 @@ def test_gnu_make_port_build_scripts_use_make_job_helper() -> None:
             ['WOS_MAKE_JOBS="$(wos_make_jobs)"'],
             f"{script.relative_to(ROOT)} shared GNU Make job helper",
         )
-        require_tokens(source, ['wos_make "$WOS_MAKE_JOBS"'], f"{script.relative_to(ROOT)} shared GNU Make job helper")
+        if script.name == "build_make.sh":
+            make_jobs = "WOS_GNU_MAKE_BUILD_JOBS"
+        elif script == WOS_TLS_BUILD:
+            make_jobs = "WOS_TLS_BUILD_JOBS"
+        else:
+            make_jobs = "WOS_MAKE_JOBS"
+        require_tokens(source, [f'wos_make "${make_jobs}"'], f"{script.relative_to(ROOT)} shared GNU Make job helper")
         if re.search(r"(?:host_env\s+)?make\b[^\n]*-j\"\$WOS_BUILD_JOBS\"", source):
             fail(f"{script.relative_to(ROOT)} must use WOS_MAKE_JOBS for GNU Make parallelism")
         if re.search(r"\bmake\b(?:(?!WOS_MAKE_JOBSERVER_ARG).)*-j\"\$WOS_MAKE_JOBS\"", source):
@@ -856,8 +862,18 @@ def test_ninja_port_build_scripts_use_ninja_job_helper() -> None:
     require_tokens(
         clang_source,
         [
-            'WOS_LLVM_PARALLEL_LINK_JOBS="${WOS_LLVM_PARALLEL_LINK_JOBS:-$WOS_NINJA_JOBS}"',
-            "WOS_LLVM_PARALLEL_LINK_JOBS must be a positive integer",
+            'WOS_CLANG_HOST_SYSTEM="$(uname -s 2>/dev/null || printf unknown)"',
+            'if [ -z "${WOS_LLVM_NINJA_JOBS:-}" ]; then',
+            'WOS_LLVM_NINJA_JOBS="$WOS_NINJA_JOBS"',
+            '[ "$WOS_LLVM_NINJA_JOBS" -gt 8 ]',
+            "WOS_LLVM_NINJA_JOBS=8",
+            'if [ -z "${WOS_LLVM_PARALLEL_LINK_JOBS:-}" ]; then',
+            'WOS_LLVM_PARALLEL_LINK_JOBS="$WOS_LLVM_NINJA_JOBS"',
+            '[ "$WOS_LLVM_PARALLEL_LINK_JOBS" -gt 2 ]',
+            "WOS_LLVM_PARALLEL_LINK_JOBS=2",
+            'export CMAKE_BUILD_PARALLEL_LEVEL="$WOS_LLVM_NINJA_JOBS"',
+            'ninja -C "$CLANG_BUILD" -j"$WOS_LLVM_NINJA_JOBS"',
+            "$jobs_setting must be a positive integer",
             'wos_timed_step "configure" "clang_for_wos"',
             'wos_timed_step "build" "clang_for_wos"',
             '-DLLVM_PARALLEL_LINK_JOBS="$WOS_LLVM_PARALLEL_LINK_JOBS"',
@@ -917,6 +933,22 @@ def test_wos_port_install_steps_keep_make_parallelism() -> None:
         source = script.read_text()
         if re.search(r'(?m)^\s*(?:if !\s+|yes "" \|\s+)?make\b', source):
             fail(f"{script.relative_to(ROOT)} must use wos_make or host_env make with WOS_MAKE_JOBS")
+
+
+def test_native_wos_libressl_build_avoids_zero_length_parallel_objects() -> None:
+    source = WOS_TLS_BUILD.read_text()
+    require_tokens(
+        source,
+        [
+            'if [ -z "${WOS_TLS_BUILD_JOBS:-}" ]; then',
+            'WOS_TLS_BUILD_JOBS="$WOS_MAKE_JOBS"',
+            'if [ "$HOST_SYSTEM" = "WOS" ]; then',
+            "WOS_TLS_BUILD_JOBS=1",
+            "WOS_TLS_BUILD_JOBS must be a positive integer",
+            'wos_make "$WOS_TLS_BUILD_JOBS" -C "$TLS_WORK"',
+        ],
+        "native WOS LibreSSL serialization",
+    )
 
 
 def test_wos_tar_invocations_use_busybox_compatible_long_options() -> None:
@@ -1000,8 +1032,10 @@ def test_gnu_make_script_handles_native_wos_autoconf_probes() -> None:
             'cp "$path" "$tmp"',
             "refresh_make_release_generated_files()",
             "refresh_make_build_generated_files()",
+            "patch_make_build_rm_force()",
+            "rm -f \\$@-t \\$@ || true;",
             'if [ "$HOST_SYSTEM" = "WOS" ]; then\n    refresh_make_release_generated_files "$MAKE_SOURCE_DIR"\nfi',
-            'if [ "$HOST_SYSTEM" = "WOS" ]; then\n    refresh_make_build_generated_files "$MAKE_BUILD"\nfi',
+            'if [ "$HOST_SYSTEM" = "WOS" ]; then\n    refresh_make_build_generated_files "$MAKE_BUILD"\n    patch_make_build_rm_force "$MAKE_BUILD"\nfi',
             'if [ "$HOST_SYSTEM" = "WOS" ] && { [ ! -x "$MAKE_BUILD/make" ] || [ ! -f "$MAKE_BUILD/config.status" ]; }; then',
             'rm -f "$MAKE_BUILD/Makefile"',
             '[ ! -f "$MAKE_BUILD/config.status" ]',
@@ -1024,7 +1058,8 @@ def test_gnu_make_script_handles_native_wos_autoconf_probes() -> None:
             '"${GNU_MAKE_CONFIGURE_CACHE_ARGS[@]}"',
             "GNU_MAKE_BUILD_ARGS=()",
             "GNU_MAKE_BUILD_ARGS=(MAKEINFO=true)",
-            'wos_make "$WOS_MAKE_JOBS" -C "$MAKE_BUILD" "${GNU_MAKE_BUILD_ARGS[@]}"',
+            'WOS_GNU_MAKE_BUILD_JOBS="${WOS_GNU_MAKE_BUILD_JOBS:-1}"',
+            'wos_make "$WOS_GNU_MAKE_BUILD_JOBS" -C "$MAKE_BUILD" "${GNU_MAKE_BUILD_ARGS[@]}"',
         ],
         "GNU make native WOS Autoconf probe handling",
     )
@@ -1460,8 +1495,9 @@ def test_cpython_install_avoids_sysroot_usr_symlink() -> None:
     require_tokens(
         source,
         [
-            'echo "Installing target CPython with WOS_MAKE_JOBS=$WOS_MAKE_JOBS..."',
-            'wos_make "$WOS_MAKE_JOBS" -C "$PYTHON_TARGET_BUILD" \\',
+            'WOS_PYTHON_INSTALL_JOBS="${WOS_PYTHON_INSTALL_JOBS:-1}"',
+            'echo "Installing target CPython with WOS_PYTHON_INSTALL_JOBS=$WOS_PYTHON_INSTALL_JOBS..."',
+            'wos_make "$WOS_PYTHON_INSTALL_JOBS" -C "$PYTHON_TARGET_BUILD" \\',
             "--prefix=/usr",
             "--exec-prefix=/usr",
             "prefix= \\",
@@ -1544,7 +1580,7 @@ def test_native_wos_clang_port_stages_tablegen_for_next_self_host() -> None:
             'TARGET_C_FLAGS="$TARGET_COMMON_FLAGS $TARGET_C_INCLUDE_FLAGS"',
             'TARGET_CXX_FLAGS="$TARGET_COMMON_FLAGS -std=c++23 -isystem $TARGET_SYSROOT/include/c++/v1 $TARGET_C_INCLUDE_FLAGS"',
             "collect_wos_llvm_bin_outputs()",
-            'ninja -C "$CLANG_BUILD" -j"$WOS_NINJA_JOBS" "${WOS_LLVM_BIN_OUTPUTS[@]}"',
+            'ninja -C "$CLANG_BUILD" -j"$WOS_LLVM_NINJA_JOBS" "${WOS_LLVM_BIN_OUTPUTS[@]}"',
             "install_built_toolset",
             "llvm-symbolizer",
             "llvm-tblgen",
@@ -2040,7 +2076,7 @@ def test_wos_tls_build_is_self_hostable_without_perl() -> None:
             "--disable-tests",
             "--disable-asm",
             "disable_libressl_man_install",
-            "wos_make \"$WOS_MAKE_JOBS\" -C \"$TLS_WORK\"",
+            "wos_make \"$WOS_TLS_BUILD_JOBS\" -C \"$TLS_WORK\"",
             "prefix= \\",
             "exec_prefix= \\",
             "includedir=/include \\",
