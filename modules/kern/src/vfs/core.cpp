@@ -7841,10 +7841,11 @@ auto vfs_open_resolved_for_task(ker::mod::sched::task::Task* task, const char* r
 
     if (f == nullptr) {
         vfs_debug_log("vfs_open: failed to open file\n");
-        log_loader_path_event("open-failed", raw_path, path_buffer.data(), mount, -ENOENT);
+        int const OPEN_RESULT = backend_open_result != -ENOSYS ? backend_open_result : -ENOENT;
+        log_loader_path_event("open-failed", raw_path, path_buffer.data(), mount, OPEN_RESULT);
         vfs_open_store_missing_metadata_result(path_buffer.data(), mount, flags, OPEN_REQUIRE_DIRECTORY, backend_open_result,
                                                path_buffer_len, path_buffer_hash);
-        return -ENOENT;
+        return OPEN_RESULT;
     }
     if ((path_requires_directory || flags_require_directory) && !f->is_directory) {
         vfs_open_store_missing_metadata_result(path_buffer.data(), mount, flags, OPEN_REQUIRE_DIRECTORY, -ENOTDIR, path_buffer_len,

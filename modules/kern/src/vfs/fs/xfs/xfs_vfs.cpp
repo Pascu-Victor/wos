@@ -4358,31 +4358,38 @@ auto xfs_open_path(const char* fs_path, int flags, int mode, XfsMountContext* ct
         if (parent_ret == 0) {
             used_create_lookup = true;
             bool create_lookup_handled = false;
-            if (xfs_dir_name_filter_known_absent(create_parent_ip, create_filename, create_filename_len)) {
-                create_lookup_handled = true;
-                create_missing = true;
-                record_create_lookup(0);
-            } else if (TRUSTED_KNOWN_ABSENT_CREATE) {
-                XfsDirEntry cached_existing{};
-                int cached_lookup_ret = 0;
-                if (xfs_dentry_cache_lookup_parent(ctx, create_parent_ip->ino, create_filename, create_filename_len, &cached_existing,
-                                                   &cached_lookup_ret)) {
+            bool const EXCLUSIVE_CREATE = (flags & O_EXCL_FLAG) != 0;
+            // O_EXCL is an existence assertion, so it must observe the
+            // authoritative directory while metadata mutations are locked.
+            // Negative filters and caches are only safe shortcuts for a
+            // non-exclusive create whose result does not distinguish a race.
+            if (!EXCLUSIVE_CREATE) {
+                if (xfs_dir_name_filter_known_absent(create_parent_ip, create_filename, create_filename_len)) {
                     create_lookup_handled = true;
-                    if (cached_lookup_ret == -ENOENT) {
-                        create_missing = true;
-                        record_create_lookup(0);
-                    } else if (cached_lookup_ret == 0) {
-                        xfs_inode_release(create_parent_ip);
-                        create_parent_ip = nullptr;
-                        record_create_lookup(-EEXIST);
-                        xfs_set_open_result(result_out, -EEXIST);
-                        return nullptr;
-                    } else {
-                        xfs_inode_release(create_parent_ip);
-                        create_parent_ip = nullptr;
-                        record_create_lookup(cached_lookup_ret);
-                        xfs_set_open_result(result_out, cached_lookup_ret);
-                        return nullptr;
+                    create_missing = true;
+                    record_create_lookup(0);
+                } else if (TRUSTED_KNOWN_ABSENT_CREATE) {
+                    XfsDirEntry cached_existing{};
+                    int cached_lookup_ret = 0;
+                    if (xfs_dentry_cache_lookup_parent(ctx, create_parent_ip->ino, create_filename, create_filename_len, &cached_existing,
+                                                       &cached_lookup_ret)) {
+                        create_lookup_handled = true;
+                        if (cached_lookup_ret == -ENOENT) {
+                            create_missing = true;
+                            record_create_lookup(0);
+                        } else if (cached_lookup_ret == 0) {
+                            xfs_inode_release(create_parent_ip);
+                            create_parent_ip = nullptr;
+                            record_create_lookup(-EEXIST);
+                            xfs_set_open_result(result_out, -EEXIST);
+                            return nullptr;
+                        } else {
+                            xfs_inode_release(create_parent_ip);
+                            create_parent_ip = nullptr;
+                            record_create_lookup(cached_lookup_ret);
+                            xfs_set_open_result(result_out, cached_lookup_ret);
+                            return nullptr;
+                        }
                     }
                 }
             }

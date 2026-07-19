@@ -806,6 +806,38 @@ def test_tmpfs_permission_denied_open_runs_close_hook() -> None:
     )
 
 
+def test_open_exclusive_create_reports_existing_paths() -> None:
+    vfs_core = KERNEL_VFS_CORE_CPP.read_text()
+    tmpfs = (ROOT / "modules" / "kern" / "src" / "vfs" / "fs" / "tmpfs.cpp").read_text()
+
+    open_body = function_body(vfs_core, r"auto\s+vfs_open_resolved_for_task\([^{}]*\)\s*->\s*int")
+    require_tokens(
+        open_body,
+        [
+            "int const OPEN_RESULT = backend_open_result != -ENOSYS ? backend_open_result : -ENOENT;",
+            'log_loader_path_event("open-failed", raw_path, path_buffer.data(), mount, OPEN_RESULT);',
+            "return OPEN_RESULT;",
+        ],
+        "backend open errno propagation",
+    )
+
+    tmpfs_open = function_body(
+        tmpfs,
+        r"auto\s+tmpfs_open_path\(TmpNode\*\s+root,\s*const\s+char\*\s+path,\s*int\s+flags,\s*int\s+mode,\s*int\*\s+result_out\)\s*->\s*ker::vfs::File\*",
+    )
+    require_order(
+        tmpfs_open,
+        [
+            "tmpfs_lock.lock();",
+            "node != nullptr && !created_by_open && (flags & (O_CREAT | O_EXCL)) == (O_CREAT | O_EXCL)",
+            "tmpfs_lock.unlock();",
+            "tmpfs_set_open_result(result_out, -EEXIST);",
+            "TmpNode* file_node = tmpfs_canonical_node(node);",
+        ],
+        "tmpfs atomic exclusive create",
+    )
+
+
 if __name__ == "__main__":
     test_kernel_dirent_types_match_mlibc_public_abi()
     test_git_helper_pipe_cloexec_support_is_preserved_by_mlibc()
@@ -821,4 +853,5 @@ if __name__ == "__main__":
     test_metadata_cache_store_uses_pre_backend_stat_generation()
     test_open_create_uses_central_cache_notify_path()
     test_tmpfs_permission_denied_open_runs_close_hook()
+    test_open_exclusive_create_reports_existing_paths()
     print("WOS mlibc VFS source invariants hold")

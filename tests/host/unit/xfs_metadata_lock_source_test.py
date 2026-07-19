@@ -186,6 +186,8 @@ def test_known_absent_create_hint_requires_xfs_proof() -> None:
         open_body,
         [
             "bool const TRUSTED_KNOWN_ABSENT_CREATE",
+            "bool const EXCLUSIVE_CREATE",
+            "if (!EXCLUSIVE_CREATE)",
             "xfs_dir_name_filter_known_absent(",
             "else if (TRUSTED_KNOWN_ABSENT_CREATE)",
             "xfs_dentry_cache_lookup_parent(",
@@ -194,7 +196,7 @@ def test_known_absent_create_hint_requires_xfs_proof() -> None:
             "xfs_dir_lookup(create_parent_ip, create_filename, create_filename_len, &existing)",
             "create_missing = true;",
         ],
-        "XFS must revalidate the VFS hint under its metadata lock before preserving O_EXCL semantics",
+        "XFS must bypass absence shortcuts and revalidate O_EXCL under its metadata lock",
     )
 
 

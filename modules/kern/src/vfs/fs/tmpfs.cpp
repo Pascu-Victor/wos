@@ -63,6 +63,7 @@ constexpr size_t DEFAULT_TMPFS_BLOCK_SIZE = 4096;
 static_assert(DEFAULT_TMPFS_BLOCK_SIZE == ker::mod::mm::paging::PAGE_SIZE);
 constexpr size_t INITIAL_CHILDREN_CAPACITY = 8;
 constexpr int O_CREAT = 0100;  // octal = 64 decimal = 0x40 hex
+constexpr int O_EXCL = 0200;
 constexpr uint64_t TMPFS_MIN_FREE_RESERVE_BYTES = 16ULL * 1024ULL * 1024ULL;
 constexpr uint64_t TMPFS_MAX_FREE_RESERVE_BYTES = 256ULL * 1024ULL * 1024ULL;
 constexpr uint64_t TMPFS_FREE_RESERVE_DIVISOR = 8;
@@ -1118,6 +1119,11 @@ auto tmpfs_open_path(TmpNode* root, const char* path, int flags, int mode, int* 
                 created_by_open = node != nullptr;
             }
         }
+    }
+    if (node != nullptr && !created_by_open && (flags & (O_CREAT | O_EXCL)) == (O_CREAT | O_EXCL)) {
+        tmpfs_lock.unlock();
+        tmpfs_set_open_result(result_out, -EEXIST);
+        return nullptr;
     }
     TmpNode* file_node = tmpfs_canonical_node(node);
     if (file_node != nullptr) {
