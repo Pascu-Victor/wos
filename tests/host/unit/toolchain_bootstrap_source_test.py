@@ -16,6 +16,7 @@ WOS_TOOLCHAIN = ROOT / "tools" / "wos-toolchain.sh"
 WOS_LIBCXX_BUILD = ROOT / "scripts" / "build" / "build_libcxx_for_wos.sh"
 WOS_CLANG_BUILD = ROOT / "scripts" / "build" / "build_clang_for_wos.sh"
 WOS_BUSYBOX_BUILD = ROOT / "scripts" / "build" / "build_busybox.sh"
+WOS_BUSYBOX_CONFIG = ROOT / "configs" / "busybox" / "wos_full.config"
 WOS_CMAKE_BUILD = ROOT / "scripts" / "build" / "build_cmake_for_wos.sh"
 WOS_CURL_BUILD = ROOT / "scripts" / "build" / "build_curl_for_wos.sh"
 WOS_DROPBEAR_BUILD = ROOT / "scripts" / "build" / "build_dropbear.sh"
@@ -1656,6 +1657,19 @@ def test_busybox_and_dropbear_scripts_honor_host_toolchain_override() -> None:
             '--host="$TARGET_ARCH"',
         ],
         "Dropbear WOS build script host-toolchain override",
+    )
+
+
+def test_busybox_less_honors_git_raw_color_pager_options() -> None:
+    require_tokens(
+        WOS_BUSYBOX_CONFIG.read_text(),
+        [
+            "CONFIG_LESS=y",
+            "CONFIG_FEATURE_LESS_DASHCMD=y",
+            "CONFIG_FEATURE_LESS_RAW=y",
+            "CONFIG_FEATURE_LESS_ENV=y",
+        ],
+        "BusyBox less Git color pager support",
     )
 
 
