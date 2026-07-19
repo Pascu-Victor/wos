@@ -106,10 +106,18 @@ def main() -> None:
         function_body(source, "kernel_vmap_free"),
         [
             "queue_kernel_vmap_free(FIRST_PAGE, PAGE_COUNT)",
+            "drain_kernel_vmap_frees_if_over_limit()",
+        ],
+        "vmap free must request a context-gated warm-pool drain",
+    )
+
+    require_order(
+        function_body(source, "drain_kernel_vmap_frees_if_over_limit"),
+        [
             "kernel_vmap_warm_pool_over_limit()",
             "drain_kernel_vmap_frees()",
         ],
-        "vmap free must bound cached mappings through the context-gated drainer",
+        "safe callers must be able to enforce the vmap warm-pool cap after unlocking",
     )
 
     require_order(

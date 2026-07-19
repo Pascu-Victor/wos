@@ -552,6 +552,12 @@ void drain_deferred_data_buffer_frees() {
 #endif
 }
 
+void drain_deferred_data_buffer_frees_if_over_limit() {
+#ifndef WOS_HOST_TEST
+    ker::mod::mm::virt::drain_kernel_vmap_frees_if_over_limit();
+#endif
+}
+
 void free_buffer_data(BufHead* bh) {
     if (bh == nullptr || bh->data == nullptr) {
         return;
@@ -2794,6 +2800,7 @@ auto bread(dev::BlockDevice* bdev, uint64_t block_no, BufferReadClass read_class
 
     evict_lru_for_allocation(bdev->block_size);
     cache_lock.unlock_irqrestore(irqflags);
+    drain_deferred_data_buffer_frees_if_over_limit();
 
     uint64_t const PERF_ALLOC_STARTED_US = perf_xfs_started_us(ker::mod::perf::WkiPerfLocalXfsOp::BUF_ALLOC);
     bh = alloc_detached_buffer(bdev, block_no);
@@ -2838,6 +2845,7 @@ auto bread(dev::BlockDevice* bdev, uint64_t block_no, BufferReadClass read_class
 
     insert_allocated_buffer_locked(bh);
     cache_lock.unlock_irqrestore(irqflags);
+    drain_deferred_data_buffer_frees_if_over_limit();
 
     return bh;
 }
@@ -2879,6 +2887,7 @@ auto bread_multi(dev::BlockDevice* bdev, uint64_t block_no, size_t count, Buffer
     stat_misses++;
     evict_lru_for_allocation(total_size);
     cache_lock.unlock_irqrestore(irqflags);
+    drain_deferred_data_buffer_frees_if_over_limit();
 
     uint64_t const PERF_ALLOC_STARTED_US = perf_xfs_started_us(ker::mod::perf::WkiPerfLocalXfsOp::BUF_ALLOC);
     bh = alloc_detached_buffer_with_size(bdev, block_no, total_size, 0);
@@ -2922,6 +2931,7 @@ auto bread_multi(dev::BlockDevice* bdev, uint64_t block_no, size_t count, Buffer
 
     insert_allocated_buffer_locked(bh);
     cache_lock.unlock_irqrestore(irqflags);
+    drain_deferred_data_buffer_frees_if_over_limit();
 
     return bh;
 }
@@ -3020,6 +3030,7 @@ auto bget_impl(dev::BlockDevice* bdev, uint64_t block_no) -> BufHead* {
     // Not cached - allocate a new buffer and insert without reading.
     evict_lru_for_allocation(bdev->block_size);
     cache_lock.unlock_irqrestore(irqflags);
+    drain_deferred_data_buffer_frees_if_over_limit();
 
     uint64_t const PERF_ALLOC_STARTED_US = perf_xfs_started_us(ker::mod::perf::WkiPerfLocalXfsOp::BUF_ALLOC);
     bh = alloc_detached_buffer(bdev, block_no);
@@ -3046,6 +3057,7 @@ auto bget_impl(dev::BlockDevice* bdev, uint64_t block_no) -> BufHead* {
 
     insert_allocated_buffer_locked(bh);
     cache_lock.unlock_irqrestore(irqflags);
+    drain_deferred_data_buffer_frees_if_over_limit();
     if (PERF_ALLOC_STARTED_US != 0) {
         ker::mod::perf::record_local_xfs_summary(ker::mod::perf::WkiPerfLocalXfsOp::BUF_ALLOC, 0, PERF_ALLOC_US, true, bdev->block_size);
     }
@@ -3085,6 +3097,7 @@ auto bget_multi_impl(dev::BlockDevice* bdev, uint64_t block_no, size_t count) ->
 
     evict_lru_for_allocation(total_size);
     cache_lock.unlock_irqrestore(irqflags);
+    drain_deferred_data_buffer_frees_if_over_limit();
 
     uint64_t const PERF_ALLOC_STARTED_US = perf_xfs_started_us(ker::mod::perf::WkiPerfLocalXfsOp::BUF_ALLOC);
     bh = alloc_detached_buffer_with_size(bdev, block_no, total_size, BH_VALID);
@@ -3108,6 +3121,7 @@ auto bget_multi_impl(dev::BlockDevice* bdev, uint64_t block_no, size_t count) ->
 
     insert_allocated_buffer_locked(bh);
     cache_lock.unlock_irqrestore(irqflags);
+    drain_deferred_data_buffer_frees_if_over_limit();
     if (PERF_ALLOC_STARTED_US != 0) {
         ker::mod::perf::record_local_xfs_summary(ker::mod::perf::WkiPerfLocalXfsOp::BUF_ALLOC, 0, PERF_ALLOC_US, true, total_size);
     }

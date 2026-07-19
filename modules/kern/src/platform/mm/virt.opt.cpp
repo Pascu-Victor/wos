@@ -2982,6 +2982,12 @@ void drain_kernel_vmap_frees() {
     }
 }
 
+void drain_kernel_vmap_frees_if_over_limit() {
+    if (kernel_vmap_warm_pool_over_limit()) {
+        drain_kernel_vmap_frees();
+    }
+}
+
 auto kernel_vmap_contains(const void* ptr) -> bool {
     if (!kernel_vmap_initialized || ptr == nullptr) {
         return false;
@@ -3057,9 +3063,7 @@ void kernel_vmap_free(void* ptr, uint64_t size) {
     // it must not retain the multi-gigabyte high-water mark of parallel native
     // builds. drain_kernel_vmap_frees() is a no-op in IRQ-disabled or
     // non-preemptible contexts, preserving the deferred-free lock invariant.
-    if (kernel_vmap_warm_pool_over_limit()) {
-        drain_kernel_vmap_frees();
-    }
+    drain_kernel_vmap_frees_if_over_limit();
 }
 
 void map_range(PageTable* page_table, Range range, uint64_t flags, uint64_t offset) {

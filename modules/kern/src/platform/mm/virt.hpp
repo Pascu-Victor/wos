@@ -130,6 +130,9 @@ void kernel_vmap_free(void* ptr, uint64_t size);
 // Complete frees deferred by IRQ-disabled callers. Safe contexts may call this
 // opportunistically; it is a no-op while IRQs or preemption are disabled.
 void drain_kernel_vmap_frees();
+// Drain only when deferred mappings have reached the warm-pool cap. Callers
+// that queue frees under an IRQ lock should retry this after releasing it.
+void drain_kernel_vmap_frees_if_over_limit();
 PageTable* create_pagemap();
 void release_pagemap(PageTable* pagemap);
 void get_page_table_pool_stats_snapshot(PageTablePoolStatsSnapshot& out);

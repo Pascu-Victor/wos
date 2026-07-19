@@ -146,6 +146,13 @@ def main() -> None:
         "buffer data free must match virtual, page, and heap backing",
     )
 
+    conditional_drain_body = function_body(source, "drain_deferred_data_buffer_frees_if_over_limit")
+    require(
+        conditional_drain_body,
+        "ker::mod::mm::virt::drain_kernel_vmap_frees_if_over_limit()",
+        "buffer cache must expose a safe post-lock warm-pool drain",
+    )
+
     snapshot_body = function_body(source, "make_writeback_run_snapshot")
     require_order(
         snapshot_body,
@@ -334,13 +341,16 @@ def main() -> None:
             [
                 f"evict_lru_for_allocation({size_token})",
                 "cache_lock.unlock_irqrestore(irqflags)",
+                "drain_deferred_data_buffer_frees_if_over_limit()",
                 allocator,
                 "irqflags = cache_lock.lock_irqsave()",
                 "BufHead* existing = hash_lookup",
                 "free_detached_buffer(bh)",
                 "insert_allocated_buffer_locked(bh)",
+                "cache_lock.unlock_irqrestore(irqflags)",
+                "drain_deferred_data_buffer_frees_if_over_limit()",
             ],
-            f"{name} cold miss must allocate detached and recheck before insert",
+            f"{name} cold miss must enforce the vmap cap outside the cache lock",
         )
 
     xfs_span_body = function_body(xfs_mount, "xfs_device_block_span")
