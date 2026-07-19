@@ -35,6 +35,7 @@
 #include <platform/smt/smt.hpp>
 #include <platform/sys/usercopy.hpp>
 #include <string_view>
+#include <syscalls_impl/process/exec.hpp>
 #include <util/errno_name.hpp>
 #include <util/hcf.hpp>
 #include <util/smallvec.hpp>
@@ -73,6 +74,7 @@ static_assert(WKI_COMPUTE_RX_PAYLOAD_MAX <= WKI_ETH_MAX_PAYLOAD);
 constexpr size_t WKI_SUBMITTED_TASK_INDEX_BUCKETS = 1024;
 static_assert((WKI_SUBMITTED_TASK_INDEX_BUCKETS & (WKI_SUBMITTED_TASK_INDEX_BUCKETS - 1)) == 0);
 constexpr uint64_t WKI_TASK_SUBMIT_VFS_TIMEOUT_US = 60'000'000;  // Remote binary fetch + launch.
+constexpr size_t WKI_FILE_BACKED_ELF_MIN_SIZE = static_cast<size_t>(8) * 1024 * 1024;
 constexpr uint64_t WKI_TASK_SUBMIT_INLINE_RECEIVER_TIMEOUT_US = WKI_OP_TIMEOUT_US - 1'000'000;
 constexpr uint64_t WKI_TASK_SUBMIT_VFS_RECEIVER_TIMEOUT_US = WKI_TASK_SUBMIT_VFS_TIMEOUT_US - 5'000'000;
 static_assert(WKI_TASK_SUBMIT_INLINE_RECEIVER_TIMEOUT_US > 0);
@@ -1346,6 +1348,11 @@ void cleanup_proxy_resources(ker::mod::sched::task::Task* task) {
         task->elf_buffer = nullptr;
         task->elf_buffer_size = 0;
     }
+    if (task->exec_image_file != nullptr) {
+        ker::vfs::vfs_put_file(task->exec_image_file);
+        task->exec_image_file = nullptr;
+        task->exec_image_size = 0;
+    }
 }
 
 void write_proxy_output(ker::mod::sched::task::Task* proxy, const uint8_t* output_data, uint16_t output_len, uint32_t task_id) {
@@ -2150,7 +2157,7 @@ auto wki_try_remote_spawn(ker::mod::sched::task::Task* task, const WkiRemoteSpaw
     }
 
     const bool HAS_EXE_PATH = task->exe_path.front() != '\0';
-    const bool HAS_INLINE_BINARY = task->elf_buffer != nullptr && task->elf_buffer_size != 0;
+    const bool HAS_INLINE_BINARY = task->elf_buffer_complete && task->elf_buffer != nullptr && task->elf_buffer_size != 0;
     if (!HAS_EXE_PATH && !HAS_INLINE_BINARY) {
         log_spawn_diag(task, WkiRemoteSpawnResult::LOCAL, "no-exec-context");
         return WkiRemoteSpawnResult::LOCAL;
@@ -2488,6 +2495,12 @@ auto wki_try_remote_spawn(ker::mod::sched::task::Task* task, const WkiRemoteSpaw
     }
     task->elf_buffer = nullptr;
     task->elf_buffer_size = 0;
+    task->elf_buffer_complete = true;
+    if (task->exec_image_file != nullptr) {
+        ker::vfs::vfs_put_file(task->exec_image_file);
+        task->exec_image_file = nullptr;
+        task->exec_image_size = 0;
+    }
     if (!NEEDS_PROXY_PUBLICATION) {
         task->wki_proxy_task_id = tid;
         task->wki_proxy_task = true;
@@ -4771,6 +4784,54 @@ struct ExecResult {
     TaskRejectReason reject_reason = TaskRejectReason::FETCH_FAILED;
 };
 
+auto finish_remote_exec_task(ker::mod::sched::task::Task* new_task) -> ExecResult {
+    ExecResult result;
+    if (new_task == nullptr) {
+        result.reject_reason = TaskRejectReason::NO_MEM;
+        return result;
+    }
+
+    // Set up stdin as /dev/null (EOF on read)
+    {
+        auto* stdin_file = new ker::vfs::File();  // NOLINT(cppcoreguidelines-owning-memory)
+        stdin_file->fd = 0;
+        stdin_file->private_data = nullptr;
+        stdin_file->fops = &g_stdin_null_fops;
+        stdin_file->pos = 0;
+        stdin_file->is_directory = false;
+        stdin_file->fs_type = ker::vfs::FSType::DEVFS;
+        stdin_file->refcount = 1;
+        stdin_file->open_flags = 0;
+        stdin_file->fd_flags = 0;
+        stdin_file->vfs_path = nullptr;
+        stdin_file->dir_fs_count = 0;
+        (void)new_task->fd_table.insert(0, stdin_file);
+    }
+
+    // D19: Set up stdout/stderr capture
+    auto* output_cap = new TaskOutputCapture();
+    for (unsigned fd_idx = 1; fd_idx <= 2; fd_idx++) {
+        auto* capture_file = new ker::vfs::File();  // NOLINT(cppcoreguidelines-owning-memory)
+        capture_file->fd = static_cast<int>(fd_idx);
+        capture_file->private_data = output_cap;
+        capture_file->fops = &g_capture_fops;
+        capture_file->pos = 0;
+        capture_file->is_directory = false;
+        capture_file->fs_type = ker::vfs::FSType::DEVFS;
+        capture_file->refcount = 1;
+        capture_file->open_flags = 1;
+        capture_file->fd_flags = 0;
+        capture_file->vfs_path = nullptr;
+        capture_file->dir_fs_count = 0;
+        (void)new_task->fd_table.insert(fd_idx, capture_file);
+    }
+
+    // Caller prepares argv/envp/cwd before scheduler publication.
+    result.task = new_task;
+    result.output = output_cap;
+    return result;
+}
+
 auto exec_elf_buffer(uint8_t* elf_buffer, uint32_t binary_len, bool shared_elf_buffer) -> ExecResult {
     ExecResult result;
 
@@ -4835,46 +4896,21 @@ auto exec_elf_buffer(uint8_t* elf_buffer, uint32_t binary_len, bool shared_elf_b
         return result;
     }
 
-    // Set up stdin as /dev/null (EOF on read)
-    {
-        auto* stdin_file = new ker::vfs::File();  // NOLINT(cppcoreguidelines-owning-memory)
-        stdin_file->fd = 0;
-        stdin_file->private_data = nullptr;
-        stdin_file->fops = &g_stdin_null_fops;
-        stdin_file->pos = 0;
-        stdin_file->is_directory = false;
-        stdin_file->fs_type = ker::vfs::FSType::DEVFS;
-        stdin_file->refcount = 1;
-        stdin_file->open_flags = 0;
-        stdin_file->fd_flags = 0;
-        stdin_file->vfs_path = nullptr;
-        stdin_file->dir_fs_count = 0;
-        (void)new_task->fd_table.insert(0, stdin_file);
+    return finish_remote_exec_task(new_task);
+}
+
+auto exec_elf_file(ker::vfs::File* owned_file, uint32_t binary_len, const ker::vfs::Stat& file_stat) -> ExecResult {
+    auto stack_base = reinterpret_cast<uint64_t>(ker::mod::mm::phys::page_alloc(ker::mod::mm::KERNEL_STACK_SIZE));
+    if (stack_base == 0) {
+        ker::vfs::vfs_put_file(owned_file);
+        ExecResult result;
+        result.reject_reason = TaskRejectReason::NO_MEM;
+        return result;
     }
 
-    // D19: Set up stdout/stderr capture
-    auto* output_cap = new TaskOutputCapture();
-    for (unsigned fd_idx = 1; fd_idx <= 2; fd_idx++) {
-        auto* capture_file = new ker::vfs::File();  // NOLINT(cppcoreguidelines-owning-memory)
-        capture_file->fd = static_cast<int>(fd_idx);
-        capture_file->private_data = output_cap;
-        capture_file->fops = &g_capture_fops;
-        capture_file->pos = 0;
-        capture_file->is_directory = false;
-        capture_file->fs_type = ker::vfs::FSType::DEVFS;
-        capture_file->refcount = 1;
-        capture_file->open_flags = 1;
-        capture_file->fd_flags = 0;
-        capture_file->vfs_path = nullptr;
-        capture_file->dir_fs_count = 0;
-        (void)new_task->fd_table.insert(fd_idx, capture_file);
-    }
-
-    // Note: Caller is responsible for calling post_task_balanced() after
-    // setting up argv/envp/cwd on the user stack.
-    result.task = new_task;
-    result.output = output_cap;
-    return result;
+    auto* task = ker::syscall::process::create_file_backed_process_task("wki-remote", owned_file, binary_len, file_stat,
+                                                                        stack_base + ker::mod::mm::KERNEL_STACK_SIZE);
+    return finish_remote_exec_task(task);
 }
 
 // ---------------------------------------------------------------------------
@@ -4883,7 +4919,9 @@ auto exec_elf_buffer(uint8_t* elf_buffer, uint32_t binary_len, bool shared_elf_b
 
 struct VfsLoadResult {
     uint8_t* buffer = nullptr;
+    ker::vfs::File* file = nullptr;
     uint32_t size = 0;
+    ker::vfs::Stat file_stat = {};
     TaskRejectReason reject_reason = TaskRejectReason::FETCH_FAILED;
     bool shared = false;
 };
@@ -4959,6 +4997,57 @@ auto load_elf_from_vfs_path(const char* path, uint16_t submitter_node, uint32_t 
                                                                                equivalent_local_path.size(), &equivalent_local_stat)) {
         resolved_path = equivalent_local_path.data();
         statbuf = equivalent_local_stat;
+    }
+
+    // A complete large executable buffer recreates the same high-order buddy
+    // allocation that local exec avoids. Keep the opened file instead; the
+    // receiver will read bounded ELF metadata now and fault immutable PT_LOAD
+    // pages from this retained handle on demand.
+    if (std::cmp_greater_equal(statbuf.st_size, WKI_FILE_BACKED_ELF_MIN_SIZE)) {
+        int open_flags = ker::vfs::O_NOTIFY_CACHE_CHANGE;
+        if (using_disconnected_host_fallback) {
+            open_flags |= ker::vfs::O_LOCAL;
+        }
+        int const FD = ker::vfs::vfs_open(resolved_path, open_flags, 0);
+        if (FD < 0) {
+            result.reject_reason = TaskRejectReason::BINARY_NOT_FOUND;
+            load_measure.finish(perf_compute_reject_status(result.reject_reason));
+            return result;
+        }
+
+        auto* const CURRENT_TASK = ker::mod::sched::get_current_task();
+        result.file = ker::vfs::vfs_get_file_retain(CURRENT_TASK, FD);
+        ker::vfs::vfs_close(FD);
+        if (result.file == nullptr || !request_is_current()) {
+            if (result.file != nullptr) {
+                ker::vfs::vfs_put_file(result.file);
+                result.file = nullptr;
+            }
+            result.reject_reason = TaskRejectReason::OVERLOADED;
+            load_measure.finish(perf_compute_reject_status(result.reject_reason));
+            return result;
+        }
+
+        if (!ker::syscall::process::supports_file_backed_process(result.file, static_cast<size_t>(statbuf.st_size))) {
+            ker::vfs::vfs_put_file(result.file);
+            result.file = nullptr;
+        } else {
+            ker::vfs::Stat post_open_stat = {};
+            if (ker::vfs::vfs_stat(resolved_path, &post_open_stat) != 0 || !shared_elf_freshness_matches(statbuf, post_open_stat)) {
+                ker::vfs::vfs_put_file(result.file);
+                result.file = nullptr;
+                result.reject_reason = TaskRejectReason::FETCH_FAILED;
+                load_measure.finish(perf_compute_reject_status(result.reject_reason));
+                return result;
+            }
+
+            result.size = static_cast<uint32_t>(statbuf.st_size);
+            result.file_stat = statbuf;
+            result.reject_reason = TaskRejectReason::ACCEPTED;
+            result.shared = false;
+            load_measure.finish(0, result.size);
+            return result;
+        }
     }
 
     // The I/O path may switch to a disconnected-host fallback during retry.
@@ -5304,6 +5393,8 @@ void handle_task_submit_work(uint16_t src_node, const uint8_t* payload, uint16_t
     auto var_len = static_cast<uint16_t>(payload_len - sizeof(TaskSubmitPayload));
 
     uint8_t* elf_buffer = nullptr;
+    ker::vfs::File* elf_file = nullptr;
+    ker::vfs::Stat elf_file_stat = {};
     uint32_t binary_len = 0;
     TaskRejectReason reject_reason = TaskRejectReason::ACCEPTED;
     bool elf_buffer_shared = false;
@@ -5313,6 +5404,15 @@ void handle_task_submit_work(uint16_t src_node, const uint8_t* payload, uint16_t
     WkiTaskIdentityContext submitted_identity = {};
     bool has_submitted_identity = false;
     std::strncpy(exe_path_buf.data(), "wki-remote", exe_path_buf.size() - 1);
+
+    auto release_elf_source = [&]() {
+        release_loaded_elf_buffer(elf_buffer, elf_buffer_shared);
+        elf_buffer = nullptr;
+        if (elf_file != nullptr) {
+            ker::vfs::vfs_put_file(elf_file);
+            elf_file = nullptr;
+        }
+    };
 
     auto send_submit_response = [&](MsgType type, const TaskResponsePayload& response) -> int {
         return wki_send_on_channel_generation(src_node, session.rx_channel, session.rx_channel_generation, type, &response,
@@ -5390,13 +5490,15 @@ void handle_task_submit_work(uint16_t src_node, const uint8_t* payload, uint16_t
             *std::next(path_buf.begin(), static_cast<ptrdiff_t>(copy_len)) = '\0';
 
             auto vfs_result = load_elf_from_vfs_path(path_buf.data(), hdr->src_node, submit->task_id, session, deadline_us);
-            if (vfs_result.buffer == nullptr) {
+            if (vfs_result.buffer == nullptr && vfs_result.file == nullptr) {
                 ker::mod::dbg::log("[WKI] Task submit VFS_REF load failed: task_id=%u path='%s' reason=%u", submit->task_id,
                                    path_buf.data(), static_cast<uint8_t>(vfs_result.reject_reason));
                 reject_reason = vfs_result.reject_reason;
                 break;
             }
             elf_buffer = vfs_result.buffer;
+            elf_file = vfs_result.file;
+            elf_file_stat = vfs_result.file_stat;
             binary_len = vfs_result.size;
             elf_buffer_shared = vfs_result.shared;
             std::strncpy(exe_path_buf.data(), path_buf.data(), exe_path_buf.size() - 1);
@@ -5439,13 +5541,15 @@ void handle_task_submit_work(uint16_t src_node, const uint8_t* payload, uint16_t
             // Construct full path: "/remote_<node>_<resource>/<ref_path>" or just try ref_path.
             // For simplicity: try the path as-is first (works if already mounted at that path).
             auto vfs_result = load_elf_from_vfs_path(ref_path.data(), hdr->src_node, submit->task_id, session, deadline_us);
-            if (vfs_result.buffer == nullptr) {
+            if (vfs_result.buffer == nullptr && vfs_result.file == nullptr) {
                 ker::mod::dbg::log("[WKI] RESOURCE_REF: failed to load node=0x%04x res=%u path='%s'", ref_node, ref_resource,
                                    ref_path.data());
                 reject_reason = TaskRejectReason::FETCH_FAILED;
                 break;
             }
             elf_buffer = vfs_result.buffer;
+            elf_file = vfs_result.file;
+            elf_file_stat = vfs_result.file_stat;
             binary_len = vfs_result.size;
             elf_buffer_shared = vfs_result.shared;
             std::strncpy(exe_path_buf.data(), ref_path.data(), exe_path_buf.size() - 1);
@@ -5467,7 +5571,7 @@ void handle_task_submit_work(uint16_t src_node, const uint8_t* payload, uint16_t
     int32_t const LOAD_CANCEL_SIGNAL = take_cancelled_task_submit_locked(session, submit->task_id);
     s_compute_lock.unlock();
     if (LOAD_CANCEL_SIGNAL != 0) {
-        release_loaded_elf_buffer(elf_buffer, elf_buffer_shared);
+        release_elf_source();
         TaskResponsePayload reject = {};
         reject.task_id = submit->task_id;
         reject.status = static_cast<uint8_t>(TaskRejectReason::OVERLOADED);
@@ -5501,8 +5605,8 @@ void handle_task_submit_work(uint16_t src_node, const uint8_t* payload, uint16_t
     }
 
     // If binary loading failed, reject
-    if (elf_buffer == nullptr || reject_reason != TaskRejectReason::ACCEPTED) {
-        release_loaded_elf_buffer(elf_buffer, elf_buffer_shared);
+    if ((elf_buffer == nullptr && elf_file == nullptr) || reject_reason != TaskRejectReason::ACCEPTED) {
+        release_elf_source();
         TaskResponsePayload reject = {};
         reject.task_id = submit->task_id;
         reject.status = static_cast<uint8_t>(reject_reason);
@@ -5525,7 +5629,7 @@ void handle_task_submit_work(uint16_t src_node, const uint8_t* payload, uint16_t
     ScopedSubmitVfsIdentity submit_vfs_identity(current_task, has_submitted_identity ? &submitted_identity : nullptr,
                                                 effective_submitter_hostname, policy_cursor, policy_len);
     if (!submit_vfs_identity.policy_valid()) {
-        release_loaded_elf_buffer(elf_buffer, elf_buffer_shared);
+        release_elf_source();
         TaskResponsePayload reject = {};
         reject.task_id = submit->task_id;
         reject.status = static_cast<uint8_t>(TaskRejectReason::FETCH_FAILED);
@@ -5535,7 +5639,10 @@ void handle_task_submit_work(uint16_t src_node, const uint8_t* payload, uint16_t
         handle_measure.finish(perf_compute_reject_status(TaskRejectReason::FETCH_FAILED), binary_len);
         return;
     }
-    ExecResult const EXEC = exec_elf_buffer(elf_buffer, binary_len, elf_buffer_shared);
+    ExecResult const EXEC = elf_file != nullptr ? exec_elf_file(elf_file, binary_len, elf_file_stat)
+                                                : exec_elf_buffer(elf_buffer, binary_len, elf_buffer_shared);
+    elf_file = nullptr;
+    elf_buffer = nullptr;
     if (EXEC.task == nullptr) {
         auto exec_reason = EXEC.reject_reason;
         if (exec_reason == TaskRejectReason::ACCEPTED) {

@@ -22,6 +22,11 @@ namespace ker::vfs {
 struct File;
 }  // namespace ker::vfs
 
+namespace ker::loader::elf {
+struct ElfFileView;
+struct ElfLoadOptions;
+}  // namespace ker::loader::elf
+
 namespace ker::mod::sched::task {
 
 enum class WkiVfsRoute : uint8_t {
@@ -225,6 +230,7 @@ struct Task {
     auto operator=(const Task&) -> Task& = delete;
     auto operator=(Task&&) -> Task& = delete;
     Task(const char* name, uint64_t elf_start, uint64_t kernel_rsp, TaskType type);
+    auto initialize_process_image(const ker::loader::elf::ElfFileView& elf, const ker::loader::elf::ElfLoadOptions& options) -> bool;
 
     // Factory for kernel threads (DAEMON tasks).
     // entryFunc: [[noreturn]] void func() - the kernel thread body.
@@ -301,6 +307,11 @@ struct Task {
     // ELF buffer for cleanup and auxv metadata.
     uint8_t* elf_buffer{};
     size_t elf_buffer_size{};
+    // Large dynamic executables retain the opened file instead of a
+    // contiguous full-file buffer. elf_buffer then contains only bounded ELF
+    // header/program-header metadata for ptrace and procfs.
+    ker::vfs::File* exec_image_file{};
+    uint64_t exec_image_size{};
     uint64_t program_header_addr{};  // Virtual address of program headers (AT_PHDR)
     uint64_t elf_header_addr{};      // Virtual address of ELF header (AT_EHDR)
     uint64_t interp_base = 0;        // Load base of dynamic linker (AT_BASE), 0 if statically linked
@@ -553,6 +564,7 @@ struct Task {
     bool domain_hard = false;
     bool has_run{};                     // True once the task has run at least once
     bool is_elf_buffer_shared = false;  // True if buffer is from shared cache, don't delete[]
+    bool elf_buffer_complete = true;    // False when elf_buffer is bounded metadata only
 
     // True when this Task is a userspace thread (shares pagemap with owning process).
     // Thread exits must NOT free the pagemap or close shared FDs.

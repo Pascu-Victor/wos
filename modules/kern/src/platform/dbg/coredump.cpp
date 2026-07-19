@@ -1,5 +1,6 @@
 #include "coredump.hpp"
 
+#include <bits/off_t.h>
 #include <bits/ssize_t.h>
 
 #include <algorithm>
@@ -374,6 +375,8 @@ struct CoreDumpRequest {
     uint8_t* elf_buffer;  // stolen from task->elf_buffer; retained after write to avoid allocator re-entry during crash handling
     size_t elf_buffer_size;
     bool elf_buffer_shared;
+    ker::vfs::File* exec_image_file;  // stolen retained reference for file-backed executable streaming
+    uint64_t exec_image_size;
     uint64_t user_rsp;
     std::array<PinnedCoreDumpPage, MAX_PINNED_USER_PAGES> pinned_pages{};
     size_t pinned_page_count = 0;
@@ -559,6 +562,11 @@ void perform_coredump(const CoreDumpRequest& req);
                 }
                 req.elf_buffer = nullptr;
             }
+            if (req.exec_image_file != nullptr) {
+                ker::vfs::vfs_put_file(req.exec_image_file);
+                req.exec_image_file = nullptr;
+                req.exec_image_size = 0;
+            }
 
             // Release the refcount acquired at exception time.
             // GC was blocked from reclaiming the task (and its pagemap) while rc > 1.
@@ -642,7 +650,12 @@ void perform_coredump(const CoreDumpRequest& req) {
     hdr.program_header_addr = req.program_header_addr;
     hdr.segment_count = SEG_COUNT;
     hdr.segment_table_offset = sizeof(CoreDumpHeader);
-    hdr.elf_size = req.elf_buffer != nullptr ? req.elf_buffer_size : 0;
+    hdr.elf_size = 0;
+    if (req.exec_image_file != nullptr) {
+        hdr.elf_size = req.exec_image_size;
+    } else if (req.elf_buffer != nullptr) {
+        hdr.elf_size = req.elf_buffer_size;
+    }
     hdr.elf_offset = next_offset;
     hdr.segment_entry_size = sizeof(CoreDumpSegment);
     hdr.page_size = PAGE;
@@ -715,7 +728,21 @@ void perform_coredump(const CoreDumpRequest& req) {
         ok = write_all(FD, page_ptr, PAGE);
     }
 
-    if (ok && req.elf_buffer != nullptr && req.elf_buffer_size != 0) {
+    if (ok && req.exec_image_file != nullptr && req.exec_image_size != 0) {
+        std::array<uint8_t, 4096> chunk{};
+        uint64_t offset = 0;
+        while (ok && offset < req.exec_image_size) {
+            auto const TO_READ =
+                static_cast<size_t>(req.exec_image_size - offset < chunk.size() ? req.exec_image_size - offset : chunk.size());
+            ssize_t const READ = ker::vfs::vfs_pread_file(req.exec_image_file, chunk.data(), TO_READ, static_cast<off_t>(offset));
+            if (READ <= 0) {
+                ok = false;
+                break;
+            }
+            ok = write_all(FD, chunk.data(), static_cast<size_t>(READ));
+            offset += static_cast<uint64_t>(READ);
+        }
+    } else if (ok && req.elf_buffer != nullptr && req.elf_buffer_size != 0) {
         const uint8_t* elf = req.elf_buffer;
         size_t remaining = req.elf_buffer_size;
         while (ok && remaining > 0) {
@@ -872,6 +899,8 @@ void try_write_for_task(ker::mod::sched::task::Task* task, const ker::mod::cpu::
     req.elf_buffer = task->elf_buffer;
     req.elf_buffer_size = task->elf_buffer_size;
     req.elf_buffer_shared = task->is_elf_buffer_shared;
+    req.exec_image_file = task->exec_image_file;
+    req.exec_image_size = task->exec_image_size;
     req.pinned_pages = {};
     req.pinned_page_count = 0;
     pin_user_page_for_coredump(req, task->pagemap, frame.rip, SegmentType::FAULT_PAGE);
@@ -881,6 +910,8 @@ void try_write_for_task(ker::mod::sched::task::Task* task, const ker::mod::cpu::
     task->elf_buffer = nullptr;
     task->elf_buffer_size = 0;
     task->is_elf_buffer_shared = false;
+    task->exec_image_file = nullptr;
+    task->exec_image_size = 0;
 
     // Publish the slot and wake the coredump task. Safe from CPL=3 exception context:
     // userspace-fault handlers cannot be holding any kernel spinlock.

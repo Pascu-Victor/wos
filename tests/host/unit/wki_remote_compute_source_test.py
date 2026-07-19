@@ -1345,7 +1345,7 @@ def test_remote_stdio_capture_is_write_only_and_non_tty() -> None:
     if "return false;" not in capture_isatty:
         fail("remote stdout/stderr capture must not report tty semantics")
 
-    exec_body = function_body(source, "exec_elf_buffer")
+    exec_body = function_body(source, "finish_remote_exec_task")
     for snippet in [
         "stdin_file->open_flags = 0;",
         "capture_file->open_flags = 1;",
@@ -1353,6 +1353,40 @@ def test_remote_stdio_capture_is_write_only_and_non_tty() -> None:
     ]:
         if snippet not in exec_body:
             fail(f"remote stdio capture must preserve VFS access modes: {snippet}")
+
+
+def test_large_vfs_ref_exec_keeps_a_file_backed_source() -> None:
+    source = REMOTE_COMPUTE_CPP.read_text()
+    loader_body = function_body(source, "load_elf_from_vfs_path")
+    require_tokens(
+        loader_body,
+        [
+            "std::cmp_greater_equal(statbuf.st_size, WKI_FILE_BACKED_ELF_MIN_SIZE)",
+            "result.file = ker::vfs::vfs_get_file_retain(CURRENT_TASK, FD)",
+            "ker::syscall::process::supports_file_backed_process(result.file",
+            "result.file_stat = statbuf",
+            "return result;",
+            "buf = new uint8_t[file_size]",
+        ],
+        "large VFS_REF retained-file source",
+    )
+    require_order(
+        loader_body,
+        "std::cmp_greater_equal(statbuf.st_size, WKI_FILE_BACKED_ELF_MIN_SIZE)",
+        "buf = new uint8_t[file_size]",
+        "large VFS_REF must return a retained file before the legacy full-buffer allocation",
+    )
+
+    submit_body = function_body(source, "handle_task_submit_work")
+    require_tokens(
+        submit_body,
+        [
+            "vfs_result.buffer == nullptr && vfs_result.file == nullptr",
+            "elf_file = vfs_result.file",
+            "elf_file != nullptr ? exec_elf_file(elf_file, binary_len, elf_file_stat)",
+        ],
+        "large VFS_REF file-backed execution",
+    )
 
 
 def test_submitted_vfs_policy_is_active_during_elf_construction() -> None:
@@ -1375,12 +1409,12 @@ def test_submitted_vfs_policy_is_active_during_elf_construction() -> None:
     require_order(
         body,
         "if (!submit_vfs_identity.policy_valid())",
-        "exec_elf_buffer(elf_buffer, binary_len, elf_buffer_shared)",
+        "ExecResult const EXEC = elf_file != nullptr",
         "submitted policy validation before ELF construction",
     )
     require_order(
         body,
-        "exec_elf_buffer(elf_buffer, binary_len, elf_buffer_shared)",
+        "ExecResult const EXEC = elf_file != nullptr",
         "submit_vfs_identity.transfer_vfs_rules_to(new_task)",
         "validated policy transfer after ELF construction",
     )
@@ -1464,7 +1498,7 @@ def test_receiver_child_owner_spans_interpreter_output_and_publication() -> None
     require_order(
         exec_body,
         "complete_unpublished_process_construction(new_task)",
-        "new TaskOutputCapture()",
+        "finish_remote_exec_task(new_task)",
         "receiver must finish the owned interpreter stage before output setup",
     )
     require_tokens(
@@ -1483,7 +1517,7 @@ def test_receiver_child_owner_spans_interpreter_output_and_publication() -> None
     work_body = function_body(source, "handle_task_submit_work")
     require_order(
         work_body,
-        "exec_elf_buffer(elf_buffer, binary_len, elf_buffer_shared)",
+        "ExecResult const EXEC = elf_file != nullptr",
         "g_running_remote_tasks.push_back(rt)",
         "receiver child ownership must cover output and prepublication monitor setup",
     )
@@ -2265,6 +2299,7 @@ def main() -> None:
     test_vfs_ref_loader_deadlines_are_saturating()
     test_shared_elf_cache_preserves_inflight_load_markers()
     test_remote_stdio_capture_is_write_only_and_non_tty()
+    test_large_vfs_ref_exec_keeps_a_file_backed_source()
     test_submitted_vfs_policy_is_active_during_elf_construction()
     test_controller_descendants_default_to_local_placement()
     test_receiver_child_owner_spans_interpreter_output_and_publication()

@@ -6,6 +6,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[3]
 EXEC_CPP = ROOT / "modules" / "kern" / "src" / "syscalls_impl" / "process" / "exec.cpp"
 ELF_LOADER_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "loader" / "elf_loader.cpp"
+TASK_HPP = ROOT / "modules" / "kern" / "src" / "platform" / "sched" / "task.hpp"
+COREDUMP_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "dbg" / "coredump.cpp"
+REMOTE_COMPUTE_CPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "remote_compute.cpp"
 
 
 def fail(message: str) -> None:
@@ -183,6 +186,54 @@ def require_callers_use_sparse_reader(source: str) -> None:
             fail(f"execve lazy ELF range lifetime invariant missing: {snippet}")
 
 
+def require_large_dynamic_elf_is_file_backed(source: str) -> None:
+    for snippet in [
+        "EXEC_FILE_BACKED_ELF_MIN_SIZE",
+        "struct PreparedFileBackedElf",
+        "prepare_file_backed_elf",
+        "FILE_BACKED_ELF ? prepared_elf.take_task_metadata() : new uint8_t[FILE_SIZE]",
+        "loader::elf::load_elf(prepared_elf.view",
+        "new_task->initialize_process_image(prepared_elf.view",
+        "new_task->exec_image_file = exec_file",
+        "task->exec_image_file = FILE_BACKED_ELF ? exec_file : nullptr",
+    ]:
+        if snippet not in source:
+            fail(f"large dynamic ELF file-backed invariant missing: {snippet}")
+
+    prepare_body = function_body(source, "prepare_file_backed_elf")
+    for snippet in [
+        "file_size < EXEC_FILE_BACKED_ELF_MIN_SIZE",
+        "phdr_bytes > EXEC_FILE_BACKED_METADATA_MAX",
+        "shdr_bytes > EXEC_FILE_BACKED_METADATA_MAX",
+        "shstrtab.sh_size > EXEC_FILE_BACKED_METADATA_MAX",
+        "if (!has_interp)",
+        "out.view.read_at = exec_file_read_at",
+        "out.view.contiguous_base = nullptr",
+    ]:
+        if snippet not in prepare_body:
+            fail(f"bounded ELF metadata validation missing: {snippet}")
+
+    task_header = TASK_HPP.read_text()
+    for snippet in ["exec_image_file", "exec_image_size", "elf_buffer_complete"]:
+        if snippet not in task_header:
+            fail(f"task file-backed ELF lifetime field missing: {snippet}")
+
+    coredump_source = COREDUMP_CPP.read_text()
+    for snippet in [
+        "if (req.exec_image_file != nullptr)",
+        "hdr.elf_size = req.exec_image_size",
+        "vfs_pread_file(req.exec_image_file",
+        "req.exec_image_file = task->exec_image_file",
+        "task->exec_image_file = nullptr",
+    ]:
+        if snippet not in coredump_source:
+            fail(f"coredump must preserve full file-backed ELF payload: {snippet}")
+
+    remote_source = REMOTE_COMPUTE_CPP.read_text()
+    if "task->elf_buffer_complete && task->elf_buffer != nullptr" not in remote_source:
+        fail("WKI must not transmit compact ELF metadata as a complete inline executable")
+
+
 def require_stdio_fallback_access_modes(source: str) -> None:
     body = function_body(source, "ensure_exec_stdio_fallbacks")
     for snippet in [
@@ -197,7 +248,7 @@ def require_stdio_fallback_access_modes(source: str) -> None:
 
 
 def require_loader_does_not_scan_unread_symbol_payloads(loader_source: str) -> None:
-    body = function_body_containing(loader_source, "load_elf", "if (REGISTER_SPECIAL_SYMBOLS)")
+    body = function_body_containing(loader_source, "load_elf_impl", "if (REGISTER_SPECIAL_SYMBOLS)")
     registration_gate = body.find("if (REGISTER_SPECIAL_SYMBOLS)")
     registration = body.find("debug::register_process", registration_gate)
     if registration_gate < 0 or registration < registration_gate:
@@ -227,7 +278,7 @@ def require_loader_lazy_file_ranges(loader_source: str) -> None:
         if snippet not in (ROOT / "modules" / "kern" / "src" / "platform" / "loader" / "elf_loader.hpp").read_text() + loader_source:
             fail(f"loader lazy range API missing: {snippet}")
 
-    load_body = function_body_containing(loader_source, "load_elf", "ENABLE_LAZY_FILE_RANGES")
+    load_body = function_body_containing(loader_source, "load_elf_impl", "ENABLE_LAZY_FILE_RANGES")
     for snippet in [
         "options.lazy_file_ranges != nullptr && (has_dynamic_interp || BASE_ADDRESS != 0)",
         "lazy_load_page_range(current_header, j, elf_file.load_base, lazy_range)",
@@ -256,6 +307,7 @@ def main() -> None:
     loader_source = ELF_LOADER_CPP.read_text()
     require_sparse_exec_reads(source)
     require_callers_use_sparse_reader(source)
+    require_large_dynamic_elf_is_file_backed(source)
     require_stdio_fallback_access_modes(source)
     require_loader_does_not_scan_unread_symbol_payloads(loader_source)
     require_loader_lazy_file_ranges(loader_source)

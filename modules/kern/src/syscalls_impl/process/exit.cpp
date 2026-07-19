@@ -492,6 +492,11 @@ namespace {
             current_task->elf_buffer = nullptr;
             current_task->elf_buffer_size = 0;
         }
+        if (current_task->exec_image_file != nullptr) {
+            ker::vfs::vfs_put_file(current_task->exec_image_file);
+            current_task->exec_image_file = nullptr;
+            current_task->exec_image_size = 0;
+        }
     }
 
     // Retire direct-submit pointers before destroying a child whose creator

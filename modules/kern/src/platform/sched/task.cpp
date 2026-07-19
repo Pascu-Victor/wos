@@ -479,6 +479,11 @@ void teardown_unpublished_process_resources(Task* task) {
     task->elf_buffer = nullptr;
     task->elf_buffer_size = 0;
     task->is_elf_buffer_shared = false;
+    if (task->exec_image_file != nullptr) {
+        ker::vfs::vfs_put_file(task->exec_image_file);
+        task->exec_image_file = nullptr;
+        task->exec_image_size = 0;
+    }
 
     if (task->thread != nullptr) {
         // User pages belong to the pagemap destroyed below. The Thread row
@@ -665,6 +670,8 @@ auto task_selftest_unpublished_process_owner_releases_resources() -> bool {
 
     ker::vfs::File file{};
     file.refcount.store(2, std::memory_order_relaxed);
+    ker::vfs::File exec_file{};
+    exec_file.refcount.store(2, std::memory_order_relaxed);
     constexpr uint64_t FD = 29;
     if (!child->fd_table.insert(FD, &file)) {
         delete child;
@@ -672,6 +679,8 @@ auto task_selftest_unpublished_process_owner_releases_resources() -> bool {
     }
     child->elf_buffer = new uint8_t[4];
     child->elf_buffer_size = 4;
+    child->exec_image_file = &exec_file;
+    child->exec_image_size = 4096;
     if (child->elf_buffer == nullptr) {
         child->fd_table.remove(FD);
         delete child;
@@ -687,7 +696,7 @@ auto task_selftest_unpublished_process_owner_releases_resources() -> bool {
     bool const TRANSFERRED_REF_HELD = TAKEN == child && child->ref_count.load(std::memory_order_acquire) == 2;
     bool const DESTROYED = destroy_unpublished_process(TAKEN);
     return CLAIMED && OWNER_REF_HELD && DUPLICATE_REJECTED && WRONG_RELEASE_REJECTED && OWNER_CLEARED && TRANSFERRED_REF_HELD &&
-           DESTROYED && file.refcount.load(std::memory_order_relaxed) == 1;
+           DESTROYED && file.refcount.load(std::memory_order_relaxed) == 1 && exec_file.refcount.load(std::memory_order_relaxed) == 1;
 }
 
 auto task_selftest_owned_unpublished_process_teardown_releases_resources() -> bool {
@@ -784,6 +793,8 @@ Task::Task(const char* name, uint64_t elf_start, uint64_t kernel_rsp, TaskType t
     this->parent_pid = 0;        // Initialize to 0 (no parent by default, will be set by exec or fork)
     this->elf_buffer = nullptr;  // No ELF buffer by default
     this->elf_buffer_size = 0;
+    this->exec_image_file = nullptr;
+    this->exec_image_size = 0;
     this->has_run = false;  // Task hasn't run yet, context.frame contains initial setup
     this->exit_status = 0;  // Initialize exit status
     this->exit_in_progress = false;
@@ -939,10 +950,11 @@ Task::Task(const char* name, uint64_t elf_start, uint64_t kernel_rsp, TaskType t
     // The elfStart pointer points to kernel heap memory allocated by the parent process
     mm::virt::copy_kernel_mappings(this);
 
-    // Validate ELF pointer before any operations
+    // A null source constructs a recoverable process skeleton. Exec's
+    // file-backed path claims unpublished ownership before it performs any
+    // potentially blocking VFS reads in initialize_process_image().
     if (elf_start == 0) {
-        dbg::log("ERROR: Task created with null ELF pointer");
-        hcf();
+        return;
     }
 
     // Add compiler memory barrier to ensure elfStart is fully visible
@@ -1028,6 +1040,69 @@ Task::Task(const char* name, uint64_t elf_start, uint64_t kernel_rsp, TaskType t
             dbg::log("Failed to translate SafeStack TLS vaddr %x for PID %x", DEST_VADDR, this->pid);
         }
     }
+}
+
+auto Task::initialize_process_image(const ker::loader::elf::ElfFileView& elf, const ker::loader::elf::ElfLoadOptions& options) -> bool {
+    if (type != TaskType::PROCESS || pagemap == nullptr || thread != nullptr || entry != 0) {
+        return false;
+    }
+
+    ker::loader::elf::TlsModule const TLS_INFO = loader::elf::extract_tls_info(elf);
+    thread = threading::create_thread(ker::mod::mm::USER_STACK_SIZE, TLS_INFO.tls_size, pagemap, pid, TLS_INFO);
+    if (thread == nullptr) {
+        dbg::log("Failed to create thread for task %s - OOM", name);
+        return false;
+    }
+
+    auto* per_cpu = new cpu::PerCpu();
+    if (per_cpu == nullptr) {
+        return false;
+    }
+    per_cpu->syscall_stack = context.syscall_kernel_stack;
+    per_cpu->cpu_id = cpu::current_cpu();
+    context.syscall_scratch_area = reinterpret_cast<uint64_t>(per_cpu);
+    context.frame.rsp = thread->stack;
+
+    loader::elf::ElfLoadResult const ELF_RESULT = loader::elf::load_elf(elf, pagemap, pid, name, options);
+    if (ELF_RESULT.entry_point == 0) {
+        dbg::log("Failed to load file-backed ELF for task %s", name);
+        return false;
+    }
+    entry = ELF_RESULT.entry_point;
+    context.frame.rip = ELF_RESULT.entry_point;
+    program_header_addr = ELF_RESULT.program_header_addr;
+    elf_header_addr = ELF_RESULT.elf_header_addr;
+    program_header_count = ELF_RESULT.program_header_count;
+    program_header_ent_size = ELF_RESULT.program_header_ent_size;
+
+    if (ELF_RESULT.has_interp) {
+        const char* const INTERP_PATH = std::begin(ELF_RESULT.interp_path);
+        size_t const INTERP_LEN = std::strlen(INTERP_PATH);
+        if (INTERP_LEN >= pending_interp_path.size()) {
+            dbg::log("Interpreter path is too long for task %s", name);
+            entry = 0;
+            context.frame.rip = 0;
+            return false;
+        }
+        std::memcpy(pending_interp_path.data(), INTERP_PATH, INTERP_LEN + 1);
+    }
+
+    context.frame.int_num = 0;
+    context.frame.err_code = 0;
+    context.frame.ss = 0x1b;
+    context.frame.cs = 0x23;
+    context.frame.flags = 0x202;
+
+    ker::loader::debug::DebugSymbol const* ssym = ker::loader::debug::get_process_symbol(pid, "__safestack_unsafe_stack_ptr");
+    if ((ssym != nullptr) && ssym->is_tls_offset) {
+        uint64_t const DEST_VADDR = thread->tls_base_virt + ssym->raw_value;
+        uint64_t const DEST_PADDR = mm::virt::translate(pagemap, DEST_VADDR);
+        if (DEST_PADDR != mm::virt::PADDR_INVALID) {
+            auto* dest_ptr = static_cast<uint64_t*>(mm::addr::get_virt_pointer(DEST_PADDR));
+            *dest_ptr = thread->safestack_ptr_value;
+        }
+    }
+    return true;
 }
 
 Task* Task::create_user_thread(Task* parent, uint64_t tcb_vaddr, uint64_t user_sp, uint64_t enter_thread_va) {
@@ -1166,6 +1241,8 @@ Task* Task::create_user_thread(Task* parent, uint64_t tcb_vaddr, uint64_t user_s
     // ELF buffer: threads have no separate ELF
     t->elf_buffer = nullptr;
     t->elf_buffer_size = 0;
+    t->exec_image_file = nullptr;
+    t->exec_image_size = 0;
 
     // Scheduling defaults
     t->has_run = false;

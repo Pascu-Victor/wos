@@ -7,6 +7,7 @@
 
 // #define EXEC_DEBUG
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cerrno>
@@ -558,6 +559,8 @@ auto read_file_fully(int fd, uint8_t* dst, size_t size, const char* path) -> ssi
 
 constexpr size_t EXEC_SPARSE_ELF_MIN_SIZE = static_cast<size_t>(64) * 1024;
 constexpr size_t EXEC_SHEBANG_PROBE_SIZE = 4096;
+constexpr size_t EXEC_FILE_BACKED_ELF_MIN_SIZE = static_cast<size_t>(8) * 1024 * 1024;
+constexpr uint64_t EXEC_FILE_BACKED_METADATA_MAX = static_cast<uint64_t>(4) * 1024 * 1024;
 
 struct ExecImageReadResult {
     ssize_t bytes_read{};
@@ -577,6 +580,183 @@ auto exec_table_size(uint64_t count, uint64_t entry_size, uint64_t& out) -> bool
     }
     out = count * entry_size;
     return true;
+}
+
+struct ExecFileReadContext {
+    vfs::File* file{};
+    uint64_t logical_size{};
+};
+
+struct PreparedFileBackedElf {
+    loader::elf::ElfFileView view{};
+    ExecFileReadContext read_context{};
+    Elf64_Phdr* program_headers{};
+    Elf64_Shdr* section_headers{};
+    char* section_names{};
+    uint8_t* task_metadata{};
+    size_t task_metadata_size{};
+    size_t bytes_read{};
+
+    PreparedFileBackedElf() = default;
+    PreparedFileBackedElf(const PreparedFileBackedElf&) = delete;
+    auto operator=(const PreparedFileBackedElf&) -> PreparedFileBackedElf& = delete;
+
+    ~PreparedFileBackedElf() {
+        delete[] program_headers;
+        delete[] section_headers;
+        delete[] section_names;
+        delete[] task_metadata;
+    }
+
+    auto take_task_metadata() -> uint8_t* {
+        uint8_t* const RESULT = task_metadata;
+        task_metadata = nullptr;
+        return RESULT;
+    }
+};
+
+auto read_exec_file_exact(vfs::File* file, uint64_t logical_size, uint64_t offset, void* destination, size_t size) -> bool {
+    if (file == nullptr || destination == nullptr || offset > logical_size || size > logical_size - offset ||
+        offset > static_cast<uint64_t>(INT64_MAX)) {
+        return false;
+    }
+
+    auto* out = static_cast<uint8_t*>(destination);
+    size_t total = 0;
+    int consecutive_errors = 0;
+    constexpr int MAX_CONSECUTIVE_ERRORS = 3;
+    while (total < size) {
+        uint64_t const READ_OFFSET = offset + total;
+        if (READ_OFFSET > static_cast<uint64_t>(INT64_MAX)) {
+            return false;
+        }
+        ssize_t const RC = vfs::vfs_pread_file(file, out + total, size - total, static_cast<off_t>(READ_OFFSET));
+        if (RC > 0) {
+            total += static_cast<size_t>(RC);
+            consecutive_errors = 0;
+            continue;
+        }
+        if (RC == 0) {
+            return false;
+        }
+        if (++consecutive_errors >= MAX_CONSECUTIVE_ERRORS) {
+            return false;
+        }
+    }
+    return true;
+}
+
+auto exec_file_read_at(void* context, uint64_t offset, void* destination, size_t size) -> bool {
+    auto* source = static_cast<ExecFileReadContext*>(context);
+    if (source == nullptr || source->file == nullptr) {
+        return false;
+    }
+    return read_exec_file_exact(source->file, source->logical_size, offset, destination, size);
+}
+
+enum class PrepareFileBackedElfResult : uint8_t {
+    READY,
+    FALLBACK,
+    INVALID,
+    OUT_OF_MEMORY,
+    IO_ERROR,
+};
+
+auto prepare_file_backed_elf(vfs::File* file, size_t file_size, PreparedFileBackedElf& out) -> PrepareFileBackedElfResult {
+    if (file == nullptr || file_size < sizeof(Elf64_Ehdr) || file_size < EXEC_FILE_BACKED_ELF_MIN_SIZE) {
+        return PrepareFileBackedElfResult::FALLBACK;
+    }
+
+    Elf64_Ehdr header{};
+    if (!read_exec_file_exact(file, file_size, 0, &header, sizeof(header))) {
+        return PrepareFileBackedElfResult::IO_ERROR;
+    }
+    out.bytes_read += sizeof(header);
+    if (header.e_ident[EI_MAG0] != ELFMAG0 || header.e_ident[EI_MAG1] != ELFMAG1 || header.e_ident[EI_MAG2] != ELFMAG2 ||
+        header.e_ident[EI_MAG3] != ELFMAG3 || header.e_ident[EI_CLASS] != ELFCLASS64 || header.e_phnum == 0 ||
+        header.e_phentsize != sizeof(Elf64_Phdr)) {
+        return PrepareFileBackedElfResult::FALLBACK;
+    }
+
+    uint64_t phdr_bytes = 0;
+    if (!exec_table_size(header.e_phnum, header.e_phentsize, phdr_bytes) || phdr_bytes > EXEC_FILE_BACKED_METADATA_MAX ||
+        !exec_range_in_file(file_size, header.e_phoff, phdr_bytes)) {
+        return PrepareFileBackedElfResult::INVALID;
+    }
+    out.program_headers = new Elf64_Phdr[header.e_phnum];
+    if (out.program_headers == nullptr) {
+        return PrepareFileBackedElfResult::OUT_OF_MEMORY;
+    }
+    if (!read_exec_file_exact(file, file_size, header.e_phoff, out.program_headers, static_cast<size_t>(phdr_bytes))) {
+        return PrepareFileBackedElfResult::IO_ERROR;
+    }
+    out.bytes_read += static_cast<size_t>(phdr_bytes);
+
+    bool has_interp = false;
+    for (Elf64_Half i = 0; i < header.e_phnum; ++i) {
+        has_interp = has_interp || out.program_headers[i].p_type == PT_INTERP;  // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
+    }
+    // The loader's static relocation path intentionally still requires the
+    // complete image. Large dynamically linked programs are the fragmented-
+    // memory failure mode this bounded source removes.
+    if (!has_interp) {
+        return PrepareFileBackedElfResult::FALLBACK;
+    }
+
+    if (header.e_shnum != 0) {
+        uint64_t shdr_bytes = 0;
+        if (header.e_shentsize != sizeof(Elf64_Shdr) || header.e_shstrndx >= header.e_shnum ||
+            !exec_table_size(header.e_shnum, header.e_shentsize, shdr_bytes) || shdr_bytes > EXEC_FILE_BACKED_METADATA_MAX ||
+            !exec_range_in_file(file_size, header.e_shoff, shdr_bytes)) {
+            return PrepareFileBackedElfResult::INVALID;
+        }
+        out.section_headers = new Elf64_Shdr[header.e_shnum];
+        if (out.section_headers == nullptr) {
+            return PrepareFileBackedElfResult::OUT_OF_MEMORY;
+        }
+        if (!read_exec_file_exact(file, file_size, header.e_shoff, out.section_headers, static_cast<size_t>(shdr_bytes))) {
+            return PrepareFileBackedElfResult::IO_ERROR;
+        }
+        out.bytes_read += static_cast<size_t>(shdr_bytes);
+
+        const Elf64_Shdr& shstrtab = out.section_headers[header.e_shstrndx];  // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
+        if (shstrtab.sh_size > EXEC_FILE_BACKED_METADATA_MAX || !exec_range_in_file(file_size, shstrtab.sh_offset, shstrtab.sh_size)) {
+            return PrepareFileBackedElfResult::INVALID;
+        }
+        if (shstrtab.sh_size != 0) {
+            out.section_names = new char[static_cast<size_t>(shstrtab.sh_size)];
+            if (out.section_names == nullptr) {
+                return PrepareFileBackedElfResult::OUT_OF_MEMORY;
+            }
+            if (!read_exec_file_exact(file, file_size, shstrtab.sh_offset, out.section_names, static_cast<size_t>(shstrtab.sh_size))) {
+                return PrepareFileBackedElfResult::IO_ERROR;
+            }
+            out.bytes_read += static_cast<size_t>(shstrtab.sh_size);
+        }
+        out.view.section_names_size = shstrtab.sh_size;
+    }
+
+    if (header.e_phoff > EXEC_FILE_BACKED_METADATA_MAX || phdr_bytes > EXEC_FILE_BACKED_METADATA_MAX - header.e_phoff) {
+        return PrepareFileBackedElfResult::INVALID;
+    }
+    out.task_metadata_size = std::max(static_cast<size_t>(header.e_phoff + phdr_bytes), sizeof(Elf64_Ehdr));
+    out.task_metadata = new uint8_t[out.task_metadata_size]{};
+    if (out.task_metadata == nullptr) {
+        return PrepareFileBackedElfResult::OUT_OF_MEMORY;
+    }
+    std::memcpy(out.task_metadata, &header, sizeof(header));
+    std::memcpy(out.task_metadata + header.e_phoff, out.program_headers, static_cast<size_t>(phdr_bytes));
+
+    out.view.elf_header = header;
+    out.view.program_headers = out.program_headers;
+    out.view.section_headers = out.section_headers;
+    out.view.section_names = out.section_names;
+    out.read_context = {.file = file, .logical_size = file_size};
+    out.view.read_at = exec_file_read_at;
+    out.view.read_context = &out.read_context;
+    out.view.logical_size = file_size;
+    out.view.contiguous_base = nullptr;
+    return PrepareFileBackedElfResult::READY;
 }
 
 auto read_file_range_fully(int fd, uint8_t* dst, size_t file_size, uint64_t offset, uint64_t size, const char* path, size_t& bytes_read)
@@ -1077,6 +1257,70 @@ auto exec_selftest_cloexec_snapshot_collects_marked_fds() -> bool {
 }
 #endif
 
+auto supports_file_backed_process(vfs::File* file, size_t file_size) -> bool {
+    PreparedFileBackedElf prepared_elf;
+    return prepare_file_backed_elf(file, file_size, prepared_elf) == PrepareFileBackedElfResult::READY;
+}
+
+auto create_file_backed_process_task(const char* name, vfs::File* owned_file, size_t file_size, const vfs::Stat& file_stat,
+                                     uint64_t kernel_rsp) -> mod::sched::task::Task* {
+    auto release_inputs = [&]() {
+        if (owned_file != nullptr) {
+            vfs::vfs_put_file(owned_file);
+            owned_file = nullptr;
+        }
+        if (kernel_rsp != 0) {
+            mod::mm::phys::page_free(reinterpret_cast<void*>(kernel_rsp - mod::mm::KERNEL_STACK_SIZE));
+            kernel_rsp = 0;
+        }
+    };
+
+    PreparedFileBackedElf prepared_elf;
+    if (name == nullptr || owned_file == nullptr || kernel_rsp == 0 ||
+        prepare_file_backed_elf(owned_file, file_size, prepared_elf) != PrepareFileBackedElfResult::READY) {
+        release_inputs();
+        return nullptr;
+    }
+
+    auto* new_task = new mod::sched::task::Task(name, 0, kernel_rsp, mod::sched::task::TaskType::PROCESS);  // NOLINT
+    if (new_task == nullptr) {
+        release_inputs();
+        return nullptr;
+    }
+    kernel_rsp = 0;
+
+    new_task->elf_buffer = prepared_elf.take_task_metadata();
+    new_task->elf_buffer_size = prepared_elf.task_metadata_size;
+    new_task->is_elf_buffer_shared = false;
+    new_task->elf_buffer_complete = false;
+    new_task->exec_image_file = owned_file;
+    new_task->exec_image_size = file_size;
+    owned_file = nullptr;
+
+    auto* const OWNER = mod::sched::get_current_task();
+    if (OWNER == nullptr || !mod::sched::task::claim_unpublished_process(OWNER, new_task)) [[unlikely]] {
+        mod::dbg::panic_handler("file-backed exec: cannot publish child recovery ownership");
+        hcf();
+    }
+
+    loader::elf::ElfLazyLoadRangeVec loader_lazy_ranges;
+    loader::elf::ElfLoadOptions const LOAD_OPTIONS{
+        .register_special_symbols = true,
+        .base_address = 0,
+        .lazy_file_ranges = exec_lazy_file_segments_enabled() ? &loader_lazy_ranges : nullptr,
+    };
+    if (!new_task->initialize_process_image(prepared_elf.view, LOAD_OPTIONS) ||
+        !append_exec_lazy_file_ranges(new_task->lazy_vmem_ranges, loader_lazy_ranges, new_task->exec_image_file, file_stat) ||
+        !mod::sched::task::complete_unpublished_process_construction(new_task)) {
+        if (!mod::sched::task::destroy_owned_unpublished_process(OWNER, new_task)) [[unlikely]] {
+            mod::dbg::panic_handler("file-backed exec: lost child recovery ownership during teardown");
+            hcf();
+        }
+        return nullptr;
+    }
+    return new_task;
+}
+
 auto wos_proc_exec(const char* path, const char* const* argv, const char* const* envp) -> uint64_t {
     return wos_proc_exec_impl(path, argv, envp, nullptr, 0);
 }
@@ -1148,9 +1392,31 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
         return 0;
     }
 
-    auto* elf_buffer = new uint8_t[FILE_SIZE];
+    vfs::File* exec_file = vfs::vfs_get_file_retain(parent_task, FD);
+    auto release_exec_file_once = [&]() {
+        if (exec_file != nullptr) {
+            vfs::vfs_put_file(exec_file);
+            exec_file = nullptr;
+        }
+    };
+
+    PreparedFileBackedElf prepared_elf;
+    PrepareFileBackedElfResult const PREPARED_RESULT = prepare_file_backed_elf(exec_file, static_cast<size_t>(FILE_SIZE), prepared_elf);
+    bool const FILE_BACKED_ELF = PREPARED_RESULT == PrepareFileBackedElfResult::READY;
+    if (PREPARED_RESULT == PrepareFileBackedElfResult::INVALID || PREPARED_RESULT == PrepareFileBackedElfResult::IO_ERROR ||
+        PREPARED_RESULT == PrepareFileBackedElfResult::OUT_OF_MEMORY) {
+        dbg::log("wos_proc_exec: Failed to prepare bounded ELF source");
+        release_exec_file_once();
+        vfs::vfs_close(FD);
+        return 0;
+    }
+
+    auto* elf_buffer = FILE_BACKED_ELF ? prepared_elf.take_task_metadata() : new uint8_t[FILE_SIZE];
+    size_t const ELF_BUFFER_SIZE = FILE_BACKED_ELF ? prepared_elf.task_metadata_size : static_cast<size_t>(FILE_SIZE);
+    bool const ELF_BUFFER_COMPLETE = !FILE_BACKED_ELF;
     if (elf_buffer == nullptr) {
         dbg::log("wos_proc_exec: Failed to allocate buffer");
+        release_exec_file_once();
         vfs::vfs_close(FD);
         return 0;
     }
@@ -1159,7 +1425,11 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
     uint64_t const ELF_READ_STARTED_US = time::get_us();
     record_local_proc_event(parent_task, perf::WkiPerfLocalProcOp::ELF_READ, perf::WkiPerfPhase::BEGIN, ELF_READ_CORR, 0,
                             clamp_perf_aux(static_cast<uint64_t>(FILE_SIZE)), WOS_PERF_CALLSITE());
-    ExecImageReadResult const READ_RESULT = read_exec_image_for_loader(FD, elf_buffer, static_cast<size_t>(FILE_SIZE), path);
+    ExecImageReadResult const READ_RESULT = FILE_BACKED_ELF
+                                                ? ExecImageReadResult{.bytes_read = static_cast<ssize_t>(prepared_elf.bytes_read),
+                                                                      .status = 0,
+                                                                      .shebang_probe_size = sizeof(Elf64_Ehdr)}
+                                                : read_exec_image_for_loader(FD, elf_buffer, static_cast<size_t>(FILE_SIZE), path);
     uint32_t const ELF_READ_US = clamp_perf_aux(time::get_us() - ELF_READ_STARTED_US);
     int32_t const ELF_READ_STATUS = READ_RESULT.status;
     record_local_proc_event(parent_task, perf::WkiPerfLocalProcOp::ELF_READ, perf::WkiPerfPhase::END, ELF_READ_CORR, ELF_READ_STATUS,
@@ -1171,6 +1441,7 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
 
     if (READ_RESULT.status < 0) {
         dbg::log("wos_proc_exec: Failed to read file completely");
+        release_exec_file_once();
         delete[] elf_buffer;
         return 0;
     }
@@ -1181,6 +1452,7 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
     ShebangInfo shebang = {};
     size_t const SHEBANG_BYTES = READ_RESULT.shebang_probe_size != 0 ? READ_RESULT.shebang_probe_size : static_cast<size_t>(FILE_SIZE);
     if (parse_shebang_line(elf_buffer, SHEBANG_BYTES, &shebang)) {
+        release_exec_file_once();
         delete[] elf_buffer;
         if (shebang_depth >= MAX_SHEBANG_DEPTH) {
             return 0;
@@ -1197,12 +1469,14 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
     if (elf_header->e_ident[EI_MAG0] != ELFMAG0 || elf_header->e_ident[EI_MAG1] != ELFMAG1 || elf_header->e_ident[EI_MAG2] != ELFMAG2 ||
         elf_header->e_ident[EI_MAG3] != ELFMAG3) {
         dbg::log("wos_proc_exec: Not a valid ELF file");
+        release_exec_file_once();
         delete[] elf_buffer;
         return 0;
     }
 
     if (elf_header->e_ident[EI_CLASS] != ELFCLASS64) {
         dbg::log("wos_proc_exec: Not a 64-bit ELF");
+        release_exec_file_once();
         delete[] elf_buffer;
         return 0;
     }
@@ -1218,6 +1492,7 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
 
     if (parent_task->owned_unpublished_process.load(std::memory_order_acquire) != nullptr) {
         dbg::log("wos_proc_exec: parent PID %x already owns an unpublished process", PARENT_PID);
+        release_exec_file_once();
         delete[] elf_buffer;
         return 0;
     }
@@ -1225,6 +1500,7 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
     uint64_t const KERNEL_RSP = allocate_kernel_stack();
     if (KERNEL_RSP == 0) {
         dbg::log("wos_proc_exec: Failed to allocate kernel stack");
+        release_exec_file_once();
         delete[] elf_buffer;
         return 0;
     }
@@ -1234,8 +1510,8 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
     volatile uint64_t canary1 = 0xDEAD'BEEF'CAFE'BABEULL;  // NOLINT
     volatile uint64_t canary2 = 0x1234'5678'9ABC'DEF0ULL;  // NOLINT
 
-    auto* new_task =
-        new sched::task::Task(process_name, reinterpret_cast<uint64_t>(elf_buffer), KERNEL_RSP, sched::task::TaskType::PROCESS);
+    auto* new_task = new sched::task::Task(process_name, FILE_BACKED_ELF ? 0 : reinterpret_cast<uint64_t>(elf_buffer), KERNEL_RSP,
+                                           sched::task::TaskType::PROCESS);
 
     // Check canaries for stack corruption
     if (canary1 != 0xDEAD'BEEF'CAFE'BABEULL || canary2 != 0x1234'5678'9ABC'DEF0ULL) {  // NOLINT
@@ -1252,12 +1528,14 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
         dbg::log("EXEC BUG: operator new returned non-HHDM ptr: %p", new_task);
         dbg::log("  expected range: 0xffff800000000000 - 0xffff900000000000");
         dbg::log("  &newTask on stack = %p, kernelRsp = %lx", &new_task, KERNEL_RSP);
+        release_exec_file_once();
         delete[] elf_buffer;
         return 0;
     }
 
     if (new_task == nullptr) {
         ker::mod::mm::phys::page_free(reinterpret_cast<void*>(KERNEL_RSP - ker::mod::mm::KERNEL_STACK_SIZE));
+        release_exec_file_once();
         delete[] elf_buffer;
         return 0;
     }
@@ -1266,8 +1544,16 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
     // every caller-owned resource and publish fatal-exit recovery before the
     // post-construction interpreter stage can enter a voluntary wait.
     new_task->elf_buffer = elf_buffer;
-    new_task->elf_buffer_size = FILE_SIZE;
+    new_task->elf_buffer_size = ELF_BUFFER_SIZE;
     new_task->is_elf_buffer_shared = false;
+    new_task->elf_buffer_complete = ELF_BUFFER_COMPLETE;
+    if (FILE_BACKED_ELF) {
+        new_task->exec_image_file = exec_file;
+        new_task->exec_image_size = static_cast<uint64_t>(FILE_SIZE);
+        exec_file = nullptr;
+    } else {
+        release_exec_file_once();
+    }
     if (!sched::task::claim_unpublished_process(parent_task, new_task)) {
         dbg::panic_handler("wos_proc_exec: current task already owns an unpublished process");
         hcf();
@@ -1279,6 +1565,21 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
             hcf();
         }
     };
+
+    if (FILE_BACKED_ELF) {
+        loader::elf::ElfLazyLoadRangeVec loader_lazy_ranges;
+        loader::elf::ElfLoadOptions const LOAD_OPTIONS{
+            .register_special_symbols = true,
+            .base_address = 0,
+            .lazy_file_ranges = exec_lazy_file_segments_enabled() ? &loader_lazy_ranges : nullptr,
+        };
+        if (!new_task->initialize_process_image(prepared_elf.view, LOAD_OPTIONS) ||
+            !append_exec_lazy_file_ranges(new_task->lazy_vmem_ranges, loader_lazy_ranges, new_task->exec_image_file, exec_stat)) {
+            dbg::log("wos_proc_exec: Failed to initialize file-backed process image");
+            cleanup_unpublished_task();
+            return 0;
+        }
+    }
 
     if (new_task->thread == nullptr || new_task->pagemap == nullptr || new_task->entry == 0) {
         dbg::log("wos_proc_exec: Failed to create task (OOM or ELF load failure)");
@@ -1741,7 +2042,27 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
         }
     };
 
-    auto* elf_buffer = new uint8_t[FILE_SIZE];
+    PreparedFileBackedElf prepared_elf;
+    PrepareFileBackedElfResult const PREPARED_RESULT = prepare_file_backed_elf(exec_file, static_cast<size_t>(FILE_SIZE), prepared_elf);
+    bool const FILE_BACKED_ELF = PREPARED_RESULT == PrepareFileBackedElfResult::READY;
+    if (PREPARED_RESULT == PrepareFileBackedElfResult::INVALID || PREPARED_RESULT == PrepareFileBackedElfResult::IO_ERROR ||
+        PREPARED_RESULT == PrepareFileBackedElfResult::OUT_OF_MEMORY) {
+        int error = -ENOEXEC;
+        if (PREPARED_RESULT == PrepareFileBackedElfResult::OUT_OF_MEMORY) {
+            error = -ENOMEM;
+        } else if (PREPARED_RESULT == PrepareFileBackedElfResult::IO_ERROR) {
+            error = -EIO;
+        }
+        end_local_proc_stage(task, perf::WkiPerfLocalProcOp::OPEN_ACCESS, OPEN_ACCESS_STAGE, error, 0, WOS_PERF_CALLSITE());
+        release_exec_file_once();
+        vfs::vfs_close(FD);
+        free_kernel_arg_env();
+        return static_cast<uint64_t>(error);
+    }
+
+    auto* elf_buffer = FILE_BACKED_ELF ? prepared_elf.take_task_metadata() : new uint8_t[FILE_SIZE];
+    size_t const ELF_BUFFER_SIZE = FILE_BACKED_ELF ? prepared_elf.task_metadata_size : static_cast<size_t>(FILE_SIZE);
+    bool const ELF_BUFFER_COMPLETE = !FILE_BACKED_ELF;
     if (elf_buffer == nullptr) {
 #ifdef EXEC_DEBUG
         dbg::log("wos_proc_execve: alloc failed for '%s' (%ld bytes)", exec_path, file_size);
@@ -1761,7 +2082,11 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
                             clamp_perf_aux(static_cast<uint64_t>(FILE_SIZE)), WOS_PERF_CALLSITE());
     bool const EXEC_LAZY_FILE_SEGMENTS = exec_file != nullptr && exec_lazy_file_segments_enabled();
     ExecImageReadResult const READ_RESULT =
-        read_exec_image_for_loader(FD, elf_buffer, static_cast<size_t>(FILE_SIZE), exec_path, true, EXEC_LAZY_FILE_SEGMENTS);
+        FILE_BACKED_ELF
+            ? ExecImageReadResult{.bytes_read = static_cast<ssize_t>(prepared_elf.bytes_read),
+                                  .status = 0,
+                                  .shebang_probe_size = sizeof(Elf64_Ehdr)}
+            : read_exec_image_for_loader(FD, elf_buffer, static_cast<size_t>(FILE_SIZE), exec_path, true, EXEC_LAZY_FILE_SEGMENTS);
     uint32_t const ELF_READ_US = clamp_perf_aux(time::get_us() - ELF_READ_STARTED_US);
     int32_t const ELF_READ_STATUS = READ_RESULT.status;
     record_local_proc_event(task, perf::WkiPerfLocalProcOp::ELF_READ, perf::WkiPerfPhase::END, ELF_READ_CORR, ELF_READ_STATUS, ELF_READ_US,
@@ -1818,6 +2143,7 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
         uint8_t* saved_elf_buffer = task->elf_buffer;
         size_t const SAVED_ELF_BUFFER_SIZE = task->elf_buffer_size;
         bool const SAVED_IS_ELF_BUFFER_SHARED = task->is_elf_buffer_shared;
+        bool const SAVED_ELF_BUFFER_COMPLETE = task->elf_buffer_complete;
         bool const SAVED_WKI_SKIP_LEGACY_PLACEMENT = task->wki_skip_legacy_placement;
         uint64_t const SAVED_WKI_REMOTE_PID = task->wki_remote_pid;
         std::array<char, sched::task::Task::EXE_PATH_MAX> saved_exe_path = {};
@@ -1829,8 +2155,9 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
         }
 
         task->elf_buffer = elf_buffer;
-        task->elf_buffer_size = static_cast<size_t>(FILE_SIZE);
+        task->elf_buffer_size = ELF_BUFFER_SIZE;
         task->is_elf_buffer_shared = false;
+        task->elf_buffer_complete = ELF_BUFFER_COMPLETE;
         std::memcpy(task->exe_path.data(), exec_path, path_len);
         fixed_slot(task->exe_path, path_len) = '\0';
 
@@ -1846,6 +2173,7 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
         task->elf_buffer = saved_elf_buffer;
         task->elf_buffer_size = SAVED_ELF_BUFFER_SIZE;
         task->is_elf_buffer_shared = SAVED_IS_ELF_BUFFER_SHARED;
+        task->elf_buffer_complete = SAVED_ELF_BUFFER_COMPLETE;
 
         if (remote_result == ker::net::wki::WkiRemoteSpawnResult::REMOTE) {
             task->deferred_task_switch = true;
@@ -1873,6 +2201,7 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
     // kernel mappings are active. We'll create a new user pagemap.
     LocalProcStage const NEW_IMAGE_STAGE = begin_local_proc_stage(task, perf::WkiPerfLocalProcOp::NEW_IMAGE, 0, WOS_PERF_CALLSITE());
     uint8_t* old_elf_buffer = task->elf_buffer;
+    vfs::File* old_exec_image_file = task->exec_image_file;
     auto* old_pagemap = task->pagemap;
     auto* old_thread = task->thread;
     auto* new_pagemap = mm::virt::create_pagemap();
@@ -1890,7 +2219,8 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
     }
 
     // --- Create new thread (user stack + TLS) ---
-    ker::loader::elf::TlsModule const TLS_INFO = loader::elf::extract_tls_info(static_cast<void*>(elf_buffer));
+    ker::loader::elf::TlsModule const TLS_INFO =
+        FILE_BACKED_ELF ? loader::elf::extract_tls_info(prepared_elf.view) : loader::elf::extract_tls_info(static_cast<void*>(elf_buffer));
     auto* new_thread =
         mod::sched::threading::create_thread(ker::mod::mm::USER_STACK_SIZE, TLS_INFO.tls_size, new_pagemap, task->pid, TLS_INFO);
     char* new_name = nullptr;
@@ -1946,7 +2276,9 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
         .lazy_file_ranges = EXEC_LAZY_FILE_SEGMENTS ? &main_loader_lazy_ranges : nullptr,
     };
     loader::elf::ElfLoadResult elf_result =
-        loader::elf::load_elf(reinterpret_cast<loader::elf::ElfFile*>(elf_buffer), new_pagemap, task->pid, task->name, MAIN_LOAD_OPTIONS);
+        FILE_BACKED_ELF ? loader::elf::load_elf(prepared_elf.view, new_pagemap, task->pid, task->name, MAIN_LOAD_OPTIONS)
+                        : loader::elf::load_elf(reinterpret_cast<loader::elf::ElfFile*>(elf_buffer), new_pagemap, task->pid, task->name,
+                                                MAIN_LOAD_OPTIONS);
     if (elf_result.entry_point == 0) {
 #ifdef EXEC_DEBUG
         dbg::log("wos_proc_execve: ELF load failed for '%s'", exec_path);
@@ -1964,7 +2296,9 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
         free_kernel_arg_env_once();
         return static_cast<uint64_t>(-ENOMEM);
     }
-    release_exec_file_once();
+    if (!FILE_BACKED_ELF) {
+        release_exec_file_once();
+    }
     end_local_proc_stage(task, perf::WkiPerfLocalProcOp::LOAD_ELF, LOAD_ELF_STAGE, 0, static_cast<uint64_t>(FILE_SIZE),
                          WOS_PERF_CALLSITE());
 
@@ -2301,6 +2635,9 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
             delete[] old_elf_buffer;
         }
     }
+    if (old_exec_image_file != nullptr) {
+        vfs::vfs_put_file(old_exec_image_file);
+    }
 
     task->entry = NEW_EXEC_ENTRY;
     task->program_header_addr = NEW_PROGRAM_HEADER_ADDR;
@@ -2308,7 +2645,14 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
     task->program_header_count = NEW_PROGRAM_HEADER_COUNT;
     task->program_header_ent_size = NEW_PROGRAM_HEADER_ENT_SIZE;
     task->elf_buffer = elf_buffer;
-    task->elf_buffer_size = FILE_SIZE;
+    task->elf_buffer_size = ELF_BUFFER_SIZE;
+    task->is_elf_buffer_shared = false;
+    task->elf_buffer_complete = ELF_BUFFER_COMPLETE;
+    task->exec_image_file = FILE_BACKED_ELF ? exec_file : nullptr;
+    task->exec_image_size = FILE_BACKED_ELF ? static_cast<uint64_t>(FILE_SIZE) : 0;
+    if (FILE_BACKED_ELF) {
+        exec_file = nullptr;
+    }
     task->interp_base = new_interp_base;
     task->mmap_next.store(0, std::memory_order_relaxed);
 
