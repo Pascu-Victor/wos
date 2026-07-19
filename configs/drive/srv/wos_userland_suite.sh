@@ -106,6 +106,14 @@ MANDEL_HEIGHT="${WOS_SUITE_MANDEL_HEIGHT:-$DEFAULT_MANDEL_HEIGHT}"
 MANDEL_MAX_ITER="${WOS_SUITE_MANDEL_MAX_ITER:-$DEFAULT_MANDEL_MAX_ITER}"
 MANDEL_THREADS="${WOS_SUITE_MANDEL_THREADS:-8}"
 MANDEL_REPEAT="${WOS_SUITE_MANDEL_REPEAT:-$DEFAULT_MANDEL_REPEAT}"
+if [ "${WOS_SUITE_MANDEL_NODES+x}" = x ]; then
+    MANDEL_NODES="$WOS_SUITE_MANDEL_NODES"
+else
+    # Auto-placement deliberately requires a remote peer. Keep the aggregate
+    # suite valid on a one-node cluster while allowing distributed runs to
+    # provide a comma-separated node list explicitly.
+    MANDEL_NODES="$(hostname)"
+fi
 
 RENDER_SCENE="${WOS_SUITE_RENDER_SCENE:-/srv/Duck.glb}"
 RENDER_WIDTH="${WOS_SUITE_RENDER_WIDTH:-$DEFAULT_RENDER_WIDTH}"
@@ -528,7 +536,8 @@ case_mandelbench() {
             --height "$MANDEL_HEIGHT" \
             --max-iter "$MANDEL_MAX_ITER" \
             --threads "$MANDEL_THREADS" \
-            --repeat "$MANDEL_REPEAT"
+            --repeat "$MANDEL_REPEAT" \
+            --nodes "$MANDEL_NODES"
     )
 }
 
@@ -752,7 +761,7 @@ printf 'RESULT_DIR=%s\n' "$ARTIFACT_ROOT"
 printf 'CASE_TIMEOUT_SECONDS=%s\n' "$CASE_TIMEOUT_SECONDS"
 printf 'CAT_BEE_ITERATIONS=%s\n' "$BEE_ITERATIONS"
 printf 'DATA_MIB=%s\n' "$DATA_MIB"
-printf 'MANDELBENCH=%sx%s iter=%s repeat=%s workers=%s\n' "$MANDEL_WIDTH" "$MANDEL_HEIGHT" "$MANDEL_MAX_ITER" "$MANDEL_REPEAT" "$MANDEL_THREADS"
+printf 'MANDELBENCH=%sx%s iter=%s repeat=%s workers=%s nodes=%s\n' "$MANDEL_WIDTH" "$MANDEL_HEIGHT" "$MANDEL_MAX_ITER" "$MANDEL_REPEAT" "$MANDEL_THREADS" "$MANDEL_NODES"
 printf 'RENDERBENCH=%sx%s spp=%s depth=%s scene=%s\n' "$RENDER_WIDTH" "$RENDER_HEIGHT" "$RENDER_SPP" "$RENDER_MAX_DEPTH" "$RENDER_SCENE"
 printf 'NETBENCH_CASE_TIMEOUT_SECONDS=%s\n' "$NETBENCH_CASE_TIMEOUT_SECONDS"
 
