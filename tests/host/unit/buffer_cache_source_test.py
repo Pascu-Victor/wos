@@ -124,9 +124,13 @@ def main() -> None:
             "if (size > BUFFER_CACHE_BUDDY_ALLOC_MAX_BYTES)",
             'kernel_vmap_alloc(size, "buffer_cache")',
             "flags |= BH_DATA_VMAP",
-            "ker::mod::mm::phys::page_alloc_full_overwrite(size, \"buffer_cache\")",
+            "ker::mod::mm::phys::page_alloc_full_overwrite_may_fail(size, \"buffer_cache\")",
+            "if (page_data != nullptr)",
+            "flags |= BH_DATA_PAGE_ALLOC",
+            'kernel_vmap_alloc(size, "buffer_cache")',
+            "flags |= BH_DATA_VMAP",
         ],
-        "buffer data allocation must use order-0 virtual backing before falling back to bounded buddy allocations",
+        "buffer data allocation must use order-0 virtual backing for large runs and as the bounded buddy fallback",
     )
 
     free_data_body = function_body(source, "free_data_buffer")

@@ -498,12 +498,23 @@ auto allocate_buffer_data(size_t size, uint32_t& flags) -> uint8_t* {
     }
 #endif
     if (size >= ker::mod::mm::paging::PAGE_SIZE && (size % ker::mod::mm::paging::PAGE_SIZE) == 0) {
-        auto* page_data = static_cast<uint8_t*>(ker::mod::mm::phys::page_alloc_full_overwrite(size, "buffer_cache"));
-        if (page_data == nullptr) {
-            return nullptr;
+        auto* page_data = static_cast<uint8_t*>(ker::mod::mm::phys::page_alloc_full_overwrite_may_fail(size, "buffer_cache"));
+        if (page_data != nullptr) {
+            flags |= BH_DATA_PAGE_ALLOC;
+            return page_data;
         }
-        flags |= BH_DATA_PAGE_ALLOC;
-        return page_data;
+#ifndef WOS_HOST_TEST
+        // Small buffers normally use the buddy allocator to avoid vmap
+        // lifecycle overhead. Under fragmentation, retain the same contiguous
+        // virtual layout with independent order-0 backing pages.
+        auto* data = static_cast<uint8_t*>(ker::mod::mm::virt::kernel_vmap_alloc(size, "buffer_cache"));
+        if (data != nullptr) {
+            flags |= BH_DATA_VMAP;
+        }
+        return data;
+#else
+        return nullptr;
+#endif
     }
     return new uint8_t[size];
 }
