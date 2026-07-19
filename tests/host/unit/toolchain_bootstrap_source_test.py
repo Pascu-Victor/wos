@@ -1564,13 +1564,16 @@ def test_wos_toolchain_uses_shared_busybox_and_dropbear_build_scripts() -> None:
             'bootstrap_phase_start 10 "Bash for WOS userspace"',
             'bootstrap_phase_start 11 "Ninja for WOS userspace"',
             'bootstrap_phase_start 12 "CMake for WOS userspace"',
-            'bootstrap_phase_start 13 "CPython for WOS userspace"',
-            'bootstrap_phase_start 14 "Meson for WOS userspace"',
-            'bootstrap_phase_start 15 "NASM for WOS userspace"',
-            'bootstrap_phase_start 16 "ncurses and nano for WOS userspace"',
-            'bootstrap_phase_start 17 "zlib LibreSSL and curl for WOS userspace"',
+            'bootstrap_phase_start 13 "NASM for WOS userspace"',
+            'bootstrap_phase_start 14 "ncurses and nano for WOS userspace"',
+            'bootstrap_phase_start 15 "zlib LibreSSL and curl for WOS userspace"',
+            'bootstrap_phase_start 16 "CPython for WOS userspace"',
+            'bootstrap_phase_start 17 "Meson for WOS userspace"',
             'bootstrap_phase_start 18 "Git for WOS userspace"',
             'bootstrap_phase_start 19 "clang/lld for WOS userspace"',
+            'if [ "$HOST_SYSTEM" = "WOS" ]; then',
+            'CLANG_FOR_WOS_CMAKE="$SYSROOT/bin/cmake"',
+            'WOS_CMAKE_COMMAND="$CLANG_FOR_WOS_CMAKE"',
             'WOS_HOST_TOOLCHAIN_ROOT="$HOST" \\',
             'WOS_BUSYBOX_BUILD_DIR="$B/busybox-build" \\',
             'WOS_BUSYBOX_INSTALL_DIR="$B/busybox-install" \\',
@@ -1584,6 +1587,14 @@ def test_wos_toolchain_uses_shared_busybox_and_dropbear_build_scripts() -> None:
             '"$B/../scripts/build/build_clang_for_wos.sh"',
         ],
         "WOS target toolchain BusyBox/Dropbear script delegation",
+    )
+    require_tokens(
+        WOS_CLANG_BUILD.read_text(),
+        [
+            'WOS_CMAKE_COMMAND="${WOS_CMAKE_COMMAND:-cmake}"',
+            '"$WOS_CMAKE_COMMAND" -S "$LLVM_SRC" -B "$CLANG_BUILD" -G Ninja',
+        ],
+        "native clang build CMake selection",
     )
 
     forbidden = [

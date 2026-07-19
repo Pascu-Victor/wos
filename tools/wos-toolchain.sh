@@ -874,8 +874,21 @@ bootstrap_phase_end
 
 # 19. Build clang/lld for WOS userspace
 bootstrap_phase_start 19 "clang/lld for WOS userspace"
+CLANG_FOR_WOS_CMAKE=cmake
+if [ "$HOST_SYSTEM" = "WOS" ]; then
+    CLANG_FOR_WOS_CMAKE="$SYSROOT/bin/cmake"
+    # WOS Bash's -x file test can report a false negative on XFS even when
+    # the executable mode bits are set and execve() succeeds.  Phase 12 owns
+    # this path, so require the artifact here and let the invocation below
+    # authoritatively validate executability.
+    if [ ! -e "$CLANG_FOR_WOS_CMAKE" ]; then
+        echo "ERROR: native WOS clang build requires Phase 12 CMake at $CLANG_FOR_WOS_CMAKE" >&2
+        exit 1
+    fi
+fi
 WOS_HOST_TOOLCHAIN_ROOT="$HOST" \
     WOS_SYSROOT_PATH="$SYSROOT" \
     WOS_CLANG_FOR_WOS_BUILD_DIR="$B/clang-wos-build" \
+    WOS_CMAKE_COMMAND="$CLANG_FOR_WOS_CMAKE" \
     "$B/../scripts/build/build_clang_for_wos.sh"
 bootstrap_phase_end

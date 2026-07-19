@@ -56,6 +56,7 @@ LLVM_SRC="$B/src/llvm-project/llvm"
 TARGET_ARCH="${WOS_TARGET_ARCH:-x86_64-pc-wos}"
 CLANG_VERSION="${WOS_CLANG_VERSION:-22}"
 HOST_PYTHON="${HOST_PYTHON:-$(command -v python3)}"
+WOS_CMAKE_COMMAND="${WOS_CMAKE_COMMAND:-cmake}"
 
 export NINJA_STATUS="[%f/%t %e] "
 export PATH="$HOST/bin:$PATH"
@@ -92,7 +93,7 @@ TARGET_LINK_FLAGS="--sysroot=$TARGET_SYSROOT -fuse-ld=lld -L$TARGET_SYSROOT/lib 
 TARGET_CXX_STANDARD_LIBRARIES="-lc++ -lc++abi -lunwind -lm -lpthread -ldl -lrt -lc"
 
 wos_timed_step "configure" "clang_for_wos" \
-    cmake -S "$LLVM_SRC" -B "$CLANG_BUILD" -G Ninja \
+    "$WOS_CMAKE_COMMAND" -S "$LLVM_SRC" -B "$CLANG_BUILD" -G Ninja \
     "${WOS_CCACHE_CMAKE_ARGS[@]}" \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_INSTALL_PREFIX="$TARGET_SYSROOT/usr" \
