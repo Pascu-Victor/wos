@@ -29,7 +29,7 @@ timestamp() {
 }
 
 RUN_ID="${WOS_SUITE_RUN_ID:-$(timestamp)}"
-SUITE_REVISION="case-watchdog-v5"
+SUITE_REVISION="command-matrix-v2"
 SCALE="${WOS_SUITE_SCALE:-full}"
 
 case "$SCALE" in
@@ -87,6 +87,7 @@ ARTIFACT_ROOT="${WOS_SUITE_ARTIFACT_ROOT:-/tmp/wos-userland-suite-$RUN_ID}"
 LOG_DIR="$ARTIFACT_ROOT/logs"
 WORK_DIR="$ARTIFACT_ROOT/work"
 SUMMARY_FILE="$ARTIFACT_ROOT/summary.tsv"
+COMMAND_MATRIX_ROOT="${WOS_SUITE_COMMAND_MATRIX_ROOT:-/root/wos-command-matrix-$RUN_ID}"
 
 BEE_ITERATIONS="${WOS_SUITE_BEE_ITERATIONS:-$DEFAULT_BEE_ITERATIONS}"
 DATA_MIB="${WOS_SUITE_DATA_MIB:-$DEFAULT_DATA_MIB}"
@@ -435,6 +436,11 @@ case_shell_validate() {
     sh /srv/tests/validate.sh
 }
 
+case_command_mix() {
+    case_id="$1"
+    sh /srv/tests/command_matrix.sh "$case_id" "$COMMAND_MATRIX_ROOT"
+}
+
 case_testd() {
     /usr/bin/testd
 }
@@ -770,6 +776,109 @@ if [ -f /srv/tests/validate.sh ]; then
 else
     skip_case shell_validate "missing /srv/tests/validate.sh"
 fi
+
+# Keep these registrations explicit: runtime_test_audit.py treats each entry as
+# a required independently logged case, and catches missing/duplicate results.
+run_case command_mix_001 case_command_mix 1
+run_case command_mix_002 case_command_mix 2
+run_case command_mix_003 case_command_mix 3
+run_case command_mix_004 case_command_mix 4
+run_case command_mix_005 case_command_mix 5
+run_case command_mix_006 case_command_mix 6
+run_case command_mix_007 case_command_mix 7
+run_case command_mix_008 case_command_mix 8
+run_case command_mix_009 case_command_mix 9
+run_case command_mix_010 case_command_mix 10
+run_case command_mix_011 case_command_mix 11
+run_case command_mix_012 case_command_mix 12
+run_case command_mix_013 case_command_mix 13
+run_case command_mix_014 case_command_mix 14
+run_case command_mix_015 case_command_mix 15
+run_case command_mix_016 case_command_mix 16
+run_case command_mix_017 case_command_mix 17
+run_case command_mix_018 case_command_mix 18
+run_case command_mix_019 case_command_mix 19
+run_case command_mix_020 case_command_mix 20
+run_case command_mix_021 case_command_mix 21
+run_case command_mix_022 case_command_mix 22
+run_case command_mix_023 case_command_mix 23
+run_case command_mix_024 case_command_mix 24
+run_case command_mix_025 case_command_mix 25
+run_case command_mix_026 case_command_mix 26
+run_case command_mix_027 case_command_mix 27
+run_case command_mix_028 case_command_mix 28
+run_case command_mix_029 case_command_mix 29
+run_case command_mix_030 case_command_mix 30
+run_case command_mix_031 case_command_mix 31
+run_case command_mix_032 case_command_mix 32
+run_case command_mix_033 case_command_mix 33
+run_case command_mix_034 case_command_mix 34
+run_case command_mix_035 case_command_mix 35
+run_case command_mix_036 case_command_mix 36
+run_case command_mix_037 case_command_mix 37
+run_case command_mix_038 case_command_mix 38
+run_case command_mix_039 case_command_mix 39
+run_case command_mix_040 case_command_mix 40
+run_case command_mix_041 case_command_mix 41
+run_case command_mix_042 case_command_mix 42
+run_case command_mix_043 case_command_mix 43
+run_case command_mix_044 case_command_mix 44
+run_case command_mix_045 case_command_mix 45
+run_case command_mix_046 case_command_mix 46
+run_case command_mix_047 case_command_mix 47
+run_case command_mix_048 case_command_mix 48
+run_case command_mix_049 case_command_mix 49
+run_case command_mix_050 case_command_mix 50
+run_case command_mix_051 case_command_mix 51
+run_case command_mix_052 case_command_mix 52
+run_case command_mix_053 case_command_mix 53
+run_case command_mix_054 case_command_mix 54
+run_case command_mix_055 case_command_mix 55
+run_case command_mix_056 case_command_mix 56
+run_case command_mix_057 case_command_mix 57
+run_case command_mix_058 case_command_mix 58
+run_case command_mix_059 case_command_mix 59
+run_case command_mix_060 case_command_mix 60
+run_case command_mix_061 case_command_mix 61
+run_case command_mix_062 case_command_mix 62
+run_case command_mix_063 case_command_mix 63
+run_case command_mix_064 case_command_mix 64
+run_case command_mix_065 case_command_mix 65
+run_case command_mix_066 case_command_mix 66
+run_case command_mix_067 case_command_mix 67
+run_case command_mix_068 case_command_mix 68
+run_case command_mix_069 case_command_mix 69
+run_case command_mix_070 case_command_mix 70
+run_case command_mix_071 case_command_mix 71
+run_case command_mix_072 case_command_mix 72
+run_case command_mix_073 case_command_mix 73
+run_case command_mix_074 case_command_mix 74
+run_case command_mix_075 case_command_mix 75
+run_case command_mix_076 case_command_mix 76
+run_case command_mix_077 case_command_mix 77
+run_case command_mix_078 case_command_mix 78
+run_case command_mix_079 case_command_mix 79
+run_case command_mix_080 case_command_mix 80
+run_case command_mix_081 case_command_mix 81
+run_case command_mix_082 case_command_mix 82
+run_case command_mix_083 case_command_mix 83
+run_case command_mix_084 case_command_mix 84
+run_case command_mix_085 case_command_mix 85
+run_case command_mix_086 case_command_mix 86
+run_case command_mix_087 case_command_mix 87
+run_case command_mix_088 case_command_mix 88
+run_case command_mix_089 case_command_mix 89
+run_case command_mix_090 case_command_mix 90
+run_case command_mix_091 case_command_mix 91
+run_case command_mix_092 case_command_mix 92
+run_case command_mix_093 case_command_mix 93
+run_case command_mix_094 case_command_mix 94
+run_case command_mix_095 case_command_mix 95
+run_case command_mix_096 case_command_mix 96
+run_case command_mix_097 case_command_mix 97
+run_case command_mix_098 case_command_mix 98
+run_case command_mix_099 case_command_mix 99
+run_case command_mix_100 case_command_mix 100
 
 if [ "$RUN_TESTD" = "1" ] && require_exe testd /usr/bin/testd; then
     run_case testd case_testd

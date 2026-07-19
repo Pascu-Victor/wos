@@ -17,6 +17,7 @@ WOS_SHOWCASE_BENCH = ROOT / "configs" / "rootfs" / "root" / "wos-showcase" / "30
 WOS_SHOWCASE_COMMON = ROOT / "configs" / "rootfs" / "root" / "wos-showcase" / "showcase-common.sh"
 WOS_METADATA_BENCH = ROOT / "configs" / "rootfs" / "root" / "wos-showcase" / "metadata_bench.py"
 USERLAND_SUITE = ROOT / "configs" / "drive" / "srv" / "wos_userland_suite.sh"
+COMMAND_MATRIX = ROOT / "configs" / "drive" / "srv" / "tests" / "command_matrix.sh"
 RUN_USERLAND_SUITE = ROOT / "scripts" / "bench" / "run_wos_userland_suite.sh"
 WOS_SSH = ROOT / "scripts" / "remote" / "wos_ssh.sh"
 
@@ -266,7 +267,7 @@ def test_userland_suite_passes_netbench_timeout() -> None:
         source,
         [
             "NETBENCH_TIMEOUT_MS=\"${WOS_SUITE_NETBENCH_TIMEOUT_MS:-30000}\"",
-            "SUITE_REVISION=\"case-watchdog-v5\"",
+            "SUITE_REVISION=\"command-matrix-v2\"",
             "SUITE_REVISION=%s",
             "NETBENCH_CASE_TIMEOUT_SECONDS=\"${WOS_SUITE_NETBENCH_CASE_TIMEOUT_SECONDS:-120}\"",
             "invalid WOS_SUITE_NETBENCH_CASE_TIMEOUT_SECONDS=%s; using 120",
@@ -351,6 +352,53 @@ def test_userland_suite_passes_netbench_timeout() -> None:
         ],
         "suite netbench abort trap",
     )
+
+
+def test_userland_suite_registers_command_matrix() -> None:
+    source = USERLAND_SUITE.read_text()
+    dispatcher = COMMAND_MATRIX.read_text()
+
+    registrations = re.findall(
+        r"^run_case command_mix_(\d{3}) case_command_mix (\d+)$",
+        source,
+        flags=re.MULTILINE,
+    )
+    expected = [(f"{case_id:03d}", str(case_id)) for case_id in range(1, 101)]
+    if registrations != expected:
+        fail("wos-userland-suite must register exactly command_mix_001 through command_mix_100 in order")
+
+    case_command_mix = shell_function_body(source, "case_command_mix")
+    require_tokens(
+        source,
+        [
+            'COMMAND_MATRIX_ROOT="${WOS_SUITE_COMMAND_MATRIX_ROOT:-/root/wos-command-matrix-$RUN_ID}"',
+            "runtime_test_audit.py treats each entry as",
+        ],
+        "suite command-matrix root and audit contract",
+    )
+    require_tokens(
+        case_command_mix,
+        ['sh /srv/tests/command_matrix.sh "$case_id" "$COMMAND_MATRIX_ROOT"'],
+        "suite command-matrix dispatcher",
+    )
+    require_tokens(
+        dispatcher,
+        [
+            'if [ "$case_id" -lt 1 ] || [ "$case_id" -gt 100 ]',
+            "set -eu",
+            "group=$(( (case_id - 1) / 5 + 1 ))",
+            "variant=$(( (case_id - 1) % 5 + 1 ))",
+            'per_worker=$((variant + 5))',
+            'git fsck --no-dangling',
+            '/usr/bin/clang "$obj" -o "$bin"',
+            'CC=/usr/bin/clang cmake -S "$case_dir"',
+            '/usr/bin/llvm-ar rcs "$case_dir/libmatrix.a"',
+        ],
+        "command-matrix bounded stress and toolchain coverage",
+    )
+
+    subprocess.run(["sh", "-n", str(COMMAND_MATRIX)], check=True)
+    subprocess.run(["sh", "-n", str(USERLAND_SUITE)], check=True)
 
 
 def test_userland_suite_cases_are_watchdog_bounded() -> None:
@@ -1513,6 +1561,7 @@ def main() -> None:
     test_ping_receive_is_deadline_bounded()
     test_netbench_io_is_deadline_bounded()
     test_userland_suite_passes_netbench_timeout()
+    test_userland_suite_registers_command_matrix()
     test_userland_suite_cases_are_watchdog_bounded()
     test_userland_suite_can_request_guest_shutdown()
     test_wos_ssh_connect_path_is_bounded()
