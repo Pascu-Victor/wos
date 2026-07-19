@@ -19,6 +19,7 @@
 #include "platform/dbg/dbg.hpp"
 #include "platform/debug/ptrace.hpp"
 #include "platform/interrupt/gdt.hpp"
+#include "platform/mm/virt.hpp"
 #include "platform/sched/scheduler.hpp"
 #include "syscalls_impl/log/sys_log.hpp"
 #include "syscalls_impl/multiproc/threadInfo.hpp"
@@ -156,6 +157,11 @@ extern "C" auto syscall_handler(cpu::GPRegs* regs) -> uint64_t {
     if (ker::mod::debug::ptrace::report_syscall_stop(exit_regs, callnum_raw, true)) {
         result = exit_regs.rax;
     }
+    // Buffer-cache eviction can queue vmap frees while nested filesystem
+    // spinlocks keep preemption disabled.  The common syscall-return boundary
+    // is outside those locks, so enforce the warm-pool cap before returning to
+    // userspace.  The helper remains a no-op for deliberately IRQ-off paths.
+    ker::mod::mm::virt::drain_kernel_vmap_frees_if_over_limit();
     return result;
 }
 

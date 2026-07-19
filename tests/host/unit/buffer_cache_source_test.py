@@ -153,6 +153,19 @@ def main() -> None:
         "buffer cache must expose a safe post-lock warm-pool drain",
     )
 
+    dirty_worker_body = function_body(source, "dirty_writeback_worker")
+    require_order(
+        dirty_worker_body,
+        [
+            "dirty_writeback_queued.store(false",
+            "cache_lock.unlock_irqrestore(IRQFLAGS)",
+            "if (STILL_DIRTY)",
+            "request_dirty_writeback()",
+            "drain_deferred_data_buffer_frees_if_over_limit()",
+        ],
+        "writeback worker completion must enforce the vmap cap outside filesystem locks",
+    )
+
     snapshot_body = function_body(source, "make_writeback_run_snapshot")
     require_order(
         snapshot_body,

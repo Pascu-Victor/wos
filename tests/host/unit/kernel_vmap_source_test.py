@@ -11,6 +11,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[3]
 VIRT = ROOT / "modules/kern/src/platform/mm/virt.opt.cpp"
 MM = ROOT / "modules/kern/src/platform/mm/mm.opt.cpp"
+SYSCALL = ROOT / "modules/kern/src/platform/sys/syscall.cpp"
 
 
 def fail(message: str) -> None:
@@ -49,6 +50,7 @@ def require_order(source: str, tokens: list[str], context: str) -> None:
 def main() -> None:
     source = VIRT.read_text()
     mm_source = MM.read_text()
+    syscall_source = SYSCALL.read_text()
 
     require_order(
         function_body(mm_source, "init"),
@@ -141,6 +143,17 @@ def main() -> None:
             "release_kernel_vmap_span(first_page, page_count, true)",
         ],
         "deferred frees must shoot down only from a safe single drainer",
+    )
+
+    require_order(
+        function_body(syscall_source, "syscall_handler"),
+        [
+            "sched::finish_syscall_accounting()",
+            "report_syscall_stop(exit_regs, callnum_raw, true)",
+            "drain_kernel_vmap_frees_if_over_limit()",
+            "return result",
+        ],
+        "syscall return must enforce the vmap cap after nested subsystem locks unwind",
     )
 
     service_body = function_body(source, "service_tlb_shootdown_requests_for_cpu")

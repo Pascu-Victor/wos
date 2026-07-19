@@ -2722,6 +2722,11 @@ void dirty_writeback_worker(void* unused) {
     if (STILL_DIRTY) {
         static_cast<void>(request_dirty_writeback());
     }
+
+    // Kernel producers do not necessarily cross a syscall-return boundary.
+    // This worker is now outside the cache lock and any filesystem call, so it
+    // is a safe fallback point for enforcing the deferred vmap-free cap.
+    drain_deferred_data_buffer_frees_if_over_limit();
 }
 
 }  // anonymous namespace
