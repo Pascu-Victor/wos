@@ -18,6 +18,8 @@ inline auto page_alloc(uint64_t size, std::string_view = "anonymous") -> void* {
     return std::aligned_alloc(alignof(std::max_align_t), size);
 }
 
+inline auto page_alloc_full_overwrite(uint64_t size, std::string_view name = "full_overwrite") -> void* { return page_alloc(size, name); }
+
 inline void page_free(void* page) { std::free(page); }
 
 inline auto get_free_mem_pages() -> uint64_t { return 1024 * 1024; }

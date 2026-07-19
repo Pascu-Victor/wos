@@ -75,18 +75,33 @@ def main() -> None:
     )
     require(
         source,
-        "constexpr size_t BUFFER_CACHE_MEMORY_DIVISOR = 4;",
-        "buffer-cache max must leave headroom for non-cache kernel allocations",
+        "constexpr size_t BUFFER_CACHE_MEMORY_NUMERATOR = 7;",
+        "buffer-cache max numerator",
     )
     require(
         source,
-        "constexpr size_t DIRTY_TARGET_MEMORY_DIVISOR = 20;",
-        "dirty target must stay below global memory pressure thresholds",
+        "constexpr size_t BUFFER_CACHE_MEMORY_DENOMINATOR = 16;",
+        "buffer-cache max denominator",
     )
     require(
         source,
-        "constexpr size_t BUFFER_CACHE_MAX_SIZE = size_t{1} * 1024 * 1024 * 1024;",
-        "buffer-cache max must be capped until global reclaim is mature",
+        "constexpr size_t DIRTY_TARGET_MEMORY_DIVISOR = 8;",
+        "normal-memory dirty target divisor",
+    )
+    require(
+        source,
+        "constexpr size_t DIRTY_TARGET_LARGE_MEMORY_DIVISOR = 4;",
+        "large-memory dirty target divisor",
+    )
+    require(
+        source,
+        "constexpr uint64_t DIRTY_TARGET_LARGE_MEMORY_THRESHOLD = uint64_t{8} * 1024 * 1024 * 1024;",
+        "large-memory dirty target threshold",
+    )
+    require(
+        source,
+        "constexpr size_t BUFFER_CACHE_MAX_SIZE = size_t{16} * 1024 * 1024 * 1024;",
+        "buffer-cache max cap",
     )
     require(
         source,
@@ -101,7 +116,7 @@ def main() -> None:
             "flags &= ~BH_DATA_PAGE_ALLOC",
             "if (size > BUFFER_CACHE_CONTIG_ALLOC_MAX_BYTES)",
             "return nullptr",
-            "ker::mod::mm::phys::page_alloc(size, \"buffer_cache\")",
+            "ker::mod::mm::phys::page_alloc_full_overwrite(size, \"buffer_cache\")",
         ],
         "buffer data allocation must reject overlarge contiguous buffers before page allocation",
     )
@@ -110,22 +125,28 @@ def main() -> None:
     require_order(
         hard_limit_body,
         [
-            "if (target_bytes > max_bytes / 2)",
+            "if (target_bytes == 0)",
+            "return 0",
             "return max_bytes",
-            "return std::min(max_bytes, target_bytes * 2)",
         ],
-        "dirty hard limit must be bounded to about twice the dirty target",
+        "dirty hard limit must preserve the zero target and otherwise use the cache cap",
     )
 
     dirty_target_body = function_body(source, "choose_dirty_target_bytes_for_total")
     require_order(
         dirty_target_body,
         [
+            "size_t const MEMORY_DIVISOR",
+            "DIRTY_TARGET_LARGE_MEMORY_THRESHOLD",
+            "DIRTY_TARGET_LARGE_MEMORY_DIVISOR",
+            "DIRTY_TARGET_MEMORY_DIVISOR",
             "uint64_t const MIN_TARGET",
-            "uint64_t const MAX_TARGET = std::max<uint64_t>(MIN_TARGET, max_bytes / DIRTY_TARGET_DIVISOR)",
+            "uint64_t const MAX_TARGET",
+            "DIRTY_TARGET_MAX_NUMERATOR",
+            "DIRTY_TARGET_MAX_DENOMINATOR",
             "std::clamp<uint64_t>(SCALED, MIN_TARGET, MAX_TARGET)",
         ],
-        "dirty target must stay below the hard limit on large-memory VMs",
+        "dirty target must scale by memory class and stay below the configured fraction of the cache cap",
     )
 
     candidate_body = function_body(source, "find_writeback_candidate_locked")
@@ -246,7 +267,7 @@ def main() -> None:
         "checked buffer-cache block span sizing",
     )
 
-    for name in ("bread_multi", "bget_multi"):
+    for name in ("bread_multi", "bget_multi_impl"):
         body = function_body(source, name)
         require_order(
             body,
@@ -265,8 +286,8 @@ def main() -> None:
     for name, allocator, size_token in [
         ("bread", "alloc_detached_buffer(bdev, block_no)", "bdev->block_size"),
         ("bread_multi", "alloc_detached_buffer_with_size(bdev, block_no, total_size, 0)", "total_size"),
-        ("bget", "alloc_detached_buffer(bdev, block_no)", "bdev->block_size"),
-        ("bget_multi", "alloc_detached_buffer_with_size(bdev, block_no, total_size, BH_VALID)", "total_size"),
+        ("bget_impl", "alloc_detached_buffer(bdev, block_no)", "bdev->block_size"),
+        ("bget_multi_impl", "alloc_detached_buffer_with_size(bdev, block_no, total_size, BH_VALID)", "total_size"),
     ]:
         body = function_body(source, name)
         require_order(
@@ -299,8 +320,9 @@ def main() -> None:
         require(xfs_span_body, token, "XFS device block-span guard")
 
     for name, io_call in [
-        ("xfs_buf_read", "bread(ctx->device, dev_block)"),
-        ("xfs_buf_read_multi", "bread_multi(ctx->device, dev_block, dev_count)"),
+        ("xfs_buf_read", "bread(ctx->device, dev_block, BufferReadClass::FILESYSTEM_METADATA)"),
+        ("xfs_buf_read_data", "bread(ctx->device, dev_block, BufferReadClass::FILE_DATA)"),
+        ("xfs_buf_read_multi", "bread_multi(ctx->device, dev_block, dev_count, BufferReadClass::FILESYSTEM_METADATA)"),
         ("xfs_buf_get", "bget(ctx->device, dev_block)"),
         ("xfs_buf_get_multi", "bget_multi(ctx->device, dev_block, dev_count)"),
     ]:
