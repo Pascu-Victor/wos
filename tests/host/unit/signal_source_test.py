@@ -6,8 +6,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 SIGNAL_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "sys" / "signal.cpp"
+SYSCALL_ASM = ROOT / "modules" / "kern" / "src" / "platform" / "sys" / "syscall.asm"
 GATES_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "interrupt" / "gates.cpp"
 CONTEXT_SWITCH_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "sys" / "context_switch.cpp"
+COREDUMP_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "dbg" / "coredump.cpp"
 PROCESS_CALLNUMS = ROOT / "modules" / "kern" / "src" / "abi" / "callnums" / "process.h"
 PROCESS_CPP = ROOT / "modules" / "kern" / "src" / "syscalls_impl" / "process" / "process.cpp"
 WOS_PROCESS_H = ROOT / "toolchain" / "src" / "mlibc" / "sysdeps" / "wos" / "include" / "sys" / "process.h"
@@ -105,6 +107,40 @@ def test_syscall_signal_delivery_updates_live_gs_scratch() -> None:
         "write_live_syscall_return(frame.saved_rsp, frame.saved_rip, frame.saved_rflags);",
         "return 1;",
         "sigreturn must restore live GS scratch before the iret return",
+    )
+
+
+def test_signal_iret_preserves_restored_user_r11() -> None:
+    source = SYSCALL_ASM.read_text()
+
+    require_order(
+        source,
+        "jne .signal_iret_return",
+        "mov [rsp + 32], r10",
+        "signal IRET must branch before the SYSRET-only r11 flags update",
+    )
+    require_tokens(
+        source,
+        [
+            ".signal_iret_return:",
+            "mov r11, [rdi + 32]",
+        ],
+        "signal IRET must restore r11 from the saved GPRegs block",
+    )
+
+
+def test_coredump_file_is_private_writable_and_truncated() -> None:
+    source = COREDUMP_CPP.read_text()
+
+    require_tokens(
+        source,
+        [
+            "constexpr int O_WRONLY = 01;",
+            "constexpr int O_CREAT = 0100;",
+            "constexpr int O_TRUNC = 01000;",
+            "ker::vfs::vfs_open(path.data(), O_WRONLY | O_CREAT | O_TRUNC, 0600);",
+        ],
+        "coredump output open contract",
     )
 
 
@@ -307,6 +343,8 @@ def test_sigpending_is_wired_through_wos_sysdeps() -> None:
 
 if __name__ == "__main__":
     test_syscall_signal_delivery_updates_live_gs_scratch()
+    test_signal_iret_preserves_restored_user_r11()
+    test_coredump_file_is_private_writable_and_truncated()
     test_signal_targets_are_user_canonical_on_all_delivery_paths()
     test_interrupt_signal_delivery_is_gated_by_user_return_frame()
     test_synchronous_user_exceptions_can_reach_installed_signal_handlers_before_coredump()
