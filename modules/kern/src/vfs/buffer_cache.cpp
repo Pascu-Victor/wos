@@ -535,6 +535,12 @@ void free_data_buffer(uint8_t* data, uint32_t flags, size_t size) {
     }
 }
 
+void drain_deferred_data_buffer_frees() {
+#ifndef WOS_HOST_TEST
+    ker::mod::mm::virt::drain_kernel_vmap_frees();
+#endif
+}
+
 void free_buffer_data(BufHead* bh) {
     if (bh == nullptr || bh->data == nullptr) {
         return;
@@ -731,12 +737,11 @@ auto reclaim_clean_cache_locked(size_t target_bytes, size_t byte_budget, size_t 
     return stats;
 }
 
-void reclaim_clean_cache_over_limit_locked() {
+auto reclaim_clean_cache_over_limit_locked() -> BufferCacheReclaimStats {
     if (cache_total_bytes <= cache_max_bytes) {
-        return;
+        return {};
     }
-    static_cast<void>(
-        reclaim_clean_cache_locked(cache_max_bytes, HOT_EVICT_MAX_BYTES, HOT_EVICT_MAX_VICTIMS, HOT_EVICT_SCAN_BUDGET, false));
+    return reclaim_clean_cache_locked(cache_max_bytes, HOT_EVICT_MAX_BYTES, HOT_EVICT_MAX_VICTIMS, HOT_EVICT_SCAN_BUDGET, false);
 }
 
 // Cache misses must keep the logical cache close to its cap. WOS does not yet
@@ -2403,8 +2408,11 @@ auto writeback_dirty_one_after(const DirtyWritebackFilter& filter, uint64_t min_
     }
     if (result.status == 0) {
         uint64_t const IRQFLAGS = cache_lock.lock_irqsave();
-        reclaim_clean_cache_over_limit_locked();
+        BufferCacheReclaimStats const RECLAIM = reclaim_clean_cache_over_limit_locked();
         cache_lock.unlock_irqrestore(IRQFLAGS);
+        if (RECLAIM.freed_bytes != 0) {
+            drain_deferred_data_buffer_frees();
+        }
     }
     return result;
 }
@@ -3390,6 +3398,7 @@ void invalidate_bdev(dev::BlockDevice* bdev) {
     }
 
     cache_lock.unlock_irqrestore(IRQFLAGS);
+    drain_deferred_data_buffer_frees();
 }
 
 void discard_bdev_range(dev::BlockDevice* bdev, uint64_t block_no, size_t count) {
@@ -3421,6 +3430,7 @@ void discard_bdev_range(dev::BlockDevice* bdev, uint64_t block_no, size_t count)
         }
 
         cache_lock.unlock_irqrestore(IRQFLAGS);
+        drain_deferred_data_buffer_frees();
         if (discarded_bytes != 0) {
             perf_record_xfs_count(ker::mod::perf::WkiPerfLocalXfsOp::BUF_DISCARD, discarded_bytes);
         }
@@ -3446,6 +3456,7 @@ void discard_bdev_range(dev::BlockDevice* bdev, uint64_t block_no, size_t count)
     }
 
     cache_lock.unlock_irqrestore(IRQFLAGS);
+    drain_deferred_data_buffer_frees();
     if (discarded_bytes != 0) {
         perf_record_xfs_count(ker::mod::perf::WkiPerfLocalXfsOp::BUF_DISCARD, discarded_bytes);
     }
@@ -3514,6 +3525,7 @@ auto reclaim_clean_buffer_cache(size_t target_bytes) -> BufferCacheReclaimStats 
     uint64_t const IRQFLAGS = cache_lock.lock_irqsave();
     stats = reclaim_clean_cache_locked(target_bytes, SIZE_MAX, SIZE_MAX, SIZE_MAX, false);
     cache_lock.unlock_irqrestore(IRQFLAGS);
+    drain_deferred_data_buffer_frees();
     return stats;
 }
 
@@ -3526,6 +3538,7 @@ auto reclaim_clean_buffer_cache_for_pressure(size_t byte_budget) -> size_t {
     size_t const TARGET_BYTES = cache_total_bytes > byte_budget ? cache_total_bytes - byte_budget : 0;
     BufferCacheReclaimStats const STATS = reclaim_clean_cache_locked(TARGET_BYTES, byte_budget, SIZE_MAX, SIZE_MAX, false);
     cache_lock.unlock_irqrestore(IRQFLAGS);
+    drain_deferred_data_buffer_frees();
     return STATS.freed_bytes;
 }
 

@@ -231,9 +231,12 @@ def main() -> None:
         [
             "brelse(run.buffers.at(i))",
             "if (result.status == 0)",
-            "reclaim_clean_cache_over_limit_locked()",
+            "BufferCacheReclaimStats const RECLAIM = reclaim_clean_cache_over_limit_locked()",
+            "cache_lock.unlock_irqrestore(IRQFLAGS)",
+            "if (RECLAIM.freed_bytes != 0)",
+            "drain_deferred_data_buffer_frees()",
         ],
-        "successful dirty writeback should shrink clean cache after releasing writeback refs",
+        "successful dirty writeback should reclaim vmap buffers only after releasing the cache lock",
     )
 
     require(source, "write_dirty_run_buffers_individually", "dirty writeback allocation fallback")

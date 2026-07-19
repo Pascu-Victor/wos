@@ -79,13 +79,16 @@ def main() -> None:
         function_body(source, "kernel_vmap_alloc"),
         [
             "reserve_kernel_vmap_span(PAGE_COUNT, first_page)",
+            "entry->present != 0 && entry->frame != 0",
+            "continue",
             "page_alloc_full_overwrite_page_with_reclaim(name)",
             "map_page(kernel_pagemap",
             "if (mapped_pages != PAGE_COUNT)",
-            "release_kernel_vmap_mappings(START, mapped_pages)",
-            "release_kernel_vmap_span(first_page, PAGE_COUNT)",
+            "queue_kernel_vmap_free(first_page, mapped_pages)",
+            "release_kernel_vmap_span(first_page + mapped_pages, PAGE_COUNT - mapped_pages)",
+            "drain_kernel_vmap_frees()",
         ],
-        "vmap allocation must use order-0 backing and roll back partial mappings",
+        "vmap allocation must reuse cached mappings and reclaim partial failures",
     )
 
     require_order(
@@ -97,6 +100,26 @@ def main() -> None:
             "phys::page_ref_dec(frames.at(page))",
         ],
         "vmap teardown must invalidate every CPU before releasing physical frames",
+    )
+
+    require_order(
+        function_body(source, "kernel_vmap_free"),
+        [
+            "queue_kernel_vmap_free(FIRST_PAGE, PAGE_COUNT)",
+        ],
+        "vmap free must cache mappings without entering a shootdown",
+    )
+
+    require_order(
+        function_body(source, "drain_kernel_vmap_frees"),
+        [
+            "!kernel_vmap_context_can_drain()",
+            "kernel_vmap_draining.compare_exchange_strong",
+            "find_pending_kernel_vmap_run(first_page, page_count)",
+            "release_kernel_vmap_mappings(START, page_count)",
+            "release_kernel_vmap_span(first_page, page_count, true)",
+        ],
+        "deferred frees must shoot down only from a safe single drainer",
     )
 
     service_body = function_body(source, "service_tlb_shootdown_requests_for_cpu")
