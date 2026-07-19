@@ -10,7 +10,6 @@
 
 #include "platform/asm/cpu.hpp"
 #include "platform/mm/addr.hpp"
-#include "platform/mm/page_alloc.hpp"
 #include "platform/mm/paging.hpp"
 #include "platform/mm/phys.hpp"
 
@@ -30,19 +29,6 @@ constexpr uint64_t STACK_GROW_RSP_FAR_BYTES = 512ULL * 1024ULL;
 auto min_u64(uint64_t a, uint64_t b) -> uint64_t { return a < b ? a : b; }
 
 auto max_u64(uint64_t a, uint64_t b) -> uint64_t { return a > b ? a : b; }
-
-auto buddy_backing_size(uint64_t size) -> uint64_t {
-    if (size == 0) {
-        return 0;
-    }
-
-    uint64_t const PAGES = (size + mm::paging::PAGE_SIZE - 1) / mm::paging::PAGE_SIZE;
-    uint64_t rounded_pages = 1;
-    while (rounded_pages < PAGES && rounded_pages < (uint64_t{1} << mm::PageAllocator::MAX_ORDER)) {
-        rounded_pages <<= 1;
-    }
-    return rounded_pages * mm::paging::PAGE_SIZE;
-}
 
 auto stack_top(const Thread* thread) -> uint64_t {
     if (thread == nullptr || thread->stack_size == 0) {
@@ -64,6 +50,29 @@ void free_mapped_user_range(mm::paging::PageTable* page_table, uint64_t start, u
         }
         mm::virt::unmap_page(page_table, addr);
     }
+}
+
+auto write_mapped_user_bytes(mm::paging::PageTable* page_table, uint64_t vaddr, const void* source, size_t size) -> bool {
+    const auto* source_bytes = static_cast<const uint8_t*>(source);
+    while (size != 0) {
+        uint64_t const PADDR = mm::virt::translate(page_table, vaddr);
+        if (PADDR == mm::virt::PADDR_INVALID) {
+            return false;
+        }
+
+        size_t const PAGE_REMAINING = mm::paging::PAGE_SIZE - (vaddr & (mm::paging::PAGE_SIZE - 1));
+        size_t const CHUNK_SIZE = size < PAGE_REMAINING ? size : PAGE_REMAINING;
+        std::memcpy(mm::addr::get_virt_pointer(PADDR), source_bytes, CHUNK_SIZE);
+        source_bytes += CHUNK_SIZE;
+        vaddr += CHUNK_SIZE;
+        size -= CHUNK_SIZE;
+    }
+    return true;
+}
+
+template <typename T>
+auto write_mapped_user_value(mm::paging::PageTable* page_table, uint64_t vaddr, const T& value) -> bool {
+    return write_mapped_user_bytes(page_table, vaddr, &value, sizeof(value));
 }
 }  // namespace
 
@@ -165,59 +174,35 @@ Thread* create_thread(uint64_t stack_size, uint64_t tls_size, mm::paging::PageTa
     uint64_t const TOTAL_TLS_SIZE = ACTUAL_TLS_SIZE + TCB_SIZE + SAFESTACK_SIZE;
     uint64_t const ALIGNED_TOTAL_SIZE = page_align_up(TOTAL_TLS_SIZE);
 
-    void* tls = mm::phys::page_alloc(ALIGNED_TOTAL_SIZE, "thread_tls");
-    if (tls == nullptr) {
-        log::error("create_thread: failed to allocate TLS memory (%llu bytes)", static_cast<unsigned long long>(ALIGNED_TOTAL_SIZE));
-        delete thread;
-        return nullptr;
-    }
-
-    // TLS is reclaimed one 4 KiB leaf at a time during destroy_user_space() /
-    // COW teardown, so split the bulk allocation before exposing it through
-    // page tables. The user stack is backed lazily with single-page leaves.
-    bool const TLS_SPLIT = mm::phys::page_split_to_order0(tls);
-    if (!TLS_SPLIT) {
-        log::error("create_thread: failed to split TLS backing pages tls=%p tls_size=%llu", tls,
-                   static_cast<unsigned long long>(ALIGNED_TOTAL_SIZE));
-        mm::phys::page_free(tls);
-        delete thread;
-        return nullptr;
-    }
-    // page_alloc() returns buddy-sized backing; only the mapped TLS range is
-    // later reclaimed through destroy_user_space(), so return the tail now.
-    uint64_t const TLS_BACKING_SIZE = buddy_backing_size(ALIGNED_TOTAL_SIZE);
-    for (uint64_t offset = ALIGNED_TOTAL_SIZE; offset < TLS_BACKING_SIZE; offset += mm::paging::PAGE_SIZE) {
-        auto* tail_page = reinterpret_cast<uint8_t*>(tls) + offset;
-        std::memset(tail_page, 0, mm::paging::PAGE_SIZE);
-        mm::phys::page_free(tail_page);
-    }
-
-    // CRITICAL FIX: Use page-aligned size for virtual address calculation too
+    // Keep the user ABI contiguous while backing the mapping with independent
+    // order-0 pages. Process creation only needs a contiguous virtual TLS
+    // range; requiring one physical run makes fork/exec fail under harmless
+    // buddy fragmentation.
     uint64_t const TLS_VIRT_ADDR = 0x7FFF00000000ULL - ALIGNED_TOTAL_SIZE;
     uint64_t const STACK_VIRT_ADDR = TLS_VIRT_ADDR - stack_size;
     thread->magic = 0xDEADBEEF;
 
-    // Map all pages for TLS
     for (uint64_t offset = 0; offset < ALIGNED_TOTAL_SIZE; offset += mm::paging::PAGE_SIZE) {
-        auto const TLS_PHYS = reinterpret_cast<uint64_t>(mm::addr::get_phys_pointer(reinterpret_cast<uint64_t>(tls) + offset));
+        void* tls_page = mm::phys::page_alloc(mm::paging::PAGE_SIZE, "thread_tls_page");
+        if (tls_page == nullptr) {
+            log::error("create_thread: failed to allocate TLS page offset=%llu total=%llu", static_cast<unsigned long long>(offset),
+                       static_cast<unsigned long long>(ALIGNED_TOTAL_SIZE));
+            free_mapped_user_range(page_table, TLS_VIRT_ADDR, TLS_VIRT_ADDR + offset);
+            delete thread;
+            return nullptr;
+        }
+        std::memset(tls_page, 0, mm::paging::PAGE_SIZE);
+        auto const TLS_PHYS = reinterpret_cast<uint64_t>(mm::addr::get_phys_pointer(reinterpret_cast<uint64_t>(tls_page)));
         mm::virt::map_page(page_table, TLS_VIRT_ADDR + offset, TLS_PHYS, mm::paging::page_types::USER);
     }
 
     // TCB goes at the TOP of the TLS area (highest address)
-    void* tcb = reinterpret_cast<uint8_t*>(tls) + ACTUAL_TLS_SIZE;
     uint64_t const TCB_VIRT_ADDR = TLS_VIRT_ADDR + ACTUAL_TLS_SIZE;
 
     // SafeStack area goes after the TCB
-    void* safestack_area = reinterpret_cast<uint8_t*>(tls) + ACTUAL_TLS_SIZE + TCB_SIZE;
     uint64_t const SAFESTACK_VIRT_ADDR = TLS_VIRT_ADDR + ACTUAL_TLS_SIZE + TCB_SIZE;
 
-    // Initialize the TLS area (clear it first)
-    std::memset(tls, 0, ACTUAL_TLS_SIZE);
-
     // Initialize the TCB according to mlibc's Tcb structure
-    // Zero out the entire TCB area
-    std::memset(tcb, 0, TCB_SIZE);
-
     // Set up minimal TCB structure for mlibc
     // TCB layout for x86_64 (from mlibc/tcb.hpp):
     // +0x00: selfPointer (Tcb *) - points to TCB itself
@@ -229,29 +214,30 @@ Thread* create_thread(uint64_t stack_size, uint64_t tls_size, mm::paging::PageTa
     // +0x28: stackCanary
     // +0x30: cancelBits
 
-    auto* tcb_ptr = static_cast<uint64_t*>(tcb);
-    tcb_ptr[0] = TCB_VIRT_ADDR;  // selfPointer points to TCB itself
-    tcb_ptr[1] = 1;              // dtvSize
-    tcb_ptr[2] = 0;              // dtvPointers (can be null for now)
-
-    auto* tcb_i32 = static_cast<uint32_t*>(tcb);
-    tcb_i32[6] = static_cast<uint32_t>(initial_tid);  // tid, used by mlibc futex locks
-    tcb_i32[7] = 0;                                   // didExit
-
-    // CRITICAL: Set the stack canary at offset 0x28 (40 decimal)
-    tcb_ptr[5] = 0x3000000018ULL;  // stackCanary at fs:[0x28]
-
-    tcb_i32[12] = 0;  // cancelBits at offset 0x30
+    uint64_t const SELF_POINTER = TCB_VIRT_ADDR;
+    uint64_t const DTV_SIZE = 1;
+    uint64_t const DTV_POINTERS = 0;
+    auto const INITIAL_TID = static_cast<uint32_t>(initial_tid);
+    uint32_t const DID_EXIT = 0;
+    uint64_t const STACK_CANARY = 0x3000000018ULL;
+    uint32_t const CANCEL_BITS = 0;
+    bool const TCB_INITIALIZED = write_mapped_user_value(page_table, TCB_VIRT_ADDR, SELF_POINTER) &&
+                                 write_mapped_user_value(page_table, TCB_VIRT_ADDR + 0x08, DTV_SIZE) &&
+                                 write_mapped_user_value(page_table, TCB_VIRT_ADDR + 0x10, DTV_POINTERS) &&
+                                 write_mapped_user_value(page_table, TCB_VIRT_ADDR + 0x18, INITIAL_TID) &&
+                                 write_mapped_user_value(page_table, TCB_VIRT_ADDR + 0x1C, DID_EXIT) &&
+                                 write_mapped_user_value(page_table, TCB_VIRT_ADDR + 0x28, STACK_CANARY) &&
+                                 write_mapped_user_value(page_table, TCB_VIRT_ADDR + 0x30, CANCEL_BITS);
+    if (!TCB_INITIALIZED) {
+        log::error("create_thread: failed to initialize mapped TCB");
+        free_mapped_user_range(page_table, TLS_VIRT_ADDR, TLS_VIRT_ADDR + ALIGNED_TOTAL_SIZE);
+        delete thread;
+        return nullptr;
+    }
 
     // SafeStack support: The TLS area needs to have space for __safestack_unsafe_stack_ptr
     // This is a thread-local variable that the compiler uses for SafeStack
     // According to the relocation, it should be at TLS offset -8 from the TCB
-
-    // Set up TLS variables area RIGHT BEFORE the TCB (negative offsets from fs register)
-    // Use physical address since the page table hasn't been switched yet
-
-    // Initialize the entire TLS area with zeros first
-    std::memset(tls, 0, ACTUAL_TLS_SIZE);
 
     // For mlibc TLS variables, we need to set up the proper layout:
     // The linker expects TLS variables at specific offsets from the TCB
@@ -259,17 +245,15 @@ Thread* create_thread(uint64_t stack_size, uint64_t tls_size, mm::paging::PageTa
 
     // Set up key TLS variables:
     // 1. SafeStack pointer at the standard location (offset 0 in TLS segment)
-    auto* safestack_ptr = static_cast<uint64_t*>(tls);  // At TLS offset 0
     uint64_t const SAFESTACK_TOP = SAFESTACK_VIRT_ADDR + SAFESTACK_SIZE;
 
     uint64_t const SAFESTACK_PTR_VALUE = SAFESTACK_TOP - 512;  // Leave 512 bytes safety margin from top
-    *safestack_ptr = SAFESTACK_PTR_VALUE;                      // SafeStack grows downward
-
-    auto* errno_ptr = reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(tls) + 0xa0);  // TLS offset 160
-    *errno_ptr = 0;                                                                    // Initialize errno to 0
-
-    // Initialize the SafeStack area
-    std::memset(safestack_area, 0, SAFESTACK_SIZE);
+    if (!write_mapped_user_value(page_table, TLS_VIRT_ADDR, SAFESTACK_PTR_VALUE)) {
+        log::error("create_thread: failed to initialize SafeStack pointer");
+        free_mapped_user_range(page_table, TLS_VIRT_ADDR, TLS_VIRT_ADDR + ALIGNED_TOTAL_SIZE);
+        delete thread;
+        return nullptr;
+    }
 
     // Save TLS mapping info into the Thread object for later initialization
     thread->tls_size = ALIGNED_TOTAL_SIZE;
@@ -286,8 +270,8 @@ Thread* create_thread(uint64_t stack_size, uint64_t tls_size, mm::paging::PageTa
     // User GS_BASE points at the base of the reserved stack range.
     thread->gsbase = STACK_VIRT_ADDR;
 
-    // Store the physical (HHDM) pointers for cleanup
-    thread->tls_phys_ptr = reinterpret_cast<uint64_t>(tls);
+    // TLS pages are owned and reclaimed individually through the user pagemap.
+    thread->tls_phys_ptr = 0;
     thread->stack_phys_ptr = 0;
 
     uint64_t const STACK_TOP = STACK_VIRT_ADDR + stack_size;

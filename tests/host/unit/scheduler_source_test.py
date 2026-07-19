@@ -775,13 +775,21 @@ def test_user_thread_tcbs_publish_nonzero_tid_before_user_execution() -> None:
     require_tokens(
         create_thread_body,
         [
-            "tcb_i32[6] = static_cast<uint32_t>(initial_tid);",
-            "used by mlibc futex locks",
+            'mm::phys::page_alloc(mm::paging::PAGE_SIZE, "thread_tls_page")',
+            "free_mapped_user_range(page_table, TLS_VIRT_ADDR, TLS_VIRT_ADDR + offset);",
+            "auto const INITIAL_TID = static_cast<uint32_t>(initial_tid);",
+            "write_mapped_user_value(page_table, TCB_VIRT_ADDR + 0x18, INITIAL_TID)",
+            "thread->tls_phys_ptr = 0;",
         ],
-        "initial user TCB tid publish",
+        "fragmentation-safe initial user TLS and TCB construction",
     )
-    if "tcb_i32[6] = 0" in create_thread_body:
-        fail("initial user TCB tid must not be left as zero; mlibc futex locks use zero as unlocked")
+    forbidden = [
+        'mm::phys::page_alloc(ALIGNED_TOTAL_SIZE, "thread_tls")',
+        "mm::phys::page_split_to_order0(tls)",
+    ]
+    present = [token for token in forbidden if token in create_thread_body]
+    if present:
+        fail(f"initial user TLS still requires a contiguous physical run: {present[0]}")
 
     require_tokens(
         task_source,

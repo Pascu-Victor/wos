@@ -23,10 +23,10 @@ struct Thread {
     uint64_t tls_base_virt{};
     uint64_t safestack_ptr_value{};
 
-    // Physical memory pointers (HHDM addresses) for direct cleanup. Process
-    // stacks are normally lazily backed, so stack_phys_ptr remains 0 and
-    // destroy_user_space() frees committed pages from the page tables.
-    uint64_t tls_phys_ptr{};    // HHDM pointer to TLS+TCB+SafeStack allocation
+    // Physical memory pointers (HHDM addresses) for legacy direct cleanup.
+    // Current process stacks and TLS are page-granular pagemap-owned ranges,
+    // so both remain 0 and destroy_user_space() frees committed pages.
+    uint64_t tls_phys_ptr{};    // Legacy eager TLS allocation
     uint64_t stack_phys_ptr{};  // HHDM pointer to legacy eager stack allocation
 
     uint32_t magic = 0;
