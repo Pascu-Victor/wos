@@ -27,6 +27,7 @@ constexpr uint32_t BH_DATA_PAGE_ALLOC = (1U << 4);  // Buffer data was allocated
 constexpr uint32_t BH_DIRTY_INDEXED = (1U << 5);    // Buffer is present in the dirty range index
 constexpr uint32_t BH_RANGE_INDEXED = (1U << 6);    // Buffer is present in the cached range index
 constexpr uint32_t BH_LRU_REFERENCED = (1U << 7);   // Clean eviction should give this buffer a second chance
+constexpr uint32_t BH_DATA_VMAP = (1U << 8);        // Buffer data uses virtually-contiguous order-0 backing pages
 
 // Buffer head - represents a single cached block from a block device.
 // Analogous to Linux struct buffer_head / simplified xfs_buf.

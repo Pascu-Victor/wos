@@ -120,6 +120,12 @@ void init_tlb_shootdown();
 void note_tlb_shootdown_cpu_online();
 void service_pending_tlb_shootdowns();
 void init_pagemap();
+// Prepare a bounded kernel virtual arena whose runtime allocations are backed
+// by independent order-0 physical pages. Call after init_pagemap() and before
+// task pagemaps copy the kernel-half PML4 entries.
+void init_kernel_vmap();
+auto kernel_vmap_alloc(uint64_t size, std::string_view name = "kernel_vmap") -> void*;
+void kernel_vmap_free(void* ptr, uint64_t size);
 PageTable* create_pagemap();
 void release_pagemap(PageTable* pagemap);
 void get_page_table_pool_stats_snapshot(PageTablePoolStatsSnapshot& out);

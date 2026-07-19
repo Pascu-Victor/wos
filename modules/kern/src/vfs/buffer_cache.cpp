@@ -23,6 +23,7 @@
 #include <platform/ktime/ktime.hpp>
 #include <platform/mm/paging.hpp>
 #include <platform/mm/phys.hpp>
+#include <platform/mm/virt.hpp>
 #include <platform/perf/perf_events.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
@@ -273,6 +274,9 @@ constexpr size_t DIRTY_HARD_FALLBACK_BUDGET = DIRTY_WRITEBACK_BUDGET * 4;
 constexpr size_t DIRTY_HARD_FALLBACK_BYTES = size_t{64} * 1024 * 1024;
 constexpr size_t DIRTY_WRITEBACK_RUN_MAX_BUFFERS = 1024;
 constexpr size_t BUFFER_CACHE_CONTIG_ALLOC_MAX_BYTES = size_t{2} * 1024 * 1024;
+#ifndef WOS_HOST_TEST
+constexpr size_t BUFFER_CACHE_BUDDY_ALLOC_MAX_BYTES = size_t{64} * 1024;
+#endif
 constexpr size_t DIRTY_WRITEBACK_RUN_MAX_BYTES = BUFFER_CACHE_CONTIG_ALLOC_MAX_BYTES;
 constexpr size_t DIRTY_WAKE_BATCH = 32;
 constexpr size_t DIRTY_COPY_COVERAGE_MAX_INTERVALS = 64;
@@ -381,6 +385,7 @@ BufHeadPool bufhead_pool{};
 struct WritebackSnapshot {
     uint8_t* data = nullptr;
     uint32_t flags = 0;
+    size_t size = 0;
 };
 
 auto perf_xfs_started_us(ker::mod::perf::WkiPerfLocalXfsOp op) -> uint64_t {
@@ -479,10 +484,19 @@ void free_bufhead(BufHead* bh) {
 }
 
 auto allocate_buffer_data(size_t size, uint32_t& flags) -> uint8_t* {
-    flags &= ~BH_DATA_PAGE_ALLOC;
+    flags &= ~(BH_DATA_PAGE_ALLOC | BH_DATA_VMAP);
     if (size > BUFFER_CACHE_CONTIG_ALLOC_MAX_BYTES) {
         return nullptr;
     }
+#ifndef WOS_HOST_TEST
+    if (size > BUFFER_CACHE_BUDDY_ALLOC_MAX_BYTES) {
+        auto* data = static_cast<uint8_t*>(ker::mod::mm::virt::kernel_vmap_alloc(size, "buffer_cache"));
+        if (data != nullptr) {
+            flags |= BH_DATA_VMAP;
+        }
+        return data;
+    }
+#endif
     if (size >= ker::mod::mm::paging::PAGE_SIZE && (size % ker::mod::mm::paging::PAGE_SIZE) == 0) {
         auto* page_data = static_cast<uint8_t*>(ker::mod::mm::phys::page_alloc_full_overwrite(size, "buffer_cache"));
         if (page_data == nullptr) {
@@ -502,10 +516,18 @@ auto checked_block_span_size(const dev::BlockDevice* bdev, size_t count, size_t&
     return true;
 }
 
-void free_data_buffer(uint8_t* data, uint32_t flags) {
+void free_data_buffer(uint8_t* data, uint32_t flags, size_t size) {
     if (data == nullptr) {
         return;
     }
+#ifndef WOS_HOST_TEST
+    if ((flags & BH_DATA_VMAP) != 0) {
+        ker::mod::mm::virt::kernel_vmap_free(data, size);
+        return;
+    }
+#else
+    (void)size;
+#endif
     if ((flags & BH_DATA_PAGE_ALLOC) != 0) {
         ker::mod::mm::phys::page_free(data);
     } else {
@@ -517,9 +539,9 @@ void free_buffer_data(BufHead* bh) {
     if (bh == nullptr || bh->data == nullptr) {
         return;
     }
-    free_data_buffer(bh->data, bh->flags);
+    free_data_buffer(bh->data, bh->flags, bh->size);
     bh->data = nullptr;
-    bh->flags &= ~BH_DATA_PAGE_ALLOC;
+    bh->flags &= ~(BH_DATA_PAGE_ALLOC | BH_DATA_VMAP);
 }
 
 auto make_writeback_snapshot(const BufHead* bh) -> WritebackSnapshot {
@@ -528,6 +550,7 @@ auto make_writeback_snapshot(const BufHead* bh) -> WritebackSnapshot {
     if (snapshot.data == nullptr) {
         return snapshot;
     }
+    snapshot.size = bh->size;
     memcpy(snapshot.data, bh->data, bh->size);
     return snapshot;
 }
@@ -541,9 +564,10 @@ auto make_writeback_snapshot_for_epoch(const BufHead* bh, uint64_t dirty_epoch) 
 }
 
 void free_writeback_snapshot(WritebackSnapshot& snapshot) {
-    free_data_buffer(snapshot.data, snapshot.flags);
+    free_data_buffer(snapshot.data, snapshot.flags, snapshot.size);
     snapshot.data = nullptr;
     snapshot.flags = 0;
+    snapshot.size = 0;
 }
 
 void free_unlinked_buffer(BufHead* bh) {
@@ -2277,6 +2301,7 @@ auto make_writeback_run_snapshot(const DirtyWritebackRun& run) -> WritebackSnaps
     if (snapshot.data == nullptr) {
         return snapshot;
     }
+    snapshot.size = run.bytes;
 
     size_t offset = 0;
     for (size_t i = 0; i < run.count; ++i) {

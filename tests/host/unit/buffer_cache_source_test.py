@@ -70,6 +70,11 @@ def main() -> None:
     )
     require(
         source,
+        "constexpr size_t BUFFER_CACHE_BUDDY_ALLOC_MAX_BYTES = size_t{64} * 1024;",
+        "buffer-cache buddy allocation cap",
+    )
+    require(
+        source,
         "constexpr size_t DIRTY_WRITEBACK_RUN_MAX_BYTES = BUFFER_CACHE_CONTIG_ALLOC_MAX_BYTES;",
         "dirty writeback must share the contiguous allocation cap",
     )
@@ -113,12 +118,39 @@ def main() -> None:
     require_order(
         allocate_body,
         [
-            "flags &= ~BH_DATA_PAGE_ALLOC",
+            "flags &= ~(BH_DATA_PAGE_ALLOC | BH_DATA_VMAP)",
             "if (size > BUFFER_CACHE_CONTIG_ALLOC_MAX_BYTES)",
             "return nullptr",
+            "if (size > BUFFER_CACHE_BUDDY_ALLOC_MAX_BYTES)",
+            'kernel_vmap_alloc(size, "buffer_cache")',
+            "flags |= BH_DATA_VMAP",
             "ker::mod::mm::phys::page_alloc_full_overwrite(size, \"buffer_cache\")",
         ],
-        "buffer data allocation must reject overlarge contiguous buffers before page allocation",
+        "buffer data allocation must use order-0 virtual backing before falling back to bounded buddy allocations",
+    )
+
+    free_data_body = function_body(source, "free_data_buffer")
+    require_order(
+        free_data_body,
+        [
+            "if ((flags & BH_DATA_VMAP) != 0)",
+            "kernel_vmap_free(data, size)",
+            "if ((flags & BH_DATA_PAGE_ALLOC) != 0)",
+            "page_free(data)",
+            "delete[] data",
+        ],
+        "buffer data free must match virtual, page, and heap backing",
+    )
+
+    snapshot_body = function_body(source, "make_writeback_run_snapshot")
+    require_order(
+        snapshot_body,
+        [
+            "snapshot.data = allocate_buffer_data(run.bytes, snapshot.flags)",
+            "if (snapshot.data == nullptr)",
+            "snapshot.size = run.bytes",
+        ],
+        "writeback snapshots must retain the exact vmap teardown size",
     )
 
     hard_limit_body = function_body(source, "choose_dirty_hard_limit_bytes")

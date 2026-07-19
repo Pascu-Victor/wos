@@ -55,6 +55,10 @@ void init() {
     // Set kernel CR3 for safe memset in pageAlloc when called from userspace context
     auto const KERNEL_PAGEMAP_VADDR = reinterpret_cast<uint64_t>(virt::get_kernel_pagemap());
     phys::set_kernel_cr3(reinterpret_cast<uint64_t>(addr::get_phys_pointer(KERNEL_PAGEMAP_VADDR)));
+    // Runtime virtually-contiguous allocations use pre-created page-table
+    // paths so mapping order-0 backing pages cannot allocate while fragmented.
+    // Install the kernel-half PML4 entry before task pagemaps are created.
+    virt::init_kernel_vmap();
     // Kernel stacks must remain available after small allocations fragment the
     // general buddy zones. Reserve their fixed-size backing before GDT, SMP,
     // and task creation begin.

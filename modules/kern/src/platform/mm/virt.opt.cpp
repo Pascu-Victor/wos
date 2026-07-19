@@ -53,6 +53,87 @@ constexpr uint64_t PTE_FRAME_MASK = 0x000FFFFFFFFFF000ULL;
 
 sys::Spinlock cow_pte_lock;
 
+// Buffer-cache snapshots need contiguous virtual bytes, not contiguous
+// physical frames. Keep this arena within one kernel-half PML4 slot and back
+// it with order-0 pages. Runtime page-table allocation is forbidden: init
+// pre-creates every path that the active prefix can use.
+constexpr vaddr_t KERNEL_VMAP_BASE = 0xffffa00000000000ULL;
+constexpr uint64_t KERNEL_VMAP_MAX_BYTES = uint64_t{16} * 1024 * 1024 * 1024;
+constexpr size_t KERNEL_VMAP_MAX_PAGES = KERNEL_VMAP_MAX_BYTES / paging::PAGE_SIZE;
+constexpr size_t KERNEL_VMAP_BITMAP_WORDS = (KERNEL_VMAP_MAX_PAGES + 63) / 64;
+constexpr uint64_t KERNEL_VMAP_MIN_BYTES = uint64_t{256} * 1024 * 1024;
+
+sys::Spinlock kernel_vmap_lock;
+std::array<uint64_t, KERNEL_VMAP_BITMAP_WORDS> kernel_vmap_bitmap{};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+size_t kernel_vmap_active_pages = 0;                                  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+size_t kernel_vmap_next_page = 0;                                     // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+bool kernel_vmap_initialized = false;                                 // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+
+auto kernel_vmap_bit_is_set(size_t page) -> bool { return (kernel_vmap_bitmap.at(page / 64) & (uint64_t{1} << (page % 64))) != 0; }
+
+void kernel_vmap_bit_set(size_t page) { kernel_vmap_bitmap.at(page / 64) |= uint64_t{1} << (page % 64); }
+
+void kernel_vmap_bit_clear(size_t page) { kernel_vmap_bitmap.at(page / 64) &= ~(uint64_t{1} << (page % 64)); }
+
+auto find_kernel_vmap_span_locked(size_t begin, size_t end, size_t page_count, size_t& first_page) -> bool {
+    size_t run = 0;
+    for (size_t page = begin; page < end; ++page) {
+        if (kernel_vmap_bit_is_set(page)) {
+            run = 0;
+            continue;
+        }
+        ++run;
+        if (run == page_count) {
+            first_page = page + 1 - page_count;
+            return true;
+        }
+    }
+    return false;
+}
+
+auto reserve_kernel_vmap_span(size_t page_count, size_t& first_page) -> bool {
+    if (!kernel_vmap_initialized || page_count == 0 || page_count > kernel_vmap_active_pages) {
+        return false;
+    }
+
+    uint64_t const FLAGS = kernel_vmap_lock.lock_irqsave();
+    bool found = find_kernel_vmap_span_locked(kernel_vmap_next_page, kernel_vmap_active_pages, page_count, first_page);
+    if (!found && kernel_vmap_next_page != 0) {
+        found = find_kernel_vmap_span_locked(0, kernel_vmap_next_page, page_count, first_page);
+    }
+    if (found) {
+        for (size_t page = first_page; page < first_page + page_count; ++page) {
+            kernel_vmap_bit_set(page);
+        }
+        kernel_vmap_next_page = first_page + page_count;
+        if (kernel_vmap_next_page >= kernel_vmap_active_pages) {
+            kernel_vmap_next_page = 0;
+        }
+    }
+    kernel_vmap_lock.unlock_irqrestore(FLAGS);
+    return found;
+}
+
+auto release_kernel_vmap_span(size_t first_page, size_t page_count) -> bool {
+    if (page_count == 0 || first_page >= kernel_vmap_active_pages || page_count > kernel_vmap_active_pages - first_page) {
+        return false;
+    }
+
+    uint64_t const FLAGS = kernel_vmap_lock.lock_irqsave();
+    for (size_t page = first_page; page < first_page + page_count; ++page) {
+        if (!kernel_vmap_bit_is_set(page)) {
+            kernel_vmap_lock.unlock_irqrestore(FLAGS);
+            return false;
+        }
+    }
+    for (size_t page = first_page; page < first_page + page_count; ++page) {
+        kernel_vmap_bit_clear(page);
+    }
+    kernel_vmap_next_page = std::min(first_page, kernel_vmap_next_page);
+    kernel_vmap_lock.unlock_irqrestore(FLAGS);
+    return true;
+}
+
 auto perf_clamp_u32(uint64_t value) -> uint32_t { return value > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(value); }
 
 auto perf_clamp_i32(uint64_t value) -> int32_t {
@@ -401,6 +482,7 @@ struct TlbShootdownRequest {
     std::atomic<PageTable*> pagemap{nullptr};
     std::atomic<vaddr_t> vaddr{0};
     std::atomic<bool> reload_cr3{false};
+    std::atomic<bool> shared_kernel{false};
     std::atomic<uint32_t> pending{0};
     std::array<std::atomic<uint8_t>, TLB_SHOOTDOWN_MAX_CPUS> targets{};
     std::array<std::atomic<uint64_t>, TLB_SHOOTDOWN_MAX_CPUS> observed{};
@@ -544,8 +626,14 @@ void service_tlb_shootdown_requests_for_cpu(uint64_t cpu_no) {
             continue;
         }
 
+        bool const SHARED_KERNEL = request.shared_kernel.load(std::memory_order_acquire);
         PageTable* const TARGET_PAGEMAP = request.pagemap.load(std::memory_order_acquire);
-        if (TARGET_PAGEMAP != nullptr) {
+        if (SHARED_KERNEL) {
+            // Kernel-half page tables are shared by every task pagemap. A full
+            // local reload invalidates stale leaves regardless of which task
+            // CR3 happens to be active on this CPU.
+            wrcr3(rdcr3());
+        } else if (TARGET_PAGEMAP != nullptr) {
             invalidate_local_tlb_if_current(TARGET_PAGEMAP, request.vaddr.load(std::memory_order_acquire),
                                             request.reload_cr3.load(std::memory_order_acquire));
         }
@@ -661,14 +749,15 @@ void log_tlb_shootdown_wait(TlbShootdownRequest& request, uint64_t origin_cpu, u
     auto* current = sched::get_current_task();
     log::warn(
         "tlb shootdown wait: origin_cpu=%llu pid=%llu name=%s generation=%llu pending=%u missing=%u unclaimed=%u first_missing=%u "
-        "missing_low=0x%llx pagemap=%p vaddr=0x%llx reload=%u elapsed_us=%llu retries=%llu late_acks=%llu",
+        "missing_low=0x%llx pagemap=%p vaddr=0x%llx reload=%u shared_kernel=%u elapsed_us=%llu retries=%llu late_acks=%llu",
         static_cast<unsigned long long>(origin_cpu), static_cast<unsigned long long>(current != nullptr ? current->pid : 0),
         current != nullptr && current->name != nullptr ? current->name : "?", static_cast<unsigned long long>(generation), SNAPSHOT.pending,
         SNAPSHOT.missing_count, SNAPSHOT.unclaimed_count, SNAPSHOT.first_missing,
         static_cast<unsigned long long>(SNAPSHOT.missing_mask_low), request.pagemap.load(std::memory_order_acquire),
         static_cast<unsigned long long>(request.vaddr.load(std::memory_order_acquire)),
-        request.reload_cr3.load(std::memory_order_acquire) ? 1U : 0U, static_cast<unsigned long long>(elapsed_us),
-        static_cast<unsigned long long>(retries), static_cast<unsigned long long>(tlb_shootdown_late_acks.load(std::memory_order_relaxed)));
+        request.reload_cr3.load(std::memory_order_acquire) ? 1U : 0U, request.shared_kernel.load(std::memory_order_acquire) ? 1U : 0U,
+        static_cast<unsigned long long>(elapsed_us), static_cast<unsigned long long>(retries),
+        static_cast<unsigned long long>(tlb_shootdown_late_acks.load(std::memory_order_relaxed)));
 }
 
 void wait_for_tlb_shootdown_completion(TlbShootdownRequest& request, uint64_t origin_cpu, uint64_t generation, uint64_t core_count) {
@@ -751,6 +840,7 @@ void shootdown_remote_user_pagemap(PageTable* pagemap, vaddr_t vaddr, bool reloa
     request.pagemap.store(pagemap, std::memory_order_relaxed);
     request.vaddr.store(vaddr, std::memory_order_relaxed);
     request.reload_cr3.store(reload_cr3, std::memory_order_relaxed);
+    request.shared_kernel.store(false, std::memory_order_relaxed);
     request.pending.store(pending, std::memory_order_release);
     request.generation.store(next_generation, std::memory_order_release);
 
@@ -761,6 +851,61 @@ void shootdown_remote_user_pagemap(PageTable* pagemap, vaddr_t vaddr, bool reloa
     }
 
     wait_for_tlb_shootdown_completion(request, ORIGIN_CPU, next_generation, CORE_COUNT);
+    request.pagemap.store(nullptr, std::memory_order_release);
+    release_tlb_shootdown_gate(gate);
+}
+
+void shootdown_shared_kernel_mappings() {
+    // Before the shootdown vector/SMP state exists, only the BSP can have used
+    // these runtime mappings. Reload its current CR3 and return.
+    wrcr3(rdcr3());
+    if (tlb_shootdown_vector == 0 || !smt::has_cpu_data()) {
+        return;
+    }
+
+    auto gate = acquire_tlb_shootdown_gate();
+    if (!gate.held) {
+        return;
+    }
+
+    uint64_t const ORIGIN_CPU = gate.cpu_no;
+    uint64_t const CORE_COUNT = bounded_core_count();
+    auto& request = tlb_shootdown_requests[static_cast<size_t>(ORIGIN_CPU)];
+    uint32_t pending = 0;
+    for (uint64_t target_cpu = 0; target_cpu < CORE_COUNT; ++target_cpu) {
+        bool const TARGET =
+            target_cpu != ORIGIN_CPU && tlb_shootdown_cpu_online[static_cast<size_t>(target_cpu)].load(std::memory_order_acquire) != 0U;
+        request.targets[static_cast<size_t>(target_cpu)].store(TARGET ? 1U : 0U, std::memory_order_relaxed);
+        if (TARGET) {
+            ++pending;
+        }
+    }
+
+    if (pending == 0) {
+        release_tlb_shootdown_gate(gate);
+        return;
+    }
+
+    uint64_t next_generation = request.generation.load(std::memory_order_relaxed) + 1;
+    if (next_generation == 0) {
+        next_generation = 1;
+    }
+
+    request.pagemap.store(kernel_pagemap, std::memory_order_relaxed);
+    request.vaddr.store(0, std::memory_order_relaxed);
+    request.reload_cr3.store(true, std::memory_order_relaxed);
+    request.shared_kernel.store(true, std::memory_order_relaxed);
+    request.pending.store(pending, std::memory_order_release);
+    request.generation.store(next_generation, std::memory_order_release);
+
+    for (uint64_t target_cpu = 0; target_cpu < CORE_COUNT; ++target_cpu) {
+        if (request.targets[static_cast<size_t>(target_cpu)].load(std::memory_order_relaxed) != 0U) {
+            send_tlb_shootdown_ipi(target_cpu);
+        }
+    }
+
+    wait_for_tlb_shootdown_completion(request, ORIGIN_CPU, next_generation, CORE_COUNT);
+    request.shared_kernel.store(false, std::memory_order_release);
     request.pagemap.store(nullptr, std::memory_order_release);
     release_tlb_shootdown_gate(gate);
 }
@@ -2609,6 +2754,141 @@ void unmap_page(PageTable* page_table, vaddr_t vaddr) {
     *entry = paging::purge_page_table_entry();
     flush_pagemap_after_update(page_table, vaddr, false);
     drop_present_leaf_ref(OLD_ENTRY);
+}
+
+namespace {
+
+auto release_kernel_vmap_mappings(vaddr_t start, size_t page_count) -> bool {
+    if (kernel_pagemap == nullptr || page_count == 0) {
+        return false;
+    }
+
+    // Validate the complete range before mutating it so a bad size or double
+    // free cannot leave a partially torn-down allocation.
+    for (size_t page = 0; page < page_count; ++page) {
+        vaddr_t const VADDR = start + (page * paging::PAGE_SIZE);
+        PageTableEntry* entry = leaf_entry(kernel_pagemap, VADDR);
+        if (entry == nullptr || entry->present == 0 || entry->frame == 0) {
+            return false;
+        }
+    }
+
+    // Buffer-cache vmap allocations are at most 2 MiB, but keep teardown
+    // bounded for any future caller. PTEs are cleared before the global flush;
+    // frames remain referenced until every CPU has discarded stale leaves.
+    constexpr size_t RELEASE_BATCH_PAGES = 512;
+    std::array<void*, RELEASE_BATCH_PAGES> frames{};
+    size_t released = 0;
+    while (released < page_count) {
+        size_t const BATCH = std::min(RELEASE_BATCH_PAGES, page_count - released);
+        for (size_t page = 0; page < BATCH; ++page) {
+            vaddr_t const VADDR = start + ((released + page) * paging::PAGE_SIZE);
+            PageTableEntry* entry = leaf_entry(kernel_pagemap, VADDR);
+            uint64_t const PHYS_ADDR = static_cast<uint64_t>(entry->frame) << paging::PAGE_SHIFT;
+            frames.at(page) = reinterpret_cast<void*>(addr::get_virt_pointer(PHYS_ADDR));
+            *entry = paging::purge_page_table_entry();
+        }
+
+        shootdown_shared_kernel_mappings();
+        for (size_t page = 0; page < BATCH; ++page) {
+            phys::page_ref_dec(frames.at(page));
+            frames.at(page) = nullptr;
+        }
+        released += BATCH;
+    }
+    return true;
+}
+
+}  // namespace
+
+void init_kernel_vmap() {
+    if (kernel_vmap_initialized) {
+        return;
+    }
+    if (kernel_pagemap == nullptr) {
+        log::critical("kernel vmap init requires the kernel pagemap");
+        hcf();
+    }
+
+    uint64_t const TOTAL_MEM = phys::get_total_mem_bytes();
+    uint64_t arena_bytes = std::clamp<uint64_t>(TOTAL_MEM / 2, KERNEL_VMAP_MIN_BYTES, KERNEL_VMAP_MAX_BYTES);
+    arena_bytes = (arena_bytes + LARGE_PAGE_2M_BYTES - 1) & ~(LARGE_PAGE_2M_BYTES - 1);
+    kernel_vmap_active_pages = static_cast<size_t>(arena_bytes / paging::PAGE_SIZE);
+    kernel_vmap_next_page = 0;
+    kernel_vmap_bitmap.fill(0);
+
+    // Pre-create the complete hierarchy down through PML1. Runtime map_page()
+    // calls then only publish independent leaf PTEs and cannot recurse into
+    // physical reclaim to allocate a page table.
+    uint64_t constexpr FLAGS = paging::page_types::KERNEL;
+    for (uint64_t offset = 0; offset < arena_bytes; offset += LARGE_PAGE_2M_BYTES) {
+        vaddr_t const VADDR = KERNEL_VMAP_BASE + offset;
+        PageTable* pml3 = advance_page_table(kernel_pagemap, index_of(VADDR, 4), FLAGS);
+        PageTable* pml2 = advance_page_table(pml3, index_of(VADDR, 3), FLAGS);
+        static_cast<void>(advance_page_table(pml2, index_of(VADDR, 2), FLAGS));
+    }
+
+    kernel_vmap_initialized = true;
+    log::info("prepared kernel vmap arena: base=%p bytes=%llu pages=%zu", KERNEL_VMAP_BASE, static_cast<unsigned long long>(arena_bytes),
+              kernel_vmap_active_pages);
+}
+
+auto kernel_vmap_alloc(uint64_t size, std::string_view name) -> void* {
+    if (!kernel_vmap_initialized || size == 0 || size > UINT64_MAX - (paging::PAGE_SIZE - 1)) {
+        return nullptr;
+    }
+
+    uint64_t const ROUNDED_SIZE = (size + paging::PAGE_SIZE - 1) & ~(paging::PAGE_SIZE - 1);
+    auto const PAGE_COUNT = static_cast<size_t>(ROUNDED_SIZE / paging::PAGE_SIZE);
+    size_t first_page = 0;
+    if (!reserve_kernel_vmap_span(PAGE_COUNT, first_page)) {
+        return nullptr;
+    }
+
+    vaddr_t const START = KERNEL_VMAP_BASE + (first_page * paging::PAGE_SIZE);
+    size_t mapped_pages = 0;
+    for (; mapped_pages < PAGE_COUNT; ++mapped_pages) {
+        void* frame = phys::page_alloc_full_overwrite_page_with_reclaim(name);
+        if (frame == nullptr) {
+            break;
+        }
+        auto const PADDR = reinterpret_cast<paddr_t>(addr::get_phys_pointer(reinterpret_cast<vaddr_t>(frame)));
+        map_page(kernel_pagemap, START + (mapped_pages * paging::PAGE_SIZE), PADDR, paging::page_types::KERNEL);
+    }
+
+    if (mapped_pages != PAGE_COUNT) {
+        if (mapped_pages != 0) {
+            static_cast<void>(release_kernel_vmap_mappings(START, mapped_pages));
+        }
+        static_cast<void>(release_kernel_vmap_span(first_page, PAGE_COUNT));
+        return nullptr;
+    }
+    return reinterpret_cast<void*>(START);
+}
+
+void kernel_vmap_free(void* ptr, uint64_t size) {
+    if (ptr == nullptr || !kernel_vmap_initialized || size == 0 || size > UINT64_MAX - (paging::PAGE_SIZE - 1)) {
+        return;
+    }
+
+    auto const START = reinterpret_cast<vaddr_t>(ptr);
+    uint64_t const ARENA_BYTES = static_cast<uint64_t>(kernel_vmap_active_pages) * paging::PAGE_SIZE;
+    uint64_t const ROUNDED_SIZE = (size + paging::PAGE_SIZE - 1) & ~(paging::PAGE_SIZE - 1);
+    if ((START & (paging::PAGE_SIZE - 1)) != 0 || START < KERNEL_VMAP_BASE || START - KERNEL_VMAP_BASE >= ARENA_BYTES ||
+        ROUNDED_SIZE > ARENA_BYTES - (START - KERNEL_VMAP_BASE)) {
+        log::critical("rejected invalid kernel vmap free: ptr=%p size=%llu", ptr, static_cast<unsigned long long>(size));
+        return;
+    }
+
+    auto const FIRST_PAGE = static_cast<size_t>((START - KERNEL_VMAP_BASE) / paging::PAGE_SIZE);
+    auto const PAGE_COUNT = static_cast<size_t>(ROUNDED_SIZE / paging::PAGE_SIZE);
+    if (!release_kernel_vmap_mappings(START, PAGE_COUNT)) {
+        log::critical("rejected unmapped kernel vmap free: ptr=%p size=%llu", ptr, static_cast<unsigned long long>(size));
+        return;
+    }
+    if (!release_kernel_vmap_span(FIRST_PAGE, PAGE_COUNT)) {
+        log::critical("kernel vmap bitmap mismatch after free: ptr=%p size=%llu", ptr, static_cast<unsigned long long>(size));
+    }
 }
 
 void map_range(PageTable* page_table, Range range, uint64_t flags, uint64_t offset) {

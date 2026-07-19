@@ -153,6 +153,10 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/buffer_cache_source_test.py
 )
 add_test(
+    NAME kernel_vmap_source_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/kernel_vmap_source_test.py
+)
+add_test(
     NAME udp_bind_device_source_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/udp_bind_device_source_test.py
 )
@@ -434,6 +438,7 @@ set_tests_properties(
     virtio_net_source_test
     block_device_source_test
     buffer_cache_source_test
+    kernel_vmap_source_test
     udp_bind_device_source_test
     mlibc_dns_source_test
     mlibc_spawn_source_test
