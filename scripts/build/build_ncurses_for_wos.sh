@@ -263,7 +263,7 @@ if [ ! -e "$TARGET_SYSROOT/usr" ]; then
 fi
 
 NCURSES_TARGET_FLAGS="--target=$TARGET_ARCH --sysroot=$TARGET_SYSROOT"
-NCURSES_CFLAGS="$NCURSES_TARGET_FLAGS -O2 -g -fPIC -fPIE -fno-sanitize=safe-stack -fno-stack-protector"
+NCURSES_CFLAGS="$NCURSES_TARGET_FLAGS -O2 -g -fPIC -fno-sanitize=safe-stack -fno-stack-protector"
 NCURSES_CPPFLAGS="$NCURSES_TARGET_FLAGS -I$TARGET_SYSROOT/include"
 NCURSES_LDFLAGS="$NCURSES_TARGET_FLAGS -fuse-ld=lld -L$TARGET_SYSROOT/lib -fno-sanitize=safe-stack"
 

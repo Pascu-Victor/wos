@@ -273,9 +273,9 @@ ac_cv_header_ncurses_curses_h=no
 ac_cv_header_ncurses_h=no
 ac_cv_header_ncurses_ncurses_h=no
 ac_cv_header_ncurses_panel_h=no
-ac_cv_header_ncursesw_curses_h=no
-ac_cv_header_ncursesw_ncurses_h=no
-ac_cv_header_ncursesw_panel_h=no
+ac_cv_header_ncursesw_curses_h=yes
+ac_cv_header_ncursesw_ncurses_h=yes
+ac_cv_header_ncursesw_panel_h=yes
 ac_cv_header_ndbm_h=no
 ac_cv_header_net_ethernet_h=yes
 ac_cv_header_net_if_h=yes
@@ -343,7 +343,7 @@ ac_cv_header_sys_wait_h=yes
 ac_cv_header_sys_xattr_h=no
 ac_cv_header_sysexits_h=yes
 ac_cv_header_syslog_h=yes
-ac_cv_header_term_h=no
+ac_cv_header_term_h=yes
 ac_cv_header_termios_h=yes
 ac_cv_header_time_altzone=no
 ac_cv_header_unistd_h=yes
@@ -673,6 +673,13 @@ ac_cv_type_uid_t=yes
 ac_cv_wchar_t_usable=no
 EOF
 
+	if [ "$PYTHON_TARGET_TLS_AVAILABLE" != "1" ]; then
+		cat >> "$tmp_config_site" <<'EOF'
+py_cv_module__ssl=n/a
+py_cv_module__hashlib=n/a
+EOF
+	fi
+
 	if [ ! -f "$PYTHON_CONFIG_SITE" ] || ! cmp -s "$tmp_config_site" "$PYTHON_CONFIG_SITE"; then
 		mv "$tmp_config_site" "$PYTHON_CONFIG_SITE"
 	else
@@ -822,6 +829,17 @@ if [ ! -e "$TARGET_SYSROOT/usr" ]; then
     ln -s . "$TARGET_SYSROOT/usr"
 fi
 
+PYTHON_TARGET_TLS_AVAILABLE=0
+PYTHON_OPENSSL_CONFIGURE_ARGS=()
+if [ -f "$TARGET_SYSROOT/include/openssl/ssl.h" ] &&
+	[ -f "$TARGET_SYSROOT/lib/libssl.a" ] &&
+	[ -f "$TARGET_SYSROOT/lib/libcrypto.a" ]; then
+	PYTHON_TARGET_TLS_AVAILABLE=1
+	PYTHON_OPENSSL_CONFIGURE_ARGS=(--with-openssl="$TARGET_SYSROOT")
+else
+	echo "Target LibreSSL is unavailable; disabling CPython _ssl and _hashlib modules"
+fi
+
 BUILD_PYTHON=""
 EXTERNAL_BUILD_PYTHON=""
 if [ "$HOST_SYSTEM" = "WOS" ] || [ -n "${WOS_PYTHON_BUILD_PYTHON:-}" ]; then
@@ -897,6 +915,7 @@ if [ ! -f "$PYTHON_TARGET_BUILD/Makefile" ] || [ "$PYTHON_SRC/configure" -nt "$P
 		PKG_CONFIG_PATH= \
 		"$PYTHON_SRC/configure" \
 		"${PYTHON_CONFIGURE_CACHE_ARGS[@]}" \
+		"${PYTHON_OPENSSL_CONFIGURE_ARGS[@]}" \
 		--build="$BUILD_TRIPLE" \
 		--host="$TARGET_ARCH" \
 		--prefix=/usr \

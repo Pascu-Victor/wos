@@ -1431,6 +1431,10 @@ def test_cpython_target_configure_preseeds_wos_runtime_probes() -> None:
             "ac_cv_cc_name=clang",
             "ac_cv_cc_supports_fstrict_overflow=yes",
             "ac_cv_header_alloca_h=yes",
+            "ac_cv_header_ncursesw_curses_h=yes",
+            "ac_cv_header_ncursesw_ncurses_h=yes",
+            "ac_cv_header_ncursesw_panel_h=yes",
+            "ac_cv_header_term_h=yes",
             "ac_cv_header_sys_epoll_h=yes",
             "ac_cv_header_sys_eventfd_h=no",
             "ac_cv_header_stdatomic_h=no",
@@ -1443,6 +1447,30 @@ def test_cpython_target_configure_preseeds_wos_runtime_probes() -> None:
             "ac_cv_type_sockaddr_storage=yes",
         ],
         "CPython target configure WOS runtime probe preseeds",
+    )
+    require_tokens(
+        config_site,
+        [
+            'if [ "$PYTHON_TARGET_TLS_AVAILABLE" != "1" ]; then',
+            "py_cv_module__ssl=n/a",
+            "py_cv_module__hashlib=n/a",
+        ],
+        "CPython clean-sysroot TLS module gating",
+    )
+    require_tokens(
+        ROOT_CMAKE.read_text(),
+        [
+            "if(TARGET python_for_wos AND TARGET ncurses_for_wos)",
+            "add_dependencies(python_for_wos ncurses_for_wos)",
+            "if(TARGET python_for_wos AND TARGET openssl_for_wos)",
+            "add_dependencies(python_for_wos openssl_for_wos)",
+        ],
+        "CPython target ncurses build ordering",
+    )
+    require_tokens(
+        (ROOT / "scripts" / "build" / "build_ncurses_for_wos.sh").read_text(),
+        ['NCURSES_CFLAGS="$NCURSES_TARGET_FLAGS -O2 -g -fPIC -fno-sanitize=safe-stack -fno-stack-protector"'],
+        "ncurses static archives remain linkable into CPython shared modules",
     )
     require_tokens(
         config_site,
@@ -2630,6 +2658,9 @@ def test_wos_python_ssl_build_handles_libressl_sigalg_gap() -> None:
             "#define SSL_CTX_set1_client_sigalgs_list(ctx, sigalgslist) (0)",
             "#define SSL_CTX_set1_sigalgs_list(ctx, sigalgslist) (0)",
             'PYTHON_CPPFLAGS="$PYTHON_CPPFLAGS -include $PYTHON_LIBRESSL_SIGALGS_COMPAT_HEADER"',
+            "PYTHON_OPENSSL_CONFIGURE_ARGS=()",
+            'PYTHON_OPENSSL_CONFIGURE_ARGS=(--with-openssl="$TARGET_SYSROOT")',
+            '"${PYTHON_OPENSSL_CONFIGURE_ARGS[@]}"',
             'CPPFLAGS="$PYTHON_CPPFLAGS"',
         ],
         "CPython _ssl LibreSSL compatibility patch",

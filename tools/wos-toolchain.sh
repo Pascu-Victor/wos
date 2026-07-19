@@ -776,35 +776,8 @@ WOS_SYSROOT_PATH="$SYSROOT" \
     "$B/../scripts/build/build_cmake_for_wos.sh"
 bootstrap_phase_end
 
-# 13. Build CPython for WOS userspace
-bootstrap_phase_start 13 "CPython for WOS userspace"
-cd "$B/src"
-PYTHON_GIT_BRANCH="${WOS_PYTHON_GIT_BRANCH:-wos-support}"
-if [ ! -f python/configure ]; then
-    if [ -d "$WORKSPACE_ROOT/.git" ]; then
-        git -C "$WORKSPACE_ROOT" submodule update --init --depth=1 toolchain/src/python || true
-    fi
-fi
-if [ ! -f python/configure ]; then
-    git clone --depth=1 --branch "$PYTHON_GIT_BRANCH" https://github.com/Pascu-Victor/cpython.git python
-fi
-
-WOS_SYSROOT_PATH="$SYSROOT" \
-    WOS_PYTHON_SOURCE_DIR="$B/src/python" \
-    WOS_PYTHON_BUILD_DIR="$B/python-build" \
-    "$B/../scripts/build/build_python_for_wos.sh"
-bootstrap_phase_end
-
-# 14. Stage Meson for WOS userspace
-bootstrap_phase_start 14 "Meson for WOS userspace"
-WOS_SYSROOT_PATH="$SYSROOT" \
-    WOS_MESON_SOURCE_DIR="$B/src/meson" \
-    WOS_MESON_BUILD_DIR="$B/meson-build" \
-    "$B/../scripts/build/build_meson_for_wos.sh"
-bootstrap_phase_end
-
-# 15. Build NASM for WOS userspace
-bootstrap_phase_start 15 "NASM for WOS userspace"
+# 13. Build NASM for WOS userspace
+bootstrap_phase_start 13 "NASM for WOS userspace"
 cd "$B/src"
 NASM_GIT_BRANCH="${WOS_NASM_GIT_BRANCH:-wos-support}"
 if [ ! -f nasm/configure.ac ]; then
@@ -822,8 +795,8 @@ WOS_SYSROOT_PATH="$SYSROOT" \
     "$B/../scripts/build/build_nasm_for_wos.sh"
 bootstrap_phase_end
 
-# 16. Build ncurses and nano for WOS userspace
-bootstrap_phase_start 16 "ncurses and nano for WOS userspace"
+# 14. Build ncurses and nano for WOS userspace
+bootstrap_phase_start 14 "ncurses and nano for WOS userspace"
 WOS_SYSROOT_PATH="$SYSROOT" \
     WOS_NCURSES_SOURCE_DIR="$B/src/ncurses" \
     WOS_NCURSES_BUILD_DIR="$B/ncurses-build" \
@@ -835,8 +808,9 @@ WOS_SYSROOT_PATH="$SYSROOT" \
     "$B/../scripts/build/build_nano_for_wos.sh"
 bootstrap_phase_end
 
-# 17. Build zlib, OpenSSL, and curl for WOS userspace
-bootstrap_phase_start 17 "zlib LibreSSL and curl for WOS userspace"
+# 15. Build zlib, LibreSSL, and curl before CPython so target feature probes
+# cannot fall back to the self-host system's headers or libraries.
+bootstrap_phase_start 15 "zlib LibreSSL and curl for WOS userspace"
 WOS_SYSROOT_PATH="$SYSROOT" \
     WOS_ZLIB_SOURCE_DIR="$B/src/zlib" \
     WOS_ZLIB_BUILD_DIR="$B/zlib-build" \
@@ -851,6 +825,33 @@ WOS_SYSROOT_PATH="$SYSROOT" \
     WOS_CURL_SOURCE_DIR="$B/src/curl" \
     WOS_CURL_BUILD_DIR="$B/curl-build" \
     "$B/../scripts/build/build_curl_for_wos.sh"
+bootstrap_phase_end
+
+# 16. Build CPython for WOS userspace
+bootstrap_phase_start 16 "CPython for WOS userspace"
+cd "$B/src"
+PYTHON_GIT_BRANCH="${WOS_PYTHON_GIT_BRANCH:-wos-support}"
+if [ ! -f python/configure ]; then
+    if [ -d "$WORKSPACE_ROOT/.git" ]; then
+        git -C "$WORKSPACE_ROOT" submodule update --init --depth=1 toolchain/src/python || true
+    fi
+fi
+if [ ! -f python/configure ]; then
+    git clone --depth=1 --branch "$PYTHON_GIT_BRANCH" https://github.com/Pascu-Victor/cpython.git python
+fi
+
+WOS_SYSROOT_PATH="$SYSROOT" \
+    WOS_PYTHON_SOURCE_DIR="$B/src/python" \
+    WOS_PYTHON_BUILD_DIR="$B/python-build" \
+    "$B/../scripts/build/build_python_for_wos.sh"
+bootstrap_phase_end
+
+# 17. Stage Meson for WOS userspace
+bootstrap_phase_start 17 "Meson for WOS userspace"
+WOS_SYSROOT_PATH="$SYSROOT" \
+    WOS_MESON_SOURCE_DIR="$B/src/meson" \
+    WOS_MESON_BUILD_DIR="$B/meson-build" \
+    "$B/../scripts/build/build_meson_for_wos.sh"
 bootstrap_phase_end
 
 # 18. Build Git for WOS userspace

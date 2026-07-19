@@ -860,6 +860,13 @@ if(WOS_BUILD_NCURSES_FOR_WOS OR WOS_BUILD_NANO_FOR_WOS)
     list(APPEND WOS_NCURSES_FOR_WOS_ROOTFS_INPUTS ${NCURSES_FOR_WOS_STAMP})
 endif()
 
+if(TARGET python_for_wos AND TARGET ncurses_for_wos)
+    add_dependencies(python_for_wos ncurses_for_wos)
+endif()
+if(TARGET python_for_wos AND TARGET openssl_for_wos)
+    add_dependencies(python_for_wos openssl_for_wos)
+endif()
+
 # --- nano_for_wos: cross-compile GNU nano to run inside WOS -----------------
 set(NANO_FOR_WOS_STAMP ${CMAKE_BINARY_DIR}/stamps/nano_for_wos.stamp)
 set(WOS_NANO_FOR_WOS_ROOTFS_INPUTS)
