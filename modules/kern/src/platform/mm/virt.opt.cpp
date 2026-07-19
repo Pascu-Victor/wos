@@ -63,6 +63,7 @@ constexpr uint64_t KERNEL_VMAP_MAX_BYTES = uint64_t{16} * 1024 * 1024 * 1024;
 constexpr size_t KERNEL_VMAP_MAX_PAGES = KERNEL_VMAP_MAX_BYTES / paging::PAGE_SIZE;
 constexpr size_t KERNEL_VMAP_BITMAP_WORDS = (KERNEL_VMAP_MAX_PAGES + 63) / 64;
 constexpr uint64_t KERNEL_VMAP_MIN_BYTES = uint64_t{256} * 1024 * 1024;
+constexpr size_t KERNEL_VMAP_WARM_POOL_MAX_PAGES = (size_t{256} * 1024 * 1024) / paging::PAGE_SIZE;
 
 sys::Spinlock kernel_vmap_lock;
 std::array<uint64_t, KERNEL_VMAP_BITMAP_WORDS> kernel_vmap_bitmap{};          // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
@@ -71,6 +72,7 @@ std::atomic<bool> kernel_vmap_draining{false};                                //
 size_t kernel_vmap_active_pages = 0;                                          // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 size_t kernel_vmap_next_page = 0;                                             // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 size_t kernel_vmap_pending_first_page = KERNEL_VMAP_MAX_PAGES;                // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+size_t kernel_vmap_pending_pages = 0;                                         // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 bool kernel_vmap_initialized = false;                                         // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
 auto kernel_vmap_bit_is_set(size_t page) -> bool { return (kernel_vmap_bitmap.at(page / 64) & (uint64_t{1} << (page % 64))) != 0; }
@@ -115,6 +117,9 @@ auto reserve_kernel_vmap_span(size_t page_count, size_t& first_page) -> bool {
     }
     if (found) {
         for (size_t page = first_page; page < first_page + page_count; ++page) {
+            if (kernel_vmap_pending_bit_is_set(page)) {
+                --kernel_vmap_pending_pages;
+            }
             kernel_vmap_bit_set(page);
             kernel_vmap_pending_bit_clear(page);
         }
@@ -146,6 +151,9 @@ auto release_kernel_vmap_span(size_t first_page, size_t page_count, bool require
         }
     }
     for (size_t page = first_page; page < first_page + page_count; ++page) {
+        if (kernel_vmap_pending_bit_is_set(page)) {
+            --kernel_vmap_pending_pages;
+        }
         kernel_vmap_bit_clear(page);
         kernel_vmap_pending_bit_clear(page);
     }
@@ -177,6 +185,7 @@ auto queue_kernel_vmap_free(size_t first_page, size_t page_count) -> bool {
         kernel_vmap_pending_bit_set(page);
         kernel_vmap_bit_clear(page);
     }
+    kernel_vmap_pending_pages += page_count;
     kernel_vmap_pending_first_page = std::min(kernel_vmap_pending_first_page, first_page);
     kernel_vmap_next_page = std::min(kernel_vmap_next_page, first_page);
     kernel_vmap_lock.unlock_irqrestore(FLAGS);
@@ -214,6 +223,13 @@ auto kernel_vmap_has_pending_frees() -> bool {
     bool const PENDING = kernel_vmap_pending_first_page < kernel_vmap_active_pages;
     kernel_vmap_lock.unlock_irqrestore(FLAGS);
     return PENDING;
+}
+
+auto kernel_vmap_warm_pool_over_limit() -> bool {
+    uint64_t const FLAGS = kernel_vmap_lock.lock_irqsave();
+    bool const OVER_LIMIT = kernel_vmap_pending_pages >= KERNEL_VMAP_WARM_POOL_MAX_PAGES;
+    kernel_vmap_lock.unlock_irqrestore(FLAGS);
+    return OVER_LIMIT;
 }
 
 auto perf_clamp_u32(uint64_t value) -> uint32_t { return value > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(value); }
@@ -2905,6 +2921,7 @@ void init_kernel_vmap() {
     kernel_vmap_active_pages = static_cast<size_t>(arena_bytes / paging::PAGE_SIZE);
     kernel_vmap_next_page = 0;
     kernel_vmap_pending_first_page = kernel_vmap_active_pages;
+    kernel_vmap_pending_pages = 0;
     kernel_vmap_bitmap.fill(0);
     kernel_vmap_pending_bitmap.fill(0);
     kernel_vmap_draining.store(false, std::memory_order_relaxed);
@@ -3033,6 +3050,15 @@ void kernel_vmap_free(void* ptr, uint64_t size) {
     auto const PAGE_COUNT = static_cast<size_t>(ROUNDED_SIZE / paging::PAGE_SIZE);
     if (!queue_kernel_vmap_free(FIRST_PAGE, PAGE_COUNT)) {
         log::critical("rejected duplicate or unmapped kernel vmap free: ptr=%p size=%llu", ptr, static_cast<unsigned long long>(size));
+        return;
+    }
+
+    // A small warm pool avoids global shootdowns in hot alloc/free cycles, but
+    // it must not retain the multi-gigabyte high-water mark of parallel native
+    // builds. drain_kernel_vmap_frees() is a no-op in IRQ-disabled or
+    // non-preemptible contexts, preserving the deferred-free lock invariant.
+    if (kernel_vmap_warm_pool_over_limit()) {
+        drain_kernel_vmap_frees();
     }
 }
 

@@ -106,8 +106,21 @@ def main() -> None:
         function_body(source, "kernel_vmap_free"),
         [
             "queue_kernel_vmap_free(FIRST_PAGE, PAGE_COUNT)",
+            "kernel_vmap_warm_pool_over_limit()",
+            "drain_kernel_vmap_frees()",
         ],
-        "vmap free must cache mappings without entering a shootdown",
+        "vmap free must bound cached mappings through the context-gated drainer",
+    )
+
+    require_order(
+        source,
+        [
+            "KERNEL_VMAP_WARM_POOL_MAX_PAGES",
+            "size_t kernel_vmap_pending_pages = 0",
+            "kernel_vmap_pending_pages += page_count",
+            "kernel_vmap_pending_pages >= KERNEL_VMAP_WARM_POOL_MAX_PAGES",
+        ],
+        "vmap warm-pool accounting must prevent unbounded physical retention",
     )
 
     require_order(
