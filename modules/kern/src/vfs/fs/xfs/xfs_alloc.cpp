@@ -572,16 +572,22 @@ auto delete_free_extent_record(XfsMountContext* mount, XfsTransaction* tp, xfs_a
     if (BNO_REC.blockcount != blockcount) {
         return -EIO;
     }
-    rc = xfs_btree_delete(&bno_cur, tp);
-    if (rc != 0) {
-        return rc;
-    }
 
     XfsBtreeCursor<XfsCntbtTraits> cnt_cur;
     cnt_cur.mount = mount;
     cnt_cur.agno = agno;
     XfsCntbtTraits::IRec const CNT_TARGET{.startblock = startblock, .blockcount = blockcount};
     rc = xfs_btree_lookup(&cnt_cur, pag->agf_cnt_root, pag->agf_cnt_level, CNT_TARGET, XfsBtreeLookup::EQ);
+    if (rc != 0) {
+        return rc;
+    }
+
+    XfsCntbtTraits::IRec const CNT_REC = xfs_btree_get_rec(&cnt_cur);
+    if (!same_free_extent(CNT_REC.startblock, CNT_REC.blockcount, BNO_REC.startblock, BNO_REC.blockcount)) {
+        return -EIO;
+    }
+
+    rc = xfs_btree_delete(&bno_cur, tp);
     if (rc != 0) {
         return rc;
     }
@@ -694,6 +700,22 @@ auto xfs_free_extent(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t 
     }
 
     XfsPerAG* pag = &mount->per_ag[agno];
+
+    // Reject a double-free before AGFL refill changes either free-space tree.
+    // Refill can shorten or remove the records adjacent to this extent, so the
+    // neighbor cursors used for coalescing must be opened only after refill.
+    int const VALID_RC = xfs_validate_allocated_extent(mount, agno, agbno, len);
+    if (VALID_RC != 0) {
+        return VALID_RC;
+    }
+
+    if (pag->agf_flcount < XFS_AGFL_MIN) {
+        int const REFILL_RC = agfl_refill(mount, tp, agno);
+        if (REFILL_RC != 0) {
+            return REFILL_RC;
+        }
+    }
+
     xfs_agblock_t merged_start = agbno;
     xfs_extlen_t merged_len = len;
 
@@ -742,13 +764,6 @@ auto xfs_free_extent(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t 
         }
     } else if (rc != -ENOENT) {
         return rc;
-    }
-
-    if (pag->agf_flcount < XFS_AGFL_MIN) {
-        int const REFILL_RC = agfl_refill(mount, tp, agno);
-        if (REFILL_RC != 0) {
-            return REFILL_RC;
-        }
     }
 
     if (merge_prev) {

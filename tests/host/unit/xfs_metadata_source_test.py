@@ -187,6 +187,7 @@ def test_free_space_allocators_validate_dual_indexes_before_delete() -> None:
     agfl_body = function_body(source, "agfl_refill")
     hint_body = function_body(source, "alloc_ag_by_hint")
     size_body = function_body(source, "alloc_ag_by_size")
+    delete_body = function_body(source, "delete_free_extent_record")
 
     require(source, "auto same_free_extent(", "free-space tree identity helper")
 
@@ -225,13 +226,26 @@ def test_free_space_allocators_validate_dual_indexes_before_delete() -> None:
     require_order(
         size_body,
         [
-            "bno_target.blockcount = FOUND.blockcount;",
+            "bno_target.blockcount = found.blockcount;",
             "XfsBtreeLookup::EQ",
-            "same_free_extent(BNO_FOUND.startblock, BNO_FOUND.blockcount, FOUND.startblock, FOUND.blockcount)",
+            "same_free_extent(BNO_FOUND.startblock, BNO_FOUND.blockcount, found.startblock, found.blockcount)",
             "int delrc = xfs_btree_delete(&cur, tp);",
             "delrc = xfs_btree_delete(&bno_cur, tp);",
         ],
         "size allocation must validate exact bnobt extent before deleting either free-space record",
+    )
+
+    require_order(
+        delete_body,
+        [
+            "XfsBtreeLookup::EQ",
+            "XfsCntbtTraits::IRec const CNT_TARGET",
+            "XfsBtreeLookup::EQ",
+            "same_free_extent(CNT_REC.startblock, CNT_REC.blockcount, BNO_REC.startblock, BNO_REC.blockcount)",
+            "rc = xfs_btree_delete(&bno_cur, tp);",
+            "return xfs_btree_delete(&cnt_cur, tp);",
+        ],
+        "free-space coalescing must validate both indexes before deleting either record",
     )
 
 

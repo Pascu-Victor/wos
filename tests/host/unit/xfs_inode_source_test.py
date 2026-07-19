@@ -21,11 +21,11 @@ def main() -> None:
     bmap_source = BMAP.read_text()
     alloc_source = ALLOC.read_text()
 
-    marked_free = 'if (ALLOCATED == 0) {\n        mod::dbg::logger<"xfs">::debug("xfs_inode_read: inode %lu is marked free"'
+    marked_free = 'mod::dbg::logger<"xfs">::debug("xfs_inode_read: inode %lu is marked free"'
     lookup_failed = "if (ALLOCATED < 0) {"
     rate_limited = "alloc_lookup_failure_count.fetch_add(1, std::memory_order_relaxed) + 1"
     warning_interval = "ALLOC_LOOKUP_WARN_INTERVAL"
-    lookup_warn = 'mod::dbg::logger<"xfs">::warn(\n                "xfs_inode_read: allocation lookup failed'
+    lookup_warn = '"xfs_inode_read: allocation lookup failed'
     direct_validation = "validating dinode directly"
     disk_read = "// Not in cache - read from disk"
 
@@ -75,11 +75,11 @@ def main() -> None:
     free_extent = alloc_source[
         alloc_source.find("auto xfs_free_extent(") : alloc_source.find("// ============================================================================\n// AGFL")
     ]
+    validation_pos = free_extent.find("xfs_validate_allocated_extent(mount, agno, agbno, len)")
     refill_pos = free_extent.find("if (pag->agf_flcount < XFS_AGFL_MIN)")
-    prev_overlap_pos = free_extent.find("extent overlaps previous free record")
-    next_overlap_pos = free_extent.find("extent overlaps next free record")
-    if min(refill_pos, prev_overlap_pos, next_overlap_pos) < 0 or refill_pos < max(prev_overlap_pos, next_overlap_pos):
-        fail("xfs_free_extent must check overlaps before mutating AGFL state")
+    neighbor_lookup_pos = free_extent.find("XfsBtreeCursor<XfsBnobtTraits> prev_cur;")
+    if min(validation_pos, refill_pos, neighbor_lookup_pos) < 0 or not validation_pos < refill_pos < neighbor_lookup_pos:
+        fail("xfs_free_extent must validate before AGFL refill and reopen coalescing cursors after refill")
 
     bmap_loop_start = bmap_source.find("while (count < max_extents)")
     bmap_loop = bmap_source[bmap_loop_start : bmap_source.find("return static_cast<int>(count);", bmap_loop_start)]
