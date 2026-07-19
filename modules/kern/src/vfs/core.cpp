@@ -14919,6 +14919,14 @@ auto vfs_pipe_for_task(ker::mod::sched::task::Task* task, int pipefd[2],
             return finish(0);
         }
 
+        size_t total_written = 0;
+        auto finish_with_progress = [&](ssize_t error) -> ssize_t {
+            if (total_written != 0) {
+                return finish(static_cast<ssize_t>(total_written), static_cast<uint64_t>(total_written));
+            }
+            return finish(error);
+        };
+
         for (;;) {
             PipeWakeList pending_readers{};
             size_t pending_readers_count = 0;
@@ -14943,7 +14951,7 @@ auto vfs_pipe_for_task(ker::mod::sched::task::Task* task, int pipefd[2],
                 if (task) {
                     task->signal_add_pending_mask(1ULL << (13 - 1));
                 }
-                return finish(-EPIPE);
+                return finish_with_progress(-EPIPE);
             }
 
             if (st->direct_write_active) {
@@ -14958,18 +14966,18 @@ auto vfs_pipe_for_task(ker::mod::sched::task::Task* task, int pipefd[2],
                                   f->open_flags, static_cast<unsigned long long>(BUFFERED), static_cast<unsigned long long>(CAPACITY),
                                   OPEN_ENDS);
                     }
-                    return finish(-EAGAIN);
+                    return finish_with_progress(-EAGAIN);
                 }
 
                 auto* current_task = ker::mod::sched::get_current_task();
                 if (current_task == nullptr) {
                     st->lock.unlock_irqrestore(IRQF);
-                    return finish(-ESRCH);
+                    return finish_with_progress(-ESRCH);
                 }
 
                 if (current_task_has_deliverable_signal()) {
                     st->lock.unlock_irqrestore(IRQF);
-                    return finish(-EINTR);
+                    return finish_with_progress(-EINTR);
                 }
 
                 bool const REGISTERED = pipe_register_waiter(st->writers_waiting, current_task->pid);
@@ -14987,17 +14995,20 @@ auto vfs_pipe_for_task(ker::mod::sched::task::Task* task, int pipefd[2],
 
             size_t const AVAIL = st->capacity - st->count;
             if (AVAIL > 0) {
-                size_t const TO_STAGE = std::min({count, AVAIL, bounce.size()});
+                size_t const REMAINING = count - total_written;
+                size_t const TO_STAGE = std::min({REMAINING, AVAIL, bounce.size()});
                 st->lock.unlock_irqrestore(IRQF);
-                if (!pipe_copy_from_caller(buf, bounce.data(), TO_STAGE)) {
-                    return finish(-EFAULT);
+                auto const SOURCE_ADDR = reinterpret_cast<uint64_t>(buf) + total_written;
+                auto const* source = reinterpret_cast<const void*>(SOURCE_ADDR);
+                if (!pipe_copy_from_caller(source, bounce.data(), TO_STAGE)) {
+                    return finish_with_progress(-EFAULT);
                 }
 
                 uint64_t const WRITE_IRQF = st->lock.lock_irqsave();
                 if (st->read_closed) {
                     st->lock.unlock_irqrestore(WRITE_IRQF);
                     signal_current_sigpipe();
-                    return finish(-EPIPE);
+                    return finish_with_progress(-EPIPE);
                 }
                 if (st->direct_write_active || st->count >= st->capacity) {
                     st->lock.unlock_irqrestore(WRITE_IRQF);
@@ -15017,7 +15028,11 @@ auto vfs_pipe_for_task(ker::mod::sched::task::Task* task, int pipefd[2],
                 st->lock.unlock_irqrestore(WRITE_IRQF);
                 pipe_reschedule_waiters(pending_readers, pending_readers_count);
                 pipe_reschedule_waiters(pending_read_pollers, pending_read_pollers_count);
-                return finish(static_cast<ssize_t>(TO_WRITE), static_cast<uint64_t>(TO_WRITE));
+                total_written += TO_WRITE;
+                if (total_written == count) {
+                    return finish(static_cast<ssize_t>(total_written), static_cast<uint64_t>(total_written));
+                }
+                continue;
             }
 
             if (f->open_flags & O_NONBLOCK) {
@@ -15034,18 +15049,18 @@ auto vfs_pipe_for_task(ker::mod::sched::task::Task* task, int pipefd[2],
                         static_cast<unsigned long long>(BUFFERED), static_cast<unsigned long long>(CAPACITY), OPEN_ENDS,
                         READ_CLOSED ? 1U : 0U);
                 }
-                return finish(-EAGAIN);
+                return finish_with_progress(-EAGAIN);
             }
 
             auto* current_task = ker::mod::sched::get_current_task();
             if (current_task == nullptr) {
                 st->lock.unlock_irqrestore(IRQF);
-                return finish(-ESRCH);
+                return finish_with_progress(-ESRCH);
             }
 
             if (current_task_has_deliverable_signal()) {
                 st->lock.unlock_irqrestore(IRQF);
-                return finish(-EINTR);
+                return finish_with_progress(-EINTR);
             }
 
             bool const REGISTERED = pipe_register_waiter(st->writers_waiting, current_task->pid);

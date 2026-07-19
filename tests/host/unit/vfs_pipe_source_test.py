@@ -99,14 +99,25 @@ def test_local_pipe_bounces_are_producer_initialized() -> None:
         write_body,
         [
             declaration,
-            "size_t const TO_STAGE = std::min({count, AVAIL, bounce.size()})",
-            "pipe_copy_from_caller(buf, bounce.data(), TO_STAGE)",
-            "return finish(-EFAULT)",
+            "size_t total_written = 0",
+            "auto finish_with_progress = [&](ssize_t error) -> ssize_t",
+            "size_t const REMAINING = count - total_written",
+            "size_t const TO_STAGE = std::min({REMAINING, AVAIL, bounce.size()})",
+            "reinterpret_cast<uint64_t>(buf) + total_written",
+            "pipe_copy_from_caller(source, bounce.data(), TO_STAGE)",
+            "return finish_with_progress(-EFAULT)",
             "size_t const TO_WRITE = std::min(TO_STAGE, st->capacity - st->count)",
             "pipe_copy_to_ring_locked(st, bounce.data(), TO_WRITE)",
+            "total_written += TO_WRITE",
+            "if (total_written == count)",
+            "return finish(static_cast<ssize_t>(total_written), static_cast<uint64_t>(total_written))",
+            "continue",
         ],
         "local pipe write bounce",
     )
+
+    if write_body.count("return finish_with_progress(") < 8:
+        fail("local pipe writes must preserve partial progress across terminal conditions")
 
     caller_copy = function_body(source, "pipe_copy_from_caller")
     require_order(
