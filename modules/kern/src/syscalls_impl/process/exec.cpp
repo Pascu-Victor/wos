@@ -516,7 +516,7 @@ struct ShebangInfo {
 };
 
 auto allocate_kernel_stack() -> uint64_t {
-    auto stack_base = reinterpret_cast<uint64_t>(ker::mod::mm::phys::page_alloc(ker::mod::mm::KERNEL_STACK_SIZE));
+    auto stack_base = reinterpret_cast<uint64_t>(ker::mod::mm::phys::kernel_stack_alloc("exec_kstack"));
     if (stack_base == 0) {
         return 0;
     }

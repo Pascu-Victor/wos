@@ -471,7 +471,7 @@ auto repair_stale_process_syscall_resume(sched::task::Task* task) -> bool {
 
 #ifdef WOS_SELFTEST
 auto context_switch_selftest_repair_stale_process_syscall_resume() -> bool {
-    auto* stack = static_cast<uint8_t*>(mm::phys::page_alloc(mm::KERNEL_STACK_SIZE, "ctxswitch_stale_syscall_ktest"));
+    auto* stack = static_cast<uint8_t*>(mm::phys::kernel_stack_alloc("ctxswitch_stale_syscall_ktest"));
     if (stack == nullptr) {
         return false;
     }

@@ -26,6 +26,7 @@
 #include "platform/init/limine_requests.hpp"
 #include "platform/mm/addr.hpp"
 #include "platform/mm/dyn/kmalloc.hpp"
+#include "platform/mm/mm.hpp"
 #include "platform/mm/paging.hpp"
 #include "platform/mm/virt.hpp"
 #include "platform/sched/scheduler.hpp"
@@ -84,6 +85,25 @@ bool regular_zone_lookup_ready = false;
 constexpr size_t PAGE_ALLOC_BUFFER_RECLAIM_MIN_BYTES = size_t{8} * 1024 * 1024;
 constexpr size_t PAGE_ALLOC_BUFFER_RECLAIM_MAX_BYTES = size_t{64} * 1024 * 1024;
 constexpr uint64_t PAGE_ALLOC_RECLAIM_RESERVE_BYTES = uint64_t{256} * 1024 * 1024;
+
+// Runtime task creation must not depend on an order-7 block surviving in the
+// general buddy allocator. A build workload can leave gigabytes free while
+// fragmenting every regular zone below the 512 KiB kernel-stack order.
+constexpr size_t KERNEL_STACK_POOL_CAPACITY = 256;
+constexpr size_t KERNEL_STACK_POOL_BYTES = KERNEL_STACK_POOL_CAPACITY * ker::mod::mm::KERNEL_STACK_SIZE;
+constexpr size_t KERNEL_STACK_POOL_MIN_BYTES = size_t{16} * 1024 * 1024;
+
+struct KernelStackPool {
+    sys::Spinlock lock;
+    std::array<void*, KERNEL_STACK_POOL_CAPACITY> free_slots{};
+    std::array<bool, KERNEL_STACK_POOL_CAPACITY> in_use{};
+    uint8_t* base = nullptr;
+    size_t capacity = 0;
+    size_t free_count = 0;
+    size_t high_watermark = 0;
+};
+
+KernelStackPool kernel_stack_pool{};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
 // Per-CPU caches (initialized in init())
 PerCpuPageCache* per_cpu_caches = nullptr;
@@ -1228,14 +1248,18 @@ void prepare_allocated_block(void* block, uint64_t size, ReturnedPageZeroing zer
         }
     }
 
-    if (zeroing == ReturnedPageZeroing::ZERO) {
-        std::memset(block, 0, size);
-    }
 #ifdef WOS_KASAN
     if (kasan::is_enabled() && !kasan::in_shadow_fault()) {
+        // A reused kernel stack can retain compiler stack-redzone poison when
+        // its task exited without unwinding. phys.opt.cpp is deliberately not
+        // instrumented, but unpoison before memset also keeps this helper safe
+        // if its compile policy changes.
         kasan::unpoison_range(block, size);
     }
 #endif
+    if (zeroing == ReturnedPageZeroing::ZERO) {
+        std::memset(block, 0, size);
+    }
 
     if (saved_cr3 != 0) {
         wrcr3(saved_cr3);
@@ -1477,7 +1501,7 @@ auto page_alloc_buffer_reclaim_budget(uint64_t requested_pages) -> size_t {
 }
 
 auto page_alloc_with_reclaim_impl(uint64_t size, std::string_view name, ReturnedPageZeroing zeroing, void* caller_addr,
-                                  uint32_t retry_count) -> void* {
+                                  uint32_t retry_count, bool log_oom) -> void* {
     uint64_t requested_pages = 0;
     if (!page_alloc_size_within_buddy_limit(size, requested_pages)) {
         return nullptr;
@@ -1509,7 +1533,7 @@ auto page_alloc_with_reclaim_impl(uint64_t size, std::string_view name, Returned
         }
     }
 
-    return page_alloc_impl(size, name, zeroing, caller_addr, true);
+    return page_alloc_impl(size, name, zeroing, caller_addr, log_oom);
 }
 
 void dump_page_alloc_oom_header(uint64_t size, void* caller_addr, std::string_view name) {
@@ -1538,6 +1562,10 @@ auto page_alloc_full_overwrite(uint64_t size, std::string_view name) -> void* {
     return page_alloc_impl(size, name, ReturnedPageZeroing::FULL_OVERWRITE, __builtin_return_address(0), true);
 }
 
+auto page_alloc_full_overwrite_may_fail(uint64_t size, std::string_view name) -> void* {
+    return page_alloc_impl(size, name, ReturnedPageZeroing::FULL_OVERWRITE, __builtin_return_address(0), false);
+}
+
 auto page_alloc_full_overwrite_page(std::string_view name) -> void* {
     return page_alloc_impl(paging::PAGE_SIZE, name, ReturnedPageZeroing::FULL_OVERWRITE, __builtin_return_address(0), true);
 }
@@ -1551,13 +1579,117 @@ auto page_alloc_full_overwrite_page_may_fail(std::string_view name) -> void* {
 }
 
 auto page_alloc_with_reclaim(uint64_t size, std::string_view name, uint32_t retry_count) -> void* {
-    return page_alloc_with_reclaim_impl(size, name, ReturnedPageZeroing::ZERO, __builtin_return_address(0), retry_count);
+    return page_alloc_with_reclaim_impl(size, name, ReturnedPageZeroing::ZERO, __builtin_return_address(0), retry_count, true);
+}
+
+auto page_alloc_with_reclaim_may_fail(uint64_t size, std::string_view name, uint32_t retry_count) -> void* {
+    return page_alloc_with_reclaim_impl(size, name, ReturnedPageZeroing::ZERO, __builtin_return_address(0), retry_count, false);
 }
 
 auto page_alloc_full_overwrite_page_with_reclaim(std::string_view name, uint32_t retry_count) -> void* {
     return page_alloc_with_reclaim_impl(paging::PAGE_SIZE, name, ReturnedPageZeroing::FULL_OVERWRITE, __builtin_return_address(0),
-                                        retry_count);
+                                        retry_count, true);
 }
+
+void init_kernel_stack_pool() {
+    size_t arena_bytes = KERNEL_STACK_POOL_BYTES;
+    void* backing = nullptr;
+    while (arena_bytes >= KERNEL_STACK_POOL_MIN_BYTES) {
+        backing = page_alloc_full_overwrite_may_fail(arena_bytes, "kernel_stack_pool");
+        if (backing != nullptr) {
+            break;
+        }
+        arena_bytes /= 2;
+    }
+
+    void* const BACKING = backing;
+    if (BACKING == nullptr) {
+        log::warn("unable to reserve a kernel stack pool; using nonfatal buddy fallback");
+        return;
+    }
+
+    auto& pool = kernel_stack_pool;
+    uint64_t const FLAGS = pool.lock.lock_irqsave();
+    pool.base = static_cast<uint8_t*>(BACKING);
+    pool.capacity = arena_bytes / ker::mod::mm::KERNEL_STACK_SIZE;
+    pool.free_count = pool.capacity;
+    pool.high_watermark = 0;
+    for (size_t i = 0; i < pool.capacity; ++i) {
+        pool.free_slots.at(i) = pool.base + (i * ker::mod::mm::KERNEL_STACK_SIZE);
+        pool.in_use.at(i) = false;
+    }
+    pool.lock.unlock_irqrestore(FLAGS);
+
+    log::info("reserved kernel stack pool: slots=%zu stack_bytes=%zu total_bytes=%zu", pool.capacity, ker::mod::mm::KERNEL_STACK_SIZE,
+              arena_bytes);
+}
+
+auto kernel_stack_alloc(std::string_view name) -> void* {
+    auto& pool = kernel_stack_pool;
+    void* stack = nullptr;
+
+    uint64_t const FLAGS = pool.lock.lock_irqsave();
+    if (pool.free_count != 0) {
+        --pool.free_count;
+        stack = pool.free_slots.at(pool.free_count);
+        pool.free_slots.at(pool.free_count) = nullptr;
+        size_t const INDEX = (static_cast<uint8_t*>(stack) - pool.base) / ker::mod::mm::KERNEL_STACK_SIZE;
+        if (INDEX >= pool.in_use.size() || pool.in_use.at(INDEX)) [[unlikely]] {
+            pool.lock.unlock_irqrestore(FLAGS);
+            dbg::panic_handler("kernel stack pool allocation state is corrupt");
+            hcf();
+        }
+        pool.in_use.at(INDEX) = true;
+        size_t const ACTIVE = pool.capacity - pool.free_count;
+        pool.high_watermark = std::max(ACTIVE, pool.high_watermark);
+    }
+    pool.lock.unlock_irqrestore(FLAGS);
+
+    if (stack != nullptr) {
+        prepare_allocated_block(stack, ker::mod::mm::KERNEL_STACK_SIZE, ReturnedPageZeroing::ZERO);
+        return stack;
+    }
+
+    return page_alloc_with_reclaim_may_fail(ker::mod::mm::KERNEL_STACK_SIZE, name);
+}
+
+namespace {
+enum class KernelStackPoolRelease : uint8_t {
+    NOT_POOL,
+    RELEASED,
+    REJECTED,
+};
+
+auto release_kernel_stack_pool_slot(void* page) -> KernelStackPoolRelease {
+    auto& pool = kernel_stack_pool;
+    auto const PTR = reinterpret_cast<uint64_t>(page);
+    auto const BASE = reinterpret_cast<uint64_t>(pool.base);
+    uint64_t const POOL_BYTES = pool.capacity * ker::mod::mm::KERNEL_STACK_SIZE;
+    if (pool.base == nullptr || PTR < BASE || PTR - BASE >= POOL_BYTES) {
+        return KernelStackPoolRelease::NOT_POOL;
+    }
+
+    auto const OFFSET = static_cast<size_t>(PTR - BASE);
+    if ((OFFSET % ker::mod::mm::KERNEL_STACK_SIZE) != 0) [[unlikely]] {
+        dbg::emergency_log("kernel stack pool: rejecting unaligned free ptr=0x%lx\n", reinterpret_cast<uint64_t>(page));
+        return KernelStackPoolRelease::REJECTED;
+    }
+
+    size_t const INDEX = OFFSET / ker::mod::mm::KERNEL_STACK_SIZE;
+    uint64_t const FLAGS = pool.lock.lock_irqsave();
+    if (INDEX >= pool.in_use.size() || !pool.in_use.at(INDEX) || pool.free_count >= pool.free_slots.size()) [[unlikely]] {
+        pool.lock.unlock_irqrestore(FLAGS);
+        dbg::emergency_log("kernel stack pool: rejecting duplicate/corrupt free ptr=0x%lx index=%lu\n", reinterpret_cast<uint64_t>(page),
+                           static_cast<uint64_t>(INDEX));
+        return KernelStackPoolRelease::REJECTED;
+    }
+    pool.in_use.at(INDEX) = false;
+    pool.free_slots.at(pool.free_count) = page;
+    ++pool.free_count;
+    pool.lock.unlock_irqrestore(FLAGS);
+    return KernelStackPoolRelease::RELEASED;
+}
+}  // namespace
 
 auto page_alloc_huge(uint64_t size) -> void* {
     if (huge_page_zone == nullptr) {
@@ -1616,6 +1748,14 @@ auto page_alloc_huge(uint64_t size) -> void* {
 }
 
 void page_free(void* page) {
+    if (page == nullptr) {
+        return;
+    }
+
+    if (release_kernel_stack_pool_slot(page) != KernelStackPoolRelease::NOT_POOL) {
+        return;
+    }
+
     // Try huge page zone first
     if (huge_page_zone != nullptr) {
         auto const PAGE_ADDR = reinterpret_cast<uint64_t>(page);

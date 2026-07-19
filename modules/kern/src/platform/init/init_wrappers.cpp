@@ -97,7 +97,7 @@ void gdt_init() {
     // interrupt stack; the captured boot RSP is just the current stack pointer.
     static uint64_t bsp_rsp0 = 0;
     if (bsp_rsp0 == 0) {
-        auto const STACK_BASE = reinterpret_cast<uint64_t>(mod::mm::phys::page_alloc(mod::mm::KERNEL_STACK_SIZE));
+        auto const STACK_BASE = reinterpret_cast<uint64_t>(mod::mm::phys::kernel_stack_alloc("bsp-rsp0-stack"));
         if (STACK_BASE == 0) {
             hcf();
         }

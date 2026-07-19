@@ -110,18 +110,23 @@ struct PageLookupHint {
 void init(limine_memmap_response* memmap_response);
 void set_kernel_cr3(uint64_t cr3);    // Call after initPagemap to set kernel CR3 for safe memset
 void init_huge_page_zone_deferred();  // Call after initPagemap to initialize huge page zone
+void init_kernel_stack_pool();        // Reserve contiguous stack slots before runtime fragmentation
 void enable_per_cpu_allocations();    // Call after cpuParamInit to enable per-CPU page caches
 auto page_alloc(uint64_t size = ker::mod::mm::paging::PAGE_SIZE, std::string_view name = "anonymous") -> void*;
 auto page_alloc_full_overwrite(uint64_t size = ker::mod::mm::paging::PAGE_SIZE, std::string_view name = "full_overwrite") -> void*;
+auto page_alloc_full_overwrite_may_fail(uint64_t size = ker::mod::mm::paging::PAGE_SIZE, std::string_view name = "full_overwrite") -> void*;
 auto page_alloc_full_overwrite_page(std::string_view name = "full_overwrite") -> void*;
 auto page_alloc_may_fail(uint64_t size = ker::mod::mm::paging::PAGE_SIZE, std::string_view name = "anonymous") -> void*;
 auto page_alloc_full_overwrite_page_may_fail(std::string_view name = "full_overwrite") -> void*;
 inline constexpr uint32_t PAGE_ALLOC_RECLAIM_RETRY_DEFAULT = 2048;
 auto page_alloc_with_reclaim(uint64_t size = ker::mod::mm::paging::PAGE_SIZE, std::string_view name = "anonymous",
                              uint32_t retry_count = PAGE_ALLOC_RECLAIM_RETRY_DEFAULT) -> void*;
+auto page_alloc_with_reclaim_may_fail(uint64_t size = ker::mod::mm::paging::PAGE_SIZE, std::string_view name = "anonymous",
+                                      uint32_t retry_count = PAGE_ALLOC_RECLAIM_RETRY_DEFAULT) -> void*;
 auto page_alloc_full_overwrite_page_with_reclaim(std::string_view name = "full_overwrite",
                                                  uint32_t retry_count = PAGE_ALLOC_RECLAIM_RETRY_DEFAULT) -> void*;
 auto page_alloc_huge(uint64_t size) -> void*;  // Try the optional huge page zone, if enabled.
+auto kernel_stack_alloc(std::string_view name = "kernel_stack") -> void*;
 void page_free(void* page);
 auto can_wait_for_reclaim() -> bool;
 auto page_split_to_order0(void* page) -> bool;

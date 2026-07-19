@@ -56,7 +56,7 @@ uint32_t bsp_lapic_id;
 uint64_t g_cpu_count;
 
 auto allocate_kernel_stack_top(const char* name) -> uint64_t {
-    auto const STACK_BASE = reinterpret_cast<uint64_t>(mm::phys::page_alloc(mm::KERNEL_STACK_SIZE, name));
+    auto const STACK_BASE = reinterpret_cast<uint64_t>(mm::phys::kernel_stack_alloc(name));
     if (STACK_BASE == 0) {
         dbg::log("FATAL: Failed to allocate kernel stack for %s", name != nullptr ? name : "?");
         hcf();

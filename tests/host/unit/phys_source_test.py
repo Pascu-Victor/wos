@@ -7,6 +7,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[3]
 PHYS_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "mm" / "phys.opt.cpp"
 PHYS_HPP = ROOT / "modules" / "kern" / "src" / "platform" / "mm" / "phys.hpp"
+MM_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "mm" / "mm.opt.cpp"
 PAGE_ALLOC_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "mm" / "page_alloc.cpp"
 KMALLOC_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "mm" / "dyn" / "kmalloc.opt.cpp"
 MM_KTEST = ROOT / "modules" / "kern" / "src" / "test" / "mm_ktest.cpp"
@@ -453,6 +454,116 @@ def test_live_slab_pages_are_not_reused_by_physical_allocator() -> None:
     )
 
 
+def test_kernel_stacks_use_an_early_fixed_slot_pool() -> None:
+    phys = PHYS_CPP.read_text()
+    phys_hpp = PHYS_HPP.read_text()
+    mm = MM_CPP.read_text()
+
+    require_tokens(
+        phys_hpp,
+        [
+            "void init_kernel_stack_pool();",
+            'auto kernel_stack_alloc(std::string_view name = "kernel_stack") -> void*;',
+            "auto page_alloc_full_overwrite_may_fail(",
+            "auto page_alloc_with_reclaim_may_fail(",
+        ],
+        "kernel stack pool public API",
+    )
+    require_order(
+        function_body(mm, "init"),
+        [
+            "virt::init_pagemap()",
+            "phys::set_kernel_cr3",
+            "phys::init_kernel_stack_pool()",
+        ],
+        "kernel stack pool must be reserved after the final kernel pagemap and before later boot phases",
+    )
+    require_tokens(
+        phys,
+        [
+            "constexpr size_t KERNEL_STACK_POOL_CAPACITY = 256",
+            "constexpr size_t KERNEL_STACK_POOL_BYTES = KERNEL_STACK_POOL_CAPACITY * ker::mod::mm::KERNEL_STACK_SIZE",
+            "constexpr size_t KERNEL_STACK_POOL_MIN_BYTES = size_t{16} * 1024 * 1024",
+            "std::array<void*, KERNEL_STACK_POOL_CAPACITY> free_slots{}",
+            "std::array<bool, KERNEL_STACK_POOL_CAPACITY> in_use{}",
+        ],
+        "fixed kernel stack pool storage",
+    )
+    require_order(
+        function_body(phys, "init_kernel_stack_pool"),
+        [
+            "while (arena_bytes >= KERNEL_STACK_POOL_MIN_BYTES)",
+            'page_alloc_full_overwrite_may_fail(arena_bytes, "kernel_stack_pool")',
+            "arena_bytes /= 2",
+            "pool.base = static_cast<uint8_t*>(BACKING)",
+            "pool.capacity = arena_bytes / ker::mod::mm::KERNEL_STACK_SIZE",
+            "pool.free_count = pool.capacity",
+            "pool.free_slots.at(i) = pool.base + (i * ker::mod::mm::KERNEL_STACK_SIZE)",
+        ],
+        "early contiguous kernel stack pool reservation",
+    )
+    require_order(
+        function_body(phys, "kernel_stack_alloc"),
+        [
+            "pool.lock.lock_irqsave()",
+            "--pool.free_count",
+            "pool.in_use.at(INDEX) = true",
+            "pool.lock.unlock_irqrestore(FLAGS)",
+            "prepare_allocated_block(stack, ker::mod::mm::KERNEL_STACK_SIZE, ReturnedPageZeroing::ZERO)",
+            "page_alloc_with_reclaim_may_fail(ker::mod::mm::KERNEL_STACK_SIZE, name)",
+        ],
+        "kernel stack pool allocation and buddy fallback",
+    )
+    require_tokens(
+        function_body(phys, "page_alloc_full_overwrite_may_fail"),
+        ["ReturnedPageZeroing::FULL_OVERWRITE", "__builtin_return_address(0)", "false"],
+        "kernel stack arena reservation must not enter the fatal OOM dump",
+    )
+    require_tokens(
+        function_body(phys, "page_alloc_with_reclaim_may_fail"),
+        ["ReturnedPageZeroing::ZERO", "__builtin_return_address(0)", "retry_count", "false"],
+        "kernel stack buddy fallback must return failure without the fatal OOM dump",
+    )
+    require_order(
+        function_body(phys, "release_kernel_stack_pool_slot"),
+        [
+            "OFFSET % ker::mod::mm::KERNEL_STACK_SIZE",
+            "pool.lock.lock_irqsave()",
+            "!pool.in_use.at(INDEX)",
+            "pool.in_use.at(INDEX) = false",
+            "pool.free_slots.at(pool.free_count) = page",
+            "pool.lock.unlock_irqrestore(FLAGS)",
+        ],
+        "kernel stack pool free validation",
+    )
+    require_order(
+        function_body(phys, "page_free"),
+        [
+            "release_kernel_stack_pool_slot(page)",
+            "KernelStackPoolRelease::NOT_POOL",
+            "// Try huge page zone first",
+        ],
+        "page_free must return fixed stack slots before consulting buddy metadata",
+    )
+
+    stack_callers = [
+        ROOT / "modules/kern/src/platform/init/init_wrappers.cpp",
+        ROOT / "modules/kern/src/platform/smt/smt.cpp",
+        ROOT / "modules/kern/src/platform/sched/task.cpp",
+        ROOT / "modules/kern/src/syscalls_impl/process/process.cpp",
+        ROOT / "modules/kern/src/syscalls_impl/process/exec.cpp",
+        ROOT / "modules/kern/src/net/wki/remote_compute.cpp",
+        ROOT / "modules/kern/src/platform/sys/context_switch.cpp",
+        ROOT / "modules/kern/src/platform/debug/ptrace.cpp",
+    ]
+    for caller in stack_callers:
+        source = caller.read_text()
+        if "kernel_stack_alloc(" not in source:
+            fail(f"kernel stack allocation entrypoint still bypasses the fixed pool: {caller}")
+        if re.search(r"page_alloc(?:_with_reclaim)?\([^\n;]*KERNEL_STACK_SIZE", source):
+            fail(f"direct high-order kernel stack allocation remains: {caller}")
+
+
 def main() -> None:
     test_internal_reservation_requires_nonzero_base_and_spare_page()
     test_per_cpu_cache_reservation_uses_selector_not_raw_memmap_base()
@@ -462,6 +573,7 @@ def main() -> None:
     test_allocator_size_rounding_rejects_overflow_and_overmax_requests()
     test_kmalloc_realloc_bounds_small_copy_by_old_slab_size()
     test_live_slab_pages_are_not_reused_by_physical_allocator()
+    test_kernel_stacks_use_an_early_fixed_slot_pool()
     print("physical memory source invariants hold")
 
 

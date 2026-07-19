@@ -1250,7 +1250,7 @@ auto report_signal_stop(ker::mod::sched::task::Task& task, uint32_t signal) -> b
 
 #ifdef WOS_SELFTEST
 auto ptrace_selftest_syscall_snapshot_patches_live_sysret_state() -> bool {
-    auto* stack = static_cast<uint8_t*>(ker::mod::mm::phys::page_alloc(ker::mod::mm::KERNEL_STACK_SIZE, "ptrace_sysret_state_ktest"));
+    auto* stack = static_cast<uint8_t*>(ker::mod::mm::phys::kernel_stack_alloc("ptrace_sysret_state_ktest"));
     if (stack == nullptr) {
         return false;
     }

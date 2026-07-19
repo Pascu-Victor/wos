@@ -1106,7 +1106,7 @@ auto Task::initialize_process_image(const ker::loader::elf::ElfFileView& elf, co
 }
 
 Task* Task::create_user_thread(Task* parent, uint64_t tcb_vaddr, uint64_t user_sp, uint64_t enter_thread_va) {
-    auto const KSTACK_BASE = reinterpret_cast<uint64_t>(mm::phys::page_alloc(ker::mod::mm::KERNEL_STACK_SIZE));
+    auto const KSTACK_BASE = reinterpret_cast<uint64_t>(mm::phys::kernel_stack_alloc("user_thread_kstack"));
     if (KSTACK_BASE == 0) {
         dbg::log("createUserThread: OOM allocating kernel stack");
         return nullptr;
@@ -1307,7 +1307,7 @@ Task* Task::create_kernel_thread(const char* name, void (*entry_func)()) {
         return nullptr;
     }
 
-    auto stack_base = reinterpret_cast<uint64_t>(mm::phys::page_alloc(ker::mod::mm::KERNEL_STACK_SIZE));
+    auto stack_base = reinterpret_cast<uint64_t>(mm::phys::kernel_stack_alloc("kernel_thread_kstack"));
     if (stack_base == 0) {
         dbg::log("create_kernel_thread: OOM allocating kernel stack for '%s'", name);
         return nullptr;

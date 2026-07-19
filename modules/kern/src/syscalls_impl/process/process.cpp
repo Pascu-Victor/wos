@@ -314,7 +314,7 @@ inline void log_unmapped_child_resume_state(const ker::mod::sched::task::Task* p
 }
 
 auto alloc_fork_kernel_stack_with_reclaim() -> uint64_t {
-    return reinterpret_cast<uint64_t>(ker::mod::mm::phys::page_alloc_with_reclaim(ker::mod::mm::KERNEL_STACK_SIZE, "fork_kstack"));
+    return reinterpret_cast<uint64_t>(ker::mod::mm::phys::kernel_stack_alloc("fork_kstack"));
 }
 
 auto fork_free_page_low_watermark() -> uint64_t {

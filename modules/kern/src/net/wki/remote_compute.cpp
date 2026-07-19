@@ -4854,7 +4854,7 @@ auto exec_elf_buffer(uint8_t* elf_buffer, uint32_t binary_len, bool shared_elf_b
     }
 
     // Allocate kernel stack
-    auto stack_base = reinterpret_cast<uint64_t>(ker::mod::mm::phys::page_alloc(ker::mod::mm::KERNEL_STACK_SIZE));
+    auto stack_base = reinterpret_cast<uint64_t>(ker::mod::mm::phys::kernel_stack_alloc("wki_exec_kstack"));
     if (stack_base == 0) {
         release_loaded_elf_buffer(elf_buffer, shared_elf_buffer);
         result.reject_reason = TaskRejectReason::NO_MEM;
@@ -4900,7 +4900,7 @@ auto exec_elf_buffer(uint8_t* elf_buffer, uint32_t binary_len, bool shared_elf_b
 }
 
 auto exec_elf_file(ker::vfs::File* owned_file, uint32_t binary_len, const ker::vfs::Stat& file_stat) -> ExecResult {
-    auto stack_base = reinterpret_cast<uint64_t>(ker::mod::mm::phys::page_alloc(ker::mod::mm::KERNEL_STACK_SIZE));
+    auto stack_base = reinterpret_cast<uint64_t>(ker::mod::mm::phys::kernel_stack_alloc("wki_file_exec_kstack"));
     if (stack_base == 0) {
         ker::vfs::vfs_put_file(owned_file);
         ExecResult result;
