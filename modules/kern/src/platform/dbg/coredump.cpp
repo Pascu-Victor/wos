@@ -39,8 +39,10 @@ constexpr uint64_t SNAPSHOT_FLAG_PINNED_DIAGNOSTIC_PAGES = 1ULL << 1;
 constexpr int CANONICAL_SIGN_BIT = 47;
 constexpr uint64_t CANONICAL_KERNEL_UPPER = 0x1ffffULL;
 
-// Keep this in sync with tmpfs' internal flag.
+// Keep these in sync with the VFS/userspace Linux-compatible open flags.
+constexpr int O_WRONLY = 01;
 constexpr int O_CREAT = 0100;  // octal = 64 decimal = 0x40 hex
+constexpr int O_TRUNC = 01000;
 constexpr uint32_t RING_SIZE = 4;
 
 auto page_table_entry_at(ker::mod::mm::paging::PageTable* table, size_t index) -> ker::mod::mm::paging::PageTableEntry& {
@@ -596,7 +598,7 @@ void perform_coredump(const CoreDumpRequest& req) {
     append_cstr(path.data(), path.size(), pos, SUFFIX);
     path.at(pos) = '\0';
 
-    int const FD = ker::vfs::vfs_open(path.data(), O_CREAT, 0);
+    int const FD = ker::vfs::vfs_open(path.data(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
     if (FD < 0) {
         log::error("failed to open %s", path.data());
         return;
