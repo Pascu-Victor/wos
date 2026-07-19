@@ -1509,7 +1509,13 @@ auto page_alloc_with_reclaim_impl(uint64_t size, std::string_view name, Returned
 
     bool const CAN_RECLAIM = can_wait_for_reclaim();
     if (CAN_RECLAIM && !page_alloc_can_satisfy(size, PAGE_ALLOC_RECLAIM_RESERVE_BYTES)) {
-        static_cast<void>(ker::vfs::reclaim_clean_buffer_cache_for_pressure(PAGE_ALLOC_BUFFER_RECLAIM_MAX_BYTES));
+        // Kernel-vmap users cache stable order-0 mappings so hot allocation
+        // cycles avoid a global TLB shootdown. Under physical pressure, purge
+        // those free mappings before asking subsystems to evict live objects.
+        virt::drain_kernel_vmap_frees();
+        if (!page_alloc_can_satisfy(size, PAGE_ALLOC_RECLAIM_RESERVE_BYTES)) {
+            static_cast<void>(ker::vfs::reclaim_clean_buffer_cache_for_pressure(PAGE_ALLOC_BUFFER_RECLAIM_MAX_BYTES));
+        }
     }
 
     for (uint32_t attempt = 0; attempt < retry_count; ++attempt) {

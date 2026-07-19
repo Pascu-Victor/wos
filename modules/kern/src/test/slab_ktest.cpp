@@ -1,9 +1,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <platform/mm/dyn/kmalloc.hpp>
+#include <platform/mm/virt.hpp>
 #include <test/ktest.hpp>
 
 namespace km = ker::mod::mm::dyn::kmalloc;
+namespace virt = ker::mod::mm::virt;
 
 // ---------------------------------------------------------------------------
 // Basic alloc/free
@@ -25,6 +27,20 @@ KTEST(Slab, AllocFreeLarge) {
     void* p = km::malloc(0x800);
     KREQUIRE_NE(p, nullptr);
     km::free(p);
+}
+
+KTEST(Slab, MultiMegabyteAllocationUsesVmap) {
+    constexpr size_t SIZE = 0x35DF00;
+    auto* data = static_cast<uint8_t*>(km::malloc(SIZE));
+    KREQUIRE_NE(data, nullptr);
+    KEXPECT_TRUE(virt::kernel_vmap_contains(data));
+    for (size_t offset = 0; offset < SIZE; offset += 4096) {
+        data[offset] = static_cast<uint8_t>(offset / 4096);
+    }
+    KEXPECT_EQ(data[0], 0U);
+    KEXPECT_EQ(data[(SIZE - 1) & ~size_t{4095}], static_cast<uint8_t>(((SIZE - 1) & ~size_t{4095}) / 4096));
+    km::free(data);
+    virt::drain_kernel_vmap_frees();
 }
 
 // ---------------------------------------------------------------------------

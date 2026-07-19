@@ -126,6 +126,7 @@ void init_pagemap();
 void init_kernel_vmap();
 auto kernel_vmap_alloc(uint64_t size, std::string_view name = "kernel_vmap") -> void*;
 void kernel_vmap_free(void* ptr, uint64_t size);
+[[nodiscard]] auto kernel_vmap_contains(const void* ptr) -> bool;
 // Complete frees deferred by IRQ-disabled callers. Safe contexts may call this
 // opportunistically; it is a no-op while IRQs or preemption are disabled.
 void drain_kernel_vmap_frees();

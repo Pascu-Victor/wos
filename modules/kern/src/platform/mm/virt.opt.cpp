@@ -2965,6 +2965,15 @@ void drain_kernel_vmap_frees() {
     }
 }
 
+auto kernel_vmap_contains(const void* ptr) -> bool {
+    if (!kernel_vmap_initialized || ptr == nullptr) {
+        return false;
+    }
+    auto const ADDRESS = reinterpret_cast<vaddr_t>(ptr);
+    uint64_t const ARENA_BYTES = static_cast<uint64_t>(kernel_vmap_active_pages) * paging::PAGE_SIZE;
+    return ADDRESS >= KERNEL_VMAP_BASE && ADDRESS - KERNEL_VMAP_BASE < ARENA_BYTES;
+}
+
 auto kernel_vmap_alloc(uint64_t size, std::string_view name) -> void* {
     if (!kernel_vmap_initialized || size == 0 || size > UINT64_MAX - (paging::PAGE_SIZE - 1)) {
         return nullptr;

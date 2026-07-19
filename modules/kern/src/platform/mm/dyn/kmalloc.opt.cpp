@@ -17,6 +17,7 @@
 #include "platform/mm/page_alloc.hpp"
 #include "platform/mm/paging.hpp"
 #include "platform/mm/phys.hpp"
+#include "platform/mm/virt.hpp"
 #include "platform/sys/spinlock.hpp"
 
 #ifdef WOS_KASAN
@@ -692,7 +693,14 @@ auto slab_size_to_idx(size_t slab_size) -> SlabClass {
 auto alloc_medium_backing(uint64_t size) -> void* { return phys::page_alloc_with_reclaim(size, "kmalloc_medium"); }
 
 auto alloc_large_backing(uint64_t size) -> void* {
-    void* alloc_ptr = phys::page_alloc_huge(size);
+    // Large C++ containers require contiguous virtual bytes, not contiguous
+    // physical frames. Use the order-0-backed kernel arena first so a
+    // fragmented buddy allocator cannot reject multi-megabyte allocations.
+    void* alloc_ptr = virt::kernel_vmap_alloc(size, "kmalloc_large");
+    if (alloc_ptr != nullptr) {
+        return alloc_ptr;
+    }
+    alloc_ptr = phys::page_alloc_huge(size);
     if (alloc_ptr != nullptr) {
         return alloc_ptr;
     }
@@ -853,7 +861,9 @@ auto malloc_impl(uint64_t size, uintptr_t caller, const char* tag) -> void* {
 #endif
         return nullptr;
     }
-    (void)phys::page_mark_kind(alloc_ptr, PageKind::KMALLOC_LARGE);
+    if (!virt::kernel_vmap_contains(alloc_ptr)) {
+        (void)phys::page_mark_kind(alloc_ptr, PageKind::KMALLOC_LARGE);
+    }
 
     // Set up header with tracking info
     auto* header = static_cast<LargeAllocationHeader*>(alloc_ptr);
@@ -1106,7 +1116,9 @@ auto realloc(void* ptr, size_t size) -> void* {
             if (new_alloc == nullptr) {
                 return nullptr;
             }
-            (void)phys::page_mark_kind(new_alloc, PageKind::KMALLOC_LARGE);
+            if (!virt::kernel_vmap_contains(new_alloc)) {
+                (void)phys::page_mark_kind(new_alloc, PageKind::KMALLOC_LARGE);
+            }
 
             auto* new_header = static_cast<LargeAllocationHeader*>(new_alloc);
             new_header->size = new_rounded_size;
@@ -1138,7 +1150,11 @@ auto realloc(void* ptr, size_t size) -> void* {
 #endif
             potential_large_header->magic = 0;
             large_alloc_lock.unlock_irqrestore(LOCK_FLAGS);
-            phys::page_free(potential_large_header);
+            if (virt::kernel_vmap_contains(potential_large_header)) {
+                virt::kernel_vmap_free(potential_large_header, potential_large_header->size);
+            } else {
+                phys::page_free(potential_large_header);
+            }
             return static_cast<void*>(new_header + 1);
         }
 
@@ -1280,7 +1296,8 @@ void free(void* ptr) {
     auto ptr_val = reinterpret_cast<uintptr_t>(ptr);
     const bool IN_HHDM = (ptr_val >= 0xffff800000000000ULL && ptr_val < 0xffff900000000000ULL);
     const bool IN_KERNEL_STATIC = (ptr_val >= 0xffffffff80000000ULL && ptr_val < 0xffffffffc0000000ULL);
-    if (!IN_HHDM && !IN_KERNEL_STATIC) {
+    const bool IN_KERNEL_VMAP = virt::kernel_vmap_contains(ptr);
+    if (!IN_HHDM && !IN_KERNEL_STATIC && !IN_KERNEL_VMAP) {
         ker::mod::dbg::log("kmalloc::free: caller=%p freeing ptr=%p outside valid kernel range", __builtin_return_address(0), ptr);
         return;
     }
@@ -1305,7 +1322,11 @@ void free(void* ptr) {
             // Poison entire allocation (header + user data) as freed.
             kasan::poison_range(static_cast<void*>(potential_large_header), size, kasan::SHADOW_HEAP_FREED);
 #endif
-            phys::page_free(potential_large_header);  // Free from header, not data ptr
+            if (virt::kernel_vmap_contains(potential_large_header)) {
+                virt::kernel_vmap_free(potential_large_header, size);
+            } else {
+                phys::page_free(potential_large_header);  // Free from header, not data ptr
+            }
             return;
         }
         if (R == TrackedFreeResult::DOUBLE_FREE) {

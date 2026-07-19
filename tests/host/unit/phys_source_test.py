@@ -268,6 +268,7 @@ def test_allocator_size_rounding_rejects_overflow_and_overmax_requests() -> None
             "uint64_t requested_pages = 0",
             "if (!page_alloc_size_within_buddy_limit(size, requested_pages))",
             "return nullptr",
+            "virt::drain_kernel_vmap_frees()",
             "for (uint32_t attempt = 0; attempt < retry_count; ++attempt)",
         ],
         "reclaim allocation must reject invalid sizes before reclaim retries",
@@ -321,6 +322,28 @@ def test_allocator_size_rounding_rejects_overflow_and_overmax_requests() -> None
             "header->size = rounded_size",
         ],
         "kmalloc malloc must reject overflowed tracked allocation sizes",
+    )
+
+    require_order(
+        function_body(kmalloc, "alloc_large_backing"),
+        [
+            'virt::kernel_vmap_alloc(size, "kmalloc_large")',
+            "if (alloc_ptr != nullptr)",
+            "return alloc_ptr",
+            "phys::page_alloc_huge(size)",
+            'phys::page_alloc_with_reclaim(size, "kmalloc_large")',
+        ],
+        "large kmalloc backing must prefer order-0 virtual mappings before physical-contiguous fallbacks",
+    )
+
+    require_order(
+        function_body(kmalloc, "free"),
+        [
+            "virt::kernel_vmap_contains(potential_large_header)",
+            "virt::kernel_vmap_free(potential_large_header, size)",
+            "phys::page_free(potential_large_header)",
+        ],
+        "large kmalloc free must match virtual and physical backing",
     )
 
     realloc_body = function_body(kmalloc, "realloc")
