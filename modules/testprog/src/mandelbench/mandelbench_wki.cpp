@@ -748,7 +748,9 @@ auto move_child_release_fd(int release_read_fd) -> bool {
 void close_standard_fds_for_worker_child() {
     close(STDIN_FILENO);
     close(STDOUT_FILENO);
-    close(STDERR_FILENO);
+    // Keep stderr inherited so descriptor-move, placement, exec, and worker
+    // failures remain observable. Worker payloads use WORKER_OUTPUT_FD, not
+    // the standard streams.
 }
 
 void install_worker_vfs_policy(int worker_id, const std::string& target_node) {

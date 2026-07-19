@@ -1185,9 +1185,11 @@ def test_mandelbench_coalesces_remote_workers_and_keeps_local_compute_local() ->
     close_stdio_body = function_body(source, "close_standard_fds_for_worker_child")
     require_tokens(
         close_stdio_body,
-        ["close(STDIN_FILENO);", "close(STDOUT_FILENO);", "close(STDERR_FILENO);"],
+        ["close(STDIN_FILENO);", "close(STDOUT_FILENO);", "Worker payloads use WORKER_OUTPUT_FD"],
         "mandelbench worker child stdio cleanup",
     )
+    if "close(STDERR_FILENO);" in close_stdio_body:
+        fail("mandelbench worker launch must preserve stderr for exec and protocol diagnostics")
 
     worker_body = function_body(source, "mandelbench_worker")
     require_tokens(
