@@ -1618,6 +1618,7 @@ auto xfs_inode_write(XfsInode* ip, XfsTransaction* tp) -> int {
     dip->di_magic = Be16::from_cpu(XFS_DINODE_MAGIC);
     dip->di_version = 3;
     dip->di_metatype = Be16::from_cpu(0);
+    dip->di_aformat = static_cast<int8_t>(XFS_DINODE_FMT_EXTENTS);
     dip->di_next_unlinked = Be32::from_cpu(UINT32_MAX);
     dip->di_ino = Be64::from_cpu(ip->ino);
     __builtin_memcpy(&dip->di_uuid, &mount->uuid, sizeof(XfsUuidT));

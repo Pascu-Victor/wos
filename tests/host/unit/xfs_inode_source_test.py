@@ -50,6 +50,7 @@ def main() -> None:
         ("bool const LARGE_EXTENT_COUNTS = (ip->flags2 & XFS_DIFLAG2_NREXT64) != 0;", "per-inode extent counter selection"),
         ("if (LARGE_EXTENT_COUNTS && !xfs_has_nrext64(mount))", "NREXT64 feature validation"),
         ("dip->di_anextents = Be16{0};", "NREXT64 padding clear"),
+        ("dip->di_aformat = static_cast<int8_t>(XFS_DINODE_FMT_EXTENTS);", "absent attribute fork format"),
     ):
         haystack = format_source if "constexpr" in needle else source
         if needle not in haystack:
