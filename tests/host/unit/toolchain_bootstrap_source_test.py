@@ -922,6 +922,26 @@ def test_host_toolchain_lldb_python_bindings_are_opt_in() -> None:
         fail("host LLDB Python bindings must not be enabled unconditionally")
 
 
+def test_optional_host_clang_tidy_cache_failure_does_not_abort_bootstrap() -> None:
+    source = HOST_TOOLCHAIN.read_text()
+    require_tokens(
+        source,
+        [
+            "WOS_BUILD_CLANG_TIDY_CACHE=0",
+            "if [ -d clang-tidy-cache ] || git clone --depth=1",
+            "clang-tidy-cache clone failed; continuing without this optional helper",
+            'if [ "$WOS_BUILD_CLANG_TIDY_CACHE" -eq 1 ]; then',
+            "if ! env -u CC -u CXX -u LD",
+            "go build -o $B/host/bin/clang-tidy-cache .; then",
+            "rm -f $B/host/bin/clang-tidy-cache",
+            "continuing without this optional helper",
+        ],
+        "optional host clang-tidy-cache failure handling",
+    )
+    if "[ ! -d clang-tidy-cache ] && git clone" in source:
+        fail("optional clang-tidy-cache clone must not abort the host toolchain")
+
+
 def test_wos_port_install_steps_keep_make_parallelism() -> None:
     scripts = [
         WOS_BUSYBOX_BUILD,
@@ -2775,6 +2795,7 @@ if __name__ == "__main__":
     test_gnu_make_port_build_scripts_use_make_job_helper()
     test_ninja_port_build_scripts_use_ninja_job_helper()
     test_host_toolchain_install_uses_ninja_jobs()
+    test_optional_host_clang_tidy_cache_failure_does_not_abort_bootstrap()
     test_wos_port_install_steps_keep_make_parallelism()
     test_wos_tar_invocations_use_busybox_compatible_long_options()
     test_wos_source_copy_wrappers_avoid_busybox_tar_pipelines()

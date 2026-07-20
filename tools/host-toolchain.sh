@@ -53,7 +53,17 @@ cd $B/src
 
 [ ! -d mlibc ] && git clone --depth=1 --branch=wos-support https://github.com/Pascu-Victor/mlibc.git
 [ ! -d llvm-project ] && git clone --depth=1 --branch=wos https://github.com/Pascu-Victor/llvm-project.git
-[ ! -d clang-tidy-cache ] && git clone --depth=1 https://github.com/williamfligor/clang-tidy-cache.git
+
+WOS_BUILD_CLANG_TIDY_CACHE=0
+if command -v go >/dev/null 2>&1; then
+    if [ -d clang-tidy-cache ] || git clone --depth=1 https://github.com/williamfligor/clang-tidy-cache.git; then
+        WOS_BUILD_CLANG_TIDY_CACHE=1
+    else
+        echo "WARNING: clang-tidy-cache clone failed; continuing without this optional helper." >&2
+    fi
+else
+    echo "Skipping clang-tidy-cache: go not found"
+fi
 
 # 2. Build stage1 clang/lld for the host
 export CFLAGS="-std=c23"
@@ -93,13 +103,16 @@ ln -sf llvm-ar ar
 # 4. Build clang-tidy-cache into the local host tools directory when Go is
 # available. The compiler/sysroot bootstrap does not require this helper, and
 # WOS does not ship a Go toolchain yet.
-if command -v go >/dev/null 2>&1; then
+if [ "$WOS_BUILD_CLANG_TIDY_CACHE" -eq 1 ]; then
     cd $B/src/clang-tidy-cache
-    env -u CC -u CXX -u LD -u CFLAGS -u CXXFLAGS -u CPPFLAGS -u LDFLAGS \
+    if ! env -u CC -u CXX -u LD -u CFLAGS -u CXXFLAGS -u CPPFLAGS -u LDFLAGS \
         CGO_ENABLED=0 \
-        go build -o $B/host/bin/clang-tidy-cache .
+        go build -o $B/host/bin/clang-tidy-cache .; then
+        rm -f $B/host/bin/clang-tidy-cache
+        echo "WARNING: clang-tidy-cache build failed; continuing without this optional helper." >&2
+    fi
 else
-    echo "Skipping clang-tidy-cache: go not found"
+    rm -f $B/host/bin/clang-tidy-cache
 fi
 
 echo "Host toolchain built successfully at $B/host"
