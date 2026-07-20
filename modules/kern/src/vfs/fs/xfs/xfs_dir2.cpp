@@ -1553,6 +1553,12 @@ struct XfsDir3LeafHdr {
 
 static_assert(sizeof(XfsDir3LeafHdr) == 64);
 
+struct XfsDir2LeafTail {
+    Be32 bestcount;
+} __attribute__((packed));
+
+static_assert(sizeof(XfsDir2LeafTail) == 4);
+
 constexpr size_t XFS_DA3_CRC_OFF = __builtin_offsetof(XfsDa3Blkinfo, crc);
 
 auto dir2_buf_get_dir_block(XfsMountContext* ctx, xfs_fsblock_t disk_block) -> BufHead* {
@@ -1677,8 +1683,67 @@ auto dir2_leaf_entries(const XfsDir3LeafHdr* hdr) -> const XfsDir2LeafEntry* {
     return reinterpret_cast<const XfsDir2LeafEntry*>(reinterpret_cast<const uint8_t*>(hdr) + sizeof(XfsDir3LeafHdr));
 }
 
-auto dir2_leaf_capacity(const XfsMountContext* ctx) -> size_t {
-    return (ctx->dir_blk_size - sizeof(XfsDir3LeafHdr)) / sizeof(XfsDir2LeafEntry);
+auto dir2_leaf_layout(const XfsMountContext* ctx, const XfsDir3LeafHdr* hdr, size_t bestcount_override, size_t* bestcount_out,
+                      size_t* capacity_out) -> bool {
+    uint16_t const MAGIC = hdr->info.hdr.magic.to_cpu();
+    size_t bestcount = 0;
+    size_t trailer_size = 0;
+    if (MAGIC == XFS_DIR3_LEAF_MAGIC) {
+        const auto* tail =
+            reinterpret_cast<const XfsDir2LeafTail*>(reinterpret_cast<const uint8_t*>(hdr) + ctx->dir_blk_size - sizeof(XfsDir2LeafTail));
+        bestcount = bestcount_override == SIZE_MAX ? tail->bestcount.to_cpu() : bestcount_override;
+        if (bestcount > (ctx->dir_blk_size - sizeof(XfsDir3LeafHdr) - sizeof(XfsDir2LeafTail)) / sizeof(Be16)) {
+            return false;
+        }
+        trailer_size = sizeof(XfsDir2LeafTail) + (bestcount * sizeof(Be16));
+    } else if (MAGIC != XFS_DIR3_LEAFN_MAGIC) {
+        return false;
+    }
+
+    if (sizeof(XfsDir3LeafHdr) + trailer_size > ctx->dir_blk_size) {
+        return false;
+    }
+    *bestcount_out = bestcount;
+    *capacity_out = (ctx->dir_blk_size - sizeof(XfsDir3LeafHdr) - trailer_size) / sizeof(XfsDir2LeafEntry);
+    return true;
+}
+
+auto dir2_leaf_bests(const XfsMountContext* ctx, XfsDir3LeafHdr* hdr) -> Be16* {
+    auto* tail = reinterpret_cast<XfsDir2LeafTail*>(reinterpret_cast<uint8_t*>(hdr) + ctx->dir_blk_size - sizeof(XfsDir2LeafTail));
+    return reinterpret_cast<Be16*>(tail) - tail->bestcount.to_cpu();
+}
+
+auto dir2_leaf_set_best(const XfsMountContext* ctx, XfsDir3LeafHdr* hdr, xfs_dir2_db_t db, uint16_t best) -> int {
+    size_t bestcount = 0;
+    size_t capacity = 0;
+    if (!dir2_leaf_layout(ctx, hdr, SIZE_MAX, &bestcount, &capacity) || db >= bestcount || hdr->count.to_cpu() > capacity) {
+        return -EINVAL;
+    }
+    dir2_leaf_bests(ctx, hdr)[db] = Be16::from_cpu(best);
+    return 0;
+}
+
+auto dir2_leaf_extend_bests(const XfsMountContext* ctx, XfsDir3LeafHdr* hdr, uint16_t best) -> int {
+    size_t old_bestcount = 0;
+    size_t old_capacity = 0;
+    if (!dir2_leaf_layout(ctx, hdr, SIZE_MAX, &old_bestcount, &old_capacity) || old_bestcount >= UINT32_MAX) {
+        return -EINVAL;
+    }
+
+    size_t new_bestcount = old_bestcount + 1;
+    size_t new_capacity = 0;
+    size_t ignored = 0;
+    if (!dir2_leaf_layout(ctx, hdr, new_bestcount, &ignored, &new_capacity) || hdr->count.to_cpu() > new_capacity) {
+        return -ENOSPC;
+    }
+
+    auto* tail = reinterpret_cast<XfsDir2LeafTail*>(reinterpret_cast<uint8_t*>(hdr) + ctx->dir_blk_size - sizeof(XfsDir2LeafTail));
+    auto* old_bests = reinterpret_cast<Be16*>(tail) - old_bestcount;
+    auto* new_bests = reinterpret_cast<Be16*>(tail) - new_bestcount;
+    __builtin_memmove(new_bests, old_bests, old_bestcount * sizeof(Be16));
+    new_bests[old_bestcount] = Be16::from_cpu(best);
+    tail->bestcount = Be32::from_cpu(static_cast<uint32_t>(new_bestcount));
+    return 0;
 }
 
 auto dir2_count_stale_leaf_entries(const XfsDir2LeafEntry* entries, size_t count) -> size_t {
@@ -1722,8 +1787,10 @@ auto dir2_read_leaf_block(XfsInode* dp, BufHead** bhp) -> int {
         return -ENOSYS;
     }
 
-    size_t const CAPACITY = dir2_leaf_capacity(ctx);
-    if (hdr->count.to_cpu() > CAPACITY) {
+    size_t bestcount = 0;
+    size_t capacity = 0;
+    if (!dir2_leaf_layout(ctx, hdr, SIZE_MAX, &bestcount, &capacity) || hdr->count.to_cpu() > capacity ||
+        (hdr->info.hdr.magic.to_cpu() == XFS_DIR3_LEAF_MAGIC && bestcount != dir2_data_block_count(dp))) {
         brelse(bh);
         return -EINVAL;
     }
@@ -1978,12 +2045,16 @@ auto dir2_leaf_prepare_stale_insert(const XfsDir3LeafHdr* hdr, xfs_dahash_t hash
     return 0;
 }
 
-auto dir2_leaf_preflight_index_slot(XfsMountContext const* ctx, const XfsDir3LeafHdr* hdr) -> int {
+auto dir2_leaf_preflight_index_slot(XfsMountContext const* ctx, const XfsDir3LeafHdr* hdr, size_t bestcount_override = SIZE_MAX) -> int {
     uint16_t const LEAF_COUNT = hdr->count.to_cpu();
     uint16_t const STALE_COUNT = hdr->stale.to_cpu();
-    size_t const CAPACITY = dir2_leaf_capacity(ctx);
-    if (CAPACITY > UINT16_MAX || LEAF_COUNT > CAPACITY) {
+    size_t bestcount = 0;
+    size_t capacity = 0;
+    if (!dir2_leaf_layout(ctx, hdr, bestcount_override, &bestcount, &capacity) || capacity > UINT16_MAX) {
         return -EINVAL;
+    }
+    if (LEAF_COUNT > capacity) {
+        return bestcount_override == SIZE_MAX ? -EINVAL : -ENOSPC;
     }
 
     const auto* lep = dir2_leaf_entries(hdr);
@@ -1991,7 +2062,7 @@ auto dir2_leaf_preflight_index_slot(XfsMountContext const* ctx, const XfsDir3Lea
     if (ACTUAL_STALE != static_cast<size_t>(STALE_COUNT)) {
         return -EINVAL;
     }
-    if (ACTUAL_STALE != 0 || LEAF_COUNT < CAPACITY) {
+    if (ACTUAL_STALE != 0 || LEAF_COUNT < capacity) {
         return 0;
     }
     return -ENOSPC;
@@ -2568,7 +2639,9 @@ auto dir2_block_to_leaf(XfsInode* dp, XfsTransaction* tp) -> int {
         return -EINVAL;
     }
 
-    size_t const LEAF_CAPACITY = (BLKSIZE - sizeof(XfsDir3LeafHdr)) / sizeof(XfsDir2LeafEntry);
+    constexpr size_t INITIAL_BESTCOUNT = 2;
+    size_t const LEAF_CAPACITY =
+        (BLKSIZE - sizeof(XfsDir3LeafHdr) - sizeof(XfsDir2LeafTail) - (INITIAL_BESTCOUNT * sizeof(Be16))) / sizeof(XfsDir2LeafEntry);
     if (LEAF_COUNT > LEAF_CAPACITY || LEAF_CAPACITY > UINT16_MAX) {
         brelse(block_bh);
         return -ENOSPC;
@@ -2604,6 +2677,7 @@ auto dir2_block_to_leaf(XfsInode* dp, XfsTransaction* tp) -> int {
     __builtin_memset(new_data, 0, BLKSIZE);
     dir2_init_data_header(dp, new_data_disk, XFS_DIR3_DATA_MAGIC, new_data);
     dir2_make_data_free(ctx, new_data, DATA_START, BLKSIZE, DATA_START, BLKSIZE - DATA_START);
+    uint16_t const NEW_DATA_BEST = reinterpret_cast<XfsDir3DataHdr*>(new_data)->best_free.at(0).length.to_cpu();
     dir2_recompute_data_crc(new_data, BLKSIZE);
     xfs_trans_log_buf_full(tp, new_data_bh);
     brelse(new_data_bh);
@@ -2624,20 +2698,26 @@ auto dir2_block_to_leaf(XfsInode* dp, XfsTransaction* tp) -> int {
         return -EIO;
     }
 
+    data_hdr->hdr.magic = Be32::from_cpu(XFS_DIR3_DATA_MAGIC);
+    dir2_make_data_free(ctx, block, DATA_START, BLKSIZE, OLD_LEAF_START, BLKSIZE - OLD_LEAF_START);
+    uint16_t const OLD_DATA_BEST = data_hdr->best_free.at(0).length.to_cpu();
+    dir2_recompute_data_crc(block, BLKSIZE);
+    xfs_trans_log_buf_full(tp, block_bh);
+    brelse(block_bh);
+
     uint8_t* leaf_block = leaf_bh->data;
     __builtin_memset(leaf_block, 0, BLKSIZE);
     auto* leaf_hdr = reinterpret_cast<XfsDir3LeafHdr*>(leaf_block);
     dir2_init_leaf_header(dp, leaf_disk, leaf_hdr, LEAF_COUNT, STALE_COUNT);
     __builtin_memcpy(dir2_leaf_entries(leaf_hdr), leaf_copy, LEAF_BYTES);
+    auto* leaf_tail = reinterpret_cast<XfsDir2LeafTail*>(leaf_block + BLKSIZE - sizeof(XfsDir2LeafTail));
+    leaf_tail->bestcount = Be32::from_cpu(INITIAL_BESTCOUNT);
+    auto* bests = dir2_leaf_bests(ctx, leaf_hdr);
+    bests[0] = Be16::from_cpu(OLD_DATA_BEST);
+    bests[1] = Be16::from_cpu(NEW_DATA_BEST);
     dir2_recompute_leaf_crc(leaf_block, BLKSIZE);
     xfs_trans_log_buf_full(tp, leaf_bh);
     brelse(leaf_bh);
-
-    data_hdr->hdr.magic = Be32::from_cpu(XFS_DIR3_DATA_MAGIC);
-    dir2_make_data_free(ctx, block, DATA_START, BLKSIZE, OLD_LEAF_START, BLKSIZE - OLD_LEAF_START);
-    dir2_recompute_data_crc(block, BLKSIZE);
-    xfs_trans_log_buf_full(tp, block_bh);
-    brelse(block_bh);
 
     dp->size = 2ULL * static_cast<uint64_t>(ctx->dir_blk_size);
     dp->dirty = true;
@@ -2924,11 +3004,8 @@ auto dir2_leaf_node_addname(XfsInode* dp, const char* name, uint16_t namelen, xf
     auto* leaf_hdr = reinterpret_cast<XfsDir3LeafHdr*>(leaf_bh->data);
     int stale_idx = -1;
     int insert_pos = 0;
-    bool update_leaf = true;
     rc = dir2_leaf_preflight_index_slot(ctx, leaf_hdr);
-    if (rc == -ENOSPC) {
-        update_leaf = false;
-    } else if (rc != 0) {
+    if (rc != 0) {
         brelse(leaf_bh);
         return rc;
     }
@@ -2939,24 +3016,40 @@ auto dir2_leaf_node_addname(XfsInode* dp, const char* name, uint16_t namelen, xf
     size_t free_len = 0;
     rc = dir2_leaf_node_find_free_region(dp, NEED_LEN, &data_bh, &db, &free_off, &free_len);
     if (rc == -ENOSPC) {
+        size_t bestcount = 0;
+        size_t capacity = 0;
+        if (!dir2_leaf_layout(ctx, leaf_hdr, SIZE_MAX, &bestcount, &capacity)) {
+            brelse(leaf_bh);
+            return -EINVAL;
+        }
+        rc = dir2_leaf_preflight_index_slot(ctx, leaf_hdr, bestcount + 1);
+        if (rc != 0) {
+            brelse(leaf_bh);
+            return rc;
+        }
         rc = dir2_leaf_alloc_data_block(dp, tp, &data_bh, &db, &free_off, &free_len);
+        if (rc == 0) {
+            auto const* new_data_hdr = reinterpret_cast<const XfsDir3DataHdr*>(data_bh->data);
+            rc = dir2_leaf_extend_bests(ctx, leaf_hdr, new_data_hdr->best_free.at(0).length.to_cpu());
+        }
     }
     if (rc != 0) {
+        if (data_bh != nullptr) {
+            brelse(data_bh);
+        }
         brelse(leaf_bh);
         return rc;
     }
 
     xfs_dir2_dataptr_t const DATAPTR = dir2_db_off_to_dataptr(ctx, db, free_off);
-    if (update_leaf) {
-        rc = dir2_leaf_ensure_stale_slot(ctx, leaf_hdr);
-        if (rc == 0) {
-            rc = dir2_leaf_prepare_stale_insert(leaf_hdr, HASH, &stale_idx, &insert_pos);
-        }
-        if (rc != 0) {
-            brelse(data_bh);
-            brelse(leaf_bh);
-            return rc;
-        }
+    rc = dir2_leaf_ensure_stale_slot(ctx, leaf_hdr);
+    if (rc == 0) {
+        rc = dir2_leaf_prepare_stale_insert(leaf_hdr, HASH, &stale_idx, &insert_pos);
+    }
+    if (rc != 0) {
+        brelse(data_bh);
+        brelse(leaf_bh);
+        return rc;
     }
 
     uint8_t* data_block = data_bh->data;
@@ -2966,11 +3059,16 @@ auto dir2_leaf_node_addname(XfsInode* dp, const char* name, uint16_t namelen, xf
     dir2_recompute_data_crc(data_block, ctx->dir_blk_size);
     xfs_trans_log_buf_full(tp, data_bh);
 
-    if (update_leaf) {
-        dir2_leaf_reuse_stale_entry(leaf_hdr, HASH, DATAPTR, stale_idx, insert_pos);
-        dir2_recompute_leaf_crc(leaf_bh->data, ctx->dir_blk_size);
-        xfs_trans_log_buf_full(tp, leaf_bh);
+    auto const* updated_data_hdr = reinterpret_cast<const XfsDir3DataHdr*>(data_block);
+    rc = dir2_leaf_set_best(ctx, leaf_hdr, db, updated_data_hdr->best_free.at(0).length.to_cpu());
+    if (rc != 0) {
+        brelse(data_bh);
+        brelse(leaf_bh);
+        return rc;
     }
+    dir2_leaf_reuse_stale_entry(leaf_hdr, HASH, DATAPTR, stale_idx, insert_pos);
+    dir2_recompute_leaf_crc(leaf_bh->data, ctx->dir_blk_size);
+    xfs_trans_log_buf_full(tp, leaf_bh);
 
     brelse(data_bh);
     brelse(leaf_bh);
@@ -3325,14 +3423,15 @@ auto dir2_leaf_node_removename(XfsInode* dp, const char* name, uint16_t namelen,
     auto* leaf_hdr = reinterpret_cast<XfsDir3LeafHdr*>(leaf_bh->data);
     int leaf_idx = -1;
     rc = dir2_leaf_find_dataptr(leaf_hdr, HASH, DATAPTR, &leaf_idx);
-    if (rc == 0) {
-        auto* lep = dir2_leaf_entries(leaf_hdr);
-        lep[leaf_idx].address = Be32::from_cpu(XFS_DIR2_NULL_DATAPTR);
-        uint16_t const STALE_COUNT = leaf_hdr->stale.to_cpu();
-        leaf_hdr->stale = Be16::from_cpu(static_cast<uint16_t>(STALE_COUNT + 1));
-        dir2_recompute_leaf_crc(leaf_bh->data, ctx->dir_blk_size);
-        xfs_trans_log_buf_full(tp, leaf_bh);
+    if (rc != 0) {
+        brelse(leaf_bh);
+        brelse(data_bh);
+        return rc;
     }
+    auto* lep = dir2_leaf_entries(leaf_hdr);
+    lep[leaf_idx].address = Be32::from_cpu(XFS_DIR2_NULL_DATAPTR);
+    uint16_t const STALE_COUNT = leaf_hdr->stale.to_cpu();
+    leaf_hdr->stale = Be16::from_cpu(static_cast<uint16_t>(STALE_COUNT + 1));
 
     uint8_t* data_block = data_bh->data;
     size_t const DATA_START = sizeof(XfsDir3DataHdr);
@@ -3340,6 +3439,16 @@ auto dir2_leaf_node_removename(XfsInode* dp, const char* name, uint16_t namelen,
     dir2_make_data_free(ctx, data_block, DATA_START, DATA_END, entry_off, entry_size);
     dir2_recompute_data_crc(data_block, ctx->dir_blk_size);
     xfs_trans_log_buf_full(tp, data_bh);
+
+    const auto* updated_data_hdr = reinterpret_cast<const XfsDir3DataHdr*>(data_block);
+    int const BEST_RC = dir2_leaf_set_best(ctx, leaf_hdr, db, updated_data_hdr->best_free.at(0).length.to_cpu());
+    if (BEST_RC != 0) {
+        brelse(leaf_bh);
+        brelse(data_bh);
+        return BEST_RC;
+    }
+    dir2_recompute_leaf_crc(leaf_bh->data, ctx->dir_blk_size);
+    xfs_trans_log_buf_full(tp, leaf_bh);
 
     brelse(leaf_bh);
     brelse(data_bh);
