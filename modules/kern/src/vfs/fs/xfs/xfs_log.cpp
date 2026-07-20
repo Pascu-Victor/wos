@@ -701,6 +701,11 @@ auto xfs_log_batch_flush_locked(XfsMountContext* mount) -> int {
     }
 
     int const RC = xfs_log_write_record_locked(mount, active_batch->items.data(), static_cast<int>(active_batch->item_count));
+    if (RC != 0) {
+        // Keep the batch and its journal holds intact.  Metadata must not
+        // become writeback-eligible until a WAL retry succeeds.
+        return RC;
+    }
     for (size_t i = 0; i < active_batch->item_count; ++i) {
         XfsTransItem& item = active_batch->items.at(i);
         if (item.type != XfsLogItemType::BUFFER || item.buf.bp == nullptr) {
@@ -778,7 +783,7 @@ auto xfs_log_write(XfsMountContext* mount, const XfsTransItem* items, int item_c
     XfsLogWriteGuard guard;
     if (mount == nullptr || active_log == nullptr || active_log->mount != mount || !active_log->active || active_batch == nullptr ||
         active_batch->mount != mount) {
-        return -EINVAL;
+        return -ENODEV;
     }
 
     int result = 0;
@@ -787,6 +792,9 @@ auto xfs_log_write(XfsMountContext* mount, const XfsTransItem* items, int item_c
                                           active_batch->body_bytes + transaction_body_bytes > XFS_LOG_BATCH_MAX_BODY_BYTES);
     if (FLUSH_BEFORE_ADD) {
         result = xfs_log_batch_flush_locked(mount);
+        if (result != 0) {
+            return result;
+        }
     }
 
     if (dirty_items > active_batch->items.size()) {
@@ -802,8 +810,10 @@ auto xfs_log_write(XfsMountContext* mount, const XfsTransItem* items, int item_c
 
     if (active_batch->transactions >= XFS_LOG_BATCH_MAX_TRANSACTIONS || active_batch->body_bytes >= XFS_LOG_BATCH_MAX_BODY_BYTES) {
         int const FLUSH_RC = xfs_log_batch_flush_locked(mount);
-        if (result == 0) {
-            result = FLUSH_RC;
+        if (FLUSH_RC != 0) {
+            // The transaction has already been accepted into the retained
+            // batch.  Its metadata remains journal-held for a later retry.
+            mod::dbg::log("[xfs log] deferred batch flush failed: %d", FLUSH_RC);
         }
     }
     return result;

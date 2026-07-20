@@ -121,6 +121,10 @@ auto agfl_refill(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t agno
         return -EINVAL;
     }
     XfsPerAG* pag = &mount->per_ag[agno];
+    int const CAPTURE_RC = xfs_trans_capture_perag(tp, agno);
+    if (CAPTURE_RC != 0) {
+        return CAPTURE_RC;
+    }
 
     while (pag->agf_flcount < XFS_AGFL_MIN && pag->agf_freeblks > 0) {
         // Find and delete the smallest available extent (size >= 1)
@@ -128,8 +132,9 @@ auto agfl_refill(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t agno
         cur.mount = mount;
         cur.agno = agno;
         XfsCntbtTraits::IRec const TARGET{.blockcount = 1, .startblock = 0};
-        if (xfs_btree_lookup(&cur, pag->agf_cnt_root, pag->agf_cnt_level, TARGET, XfsBtreeLookup::GE) != 0) {
-            return 0;
+        int rc = xfs_btree_lookup(&cur, pag->agf_cnt_root, pag->agf_cnt_level, TARGET, XfsBtreeLookup::GE);
+        if (rc != 0) {
+            return rc == -ENOENT ? 0 : rc;
         }
         XfsCntbtTraits::IRec const FOUND = xfs_btree_get_rec(&cur);
         if (FOUND.blockcount == 0) {
@@ -141,7 +146,7 @@ auto agfl_refill(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t agno
         bno_cur.mount = mount;
         bno_cur.agno = agno;
         XfsBnobtTraits::IRec const BNO_TARGET{.startblock = FOUND.startblock, .blockcount = FOUND.blockcount};
-        int rc = xfs_btree_lookup(&bno_cur, pag->agf_bno_root, pag->agf_bno_level, BNO_TARGET, XfsBtreeLookup::EQ);
+        rc = xfs_btree_lookup(&bno_cur, pag->agf_bno_root, pag->agf_bno_level, BNO_TARGET, XfsBtreeLookup::EQ);
         if (rc != 0) {
             return rc;
         }
@@ -231,6 +236,10 @@ auto alloc_ag_by_hint(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t
     if (pag->agf_freeblks < req.minlen) {
         return -ENOSPC;
     }
+    int const CAPTURE_RC = xfs_trans_capture_perag(tp, agno);
+    if (CAPTURE_RC != 0) {
+        return CAPTURE_RC;
+    }
     if (pag->agf_flcount < XFS_AGFL_MIN) {
         int const REFILL_RC = agfl_refill(mount, tp, agno);
         if (REFILL_RC != 0) {
@@ -244,7 +253,7 @@ auto alloc_ag_by_hint(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t
     XfsBnobtTraits::IRec const BNO_TARGET{.startblock = req.agbno, .blockcount = 0};
     int rc = xfs_btree_lookup(&bno_cur, pag->agf_bno_root, pag->agf_bno_level, BNO_TARGET, XfsBtreeLookup::LE);
     if (rc != 0) {
-        return -ENOSPC;
+        return rc == -ENOENT ? -ENOSPC : rc;
     }
 
     XfsBnobtTraits::IRec const FOUND = xfs_btree_get_rec(&bno_cur);
@@ -349,6 +358,10 @@ auto alloc_ag_by_size(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t
     if (pag->agf_freeblks < req.minlen) {
         return -ENOSPC;
     }
+    int const CAPTURE_RC = xfs_trans_capture_perag(tp, agno);
+    if (CAPTURE_RC != 0) {
+        return CAPTURE_RC;
+    }
 
     // Ensure the AGFL has enough blocks to cover any btree splits that may
     // occur during this allocation, without re-entering xfs_alloc_extent.
@@ -370,7 +383,7 @@ auto alloc_ag_by_size(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t
 
     int rc = xfs_btree_lookup(&cur, pag->agf_cnt_root, pag->agf_cnt_level, target, XfsBtreeLookup::GE);
     if (rc != 0) {
-        return -ENOSPC;
+        return rc == -ENOENT ? -ENOSPC : rc;
     }
 
     XfsCntbtTraits::IRec found{};
@@ -409,6 +422,9 @@ auto alloc_ag_by_size(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t
 
         rc = xfs_btree_increment(&cur);
         if (rc != 0) {
+            if (rc != -ENOENT) {
+                return rc;
+            }
             break;
         }
     }
@@ -540,6 +556,12 @@ auto log_agf_free_space_roots(XfsMountContext* mount, XfsTransaction* tp, xfs_ag
         return -EIO;
     }
 
+    int const CAPTURE_RC = xfs_trans_capture_buf(tp, agf_bh);
+    if (CAPTURE_RC != 0) {
+        brelse(agf_bh);
+        return CAPTURE_RC;
+    }
+
     auto* agf = reinterpret_cast<XfsAgf*>(agf_bh->data + agf_offset);
     agf->agf_freeblks = Be32::from_cpu(pag->agf_freeblks);
     agf->agf_bno_root = Be32::from_cpu(pag->agf_bno_root);
@@ -609,10 +631,16 @@ auto xfs_alloc_extent(XfsMountContext* mount, XfsTransaction* tp, const XfsAlloc
             if (HINT_RC == 0) {
                 return 0;
             }
+            if (HINT_RC != -ENOSPC) {
+                return HINT_RC;
+            }
         }
         int const RC = alloc_ag_by_size(mount, tp, req.agno, req, result);
         if (RC == 0) {
             return 0;
+        }
+        if (RC != -ENOSPC) {
+            return RC;
         }
     }
 
@@ -624,6 +652,9 @@ auto xfs_alloc_extent(XfsMountContext* mount, XfsTransaction* tp, const XfsAlloc
         int const RC = alloc_ag_by_size(mount, tp, ag, req, result);
         if (RC == 0) {
             return 0;
+        }
+        if (RC != -ENOSPC) {
+            return RC;
         }
     }
 
@@ -706,6 +737,11 @@ auto xfs_free_extent(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t 
     int const VALID_RC = xfs_validate_allocated_extent(mount, agno, agbno, len);
     if (VALID_RC != 0) {
         return VALID_RC;
+    }
+
+    int const CAPTURE_RC = xfs_trans_capture_perag(tp, agno);
+    if (CAPTURE_RC != 0) {
+        return CAPTURE_RC;
     }
 
     if (pag->agf_flcount < XFS_AGFL_MIN) {
@@ -844,6 +880,11 @@ auto log_agf_freelist(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t
         return -EIO;
     }
 
+    int const CAPTURE_RC = xfs_trans_capture_buf(tp, ag0_bh);
+    if (CAPTURE_RC != 0) {
+        return CAPTURE_RC;
+    }
+
     XfsPerAG const* pag = &mount->per_ag[agno];
     auto* agf = reinterpret_cast<XfsAgf*>(ag0_bh->data + agf_off);
     agf->agf_flfirst = Be32::from_cpu(pag->agf_flfirst);
@@ -895,6 +936,12 @@ auto xfs_alloc_get_freelist(XfsMountContext* mount, XfsTransaction* tp, xfs_agnu
 
     auto* agfl_bno = reinterpret_cast<Be32*>(reinterpret_cast<uint8_t*>(agfl) + sizeof(XfsAgfl));
     uint32_t const AGFL_SZ = xfs_agfl_size(mount);
+
+    int const CAPTURE_RC = xfs_trans_capture_perag(tp, agno);
+    if (CAPTURE_RC != 0) {
+        brelse(bh);
+        return CAPTURE_RC;
+    }
 
     // Drain any corrupted NULLAGBLOCK slots from the head of the freelist.
     // This matches Linux's xfs_verify_agbno check in xfs_alloc_get_freelist().
@@ -972,6 +1019,15 @@ auto xfs_alloc_put_freelist(XfsMountContext* mount, XfsTransaction* tp, xfs_agnu
     }
 
     auto* agfl_bno = reinterpret_cast<Be32*>(reinterpret_cast<uint8_t*>(agfl) + sizeof(XfsAgfl));
+
+    int capture_rc = xfs_trans_capture_perag(tp, agno);
+    if (capture_rc == 0) {
+        capture_rc = xfs_trans_capture_buf(tp, bh);
+    }
+    if (capture_rc != 0) {
+        brelse(bh);
+        return capture_rc;
+    }
 
     // Advance tail and write the block number.
     if (pag->agf_flcount == 0) {

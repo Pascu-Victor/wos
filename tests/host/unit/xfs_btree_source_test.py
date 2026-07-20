@@ -8,6 +8,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 BTREE = ROOT / "modules/kern/src/vfs/fs/xfs/xfs_btree.cpp"
+ALLOC = ROOT / "modules/kern/src/vfs/fs/xfs/xfs_alloc.cpp"
 
 
 def fail(message: str) -> None:
@@ -28,6 +29,7 @@ def require_order(source: str, first: str, second: str, description: str) -> Non
 
 def main() -> None:
     source = BTREE.read_text()
+    alloc_source = ALLOC.read_text()
 
     split_start = source.find("auto btree_split_internal(")
     parent_start = source.find("\n// Insert a new key/pointer pair", split_start)
@@ -120,6 +122,37 @@ def main() -> None:
         source,
         "if (preserve_only_leaf) {\n            // Every internal level has exactly one child",
         "empty sole leaf retention before parent removal",
+    )
+
+    alloc_extent_start = alloc_source.find("auto xfs_alloc_extent(")
+    alloc_extent = alloc_source[alloc_extent_start:]
+    if alloc_extent_start < 0:
+        fail("could not isolate xfs_alloc_extent")
+    require(
+        alloc_extent,
+        "if (HINT_RC != -ENOSPC) {\n                return HINT_RC;\n            }",
+        "hinted allocation propagates non-space failures",
+    )
+    require(
+        alloc_extent,
+        "if (RC != -ENOSPC) {\n            return RC;\n        }",
+        "preferred and fallback allocation propagate non-space failures",
+    )
+
+    by_size_start = alloc_source.find("auto alloc_ag_by_size(")
+    by_size_end = alloc_source.find("\nauto log_agf_free_space_roots(", by_size_start)
+    if by_size_start < 0 or by_size_end < 0 or by_size_start >= by_size_end:
+        fail("could not isolate alloc_ag_by_size")
+    by_size = alloc_source[by_size_start:by_size_end]
+    require(
+        by_size,
+        "return rc == -ENOENT ? -ENOSPC : rc;",
+        "empty cntbt lookup distinguishes no space from metadata failure",
+    )
+    require(
+        by_size,
+        "if (rc != -ENOENT) {\n                return rc;\n            }",
+        "cntbt traversal propagates metadata failures",
     )
 
 

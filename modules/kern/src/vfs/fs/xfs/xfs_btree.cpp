@@ -504,6 +504,10 @@ auto btree_propagate_first_key(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp, 
     }
 
     for (int lev = child_level + 1; lev < cur->nlevels; lev++) {
+        int const CAPTURE_RC = xfs_trans_capture_buf(tp, cur->level_at(lev).bp);
+        if (CAPTURE_RC != 0) {
+            return CAPTURE_RC;
+        }
         int const PARENT_PTR = cur->level_at(lev).ptr;
         typename Traits::Key* pkey = nullptr;
         int const KEY_RC = checked_key_at_mut(cur, lev, PARENT_PTR, &pkey);
@@ -567,6 +571,11 @@ auto xfs_btree_update(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp, const typ
         return -EINVAL;
     }
 
+    int capture_rc = xfs_trans_capture_buf(tp, cur->level_at(0).bp);
+    if (capture_rc != 0) {
+        return capture_rc;
+    }
+
     // Encode the in-memory record to on-disk format
     auto* rec = cur->rec_at_mut(PTR);
     typename Traits::Rec new_rec{};
@@ -578,6 +587,10 @@ auto xfs_btree_update(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp, const typ
         typename Traits::Key key;
         Traits::init_key_from_rec(&key, rec);
         for (int lev = 1; lev < cur->nlevels; lev++) {
+            capture_rc = xfs_trans_capture_buf(tp, cur->level_at(lev).bp);
+            if (capture_rc != 0) {
+                return capture_rc;
+            }
             int const PARENT_PTR = cur->level_at(lev).ptr;
             typename Traits::Key* pkey = nullptr;
             int const KEY_RC = checked_key_at_mut(cur, lev, PARENT_PTR, &pkey);
@@ -797,6 +810,10 @@ auto btree_split_internal(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp, int l
     if (left_bp == nullptr) {
         return -EIO;
     }
+    int capture_rc = xfs_trans_capture_buf(tp, left_bp);
+    if (capture_rc != 0) {
+        return capture_rc;
+    }
     int const NR = cur->numrecs(lev);  // should == max_keys (full)
     int const MID = NR / 2;            // left keeps [1..mid], right gets [mid+1..nr]
 
@@ -851,6 +868,12 @@ auto btree_split_internal(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp, int l
                                      : OLD_RIGHT_SIB;
         BufHead* old_right_bh = xfs_buf_read(cur->mount, ABS_OLD);
         if (old_right_bh != nullptr) {
+            capture_rc = xfs_trans_capture_buf(tp, old_right_bh);
+            if (capture_rc != 0) {
+                brelse(old_right_bh);
+                brelse(right_bp);
+                return capture_rc;
+            }
             btree_set_leftsib<Traits>(old_right_bh, RIGHT_BLOCKNO);
             btree_update_crc<Traits>(old_right_bh);
             xfs_trans_log_buf_full(tp, old_right_bh);
@@ -992,6 +1015,10 @@ auto btree_insert_into_parent(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp, i
     if (parent_bp == nullptr) {
         return -EIO;
     }
+    int const CAPTURE_RC = xfs_trans_capture_buf(tp, parent_bp);
+    if (CAPTURE_RC != 0) {
+        return CAPTURE_RC;
+    }
     int const PARENT_NR = cur->numrecs(lev);
     int const MAX_KEYS = btree_max_keys_node<Traits>(cur->mount->block_size);
 
@@ -1059,6 +1086,10 @@ auto btree_remove_from_parent(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp, i
     if (parent_bp == nullptr) {
         return -EIO;
     }
+    int capture_rc = xfs_trans_capture_buf(tp, parent_bp);
+    if (capture_rc != 0) {
+        return capture_rc;
+    }
 
     int const REMOVE_POS = cur->level_at(lev).ptr;
     int const PARENT_NR = cur->numrecs(lev);
@@ -1103,6 +1134,10 @@ auto btree_remove_from_parent(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp, i
         typename Traits::Key new_first_key;
         __builtin_memcpy(&new_first_key, p_data + Traits::HDR_LEN, Traits::KEY_LEN);
         for (int glev = lev + 1; glev < cur->nlevels; glev++) {
+            capture_rc = xfs_trans_capture_buf(tp, cur->level_at(glev).bp);
+            if (capture_rc != 0) {
+                return capture_rc;
+            }
             int const GPTR = cur->level_at(glev).ptr;
             typename Traits::Key* gkey = nullptr;
             int const KEY_RC = checked_key_at_mut(cur, glev, GPTR, &gkey);
@@ -1165,6 +1200,11 @@ auto xfs_btree_insert(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp, const typ
     int const NR = cur->numrecs(0);
     int const MAX_RECS = btree_max_recs_leaf<Traits>(cur->mount->block_size);
 
+    int capture_rc = xfs_trans_capture_buf(tp, cur->level_at(0).bp);
+    if (capture_rc != 0) {
+        return capture_rc;
+    }
+
     // Reserve the entire split chain before changing the leaf. Running out of
     // AGFL blocks after a leaf split would leave partial topology behind, and
     // transaction cancellation cannot currently restore buffer contents.
@@ -1209,6 +1249,10 @@ auto xfs_btree_insert(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp, const typ
             Key key;
             Traits::init_key_from_rec(&key, reinterpret_cast<const Rec*>(base));
             for (int lev = 1; lev < cur->nlevels; lev++) {
+                capture_rc = xfs_trans_capture_buf(tp, cur->level_at(lev).bp);
+                if (capture_rc != 0) {
+                    return capture_rc;
+                }
                 int const PP = cur->level_at(lev).ptr;
                 typename Traits::Key* pkey = nullptr;
                 int const KEY_RC = checked_key_at_mut(cur, lev, PP, &pkey);
@@ -1270,6 +1314,12 @@ auto xfs_btree_insert(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp, const typ
                                      : OLD_RIGHT_SIB;
         BufHead* old_right_bh = xfs_buf_read(cur->mount, ABS_OLD);
         if (old_right_bh != nullptr) {
+            capture_rc = xfs_trans_capture_buf(tp, old_right_bh);
+            if (capture_rc != 0) {
+                brelse(old_right_bh);
+                brelse(right_bp);
+                return capture_rc;
+            }
             btree_set_leftsib<Traits>(old_right_bh, RIGHT_BLOCKNO);
             btree_update_crc<Traits>(old_right_bh);
             xfs_trans_log_buf_full(tp, old_right_bh);
@@ -1344,6 +1394,11 @@ auto xfs_btree_delete(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp) -> int {
         return -EINVAL;
     }
 
+    int capture_rc = xfs_trans_capture_buf(tp, cur->level_at(0).bp);
+    if (capture_rc != 0) {
+        return capture_rc;
+    }
+
     // A multi-level tree can shrink to one record without collapsing its
     // root.  Keep that final leaf linked when deleting the record so a
     // replacement insert still has a valid path from the fixed AGF root.
@@ -1370,6 +1425,10 @@ auto xfs_btree_delete(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp) -> int {
         Key key;
         Traits::init_key_from_rec(&key, reinterpret_cast<const Rec*>(base));
         for (int lev = 1; lev < cur->nlevels; lev++) {
+            capture_rc = xfs_trans_capture_buf(tp, cur->level_at(lev).bp);
+            if (capture_rc != 0) {
+                return capture_rc;
+            }
             int const PP = cur->level_at(lev).ptr;
             typename Traits::Key* pkey = nullptr;
             int const KEY_RC = checked_key_at_mut(cur, lev, PP, &pkey);
@@ -1418,6 +1477,11 @@ auto xfs_btree_delete(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp) -> int {
                                           : LEFT_SIB;
             BufHead* lbh = xfs_buf_read(cur->mount, ABS_LEFT);
             if (lbh != nullptr) {
+                capture_rc = xfs_trans_capture_buf(tp, lbh);
+                if (capture_rc != 0) {
+                    brelse(lbh);
+                    return capture_rc;
+                }
                 btree_set_rightsib<Traits>(lbh, RIGHT_SIB);
                 btree_update_crc<Traits>(lbh);
                 xfs_trans_log_buf_full(tp, lbh);
@@ -1431,6 +1495,11 @@ auto xfs_btree_delete(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp) -> int {
                                            : RIGHT_SIB;
             BufHead* rbh = xfs_buf_read(cur->mount, ABS_RIGHT);
             if (rbh != nullptr) {
+                capture_rc = xfs_trans_capture_buf(tp, rbh);
+                if (capture_rc != 0) {
+                    brelse(rbh);
+                    return capture_rc;
+                }
                 btree_set_leftsib<Traits>(rbh, LEFT_SIB);
                 btree_update_crc<Traits>(rbh);
                 xfs_trans_log_buf_full(tp, rbh);

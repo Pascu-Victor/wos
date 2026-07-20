@@ -216,6 +216,12 @@ KTEST(XFS, BlockLookupUsesLeafIndexForMisses) { KEXPECT_TRUE(ker::vfs::xfs::xfs_
 
 KTEST(XFS, LeafIndexCompleteMarker) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_leaf_index_complete_marker()); }
 
+KTEST(XFS, NodeDirectoryGrowthLayout) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_node_directory_growth_layout()); }
+
+KTEST(XFS, NodeDirectoryStaleCompaction) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_node_directory_stale_compaction()); }
+
+KTEST(XFS, NodeDirectoryFreeLayout) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_node_directory_free_layout()); }
+
 KTEST(XFS, NewDirectoryNameFilterProvesOnlySafeMisses) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_directory_name_filter()); }
 
 KTEST(XFS, DentryCacheInvalidationKeepsUnrelatedDirectoryHot) {

@@ -1320,7 +1320,11 @@ auto xfs_bmap_add_extent(XfsInode* ip, XfsTransaction* tp, const XfsBmbtIrec& ne
                       static_cast<unsigned long>(ip->ino));
         return -EOPNOTSUPP;
     }
-    int rc = ensure_inode_logged(tp, ip);
+    int rc = xfs_trans_capture_inode(tp, ip);
+    if (rc != 0) {
+        return rc;
+    }
+    rc = ensure_inode_logged(tp, ip);
     if (rc != 0) {
         return rc;
     }

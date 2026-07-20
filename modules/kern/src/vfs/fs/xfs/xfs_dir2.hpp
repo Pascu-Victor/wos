@@ -111,6 +111,9 @@ struct XfsDentryCacheStats {
 
 void xfs_dentry_cache_stats(XfsDentryCacheStats& out);
 void xfs_dentry_cache_purge_mount(XfsMountContext* mount);
+// Invalidate entries published by a directory mutation whose transaction was
+// subsequently cancelled.
+void xfs_dentry_cache_invalidate_dir(XfsInode* dp);
 
 #ifdef WOS_SELFTEST
 auto xfs_selftest_dentry_cache_shortform() -> bool;
@@ -123,6 +126,9 @@ auto xfs_selftest_dentry_cache_remove_keeps_sibling_hot() -> bool;
 auto xfs_selftest_shortform_readdir_cookies_are_monotonic() -> bool;
 auto xfs_selftest_shortform_offsets_match_data_layout() -> bool;
 auto xfs_selftest_shortform_readdir_resume_after_removals() -> bool;
+auto xfs_selftest_node_directory_growth_layout() -> bool;
+auto xfs_selftest_node_directory_stale_compaction() -> bool;
+auto xfs_selftest_node_directory_free_layout() -> bool;
 #endif
 
 // ============================================================================

@@ -72,12 +72,22 @@ auto inobt_free_mask_for_bit(uint32_t bit) -> uint64_t {
     return static_cast<uint64_t>(1) << bit;
 }
 
-void log_agi_state(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t agno, xfs_agino_t newino, bool update_newino) {
+auto log_agi_state(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t agno, xfs_agino_t newino, bool update_newino) -> int {
+    if (mount == nullptr || tp == nullptr || mount->per_ag == nullptr || agno >= mount->ag_count) {
+        return -EINVAL;
+    }
+
     XfsPerAG const* pag = &mount->per_ag[agno];
     uint64_t const AG_START_BLOCK = xfs_agbno_to_fsbno(agno, 0, mount->ag_blk_log);
     BufHead* agi_bh = xfs_buf_read(mount, AG_START_BLOCK);
     if (agi_bh == nullptr) {
-        return;
+        return -EIO;
+    }
+
+    int const CAPTURE_RC = xfs_trans_capture_buf(tp, agi_bh);
+    if (CAPTURE_RC != 0) {
+        brelse(agi_bh);
+        return CAPTURE_RC;
     }
 
     auto agi_offset = static_cast<size_t>(mount->sect_size * 2);
@@ -96,6 +106,7 @@ void log_agi_state(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t ag
     __builtin_memcpy(&agi->agi_crc, &crc, sizeof(crc));
     xfs_trans_log_buf(tp, agi_bh, static_cast<uint32_t>(agi_offset), static_cast<uint32_t>(sizeof(XfsAgi)));
     brelse(agi_bh);
+    return 0;
 }
 
 void init_free_dinode(XfsMountContext* mount, XfsDinode* dip, xfs_ino_t ino) {
@@ -147,6 +158,9 @@ auto init_inode_chunk(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t
 }
 
 auto allocate_inode_chunk(XfsMountContext* mount, XfsTransaction* tp) -> xfs_ino_t {
+    if (mount == nullptr || tp == nullptr) {
+        return NULLFSINO;
+    }
     xfs_extlen_t const CHUNK_BLOCKS = inode_chunk_blocks(mount);
     if (CHUNK_BLOCKS == 0) {
         return NULLFSINO;
@@ -177,6 +191,11 @@ auto allocate_inode_chunk(XfsMountContext* mount, XfsTransaction* tp) -> xfs_ino
     }
 
     XfsPerAG* pag = &mount->per_ag[result.agno];
+    rc = xfs_trans_capture_perag(tp, result.agno);
+    if (rc != 0) {
+        return NULLFSINO;
+    }
+
     XfsInobtTraits::IRec rec{};
     rec.startino = STARTINO;
     rec.holemask = XFS_INOBT_HOLEMASK_FULL;
@@ -192,6 +211,7 @@ auto allocate_inode_chunk(XfsMountContext* mount, XfsTransaction* tp) -> xfs_ino
     auto new_ino_level = static_cast<uint8_t>(pag->agi_level);
     rc = xfs_btree_insert(&ino_cur, tp, rec, pag->agi_root, pag->agi_level, &new_ino_root, &new_ino_level);
     if (rc != 0) {
+        tp->error = rc;
         return NULLFSINO;
     }
     pag->agi_root = static_cast<xfs_agblock_t>(new_ino_root);
@@ -205,6 +225,7 @@ auto allocate_inode_chunk(XfsMountContext* mount, XfsTransaction* tp) -> xfs_ino
         auto new_fi_level = static_cast<uint8_t>(pag->agi_free_level);
         rc = xfs_btree_insert(&fi_cur, tp, rec, pag->agi_free_root, pag->agi_free_level, &new_fi_root, &new_fi_level);
         if (rc != 0) {
+            tp->error = rc;
             return NULLFSINO;
         }
         pag->agi_free_root = static_cast<xfs_agblock_t>(new_fi_root);
@@ -213,7 +234,11 @@ auto allocate_inode_chunk(XfsMountContext* mount, XfsTransaction* tp) -> xfs_ino
 
     pag->agi_count += XFS_INODES_PER_CHUNK;
     pag->agi_freecount += XFS_INODES_PER_CHUNK;
-    log_agi_state(mount, tp, result.agno, STARTINO, true);
+    rc = log_agi_state(mount, tp, result.agno, STARTINO, true);
+    if (rc != 0) {
+        tp->error = rc;
+        return NULLFSINO;
+    }
 
     return ialloc_ag(mount, tp, result.agno);
 }
@@ -227,6 +252,9 @@ auto first_free_inode_bit(uint64_t free_mask) -> int {
 
 // Try to allocate an inode from a specific AG
 auto ialloc_ag(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t agno) -> xfs_ino_t {
+    if (mount == nullptr || tp == nullptr || mount->per_ag == nullptr || agno >= mount->ag_count) {
+        return NULLFSINO;
+    }
     XfsPerAG* pag = &mount->per_ag[agno];
 
     if (pag->agi_freecount == 0) {
@@ -252,6 +280,10 @@ auto ialloc_ag(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t agno) 
 
         int rc = xfs_btree_lookup(&cur, pag->agi_root, pag->agi_level, target, XfsBtreeLookup::GE);
         if (rc != 0) {
+            if (rc != -ENOENT) {
+                tp->error = rc;
+                return NULLFSINO;
+            }
             if (SEARCH_START != 0) {
                 continue;
             }
@@ -269,6 +301,11 @@ auto ialloc_ag(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t agno) 
                     xfs_agino_t const AGINO = rec.startino + static_cast<xfs_agino_t>(BIT);
                     xfs_ino_t const INO = (static_cast<xfs_ino_t>(agno) << mount->agino_log) | AGINO;
 
+                    int const CAPTURE_RC = xfs_trans_capture_perag(tp, agno);
+                    if (CAPTURE_RC != 0) {
+                        return NULLFSINO;
+                    }
+
                     // 1. Clear the bit in ir_free and decrement ir_freecount
                     rec.free_mask &= ~inobt_free_mask_for_bit(static_cast<uint32_t>(BIT));
                     rec.freecount--;
@@ -281,6 +318,7 @@ auto ialloc_ag(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t agno) 
                     // same tree a second time.
                     int urc = xfs_btree_update(&cur, tp, rec);
                     if (urc != 0) {
+                        tp->error = urc;
                         return NULLFSINO;
                     }
 
@@ -293,20 +331,31 @@ auto ialloc_ag(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t agno) 
                         XfsFinobtTraits::IRec fi_target{};
                         fi_target.startino = rec.startino;
 
-                        urc = xfs_btree_lookup(&fi_cur, pag->agi_free_root, pag->agi_free_level, fi_target, XfsBtreeLookup::GE);
-                        if (urc == 0) {
-                            if (rec.freecount == 0) {
-                                // No more free inodes in this chunk - remove from finobt
-                                xfs_btree_delete(&fi_cur, tp);
-                            } else {
-                                xfs_btree_update(&fi_cur, tp, rec);
-                            }
+                        urc = xfs_btree_lookup(&fi_cur, pag->agi_free_root, pag->agi_free_level, fi_target, XfsBtreeLookup::EQ);
+                        if (urc != 0) {
+                            tp->error = urc;
+                            return NULLFSINO;
+                        }
+
+                        if (rec.freecount == 0) {
+                            // No more free inodes in this chunk - remove from finobt
+                            urc = xfs_btree_delete(&fi_cur, tp);
+                        } else {
+                            urc = xfs_btree_update(&fi_cur, tp, rec);
+                        }
+                        if (urc != 0) {
+                            tp->error = urc;
+                            return NULLFSINO;
                         }
                     }
 
                     // 5. Update AGI counters
                     pag->agi_freecount--;
-                    log_agi_state(mount, tp, agno, AGINO, true);
+                    urc = log_agi_state(mount, tp, agno, AGINO, true);
+                    if (urc != 0) {
+                        tp->error = urc;
+                        return NULLFSINO;
+                    }
 
                     // The create/mkdir/symlink caller logs the initialized
                     // inode in this same transaction before the inode becomes
@@ -322,6 +371,10 @@ auto ialloc_ag(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t agno) 
 
             rc = xfs_btree_increment(&cur);
             if (rc != 0) {
+                if (rc != -ENOENT) {
+                    tp->error = rc;
+                    return NULLFSINO;
+                }
                 break;
             }
         }
@@ -337,7 +390,7 @@ auto ialloc_ag(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t agno) 
 }  // anonymous namespace
 
 auto xfs_ialloc(XfsMountContext* mount, XfsTransaction* tp, [[maybe_unused]] uint16_t mode) -> xfs_ino_t {
-    if (mount == nullptr) {
+    if (mount == nullptr || tp == nullptr) {
         return NULLFSINO;
     }
 
@@ -346,6 +399,9 @@ auto xfs_ialloc(XfsMountContext* mount, XfsTransaction* tp, [[maybe_unused]] uin
         xfs_ino_t const INO = ialloc_ag(mount, tp, ag);
         if (INO != NULLFSINO) {
             return INO;
+        }
+        if (tp != nullptr && tp->error != 0) {
+            return NULLFSINO;
         }
     }
 
@@ -398,7 +454,7 @@ auto xfs_inode_allocated(XfsMountContext* mount, xfs_ino_t ino) -> int {
 }
 
 auto xfs_ifree(XfsMountContext* mount, XfsTransaction* tp, xfs_ino_t ino) -> int {
-    if (mount == nullptr || ino == NULLFSINO) {
+    if (mount == nullptr || tp == nullptr || ino == NULLFSINO) {
         return -EINVAL;
     }
 
@@ -411,6 +467,11 @@ auto xfs_ifree(XfsMountContext* mount, XfsTransaction* tp, xfs_ino_t ino) -> int
     }
 
     XfsPerAG* pag = &mount->per_ag[AGNO];
+
+    int const CAPTURE_RC = xfs_trans_capture_perag(tp, AGNO);
+    if (CAPTURE_RC != 0) {
+        return CAPTURE_RC;
+    }
 
     // Compute the chunk start inode (aligned to 64-inode boundary)
     xfs_agino_t const CHUNK_START = AGINO & ~static_cast<xfs_agino_t>(XFS_INODES_PER_CHUNK - 1);
@@ -443,13 +504,13 @@ auto xfs_ifree(XfsMountContext* mount, XfsTransaction* tp, xfs_ino_t ino) -> int
     }
 
     // 2-3. Set the free bit and increment freecount
-    bool const WAS_FULLY_ALLOCATED = (rec.freecount == 0);
     rec.free_mask |= INODE_BIT;
     rec.freecount++;
 
     // 4. Update inobt on disk
     rc = xfs_btree_update(&cur, tp, rec);
     if (rc != 0) {
+        tp->error = rc;
         return rc;
     }
 
@@ -462,20 +523,37 @@ auto xfs_ifree(XfsMountContext* mount, XfsTransaction* tp, xfs_ino_t ino) -> int
         XfsFinobtTraits::IRec fi_target{};
         fi_target.startino = CHUNK_START;
 
-        int const FRC = xfs_btree_lookup(&fi_cur, pag->agi_free_root, pag->agi_free_level, fi_target, XfsBtreeLookup::GE);
+        int const FRC = xfs_btree_lookup(&fi_cur, pag->agi_free_root, pag->agi_free_level, fi_target, XfsBtreeLookup::EQ);
 
-        if (WAS_FULLY_ALLOCATED || FRC != 0) {
+        if (FRC == -ENOENT) {
             // Chunk wasn't in finobt - insert it
-            xfs_btree_insert(&fi_cur, tp, rec, pag->agi_free_root, pag->agi_free_level, nullptr, nullptr);
-        } else {
+            uint64_t new_fi_root = pag->agi_free_root;
+            auto new_fi_level = static_cast<uint8_t>(pag->agi_free_level);
+            rc = xfs_btree_insert(&fi_cur, tp, rec, pag->agi_free_root, pag->agi_free_level, &new_fi_root, &new_fi_level);
+            if (rc == 0) {
+                pag->agi_free_root = static_cast<xfs_agblock_t>(new_fi_root);
+                pag->agi_free_level = new_fi_level;
+            }
+        } else if (FRC == 0) {
             // Update existing finobt record
-            xfs_btree_update(&fi_cur, tp, rec);
+            rc = xfs_btree_update(&fi_cur, tp, rec);
+        } else {
+            rc = FRC;
+        }
+
+        if (rc != 0) {
+            tp->error = rc;
+            return rc;
         }
     }
 
     // 6. Update AGI counters
     pag->agi_freecount++;
-    log_agi_state(mount, tp, AGNO, 0, false);
+    rc = log_agi_state(mount, tp, AGNO, 0, false);
+    if (rc != 0) {
+        tp->error = rc;
+        return rc;
+    }
 #ifdef XFS_DEBUG
     mod::dbg::logger<"xfs">::debug("xfs_ifree: freed inode %lu", static_cast<unsigned long>(ino));
 #endif

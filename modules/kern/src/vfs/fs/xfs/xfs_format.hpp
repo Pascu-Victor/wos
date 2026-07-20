@@ -494,8 +494,8 @@ constexpr uint32_t XFS_DIR3_BLOCK_MAGIC = 0x58444233;  // 'XDB3' - single-block 
 constexpr uint32_t XFS_DIR3_DATA_MAGIC = 0x58444433;   // 'XDD3' - multi-block data
 constexpr uint32_t XFS_DIR3_FREE_MAGIC = 0x58444633;   // 'XDF3' - free space index
 constexpr uint32_t XFS_DIR3_LEAF_MAGIC = 0x3DF1;       // leaf (v3) - stored as Be16 in da_blkinfo
-constexpr uint32_t XFS_DIR3_LEAFN_MAGIC = 0x3FF1;      // leaf node (v3)
-constexpr uint32_t XFS_DA3_NODE_MAGIC = 0xFEBE;        // DA btree node (v3)
+constexpr uint32_t XFS_DIR3_LEAFN_MAGIC = 0x3DFF;      // leaf node (v3)
+constexpr uint32_t XFS_DA3_NODE_MAGIC = 0x3EBE;        // DA btree node (v3)
 
 // --- Directory entry file types (v3 / ftype feature) ---
 constexpr uint8_t XFS_DIR3_FT_UNKNOWN = 0;
@@ -645,11 +645,24 @@ struct XfsDa3NodeHdr {
     Be16 level;
     Be32 pad32;
 } __attribute__((packed));
+static_assert(sizeof(XfsDa3NodeHdr) == 64);
 
 struct XfsDaNodeEntry {
     Be32 hashval;  // hash value
     Be32 before;   // btree block before this key
 } __attribute__((packed));
+static_assert(sizeof(XfsDaNodeEntry) == 8);
+
+// Node-format directory free-space index header.  The Be16 bests array starts
+// immediately after this header and contains one entry per data block.
+struct XfsDir3FreeHdr {
+    XfsDir3BlkHdr hdr;
+    Be32 firstdb;
+    Be32 nvalid;
+    Be32 nused;
+    Be32 pad;
+} __attribute__((packed));
+static_assert(sizeof(XfsDir3FreeHdr) == 64);
 
 // ============================================================================
 // Extended Attribute Format Structures

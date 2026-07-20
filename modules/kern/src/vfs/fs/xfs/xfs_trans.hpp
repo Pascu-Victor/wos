@@ -56,14 +56,65 @@ struct XfsTransItem {
     constexpr XfsTransItem() : buf{} {}
 };
 
+// Full-buffer before-image retained until the transaction commits.  Captures
+// happen before the first metadata write so cancellation can restore cache
+// contents without allocating memory or issuing I/O.
+struct XfsTransBufUndo {
+    BufHead* bp{};
+    uint8_t* before_image{};
+    size_t size{};
+    bool journal_held{};
+    XfsTransBufUndo* next{};
+};
+
+// Mutable per-AG fields.  The embedded lock is deliberately excluded.
+struct XfsTransPerAgState {
+    xfs_agblock_t agf_bno_root{};
+    xfs_agblock_t agf_cnt_root{};
+    uint32_t agf_bno_level{};
+    uint32_t agf_cnt_level{};
+    uint32_t agf_freeblks{};
+    uint32_t agf_longest{};
+    uint32_t agf_flcount{};
+    uint32_t agf_flfirst{};
+    uint32_t agf_fllast{};
+    uint32_t agi_count{};
+    xfs_agblock_t agi_root{};
+    uint32_t agi_level{};
+    uint32_t agi_freecount{};
+    xfs_agblock_t agi_free_root{};
+    uint32_t agi_free_level{};
+    xfs_agino_t ialloc_hint_startino{};
+    bool ialloc_hint_valid{};
+};
+
+struct XfsTransPerAgUndo {
+    xfs_agnumber_t agno{};
+    XfsTransPerAgState before{};
+    XfsTransPerAgUndo* next{};
+};
+
+// Deep snapshot of the mutable data-fork state used by block-map updates.
+struct XfsTransInodeUndo {
+    XfsInode* ip{};
+    XfsIfork data_fork{};
+    uint64_t size{};
+    uint64_t nblocks{};
+    uint32_t nextents{};
+    bool dirty{};
+    uint64_t dir_generation{};
+    uint64_t dir_leaf_index_complete_generation{};
+    bool dir_leaf_index_complete{};
+    std::array<uint64_t, XFS_DIR_NAME_FILTER_WORDS> dir_name_filter{};
+    bool dir_name_filter_complete{};
+    bool owns_data_fork{};
+    XfsTransInodeUndo* next{};
+};
+
 // Transaction structure
 struct XfsTransaction {
     XfsTransaction() = default;
-    ~XfsTransaction() {
-        if (items != inline_items.data()) {
-            delete[] items;
-        }
-    }
+    ~XfsTransaction();
 
     XfsTransaction(const XfsTransaction&) = delete;
     auto operator=(const XfsTransaction&) -> XfsTransaction& = delete;
@@ -76,9 +127,13 @@ struct XfsTransaction {
     XfsTransItem* items{inline_items.data()};
     int item_capacity{XFS_TRANS_INLINE_ITEMS};
     int item_count{};
+    int error{};
     bool overflowed{};
     bool committed{};
     bool cancelled{};
+    XfsTransBufUndo* buf_undo{};
+    XfsTransPerAgUndo* perag_undo{};
+    XfsTransInodeUndo* inode_undo{};
 };
 
 // ============================================================================
@@ -97,6 +152,12 @@ void xfs_trans_log_buf_full(XfsTransaction* tp, BufHead* bp);
 
 // Log a modified inode within a transaction.
 void xfs_trans_log_inode(XfsTransaction* tp, XfsInode* ip);
+
+// Capture transaction-local state before its first mutation.  These helpers
+// may allocate and therefore must be called before modifying the object.
+auto xfs_trans_capture_buf(XfsTransaction* tp, BufHead* bp) -> int;
+auto xfs_trans_capture_perag(XfsTransaction* tp, xfs_agnumber_t agno) -> int;
+auto xfs_trans_capture_inode(XfsTransaction* tp, XfsInode* ip) -> int;
 
 // Commit the transaction - write log entries and mark buffers dirty.
 // Returns 0 on success.

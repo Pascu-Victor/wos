@@ -1612,6 +1612,14 @@ auto xfs_inode_write(XfsInode* ip, XfsTransaction* tp) -> int {
         return -EIO;
     }
 
+    if (tp != nullptr) {
+        int const CAPTURE_RC = xfs_trans_capture_buf(tp, bh);
+        if (CAPTURE_RC != 0) {
+            brelse(bh);
+            return CAPTURE_RC;
+        }
+    }
+
     auto* dip = reinterpret_cast<XfsDinode*>(bh->data + OFFSET);
     __builtin_memset(dip, 0, mount->inode_size);
 
