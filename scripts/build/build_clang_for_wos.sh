@@ -176,6 +176,7 @@ WOS_LLVM_REQUIRED_TOOLS=(
     llvm-objcopy
     llvm-strip
     llvm-readelf
+    llvm-readobj
     llvm-objdump
     llvm-symbolizer
     llvm-as

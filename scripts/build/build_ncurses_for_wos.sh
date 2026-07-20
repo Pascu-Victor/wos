@@ -319,9 +319,14 @@ wos_timed_step "configure" "ncurses" \
     --with-fallbacks=xterm,xterm-256color,screen,screen-256color,tmux,tmux-256color,rxvt,rxvt-256color,linux,vt100,vt220,ansi,dumb
 
 wos_make "$WOS_MAKE_JOBS" -C "$NCURSES_WORK"
-wos_make "$WOS_MAKE_JOBS" -C "$NCURSES_WORK" \
-    DESTDIR="$TARGET_SYSROOT" \
-    install.libs install.includes install.data
+# These top-level install goals overlap in ncurses' recursive include target.
+# Running them in one parallel make can make two sub-makes create and remove
+# the same generated headers.sed temporary files.
+for install_target in install.libs install.includes install.data; do
+    wos_make "$WOS_MAKE_JOBS" -C "$NCURSES_WORK" \
+        DESTDIR="$TARGET_SYSROOT" \
+        "$install_target"
+done
 
 if [ -f "$TARGET_SYSROOT/bin/ncursesw6-config" ]; then
     ln -sfn ncursesw6-config "$TARGET_SYSROOT/bin/ncursesw-config"

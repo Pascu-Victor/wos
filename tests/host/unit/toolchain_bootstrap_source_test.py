@@ -1470,9 +1470,16 @@ def test_cpython_target_configure_preseeds_wos_runtime_probes() -> None:
     )
     require_tokens(
         (ROOT / "scripts" / "build" / "build_ncurses_for_wos.sh").read_text(),
-        ['NCURSES_CFLAGS="$NCURSES_TARGET_FLAGS -O2 -g -fPIC -fno-sanitize=safe-stack -fno-stack-protector"'],
+        [
+            'NCURSES_CFLAGS="$NCURSES_TARGET_FLAGS -O2 -g -fPIC -fno-sanitize=safe-stack -fno-stack-protector"',
+            "for install_target in install.libs install.includes install.data; do",
+            '"$install_target"',
+        ],
         "ncurses static archives remain linkable into CPython shared modules",
     )
+    ncurses_source = (ROOT / "scripts" / "build" / "build_ncurses_for_wos.sh").read_text()
+    if 'DESTDIR="$TARGET_SYSROOT" \\\n    install.libs install.includes install.data' in ncurses_source:
+        fail("ncurses install goals must remain sequential because their recursive include targets overlap")
     require_tokens(
         config_site,
         [
@@ -1633,6 +1640,7 @@ def test_native_wos_clang_port_stages_tablegen_for_next_self_host() -> None:
             "llvm-strings",
             "llvm-dwarfdump",
             "llvm-symbolizer",
+            "llvm-readobj",
             "llvm-config",
             "llvm-tblgen",
             "clang-tblgen",
