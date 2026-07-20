@@ -150,7 +150,7 @@ setup_wos_host_toolchain_shim() {
     ln -sfn clang "$shim_bin/cc"
     ln -sfn clang++ "$shim_bin/c++"
 
-    for tool in ld.lld llvm-ar llvm-ranlib llvm-strip llvm-objcopy llvm-nm llvm-readelf llvm-objdump llvm-tblgen clang-tblgen; do
+    for tool in ld.lld llvm-ar llvm-ranlib llvm-strip llvm-objcopy llvm-nm llvm-readelf llvm-objdump llvm-config llvm-tblgen clang-tblgen; do
         tool_path="$(find_system_tool "$tool")"
         ln -sfn "$tool_path" "$shim_bin/$tool"
     done

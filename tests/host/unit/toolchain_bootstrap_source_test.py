@@ -862,15 +862,10 @@ def test_ninja_port_build_scripts_use_ninja_job_helper() -> None:
     require_tokens(
         clang_source,
         [
-            'WOS_CLANG_HOST_SYSTEM="$(uname -s 2>/dev/null || printf unknown)"',
             'if [ -z "${WOS_LLVM_NINJA_JOBS:-}" ]; then',
             'WOS_LLVM_NINJA_JOBS="$WOS_NINJA_JOBS"',
-            '[ "$WOS_LLVM_NINJA_JOBS" -gt 8 ]',
-            "WOS_LLVM_NINJA_JOBS=8",
             'if [ -z "${WOS_LLVM_PARALLEL_LINK_JOBS:-}" ]; then',
             'WOS_LLVM_PARALLEL_LINK_JOBS="$WOS_LLVM_NINJA_JOBS"',
-            '[ "$WOS_LLVM_PARALLEL_LINK_JOBS" -gt 2 ]',
-            "WOS_LLVM_PARALLEL_LINK_JOBS=2",
             'export CMAKE_BUILD_PARALLEL_LEVEL="$WOS_LLVM_NINJA_JOBS"',
             'ninja -C "$CLANG_BUILD" -j"$WOS_LLVM_NINJA_JOBS"',
             "$jobs_setting must be a positive integer",
@@ -880,6 +875,12 @@ def test_ninja_port_build_scripts_use_ninja_job_helper() -> None:
         ],
         "native WOS clang LLVM link parallelism",
     )
+    for forbidden in (
+        'WOS_LLVM_NINJA_JOBS=8',
+        'WOS_LLVM_PARALLEL_LINK_JOBS=2',
+    ):
+        if forbidden in clang_source:
+            fail(f"native WOS clang build must honor requested parallelism: {forbidden}")
     if "-DLLVM_PARALLEL_LINK_JOBS=1" in clang_source:
         fail("native WOS clang build must not force serial LLVM link jobs")
 
@@ -1546,7 +1547,7 @@ def test_native_wos_bootstrap_keeps_host_toolchain_shim_discoverable() -> None:
             'WOS_HOST_TOOLCHAIN_ROOT="$WORKSPACE_ROOT/toolchain/wos-host-shim"',
             'ln -sfn "$(basename "$shim_root")" host',
             'elif ! wos_host_tool_is_usable "$compat_root/bin/clang"; then',
-            "llvm-tblgen clang-tblgen",
+            "llvm-config llvm-tblgen clang-tblgen",
             "Host toolchain compatibility path",
         ],
         "native WOS bootstrap host-toolchain compatibility shim",
@@ -1622,6 +1623,7 @@ def test_native_wos_clang_port_stages_tablegen_for_next_self_host() -> None:
             'ninja -C "$CLANG_BUILD" -j"$WOS_LLVM_NINJA_JOBS" "${WOS_LLVM_BIN_OUTPUTS[@]}"',
             "install_built_toolset",
             "llvm-symbolizer",
+            "llvm-config",
             "llvm-tblgen",
             "clang-tblgen",
             '-DLLVM_TABLEGEN="$HOST/bin/llvm-tblgen"',
