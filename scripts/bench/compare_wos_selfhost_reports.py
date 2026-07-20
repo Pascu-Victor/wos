@@ -7,6 +7,7 @@ import argparse
 import csv
 import json
 import math
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -145,7 +146,20 @@ def read_outer_wall_runs(path: Path) -> list[dict[str, Any]]:
     seen_runs: set[str] = set()
     with path.open("r", encoding="utf-8", newline="") as file:
         reader = csv.DictReader(file, delimiter="\t")
-        required_fields = {"run", "wall_ms", "runner_status", "evidence_status", "accepted"}
+        required_fields = {
+            "run",
+            "wall_ms",
+            "runner_status",
+            "evidence_status",
+            "accepted",
+            "commit",
+            "submodules_sha256",
+            "repo",
+            "mirror_commit",
+            "distdir_enabled",
+            "distdir_manifest_sha256",
+            "timed_out",
+        }
         missing_fields = required_fields - set(reader.fieldnames or ())
         if missing_fields:
             fail(f"{path}: missing outer-wall fields: {', '.join(sorted(missing_fields))}")
@@ -159,7 +173,7 @@ def read_outer_wall_runs(path: Path) -> list[dict[str, Any]]:
             seen_runs.add(run)
 
             parsed: dict[str, int] = {}
-            for field in ("wall_ms", "runner_status", "evidence_status", "accepted"):
+            for field in ("wall_ms", "runner_status", "evidence_status", "accepted", "distdir_enabled", "timed_out"):
                 value = row[field].strip()
                 try:
                     parsed[field] = int(value)
@@ -173,8 +187,42 @@ def read_outer_wall_runs(path: Path) -> list[dict[str, Any]]:
                 fail(f"{path}:{lineno}: evidence collection did not pass: {parsed['evidence_status']}")
             if parsed["accepted"] != 1:
                 fail(f"{path}:{lineno}: run is not accepted")
+            if parsed["distdir_enabled"] not in (0, 1):
+                fail(f"{path}:{lineno}: distdir_enabled must be 0 or 1")
+            if parsed["timed_out"] != 0:
+                fail(f"{path}:{lineno}: timed_out must be 0 for acceptance evidence")
 
-            runs.append({"run": run, "wall_ms": parsed["wall_ms"]})
+            commit = row["commit"].strip()
+            submodules_sha256 = row["submodules_sha256"].strip()
+            repo = row["repo"].strip()
+            mirror_commit = row["mirror_commit"].strip()
+            distdir_manifest_sha256 = row["distdir_manifest_sha256"].strip()
+            if re.fullmatch(r"[0-9a-f]{40}", commit) is None:
+                fail(f"{path}:{lineno}: commit must be a full lowercase 40-hex commit")
+            if re.fullmatch(r"[0-9a-f]{64}", submodules_sha256) is None:
+                fail(f"{path}:{lineno}: submodules_sha256 must be a lowercase SHA-256 digest")
+            if not repo:
+                fail(f"{path}:{lineno}: repo provenance must not be empty")
+            if mirror_commit and re.fullmatch(r"[0-9a-f]{40}", mirror_commit) is None:
+                fail(f"{path}:{lineno}: mirror_commit must be empty or a full lowercase 40-hex commit")
+            if parsed["distdir_enabled"] == 1:
+                if re.fullmatch(r"[0-9a-f]{64}", distdir_manifest_sha256) is None:
+                    fail(f"{path}:{lineno}: enabled distdir requires a lowercase SHA-256 manifest digest")
+            elif distdir_manifest_sha256:
+                fail(f"{path}:{lineno}: disabled distdir must not have a manifest digest")
+
+            runs.append(
+                {
+                    "run": run,
+                    "wall_ms": parsed["wall_ms"],
+                    "commit": commit,
+                    "submodules_sha256": submodules_sha256,
+                    "repo": repo,
+                    "mirror_commit": mirror_commit,
+                    "distdir_enabled": parsed["distdir_enabled"],
+                    "distdir_manifest_sha256": distdir_manifest_sha256,
+                }
+            )
 
     if not runs:
         fail(f"{path}: no outer-wall run rows found")
@@ -184,6 +232,27 @@ def read_outer_wall_runs(path: Path) -> list[dict[str, Any]]:
 def compare_outer_wall_runs(
     wos_runs: list[dict[str, Any]], linux_runs: list[dict[str, Any]], max_ratio: float
 ) -> dict[str, Any]:
+    combined_runs = [*wos_runs, *linux_runs]
+    provenance: dict[str, Any] = {}
+    for field in ("commit", "submodules_sha256", "repo", "distdir_enabled", "distdir_manifest_sha256"):
+        values = {run[field] for run in combined_runs}
+        if len(values) != 1:
+            fail(f"full-process comparison requires identical {field} provenance across Linux and WOS runs")
+        provenance[field] = next(iter(values))
+
+    mirror_modes = {bool(run["mirror_commit"]) for run in combined_runs}
+    if len(mirror_modes) != 1:
+        fail("full-process comparison requires Linux and WOS to use the same direct-or-mirror source mode")
+    mirrored = next(iter(mirror_modes))
+    provenance["source_mode"] = "mirror" if mirrored else "direct"
+    if mirrored:
+        mirror_commits = {run["mirror_commit"] for run in combined_runs}
+        if mirror_commits != {provenance["commit"]}:
+            fail("full-process mirror HEAD provenance must equal the checked-out root commit")
+        provenance["mirror_commit"] = provenance["commit"]
+    else:
+        provenance["mirror_commit"] = ""
+
     if len(linux_runs) == 1:
         paired_linux_runs = linux_runs * len(wos_runs)
     elif len(linux_runs) == len(wos_runs):
@@ -223,6 +292,7 @@ def compare_outer_wall_runs(
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "max_wos_ratio": max_ratio,
         "metric": "complete_outer_wall_ms",
+        "provenance": provenance,
         "steps": rows,
         "missing": [],
         "failures": failures,

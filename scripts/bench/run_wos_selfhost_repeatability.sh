@@ -13,6 +13,10 @@ WOS_SFTP_GET="${WOS_SELFHOST_REPEAT_SFTP_GET:-$WORKSPACE_ROOT/scripts/remote/wos
 DEFAULT_RUNS=50
 DEFAULT_HOST="wos-0"
 DEFAULT_JOBS=32
+DEFAULT_RUN_TIMEOUT_SECONDS=7200
+DEFAULT_REPO="https://github.com/Pascu-Victor/wos.git"
+DEFAULT_CLEANUP_WAIT_SECONDS=60
+DEFAULT_CLEANUP_PROBE_SECONDS=5
 DEFAULT_WORKDIR="/root/wos-selfhost-bench"
 DEFAULT_SERIAL_LOG="$WORKSPACE_ROOT/serial-vm0.log"
 DEFAULT_SERIAL_FAIL_REGEX='out of memory|oom killer|oom:|kernel panic|hung task|blocked for more than|allocation failure|allocator failure|failed to allocate|I/O error|input/output error|filesystem.*(corrupt|shutdown)|corruption detected|forced shutdown|error xfs:|xfs.*(error|corrupt|shutdown|failed)|\[xfs (btree|free|agfl|trans)\]|AGFL empty|KASAN:|UBSAN:'
@@ -39,6 +43,10 @@ Options:
                            otherwise the first observed commit is the baseline
   --repo URL               Override the self-host runner repository URL
   --mirror-file PATH       Forward an iteration-only guest file mirror
+  --distdir PATH           Reuse guest source tarballs from this directory;
+                           the path must be outside the guest scratch workdir
+  --run-timeout-seconds N  Fail a run after N seconds
+                           (default: $DEFAULT_RUN_TIMEOUT_SECONDS)
   --serial-fail-regex ERE  Case-insensitive serial failure expression
   --no-heartbeat-sync      Do not request out-of-band sync after runner phases
   -h, --help               Show this help
@@ -49,7 +57,9 @@ The script assumes the VM is already running, for example:
 It never passes --resume-checkout, --source-cache, or --skip-bootstrap. A
 nonzero run, changed commit/submodule manifest, VM reboot, serial truncation,
 serial failure match, or missing evidence marks that run failed. All requested
-runs are still attempted. The script exits nonzero unless every run passes.
+runs are attempted unless timed-out runner cleanup cannot be proven; in that
+case the script stops without reusing the guest workdir. The script exits
+nonzero unless every run passes.
 EOF
 }
 
@@ -206,6 +216,80 @@ append_reason() {
     fi
 }
 
+guest_canonical_path() {
+    local python_code='import os, sys; print(os.path.realpath(sys.argv[1]))'
+    local canonical
+
+    canonical="$(guest_output "python3 -c $(shell_quote "$python_code") $(shell_quote "$1")" 2>/dev/null || true)"
+    printf '%s\n' "$canonical" | sed -n '1p'
+}
+
+write_guest_distdir_manifest() {
+    local root="$1"
+    local output="$2"
+    local command
+
+    command="cd $(shell_quote "$root") && find . -mindepth 1 -maxdepth 1 -type f -print"
+    command+=" | LC_ALL=C sort | while IFS= read -r file; do sha256sum \"\$file\"; done"
+    guest_output "$command" > "$output"
+}
+
+mirror_repo_relative_path() {
+    local effective_repo="${repo:-$DEFAULT_REPO}"
+    case "$effective_repo" in
+        https://github.com/*)
+            local relative="${effective_repo#https://github.com/}"
+            case "$relative" in
+                ""|/*|*/*/*|*\?*|*\#*|*\\*|*[!A-Za-z0-9._/-]*)
+                    die "unsafe mirror repository path derived from --repo: $effective_repo"
+                    ;;
+            esac
+            local owner="${relative%%/*}"
+            local repository="${relative#*/}"
+            case "$owner" in
+                ""|.|..)
+                    die "unsafe mirror owner path derived from --repo: $effective_repo"
+                    ;;
+            esac
+            case "$repository" in
+                ""|.|..)
+                    die "unsafe mirror repository name derived from --repo: $effective_repo"
+                    ;;
+            esac
+            printf '%s\n' "$relative"
+            ;;
+        *)
+            die "--mirror-file requires an https://github.com/ repository URL: $effective_repo"
+            ;;
+    esac
+}
+
+wait_for_guest_runner_cleanup() {
+    local lock_path="${workdir%/}.lock"
+    local deadline_ms now remaining_ms probe_seconds
+
+    deadline_ms=$(( $(now_ms) + DEFAULT_CLEANUP_WAIT_SECONDS * 1000 ))
+    while :; do
+        now="$(now_ms)"
+        remaining_ms=$((deadline_ms - now))
+        if [ "$remaining_ms" -le 0 ]; then
+            return 1
+        fi
+        probe_seconds=$(((remaining_ms + 999) / 1000))
+        if [ "$probe_seconds" -gt "$DEFAULT_CLEANUP_PROBE_SECONDS" ]; then
+            probe_seconds="$DEFAULT_CLEANUP_PROBE_SECONDS"
+        fi
+        if timeout --signal=KILL "${probe_seconds}s" "$WOS_SSH" "$host" \
+            "test ! -e $(shell_quote "$lock_path")" >/dev/null 2>&1; then
+            return 0
+        fi
+        now="$(now_ms)"
+        if [ "$now" -lt "$deadline_ms" ]; then
+            sleep 1
+        fi
+    done
+}
+
 runs="$DEFAULT_RUNS"
 host="$DEFAULT_HOST"
 jobs="$DEFAULT_JOBS"
@@ -215,6 +299,8 @@ serial_log="$DEFAULT_SERIAL_LOG"
 expected_commit=""
 repo=""
 mirror_file=""
+distdir=""
+run_timeout_seconds="$DEFAULT_RUN_TIMEOUT_SECONDS"
 serial_fail_regex="$DEFAULT_SERIAL_FAIL_REGEX"
 heartbeat_sync=1
 
@@ -265,6 +351,16 @@ while (($# > 0)); do
             [ -n "$mirror_file" ] || die "--mirror-file requires a value"
             shift
             ;;
+        --distdir)
+            distdir="${2:-}"
+            [ -n "$distdir" ] || die "--distdir requires a value"
+            shift
+            ;;
+        --run-timeout-seconds)
+            run_timeout_seconds="${2:-}"
+            [ -n "$run_timeout_seconds" ] || die "--run-timeout-seconds requires a value"
+            shift
+            ;;
         --serial-fail-regex)
             serial_fail_regex="${2:-}"
             [ -n "$serial_fail_regex" ] || die "--serial-fail-regex requires a value"
@@ -286,11 +382,18 @@ done
 
 require_positive_integer "--runs" "$runs"
 require_positive_integer "--jobs" "$jobs"
+require_positive_integer "--run-timeout-seconds" "$run_timeout_seconds"
 reject_remote_whitespace "--host" "$host"
 reject_remote_whitespace "--workdir" "$workdir"
 reject_remote_whitespace "--expected-commit" "$expected_commit"
 reject_remote_whitespace "--repo" "$repo"
 reject_remote_whitespace "--mirror-file" "$mirror_file"
+reject_remote_whitespace "--distdir" "$distdir"
+
+if [ -n "$mirror_file" ]; then
+    [[ "$expected_commit" =~ ^[0-9a-f]{40}$ ]] ||
+        die "--mirror-file requires --expected-commit as a full lowercase 40-hex commit"
+fi
 
 [ -x "$SELFHOST_RUNNER" ] || die "self-host runner is not executable: $SELFHOST_RUNNER"
 [ -x "$WOS_SSH" ] || die "WOS SSH helper is not executable: $WOS_SSH"
@@ -298,6 +401,7 @@ reject_remote_whitespace "--mirror-file" "$mirror_file"
 command -v python3 >/dev/null 2>&1 || die "python3 is required"
 command -v sha256sum >/dev/null 2>&1 || die "sha256sum is required"
 command -v dd >/dev/null 2>&1 || die "dd is required"
+command -v timeout >/dev/null 2>&1 || die "timeout is required"
 
 if [ -z "$output_dir" ]; then
     output_dir="$WORKSPACE_ROOT/benchmarks/results/wos-selfhost-repeat-$(date -u +%Y%m%dT%H%M%SZ)"
@@ -311,15 +415,58 @@ initial_boot_id="$(serial_boot_id || true)"
 initial_uptime="$(read_guest_uptime || true)"
 [ -n "$initial_uptime" ] || die "cannot read /proc/uptime from $host; launch the VM before running this harness"
 
+if [ -n "$distdir" ]; then
+    guest_output "test -d $(shell_quote "$distdir")" >/dev/null 2>&1 ||
+        die "--distdir must name an existing guest directory: $distdir"
+    canonical_distdir="$(guest_canonical_path "$distdir")"
+    canonical_workdir="$(guest_canonical_path "$workdir")"
+    [ -n "$canonical_distdir" ] && [ -n "$canonical_workdir" ] ||
+        die "failed to canonicalize guest distdir/workdir paths"
+    case "$canonical_distdir" in
+        "$canonical_workdir"|"$canonical_workdir"/*)
+            die "--distdir must be outside the guest scratch workdir: $distdir"
+            ;;
+    esac
+fi
+
+mirror_commit=""
+if [ -n "$mirror_file" ]; then
+    canonical_mirror_root="$(guest_canonical_path "$mirror_file")"
+    [ -n "$canonical_mirror_root" ] || die "failed to canonicalize guest mirror root: $mirror_file"
+    guest_output "test -d $(shell_quote "$canonical_mirror_root")" >/dev/null 2>&1 ||
+        die "guest mirror root does not exist: $mirror_file"
+    mirror_repo="$canonical_mirror_root/$(mirror_repo_relative_path)"
+    guest_output "test -d $(shell_quote "$mirror_repo")" >/dev/null 2>&1 ||
+        die "guest mirror repository does not exist: $mirror_repo"
+    canonical_mirror_repo="$(guest_canonical_path "$mirror_repo")"
+    case "$canonical_mirror_repo" in
+        "$canonical_mirror_root"/*) ;;
+        *) die "guest mirror repository escapes mirror root: $mirror_repo" ;;
+    esac
+    mirror_commit="$(guest_output "git --git-dir $(shell_quote "$mirror_repo") rev-parse HEAD" 2>/dev/null || true)"
+    mirror_commit="$(printf '%s\n' "$mirror_commit" | sed -n '1p')"
+    [ "$mirror_commit" = "$expected_commit" ] ||
+        die "mirror HEAD does not match --expected-commit: mirror=$mirror_commit expected=$expected_commit"
+fi
+distdir_enabled=0
+distdir_manifest_sha256=""
+if [ -n "$distdir" ]; then
+    distdir_enabled=1
+    write_guest_distdir_manifest "$canonical_distdir" "$output_dir/distdir-manifest.txt" ||
+        die "failed to capture guest distdir manifest: $canonical_distdir"
+    distdir_manifest_sha256="$(sha256sum "$output_dir/distdir-manifest.txt" | sed 's/[[:space:]].*//')"
+fi
+
 session_id="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 runs_tsv="$output_dir/runs.tsv"
 summary_tsv="$output_dir/summary.tsv"
 summary_json="$output_dir/summary.json"
-printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "run" "start_utc" "end_utc" "wall_ms" "runner_status" "evidence_status" \
     "accepted" "commit" "submodules_sha256" "uptime_before" "uptime_after" \
     "boot_id_before" "boot_id_after" "serial_start" "serial_end" "serial_sha256" "serial_failures" \
-    "failure_reasons" "run_dir" "console_log" > "$runs_tsv"
+    "failure_reasons" "run_dir" "console_log" "repo" "mirror_commit" "distdir_enabled" \
+    "distdir_manifest_sha256" "timed_out" > "$runs_tsv"
 
 baseline_commit="$expected_commit"
 baseline_submodules=""
@@ -328,6 +475,7 @@ attempted=0
 runner_completed=0
 accepted=0
 failed=0
+timed_out_runs=0
 same_boot=1
 same_commit=1
 same_submodules=1
@@ -373,20 +521,66 @@ for ((run_number = 1; run_number <= runs; ++run_number)); do
     if [ -n "$mirror_file" ]; then
         runner_cmd+=(--mirror-file "$mirror_file")
     fi
+    if [ -n "$distdir" ]; then
+        runner_cmd+=(--distdir "$distdir")
+    fi
 
     echo "[$run_label/$runs] start $(printf '%q ' "${runner_cmd[@]}")"
     set +e
-    "${runner_cmd[@]}" > "$console_log" 2>&1
+    timeout --signal=TERM --kill-after=60s "${run_timeout_seconds}s" "${runner_cmd[@]}" > "$console_log" 2>&1
     runner_status=$?
     set -e
     end_ms="$(now_ms)"
     end_utc="$(timestamp_utc)"
     wall_ms=$((end_ms - start_ms))
     attempted=$((attempted + 1))
+    timed_out=0
+    cleanup_incomplete=0
+    case "$runner_status" in
+        124|137)
+            timed_out=1
+            timed_out_runs=$((timed_out_runs + 1))
+            append_reason "runner_timeout"
+            if ! wait_for_guest_runner_cleanup; then
+                append_reason "runner_cleanup_incomplete"
+                cleanup_incomplete=1
+            fi
+            ;;
+    esac
     if [ "$runner_status" -eq 0 ]; then
         runner_completed=$((runner_completed + 1))
     else
         append_reason "runner_status_$runner_status"
+    fi
+
+    if [ "$cleanup_incomplete" -eq 1 ]; then
+        uptime_after=""
+        boot_id_after="$(serial_boot_id || true)"
+        serial_end="$(serial_size || printf 0)"
+        if ! capture_serial_range "$serial_start" "$serial_end" "$run_dir/serial.log"; then
+            append_reason "serial_missing_or_truncated"
+        fi
+        serial_sha="$(sha256sum "$run_dir/serial.log" | sed 's/[[:space:]].*//')"
+        if grep -Ein "$serial_fail_regex" "$run_dir/serial.log" > "$run_dir/serial-failures.txt"; then
+            serial_failures="$(wc -l < "$run_dir/serial-failures.txt" | tr -d '[:space:]')"
+            append_reason "serial_failure_match"
+        else
+            : > "$run_dir/serial-failures.txt"
+        fi
+        evidence_status=1
+        append_reason "evidence_incomplete"
+        printf 'guest cleanup could not be proven; no further guest evidence collection or mutation was attempted\n' \
+            >> "$collection_log"
+        run_accepted=0
+        failed=$((failed + 1))
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$run_number" "$start_utc" "$end_utc" "$wall_ms" "$runner_status" "$evidence_status" \
+            "$run_accepted" "" "" "$uptime_before" "$uptime_after" \
+            "$boot_id_before" "$boot_id_after" "$serial_start" "$serial_end" "$serial_sha" "$serial_failures" \
+            "$failure_reasons" "$run_dir" "$console_log" "${repo:-$DEFAULT_REPO}" "$mirror_commit" "$distdir_enabled" \
+            "$distdir_manifest_sha256" "$timed_out" >> "$runs_tsv"
+        echo "[$run_label/$runs] FAIL ${wall_ms}ms reasons=$failure_reasons; stopping to avoid unsafe guest reuse" >&2
+        break
     fi
 
     uptime_after="$(read_guest_uptime || true)"
@@ -420,8 +614,8 @@ for ((run_number = 1; run_number <= runs; ++run_number)); do
     checkout_path="$workdir/wos"
     commit="$(guest_output "git -C $(shell_quote "$checkout_path") rev-parse HEAD" 2>> "$collection_log" || true)"
     commit="$(printf '%s\n' "$commit" | sed -n '1p')"
-    if [ -z "$commit" ]; then
-        append_reason "commit_unavailable"
+    if ! [[ "$commit" =~ ^[0-9a-f]{40}$ ]]; then
+        append_reason "commit_invalid_or_unavailable"
         same_commit=0
     elif [ -z "$baseline_commit" ]; then
         baseline_commit="$commit"
@@ -429,12 +623,16 @@ for ((run_number = 1; run_number <= runs; ++run_number)); do
         append_reason "commit_mismatch"
         same_commit=0
     fi
+    if [ -n "$mirror_commit" ] && [ "$commit" != "$mirror_commit" ]; then
+        append_reason "mirror_commit_mismatch"
+        same_commit=0
+    fi
 
     remote_submodules="$workdir/submodules.txt"
     submodules_sha="$(guest_output "sha256sum $(shell_quote "$remote_submodules")" 2>> "$collection_log" || true)"
     submodules_sha="$(printf '%s\n' "$submodules_sha" | sed -n '1{s/[[:space:]].*//;p;}')"
-    if [ -z "$submodules_sha" ]; then
-        append_reason "submodule_manifest_unavailable"
+    if ! [[ "$submodules_sha" =~ ^[0-9a-f]{64}$ ]]; then
+        append_reason "submodule_manifest_invalid_or_unavailable"
         same_submodules=0
     elif [ -z "$baseline_submodules" ]; then
         baseline_submodules="$submodules_sha"
@@ -475,11 +673,12 @@ EOF
         failed=$((failed + 1))
     fi
 
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
         "$run_number" "$start_utc" "$end_utc" "$wall_ms" "$runner_status" "$evidence_status" \
         "$run_accepted" "$commit" "$submodules_sha" "$uptime_before" "$uptime_after" \
         "$boot_id_before" "$boot_id_after" "$serial_start" "$serial_end" "$serial_sha" "$serial_failures" \
-        "$failure_reasons" "$run_dir" "$console_log" >> "$runs_tsv"
+        "$failure_reasons" "$run_dir" "$console_log" "${repo:-$DEFAULT_REPO}" "$mirror_commit" "$distdir_enabled" \
+        "$distdir_manifest_sha256" "$timed_out" >> "$runs_tsv"
 
     if [ "$run_accepted" -eq 1 ]; then
         echo "[$run_label/$runs] PASS ${wall_ms}ms commit=$commit serial=${serial_start}-${serial_end}"
@@ -495,7 +694,7 @@ if [ "$attempted" -eq "$runs" ] && [ "$accepted" -eq "$runs" ] && [ "$failed" -e
 fi
 
 {
-    printf 'schema_version\t1\n'
+    printf 'schema_version\t2\n'
     printf 'generated_utc\t%s\n' "$(timestamp_utc)"
     printf 'pass\t%s\n' "$overall_pass"
     printf 'requested_runs\t%s\n' "$runs"
@@ -503,6 +702,7 @@ fi
     printf 'runner_completed_runs\t%s\n' "$runner_completed"
     printf 'accepted_runs\t%s\n' "$accepted"
     printf 'failed_runs\t%s\n' "$failed"
+    printf 'timed_out_runs\t%s\n' "$timed_out_runs"
     printf 'same_boot\t%s\n' "$same_boot"
     printf 'same_commit\t%s\n' "$same_commit"
     printf 'same_submodules\t%s\n' "$same_submodules"
@@ -512,6 +712,14 @@ fi
     printf 'host\t%s\n' "$host"
     printf 'jobs\t%s\n' "$jobs"
     printf 'workdir\t%s\n' "$workdir"
+    printf 'repo\t%s\n' "${repo:-$DEFAULT_REPO}"
+    printf 'mirror_file\t%s\n' "$mirror_file"
+    printf 'mirror_commit\t%s\n' "$mirror_commit"
+    printf 'distdir\t%s\n' "$distdir"
+    printf 'canonical_distdir\t%s\n' "${canonical_distdir:-}"
+    printf 'distdir_enabled\t%s\n' "$distdir_enabled"
+    printf 'distdir_manifest_sha256\t%s\n' "$distdir_manifest_sha256"
+    printf 'run_timeout_seconds\t%s\n' "$run_timeout_seconds"
     printf 'serial_log\t%s\n' "$serial_log"
     printf 'runs_tsv\t%s\n' "$runs_tsv"
 } > "$summary_tsv"
@@ -533,10 +741,13 @@ with open(source, encoding="utf-8") as rows:
             "runner_completed_runs",
             "accepted_runs",
             "failed_runs",
+            "timed_out_runs",
             "same_boot",
             "same_commit",
             "same_submodules",
             "jobs",
+            "distdir_enabled",
+            "run_timeout_seconds",
         }:
             data[key] = int(value)
         else:

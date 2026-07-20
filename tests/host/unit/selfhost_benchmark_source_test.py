@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import csv
+import hashlib
 import json
 import os
 import subprocess
@@ -61,6 +62,13 @@ def test_selfhost_runner_covers_acceptance_flow() -> None:
             'WOS_MAKE_JOBS="$jobs"',
             "unset WOS_BUILD_JOBS WOS_MAKE_JOBS WOS_NINJA_JOBS CMAKE_BUILD_PARALLEL_LEVEL",
             "./tools/bootstrap.sh",
+            "WOS_USE_CCACHE=0",
+            'log "bootstrap_ccache=disabled"',
+            "canonical_path()",
+            'canonical_workdir="$(canonical_path "$workdir")"',
+            'if [ "$canonical_workdir" != "${workdir%/}" ]; then',
+            "scratch workdir must be an absolute normalized path without symlink aliases",
+            "source distdir must be outside the scratch workdir",
             "configure_cmake_command()",
             'printf \'%s\\n\' "$host_toolchain/bin/cmake"',
             'local cmake_args=("$cmake_command" -GNinja',
@@ -130,12 +138,19 @@ def test_selfhost_repeatability_runner_preserves_acceptance_evidence() -> None:
             "DEFAULT_RUNS=50",
             'DEFAULT_WORKDIR="/root/wos-selfhost-bench"',
             'DEFAULT_SERIAL_LOG="$WORKSPACE_ROOT/serial-vm0.log"',
+            "DEFAULT_RUN_TIMEOUT_SECONDS=7200",
             'initial_boot_id="$(serial_boot_id || true)"',
             "for ((run_number = 1; run_number <= runs; ++run_number))",
             'runner_cmd=("$SELFHOST_RUNNER" wos --host "$host" --jobs "$jobs" --workdir "$workdir" --log-dir "$remote_log_dir"',
             '--history-file "$remote_log_dir/selfhost-history.tsv")',
             "runner_cmd+=(--heartbeat-sync)",
-            '"${runner_cmd[@]}" > "$console_log" 2>&1',
+            'timeout --signal=TERM --kill-after=60s "${run_timeout_seconds}s" "${runner_cmd[@]}" > "$console_log" 2>&1',
+            'runner_cmd+=(--distdir "$distdir")',
+            'append_reason "runner_timeout"',
+            "wait_for_guest_runner_cleanup()",
+            'timeout --signal=KILL "${probe_seconds}s" "$WOS_SSH"',
+            "no further guest evidence collection or mutation was attempted",
+            "stopping to avoid unsafe guest reuse",
             'expected_bytes=$((after - before))',
             'iflag=skip_bytes,count_bytes',
             'capture_serial_range "$serial_start" "$serial_end" "$run_dir/serial.log"',
@@ -160,6 +175,10 @@ def test_selfhost_repeatability_runner_preserves_acceptance_evidence() -> None:
             'summary_json="$output_dir/summary.json"',
             'json.dump(data, result, indent=2, sort_keys=True)',
             'if [ "$overall_pass" -ne 1 ]; then',
+            "mirror_commit",
+            "distdir_enabled",
+            "distdir_manifest_sha256",
+            "timed_out_runs",
         ],
         "WOS self-host repeatability evidence runner",
     )
@@ -193,6 +212,16 @@ def test_selfhost_repeatability_runner_preserves_acceptance_evidence() -> None:
     if invalid_result.returncode == 0 or "--runs must be a positive integer" not in invalid_result.stderr:
         fail("repeatability runner accepted an invalid run count")
 
+    invalid_timeout = subprocess.run(
+        ["bash", str(SELFHOST_REPEATABILITY), "--run-timeout-seconds", "0"],
+        cwd=ROOT,
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+    if invalid_timeout.returncode == 0 or "--run-timeout-seconds must be a positive integer" not in invalid_timeout.stderr:
+        fail("repeatability runner accepted an invalid per-run timeout")
+
 
 def test_linux_selfhost_baseline_preserves_full_process_evidence() -> None:
     source = SELFHOST_LINUX_BASELINE.read_text()
@@ -202,12 +231,15 @@ def test_linux_selfhost_baseline_preserves_full_process_evidence() -> None:
             "DEFAULT_RUNS=50",
             'DEFAULT_WORKDIR="/tmp/wos-selfhost-linux-baseline"',
             'DEFAULT_REPO="https://github.com/Pascu-Victor/wos.git"',
+            "DEFAULT_RUN_TIMEOUT_SECONDS=7200",
             "for ((run_number = 1; run_number <= runs; ++run_number))",
             'runner_cmd=("$SELFHOST_RUNNER" linux --jobs "$jobs" --workdir "$workdir" --repo "$repo"',
             '--log-dir "$local_log_dir" --history-file "$local_history_file")',
             "runner_cmd+=(--heartbeat-sync)",
             'start_ms="$(now_ms)"',
-            '"${runner_cmd[@]}" > "$console_log" 2>&1',
+            'timeout --signal=TERM --kill-after=60s "${run_timeout_seconds}s" "${runner_cmd[@]}" > "$console_log" 2>&1',
+            'runner_cmd+=(--distdir "$distdir")',
+            'append_reason "runner_timeout"',
             'end_ms="$(now_ms)"',
             'wall_ms=$((end_ms - start_ms))',
             'commit="$(git -C "$checkout_path" rev-parse HEAD',
@@ -226,6 +258,10 @@ def test_linux_selfhost_baseline_preserves_full_process_evidence() -> None:
             '"accepted" "commit" "submodules_sha256"',
             'json.dump(data, result, indent=2, sort_keys=True)',
             'if [ "$overall_pass" -ne 1 ]; then',
+            "mirror_commit",
+            "distdir_enabled",
+            "distdir_manifest_sha256",
+            "timed_out_runs",
         ],
         "Linux full-process self-host baseline evidence runner",
     )
@@ -265,6 +301,16 @@ def test_linux_selfhost_baseline_preserves_full_process_evidence() -> None:
     if invalid_result.returncode == 0 or "--runs must be a positive integer" not in invalid_result.stderr:
         fail("Linux baseline accepted an invalid run count")
 
+    invalid_timeout = subprocess.run(
+        ["bash", str(SELFHOST_LINUX_BASELINE), "--run-timeout-seconds", "0"],
+        cwd=ROOT,
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+    if invalid_timeout.returncode == 0 or "--run-timeout-seconds must be a positive integer" not in invalid_timeout.stderr:
+        fail("Linux baseline accepted an invalid per-run timeout")
+
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
         fake_runner = tmp_path / "fake-selfhost-runner.sh"
@@ -291,7 +337,7 @@ while (($# > 0)); do
             history_file="$2"
             shift 2
             ;;
-        --jobs|--repo|--mirror-file)
+        --jobs|--repo|--mirror-file|--distdir)
             shift 2
             ;;
         --heartbeat-sync)
@@ -306,6 +352,11 @@ done
 [ -n "$workdir" ]
 [ -n "$log_dir" ]
 [ -n "$history_file" ]
+should_timeout=0
+if [ -n "${FAKE_TIMEOUT_MARKER:-}" ] && [ ! -e "$FAKE_TIMEOUT_MARKER" ]; then
+    : > "$FAKE_TIMEOUT_MARKER"
+    should_timeout=1
+fi
 rm -rf -- "$workdir"
 mkdir -p "$workdir"
 git clone -q --no-checkout "$FAKE_SOURCE_REPO" "$workdir/wos"
@@ -318,12 +369,25 @@ printf 'run_id\\ttimestamp_utc\\n' > "$history_file"
 printf ' same-submodule-pin path\\n' > "$workdir/submodules.txt"
 printf 'WOS_BUILD_DISK_IMAGES:BOOL=OFF\\n' > "$workdir/wos/build-selfhost/CMakeCache.txt"
 printf 'fake command log\\n' > "$log_dir/build.log"
+if [ "$should_timeout" -eq 1 ]; then
+    if [ "${FAKE_STALE_LOCK:-0}" = "1" ]; then
+        mkdir "${workdir%/}.lock"
+    fi
+    sleep 5
+fi
 """,
             encoding="ascii",
         )
         fake_runner.chmod(0o755)
         output_dir = tmp_path / "results"
         workdir = tmp_path / "work"
+        distdir = tmp_path / "distfiles"
+        distdir.mkdir()
+        distfile = distdir / "fixture-source.tar.xz"
+        distfile.write_bytes(b"fixture source archive\n")
+        distfile_sha256 = hashlib.sha256(distfile.read_bytes()).hexdigest()
+        distdir_manifest = f"{distfile_sha256}  ./fixture-source.tar.xz\n"
+        distdir_manifest_sha256 = hashlib.sha256(distdir_manifest.encode("ascii")).hexdigest()
         environment = os.environ.copy()
         environment["WOS_LINUX_SELFHOST_BASELINE_RUNNER"] = str(fake_runner)
         environment["FAKE_SOURCE_REPO"] = str(ROOT)
@@ -338,6 +402,8 @@ printf 'fake command log\\n' > "$log_dir/build.log"
                 str(workdir),
                 "--output-dir",
                 str(output_dir),
+                "--distdir",
+                str(distdir),
                 "--no-heartbeat-sync",
             ],
             cwd=ROOT,
@@ -354,6 +420,18 @@ printf 'fake command log\\n' > "$log_dir/build.log"
             fail(f"Linux baseline did not emit two accepted outer-wall rows: {rows!r}")
         if any(int(row["wall_ms"]) < 0 for row in rows):
             fail(f"Linux baseline emitted an invalid outer wall time: {rows!r}")
+        if any(
+            row["distdir_enabled"] != "1"
+            or row["distdir_manifest_sha256"] != distdir_manifest_sha256
+            or row["timed_out"] != "0"
+            for row in rows
+        ):
+            fail(f"Linux baseline did not preserve per-run distdir/timeout provenance: {rows!r}")
+        summary = json.loads((output_dir / "summary.json").read_text(encoding="ascii"))
+        if summary.get("distdir") != str(distdir) or summary.get("run_timeout_seconds") != 7200:
+            fail(f"Linux baseline did not preserve distdir/timeout summary provenance: {summary!r}")
+        if summary.get("distdir_manifest_sha256") != distdir_manifest_sha256:
+            fail(f"Linux baseline did not preserve the pre-run distdir manifest: {summary!r}")
         for run_number in (1, 2):
             run_dir = output_dir / "runs" / f"run-{run_number:04d}"
             for name in (
@@ -372,6 +450,163 @@ printf 'fake command log\\n' > "$log_dir/build.log"
                     fail(f"Linux baseline fixture is missing per-run evidence: {run_dir / name}")
             if "WOS_BUILD_DISK_IMAGES:BOOL=OFF" not in (run_dir / "CMakeCache.txt").read_text(encoding="ascii"):
                 fail("Linux baseline fixture did not preserve the parity configure cache")
+
+        timeout_output_dir = tmp_path / "timeout-results"
+        timeout_workdir = tmp_path / "timeout-work"
+        timeout_marker = tmp_path / "timeout-marker"
+        environment["FAKE_TIMEOUT_MARKER"] = str(timeout_marker)
+        result = subprocess.run(
+            [
+                str(SELFHOST_LINUX_BASELINE),
+                "--runs",
+                "2",
+                "--jobs",
+                "1",
+                "--workdir",
+                str(timeout_workdir),
+                "--output-dir",
+                str(timeout_output_dir),
+                "--distdir",
+                str(distdir),
+                "--run-timeout-seconds",
+                "2",
+                "--no-heartbeat-sync",
+            ],
+            cwd=ROOT,
+            env=environment,
+            check=False,
+            text=True,
+            capture_output=True,
+        )
+        if result.returncode == 0:
+            fail("Linux baseline timeout fixture unexpectedly passed")
+        with (timeout_output_dir / "runs.tsv").open(encoding="utf-8", newline="") as file:
+            timeout_rows = list(csv.DictReader(file, delimiter="\t"))
+        if len(timeout_rows) != 2:
+            fail(f"Linux baseline timeout did not attempt every requested run: {timeout_rows!r}")
+        if timeout_rows[0]["timed_out"] != "1" or "runner_timeout" not in timeout_rows[0]["failure_reasons"]:
+            fail(f"Linux baseline did not classify the timed-out run: {timeout_rows!r}")
+        if timeout_rows[1]["runner_status"] != "0" or timeout_rows[1]["accepted"] != "1":
+            fail(f"Linux baseline did not continue after a timed-out run: {timeout_rows!r}")
+
+        stale_output_dir = tmp_path / "stale-timeout-results"
+        stale_workdir = tmp_path / "stale-timeout-work"
+        environment["FAKE_TIMEOUT_MARKER"] = str(tmp_path / "stale-timeout-marker")
+        environment["FAKE_STALE_LOCK"] = "1"
+        result = subprocess.run(
+            [
+                str(SELFHOST_LINUX_BASELINE),
+                "--runs",
+                "2",
+                "--jobs",
+                "1",
+                "--workdir",
+                str(stale_workdir),
+                "--output-dir",
+                str(stale_output_dir),
+                "--distdir",
+                str(distdir),
+                "--run-timeout-seconds",
+                "2",
+                "--no-heartbeat-sync",
+            ],
+            cwd=ROOT,
+            env=environment,
+            check=False,
+            text=True,
+            capture_output=True,
+        )
+        if result.returncode == 0:
+            fail("Linux baseline accepted a timeout with unproven cleanup")
+        with (stale_output_dir / "runs.tsv").open(encoding="utf-8", newline="") as file:
+            stale_rows = list(csv.DictReader(file, delimiter="\t"))
+        if len(stale_rows) != 1 or "runner_cleanup_incomplete" not in stale_rows[0]["failure_reasons"]:
+            fail(f"Linux baseline did not stop after unproven cleanup: {stale_rows!r}")
+        if (stale_output_dir / "runs" / "run-0002").exists():
+            fail("Linux baseline reused the workdir after unproven cleanup")
+        if (stale_output_dir / "runs" / "run-0001" / "command-logs.tar").exists():
+            fail("Linux baseline mutated/archived active workdir evidence after unproven cleanup")
+        if not Path(f"{stale_workdir}.lock").is_dir():
+            fail("Linux baseline removed an unproven active-workdir lock")
+
+        contained_workdir = tmp_path / "contained-work"
+        contained_distdir = contained_workdir / "distfiles"
+        contained_distdir.mkdir(parents=True)
+        distdir_alias = tmp_path / "contained-distdir-alias"
+        distdir_alias.symlink_to(contained_distdir, target_is_directory=True)
+        result = subprocess.run(
+            [
+                str(SELFHOST_LINUX_BASELINE),
+                "--runs",
+                "1",
+                "--workdir",
+                str(contained_workdir),
+                "--output-dir",
+                str(tmp_path / "contained-results"),
+                "--distdir",
+                str(distdir_alias),
+            ],
+            cwd=ROOT,
+            env=environment,
+            check=False,
+            text=True,
+            capture_output=True,
+        )
+        if result.returncode == 0 or "--distdir must be outside the scratch workdir" not in result.stderr:
+            fail("Linux baseline accepted a symlinked distdir inside the scratch workdir")
+
+        mirror_root = tmp_path / "mirror-root"
+        mirror_root.mkdir()
+        invalid_mirror_repos = (
+            "https://github.com/owner/repo.git/extra",
+            "https://github.com/../repo.git",
+            "https://github.com/owner/repo.git?ref=unsafe",
+            "https://github.com/owner/repo.git#unsafe",
+        )
+        for index, invalid_repo in enumerate(invalid_mirror_repos):
+            result = subprocess.run(
+                [
+                    str(SELFHOST_LINUX_BASELINE),
+                    "--runs",
+                    "1",
+                    "--output-dir",
+                    str(tmp_path / f"invalid-mirror-results-{index}"),
+                    "--repo",
+                    invalid_repo,
+                    "--mirror-file",
+                    str(mirror_root),
+                    "--expected-commit",
+                    "a" * 40,
+                ],
+                cwd=ROOT,
+                env=environment,
+                check=False,
+                text=True,
+                capture_output=True,
+            )
+            if result.returncode == 0 or "unsafe mirror" not in result.stderr:
+                fail(f"Linux baseline accepted an unsafe mirror repository path: {invalid_repo}")
+
+        result = subprocess.run(
+            [
+                str(SELFHOST_LINUX_BASELINE),
+                "--runs",
+                "1",
+                "--output-dir",
+                str(tmp_path / "uppercase-commit-results"),
+                "--mirror-file",
+                str(mirror_root),
+                "--expected-commit",
+                "A" * 40,
+            ],
+            cwd=ROOT,
+            env=environment,
+            check=False,
+            text=True,
+            capture_output=True,
+        )
+        if result.returncode == 0 or "full lowercase 40-hex commit" not in result.stderr:
+            fail("Linux baseline accepted a non-canonical expected commit")
 
 
 def test_selfhost_cluster_profile_is_single_large_vm() -> None:
@@ -974,6 +1209,8 @@ def test_selfhost_runner_keeps_remote_and_scratch_handling_guarded() -> None:
         fail("bootstrap skip branch must leave timing output to time_step")
     if "< <(" in source:
         fail("WOS self-host benchmark must avoid Bash process substitution for WOS shell compatibility")
+    if 'case "$workdir" in' in source:
+        fail("destructive scratch allowlist must validate the canonical workdir")
 
 
 def test_selfhost_report_comparator_checks_clone_build_and_total() -> None:
@@ -985,7 +1222,12 @@ def test_selfhost_report_comparator_checks_clone_build_and_total() -> None:
             'FULL_PROCESS_ACCEPTANCE_PROFILE = "full-process"',
             "FULL_PROCESS_MAX_WOS_RATIO = 1.10",
             '"metric": "complete_outer_wall_ms"',
-            'required_fields = {"run", "wall_ms", "runner_status", "evidence_status", "accepted"}',
+            '"submodules_sha256",',
+            '"mirror_commit",',
+            '"distdir_enabled",',
+            '"distdir_manifest_sha256",',
+            '"timed_out",',
+            '"provenance": provenance',
             "full-process acceptance ratio cannot exceed",
             "--max-wos-ratio",
             "ratio = wos_ms / linux_ms",
@@ -1054,9 +1296,17 @@ def test_selfhost_report_comparator_checks_clone_build_and_total() -> None:
         wos_runs = tmp_path / "wos-runs.tsv"
         linux_runs = tmp_path / "linux-runs.tsv"
         full_process_json = tmp_path / "full-process.json"
-        runs_header = "run\twall_ms\trunner_status\tevidence_status\taccepted\n"
-        wos_runs.write_text(runs_header + "1\t1100\t0\t0\t1\n2\t1090\t0\t0\t1\n", encoding="ascii")
-        linux_runs.write_text(runs_header + "baseline\t1000\t0\t0\t1\n", encoding="ascii")
+        runs_header = (
+            "run\twall_ms\trunner_status\tevidence_status\taccepted\tcommit\t"
+            "submodules_sha256\trepo\tmirror_commit\tdistdir_enabled\t"
+            "distdir_manifest_sha256\ttimed_out\n"
+        )
+        provenance = f"{'a' * 40}\t{'b' * 64}\thttps://github.com/Pascu-Victor/wos.git\t\t1\t{'e' * 64}\t0"
+        wos_runs.write_text(
+            runs_header + f"1\t1100\t0\t0\t1\t{provenance}\n2\t1090\t0\t0\t1\t{provenance}\n",
+            encoding="ascii",
+        )
+        linux_runs.write_text(runs_header + f"baseline\t1000\t0\t0\t1\t{provenance}\n", encoding="ascii")
         result = subprocess.run(
             [
                 str(SELFHOST_COMPARE),
@@ -1082,7 +1332,7 @@ def test_selfhost_report_comparator_checks_clone_build_and_total() -> None:
         if len(data.get("steps", [])) != 2 or not all(row["pass"] for row in data["steps"]):
             fail(f"full-process comparator did not check every WOS run: {data!r}")
 
-        wos_runs.write_text(runs_header + "1\t1101\t0\t0\t1\n", encoding="ascii")
+        wos_runs.write_text(runs_header + f"1\t1101\t0\t0\t1\t{provenance}\n", encoding="ascii")
         result = subprocess.run(
             [
                 str(SELFHOST_COMPARE),
@@ -1120,6 +1370,85 @@ def test_selfhost_report_comparator_checks_clone_build_and_total() -> None:
         )
         if result.returncode == 0 or "cannot exceed 1.10" not in result.stderr:
             fail("full-process comparator allowed the acceptance ceiling to be relaxed")
+
+        provenance_mismatches = [
+            (
+                f"{'c' * 40}\t{'b' * 64}\thttps://github.com/Pascu-Victor/wos.git\t\t1\t{'e' * 64}\t0",
+                "identical commit provenance",
+            ),
+            (
+                f"{'a' * 40}\t{'d' * 64}\thttps://github.com/Pascu-Victor/wos.git\t\t1\t{'e' * 64}\t0",
+                "identical submodules_sha256 provenance",
+            ),
+            (
+                f"{'a' * 40}\t{'b' * 64}\thttps://example.invalid/wos.git\t\t1\t{'e' * 64}\t0",
+                "identical repo provenance",
+            ),
+            (
+                f"{'a' * 40}\t{'b' * 64}\thttps://github.com/Pascu-Victor/wos.git\t\t0\t\t0",
+                "identical distdir_enabled provenance",
+            ),
+            (
+                f"{'a' * 40}\t{'b' * 64}\thttps://github.com/Pascu-Victor/wos.git\t\t1\t{'f' * 64}\t0",
+                "identical distdir_manifest_sha256 provenance",
+            ),
+            (
+                f"{'a' * 40}\t{'b' * 64}\thttps://github.com/Pascu-Victor/wos.git\t{'a' * 40}\t1\t{'e' * 64}\t0",
+                "same direct-or-mirror source mode",
+            ),
+        ]
+        wos_runs.write_text(runs_header + f"1\t1100\t0\t0\t1\t{provenance}\n", encoding="ascii")
+        for bad_provenance, expected_error in provenance_mismatches:
+            linux_runs.write_text(
+                runs_header + f"baseline\t1000\t0\t0\t1\t{bad_provenance}\n",
+                encoding="ascii",
+            )
+            result = subprocess.run(
+                [
+                    str(SELFHOST_COMPARE),
+                    "--wos-runs",
+                    str(wos_runs),
+                    "--linux-runs",
+                    str(linux_runs),
+                    "--acceptance-profile",
+                    "full-process",
+                ],
+                cwd=ROOT,
+                check=False,
+                text=True,
+                capture_output=True,
+            )
+            if result.returncode == 0 or expected_error not in result.stderr:
+                fail(f"full-process comparator accepted mismatched provenance: {bad_provenance!r}")
+
+        bad_mirror_provenance = (
+            f"{'a' * 40}\t{'b' * 64}\thttps://github.com/Pascu-Victor/wos.git\t{'c' * 40}\t1\t{'e' * 64}\t0"
+        )
+        wos_runs.write_text(
+            runs_header + f"1\t1100\t0\t0\t1\t{bad_mirror_provenance}\n",
+            encoding="ascii",
+        )
+        linux_runs.write_text(
+            runs_header + f"baseline\t1000\t0\t0\t1\t{bad_mirror_provenance}\n",
+            encoding="ascii",
+        )
+        result = subprocess.run(
+            [
+                str(SELFHOST_COMPARE),
+                "--wos-runs",
+                str(wos_runs),
+                "--linux-runs",
+                str(linux_runs),
+                "--acceptance-profile",
+                "full-process",
+            ],
+            cwd=ROOT,
+            check=False,
+            text=True,
+            capture_output=True,
+        )
+        if result.returncode == 0 or "mirror HEAD provenance" not in result.stderr:
+            fail("full-process comparator accepted a mirror HEAD different from the checkout commit")
 
         result = subprocess.run(
             [

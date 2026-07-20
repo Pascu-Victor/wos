@@ -889,17 +889,46 @@ acquire_workdir_lock() {
     trap selfhost_cleanup EXIT
 }
 
+canonical_path() {
+    python3 - "$1" <<'PY'
+import os
+import sys
+
+print(os.path.realpath(sys.argv[1]))
+PY
+}
+
 safe_prepare_workdir() {
+    local canonical_workdir
+    canonical_workdir="$(canonical_path "$workdir")"
+    if [ "$canonical_workdir" != "${workdir%/}" ]; then
+        echo "scratch workdir must be an absolute normalized path without symlink aliases: $workdir" >&2
+        exit 1
+    fi
+
     if [ -n "$source_cache" ]; then
-        case "${source_cache%/}" in
-            "$workdir"|"$workdir"/*)
+        local canonical_source_cache
+        canonical_source_cache="$(canonical_path "$source_cache")"
+        case "$canonical_source_cache" in
+            "$canonical_workdir"|"$canonical_workdir"/*)
                 echo "source cache must be outside the scratch workdir: $source_cache" >&2
                 exit 1
                 ;;
         esac
     fi
 
-    case "$workdir" in
+    if [ -n "$distdir" ]; then
+        local canonical_distdir
+        canonical_distdir="$(canonical_path "$distdir")"
+        case "$canonical_distdir" in
+            "$canonical_workdir"|"$canonical_workdir"/*)
+                echo "source distdir must be outside the scratch workdir: $distdir" >&2
+                exit 1
+                ;;
+        esac
+    fi
+
+    case "$canonical_workdir" in
         /tmp|/tmp/|/var/tmp|/var/tmp/)
             echo "refusing to replace temporary directory root: $workdir" >&2
             exit 1
@@ -1157,6 +1186,7 @@ bootstrap_toolchain() {
         cd "$checkout"
         WOS_BOOTSTRAP_DETAIL_TSV="$bootstrap_detail_report" \
             WOS_SOURCE_DISTDIR="$distdir" \
+            WOS_USE_CCACHE=0 \
             run_with_jobs_env ./tools/bootstrap.sh
     )
 }
@@ -1314,6 +1344,8 @@ log "bootstrap_detail_report=$bootstrap_detail_report"
 log "cache_diag_report=$cache_diag_report"
 log "host_toolchain=$host_toolchain"
 log "host_sysroot=$host_sysroot"
+log "distdir=$distdir"
+log "bootstrap_ccache=disabled"
 log "history_file=$history_file"
 log "log_dir=$log_dir"
 log "target=$target"
@@ -1636,6 +1668,7 @@ reject_whitespace "--mirror-http-prefix" "$mirror_http_prefix"
 reject_whitespace "--host-toolchain" "$host_toolchain"
 reject_whitespace "--host-sysroot" "$host_sysroot"
 reject_whitespace "--source-cache" "$source_cache"
+reject_whitespace "--distdir" "$distdir"
 
 case "$mode" in
     linux)
