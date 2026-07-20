@@ -331,9 +331,19 @@ def test_allocator_size_rounding_rejects_overflow_and_overmax_requests() -> None
             "if (alloc_ptr != nullptr)",
             "return alloc_ptr",
             "phys::page_alloc_huge(size)",
-            'phys::page_alloc_with_reclaim(size, "kmalloc_large")',
+            'phys::page_alloc_with_reclaim_may_fail(size, "kmalloc_large")',
         ],
         "large kmalloc backing must prefer order-0 virtual mappings before physical-contiguous fallbacks",
+    )
+    require_tokens(
+        function_body(kmalloc, "allocate_debug_block"),
+        ['phys::page_alloc_with_reclaim_may_fail(ALLOC_DEBUG_BLOCK_BYTES, "kmalloc_debug")'],
+        "optional kmalloc debug metadata must fail locally under memory pressure",
+    )
+    require_tokens(
+        function_body(kmalloc, "alloc_medium_backing"),
+        ['phys::page_alloc_with_reclaim_may_fail(size, "kmalloc_medium")'],
+        "medium kmalloc backing must return allocation failure without halting the system",
     )
 
     require_order(
@@ -489,6 +499,7 @@ def test_kernel_stacks_use_an_early_fixed_slot_pool() -> None:
             'auto kernel_stack_alloc(std::string_view name = "kernel_stack") -> void*;',
             "auto page_alloc_full_overwrite_may_fail(",
             "auto page_alloc_with_reclaim_may_fail(",
+            "auto page_alloc_full_overwrite_page_with_reclaim_may_fail(",
         ],
         "kernel stack pool public API",
     )
@@ -546,6 +557,11 @@ def test_kernel_stacks_use_an_early_fixed_slot_pool() -> None:
         function_body(phys, "page_alloc_with_reclaim_may_fail"),
         ["ReturnedPageZeroing::ZERO", "__builtin_return_address(0)", "retry_count", "false"],
         "kernel stack buddy fallback must return failure without the fatal OOM dump",
+    )
+    require_tokens(
+        function_body(phys, "page_alloc_full_overwrite_page_with_reclaim_may_fail"),
+        ["ReturnedPageZeroing::FULL_OVERWRITE", "__builtin_return_address(0)", "retry_count", "false"],
+        "recoverable full-overwrite page allocations must not enter the fatal OOM dump",
     )
     require_order(
         function_body(phys, "release_kernel_stack_pool_slot"),

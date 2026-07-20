@@ -1597,6 +1597,11 @@ auto page_alloc_full_overwrite_page_with_reclaim(std::string_view name, uint32_t
                                         retry_count, true);
 }
 
+auto page_alloc_full_overwrite_page_with_reclaim_may_fail(std::string_view name, uint32_t retry_count) -> void* {
+    return page_alloc_with_reclaim_impl(paging::PAGE_SIZE, name, ReturnedPageZeroing::FULL_OVERWRITE, __builtin_return_address(0),
+                                        retry_count, false);
+}
+
 void init_kernel_stack_pool() {
     size_t arena_bytes = KERNEL_STACK_POOL_BYTES;
     void* backing = nullptr;

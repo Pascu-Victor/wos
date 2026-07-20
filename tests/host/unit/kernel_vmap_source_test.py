@@ -83,7 +83,7 @@ def main() -> None:
             "reserve_kernel_vmap_span(PAGE_COUNT, first_page)",
             "entry->present != 0 && entry->frame != 0",
             "continue",
-            "page_alloc_full_overwrite_page_with_reclaim(name)",
+            "page_alloc_full_overwrite_page_with_reclaim_may_fail(name)",
             "map_page(kernel_pagemap",
             "if (mapped_pages != PAGE_COUNT)",
             "queue_kernel_vmap_free(first_page, mapped_pages)",

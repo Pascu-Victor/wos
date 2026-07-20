@@ -125,6 +125,8 @@ auto page_alloc_with_reclaim_may_fail(uint64_t size = ker::mod::mm::paging::PAGE
                                       uint32_t retry_count = PAGE_ALLOC_RECLAIM_RETRY_DEFAULT) -> void*;
 auto page_alloc_full_overwrite_page_with_reclaim(std::string_view name = "full_overwrite",
                                                  uint32_t retry_count = PAGE_ALLOC_RECLAIM_RETRY_DEFAULT) -> void*;
+auto page_alloc_full_overwrite_page_with_reclaim_may_fail(std::string_view name = "full_overwrite",
+                                                          uint32_t retry_count = PAGE_ALLOC_RECLAIM_RETRY_DEFAULT) -> void*;
 auto page_alloc_huge(uint64_t size) -> void*;  // Try the optional huge page zone, if enabled.
 auto kernel_stack_alloc(std::string_view name = "kernel_stack") -> void*;
 void page_free(void* page);

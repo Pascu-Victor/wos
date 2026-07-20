@@ -775,7 +775,7 @@ def test_user_thread_tcbs_publish_nonzero_tid_before_user_execution() -> None:
     require_tokens(
         create_thread_body,
         [
-            'mm::phys::page_alloc(mm::paging::PAGE_SIZE, "thread_tls_page")',
+            'mm::phys::page_alloc_with_reclaim_may_fail(mm::paging::PAGE_SIZE, "thread_tls_page")',
             "free_mapped_user_range(page_table, TLS_VIRT_ADDR, TLS_VIRT_ADDR + offset);",
             "auto const INITIAL_TID = static_cast<uint32_t>(initial_tid);",
             "write_mapped_user_value(page_table, TCB_VIRT_ADDR + 0x18, INITIAL_TID)",

@@ -99,7 +99,7 @@ bool ensure_stack_backing(Thread* thread, mm::paging::PageTable* page_table, uin
             continue;
         }
 
-        void* page = mm::phys::page_alloc(mm::paging::PAGE_SIZE, "thread_stack_lazy");
+        void* page = mm::phys::page_alloc_with_reclaim_may_fail(mm::paging::PAGE_SIZE, "thread_stack_lazy");
         if (page == nullptr) {
             log::error("ensure_stack_backing: OOM backing stack page vaddr=0x%llx range=[0x%llx,0x%llx)",
                        static_cast<unsigned long long>(addr), static_cast<unsigned long long>(LOW), static_cast<unsigned long long>(HIGH));
@@ -183,7 +183,7 @@ Thread* create_thread(uint64_t stack_size, uint64_t tls_size, mm::paging::PageTa
     thread->magic = 0xDEADBEEF;
 
     for (uint64_t offset = 0; offset < ALIGNED_TOTAL_SIZE; offset += mm::paging::PAGE_SIZE) {
-        void* tls_page = mm::phys::page_alloc(mm::paging::PAGE_SIZE, "thread_tls_page");
+        void* tls_page = mm::phys::page_alloc_with_reclaim_may_fail(mm::paging::PAGE_SIZE, "thread_tls_page");
         if (tls_page == nullptr) {
             log::error("create_thread: failed to allocate TLS page offset=%llu total=%llu", static_cast<unsigned long long>(offset),
                        static_cast<unsigned long long>(ALIGNED_TOTAL_SIZE));

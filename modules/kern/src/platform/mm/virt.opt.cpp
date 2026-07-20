@@ -445,7 +445,10 @@ auto handle_lazy_vmem_fault(sched::task::Task* task, uint64_t vaddr, const pagin
             return OK;
         }
 
-        void* const PAGE = phys::page_alloc(paging::PAGE_SIZE, "lazy-vmem");
+        // This may run from a hardware page fault with interrupts disabled and
+        // lazy_vmem_lock held. Failure is process-local; never enter the fatal
+        // allocator dump or a yielding reclaim loop from this context.
+        void* const PAGE = phys::page_alloc_may_fail(paging::PAGE_SIZE, "lazy-vmem");
         if (PAGE == nullptr) {
             task->lazy_vmem_lock.unlock_irqrestore(IRQF);
             log::error("lazy vmem fault: OOM pid=%lu vaddr=0x%llx", task->pid, static_cast<unsigned long long>(PAGE_VADDR));
@@ -498,8 +501,8 @@ void record_cow_perf_event(sched::task::Task* task, perf::WkiPerfLocalVmemOp op,
 }
 
 auto alloc_cow_destination_page(bool full_overwrite) -> void* {
-    void* const PAGE = full_overwrite ? phys::page_alloc_full_overwrite_page_with_reclaim("cow_copy")
-                                      : phys::page_alloc_with_reclaim(paging::PAGE_SIZE, "cow_zero");
+    void* const PAGE = full_overwrite ? phys::page_alloc_full_overwrite_page_with_reclaim_may_fail("cow_copy")
+                                      : phys::page_alloc_with_reclaim_may_fail(paging::PAGE_SIZE, "cow_zero");
     if (PAGE != nullptr && !full_overwrite) {
         std::memset(PAGE, 0, paging::PAGE_SIZE);
     }
@@ -1609,7 +1612,6 @@ auto resolve_user_write_mapping(sched::task::Task* task, vaddr_t vaddr) -> UserW
     if (new_page == nullptr) {
         phys::page_ref_dec(old_virt, &cow_lookup);
         log::error("COW fault: OOM allocating new page for vaddr 0x%x", VADDR);
-        hcf();
         return UserWriteFaultStatus::NOT_WRITABLE;
     }
 
@@ -3017,7 +3019,7 @@ auto kernel_vmap_alloc(uint64_t size, std::string_view name) -> void* {
         if (entry != nullptr && entry->present != 0 && entry->frame != 0) {
             continue;
         }
-        void* frame = phys::page_alloc_full_overwrite_page_with_reclaim(name);
+        void* frame = phys::page_alloc_full_overwrite_page_with_reclaim_may_fail(name);
         if (frame == nullptr) {
             break;
         }
@@ -4305,7 +4307,7 @@ auto deep_copy_user_pagemap_cow(PageTable* src, PageTable* dst) -> bool {
                     uint64_t const PTE_FLAGS = PDE_RAW_VAL & ~(FRAME_MASK | PS_BIT);
 
                     for (size_t i1 = 0; i1 < PML2_ENTRY_NUMBER; i1++) {
-                        auto* sub = phys::page_alloc(paging::PAGE_SIZE, "cow_huge_sub");
+                        auto* sub = phys::page_alloc_with_reclaim_may_fail(paging::PAGE_SIZE, "cow_huge_sub");
                         if (sub == nullptr) {
                             // OOM: free already-allocated sub-pages and pml1
                             for (size_t j = 0; j < i1; j++) {
@@ -4367,7 +4369,7 @@ auto deep_copy_user_pagemap_cow(PageTable* src, PageTable* dst) -> bool {
                     void* data_virt = reinterpret_cast<void*>(addr::get_virt_pointer(DATA_PHYS));
 
                     if (EAGER_COPY_WRITABLE_PRIVATE && IS_WRITABLE_PRIVATE) {
-                        auto* child_page = phys::page_alloc_full_overwrite_page_with_reclaim("fork_copy");
+                        auto* child_page = phys::page_alloc_full_overwrite_page_with_reclaim_may_fail("fork_copy");
                         if (child_page == nullptr) {
                             return false;
                         }

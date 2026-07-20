@@ -319,7 +319,8 @@ def test_cow_write_resolution_serializes_pte_reference_consumption() -> None:
             "void* new_page = alloc_cow_destination_page(DESTINATION_FULL_OVERWRITE_BEFORE_EXPOSURE);",
             "CURRENT_PHYS == old_phys",
             "installed_private_page = true;",
-            "phys::page_ref_dec(old_virt, &cow_lookup);\n    phys::page_ref_dec(old_virt, &cow_lookup);",
+            "phys::page_ref_dec(old_virt, &cow_lookup);",
+            "if (old_mapping_refcounted)",
         ],
         "COW resolver locking and refcount protocol",
     )
@@ -397,12 +398,53 @@ def test_page_table_pool_duplicate_release_does_not_fall_through_to_page_free() 
     )
 
 
+def test_user_memory_pressure_does_not_enter_fatal_oom() -> None:
+    vmem = SYS_VMEM_CPP.read_text()
+    virt = VIRT_CPP.read_text()
+
+    require_tokens(
+        function_body(vmem, "file_mmap_cached_page_for_file"),
+        [
+            'page_alloc_full_overwrite_page_with_reclaim_may_fail("vmem-file-cache")',
+            'page_alloc_with_reclaim_may_fail(ker::mod::mm::paging::PAGE_SIZE, "vmem-file-cache")',
+        ],
+        "file mmap cache allocation pressure",
+    )
+    require_tokens(
+        function_body(virt, "alloc_cow_destination_page"),
+        [
+            'page_alloc_full_overwrite_page_with_reclaim_may_fail("cow_copy")',
+            'page_alloc_with_reclaim_may_fail(paging::PAGE_SIZE, "cow_zero")',
+        ],
+        "COW destination allocation pressure",
+    )
+    cow_body = function_body(virt, "resolve_user_write_mapping")
+    require_tokens(
+        cow_body,
+        [
+            "if (new_page == nullptr)",
+            "phys::page_ref_dec(old_virt, &cow_lookup);",
+            "return UserWriteFaultStatus::NOT_WRITABLE;",
+        ],
+        "COW allocation failure rollback",
+    )
+    cow_failure = block_between(cow_body, "if (new_page == nullptr)", "if (DESTINATION_FULL_OVERWRITE_BEFORE_EXPOSURE)", "COW OOM branch")
+    if "hcf()" in cow_failure:
+        fail("recoverable COW allocation failure must not halt the kernel")
+    require_tokens(
+        function_body(virt, "handle_lazy_vmem_fault"),
+        ['page_alloc_may_fail(paging::PAGE_SIZE, "lazy-vmem")'],
+        "IRQ-disabled anonymous lazy fault allocation",
+    )
+
+
 def main() -> None:
     test_munmap_and_mprotect_reject_overflowing_lengths()
     test_nonfixed_mmap_address_selection_is_reserved_before_mapping()
     test_owned_frame_tracking_is_disabled_off_the_fault_path()
     test_cow_write_resolution_serializes_pte_reference_consumption()
     test_page_table_pool_duplicate_release_does_not_fall_through_to_page_free()
+    test_user_memory_pressure_does_not_enter_fatal_oom()
     print("vmem mmap, owned-frame, and COW invariants hold")
 
 

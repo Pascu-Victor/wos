@@ -176,7 +176,7 @@ auto pop_debug_slot_locked() -> AllocDebugInfo* {
 }
 
 auto allocate_debug_block() -> AllocDebugBlock* {
-    return static_cast<AllocDebugBlock*>(phys::page_alloc_with_reclaim(ALLOC_DEBUG_BLOCK_BYTES, "kmalloc_debug"));
+    return static_cast<AllocDebugBlock*>(phys::page_alloc_with_reclaim_may_fail(ALLOC_DEBUG_BLOCK_BYTES, "kmalloc_debug"));
 }
 
 auto register_alloc_debug(uintptr_t caller, const char* tag) -> AllocDebugInfo* {
@@ -690,7 +690,7 @@ auto slab_size_to_idx(size_t slab_size) -> SlabClass {
     }
 }
 
-auto alloc_medium_backing(uint64_t size) -> void* { return phys::page_alloc_with_reclaim(size, "kmalloc_medium"); }
+auto alloc_medium_backing(uint64_t size) -> void* { return phys::page_alloc_with_reclaim_may_fail(size, "kmalloc_medium"); }
 
 auto alloc_large_backing(uint64_t size) -> void* {
     // Large C++ containers require contiguous virtual bytes, not contiguous
@@ -704,7 +704,7 @@ auto alloc_large_backing(uint64_t size) -> void* {
     if (alloc_ptr != nullptr) {
         return alloc_ptr;
     }
-    return phys::page_alloc_with_reclaim(size, "kmalloc_large");
+    return phys::page_alloc_with_reclaim_may_fail(size, "kmalloc_large");
 }
 
 auto checked_page_rounded_alloc_size(uint64_t payload_size, uint64_t header_size, uint64_t& out_rounded_size) -> bool {

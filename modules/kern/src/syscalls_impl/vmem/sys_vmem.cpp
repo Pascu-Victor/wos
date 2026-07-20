@@ -816,8 +816,9 @@ auto file_mmap_cached_page_for_file(ker::vfs::File* file, const ker::vfs::Stat& 
     uint64_t const FILE_SIZE = KEY.size;
     bool const FULL_PAGE_READ =
         file_offset < FILE_SIZE && FILE_SIZE - file_offset >= static_cast<uint64_t>(ker::mod::mm::paging::PAGE_SIZE);
-    void* const NEW_PAGE = FULL_PAGE_READ ? ker::mod::mm::phys::page_alloc_full_overwrite_page("vmem-file-cache")
-                                          : ker::mod::mm::phys::page_alloc(ker::mod::mm::paging::PAGE_SIZE, "vmem-file-cache");
+    void* const NEW_PAGE = FULL_PAGE_READ
+                               ? ker::mod::mm::phys::page_alloc_full_overwrite_page_with_reclaim_may_fail("vmem-file-cache")
+                               : ker::mod::mm::phys::page_alloc_with_reclaim_may_fail(ker::mod::mm::paging::PAGE_SIZE, "vmem-file-cache");
     if (NEW_PAGE == nullptr) {
         return false;
     }
@@ -1134,7 +1135,7 @@ auto get_anon_zero_page() -> void* {
         return EXISTING;
     }
 
-    void* const CANDIDATE = ker::mod::mm::phys::page_alloc(ker::mod::mm::paging::PAGE_SIZE, "vmem-zero");
+    void* const CANDIDATE = ker::mod::mm::phys::page_alloc_with_reclaim_may_fail(ker::mod::mm::paging::PAGE_SIZE, "vmem-zero");
     if (CANDIDATE == nullptr) {
         return nullptr;
     }
@@ -1332,7 +1333,7 @@ auto materialize_lazy_file_page_impl(ker::mod::sched::task::Task* task, const La
             return false;
         }
     } else {
-        page = ker::mod::mm::phys::page_alloc(ker::mod::mm::paging::PAGE_SIZE, "vmem-file-lazy");
+        page = ker::mod::mm::phys::page_alloc_with_reclaim_may_fail(ker::mod::mm::paging::PAGE_SIZE, "vmem-file-lazy");
         if (page == nullptr) {
             return false;
         }
@@ -1406,7 +1407,7 @@ auto materialize_reserved_page(ker::mod::sched::task::Task* task, uint64_t vaddr
         return true;
     }
 
-    void* const PHYS_PAGE = ker::mod::mm::phys::page_alloc(ker::mod::mm::paging::PAGE_SIZE, "vmem-reserve");
+    void* const PHYS_PAGE = ker::mod::mm::phys::page_alloc_with_reclaim_may_fail(ker::mod::mm::paging::PAGE_SIZE, "vmem-reserve");
     if (PHYS_PAGE == nullptr) {
         return false;
     }
@@ -1471,7 +1472,7 @@ auto private_anon_allocate(ker::mod::sched::task::Task* task, uint64_t vaddr, ui
 
     for (uint64_t i = 0; i < NUM_PAGES; i++) {
         auto current_vaddr = vaddr + (i * ker::mod::mm::paging::PAGE_SIZE);
-        void* const PHYS_PAGE = ker::mod::mm::phys::page_alloc(ker::mod::mm::paging::PAGE_SIZE, "vmem-anon");
+        void* const PHYS_PAGE = ker::mod::mm::phys::page_alloc_with_reclaim_may_fail(ker::mod::mm::paging::PAGE_SIZE, "vmem-anon");
         if (PHYS_PAGE == nullptr) {
             log::error("out of physical memory after mapping %llu/%llu anon pages", static_cast<unsigned long long>(mapped_pages),
                        static_cast<unsigned long long>(NUM_PAGES));
@@ -1885,7 +1886,7 @@ auto file_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags, 
     uint64_t mapped_pages = 0;
     for (uint64_t i = 0; i < NUM_PAGES; i++) {
         auto current_vaddr = vaddr + (i * ker::mod::mm::paging::PAGE_SIZE);
-        void* const PHYS_PAGE = ker::mod::mm::phys::page_alloc(ker::mod::mm::paging::PAGE_SIZE, "vmem-file");
+        void* const PHYS_PAGE = ker::mod::mm::phys::page_alloc_with_reclaim_may_fail(ker::mod::mm::paging::PAGE_SIZE, "vmem-file");
         if (PHYS_PAGE == nullptr) {
             ker::vfs::vfs_put_file(eager_file);
             rollback_mapped_pages(task, vaddr, mapped_pages);
