@@ -136,17 +136,20 @@ def test_nonfixed_mmap_address_selection_is_reserved_before_mapping() -> None:
     require_tokens(
         source,
         [
-            "ker::mod::sys::Mutex g_mmap_reserve_lock;",
+            "ker::mod::sys::Mutex g_shared_vmem_publication_lock;",
             "release_mmap_reservation(task, vaddr, size, HAS_ADDRESS_RESERVATION)",
         ],
         "mmap address reservation surface",
     )
+    if "g_mmap_reserve_lock" in source:
+        fail("mmap reservation must not nest a standalone sleeping mutex inside shared VM publication")
     require_tokens(
         reserve_body,
         [
-            "ker::mod::sys::MutexGuard guard(g_mmap_reserve_lock)",
+            "SharedVmemPublicationGuard publication_guard;",
             "uint64_t const VADDR = find_free_range(task, size, hint)",
-            "add_shared_vmem_range(task, VADDR, size, 0, 0)",
+            "update_shared_vmem_ranges_locked(",
+            "add_lazy_vmem_range(candidate, VADDR, size, 0, 0)",
             "out_vaddr = VADDR",
         ],
         "mmap reservation helper",
@@ -154,14 +157,15 @@ def test_nonfixed_mmap_address_selection_is_reserved_before_mapping() -> None:
     require_order(
         reserve_body,
         "uint64_t const VADDR = find_free_range(task, size, hint)",
-        "add_shared_vmem_range(task, VADDR, size, 0, 0)",
+        "add_lazy_vmem_range(candidate, VADDR, size, 0, 0)",
         "non-fixed mmap must publish a reservation before mapping work starts",
     )
     require_ordered_tokens(
         reserve_body,
         [
-            "if (!add_shared_vmem_range(task, VADDR, size, 0, 0))",
-            "(void)remove_shared_vmem_range(task, VADDR, size)",
+            "bool const RESERVED = update_shared_vmem_ranges_locked(",
+            "if (!RESERVED)",
+            "remove_lazy_vmem_range(candidate, VADDR, size)",
             "return ker::abi::vmem::VMEM_ENOMEM",
         ],
         "failed mmap reservation publication must roll back partial shared ranges",
@@ -456,8 +460,13 @@ def test_thread_publication_is_serialized_with_shared_vmem_updates() -> None:
     )
     require_tokens(
         function_body(vmem, "update_shared_vmem_ranges"),
-        ["SharedVmemPublicationGuard publication_guard;", "get_active_task_count()", "get_active_task_at_safe(i)"],
+        ["SharedVmemPublicationGuard publication_guard;", "update_shared_vmem_ranges_locked(task, std::move(update))"],
         "shared VM metadata update serialization",
+    )
+    require_tokens(
+        function_body(vmem, "update_shared_vmem_ranges_locked"),
+        ["get_active_task_count()", "get_active_task_at_safe(i)"],
+        "already-serialized shared VM metadata propagation",
     )
 
     create_case = block_between(

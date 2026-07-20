@@ -46,7 +46,6 @@ namespace {
 // Get the current task
 inline auto get_current_task() -> ker::mod::sched::task::Task* { return ker::mod::sched::get_current_task(); }
 
-ker::mod::sys::Mutex g_mmap_reserve_lock;
 ker::mod::sys::Mutex g_shared_vmem_publication_lock;
 
 constexpr bool ENABLE_WATCHED_MMAP_LOGS = false;
@@ -647,8 +646,7 @@ auto protect_lazy_vmem_range(ker::mod::sched::task::Task* task, uint64_t vaddr, 
 }
 
 template <typename Fn>
-auto update_shared_vmem_ranges(ker::mod::sched::task::Task* task, Fn update) -> bool {
-    SharedVmemPublicationGuard publication_guard;
+auto update_shared_vmem_ranges_locked(ker::mod::sched::task::Task* task, Fn update) -> bool {
     if (task == nullptr || task->pagemap == nullptr) {
         return update(task);
     }
@@ -675,6 +673,12 @@ auto update_shared_vmem_ranges(ker::mod::sched::task::Task* task, Fn update) -> 
         ok = update(task) && ok;
     }
     return ok;
+}
+
+template <typename Fn>
+auto update_shared_vmem_ranges(ker::mod::sched::task::Task* task, Fn update) -> bool {
+    SharedVmemPublicationGuard publication_guard;
+    return update_shared_vmem_ranges_locked(task, std::move(update));
 }
 
 auto remove_shared_vmem_range(ker::mod::sched::task::Task* task, uint64_t vaddr, uint64_t size) -> bool {
@@ -1247,7 +1251,7 @@ auto find_free_range(ker::mod::sched::task::Task* task, uint64_t size, uint64_t 
 auto reserve_free_mmap_range(ker::mod::sched::task::Task* task, uint64_t size, uint64_t hint, uint64_t& out_vaddr) -> uint64_t {
     out_vaddr = 0;
 
-    ker::mod::sys::MutexGuard guard(g_mmap_reserve_lock);
+    SharedVmemPublicationGuard publication_guard;
     uint64_t const VADDR = find_free_range(task, size, hint);
     if (VADDR == 0) {
         return ker::abi::vmem::VMEM_ENOMEM;
@@ -1255,8 +1259,11 @@ auto reserve_free_mmap_range(ker::mod::sched::task::Task* task, uint64_t size, u
 
     // Reserve the chosen range before returning it to the mapper. This closes
     // the check-then-map race between sibling threads that share a pagemap.
-    if (!add_shared_vmem_range(task, VADDR, size, 0, 0)) {
-        (void)remove_shared_vmem_range(task, VADDR, size);
+    bool const RESERVED = update_shared_vmem_ranges_locked(
+        task, [VADDR, size](ker::mod::sched::task::Task* candidate) { return add_lazy_vmem_range(candidate, VADDR, size, 0, 0); });
+    if (!RESERVED) {
+        (void)update_shared_vmem_ranges_locked(
+            task, [VADDR, size](ker::mod::sched::task::Task* candidate) { return remove_lazy_vmem_range(candidate, VADDR, size); });
         return ker::abi::vmem::VMEM_ENOMEM;
     }
 
