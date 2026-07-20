@@ -1619,13 +1619,25 @@ def test_native_wos_clang_port_stages_tablegen_for_next_self_host() -> None:
             'TARGET_C_INCLUDE_FLAGS="-isystem $HOST/lib/clang/22/include -isystem $TARGET_SYSROOT/include"',
             'TARGET_C_FLAGS="$TARGET_COMMON_FLAGS $TARGET_C_INCLUDE_FLAGS"',
             'TARGET_CXX_FLAGS="$TARGET_COMMON_FLAGS -std=c++23 -isystem $TARGET_SYSROOT/include/c++/v1 $TARGET_C_INCLUDE_FLAGS"',
-            "collect_wos_llvm_bin_outputs()",
+            "WOS_LLVM_REQUIRED_TOOLS=(",
+            '"clang-$CLANG_VERSION"',
+            '[ "$tool" = "ld.lld" ] && continue',
+            'WOS_LLVM_BIN_OUTPUTS+=("bin/$tool")',
             'ninja -C "$CLANG_BUILD" -j"$WOS_LLVM_NINJA_JOBS" "${WOS_LLVM_BIN_OUTPUTS[@]}"',
             "install_built_toolset",
+            'for name in "${WOS_LLVM_REQUIRED_TOOLS[@]}"; do',
+            "llvm-as",
+            "llvm-dis",
+            "llvm-link",
+            "llvm-size",
+            "llvm-strings",
+            "llvm-dwarfdump",
             "llvm-symbolizer",
             "llvm-config",
             "llvm-tblgen",
             "clang-tblgen",
+            "obj2yaml",
+            "yaml2obj",
             '-DLLVM_TABLEGEN="$HOST/bin/llvm-tblgen"',
             '-DCLANG_TABLEGEN="$HOST/bin/clang-tblgen"',
         ],
@@ -1633,6 +1645,8 @@ def test_native_wos_clang_port_stages_tablegen_for_next_self_host() -> None:
     )
     if "< <(" in source:
         fail("native WOS clang tool staging must not use Bash process substitution; WOS Bash rejects it")
+    if "collect_wos_llvm_bin_outputs" in source or 'for source in "$CLANG_BUILD/bin"/*' in source:
+        fail("native WOS clang build must not expand the required artifact set from every generated LLVM binary")
 
 
 def test_busybox_and_dropbear_scripts_honor_host_toolchain_override() -> None:
