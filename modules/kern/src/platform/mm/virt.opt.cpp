@@ -885,7 +885,6 @@ void wait_for_tlb_shootdown_completion(TlbShootdownRequest& request, uint64_t or
             TlbShootdownWaitSnapshot const SNAPSHOT = snapshot_tlb_shootdown_wait(request, core_count, generation);
             if (SNAPSHOT.missing_count == 0U) {
                 if (SNAPSHOT.pending != 0U) {
-                    log_tlb_shootdown_wait(request, origin_cpu, core_count, generation, time::get_us() - START_US, retries);
                     request.pending.store(0U, std::memory_order_release);
                 }
                 break;

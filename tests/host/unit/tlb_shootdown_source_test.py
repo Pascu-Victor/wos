@@ -102,6 +102,15 @@ def require_atomic_per_origin_protocol(source: str) -> None:
         if snippet not in wait_body:
             fail(f"shootdown wait loop must service incoming requests while spinning: {snippet}")
 
+    completed_branch = wait_body.find("if (SNAPSHOT.missing_count == 0U)")
+    completed_brace = wait_body.find("{", completed_branch)
+    completed_end = find_matching_brace(wait_body, completed_brace)
+    completed_body = wait_body[completed_brace + 1 : completed_end]
+    if "request.pending.store(0U, std::memory_order_release)" not in completed_body:
+        fail("completed shootdown branch must normalize a stale advisory pending count")
+    if "log_tlb_shootdown_wait" in completed_body or "log::" in completed_body or "dbg::" in completed_body:
+        fail("completed shootdown branch must not log while holding the global gate")
+
     handler_body = function_body(source, "tlb_shootdown_handler")
     if "service_tlb_shootdown_requests_for_cpu(cpu::current_cpu())" not in handler_body:
         fail("IPI handler must service pending shootdown requests for the interrupted CPU")
