@@ -1090,6 +1090,8 @@ auto wos_proc_clone_vm(uint64_t args_addr) -> uint64_t {
         cleanup_child();
         return static_cast<uint64_t>(-ENOMEM);
     }
+    parent->shares_user_pagemap = true;
+    child->shares_user_pagemap = true;
 
     auto* child_thread = new sched::threading::Thread();
     if (child_thread == nullptr) {

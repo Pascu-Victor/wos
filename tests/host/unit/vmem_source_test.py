@@ -10,6 +10,8 @@ SYS_VMEM_HPP = ROOT / "modules" / "kern" / "src" / "syscalls_impl" / "vmem" / "s
 THREAD_CONTROL_CPP = ROOT / "modules" / "kern" / "src" / "syscalls_impl" / "multiproc" / "threadControl.cpp"
 PROCESS_CPP = ROOT / "modules" / "kern" / "src" / "syscalls_impl" / "process" / "process.cpp"
 VIRT_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "mm" / "virt.opt.cpp"
+TASK_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "sched" / "task.cpp"
+TASK_HPP = ROOT / "modules" / "kern" / "src" / "platform" / "sched" / "task.hpp"
 
 
 def fail(message: str) -> None:
@@ -450,6 +452,8 @@ def test_thread_publication_is_serialized_with_shared_vmem_updates() -> None:
     vmem = SYS_VMEM_CPP.read_text()
     thread_control = THREAD_CONTROL_CPP.read_text()
     process = PROCESS_CPP.read_text()
+    task_source = TASK_CPP.read_text()
+    task_header = TASK_HPP.read_text()
 
     require_tokens(
         header,
@@ -478,6 +482,15 @@ def test_thread_publication_is_serialized_with_shared_vmem_updates() -> None:
         "stable shared VM metadata task snapshot",
     )
     shared_update = function_body(vmem, "update_shared_vmem_ranges_locked")
+    require_ordered_tokens(
+        shared_update,
+        [
+            "if (!task->shares_user_pagemap)",
+            "return update(task);",
+            "snapshot_active_task_lifetime_refs_if(MATCH_SIBLING, PAGEMAP, tasks, capacity)",
+        ],
+        "unshared pagemap metadata update fast path",
+    )
     if "get_active_task_count()" in shared_update or "get_active_task_at_safe(i)" in shared_update:
         fail("shared VM propagation must not iterate a mutable active-task array by count/index")
     if "find_active_task_lifetime_ref_if" in shared_update:
@@ -498,6 +511,21 @@ def test_thread_publication_is_serialized_with_shared_vmem_updates() -> None:
         ],
         "thread lazy-range clone through scheduler publication",
     )
+    require_tokens(
+        task_header,
+        ["bool shares_user_pagemap = false;"],
+        "shared user pagemap marker",
+    )
+    require_ordered_tokens(
+        task_source,
+        [
+            "Task* Task::create_user_thread(Task* parent",
+            "clone_lazy_vmem_ranges(*t, *parent)",
+            "parent->shares_user_pagemap = true;",
+            "t->shares_user_pagemap = true;",
+        ],
+        "thread shared-pagemap marking",
+    )
 
     clone_vm = function_body(process, "wos_proc_clone_vm")
     require_ordered_tokens(
@@ -506,6 +534,8 @@ def test_thread_publication_is_serialized_with_shared_vmem_updates() -> None:
             "ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;",
             "child->pagemap = parent->pagemap;",
             "clone_lazy_vmem_ranges(*child, *parent)",
+            "parent->shares_user_pagemap = true;",
+            "child->shares_user_pagemap = true;",
             "post_task_balanced(child)",
         ],
         "clone-VM lazy-range clone through scheduler publication",

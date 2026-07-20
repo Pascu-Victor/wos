@@ -570,6 +570,11 @@ struct Task {
     // Thread exits must NOT free the pagemap or close shared FDs.
     bool is_thread = false;
 
+    // Monotonic marker set before publishing any task that shares this task's
+    // user pagemap. Shared-VM publication keeps false negatives impossible;
+    // retaining a true value after the last sibling exits is conservative.
+    bool shares_user_pagemap = false;
+
     // WKI: prefer inline delivery for remote compute placement (V2 A6.4).
     bool wki_prefer_inline = false;
 
