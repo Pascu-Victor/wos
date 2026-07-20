@@ -10,7 +10,6 @@
 
 #include "xfs_dir2.hpp"
 
-#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cerrno>
@@ -135,6 +134,10 @@ auto dir2_data_entsize(const XfsMountContext* ctx, uint8_t namelen) -> size_t {
     return (len + XFS_DIR2_DATA_ALIGN - 1) & ~(XFS_DIR2_DATA_ALIGN - 1);
 }
 
+auto dir2_data_first_offset(const XfsMountContext* ctx) -> size_t {
+    return sizeof(XfsDir3DataHdr) + dir2_data_entsize(ctx, 1) + dir2_data_entsize(ctx, 2);
+}
+
 // Read the inode number from a data entry
 auto dir2_data_entry_ino(const XfsDir2DataEntry* dep) -> xfs_ino_t { return dep->inumber.to_cpu(); }
 
@@ -186,72 +189,81 @@ auto sf_entry_size(const XfsDir2SfHdr* hdr, const XfsDir2SfEntry* sfep, bool has
     return sizeof(uint8_t) + 2 + sfep->namelen + (has_ftype ? 1 : 0) + xfs_dir2_sf_inumber_size(hdr);
 }
 
-auto sf_repair_offset_tags(uint8_t* data, size_t data_size, const XfsMountContext* ctx) -> bool {
+auto sf_repair_offset_tags(uint8_t* data, size_t data_size, const XfsMountContext* ctx) -> int {
     size_t hdr_size = 0;
     if (data == nullptr || ctx == nullptr || !dir2_sf_header_size_if_valid(data, data_size, &hdr_size)) {
-        return false;
+        return -EINVAL;
     }
 
     auto* hdr = reinterpret_cast<XfsDir2SfHdr*>(data);
     bool const HAS_FTYPE = xfs_has_ftype(ctx);
     uint8_t* ptr = data + hdr_size;
-    uint16_t previous = 0;
-    bool changed = false;
+    size_t next_offset = dir2_data_first_offset(ctx);
 
     for (uint8_t i = 0; i < hdr->count; i++) {
         if (ptr >= data + data_size) {
-            break;
+            return -EINVAL;
         }
 
         auto* sfep = reinterpret_cast<XfsDir2SfEntry*>(ptr);
         size_t const ENTRY_SIZE = sf_entry_size(hdr, sfep, HAS_FTYPE);
-        if (ENTRY_SIZE == 0 || ptr + ENTRY_SIZE > data + data_size) {
-            break;
+        if (sfep->namelen == 0 || ENTRY_SIZE == 0 || ptr + ENTRY_SIZE > data + data_size || next_offset > UINT16_MAX) {
+            return -EINVAL;
         }
 
-        uint16_t stored = sf_entry_stored_offset(sfep);
-        if (stored <= previous) {
-            if (previous == UINT16_MAX) {
-                break;
-            }
-            stored = static_cast<uint16_t>(previous + 1U);
-            sf_entry_store_offset(sfep, stored);
-            changed = true;
+        size_t stored = sf_entry_stored_offset(sfep);
+        if (stored < next_offset) {
+            stored = next_offset;
+            sf_entry_store_offset(sfep, static_cast<uint16_t>(stored));
         }
-        previous = stored;
+        next_offset = stored + dir2_data_entsize(ctx, sfep->namelen);
+        if (next_offset > UINT16_MAX) {
+            return -E2BIG;
+        }
         ptr += ENTRY_SIZE;
     }
 
-    return changed;
+    return ptr == data + data_size ? 0 : -EINVAL;
 }
 
-auto sf_next_offset_tag(const uint8_t* data, size_t data_size, const XfsMountContext* ctx) -> uint16_t {
+auto sf_next_offset_tag(const uint8_t* data, size_t data_size, const XfsMountContext* ctx, uint16_t* offset_out) -> int {
     size_t hdr_size = 0;
-    if (data == nullptr || ctx == nullptr || !dir2_sf_header_size_if_valid(data, data_size, &hdr_size)) {
-        return 1;
+    if (data == nullptr || ctx == nullptr || offset_out == nullptr || !dir2_sf_header_size_if_valid(data, data_size, &hdr_size)) {
+        return -EINVAL;
     }
 
     const auto* hdr = reinterpret_cast<const XfsDir2SfHdr*>(data);
     bool const HAS_FTYPE = xfs_has_ftype(ctx);
     const uint8_t* ptr = data + hdr_size;
-    uint16_t max_offset = 0;
+    size_t next_offset = dir2_data_first_offset(ctx);
 
     for (uint8_t i = 0; i < hdr->count; i++) {
         if (ptr >= data + data_size) {
-            break;
+            return -EINVAL;
         }
 
         const auto* sfep = reinterpret_cast<const XfsDir2SfEntry*>(ptr);
         size_t const ENTRY_SIZE = sf_entry_size(hdr, sfep, HAS_FTYPE);
-        if (ENTRY_SIZE == 0 || ptr + ENTRY_SIZE > data + data_size) {
-            break;
+        if (sfep->namelen == 0 || ENTRY_SIZE == 0 || ptr + ENTRY_SIZE > data + data_size) {
+            return -EINVAL;
         }
 
-        max_offset = std::max(max_offset, sf_entry_stored_offset(sfep));
+        size_t const STORED = sf_entry_stored_offset(sfep);
+        if (STORED < next_offset) {
+            return -EINVAL;
+        }
+        next_offset = STORED + dir2_data_entsize(ctx, sfep->namelen);
+        if (next_offset > UINT16_MAX) {
+            return -E2BIG;
+        }
         ptr += ENTRY_SIZE;
     }
 
-    return max_offset < UINT16_MAX ? static_cast<uint16_t>(max_offset + 1U) : static_cast<uint16_t>(hdr->count + 1U);
+    if (ptr != data + data_size) {
+        return -EINVAL;
+    }
+    *offset_out = static_cast<uint16_t>(next_offset);
+    return 0;
 }
 
 auto data_entry_cookie(const XfsMountContext* ctx, xfs_dir2_db_t db, size_t offset) -> uint64_t {
@@ -2213,8 +2225,15 @@ auto dir2_sf_addname(XfsInode* dp, const char* name, uint16_t namelen, xfs_ino_t
 
     // Copy existing data
     __builtin_memcpy(new_data, old_data, OLD_SIZE);
-    sf_repair_offset_tags(new_data, OLD_SIZE, ctx);
-    auto const OFF_VAL = sf_next_offset_tag(new_data, OLD_SIZE, ctx);
+    int rc = sf_repair_offset_tags(new_data, OLD_SIZE, ctx);
+    uint16_t off_val = 0;
+    if (rc == 0) {
+        rc = sf_next_offset_tag(new_data, OLD_SIZE, ctx, &off_val);
+    }
+    if (rc != 0) {
+        delete[] new_data;
+        return rc;
+    }
 
     // Update the header: increment count
     auto* new_hdr = reinterpret_cast<XfsDir2SfHdr*>(new_data);
@@ -2227,8 +2246,8 @@ auto dir2_sf_addname(XfsInode* dp, const char* name, uint16_t namelen, xfs_ino_t
     entry_ptr[0] = static_cast<uint8_t>(namelen);
     // Offset tags back readdir cookies.  Keep them monotonic across remove/add
     // churn so callers can resume after deleting previously returned names.
-    entry_ptr[1] = static_cast<uint8_t>(OFF_VAL >> 8U);
-    entry_ptr[2] = static_cast<uint8_t>(OFF_VAL & 0xffU);
+    entry_ptr[1] = static_cast<uint8_t>(off_val >> 8U);
+    entry_ptr[2] = static_cast<uint8_t>(off_val & 0xffU);
     // name
     __builtin_memcpy(entry_ptr + 3, name, namelen);
 
@@ -3034,7 +3053,11 @@ auto dir2_sf_removename(XfsInode* dp, const char* name, uint16_t namelen, XfsTra
     if (AFTER_OFFSET < OLD_SIZE) {
         __builtin_memcpy(new_data + entry_offset_start, old_data + AFTER_OFFSET, OLD_SIZE - AFTER_OFFSET);
     }
-    sf_repair_offset_tags(new_data, NEW_SIZE, ctx);
+    int const REPAIR_RC = sf_repair_offset_tags(new_data, NEW_SIZE, ctx);
+    if (REPAIR_RC != 0) {
+        delete[] new_data;
+        return REPAIR_RC;
+    }
 
     // Replace the data fork
     delete[] dp->data_fork.local.data;
@@ -3938,6 +3961,40 @@ auto xfs_selftest_shortform_readdir_cookies_are_monotonic() -> bool {
 
     int const RC = xfs_dir_iterate(&dir, callback, &check);
     return RC == 0 && check.ok && check.real_entries == 4;
+}
+
+auto xfs_selftest_shortform_offsets_match_data_layout() -> bool {
+    XfsMountContext mount{};
+    mount.inode_size = 512;
+    mount.feat_incompat = XFS_SB_FEAT_INCOMPAT_FTYPE;
+
+    std::array<uint8_t, 32> data{};
+    XfsInode dir{};
+    xfs_selftest_make_shortform_one_entry_dir(&mount, &dir, data, 100, 42);
+
+    auto* heap_data = new uint8_t[dir.data_fork.local.size];
+    if (heap_data == nullptr) {
+        return false;
+    }
+    std::memcpy(heap_data, dir.data_fork.local.data, dir.data_fork.local.size);
+    dir.data_fork.local.data = heap_data;
+
+    XfsTransaction tp{};
+    tp.mount = &mount;
+    if (xfs_dir_addname(&dir, "bar", 3, 84, XFS_DIR3_FT_REG_FILE, &tp) != 0) {
+        delete[] dir.data_fork.local.data;
+        return false;
+    }
+
+    const auto* hdr = reinterpret_cast<const XfsDir2SfHdr*>(dir.data_fork.local.data);
+    const auto* first = reinterpret_cast<const XfsDir2SfEntry*>(dir.data_fork.local.data + xfs_dir2_sf_hdr_size(hdr));
+    const auto* second =
+        reinterpret_cast<const XfsDir2SfEntry*>(reinterpret_cast<const uint8_t*>(first) + sf_entry_size(hdr, first, xfs_has_ftype(&mount)));
+    size_t const FIRST_OFFSET = dir2_data_first_offset(&mount);
+    bool const OK = hdr->count == 2 && sf_entry_stored_offset(first) == FIRST_OFFSET &&
+                    sf_entry_stored_offset(second) == FIRST_OFFSET + dir2_data_entsize(&mount, first->namelen);
+    delete[] dir.data_fork.local.data;
+    return OK;
 }
 
 auto xfs_selftest_shortform_readdir_resume_after_removals() -> bool {

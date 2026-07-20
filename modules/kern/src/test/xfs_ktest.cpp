@@ -254,6 +254,8 @@ KTEST(XFS, ShortformReaddirCookiesProgressAcrossDuplicateOffsets) {
     KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_shortform_readdir_cookies_are_monotonic());
 }
 
+KTEST(XFS, ShortformOffsetsMatchDataLayout) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_shortform_offsets_match_data_layout()); }
+
 KTEST(XFS, ShortformReaddirCookiesResumeAfterRemovals) {
     KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_shortform_readdir_resume_after_removals());
 }

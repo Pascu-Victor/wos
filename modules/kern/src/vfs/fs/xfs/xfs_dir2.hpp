@@ -121,6 +121,7 @@ auto xfs_selftest_dentry_cache_keeps_unrelated_dir_hot() -> bool;
 auto xfs_selftest_dentry_cache_add_keeps_sibling_hot() -> bool;
 auto xfs_selftest_dentry_cache_remove_keeps_sibling_hot() -> bool;
 auto xfs_selftest_shortform_readdir_cookies_are_monotonic() -> bool;
+auto xfs_selftest_shortform_offsets_match_data_layout() -> bool;
 auto xfs_selftest_shortform_readdir_resume_after_removals() -> bool;
 #endif
 
