@@ -9,6 +9,17 @@ struct Task;
 }  // namespace ker::mod::sched::task
 
 namespace ker::syscall::vmem {
+class SharedVmemPublicationGuard {
+   public:
+    SharedVmemPublicationGuard();
+    ~SharedVmemPublicationGuard();
+
+    SharedVmemPublicationGuard(const SharedVmemPublicationGuard&) = delete;
+    SharedVmemPublicationGuard(SharedVmemPublicationGuard&&) = delete;
+    auto operator=(const SharedVmemPublicationGuard&) -> SharedVmemPublicationGuard& = delete;
+    auto operator=(SharedVmemPublicationGuard&&) -> SharedVmemPublicationGuard& = delete;
+};
+
 struct FileMmapCacheStats {
     uint64_t pages;
     uint64_t bytes;

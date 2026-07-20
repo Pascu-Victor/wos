@@ -6,6 +6,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 SYS_VMEM_CPP = ROOT / "modules" / "kern" / "src" / "syscalls_impl" / "vmem" / "sys_vmem.cpp"
+SYS_VMEM_HPP = ROOT / "modules" / "kern" / "src" / "syscalls_impl" / "vmem" / "sys_vmem.hpp"
+THREAD_CONTROL_CPP = ROOT / "modules" / "kern" / "src" / "syscalls_impl" / "multiproc" / "threadControl.cpp"
 VIRT_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "mm" / "virt.opt.cpp"
 
 
@@ -438,6 +440,43 @@ def test_user_memory_pressure_does_not_enter_fatal_oom() -> None:
     )
 
 
+def test_thread_publication_is_serialized_with_shared_vmem_updates() -> None:
+    header = SYS_VMEM_HPP.read_text()
+    vmem = SYS_VMEM_CPP.read_text()
+    thread_control = THREAD_CONTROL_CPP.read_text()
+
+    require_tokens(
+        header,
+        [
+            "class SharedVmemPublicationGuard",
+            "SharedVmemPublicationGuard();",
+            "~SharedVmemPublicationGuard();",
+        ],
+        "shared VM publication guard API",
+    )
+    require_tokens(
+        function_body(vmem, "update_shared_vmem_ranges"),
+        ["SharedVmemPublicationGuard publication_guard;", "get_active_task_count()", "get_active_task_at_safe(i)"],
+        "shared VM metadata update serialization",
+    )
+
+    create_case = block_between(
+        thread_control,
+        "case abi::multiproc::threadControlOps::THREAD_CREATE:",
+        "case abi::multiproc::threadControlOps::THREAD_EXIT:",
+        "thread creation syscall case",
+    )
+    require_ordered_tokens(
+        create_case,
+        [
+            "ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;",
+            "Task::create_user_thread(parent, tcb_va, user_sp, enter_va)",
+            "post_task_for_cpu(TARGET_CPU, t)",
+        ],
+        "thread lazy-range clone through scheduler publication",
+    )
+
+
 def main() -> None:
     test_munmap_and_mprotect_reject_overflowing_lengths()
     test_nonfixed_mmap_address_selection_is_reserved_before_mapping()
@@ -445,6 +484,7 @@ def main() -> None:
     test_cow_write_resolution_serializes_pte_reference_consumption()
     test_page_table_pool_duplicate_release_does_not_fall_through_to_page_free()
     test_user_memory_pressure_does_not_enter_fatal_oom()
+    test_thread_publication_is_serialized_with_shared_vmem_updates()
     print("vmem mmap, owned-frame, and COW invariants hold")
 
 

@@ -21,6 +21,7 @@
 #include "platform/dbg/dbg.hpp"
 #include "platform/smt/smt.hpp"
 #include "syscalls_impl/log/sys_log.hpp"
+#include "syscalls_impl/vmem/sys_vmem.hpp"
 
 namespace ker::syscall::multiproc {
 namespace {
@@ -186,6 +187,11 @@ auto thread_control(abi::multiproc::threadControlOps op, void* arg1, void* arg2,
                 return static_cast<uint64_t>(-EFAULT);
             }
 
+            // Serialize the lazy-range clone through scheduler publication with
+            // shared-address-space mmap/munmap/mprotect metadata propagation.
+            // The new thread must either clone a completed update or be visible
+            // to the next update's active-task snapshot.
+            ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;
             auto* t = mod::sched::task::Task::create_user_thread(parent, tcb_va, user_sp, enter_va);
             if (t == nullptr) {
                 return static_cast<uint64_t>(-ENOMEM);

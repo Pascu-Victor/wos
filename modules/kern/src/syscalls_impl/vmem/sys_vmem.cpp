@@ -47,6 +47,7 @@ namespace {
 inline auto get_current_task() -> ker::mod::sched::task::Task* { return ker::mod::sched::get_current_task(); }
 
 ker::mod::sys::Mutex g_mmap_reserve_lock;
+ker::mod::sys::Mutex g_shared_vmem_publication_lock;
 
 constexpr bool ENABLE_WATCHED_MMAP_LOGS = false;
 constexpr uint64_t WATCH_MMAP_VADDR = 0x00001000007da000ULL;
@@ -647,6 +648,7 @@ auto protect_lazy_vmem_range(ker::mod::sched::task::Task* task, uint64_t vaddr, 
 
 template <typename Fn>
 auto update_shared_vmem_ranges(ker::mod::sched::task::Task* task, Fn update) -> bool {
+    SharedVmemPublicationGuard publication_guard;
     if (task == nullptr || task->pagemap == nullptr) {
         return update(task);
     }
@@ -1956,6 +1958,10 @@ auto file_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags, 
 }
 
 }  // anonymous namespace
+
+SharedVmemPublicationGuard::SharedVmemPublicationGuard() { g_shared_vmem_publication_lock.lock(); }
+
+SharedVmemPublicationGuard::~SharedVmemPublicationGuard() { g_shared_vmem_publication_lock.unlock(); }
 
 auto materialize_lazy_file_page(ker::mod::sched::task::Task* task, const ker::mod::sched::task::LazyVmemRange& range, uint64_t page_vaddr,
                                 const ker::mod::mm::paging::PageFault& fault) -> bool {
