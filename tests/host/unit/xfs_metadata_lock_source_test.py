@@ -170,6 +170,55 @@ def test_metadata_mutators_are_serialized() -> None:
             fail(f"{name} must serialize XFS metadata mutations")
 
 
+def test_xfs_namespace_cache_publication_is_ordered() -> None:
+    source = VFS_CORE_CPP.read_text()
+    for token in [
+        "ker::mod::sys::Mutex g_xfs_namespace_publication_mutex;",
+        "class XfsNamespacePublicationGuard",
+        "g_xfs_namespace_publication_mutex.lock();",
+        "g_xfs_namespace_publication_mutex.unlock();",
+    ]:
+        if token not in source:
+            fail(f"VFS must define the XFS namespace publication guard: missing {token}")
+
+    for name in [
+        "vfs_open_resolved_for_task",
+        "vfs_open_file_impl",
+        "vfs_symlink_resolved_linkpath",
+        "vfs_mkdir_resolved_path",
+        "vfs_unlink_resolved_path",
+        "vfs_rmdir_resolved_path",
+        "vfs_rename_resolved_paths",
+        "vfs_link_resolved_paths",
+    ]:
+        if "XfsNamespacePublicationGuard namespace_publication_guard" not in function_body(source, name):
+            fail(f"{name} must order the XFS mutation with its VFS cache publication")
+
+    require_order(
+        function_body(source, "vfs_unlink_resolved_path"),
+        [
+            "XfsNamespacePublicationGuard namespace_publication_guard(mount);",
+            "xfs_unlink_path(",
+            "vfs_cache_notify_path_changed(resolved_path, nullptr);",
+            "metadata_cache_store_missing_path_on_current_mount(",
+        ],
+        "XFS unlink and its negative cache publication must remain ordered",
+    )
+
+
+def test_reused_directory_inode_starts_with_fresh_dentry_generation() -> None:
+    require_order(
+        function_body(XFS_VFS_CPP.read_text(), "xfs_mkdir_path"),
+        [
+            "rc = xfs_trans_commit(tp);",
+            "if (rc != 0)",
+            "xfs_dentry_cache_invalidate_dir(new_inode);",
+            "xfs_inode_cache_new(new_inode)",
+        ],
+        "a committed mkdir must discard dentry-cache state from an older inode incarnation",
+    )
+
+
 def test_known_absent_create_hint_requires_xfs_proof() -> None:
     core_source = VFS_CORE_CPP.read_text()
     open_body = function_body(XFS_VFS_CPP.read_text(), "xfs_open_path")
@@ -316,6 +365,8 @@ def main() -> None:
     test_metadata_guard_records_wait_and_hold_time()
     test_inode_io_lock_precedes_metadata_lock()
     test_metadata_mutators_are_serialized()
+    test_xfs_namespace_cache_publication_is_ordered()
+    test_reused_directory_inode_starts_with_fresh_dentry_generation()
     test_known_absent_create_hint_requires_xfs_proof()
     test_xfs_open_seeds_fstat_snapshot_without_second_metadata_lock()
     test_writer_serializes_metadata_but_releases_it_for_data_io()

@@ -5237,6 +5237,10 @@ auto xfs_mkdir_path(const char* fs_path, int mode, XfsMountContext* ctx, ker::vf
     if (statbuf != nullptr) {
         fill_stat(new_inode, statbuf);
     }
+    // An inode number may have belonged to a previously removed directory.
+    // Start the new directory incarnation with a fresh dentry generation so
+    // cached child names from that old incarnation cannot become visible.
+    xfs_dentry_cache_invalidate_dir(new_inode);
     size_t const DIR_PATH_LEN = xfs_known_path_len(fs_path, known_fs_path_len);
     xfs_path_inode_cache_invalidate_path(ctx, fs_path, DIR_PATH_LEN);
     xfs_path_inode_cache_store(ctx, fs_path, DIR_PATH_LEN, NEW_INO, XFS_DIR3_FT_DIR);

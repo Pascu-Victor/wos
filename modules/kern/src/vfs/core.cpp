@@ -334,6 +334,38 @@ std::atomic<uint64_t> g_metadata_invalidation_generation{1};
 std::atomic<uint64_t> g_metadata_subtree_invalidation_generation{1};
 std::deque<AdvisoryLock> g_advisory_locks;
 ker::mod::sys::Mutex g_advisory_lock_mutex;
+// XFS serializes its on-disk namespace updates internally, but VFS publishes
+// the corresponding cache invalidation after the backend call returns. Keep
+// those two halves ordered so an older create cannot publish after a newer
+// unlink (or vice versa).
+ker::mod::sys::Mutex g_xfs_namespace_publication_mutex;
+
+class XfsNamespacePublicationGuard {
+   public:
+    explicit XfsNamespacePublicationGuard(const MountPoint* mount, bool active = true)
+        : locked(active && mount != nullptr && mount->fs_type == FSType::XFS) {
+        if (locked) {
+            g_xfs_namespace_publication_mutex.lock();
+        }
+    }
+
+    ~XfsNamespacePublicationGuard() { unlock(); }
+
+    XfsNamespacePublicationGuard(const XfsNamespacePublicationGuard&) = delete;
+    XfsNamespacePublicationGuard(XfsNamespacePublicationGuard&&) = delete;
+    auto operator=(const XfsNamespacePublicationGuard&) -> XfsNamespacePublicationGuard& = delete;
+    auto operator=(XfsNamespacePublicationGuard&&) -> XfsNamespacePublicationGuard& = delete;
+
+    void unlock() {
+        if (locked) {
+            g_xfs_namespace_publication_mutex.unlock();
+            locked = false;
+        }
+    }
+
+   private:
+    bool locked;
+};
 
 std::atomic<uint64_t> g_vfs_metadata_hits{0};
 std::atomic<uint64_t> g_vfs_metadata_misses{0};
@@ -7783,6 +7815,7 @@ auto vfs_open_resolved_for_task(ker::mod::sched::task::Task* task, const char* r
 
     ker::vfs::File* f = nullptr;
     int backend_open_result = -ENOSYS;
+    XfsNamespacePublicationGuard namespace_publication_guard(mount, (backend_flags & (ker::vfs::O_CREAT | ker::vfs::O_TRUNC)) != 0);
 
     // Route to the appropriate filesystem driver based on mount point
     switch (mount->fs_type) {
@@ -7906,6 +7939,7 @@ auto vfs_open_resolved_for_task(ker::mod::sched::task::Task* task, const char* r
         file_stat_snapshot_refresh(f);
     }
     metadata_cache_store_opened_file_stat_or_hints(f, mount);
+    namespace_publication_guard.unlock();
 
     int const FD = vfs_install_open_file(task, f);
     if (FD < 0) {
@@ -9027,6 +9061,7 @@ auto vfs_symlink_resolved_linkpath(const char* target, const char* abs_linkpath,
     }
 
     if (mount->fs_type == FSType::XFS) {
+        XfsNamespacePublicationGuard namespace_publication_guard(mount);
         const char* fs_path = strip_mount_prefix(mount, abs_linkpath);
         size_t const FS_PATH_LEN = strip_mount_prefix_len(mount, abs_linkpath, known_abs_linkpath_len);
         Stat link_stat{};
@@ -9841,6 +9876,7 @@ auto vfs_mkdir_resolved_path(const char* abs_path, int mode, size_t known_abs_pa
     }
 
     if (mount->fs_type == FSType::XFS) {
+        XfsNamespacePublicationGuard namespace_publication_guard(mount);
         auto* xctx = static_cast<ker::vfs::xfs::XfsMountContext*>(mount->private_data);
         Stat created_stat{};
         int const R = ker::vfs::xfs::xfs_mkdir_path(fs_path, mode, xctx, &created_stat, FS_PATH_LEN);
@@ -12487,6 +12523,7 @@ auto vfs_unlink_resolved_path(const char* resolved_path, size_t known_resolved_p
     size_t const FS_PATH_LEN = strip_mount_prefix_len(mount, resolved_path, known_resolved_path_len);
 
     if (mount->fs_type == FSType::XFS) {
+        XfsNamespacePublicationGuard namespace_publication_guard(mount);
         const char* fs_path = strip_mount_prefix(mount, resolved_path);
         int const RET =
             ker::vfs::xfs::xfs_unlink_path(fs_path, static_cast<ker::vfs::xfs::XfsMountContext*>(mount->private_data), FS_PATH_LEN);
@@ -12642,6 +12679,7 @@ auto vfs_rmdir_resolved_path(const char* resolved_path, size_t known_resolved_pa
     }
 
     if (mount->fs_type == FSType::XFS) {
+        XfsNamespacePublicationGuard namespace_publication_guard(mount);
         const char* fs_path = strip_mount_prefix(mount, resolved_path);
         int const RET =
             ker::vfs::xfs::xfs_rmdir_path(fs_path, static_cast<ker::vfs::xfs::XfsMountContext*>(mount->private_data), FS_PATH_LEN);
@@ -12837,6 +12875,7 @@ auto vfs_rename_resolved_paths(const char* old_resolved_path, const char* new_re
     }
 
     if (old_mount->fs_type == FSType::XFS && new_mount->fs_type == FSType::XFS && old_mount == new_mount) {
+        XfsNamespacePublicationGuard namespace_publication_guard(old_mount);
         Stat renamed_stat{};
         size_t const OLD_FS_PATH_LEN = strip_mount_prefix_len(old_mount, old_resolved_path, known_old_resolved_path_len);
         size_t const NEW_FS_PATH_LEN = strip_mount_prefix_len(new_mount, new_resolved_path, known_new_resolved_path_len);
@@ -19377,6 +19416,7 @@ static auto vfs_open_file_impl(const char* path, int flags, int mode, bool resol
 
     File* f = nullptr;
     int backend_open_result = -ENOSYS;
+    XfsNamespacePublicationGuard namespace_publication_guard(mount, (backend_flags & (ker::vfs::O_CREAT | ker::vfs::O_TRUNC)) != 0);
 
     switch (mount->fs_type) {
         case FSType::DEVFS:
@@ -19471,6 +19511,7 @@ static auto vfs_open_file_impl(const char* path, int flags, int mode, bool resol
         vfs_open_store_missing_metadata_result(pathBuffer, mount, flags, OPEN_REQUIRE_DIRECTORY, backend_open_result, path_buffer_len,
                                                path_buffer_hash);
     }
+    namespace_publication_guard.unlock();
 
     return f;
 }
@@ -19815,6 +19856,7 @@ auto vfs_link_resolved_paths(const char* old_abs_path, const char* new_abs_path)
     }
 
     if (old_mount->fs_type == FSType::XFS) {
+        XfsNamespacePublicationGuard namespace_publication_guard(old_mount);
         const char* old_fs = strip_mount_prefix(old_mount, old_abs_path);
         const char* new_fs = strip_mount_prefix(new_mount, new_abs_path);
         size_t const OLD_FS_LEN = strip_mount_prefix_len(old_mount, old_abs_path, UNKNOWN_PATH_LEN);
