@@ -110,6 +110,35 @@ def require_atomic_per_origin_protocol(source: str) -> None:
         fail("completed shootdown branch must normalize a stale advisory pending count")
     if "log_tlb_shootdown_wait" in completed_body or "log::" in completed_body or "dbg::" in completed_body:
         fail("completed shootdown branch must not log while holding the global gate")
+    for forbidden in ["log_tlb_shootdown_wait", "log::", "dbg::"]:
+        if forbidden in wait_body:
+            fail(f"shootdown completion wait must remain log-free while holding the global gate: {forbidden}")
+
+    gate_body = function_body(source, "acquire_tlb_shootdown_gate")
+    irq_save = gate_body.find('asm volatile("pushfq; popq %0; cli"')
+    preempt_disable = gate_body.find("sched::preempt_disable_token_at", irq_save)
+    current_cpu = gate_body.find("cpu::current_cpu()", preempt_disable)
+    acquire = gate_body.find("tlb_shootdown_gate_owner.compare_exchange_weak", current_cpu)
+    if not (0 <= irq_save < preempt_disable < current_cpu < acquire):
+        fail("shootdown gate must mask interrupts before identifying and publishing its CPU owner")
+    for snippet in [
+        ".interrupt_flags = interrupt_flags",
+        "service_tlb_shootdown_requests_for_cpu(CPU_NO)",
+        "(interrupt_flags & cpu::GATE_IF_MASK) != 0U",
+        'asm volatile("sti" ::: "memory")',
+    ]:
+        if snippet not in gate_body:
+            fail(f"shootdown gate acquisition must preserve IRQ state and service requests while contended: {snippet}")
+    for forbidden in ["log::", "dbg::"]:
+        if forbidden in gate_body:
+            fail(f"shootdown gate contention must remain log-free: {forbidden}")
+
+    release_body = function_body(source, "release_tlb_shootdown_gate")
+    release_gate = release_body.find("tlb_shootdown_gate_owner.store(TLB_SHOOTDOWN_GATE_FREE, std::memory_order_release)")
+    enable_preempt = release_body.find("sched::preempt_enable_token_at", release_gate)
+    restore_irq = release_body.find("guard.interrupt_flags & cpu::GATE_IF_MASK", enable_preempt)
+    if not (0 <= release_gate < enable_preempt < restore_irq):
+        fail("shootdown gate release must publish availability before restoring preemption and IRQ state")
 
     handler_body = function_body(source, "tlb_shootdown_handler")
     if "service_tlb_shootdown_requests_for_cpu(cpu::current_cpu())" not in handler_body:

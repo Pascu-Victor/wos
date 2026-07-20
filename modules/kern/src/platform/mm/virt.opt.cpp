@@ -605,8 +605,6 @@ uint8_t tlb_shootdown_vector = 0;                         // NOLINT(cppcoreguide
 constexpr uint32_t TLB_SHOOTDOWN_GATE_FREE = 0;
 constexpr uint64_t TLB_SHOOTDOWN_RETRY_US = 1'000;
 constexpr uint64_t TLB_SHOOTDOWN_WAKE_RESCUE_US = 10'000;
-constexpr uint64_t TLB_SHOOTDOWN_LOG_FIRST_US = 50'000;
-constexpr uint64_t TLB_SHOOTDOWN_LOG_REPEAT_US = 1'000'000;
 
 struct TlbShootdownWaitSnapshot {
     uint64_t missing_mask_low{};
@@ -619,6 +617,7 @@ struct TlbShootdownWaitSnapshot {
 struct TlbShootdownGateGuard {
     sched::task::Task* preempt_owner{};
     uint64_t cpu_no{UINT64_MAX};
+    uint64_t interrupt_flags{};
     bool held{};
 };
 
@@ -757,27 +756,38 @@ void service_tlb_shootdown_requests_for_cpu(uint64_t cpu_no) {
 }
 
 auto acquire_tlb_shootdown_gate() -> TlbShootdownGateGuard {
-    uint64_t const START_US = time::get_us();
-    uint64_t next_log_us = START_US + TLB_SHOOTDOWN_LOG_FIRST_US;
     uint64_t spins = 0;
     bool counted_contention = false;
 
     for (;;) {
+        uint64_t interrupt_flags = 0;
+        asm volatile("pushfq; popq %0; cli" : "=r"(interrupt_flags)::"memory");
         auto* const PREEMPT_OWNER = sched::preempt_disable_token_at(reinterpret_cast<uint64_t>(__builtin_return_address(0)));
         uint64_t const CPU_NO = cpu::current_cpu();
         if (!cpu_slot_valid(CPU_NO)) {
             sched::preempt_enable_token_at(PREEMPT_OWNER, reinterpret_cast<uint64_t>(__builtin_return_address(0)));
+            if ((interrupt_flags & cpu::GATE_IF_MASK) != 0U) {
+                asm volatile("sti" ::: "memory");
+            }
             return {};
         }
 
         auto const OWNER_ID = static_cast<uint32_t>(CPU_NO + 1U);
         uint32_t expected = TLB_SHOOTDOWN_GATE_FREE;
         if (tlb_shootdown_gate_owner.compare_exchange_weak(expected, OWNER_ID, std::memory_order_acq_rel, std::memory_order_acquire)) {
-            return TlbShootdownGateGuard{.preempt_owner = PREEMPT_OWNER, .cpu_no = CPU_NO, .held = true};
+            return TlbShootdownGateGuard{
+                .preempt_owner = PREEMPT_OWNER,
+                .cpu_no = CPU_NO,
+                .interrupt_flags = interrupt_flags,
+                .held = true,
+            };
         }
 
         service_tlb_shootdown_requests_for_cpu(CPU_NO);
         sched::preempt_enable_token_at(PREEMPT_OWNER, reinterpret_cast<uint64_t>(__builtin_return_address(0)));
+        if ((interrupt_flags & cpu::GATE_IF_MASK) != 0U) {
+            asm volatile("sti" ::: "memory");
+        }
 
         if (!counted_contention) {
             tlb_shootdown_gate_contentions.fetch_add(1, std::memory_order_relaxed);
@@ -786,15 +796,6 @@ auto acquire_tlb_shootdown_gate() -> TlbShootdownGateGuard {
 
         ++spins;
         if ((spins & 0xFFFU) == 0U) {
-            uint64_t const NOW_US = time::get_us();
-            if (NOW_US >= next_log_us) {
-                uint32_t const OWNER = tlb_shootdown_gate_owner.load(std::memory_order_acquire);
-                log::warn("tlb shootdown gate wait: cpu=%llu owner=%u elapsed_us=%llu spins=%llu contentions=%llu",
-                          static_cast<unsigned long long>(CPU_NO), OWNER, static_cast<unsigned long long>(NOW_US - START_US),
-                          static_cast<unsigned long long>(spins),
-                          static_cast<unsigned long long>(tlb_shootdown_gate_contentions.load(std::memory_order_relaxed)));
-                next_log_us = NOW_US + TLB_SHOOTDOWN_LOG_REPEAT_US;
-            }
             if (sched::preempt_count() == 0 && sched::interrupts_enabled()) {
                 sched::kern_yield();
             }
@@ -809,6 +810,9 @@ void release_tlb_shootdown_gate(TlbShootdownGateGuard& guard) {
         guard.held = false;
     }
     sched::preempt_enable_token_at(guard.preempt_owner, reinterpret_cast<uint64_t>(__builtin_return_address(0)));
+    if ((guard.interrupt_flags & cpu::GATE_IF_MASK) != 0U) {
+        asm volatile("sti" ::: "memory");
+    }
 }
 
 void send_tlb_shootdown_ipi(uint64_t cpu_no) {
@@ -848,29 +852,10 @@ void retry_tlb_shootdown_wait(TlbShootdownRequest& request, uint64_t core_count,
     }
 }
 
-void log_tlb_shootdown_wait(TlbShootdownRequest& request, uint64_t origin_cpu, uint64_t core_count, uint64_t generation,
-                            uint64_t elapsed_us, uint64_t retries) {
-    TlbShootdownWaitSnapshot const SNAPSHOT = snapshot_tlb_shootdown_wait(request, core_count, generation);
-    auto* current = sched::get_current_task();
-    log::warn(
-        "tlb shootdown wait: origin_cpu=%llu pid=%llu name=%s generation=%llu pending=%u missing=%u unclaimed=%u first_missing=%u "
-        "missing_low=0x%llx pagemap=%p vaddr=0x%llx reload=%u shared_kernel=%u elapsed_us=%llu retries=%llu late_acks=%llu",
-        static_cast<unsigned long long>(origin_cpu), static_cast<unsigned long long>(current != nullptr ? current->pid : 0),
-        current != nullptr && current->name != nullptr ? current->name : "?", static_cast<unsigned long long>(generation), SNAPSHOT.pending,
-        SNAPSHOT.missing_count, SNAPSHOT.unclaimed_count, SNAPSHOT.first_missing,
-        static_cast<unsigned long long>(SNAPSHOT.missing_mask_low), request.pagemap.load(std::memory_order_acquire),
-        static_cast<unsigned long long>(request.vaddr.load(std::memory_order_acquire)),
-        request.reload_cr3.load(std::memory_order_acquire) ? 1U : 0U, request.shared_kernel.load(std::memory_order_acquire) ? 1U : 0U,
-        static_cast<unsigned long long>(elapsed_us), static_cast<unsigned long long>(retries),
-        static_cast<unsigned long long>(tlb_shootdown_late_acks.load(std::memory_order_relaxed)));
-}
-
 void wait_for_tlb_shootdown_completion(TlbShootdownRequest& request, uint64_t origin_cpu, uint64_t generation, uint64_t core_count) {
     uint64_t const START_US = time::get_us();
     uint64_t next_retry_us = START_US + TLB_SHOOTDOWN_RETRY_US;
     uint64_t next_wake_rescue_us = START_US + TLB_SHOOTDOWN_WAKE_RESCUE_US;
-    uint64_t next_log_us = START_US + TLB_SHOOTDOWN_LOG_FIRST_US;
-    uint64_t retries = 0;
     uint64_t spins = 0;
 
     for (;;) {
@@ -894,15 +879,10 @@ void wait_for_tlb_shootdown_completion(TlbShootdownRequest& request, uint64_t or
             if (NOW_US >= next_retry_us) {
                 bool const WAKE_RESCUE = NOW_US >= next_wake_rescue_us;
                 retry_tlb_shootdown_wait(request, core_count, generation, WAKE_RESCUE);
-                ++retries;
                 next_retry_us = NOW_US + TLB_SHOOTDOWN_RETRY_US;
                 if (WAKE_RESCUE) {
                     next_wake_rescue_us = NOW_US + TLB_SHOOTDOWN_WAKE_RESCUE_US;
                 }
-            }
-            if (NOW_US >= next_log_us) {
-                log_tlb_shootdown_wait(request, origin_cpu, core_count, generation, NOW_US - START_US, retries);
-                next_log_us = NOW_US + TLB_SHOOTDOWN_LOG_REPEAT_US;
             }
         }
         asm volatile("pause" ::: "memory");
