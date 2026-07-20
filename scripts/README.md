@@ -24,7 +24,8 @@ symlink only if it is meant to be part of the user-facing command surface.
 `scripts/bench/run_wos_selfhost_build.sh` runs the clone/submodule/bootstrap/
 configure/build flow either inside an already-launched WOS VM or on Linux. It
 defaults to cloning `https://github.com/Pascu-Victor/wos.git`, building the
-`wos_full` target with Qt/wosdbg disabled, and writing
+`wos_full` target with Qt/wosdbg and host-only disk-image packaging disabled,
+and writing
 `selfhost-report.tsv`. It also writes `selfhost-detail.tsv` for the current
 run and appends the same detailed rows to `<workdir>-history.tsv` by default.
 In WOS mode it also writes `selfhost-cache-deltas.tsv` with VFS, XFS dentry,
@@ -97,10 +98,10 @@ scripts/bench/compare_wos_selfhost_reports.py \
   --json-output benchmarks/results/wos-selfhost-comparison.json
 ```
 
-For the checkout/configure parity acceptance check, include the detailed timing
-reports. This compares the derived `clone_checkout` time from root repository
-clone plus recursive submodule init/update, and `configure_wos`, with a strict
-WOS/Linux ratio of 1.0:
+For a checkout/configure diagnostic comparison, include the detailed timing
+reports. This profile compares the derived `clone_checkout` time from root
+repository clone plus recursive submodule init/update, and `configure_wos`,
+with a WOS/Linux ratio of 1.0. It is not the full-process acceptance check:
 
 ```sh
 scripts/bench/compare_wos_selfhost_reports.py \
@@ -109,8 +110,89 @@ scripts/bench/compare_wos_selfhost_reports.py \
   --wos-detail /root/wos-selfhost-bench/selfhost-detail.tsv \
   --linux-detail /tmp/wos-selfhost-linux/selfhost-detail.tsv \
   --acceptance-profile checkout-configure \
-  --json-output benchmarks/results/wos-selfhost-acceptance.json
+  --json-output benchmarks/results/wos-selfhost-checkout-configure-diagnostic.json
 ```
+
+### Repeated WOS self-host acceptance runs
+
+`scripts/bench/run_wos_selfhost_repeatability.sh` is the host-side evidence
+wrapper for repeated full builds. It runs 50 fresh self-host attempts by
+default in one already-booted WOS VM. Every attempt uses the normal shallow
+clone, runs `tools/bootstrap.sh`, configures a new `build-selfhost`, and builds
+`wos_full`; it never enables `--resume-checkout`, `--source-cache`, or
+`--skip-bootstrap`.
+
+Launch the self-host VM once, then start the repeatability run:
+
+```sh
+bin/wos-cluster --config configs/cluster_selfhost.json --launch --no-setup
+scripts/bench/run_wos_selfhost_repeatability.sh \
+  --output-dir benchmarks/results/wos-selfhost-repeat-50
+```
+
+The wrapper times the complete host-side command, including the guest workdir
+replacement that occurs before the runner's own timed phases. Before the next
+attempt replaces that workdir, it archives the current reports, bootstrap
+detail, submodule manifest, CMake cache, and command logs. It also saves the
+exact new byte range from `serial-vm0.log`, pins the serial-reported boot ID,
+records guest uptime and resource snapshots, rejects commit or submodule drift,
+and detects a reboot or serial-log reset. A failed attempt does not stop later
+attempts, but the final command returns nonzero unless all requested runs pass.
+
+The result directory contains:
+
+- `runs.tsv`: one machine-readable status row per attempt;
+- `summary.tsv` and `summary.json`: aggregate pass/fail evidence;
+- `runs/run-NNNN/`: console output, reports, guest snapshots, serial range,
+  serial matches, CMake cache, and `command-logs.tar` for that attempt.
+
+The required performance acceptance profile compares the complete outer
+command `wall_ms` recorded in WOS repeat and Linux baseline `runs.tsv`
+evidence. It enforces every WOS comparison at WOS/Linux <= 1.10:
+
+```sh
+scripts/bench/run_linux_selfhost_baseline.sh \
+  --expected-commit <commit-from-the-WOS-batch> \
+  --output-dir benchmarks/results/linux-selfhost-baseline
+scripts/bench/compare_wos_selfhost_reports.py \
+  --wos-runs benchmarks/results/wos-selfhost-repeat-50/runs.tsv \
+  --linux-runs benchmarks/results/linux-selfhost-baseline/runs.tsv \
+  --acceptance-profile full-process \
+  --json-output benchmarks/results/wos-selfhost-full-process-acceptance.json
+```
+
+`run_linux_selfhost_baseline.sh` runs 50 fresh attempts by default. Like the
+WOS wrapper, it delegates each attempt to `run_wos_selfhost_build.sh`, never
+uses resume, a source cache, `--skip-bootstrap`, or a prebuilt host toolchain,
+and records the outer wall clock around the runner invocation. It archives
+per-run command logs, all timing reports, bootstrap details, the CMake cache,
+root commit and recursive submodule manifest, plus before/after Linux host
+snapshots. Host reboot, source drift, command failure, or missing evidence
+rejects the affected batch while later attempts continue. Use the same job
+count, repository/mirror policy, and expected commit for the WOS and Linux
+batches.
+
+Both modes configure the benchmark target with host-only disk-image packaging
+disabled. The full sysroot and all kernel/userspace component artifacts are
+still built and verified, while the timed target graph stays identical across
+Linux and WOS.
+
+Linux evidence may contain one accepted baseline row, used for every WOS run,
+or the same number of rows as the WOS evidence for pairwise comparison. Every
+input row must have successful `runner_status` and `evidence_status` fields and
+`accepted=1`. The profile refuses `selfhost-report.tsv`: its `total` is an
+inner phase sum and does not include the complete outer command, including
+remote invocation and fresh-workdir preparation. The existing inner Linux
+reports alone are therefore not sufficient acceptance evidence.
+
+The default serial failure expression covers kernel OOM, XFS allocator/btree
+errors, kernel panic, KASan, and UBSan diagnostics. Use
+`--serial-fail-regex` only when a documented acceptance profile requires a
+different expression. Use `--expected-commit` when the accepted root commit is
+known in advance; otherwise the first observed commit becomes the batch
+baseline. Direct GitHub cloning remains the default. `--mirror-file` is
+available for iteration on a locally snapshotted tree, but mirror-backed runs
+must be identified as such in reported evidence.
 
 ## Cross-OS host KVM tracing
 

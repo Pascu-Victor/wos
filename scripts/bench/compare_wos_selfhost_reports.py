@@ -14,10 +14,12 @@ from typing import Any
 
 
 DEFAULT_STEPS = ("clone_sources", "build_wos", "total")
-ACCEPTANCE_PROFILE = "checkout-configure"
-ACCEPTANCE_STEPS = ("clone_checkout", "configure_wos")
+FULL_PROCESS_ACCEPTANCE_PROFILE = "full-process"
+CHECKOUT_CONFIGURE_DIAGNOSTIC_PROFILE = "checkout-configure"
+CHECKOUT_CONFIGURE_STEPS = ("clone_checkout", "configure_wos")
 DEFAULT_MAX_WOS_RATIO = 1.25
-ACCEPTANCE_MAX_WOS_RATIO = 1.0
+FULL_PROCESS_MAX_WOS_RATIO = 1.10
+CHECKOUT_CONFIGURE_MAX_WOS_RATIO = 1.0
 CLONE_CHECKOUT_EVENTS = (
     "clone:wos_repo",
     "clone:submodule_init",
@@ -135,6 +137,99 @@ def augment_with_detail(report: dict[str, int], detail_path: Path | None) -> dic
     return timings
 
 
+def read_outer_wall_runs(path: Path) -> list[dict[str, Any]]:
+    if not path.is_file():
+        fail(f"missing outer-wall run evidence: {path}")
+
+    runs: list[dict[str, Any]] = []
+    seen_runs: set[str] = set()
+    with path.open("r", encoding="utf-8", newline="") as file:
+        reader = csv.DictReader(file, delimiter="\t")
+        required_fields = {"run", "wall_ms", "runner_status", "evidence_status", "accepted"}
+        missing_fields = required_fields - set(reader.fieldnames or ())
+        if missing_fields:
+            fail(f"{path}: missing outer-wall fields: {', '.join(sorted(missing_fields))}")
+
+        for lineno, row in enumerate(reader, start=2):
+            run = row["run"].strip()
+            if not run:
+                fail(f"{path}:{lineno}: run identifier is empty")
+            if run in seen_runs:
+                fail(f"{path}:{lineno}: duplicate run identifier {run!r}")
+            seen_runs.add(run)
+
+            parsed: dict[str, int] = {}
+            for field in ("wall_ms", "runner_status", "evidence_status", "accepted"):
+                value = row[field].strip()
+                try:
+                    parsed[field] = int(value)
+                except ValueError:
+                    fail(f"{path}:{lineno}: {field} is not an integer: {value!r}")
+            if parsed["wall_ms"] < 0:
+                fail(f"{path}:{lineno}: wall_ms must be nonnegative")
+            if parsed["runner_status"] != 0:
+                fail(f"{path}:{lineno}: runner did not pass: {parsed['runner_status']}")
+            if parsed["evidence_status"] != 0:
+                fail(f"{path}:{lineno}: evidence collection did not pass: {parsed['evidence_status']}")
+            if parsed["accepted"] != 1:
+                fail(f"{path}:{lineno}: run is not accepted")
+
+            runs.append({"run": run, "wall_ms": parsed["wall_ms"]})
+
+    if not runs:
+        fail(f"{path}: no outer-wall run rows found")
+    return runs
+
+
+def compare_outer_wall_runs(
+    wos_runs: list[dict[str, Any]], linux_runs: list[dict[str, Any]], max_ratio: float
+) -> dict[str, Any]:
+    if len(linux_runs) == 1:
+        paired_linux_runs = linux_runs * len(wos_runs)
+    elif len(linux_runs) == len(wos_runs):
+        paired_linux_runs = linux_runs
+    else:
+        fail(
+            "full-process comparison requires one Linux baseline run or the same "
+            f"number of Linux and WOS runs (got Linux={len(linux_runs)}, WOS={len(wos_runs)})"
+        )
+
+    rows: list[dict[str, Any]] = []
+    failures: list[str] = []
+    for wos_run, linux_run in zip(wos_runs, paired_linux_runs, strict=True):
+        wos_ms = wos_run["wall_ms"]
+        linux_ms = linux_run["wall_ms"]
+        if linux_ms == 0:
+            ratio = 1.0 if wos_ms == 0 else math.inf
+        else:
+            ratio = wos_ms / linux_ms
+        passed = ratio <= max_ratio
+        step = f"outer_wall:{wos_run['run']}"
+        if not passed:
+            failures.append(f"{step}: WOS/Linux ratio {ratio:.3f} > {max_ratio:.3f}")
+        rows.append(
+            {
+                "step": step,
+                "wos_run": wos_run["run"],
+                "linux_run": linux_run["run"],
+                "wos_ms": wos_ms,
+                "linux_ms": linux_ms,
+                "ratio": ratio,
+                "pass": passed,
+            }
+        )
+
+    return {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "max_wos_ratio": max_ratio,
+        "metric": "complete_outer_wall_ms",
+        "steps": rows,
+        "missing": [],
+        "failures": failures,
+        "pass": not failures,
+    }
+
+
 def compare_reports(wos: dict[str, int], linux: dict[str, int], steps: list[str], max_ratio: float) -> dict[str, Any]:
     rows: list[dict[str, Any]] = []
     missing: list[str] = []
@@ -193,13 +288,15 @@ def print_text(result: dict[str, Any]) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--wos", required=True, type=Path, help="WOS selfhost-report.tsv")
-    parser.add_argument("--linux", required=True, type=Path, help="Linux selfhost-report.tsv")
+    parser.add_argument("--wos", type=Path, help="WOS inner selfhost-report.tsv")
+    parser.add_argument("--linux", type=Path, help="Linux inner selfhost-report.tsv")
+    parser.add_argument("--wos-runs", type=Path, help="WOS runs.tsv containing complete outer wall time")
+    parser.add_argument("--linux-runs", type=Path, help="Linux runs.tsv containing complete outer wall time")
     parser.add_argument(
         "--max-wos-ratio",
         type=positive_float,
         default=None,
-        help="maximum allowed WOS/Linux time ratio for required steps; default 1.25, or 1.0 with --acceptance-profile",
+        help="maximum allowed WOS/Linux ratio; full-process acceptance forbids values above 1.10",
     )
     parser.add_argument(
         "--steps",
@@ -211,8 +308,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--linux-detail", type=Path, help="Linux selfhost-detail.tsv for detail or derived steps")
     parser.add_argument(
         "--acceptance-profile",
-        choices=(ACCEPTANCE_PROFILE,),
-        help="strict goal check: compare clone_checkout and configure_wos at WOS/Linux ratio <= 1.0",
+        choices=(FULL_PROCESS_ACCEPTANCE_PROFILE, CHECKOUT_CONFIGURE_DIAGNOSTIC_PROFILE),
+        help="full-process checks complete outer wall time at <=1.10; checkout-configure is a diagnostic profile",
     )
     parser.add_argument("--json-output", type=Path, help="write comparison evidence as JSON")
     return parser
@@ -220,22 +317,50 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    if args.acceptance_profile == ACCEPTANCE_PROFILE:
-        if args.wos_detail is None or args.linux_detail is None:
-            fail(f"--acceptance-profile {ACCEPTANCE_PROFILE} requires --wos-detail and --linux-detail")
-        if args.steps is None:
-            args.steps = list(ACCEPTANCE_STEPS)
+    if args.acceptance_profile == FULL_PROCESS_ACCEPTANCE_PROFILE:
+        if args.wos_runs is None or args.linux_runs is None:
+            fail(
+                f"--acceptance-profile {FULL_PROCESS_ACCEPTANCE_PROFILE} requires "
+                "--wos-runs and --linux-runs; inner selfhost-report.tsv totals do not include complete outer wall time"
+            )
+        if args.wos is not None or args.linux is not None or args.wos_detail is not None or args.linux_detail is not None:
+            fail("full-process acceptance uses outer runs.tsv evidence, not inner timing reports")
+        if args.steps is not None:
+            fail("full-process acceptance always compares complete outer wall time; --steps is not allowed")
         if args.max_wos_ratio is None:
-            args.max_wos_ratio = ACCEPTANCE_MAX_WOS_RATIO
+            args.max_wos_ratio = FULL_PROCESS_MAX_WOS_RATIO
+        elif args.max_wos_ratio > FULL_PROCESS_MAX_WOS_RATIO:
+            fail(
+                f"full-process acceptance ratio cannot exceed {FULL_PROCESS_MAX_WOS_RATIO:.2f}: "
+                f"{args.max_wos_ratio:.3f}"
+            )
+        result = compare_outer_wall_runs(
+            read_outer_wall_runs(args.wos_runs), read_outer_wall_runs(args.linux_runs), args.max_wos_ratio
+        )
     else:
-        if args.steps is None:
-            args.steps = list(DEFAULT_STEPS)
-        if args.max_wos_ratio is None:
-            args.max_wos_ratio = DEFAULT_MAX_WOS_RATIO
+        if args.wos is None or args.linux is None:
+            fail("inner timing comparison requires --wos and --linux")
 
-    wos = augment_with_detail(read_report(args.wos), args.wos_detail)
-    linux = augment_with_detail(read_report(args.linux), args.linux_detail)
-    result = compare_reports(wos, linux, args.steps, args.max_wos_ratio)
+        if args.acceptance_profile == CHECKOUT_CONFIGURE_DIAGNOSTIC_PROFILE:
+            if args.wos_detail is None or args.linux_detail is None:
+                fail(
+                    f"--acceptance-profile {CHECKOUT_CONFIGURE_DIAGNOSTIC_PROFILE} requires "
+                    "--wos-detail and --linux-detail"
+                )
+            if args.steps is None:
+                args.steps = list(CHECKOUT_CONFIGURE_STEPS)
+            if args.max_wos_ratio is None:
+                args.max_wos_ratio = CHECKOUT_CONFIGURE_MAX_WOS_RATIO
+        else:
+            if args.steps is None:
+                args.steps = list(DEFAULT_STEPS)
+            if args.max_wos_ratio is None:
+                args.max_wos_ratio = DEFAULT_MAX_WOS_RATIO
+
+        wos = augment_with_detail(read_report(args.wos), args.wos_detail)
+        linux = augment_with_detail(read_report(args.linux), args.linux_detail)
+        result = compare_reports(wos, linux, args.steps, args.max_wos_ratio)
+
     if args.acceptance_profile is not None:
         result["acceptance_profile"] = args.acceptance_profile
 

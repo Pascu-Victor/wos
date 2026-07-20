@@ -1188,13 +1188,11 @@ configure_wos() {
         -DWOS_BUILD_HOST_TOOLS=OFF \
         -DWOS_BUILD_CMAKE_FOR_HOST=OFF \
         -DWOS_USE_CCACHE=OFF \
+        -DWOS_BUILD_DISK_IMAGES=OFF \
         -DWOS_ASSUME_BOOTSTRAPPED_TOOLCHAIN=ON)
     if [ -n "$host_toolchain" ]; then
         cmake_args+=("-DWOS_HOST_TOOLCHAIN_PATH=$host_toolchain")
         cmake_args+=("-DWOS_SYSROOT_PATH=$host_sysroot")
-    fi
-    if [ "$mode" = "wos" ]; then
-        cmake_args+=(-DWOS_BUILD_DISK_IMAGES=OFF)
     fi
     run_with_jobs_env "${cmake_args[@]}"
 }

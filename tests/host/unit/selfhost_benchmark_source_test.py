@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 
+import csv
 import json
+import os
 import subprocess
 import tempfile
 from pathlib import Path
@@ -8,6 +10,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 SELFHOST_RUNNER = ROOT / "scripts" / "bench" / "run_wos_selfhost_build.sh"
+SELFHOST_REPEATABILITY = ROOT / "scripts" / "bench" / "run_wos_selfhost_repeatability.sh"
+SELFHOST_LINUX_BASELINE = ROOT / "scripts" / "bench" / "run_linux_selfhost_baseline.sh"
 SELFHOST_COMPARE = ROOT / "scripts" / "bench" / "compare_wos_selfhost_reports.py"
 SELFHOST_CLUSTER = ROOT / "configs" / "cluster_selfhost.json"
 GIT_MIRROR = ROOT / "scripts" / "dev" / "git_mirror_for_wos.sh"
@@ -80,6 +84,16 @@ def test_selfhost_runner_covers_acceptance_flow() -> None:
         "WOS self-host benchmark acceptance flow",
     )
 
+    configure_start = source.find("configure_wos()")
+    configure_end = source.find("build_wos()", configure_start)
+    configure_block = source[configure_start:configure_end]
+    if configure_start < 0 or configure_end < 0:
+        fail("self-host benchmark configure flow is missing")
+    if configure_block.count("-DWOS_BUILD_DISK_IMAGES=OFF") != 1:
+        fail("self-host benchmark must disable host-only disk packaging in both operating systems")
+    if 'if [ "$mode" = "wos" ]' in configure_block:
+        fail("self-host benchmark Linux and WOS configure target graphs diverge")
+
 
 def test_selfhost_runner_locks_workdir_before_replacing_it() -> None:
     source = SELFHOST_RUNNER.read_text()
@@ -106,6 +120,258 @@ def test_selfhost_runner_locks_workdir_before_replacing_it() -> None:
     remove_pos = source.find('rm -rf -- "$workdir"', lock_pos)
     if lock_pos < 0 or remove_pos < 0:
         fail("self-host benchmark must acquire the workdir lock before replacing the workdir")
+
+
+def test_selfhost_repeatability_runner_preserves_acceptance_evidence() -> None:
+    source = SELFHOST_REPEATABILITY.read_text()
+    require_tokens(
+        source,
+        [
+            "DEFAULT_RUNS=50",
+            'DEFAULT_WORKDIR="/root/wos-selfhost-bench"',
+            'DEFAULT_SERIAL_LOG="$WORKSPACE_ROOT/serial-vm0.log"',
+            'initial_boot_id="$(serial_boot_id || true)"',
+            "for ((run_number = 1; run_number <= runs; ++run_number))",
+            'runner_cmd=("$SELFHOST_RUNNER" wos --host "$host" --jobs "$jobs" --workdir "$workdir" --log-dir "$remote_log_dir"',
+            '--history-file "$remote_log_dir/selfhost-history.tsv")',
+            "runner_cmd+=(--heartbeat-sync)",
+            '"${runner_cmd[@]}" > "$console_log" 2>&1',
+            'expected_bytes=$((after - before))',
+            'iflag=skip_bytes,count_bytes',
+            'capture_serial_range "$serial_start" "$serial_end" "$run_dir/serial.log"',
+            'grep -Ein "$serial_fail_regex" "$run_dir/serial.log"',
+            "hung task|blocked for more than",
+            "allocation failure|allocator failure|failed to allocate",
+            "I/O error|input/output error",
+            "filesystem.*(corrupt|shutdown)",
+            "xfs.*(error|corrupt|shutdown|failed)",
+            'guest_output "git -C $(shell_quote "$checkout_path") rev-parse HEAD"',
+            'append_reason "commit_mismatch"',
+            'append_reason "submodule_manifest_mismatch"',
+            'append_reason "vm_boot_id_mismatch_during"',
+            'append_reason "vm_reboot_or_unreachable_during"',
+            "selfhost-report.tsv\tselfhost-report.tsv",
+            "bootstrap-detail.tsv\tbootstrap-detail.tsv",
+            "selfhost-cache-deltas.tsv\tselfhost-cache-deltas.tsv",
+            "wos/build-selfhost/CMakeCache.txt\tCMakeCache.txt",
+            'archive_guest_logs "$remote_log_dir" "$run_dir/command-logs.tar"',
+            'runs_tsv="$output_dir/runs.tsv"',
+            'summary_tsv="$output_dir/summary.tsv"',
+            'summary_json="$output_dir/summary.json"',
+            'json.dump(data, result, indent=2, sort_keys=True)',
+            'if [ "$overall_pass" -ne 1 ]; then',
+        ],
+        "WOS self-host repeatability evidence runner",
+    )
+
+    command_start = source.find('runner_cmd=("$SELFHOST_RUNNER"')
+    command_end = source.find('echo "[$run_label/$runs] start', command_start)
+    if command_start < 0 or command_end < 0:
+        fail("repeatability runner command construction is missing")
+    command_block = source[command_start:command_end]
+    for forbidden in ("--resume-checkout", "--source-cache", "--skip-bootstrap"):
+        if forbidden in command_block:
+            fail(f"repeatability runner must keep every attempt fresh: {forbidden}")
+
+    help_result = subprocess.run(
+        ["bash", str(SELFHOST_REPEATABILITY), "--help"],
+        cwd=ROOT,
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+    if help_result.returncode != 0 or "flow 50" not in help_result.stdout:
+        fail(f"repeatability runner help failed: {help_result.stderr or help_result.stdout}")
+
+    invalid_result = subprocess.run(
+        ["bash", str(SELFHOST_REPEATABILITY), "--runs", "0"],
+        cwd=ROOT,
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+    if invalid_result.returncode == 0 or "--runs must be a positive integer" not in invalid_result.stderr:
+        fail("repeatability runner accepted an invalid run count")
+
+
+def test_linux_selfhost_baseline_preserves_full_process_evidence() -> None:
+    source = SELFHOST_LINUX_BASELINE.read_text()
+    require_tokens(
+        source,
+        [
+            "DEFAULT_RUNS=50",
+            'DEFAULT_WORKDIR="/tmp/wos-selfhost-linux-baseline"',
+            'DEFAULT_REPO="https://github.com/Pascu-Victor/wos.git"',
+            "for ((run_number = 1; run_number <= runs; ++run_number))",
+            'runner_cmd=("$SELFHOST_RUNNER" linux --jobs "$jobs" --workdir "$workdir" --repo "$repo"',
+            '--log-dir "$local_log_dir" --history-file "$local_history_file")',
+            "runner_cmd+=(--heartbeat-sync)",
+            'start_ms="$(now_ms)"',
+            '"${runner_cmd[@]}" > "$console_log" 2>&1',
+            'end_ms="$(now_ms)"',
+            'wall_ms=$((end_ms - start_ms))',
+            'commit="$(git -C "$checkout_path" rev-parse HEAD',
+            'append_reason "commit_mismatch"',
+            'append_reason "submodule_manifest_mismatch"',
+            'append_reason "linux_boot_id_mismatch_during"',
+            "selfhost-report.tsv\tselfhost-report.tsv",
+            "bootstrap-detail.tsv\tbootstrap-detail.tsv",
+            "selfhost-history.tsv\tselfhost-history.tsv",
+            "wos/build-selfhost/CMakeCache.txt\tCMakeCache.txt",
+            'archive_command_logs "$local_log_dir" "$run_dir/command-logs.tar"',
+            'runs_tsv="$output_dir/runs.tsv"',
+            'summary_tsv="$output_dir/summary.tsv"',
+            'summary_json="$output_dir/summary.json"',
+            '"run" "start_utc" "end_utc" "wall_ms" "runner_status" "evidence_status"',
+            '"accepted" "commit" "submodules_sha256"',
+            'json.dump(data, result, indent=2, sort_keys=True)',
+            'if [ "$overall_pass" -ne 1 ]; then',
+        ],
+        "Linux full-process self-host baseline evidence runner",
+    )
+
+    command_start = source.find('runner_cmd=("$SELFHOST_RUNNER"')
+    command_end = source.find('echo "[$run_label/$runs] start', command_start)
+    if command_start < 0 or command_end < 0:
+        fail("Linux baseline runner command construction is missing")
+    command_block = source[command_start:command_end]
+    for forbidden in ("--resume-checkout", "--source-cache", "--skip-bootstrap", "--host-toolchain"):
+        if forbidden in command_block:
+            fail(f"Linux baseline must keep every full-process attempt fresh: {forbidden}")
+
+    timer_start = source.find('start_ms="$(now_ms)"', command_end)
+    invocation = source.find('"${runner_cmd[@]}" > "$console_log" 2>&1', timer_start)
+    timer_end = source.find('end_ms="$(now_ms)"', invocation)
+    if timer_start < 0 or invocation < timer_start or timer_end < invocation:
+        fail("Linux baseline outer clock does not enclose the complete runner invocation")
+
+    help_result = subprocess.run(
+        ["bash", str(SELFHOST_LINUX_BASELINE), "--help"],
+        cwd=ROOT,
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+    if help_result.returncode != 0 or "flow 50" not in help_result.stdout:
+        fail(f"Linux baseline help failed: {help_result.stderr or help_result.stdout}")
+
+    invalid_result = subprocess.run(
+        ["bash", str(SELFHOST_LINUX_BASELINE), "--runs", "0"],
+        cwd=ROOT,
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+    if invalid_result.returncode == 0 or "--runs must be a positive integer" not in invalid_result.stderr:
+        fail("Linux baseline accepted an invalid run count")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        fake_runner = tmp_path / "fake-selfhost-runner.sh"
+        fake_runner.write_text(
+            """#!/bin/bash
+set -euo pipefail
+
+mode="${1:-}"
+shift
+workdir=""
+log_dir=""
+history_file=""
+while (($# > 0)); do
+    case "$1" in
+        --workdir)
+            workdir="$2"
+            shift 2
+            ;;
+        --log-dir)
+            log_dir="$2"
+            shift 2
+            ;;
+        --history-file)
+            history_file="$2"
+            shift 2
+            ;;
+        --jobs|--repo|--mirror-file)
+            shift 2
+            ;;
+        --heartbeat-sync)
+            shift
+            ;;
+        *)
+            exit 64
+            ;;
+    esac
+done
+[ "$mode" = linux ]
+[ -n "$workdir" ]
+[ -n "$log_dir" ]
+[ -n "$history_file" ]
+rm -rf -- "$workdir"
+mkdir -p "$workdir"
+git clone -q --no-checkout "$FAKE_SOURCE_REPO" "$workdir/wos"
+mkdir -p "$workdir/wos/build-selfhost" "$log_dir"
+printf 'clone_sources\\t1\\nbuild_wos\\t1\\ntotal\\t2\\n' > "$workdir/selfhost-report.tsv"
+printf 'run_id\\ttimestamp_utc\\n' > "$workdir/selfhost-detail.tsv"
+printf 'phase\\telapsed_ms\\n' > "$workdir/bootstrap-detail.tsv"
+printf 'run_id\\ttimestamp_utc\\n' > "$workdir/selfhost-cache-deltas.tsv"
+printf 'run_id\\ttimestamp_utc\\n' > "$history_file"
+printf ' same-submodule-pin path\\n' > "$workdir/submodules.txt"
+printf 'WOS_BUILD_DISK_IMAGES:BOOL=OFF\\n' > "$workdir/wos/build-selfhost/CMakeCache.txt"
+printf 'fake command log\\n' > "$log_dir/build.log"
+""",
+            encoding="ascii",
+        )
+        fake_runner.chmod(0o755)
+        output_dir = tmp_path / "results"
+        workdir = tmp_path / "work"
+        environment = os.environ.copy()
+        environment["WOS_LINUX_SELFHOST_BASELINE_RUNNER"] = str(fake_runner)
+        environment["FAKE_SOURCE_REPO"] = str(ROOT)
+        result = subprocess.run(
+            [
+                str(SELFHOST_LINUX_BASELINE),
+                "--runs",
+                "2",
+                "--jobs",
+                "1",
+                "--workdir",
+                str(workdir),
+                "--output-dir",
+                str(output_dir),
+                "--no-heartbeat-sync",
+            ],
+            cwd=ROOT,
+            env=environment,
+            check=False,
+            text=True,
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            fail(f"Linux baseline fixture run failed: {result.stderr or result.stdout}")
+        with (output_dir / "runs.tsv").open(encoding="utf-8", newline="") as file:
+            rows = list(csv.DictReader(file, delimiter="\t"))
+        if len(rows) != 2 or any(row["accepted"] != "1" for row in rows):
+            fail(f"Linux baseline did not emit two accepted outer-wall rows: {rows!r}")
+        if any(int(row["wall_ms"]) < 0 for row in rows):
+            fail(f"Linux baseline emitted an invalid outer wall time: {rows!r}")
+        for run_number in (1, 2):
+            run_dir = output_dir / "runs" / f"run-{run_number:04d}"
+            for name in (
+                "console.log",
+                "selfhost-report.tsv",
+                "selfhost-detail.tsv",
+                "bootstrap-detail.tsv",
+                "selfhost-history.tsv",
+                "submodules.txt",
+                "CMakeCache.txt",
+                "command-logs.tar",
+                "host-before.txt",
+                "host-after.txt",
+            ):
+                if not (run_dir / name).is_file():
+                    fail(f"Linux baseline fixture is missing per-run evidence: {run_dir / name}")
+            if "WOS_BUILD_DISK_IMAGES:BOOL=OFF" not in (run_dir / "CMakeCache.txt").read_text(encoding="ascii"):
+                fail("Linux baseline fixture did not preserve the parity configure cache")
 
 
 def test_selfhost_cluster_profile_is_single_large_vm() -> None:
@@ -716,6 +982,11 @@ def test_selfhost_report_comparator_checks_clone_build_and_total() -> None:
         source,
         [
             'DEFAULT_STEPS = ("clone_sources", "build_wos", "total")',
+            'FULL_PROCESS_ACCEPTANCE_PROFILE = "full-process"',
+            "FULL_PROCESS_MAX_WOS_RATIO = 1.10",
+            '"metric": "complete_outer_wall_ms"',
+            'required_fields = {"run", "wall_ms", "runner_status", "evidence_status", "accepted"}',
+            "full-process acceptance ratio cannot exceed",
             "--max-wos-ratio",
             "ratio = wos_ms / linux_ms",
             "--json-output",
@@ -780,9 +1051,99 @@ def test_selfhost_report_comparator_checks_clone_build_and_total() -> None:
         if result.returncode == 0:
             fail("self-host comparator accepted WOS reports beyond the ratio threshold")
 
+        wos_runs = tmp_path / "wos-runs.tsv"
+        linux_runs = tmp_path / "linux-runs.tsv"
+        full_process_json = tmp_path / "full-process.json"
+        runs_header = "run\twall_ms\trunner_status\tevidence_status\taccepted\n"
+        wos_runs.write_text(runs_header + "1\t1100\t0\t0\t1\n2\t1090\t0\t0\t1\n", encoding="ascii")
+        linux_runs.write_text(runs_header + "baseline\t1000\t0\t0\t1\n", encoding="ascii")
+        result = subprocess.run(
+            [
+                str(SELFHOST_COMPARE),
+                "--wos-runs",
+                str(wos_runs),
+                "--linux-runs",
+                str(linux_runs),
+                "--acceptance-profile",
+                "full-process",
+                "--json-output",
+                str(full_process_json),
+            ],
+            cwd=ROOT,
+            check=False,
+            text=True,
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            fail(f"full-process comparator rejected the 1.10 ceiling: {result.stderr or result.stdout}")
+        data = json.loads(full_process_json.read_text(encoding="ascii"))
+        if data.get("metric") != "complete_outer_wall_ms" or data.get("max_wos_ratio") != 1.1:
+            fail(f"full-process comparator did not record outer-wall acceptance: {data!r}")
+        if len(data.get("steps", [])) != 2 or not all(row["pass"] for row in data["steps"]):
+            fail(f"full-process comparator did not check every WOS run: {data!r}")
+
+        wos_runs.write_text(runs_header + "1\t1101\t0\t0\t1\n", encoding="ascii")
+        result = subprocess.run(
+            [
+                str(SELFHOST_COMPARE),
+                "--wos-runs",
+                str(wos_runs),
+                "--linux-runs",
+                str(linux_runs),
+                "--acceptance-profile",
+                "full-process",
+            ],
+            cwd=ROOT,
+            check=False,
+            text=True,
+            capture_output=True,
+        )
+        if result.returncode == 0 or "1.101 > 1.100" not in result.stderr:
+            fail("full-process comparator accepted an outer-wall ratio above 1.10")
+
+        result = subprocess.run(
+            [
+                str(SELFHOST_COMPARE),
+                "--wos-runs",
+                str(wos_runs),
+                "--linux-runs",
+                str(linux_runs),
+                "--acceptance-profile",
+                "full-process",
+                "--max-wos-ratio",
+                "1.11",
+            ],
+            cwd=ROOT,
+            check=False,
+            text=True,
+            capture_output=True,
+        )
+        if result.returncode == 0 or "cannot exceed 1.10" not in result.stderr:
+            fail("full-process comparator allowed the acceptance ceiling to be relaxed")
+
+        result = subprocess.run(
+            [
+                str(SELFHOST_COMPARE),
+                "--wos",
+                str(wos_report),
+                "--linux",
+                str(linux_report),
+                "--acceptance-profile",
+                "full-process",
+            ],
+            cwd=ROOT,
+            check=False,
+            text=True,
+            capture_output=True,
+        )
+        if result.returncode == 0 or "inner selfhost-report.tsv totals do not include complete outer wall time" not in result.stderr:
+            fail("full-process comparator accepted unsafe inner phase totals")
+
 
 if __name__ == "__main__":
     test_selfhost_runner_covers_acceptance_flow()
+    test_selfhost_repeatability_runner_preserves_acceptance_evidence()
+    test_linux_selfhost_baseline_preserves_full_process_evidence()
     test_selfhost_runner_verifies_toolchain_kernel_and_utilities()
     test_selfhost_runner_preflights_wos_only_self_host_tools()
     test_selfhost_runner_scrubs_inherited_toolchain_environment()
