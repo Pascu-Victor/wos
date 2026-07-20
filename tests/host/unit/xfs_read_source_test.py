@@ -31,41 +31,32 @@ def require_order(source: str, tokens: list[str], context: str) -> None:
 
 def main() -> None:
     source = XFS_VFS.read_text()
-    read_overlay_start = source.find("// Full-block read. Large reads use direct I/O")
+    read_overlay_start = source.find("// Cache the complete request span")
     read_overlay_end = source.find("// Partial or unaligned", read_overlay_start)
     if read_overlay_start < 0 or read_overlay_end < 0:
         fail("could not isolate full-block read handling")
     read_overlay_body = source[read_overlay_start:read_overlay_end]
 
-    require(read_overlay_body, "auto read_cached_blocks = [&]() -> bool", "full-block reads need a buffered fallback")
     require(
         read_overlay_body,
-        "copy_cached_bdev_range_if_complete(ctx->device, dev_block, dev_count, dst + total_read)",
-        "full-block reads must reuse complete cached ranges before direct I/O",
+        "bread_multi(ctx->device, DEV_BLOCK, DEV_COUNT, BufferReadClass::FILE_DATA)",
+        "full-block reads must populate and reuse the file-data buffer cache",
     )
     require(
         read_overlay_body,
-        "copy_dirty_bdev_range(ctx->device, dev_block, dev_count, direct_dst)",
-        "successful direct reads must overlay dirty buffered writes",
-    )
-    require(
-        read_overlay_body,
-        "falling back to buffered blocks",
-        "failed direct reads must leave a diagnostic before buffered fallback",
+        "std::memcpy(dst + total_read, bp->data, chunk)",
+        "full-block reads must copy from the referenced cache span",
     )
     require_order(
         read_overlay_body,
         [
-            "int const RC = xfs_block_read_with_retry(ctx->device, dev_block, dev_count, direct_dst)",
-            "if (RC != 0)",
-            "bool const OK = read_cached_blocks();",
-            "OK ? 0 : RC, OK ? chunk : 0",
-            "if (!OK)",
+            "BufHead* bp = bread_multi(ctx->device, DEV_BLOCK, DEV_COUNT, BufferReadClass::FILE_DATA);",
+            "if (bp == nullptr)",
             "return finish_read((total_read > 0) ? static_cast<ssize_t>(total_read) : -EIO);",
-            "} else {",
-            "copy_dirty_bdev_range(ctx->device, dev_block, dev_count, direct_dst)",
+            "std::memcpy(dst + total_read, bp->data, chunk);",
+            "brelse(bp);",
         ],
-        "direct-read failures must try buffered blocks before reporting EIO while preserving the direct success overlay",
+        "cached full-block reads must retain the span through the copy and release it afterwards",
     )
 
 

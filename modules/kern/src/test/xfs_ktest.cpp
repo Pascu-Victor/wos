@@ -132,10 +132,10 @@ KTEST(XFS, MappedAppendSkipsReadOnlyAtCleanBlockBoundary) {
 
 KTEST(XFS, FreshBlockZeroingPreservesWriteRange) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_zero_fresh_block_preserves_write_range()); }
 
-KTEST(XFS, DirectReadBatchIsBoundedAndBlockAligned) {
-    KEXPECT_EQ(ker::vfs::xfs::xfs_selftest_direct_read_batch_max_bytes(4096), static_cast<size_t>(2 * 1024 * 1024));
-    KEXPECT_EQ(ker::vfs::xfs::xfs_selftest_direct_read_batch_max_bytes(512), static_cast<size_t>(2 * 1024 * 1024));
-    KEXPECT_EQ(ker::vfs::xfs::xfs_selftest_direct_read_batch_max_bytes(3 * 1024 * 1024), static_cast<size_t>(3 * 1024 * 1024));
+KTEST(XFS, CachedReadBatchIsBoundedAndBlockAligned) {
+    KEXPECT_EQ(ker::vfs::xfs::xfs_selftest_read_batch_max_bytes(4096), static_cast<size_t>(2 * 1024 * 1024));
+    KEXPECT_EQ(ker::vfs::xfs::xfs_selftest_read_batch_max_bytes(512), static_cast<size_t>(2 * 1024 * 1024));
+    KEXPECT_EQ(ker::vfs::xfs::xfs_selftest_read_batch_max_bytes(3 * 1024 * 1024), static_cast<size_t>(3 * 1024 * 1024));
 }
 
 KTEST(XFS, BufGetMultiSkipsDeviceRead) {

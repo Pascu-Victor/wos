@@ -53,8 +53,7 @@ using log = ker::mod::dbg::logger<"xfs">;
 namespace {
 
 constexpr uint32_t XFS_SLOW_TRACE_US = 2048;
-constexpr size_t XFS_DIRECT_READ_MIN_BYTES = size_t{4} * 1024;
-constexpr size_t XFS_DIRECT_READ_BATCH_MAX_BYTES = size_t{2} * 1024 * 1024;
+constexpr size_t XFS_READ_BATCH_MAX_BYTES = size_t{2} * 1024 * 1024;
 constexpr int64_t XFS_NSEC_PER_SEC_SIGNED = 1000000000LL;
 constexpr uint64_t XFS_NSEC_PER_SEC = static_cast<uint64_t>(XFS_NSEC_PER_SEC_SIGNED);
 constexpr int64_t XFS_BIGTIME_EPOCH_OFFSET = (1LL << 31);
@@ -430,11 +429,11 @@ void xfs_zero_fresh_block_unwritten_ranges(uint8_t* block, size_t block_size, si
     }
 }
 
-auto xfs_direct_read_batch_max_bytes(size_t block_size) -> size_t {
+auto xfs_read_batch_max_bytes(size_t block_size) -> size_t {
     if (block_size == 0) {
-        return XFS_DIRECT_READ_BATCH_MAX_BYTES;
+        return XFS_READ_BATCH_MAX_BYTES;
     }
-    size_t const MAX_BLOCKS = std::max<size_t>(1, XFS_DIRECT_READ_BATCH_MAX_BYTES / block_size);
+    size_t const MAX_BLOCKS = std::max<size_t>(1, XFS_READ_BATCH_MAX_BYTES / block_size);
     return MAX_BLOCKS * block_size;
 }
 
@@ -1022,30 +1021,6 @@ auto xfs_fsblock_to_dev_block(XfsMountContext* ctx, xfs_fsblock_t fsbno) -> uint
     return LINEAR_BLOCK * (ctx->block_size / ctx->device->block_size);
 }
 
-auto xfs_block_read_with_retry(dev::BlockDevice* bdev, uint64_t block_no, size_t count, uint8_t* buffer) -> int {
-    constexpr int MAX_ATTEMPTS = 3;
-    uint64_t const STARTED_US = perf_xfs_started_us(ker::mod::perf::WkiPerfLocalXfsOp::DIRECT_READ);
-    int rc = -EIO;
-    for (int attempt = 1; attempt <= MAX_ATTEMPTS; ++attempt) {
-        int const RC = dev::block_read(bdev, block_no, count, buffer);
-        if (RC == 0) {
-            rc = 0;
-            break;
-        }
-        if (attempt < MAX_ATTEMPTS) {
-            log::warn("transient extent read failure on %s block=%llu count=%zu rc=%d attempt=%d/%d", bdev->name.data(),
-                      static_cast<unsigned long long>(block_no), count, RC, attempt, MAX_ATTEMPTS);
-            ker::mod::sched::kern_yield();
-            continue;
-        }
-        log::warn("extent read failed on %s block=%llu count=%zu rc=%d after %d attempts", bdev->name.data(),
-                  static_cast<unsigned long long>(block_no), count, RC, MAX_ATTEMPTS);
-        rc = RC;
-    }
-    perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::DIRECT_READ, STARTED_US, rc, count * static_cast<uint64_t>(bdev->block_size));
-    return rc;
-}
-
 auto xfs_fsb_to_dev_count(XfsMountContext* ctx, xfs_filblks_t fsb_count) -> size_t {
     return static_cast<size_t>(fsb_count) * (ctx->block_size / ctx->device->block_size);
 }
@@ -1338,7 +1313,7 @@ auto xfs_vfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
         }
 
         if (BLOCK_OFF == 0 && (chunk & (ctx->block_size - 1)) == 0) {
-            size_t const READ_BATCH_MAX_BYTES = xfs_direct_read_batch_max_bytes(ctx->block_size);
+            size_t const READ_BATCH_MAX_BYTES = xfs_read_batch_max_bytes(ctx->block_size);
             chunk = std::min(chunk, READ_BATCH_MAX_BYTES);
             auto const START_AG = static_cast<xfs_agnumber_t>(DISK_BLOCK >> ctx->ag_blk_log);
             while (chunk < remaining && chunk < READ_BATCH_MAX_BYTES) {
@@ -1379,79 +1354,26 @@ auto xfs_vfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
         t0 = ker::mod::tsc::get_ns();
 #endif
         if (BLOCK_OFF == 0 && (chunk & (ctx->block_size - 1)) == 0) {
-            // Full-block read. Large reads use direct I/O, then overlay any
-            // dirty cached intervals so overlapping size-keyed buffers remain
-            // authoritative over the disk snapshot.
+            // Cache the complete request span. Besides coalescing the first
+            // device read, bread_multi reuses overlapping cached aliases and
+            // overlays newer dirty buffers before returning the data.
             size_t const FSB_COUNT = chunk >> ctx->block_log;
-
-            auto read_cached_blocks = [&]() -> bool {
-                bool ok = true;
-                for (size_t i = 0; i < FSB_COUNT; ++i) {
-                    BufHead* bp = xfs_buf_read_data(ctx, DISK_BLOCK + static_cast<xfs_fsblock_t>(i));
-                    if (bp == nullptr) {
-                        ok = false;
-                        break;
-                    }
-                    std::memcpy(dst + total_read + (i << ctx->block_log), bp->data, ctx->block_size);
-                    brelse(bp);
-                }
-                return ok;
-            };
-
-            bool read_from_cache = chunk < XFS_DIRECT_READ_MIN_BYTES;
             uint64_t const DEV_BLOCK = xfs_fsblock_to_dev_block(ctx, DISK_BLOCK);
             size_t const DEV_COUNT = xfs_fsb_to_dev_count(ctx, static_cast<xfs_filblks_t>(FSB_COUNT));
-            if (!read_from_cache && has_dirty_bdev_range(ctx->device, DEV_BLOCK, DEV_COUNT)) {
-                read_from_cache = true;
-            }
-
-            uint8_t* direct_dst = dst + total_read;
 #ifdef XFS_BENCH
             acc_io += ker::mod::tsc::get_ns() - t0;
 #endif
-            if (read_from_cache) {
-                bool const OK = read_cached_blocks();
-                perf_accounted_us += perf_record_xfs_stage_elapsed(ker::mod::perf::WkiPerfLocalXfsOp::READ_IO, PERF_IO_STARTED_US,
-                                                                   OK ? 0 : -EIO, OK ? chunk : 0);
-                if (!OK) {
-                    return finish_read((total_read > 0) ? static_cast<ssize_t>(total_read) : -EIO);
-                }
-                uint64_t const PERF_COPY_STARTED_US = perf_xfs_started_us(ker::mod::perf::WkiPerfLocalXfsOp::READ_COPY);
-                perf_accounted_us +=
-                    perf_record_xfs_stage_elapsed(ker::mod::perf::WkiPerfLocalXfsOp::READ_COPY, PERF_COPY_STARTED_US, 0, chunk);
-            } else {
-                uint64_t const PERF_COPY_STARTED_US = perf_xfs_started_us(ker::mod::perf::WkiPerfLocalXfsOp::READ_COPY);
-                bool const COPIED_CACHED = copy_cached_bdev_range_if_complete(ctx->device, DEV_BLOCK, DEV_COUNT, direct_dst);
-                if (COPIED_CACHED) {
-                    perf_accounted_us +=
-                        perf_record_xfs_stage_elapsed(ker::mod::perf::WkiPerfLocalXfsOp::READ_COPY, PERF_COPY_STARTED_US, 0, chunk);
-                } else {
-                    int const RC = xfs_block_read_with_retry(ctx->device, DEV_BLOCK, DEV_COUNT, direct_dst);
-                    if (RC != 0) {
-                        log::warn("direct extent read failed on %s block=%lu count=%lu rc=%d; falling back to buffered blocks",
-                                  ctx->device != nullptr ? ctx->device->name.data() : "<null>", static_cast<unsigned long>(DEV_BLOCK),
-                                  static_cast<unsigned long>(DEV_COUNT), RC);
-                        bool const OK = read_cached_blocks();
-                        perf_accounted_us += perf_record_xfs_stage_elapsed(ker::mod::perf::WkiPerfLocalXfsOp::READ_IO, PERF_IO_STARTED_US,
-                                                                           OK ? 0 : RC, OK ? chunk : 0);
-                        if (!OK) {
-                            return finish_read((total_read > 0) ? static_cast<ssize_t>(total_read) : -EIO);
-                        }
-                        perf_accounted_us +=
-                            perf_record_xfs_stage_elapsed(ker::mod::perf::WkiPerfLocalXfsOp::READ_COPY, PERF_COPY_STARTED_US, 0, chunk);
-                        total_read += chunk;
-                        remaining -= chunk;
-                        continue;
-                    }
-                    perf_accounted_us +=
-                        perf_record_xfs_stage_elapsed(ker::mod::perf::WkiPerfLocalXfsOp::READ_IO, PERF_IO_STARTED_US, 0, chunk);
-                    bool const OVERLAYED = copy_dirty_bdev_range(ctx->device, DEV_BLOCK, DEV_COUNT, direct_dst);
-                    if (OVERLAYED) {
-                        perf_accounted_us +=
-                            perf_record_xfs_stage_elapsed(ker::mod::perf::WkiPerfLocalXfsOp::READ_COPY, PERF_COPY_STARTED_US, 0, chunk);
-                    }
-                }
+            BufHead* bp = bread_multi(ctx->device, DEV_BLOCK, DEV_COUNT, BufferReadClass::FILE_DATA);
+            perf_accounted_us += perf_record_xfs_stage_elapsed(ker::mod::perf::WkiPerfLocalXfsOp::READ_IO, PERF_IO_STARTED_US,
+                                                               bp != nullptr ? 0 : -EIO, bp != nullptr ? chunk : 0);
+            if (bp == nullptr) {
+                return finish_read((total_read > 0) ? static_cast<ssize_t>(total_read) : -EIO);
             }
+            uint64_t const PERF_COPY_STARTED_US = perf_xfs_started_us(ker::mod::perf::WkiPerfLocalXfsOp::READ_COPY);
+            std::memcpy(dst + total_read, bp->data, chunk);
+            perf_accounted_us +=
+                perf_record_xfs_stage_elapsed(ker::mod::perf::WkiPerfLocalXfsOp::READ_COPY, PERF_COPY_STARTED_US, 0, chunk);
+            brelse(bp);
         } else {
             // Partial or unaligned - fall back to single cached block.
             chunk = std::min(ctx->block_size - BLOCK_OFF, remaining);
@@ -2489,7 +2411,7 @@ auto xfs_selftest_zero_fresh_block_preserves_write_range() -> bool {
     return true;
 }
 
-auto xfs_selftest_direct_read_batch_max_bytes(size_t block_size) -> size_t { return xfs_direct_read_batch_max_bytes(block_size); }
+auto xfs_selftest_read_batch_max_bytes(size_t block_size) -> size_t { return xfs_read_batch_max_bytes(block_size); }
 
 auto xfs_selftest_parent_path_cache() -> bool {
     XfsMountContext mount_a{};

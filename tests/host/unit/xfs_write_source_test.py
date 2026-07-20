@@ -23,6 +23,15 @@ def require_absent(source: str, token: str, context: str) -> None:
         fail(f"{context}: unexpected {token}")
 
 
+def require_order(source: str, tokens: list[str], context: str) -> None:
+    cursor = 0
+    for token in tokens:
+        position = source.find(token, cursor)
+        if position < 0:
+            fail(f"{context}: missing or out-of-order {token}")
+        cursor = position + len(token)
+
+
 def main() -> None:
     source = XFS_VFS.read_text()
     write_start = source.find("auto xfs_vfs_write_locked(")
@@ -37,7 +46,7 @@ def main() -> None:
         fail("could not isolate buffered_write body")
     buffered_body = write_body[buffered_start:buffered_end]
 
-    read_overlay_start = source.find("// Full-block read. Large reads use direct I/O")
+    read_overlay_start = source.find("// Cache the complete request span")
     read_overlay_end = source.find("// Partial or unaligned", read_overlay_start)
     if read_overlay_start < 0 or read_overlay_end < 0:
         fail("could not isolate full-block read overlay handling")
@@ -45,12 +54,12 @@ def main() -> None:
 
     require(
         source,
-        "constexpr size_t XFS_BUFFERED_WRITE_BATCH_MAX_BYTES = size_t{2} * 1024 * 1024;",
+        "constexpr size_t XFS_BUFFERED_WRITE_BATCH_MAX_BYTES = size_t{256} * 1024;",
         "XFS buffered writes must stay under the buffer-cache contiguous allocation cap",
     )
     require(
         source,
-        "constexpr xfs_extlen_t XFS_WRITE_ALLOC_TRANSACTION_BLOCKS = 16384;",
+        "constexpr xfs_extlen_t XFS_WRITE_ALLOC_TRANSACTION_BLOCKS = 1024;",
         "large XFS hole writes must split metadata allocation transactions before transaction log headroom is exhausted",
     )
     require(
@@ -80,8 +89,8 @@ def main() -> None:
     )
     require(
         source,
-        "constexpr size_t XFS_DIRTY_THROTTLE_INTERVAL_BYTES = XFS_BUFFERED_WRITE_BATCH_MAX_BYTES;",
-        "dirty throttling must run once per buffered write batch",
+        "constexpr size_t XFS_DIRTY_THROTTLE_INTERVAL_BYTES = size_t{4} * 1024 * 1024;",
+        "dirty throttling must use the current bounded writeback interval",
     )
     require(
         source,
@@ -133,10 +142,15 @@ def main() -> None:
         "throttle_dirty_buffer_cache(ctx->device)",
         "locked XFS write path must not park in dirty throttling while holding metadata/io locks",
     )
-    require_absent(
+    require_order(
         write_body,
-        "XfsMetadataGuard",
-        "locked XFS write helper is shared by callers that already hold the mount metadata lock",
+        [
+            "ssize_t const MAPPED_FAST_RET = try_mapped_write_without_metadata_lock();",
+            "if (MAPPED_FAST_RET != -EAGAIN)",
+            "return finish_write(MAPPED_FAST_RET);",
+            "XfsMetadataGuard metadata_guard(ctx, true, WOS_PERF_CALLSITE());",
+        ],
+        "mapped writes must try the lockless path before acquiring the metadata lock for allocation or inode updates",
     )
     require_absent(
         source,
@@ -167,23 +181,23 @@ def main() -> None:
     )
     require(
         buffered_body,
-        "BufHead* bp = fresh_allocation ? xfs_buf_get(ctx, current_disk_block) : xfs_buf_read(ctx, current_disk_block)",
+        "BufHead* bp = fresh_allocation ? xfs_buf_get(ctx, current_disk_block) : xfs_buf_read_data(ctx, current_disk_block)",
         "fresh partial regular-file writes must avoid reading old data",
     )
     require(
         buffered_body,
-        "std::memset(bp->data, 0, ctx->block_size)",
+        "xfs_zero_fresh_block_unwritten_ranges(bp->data, ctx->block_size, block_off, CHUNK)",
         "fresh partial regular-file writes must zero unwritten bytes",
     )
     require(
         read_overlay_body,
-        "copy_cached_bdev_range_if_complete(ctx->device, dev_block, dev_count, dst + total_read)",
-        "full-block reads must reuse complete cached ranges",
+        "bread_multi(ctx->device, DEV_BLOCK, DEV_COUNT, BufferReadClass::FILE_DATA)",
+        "full-block reads must populate and reuse cached data spans",
     )
     require(
         read_overlay_body,
-        "copy_dirty_bdev_range(ctx->device, dev_block, dev_count, direct_dst)",
-        "direct reads must overlay dirty buffered writes",
+        "std::memcpy(dst + total_read, bp->data, chunk)",
+        "full-block reads must consume the authoritative cached span",
     )
     truncate_start = source.find("auto xfs_vfs_truncate(File* f")
     truncate_end = source.find("// ============================================================================\n// FileOperations vtable", truncate_start)
