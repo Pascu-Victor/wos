@@ -709,12 +709,12 @@ void service_tlb_shootdown_requests_for_cpu(uint64_t cpu_no) {
         }
 
         auto& request = tlb_shootdown_requests[static_cast<size_t>(origin)];
-        if (request.targets[static_cast<size_t>(cpu_no)].load(std::memory_order_acquire) == 0U) {
-            continue;
-        }
-
         uint64_t const GENERATION = request.generation.load(std::memory_order_acquire);
         if (GENERATION == 0) {
+            continue;
+        }
+        if (request.targets[static_cast<size_t>(cpu_no)].load(std::memory_order_acquire) == 0U ||
+            request.generation.load(std::memory_order_acquire) != GENERATION) {
             continue;
         }
 
@@ -729,14 +729,18 @@ void service_tlb_shootdown_requests_for_cpu(uint64_t cpu_no) {
 
         bool const SHARED_KERNEL = request.shared_kernel.load(std::memory_order_acquire);
         PageTable* const TARGET_PAGEMAP = request.pagemap.load(std::memory_order_acquire);
+        vaddr_t const TARGET_VADDR = request.vaddr.load(std::memory_order_acquire);
+        bool const RELOAD_CR3 = request.reload_cr3.load(std::memory_order_acquire);
+        if (request.generation.load(std::memory_order_acquire) != GENERATION) {
+            continue;
+        }
         if (SHARED_KERNEL) {
             // Kernel-half page tables are shared by every task pagemap. A full
             // local reload invalidates stale leaves regardless of which task
             // CR3 happens to be active on this CPU.
             wrcr3(rdcr3());
         } else if (TARGET_PAGEMAP != nullptr) {
-            invalidate_local_tlb_if_current(TARGET_PAGEMAP, request.vaddr.load(std::memory_order_acquire),
-                                            request.reload_cr3.load(std::memory_order_acquire));
+            invalidate_local_tlb_if_current(TARGET_PAGEMAP, TARGET_VADDR, RELOAD_CR3);
         }
 
         uint32_t pending = request.pending.load(std::memory_order_acquire);
@@ -919,23 +923,25 @@ void shootdown_remote_user_pagemap(PageTable* pagemap, vaddr_t vaddr, bool reloa
     uint64_t const ORIGIN_CPU = gate.cpu_no;
     uint64_t const CORE_COUNT = bounded_core_count();
     auto& request = tlb_shootdown_requests[static_cast<size_t>(ORIGIN_CPU)];
+    uint64_t next_generation = request.generation.exchange(0, std::memory_order_acq_rel) + 1;
+    if (next_generation == 0) {
+        next_generation = 1;
+    }
+
     uint32_t pending = 0;
     for (uint64_t target_cpu = 0; target_cpu < CORE_COUNT; ++target_cpu) {
         bool const TARGET = target_cpu != ORIGIN_CPU && cpu_may_have_active_pagemap(target_cpu, pagemap);
-        request.targets[static_cast<size_t>(target_cpu)].store(TARGET ? 1U : 0U, std::memory_order_relaxed);
+        request.targets[static_cast<size_t>(target_cpu)].store(TARGET ? 1U : 0U, std::memory_order_release);
         if (TARGET) {
             ++pending;
         }
     }
 
     if (pending == 0) {
+        request.pending.store(0, std::memory_order_relaxed);
+        request.generation.store(next_generation, std::memory_order_release);
         release_tlb_shootdown_gate(gate);
         return;
-    }
-
-    uint64_t next_generation = request.generation.load(std::memory_order_relaxed) + 1;
-    if (next_generation == 0) {
-        next_generation = 1;
     }
 
     request.pagemap.store(pagemap, std::memory_order_relaxed);
@@ -972,24 +978,26 @@ void shootdown_shared_kernel_mappings() {
     uint64_t const ORIGIN_CPU = gate.cpu_no;
     uint64_t const CORE_COUNT = bounded_core_count();
     auto& request = tlb_shootdown_requests[static_cast<size_t>(ORIGIN_CPU)];
+    uint64_t next_generation = request.generation.exchange(0, std::memory_order_acq_rel) + 1;
+    if (next_generation == 0) {
+        next_generation = 1;
+    }
+
     uint32_t pending = 0;
     for (uint64_t target_cpu = 0; target_cpu < CORE_COUNT; ++target_cpu) {
         bool const TARGET =
             target_cpu != ORIGIN_CPU && tlb_shootdown_cpu_online[static_cast<size_t>(target_cpu)].load(std::memory_order_acquire) != 0U;
-        request.targets[static_cast<size_t>(target_cpu)].store(TARGET ? 1U : 0U, std::memory_order_relaxed);
+        request.targets[static_cast<size_t>(target_cpu)].store(TARGET ? 1U : 0U, std::memory_order_release);
         if (TARGET) {
             ++pending;
         }
     }
 
     if (pending == 0) {
+        request.pending.store(0, std::memory_order_relaxed);
+        request.generation.store(next_generation, std::memory_order_release);
         release_tlb_shootdown_gate(gate);
         return;
-    }
-
-    uint64_t next_generation = request.generation.load(std::memory_order_relaxed) + 1;
-    if (next_generation == 0) {
-        next_generation = 1;
     }
 
     request.pagemap.store(kernel_pagemap, std::memory_order_relaxed);

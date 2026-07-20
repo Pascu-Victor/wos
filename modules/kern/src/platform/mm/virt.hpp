@@ -8,6 +8,7 @@
 #include <platform/mm/addr.hpp>
 #include <platform/mm/paging.hpp>
 #include <platform/mm/phys.hpp>
+#include <platform/mm/tlb_shootdown.hpp>
 #include <platform/sched/task.hpp>
 
 #include "platform/asm/cpu.hpp"
@@ -118,7 +119,6 @@ void switch_to_kernel_pagemap();
 PageTable* get_kernel_pagemap();
 void init_tlb_shootdown();
 void note_tlb_shootdown_cpu_online();
-void service_pending_tlb_shootdowns();
 void init_pagemap();
 // Prepare a bounded kernel virtual arena whose runtime allocations are backed
 // by independent order-0 physical pages. Call after init_pagemap() and before

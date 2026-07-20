@@ -28,6 +28,7 @@
 #include "platform/mm/dyn/kmalloc.hpp"
 #include "platform/mm/mm.hpp"
 #include "platform/mm/paging.hpp"
+#include "platform/mm/tlb_shootdown.hpp"
 #include "platform/mm/virt.hpp"
 #include "platform/sched/scheduler.hpp"
 #include "platform/sys/spinlock.hpp"
@@ -178,9 +179,17 @@ struct TrackedSpinlock {
         asm volatile("pushfq; popq %0" : "=r"(flags));
         asm volatile("cli");
 
+        uint32_t service_spins = 0;
         while (locked.exchange(true, std::memory_order_acquire)) {
-            while (locked.load(std::memory_order_relaxed)) {
-                asm volatile("pause");
+            for (;;) {
+                ++service_spins;
+                if ((service_spins & 0xFFU) == 0U) {
+                    virt::service_pending_tlb_shootdowns();
+                }
+                asm volatile("pause" ::: "memory");
+                if (!locked.load(std::memory_order_relaxed)) {
+                    break;
+                }
             }
         }
 #ifdef WOS_PHYS_LOCK_DEBUG

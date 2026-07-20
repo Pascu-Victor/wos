@@ -3,7 +3,7 @@
 #include <atomic>
 #include <cstdint>
 #include <platform/dbg/dbg.hpp>
-#include <platform/mm/virt.hpp>
+#include <platform/mm/tlb_shootdown.hpp>
 #include <platform/sched/scheduler.hpp>
 
 #if SPINLOCK_DEBUG
@@ -81,6 +81,7 @@ void print_stack(void** frames, int depth, const char* label) {
 void lock_ticket(Spinlock* lock) {
     // Take a ticket - this is our position in the FIFO queue.
     uint32_t const MY_TICKET = lock->next_ticket.fetch_add(1, std::memory_order_relaxed);
+    uint32_t service_spins = 0;
 
 #if SPINLOCK_DEBUG
     uint64_t spins = 0;
@@ -89,7 +90,11 @@ void lock_ticket(Spinlock* lock) {
 
     // Spin until the lock is "serving" our ticket.
     while (lock->now_serving.load(std::memory_order_acquire) != MY_TICKET) {
-        asm volatile("pause");
+        ++service_spins;
+        if ((service_spins & 0xFFU) == 0U && !sched::interrupts_enabled()) {
+            mm::virt::service_pending_tlb_shootdowns();
+        }
+        asm volatile("pause" ::: "memory");
 #if SPINLOCK_DEBUG
         if (!warned && ++spins >= SPINLOCK_DEBUG_THRESHOLD) {
             warned = true;

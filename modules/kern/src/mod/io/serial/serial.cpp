@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <platform/asm/cpu.hpp>
+#include <platform/mm/tlb_shootdown.hpp>
 #include <platform/sched/scheduler.hpp>
 
 #include "mod/io/port/port.hpp"
@@ -100,6 +101,7 @@ void acquire_lock() {
     // lock after we disabled preemption but before the CAS below, treat that as
     // a same-owner recursive acquisition instead of taking the lock twice.
     uintptr_t expected = NO_OWNER;
+    uint32_t service_spins = 0;
     while (!lock_owner.compare_exchange_weak(expected, OWNER, std::memory_order_acquire, std::memory_order_relaxed)) {
         if (expected == OWNER) {
             if (PREEMPT_OWNER != nullptr) {
@@ -109,7 +111,11 @@ void acquire_lock() {
             return;
         }
         expected = NO_OWNER;
-        asm volatile("pause");
+        ++service_spins;
+        if ((service_spins & 0xFFU) == 0U && !ker::mod::sched::interrupts_enabled()) {
+            ker::mod::mm::virt::service_pending_tlb_shootdowns();
+        }
+        asm volatile("pause" ::: "memory");
     }
     lock_preempt_owner = PREEMPT_OWNER;
     lock_depth.store(1, std::memory_order_relaxed);

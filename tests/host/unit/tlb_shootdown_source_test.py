@@ -5,8 +5,13 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 VIRT_HPP = ROOT / "modules" / "kern" / "src" / "platform" / "mm" / "virt.hpp"
+TLB_SHOOTDOWN_HPP = ROOT / "modules" / "kern" / "src" / "platform" / "mm" / "tlb_shootdown.hpp"
 VIRT_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "mm" / "virt.opt.cpp"
 SCHEDULER_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "sched" / "scheduler.cpp"
+SPINLOCK_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "sys" / "spinlock.cpp"
+PAGE_ALLOC_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "mm" / "page_alloc.cpp"
+PHYS_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "mm" / "phys.opt.cpp"
+SERIAL_CPP = ROOT / "modules" / "kern" / "src" / "mod" / "io" / "serial" / "serial.cpp"
 
 
 def fail(message: str) -> None:
@@ -46,13 +51,25 @@ def function_body(source: str, name: str) -> str:
     fail(f"{name} function not found")
 
 
-def require_public_hooks(header: str) -> None:
-    for snippet in [
-        "void init_tlb_shootdown();",
-        "void note_tlb_shootdown_cpu_online();",
-    ]:
+def signature_body(source: str, signature: str) -> str:
+    start = source.find(signature)
+    if start < 0:
+        fail(f"{signature} function not found")
+    brace = source.find("{", start + len(signature))
+    if brace < 0:
+        fail(f"{signature} function body not found")
+    end = find_matching_brace(source, brace)
+    return source[brace + 1 : end]
+
+
+def require_public_hooks(header: str, service_header: str) -> None:
+    for snippet in ["void init_tlb_shootdown();", "void note_tlb_shootdown_cpu_online();"]:
         if snippet not in header:
             fail(f"TLB shootdown hook missing from virt.hpp: {snippet}")
+    if "#include <platform/mm/tlb_shootdown.hpp>" not in header:
+        fail("virt.hpp must preserve the lightweight cooperative-service API include")
+    if "void service_pending_tlb_shootdowns();" not in service_header:
+        fail("lightweight TLB shootdown service hook is missing")
 
 
 def require_atomic_per_origin_protocol(source: str) -> None:
@@ -78,7 +95,7 @@ def require_atomic_per_origin_protocol(source: str) -> None:
 
     wait_body = function_body(source, "wait_for_tlb_shootdown_completion")
     for snippet in [
-        "request.pending.load(std::memory_order_acquire) != 0",
+        "request.pending.load(std::memory_order_acquire) == 0U",
         "service_tlb_shootdown_requests_for_cpu(origin_cpu)",
         'asm volatile("pause" ::: "memory")',
     ]:
@@ -88,6 +105,73 @@ def require_atomic_per_origin_protocol(source: str) -> None:
     handler_body = function_body(source, "tlb_shootdown_handler")
     if "service_tlb_shootdown_requests_for_cpu(cpu::current_cpu())" not in handler_body:
         fail("IPI handler must service pending shootdown requests for the interrupted CPU")
+
+
+def require_generation_publication_is_quiescent(source: str) -> None:
+    service_body = function_body(source, "service_tlb_shootdown_requests_for_cpu")
+    first_generation = service_body.find("uint64_t const GENERATION = request.generation.load(std::memory_order_acquire)")
+    target = service_body.find("request.targets[static_cast<size_t>(cpu_no)].load(std::memory_order_acquire)")
+    target_revalidation = service_body.find("request.generation.load(std::memory_order_acquire) != GENERATION", target)
+    fields = service_body.find("bool const SHARED_KERNEL = request.shared_kernel.load(std::memory_order_acquire)")
+    field_revalidation = service_body.find("request.generation.load(std::memory_order_acquire) != GENERATION", fields)
+    if not (0 <= first_generation < target < target_revalidation < fields < field_revalidation):
+        fail("shootdown service must validate one nonzero generation around target and field reads")
+
+    for name in ["shootdown_remote_user_pagemap", "shootdown_shared_kernel_mappings"]:
+        body = function_body(source, name)
+        quiesce = body.find("request.generation.exchange(0, std::memory_order_acq_rel)")
+        targets = body.find("request.targets[static_cast<size_t>(target_cpu)].store(TARGET ? 1U : 0U, std::memory_order_release)")
+        publish = body.rfind("request.generation.store(next_generation, std::memory_order_release)")
+        if not (0 <= quiesce < targets < publish):
+            fail(f"{name} must quiesce the old generation before writing targets and release-publish the new generation")
+
+
+def require_cooperative_service_remains_raw_context_safe(source: str) -> None:
+    bodies = [
+        function_body(source, "service_pending_tlb_shootdowns"),
+        function_body(source, "service_tlb_shootdown_requests_for_cpu"),
+        function_body(source, "bounded_core_count"),
+        function_body(source, "invalidate_local_tlb_if_current"),
+    ]
+    for forbidden in ["new ", "page_alloc(", "kmalloc(", "kern_yield(", "log::", "dbg::", ".lock(", "lock_irq"]:
+        if any(forbidden in body for body in bodies):
+            fail(f"cooperative TLB service must remain allocation-free, nonblocking, and log-free: {forbidden}")
+
+
+def require_bounded_cooperative_service(body: str, context: str, needs_irq_guard: bool) -> None:
+    for snippet in [
+        "++service_spins;",
+        "(service_spins & 0xFFU) == 0U",
+        "service_pending_tlb_shootdowns();",
+    ]:
+        if snippet not in body:
+            fail(f"{context} must periodically service pending shootdowns: {snippet}")
+    has_irq_guard = "interrupts_enabled()" in body
+    if has_irq_guard != needs_irq_guard:
+        fail(f"{context} IRQ-state guard does not match whether the wait always masks interrupts")
+
+
+def require_test_and_test_set_service_is_bounded(body: str, lock_name: str, context: str) -> None:
+    failed_exchange = body.find(f"{lock_name}.exchange(true, std::memory_order_acquire)")
+    service_tick = body.find("++service_spins;", failed_exchange)
+    retry_load = body.find(f"{lock_name}.load(std::memory_order_relaxed)", failed_exchange)
+    if not (0 <= failed_exchange < service_tick < retry_load):
+        fail(f"{context} must count every failed exchange before its relaxed retry wait")
+
+
+def require_irq_masked_raw_waits_service_shootdowns(spinlock: str, page_alloc: str, phys: str, serial: str) -> None:
+    require_bounded_cooperative_service(function_body(spinlock, "lock_ticket"), "ticket lock wait", True)
+    page_alloc_body = signature_body(page_alloc, "auto PageAllocator::lock_irq()")
+    phys_body = function_body(phys, "lock_irq")
+    require_bounded_cooperative_service(page_alloc_body, "page allocator wait", False)
+    require_bounded_cooperative_service(phys_body, "physical allocator wait", False)
+    require_test_and_test_set_service_is_bounded(page_alloc_body, "lock_held", "page allocator wait")
+    require_test_and_test_set_service_is_bounded(phys_body, "locked", "physical allocator wait")
+    require_bounded_cooperative_service(function_body(serial, "acquire_lock"), "serial lock wait", True)
+
+    for source, context in [(page_alloc, "page allocator"), (serial, "serial")]:
+        if "#include <platform/mm/virt.hpp>" in source:
+            fail(f"{context} must not introduce a low-level MM/serial header cycle")
 
 
 def require_flush_helper_reaches_remote_cpus(source: str) -> None:
@@ -100,11 +184,11 @@ def require_flush_helper_reaches_remote_cpus(source: str) -> None:
     remote_body = function_body(source, "shootdown_remote_user_pagemap")
     for snippet in [
         "user_pagemap_can_need_remote_shootdown(pagemap)",
-        "tlb_shootdown_cpu_online",
+        "cpu_may_have_active_pagemap(target_cpu, pagemap)",
         "target_cpu != ORIGIN_CPU",
         "request.generation.store(next_generation, std::memory_order_release)",
         "send_tlb_shootdown_ipi(target_cpu)",
-        "wait_for_tlb_shootdown_completion(request, ORIGIN_CPU)",
+        "wait_for_tlb_shootdown_completion(request, ORIGIN_CPU, next_generation, CORE_COUNT)",
     ]:
         if snippet not in remote_body:
             fail(f"remote shootdown path missing snippet: {snippet}")
@@ -153,10 +237,18 @@ def require_scheduler_registers_and_marks_online(source: str) -> None:
 
 def main() -> None:
     header = VIRT_HPP.read_text()
+    service_header = TLB_SHOOTDOWN_HPP.read_text()
     virt = VIRT_CPP.read_text()
     scheduler = SCHEDULER_CPP.read_text()
-    require_public_hooks(header)
+    spinlock = SPINLOCK_CPP.read_text()
+    page_alloc = PAGE_ALLOC_CPP.read_text()
+    phys = PHYS_CPP.read_text()
+    serial = SERIAL_CPP.read_text()
+    require_public_hooks(header, service_header)
     require_atomic_per_origin_protocol(virt)
+    require_generation_publication_is_quiescent(virt)
+    require_cooperative_service_remains_raw_context_safe(virt)
+    require_irq_masked_raw_waits_service_shootdowns(spinlock, page_alloc, phys, serial)
     require_flush_helper_reaches_remote_cpus(virt)
     require_mapping_mutations_use_shootdown(virt)
     require_scheduler_registers_and_marks_online(scheduler)

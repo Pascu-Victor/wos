@@ -7,6 +7,7 @@
 #include <cstring>
 #include <platform/dbg/dbg.hpp>
 #include <platform/mm/paging.hpp>
+#include <platform/mm/tlb_shootdown.hpp>
 
 namespace ker::mod::mm {
 
@@ -464,9 +465,17 @@ auto PageAllocator::lock_irq() -> uint64_t {
     asm volatile("pushfq; popq %0" : "=r"(flags));
     asm volatile("cli");
 
+    uint32_t service_spins = 0;
     while (lock_held.exchange(true, std::memory_order_acquire)) {
-        while (lock_held.load(std::memory_order_relaxed)) {
-            asm volatile("pause");
+        for (;;) {
+            ++service_spins;
+            if ((service_spins & 0xFFU) == 0U) {
+                virt::service_pending_tlb_shootdowns();
+            }
+            asm volatile("pause" ::: "memory");
+            if (!lock_held.load(std::memory_order_relaxed)) {
+                break;
+            }
         }
     }
 
