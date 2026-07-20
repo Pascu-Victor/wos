@@ -468,16 +468,20 @@ def test_thread_publication_is_serialized_with_shared_vmem_updates() -> None:
     require_tokens(
         function_body(vmem, "update_shared_vmem_ranges_locked"),
         [
-            "find_active_task_lifetime_ref_if(MATCH_UNVISITED_SIBLING, &scan)",
-            "if (!tasks.push_back(candidate))",
-            "for (auto* candidate : tasks)",
+            "std::array<ker::mod::sched::task::Task*, INLINE_TASKS> inline_tasks{}",
+            "snapshot_active_task_lifetime_refs_if(MATCH_SIBLING, PAGEMAP, tasks, capacity)",
+            "new (std::nothrow) ker::mod::sched::task::Task*[task_count]",
+            "for (size_t i = 0; i < task_count; ++i)",
             "candidate->release();",
+            "delete[] heap_tasks;",
         ],
         "stable shared VM metadata task snapshot",
     )
     shared_update = function_body(vmem, "update_shared_vmem_ranges_locked")
     if "get_active_task_count()" in shared_update or "get_active_task_at_safe(i)" in shared_update:
         fail("shared VM propagation must not iterate a mutable active-task array by count/index")
+    if "find_active_task_lifetime_ref_if" in shared_update:
+        fail("shared VM propagation must not rescan the registry once per sibling")
 
     create_case = block_between(
         thread_control,

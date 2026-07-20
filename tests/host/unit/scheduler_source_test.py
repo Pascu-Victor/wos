@@ -1999,6 +1999,34 @@ def test_runnable_publication_requires_successful_heap_insert() -> None:
     )
 
 
+def test_active_task_snapshot_holds_one_registry_lock() -> None:
+    source = SCHEDULER_CPP.read_text()
+    body = function_body(source, "snapshot_active_task_lifetime_refs_if")
+
+    require_tokens(
+        body,
+        [
+            "global_task_registry_lock.lock_irqsave()",
+            "if (matching > capacity || (matching != 0 && out == nullptr))",
+            "if (retained == capacity)",
+            "out[retained_i]->release()",
+            "candidate->try_acquire_lifetime_ref()",
+            "out[retained++] = candidate",
+            "global_task_registry_lock.unlock_irqrestore(FLAGS)",
+        ],
+        "active task lifetime-ref snapshot",
+    )
+    require_order(
+        body,
+        "if (matching > capacity || (matching != 0 && out == nullptr))",
+        "candidate->try_acquire_lifetime_ref()",
+        "snapshot must reject insufficient capacity before retaining tasks",
+    )
+    for forbidden in ("new ", "kmalloc", "log::", "dbg::"):
+        if forbidden in body:
+            fail(f"active task snapshot must not allocate or log under the registry lock: {forbidden}")
+
+
 def main() -> None:
     test_scheduler_wait_check_arm_halt_is_irq_atomic()
     test_event_wake_cancel_preserves_current_task_wakeup_token()
@@ -2031,6 +2059,7 @@ def main() -> None:
     test_switch_picker_evicts_unpublishable_runnable_tasks()
     test_voluntary_blocked_current_cannot_hide_runnable_peer()
     test_runnable_publication_requires_successful_heap_insert()
+    test_active_task_snapshot_holds_one_registry_lock()
     print("scheduler wake-token and runtime accounting invariants hold")
 
 

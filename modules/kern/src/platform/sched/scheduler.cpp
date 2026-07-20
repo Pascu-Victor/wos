@@ -6150,6 +6150,47 @@ auto find_active_task_lifetime_ref_if(ActiveTaskPredicate predicate, void* conte
     return nullptr;
 }
 
+auto snapshot_active_task_lifetime_refs_if(ActiveTaskPredicate predicate, void* context, task::Task** out, size_t capacity) -> size_t {
+    if (predicate == nullptr) {
+        return 0;
+    }
+
+    uint64_t const FLAGS = global_task_registry_lock.lock_irqsave();
+    size_t matching = 0;
+    for (uint32_t i = 0; i < active_task_count; ++i) {
+        task::Task* candidate = active_task_slot(i);
+        if (candidate != nullptr && predicate(candidate, context)) {
+            ++matching;
+        }
+    }
+
+    if (matching > capacity || (matching != 0 && out == nullptr)) {
+        global_task_registry_lock.unlock_irqrestore(FLAGS);
+        return matching;
+    }
+
+    size_t retained = 0;
+    for (uint32_t i = 0; i < active_task_count; ++i) {
+        task::Task* candidate = active_task_slot(i);
+        if (candidate == nullptr || !predicate(candidate, context)) {
+            continue;
+        }
+        if (retained == capacity) {
+            for (size_t retained_i = 0; retained_i < retained; ++retained_i) {
+                out[retained_i]->release();
+            }
+            global_task_registry_lock.unlock_irqrestore(FLAGS);
+            return capacity + 1;
+        }
+        if (!candidate->try_acquire_lifetime_ref()) {
+            continue;
+        }
+        out[retained++] = candidate;
+    }
+    global_task_registry_lock.unlock_irqrestore(FLAGS);
+    return retained;
+}
+
 auto find_dead_task_lifetime_ref_if(DeadTaskPredicate predicate, void* context) -> task::Task* {
     if (predicate == nullptr || run_queues == nullptr) {
         return nullptr;

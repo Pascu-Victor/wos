@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <new>
 #include <platform/asm/cpu.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/init/limine_requests.hpp>
@@ -652,46 +653,46 @@ auto update_shared_vmem_ranges_locked(ker::mod::sched::task::Task* task, Fn upda
     }
 
     auto* const PAGEMAP = task->pagemap;
-    using SharedVmemTaskVec = ker::util::SmallVec<ker::mod::sched::task::Task*, 32>;
-    struct SharedVmemTaskScan {
-        ker::mod::mm::paging::PageTable* pagemap;
-        SharedVmemTaskVec* tasks;
-    };
-    SharedVmemTaskVec tasks;
-    SharedVmemTaskScan scan{.pagemap = PAGEMAP, .tasks = &tasks};
-    auto const MATCH_UNVISITED_SIBLING = [](ker::mod::sched::task::Task* candidate, void* context) -> bool {
-        auto* const STATE = static_cast<SharedVmemTaskScan*>(context);
-        return candidate != nullptr && candidate->pagemap == STATE->pagemap && candidate->type != ker::mod::sched::task::TaskType::DAEMON &&
-               !STATE->tasks->contains(candidate);
+    auto const MATCH_SIBLING = [](ker::mod::sched::task::Task* candidate, void* context) -> bool {
+        auto* const PAGEMAP = static_cast<ker::mod::mm::paging::PageTable*>(context);
+        return candidate != nullptr && candidate->pagemap == PAGEMAP && candidate->type != ker::mod::sched::task::TaskType::DAEMON;
     };
 
-    // Count/index iteration over the active-task array is not a stable
-    // snapshot: task removal swaps the final entry into the removed slot and
-    // can make a live sibling disappear behind the current index. Acquire one
-    // unvisited lifetime reference per registry scan instead. Shared-VM task
-    // publication is serialized by the caller, so matching tasks can only
-    // leave while this snapshot is assembled.
+    constexpr size_t INLINE_TASKS = 32;
+    std::array<ker::mod::sched::task::Task*, INLINE_TASKS> inline_tasks{};
+    ker::mod::sched::task::Task** tasks = inline_tasks.data();
+    ker::mod::sched::task::Task** heap_tasks = nullptr;
+    size_t capacity = inline_tasks.size();
+    size_t task_count = 0;
+
+    // Snapshot the registry under one lock acquisition so removal cannot swap
+    // an unvisited sibling behind an index. Shared-VM publication is serialized
+    // by the caller; the retry only handles a generic capacity race.
     for (;;) {
-        auto* candidate = ker::mod::sched::find_active_task_lifetime_ref_if(MATCH_UNVISITED_SIBLING, &scan);
-        if (candidate == nullptr) {
+        task_count = ker::mod::sched::snapshot_active_task_lifetime_refs_if(MATCH_SIBLING, PAGEMAP, tasks, capacity);
+        if (task_count <= capacity) {
             break;
         }
-        if (!tasks.push_back(candidate)) {
-            candidate->release();
-            for (auto* retained : tasks) {
-                retained->release();
-            }
+        auto** larger = new (std::nothrow) ker::mod::sched::task::Task*[task_count];
+        if (larger == nullptr) {
+            delete[] heap_tasks;
             return false;
         }
+        delete[] heap_tasks;
+        heap_tasks = larger;
+        tasks = heap_tasks;
+        capacity = task_count;
     }
 
     bool touched_current = false;
     bool ok = true;
-    for (auto* candidate : tasks) {
+    for (size_t i = 0; i < task_count; ++i) {
+        auto* candidate = tasks[i];
         touched_current = touched_current || candidate == task;
         ok = update(candidate) && ok;
         candidate->release();
     }
+    delete[] heap_tasks;
 
     if (!touched_current) {
         ok = update(task) && ok;
