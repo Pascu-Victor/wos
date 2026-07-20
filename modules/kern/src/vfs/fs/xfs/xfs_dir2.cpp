@@ -3133,41 +3133,6 @@ auto dir2_block_addname(XfsInode* dp, const char* name, uint16_t namelen, xfs_in
     // Leaf entries are just before the tail
     uint8_t* leaf_start = block + BLKSIZE - sizeof(XfsDir2BlockTail) - LEAF_BYTES;
 
-    // Scan data area for a free space entry large enough
-    size_t const DATA_START = sizeof(XfsDir3DataHdr);
-    auto const DATA_END = static_cast<size_t>(leaf_start - block);
-
-    size_t offset = DATA_START;
-    size_t found_offset = 0;
-    uint16_t found_free_len = 0;
-    bool found_free = false;
-
-    while (offset < DATA_END) {
-        uint16_t free_len = 0;
-        if (dir2_data_unused_at_if_valid(block, offset, DATA_END, &free_len)) {
-            if (free_len >= NEED_LEN) {
-                found_offset = offset;
-                found_free_len = free_len;
-                found_free = true;
-                break;
-            }
-            offset += free_len;
-            continue;
-        }
-
-        const XfsDir2DataEntry* dep = nullptr;
-        size_t dep_size = 0;
-        if (!dir2_data_entry_at_if_valid(ctx, block, offset, DATA_END, &dep, &dep_size)) {
-            break;
-        }
-        offset += dep_size;
-    }
-
-    if (!found_free) {
-        brelse(bh);
-        return -ENOSPC;  // block full - would need conversion to leaf format
-    }
-
     auto* blp = reinterpret_cast<XfsDir2LeafEntry*>(leaf_start);
     uint32_t const STALE_COUNT = btp->stale.to_cpu();
     size_t const ACTUAL_STALE = dir2_count_stale_leaf_entries(blp, leaf_count);
@@ -3176,19 +3141,66 @@ auto dir2_block_addname(XfsInode* dp, const char* name, uint16_t namelen, xfs_in
         return -EINVAL;
     }
 
+    // Scan data area for a free space entry large enough
+    size_t const DATA_START = sizeof(XfsDir3DataHdr);
+    auto const DATA_END = static_cast<size_t>(leaf_start - block);
+    constexpr size_t LEAF_SLOT_SIZE = sizeof(XfsDir2LeafEntry);
+
+    size_t offset = DATA_START;
+    size_t found_offset = 0;
+    uint16_t found_free_len = 0;
+    bool found_free = false;
+    size_t tail_free_offset = 0;
+    uint16_t tail_free_len = 0;
+    bool found_tail_free = false;
+
+    while (offset < DATA_END) {
+        uint16_t free_len = 0;
+        if (dir2_data_unused_at_if_valid(block, offset, DATA_END, &free_len)) {
+            bool const IS_TAIL_FREE = offset + free_len == DATA_END;
+            if (IS_TAIL_FREE) {
+                tail_free_offset = offset;
+                tail_free_len = free_len;
+                found_tail_free = true;
+            }
+
+            size_t usable_len = free_len;
+            if (STALE_COUNT == 0 && IS_TAIL_FREE) {
+                usable_len = usable_len >= LEAF_SLOT_SIZE ? usable_len - LEAF_SLOT_SIZE : 0;
+            }
+            if (!found_free && usable_len >= NEED_LEN) {
+                found_offset = offset;
+                found_free_len = static_cast<uint16_t>(usable_len);
+                found_free = true;
+            }
+            offset += free_len;
+            continue;
+        }
+
+        const XfsDir2DataEntry* dep = nullptr;
+        size_t dep_size = 0;
+        if (!dir2_data_entry_at_if_valid(ctx, block, offset, DATA_END, &dep, &dep_size)) {
+            brelse(bh);
+            return -EINVAL;
+        }
+        offset += dep_size;
+    }
+
+    if (offset != DATA_END) {
+        brelse(bh);
+        return -EINVAL;
+    }
+    if (!found_free || (STALE_COUNT == 0 && (!found_tail_free || static_cast<size_t>(tail_free_len) < LEAF_SLOT_SIZE))) {
+        brelse(bh);
+        return -ENOSPC;  // block full - would need conversion to leaf format
+    }
+
     // Add a leaf entry for the new name.  Precompute the sorted slot before
     // mutating the data area so readdir cannot expose an unindexed entry.
     xfs_dahash_t const HASH = xfs_da_hashname(reinterpret_cast<const uint8_t*>(name), namelen);
     int stale_idx = -1;
     int insert_pos = 0;
-    if (STALE_COUNT == 0) {
-        size_t const NEW_LEAF_BYTES = (static_cast<size_t>(leaf_count) + 1) * sizeof(XfsDir2LeafEntry);
-        size_t const NEW_LEAF_START = BLKSIZE - sizeof(XfsDir2BlockTail) - NEW_LEAF_BYTES;
-        if (found_offset + NEED_LEN > NEW_LEAF_START) {
-            brelse(bh);
-            return -ENOSPC;
-        }
-    } else {
+    if (STALE_COUNT != 0) {
         for (int i = 0; std::cmp_less(i, leaf_count); i++) {
             if (blp[i].address.to_cpu() != XFS_DIR2_NULL_DATAPTR && blp[i].hashval.to_cpu() <= HASH) {
                 insert_pos = i + 1;
@@ -3218,8 +3230,27 @@ auto dir2_block_addname(XfsInode* dp, const char* name, uint16_t namelen, xfs_in
         return CAPTURE_RC;
     }
 
-    // Write the new data entry at found_offset
-    uint16_t const OLD_FREE_LEN = found_free_len;
+    // Reserve the independently-owned leaf slot before writing either area.
+    // When the selected data region is also the trailing free record, its
+    // usable length was already reduced during preflight.
+    uint16_t old_free_len = found_free_len;
+    size_t current_data_end = DATA_END;
+    if (STALE_COUNT == 0) {
+        current_data_end -= LEAF_SLOT_SIZE;
+        size_t const REMAINING_TAIL = static_cast<size_t>(tail_free_len) - LEAF_SLOT_SIZE;
+        if (REMAINING_TAIL != 0) {
+            auto* tail_unused = reinterpret_cast<XfsDir2DataUnused*>(block + tail_free_offset);
+            tail_unused->freetag = Be16::from_cpu(XFS_DIR2_DATA_FREE_TAG);
+            tail_unused->length = Be16::from_cpu(static_cast<uint16_t>(REMAINING_TAIL));
+            auto* tail_tag = reinterpret_cast<Be16*>(block + current_data_end - sizeof(Be16));
+            *tail_tag = Be16::from_cpu(static_cast<uint16_t>(tail_free_offset));
+        }
+        if (found_offset == tail_free_offset) {
+            old_free_len = static_cast<uint16_t>(REMAINING_TAIL);
+        }
+    }
+
+    // Write the new data entry at found_offset.
 
     auto* dep = reinterpret_cast<XfsDir2DataEntry*>(block + found_offset);
     dep->inumber = Be64::from_cpu(ino);
@@ -3249,8 +3280,8 @@ auto dir2_block_addname(XfsInode* dp, const char* name, uint16_t namelen, xfs_in
     }
 
     // If there's remaining free space after our entry, create a new unused entry
-    if (OLD_FREE_LEN > NEED_LEN) {
-        size_t const REMAINING = OLD_FREE_LEN - NEED_LEN;
+    if (old_free_len > NEED_LEN) {
+        size_t const REMAINING = old_free_len - NEED_LEN;
         auto* new_unused = reinterpret_cast<XfsDir2DataUnused*>(block + ENTRY_END);
         new_unused->freetag = Be16::from_cpu(XFS_DIR2_DATA_FREE_TAG);
         new_unused->length = Be16::from_cpu(static_cast<uint16_t>(REMAINING));
@@ -3311,43 +3342,11 @@ auto dir2_block_addname(XfsInode* dp, const char* name, uint16_t namelen, xfs_in
         btp->count = Be32::from_cpu(leaf_count);
     }
 
-    // Update best_free in the header to reflect the remaining free space.
-    // After inserting the data entry (consuming need_len bytes from the old
-    // free region), there may be a leftover free region.
+    // Rebuild bestfree over the exact post-growth data span.  This records
+    // both an interior insertion remainder and the independently-shortened
+    // trailing free record.
     auto* mutable_hdr = reinterpret_cast<XfsDir3DataHdr*>(block);
-    {
-        size_t const ENTRY_END = found_offset + NEED_LEN;
-        // Compute where the leaf area now starts
-        size_t const CURRENT_LEAF_START = BLKSIZE - sizeof(XfsDir2BlockTail) - (static_cast<size_t>(leaf_count) * sizeof(XfsDir2LeafEntry));
-        // The remaining free space is between entry_end and current_leaf_start
-        // (only if a free-space marker was written there earlier, check it)
-        mutable_hdr->best_free.at(0).offset = Be16{0};
-        mutable_hdr->best_free.at(0).length = Be16{0};
-        mutable_hdr->best_free.at(1).offset = Be16{0};
-        mutable_hdr->best_free.at(1).length = Be16{0};
-        mutable_hdr->best_free.at(2).offset = Be16{0};
-        mutable_hdr->best_free.at(2).length = Be16{0};
-        // Check the remainder area for a free-tag marker
-        if (ENTRY_END < CURRENT_LEAF_START) {
-            const auto* rem = reinterpret_cast<const XfsDir2DataUnused*>(block + ENTRY_END);
-            if (rem->freetag.to_cpu() == XFS_DIR2_DATA_FREE_TAG) {
-                uint16_t rem_len = rem->length.to_cpu();
-                // The free region may need its length truncated if the leaf
-                // array grew into it (leaf area shifted down).
-                size_t const MAX_FREE = CURRENT_LEAF_START - ENTRY_END;
-                if (rem_len > MAX_FREE) {
-                    // Adjust free region length and re-write its tail tag
-                    auto* adj_unused = reinterpret_cast<XfsDir2DataUnused*>(block + ENTRY_END);
-                    adj_unused->length = Be16::from_cpu(static_cast<uint16_t>(MAX_FREE));
-                    auto* adj_tag = reinterpret_cast<Be16*>(block + ENTRY_END + MAX_FREE - sizeof(Be16));
-                    *adj_tag = Be16::from_cpu(static_cast<uint16_t>(ENTRY_END));
-                    rem_len = static_cast<uint16_t>(MAX_FREE);
-                }
-                mutable_hdr->best_free.at(0).offset = Be16::from_cpu(static_cast<uint16_t>(ENTRY_END));
-                mutable_hdr->best_free.at(0).length = Be16::from_cpu(rem_len);
-            }
-        }
-    }
+    dir2_rebuild_data_bestfree(ctx, block, DATA_START, current_data_end);
 
     // Recompute CRC over the entire block
     mutable_hdr->hdr.crc = Be32{0};
