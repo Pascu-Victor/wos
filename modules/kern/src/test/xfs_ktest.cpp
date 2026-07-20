@@ -17,6 +17,7 @@
 #include <vfs/fs/xfs/xfs_dir2.hpp>
 #include <vfs/fs/xfs/xfs_format.hpp>
 #include <vfs/fs/xfs/xfs_mount.hpp>
+#include <vfs/fs/xfs/xfs_trans.hpp>
 #include <vfs/fs/xfs/xfs_vfs.hpp>
 
 // ---------------------------------------------------------------------------
@@ -75,6 +76,8 @@ KTEST(XFS, MagicConstant) {
 KTEST(XFS, SuperblockStructSize) { KEXPECT_EQ(sizeof(ker::vfs::xfs::XfsDsb), static_cast<size_t>(264)); }
 
 KTEST(XFS, InodeStructSize) { KEXPECT_EQ(sizeof(ker::vfs::xfs::XfsDinode), static_cast<size_t>(176)); }
+
+KTEST(XFS, TransactionCancelRestoresLinkCount) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_transaction_cancel_restores_nlink()); }
 
 KTEST(XFS, AgfStructSize) { KEXPECT_EQ(sizeof(ker::vfs::xfs::XfsAgf), static_cast<size_t>(224)); }
 

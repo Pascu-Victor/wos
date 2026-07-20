@@ -61,11 +61,13 @@ def main() -> None:
     inode = (XFS / "xfs_inode.cpp").read_text()
     dir2 = (XFS / "xfs_dir2.cpp").read_text()
     log = (XFS / "xfs_log.cpp").read_text()
+    vfs = (XFS / "xfs_vfs.cpp").read_text()
 
     for token in [
         "struct XfsTransBufUndo",
         "struct XfsTransPerAgUndo",
         "struct XfsTransInodeUndo",
+        "uint32_t nlink{};",
         "bool journal_held{};",
         "auto xfs_trans_capture_buf(XfsTransaction* tp, BufHead* bp) -> int;",
         "auto xfs_trans_capture_perag(XfsTransaction* tp, xfs_agnumber_t agno) -> int;",
@@ -83,6 +85,13 @@ def main() -> None:
         ["xfs_trans_restore_undo(tp);", "brelse(item.buf.bp);", "xfs_trans_release(tp);"],
         "cancel restores before releasing transaction buffers",
     )
+    require_order(
+        function_body(trans, "xfs_trans_capture_inode"),
+        ["undo->nlink = ip->nlink;", "undo->dirty = ip->dirty;"],
+        "inode capture snapshots link count",
+    )
+    if "undo->ip->nlink = undo->nlink;" not in restore:
+        fail("inode cancellation must restore link count")
     require_order(
         function_body(trans, "xfs_trans_capture_buf"),
         ["bjournal_hold(bp);", "__builtin_memcpy(undo->before_image"],
@@ -175,6 +184,53 @@ def main() -> None:
         ["xfs_trans_capture_buf(tp, data_bh)", "lep[leaf_idx].address ="],
         "leaf/node remove snapshots data and index buffers before overwrite",
     )
+
+    require_order(
+        function_body(vfs, "xfs_link_path"),
+        ["xfs_trans_capture_inode(tp, source_ip)", "source_ip->nlink++", "xfs_dir_addname(new_parent"],
+        "hard link snapshots link count before namespace mutation",
+    )
+    require_order(
+        function_body(vfs, "xfs_unlink_path"),
+        [
+            "target_ip = xfs_inode_read_known_allocated",
+            "xfs_trans_capture_inode(tp, target_ip)",
+            "xfs_dir_removename(parent_ip",
+            "target_ip->nlink--",
+        ],
+        "unlink holds and snapshots its target before removing the name",
+    )
+    require_order(
+        function_body(vfs, "xfs_rmdir_path"),
+        ["xfs_trans_capture_inode(tp, dir_ip)", "xfs_dir_removename(parent_ip", "dir_ip->nlink = 0"],
+        "rmdir snapshots the removed directory link count",
+    )
+    require_order(
+        function_body(vfs, "xfs_rename_path"),
+        [
+            "displaced = xfs_inode_read_known_allocated",
+            "xfs_trans_capture_inode(tp, displaced)",
+            "xfs_dir_removename(new_parent",
+            "displaced->nlink--",
+            "xfs_dir_addname(new_parent",
+            "xfs_dir_removename(old_parent",
+        ],
+        "overwrite rename snapshots the displaced inode before namespace mutation",
+    )
+
+    for function_name, add_token in [
+        ("xfs_open_path", "xfs_dir_addname(create_parent_ip"),
+        ("xfs_mkdir_path", "xfs_dir_addname(parent_ip"),
+        ("xfs_symlink_path", "xfs_dir_addname(parent_ip"),
+    ]:
+        body = function_body(vfs, function_name)
+        require_order(
+            body,
+            ["xfs_ialloc(ctx, tp", "xfs_ialloc_conflicts_with_cached_inode(ctx, NEW_INO)", add_token, "xfs_trans_commit(tp)"],
+            f"{function_name} rejects an allocator/cache collision before publishing a name",
+        )
+    if "ip = xfs_inode_read_known_allocated(ctx, NEW_INO);" in function_body(vfs, "xfs_open_path"):
+        fail("create must not reopen an existing cached inode after publishing a new name")
 
 
 if __name__ == "__main__":

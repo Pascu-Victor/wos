@@ -148,6 +148,7 @@ void xfs_trans_restore_undo(XfsTransaction* tp) {
         undo->ip->size = undo->size;
         undo->ip->nblocks = undo->nblocks;
         undo->ip->nextents = undo->nextents;
+        undo->ip->nlink = undo->nlink;
         undo->ip->dirty = undo->dirty;
         undo->ip->dir_generation = undo->dir_generation;
         undo->ip->dir_leaf_index_complete_generation = undo->dir_leaf_index_complete_generation;
@@ -488,6 +489,7 @@ auto xfs_trans_capture_inode(XfsTransaction* tp, XfsInode* ip) -> int {
     undo->size = ip->size;
     undo->nblocks = ip->nblocks;
     undo->nextents = ip->nextents;
+    undo->nlink = ip->nlink;
     undo->dirty = ip->dirty;
     undo->dir_generation = ip->dir_generation;
     undo->dir_leaf_index_complete_generation = ip->dir_leaf_index_complete_generation;
@@ -654,5 +656,28 @@ void xfs_trans_cancel(XfsTransaction* tp) {
     tp->cancelled = true;
     xfs_trans_release(tp);
 }
+
+#ifdef WOS_SELFTEST
+auto xfs_selftest_transaction_cancel_restores_nlink() -> bool {
+    XfsMountContext mount{};
+    XfsInode inode{};
+    inode.mount = &mount;
+    inode.nlink = 2;
+    inode.data_fork.format = XFS_DINODE_FMT_EXTENTS;
+
+    XfsTransaction* tp = xfs_trans_alloc(&mount);
+    if (tp == nullptr || xfs_trans_capture_inode(tp, &inode) != 0) {
+        if (tp != nullptr) {
+            xfs_trans_cancel(tp);
+        }
+        return false;
+    }
+
+    inode.nlink = 0;
+    inode.dirty = true;
+    xfs_trans_cancel(tp);
+    return inode.nlink == 2 && !inode.dirty;
+}
+#endif
 
 }  // namespace ker::vfs::xfs

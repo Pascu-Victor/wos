@@ -101,6 +101,7 @@ struct XfsTransInodeUndo {
     uint64_t size{};
     uint64_t nblocks{};
     uint32_t nextents{};
+    uint32_t nlink{};
     bool dirty{};
     uint64_t dir_generation{};
     uint64_t dir_leaf_index_complete_generation{};
@@ -165,5 +166,9 @@ auto xfs_trans_commit(XfsTransaction* tp) -> int;
 
 // Cancel a transaction - discard all changes.
 void xfs_trans_cancel(XfsTransaction* tp);
+
+#ifdef WOS_SELFTEST
+auto xfs_selftest_transaction_cancel_restores_nlink() -> bool;
+#endif
 
 }  // namespace ker::vfs::xfs
