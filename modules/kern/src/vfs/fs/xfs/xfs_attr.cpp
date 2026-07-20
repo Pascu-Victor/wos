@@ -520,8 +520,9 @@ void attr_leaf_compute_crc(uint8_t* block, size_t block_size) {
     // Zero the CRC field before computing
     __builtin_memset(block + XFS_ATTR3_LEAF_CRC_OFF, 0, 4);
     uint32_t const CRC = util::crc32c_block_with_cksum(block, block_size, XFS_ATTR3_LEAF_CRC_OFF);
-    Be32 crc_be = Be32::from_cpu(CRC);
-    __builtin_memcpy(block + XFS_ATTR3_LEAF_CRC_OFF, &crc_be, 4);
+    // XFS metadata checksums are stored little-endian, including the checksum
+    // slot embedded in the otherwise big-endian DA header.
+    __builtin_memcpy(block + XFS_ATTR3_LEAF_CRC_OFF, &CRC, sizeof(CRC));
 }
 
 struct AttrLeafBuildRec {

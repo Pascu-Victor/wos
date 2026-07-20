@@ -136,7 +136,7 @@ def main() -> None:
     require(sf_to_block, "xfs_trans_log_buf_full(tp, bh);", "shortform conversion logs initialized block")
     require_order(
         sf_to_block,
-        "hdr3->hdr.crc = Be32::from_cpu(CRC);",
+        "__builtin_memcpy(&hdr3->hdr.crc, &CRC, sizeof(CRC));",
         "xfs_trans_log_buf_full(tp, bh);",
         "shortform conversion logs after final crc",
     )

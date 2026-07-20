@@ -1736,14 +1736,16 @@ void dir2_recompute_leaf_crc(uint8_t* block, size_t blksize) {
     auto* hdr = reinterpret_cast<XfsDir3LeafHdr*>(block);
     hdr->info.crc = Be32{0};
     uint32_t const CRC = util::crc32c_block_with_cksum(block, blksize, XFS_DA3_CRC_OFF);
-    hdr->info.crc = Be32::from_cpu(CRC);
+    // XFS checksum fields are stored little-endian even when the surrounding
+    // metadata structure declares the slot as __be32.
+    __builtin_memcpy(&hdr->info.crc, &CRC, sizeof(CRC));
 }
 
 void dir2_recompute_data_crc(uint8_t* block, size_t blksize) {
     auto* hdr = reinterpret_cast<XfsDir3DataHdr*>(block);
     hdr->hdr.crc = Be32{0};
     uint32_t const CRC = util::crc32c_block_with_cksum(block, blksize, 4);
-    hdr->hdr.crc = Be32::from_cpu(CRC);
+    __builtin_memcpy(&hdr->hdr.crc, &CRC, sizeof(CRC));
 }
 
 auto dir2_validate_leaf_data_block(const uint8_t* block) -> int {
@@ -2494,7 +2496,7 @@ auto dir2_sf_to_block(XfsInode* dp, XfsTransaction* tp) -> int {
     // 3f. Compute CRC over the block
     hdr3->hdr.crc = Be32{0};
     uint32_t const CRC = util::crc32c_block_with_cksum(block, BLKSIZE, 4);  // crc at offset 4 in XfsDir3BlkHdr
-    hdr3->hdr.crc = Be32::from_cpu(CRC);
+    __builtin_memcpy(&hdr3->hdr.crc, &CRC, sizeof(CRC));
 
     // The transaction owns a reference until commit, so the follow-up
     // dir2_block_addname read in this same transaction can reuse the cached
@@ -2896,7 +2898,7 @@ auto dir2_block_addname(XfsInode* dp, const char* name, uint16_t namelen, xfs_in
     // Recompute CRC over the entire block
     mutable_hdr->hdr.crc = Be32{0};
     uint32_t const CRC = util::crc32c_block_with_cksum(block, BLKSIZE, 4);
-    mutable_hdr->hdr.crc = Be32::from_cpu(CRC);
+    __builtin_memcpy(&mutable_hdr->hdr.crc, &CRC, sizeof(CRC));
 
     xfs_trans_log_buf_full(tp, bh);
     brelse(bh);
@@ -3291,7 +3293,7 @@ auto dir2_block_removename(XfsInode* dp, const char* name, uint16_t namelen, Xfs
     // Update CRC over the block
     hdr->hdr.crc = Be32{0};
     uint32_t const CRC = util::crc32c_block_with_cksum(block, BLKSIZE, 4);
-    hdr->hdr.crc = Be32::from_cpu(CRC);
+    __builtin_memcpy(&hdr->hdr.crc, &CRC, sizeof(CRC));
 
     xfs_trans_log_buf_full(tp, bh);
     brelse(bh);
