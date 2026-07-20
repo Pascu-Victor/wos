@@ -53,20 +53,6 @@ auto btree_owner(const XfsBtreeCursor<Traits>* cur) -> uint64_t {
     }
 }
 
-constexpr xfs_agblock_t XFS_AG_BTREE_RESERVED_MAX = 4;
-
-template <typename Traits>
-auto btree_should_preserve_empty_ag_block(const XfsBtreeCursor<Traits>* cur, xfs_agblock_t agbno) -> bool {
-    if constexpr (Traits::TYPE == XfsBtreeType::SHORT) {
-        static_cast<void>(cur);
-        return agbno <= XFS_AG_BTREE_RESERVED_MAX;
-    } else {
-        static_cast<void>(cur);
-        static_cast<void>(agbno);
-        return false;
-    }
-}
-
 }  // namespace
 
 // ============================================================================
@@ -784,10 +770,21 @@ void btree_write_ptr(uint8_t* block_data, uint32_t block_size, int idx, uint64_t
     }
 }
 
+template <typename Traits>
+auto btree_blockno(const XfsBtreeCursor<Traits>* cur, const BufHead* bp) -> uint64_t {
+    uint64_t const ABS_BLOCK = bp->block_no / (cur->mount->block_size / cur->mount->sect_size);
+    if constexpr (Traits::TYPE == XfsBtreeType::SHORT) {
+        return ABS_BLOCK % cur->mount->ag_blocks;
+    } else {
+        return ABS_BLOCK;
+    }
+}
+
 // Forward declaration for mutual recursion
 template <typename Traits>
 auto btree_insert_into_parent(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp, int lev, const typename Traits::Key& new_key,
-                              uint64_t new_ptr, uint64_t root_block, uint8_t nlevels, uint64_t* new_root, uint8_t* new_nlevels) -> int;
+                              uint64_t left_ptr, uint64_t new_ptr, uint64_t root_block, uint8_t nlevels, uint64_t* new_root,
+                              uint8_t* new_nlevels) -> int;
 
 // Split a full internal node at level `lev`.  The cursor's level_at(lev).ptr
 // indicates the current child position.  After the split the new key/pointer
@@ -839,14 +836,7 @@ auto btree_split_internal(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp, int l
     }();
 
     // Derive left block's own block number for right->leftsib
-    uint64_t const LEFT_BLOCKNO = [&]() -> uint64_t {
-        uint64_t const ABS = left_bp->block_no / (cur->mount->block_size / cur->mount->sect_size);
-        if constexpr (Traits::TYPE == XfsBtreeType::SHORT) {
-            return ABS % cur->mount->ag_blocks;
-        } else {
-            return ABS;
-        }
-    }();
+    uint64_t const LEFT_BLOCKNO = btree_blockno<Traits>(cur, left_bp);
 
     btree_set_rightsib<Traits>(left_bp, RIGHT_BLOCKNO);
     btree_set_leftsib<Traits>(right_bp, LEFT_BLOCKNO);
@@ -932,7 +922,8 @@ auto btree_split_internal(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp, int l
     brelse(right_bp);
 
     // Propagate promoted key and new right sibling block number up
-    return btree_insert_into_parent<Traits>(cur, tp, lev + 1, promoted_key, RIGHT_BLOCKNO, root_block, nlevels, new_root, new_nlevels);
+    return btree_insert_into_parent<Traits>(cur, tp, lev + 1, promoted_key, LEFT_BLOCKNO, RIGHT_BLOCKNO, root_block, nlevels, new_root,
+                                            new_nlevels);
 }
 
 // Insert a new key/pointer pair into the parent node at level `lev`.
@@ -940,7 +931,8 @@ auto btree_split_internal(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp, int l
 // we have exhausted all existing levels and need to grow a new root.
 template <typename Traits>
 auto btree_insert_into_parent(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp, int lev, const typename Traits::Key& new_key,
-                              uint64_t new_ptr, uint64_t root_block, uint8_t nlevels, uint64_t* new_root, uint8_t* new_nlevels) -> int {
+                              uint64_t left_ptr, uint64_t new_ptr, uint64_t root_block, uint8_t nlevels, uint64_t* new_root,
+                              uint8_t* new_nlevels) -> int {
     if (lev == cur->nlevels) {
         if (nlevels >= XFS_BTREE_MAXLEVELS) {
             return -EIO;
@@ -973,7 +965,11 @@ auto btree_insert_into_parent(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp, i
         __builtin_memcpy(nr_data + btree_key_off<Traits>(1), &new_key, Traits::KEY_LEN);
 
         // Two pointers (layout: after 2 keys)
-        btree_write_ptr<Traits>(nr_data, cur->mount->block_size, 1, root_block);
+        if (left_ptr != root_block) {
+            brelse(new_root_bp);
+            return -EIO;
+        }
+        btree_write_ptr<Traits>(nr_data, cur->mount->block_size, 1, left_ptr);
         btree_write_ptr<Traits>(nr_data, cur->mount->block_size, 2, new_ptr);
 
         btree_set_numrecs_raw<Traits>(nr_data, 2);
@@ -996,9 +992,28 @@ auto btree_insert_into_parent(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp, i
     if (parent_bp == nullptr) {
         return -EIO;
     }
-    int const INSERT_POS = cur->level_at(lev).ptr + 1;  // new child is to the right of current
     int const PARENT_NR = cur->numrecs(lev);
     int const MAX_KEYS = btree_max_keys_node<Traits>(cur->mount->block_size);
+
+    // A split can allocate and touch other metadata buffers before it reaches
+    // the parent. Do not assume the cursor slot still identifies the block
+    // that was split: find that exact child and insert immediately after it.
+    // This also prevents a stale slot from duplicating new_ptr while orphaning
+    // the real left child from the parent index.
+    int left_pos = 0;
+    for (int pos = 1; pos <= PARENT_NR; ++pos) {
+        if (cur->ptr_at(lev, pos) == left_ptr) {
+            if (left_pos != 0) {
+                return -EIO;
+            }
+            left_pos = pos;
+        }
+    }
+    if (left_pos == 0) {
+        return -EIO;
+    }
+    cur->level_at(lev).ptr = left_pos;
+    int const INSERT_POS = left_pos + 1;
 
     if (PARENT_NR < MAX_KEYS) {
         uint8_t* p_data = parent_bp->data;
@@ -1075,16 +1090,11 @@ auto btree_remove_from_parent(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp, i
             xfs_trans_log_buf_full(tp, parent_bp);
             return 0;
         }
-        // Non-root internal node is empty - return it to the AGFL and recurse up.
-        // Use xfs_alloc_put_freelist (not xfs_free_extent) for the same
-        // reason as the leaf case: avoids recursion through btree insert.
-        uint64_t const ABS_BLOCK = parent_bp->block_no / (cur->mount->block_size / cur->mount->sect_size);
-        auto par_agbno = static_cast<xfs_agblock_t>(ABS_BLOCK % cur->mount->ag_blocks);
+        // Detach the empty internal node, but do not recycle it yet.
+        // Transaction cancellation has no buffer before-images, so AGFL
+        // publication could let another tree reuse a still-visible block.
         btree_update_crc<Traits>(parent_bp);
         xfs_trans_log_buf_full(tp, parent_bp);
-        if (!btree_should_preserve_empty_ag_block<Traits>(cur, par_agbno)) {
-            xfs_alloc_put_freelist(cur->mount, tp, cur->agno, par_agbno);
-        }
         return btree_remove_from_parent<Traits>(cur, tp, lev + 1);
     }
 
@@ -1155,6 +1165,28 @@ auto xfs_btree_insert(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp, const typ
     int const NR = cur->numrecs(0);
     int const MAX_RECS = btree_max_recs_leaf<Traits>(cur->mount->block_size);
 
+    // Reserve the entire split chain before changing the leaf. Running out of
+    // AGFL blocks after a leaf split would leave partial topology behind, and
+    // transaction cancellation cannot currently restore buffer contents.
+    if (NR >= MAX_RECS) {
+        uint32_t required_blocks = 1;  // right leaf
+        bool split_reaches_root = true;
+        for (int lev = 1; lev < cur->nlevels; ++lev) {
+            if (cur->numrecs(lev) < btree_max_keys_node<Traits>(cur->mount->block_size)) {
+                split_reaches_root = false;
+                break;
+            }
+            required_blocks++;
+        }
+        if (split_reaches_root) {
+            required_blocks++;  // new root
+        }
+        if (cur->mount->per_ag == nullptr || cur->agno >= cur->mount->ag_count ||
+            cur->mount->per_ag[cur->agno].agf_flcount < required_blocks) {
+            return -ENOSPC;
+        }
+    }
+
     if (NR < MAX_RECS) {
         // Room in current leaf - shift records right and insert
         uint8_t* base = cur->level_at(0).bp->data + Traits::HDR_LEN;
@@ -1224,14 +1256,7 @@ auto xfs_btree_insert(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp, const typ
         }
     }();
 
-    uint64_t const LEFT_BLOCKNO = [&]() -> uint64_t {
-        uint64_t const ABS = left_bp->block_no / (cur->mount->block_size / cur->mount->sect_size);
-        if constexpr (Traits::TYPE == XfsBtreeType::SHORT) {
-            return ABS % cur->mount->ag_blocks;
-        } else {
-            return ABS;
-        }
-    }();
+    uint64_t const LEFT_BLOCKNO = btree_blockno<Traits>(cur, left_bp);
 
     btree_set_rightsib<Traits>(left_bp, RIGHT_BLOCKNO);
     btree_set_leftsib<Traits>(right_bp, LEFT_BLOCKNO);
@@ -1300,7 +1325,8 @@ auto xfs_btree_insert(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp, const typ
     brelse(right_bp);
 
     // Propagate the split upward
-    return btree_insert_into_parent<Traits>(cur, tp, 1, right_first_key, RIGHT_BLOCKNO, root_block, nlevels, new_root, new_nlevels);
+    return btree_insert_into_parent<Traits>(cur, tp, 1, right_first_key, LEFT_BLOCKNO, RIGHT_BLOCKNO, root_block, nlevels, new_root,
+                                            new_nlevels);
 }
 
 // ============================================================================
@@ -1316,6 +1342,16 @@ auto xfs_btree_delete(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp) -> int {
     int const NR = cur->numrecs(0);
     if (PTR < 1 || PTR > NR || cur->level_at(0).bp == nullptr) {
         return -EINVAL;
+    }
+
+    // A multi-level tree can shrink to one record without collapsing its
+    // root.  Keep that final leaf linked when deleting the record so a
+    // replacement insert still has a valid path from the fixed AGF root.
+    // Otherwise btree_remove_from_parent leaves a zero-record internal root,
+    // and all subsequent lookups fail before reaching the empty leaf.
+    bool preserve_only_leaf = NR == 1 && cur->nlevels > 1;
+    for (int lev = 1; preserve_only_leaf && lev < cur->nlevels; ++lev) {
+        preserve_only_leaf = cur->numrecs(lev) == 1;
     }
 
     // Shift records left to fill the gap
@@ -1362,6 +1398,13 @@ auto xfs_btree_delete(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp) -> int {
             return 0;
         }
 
+        if (preserve_only_leaf) {
+            // Every internal level has exactly one child, so unlinking this
+            // leaf would empty the root.  The next insert can descend through
+            // the retained path and will refresh all first keys.
+            return 0;
+        }
+
         // Non-root leaf - unlink it from the sibling chain and free it.
         uint64_t const LEFT_SIB = cur->left_sibling(0);
         uint64_t const RIGHT_SIB = cur->right_sibling(0);
@@ -1395,19 +1438,11 @@ auto xfs_btree_delete(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp) -> int {
             }
         }
 
-        // Update and log the now-empty leaf, then return it to the AGFL.
-        // We use xfs_alloc_put_freelist rather than xfs_free_extent to avoid
-        // recursion: xfs_free_extent calls xfs_btree_insert which can trigger
-        // btree_alloc_new_block => xfs_alloc_extent => xfs_btree_delete again.
-        // The AGFL path never touches the free space btrees.
+        // Keep the retired leaf out of the AGFL until transaction-safe
+        // deferred retirement exists. Leaking an unreachable metadata block
+        // is preferable to cross-tree reuse after an error/cancel.
         btree_update_crc<Traits>(leaf_bp);
         xfs_trans_log_buf_full(tp, leaf_bp);
-
-        uint64_t const ABS_LEAF = leaf_bp->block_no / (cur->mount->block_size / cur->mount->sect_size);
-        auto leaf_agbno = static_cast<xfs_agblock_t>(ABS_LEAF % cur->mount->ag_blocks);
-        if (!btree_should_preserve_empty_ag_block<Traits>(cur, leaf_agbno)) {
-            xfs_alloc_put_freelist(cur->mount, tp, cur->agno, leaf_agbno);
-        }
 
         // Remove the corresponding key/pointer from the parent
         return btree_remove_from_parent<Traits>(cur, tp, 1);

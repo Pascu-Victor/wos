@@ -53,7 +53,7 @@ def main() -> None:
     )
     require(
         source,
-        "btree_write_ptr<Traits>(nr_data, cur->mount->block_size, 1, root_block);",
+        "btree_write_ptr<Traits>(nr_data, cur->mount->block_size, 1, left_ptr);",
         "new root writes child pointer through fixed layout helper",
     )
 
@@ -89,26 +89,37 @@ def main() -> None:
     if "insert_ptr - MID - 1" in leaf_split:
         fail("leaf split right-half insertion must not shift one slot too far left")
 
-    require(source, "constexpr xfs_agblock_t XFS_AG_BTREE_RESERVED_MAX = 4;", "reserved AG btree block cutoff")
     require(
         source,
-        "auto btree_should_preserve_empty_ag_block(const XfsBtreeCursor<Traits>* cur, xfs_agblock_t agbno) -> bool",
-        "reserved AG btree block preservation helper",
+        "cur->mount->per_ag[cur->agno].agf_flcount < required_blocks",
+        "whole split-chain AGFL preflight",
     )
     require(
         source,
-        "return agbno <= XFS_AG_BTREE_RESERVED_MAX;",
-        "short-form AG btree reserved block preservation",
+        "if (cur->ptr_at(lev, pos) == left_ptr)",
+        "parent insertion must locate the exact child that was split",
     )
     require(
         source,
-        "if (!btree_should_preserve_empty_ag_block<Traits>(cur, par_agbno)) {\n            xfs_alloc_put_freelist(cur->mount, tp, cur->agno, par_agbno);\n        }\n        return btree_remove_from_parent<Traits>(cur, tp, lev + 1);",
-        "empty internal delete must remove parent pointer without recycling reserved AG blocks",
+        "cur->level_at(lev).ptr = left_pos;\n    int const INSERT_POS = left_pos + 1;",
+        "parent insertion position derived from verified left child",
+    )
+    if "xfs_alloc_put_freelist(cur->mount, tp, cur->agno" in source:
+        fail("btree deletion must not publish retired blocks before transaction-safe deferred retirement")
+    require(
+        source,
+        "bool preserve_only_leaf = NR == 1 && cur->nlevels > 1;",
+        "sole multi-level leaf preservation predicate",
     )
     require(
         source,
-        "if (!btree_should_preserve_empty_ag_block<Traits>(cur, leaf_agbno)) {\n            xfs_alloc_put_freelist(cur->mount, tp, cur->agno, leaf_agbno);\n        }\n\n        // Remove the corresponding key/pointer from the parent",
-        "empty leaf delete must remove parent pointer without recycling reserved AG blocks",
+        "for (int lev = 1; preserve_only_leaf && lev < cur->nlevels; ++lev) {\n        preserve_only_leaf = cur->numrecs(lev) == 1;\n    }",
+        "sole-child check through every internal level",
+    )
+    require(
+        source,
+        "if (preserve_only_leaf) {\n            // Every internal level has exactly one child",
+        "empty sole leaf retention before parent removal",
     )
 
 

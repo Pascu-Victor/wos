@@ -16,6 +16,7 @@
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <platform/dbg/dbg.hpp>
 #include <util/crc32c.hpp>
 #include <vfs/buffer_cache.hpp>
@@ -70,13 +71,44 @@ auto agfl_bno_usable(const XfsMountContext* mount, xfs_agblock_t bno) -> bool {
     return bno != NULLAGBLOCK && bno < mount->ag_blocks && bno > XFS_AG_RESERVED_MAX;
 }
 
-// Minimum number of blocks the AGFL should hold before mutating free-space
-// btrees. Free/alloc paths can touch both bnobt and cntbt, and each tree can
-// split up to its maximum depth.
-constexpr uint32_t XFS_AGFL_MIN = static_cast<uint32_t>(2 * XFS_BTREE_MAXLEVELS);
+// Minimum number of blocks the AGFL should hold before mutating metadata
+// btrees. One inode-allocation transaction can split bnobt, cntbt, inobt, and
+// finobt, while mapped writes can also split a bmbt. Keep enough reserve for
+// all of those trees instead of only the two free-space indexes.
+constexpr uint32_t XFS_AGFL_MIN = 64;
 
 auto same_free_extent(xfs_agblock_t lhs_start, xfs_extlen_t lhs_len, xfs_agblock_t rhs_start, xfs_extlen_t rhs_len) -> bool {
     return lhs_start == rhs_start && lhs_len == rhs_len;
+}
+
+auto refresh_agf_longest(XfsMountContext* mount, xfs_agnumber_t agno) -> int {
+    if (mount == nullptr || mount->per_ag == nullptr || agno >= mount->ag_count) {
+        return -EINVAL;
+    }
+
+    XfsPerAG* pag = &mount->per_ag[agno];
+    XfsBtreeCursor<XfsCntbtTraits> cur;
+    cur.mount = mount;
+    cur.agno = agno;
+    XfsCntbtTraits::IRec const LAST{
+        .startblock = std::numeric_limits<xfs_agblock_t>::max(),
+        .blockcount = std::numeric_limits<xfs_extlen_t>::max(),
+    };
+    int const RC = xfs_btree_lookup(&cur, pag->agf_cnt_root, pag->agf_cnt_level, LAST, XfsBtreeLookup::LE);
+    if (RC == -ENOENT) {
+        pag->agf_longest = 0;
+        return 0;
+    }
+    if (RC != 0) {
+        return RC;
+    }
+
+    XfsCntbtTraits::IRec const REC = xfs_btree_get_rec(&cur);
+    if (REC.blockcount > pag->agf_freeblks) {
+        return -EIO;
+    }
+    pag->agf_longest = REC.blockcount;
+    return 0;
 }
 
 // Top up the AGFL for the given AG to at least XFS_AGFL_MIN blocks.
@@ -176,29 +208,9 @@ auto agfl_refill(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t agno
             return rc;
         }
 
-        // Write updated AGF (roots, levels, freeblks) to disk
-        uint64_t const AG0 = xfs_agbno_to_fsbno(agno, 0, mount->ag_blk_log);
-        BufHead* agf_bh = xfs_buf_read(mount, AG0);
-        if (agf_bh != nullptr) {
-            size_t agf_off = 0;
-            rc = agf_sector_offset(mount, &agf_off);
-            if (rc != 0) {
-                brelse(agf_bh);
-                return rc;
-            }
-            auto* agf = reinterpret_cast<XfsAgf*>(agf_bh->data + agf_off);
-            agf->agf_freeblks = Be32::from_cpu(pag->agf_freeblks);
-            agf->agf_bno_root = Be32::from_cpu(pag->agf_bno_root);
-            agf->agf_cnt_root = Be32::from_cpu(pag->agf_cnt_root);
-            agf->agf_bno_level = Be32::from_cpu(pag->agf_bno_level);
-            agf->agf_cnt_level = Be32::from_cpu(pag->agf_cnt_level);
-            agf->agf_crc = Be32{0};
-            uint32_t crc = util::crc32c_block_with_cksum(agf, mount->sect_size, XFS_AGF_CRC_OFF);
-            __builtin_memcpy(&agf->agf_crc, &crc, sizeof(crc));
-            xfs_trans_log_buf(tp, agf_bh, static_cast<uint32_t>(agf_off), static_cast<uint32_t>(sizeof(XfsAgf)));
-            brelse(agf_bh);
-        } else {
-            return -EIO;
+        rc = log_agf_free_space_roots(mount, tp, agno);
+        if (rc != 0) {
+            return rc;
         }
     }
     return 0;
@@ -331,11 +343,6 @@ auto alloc_ag_by_hint(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t
 
 auto alloc_ag_by_size(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t agno, const XfsAllocReq& req, XfsAllocResult* result)
     -> int {
-    size_t agf_offset = 0;
-    if (agf_sector_offset(mount, &agf_offset) != 0) {
-        return -EIO;
-    }
-
     XfsPerAG* pag = &mount->per_ag[agno];
 
     // Quick check: does this AG have enough free blocks?
@@ -501,23 +508,9 @@ auto alloc_ag_by_size(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t
     // ---- 4. Update AGF free block count and btree roots ----
     pag->agf_freeblks -= alloc_len;
 
-    // Read the on-disk AGF block and update it (freeblks + possibly new roots/levels)
-    uint64_t const AG_START_BLOCK = xfs_agbno_to_fsbno(agno, 0, mount->ag_blk_log);
-    BufHead* agf_bh = xfs_buf_read(mount, AG_START_BLOCK);
-    if (agf_bh != nullptr) {
-        auto* agf = reinterpret_cast<XfsAgf*>(agf_bh->data + agf_offset);
-        agf->agf_freeblks = Be32::from_cpu(pag->agf_freeblks);
-        agf->agf_bno_root = Be32::from_cpu(pag->agf_bno_root);
-        agf->agf_cnt_root = Be32::from_cpu(pag->agf_cnt_root);
-        agf->agf_bno_level = Be32::from_cpu(pag->agf_bno_level);
-        agf->agf_cnt_level = Be32::from_cpu(pag->agf_cnt_level);
-        // Recompute CRC
-        agf->agf_crc = Be32{0};
-        uint32_t crc = util::crc32c_block_with_cksum(agf, mount->sect_size, XFS_AGF_CRC_OFF);
-        __builtin_memcpy(&agf->agf_crc, &crc, sizeof(crc));
-        // ---- 5. Log the AGF buffer ----
-        xfs_trans_log_buf(tp, agf_bh, static_cast<uint32_t>(agf_offset), static_cast<uint32_t>(sizeof(XfsAgf)));
-        brelse(agf_bh);
+    int const LOG_RC = log_agf_free_space_roots(mount, tp, agno);
+    if (LOG_RC != 0) {
+        return LOG_RC;
     }
 
     result->agno = agno;
@@ -530,6 +523,11 @@ auto alloc_ag_by_size(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t
 }
 
 auto log_agf_free_space_roots(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t agno) -> int {
+    int const LONGEST_RC = refresh_agf_longest(mount, agno);
+    if (LONGEST_RC != 0) {
+        return LONGEST_RC;
+    }
+
     size_t agf_offset = 0;
     if (agf_sector_offset(mount, &agf_offset) != 0) {
         return -EIO;
@@ -548,6 +546,7 @@ auto log_agf_free_space_roots(XfsMountContext* mount, XfsTransaction* tp, xfs_ag
     agf->agf_cnt_root = Be32::from_cpu(pag->agf_cnt_root);
     agf->agf_bno_level = Be32::from_cpu(pag->agf_bno_level);
     agf->agf_cnt_level = Be32::from_cpu(pag->agf_cnt_level);
+    agf->agf_longest = Be32::from_cpu(pag->agf_longest);
     agf->agf_crc = Be32{0};
     uint32_t crc = util::crc32c_block_with_cksum(agf, mount->sect_size, XFS_AGF_CRC_OFF);
     __builtin_memcpy(&agf->agf_crc, &crc, sizeof(crc));
@@ -954,12 +953,10 @@ auto xfs_alloc_put_freelist(XfsMountContext* mount, XfsTransaction* tp, xfs_agnu
         return -EIO;
     }
 
-    // If the AGFL is full, fall back to returning the block to the free space
-    // trees.  This path is safe: xfs_alloc_put_freelist is only called from
-    // xfs_btree_delete (not from xfs_btree_insert), so xfs_free_extent won't
-    // re-enter the delete path.
+    // Never re-enter the free-space btrees from a freelist put. Callers can be
+    // retiring a btree block and may still hold cursors into those trees.
     if (pag->agf_flcount >= xfs_agfl_size(mount)) {
-        return xfs_free_extent(mount, tp, agno, bno, 1);
+        return -ENOSPC;
     }
 
     uint64_t const AG0 = xfs_agbno_to_fsbno(agno, 0, mount->ag_blk_log);
@@ -971,7 +968,7 @@ auto xfs_alloc_put_freelist(XfsMountContext* mount, XfsTransaction* tp, xfs_agnu
     auto* agfl = reinterpret_cast<XfsAgfl*>(bh->data + agfl_off);
     if (agfl->agfl_magicnum.to_cpu() != XFS_AGFL_MAGIC) {
         brelse(bh);
-        return xfs_free_extent(mount, tp, agno, bno, 1);
+        return -EIO;
     }
 
     auto* agfl_bno = reinterpret_cast<Be32*>(reinterpret_cast<uint8_t*>(agfl) + sizeof(XfsAgfl));

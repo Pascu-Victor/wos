@@ -169,6 +169,7 @@ def test_agfl_slot_updates_refresh_sector_crc() -> None:
         "AGFL CRC helper",
     )
     require_absent(put_body, "SLOT_OFF", "AGFL slot update must log the CRC-covered sector")
+    require_absent(put_body, "xfs_free_extent", "AGFL put must not re-enter free-space btrees")
     require_order(
         put_body,
         [
@@ -182,6 +183,23 @@ def test_agfl_slot_updates_refresh_sector_crc() -> None:
     )
 
 
+def test_agf_longest_tracks_cntbt_maximum() -> None:
+    alloc = XFS_ALLOC.read_text()
+    require(
+        alloc,
+        "auto refresh_agf_longest(XfsMountContext* mount, xfs_agnumber_t agno) -> int",
+        "AGF longest refresh helper",
+    )
+    require(
+        alloc,
+        "xfs_btree_lookup(&cur, pag->agf_cnt_root, pag->agf_cnt_level, LAST, XfsBtreeLookup::LE)",
+        "cntbt maximum lookup for AGF longest",
+    )
+    require(
+        alloc,
+        "agf->agf_longest = Be32::from_cpu(pag->agf_longest);",
+        "on-disk AGF longest update",
+    )
 def test_free_space_allocators_validate_dual_indexes_before_delete() -> None:
     source = XFS_ALLOC.read_text()
     agfl_body = function_body(source, "agfl_refill")
@@ -254,6 +272,7 @@ def main() -> None:
     test_btree_insert_delete_refresh_crc_before_logging()
     test_btree_split_key_propagation_is_buffer_safe()
     test_agfl_slot_updates_refresh_sector_crc()
+    test_agf_longest_tracks_cntbt_maximum()
     test_free_space_allocators_validate_dual_indexes_before_delete()
     print("XFS metadata CRC source invariants hold")
 
