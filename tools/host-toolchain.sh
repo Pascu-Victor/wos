@@ -22,6 +22,7 @@ HOST_PYTHON="${HOST_PYTHON:-$(command -v python3)}"
 HOST_TOOLCHAIN_RPATH="\$ORIGIN/../lib"
 
 WOS_HOST_LLDB_PYTHON="${WOS_HOST_LLDB_PYTHON:-0}"
+WOS_HOST_CLANG_TIDY_CACHE="${WOS_HOST_CLANG_TIDY_CACHE:-auto}"
 LLDB_PYTHON_CMAKE_ARGS=(
     -DLLDB_ENABLE_PYTHON=OFF
     -DLLDB_ENABLE_SWIG=OFF
@@ -55,14 +56,35 @@ cd $B/src
 [ ! -d llvm-project ] && git clone --depth=1 --branch=wos https://github.com/Pascu-Victor/llvm-project.git
 
 WOS_BUILD_CLANG_TIDY_CACHE=0
-if command -v go >/dev/null 2>&1; then
-    if [ -d clang-tidy-cache ] || git clone --depth=1 https://github.com/williamfligor/clang-tidy-cache.git; then
+case "$WOS_HOST_CLANG_TIDY_CACHE" in
+    1|ON|on|TRUE|true|YES|yes)
         WOS_BUILD_CLANG_TIDY_CACHE=1
+        ;;
+    auto|AUTO)
+        if command -v go >/dev/null 2>&1; then
+            WOS_BUILD_CLANG_TIDY_CACHE=1
+        fi
+        ;;
+    0|OFF|off|FALSE|false|NO|no)
+        ;;
+    *)
+        echo "ERROR: WOS_HOST_CLANG_TIDY_CACHE must be auto, 0/1, OFF/ON, false/true, or no/yes." >&2
+        exit 1
+        ;;
+esac
+
+if [ "$WOS_BUILD_CLANG_TIDY_CACHE" -eq 1 ] && ! command -v go >/dev/null 2>&1; then
+    echo "WARNING: clang-tidy-cache requested but go was not found; continuing without this optional helper." >&2
+    WOS_BUILD_CLANG_TIDY_CACHE=0
+fi
+
+if [ "$WOS_BUILD_CLANG_TIDY_CACHE" -eq 1 ]; then
+    if [ -d clang-tidy-cache ] || git clone --depth=1 https://github.com/williamfligor/clang-tidy-cache.git; then
+        :
     else
         echo "WARNING: clang-tidy-cache clone failed; continuing without this optional helper." >&2
+        WOS_BUILD_CLANG_TIDY_CACHE=0
     fi
-else
-    echo "Skipping clang-tidy-cache: go not found"
 fi
 
 # 2. Build stage1 clang/lld for the host

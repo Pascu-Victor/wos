@@ -62,6 +62,7 @@ def test_selfhost_runner_covers_acceptance_flow() -> None:
             'WOS_MAKE_JOBS="$jobs"',
             "unset WOS_BUILD_JOBS WOS_MAKE_JOBS WOS_NINJA_JOBS CMAKE_BUILD_PARALLEL_LEVEL",
             "./tools/bootstrap.sh",
+            "WOS_HOST_CLANG_TIDY_CACHE=0",
             "WOS_USE_CCACHE=0",
             'log "bootstrap_ccache=disabled"',
             "canonical_path()",

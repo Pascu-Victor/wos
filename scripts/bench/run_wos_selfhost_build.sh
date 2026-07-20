@@ -1186,6 +1186,7 @@ bootstrap_toolchain() {
         cd "$checkout"
         WOS_BOOTSTRAP_DETAIL_TSV="$bootstrap_detail_report" \
             WOS_SOURCE_DISTDIR="$distdir" \
+            WOS_HOST_CLANG_TIDY_CACHE=0 \
             WOS_USE_CCACHE=0 \
             run_with_jobs_env ./tools/bootstrap.sh
     )

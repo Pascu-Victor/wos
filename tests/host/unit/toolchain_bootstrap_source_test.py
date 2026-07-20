@@ -927,6 +927,7 @@ def test_optional_host_clang_tidy_cache_failure_does_not_abort_bootstrap() -> No
     require_tokens(
         source,
         [
+            'WOS_HOST_CLANG_TIDY_CACHE="${WOS_HOST_CLANG_TIDY_CACHE:-auto}"',
             "WOS_BUILD_CLANG_TIDY_CACHE=0",
             "if [ -d clang-tidy-cache ] || git clone --depth=1",
             "clang-tidy-cache clone failed; continuing without this optional helper",
