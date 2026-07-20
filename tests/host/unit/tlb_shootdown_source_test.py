@@ -127,8 +127,12 @@ def require_generation_publication_is_quiescent(source: str) -> None:
 
 
 def require_cooperative_service_remains_raw_context_safe(source: str) -> None:
+    entry_body = function_body(source, "service_pending_tlb_shootdowns")
+    if "service_tlb_shootdown_requests_for_cpu(cpu::get_current_cpu_id_safe())" not in entry_body:
+        fail("cooperative TLB service must use the early-boot-safe CPU identifier")
+
     bodies = [
-        function_body(source, "service_pending_tlb_shootdowns"),
+        entry_body,
         function_body(source, "service_tlb_shootdown_requests_for_cpu"),
         function_body(source, "bounded_core_count"),
         function_body(source, "invalidate_local_tlb_if_current"),

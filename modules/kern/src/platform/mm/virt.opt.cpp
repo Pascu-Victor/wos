@@ -1728,7 +1728,7 @@ void service_pending_tlb_shootdowns() {
     if (tlb_shootdown_vector == 0 || !smt::has_cpu_data()) {
         return;
     }
-    service_tlb_shootdown_requests_for_cpu(cpu::current_cpu());
+    service_tlb_shootdown_requests_for_cpu(cpu::get_current_cpu_id_safe());
 }
 
 constexpr size_t KERNEL_PML4_START = 256;
