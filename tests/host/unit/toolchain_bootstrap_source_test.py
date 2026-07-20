@@ -871,6 +871,7 @@ def test_ninja_port_build_scripts_use_ninja_job_helper() -> None:
             "$jobs_setting must be a positive integer",
             'wos_timed_step "configure" "clang_for_wos"',
             'wos_timed_step "build" "clang_for_wos"',
+            "-DLLVM_ENABLE_THREADS=ON",
             '-DLLVM_PARALLEL_LINK_JOBS="$WOS_LLVM_PARALLEL_LINK_JOBS"',
         ],
         "native WOS clang LLVM link parallelism",
@@ -883,6 +884,8 @@ def test_ninja_port_build_scripts_use_ninja_job_helper() -> None:
             fail(f"native WOS clang build must honor requested parallelism: {forbidden}")
     if "-DLLVM_PARALLEL_LINK_JOBS=1" in clang_source:
         fail("native WOS clang build must not force serial LLVM link jobs")
+    if "-DLLVM_ENABLE_THREADS=OFF" in clang_source:
+        fail("native WOS clang and lld must retain runtime thread-pool support")
 
 
 def test_host_toolchain_install_uses_ninja_jobs() -> None:
