@@ -652,20 +652,44 @@ auto update_shared_vmem_ranges_locked(ker::mod::sched::task::Task* task, Fn upda
     }
 
     auto* const PAGEMAP = task->pagemap;
+    using SharedVmemTaskVec = ker::util::SmallVec<ker::mod::sched::task::Task*, 32>;
+    struct SharedVmemTaskScan {
+        ker::mod::mm::paging::PageTable* pagemap;
+        SharedVmemTaskVec* tasks;
+    };
+    SharedVmemTaskVec tasks;
+    SharedVmemTaskScan scan{.pagemap = PAGEMAP, .tasks = &tasks};
+    auto const MATCH_UNVISITED_SIBLING = [](ker::mod::sched::task::Task* candidate, void* context) -> bool {
+        auto* const STATE = static_cast<SharedVmemTaskScan*>(context);
+        return candidate != nullptr && candidate->pagemap == STATE->pagemap && candidate->type != ker::mod::sched::task::TaskType::DAEMON &&
+               !STATE->tasks->contains(candidate);
+    };
+
+    // Count/index iteration over the active-task array is not a stable
+    // snapshot: task removal swaps the final entry into the removed slot and
+    // can make a live sibling disappear behind the current index. Acquire one
+    // unvisited lifetime reference per registry scan instead. Shared-VM task
+    // publication is serialized by the caller, so matching tasks can only
+    // leave while this snapshot is assembled.
+    for (;;) {
+        auto* candidate = ker::mod::sched::find_active_task_lifetime_ref_if(MATCH_UNVISITED_SIBLING, &scan);
+        if (candidate == nullptr) {
+            break;
+        }
+        if (!tasks.push_back(candidate)) {
+            candidate->release();
+            for (auto* retained : tasks) {
+                retained->release();
+            }
+            return false;
+        }
+    }
+
     bool touched_current = false;
     bool ok = true;
-    uint32_t const TASK_COUNT = ker::mod::sched::get_active_task_count();
-    for (uint32_t i = 0; i < TASK_COUNT; ++i) {
-        auto* candidate = ker::mod::sched::get_active_task_at_safe(i);
-        if (candidate == nullptr) {
-            continue;
-        }
-
-        if (candidate->pagemap == PAGEMAP && candidate->type != ker::mod::sched::task::TaskType::DAEMON) {
-            touched_current = touched_current || candidate == task;
-            ok = update(candidate) && ok;
-        }
-
+    for (auto* candidate : tasks) {
+        touched_current = touched_current || candidate == task;
+        ok = update(candidate) && ok;
         candidate->release();
     }
 

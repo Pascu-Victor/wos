@@ -8,6 +8,7 @@ ROOT = Path(__file__).resolve().parents[3]
 SYS_VMEM_CPP = ROOT / "modules" / "kern" / "src" / "syscalls_impl" / "vmem" / "sys_vmem.cpp"
 SYS_VMEM_HPP = ROOT / "modules" / "kern" / "src" / "syscalls_impl" / "vmem" / "sys_vmem.hpp"
 THREAD_CONTROL_CPP = ROOT / "modules" / "kern" / "src" / "syscalls_impl" / "multiproc" / "threadControl.cpp"
+PROCESS_CPP = ROOT / "modules" / "kern" / "src" / "syscalls_impl" / "process" / "process.cpp"
 VIRT_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "mm" / "virt.opt.cpp"
 
 
@@ -448,6 +449,7 @@ def test_thread_publication_is_serialized_with_shared_vmem_updates() -> None:
     header = SYS_VMEM_HPP.read_text()
     vmem = SYS_VMEM_CPP.read_text()
     thread_control = THREAD_CONTROL_CPP.read_text()
+    process = PROCESS_CPP.read_text()
 
     require_tokens(
         header,
@@ -465,9 +467,17 @@ def test_thread_publication_is_serialized_with_shared_vmem_updates() -> None:
     )
     require_tokens(
         function_body(vmem, "update_shared_vmem_ranges_locked"),
-        ["get_active_task_count()", "get_active_task_at_safe(i)"],
-        "already-serialized shared VM metadata propagation",
+        [
+            "find_active_task_lifetime_ref_if(MATCH_UNVISITED_SIBLING, &scan)",
+            "if (!tasks.push_back(candidate))",
+            "for (auto* candidate : tasks)",
+            "candidate->release();",
+        ],
+        "stable shared VM metadata task snapshot",
     )
+    shared_update = function_body(vmem, "update_shared_vmem_ranges_locked")
+    if "get_active_task_count()" in shared_update or "get_active_task_at_safe(i)" in shared_update:
+        fail("shared VM propagation must not iterate a mutable active-task array by count/index")
 
     create_case = block_between(
         thread_control,
@@ -483,6 +493,18 @@ def test_thread_publication_is_serialized_with_shared_vmem_updates() -> None:
             "post_task_for_cpu(TARGET_CPU, t)",
         ],
         "thread lazy-range clone through scheduler publication",
+    )
+
+    clone_vm = function_body(process, "wos_proc_clone_vm")
+    require_ordered_tokens(
+        clone_vm,
+        [
+            "ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;",
+            "child->pagemap = parent->pagemap;",
+            "clone_lazy_vmem_ranges(*child, *parent)",
+            "post_task_balanced(child)",
+        ],
+        "clone-VM lazy-range clone through scheduler publication",
     )
 
 

@@ -1040,6 +1040,12 @@ auto wos_proc_clone_vm(uint64_t args_addr) -> uint64_t {
     child->parent_pid = parent->pid;
     child->type = sched::task::TaskType::PROCESS;
     child->cpu = cpu::current_cpu();
+
+    // Keep the shared-address-space metadata clone and scheduler publication
+    // atomic with respect to mmap/munmap/mprotect propagation. Otherwise a
+    // WOS_CLONE_VM child can clone the old range set after an update's task
+    // snapshot and then publish with permanently stale lazy-fault metadata.
+    ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;
     child->pagemap = parent->pagemap;
     child->entry = parent->entry;
     child->program_header_addr = parent->program_header_addr;
