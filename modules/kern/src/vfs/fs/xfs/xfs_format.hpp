@@ -179,6 +179,7 @@ constexpr uint16_t XFS_DIFLAG_NODUMP = (1U << 7);
 
 // Inode flags2 (di_flags2) - v3 inodes only
 constexpr uint64_t XFS_DIFLAG2_BIGTIME = (1ULL << 3);
+constexpr uint64_t XFS_DIFLAG2_NREXT64 = (1ULL << 4);
 
 // XFS timestamp (on-disk) - packed into 8 bytes
 using xfs_timestamp_t = Be64;

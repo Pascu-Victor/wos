@@ -535,6 +535,12 @@ void xfs_stamp_new_inode(XfsInode* ip) {
     if (ip == nullptr) {
         return;
     }
+    if (ip->mount != nullptr && xfs_has_bigtime(ip->mount)) {
+        ip->flags2 |= XFS_DIFLAG2_BIGTIME;
+    }
+    if (ip->mount != nullptr && xfs_has_nrext64(ip->mount)) {
+        ip->flags2 |= XFS_DIFLAG2_NREXT64;
+    }
     uint64_t const NOW = xfs_current_timestamp(ip);
     ip->atime = NOW;
     ip->mtime = NOW;

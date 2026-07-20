@@ -1131,14 +1131,28 @@ auto xfs_inode_read_impl(XfsMountContext* mount, xfs_ino_t ino, bool allocation_
     ip->ctime = dip->di_ctime.to_cpu();
     ip->crtime = dip->di_crtime.to_cpu();
 
-    // NREXT64: extent counts are stored in different fields
-    if (xfs_has_nrext64(mount)) {
+    // The filesystem feature only permits large counters. Each inode selects
+    // the large-counter union fields independently with XFS_DIFLAG2_NREXT64.
+    bool const LARGE_EXTENT_COUNTS = (ip->flags2 & XFS_DIFLAG2_NREXT64) != 0;
+    if (LARGE_EXTENT_COUNTS && !xfs_has_nrext64(mount)) {
+        brelse(bh);
+        free_inode(ip);
+        return finish_inode_fetch(nullptr, -EINVAL);
+    }
+    if (LARGE_EXTENT_COUNTS) {
         // Data extent count in di_pad[0..7] as Be64 (di_big_nextents)
         Be64 big_nextents_be{};
         __builtin_memcpy(&big_nextents_be, dip->di_pad.data(), sizeof(Be64));
-        ip->nextents = static_cast<uint32_t>(big_nextents_be.to_cpu());
+        uint64_t const BIG_NEXTENTS = big_nextents_be.to_cpu();
+        uint32_t const BIG_ANEXTENTS = dip->di_nextents.to_cpu();
+        if (BIG_NEXTENTS > UINT32_MAX || BIG_ANEXTENTS > UINT16_MAX || dip->di_anextents.to_cpu() != 0) {
+            brelse(bh);
+            free_inode(ip);
+            return finish_inode_fetch(nullptr, -EFBIG);
+        }
+        ip->nextents = static_cast<uint32_t>(BIG_NEXTENTS);
         // Attr extent count in di_nextents as Be32 (di_big_anextents)
-        ip->anextents = dip->di_nextents.to_cpu();
+        ip->anextents = static_cast<uint16_t>(BIG_ANEXTENTS);
     } else {
         ip->nextents = dip->di_nextents.to_cpu();
         ip->anextents = dip->di_anextents.to_cpu();
@@ -1576,6 +1590,10 @@ auto xfs_inode_write(XfsInode* ip, XfsTransaction* tp) -> int {
     }
 
     XfsMountContext* mount = ip->mount;
+    bool const LARGE_EXTENT_COUNTS = (ip->flags2 & XFS_DIFLAG2_NREXT64) != 0;
+    if (LARGE_EXTENT_COUNTS && !xfs_has_nrext64(mount)) {
+        return -EINVAL;
+    }
     xfs_fsblock_t const BLOCK = xfs_inode_block(mount, ip->ino);
     size_t const OFFSET = xfs_inode_offset(mount, ip->ino);
 
@@ -1620,13 +1638,14 @@ auto xfs_inode_write(XfsInode* ip, XfsTransaction* tp) -> int {
     dip->di_ctime = xfs_timestamp_t::from_cpu(ip->ctime);
     dip->di_crtime = xfs_timestamp_t::from_cpu(ip->crtime);
 
-    // NREXT64: extent counts are stored in different fields (mirrors read path)
-    if (xfs_has_nrext64(mount)) {
+    // NREXT64 is selected per inode, not merely by the superblock feature.
+    if (LARGE_EXTENT_COUNTS) {
         // Data extent count => di_pad[0..7] as Be64
         Be64 big_nextents_be = Be64::from_cpu(static_cast<uint64_t>(ip->nextents));
         __builtin_memcpy(dip->di_pad.data(), &big_nextents_be, sizeof(Be64));
         // Attr extent count => di_nextents as Be32
         dip->di_nextents = Be32::from_cpu(static_cast<uint32_t>(ip->anextents));
+        dip->di_anextents = Be16{0};
     } else {
         dip->di_nextents = Be32::from_cpu(ip->nextents);
         dip->di_anextents = Be16::from_cpu(ip->anextents);

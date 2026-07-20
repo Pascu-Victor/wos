@@ -10,6 +10,8 @@ ROOT = Path(__file__).resolve().parents[3]
 INODE = ROOT / "modules/kern/src/vfs/fs/xfs/xfs_inode.cpp"
 BMAP = ROOT / "modules/kern/src/vfs/fs/xfs/xfs_bmap.cpp"
 ALLOC = ROOT / "modules/kern/src/vfs/fs/xfs/xfs_alloc.cpp"
+FORMAT = ROOT / "modules/kern/src/vfs/fs/xfs/xfs_format.hpp"
+VFS = ROOT / "modules/kern/src/vfs/fs/xfs/xfs_vfs.cpp"
 
 
 def fail(message: str) -> None:
@@ -20,6 +22,8 @@ def main() -> None:
     source = INODE.read_text()
     bmap_source = BMAP.read_text()
     alloc_source = ALLOC.read_text()
+    format_source = FORMAT.read_text()
+    vfs_source = VFS.read_text()
 
     marked_free = 'mod::dbg::logger<"xfs">::debug("xfs_inode_read: inode %lu is marked free"'
     lookup_failed = "if (ALLOCATED < 0) {"
@@ -40,6 +44,21 @@ def main() -> None:
     ):
         if needle not in source:
             fail(f"missing {description}")
+
+    for needle, description in (
+        ("constexpr uint64_t XFS_DIFLAG2_NREXT64 = (1ULL << 4);", "per-inode NREXT64 flag"),
+        ("bool const LARGE_EXTENT_COUNTS = (ip->flags2 & XFS_DIFLAG2_NREXT64) != 0;", "per-inode extent counter selection"),
+        ("if (LARGE_EXTENT_COUNTS && !xfs_has_nrext64(mount))", "NREXT64 feature validation"),
+        ("dip->di_anextents = Be16{0};", "NREXT64 padding clear"),
+    ):
+        haystack = format_source if "constexpr" in needle else source
+        if needle not in haystack:
+            fail(f"missing {description}")
+
+    if "if (xfs_has_nrext64(mount))" in source:
+        fail("inode counter union must not be selected from the superblock feature alone")
+    if "ip->flags2 |= XFS_DIFLAG2_BIGTIME;" not in vfs_source or "ip->flags2 |= XFS_DIFLAG2_NREXT64;" not in vfs_source:
+        fail("new inodes must inherit enabled per-inode format flags")
 
     if source.find(lookup_failed) > source.find(disk_read):
         fail("allocation lookup warning must continue into disk dinode validation")
