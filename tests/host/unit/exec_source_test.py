@@ -247,6 +247,61 @@ def require_stdio_fallback_access_modes(source: str) -> None:
             fail(f"exec stdio fallback must preserve VFS access modes: {snippet}")
 
 
+def require_spawn_actions_snapshot_user_memory_and_preserve_cloexec_sources(source: str) -> None:
+    snapshot = function_body(source, "snapshot_spawn_options")
+    for snippet in [
+        "usercopy::copy_value_from_task",
+        "usercopy::copy_from_task",
+        "usercopy::copy_cstring_from_task",
+        "snapshot.options.actions = ACTION_COUNT != 0 ? snapshot.actions.data() : nullptr",
+    ]:
+        if snippet not in snapshot:
+            fail(f"spawn options must be snapshotted from user memory: {snippet}")
+
+    clone = function_body(source, "clone_exec_fd_table_checked")
+    if "bool preserve_cloexec = false" not in source:
+        fail("spawn FD clone must select whether CLOEXEC descriptors survive for actions")
+    for snippet in [
+        "if (CLOEXEC && !preserve_cloexec)",
+        "child->set_fd_cloexec(static_cast<unsigned>(key))",
+    ]:
+        if snippet not in clone:
+            fail(f"spawn FD clone must retain action source descriptors: {snippet}")
+
+    spawn = function_body(source, "wos_proc_spawn")
+    for snippet in [
+        "new (std::nothrow) SpawnOptionsSnapshot",
+        "snapshot_spawn_options(*parent, options, *snapshot)",
+        "wos_proc_exec_impl(path, argv, envp, &snapshot->options, 0)",
+        "delete snapshot",
+    ]:
+        if snippet not in spawn:
+            fail(f"spawn syscall must own its options snapshot: {snippet}")
+
+    exec_impl = function_body(source, "wos_proc_exec_impl")
+    clone_pos = exec_impl.find("clone_exec_fd_table_checked(parent_task, new_task, spawn_options != nullptr)")
+    apply_pos = exec_impl.find("apply_spawn_options(new_task, spawn_options)")
+    close_pos = exec_impl.find("close_spawn_cloexec_fds(new_task)")
+    if clone_pos < 0 or apply_pos <= clone_pos or close_pos <= apply_pos:
+        fail("spawn must clone CLOEXEC sources, apply ordered actions, then close remaining CLOEXEC descriptors")
+    if "spawn_options == nullptr && !ensure_exec_stdio_fallbacks(new_task)" not in exec_impl:
+        fail("option-aware spawn must not reopen descriptors intentionally closed by file actions")
+
+    apply = function_body(source, "apply_spawn_options")
+    if "task->pgid = options->pgroup == 0 ? task->pid : static_cast<uint64_t>(options->pgroup)" not in apply:
+        fail("spawn SETPGROUP must create Ninja's requested child process group")
+
+    if source.count("publication lost child ownership for PID %x") != 2:
+        fail("spawn publication ownership diagnostics must cover local and remote children")
+    for marker in [
+        'dbg::log("wos_proc_exec: remote publication lost child ownership for PID %x", CHILD_PID);',
+        'dbg::log("wos_proc_exec: local publication lost child ownership for PID %x", CHILD_PID);',
+    ]:
+        marker_pos = source.find(marker)
+        if marker_pos < 0 or "return CHILD_PID;" not in source[marker_pos : marker_pos + 450]:
+            fail("published spawn failures must return the child PID instead of triggering duplicate fallback")
+
+
 def require_loader_does_not_scan_unread_symbol_payloads(loader_source: str) -> None:
     body = function_body_containing(loader_source, "load_elf_impl", "if (REGISTER_SPECIAL_SYMBOLS)")
     registration_gate = body.find("if (REGISTER_SPECIAL_SYMBOLS)")
@@ -309,6 +364,7 @@ def main() -> None:
     require_callers_use_sparse_reader(source)
     require_large_dynamic_elf_is_file_backed(source)
     require_stdio_fallback_access_modes(source)
+    require_spawn_actions_snapshot_user_memory_and_preserve_cloexec_sources(source)
     require_loader_does_not_scan_unread_symbol_payloads(loader_source)
     require_loader_lazy_file_ranges(loader_source)
     print("exec sparse-read source invariants hold")

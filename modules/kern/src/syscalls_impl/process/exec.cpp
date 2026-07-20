@@ -17,6 +17,7 @@
 #include <cstring>
 #include <iterator>
 #include <net/wki/remote_compute.hpp>
+#include <new>
 #include <platform/dbg/dbg.hpp>
 #include <platform/init/limine_requests.hpp>
 #include <platform/ktime/ktime.hpp>
@@ -30,6 +31,7 @@
 #include <platform/sched/task.hpp>
 #include <platform/sys/context_switch.hpp>
 #include <platform/sys/signal.hpp>
+#include <platform/sys/usercopy.hpp>
 #include <string_view>
 #include <util/hcf.hpp>
 #include <util/smallvec.hpp>
@@ -60,6 +62,7 @@ constexpr int MAX_SHEBANG_DEPTH = 4;
 constexpr size_t EXEC_PATH_MAX = 512;
 constexpr int WOS_SIGKILL = 9;
 constexpr int WOS_SIGSTOP = 19;
+constexpr uint64_t MAX_SPAWN_ACTIONS = 32;
 using exec_log = ker::mod::dbg::logger<"exec">;
 
 auto exec_cmdline_has_token(const char* cmdline, const char* token) -> bool {
@@ -230,7 +233,8 @@ void release_task_fd_table_files(ker::mod::sched::task::Task* task) {
 }
 #endif
 
-auto clone_exec_fd_table_checked(ker::mod::sched::task::Task* parent, ker::mod::sched::task::Task* child) -> bool {
+auto clone_exec_fd_table_checked(ker::mod::sched::task::Task* parent, ker::mod::sched::task::Task* child, bool preserve_cloexec = false)
+    -> bool {
     if (parent == nullptr || child == nullptr) {
         return false;
     }
@@ -241,7 +245,8 @@ auto clone_exec_fd_table_checked(ker::mod::sched::task::Task* parent, ker::mod::
         if (!ok || val == nullptr) {
             return;
         }
-        if (parent->get_fd_cloexec(static_cast<unsigned>(key))) {
+        bool const CLOEXEC = parent->get_fd_cloexec(static_cast<unsigned>(key));
+        if (CLOEXEC && !preserve_cloexec) {
             return;
         }
 
@@ -257,6 +262,8 @@ auto clone_exec_fd_table_checked(ker::mod::sched::task::Task* parent, ker::mod::
         if (!child->fd_table.insert(key, parent_file)) {
             parent_file->refcount.fetch_sub(1, std::memory_order_acq_rel);
             ok = false;
+        } else if (CLOEXEC) {
+            child->set_fd_cloexec(static_cast<unsigned>(key));
         }
     });
     parent->fd_table_lock.unlock_irqrestore(IRQF);
@@ -401,7 +408,6 @@ auto apply_spawn_options(ker::mod::sched::task::Task* task, const ker::abi::proc
         return false;
     }
 
-    constexpr uint64_t MAX_SPAWN_ACTIONS = 32;
     if (options->action_count > MAX_SPAWN_ACTIONS || (options->action_count != 0 && options->actions == nullptr)) {
         return false;
     }
@@ -434,8 +440,12 @@ auto apply_spawn_options(ker::mod::sched::task::Task* task, const ker::abi::proc
         ker::mod::sys::signal::sync_task_signal_mask_cache(task);
     }
 
-    // SPAWN_FLAG_SETPGROUP is accepted as a no-op to match the current mlibc
-    // posix_spawn child path, which logs and ignores POSIX_SPAWN_SETPGROUP.
+    if ((options->flags & ker::abi::process::SPAWN_FLAG_SETPGROUP) != 0) {
+        if (options->pgroup < 0) {
+            return false;
+        }
+        task->pgid = options->pgroup == 0 ? task->pid : static_cast<uint64_t>(options->pgroup);
+    }
     return true;
 }
 
@@ -488,6 +498,78 @@ auto collect_cloexec_fds_locked(ker::mod::sched::task::Task* task, FdSnapshot& f
     });
     task->fd_table_lock.unlock_irqrestore(IRQF);
     return fd_count;
+}
+
+auto close_spawn_cloexec_fds(ker::mod::sched::task::Task* task) -> void {
+    for (;;) {
+        FdSnapshot fds{};
+        size_t const FD_COUNT = collect_cloexec_fds_locked(task, fds);
+        if (FD_COUNT == 0) {
+            return;
+        }
+        for (size_t i = 0; i < FD_COUNT; ++i) {
+            spawn_close_fd(task, static_cast<int32_t>(fixed_slot(fds, i)));
+        }
+    }
+}
+
+struct SpawnOptionsSnapshot {
+    ker::abi::process::SpawnOptions options{};
+    std::array<ker::abi::process::SpawnFdAction, MAX_SPAWN_ACTIONS> actions{};
+    std::array<char*, MAX_SPAWN_ACTIONS> owned_paths{};
+
+    ~SpawnOptionsSnapshot() {
+        for (auto* path : owned_paths) {
+            delete[] path;
+        }
+    }
+};
+
+auto snapshot_spawn_options(ker::mod::sched::task::Task& parent, const ker::abi::process::SpawnOptions* user_options,
+                            SpawnOptionsSnapshot& snapshot) -> bool {
+    if (user_options == nullptr ||
+        !ker::mod::sys::usercopy::copy_value_from_task(parent, reinterpret_cast<uint64_t>(user_options), snapshot.options)) {
+        return false;
+    }
+    if (snapshot.options.size != sizeof(ker::abi::process::SpawnOptions) ||
+        snapshot.options.version != ker::abi::process::SPAWN_OPTIONS_VERSION || snapshot.options.reserved0 != 0 ||
+        snapshot.options.reserved1 != 0 || (snapshot.options.flags & ~ker::abi::process::SPAWN_SUPPORTED_FLAGS) != 0 ||
+        snapshot.options.action_count > MAX_SPAWN_ACTIONS || (snapshot.options.action_count != 0 && snapshot.options.actions == nullptr)) {
+        return false;
+    }
+
+    uint64_t const ACTION_COUNT = snapshot.options.action_count;
+    if (ACTION_COUNT != 0 &&
+        !ker::mod::sys::usercopy::copy_from_task(parent, reinterpret_cast<uint64_t>(snapshot.options.actions), snapshot.actions.data(),
+                                                 ACTION_COUNT * sizeof(ker::abi::process::SpawnFdAction))) {
+        return false;
+    }
+
+    for (uint64_t i = 0; i < ACTION_COUNT; ++i) {
+        auto& action = fixed_slot(snapshot.actions, static_cast<size_t>(i));
+        switch (static_cast<ker::abi::process::SpawnFdActionType>(action.type)) {
+            case ker::abi::process::SpawnFdActionType::CLOSE:
+            case ker::abi::process::SpawnFdActionType::DUP2:
+                action.path = nullptr;
+                break;
+            case ker::abi::process::SpawnFdActionType::OPEN: {
+                auto* path = new (std::nothrow) char[EXEC_PATH_MAX];
+                if (path == nullptr || !ker::mod::sys::usercopy::copy_cstring_from_task(parent, reinterpret_cast<uint64_t>(action.path),
+                                                                                        path, EXEC_PATH_MAX)) {
+                    delete[] path;
+                    return false;
+                }
+                fixed_slot(snapshot.owned_paths, static_cast<size_t>(i)) = path;
+                action.path = path;
+                break;
+            }
+            default:
+                return false;
+        }
+    }
+
+    snapshot.options.actions = ACTION_COUNT != 0 ? snapshot.actions.data() : nullptr;
+    return true;
 }
 
 inline auto local_wki_hostname() -> const char* { return std::begin(ker::net::wki::g_wki.local_hostname); }
@@ -1255,6 +1337,47 @@ auto exec_selftest_cloexec_snapshot_collects_marked_fds() -> bool {
     task.fd_table.remove(255);
     return ok && COUNT == 2 && saw0 && saw255;
 }
+
+auto exec_selftest_spawn_dup2_consumes_cloexec_source() -> bool {
+    ker::mod::sched::task::Task parent{};
+    ker::mod::sched::task::Task child{};
+    ker::vfs::File source{};
+    ker::vfs::File displaced{};
+    source.refcount.store(1, std::memory_order_relaxed);
+    displaced.refcount.store(1, std::memory_order_relaxed);
+
+    constexpr int32_t SOURCE_FD = 7;
+    constexpr int32_t DESTINATION_FD = 1;
+    child.pid = 42;
+    bool ok = parent.fd_table.insert(SOURCE_FD, &source) && parent.fd_table.insert(DESTINATION_FD, &displaced);
+    parent.set_fd_cloexec(SOURCE_FD);
+    ok = ok && clone_exec_fd_table_checked(&parent, &child, true) && child.get_fd_cloexec(SOURCE_FD);
+
+    ker::abi::process::SpawnFdAction action{
+        .type = static_cast<uint32_t>(ker::abi::process::SpawnFdActionType::DUP2),
+        .fd = DESTINATION_FD,
+        .srcfd = SOURCE_FD,
+    };
+    ker::abi::process::SpawnOptions options{
+        .size = sizeof(ker::abi::process::SpawnOptions),
+        .version = ker::abi::process::SPAWN_OPTIONS_VERSION,
+        .flags = ker::abi::process::SPAWN_FLAG_SETPGROUP,
+        .pgroup = 0,
+        .actions = &action,
+        .action_count = 1,
+    };
+    ok = ok && apply_spawn_options(&child, &options);
+    close_spawn_cloexec_fds(&child);
+    ok = ok && child.fd_table.lookup(SOURCE_FD) == nullptr && child.fd_table.lookup(DESTINATION_FD) == &source &&
+         !child.get_fd_cloexec(DESTINATION_FD) && child.pgid == child.pid && source.refcount.load(std::memory_order_relaxed) == 2 &&
+         displaced.refcount.load(std::memory_order_relaxed) == 1;
+
+    release_task_fd_table_files(&child);
+    ok = ok && source.refcount.load(std::memory_order_relaxed) == 1;
+    parent.fd_table.remove(SOURCE_FD);
+    parent.fd_table.remove(DESTINATION_FD);
+    return ok;
+}
 #endif
 
 auto supports_file_backed_process(vfs::File* file, size_t file_size) -> bool {
@@ -1327,7 +1450,19 @@ auto wos_proc_exec(const char* path, const char* const* argv, const char* const*
 
 auto wos_proc_spawn(const char* path, const char* const* argv, const char* const* envp, const ker::abi::process::SpawnOptions* options)
     -> uint64_t {
-    return wos_proc_exec_impl(path, argv, envp, options, 0);
+    if (options == nullptr) {
+        return wos_proc_exec_impl(path, argv, envp, nullptr, 0);
+    }
+
+    auto* parent = ker::mod::sched::get_current_task();
+    auto* snapshot = new (std::nothrow) SpawnOptionsSnapshot;
+    if (parent == nullptr || snapshot == nullptr || !snapshot_spawn_options(*parent, options, *snapshot)) {
+        delete snapshot;
+        return 0;
+    }
+    uint64_t const RESULT = wos_proc_exec_impl(path, argv, envp, &snapshot->options, 0);
+    delete snapshot;
+    return RESULT;
 }
 
 namespace {
@@ -1633,8 +1768,9 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
         return 0;
     }
 
-    // Inherit file descriptors from parent, respecting FD_CLOEXEC (per-fd bitmap).
-    if (!clone_exec_fd_table_checked(parent_task, new_task)) {
+    // Spawn file actions must be able to consume CLOEXEC source descriptors;
+    // ordinary exec creation can omit them immediately.
+    if (!clone_exec_fd_table_checked(parent_task, new_task, spawn_options != nullptr)) {
         cleanup_unpublished_task();
         return 0;
     }
@@ -1643,9 +1779,14 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
         cleanup_unpublished_task();
         return 0;
     }
+    if (spawn_options != nullptr) {
+        close_spawn_cloexec_fds(new_task);
+    }
 
-    // Ensure fds 0/1/2 are always set (open /dev/console if not inherited)
-    if (!ensure_exec_stdio_fallbacks(new_task)) {
+    // Legacy WOS exec creation supplies console fallbacks. Option-aware
+    // posix_spawn must preserve the exact post-action descriptor set, including
+    // intentionally closed stdin/stdout/stderr descriptors.
+    if (spawn_options == nullptr && !ensure_exec_stdio_fallbacks(new_task)) {
         cleanup_unpublished_task();
         return 0;
     }
@@ -1869,7 +2010,9 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
     if (remote_result == ker::net::wki::WkiRemoteSpawnResult::REMOTE) {
         if (!sched::task::release_unpublished_process(parent_task, new_task)) {
             dbg::log("wos_proc_exec: remote publication lost child ownership for PID %x", CHILD_PID);
-            return 0;
+            // The child is already published remotely. Report its PID so a
+            // posix_spawn caller cannot fall back and launch it a second time.
+            return CHILD_PID;
         }
         return CHILD_PID;
     }
@@ -1897,7 +2040,9 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
 
     if (!sched::task::release_unpublished_process(parent_task, new_task)) {
         dbg::log("wos_proc_exec: local publication lost child ownership for PID %x", CHILD_PID);
-        return 0;
+        // post_task_balanced() already made the child runnable. A failure
+        // result here would make mlibc retry via fork+exec and run it twice.
+        return CHILD_PID;
     }
     return CHILD_PID;
 

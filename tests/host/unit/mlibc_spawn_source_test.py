@@ -32,6 +32,10 @@ def test_wos_exposes_spawn_sysdep() -> None:
     require(wos_impl, "ker::process::spawn(", "WOS option-aware spawn syscall")
     require(wos_impl, "kernel_options.version = ker::abi::process::SPAWN_OPTIONS_VERSION;", "WOS spawn ABI version fill")
     require(wos_impl, "SpawnFdActionType::DUP2", "WOS spawn fd-action conversion")
+    require(wos_impl, "options->action_count != 0 && !options->actions", "WOS spawn action pointer validation")
+    require(wos_impl, "if (r < 0)\n\t\treturn static_cast<int>(-r);", "WOS spawn negative errno translation")
+    if "generic fork+exec fallback until the WOS fast-spawn fd action path is audited" in wos_impl:
+        fail("WOS spawn must not reject bounded Ninja file actions")
     require(wos_impl, "return EAGAIN;", "WOS spawn sysdep failure fallback signal")
 
 

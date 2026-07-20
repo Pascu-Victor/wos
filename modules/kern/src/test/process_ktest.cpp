@@ -22,3 +22,7 @@ KTEST(ExecFdInstall, StdioInsertFailureClosesFile) {
 KTEST(ExecFdCloexec, SnapshotCollectsMarkedFds) {
     KEXPECT_TRUE(ker::syscall::process::exec_selftest_cloexec_snapshot_collects_marked_fds());
 }
+
+KTEST(ExecSpawnFdActions, Dup2ConsumesCloexecSourceBeforeFinalClose) {
+    KEXPECT_TRUE(ker::syscall::process::exec_selftest_spawn_dup2_consumes_cloexec_source());
+}
