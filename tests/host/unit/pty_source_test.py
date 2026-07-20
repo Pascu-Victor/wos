@@ -6,6 +6,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 PTY_CPP = ROOT / "modules" / "kern" / "src" / "dev" / "pty.cpp"
+CONSOLE_CPP = ROOT / "modules" / "kern" / "src" / "dev" / "console.cpp"
 DEVICE_HPP = ROOT / "modules" / "kern" / "src" / "dev" / "device.hpp"
 FILE_OPERATIONS_HPP = ROOT / "modules" / "kern" / "src" / "vfs" / "file_operations.hpp"
 DEVFS_CPP = ROOT / "modules" / "kern" / "src" / "vfs" / "fs" / "devfs.cpp"
@@ -77,7 +78,24 @@ def test_detached_pty_device_is_not_logged_as_pointer_corruption() -> None:
     require_order(body, "if (pair == nullptr)", "if (!is_valid_kernel_pointer(pair))", "null detach before corruption warning")
 
 
-def test_pty_pair_detaches_only_after_both_sides_close() -> None:
+def test_devfs_and_pty_pointer_validation_accept_kernel_vmap() -> None:
+    for source, context in [
+        (DEVFS_CPP.read_text(), "devfs pointer validation"),
+        (PTY_CPP.read_text(), "PTY pointer validation"),
+    ]:
+        body = function_body(source, "is_valid_kernel_pointer")
+        require_tokens(
+            body,
+            [
+                "IN_HHDM",
+                "IN_KERNEL_STATIC",
+                "ker::mod::mm::virt::kernel_vmap_contains(ptr)",
+            ],
+            context,
+        )
+
+
+def test_pty_pair_retires_only_after_both_sides_close() -> None:
     source = PTY_CPP.read_text()
     master_close = function_body(source, "master_close")
     slave_close = function_body(source, "slave_close")
@@ -88,7 +106,7 @@ def test_pty_pair_detaches_only_after_both_sides_close() -> None:
             "if (pair->master_opened > 0)",
             "pair->master_opened--;",
             "if (pair->master_opened <= 0 && pair->slave_opened <= 0 && !pair->freeing)",
-            "pty_detach_devices(pair);",
+            "pair->freeing = true;",
         ],
         "PTY master close must keep pair attached while any endpoint remains open",
     )
@@ -98,7 +116,7 @@ def test_pty_pair_detaches_only_after_both_sides_close() -> None:
             "if (pair->slave_opened > 0)",
             "pair->slave_opened--;",
             "if (pair->master_opened <= 0 && pair->slave_opened <= 0 && !pair->freeing)",
-            "pty_detach_devices(pair);",
+            "pair->freeing = true;",
         ],
         "PTY slave close must keep pair attached while any endpoint remains open",
     )
@@ -107,6 +125,114 @@ def test_pty_pair_detaches_only_after_both_sides_close() -> None:
         fail("PTY master close must not detach solely because the slave side is closed")
     if "if (pair->master_opened <= 0 && !pair->freeing)" in slave_close:
         fail("PTY slave close must not detach solely because the master side is closed")
+    if "pty_detach_devices" in source:
+        fail("PTY retirement must not race device private_data detachment with /dev/pts open")
+
+
+def test_pts_open_publishes_lifetime_under_namespace_pin() -> None:
+    devfs_source = DEVFS_CPP.read_text()
+    pty_source = PTY_CPP.read_text()
+    open_body = function_body(devfs_source, "devfs_open_path")
+    remove_body = function_body(devfs_source, "devfs_remove_node")
+    readdir_body = function_body(devfs_source, "devfs_readdir")
+    slave_open_body = function_body(pty_source, "slave_open")
+    indexed_open_body = function_body(pty_source, "pty_open_slave_by_index")
+    allocate_body = function_body(pty_source, "pty_alloc")
+    master_open_body = function_body(pty_source, "ptmx_open")
+    tty_open_body = function_body(CONSOLE_CPP.read_text(), "tty_open")
+
+    require_tokens(
+        open_body,
+        [
+            "bool const PTS_PATH = is_pts_devfs_path(rel_path);",
+            "OptionalPtsLock const PTS_GUARD(PTS_PATH);",
+            "node = walk_path(rel_path);",
+            "node->device->char_ops->open(file)",
+        ],
+        "/dev/pts open namespace pin",
+    )
+    require_order(open_body, "OptionalPtsLock const PTS_GUARD", "node = walk_path", "pin before /dev/pts lookup")
+    require_order(open_body, "node = walk_path", "node->device->char_ops->open(file)", "pin through device open")
+    require_tokens(
+        remove_body,
+        [
+            "OptionalPtsLock const PTS_GUARD(is_pts_devfs_path(path));",
+            "remove_child(node->parent, node);",
+            "delete node;",
+        ],
+        "/dev/pts removal namespace pin",
+    )
+    require_tokens(
+        slave_open_body,
+        [
+            "uint64_t const IRQF = pair->lock.lock_irqsave();",
+            "if (pair->freeing || pair->slave_locked)",
+            "pty_pair_acquire(pair);",
+            "pair->slave_opened++;",
+            "pair->lock.unlock_irqrestore(IRQF);",
+        ],
+        "PTY slave lifetime publication",
+    )
+    require_order(slave_open_body, "pair->lock.lock_irqsave", "pty_pair_acquire(pair)", "pair pin under endpoint lock")
+    require_order(slave_open_body, "pty_pair_acquire(pair)", "pair->slave_opened++", "pair pin before open count")
+    published_open = slave_open_body[slave_open_body.find("pty_pair_acquire(pair)") :]
+    require_order(published_open, "pair->slave_opened++", "pair->lock.unlock_irqrestore", "open count before endpoint unlock")
+    require_tokens(
+        readdir_body,
+        [
+            "OptionalPtsLock const PTS_GUARD(devfs_file->guards_pts_namespace);",
+            "dir_node->children_count",
+            "dir_node->children[CHILD_INDEX]",
+        ],
+        "/dev/pts directory traversal namespace pin",
+    )
+    require_tokens(
+        indexed_open_body,
+        [
+            "pty_tree_lock.lock_irqsave();",
+            "pair->lock.lock_irqsave();",
+            "if (pair->freeing || !pair->allocated)",
+            "pty_pair_acquire(pair);",
+            "pair->slave_opened++;",
+        ],
+        "/dev/tty indexed slave lifetime publication",
+    )
+    require_order(indexed_open_body, "pty_tree_lock.lock_irqsave", "pair->lock.lock_irqsave", "tree before pair lock")
+    require_order(indexed_open_body, "pty_pair_acquire(pair)", "pair->slave_opened++", "indexed pair pin before open count")
+    require_tokens(
+        tty_open_body,
+        [
+            "pty_open_slave_by_index(task->controlling_tty)",
+            "dff->device = &pair->slave_dev;",
+        ],
+        "/dev/tty retirement-safe slave open",
+    )
+    if "pair->slave_opened++" in tty_open_body:
+        fail("/dev/tty must not publish its slave count outside the PTY tree/pair lock transaction")
+    require_tokens(
+        allocate_body,
+        [
+            "pair->allocated = false;",
+            "pty_tree.insert(SLOT, pair)",
+            "vfs::devfs::devfs_add_device_node(pts_path, &pair->slave_dev)",
+        ],
+        "PTY publication after tree and devfs registration",
+    )
+    require_order(allocate_body, "pair->allocated = false", "pty_tree.insert(SLOT, pair)", "unpublished pair before tree insertion")
+    if "pair->allocated = true" in allocate_body:
+        fail("PTY allocator must not publish a pair before PTMX establishes its master endpoint")
+    require_tokens(
+        master_open_body,
+        [
+            "auto* pair = pty_get(IDX);",
+            "uint64_t const IRQF = pair->lock.lock_irqsave();",
+            "pair->allocated = true;",
+            "pair->master_opened++;",
+        ],
+        "PTY publication with master endpoint",
+    )
+    require_order(master_open_body, "pair->lock.lock_irqsave", "pair->allocated = true", "publish pair under endpoint lock")
+    require_order(master_open_body, "pair->allocated = true", "pair->master_opened++", "publish pair with master open count")
 
 
 def test_pty_waiter_wakes_preserve_deferred_switch_state() -> None:
@@ -334,7 +460,9 @@ def test_procfs_fd_links_open_by_retaining_referenced_files() -> None:
 
 def main() -> None:
     test_detached_pty_device_is_not_logged_as_pointer_corruption()
-    test_pty_pair_detaches_only_after_both_sides_close()
+    test_devfs_and_pty_pointer_validation_accept_kernel_vmap()
+    test_pty_pair_retires_only_after_both_sides_close()
+    test_pts_open_publishes_lifetime_under_namespace_pin()
     test_pty_waiter_wakes_preserve_deferred_switch_state()
     test_pty_slave_write_fairness_returns_partial_progress()
     test_pty_poll_waits_publish_local_pty_wait_kind()

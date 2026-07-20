@@ -136,7 +136,11 @@ int tty_open(ker::vfs::File* file) {
         return -ENXIO;  // No controlling terminal
     }
 
-    auto* pair = ker::dev::pty::pty_get(task->controlling_tty);
+    if (file == nullptr || file->private_data == nullptr) {
+        return -ENOMEM;
+    }
+
+    auto* pair = ker::dev::pty::pty_open_slave_by_index(task->controlling_tty);
     if (pair == nullptr) {
 #ifdef CONSOLE_DEBUG
         log::debug("tty_open: invalid controlling_tty index");
@@ -155,17 +159,8 @@ int tty_open(ker::vfs::File* file) {
         ker::dev::Device* device;
         uint32_t magic;
     };
-    if (file == nullptr || file->private_data == nullptr) {
-        ker::dev::pty::pty_put(pair);
-        return -ENOMEM;
-    }
     auto* dff = static_cast<DevFSFileHack*>(file->private_data);
     dff->device = &pair->slave_dev;
-
-    // Increment slave open refcount so the matching close is balanced
-    uint64_t const IRQF = pair->lock.lock_irqsave();
-    pair->slave_opened++;
-    pair->lock.unlock_irqrestore(IRQF);
 
     return 0;
 }

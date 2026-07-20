@@ -94,7 +94,7 @@ auto is_valid_kernel_pointer(const void* ptr) -> bool {
     auto addr = reinterpret_cast<uintptr_t>(ptr);
     bool const IN_HHDM = (addr >= 0xffff800000000000ULL && addr < 0xffff900000000000ULL);
     bool const IN_KERNEL_STATIC = (addr >= 0xffffffff80000000ULL && addr < 0xffffffffc0000000ULL);
-    return IN_HHDM || IN_KERNEL_STATIC;
+    return IN_HHDM || IN_KERNEL_STATIC || ker::mod::mm::virt::kernel_vmap_contains(ptr);
 }
 
 auto read_call_buffer_byte(const void* buf, size_t index, uint8_t* out) -> bool {
@@ -228,14 +228,6 @@ void pty_pair_release(PtyPair* pair) {
     }
 }
 
-void pty_detach_devices(PtyPair* pair) {
-    if (pair == nullptr) {
-        return;
-    }
-    pair->master_dev.private_data = nullptr;
-    pair->slave_dev.private_data = nullptr;
-}
-
 auto register_waiter(ker::util::SmallVec<uint64_t, 2>& waiters, uint64_t pid) -> bool {
     for (uint64_t const WAITER_PID : waiters) {
         if (WAITER_PID == pid) {
@@ -365,6 +357,10 @@ bool pty_initialized = false;
 // --- Master-side device operations ---
 
 int ptmx_open(ker::vfs::File* file) {
+    if (file == nullptr || file->private_data == nullptr) {
+        return -ENOMEM;
+    }
+
     // Allocate a new PTY pair
     int const IDX = pty_alloc();
     if (IDX < 0) {
@@ -376,6 +372,7 @@ int ptmx_open(ker::vfs::File* file) {
         return -ENOMEM;
     }
     uint64_t const IRQF = pair->lock.lock_irqsave();
+    pair->allocated = true;
     pair->master_opened++;
     pair->lock.unlock_irqrestore(IRQF);
 
@@ -387,17 +384,9 @@ int ptmx_open(ker::vfs::File* file) {
     // singleton ptmx_dev.  Redirect it to pair->master_dev so that
     // pair_from_file() on subsequent ioctl/read/write calls can locate the
     // correct PtyPair through device->private_data.
-    if (file != nullptr && file->private_data != nullptr) {
-        auto* dff = static_cast<DevFSFileHack*>(file->private_data);
-        dff->device = &pair->master_dev;
-        return 0;
-    }
-
-    uint64_t const CLOSE_IRQF = pair->lock.lock_irqsave();
-    pair->master_opened--;
-    pair->lock.unlock_irqrestore(CLOSE_IRQF);
-    pty_put(pair);
-    return -ENOMEM;
+    auto* dff = static_cast<DevFSFileHack*>(file->private_data);
+    dff->device = &pair->master_dev;
+    return 0;
 }
 
 int master_close(ker::vfs::File* file) {
@@ -429,7 +418,6 @@ int master_close(ker::vfs::File* file) {
     if (pair->master_opened <= 0 && pair->slave_opened <= 0 && !pair->freeing) {
         pair->allocated = false;
         pair->freeing = true;
-        pty_detach_devices(pair);
         should_free = true;
     }
     pair->lock.unlock_irqrestore(IRQF);
@@ -945,15 +933,16 @@ int slave_open(ker::vfs::File* file) {
         return -ENODEV;
     }
 
-    uint64_t irqf = pair->lock.lock_irqsave();
-    bool const SLAVE_LOCKED = pair->slave_locked;
-    pair->lock.unlock_irqrestore(irqf);
-    if (SLAVE_LOCKED) {
+    // devfs holds the /dev/pts namespace mutex while invoking this callback,
+    // so the radix-tree reference pins pair until this endpoint reference and
+    // its open count are published together under pair->lock.
+    uint64_t const IRQF = pair->lock.lock_irqsave();
+    if (pair->freeing || pair->slave_locked) {
+        pair->lock.unlock_irqrestore(IRQF);
         return -EIO;  // Slave is locked, cannot open
     }
 
     pty_pair_acquire(pair);
-    irqf = pair->lock.lock_irqsave();
     pair->slave_opened++;
 
     // Set initial foreground process group to the opener's pgid (only on first open)
@@ -963,7 +952,7 @@ int slave_open(ker::vfs::File* file) {
             pair->foreground_pgrp = (task->pgid != 0) ? task->pgid : task->pid;
         }
     }
-    pair->lock.unlock_irqrestore(irqf);
+    pair->lock.unlock_irqrestore(IRQF);
 
     wake_master_pollers(pair);
 
@@ -986,7 +975,6 @@ int slave_close(ker::vfs::File* file) {
     if (pair->master_opened <= 0 && pair->slave_opened <= 0 && !pair->freeing) {
         pair->allocated = false;
         pair->freeing = true;
-        pty_detach_devices(pair);
         should_free = true;
     }
     pair->lock.unlock_irqrestore(IRQF);
@@ -1433,7 +1421,9 @@ auto pty_alloc() -> int {
     }
 
     pair->index = N;
-    pair->allocated = true;
+    // ptmx_open publishes the pair only after the radix tree, /dev/pts node,
+    // and first master endpoint all own references.
+    pair->allocated = false;
     pair->slave_locked = true;
     pair->slave_opened = 0;
     pair->master_opened = 0;
@@ -1520,6 +1510,34 @@ auto pty_get(int index) -> PtyPair* {
     }
     pty_tree_lock.unlock_irqrestore(IRQF);
     return ptr;
+}
+
+auto pty_open_slave_by_index(int index) -> PtyPair* {
+    if (index < 0 || std::cmp_greater_equal(index, PTY_MAX)) {
+        return nullptr;
+    }
+
+    uint64_t const TREE_IRQF = pty_tree_lock.lock_irqsave();
+    auto* pair = pty_tree.lookup(static_cast<uint64_t>(index));
+    if (pair == nullptr) {
+        pty_tree_lock.unlock_irqrestore(TREE_IRQF);
+        return nullptr;
+    }
+
+    // Final close releases pair->lock before removing the tree reference, so
+    // tree -> pair is the only nested lock order. Publish both lifetime facts
+    // before allowing retirement to observe the endpoint counts again.
+    uint64_t const PAIR_IRQF = pair->lock.lock_irqsave();
+    if (pair->freeing || !pair->allocated) {
+        pair->lock.unlock_irqrestore(PAIR_IRQF);
+        pty_tree_lock.unlock_irqrestore(TREE_IRQF);
+        return nullptr;
+    }
+    pty_pair_acquire(pair);
+    pair->slave_opened++;
+    pair->lock.unlock_irqrestore(PAIR_IRQF);
+    pty_tree_lock.unlock_irqrestore(TREE_IRQF);
+    return pair;
 }
 
 void pty_put(PtyPair* pair) { pty_pair_release(pair); }

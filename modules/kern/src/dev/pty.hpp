@@ -189,6 +189,10 @@ auto pty_alloc() -> int;
 // Get PtyPair by index (nullptr if invalid/unallocated)
 auto pty_get(int index) -> PtyPair*;
 
+// Acquire a slave endpoint reference by PTY index. The pair reference and
+// slave open count are published atomically against final retirement.
+auto pty_open_slave_by_index(int index) -> PtyPair*;
+
 // Release a PtyPair reference previously obtained from pty_get().
 void pty_put(PtyPair* pair);
 

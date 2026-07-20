@@ -19,7 +19,9 @@
 #include <platform/dbg/dbg.hpp>
 #include <platform/dbg/journal.hpp>
 #include <platform/ktime/ktime.hpp>
+#include <platform/mm/virt.hpp>
 #include <platform/sched/task.hpp>
+#include <platform/sys/mutex.hpp>
 #include <platform/sys/spinlock.hpp>
 #include <string_view>
 #include <utility>
@@ -41,7 +43,8 @@ namespace {
 constexpr uint32_t DEVFS_FILE_MAGIC = 0xDEADBEEF;
 constexpr uint64_t NS_PER_SEC = 1000000000ULL;
 using log = ker::mod::dbg::logger<"devfs">;
-ker::mod::sys::Spinlock g_wki_lock;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+ker::mod::sys::Spinlock g_wki_lock;          // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+ker::mod::sys::Mutex g_pts_namespace_mutex;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
 class OptionalWkiLock {
    public:
@@ -62,6 +65,25 @@ class OptionalWkiLock {
     bool locked;
 };
 
+class OptionalPtsLock {
+   public:
+    explicit OptionalPtsLock(bool enabled) : locked(enabled) {
+        if (locked) {
+            g_pts_namespace_mutex.lock();
+        }
+    }
+    OptionalPtsLock(const OptionalPtsLock&) = delete;
+    auto operator=(const OptionalPtsLock&) -> OptionalPtsLock& = delete;
+    ~OptionalPtsLock() {
+        if (locked) {
+            g_pts_namespace_mutex.unlock();
+        }
+    }
+
+   private:
+    bool locked;
+};
+
 void wki_release_node_ref(DevFSNode* node);
 
 auto is_wki_devfs_path(const char* path) -> bool {
@@ -72,11 +94,24 @@ auto is_wki_devfs_path(const char* path) -> bool {
     return std::strncmp(rel_path, "wki", 3) == 0 && (rel_path[3] == '\0' || rel_path[3] == '/');
 }
 
+auto is_pts_devfs_path(const char* path) -> bool {
+    if (path == nullptr) {
+        return false;
+    }
+    const char* rel_path = path;
+    if (std::strncmp(rel_path, "/dev/", 5) == 0) {
+        rel_path += 5;
+    } else if (*rel_path == '/') {
+        rel_path++;
+    }
+    return std::strncmp(rel_path, "pts", 3) == 0 && (rel_path[3] == '\0' || rel_path[3] == '/');
+}
+
 auto is_valid_kernel_pointer(const void* ptr) -> bool {
     auto addr = reinterpret_cast<uintptr_t>(ptr);
     bool const IN_HHDM = (addr >= 0xffff800000000000ULL && addr < 0xffff900000000000ULL);
     bool const IN_KERNEL_STATIC = (addr >= 0xffffffff80000000ULL && addr < 0xffffffffc0000000ULL);
-    return IN_HHDM || IN_KERNEL_STATIC;
+    return IN_HHDM || IN_KERNEL_STATIC || ker::mod::mm::virt::kernel_vmap_contains(ptr);
 }
 
 // -- DevFSNode tree root ----------------------------------------------
@@ -261,6 +296,7 @@ struct DevFSFile {
     ker::dev::Device* device = nullptr;
     uint32_t magic = DEVFS_FILE_MAGIC;
     bool owns_wki_node_ref = false;
+    bool guards_pts_namespace = false;
 };
 
 auto validate_devfs_file(File* f, const char* op) -> DevFSFile* {
@@ -397,6 +433,7 @@ auto devfs_readdir(File* f, DirEntry* entry, size_t index) -> int {
         return -EBADF;
     }
     OptionalWkiLock const WKI_GUARD(devfs_file->owns_wki_node_ref);
+    OptionalPtsLock const PTS_GUARD(devfs_file->guards_pts_namespace);
     auto* dir_node = devfs_file->node;
     if (dir_node == nullptr || dir_node->type != DevFSNodeType::DIRECTORY) {
         return -ENOTDIR;
@@ -613,6 +650,11 @@ auto devfs_open_path(const char* path, int flags, int /*mode*/) -> File* {
     }
 
     bool const WKI_PATH = is_wki_devfs_path(rel_path);
+    bool const PTS_PATH = is_pts_devfs_path(rel_path);
+    // A /dev/pts node embeds its Device in the owning PtyPair. Keep namespace
+    // removal from dropping the tree-owned pair reference until the device
+    // open callback has published its endpoint reference.
+    OptionalPtsLock const PTS_GUARD(PTS_PATH);
     DevFSNode* node = nullptr;
     {
         OptionalWkiLock const WKI_GUARD(WKI_PATH);
@@ -631,6 +673,7 @@ auto devfs_open_path(const char* path, int flags, int /*mode*/) -> File* {
         return nullptr;
     }
     devfs_file->node = node;
+    devfs_file->guards_pts_namespace = PTS_PATH && node->type == DevFSNodeType::DIRECTORY;
 
     file->fd = -1;
     file->fops = &devfs_fops;
@@ -683,7 +726,10 @@ auto devfs_open_path(const char* path, int flags, int /*mode*/) -> File* {
     return file;
 }
 
-auto devfs_create_directory(const char* path) -> DevFSNode* { return walk_path(path, true); }
+auto devfs_create_directory(const char* path) -> DevFSNode* {
+    OptionalPtsLock const PTS_GUARD(is_pts_devfs_path(path));
+    return walk_path(path, true);
+}
 
 auto devfs_create_symlink(const char* path, const char* target) -> DevFSNode* {
     if (path == nullptr || target == nullptr) {
@@ -756,6 +802,8 @@ auto devfs_add_device_node(const char* name, ker::dev::Device* dev) -> DevFSNode
 }
 
 auto devfs_add_device_node(const std::array<char, DEVFS_NAME_MAX>& name, ker::dev::Device* dev) -> DevFSNode* {
+    OptionalPtsLock const PTS_GUARD(is_pts_devfs_path(name.data()));
+
     // If the name contains '/', walk to the parent directory first.
     // e.g. "pts/0" => find (or create) the "pts" dir, then add node "0" there.
     const char* slash = nullptr;
@@ -803,6 +851,7 @@ auto devfs_add_device_node(const std::array<char, DEVFS_NAME_MAX>& name, ker::de
 }
 
 auto devfs_remove_node(const char* path) -> bool {
+    OptionalPtsLock const PTS_GUARD(is_pts_devfs_path(path));
     auto* node = walk_path(path, false);
     if (node == nullptr || node == &root_node || node->parent == nullptr) {
         return false;
