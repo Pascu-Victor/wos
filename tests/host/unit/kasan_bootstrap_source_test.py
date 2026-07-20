@@ -153,12 +153,24 @@ def test_selftest_ap_context_is_prepared_before_goto_address() -> None:
     require_order(
         body,
         [
+            "prepare_selftest_ap_context(bsp_cpu);",
+            "auto* bsp_per_cpu = selftest_ap_per_cpu(bsp_cpu);",
+            "zero_per_cpu(*bsp_per_cpu);",
+            "bsp_per_cpu->cpu_id = bsp_cpu;",
+            "cpu::wrgsbase(BSP_PER_CPU_ADDR);",
+            "cpu_set_msr(IA32_KERNEL_GS_BASE, BSP_PER_CPU_ADDR);",
+            "cpu::set_current_cpuid(bsp_cpu);",
+            "if (g_cpu_count <= 1)",
             "prepare_selftest_ap_context(i);",
             "expected_mask |= 1ULL << i;",
             "__atomic_store_n(&response->cpus[i]->goto_address",
         ],
-        "selftest AP context must be prepared before AP release",
+        "selftest BSP/AP contexts must be prepared before AP release",
     )
+    bsp_setup = body.split("if (g_cpu_count <= 1)", 1)[0]
+    for forbidden in ("notify_per_cpu_ready", "enable_per_cpu_allocations"):
+        if forbidden in bsp_setup:
+            fail(f"selftest BSP GS setup must not enable allocator fast paths: {forbidden}")
 
 
 def test_kasan_shadow_fault_primitives_remain_excluded() -> None:

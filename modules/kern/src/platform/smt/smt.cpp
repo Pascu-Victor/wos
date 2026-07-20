@@ -722,7 +722,36 @@ void init() {
 
 void park_secondary_cpus_for_selftest() {
     auto* response = SMP_REQUEST.response;
-    if (response == nullptr || g_cpu_count <= 1) {
+    if (response == nullptr) {
+        return;
+    }
+
+    uint64_t bsp_cpu = 0;
+    for (uint64_t i = 0; i < response->cpu_count; ++i) {
+        if (response->cpus[i]->lapic_id == bsp_lapic_id) {
+            bsp_cpu = i;
+            break;
+        }
+    }
+
+    // The selftest suite runs before start_smt(), but sanitizer fault paths and
+    // ordinary kernel helpers may still use direct GS-based per-CPU accessors.
+    // APs install their storage in selftest_secondary_cpu_park(); give the BSP
+    // the same valid context without enabling per-CPU allocator fast paths.
+    prepare_selftest_ap_context(bsp_cpu);
+    auto* bsp_per_cpu = selftest_ap_per_cpu(bsp_cpu);
+    if (bsp_per_cpu == nullptr) {
+        hcf();
+    }
+    zero_per_cpu(*bsp_per_cpu);
+    bsp_per_cpu->cpu_id = bsp_cpu;
+    auto const BSP_PER_CPU_ADDR = reinterpret_cast<uint64_t>(bsp_per_cpu);
+    cpu::enable_fsgsbase();
+    cpu::wrgsbase(BSP_PER_CPU_ADDR);
+    cpu_set_msr(IA32_KERNEL_GS_BASE, BSP_PER_CPU_ADDR);
+    cpu::set_current_cpuid(bsp_cpu);
+
+    if (g_cpu_count <= 1) {
         return;
     }
 

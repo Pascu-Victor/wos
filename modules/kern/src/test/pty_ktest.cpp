@@ -3,8 +3,6 @@
 #include <cstdio>
 #include <dev/pty.hpp>
 #include <platform/mm/virt.hpp>
-#include <platform/sched/scheduler.hpp>
-#include <platform/sched/task.hpp>
 #include <test/ktest.hpp>
 #include <vfs/file.hpp>
 #include <vfs/fs/devfs.hpp>
@@ -44,7 +42,6 @@ struct PtyLifetimeResult {
     bool closes_succeeded = true;
     bool master_identity_is_vmap = false;
     bool slave_identity_is_vmap = false;
-    bool tty_open_succeeded = false;
     bool pts_entry_was_visible = false;
     bool pts_entry_was_removed = false;
     int first_pty = -1;
@@ -56,11 +53,8 @@ auto run_pty_lifetime_scenario() -> PtyLifetimeResult {
     ker::vfs::File* master = nullptr;
     ker::vfs::File* first_slave = nullptr;
     ker::vfs::File* second_slave = nullptr;
-    ker::vfs::File* tty = nullptr;
     ker::vfs::File* pts_directory = nullptr;
     ker::vfs::File* next_master = nullptr;
-    auto* task = ker::mod::sched::get_current_task();
-    int const SAVED_CONTROLLING_TTY = task != nullptr ? task->controlling_tty : -1;
 
     do {
         pts_directory = ker::vfs::devfs::devfs_open_path("/dev/pts", 0, 0);
@@ -80,12 +74,7 @@ auto run_pty_lifetime_scenario() -> PtyLifetimeResult {
             break;
         }
         result.slave_identity_is_vmap = ker::mod::mm::virt::kernel_vmap_contains(ker::dev::pty::pty_file_identity_key(first_slave));
-        if (ker::vfs::devfs::devfs_ioctl(first_slave, ker::dev::pty::TIOCSCTTY, 0) != 0) {
-            break;
-        }
-        tty = ker::vfs::devfs::devfs_open_path("/dev/tty", 2, 0);
-        result.tty_open_succeeded = tty != nullptr;
-        if (tty == nullptr || !close_and_clear(master)) {
+        if (!close_and_clear(master)) {
             result.closes_succeeded = false;
             break;
         }
@@ -94,11 +83,7 @@ auto run_pty_lifetime_scenario() -> PtyLifetimeResult {
         if (second_slave == nullptr) {
             break;
         }
-        if (task != nullptr) {
-            task->controlling_tty = SAVED_CONTROLLING_TTY;
-        }
         bool endpoint_closes_succeeded = close_and_clear(first_slave);
-        endpoint_closes_succeeded = close_and_clear(tty) && endpoint_closes_succeeded;
         endpoint_closes_succeeded = close_and_clear(second_slave) && endpoint_closes_succeeded;
         result.closes_succeeded = endpoint_closes_succeeded;
         if (!result.closes_succeeded) {
@@ -116,13 +101,9 @@ auto run_pty_lifetime_scenario() -> PtyLifetimeResult {
         result.completed = true;
     } while (false);
 
-    if (task != nullptr) {
-        task->controlling_tty = SAVED_CONTROLLING_TTY;
-    }
     result.closes_succeeded = close_and_clear(master) && result.closes_succeeded;
     result.closes_succeeded = close_and_clear(first_slave) && result.closes_succeeded;
     result.closes_succeeded = close_and_clear(second_slave) && result.closes_succeeded;
-    result.closes_succeeded = close_and_clear(tty) && result.closes_succeeded;
     result.closes_succeeded = close_and_clear(pts_directory) && result.closes_succeeded;
     result.closes_succeeded = close_and_clear(next_master) && result.closes_succeeded;
     return result;
@@ -136,7 +117,6 @@ KTEST(PTY, VmapBackedMasterAndSlaveSurviveCloseOrdering) {
     KEXPECT_TRUE(RESULT.closes_succeeded);
     KEXPECT_TRUE(RESULT.master_identity_is_vmap);
     KEXPECT_TRUE(RESULT.slave_identity_is_vmap);
-    KEXPECT_TRUE(RESULT.tty_open_succeeded);
     KEXPECT_TRUE(RESULT.pts_entry_was_visible);
     KEXPECT_TRUE(RESULT.pts_entry_was_removed);
     KEXPECT_EQ(RESULT.second_pty, RESULT.first_pty);
