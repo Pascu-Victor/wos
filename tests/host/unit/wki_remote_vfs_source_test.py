@@ -252,6 +252,34 @@ def test_vfs_route_scratch_is_initialized_by_its_producer() -> None:
             fail(f"route scratch must not retain redundant value initialization: {legacy}")
 
 
+def test_remote_chown_matches_xfs_noop_semantics() -> None:
+    core = VFS_CORE_CPP.read_text()
+    path_chown = function_body(core, "vfs_chown_resolved_path")
+    file_chown = function_body(core, "vfs_fchown_for_task")
+
+    require_order(
+        path_chown,
+        [
+            "case FSType::FAT32:",
+            "case FSType::XFS:",
+            "case FSType::REMOTE:",
+            "return 0;  // Accept silently",
+        ],
+        "remote path chown follows XFS ownership semantics",
+    )
+    require_order(
+        file_chown,
+        [
+            "case FSType::FAT32:",
+            "case FSType::XFS:",
+            "case FSType::REMOTE:",
+            "vfs_put_file(f);",
+            "return 0;  // Accept silently",
+        ],
+        "remote file chown follows XFS ownership semantics",
+    )
+
+
 def test_wki_host_mount_scratch_is_initialized_by_its_producers() -> None:
     core = VFS_CORE_CPP.read_text()
     mount = function_body(core, "ensure_wki_host_root_mount")
@@ -3944,6 +3972,7 @@ def test_metadata_batch_never_replays_after_a_send_attempt() -> None:
 def main() -> None:
     test_vfs_host_alias_rewrite_is_overlap_safe()
     test_vfs_route_scratch_is_initialized_by_its_producer()
+    test_remote_chown_matches_xfs_noop_semantics()
     test_wki_host_mount_scratch_is_initialized_by_its_producers()
     test_vfs_rename_scratch_is_initialized_by_its_producers()
     test_proxy_op_slot_waits_are_bounded()

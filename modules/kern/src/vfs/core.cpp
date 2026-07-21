@@ -13508,6 +13508,7 @@ auto vfs_chown_resolved_path(const char* path, uint32_t owner, uint32_t group, s
         }
         case FSType::FAT32:
         case FSType::XFS:
+        case FSType::REMOTE:
             return 0;  // Accept silently
         default:
             return -ENOSYS;
@@ -13549,6 +13550,7 @@ auto vfs_fchown_for_task(ker::mod::sched::task::Task* task, int fd, uint32_t own
         case FSType::DEVFS:
         case FSType::FAT32:
         case FSType::XFS:
+        case FSType::REMOTE:
             vfs_put_file(f);
             return 0;  // Accept silently
         default:
