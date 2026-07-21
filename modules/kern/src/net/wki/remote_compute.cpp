@@ -2132,6 +2132,20 @@ auto try_remote_placement(ker::mod::sched::task::Task* task) -> ker::mod::sched:
 
 namespace {
 auto wki_preferred_remote_node() -> uint16_t;
+void wki_release_preferred_remote_node(uint16_t node_id);
+
+class PreferredRemoteReservation {
+   public:
+    PreferredRemoteReservation() = default;
+    PreferredRemoteReservation(const PreferredRemoteReservation&) = delete;
+    auto operator=(const PreferredRemoteReservation&) -> PreferredRemoteReservation& = delete;
+    ~PreferredRemoteReservation();
+
+    void adopt(uint16_t selected_node_id) { node_id = selected_node_id; }
+
+   private:
+    uint16_t node_id = WKI_NODE_INVALID;
+};
 }  // namespace
 
 // ===============================================================================
@@ -2335,6 +2349,7 @@ auto wki_try_remote_spawn(ker::mod::sched::task::Task* task, const WkiRemoteSpaw
     task->wki_skip_legacy_placement = true;
 
     uint16_t best_node = WKI_NODE_INVALID;
+    PreferredRemoteReservation preferred_reservation;
     if (EXPLICIT_TARGET) {
         const char* const TARGET_HOSTNAME = task->wki_target_hostname.data();
         uint16_t node_id = wki_peer_find_by_hostname(TARGET_HOSTNAME);
@@ -2372,6 +2387,7 @@ auto wki_try_remote_spawn(ker::mod::sched::task::Task* task, const WkiRemoteSpaw
             s_compute_lock.lock();
             best_node = wki_preferred_remote_node();
             s_compute_lock.unlock();
+            preferred_reservation.adopt(best_node);
         }
         if (best_node == WKI_NODE_INVALID) {
             WkiRemoteSpawnResult const RESULT = STRICT_REMOTE ? WkiRemoteSpawnResult::FAILED : WkiRemoteSpawnResult::LOCAL;
@@ -3643,13 +3659,32 @@ auto wki_least_loaded_node(uint16_t local_load) -> uint16_t {
 namespace {
 
 // s_compute_lock must be held by caller.
+auto active_submitted_tasks_for_node_locked(uint16_t node_id) -> size_t {
+    size_t active = 0;
+    for (const auto& slot : g_submitted_tasks) {
+        if (slot.occupied && slot.task.active && slot.task.target_node == node_id) {
+            active++;
+        }
+    }
+    return active;
+}
+
+auto preferred_remote_placement_score(const RemoteNodeLoad& load, size_t active_submissions) -> uint64_t {
+    uint64_t const CPUS = std::max<uint64_t>(load.num_cpus, 1);
+    uint64_t const INFLIGHT = active_submissions + load.placement_reservations;
+    uint64_t const INFLIGHT_PRESSURE = (INFLIGHT * 1000ULL) / CPUS;
+    return static_cast<uint64_t>(load.avg_load_pct) + WKI_REMOTE_PLACEMENT_PENALTY + INFLIGHT_PRESSURE;
+}
+
+// s_compute_lock must be held by caller. The returned node owns one transient
+// reservation until PreferredRemoteReservation releases it on function exit.
 auto wki_preferred_remote_node() -> uint16_t {
-    std::array<uint16_t, WKI_MAX_PEERS> candidates = {};
+    std::array<RemoteNodeLoad*, WKI_MAX_PEERS> candidates = {};
     size_t candidate_count = 0;
-    uint32_t best_load = UINT32_MAX;
+    uint64_t best_score = UINT64_MAX;
     uint64_t const NOW = wki_now_us();
 
-    for (const auto& rl : g_remote_loads) {
+    for (auto& rl : g_remote_loads) {
         if (!rl.valid) {
             continue;
         }
@@ -3660,24 +3695,42 @@ auto wki_preferred_remote_node() -> uint16_t {
         if (peer == nullptr || peer->state != PeerState::CONNECTED) {
             continue;
         }
-        uint32_t const ADJUSTED = static_cast<uint32_t>(rl.avg_load_pct) + WKI_REMOTE_PLACEMENT_PENALTY;
-        if (ADJUSTED < best_load) {
-            best_load = ADJUSTED;
+        uint64_t const SCORE = preferred_remote_placement_score(rl, active_submitted_tasks_for_node_locked(rl.node_id));
+        if (SCORE < best_score) {
+            best_score = SCORE;
             candidate_count = 0;
         }
-        if (ADJUSTED == best_load && candidate_count < candidates.size()) {
-            candidates.at(candidate_count++) = rl.node_id;
+        if (SCORE == best_score && candidate_count < candidates.size()) {
+            candidates.at(candidate_count++) = &rl;
         }
     }
 
     if (candidate_count != 0) {
-        uint16_t const NODE = candidates.at(g_preferred_remote_cursor % candidate_count);
+        RemoteNodeLoad* const SELECTED = candidates.at(g_preferred_remote_cursor % candidate_count);
         ++g_preferred_remote_cursor;
-        return NODE;
+        if (SELECTED->placement_reservations != UINT32_MAX) {
+            SELECTED->placement_reservations++;
+        }
+        return SELECTED->node_id;
     }
 
     return WKI_NODE_INVALID;
 }
+
+void wki_release_preferred_remote_node(uint16_t node_id) {
+    if (node_id == WKI_NODE_INVALID) {
+        return;
+    }
+
+    s_compute_lock.lock();
+    RemoteNodeLoad* const LOAD = find_remote_load(node_id);
+    if (LOAD != nullptr && LOAD->placement_reservations != 0) {
+        LOAD->placement_reservations--;
+    }
+    s_compute_lock.unlock();
+}
+
+PreferredRemoteReservation::~PreferredRemoteReservation() { wki_release_preferred_remote_node(node_id); }
 
 }  // namespace
 
@@ -4330,6 +4383,23 @@ auto wki_remote_compute_selftest_load_snapshot_survives_cleanup() -> bool {
 
     return SNAPSHOT_FOUND && snapshot.valid && snapshot.node_id == NODE_ID && snapshot.num_cpus == CPU_COUNT &&
            snapshot.avg_load_pct == LOAD_PCT && snapshot.last_update_us == LAST_UPDATE_US && CLEANED_UP;
+}
+
+auto wki_remote_compute_selftest_placement_score_accounts_for_inflight() -> bool {
+    RemoteNodeLoad load = {};
+    load.num_cpus = 8;
+    load.avg_load_pct = 100;
+
+    uint64_t const IDLE_SCORE = preferred_remote_placement_score(load, 0);
+    uint64_t const ONE_ACTIVE_SCORE = preferred_remote_placement_score(load, 1);
+
+    load.placement_reservations = 1;
+    uint64_t const ONE_RESERVED_SCORE = preferred_remote_placement_score(load, 0);
+
+    load.num_cpus = 4;
+    uint64_t const FOUR_CPU_RESERVED_SCORE = preferred_remote_placement_score(load, 0);
+
+    return ONE_ACTIVE_SCORE > IDLE_SCORE && ONE_RESERVED_SCORE == ONE_ACTIVE_SCORE && FOUR_CPU_RESERVED_SCORE > ONE_RESERVED_SCORE;
 }
 
 auto wki_remote_compute_selftest_submit_policy_scope_restores_worker() -> bool {

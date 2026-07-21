@@ -32,6 +32,9 @@ struct RemoteNodeLoad {
     uint16_t avg_load_pct = 0;  // 0-1000
     uint16_t free_mem_pages = 0;
     uint64_t last_update_us = 0;
+    // Submitter-local reservations bridge selection and SubmittedTask
+    // publication. This field is never serialized on the wire.
+    uint32_t placement_reservations = 0;
 };
 
 // -----------------------------------------------------------------------------
@@ -404,6 +407,7 @@ auto wki_remote_compute_selftest_task_exit_retires_wait_owners() -> bool;
 auto wki_remote_compute_selftest_submitted_slots_reclaim_safely() -> bool;
 auto wki_remote_compute_selftest_task_id_wrap_is_safe() -> bool;
 auto wki_remote_compute_selftest_load_snapshot_survives_cleanup() -> bool;
+auto wki_remote_compute_selftest_placement_score_accounts_for_inflight() -> bool;
 auto wki_remote_compute_selftest_submit_policy_scope_restores_worker() -> bool;
 auto wki_remote_compute_selftest_submit_context_lengths_are_checked() -> bool;
 auto wki_remote_compute_selftest_submit_worker_count_is_bounded() -> bool;

@@ -31,6 +31,10 @@ KTEST(WkiRemoteCompute, LoadSnapshotSurvivesCleanup) {
     KEXPECT_TRUE(ker::net::wki::wki_remote_compute_selftest_load_snapshot_survives_cleanup());
 }
 
+KTEST(WkiRemoteCompute, PlacementScoreAccountsForInflight) {
+    KEXPECT_TRUE(ker::net::wki::wki_remote_compute_selftest_placement_score_accounts_for_inflight());
+}
+
 KTEST(WkiRemoteCompute, SubmitPolicyScopeRestoresWorker) {
     KEXPECT_TRUE(ker::net::wki::wki_remote_compute_selftest_submit_policy_scope_restores_worker());
 }

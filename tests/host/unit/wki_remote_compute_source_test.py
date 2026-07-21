@@ -316,6 +316,48 @@ def test_remote_load_procfs_uses_locked_snapshot() -> None:
     require_tokens(ktest, ["LoadSnapshotSurvivesCleanup", token], "remote load snapshot KTEST coverage")
 
 
+def test_preferred_placement_accounts_for_inflight_submissions() -> None:
+    source = REMOTE_COMPUTE_CPP.read_text()
+    header = REMOTE_COMPUTE_HPP.read_text()
+    ktest = REMOTE_COMPUTE_KTEST.read_text()
+
+    preferred = function_body(source, "wki_preferred_remote_node")
+    require_tokens(
+        preferred,
+        [
+            "preferred_remote_placement_score(rl, active_submitted_tasks_for_node_locked(rl.node_id))",
+            "SELECTED->placement_reservations++",
+            "return SELECTED->node_id",
+        ],
+        "preferred placement must reserve score capacity before returning",
+    )
+
+    release = function_body(source, "wki_release_preferred_remote_node")
+    require_tokens(
+        release,
+        [
+            "s_compute_lock.lock()",
+            "find_remote_load(node_id)",
+            "LOAD->placement_reservations--",
+            "s_compute_lock.unlock()",
+        ],
+        "placement reservation release must be compute-lock serialized",
+    )
+
+    spawn = function_body(source, "wki_try_remote_spawn")
+    require_order(
+        spawn,
+        "best_node = wki_preferred_remote_node()",
+        "preferred_reservation.adopt(best_node)",
+        "remote-preferred selection must transfer reservation ownership to the scope guard",
+    )
+
+    token = "wki_remote_compute_selftest_placement_score_accounts_for_inflight"
+    require_tokens(source, [f"auto {token}() -> bool"], "placement score selftest implementation")
+    require_tokens(header, [f"auto {token}() -> bool;"], "placement score selftest declaration")
+    require_tokens(ktest, ["PlacementScoreAccountsForInflight", token], "placement score KTEST coverage")
+
+
 def test_submitted_task_slots_are_indexed_and_reclaimed() -> None:
     source = REMOTE_COMPUTE_CPP.read_text()
     header = REMOTE_COMPUTE_HPP.read_text()
@@ -2293,6 +2335,7 @@ def main() -> None:
     test_task_completion_uses_bounded_stack_storage()
     test_proxy_waiting_publication_is_transactional()
     test_remote_load_procfs_uses_locked_snapshot()
+    test_preferred_placement_accounts_for_inflight_submissions()
     test_load_report_uses_cpu_accounting_and_shared_local_cache()
     test_receiver_path_localization_bounds_suffix_scan()
     test_vfs_ref_loader_rejects_null_or_empty_path_before_vfs_use()
