@@ -40,6 +40,9 @@ Options:
   --distributed           Run the WOS payload with REMOTE placement enabled.
                           The submitting node owns the checkout and reports;
                           build processes may execute on connected WOS peers.
+  --distributed-hosts CSV Explicit WOS compiler placement targets. Required
+                          with --distributed and must contain at least two
+                          unique host names, including the submitter.
   --skip-bootstrap        Skip ./tools/bootstrap.sh, useful only for iteration
   --keep-workdir          Refuse to replace an existing checkout in workdir
   --resume-checkout       Reuse the existing depth-1 checkout in workdir after
@@ -138,6 +141,7 @@ host_sysroot="${WOS_SELFHOST_HOST_SYSROOT:-}"
 source_cache="${WOS_SELFHOST_SOURCE_CACHE:-}"
 distdir="${WOS_SELFHOST_DISTDIR:-}"
 distributed="${WOS_SELFHOST_DISTRIBUTED:-0}"
+distributed_hosts="${WOS_SELFHOST_DISTRIBUTED_HOSTS:-}"
 clean_path="${WOS_SELFHOST_CLEAN_PATH:-}"
 priority_reset="${WOS_SELFHOST_PRIORITY_RESET:-}"
 priority_nice_delta="${WOS_SELFHOST_PRIORITY_NICE_DELTA:-}"
@@ -823,6 +827,7 @@ run_with_jobs_env() {
             WOS_MAKE_JOBS="$jobs" \
             CMAKE_BUILD_PARALLEL_LEVEL="$jobs" \
             WOS_DISTRIBUTED_COMPILER=1 \
+            WOS_DISTRIBUTED_COMPILER_HOSTS="$distributed_hosts" \
             "$@"
     else
         WOS_BUILD_JOBS="$jobs" \
@@ -1470,6 +1475,7 @@ run_wos() {
     remote_env+=" WOS_SELFHOST_SOURCE_CACHE=$(shell_quote "$source_cache")"
     remote_env+=" WOS_SELFHOST_DISTDIR=$(shell_quote "$distdir")"
     remote_env+=" WOS_SELFHOST_DISTRIBUTED=$(shell_quote "$distributed")"
+    remote_env+=" WOS_SELFHOST_DISTRIBUTED_HOSTS=$(shell_quote "$distributed_hosts")"
     remote_env+=" WOS_SELFHOST_HEARTBEAT_INTERVAL=$(shell_quote "$heartbeat_interval")"
     remote_env+=" WOS_SELFHOST_HEARTBEAT_TAIL=$(shell_quote "$heartbeat_tail")"
     remote_env+=" WOS_SELFHOST_HEARTBEAT_STALL_SNAPSHOTS=$(shell_quote "$heartbeat_stall_snapshots")"
@@ -1537,6 +1543,7 @@ heartbeat_tail="4"
 heartbeat_stall_snapshots="6"
 heartbeat_sync="0"
 distributed=0
+distributed_hosts=""
 
 while (($# > 0)); do
     case "$1" in
@@ -1653,6 +1660,11 @@ while (($# > 0)); do
         --distributed)
             distributed=1
             ;;
+        --distributed-hosts)
+            distributed_hosts="${2:-}"
+            [ -n "$distributed_hosts" ] || die "--distributed-hosts requires a value"
+            shift
+            ;;
         -h|--help)
             usage
             exit 0
@@ -1678,6 +1690,27 @@ esac
 
 if [ "$distributed" -eq 1 ] && [ "$mode" != "wos" ]; then
     die "--distributed is only supported with wos mode"
+fi
+
+if [ "$distributed" -eq 1 ]; then
+    [ -n "$distributed_hosts" ] || die "--distributed requires --distributed-hosts"
+    reject_whitespace "--distributed-hosts" "$distributed_hosts"
+    case "$distributed_hosts" in
+        ,*|*,|*,,*) die "distributed host list contains an empty entry" ;;
+    esac
+    IFS=, read -r -a distributed_host_list <<< "$distributed_hosts"
+    [ "${#distributed_host_list[@]}" -ge 2 ] || die "distributed mode requires at least two WOS hosts"
+    declare -A distributed_host_seen=()
+    for distributed_host in "${distributed_host_list[@]}"; do
+        case "$distributed_host" in
+            *[!A-Za-z0-9._-]*) die "distributed host contains unsafe characters: $distributed_host" ;;
+        esac
+        [ -z "${distributed_host_seen[$distributed_host]:-}" ] || die "duplicate distributed host: $distributed_host"
+        distributed_host_seen[$distributed_host]=1
+    done
+    [ -n "${distributed_host_seen[$host]:-}" ] || die "distributed hosts must include the submitter: $host"
+elif [ -n "$distributed_hosts" ]; then
+    die "--distributed-hosts requires --distributed"
 fi
 
 if [ -z "$workdir" ]; then

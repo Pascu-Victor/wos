@@ -15,6 +15,7 @@ SELFHOST_REPEATABILITY = ROOT / "scripts" / "bench" / "run_wos_selfhost_repeatab
 SELFHOST_LINUX_BASELINE = ROOT / "scripts" / "bench" / "run_linux_selfhost_baseline.sh"
 SELFHOST_COMPARE = ROOT / "scripts" / "bench" / "compare_wos_selfhost_reports.py"
 SELFHOST_CLUSTER = ROOT / "configs" / "cluster_selfhost.json"
+DISTRIBUTED_CLUSTER = ROOT / "configs" / "cluster_bench_4.json"
 GIT_MIRROR = ROOT / "scripts" / "dev" / "git_mirror_for_wos.sh"
 ROOTFS_ALIASES = ROOT / "configs" / "rootfs" / "aliases.tsv"
 
@@ -49,6 +50,8 @@ def test_selfhost_runner_covers_acceptance_flow() -> None:
             'distributed_command+=" -- $remote_env bash \\\"\\$payload\\\""',
             'WOS_SELFHOST_DISTRIBUTED=$(shell_quote "$distributed")',
             "WOS_DISTRIBUTED_COMPILER=1",
+            'WOS_DISTRIBUTED_COMPILER_HOSTS="$distributed_hosts"',
+            '--distributed-hosts',
             'for routed_path in /root /usr /bin /lib /lib64 /libexec /share /etc /proc /dev /run /tmp; do',
             "clone_cmd=(git clone)",
             "run_timed_event \"clone\" \"wos_repo\" run_git_http",
@@ -117,11 +120,37 @@ def test_wos_bootstrap_distributes_only_compiler_processes() -> None:
         [
             'compiler=("$system_clang" -resource-dir "$resource_dir")',
             r'if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ]; then',
-            r'exec remotely "\${compiler[@]}" "\$@"',
+            r'IFS=, read -r -a compiler_hosts <<< "\${WOS_DISTRIBUTED_COMPILER_HOSTS:-}"',
+            r'compiler_host="\${compiler_hosts[\$((\$\$ % \${#compiler_hosts[@]}))]}"',
+            r'exec on "\$compiler_host" "\${compiler[@]}" "\$@"',
             r'exec "\${compiler[@]}" "\$@"',
         ],
         "WOS native compiler-only distribution",
     )
+
+
+def test_distributed_compiler_hosts_are_validated_before_launch() -> None:
+    invalid_cases = [
+        (["--distributed"], "--distributed requires --distributed-hosts"),
+        (
+            ["--distributed", "--distributed-hosts", "wos-0,wos-0"],
+            "duplicate distributed host",
+        ),
+        (
+            ["--distributed", "--distributed-hosts", "wos-1,wos-2"],
+            "distributed hosts must include the submitter",
+        ),
+    ]
+    for arguments, expected_error in invalid_cases:
+        result = subprocess.run(
+            [str(SELFHOST_RUNNER), "wos", *arguments],
+            cwd=ROOT,
+            check=False,
+            text=True,
+            capture_output=True,
+        )
+        if result.returncode == 0 or expected_error not in result.stderr:
+            fail(f"distributed host validation accepted {arguments!r}")
 
 
 def test_selfhost_runner_locks_workdir_before_replacing_it() -> None:
@@ -202,7 +231,7 @@ def test_selfhost_repeatability_runner_preserves_acceptance_evidence() -> None:
             "timed_out_runs",
             "--distributed-hosts",
             "--distributed-serial-logs",
-            'runner_cmd+=(--distributed)',
+            'runner_cmd+=(--distributed --distributed-hosts "$distributed_hosts_csv")',
             'capture_distributed_telemetry "$runner_pid" "$run_dir/distributed-telemetry.tsv"',
             'running_active=\\([0-9][0-9]*\\)',
             'distributed_workload_observed_on_${distributed_running_hosts}_hosts',
@@ -660,6 +689,17 @@ def test_selfhost_cluster_profile_is_single_large_vm() -> None:
 
     if vm["disk0"] != "disk.qcow2" or vm["disk1"] != "mountfs.qcow2":
         fail("self-host cluster profile must use the normal WOS disks")
+
+
+def test_distributed_cluster_has_plausible_per_core_memory() -> None:
+    config = json.loads(DISTRIBUTED_CLUSTER.read_text())
+    global_vm = config["zones"][0]["vm"]
+    if global_vm["memory"] != "16384M" or global_vm["cpus"] != 8:
+        fail("distributed benchmark nodes must provide 2 GiB per core")
+
+    node_zones = [zone for zone in config["zones"] if zone["id"] != "GLOBAL"]
+    if [zone["nodes"] for zone in node_zones] != [4, 4]:
+        fail("distributed benchmark profile must launch four WOS systems")
 
 
 def test_selfhost_runner_verifies_toolchain_kernel_and_utilities() -> None:
@@ -1500,6 +1540,8 @@ def test_selfhost_report_comparator_checks_clone_build_and_total() -> None:
 
 if __name__ == "__main__":
     test_selfhost_runner_covers_acceptance_flow()
+    test_wos_bootstrap_distributes_only_compiler_processes()
+    test_distributed_compiler_hosts_are_validated_before_launch()
     test_selfhost_repeatability_runner_preserves_acceptance_evidence()
     test_linux_selfhost_baseline_preserves_full_process_evidence()
     test_selfhost_runner_verifies_toolchain_kernel_and_utilities()
@@ -1514,5 +1556,6 @@ if __name__ == "__main__":
     test_selfhost_runner_records_detailed_historical_timings()
     test_selfhost_runner_timing_avoids_python_when_epochrealtime_exists()
     test_selfhost_runner_keeps_remote_and_scratch_handling_guarded()
+    test_distributed_cluster_has_plausible_per_core_memory()
     test_selfhost_report_comparator_checks_clone_build_and_total()
     print("WOS self-host benchmark source invariants hold")

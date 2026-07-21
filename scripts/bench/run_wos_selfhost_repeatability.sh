@@ -697,7 +697,7 @@ for ((run_number = 1; run_number <= runs; ++run_number)); do
         runner_cmd+=(--distdir "$distdir")
     fi
     if [ "$distributed" -eq 1 ]; then
-        runner_cmd+=(--distributed)
+        runner_cmd+=(--distributed --distributed-hosts "$distributed_hosts_csv")
     fi
 
     echo "[$run_label/$runs] start $(printf '%q ' "${runner_cmd[@]}")"

@@ -110,7 +110,13 @@ if [ "\$use_config" -eq 1 ] && [ -f "\$config" ]; then
 fi
 
 if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ]; then
-    exec remotely "\${compiler[@]}" "\$@"
+    IFS=, read -r -a compiler_hosts <<< "\${WOS_DISTRIBUTED_COMPILER_HOSTS:-}"
+    if [ "\${#compiler_hosts[@]}" -lt 2 ]; then
+        echo "ERROR: distributed compiler requires at least two WOS hosts" >&2
+        exit 1
+    fi
+    compiler_host="\${compiler_hosts[\$((\$\$ % \${#compiler_hosts[@]}))]}"
+    exec on "\$compiler_host" "\${compiler[@]}" "\$@"
 fi
 exec "\${compiler[@]}" "\$@"
 EOF
