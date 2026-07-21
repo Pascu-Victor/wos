@@ -137,6 +137,7 @@ host_toolchain="${WOS_SELFHOST_HOST_TOOLCHAIN:-}"
 host_sysroot="${WOS_SELFHOST_HOST_SYSROOT:-}"
 source_cache="${WOS_SELFHOST_SOURCE_CACHE:-}"
 distdir="${WOS_SELFHOST_DISTDIR:-}"
+distributed="${WOS_SELFHOST_DISTRIBUTED:-0}"
 clean_path="${WOS_SELFHOST_CLEAN_PATH:-}"
 priority_reset="${WOS_SELFHOST_PRIORITY_RESET:-}"
 priority_nice_delta="${WOS_SELFHOST_PRIORITY_NICE_DELTA:-}"
@@ -816,11 +817,19 @@ require_any() {
 }
 
 run_with_jobs_env() {
-    WOS_BUILD_JOBS="$jobs" \
-        WOS_NINJA_JOBS="$jobs" \
-        WOS_MAKE_JOBS="$jobs" \
-        CMAKE_BUILD_PARALLEL_LEVEL="$jobs" \
-        "$@"
+    if [ "$mode" = "wos" ] && [ "$distributed" = "1" ]; then
+        WOS_BUILD_JOBS="$jobs" \
+            WOS_NINJA_JOBS="$jobs" \
+            WOS_MAKE_JOBS="$jobs" \
+            CMAKE_BUILD_PARALLEL_LEVEL="$jobs" \
+            remotely "$@"
+    else
+        WOS_BUILD_JOBS="$jobs" \
+            WOS_NINJA_JOBS="$jobs" \
+            WOS_MAKE_JOBS="$jobs" \
+            CMAKE_BUILD_PARALLEL_LEVEL="$jobs" \
+            "$@"
+    fi
 }
 
 run_git_http() {
@@ -1459,6 +1468,7 @@ run_wos() {
     remote_env+=" WOS_SELFHOST_HOST_SYSROOT=$(shell_quote "$host_sysroot")"
     remote_env+=" WOS_SELFHOST_SOURCE_CACHE=$(shell_quote "$source_cache")"
     remote_env+=" WOS_SELFHOST_DISTDIR=$(shell_quote "$distdir")"
+    remote_env+=" WOS_SELFHOST_DISTRIBUTED=$(shell_quote "$distributed")"
     remote_env+=" WOS_SELFHOST_HEARTBEAT_INTERVAL=$(shell_quote "$heartbeat_interval")"
     remote_env+=" WOS_SELFHOST_HEARTBEAT_TAIL=$(shell_quote "$heartbeat_tail")"
     remote_env+=" WOS_SELFHOST_HEARTBEAT_STALL_SNAPSHOTS=$(shell_quote "$heartbeat_stall_snapshots")"
@@ -1484,7 +1494,7 @@ run_wos() {
         for routed_path in /root /usr /bin /lib /lib64 /libexec /share /etc /proc /dev /run /tmp; do
             distributed_command+=" $(shell_quote "-$routed_path")"
         done
-        distributed_command+=" -- remotely $remote_env bash \"\$payload\""
+        distributed_command+=" -- $remote_env bash \"\$payload\""
         remote_command+="; $distributed_command"
     else
         remote_command+="; $remote_env bash \"\$payload\""
