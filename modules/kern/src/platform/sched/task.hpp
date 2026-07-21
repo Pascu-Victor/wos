@@ -546,6 +546,10 @@ struct Task {
     uint32_t slice_ns{};       // Time slice in nanoseconds
     uint32_t slice_used_ns{};  // Accumulated runtime within current slice
     int32_t heap_index{};      // -1 if not in any per-CPU RunHeap
+    static constexpr uint32_t ACTIVE_REGISTRY_INDEX_INVALID = UINT32_MAX;
+    // Dense active-task registry slot. The registry lock protects this field
+    // and updates it whenever swap-removal moves another task into the slot.
+    uint32_t active_registry_index = ACTIVE_REGISTRY_INDEX_INVALID;
     uint32_t last_run_us = 0;
     uint32_t last_sleep_us = 0;
 

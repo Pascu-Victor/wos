@@ -865,15 +865,14 @@ def test_pid_allocation_and_publication_reject_duplicates() -> None:
     require_tokens(
         active_insert_body,
         [
-            "if (existing == t)",
+            "t->active_registry_index != task::Task::ACTIVE_REGISTRY_INDEX_INVALID",
+            "active_task_slot(INDEX) == t",
             "return true",
-            "if (existing != nullptr && existing->pid == t->pid)",
-            "return false",
         ],
-        "active task list must reject a different task with a duplicate PID",
+        "active task list duplicate insert must be idempotent only for its cached task slot",
     )
-    if "active_task_slot(i) = t;" in active_insert_body:
-        fail("active task list must not replace an existing task with the same PID")
+    if "for (uint32_t i = 0; i < active_task_count; ++i)" in active_insert_body:
+        fail("active task list insertion must rely on PID uniqueness instead of rescanning the dense registry")
 
 
 def test_default_user_stack_reservation_covers_native_toolchain_links() -> None:
@@ -977,6 +976,72 @@ def test_private_pagemap_gc_skips_global_sibling_scans() -> None:
         "if (!cur->shares_user_pagemap.load(std::memory_order_acquire))",
         "for (uint64_t scan_cpu = 0; scan_cpu < smt::get_core_count(); scan_cpu++)",
         "private pagemap GC must bypass dead-list scans",
+    )
+
+
+def test_active_registry_uses_cached_dense_slot_for_constant_time_updates() -> None:
+    source = SCHEDULER_CPP.read_text()
+    task_header = TASK_HPP.read_text()
+    insert_body = function_body(source, "active_list_insert")
+    remove_body = function_body(source, "active_list_remove")
+    fresh_body = function_body(source, "register_fresh_task_visibility")
+
+    require_tokens(
+        task_header,
+        [
+            "static constexpr uint32_t ACTIVE_REGISTRY_INDEX_INVALID = UINT32_MAX;",
+            "uint32_t active_registry_index = ACTIVE_REGISTRY_INDEX_INVALID;",
+        ],
+        "task cached active registry slot",
+    )
+    require_tokens(
+        insert_body,
+        [
+            "t->active_registry_index",
+            "active_task_slot(INDEX) = t;",
+            "t->active_registry_index = INDEX;",
+        ],
+        "active registry constant-time insertion",
+    )
+    require_tokens(
+        remove_body,
+        [
+            "uint32_t const INDEX = subject->active_registry_index;",
+            "if (INDEX == task::Task::ACTIVE_REGISTRY_INDEX_INVALID)",
+            "task::Task* const MOVED_TASK = active_task_slot(LAST_INDEX);",
+            "MOVED_TASK->active_registry_index = INDEX;",
+            "subject->active_registry_index = task::Task::ACTIVE_REGISTRY_INDEX_INVALID;",
+        ],
+        "active registry constant-time swap removal",
+    )
+    require_tokens(
+        fresh_body,
+        [
+            "task->active_registry_index != ::ker::mod::sched::task::Task::ACTIVE_REGISTRY_INDEX_INVALID",
+            "active_task_slot(ACTIVE_INDEX) = task;",
+            "task->active_registry_index = ACTIVE_INDEX;",
+        ],
+        "fresh task cached active registry publication",
+    )
+    for body, context in [
+        (insert_body, "active registry insertion"),
+        (remove_body, "active registry removal"),
+        (fresh_body, "fresh task publication"),
+    ]:
+        if "for (uint32_t i = 0; i < active_task_count; ++i)" in body:
+            fail(f"{context} must not scan the dense active task registry")
+
+    detach_body = function_body(source, "detach_next_reclaimable_task_locked")
+    require_order(
+        detach_body,
+        "if (task::task_waited_on(*cur))",
+        "uint64_t const DEATH_EPOCH = cur->death_epoch.load(std::memory_order_acquire);",
+        "waited zombies must leave the active scan index before heavy cleanup becomes reclaimable",
+    )
+    require_tokens(
+        detach_body,
+        ["if (task::task_waited_on(*cur))", "active_list_remove(cur);"],
+        "waited zombie early active-registry detachment",
     )
 
 
@@ -2002,7 +2067,7 @@ def test_runnable_publication_requires_successful_heap_insert() -> None:
             "bool posted = false;",
             "posted = publish_runnable_task_locked(rq, task, \"post-task\")",
             "if (!posted)",
-            "active_list_remove(task->pid)",
+            "active_list_remove(task)",
             "pid_table_remove(task->pid)",
             'log_rejected_task_publication("runnable heap insert failed", cpu_no, task)',
             "return false;",
@@ -2061,6 +2126,7 @@ def main() -> None:
     test_execve_publishes_new_context_before_old_image_teardown()
     test_pagemap_sibling_check_includes_dead_publishers()
     test_private_pagemap_gc_skips_global_sibling_scans()
+    test_active_registry_uses_cached_dense_slot_for_constant_time_updates()
     test_process_syscall_reschedules_defer_to_syscall_exit()
     test_scheduler_timer_disarm_clears_pending_reschedule_token()
     test_idle_timer_arms_when_idle_runqueue_has_runnable_work()

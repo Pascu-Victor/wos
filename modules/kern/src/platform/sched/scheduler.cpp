@@ -1154,19 +1154,20 @@ auto active_list_insert(task::Task* t) -> bool {
         return false;
     }
     uint64_t const FLAGS = global_task_registry_lock.lock_irqsave();
-    for (uint32_t i = 0; i < active_task_count; ++i) {
-        auto* existing = active_task_slot(i);
-        if (existing == t) {
+    if (t->active_registry_index != task::Task::ACTIVE_REGISTRY_INDEX_INVALID) {
+        uint32_t const INDEX = t->active_registry_index;
+        if (INDEX < active_task_count && active_task_slot(INDEX) == t) {
             global_task_registry_lock.unlock_irqrestore(FLAGS);
             return true;
         }
-        if (existing != nullptr && existing->pid == t->pid) {
-            global_task_registry_lock.unlock_irqrestore(FLAGS);
-            return false;
-        }
+        global_task_registry_lock.unlock_irqrestore(FLAGS);
+        dbg::panic_handler("scheduler: corrupt cached active registry index during insert");
+        hcf();
     }
     if (active_task_count < MAX_ACTIVE_TASKS) {
-        active_task_slot(active_task_count++) = t;
+        uint32_t const INDEX = active_task_count++;
+        active_task_slot(INDEX) = t;
+        t->active_registry_index = INDEX;
         global_task_registry_lock.unlock_irqrestore(FLAGS);
         return true;
     }
@@ -1174,17 +1175,30 @@ auto active_list_insert(task::Task* t) -> bool {
     return false;
 }
 
-void active_list_remove(uint64_t pid) {
-    uint64_t const FLAGS = global_task_registry_lock.lock_irqsave();
-    uint32_t i = 0;
-    while (i < active_task_count) {
-        if (active_task_slot(i) != nullptr && active_task_slot(i)->pid == pid) {
-            active_task_slot(i) = active_task_slot(--active_task_count);
-            active_task_slot(active_task_count) = nullptr;
-            continue;
-        }
-        ++i;
+void active_list_remove(task::Task* subject) {
+    if (subject == nullptr) {
+        return;
     }
+    uint64_t const FLAGS = global_task_registry_lock.lock_irqsave();
+    uint32_t const INDEX = subject->active_registry_index;
+    if (INDEX == task::Task::ACTIVE_REGISTRY_INDEX_INVALID) {
+        global_task_registry_lock.unlock_irqrestore(FLAGS);
+        return;
+    }
+    if (INDEX >= active_task_count || active_task_slot(INDEX) != subject) [[unlikely]] {
+        global_task_registry_lock.unlock_irqrestore(FLAGS);
+        dbg::panic_handler("scheduler: corrupt cached active registry index during removal");
+        hcf();
+    }
+
+    uint32_t const LAST_INDEX = --active_task_count;
+    task::Task* const MOVED_TASK = active_task_slot(LAST_INDEX);
+    active_task_slot(INDEX) = MOVED_TASK;
+    active_task_slot(LAST_INDEX) = nullptr;
+    if (INDEX != LAST_INDEX) {
+        MOVED_TASK->active_registry_index = INDEX;
+    }
+    subject->active_registry_index = task::Task::ACTIVE_REGISTRY_INDEX_INVALID;
     global_task_registry_lock.unlock_irqrestore(FLAGS);
 }
 
@@ -1205,17 +1219,10 @@ auto register_fresh_task_visibility(task::Task* task) -> bool {
     }
 
     uint64_t const FLAGS = global_task_registry_lock.lock_irqsave();
-    for (uint32_t i = 0; i < active_task_count; ++i) {
-        task::Task* const EXISTING = active_task_slot(i);
-        if (EXISTING == task) [[unlikely]] {
-            global_task_registry_lock.unlock_irqrestore(FLAGS);
-            dbg::panic_handler("scheduler: fresh task already present in active registry");
-            hcf();
-        }
-        if (EXISTING != nullptr && EXISTING->pid == task->pid) {
-            global_task_registry_lock.unlock_irqrestore(FLAGS);
-            return false;
-        }
+    if (task->active_registry_index != ::ker::mod::sched::task::Task::ACTIVE_REGISTRY_INDEX_INVALID) [[unlikely]] {
+        global_task_registry_lock.unlock_irqrestore(FLAGS);
+        dbg::panic_handler("scheduler: fresh task already present in active registry");
+        hcf();
     }
 
     uint32_t pid_index = MAX_PIDS;
@@ -1246,8 +1253,9 @@ auto register_fresh_task_visibility(task::Task* task) -> bool {
     // until both fixed-capacity commits are complete.
     pid_slot(pid_index).task = task;
     pid_slot(pid_index).pid = task->pid;
-    active_task_slot(active_task_count) = task;
-    active_task_count++;
+    uint32_t const ACTIVE_INDEX = active_task_count++;
+    active_task_slot(ACTIVE_INDEX) = task;
+    task->active_registry_index = ACTIVE_INDEX;
     global_task_registry_lock.unlock_irqrestore(FLAGS);
     return true;
 }
@@ -3110,7 +3118,7 @@ bool post_task_for_cpu_impl(uint64_t cpu_no, task::Task* task, bool release_rese
 
     if (!posted) {
         if (task->pid > 0) {
-            active_list_remove(task->pid);
+            active_list_remove(task);
             pid_table_remove(task->pid);
         }
         log_rejected_task_publication("runnable heap insert failed", cpu_no, task);
@@ -6715,6 +6723,14 @@ auto detach_next_reclaimable_task_locked(RunQueue* rq, uint64_t cpu_no) -> GcDet
             continue;
         }
 
+        // Once waitpid has consumed the exit status, this task must no longer
+        // lengthen wait-any and process-group scans. Keep the PID registration
+        // and dead-list node until the existing epoch/refcount guards permit
+        // full teardown, but compact the dense active scan index immediately.
+        if (task::task_waited_on(*cur)) {
+            active_list_remove(cur);
+        }
+
         uint64_t const DEATH_EPOCH = cur->death_epoch.load(std::memory_order_acquire);
         if (!EpochManager::is_safe_to_reclaim(DEATH_EPOCH)) {
 #ifdef SCHED_DEBUG
@@ -6833,7 +6849,7 @@ auto detach_next_reclaimable_task_locked(RunQueue* rq, uint64_t cpu_no) -> GcDet
         // can acquire it while the heavy cleanup runs outside the runqueue lock.
         if (cur->pid > 0) {
             pid_table_remove(cur->pid);
-            active_list_remove(cur->pid);
+            active_list_remove(cur);
         }
 
         return {.task = cur, .should_free_pagemap = should_free_pagemap};
