@@ -797,13 +797,10 @@ void handle_hello(WkiTransport* transport, const WkiHeader* hdr, const uint8_t* 
         wki_timer_notify();
     }
 
-    // Only run topology updates and resource discovery on actual state transitions
+    // Only run topology updates and peer registration on actual state transitions.
     if (newly_connected || resync_connected_peer) {
         // Topology changed: regenerate our LSA and flood
         wki_lsa_generate_and_flood();
-
-        // Re-advertise our remotable devices only to the newly connected peer.
-        wki_resource_advertise_to_peer(peer_node);
 
         // V2: Register peer in /dev/nodes/ hierarchy
         vfs::devfs::devfs_nodes_add_peer(log_hostname.data(), peer_node);
@@ -813,6 +810,11 @@ void handle_hello(WkiTransport* transport, const WkiHeader* hdr, const uint8_t* 
             wki_event_publish(EVENT_CLASS_SYSTEM, EVENT_SYSTEM_NODE_JOIN, &peer_node, sizeof(peer_node));
         }
     }
+
+    // Every HELLO that reaches the full handshake path is also an explicit
+    // resource snapshot request. Stable broadcast beacons return above, so
+    // post-cleanup direct HELLOs can resynchronize without periodic replay.
+    wki_resource_advertise_to_peer(peer_node);
 }
 
 void handle_hello_ack(WkiTransport* transport, const WkiHeader* /*hdr*/, const uint8_t* payload, uint16_t payload_len) {
@@ -1650,6 +1652,8 @@ void drain_pending_epoch_reset_cleanups() {
         }
 
         bool resume_block_after_gate = false;
+        WkiTransport* resource_resync_transport = nullptr;
+        uint16_t resource_resync_peer = WKI_NODE_INVALID;
         {
             // This is the task-context half of HELLO epoch handling. The
             // lifecycle lease prevents publication from crossing teardown and
@@ -1684,7 +1688,16 @@ void drain_pending_epoch_reset_cleanups() {
                 // Reliable RESOURCE/DEV frames remain unacknowledged while
                 // this flag is set and are replayed after reconciliation.
                 peer.vfs_reset_rebind_pending.store(false, std::memory_order_release);
+                if (CONNECTED && INVALIDATE_DISCOVERY && peer.transport != nullptr) {
+                    resource_resync_transport = peer.transport;
+                    resource_resync_peer = peer.node_id;
+                }
             }
+        }
+        if (resource_resync_transport != nullptr) {
+            // Ask only after discovery invalidation and admission reopening.
+            // The peer's direct-HELLO handler replies with a current snapshot.
+            wki_peer_send_hello(resource_resync_transport, resource_resync_peer);
         }
         if (resume_block_after_gate) {
             // DEV_ATTACH_ACK admission and the peer lifecycle gate must be

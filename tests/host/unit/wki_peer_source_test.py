@@ -227,6 +227,21 @@ def test_hello_boot_epoch_fences_connected_broadcast_restarts() -> None:
         if channel_reset < 0 or body.find("resync_connected_peer = !newly_connected", channel_reset) < 0:
             fail(f"{handler_name} channel epoch reset must re-advertise current resources")
 
+    require_order(
+        handle_hello,
+        "if (newly_connected || resync_connected_peer)",
+        "Every HELLO that reaches the full handshake path",
+        "HELLO resource replay must remain outside transition-only work",
+    )
+    require_order(
+        handle_hello,
+        "Every HELLO that reaches the full handshake path",
+        "wki_resource_advertise_to_peer(peer_node)",
+        "a post-cleanup direct HELLO must request a current resource snapshot",
+    )
+    if handle_hello.count("wki_resource_advertise_to_peer(peer_node)") != 1:
+        fail("HELLO must have exactly one unconditional resource snapshot replay")
+
 
 def test_connected_epoch_reset_retires_vfs_before_channel_reuse() -> None:
     source = PEER_CPP.read_text()
@@ -283,6 +298,12 @@ def test_connected_epoch_reset_retires_vfs_before_channel_reuse() -> None:
         "wki_resources_rebind_vfs_for_peer(peer.node_id)",
         "peer.vfs_reset_rebind_pending.store(false, std::memory_order_release)",
         "epoch admission must remain closed through reconciliation",
+    )
+    require_order(
+        drain_body,
+        "peer.vfs_reset_rebind_pending.store(false, std::memory_order_release)",
+        "wki_peer_send_hello(resource_resync_transport, resource_resync_peer)",
+        "post-epoch resource resync must start only after reliable admission reopens",
     )
 
     marker_body = function_body(REMOTE_VFS_CPP.read_text(), "wki_remote_vfs_mark_epoch_reset")
