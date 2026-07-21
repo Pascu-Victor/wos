@@ -184,6 +184,20 @@ def test_hello_boot_epoch_fences_connected_broadcast_restarts() -> None:
         "if (newly_connected || resync_connected_peer)",
         "HELLO_ACK boot epoch restart must re-advertise state",
     )
+    require_order(
+        handle_hello_ack,
+        "if (newly_connected || resync_connected_peer)",
+        "A HELLO_ACK confirms that the peer has processed our latest HELLO",
+        "HELLO_ACK resource replay must remain outside transition-only work",
+    )
+    require_order(
+        handle_hello_ack,
+        "A HELLO_ACK confirms that the peer has processed our latest HELLO",
+        "wki_resource_advertise_to_peer(peer_node)",
+        "every valid HELLO_ACK must replay the current resource snapshot",
+    )
+    if handle_hello_ack.count("wki_resource_advertise_to_peer(peer_node)") != 1:
+        fail("HELLO_ACK must have exactly one unconditional resource snapshot replay")
 
     for token in [
         "uint32_t remote_boot_epoch = 0;",

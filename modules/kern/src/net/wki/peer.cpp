@@ -994,9 +994,6 @@ void handle_hello_ack(WkiTransport* transport, const WkiHeader* /*hdr*/, const u
 
         wki_lsa_generate_and_flood();
 
-        // Advertise our remotable devices only to the newly connected peer.
-        wki_resource_advertise_to_peer(peer_node);
-
         // V2: Register peer in /dev/nodes/ hierarchy
         vfs::devfs::devfs_nodes_add_peer(log_hostname.data(), peer_node);
 
@@ -1005,6 +1002,12 @@ void handle_hello_ack(WkiTransport* transport, const WkiHeader* /*hdr*/, const u
             wki_event_publish(EVENT_CLASS_SYSTEM, EVENT_SYSTEM_NODE_JOIN, &peer_node, sizeof(peer_node));
         }
     }
+
+    // A HELLO_ACK confirms that the peer has processed our latest HELLO and
+    // any receive-side channel reset it triggered. Replay the current resource
+    // snapshot even when our local state and epoch values were already current;
+    // an earlier snapshot may have raced ahead of that peer-side reset.
+    wki_resource_advertise_to_peer(peer_node);
 }
 
 }  // namespace detail
