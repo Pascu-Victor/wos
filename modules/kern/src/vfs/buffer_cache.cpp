@@ -1516,16 +1516,19 @@ auto find_oldest_newer_cached_alias_locked(const BufHead* source, uint64_t min_e
     return best;
 }
 
-void overlay_newer_cached_aliases_locked(const BufHead* source, uint64_t source_epoch, uint8_t* dst) {
+auto overlay_newer_cached_aliases_locked(const BufHead* source, uint64_t source_epoch, uint8_t* dst) -> bool {
     if (source == nullptr || source->bdev == nullptr || dst == nullptr) {
-        return;
+        return false;
     }
 
+    bool copied = false;
     uint64_t min_epoch = source_epoch;
     while (const BufHead* alias = find_oldest_newer_cached_alias_locked(source, min_epoch)) {
         overlay_cached_alias_into_snapshot(alias, source, dst);
+        copied = true;
         min_epoch = alias->dirty_epoch;
     }
+    return copied;
 }
 
 void overlay_newer_cached_aliases(BufHead const* source, uint64_t source_epoch, uint8_t* dst) {
@@ -1534,7 +1537,7 @@ void overlay_newer_cached_aliases(BufHead const* source, uint64_t source_epoch, 
     }
 
     uint64_t const IRQFLAGS = cache_lock.lock_irqsave();
-    overlay_newer_cached_aliases_locked(source, source_epoch, dst);
+    static_cast<void>(overlay_newer_cached_aliases_locked(source, source_epoch, dst));
     cache_lock.unlock_irqrestore(IRQFLAGS);
 }
 
@@ -2632,15 +2635,13 @@ auto copy_dirty_bdev_range_for_cached_buffer_locked(BufHead* bh, uint64_t block_
     if (count > SIZE_MAX / bh->bdev->block_size) {
         return false;
     }
-    if (cache_dirty_buffers == 0 || (((bh->flags & BH_DIRTY) != 0) && cache_dirty_buffers == 1)) {
+    if ((bh->flags & BH_DIRTY) != 0) {
+        return overlay_newer_cached_aliases_locked(bh, bh->dirty_epoch, bh->data);
+    }
+    if (cache_dirty_buffers == 0) {
         return false;
     }
-
-    uint64_t min_epoch = 0;
-    if ((bh->flags & BH_DIRTY) != 0) {
-        min_epoch = bh->dirty_epoch;
-    }
-    return copy_dirty_bdev_range_locked(bh->bdev, block_no, count, bh->data, min_epoch);
+    return copy_dirty_bdev_range_locked(bh->bdev, block_no, count, bh->data, 0);
 }
 
 auto dirty_bytes_above_target_locked() -> bool { return cache_dirty_bytes > dirty_target_bytes_locked(); }

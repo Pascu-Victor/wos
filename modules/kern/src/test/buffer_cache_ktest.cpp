@@ -862,6 +862,38 @@ KTEST(BufferCache, OlderDirtyAliasCannotOverwriteNewerCleanAlias) {
     ker::vfs::invalidate_bdev(&dev);
 }
 
+KTEST(BufferCache, BreadMultiDirtyHitOverlaysNewerCleanSingleAlias) {
+    ker::dev::BlockDevice dev = make_null_bdev();
+    RecordingWriteState io{};
+    dev.write_blocks = recording_write;
+    dev.private_data = &io;
+    ker::vfs::invalidate_bdev(&dev);
+
+    uint64_t const BLOCK = 780;
+
+    ker::vfs::BufHead* older_multi = ker::vfs::bget_multi(&dev, BLOCK, 2);
+    KREQUIRE_NE(older_multi, nullptr);
+    memset(older_multi->data, 0xA1, older_multi->size);
+    ker::vfs::bdirty(older_multi);
+    ker::vfs::brelse(older_multi);
+
+    ker::vfs::BufHead* newer_single = ker::vfs::bget(&dev, BLOCK);
+    KREQUIRE_NE(newer_single, nullptr);
+    memset(newer_single->data, 0xB2, newer_single->size);
+    KEXPECT_EQ(ker::vfs::bwrite(newer_single), 0);
+    ker::vfs::brelse(newer_single);
+
+    KREQUIRE_EQ(io.write_calls, static_cast<size_t>(1));
+    ker::vfs::BufHead* reread_multi = ker::vfs::bread_multi(&dev, BLOCK, 2);
+    KREQUIRE_NE(reread_multi, nullptr);
+    KEXPECT_EQ(reread_multi->data[0], static_cast<uint8_t>(0xB2));
+    KEXPECT_EQ(reread_multi->data[511], static_cast<uint8_t>(0xB2));
+    KEXPECT_EQ(reread_multi->data[512], static_cast<uint8_t>(0xA1));
+    KEXPECT_EQ(reread_multi->data[reread_multi->size - 1], static_cast<uint8_t>(0xA1));
+    ker::vfs::brelse(reread_multi);
+    ker::vfs::invalidate_bdev(&dev);
+}
+
 KTEST(BufferCache, BgetMultiSamePointer) {
     // Two bget_multi calls for the same (dev, block, count) must return
     // the same buffer (cache hit), so dirty data is always visible.
