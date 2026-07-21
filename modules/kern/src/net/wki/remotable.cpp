@@ -1221,12 +1221,37 @@ auto classify_remotable_rx(MsgType type, uint16_t peer_node, const uint8_t* payl
     ResourceAdvertPayload advert = {};
     std::memcpy(&advert, payload, sizeof(advert));
     auto const RESOURCE_TYPE = static_cast<ResourceType>(advert.resource_type);
+    auto decode_for_admission = [&](ResourceType resource_type, size_t base_and_name_size,
+                                    ResourceIncarnationToken* token_out) -> WkiRemotableRxAdmission {
+        if (decode_resource_incarnation(peer_node, resource_type, payload, payload_len, base_and_name_size, token_out)) {
+            return WkiRemotableRxAdmission::DEFERRED;
+        }
+
+        // A peer can become CONNECTED from HELLO_ACK just before a concurrent
+        // HELLO publishes its boot epoch. Do not consume and ACK an otherwise
+        // valid incarnation-bearing control in that narrow window: the sender
+        // must retransmit it after the owner identity is known.
+        bool const WITH_INCARNATION = wki_resource_incarnation_negotiated(peer_node, resource_type);
+        size_t const EXPECTED_SIZE = base_and_name_size + (WITH_INCARNATION ? sizeof(ResourceIncarnationToken) : 0);
+        if (WITH_INCARNATION && payload_len == EXPECTED_SIZE) {
+            ResourceIncarnationToken token = {};
+            std::memcpy(&token, payload + base_and_name_size, sizeof(token));
+            WkiPeer const* peer = wki_peer_find(peer_node);
+            if (wki_resource_incarnation_valid(token) && peer != nullptr && peer->remote_boot_epoch == 0) {
+                return WkiRemotableRxAdmission::RETRY;
+            }
+        }
+        return WkiRemotableRxAdmission::DISCARD;
+    };
+
     if (type == MsgType::RESOURCE_WITHDRAW) {
         ResourceIncarnationToken token = {};
-        if (advert.name_len != 0 ||
-            !decode_resource_incarnation(peer_node, RESOURCE_TYPE, payload, payload_len, sizeof(ResourceAdvertPayload), &token) ||
-            payload_len > REMOTABLE_RX_PAYLOAD_MAX) {
+        if (advert.name_len != 0 || payload_len > REMOTABLE_RX_PAYLOAD_MAX) {
             return WkiRemotableRxAdmission::DISCARD;
+        }
+        WkiRemotableRxAdmission const ADMISSION = decode_for_admission(RESOURCE_TYPE, sizeof(ResourceAdvertPayload), &token);
+        if (ADMISSION != WkiRemotableRxAdmission::DEFERRED) {
+            return ADMISSION;
         }
         *copy_len = payload_len;
         return WkiRemotableRxAdmission::DEFERRED;
@@ -1235,12 +1260,38 @@ auto classify_remotable_rx(MsgType type, uint16_t peer_node, const uint8_t* payl
     size_t const HEADER_SIZE = RESOURCE_TYPE == ResourceType::NET ? sizeof(ResourceAdvertNetPayload) : sizeof(ResourceAdvertPayload);
     size_t const BASE_AND_NAME_SIZE = HEADER_SIZE + advert.name_len;
     ResourceIncarnationToken token = {};
-    if (payload_len < HEADER_SIZE || BASE_AND_NAME_SIZE > payload_len || payload_len > REMOTABLE_RX_PAYLOAD_MAX ||
-        !decode_resource_incarnation(peer_node, RESOURCE_TYPE, payload, payload_len, BASE_AND_NAME_SIZE, &token)) {
+    if (payload_len < HEADER_SIZE || BASE_AND_NAME_SIZE > payload_len || payload_len > REMOTABLE_RX_PAYLOAD_MAX) {
         return WkiRemotableRxAdmission::DISCARD;
+    }
+    WkiRemotableRxAdmission const ADMISSION = decode_for_admission(RESOURCE_TYPE, BASE_AND_NAME_SIZE, &token);
+    if (ADMISSION != WkiRemotableRxAdmission::DEFERRED) {
+        return ADMISSION;
     }
     *copy_len = payload_len;
     return WkiRemotableRxAdmission::DEFERRED;
+}
+
+auto resource_rx_owner_epoch_matches(const PendingResourceRx& pending) -> bool {
+    if (pending.payload_len < sizeof(ResourceAdvertPayload)) {
+        return false;
+    }
+
+    ResourceAdvertPayload advert = {};
+    std::memcpy(&advert, pending.payload.data(), sizeof(advert));
+    auto const RESOURCE_TYPE = static_cast<ResourceType>(advert.resource_type);
+    if (!wki_resource_type_uses_incarnation(RESOURCE_TYPE) || !wki_resource_incarnation_negotiated(pending.hdr.src_node, RESOURCE_TYPE)) {
+        return false;
+    }
+
+    size_t base_and_name_size = sizeof(ResourceAdvertPayload);
+    if (pending.type == MsgType::RESOURCE_ADVERT) {
+        size_t const HEADER_SIZE = RESOURCE_TYPE == ResourceType::NET ? sizeof(ResourceAdvertNetPayload) : sizeof(ResourceAdvertPayload);
+        base_and_name_size = HEADER_SIZE + advert.name_len;
+    }
+
+    ResourceIncarnationToken token = {};
+    return decode_resource_incarnation(pending.hdr.src_node, RESOURCE_TYPE, pending.payload.data(), pending.payload_len, base_and_name_size,
+                                       &token);
 }
 
 auto resource_rx_channel_token_matches(const PendingResourceRx& pending) -> bool {
@@ -1318,8 +1369,8 @@ void wki_remotable_process_pending_rx() {
         if (!wki_peer_lifecycle_acquire(peer)) {
             continue;
         }
-        bool const CURRENT =
-            peer->node_id == pending.hdr.src_node && peer->state == PeerState::CONNECTED && resource_rx_channel_token_matches(pending);
+        bool const CURRENT_SESSION = resource_rx_channel_token_matches(pending) || resource_rx_owner_epoch_matches(pending);
+        bool const CURRENT = peer->node_id == pending.hdr.src_node && peer->state == PeerState::CONNECTED && CURRENT_SESSION;
         if (CURRENT) {
             if (pending.type == MsgType::RESOURCE_ADVERT) {
                 detail::handle_resource_advert(&pending.hdr, pending.payload.data(), pending.payload_len);

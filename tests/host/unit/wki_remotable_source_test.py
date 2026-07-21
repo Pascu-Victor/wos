@@ -111,6 +111,43 @@ def test_deferred_retry_deadlines_are_saturating() -> None:
         fail("remotable retry scheduling must not use wrapping deadline arithmetic: " + ", ".join(present))
 
 
+def test_resource_rx_survives_same_boot_channel_reset_without_acking_unknown_epoch() -> None:
+    source = REMOTABLE_CPP.read_text()
+
+    classify = function_body(source, "classify_remotable_rx")
+    require_order(
+        classify,
+        [
+            "decode_resource_incarnation(peer_node, resource_type",
+            "peer->remote_boot_epoch == 0",
+            "return WkiRemotableRxAdmission::RETRY",
+        ],
+        "incarnation-bearing resource control waits for the peer boot epoch before ACK",
+    )
+
+    owner_epoch = function_body(source, "resource_rx_owner_epoch_matches")
+    require_order(
+        owner_epoch,
+        [
+            "wki_resource_type_uses_incarnation(RESOURCE_TYPE)",
+            "wki_resource_incarnation_negotiated(pending.hdr.src_node, RESOURCE_TYPE)",
+            "decode_resource_incarnation(pending.hdr.src_node, RESOURCE_TYPE",
+        ],
+        "deferred BLOCK/VFS control proves its current owner boot epoch",
+    )
+
+    process = function_body(source, "wki_remotable_process_pending_rx")
+    require_order(
+        process,
+        [
+            "resource_rx_channel_token_matches(pending) || resource_rx_owner_epoch_matches(pending)",
+            "peer->state == PeerState::CONNECTED",
+            "detail::handle_resource_advert",
+        ],
+        "ACKed same-boot resource control survives a channel generation reset",
+    )
+
+
 def test_pending_net_attach_is_generation_and_epoch_fenced() -> None:
     source = REMOTABLE_CPP.read_text()
     required = [
