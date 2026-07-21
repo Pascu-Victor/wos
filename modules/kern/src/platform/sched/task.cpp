@@ -1149,8 +1149,8 @@ Task* Task::create_user_thread(Task* parent, uint64_t tcb_vaddr, uint64_t user_s
         delete t;
         return nullptr;
     }
-    parent->shares_user_pagemap = true;
-    t->shares_user_pagemap = true;
+    parent->shares_user_pagemap.store(true, std::memory_order_release);
+    t->shares_user_pagemap.store(true, std::memory_order_release);
 
     // Thread struct: only fsbase and stack are meaningful; mlibc manages the TLS allocation
     auto* thr = new threading::Thread{};

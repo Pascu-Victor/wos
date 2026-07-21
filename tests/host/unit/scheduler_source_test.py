@@ -962,6 +962,24 @@ def test_pagemap_sibling_check_includes_dead_publishers() -> None:
         fail("exit-time pagemap sibling check must not ignore dead tasks that still publish the pagemap")
 
 
+def test_private_pagemap_gc_skips_global_sibling_scans() -> None:
+    source = SCHEDULER_CPP.read_text()
+    body = function_body(source, "gc_task_has_pagemap_sibling_locked")
+
+    require_order(
+        body,
+        "if (!cur->shares_user_pagemap.load(std::memory_order_acquire))",
+        "uint32_t const ACTIVE_COUNT = get_active_task_count();",
+        "private pagemap GC must bypass the active task registry scan",
+    )
+    require_order(
+        body,
+        "if (!cur->shares_user_pagemap.load(std::memory_order_acquire))",
+        "for (uint64_t scan_cpu = 0; scan_cpu < smt::get_core_count(); scan_cpu++)",
+        "private pagemap GC must bypass dead-list scans",
+    )
+
+
 def test_process_syscall_reschedules_defer_to_syscall_exit() -> None:
     source = CONTEXT_SWITCH_CPP.read_text()
     helper_body = function_body(source, "defer_process_reschedule_to_syscall_exit")
@@ -2042,6 +2060,7 @@ def main() -> None:
     test_default_user_stack_reservation_covers_native_toolchain_links()
     test_execve_publishes_new_context_before_old_image_teardown()
     test_pagemap_sibling_check_includes_dead_publishers()
+    test_private_pagemap_gc_skips_global_sibling_scans()
     test_process_syscall_reschedules_defer_to_syscall_exit()
     test_scheduler_timer_disarm_clears_pending_reschedule_token()
     test_idle_timer_arms_when_idle_runqueue_has_runnable_work()

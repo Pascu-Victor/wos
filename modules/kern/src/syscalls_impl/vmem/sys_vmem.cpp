@@ -651,7 +651,7 @@ auto update_shared_vmem_ranges_locked(ker::mod::sched::task::Task* task, Fn upda
     if (task == nullptr || task->pagemap == nullptr) {
         return update(task);
     }
-    if (!task->shares_user_pagemap) {
+    if (!task->shares_user_pagemap.load(std::memory_order_acquire)) {
         return update(task);
     }
 

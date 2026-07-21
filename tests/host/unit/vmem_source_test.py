@@ -485,7 +485,7 @@ def test_thread_publication_is_serialized_with_shared_vmem_updates() -> None:
     require_ordered_tokens(
         shared_update,
         [
-            "if (!task->shares_user_pagemap)",
+            "if (!task->shares_user_pagemap.load(std::memory_order_acquire))",
             "return update(task);",
             "snapshot_active_task_lifetime_refs_if(MATCH_SIBLING, PAGEMAP, tasks, capacity)",
         ],
@@ -513,7 +513,7 @@ def test_thread_publication_is_serialized_with_shared_vmem_updates() -> None:
     )
     require_tokens(
         task_header,
-        ["bool shares_user_pagemap = false;"],
+        ["std::atomic<bool> shares_user_pagemap{false};"],
         "shared user pagemap marker",
     )
     require_ordered_tokens(
@@ -521,8 +521,8 @@ def test_thread_publication_is_serialized_with_shared_vmem_updates() -> None:
         [
             "Task* Task::create_user_thread(Task* parent",
             "clone_lazy_vmem_ranges(*t, *parent)",
-            "parent->shares_user_pagemap = true;",
-            "t->shares_user_pagemap = true;",
+            "parent->shares_user_pagemap.store(true, std::memory_order_release);",
+            "t->shares_user_pagemap.store(true, std::memory_order_release);",
         ],
         "thread shared-pagemap marking",
     )
@@ -534,8 +534,8 @@ def test_thread_publication_is_serialized_with_shared_vmem_updates() -> None:
             "ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;",
             "child->pagemap = parent->pagemap;",
             "clone_lazy_vmem_ranges(*child, *parent)",
-            "parent->shares_user_pagemap = true;",
-            "child->shares_user_pagemap = true;",
+            "parent->shares_user_pagemap.store(true, std::memory_order_release);",
+            "child->shares_user_pagemap.store(true, std::memory_order_release);",
             "post_task_balanced(child)",
         ],
         "clone-VM lazy-range clone through scheduler publication",

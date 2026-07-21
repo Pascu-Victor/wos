@@ -6666,6 +6666,9 @@ auto gc_task_has_pagemap_sibling_locked(task::Task* cur) -> bool {
     if (cur == nullptr || cur->pagemap == nullptr) {
         return false;
     }
+    if (!cur->shares_user_pagemap.load(std::memory_order_acquire)) {
+        return false;
+    }
 
     uint32_t const ACTIVE_COUNT = get_active_task_count();
     for (uint32_t ai = 0; ai < ACTIVE_COUNT; ai++) {
