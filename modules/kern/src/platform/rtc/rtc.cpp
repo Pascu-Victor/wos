@@ -1,6 +1,7 @@
 #include "rtc.hpp"
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <mod/io/port/port.hpp>
@@ -37,8 +38,8 @@ constexpr uint64_t SEC_PER_DAY = 24 * SEC_PER_HOUR;
 uint64_t epoch_sec_at_boot = 0;
 // TSC nanoseconds snapshot taken at the moment we read the RTC.
 uint64_t tsc_ns_at_boot = 0;
-// Signed NTP correction applied by setOffset().
-int64_t ntp_delta_sec = 0;
+// Signed NTP correction relative to the CMOS/TSC wall clock.
+std::atomic<int64_t> ntp_delta_ns{0};
 
 // ---------------------------------------------------------------------------
 // CMOS helpers
@@ -150,18 +151,15 @@ void init() {
               static_cast<unsigned long>(epoch_sec_at_boot));
 }
 
-uint64_t get_epoch_sec() {
-    uint64_t const MONO_SEC = (tsc::get_ns() - tsc_ns_at_boot) / NS_PER_SEC;
-    return epoch_sec_at_boot + MONO_SEC + static_cast<uint64_t>(ntp_delta_sec);
-}
+auto get_epoch_sec() -> uint64_t { return get_epoch_ns() / NS_PER_SEC; }
 
-uint64_t get_epoch_ns() {
+auto get_epoch_ns() -> uint64_t {
     uint64_t const MONO_NS = tsc::get_ns() - tsc_ns_at_boot;
     uint64_t const BOOT_EPOCH_NS = epoch_sec_at_boot * NS_PER_SEC;
-    int64_t const NTP_NS = ntp_delta_sec * static_cast<int64_t>(NS_PER_SEC);
+    int64_t const NTP_NS = ntp_delta_ns.load(std::memory_order_relaxed);
     return BOOT_EPOCH_NS + MONO_NS + static_cast<uint64_t>(NTP_NS);
 }
 
-void set_offset(int64_t delta_sec) { ntp_delta_sec = delta_sec; }
+void adjust_offset_ns(int64_t delta_ns) { ntp_delta_ns.fetch_add(delta_ns, std::memory_order_relaxed); }
 
 }  // namespace ker::mod::rtc

@@ -15,8 +15,7 @@ void init();
 // Returns Unix timestamp in nanoseconds.
 [[nodiscard]] uint64_t get_epoch_ns();
 
-// Apply an NTP correction.  delta_sec is the signed difference
-// (ntp_unix_sec - rtc_unix_sec) measured at sync time.
-void set_offset(int64_t delta_sec);
+// Apply a signed NTP correction to the current wall clock.
+void adjust_offset_ns(int64_t delta_ns);
 
 }  // namespace ker::mod::rtc

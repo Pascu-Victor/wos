@@ -5,6 +5,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 TIME_CPP = ROOT / "modules" / "kern" / "src" / "syscalls_impl" / "time" / "time.cpp"
+NTP_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "ntp" / "ntp.cpp"
+RTC_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "rtc" / "rtc.cpp"
 
 
 def fail(message: str) -> None:
@@ -87,9 +89,34 @@ def test_setitimer_timevals_are_checked_and_saturating() -> None:
         fail(f"SETITIMER still has wrapping timeval/deadline arithmetic: {present[0]}")
 
 
+def test_sntp_preserves_fractional_time_and_uses_four_timestamps() -> None:
+    ntp = NTP_CPP.read_text()
+    rtc = RTC_CPP.read_text()
+
+    require_order(
+        function_body(ntp, "try_sync"),
+        "CLIENT_TX_NS = rtc::get_epoch_ns()",
+        "unix_ns_to_ntp(CLIENT_TX_NS, req.data() + 40)",
+        "CLIENT_RX_NS = rtc::get_epoch_ns()",
+        "resp.at(24 + i) != req.at(40 + i)",
+        "ntp_to_unix_ns(resp.data() + 32, &server_rx_ns)",
+        "ntp_to_unix_ns(resp.data() + 40, &server_tx_ns)",
+        "((server_rx_ns - CLIENT_TX) + (server_tx_ns - CLIENT_RX)) / 2",
+        "rtc::adjust_offset_ns(OFFSET_NS)",
+    )
+    require_order(
+        function_body(rtc, "get_epoch_ns"),
+        "ntp_delta_ns.load(std::memory_order_relaxed)",
+        "BOOT_EPOCH_NS + MONO_NS + static_cast<uint64_t>(NTP_NS)",
+    )
+    if "rtc::set_offset(DELTA)" in ntp or "ntp_delta_sec" in rtc:
+        fail("SNTP still truncates clock corrections to whole seconds")
+
+
 def main() -> None:
     test_setitimer_timevals_are_checked_and_saturating()
-    print("time syscall setitimer conversion and deadline are overflow guarded")
+    test_sntp_preserves_fractional_time_and_uses_four_timestamps()
+    print("time syscall arithmetic and full-precision SNTP invariants hold")
 
 
 if __name__ == "__main__":
