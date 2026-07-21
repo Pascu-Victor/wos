@@ -143,7 +143,15 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
     compiler_lock_cleanup
     trap - EXIT HUP INT TERM
     compiler_host="\${compiler_hosts[\$((compiler_index % \${#compiler_hosts[@]}))]}"
-    exec on "\$compiler_host" "\${compiler[@]}" "\$@"
+    if on "\$compiler_host" "\${compiler[@]}" "\$@"; then
+        exit 0
+    else
+        compiler_status=\$?
+    fi
+    if [ "\$compiler_status" -ne 127 ]; then
+        exit "\$compiler_status"
+    fi
+    echo "warning: distributed compiler placement on \$compiler_host was unavailable; retrying locally" >&2
 fi
 exec "\${compiler[@]}" "\$@"
 EOF
