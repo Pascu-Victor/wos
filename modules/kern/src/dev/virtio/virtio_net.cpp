@@ -294,10 +294,9 @@ void fill_rx_queue_for(VirtIONetDevice* dev, Virtqueue* rxq) {
         return;
     }
 
-    size_t target_free = ker::net::pkt_pool_free_count();
     if (rxq->num_free > 0) {
-        target_free = std::max(target_free, static_cast<size_t>(rxq->num_free) + ker::net::PKT_POOL_RX_REFILL_RESERVE);
-        ker::net::pkt_pool_ensure_free(target_free);
+        size_t const TARGET_FREE = static_cast<size_t>(rxq->num_free) + ker::net::PKT_POOL_RX_REFILL_RESERVE;
+        ker::net::pkt_pool_ensure_free(TARGET_FREE);
     }
 
     size_t const BEFORE_FREE = ker::net::pkt_pool_free_count();

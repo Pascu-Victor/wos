@@ -218,11 +218,28 @@ def test_queues_start_suppressed_and_napi_precedes_irq_registration() -> None:
         fail("removed queue-selector hot-path lock must not remain in the device")
 
 
+def test_rx_refill_growth_target_does_not_ratchet_from_free_snapshot() -> None:
+    body = function_body(VIRTIO_NET_CPP.read_text(), "fill_rx_queue_for")
+
+    require_order(
+        body,
+        "if (rxq->num_free > 0)",
+        "static_cast<size_t>(rxq->num_free) + ker::net::PKT_POOL_RX_REFILL_RESERVE",
+        "ker::net::pkt_pool_ensure_free(TARGET_FREE)",
+        "size_t const BEFORE_FREE = ker::net::pkt_pool_free_count()",
+    )
+    if "std::max(TARGET_FREE" in body or re.search(
+        r"\b(?:TARGET_FREE|target_free)\s*=\s*ker::net::pkt_pool_free_count\(\)", body
+    ):
+        fail("RX refill target must not inherit a racy packet-pool free-count snapshot")
+
+
 def main() -> None:
     test_ctrl_ack_deadline_is_saturating()
     test_used_ring_idx_is_acquired_before_empty_check()
     test_split_ring_notification_rearm_is_race_safe_and_bounded()
     test_queues_start_suppressed_and_napi_precedes_irq_registration()
+    test_rx_refill_growth_target_does_not_ratchet_from_free_snapshot()
     print("virtio-net polling guards are source covered")
 
 
