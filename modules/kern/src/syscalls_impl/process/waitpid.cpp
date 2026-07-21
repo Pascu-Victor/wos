@@ -243,7 +243,7 @@ auto claim_exited_child(ker::mod::sched::task::Task* parent, uint64_t selector) 
         if (child == nullptr) {
             break;
         }
-        if (sched_task::task_try_mark_waited_on(*child)) {
+        if (ker::mod::sched::try_mark_task_waited_on(*child)) {
             return {.task = child, .release_ref = true};
         }
         child->release();
@@ -254,7 +254,7 @@ auto claim_exited_child(ker::mod::sched::task::Task* parent, uint64_t selector) 
         if (child == nullptr) {
             break;
         }
-        if (sched_task::task_try_mark_waited_on(*child)) {
+        if (ker::mod::sched::try_mark_task_waited_on(*child)) {
             return {.task = child, .release_ref = true};
         }
         child->release();
@@ -274,7 +274,7 @@ auto claim_specific_exited_child(ker::mod::sched::task::Task* waiter, uint64_t p
         if (child == nullptr) {
             break;
         }
-        if (sched_task::task_try_mark_waited_on(*child)) {
+        if (ker::mod::sched::try_mark_task_waited_on(*child)) {
             return {.task = child, .release_ref = true};
         }
         child->release();
@@ -285,7 +285,7 @@ auto claim_specific_exited_child(ker::mod::sched::task::Task* waiter, uint64_t p
         if (child == nullptr) {
             break;
         }
-        if (sched_task::task_try_mark_waited_on(*child)) {
+        if (ker::mod::sched::try_mark_task_waited_on(*child)) {
             return {.task = child, .release_ref = true};
         }
         child->release();
@@ -557,7 +557,7 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t ru
 #ifdef WAITPID_DEBUG
         log::debug("target task PID %x has already exited with status %d", pid, target_task->exit_status);
 #endif
-        if (!sched_task::task_try_mark_waited_on(*target_task)) {
+        if (!ker::mod::sched::try_mark_task_waited_on(*target_task)) {
             return static_cast<uint64_t>(-ECHILD);
         }
         sched_task::task_accumulate_waited_child_times(*current_task, *target_task);
@@ -613,7 +613,7 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t ru
     if (TRACE_WAIT) {
         current_task->deferred_task_switch = true;
         if (is_waitable_exit(target_task)) {
-            if (!sched_task::task_try_mark_waited_on(*target_task)) {
+            if (!ker::mod::sched::try_mark_task_waited_on(*target_task)) {
                 clear_waitpid_publish_pending(current_task);
                 current_task->deferred_task_switch = false;
                 current_task->waiting_for_pid = 0;
@@ -657,7 +657,7 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t ru
     if (is_waitable_exit(target_task)) {
         target_task->exit_waiters_lock.unlock_irqrestore(WAITER_LOCK_FLAGS);
         clear_waitpid_publish_pending(current_task);
-        if (!sched_task::task_try_mark_waited_on(*target_task)) {
+        if (!ker::mod::sched::try_mark_task_waited_on(*target_task)) {
             current_task->waiting_for_pid = 0;
             current_task->wait_options = 0;
             current_task->wait_status_user_addr = 0;

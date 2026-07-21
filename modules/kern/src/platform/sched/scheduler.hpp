@@ -381,6 +381,9 @@ bool can_query_current_task();
 void remove_current_task();                               // Remove current task from runqueue (for exit)
 auto find_task_by_pid(uint64_t pid) -> task::Task*;       // Find a task by PID (O(1) via PID registry)
 auto find_task_by_pid_safe(uint64_t pid) -> task::Task*;  // Find task by PID with refcount (caller must release!)
+// Atomically claim a child's exit status and retire DEAD tasks from the dense
+// active scan index without waiting for heavyweight GC teardown.
+auto try_mark_task_waited_on(task::Task& subject) -> bool;
 auto task_has_live_pagemap_sibling(task::Task* subject) -> bool;
 void set_task_nice(task::Task* task, int nice);               // Update task weight safely on its run queue
 auto signal_process_group(uint64_t pgid, int sig) -> size_t;  // Send signal to all live tasks in a process group

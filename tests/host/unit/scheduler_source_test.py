@@ -1044,6 +1044,29 @@ def test_active_registry_uses_cached_dense_slot_for_constant_time_updates() -> N
         "waited zombie early active-registry detachment",
     )
 
+    waited_claim_body = function_body(source, "try_mark_task_waited_on")
+    require_order(
+        waited_claim_body,
+        "task::task_try_mark_waited_on(subject)",
+        "active_list_remove(&subject);",
+        "wait-status ownership must be claimed before retiring active scan visibility",
+    )
+    require_tokens(
+        waited_claim_body,
+        [
+            "subject.state.load(std::memory_order_acquire) == task::TaskState::DEAD",
+            "active_list_remove(&subject);",
+        ],
+        "immediate waited zombie active-registry retirement",
+    )
+    dead_enqueue_body = function_body(source, "insert_into_dead_list")
+    require_order(
+        dead_enqueue_body,
+        "rq->dead_list.push(task)",
+        "active_list_remove(task);",
+        "already-waited exits must retain dead-list visibility before leaving the active scan index",
+    )
+
 
 def test_process_syscall_reschedules_defer_to_syscall_exit() -> None:
     source = CONTEXT_SWITCH_CPP.read_text()

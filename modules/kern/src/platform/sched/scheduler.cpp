@@ -697,7 +697,7 @@ inline auto complete_waitpid_exit_for_scheduler(task::Task* waiter, task::Task* 
         task::task_release_waitpid_completion_claim(*waiter);
         return false;
     }
-    if (!task::task_try_mark_waited_on(*child)) {
+    if (!try_mark_task_waited_on(*child)) {
         task::task_release_waitpid_completion_claim(*waiter);
         return false;
     }
@@ -721,7 +721,7 @@ inline auto complete_registered_waitpid_exit_for_scheduler(task::Task* waiter, t
         task::task_release_waitpid_completion_claim(*waiter);
         return false;
     }
-    if (!task::task_try_mark_waited_on(*child)) {
+    if (!try_mark_task_waited_on(*child)) {
         task::task_release_waitpid_completion_claim(*waiter);
         return false;
     }
@@ -3499,6 +3499,16 @@ void account_task_runtime_delta(task::Task* task, uint64_t now_us, uint64_t delt
 }
 
 }  // namespace
+
+auto try_mark_task_waited_on(task::Task& subject) -> bool {
+    if (!task::task_try_mark_waited_on(subject)) {
+        return false;
+    }
+    if (subject.state.load(std::memory_order_acquire) == task::TaskState::DEAD) {
+        active_list_remove(&subject);
+    }
+    return true;
+}
 
 void request_local_timer_recheck() { request_local_reschedule(); }
 
@@ -6549,6 +6559,9 @@ void insert_into_dead_list(task::Task* task) {
 
     task->sched_queue = task::Task::sched_queue::DEAD_GC;
     run_queues->with_lock_void(0, [task](RunQueue* rq) { rq->dead_list.push(task); });
+    if (task::task_waited_on(*task)) {
+        active_list_remove(task);
+    }
     complete_parent_waitpid_after_dead_enqueue(task);
 }
 

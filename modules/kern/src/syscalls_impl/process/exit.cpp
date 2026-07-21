@@ -228,7 +228,7 @@ auto complete_exit_wait(ker::mod::sched::task::Task* waiter, ker::mod::sched::ta
         sched_task::task_release_waitpid_completion_claim(*waiter);
         return false;
     }
-    if (!sched_task::task_try_mark_waited_on(*child)) {
+    if (!ker::mod::sched::try_mark_task_waited_on(*child)) {
         sched_task::task_release_waitpid_completion_claim(*waiter);
         return false;
     }
