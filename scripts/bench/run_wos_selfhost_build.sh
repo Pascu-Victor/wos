@@ -828,6 +828,7 @@ run_with_jobs_env() {
             CMAKE_BUILD_PARALLEL_LEVEL="$jobs" \
             WOS_DISTRIBUTED_COMPILER=1 \
             WOS_DISTRIBUTED_COMPILER_HOSTS="$distributed_hosts" \
+            WOS_DISTRIBUTED_COMPILER_STATE="$workdir/tmp/distributed-compiler" \
             "$@"
     else
         WOS_BUILD_JOBS="$jobs" \

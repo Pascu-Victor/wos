@@ -85,6 +85,7 @@ config_dir="\$(cd "\$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
 config="\$config_dir/$WOS_TARGET_ARCH.cfg"
 use_config=0
 next_is_target=0
+compile_only=0
 for arg in "\$@"; do
     if [ "\$next_is_target" -eq 1 ]; then
         if [ "\$arg" = "$WOS_TARGET_ARCH" ]; then
@@ -95,6 +96,9 @@ for arg in "\$@"; do
     fi
 
     case "\$arg" in
+        -c)
+            compile_only=1
+            ;;
         --target=$WOS_TARGET_ARCH|-target=$WOS_TARGET_ARCH)
             use_config=1
             ;;
@@ -109,13 +113,36 @@ if [ "\$use_config" -eq 1 ] && [ -f "\$config" ]; then
     compiler+=(--config="\$config")
 fi
 
-if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ]; then
+if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; then
     IFS=, read -r -a compiler_hosts <<< "\${WOS_DISTRIBUTED_COMPILER_HOSTS:-}"
     if [ "\${#compiler_hosts[@]}" -lt 2 ]; then
         echo "ERROR: distributed compiler requires at least two WOS hosts" >&2
         exit 1
     fi
-    compiler_host="\${compiler_hosts[\$((\$\$ % \${#compiler_hosts[@]}))]}"
+    compiler_state="\${WOS_DISTRIBUTED_COMPILER_STATE:-}"
+    if [ -z "\$compiler_state" ]; then
+        echo "ERROR: distributed compiler state path is missing" >&2
+        exit 1
+    fi
+    compiler_lock="\$compiler_state.lock"
+    while ! mkdir "\$compiler_lock" 2>/dev/null; do
+        :
+    done
+    compiler_lock_cleanup() {
+        rmdir "\$compiler_lock" 2>/dev/null || true
+    }
+    trap compiler_lock_cleanup EXIT HUP INT TERM
+    compiler_index=0
+    if [ -s "\$compiler_state" ]; then
+        read -r compiler_index < "\$compiler_state" || compiler_index=0
+    fi
+    case "\$compiler_index" in
+        ''|*[!0-9]*) compiler_index=0 ;;
+    esac
+    printf '%s\n' "\$((compiler_index + 1))" > "\$compiler_state"
+    compiler_lock_cleanup
+    trap - EXIT HUP INT TERM
+    compiler_host="\${compiler_hosts[\$((compiler_index % \${#compiler_hosts[@]}))]}"
     exec on "\$compiler_host" "\${compiler[@]}" "\$@"
 fi
 exec "\${compiler[@]}" "\$@"
