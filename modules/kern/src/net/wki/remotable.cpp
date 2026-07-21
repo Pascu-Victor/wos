@@ -14,6 +14,7 @@
 #include <net/netdevice.hpp>
 #include <net/netif.hpp>
 #include <net/route.hpp>
+#include <net/wki/channel.hpp>
 #include <net/wki/dev_proxy.hpp>
 #include <net/wki/dev_server.hpp>
 #include <net/wki/peer.hpp>
@@ -552,7 +553,7 @@ auto wki_block_resource_incarnation_token(uint32_t resource_id) -> ResourceIncar
 
 namespace {
 
-void send_resource_advert_to_peer(uint16_t peer_node, ker::dev::BlockDevice* bdev, uint32_t resource_id) {
+auto send_resource_advert_to_peer(uint16_t peer_node, ker::dev::BlockDevice* bdev, uint32_t resource_id) -> int {
     // Build ResourceAdvertPayload + name
     uint8_t name_len = 0;
     while (name_len < DISCOVERED_RESOURCE_NAME_LEN - 1 && bdev->name.at(name_len) != '\0') {
@@ -592,10 +593,10 @@ void send_resource_advert_to_peer(uint16_t peer_node, ker::dev::BlockDevice* bde
         memcpy(buf.data() + sizeof(ResourceAdvertPayload) + name_len, &TOKEN, sizeof(TOKEN));
     }
 
-    wki_send(peer_node, WKI_CHAN_CONTROL, MsgType::RESOURCE_ADVERT, buf.data(), total_len);
+    return wki_send(peer_node, WKI_CHAN_CONTROL, MsgType::RESOURCE_ADVERT, buf.data(), total_len);
 }
 
-void send_net_resource_advert_to_peer(uint16_t peer_node, ker::net::NetDevice* ndev, uint32_t resource_id) {
+auto send_net_resource_advert_to_peer(uint16_t peer_node, ker::net::NetDevice* ndev, uint32_t resource_id) -> int {
     uint8_t name_len = 0;
     while (name_len < DISCOVERED_RESOURCE_NAME_LEN - 1 && ndev->name.at(name_len) != '\0') {
         name_len++;
@@ -630,46 +631,36 @@ void send_net_resource_advert_to_peer(uint16_t peer_node, ker::net::NetDevice* n
     adv->name_len = name_len;
     memcpy(buf.data() + sizeof(ResourceAdvertNetPayload), ndev->name.data(), name_len);
 
-    wki_send(peer_node, WKI_CHAN_CONTROL, MsgType::RESOURCE_ADVERT, buf.data(), total_len);
+    return wki_send(peer_node, WKI_CHAN_CONTROL, MsgType::RESOURCE_ADVERT, buf.data(), total_len);
 }
 
-void advertise_resources_to_peer(uint16_t peer_node) {
-    WkiPeer const* peer = wki_peer_find(peer_node);
-    if (peer == nullptr || peer->state != PeerState::CONNECTED) {
+enum class ResourceAdvertStage : uint8_t {
+    WAIT_FOR_IDLE,
+    VFS,
+    BLOCK,
+    NET,
+    COMPLETE,
+};
+
+auto control_stream_is_idle(WkiPeer* peer) -> bool {
+    WkiChannel* channel = wki_channel_lookup_in_peer(peer, peer->node_id, WKI_CHAN_CONTROL);
+    if (channel == nullptr) {
+        return true;
+    }
+
+    channel->lock.lock();
+    bool const IDLE = channel->active && channel->peer_node_id == peer->node_id && channel->channel_id == WKI_CHAN_CONTROL &&
+                      channel->retransmit_count == 0 && channel->tx_credits == WKI_CREDITS_CONTROL;
+    channel->lock.unlock();
+    return IDLE;
+}
+
+void request_resource_snapshot(WkiPeer* peer) {
+    if (peer == nullptr || peer->node_id == WKI_NODE_INVALID) {
         return;
     }
-
-    // Iterate all registered block devices
-    size_t const COUNT = ker::dev::block_device_count();
-    for (size_t i = 0; i < COUNT; i++) {
-        ker::dev::BlockDevice* bdev = ker::dev::block_device_at(i);
-        if (bdev == nullptr || bdev->remotable == nullptr) {
-            continue;
-        }
-        if (!bdev->remotable->can_remote()) {
-            continue;
-        }
-
-        auto resource_id = static_cast<uint32_t>(i);
-        send_resource_advert_to_peer(peer_node, bdev, resource_id);
-    }
-
-    wki_remote_vfs_advertise_exports_to_peer(peer_node);
-
-    // Iterate all registered net devices
-    size_t const NDEV_COUNT = ker::net::netdev_count();
-    for (size_t i = 0; i < NDEV_COUNT; i++) {
-        ker::net::NetDevice* ndev = ker::net::netdev_at(i);
-        if (ndev == nullptr || ndev->remotable == nullptr) {
-            continue;
-        }
-        if (!ndev->remotable->can_remote()) {
-            continue;
-        }
-
-        auto net_resource_id = ndev->ifindex;
-        send_net_resource_advert_to_peer(peer_node, ndev, net_resource_id);
-    }
+    peer->resource_advert_request.fetch_add(1, std::memory_order_release);
+    wki_deferred_work_notify();
 }
 
 }  // namespace
@@ -679,15 +670,12 @@ void wki_resource_advertise_all() {
         return;
     }
 
-    // Keep the export set up to date before broadcasting it.
-    wki_remote_vfs_refresh_exports();
-
     for (size_t p = 0; p < WKI_MAX_PEERS; p++) {
-        WkiPeer const* peer = &g_wki.peers.at(p);
+        WkiPeer* peer = &g_wki.peers.at(p);
         if (peer->node_id == WKI_NODE_INVALID || peer->state != PeerState::CONNECTED) {
             continue;
         }
-        advertise_resources_to_peer(peer->node_id);
+        request_resource_snapshot(peer);
     }
 }
 
@@ -696,8 +684,90 @@ void wki_resource_advertise_to_peer(uint16_t peer_node) {
         return;
     }
 
-    wki_remote_vfs_refresh_exports();
-    advertise_resources_to_peer(peer_node);
+    request_resource_snapshot(wki_peer_find(peer_node));
+}
+
+void wki_resource_process_pending_adverts() {
+    bool refreshed_exports = false;
+
+    for (auto& peer : g_wki.peers) {
+        uint64_t const REQUEST = peer.resource_advert_request.load(std::memory_order_acquire);
+        if (peer.node_id == WKI_NODE_INVALID || peer.state != PeerState::CONNECTED || REQUEST == 0 ||
+            (peer.resource_advert_active_request == REQUEST &&
+             peer.resource_advert_stage == static_cast<uint8_t>(ResourceAdvertStage::COMPLETE))) {
+            continue;
+        }
+
+        PeerLifecycleLease lifecycle;
+        if (!lifecycle.acquire(&peer) || peer.state != PeerState::CONNECTED ||
+            peer.vfs_reset_rebind_pending.load(std::memory_order_acquire)) {
+            continue;
+        }
+
+        if (peer.resource_advert_active_request != REQUEST) {
+            peer.resource_advert_active_request = REQUEST;
+            peer.resource_advert_stage = static_cast<uint8_t>(ResourceAdvertStage::WAIT_FOR_IDLE);
+            peer.resource_advert_index = 0;
+        }
+
+        auto stage = static_cast<ResourceAdvertStage>(peer.resource_advert_stage);
+        if (stage == ResourceAdvertStage::WAIT_FOR_IDLE) {
+            if (!control_stream_is_idle(&peer)) {
+                continue;
+            }
+            if (!refreshed_exports) {
+                wki_remote_vfs_refresh_exports();
+                refreshed_exports = true;
+            }
+            stage = ResourceAdvertStage::VFS;
+            peer.resource_advert_stage = static_cast<uint8_t>(stage);
+        }
+
+        if (stage == ResourceAdvertStage::VFS) {
+            if (!wki_remote_vfs_advertise_exports_to_peer(peer.node_id)) {
+                continue;
+            }
+            stage = ResourceAdvertStage::BLOCK;
+            peer.resource_advert_stage = static_cast<uint8_t>(stage);
+            peer.resource_advert_index = 0;
+        }
+
+        if (stage == ResourceAdvertStage::BLOCK) {
+            size_t const COUNT = ker::dev::block_device_count();
+            while (peer.resource_advert_index < COUNT) {
+                size_t const INDEX = peer.resource_advert_index;
+                ker::dev::BlockDevice* bdev = ker::dev::block_device_at(INDEX);
+                if (bdev != nullptr && bdev->remotable != nullptr && bdev->remotable->can_remote() &&
+                    send_resource_advert_to_peer(peer.node_id, bdev, static_cast<uint32_t>(INDEX)) != WKI_OK) {
+                    break;
+                }
+                peer.resource_advert_index++;
+            }
+            if (peer.resource_advert_index < COUNT) {
+                continue;
+            }
+            stage = ResourceAdvertStage::NET;
+            peer.resource_advert_stage = static_cast<uint8_t>(stage);
+            peer.resource_advert_index = 0;
+        }
+
+        if (stage == ResourceAdvertStage::NET) {
+            size_t const COUNT = ker::net::netdev_count();
+            while (peer.resource_advert_index < COUNT) {
+                size_t const INDEX = peer.resource_advert_index;
+                ker::net::NetDevice* ndev = ker::net::netdev_at(INDEX);
+                if (ndev != nullptr && ndev->remotable != nullptr && ndev->remotable->can_remote() &&
+                    send_net_resource_advert_to_peer(peer.node_id, ndev, ndev->ifindex) != WKI_OK) {
+                    break;
+                }
+                peer.resource_advert_index++;
+            }
+            if (peer.resource_advert_index < COUNT) {
+                continue;
+            }
+            peer.resource_advert_stage = static_cast<uint8_t>(ResourceAdvertStage::COMPLETE);
+        }
+    }
 }
 
 void wki_remotable_notify_net_changed(ker::net::NetDevice* dev) {
@@ -706,11 +776,11 @@ void wki_remotable_notify_net_changed(ker::net::NetDevice* dev) {
     }
 
     for (size_t p = 0; p < WKI_MAX_PEERS; p++) {
-        WkiPeer const* peer = &g_wki.peers.at(p);
+        WkiPeer* peer = &g_wki.peers.at(p);
         if (peer->node_id == WKI_NODE_INVALID || peer->state != PeerState::CONNECTED) {
             continue;
         }
-        send_net_resource_advert_to_peer(peer->node_id, dev, dev->ifindex);
+        request_resource_snapshot(peer);
     }
 }
 

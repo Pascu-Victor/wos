@@ -77,6 +77,10 @@ void wki_resource_advertise_all();
 // Advertise all local remotable resources to one connected peer.
 void wki_resource_advertise_to_peer(uint16_t peer_node);
 
+// Drain coalesced outbound snapshots from the task-context deferred worker.
+// HELLO/NAPI callers only set per-peer atomic request state.
+void wki_resource_process_pending_adverts();
+
 // Snapshot whether this exact locally observed resource generation is still
 // advertised. Generation 0 is never live.
 auto wki_resource_generation_snapshot(uint16_t node_id, ResourceType type, uint32_t resource_id) -> uint64_t;

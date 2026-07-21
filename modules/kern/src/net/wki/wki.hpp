@@ -234,6 +234,15 @@ struct WkiPeer {
     // so an unknown-to-known observation still tears down fail-closed.
     std::atomic<bool> vfs_reset_owner_reboot_proven{false};
 
+    // HELLO and local resource mutations only request a snapshot here. The
+    // deferred worker serializes the current snapshot after older reliable
+    // control traffic has drained, so boot-time export rebuilds cannot fill
+    // the channel with stale adverts and drop the post-pivot root export.
+    std::atomic<uint64_t> resource_advert_request{0};
+    uint64_t resource_advert_active_request = 0;
+    size_t resource_advert_index = 0;
+    uint8_t resource_advert_stage = 0;
+
     // HELLO retry
     uint64_t hello_sent_time = 0;
     uint8_t hello_retries = 0;

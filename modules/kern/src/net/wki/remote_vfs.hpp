@@ -304,8 +304,9 @@ auto wki_remote_vfs_export_snapshot_is_current(const VfsExport& expected) -> boo
 // Server side: advertise all VFS exports to all connected peers
 void wki_remote_vfs_advertise_exports();
 
-// Server side: advertise all VFS exports to one connected peer.
-void wki_remote_vfs_advertise_exports_to_peer(uint16_t peer_node);
+// Server side: advertise all VFS exports to one connected peer. Returns false
+// if the reliable stream could not accept the complete current export set.
+auto wki_remote_vfs_advertise_exports_to_peer(uint16_t peer_node) -> bool;
 
 // Consumer side: mount a remote VFS at local_mount_path. Automatic mounts pass
 // the exact observed generation; manual callers snapshot the current one.

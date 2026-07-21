@@ -164,6 +164,10 @@ void process_deferred_blocking_work() {
     // queues. Admission copied it into fixed storage on the network RX path.
     wki_remotable_process_pending_rx();
 
+    // Publish coalesced current resource snapshots only from task context and
+    // only after each peer's older reliable control stream has drained.
+    wki_resource_process_pending_adverts();
+
     // DEV_DETACH becomes ACK-visible only after RX admission has made the
     // exact owner binding unreachable. Drain the blocking half here before
     // replacement attach workers run.

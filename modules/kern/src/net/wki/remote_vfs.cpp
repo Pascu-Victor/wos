@@ -4620,12 +4620,12 @@ auto wki_remote_vfs_export_snapshot_is_current(const VfsExport& expected) -> boo
 
 namespace {
 
-void advertise_exports_to_peer(uint16_t peer_node) {
+auto advertise_exports_to_peer(uint16_t peer_node) -> bool {
     s_vfs_lock.lock();
     uint64_t const PUBLICATION_REVISION = g_vfs_export_revision;
     if ((PUBLICATION_REVISION & 1U) != 0) {
         s_vfs_lock.unlock();
-        return;
+        return false;
     }
     size_t const EXPORT_COUNT = g_vfs_exports.size();
     s_vfs_lock.unlock();
@@ -4634,7 +4634,7 @@ void advertise_exports_to_peer(uint16_t peer_node) {
         s_vfs_lock.lock();
         if (g_vfs_export_revision != PUBLICATION_REVISION || idx >= g_vfs_exports.size()) {
             s_vfs_lock.unlock();
-            return;
+            return false;
         }
         VfsExport const EXP = *std::next(g_vfs_exports.begin(), static_cast<ptrdiff_t>(idx));
         s_vfs_lock.unlock();
@@ -4664,23 +4664,27 @@ void advertise_exports_to_peer(uint16_t peer_node) {
             memcpy(buf.data() + sizeof(ResourceAdvertPayload) + NAME_LEN, &TOKEN, sizeof(TOKEN));
         }
 
-        wki_send(peer_node, WKI_CHAN_CONTROL, MsgType::RESOURCE_ADVERT, buf.data(), total_len);
+        if (wki_send(peer_node, WKI_CHAN_CONTROL, MsgType::RESOURCE_ADVERT, buf.data(), total_len) != WKI_OK) {
+            return false;
+        }
     }
+
+    return true;
 }
 
 }  // namespace
 
-void wki_remote_vfs_advertise_exports_to_peer(uint16_t peer_node) {
+auto wki_remote_vfs_advertise_exports_to_peer(uint16_t peer_node) -> bool {
     if (!g_remote_vfs_initialized || peer_node == WKI_NODE_INVALID) {
-        return;
+        return false;
     }
 
     WkiPeer const* peer = wki_peer_find(peer_node);
     if (peer == nullptr || peer->state != PeerState::CONNECTED) {
-        return;
+        return false;
     }
 
-    advertise_exports_to_peer(peer_node);
+    return advertise_exports_to_peer(peer_node);
 }
 
 void wki_remote_vfs_advertise_exports() {
@@ -4688,13 +4692,7 @@ void wki_remote_vfs_advertise_exports() {
         return;
     }
 
-    for (size_t p = 0; p < WKI_MAX_PEERS; p++) {
-        WkiPeer const* peer = &g_wki.peers[p];  // NOLINT(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
-        if (peer->node_id == WKI_NODE_INVALID || peer->state != PeerState::CONNECTED) {
-            continue;
-        }
-        advertise_exports_to_peer(peer->node_id);
-    }
+    wki_resource_advertise_all();
 }
 
 // -------------------------------------------------------------------------------

@@ -6,6 +6,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 REMOTABLE_CPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "remotable.cpp"
+WKI_CPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "wki.cpp"
+WKI_HPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "wki.hpp"
 
 
 def fail(message: str) -> None:
@@ -109,6 +111,52 @@ def test_deferred_retry_deadlines_are_saturating() -> None:
     present = [token for token in forbidden if token in source]
     if present:
         fail("remotable retry scheduling must not use wrapping deadline arithmetic: " + ", ".join(present))
+
+
+def test_resource_snapshots_are_coalesced_after_control_stream_drain() -> None:
+    source = REMOTABLE_CPP.read_text()
+    wki_source = WKI_CPP.read_text()
+    header = WKI_HPP.read_text()
+
+    request = function_body(source, "request_resource_snapshot")
+    for token in ["resource_advert_request.fetch_add(1, std::memory_order_release)", "wki_deferred_work_notify()"]:
+        if token not in request:
+            fail(f"resource snapshot request must remain atomic and NAPI-safe: missing {token}")
+    for forbidden in ["wki_send", "wki_remote_vfs_refresh_exports", "new ", "delete"]:
+        if forbidden in request:
+            fail(f"resource snapshot request must not send, allocate, or refresh in RX context: found {forbidden!r}")
+
+    idle = function_body(source, "control_stream_is_idle")
+    require_order(
+        idle,
+        [
+            "channel->lock.lock()",
+            "channel->retransmit_count == 0",
+            "channel->tx_credits == WKI_CREDITS_CONTROL",
+            "channel->lock.unlock()",
+        ],
+        "resource replay waits for stale reliable control traffic",
+    )
+
+    process = function_body(source, "wki_resource_process_pending_adverts")
+    require_order(
+        process,
+        [
+            "peer.vfs_reset_rebind_pending.load(std::memory_order_acquire)",
+            "control_stream_is_idle(&peer)",
+            "wki_remote_vfs_refresh_exports()",
+            "wki_remote_vfs_advertise_exports_to_peer(peer.node_id)",
+            "send_resource_advert_to_peer(peer.node_id",
+            "send_net_resource_advert_to_peer(peer.node_id",
+            "ResourceAdvertStage::COMPLETE",
+        ],
+        "deferred current resource snapshot",
+    )
+    if "wki_resource_process_pending_adverts();" not in function_body(wki_source, "process_deferred_blocking_work"):
+        fail("deferred WKI worker must drain pending outbound resource snapshots")
+    for token in ["resource_advert_request", "resource_advert_active_request", "resource_advert_stage"]:
+        if token not in header:
+            fail(f"per-peer coalesced resource replay state is missing {token}")
 
 
 def test_resource_rx_survives_same_boot_channel_reset_without_acking_unknown_epoch() -> None:
@@ -286,6 +334,7 @@ def test_same_incarnation_block_advert_revives_exact_generation() -> None:
 
 def main() -> None:
     test_deferred_retry_deadlines_are_saturating()
+    test_resource_snapshots_are_coalesced_after_control_stream_drain()
     test_pending_net_attach_is_generation_and_epoch_fenced()
     test_pending_vfs_mount_waits_for_detach_ack_without_spending_retries()
     test_pending_vfs_mount_prepares_only_the_local_host_directory()
