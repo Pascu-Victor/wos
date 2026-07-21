@@ -284,6 +284,8 @@ constexpr int WKI_IPC_FD_OPEN_FLAG_MASK = WKI_IPC_FD_ACCESS_MASK | WKI_IPC_O_NON
 
 auto ipc_fd_access_mode(int open_flags) -> uint16_t { return static_cast<uint16_t>(open_flags & WKI_IPC_FD_ACCESS_MASK); }
 
+auto ipc_pipe_endpoint_requires_affinity(int open_flags) -> bool { return ipc_fd_access_mode(open_flags) == 0; }
+
 auto ipc_fd_export_open_flags(int open_flags) -> uint16_t { return static_cast<uint16_t>(open_flags & WKI_IPC_FD_OPEN_FLAG_MASK); }
 
 auto ipc_fd_import_open_flags(uint16_t flags) -> int { return static_cast<int>(flags & WKI_IPC_FD_OPEN_FLAG_MASK); }
@@ -3690,7 +3692,7 @@ auto wki_ipc_find_pipe_affinity_node(const ker::mod::sched::task::Task* task, ui
         }
 
         const auto* file = static_cast<const ker::vfs::File*>(val);
-        if (!ker::vfs::vfs_is_pipe_file(file) || file->private_data == nullptr) {
+        if (!ker::vfs::vfs_is_pipe_file(file) || file->private_data == nullptr || !ipc_pipe_endpoint_requires_affinity(file->open_flags)) {
             return;
         }
 
@@ -4926,6 +4928,17 @@ auto wki_ipc_selftest_pipe_fd_flags_preserve_nonblocking_access_mode() -> int {
     }
 
     return 0;
+}
+
+auto wki_ipc_selftest_pipe_affinity_uses_read_endpoints_only() -> int {
+    constexpr int READ_NONBLOCK = WKI_IPC_O_NONBLOCK;
+    constexpr int WRITE_ONLY = 1;
+    constexpr int WRITE_NONBLOCK = WRITE_ONLY | WKI_IPC_O_NONBLOCK;
+
+    return ipc_pipe_endpoint_requires_affinity(READ_NONBLOCK) && !ipc_pipe_endpoint_requires_affinity(WRITE_ONLY) &&
+                   !ipc_pipe_endpoint_requires_affinity(WRITE_NONBLOCK)
+               ? 0
+               : -EIO;
 }
 
 auto wki_ipc_selftest_write_only_pipe_omits_receive_ring() -> int {

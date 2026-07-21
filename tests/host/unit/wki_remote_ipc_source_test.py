@@ -370,6 +370,17 @@ def test_pipe_fd_open_flags_preserve_nonblocking_access_mode() -> None:
     require_order(write_body, "if (NONBLOCKING)", "pause_for_ipc_send_retry(ret, ATTEMPT)", "message nonblocking send check")
 
 
+def test_pipe_affinity_ignores_write_only_shared_output_endpoints() -> None:
+    remote_ipc = REMOTE_IPC_CPP.read_text()
+    helper = function_body(remote_ipc, "ipc_pipe_endpoint_requires_affinity")
+    affinity = function_body(remote_ipc, "wki_ipc_find_pipe_affinity_node")
+
+    if "ipc_fd_access_mode(open_flags) == 0" not in helper:
+        fail("pipe affinity must be limited to readable pipe endpoints")
+    if "!ipc_pipe_endpoint_requires_affinity(file->open_flags)" not in affinity:
+        fail("pipe affinity selection must ignore shared write-only stdout/stderr endpoints")
+
+
 def test_write_only_pipe_proxy_omits_receive_ring() -> None:
     remote_ipc = REMOTE_IPC_CPP.read_text()
     header = REMOTE_IPC_HPP.read_text()
@@ -850,6 +861,7 @@ def test_ipc_selftests_are_declared_and_registered() -> None:
         "wki_ipc_selftest_nonblocking_pipe_write_view_preserves_source_flags",
         "wki_ipc_selftest_export_pipe_write_burst_is_bounded",
         "wki_ipc_selftest_pipe_fd_flags_preserve_nonblocking_access_mode",
+        "wki_ipc_selftest_pipe_affinity_uses_read_endpoints_only",
         "wki_ipc_selftest_write_only_pipe_omits_receive_ring",
         "wki_ipc_selftest_attach_insert_failure_preserves_existing_fd",
         "wki_ipc_selftest_dev_op_response_cookie_fences_stale_completion",
@@ -873,6 +885,7 @@ def main() -> None:
     test_export_pipe_write_uses_nonmutating_nonblocking_view()
     test_proxy_pipe_write_reuses_bounded_stack_frame()
     test_pipe_fd_open_flags_preserve_nonblocking_access_mode()
+    test_pipe_affinity_ignores_write_only_shared_output_endpoints()
     test_write_only_pipe_proxy_omits_receive_ring()
     test_pty_export_data_can_write_from_deferred_worker_without_backlog()
     test_attach_fd_install_is_transactional()

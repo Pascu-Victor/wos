@@ -232,6 +232,10 @@ KTEST(WkiIpcExportPipe, PreservesNonblockingFlagAndAccessMode) {
     KEXPECT_EQ(ker::net::wki::wki_ipc_selftest_pipe_fd_flags_preserve_nonblocking_access_mode(), 0);
 }
 
+KTEST(WkiIpcExportPipe, PipeAffinityUsesReadEndpointsOnly) {
+    KEXPECT_EQ(ker::net::wki::wki_ipc_selftest_pipe_affinity_uses_read_endpoints_only(), 0);
+}
+
 KTEST(WkiIpcAttach, WriteOnlyPipeOmitsReceiveRing) { KEXPECT_EQ(ker::net::wki::wki_ipc_selftest_write_only_pipe_omits_receive_ring(), 0); }
 
 KTEST(WkiIpcAttach, InsertFailurePreservesExistingFd) {
