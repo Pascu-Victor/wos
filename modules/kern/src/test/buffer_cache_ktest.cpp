@@ -894,6 +894,68 @@ KTEST(BufferCache, BreadMultiDirtyHitOverlaysNewerCleanSingleAlias) {
     ker::vfs::invalidate_bdev(&dev);
 }
 
+KTEST(BufferCache, BreadMultiCleanHitOverlaysNewerCleanSingleAlias) {
+    ker::dev::BlockDevice dev = make_null_bdev();
+    RecordingWriteState io{};
+    dev.write_blocks = recording_write;
+    dev.private_data = &io;
+    ker::vfs::invalidate_bdev(&dev);
+
+    uint64_t const BLOCK = 790;
+
+    ker::vfs::BufHead* stale_multi = ker::vfs::bread_multi(&dev, BLOCK, 2);
+    KREQUIRE_NE(stale_multi, nullptr);
+    KEXPECT_EQ(stale_multi->data[0], static_cast<uint8_t>(0));
+
+    ker::vfs::BufHead* newer_single = ker::vfs::bget(&dev, BLOCK);
+    KREQUIRE_NE(newer_single, nullptr);
+    memset(newer_single->data, 0xB2, newer_single->size);
+    KEXPECT_EQ(ker::vfs::bwrite(newer_single), 0);
+    ker::vfs::brelse(newer_single);
+    ker::vfs::brelse(stale_multi);
+
+    ker::vfs::BufHead* reread_multi = ker::vfs::bread_multi(&dev, BLOCK, 2);
+    KREQUIRE_NE(reread_multi, nullptr);
+    KEXPECT_EQ(reread_multi->data[0], static_cast<uint8_t>(0xB2));
+    KEXPECT_EQ(reread_multi->data[511], static_cast<uint8_t>(0xB2));
+    KEXPECT_EQ(reread_multi->data[512], static_cast<uint8_t>(0));
+    KEXPECT_EQ(reread_multi->data[reread_multi->size - 1], static_cast<uint8_t>(0));
+    ker::vfs::brelse(reread_multi);
+    ker::vfs::invalidate_bdev(&dev);
+}
+
+KTEST(BufferCache, BreadMultiMissOverlaysNewerCleanSingleAlias) {
+    ker::dev::BlockDevice dev = make_null_bdev();
+    RecordingWriteState io{};
+    dev.write_blocks = recording_write;
+    dev.private_data = &io;
+    ker::vfs::invalidate_bdev(&dev);
+
+    uint64_t const BLOCK = 810;
+
+    ker::vfs::BufHead* stale_multi = ker::vfs::bread_multi(&dev, BLOCK, 2);
+    KREQUIRE_NE(stale_multi, nullptr);
+    ker::vfs::BufHead* clean_tail = ker::vfs::bread(&dev, BLOCK + 2);
+    KREQUIRE_NE(clean_tail, nullptr);
+
+    ker::vfs::BufHead* newer_single = ker::vfs::bget(&dev, BLOCK);
+    KREQUIRE_NE(newer_single, nullptr);
+    memset(newer_single->data, 0xC3, newer_single->size);
+    KEXPECT_EQ(ker::vfs::bwrite(newer_single), 0);
+    ker::vfs::brelse(newer_single);
+    ker::vfs::brelse(clean_tail);
+    ker::vfs::brelse(stale_multi);
+
+    ker::vfs::BufHead* reread_multi = ker::vfs::bread_multi(&dev, BLOCK, 3);
+    KREQUIRE_NE(reread_multi, nullptr);
+    KEXPECT_EQ(reread_multi->data[0], static_cast<uint8_t>(0xC3));
+    KEXPECT_EQ(reread_multi->data[511], static_cast<uint8_t>(0xC3));
+    KEXPECT_EQ(reread_multi->data[512], static_cast<uint8_t>(0));
+    KEXPECT_EQ(reread_multi->data[reread_multi->size - 1], static_cast<uint8_t>(0));
+    ker::vfs::brelse(reread_multi);
+    ker::vfs::invalidate_bdev(&dev);
+}
+
 KTEST(BufferCache, BgetMultiSamePointer) {
     // Two bget_multi calls for the same (dev, block, count) must return
     // the same buffer (cache hit), so dirty data is always visible.

@@ -362,6 +362,8 @@ ker::mod::sched::Workqueue* dirty_writeback_wq = nullptr;
 void clear_buffer_dirty_locked(BufHead* bh);
 auto copy_dirty_bdev_range_locked(dev::BlockDevice* bdev, uint64_t block_no, size_t count, uint8_t* dst, uint64_t min_epoch_exclusive)
     -> bool;
+auto overlay_newer_cached_range_locked(dev::BlockDevice* bdev, uint64_t block_no, size_t count, uint64_t min_epoch_exclusive, uint8_t* dst)
+    -> bool;
 void overlay_newer_cached_aliases(BufHead const* source, uint64_t source_epoch, uint8_t* dst);
 void dirty_coverage_add(std::array<DirtyCoverageInterval, DIRTY_COPY_COVERAGE_MAX_INTERVALS>& intervals, size_t& interval_count,
                         DirtyCoverageInterval interval, bool& overflow);
@@ -1346,9 +1348,7 @@ auto copy_cached_bdev_range_if_complete_internal(dev::BlockDevice* bdev, uint64_
         size_t const SRC_OFF = static_cast<size_t>(block_no - covering->block_no) * bdev->block_size;
         size_t const COPY_BYTES = count * bdev->block_size;
         std::memcpy(dst, covering->data + SRC_OFF, COPY_BYTES);
-        if (cache_dirty_buffers != 0) {
-            static_cast<void>(copy_dirty_bdev_range_locked(bdev, block_no, count, dst, covering->dirty_epoch));
-        }
+        static_cast<void>(overlay_newer_cached_range_locked(bdev, block_no, count, covering->dirty_epoch, dst));
         stat_range_copy_cover_hits.fetch_add(1, std::memory_order_relaxed);
         cache_lock.unlock_irqrestore(IRQFLAGS);
         return true;
@@ -1362,8 +1362,8 @@ auto copy_cached_bdev_range_if_complete_internal(dev::BlockDevice* bdev, uint64_
     range_copy_cached_overlaps_locked(state->tree_root, bdev, block_no, count, dst, coverage, coverage_count, visit_count, copied,
                                       coverage_overflow);
     bool const COMPLETE = copied && !coverage_overflow && dirty_coverage_complete(coverage, coverage_count, block_no, count);
-    if (COMPLETE && cache_dirty_buffers != 0) {
-        static_cast<void>(copy_dirty_bdev_range_locked(bdev, block_no, count, dst, 0));
+    if (COMPLETE) {
+        static_cast<void>(overlay_newer_cached_range_locked(bdev, block_no, count, 0, dst));
     }
     if (COMPLETE) {
         stat_range_copy_overlap_hits.fetch_add(1, std::memory_order_relaxed);
@@ -1429,38 +1429,40 @@ void discard_clean_overlapping_aliases_locked(BufHead* source) {
     }
 }
 
-auto cached_alias_can_overlay_writeback(const BufHead* alias, const BufHead* source, uint64_t source_epoch) -> bool {
-    if (alias == nullptr || source == nullptr || alias == source || alias->bdev != source->bdev || alias->data == nullptr ||
-        source->bdev == nullptr || source->bdev->block_size == 0 || (alias->flags & BH_VALID) == 0 || alias->dirty_epoch <= source_epoch) {
+auto cached_alias_can_overlay_range(const BufHead* alias, dev::BlockDevice* bdev, uint64_t block_no, size_t count,
+                                    uint64_t min_epoch_exclusive) -> bool {
+    if (alias == nullptr || bdev == nullptr || bdev->block_size == 0 || count == 0 || alias->bdev != bdev || alias->data == nullptr ||
+        (alias->flags & BH_VALID) == 0 || alias->dirty_epoch <= min_epoch_exclusive) {
         return false;
     }
-    return block_ranges_overlap(alias->block_no, buffer_block_count(alias), source->block_no, buffer_block_count(source));
+    return buffer_overlaps_range(alias, bdev, block_no, count);
 }
 
-void overlay_cached_alias_into_snapshot(const BufHead* alias, const BufHead* source, uint8_t* dst) {
-    if (dst == nullptr || !cached_alias_can_overlay_writeback(alias, source, 0)) {
+void overlay_cached_alias_into_range(const BufHead* alias, dev::BlockDevice* bdev, uint64_t block_no, size_t count, uint8_t* dst) {
+    if (dst == nullptr || !cached_alias_can_overlay_range(alias, bdev, block_no, count, 0)) {
         return;
     }
 
     uint64_t const ALIAS_LAST = range_buffer_last_block(alias);
-    uint64_t const SOURCE_LAST = range_buffer_last_block(source);
-    uint64_t const COPY_FIRST = std::max(alias->block_no, source->block_no);
-    uint64_t const COPY_LAST = std::min(ALIAS_LAST, SOURCE_LAST);
+    uint64_t const RANGE_LAST = block_range_last_block(block_no, count);
+    uint64_t const COPY_FIRST = std::max(alias->block_no, block_no);
+    uint64_t const COPY_LAST = std::min(ALIAS_LAST, RANGE_LAST);
     if (COPY_FIRST > COPY_LAST) {
         return;
     }
 
-    size_t const BLOCK_SIZE = source->bdev->block_size;
+    size_t const BLOCK_SIZE = bdev->block_size;
     auto const COPY_BLOCKS = static_cast<size_t>(COPY_LAST - COPY_FIRST + 1);
     size_t copy_bytes = COPY_BLOCKS * BLOCK_SIZE;
     size_t const SRC_OFF = static_cast<size_t>(COPY_FIRST - alias->block_no) * BLOCK_SIZE;
-    size_t const DST_OFF = static_cast<size_t>(COPY_FIRST - source->block_no) * BLOCK_SIZE;
-    if (SRC_OFF >= alias->size || DST_OFF >= source->size) {
+    size_t const DST_OFF = static_cast<size_t>(COPY_FIRST - block_no) * BLOCK_SIZE;
+    size_t const DST_SIZE = count * BLOCK_SIZE;
+    if (SRC_OFF >= alias->size || DST_OFF >= DST_SIZE) {
         return;
     }
 
     copy_bytes = std::min(copy_bytes, alias->size - SRC_OFF);
-    copy_bytes = std::min(copy_bytes, source->size - DST_OFF);
+    copy_bytes = std::min(copy_bytes, DST_SIZE - DST_OFF);
     if (copy_bytes == 0) {
         return;
     }
@@ -1468,8 +1470,9 @@ void overlay_cached_alias_into_snapshot(const BufHead* alias, const BufHead* sou
     std::memcpy(dst + DST_OFF, alias->data + SRC_OFF, copy_bytes);
 }
 
-void consider_newer_cached_alias(const BufHead* alias, const BufHead* source, uint64_t min_epoch_exclusive, const BufHead*& best) {
-    if (!cached_alias_can_overlay_writeback(alias, source, min_epoch_exclusive)) {
+void consider_newer_cached_range_alias(const BufHead* alias, dev::BlockDevice* bdev, uint64_t block_no, size_t count,
+                                       uint64_t min_epoch_exclusive, const BufHead*& best) {
+    if (!cached_alias_can_overlay_range(alias, bdev, block_no, count, min_epoch_exclusive)) {
         return;
     }
     if (best == nullptr || alias->dirty_epoch < best->dirty_epoch ||
@@ -1478,57 +1481,67 @@ void consider_newer_cached_alias(const BufHead* alias, const BufHead* source, ui
     }
 }
 
-void range_consider_newer_cached_aliases_locked(BufHead* root, const BufHead* source, uint64_t min_epoch_exclusive, const BufHead*& best) {
-    if (root == nullptr || source == nullptr) {
+void range_consider_newer_cached_aliases_locked(BufHead* root, dev::BlockDevice* bdev, uint64_t block_no, size_t count,
+                                                uint64_t min_epoch_exclusive, const BufHead*& best) {
+    if (root == nullptr || bdev == nullptr || count == 0) {
         return;
     }
 
-    uint64_t const SOURCE_LAST = range_buffer_last_block(source);
-    if (root->range_left != nullptr && root->range_left->range_subtree_last_block >= source->block_no) {
-        range_consider_newer_cached_aliases_locked(root->range_left, source, min_epoch_exclusive, best);
+    uint64_t const RANGE_LAST = block_range_last_block(block_no, count);
+    if (root->range_left != nullptr && root->range_left->range_subtree_last_block >= block_no) {
+        range_consider_newer_cached_aliases_locked(root->range_left, bdev, block_no, count, min_epoch_exclusive, best);
     }
 
-    consider_newer_cached_alias(root, source, min_epoch_exclusive, best);
+    consider_newer_cached_range_alias(root, bdev, block_no, count, min_epoch_exclusive, best);
 
-    if (root->block_no <= SOURCE_LAST) {
-        range_consider_newer_cached_aliases_locked(root->range_right, source, min_epoch_exclusive, best);
+    if (root->block_no <= RANGE_LAST) {
+        range_consider_newer_cached_aliases_locked(root->range_right, bdev, block_no, count, min_epoch_exclusive, best);
     }
 }
 
-auto find_oldest_newer_cached_alias_locked(const BufHead* source, uint64_t min_epoch_exclusive) -> const BufHead* {
+auto find_oldest_newer_cached_range_alias_locked(dev::BlockDevice* bdev, uint64_t block_no, size_t count, uint64_t min_epoch_exclusive)
+    -> const BufHead* {
     if (range_index_degraded) {
         const BufHead* best = nullptr;
         for (auto* bucket_head : hash_buckets) {
             for (BufHead* bh = bucket_head; bh != nullptr; bh = bh->hash_next) {
-                consider_newer_cached_alias(bh, source, min_epoch_exclusive, best);
+                consider_newer_cached_range_alias(bh, bdev, block_no, count, min_epoch_exclusive, best);
             }
         }
         return best;
     }
 
-    RangeBdevState* state = find_range_bdev_state_locked(source->bdev);
-    if (state == nullptr || state->buffers <= 1 || !range_tree_overlaps(state->tree_root, source->block_no, buffer_block_count(source))) {
+    RangeBdevState* state = find_range_bdev_state_locked(bdev);
+    if (state == nullptr || state->buffers == 0 || !range_tree_overlaps(state->tree_root, block_no, count)) {
         return nullptr;
     }
 
     const BufHead* best = nullptr;
-    range_consider_newer_cached_aliases_locked(state->tree_root, source, min_epoch_exclusive, best);
+    range_consider_newer_cached_aliases_locked(state->tree_root, bdev, block_no, count, min_epoch_exclusive, best);
     return best;
 }
 
-auto overlay_newer_cached_aliases_locked(const BufHead* source, uint64_t source_epoch, uint8_t* dst) -> bool {
-    if (source == nullptr || source->bdev == nullptr || dst == nullptr) {
+auto overlay_newer_cached_range_locked(dev::BlockDevice* bdev, uint64_t block_no, size_t count, uint64_t min_epoch_exclusive, uint8_t* dst)
+    -> bool {
+    if (bdev == nullptr || bdev->block_size == 0 || count == 0 || dst == nullptr || count > SIZE_MAX / bdev->block_size) {
         return false;
     }
 
     bool copied = false;
-    uint64_t min_epoch = source_epoch;
-    while (const BufHead* alias = find_oldest_newer_cached_alias_locked(source, min_epoch)) {
-        overlay_cached_alias_into_snapshot(alias, source, dst);
+    uint64_t min_epoch = min_epoch_exclusive;
+    while (const BufHead* alias = find_oldest_newer_cached_range_alias_locked(bdev, block_no, count, min_epoch)) {
+        overlay_cached_alias_into_range(alias, bdev, block_no, count, dst);
         copied = true;
         min_epoch = alias->dirty_epoch;
     }
     return copied;
+}
+
+auto overlay_newer_cached_aliases_locked(const BufHead* source, uint64_t source_epoch, uint8_t* dst) -> bool {
+    if (source == nullptr || source->bdev == nullptr || source->bdev->block_size == 0 || source->size % source->bdev->block_size != 0) {
+        return false;
+    }
+    return overlay_newer_cached_range_locked(source->bdev, source->block_no, buffer_block_count(source), source_epoch, dst);
 }
 
 void overlay_newer_cached_aliases(BufHead const* source, uint64_t source_epoch, uint8_t* dst) {
@@ -2628,20 +2641,14 @@ auto copy_dirty_bdev_range_after_epoch(dev::BlockDevice* bdev, uint64_t block_no
     return COPIED;
 }
 
-auto copy_dirty_bdev_range_for_cached_buffer_locked(BufHead* bh, uint64_t block_no, size_t count) -> bool {
+auto overlay_newer_cached_aliases_for_buffer_locked(BufHead* bh, uint64_t block_no, size_t count) -> bool {
     if (bh == nullptr || bh->bdev == nullptr || bh->bdev->block_size == 0 || count == 0 || bh->data == nullptr || !cache_initialized) {
         return false;
     }
     if (count > SIZE_MAX / bh->bdev->block_size) {
         return false;
     }
-    if ((bh->flags & BH_DIRTY) != 0) {
-        return overlay_newer_cached_aliases_locked(bh, bh->dirty_epoch, bh->data);
-    }
-    if (cache_dirty_buffers == 0) {
-        return false;
-    }
-    return copy_dirty_bdev_range_locked(bh->bdev, block_no, count, bh->data, 0);
+    return overlay_newer_cached_range_locked(bh->bdev, block_no, count, bh->dirty_epoch, bh->data);
 }
 
 auto dirty_bytes_above_target_locked() -> bool { return cache_dirty_bytes > dirty_target_bytes_locked(); }
@@ -2795,7 +2802,7 @@ auto bread(dev::BlockDevice* bdev, uint64_t block_no, BufferReadClass read_class
         bh->refcount.fetch_add(1, std::memory_order_relaxed);
         lru_touch(bh);
         stat_hits++;
-        static_cast<void>(copy_dirty_bdev_range_for_cached_buffer_locked(bh, block_no, 1));
+        static_cast<void>(overlay_newer_cached_aliases_for_buffer_locked(bh, block_no, 1));
         cache_lock.unlock_irqrestore(irqflags);
         perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::BUF_READ_HIT, PERF_STARTED_US, 0, bdev->block_size);
         return bh;
@@ -2842,7 +2849,7 @@ auto bread(dev::BlockDevice* bdev, uint64_t block_no, BufferReadClass read_class
     if (existing != nullptr) {
         existing->refcount.fetch_add(1, std::memory_order_relaxed);
         lru_touch(existing);
-        static_cast<void>(copy_dirty_bdev_range_for_cached_buffer_locked(existing, block_no, 1));
+        static_cast<void>(overlay_newer_cached_aliases_for_buffer_locked(existing, block_no, 1));
         cache_lock.unlock_irqrestore(irqflags);
         free_detached_buffer(bh);
         perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::BUF_READ_HIT, PERF_STARTED_US, 0, bdev->block_size);
@@ -2884,7 +2891,7 @@ auto bread_multi(dev::BlockDevice* bdev, uint64_t block_no, size_t count, Buffer
         bh->refcount.fetch_add(1, std::memory_order_relaxed);
         lru_touch(bh);
         stat_hits++;
-        static_cast<void>(copy_dirty_bdev_range_for_cached_buffer_locked(bh, block_no, count));
+        static_cast<void>(overlay_newer_cached_aliases_for_buffer_locked(bh, block_no, count));
         cache_lock.unlock_irqrestore(irqflags);
         perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::BUF_READ_HIT, PERF_STARTED_US, 0, total_size);
         return bh;
@@ -2928,7 +2935,7 @@ auto bread_multi(dev::BlockDevice* bdev, uint64_t block_no, size_t count, Buffer
     if (existing != nullptr) {
         existing->refcount.fetch_add(1, std::memory_order_relaxed);
         lru_touch(existing);
-        static_cast<void>(copy_dirty_bdev_range_for_cached_buffer_locked(existing, block_no, count));
+        static_cast<void>(overlay_newer_cached_aliases_for_buffer_locked(existing, block_no, count));
         cache_lock.unlock_irqrestore(irqflags);
         free_detached_buffer(bh);
         perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::BUF_READ_HIT, PERF_STARTED_US, 0, total_size);
