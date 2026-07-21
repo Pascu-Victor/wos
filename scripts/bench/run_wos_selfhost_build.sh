@@ -37,6 +37,9 @@ Options:
   --target NAME           CMake target to build (default: $DEFAULT_TARGET)
   --jobs N                Parallel build jobs for clone, bootstrap, and build
                           (default: $DEFAULT_JOBS)
+  --distributed           Run the WOS payload with REMOTE placement enabled.
+                          The submitting node owns the checkout and reports;
+                          build processes may execute on connected WOS peers.
   --skip-bootstrap        Skip ./tools/bootstrap.sh, useful only for iteration
   --keep-workdir          Refuse to replace an existing checkout in workdir
   --resume-checkout       Reuse the existing depth-1 checkout in workdir after
@@ -1468,7 +1471,24 @@ run_wos() {
     local remote_command
     remote_command="payload=\${TMPDIR:-/tmp}/wos-selfhost-build.\$\$.sh"
     remote_command+="; cat > \"\$payload\" || exit \$?"
-    remote_command+="; $remote_env bash \"\$payload\""
+    if [ "$distributed" -eq 1 ]; then
+        local distributed_command="locally forward"
+        local routed_path
+        for routed_path in "$workdir" "$history_file" "$log_dir" "$mirror_file" "$mirror_local_path" \
+            "$source_cache" "$distdir" "$host_toolchain" "$host_sysroot"; do
+            if [ -n "$routed_path" ]; then
+                distributed_command+=" $(shell_quote "+${routed_path%/}")"
+            fi
+        done
+        distributed_command+=" \"+\$payload\""
+        for routed_path in /root /usr /bin /lib /lib64 /libexec /share /etc /proc /dev /run /tmp; do
+            distributed_command+=" $(shell_quote "-$routed_path")"
+        done
+        distributed_command+=" -- remotely $remote_env bash \"\$payload\""
+        remote_command+="; $distributed_command"
+    else
+        remote_command+="; $remote_env bash \"\$payload\""
+    fi
     remote_command+="; status=\$?"
     remote_command+="; rm -f \"\$payload\""
     remote_command+="; exit \$status"
@@ -1505,6 +1525,7 @@ heartbeat_interval="30"
 heartbeat_tail="4"
 heartbeat_stall_snapshots="6"
 heartbeat_sync="0"
+distributed=0
 
 while (($# > 0)); do
     case "$1" in
@@ -1618,6 +1639,9 @@ while (($# > 0)); do
         --heartbeat-sync)
             heartbeat_sync="1"
             ;;
+        --distributed)
+            distributed=1
+            ;;
         -h|--help)
             usage
             exit 0
@@ -1640,6 +1664,10 @@ case "$mode" in
         die "unknown mode: $mode"
         ;;
 esac
+
+if [ "$distributed" -eq 1 ] && [ "$mode" != "wos" ]; then
+    die "--distributed is only supported with wos mode"
+fi
 
 if [ -z "$workdir" ]; then
     case "$mode" in

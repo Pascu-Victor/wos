@@ -1,6 +1,6 @@
 #!/bin/bash
-# Run the complete WOS self-host build repeatedly in one already-booted VM and
-# preserve enough host-side evidence to audit every attempt.
+# Run the complete WOS self-host build repeatedly in an already-booted WOS
+# topology and preserve enough host-side evidence to audit every attempt.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -26,9 +26,9 @@ usage() {
 Usage: scripts/bench/run_wos_selfhost_repeatability.sh [options]
 
 Run the exact fresh WOS self-host clone/bootstrap/configure/wos_full flow 50
-times by default in one already-booted VM. Each run replaces the same guest
-workdir, while its reports, command logs, console output, and serial byte range
-are archived under a distinct host-side result directory.
+times by default. Each run replaces the same submitter-owned workdir, while its
+reports, command logs, console output, and serial byte ranges are archived under
+a distinct host-side result directory.
 
 Options:
   --runs N                 Number of fresh runs (default: $DEFAULT_RUNS)
@@ -39,6 +39,12 @@ Options:
   --output-dir PATH        New host result directory
                            (default: benchmarks/results/wos-selfhost-repeat-<UTC>)
   --serial-log PATH        Host serial log (default: serial-vm0.log)
+  --distributed-hosts CSV Enable REMOTE placement and require workload on at
+                           least two listed WOS nodes. The first host must equal
+                           --host (example: wos-0,wos-1,wos-2,wos-3)
+  --distributed-serial-logs CSV
+                           Host serial logs corresponding one-for-one with
+                           --distributed-hosts
   --expected-commit SHA    Require every checkout to use this root commit;
                            otherwise the first observed commit is the baseline
   --repo URL               Override the self-host runner repository URL
@@ -51,7 +57,7 @@ Options:
   --no-heartbeat-sync      Do not request out-of-band sync after runner phases
   -h, --help               Show this help
 
-The script assumes the VM is already running, for example:
+The script assumes the WOS topology is already running, for example:
   bin/wos-cluster --config configs/cluster_selfhost.json --launch --no-setup
 
 It never passes --resume-checkout, --source-cache, or --skip-bootstrap. A
@@ -148,6 +154,109 @@ capture_serial_range() {
     dd if="$serial_log" of="$output" iflag=skip_bytes,count_bytes skip="$before" count="$expected_bytes" status=none
     captured_bytes="$(wc -c < "$output" | tr -d '[:space:]')"
     [ "$captured_bytes" -eq "$expected_bytes" ]
+}
+
+capture_named_serial_range() {
+    local named_serial_log="$1"
+    local before="$2"
+    local after="$3"
+    local output="$4"
+    local expected_bytes
+    local captured_bytes
+
+    : > "$output"
+    if [ ! -f "$named_serial_log" ] || [ "$after" -lt "$before" ]; then
+        return 1
+    fi
+    if [ "$after" -eq "$before" ]; then
+        return 0
+    fi
+    expected_bytes=$((after - before))
+    dd if="$named_serial_log" of="$output" iflag=skip_bytes,count_bytes skip="$before" count="$expected_bytes" status=none
+    captured_bytes="$(wc -c < "$output" | tr -d '[:space:]')"
+    [ "$captured_bytes" -eq "$expected_bytes" ]
+}
+
+named_serial_boot_id() {
+    local named_serial_log="$1"
+
+    grep -aEo 'WOS version=[^[:space:]]+ boot_id=[[:xdigit:]]+' "$named_serial_log" 2>/dev/null |
+        tail -n 1 | sed 's/.*boot_id=//'
+}
+
+capture_distributed_serial_starts() {
+    distributed_serial_starts=()
+    local participant_serial
+
+    for participant_serial in "${distributed_serial_logs[@]}"; do
+        distributed_serial_starts+=("$(wc -c < "$participant_serial" | tr -d '[:space:]')")
+    done
+}
+
+capture_distributed_serial_evidence() {
+    local run_dir="$1"
+    local index participant_host participant_serial before after boot_id output failures
+
+    for ((index = 0; index < ${#distributed_hosts[@]}; ++index)); do
+        participant_host="${distributed_hosts[$index]}"
+        participant_serial="${distributed_serial_logs[$index]}"
+        before="${distributed_serial_starts[$index]}"
+        after="$(wc -c < "$participant_serial" | tr -d '[:space:]')"
+        output="$run_dir/serial-${participant_host}.log"
+        if ! capture_named_serial_range "$participant_serial" "$before" "$after" "$output"; then
+            append_reason "participant_serial_missing_or_truncated_${participant_host}"
+            continue
+        fi
+        boot_id="$(named_serial_boot_id "$participant_serial" || true)"
+        if [ "$boot_id" != "${distributed_boot_ids[$index]}" ]; then
+            append_reason "participant_boot_id_mismatch_${participant_host}"
+            same_boot=0
+        fi
+        failures="$run_dir/serial-${participant_host}-failures.txt"
+        if grep -Ein "$serial_fail_regex" "$output" > "$failures"; then
+            append_reason "participant_serial_failure_${participant_host}"
+        else
+            : > "$failures"
+        fi
+    done
+}
+
+capture_distributed_telemetry() {
+    local runner_pid="$1"
+    local output="$2"
+    local participant_host snapshot timestamp load_line compute_line running_active index
+
+    printf 'timestamp_utc\thost\tloadavg_state\twki_compute\n' > "$output"
+    distributed_running_seen=()
+    for ((index = 0; index < ${#distributed_hosts[@]}; ++index)); do
+        distributed_running_seen+=(0)
+    done
+
+    while kill -0 "$runner_pid" 2>/dev/null; do
+        timestamp="$(timestamp_utc)"
+        for ((index = 0; index < ${#distributed_hosts[@]}; ++index)); do
+            participant_host="${distributed_hosts[$index]}"
+            snapshot="$("$WOS_SSH" "$participant_host" \
+                "sed -n '1p' /proc/kcpustate; grep '^wki_compute ' /proc/wki/netdiag" 2>/dev/null || true)"
+            load_line="$(printf '%s\n' "$snapshot" | sed -n '1p')"
+            compute_line="$(printf '%s\n' "$snapshot" | sed -n '2p')"
+            printf '%s\t%s\t%s\t%s\n' "$timestamp" "$participant_host" "$load_line" "$compute_line" >> "$output"
+            running_active="$(printf '%s\n' "$compute_line" | sed -n 's/.* running_active=\([0-9][0-9]*\).*/\1/p')"
+            if [ -n "$running_active" ] && [ "$running_active" -gt 0 ]; then
+                distributed_running_seen[$index]=1
+            fi
+        done
+        if kill -0 "$runner_pid" 2>/dev/null; then
+            sleep 2
+        fi
+    done
+
+    distributed_running_hosts=0
+    for ((index = 0; index < ${#distributed_running_seen[@]}; ++index)); do
+        if [ "${distributed_running_seen[$index]}" -eq 1 ]; then
+            distributed_running_hosts=$((distributed_running_hosts + 1))
+        fi
+    done
 }
 
 guest_output() {
@@ -303,6 +412,8 @@ distdir=""
 run_timeout_seconds="$DEFAULT_RUN_TIMEOUT_SECONDS"
 serial_fail_regex="$DEFAULT_SERIAL_FAIL_REGEX"
 heartbeat_sync=1
+distributed_hosts_csv=""
+distributed_serial_logs_csv=""
 
 while (($# > 0)); do
     case "$1" in
@@ -334,6 +445,16 @@ while (($# > 0)); do
         --serial-log)
             serial_log="${2:-}"
             [ -n "$serial_log" ] || die "--serial-log requires a value"
+            shift
+            ;;
+        --distributed-hosts)
+            distributed_hosts_csv="${2:-}"
+            [ -n "$distributed_hosts_csv" ] || die "--distributed-hosts requires a value"
+            shift
+            ;;
+        --distributed-serial-logs)
+            distributed_serial_logs_csv="${2:-}"
+            [ -n "$distributed_serial_logs_csv" ] || die "--distributed-serial-logs requires a value"
             shift
             ;;
         --expected-commit)
@@ -389,6 +510,40 @@ reject_remote_whitespace "--expected-commit" "$expected_commit"
 reject_remote_whitespace "--repo" "$repo"
 reject_remote_whitespace "--mirror-file" "$mirror_file"
 reject_remote_whitespace "--distdir" "$distdir"
+reject_remote_whitespace "--distributed-hosts" "$distributed_hosts_csv"
+reject_remote_whitespace "--distributed-serial-logs" "$distributed_serial_logs_csv"
+
+distributed=0
+distributed_hosts=()
+distributed_serial_logs=()
+distributed_boot_ids=()
+if [ -n "$distributed_hosts_csv" ] || [ -n "$distributed_serial_logs_csv" ]; then
+    [ -n "$distributed_hosts_csv" ] && [ -n "$distributed_serial_logs_csv" ] ||
+        die "--distributed-hosts and --distributed-serial-logs must be used together"
+    case "$distributed_hosts_csv" in
+        ,*|*,|*,,*) die "distributed host list contains an empty entry" ;;
+    esac
+    case "$distributed_serial_logs_csv" in
+        ,*|*,|*,,*) die "distributed serial log list contains an empty entry" ;;
+    esac
+    IFS=, read -r -a distributed_hosts <<< "$distributed_hosts_csv"
+    IFS=, read -r -a distributed_serial_logs <<< "$distributed_serial_logs_csv"
+    [ "${#distributed_hosts[@]}" -ge 2 ] || die "distributed mode requires at least two WOS hosts"
+    [ "${#distributed_hosts[@]}" -eq "${#distributed_serial_logs[@]}" ] ||
+        die "distributed hosts and serial logs must have the same number of entries"
+    [ "${distributed_hosts[0]}" = "$host" ] || die "the first distributed host must equal --host"
+
+    declare -A distributed_host_seen=()
+    for participant_host in "${distributed_hosts[@]}"; do
+        [ -n "$participant_host" ] || die "distributed host entries must not be empty"
+        case "$participant_host" in
+            *[!A-Za-z0-9._-]*) die "distributed host contains unsafe filename characters: $participant_host" ;;
+        esac
+        [ -z "${distributed_host_seen[$participant_host]:-}" ] || die "duplicate distributed host: $participant_host"
+        distributed_host_seen[$participant_host]=1
+    done
+    distributed=1
+fi
 
 if [ -n "$mirror_file" ]; then
     [[ "$expected_commit" =~ ^[0-9a-f]{40}$ ]] ||
@@ -414,6 +569,20 @@ initial_boot_id="$(serial_boot_id || true)"
 [ -n "$initial_boot_id" ] || die "cannot find the current WOS boot ID in serial log: $serial_log"
 initial_uptime="$(read_guest_uptime || true)"
 [ -n "$initial_uptime" ] || die "cannot read /proc/uptime from $host; launch the VM before running this harness"
+
+if [ "$distributed" -eq 1 ]; then
+    for participant_serial in "${distributed_serial_logs[@]}"; do
+        [ -f "$participant_serial" ] || die "participant serial log does not exist: $participant_serial"
+        participant_boot_id="$(named_serial_boot_id "$participant_serial" || true)"
+        [ -n "$participant_boot_id" ] || die "cannot find WOS boot ID in participant serial log: $participant_serial"
+        distributed_boot_ids+=("$participant_boot_id")
+    done
+    for participant_host in "${distributed_hosts[@]}"; do
+        "$WOS_SSH" "$participant_host" \
+            "sed -n '1p' /proc/kcpustate; grep '^wki_compute ' /proc/wki/netdiag" >/dev/null 2>&1 ||
+            die "distributed participant is unreachable or lacks telemetry: $participant_host"
+    done
+fi
 
 if [ -n "$distdir" ]; then
     guest_output "test -d $(shell_quote "$distdir")" >/dev/null 2>&1 ||
@@ -508,6 +677,9 @@ for ((run_number = 1; run_number <= runs; ++run_number)); do
     fi
 
     serial_start="$(serial_size || printf 0)"
+    if [ "$distributed" -eq 1 ]; then
+        capture_distributed_serial_starts
+    fi
     start_utc="$(timestamp_utc)"
     start_ms="$(now_ms)"
     runner_cmd=("$SELFHOST_RUNNER" wos --host "$host" --jobs "$jobs" --workdir "$workdir" --log-dir "$remote_log_dir"
@@ -524,10 +696,19 @@ for ((run_number = 1; run_number <= runs; ++run_number)); do
     if [ -n "$distdir" ]; then
         runner_cmd+=(--distdir "$distdir")
     fi
+    if [ "$distributed" -eq 1 ]; then
+        runner_cmd+=(--distributed)
+    fi
 
     echo "[$run_label/$runs] start $(printf '%q ' "${runner_cmd[@]}")"
     set +e
-    timeout --signal=TERM --kill-after=60s "${run_timeout_seconds}s" "${runner_cmd[@]}" > "$console_log" 2>&1
+    timeout --signal=TERM --kill-after=60s "${run_timeout_seconds}s" "${runner_cmd[@]}" > "$console_log" 2>&1 &
+    runner_pid=$!
+    distributed_running_hosts=0
+    if [ "$distributed" -eq 1 ]; then
+        capture_distributed_telemetry "$runner_pid" "$run_dir/distributed-telemetry.tsv"
+    fi
+    wait "$runner_pid"
     runner_status=$?
     set -e
     end_ms="$(now_ms)"
@@ -552,6 +733,9 @@ for ((run_number = 1; run_number <= runs; ++run_number)); do
     else
         append_reason "runner_status_$runner_status"
     fi
+    if [ "$distributed" -eq 1 ] && [ "$distributed_running_hosts" -lt 2 ]; then
+        append_reason "distributed_workload_observed_on_${distributed_running_hosts}_hosts"
+    fi
 
     if [ "$cleanup_incomplete" -eq 1 ]; then
         uptime_after=""
@@ -566,6 +750,9 @@ for ((run_number = 1; run_number <= runs; ++run_number)); do
             append_reason "serial_failure_match"
         else
             : > "$run_dir/serial-failures.txt"
+        fi
+        if [ "$distributed" -eq 1 ]; then
+            capture_distributed_serial_evidence "$run_dir"
         fi
         evidence_status=1
         append_reason "evidence_incomplete"
@@ -609,6 +796,9 @@ for ((run_number = 1; run_number <= runs; ++run_number)); do
         append_reason "serial_failure_match"
     else
         : > "$run_dir/serial-failures.txt"
+    fi
+    if [ "$distributed" -eq 1 ]; then
+        capture_distributed_serial_evidence "$run_dir"
     fi
 
     checkout_path="$workdir/wos"
@@ -721,6 +911,10 @@ fi
     printf 'distdir_manifest_sha256\t%s\n' "$distdir_manifest_sha256"
     printf 'run_timeout_seconds\t%s\n' "$run_timeout_seconds"
     printf 'serial_log\t%s\n' "$serial_log"
+    printf 'distributed\t%s\n' "$distributed"
+    printf 'distributed_hosts\t%s\n' "$distributed_hosts_csv"
+    printf 'distributed_serial_logs\t%s\n' "$distributed_serial_logs_csv"
+    printf 'required_distributed_running_hosts\t2\n'
     printf 'runs_tsv\t%s\n' "$runs_tsv"
 } > "$summary_tsv"
 
