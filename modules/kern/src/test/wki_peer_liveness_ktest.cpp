@@ -271,3 +271,7 @@ KTEST(WkiPeerHandshake, HelloEpochWordsAreIndependent) {
 KTEST(WkiPeerHandshake, RemoteBootEpochDetectsRestart) {
     KEXPECT_TRUE(ker::net::wki::wki_peer_selftest_remote_boot_epoch_detects_restart());
 }
+
+KTEST(WkiPeerHandshake, BootEpochAdvancesLocalChannelEpoch) {
+    KEXPECT_TRUE(ker::net::wki::wki_peer_selftest_boot_epoch_advances_local_channel_epoch());
+}

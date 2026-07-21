@@ -46,6 +46,7 @@ void wki_timer_notify();
 auto wki_peer_selftest_hello_ack_state_transition() -> bool;
 auto wki_peer_selftest_hello_epoch_words_are_independent() -> bool;
 auto wki_peer_selftest_remote_boot_epoch_detects_restart() -> bool;
+auto wki_peer_selftest_boot_epoch_advances_local_channel_epoch() -> bool;
 #endif
 
 }  // namespace ker::net::wki

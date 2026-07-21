@@ -150,6 +150,12 @@ def test_hello_boot_epoch_fences_connected_broadcast_restarts() -> None:
     )
     require_order(
         handle_hello,
+        "peer_advance_local_channel_epoch(peer)",
+        "wki_peer_send_hello_ack(peer)",
+        "HELLO boot epoch reset must publish a reciprocal channel epoch",
+    )
+    require_order(
+        handle_hello,
         "resync_connected_peer = !newly_connected && !WAS_FENCED",
         "if (newly_connected || resync_connected_peer)",
         "HELLO boot epoch restart must re-advertise state",
@@ -165,6 +171,12 @@ def test_hello_boot_epoch_fences_connected_broadcast_restarts() -> None:
         "if (remote_boot_epoch_changed && !WAS_FENCED)",
         "wki_channels_close_for_peer(peer_node)",
         "HELLO_ACK boot epoch change must close stale channels",
+    )
+    require_order(
+        handle_hello_ack,
+        "peer_advance_local_channel_epoch(peer)",
+        "wki_peer_send_hello(transport, peer_node)",
+        "HELLO_ACK boot epoch reset must publish a reciprocal channel epoch",
     )
     require_order(
         handle_hello_ack,
@@ -187,11 +199,19 @@ def test_hello_boot_epoch_fences_connected_broadcast_restarts() -> None:
     for token in [
         "HelloEpochWordsAreIndependent",
         "RemoteBootEpochDetectsRestart",
+        "BootEpochAdvancesLocalChannelEpoch",
         "wki_peer_selftest_hello_epoch_words_are_independent",
         "wki_peer_selftest_remote_boot_epoch_detects_restart",
+        "wki_peer_selftest_boot_epoch_advances_local_channel_epoch",
     ]:
         if token not in ktest_source:
             fail(f"peer boot epoch KTEST is missing {token}")
+
+    for handler_name in ["handle_hello", "handle_hello_ack"]:
+        body = function_body(source, handler_name)
+        channel_reset = body.find("else if (remote_channel_epoch_changed")
+        if channel_reset < 0 or body.find("resync_connected_peer = !newly_connected", channel_reset) < 0:
+            fail(f"{handler_name} channel epoch reset must re-advertise current resources")
 
 
 def test_connected_epoch_reset_retires_vfs_before_channel_reuse() -> None:

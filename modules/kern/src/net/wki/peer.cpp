@@ -322,6 +322,16 @@ auto next_channel_epoch(uint32_t epoch) -> uint32_t {
     return epoch == 0 ? 1 : epoch;
 }
 
+void peer_advance_local_channel_epoch(WkiPeer* peer) {
+    if (peer == nullptr) {
+        return;
+    }
+
+    peer->lock.lock();
+    peer->local_channel_epoch = next_channel_epoch(peer->local_channel_epoch);
+    peer->lock.unlock();
+}
+
 auto peer_note_remote_channel_epoch_locked(WkiPeer* peer, uint32_t remote_epoch) -> bool {
     if (peer == nullptr || remote_epoch == 0 || remote_epoch == peer->remote_channel_epoch) {
         return false;
@@ -751,11 +761,18 @@ void handle_hello(WkiTransport* transport, const WkiHeader* hdr, const uint8_t* 
     }
     if (remote_boot_epoch_changed) {
         log::info("Peer 0x%04x boot epoch changed to %u; resetting stale channel state", peer_node, REMOTE_BOOT_EPOCH);
+        if (!WAS_FENCED) {
+            // We may have accepted reliable traffic before learning this boot
+            // epoch. Tell the sender to retire its matching sequence stream so
+            // it replays a current resource snapshot on a fresh channel.
+            peer_advance_local_channel_epoch(peer);
+        }
         wki_channels_close_for_peer(peer_node);
         resync_connected_peer = !newly_connected && !WAS_FENCED;
     } else if (remote_channel_epoch_changed) {
         log::info("Peer 0x%04x channel epoch advanced to %u; resetting stale channel state", peer_node, REMOTE_CHANNEL_EPOCH);
         wki_channels_close_for_peer(peer_node);
+        resync_connected_peer = !newly_connected && !WAS_FENCED;
     }
 
     // Send HELLO_ACK
@@ -928,11 +945,19 @@ void handle_hello_ack(WkiTransport* transport, const WkiHeader* /*hdr*/, const u
 
     if (remote_boot_epoch_changed && !WAS_FENCED) {
         log::info("Peer 0x%04x boot epoch changed to %u; resetting stale channel state", peer_node, REMOTE_BOOT_EPOCH);
+        // HELLO_ACK does not normally elicit a response. Advance our epoch and
+        // send a direct HELLO below so the peer observes the reciprocal reset.
+        peer_advance_local_channel_epoch(peer);
         wki_channels_close_for_peer(peer_node);
         resync_connected_peer = !newly_connected;
     } else if (remote_channel_epoch_changed && !WAS_FENCED) {
         log::info("Peer 0x%04x channel epoch advanced to %u; resetting stale channel state", peer_node, REMOTE_CHANNEL_EPOCH);
         wki_channels_close_for_peer(peer_node);
+        resync_connected_peer = !newly_connected;
+    }
+
+    if (remote_boot_epoch_changed && !WAS_FENCED) {
+        wki_peer_send_hello(transport, peer_node);
     }
 
     bool reconnected = false;
@@ -1035,6 +1060,19 @@ auto wki_peer_selftest_remote_boot_epoch_detects_restart() -> bool {
 
     return ZERO_IGNORED && FIRST_NONZERO_RECORDS && SAME_NONZERO_IGNORED && NEW_NONZERO_DETECTED && MATCH_HELPER_ACCEPTS_CURRENT &&
            MATCH_HELPER_REJECTS_STALE;
+}
+
+auto wki_peer_selftest_boot_epoch_advances_local_channel_epoch() -> bool {
+    WkiPeer peer{};
+
+    peer_advance_local_channel_epoch(&peer);
+    bool const ZERO_ADVANCES_TO_ONE = peer.local_channel_epoch == 1;
+
+    peer.local_channel_epoch = UINT32_MAX;
+    peer_advance_local_channel_epoch(&peer);
+    bool const WRAP_SKIPS_ZERO = peer.local_channel_epoch == 1;
+
+    return ZERO_ADVANCES_TO_ONE && WRAP_SKIPS_ZERO;
 }
 #endif
 
