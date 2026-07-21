@@ -48,7 +48,7 @@ def test_selfhost_runner_covers_acceptance_flow() -> None:
             'local distributed_command="locally forward"',
             'distributed_command+=" -- $remote_env bash \\\"\\$payload\\\""',
             'WOS_SELFHOST_DISTRIBUTED=$(shell_quote "$distributed")',
-            'remotely "$@"',
+            "WOS_DISTRIBUTED_COMPILER=1",
             'for routed_path in /root /usr /bin /lib /lib64 /libexec /share /etc /proc /dev /run /tmp; do',
             "clone_cmd=(git clone)",
             "run_timed_event \"clone\" \"wos_repo\" run_git_http",
@@ -108,6 +108,20 @@ def test_selfhost_runner_covers_acceptance_flow() -> None:
         fail("self-host benchmark must disable host-only disk packaging in both operating systems")
     if 'if [ "$mode" = "wos" ]' in configure_block:
         fail("self-host benchmark Linux and WOS configure target graphs diverge")
+
+
+def test_wos_bootstrap_distributes_only_compiler_processes() -> None:
+    source = (ROOT / "tools" / "bootstrap.sh").read_text()
+    require_tokens(
+        source,
+        [
+            'compiler=("$system_clang" -resource-dir "$resource_dir")',
+            r'if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ]; then',
+            r'exec remotely "\${compiler[@]}" "\$@"',
+            r'exec "\${compiler[@]}" "\$@"',
+        ],
+        "WOS native compiler-only distribution",
+    )
 
 
 def test_selfhost_runner_locks_workdir_before_replacing_it() -> None:

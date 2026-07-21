@@ -104,10 +104,15 @@ for arg in "\$@"; do
     esac
 done
 
+compiler=("$system_clang" -resource-dir "$resource_dir")
 if [ "\$use_config" -eq 1 ] && [ -f "\$config" ]; then
-    exec "$system_clang" -resource-dir "$resource_dir" --config="\$config" "\$@"
+    compiler+=(--config="\$config")
 fi
-exec "$system_clang" -resource-dir "$resource_dir" "\$@"
+
+if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ]; then
+    exec remotely "\${compiler[@]}" "\$@"
+fi
+exec "\${compiler[@]}" "\$@"
 EOF
     chmod +x "$output"
 }

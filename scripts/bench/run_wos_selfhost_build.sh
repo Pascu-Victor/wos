@@ -822,7 +822,8 @@ run_with_jobs_env() {
             WOS_NINJA_JOBS="$jobs" \
             WOS_MAKE_JOBS="$jobs" \
             CMAKE_BUILD_PARALLEL_LEVEL="$jobs" \
-            remotely "$@"
+            WOS_DISTRIBUTED_COMPILER=1 \
+            "$@"
     else
         WOS_BUILD_JOBS="$jobs" \
             WOS_NINJA_JOBS="$jobs" \
