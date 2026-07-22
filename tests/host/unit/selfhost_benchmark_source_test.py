@@ -147,7 +147,8 @@ def test_wos_bootstrap_distributes_only_compiler_processes() -> None:
             r'''printf '%q\n' "\$arg" >> "\$compiler_response"''',
             r'for arg in "\${compiler_forward_args[@]}"; do',
             r'env -i PATH="\$compiler_remote_path" HOME="\${HOME:-/root}" TMPDIR="\${TMPDIR:-/tmp}" TZ=UTC0',
-            r'on "\$compiler_host" "\${compiler[@]}" -fno-temp-file "@\$compiler_response"',
+            r'on "\$compiler_host" forward "+\$compiler_responses" --',
+            r'"\${compiler[@]}" -fno-temp-file "@\$compiler_response"',
             r'rm -f -- "\$compiler_input"',
             r'compiler_slot_cleanup',
             r"warning: distributed compiler on \$compiler_host failed with status \$compiler_status; retrying locally",
@@ -278,6 +279,10 @@ def test_wos_bootstrap_remote_response_file_preserves_arguments() -> None:
 set -u
 [ "${TZ:-}" = UTC0 ]
 shift
+[ "$1" = forward ]
+[ "$2" = "+$(dirname "${!#}")" ]
+[ "$3" = -- ]
+shift 3
 response="${!#}"
 response="${response#@}"
 if grep -F -- CPP_SOURCE_PATH "$response" >/dev/null || \

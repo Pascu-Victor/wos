@@ -370,7 +370,8 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
         done
         compiler_remote_path="\${PATH:-/usr/bin:/bin}"
         if env -i PATH="\$compiler_remote_path" HOME="\${HOME:-/root}" TMPDIR="\${TMPDIR:-/tmp}" TZ=UTC0 \
-            on "\$compiler_host" "\${compiler[@]}" -fno-temp-file "@\$compiler_response"; then
+            on "\$compiler_host" forward "+\$compiler_responses" -- \
+            "\${compiler[@]}" -fno-temp-file "@\$compiler_response"; then
             compiler_status=0
         else
             compiler_status=\$?
