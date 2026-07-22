@@ -163,6 +163,7 @@ total_elapsed=0
 commit="unknown"
 heartbeat_pid=""
 workdir_lock=""
+distributed_compiler_state=""
 
 sanitize_selfhost_environment() {
     unset CC CXX CPP LD AR AS NM OBJCOPY OBJDUMP RANLIB READELF STRIP
@@ -828,7 +829,7 @@ run_with_jobs_env() {
             CMAKE_BUILD_PARALLEL_LEVEL="$jobs" \
             WOS_DISTRIBUTED_COMPILER=1 \
             WOS_DISTRIBUTED_COMPILER_HOSTS="$distributed_hosts" \
-            WOS_DISTRIBUTED_COMPILER_STATE="$workdir/tmp/distributed-compiler" \
+            WOS_DISTRIBUTED_COMPILER_STATE="$distributed_compiler_state" \
             "$@"
     else
         WOS_BUILD_JOBS="$jobs" \
@@ -994,6 +995,9 @@ safe_prepare_workdir() {
     fi
     ensure_parent_dir "$history_file"
     mkdir -p "$log_dir"
+    if [ "$mode" = "wos" ] && [ "$distributed" = "1" ]; then
+        distributed_compiler_state="$(mktemp -d /tmp/wos-distributed-compiler.XXXXXX)/state"
+    fi
     : > "$report"
     : > "$detail_report"
     : > "$cache_diag_report"
@@ -1368,6 +1372,7 @@ log "distdir=$distdir"
 log "bootstrap_ccache=disabled"
 log "history_file=$history_file"
 log "log_dir=$log_dir"
+log "distributed_compiler_state=$distributed_compiler_state"
 log "target=$target"
 log "git_http_low_speed=${git_http_low_speed_limit}Bps/${git_http_low_speed_time}s"
 log "heartbeat=${heartbeat_interval}s tail=${heartbeat_tail} stall_snapshots=${heartbeat_stall_snapshots} sync=${heartbeat_sync}"
