@@ -127,18 +127,24 @@ def test_wos_bootstrap_distributes_only_compiler_processes() -> None:
             r'compiler_jobs_per_host="\${WOS_DISTRIBUTED_COMPILER_JOBS_PER_HOST:-}"',
             r'compiler_total_jobs="\${WOS_NINJA_JOBS:-\${WOS_BUILD_JOBS:-}}"',
             r'compiler_jobs_per_host="\$(((compiler_total_jobs + \${#compiler_hosts[@]} - 1) / \${#compiler_hosts[@]}))"',
+            r'compiler_min_preprocessed_bytes="\${WOS_DISTRIBUTED_COMPILER_MIN_PREPROCESSED_BYTES:-1048576}"',
             r'compiler_preprocessed_language=cpp-output',
             r'compiler_preprocessed_language=c++-cpp-output',
-            r'compiler_input="\$(mktemp "\$compiler_responses/clang-input.XXXXXX")"',
-            r'"\${compiler[@]}" "\$@" -E -o "\$compiler_input" -Wno-unused-command-line-argument',
             r'while ! mkdir "\$compiler_lock" 2>/dev/null; do',
+            r'compiler_job_dir="\$(mktemp -d "\$compiler_responses/clang-job.XXXXXX" || true)"',
+            r'compiler_input="\$compiler_job_dir/input"',
+            r'"\${compiler[@]}" "\$@" -E -o "\$compiler_input" -Wno-unused-command-line-argument',
+            r'compiler_input_size="\$(stat -c %s -- "\$compiler_input" 2>/dev/null || true)"',
+            r'compiler_forward_args+=(-x "\$compiler_preprocessed_language" -Wno-unused-command-line-argument "\$compiler_input")',
+            r'if [ "\$compiler_input_size" -lt "\$compiler_min_preprocessed_bytes" ]; then',
+            r'"\${compiler[@]}" "\${compiler_forward_args[@]}"',
             r'compiler_candidate_slot="\$compiler_host_slots/\$compiler_slot_index"',
             r'if mkdir "\$compiler_candidate_slot" 2>/dev/null; then',
             r'compiler_host="\${compiler_hosts[\$compiler_candidate_index]}"',
             r'compiler_slot_cleanup() {',
-            r'compiler_response="\$(mktemp "\$compiler_responses/clang.XXXXXX")"',
+            r'compiler_response="\$compiler_job_dir.response"',
             r'''printf '%q\n' "\$arg" >> "\$compiler_response"''',
-            r'for arg in -x "\$compiler_preprocessed_language" -Wno-unused-command-line-argument "\$compiler_input"; do',
+            r'for arg in "\${compiler_forward_args[@]}"; do',
             r'env -i PATH="\$compiler_remote_path" HOME="\${HOME:-/root}" TMPDIR="\${TMPDIR:-/tmp}" TZ=UTC0',
             r'on "\$compiler_host" "\${compiler[@]}" -fno-temp-file "@\$compiler_response"',
             r'rm -f -- "\$compiler_input"',
@@ -183,6 +189,21 @@ test ! -x "$1/object-output"
 def test_wos_bootstrap_caps_concurrent_compilers_per_host() -> None:
     with tempfile.TemporaryDirectory() as temp_dir:
         (Path(temp_dir) / "input.c").write_text("int input;\n", encoding="ascii")
+        mock_compiler = Path(temp_dir) / "system-clang"
+        mock_compiler.write_text(
+            r'''#!/bin/bash
+set -u
+output=
+next_is_output=0
+for arg in "$@"; do
+    if [ "$next_is_output" -eq 1 ]; then output="$arg"; next_is_output=0; continue; fi
+    if [ "$arg" = -o ]; then next_is_output=1; fi
+done
+[ -n "$output" ] && : > "$output"
+''',
+            encoding="ascii",
+        )
+        mock_compiler.chmod(0o755)
         mock_on = Path(temp_dir) / "on"
         mock_state = Path(temp_dir) / "mock-on"
         mock_on.write_text(
@@ -220,12 +241,13 @@ exit 0
 set -euo pipefail
 WOS_TARGET_ARCH=x86_64-pc-wos
 source <(sed -n '/^write_clang_wrapper()/,/^}/p' tools/bootstrap.sh)
-write_clang_wrapper "$1/clang" /usr/bin/true /tmp
+write_clang_wrapper "$1/clang" "$1/system-clang" /tmp
 for index in 0 1 2 3 4 5 6 7; do
     PATH="$1:$PATH" \
         WOS_DISTRIBUTED_COMPILER=1 \
         WOS_DISTRIBUTED_COMPILER_HOSTS=wos-0,wos-1 \
         WOS_DISTRIBUTED_COMPILER_STATE="$1/compiler-state" \
+        WOS_DISTRIBUTED_COMPILER_MIN_PREPROCESSED_BYTES=0 \
         WOS_NINJA_JOBS=4 \
         "$1/clang" -c -o "$1/object-$index" "$1/input.c" &
 done
@@ -305,6 +327,7 @@ PATH="$1:$PATH" \
     WOS_DISTRIBUTED_COMPILER=1 \
     WOS_DISTRIBUTED_COMPILER_HOSTS=wos-0,wos-1 \
     WOS_DISTRIBUTED_COMPILER_STATE="$1/compiler-state" \
+    WOS_DISTRIBUTED_COMPILER_MIN_PREPROCESSED_BYTES=0 \
     WOS_NINJA_JOBS=1 \
     "$1/clang" -D'TEST_TEXT="quoted value"' -MD -MF "$1/dependencies with spaces.d" \
         -c "$1/source with spaces.cpp" \
@@ -318,6 +341,7 @@ PATH="$1:$PATH" \
     WOS_DISTRIBUTED_COMPILER=1 \
     WOS_DISTRIBUTED_COMPILER_HOSTS=wos-0,wos-1 \
     WOS_DISTRIBUTED_COMPILER_STATE="$1/compiler-state" \
+    WOS_DISTRIBUTED_COMPILER_MIN_PREPROCESSED_BYTES=0 \
     WOS_NINJA_JOBS=1 \
     "$1/clang" -MD -MF "$1/c dependencies with spaces.d" -c "$1/source with spaces.c" \
         -o "$1/c object with spaces.o"
@@ -344,6 +368,59 @@ cmp "$1/c object with spaces.o" "$1/direct c object with spaces.o"
             fail(f"WOS compiler shim response-file test failed: {result.stderr}")
 
 
+def test_wos_bootstrap_keeps_small_preprocessed_inputs_local() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp = Path(temp_dir)
+        source = temp / "small.c"
+        source.write_text("int small_compile(void) { return 17; }\n", encoding="ascii")
+        remote_marker = temp / "remote-marker"
+        mock_on = temp / "on"
+        mock_on.write_text(
+            "#!/bin/bash\ntouch REMOTE_MARKER\nexit 99\n".replace(
+                "REMOTE_MARKER", shlex.quote(str(remote_marker))
+            ),
+            encoding="ascii",
+        )
+        mock_on.chmod(0o755)
+        system_clang = ROOT / "toolchain" / "host" / "bin" / "clang"
+        resource_dir = ROOT / "toolchain" / "host" / "lib" / "clang" / "22"
+        script = r'''
+set -euo pipefail
+WOS_TARGET_ARCH=x86_64-pc-wos
+source <(sed -n '/^write_clang_wrapper()/,/^}/p' tools/bootstrap.sh)
+write_clang_wrapper "$1/clang" "$2" "$3"
+PATH="$1:$PATH" \
+    WOS_DISTRIBUTED_COMPILER=1 \
+    WOS_DISTRIBUTED_COMPILER_HOSTS=wos-0,wos-1 \
+    WOS_DISTRIBUTED_COMPILER_STATE="$1/compiler-state" \
+    WOS_DISTRIBUTED_COMPILER_MIN_PREPROCESSED_BYTES=999999999 \
+    WOS_NINJA_JOBS=1 \
+    "$1/clang" -MD -MF "$1/small.d" -c "$1/small.c" -o "$1/small.o"
+test -s "$1/small.o"
+test -s "$1/small.d"
+test ! -e "$1/remote-marker"
+"$2" -resource-dir "$3" -c "$1/small.c" -o "$1/direct-small.o"
+cmp "$1/small.o" "$1/direct-small.o"
+'''
+        result = subprocess.run(
+            [
+                "bash",
+                "-c",
+                script,
+                "wos-bootstrap-small-local-test",
+                temp_dir,
+                str(system_clang),
+                str(resource_dir),
+            ],
+            cwd=ROOT,
+            check=False,
+            text=True,
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            fail(f"WOS compiler shim small-input local test failed: {result.stderr}")
+
+
 def test_wos_bootstrap_retries_failed_remote_compiler_locally() -> None:
     with tempfile.TemporaryDirectory() as temp_dir:
         temp = Path(temp_dir)
@@ -352,7 +429,24 @@ def test_wos_bootstrap_retries_failed_remote_compiler_locally() -> None:
         mock_on.chmod(0o755)
         mock_compiler = temp / "system-clang"
         mock_compiler.write_text(
-            '#!/bin/bash\nprintf \'local\\n\' > "$WOS_FALLBACK_MARKER"\n',
+            r'''#!/bin/bash
+set -u
+output=
+preprocess=0
+next_is_output=0
+for arg in "$@"; do
+    if [ "$next_is_output" -eq 1 ]; then output="$arg"; next_is_output=0; continue; fi
+    case "$arg" in
+        -E) preprocess=1 ;;
+        -o) next_is_output=1 ;;
+    esac
+done
+if [ "$preprocess" -eq 1 ]; then
+    [ -n "$output" ] && : > "$output"
+else
+    printf 'local\n' > "$WOS_FALLBACK_MARKER"
+fi
+''',
             encoding="ascii",
         )
         mock_compiler.chmod(0o755)
@@ -367,6 +461,7 @@ PATH="$1:$PATH" \
     WOS_DISTRIBUTED_COMPILER=1 \
     WOS_DISTRIBUTED_COMPILER_HOSTS=wos-0,wos-1 \
     WOS_DISTRIBUTED_COMPILER_STATE="$1/compiler-state" \
+    WOS_DISTRIBUTED_COMPILER_MIN_PREPROCESSED_BYTES=0 \
     WOS_NINJA_JOBS=1 \
     "$1/clang" -c -o "$1/object.o" "$1/input.c"
 test "$(cat "$1/fallback-marker")" = local
@@ -1816,6 +1911,7 @@ if __name__ == "__main__":
     test_wos_bootstrap_repairs_only_link_output_mode()
     test_wos_bootstrap_caps_concurrent_compilers_per_host()
     test_wos_bootstrap_remote_response_file_preserves_arguments()
+    test_wos_bootstrap_keeps_small_preprocessed_inputs_local()
     test_wos_bootstrap_retries_failed_remote_compiler_locally()
     test_distributed_compiler_hosts_are_validated_before_launch()
     test_selfhost_repeatability_runner_preserves_acceptance_evidence()

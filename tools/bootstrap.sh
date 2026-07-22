@@ -157,6 +157,13 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
             exit 1
             ;;
     esac
+    compiler_min_preprocessed_bytes="\${WOS_DISTRIBUTED_COMPILER_MIN_PREPROCESSED_BYTES:-1048576}"
+    case "\$compiler_min_preprocessed_bytes" in
+        ''|*[!0-9]*)
+            echo "ERROR: distributed compiler minimum preprocessed size must be a non-negative integer" >&2
+            exit 1
+            ;;
+    esac
     compiler_args=("\$@")
     compiler_source_index=-1
     compiler_source_count=0
@@ -219,13 +226,25 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
             echo "ERROR: distributed compiler response directory could not be created" >&2
             exit 1
         fi
-        compiler_input="\$(mktemp "\$compiler_responses/clang-input.XXXXXX")"
-        if [ -z "\$compiler_input" ]; then
-            echo "ERROR: distributed compiler input file could not be created" >&2
+        compiler_lock="\$compiler_state.lock"
+        compiler_lock_cleanup() {
+            rmdir "\$compiler_lock" 2>/dev/null || true
+        }
+        while ! mkdir "\$compiler_lock" 2>/dev/null; do
+            :
+        done
+        trap compiler_lock_cleanup EXIT HUP INT TERM
+        compiler_job_dir="\$(mktemp -d "\$compiler_responses/clang-job.XXXXXX" || true)"
+        compiler_lock_cleanup
+        trap - EXIT HUP INT TERM
+        if [ -z "\$compiler_job_dir" ] || [ ! -d "\$compiler_job_dir" ]; then
+            echo "ERROR: distributed compiler job directory could not be created" >&2
             exit 1
         fi
+        compiler_input="\$compiler_job_dir/input"
         compiler_input_cleanup() {
-            rm -f -- "\$compiler_input"
+            rm -f -- "\$compiler_input" 2>/dev/null || true
+            rmdir "\$compiler_job_dir" 2>/dev/null || true
         }
         trap compiler_input_cleanup EXIT HUP INT TERM
         if "\${compiler[@]}" "\$@" -E -o "\$compiler_input" -Wno-unused-command-line-argument; then
@@ -236,10 +255,49 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
             trap - EXIT HUP INT TERM
             exit "\$compiler_status"
         fi
-        compiler_lock="\$compiler_state.lock"
-        compiler_lock_cleanup() {
-            rmdir "\$compiler_lock" 2>/dev/null || true
-        }
+        compiler_input_size="\$(stat -c %s -- "\$compiler_input" 2>/dev/null || true)"
+        case "\$compiler_input_size" in
+            ''|*[!0-9]*)
+                echo "ERROR: distributed compiler input size could not be determined" >&2
+                exit 1
+                ;;
+        esac
+        compiler_forward_args=()
+        compiler_skip_arg=0
+        for ((compiler_arg_index = 0; compiler_arg_index < \${#compiler_args[@]}; compiler_arg_index++)); do
+            arg="\${compiler_args[\$compiler_arg_index]}"
+            if [ "\$compiler_skip_arg" -eq 1 ]; then
+                compiler_skip_arg=0
+                continue
+            fi
+            if [ "\$compiler_arg_index" -eq "\$compiler_source_index" ]; then
+                continue
+            fi
+            case "\$arg" in
+                -MD|-MMD|-MP|-MG)
+                    continue
+                    ;;
+                -MF|-MT|-MQ|-MJ)
+                    compiler_skip_arg=1
+                    continue
+                    ;;
+                -MF*|-MT*|-MQ*|-MJ*)
+                    continue
+                    ;;
+            esac
+            compiler_forward_args+=("\$arg")
+        done
+        compiler_forward_args+=(-x "\$compiler_preprocessed_language" -Wno-unused-command-line-argument "\$compiler_input")
+        if [ "\$compiler_input_size" -lt "\$compiler_min_preprocessed_bytes" ]; then
+            if "\${compiler[@]}" "\${compiler_forward_args[@]}"; then
+                compiler_status=0
+            else
+                compiler_status=\$?
+            fi
+            compiler_input_cleanup
+            trap - EXIT HUP INT TERM
+            exit "\$compiler_status"
+        fi
         compiler_lock_and_input_cleanup() {
             compiler_lock_cleanup
             compiler_input_cleanup
@@ -289,68 +347,41 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
         compiler_slot_cleanup() {
             rmdir "\$compiler_slot" 2>/dev/null || true
         }
-        compiler_response="\$(mktemp "\$compiler_responses/clang.XXXXXX")"
-        if [ -z "\$compiler_response" ]; then
+        compiler_response="\$compiler_job_dir.response"
+        if ! : > "\$compiler_response"; then
             compiler_input_cleanup
             compiler_slot_cleanup
             echo "ERROR: distributed compiler response file could not be created" >&2
             exit 1
         fi
-    # Keep response files until the scratch workdir is removed. Concurrent
-    # forwarded unlink operations can leave remote VFS peers with a stale
-    # negative lookup for a file that still exists.
-    compiler_remote_cleanup() {
+        # Keep response files until the scratch workdir is removed. Concurrent
+        # forwarded unlink operations can leave remote VFS peers with a stale
+        # negative lookup for a file that still exists.
+        compiler_remote_cleanup() {
+            compiler_input_cleanup
+            compiler_slot_cleanup
+        }
+        trap compiler_remote_cleanup EXIT HUP INT TERM
+        for arg in "\${compiler_forward_args[@]}"; do
+            if ! printf '%q\n' "\$arg" >> "\$compiler_response"; then
+                echo "ERROR: distributed compiler response file could not be written" >&2
+                exit 1
+            fi
+        done
+        compiler_remote_path="\${PATH:-/usr/bin:/bin}"
+        if env -i PATH="\$compiler_remote_path" HOME="\${HOME:-/root}" TMPDIR="\${TMPDIR:-/tmp}" TZ=UTC0 \
+            on "\$compiler_host" "\${compiler[@]}" -fno-temp-file "@\$compiler_response"; then
+            compiler_status=0
+        else
+            compiler_status=\$?
+        fi
         compiler_input_cleanup
         compiler_slot_cleanup
-    }
-    trap compiler_remote_cleanup EXIT HUP INT TERM
-    compiler_skip_arg=0
-    for ((compiler_arg_index = 0; compiler_arg_index < \${#compiler_args[@]}; compiler_arg_index++)); do
-        arg="\${compiler_args[\$compiler_arg_index]}"
-        if [ "\$compiler_skip_arg" -eq 1 ]; then
-            compiler_skip_arg=0
-            continue
+        trap - EXIT HUP INT TERM
+        if [ "\$compiler_status" -eq 0 ]; then
+            exit 0
         fi
-        if [ "\$compiler_arg_index" -eq "\$compiler_source_index" ]; then
-            continue
-        fi
-        case "\$arg" in
-            -MD|-MMD|-MP|-MG)
-                continue
-                ;;
-            -MF|-MT|-MQ|-MJ)
-                compiler_skip_arg=1
-                continue
-                ;;
-            -MF*|-MT*|-MQ*|-MJ*)
-                continue
-                ;;
-        esac
-        if ! printf '%q\n' "\$arg" >> "\$compiler_response"; then
-            echo "ERROR: distributed compiler response file could not be written" >&2
-            exit 1
-        fi
-    done
-    for arg in -x "\$compiler_preprocessed_language" -Wno-unused-command-line-argument "\$compiler_input"; do
-        if ! printf '%q\n' "\$arg" >> "\$compiler_response"; then
-            echo "ERROR: distributed compiler response file could not be written" >&2
-            exit 1
-        fi
-    done
-    compiler_remote_path="\${PATH:-/usr/bin:/bin}"
-    if env -i PATH="\$compiler_remote_path" HOME="\${HOME:-/root}" TMPDIR="\${TMPDIR:-/tmp}" TZ=UTC0 \
-        on "\$compiler_host" "\${compiler[@]}" -fno-temp-file "@\$compiler_response"; then
-        compiler_status=0
-    else
-        compiler_status=\$?
-    fi
-    compiler_input_cleanup
-    compiler_slot_cleanup
-    trap - EXIT HUP INT TERM
-    if [ "\$compiler_status" -eq 0 ]; then
-        exit 0
-    fi
-    echo "warning: distributed compiler on \$compiler_host failed with status \$compiler_status; retrying locally" >&2
+        echo "warning: distributed compiler on \$compiler_host failed with status \$compiler_status; retrying locally" >&2
     fi
 fi
 if "\${compiler[@]}" "\$@"; then
