@@ -139,25 +139,74 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
         echo "ERROR: distributed compiler state path is missing" >&2
         exit 1
     fi
+    compiler_jobs_per_host="\${WOS_DISTRIBUTED_COMPILER_JOBS_PER_HOST:-}"
+    if [ -z "\$compiler_jobs_per_host" ]; then
+        compiler_total_jobs="\${WOS_NINJA_JOBS:-\${WOS_BUILD_JOBS:-}}"
+        case "\$compiler_total_jobs" in
+            ''|*[!0-9]*|0)
+                compiler_jobs_per_host=8
+                ;;
+            *)
+                compiler_jobs_per_host="\$(((compiler_total_jobs + \${#compiler_hosts[@]} - 1) / \${#compiler_hosts[@]}))"
+                ;;
+        esac
+    fi
+    case "\$compiler_jobs_per_host" in
+        ''|*[!0-9]*|0)
+            echo "ERROR: distributed compiler jobs per host must be a positive integer" >&2
+            exit 1
+            ;;
+    esac
     compiler_lock="\$compiler_state.lock"
-    while ! mkdir "\$compiler_lock" 2>/dev/null; do
-        :
-    done
     compiler_lock_cleanup() {
         rmdir "\$compiler_lock" 2>/dev/null || true
     }
-    trap compiler_lock_cleanup EXIT HUP INT TERM
-    compiler_index=0
-    if [ -s "\$compiler_state" ]; then
-        read -r compiler_index < "\$compiler_state" || compiler_index=0
+    compiler_slots="\$compiler_state.slots"
+    if ! mkdir -p "\$compiler_slots"; then
+        echo "ERROR: distributed compiler slot directory could not be created" >&2
+        exit 1
     fi
-    case "\$compiler_index" in
-        ''|*[!0-9]*) compiler_index=0 ;;
-    esac
-    printf '%s\n' "\$((compiler_index + 1))" > "\$compiler_state"
-    compiler_lock_cleanup
-    trap - EXIT HUP INT TERM
-    compiler_host="\${compiler_hosts[\$((compiler_index % \${#compiler_hosts[@]}))]}"
+    compiler_host=""
+    compiler_slot=""
+    while [ -z "\$compiler_slot" ]; do
+        while ! mkdir "\$compiler_lock" 2>/dev/null; do
+            :
+        done
+        trap compiler_lock_cleanup EXIT HUP INT TERM
+        compiler_index=0
+        if [ -s "\$compiler_state" ]; then
+            read -r compiler_index < "\$compiler_state" || compiler_index=0
+        fi
+        case "\$compiler_index" in
+            ''|*[!0-9]*) compiler_index=0 ;;
+        esac
+        for ((compiler_offset = 0; compiler_offset < \${#compiler_hosts[@]}; compiler_offset++)); do
+            compiler_candidate_index="\$(((compiler_index + compiler_offset) % \${#compiler_hosts[@]}))"
+            compiler_host_slots="\$compiler_slots/\$compiler_candidate_index"
+            if ! mkdir -p "\$compiler_host_slots"; then
+                echo "ERROR: distributed compiler host slot directory could not be created" >&2
+                exit 1
+            fi
+            for ((compiler_slot_index = 0; compiler_slot_index < compiler_jobs_per_host; compiler_slot_index++)); do
+                compiler_candidate_slot="\$compiler_host_slots/\$compiler_slot_index"
+                if mkdir "\$compiler_candidate_slot" 2>/dev/null; then
+                    compiler_host="\${compiler_hosts[\$compiler_candidate_index]}"
+                    compiler_slot="\$compiler_candidate_slot"
+                    printf '%s\n' "\$((compiler_candidate_index + 1))" > "\$compiler_state"
+                    break 2
+                fi
+            done
+        done
+        compiler_lock_cleanup
+        trap - EXIT HUP INT TERM
+        if [ -z "\$compiler_slot" ]; then
+            sleep 0.01
+        fi
+    done
+    compiler_slot_cleanup() {
+        rmdir "\$compiler_slot" 2>/dev/null || true
+    }
+    trap compiler_slot_cleanup EXIT HUP INT TERM
     if on "\$compiler_host" "\${compiler[@]}" "\$@"; then
         exit 0
     else
@@ -166,6 +215,8 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
     if [ "\$compiler_status" -ne 127 ]; then
         exit "\$compiler_status"
     fi
+    compiler_slot_cleanup
+    trap - EXIT HUP INT TERM
     echo "warning: distributed compiler placement on \$compiler_host was unavailable; retrying locally" >&2
 fi
 if "\${compiler[@]}" "\$@"; then

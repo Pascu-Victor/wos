@@ -122,11 +122,17 @@ def test_wos_bootstrap_distributes_only_compiler_processes() -> None:
             'compiler=("$system_clang" -resource-dir "$resource_dir")',
             r'if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; then',
             r'IFS=, read -r -a compiler_hosts <<< "\${WOS_DISTRIBUTED_COMPILER_HOSTS:-}"',
+            r'compiler_jobs_per_host="\${WOS_DISTRIBUTED_COMPILER_JOBS_PER_HOST:-}"',
+            r'compiler_total_jobs="\${WOS_NINJA_JOBS:-\${WOS_BUILD_JOBS:-}}"',
+            r'compiler_jobs_per_host="\$(((compiler_total_jobs + \${#compiler_hosts[@]} - 1) / \${#compiler_hosts[@]}))"',
             r'while ! mkdir "\$compiler_lock" 2>/dev/null; do',
-            r'''printf '%s\n' "\$((compiler_index + 1))" > "\$compiler_state"''',
-            r'compiler_host="\${compiler_hosts[\$((compiler_index % \${#compiler_hosts[@]}))]}"',
+            r'compiler_candidate_slot="\$compiler_host_slots/\$compiler_slot_index"',
+            r'if mkdir "\$compiler_candidate_slot" 2>/dev/null; then',
+            r'compiler_host="\${compiler_hosts[\$compiler_candidate_index]}"',
+            r'compiler_slot_cleanup() {',
             r'if on "\$compiler_host" "\${compiler[@]}" "\$@"; then',
             r'if [ "\$compiler_status" -ne 127 ]; then',
+            r'compiler_slot_cleanup',
             r"warning: distributed compiler placement on \$compiler_host was unavailable; retrying locally",
             r'if "\${compiler[@]}" "\$@"; then',
             r'[ "\$link_output" -eq 1 ]',
@@ -162,6 +168,68 @@ test ! -x "$1/object-output"
         )
         if result.returncode != 0:
             fail(f"WOS compiler shim output-mode test failed: {result.stderr}")
+
+
+def test_wos_bootstrap_caps_concurrent_compilers_per_host() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        mock_on = Path(temp_dir) / "on"
+        mock_on.write_text(
+            r'''#!/bin/bash
+set -u
+host="$1"
+state="${MOCK_ON_STATE:?}"
+lock="$state.lock"
+while ! mkdir "$lock" 2>/dev/null; do :; done
+active_file="$state.active.$host"
+max_file="$state.max.$host"
+active=0
+maximum=0
+if [ -s "$active_file" ]; then read -r active < "$active_file" || active=0; fi
+if [ -s "$max_file" ]; then read -r maximum < "$max_file" || maximum=0; fi
+active=$((active + 1))
+printf '%s\n' "$active" > "$active_file"
+if [ "$active" -gt "$maximum" ]; then printf '%s\n' "$active" > "$max_file"; fi
+rmdir "$lock"
+cleanup() {
+    while ! mkdir "$lock" 2>/dev/null; do :; done
+    active=0
+    if [ -s "$active_file" ]; then read -r active < "$active_file" || active=0; fi
+    printf '%s\n' "$((active - 1))" > "$active_file"
+    rmdir "$lock"
+}
+trap cleanup EXIT
+sleep 0.1
+exit 0
+''',
+            encoding="ascii",
+        )
+        mock_on.chmod(0o755)
+        script = r'''
+set -euo pipefail
+WOS_TARGET_ARCH=x86_64-pc-wos
+source <(sed -n '/^write_clang_wrapper()/,/^}/p' tools/bootstrap.sh)
+write_clang_wrapper "$1/clang" /usr/bin/true /tmp
+for index in 0 1 2 3 4 5 6 7; do
+    PATH="$1:$PATH" MOCK_ON_STATE="$1/mock-on" \
+        WOS_DISTRIBUTED_COMPILER=1 \
+        WOS_DISTRIBUTED_COMPILER_HOSTS=wos-0,wos-1 \
+        WOS_DISTRIBUTED_COMPILER_STATE="$1/compiler-state" \
+        WOS_NINJA_JOBS=4 \
+        "$1/clang" -c -o "$1/object-$index" input.c &
+done
+wait
+test "$(cat "$1/mock-on.max.wos-0")" -eq 2
+test "$(cat "$1/mock-on.max.wos-1")" -eq 2
+'''
+        result = subprocess.run(
+            ["bash", "-c", script, "wos-bootstrap-cap-test", temp_dir],
+            cwd=ROOT,
+            check=False,
+            text=True,
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            fail(f"WOS compiler shim per-host cap test failed: {result.stderr}")
 
 
 def test_distributed_compiler_hosts_are_validated_before_launch() -> None:
@@ -1577,6 +1645,7 @@ if __name__ == "__main__":
     test_selfhost_runner_covers_acceptance_flow()
     test_wos_bootstrap_distributes_only_compiler_processes()
     test_wos_bootstrap_repairs_only_link_output_mode()
+    test_wos_bootstrap_caps_concurrent_compilers_per_host()
     test_distributed_compiler_hosts_are_validated_before_launch()
     test_selfhost_repeatability_runner_preserves_acceptance_evidence()
     test_linux_selfhost_baseline_preserves_full_process_evidence()
