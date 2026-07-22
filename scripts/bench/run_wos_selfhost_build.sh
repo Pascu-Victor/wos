@@ -824,10 +824,6 @@ require_any() {
 
 run_with_jobs_env() {
     if [ "$mode" = "wos" ] && [ "$distributed" = "1" ]; then
-        # Remote source-mode clang spends most of its lifetime walking headers
-        # through the submitter's VFS proxy. Preprocess on the submitter and
-        # forward one contiguous input so every listed node can sustain its
-        # equal share of compiler jobs without serializing on metadata I/O.
         WOS_BUILD_JOBS="$jobs" \
             WOS_NINJA_JOBS="$jobs" \
             WOS_MAKE_JOBS="$jobs" \
@@ -835,7 +831,7 @@ run_with_jobs_env() {
             WOS_DISTRIBUTED_COMPILER=1 \
             WOS_DISTRIBUTED_COMPILER_HOSTS="$distributed_hosts" \
             WOS_DISTRIBUTED_COMPILER_STATE="$distributed_compiler_state" \
-            WOS_DISTRIBUTED_COMPILER_TRANSPORT=rewritten \
+            WOS_DISTRIBUTED_COMPILER_TRANSPORT=source \
             WOS_DISTRIBUTED_COMPILER_JOBS_PER_HOST="$distributed_jobs_per_host" \
             "$@"
     else

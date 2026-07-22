@@ -55,7 +55,7 @@ def test_selfhost_runner_covers_acceptance_flow() -> None:
             'WOS_DISTRIBUTED_COMPILER_HOSTS="$distributed_hosts"',
             'distributed_compiler_state="$workdir/tmp/distributed-compiler"',
             'WOS_DISTRIBUTED_COMPILER_STATE="$distributed_compiler_state"',
-            "WOS_DISTRIBUTED_COMPILER_TRANSPORT=rewritten",
+            "WOS_DISTRIBUTED_COMPILER_TRANSPORT=source",
             'WOS_DISTRIBUTED_COMPILER_JOBS_PER_HOST="$distributed_jobs_per_host"',
             'distributed_jobs_per_host="$(((jobs + ${#distributed_host_list[@]} - 1) / ${#distributed_host_list[@]}))"',
             'WOS_SELFHOST_DISTRIBUTED_JOBS_PER_HOST=$(shell_quote "$distributed_jobs_per_host")',
@@ -1190,7 +1190,7 @@ def test_distributed_selfhost_cluster_balances_cpu_and_memory() -> None:
     controller_memory_mib = 0
     for zone in node_zones:
         overrides = zone.get("nodes_config", [])
-        if overrides != [{"id": 0, "vm": {"memory": "49152M", "cpus": 8}}]:
+        if overrides != [{"id": 0, "vm": {"memory": "49152M", "cpus": 12}}]:
             fail("distributed self-host controller must provide 8 CPUs and 48 GiB")
         controller_memory_mib = int(overrides[0]["vm"]["memory"].removesuffix("M"))
 
