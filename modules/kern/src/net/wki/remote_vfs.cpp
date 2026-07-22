@@ -910,9 +910,8 @@ auto acquire_vfs_proxy_lane(ProxyVfsState* anchor, bool prefer_rdma_read_anchor 
     if (anchor->lane_anchor && anchor->lanes_ready && anchor->active && !anchor->destroy_when_idle && !anchor->resources_releasing &&
         !anchor->resources_released && anchor->lane_count > 0 && anchor->lane_count <= anchor->lanes.size()) {
         std::array<ProxyVfsState*, VFS_PROXY_LANE_COUNT> live_lanes{};
-        std::array<ProxyVfsState*, VFS_PROXY_RDMA_LANE_COUNT> rdma_lanes{};
+        std::array<bool, VFS_PROXY_LANE_COUNT> live_lane_has_requested_rdma{};
         size_t live_lane_count = 0;
-        size_t rdma_lane_count = 0;
         bool const PREFER_RDMA = prefer_rdma_read_anchor || prefer_rdma_write_anchor;
         uint64_t const NOW_US = PREFER_RDMA ? wki_now_us() : 0;
 
@@ -926,25 +925,50 @@ auto acquire_vfs_proxy_lane(ProxyVfsState* anchor, bool prefer_rdma_read_anchor 
                 candidate->lane_index != lane_index) {
                 continue;
             }
-            live_lanes.at(live_lane_count++) = candidate;
-
             bool const HAS_REQUESTED_RDMA =
                 PREFER_RDMA && vfs_proxy_lane_has_requested_rdma(candidate, prefer_rdma_read_anchor, prefer_rdma_write_anchor, NOW_US);
-            if (PREFER_RDMA && HAS_REQUESTED_RDMA && rdma_lane_count < rdma_lanes.size()) {
-                rdma_lanes.at(rdma_lane_count++) = candidate;
-            }
+            live_lanes.at(live_lane_count) = candidate;
+            live_lane_has_requested_rdma.at(live_lane_count) = HAS_REQUESTED_RDMA;
+            live_lane_count++;
         }
 
-        if (PREFER_RDMA && rdma_lane_count > 0) {
-            auto const INDEX = static_cast<size_t>(anchor->lane_selection_cursor++ % rdma_lane_count);
-            selected = rdma_lanes.at(INDEX);
-        } else if (live_lane_count > 0) {
-            // Allocation failure and transport cooldown preserve a usable,
-            // evenly striped message path instead of failing the open. A
-            // round-robin cursor avoids the low-bit aliasing of stride-sized
-            // process IDs onto only a subset of power-of-two lane counts.
-            auto const INDEX = static_cast<size_t>(anchor->lane_selection_cursor++ % live_lane_count);
-            selected = live_lanes.at(INDEX);
+        if (live_lane_count > 0) {
+            // Prefer an idle lane first, then the fewest in-flight selections
+            // and pinned remote FDs. lifecycle_refs is incremented by this
+            // function while still holding s_vfs_lock, so it also closes the
+            // handoff window before an open records its durable reference.
+            // RDMA is only the final tie-breaker: a mount where registration
+            // succeeded on two of eight lanes must not queue every compiler
+            // behind those two stop-and-wait bindings. Cursor order keeps
+            // equal-pressure selections evenly striped.
+            auto const START = static_cast<size_t>(anchor->lane_selection_cursor++ % live_lane_count);
+            bool selected_busy = true;
+            uint32_t selected_lifecycle_refs = UINT32_MAX;
+            uint32_t selected_open_refs = UINT32_MAX;
+            bool selected_has_requested_rdma = false;
+            for (size_t offset = 0; offset < live_lane_count; ++offset) {
+                size_t const INDEX = (START + offset) % live_lane_count;
+                auto* candidate = live_lanes.at(INDEX);
+                bool const BUSY = candidate->op_pending.load(std::memory_order_acquire) ||
+                                  candidate->op_untracked_send_pending.load(std::memory_order_acquire);
+                uint32_t const LIFECYCLE_REFS = candidate->lifecycle_refs;
+                uint32_t const OPEN_REFS = candidate->open_file_refs.load(std::memory_order_acquire);
+                bool const HAS_REQUESTED_RDMA = live_lane_has_requested_rdma.at(INDEX);
+                bool const LOWER_PRESSURE =
+                    selected == nullptr || (selected_busy && !BUSY) ||
+                    (selected_busy == BUSY && LIFECYCLE_REFS < selected_lifecycle_refs) ||
+                    (selected_busy == BUSY && LIFECYCLE_REFS == selected_lifecycle_refs && OPEN_REFS < selected_open_refs) ||
+                    (selected_busy == BUSY && LIFECYCLE_REFS == selected_lifecycle_refs && OPEN_REFS == selected_open_refs &&
+                     HAS_REQUESTED_RDMA && !selected_has_requested_rdma);
+                if (!LOWER_PRESSURE) {
+                    continue;
+                }
+                selected = candidate;
+                selected_busy = BUSY;
+                selected_lifecycle_refs = LIFECYCLE_REFS;
+                selected_open_refs = OPEN_REFS;
+                selected_has_requested_rdma = HAS_REQUESTED_RDMA;
+            }
         }
         if (selected != nullptr) {
             selected->lifecycle_refs++;
@@ -4187,6 +4211,54 @@ auto wki_remote_vfs_selftest_lane_round_robin_uses_full_capacity() -> bool {
         }
     }
     return anchor.lane_selection_cursor == VFS_PROXY_LANE_COUNT;
+}
+
+auto wki_remote_vfs_selftest_lane_pressure_precedes_rdma() -> bool {
+    WkiTransport transport{};
+    transport.name = "wki-roce";
+
+    ProxyVfsState anchor{};
+    ProxyVfsState rdma_lane{};
+    anchor.active = true;
+    anchor.lane_anchor = true;
+    anchor.lanes_ready = true;
+    anchor.mount_group_id = 1;
+    anchor.lane_index = 0;
+    anchor.lanes.at(0) = &anchor;
+    anchor.lanes.at(1) = &rdma_lane;
+    anchor.lane_count = 2;
+    rdma_lane.active = true;
+    rdma_lane.mount_group_id = 1;
+    rdma_lane.lane_index = 1;
+    rdma_lane.rdma_transport = &transport;
+    rdma_lane.rdma_capable = true;
+
+    rdma_lane.op_pending.store(true, std::memory_order_release);
+    ProxyVfsState* selected = acquire_vfs_proxy_lane(&anchor, true, false);
+    if (selected != &anchor || anchor.lifecycle_refs != 1 || rdma_lane.lifecycle_refs != 0) {
+        return false;
+    }
+
+    rdma_lane.op_pending.store(false, std::memory_order_release);
+    anchor.op_pending.store(true, std::memory_order_release);
+    selected = acquire_vfs_proxy_lane(&anchor, true, false);
+    if (selected != &rdma_lane || anchor.lifecycle_refs != 1 || rdma_lane.lifecycle_refs != 1) {
+        return false;
+    }
+
+    anchor.op_pending.store(false, std::memory_order_release);
+    anchor.lifecycle_refs = 0;
+    rdma_lane.lifecycle_refs = 1;
+    selected = acquire_vfs_proxy_lane(&anchor, true, false);
+    if (selected != &anchor || anchor.lifecycle_refs != 1 || rdma_lane.lifecycle_refs != 1) {
+        return false;
+    }
+
+    anchor.lifecycle_refs = 0;
+    rdma_lane.lifecycle_refs = 0;
+    rdma_lane.open_file_refs.store(1, std::memory_order_release);
+    selected = acquire_vfs_proxy_lane(&anchor, true, false);
+    return selected == &anchor && anchor.lifecycle_refs == 1 && rdma_lane.lifecycle_refs == 0;
 }
 
 auto wki_remote_vfs_selftest_slot_waiter_fifo() -> bool {

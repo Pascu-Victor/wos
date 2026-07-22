@@ -960,19 +960,19 @@ def test_wos_port_install_steps_keep_make_parallelism() -> None:
             fail(f"{script.relative_to(ROOT)} must use wos_make or host_env make with WOS_MAKE_JOBS")
 
 
-def test_native_wos_libressl_build_avoids_zero_length_parallel_objects() -> None:
+def test_native_wos_libressl_parallelism_requires_distributed_compiler() -> None:
     source = WOS_TLS_BUILD.read_text()
     require_tokens(
         source,
         [
             'if [ -z "${WOS_TLS_BUILD_JOBS:-}" ]; then',
             'WOS_TLS_BUILD_JOBS="$WOS_MAKE_JOBS"',
-            'if [ "$HOST_SYSTEM" = "WOS" ]; then',
+            'if [ "$HOST_SYSTEM" = "WOS" ] && [ "${WOS_DISTRIBUTED_COMPILER:-0}" != "1" ]; then',
             "WOS_TLS_BUILD_JOBS=1",
             "WOS_TLS_BUILD_JOBS must be a positive integer",
             'wos_make "$WOS_TLS_BUILD_JOBS" -C "$TLS_WORK"',
         ],
-        "native WOS LibreSSL serialization",
+        "native WOS LibreSSL distributed parallelism",
     )
 
 
@@ -2801,6 +2801,7 @@ if __name__ == "__main__":
     test_host_toolchain_install_uses_ninja_jobs()
     test_optional_host_clang_tidy_cache_failure_does_not_abort_bootstrap()
     test_wos_port_install_steps_keep_make_parallelism()
+    test_native_wos_libressl_parallelism_requires_distributed_compiler()
     test_wos_tar_invocations_use_busybox_compatible_long_options()
     test_wos_source_copy_wrappers_avoid_busybox_tar_pipelines()
     test_gnu_make_script_passes_build_triplet_on_wos()

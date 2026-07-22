@@ -23,10 +23,11 @@ TARGET_SYSROOT="${WOS_SYSROOT_PATH:-$B/sysroot}"
 HOST_SYSTEM="$(uname -s 2>/dev/null || printf unknown)"
 if [ -z "${WOS_TLS_BUILD_JOBS:-}" ]; then
     WOS_TLS_BUILD_JOBS="$WOS_MAKE_JOBS"
-    # Native WOS can occasionally acknowledge a concurrent compiler output
-    # write while leaving a zero-length object behind.  LibreSSL's build then
-    # archives that object and fails much later with missing SSL symbols.
-    if [ "$HOST_SYSTEM" = "WOS" ]; then
+    # Keep the conservative single-node fallback for native WOS. Distributed
+    # compilation has independent, bounded output lanes and must retain normal
+    # make parallelism so its worker nodes receive more than one object at a
+    # time. The repeatability gate verifies every produced archive and binary.
+    if [ "$HOST_SYSTEM" = "WOS" ] && [ "${WOS_DISTRIBUTED_COMPILER:-0}" != "1" ]; then
         WOS_TLS_BUILD_JOBS=1
     fi
 fi

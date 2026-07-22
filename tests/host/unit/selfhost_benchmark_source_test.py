@@ -139,7 +139,11 @@ def test_wos_bootstrap_distributes_only_compiler_processes() -> None:
             r"source|preprocessed|rewritten)",
             r'compiler_jobs_per_host="\$(((compiler_total_jobs + \${#compiler_hosts[@]} - 1) / \${#compiler_hosts[@]}))"',
             r'compiler_slots="\$compiler_state.source-slots"',
-            r'compiler_start_index="\$((\$\$ % \${#compiler_hosts[@]}))"',
+            r'compiler_lock="\$compiler_state.source-lock"',
+            r'compiler_next="\$compiler_state.source-next"',
+            r'read -r compiler_start_index < "\$compiler_next" || compiler_start_index=0',
+            r'compiler_start_index="\$((compiler_start_index % \${#compiler_hosts[@]}))"',
+            r'''printf '%s\n' "\$(((compiler_candidate_index + 1) % \${#compiler_hosts[@]}))" > "\$compiler_next"''',
             r'on "\$compiler_host" "\${compiler[@]}" -fno-temp-file "@\$compiler_response"',
             r'compiler_jobs_per_host="\${WOS_DISTRIBUTED_COMPILER_JOBS_PER_HOST:-}"',
             r'compiler_local_jobs="\${WOS_DISTRIBUTED_COMPILER_LOCAL_JOBS:-\$compiler_jobs_per_host}"',
@@ -193,6 +197,8 @@ def test_wos_bootstrap_distributes_only_compiler_processes() -> None:
         ],
         "WOS native compiler-only distribution",
     )
+    if r'compiler_start_index="\$((\$\$ % \${#compiler_hosts[@]}))"' in source:
+        fail("source-mode distributed compiler selection must not alias host choice to process-ID stride")
 
 
 def test_wos_bootstrap_repairs_only_link_output_mode() -> None:

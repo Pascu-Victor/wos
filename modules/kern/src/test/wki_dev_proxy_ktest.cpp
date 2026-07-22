@@ -80,3 +80,7 @@ KTEST(WkiRemoteVfsLanes, MultiRdmaSelectionRequiresRequestedDirections) {
 KTEST(WkiRemoteVfsLanes, RoundRobinUsesFullCapacity) {
     KEXPECT_TRUE(ker::net::wki::wki_remote_vfs_selftest_lane_round_robin_uses_full_capacity());
 }
+
+KTEST(WkiRemoteVfsLanes, PressurePrecedesRdmaPreference) {
+    KEXPECT_TRUE(ker::net::wki::wki_remote_vfs_selftest_lane_pressure_precedes_rdma());
+}

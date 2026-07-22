@@ -180,6 +180,8 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
                 ;;
         esac
         compiler_slots="\$compiler_state.source-slots"
+        compiler_lock="\$compiler_state.source-lock"
+        compiler_next="\$compiler_state.source-next"
         compiler_successes="\$compiler_state.successes"
         if ! mkdir -p "\$compiler_slots" "\$compiler_successes"; then
             echo "ERROR: distributed compiler state directories could not be created" >&2
@@ -194,8 +196,22 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
         }
         compiler_host=""
         compiler_slot=""
-        compiler_start_index="\$((\$\$ % \${#compiler_hosts[@]}))"
+        compiler_lock_cleanup() {
+            rmdir "\$compiler_lock" 2>/dev/null || true
+        }
         while [ -z "\$compiler_slot" ]; do
+            while ! mkdir "\$compiler_lock" 2>/dev/null; do
+                sleep 0
+            done
+            trap compiler_lock_cleanup EXIT HUP INT TERM
+            compiler_start_index=0
+            if [ -s "\$compiler_next" ]; then
+                read -r compiler_start_index < "\$compiler_next" || compiler_start_index=0
+            fi
+            case "\$compiler_start_index" in
+                ''|*[!0-9]*) compiler_start_index=0 ;;
+            esac
+            compiler_start_index="\$((compiler_start_index % \${#compiler_hosts[@]}))"
             for ((compiler_offset = 0; compiler_offset < \${#compiler_hosts[@]}; compiler_offset++)); do
                 compiler_candidate_index="\$(((compiler_start_index + compiler_offset) % \${#compiler_hosts[@]}))"
                 compiler_host_slots="\$compiler_slots/\$compiler_candidate_index"
@@ -212,11 +228,16 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
                     if mkdir "\$compiler_candidate_slot" 2>/dev/null; then
                         compiler_host="\${compiler_hosts[\$compiler_candidate_index]}"
                         compiler_slot="\$compiler_candidate_slot"
+                        printf '%s\n' "\$(((compiler_candidate_index + 1) % \${#compiler_hosts[@]}))" > "\$compiler_next"
                         break 2
                     fi
                 done
             done
-            sleep 0
+            compiler_lock_cleanup
+            trap - EXIT HUP INT TERM
+            if [ -z "\$compiler_slot" ]; then
+                sleep 0
+            fi
         done
         compiler_slot_release() {
             rmdir "\$compiler_slot" 2>/dev/null || true
