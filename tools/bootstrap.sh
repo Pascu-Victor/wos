@@ -139,6 +139,122 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
         echo "ERROR: distributed compiler state path is missing" >&2
         exit 1
     fi
+    compiler_transport="\${WOS_DISTRIBUTED_COMPILER_TRANSPORT:-source}"
+    case "\$compiler_transport" in
+        source|preprocessed)
+            ;;
+        *)
+            echo "ERROR: distributed compiler transport must be 'source' or 'preprocessed'" >&2
+            exit 1
+            ;;
+    esac
+    if [ "\$compiler_transport" = source ]; then
+        compiler_total_jobs="\${WOS_NINJA_JOBS:-\${WOS_BUILD_JOBS:-}}"
+        case "\$compiler_total_jobs" in
+            ''|*[!0-9]*|0)
+                compiler_total_jobs=32
+                ;;
+        esac
+        compiler_jobs_per_host="\${WOS_DISTRIBUTED_COMPILER_JOBS_PER_HOST:-}"
+        if [ -z "\$compiler_jobs_per_host" ]; then
+            compiler_jobs_per_host="\$(((compiler_total_jobs + \${#compiler_hosts[@]} - 1) / \${#compiler_hosts[@]}))"
+        fi
+        case "\$compiler_jobs_per_host" in
+            ''|*[!0-9]*|0)
+                echo "ERROR: distributed compiler jobs per host must be a positive integer" >&2
+                exit 1
+                ;;
+        esac
+        compiler_slots="\$compiler_state.source-slots"
+        compiler_successes="\$compiler_state.successes"
+        if ! mkdir -p "\$compiler_slots" "\$compiler_successes"; then
+            echo "ERROR: distributed compiler state directories could not be created" >&2
+            exit 1
+        fi
+        compiler_record_success() {
+            local success_index="\$1"
+            local success_host="\$2"
+            if ! printf '%s\n' "\$success_host" > "\$compiler_successes/\$success_index"; then
+                echo "warning: distributed compiler could not record successful host \$success_host" >&2
+            fi
+        }
+        compiler_host=""
+        compiler_slot=""
+        compiler_start_index="\$((\$\$ % \${#compiler_hosts[@]}))"
+        while [ -z "\$compiler_slot" ]; do
+            for ((compiler_offset = 0; compiler_offset < \${#compiler_hosts[@]}; compiler_offset++)); do
+                compiler_candidate_index="\$(((compiler_start_index + compiler_offset) % \${#compiler_hosts[@]}))"
+                compiler_host_slots="\$compiler_slots/\$compiler_candidate_index"
+                if ! mkdir -p "\$compiler_host_slots"; then
+                    echo "ERROR: distributed compiler host slot directory could not be created" >&2
+                    exit 1
+                fi
+                for ((compiler_slot_index = 0; compiler_slot_index < compiler_jobs_per_host; compiler_slot_index++)); do
+                    compiler_candidate_slot="\$compiler_host_slots/\$compiler_slot_index"
+                    if mkdir "\$compiler_candidate_slot" 2>/dev/null; then
+                        compiler_host="\${compiler_hosts[\$compiler_candidate_index]}"
+                        compiler_slot="\$compiler_candidate_slot"
+                        break 2
+                    fi
+                done
+            done
+            sleep 0
+        done
+        compiler_slot_release() {
+            rmdir "\$compiler_slot" 2>/dev/null || true
+        }
+        trap compiler_slot_release EXIT HUP INT TERM
+        if [ "\$compiler_candidate_index" -eq 0 ]; then
+            if "\${compiler[@]}" "\$@"; then
+                compiler_status=0
+                compiler_record_success 0 "\${compiler_hosts[0]}"
+            else
+                compiler_status=\$?
+            fi
+            compiler_slot_release
+            trap - EXIT HUP INT TERM
+            exit "\$compiler_status"
+        fi
+        compiler_responses="\$compiler_state.responses"
+        if ! mkdir -p "\$compiler_responses"; then
+            echo "ERROR: distributed compiler response directory could not be created" >&2
+            exit 1
+        fi
+        compiler_response="\$(mktemp "\$compiler_responses/clang.XXXXXX")"
+        if [ -z "\$compiler_response" ]; then
+            echo "ERROR: distributed compiler response file could not be created" >&2
+            exit 1
+        fi
+        # Keep response files until the scratch workdir is removed. Concurrent
+        # forwarded unlink operations can leave peers with stale lookups.
+        for arg in "\$@"; do
+            if ! printf '%q\n' "\$arg" >> "\$compiler_response"; then
+                echo "ERROR: distributed compiler response file could not be written" >&2
+                exit 1
+            fi
+        done
+        compiler_remote_path="\${PATH:-/usr/bin:/bin}"
+        if env -i PATH="\$compiler_remote_path" HOME="\${HOME:-/root}" TMPDIR="\${TMPDIR:-/tmp}" TZ=UTC0 \
+            on "\$compiler_host" "\${compiler[@]}" -fno-temp-file "@\$compiler_response"; then
+            compiler_status=0
+        else
+            compiler_status=\$?
+        fi
+        compiler_slot_release
+        trap - EXIT HUP INT TERM
+        if [ "\$compiler_status" -eq 0 ]; then
+            compiler_record_success "\$compiler_candidate_index" "\$compiler_host"
+            exit 0
+        fi
+        echo "warning: distributed compiler on \$compiler_host failed with status \$compiler_status; retrying locally" >&2
+        if "\${compiler[@]}" "\$@"; then
+            compiler_status=0
+            compiler_record_success 0 "\${compiler_hosts[0]}"
+        else
+            compiler_status=\$?
+        fi
+        exit "\$compiler_status"
+    fi
     compiler_total_jobs="\${WOS_NINJA_JOBS:-\${WOS_BUILD_JOBS:-}}"
     case "\$compiler_total_jobs" in
         ''|*[!0-9]*|0)
@@ -149,9 +265,9 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
             ;;
     esac
     # The self-host runner validates that compiler_hosts[0] is the submitter.
-    # Keep its full Ninja width available while bounding each slower remote-VFS
-    # path to one successful compile per run unless the caller explicitly
-    # overrides the reusable per-host concurrency limit.
+    # Keep the full Ninja width available locally: Ninja already bounds the
+    # process count, and shrinking local slots after peer slots become
+    # persistent would leave wrappers spinning while usable CPUs sit idle.
     compiler_jobs_per_host="\${WOS_DISTRIBUTED_COMPILER_JOBS_PER_HOST:-}"
     case "\$compiler_jobs_per_host" in
         '')
@@ -174,7 +290,10 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
             exit 1
             ;;
     esac
-    compiler_min_preprocessed_bytes="\${WOS_DISTRIBUTED_COMPILER_MIN_PREPROCESSED_BYTES:-1048576}"
+    # Default to dispatching the bounded peer job immediately. Deferring small
+    # inputs would preprocess three out of every four jobs locally until a
+    # large source happened to occupy each persistent peer slot.
+    compiler_min_preprocessed_bytes="\${WOS_DISTRIBUTED_COMPILER_MIN_PREPROCESSED_BYTES:-0}"
     case "\$compiler_min_preprocessed_bytes" in
         ''|*[!0-9]*)
             echo "ERROR: distributed compiler minimum preprocessed size must be a non-negative integer" >&2
@@ -238,23 +357,137 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
         esac
     fi
     if [ -n "\$compiler_preprocessed_language" ]; then
-        compiler_responses="\$compiler_state.responses"
-        if ! mkdir -p "\$compiler_responses"; then
-            echo "ERROR: distributed compiler response directory could not be created" >&2
-            exit 1
-        fi
         compiler_lock="\$compiler_state.lock"
         compiler_lock_cleanup() {
             rmdir "\$compiler_lock" 2>/dev/null || true
         }
+        compiler_slots="\$compiler_state.slots"
+        if ! mkdir -p "\$compiler_slots"; then
+            echo "ERROR: distributed compiler slot directory could not be created" >&2
+            exit 1
+        fi
+        compiler_successes="\$compiler_state.successes"
+        compiler_record_success() {
+            local success_index="\$1"
+            local success_host="\$2"
+            if ! mkdir -p "\$compiler_successes" ||
+               ! printf '%s\n' "\$success_host" > "\$compiler_successes/\$success_index"; then
+                echo "warning: distributed compiler could not record successful host \$success_host" >&2
+            fi
+        }
+        compiler_host=""
+        compiler_slot=""
+        compiler_slot_persistent=0
+        if [ "\$compiler_persist_remote_slots" -eq 1 ]; then
+            # The default mode needs only one successful compile per peer. Use
+            # atomic directory creation to claim those jobs; local jobs must
+            # never queue behind the shared reusable-slot scheduler.
+            for ((compiler_candidate_index = 1; compiler_candidate_index < \${#compiler_hosts[@]}; compiler_candidate_index++)); do
+                compiler_host_slots="\$compiler_slots/\$compiler_candidate_index"
+                if ! mkdir -p "\$compiler_host_slots"; then
+                    echo "ERROR: distributed compiler host slot directory could not be created" >&2
+                    exit 1
+                fi
+                for ((compiler_slot_index = 0; compiler_slot_index < compiler_remote_jobs_per_host; compiler_slot_index++)); do
+                    compiler_candidate_slot="\$compiler_host_slots/\$compiler_slot_index"
+                    if mkdir "\$compiler_candidate_slot" 2>/dev/null; then
+                        compiler_host="\${compiler_hosts[\$compiler_candidate_index]}"
+                        compiler_slot="\$compiler_candidate_slot"
+                        compiler_slot_persistent=1
+                        break 2
+                    fi
+                done
+            done
+            if [ -z "\$compiler_slot" ]; then
+                if "\${compiler[@]}" "\$@"; then
+                    compiler_status=0
+                    compiler_record_success 0 "\${compiler_hosts[0]}"
+                else
+                    compiler_status=\$?
+                fi
+                exit "\$compiler_status"
+            fi
+        else
+            while [ -z "\$compiler_slot" ]; do
+                while ! mkdir "\$compiler_lock" 2>/dev/null; do
+                    :
+                done
+                trap compiler_lock_cleanup EXIT HUP INT TERM
+                compiler_index=0
+                if [ -s "\$compiler_state" ]; then
+                    read -r compiler_index < "\$compiler_state" || compiler_index=0
+                fi
+                case "\$compiler_index" in
+                    ''|*[!0-9]*) compiler_index=0 ;;
+                esac
+                for ((compiler_offset = 0; compiler_offset < \${#compiler_hosts[@]}; compiler_offset++)); do
+                    compiler_candidate_index="\$(((compiler_index + compiler_offset) % \${#compiler_hosts[@]}))"
+                    compiler_host_slots="\$compiler_slots/\$compiler_candidate_index"
+                    if ! mkdir -p "\$compiler_host_slots"; then
+                        echo "ERROR: distributed compiler host slot directory could not be created" >&2
+                        exit 1
+                    fi
+                    compiler_candidate_jobs="\$compiler_remote_jobs_per_host"
+                    if [ "\$compiler_candidate_index" -eq 0 ]; then
+                        compiler_candidate_jobs="\$compiler_local_jobs"
+                    fi
+                    for ((compiler_slot_index = 0; compiler_slot_index < compiler_candidate_jobs; compiler_slot_index++)); do
+                        compiler_candidate_slot="\$compiler_host_slots/\$compiler_slot_index"
+                        if mkdir "\$compiler_candidate_slot" 2>/dev/null; then
+                            compiler_host="\${compiler_hosts[\$compiler_candidate_index]}"
+                            compiler_slot="\$compiler_candidate_slot"
+                            printf '%s\n' "\$((compiler_candidate_index + 1))" > "\$compiler_state"
+                            break 2
+                        fi
+                    done
+                done
+                compiler_lock_cleanup
+                trap - EXIT HUP INT TERM
+                if [ -z "\$compiler_slot" ]; then
+                    sleep 0
+                fi
+            done
+        fi
+        compiler_slot_release() {
+            rmdir "\$compiler_slot" 2>/dev/null || true
+        }
+        compiler_slot_cleanup() {
+            if [ "\$compiler_slot_persistent" -eq 0 ]; then
+                compiler_slot_release
+            fi
+        }
+        if [ "\$compiler_candidate_index" -eq 0 ]; then
+            trap compiler_slot_release EXIT HUP INT TERM
+            if "\${compiler[@]}" "\$@"; then
+                compiler_status=0
+                compiler_record_success 0 "\${compiler_hosts[0]}"
+            else
+                compiler_status=\$?
+            fi
+            compiler_slot_release
+            trap - EXIT HUP INT TERM
+            exit "\$compiler_status"
+        fi
+        compiler_responses="\$compiler_state.responses"
+        if ! mkdir -p "\$compiler_responses"; then
+            compiler_slot_release
+            echo "ERROR: distributed compiler response directory could not be created" >&2
+            exit 1
+        fi
+        compiler_slot_and_lock_cleanup() {
+            compiler_lock_cleanup
+            compiler_slot_release
+        }
         while ! mkdir "\$compiler_lock" 2>/dev/null; do
             :
         done
-        trap compiler_lock_cleanup EXIT HUP INT TERM
+        trap compiler_slot_and_lock_cleanup EXIT HUP INT TERM
         compiler_job_dir="\$(mktemp -d "\$compiler_responses/clang-job.XXXXXX" || true)"
         compiler_lock_cleanup
-        trap - EXIT HUP INT TERM
+        trap compiler_slot_release EXIT HUP INT TERM
         if [ -z "\$compiler_job_dir" ] || [ ! -d "\$compiler_job_dir" ]; then
+            compiler_slot_release
+            trap - EXIT HUP INT TERM
             echo "ERROR: distributed compiler job directory could not be created" >&2
             exit 1
         fi
@@ -263,12 +496,16 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
             rm -f -- "\$compiler_input" 2>/dev/null || true
             rmdir "\$compiler_job_dir" 2>/dev/null || true
         }
-        trap compiler_input_cleanup EXIT HUP INT TERM
+        compiler_input_and_slot_cleanup() {
+            compiler_input_cleanup
+            compiler_slot_release
+        }
+        trap compiler_input_and_slot_cleanup EXIT HUP INT TERM
         if "\${compiler[@]}" "\$@" -E -o "\$compiler_input" -Wno-unused-command-line-argument; then
             compiler_status=0
         else
             compiler_status=\$?
-            compiler_input_cleanup
+            compiler_input_and_slot_cleanup
             trap - EXIT HUP INT TERM
             exit "\$compiler_status"
         fi
@@ -306,81 +543,20 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
         done
         compiler_forward_args+=(-x "\$compiler_preprocessed_language" -Wno-unused-command-line-argument "\$compiler_input")
         if [ "\$compiler_input_size" -lt "\$compiler_min_preprocessed_bytes" ]; then
-            if "\${compiler[@]}" "\${compiler_forward_args[@]}"; then
+            compiler_input_and_slot_cleanup
+            trap - EXIT HUP INT TERM
+            if "\${compiler[@]}" "\$@"; then
                 compiler_status=0
+                compiler_record_success 0 "\${compiler_hosts[0]}"
             else
                 compiler_status=\$?
             fi
-            compiler_input_cleanup
-            trap - EXIT HUP INT TERM
             exit "\$compiler_status"
         fi
-        compiler_lock_and_input_cleanup() {
-            compiler_lock_cleanup
-            compiler_input_cleanup
-        }
-        compiler_slots="\$compiler_state.slots"
-        if ! mkdir -p "\$compiler_slots"; then
-            echo "ERROR: distributed compiler slot directory could not be created" >&2
-            exit 1
-        fi
-        compiler_host=""
-        compiler_slot=""
-        compiler_slot_persistent=0
-        while [ -z "\$compiler_slot" ]; do
-            while ! mkdir "\$compiler_lock" 2>/dev/null; do
-                :
-            done
-            trap compiler_lock_and_input_cleanup EXIT HUP INT TERM
-            compiler_index=0
-            if [ -s "\$compiler_state" ]; then
-                read -r compiler_index < "\$compiler_state" || compiler_index=0
-            fi
-            case "\$compiler_index" in
-                ''|*[!0-9]*) compiler_index=0 ;;
-            esac
-            for ((compiler_offset = 0; compiler_offset < \${#compiler_hosts[@]}; compiler_offset++)); do
-                compiler_candidate_index="\$(((compiler_index + compiler_offset) % \${#compiler_hosts[@]}))"
-                compiler_host_slots="\$compiler_slots/\$compiler_candidate_index"
-                if ! mkdir -p "\$compiler_host_slots"; then
-                    echo "ERROR: distributed compiler host slot directory could not be created" >&2
-                    exit 1
-                fi
-                compiler_candidate_jobs="\$compiler_remote_jobs_per_host"
-                if [ "\$compiler_candidate_index" -eq 0 ]; then
-                    compiler_candidate_jobs="\$compiler_local_jobs"
-                fi
-                for ((compiler_slot_index = 0; compiler_slot_index < compiler_candidate_jobs; compiler_slot_index++)); do
-                    compiler_candidate_slot="\$compiler_host_slots/\$compiler_slot_index"
-                    if mkdir "\$compiler_candidate_slot" 2>/dev/null; then
-                        compiler_host="\${compiler_hosts[\$compiler_candidate_index]}"
-                        compiler_slot="\$compiler_candidate_slot"
-                        if [ "\$compiler_candidate_index" -ne 0 ] && [ "\$compiler_persist_remote_slots" -eq 1 ]; then
-                            compiler_slot_persistent=1
-                        fi
-                        printf '%s\n' "\$((compiler_candidate_index + 1))" > "\$compiler_state"
-                        break 2
-                    fi
-                done
-            done
-            compiler_lock_cleanup
-            trap compiler_input_cleanup EXIT HUP INT TERM
-            if [ -z "\$compiler_slot" ]; then
-                sleep 0
-            fi
-        done
-        compiler_slot_release() {
-            rmdir "\$compiler_slot" 2>/dev/null || true
-        }
-        compiler_slot_cleanup() {
-            if [ "\$compiler_slot_persistent" -eq 0 ]; then
-                compiler_slot_release
-            fi
-        }
         compiler_response="\$compiler_job_dir.response"
         if ! : > "\$compiler_response"; then
             compiler_input_cleanup
-            compiler_slot_cleanup
+            compiler_slot_release
             echo "ERROR: distributed compiler response file could not be created" >&2
             exit 1
         fi
@@ -408,11 +584,7 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
         fi
         compiler_input_cleanup
         if [ "\$compiler_status" -eq 0 ]; then
-            compiler_successes="\$compiler_state.successes"
-            if ! mkdir -p "\$compiler_successes" ||
-               ! printf '%s\n' "\$compiler_host" > "\$compiler_successes/\$compiler_candidate_index"; then
-                echo "warning: distributed compiler could not record successful host \$compiler_host" >&2
-            fi
+            compiler_record_success "\$compiler_candidate_index" "\$compiler_host"
             compiler_slot_cleanup
         else
             compiler_slot_release
@@ -422,6 +594,13 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
             exit 0
         fi
         echo "warning: distributed compiler on \$compiler_host failed with status \$compiler_status; retrying locally" >&2
+        if "\${compiler[@]}" "\$@"; then
+            compiler_status=0
+            compiler_record_success 0 "\${compiler_hosts[0]}"
+        else
+            compiler_status=\$?
+        fi
+        exit "\$compiler_status"
     fi
 fi
 if "\${compiler[@]}" "\$@"; then

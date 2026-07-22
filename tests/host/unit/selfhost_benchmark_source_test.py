@@ -53,7 +53,7 @@ def test_selfhost_runner_covers_acceptance_flow() -> None:
             'WOS_SELFHOST_DISTRIBUTED=$(shell_quote "$distributed")',
             "WOS_DISTRIBUTED_COMPILER=1",
             'WOS_DISTRIBUTED_COMPILER_HOSTS="$distributed_hosts"',
-            'distributed_compiler_state="$(mktemp -d /tmp/wos-distributed-compiler.XXXXXX)/state"',
+            'distributed_compiler_state="$workdir/tmp/distributed-compiler"',
             'WOS_DISTRIBUTED_COMPILER_STATE="$distributed_compiler_state"',
             '--distributed-hosts',
             'for routed_path in /root /usr /bin /lib /lib64 /libexec /share /etc /proc /dev /run /tmp; do',
@@ -125,6 +125,11 @@ def test_wos_bootstrap_distributes_only_compiler_processes() -> None:
             'compiler=("$system_clang" -resource-dir "$resource_dir")',
             r'if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; then',
             r'IFS=, read -r -a compiler_hosts <<< "\${WOS_DISTRIBUTED_COMPILER_HOSTS:-}"',
+            r'compiler_transport="\${WOS_DISTRIBUTED_COMPILER_TRANSPORT:-source}"',
+            r'compiler_jobs_per_host="\$(((compiler_total_jobs + \${#compiler_hosts[@]} - 1) / \${#compiler_hosts[@]}))"',
+            r'compiler_slots="\$compiler_state.source-slots"',
+            r'compiler_start_index="\$((\$\$ % \${#compiler_hosts[@]}))"',
+            r'on "\$compiler_host" "\${compiler[@]}" -fno-temp-file "@\$compiler_response"',
             r'compiler_jobs_per_host="\${WOS_DISTRIBUTED_COMPILER_JOBS_PER_HOST:-}"',
             r'compiler_total_jobs="\${WOS_NINJA_JOBS:-\${WOS_BUILD_JOBS:-}}"',
             r'compiler_local_jobs="\$compiler_total_jobs"',
@@ -133,7 +138,9 @@ def test_wos_bootstrap_distributes_only_compiler_processes() -> None:
             r'compiler_local_jobs="\$compiler_jobs_per_host"',
             r'compiler_remote_jobs_per_host="\$compiler_jobs_per_host"',
             r'compiler_persist_remote_slots=0',
-            r'compiler_min_preprocessed_bytes="\${WOS_DISTRIBUTED_COMPILER_MIN_PREPROCESSED_BYTES:-1048576}"',
+            r'if [ "\$compiler_persist_remote_slots" -eq 1 ]; then',
+            r'for ((compiler_candidate_index = 1; compiler_candidate_index < \${#compiler_hosts[@]}; compiler_candidate_index++)); do',
+            r'compiler_min_preprocessed_bytes="\${WOS_DISTRIBUTED_COMPILER_MIN_PREPROCESSED_BYTES:-0}"',
             r'compiler_preprocessed_language=cpp-output',
             r'compiler_preprocessed_language=c++-cpp-output',
             r'while ! mkdir "\$compiler_lock" 2>/dev/null; do',
@@ -143,16 +150,17 @@ def test_wos_bootstrap_distributes_only_compiler_processes() -> None:
             r'compiler_input_size="\$(stat -c %s -- "\$compiler_input" 2>/dev/null || true)"',
             r'compiler_forward_args+=(-x "\$compiler_preprocessed_language" -Wno-unused-command-line-argument "\$compiler_input")',
             r'if [ "\$compiler_input_size" -lt "\$compiler_min_preprocessed_bytes" ]; then',
-            r'"\${compiler[@]}" "\${compiler_forward_args[@]}"',
+            r'"\${compiler[@]}" "\$@"',
             r'compiler_candidate_slot="\$compiler_host_slots/\$compiler_slot_index"',
             r'compiler_candidate_jobs="\$compiler_remote_jobs_per_host"',
             r'compiler_candidate_jobs="\$compiler_local_jobs"',
             r'compiler_slot_persistent=1',
             r'compiler_successes="\$compiler_state.successes"',
-            r'''printf '%s\n' "\$compiler_host" > "\$compiler_successes/\$compiler_candidate_index"''',
+            r'''printf '%s\n' "\$success_host" > "\$compiler_successes/\$success_index"''',
             r'if mkdir "\$compiler_candidate_slot" 2>/dev/null; then',
             r'compiler_host="\${compiler_hosts[\$compiler_candidate_index]}"',
             r'compiler_slot_cleanup() {',
+            r'if [ "\$compiler_candidate_index" -eq 0 ]; then',
             r'compiler_response="\$compiler_job_dir.response"',
             r'''printf '%q\n' "\$arg" >> "\$compiler_response"''',
             r'for arg in "\${compiler_forward_args[@]}"; do',
@@ -264,15 +272,15 @@ for index in 0 1 2 3 4 5 6 7; do
         WOS_DISTRIBUTED_COMPILER=1 \
         WOS_DISTRIBUTED_COMPILER_HOSTS=wos-0,wos-1 \
         WOS_DISTRIBUTED_COMPILER_STATE="$1/compiler-state" \
+        WOS_DISTRIBUTED_COMPILER_JOBS_PER_HOST=1 \
         WOS_DISTRIBUTED_COMPILER_MIN_PREPROCESSED_BYTES=0 \
         WOS_NINJA_JOBS=4 \
         "$1/clang" -c -o "$1/object-$index" "$1/input.c" &
 done
 wait
-test "$(cat "$1/mock-on.max.wos-0")" -eq 4
+test ! -e "$1/mock-on.max.wos-0"
 test "$(cat "$1/mock-on.max.wos-1")" -eq 1
-test "$(cat "$1/mock-on.count.wos-0")" -eq 7
-test "$(cat "$1/mock-on.count.wos-1")" -eq 1
+test "$(cat "$1/mock-on.count.wos-1")" -ge 1
 test "$(cat "$1/compiler-state.successes/0")" = wos-0
 test "$(cat "$1/compiler-state.successes/1")" = wos-1
 '''
@@ -348,10 +356,13 @@ set -euo pipefail
 WOS_TARGET_ARCH=x86_64-pc-wos
 source <(sed -n '/^write_clang_wrapper()/,/^}/p' tools/bootstrap.sh)
 write_clang_wrapper "$1/clang" "$2" "$3"
+printf '1\n' > "$1/compiler-state"
 PATH="$1:$PATH" \
     WOS_DISTRIBUTED_COMPILER=1 \
     WOS_DISTRIBUTED_COMPILER_HOSTS=wos-0,wos-1 \
     WOS_DISTRIBUTED_COMPILER_STATE="$1/compiler-state" \
+    WOS_DISTRIBUTED_COMPILER_TRANSPORT=preprocessed \
+    WOS_DISTRIBUTED_COMPILER_JOBS_PER_HOST=1 \
     WOS_DISTRIBUTED_COMPILER_MIN_PREPROCESSED_BYTES=0 \
     WOS_NINJA_JOBS=1 \
     "$1/clang" -D'TEST_TEXT="quoted value"' -MD -MF "$1/dependencies with spaces.d" \
@@ -362,10 +373,13 @@ test -s "$1/dependencies with spaces.d"
 "$2" -resource-dir "$3" -D'TEST_TEXT="quoted value"' -c "$1/source with spaces.cpp" \
     -o "$1/direct object with spaces.o"
 cmp "$1/object with spaces.o" "$1/direct object with spaces.o"
+printf '1\n' > "$1/compiler-state"
 PATH="$1:$PATH" \
     WOS_DISTRIBUTED_COMPILER=1 \
     WOS_DISTRIBUTED_COMPILER_HOSTS=wos-0,wos-1 \
     WOS_DISTRIBUTED_COMPILER_STATE="$1/compiler-state" \
+    WOS_DISTRIBUTED_COMPILER_TRANSPORT=preprocessed \
+    WOS_DISTRIBUTED_COMPILER_JOBS_PER_HOST=1 \
     WOS_DISTRIBUTED_COMPILER_MIN_PREPROCESSED_BYTES=0 \
     WOS_NINJA_JOBS=1 \
     "$1/clang" -MD -MF "$1/c dependencies with spaces.d" -c "$1/source with spaces.c" \
@@ -418,6 +432,7 @@ PATH="$1:$PATH" \
     WOS_DISTRIBUTED_COMPILER=1 \
     WOS_DISTRIBUTED_COMPILER_HOSTS=wos-0,wos-1 \
     WOS_DISTRIBUTED_COMPILER_STATE="$1/compiler-state" \
+    WOS_DISTRIBUTED_COMPILER_TRANSPORT=preprocessed \
     WOS_DISTRIBUTED_COMPILER_MIN_PREPROCESSED_BYTES=999999999 \
     WOS_NINJA_JOBS=1 \
     "$1/clang" -MD -MF "$1/small.d" -c "$1/small.c" -o "$1/small.o"
@@ -444,6 +459,61 @@ cmp "$1/small.o" "$1/direct-small.o"
         )
         if result.returncode != 0:
             fail(f"WOS compiler shim small-input local test failed: {result.stderr}")
+
+
+def test_wos_bootstrap_compiles_submitter_jobs_once() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp = Path(temp_dir)
+        (temp / "input.c").write_text("int input;\n", encoding="ascii")
+        mock_compiler = temp / "system-clang"
+        mock_compiler.write_text(
+            r'''#!/bin/bash
+set -u
+count=0
+if [ -s "$WOS_COMPILER_COUNT" ]; then read -r count < "$WOS_COMPILER_COUNT" || count=0; fi
+printf '%s\n' "$((count + 1))" > "$WOS_COMPILER_COUNT"
+output=
+next_is_output=0
+for arg in "$@"; do
+    if [ "$next_is_output" -eq 1 ]; then output="$arg"; next_is_output=0; continue; fi
+    if [ "$arg" = -o ]; then next_is_output=1; fi
+done
+[ -n "$output" ] && printf 'object\n' > "$output"
+''',
+            encoding="ascii",
+        )
+        mock_compiler.chmod(0o755)
+        mock_on = temp / "on"
+        mock_on.write_text("#!/bin/bash\nexit 99\n", encoding="ascii")
+        mock_on.chmod(0o755)
+        script = r'''
+set -euo pipefail
+WOS_TARGET_ARCH=x86_64-pc-wos
+source <(sed -n '/^write_clang_wrapper()/,/^}/p' tools/bootstrap.sh)
+write_clang_wrapper "$1/clang" "$1/system-clang" /tmp
+mkdir -p "$1/compiler-state.slots/1/0"
+PATH="$1:$PATH" \
+    WOS_COMPILER_COUNT="$1/compiler-count" \
+    WOS_DISTRIBUTED_COMPILER=1 \
+    WOS_DISTRIBUTED_COMPILER_HOSTS=wos-0,wos-1 \
+    WOS_DISTRIBUTED_COMPILER_STATE="$1/compiler-state" \
+    WOS_DISTRIBUTED_COMPILER_TRANSPORT=preprocessed \
+    WOS_DISTRIBUTED_COMPILER_MIN_PREPROCESSED_BYTES=0 \
+    WOS_NINJA_JOBS=2 \
+    "$1/clang" -c -o "$1/object.o" "$1/input.c"
+test "$(cat "$1/compiler-count")" -eq 1
+test "$(cat "$1/compiler-state.successes/0")" = wos-0
+test ! -e "$1/compiler-state.responses"
+'''
+        result = subprocess.run(
+            ["bash", "-c", script, "wos-bootstrap-local-once-test", temp_dir],
+            cwd=ROOT,
+            check=False,
+            text=True,
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            fail(f"WOS compiler shim local single-pass test failed: {result.stderr}")
 
 
 def test_wos_bootstrap_retries_failed_remote_compiler_locally() -> None:
@@ -481,16 +551,18 @@ set -euo pipefail
 WOS_TARGET_ARCH=x86_64-pc-wos
 source <(sed -n '/^write_clang_wrapper()/,/^}/p' tools/bootstrap.sh)
 write_clang_wrapper "$1/clang" "$1/system-clang" /tmp
+printf '1\n' > "$1/compiler-state"
 PATH="$1:$PATH" \
     WOS_FALLBACK_MARKER="$1/fallback-marker" \
     WOS_DISTRIBUTED_COMPILER=1 \
     WOS_DISTRIBUTED_COMPILER_HOSTS=wos-0,wos-1 \
     WOS_DISTRIBUTED_COMPILER_STATE="$1/compiler-state" \
+    WOS_DISTRIBUTED_COMPILER_TRANSPORT=preprocessed \
     WOS_DISTRIBUTED_COMPILER_MIN_PREPROCESSED_BYTES=0 \
     WOS_NINJA_JOBS=1 \
     "$1/clang" -c -o "$1/object.o" "$1/input.c"
 test "$(cat "$1/fallback-marker")" = local
-test ! -e "$1/compiler-state.successes/0"
+test "$(cat "$1/compiler-state.successes/0")" = wos-0
 test ! -e "$1/compiler-state.successes/1"
 '''
         result = subprocess.run(
@@ -1085,8 +1157,8 @@ def test_distributed_cluster_has_plausible_per_core_memory() -> None:
 def test_distributed_selfhost_cluster_balances_cpu_and_memory() -> None:
     config = json.loads(DISTRIBUTED_SELFHOST_CLUSTER.read_text())
     global_vm = config["zones"][0]["vm"]
-    if global_vm["memory"] != "16384M" or global_vm["cpus"] != 4:
-        fail("distributed self-host workers must provide 4 GiB per core")
+    if global_vm["memory"] != "24576M" or global_vm["cpus"] != 8:
+        fail("distributed self-host workers must provide 3 GiB per core")
 
     node_zones = [zone for zone in config["zones"] if zone["id"] != "GLOBAL"]
     if [zone["nodes"] for zone in node_zones] != [4, 4]:
@@ -1094,10 +1166,10 @@ def test_distributed_selfhost_cluster_balances_cpu_and_memory() -> None:
 
     for zone in node_zones:
         overrides = zone.get("nodes_config", [])
-        if overrides != [{"id": 0, "vm": {"memory": "65536M", "cpus": 20}}]:
-            fail("distributed self-host controller must provide 20 build CPUs in every zone")
+        if overrides != [{"id": 0, "vm": {"memory": "65536M", "cpus": 8}}]:
+            fail("distributed self-host controller must provide 8 CPUs and 64 GiB")
 
-    if 20 + 3 * global_vm["cpus"] != 32:
+    if 4 * global_vm["cpus"] != 32:
         fail("distributed self-host profile must not oversubscribe the 32-thread host")
 
 
@@ -1944,6 +2016,7 @@ if __name__ == "__main__":
     test_wos_bootstrap_caps_concurrent_compilers_per_host()
     test_wos_bootstrap_remote_response_file_preserves_arguments()
     test_wos_bootstrap_keeps_small_preprocessed_inputs_local()
+    test_wos_bootstrap_compiles_submitter_jobs_once()
     test_wos_bootstrap_retries_failed_remote_compiler_locally()
     test_distributed_compiler_hosts_are_validated_before_launch()
     test_selfhost_repeatability_runner_preserves_acceptance_evidence()
@@ -1961,5 +2034,6 @@ if __name__ == "__main__":
     test_selfhost_runner_timing_avoids_python_when_epochrealtime_exists()
     test_selfhost_runner_keeps_remote_and_scratch_handling_guarded()
     test_distributed_cluster_has_plausible_per_core_memory()
+    test_distributed_selfhost_cluster_balances_cpu_and_memory()
     test_selfhost_report_comparator_checks_clone_build_and_total()
     print("WOS self-host benchmark source invariants hold")

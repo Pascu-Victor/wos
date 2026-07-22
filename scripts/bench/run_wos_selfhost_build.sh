@@ -996,7 +996,10 @@ safe_prepare_workdir() {
     ensure_parent_dir "$history_file"
     mkdir -p "$log_dir"
     if [ "$mode" = "wos" ] && [ "$distributed" = "1" ]; then
-        distributed_compiler_state="$(mktemp -d /tmp/wos-distributed-compiler.XXXXXX)/state"
+        # The workdir is already forwarded to every placement target. Keep the
+        # compiler response/state tree there so each job reuses that attachment
+        # instead of creating a new remote-VFS forwarding rule.
+        distributed_compiler_state="$workdir/tmp/distributed-compiler"
     fi
     : > "$report"
     : > "$detail_report"
