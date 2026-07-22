@@ -150,11 +150,13 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
     esac
     # The self-host runner validates that compiler_hosts[0] is the submitter.
     # Keep its full Ninja width available while bounding each slower remote-VFS
-    # path to one in-flight compile unless the caller explicitly overrides it.
+    # path to one successful compile per run unless the caller explicitly
+    # overrides the reusable per-host concurrency limit.
     compiler_jobs_per_host="\${WOS_DISTRIBUTED_COMPILER_JOBS_PER_HOST:-}"
     case "\$compiler_jobs_per_host" in
         '')
             compiler_remote_jobs_per_host="\${WOS_DISTRIBUTED_COMPILER_REMOTE_JOBS_PER_HOST:-1}"
+            compiler_persist_remote_slots=1
             ;;
         *[!0-9]*|0)
             echo "ERROR: distributed compiler jobs per host must be a positive integer" >&2
@@ -163,6 +165,7 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
         *)
             compiler_local_jobs="\$compiler_jobs_per_host"
             compiler_remote_jobs_per_host="\$compiler_jobs_per_host"
+            compiler_persist_remote_slots=0
             ;;
     esac
     case "\$compiler_remote_jobs_per_host" in
@@ -323,6 +326,7 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
         fi
         compiler_host=""
         compiler_slot=""
+        compiler_slot_persistent=0
         while [ -z "\$compiler_slot" ]; do
             while ! mkdir "\$compiler_lock" 2>/dev/null; do
                 :
@@ -351,6 +355,9 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
                     if mkdir "\$compiler_candidate_slot" 2>/dev/null; then
                         compiler_host="\${compiler_hosts[\$compiler_candidate_index]}"
                         compiler_slot="\$compiler_candidate_slot"
+                        if [ "\$compiler_candidate_index" -ne 0 ] && [ "\$compiler_persist_remote_slots" -eq 1 ]; then
+                            compiler_slot_persistent=1
+                        fi
                         printf '%s\n' "\$((compiler_candidate_index + 1))" > "\$compiler_state"
                         break 2
                     fi
@@ -362,8 +369,13 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
                 sleep 0
             fi
         done
-        compiler_slot_cleanup() {
+        compiler_slot_release() {
             rmdir "\$compiler_slot" 2>/dev/null || true
+        }
+        compiler_slot_cleanup() {
+            if [ "\$compiler_slot_persistent" -eq 0 ]; then
+                compiler_slot_release
+            fi
         }
         compiler_response="\$compiler_job_dir.response"
         if ! : > "\$compiler_response"; then
@@ -377,7 +389,7 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
         # negative lookup for a file that still exists.
         compiler_remote_cleanup() {
             compiler_input_cleanup
-            compiler_slot_cleanup
+            compiler_slot_release
         }
         trap compiler_remote_cleanup EXIT HUP INT TERM
         for arg in "\${compiler_forward_args[@]}"; do
@@ -395,7 +407,11 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
             compiler_status=\$?
         fi
         compiler_input_cleanup
-        compiler_slot_cleanup
+        if [ "\$compiler_status" -eq 0 ]; then
+            compiler_slot_cleanup
+        else
+            compiler_slot_release
+        fi
         trap - EXIT HUP INT TERM
         if [ "\$compiler_status" -eq 0 ]; then
             exit 0

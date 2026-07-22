@@ -129,8 +129,10 @@ def test_wos_bootstrap_distributes_only_compiler_processes() -> None:
             r'compiler_total_jobs="\${WOS_NINJA_JOBS:-\${WOS_BUILD_JOBS:-}}"',
             r'compiler_local_jobs="\$compiler_total_jobs"',
             r'compiler_remote_jobs_per_host="\${WOS_DISTRIBUTED_COMPILER_REMOTE_JOBS_PER_HOST:-1}"',
+            r'compiler_persist_remote_slots=1',
             r'compiler_local_jobs="\$compiler_jobs_per_host"',
             r'compiler_remote_jobs_per_host="\$compiler_jobs_per_host"',
+            r'compiler_persist_remote_slots=0',
             r'compiler_min_preprocessed_bytes="\${WOS_DISTRIBUTED_COMPILER_MIN_PREPROCESSED_BYTES:-1048576}"',
             r'compiler_preprocessed_language=cpp-output',
             r'compiler_preprocessed_language=c++-cpp-output',
@@ -145,6 +147,7 @@ def test_wos_bootstrap_distributes_only_compiler_processes() -> None:
             r'compiler_candidate_slot="\$compiler_host_slots/\$compiler_slot_index"',
             r'compiler_candidate_jobs="\$compiler_remote_jobs_per_host"',
             r'compiler_candidate_jobs="\$compiler_local_jobs"',
+            r'compiler_slot_persistent=1',
             r'if mkdir "\$compiler_candidate_slot" 2>/dev/null; then',
             r'compiler_host="\${compiler_hosts[\$compiler_candidate_index]}"',
             r'compiler_slot_cleanup() {',
@@ -222,12 +225,17 @@ lock="$state.lock"
 while ! mkdir "$lock" 2>/dev/null; do :; done
 active_file="$state.active.$host"
 max_file="$state.max.$host"
+count_file="$state.count.$host"
 active=0
 maximum=0
+count=0
 if [ -s "$active_file" ]; then read -r active < "$active_file" || active=0; fi
 if [ -s "$max_file" ]; then read -r maximum < "$max_file" || maximum=0; fi
+if [ -s "$count_file" ]; then read -r count < "$count_file" || count=0; fi
 active=$((active + 1))
+count=$((count + 1))
 printf '%s\n' "$active" > "$active_file"
+printf '%s\n' "$count" > "$count_file"
 if [ "$active" -gt "$maximum" ]; then printf '%s\n' "$active" > "$max_file"; fi
 rmdir "$lock"
 cleanup() {
@@ -261,6 +269,8 @@ done
 wait
 test "$(cat "$1/mock-on.max.wos-0")" -eq 4
 test "$(cat "$1/mock-on.max.wos-1")" -eq 1
+test "$(cat "$1/mock-on.count.wos-0")" -eq 7
+test "$(cat "$1/mock-on.count.wos-1")" -eq 1
 '''
         result = subprocess.run(
             ["bash", "-c", script, "wos-bootstrap-cap-test", temp_dir],
