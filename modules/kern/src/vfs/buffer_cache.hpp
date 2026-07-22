@@ -36,6 +36,9 @@ struct BufHead {
     uint64_t block_no{};            // Block number on the device
     dev::BlockDevice* bdev{};       // Owning block device
     std::atomic<int32_t> refcount;  // Reference count (0 = reclaimable)
+    // A retired buffer is no longer reachable through cache lookups, but its
+    // allocation remains alive until pre-existing holders release it.
+    std::atomic<bool> retired;
     // Journal batches pin metadata against writeback until their log record is
     // complete. Batch references separately keep the allocation alive.
     std::atomic<uint32_t> journal_pending;
@@ -166,6 +169,11 @@ void invalidate_bdev(dev::BlockDevice* bdev);
 // Use only when the caller has made the storage range authoritative by other
 // means, such as overwriting freshly allocated blocks directly.
 void discard_bdev_range(dev::BlockDevice* bdev, uint64_t block_no, size_t count);
+
+// Atomically make every overlapping cache alias unreachable without writing
+// it back. Referenced aliases are freed by their final brelse(). Returns false
+// without changing the range when writeback is already in flight.
+auto retire_bdev_range(dev::BlockDevice* bdev, uint64_t block_no, size_t count) -> bool;
 
 // Get cache statistics for diagnostics.
 struct BufferCacheStats {

@@ -15,6 +15,7 @@
 #include <new>
 #include <platform/dbg/dbg.hpp>
 #include <platform/mm/phys.hpp>
+#include <platform/sched/scheduler.hpp>
 #include <platform/sys/spinlock.hpp>
 #include <vfs/buffer_cache.hpp>
 #include <vfs/fs/xfs/xfs_dir2.hpp>
@@ -214,6 +215,23 @@ void xfs_trans_reset_for_reuse(XfsTransaction* tp) {
     tp->overflowed = false;
     tp->committed = false;
     tp->cancelled = false;
+    tp->retired_range_count = 0;
+}
+
+void xfs_trans_discard_retired_ranges(XfsTransaction* tp) {
+    if (tp == nullptr || tp->mount == nullptr || tp->mount->device == nullptr) {
+        return;
+    }
+
+    for (size_t i = 0; i < tp->retired_range_count; ++i) {
+        XfsTransRetiredRange const& range = tp->retired_ranges.at(i);
+        // Ordinary holders are detached immediately and free themselves on
+        // their final brelse(). Only an already-running device write requires
+        // a retry before the metadata lock may permit block reuse.
+        while (!retire_bdev_range(tp->mount->device, range.block_no, range.count)) {
+            ker::mod::sched::kern_yield();
+        }
+    }
 }
 
 void xfs_trans_add_arena_locked(void* arena, size_t bytes) {
@@ -564,6 +582,27 @@ auto xfs_trans_capture_inode(XfsTransaction* tp, XfsInode* ip) -> int {
     return 0;
 }
 
+auto xfs_trans_retire_bdev_range(XfsTransaction* tp, uint64_t block_no, size_t count) -> int {
+    if (tp == nullptr || tp->mount == nullptr || tp->mount->device == nullptr || count == 0 || tp->committed || tp->cancelled ||
+        count - 1 > UINT64_MAX - block_no) {
+        return -EINVAL;
+    }
+
+    for (size_t i = 0; i < tp->retired_range_count; ++i) {
+        XfsTransRetiredRange const& range = tp->retired_ranges.at(i);
+        if (range.block_no == block_no && range.count == count) {
+            return 0;
+        }
+    }
+    if (tp->retired_range_count >= tp->retired_ranges.size()) {
+        tp->error = -EFBIG;
+        return -EFBIG;
+    }
+
+    tp->retired_ranges.at(tp->retired_range_count++) = XfsTransRetiredRange{.block_no = block_no, .count = count};
+    return 0;
+}
+
 auto xfs_trans_commit(XfsTransaction* tp) -> int {
     if (tp == nullptr) {
         return -EINVAL;
@@ -630,6 +669,7 @@ auto xfs_trans_commit(XfsTransaction* tp) -> int {
 
     tp->committed = true;
     xfs_trans_discard_undo(tp);
+    xfs_trans_discard_retired_ranges(tp);
     xfs_trans_release(tp);
     return RC;
 }
@@ -658,6 +698,19 @@ void xfs_trans_cancel(XfsTransaction* tp) {
 }
 
 #ifdef WOS_SELFTEST
+namespace {
+
+auto xfs_retirement_selftest_read(ker::dev::BlockDevice* dev, uint64_t /*block*/, size_t count, void* buffer) -> int {
+    __builtin_memset(buffer, 0, count * dev->block_size);
+    return 0;
+}
+
+auto xfs_retirement_selftest_write(ker::dev::BlockDevice* /*dev*/, uint64_t /*block*/, size_t /*count*/, const void* /*buffer*/) -> int {
+    return 0;
+}
+
+}  // namespace
+
 auto xfs_selftest_transaction_cancel_restores_nlink() -> bool {
     XfsMountContext mount{};
     XfsInode inode{};
@@ -677,6 +730,57 @@ auto xfs_selftest_transaction_cancel_restores_nlink() -> bool {
     inode.dirty = true;
     xfs_trans_cancel(tp);
     return inode.nlink == 2 && !inode.dirty;
+}
+
+auto xfs_selftest_transaction_retired_ranges_commit_only() -> bool {
+    constexpr uint64_t BLOCK = 96;
+    constexpr size_t COUNT = 8;
+
+    ker::dev::BlockDevice dev{};
+    dev.block_size = 512;
+    dev.total_blocks = 1024;
+    dev.read_blocks = xfs_retirement_selftest_read;
+    dev.write_blocks = xfs_retirement_selftest_write;
+
+    XfsMountContext mount{};
+    mount.device = &dev;
+
+    auto cache_range = [&]() -> BufHead* {
+        BufHead* bh = bget_multi(&dev, BLOCK, COUNT);
+        if (bh == nullptr) {
+            return nullptr;
+        }
+        __builtin_memset(bh->data, 0xA5, bh->size);
+        bdirty(bh);
+        return bh;
+    };
+
+    BufHead* cancelled_pinned = cache_range();
+    bool ok = cancelled_pinned != nullptr && has_cached_bdev_range(&dev, BLOCK, COUNT);
+    XfsTransaction* cancelled = xfs_trans_alloc(&mount);
+    bool const CANCEL_REGISTERED = cancelled != nullptr && xfs_trans_retire_bdev_range(cancelled, BLOCK, COUNT) == 0;
+    ok = ok && CANCEL_REGISTERED;
+    if (cancelled != nullptr) {
+        xfs_trans_cancel(cancelled);
+    }
+    ok = ok && has_cached_bdev_range(&dev, BLOCK, COUNT);
+    brelse(cancelled_pinned);
+
+    discard_bdev_range(&dev, BLOCK, COUNT);
+    BufHead* committed_pinned = cache_range();
+    ok = ok && committed_pinned != nullptr && has_cached_bdev_range(&dev, BLOCK, COUNT);
+    XfsTransaction* committed = xfs_trans_alloc(&mount);
+    bool const COMMIT_REGISTERED = committed != nullptr && xfs_trans_retire_bdev_range(committed, BLOCK, COUNT) == 0;
+    ok = ok && COMMIT_REGISTERED;
+    if (committed != nullptr) {
+        int const COMMIT_RC = xfs_trans_commit(committed);
+        ok = ok && COMMIT_RC == 0;
+    }
+    ok = ok && !has_cached_bdev_range(&dev, BLOCK, COUNT);
+    brelse(committed_pinned);
+
+    invalidate_bdev(&dev);
+    return ok;
 }
 #endif
 

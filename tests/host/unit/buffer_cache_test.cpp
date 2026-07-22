@@ -823,6 +823,42 @@ TEST_F(BufferCacheTest, DiscardRangeDropsOnlyUnreferencedOverlappingBuffers) {
     dev.private_data = nullptr;
 }
 
+TEST_F(BufferCacheTest, RetireRangeUnlinksPinnedAliasesUntilFinalRelease) {
+    RecordingIoState io{};
+    dev.write_blocks = recording_write;
+    dev.flush = recording_flush;
+    dev.private_data = &io;
+
+    constexpr uint64_t BLOCK = 180;
+    constexpr size_t COUNT = 8;
+    BufHead* pinned = bget_multi(&dev, BLOCK, COUNT);
+    ASSERT_NE(pinned, nullptr);
+    memset(pinned->data, 0xA5, pinned->size);
+    bdirty(pinned);
+    BufferCacheStats const PINNED_STATS = buffer_cache_stats();
+
+    EXPECT_TRUE(retire_bdev_range(&dev, BLOCK + 3, 1));
+    EXPECT_FALSE(has_cached_bdev_range(&dev, BLOCK, COUNT));
+    EXPECT_FALSE(has_dirty_bdev_range(&dev, BLOCK, COUNT));
+    EXPECT_EQ(io.write_calls, 0u);
+    EXPECT_EQ(io.flush_calls, 0u);
+    EXPECT_EQ(pinned->refcount.load(std::memory_order_relaxed), 1);
+
+    BufHead* replacement = bget_multi(&dev, BLOCK, COUNT);
+    ASSERT_NE(replacement, nullptr);
+    EXPECT_NE(replacement, pinned);
+    memset(replacement->data, 0x5A, replacement->size);
+    brelse(replacement);
+
+    BufferCacheStats const BEFORE_RELEASE = buffer_cache_stats();
+    EXPECT_GT(BEFORE_RELEASE.total_buffers, PINNED_STATS.total_buffers);
+    brelse(pinned);
+    BufferCacheStats const AFTER_RELEASE = buffer_cache_stats();
+    EXPECT_LT(AFTER_RELEASE.total_buffers, BEFORE_RELEASE.total_buffers);
+    EXPECT_TRUE(has_cached_bdev_range(&dev, BLOCK, COUNT));
+    dev.private_data = nullptr;
+}
+
 TEST_F(BufferCacheTest, RangeOperationsHandleLastBlockWithoutWrapping) {
     RecordingIoState io{};
     dev.write_blocks = recording_write;

@@ -72,6 +72,8 @@ def main() -> None:
         "auto xfs_trans_capture_buf(XfsTransaction* tp, BufHead* bp) -> int;",
         "auto xfs_trans_capture_perag(XfsTransaction* tp, xfs_agnumber_t agno) -> int;",
         "auto xfs_trans_capture_inode(XfsTransaction* tp, XfsInode* ip) -> int;",
+        "struct XfsTransRetiredRange",
+        "auto xfs_trans_retire_bdev_range(XfsTransaction* tp, uint64_t block_no, size_t count) -> int;",
     ]:
         if token not in header:
             fail(f"transaction header missing undo contract {token!r}")
@@ -104,8 +106,23 @@ def main() -> None:
     )
     require_order(
         function_body(trans, "xfs_trans_commit"),
-        ["tp->committed = true;", "xfs_trans_discard_undo(tp);", "xfs_trans_release(tp);"],
-        "successful commit discards before-images",
+        ["tp->committed = true;", "xfs_trans_discard_undo(tp);", "xfs_trans_discard_retired_ranges(tp);", "xfs_trans_release(tp);"],
+        "successful commit discards before-images and retired aliases",
+    )
+    retire_body = function_body(trans, "xfs_trans_discard_retired_ranges")
+    if "retire_bdev_range(" not in retire_body:
+        fail("commit retirement must detach pinned cache aliases")
+    if "has_cached_bdev_range(" in retire_body:
+        fail("commit retirement must not wait for ordinary cache holders")
+    require_order(
+        function_body(bmap, "bmbt_return_block"),
+        [
+            "uint64_t const AG_BASE = static_cast<uint64_t>(AGNO) * mount->ag_blocks;",
+            "uint64_t const DEV_BLOCK = (AG_BASE + AGBNO) * DEV_COUNT;",
+            "xfs_free_extent(mount, tp",
+            "xfs_trans_retire_bdev_range(tp, DEV_BLOCK, DEV_COUNT)",
+        ],
+        "BMBT blocks become reusable only with commit-time cache retirement",
     )
     require_order(
         function_body(trans, "xfs_trans_commit"),

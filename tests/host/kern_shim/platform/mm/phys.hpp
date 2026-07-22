@@ -19,6 +19,9 @@ inline auto page_alloc(uint64_t size, std::string_view = "anonymous") -> void* {
 }
 
 inline auto page_alloc_full_overwrite(uint64_t size, std::string_view name = "full_overwrite") -> void* { return page_alloc(size, name); }
+inline auto page_alloc_full_overwrite_may_fail(uint64_t size, std::string_view name = "full_overwrite") -> void* {
+    return page_alloc(size, name);
+}
 
 inline void page_free(void* page) { std::free(page); }
 

@@ -794,6 +794,7 @@ auto alloc_detached_buffer_with_size(dev::BlockDevice* bdev, uint64_t block_no, 
     bh->block_no = block_no;
     bh->bdev = bdev;
     bh->refcount.store(1, std::memory_order_relaxed);
+    bh->retired.store(false, std::memory_order_relaxed);
     bh->journal_pending.store(0, std::memory_order_relaxed);
     bh->flags = initial_flags | data_flags;
     bh->size = size;
@@ -1210,6 +1211,29 @@ auto range_find_discard_candidate_locked(BufHead* root, dev::BlockDevice* bdev, 
 
     if (root->block_no <= QUERY_LAST) {
         return range_find_discard_candidate_locked(root->range_right, bdev, block_no, count);
+    }
+    return nullptr;
+}
+
+auto range_find_overlap_locked(BufHead* root, dev::BlockDevice* bdev, uint64_t block_no, size_t count, bool writeback_only) -> BufHead* {
+    if (root == nullptr || bdev == nullptr || count == 0) {
+        return nullptr;
+    }
+
+    uint64_t const QUERY_LAST = block_range_last_block(block_no, count);
+    if (root->range_left != nullptr && root->range_left->range_subtree_last_block >= block_no) {
+        if (BufHead* found = range_find_overlap_locked(root->range_left, bdev, block_no, count, writeback_only)) {
+            return found;
+        }
+    }
+
+    if (root->bdev == bdev && root->block_no <= QUERY_LAST && range_buffer_last_block(root) >= block_no &&
+        (!writeback_only || (root->flags & BH_WRITEBACK) != 0)) {
+        return root;
+    }
+
+    if (root->block_no <= QUERY_LAST) {
+        return range_find_overlap_locked(root->range_right, bdev, block_no, count, writeback_only);
     }
     return nullptr;
 }
@@ -2121,6 +2145,43 @@ void clear_buffer_dirty_locked(BufHead* bh) {
     cache_dirty_bytes -= bh->size;
 }
 
+auto retired_buffer_reclaimable_locked(const BufHead* bh) -> bool {
+    if (bh == nullptr || !bh->retired.load(std::memory_order_acquire) || bh->refcount.load(std::memory_order_relaxed) != 0 ||
+        bh->journal_pending.load(std::memory_order_relaxed) != 0) {
+        return false;
+    }
+    uint32_t constexpr BLOCKING_FLAGS = BH_LOCKED | BH_WRITEBACK;
+    return (bh->flags & BLOCKING_FLAGS) == 0;
+}
+
+auto free_retired_buffer_if_reclaimable_locked(BufHead* bh) -> bool {
+    if (!retired_buffer_reclaimable_locked(bh)) {
+        return false;
+    }
+    free_unlinked_buffer(bh);
+    return true;
+}
+
+auto retire_buffer_locked(BufHead* bh) -> bool {
+    if (bh == nullptr) {
+        return false;
+    }
+    // Hold a temporary reference across publication and unlinking. This
+    // closes the race with the pre-existing final holder entering brelse().
+    bh->refcount.fetch_add(1, std::memory_order_acq_rel);
+    if (bh->retired.exchange(true, std::memory_order_acq_rel)) {
+        static_cast<void>(bh->refcount.fetch_sub(1, std::memory_order_acq_rel));
+        return false;
+    }
+    hash_remove(bh);
+    lru_remove(bh);
+    if ((bh->flags & BH_DIRTY) != 0) {
+        clear_buffer_dirty_locked(bh);
+    }
+    static_cast<void>(bh->refcount.fetch_sub(1, std::memory_order_acq_rel));
+    return free_retired_buffer_if_reclaimable_locked(bh);
+}
+
 void collect_dirty_waiters_locked(DirtyWakeList& wake_list) {
     if (cache_dirty_bytes > dirty_throttle_resume_bytes_locked()) {
         return;
@@ -2184,6 +2245,9 @@ auto owns_writeback_epoch(const BufHead* bh, uint64_t epoch) -> bool {
 }
 
 auto mark_buffer_dirty_locked(BufHead* bh) -> bool {
+    if (bh == nullptr || bh->retired.load(std::memory_order_acquire)) {
+        return false;
+    }
     bh->dirty_epoch = allocate_dirty_epoch();
     discard_clean_overlapping_aliases_locked(bh);
     if ((bh->flags & BH_DIRTY) != 0) {
@@ -2954,9 +3018,19 @@ void brelse(BufHead* bh) {
         return;
     }
 
+    bool const RETIRED = bh->retired.load(std::memory_order_acquire);
     int32_t const PREV = bh->refcount.fetch_sub(1, std::memory_order_acq_rel);
     if (PREV <= 0) {
         bh->refcount.store(0, std::memory_order_relaxed);
+        return;
+    }
+    if (PREV == 1 && RETIRED) {
+        uint64_t const IRQFLAGS = cache_lock.lock_irqsave();
+        bool const FREED = free_retired_buffer_if_reclaimable_locked(bh);
+        cache_lock.unlock_irqrestore(IRQFLAGS);
+        if (FREED) {
+            drain_deferred_data_buffer_frees();
+        }
     }
 }
 
@@ -2994,11 +3068,18 @@ auto bwrite(BufHead* bh) -> int {
     if (bh == nullptr) {
         return -EINVAL;
     }
+    if (bh->retired.load(std::memory_order_acquire)) {
+        return -EIO;
+    }
 
     uint64_t writeback_dirty_epoch = 0;
     uint64_t owned_writeback_epoch = 0;
     {
         uint64_t const IRQFLAGS = cache_lock.lock_irqsave();
+        if (bh->retired.load(std::memory_order_acquire)) {
+            cache_lock.unlock_irqrestore(IRQFLAGS);
+            return -EIO;
+        }
         mark_buffer_dirty_locked(bh);
         writeback_dirty_epoch = bh->dirty_epoch;
         if ((bh->flags & BH_WRITEBACK) == 0) {
@@ -3012,7 +3093,7 @@ auto bwrite(BufHead* bh) -> int {
 }
 
 void bdirty(BufHead* bh) {
-    if (bh == nullptr) {
+    if (bh == nullptr || bh->retired.load(std::memory_order_acquire)) {
         return;
     }
 
@@ -3512,6 +3593,53 @@ void discard_bdev_range(dev::BlockDevice* bdev, uint64_t block_no, size_t count)
     if (discarded_bytes != 0) {
         perf_record_xfs_count(ker::mod::perf::WkiPerfLocalXfsOp::BUF_DISCARD, discarded_bytes);
     }
+}
+
+auto retire_bdev_range(dev::BlockDevice* bdev, uint64_t block_no, size_t count) -> bool {
+    if (bdev == nullptr || count == 0) {
+        return true;
+    }
+    if (!cache_initialized) {
+        buffer_cache_init();
+    }
+
+    uint64_t const IRQFLAGS = cache_lock.lock_irqsave();
+    auto find_overlap = [&](bool writeback_only) -> BufHead* {
+        if (!range_index_degraded) {
+            RangeBdevState* state = find_range_bdev_state_locked(bdev);
+            return state == nullptr ? nullptr : range_find_overlap_locked(state->tree_root, bdev, block_no, count, writeback_only);
+        }
+        for (auto* bucket_head : hash_buckets) {
+            for (BufHead* bh = bucket_head; bh != nullptr; bh = bh->hash_next) {
+                if (buffer_overlaps_range(bh, bdev, block_no, count) && (!writeback_only || (bh->flags & BH_WRITEBACK) != 0)) {
+                    return bh;
+                }
+            }
+        }
+        return nullptr;
+    };
+
+    // Do not partially retire a range while an old write is already using one
+    // of its aliases. The caller can retry once that finite I/O completes.
+    if (find_overlap(true) != nullptr) {
+        cache_lock.unlock_irqrestore(IRQFLAGS);
+        return false;
+    }
+
+    DirtyWakeList wake_list{};
+    uint64_t retired_bytes = 0;
+    while (BufHead* bh = find_overlap(false)) {
+        retired_bytes += bh->size;
+        static_cast<void>(retire_buffer_locked(bh));
+    }
+    collect_dirty_waiters_locked(wake_list);
+    cache_lock.unlock_irqrestore(IRQFLAGS);
+    wake_dirty_waiters(wake_list);
+    drain_deferred_data_buffer_frees();
+    if (retired_bytes != 0) {
+        perf_record_xfs_count(ker::mod::perf::WkiPerfLocalXfsOp::BUF_DISCARD, retired_bytes);
+    }
+    return true;
 }
 
 auto buffer_cache_stats() -> BufferCacheStats {

@@ -112,6 +112,15 @@ struct XfsTransInodeUndo {
     XfsTransInodeUndo* next{};
 };
 
+// Buffer-cache ranges whose old contents become unreachable only when the
+// transaction commits.  Keep them cached on cancellation so the restored
+// metadata can still use them; discard them after a successful commit and
+// before the caller can release the filesystem metadata lock.
+struct XfsTransRetiredRange {
+    uint64_t block_no{};
+    size_t count{};
+};
+
 // Transaction structure
 struct XfsTransaction {
     XfsTransaction() = default;
@@ -135,6 +144,8 @@ struct XfsTransaction {
     XfsTransBufUndo* buf_undo{};
     XfsTransPerAgUndo* perag_undo{};
     XfsTransInodeUndo* inode_undo{};
+    std::array<XfsTransRetiredRange, XFS_TRANS_MAX_ITEMS> retired_ranges{};
+    size_t retired_range_count{};
 };
 
 // ============================================================================
@@ -160,6 +171,10 @@ auto xfs_trans_capture_buf(XfsTransaction* tp, BufHead* bp) -> int;
 auto xfs_trans_capture_perag(XfsTransaction* tp, xfs_agnumber_t agno) -> int;
 auto xfs_trans_capture_inode(XfsTransaction* tp, XfsInode* ip) -> int;
 
+// Retire a device-block range only after a successful commit.  This prevents
+// stale metadata aliases from contaminating a later owner of recycled blocks.
+auto xfs_trans_retire_bdev_range(XfsTransaction* tp, uint64_t block_no, size_t count) -> int;
+
 // Commit the transaction - write log entries and mark buffers dirty.
 // Returns 0 on success.
 auto xfs_trans_commit(XfsTransaction* tp) -> int;
@@ -169,6 +184,7 @@ void xfs_trans_cancel(XfsTransaction* tp);
 
 #ifdef WOS_SELFTEST
 auto xfs_selftest_transaction_cancel_restores_nlink() -> bool;
+auto xfs_selftest_transaction_retired_ranges_commit_only() -> bool;
 #endif
 
 }  // namespace ker::vfs::xfs

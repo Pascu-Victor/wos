@@ -194,7 +194,9 @@ auto bmbt_alloc_block(XfsInode* ip, XfsTransaction* tp, uint16_t level, BufHead*
 }
 
 auto bmbt_return_block(XfsMountContext* mount, XfsTransaction* tp, xfs_fsblock_t fsb) -> int {
-    if (mount == nullptr || tp == nullptr || fsb == NULLFSBLOCK) {
+    if (mount == nullptr || mount->device == nullptr || mount->device->block_size == 0 || mount->ag_blocks == 0 ||
+        mount->block_size < mount->device->block_size || (mount->block_size % mount->device->block_size) != 0 || tp == nullptr ||
+        fsb == NULLFSBLOCK) {
         return -EINVAL;
     }
     xfs_agnumber_t const AGNO = xfs_ag_number(fsb, mount->ag_blk_log);
@@ -202,7 +204,21 @@ auto bmbt_return_block(XfsMountContext* mount, XfsTransaction* tp, xfs_fsblock_t
     if (AGNO >= mount->ag_count || AGBNO >= mount->ag_blocks) {
         return -EIO;
     }
-    return xfs_free_extent(mount, tp, AGNO, AGBNO, 1);
+    size_t const DEV_COUNT = mount->block_size / mount->device->block_size;
+    if (static_cast<uint64_t>(AGNO) > UINT64_MAX / mount->ag_blocks) {
+        return -EIO;
+    }
+    uint64_t const AG_BASE = static_cast<uint64_t>(AGNO) * mount->ag_blocks;
+    if (AGBNO > UINT64_MAX - AG_BASE || AG_BASE + AGBNO > UINT64_MAX / DEV_COUNT) {
+        return -EIO;
+    }
+    uint64_t const DEV_BLOCK = (AG_BASE + AGBNO) * DEV_COUNT;
+
+    int const FREE_RC = xfs_free_extent(mount, tp, AGNO, AGBNO, 1);
+    if (FREE_RC != 0) {
+        return FREE_RC;
+    }
+    return xfs_trans_retire_bdev_range(tp, DEV_BLOCK, DEV_COUNT);
 }
 
 auto bmbt_valid_irec(const XfsBmbtIrec& rec) -> bool {

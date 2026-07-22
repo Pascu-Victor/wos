@@ -328,6 +328,39 @@ def main() -> None:
         "insert must account before indexing a prepared buffer",
     )
 
+    allocate_body = function_body(source, "alloc_detached_buffer_with_size")
+    require_order(
+        allocate_body,
+        ["bh->refcount.store(1", "bh->retired.store(false", "bh->journal_pending.store(0"],
+        "reused buffer heads must clear deferred-retirement state",
+    )
+    retire_one_body = function_body(source, "retire_buffer_locked")
+    require_order(
+        retire_one_body,
+        [
+            "bh->refcount.fetch_add(1",
+            "bh->retired.exchange(true",
+            "hash_remove(bh)",
+            "lru_remove(bh)",
+            "clear_buffer_dirty_locked(bh)",
+            "bh->refcount.fetch_sub(1",
+            "free_retired_buffer_if_reclaimable_locked(bh)",
+        ],
+        "retirement must publish an unreachable alias while holding a temporary lifetime reference",
+    )
+    retire_range_body = function_body(source, "retire_bdev_range")
+    require_order(
+        retire_range_body,
+        ["if (find_overlap(true) != nullptr)", "return false", "while (BufHead* bh = find_overlap(false))", "retire_buffer_locked(bh)"],
+        "range retirement must wait out writeback before detaching ordinary holders",
+    )
+    brelse_body = function_body(source, "brelse")
+    require_order(
+        brelse_body,
+        ["bool const RETIRED = bh->retired.load", "bh->refcount.fetch_sub", "if (PREV == 1 && RETIRED)"],
+        "final release must snapshot retirement before dropping its reference",
+    )
+
     span_body = function_body(source, "checked_block_span_size")
     require_order(
         span_body,

@@ -1143,6 +1143,29 @@ KTEST(BufferCache, RangeOperationsHandleLastBlockWithoutWrapping) {
     ker::vfs::invalidate_bdev(&dev);
 }
 
+KTEST(BufferCache, RetireRangeUnlinksPinnedAliasWithoutWaiting) {
+    ker::dev::BlockDevice dev = make_null_bdev();
+    ker::vfs::invalidate_bdev(&dev);
+
+    constexpr uint64_t BLOCK = 1180;
+    constexpr size_t COUNT = 8;
+    ker::vfs::BufHead* pinned = ker::vfs::bget_multi(&dev, BLOCK, COUNT);
+    KREQUIRE_NE(pinned, nullptr);
+    memset(pinned->data, 0xA5, pinned->size);
+    ker::vfs::bdirty(pinned);
+
+    KEXPECT_TRUE(ker::vfs::retire_bdev_range(&dev, BLOCK + 2, 1));
+    KEXPECT_FALSE(ker::vfs::has_cached_bdev_range(&dev, BLOCK, COUNT));
+    KEXPECT_FALSE(ker::vfs::has_dirty_bdev_range(&dev, BLOCK, COUNT));
+
+    ker::vfs::BufHead* replacement = ker::vfs::bget_multi(&dev, BLOCK, COUNT);
+    KREQUIRE_NE(replacement, nullptr);
+    KEXPECT_NE(replacement, pinned);
+    ker::vfs::brelse(replacement);
+    ker::vfs::brelse(pinned);
+    ker::vfs::invalidate_bdev(&dev);
+}
+
 KTEST(BufferCache, SyncRangeFailedWritesProgressAcrossBatches) {
     ker::dev::BlockDevice dev = make_null_bdev();
     RecordingWriteState io{};
