@@ -1083,7 +1083,7 @@ auto discard_inode_data_buffers(XfsMountContext* ctx, XfsInode* ip, uint64_t byt
     });
 }
 
-auto walk_path(XfsMountContext* ctx, const char* path) -> XfsInode* {
+auto walk_path(XfsMountContext* ctx, const char* path, bool allow_dentry_cache = true) -> XfsInode* {
     // Start at the root inode
     XfsInode* ip = xfs_root_inode_read(ctx);
     if (ip == nullptr) {
@@ -1130,7 +1130,8 @@ auto walk_path(XfsMountContext* ctx, const char* path) -> XfsInode* {
 
         // Look up the component
         XfsDirEntry de{};
-        int const RET = xfs_dir_lookup(ip, comp_start, namelen, &de);
+        int const RET =
+            allow_dentry_cache ? xfs_dir_lookup(ip, comp_start, namelen, &de) : xfs_dir_lookup_authoritative(ip, comp_start, namelen, &de);
         if (RET != 0) {
             xfs_inode_release(ip);
             return nullptr;
@@ -3612,7 +3613,7 @@ auto xfs_find_parent_and_name(const char* fs_path, XfsMountContext* ctx, XfsInod
             std::memcpy(static_cast<char*>(parent_path), fs_path, parent_len);
             parent_path[parent_len] = '\0';
             auto const* parent_path_chars = static_cast<const char*>(parent_path);
-            parent_ip = walk_path(ctx, parent_path_chars);
+            parent_ip = walk_path(ctx, parent_path_chars, allow_parent_cache);
             if (parent_ip != nullptr && xfs_inode_isdir(parent_ip)) {
                 xfs_parent_path_cache_store(ctx, parent_path_chars, parent_len, parent_ip->ino);
             }
@@ -5821,16 +5822,32 @@ auto xfs_unlink_path(const char* fs_path, XfsMountContext* ctx, size_t known_fs_
     const char* filename = nullptr;
     uint16_t filename_len = 0;
     size_t fs_path_len = UNKNOWN_XFS_PATH_LEN;
+    bool authoritative_lookup = false;
     int rc = xfs_find_parent_and_name(fs_path, ctx, &parent_ip, &filename, &filename_len, nullptr, true, known_fs_path_len, &fs_path_len);
+    if (rc == -ENOENT) {
+        authoritative_lookup = true;
+        rc = xfs_find_parent_and_name(fs_path, ctx, &parent_ip, &filename, &filename_len, nullptr, false, known_fs_path_len, &fs_path_len);
+    }
     if (rc != 0) {
         return rc;
     }
 
     // Look up the entry to be deleted (must verify it exists and is a regular file)
     XfsDirEntry de{};
-    rc = xfs_dir_lookup(parent_ip, filename, filename_len, &de);
-    if (rc != 0) {
+    rc = authoritative_lookup ? xfs_dir_lookup_authoritative(parent_ip, filename, filename_len, &de)
+                              : xfs_dir_lookup(parent_ip, filename, filename_len, &de);
+    if (rc == -ENOENT && !authoritative_lookup) {
         xfs_inode_release(parent_ip);
+        parent_ip = nullptr;
+        rc = xfs_find_parent_and_name(fs_path, ctx, &parent_ip, &filename, &filename_len, nullptr, false, known_fs_path_len, &fs_path_len);
+        if (rc == 0) {
+            rc = xfs_dir_lookup_authoritative(parent_ip, filename, filename_len, &de);
+        }
+    }
+    if (rc != 0) {
+        if (parent_ip != nullptr) {
+            xfs_inode_release(parent_ip);
+        }
         return rc;
     }
 

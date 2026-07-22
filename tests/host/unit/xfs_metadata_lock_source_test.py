@@ -8,6 +8,7 @@ ROOT = Path(__file__).resolve().parents[3]
 XFS_MOUNT_HPP = ROOT / "modules" / "kern" / "src" / "vfs" / "fs" / "xfs" / "xfs_mount.hpp"
 XFS_INODE_HPP = ROOT / "modules" / "kern" / "src" / "vfs" / "fs" / "xfs" / "xfs_inode.hpp"
 XFS_INODE_CPP = ROOT / "modules" / "kern" / "src" / "vfs" / "fs" / "xfs" / "xfs_inode.cpp"
+XFS_DIR2_CPP = ROOT / "modules" / "kern" / "src" / "vfs" / "fs" / "xfs" / "xfs_dir2.cpp"
 XFS_VFS_CPP = ROOT / "modules" / "kern" / "src" / "vfs" / "fs" / "xfs" / "xfs_vfs.cpp"
 VFS_CORE_CPP = ROOT / "modules" / "kern" / "src" / "vfs" / "core.cpp"
 VFS_HPP = ROOT / "modules" / "kern" / "src" / "vfs" / "vfs.hpp"
@@ -168,6 +169,44 @@ def test_metadata_mutators_are_serialized() -> None:
     for name, token in checks.items():
         if token not in function_body(source, name):
             fail(f"{name} must serialize XFS metadata mutations")
+
+
+def test_unlink_retries_false_enoent_without_namespace_caches() -> None:
+    dir_source = XFS_DIR2_CPP.read_text()
+    vfs_source = XFS_VFS_CPP.read_text()
+    authoritative_body = function_body(dir_source, "xfs_dir_lookup_authoritative")
+    if "xfs_dir_lookup_impl(dp, name, namelen, entry, false)" not in authoritative_body:
+        fail("authoritative directory lookup must bypass the dentry cache")
+    require_order(
+        function_body(dir_source, "xfs_selftest_authoritative_lookup_repairs_stale_negative"),
+        [
+            'xfs_dentry_cache_store(&dir, "foo", 3, -ENOENT, nullptr)',
+            'xfs_dir_lookup(&dir, "foo", 3, &entry) == -ENOENT',
+            'xfs_dir_lookup_authoritative(&dir, "foo", 3, &entry) == 0',
+            'xfs_dir_lookup(&dir, "foo", 3, &entry) == 0',
+        ],
+        "authoritative lookup selftest must reproduce and repair a stale negative dentry",
+    )
+
+    require_order(
+        function_body(vfs_source, "xfs_unlink_path"),
+        [
+            "xfs_find_parent_and_name(fs_path",
+            "if (rc == -ENOENT)",
+            "nullptr, false, known_fs_path_len",
+            "xfs_dir_lookup_authoritative(parent_ip, filename, filename_len, &de)",
+            "if (rc == -ENOENT && !authoritative_lookup)",
+            "xfs_inode_release(parent_ip);",
+            "nullptr, false, known_fs_path_len",
+            "xfs_dir_lookup_authoritative(parent_ip, filename, filename_len, &de)",
+            "xfs_trans_alloc(ctx)",
+        ],
+        "unlink must retry cache-derived ENOENT authoritatively before starting a transaction",
+    )
+
+    walk_body = function_body(vfs_source, "walk_path")
+    if "xfs_dir_lookup_authoritative(ip, comp_start, namelen, &de)" not in walk_body:
+        fail("uncached parent walks must bypass component dentry-cache answers")
 
 
 def test_xfs_namespace_cache_publication_is_ordered() -> None:

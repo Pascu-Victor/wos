@@ -1531,7 +1531,9 @@ auto xfs_dentry_cache_lookup_parent(XfsMountContext* mount, xfs_ino_t parent_ino
     return xfs_dentry_cache_lookup_impl(mount, parent_ino, name, namelen, entry, result);
 }
 
-auto xfs_dir_lookup(XfsInode* dp, const char* name, uint16_t namelen, XfsDirEntry* entry) -> int {
+namespace {
+
+auto xfs_dir_lookup_impl(XfsInode* dp, const char* name, uint16_t namelen, XfsDirEntry* entry, bool allow_cache) -> int {
     if (dp == nullptr || name == nullptr || entry == nullptr) {
         return -EINVAL;
     }
@@ -1542,9 +1544,11 @@ auto xfs_dir_lookup(XfsInode* dp, const char* name, uint16_t namelen, XfsDirEntr
     mod::dbg::log("[xfs] dir_lookup: ino=%lu fmt=%d size=%lu name=%.*s", static_cast<unsigned long>(dp->ino), dp->data_fork.format,
                   static_cast<unsigned long>(dp->size), static_cast<int>(namelen), name);
 #endif
-    int cached_result = 0;
-    if (xfs_dentry_cache_lookup(dp, name, namelen, entry, &cached_result)) {
-        return cached_result;
+    if (allow_cache) {
+        int cached_result = 0;
+        if (xfs_dentry_cache_lookup(dp, name, namelen, entry, &cached_result)) {
+            return cached_result;
+        }
     }
 
     int result = 0;
@@ -1565,6 +1569,16 @@ auto xfs_dir_lookup(XfsInode* dp, const char* name, uint16_t namelen, XfsDirEntr
     }
     xfs_dentry_cache_store(dp, name, namelen, result, entry);
     return result;
+}
+
+}  // namespace
+
+auto xfs_dir_lookup(XfsInode* dp, const char* name, uint16_t namelen, XfsDirEntry* entry) -> int {
+    return xfs_dir_lookup_impl(dp, name, namelen, entry, true);
+}
+
+auto xfs_dir_lookup_authoritative(XfsInode* dp, const char* name, uint16_t namelen, XfsDirEntry* entry) -> int {
+    return xfs_dir_lookup_impl(dp, name, namelen, entry, false);
 }
 
 void xfs_dir_observe_entry(XfsInode* dp, const XfsDirEntry* entry) {
@@ -4665,6 +4679,25 @@ auto xfs_selftest_dentry_cache_shortform() -> bool {
     XfsDentryCacheStats after_invalidate{};
     xfs_dentry_cache_stats(after_invalidate);
     return after_invalidate.misses > after_hit.misses && after_invalidate.invalidations > after_hit.invalidations;
+}
+
+auto xfs_selftest_authoritative_lookup_repairs_stale_negative() -> bool {
+    XfsMountContext mount{};
+    mount.inode_size = 512;
+    mount.feat_incompat = XFS_SB_FEAT_INCOMPAT_FTYPE;
+    xfs_dentry_cache_purge_mount(&mount);
+
+    std::array<uint8_t, 32> data{};
+    XfsInode dir{};
+    xfs_selftest_make_shortform_one_entry_dir(&mount, &dir, data, 101, 43);
+    xfs_dentry_cache_store(&dir, "foo", 3, -ENOENT, nullptr);
+
+    XfsDirEntry entry{};
+    bool const STALE_NEGATIVE_OBSERVED = xfs_dir_lookup(&dir, "foo", 3, &entry) == -ENOENT;
+    bool const AUTHORITATIVE_FOUND = xfs_dir_lookup_authoritative(&dir, "foo", 3, &entry) == 0 && entry.ino == 43;
+    bool const CACHE_REPAIRED = xfs_dir_lookup(&dir, "foo", 3, &entry) == 0 && entry.ino == 43;
+    xfs_dentry_cache_purge_mount(&mount);
+    return STALE_NEGATIVE_OBSERVED && AUTHORITATIVE_FOUND && CACHE_REPAIRED;
 }
 
 auto xfs_selftest_block_lookup_uses_leaf_index_for_misses() -> bool {

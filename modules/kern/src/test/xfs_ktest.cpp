@@ -215,6 +215,10 @@ KTEST(XFS, CloseTrimDetectsActualEofPrealloc) { KEXPECT_TRUE(ker::vfs::xfs::xfs_
 
 KTEST(XFS, DentryCacheHitsAndInvalidates) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_dentry_cache_shortform()); }
 
+KTEST(XFS, AuthoritativeLookupRepairsStaleNegative) {
+    KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_authoritative_lookup_repairs_stale_negative());
+}
+
 KTEST(XFS, BlockLookupUsesLeafIndexForMisses) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_block_lookup_uses_leaf_index_for_misses()); }
 
 KTEST(XFS, LeafIndexCompleteMarker) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_leaf_index_complete_marker()); }

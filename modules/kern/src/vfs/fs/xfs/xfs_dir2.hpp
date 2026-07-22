@@ -63,6 +63,11 @@ using XfsDirIterFn = int (*)(const XfsDirEntry* entry, void* ctx);
 // -ENOENT if not found, or negative errno on I/O error.
 auto xfs_dir_lookup(XfsInode* dp, const char* name, uint16_t namelen, XfsDirEntry* entry) -> int;
 
+// Bypass a cached answer and consult the directory data/index directly. This
+// is reserved for retrying namespace mutations after a cache-assisted lookup
+// reports ENOENT; successful and negative results still repair the cache.
+auto xfs_dir_lookup_authoritative(XfsInode* dp, const char* name, uint16_t namelen, XfsDirEntry* entry) -> int;
+
 // Look up a name already observed for a parent inode without loading that
 // parent inode.  Returns true only when the dentry cache can answer.
 auto xfs_dentry_cache_lookup_parent(XfsMountContext* mount, xfs_ino_t parent_ino, const char* name, uint16_t namelen, XfsDirEntry* entry,
@@ -117,6 +122,7 @@ void xfs_dentry_cache_invalidate_dir(XfsInode* dp);
 
 #ifdef WOS_SELFTEST
 auto xfs_selftest_dentry_cache_shortform() -> bool;
+auto xfs_selftest_authoritative_lookup_repairs_stale_negative() -> bool;
 auto xfs_selftest_block_lookup_uses_leaf_index_for_misses() -> bool;
 auto xfs_selftest_leaf_index_complete_marker() -> bool;
 auto xfs_selftest_directory_name_filter() -> bool;
