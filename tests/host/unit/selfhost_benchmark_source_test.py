@@ -128,10 +128,40 @@ def test_wos_bootstrap_distributes_only_compiler_processes() -> None:
             r'if on "\$compiler_host" "\${compiler[@]}" "\$@"; then',
             r'if [ "\$compiler_status" -ne 127 ]; then',
             r"warning: distributed compiler placement on \$compiler_host was unavailable; retrying locally",
-            r'exec "\${compiler[@]}" "\$@"',
+            r'if "\${compiler[@]}" "\$@"; then',
+            r'[ "\$link_output" -eq 1 ]',
+            r'[ -n "\$output_file" ]',
+            r'[ ! -x "\$output_file" ]',
+            r'chmod a+x -- "\$output_file"',
+            r"linked output '\$output_file' is not executable and could not be repaired",
         ],
         "WOS native compiler-only distribution",
     )
+
+
+def test_wos_bootstrap_repairs_only_link_output_mode() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        script = r'''
+set -euo pipefail
+WOS_TARGET_ARCH=x86_64-pc-wos
+source <(sed -n '/^write_clang_wrapper()/,/^}/p' tools/bootstrap.sh)
+touch "$1/link-output" "$1/object-output"
+chmod 0644 "$1/link-output" "$1/object-output"
+write_clang_wrapper "$1/clang" /usr/bin/true /tmp
+"$1/clang" -o "$1/link-output" input.c
+"$1/clang" -c -o "$1/object-output" input.c
+test -x "$1/link-output"
+test ! -x "$1/object-output"
+'''
+        result = subprocess.run(
+            ["bash", "-c", script, "wos-bootstrap-shim-test", temp_dir],
+            cwd=ROOT,
+            check=False,
+            text=True,
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            fail(f"WOS compiler shim output-mode test failed: {result.stderr}")
 
 
 def test_distributed_compiler_hosts_are_validated_before_launch() -> None:
@@ -1546,6 +1576,7 @@ def test_selfhost_report_comparator_checks_clone_build_and_total() -> None:
 if __name__ == "__main__":
     test_selfhost_runner_covers_acceptance_flow()
     test_wos_bootstrap_distributes_only_compiler_processes()
+    test_wos_bootstrap_repairs_only_link_output_mode()
     test_distributed_compiler_hosts_are_validated_before_launch()
     test_selfhost_repeatability_runner_preserves_acceptance_evidence()
     test_linux_selfhost_baseline_preserves_full_process_evidence()

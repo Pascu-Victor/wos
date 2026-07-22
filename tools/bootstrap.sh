@@ -85,8 +85,16 @@ config_dir="\$(cd "\$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
 config="\$config_dir/$WOS_TARGET_ARCH.cfg"
 use_config=0
 next_is_target=0
+next_is_output=0
 compile_only=0
+link_output=1
+output_file=""
 for arg in "\$@"; do
+    if [ "\$next_is_output" -eq 1 ]; then
+        output_file="\$arg"
+        next_is_output=0
+        continue
+    fi
     if [ "\$next_is_target" -eq 1 ]; then
         if [ "\$arg" = "$WOS_TARGET_ARCH" ]; then
             use_config=1
@@ -96,8 +104,15 @@ for arg in "\$@"; do
     fi
 
     case "\$arg" in
+        -o)
+            next_is_output=1
+            ;;
         -c)
             compile_only=1
+            link_output=0
+            ;;
+        -E|-S|-M|-MM|-fsyntax-only|--analyze)
+            link_output=0
             ;;
         --target=$WOS_TARGET_ARCH|-target=$WOS_TARGET_ARCH)
             use_config=1
@@ -153,7 +168,19 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
     fi
     echo "warning: distributed compiler placement on \$compiler_host was unavailable; retrying locally" >&2
 fi
-exec "\${compiler[@]}" "\$@"
+if "\${compiler[@]}" "\$@"; then
+    compiler_status=0
+else
+    compiler_status=\$?
+fi
+if [ "\$compiler_status" -eq 0 ] && [ "\$link_output" -eq 1 ] && [ -n "\$output_file" ] && [ -f "\$output_file" ] &&
+   [ ! -x "\$output_file" ]; then
+    if ! chmod a+x -- "\$output_file"; then
+        echo "ERROR: linked output '\$output_file' is not executable and could not be repaired" >&2
+        exit 1
+    fi
+fi
+exit "\$compiler_status"
 EOF
     chmod +x "$output"
 }
