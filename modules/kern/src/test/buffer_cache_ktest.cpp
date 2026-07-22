@@ -246,6 +246,33 @@ KTEST(BufferCache, FailedBwriteMarksCleanBufferDirtyForRetry) {
     ker::vfs::invalidate_bdev(&dev);
 }
 
+KTEST(BufferCache, JournalHoldDefersDirtyWritebackUntilRelease) {
+    ker::dev::BlockDevice dev = make_null_bdev();
+    RecordingWriteState io{};
+    dev.write_blocks = recording_write;
+    dev.private_data = &io;
+    ker::vfs::invalidate_bdev(&dev);
+
+    const uint64_t BLOCK_NO = 34;
+    ker::vfs::BufHead* bh = ker::vfs::bget(&dev, BLOCK_NO);
+    KREQUIRE_NE(bh, nullptr);
+    bh->data[0] = 0x5A;
+    ker::vfs::bdirty(bh);
+    ker::vfs::bjournal_hold(bh);
+
+    KEXPECT_EQ(ker::vfs::sync_blockdev(&dev), 0);
+    KEXPECT_EQ(io.write_calls, static_cast<size_t>(0));
+    KEXPECT_TRUE(ker::vfs::has_dirty_bdev_range(&dev, BLOCK_NO, 1));
+
+    ker::vfs::bjournal_release(bh);
+    KEXPECT_EQ(ker::vfs::sync_blockdev(&dev), 0);
+    KEXPECT_EQ(io.write_calls, static_cast<size_t>(1));
+    KEXPECT_FALSE(ker::vfs::has_dirty_bdev_range(&dev, BLOCK_NO, 1));
+
+    ker::vfs::brelse(bh);
+    ker::vfs::invalidate_bdev(&dev);
+}
+
 KTEST(BufferCache, BwriteDoesNotClearForeignWritebackMarker) {
     ker::dev::BlockDevice dev = make_null_bdev();
     RecordingWriteState io{};

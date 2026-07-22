@@ -223,6 +223,20 @@ def main() -> None:
         "background dirty writeback should skip in-flight buffers",
     )
 
+    journal_hold_body = function_body(source, "bjournal_hold")
+    require_order(
+        journal_hold_body,
+        [
+            "cache_lock.lock_irqsave()",
+            "journal_pending.fetch_add",
+            "while ((bh->flags & BH_WRITEBACK) != 0)",
+            "cache_lock.unlock_irqrestore(irqflags)",
+            "kern_yield()",
+            "cache_lock.lock_irqsave()",
+        ],
+        "journal capture must publish its hold with candidate selection and wait out older writeback",
+    )
+
     evict_body = function_body(source, "evict_lru_for_allocation")
     require_order(
         evict_body,

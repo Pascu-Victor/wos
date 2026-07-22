@@ -99,6 +99,7 @@ auto bread_multi(dev::BlockDevice* bdev, uint64_t block_no, size_t count, Buffer
 void brelse(BufHead* bh);
 
 // Prevent/re-enable writeback while a write-ahead log batch owns metadata.
+// Acquiring a hold may yield until an already-selected writeback completes.
 void bjournal_hold(BufHead* bh);
 void bjournal_release(BufHead* bh);
 

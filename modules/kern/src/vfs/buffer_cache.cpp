@@ -2961,9 +2961,23 @@ void brelse(BufHead* bh) {
 }
 
 void bjournal_hold(BufHead* bh) {
-    if (bh != nullptr) {
-        bh->journal_pending.fetch_add(1, std::memory_order_acq_rel);
+    if (bh == nullptr) {
+        return;
     }
+
+    // Publish the journal hold under the same lock that selects writeback
+    // candidates. This closes the window where writeback could observe zero
+    // journal owners and claim the buffer while a transaction starts taking
+    // its before-image. A writer that claimed the buffer first must finish
+    // before the caller is allowed to mutate it.
+    uint64_t irqflags = cache_lock.lock_irqsave();
+    bh->journal_pending.fetch_add(1, std::memory_order_acq_rel);
+    while ((bh->flags & BH_WRITEBACK) != 0) {
+        cache_lock.unlock_irqrestore(irqflags);
+        ker::mod::sched::kern_yield();
+        irqflags = cache_lock.lock_irqsave();
+    }
+    cache_lock.unlock_irqrestore(irqflags);
 }
 
 void bjournal_release(BufHead* bh) {
