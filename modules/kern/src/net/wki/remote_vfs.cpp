@@ -1733,12 +1733,21 @@ void cache_readlink_result(ProxyVfsState* state, uint32_t expected_generation, c
     state->lock.unlock();
 }
 
+struct ProxySlotCaller {
+    uint64_t pid = 0;
+    ker::mod::sched::task::TaskType type = ker::mod::sched::task::TaskType::IDLE;
+};
+
+auto current_proxy_slot_caller() -> ProxySlotCaller;
+void park_proxy_slot_caller(const ProxySlotCaller& caller, uint64_t deadline_us, bool registered);
+
 auto proxy_acquire_shared_io_slot(ProxyVfsState* state, uint64_t start_us) -> int {
     if (state == nullptr) {
         return WKI_OK;
     }
 
     uint64_t const DEADLINE_US = wki_future_deadline_us(start_us, VFS_PROXY_SLOT_WAIT_TIMEOUT_US);
+    ProxySlotCaller const CALLER = current_proxy_slot_caller();
     while (true) {
         bool expected = false;
         if (state->shared_io_in_use.compare_exchange_weak(expected, true, std::memory_order_acq_rel, std::memory_order_acquire)) {
@@ -1751,7 +1760,7 @@ auto proxy_acquire_shared_io_slot(ProxyVfsState* state, uint64_t start_us) -> in
         if (wki_now_us() >= DEADLINE_US) {
             return WKI_ERR_TIMEOUT;
         }
-        ker::mod::sched::kern_sleep_us(VFS_PROXY_CONTENTION_SLEEP_US);
+        park_proxy_slot_caller(CALLER, DEADLINE_US, false);
     }
 }
 
@@ -1810,11 +1819,6 @@ struct RoceTaggedReceive {
 auto proxy_op_slot_busy(const ProxyVfsState* state) -> bool {
     return state->op_pending.load(std::memory_order_acquire) || state->op_untracked_send_pending.load(std::memory_order_acquire);
 }
-
-struct ProxySlotCaller {
-    uint64_t pid = 0;
-    ker::mod::sched::task::TaskType type = ker::mod::sched::task::TaskType::IDLE;
-};
 
 struct ProxySlotWaiterRemoval {
     bool removed = false;

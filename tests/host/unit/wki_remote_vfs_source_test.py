@@ -1072,10 +1072,13 @@ def test_shared_io_slot_waits_are_bounded() -> None:
             "return WKI_OK",
             "if (wki_now_us() >= DEADLINE_US)",
             "return WKI_ERR_TIMEOUT",
-            "ker::mod::sched::kern_sleep_us(VFS_PROXY_CONTENTION_SLEEP_US)",
+            "ProxySlotCaller const CALLER = current_proxy_slot_caller()",
+            "park_proxy_slot_caller(CALLER, DEADLINE_US, false)",
         ],
         "shared RDMA I/O slot acquisition",
     )
+    if "kern_sleep_us" in body:
+        fail("shared RDMA I/O PROCESS contenders must use caller-aware parking")
     if "void proxy_acquire_shared_io_slot" in source:
         fail("shared RDMA I/O slot acquisition must return timeout status")
     require_tokens(
