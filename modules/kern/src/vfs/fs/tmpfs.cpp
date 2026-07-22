@@ -869,6 +869,64 @@ auto tmpfs_walk_path(const char* path, bool create_intermediate) -> TmpNode* {
     return tmpfs_walk_path(root_node, path, create_intermediate);
 }
 
+auto tmpfs_mkdir_path(TmpNode* root, const char* path, uint32_t mode) -> int {
+    if (root == nullptr || path == nullptr) {
+        return -EINVAL;
+    }
+
+    while (*path == '/') {
+        ++path;
+    }
+    if (*path == '\0') {
+        return -EEXIST;
+    }
+
+    tmpfs_lock.lock();
+    int const RESULT = [&]() -> int {
+        TmpNode* parent = root;
+        for (;;) {
+            std::array<char, TMPFS_NAME_MAX> component{};
+            size_t component_len = 0;
+            while (path[component_len] != '\0' && path[component_len] != '/') {
+                if (component_len >= component.size() - 1) {
+                    return -ENAMETOOLONG;
+                }
+                component.at(component_len) = path[component_len];
+                ++component_len;
+            }
+            component.at(component_len) = '\0';
+            path += component_len;
+            while (*path == '/') {
+                ++path;
+            }
+
+            if (parent->type != TmpNodeType::DIRECTORY) {
+                return -ENOTDIR;
+            }
+
+            TmpNode* child = tmpfs_lookup(parent, component.data());
+            if (*path == '\0') {
+                if (child != nullptr) {
+                    return -EEXIST;
+                }
+                child = tmpfs_mkdir(parent, component.data());
+                if (child == nullptr) {
+                    return -ENOMEM;
+                }
+                child->mode = mode & 07777;
+                return 0;
+            }
+
+            if (child == nullptr) {
+                return -ENOENT;
+            }
+            parent = child;
+        }
+    }();
+    tmpfs_lock.unlock();
+    return RESULT;
+}
+
 // --- Initialization ---
 
 void register_tmpfs() {

@@ -9817,20 +9817,20 @@ auto vfs_realpath(const char* path, char* buf, size_t bufsize, size_t* len_out) 
 }
 
 namespace {
-auto vfs_mkdir_cached_existing_directory_result(const char* abs_path, MountPoint const* mount, size_t known_abs_path_len = UNKNOWN_PATH_LEN,
-                                                uint64_t known_abs_path_hash = UNKNOWN_PATH_HASH) -> int {
+auto vfs_mkdir_cached_existing_result(const char* abs_path, MountPoint const* mount, size_t known_abs_path_len = UNKNOWN_PATH_LEN,
+                                      uint64_t known_abs_path_hash = UNKNOWN_PATH_HASH) -> int {
     if (abs_path == nullptr || mount == nullptr || !metadata_cacheable_fs(mount->fs_type)) {
         return -EAGAIN;
     }
 
     Stat cached{};
     int const CACHED_STAT = metadata_cache_lookup_mount_stat(abs_path, mount, true, true, &cached, known_abs_path_len, known_abs_path_hash);
-    if (CACHED_STAT == 0 && (cached.st_mode & static_cast<mode_t>(S_IFMT)) == static_cast<mode_t>(S_IFDIR)) {
-        return 0;
+    if (CACHED_STAT == 0) {
+        return -EEXIST;
     }
 
     int const EXISTENCE_CACHED = existence_cache_lookup_mount(abs_path, mount, true, known_abs_path_len, known_abs_path_hash);
-    return EXISTENCE_CACHED == 0 ? 0 : -EAGAIN;
+    return EXISTENCE_CACHED == 0 ? -EEXIST : -EAGAIN;
 }
 
 auto vfs_mkdir_resolved_path(const char* abs_path, int mode, size_t known_abs_path_len = UNKNOWN_PATH_LEN,
@@ -9849,30 +9849,23 @@ auto vfs_mkdir_resolved_path(const char* abs_path, int mode, size_t known_abs_pa
     size_t const FS_PATH_LEN = strip_mount_prefix_len(mount, abs_path, known_abs_path_len);
 
     if (fs_path[0] == '\0') {
-        return 0;
+        return -EEXIST;
     }
 
-    if (vfs_mkdir_cached_existing_directory_result(abs_path, mount, known_abs_path_len, known_abs_path_hash) == 0) {
-        return 0;
+    int const CACHED_EXISTING = vfs_mkdir_cached_existing_result(abs_path, mount, known_abs_path_len, known_abs_path_hash);
+    if (CACHED_EXISTING == -EEXIST) {
+        return CACHED_EXISTING;
     }
 
     if (mount->fs_type == FSType::TMPFS) {
-        auto* node = ker::vfs::tmpfs::tmpfs_walk_path(tmpfs_root_for_mount(mount), fs_path, true);
-        if (node == nullptr) {
-            return -1;
+        int const R = ker::vfs::tmpfs::tmpfs_mkdir_path(tmpfs_root_for_mount(mount), fs_path, static_cast<uint32_t>(mode));
+        if (R == 0) {
+            vfs_cache_notify_path_changed(abs_path, nullptr);
+            Stat created_stat{};
+            static_cast<void>(
+                vfs_stat_resolved_cache_or_impl(abs_path, false, true, false, &created_stat, known_abs_path_len, known_abs_path_hash));
         }
-        auto* stat_node = ker::vfs::tmpfs::tmpfs_canonical_node(node);
-        Stat created_stat{};
-        bool const HAVE_DIRECTORY_STAT = stat_node != nullptr && stat_node->type == ker::vfs::tmpfs::TmpNodeType::DIRECTORY;
-        if (HAVE_DIRECTORY_STAT) {
-            fill_tmpfs_node_stat(mount->dev_id, stat_node, &created_stat);
-        }
-        vfs_cache_notify_path_changed(abs_path, nullptr);
-        if (HAVE_DIRECTORY_STAT) {
-            metadata_cache_store_non_symlink_stat_variants(abs_path, mount->fs_type, mount->dev_id, created_stat, metadata_snapshot_stamp(),
-                                                           known_abs_path_len, mount, known_abs_path_hash);
-        }
-        return 0;
+        return R;
     }
 
     if (mount->fs_type == FSType::XFS) {
@@ -9880,8 +9873,6 @@ auto vfs_mkdir_resolved_path(const char* abs_path, int mode, size_t known_abs_pa
         auto* xctx = static_cast<ker::vfs::xfs::XfsMountContext*>(mount->private_data);
         Stat created_stat{};
         int const R = ker::vfs::xfs::xfs_mkdir_path(fs_path, mode, xctx, &created_stat, FS_PATH_LEN);
-        // mkdir -p calls mkdir on existing dirs; treat EEXIST as success
-        int const RESULT = (R == -EEXIST) ? 0 : R;
         if (R == 0) {
             vfs_cache_notify_path_changed(abs_path, nullptr);
             metadata_cache_store_non_symlink_stat_variants(abs_path, mount->fs_type, mount->dev_id, created_stat, metadata_snapshot_stamp(),
@@ -9890,22 +9881,21 @@ auto vfs_mkdir_resolved_path(const char* abs_path, int mode, size_t known_abs_pa
             metadata_cache_store_non_symlink_stat_variants(abs_path, mount->fs_type, mount->dev_id, created_stat, metadata_snapshot_stamp(),
                                                            known_abs_path_len, mount, known_abs_path_hash);
         }
-        return RESULT;
+        return R;
     }
 
     if (mount->fs_type == FSType::REMOTE) {
         int const R = ker::net::wki::wki_remote_vfs_mkdir(mount->private_data, fs_path, mode);
-        int const RESULT = (R == -EEXIST) ? 0 : R;
         if (R == 0) {
             vfs_cache_notify_path_changed(abs_path, nullptr);
         }
-        return RESULT;
+        return R;
     }
 
-    // For other mounts (devfs, procfs, etc.) return 0 if the directory exists
+    // Read-only synthetic filesystems still report an existing final component.
     ker::vfs::Stat st{};
     if (vfs_stat(abs_path, &st) == 0) {
-        return 0;
+        return -EEXIST;
     }
     return -ENOSYS;
 }
@@ -16662,7 +16652,7 @@ auto vfs_selftest_mkdir_seeds_metadata_cache() -> bool {
     ok = ok && vfs_lstat(PATH, &st) == 0 && (st.st_mode & S_IFMT) == S_IFDIR;
     vfs_get_cache_perf_snapshot(after_lstat);
     ok = ok && after_lstat.metadata_hits > after_mkdir.metadata_hits;
-    ok = ok && vfs_mkdir(PATH, 0755) == 0;
+    ok = ok && vfs_mkdir(PATH, 0755) == -EEXIST;
     vfs_get_cache_perf_snapshot(after_repeat_mkdir);
     ok = ok && after_repeat_mkdir.metadata_hits > after_lstat.metadata_hits;
 

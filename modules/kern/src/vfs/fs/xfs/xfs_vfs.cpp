@@ -5138,11 +5138,11 @@ auto xfs_mkdir_path(const char* fs_path, int mode, XfsMountContext* ctx, ker::vf
                     fill_stat(existing, statbuf);
                 }
                 xfs_inode_release(existing);
-                return IS_DIR ? -EEXIST : -ENOTDIR;
+                return -EEXIST;
             }
         }
         if (parent_ret == -ENOTDIR) {
-            return -ENOENT;
+            return -ENOTDIR;
         }
         return parent_ret;
     }
@@ -5158,7 +5158,7 @@ auto xfs_mkdir_path(const char* fs_path, int mode, XfsMountContext* ctx, ker::vf
             }
         }
         xfs_inode_release(parent_ip);
-        return existing.ftype == XFS_DIR3_FT_DIR ? -EEXIST : -ENOTDIR;
+        return -EEXIST;
     }
     if (LOOKUP_RET != -ENOENT) {
         xfs_inode_release(parent_ip);

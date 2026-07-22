@@ -109,6 +109,9 @@ auto tmpfs_directory_is_empty(const TmpNode* dir) -> bool;
 // The path should NOT have a leading "/" (it's relative to tmpfs root).
 auto tmpfs_walk_path(TmpNode* root, const char* path, bool create_intermediate) -> TmpNode*;
 auto tmpfs_walk_path(const char* path, bool create_intermediate) -> TmpNode*;
+// Create exactly the final path component without creating missing parents.
+// Returns -EEXIST when the final component already exists.
+auto tmpfs_mkdir_path(TmpNode* root, const char* path, uint32_t mode) -> int;
 
 // File-level operations
 auto create_root_file(TmpNode* root) -> ker::vfs::File*;

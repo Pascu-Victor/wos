@@ -729,12 +729,29 @@ KTEST(VFS, RealpathFastPathFollowsSimpleSymlink) {
     KEXPECT_EQ(ker::vfs::vfs_rmdir(TARGET), 0);
 }
 
-KTEST(VFS, Mkdir) {
-    KEXPECT_EQ(ker::vfs::vfs_mkdir("/tmp/ktest_dir", 0755), 0);
+KTEST(VFS, MkdirExclusiveFinalComponent) {
+    constexpr const char* DIR = "/tmp/ktest_dir";
+    constexpr const char* MISSING_CHILD = "/tmp/ktest_missing_parent/child";
+    constexpr const char* FILE_PATH = "/tmp/ktest_mkdir_existing_file";
+    static_cast<void>(ker::vfs::vfs_rmdir(DIR));
+    static_cast<void>(ker::vfs::vfs_rmdir("/tmp/ktest_missing_parent"));
+    static_cast<void>(ker::vfs::vfs_unlink(FILE_PATH));
+
+    KEXPECT_EQ(ker::vfs::vfs_mkdir(DIR, 0755), 0);
+    KEXPECT_EQ(ker::vfs::vfs_mkdir(DIR, 0755), -EEXIST);
+    KEXPECT_EQ(ker::vfs::vfs_mkdir(MISSING_CHILD, 0755), -ENOENT);
 
     ker::vfs::Stat st{};
-    KEXPECT_EQ(ker::vfs::vfs_stat("/tmp/ktest_dir", &st), 0);
+    KEXPECT_EQ(ker::vfs::vfs_stat(DIR, &st), 0);
     KEXPECT_TRUE((st.st_mode & ker::vfs::S_IFDIR) != 0U);
+
+    ker::vfs::File* file = ker::vfs::vfs_open_file(FILE_PATH, ker::vfs::O_CREAT | 1, 0644);
+    KREQUIRE_NE(file, nullptr);
+    ker::vfs::vfs_put_file(file);
+    KEXPECT_EQ(ker::vfs::vfs_mkdir(FILE_PATH, 0755), -EEXIST);
+
+    KEXPECT_EQ(ker::vfs::vfs_unlink(FILE_PATH), 0);
+    KEXPECT_EQ(ker::vfs::vfs_rmdir(DIR), 0);
 }
 
 KTEST(VFS, TmpfsMountHasSeparateRoot) {
