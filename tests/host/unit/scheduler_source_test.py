@@ -1699,8 +1699,23 @@ def test_timer_waitpid_repair_rechecks_stranded_waiters_without_sigchld() -> Non
 
     require_tokens(
         source,
-        ["WAITPID_REPAIR_FALLBACK_MIN_US = 50'000ULL"],
+        [
+            "WAITPID_REPAIR_FALLBACK_MIN_US = 50'000ULL",
+            "WAITPID_COMPLETION_CLAIM_LEASE_US = 1'000'000ULL",
+        ],
         "waitpid fallback repair threshold",
+    )
+    claim_recovery_body = function_body(source, "recover_stalled_waitpid_completion_claim")
+    require_tokens(
+        claim_recovery_body,
+        [
+            "waiter->waitpid_completion_claimed.load(std::memory_order_acquire)",
+            "waiter->waitpid_claim_observed_us.compare_exchange_strong",
+            "now_us - observed_us < WAITPID_COMPLETION_CLAIM_LEASE_US",
+            "waiter->waitpid_completion_claimed.compare_exchange_strong(expected, false",
+            "waiter->waitpid_claim_observed_us.store(0, std::memory_order_release)",
+        ],
+        "stalled waitpid completion claim recovery lease",
     )
     require_tokens(
         repair_due_body,
@@ -1733,6 +1748,7 @@ def test_timer_waitpid_repair_rechecks_stranded_waiters_without_sigchld() -> Non
             "TIMED_SCAN && wake_count < PENDING_WAKE_LIMIT",
             "waitpid_repair_due(t, WAIT_SCAN_NOW_US) && t->try_acquire()",
             "t->waitpid_last_repair_us = WAIT_SCAN_NOW_US;",
+            "recover_stalled_waitpid_completion_claim(waiter, WAIT_SCAN_NOW_US)",
             "if (complete_or_preserve_waitpid_block(waiter))",
             "reschedule_task_for_cpu(target_cpu, waiter);",
             "waiter->release();",
@@ -1750,6 +1766,12 @@ def test_timer_waitpid_repair_rechecks_stranded_waiters_without_sigchld() -> Non
         "if (complete_or_preserve_waitpid_block(waiter))",
         "reschedule_task_for_cpu(target_cpu, waiter);",
         "waitpid fallback repair must only wake after the wait resolves",
+    )
+    require_order(
+        timer_body,
+        "recover_stalled_waitpid_completion_claim(waiter, WAIT_SCAN_NOW_US)",
+        "if (complete_or_preserve_waitpid_block(waiter))",
+        "timer repair must reclaim a leased-out claim before rechecking waitpid completion",
     )
     repair_completion_body = timer_body[timer_body.find("for (uint32_t i = 0; i < waitpid_repair_count; ++i)") :]
     if "waiter->waitpid_last_repair_us = WAIT_SCAN_NOW_US;" in repair_completion_body:

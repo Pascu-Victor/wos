@@ -355,6 +355,7 @@ struct Task {
     uint64_t wait_resume_rsp_user_addr{};  // Userspace RSP expected when returning from waitpid
     uint64_t wait_resume_rsp_phys_addr{};  // Last translated physical address for wait_resume_rsp_user_addr (debug; may change after COW)
     uint64_t waitpid_last_repair_us{};     // Last fallback waitpid repair attempt while still blocked.
+    std::atomic<uint64_t> waitpid_claim_observed_us{0};   // First timer observation of a continuously held completion claim.
     std::atomic<bool> waitpid_completion_claimed{false};  // One scheduler/exit completion per blocked waitpid.
 
     // Signal state.
@@ -818,6 +819,7 @@ inline void task_clear_waitpid_block_state(Task& task) {
     task.wait_resume_rsp_user_addr = 0;
     task.wait_resume_rsp_phys_addr = 0;
     task.waitpid_last_repair_us = 0;
+    task.waitpid_claim_observed_us.store(0, std::memory_order_release);
     task.clear_wait_channel();
     task.waitpid_completion_claimed.store(false, std::memory_order_release);
 }
@@ -827,7 +829,10 @@ inline void task_clear_waitpid_block_state(Task& task) {
     return task.waitpid_completion_claimed.compare_exchange_strong(expected, true, std::memory_order_acq_rel, std::memory_order_acquire);
 }
 
-inline void task_release_waitpid_completion_claim(Task& task) { task.waitpid_completion_claimed.store(false, std::memory_order_release); }
+inline void task_release_waitpid_completion_claim(Task& task) {
+    task.waitpid_claim_observed_us.store(0, std::memory_order_release);
+    task.waitpid_completion_claimed.store(false, std::memory_order_release);
+}
 
 #ifdef WOS_SELFTEST
 auto task_selftest_fd_clone_failure_releases_refs() -> bool;

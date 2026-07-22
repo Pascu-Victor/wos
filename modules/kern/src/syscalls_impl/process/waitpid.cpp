@@ -463,6 +463,7 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t ru
         }
 
         current_task->waitpid_completion_claimed.store(false, std::memory_order_release);
+        current_task->waitpid_claim_observed_us.store(0, std::memory_order_release);
         current_task->waitpid_last_repair_us = 0;
         current_task->waitpid_publish_pending.store(true, std::memory_order_release);
         current_task->waiting_for_pid = WAIT_SELECTOR;
@@ -587,6 +588,7 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t ru
     // Prepare the current task's wait state before publishing ourselves on the child's
     // waiter list. Once the child can see our PID, it may wake us immediately.
     current_task->waitpid_completion_claimed.store(false, std::memory_order_release);
+    current_task->waitpid_claim_observed_us.store(0, std::memory_order_release);
     current_task->waitpid_last_repair_us = 0;
     current_task->waitpid_publish_pending.store(true, std::memory_order_release);
     current_task->waiting_for_pid = TARGET_PID;

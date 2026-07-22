@@ -71,11 +71,14 @@ def require_task_has_publish_fence(task_hpp: str, task_cpp: str) -> None:
         fail("Task is missing waitpid completion single-winner atomic")
     if "uint64_t waitpid_last_repair_us{}" not in task_hpp:
         fail("Task is missing waitpid fallback repair backoff timestamp")
+    if "std::atomic<uint64_t> waitpid_claim_observed_us{0}" not in task_hpp:
+        fail("Task is missing waitpid completion-claim lease timestamp")
     for snippet in [
         "task_try_claim_waitpid_completion",
         "task_release_waitpid_completion_claim",
         "compare_exchange_strong(expected, true, std::memory_order_acq_rel, std::memory_order_acquire)",
         "task.waitpid_last_repair_us = 0",
+        "task.waitpid_claim_observed_us.store(0, std::memory_order_release)",
         "task.waitpid_completion_claimed.store(false, std::memory_order_release)",
     ]:
         if snippet not in task_hpp:
@@ -271,6 +274,7 @@ def require_interrupted_waitpid_cleans_stale_wait_state(task_hpp: str, task_cpp:
         "task.wait_resume_rsp_user_addr = 0",
         "task.waitpid_last_repair_us = 0",
         "task.clear_wait_channel()",
+        "task.waitpid_claim_observed_us.store(0, std::memory_order_release)",
         "task.waitpid_completion_claimed.store(false, std::memory_order_release)",
     ]:
         if snippet not in task_hpp:

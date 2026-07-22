@@ -490,6 +490,7 @@ inline constexpr int WOS_WSTOPPED = 2;
 inline constexpr int STOP_STATUS_LOW = 0x7f;
 inline constexpr uint64_t SIGCHLD_MASK = 1ULL << (17 - 1);
 inline constexpr uint64_t WAITPID_REPAIR_FALLBACK_MIN_US = 50'000ULL;
+inline constexpr uint64_t WAITPID_COMPLETION_CLAIM_LEASE_US = 1'000'000ULL;
 
 inline auto job_control_stop_status(const task::Task& task) -> int32_t {
     uint32_t const SIGNAL = task.jobctl_stop_signal != 0 ? task.jobctl_stop_signal : 19;
@@ -611,6 +612,35 @@ inline auto waitpid_repair_due(const task::Task* waiter, uint64_t now_us) -> boo
     }
     uint64_t const LAST_REPAIR_US = waiter->waitpid_last_repair_us != 0 ? waiter->waitpid_last_repair_us : waiter->last_sleep_start_us;
     return LAST_REPAIR_US != 0 && now_us > LAST_REPAIR_US && now_us - LAST_REPAIR_US >= WAITPID_REPAIR_FALLBACK_MIN_US;
+}
+
+inline auto recover_stalled_waitpid_completion_claim(task::Task* waiter, uint64_t now_us) -> bool {
+    if (waiter == nullptr || !waiter->wait_channel_is(task::WaitChannelKind::WAITPID) || waiter->waiting_for_pid == 0 ||
+        !waiter->waitpid_completion_claimed.load(std::memory_order_acquire)) {
+        if (waiter != nullptr) {
+            waiter->waitpid_claim_observed_us.store(0, std::memory_order_release);
+        }
+        return false;
+    }
+
+    uint64_t observed_us = waiter->waitpid_claim_observed_us.load(std::memory_order_acquire);
+    if (observed_us == 0) {
+        (void)waiter->waitpid_claim_observed_us.compare_exchange_strong(observed_us, now_us, std::memory_order_acq_rel,
+                                                                        std::memory_order_acquire);
+        return false;
+    }
+    if (now_us <= observed_us || now_us - observed_us < WAITPID_COMPLETION_CLAIM_LEASE_US) {
+        return false;
+    }
+
+    bool expected = true;
+    if (!waiter->waitpid_completion_claimed.compare_exchange_strong(expected, false, std::memory_order_acq_rel,
+                                                                    std::memory_order_acquire)) {
+        waiter->waitpid_claim_observed_us.store(0, std::memory_order_release);
+        return false;
+    }
+    waiter->waitpid_claim_observed_us.store(0, std::memory_order_release);
+    return true;
 }
 
 inline auto active_waitpid_unwaited_child(task::Task* child, void* raw_waiter) -> bool {
@@ -4520,6 +4550,7 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
     }
     for (uint32_t i = 0; i < waitpid_repair_count; ++i) {
         task::Task* waiter = pending_wake_slot(waitpid_repair, i);
+        (void)recover_stalled_waitpid_completion_claim(waiter, WAIT_SCAN_NOW_US);
         if (complete_or_preserve_waitpid_block(waiter)) {
             uint64_t target_cpu = waiter->cpu;
             if (target_cpu >= smt::get_core_count()) {
@@ -8235,6 +8266,29 @@ auto scheduler_selftest_handoff_preserves_runnable_event_token() -> bool {
 
     return outgoing.sched_queue == task::Task::sched_queue::RUNNABLE && outgoing.wakeup_pending.load(std::memory_order_acquire) &&
            waitpid_repair_task == nullptr;
+}
+
+auto scheduler_selftest_stalled_waitpid_claim_recovery_is_leased() -> bool {
+    task::Task waiter{};
+    constexpr uint64_t FIRST_OBSERVATION_US = 100;
+
+    waiter.waiting_for_pid = WAIT_ANY_CHILD;
+    waiter.set_wait_channel("waitpid", task::WaitChannelKind::WAITPID);
+    waiter.waitpid_completion_claimed.store(true, std::memory_order_release);
+
+    bool const FIRST_OBSERVATION_ONLY = !recover_stalled_waitpid_completion_claim(&waiter, FIRST_OBSERVATION_US) &&
+                                        waiter.waitpid_completion_claimed.load(std::memory_order_acquire) &&
+                                        waiter.waitpid_claim_observed_us.load(std::memory_order_acquire) == FIRST_OBSERVATION_US;
+    bool const PRESERVED_BEFORE_LEASE =
+        !recover_stalled_waitpid_completion_claim(&waiter, FIRST_OBSERVATION_US + WAITPID_COMPLETION_CLAIM_LEASE_US - 1) &&
+        waiter.waitpid_completion_claimed.load(std::memory_order_acquire);
+    bool const RECOVERED_AT_LEASE =
+        recover_stalled_waitpid_completion_claim(&waiter, FIRST_OBSERVATION_US + WAITPID_COMPLETION_CLAIM_LEASE_US) &&
+        !waiter.waitpid_completion_claimed.load(std::memory_order_acquire) &&
+        waiter.waitpid_claim_observed_us.load(std::memory_order_acquire) == 0;
+
+    task::task_clear_waitpid_block_state(waiter);
+    return FIRST_OBSERVATION_ONLY && PRESERVED_BEFORE_LEASE && RECOVERED_AT_LEASE;
 }
 
 auto scheduler_selftest_reserved_wake_precedes_handoff_commit() -> bool {
