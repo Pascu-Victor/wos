@@ -133,11 +133,10 @@ def test_wos_bootstrap_distributes_only_compiler_processes() -> None:
             r'compiler_slot_cleanup() {',
             r'compiler_response="\$(mktemp "\$compiler_responses/clang.XXXXXX")"',
             r'''printf '%q\n' "\$arg" >> "\$compiler_response"''',
-            r'env -i PATH="\$compiler_remote_path" HOME="\${HOME:-/root}" TMPDIR="\${TMPDIR:-/tmp}"',
+            r'env -i PATH="\$compiler_remote_path" HOME="\${HOME:-/root}" TMPDIR="\${TMPDIR:-/tmp}" TZ=UTC0',
             r'on "\$compiler_host" "\${compiler[@]}" -fno-temp-file "@\$compiler_response"',
             r'compiler_slot_cleanup',
-            r'if [ "\$compiler_status" -ne 127 ]; then',
-            r"warning: distributed compiler placement on \$compiler_host was unavailable; retrying locally",
+            r"warning: distributed compiler on \$compiler_host failed with status \$compiler_status; retrying locally",
             r'if "\${compiler[@]}" "\$@"; then',
             r'[ "\$link_output" -eq 1 ]',
             r'[ -n "\$output_file" ]',
@@ -244,6 +243,7 @@ def test_wos_bootstrap_remote_response_file_preserves_arguments() -> None:
         mock_on.write_text(
             r'''#!/bin/bash
 set -eu
+[ "${TZ:-}" = UTC0 ]
 shift
 exec "$@"
 ''',
@@ -293,6 +293,45 @@ test -s "$1/object with spaces.o"
         )
         if result.returncode != 0:
             fail(f"WOS compiler shim response-file test failed: {result.stderr}")
+
+
+def test_wos_bootstrap_retries_failed_remote_compiler_locally() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp = Path(temp_dir)
+        mock_on = temp / "on"
+        mock_on.write_text("#!/bin/bash\nexit 1\n", encoding="ascii")
+        mock_on.chmod(0o755)
+        mock_compiler = temp / "system-clang"
+        mock_compiler.write_text(
+            '#!/bin/bash\nprintf \'local\\n\' > "$WOS_FALLBACK_MARKER"\n',
+            encoding="ascii",
+        )
+        mock_compiler.chmod(0o755)
+        script = r'''
+set -euo pipefail
+WOS_TARGET_ARCH=x86_64-pc-wos
+source <(sed -n '/^write_clang_wrapper()/,/^}/p' tools/bootstrap.sh)
+write_clang_wrapper "$1/clang" "$1/system-clang" /tmp
+PATH="$1:$PATH" \
+    WOS_FALLBACK_MARKER="$1/fallback-marker" \
+    WOS_DISTRIBUTED_COMPILER=1 \
+    WOS_DISTRIBUTED_COMPILER_HOSTS=wos-0,wos-1 \
+    WOS_DISTRIBUTED_COMPILER_STATE="$1/compiler-state" \
+    WOS_NINJA_JOBS=1 \
+    "$1/clang" -c -o "$1/object.o" input.c
+test "$(cat "$1/fallback-marker")" = local
+'''
+        result = subprocess.run(
+            ["bash", "-c", script, "wos-bootstrap-fallback-test", temp_dir],
+            cwd=ROOT,
+            check=False,
+            text=True,
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            fail(f"WOS compiler shim local fallback test failed: {result.stderr}")
+        if "failed with status 1; retrying locally" not in result.stderr:
+            fail("WOS compiler shim did not report the remote failure before local retry")
 
 
 def test_distributed_compiler_hosts_are_validated_before_launch() -> None:
@@ -1711,6 +1750,7 @@ if __name__ == "__main__":
     test_wos_bootstrap_repairs_only_link_output_mode()
     test_wos_bootstrap_caps_concurrent_compilers_per_host()
     test_wos_bootstrap_remote_response_file_preserves_arguments()
+    test_wos_bootstrap_retries_failed_remote_compiler_locally()
     test_distributed_compiler_hosts_are_validated_before_launch()
     test_selfhost_repeatability_runner_preserves_acceptance_evidence()
     test_linux_selfhost_baseline_preserves_full_process_evidence()

@@ -229,7 +229,7 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
         fi
     done
     compiler_remote_path="\${PATH:-/usr/bin:/bin}"
-    if env -i PATH="\$compiler_remote_path" HOME="\${HOME:-/root}" TMPDIR="\${TMPDIR:-/tmp}" \
+    if env -i PATH="\$compiler_remote_path" HOME="\${HOME:-/root}" TMPDIR="\${TMPDIR:-/tmp}" TZ=UTC0 \
         on "\$compiler_host" "\${compiler[@]}" -fno-temp-file "@\$compiler_response"; then
         compiler_status=0
     else
@@ -240,10 +240,7 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
     if [ "\$compiler_status" -eq 0 ]; then
         exit 0
     fi
-    if [ "\$compiler_status" -ne 127 ]; then
-        exit "\$compiler_status"
-    fi
-    echo "warning: distributed compiler placement on \$compiler_host was unavailable; retrying locally" >&2
+    echo "warning: distributed compiler on \$compiler_host failed with status \$compiler_status; retrying locally" >&2
 fi
 if "\${compiler[@]}" "\$@"; then
     compiler_status=0
