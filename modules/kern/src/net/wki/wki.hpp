@@ -698,6 +698,11 @@ auto wki_wait_for_op(WkiWaitEntry* entry, uint64_t timeout_us) -> int;
 // instead of entering a long scheduler park.
 auto wki_current_wait_must_drive_progress() -> bool;
 
+// True when the current PROCESS task is at an in-kernel syscall point where
+// the scheduler can park and later resume its kernel stack. Syscall entry may
+// have IF masked; preemptible_syscall_park() preserves that state itself.
+auto wki_current_process_wait_can_park() -> bool;
+
 // Wake a waiting task. Called from RX handler context.
 void wki_wake_op(WkiWaitEntry* entry, int result);
 

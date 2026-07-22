@@ -776,6 +776,8 @@ void publish_claimed_wait_entry(WkiWaitEntry* entry, int result) {
 
 }  // namespace
 
+auto wki_current_process_wait_can_park() -> bool { return process_wait_can_park(mod::sched::get_current_task()); }
+
 auto wki_wait_for_op(WkiWaitEntry* entry, uint64_t timeout_us) -> int {
     // Record the calling task so wake_op can send an IPI. Do not reset
     // state/result here: many callers publish the stack wait entry before
@@ -825,7 +827,7 @@ auto wki_wait_for_op(WkiWaitEntry* entry, uint64_t timeout_us) -> int {
             next_diag_us = wki_future_deadline_us(NOW_US, WKI_WAIT_DIAG_INTERVAL_US);
         }
         auto* waiter_task = entry->task.load(std::memory_order_acquire);
-        bool const PROCESS_CAN_PARK = process_wait_can_park(waiter_task);
+        bool const PROCESS_CAN_PARK = wki_current_process_wait_can_park();
         if (PROCESS_CAN_PARK) {
             mod::sched::preemptible_syscall_park("wki_wait", entry->deadline_us);
         } else if (waiter_task != nullptr) {

@@ -154,7 +154,7 @@ def test_process_wait_parks_only_at_safe_syscall_points() -> None:
     require_tokens(
         wait_body,
         [
-            "bool const PROCESS_CAN_PARK = process_wait_can_park(waiter_task)",
+            "bool const PROCESS_CAN_PARK = wki_current_process_wait_can_park()",
             'mod::sched::preemptible_syscall_park("wki_wait", entry->deadline_us)',
             "TaskType::DAEMON",
             "mod::sched::kern_block()",
@@ -173,7 +173,7 @@ def test_process_wait_parks_only_at_safe_syscall_points() -> None:
         fail("WKI PROCESS park branch must not append a scheduler yield or block")
     require_order(
         wait_body,
-        "process_wait_can_park(waiter_task)",
+        "wki_current_process_wait_can_park()",
         'waiter_task->set_wait_channel("wki_wait")',
         "proxy-exec park exclusion must be checked before replacing the typed wait channel",
     )

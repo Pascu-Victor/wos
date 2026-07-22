@@ -568,9 +568,7 @@ def test_proxy_op_slot_waits_are_bounded() -> None:
             "wki_current_wait_must_drive_progress()",
             "wki_spin_yield()",
             "caller.type == ker::mod::sched::task::TaskType::PROCESS",
-            "bool const SYSCALL_PARK_SAFE",
-            "task->syscall_account_start_us != 0",
-            "ker::mod::sched::interrupts_enabled()",
+            "wki_current_process_wait_can_park()",
             "uint64_t const PARK_DEADLINE_US",
             'ker::mod::sched::preemptible_syscall_park("wki_vfs_slot", PARK_DEADLINE_US)',
             "if (!registered)",
@@ -584,9 +582,13 @@ def test_proxy_op_slot_waits_are_bounded() -> None:
         [
             "std::atomic<bool> retirement_pending{false};",
             "auto wki_current_wait_must_drive_progress() -> bool;",
+            "auto wki_current_process_wait_can_park() -> bool;",
         ],
         "WKI progress-driving wait API",
     )
+    park_body = function_body(source, "park_proxy_slot_caller")
+    if "interrupts_enabled()" in park_body:
+        fail("remote VFS PROCESS park must accept the IF-masked syscall entry state")
     require_order(
         function_body(wki_source, "wki_wait_cleanup_for_task"),
         [

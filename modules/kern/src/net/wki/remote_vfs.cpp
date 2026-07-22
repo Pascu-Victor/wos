@@ -1976,10 +1976,7 @@ void park_proxy_slot_caller(const ProxySlotCaller& caller, uint64_t deadline_us,
         return;
     }
     if (caller.type == ker::mod::sched::task::TaskType::PROCESS) {
-        auto* task = ker::mod::sched::get_current_task();
-        bool const SYSCALL_PARK_SAFE = task != nullptr && task->syscall_account_start_us != 0 && ker::mod::sched::preempt_count() == 0 &&
-                                       ker::mod::sched::interrupts_enabled();
-        if (!SYSCALL_PARK_SAFE || task->has_interrupting_signal_pending()) {
+        if (!wki_current_process_wait_can_park()) {
             // File-backed page faults can reach remote reads on a PROCESS task
             // outside a syscall safe point. Preserve IRQ/exception state there.
             // Pending signals also make syscall park return immediately; this
@@ -1987,6 +1984,9 @@ void park_proxy_slot_caller(const ProxySlotCaller& caller, uint64_t deadline_us,
             ker::mod::sched::kern_yield();
             return;
         }
+        // Syscall entry may have IF masked. The shared WKI eligibility check
+        // deliberately accepts that state because preemptible_syscall_park()
+        // preserves and restores the caller's interrupt state itself.
         uint64_t const PARK_DEADLINE_US =
             registered ? deadline_us : wki_future_deadline_us(NOW_US, std::min(REMAINING_US, VFS_PROXY_CONTENTION_SLEEP_US));
         ker::mod::sched::preemptible_syscall_park("wki_vfs_slot", PARK_DEADLINE_US);
