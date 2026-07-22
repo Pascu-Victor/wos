@@ -127,6 +127,10 @@ def test_wos_bootstrap_distributes_only_compiler_processes() -> None:
             r'compiler_jobs_per_host="\${WOS_DISTRIBUTED_COMPILER_JOBS_PER_HOST:-}"',
             r'compiler_total_jobs="\${WOS_NINJA_JOBS:-\${WOS_BUILD_JOBS:-}}"',
             r'compiler_jobs_per_host="\$(((compiler_total_jobs + \${#compiler_hosts[@]} - 1) / \${#compiler_hosts[@]}))"',
+            r'compiler_preprocessed_language=cpp-output',
+            r'compiler_preprocessed_language=c++-cpp-output',
+            r'compiler_input="\$(mktemp "\$compiler_responses/clang-input.XXXXXX")"',
+            r'"\${compiler[@]}" "\$@" -E -o "\$compiler_input" -Wno-unused-command-line-argument',
             r'while ! mkdir "\$compiler_lock" 2>/dev/null; do',
             r'compiler_candidate_slot="\$compiler_host_slots/\$compiler_slot_index"',
             r'if mkdir "\$compiler_candidate_slot" 2>/dev/null; then',
@@ -134,8 +138,10 @@ def test_wos_bootstrap_distributes_only_compiler_processes() -> None:
             r'compiler_slot_cleanup() {',
             r'compiler_response="\$(mktemp "\$compiler_responses/clang.XXXXXX")"',
             r'''printf '%q\n' "\$arg" >> "\$compiler_response"''',
+            r'for arg in -x "\$compiler_preprocessed_language" -Wno-unused-command-line-argument "\$compiler_input"; do',
             r'env -i PATH="\$compiler_remote_path" HOME="\${HOME:-/root}" TMPDIR="\${TMPDIR:-/tmp}" TZ=UTC0',
             r'on "\$compiler_host" "\${compiler[@]}" -fno-temp-file "@\$compiler_response"',
+            r'rm -f -- "\$compiler_input"',
             r'compiler_slot_cleanup',
             r"warning: distributed compiler on \$compiler_host failed with status \$compiler_status; retrying locally",
             r'if "\${compiler[@]}" "\$@"; then',
@@ -176,6 +182,7 @@ test ! -x "$1/object-output"
 
 def test_wos_bootstrap_caps_concurrent_compilers_per_host() -> None:
     with tempfile.TemporaryDirectory() as temp_dir:
+        (Path(temp_dir) / "input.c").write_text("int input;\n", encoding="ascii")
         mock_on = Path(temp_dir) / "on"
         mock_state = Path(temp_dir) / "mock-on"
         mock_on.write_text(
@@ -220,7 +227,7 @@ for index in 0 1 2 3 4 5 6 7; do
         WOS_DISTRIBUTED_COMPILER_HOSTS=wos-0,wos-1 \
         WOS_DISTRIBUTED_COMPILER_STATE="$1/compiler-state" \
         WOS_NINJA_JOBS=4 \
-        "$1/clang" -c -o "$1/object-$index" input.c &
+        "$1/clang" -c -o "$1/object-$index" "$1/input.c" &
 done
 wait
 test "$(cat "$1/mock-on.max.wos-0")" -eq 2
@@ -240,18 +247,43 @@ test "$(cat "$1/mock-on.max.wos-1")" -eq 2
 def test_wos_bootstrap_remote_response_file_preserves_arguments() -> None:
     with tempfile.TemporaryDirectory() as temp_dir:
         temp = Path(temp_dir)
+        source = temp / "source with spaces.cpp"
+        c_source = temp / "source with spaces.c"
         mock_on = temp / "on"
         mock_on.write_text(
             r'''#!/bin/bash
-set -eu
+set -u
 [ "${TZ:-}" = UTC0 ]
 shift
-exec "$@"
-''',
+response="${!#}"
+response="${response#@}"
+if grep -F -- CPP_SOURCE_PATH "$response" >/dev/null || \
+        grep -F -- C_SOURCE_PATH "$response" >/dev/null; then
+    echo "remote compiler response still names the original source" >&2
+    exit 90
+fi
+if grep -Fx -- -MD "$response" >/dev/null || grep -Fx -- -MF "$response" >/dev/null; then
+    echo "remote compiler response still contains dependency flags" >&2
+    exit 91
+fi
+if ! grep -Ex -- 'cpp-output|c\+\+-cpp-output' "$response" >/dev/null; then
+    echo "remote compiler response does not select preprocessed C/C++" >&2
+    exit 92
+fi
+mv CPP_SOURCE_PATH CPP_HIDDEN_SOURCE_PATH
+mv C_SOURCE_PATH C_HIDDEN_SOURCE_PATH
+"$@"
+status=$?
+mv CPP_HIDDEN_SOURCE_PATH CPP_SOURCE_PATH
+mv C_HIDDEN_SOURCE_PATH C_SOURCE_PATH
+exit "$status"
+'''.replace("CPP_SOURCE_PATH", shlex.quote(str(source)))
+            .replace("CPP_HIDDEN_SOURCE_PATH", shlex.quote(str(source) + ".hidden"))
+            .replace("C_SOURCE_PATH", shlex.quote(str(c_source)))
+            .replace("C_HIDDEN_SOURCE_PATH", shlex.quote(str(c_source) + ".hidden")),
             encoding="ascii",
         )
         mock_on.chmod(0o755)
-        source = temp / "source with spaces.c"
         source.write_text(
             r'''#ifndef TEST_TEXT
 #error TEST_TEXT was not preserved
@@ -261,6 +293,7 @@ int response_file_test(void) { return text[0]; }
 ''',
             encoding="ascii",
         )
+        c_source.write_text("int c_response_file_test(void) { return 7; }\n", encoding="ascii")
         system_clang = ROOT / "toolchain" / "host" / "bin" / "clang"
         resource_dir = ROOT / "toolchain" / "host" / "lib" / "clang" / "22"
         script = r'''
@@ -273,9 +306,24 @@ PATH="$1:$PATH" \
     WOS_DISTRIBUTED_COMPILER_HOSTS=wos-0,wos-1 \
     WOS_DISTRIBUTED_COMPILER_STATE="$1/compiler-state" \
     WOS_NINJA_JOBS=1 \
-    "$1/clang" -D'TEST_TEXT="quoted value"' -c "$1/source with spaces.c" \
+    "$1/clang" -D'TEST_TEXT="quoted value"' -MD -MF "$1/dependencies with spaces.d" \
+        -c "$1/source with spaces.cpp" \
         -o "$1/object with spaces.o"
 test -s "$1/object with spaces.o"
+test -s "$1/dependencies with spaces.d"
+"$2" -resource-dir "$3" -D'TEST_TEXT="quoted value"' -c "$1/source with spaces.cpp" \
+    -o "$1/direct object with spaces.o"
+cmp "$1/object with spaces.o" "$1/direct object with spaces.o"
+PATH="$1:$PATH" \
+    WOS_DISTRIBUTED_COMPILER=1 \
+    WOS_DISTRIBUTED_COMPILER_HOSTS=wos-0,wos-1 \
+    WOS_DISTRIBUTED_COMPILER_STATE="$1/compiler-state" \
+    WOS_NINJA_JOBS=1 \
+    "$1/clang" -MD -MF "$1/c dependencies with spaces.d" -c "$1/source with spaces.c" \
+        -o "$1/c object with spaces.o"
+test -s "$1/c dependencies with spaces.d"
+"$2" -resource-dir "$3" -c "$1/source with spaces.c" -o "$1/direct c object with spaces.o"
+cmp "$1/c object with spaces.o" "$1/direct c object with spaces.o"
 '''
         result = subprocess.run(
             [
@@ -308,6 +356,7 @@ def test_wos_bootstrap_retries_failed_remote_compiler_locally() -> None:
             encoding="ascii",
         )
         mock_compiler.chmod(0o755)
+        (temp / "input.c").write_text("int input;\n", encoding="ascii")
         script = r'''
 set -euo pipefail
 WOS_TARGET_ARCH=x86_64-pc-wos
@@ -319,7 +368,7 @@ PATH="$1:$PATH" \
     WOS_DISTRIBUTED_COMPILER_HOSTS=wos-0,wos-1 \
     WOS_DISTRIBUTED_COMPILER_STATE="$1/compiler-state" \
     WOS_NINJA_JOBS=1 \
-    "$1/clang" -c -o "$1/object.o" input.c
+    "$1/clang" -c -o "$1/object.o" "$1/input.c"
 test "$(cat "$1/fallback-marker")" = local
 '''
         result = subprocess.run(

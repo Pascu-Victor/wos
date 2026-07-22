@@ -157,72 +157,181 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
             exit 1
             ;;
     esac
-    compiler_lock="\$compiler_state.lock"
-    compiler_lock_cleanup() {
-        rmdir "\$compiler_lock" 2>/dev/null || true
-    }
-    compiler_slots="\$compiler_state.slots"
-    if ! mkdir -p "\$compiler_slots"; then
-        echo "ERROR: distributed compiler slot directory could not be created" >&2
-        exit 1
-    fi
-    compiler_host=""
-    compiler_slot=""
-    while [ -z "\$compiler_slot" ]; do
-        while ! mkdir "\$compiler_lock" 2>/dev/null; do
-            :
-        done
-        trap compiler_lock_cleanup EXIT HUP INT TERM
-        compiler_index=0
-        if [ -s "\$compiler_state" ]; then
-            read -r compiler_index < "\$compiler_state" || compiler_index=0
+    compiler_args=("\$@")
+    compiler_source_index=-1
+    compiler_source_count=0
+    compiler_explicit_language=""
+    compiler_skip_arg=0
+    for ((compiler_arg_index = 0; compiler_arg_index < \${#compiler_args[@]}; compiler_arg_index++)); do
+        arg="\${compiler_args[\$compiler_arg_index]}"
+        if [ "\$compiler_skip_arg" -eq 1 ]; then
+            compiler_skip_arg=0
+            continue
         fi
-        case "\$compiler_index" in
-            ''|*[!0-9]*) compiler_index=0 ;;
-        esac
-        for ((compiler_offset = 0; compiler_offset < \${#compiler_hosts[@]}; compiler_offset++)); do
-            compiler_candidate_index="\$(((compiler_index + compiler_offset) % \${#compiler_hosts[@]}))"
-            compiler_host_slots="\$compiler_slots/\$compiler_candidate_index"
-            if ! mkdir -p "\$compiler_host_slots"; then
-                echo "ERROR: distributed compiler host slot directory could not be created" >&2
-                exit 1
-            fi
-            for ((compiler_slot_index = 0; compiler_slot_index < compiler_jobs_per_host; compiler_slot_index++)); do
-                compiler_candidate_slot="\$compiler_host_slots/\$compiler_slot_index"
-                if mkdir "\$compiler_candidate_slot" 2>/dev/null; then
-                    compiler_host="\${compiler_hosts[\$compiler_candidate_index]}"
-                    compiler_slot="\$compiler_candidate_slot"
-                    printf '%s\n' "\$((compiler_candidate_index + 1))" > "\$compiler_state"
-                    break 2
+        case "\$arg" in
+            -x)
+                if [ "\$((compiler_arg_index + 1))" -lt "\${#compiler_args[@]}" ]; then
+                    compiler_explicit_language="\${compiler_args[\$((compiler_arg_index + 1))]}"
                 fi
-            done
-        done
-        compiler_lock_cleanup
-        trap - EXIT HUP INT TERM
-        if [ -z "\$compiler_slot" ]; then
-            sleep 0
-        fi
+                compiler_skip_arg=1
+                ;;
+            -x*)
+                compiler_explicit_language="\${arg#-x}"
+                ;;
+            -o|-MF|-MT|-MQ|-MJ|-I|-isystem|-include|-imacros|-iquote|-idirafter|-iprefix|-iwithprefix|-isysroot|--sysroot|-target|--target|-resource-dir|-Xclang|-mllvm)
+                compiler_skip_arg=1
+                ;;
+            -*)
+                ;;
+            *)
+                if [ -f "\$arg" ]; then
+                    case "\$compiler_explicit_language:\$arg" in
+                        c:*|c++:*|objective-c:*|objective-c++:*|*:*.c|*:*.cc|*:*.cp|*:*.cpp|*:*.cxx|*:*.C|*:*.m|*:*.mm)
+                            compiler_source_index="\$compiler_arg_index"
+                            compiler_source_count="\$((compiler_source_count + 1))"
+                            ;;
+                    esac
+                fi
+                ;;
+        esac
     done
-    compiler_slot_cleanup() {
-        rmdir "\$compiler_slot" 2>/dev/null || true
-    }
-    compiler_responses="\$compiler_state.responses"
-    if ! mkdir -p "\$compiler_responses"; then
-        compiler_slot_cleanup
-        echo "ERROR: distributed compiler response directory could not be created" >&2
-        exit 1
+    compiler_preprocessed_language=""
+    if [ "\$compiler_source_count" -eq 1 ]; then
+        compiler_source="\${compiler_args[\$compiler_source_index]}"
+        case "\$compiler_explicit_language" in
+            c) compiler_preprocessed_language=cpp-output ;;
+            c++) compiler_preprocessed_language=c++-cpp-output ;;
+            objective-c) compiler_preprocessed_language=objective-c-cpp-output ;;
+            objective-c++) compiler_preprocessed_language=objective-c++-cpp-output ;;
+            '')
+                case "\$compiler_source" in
+                    *.c) compiler_preprocessed_language=cpp-output ;;
+                    *.cc|*.cp|*.cpp|*.cxx|*.C) compiler_preprocessed_language=c++-cpp-output ;;
+                    *.m) compiler_preprocessed_language=objective-c-cpp-output ;;
+                    *.mm) compiler_preprocessed_language=objective-c++-cpp-output ;;
+                esac
+                ;;
+        esac
     fi
-    compiler_response="\$(mktemp "\$compiler_responses/clang.XXXXXX")"
-    if [ -z "\$compiler_response" ]; then
-        compiler_slot_cleanup
-        echo "ERROR: distributed compiler response file could not be created" >&2
-        exit 1
-    fi
+    if [ -n "\$compiler_preprocessed_language" ]; then
+        compiler_responses="\$compiler_state.responses"
+        if ! mkdir -p "\$compiler_responses"; then
+            echo "ERROR: distributed compiler response directory could not be created" >&2
+            exit 1
+        fi
+        compiler_input="\$(mktemp "\$compiler_responses/clang-input.XXXXXX")"
+        if [ -z "\$compiler_input" ]; then
+            echo "ERROR: distributed compiler input file could not be created" >&2
+            exit 1
+        fi
+        compiler_input_cleanup() {
+            rm -f -- "\$compiler_input"
+        }
+        trap compiler_input_cleanup EXIT HUP INT TERM
+        if "\${compiler[@]}" "\$@" -E -o "\$compiler_input" -Wno-unused-command-line-argument; then
+            compiler_status=0
+        else
+            compiler_status=\$?
+            compiler_input_cleanup
+            trap - EXIT HUP INT TERM
+            exit "\$compiler_status"
+        fi
+        compiler_lock="\$compiler_state.lock"
+        compiler_lock_cleanup() {
+            rmdir "\$compiler_lock" 2>/dev/null || true
+        }
+        compiler_lock_and_input_cleanup() {
+            compiler_lock_cleanup
+            compiler_input_cleanup
+        }
+        compiler_slots="\$compiler_state.slots"
+        if ! mkdir -p "\$compiler_slots"; then
+            echo "ERROR: distributed compiler slot directory could not be created" >&2
+            exit 1
+        fi
+        compiler_host=""
+        compiler_slot=""
+        while [ -z "\$compiler_slot" ]; do
+            while ! mkdir "\$compiler_lock" 2>/dev/null; do
+                :
+            done
+            trap compiler_lock_and_input_cleanup EXIT HUP INT TERM
+            compiler_index=0
+            if [ -s "\$compiler_state" ]; then
+                read -r compiler_index < "\$compiler_state" || compiler_index=0
+            fi
+            case "\$compiler_index" in
+                ''|*[!0-9]*) compiler_index=0 ;;
+            esac
+            for ((compiler_offset = 0; compiler_offset < \${#compiler_hosts[@]}; compiler_offset++)); do
+                compiler_candidate_index="\$(((compiler_index + compiler_offset) % \${#compiler_hosts[@]}))"
+                compiler_host_slots="\$compiler_slots/\$compiler_candidate_index"
+                if ! mkdir -p "\$compiler_host_slots"; then
+                    echo "ERROR: distributed compiler host slot directory could not be created" >&2
+                    exit 1
+                fi
+                for ((compiler_slot_index = 0; compiler_slot_index < compiler_jobs_per_host; compiler_slot_index++)); do
+                    compiler_candidate_slot="\$compiler_host_slots/\$compiler_slot_index"
+                    if mkdir "\$compiler_candidate_slot" 2>/dev/null; then
+                        compiler_host="\${compiler_hosts[\$compiler_candidate_index]}"
+                        compiler_slot="\$compiler_candidate_slot"
+                        printf '%s\n' "\$((compiler_candidate_index + 1))" > "\$compiler_state"
+                        break 2
+                    fi
+                done
+            done
+            compiler_lock_cleanup
+            trap compiler_input_cleanup EXIT HUP INT TERM
+            if [ -z "\$compiler_slot" ]; then
+                sleep 0
+            fi
+        done
+        compiler_slot_cleanup() {
+            rmdir "\$compiler_slot" 2>/dev/null || true
+        }
+        compiler_response="\$(mktemp "\$compiler_responses/clang.XXXXXX")"
+        if [ -z "\$compiler_response" ]; then
+            compiler_input_cleanup
+            compiler_slot_cleanup
+            echo "ERROR: distributed compiler response file could not be created" >&2
+            exit 1
+        fi
     # Keep response files until the scratch workdir is removed. Concurrent
     # forwarded unlink operations can leave remote VFS peers with a stale
     # negative lookup for a file that still exists.
-    trap compiler_slot_cleanup EXIT HUP INT TERM
-    for arg in "\$@"; do
+    compiler_remote_cleanup() {
+        compiler_input_cleanup
+        compiler_slot_cleanup
+    }
+    trap compiler_remote_cleanup EXIT HUP INT TERM
+    compiler_skip_arg=0
+    for ((compiler_arg_index = 0; compiler_arg_index < \${#compiler_args[@]}; compiler_arg_index++)); do
+        arg="\${compiler_args[\$compiler_arg_index]}"
+        if [ "\$compiler_skip_arg" -eq 1 ]; then
+            compiler_skip_arg=0
+            continue
+        fi
+        if [ "\$compiler_arg_index" -eq "\$compiler_source_index" ]; then
+            continue
+        fi
+        case "\$arg" in
+            -MD|-MMD|-MP|-MG)
+                continue
+                ;;
+            -MF|-MT|-MQ|-MJ)
+                compiler_skip_arg=1
+                continue
+                ;;
+            -MF*|-MT*|-MQ*|-MJ*)
+                continue
+                ;;
+        esac
+        if ! printf '%q\n' "\$arg" >> "\$compiler_response"; then
+            echo "ERROR: distributed compiler response file could not be written" >&2
+            exit 1
+        fi
+    done
+    for arg in -x "\$compiler_preprocessed_language" -Wno-unused-command-line-argument "\$compiler_input"; do
         if ! printf '%q\n' "\$arg" >> "\$compiler_response"; then
             echo "ERROR: distributed compiler response file could not be written" >&2
             exit 1
@@ -235,12 +344,14 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
     else
         compiler_status=\$?
     fi
+    compiler_input_cleanup
     compiler_slot_cleanup
     trap - EXIT HUP INT TERM
     if [ "\$compiler_status" -eq 0 ]; then
         exit 0
     fi
     echo "warning: distributed compiler on \$compiler_host failed with status \$compiler_status; retrying locally" >&2
+    fi
 fi
 if "\${compiler[@]}" "\$@"; then
     compiler_status=0
