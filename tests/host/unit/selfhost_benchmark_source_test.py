@@ -4,6 +4,7 @@ import csv
 import hashlib
 import json
 import os
+import shlex
 import subprocess
 import tempfile
 from pathlib import Path
@@ -130,9 +131,12 @@ def test_wos_bootstrap_distributes_only_compiler_processes() -> None:
             r'if mkdir "\$compiler_candidate_slot" 2>/dev/null; then',
             r'compiler_host="\${compiler_hosts[\$compiler_candidate_index]}"',
             r'compiler_slot_cleanup() {',
-            r'if on "\$compiler_host" "\${compiler[@]}" "\$@"; then',
+            r'compiler_response="\$(mktemp "\$compiler_responses/clang.XXXXXX")"',
+            r'''printf '%q\n' "\$arg" >> "\$compiler_response"''',
+            r'env -i PATH="\$compiler_remote_path" HOME="\${HOME:-/root}" TMPDIR="\${TMPDIR:-/tmp}"',
+            r'on "\$compiler_host" "\${compiler[@]}" "@\$compiler_response"',
+            r'compiler_remote_cleanup',
             r'if [ "\$compiler_status" -ne 127 ]; then',
-            r'compiler_slot_cleanup',
             r"warning: distributed compiler placement on \$compiler_host was unavailable; retrying locally",
             r'if "\${compiler[@]}" "\$@"; then',
             r'[ "\$link_output" -eq 1 ]',
@@ -173,11 +177,12 @@ test ! -x "$1/object-output"
 def test_wos_bootstrap_caps_concurrent_compilers_per_host() -> None:
     with tempfile.TemporaryDirectory() as temp_dir:
         mock_on = Path(temp_dir) / "on"
+        mock_state = Path(temp_dir) / "mock-on"
         mock_on.write_text(
             r'''#!/bin/bash
 set -u
 host="$1"
-state="${MOCK_ON_STATE:?}"
+state=MOCK_STATE_PATH
 lock="$state.lock"
 while ! mkdir "$lock" 2>/dev/null; do :; done
 active_file="$state.active.$host"
@@ -200,7 +205,7 @@ cleanup() {
 trap cleanup EXIT
 sleep 0.1
 exit 0
-''',
+'''.replace("MOCK_STATE_PATH", shlex.quote(str(mock_state))),
             encoding="ascii",
         )
         mock_on.chmod(0o755)
@@ -210,7 +215,7 @@ WOS_TARGET_ARCH=x86_64-pc-wos
 source <(sed -n '/^write_clang_wrapper()/,/^}/p' tools/bootstrap.sh)
 write_clang_wrapper "$1/clang" /usr/bin/true /tmp
 for index in 0 1 2 3 4 5 6 7; do
-    PATH="$1:$PATH" MOCK_ON_STATE="$1/mock-on" \
+    PATH="$1:$PATH" \
         WOS_DISTRIBUTED_COMPILER=1 \
         WOS_DISTRIBUTED_COMPILER_HOSTS=wos-0,wos-1 \
         WOS_DISTRIBUTED_COMPILER_STATE="$1/compiler-state" \
@@ -230,6 +235,64 @@ test "$(cat "$1/mock-on.max.wos-1")" -eq 2
         )
         if result.returncode != 0:
             fail(f"WOS compiler shim per-host cap test failed: {result.stderr}")
+
+
+def test_wos_bootstrap_remote_response_file_preserves_arguments() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp = Path(temp_dir)
+        mock_on = temp / "on"
+        mock_on.write_text(
+            r'''#!/bin/bash
+set -eu
+shift
+exec "$@"
+''',
+            encoding="ascii",
+        )
+        mock_on.chmod(0o755)
+        source = temp / "source with spaces.c"
+        source.write_text(
+            r'''#ifndef TEST_TEXT
+#error TEST_TEXT was not preserved
+#endif
+static const char *text = TEST_TEXT;
+int response_file_test(void) { return text[0]; }
+''',
+            encoding="ascii",
+        )
+        system_clang = ROOT / "toolchain" / "host" / "bin" / "clang"
+        resource_dir = ROOT / "toolchain" / "host" / "lib" / "clang" / "22"
+        script = r'''
+set -euo pipefail
+WOS_TARGET_ARCH=x86_64-pc-wos
+source <(sed -n '/^write_clang_wrapper()/,/^}/p' tools/bootstrap.sh)
+write_clang_wrapper "$1/clang" "$2" "$3"
+PATH="$1:$PATH" \
+    WOS_DISTRIBUTED_COMPILER=1 \
+    WOS_DISTRIBUTED_COMPILER_HOSTS=wos-0,wos-1 \
+    WOS_DISTRIBUTED_COMPILER_STATE="$1/compiler-state" \
+    WOS_NINJA_JOBS=1 \
+    "$1/clang" -D'TEST_TEXT="quoted value"' -c "$1/source with spaces.c" \
+        -o "$1/object with spaces.o"
+test -s "$1/object with spaces.o"
+'''
+        result = subprocess.run(
+            [
+                "bash",
+                "-c",
+                script,
+                "wos-bootstrap-response-test",
+                temp_dir,
+                str(system_clang),
+                str(resource_dir),
+            ],
+            cwd=ROOT,
+            check=False,
+            text=True,
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            fail(f"WOS compiler shim response-file test failed: {result.stderr}")
 
 
 def test_distributed_compiler_hosts_are_validated_before_launch() -> None:
@@ -1646,6 +1709,7 @@ if __name__ == "__main__":
     test_wos_bootstrap_distributes_only_compiler_processes()
     test_wos_bootstrap_repairs_only_link_output_mode()
     test_wos_bootstrap_caps_concurrent_compilers_per_host()
+    test_wos_bootstrap_remote_response_file_preserves_arguments()
     test_distributed_compiler_hosts_are_validated_before_launch()
     test_selfhost_repeatability_runner_preserves_acceptance_evidence()
     test_linux_selfhost_baseline_preserves_full_process_evidence()

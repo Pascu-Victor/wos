@@ -200,23 +200,50 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
         compiler_lock_cleanup
         trap - EXIT HUP INT TERM
         if [ -z "\$compiler_slot" ]; then
-            sleep 0.01
+            sleep 0
         fi
     done
     compiler_slot_cleanup() {
         rmdir "\$compiler_slot" 2>/dev/null || true
     }
-    trap compiler_slot_cleanup EXIT HUP INT TERM
-    if on "\$compiler_host" "\${compiler[@]}" "\$@"; then
-        exit 0
+    compiler_responses="\$compiler_state.responses"
+    if ! mkdir -p "\$compiler_responses"; then
+        compiler_slot_cleanup
+        echo "ERROR: distributed compiler response directory could not be created" >&2
+        exit 1
+    fi
+    compiler_response="\$(mktemp "\$compiler_responses/clang.XXXXXX")"
+    if [ -z "\$compiler_response" ]; then
+        compiler_slot_cleanup
+        echo "ERROR: distributed compiler response file could not be created" >&2
+        exit 1
+    fi
+    compiler_remote_cleanup() {
+        rm -f "\$compiler_response"
+        compiler_slot_cleanup
+    }
+    trap compiler_remote_cleanup EXIT HUP INT TERM
+    for arg in "\$@"; do
+        if ! printf '%q\n' "\$arg" >> "\$compiler_response"; then
+            echo "ERROR: distributed compiler response file could not be written" >&2
+            exit 1
+        fi
+    done
+    compiler_remote_path="\${PATH:-/usr/bin:/bin}"
+    if env -i PATH="\$compiler_remote_path" HOME="\${HOME:-/root}" TMPDIR="\${TMPDIR:-/tmp}" \
+        on "\$compiler_host" "\${compiler[@]}" "@\$compiler_response"; then
+        compiler_status=0
     else
         compiler_status=\$?
+    fi
+    compiler_remote_cleanup
+    trap - EXIT HUP INT TERM
+    if [ "\$compiler_status" -eq 0 ]; then
+        exit 0
     fi
     if [ "\$compiler_status" -ne 127 ]; then
         exit "\$compiler_status"
     fi
-    compiler_slot_cleanup
-    trap - EXIT HUP INT TERM
     echo "warning: distributed compiler placement on \$compiler_host was unavailable; retrying locally" >&2
 fi
 if "\${compiler[@]}" "\$@"; then
