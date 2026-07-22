@@ -2101,10 +2101,10 @@ auto acquire_proxy_untracked_send_slot_locked(ProxyVfsState* state, uint64_t sta
     return acquire_proxy_slot_locked(state, start_us, true);
 }
 
-auto vfs_proxy_untracked_send_status_is_retryable(int status) -> bool {
+auto vfs_proxy_send_status_is_retryable(int status) -> bool {
     // Reliable sends return before publishing a sequence when either the peer's
     // advertised credits or the local packet/retransmit storage are exhausted.
-    // Retrying those two results therefore cannot duplicate a close request.
+    // Retrying those two results therefore cannot duplicate a request.
     return status == WKI_ERR_NO_CREDITS || status == WKI_ERR_NO_MEM;
 }
 
@@ -2541,14 +2541,29 @@ auto vfs_proxy_send_and_wait(ProxyVfsState* state, uint16_t op_id, const uint8_t
                                      ker::mod::perf::WkiPerfPhase::BEGIN, state->owner_node, state->assigned_channel, CORRELATION, 0,
                                      REQ_DATA_LEN, CALLSITE);
 
-    int send_ret = WKI_ERR_INVALID;
-    if (req_tail_len == 0) {
-        send_ret =
-            wki_send_on_channel_identity(CHANNEL_IDENTITY, MsgType::DEV_OP_REQ, req_buf.data(), static_cast<uint16_t>(REQ_PREFIX_TOTAL));
-    } else {
-        send_ret =
-            wki_send_on_channel_identity_split(CHANNEL_IDENTITY, MsgType::DEV_OP_REQ, req_buf.data(),
-                                               static_cast<uint16_t>(REQ_PREFIX_TOTAL), req_tail, static_cast<uint16_t>(req_tail_len));
+    uint64_t const SEND_DEADLINE_US = wki_future_deadline_us(PROXY_WAIT_START, wait_timeout_us);
+    ProxySlotCaller const SEND_CALLER = current_proxy_slot_caller();
+    int send_ret = WKI_ERR_NO_CREDITS;
+    while (true) {
+        if (req_tail_len == 0) {
+            send_ret = wki_send_on_channel_identity(CHANNEL_IDENTITY, MsgType::DEV_OP_REQ, req_buf.data(),
+                                                    static_cast<uint16_t>(REQ_PREFIX_TOTAL));
+        } else {
+            send_ret =
+                wki_send_on_channel_identity_split(CHANNEL_IDENTITY, MsgType::DEV_OP_REQ, req_buf.data(),
+                                                   static_cast<uint16_t>(REQ_PREFIX_TOTAL), req_tail, static_cast<uint16_t>(req_tail_len));
+        }
+        if (send_ret == WKI_OK || !vfs_proxy_send_status_is_retryable(send_ret)) {
+            break;
+        }
+        if (wki_now_us() >= SEND_DEADLINE_US) {
+            send_ret = WKI_ERR_TIMEOUT;
+            break;
+        }
+        // Retain the published operation and proxy slot while reliable-channel
+        // pressure clears.  These errors precede sequence publication, so the
+        // expected response sequence remains stable across retries.
+        park_proxy_slot_caller(SEND_CALLER, SEND_DEADLINE_US, false);
     }
     int const SEND_RET = send_ret;
 
@@ -2681,7 +2696,7 @@ auto vfs_proxy_send_untracked(ProxyVfsState* state, uint16_t op_id, const uint8_
     int send_ret = WKI_ERR_NO_CREDITS;
     while (true) {
         send_ret = wki_send_on_channel_identity(CHANNEL_IDENTITY, MsgType::DEV_OP_REQ, req_buf.data(), static_cast<uint16_t>(REQ_TOTAL));
-        if (send_ret == WKI_OK || !vfs_proxy_untracked_send_status_is_retryable(send_ret)) {
+        if (send_ret == WKI_OK || !vfs_proxy_send_status_is_retryable(send_ret)) {
             break;
         }
         if (wki_now_us() >= SEND_DEADLINE_US) {
@@ -2791,8 +2806,24 @@ auto vfs_proxy_write_rdma_and_wait(ProxyVfsState* state, int32_t remote_fd, int6
         }
     }
 
-    int const SEND_RET =
-        wki_send_on_channel_identity(CHANNEL_IDENTITY, MsgType::DEV_OP_REQ, req_buf.data(), static_cast<uint16_t>(req_buf.size()));
+    uint64_t const SEND_DEADLINE_US = wki_future_deadline_us(PROXY_WAIT_START, VFS_PROXY_OP_TIMEOUT_US);
+    ProxySlotCaller const SEND_CALLER = current_proxy_slot_caller();
+    int send_ret = WKI_ERR_NO_CREDITS;
+    while (true) {
+        send_ret =
+            wki_send_on_channel_identity(CHANNEL_IDENTITY, MsgType::DEV_OP_REQ, req_buf.data(), static_cast<uint16_t>(req_buf.size()));
+        if (send_ret == WKI_OK || !vfs_proxy_send_status_is_retryable(send_ret)) {
+            break;
+        }
+        if (wki_now_us() >= SEND_DEADLINE_US) {
+            send_ret = WKI_ERR_TIMEOUT;
+            break;
+        }
+        // Preserve control-before-data ordering for RoCE and keep the operation
+        // sequence stable while pre-enqueue channel pressure clears.
+        park_proxy_slot_caller(SEND_CALLER, SEND_DEADLINE_US, false);
+    }
+    int const SEND_RET = send_ret;
     if (SEND_RET != WKI_OK) {
         cancel_proxy_op_wait(state, wait, OP_GENERATION, SEND_RET);
 
