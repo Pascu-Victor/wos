@@ -17,6 +17,7 @@ SELFHOST_LINUX_BASELINE = ROOT / "scripts" / "bench" / "run_linux_selfhost_basel
 SELFHOST_COMPARE = ROOT / "scripts" / "bench" / "compare_wos_selfhost_reports.py"
 SELFHOST_CLUSTER = ROOT / "configs" / "cluster_selfhost.json"
 DISTRIBUTED_CLUSTER = ROOT / "configs" / "cluster_bench_4.json"
+DISTRIBUTED_SELFHOST_CLUSTER = ROOT / "configs" / "cluster_selfhost_4.json"
 GIT_MIRROR = ROOT / "scripts" / "dev" / "git_mirror_for_wos.sh"
 ROOTFS_ALIASES = ROOT / "configs" / "rootfs" / "aliases.tsv"
 
@@ -906,6 +907,22 @@ def test_distributed_cluster_has_plausible_per_core_memory() -> None:
     node_zones = [zone for zone in config["zones"] if zone["id"] != "GLOBAL"]
     if [zone["nodes"] for zone in node_zones] != [4, 4]:
         fail("distributed benchmark profile must launch four WOS systems")
+
+
+def test_distributed_selfhost_cluster_has_peak_memory_headroom() -> None:
+    config = json.loads(DISTRIBUTED_SELFHOST_CLUSTER.read_text())
+    global_vm = config["zones"][0]["vm"]
+    if global_vm["memory"] != "16384M" or global_vm["cpus"] != 8:
+        fail("distributed self-host workers must provide 2 GiB per core")
+
+    node_zones = [zone for zone in config["zones"] if zone["id"] != "GLOBAL"]
+    if [zone["nodes"] for zone in node_zones] != [4, 4]:
+        fail("distributed self-host profile must launch four WOS systems")
+
+    for zone in node_zones:
+        overrides = zone.get("nodes_config", [])
+        if overrides != [{"id": 0, "vm": {"memory": "65536M", "cpus": 8}}]:
+            fail("distributed self-host controller must provide 8 GiB per core in every zone")
 
 
 def test_selfhost_runner_verifies_toolchain_kernel_and_utilities() -> None:
