@@ -16,7 +16,7 @@
                 "ip": null
             },
             "vm": {
-                "memory": "16384M",
+                "memory": "32768M",
                 "cpus": 8,
                 "disk0": "disk.qcow2",
                 "disk1": "mountfs.qcow2"
