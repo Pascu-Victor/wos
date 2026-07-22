@@ -685,6 +685,8 @@ def test_selfhost_repeatability_runner_preserves_acceptance_evidence() -> None:
             'capture_distributed_telemetry "$runner_pid" "$run_dir/distributed-telemetry.tsv"',
             'running_active=\\([0-9][0-9]*\\)',
             'capture_distributed_success_evidence "$console_log" "$run_dir/distributed-success.tsv"',
+            'expected_compiler_state="${workdir%/}/tmp/distributed-compiler"',
+            'if [ "$compiler_state" != "$expected_compiler_state" ]; then',
             'distributed_workload_succeeded_on_${distributed_successful_hosts}_hosts',
             'capture_distributed_serial_evidence "$run_dir"',
             'distributed_success_evidence',

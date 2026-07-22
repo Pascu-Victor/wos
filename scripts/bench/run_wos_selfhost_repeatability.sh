@@ -262,18 +262,15 @@ capture_distributed_telemetry() {
 capture_distributed_success_evidence() {
     local console_log="$1"
     local output="$2"
-    local compiler_state index participant_host marker marker_path
+    local compiler_state expected_compiler_state index participant_host marker marker_path
 
     printf 'host\tmarker_host\tsuccessful\n' > "$output"
     distributed_successful_hosts=0
     compiler_state="$(sed -n 's/.*distributed_compiler_state=\([^[:space:]]*\).*/\1/p' "$console_log" | tail -n 1)"
-    case "$compiler_state" in
-        /tmp/wos-distributed-compiler.??????/state)
-            ;;
-        *)
-            return 0
-            ;;
-    esac
+    expected_compiler_state="${workdir%/}/tmp/distributed-compiler"
+    if [ "$compiler_state" != "$expected_compiler_state" ]; then
+        return 0
+    fi
 
     for ((index = 0; index < ${#distributed_hosts[@]}; ++index)); do
         participant_host="${distributed_hosts[$index]}"
