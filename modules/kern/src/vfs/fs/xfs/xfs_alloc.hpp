@@ -54,4 +54,8 @@ auto xfs_alloc_get_freelist(XfsMountContext* mount, XfsTransaction* tp, xfs_agnu
 // Returns 0 on success.
 auto xfs_alloc_put_freelist(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t agno, xfs_agblock_t bno) -> int;
 
+#ifdef WOS_SELFTEST
+auto xfs_selftest_agfl_skips_live_free_space_block() -> bool;
+#endif
+
 }  // namespace ker::vfs::xfs

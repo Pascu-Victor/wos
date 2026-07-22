@@ -71,6 +71,70 @@ auto agfl_bno_usable(const XfsMountContext* mount, xfs_agblock_t bno) -> bool {
     return bno != NULLAGBLOCK && bno < mount->ag_blocks && bno > XFS_AG_RESERVED_MAX;
 }
 
+template <typename Traits>
+auto ag_btree_contains_block(XfsMountContext* mount, xfs_agnumber_t agno, xfs_agblock_t node, uint8_t nlevels, xfs_agblock_t target)
+    -> int {
+    if (mount == nullptr || nlevels == 0 || nlevels > XFS_BTREE_MAXLEVELS || node == NULLAGBLOCK || node >= mount->ag_blocks) {
+        return -EIO;
+    }
+    if (node == target) {
+        return 1;
+    }
+    if (nlevels == 1) {
+        return 0;
+    }
+
+    BufHead* bh = xfs_buf_read(mount, xfs_agbno_to_fsbno(agno, node, mount->ag_blk_log));
+    if (bh == nullptr) {
+        return -EIO;
+    }
+    const auto* hdr = reinterpret_cast<const XfsBtreeSblock*>(bh->data);
+    uint16_t const LEVEL = hdr->bb_level.to_cpu();
+    uint16_t const NUMRECS = hdr->bb_numrecs.to_cpu();
+    auto const MAX_RECS = static_cast<uint32_t>((mount->block_size - Traits::HDR_LEN) / (Traits::KEY_LEN + Traits::PTR_LEN));
+    if (hdr->bb_magic.to_cpu() != Traits::MAGIC || LEVEL != nlevels - 1 || NUMRECS == 0 || NUMRECS > MAX_RECS) {
+        brelse(bh);
+        return -EIO;
+    }
+
+    size_t const PTR_BASE = Traits::HDR_LEN + (static_cast<size_t>(MAX_RECS) * Traits::KEY_LEN);
+    for (uint16_t index = 0; index < NUMRECS; ++index) {
+        Be32 child_be{};
+        __builtin_memcpy(&child_be, bh->data + PTR_BASE + (static_cast<size_t>(index) * Traits::PTR_LEN), sizeof(child_be));
+        xfs_agblock_t const CHILD = child_be.to_cpu();
+        if (CHILD == NULLAGBLOCK || CHILD >= mount->ag_blocks) {
+            brelse(bh);
+            return -EIO;
+        }
+        if (CHILD == target) {
+            brelse(bh);
+            return 1;
+        }
+        if (nlevels > 2) {
+            int const FOUND = ag_btree_contains_block<Traits>(mount, agno, CHILD, static_cast<uint8_t>(nlevels - 1), target);
+            if (FOUND != 0) {
+                brelse(bh);
+                return FOUND;
+            }
+        }
+    }
+    brelse(bh);
+    return 0;
+}
+
+auto free_space_btree_contains_block(XfsMountContext* mount, xfs_agnumber_t agno, xfs_agblock_t target) -> int {
+    if (mount == nullptr || mount->per_ag == nullptr || agno >= mount->ag_count) {
+        return -EINVAL;
+    }
+    XfsPerAG const* pag = &mount->per_ag[agno];
+    int const BNO_FOUND =
+        ag_btree_contains_block<XfsBnobtTraits>(mount, agno, pag->agf_bno_root, static_cast<uint8_t>(pag->agf_bno_level), target);
+    if (BNO_FOUND != 0) {
+        return BNO_FOUND;
+    }
+    return ag_btree_contains_block<XfsCntbtTraits>(mount, agno, pag->agf_cnt_root, static_cast<uint8_t>(pag->agf_cnt_level), target);
+}
+
 // Minimum number of blocks the AGFL should hold before mutating metadata
 // btrees. One inode-allocation transaction can split bnobt, cntbt, inobt, and
 // finobt, while mapped writes can also split a bmbt. Keep enough reserve for
@@ -936,6 +1000,10 @@ auto xfs_alloc_get_freelist(XfsMountContext* mount, XfsTransaction* tp, xfs_agnu
 
     auto* agfl_bno = reinterpret_cast<Be32*>(reinterpret_cast<uint8_t*>(agfl) + sizeof(XfsAgfl));
     uint32_t const AGFL_SZ = xfs_agfl_size(mount);
+    if (pag->agf_flcount > AGFL_SZ || pag->agf_flfirst >= AGFL_SZ || pag->agf_fllast >= AGFL_SZ) {
+        brelse(bh);
+        return -EIO;
+    }
 
     int const CAPTURE_RC = xfs_trans_capture_perag(tp, agno);
     if (CAPTURE_RC != 0) {
@@ -947,12 +1015,36 @@ auto xfs_alloc_get_freelist(XfsMountContext* mount, XfsTransaction* tp, xfs_agnu
     // This matches Linux's xfs_verify_agbno check in xfs_alloc_get_freelist().
     while (pag->agf_flcount > 0) {
         uint32_t const BNO_RAW = agfl_bno[pag->agf_flfirst].to_cpu();
+        bool duplicate = false;
         if (agfl_bno_usable(mount, BNO_RAW)) {
-            // Valid entry found.
-            break;
+            for (uint32_t offset = 1; offset < pag->agf_flcount; ++offset) {
+                uint32_t const INDEX = (pag->agf_flfirst + offset) % AGFL_SZ;
+                if (agfl_bno[INDEX].to_cpu() == BNO_RAW) {
+                    duplicate = true;
+                    break;
+                }
+            }
         }
-        mod::dbg::log("[xfs agfl] get_freelist: agno=%u skipping reserved/corrupt slot[%u]=%u (fllast=%u flcount=%u)\n", agno,
-                      pag->agf_flfirst, BNO_RAW, pag->agf_fllast, pag->agf_flcount);
+        if (duplicate) {
+            mod::dbg::log("[xfs agfl] get_freelist: agno=%u dropping duplicate active block slot[%u]=%u (fllast=%u flcount=%u)\n", agno,
+                          pag->agf_flfirst, BNO_RAW, pag->agf_fllast, pag->agf_flcount);
+        } else if (agfl_bno_usable(mount, BNO_RAW)) {
+            int const REACHABLE = free_space_btree_contains_block(mount, agno, BNO_RAW);
+            if (REACHABLE < 0) {
+                mod::dbg::log("[xfs agfl] get_freelist: agno=%u could not validate candidate block=%u rc=%d\n", agno, BNO_RAW, REACHABLE);
+                brelse(bh);
+                return REACHABLE;
+            }
+            if (REACHABLE == 0) {
+                // Valid, unique, and not already owned by either free-space tree.
+                break;
+            }
+            mod::dbg::log("[xfs agfl] get_freelist: agno=%u dropping live free-space btree block slot[%u]=%u (fllast=%u flcount=%u)\n",
+                          agno, pag->agf_flfirst, BNO_RAW, pag->agf_fllast, pag->agf_flcount);
+        } else {
+            mod::dbg::log("[xfs agfl] get_freelist: agno=%u skipping reserved/corrupt slot[%u]=%u (fllast=%u flcount=%u)\n", agno,
+                          pag->agf_flfirst, BNO_RAW, pag->agf_fllast, pag->agf_flcount);
+        }
         pag->agf_flfirst = (pag->agf_flfirst + 1) % AGFL_SZ;
         pag->agf_flcount--;
     }
@@ -1051,5 +1143,110 @@ auto xfs_alloc_put_freelist(XfsMountContext* mount, XfsTransaction* tp, xfs_agnu
     }
     return 0;
 }
+
+#ifdef WOS_SELFTEST
+namespace {
+
+auto agfl_selftest_read(ker::dev::BlockDevice* dev, uint64_t /*block*/, size_t count, void* buffer) -> int {
+    __builtin_memset(buffer, 0, count * dev->block_size);
+    return 0;
+}
+
+auto agfl_selftest_write(ker::dev::BlockDevice* /*dev*/, uint64_t /*block*/, size_t /*count*/, const void* /*buffer*/) -> int { return 0; }
+
+}  // namespace
+
+auto xfs_selftest_agfl_skips_live_free_space_block() -> bool {
+    constexpr uint32_t BLOCK_SIZE = 1024;
+    constexpr uint32_t SECTOR_SIZE = 256;
+    constexpr uint32_t AG_BLOCKS = 4096;
+    constexpr xfs_agblock_t BNO_ROOT = 1;
+    constexpr xfs_agblock_t CNT_ROOT = 2;
+    constexpr xfs_agblock_t LIVE_CHILD = 10;
+    constexpr xfs_agblock_t SAFE_BLOCK = 11;
+
+    ker::dev::BlockDevice dev{};
+    dev.block_size = SECTOR_SIZE;
+    dev.total_blocks = static_cast<uint64_t>(AG_BLOCKS) * (BLOCK_SIZE / SECTOR_SIZE);
+    dev.read_blocks = agfl_selftest_read;
+    dev.write_blocks = agfl_selftest_write;
+
+    XfsPerAG pag{};
+    pag.agno = 0;
+    pag.agf_length = AG_BLOCKS;
+    pag.agf_bno_root = BNO_ROOT;
+    pag.agf_cnt_root = CNT_ROOT;
+    pag.agf_bno_level = 2;
+    pag.agf_cnt_level = 1;
+    pag.agf_flfirst = 0;
+    pag.agf_fllast = 1;
+    pag.agf_flcount = 2;
+
+    XfsMountContext mount{};
+    mount.device = &dev;
+    mount.block_size = BLOCK_SIZE;
+    mount.block_log = 10;
+    mount.total_blocks = AG_BLOCKS;
+    mount.ag_count = 1;
+    mount.ag_blocks = AG_BLOCKS;
+    mount.ag_blk_log = 12;
+    mount.sect_size = SECTOR_SIZE;
+    mount.sect_log = 8;
+    mount.per_ag = &pag;
+
+    BufHead* ag0 = xfs_buf_get(&mount, 0);
+    BufHead* bno_root = xfs_buf_get(&mount, BNO_ROOT);
+    BufHead* cnt_root = xfs_buf_get(&mount, CNT_ROOT);
+    if (ag0 == nullptr || bno_root == nullptr || cnt_root == nullptr) {
+        if (ag0 != nullptr) {
+            brelse(ag0);
+        }
+        if (bno_root != nullptr) {
+            brelse(bno_root);
+        }
+        if (cnt_root != nullptr) {
+            brelse(cnt_root);
+        }
+        invalidate_bdev(&dev);
+        return false;
+    }
+
+    __builtin_memset(ag0->data, 0, ag0->size);
+    auto* agfl = reinterpret_cast<XfsAgfl*>(ag0->data + (3U * SECTOR_SIZE));
+    agfl->agfl_magicnum = Be32::from_cpu(XFS_AGFL_MAGIC);
+    auto* agfl_bno = reinterpret_cast<Be32*>(reinterpret_cast<uint8_t*>(agfl) + sizeof(XfsAgfl));
+    agfl_bno[0] = Be32::from_cpu(LIVE_CHILD);
+    agfl_bno[1] = Be32::from_cpu(SAFE_BLOCK);
+
+    __builtin_memset(bno_root->data, 0, bno_root->size);
+    auto* bno_hdr = reinterpret_cast<XfsBtreeSblock*>(bno_root->data);
+    bno_hdr->bb_magic = Be32::from_cpu(XFS_ABTB_CRC_MAGIC);
+    bno_hdr->bb_level = Be16::from_cpu(1);
+    bno_hdr->bb_numrecs = Be16::from_cpu(1);
+    uint32_t const BNO_MAX_RECS = (BLOCK_SIZE - XfsBnobtTraits::HDR_LEN) / (XfsBnobtTraits::KEY_LEN + XfsBnobtTraits::PTR_LEN);
+    size_t const BNO_PTR_BASE = XfsBnobtTraits::HDR_LEN + (static_cast<size_t>(BNO_MAX_RECS) * XfsBnobtTraits::KEY_LEN);
+    Be32 live_child = Be32::from_cpu(LIVE_CHILD);
+    __builtin_memcpy(bno_root->data + BNO_PTR_BASE, &live_child, sizeof(live_child));
+
+    __builtin_memset(cnt_root->data, 0, cnt_root->size);
+    auto* cnt_hdr = reinterpret_cast<XfsBtreeSblock*>(cnt_root->data);
+    cnt_hdr->bb_magic = Be32::from_cpu(XFS_ABTC_CRC_MAGIC);
+    cnt_hdr->bb_level = Be16::from_cpu(0);
+    cnt_hdr->bb_numrecs = Be16::from_cpu(1);
+
+    brelse(ag0);
+    brelse(bno_root);
+    brelse(cnt_root);
+
+    XfsTransaction* tp = xfs_trans_alloc(&mount);
+    xfs_agblock_t selected = NULLAGBLOCK;
+    bool ok = tp != nullptr && xfs_alloc_get_freelist(&mount, tp, 0, &selected) == 0 && selected == SAFE_BLOCK && pag.agf_flcount == 0;
+    if (tp != nullptr) {
+        xfs_trans_cancel(tp);
+    }
+    invalidate_bdev(&dev);
+    return ok;
+}
+#endif
 
 }  // namespace ker::vfs::xfs

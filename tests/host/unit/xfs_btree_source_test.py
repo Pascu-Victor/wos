@@ -98,7 +98,7 @@ def main() -> None:
     )
     require(
         source,
-        "if (cur->ptr_at(lev, pos) == left_ptr)",
+        "if (CHILD == left_ptr)",
         "parent insertion must locate the exact child that was split",
     )
     require(
@@ -106,6 +106,15 @@ def main() -> None:
         "cur->level_at(lev).ptr = left_pos;\n    int const INSERT_POS = left_pos + 1;",
         "parent insertion position derived from verified left child",
     )
+    require(source, "if (left_ptr == new_ptr)", "split child self-alias rejection")
+    require(source, "if (CHILD == new_ptr)", "duplicate parent child rejection")
+    require(source, "return -EEXIST;", "duplicate btree key rejection")
+    require(
+        alloc_source,
+        "free_space_btree_contains_block(mount, agno, BNO_RAW)",
+        "AGFL live free-space-tree block rejection",
+    )
+    require(alloc_source, "dropping duplicate active block", "duplicate active AGFL entry rejection")
     if "xfs_alloc_put_freelist(cur->mount, tp, cur->agno" in source:
         fail("btree deletion must not publish retired blocks before transaction-safe deferred retirement")
     require(

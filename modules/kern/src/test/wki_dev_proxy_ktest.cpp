@@ -76,3 +76,7 @@ KTEST(WkiRemoteVfsReadlinkCache, GenerationInvalidationAndWrap) {
 KTEST(WkiRemoteVfsLanes, MultiRdmaSelectionRequiresRequestedDirections) {
     KEXPECT_TRUE(ker::net::wki::wki_remote_vfs_selftest_multi_rdma_lane_selection());
 }
+
+KTEST(WkiRemoteVfsLanes, RoundRobinUsesFullCapacity) {
+    KEXPECT_TRUE(ker::net::wki::wki_remote_vfs_selftest_lane_round_robin_uses_full_capacity());
+}

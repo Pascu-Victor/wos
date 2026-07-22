@@ -142,6 +142,7 @@ source_cache="${WOS_SELFHOST_SOURCE_CACHE:-}"
 distdir="${WOS_SELFHOST_DISTDIR:-}"
 distributed="${WOS_SELFHOST_DISTRIBUTED:-0}"
 distributed_hosts="${WOS_SELFHOST_DISTRIBUTED_HOSTS:-}"
+distributed_jobs_per_host="${WOS_SELFHOST_DISTRIBUTED_JOBS_PER_HOST:-}"
 clean_path="${WOS_SELFHOST_CLEAN_PATH:-}"
 priority_reset="${WOS_SELFHOST_PRIORITY_RESET:-}"
 priority_nice_delta="${WOS_SELFHOST_PRIORITY_NICE_DELTA:-}"
@@ -823,6 +824,10 @@ require_any() {
 
 run_with_jobs_env() {
     if [ "$mode" = "wos" ] && [ "$distributed" = "1" ]; then
+        # Remote source-mode clang spends most of its lifetime walking headers
+        # through the submitter's VFS proxy. Preprocess on the submitter and
+        # forward one contiguous input so every listed node can sustain its
+        # equal share of compiler jobs without serializing on metadata I/O.
         WOS_BUILD_JOBS="$jobs" \
             WOS_NINJA_JOBS="$jobs" \
             WOS_MAKE_JOBS="$jobs" \
@@ -830,6 +835,8 @@ run_with_jobs_env() {
             WOS_DISTRIBUTED_COMPILER=1 \
             WOS_DISTRIBUTED_COMPILER_HOSTS="$distributed_hosts" \
             WOS_DISTRIBUTED_COMPILER_STATE="$distributed_compiler_state" \
+            WOS_DISTRIBUTED_COMPILER_TRANSPORT=preprocessed \
+            WOS_DISTRIBUTED_COMPILER_JOBS_PER_HOST="$distributed_jobs_per_host" \
             "$@"
     else
         WOS_BUILD_JOBS="$jobs" \
@@ -1485,6 +1492,7 @@ run_wos() {
     remote_env+=" WOS_SELFHOST_DISTDIR=$(shell_quote "$distdir")"
     remote_env+=" WOS_SELFHOST_DISTRIBUTED=$(shell_quote "$distributed")"
     remote_env+=" WOS_SELFHOST_DISTRIBUTED_HOSTS=$(shell_quote "$distributed_hosts")"
+    remote_env+=" WOS_SELFHOST_DISTRIBUTED_JOBS_PER_HOST=$(shell_quote "$distributed_jobs_per_host")"
     remote_env+=" WOS_SELFHOST_HEARTBEAT_INTERVAL=$(shell_quote "$heartbeat_interval")"
     remote_env+=" WOS_SELFHOST_HEARTBEAT_TAIL=$(shell_quote "$heartbeat_tail")"
     remote_env+=" WOS_SELFHOST_HEARTBEAT_STALL_SNAPSHOTS=$(shell_quote "$heartbeat_stall_snapshots")"
@@ -1553,6 +1561,7 @@ heartbeat_stall_snapshots="6"
 heartbeat_sync="0"
 distributed=0
 distributed_hosts=""
+distributed_jobs_per_host=""
 
 while (($# > 0)); do
     case "$1" in
@@ -1718,6 +1727,7 @@ if [ "$distributed" -eq 1 ]; then
         distributed_host_seen[$distributed_host]=1
     done
     [ -n "${distributed_host_seen[$host]:-}" ] || die "distributed hosts must include the submitter: $host"
+    distributed_jobs_per_host="$(((jobs + ${#distributed_host_list[@]} - 1) / ${#distributed_host_list[@]}))"
 elif [ -n "$distributed_hosts" ]; then
     die "--distributed-hosts requires --distributed"
 fi

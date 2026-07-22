@@ -956,6 +956,11 @@ template <typename Traits>
 auto btree_insert_into_parent(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp, int lev, const typename Traits::Key& new_key,
                               uint64_t left_ptr, uint64_t new_ptr, uint64_t root_block, uint8_t nlevels, uint64_t* new_root,
                               uint8_t* new_nlevels) -> int {
+    if (left_ptr == new_ptr) {
+        mod::dbg::log("[xfs btree] split child aliases new child magic=0x%x block=%lu level=%d\n", Traits::MAGIC,
+                      static_cast<unsigned long>(left_ptr), lev);
+        return -EIO;
+    }
     if (lev == cur->nlevels) {
         if (nlevels >= XFS_BTREE_MAXLEVELS) {
             return -EIO;
@@ -1029,7 +1034,13 @@ auto btree_insert_into_parent(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp, i
     // the real left child from the parent index.
     int left_pos = 0;
     for (int pos = 1; pos <= PARENT_NR; ++pos) {
-        if (cur->ptr_at(lev, pos) == left_ptr) {
+        uint64_t const CHILD = cur->ptr_at(lev, pos);
+        if (CHILD == new_ptr) {
+            mod::dbg::log("[xfs btree] parent already references new child magic=0x%x block=%lu level=%d pos=%d\n", Traits::MAGIC,
+                          static_cast<unsigned long>(new_ptr), lev, pos);
+            return -EIO;
+        }
+        if (CHILD == left_ptr) {
             if (left_pos != 0) {
                 return -EIO;
             }
@@ -1189,6 +1200,13 @@ auto xfs_btree_insert(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp, const typ
     } else if (RC == 0) {
         // Cursor is at GE position - insert before it
         insert_ptr = cur->level_at(0).ptr;
+        Key existing_key{};
+        Traits::init_key_from_rec(&existing_key, cur->rec_at(insert_ptr));
+        if (Traits::cmp_key(&existing_key, irec) == 0) {
+            mod::dbg::log("[xfs btree] refusing duplicate key magic=0x%x root=%lu level=%u leaf_ptr=%d\n", Traits::MAGIC,
+                          static_cast<unsigned long>(root_block), nlevels, insert_ptr);
+            return -EEXIST;
+        }
     } else {
         return RC;
     }

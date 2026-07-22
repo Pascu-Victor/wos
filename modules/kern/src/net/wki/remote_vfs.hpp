@@ -30,11 +30,11 @@ constexpr size_t VFS_EXPORT_NAME_LEN = 64;
 constexpr size_t VFS_READLINK_CACHE_ENTRIES = 128;
 constexpr size_t VFS_READLINK_CACHE_TEXT_MAX = 512;
 constexpr size_t VFS_PROXY_SLOT_WAITER_CAPACITY = 64;
-// A mount keeps a bounded set of independent stop-and-wait bindings. Ordinary
-// exports retain four active bindings and their RDMA registrations, while
-// automatically mounted dedicated /tmp exports can use the full capacity.
+// A mount keeps a bounded set of independent stop-and-wait bindings. Keep one
+// binding per supported lane so an eight-way remote workload cannot collapse
+// onto fewer server queues while waiting on source and header I/O.
 constexpr size_t VFS_PROXY_LANE_COUNT = 8;
-constexpr size_t VFS_PROXY_DEFAULT_LANE_COUNT = 4;
+constexpr size_t VFS_PROXY_DEFAULT_LANE_COUNT = VFS_PROXY_LANE_COUNT;
 static_assert(VFS_PROXY_DEFAULT_LANE_COUNT > 0 && VFS_PROXY_DEFAULT_LANE_COUNT <= VFS_PROXY_LANE_COUNT);
 static_assert(VFS_PROXY_LANE_COUNT <= UINT8_MAX);
 // Write-heavy distributed workloads stripe across every binding selected for
@@ -115,6 +115,7 @@ struct ProxyVfsState {
     std::array<ProxyVfsState*, VFS_PROXY_LANE_COUNT> lanes = {};
     uint8_t lane_count = 0;
     bool lanes_ready = false;
+    uint64_t lane_selection_cursor = 0;  // Protected by s_vfs_lock.
     uint16_t owner_node = WKI_NODE_INVALID;
     uint16_t assigned_channel = 0;
     WkiChannel* assigned_channel_ref = nullptr;
@@ -329,6 +330,7 @@ auto wki_remote_vfs_selftest_write_behind_capacity_classes() -> bool;
 auto wki_remote_vfs_selftest_write_behind_growth() -> bool;
 auto wki_remote_vfs_selftest_readlink_cache_generation_invalidation() -> bool;
 auto wki_remote_vfs_selftest_multi_rdma_lane_selection() -> bool;
+auto wki_remote_vfs_selftest_lane_round_robin_uses_full_capacity() -> bool;
 #endif
 
 // Task-exit hook: release a task's active proxy operation or queued slot wait.

@@ -935,14 +935,15 @@ auto acquire_vfs_proxy_lane(ProxyVfsState* anchor, bool prefer_rdma_read_anchor 
             }
         }
 
-        uint64_t const PID = perf_current_pid();
         if (PREFER_RDMA && rdma_lane_count > 0) {
-            size_t const INDEX = PID != 0 ? static_cast<size_t>(PID % rdma_lane_count) : 0;
+            auto const INDEX = static_cast<size_t>(anchor->lane_selection_cursor++ % rdma_lane_count);
             selected = rdma_lanes.at(INDEX);
         } else if (live_lane_count > 0) {
             // Allocation failure and transport cooldown preserve a usable,
-            // task-striped message path instead of failing the open.
-            size_t const INDEX = PID != 0 ? static_cast<size_t>(PID % live_lane_count) : 0;
+            // evenly striped message path instead of failing the open. A
+            // round-robin cursor avoids the low-bit aliasing of stride-sized
+            // process IDs onto only a subset of power-of-two lane counts.
+            auto const INDEX = static_cast<size_t>(anchor->lane_selection_cursor++ % live_lane_count);
             selected = live_lanes.at(INDEX);
         }
         if (selected != nullptr) {
@@ -4158,6 +4159,34 @@ auto wki_remote_vfs_selftest_multi_rdma_lane_selection() -> bool {
     ProxyVfsState* const METADATA_LANE = acquire_vfs_proxy_lane(&anchor);
     return METADATA_LANE != nullptr && (METADATA_LANE == &anchor || METADATA_LANE == &auxiliary) &&
            anchor.lifecycle_refs + auxiliary.lifecycle_refs == 6;
+}
+
+auto wki_remote_vfs_selftest_lane_round_robin_uses_full_capacity() -> bool {
+    ProxyVfsState anchor{};
+    std::array<ProxyVfsState, VFS_PROXY_LANE_COUNT - 1> auxiliaries{};
+    anchor.active = true;
+    anchor.lane_anchor = true;
+    anchor.lanes_ready = true;
+    anchor.mount_group_id = 1;
+    anchor.lane_index = 0;
+    anchor.lanes.at(0) = &anchor;
+    anchor.lane_count = VFS_PROXY_LANE_COUNT;
+
+    for (size_t index = 0; index < auxiliaries.size(); ++index) {
+        auto& lane = auxiliaries.at(index);
+        lane.active = true;
+        lane.mount_group_id = anchor.mount_group_id;
+        lane.lane_index = static_cast<uint8_t>(index + 1);
+        anchor.lanes.at(index + 1) = &lane;
+    }
+
+    for (size_t index = 0; index < VFS_PROXY_LANE_COUNT; ++index) {
+        ProxyVfsState* const SELECTED = acquire_vfs_proxy_lane(&anchor);
+        if (SELECTED != anchor.lanes.at(index) || SELECTED->lifecycle_refs != 1) {
+            return false;
+        }
+    }
+    return anchor.lane_selection_cursor == VFS_PROXY_LANE_COUNT;
 }
 
 auto wki_remote_vfs_selftest_slot_waiter_fifo() -> bool {

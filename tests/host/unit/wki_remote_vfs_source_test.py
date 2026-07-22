@@ -3583,7 +3583,7 @@ def test_remote_vfs_mount_lanes_preserve_channel_and_lifetime_affinity() -> None
         header,
         [
             "constexpr size_t VFS_PROXY_LANE_COUNT = 8;",
-            "constexpr size_t VFS_PROXY_DEFAULT_LANE_COUNT = 4;",
+            "constexpr size_t VFS_PROXY_DEFAULT_LANE_COUNT = VFS_PROXY_LANE_COUNT;",
             "VFS_PROXY_DEFAULT_LANE_COUNT <= VFS_PROXY_LANE_COUNT",
             "constexpr size_t VFS_PROXY_RDMA_LANE_COUNT = VFS_PROXY_LANE_COUNT;",
             "static_assert(VFS_PROXY_RDMA_LANE_COUNT > 1 && VFS_PROXY_RDMA_LANE_COUNT <= VFS_PROXY_LANE_COUNT);",
@@ -3593,6 +3593,7 @@ def test_remote_vfs_mount_lanes_preserve_channel_and_lifetime_affinity() -> None
             "std::array<ProxyVfsState*, VFS_PROXY_LANE_COUNT> lanes = {};",
             "uint8_t lane_count = 0;",
             "bool lanes_ready = false;",
+            "uint64_t lane_selection_cursor = 0;",
         ],
         "bounded remote VFS lane metadata",
     )
@@ -3639,11 +3640,10 @@ def test_remote_vfs_mount_lanes_preserve_channel_and_lifetime_affinity() -> None
             "bool const HAS_REQUESTED_RDMA",
             "vfs_proxy_lane_has_requested_rdma(candidate, prefer_rdma_read_anchor, prefer_rdma_write_anchor, NOW_US)",
             "rdma_lanes.at(rdma_lane_count++) = candidate",
-            "uint64_t const PID = perf_current_pid()",
             "if (PREFER_RDMA && rdma_lane_count > 0)",
-            "PID % rdma_lane_count",
+            "anchor->lane_selection_cursor++ % rdma_lane_count",
             "else if (live_lane_count > 0)",
-            "PID % live_lane_count",
+            "anchor->lane_selection_cursor++ % live_lane_count",
             "selected->lifecycle_refs++",
             "s_vfs_lock.unlock()",
         ],
@@ -3901,7 +3901,7 @@ def test_capability_gated_vfs_data_lanes_bound_rdma_buffers() -> None:
         header,
         [
             "constexpr size_t VFS_PROXY_LANE_COUNT = 8;",
-            "constexpr size_t VFS_PROXY_DEFAULT_LANE_COUNT = 4;",
+            "constexpr size_t VFS_PROXY_DEFAULT_LANE_COUNT = VFS_PROXY_LANE_COUNT;",
             "constexpr size_t VFS_PROXY_RDMA_LANE_COUNT = VFS_PROXY_LANE_COUNT;",
             "VFS_PROXY_RDMA_LANE_COUNT <= VFS_PROXY_LANE_COUNT",
         ],
@@ -3972,6 +3972,8 @@ def test_capability_gated_vfs_data_lanes_bound_rdma_buffers() -> None:
         [
             "KTEST(WkiRemoteVfsLanes, MultiRdmaSelectionRequiresRequestedDirections)",
             "wki_remote_vfs_selftest_multi_rdma_lane_selection()",
+            "KTEST(WkiRemoteVfsLanes, RoundRobinUsesFullCapacity)",
+            "wki_remote_vfs_selftest_lane_round_robin_uses_full_capacity()",
         ],
         "multi-lane selector KTEST hook",
     )

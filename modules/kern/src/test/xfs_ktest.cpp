@@ -12,6 +12,7 @@
 #include <cstring>
 #include <dev/block_device.hpp>
 #include <test/ktest.hpp>
+#include <vfs/fs/xfs/xfs_alloc.hpp>
 #include <vfs/fs/xfs/xfs_bmap.hpp>
 #include <vfs/fs/xfs/xfs_btree.hpp>
 #include <vfs/fs/xfs/xfs_dir2.hpp>
@@ -88,6 +89,8 @@ KTEST(XFS, BmapInsertMergeCases) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_bmap
 KTEST(XFS, BmapSyntheticBtreeLookup) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_bmap_synthetic_btree_lookup()); }
 
 KTEST(XFS, BmapExtentPromotion) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_bmap_extent_promotion()); }
+
+KTEST(XFS, AgflSkipsLiveFreeSpaceBlock) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_agfl_skips_live_free_space_block()); }
 
 KTEST(XFS, SmallHoleWriteAllocatesOnlyNeededBlocks) {
     constexpr size_t BLOCK_SIZE = 4096;
