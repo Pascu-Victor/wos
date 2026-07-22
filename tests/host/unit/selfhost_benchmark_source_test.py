@@ -148,6 +148,8 @@ def test_wos_bootstrap_distributes_only_compiler_processes() -> None:
             r'compiler_candidate_jobs="\$compiler_remote_jobs_per_host"',
             r'compiler_candidate_jobs="\$compiler_local_jobs"',
             r'compiler_slot_persistent=1',
+            r'compiler_successes="\$compiler_state.successes"',
+            r'''printf '%s\n' "\$compiler_host" > "\$compiler_successes/\$compiler_candidate_index"''',
             r'if mkdir "\$compiler_candidate_slot" 2>/dev/null; then',
             r'compiler_host="\${compiler_hosts[\$compiler_candidate_index]}"',
             r'compiler_slot_cleanup() {',
@@ -271,6 +273,8 @@ test "$(cat "$1/mock-on.max.wos-0")" -eq 4
 test "$(cat "$1/mock-on.max.wos-1")" -eq 1
 test "$(cat "$1/mock-on.count.wos-0")" -eq 7
 test "$(cat "$1/mock-on.count.wos-1")" -eq 1
+test "$(cat "$1/compiler-state.successes/0")" = wos-0
+test "$(cat "$1/compiler-state.successes/1")" = wos-1
 '''
         result = subprocess.run(
             ["bash", "-c", script, "wos-bootstrap-cap-test", temp_dir],
@@ -486,6 +490,8 @@ PATH="$1:$PATH" \
     WOS_NINJA_JOBS=1 \
     "$1/clang" -c -o "$1/object.o" "$1/input.c"
 test "$(cat "$1/fallback-marker")" = local
+test ! -e "$1/compiler-state.successes/0"
+test ! -e "$1/compiler-state.successes/1"
 '''
         result = subprocess.run(
             ["bash", "-c", script, "wos-bootstrap-fallback-test", temp_dir],
@@ -606,9 +612,11 @@ def test_selfhost_repeatability_runner_preserves_acceptance_evidence() -> None:
             'runner_cmd+=(--distributed --distributed-hosts "$distributed_hosts_csv")',
             'capture_distributed_telemetry "$runner_pid" "$run_dir/distributed-telemetry.tsv"',
             'running_active=\\([0-9][0-9]*\\)',
-            'distributed_workload_observed_on_${distributed_running_hosts}_hosts',
+            'capture_distributed_success_evidence "$console_log" "$run_dir/distributed-success.tsv"',
+            'distributed_workload_succeeded_on_${distributed_successful_hosts}_hosts',
             'capture_distributed_serial_evidence "$run_dir"',
-            'required_distributed_running_hosts',
+            'distributed_success_evidence',
+            'required_distributed_successful_hosts',
         ],
         "WOS self-host repeatability evidence runner",
     )

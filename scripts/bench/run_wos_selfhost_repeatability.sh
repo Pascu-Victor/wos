@@ -259,6 +259,36 @@ capture_distributed_telemetry() {
     done
 }
 
+capture_distributed_success_evidence() {
+    local console_log="$1"
+    local output="$2"
+    local compiler_state index participant_host marker marker_path
+
+    printf 'host\tmarker_host\tsuccessful\n' > "$output"
+    distributed_successful_hosts=0
+    compiler_state="$(sed -n 's/.*distributed_compiler_state=\([^[:space:]]*\).*/\1/p' "$console_log" | tail -n 1)"
+    case "$compiler_state" in
+        /tmp/wos-distributed-compiler.??????/state)
+            ;;
+        *)
+            return 0
+            ;;
+    esac
+
+    for ((index = 0; index < ${#distributed_hosts[@]}; ++index)); do
+        participant_host="${distributed_hosts[$index]}"
+        marker_path="$compiler_state.successes/$index"
+        marker="$(guest_output "cat $(shell_quote "$marker_path")" 2>/dev/null || true)"
+        marker="$(printf '%s\n' "$marker" | sed -n '1p')"
+        if [ "$marker" = "$participant_host" ]; then
+            printf '%s\t%s\t1\n' "$participant_host" "$marker" >> "$output"
+            distributed_successful_hosts=$((distributed_successful_hosts + 1))
+        else
+            printf '%s\t%s\t0\n' "$participant_host" "$marker" >> "$output"
+        fi
+    done
+}
+
 guest_output() {
     local command="$1"
     "$WOS_SSH" "$host" "$command"
@@ -733,8 +763,12 @@ for ((run_number = 1; run_number <= runs; ++run_number)); do
     else
         append_reason "runner_status_$runner_status"
     fi
-    if [ "$distributed" -eq 1 ] && [ "$distributed_running_hosts" -lt 2 ]; then
-        append_reason "distributed_workload_observed_on_${distributed_running_hosts}_hosts"
+    distributed_successful_hosts=0
+    if [ "$distributed" -eq 1 ] && [ "$cleanup_incomplete" -eq 0 ]; then
+        capture_distributed_success_evidence "$console_log" "$run_dir/distributed-success.tsv"
+    fi
+    if [ "$distributed" -eq 1 ] && [ "$distributed_successful_hosts" -lt 2 ]; then
+        append_reason "distributed_workload_succeeded_on_${distributed_successful_hosts}_hosts"
     fi
 
     if [ "$cleanup_incomplete" -eq 1 ]; then
@@ -884,7 +918,7 @@ if [ "$attempted" -eq "$runs" ] && [ "$accepted" -eq "$runs" ] && [ "$failed" -e
 fi
 
 {
-    printf 'schema_version\t2\n'
+    printf 'schema_version\t3\n'
     printf 'generated_utc\t%s\n' "$(timestamp_utc)"
     printf 'pass\t%s\n' "$overall_pass"
     printf 'requested_runs\t%s\n' "$runs"
@@ -914,7 +948,8 @@ fi
     printf 'distributed\t%s\n' "$distributed"
     printf 'distributed_hosts\t%s\n' "$distributed_hosts_csv"
     printf 'distributed_serial_logs\t%s\n' "$distributed_serial_logs_csv"
-    printf 'required_distributed_running_hosts\t2\n'
+    printf 'distributed_success_evidence\tsuccess_markers\n'
+    printf 'required_distributed_successful_hosts\t2\n'
     printf 'runs_tsv\t%s\n' "$runs_tsv"
 } > "$summary_tsv"
 

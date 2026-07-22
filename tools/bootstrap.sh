@@ -408,6 +408,11 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
         fi
         compiler_input_cleanup
         if [ "\$compiler_status" -eq 0 ]; then
+            compiler_successes="\$compiler_state.successes"
+            if ! mkdir -p "\$compiler_successes" ||
+               ! printf '%s\n' "\$compiler_host" > "\$compiler_successes/\$compiler_candidate_index"; then
+                echo "warning: distributed compiler could not record successful host \$compiler_host" >&2
+            fi
             compiler_slot_cleanup
         else
             compiler_slot_release
