@@ -373,6 +373,7 @@ def test_selfhost_repeatability_runner_preserves_acceptance_evidence() -> None:
             'grep -Ein "$serial_fail_regex" "$run_dir/serial.log"',
             "hung task|blocked for more than",
             "allocation failure|allocator failure|failed to allocate",
+            "async remote close send failed",
             "I/O error|input/output error",
             "filesystem.*(corrupt|shutdown)",
             "xfs.*(error|corrupt|shutdown|failed)",

@@ -2101,6 +2101,13 @@ auto acquire_proxy_untracked_send_slot_locked(ProxyVfsState* state, uint64_t sta
     return acquire_proxy_slot_locked(state, start_us, true);
 }
 
+auto vfs_proxy_untracked_send_status_is_retryable(int status) -> bool {
+    // Reliable sends return before publishing a sequence when either the peer's
+    // advertised credits or the local packet/retransmit storage are exhausted.
+    // Retrying those two results therefore cannot duplicate a close request.
+    return status == WKI_ERR_NO_CREDITS || status == WKI_ERR_NO_MEM;
+}
+
 // Caller must hold the lock protecting waiter_slot.
 auto claim_and_clear_waiter_locked(WkiWaitEntry*& waiter_slot) -> WkiWaitEntry* {
     WkiWaitEntry* waiter = waiter_slot;
@@ -2669,8 +2676,24 @@ auto vfs_proxy_send_untracked(ProxyVfsState* state, uint16_t op_id, const uint8_
                                      ker::mod::perf::WkiPerfPhase::BEGIN, state->owner_node, state->assigned_channel, CORRELATION, 0,
                                      REQ_DATA_LEN, CALLSITE);
 
-    int const SEND_RET =
-        wki_send_on_channel_identity(CHANNEL_IDENTITY, MsgType::DEV_OP_REQ, req_buf.data(), static_cast<uint16_t>(REQ_TOTAL));
+    uint64_t const SEND_DEADLINE_US = wki_future_deadline_us(PROXY_WAIT_START, VFS_PROXY_OP_TIMEOUT_US);
+    ProxySlotCaller const SEND_CALLER = current_proxy_slot_caller();
+    int send_ret = WKI_ERR_NO_CREDITS;
+    while (true) {
+        send_ret = wki_send_on_channel_identity(CHANNEL_IDENTITY, MsgType::DEV_OP_REQ, req_buf.data(), static_cast<uint16_t>(REQ_TOTAL));
+        if (send_ret == WKI_OK || !vfs_proxy_untracked_send_status_is_retryable(send_ret)) {
+            break;
+        }
+        if (wki_now_us() >= SEND_DEADLINE_US) {
+            send_ret = WKI_ERR_TIMEOUT;
+            break;
+        }
+        // Keep ownership of the proxy slot so later RPCs cannot overtake this
+        // close.  The shared park helper preserves syscall IF state and lets a
+        // WKI progress daemon drive receive/ACK work instead of sleeping.
+        park_proxy_slot_caller(SEND_CALLER, SEND_DEADLINE_US, false);
+    }
+    int const SEND_RET = send_ret;
 
     state->lock.lock();
     state->op_untracked_send_pending.store(false, std::memory_order_release);

@@ -19,7 +19,7 @@ DEFAULT_CLEANUP_WAIT_SECONDS=60
 DEFAULT_CLEANUP_PROBE_SECONDS=5
 DEFAULT_WORKDIR="/root/wos-selfhost-bench"
 DEFAULT_SERIAL_LOG="$WORKSPACE_ROOT/serial-vm0.log"
-DEFAULT_SERIAL_FAIL_REGEX='out of memory|oom killer|oom:|kernel panic|hung task|blocked for more than|allocation failure|allocator failure|failed to allocate|I/O error|input/output error|filesystem.*(corrupt|shutdown)|corruption detected|forced shutdown|error xfs:|xfs.*(error|corrupt|shutdown|failed)|\[xfs (btree|free|agfl|trans)\]|AGFL empty|KASAN:|UBSAN:'
+DEFAULT_SERIAL_FAIL_REGEX='out of memory|oom killer|oom:|kernel panic|hung task|blocked for more than|allocation failure|allocator failure|failed to allocate|async remote close send failed|I/O error|input/output error|filesystem.*(corrupt|shutdown)|corruption detected|forced shutdown|error xfs:|xfs.*(error|corrupt|shutdown|failed)|\[xfs (btree|free|agfl|trans)\]|AGFL empty|KASAN:|UBSAN:'
 
 usage() {
     cat <<EOF

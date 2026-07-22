@@ -643,6 +643,54 @@ def test_proxy_operations_fail_before_setup_when_slot_wait_times_out() -> None:
     )
 
 
+def test_untracked_proxy_send_retries_only_pre_enqueue_pressure() -> None:
+    source = REMOTE_VFS_CPP.read_text()
+    retryable_body = function_body(source, "vfs_proxy_untracked_send_status_is_retryable")
+    untracked_body = function_body(source, "vfs_proxy_send_untracked")
+
+    require_tokens(
+        retryable_body,
+        [
+            "status == WKI_ERR_NO_CREDITS",
+            "status == WKI_ERR_NO_MEM",
+        ],
+        "untracked proxy retryable pre-enqueue statuses",
+    )
+    for terminal_status in [
+        "WKI_ERR_NO_ROUTE",
+        "WKI_ERR_PEER_FENCED",
+        "WKI_ERR_TIMEOUT",
+        "WKI_ERR_INVALID",
+        "WKI_ERR_NOT_FOUND",
+        "WKI_ERR_BUSY",
+        "WKI_ERR_TX_FAILED",
+    ]:
+        if terminal_status in retryable_body:
+            fail(f"untracked proxy send must not retry terminal status {terminal_status}")
+
+    require_order(
+        untracked_body,
+        [
+            "acquire_proxy_untracked_send_slot_locked(state, PROXY_WAIT_START)",
+            "state->lock.unlock()",
+            "uint64_t const SEND_DEADLINE_US = wki_future_deadline_us(PROXY_WAIT_START, VFS_PROXY_OP_TIMEOUT_US)",
+            "ProxySlotCaller const SEND_CALLER = current_proxy_slot_caller()",
+            "int send_ret = WKI_ERR_NO_CREDITS",
+            "while (true)",
+            "wki_send_on_channel_identity(CHANNEL_IDENTITY, MsgType::DEV_OP_REQ",
+            "send_ret == WKI_OK || !vfs_proxy_untracked_send_status_is_retryable(send_ret)",
+            "wki_now_us() >= SEND_DEADLINE_US",
+            "send_ret = WKI_ERR_TIMEOUT",
+            "park_proxy_slot_caller(SEND_CALLER, SEND_DEADLINE_US, false)",
+            "int const SEND_RET = send_ret",
+            "state->lock.lock()",
+            "state->op_untracked_send_pending.store(false, std::memory_order_release)",
+            "unlock_proxy_slot_and_wake_next(state)",
+        ],
+        "bounded ordered untracked proxy send retry",
+    )
+
+
 def test_proxy_request_envelopes_use_stack_storage() -> None:
     source = REMOTE_VFS_CPP.read_text()
 
@@ -3979,6 +4027,7 @@ def main() -> None:
     test_vfs_rename_scratch_is_initialized_by_its_producers()
     test_proxy_op_slot_waits_are_bounded()
     test_proxy_operations_fail_before_setup_when_slot_wait_times_out()
+    test_untracked_proxy_send_retries_only_pre_enqueue_pressure()
     test_proxy_request_envelopes_use_stack_storage()
     test_readdir_batch_buffers_use_bounded_stack_storage()
     test_proxy_slot_release_paths_handoff_after_unlock()
