@@ -16,7 +16,7 @@
                 "ip": null
             },
             "vm": {
-                "memory": "24576M",
+                "memory": "16384M",
                 "cpus": 8,
                 "disk0": "disk.qcow2",
                 "disk1": "mountfs.qcow2"
@@ -30,7 +30,7 @@
                 {
                     "id": 0,
                     "vm": {
-                        "memory": "65536M",
+                        "memory": "49152M",
                         "cpus": 8
                     }
                 }
@@ -52,7 +52,7 @@
                 {
                     "id": 0,
                     "vm": {
-                        "memory": "65536M",
+                        "memory": "49152M",
                         "cpus": 8
                     }
                 }

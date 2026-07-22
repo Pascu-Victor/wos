@@ -1159,20 +1159,25 @@ def test_distributed_cluster_has_plausible_per_core_memory() -> None:
 def test_distributed_selfhost_cluster_balances_cpu_and_memory() -> None:
     config = json.loads(DISTRIBUTED_SELFHOST_CLUSTER.read_text())
     global_vm = config["zones"][0]["vm"]
-    if global_vm["memory"] != "24576M" or global_vm["cpus"] != 8:
-        fail("distributed self-host workers must provide 3 GiB per core")
+    if global_vm["memory"] != "16384M" or global_vm["cpus"] != 8:
+        fail("distributed self-host workers must provide 2 GiB per core")
 
     node_zones = [zone for zone in config["zones"] if zone["id"] != "GLOBAL"]
     if [zone["nodes"] for zone in node_zones] != [4, 4]:
         fail("distributed self-host profile must launch four WOS systems")
 
+    controller_memory_mib = 0
     for zone in node_zones:
         overrides = zone.get("nodes_config", [])
-        if overrides != [{"id": 0, "vm": {"memory": "65536M", "cpus": 8}}]:
-            fail("distributed self-host controller must provide 8 CPUs and 64 GiB")
+        if overrides != [{"id": 0, "vm": {"memory": "49152M", "cpus": 8}}]:
+            fail("distributed self-host controller must provide 8 CPUs and 48 GiB")
+        controller_memory_mib = int(overrides[0]["vm"]["memory"].removesuffix("M"))
 
     if 4 * global_vm["cpus"] != 32:
         fail("distributed self-host profile must not oversubscribe the 32-thread host")
+    worker_memory_mib = int(global_vm["memory"].removesuffix("M"))
+    if controller_memory_mib + (3 * worker_memory_mib) != 98304:
+        fail("distributed self-host profile must fit its 96 GiB VM allocation on the benchmark host")
 
 
 def test_selfhost_runner_verifies_toolchain_kernel_and_utilities() -> None:
