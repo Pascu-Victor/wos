@@ -55,7 +55,7 @@ def test_selfhost_runner_covers_acceptance_flow() -> None:
             'WOS_DISTRIBUTED_COMPILER_HOSTS="$distributed_hosts"',
             'distributed_compiler_state="$workdir/tmp/distributed-compiler"',
             'WOS_DISTRIBUTED_COMPILER_STATE="$distributed_compiler_state"',
-            "WOS_DISTRIBUTED_COMPILER_TRANSPORT=preprocessed",
+            "WOS_DISTRIBUTED_COMPILER_TRANSPORT=rewritten",
             'WOS_DISTRIBUTED_COMPILER_JOBS_PER_HOST="$distributed_jobs_per_host"',
             'distributed_jobs_per_host="$(((jobs + ${#distributed_host_list[@]} - 1) / ${#distributed_host_list[@]}))"',
             'WOS_SELFHOST_DISTRIBUTED_JOBS_PER_HOST=$(shell_quote "$distributed_jobs_per_host")',
@@ -130,6 +130,7 @@ def test_wos_bootstrap_distributes_only_compiler_processes() -> None:
             r'if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; then',
             r'IFS=, read -r -a compiler_hosts <<< "\${WOS_DISTRIBUTED_COMPILER_HOSTS:-}"',
             r'compiler_transport="\${WOS_DISTRIBUTED_COMPILER_TRANSPORT:-source}"',
+            r"source|preprocessed|rewritten)",
             r'compiler_jobs_per_host="\$(((compiler_total_jobs + \${#compiler_hosts[@]} - 1) / \${#compiler_hosts[@]}))"',
             r'compiler_slots="\$compiler_state.source-slots"',
             r'compiler_start_index="\$((\$\$ % \${#compiler_hosts[@]}))"',
@@ -150,9 +151,10 @@ def test_wos_bootstrap_distributes_only_compiler_processes() -> None:
             r'while ! mkdir "\$compiler_lock" 2>/dev/null; do',
             r'compiler_job_dir="\$(mktemp -d "\$compiler_responses/clang-job.XXXXXX" || true)"',
             r'compiler_input="\$compiler_job_dir/input"',
-            r'"\${compiler[@]}" "\$@" -E -o "\$compiler_input" -Wno-unused-command-line-argument',
+            r'"\${compiler[@]}" "\$@" "\${compiler_preprocess_args[@]}" -o "\$compiler_input" -Wno-unused-command-line-argument',
             r'compiler_input_size="\$(stat -c %s -- "\$compiler_input" 2>/dev/null || true)"',
-            r'compiler_forward_args+=(-x "\$compiler_preprocessed_language" -Wno-unused-command-line-argument "\$compiler_input")',
+            r'compiler_preprocess_args+=(-frewrite-includes)',
+            r'compiler_forward_args+=(-x "\$compiler_remote_language" -Wno-unused-command-line-argument "\$compiler_input")',
             r'if [ "\$compiler_input_size" -lt "\$compiler_min_preprocessed_bytes" ]; then',
             r'"\${compiler[@]}" "\$@"',
             r'compiler_candidate_slot="\$compiler_host_slots/\$compiler_slot_index"',
@@ -304,6 +306,7 @@ def test_wos_bootstrap_remote_response_file_preserves_arguments() -> None:
         temp = Path(temp_dir)
         source = temp / "source with spaces.cpp"
         c_source = temp / "source with spaces.c"
+        header = temp / "header with spaces.h"
         mock_on = temp / "on"
         mock_on.write_text(
             r'''#!/bin/bash
@@ -325,34 +328,43 @@ if grep -Fx -- -MD "$response" >/dev/null || grep -Fx -- -MF "$response" >/dev/n
     echo "remote compiler response still contains dependency flags" >&2
     exit 91
 fi
-if ! grep -Ex -- 'cpp-output|c\+\+-cpp-output' "$response" >/dev/null; then
-    echo "remote compiler response does not select preprocessed C/C++" >&2
+if ! grep -Ex -- 'c|c\+\+' "$response" >/dev/null; then
+    echo "remote compiler response does not select rewritten C/C++" >&2
     exit 92
 fi
 mv CPP_SOURCE_PATH CPP_HIDDEN_SOURCE_PATH
 mv C_SOURCE_PATH C_HIDDEN_SOURCE_PATH
+mv HEADER_PATH HEADER_HIDDEN_PATH
 "$@"
 status=$?
 mv CPP_HIDDEN_SOURCE_PATH CPP_SOURCE_PATH
 mv C_HIDDEN_SOURCE_PATH C_SOURCE_PATH
+mv HEADER_HIDDEN_PATH HEADER_PATH
 exit "$status"
 '''.replace("CPP_SOURCE_PATH", shlex.quote(str(source)))
             .replace("CPP_HIDDEN_SOURCE_PATH", shlex.quote(str(source) + ".hidden"))
             .replace("C_SOURCE_PATH", shlex.quote(str(c_source)))
-            .replace("C_HIDDEN_SOURCE_PATH", shlex.quote(str(c_source) + ".hidden")),
+            .replace("C_HIDDEN_SOURCE_PATH", shlex.quote(str(c_source) + ".hidden"))
+            .replace("HEADER_PATH", shlex.quote(str(header)))
+            .replace("HEADER_HIDDEN_PATH", shlex.quote(str(header) + ".hidden")),
             encoding="ascii",
         )
         mock_on.chmod(0o755)
         source.write_text(
-            r'''#ifndef TEST_TEXT
+            r'''#include "header with spaces.h"
+#ifndef TEST_TEXT
 #error TEST_TEXT was not preserved
 #endif
 static const char *text = TEST_TEXT;
-int response_file_test(void) { return text[0]; }
+int response_file_test(void) { return text[0] + TEST_HEADER_VALUE; }
 ''',
             encoding="ascii",
         )
-        c_source.write_text("int c_response_file_test(void) { return 7; }\n", encoding="ascii")
+        c_source.write_text(
+            '#include "header with spaces.h"\nint c_response_file_test(void) { return TEST_HEADER_VALUE; }\n',
+            encoding="ascii",
+        )
+        header.write_text("#define TEST_HEADER_VALUE 11\n", encoding="ascii")
         system_clang = ROOT / "toolchain" / "host" / "bin" / "clang"
         resource_dir = ROOT / "toolchain" / "host" / "lib" / "clang" / "22"
         script = r'''
@@ -365,7 +377,7 @@ PATH="$1:$PATH" \
     WOS_DISTRIBUTED_COMPILER=1 \
     WOS_DISTRIBUTED_COMPILER_HOSTS=wos-0,wos-1 \
     WOS_DISTRIBUTED_COMPILER_STATE="$1/compiler-state" \
-    WOS_DISTRIBUTED_COMPILER_TRANSPORT=preprocessed \
+    WOS_DISTRIBUTED_COMPILER_TRANSPORT=rewritten \
     WOS_DISTRIBUTED_COMPILER_JOBS_PER_HOST=1 \
     WOS_DISTRIBUTED_COMPILER_MIN_PREPROCESSED_BYTES=0 \
     WOS_NINJA_JOBS=1 \
@@ -376,13 +388,16 @@ test -s "$1/object with spaces.o"
 test -s "$1/dependencies with spaces.d"
 "$2" -resource-dir "$3" -D'TEST_TEXT="quoted value"' -c "$1/source with spaces.cpp" \
     -o "$1/direct object with spaces.o"
-cmp "$1/object with spaces.o" "$1/direct object with spaces.o"
+objcopy="${2%/clang}/llvm-objcopy"
+"$objcopy" --dump-section ".text=$1/rewritten cpp text" "$1/object with spaces.o"
+"$objcopy" --dump-section ".text=$1/direct cpp text" "$1/direct object with spaces.o"
+cmp "$1/rewritten cpp text" "$1/direct cpp text"
 printf '1\n' > "$1/compiler-state"
 PATH="$1:$PATH" \
     WOS_DISTRIBUTED_COMPILER=1 \
     WOS_DISTRIBUTED_COMPILER_HOSTS=wos-0,wos-1 \
     WOS_DISTRIBUTED_COMPILER_STATE="$1/compiler-state" \
-    WOS_DISTRIBUTED_COMPILER_TRANSPORT=preprocessed \
+    WOS_DISTRIBUTED_COMPILER_TRANSPORT=rewritten \
     WOS_DISTRIBUTED_COMPILER_JOBS_PER_HOST=1 \
     WOS_DISTRIBUTED_COMPILER_MIN_PREPROCESSED_BYTES=0 \
     WOS_NINJA_JOBS=1 \
@@ -390,7 +405,9 @@ PATH="$1:$PATH" \
         -o "$1/c object with spaces.o"
 test -s "$1/c dependencies with spaces.d"
 "$2" -resource-dir "$3" -c "$1/source with spaces.c" -o "$1/direct c object with spaces.o"
-cmp "$1/c object with spaces.o" "$1/direct c object with spaces.o"
+"$objcopy" --dump-section ".text=$1/rewritten c text" "$1/c object with spaces.o"
+"$objcopy" --dump-section ".text=$1/direct c text" "$1/direct c object with spaces.o"
+cmp "$1/rewritten c text" "$1/direct c text"
 '''
         result = subprocess.run(
             [
@@ -408,7 +425,7 @@ cmp "$1/c object with spaces.o" "$1/direct c object with spaces.o"
             capture_output=True,
         )
         if result.returncode != 0:
-            fail(f"WOS compiler shim response-file test failed: {result.stderr}")
+            fail(f"WOS compiler shim response-file test failed: stdout={result.stdout!r} stderr={result.stderr!r}")
 
 
 def test_wos_bootstrap_keeps_small_preprocessed_inputs_local() -> None:

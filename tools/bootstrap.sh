@@ -141,10 +141,10 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
     fi
     compiler_transport="\${WOS_DISTRIBUTED_COMPILER_TRANSPORT:-source}"
     case "\$compiler_transport" in
-        source|preprocessed)
+        source|preprocessed|rewritten)
             ;;
         *)
-            echo "ERROR: distributed compiler transport must be 'source' or 'preprocessed'" >&2
+            echo "ERROR: distributed compiler transport must be 'source', 'preprocessed', or 'rewritten'" >&2
             exit 1
             ;;
     esac
@@ -357,6 +357,17 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
         esac
     fi
     if [ -n "\$compiler_preprocessed_language" ]; then
+        compiler_remote_language="\$compiler_preprocessed_language"
+        compiler_preprocess_args=(-E)
+        if [ "\$compiler_transport" = rewritten ]; then
+            compiler_preprocess_args+=(-frewrite-includes)
+            case "\$compiler_preprocessed_language" in
+                cpp-output) compiler_remote_language=c ;;
+                c++-cpp-output) compiler_remote_language=c++ ;;
+                objective-c-cpp-output) compiler_remote_language=objective-c ;;
+                objective-c++-cpp-output) compiler_remote_language=objective-c++ ;;
+            esac
+        fi
         compiler_lock="\$compiler_state.lock"
         compiler_lock_cleanup() {
             rmdir "\$compiler_lock" 2>/dev/null || true
@@ -501,7 +512,7 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
             compiler_slot_release
         }
         trap compiler_input_and_slot_cleanup EXIT HUP INT TERM
-        if "\${compiler[@]}" "\$@" -E -o "\$compiler_input" -Wno-unused-command-line-argument; then
+        if "\${compiler[@]}" "\$@" "\${compiler_preprocess_args[@]}" -o "\$compiler_input" -Wno-unused-command-line-argument; then
             compiler_status=0
         else
             compiler_status=\$?
@@ -541,7 +552,7 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
             esac
             compiler_forward_args+=("\$arg")
         done
-        compiler_forward_args+=(-x "\$compiler_preprocessed_language" -Wno-unused-command-line-argument "\$compiler_input")
+        compiler_forward_args+=(-x "\$compiler_remote_language" -Wno-unused-command-line-argument "\$compiler_input")
         if [ "\$compiler_input_size" -lt "\$compiler_min_preprocessed_bytes" ]; then
             compiler_input_and_slot_cleanup
             trap - EXIT HUP INT TERM

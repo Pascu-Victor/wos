@@ -835,7 +835,7 @@ run_with_jobs_env() {
             WOS_DISTRIBUTED_COMPILER=1 \
             WOS_DISTRIBUTED_COMPILER_HOSTS="$distributed_hosts" \
             WOS_DISTRIBUTED_COMPILER_STATE="$distributed_compiler_state" \
-            WOS_DISTRIBUTED_COMPILER_TRANSPORT=preprocessed \
+            WOS_DISTRIBUTED_COMPILER_TRANSPORT=rewritten \
             WOS_DISTRIBUTED_COMPILER_JOBS_PER_HOST="$distributed_jobs_per_host" \
             "$@"
     else
