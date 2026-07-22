@@ -1732,14 +1732,8 @@ if [ "$distributed" -eq 1 ]; then
     done
     [ -n "${distributed_host_seen[$host]:-}" ] || die "distributed hosts must include the submitter: $host"
     distributed_jobs_per_host="$(((jobs + ${#distributed_host_list[@]} - 1) / ${#distributed_host_list[@]}))"
-    # Remote source compilers block on synchronous VFS reads. Keep half of the
-    # submitter's equal share local so it can serve those reads, and move the
-    # remaining slots to peers where modest oversubscription hides I/O latency.
-    distributed_local_jobs="$((distributed_jobs_per_host / 2))"
-    if [ "$distributed_local_jobs" -lt 1 ]; then
-        distributed_local_jobs=1
-    fi
-    distributed_remote_jobs_per_host="$(((jobs - distributed_local_jobs + ${#distributed_host_list[@]} - 2) / (${#distributed_host_list[@]} - 1)))"
+    distributed_local_jobs="$distributed_jobs_per_host"
+    distributed_remote_jobs_per_host="$distributed_jobs_per_host"
 elif [ -n "$distributed_hosts" ]; then
     die "--distributed-hosts requires --distributed"
 fi
