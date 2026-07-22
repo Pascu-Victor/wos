@@ -139,21 +139,35 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
         echo "ERROR: distributed compiler state path is missing" >&2
         exit 1
     fi
-    compiler_jobs_per_host="\${WOS_DISTRIBUTED_COMPILER_JOBS_PER_HOST:-}"
-    if [ -z "\$compiler_jobs_per_host" ]; then
-        compiler_total_jobs="\${WOS_NINJA_JOBS:-\${WOS_BUILD_JOBS:-}}"
-        case "\$compiler_total_jobs" in
-            ''|*[!0-9]*|0)
-                compiler_jobs_per_host=8
-                ;;
-            *)
-                compiler_jobs_per_host="\$(((compiler_total_jobs + \${#compiler_hosts[@]} - 1) / \${#compiler_hosts[@]}))"
-                ;;
-        esac
-    fi
-    case "\$compiler_jobs_per_host" in
+    compiler_total_jobs="\${WOS_NINJA_JOBS:-\${WOS_BUILD_JOBS:-}}"
+    case "\$compiler_total_jobs" in
         ''|*[!0-9]*|0)
+            compiler_local_jobs=8
+            ;;
+        *)
+            compiler_local_jobs="\$compiler_total_jobs"
+            ;;
+    esac
+    # The self-host runner validates that compiler_hosts[0] is the submitter.
+    # Keep its full Ninja width available while bounding each slower remote-VFS
+    # path to one in-flight compile unless the caller explicitly overrides it.
+    compiler_jobs_per_host="\${WOS_DISTRIBUTED_COMPILER_JOBS_PER_HOST:-}"
+    case "\$compiler_jobs_per_host" in
+        '')
+            compiler_remote_jobs_per_host="\${WOS_DISTRIBUTED_COMPILER_REMOTE_JOBS_PER_HOST:-1}"
+            ;;
+        *[!0-9]*|0)
             echo "ERROR: distributed compiler jobs per host must be a positive integer" >&2
+            exit 1
+            ;;
+        *)
+            compiler_local_jobs="\$compiler_jobs_per_host"
+            compiler_remote_jobs_per_host="\$compiler_jobs_per_host"
+            ;;
+    esac
+    case "\$compiler_remote_jobs_per_host" in
+        ''|*[!0-9]*|0)
+            echo "ERROR: distributed compiler remote jobs per host must be a positive integer" >&2
             exit 1
             ;;
     esac
@@ -328,7 +342,11 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
                     echo "ERROR: distributed compiler host slot directory could not be created" >&2
                     exit 1
                 fi
-                for ((compiler_slot_index = 0; compiler_slot_index < compiler_jobs_per_host; compiler_slot_index++)); do
+                compiler_candidate_jobs="\$compiler_remote_jobs_per_host"
+                if [ "\$compiler_candidate_index" -eq 0 ]; then
+                    compiler_candidate_jobs="\$compiler_local_jobs"
+                fi
+                for ((compiler_slot_index = 0; compiler_slot_index < compiler_candidate_jobs; compiler_slot_index++)); do
                     compiler_candidate_slot="\$compiler_host_slots/\$compiler_slot_index"
                     if mkdir "\$compiler_candidate_slot" 2>/dev/null; then
                         compiler_host="\${compiler_hosts[\$compiler_candidate_index]}"
