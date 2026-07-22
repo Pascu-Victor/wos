@@ -165,6 +165,20 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
                 exit 1
                 ;;
         esac
+        compiler_local_jobs="\${WOS_DISTRIBUTED_COMPILER_LOCAL_JOBS:-\$compiler_jobs_per_host}"
+        compiler_remote_jobs_per_host="\${WOS_DISTRIBUTED_COMPILER_REMOTE_JOBS_PER_HOST:-\$compiler_jobs_per_host}"
+        case "\$compiler_local_jobs" in
+            ''|*[!0-9]*|0)
+                echo "ERROR: distributed compiler local jobs must be a positive integer" >&2
+                exit 1
+                ;;
+        esac
+        case "\$compiler_remote_jobs_per_host" in
+            ''|*[!0-9]*|0)
+                echo "ERROR: distributed compiler remote jobs per host must be a positive integer" >&2
+                exit 1
+                ;;
+        esac
         compiler_slots="\$compiler_state.source-slots"
         compiler_successes="\$compiler_state.successes"
         if ! mkdir -p "\$compiler_slots" "\$compiler_successes"; then
@@ -189,7 +203,11 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
                     echo "ERROR: distributed compiler host slot directory could not be created" >&2
                     exit 1
                 fi
-                for ((compiler_slot_index = 0; compiler_slot_index < compiler_jobs_per_host; compiler_slot_index++)); do
+                compiler_candidate_jobs="\$compiler_remote_jobs_per_host"
+                if [ "\$compiler_candidate_index" -eq 0 ]; then
+                    compiler_candidate_jobs="\$compiler_local_jobs"
+                fi
+                for ((compiler_slot_index = 0; compiler_slot_index < compiler_candidate_jobs; compiler_slot_index++)); do
                     compiler_candidate_slot="\$compiler_host_slots/\$compiler_slot_index"
                     if mkdir "\$compiler_candidate_slot" 2>/dev/null; then
                         compiler_host="\${compiler_hosts[\$compiler_candidate_index]}"

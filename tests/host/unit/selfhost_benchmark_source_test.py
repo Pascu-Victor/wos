@@ -57,8 +57,14 @@ def test_selfhost_runner_covers_acceptance_flow() -> None:
             'WOS_DISTRIBUTED_COMPILER_STATE="$distributed_compiler_state"',
             "WOS_DISTRIBUTED_COMPILER_TRANSPORT=source",
             'WOS_DISTRIBUTED_COMPILER_JOBS_PER_HOST="$distributed_jobs_per_host"',
+            'WOS_DISTRIBUTED_COMPILER_LOCAL_JOBS="$distributed_local_jobs"',
+            'WOS_DISTRIBUTED_COMPILER_REMOTE_JOBS_PER_HOST="$distributed_remote_jobs_per_host"',
             'distributed_jobs_per_host="$(((jobs + ${#distributed_host_list[@]} - 1) / ${#distributed_host_list[@]}))"',
+            'distributed_local_jobs="$((distributed_jobs_per_host / 2))"',
+            'distributed_remote_jobs_per_host="$(((jobs - distributed_local_jobs + ${#distributed_host_list[@]} - 2) / (${#distributed_host_list[@]} - 1)))"',
             'WOS_SELFHOST_DISTRIBUTED_JOBS_PER_HOST=$(shell_quote "$distributed_jobs_per_host")',
+            'WOS_SELFHOST_DISTRIBUTED_LOCAL_JOBS=$(shell_quote "$distributed_local_jobs")',
+            'WOS_SELFHOST_DISTRIBUTED_REMOTE_JOBS_PER_HOST=$(shell_quote "$distributed_remote_jobs_per_host")',
             '--distributed-hosts',
             'for routed_path in /root /usr /bin /lib /lib64 /libexec /share /etc /proc /dev /run /tmp; do',
             "clone_cmd=(git clone)",
@@ -136,6 +142,8 @@ def test_wos_bootstrap_distributes_only_compiler_processes() -> None:
             r'compiler_start_index="\$((\$\$ % \${#compiler_hosts[@]}))"',
             r'on "\$compiler_host" "\${compiler[@]}" -fno-temp-file "@\$compiler_response"',
             r'compiler_jobs_per_host="\${WOS_DISTRIBUTED_COMPILER_JOBS_PER_HOST:-}"',
+            r'compiler_local_jobs="\${WOS_DISTRIBUTED_COMPILER_LOCAL_JOBS:-\$compiler_jobs_per_host}"',
+            r'compiler_remote_jobs_per_host="\${WOS_DISTRIBUTED_COMPILER_REMOTE_JOBS_PER_HOST:-\$compiler_jobs_per_host}"',
             r'compiler_total_jobs="\${WOS_NINJA_JOBS:-\${WOS_BUILD_JOBS:-}}"',
             r'compiler_local_jobs="\$compiler_total_jobs"',
             r'compiler_remote_jobs_per_host="\${WOS_DISTRIBUTED_COMPILER_REMOTE_JOBS_PER_HOST:-1}"',
@@ -279,13 +287,15 @@ for index in 0 1 2 3 4 5 6 7; do
         WOS_DISTRIBUTED_COMPILER_HOSTS=wos-0,wos-1 \
         WOS_DISTRIBUTED_COMPILER_STATE="$1/compiler-state" \
         WOS_DISTRIBUTED_COMPILER_JOBS_PER_HOST=1 \
+        WOS_DISTRIBUTED_COMPILER_LOCAL_JOBS=1 \
+        WOS_DISTRIBUTED_COMPILER_REMOTE_JOBS_PER_HOST=2 \
         WOS_DISTRIBUTED_COMPILER_MIN_PREPROCESSED_BYTES=0 \
         WOS_NINJA_JOBS=4 \
         "$1/clang" -c -o "$1/object-$index" "$1/input.c" &
 done
 wait
 test ! -e "$1/mock-on.max.wos-0"
-test "$(cat "$1/mock-on.max.wos-1")" -eq 1
+test "$(cat "$1/mock-on.max.wos-1")" -eq 2
 test "$(cat "$1/mock-on.count.wos-1")" -ge 1
 test "$(cat "$1/compiler-state.successes/0")" = wos-0
 test "$(cat "$1/compiler-state.successes/1")" = wos-1

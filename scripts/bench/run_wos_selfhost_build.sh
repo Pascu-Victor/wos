@@ -143,6 +143,8 @@ distdir="${WOS_SELFHOST_DISTDIR:-}"
 distributed="${WOS_SELFHOST_DISTRIBUTED:-0}"
 distributed_hosts="${WOS_SELFHOST_DISTRIBUTED_HOSTS:-}"
 distributed_jobs_per_host="${WOS_SELFHOST_DISTRIBUTED_JOBS_PER_HOST:-}"
+distributed_local_jobs="${WOS_SELFHOST_DISTRIBUTED_LOCAL_JOBS:-}"
+distributed_remote_jobs_per_host="${WOS_SELFHOST_DISTRIBUTED_REMOTE_JOBS_PER_HOST:-}"
 clean_path="${WOS_SELFHOST_CLEAN_PATH:-}"
 priority_reset="${WOS_SELFHOST_PRIORITY_RESET:-}"
 priority_nice_delta="${WOS_SELFHOST_PRIORITY_NICE_DELTA:-}"
@@ -833,6 +835,8 @@ run_with_jobs_env() {
             WOS_DISTRIBUTED_COMPILER_STATE="$distributed_compiler_state" \
             WOS_DISTRIBUTED_COMPILER_TRANSPORT=source \
             WOS_DISTRIBUTED_COMPILER_JOBS_PER_HOST="$distributed_jobs_per_host" \
+            WOS_DISTRIBUTED_COMPILER_LOCAL_JOBS="$distributed_local_jobs" \
+            WOS_DISTRIBUTED_COMPILER_REMOTE_JOBS_PER_HOST="$distributed_remote_jobs_per_host" \
             "$@"
     else
         WOS_BUILD_JOBS="$jobs" \
@@ -1489,6 +1493,8 @@ run_wos() {
     remote_env+=" WOS_SELFHOST_DISTRIBUTED=$(shell_quote "$distributed")"
     remote_env+=" WOS_SELFHOST_DISTRIBUTED_HOSTS=$(shell_quote "$distributed_hosts")"
     remote_env+=" WOS_SELFHOST_DISTRIBUTED_JOBS_PER_HOST=$(shell_quote "$distributed_jobs_per_host")"
+    remote_env+=" WOS_SELFHOST_DISTRIBUTED_LOCAL_JOBS=$(shell_quote "$distributed_local_jobs")"
+    remote_env+=" WOS_SELFHOST_DISTRIBUTED_REMOTE_JOBS_PER_HOST=$(shell_quote "$distributed_remote_jobs_per_host")"
     remote_env+=" WOS_SELFHOST_HEARTBEAT_INTERVAL=$(shell_quote "$heartbeat_interval")"
     remote_env+=" WOS_SELFHOST_HEARTBEAT_TAIL=$(shell_quote "$heartbeat_tail")"
     remote_env+=" WOS_SELFHOST_HEARTBEAT_STALL_SNAPSHOTS=$(shell_quote "$heartbeat_stall_snapshots")"
@@ -1558,6 +1564,8 @@ heartbeat_sync="0"
 distributed=0
 distributed_hosts=""
 distributed_jobs_per_host=""
+distributed_local_jobs=""
+distributed_remote_jobs_per_host=""
 
 while (($# > 0)); do
     case "$1" in
@@ -1724,6 +1732,14 @@ if [ "$distributed" -eq 1 ]; then
     done
     [ -n "${distributed_host_seen[$host]:-}" ] || die "distributed hosts must include the submitter: $host"
     distributed_jobs_per_host="$(((jobs + ${#distributed_host_list[@]} - 1) / ${#distributed_host_list[@]}))"
+    # Remote source compilers block on synchronous VFS reads. Keep half of the
+    # submitter's equal share local so it can serve those reads, and move the
+    # remaining slots to peers where modest oversubscription hides I/O latency.
+    distributed_local_jobs="$((distributed_jobs_per_host / 2))"
+    if [ "$distributed_local_jobs" -lt 1 ]; then
+        distributed_local_jobs=1
+    fi
+    distributed_remote_jobs_per_host="$(((jobs - distributed_local_jobs + ${#distributed_host_list[@]} - 2) / (${#distributed_host_list[@]} - 1)))"
 elif [ -n "$distributed_hosts" ]; then
     die "--distributed-hosts requires --distributed"
 fi
