@@ -453,7 +453,7 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
             # launcher installs the route policy after it is already running
             # on the peer, so recursive-build process context cannot inflate
             # TASK_SUBMIT beyond WKI's single-frame payload limit.
-            compiler_remote_command=(on "\$compiler_host" /usr/bin/bash "$distributed_staged_launcher" "\$compiler_route_response")
+            compiler_remote_command=(forward --clear -- on "\$compiler_host" /usr/bin/bash "$distributed_staged_launcher" "\$compiler_route_response")
         else
             compiler_remote_command=(on "\$compiler_host")
         fi
