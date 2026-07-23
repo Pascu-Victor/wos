@@ -251,9 +251,16 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
         esac
         compiler_local_jobs="\${WOS_DISTRIBUTED_COMPILER_LOCAL_JOBS:-\$compiler_jobs_per_host}"
         compiler_remote_jobs_per_host="\${WOS_DISTRIBUTED_COMPILER_REMOTE_JOBS_PER_HOST:-\$compiler_jobs_per_host}"
+        compiler_remote_timeout="\${WOS_DISTRIBUTED_COMPILER_REMOTE_TIMEOUT:-300}"
         case "\$compiler_local_jobs" in
             ''|*[!0-9]*|0)
                 echo "ERROR: distributed compiler local jobs must be a positive integer" >&2
+                exit 1
+                ;;
+        esac
+        case "\$compiler_remote_timeout" in
+            ''|*[!0-9]*|0)
+                echo "ERROR: distributed compiler remote timeout must be a positive integer" >&2
                 exit 1
                 ;;
         esac
@@ -438,11 +445,10 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
                 fi
                 compiler_route_args+=("+\$compiler_route")
             }
-            # Build systems create generated headers after their roots are
-            # snapshotted. Keep the immutable source/sysroot roots peer-local,
-            # but resolve the mutable build working tree on the submitter so a
-            # later Ninja/Make generator edge is immediately visible.
-            compiler_add_home_route "\$PWD" || exit 1
+            # Component build entrypoints finish their generated inputs before
+            # staging. Keep the working tree peer-local: routing the cwd home
+            # makes every compiler parse through remote VFS, saturating the
+            # submitter while peer CPUs wait on filesystem service.
             compiler_add_home_route "\$compiler_state" || exit 1
             compiler_add_home_route "\$compiler_responses" || exit 1
             compiler_add_home_route "\$output_file" || exit 1
@@ -542,23 +548,40 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
             # guaranteed root directory; the launcher installs the route
             # policy before entering the submitter's build directory.
             compiler_remote_command=(
-                forward --clear -- on "\$compiler_host" /usr/bin/bash "$distributed_staged_launcher"
+                forward --clear -- on "\$compiler_host" /usr/bin/timeout
+                -s TERM -k 5 "\$compiler_remote_timeout"
+                /usr/bin/bash "$distributed_staged_launcher"
                 "\$compiler_route_response" "\$PWD" "\$compiler_remote_output" "\$output_file"
             )
         else
-            compiler_remote_command=(on "\$compiler_host")
+            compiler_remote_command=(
+                on "\$compiler_host" /usr/bin/timeout
+                -s TERM -k 5 "\$compiler_remote_timeout"
+            )
         fi
-        if (
-            if [ "\$compiler_transport" = staged ]; then
-                cd / || exit 1
+        compiler_run_remote() {
+            (
+                if [ "\$compiler_transport" = staged ]; then
+                    cd / || exit 1
+                fi
+                env -i PATH="\$compiler_remote_path" HOME="\${HOME:-/root}" TMPDIR="\${TMPDIR:-/tmp}" TZ=UTC0 \
+                    "\${compiler_remote_command[@]}" "\${compiler[@]}" -fno-temp-file "@\$compiler_response"
+            )
+        }
+        compiler_remote_attempt=1
+        while true; do
+            if compiler_run_remote; then
+                compiler_status=0
+                break
             fi
-            env -i PATH="\$compiler_remote_path" HOME="\${HOME:-/root}" TMPDIR="\${TMPDIR:-/tmp}" TZ=UTC0 \
-                "\${compiler_remote_command[@]}" "\${compiler[@]}" -fno-temp-file "@\$compiler_response"
-        ); then
-            compiler_status=0
-        else
             compiler_status=\$?
-        fi
+            if [ "\$compiler_status" -ne 127 ] || [ "\$compiler_remote_attempt" -ge 2 ]; then
+                break
+            fi
+            echo "warning: distributed compiler launch on \$compiler_host failed with status 127; retrying once" >&2
+            sleep 1
+            compiler_remote_attempt="\$((compiler_remote_attempt + 1))"
+        done
         compiler_slot_release
         trap - EXIT HUP INT TERM
         if [ "\$compiler_status" -eq 0 ]; then

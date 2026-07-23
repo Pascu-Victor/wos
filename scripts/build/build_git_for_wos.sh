@@ -115,7 +115,8 @@ GIT_MAKE_FLAGS=(
     "WOS_SKIP_TEST_ARTIFACTS=YesPlease"
 )
 
-wos_make "$WOS_MAKE_JOBS" -C "$GIT_WORK" "${GIT_MAKE_FLAGS[@]}" generated-hdrs
+wos_make "$WOS_MAKE_JOBS" -C "$GIT_WORK" "${GIT_MAKE_FLAGS[@]}" \
+    generated-hdrs version-def.h
 wos_stage_distributed_build_roots \
     "$WORKSPACE_ROOT" "" \
     "$GIT_WORK" "$TARGET_SYSROOT/include"

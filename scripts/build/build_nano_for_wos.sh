@@ -350,6 +350,13 @@ wos_timed_step "configure" "nano" \
     --disable-mouse \
     --enable-utf8
 
+# Gnulib generates its replacement headers as BUILT_SOURCES immediately
+# before compiling libgnu. Make those dependencies explicit before staging so
+# remote compilers never observe the configure-time snapshot without them.
+wos_make "$WOS_MAKE_JOBS" -C "$NANO_WORK/lib" \
+    --eval='.PHONY: wos-generated-headers' \
+    --eval='wos-generated-headers: $(BUILT_SOURCES)' \
+    wos-generated-headers
 wos_make "$WOS_MAKE_JOBS" -C "$NANO_WORK/src" revision.h
 wos_stage_distributed_build_roots \
     "$WORKSPACE_ROOT" "" \

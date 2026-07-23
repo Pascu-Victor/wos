@@ -201,8 +201,28 @@ for tool in "${WOS_LLVM_REQUIRED_TOOLS[@]}"; do
     WOS_LLVM_BIN_OUTPUTS+=("bin/$tool")
 done
 
+# CMake's object-order targets contain the generated TableGen/VCS inputs for
+# each reachable library without compiling that library's objects. Complete
+# those edges before taking the peer snapshot; the broad llvm-headers and
+# clang-tablegen-targets umbrellas do not cover library-private files such as
+# GenVT.inc, TargetLibraryInfo.inc, AttrDocTable.inc, or VCSVersion.inc.
+WOS_LLVM_GENERATOR_TARGETS=()
+while IFS= read -r generator_target; do
+    [ -n "$generator_target" ] || continue
+    WOS_LLVM_GENERATOR_TARGETS+=("$generator_target")
+done < <(
+    ninja -C "$CLANG_BUILD" -t graph "${WOS_LLVM_BIN_OUTPUTS[@]}" |
+        sed -n 's/^"[^"]*" \[label="\(cmake_object_order_depends_target_[^"]*\)"\]$/\1/p' |
+        sort -u
+)
+if [ "${#WOS_LLVM_GENERATOR_TARGETS[@]}" -eq 0 ]; then
+    echo "ERROR: native Clang graph exposed no generator-order targets" >&2
+    exit 1
+fi
+
 ninja -C "$CLANG_BUILD" -j"$WOS_LLVM_NINJA_JOBS" \
-    llvm-headers clang-tablegen-targets ELFOptionsTableGen
+    llvm-headers clang-tablegen-targets ELFOptionsTableGen \
+    "${WOS_LLVM_GENERATOR_TARGETS[@]}"
 wos_stage_distributed_build_roots \
     "$WORKSPACE_ROOT" "$LLVM_SRC" \
     "$CLANG_BUILD" "$TARGET_SYSROOT/include"

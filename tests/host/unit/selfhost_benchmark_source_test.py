@@ -177,7 +177,8 @@ def test_wos_bootstrap_distributes_only_compiler_processes() -> None:
             r'compiler_start_index="\$((1 + compiler_start_index % compiler_remote_host_count))"',
             r'compiler_route_response="\$(mktemp "\$compiler_responses/routes.XXXXXX")"',
             r'''printf '%s\n' "\${compiler_route_args[@]}" > "\$compiler_route_response"''',
-            r'forward --clear -- on "\$compiler_host" /usr/bin/bash',
+            r'forward --clear -- on "\$compiler_host" /usr/bin/timeout',
+            r'-s TERM -k 5 "\$compiler_remote_timeout"',
             r'compiler_remote_output="/tmp/wos-distributed-staged.\$compiler_candidate_index.\$\$.output"',
             r'"\$compiler_route_response" "\$PWD" "\$compiler_remote_output" "\$output_file"',
             '''"$@" -o "$local_output"''',
@@ -186,9 +187,8 @@ def test_wos_bootstrap_distributes_only_compiler_processes() -> None:
             "distributed staged compiler output copy failed after",
             r'if [ "\$compiler_transport" = staged ]; then',
             r'cd / || exit 1',
-            r'compiler_remote_command=(on "\$compiler_host")',
+            r'on "\$compiler_host" /usr/bin/timeout',
             r'for compiler_local_system_root in /usr /bin /lib /lib64 /libexec /share /etc /proc /dev /run /tmp; do',
-            r'compiler_add_home_route "\$PWD"',
             r'compiler_add_home_route "\$compiler_state"',
             r'compiler_add_home_route "\$output_file"',
             r'compiler_skip_output_arg=0',
@@ -201,6 +201,10 @@ def test_wos_bootstrap_distributes_only_compiler_processes() -> None:
             r'compiler_jobs_per_host="\${WOS_DISTRIBUTED_COMPILER_JOBS_PER_HOST:-}"',
             r'compiler_local_jobs="\${WOS_DISTRIBUTED_COMPILER_LOCAL_JOBS:-\$compiler_jobs_per_host}"',
             r'compiler_remote_jobs_per_host="\${WOS_DISTRIBUTED_COMPILER_REMOTE_JOBS_PER_HOST:-\$compiler_jobs_per_host}"',
+            r'compiler_remote_timeout="\${WOS_DISTRIBUTED_COMPILER_REMOTE_TIMEOUT:-300}"',
+            r'compiler_run_remote() {',
+            r'if [ "\$compiler_status" -ne 127 ] || [ "\$compiler_remote_attempt" -ge 2 ]; then',
+            r"distributed compiler launch on \$compiler_host failed with status 127; retrying once",
             r'compiler_total_jobs="\${WOS_NINJA_JOBS:-\${WOS_BUILD_JOBS:-}}"',
             r'compiler_local_jobs="\$compiler_total_jobs"',
             r'compiler_remote_jobs_per_host="\${WOS_DISTRIBUTED_COMPILER_REMOTE_JOBS_PER_HOST:-1}"',
@@ -257,6 +261,8 @@ def test_wos_bootstrap_distributes_only_compiler_processes() -> None:
         ],
         "WOS native compiler-only distribution",
     )
+    if r'compiler_add_home_route "\$PWD"' in source:
+        fail("staged compiler must not route its working tree through the submitter")
     if r'compiler_start_index="\$((\$\$ % \${#compiler_hosts[@]}))"' in source:
         fail("source-mode distributed compiler selection must not alias host choice to process-ID stride")
     if "source-lock" in source or "source-next" in source:
@@ -436,13 +442,22 @@ def test_wos_toolchain_stages_configured_build_roots() -> None:
             'wos_make "$WOS_MAKE_JOBS" -C "$NCURSES_WORK" sources'
         ],
         "build_nano_for_wos.sh": [
+            "--eval='.PHONY: wos-generated-headers'",
+            "--eval='wos-generated-headers: $(BUILT_SOURCES)'",
             'wos_make "$WOS_MAKE_JOBS" -C "$NANO_WORK/src" revision.h'
         ],
+        "build_python_for_wos.sh": [
+            "--eval='.PHONY: wos-frozen-module-headers'",
+            "--eval='wos-frozen-module-headers: $(FROZEN_FILES_OUT)'",
+        ],
         "build_git_for_wos.sh": [
-            'wos_make "$WOS_MAKE_JOBS" -C "$GIT_WORK" "${GIT_MAKE_FLAGS[@]}" generated-hdrs'
+            'wos_make "$WOS_MAKE_JOBS" -C "$GIT_WORK" "${GIT_MAKE_FLAGS[@]}"',
+            "generated-hdrs version-def.h",
         ],
         "build_clang_for_wos.sh": [
-            "llvm-headers clang-tablegen-targets ELFOptionsTableGen"
+            'ninja -C "$CLANG_BUILD" -t graph "${WOS_LLVM_BIN_OUTPUTS[@]}"',
+            "cmake_object_order_depends_target_",
+            '"${WOS_LLVM_GENERATOR_TARGETS[@]}"',
         ],
     }
     for name, tokens in generator_tokens.items():
@@ -966,7 +981,7 @@ test -s "$1/explicit.d"
 test -s "$1/compile.json"
 test -s "$1/diagnostics.dia"
 grep -Fx -- "-$1/source-root" "$1/on.args"
-grep -Fx -- "+$1/source-root" "$1/on.args"
+! grep -Fx -- "+$1/source-root" "$1/on.args"
 grep -Fx -- -/usr "$1/on.args"
 grep -Fx -- -/lib "$1/on.args"
 grep -Fx -- -/tmp "$1/on.args"

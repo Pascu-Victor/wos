@@ -946,6 +946,13 @@ if [ -f "$PYTHON_TARGET_BUILD/python" ]; then
 fi
 
 echo "Building target CPython with WOS_MAKE_JOBS=$WOS_MAKE_JOBS..."
+# Frozen-module headers are Makefile-generated inputs consumed by many target
+# objects. Generate them with the configured build Python before snapshotting
+# the target tree; this target does not compile target-WOS objects.
+wos_make "$WOS_MAKE_JOBS" -C "$PYTHON_TARGET_BUILD" \
+    --eval='.PHONY: wos-frozen-module-headers' \
+    --eval='wos-frozen-module-headers: $(FROZEN_FILES_OUT)' \
+    wos-frozen-module-headers
 wos_stage_distributed_build_roots \
 	"$WORKSPACE_ROOT" "$PYTHON_SRC" \
 	"$PYTHON_TARGET_BUILD" "$TARGET_SYSROOT/include"
