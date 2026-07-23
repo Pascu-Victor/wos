@@ -36,38 +36,68 @@ if [ "${#stage_base}" -ge 256 ]; then
 fi
 
 roots=()
+active_roots=()
 archive_entries=()
 declare -A root_seen=()
-for requested_root in "$@"; do
+declare -A active_root_seen=()
+canonical_root=""
+validate_root() {
+    local requested_root="$1"
     case "$requested_root" in
         *$'\n'*|*$'\r'*|*[\*\?\[]*)
             echo "ERROR: distributed compiler root contains unsafe characters: $requested_root" >&2
             exit 1
             ;;
     esac
-    root="$(realpath "$requested_root")"
-    case "$root" in
+    if ! canonical_root="$(realpath "$requested_root")"; then
+        echo "ERROR: distributed compiler root could not be resolved: $requested_root" >&2
+        exit 1
+    fi
+    case "$canonical_root" in
         "$stage_base"/*) ;;
         *)
-            echo "ERROR: distributed compiler root escapes stage base: $root" >&2
+            echo "ERROR: distributed compiler root escapes stage base: $canonical_root" >&2
             exit 1
             ;;
     esac
-    if [ ! -d "$root" ]; then
-        echo "ERROR: distributed compiler root is not a directory: $root" >&2
+    if [ ! -d "$canonical_root" ]; then
+        echo "ERROR: distributed compiler root is not a directory: $canonical_root" >&2
         exit 1
     fi
-    if [ "${#root}" -ge 256 ]; then
-        echo "ERROR: distributed compiler root is too long for a WKI VFS rule: $root" >&2
+    if [ "${#canonical_root}" -ge 256 ]; then
+        echo "ERROR: distributed compiler root is too long for a WKI VFS rule: $canonical_root" >&2
         exit 1
     fi
+}
+
+add_active_root() {
+    local root="$1"
+    if [ -n "${active_root_seen[$root]:-}" ]; then
+        return 0
+    fi
+    active_root_seen[$root]=1
+    active_roots+=("$root")
+}
+
+for requested_root in "$@"; do
+    validate_root "$requested_root"
+    root="$canonical_root"
     if [ -n "${root_seen[$root]:-}" ]; then
         continue
     fi
     root_seen[$root]=1
     roots+=("$root")
     archive_entries+=("${root#/}")
+    add_active_root "$root"
 done
+
+# Retained roots were staged by an earlier call and remain unchanged on every
+# peer. Keep them active without re-copying them on every toolchain phase.
+while IFS= read -r retained_root; do
+    [ -n "$retained_root" ] || continue
+    validate_root "$retained_root"
+    add_active_root "$canonical_root"
+done <<< "${WOS_DISTRIBUTED_COMPILER_RETAINED_ROOTS:-}"
 
 # WOS BusyBox tar currently drops leading ../ components from relative symlink
 # targets while extracting. Dereference trusted in-tree links when creating the
@@ -127,18 +157,23 @@ for ((host_index = 1; host_index < ${#hosts[@]}; host_index++)); do
         sh -eu -c '
             archive=$1
             base=$2
-            shift 2
-            for root do
+            requested_count=$3
+            shift 3
+            requested_index=0
+            while [ "$requested_index" -lt "$requested_count" ]; do
+                root=$1
+                shift
                 case "$root" in
                     "$base"/*) rm -rf -- "$root" ;;
                     *) exit 64 ;;
                 esac
+                requested_index=$((requested_index + 1))
             done
             tar -C / -xf "$archive"
             for root do
                 [ -d "$root" ]
             done
-        ' sh "$archive" "$stage_base" "${roots[@]}"
+        ' sh "$archive" "$stage_base" "${#roots[@]}" "${roots[@]}" "${active_roots[@]}"
     )
     "${command[@]}" &
     stage_pids+=("$!")
@@ -157,10 +192,7 @@ if [ "$stage_status" -ne 0 ]; then
 fi
 
 manifest_tmp="$(mktemp "$stage_dir/local-roots.XXXXXX")"
-if [ -s "$manifest" ]; then
-    cat "$manifest" > "$manifest_tmp"
-fi
-printf '%s\n' "${roots[@]}" >> "$manifest_tmp"
+printf '%s\n' "${active_roots[@]}" > "$manifest_tmp"
 manifest_sorted="$manifest_tmp.sorted"
 sort -u "$manifest_tmp" > "$manifest_sorted"
 mv -f -- "$manifest_sorted" "$manifest"

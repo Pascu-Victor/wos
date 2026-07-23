@@ -80,6 +80,7 @@ def test_selfhost_runner_covers_acceptance_flow() -> None:
             'WOS_SELFHOST_DISTRIBUTED_REMOTE_JOBS_PER_HOST=$(shell_quote "$distributed_remote_jobs_per_host")',
             'time_step stage_wos_sources stage_wos_sources',
             '"$checkout/tools/stage-distributed-compiler-roots.sh"',
+            'WOS_DISTRIBUTED_COMPILER_RETAINED_ROOTS="$checkout/toolchain/wos-host-shim/lib"',
             '--distributed-hosts',
             'for routed_path in /root /usr /bin /lib /lib64 /libexec /share /etc /proc /dev /run /tmp; do',
             "clone_cmd=(git clone)",
@@ -242,6 +243,7 @@ def test_wos_toolchain_stages_sources_before_distributed_compiles() -> None:
         [
             "stage_distributed_compiler_roots()",
             'WOS_DISTRIBUTED_COMPILER_STAGE_BASE="$(dirname "$WORKSPACE_ROOT")"',
+            'WOS_DISTRIBUTED_COMPILER_RETAINED_ROOTS="$HOST/lib"',
             'stage_distributed_compiler_roots "$B/src/mlibc" "$HOST/lib" "$SYSROOT/include"',
             'stage_distributed_compiler_roots "$SYSROOT/include"',
             'stage_distributed_compiler_roots "$B/src/llvm-project/compiler-rt"',
@@ -807,6 +809,9 @@ def test_distributed_compiler_root_staging_is_guarded_and_atomic() -> None:
         root = stage_base / "checkout" / "modules"
         root.mkdir(parents=True)
         (root / "sentinel").write_text("staged\n", encoding="ascii")
+        retained = stage_base / "checkout" / "toolchain" / "persistent"
+        retained.mkdir(parents=True)
+        (retained / "sentinel").write_text("retained\n", encoding="ascii")
         linked_target = stage_base / "linked-target"
         linked_target.mkdir()
         (linked_target / "header.h").write_text("linked\n", encoding="ascii")
@@ -841,10 +846,11 @@ exec "$@"
                 "WOS_DISTRIBUTED_COMPILER_HOSTS": "wos-0,wos-1",
                 "WOS_DISTRIBUTED_COMPILER_STATE": str(state),
                 "WOS_DISTRIBUTED_COMPILER_STAGE_BASE": str(stage_base),
+                "WOS_DISTRIBUTED_COMPILER_RETAINED_ROOTS": str(retained),
             }
         )
         result = subprocess.run(
-            [str(STAGE_DISTRIBUTED_ROOTS), str(root), str(root)],
+            [str(STAGE_DISTRIBUTED_ROOTS), str(root), str(root), str(retained)],
             cwd=ROOT,
             check=False,
             text=True,
@@ -854,13 +860,33 @@ exec "$@"
         if result.returncode != 0:
             fail(f"distributed root staging failed: {result.stderr}")
         manifest = Path(f"{state}.local-roots")
-        if manifest.read_text(encoding="ascii") != f"{root}\n":
+        expected_manifest = "".join(f"{path}\n" for path in sorted((retained, root)))
+        if manifest.read_text(encoding="ascii") != expected_manifest:
             fail("distributed root staging did not atomically publish a deduplicated manifest")
         if (root / "sentinel").read_text(encoding="ascii") != "staged\n":
             fail("distributed root staging did not restore the exact staged root")
         staged_link = linked_dir / "abi-bits"
         if staged_link.is_symlink() or (staged_link / "header.h").read_text(encoding="ascii") != "linked\n":
             fail("distributed root staging did not safely dereference an in-tree relative symlink")
+
+        next_root = stage_base / "checkout" / "next-phase"
+        next_root.mkdir()
+        (next_root / "sentinel").write_text("next\n", encoding="ascii")
+        result = subprocess.run(
+            [str(STAGE_DISTRIBUTED_ROOTS), str(next_root)],
+            cwd=ROOT,
+            check=False,
+            text=True,
+            capture_output=True,
+            env=environment,
+        )
+        if result.returncode != 0:
+            fail(f"distributed next-phase root staging failed: {result.stderr}")
+        expected_manifest = "".join(f"{path}\n" for path in sorted((next_root, retained)))
+        if manifest.read_text(encoding="ascii") != expected_manifest:
+            fail("distributed root staging retained stale roots from a prior phase")
+        if (retained / "sentinel").read_text(encoding="ascii") != "retained\n":
+            fail("distributed root staging recopied or damaged a retained root")
 
         internal_escape = root / "escaping-link"
         internal_escape.symlink_to(temp / "outside-internal", target_is_directory=True)

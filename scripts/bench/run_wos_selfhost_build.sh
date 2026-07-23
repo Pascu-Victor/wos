@@ -1304,6 +1304,7 @@ stage_wos_sources() {
     fi
     run_with_jobs_env env \
         WOS_DISTRIBUTED_COMPILER_STAGE_BASE="$workdir" \
+        WOS_DISTRIBUTED_COMPILER_RETAINED_ROOTS="$checkout/toolchain/wos-host-shim/lib"$'\n'"$checkout/toolchain/sysroot/include" \
         "$checkout/tools/stage-distributed-compiler-roots.sh" \
         "$checkout/modules"
 }

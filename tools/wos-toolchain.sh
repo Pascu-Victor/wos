@@ -199,6 +199,7 @@ stage_distributed_compiler_roots() {
         return 0
     fi
     WOS_DISTRIBUTED_COMPILER_STAGE_BASE="$(dirname "$WORKSPACE_ROOT")" \
+        WOS_DISTRIBUTED_COMPILER_RETAINED_ROOTS="$HOST/lib"$'\n'"$SYSROOT/include" \
         "$WORKSPACE_ROOT/tools/stage-distributed-compiler-roots.sh" "$@"
 }
 
