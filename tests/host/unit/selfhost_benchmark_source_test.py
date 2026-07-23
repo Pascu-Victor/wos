@@ -260,7 +260,8 @@ def test_wos_toolchain_stages_sources_before_distributed_compiles() -> None:
         [
             "stage_distributed_compiler_roots()",
             'export WOS_DISTRIBUTED_COMPILER_STAGE_BASE="${WOS_DISTRIBUTED_COMPILER_STAGE_BASE:-$(dirname "$WORKSPACE_ROOT")}"',
-            'export WOS_DISTRIBUTED_COMPILER_RETAINED_ROOTS="${WOS_DISTRIBUTED_COMPILER_RETAINED_ROOTS:-$HOST/lib"',
+            'if [ -z "${WOS_DISTRIBUTED_COMPILER_RETAINED_ROOTS:-}" ]; then',
+            'export WOS_DISTRIBUTED_COMPILER_RETAINED_ROOTS="$HOST/lib"$\'\\n\'"$SYSROOT/include"',
             'stage_distributed_compiler_roots "$B/src/mlibc" "$HOST/lib" "$SYSROOT/include"',
             'stage_distributed_compiler_roots "$SYSROOT/include"',
             'stage_distributed_compiler_roots "$B/src/llvm-project/compiler-rt"',
