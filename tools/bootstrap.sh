@@ -350,8 +350,15 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
             echo "ERROR: distributed compiler response directory could not be created" >&2
             exit 1
         fi
-        compiler_response="\$(mktemp "\$compiler_responses/clang.XXXXXX")"
-        if [ -z "\$compiler_response" ]; then
+        # Response files remain until the build scratch tree is removed because
+        # peers can retain stale negative VFS lookups after an unlink. Avoid
+        # mkstemp here: mlibc currently scans candidates from .000000 in every
+        # process, so the retained set makes sustained parallel builds perform
+        # an ever-growing number of exclusive creates. Wrapper PIDs are unique
+        # for concurrently active compiler processes, just like the job
+        # directories in the preprocessed transport below.
+        compiler_response="\$compiler_responses/clang.\$\$"
+        if ! : > "\$compiler_response"; then
             echo "ERROR: distributed compiler response file could not be created" >&2
             exit 1
         fi
@@ -524,8 +531,8 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
                 fi
                 exit "\$compiler_status"
             fi
-            compiler_route_response="\$(mktemp "\$compiler_responses/routes.XXXXXX")"
-            if [ -z "\$compiler_route_response" ]; then
+            compiler_route_response="\$compiler_responses/routes.\$\$"
+            if ! : > "\$compiler_route_response"; then
                 compiler_slot_release
                 trap - EXIT HUP INT TERM
                 echo "ERROR: staged distributed compiler route file could not be created" >&2
