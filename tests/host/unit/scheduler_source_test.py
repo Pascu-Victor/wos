@@ -1707,6 +1707,8 @@ def test_timer_waitpid_repair_rechecks_stranded_waiters_without_sigchld() -> Non
     repair_due_body = function_body(source, "waitpid_repair_due")
     wait_deadline_body = function_body(source, "task_wait_deadline_us")
     wait_list_push_body = function_body(source, "wait_list_push_locked")
+    orphan_predicate_body = function_body(source, "orphaned_waitpid_candidate_locked")
+    orphan_repair_body = function_body(source, "repair_one_orphaned_waitpid_from_registry")
     timer_body = function_body(source, "process_tasks")
     reschedule_body = function_body(source, "reschedule_task_for_cpu_once")
 
@@ -1763,6 +1765,38 @@ def test_timer_waitpid_repair_rechecks_stranded_waiters_without_sigchld() -> Non
             "note_wait_deadline_locked(rq, t);",
         ],
         "every waitpid wait-list publication must carry a fallback repair deadline",
+    )
+    require_tokens(
+        orphan_predicate_body,
+        [
+            "candidate->scheduler_published.load(std::memory_order_acquire)",
+            "candidate->sched_queue == task::Task::sched_queue::WAITING",
+            "candidate->wait_channel_is(task::WaitChannelKind::WAITPID)",
+            "candidate->waiting_for_pid != 0",
+            "!candidate->deferred_task_switch",
+            "candidate->last_sleep_start_us == 0",
+            "!runqueue_task_is_reserved_locked(rq, candidate)",
+            "!rq->runnable_heap.contains(candidate)",
+            "!wait_list_contains_locked(rq, candidate)",
+        ],
+        "orphaned waitpid repair signature",
+    )
+    require_tokens(
+        orphan_repair_body,
+        [
+            "cpu::current_cpu() != 0",
+            "ORPHANED_WAITPID_SCAN_BATCH",
+            "get_active_task_at_safe(INDEX)",
+            "orphaned_waitpid_candidate_locked(rq, candidate)",
+            "reschedule_task_for_cpu(OWNER_CPU, candidate)",
+            "candidate->release()",
+        ],
+        "bounded active-registry audit for ownerless waitpid tasks",
+    )
+    require_tokens(
+        timer_body,
+        ["repair_one_orphaned_waitpid_from_registry();"],
+        "timer must audit the impossible unlinked waitpid signature",
     )
     require_tokens(
         timer_body,

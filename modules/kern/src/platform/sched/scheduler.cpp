@@ -90,6 +90,8 @@ struct PidHashEntry {
 std::atomic<uint64_t> g_preempt_block_warnings{0};
 sys::Spinlock g_placement_lock;
 constexpr size_t PENDING_WAKE_LIMIT = 16;
+constexpr uint32_t ORPHANED_WAITPID_SCAN_BATCH = 32;
+std::atomic<uint32_t> orphaned_waitpid_scan_cursor{0};
 using PendingWakeList = std::array<task::Task*, PENDING_WAKE_LIMIT>;
 
 inline auto pending_wake_slot(PendingWakeList& tasks, uint32_t index) -> task::Task*& {
@@ -2272,6 +2274,50 @@ inline void repair_stale_wait_membership_locked(RunQueue* rq, task::Task* t) {
 
 inline auto runqueue_task_is_reserved_locked(RunQueue* rq, task::Task const* task) -> bool {
     return rq != nullptr && task != nullptr && (rq->current_task == task || rq->handoff_task == task);
+}
+
+inline auto orphaned_waitpid_candidate_locked(RunQueue* rq, task::Task* candidate) -> bool {
+    return rq != nullptr && candidate != nullptr && candidate->state.load(std::memory_order_acquire) == task::TaskState::ACTIVE &&
+           candidate->scheduler_published.load(std::memory_order_acquire) && !candidate->gc_queued.load(std::memory_order_acquire) &&
+           candidate->wki_proxy_task_id == 0 && candidate->sched_queue == task::Task::sched_queue::WAITING &&
+           candidate->wait_channel_is(task::WaitChannelKind::WAITPID) && candidate->waiting_for_pid != 0 &&
+           !candidate->deferred_task_switch && candidate->last_sleep_start_us == 0 && candidate->heap_index < 0 &&
+           candidate->sched_next == nullptr && !runqueue_task_is_reserved_locked(rq, candidate) && !rq->runnable_heap.contains(candidate) &&
+           !wait_list_contains_locked(rq, candidate);
+}
+
+void repair_one_orphaned_waitpid_from_registry() {
+    if (run_queues == nullptr || cpu::current_cpu() != 0) {
+        return;
+    }
+
+    uint32_t const ACTIVE_COUNT = get_active_task_count();
+    if (ACTIVE_COUNT == 0) {
+        return;
+    }
+
+    uint32_t const START = orphaned_waitpid_scan_cursor.fetch_add(ORPHANED_WAITPID_SCAN_BATCH, std::memory_order_relaxed);
+    uint32_t const SCAN_COUNT = std::min(ACTIVE_COUNT, ORPHANED_WAITPID_SCAN_BATCH);
+    for (uint32_t offset = 0; offset < SCAN_COUNT; ++offset) {
+        uint32_t const INDEX = (START + offset) % ACTIVE_COUNT;
+        task::Task* candidate = get_active_task_at_safe(INDEX);
+        if (candidate == nullptr) {
+            continue;
+        }
+
+        uint64_t const OWNER_CPU = candidate->cpu;
+        bool orphaned = false;
+        if (OWNER_CPU < smt::get_core_count()) {
+            run_queues->with_lock_void(
+                OWNER_CPU, [candidate, &orphaned](RunQueue* rq) { orphaned = orphaned_waitpid_candidate_locked(rq, candidate); });
+        }
+        if (orphaned) {
+            reschedule_task_for_cpu(OWNER_CPU, candidate);
+            candidate->release();
+            return;
+        }
+        candidate->release();
+    }
 }
 
 struct ReservedTaskWake {
@@ -4573,6 +4619,7 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
         }
         waiter->release();
     }
+    repair_one_orphaned_waitpid_from_registry();
     for (uint32_t i = 0; i < signal_wake_count; ++i) {
         wake_task_for_signal(pending_wake_slot(signal_wake, i));
     }
@@ -8326,12 +8373,16 @@ auto scheduler_selftest_waitpid_wait_publication_arms_repair() -> bool {
     waiter.sched_queue = task::Task::sched_queue::WAITING;
     waiter.sched_next = nullptr;
     waiter.heap_index = -1;
+    waiter.cpu = 0;
+    waiter.scheduler_published.store(true, std::memory_order_relaxed);
     waiter.set_wait_channel("waitpid", task::WaitChannelKind::WAITPID);
 
+    bool const ORPHAN_RECOGNIZED = orphaned_waitpid_candidate_locked(rq, &waiter);
     wait_list_push_locked(rq, &waiter);
     uint64_t const FIRST_SLEEP_START_US = waiter.last_sleep_start_us;
     uint64_t const FIRST_DEADLINE_US = rq->next_wait_deadline_us;
     bool const ARMED = FIRST_SLEEP_START_US != 0 && FIRST_DEADLINE_US > FIRST_SLEEP_START_US && wait_list_contains_locked(rq, &waiter);
+    bool const LINKED_WAITER_NOT_ORPHANED = !orphaned_waitpid_candidate_locked(rq, &waiter);
 
     wait_list_remove_all_locked(rq, &waiter);
     waiter.last_sleep_start_us = 123;
@@ -8340,7 +8391,7 @@ auto scheduler_selftest_waitpid_wait_publication_arms_repair() -> bool {
 
     wait_list_remove_all_locked(rq, &waiter);
     task::task_clear_waitpid_block_state(waiter);
-    return ARMED && PRESERVED && rq->next_wait_deadline_us == 0;
+    return ORPHAN_RECOGNIZED && ARMED && LINKED_WAITER_NOT_ORPHANED && PRESERVED && rq->next_wait_deadline_us == 0;
 }
 
 auto scheduler_selftest_reserved_wake_precedes_handoff_commit() -> bool {
