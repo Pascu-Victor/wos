@@ -64,6 +64,7 @@ def test_selfhost_runner_covers_acceptance_flow() -> None:
             'WOS_DISTRIBUTED_COMPILER_REMOTE_JOBS_PER_HOST="$distributed_remote_jobs_per_host"',
             'distributed_jobs_per_host="$(((jobs + ${#distributed_host_list[@]} - 1) / ${#distributed_host_list[@]}))"',
             'if [ -z "$distributed_local_jobs" ]; then',
+            'if [ -e /proc/wki/peers ]; then',
             'distributed_local_jobs="$((submitter_cpus / 3))"',
             'if [ -z "$distributed_preprocess_jobs" ]; then',
             'distributed_preprocess_jobs="$((submitter_cpus - distributed_local_jobs))"',

@@ -740,7 +740,10 @@ validate_runtime_settings() {
         local submitter_cpus=""
         local smallest_peer_cpus=""
         local peer_hostname peer_node peer_connected peer_cpus peer_load peer_update peer_local
-        if [ -r /proc/wki/peers ]; then
+        # WOS procfs files are readable, but access(R_OK) currently reports
+        # false for them, so use existence here and let the read diagnose an
+        # actual failure.
+        if [ -e /proc/wki/peers ]; then
             while read -r peer_hostname peer_node peer_connected peer_cpus peer_load peer_update peer_local; do
                 if [ "$peer_local" = "1" ]; then
                     submitter_cpus="$peer_cpus"
