@@ -84,17 +84,15 @@ write_clang_wrapper() {
 #!/bin/bash
 set -u
 
-host_input="$1"
-host_response="$2"
-local_input="$3"
-local_response="$4"
-local_output="$5"
-host_output="$6"
-shift 6
+host_response="$1"
+local_input="$2"
+local_response="$3"
+local_output="$4"
+shift 4
 
 trap 'rm -f -- "$local_input" "$local_response" "$local_output" 2>/dev/null || true' EXIT HUP INT TERM
 
-if ! cp -- "$host_input" "$local_input" || ! cp -- "$host_response" "$local_response"; then
+if ! cat > "$local_input" || ! cp -- "$host_response" "$local_response"; then
     exit 1
 fi
 compiler_status=0
@@ -102,7 +100,7 @@ compiler_status=0
 if [ "$compiler_status" -ne 0 ]; then
     exit "$compiler_status"
 fi
-if ! cp -- "$local_output" "$host_output"; then
+if ! cat -- "$local_output"; then
     exit 1
 fi
 EOF
@@ -575,7 +573,7 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
             fi
         }
         compiler_input_cleanup() {
-            rm -f -- "\$compiler_input" "\$compiler_stage" 2>/dev/null || true
+            rm -f -- "\$compiler_input" "\$compiler_stage" "\${compiler_result:-}" 2>/dev/null || true
             rmdir "\$compiler_job_dir" 2>/dev/null || true
         }
         compiler_input_and_slot_cleanup() {
@@ -687,6 +685,7 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
             exit "\$compiler_status"
         fi
         compiler_response="\$compiler_job_dir.response"
+        compiler_result="\$compiler_job_dir/output"
         if ! : > "\$compiler_response"; then
             compiler_input_cleanup
             compiler_slot_release
@@ -708,14 +707,24 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
             fi
         done
         compiler_remote_path="\${PATH:-/usr/bin:/bin}"
-        if env -i PATH="\$compiler_remote_path" HOME="\${HOME:-/root}" TMPDIR="\${TMPDIR:-/tmp}" TZ=UTC0 \
-            on "\$compiler_host" forward "+\$compiler_responses" -- \
-            locally bash "\$compiler_stage" "\$compiler_input" "\$compiler_response" \
-            "\$compiler_remote_input" "\$compiler_remote_response" "\$compiler_remote_output" \
-            "\$compiler_output_dest" "\${compiler[@]}" -fno-temp-file; then
-            compiler_status=0
+        cat -- "\$compiler_input" | \
+            env -i PATH="\$compiler_remote_path" HOME="\${HOME:-/root}" TMPDIR="\${TMPDIR:-/tmp}" TZ=UTC0 \
+                on "\$compiler_host" forward "+\$compiler_responses" -- \
+                locally bash "\$compiler_stage" "\$compiler_response" \
+                "\$compiler_remote_input" "\$compiler_remote_response" "\$compiler_remote_output" \
+                "\${compiler[@]}" -fno-temp-file > "\$compiler_result"
+        compiler_pipeline_status=("\${PIPESTATUS[@]}")
+        if [ "\${compiler_pipeline_status[0]}" -eq 0 ] && [ "\${compiler_pipeline_status[1]}" -eq 0 ]; then
+            if cp -- "\$compiler_result" "\$compiler_output_dest"; then
+                compiler_status=0
+            else
+                compiler_status=1
+            fi
         else
-            compiler_status=\$?
+            compiler_status="\${compiler_pipeline_status[1]}"
+            if [ "\$compiler_status" -eq 0 ]; then
+                compiler_status="\${compiler_pipeline_status[0]}"
+            fi
         fi
         compiler_input_cleanup
         if [ "\$compiler_status" -eq 0 ]; then

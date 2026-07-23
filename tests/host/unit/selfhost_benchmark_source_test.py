@@ -201,7 +201,8 @@ def test_wos_bootstrap_distributes_only_compiler_processes() -> None:
             r'for arg in "\${compiler_forward_args[@]}"; do',
             r'env -i PATH="\$compiler_remote_path" HOME="\${HOME:-/root}" TMPDIR="\${TMPDIR:-/tmp}" TZ=UTC0',
             r'on "\$compiler_host" forward "+\$compiler_responses" --',
-            r'locally bash "\$compiler_stage" "\$compiler_input" "\$compiler_response"',
+            r'cat -- "\$compiler_input" |',
+            r'locally bash "\$compiler_stage" "\$compiler_response"',
             r'"\${compiler[@]}" -fno-temp-file',
             r'rm -f -- "\$compiler_input"',
             r'compiler_slot_cleanup',
@@ -353,11 +354,11 @@ set -u
 [ "${TZ:-}" = UTC0 ]
 shift
 [ "$1" = forward ]
-[ "$2" = "+$(dirname "$8")" ]
+[ "$2" = "+$(dirname "$7")" ]
 [ "$3" = -- ]
 [ "$4" = locally ]
 [ "$5" = bash ]
-response="$8"
+response="$7"
 if grep -F -- CPP_SOURCE_PATH "$response" >/dev/null || \
         grep -F -- C_SOURCE_PATH "$response" >/dev/null; then
     echo "remote compiler response still names the original source" >&2
