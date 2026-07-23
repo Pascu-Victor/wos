@@ -1083,10 +1083,26 @@ def test_gnu_make_script_handles_native_wos_autoconf_probes() -> None:
             '"${GNU_MAKE_CONFIGURE_CACHE_ARGS[@]}"',
             "GNU_MAKE_BUILD_ARGS=()",
             "GNU_MAKE_BUILD_ARGS=(MAKEINFO=true)",
-            'WOS_GNU_MAKE_BUILD_JOBS="${WOS_GNU_MAKE_BUILD_JOBS:-1}"',
             'wos_make "$WOS_GNU_MAKE_BUILD_JOBS" -C "$MAKE_BUILD" "${GNU_MAKE_BUILD_ARGS[@]}"',
         ],
         "GNU make native WOS Autoconf probe handling",
+    )
+
+
+def test_native_wos_gnu_make_parallelism_requires_distributed_compiler() -> None:
+    source = (ROOT / "scripts" / "build" / "build_make.sh").read_text()
+    require_tokens(
+        source,
+        [
+            'if [ -z "${WOS_GNU_MAKE_BUILD_JOBS:-}" ]; then',
+            "WOS_GNU_MAKE_BUILD_JOBS=1",
+            'if [ "$HOST_SYSTEM" = "WOS" ] && [ "${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ]; then',
+            'WOS_GNU_MAKE_BUILD_JOBS="$WOS_MAKE_JOBS"',
+            "WOS_GNU_MAKE_BUILD_JOBS must be a positive integer",
+            'wos_make 1 -C "$MAKE_BUILD/lib" alloca.h fnmatch.h glob.h',
+            'wos_make "$WOS_GNU_MAKE_BUILD_JOBS" -C "$MAKE_BUILD" "${GNU_MAKE_BUILD_ARGS[@]}"',
+        ],
+        "native WOS GNU make distributed parallelism",
     )
 
 
@@ -2807,6 +2823,7 @@ if __name__ == "__main__":
     test_gnu_make_script_passes_build_triplet_on_wos()
     test_gnu_make_defaults_to_pipe_jobserver_on_wos()
     test_gnu_make_script_handles_native_wos_autoconf_probes()
+    test_native_wos_gnu_make_parallelism_requires_distributed_compiler()
     test_gnu_make_script_preseeds_wos_target_configure_probes()
     test_bash_script_falls_back_to_target_triplet_on_native_wos()
     test_bash_script_handles_native_wos_autoconf_maintainer_rules()

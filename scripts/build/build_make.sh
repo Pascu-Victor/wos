@@ -14,7 +14,13 @@ wos_setup_ccache
 WOS_CCACHE_PREFIX="$(wos_ccache_prefix)"
 WOS_BUILD_JOBS="$(wos_build_jobs)"
 WOS_MAKE_JOBS="$(wos_make_jobs)"
-WOS_GNU_MAKE_BUILD_JOBS="${WOS_GNU_MAKE_BUILD_JOBS:-1}"
+HOST_SYSTEM="$(uname -s 2>/dev/null || printf unknown)"
+if [ -z "${WOS_GNU_MAKE_BUILD_JOBS:-}" ]; then
+    WOS_GNU_MAKE_BUILD_JOBS=1
+    if [ "$HOST_SYSTEM" = "WOS" ] && [ "${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ]; then
+        WOS_GNU_MAKE_BUILD_JOBS="$WOS_MAKE_JOBS"
+    fi
+fi
 case "$WOS_GNU_MAKE_BUILD_JOBS" in
     ''|*[!0-9]*|0)
         echo "ERROR: WOS_GNU_MAKE_BUILD_JOBS must be a positive integer, got '$WOS_GNU_MAKE_BUILD_JOBS'" >&2
@@ -33,7 +39,6 @@ MAKE_TARBALL_URL="${WOS_GNU_MAKE_TARBALL_URL:-https://ftp.gnu.org/gnu/make/make-
 MAKE_TARBALL_SHA256="${WOS_GNU_MAKE_TARBALL_SHA256:-dd16fb1d67bfab79a72f5e8390735c49e3e8e70b4945a15ab1f81ddb78658fb3}"
 MAKE_TARBALL_URLS="${WOS_GNU_MAKE_TARBALL_URLS:-$MAKE_TARBALL_URL}"
 MAKE_DOWNLOAD_ATTEMPTS="${WOS_GNU_MAKE_DOWNLOAD_ATTEMPTS:-${WOS_SOURCE_DOWNLOAD_ATTEMPTS:-3}}"
-HOST_SYSTEM="$(uname -s 2>/dev/null || printf unknown)"
 
 require_file() {
     local path="$1"
