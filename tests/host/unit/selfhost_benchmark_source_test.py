@@ -370,6 +370,8 @@ def test_wos_toolchain_stages_configured_build_roots() -> None:
         "build_nasm_for_wos.sh": [
             'wos_timed_step "configure" "nasm"',
             "wos_stage_distributed_build_roots",
+            '"$WORKSPACE_ROOT" ""',
+            '"$NASM_SOURCE_DIR" "$NASM_BUILD" "$TARGET_SYSROOT/include"',
             'wos_make "$WOS_MAKE_JOBS" -C "$NASM_BUILD"',
         ],
         "build_python_for_wos.sh": [
