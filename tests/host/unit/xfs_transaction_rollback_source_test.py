@@ -235,6 +235,10 @@ def main() -> None:
     require_order(
         function_body(vfs, "xfs_rename_path"),
         [
+            "int const NEW_LOOKUP_RC = xfs_dir_lookup(new_parent",
+            "if (NEW_LOOKUP_RC == 0 && new_de.ino == old_de.ino)",
+            "return 0;",
+            "XfsTransaction* tp = xfs_trans_alloc(ctx);",
             "displaced = xfs_inode_read_known_allocated",
             "xfs_trans_capture_inode(tp, displaced)",
             "xfs_dir_removename(new_parent",
@@ -242,7 +246,7 @@ def main() -> None:
             "xfs_dir_addname(new_parent",
             "xfs_dir_removename(old_parent",
         ],
-        "overwrite rename snapshots the displaced inode before namespace mutation",
+        "same-inode rename is a no-op before overwrite rename mutates the namespace",
     )
 
     for function_name, add_token in [

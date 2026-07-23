@@ -171,6 +171,20 @@ def test_metadata_mutators_are_serialized() -> None:
             fail(f"{name} must serialize XFS metadata mutations")
 
 
+def test_sync_flush_is_serialized_after_inode_writeback() -> None:
+    source = XFS_VFS_CPP.read_text()
+    require_order(
+        function_body(source, "xfs_sync_mount"),
+        [
+            "xfs_icache_sync_dirty(ctx);",
+            "XfsMetadataGuard metadata_guard(ctx",
+            "xfs_log_flush(ctx);",
+            "sync_blockdev(ctx->device);",
+        ],
+        "sync must serialize the WAL and block-device flush after inode writeback",
+    )
+
+
 def test_unlink_retries_false_enoent_without_namespace_caches() -> None:
     dir_source = XFS_DIR2_CPP.read_text()
     vfs_source = XFS_VFS_CPP.read_text()
@@ -404,6 +418,7 @@ def main() -> None:
     test_metadata_guard_records_wait_and_hold_time()
     test_inode_io_lock_precedes_metadata_lock()
     test_metadata_mutators_are_serialized()
+    test_sync_flush_is_serialized_after_inode_writeback()
     test_xfs_namespace_cache_publication_is_ordered()
     test_reused_directory_inode_starts_with_fresh_dentry_generation()
     test_known_absent_create_hint_requires_xfs_proof()

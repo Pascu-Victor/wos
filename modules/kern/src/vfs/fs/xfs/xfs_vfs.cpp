@@ -3449,6 +3449,7 @@ auto xfs_sync_mount(XfsMountContext* ctx) -> int {
     }
 
     int const INODE_RET = xfs_icache_sync_dirty(ctx);
+    XfsMetadataGuard metadata_guard(ctx, true, WOS_PERF_CALLSITE());
     int const LOG_RET = xfs_log_flush(ctx);
     int const BLOCK_RET = sync_blockdev(ctx->device);
     if (INODE_RET != 0) {
@@ -5682,6 +5683,18 @@ auto xfs_rename_path(const char* old_fs_path, const char* new_fs_path, XfsMountC
         return rc;
     }
 
+    XfsDirEntry new_de{};
+    int const NEW_LOOKUP_RC = xfs_dir_lookup(new_parent, new_name, new_namelen, &new_de);
+    if (NEW_LOOKUP_RC == 0 && new_de.ino == old_de.ino) {
+        if (statbuf != nullptr) {
+            fill_stat(moved_inode, statbuf);
+            xfs_inode_release_metadata_locked(moved_inode);
+        }
+        xfs_inode_release_metadata_locked(new_parent);
+        xfs_inode_release_metadata_locked(old_parent);
+        return 0;
+    }
+
     XfsTransaction* tp = xfs_trans_alloc(ctx);
     if (tp == nullptr) {
         if (moved_inode != nullptr) {
@@ -5694,9 +5707,8 @@ auto xfs_rename_path(const char* old_fs_path, const char* new_fs_path, XfsMountC
 
     // If destination exists, remove it first. Keep the displaced inode
     // referenced until the transaction no longer points at it.
-    XfsDirEntry new_de{};
     XfsInode* displaced = nullptr;
-    if (xfs_dir_lookup(new_parent, new_name, new_namelen, &new_de) == 0) {
+    if (NEW_LOOKUP_RC == 0) {
         purge_parent_path_cache = purge_parent_path_cache || xfs_dentry_type_may_be_directory(new_de.ftype);
         displaced = xfs_inode_read_known_allocated(ctx, new_de.ino);
         if (displaced == nullptr) {
