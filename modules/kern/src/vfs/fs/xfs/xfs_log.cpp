@@ -643,6 +643,12 @@ auto xfs_log_item_matches_buffer(const XfsTransItem& item, const BufHead* bp) ->
         return false;
     }
     BufHead const* existing = item.buf.bp;
+    // A retired buffer describes the previous owner of this physical range.
+    // If the allocator has already recycled the range, the new live buffer
+    // must remain a separate batch item so flush can dirty its home image.
+    if (existing->retired.load(std::memory_order_acquire) || bp->retired.load(std::memory_order_acquire)) {
+        return false;
+    }
     return existing == bp || (existing->bdev == bp->bdev && existing->block_no == bp->block_no && existing->size == bp->size);
 }
 
@@ -671,7 +677,8 @@ auto xfs_log_transaction_shape(const XfsTransItem* items, int item_count, size_t
         BufHead const* bp = items[i].buf.bp;
         uint32_t const OFFSET = items[i].buf.offset;
         uint32_t const LEN = items[i].buf.len;
-        if (bp == nullptr || OFFSET > bp->size || LEN > bp->size - OFFSET || body_bytes > SIZE_MAX - 16U - LEN) {
+        if (bp == nullptr || bp->retired.load(std::memory_order_acquire) || OFFSET > bp->size || LEN > bp->size - OFFSET ||
+            body_bytes > SIZE_MAX - 16U - LEN) {
             return -EIO;
         }
         dirty_items++;
@@ -734,6 +741,9 @@ auto xfs_log_batch_add_locked(const XfsTransItem* items, int item_count) -> int 
         BufHead* bp = items[i].buf.bp;
         uint32_t const OFFSET = items[i].buf.offset;
         uint32_t const LEN = items[i].buf.len;
+        if (bp->retired.load(std::memory_order_acquire)) {
+            return -EIO;
+        }
         if (XfsTransItem* existing = xfs_log_batch_find_item(active_batch, bp)) {
             if (existing->buf.bp != bp) {
                 __builtin_memcpy(existing->buf.bp->data + OFFSET, bp->data + OFFSET, LEN);
@@ -827,5 +837,86 @@ auto xfs_log_flush(XfsMountContext* mount) -> int {
     }
     return xfs_log_batch_flush_locked(mount);
 }
+
+#ifdef WOS_SELFTEST
+namespace {
+
+auto xfs_log_recycle_selftest_read(ker::dev::BlockDevice* dev, uint64_t /*block*/, size_t count, void* buffer) -> int {
+    __builtin_memset(buffer, 0, count * dev->block_size);
+    return 0;
+}
+
+auto xfs_log_recycle_selftest_write(ker::dev::BlockDevice* /*dev*/, uint64_t /*block*/, size_t /*count*/, const void* /*buffer*/) -> int {
+    return 0;
+}
+
+}  // namespace
+
+auto xfs_selftest_log_recycled_buffer_is_distinct() -> bool {
+    constexpr uint64_t BLOCK = 128;
+    constexpr size_t COUNT = 8;
+
+    ker::dev::BlockDevice dev{};
+    dev.block_size = 512;
+    dev.total_blocks = 1024;
+    dev.read_blocks = xfs_log_recycle_selftest_read;
+    dev.write_blocks = xfs_log_recycle_selftest_write;
+    invalidate_bdev(&dev);
+
+    BufHead* old = bget_multi(&dev, BLOCK, COUNT);
+    if (old == nullptr) {
+        return false;
+    }
+    __builtin_memset(old->data, 0xA5, old->size);
+
+    // Mirror an active batch's reference and writeback hold.
+    old->refcount.fetch_add(1, std::memory_order_relaxed);
+    bjournal_hold(old);
+    XfsLogBatch batch{};
+    batch.items.at(0).type = XfsLogItemType::BUFFER;
+    batch.items.at(0).buf = {
+        .bp = old,
+        .offset = 0,
+        .len = static_cast<uint32_t>(old->size),
+        .dirty = true,
+    };
+    batch.item_count = 1;
+
+    bool ok = xfs_log_batch_find_item(&batch, old) == &batch.items.at(0) && retire_bdev_range(&dev, BLOCK, COUNT) &&
+              old->retired.load(std::memory_order_acquire);
+
+    BufHead* replacement = bget_multi(&dev, BLOCK, COUNT);
+    ok = ok && replacement != nullptr && replacement != old && !replacement->retired.load(std::memory_order_acquire) &&
+         xfs_log_batch_find_item(&batch, replacement) == nullptr;
+
+    if (replacement != nullptr) {
+        __builtin_memset(replacement->data, 0x3A, replacement->size);
+        XfsTransItem replacement_item{};
+        replacement_item.type = XfsLogItemType::BUFFER;
+        replacement_item.buf = {
+            .bp = replacement,
+            .offset = 0,
+            .len = static_cast<uint32_t>(replacement->size),
+            .dirty = true,
+        };
+
+        size_t dirty_items = 0;
+        size_t body_bytes = 0;
+        ok = ok && xfs_log_transaction_shape(&replacement_item, 1, &dirty_items, &body_bytes) == 0 && dirty_items == 1 &&
+             body_bytes == 16U + replacement->size;
+        brelse(replacement);
+    }
+
+    size_t dirty_items = 0;
+    size_t body_bytes = 0;
+    ok = ok && xfs_log_transaction_shape(batch.items.data(), 1, &dirty_items, &body_bytes) == -EIO;
+
+    bjournal_release(old);
+    brelse(old);
+    brelse(old);
+    invalidate_bdev(&dev);
+    return ok;
+}
+#endif
 
 }  // namespace ker::vfs::xfs

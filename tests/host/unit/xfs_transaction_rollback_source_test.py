@@ -134,6 +134,16 @@ def main() -> None:
         ["if (RC != 0)", "return RC;", "bdirty(item.buf.bp);"],
         "failed WAL flush retains holds and does not dirty metadata",
     )
+    log_match = function_body(log, "xfs_log_item_matches_buffer")
+    if "existing->retired.load" not in log_match or "bp->retired.load" not in log_match:
+        fail("journal batches must not coalesce recycled blocks with retired buffer identities")
+    if "bp->retired.load" not in function_body(log, "xfs_log_transaction_shape"):
+        fail("journal transaction validation must reject retired incoming buffers")
+    require_order(
+        function_body(log, "xfs_log_batch_add_locked"),
+        ["bp->retired.load", "xfs_log_batch_find_item(active_batch, bp)", "bjournal_hold(bp);"],
+        "journal batching rejects retired inputs before matching or retaining them",
+    )
 
     require_order(
         function_body(btree, "xfs_btree_update"),

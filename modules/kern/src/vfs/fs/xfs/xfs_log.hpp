@@ -54,4 +54,8 @@ auto xfs_log_write(XfsMountContext* mount, const XfsTransItem* items, int item_c
 // Commit the current metadata group and release its writeback holds.
 auto xfs_log_flush(XfsMountContext* mount) -> int;
 
+#ifdef WOS_SELFTEST
+auto xfs_selftest_log_recycled_buffer_is_distinct() -> bool;
+#endif
+
 }  // namespace ker::vfs::xfs

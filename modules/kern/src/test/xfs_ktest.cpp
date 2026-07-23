@@ -17,6 +17,7 @@
 #include <vfs/fs/xfs/xfs_btree.hpp>
 #include <vfs/fs/xfs/xfs_dir2.hpp>
 #include <vfs/fs/xfs/xfs_format.hpp>
+#include <vfs/fs/xfs/xfs_log.hpp>
 #include <vfs/fs/xfs/xfs_mount.hpp>
 #include <vfs/fs/xfs/xfs_trans.hpp>
 #include <vfs/fs/xfs/xfs_vfs.hpp>
@@ -81,6 +82,8 @@ KTEST(XFS, InodeStructSize) { KEXPECT_EQ(sizeof(ker::vfs::xfs::XfsDinode), stati
 KTEST(XFS, TransactionCancelRestoresLinkCount) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_transaction_cancel_restores_nlink()); }
 
 KTEST(XFS, TransactionRetiredRangesCommitOnly) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_transaction_retired_ranges_commit_only()); }
+
+KTEST(XFS, LogRecycledBufferIsDistinct) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_log_recycled_buffer_is_distinct()); }
 
 KTEST(XFS, AgfStructSize) { KEXPECT_EQ(sizeof(ker::vfs::xfs::XfsAgf), static_cast<size_t>(224)); }
 
