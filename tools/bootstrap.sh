@@ -597,6 +597,13 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
                 -Wp,-MD,*|-Wp,-MMD,*|-Wp,-MP|-Wp,-MG)
                     continue
                     ;;
+                -include|-include-pch|-imacros)
+                    compiler_skip_arg=1
+                    continue
+                    ;;
+                -include*|-imacros*)
+                    continue
+                    ;;
                 -MF|-MT|-MQ|-MJ)
                     compiler_skip_arg=1
                     continue

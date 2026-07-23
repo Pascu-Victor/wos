@@ -420,12 +420,14 @@ PATH="$1:$PATH" \
     WOS_DISTRIBUTED_COMPILER_JOBS_PER_HOST=1 \
     WOS_DISTRIBUTED_COMPILER_MIN_PREPROCESSED_BYTES=0 \
     WOS_NINJA_JOBS=1 \
-    "$1/clang" -D'TEST_TEXT="quoted value"' -MD -MF "$1/dependencies with spaces.d" \
+    "$1/clang" -D'TEST_TEXT="quoted value"' -include "$1/header with spaces.h" \
+        -MD -MF "$1/dependencies with spaces.d" \
         -c "$1/source with spaces.cpp" \
         -o "$1/object with spaces.o"
 test -s "$1/object with spaces.o"
 test -s "$1/dependencies with spaces.d"
-"$2" -resource-dir "$3" -D'TEST_TEXT="quoted value"' -c "$1/source with spaces.cpp" \
+"$2" -resource-dir "$3" -D'TEST_TEXT="quoted value"' -include "$1/header with spaces.h" \
+    -c "$1/source with spaces.cpp" \
     -o "$1/direct object with spaces.o"
 objcopy="${2%/clang}/llvm-objcopy"
 "$objcopy" --dump-section ".text=$1/rewritten cpp text" "$1/object with spaces.o"
