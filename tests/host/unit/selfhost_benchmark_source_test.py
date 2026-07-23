@@ -201,8 +201,9 @@ def test_wos_bootstrap_distributes_only_compiler_processes() -> None:
             r'for arg in "\${compiler_forward_args[@]}"; do',
             r'env -i PATH="\$compiler_remote_path" HOME="\${HOME:-/root}" TMPDIR="\${TMPDIR:-/tmp}" TZ=UTC0',
             r'on "\$compiler_host" forward "+\$compiler_responses" --',
-            r'cat -- "\$compiler_input" |',
-            r'locally bash "\$compiler_stage" "\$compiler_response"',
+            r'compiler_stream_marker="WOS_DISTRIBUTED_INPUT_\${compiler_candidate_index}_\$\$"',
+            r'''printf '%65536s\n%s\n' '' "\$compiler_stream_marker"''',
+            r'locally bash "\$compiler_stage" "\$compiler_stream_marker" "\$compiler_input_sha256"',
             r'"\${compiler[@]}" -fno-temp-file',
             r'rm -f -- "\$compiler_input"',
             r'compiler_slot_cleanup',
@@ -299,6 +300,7 @@ cleanup() {
     rmdir "$lock"
 }
 trap cleanup EXIT
+cat >/dev/null
 sleep 0.1
 exit 0
 '''.replace("MOCK_STATE_PATH", shlex.quote(str(mock_state))),
@@ -354,11 +356,11 @@ set -u
 [ "${TZ:-}" = UTC0 ]
 shift
 [ "$1" = forward ]
-[ "$2" = "+$(dirname "$7")" ]
+[ "$2" = "+$(dirname "$9")" ]
 [ "$3" = -- ]
 [ "$4" = locally ]
 [ "$5" = bash ]
-response="$7"
+response="$9"
 if grep -F -- CPP_SOURCE_PATH "$response" >/dev/null || \
         grep -F -- C_SOURCE_PATH "$response" >/dev/null; then
     echo "remote compiler response still names the original source" >&2
