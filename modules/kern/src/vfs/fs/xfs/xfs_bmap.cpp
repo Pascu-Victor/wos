@@ -1767,8 +1767,8 @@ auto xfs_selftest_bmap_synthetic_btree_lookup() -> bool {
 
 auto xfs_selftest_bmap_extent_promotion() -> bool {
     ker::dev::BlockDevice dev{};
-    constexpr uint32_t SELFTEST_BLOCK_SIZE = 1024;
-    constexpr uint32_t SELFTEST_SECTOR_SIZE = 256;
+    constexpr uint32_t SELFTEST_BLOCK_SIZE = 2048;
+    constexpr uint32_t SELFTEST_SECTOR_SIZE = 512;
     constexpr uint32_t SELFTEST_AG_BLOCKS = 4096;
     dev.block_size = SELFTEST_SECTOR_SIZE;
     dev.total_blocks = static_cast<uint64_t>(SELFTEST_AG_BLOCKS) * (SELFTEST_BLOCK_SIZE / SELFTEST_SECTOR_SIZE);
@@ -1791,7 +1791,7 @@ auto xfs_selftest_bmap_extent_promotion() -> bool {
     XfsMountContext mount{};
     mount.device = &dev;
     mount.block_size = SELFTEST_BLOCK_SIZE;
-    mount.block_log = 10;
+    mount.block_log = 11;
     mount.total_blocks = SELFTEST_AG_BLOCKS;
     mount.inode_size = 512;
     mount.inodes_per_block = 1;
@@ -1801,7 +1801,7 @@ auto xfs_selftest_bmap_extent_promotion() -> bool {
     mount.ag_blk_log = 12;
     mount.agino_log = 12;
     mount.sect_size = SELFTEST_SECTOR_SIZE;
-    mount.sect_log = 8;
+    mount.sect_log = 9;
     mount.per_ag = &pag;
 
     if (!bmap_selftest_init_ag0(&mount)) {
