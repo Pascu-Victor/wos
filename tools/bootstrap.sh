@@ -499,9 +499,13 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
             echo "ERROR: distributed compiler response directory could not be created" >&2
             exit 1
         fi
-        # mktemp already creates the unique job directory atomically. A shared
-        # lock around it only turns concurrent preprocessing into a spin queue.
-        compiler_job_dir="\$(mktemp -d "\$compiler_responses/clang-job.XXXXXX" || true)"
+        # WOS mktemp currently races when many wrappers create directories at
+        # once. Each wrapper is a distinct process, so its PID provides a
+        # collision-free name without serializing preprocessing.
+        compiler_job_dir="\$compiler_responses/clang-job.\$\$"
+        if ! mkdir "\$compiler_job_dir" 2>/dev/null; then
+            compiler_job_dir=""
+        fi
         trap compiler_slot_release EXIT HUP INT TERM
         if [ -z "\$compiler_job_dir" ] || [ ! -d "\$compiler_job_dir" ]; then
             compiler_slot_release
