@@ -400,6 +400,9 @@ def test_wos_toolchain_stages_configured_build_roots() -> None:
         "build_dropbear.sh": [
             'wos_make "$WOS_MAKE_JOBS" -C "$DB_BUILD" default_options_guard.h'
         ],
+        "build_make.sh": [
+            'wos_make 1 -C "$MAKE_BUILD/lib" alloca.h fnmatch.h glob.h'
+        ],
         "build_bash_for_wos.sh": [
             "version.h parser-built signames.h syntax.c builtins/builtext.h",
             'for definition in "$BASH_WORK"/builtins/*.def',
