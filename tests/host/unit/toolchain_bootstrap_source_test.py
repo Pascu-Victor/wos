@@ -688,7 +688,7 @@ def test_mlibc_wrap_dependencies_are_prefetched_with_retries() -> None:
     require_tokens(
         bootstrap,
         [
-            'wos_prefetch_meson_subprojects "$B/src/mlibc" freestnd-c-hdrs freestnd-cxx-hdrs frigg',
+            'wos_prefetch_meson_subprojects "$B/src/mlibc" freestnd-c-hdrs freestnd-cxx-hdrs frigg libsmarter',
             'meson_setup_rerunnable "$B/mlibc-build"',
         ],
         "bootstrap mlibc Meson dependency prefetch",
@@ -696,7 +696,7 @@ def test_mlibc_wrap_dependencies_are_prefetched_with_retries() -> None:
     require_tokens(
         build_script,
         [
-            'wos_prefetch_meson_subprojects "$MLIBC_SRC" freestnd-c-hdrs freestnd-cxx-hdrs frigg',
+            'wos_prefetch_meson_subprojects "$MLIBC_SRC" freestnd-c-hdrs freestnd-cxx-hdrs frigg libsmarter',
             'meson setup --prefix="$TARGET_SYSROOT"',
         ],
         "incremental mlibc Meson dependency prefetch",

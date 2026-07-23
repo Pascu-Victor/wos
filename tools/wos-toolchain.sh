@@ -615,7 +615,7 @@ export CFLAGS="--sysroot=$SYSROOT -std=c23 -fno-sanitize=safe-stack "
 export CXXFLAGS="--sysroot=$SYSROOT -std=c++23 -fno-sanitize=safe-stack "
 export LDFLAGS="--sysroot=$SYSROOT"
 
-wos_prefetch_meson_subprojects "$B/src/mlibc" freestnd-c-hdrs freestnd-cxx-hdrs frigg
+wos_prefetch_meson_subprojects "$B/src/mlibc" freestnd-c-hdrs freestnd-cxx-hdrs frigg libsmarter
 stage_distributed_compiler_roots "$B/src/mlibc" "$SYSROOT/include"
 
 mkdir -p $B/mlibc-build
