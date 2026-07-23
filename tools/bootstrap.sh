@@ -148,6 +148,10 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
             exit 1
             ;;
     esac
+    compiler_slot_pause=(sleep 0)
+    if command -v usleep >/dev/null 2>&1; then
+        compiler_slot_pause=(usleep 1000)
+    fi
     if [ "\$compiler_transport" = source ]; then
         compiler_total_jobs="\${WOS_NINJA_JOBS:-\${WOS_BUILD_JOBS:-}}"
         case "\$compiler_total_jobs" in
@@ -224,7 +228,7 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
             done
             if [ -z "\$compiler_slot" ]; then
                 compiler_start_index="\$(((compiler_start_index + 1) % \${#compiler_hosts[@]}))"
-                sleep 0
+                "\${compiler_slot_pause[@]}"
             fi
         done
         compiler_slot_release() {
@@ -481,7 +485,7 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
                 done
                 if [ -z "\$compiler_slot" ]; then
                     compiler_start_index="\$(((compiler_start_index + 1) % \${#compiler_hosts[@]}))"
-                    sleep 0
+                    "\${compiler_slot_pause[@]}"
                 fi
             done
         fi
@@ -556,7 +560,7 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
             done
             if [ -z "\$compiler_preprocess_slot" ]; then
                 compiler_preprocess_start="\$(((compiler_preprocess_start + 1) % compiler_preprocess_jobs))"
-                sleep 0
+                "\${compiler_slot_pause[@]}"
             fi
         done
         if "\${compiler[@]}" "\$@" "\${compiler_preprocess_args[@]}" -o "\$compiler_input" -Wno-unused-command-line-argument; then

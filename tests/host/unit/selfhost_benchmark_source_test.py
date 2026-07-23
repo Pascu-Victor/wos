@@ -148,6 +148,8 @@ def test_wos_bootstrap_distributes_only_compiler_processes() -> None:
             r'IFS=, read -r -a compiler_hosts <<< "\${WOS_DISTRIBUTED_COMPILER_HOSTS:-}"',
             r'compiler_transport="\${WOS_DISTRIBUTED_COMPILER_TRANSPORT:-source}"',
             r"source|preprocessed|rewritten)",
+            r'compiler_slot_pause=(usleep 1000)',
+            r'"\${compiler_slot_pause[@]}"',
             r'compiler_jobs_per_host="\$(((compiler_total_jobs + \${#compiler_hosts[@]} - 1) / \${#compiler_hosts[@]}))"',
             r'compiler_slots="\$compiler_state.source-slots"',
             r'compiler_start_index="\$((RANDOM % \${#compiler_hosts[@]}))"',
