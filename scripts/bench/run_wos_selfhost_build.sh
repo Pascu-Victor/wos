@@ -795,7 +795,10 @@ validate_runtime_settings() {
             if [ "$distributed_compiler_transport" = "source" ]; then
                 distributed_local_jobs="$distributed_jobs_per_host"
             elif [ "$distributed_compiler_transport" = "staged" ]; then
-                distributed_local_jobs="$((submitter_cpus / 3))"
+                # One runnable compile per peer vCPU fills a staged worker.
+                # Use the submitter's other two thirds for compilation while
+                # retaining one third for orchestration, linking, and WKI.
+                distributed_local_jobs="$(((submitter_cpus * 2) / 3))"
                 [ "$distributed_local_jobs" -gt 0 ] || distributed_local_jobs=1
             else
                 distributed_local_jobs="$((submitter_cpus / 3))"
@@ -808,7 +811,7 @@ validate_runtime_settings() {
         fi
         if [ -z "$distributed_remote_jobs_per_host" ]; then
             if [ "$distributed_compiler_transport" = "staged" ] && [ -n "$smallest_peer_cpus" ]; then
-                distributed_remote_jobs_per_host="$(((smallest_peer_cpus * 3 + 1) / 2))"
+                distributed_remote_jobs_per_host="$smallest_peer_cpus"
             else
                 distributed_remote_jobs_per_host="$distributed_jobs_per_host"
             fi
