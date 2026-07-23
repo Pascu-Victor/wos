@@ -18,6 +18,7 @@ static constexpr uint32_t WEIGHT_NICE_N5 = 3121;  // nice=-5 (higher prio)
 namespace ker::mod::sched {
 auto scheduler_selftest_handoff_preserves_runnable_event_token() -> bool;
 auto scheduler_selftest_stalled_waitpid_claim_recovery_is_leased() -> bool;
+auto scheduler_selftest_waitpid_wait_publication_arms_repair() -> bool;
 auto scheduler_selftest_reserved_wake_precedes_handoff_commit() -> bool;
 auto scheduler_selftest_concurrent_reschedule_requests_are_serialized() -> bool;
 auto scheduler_selftest_runtime_delta_saturates() -> bool;
@@ -117,6 +118,10 @@ KTEST(SchedulerHandoff, RunnableEventTokenSurvivesCommit) {
 
 KTEST(SchedulerWaitpid, StalledCompletionClaimRecoveryIsLeased) {
     KEXPECT_TRUE(ker::mod::sched::scheduler_selftest_stalled_waitpid_claim_recovery_is_leased());
+}
+
+KTEST(SchedulerWaitpid, WaitPublicationArmsFallbackRepair) {
+    KEXPECT_TRUE(ker::mod::sched::scheduler_selftest_waitpid_wait_publication_arms_repair());
 }
 
 KTEST(SchedulerHandoff, ReservedWakePrecedesCommit) {

@@ -1706,6 +1706,7 @@ def test_timer_waitpid_repair_rechecks_stranded_waiters_without_sigchld() -> Non
     source = SCHEDULER_CPP.read_text()
     repair_due_body = function_body(source, "waitpid_repair_due")
     wait_deadline_body = function_body(source, "task_wait_deadline_us")
+    wait_list_push_body = function_body(source, "wait_list_push_locked")
     timer_body = function_body(source, "process_tasks")
     reschedule_body = function_body(source, "reschedule_task_for_cpu_once")
 
@@ -1751,6 +1752,17 @@ def test_timer_waitpid_repair_rechecks_stranded_waiters_without_sigchld() -> Non
             "min_nonzero_deadline(min_nonzero_deadline(t->wake_at_us, t->itimer_real_expire_us), waitpid_repair_deadline_us)",
         ],
         "waitpid repair must arm wait-list deadline without timed wake",
+    )
+    require_tokens(
+        wait_list_push_body,
+        [
+            "t->wait_channel_is(task::WaitChannelKind::WAITPID)",
+            "t->waiting_for_pid != 0",
+            "t->last_sleep_start_us == 0",
+            "t->last_sleep_start_us = NOW_US != 0 ? NOW_US : 1;",
+            "note_wait_deadline_locked(rq, t);",
+        ],
+        "every waitpid wait-list publication must carry a fallback repair deadline",
     )
     require_tokens(
         timer_body,
@@ -1799,6 +1811,10 @@ def test_timer_waitpid_repair_rechecks_stranded_waiters_without_sigchld() -> Non
     require_tokens(
         waitpid_requeue_body,
         [
+            "bool const ORPHANED_WAITPID",
+            "!found_and_removed && task->scheduler_published.load(std::memory_order_acquire)",
+            "task->sched_queue == task::Task::sched_queue::WAITING",
+            "if (found_and_removed || ORPHANED_WAITPID)",
             "if (task->last_sleep_start_us == 0)",
             "task->last_sleep_start_us = time::get_us();",
             "wait_list_push_locked(rq, task);",

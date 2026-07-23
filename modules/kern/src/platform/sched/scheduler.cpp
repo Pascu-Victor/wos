@@ -2190,6 +2190,14 @@ inline void wait_list_push_locked(RunQueue* rq, task::Task* t) {
     if (rq == nullptr || t == nullptr) {
         return;
     }
+    // A waitpid completion can race between proxy EXITING publication and
+    // dead-list insertion.  The waiter must remain blocked during that gap,
+    // but it still needs a deadline for the fallback scan even when an earlier
+    // event-before-park wake cleared its sleep accounting timestamp.
+    if (t->wait_channel_is(task::WaitChannelKind::WAITPID) && t->waiting_for_pid != 0 && t->last_sleep_start_us == 0) {
+        uint64_t const NOW_US = time::get_us();
+        t->last_sleep_start_us = NOW_US != 0 ? NOW_US : 1;
+    }
     rq->wait_list.push(t);
     note_wait_deadline_locked(rq, t);
 }
@@ -5944,7 +5952,16 @@ void reschedule_task_for_cpu_once(uint64_t cpu_no, task::Task* task) {
     }
 
     if (is_waitpid_wait_channel(task->wait_channel_kind) && task->waiting_for_pid != 0 && !complete_or_preserve_waitpid_block(task)) {
-        if (found_and_removed) {
+        // A wake may race the outgoing-task handoff after sched_queue becomes
+        // WAITING but before (or while) its physical wait-list membership is
+        // transferred.  The full owner scan above proves that a published
+        // ownerless WAITING task is not current, reserved, runnable, or on any
+        // wait list.  Republish that orphan instead of relying on an unrelated
+        // future wake to repair it.
+        bool const ORPHANED_WAITPID = !found_and_removed && task->scheduler_published.load(std::memory_order_acquire) &&
+                                      task->sched_queue == task::Task::sched_queue::WAITING && task->heap_index < 0 &&
+                                      task->sched_next == nullptr;
+        if (found_and_removed || ORPHANED_WAITPID) {
             uint64_t owner_cpu = found_owner_cpu;
             if (owner_cpu >= NCPUS_RESCHED) {
                 owner_cpu = task->cpu < NCPUS_RESCHED ? task->cpu : cpu_no;
@@ -8255,9 +8272,11 @@ namespace {
 using SchedulerRunQueueStorage = std::array<std::byte, sizeof(RunQueue)>;
 alignas(RunQueue) SchedulerRunQueueStorage scheduler_reschedule_selftest_first_storage{};   // NOLINT
 alignas(RunQueue) SchedulerRunQueueStorage scheduler_reschedule_selftest_second_storage{};  // NOLINT
+alignas(RunQueue) SchedulerRunQueueStorage scheduler_waitpid_selftest_storage{};            // NOLINT
 RunQueue* scheduler_reschedule_selftest_first_rq{};                                         // NOLINT
 RunQueue* scheduler_reschedule_selftest_second_rq{};                                        // NOLINT
 task::Task scheduler_reschedule_selftest_target;                                            // NOLINT
+task::Task scheduler_waitpid_selftest_target;                                               // NOLINT
 }  // namespace
 
 auto scheduler_selftest_handoff_preserves_runnable_event_token() -> bool {
@@ -8294,6 +8313,34 @@ auto scheduler_selftest_stalled_waitpid_claim_recovery_is_leased() -> bool {
 
     task::task_clear_waitpid_block_state(waiter);
     return FIRST_OBSERVATION_ONLY && PRESERVED_BEFORE_LEASE && RECOVERED_AT_LEASE;
+}
+
+auto scheduler_selftest_waitpid_wait_publication_arms_repair() -> bool {
+    auto* rq = ::new (static_cast<void*>(scheduler_waitpid_selftest_storage.data())) RunQueue{};
+    auto& waiter = scheduler_waitpid_selftest_target;
+
+    waiter.state.store(task::TaskState::ACTIVE, std::memory_order_relaxed);
+    waiter.waiting_for_pid = WAIT_ANY_CHILD;
+    waiter.waitpid_last_repair_us = 0;
+    waiter.last_sleep_start_us = 0;
+    waiter.sched_queue = task::Task::sched_queue::WAITING;
+    waiter.sched_next = nullptr;
+    waiter.heap_index = -1;
+    waiter.set_wait_channel("waitpid", task::WaitChannelKind::WAITPID);
+
+    wait_list_push_locked(rq, &waiter);
+    uint64_t const FIRST_SLEEP_START_US = waiter.last_sleep_start_us;
+    uint64_t const FIRST_DEADLINE_US = rq->next_wait_deadline_us;
+    bool const ARMED = FIRST_SLEEP_START_US != 0 && FIRST_DEADLINE_US > FIRST_SLEEP_START_US && wait_list_contains_locked(rq, &waiter);
+
+    wait_list_remove_all_locked(rq, &waiter);
+    waiter.last_sleep_start_us = 123;
+    wait_list_push_locked(rq, &waiter);
+    bool const PRESERVED = waiter.last_sleep_start_us == 123 && rq->next_wait_deadline_us == 123 + WAITPID_REPAIR_FALLBACK_MIN_US;
+
+    wait_list_remove_all_locked(rq, &waiter);
+    task::task_clear_waitpid_block_state(waiter);
+    return ARMED && PRESERVED && rq->next_wait_deadline_us == 0;
 }
 
 auto scheduler_selftest_reserved_wake_precedes_handoff_commit() -> bool {
