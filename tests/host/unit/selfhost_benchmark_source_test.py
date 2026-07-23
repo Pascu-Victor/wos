@@ -159,6 +159,7 @@ def test_wos_bootstrap_distributes_only_compiler_processes() -> None:
             r'compiler_start_index="\$((RANDOM % \${#compiler_hosts[@]}))"',
             r'compiler_start_index="\$(((compiler_start_index + 1) % \${#compiler_hosts[@]}))"',
             r'compiler_remote_command=(on "\$compiler_host")',
+            r'compiler_remote_command+=(forward --clear)',
             r'for compiler_local_system_root in /usr /bin /lib /lib64 /libexec /share /etc /proc /dev /run /tmp; do',
             r'compiler_remote_command+=(-- locally)',
             r'compiler_add_home_route "\$compiler_state"',

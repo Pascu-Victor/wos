@@ -136,6 +136,14 @@ namespace wkictl {
 
 auto run_forward(int argc, char** argv) -> int {
     int command_index = 1;
+    if (command_index < argc && std::strcmp(argv[command_index], "--clear") == 0) {
+        int const CLEAR_RC = ker::abi::vfs::wki_rule_clear_vfs();
+        if (CLEAR_RC < 0) {
+            std::println(stderr, "forward: failed to clear inherited VFS rules: {}", CLEAR_RC);
+            return 1;
+        }
+        command_index++;
+    }
     for (; command_index < argc; ++command_index) {
         const char* arg = argv[command_index];
         if (std::strcmp(arg, "--") == 0) {

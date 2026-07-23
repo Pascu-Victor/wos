@@ -157,6 +157,9 @@ def test_wkictl_vfs_forward_and_commands_use_wki_wrappers() -> None:
     require_tokens(
         forward_body,
         [
+            'std::strcmp(argv[command_index], "--clear") == 0',
+            "ker::abi::vfs::wki_rule_clear_vfs()",
+            "forward: failed to clear inherited VFS rules",
             'std::strcmp(arg, "--") == 0',
             "arg[0] == '+' ? ker::abi::vfs::WKI_VFS_ROUTE_HOST : ker::abi::vfs::WKI_VFS_ROUTE_LOCAL",
             "add_forward_operand(arg + 1, ROUTE)",

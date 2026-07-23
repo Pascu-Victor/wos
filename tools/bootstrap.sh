@@ -303,12 +303,12 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
                 echo "ERROR: staged distributed compiler has no local root manifest" >&2
                 exit 1
             fi
-            compiler_remote_command+=(forward)
-            # The outer self-host command routes system prefixes homeward so
-            # any nested remote task can still use VM0's environment. A staged
-            # compiler must reverse those inherited rules: every peer has the
-            # same packaged compiler/runtime, and fetching them from VM0 puts
-            # otherwise runnable Clang processes to sleep in remote VFS.
+            compiler_remote_command+=(forward --clear)
+            # Drop the outer self-host command's forwarding policy before
+            # installing this compiler job's minimal policy. Carrying both
+            # policies can overflow WKI's single-frame task-submit payload once
+            # enough source roots have been staged. Every peer has the same
+            # packaged compiler/runtime, so keep those paths peer-local.
             for compiler_local_system_root in /usr /bin /lib /lib64 /libexec /share /etc /proc /dev /run /tmp; do
                 compiler_remote_command+=("-\$compiler_local_system_root")
             done
