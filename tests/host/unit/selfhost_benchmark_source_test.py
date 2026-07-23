@@ -353,6 +353,10 @@ if grep -Fx -- -MD "$response" >/dev/null || grep -Fx -- -MF "$response" >/dev/n
     echo "remote compiler response still contains dependency flags" >&2
     exit 91
 fi
+if grep -E -- '^-Wp,-M(D|MD),' "$response" >/dev/null; then
+    echo "remote compiler response still contains Kbuild dependency flags" >&2
+    exit 93
+fi
 if ! grep -Ex -- 'c|c\+\+' "$response" >/dev/null; then
     echo "remote compiler response does not select rewritten C/C++" >&2
     exit 92
@@ -443,9 +447,10 @@ cmp "$1/rewritten c text" "$1/direct c text"
         WOS_DISTRIBUTED_COMPILER_JOBS_PER_HOST=1 \
         WOS_DISTRIBUTED_COMPILER_MIN_PREPROCESSED_BYTES=0 \
         WOS_NINJA_JOBS=1 \
-        "$1/clang" -c "source with spaces.c"
+        "$1/clang" -Wp,-MD,"$1/default-output.d" -c "source with spaces.c"
 )
 test -s "$1/source with spaces.o"
+test -s "$1/default-output.d"
 '''
         result = subprocess.run(
             [
