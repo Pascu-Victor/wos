@@ -294,7 +294,7 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
             fi
         done
         compiler_remote_path="\${PATH:-/usr/bin:/bin}"
-        compiler_remote_command=(on "\$compiler_host")
+        compiler_remote_command=()
         if [ "\$compiler_transport" = staged ]; then
             compiler_local_roots="\$compiler_state.local-roots"
             if [ ! -s "\$compiler_local_roots" ]; then
@@ -303,7 +303,7 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
                 echo "ERROR: staged distributed compiler has no local root manifest" >&2
                 exit 1
             fi
-            compiler_remote_command+=(forward --clear)
+            compiler_remote_command=(forward --clear)
             # Drop the outer self-host command's forwarding policy before
             # installing this compiler job's minimal policy. Carrying both
             # policies can overflow WKI's single-frame task-submit payload once
@@ -421,7 +421,14 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
                 fi
                 compiler_add_home_route "\$compiler_output_directory" || exit 1
             fi
-            compiler_remote_command+=(-- locally)
+            # Apply the minimal policy on the submitter before `on` marks the
+            # next exec remote. Otherwise WKI must serialize the inherited
+            # policy and this helper's complete rule argv just to launch
+            # `forward`, which can overflow one task-submit frame before
+            # --clear ever executes.
+            compiler_remote_command+=(-- on "\$compiler_host" locally)
+        else
+            compiler_remote_command=(on "\$compiler_host")
         fi
         if env -i PATH="\$compiler_remote_path" HOME="\${HOME:-/root}" TMPDIR="\${TMPDIR:-/tmp}" TZ=UTC0 \
             "\${compiler_remote_command[@]}" "\${compiler[@]}" -fno-temp-file "@\$compiler_response"; then
