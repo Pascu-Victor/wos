@@ -1740,6 +1740,8 @@ def test_timer_waitpid_repair_rechecks_stranded_waiters_without_sigchld() -> Non
             "bool const SIGCHLD_PENDING = (waiter->signal_pending_bits() & SIGCHLD_MASK) != 0;",
             "if (SIGCHLD_PENDING)",
             "waiter->waitpid_last_repair_us != 0 ? waiter->waitpid_last_repair_us : waiter->last_sleep_start_us",
+            "if (LAST_REPAIR_US == 0)",
+            "return true;",
             "now_us - LAST_REPAIR_US >= WAITPID_REPAIR_FALLBACK_MIN_US",
         ],
         "waitpid fallback repair predicate",

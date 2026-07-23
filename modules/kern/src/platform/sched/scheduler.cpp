@@ -615,7 +615,10 @@ inline auto waitpid_repair_due(const task::Task* waiter, uint64_t now_us) -> boo
         return true;
     }
     uint64_t const LAST_REPAIR_US = waiter->waitpid_last_repair_us != 0 ? waiter->waitpid_last_repair_us : waiter->last_sleep_start_us;
-    return LAST_REPAIR_US != 0 && now_us > LAST_REPAIR_US && now_us - LAST_REPAIR_US >= WAITPID_REPAIR_FALLBACK_MIN_US;
+    if (LAST_REPAIR_US == 0) {
+        return true;
+    }
+    return now_us > LAST_REPAIR_US && now_us - LAST_REPAIR_US >= WAITPID_REPAIR_FALLBACK_MIN_US;
 }
 
 inline auto recover_stalled_waitpid_completion_claim(task::Task* waiter, uint64_t now_us) -> bool {
@@ -8390,6 +8393,7 @@ auto scheduler_selftest_waitpid_wait_publication_arms_repair() -> bool {
     waiter.scheduler_published.store(true, std::memory_order_relaxed);
     waiter.set_wait_channel("waitpid", task::WaitChannelKind::WAITPID);
 
+    bool const ZERO_STAMP_REPAIR_DUE = waitpid_repair_due(&waiter, 1);
     bool const ORPHAN_RECOGNIZED = orphaned_waitpid_candidate_locked(rq, &waiter);
     wait_list_push_locked(rq, &waiter);
     uint64_t const FIRST_SLEEP_START_US = waiter.last_sleep_start_us;
@@ -8403,10 +8407,13 @@ auto scheduler_selftest_waitpid_wait_publication_arms_repair() -> bool {
     wait_list_push_locked(rq, &waiter);
     bool const PRESERVED = waiter.last_sleep_start_us == 123 && rq->next_wait_deadline_us == 123 + WAITPID_REPAIR_FALLBACK_MIN_US;
 
+    waiter.waitpid_last_repair_us = 100;
+    bool const REPAIR_BACKOFF_PRESERVED = !waitpid_repair_due(&waiter, 100 + WAITPID_REPAIR_FALLBACK_MIN_US - 1) &&
+                                          waitpid_repair_due(&waiter, 100 + WAITPID_REPAIR_FALLBACK_MIN_US);
     wait_list_remove_all_locked(rq, &waiter);
     task::task_clear_waitpid_block_state(waiter);
-    return ORPHAN_RECOGNIZED && ARMED && LINKED_WAITER_NOT_ORPHANED && UNLINKED_STAMPED_WAITER_RECOGNIZED && PRESERVED &&
-           rq->next_wait_deadline_us == 0;
+    return ZERO_STAMP_REPAIR_DUE && ORPHAN_RECOGNIZED && ARMED && LINKED_WAITER_NOT_ORPHANED && UNLINKED_STAMPED_WAITER_RECOGNIZED &&
+           PRESERVED && REPAIR_BACKOFF_PRESERVED && rq->next_wait_deadline_us == 0;
 }
 
 auto scheduler_selftest_reserved_wake_precedes_handoff_commit() -> bool {
