@@ -258,15 +258,20 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
         compiler_host=""
         compiler_slot=""
         # Slot directories are the admission authority, so selecting a host
-        # does not need a global lock. A shared next-host file made every
-        # compiler serialize on the submitter before any work could be sent to
-        # a peer; under oversubscription, wrappers spent whole cores repeatedly
-        # spawning `sleep 0` while the peer CPUs sat idle. Start each wrapper at
-        # an independently mixed host and use atomic mkdir claims directly.
-        compiler_start_index="\$((RANDOM % \${#compiler_hosts[@]}))"
+        # does not need a global lock. Prefer a randomly rotated peer order and
+        # consider the submitter only after every peer is full. The submitter
+        # also runs Ninja, generators, linkers, and every wrapper; treating it
+        # as an equal first choice saturated its CPUs while partially filled
+        # peer VMs sat idle.
+        compiler_remote_host_count="\$((\${#compiler_hosts[@]} - 1))"
+        compiler_start_index="\$((1 + RANDOM % compiler_remote_host_count))"
         while [ -z "\$compiler_slot" ]; do
             for ((compiler_offset = 0; compiler_offset < \${#compiler_hosts[@]}; compiler_offset++)); do
-                compiler_candidate_index="\$(((compiler_start_index + compiler_offset) % \${#compiler_hosts[@]}))"
+                if [ "\$compiler_offset" -lt "\$compiler_remote_host_count" ]; then
+                    compiler_candidate_index="\$((1 + (compiler_start_index - 1 + compiler_offset) % compiler_remote_host_count))"
+                else
+                    compiler_candidate_index=0
+                fi
                 compiler_host_slots="\$compiler_slots/\$compiler_candidate_index"
                 if ! mkdir -p "\$compiler_host_slots"; then
                     echo "ERROR: distributed compiler host slot directory could not be created" >&2
@@ -286,7 +291,7 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
                 done
             done
             if [ -z "\$compiler_slot" ]; then
-                compiler_start_index="\$(((compiler_start_index + 1) % \${#compiler_hosts[@]}))"
+                compiler_start_index="\$((1 + compiler_start_index % compiler_remote_host_count))"
                 if [ "\$compiler_slot_has_usleep" -eq 1 ]; then
                     usleep "\$compiler_slot_pause_us"
                     if [ "\$compiler_slot_pause_us" -lt 16000 ]; then
@@ -679,13 +684,17 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
                 exit "\$compiler_status"
             fi
         else
-            # Atomic slot directories are the admission authority. Avoid a
-            # global next-host lock here: under oversubscription its spin loop
-            # serialized preprocessing on the submitter while peer CPUs idled.
-            compiler_start_index="\$((RANDOM % \${#compiler_hosts[@]}))"
+            # Fill peers before consuming submitter slots. The submitter has
+            # preprocessing and build-orchestration work that peers cannot do.
+            compiler_remote_host_count="\$((\${#compiler_hosts[@]} - 1))"
+            compiler_start_index="\$((1 + RANDOM % compiler_remote_host_count))"
             while [ -z "\$compiler_slot" ]; do
                 for ((compiler_offset = 0; compiler_offset < \${#compiler_hosts[@]}; compiler_offset++)); do
-                    compiler_candidate_index="\$(((compiler_start_index + compiler_offset) % \${#compiler_hosts[@]}))"
+                    if [ "\$compiler_offset" -lt "\$compiler_remote_host_count" ]; then
+                        compiler_candidate_index="\$((1 + (compiler_start_index - 1 + compiler_offset) % compiler_remote_host_count))"
+                    else
+                        compiler_candidate_index=0
+                    fi
                     compiler_host_slots="\$compiler_slots/\$compiler_candidate_index"
                     if ! mkdir -p "\$compiler_host_slots"; then
                         echo "ERROR: distributed compiler host slot directory could not be created" >&2
@@ -705,7 +714,7 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
                     done
                 done
                 if [ -z "\$compiler_slot" ]; then
-                    compiler_start_index="\$(((compiler_start_index + 1) % \${#compiler_hosts[@]}))"
+                    compiler_start_index="\$((1 + compiler_start_index % compiler_remote_host_count))"
                     "\${compiler_slot_pause[@]}"
                 fi
             done

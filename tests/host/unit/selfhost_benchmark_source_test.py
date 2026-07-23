@@ -172,8 +172,8 @@ def test_wos_bootstrap_distributes_only_compiler_processes() -> None:
             r'compiler_slot_pause_us="\$((compiler_slot_pause_us * 2))"',
             r'compiler_jobs_per_host="\$(((compiler_total_jobs + \${#compiler_hosts[@]} - 1) / \${#compiler_hosts[@]}))"',
             r'compiler_slots="\$compiler_state.source-slots"',
-            r'compiler_start_index="\$((RANDOM % \${#compiler_hosts[@]}))"',
-            r'compiler_start_index="\$(((compiler_start_index + 1) % \${#compiler_hosts[@]}))"',
+            r'compiler_start_index="\$((1 + RANDOM % compiler_remote_host_count))"',
+            r'compiler_start_index="\$((1 + compiler_start_index % compiler_remote_host_count))"',
             r'compiler_route_response="\$(mktemp "\$compiler_responses/routes.XXXXXX")"',
             r'''printf '%s\n' "\${compiler_route_args[@]}" > "\$compiler_route_response"''',
             r'compiler_remote_command=(forward --clear -- on "\$compiler_host" /usr/bin/bash',
@@ -193,7 +193,6 @@ def test_wos_bootstrap_distributes_only_compiler_processes() -> None:
             r'compiler_total_jobs="\${WOS_NINJA_JOBS:-\${WOS_BUILD_JOBS:-}}"',
             r'compiler_local_jobs="\$compiler_total_jobs"',
             r'compiler_remote_jobs_per_host="\${WOS_DISTRIBUTED_COMPILER_REMOTE_JOBS_PER_HOST:-1}"',
-            r'compiler_start_index="\$((RANDOM % \${#compiler_hosts[@]}))"',
             "Each wrapper is a distinct process",
             r'compiler_persist_remote_slots=1',
             r'compiler_preprocess_jobs="\${WOS_DISTRIBUTED_COMPILER_PREPROCESS_JOBS:-\$compiler_local_jobs}"',
@@ -253,6 +252,12 @@ def test_wos_bootstrap_distributes_only_compiler_processes() -> None:
         fail("source-mode distributed compiler selection must not serialize through global state")
     if "compiler_lock" in source:
         fail("distributed compiler selection must not serialize through a global spin lock")
+    if source.count(r'compiler_remote_host_count="\$((\${#compiler_hosts[@]} - 1))"') < 2:
+        fail("distributed compiler selection must identify peer capacity independently")
+    if source.count(
+        r'compiler_candidate_index="\$((1 + (compiler_start_index - 1 + compiler_offset) % compiler_remote_host_count))"'
+    ) < 2:
+        fail("distributed compiler selection must scan peers before the submitter")
 
 
 def test_wos_toolchain_stages_sources_before_distributed_compiles() -> None:
@@ -887,7 +892,6 @@ def test_wos_bootstrap_staged_compiler_routes_source_and_outputs() -> None:
         source = source_root / "input.c"
         source.write_text("int staged_input(void) { return 23; }\n", encoding="ascii")
         state = temp / "compiler-state"
-        (Path(f"{state}.source-slots") / "0" / "0").mkdir(parents=True)
         Path(f"{state}.local-roots").write_text(f"{source_root}\n", encoding="ascii")
         trace = temp / "on.args"
         mock_forward = temp / "forward"
