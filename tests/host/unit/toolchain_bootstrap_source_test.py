@@ -1520,7 +1520,9 @@ def test_cpython_target_configure_preseeds_wos_runtime_probes() -> None:
         [
             'NCURSES_CFLAGS="$NCURSES_TARGET_FLAGS -O2 -g -fPIC -fno-sanitize=safe-stack -fno-stack-protector"',
             "for install_target in install.libs install.includes install.data; do",
-            'wos_make 1 -C "$NCURSES_WORK"',
+            'if ! wos_make 1 -C "$NCURSES_WORK"',
+            'if [ "$HOST_SYSTEM" != "WOS" ]; then',
+            "Retrying ncurses $install_target after transient WOS install failure",
             '"$install_target"',
         ],
         "ncurses static archives remain linkable into CPython shared modules",

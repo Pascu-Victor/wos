@@ -329,9 +329,20 @@ wos_make "$WOS_MAKE_JOBS" -C "$NCURSES_WORK"
 # recursive install serially: parallel headers.sh instances name temporary
 # files from short-lived PIDs and can remove one another's headers.sed file.
 for install_target in install.libs install.includes install.data; do
-    wos_make 1 -C "$NCURSES_WORK" \
+    if ! wos_make 1 -C "$NCURSES_WORK" \
         DESTDIR="$TARGET_SYSROOT" \
-        "$install_target"
+        "$install_target"; then
+        if [ "$HOST_SYSTEM" != "WOS" ]; then
+            exit 1
+        fi
+        # Native WOS can transiently report ENOENT while headers.sh removes
+        # its PID-named temporary after a successful install. The targets are
+        # idempotent, so retry the same serial target once.
+        echo "Retrying ncurses $install_target after transient WOS install failure..." >&2
+        wos_make 1 -C "$NCURSES_WORK" \
+            DESTDIR="$TARGET_SYSROOT" \
+            "$install_target"
+    fi
 done
 
 if [ -f "$TARGET_SYSROOT/bin/ncursesw6-config" ]; then
