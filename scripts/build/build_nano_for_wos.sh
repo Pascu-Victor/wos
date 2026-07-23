@@ -340,6 +340,7 @@ wos_timed_step "configure" "nano" \
     --datarootdir=/share \
     --datadir=/share \
     --mandir=/share/man \
+    --disable-dependency-tracking \
     --disable-nls \
     --disable-libmagic \
     --disable-speller \

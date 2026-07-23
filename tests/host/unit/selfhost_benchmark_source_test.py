@@ -339,6 +339,7 @@ def test_wos_toolchain_stages_configured_build_roots() -> None:
         ],
         "build_nano_for_wos.sh": [
             'wos_timed_step "configure" "nano"',
+            "--disable-dependency-tracking",
             "wos_stage_distributed_build_roots",
             'wos_make "$WOS_MAKE_JOBS" -C "$NANO_WORK"',
         ],
