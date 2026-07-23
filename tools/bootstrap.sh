@@ -79,6 +79,7 @@ write_clang_wrapper() {
     local system_clang="$2"
     local resource_dir="$3"
     local distributed_stage="${output}.distributed-stage"
+    local distributed_staged_launcher="${output}.distributed-staged"
 
     cat > "$distributed_stage" << 'EOF'
 #!/bin/bash
@@ -107,6 +108,20 @@ if ! cp -- "$local_output" "$host_output"; then
 fi
 EOF
     chmod +x "$distributed_stage"
+
+    cat > "$distributed_staged_launcher" << 'EOF'
+#!/bin/bash
+set -eu
+
+route_file="$1"
+shift
+route_args=()
+while IFS= read -r route_arg; do
+    route_args+=("$route_arg")
+done < "$route_file"
+exec forward --clear "${route_args[@]}" -- locally "$@"
+EOF
+    chmod +x "$distributed_staged_launcher"
 
     cat > "$output" << EOF
 #!/bin/bash
@@ -303,14 +318,14 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
                 echo "ERROR: staged distributed compiler has no local root manifest" >&2
                 exit 1
             fi
-            compiler_remote_command=(forward --clear)
+            compiler_route_args=()
             # Drop the outer self-host command's forwarding policy before
             # installing this compiler job's minimal policy. Carrying both
             # policies can overflow WKI's single-frame task-submit payload once
             # enough source roots have been staged. Every peer has the same
             # packaged compiler/runtime, so keep those paths peer-local.
             for compiler_local_system_root in /usr /bin /lib /lib64 /libexec /share /etc /proc /dev /run /tmp; do
-                compiler_remote_command+=("-\$compiler_local_system_root")
+                compiler_route_args+=("-\$compiler_local_system_root")
             done
             while IFS= read -r compiler_local_root; do
                 case "\$compiler_local_root" in
@@ -329,7 +344,7 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
                             echo "ERROR: staged distributed compiler root is too long for a WKI VFS rule: \$compiler_local_root" >&2
                             exit 1
                         fi
-                        compiler_remote_command+=("-\$compiler_local_root")
+                        compiler_route_args+=("-\$compiler_local_root")
                         ;;
                     *)
                         compiler_slot_release
@@ -356,7 +371,7 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
                     echo "ERROR: staged compiler route is too long for a WKI VFS rule: \$compiler_route" >&2
                     return 1
                 fi
-                compiler_remote_command+=("+\$compiler_route")
+                compiler_route_args+=("+\$compiler_route")
             }
             compiler_add_home_route "\$compiler_state" || exit 1
             compiler_add_home_route "\$compiler_responses" || exit 1
@@ -421,12 +436,24 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
                 fi
                 compiler_add_home_route "\$compiler_output_directory" || exit 1
             fi
-            # Apply the minimal policy on the submitter before `on` marks the
-            # next exec remote. Otherwise WKI must serialize the inherited
-            # policy and this helper's complete rule argv just to launch
-            # `forward`, which can overflow one task-submit frame before
-            # --clear ever executes.
-            compiler_remote_command+=(-- on "\$compiler_host" locally)
+            compiler_route_response="\$(mktemp "\$compiler_responses/routes.XXXXXX")"
+            if [ -z "\$compiler_route_response" ]; then
+                compiler_slot_release
+                trap - EXIT HUP INT TERM
+                echo "ERROR: staged distributed compiler route file could not be created" >&2
+                exit 1
+            fi
+            if ! printf '%s\n' "\${compiler_route_args[@]}" > "\$compiler_route_response"; then
+                compiler_slot_release
+                trap - EXIT HUP INT TERM
+                echo "ERROR: staged distributed compiler route file could not be written" >&2
+                exit 1
+            fi
+            # Submit only a fixed launcher and two response-file paths. The
+            # launcher installs the route policy after it is already running
+            # on the peer, so recursive-build process context cannot inflate
+            # TASK_SUBMIT beyond WKI's single-frame payload limit.
+            compiler_remote_command=(on "\$compiler_host" /usr/bin/bash "$distributed_staged_launcher" "\$compiler_route_response")
         else
             compiler_remote_command=(on "\$compiler_host")
         fi

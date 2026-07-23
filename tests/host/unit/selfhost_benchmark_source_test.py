@@ -159,8 +159,9 @@ def test_wos_bootstrap_distributes_only_compiler_processes() -> None:
             r'compiler_slots="\$compiler_state.source-slots"',
             r'compiler_start_index="\$((RANDOM % \${#compiler_hosts[@]}))"',
             r'compiler_start_index="\$(((compiler_start_index + 1) % \${#compiler_hosts[@]}))"',
-            r'compiler_remote_command=(forward --clear)',
-            r'compiler_remote_command+=(-- on "\$compiler_host" locally)',
+            r'compiler_route_response="\$(mktemp "\$compiler_responses/routes.XXXXXX")"',
+            r'''printf '%s\n' "\${compiler_route_args[@]}" > "\$compiler_route_response"''',
+            r'compiler_remote_command=(on "\$compiler_host" /usr/bin/bash',
             r'compiler_remote_command=(on "\$compiler_host")',
             r'for compiler_local_system_root in /usr /bin /lib /lib64 /libexec /share /etc /proc /dev /run /tmp; do',
             r'compiler_add_home_route "\$compiler_state"',
@@ -723,7 +724,7 @@ printf '%s\n' "$@" > "$trace"
 [ "$1" = --clear ]
 while [ "$1" != -- ]; do shift; done
 shift
-[ "$1" = on ]
+[ "$1" = locally ]
 exec "$@"
 '''.replace("TRACE_PATH", shlex.quote(str(trace))),
             encoding="ascii",
@@ -734,8 +735,6 @@ exec "$@"
             r'''#!/bin/bash
 set -eu
 [ "$1" = wos-1 ]
-shift
-[ "$1" = locally ]
 shift
 exec "$@"
 ''',
@@ -776,8 +775,6 @@ grep -Fx -- "+$1/explicit.d" "$1/on.args"
 grep -Fx -- "+$1/compile.json" "$1/on.args"
 grep -Fx -- "+$1/diagnostics.dia" "$1/on.args"
 grep -Fx -- "+$1/module-cache" "$1/on.args"
-grep -Fx -- on "$1/on.args"
-grep -Fx -- wos-1 "$1/on.args"
 grep -Fx -- locally "$1/on.args"
 rm -rf -- "$1/compiler-state.source-slots/1"
 mkdir -p "$1/compiler-state.source-slots/0/0"
