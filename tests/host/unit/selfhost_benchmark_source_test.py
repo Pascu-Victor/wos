@@ -159,6 +159,7 @@ def test_wos_bootstrap_distributes_only_compiler_processes() -> None:
             r'compiler_start_index="\$((RANDOM % \${#compiler_hosts[@]}))"',
             r'compiler_start_index="\$(((compiler_start_index + 1) % \${#compiler_hosts[@]}))"',
             r'compiler_remote_command=(on "\$compiler_host")',
+            r'for compiler_local_system_root in /usr /bin /lib /lib64 /libexec /share /etc /proc /dev /run /tmp; do',
             r'compiler_remote_command+=(-- locally)',
             r'compiler_add_home_route "\$compiler_state"',
             r'compiler_add_home_route "\$output_file"',
@@ -753,6 +754,9 @@ test -s "$1/explicit.d"
 test -s "$1/compile.json"
 test -s "$1/diagnostics.dia"
 grep -Fx -- "-$1/source-root" "$1/on.args"
+grep -Fx -- -/usr "$1/on.args"
+grep -Fx -- -/lib "$1/on.args"
+grep -Fx -- -/tmp "$1/on.args"
 grep -Fx -- "+$1/compiler-state" "$1/on.args"
 grep -Fx -- "+$1/output.o" "$1/on.args"
 grep -Fx -- "+$1/explicit.d" "$1/on.args"

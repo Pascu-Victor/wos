@@ -304,6 +304,14 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
                 exit 1
             fi
             compiler_remote_command+=(forward)
+            # The outer self-host command routes system prefixes homeward so
+            # any nested remote task can still use VM0's environment. A staged
+            # compiler must reverse those inherited rules: every peer has the
+            # same packaged compiler/runtime, and fetching them from VM0 puts
+            # otherwise runnable Clang processes to sleep in remote VFS.
+            for compiler_local_system_root in /usr /bin /lib /lib64 /libexec /share /etc /proc /dev /run /tmp; do
+                compiler_remote_command+=("-\$compiler_local_system_root")
+            done
             while IFS= read -r compiler_local_root; do
                 case "\$compiler_local_root" in
                     /*)
