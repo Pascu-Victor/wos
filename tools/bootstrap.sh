@@ -86,14 +86,19 @@ set -u
 
 stream_marker="$1"
 expected_sha256="$2"
-host_response="$3"
-local_input="$4"
-local_response="$5"
-local_output="$6"
-host_output="$7"
-shift 7
+host_ready="$3"
+host_response="$4"
+local_input="$5"
+local_response="$6"
+local_output="$7"
+host_output="$8"
+shift 8
 
 trap 'rm -f -- "$local_input" "$local_response" "$local_output" 2>/dev/null || true' EXIT HUP INT TERM
+
+if ! printf 'ready\n' > "$host_ready"; then
+    exit 1
+fi
 
 stream_marker_found=0
 while IFS= read -r stream_line; do
@@ -103,12 +108,14 @@ while IFS= read -r stream_line; do
     fi
 done
 if [ "$stream_marker_found" -ne 1 ] || ! cat > "$local_input"; then
+    echo "distributed compiler input stream marker was not received" >&2
     exit 1
 fi
 actual_sha256="$(sha256sum "$local_input" 2>/dev/null)"
 actual_sha256="${actual_sha256%% *}"
 if [ -z "$actual_sha256" ] || [ "$actual_sha256" != "$expected_sha256" ] || \
         ! cp -- "$host_response" "$local_response"; then
+    echo "distributed compiler input stream checksum failed" >&2
     exit 1
 fi
 compiler_status=0
@@ -589,7 +596,7 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
             fi
         }
         compiler_input_cleanup() {
-            rm -f -- "\$compiler_input" "\$compiler_stage" 2>/dev/null || true
+            rm -f -- "\$compiler_input" "\$compiler_stage" "\${compiler_ready:-}" 2>/dev/null || true
             rmdir "\$compiler_job_dir" 2>/dev/null || true
         }
         compiler_input_and_slot_cleanup() {
@@ -701,6 +708,8 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
             exit "\$compiler_status"
         fi
         compiler_response="\$compiler_job_dir.response"
+        compiler_ready="\$compiler_job_dir/ready"
+        rm -f -- "\$compiler_ready" 2>/dev/null || true
         if ! : > "\$compiler_response"; then
             compiler_input_cleanup
             compiler_slot_release
@@ -731,11 +740,22 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
             exit 1
         fi
         compiler_stream_marker="WOS_DISTRIBUTED_INPUT_\${compiler_candidate_index}_\$\$"
-        { printf '%65536s\n%s\n' '' "\$compiler_stream_marker"; cat -- "\$compiler_input"; } | \
+        {
+            compiler_ready_wait=0
+            while [ ! -s "\$compiler_ready" ] && [ "\$compiler_ready_wait" -lt 10000 ]; do
+                compiler_ready_wait="\$((compiler_ready_wait + 1))"
+                "\${compiler_slot_pause[@]}"
+            done
+            if [ ! -s "\$compiler_ready" ]; then
+                exit 1
+            fi
+            printf '%4096s\n%s\n' '' "\$compiler_stream_marker"
+            cat -- "\$compiler_input"
+        } | \
             env -i PATH="\$compiler_remote_path" HOME="\${HOME:-/root}" TMPDIR="\${TMPDIR:-/tmp}" TZ=UTC0 \
                 on "\$compiler_host" forward "+\$compiler_responses" -- \
                 locally bash "\$compiler_stage" "\$compiler_stream_marker" "\$compiler_input_sha256" \
-                "\$compiler_response" \
+                "\$compiler_ready" "\$compiler_response" \
                 "\$compiler_remote_input" "\$compiler_remote_response" "\$compiler_remote_output" \
                 "\$compiler_output_dest" "\${compiler[@]}" -fno-temp-file
         compiler_pipeline_status=("\${PIPESTATUS[@]}")

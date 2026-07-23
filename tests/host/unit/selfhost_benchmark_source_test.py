@@ -202,7 +202,8 @@ def test_wos_bootstrap_distributes_only_compiler_processes() -> None:
             r'env -i PATH="\$compiler_remote_path" HOME="\${HOME:-/root}" TMPDIR="\${TMPDIR:-/tmp}" TZ=UTC0',
             r'on "\$compiler_host" forward "+\$compiler_responses" --',
             r'compiler_stream_marker="WOS_DISTRIBUTED_INPUT_\${compiler_candidate_index}_\$\$"',
-            r'''printf '%65536s\n%s\n' '' "\$compiler_stream_marker"''',
+            r'while [ ! -s "\$compiler_ready" ] && [ "\$compiler_ready_wait" -lt 10000 ]; do',
+            r'''printf '%4096s\n%s\n' '' "\$compiler_stream_marker"''',
             r'locally bash "\$compiler_stage" "\$compiler_stream_marker" "\$compiler_input_sha256"',
             r'"\${compiler[@]}" -fno-temp-file',
             r'rm -f -- "\$compiler_input"',
@@ -274,6 +275,7 @@ done
             r'''#!/bin/bash
 set -u
 host="$1"
+printf 'ready\n' > "${10}"
 state=MOCK_STATE_PATH
 lock="$state.lock"
 while ! mkdir "$lock" 2>/dev/null; do :; done
@@ -356,11 +358,11 @@ set -u
 [ "${TZ:-}" = UTC0 ]
 shift
 [ "$1" = forward ]
-[ "$2" = "+$(dirname "$9")" ]
+[ "$2" = "+$(dirname "${10}")" ]
 [ "$3" = -- ]
 [ "$4" = locally ]
 [ "$5" = bash ]
-response="$9"
+response="${10}"
 if grep -F -- CPP_SOURCE_PATH "$response" >/dev/null || \
         grep -F -- C_SOURCE_PATH "$response" >/dev/null; then
     echo "remote compiler response still names the original source" >&2
@@ -611,7 +613,7 @@ def test_wos_bootstrap_retries_failed_remote_compiler_locally() -> None:
     with tempfile.TemporaryDirectory() as temp_dir:
         temp = Path(temp_dir)
         mock_on = temp / "on"
-        mock_on.write_text("#!/bin/bash\nexit 1\n", encoding="ascii")
+        mock_on.write_text("#!/bin/bash\nprintf 'ready\\n' > \"${10}\"\nexit 1\n", encoding="ascii")
         mock_on.chmod(0o755)
         mock_compiler = temp / "system-clang"
         mock_compiler.write_text(
