@@ -1438,12 +1438,21 @@ void finalize_proxy_task(ker::mod::sched::task::Task* proxy, int32_t exit_status
     proxy->exit_notify_ready.store(true, std::memory_order_release);
     proxy->wki_proxy_task_id = 0;
 
+    cleanup_proxy_resources(proxy);
+
+    // Publish the proxy in the dead registry before notifying waiters. A
+    // TASK_COMPLETE can race a parent that is still committing its waitpid
+    // park. If that early completion is fenced by deferred_task_switch, the
+    // scheduler's retry must be able to discover the now-waitable child.
+    proxy->death_epoch.store(ker::mod::sched::EpochManager::current_epoch(), std::memory_order_release);
+    proxy->state.store(ker::mod::sched::task::TaskState::DEAD, std::memory_order_release);
+    ker::mod::sched::insert_into_dead_list(proxy);
+
     // Send SIGCHLD to parent and wake it if blocked in waitpid(-1, ...).
     // The normal exit path (wos_proc_exit) does this, but proxy tasks never
     // go through wos_proc_exit — they are finalized here when TASK_COMPLETE
-    // arrives.  Without SIGCHLD the parent (e.g. busybox shell calling
-    // waitpid(-1,...)) would block forever because nobody added it to
-    // proxy->awaitee_on_exit.
+    // arrives.  Notification must follow dead-list publication so a parent
+    // whose direct completion is still publish-fenced can repair the wait.
     if (!proxy->is_thread && proxy->parent_pid != 0) {
         auto* parent = ker::mod::sched::find_task_by_pid_safe(proxy->parent_pid);
         if (parent != nullptr) {
@@ -1471,11 +1480,6 @@ void finalize_proxy_task(ker::mod::sched::task::Task* proxy, int32_t exit_status
     }
 
     wake_proxy_waiters(proxy, exit_status);
-    cleanup_proxy_resources(proxy);
-
-    proxy->death_epoch.store(ker::mod::sched::EpochManager::current_epoch(), std::memory_order_release);
-    proxy->state.store(ker::mod::sched::task::TaskState::DEAD, std::memory_order_release);
-    ker::mod::sched::insert_into_dead_list(proxy);
 }
 
 struct SubmitContextInfo {

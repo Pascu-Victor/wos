@@ -121,6 +121,24 @@ def test_proxy_wait_completion_respects_waitpid_publish_fence() -> None:
         fail("parent wait-any proxy completion must complete through the publish-fenced helper")
     if "parent->waiting_for_pid == WAIT_ANY_CHILD && !parent->deferred_task_switch" in finalize_body:
         fail("parent wait-any proxy completion must not bypass waitpid_publish_pending")
+    require_order(
+        finalize_body,
+        "cleanup_proxy_resources(proxy)",
+        "ker::mod::sched::insert_into_dead_list(proxy)",
+        "proxy resources must be released before the exit becomes observable",
+    )
+    require_order(
+        finalize_body,
+        "ker::mod::sched::insert_into_dead_list(proxy)",
+        "parent->signal_add_pending_mask",
+        "proxy exit must be globally waitable before parent notification",
+    )
+    require_order(
+        finalize_body,
+        "ker::mod::sched::insert_into_dead_list(proxy)",
+        "wake_proxy_waiters(proxy, exit_status)",
+        "specific proxy waiters must wake after dead-list publication",
+    )
 
     if "wki_remote_compute_selftest_proxy_wait_completion_respects_publish_fence" not in source:
         fail("remote-compute KTEST selftest must cover proxy wait publish fencing")
@@ -1133,8 +1151,7 @@ def test_proxy_waiting_publication_is_transactional() -> None:
         [
             "global_task_registry_lock.lock_irqsave()",
             "active_task_count >= MAX_ACTIVE_TASKS",
-            "EXISTING == task",
-            "EXISTING->pid == task->pid",
+            "task->active_registry_index != ::ker::mod::sched::task::Task::ACTIVE_REGISTRY_INDEX_INVALID",
             'panic_handler("scheduler: fresh task already present in active registry")',
             "entry.pid == task->pid",
             "entry.task == task",
@@ -1142,8 +1159,9 @@ def test_proxy_waiting_publication_is_transactional() -> None:
             "pid_index == MAX_PIDS",
             "pid_slot(pid_index).task = task",
             "pid_slot(pid_index).pid = task->pid",
-            "active_task_slot(active_task_count) = task",
-            "active_task_count++",
+            "uint32_t const ACTIVE_INDEX = active_task_count++",
+            "active_task_slot(ACTIVE_INDEX) = task",
+            "task->active_registry_index = ACTIVE_INDEX",
             "global_task_registry_lock.unlock_irqrestore(FLAGS)",
         ],
         "atomic fresh-task registry publication",
@@ -1156,8 +1174,8 @@ def test_proxy_waiting_publication_is_transactional() -> None:
     )
     require_order(
         registration,
-        "EXISTING->pid == task->pid",
-        "active_task_slot(active_task_count) = task",
+        "task->active_registry_index != ::ker::mod::sched::task::Task::ACTIVE_REGISTRY_INDEX_INVALID",
+        "active_task_slot(ACTIVE_INDEX) = task",
         "fresh-task active collision check before registry commit",
     )
     commit = registration[registration.find("pid_slot(pid_index).task = task") :]
@@ -1165,7 +1183,7 @@ def test_proxy_waiting_publication_is_transactional() -> None:
     require_order(
         commit,
         "pid_slot(pid_index).pid = task->pid",
-        "active_task_slot(active_task_count) = task",
+        "active_task_slot(ACTIVE_INDEX) = task",
         "PID commit before active-list commit under one lock",
     )
     require_order(
