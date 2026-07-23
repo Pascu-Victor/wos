@@ -1,11 +1,26 @@
+#include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <minimalist_malloc/bitmap.hpp>
 #include <test/ktest.hpp>
 #include <util/hashtable.hpp>
 #include <util/object_pool.hpp>
 #include <util/radix_tree.hpp>
 #include <util/smallvec.hpp>
+
+// ---------------------------------------------------------------------------
+// String tests
+// ---------------------------------------------------------------------------
+
+KTEST(String, StrncmpStopsAtNul) {
+    std::array<char, 4> lhs{'a', '\0', 'x', '\0'};
+    std::array<char, 4> rhs{'a', '\0', 'y', '\0'};
+    using StrncmpFn = int (*)(const char*, const char*, std::size_t);
+    StrncmpFn volatile runtime_strncmp = static_cast<StrncmpFn>(&std::strncmp);
+
+    KEXPECT_EQ(runtime_strncmp(lhs.data(), rhs.data(), lhs.size()), 0);
+}
 
 // ---------------------------------------------------------------------------
 // Bitmap tests

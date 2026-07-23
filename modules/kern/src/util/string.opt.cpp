@@ -172,9 +172,14 @@ auto strcmp(const char* str1, const char* str2) -> int {
 }
 
 auto strncmp(const char* str1, const char* str2, size_t n) -> int {
-    for (size_t i = 0; i < n; i++) {
-        if (str1[i] != str2[i]) {
-            return str1[i] - str2[i];
+    for (size_t i = 0; i < n; ++i) {
+        auto const LEFT = static_cast<unsigned char>(str1[i]);
+        auto const RIGHT = static_cast<unsigned char>(str2[i]);
+        if (LEFT != RIGHT) {
+            return static_cast<int>(LEFT) - static_cast<int>(RIGHT);
+        }
+        if (LEFT == '\0') {
+            return 0;
         }
     }
     return 0;
