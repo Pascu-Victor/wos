@@ -115,7 +115,9 @@ set -eu
 
 route_file="$1"
 compiler_cwd="$2"
-shift 2
+local_output="$3"
+host_output="$4"
+shift 4
 route_args=()
 while IFS= read -r route_arg; do
     route_args+=("$route_arg")
@@ -123,10 +125,29 @@ done < "$route_file"
 exec forward --clear "${route_args[@]}" -- locally /usr/bin/bash -c '
 set -eu
 compiler_cwd="$1"
-shift
+local_output="$2"
+host_output="$3"
+shift 3
+trap '"'"'rm -f -- "$local_output" 2>/dev/null || true'"'"' EXIT HUP INT TERM
+rm -f -- "$local_output"
 cd -- "$compiler_cwd"
-exec "$@"
-' distributed-staged "$compiler_cwd" "$@"
+compiler_status=0
+"$@" -o "$local_output" || compiler_status=$?
+if [ "$compiler_status" -ne 0 ]; then
+    echo "distributed staged compiler command failed with status $compiler_status" >&2
+    exit "$compiler_status"
+fi
+copy_attempt=1
+while ! cp -- "$local_output" "$host_output"; do
+    if [ "$copy_attempt" -ge 3 ]; then
+        echo "distributed staged compiler output copy failed after $copy_attempt attempts" >&2
+        exit 1
+    fi
+    echo "warning: distributed staged compiler output copy failed attempt $copy_attempt/3; retrying" >&2
+    sleep 1
+    copy_attempt=$((copy_attempt + 1))
+done
+' distributed-staged "$compiler_cwd" "$local_output" "$host_output" "$@"
 EOF
     chmod +x "$distributed_staged_launcher"
 
@@ -329,12 +350,29 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
         fi
         # Keep response files until the scratch workdir is removed. Concurrent
         # forwarded unlink operations can leave peers with stale lookups.
+        compiler_skip_output_arg=0
         for arg in "\$@"; do
+            if [ "\$compiler_transport" = staged ]; then
+                if [ "\$compiler_skip_output_arg" -eq 1 ]; then
+                    compiler_skip_output_arg=0
+                    continue
+                fi
+                case "\$arg" in
+                    -o)
+                        compiler_skip_output_arg=1
+                        continue
+                        ;;
+                esac
+            fi
             if ! printf '%q\n' "\$arg" >> "\$compiler_response"; then
                 echo "ERROR: distributed compiler response file could not be written" >&2
                 exit 1
             fi
         done
+        if [ "\$compiler_skip_output_arg" -eq 1 ]; then
+            echo "ERROR: distributed compiler output option is missing its path" >&2
+            exit 1
+        fi
         compiler_remote_path="\${PATH:-/usr/bin:/bin}"
         compiler_remote_command=()
         if [ "\$compiler_transport" = staged ]; then
@@ -400,6 +438,11 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
                 fi
                 compiler_route_args+=("+\$compiler_route")
             }
+            # Build systems create generated headers after their roots are
+            # snapshotted. Keep the immutable source/sysroot roots peer-local,
+            # but resolve the mutable build working tree on the submitter so a
+            # later Ninja/Make generator edge is immediately visible.
+            compiler_add_home_route "\$PWD" || exit 1
             compiler_add_home_route "\$compiler_state" || exit 1
             compiler_add_home_route "\$compiler_responses" || exit 1
             compiler_add_home_route "\$output_file" || exit 1
@@ -455,13 +498,25 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
                     *) compiler_dependency_route="\$compiler_dependency_route.d" ;;
                 esac
                 compiler_add_home_route "\$compiler_dependency_route" || exit 1
+                if ! printf '%q\n' -MF "\$compiler_dependency_route" >> "\$compiler_response"; then
+                    echo "ERROR: staged distributed compiler dependency route could not be written" >&2
+                    exit 1
+                fi
             fi
             if [ "\$compiler_has_implicit_module_output" -eq 1 ] && [ -n "\$output_file" ]; then
-                compiler_output_directory="\${output_file%/*}"
-                if [ "\$compiler_output_directory" = "\$output_file" ]; then
-                    compiler_output_directory="\$PWD"
+                # Clang derives an implicit module filename from -o. Replacing
+                # that output with a peer-local temporary would change or lose
+                # the module artifact, so retain the original local semantics
+                # for this uncommon compile shape.
+                compiler_slot_release
+                trap - EXIT HUP INT TERM
+                if "\${compiler[@]}" "\$@"; then
+                    compiler_status=0
+                    compiler_record_success 0 "\${compiler_hosts[0]}"
+                else
+                    compiler_status=\$?
                 fi
-                compiler_add_home_route "\$compiler_output_directory" || exit 1
+                exit "\$compiler_status"
             fi
             compiler_route_response="\$(mktemp "\$compiler_responses/routes.XXXXXX")"
             if [ -z "\$compiler_route_response" ]; then
@@ -476,13 +531,20 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
                 echo "ERROR: staged distributed compiler route file could not be written" >&2
                 exit 1
             fi
-            # Submit only a fixed launcher, the original cwd, and two
-            # response-file paths. Start from the peer's guaranteed root
-            # directory; the launcher installs the route policy before
-            # entering the submitter's build directory. Recursive-build
-            # process context therefore cannot inflate TASK_SUBMIT, and Bash
-            # never starts in a peer-local path that does not exist.
-            compiler_remote_command=(forward --clear -- on "\$compiler_host" /usr/bin/bash "$distributed_staged_launcher" "\$compiler_route_response" "\$PWD")
+            # Compile the object into peer-local /tmp, then copy the completed
+            # file through the explicit home route. Streaming every object
+            # write through remote VFS saturates the submitter and leaves peer
+            # CPUs idle. The candidate index and submitter PID are unique for
+            # every simultaneously active wrapper on a peer.
+            compiler_remote_output="/tmp/wos-distributed-staged.\$compiler_candidate_index.\$\$.output"
+            # Submit only a fixed launcher, the original cwd, the two output
+            # paths, and the response-file path. Start from the peer's
+            # guaranteed root directory; the launcher installs the route
+            # policy before entering the submitter's build directory.
+            compiler_remote_command=(
+                forward --clear -- on "\$compiler_host" /usr/bin/bash "$distributed_staged_launcher"
+                "\$compiler_route_response" "\$PWD" "\$compiler_remote_output" "\$output_file"
+            )
         else
             compiler_remote_command=(on "\$compiler_host")
         fi

@@ -177,14 +177,24 @@ def test_wos_bootstrap_distributes_only_compiler_processes() -> None:
             r'compiler_start_index="\$((1 + compiler_start_index % compiler_remote_host_count))"',
             r'compiler_route_response="\$(mktemp "\$compiler_responses/routes.XXXXXX")"',
             r'''printf '%s\n' "\${compiler_route_args[@]}" > "\$compiler_route_response"''',
-            r'compiler_remote_command=(forward --clear -- on "\$compiler_host" /usr/bin/bash',
-            r'''compiler_remote_command=(forward --clear -- on "\$compiler_host" /usr/bin/bash "$distributed_staged_launcher" "\$compiler_route_response" "\$PWD")''',
+            r'forward --clear -- on "\$compiler_host" /usr/bin/bash',
+            r'compiler_remote_output="/tmp/wos-distributed-staged.\$compiler_candidate_index.\$\$.output"',
+            r'"\$compiler_route_response" "\$PWD" "\$compiler_remote_output" "\$output_file"',
+            '''"$@" -o "$local_output"''',
+            '''cp -- "$local_output" "$host_output"''',
+            "distributed staged compiler command failed with status",
+            "distributed staged compiler output copy failed after",
             r'if [ "\$compiler_transport" = staged ]; then',
             r'cd / || exit 1',
             r'compiler_remote_command=(on "\$compiler_host")',
             r'for compiler_local_system_root in /usr /bin /lib /lib64 /libexec /share /etc /proc /dev /run /tmp; do',
+            r'compiler_add_home_route "\$PWD"',
             r'compiler_add_home_route "\$compiler_state"',
             r'compiler_add_home_route "\$output_file"',
+            r'compiler_skip_output_arg=0',
+            r'if [ "\$compiler_skip_output_arg" -eq 1 ]; then',
+            r'''printf '%q\n' -MF "\$compiler_dependency_route" >> "\$compiler_response"''',
+            "Clang derives an implicit module filename from -o",
             r'-Wp,-MD,*|-Wp,-MMD,*)',
             r'-serialize-diagnostics=*|-fmodule-output=*|-fmodules-cache-path=*)',
             r'"\${compiler_remote_command[@]}" "\${compiler[@]}" -fno-temp-file "@\$compiler_response"',
@@ -956,6 +966,7 @@ test -s "$1/explicit.d"
 test -s "$1/compile.json"
 test -s "$1/diagnostics.dia"
 grep -Fx -- "-$1/source-root" "$1/on.args"
+grep -Fx -- "+$1/source-root" "$1/on.args"
 grep -Fx -- -/usr "$1/on.args"
 grep -Fx -- -/lib "$1/on.args"
 grep -Fx -- -/tmp "$1/on.args"
