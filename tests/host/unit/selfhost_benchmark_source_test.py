@@ -180,7 +180,10 @@ def test_wos_bootstrap_distributes_only_compiler_processes() -> None:
             r'"\${compiler[@]}" "\$@" "\${compiler_preprocess_args[@]}" -o "\$compiler_input" -Wno-unused-command-line-argument',
             r'compiler_input_size="\$(stat -c %s -- "\$compiler_input" 2>/dev/null || true)"',
             r'compiler_preprocess_args+=(-frewrite-includes)',
-            r'compiler_forward_args+=(-x "\$compiler_remote_language" -Wno-unused-command-line-argument "\$compiler_input")',
+            r'compiler_remote_input="\$compiler_remote_stem.input"',
+            r'compiler_remote_response="\$compiler_remote_stem.response"',
+            r'compiler_remote_output="\$compiler_remote_stem.output"',
+            r'compiler_forward_args+=(-o "\$compiler_remote_output" -x "\$compiler_remote_language"',
             r'if [ "\$compiler_input_size" -lt "\$compiler_min_preprocessed_bytes" ]; then',
             r'"\${compiler[@]}" "\$@"',
             r'compiler_candidate_slot="\$compiler_host_slots/\$compiler_slot_index"',
@@ -198,7 +201,8 @@ def test_wos_bootstrap_distributes_only_compiler_processes() -> None:
             r'for arg in "\${compiler_forward_args[@]}"; do',
             r'env -i PATH="\$compiler_remote_path" HOME="\${HOME:-/root}" TMPDIR="\${TMPDIR:-/tmp}" TZ=UTC0',
             r'on "\$compiler_host" forward "+\$compiler_responses" --',
-            r'"\${compiler[@]}" -fno-temp-file "@\$compiler_response"',
+            r'locally bash "\$compiler_stage" "\$compiler_input" "\$compiler_response"',
+            r'"\${compiler[@]}" -fno-temp-file',
             r'rm -f -- "\$compiler_input"',
             r'compiler_slot_cleanup',
             r"warning: distributed compiler on \$compiler_host failed with status \$compiler_status; retrying locally",
@@ -349,11 +353,11 @@ set -u
 [ "${TZ:-}" = UTC0 ]
 shift
 [ "$1" = forward ]
-[ "$2" = "+$(dirname "${!#}")" ]
+[ "$2" = "+$(dirname "$8")" ]
 [ "$3" = -- ]
-shift 3
-response="${!#}"
-response="${response#@}"
+[ "$4" = locally ]
+[ "$5" = bash ]
+response="$8"
 if grep -F -- CPP_SOURCE_PATH "$response" >/dev/null || \
         grep -F -- C_SOURCE_PATH "$response" >/dev/null; then
     echo "remote compiler response still names the original source" >&2
@@ -371,9 +375,14 @@ if ! grep -Ex -- 'c|c\+\+' "$response" >/dev/null; then
     echo "remote compiler response does not select rewritten C/C++" >&2
     exit 92
 fi
+if ! grep -E -- '^/tmp/wos-distributed-compiler\.[0-9]+\.[0-9]+\.input$' "$response" >/dev/null; then
+    echo "remote compiler response does not select a peer-local staged input" >&2
+    exit 94
+fi
 mv CPP_SOURCE_PATH CPP_HIDDEN_SOURCE_PATH
 mv C_SOURCE_PATH C_HIDDEN_SOURCE_PATH
 mv HEADER_PATH HEADER_HIDDEN_PATH
+shift 3
 "$@"
 status=$?
 mv CPP_HIDDEN_SOURCE_PATH CPP_SOURCE_PATH
@@ -389,6 +398,9 @@ exit "$status"
             encoding="ascii",
         )
         mock_on.chmod(0o755)
+        mock_locally = temp / "locally"
+        mock_locally.write_text("#!/bin/bash\nexec \"$@\"\n", encoding="ascii")
+        mock_locally.chmod(0o755)
         source.write_text(
             r'''#include "header with spaces.h"
 #ifndef TEST_TEXT

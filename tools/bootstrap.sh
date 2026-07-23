@@ -78,6 +78,35 @@ write_clang_wrapper() {
     local output="$1"
     local system_clang="$2"
     local resource_dir="$3"
+    local distributed_stage="${output}.distributed-stage"
+
+    cat > "$distributed_stage" << 'EOF'
+#!/bin/bash
+set -u
+
+host_input="$1"
+host_response="$2"
+local_input="$3"
+local_response="$4"
+local_output="$5"
+host_output="$6"
+shift 6
+
+trap 'rm -f -- "$local_input" "$local_response" "$local_output" 2>/dev/null || true' EXIT HUP INT TERM
+
+if ! cp -- "$host_input" "$local_input" || ! cp -- "$host_response" "$local_response"; then
+    exit 1
+fi
+compiler_status=0
+"$@" "@$local_response" || compiler_status=$?
+if [ "$compiler_status" -ne 0 ]; then
+    exit "$compiler_status"
+fi
+if ! cp -- "$local_output" "$host_output"; then
+    exit 1
+fi
+EOF
+    chmod +x "$distributed_stage"
 
     cat > "$output" << EOF
 #!/bin/bash
@@ -530,6 +559,13 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
             echo "ERROR: distributed compiler job directory could not be created" >&2
             exit 1
         fi
+        compiler_stage="\$compiler_job_dir/stage"
+        if ! cp -- "$distributed_stage" "\$compiler_stage" || ! chmod +x "\$compiler_stage"; then
+            compiler_slot_release
+            trap - EXIT HUP INT TERM
+            echo "ERROR: distributed compiler stage helper could not be created" >&2
+            exit 1
+        fi
         compiler_input="\$compiler_job_dir/input"
         compiler_preprocess_slot=""
         compiler_preprocess_slot_release() {
@@ -539,7 +575,7 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
             fi
         }
         compiler_input_cleanup() {
-            rm -f -- "\$compiler_input" 2>/dev/null || true
+            rm -f -- "\$compiler_input" "\$compiler_stage" 2>/dev/null || true
             rmdir "\$compiler_job_dir" 2>/dev/null || true
         }
         compiler_input_and_slot_cleanup() {
@@ -591,6 +627,10 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
                 continue
             fi
             case "\$arg" in
+                -o)
+                    compiler_skip_arg=1
+                    continue
+                    ;;
                 -MD|-MMD|-MP|-MG)
                     continue
                     ;;
@@ -614,15 +654,27 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
             esac
             compiler_forward_args+=("\$arg")
         done
-        if [ -z "\$output_file" ]; then
+        compiler_output_dest="\$output_file"
+        if [ -z "\$compiler_output_dest" ]; then
             # Replacing the source with .../clang-job.XXXXXX/input changes
             # Clang's implicit object name. Preserve the original -c foo.c
             # contract for Autoconf probes and handwritten make rules.
             compiler_default_output="\${compiler_source##*/}"
             compiler_default_output="\${compiler_default_output%.*}.o"
-            compiler_forward_args+=(-o "\$compiler_default_output")
+            compiler_output_dest="\$compiler_default_output"
         fi
-        compiler_forward_args+=(-x "\$compiler_remote_language" -Wno-unused-command-line-argument "\$compiler_input")
+        # Remote VFS remains the authority for the checkout, but Clang should
+        # not page-fault through it while parsing a large rewritten translation
+        # unit. Stage the input and response into the selected peer's local
+        # /tmp, compile the object there, and copy only the completed object
+        # back to the submitter. The submitter PID is unique among concurrent
+        # wrappers, and each peer has an independent local namespace.
+        compiler_remote_stem="/tmp/wos-distributed-compiler.\$compiler_candidate_index.\$\$"
+        compiler_remote_input="\$compiler_remote_stem.input"
+        compiler_remote_response="\$compiler_remote_stem.response"
+        compiler_remote_output="\$compiler_remote_stem.output"
+        compiler_forward_args+=(-o "\$compiler_remote_output" -x "\$compiler_remote_language" \
+            -Wno-unused-command-line-argument "\$compiler_remote_input")
         if [ "\$compiler_input_size" -lt "\$compiler_min_preprocessed_bytes" ]; then
             compiler_input_and_slot_cleanup
             trap - EXIT HUP INT TERM
@@ -658,7 +710,9 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
         compiler_remote_path="\${PATH:-/usr/bin:/bin}"
         if env -i PATH="\$compiler_remote_path" HOME="\${HOME:-/root}" TMPDIR="\${TMPDIR:-/tmp}" TZ=UTC0 \
             on "\$compiler_host" forward "+\$compiler_responses" -- \
-            "\${compiler[@]}" -fno-temp-file "@\$compiler_response"; then
+            locally bash "\$compiler_stage" "\$compiler_input" "\$compiler_response" \
+            "\$compiler_remote_input" "\$compiler_remote_response" "\$compiler_remote_output" \
+            "\$compiler_output_dest" "\${compiler[@]}" -fno-temp-file; then
             compiler_status=0
         else
             compiler_status=\$?
