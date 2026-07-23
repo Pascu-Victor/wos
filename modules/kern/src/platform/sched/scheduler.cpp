@@ -621,6 +621,36 @@ inline auto waitpid_repair_due(const task::Task* waiter, uint64_t now_us) -> boo
     return now_us > LAST_REPAIR_US && now_us - LAST_REPAIR_US >= WAITPID_REPAIR_FALLBACK_MIN_US;
 }
 
+struct WaitpidRepairScanWindow {
+    uint32_t start{};
+    uint32_t size{};
+};
+
+inline auto waitpid_repair_scan_window(uint32_t wait_count, uint32_t cursor) -> WaitpidRepairScanWindow {
+    if (wait_count == 0) {
+        return {};
+    }
+    return {
+        .start = cursor % wait_count,
+        .size = std::min<uint32_t>(wait_count, static_cast<uint32_t>(PENDING_WAKE_LIMIT)),
+    };
+}
+
+inline auto waitpid_repair_scan_window_contains(WaitpidRepairScanWindow window, uint32_t index, uint32_t wait_count) -> bool {
+    if (window.size == 0 || index >= wait_count) {
+        return false;
+    }
+    uint32_t const ROTATED_INDEX = index >= window.start ? index - window.start : wait_count - window.start + index;
+    return ROTATED_INDEX < window.size;
+}
+
+inline auto waitpid_repair_next_scan_cursor(WaitpidRepairScanWindow window, uint32_t wait_count) -> uint32_t {
+    if (wait_count == 0) {
+        return 0;
+    }
+    return static_cast<uint32_t>((static_cast<uint64_t>(window.start) + window.size) % wait_count);
+}
+
 inline auto recover_stalled_waitpid_completion_claim(task::Task* waiter, uint64_t now_us) -> bool {
     if (waiter == nullptr || !waiter->wait_channel_is(task::WaitChannelKind::WAITPID) || waiter->waiting_for_pid == 0 ||
         !waiter->waitpid_completion_claimed.load(std::memory_order_acquire)) {
@@ -4555,6 +4585,8 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
             if (!TIMED_SCAN && rq->wait_list.head == nullptr) {
                 return;
             }
+            uint32_t const WAIT_COUNT = rq->wait_list.count;
+            WaitpidRepairScanWindow const WAITPID_REPAIR_WINDOW = waitpid_repair_scan_window(WAIT_COUNT, rq->waitpid_repair_scan_cursor);
 
             // Collect tasks to wake (can't modify list while iterating)
             PendingWakeList to_wake{};
@@ -4562,6 +4594,7 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
             uint64_t scan_iterations = 0;
             task::Task* t = rq->wait_list.head;
             while (t != nullptr) {
+                auto const WAIT_INDEX = static_cast<uint32_t>(scan_iterations);
                 scan_iterations++;
                 if (TIMED_SCAN && wake_count < PENDING_WAKE_LIMIT && t->wake_at_us != 0 && WAIT_SCAN_NOW_US >= t->wake_at_us) {
                     pending_wake_slot(to_wake, wake_count++) = t;
@@ -4575,12 +4608,14 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
                     }
                     pending_wake_slot(signal_wake, signal_wake_count++) = t;
                 }
-                if (waitpid_repair_count < PENDING_WAKE_LIMIT && waitpid_repair_due(t, WAIT_SCAN_NOW_US) && t->try_acquire()) {
+                if (waitpid_repair_scan_window_contains(WAITPID_REPAIR_WINDOW, WAIT_INDEX, WAIT_COUNT) &&
+                    waitpid_repair_count < PENDING_WAKE_LIMIT && waitpid_repair_due(t, WAIT_SCAN_NOW_US) && t->try_acquire()) {
                     t->waitpid_last_repair_us = WAIT_SCAN_NOW_US;
                     pending_wake_slot(waitpid_repair, waitpid_repair_count++) = t;
                 }
                 t = t->sched_next;
             }
+            rq->waitpid_repair_scan_cursor = waitpid_repair_next_scan_cursor(WAITPID_REPAIR_WINDOW, WAIT_COUNT);
             rq->wait_list_scan_iterations.fetch_add(scan_iterations, std::memory_order_relaxed);
             rq->wait_list_scan_passes.fetch_add(1, std::memory_order_relaxed);
             update_relaxed_max(rq->wait_list_scan_max, scan_iterations);
@@ -8409,10 +8444,18 @@ auto scheduler_selftest_waitpid_wait_publication_arms_repair() -> bool {
     waiter.waitpid_last_repair_us = 100;
     bool const REPAIR_BACKOFF_PRESERVED = !waitpid_repair_due(&waiter, 100 + WAITPID_REPAIR_FALLBACK_MIN_US - 1) &&
                                           waitpid_repair_due(&waiter, 100 + WAITPID_REPAIR_FALLBACK_MIN_US);
+    WaitpidRepairScanWindow const FIRST_WINDOW = waitpid_repair_scan_window(39, 0);
+    WaitpidRepairScanWindow const SECOND_WINDOW = waitpid_repair_scan_window(39, waitpid_repair_next_scan_cursor(FIRST_WINDOW, 39));
+    WaitpidRepairScanWindow const THIRD_WINDOW = waitpid_repair_scan_window(39, waitpid_repair_next_scan_cursor(SECOND_WINDOW, 39));
+    bool const REPAIR_SCAN_FAIR = FIRST_WINDOW.start == 0 && FIRST_WINDOW.size == PENDING_WAKE_LIMIT && SECOND_WINDOW.start == 16 &&
+                                  THIRD_WINDOW.start == 32 && waitpid_repair_scan_window_contains(THIRD_WINDOW, 38, 39) &&
+                                  waitpid_repair_scan_window_contains(THIRD_WINDOW, 0, 39) &&
+                                  !waitpid_repair_scan_window_contains(THIRD_WINDOW, 9, 39);
     wait_list_remove_all_locked(rq, &waiter);
     task::task_clear_waitpid_block_state(waiter);
     return ZERO_STAMP_REPAIR_DUE && ORPHAN_WITH_STALE_LINK_RECOGNIZED && ARMED && LINKED_WAITER_NOT_ORPHANED &&
-           UNLINKED_STAMPED_WAITER_RECOGNIZED && PRESERVED && REPAIR_BACKOFF_PRESERVED && rq->next_wait_deadline_us == 0;
+           UNLINKED_STAMPED_WAITER_RECOGNIZED && PRESERVED && REPAIR_BACKOFF_PRESERVED && REPAIR_SCAN_FAIR &&
+           rq->next_wait_deadline_us == 0;
 }
 
 auto scheduler_selftest_reserved_wake_precedes_handoff_commit() -> bool {

@@ -1711,6 +1711,8 @@ def test_timer_waitpid_repair_rechecks_stranded_waiters_without_sigchld() -> Non
     orphan_repair_body = function_body(source, "repair_one_orphaned_waitpid_from_registry")
     timer_body = function_body(source, "process_tasks")
     reschedule_body = function_body(source, "reschedule_task_for_cpu_once")
+    scan_window_body = function_body(source, "waitpid_repair_scan_window")
+    scan_contains_body = function_body(source, "waitpid_repair_scan_window_contains")
 
     require_tokens(
         source,
@@ -1769,6 +1771,22 @@ def test_timer_waitpid_repair_rechecks_stranded_waiters_without_sigchld() -> Non
         "every waitpid wait-list publication must carry a fallback repair deadline",
     )
     require_tokens(
+        scan_window_body,
+        [
+            "cursor % wait_count",
+            "std::min<uint32_t>(wait_count, static_cast<uint32_t>(PENDING_WAKE_LIMIT))",
+        ],
+        "bounded rotating waitpid repair window",
+    )
+    require_tokens(
+        scan_contains_body,
+        [
+            "index >= window.start ? index - window.start : wait_count - window.start + index",
+            "ROTATED_INDEX < window.size",
+        ],
+        "wrapping waitpid repair window membership",
+    )
+    require_tokens(
         orphan_predicate_body,
         [
             "candidate->scheduler_published.load(std::memory_order_acquire)",
@@ -1806,10 +1824,13 @@ def test_timer_waitpid_repair_rechecks_stranded_waiters_without_sigchld() -> Non
         timer_body,
         [
             "uint64_t const WAIT_SCAN_NOW_US = time::get_us();",
+            "waitpid_repair_scan_window(WAIT_COUNT, rq->waitpid_repair_scan_cursor)",
             "while (t != nullptr)",
             "TIMED_SCAN && wake_count < PENDING_WAKE_LIMIT",
+            "waitpid_repair_scan_window_contains(WAITPID_REPAIR_WINDOW, WAIT_INDEX, WAIT_COUNT)",
             "waitpid_repair_due(t, WAIT_SCAN_NOW_US) && t->try_acquire()",
             "t->waitpid_last_repair_us = WAIT_SCAN_NOW_US;",
+            "rq->waitpid_repair_scan_cursor = waitpid_repair_next_scan_cursor(WAITPID_REPAIR_WINDOW, WAIT_COUNT);",
             "recover_stalled_waitpid_completion_claim(waiter, WAIT_SCAN_NOW_US)",
             "if (complete_or_preserve_waitpid_block(waiter))",
             "reschedule_task_for_cpu(target_cpu, waiter);",

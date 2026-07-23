@@ -43,6 +43,7 @@ struct RunQueue {
     // Last timer timestamp (microseconds from HPET) for computing delta
     uint64_t last_tick_us{0};
     uint64_t next_wait_deadline_us{0};
+    uint32_t waitpid_repair_scan_cursor{0};
 
     // Linux-style CPU accounting buckets, stored in microseconds. These are
     // updated from timer/IRQ paths, so keep them allocation-free and lock-free.
