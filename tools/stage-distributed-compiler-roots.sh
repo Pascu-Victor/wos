@@ -69,6 +69,25 @@ for requested_root in "$@"; do
     archive_entries+=("${root#/}")
 done
 
+# WOS BusyBox tar currently drops leading ../ components from relative symlink
+# targets while extracting. Dereference trusted in-tree links when creating the
+# archive, but first prove that every followed target stays inside stage_base.
+for root in "${roots[@]}"; do
+    while IFS= read -r -d '' root_link; do
+        if ! root_link_target="$(realpath "$root_link")"; then
+            echo "ERROR: distributed compiler root contains a broken symlink: $root_link" >&2
+            exit 1
+        fi
+        case "$root_link_target" in
+            "$stage_base"/*) ;;
+            *)
+                echo "ERROR: distributed compiler root symlink escapes stage base: $root_link -> $root_link_target" >&2
+                exit 1
+                ;;
+        esac
+    done < <(find "$root" -type l -print0)
+done
+
 IFS=, read -r -a hosts <<< "$hosts_csv"
 if [ "${#hosts[@]}" -lt 2 ]; then
     echo "ERROR: staged compiler roots require at least two hosts" >&2
@@ -97,7 +116,7 @@ cleanup() {
 }
 trap cleanup EXIT HUP INT TERM
 
-tar -C / -cf "$archive" "${archive_entries[@]}"
+tar -h -C / -cf "$archive" "${archive_entries[@]}"
 
 stage_pids=()
 stage_names=()

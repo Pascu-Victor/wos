@@ -866,7 +866,7 @@ require_wos_selfhost_tools() {
     local tool
     for tool in \
         sh env make tar sed grep mktemp sha256sum xz yes sleep tail wc stat \
-        hostname realpath sort \
+        find hostname realpath sort \
         ld.lld lld llvm-ar llvm-ranlib llvm-nm llvm-objcopy llvm-strip \
         llvm-readelf llvm-objdump llvm-symbolizer llvm-tblgen clang-tblgen \
         llvm-as llvm-dis llvm-link llc opt; do

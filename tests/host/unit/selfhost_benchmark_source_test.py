@@ -806,6 +806,12 @@ def test_distributed_compiler_root_staging_is_guarded_and_atomic() -> None:
         root = stage_base / "checkout" / "modules"
         root.mkdir(parents=True)
         (root / "sentinel").write_text("staged\n", encoding="ascii")
+        linked_target = stage_base / "linked-target"
+        linked_target.mkdir()
+        (linked_target / "header.h").write_text("linked\n", encoding="ascii")
+        linked_dir = root / "nested" / "include"
+        linked_dir.mkdir(parents=True)
+        (linked_dir / "abi-bits").symlink_to("../../../../linked-target", target_is_directory=True)
         state = stage_base / "tmp" / "distributed-compiler"
         mock_bin = temp / "bin"
         mock_bin.mkdir()
@@ -851,6 +857,27 @@ exec "$@"
             fail("distributed root staging did not atomically publish a deduplicated manifest")
         if (root / "sentinel").read_text(encoding="ascii") != "staged\n":
             fail("distributed root staging did not restore the exact staged root")
+        staged_link = linked_dir / "abi-bits"
+        if staged_link.is_symlink() or (staged_link / "header.h").read_text(encoding="ascii") != "linked\n":
+            fail("distributed root staging did not safely dereference an in-tree relative symlink")
+
+        internal_escape = root / "escaping-link"
+        internal_escape.symlink_to(temp / "outside-internal", target_is_directory=True)
+        (temp / "outside-internal").mkdir()
+        before = manifest.read_text(encoding="ascii")
+        result = subprocess.run(
+            [str(STAGE_DISTRIBUTED_ROOTS), str(root)],
+            cwd=ROOT,
+            check=False,
+            text=True,
+            capture_output=True,
+            env=environment,
+        )
+        if result.returncode == 0 or "root symlink escapes stage base" not in result.stderr:
+            fail("distributed root staging followed an internal symlink escape")
+        if manifest.read_text(encoding="ascii") != before:
+            fail("rejected internal symlink staging changed the published manifest")
+        internal_escape.unlink()
 
         outside = temp / "outside"
         outside.mkdir()
