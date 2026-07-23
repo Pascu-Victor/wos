@@ -199,6 +199,13 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
             exit 1
             ;;
     esac
+    # A staged peer has a private build tree. Without an explicit -o path,
+    # Clang derives an object name in that private cwd and the submitter never
+    # receives it. Keep those legacy Makefile invocations local; explicit
+    # outputs and their side files are routed home below.
+    if [ "\$compiler_transport" = staged ] && [ -z "\$output_file" ]; then
+        exec "\${compiler[@]}" "\$@"
+    fi
     compiler_slot_has_usleep=0
     compiler_slot_pause_us=1000
     if command -v usleep >/dev/null 2>&1; then

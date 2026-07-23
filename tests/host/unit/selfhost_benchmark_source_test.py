@@ -162,6 +162,8 @@ def test_wos_bootstrap_distributes_only_compiler_processes() -> None:
             r'IFS=, read -r -a compiler_hosts <<< "\${WOS_DISTRIBUTED_COMPILER_HOSTS:-}"',
             r'compiler_transport="\${WOS_DISTRIBUTED_COMPILER_TRANSPORT:-source}"',
             r"source|staged|preprocessed|rewritten)",
+            r'if [ "\$compiler_transport" = staged ] && [ -z "\$output_file" ]; then',
+            r'exec "\${compiler[@]}" "\$@"',
             r"compiler_slot_has_usleep=0",
             r"compiler_slot_pause_us=1000",
             r'if [ "\$compiler_slot_has_usleep" -eq 1 ]; then',
@@ -948,6 +950,22 @@ grep -Fx -- "+$1/compile.json" "$1/on.args"
 grep -Fx -- "+$1/diagnostics.dia" "$1/on.args"
 grep -Fx -- "+$1/module-cache" "$1/on.args"
 grep -Fx -- locally "$1/on.args"
+(
+    cd "$1/source-root"
+    rm -f "$1/on.args" input.o
+    PATH="$1:$PATH" \
+        WOS_DISTRIBUTED_COMPILER=1 \
+        WOS_DISTRIBUTED_COMPILER_HOSTS=wos-0,wos-1 \
+        WOS_DISTRIBUTED_COMPILER_STATE="$1/compiler-state" \
+        WOS_DISTRIBUTED_COMPILER_TRANSPORT=staged \
+        WOS_DISTRIBUTED_COMPILER_JOBS_PER_HOST=1 \
+        WOS_DISTRIBUTED_COMPILER_LOCAL_JOBS=1 \
+        WOS_DISTRIBUTED_COMPILER_REMOTE_JOBS_PER_HOST=1 \
+        WOS_NINJA_JOBS=2 \
+        "$1/clang" -c input.c
+    test -s input.o
+)
+test ! -e "$1/on.args"
 rm -rf -- "$1/compiler-state.source-slots/1"
 mkdir -p "$1/compiler-state.source-slots/0/0"
 PATH="$1:$PATH" \
