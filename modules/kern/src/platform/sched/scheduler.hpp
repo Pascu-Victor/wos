@@ -409,6 +409,10 @@ enum class EventWakeDeferredSwitch : uint8_t {
 [[nodiscard]] constexpr auto event_wake_cancels_deferred_switch(EventWakeDeferredSwitch deferred_switch) -> bool {
     return deferred_switch == EventWakeDeferredSwitch::CANCEL;
 }
+[[nodiscard]] constexpr auto event_wake_should_cancel_deferred_switch(EventWakeDeferredSwitch deferred_switch, bool wki_execve_proxy_wait)
+    -> bool {
+    return event_wake_cancels_deferred_switch(deferred_switch) && !wki_execve_proxy_wait;
+}
 [[nodiscard]] auto event_wake_target_cpu(const task::Task* task, uint64_t waker_cpu) -> uint64_t;
 void wake_task_from_event(task::Task* task, EventWakeDeferredSwitch deferred_switch = EventWakeDeferredSwitch::PRESERVE);
 void wake_task_from_event_on_cpu(task::Task* task, uint64_t target_cpu,

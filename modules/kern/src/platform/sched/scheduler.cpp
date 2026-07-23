@@ -4338,7 +4338,12 @@ void wake_task_from_event_on_cpu(task::Task* task, uint64_t target_cpu, EventWak
     if (task == nullptr) {
         return;
     }
-    bool const CANCEL_DEFERRED_SWITCH = event_wake_cancels_deferred_switch(deferred_switch);
+    // A proxy pipe can retain this PID as a poll waiter across execve(). Its
+    // stale readiness event must not cancel the accepted remote-exec handoff:
+    // doing so returns success to the replaced userspace image. The wake token
+    // remains useful and is consumed by the deferred switch path.
+    bool const CANCEL_DEFERRED_SWITCH =
+        event_wake_should_cancel_deferred_switch(deferred_switch, task->wait_channel_is(task::WaitChannelKind::WKI_EXECVE_PROXY));
     if (CANCEL_DEFERRED_SWITCH) {
         task->deferred_task_switch = false;
     }

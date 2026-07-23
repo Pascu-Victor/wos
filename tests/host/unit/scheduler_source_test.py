@@ -184,7 +184,9 @@ def test_event_wake_cancel_preserves_current_task_wakeup_token() -> None:
     require_tokens(
         wake_body,
         [
-            "bool const CANCEL_DEFERRED_SWITCH = event_wake_cancels_deferred_switch(deferred_switch)",
+            "bool const CANCEL_DEFERRED_SWITCH =",
+            "event_wake_should_cancel_deferred_switch(deferred_switch, "
+            "task->wait_channel_is(task::WaitChannelKind::WKI_EXECVE_PROXY))",
             "task->deferred_task_switch = false",
             "task->wakeup_pending.store(true, std::memory_order_release)",
             "reschedule_task_for_cpu(cpu, task)",
@@ -202,6 +204,16 @@ def test_event_wake_cancel_preserves_current_task_wakeup_token() -> None:
         "task->wakeup_pending.store(true, std::memory_order_release)",
         "reschedule_task_for_cpu(cpu, task)",
         "event wakes must publish a wake token before the reschedule decision",
+    )
+    ktest = SCHEDULER_KTEST.read_text()
+    require_tokens(
+        ktest,
+        [
+            "KTEST(SchedulerWake, RemoteExecProxyPreservesDeferredSwitch)",
+            "event_wake_should_cancel_deferred_switch(EventWakeDeferredSwitch::CANCEL, false)",
+            "event_wake_should_cancel_deferred_switch(EventWakeDeferredSwitch::CANCEL, true)",
+        ],
+        "remote exec event-wake regression",
     )
     if "CurrentTaskWakeupPending" in source:
         fail("current-task event wakes must not select a mode that clears wakeup_pending")

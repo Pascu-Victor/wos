@@ -102,6 +102,15 @@ KTEST(Sched, SchedulerWaitCancellationState) {
     task.process_exit_requested.store(false, std::memory_order_relaxed);
 }
 
+KTEST(SchedulerWake, RemoteExecProxyPreservesDeferredSwitch) {
+    using ker::mod::sched::event_wake_should_cancel_deferred_switch;
+    using ker::mod::sched::EventWakeDeferredSwitch;
+
+    KEXPECT_FALSE(event_wake_should_cancel_deferred_switch(EventWakeDeferredSwitch::PRESERVE, false));
+    KEXPECT_TRUE(event_wake_should_cancel_deferred_switch(EventWakeDeferredSwitch::CANCEL, false));
+    KEXPECT_FALSE(event_wake_should_cancel_deferred_switch(EventWakeDeferredSwitch::CANCEL, true));
+}
+
 KTEST(SchedulerHandoff, RunnableEventTokenSurvivesCommit) {
     KEXPECT_TRUE(ker::mod::sched::scheduler_selftest_handoff_preserves_runnable_event_token());
 }
