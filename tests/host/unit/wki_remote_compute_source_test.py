@@ -1610,7 +1610,7 @@ def test_receiver_vfs_ref_submit_uses_bounded_worker_pool() -> None:
     require_tokens(
         source,
         [
-            "constexpr size_t WKI_COMPUTE_SUBMIT_WORKER_MAX = 4",
+            "constexpr size_t WKI_COMPUTE_SUBMIT_WORKER_MAX = 8",
             "constexpr size_t WKI_COMPUTE_SUBMIT_QUEUE_MAX = 64",
             "std::array<PendingTaskSubmit, WKI_COMPUTE_SUBMIT_QUEUE_MAX>",
             "std::array<CancelledTaskSubmit, WKI_COMPUTE_SUBMIT_CANCEL_MAX>",

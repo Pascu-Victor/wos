@@ -60,7 +60,7 @@ constexpr uint32_t WKI_LATENCY_DAEMON_SLICE_NS = 2'000'000;
 constexpr int WKI_LATENCY_DAEMON_NICE = -5;
 constexpr auto WAIT_ANY_CHILD = static_cast<uint64_t>(-1);
 constexpr uint16_t WKI_LOAD_REPORT_MAX_CPUS = 64;
-constexpr size_t WKI_COMPUTE_SUBMIT_WORKER_MAX = 4;
+constexpr size_t WKI_COMPUTE_SUBMIT_WORKER_MAX = 8;
 constexpr size_t WKI_COMPUTE_SUBMIT_QUEUE_MAX = 64;
 constexpr size_t WKI_COMPUTE_SUBMIT_CANCEL_MAX = WKI_COMPUTE_SUBMIT_QUEUE_MAX * 2;
 constexpr size_t WKI_COMPUTE_RX_WORKER_MAX = 4;
@@ -6618,10 +6618,7 @@ void wki_remote_compute_start_submit_thread() {
     }
 
     constexpr std::array<const char*, WKI_COMPUTE_SUBMIT_WORKER_MAX> WORKER_NAMES = {
-        "wki_compute0",
-        "wki_compute1",
-        "wki_compute2",
-        "wki_compute3",
+        "wki_compute0", "wki_compute1", "wki_compute2", "wki_compute3", "wki_compute4", "wki_compute5", "wki_compute6", "wki_compute7",
     };
     size_t const TARGET_WORKERS = compute_submit_worker_target(ker::mod::smt::get_core_count());
     size_t started_workers = 0;
