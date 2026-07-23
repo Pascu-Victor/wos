@@ -23,11 +23,11 @@ TARGET_SYSROOT="${WOS_SYSROOT_PATH:-$B/sysroot}"
 HOST_SYSTEM="$(uname -s 2>/dev/null || printf unknown)"
 if [ -z "${WOS_TLS_BUILD_JOBS:-}" ]; then
     WOS_TLS_BUILD_JOBS="$WOS_MAKE_JOBS"
-    # Keep the conservative single-node fallback for native WOS. Distributed
-    # compilation has independent, bounded output lanes and must retain normal
-    # make parallelism so its worker nodes receive more than one object at a
-    # time. The repeatability gate verifies every produced archive and binary.
-    if [ "$HOST_SYSTEM" = "WOS" ] && [ "${WOS_DISTRIBUTED_COMPILER:-0}" != "1" ]; then
+    # LibreSSL's recursive Automake graph can enter apps/openssl concurrently
+    # under native WOS make, racing the generated .deps/*.Tpo rename. Keep this
+    # package serial even when compiler processes themselves are distributed;
+    # the rest of the self-host build retains its configured parallelism.
+    if [ "$HOST_SYSTEM" = "WOS" ]; then
         WOS_TLS_BUILD_JOBS=1
     fi
 fi
