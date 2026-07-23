@@ -205,6 +205,8 @@ def test_wos_bootstrap_distributes_only_compiler_processes() -> None:
             r'compiler_run_remote() {',
             r'if [ "\$compiler_status" -ne 127 ] || [ "\$compiler_remote_attempt" -ge 2 ]; then',
             r"distributed compiler launch on \$compiler_host failed with status 127; retrying once",
+            r'''[ ! -f "\$output_file" ]''',
+            "distributed staged compiler returned success without publishing",
             r'compiler_total_jobs="\${WOS_NINJA_JOBS:-\${WOS_BUILD_JOBS:-}}"',
             r'compiler_local_jobs="\$compiler_total_jobs"',
             r'compiler_remote_jobs_per_host="\${WOS_DISTRIBUTED_COMPILER_REMOTE_JOBS_PER_HOST:-1}"',
@@ -1041,6 +1043,79 @@ grep -Fx -- "+$1/implicit.d" "$1/on.args"
         )
         if result.returncode != 0:
             fail(f"WOS staged compiler routing test failed: stdout={result.stdout!r} stderr={result.stderr!r}")
+
+
+def test_wos_bootstrap_retries_unpublished_staged_output_locally() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp = Path(temp_dir)
+        source_root = temp / "source-root"
+        source_root.mkdir()
+        (source_root / "input.c").write_text("int unpublished(void) { return 31; }\n", encoding="ascii")
+        state = temp / "compiler-state"
+        Path(f"{state}.local-roots").write_text(f"{source_root}\n", encoding="ascii")
+        mock_forward = temp / "forward"
+        mock_forward.write_text(
+            r'''#!/bin/bash
+set -eu
+[ "$1" = --clear ]
+while [ "$1" != -- ]; do shift; done
+shift
+exec "$@"
+''',
+            encoding="ascii",
+        )
+        mock_forward.chmod(0o755)
+        mock_on = temp / "on"
+        mock_on.write_text(
+            "#!/bin/bash\n"
+            "# Simulate a remote task whose completion arrives without its routed output.\n"
+            "exit 0\n",
+            encoding="ascii",
+        )
+        mock_on.chmod(0o755)
+        system_clang = ROOT / "toolchain" / "host" / "bin" / "clang"
+        resource_dir = ROOT / "toolchain" / "host" / "lib" / "clang" / "22"
+        script = r'''
+set -euo pipefail
+WOS_TARGET_ARCH=x86_64-pc-wos
+source <(sed -n '/^write_clang_wrapper()/,/^}/p' tools/bootstrap.sh)
+write_clang_wrapper "$1/clang" "$2" "$3"
+(
+    cd "$1/source-root"
+    PATH="$1:$PATH" \
+        WOS_DISTRIBUTED_COMPILER=1 \
+        WOS_DISTRIBUTED_COMPILER_HOSTS=wos-0,wos-1 \
+        WOS_DISTRIBUTED_COMPILER_STATE="$1/compiler-state" \
+        WOS_DISTRIBUTED_COMPILER_TRANSPORT=staged \
+        WOS_DISTRIBUTED_COMPILER_JOBS_PER_HOST=1 \
+        WOS_DISTRIBUTED_COMPILER_LOCAL_JOBS=1 \
+        WOS_DISTRIBUTED_COMPILER_REMOTE_JOBS_PER_HOST=1 \
+        WOS_NINJA_JOBS=2 \
+        "$1/clang" -c input.c -o "$1/output.o"
+)
+test -s "$1/output.o"
+test "$(cat "$1/compiler-state.successes/0")" = wos-0
+test ! -e "$1/compiler-state.successes/1"
+'''
+        result = subprocess.run(
+            [
+                "bash",
+                "-c",
+                script,
+                "wos-bootstrap-unpublished-staged-test",
+                temp_dir,
+                str(system_clang),
+                str(resource_dir),
+            ],
+            cwd=ROOT,
+            check=False,
+            text=True,
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            fail(f"WOS staged unpublished-output fallback test failed: {result.stderr}")
+        if "returned success without publishing" not in result.stderr:
+            fail("WOS staged compiler did not report its missing published output")
 
 
 def test_distributed_compiler_root_staging_is_guarded_and_atomic() -> None:
@@ -2760,6 +2835,7 @@ if __name__ == "__main__":
     test_wos_bootstrap_compiles_submitter_jobs_once()
     test_wos_bootstrap_retries_failed_remote_compiler_locally()
     test_wos_bootstrap_staged_compiler_routes_source_and_outputs()
+    test_wos_bootstrap_retries_unpublished_staged_output_locally()
     test_distributed_compiler_root_staging_is_guarded_and_atomic()
     test_distributed_compiler_hosts_are_validated_before_launch()
     test_selfhost_repeatability_runner_preserves_acceptance_evidence()

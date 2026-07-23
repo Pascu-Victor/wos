@@ -584,6 +584,11 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
         done
         compiler_slot_release
         trap - EXIT HUP INT TERM
+        if [ "\$compiler_status" -eq 0 ] && [ "\$compiler_transport" = staged ] &&
+           [ ! -f "\$output_file" ]; then
+            echo "warning: distributed staged compiler returned success without publishing '\$output_file'; retrying locally" >&2
+            compiler_status=1
+        fi
         if [ "\$compiler_status" -eq 0 ]; then
             compiler_record_success "\$compiler_candidate_index" "\$compiler_host"
             exit 0
