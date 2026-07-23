@@ -397,6 +397,18 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
                 echo "ERROR: staged distributed compiler has no local root manifest" >&2
                 exit 1
             fi
+            # Publish through a submitter-created positive dentry. A peer can
+            # finish its routed copy before the submitter invalidates a cached
+            # negative lookup for the final output path. Keeping the routed
+            # write in the state tree and moving it locally after `on` returns
+            # makes final output publication atomic from the build's view.
+            compiler_staged_output="\$compiler_responses/output.\$\$"
+            if ! : > "\$compiler_staged_output"; then
+                compiler_slot_release
+                trap - EXIT HUP INT TERM
+                echo "ERROR: staged distributed compiler output file could not be created" >&2
+                exit 1
+            fi
             compiler_route_args=()
             # Drop the outer self-host command's forwarding policy before
             # installing this compiler job's minimal policy. Carrying both
@@ -458,7 +470,7 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
             # submitter while peer CPUs wait on filesystem service.
             compiler_add_home_route "\$compiler_state" || exit 1
             compiler_add_home_route "\$compiler_responses" || exit 1
-            compiler_add_home_route "\$output_file" || exit 1
+            compiler_add_home_route "\$compiler_staged_output" || exit 1
             compiler_route_next=""
             compiler_has_explicit_dependency=0
             compiler_has_implicit_dependency=0
@@ -558,7 +570,7 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
                 forward --clear -- on "\$compiler_host" /usr/bin/timeout
                 -s TERM -k 5 "\$compiler_remote_timeout"
                 /usr/bin/bash "$distributed_staged_launcher"
-                "\$compiler_route_response" "\$PWD" "\$compiler_remote_output" "\$output_file"
+                "\$compiler_route_response" "\$PWD" "\$compiler_remote_output" "\$compiler_staged_output"
             )
         else
             compiler_remote_command=(
@@ -589,13 +601,22 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
             sleep 1
             compiler_remote_attempt="\$((compiler_remote_attempt + 1))"
         done
+        if [ "\$compiler_transport" = staged ]; then
+            if [ "\$compiler_status" -eq 0 ]; then
+                if [ ! -s "\$compiler_staged_output" ]; then
+                    echo "warning: distributed staged compiler returned success without publishing '\$output_file'; retrying locally" >&2
+                    compiler_status=1
+                elif ! mv -- "\$compiler_staged_output" "\$output_file"; then
+                    echo "warning: distributed staged compiler could not publish '\$output_file'; retrying locally" >&2
+                    compiler_status=1
+                fi
+            fi
+            if [ "\$compiler_status" -ne 0 ]; then
+                rm -f -- "\$compiler_staged_output" 2>/dev/null || true
+            fi
+        fi
         compiler_slot_release
         trap - EXIT HUP INT TERM
-        if [ "\$compiler_status" -eq 0 ] && [ "\$compiler_transport" = staged ] &&
-           [ ! -f "\$output_file" ]; then
-            echo "warning: distributed staged compiler returned success without publishing '\$output_file'; retrying locally" >&2
-            compiler_status=1
-        fi
         if [ "\$compiler_status" -eq 0 ]; then
             compiler_record_success "\$compiler_candidate_index" "\$compiler_host"
             exit 0

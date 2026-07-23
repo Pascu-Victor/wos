@@ -184,7 +184,10 @@ def test_wos_bootstrap_distributes_only_compiler_processes() -> None:
             r'forward --clear -- on "\$compiler_host" /usr/bin/timeout',
             r'-s TERM -k 5 "\$compiler_remote_timeout"',
             r'compiler_remote_output="/tmp/wos-distributed-staged.\$compiler_candidate_index.\$\$.output"',
-            r'"\$compiler_route_response" "\$PWD" "\$compiler_remote_output" "\$output_file"',
+            r'compiler_staged_output="\$compiler_responses/output.\$\$"',
+            r'if ! : > "\$compiler_staged_output"; then',
+            r'compiler_add_home_route "\$compiler_staged_output"',
+            r'"\$compiler_route_response" "\$PWD" "\$compiler_remote_output" "\$compiler_staged_output"',
             '''"$@" -o "$local_output"''',
             '''cp -- "$local_output" "$host_output"''',
             "distributed staged compiler command failed with status",
@@ -194,7 +197,7 @@ def test_wos_bootstrap_distributes_only_compiler_processes() -> None:
             r'on "\$compiler_host" /usr/bin/timeout',
             r'for compiler_local_system_root in /usr /bin /lib /lib64 /libexec /share /etc /proc /dev /run /tmp; do',
             r'compiler_add_home_route "\$compiler_state"',
-            r'compiler_add_home_route "\$output_file"',
+            r'elif ! mv -- "\$compiler_staged_output" "\$output_file"; then',
             r'compiler_skip_output_arg=0',
             r'if [ "\$compiler_skip_output_arg" -eq 1 ]; then',
             r'''printf '%q\n' -MF "\$compiler_dependency_route" >> "\$compiler_response"''',
@@ -209,7 +212,7 @@ def test_wos_bootstrap_distributes_only_compiler_processes() -> None:
             r'compiler_run_remote() {',
             r'if [ "\$compiler_status" -ne 127 ] || [ "\$compiler_remote_attempt" -ge 2 ]; then',
             r"distributed compiler launch on \$compiler_host failed with status 127; retrying once",
-            r'''[ ! -f "\$output_file" ]''',
+            r'''[ ! -s "\$compiler_staged_output" ]''',
             "distributed staged compiler returned success without publishing",
             r'compiler_total_jobs="\${WOS_NINJA_JOBS:-\${WOS_BUILD_JOBS:-}}"',
             r'compiler_local_jobs="\$compiler_total_jobs"',
@@ -992,7 +995,7 @@ grep -Fx -- -/usr "$1/on.args"
 grep -Fx -- -/lib "$1/on.args"
 grep -Fx -- -/tmp "$1/on.args"
 grep -Fx -- "+$1/compiler-state" "$1/on.args"
-grep -Fx -- "+$1/output.o" "$1/on.args"
+! grep -Fx -- "+$1/output.o" "$1/on.args"
 grep -Fx -- "+$1/explicit.d" "$1/on.args"
 grep -Fx -- "+$1/compile.json" "$1/on.args"
 grep -Fx -- "+$1/diagnostics.dia" "$1/on.args"
