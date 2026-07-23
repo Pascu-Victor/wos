@@ -2356,6 +2356,8 @@ def test_wos_curl_build_uses_native_triplet_and_real_sysroot_install() -> None:
             'CURL_LDFLAGS="$CURL_TARGET_FLAGS -fuse-ld=lld -L$TARGET_SYSROOT/lib -Wl,--dynamic-linker=/lib/ld.so -Wl,-rpath,/usr/lib -fno-sanitize=safe-stack"',
             'export CC="$HOST/bin/clang"',
             'export CPPFLAGS="$CURL_CPPFLAGS"',
+            'wos_make 1 -C "$CURL_WORK/src" tool_ca_embed.c',
+            "wos_stage_distributed_build_roots",
             'DESTDIR="$TARGET_SYSROOT" \\',
             'require_file "$TARGET_SYSROOT/bin/curl"',
             'require_file "$TARGET_SYSROOT/lib/libcurl.a"',

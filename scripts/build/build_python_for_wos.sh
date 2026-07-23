@@ -950,8 +950,9 @@ echo "Building target CPython with WOS_MAKE_JOBS=$WOS_MAKE_JOBS..."
 # objects. Generate them with the configured build Python before snapshotting
 # the target tree; this target does not compile target-WOS objects.
 wos_make "$WOS_MAKE_JOBS" -C "$PYTHON_TARGET_BUILD" \
+    --eval='.SECONDEXPANSION:' \
     --eval='.PHONY: wos-frozen-module-headers' \
-    --eval='wos-frozen-module-headers: $(FROZEN_FILES_OUT)' \
+    --eval='wos-frozen-module-headers: Python/frozen_modules/getpath.h $$(FROZEN_FILES_OUT)' \
     wos-frozen-module-headers
 wos_stage_distributed_build_roots \
 	"$WORKSPACE_ROOT" "$PYTHON_SRC" \

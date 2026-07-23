@@ -452,6 +452,11 @@ wos_timed_step "configure" "curl" \
     --disable-manual \
     --disable-docs
 
+# curl creates this disabled-CA placeholder as a Make prerequisite. Materialize
+# it before snapshotting the build tree so distributed compilers never race a
+# generated source that exists only on the submitter.
+wos_make 1 -C "$CURL_WORK/src" tool_ca_embed.c
+
 wos_stage_distributed_build_roots \
     "$WORKSPACE_ROOT" "" \
     "$CURL_WORK" "$TARGET_SYSROOT/include"

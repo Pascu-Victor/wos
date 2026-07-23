@@ -392,6 +392,7 @@ def test_wos_toolchain_stages_configured_build_roots() -> None:
         ],
         "build_curl_for_wos.sh": [
             'wos_timed_step "configure" "curl"',
+            'wos_make 1 -C "$CURL_WORK/src" tool_ca_embed.c',
             "wos_stage_distributed_build_roots",
             'wos_make "$WOS_MAKE_JOBS" -C "$CURL_WORK"',
         ],
@@ -469,8 +470,9 @@ def test_wos_toolchain_stages_configured_build_roots() -> None:
             'wos_make "$WOS_MAKE_JOBS" -C "$NANO_WORK/src" revision.h'
         ],
         "build_python_for_wos.sh": [
+            "--eval='.SECONDEXPANSION:'",
             "--eval='.PHONY: wos-frozen-module-headers'",
-            "--eval='wos-frozen-module-headers: $(FROZEN_FILES_OUT)'",
+            "--eval='wos-frozen-module-headers: Python/frozen_modules/getpath.h $$(FROZEN_FILES_OUT)'",
         ],
         "build_git_for_wos.sh": [
             'wos_make "$WOS_MAKE_JOBS" -C "$GIT_WORK" "${GIT_MAKE_FLAGS[@]}"',
