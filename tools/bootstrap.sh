@@ -559,6 +559,14 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
             esac
             compiler_forward_args+=("\$arg")
         done
+        if [ -z "\$output_file" ]; then
+            # Replacing the source with .../clang-job.XXXXXX/input changes
+            # Clang's implicit object name. Preserve the original -c foo.c
+            # contract for Autoconf probes and handwritten make rules.
+            compiler_default_output="\${compiler_source##*/}"
+            compiler_default_output="\${compiler_default_output%.*}.o"
+            compiler_forward_args+=(-o "\$compiler_default_output")
+        fi
         compiler_forward_args+=(-x "\$compiler_remote_language" -Wno-unused-command-line-argument "\$compiler_input")
         if [ "\$compiler_input_size" -lt "\$compiler_min_preprocessed_bytes" ]; then
             compiler_input_and_slot_cleanup

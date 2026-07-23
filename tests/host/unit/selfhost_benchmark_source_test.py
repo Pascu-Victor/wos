@@ -433,6 +433,19 @@ test -s "$1/c dependencies with spaces.d"
 "$objcopy" --dump-section ".text=$1/rewritten c text" "$1/c object with spaces.o"
 "$objcopy" --dump-section ".text=$1/direct c text" "$1/direct c object with spaces.o"
 cmp "$1/rewritten c text" "$1/direct c text"
+(
+    cd "$1"
+    PATH="$1:$PATH" \
+        WOS_DISTRIBUTED_COMPILER=1 \
+        WOS_DISTRIBUTED_COMPILER_HOSTS=wos-0,wos-1 \
+        WOS_DISTRIBUTED_COMPILER_STATE="$1/compiler-state-default-output" \
+        WOS_DISTRIBUTED_COMPILER_TRANSPORT=rewritten \
+        WOS_DISTRIBUTED_COMPILER_JOBS_PER_HOST=1 \
+        WOS_DISTRIBUTED_COMPILER_MIN_PREPROCESSED_BYTES=0 \
+        WOS_NINJA_JOBS=1 \
+        "$1/clang" -c "source with spaces.c"
+)
+test -s "$1/source with spaces.o"
 '''
         result = subprocess.run(
             [
