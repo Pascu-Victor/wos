@@ -33,6 +33,10 @@ SYSROOT=$B/sysroot
 HOST_SYSTEM="$(uname -s 2>/dev/null || printf unknown)"
 export WOS_HOST_TOOLCHAIN_ROOT="$HOST"
 export NINJA_STATUS="[%f/%t %e] "
+if [ "$HOST_SYSTEM" = WOS ]; then
+    export WOS_DISTRIBUTED_COMPILER_STAGE_BASE="${WOS_DISTRIBUTED_COMPILER_STAGE_BASE:-$(dirname "$WORKSPACE_ROOT")}"
+    export WOS_DISTRIBUTED_COMPILER_RETAINED_ROOTS="${WOS_DISTRIBUTED_COMPILER_RETAINED_ROOTS:-$HOST/lib"$'\n'"$SYSROOT/include}"
+fi
 
 COMPILER_RT_CMAKE_SYSROOT_ARGS=("-DCMAKE_SYSROOT=$SYSROOT")
 COMPILER_RT_NINJA_JOBS="$WOS_NINJA_JOBS"
@@ -198,9 +202,7 @@ stage_distributed_compiler_roots() {
     if [ "$HOST_SYSTEM" != WOS ]; then
         return 0
     fi
-    WOS_DISTRIBUTED_COMPILER_STAGE_BASE="$(dirname "$WORKSPACE_ROOT")" \
-        WOS_DISTRIBUTED_COMPILER_RETAINED_ROOTS="$HOST/lib"$'\n'"$SYSROOT/include" \
-        "$WORKSPACE_ROOT/tools/stage-distributed-compiler-roots.sh" "$@"
+    "$WORKSPACE_ROOT/tools/stage-distributed-compiler-roots.sh" "$@"
 }
 
 bootstrap_now_ms() {
@@ -424,6 +426,10 @@ build_compiler_rt() {
      "${COMPILER_RT_CMAKE_CACHE_ARGS[@]}" \
      $B/src/llvm-project/compiler-rt
 
+    wos_stage_distributed_build_roots \
+        "$WORKSPACE_ROOT" "$B/src/llvm-project/compiler-rt" \
+        "$B/compiler-rt-build" "$SYSROOT/include"
+
     wos_timed_step "build" "$detail_label" \
         wos_run_in_dir "$B/compiler-rt-build" \
         ninja -j"$COMPILER_RT_NINJA_JOBS" install
@@ -585,6 +591,14 @@ wos_timed_step "configure" "libcxx_headers" \
  "${LIBCXX_CMAKE_SUPPORT_CACHE_ARGS[@]}" \
  $B/src/llvm-project/runtimes
 
+wos_stage_distributed_build_roots \
+    "$WORKSPACE_ROOT" "" \
+    "$B/src/llvm-project/runtimes" \
+    "$B/src/llvm-project/libcxx" \
+    "$B/src/llvm-project/libcxxabi" \
+    "$B/libcxx-bootstrap" \
+    "$SYSROOT/include"
+
 wos_timed_step "install" "libcxx_headers" \
     wos_run_in_dir "$B/libcxx-bootstrap" \
     ninja -j"$WOS_NINJA_JOBS" install-cxx-headers install-cxxabi-headers
@@ -634,6 +648,10 @@ wos_timed_step "configure" "mlibc" \
   -Dbsd_option=enabled \
   -Db_sanitize=none \
   $B/src/mlibc
+wos_stage_distributed_build_roots \
+    "$WORKSPACE_ROOT" "$B/src/mlibc" \
+    "$B/mlibc-build" "$SYSROOT/include"
+
 wos_timed_step "build" "mlibc" \
     wos_run_in_dir "$B/mlibc-build" \
     ninja -j"$WOS_NINJA_JOBS"
@@ -712,6 +730,11 @@ wos_timed_step "configure" "libcxx_runtime" \
  -DWOS=ON \
  "${LIBCXX_RUNTIME_CMAKE_SUPPORT_CACHE_ARGS[@]}" \
  $B/src/llvm-project/runtimes
+
+libcxx_distributed_source_roots="$B/src/llvm-project/runtimes"$'\n'"$B/src/llvm-project/libcxx"$'\n'"$B/src/llvm-project/libcxxabi"$'\n'"$B/src/llvm-project/libunwind"
+wos_stage_distributed_build_roots \
+    "$WORKSPACE_ROOT" "$libcxx_distributed_source_roots" \
+    "$B/libcxx-build" "$SYSROOT/include"
 
 WOS_LIBCXX_BUILD_DIR="$B/libcxx-build" "$B/../scripts/build/build_libcxx_for_wos.sh"
 

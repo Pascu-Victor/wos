@@ -113,6 +113,10 @@ wos_timed_step "configure" "ninja_cmake" \
     -DHAVE_FORK=0 \
     -DHAVE_PIPE=0
 
+wos_stage_distributed_build_roots \
+    "$WORKSPACE_ROOT" "$NINJA_SRC" \
+    "$NINJA_BUILD" "$TARGET_SYSROOT/include"
+
 # CMake does not know when sysroot libraries change underneath this external
 # build, so force the final link if libc/libc++ were rebuilt.
 if [ -f "$NINJA_BUILD/ninja" ]; then

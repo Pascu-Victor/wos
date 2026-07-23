@@ -452,6 +452,10 @@ wos_timed_step "configure" "curl" \
     --disable-manual \
     --disable-docs
 
+wos_stage_distributed_build_roots \
+    "$WORKSPACE_ROOT" "" \
+    "$CURL_WORK" "$TARGET_SYSROOT/include"
+
 wos_make "$WOS_MAKE_JOBS" -C "$CURL_WORK"
 wos_make "$WOS_MAKE_JOBS" -C "$CURL_WORK" \
     prefix= \

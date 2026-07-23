@@ -704,3 +704,24 @@ wos_ninja_jobs() {
 
     wos_build_jobs
 }
+
+wos_stage_distributed_build_roots() {
+    local workspace_root="$1"
+    local retained_root="$2"
+    shift 2
+
+    if [ "${WOS_DISTRIBUTED_COMPILER_TRANSPORT:-source}" != staged ]; then
+        return 0
+    fi
+
+    local retained_roots="${WOS_DISTRIBUTED_COMPILER_RETAINED_ROOTS:-}"
+    if [ -n "$retained_root" ]; then
+        if [ -n "$retained_roots" ]; then
+            retained_roots+=$'\n'
+        fi
+        retained_roots+="$retained_root"
+    fi
+
+    WOS_DISTRIBUTED_COMPILER_RETAINED_ROOTS="$retained_roots" \
+        "$workspace_root/tools/stage-distributed-compiler-roots.sh" "$@"
+}

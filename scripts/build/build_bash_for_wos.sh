@@ -671,6 +671,16 @@ if [ "$HOST_SYSTEM" = "WOS" ]; then
     refresh_bash_build_generated_files "$BASH_WORK"
 fi
 
+wos_make "$WOS_MAKE_JOBS" -C "$BASH_WORK" \
+    version.h parser-built signames.h syntax.c builtins/builtext.h
+
+bash_builtin_sources=()
+for definition in "$BASH_WORK"/builtins/*.def; do
+    source_name="${definition##*/}"
+    bash_builtin_sources+=("${source_name%.def}.c")
+done
+wos_make "$WOS_MAKE_JOBS" -C "$BASH_WORK/builtins" "${bash_builtin_sources[@]}"
+
 if [ -f "$BASH_WORK/bash" ]; then
     for lib in "$TARGET_SYSROOT"/lib/libc.so "$TARGET_SYSROOT"/lib/libm.so "$TARGET_SYSROOT"/lib/libdl.so; do
         if [ -f "$lib" ] && [ "$lib" -nt "$BASH_WORK/bash" ]; then
@@ -680,6 +690,10 @@ if [ -f "$BASH_WORK/bash" ]; then
         fi
     done
 fi
+
+wos_stage_distributed_build_roots \
+    "$WORKSPACE_ROOT" "" \
+    "$BASH_WORK" "$TARGET_SYSROOT/include"
 
 wos_make "$WOS_MAKE_JOBS" -C "$BASH_WORK" bash bashbug
 

@@ -144,6 +144,10 @@ wos_timed_step "configure" "cmake_for_wos" \
     -DBUILD_QtDialog=OFF \
     -DCMake_BUILD_DEVELOPER_REFERENCE=OFF
 
+wos_stage_distributed_build_roots \
+    "$WORKSPACE_ROOT" "$CMAKE_SRC" \
+    "$CMAKE_BUILD" "$TARGET_SYSROOT/include"
+
 wos_timed_step "build" "cmake_for_wos" \
     cmake --build "$CMAKE_BUILD" --parallel "$WOS_NINJA_JOBS" --target cmake ctest cpack
 wos_timed_step "install" "cmake_for_wos" \

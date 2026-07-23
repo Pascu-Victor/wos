@@ -349,6 +349,11 @@ wos_timed_step "configure" "nano" \
     --disable-mouse \
     --enable-utf8
 
+wos_make "$WOS_MAKE_JOBS" -C "$NANO_WORK/src" revision.h
+wos_stage_distributed_build_roots \
+    "$WORKSPACE_ROOT" "" \
+    "$NANO_WORK" "$TARGET_SYSROOT/include"
+
 wos_make "$WOS_MAKE_JOBS" -C "$NANO_WORK"
 wos_make "$WOS_MAKE_JOBS" -C "$NANO_WORK" \
     prefix= \

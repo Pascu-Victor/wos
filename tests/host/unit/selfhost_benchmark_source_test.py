@@ -33,6 +33,15 @@ def require_tokens(source: str, tokens: list[str], context: str) -> None:
         fail(f"{context}: missing {', '.join(missing)}")
 
 
+def require_order(source: str, tokens: list[str], context: str) -> None:
+    offset = 0
+    for token in tokens:
+        index = source.find(token, offset)
+        if index < 0:
+            fail(f"{context}: missing ordered token after offset {offset}: {token}")
+        offset = index + len(token)
+
+
 def test_selfhost_runner_covers_acceptance_flow() -> None:
     source = SELFHOST_RUNNER.read_text()
     require_tokens(
@@ -153,8 +162,12 @@ def test_wos_bootstrap_distributes_only_compiler_processes() -> None:
             r'IFS=, read -r -a compiler_hosts <<< "\${WOS_DISTRIBUTED_COMPILER_HOSTS:-}"',
             r'compiler_transport="\${WOS_DISTRIBUTED_COMPILER_TRANSPORT:-source}"',
             r"source|staged|preprocessed|rewritten)",
-            r'compiler_slot_pause=(usleep 1000)',
-            r'"\${compiler_slot_pause[@]}"',
+            r"compiler_slot_has_usleep=0",
+            r"compiler_slot_pause_us=1000",
+            r'if [ "\$compiler_slot_has_usleep" -eq 1 ]; then',
+            r'usleep "\$compiler_slot_pause_us"',
+            r'if [ "\$compiler_slot_pause_us" -lt 16000 ]; then',
+            r'compiler_slot_pause_us="\$((compiler_slot_pause_us * 2))"',
             r'compiler_jobs_per_host="\$(((compiler_total_jobs + \${#compiler_hosts[@]} - 1) / \${#compiler_hosts[@]}))"',
             r'compiler_slots="\$compiler_state.source-slots"',
             r'compiler_start_index="\$((RANDOM % \${#compiler_hosts[@]}))"',
@@ -246,8 +259,8 @@ def test_wos_toolchain_stages_sources_before_distributed_compiles() -> None:
         source,
         [
             "stage_distributed_compiler_roots()",
-            'WOS_DISTRIBUTED_COMPILER_STAGE_BASE="$(dirname "$WORKSPACE_ROOT")"',
-            'WOS_DISTRIBUTED_COMPILER_RETAINED_ROOTS="$HOST/lib"',
+            'export WOS_DISTRIBUTED_COMPILER_STAGE_BASE="${WOS_DISTRIBUTED_COMPILER_STAGE_BASE:-$(dirname "$WORKSPACE_ROOT")}"',
+            'export WOS_DISTRIBUTED_COMPILER_RETAINED_ROOTS="${WOS_DISTRIBUTED_COMPILER_RETAINED_ROOTS:-$HOST/lib"',
             'stage_distributed_compiler_roots "$B/src/mlibc" "$HOST/lib" "$SYSROOT/include"',
             'stage_distributed_compiler_roots "$SYSROOT/include"',
             'stage_distributed_compiler_roots "$B/src/llvm-project/compiler-rt"',
@@ -262,6 +275,136 @@ def test_wos_toolchain_stages_sources_before_distributed_compiles() -> None:
     first_crt_compile = source.find("$CC -O3 -c empty.c")
     if initial_stage < 0 or first_crt_compile < 0 or initial_stage >= first_crt_compile:
         fail("WOS source staging must initialize its manifest before the first target compile")
+
+
+def test_wos_toolchain_stages_configured_build_roots() -> None:
+    helper = (ROOT / "tools" / "ccache_env.sh").read_text()
+    require_tokens(
+        helper,
+        [
+            "wos_stage_distributed_build_roots()",
+            'if [ "${WOS_DISTRIBUTED_COMPILER_TRANSPORT:-source}" != staged ]; then',
+            'retained_roots+="$retained_root"',
+            'WOS_DISTRIBUTED_COMPILER_RETAINED_ROOTS="$retained_roots"',
+            '"$workspace_root/tools/stage-distributed-compiler-roots.sh" "$@"',
+        ],
+        "configured distributed compiler root staging helper",
+    )
+
+    script_orders = {
+        "build_busybox.sh": [
+            "build_busybox_target prepare",
+            "wos_stage_distributed_build_roots",
+            "build_busybox_target busybox",
+        ],
+        "build_dropbear.sh": [
+            "wos_timed_step \"configure\" \"dropbear\"",
+            "wos_stage_distributed_build_roots",
+            'wos_make "$WOS_MAKE_JOBS" -C "$DB_BUILD"',
+        ],
+        "build_make.sh": [
+            "refresh_make_build_generated_files",
+            "wos_stage_distributed_build_roots",
+            'wos_make "$WOS_GNU_MAKE_BUILD_JOBS" -C "$MAKE_BUILD"',
+        ],
+        "build_bash_for_wos.sh": [
+            'wos_timed_step "configure" "bash"',
+            "wos_stage_distributed_build_roots",
+            "bash bashbug",
+        ],
+        "build_ncurses_for_wos.sh": [
+            'wos_timed_step "configure" "ncurses"',
+            "wos_stage_distributed_build_roots",
+            'wos_make "$WOS_MAKE_JOBS" -C "$NCURSES_WORK"',
+        ],
+        "build_nano_for_wos.sh": [
+            'wos_timed_step "configure" "nano"',
+            "wos_stage_distributed_build_roots",
+            'wos_make "$WOS_MAKE_JOBS" -C "$NANO_WORK"',
+        ],
+        "build_zlib_for_wos.sh": [
+            'wos_timed_step "configure" "zlib"',
+            "wos_stage_distributed_build_roots",
+            'wos_make "$WOS_MAKE_JOBS" -C "$ZLIB_BUILD"',
+        ],
+        "build_openssl_for_wos.sh": [
+            'wos_timed_step "configure" "libressl"',
+            "wos_stage_distributed_build_roots",
+            'wos_make "$WOS_TLS_BUILD_JOBS" -C "$TLS_WORK"',
+        ],
+        "build_curl_for_wos.sh": [
+            'wos_timed_step "configure" "curl"',
+            "wos_stage_distributed_build_roots",
+            'wos_make "$WOS_MAKE_JOBS" -C "$CURL_WORK"',
+        ],
+        "build_ninja_for_wos.sh": [
+            'wos_timed_step "configure" "ninja_cmake"',
+            "wos_stage_distributed_build_roots",
+            'wos_timed_step "build" "ninja_cmake"',
+        ],
+        "build_cmake_for_wos.sh": [
+            'wos_timed_step "configure" "cmake_for_wos"',
+            "wos_stage_distributed_build_roots",
+            'wos_timed_step "build" "cmake_for_wos"',
+        ],
+        "build_nasm_for_wos.sh": [
+            'wos_timed_step "configure" "nasm"',
+            "wos_stage_distributed_build_roots",
+            'wos_make "$WOS_MAKE_JOBS" -C "$NASM_BUILD"',
+        ],
+        "build_python_for_wos.sh": [
+            'wos_timed_step "configure" "cpython_target"',
+            "wos_stage_distributed_build_roots",
+            'wos_make "$WOS_MAKE_JOBS" -C "$PYTHON_TARGET_BUILD"',
+        ],
+        "build_clang_for_wos.sh": [
+            'wos_timed_step "configure" "clang_for_wos"',
+            "wos_stage_distributed_build_roots",
+            'wos_timed_step "build" "clang_for_wos"',
+        ],
+    }
+    for name, ordered_tokens in script_orders.items():
+        require_order(
+            (ROOT / "scripts" / "build" / name).read_text(),
+            ordered_tokens,
+            f"{name} configured-root staging",
+        )
+
+    git_source = (ROOT / "scripts" / "build" / "build_git_for_wos.sh").read_text()
+    require_order(
+        git_source,
+        ["copy_source_to_workdir", "wos_stage_distributed_build_roots", 'wos_make "$WOS_MAKE_JOBS" -C "$GIT_WORK"'],
+        "Git configured-root staging",
+    )
+
+    generator_tokens = {
+        "build_busybox.sh": ["build_busybox_target prepare"],
+        "build_bash_for_wos.sh": [
+            "version.h parser-built signames.h syntax.c builtins/builtext.h",
+            'for definition in "$BASH_WORK"/builtins/*.def',
+            'wos_make "$WOS_MAKE_JOBS" -C "$BASH_WORK/builtins"',
+        ],
+        "build_ncurses_for_wos.sh": [
+            'wos_make "$WOS_MAKE_JOBS" -C "$NCURSES_WORK" sources'
+        ],
+        "build_nano_for_wos.sh": [
+            'wos_make "$WOS_MAKE_JOBS" -C "$NANO_WORK/src" revision.h'
+        ],
+        "build_git_for_wos.sh": [
+            'wos_make "$WOS_MAKE_JOBS" -C "$GIT_WORK" "${GIT_MAKE_FLAGS[@]}" generated-hdrs'
+        ],
+        "build_clang_for_wos.sh": [
+            "llvm-headers clang-tablegen-targets ELFOptionsTableGen"
+        ],
+    }
+    for name, tokens in generator_tokens.items():
+        source = (ROOT / "scripts" / "build" / name).read_text()
+        require_tokens(source, tokens, f"{name} pre-staging generators")
+        require_order(
+            source,
+            [tokens[-1], "wos_stage_distributed_build_roots"],
+            f"{name} generators precede staging",
+        )
 
 
 def test_wos_bootstrap_repairs_only_link_output_mode() -> None:
@@ -2442,6 +2585,7 @@ if __name__ == "__main__":
     test_selfhost_runner_covers_acceptance_flow()
     test_wos_bootstrap_distributes_only_compiler_processes()
     test_wos_toolchain_stages_sources_before_distributed_compiles()
+    test_wos_toolchain_stages_configured_build_roots()
     test_wos_bootstrap_repairs_only_link_output_mode()
     test_wos_bootstrap_caps_concurrent_compilers_per_host()
     test_wos_bootstrap_remote_response_file_preserves_arguments()

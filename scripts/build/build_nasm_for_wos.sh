@@ -395,6 +395,10 @@ fi
 
 seed_nasm_generated_files
 
+wos_stage_distributed_build_roots \
+    "$WORKSPACE_ROOT" "$NASM_SOURCE_DIR" \
+    "$NASM_BUILD" "$TARGET_SYSROOT/include"
+
 if [ -f "$NASM_BUILD/nasm" ]; then
     for lib in "$TARGET_SYSROOT"/lib/libc.so "$TARGET_SYSROOT"/lib/libm.so; do
         if [ -f "$lib" ] && [ "$lib" -nt "$NASM_BUILD/nasm" ]; then

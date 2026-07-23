@@ -407,6 +407,10 @@ wos_timed_step "configure" "libressl" \
     --disable-asm
 disable_libressl_man_install
 
+wos_stage_distributed_build_roots \
+    "$WORKSPACE_ROOT" "" \
+    "$TLS_WORK" "$TARGET_SYSROOT/include"
+
 wos_make "$WOS_TLS_BUILD_JOBS" -C "$TLS_WORK"
 wos_make "$WOS_TLS_BUILD_JOBS" -C "$TLS_WORK" \
     prefix= \

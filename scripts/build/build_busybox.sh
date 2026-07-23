@@ -260,6 +260,8 @@ fi
 
 # Build busybox
 build_busybox_target() {
+    local target="${1:-busybox}"
+
     wos_make "$WOS_MAKE_JOBS" -C "$BB_BUILD" \
         CC="$BB_CC" \
         AR="$BB_AR" \
@@ -271,7 +273,7 @@ build_busybox_target() {
         CFLAGS="$BB_CFLAGS" \
         LDFLAGS="$BB_LDFLAGS" \
         "${BB_MAKE_SHELL_ARGS[@]}" \
-        busybox
+        "$target"
 }
 
 cleanup_busybox_kbuild_temps() {
@@ -284,10 +286,15 @@ if [ "$HOST_SYSTEM" = "WOS" ]; then
     cleanup_busybox_kbuild_temps
 fi
 
-if ! build_busybox_target; then
+build_busybox_target prepare
+wos_stage_distributed_build_roots \
+    "$WORKSPACE_ROOT" "$BB_SRC" \
+    "$BB_BUILD" "$TARGET_SYSROOT/include"
+
+if ! build_busybox_target busybox; then
     echo "BusyBox build failed; cleaning Kbuild temp/dependency files and retrying once at WOS_MAKE_JOBS=$WOS_MAKE_JOBS" >&2
     cleanup_busybox_kbuild_temps
-    build_busybox_target
+    build_busybox_target busybox
 fi
 
 # Install the generated BusyBox runtime tree for rootfs packaging.

@@ -472,6 +472,10 @@ if [ -f "$MAKE_BUILD/make" ]; then
     done
 fi
 
+wos_stage_distributed_build_roots \
+    "$WORKSPACE_ROOT" "" \
+    "$MAKE_SOURCE_DIR" "$MAKE_BUILD" "$TARGET_SYSROOT/include"
+
 wos_make "$WOS_GNU_MAKE_BUILD_JOBS" -C "$MAKE_BUILD" "${GNU_MAKE_BUILD_ARGS[@]}"
 
 install -m 755 "$MAKE_BUILD/make" "$TARGET_SYSROOT/bin/make"

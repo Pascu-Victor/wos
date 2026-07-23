@@ -120,6 +120,10 @@ if [ ! -f "$ZLIB_BUILD/Makefile" ] || [ "$ZLIB_SOURCE_DIR/configure" -nt "$ZLIB_
         "$ZLIB_SOURCE_DIR/configure" --prefix= --static
 fi
 
+wos_stage_distributed_build_roots \
+    "$WORKSPACE_ROOT" "" \
+    "$ZLIB_SOURCE_DIR" "$ZLIB_BUILD" "$TARGET_SYSROOT/include"
+
 wos_make "$WOS_MAKE_JOBS" -C "$ZLIB_BUILD" libz.a
 wos_make "$WOS_MAKE_JOBS" -C "$ZLIB_BUILD" \
     prefix= \

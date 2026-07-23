@@ -199,9 +199,10 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
             exit 1
             ;;
     esac
-    compiler_slot_pause=(sleep 0)
+    compiler_slot_has_usleep=0
+    compiler_slot_pause_us=1000
     if command -v usleep >/dev/null 2>&1; then
-        compiler_slot_pause=(usleep 1000)
+        compiler_slot_has_usleep=1
     fi
     if [ "\$compiler_transport" = source ] || [ "\$compiler_transport" = staged ]; then
         compiler_total_jobs="\${WOS_NINJA_JOBS:-\${WOS_BUILD_JOBS:-}}"
@@ -279,7 +280,14 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
             done
             if [ -z "\$compiler_slot" ]; then
                 compiler_start_index="\$(((compiler_start_index + 1) % \${#compiler_hosts[@]}))"
-                "\${compiler_slot_pause[@]}"
+                if [ "\$compiler_slot_has_usleep" -eq 1 ]; then
+                    usleep "\$compiler_slot_pause_us"
+                    if [ "\$compiler_slot_pause_us" -lt 16000 ]; then
+                        compiler_slot_pause_us="\$((compiler_slot_pause_us * 2))"
+                    fi
+                else
+                    sleep 0
+                fi
             fi
         done
         compiler_slot_release() {

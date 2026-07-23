@@ -115,6 +115,11 @@ GIT_MAKE_FLAGS=(
     "WOS_SKIP_TEST_ARTIFACTS=YesPlease"
 )
 
+wos_make "$WOS_MAKE_JOBS" -C "$GIT_WORK" "${GIT_MAKE_FLAGS[@]}" generated-hdrs
+wos_stage_distributed_build_roots \
+    "$WORKSPACE_ROOT" "" \
+    "$GIT_WORK" "$TARGET_SYSROOT/include"
+
 wos_make "$WOS_MAKE_JOBS" -C "$GIT_WORK" "${GIT_MAKE_FLAGS[@]}" "DESTDIR=$TARGET_SYSROOT" install
 
 require_file "$TARGET_SYSROOT/bin/git" "Git install did not produce $TARGET_SYSROOT/bin/git."

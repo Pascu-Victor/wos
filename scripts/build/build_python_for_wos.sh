@@ -946,6 +946,10 @@ if [ -f "$PYTHON_TARGET_BUILD/python" ]; then
 fi
 
 echo "Building target CPython with WOS_MAKE_JOBS=$WOS_MAKE_JOBS..."
+wos_stage_distributed_build_roots \
+	"$WORKSPACE_ROOT" "$PYTHON_SRC" \
+	"$PYTHON_TARGET_BUILD" "$TARGET_SYSROOT/include"
+
 wos_make "$WOS_MAKE_JOBS" -C "$PYTHON_TARGET_BUILD" \
     CC="$TARGET_CC" \
     CXX="$TARGET_CXX" \

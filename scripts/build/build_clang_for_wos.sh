@@ -201,6 +201,12 @@ for tool in "${WOS_LLVM_REQUIRED_TOOLS[@]}"; do
     WOS_LLVM_BIN_OUTPUTS+=("bin/$tool")
 done
 
+ninja -C "$CLANG_BUILD" -j"$WOS_LLVM_NINJA_JOBS" \
+    llvm-headers clang-tablegen-targets ELFOptionsTableGen
+wos_stage_distributed_build_roots \
+    "$WORKSPACE_ROOT" "$LLVM_SRC" \
+    "$CLANG_BUILD" "$TARGET_SYSROOT/include"
+
 wos_timed_step "build" "clang_for_wos" \
     ninja -C "$CLANG_BUILD" -j"$WOS_LLVM_NINJA_JOBS" "${WOS_LLVM_BIN_OUTPUTS[@]}"
 

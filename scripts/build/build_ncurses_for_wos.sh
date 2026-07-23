@@ -318,6 +318,11 @@ wos_timed_step "configure" "ncurses" \
     --with-terminfo-dirs=/usr/share/terminfo \
     --with-fallbacks=xterm,xterm-256color,screen,screen-256color,tmux,tmux-256color,rxvt,rxvt-256color,linux,vt100,vt220,ansi,dumb
 
+wos_make "$WOS_MAKE_JOBS" -C "$NCURSES_WORK" sources
+wos_stage_distributed_build_roots \
+    "$WORKSPACE_ROOT" "" \
+    "$NCURSES_WORK" "$TARGET_SYSROOT/include"
+
 wos_make "$WOS_MAKE_JOBS" -C "$NCURSES_WORK"
 # These top-level install goals overlap in ncurses' recursive include target.
 # Running them in one parallel make can make two sub-makes create and remove
