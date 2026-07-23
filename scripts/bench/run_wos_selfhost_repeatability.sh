@@ -267,7 +267,7 @@ capture_distributed_success_evidence() {
     printf 'host\tmarker_host\tsuccessful\n' > "$output"
     distributed_successful_hosts=0
     compiler_state="$(sed -n 's/.*distributed_compiler_state=\([^[:space:]]*\).*/\1/p' "$console_log" | tail -n 1)"
-    expected_compiler_state="${workdir%/}/tmp/distributed-compiler"
+    expected_compiler_state="${workdir%/}/state/distributed-compiler"
     if [ "$compiler_state" != "$expected_compiler_state" ]; then
         return 0
     fi

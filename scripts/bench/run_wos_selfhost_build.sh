@@ -1110,8 +1110,10 @@ safe_prepare_workdir() {
     if [ "$mode" = "wos" ] && [ "$distributed" = "1" ]; then
         # The workdir is already forwarded to every placement target. Keep the
         # compiler response/state tree there so each job reuses that attachment
-        # instead of creating a new remote-VFS forwarding rule.
-        distributed_compiler_state="$workdir/tmp/distributed-compiler"
+        # instead of creating a new remote-VFS forwarding rule. Do not place
+        # persistent scheduler state in TMPDIR: package builds may legally
+        # clean top-level temporary files while parallel compiler jobs run.
+        distributed_compiler_state="$workdir/state/distributed-compiler"
     fi
     : > "$report"
     : > "$detail_report"
