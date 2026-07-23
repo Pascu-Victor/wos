@@ -278,6 +278,7 @@ KTEST(VFS, MetadataCacheRepeatedStatRecordsHit) {
     ker::vfs::File* f = ker::vfs::vfs_open_file(PATH, ker::vfs::O_CREAT | 1, 0644);
     KREQUIRE_NE(f, nullptr);
     ker::vfs::vfs_put_file(f);
+    ker::vfs::vfs_cache_notify_path_changed(PATH, nullptr);
 
     ker::vfs::VfsCachePerfSnapshot before{};
     ker::vfs::vfs_get_cache_perf_snapshot(before);
@@ -445,6 +446,7 @@ KTEST(VFS, SymlinkCacheRepeatedReadlinkRecordsHit) {
     KREQUIRE_NE(f, nullptr);
     ker::vfs::vfs_put_file(f);
     KEXPECT_EQ(ker::vfs::vfs_symlink(TARGET, LINK), 0);
+    ker::vfs::vfs_cache_notify_path_changed(LINK, nullptr);
 
     ker::vfs::VfsCachePerfSnapshot before{};
     ker::vfs::vfs_get_cache_perf_snapshot(before);
@@ -474,6 +476,7 @@ KTEST(VFS, SymlinkCacheRepeatedNegativeReadlinkRecordsHit) {
     ker::vfs::File* f = ker::vfs::vfs_open_file(PATH, ker::vfs::O_CREAT | 1, 0644);
     KREQUIRE_NE(f, nullptr);
     ker::vfs::vfs_put_file(f);
+    ker::vfs::vfs_cache_notify_path_changed(PATH, nullptr);
 
     ker::vfs::VfsCachePerfSnapshot before{};
     ker::vfs::vfs_get_cache_perf_snapshot(before);

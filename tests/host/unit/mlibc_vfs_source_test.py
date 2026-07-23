@@ -777,14 +777,14 @@ def test_tmpfs_permission_denied_open_runs_close_hook() -> None:
     require_order(
         open_body,
         [
-            "int const PERM_RET = vfs_check_permission(node->mode, node->uid, node->gid, required_access)",
+            "int const PERM_RET = vfs_check_permission_for_task(task, node->mode, node->uid, node->gid, required_access)",
             "if (PERM_RET < 0)",
             "vfs_destroy_file(f)",
             "return PERM_RET",
         ],
         "tmpfs permission-denied open cleanup",
     )
-    denied_cleanup = open_body[open_body.find("int const PERM_RET = vfs_check_permission") :]
+    denied_cleanup = open_body[open_body.find("int const PERM_RET = vfs_check_permission_for_task") :]
     denied_cleanup = denied_cleanup[: denied_cleanup.find("int const TRUNCATE_RET = apply_open_truncation")]
     if "delete f" in denied_cleanup or "vfs_file_clear_path(f)" in denied_cleanup:
         fail("permission-denied tmpfs open must use vfs_destroy_file so tmpfs close decrements open_count")

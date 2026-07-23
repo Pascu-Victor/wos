@@ -190,7 +190,7 @@ def test_vfs_route_scratch_is_initialized_by_its_producer() -> None:
 
     caller_specs = [
         (
-            "normalize_task_path_inplace_with_route",
+            "normalize_task_path_inplace_for_task",
             "int const ROUTE_RESULT = apply_task_vfs_route",
             "if (ROUTE_RESULT < 0)",
             "copy_path_string(routed.data(), path, bufsize)",
@@ -223,8 +223,8 @@ def test_vfs_route_scratch_is_initialized_by_its_producer() -> None:
         if "std::array<char, MAX_PATH_LEN> routed{};" in body:
             fail(f"{function_name} must not value-initialize fully produced route scratch")
 
-    normalizer = function_body(core, "normalize_task_path_inplace_with_route")
-    normalizer_producer = "int const ROUTE_RESULT = apply_task_vfs_route(current_task, path, routed.data(), routed.size());"
+    normalizer = function_body(core, "normalize_task_path_inplace_for_task")
+    normalizer_producer = "int const ROUTE_RESULT = apply_task_vfs_route(task, path, routed.data(), routed.size());"
     normalizer_gate = "if (ROUTE_RESULT < 0) {\n        return ROUTE_RESULT;\n    }"
     normalizer_consumer = "return copy_path_string(routed.data(), path, bufsize);"
     normalizer_producer_pos = normalizer.find(normalizer_producer)

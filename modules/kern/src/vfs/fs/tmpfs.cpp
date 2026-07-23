@@ -674,6 +674,7 @@ auto tmpfs_create_symlink(TmpNode* parent, const char* name, const char* target)
     while (target[target_len] != '\0') {
         target_len++;
     }
+    node->size = target_len;
     node->symlink_target = new char[target_len + 1];
     if (node->symlink_target == nullptr) {
         delete node;
