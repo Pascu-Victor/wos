@@ -287,6 +287,13 @@ if [ "$HOST_SYSTEM" = "WOS" ]; then
 fi
 
 build_busybox_target prepare
+# Upstream's out-of-tree prepare rule unconditionally creates include2/asm,
+# although this BusyBox tree has no include/asm-$ARCH directory. The compiler
+# does not consume that path, but distributed staging dereferences symlinks and
+# must not archive a dangling generated link.
+if [ -L "$BB_BUILD/include2/asm" ] && [ ! -e "$BB_BUILD/include2/asm" ]; then
+    rm -f "$BB_BUILD/include2/asm"
+fi
 wos_stage_distributed_build_roots \
     "$WORKSPACE_ROOT" "$BB_SRC" \
     "$BB_BUILD" "$TARGET_SYSROOT/include"
