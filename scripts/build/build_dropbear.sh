@@ -307,6 +307,7 @@ fi
 # Build dropbearmulti (combined binary like busybox). Don't pass CFLAGS on the
 # make command line: bundled libtommath appends Dropbear-specific include paths
 # via its own Makefile, and command-line CFLAGS suppress those additions.
+wos_make "$WOS_MAKE_JOBS" -C "$DB_BUILD" default_options_guard.h
 wos_stage_distributed_build_roots \
     "$WORKSPACE_ROOT" "$DB_SRC" \
     "$DB_BUILD" "$TARGET_SYSROOT/include"

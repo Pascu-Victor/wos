@@ -395,6 +395,9 @@ def test_wos_toolchain_stages_configured_build_roots() -> None:
             'if [ -L "$BB_BUILD/include2/asm" ] && [ ! -e "$BB_BUILD/include2/asm" ]; then',
             'rm -f "$BB_BUILD/include2/asm"',
         ],
+        "build_dropbear.sh": [
+            'wos_make "$WOS_MAKE_JOBS" -C "$DB_BUILD" default_options_guard.h'
+        ],
         "build_bash_for_wos.sh": [
             "version.h parser-built signames.h syntax.c builtins/builtext.h",
             'for definition in "$BASH_WORK"/builtins/*.def',
