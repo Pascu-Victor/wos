@@ -124,13 +124,30 @@ wos_record_detail() {
         "$(uname -s 2>/dev/null || printf unknown)" >> "$output"
 }
 
+wos_run_timed_step_command() {
+    local phase="$1"
+    shift
+
+    # Configure probes create transient source/build paths after the immutable
+    # staged roots were copied to peers. Keep those small probes local; build
+    # phases run only after their configured roots have been staged.
+    if [ "$phase" = configure ] &&
+        [ "${WOS_DISTRIBUTED_COMPILER:-0}" = 1 ] &&
+        [ "${WOS_DISTRIBUTED_COMPILER_TRANSPORT:-source}" = staged ]; then
+        WOS_DISTRIBUTED_COMPILER=0 "$@"
+        return $?
+    fi
+
+    "$@"
+}
+
 wos_timed_step() {
     local phase="$1"
     local label="$2"
     shift 2
 
     if [ -z "$(wos_detail_file)" ]; then
-        "$@"
+        wos_run_timed_step_command "$phase" "$@"
         return $?
     fi
 
@@ -147,7 +164,7 @@ wos_timed_step() {
             ;;
     esac
 
-    "$@"
+    wos_run_timed_step_command "$phase" "$@"
     status=$?
 
     if [ "$had_errexit" -eq 1 ]; then
