@@ -233,6 +233,29 @@ def test_wos_bootstrap_distributes_only_compiler_processes() -> None:
         fail("distributed compiler selection must not serialize through a global spin lock")
 
 
+def test_wos_toolchain_stages_sources_before_distributed_compiles() -> None:
+    source = (ROOT / "tools" / "wos-toolchain.sh").read_text()
+    require_tokens(
+        source,
+        [
+            "stage_distributed_compiler_roots()",
+            'WOS_DISTRIBUTED_COMPILER_STAGE_BASE="$(dirname "$WORKSPACE_ROOT")"',
+            'stage_distributed_compiler_roots "$B/src/mlibc" "$HOST/lib" "$SYSROOT/include"',
+            'stage_distributed_compiler_roots "$SYSROOT/include"',
+            'stage_distributed_compiler_roots "$B/src/llvm-project/compiler-rt"',
+            'stage_distributed_compiler_roots "$B/src/cmake" "$SYSROOT/include"',
+            'stage_distributed_compiler_roots "$B/src/llvm-project" "$SYSROOT/include"',
+        ],
+        "WOS source-local compiler staging",
+    )
+    initial_stage = source.find(
+        'stage_distributed_compiler_roots "$B/src/mlibc" "$HOST/lib" "$SYSROOT/include"'
+    )
+    first_crt_compile = source.find("$CC -O3 -c empty.c")
+    if initial_stage < 0 or first_crt_compile < 0 or initial_stage >= first_crt_compile:
+        fail("WOS source staging must initialize its manifest before the first target compile")
+
+
 def test_wos_bootstrap_repairs_only_link_output_mode() -> None:
     with tempfile.TemporaryDirectory() as temp_dir:
         script = r'''
@@ -2341,6 +2364,7 @@ def test_selfhost_report_comparator_checks_clone_build_and_total() -> None:
 if __name__ == "__main__":
     test_selfhost_runner_covers_acceptance_flow()
     test_wos_bootstrap_distributes_only_compiler_processes()
+    test_wos_toolchain_stages_sources_before_distributed_compiles()
     test_wos_bootstrap_repairs_only_link_output_mode()
     test_wos_bootstrap_caps_concurrent_compilers_per_host()
     test_wos_bootstrap_remote_response_file_preserves_arguments()

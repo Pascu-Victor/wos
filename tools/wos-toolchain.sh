@@ -471,6 +471,7 @@ bootstrap_phase_start 1 "target sysroot skeleton and mlibc headers"
 mkdir -p $SYSROOT/bin $SYSROOT/lib $SYSROOT/include/abi-bits
 [ ! -e $SYSROOT/usr ] && ln -sf . $SYSROOT/usr
 [ ! -e $SYSROOT/lib64 ] && ln -sf lib $SYSROOT/lib64
+stage_distributed_compiler_roots "$B/src/mlibc" "$HOST/lib" "$SYSROOT/include"
 
 # headers-only mlibc -- compiler-rt needs these
 # Create a basic cross-file for headers-only build
@@ -506,6 +507,7 @@ wos_timed_step "install" "mlibc_headers" \
     wos_run_in_dir "$B/mlibc-headers" \
     ninja -j"$WOS_NINJA_JOBS" install
 cd $B/mlibc-headers
+stage_distributed_compiler_roots "$SYSROOT/include"
 
 # Create minimal CRT files for compiler-rt build (these will be replaced by mlibc later)
 touch empty.c
@@ -524,7 +526,7 @@ bootstrap_phase_end
 # 2. Build the compiler-rt pieces needed to finish the libc bootstrap.
 # Sanitizers are built after mlibc installs real libc/libpthread/libm/etc.
 bootstrap_phase_start 2 "compiler-rt builtins and profile bootstrap"
-stage_distributed_compiler_roots "$B/src/llvm-project/compiler-rt" "$HOST/lib" "$SYSROOT/include"
+stage_distributed_compiler_roots "$B/src/llvm-project/compiler-rt"
 export CFLAGS="--sysroot=$SYSROOT -std=c23 -fno-sanitize=safe-stack "
 export CXXFLAGS="--sysroot=$SYSROOT -std=c++23 -fno-sanitize=safe-stack "
 unset LDFLAGS
