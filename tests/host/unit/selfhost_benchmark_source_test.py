@@ -358,6 +358,7 @@ def test_wos_toolchain_stages_configured_build_roots() -> None:
         ],
         "build_cmake_for_wos.sh": [
             'wos_timed_step "configure" "cmake_for_wos"',
+            'wos_timed_step "generate" "cmake_for_wos_pch"',
             "wos_stage_distributed_build_roots",
             'wos_timed_step "build" "cmake_for_wos"',
         ],
@@ -402,6 +403,10 @@ def test_wos_toolchain_stages_configured_build_roots() -> None:
         ],
         "build_make.sh": [
             'wos_make 1 -C "$MAKE_BUILD/lib" alloca.h fnmatch.h glob.h'
+        ],
+        "build_cmake_for_wos.sh": [
+            "Source/CMakeFiles/CMakeLib.dir/cmake_pch.hxx.pch",
+            "Source/CMakeFiles/CTestLib.dir/cmake_pch.hxx.pch",
         ],
         "build_bash_for_wos.sh": [
             "version.h parser-built signames.h syntax.c builtins/builtext.h",

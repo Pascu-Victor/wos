@@ -15,6 +15,7 @@ wos_setup_ccache
 wos_setup_ccache_cmake_args
 WOS_BUILD_JOBS="$(wos_build_jobs)"
 WOS_NINJA_JOBS="$(wos_ninja_jobs)"
+HOST_SYSTEM="$(uname -s 2>/dev/null || printf unknown)"
 
 B="$WORKSPACE_ROOT/toolchain"
 HOST="${WOS_HOST_TOOLCHAIN_ROOT:-$B/host}"
@@ -143,6 +144,18 @@ wos_timed_step "configure" "cmake_for_wos" \
     -DBUILD_CursesDialog=OFF \
     -DBUILD_QtDialog=OFF \
     -DCMake_BUILD_DEVELOPER_REFERENCE=OFF
+
+if [ "$HOST_SYSTEM" = "WOS" ] &&
+    [ "${WOS_DISTRIBUTED_COMPILER_TRANSPORT:-source}" = staged ]; then
+    # PCH consumers are independent Ninja edges and may start immediately
+    # after the PCH edge. Generate the two shared artifacts on the submitter
+    # before taking the immutable peer snapshot.
+    wos_timed_step "generate" "cmake_for_wos_pch" \
+        env WOS_DISTRIBUTED_COMPILER=0 \
+        cmake --build "$CMAKE_BUILD" --parallel 2 --target \
+        Source/CMakeFiles/CMakeLib.dir/cmake_pch.hxx.pch \
+        Source/CMakeFiles/CTestLib.dir/cmake_pch.hxx.pch
+fi
 
 wos_stage_distributed_build_roots \
     "$WORKSPACE_ROOT" "$CMAKE_SRC" \
