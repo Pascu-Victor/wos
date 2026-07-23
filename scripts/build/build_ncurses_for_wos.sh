@@ -324,11 +324,12 @@ wos_stage_distributed_build_roots \
     "$NCURSES_WORK" "$TARGET_SYSROOT/include"
 
 wos_make "$WOS_MAKE_JOBS" -C "$NCURSES_WORK"
-# These top-level install goals overlap in ncurses' recursive include target.
-# Running them in one parallel make can make two sub-makes create and remove
-# the same generated headers.sed temporary files.
+# These top-level install goals and their double-colon subdirectory recipes
+# overlap in ncurses' recursive include target. Run both the goals and each
+# recursive install serially: parallel headers.sh instances name temporary
+# files from short-lived PIDs and can remove one another's headers.sed file.
 for install_target in install.libs install.includes install.data; do
-    wos_make "$WOS_MAKE_JOBS" -C "$NCURSES_WORK" \
+    wos_make 1 -C "$NCURSES_WORK" \
         DESTDIR="$TARGET_SYSROOT" \
         "$install_target"
 done
