@@ -291,10 +291,9 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
             compiler_local_jobs="\$compiler_total_jobs"
             ;;
     esac
-    # The self-host runner validates that compiler_hosts[0] is the submitter.
-    # Keep the full Ninja width available locally: Ninja already bounds the
-    # process count, and shrinking local slots after peer slots become
-    # persistent would leave wrappers spinning while usable CPUs sit idle.
+    # The self-host runner validates that compiler_hosts[0] is the submitter
+    # and supplies separate local, preprocessing, and peer limits for reusable
+    # slots. Persistent proof-only slots retain the full local Ninja width.
     compiler_jobs_per_host="\${WOS_DISTRIBUTED_COMPILER_JOBS_PER_HOST:-}"
     case "\$compiler_jobs_per_host" in
         '')
@@ -306,14 +305,27 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
             exit 1
             ;;
         *)
-            compiler_local_jobs="\$compiler_jobs_per_host"
-            compiler_remote_jobs_per_host="\$compiler_jobs_per_host"
+            compiler_local_jobs="\${WOS_DISTRIBUTED_COMPILER_LOCAL_JOBS:-\$compiler_jobs_per_host}"
+            compiler_remote_jobs_per_host="\${WOS_DISTRIBUTED_COMPILER_REMOTE_JOBS_PER_HOST:-\$compiler_jobs_per_host}"
             compiler_persist_remote_slots=0
+            ;;
+    esac
+    case "\$compiler_local_jobs" in
+        ''|*[!0-9]*|0)
+            echo "ERROR: distributed compiler local jobs must be a positive integer" >&2
+            exit 1
             ;;
     esac
     case "\$compiler_remote_jobs_per_host" in
         ''|*[!0-9]*|0)
             echo "ERROR: distributed compiler remote jobs per host must be a positive integer" >&2
+            exit 1
+            ;;
+    esac
+    compiler_preprocess_jobs="\${WOS_DISTRIBUTED_COMPILER_PREPROCESS_JOBS:-\$compiler_local_jobs}"
+    case "\$compiler_preprocess_jobs" in
+        ''|*[!0-9]*|0)
+            echo "ERROR: distributed compiler preprocess jobs must be a positive integer" >&2
             exit 1
             ;;
     esac
@@ -494,9 +506,10 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
             exit "\$compiler_status"
         fi
         compiler_responses="\$compiler_state.responses"
-        if ! mkdir -p "\$compiler_responses"; then
+        compiler_preprocess_slots="\$compiler_state.preprocess-slots"
+        if ! mkdir -p "\$compiler_responses" "\$compiler_preprocess_slots"; then
             compiler_slot_release
-            echo "ERROR: distributed compiler response directory could not be created" >&2
+            echo "ERROR: distributed compiler scratch directories could not be created" >&2
             exit 1
         fi
         # WOS mktemp currently races when many wrappers create directories at
@@ -514,15 +527,38 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
             exit 1
         fi
         compiler_input="\$compiler_job_dir/input"
+        compiler_preprocess_slot=""
+        compiler_preprocess_slot_release() {
+            if [ -n "\$compiler_preprocess_slot" ]; then
+                rmdir "\$compiler_preprocess_slot" 2>/dev/null || true
+                compiler_preprocess_slot=""
+            fi
+        }
         compiler_input_cleanup() {
             rm -f -- "\$compiler_input" 2>/dev/null || true
             rmdir "\$compiler_job_dir" 2>/dev/null || true
         }
         compiler_input_and_slot_cleanup() {
             compiler_input_cleanup
+            compiler_preprocess_slot_release
             compiler_slot_release
         }
         trap compiler_input_and_slot_cleanup EXIT HUP INT TERM
+        compiler_preprocess_start="\$((RANDOM % compiler_preprocess_jobs))"
+        while [ -z "\$compiler_preprocess_slot" ]; do
+            for ((compiler_preprocess_offset = 0; compiler_preprocess_offset < compiler_preprocess_jobs; compiler_preprocess_offset++)); do
+                compiler_preprocess_index="\$(((compiler_preprocess_start + compiler_preprocess_offset) % compiler_preprocess_jobs))"
+                compiler_preprocess_candidate="\$compiler_preprocess_slots/\$compiler_preprocess_index"
+                if mkdir "\$compiler_preprocess_candidate" 2>/dev/null; then
+                    compiler_preprocess_slot="\$compiler_preprocess_candidate"
+                    break
+                fi
+            done
+            if [ -z "\$compiler_preprocess_slot" ]; then
+                compiler_preprocess_start="\$(((compiler_preprocess_start + 1) % compiler_preprocess_jobs))"
+                sleep 0
+            fi
+        done
         if "\${compiler[@]}" "\$@" "\${compiler_preprocess_args[@]}" -o "\$compiler_input" -Wno-unused-command-line-argument; then
             compiler_status=0
         else
@@ -531,6 +567,7 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
             trap - EXIT HUP INT TERM
             exit "\$compiler_status"
         fi
+        compiler_preprocess_slot_release
         compiler_input_size="\$(stat -c %s -- "\$compiler_input" 2>/dev/null || true)"
         case "\$compiler_input_size" in
             ''|*[!0-9]*)

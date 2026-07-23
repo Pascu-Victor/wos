@@ -145,6 +145,7 @@ distributed_hosts="${WOS_SELFHOST_DISTRIBUTED_HOSTS:-}"
 distributed_jobs_per_host="${WOS_SELFHOST_DISTRIBUTED_JOBS_PER_HOST:-}"
 distributed_compiler_transport="${WOS_SELFHOST_DISTRIBUTED_COMPILER_TRANSPORT:-rewritten}"
 distributed_local_jobs="${WOS_SELFHOST_DISTRIBUTED_LOCAL_JOBS:-}"
+distributed_preprocess_jobs="${WOS_SELFHOST_DISTRIBUTED_PREPROCESS_JOBS:-}"
 distributed_remote_jobs_per_host="${WOS_SELFHOST_DISTRIBUTED_REMOTE_JOBS_PER_HOST:-}"
 clean_path="${WOS_SELFHOST_CLEAN_PATH:-}"
 priority_reset="${WOS_SELFHOST_PRIORITY_RESET:-}"
@@ -735,6 +736,57 @@ require_tool() {
 }
 
 validate_runtime_settings() {
+    if [ "$mode" = "wos" ] && [ "$distributed" = "1" ]; then
+        local submitter_cpus=""
+        local peer_hostname peer_node peer_connected peer_cpus peer_load peer_update peer_local
+        if [ -r /proc/wki/peers ]; then
+            while read -r peer_hostname peer_node peer_connected peer_cpus peer_load peer_update peer_local; do
+                if [ "$peer_local" = "1" ]; then
+                    submitter_cpus="$peer_cpus"
+                    break
+                fi
+            done < /proc/wki/peers
+        fi
+        case "$submitter_cpus" in
+            ''|*[!0-9]*|0) submitter_cpus="$distributed_jobs_per_host" ;;
+        esac
+
+        if [ -z "$distributed_local_jobs" ]; then
+            if [ "$distributed_compiler_transport" = "source" ]; then
+                distributed_local_jobs="$distributed_jobs_per_host"
+            else
+                distributed_local_jobs="$((submitter_cpus / 3))"
+                [ "$distributed_local_jobs" -gt 0 ] || distributed_local_jobs=1
+            fi
+        fi
+        if [ -z "$distributed_preprocess_jobs" ]; then
+            distributed_preprocess_jobs="$((submitter_cpus - distributed_local_jobs))"
+            [ "$distributed_preprocess_jobs" -gt 0 ] || distributed_preprocess_jobs=1
+        fi
+        if [ -z "$distributed_remote_jobs_per_host" ]; then
+            distributed_remote_jobs_per_host="$distributed_jobs_per_host"
+        fi
+        case "$distributed_local_jobs" in
+            ''|*[!0-9]*|0)
+                echo "ERROR: distributed local jobs must be a positive integer" >&2
+                exit 1
+                ;;
+        esac
+        case "$distributed_preprocess_jobs" in
+            ''|*[!0-9]*|0)
+                echo "ERROR: distributed preprocess jobs must be a positive integer" >&2
+                exit 1
+                ;;
+        esac
+        case "$distributed_remote_jobs_per_host" in
+            ''|*[!0-9]*|0)
+                echo "ERROR: distributed remote jobs per host must be a positive integer" >&2
+                exit 1
+                ;;
+        esac
+        log "distributed_compiler_limits=local:$distributed_local_jobs preprocess:$distributed_preprocess_jobs remote_per_host:$distributed_remote_jobs_per_host"
+    fi
+
     if [ -n "$host_toolchain" ]; then
         if [ ! -x "$host_toolchain/bin/clang" ] || [ ! -x "$host_toolchain/bin/cmake" ]; then
             echo "ERROR: WOS_SELFHOST_HOST_TOOLCHAIN must contain bin/clang and bin/cmake: $host_toolchain" >&2
@@ -837,6 +889,7 @@ run_with_jobs_env() {
             WOS_DISTRIBUTED_COMPILER_TRANSPORT="$distributed_compiler_transport" \
             WOS_DISTRIBUTED_COMPILER_JOBS_PER_HOST="$distributed_jobs_per_host" \
             WOS_DISTRIBUTED_COMPILER_LOCAL_JOBS="$distributed_local_jobs" \
+            WOS_DISTRIBUTED_COMPILER_PREPROCESS_JOBS="$distributed_preprocess_jobs" \
             WOS_DISTRIBUTED_COMPILER_REMOTE_JOBS_PER_HOST="$distributed_remote_jobs_per_host" \
             "$@"
     else
@@ -1496,6 +1549,7 @@ run_wos() {
     remote_env+=" WOS_SELFHOST_DISTRIBUTED_JOBS_PER_HOST=$(shell_quote "$distributed_jobs_per_host")"
     remote_env+=" WOS_SELFHOST_DISTRIBUTED_COMPILER_TRANSPORT=$(shell_quote "$distributed_compiler_transport")"
     remote_env+=" WOS_SELFHOST_DISTRIBUTED_LOCAL_JOBS=$(shell_quote "$distributed_local_jobs")"
+    remote_env+=" WOS_SELFHOST_DISTRIBUTED_PREPROCESS_JOBS=$(shell_quote "$distributed_preprocess_jobs")"
     remote_env+=" WOS_SELFHOST_DISTRIBUTED_REMOTE_JOBS_PER_HOST=$(shell_quote "$distributed_remote_jobs_per_host")"
     remote_env+=" WOS_SELFHOST_HEARTBEAT_INTERVAL=$(shell_quote "$heartbeat_interval")"
     remote_env+=" WOS_SELFHOST_HEARTBEAT_TAIL=$(shell_quote "$heartbeat_tail")"
@@ -1568,6 +1622,7 @@ distributed_hosts=""
 distributed_jobs_per_host=""
 distributed_compiler_transport="${WOS_SELFHOST_DISTRIBUTED_COMPILER_TRANSPORT:-rewritten}"
 distributed_local_jobs="${WOS_SELFHOST_DISTRIBUTED_LOCAL_JOBS:-}"
+distributed_preprocess_jobs="${WOS_SELFHOST_DISTRIBUTED_PREPROCESS_JOBS:-}"
 distributed_remote_jobs_per_host="${WOS_SELFHOST_DISTRIBUTED_REMOTE_JOBS_PER_HOST:-}"
 
 while (($# > 0)); do
@@ -1739,17 +1794,17 @@ if [ "$distributed" -eq 1 ]; then
         source|preprocessed|rewritten) ;;
         *) die "distributed compiler transport must be 'source', 'preprocessed', or 'rewritten'" ;;
     esac
-    if [ -z "$distributed_local_jobs" ]; then
-        distributed_local_jobs="$distributed_jobs_per_host"
-    fi
-    if [ -z "$distributed_remote_jobs_per_host" ]; then
-        distributed_remote_jobs_per_host="$distributed_jobs_per_host"
-    fi
     case "$distributed_local_jobs" in
-        ''|*[!0-9]*|0) die "distributed local jobs must be a positive integer" ;;
+        '' ) ;;
+        *[!0-9]*|0) die "distributed local jobs must be a positive integer" ;;
+    esac
+    case "$distributed_preprocess_jobs" in
+        '' ) ;;
+        *[!0-9]*|0) die "distributed preprocess jobs must be a positive integer" ;;
     esac
     case "$distributed_remote_jobs_per_host" in
-        ''|*[!0-9]*|0) die "distributed remote jobs per host must be a positive integer" ;;
+        '' ) ;;
+        *[!0-9]*|0) die "distributed remote jobs per host must be a positive integer" ;;
     esac
 elif [ -n "$distributed_hosts" ]; then
     die "--distributed-hosts requires --distributed"
