@@ -1782,6 +1782,8 @@ def test_timer_waitpid_repair_rechecks_stranded_waiters_without_sigchld() -> Non
         ],
         "orphaned waitpid repair signature",
     )
+    if "candidate->sched_next" in orphan_predicate_body:
+        fail("stale intrusive linkage must not hide an ownerless waitpid task from the registry audit")
     require_tokens(
         orphan_repair_body,
         [
@@ -1857,6 +1859,8 @@ def test_timer_waitpid_repair_rechecks_stranded_waiters_without_sigchld() -> Non
         ],
         "waitpid preserve requeue must keep fallback repair armed",
     )
+    if "task->sched_next" in waitpid_requeue_body:
+        fail("stale intrusive linkage must not prevent waitpid owner-scan recovery")
     require_order(
         waitpid_requeue_body,
         "task->last_sleep_start_us = time::get_us();",

@@ -2286,9 +2286,8 @@ inline auto orphaned_waitpid_candidate_locked(RunQueue* rq, task::Task* candidat
            candidate->scheduler_published.load(std::memory_order_acquire) && !candidate->gc_queued.load(std::memory_order_acquire) &&
            candidate->wki_proxy_task_id == 0 && candidate->sched_queue == task::Task::sched_queue::WAITING &&
            candidate->wait_channel_is(task::WaitChannelKind::WAITPID) && candidate->waiting_for_pid != 0 &&
-           !candidate->deferred_task_switch && candidate->heap_index < 0 && candidate->sched_next == nullptr &&
-           !runqueue_task_is_reserved_locked(rq, candidate) && !rq->runnable_heap.contains(candidate) &&
-           !wait_list_contains_locked(rq, candidate);
+           !candidate->deferred_task_switch && candidate->heap_index < 0 && !runqueue_task_is_reserved_locked(rq, candidate) &&
+           !rq->runnable_heap.contains(candidate) && !wait_list_contains_locked(rq, candidate);
 }
 
 void repair_one_orphaned_waitpid_from_registry() {
@@ -6022,8 +6021,7 @@ void reschedule_task_for_cpu_once(uint64_t cpu_no, task::Task* task) {
         // wait list.  Republish that orphan instead of relying on an unrelated
         // future wake to repair it.
         bool const ORPHANED_WAITPID = !found_and_removed && task->scheduler_published.load(std::memory_order_acquire) &&
-                                      task->sched_queue == task::Task::sched_queue::WAITING && task->heap_index < 0 &&
-                                      task->sched_next == nullptr;
+                                      task->sched_queue == task::Task::sched_queue::WAITING && task->heap_index < 0;
         if (found_and_removed || ORPHANED_WAITPID) {
             uint64_t owner_cpu = found_owner_cpu;
             if (owner_cpu >= NCPUS_RESCHED) {
@@ -8394,7 +8392,8 @@ auto scheduler_selftest_waitpid_wait_publication_arms_repair() -> bool {
     waiter.set_wait_channel("waitpid", task::WaitChannelKind::WAITPID);
 
     bool const ZERO_STAMP_REPAIR_DUE = waitpid_repair_due(&waiter, 1);
-    bool const ORPHAN_RECOGNIZED = orphaned_waitpid_candidate_locked(rq, &waiter);
+    waiter.sched_next = &waiter;
+    bool const ORPHAN_WITH_STALE_LINK_RECOGNIZED = orphaned_waitpid_candidate_locked(rq, &waiter);
     wait_list_push_locked(rq, &waiter);
     uint64_t const FIRST_SLEEP_START_US = waiter.last_sleep_start_us;
     uint64_t const FIRST_DEADLINE_US = rq->next_wait_deadline_us;
@@ -8412,8 +8411,8 @@ auto scheduler_selftest_waitpid_wait_publication_arms_repair() -> bool {
                                           waitpid_repair_due(&waiter, 100 + WAITPID_REPAIR_FALLBACK_MIN_US);
     wait_list_remove_all_locked(rq, &waiter);
     task::task_clear_waitpid_block_state(waiter);
-    return ZERO_STAMP_REPAIR_DUE && ORPHAN_RECOGNIZED && ARMED && LINKED_WAITER_NOT_ORPHANED && UNLINKED_STAMPED_WAITER_RECOGNIZED &&
-           PRESERVED && REPAIR_BACKOFF_PRESERVED && rq->next_wait_deadline_us == 0;
+    return ZERO_STAMP_REPAIR_DUE && ORPHAN_WITH_STALE_LINK_RECOGNIZED && ARMED && LINKED_WAITER_NOT_ORPHANED &&
+           UNLINKED_STAMPED_WAITER_RECOGNIZED && PRESERVED && REPAIR_BACKOFF_PRESERVED && rq->next_wait_deadline_us == 0;
 }
 
 auto scheduler_selftest_reserved_wake_precedes_handoff_commit() -> bool {
