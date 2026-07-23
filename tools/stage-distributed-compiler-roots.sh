@@ -99,25 +99,6 @@ while IFS= read -r retained_root; do
     add_active_root "$canonical_root"
 done <<< "${WOS_DISTRIBUTED_COMPILER_RETAINED_ROOTS:-}"
 
-# WOS BusyBox tar currently drops leading ../ components from relative symlink
-# targets while extracting. Dereference trusted in-tree links when creating the
-# archive, but first prove that every followed target stays inside stage_base.
-for root in "${roots[@]}"; do
-    while IFS= read -r -d '' root_link; do
-        if ! root_link_target="$(realpath "$root_link")"; then
-            echo "ERROR: distributed compiler root contains a broken symlink: $root_link" >&2
-            exit 1
-        fi
-        case "$root_link_target" in
-            "$stage_base"/*) ;;
-            *)
-                echo "ERROR: distributed compiler root symlink escapes stage base: $root_link -> $root_link_target" >&2
-                exit 1
-                ;;
-        esac
-    done < <(find "$root" -type l -print0)
-done
-
 IFS=, read -r -a hosts <<< "$hosts_csv"
 if [ "${#hosts[@]}" -lt 2 ]; then
     echo "ERROR: staged compiler roots require at least two hosts" >&2
@@ -147,10 +128,16 @@ case "$stage_retry_delay" in
 esac
 mkdir -p "$stage_dir"
 archive="$stage_dir/roots.$$.tar"
+archive_tmp=""
+root_links="$stage_dir/links.$$.list"
 manifest_tmp=""
 manifest_sorted=""
 cleanup() {
     rm -f -- "$archive" 2>/dev/null || true
+    if [ -n "$archive_tmp" ]; then
+        rm -f -- "$archive_tmp" 2>/dev/null || true
+    fi
+    rm -f -- "$root_links" 2>/dev/null || true
     if [ -n "$manifest_tmp" ]; then
         rm -f -- "$manifest_tmp" 2>/dev/null || true
     fi
@@ -160,7 +147,69 @@ cleanup() {
 }
 trap cleanup EXIT HUP INT TERM
 
-tar -h -C / -cf "$archive" "${archive_entries[@]}"
+# WOS BusyBox tar currently drops leading ../ components from relative symlink
+# targets while extracting. Dereference trusted in-tree links when creating the
+# archive, but prove on every snapshot attempt that each followed target stays
+# inside stage_base. Capturing find output in a file also preserves its failure
+# status when a live build directory changes during traversal.
+validate_snapshot_roots() {
+    local root
+    local resolved_root
+    local root_link
+    local root_link_target
+
+    : > "$root_links"
+    for root in "${roots[@]}"; do
+        if ! resolved_root="$(realpath "$root")" ||
+            [ "$resolved_root" != "$root" ] ||
+            [ ! -d "$resolved_root" ]; then
+            echo "ERROR: distributed compiler root changed during snapshot: $root" >&2
+            return 1
+        fi
+        if ! find "$root" -type l -print0 >> "$root_links"; then
+            echo "ERROR: distributed compiler root changed during traversal: $root" >&2
+            return 1
+        fi
+    done
+
+    while IFS= read -r -d '' root_link; do
+        if ! root_link_target="$(realpath "$root_link")"; then
+            echo "ERROR: distributed compiler root contains a broken symlink: $root_link" >&2
+            return 1
+        fi
+        case "$root_link_target" in
+            "$stage_base"/*) ;;
+            *)
+                echo "ERROR: distributed compiler root symlink escapes stage base: $root_link -> $root_link_target" >&2
+                return 1
+                ;;
+        esac
+    done < "$root_links"
+}
+
+archive_attempt=1
+while :; do
+    archive_tmp="$stage_dir/roots.$$.${archive_attempt}.tar.tmp"
+    rm -f -- "$archive_tmp" 2>/dev/null || true
+    if validate_snapshot_roots &&
+        tar -h -C / -cf "$archive_tmp" "${archive_entries[@]}" &&
+        validate_snapshot_roots; then
+        mv -f -- "$archive_tmp" "$archive"
+        archive_tmp=""
+        break
+    fi
+    rm -f -- "$archive_tmp" 2>/dev/null || true
+    archive_tmp=""
+    if [ "$archive_attempt" -ge "$stage_retries" ]; then
+        echo "ERROR: distributed compiler root archive failed after $archive_attempt attempts" >&2
+        exit 1
+    fi
+    echo "warning: distributed compiler root archive changed during attempt $archive_attempt/$stage_retries; retrying" >&2
+    if [ "$stage_retry_delay" -gt 0 ]; then
+        sleep "$stage_retry_delay"
+    fi
+    archive_attempt=$((archive_attempt + 1))
+done
 
 stage_peer() {
     local peer="$1"

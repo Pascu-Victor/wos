@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path
@@ -1036,9 +1037,43 @@ def test_distributed_compiler_root_staging_is_guarded_and_atomic() -> None:
         mock_bin.mkdir()
         (mock_bin / "hostname").write_text("#!/bin/sh\nprintf '%s\\n' wos-0\n", encoding="ascii")
         (mock_bin / "hostname").chmod(0o755)
+        real_tar = shutil.which("tar")
+        if real_tar is None:
+            fail("tar is required for the distributed root staging test")
+        (mock_bin / "tar").write_text(
+            f"""#!/bin/bash
+set -eu
+if [ "${{1:-}}" = -h ]; then
+    if [ ! -e "$WOS_STAGE_MOCK_ARCHIVE_FAILURE_MARKER" ]; then
+        : > "$WOS_STAGE_MOCK_ARCHIVE_FAILURE_MARKER"
+        printf '%s\\n' 'mock transient archive mutation' >&2
+        exit 1
+    fi
+    {shlex.quote(real_tar)} "$@"
+    : > "$WOS_STAGE_MOCK_ARCHIVE_READY_MARKER"
+    exit 0
+fi
+exec {shlex.quote(real_tar)} "$@"
+""",
+            encoding="ascii",
+        )
+        (mock_bin / "tar").chmod(0o755)
+        real_find = shutil.which("find")
+        if real_find is None:
+            fail("find is required for the distributed root staging test")
+        (mock_bin / "find").write_text(
+            f"""#!/bin/bash
+set -eu
+printf '%s\\n' validation >> "$WOS_STAGE_MOCK_VALIDATION_LOG"
+exec {shlex.quote(real_find)} "$@"
+""",
+            encoding="ascii",
+        )
+        (mock_bin / "find").chmod(0o755)
         (mock_bin / "on").write_text(
             r'''#!/bin/bash
 set -eu
+[ -e "$WOS_STAGE_MOCK_ARCHIVE_READY_MARKER" ]
 [ "$1" = wos-1 ]
 shift
 if [ -n "${WOS_STAGE_MOCK_FAILURE_MARKER:-}" ] &&
@@ -1066,6 +1101,9 @@ exec "$@"
                 "WOS_DISTRIBUTED_COMPILER_STAGE_BASE": str(stage_base),
                 "WOS_DISTRIBUTED_COMPILER_RETAINED_ROOTS": str(retained),
                 "WOS_DISTRIBUTED_COMPILER_STAGE_RETRY_DELAY_SECONDS": "0",
+                "WOS_STAGE_MOCK_ARCHIVE_FAILURE_MARKER": str(temp / "archive-failed-once"),
+                "WOS_STAGE_MOCK_ARCHIVE_READY_MARKER": str(temp / "archive-ready"),
+                "WOS_STAGE_MOCK_VALIDATION_LOG": str(temp / "validation.log"),
                 "WOS_STAGE_MOCK_FAILURE_MARKER": str(temp / "stage-failed-once"),
             }
         )
@@ -1079,6 +1117,11 @@ exec "$@"
         )
         if result.returncode != 0:
             fail(f"distributed root staging failed: {result.stderr}")
+        if "root archive changed during attempt 1/3; retrying" not in result.stderr:
+            fail("distributed root staging did not retry a transient local archive mutation")
+        validation_log = Path(environment["WOS_STAGE_MOCK_VALIDATION_LOG"])
+        if len(validation_log.read_text(encoding="ascii").splitlines()) < 3:
+            fail("distributed root staging did not revalidate the successful archive retry")
         if "failed attempt 1/3; retrying" not in result.stderr:
             fail("distributed root staging did not retry a transient peer failure")
         manifest = Path(f"{state}.local-roots")
@@ -1114,6 +1157,7 @@ exec "$@"
         internal_escape.symlink_to(temp / "outside-internal", target_is_directory=True)
         (temp / "outside-internal").mkdir()
         before = manifest.read_text(encoding="ascii")
+        validations_before = len(validation_log.read_text(encoding="ascii").splitlines())
         result = subprocess.run(
             [str(STAGE_DISTRIBUTED_ROOTS), str(root)],
             cwd=ROOT,
@@ -1126,6 +1170,9 @@ exec "$@"
             fail("distributed root staging followed an internal symlink escape")
         if manifest.read_text(encoding="ascii") != before:
             fail("rejected internal symlink staging changed the published manifest")
+        validations_after = len(validation_log.read_text(encoding="ascii").splitlines())
+        if validations_after - validations_before != 3:
+            fail("distributed root staging did not revalidate a rejected symlink on every retry")
         internal_escape.unlink()
 
         outside = temp / "outside"
