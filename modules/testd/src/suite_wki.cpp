@@ -29,6 +29,21 @@ TESTD_RUN(test_wki_target_policy_syscalls) {
     }
     TESTD_PASS("wki_target_local_roundtrip");
 
+    rc = ker::process::setwkitarget(nullptr, 0, ker::process::WKI_TARGET_FLAG_BALANCED);
+    if (rc != 0) {
+        restore();
+        fail("wki_target_balanced_set", "balanced target set failed");
+        return;
+    }
+    flags = 0;
+    rc = ker::process::getwkitarget(hostname.data(), hostname.size(), &flags);
+    if (rc != 0 || flags != ker::process::WKI_TARGET_FLAG_BALANCED || hostname[0] != '\0') {
+        restore();
+        fail("wki_target_balanced_get", "balanced target flag did not round-trip");
+        return;
+    }
+    TESTD_PASS("wki_target_balanced_roundtrip");
+
     constexpr std::string_view HOST = "testd-remote";
     constexpr auto HOST_LEN = static_cast<int64_t>(HOST.size());
     rc = ker::process::setwkitarget(HOST.data(), HOST.size(), ker::process::WKI_TARGET_FLAG_REMOTE | ker::process::WKI_TARGET_FLAG_STRICT);
@@ -65,6 +80,14 @@ TESTD_RUN(test_wki_target_policy_syscalls) {
     }
     TESTD_PASS("wki_target_rejects_local_remote");
 
+    rc = ker::process::setwkitarget(nullptr, 0, ker::process::WKI_TARGET_FLAG_REMOTE | ker::process::WKI_TARGET_FLAG_BALANCED);
+    if (rc != -EINVAL) {
+        restore();
+        fail("wki_target_invalid_remote_balanced", "remote+balanced target flags were not rejected");
+        return;
+    }
+    TESTD_PASS("wki_target_rejects_remote_balanced");
+
     rc = ker::process::setwkitarget(HOST.data(), HOST.size(), ker::process::WKI_TARGET_FLAG_LOCAL);
     if (rc != -EINVAL) {
         restore();
@@ -72,6 +95,14 @@ TESTD_RUN(test_wki_target_policy_syscalls) {
         return;
     }
     TESTD_PASS("wki_target_rejects_hostname_local");
+
+    rc = ker::process::setwkitarget(HOST.data(), HOST.size(), ker::process::WKI_TARGET_FLAG_BALANCED);
+    if (rc != -EINVAL) {
+        restore();
+        fail("wki_target_invalid_hostname_balanced", "hostname+balanced target was not rejected");
+        return;
+    }
+    TESTD_PASS("wki_target_rejects_hostname_balanced");
 
     std::array<char, 64> too_long_hostname{};
     too_long_hostname.fill('x');

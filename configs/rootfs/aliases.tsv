@@ -32,6 +32,7 @@ symlink	/usr/sbin/powerctl	/usr/bin/halt
 symlink	/usr/sbin/powerctl	/usr/bin/shutdown
 symlink	/usr/bin/wkictl	/usr/bin/locally
 symlink	/usr/bin/wkictl	/usr/bin/remotely
+symlink	/usr/bin/wkictl	/usr/bin/anywhere
 symlink	/usr/bin/wkictl	/usr/bin/homeward
 symlink	/usr/bin/wkictl	/usr/bin/on
 symlink	/usr/bin/wkictl	/usr/bin/forward

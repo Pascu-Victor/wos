@@ -117,7 +117,8 @@ route_file="$1"
 compiler_cwd="$2"
 local_output="$3"
 host_output="$4"
-shift 4
+host_report="$5"
+shift 5
 route_args=()
 while IFS= read -r route_arg; do
     route_args+=("$route_arg")
@@ -127,10 +128,15 @@ set -eu
 compiler_cwd="$1"
 local_output="$2"
 host_output="$3"
-shift 3
+host_report="$4"
+shift 4
 trap '"'"'rm -f -- "$local_output" 2>/dev/null || true'"'"' EXIT HUP INT TERM
 rm -f -- "$local_output"
 cd -- "$compiler_cwd"
+if ! hostname > "$host_report" || ! fsync "$host_report"; then
+    echo "distributed staged compiler could not publish its selected system" >&2
+    exit 1
+fi
 compiler_status=0
 "$@" -o "$local_output" || compiler_status=$?
 if [ "$compiler_status" -ne 0 ]; then
@@ -151,7 +157,7 @@ if ! fsync "$host_output"; then
     echo "distributed staged compiler output fsync failed" >&2
     exit 1
 fi
-' distributed-staged "$compiler_cwd" "$local_output" "$host_output" "$@"
+' distributed-staged "$compiler_cwd" "$local_output" "$host_output" "$host_report" "$@"
 EOF
     chmod +x "$distributed_staged_launcher"
 
@@ -307,54 +313,61 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
         }
         compiler_host=""
         compiler_slot=""
-        # Slot directories are the admission authority, so selecting a host
-        # does not need a global lock. Prefer a randomly rotated peer order and
-        # consider the submitter only after every peer is full. The submitter
-        # also runs Ninja, generators, linkers, and every wrapper; treating it
-        # as an equal first choice saturated its CPUs while partially filled
-        # peer VMs sat idle.
-        compiler_remote_host_count="\$((\${#compiler_hosts[@]} - 1))"
-        compiler_start_index="\$((1 + RANDOM % compiler_remote_host_count))"
-        while [ -z "\$compiler_slot" ]; do
-            for ((compiler_offset = 0; compiler_offset < \${#compiler_hosts[@]}; compiler_offset++)); do
-                if [ "\$compiler_offset" -lt "\$compiler_remote_host_count" ]; then
-                    compiler_candidate_index="\$((1 + (compiler_start_index - 1 + compiler_offset) % compiler_remote_host_count))"
-                else
-                    compiler_candidate_index=0
-                fi
-                compiler_host_slots="\$compiler_slots/\$compiler_candidate_index"
-                if ! mkdir -p "\$compiler_host_slots"; then
-                    echo "ERROR: distributed compiler host slot directory could not be created" >&2
-                    exit 1
-                fi
-                compiler_candidate_jobs="\$compiler_remote_jobs_per_host"
-                if [ "\$compiler_candidate_index" -eq 0 ]; then
-                    compiler_candidate_jobs="\$compiler_local_jobs"
-                fi
-                for ((compiler_slot_index = 0; compiler_slot_index < compiler_candidate_jobs; compiler_slot_index++)); do
-                    compiler_candidate_slot="\$compiler_host_slots/\$compiler_slot_index"
-                    if mkdir "\$compiler_candidate_slot" 2>/dev/null; then
-                        compiler_host="\${compiler_hosts[\$compiler_candidate_index]}"
-                        compiler_slot="\$compiler_candidate_slot"
-                        break 2
+        if [ "\$compiler_transport" = staged ]; then
+            # Ninja bounds total admission. The WKI balanced task policy owns
+            # system selection and accounts for VM0, connected peers, CPU
+            # capacity, current load, in-flight assignments, and free memory.
+            compiler_candidate_index=-1
+            compiler_host="<balanced>"
+            compiler_slot_release() {
+                :
+            }
+        else
+            # Source transport retains the legacy host-slot scheduler because
+            # its working tree is not staged identically on every system.
+            compiler_remote_host_count="\$((\${#compiler_hosts[@]} - 1))"
+            compiler_start_index="\$((1 + RANDOM % compiler_remote_host_count))"
+            while [ -z "\$compiler_slot" ]; do
+                for ((compiler_offset = 0; compiler_offset < \${#compiler_hosts[@]}; compiler_offset++)); do
+                    if [ "\$compiler_offset" -lt "\$compiler_remote_host_count" ]; then
+                        compiler_candidate_index="\$((1 + (compiler_start_index - 1 + compiler_offset) % compiler_remote_host_count))"
+                    else
+                        compiler_candidate_index=0
                     fi
+                    compiler_host_slots="\$compiler_slots/\$compiler_candidate_index"
+                    if ! mkdir -p "\$compiler_host_slots"; then
+                        echo "ERROR: distributed compiler host slot directory could not be created" >&2
+                        exit 1
+                    fi
+                    compiler_candidate_jobs="\$compiler_remote_jobs_per_host"
+                    if [ "\$compiler_candidate_index" -eq 0 ]; then
+                        compiler_candidate_jobs="\$compiler_local_jobs"
+                    fi
+                    for ((compiler_slot_index = 0; compiler_slot_index < compiler_candidate_jobs; compiler_slot_index++)); do
+                        compiler_candidate_slot="\$compiler_host_slots/\$compiler_slot_index"
+                        if mkdir "\$compiler_candidate_slot" 2>/dev/null; then
+                            compiler_host="\${compiler_hosts[\$compiler_candidate_index]}"
+                            compiler_slot="\$compiler_candidate_slot"
+                            break 2
+                        fi
+                    done
                 done
-            done
-            if [ -z "\$compiler_slot" ]; then
-                compiler_start_index="\$((1 + compiler_start_index % compiler_remote_host_count))"
-                if [ "\$compiler_slot_has_usleep" -eq 1 ]; then
-                    usleep "\$compiler_slot_pause_us"
-                    if [ "\$compiler_slot_pause_us" -lt 16000 ]; then
-                        compiler_slot_pause_us="\$((compiler_slot_pause_us * 2))"
+                if [ -z "\$compiler_slot" ]; then
+                    compiler_start_index="\$((1 + compiler_start_index % compiler_remote_host_count))"
+                    if [ "\$compiler_slot_has_usleep" -eq 1 ]; then
+                        usleep "\$compiler_slot_pause_us"
+                        if [ "\$compiler_slot_pause_us" -lt 16000 ]; then
+                            compiler_slot_pause_us="\$((compiler_slot_pause_us * 2))"
+                        fi
+                    else
+                        sleep 0
                     fi
-                else
-                    sleep 0
                 fi
-            fi
-        done
-        compiler_slot_release() {
-            rmdir "\$compiler_slot" 2>/dev/null || true
-        }
+            done
+            compiler_slot_release() {
+                rmdir "\$compiler_slot" 2>/dev/null || true
+            }
+        fi
         trap compiler_slot_release EXIT HUP INT TERM
         if [ "\$compiler_candidate_index" -eq 0 ]; then
             if "\${compiler[@]}" "\$@"; then
@@ -422,13 +435,21 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
             # Publish through a submitter-created positive dentry. A peer can
             # finish its routed copy before the submitter invalidates a cached
             # negative lookup for the final output path. Keeping the routed
-            # write in the state tree and moving it locally after `on` returns
+            # write in the state tree and moving it locally after `anywhere`
+            # returns
             # makes final output publication atomic from the build's view.
             compiler_staged_output="\$compiler_responses/output.\$\$"
             if ! : > "\$compiler_staged_output"; then
                 compiler_slot_release
                 trap - EXIT HUP INT TERM
                 echo "ERROR: staged distributed compiler output file could not be created" >&2
+                exit 1
+            fi
+            compiler_host_report="\$compiler_responses/host.\$\$"
+            if ! : > "\$compiler_host_report"; then
+                compiler_slot_release
+                trap - EXIT HUP INT TERM
+                echo "ERROR: staged distributed compiler host report could not be created" >&2
                 exit 1
             fi
             compiler_route_args=()
@@ -597,18 +618,18 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
             # Compile the object into peer-local /tmp, then copy the completed
             # file through the explicit home route. Streaming every object
             # write through remote VFS saturates the submitter and leaves peer
-            # CPUs idle. The candidate index and submitter PID are unique for
-            # every simultaneously active wrapper on a peer.
-            compiler_remote_output="/tmp/wos-distributed-staged.\$compiler_candidate_index.\$\$.output"
+            # CPUs idle. The submitter PID is unique for every simultaneously
+            # active wrapper on each possible selected system.
+            compiler_remote_output="/tmp/wos-distributed-staged.\$\$.output"
             # Submit only a fixed launcher, the original cwd, the two output
             # paths, and the response-file path. Start from the peer's
             # guaranteed root directory; the launcher installs the route
             # policy before entering the submitter's build directory.
             compiler_remote_command=(
-                forward --clear -- on "\$compiler_host" /usr/bin/locally /usr/bin/timeout
+                forward --clear -- anywhere /usr/bin/locally /usr/bin/timeout
                 -s TERM -k 5 "\$compiler_remote_timeout"
                 /usr/bin/bash "$distributed_staged_launcher"
-                "\$compiler_route_response" "\$PWD" "\$compiler_remote_output" "\$compiler_staged_output"
+                "\$compiler_route_response" "\$PWD" "\$compiler_remote_output" "\$compiler_staged_output" "\$compiler_host_report"
             )
         else
             compiler_remote_command=(
@@ -643,10 +664,9 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
             if [ "\$compiler_status" -eq 0 ]; then
                 # A concurrent WKI exec-proxy completion can reach the
                 # submitter before the peer's local child has copied and
-                # fsynced its object. Keep the admission slot until the actual
-                # publication boundary. Keep only a short grace period for
-                # that race so one missing object cannot hold every peer
-                # admission slot for minutes.
+                # fsynced its object. Keep the wrapper alive until the actual
+                # publication boundary, with only a short grace period so one
+                # missing object cannot retain a Ninja job for minutes.
                 compiler_publish_wait_us=0
                 compiler_publish_limit_us="\$((compiler_publish_timeout * 1000000))"
                 compiler_publish_pause_us=1000
@@ -669,6 +689,26 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
                 elif ! mv -- "\$compiler_staged_output" "\$output_file"; then
                     echo "warning: distributed staged compiler could not publish '\$output_file'; retrying locally" >&2
                     compiler_status=1
+                fi
+            fi
+            if [ "\$compiler_status" -eq 0 ]; then
+                compiler_host=""
+                if ! IFS= read -r compiler_host < "\$compiler_host_report" || [ -z "\$compiler_host" ]; then
+                    echo "warning: distributed staged compiler did not identify its selected system; retrying locally" >&2
+                    compiler_status=1
+                else
+                    compiler_candidate_index=-1
+                    for ((compiler_host_index = 0; compiler_host_index < \${#compiler_hosts[@]}; compiler_host_index++)); do
+                        if [ "\$compiler_host" = "\${compiler_hosts[\$compiler_host_index]}" ] ||
+                           [ "\$compiler_host" = "\${compiler_hosts[\$compiler_host_index]}.wos" ]; then
+                            compiler_candidate_index="\$compiler_host_index"
+                            break
+                        fi
+                    done
+                    if [ "\$compiler_candidate_index" -lt 0 ]; then
+                        echo "warning: distributed staged compiler selected unexpected system '\$compiler_host'; retrying locally" >&2
+                        compiler_status=1
+                    fi
                 fi
             fi
             if [ "\$compiler_status" -ne 0 ]; then

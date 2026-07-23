@@ -14,7 +14,8 @@ namespace wkictl {
 
 auto usage() -> int {
     std::println(stderr,
-                 "usage:\n  locally <command> [args...]\n  remotely <command> [args...]\n  homeward <command> [args...]\n  on <hostname> "
+                 "usage:\n  locally <command> [args...]\n  remotely <command> [args...]\n  anywhere <command> [args...]\n  homeward "
+                 "<command> [args...]\n  on <hostname> "
                  "<command> [args...]\n  forward "
                  "[--clear] [+include_path] [-exclude_path] [--] <command> [args...]\n  wosid\n  wkictl "
                  "target <show|clear|set>\n  wkictl vfs <list|defaults|clear|add|probe>\n  wkictl perf <show>\n  wkictl wosid");

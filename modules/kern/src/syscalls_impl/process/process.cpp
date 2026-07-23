@@ -1408,11 +1408,14 @@ auto wos_proc_setwkitarget(const char* hostname, size_t len, uint32_t flags) -> 
     if ((flags & ~ker::mod::sched::task::Task::WKI_TARGET_FLAGS_ALL) != 0) {
         return static_cast<uint64_t>(-EINVAL);
     }
-    if ((flags & ker::mod::sched::task::Task::WKI_TARGET_FLAG_LOCAL) != 0 &&
-        (flags & ker::mod::sched::task::Task::WKI_TARGET_FLAG_REMOTE) != 0) {
+    uint32_t const PLACEMENT_FLAGS =
+        flags & (ker::mod::sched::task::Task::WKI_TARGET_FLAG_LOCAL | ker::mod::sched::task::Task::WKI_TARGET_FLAG_REMOTE |
+                 ker::mod::sched::task::Task::WKI_TARGET_FLAG_BALANCED);
+    if (PLACEMENT_FLAGS != 0 && (PLACEMENT_FLAGS & (PLACEMENT_FLAGS - 1U)) != 0) {
         return static_cast<uint64_t>(-EINVAL);
     }
-    if (hostname != nullptr && len != 0 && (flags & ker::mod::sched::task::Task::WKI_TARGET_FLAG_LOCAL) != 0) {
+    if (hostname != nullptr && len != 0 &&
+        (flags & (ker::mod::sched::task::Task::WKI_TARGET_FLAG_LOCAL | ker::mod::sched::task::Task::WKI_TARGET_FLAG_BALANCED)) != 0) {
         return static_cast<uint64_t>(-EINVAL);
     }
 

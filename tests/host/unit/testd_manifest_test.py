@@ -699,11 +699,14 @@ def require_wki_policy_syscall_tests(source: str) -> None:
         "ker::process::setwkitarget(nullptr, 0, 0)",
         "ker::process::getwkitarget(hostname.data(), hostname.size(), &flags)",
         "ker::process::WKI_TARGET_FLAG_LOCAL | ker::process::WKI_TARGET_FLAG_NOINHERIT",
+        "wki_target_balanced_roundtrip",
         "ker::process::WKI_TARGET_FLAG_REMOTE | ker::process::WKI_TARGET_FLAG_STRICT",
         "rc != -ENAMETOOLONG",
         "ker::process::WKI_TARGET_FLAG_LOCAL | ker::process::WKI_TARGET_FLAG_REMOTE",
         "rc != -EINVAL",
         "wki_target_rejects_hostname_local",
+        "wki_target_rejects_remote_balanced",
+        "wki_target_rejects_hostname_balanced",
         "wki_target_rejects_oversized_hostname",
     ]
     for snippet in target_snippets:

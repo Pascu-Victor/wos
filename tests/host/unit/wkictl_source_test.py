@@ -69,6 +69,7 @@ def test_wkictl_installed_aliases_match_persona_dispatch() -> None:
         "/usr/bin/wkictl": ("copy", "build/modules/wkictl/wkictl"),
         "/usr/bin/locally": ("symlink", "/usr/bin/wkictl"),
         "/usr/bin/remotely": ("symlink", "/usr/bin/wkictl"),
+        "/usr/bin/anywhere": ("symlink", "/usr/bin/wkictl"),
         "/usr/bin/homeward": ("symlink", "/usr/bin/wkictl"),
         "/usr/bin/on": ("symlink", "/usr/bin/wkictl"),
         "/usr/bin/forward": ("symlink", "/usr/bin/wkictl"),
@@ -85,6 +86,7 @@ def test_wkictl_installed_aliases_match_persona_dispatch() -> None:
             "command_basename(argc > 0 ? argv[0] : \"wkictl\")",
             'std::strcmp(name, "locally") == 0',
             'std::strcmp(name, "remotely") == 0',
+            'std::strcmp(name, "anywhere") == 0',
             'std::strcmp(name, "homeward") == 0',
             'std::strcmp(name, "on") == 0',
             'std::strcmp(name, "forward") == 0',
@@ -115,6 +117,16 @@ def test_wkictl_target_personas_set_expected_policy() -> None:
             "return exec_command(argv + 1)",
         ],
         "remotely persona",
+    )
+
+    run_anywhere = function_body(source, "run_anywhere")
+    require_tokens(
+        run_anywhere,
+        [
+            "ker::process::setwkitarget(nullptr, 0, ker::process::WKI_TARGET_FLAG_BALANCED)",
+            "return exec_command(argv + 1)",
+        ],
+        "anywhere persona",
     )
 
     run_on = function_body(source, "run_on")
@@ -215,6 +227,7 @@ def test_wkictl_headers_expose_matching_wki_wrappers() -> None:
             "constexpr uint32_t WKI_TARGET_FLAG_LOCAL = 1U << 1",
             "constexpr uint32_t WKI_TARGET_FLAG_NOINHERIT = 1U << 2",
             "constexpr uint32_t WKI_TARGET_FLAG_REMOTE = 1U << 3",
+            "constexpr uint32_t WKI_TARGET_FLAG_BALANCED = 1U << 4",
             "inline int64_t setwkitarget",
             "inline int64_t getwkitarget",
         ],

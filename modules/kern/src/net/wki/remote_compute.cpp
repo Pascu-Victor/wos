@@ -229,6 +229,9 @@ std::array<ker::mod::sched::CpuAccountingSnapshot, WKI_LOAD_REPORT_MAX_CPUS>
 bool g_last_local_cpu_accounting_valid{};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 uint16_t g_cached_local_load_pct{};        // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 uint64_t g_cached_local_load_update_us{};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+uint32_t g_balanced_local_reservations{};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+uint64_t g_balanced_local_sample_us{};     // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+uint16_t g_balanced_placement_cursor{};    // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 ker::mod::sys::Spinlock s_compute_lock;    // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
 struct ComputeSubmitSessionToken {
@@ -2136,6 +2139,7 @@ auto try_remote_placement(ker::mod::sched::task::Task* task) -> ker::mod::sched:
 
 namespace {
 auto wki_preferred_remote_node() -> uint16_t;
+auto wki_balanced_node(uint16_t local_load, uint16_t local_cpus, uint16_t local_runnable, uint16_t local_free_mem) -> uint16_t;
 void wki_release_preferred_remote_node(uint16_t node_id);
 
 class PreferredRemoteReservation {
@@ -2191,7 +2195,9 @@ auto wki_try_remote_spawn(ker::mod::sched::task::Task* task, const WkiRemoteSpaw
     const bool STRICT_TARGET = EXPLICIT_TARGET && ((task->wki_target_flags & ker::mod::sched::task::Task::WKI_TARGET_FLAG_STRICT) != 0);
     const bool PREFER_REMOTE = !EXPLICIT_TARGET && ((task->wki_target_flags & ker::mod::sched::task::Task::WKI_TARGET_FLAG_REMOTE) != 0);
     const bool STRICT_REMOTE = PREFER_REMOTE && ((task->wki_target_flags & ker::mod::sched::task::Task::WKI_TARGET_FLAG_STRICT) != 0);
-    const bool AUTOMATIC_PLACEMENT = !EXPLICIT_TARGET && !PREFER_REMOTE;
+    const bool BALANCED_PLACEMENT =
+        !EXPLICIT_TARGET && ((task->wki_target_flags & ker::mod::sched::task::Task::WKI_TARGET_FLAG_BALANCED) != 0);
+    const bool AUTOMATIC_PLACEMENT = !EXPLICIT_TARGET && !PREFER_REMOTE && !BALANCED_PLACEMENT;
     const bool REMOTE_RECEIVER =
         task->wki_submitter_hostname.front() != '\0' && std::strcmp(task->wki_submitter_hostname.data(), wki_local_hostname()) != 0;
 
@@ -2318,7 +2324,7 @@ auto wki_try_remote_spawn(ker::mod::sched::task::Task* task, const WkiRemoteSpaw
     // A task that was already submitted from another node stays on its receiver
     // for automatic follow-on execs. Explicit targets and remote-preferred
     // policies are an opt-in fan-out path used by distributed launchers.
-    if (REMOTE_RECEIVER && !EXPLICIT_TARGET && !PREFER_REMOTE) {
+    if (REMOTE_RECEIVER && !EXPLICIT_TARGET && !PREFER_REMOTE && !BALANCED_PLACEMENT) {
         log_spawn_diag(task, WkiRemoteSpawnResult::LOCAL, "remote-receiver-auto");
         return WkiRemoteSpawnResult::LOCAL;
     }
@@ -2397,6 +2403,21 @@ auto wki_try_remote_spawn(ker::mod::sched::task::Task* task, const WkiRemoteSpaw
             WkiRemoteSpawnResult const RESULT = STRICT_REMOTE ? WkiRemoteSpawnResult::FAILED : WkiRemoteSpawnResult::LOCAL;
             log_spawn_diag(task, RESULT, "remote-preferred-no-node");
             return RESULT;
+        }
+    } else if (BALANCED_PLACEMENT) {
+        uint16_t const LOCAL_LOAD = compute_local_load();
+        uint16_t const LOCAL_CPUS = std::max<uint16_t>(static_cast<uint16_t>(ker::mod::smt::get_core_count()), 1);
+        uint16_t const LOCAL_RUNNABLE =
+            static_cast<uint16_t>(std::min<uint32_t>(ker::mod::sched::get_load_average_snapshot().runnable_tasks, UINT16_MAX));
+        uint16_t const LOCAL_FREE_MEM =
+            static_cast<uint16_t>(std::min<uint64_t>(ker::mod::mm::phys::get_free_mem_pages() / 256ULL, UINT16_MAX));
+        s_compute_lock.lock();
+        best_node = wki_balanced_node(LOCAL_LOAD, LOCAL_CPUS, LOCAL_RUNNABLE, LOCAL_FREE_MEM);
+        s_compute_lock.unlock();
+        preferred_reservation.adopt(best_node);
+        if (best_node == WKI_NODE_INVALID) {
+            log_spawn_diag(task, WkiRemoteSpawnResult::LOCAL, "balanced-local");
+            return WkiRemoteSpawnResult::LOCAL;
         }
     } else {
         uint16_t const LOCAL_LOAD = compute_local_load();
@@ -3680,6 +3701,68 @@ auto preferred_remote_placement_score(const RemoteNodeLoad& load, size_t active_
     return static_cast<uint64_t>(load.avg_load_pct) + WKI_REMOTE_PLACEMENT_PENALTY + INFLIGHT_PRESSURE;
 }
 
+auto balanced_placement_score(uint16_t load_pct, uint16_t num_cpus, uint16_t free_mem, uint64_t inflight) -> uint64_t {
+    constexpr uint16_t FREE_MEM_RESERVE = 512;
+    uint64_t const CPUS = std::max<uint64_t>(num_cpus, 1);
+    uint64_t const INFLIGHT_PRESSURE = (inflight * 1000ULL) / CPUS;
+    uint64_t const MEMORY_PRESSURE = free_mem < FREE_MEM_RESERVE ? 1000ULL + static_cast<uint64_t>(FREE_MEM_RESERVE - free_mem) : 0;
+    return static_cast<uint64_t>(load_pct) + INFLIGHT_PRESSURE + MEMORY_PRESSURE;
+}
+
+// s_compute_lock must be held by caller. WKI_NODE_INVALID denotes the local
+// node and consumes a local reservation until the next measured load sample.
+// A remote result owns a transient RemoteNodeLoad reservation that the caller
+// must release after it has either published a SubmittedTask or abandoned the
+// placement attempt.
+auto wki_balanced_node(uint16_t local_load, uint16_t local_cpus, uint16_t local_runnable, uint16_t local_free_mem) -> uint16_t {
+    if (g_balanced_local_sample_us != g_cached_local_load_update_us) {
+        g_balanced_local_sample_us = g_cached_local_load_update_us;
+        g_balanced_local_reservations = 0;
+    }
+
+    std::array<uint16_t, WKI_MAX_PEERS + 1> candidates = {};
+    size_t candidate_count = 1;
+    candidates.front() = WKI_NODE_INVALID;
+    uint64_t const LOCAL_PRESSURE = static_cast<uint64_t>(local_runnable) + g_balanced_local_reservations;
+    uint64_t best_score = balanced_placement_score(local_load, local_cpus, local_free_mem, LOCAL_PRESSURE);
+    uint64_t const NOW = wki_now_us();
+
+    for (auto& rl : g_remote_loads) {
+        if (!rl.valid || NOW - rl.last_update_us > (WKI_LOAD_REPORT_INTERVAL_US * 2)) {
+            continue;
+        }
+        auto* peer = wki_peer_find(rl.node_id);
+        if (peer == nullptr || peer->state != PeerState::CONNECTED) {
+            continue;
+        }
+        uint64_t const KNOWN_ACTIVE = active_submitted_tasks_for_node_locked(rl.node_id);
+        uint64_t const REMOTE_PRESSURE = std::max<uint64_t>(rl.runnable_tasks, KNOWN_ACTIVE) + rl.placement_reservations;
+        uint64_t const SCORE = balanced_placement_score(rl.avg_load_pct, rl.num_cpus, rl.free_mem_pages, REMOTE_PRESSURE);
+        if (SCORE < best_score) {
+            best_score = SCORE;
+            candidate_count = 0;
+        }
+        if (SCORE == best_score && candidate_count < candidates.size()) {
+            candidates.at(candidate_count++) = rl.node_id;
+        }
+    }
+
+    uint16_t const SELECTED = candidates.at(g_balanced_placement_cursor % candidate_count);
+    ++g_balanced_placement_cursor;
+    if (SELECTED == WKI_NODE_INVALID) {
+        if (g_balanced_local_reservations != UINT32_MAX) {
+            ++g_balanced_local_reservations;
+        }
+        return WKI_NODE_INVALID;
+    }
+
+    RemoteNodeLoad* const LOAD = find_remote_load(SELECTED);
+    if (LOAD != nullptr && LOAD->placement_reservations != UINT32_MAX) {
+        ++LOAD->placement_reservations;
+    }
+    return SELECTED;
+}
+
 // s_compute_lock must be held by caller. The returned node owns one transient
 // reservation until PreferredRemoteReservation releases it on function exit.
 auto wki_preferred_remote_node() -> uint16_t {
@@ -4404,6 +4487,15 @@ auto wki_remote_compute_selftest_placement_score_accounts_for_inflight() -> bool
     uint64_t const FOUR_CPU_RESERVED_SCORE = preferred_remote_placement_score(load, 0);
 
     return ONE_ACTIVE_SCORE > IDLE_SCORE && ONE_RESERVED_SCORE == ONE_ACTIVE_SCORE && FOUR_CPU_RESERVED_SCORE > ONE_RESERVED_SCORE;
+}
+
+auto wki_remote_compute_selftest_balanced_score_accounts_for_capacity() -> bool {
+    uint64_t const IDLE = balanced_placement_score(100, 8, 4096, 0);
+    uint64_t const ONE_ACTIVE = balanced_placement_score(100, 8, 4096, 1);
+    uint64_t const FOUR_CPU_ACTIVE = balanced_placement_score(100, 4, 4096, 1);
+    uint64_t const LOW_MEMORY = balanced_placement_score(100, 8, 128, 0);
+
+    return ONE_ACTIVE > IDLE && FOUR_CPU_ACTIVE > ONE_ACTIVE && LOW_MEMORY > FOUR_CPU_ACTIVE;
 }
 
 auto wki_remote_compute_selftest_submit_policy_scope_restores_worker() -> bool {

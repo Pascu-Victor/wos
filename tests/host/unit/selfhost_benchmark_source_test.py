@@ -183,13 +183,16 @@ def test_wos_bootstrap_distributes_only_compiler_processes() -> None:
             r'compiler_route_response="\$compiler_responses/routes.\$\$"',
             r'if ! : > "\$compiler_route_response"; then',
             r'''printf '%s\n' "\${compiler_route_args[@]}" > "\$compiler_route_response"''',
-            r'forward --clear -- on "\$compiler_host" /usr/bin/locally /usr/bin/timeout',
+            r"forward --clear -- anywhere /usr/bin/locally /usr/bin/timeout",
             r'-s TERM -k 5 "\$compiler_remote_timeout"',
-            r'compiler_remote_output="/tmp/wos-distributed-staged.\$compiler_candidate_index.\$\$.output"',
+            r'compiler_remote_output="/tmp/wos-distributed-staged.\$\$.output"',
             r'compiler_staged_output="\$compiler_responses/output.\$\$"',
+            r'compiler_host_report="\$compiler_responses/host.\$\$"',
             r'if ! : > "\$compiler_staged_output"; then',
             r'compiler_add_home_route "\$compiler_staged_output"',
-            r'"\$compiler_route_response" "\$PWD" "\$compiler_remote_output" "\$compiler_staged_output"',
+            r'"\$compiler_route_response" "\$PWD" "\$compiler_remote_output" "\$compiler_staged_output" "\$compiler_host_report"',
+            '''hostname > "$host_report"''',
+            r'IFS= read -r compiler_host < "\$compiler_host_report"',
             '''"$@" -o "$local_output"''',
             '''cp -- "$local_output" "$host_output"''',
             '''fsync "$host_output"''',
@@ -958,6 +961,7 @@ while [ "$1" != -- ]; do shift; done
 shift
 case "$1" in
     on) exec "$@" ;;
+    anywhere) exec "$@" ;;
     locally) shift; exec "$@" ;;
     *) exit 96 ;;
 esac
@@ -965,20 +969,21 @@ esac
             encoding="ascii",
         )
         mock_forward.chmod(0o755)
-        mock_on = temp / "on"
-        mock_on.write_text(
+        mock_anywhere = temp / "anywhere"
+        mock_anywhere.write_text(
             r'''#!/bin/bash
 set -eu
-[ "$1" = wos-1 ]
 [ "$PWD" = / ]
-shift
 [ "$1" = /usr/bin/locally ]
 shift
 exec "$@"
 ''',
             encoding="ascii",
         )
-        mock_on.chmod(0o755)
+        mock_anywhere.chmod(0o755)
+        mock_hostname = temp / "hostname"
+        mock_hostname.write_text("#!/bin/sh\nprintf 'wos-1\\n'\n", encoding="ascii")
+        mock_hostname.chmod(0o755)
         mock_fsync = temp / "fsync"
         mock_fsync.write_text('#!/bin/sh\nexec sync -f "$1"\n', encoding="ascii")
         mock_fsync.chmod(0o755)
@@ -1021,6 +1026,7 @@ grep -Fx -- "+$1/compile.json" "$1/on.args"
 grep -Fx -- "+$1/diagnostics.dia" "$1/on.args"
 grep -Fx -- "+$1/module-cache" "$1/on.args"
 grep -Fx -- locally "$1/on.args"
+test "$(cat "$1/compiler-state.successes/1")" = wos-1
 (
     cd "$1/source-root"
     rm -f "$1/on.args" input.o
@@ -1037,8 +1043,6 @@ grep -Fx -- locally "$1/on.args"
     test -s input.o
 )
 test ! -e "$1/on.args"
-rm -rf -- "$1/compiler-state.source-slots/1"
-mkdir -p "$1/compiler-state.source-slots/0/0"
 PATH="$1:$PATH" \
     WOS_DISTRIBUTED_COMPILER=1 \
     WOS_DISTRIBUTED_COMPILER_HOSTS=wos-0,wos-1 \

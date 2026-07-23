@@ -49,6 +49,9 @@ auto run(int argc, char** argv) -> int {
     if (std::strcmp(name, "remotely") == 0) {
         return run_remotely(argc, argv);
     }
+    if (std::strcmp(name, "anywhere") == 0) {
+        return run_anywhere(argc, argv);
+    }
     if (std::strcmp(name, "homeward") == 0) {
         return run_homeward(argc, argv);
     }

@@ -29,6 +29,9 @@ auto flags_name(uint32_t flags) -> std::string {
     if ((flags & ker::process::WKI_TARGET_FLAG_REMOTE) != 0) {
         append("remote");
     }
+    if ((flags & ker::process::WKI_TARGET_FLAG_BALANCED) != 0) {
+        append("balanced");
+    }
     if ((flags & ker::process::WKI_TARGET_FLAG_NOINHERIT) != 0) {
         append("noinherit");
     }
@@ -99,6 +102,18 @@ auto run_remotely(int argc, char** argv) -> int {
     return exec_command(argv + 1);
 }
 
+auto run_anywhere(int argc, char** argv) -> int {
+    if (argc < 2) {
+        return usage();
+    }
+    int64_t rc = ker::process::setwkitarget(nullptr, 0, ker::process::WKI_TARGET_FLAG_BALANCED);
+    if (rc < 0) {
+        std::println(stderr, "anywhere: failed to set balanced policy: {}", static_cast<long>(rc));
+        return 1;
+    }
+    return exec_command(argv + 1);
+}
+
 auto run_on(int argc, char** argv) -> int {
     if (argc < 3) {
         return usage();
@@ -155,6 +170,8 @@ auto handle_target(int argc, char** argv) -> int {
         flags = ker::process::WKI_TARGET_FLAG_LOCAL;
     } else if (std::strcmp(policy, "remote") == 0 || std::strcmp(policy, "remotely") == 0) {
         flags = ker::process::WKI_TARGET_FLAG_REMOTE;
+    } else if (std::strcmp(policy, "balanced") == 0 || std::strcmp(policy, "anywhere") == 0) {
+        flags = ker::process::WKI_TARGET_FLAG_BALANCED;
     } else if (std::strcmp(policy, "auto") == 0) {
         flags = 0;
     } else {

@@ -376,6 +376,50 @@ def test_preferred_placement_accounts_for_inflight_submissions() -> None:
     require_tokens(ktest, ["PlacementScoreAccountsForInflight", token], "placement score KTEST coverage")
 
 
+def test_balanced_placement_scores_all_healthy_systems() -> None:
+    source = REMOTE_COMPUTE_CPP.read_text()
+    header = REMOTE_COMPUTE_HPP.read_text()
+    ktest = REMOTE_COMPUTE_KTEST.read_text()
+
+    balanced = function_body(source, "wki_balanced_node")
+    require_tokens(
+        balanced,
+        [
+            "g_balanced_local_sample_us != g_cached_local_load_update_us",
+            "g_balanced_local_reservations = 0",
+            "static_cast<uint64_t>(local_runnable) + g_balanced_local_reservations",
+            "std::max<uint64_t>(rl.runnable_tasks, KNOWN_ACTIVE) + rl.placement_reservations",
+            "peer->state != PeerState::CONNECTED",
+            "g_balanced_local_reservations",
+            "LOAD->placement_reservations",
+        ],
+        "balanced placement must score and reserve local and remote capacity",
+    )
+
+    spawn = function_body(source, "wki_try_remote_spawn")
+    require_tokens(
+        spawn,
+        [
+            "WKI_TARGET_FLAG_BALANCED",
+            "best_node = wki_balanced_node(LOCAL_LOAD, LOCAL_CPUS, LOCAL_RUNNABLE, LOCAL_FREE_MEM)",
+            'log_spawn_diag(task, WkiRemoteSpawnResult::LOCAL, "balanced-local")',
+        ],
+        "balanced task policy selection",
+    )
+    balanced_branch = spawn[spawn.index("} else if (BALANCED_PLACEMENT)") :]
+    require_order(
+        balanced_branch,
+        "best_node = wki_balanced_node(LOCAL_LOAD, LOCAL_CPUS, LOCAL_RUNNABLE, LOCAL_FREE_MEM)",
+        "preferred_reservation.adopt(best_node)",
+        "balanced remote selection must transfer its transient reservation",
+    )
+
+    token = "wki_remote_compute_selftest_balanced_score_accounts_for_capacity"
+    require_tokens(source, [f"auto {token}() -> bool"], "balanced placement score selftest implementation")
+    require_tokens(header, [f"auto {token}() -> bool;"], "balanced placement score selftest declaration")
+    require_tokens(ktest, ["BalancedScoreAccountsForCapacity", token], "balanced placement score KTEST coverage")
+
+
 def test_submitted_task_slots_are_indexed_and_reclaimed() -> None:
     source = REMOTE_COMPUTE_CPP.read_text()
     header = REMOTE_COMPUTE_HPP.read_text()
@@ -2354,6 +2398,7 @@ def main() -> None:
     test_proxy_waiting_publication_is_transactional()
     test_remote_load_procfs_uses_locked_snapshot()
     test_preferred_placement_accounts_for_inflight_submissions()
+    test_balanced_placement_scores_all_healthy_systems()
     test_load_report_uses_cpu_accounting_and_shared_local_cache()
     test_receiver_path_localization_bounds_suffix_scan()
     test_vfs_ref_loader_rejects_null_or_empty_path_before_vfs_use()

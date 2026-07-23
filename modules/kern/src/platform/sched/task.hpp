@@ -275,8 +275,9 @@ struct Task {
     static constexpr uint32_t WKI_TARGET_FLAG_LOCAL = 1U << 1;      // pin task to local node (skip remote placement)
     static constexpr uint32_t WKI_TARGET_FLAG_NOINHERIT = 1U << 2;  // don't propagate wki_target to child processes
     static constexpr uint32_t WKI_TARGET_FLAG_REMOTE = 1U << 3;     // prefer a remote node, falling back locally unless strict
+    static constexpr uint32_t WKI_TARGET_FLAG_BALANCED = 1U << 4;   // balance across the local node and connected peers
     static constexpr uint32_t WKI_TARGET_FLAGS_ALL =
-        WKI_TARGET_FLAG_STRICT | WKI_TARGET_FLAG_LOCAL | WKI_TARGET_FLAG_NOINHERIT | WKI_TARGET_FLAG_REMOTE;
+        WKI_TARGET_FLAG_STRICT | WKI_TARGET_FLAG_LOCAL | WKI_TARGET_FLAG_NOINHERIT | WKI_TARGET_FLAG_REMOTE | WKI_TARGET_FLAG_BALANCED;
     static constexpr uint64_t PERSONALITY_ADDR_NO_RANDOMIZE = 0x0040000;
     static constexpr uint64_t DEFAULT_PERSONALITY = PERSONALITY_ADDR_NO_RANDOMIZE;
 
