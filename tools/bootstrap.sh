@@ -170,10 +170,10 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
     fi
     compiler_transport="\${WOS_DISTRIBUTED_COMPILER_TRANSPORT:-source}"
     case "\$compiler_transport" in
-        source|preprocessed|rewritten)
+        source|staged|preprocessed|rewritten)
             ;;
         *)
-            echo "ERROR: distributed compiler transport must be 'source', 'preprocessed', or 'rewritten'" >&2
+            echo "ERROR: distributed compiler transport must be 'source', 'staged', 'preprocessed', or 'rewritten'" >&2
             exit 1
             ;;
     esac
@@ -181,7 +181,7 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
     if command -v usleep >/dev/null 2>&1; then
         compiler_slot_pause=(usleep 1000)
     fi
-    if [ "\$compiler_transport" = source ]; then
+    if [ "\$compiler_transport" = source ] || [ "\$compiler_transport" = staged ]; then
         compiler_total_jobs="\${WOS_NINJA_JOBS:-\${WOS_BUILD_JOBS:-}}"
         case "\$compiler_total_jobs" in
             ''|*[!0-9]*|0)
@@ -294,8 +294,129 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
             fi
         done
         compiler_remote_path="\${PATH:-/usr/bin:/bin}"
+        compiler_remote_command=(on "\$compiler_host")
+        if [ "\$compiler_transport" = staged ]; then
+            compiler_local_roots="\$compiler_state.local-roots"
+            if [ ! -s "\$compiler_local_roots" ]; then
+                compiler_slot_release
+                trap - EXIT HUP INT TERM
+                echo "ERROR: staged distributed compiler has no local root manifest" >&2
+                exit 1
+            fi
+            compiler_remote_command+=(forward)
+            while IFS= read -r compiler_local_root; do
+                case "\$compiler_local_root" in
+                    /*)
+                        case "\$compiler_local_root" in
+                            *\$'\n'*|*\$'\r'*|*[\*\?\[]*)
+                                compiler_slot_release
+                                trap - EXIT HUP INT TERM
+                                echo "ERROR: staged distributed compiler root contains unsafe characters: \$compiler_local_root" >&2
+                                exit 1
+                                ;;
+                        esac
+                        if [ "\${#compiler_local_root}" -ge 256 ]; then
+                            compiler_slot_release
+                            trap - EXIT HUP INT TERM
+                            echo "ERROR: staged distributed compiler root is too long for a WKI VFS rule: \$compiler_local_root" >&2
+                            exit 1
+                        fi
+                        compiler_remote_command+=("-\$compiler_local_root")
+                        ;;
+                    *)
+                        compiler_slot_release
+                        trap - EXIT HUP INT TERM
+                        echo "ERROR: staged distributed compiler root is not absolute: \$compiler_local_root" >&2
+                        exit 1
+                        ;;
+                esac
+            done < "\$compiler_local_roots"
+            compiler_add_home_route() {
+                local compiler_route="\$1"
+                [ -n "\$compiler_route" ] || return 0
+                case "\$compiler_route" in
+                    /*) ;;
+                    *) compiler_route="\$PWD/\${compiler_route#./}" ;;
+                esac
+                case "\$compiler_route" in
+                    *\$'\n'*|*\$'\r'*|*[\*\?\[]*)
+                        echo "ERROR: staged compiler route contains unsafe characters: \$compiler_route" >&2
+                        return 1
+                        ;;
+                esac
+                if [ "\${#compiler_route}" -ge 256 ]; then
+                    echo "ERROR: staged compiler route is too long for a WKI VFS rule: \$compiler_route" >&2
+                    return 1
+                fi
+                compiler_remote_command+=("+\$compiler_route")
+            }
+            compiler_add_home_route "\$compiler_state" || exit 1
+            compiler_add_home_route "\$compiler_responses" || exit 1
+            compiler_add_home_route "\$output_file" || exit 1
+            compiler_route_next=""
+            compiler_has_explicit_dependency=0
+            compiler_has_implicit_dependency=0
+            compiler_has_implicit_module_output=0
+            for compiler_arg in "\$@"; do
+                if [ -n "\$compiler_route_next" ]; then
+                    compiler_add_home_route "\$compiler_arg" || exit 1
+                    if [ "\$compiler_route_next" = dependency ]; then
+                        compiler_has_explicit_dependency=1
+                    fi
+                    compiler_route_next=""
+                    continue
+                fi
+                case "\$compiler_arg" in
+                    -MF|-MJ|-dependency-file)
+                        compiler_route_next=dependency
+                        ;;
+                    -serialize-diagnostics)
+                        compiler_route_next=side-output
+                        ;;
+                    -MF?*|-MJ?*)
+                        compiler_add_home_route "\${compiler_arg:3}" || exit 1
+                        compiler_has_explicit_dependency=1
+                        ;;
+                    -Wp,-MD,*|-Wp,-MMD,*)
+                        compiler_add_home_route "\${compiler_arg#*,*,}" || exit 1
+                        compiler_has_explicit_dependency=1
+                        ;;
+                    -serialize-diagnostics=*|-fmodule-output=*|-fmodules-cache-path=*)
+                        compiler_add_home_route "\${compiler_arg#*=}" || exit 1
+                        ;;
+                    -fmodule-output)
+                        compiler_has_implicit_module_output=1
+                        ;;
+                    -MD|-MMD)
+                        compiler_has_implicit_dependency=1
+                        ;;
+                esac
+            done
+            if [ -n "\$compiler_route_next" ]; then
+                compiler_slot_release
+                trap - EXIT HUP INT TERM
+                echo "ERROR: staged compiler side-output option is missing its path" >&2
+                exit 1
+            fi
+            if [ "\$compiler_has_implicit_dependency" -eq 1 ] && [ "\$compiler_has_explicit_dependency" -eq 0 ] && [ -n "\$output_file" ]; then
+                compiler_dependency_route="\$output_file"
+                case "\$compiler_dependency_route" in
+                    *.*) compiler_dependency_route="\${compiler_dependency_route%.*}.d" ;;
+                    *) compiler_dependency_route="\$compiler_dependency_route.d" ;;
+                esac
+                compiler_add_home_route "\$compiler_dependency_route" || exit 1
+            fi
+            if [ "\$compiler_has_implicit_module_output" -eq 1 ] && [ -n "\$output_file" ]; then
+                compiler_output_directory="\${output_file%/*}"
+                if [ "\$compiler_output_directory" = "\$output_file" ]; then
+                    compiler_output_directory="\$PWD"
+                fi
+                compiler_add_home_route "\$compiler_output_directory" || exit 1
+            fi
+            compiler_remote_command+=(-- locally)
+        fi
         if env -i PATH="\$compiler_remote_path" HOME="\${HOME:-/root}" TMPDIR="\${TMPDIR:-/tmp}" TZ=UTC0 \
-            on "\$compiler_host" "\${compiler[@]}" -fno-temp-file "@\$compiler_response"; then
+            "\${compiler_remote_command[@]}" "\${compiler[@]}" -fno-temp-file "@\$compiler_response"; then
             compiler_status=0
         else
             compiler_status=\$?

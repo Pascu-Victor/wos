@@ -194,6 +194,14 @@ BOOTSTRAP_PHASE=""
 BOOTSTRAP_PHASE_LABEL=""
 BOOTSTRAP_PHASE_START_MS=""
 
+stage_distributed_compiler_roots() {
+    if [ "$HOST_SYSTEM" != WOS ]; then
+        return 0
+    fi
+    WOS_DISTRIBUTED_COMPILER_STAGE_BASE="$(dirname "$WORKSPACE_ROOT")" \
+        "$WORKSPACE_ROOT/tools/stage-distributed-compiler-roots.sh" "$@"
+}
+
 bootstrap_now_ms() {
     local epoch="${EPOCHREALTIME:-}"
 
@@ -516,6 +524,7 @@ bootstrap_phase_end
 # 2. Build the compiler-rt pieces needed to finish the libc bootstrap.
 # Sanitizers are built after mlibc installs real libc/libpthread/libm/etc.
 bootstrap_phase_start 2 "compiler-rt builtins and profile bootstrap"
+stage_distributed_compiler_roots "$B/src/llvm-project/compiler-rt" "$HOST/lib" "$SYSROOT/include"
 export CFLAGS="--sysroot=$SYSROOT -std=c23 -fno-sanitize=safe-stack "
 export CXXFLAGS="--sysroot=$SYSROOT -std=c++23 -fno-sanitize=safe-stack "
 unset LDFLAGS
@@ -604,6 +613,7 @@ export CXXFLAGS="--sysroot=$SYSROOT -std=c++23 -fno-sanitize=safe-stack "
 export LDFLAGS="--sysroot=$SYSROOT"
 
 wos_prefetch_meson_subprojects "$B/src/mlibc" freestnd-c-hdrs freestnd-cxx-hdrs frigg
+stage_distributed_compiler_roots "$B/src/mlibc" "$SYSROOT/include"
 
 mkdir -p $B/mlibc-build
 wos_timed_step "configure" "mlibc" \
@@ -631,6 +641,7 @@ bootstrap_phase_end
 
 # 5. Finish compiler-rt now that mlibc installed the libraries ASAN links to.
 bootstrap_phase_start 5 "compiler-rt sanitizers"
+stage_distributed_compiler_roots "$B/src/llvm-project/compiler-rt" "$SYSROOT/include"
 unset LDFLAGS
 build_compiler_rt ON
 bootstrap_phase_end
@@ -638,6 +649,12 @@ bootstrap_phase_end
 # 6. Build libcxx, libcxxabi, and libunwind (now that mlibc is available)
 
 bootstrap_phase_start 6 "libcxx libcxxabi and libunwind"
+stage_distributed_compiler_roots \
+    "$B/src/llvm-project/runtimes" \
+    "$B/src/llvm-project/libcxx" \
+    "$B/src/llvm-project/libcxxabi" \
+    "$B/src/llvm-project/libunwind" \
+    "$SYSROOT/include"
 mkdir -p $B/libcxx-build
 wos_timed_step "configure" "libcxx_runtime" \
     wos_run_in_dir "$B/libcxx-build" \
@@ -708,6 +725,7 @@ bootstrap_phase_end
 bootstrap_phase_start 7 "BusyBox for WOS userspace"
 cd $B/src
 [ ! -d busybox ] && git clone --depth=1 --branch=wos-support https://github.com/Pascu-Victor/busybox.git
+stage_distributed_compiler_roots "$B/src/busybox" "$SYSROOT/include"
 
 WOS_HOST_TOOLCHAIN_ROOT="$HOST" \
     WOS_SYSROOT_PATH="$SYSROOT" \
@@ -720,6 +738,7 @@ bootstrap_phase_end
 bootstrap_phase_start 8 "Dropbear SSH for WOS userspace"
 cd $B/src
 [ ! -d dropbear ] && git clone --depth=1 --branch=wos-support https://github.com/Pascu-Victor/dropbear.git
+stage_distributed_compiler_roots "$B/src/dropbear" "$SYSROOT/include"
 
 WOS_HOST_TOOLCHAIN_ROOT="$HOST" \
     WOS_SYSROOT_PATH="$SYSROOT" \
@@ -753,6 +772,7 @@ fi
 if [ ! -f ninja/CMakeLists.txt ]; then
     git clone --depth=1 https://github.com/Pascu-Victor/ninja.git ninja
 fi
+stage_distributed_compiler_roots "$B/src/ninja" "$SYSROOT/include"
 
 WOS_SYSROOT_PATH="$SYSROOT" \
     WOS_NINJA_BUILD_DIR="$B/ninja-build" \
@@ -770,6 +790,7 @@ fi
 if [ ! -f cmake/CMakeLists.txt ]; then
     git clone --branch=wos-support https://github.com/Pascu-Victor/CMake.git cmake
 fi
+stage_distributed_compiler_roots "$B/src/cmake" "$SYSROOT/include"
 
 WOS_SYSROOT_PATH="$SYSROOT" \
     WOS_CMAKE_FOR_WOS_BUILD_DIR="$B/cmake-wos-build" \
@@ -788,6 +809,7 @@ fi
 if [ ! -f nasm/configure.ac ]; then
     git clone --depth=1 --branch "$NASM_GIT_BRANCH" https://github.com/Pascu-Victor/nasm.git nasm
 fi
+stage_distributed_compiler_roots "$B/src/nasm" "$SYSROOT/include"
 
 WOS_SYSROOT_PATH="$SYSROOT" \
     WOS_NASM_SOURCE_DIR="$B/src/nasm" \
@@ -839,6 +861,7 @@ fi
 if [ ! -f python/configure ]; then
     git clone --depth=1 --branch "$PYTHON_GIT_BRANCH" https://github.com/Pascu-Victor/cpython.git python
 fi
+stage_distributed_compiler_roots "$B/src/python" "$SYSROOT/include"
 
 WOS_SYSROOT_PATH="$SYSROOT" \
     WOS_PYTHON_SOURCE_DIR="$B/src/python" \
@@ -865,6 +888,7 @@ fi
 if [ ! -f git/Makefile ]; then
     git clone --depth=1 --branch=wos-support https://github.com/Pascu-Victor/git.git git
 fi
+stage_distributed_compiler_roots "$B/src/git" "$SYSROOT/include"
 
 WOS_SYSROOT_PATH="$SYSROOT" \
     WOS_GIT_SOURCE_DIR="$B/src/git" \
@@ -874,6 +898,7 @@ bootstrap_phase_end
 
 # 19. Build clang/lld for WOS userspace
 bootstrap_phase_start 19 "clang/lld for WOS userspace"
+stage_distributed_compiler_roots "$B/src/llvm-project" "$SYSROOT/include"
 CLANG_FOR_WOS_CMAKE=cmake
 if [ "$HOST_SYSTEM" = "WOS" ]; then
     CLANG_FOR_WOS_CMAKE="$SYSROOT/bin/cmake"

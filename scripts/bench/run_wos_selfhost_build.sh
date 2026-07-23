@@ -143,7 +143,7 @@ distdir="${WOS_SELFHOST_DISTDIR:-}"
 distributed="${WOS_SELFHOST_DISTRIBUTED:-0}"
 distributed_hosts="${WOS_SELFHOST_DISTRIBUTED_HOSTS:-}"
 distributed_jobs_per_host="${WOS_SELFHOST_DISTRIBUTED_JOBS_PER_HOST:-}"
-distributed_compiler_transport="${WOS_SELFHOST_DISTRIBUTED_COMPILER_TRANSPORT:-rewritten}"
+distributed_compiler_transport="${WOS_SELFHOST_DISTRIBUTED_COMPILER_TRANSPORT:-staged}"
 distributed_local_jobs="${WOS_SELFHOST_DISTRIBUTED_LOCAL_JOBS:-}"
 distributed_preprocess_jobs="${WOS_SELFHOST_DISTRIBUTED_PREPROCESS_JOBS:-}"
 distributed_remote_jobs_per_host="${WOS_SELFHOST_DISTRIBUTED_REMOTE_JOBS_PER_HOST:-}"
@@ -738,12 +738,21 @@ require_tool() {
 validate_runtime_settings() {
     if [ "$mode" = "wos" ] && [ "$distributed" = "1" ]; then
         local submitter_cpus=""
+        local smallest_peer_cpus=""
         local peer_hostname peer_node peer_connected peer_cpus peer_load peer_update peer_local
         if [ -r /proc/wki/peers ]; then
             while read -r peer_hostname peer_node peer_connected peer_cpus peer_load peer_update peer_local; do
                 if [ "$peer_local" = "1" ]; then
                     submitter_cpus="$peer_cpus"
-                    break
+                elif [ "$peer_connected" = "1" ]; then
+                    case "$peer_cpus" in
+                        ''|*[!0-9]*|0) ;;
+                        *)
+                            if [ -z "$smallest_peer_cpus" ] || [ "$peer_cpus" -lt "$smallest_peer_cpus" ]; then
+                                smallest_peer_cpus="$peer_cpus"
+                            fi
+                            ;;
+                    esac
                 fi
             done < /proc/wki/peers
         fi
@@ -754,6 +763,8 @@ validate_runtime_settings() {
         if [ -z "$distributed_local_jobs" ]; then
             if [ "$distributed_compiler_transport" = "source" ]; then
                 distributed_local_jobs="$distributed_jobs_per_host"
+            elif [ "$distributed_compiler_transport" = "staged" ]; then
+                distributed_local_jobs="$submitter_cpus"
             else
                 distributed_local_jobs="$((submitter_cpus / 3))"
                 [ "$distributed_local_jobs" -gt 0 ] || distributed_local_jobs=1
@@ -764,7 +775,11 @@ validate_runtime_settings() {
             [ "$distributed_preprocess_jobs" -gt 0 ] || distributed_preprocess_jobs=1
         fi
         if [ -z "$distributed_remote_jobs_per_host" ]; then
-            distributed_remote_jobs_per_host="$distributed_jobs_per_host"
+            if [ "$distributed_compiler_transport" = "staged" ] && [ -n "$smallest_peer_cpus" ]; then
+                distributed_remote_jobs_per_host="$smallest_peer_cpus"
+            else
+                distributed_remote_jobs_per_host="$distributed_jobs_per_host"
+            fi
         fi
         case "$distributed_local_jobs" in
             ''|*[!0-9]*|0)
@@ -848,6 +863,7 @@ require_wos_selfhost_tools() {
     local tool
     for tool in \
         sh env make tar sed grep mktemp sha256sum xz yes sleep tail wc stat \
+        hostname realpath sort \
         ld.lld lld llvm-ar llvm-ranlib llvm-nm llvm-objcopy llvm-strip \
         llvm-readelf llvm-objdump llvm-symbolizer llvm-tblgen clang-tblgen \
         llvm-as llvm-dis llvm-link llc opt; do
@@ -1279,6 +1295,16 @@ bootstrap_toolchain() {
     )
 }
 
+stage_wos_sources() {
+    if [ "$mode" != wos ] || [ "$distributed" != 1 ] || [ "$distributed_compiler_transport" != staged ]; then
+        return 0
+    fi
+    run_with_jobs_env env \
+        WOS_DISTRIBUTED_COMPILER_STAGE_BASE="$workdir" \
+        "$checkout/tools/stage-distributed-compiler-roots.sh" \
+        "$checkout/modules"
+}
+
 configure_cmake_command() {
     if [ "$mode" = "linux" ] && [ -n "$host_toolchain" ]; then
         printf '%s\n' "$host_toolchain/bin/cmake"
@@ -1442,6 +1468,7 @@ log "git_http_low_speed=${git_http_low_speed_limit}Bps/${git_http_low_speed_time
 log "heartbeat=${heartbeat_interval}s tail=${heartbeat_tail} stall_snapshots=${heartbeat_stall_snapshots} sync=${heartbeat_sync}"
 time_step clone_sources clone_sources
 time_step bootstrap_toolchain bootstrap_toolchain
+time_step stage_wos_sources stage_wos_sources
 warm_configure_tools
 time_step configure_wos configure_wos
 time_step build_wos build_wos
@@ -1620,7 +1647,7 @@ heartbeat_sync="0"
 distributed=0
 distributed_hosts=""
 distributed_jobs_per_host=""
-distributed_compiler_transport="${WOS_SELFHOST_DISTRIBUTED_COMPILER_TRANSPORT:-rewritten}"
+distributed_compiler_transport="${WOS_SELFHOST_DISTRIBUTED_COMPILER_TRANSPORT:-staged}"
 distributed_local_jobs="${WOS_SELFHOST_DISTRIBUTED_LOCAL_JOBS:-}"
 distributed_preprocess_jobs="${WOS_SELFHOST_DISTRIBUTED_PREPROCESS_JOBS:-}"
 distributed_remote_jobs_per_host="${WOS_SELFHOST_DISTRIBUTED_REMOTE_JOBS_PER_HOST:-}"
@@ -1788,11 +1815,11 @@ if [ "$distributed" -eq 1 ]; then
         [ -z "${distributed_host_seen[$distributed_host]:-}" ] || die "duplicate distributed host: $distributed_host"
         distributed_host_seen[$distributed_host]=1
     done
-    [ -n "${distributed_host_seen[$host]:-}" ] || die "distributed hosts must include the submitter: $host"
+    [ "${distributed_host_list[0]}" = "$host" ] || die "distributed hosts must list the submitter first: $host"
     distributed_jobs_per_host="$(((jobs + ${#distributed_host_list[@]} - 1) / ${#distributed_host_list[@]}))"
     case "$distributed_compiler_transport" in
-        source|preprocessed|rewritten) ;;
-        *) die "distributed compiler transport must be 'source', 'preprocessed', or 'rewritten'" ;;
+        source|staged|preprocessed|rewritten) ;;
+        *) die "distributed compiler transport must be 'source', 'staged', 'preprocessed', or 'rewritten'" ;;
     esac
     case "$distributed_local_jobs" in
         '' ) ;;

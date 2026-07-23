@@ -20,6 +20,7 @@ DISTRIBUTED_CLUSTER = ROOT / "configs" / "cluster_bench_4.json"
 DISTRIBUTED_SELFHOST_CLUSTER = ROOT / "configs" / "cluster_selfhost_4.json"
 GIT_MIRROR = ROOT / "scripts" / "dev" / "git_mirror_for_wos.sh"
 ROOTFS_ALIASES = ROOT / "configs" / "rootfs" / "aliases.tsv"
+STAGE_DISTRIBUTED_ROOTS = ROOT / "tools" / "stage-distributed-compiler-roots.sh"
 
 
 def fail(message: str) -> None:
@@ -55,7 +56,7 @@ def test_selfhost_runner_covers_acceptance_flow() -> None:
             'WOS_DISTRIBUTED_COMPILER_HOSTS="$distributed_hosts"',
             'distributed_compiler_state="$workdir/tmp/distributed-compiler"',
             'WOS_DISTRIBUTED_COMPILER_STATE="$distributed_compiler_state"',
-            'distributed_compiler_transport="${WOS_SELFHOST_DISTRIBUTED_COMPILER_TRANSPORT:-rewritten}"',
+            'distributed_compiler_transport="${WOS_SELFHOST_DISTRIBUTED_COMPILER_TRANSPORT:-staged}"',
             'WOS_DISTRIBUTED_COMPILER_TRANSPORT="$distributed_compiler_transport"',
             'WOS_DISTRIBUTED_COMPILER_JOBS_PER_HOST="$distributed_jobs_per_host"',
             'WOS_DISTRIBUTED_COMPILER_LOCAL_JOBS="$distributed_local_jobs"',
@@ -76,6 +77,8 @@ def test_selfhost_runner_covers_acceptance_flow() -> None:
             'WOS_SELFHOST_DISTRIBUTED_LOCAL_JOBS=$(shell_quote "$distributed_local_jobs")',
             'WOS_SELFHOST_DISTRIBUTED_PREPROCESS_JOBS=$(shell_quote "$distributed_preprocess_jobs")',
             'WOS_SELFHOST_DISTRIBUTED_REMOTE_JOBS_PER_HOST=$(shell_quote "$distributed_remote_jobs_per_host")',
+            'time_step stage_wos_sources stage_wos_sources',
+            '"$checkout/tools/stage-distributed-compiler-roots.sh"',
             '--distributed-hosts',
             'for routed_path in /root /usr /bin /lib /lib64 /libexec /share /etc /proc /dev /run /tmp; do',
             "clone_cmd=(git clone)",
@@ -147,14 +150,20 @@ def test_wos_bootstrap_distributes_only_compiler_processes() -> None:
             r'if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; then',
             r'IFS=, read -r -a compiler_hosts <<< "\${WOS_DISTRIBUTED_COMPILER_HOSTS:-}"',
             r'compiler_transport="\${WOS_DISTRIBUTED_COMPILER_TRANSPORT:-source}"',
-            r"source|preprocessed|rewritten)",
+            r"source|staged|preprocessed|rewritten)",
             r'compiler_slot_pause=(usleep 1000)',
             r'"\${compiler_slot_pause[@]}"',
             r'compiler_jobs_per_host="\$(((compiler_total_jobs + \${#compiler_hosts[@]} - 1) / \${#compiler_hosts[@]}))"',
             r'compiler_slots="\$compiler_state.source-slots"',
             r'compiler_start_index="\$((RANDOM % \${#compiler_hosts[@]}))"',
             r'compiler_start_index="\$(((compiler_start_index + 1) % \${#compiler_hosts[@]}))"',
-            r'on "\$compiler_host" "\${compiler[@]}" -fno-temp-file "@\$compiler_response"',
+            r'compiler_remote_command=(on "\$compiler_host")',
+            r'compiler_remote_command+=(-- locally)',
+            r'compiler_add_home_route "\$compiler_state"',
+            r'compiler_add_home_route "\$output_file"',
+            r'-Wp,-MD,*|-Wp,-MMD,*)',
+            r'-serialize-diagnostics=*|-fmodule-output=*|-fmodules-cache-path=*)',
+            r'"\${compiler_remote_command[@]}" "\${compiler[@]}" -fno-temp-file "@\$compiler_response"',
             r'compiler_jobs_per_host="\${WOS_DISTRIBUTED_COMPILER_JOBS_PER_HOST:-}"',
             r'compiler_local_jobs="\${WOS_DISTRIBUTED_COMPILER_LOCAL_JOBS:-\$compiler_jobs_per_host}"',
             r'compiler_remote_jobs_per_host="\${WOS_DISTRIBUTED_COMPILER_REMOTE_JOBS_PER_HOST:-\$compiler_jobs_per_host}"',
@@ -666,6 +675,174 @@ test ! -e "$1/compiler-state.successes/1"
             fail("WOS compiler shim did not report the remote failure before local retry")
 
 
+def test_wos_bootstrap_staged_compiler_routes_source_and_outputs() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp = Path(temp_dir)
+        source_root = temp / "source-root"
+        source_root.mkdir()
+        source = source_root / "input.c"
+        source.write_text("int staged_input(void) { return 23; }\n", encoding="ascii")
+        state = temp / "compiler-state"
+        (Path(f"{state}.source-slots") / "0" / "0").mkdir(parents=True)
+        Path(f"{state}.local-roots").write_text(f"{source_root}\n", encoding="ascii")
+        trace = temp / "on.args"
+        mock_on = temp / "on"
+        mock_on.write_text(
+            r'''#!/bin/bash
+set -eu
+trace=TRACE_PATH
+printf '%s\n' "$@" > "$trace"
+[ "$1" = wos-1 ]
+shift
+[ "$1" = forward ]
+while [ "$1" != -- ]; do shift; done
+shift
+[ "$1" = locally ]
+shift
+exec "$@"
+'''.replace("TRACE_PATH", shlex.quote(str(trace))),
+            encoding="ascii",
+        )
+        mock_on.chmod(0o755)
+        system_clang = ROOT / "toolchain" / "host" / "bin" / "clang"
+        resource_dir = ROOT / "toolchain" / "host" / "lib" / "clang" / "22"
+        script = r'''
+set -euo pipefail
+WOS_TARGET_ARCH=x86_64-pc-wos
+source <(sed -n '/^write_clang_wrapper()/,/^}/p' tools/bootstrap.sh)
+write_clang_wrapper "$1/clang" "$2" "$3"
+PATH="$1:$PATH" \
+    WOS_DISTRIBUTED_COMPILER=1 \
+    WOS_DISTRIBUTED_COMPILER_HOSTS=wos-0,wos-1 \
+    WOS_DISTRIBUTED_COMPILER_STATE="$1/compiler-state" \
+    WOS_DISTRIBUTED_COMPILER_TRANSPORT=staged \
+    WOS_DISTRIBUTED_COMPILER_JOBS_PER_HOST=1 \
+    WOS_DISTRIBUTED_COMPILER_LOCAL_JOBS=1 \
+    WOS_DISTRIBUTED_COMPILER_REMOTE_JOBS_PER_HOST=1 \
+    WOS_NINJA_JOBS=2 \
+    "$1/clang" -MD -MF "$1/explicit.d" -MJ "$1/compile.json" \
+        -serialize-diagnostics "$1/diagnostics.dia" \
+        -fmodules-cache-path="$1/module-cache" \
+        -c "$1/source-root/input.c" -o "$1/output.o"
+test -s "$1/output.o"
+test -s "$1/explicit.d"
+test -s "$1/compile.json"
+test -s "$1/diagnostics.dia"
+grep -Fx -- "-$1/source-root" "$1/on.args"
+grep -Fx -- "+$1/compiler-state" "$1/on.args"
+grep -Fx -- "+$1/output.o" "$1/on.args"
+grep -Fx -- "+$1/explicit.d" "$1/on.args"
+grep -Fx -- "+$1/compile.json" "$1/on.args"
+grep -Fx -- "+$1/diagnostics.dia" "$1/on.args"
+grep -Fx -- "+$1/module-cache" "$1/on.args"
+grep -Fx -- locally "$1/on.args"
+rm -rf -- "$1/compiler-state.source-slots/1"
+mkdir -p "$1/compiler-state.source-slots/0/0"
+PATH="$1:$PATH" \
+    WOS_DISTRIBUTED_COMPILER=1 \
+    WOS_DISTRIBUTED_COMPILER_HOSTS=wos-0,wos-1 \
+    WOS_DISTRIBUTED_COMPILER_STATE="$1/compiler-state" \
+    WOS_DISTRIBUTED_COMPILER_TRANSPORT=staged \
+    WOS_DISTRIBUTED_COMPILER_JOBS_PER_HOST=1 \
+    WOS_DISTRIBUTED_COMPILER_LOCAL_JOBS=1 \
+    WOS_DISTRIBUTED_COMPILER_REMOTE_JOBS_PER_HOST=1 \
+    WOS_NINJA_JOBS=2 \
+    "$1/clang" -MD -c "$1/source-root/input.c" -o "$1/implicit.o"
+test -s "$1/implicit.o"
+test -s "$1/implicit.d"
+grep -Fx -- "+$1/implicit.d" "$1/on.args"
+'''
+        result = subprocess.run(
+            [
+                "bash",
+                "-c",
+                script,
+                "wos-bootstrap-staged-test",
+                temp_dir,
+                str(system_clang),
+                str(resource_dir),
+            ],
+            cwd=ROOT,
+            check=False,
+            text=True,
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            fail(f"WOS staged compiler routing test failed: stdout={result.stdout!r} stderr={result.stderr!r}")
+
+
+def test_distributed_compiler_root_staging_is_guarded_and_atomic() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp = Path(temp_dir)
+        stage_base = temp / "work"
+        root = stage_base / "checkout" / "modules"
+        root.mkdir(parents=True)
+        (root / "sentinel").write_text("staged\n", encoding="ascii")
+        state = stage_base / "tmp" / "distributed-compiler"
+        mock_bin = temp / "bin"
+        mock_bin.mkdir()
+        (mock_bin / "hostname").write_text("#!/bin/sh\nprintf '%s\\n' wos-0\n", encoding="ascii")
+        (mock_bin / "hostname").chmod(0o755)
+        (mock_bin / "on").write_text(
+            r'''#!/bin/bash
+set -eu
+[ "$1" = wos-1 ]
+shift
+[ "$1" = forward ]
+while [ "$1" != -- ]; do shift; done
+shift
+[ "$1" = locally ]
+shift
+exec "$@"
+''',
+            encoding="ascii",
+        )
+        (mock_bin / "on").chmod(0o755)
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "PATH": f"{mock_bin}:{environment['PATH']}",
+                "WOS_DISTRIBUTED_COMPILER_TRANSPORT": "staged",
+                "WOS_DISTRIBUTED_COMPILER_HOSTS": "wos-0,wos-1",
+                "WOS_DISTRIBUTED_COMPILER_STATE": str(state),
+                "WOS_DISTRIBUTED_COMPILER_STAGE_BASE": str(stage_base),
+            }
+        )
+        result = subprocess.run(
+            [str(STAGE_DISTRIBUTED_ROOTS), str(root), str(root)],
+            cwd=ROOT,
+            check=False,
+            text=True,
+            capture_output=True,
+            env=environment,
+        )
+        if result.returncode != 0:
+            fail(f"distributed root staging failed: {result.stderr}")
+        manifest = Path(f"{state}.local-roots")
+        if manifest.read_text(encoding="ascii") != f"{root}\n":
+            fail("distributed root staging did not atomically publish a deduplicated manifest")
+        if (root / "sentinel").read_text(encoding="ascii") != "staged\n":
+            fail("distributed root staging did not restore the exact staged root")
+
+        outside = temp / "outside"
+        outside.mkdir()
+        escaping = stage_base / "escaping-root"
+        escaping.symlink_to(outside, target_is_directory=True)
+        before = manifest.read_text(encoding="ascii")
+        result = subprocess.run(
+            [str(STAGE_DISTRIBUTED_ROOTS), str(escaping)],
+            cwd=ROOT,
+            check=False,
+            text=True,
+            capture_output=True,
+            env=environment,
+        )
+        if result.returncode == 0 or "escapes stage base" not in result.stderr:
+            fail("distributed root staging accepted a symlink escape")
+        if manifest.read_text(encoding="ascii") != before:
+            fail("failed distributed root staging changed the published manifest")
+
+
 def test_distributed_compiler_hosts_are_validated_before_launch() -> None:
     invalid_cases = [
         (["--distributed"], "--distributed requires --distributed-hosts"),
@@ -675,7 +852,11 @@ def test_distributed_compiler_hosts_are_validated_before_launch() -> None:
         ),
         (
             ["--distributed", "--distributed-hosts", "wos-1,wos-2"],
-            "distributed hosts must include the submitter",
+            "distributed hosts must list the submitter first",
+        ),
+        (
+            ["--distributed", "--distributed-hosts", "wos-1,wos-0"],
+            "distributed hosts must list the submitter first",
         ),
     ]
     for arguments, expected_error in invalid_cases:
@@ -2165,6 +2346,8 @@ if __name__ == "__main__":
     test_wos_bootstrap_keeps_small_preprocessed_inputs_local()
     test_wos_bootstrap_compiles_submitter_jobs_once()
     test_wos_bootstrap_retries_failed_remote_compiler_locally()
+    test_wos_bootstrap_staged_compiler_routes_source_and_outputs()
+    test_distributed_compiler_root_staging_is_guarded_and_atomic()
     test_distributed_compiler_hosts_are_validated_before_launch()
     test_selfhost_repeatability_runner_preserves_acceptance_evidence()
     test_linux_selfhost_baseline_preserves_full_process_evidence()
