@@ -428,6 +428,32 @@ heartbeat_wos_procfs_snapshot() {
     done
 }
 
+heartbeat_sync_distributed_peers() {
+    if [ "$heartbeat_sync" != "1" ] || [ "$mode" != "wos" ] || [ "$distributed" != "1" ]; then
+        return 0
+    fi
+
+    local peer
+    local peer_index=0
+    local -a peer_sync_pids=()
+    local -a heartbeat_hosts=()
+    IFS=, read -r -a heartbeat_hosts <<< "$distributed_hosts"
+    for peer in "${heartbeat_hosts[@]}"; do
+        if [ "$peer_index" -ne 0 ]; then
+            (
+                timeout -s TERM -k 5 20 on "$peer" locally sync
+            ) >/dev/null 2>&1 &
+            peer_sync_pids+=("$!")
+        fi
+        peer_index=$((peer_index + 1))
+    done
+
+    local peer_sync_pid
+    for peer_sync_pid in "${peer_sync_pids[@]}"; do
+        wait "$peer_sync_pid" 2>/dev/null || true
+    done
+}
+
 start_log_heartbeat() {
     local phase="$1"
     local label="$2"
@@ -443,6 +469,7 @@ start_log_heartbeat() {
         local stalled_ticks=0
         while :; do
             sleep "$heartbeat_interval" || exit 0
+            heartbeat_sync_distributed_peers
 
             local bytes lines
             bytes="$(heartbeat_file_bytes "$output")"
@@ -489,6 +516,7 @@ stop_log_heartbeat() {
     fi
 
     if [ "$heartbeat_sync" = "1" ]; then
+        heartbeat_sync_distributed_peers
         sync || true
     fi
 }
@@ -767,7 +795,8 @@ validate_runtime_settings() {
             if [ "$distributed_compiler_transport" = "source" ]; then
                 distributed_local_jobs="$distributed_jobs_per_host"
             elif [ "$distributed_compiler_transport" = "staged" ]; then
-                distributed_local_jobs="$submitter_cpus"
+                distributed_local_jobs="$((submitter_cpus / 3))"
+                [ "$distributed_local_jobs" -gt 0 ] || distributed_local_jobs=1
             else
                 distributed_local_jobs="$((submitter_cpus / 3))"
                 [ "$distributed_local_jobs" -gt 0 ] || distributed_local_jobs=1
@@ -779,7 +808,7 @@ validate_runtime_settings() {
         fi
         if [ -z "$distributed_remote_jobs_per_host" ]; then
             if [ "$distributed_compiler_transport" = "staged" ] && [ -n "$smallest_peer_cpus" ]; then
-                distributed_remote_jobs_per_host="$smallest_peer_cpus"
+                distributed_remote_jobs_per_host="$(((smallest_peer_cpus * 3 + 1) / 2))"
             else
                 distributed_remote_jobs_per_host="$distributed_jobs_per_host"
             fi
