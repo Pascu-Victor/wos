@@ -213,10 +213,15 @@ def test_wos_bootstrap_distributes_only_compiler_processes() -> None:
             r'compiler_local_jobs="\${WOS_DISTRIBUTED_COMPILER_LOCAL_JOBS:-\$compiler_jobs_per_host}"',
             r'compiler_remote_jobs_per_host="\${WOS_DISTRIBUTED_COMPILER_REMOTE_JOBS_PER_HOST:-\$compiler_jobs_per_host}"',
             r'compiler_remote_timeout="\${WOS_DISTRIBUTED_COMPILER_REMOTE_TIMEOUT:-300}"',
+            r'compiler_publish_timeout="\${WOS_DISTRIBUTED_COMPILER_PUBLISH_TIMEOUT:-5}"',
+            r'fsync "\$compiler_response"',
+            "distributed compiler response file could not be published",
+            r'fsync "\$compiler_route_response"',
+            "staged distributed compiler route file could not be published",
             r'compiler_run_remote() {',
             r'if [ "\$compiler_status" -ne 127 ] || [ "\$compiler_remote_attempt" -ge 2 ]; then',
             r"distributed compiler launch on \$compiler_host failed with status 127; retrying once",
-            r'compiler_publish_limit_us="\$((compiler_remote_timeout * 1000000))"',
+            r'compiler_publish_limit_us="\$((compiler_publish_timeout * 1000000))"',
             r'''while [ ! -s "\$compiler_staged_output" ] &&''',
             r'compiler_publish_wait_us="\$((compiler_publish_wait_us + compiler_publish_pause_us))"',
             r'''[ ! -s "\$compiler_staged_output" ]''',
@@ -971,6 +976,9 @@ exec "$@"
             encoding="ascii",
         )
         mock_on.chmod(0o755)
+        mock_fsync = temp / "fsync"
+        mock_fsync.write_text('#!/bin/sh\nexec sync -f "$1"\n', encoding="ascii")
+        mock_fsync.chmod(0o755)
         system_clang = ROOT / "toolchain" / "host" / "bin" / "clang"
         resource_dir = ROOT / "toolchain" / "host" / "lib" / "clang" / "22"
         script = r'''
@@ -1089,6 +1097,9 @@ exec "$@"
             encoding="ascii",
         )
         mock_on.chmod(0o755)
+        mock_fsync = temp / "fsync"
+        mock_fsync.write_text('#!/bin/sh\nexec sync -f "$1"\n', encoding="ascii")
+        mock_fsync.chmod(0o755)
         system_clang = ROOT / "toolchain" / "host" / "bin" / "clang"
         resource_dir = ROOT / "toolchain" / "host" / "lib" / "clang" / "22"
         script = r'''
@@ -1107,6 +1118,7 @@ write_clang_wrapper "$1/clang" "$2" "$3"
         WOS_DISTRIBUTED_COMPILER_LOCAL_JOBS=1 \
         WOS_DISTRIBUTED_COMPILER_REMOTE_JOBS_PER_HOST=1 \
         WOS_DISTRIBUTED_COMPILER_REMOTE_TIMEOUT=1 \
+        WOS_DISTRIBUTED_COMPILER_PUBLISH_TIMEOUT=1 \
         WOS_NINJA_JOBS=2 \
         "$1/clang" -c input.c -o "$1/output.o"
 )

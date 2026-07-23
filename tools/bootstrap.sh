@@ -267,6 +267,7 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
         compiler_local_jobs="\${WOS_DISTRIBUTED_COMPILER_LOCAL_JOBS:-\$compiler_jobs_per_host}"
         compiler_remote_jobs_per_host="\${WOS_DISTRIBUTED_COMPILER_REMOTE_JOBS_PER_HOST:-\$compiler_jobs_per_host}"
         compiler_remote_timeout="\${WOS_DISTRIBUTED_COMPILER_REMOTE_TIMEOUT:-300}"
+        compiler_publish_timeout="\${WOS_DISTRIBUTED_COMPILER_PUBLISH_TIMEOUT:-5}"
         case "\$compiler_local_jobs" in
             ''|*[!0-9]*|0)
                 echo "ERROR: distributed compiler local jobs must be a positive integer" >&2
@@ -276,6 +277,12 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
         case "\$compiler_remote_timeout" in
             ''|*[!0-9]*|0)
                 echo "ERROR: distributed compiler remote timeout must be a positive integer" >&2
+                exit 1
+                ;;
+        esac
+        case "\$compiler_publish_timeout" in
+            ''|*[!0-9]*|0)
+                echo "ERROR: distributed compiler publish timeout must be a positive integer" >&2
                 exit 1
                 ;;
         esac
@@ -558,6 +565,16 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
                 fi
                 exit "\$compiler_status"
             fi
+            # The peer reads this file through remote VFS immediately after
+            # submission. Close-after-append is not a sufficient publication
+            # boundary for an XFS-backed response file under concurrent
+            # staging and compiler traffic.
+            if ! fsync "\$compiler_response"; then
+                compiler_slot_release
+                trap - EXIT HUP INT TERM
+                echo "ERROR: distributed compiler response file could not be published" >&2
+                exit 1
+            fi
             compiler_route_response="\$compiler_responses/routes.\$\$"
             if ! : > "\$compiler_route_response"; then
                 compiler_slot_release
@@ -569,6 +586,12 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
                 compiler_slot_release
                 trap - EXIT HUP INT TERM
                 echo "ERROR: staged distributed compiler route file could not be written" >&2
+                exit 1
+            fi
+            if ! fsync "\$compiler_route_response"; then
+                compiler_slot_release
+                trap - EXIT HUP INT TERM
+                echo "ERROR: staged distributed compiler route file could not be published" >&2
                 exit 1
             fi
             # Compile the object into peer-local /tmp, then copy the completed
@@ -621,10 +644,11 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
                 # A concurrent WKI exec-proxy completion can reach the
                 # submitter before the peer's local child has copied and
                 # fsynced its object. Keep the admission slot until the actual
-                # publication boundary, bounded by the same timeout as the
-                # remote command.
+                # publication boundary. Keep only a short grace period for
+                # that race so one missing object cannot hold every peer
+                # admission slot for minutes.
                 compiler_publish_wait_us=0
-                compiler_publish_limit_us="\$((compiler_remote_timeout * 1000000))"
+                compiler_publish_limit_us="\$((compiler_publish_timeout * 1000000))"
                 compiler_publish_pause_us=1000
                 while [ ! -s "\$compiler_staged_output" ] &&
                       [ "\$compiler_publish_wait_us" -lt "\$compiler_publish_limit_us" ]; do
