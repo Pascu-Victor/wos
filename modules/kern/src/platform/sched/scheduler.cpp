@@ -2281,8 +2281,8 @@ inline auto orphaned_waitpid_candidate_locked(RunQueue* rq, task::Task* candidat
            candidate->scheduler_published.load(std::memory_order_acquire) && !candidate->gc_queued.load(std::memory_order_acquire) &&
            candidate->wki_proxy_task_id == 0 && candidate->sched_queue == task::Task::sched_queue::WAITING &&
            candidate->wait_channel_is(task::WaitChannelKind::WAITPID) && candidate->waiting_for_pid != 0 &&
-           !candidate->deferred_task_switch && candidate->last_sleep_start_us == 0 && candidate->heap_index < 0 &&
-           candidate->sched_next == nullptr && !runqueue_task_is_reserved_locked(rq, candidate) && !rq->runnable_heap.contains(candidate) &&
+           !candidate->deferred_task_switch && candidate->heap_index < 0 && candidate->sched_next == nullptr &&
+           !runqueue_task_is_reserved_locked(rq, candidate) && !rq->runnable_heap.contains(candidate) &&
            !wait_list_contains_locked(rq, candidate);
 }
 
@@ -8386,12 +8386,14 @@ auto scheduler_selftest_waitpid_wait_publication_arms_repair() -> bool {
 
     wait_list_remove_all_locked(rq, &waiter);
     waiter.last_sleep_start_us = 123;
+    bool const UNLINKED_STAMPED_WAITER_RECOGNIZED = orphaned_waitpid_candidate_locked(rq, &waiter);
     wait_list_push_locked(rq, &waiter);
     bool const PRESERVED = waiter.last_sleep_start_us == 123 && rq->next_wait_deadline_us == 123 + WAITPID_REPAIR_FALLBACK_MIN_US;
 
     wait_list_remove_all_locked(rq, &waiter);
     task::task_clear_waitpid_block_state(waiter);
-    return ORPHAN_RECOGNIZED && ARMED && LINKED_WAITER_NOT_ORPHANED && PRESERVED && rq->next_wait_deadline_us == 0;
+    return ORPHAN_RECOGNIZED && ARMED && LINKED_WAITER_NOT_ORPHANED && UNLINKED_STAMPED_WAITER_RECOGNIZED && PRESERVED &&
+           rq->next_wait_deadline_us == 0;
 }
 
 auto scheduler_selftest_reserved_wake_precedes_handoff_commit() -> bool {

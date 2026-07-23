@@ -1774,7 +1774,6 @@ def test_timer_waitpid_repair_rechecks_stranded_waiters_without_sigchld() -> Non
             "candidate->wait_channel_is(task::WaitChannelKind::WAITPID)",
             "candidate->waiting_for_pid != 0",
             "!candidate->deferred_task_switch",
-            "candidate->last_sleep_start_us == 0",
             "!runqueue_task_is_reserved_locked(rq, candidate)",
             "!rq->runnable_heap.contains(candidate)",
             "!wait_list_contains_locked(rq, candidate)",
