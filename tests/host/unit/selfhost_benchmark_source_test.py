@@ -190,6 +190,8 @@ def test_wos_bootstrap_distributes_only_compiler_processes() -> None:
             r'"\$compiler_route_response" "\$PWD" "\$compiler_remote_output" "\$compiler_staged_output"',
             '''"$@" -o "$local_output"''',
             '''cp -- "$local_output" "$host_output"''',
+            '''fsync "$host_output"''',
+            "distributed staged compiler output fsync failed",
             "distributed staged compiler command failed with status",
             "distributed staged compiler output copy failed after",
             r'if [ "\$compiler_transport" = staged ]; then',
@@ -2076,7 +2078,7 @@ def test_selfhost_runner_preflights_wos_only_self_host_tools() -> None:
         source,
         [
             "require_wos_selfhost_tools()",
-            "sh env make tar sed grep mktemp sha256sum xz yes sleep tail wc stat \\",
+            "sh env make tar sed grep mktemp sha256sum xz yes sleep tail wc stat fsync \\",
             "ld.lld lld llvm-ar llvm-ranlib llvm-nm llvm-objcopy llvm-strip \\",
             "llvm-readelf llvm-objdump llvm-symbolizer llvm-tblgen clang-tblgen \\",
             "llvm-as llvm-dis llvm-link llc opt",

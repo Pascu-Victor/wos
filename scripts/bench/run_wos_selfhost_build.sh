@@ -894,7 +894,7 @@ validate_runtime_settings() {
 require_wos_selfhost_tools() {
     local tool
     for tool in \
-        sh env make tar sed grep mktemp sha256sum xz yes sleep tail wc stat \
+        sh env make tar sed grep mktemp sha256sum xz yes sleep tail wc stat fsync \
         find hostname realpath sort \
         ld.lld lld llvm-ar llvm-ranlib llvm-nm llvm-objcopy llvm-strip \
         llvm-readelf llvm-objdump llvm-symbolizer llvm-tblgen clang-tblgen \

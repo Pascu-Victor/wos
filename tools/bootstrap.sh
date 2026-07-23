@@ -147,6 +147,10 @@ while ! cp -- "$local_output" "$host_output"; do
     sleep 1
     copy_attempt=$((copy_attempt + 1))
 done
+if ! fsync "$host_output"; then
+    echo "distributed staged compiler output fsync failed" >&2
+    exit 1
+fi
 ' distributed-staged "$compiler_cwd" "$local_output" "$host_output" "$@"
 EOF
     chmod +x "$distributed_staged_launcher"
