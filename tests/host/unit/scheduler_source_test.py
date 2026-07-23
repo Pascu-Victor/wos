@@ -1783,7 +1783,8 @@ def test_timer_waitpid_repair_rechecks_stranded_waiters_without_sigchld() -> Non
     require_tokens(
         orphan_repair_body,
         [
-            "cpu::current_cpu() != 0",
+            "ORPHANED_WAITPID_SCAN_INTERVAL_US",
+            "orphaned_waitpid_next_scan_us.compare_exchange_strong",
             "ORPHANED_WAITPID_SCAN_BATCH",
             "get_active_task_at_safe(INDEX)",
             "orphaned_waitpid_candidate_locked(rq, candidate)",

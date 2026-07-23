@@ -91,7 +91,9 @@ std::atomic<uint64_t> g_preempt_block_warnings{0};
 sys::Spinlock g_placement_lock;
 constexpr size_t PENDING_WAKE_LIMIT = 16;
 constexpr uint32_t ORPHANED_WAITPID_SCAN_BATCH = 32;
+constexpr uint64_t ORPHANED_WAITPID_SCAN_INTERVAL_US = 10'000;
 std::atomic<uint32_t> orphaned_waitpid_scan_cursor{0};
+std::atomic<uint64_t> orphaned_waitpid_next_scan_us{0};
 using PendingWakeList = std::array<task::Task*, PENDING_WAKE_LIMIT>;
 
 inline auto pending_wake_slot(PendingWakeList& tasks, uint32_t index) -> task::Task*& {
@@ -2287,7 +2289,18 @@ inline auto orphaned_waitpid_candidate_locked(RunQueue* rq, task::Task* candidat
 }
 
 void repair_one_orphaned_waitpid_from_registry() {
-    if (run_queues == nullptr || cpu::current_cpu() != 0) {
+    if (run_queues == nullptr) {
+        return;
+    }
+
+    uint64_t const NOW_US = time::get_us();
+    uint64_t next_scan_us = orphaned_waitpid_next_scan_us.load(std::memory_order_acquire);
+    if (NOW_US < next_scan_us) {
+        return;
+    }
+    uint64_t const NEW_NEXT_SCAN_US = saturating_deadline_us(NOW_US, ORPHANED_WAITPID_SCAN_INTERVAL_US);
+    if (!orphaned_waitpid_next_scan_us.compare_exchange_strong(next_scan_us, NEW_NEXT_SCAN_US, std::memory_order_acq_rel,
+                                                               std::memory_order_acquire)) {
         return;
     }
 
