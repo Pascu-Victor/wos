@@ -114,12 +114,19 @@ EOF
 set -eu
 
 route_file="$1"
-shift
+compiler_cwd="$2"
+shift 2
 route_args=()
 while IFS= read -r route_arg; do
     route_args+=("$route_arg")
 done < "$route_file"
-exec forward --clear "${route_args[@]}" -- locally "$@"
+exec forward --clear "${route_args[@]}" -- locally /usr/bin/bash -c '
+set -eu
+compiler_cwd="$1"
+shift
+cd -- "$compiler_cwd"
+exec "$@"
+' distributed-staged "$compiler_cwd" "$@"
 EOF
     chmod +x "$distributed_staged_launcher"
 
@@ -449,16 +456,23 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
                 echo "ERROR: staged distributed compiler route file could not be written" >&2
                 exit 1
             fi
-            # Submit only a fixed launcher and two response-file paths. The
-            # launcher installs the route policy after it is already running
-            # on the peer, so recursive-build process context cannot inflate
-            # TASK_SUBMIT beyond WKI's single-frame payload limit.
-            compiler_remote_command=(forward --clear -- on "\$compiler_host" /usr/bin/bash "$distributed_staged_launcher" "\$compiler_route_response")
+            # Submit only a fixed launcher, the original cwd, and two
+            # response-file paths. Start from the peer's guaranteed root
+            # directory; the launcher installs the route policy before
+            # entering the submitter's build directory. Recursive-build
+            # process context therefore cannot inflate TASK_SUBMIT, and Bash
+            # never starts in a peer-local path that does not exist.
+            compiler_remote_command=(forward --clear -- on "\$compiler_host" /usr/bin/bash "$distributed_staged_launcher" "\$compiler_route_response" "\$PWD")
         else
             compiler_remote_command=(on "\$compiler_host")
         fi
-        if env -i PATH="\$compiler_remote_path" HOME="\${HOME:-/root}" TMPDIR="\${TMPDIR:-/tmp}" TZ=UTC0 \
-            "\${compiler_remote_command[@]}" "\${compiler[@]}" -fno-temp-file "@\$compiler_response"; then
+        if (
+            if [ "\$compiler_transport" = staged ]; then
+                cd / || exit 1
+            fi
+            env -i PATH="\$compiler_remote_path" HOME="\${HOME:-/root}" TMPDIR="\${TMPDIR:-/tmp}" TZ=UTC0 \
+                "\${compiler_remote_command[@]}" "\${compiler[@]}" -fno-temp-file "@\$compiler_response"
+        ); then
             compiler_status=0
         else
             compiler_status=\$?

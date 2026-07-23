@@ -162,6 +162,9 @@ def test_wos_bootstrap_distributes_only_compiler_processes() -> None:
             r'compiler_route_response="\$(mktemp "\$compiler_responses/routes.XXXXXX")"',
             r'''printf '%s\n' "\${compiler_route_args[@]}" > "\$compiler_route_response"''',
             r'compiler_remote_command=(forward --clear -- on "\$compiler_host" /usr/bin/bash',
+            r'''compiler_remote_command=(forward --clear -- on "\$compiler_host" /usr/bin/bash "$distributed_staged_launcher" "\$compiler_route_response" "\$PWD")''',
+            r'if [ "\$compiler_transport" = staged ]; then',
+            r'cd / || exit 1',
             r'compiler_remote_command=(on "\$compiler_host")',
             r'for compiler_local_system_root in /usr /bin /lib /lib64 /libexec /share /etc /proc /dev /run /tmp; do',
             r'compiler_add_home_route "\$compiler_state"',
@@ -738,6 +741,7 @@ esac
             r'''#!/bin/bash
 set -eu
 [ "$1" = wos-1 ]
+[ "$PWD" = / ]
 shift
 exec "$@"
 ''',
@@ -751,19 +755,22 @@ set -euo pipefail
 WOS_TARGET_ARCH=x86_64-pc-wos
 source <(sed -n '/^write_clang_wrapper()/,/^}/p' tools/bootstrap.sh)
 write_clang_wrapper "$1/clang" "$2" "$3"
-PATH="$1:$PATH" \
-    WOS_DISTRIBUTED_COMPILER=1 \
-    WOS_DISTRIBUTED_COMPILER_HOSTS=wos-0,wos-1 \
-    WOS_DISTRIBUTED_COMPILER_STATE="$1/compiler-state" \
-    WOS_DISTRIBUTED_COMPILER_TRANSPORT=staged \
-    WOS_DISTRIBUTED_COMPILER_JOBS_PER_HOST=1 \
-    WOS_DISTRIBUTED_COMPILER_LOCAL_JOBS=1 \
-    WOS_DISTRIBUTED_COMPILER_REMOTE_JOBS_PER_HOST=1 \
-    WOS_NINJA_JOBS=2 \
-    "$1/clang" -MD -MF "$1/explicit.d" -MJ "$1/compile.json" \
-        -serialize-diagnostics "$1/diagnostics.dia" \
-        -fmodules-cache-path="$1/module-cache" \
-        -c "$1/source-root/input.c" -o "$1/output.o"
+(
+    cd "$1/source-root"
+    PATH="$1:$PATH" \
+        WOS_DISTRIBUTED_COMPILER=1 \
+        WOS_DISTRIBUTED_COMPILER_HOSTS=wos-0,wos-1 \
+        WOS_DISTRIBUTED_COMPILER_STATE="$1/compiler-state" \
+        WOS_DISTRIBUTED_COMPILER_TRANSPORT=staged \
+        WOS_DISTRIBUTED_COMPILER_JOBS_PER_HOST=1 \
+        WOS_DISTRIBUTED_COMPILER_LOCAL_JOBS=1 \
+        WOS_DISTRIBUTED_COMPILER_REMOTE_JOBS_PER_HOST=1 \
+        WOS_NINJA_JOBS=2 \
+        "$1/clang" -MD -MF "$1/explicit.d" -MJ "$1/compile.json" \
+            -serialize-diagnostics "$1/diagnostics.dia" \
+            -fmodules-cache-path="$1/module-cache" \
+            -c input.c -o "$1/output.o"
+)
 test -s "$1/output.o"
 test -s "$1/explicit.d"
 test -s "$1/compile.json"
