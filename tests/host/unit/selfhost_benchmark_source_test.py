@@ -165,6 +165,8 @@ def test_wos_bootstrap_distributes_only_compiler_processes() -> None:
             r'compiler_transport="\${WOS_DISTRIBUTED_COMPILER_TRANSPORT:-source}"',
             r"source|staged|preprocessed|rewritten)",
             r'if [ "\$compiler_transport" = staged ] && [ -z "\$output_file" ]; then',
+            r'case "\$PWD" in',
+            r"*/CMakeFiles/CMakeScratch/*|*/CMakeFiles/CMakeTmp/*)",
             r'exec "\${compiler[@]}" "\$@"',
             r"compiler_slot_has_usleep=0",
             r"compiler_slot_pause_us=1000",

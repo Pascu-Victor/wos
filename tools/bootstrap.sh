@@ -231,6 +231,17 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
     if [ "\$compiler_transport" = staged ] && [ -z "\$output_file" ]; then
         exec "\${compiler[@]}" "\$@"
     fi
+    # CMake creates scratch try-compile sources after a component's immutable
+    # roots have already been staged. A peer therefore cannot enter these
+    # transient working directories or read their generated input. Configure
+    # probes are small and serial; keep only those probes on the submitter.
+    if [ "\$compiler_transport" = staged ]; then
+        case "\$PWD" in
+            */CMakeFiles/CMakeScratch/*|*/CMakeFiles/CMakeTmp/*)
+                exec "\${compiler[@]}" "\$@"
+                ;;
+        esac
+    fi
     compiler_slot_has_usleep=0
     compiler_slot_pause_us=1000
     if command -v usleep >/dev/null 2>&1; then
