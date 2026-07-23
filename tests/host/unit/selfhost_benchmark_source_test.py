@@ -277,6 +277,17 @@ def test_wos_toolchain_stages_sources_before_distributed_compiles() -> None:
     if initial_stage < 0 or first_crt_compile < 0 or initial_stage >= first_crt_compile:
         fail("WOS source staging must initialize its manifest before the first target compile")
 
+    require_order(
+        source,
+        [
+            'wos_timed_step "generate" "libcxx_runtime_headers"',
+            "generate-cxx-headers generate-cxxabi-headers",
+            "wos_stage_distributed_build_roots",
+            'WOS_LIBCXX_BUILD_DIR="$B/libcxx-build"',
+        ],
+        "libc++ generated headers precede configured-root staging",
+    )
+
 
 def test_wos_toolchain_stages_configured_build_roots() -> None:
     helper = (ROOT / "tools" / "ccache_env.sh").read_text()
