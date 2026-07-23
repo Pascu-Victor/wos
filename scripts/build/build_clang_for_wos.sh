@@ -207,14 +207,20 @@ done
 # clang-tablegen-targets umbrellas do not cover library-private files such as
 # GenVT.inc, TargetLibraryInfo.inc, AttrDocTable.inc, or VCSVersion.inc.
 WOS_LLVM_GENERATOR_TARGETS=()
+WOS_LLVM_GENERATOR_TARGETS_FILE="$(mktemp "$CLANG_BUILD/wos-generator-targets.XXXXXX")"
+cleanup_generator_targets() {
+    rm -f -- "$WOS_LLVM_GENERATOR_TARGETS_FILE"
+}
+trap cleanup_generator_targets EXIT HUP INT TERM
+ninja -C "$CLANG_BUILD" -t graph "${WOS_LLVM_BIN_OUTPUTS[@]}" |
+    sed -n 's/^"[^"]*" \[label="\(cmake_object_order_depends_target_[^"]*\)"\]$/\1/p' |
+    sort -u > "$WOS_LLVM_GENERATOR_TARGETS_FILE"
 while IFS= read -r generator_target; do
     [ -n "$generator_target" ] || continue
     WOS_LLVM_GENERATOR_TARGETS+=("$generator_target")
-done < <(
-    ninja -C "$CLANG_BUILD" -t graph "${WOS_LLVM_BIN_OUTPUTS[@]}" |
-        sed -n 's/^"[^"]*" \[label="\(cmake_object_order_depends_target_[^"]*\)"\]$/\1/p' |
-        sort -u
-)
+done < "$WOS_LLVM_GENERATOR_TARGETS_FILE"
+cleanup_generator_targets
+trap - EXIT HUP INT TERM
 if [ "${#WOS_LLVM_GENERATOR_TARGETS[@]}" -eq 0 ]; then
     echo "ERROR: native Clang graph exposed no generator-order targets" >&2
     exit 1
