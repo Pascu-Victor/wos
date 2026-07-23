@@ -55,14 +55,20 @@ def test_selfhost_runner_covers_acceptance_flow() -> None:
             'WOS_DISTRIBUTED_COMPILER_HOSTS="$distributed_hosts"',
             'distributed_compiler_state="$workdir/tmp/distributed-compiler"',
             'WOS_DISTRIBUTED_COMPILER_STATE="$distributed_compiler_state"',
-            "WOS_DISTRIBUTED_COMPILER_TRANSPORT=source",
+            'distributed_compiler_transport="${WOS_SELFHOST_DISTRIBUTED_COMPILER_TRANSPORT:-rewritten}"',
+            'WOS_DISTRIBUTED_COMPILER_TRANSPORT="$distributed_compiler_transport"',
             'WOS_DISTRIBUTED_COMPILER_JOBS_PER_HOST="$distributed_jobs_per_host"',
             'WOS_DISTRIBUTED_COMPILER_LOCAL_JOBS="$distributed_local_jobs"',
             'WOS_DISTRIBUTED_COMPILER_REMOTE_JOBS_PER_HOST="$distributed_remote_jobs_per_host"',
             'distributed_jobs_per_host="$(((jobs + ${#distributed_host_list[@]} - 1) / ${#distributed_host_list[@]}))"',
+            'if [ -z "$distributed_local_jobs" ]; then',
             'distributed_local_jobs="$distributed_jobs_per_host"',
+            'if [ -z "$distributed_remote_jobs_per_host" ]; then',
             'distributed_remote_jobs_per_host="$distributed_jobs_per_host"',
+            "distributed local jobs must be a positive integer",
+            "distributed remote jobs per host must be a positive integer",
             'WOS_SELFHOST_DISTRIBUTED_JOBS_PER_HOST=$(shell_quote "$distributed_jobs_per_host")',
+            'WOS_SELFHOST_DISTRIBUTED_COMPILER_TRANSPORT=$(shell_quote "$distributed_compiler_transport")',
             'WOS_SELFHOST_DISTRIBUTED_LOCAL_JOBS=$(shell_quote "$distributed_local_jobs")',
             'WOS_SELFHOST_DISTRIBUTED_REMOTE_JOBS_PER_HOST=$(shell_quote "$distributed_remote_jobs_per_host")',
             '--distributed-hosts',
@@ -148,6 +154,8 @@ def test_wos_bootstrap_distributes_only_compiler_processes() -> None:
             r'compiler_total_jobs="\${WOS_NINJA_JOBS:-\${WOS_BUILD_JOBS:-}}"',
             r'compiler_local_jobs="\$compiler_total_jobs"',
             r'compiler_remote_jobs_per_host="\${WOS_DISTRIBUTED_COMPILER_REMOTE_JOBS_PER_HOST:-1}"',
+            r'compiler_start_index="\$((RANDOM % \${#compiler_hosts[@]}))"',
+            "mktemp already creates the unique job directory atomically",
             r'compiler_persist_remote_slots=1',
             r'compiler_local_jobs="\$compiler_jobs_per_host"',
             r'compiler_remote_jobs_per_host="\$compiler_jobs_per_host"',
@@ -157,7 +165,6 @@ def test_wos_bootstrap_distributes_only_compiler_processes() -> None:
             r'compiler_min_preprocessed_bytes="\${WOS_DISTRIBUTED_COMPILER_MIN_PREPROCESSED_BYTES:-0}"',
             r'compiler_preprocessed_language=cpp-output',
             r'compiler_preprocessed_language=c++-cpp-output',
-            r'while ! mkdir "\$compiler_lock" 2>/dev/null; do',
             r'compiler_job_dir="\$(mktemp -d "\$compiler_responses/clang-job.XXXXXX" || true)"',
             r'compiler_input="\$compiler_job_dir/input"',
             r'"\${compiler[@]}" "\$@" "\${compiler_preprocess_args[@]}" -o "\$compiler_input" -Wno-unused-command-line-argument',
@@ -198,6 +205,8 @@ def test_wos_bootstrap_distributes_only_compiler_processes() -> None:
         fail("source-mode distributed compiler selection must not alias host choice to process-ID stride")
     if "source-lock" in source or "source-next" in source:
         fail("source-mode distributed compiler selection must not serialize through global state")
+    if "compiler_lock" in source:
+        fail("distributed compiler selection must not serialize through a global spin lock")
 
 
 def test_wos_bootstrap_repairs_only_link_output_mode() -> None:
@@ -291,7 +300,8 @@ for index in 0 1 2 3 4 5 6 7; do
         WOS_DISTRIBUTED_COMPILER=1 \
         WOS_DISTRIBUTED_COMPILER_HOSTS=wos-0,wos-1 \
         WOS_DISTRIBUTED_COMPILER_STATE="$1/compiler-state" \
-        WOS_DISTRIBUTED_COMPILER_JOBS_PER_HOST=1 \
+        WOS_DISTRIBUTED_COMPILER_TRANSPORT=rewritten \
+        WOS_DISTRIBUTED_COMPILER_JOBS_PER_HOST=2 \
         WOS_DISTRIBUTED_COMPILER_LOCAL_JOBS=1 \
         WOS_DISTRIBUTED_COMPILER_REMOTE_JOBS_PER_HOST=2 \
         WOS_DISTRIBUTED_COMPILER_MIN_PREPROCESSED_BYTES=0 \
@@ -636,6 +646,53 @@ def test_distributed_compiler_hosts_are_validated_before_launch() -> None:
         )
         if result.returncode == 0 or expected_error not in result.stderr:
             fail(f"distributed host validation accepted {arguments!r}")
+
+    invalid_slot_overrides = [
+        ("WOS_SELFHOST_DISTRIBUTED_LOCAL_JOBS", "0", "distributed local jobs must be a positive integer"),
+        (
+            "WOS_SELFHOST_DISTRIBUTED_REMOTE_JOBS_PER_HOST",
+            "invalid",
+            "distributed remote jobs per host must be a positive integer",
+        ),
+    ]
+    for variable, value, expected_error in invalid_slot_overrides:
+        environment = os.environ.copy()
+        environment[variable] = value
+        result = subprocess.run(
+            [
+                str(SELFHOST_RUNNER),
+                "wos",
+                "--distributed",
+                "--distributed-hosts",
+                "wos-0,wos-1",
+            ],
+            cwd=ROOT,
+            check=False,
+            text=True,
+            capture_output=True,
+            env=environment,
+        )
+        if result.returncode == 0 or expected_error not in result.stderr:
+            fail(f"distributed compiler accepted {variable}={value!r}")
+
+    environment = os.environ.copy()
+    environment["WOS_SELFHOST_DISTRIBUTED_COMPILER_TRANSPORT"] = "invalid"
+    result = subprocess.run(
+        [
+            str(SELFHOST_RUNNER),
+            "wos",
+            "--distributed",
+            "--distributed-hosts",
+            "wos-0,wos-1",
+        ],
+        cwd=ROOT,
+        check=False,
+        text=True,
+        capture_output=True,
+        env=environment,
+    )
+    if result.returncode == 0 or "distributed compiler transport must be" not in result.stderr:
+        fail("distributed compiler accepted an invalid transport")
 
 
 def test_selfhost_runner_locks_workdir_before_replacing_it() -> None:

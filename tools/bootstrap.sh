@@ -395,10 +395,6 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
                 objective-c++-cpp-output) compiler_remote_language=objective-c++ ;;
             esac
         fi
-        compiler_lock="\$compiler_state.lock"
-        compiler_lock_cleanup() {
-            rmdir "\$compiler_lock" 2>/dev/null || true
-        }
         compiler_slots="\$compiler_state.slots"
         if ! mkdir -p "\$compiler_slots"; then
             echo "ERROR: distributed compiler slot directory could not be created" >&2
@@ -446,20 +442,13 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
                 exit "\$compiler_status"
             fi
         else
+            # Atomic slot directories are the admission authority. Avoid a
+            # global next-host lock here: under oversubscription its spin loop
+            # serialized preprocessing on the submitter while peer CPUs idled.
+            compiler_start_index="\$((RANDOM % \${#compiler_hosts[@]}))"
             while [ -z "\$compiler_slot" ]; do
-                while ! mkdir "\$compiler_lock" 2>/dev/null; do
-                    :
-                done
-                trap compiler_lock_cleanup EXIT HUP INT TERM
-                compiler_index=0
-                if [ -s "\$compiler_state" ]; then
-                    read -r compiler_index < "\$compiler_state" || compiler_index=0
-                fi
-                case "\$compiler_index" in
-                    ''|*[!0-9]*) compiler_index=0 ;;
-                esac
                 for ((compiler_offset = 0; compiler_offset < \${#compiler_hosts[@]}; compiler_offset++)); do
-                    compiler_candidate_index="\$(((compiler_index + compiler_offset) % \${#compiler_hosts[@]}))"
+                    compiler_candidate_index="\$(((compiler_start_index + compiler_offset) % \${#compiler_hosts[@]}))"
                     compiler_host_slots="\$compiler_slots/\$compiler_candidate_index"
                     if ! mkdir -p "\$compiler_host_slots"; then
                         echo "ERROR: distributed compiler host slot directory could not be created" >&2
@@ -474,14 +463,12 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
                         if mkdir "\$compiler_candidate_slot" 2>/dev/null; then
                             compiler_host="\${compiler_hosts[\$compiler_candidate_index]}"
                             compiler_slot="\$compiler_candidate_slot"
-                            printf '%s\n' "\$((compiler_candidate_index + 1))" > "\$compiler_state"
                             break 2
                         fi
                     done
                 done
-                compiler_lock_cleanup
-                trap - EXIT HUP INT TERM
                 if [ -z "\$compiler_slot" ]; then
+                    compiler_start_index="\$(((compiler_start_index + 1) % \${#compiler_hosts[@]}))"
                     sleep 0
                 fi
             done
@@ -512,16 +499,9 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
             echo "ERROR: distributed compiler response directory could not be created" >&2
             exit 1
         fi
-        compiler_slot_and_lock_cleanup() {
-            compiler_lock_cleanup
-            compiler_slot_release
-        }
-        while ! mkdir "\$compiler_lock" 2>/dev/null; do
-            :
-        done
-        trap compiler_slot_and_lock_cleanup EXIT HUP INT TERM
+        # mktemp already creates the unique job directory atomically. A shared
+        # lock around it only turns concurrent preprocessing into a spin queue.
         compiler_job_dir="\$(mktemp -d "\$compiler_responses/clang-job.XXXXXX" || true)"
-        compiler_lock_cleanup
         trap compiler_slot_release EXIT HUP INT TERM
         if [ -z "\$compiler_job_dir" ] || [ ! -d "\$compiler_job_dir" ]; then
             compiler_slot_release
