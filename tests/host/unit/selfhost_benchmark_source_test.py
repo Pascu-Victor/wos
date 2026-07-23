@@ -181,7 +181,7 @@ def test_wos_bootstrap_distributes_only_compiler_processes() -> None:
             r'compiler_route_response="\$compiler_responses/routes.\$\$"',
             r'if ! : > "\$compiler_route_response"; then',
             r'''printf '%s\n' "\${compiler_route_args[@]}" > "\$compiler_route_response"''',
-            r'forward --clear -- on "\$compiler_host" /usr/bin/timeout',
+            r'forward --clear -- on "\$compiler_host" /usr/bin/locally /usr/bin/timeout',
             r'-s TERM -k 5 "\$compiler_remote_timeout"',
             r'compiler_remote_output="/tmp/wos-distributed-staged.\$compiler_candidate_index.\$\$.output"',
             r'compiler_staged_output="\$compiler_responses/output.\$\$"',
@@ -214,6 +214,9 @@ def test_wos_bootstrap_distributes_only_compiler_processes() -> None:
             r'compiler_run_remote() {',
             r'if [ "\$compiler_status" -ne 127 ] || [ "\$compiler_remote_attempt" -ge 2 ]; then',
             r"distributed compiler launch on \$compiler_host failed with status 127; retrying once",
+            r'compiler_publish_limit_us="\$((compiler_remote_timeout * 1000000))"',
+            r'''while [ ! -s "\$compiler_staged_output" ] &&''',
+            r'compiler_publish_wait_us="\$((compiler_publish_wait_us + compiler_publish_pause_us))"',
             r'''[ ! -s "\$compiler_staged_output" ]''',
             "distributed staged compiler returned success without publishing",
             r'compiler_total_jobs="\${WOS_NINJA_JOBS:-\${WOS_BUILD_JOBS:-}}"',
@@ -959,6 +962,8 @@ set -eu
 [ "$1" = wos-1 ]
 [ "$PWD" = / ]
 shift
+[ "$1" = /usr/bin/locally ]
+shift
 exec "$@"
 ''',
             encoding="ascii",
@@ -1099,6 +1104,7 @@ write_clang_wrapper "$1/clang" "$2" "$3"
         WOS_DISTRIBUTED_COMPILER_JOBS_PER_HOST=1 \
         WOS_DISTRIBUTED_COMPILER_LOCAL_JOBS=1 \
         WOS_DISTRIBUTED_COMPILER_REMOTE_JOBS_PER_HOST=1 \
+        WOS_DISTRIBUTED_COMPILER_REMOTE_TIMEOUT=1 \
         WOS_NINJA_JOBS=2 \
         "$1/clang" -c input.c -o "$1/output.o"
 )

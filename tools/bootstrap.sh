@@ -571,7 +571,7 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
             # guaranteed root directory; the launcher installs the route
             # policy before entering the submitter's build directory.
             compiler_remote_command=(
-                forward --clear -- on "\$compiler_host" /usr/bin/timeout
+                forward --clear -- on "\$compiler_host" /usr/bin/locally /usr/bin/timeout
                 -s TERM -k 5 "\$compiler_remote_timeout"
                 /usr/bin/bash "$distributed_staged_launcher"
                 "\$compiler_route_response" "\$PWD" "\$compiler_remote_output" "\$compiler_staged_output"
@@ -607,6 +607,27 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
         done
         if [ "\$compiler_transport" = staged ]; then
             if [ "\$compiler_status" -eq 0 ]; then
+                # A concurrent WKI exec-proxy completion can reach the
+                # submitter before the peer's local child has copied and
+                # fsynced its object. Keep the admission slot until the actual
+                # publication boundary, bounded by the same timeout as the
+                # remote command.
+                compiler_publish_wait_us=0
+                compiler_publish_limit_us="\$((compiler_remote_timeout * 1000000))"
+                compiler_publish_pause_us=1000
+                while [ ! -s "\$compiler_staged_output" ] &&
+                      [ "\$compiler_publish_wait_us" -lt "\$compiler_publish_limit_us" ]; do
+                    if [ "\$compiler_slot_has_usleep" -eq 1 ]; then
+                        usleep "\$compiler_publish_pause_us"
+                        compiler_publish_wait_us="\$((compiler_publish_wait_us + compiler_publish_pause_us))"
+                        if [ "\$compiler_publish_pause_us" -lt 16000 ]; then
+                            compiler_publish_pause_us="\$((compiler_publish_pause_us * 2))"
+                        fi
+                    else
+                        sleep 1
+                        compiler_publish_wait_us="\$((compiler_publish_wait_us + 1000000))"
+                    fi
+                done
                 if [ ! -s "\$compiler_staged_output" ]; then
                     echo "warning: distributed staged compiler returned success without publishing '\$output_file'; retrying locally" >&2
                     compiler_status=1
