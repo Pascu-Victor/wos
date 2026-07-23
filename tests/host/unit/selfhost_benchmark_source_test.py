@@ -1044,6 +1044,12 @@ def test_distributed_compiler_root_staging_is_guarded_and_atomic() -> None:
             f"""#!/bin/bash
 set -eu
 if [ "${{1:-}}" = -h ]; then
+    if [ "${{WOS_STAGE_MOCK_MISSING_ONLY:-0}}" = 1 ]; then
+        {shlex.quote(real_tar)} "$@"
+        printf '%s\\n' 'tar: transient.o.tmp: No such file or directory (ENOENT)' >&2
+        printf '%s\\n' 'tar: error exit delayed from previous errors' >&2
+        exit 1
+    fi
     if [ ! -e "$WOS_STAGE_MOCK_ARCHIVE_FAILURE_MARKER" ]; then
         : > "$WOS_STAGE_MOCK_ARCHIVE_FAILURE_MARKER"
         printf '%s\\n' 'mock transient archive mutation' >&2
@@ -1065,6 +1071,11 @@ exec {shlex.quote(real_tar)} "$@"
             f"""#!/bin/bash
 set -eu
 printf '%s\\n' validation >> "$WOS_STAGE_MOCK_VALIDATION_LOG"
+if [ "${{WOS_STAGE_MOCK_MISSING_ONLY:-0}}" = 1 ]; then
+    {shlex.quote(real_find)} "$@"
+    printf '%s\\n' 'find: transient.o.tmp: No such file or directory (ENOENT)' >&2
+    exit 1
+fi
 exec {shlex.quote(real_find)} "$@"
 """,
             encoding="ascii",
@@ -1152,6 +1163,28 @@ exec "$@"
             fail("distributed root staging retained stale roots from a prior phase")
         if (retained / "sentinel").read_text(encoding="ascii") != "retained\n":
             fail("distributed root staging recopied or damaged a retained root")
+
+        missing_environment = environment.copy()
+        missing_environment["WOS_STAGE_MOCK_MISSING_ONLY"] = "1"
+        missing_root = stage_base / "checkout" / "missing-race"
+        missing_root.mkdir()
+        (missing_root / "sentinel").write_text("complete\n", encoding="ascii")
+        result = subprocess.run(
+            [str(STAGE_DISTRIBUTED_ROOTS), str(missing_root)],
+            cwd=ROOT,
+            check=False,
+            text=True,
+            capture_output=True,
+            env=missing_environment,
+        )
+        if result.returncode != 0:
+            fail(f"distributed root staging rejected an ENOENT-only traversal race: {result.stderr}")
+        if "symlink scan omitted an entry that disappeared" not in result.stderr:
+            fail("distributed root staging did not report the tolerated find ENOENT")
+        if "archive omitted an entry that disappeared" not in result.stderr:
+            fail("distributed root staging did not report the tolerated tar ENOENT")
+        if (missing_root / "sentinel").read_text(encoding="ascii") != "complete\n":
+            fail("distributed root staging lost stable files while tolerating an ENOENT race")
 
         internal_escape = root / "escaping-link"
         internal_escape.symlink_to(temp / "outside-internal", target_is_directory=True)

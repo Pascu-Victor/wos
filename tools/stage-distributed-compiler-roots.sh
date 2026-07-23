@@ -130,6 +130,7 @@ mkdir -p "$stage_dir"
 archive="$stage_dir/roots.$$.tar"
 archive_tmp=""
 root_links="$stage_dir/links.$$.list"
+snapshot_stderr="$stage_dir/snapshot.$$.stderr"
 manifest_tmp=""
 manifest_sorted=""
 cleanup() {
@@ -138,6 +139,7 @@ cleanup() {
         rm -f -- "$archive_tmp" 2>/dev/null || true
     fi
     rm -f -- "$root_links" 2>/dev/null || true
+    rm -f -- "$snapshot_stderr" 2>/dev/null || true
     if [ -n "$manifest_tmp" ]; then
         rm -f -- "$manifest_tmp" 2>/dev/null || true
     fi
@@ -146,6 +148,44 @@ cleanup() {
     fi
 }
 trap cleanup EXIT HUP INT TERM
+
+# WOS reports a readdir/open race as ENOENT and continues traversing the rest
+# of the tree, but BusyBox find and tar still return failure. An inaccessible
+# entry cannot be useful to a peer compiler, so accept only that narrow failure
+# class and keep rejecting every other diagnostic. The archive is validated
+# separately before it can be published.
+run_snapshot_command() {
+    local label="$1"
+    shift
+    local saw_missing=0
+    local saw_unexpected=0
+    local line
+
+    : > "$snapshot_stderr"
+    if "$@" 2> "$snapshot_stderr"; then
+        cat "$snapshot_stderr" >&2
+        return 0
+    fi
+
+    while IFS= read -r line; do
+        case "$line" in
+            *"No such file or directory"*)
+                saw_missing=1
+                ;;
+            "tar: error exit delayed from previous errors")
+                ;;
+            *)
+                saw_unexpected=1
+                ;;
+        esac
+    done < "$snapshot_stderr"
+    cat "$snapshot_stderr" >&2
+    if [ "$saw_missing" -eq 1 ] && [ "$saw_unexpected" -eq 0 ]; then
+        echo "warning: distributed compiler $label omitted an entry that disappeared during traversal" >&2
+        return 0
+    fi
+    return 1
+}
 
 # WOS BusyBox tar currently drops leading ../ components from relative symlink
 # targets while extracting. Dereference trusted in-tree links when creating the
@@ -166,7 +206,7 @@ validate_snapshot_roots() {
             echo "ERROR: distributed compiler root changed during snapshot: $root" >&2
             return 1
         fi
-        if ! find "$root" -type l -print0 >> "$root_links"; then
+        if ! run_snapshot_command "symlink scan" find "$root" -type l -print0 >> "$root_links"; then
             echo "ERROR: distributed compiler root changed during traversal: $root" >&2
             return 1
         fi
@@ -192,7 +232,8 @@ while :; do
     archive_tmp="$stage_dir/roots.$$.${archive_attempt}.tar.tmp"
     rm -f -- "$archive_tmp" 2>/dev/null || true
     if validate_snapshot_roots &&
-        tar -h -C / -cf "$archive_tmp" "${archive_entries[@]}" &&
+        run_snapshot_command "archive" tar -h -C / -cf "$archive_tmp" "${archive_entries[@]}" &&
+        tar -tf "$archive_tmp" >/dev/null &&
         validate_snapshot_roots; then
         mv -f -- "$archive_tmp" "$archive"
         archive_tmp=""
