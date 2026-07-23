@@ -131,6 +131,20 @@ fi
 
 stage_dir="$state.staging"
 manifest="$state.local-roots"
+stage_retries="${WOS_DISTRIBUTED_COMPILER_STAGE_RETRIES:-3}"
+stage_retry_delay="${WOS_DISTRIBUTED_COMPILER_STAGE_RETRY_DELAY_SECONDS:-1}"
+case "$stage_retries" in
+    ''|*[!0-9]*|0)
+        echo "ERROR: distributed compiler stage retries must be a positive integer" >&2
+        exit 1
+        ;;
+esac
+case "$stage_retry_delay" in
+    ''|*[!0-9]*)
+        echo "ERROR: distributed compiler stage retry delay must be a non-negative integer" >&2
+        exit 1
+        ;;
+esac
 mkdir -p "$stage_dir"
 archive="$stage_dir/roots.$$.tar"
 manifest_tmp=""
@@ -148,34 +162,55 @@ trap cleanup EXIT HUP INT TERM
 
 tar -h -C / -cf "$archive" "${archive_entries[@]}"
 
+stage_peer() {
+    local peer="$1"
+    local attempt=1
+    local command
+
+    while [ "$attempt" -le "$stage_retries" ]; do
+        command=(
+            on "$peer" forward "+$archive" "-$stage_base" -- locally
+            sh -eu -c '
+                archive=$1
+                base=$2
+                requested_count=$3
+                shift 3
+                requested_index=0
+                while [ "$requested_index" -lt "$requested_count" ]; do
+                    root=$1
+                    shift
+                    case "$root" in
+                        "$base"/*) rm -rf -- "$root" ;;
+                        *) exit 64 ;;
+                    esac
+                    requested_index=$((requested_index + 1))
+                done
+                tar -C / -xf "$archive"
+                for root do
+                    [ -d "$root" ]
+                done
+            ' sh "$archive" "$stage_base" "${#roots[@]}" "${roots[@]}" "${active_roots[@]}"
+        )
+        if "${command[@]}"; then
+            return 0
+        fi
+        if [ "$attempt" -ge "$stage_retries" ]; then
+            break
+        fi
+        echo "warning: distributed compiler root staging on $peer failed attempt $attempt/$stage_retries; retrying" >&2
+        if [ "$stage_retry_delay" -gt 0 ]; then
+            sleep "$stage_retry_delay"
+        fi
+        attempt=$((attempt + 1))
+    done
+    return 1
+}
+
 stage_pids=()
 stage_names=()
 for ((host_index = 1; host_index < ${#hosts[@]}; host_index++)); do
     peer="${hosts[$host_index]}"
-    command=(
-        on "$peer" forward "+$archive" "-$stage_base" -- locally
-        sh -eu -c '
-            archive=$1
-            base=$2
-            requested_count=$3
-            shift 3
-            requested_index=0
-            while [ "$requested_index" -lt "$requested_count" ]; do
-                root=$1
-                shift
-                case "$root" in
-                    "$base"/*) rm -rf -- "$root" ;;
-                    *) exit 64 ;;
-                esac
-                requested_index=$((requested_index + 1))
-            done
-            tar -C / -xf "$archive"
-            for root do
-                [ -d "$root" ]
-            done
-        ' sh "$archive" "$stage_base" "${#roots[@]}" "${roots[@]}" "${active_roots[@]}"
-    )
-    "${command[@]}" &
+    stage_peer "$peer" &
     stage_pids+=("$!")
     stage_names+=("$peer")
 done

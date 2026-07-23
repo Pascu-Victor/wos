@@ -1035,6 +1035,11 @@ def test_distributed_compiler_root_staging_is_guarded_and_atomic() -> None:
 set -eu
 [ "$1" = wos-1 ]
 shift
+if [ -n "${WOS_STAGE_MOCK_FAILURE_MARKER:-}" ] &&
+    [ ! -e "$WOS_STAGE_MOCK_FAILURE_MARKER" ]; then
+    : > "$WOS_STAGE_MOCK_FAILURE_MARKER"
+    exit 75
+fi
 [ "$1" = forward ]
 while [ "$1" != -- ]; do shift; done
 shift
@@ -1054,6 +1059,8 @@ exec "$@"
                 "WOS_DISTRIBUTED_COMPILER_STATE": str(state),
                 "WOS_DISTRIBUTED_COMPILER_STAGE_BASE": str(stage_base),
                 "WOS_DISTRIBUTED_COMPILER_RETAINED_ROOTS": str(retained),
+                "WOS_DISTRIBUTED_COMPILER_STAGE_RETRY_DELAY_SECONDS": "0",
+                "WOS_STAGE_MOCK_FAILURE_MARKER": str(temp / "stage-failed-once"),
             }
         )
         result = subprocess.run(
@@ -1066,6 +1073,8 @@ exec "$@"
         )
         if result.returncode != 0:
             fail(f"distributed root staging failed: {result.stderr}")
+        if "failed attempt 1/3; retrying" not in result.stderr:
+            fail("distributed root staging did not retry a transient peer failure")
         manifest = Path(f"{state}.local-roots")
         expected_manifest = "".join(f"{path}\n" for path in sorted((retained, root)))
         if manifest.read_text(encoding="ascii") != expected_manifest:
