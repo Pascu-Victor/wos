@@ -113,15 +113,36 @@ EOF
 #!/bin/bash
 set -eu
 
-route_file="$1"
-compiler_cwd="$2"
-local_output="$3"
-host_output="$4"
-shift 4
+route_count="$1"
+shift
+case "$route_count" in
+    ''|*[!0-9]*)
+        echo "distributed staged compiler route count is invalid" >&2
+        exit 1
+        ;;
+esac
+if [ "$route_count" -gt 256 ]; then
+    echo "distributed staged compiler route count exceeds WKI policy capacity" >&2
+    exit 1
+fi
 route_args=()
-while IFS= read -r route_arg; do
-    route_args+=("$route_arg")
-done < "$route_file"
+while [ "$route_count" -gt 0 ]; do
+    if [ "$#" -eq 0 ]; then
+        echo "distributed staged compiler route arguments are truncated" >&2
+        exit 1
+    fi
+    route_args+=("$1")
+    shift
+    route_count=$((route_count - 1))
+done
+if [ "$#" -lt 3 ]; then
+    echo "distributed staged compiler launcher arguments are truncated" >&2
+    exit 1
+fi
+compiler_cwd="$1"
+local_output="$2"
+host_output="$3"
+shift 3
 exec forward --clear "${route_args[@]}" -- locally /usr/bin/bash -c '
 set -eu
 compiler_cwd="$1"
@@ -575,40 +596,26 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
                 echo "ERROR: distributed compiler response file could not be published" >&2
                 exit 1
             fi
-            compiler_route_response="\$compiler_responses/routes.\$\$"
-            if ! : > "\$compiler_route_response"; then
-                compiler_slot_release
-                trap - EXIT HUP INT TERM
-                echo "ERROR: staged distributed compiler route file could not be created" >&2
-                exit 1
-            fi
-            if ! printf '%s\n' "\${compiler_route_args[@]}" > "\$compiler_route_response"; then
-                compiler_slot_release
-                trap - EXIT HUP INT TERM
-                echo "ERROR: staged distributed compiler route file could not be written" >&2
-                exit 1
-            fi
-            if ! fsync "\$compiler_route_response"; then
-                compiler_slot_release
-                trap - EXIT HUP INT TERM
-                echo "ERROR: staged distributed compiler route file could not be published" >&2
-                exit 1
-            fi
             # Compile the object into peer-local /tmp, then copy the completed
             # file through the explicit home route. Streaming every object
             # write through remote VFS saturates the submitter and leaves peer
             # CPUs idle. The candidate index and submitter PID are unique for
             # every simultaneously active wrapper on a peer.
             compiler_remote_output="/tmp/wos-distributed-staged.\$compiler_candidate_index.\$\$.output"
-            # Submit only a fixed launcher, the original cwd, the two output
-            # paths, and the response-file path. Start from the peer's
-            # guaranteed root directory; the launcher installs the route
-            # policy before entering the submitter's build directory.
+            # Carry the bounded route list directly in the task arguments.
+            # A freshly created route file can race WKI's task-time path
+            # capture under high submission concurrency, leaving the compiler
+            # peer-local but unable to publish its completed object. The route
+            # list is bounded by WKI's 256-rule policy capacity and is far
+            # smaller than the single-frame submit budget for this launcher.
+            # Start from the peer's guaranteed root directory; the launcher
+            # installs the route policy before entering the build directory.
             compiler_remote_command=(
                 forward --clear -- on "\$compiler_host" /usr/bin/locally /usr/bin/timeout
                 -s TERM -k 5 "\$compiler_remote_timeout"
                 /usr/bin/bash "$distributed_staged_launcher"
-                "\$compiler_route_response" "\$PWD" "\$compiler_remote_output" "\$compiler_staged_output"
+                "\${#compiler_route_args[@]}" "\${compiler_route_args[@]}"
+                "\$PWD" "\$compiler_remote_output" "\$compiler_staged_output"
             )
         else
             compiler_remote_command=(
