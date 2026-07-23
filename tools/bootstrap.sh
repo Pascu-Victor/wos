@@ -253,6 +253,22 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
     if command -v usleep >/dev/null 2>&1; then
         compiler_slot_has_usleep=1
     fi
+    compiler_create_shared_file() {
+        local compiler_shared_path="\$1"
+        local compiler_shared_attempt=1
+        while ! : > "\$compiler_shared_path"; do
+            if [ "\$compiler_shared_attempt" -ge 3 ]; then
+                return 1
+            fi
+            echo "warning: distributed compiler shared-file create failed attempt \$compiler_shared_attempt/3; retrying" >&2
+            if [ "\$compiler_slot_has_usleep" -eq 1 ]; then
+                usleep 1000
+            else
+                sleep 0
+            fi
+            compiler_shared_attempt="\$((compiler_shared_attempt + 1))"
+        done
+    }
     if [ "\$compiler_transport" = source ] || [ "\$compiler_transport" = staged ]; then
         compiler_total_jobs="\${WOS_NINJA_JOBS:-\${WOS_BUILD_JOBS:-}}"
         case "\$compiler_total_jobs" in
@@ -393,7 +409,7 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
         # for concurrently active compiler processes, just like the job
         # directories in the preprocessed transport below.
         compiler_response="\$compiler_responses/clang.\$\$"
-        if ! : > "\$compiler_response"; then
+        if ! compiler_create_shared_file "\$compiler_response"; then
             echo "ERROR: distributed compiler response file could not be created" >&2
             exit 1
         fi
@@ -439,14 +455,14 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
             # returns
             # makes final output publication atomic from the build's view.
             compiler_staged_output="\$compiler_responses/output.\$\$"
-            if ! : > "\$compiler_staged_output"; then
+            if ! compiler_create_shared_file "\$compiler_staged_output"; then
                 compiler_slot_release
                 trap - EXIT HUP INT TERM
                 echo "ERROR: staged distributed compiler output file could not be created" >&2
                 exit 1
             fi
             compiler_host_report="\$compiler_responses/host.\$\$"
-            if ! : > "\$compiler_host_report"; then
+            if ! compiler_create_shared_file "\$compiler_host_report"; then
                 compiler_slot_release
                 trap - EXIT HUP INT TERM
                 echo "ERROR: staged distributed compiler host report could not be created" >&2
@@ -597,7 +613,7 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
                 exit 1
             fi
             compiler_route_response="\$compiler_responses/routes.\$\$"
-            if ! : > "\$compiler_route_response"; then
+            if ! compiler_create_shared_file "\$compiler_route_response"; then
                 compiler_slot_release
                 trap - EXIT HUP INT TERM
                 echo "ERROR: staged distributed compiler route file could not be created" >&2
@@ -1106,7 +1122,7 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
             exit "\$compiler_status"
         fi
         compiler_response="\$compiler_job_dir.response"
-        if ! : > "\$compiler_response"; then
+        if ! compiler_create_shared_file "\$compiler_response"; then
             compiler_input_cleanup
             compiler_slot_release
             echo "ERROR: distributed compiler response file could not be created" >&2
