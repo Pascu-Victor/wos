@@ -462,8 +462,9 @@ def test_wos_toolchain_stages_configured_build_roots() -> None:
             'wos_make "$WOS_MAKE_JOBS" -C "$NCURSES_WORK" sources'
         ],
         "build_nano_for_wos.sh": [
+            "--eval='.SECONDEXPANSION:'",
             "--eval='.PHONY: wos-generated-headers'",
-            "--eval='wos-generated-headers: $(BUILT_SOURCES)'",
+            "--eval='wos-generated-headers: $$(BUILT_SOURCES)'",
             'wos_make "$WOS_MAKE_JOBS" -C "$NANO_WORK/src" revision.h'
         ],
         "build_python_for_wos.sh": [
