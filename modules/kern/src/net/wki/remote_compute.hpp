@@ -35,6 +35,13 @@ struct RemoteNodeLoad {
     // Submitter-local reservations bridge selection and SubmittedTask
     // publication. This field is never serialized on the wire.
     uint32_t placement_reservations = 0;
+    // Balanced selections completed since this peer's last load report. Fast
+    // tasks may finish before the next report or selector call; retaining this
+    // sample-window debt keeps short bursts capacity-weighted.
+    uint32_t balanced_assignments = 0;
+    // Monotonic submitter-local selection sequence used only as a bounded
+    // starvation guard among otherwise eligible balanced candidates.
+    uint64_t balanced_last_assignment_seq = 0;
 };
 
 // -----------------------------------------------------------------------------

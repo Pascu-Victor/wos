@@ -282,6 +282,23 @@ auto read_boot_file_fully(const char* path, uint8_t** out_buf) -> bool {
     std::array<char, 512> cache_key = {};
     build_boot_file_cache_key(submitter, path, cache_key.data(), cache_key.size());
 
+    // Probe freshness before opening the file. Remote VFS open can eagerly
+    // prefetch the complete object, so opening before consulting this cache
+    // defeats it even when immutable ld.so bytes are already resident.
+    ker::vfs::Stat preopen_freshness = {};
+    bool const HAVE_PREOPEN_FRESHNESS =
+        ALLOW_BOOT_FILE_CACHE && ker::vfs::vfs_stat(path, &preopen_freshness) == 0 && boot_file_stat_has_freshness(preopen_freshness);
+    if (HAVE_PREOPEN_FRESHNESS) {
+        size_t cached_size = 0;
+        if (boot_file_cache_lookup_copy(cache_key.data(), preopen_freshness, out_buf, &cached_size)) {
+            if constexpr (TRACE_INTERP) {
+                dbg::log("read_boot_file_fully: preopen cache hit key='%s' task=%s pid=0x%lx size=%zu", cache_key.data(), task_name,
+                         static_cast<unsigned long>(current_task != nullptr ? current_task->pid : 0), cached_size);
+            }
+            return true;
+        }
+    }
+
     // Keep the kernel-side loader open local for ordinary exec paths, but
     // still honor the submitter's temporary VFS identity during remote task
     // construction so cross-node launches continue to resolve against the

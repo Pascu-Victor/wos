@@ -225,14 +225,16 @@ void log_spawn_diag(ker::mod::sched::task::Task* task, WkiRemoteSpawnResult resu
 
 uint16_t g_preferred_remote_cursor = 0;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 std::array<ker::mod::sched::CpuAccountingSnapshot, WKI_LOAD_REPORT_MAX_CPUS>
-    g_last_local_cpu_accounting{};         // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-bool g_last_local_cpu_accounting_valid{};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-uint16_t g_cached_local_load_pct{};        // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-uint64_t g_cached_local_load_update_us{};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-uint32_t g_balanced_local_reservations{};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-uint64_t g_balanced_local_sample_us{};     // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-uint16_t g_balanced_placement_cursor{};    // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-ker::mod::sys::Spinlock s_compute_lock;    // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+    g_last_local_cpu_accounting{};                // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+bool g_last_local_cpu_accounting_valid{};         // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+uint16_t g_cached_local_load_pct{};               // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+uint64_t g_cached_local_load_update_us{};         // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+uint32_t g_balanced_local_reservations{};         // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+uint64_t g_balanced_local_sample_us{};            // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+uint64_t g_balanced_local_last_assignment_seq{};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+uint64_t g_balanced_assignment_seq{};             // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+uint16_t g_balanced_placement_cursor{};           // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+ker::mod::sys::Spinlock s_compute_lock;           // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
 struct ComputeSubmitSessionToken {
     uint16_t node_id = WKI_NODE_INVALID;
@@ -2139,8 +2141,15 @@ auto try_remote_placement(ker::mod::sched::task::Task* task) -> ker::mod::sched:
 
 namespace {
 auto wki_preferred_remote_node() -> uint16_t;
-auto wki_balanced_node(uint16_t local_load, uint16_t local_cpus, uint16_t local_runnable, uint16_t local_free_mem) -> uint16_t;
+
+struct BalancedPlacement {
+    uint16_t node_id = WKI_NODE_INVALID;
+    bool found = false;
+};
+
+auto wki_balanced_node(uint16_t local_load, uint16_t local_cpus, uint16_t local_runnable, uint16_t local_free_mem) -> BalancedPlacement;
 void wki_release_preferred_remote_node(uint16_t node_id);
+void wki_rollback_balanced_remote_assignment(uint16_t node_id);
 
 class PreferredRemoteReservation {
    public:
@@ -2150,6 +2159,20 @@ class PreferredRemoteReservation {
     ~PreferredRemoteReservation();
 
     void adopt(uint16_t selected_node_id) { node_id = selected_node_id; }
+
+   private:
+    uint16_t node_id = WKI_NODE_INVALID;
+};
+
+class BalancedRemoteAssignment {
+   public:
+    BalancedRemoteAssignment() = default;
+    BalancedRemoteAssignment(const BalancedRemoteAssignment&) = delete;
+    auto operator=(const BalancedRemoteAssignment&) -> BalancedRemoteAssignment& = delete;
+    ~BalancedRemoteAssignment();
+
+    void adopt(uint16_t selected_node_id) { node_id = selected_node_id; }
+    void commit() { node_id = WKI_NODE_INVALID; }
 
    private:
     uint16_t node_id = WKI_NODE_INVALID;
@@ -2243,6 +2266,13 @@ auto wki_try_remote_spawn(ker::mod::sched::task::Task* task, const WkiRemoteSpaw
             }
             return false;
         };
+        auto is_placement_control_helper = [&base_name](const char* name) -> bool {
+            const char* base = base_name(name);
+            constexpr std::array<const char*, 8> CONTROL_TOOLS = {
+                "wkictl", "locally", "remotely", "anywhere", "homeward", "on", "forward", "wosid",
+            };
+            return std::ranges::any_of(CONTROL_TOOLS, [base](const char* tool) { return std::strcmp(base, tool) == 0; });
+        };
         auto path_has_component = [](const char* path, const char* component) -> bool {
             if (path == nullptr || component == nullptr || component[0] == '\0') {
                 return false;
@@ -2306,6 +2336,14 @@ auto wki_try_remote_spawn(ker::mod::sched::task::Task* task, const WkiRemoteSpaw
             log_spawn_diag(task, WkiRemoteSpawnResult::LOCAL, "toolchain-helper");
             return WkiRemoteSpawnResult::LOCAL;
         }
+        // Placement controllers must run on the launch system so the policy
+        // they apply describes one payload handoff. Migrating the controller
+        // first creates an accidental proxy chain before it can request
+        // local, named, remote, or balanced placement.
+        if (is_placement_control_helper(task->name) || is_placement_control_helper(task->exe_path.data())) {
+            log_spawn_diag(task, WkiRemoteSpawnResult::LOCAL, "placement-control-helper");
+            return WkiRemoteSpawnResult::LOCAL;
+        }
         if (is_generated_build_tree_executable(task->exe_path.data())) {
             log_spawn_diag(task, WkiRemoteSpawnResult::LOCAL, "generated-build-exe");
             return WkiRemoteSpawnResult::LOCAL;
@@ -2360,6 +2398,7 @@ auto wki_try_remote_spawn(ker::mod::sched::task::Task* task, const WkiRemoteSpaw
 
     uint16_t best_node = WKI_NODE_INVALID;
     PreferredRemoteReservation preferred_reservation;
+    BalancedRemoteAssignment balanced_assignment;
     if (EXPLICIT_TARGET) {
         const char* const TARGET_HOSTNAME = task->wki_target_hostname.data();
         uint16_t node_id = wki_peer_find_by_hostname(TARGET_HOSTNAME);
@@ -2412,9 +2451,14 @@ auto wki_try_remote_spawn(ker::mod::sched::task::Task* task, const WkiRemoteSpaw
         uint16_t const LOCAL_FREE_MEM =
             static_cast<uint16_t>(std::min<uint64_t>(ker::mod::mm::phys::get_free_mem_pages() / 256ULL, UINT16_MAX));
         s_compute_lock.lock();
-        best_node = wki_balanced_node(LOCAL_LOAD, LOCAL_CPUS, LOCAL_RUNNABLE, LOCAL_FREE_MEM);
+        BalancedPlacement const PLACEMENT = wki_balanced_node(LOCAL_LOAD, LOCAL_CPUS, LOCAL_RUNNABLE, LOCAL_FREE_MEM);
         s_compute_lock.unlock();
-        preferred_reservation.adopt(best_node);
+        if (!PLACEMENT.found) {
+            log_spawn_diag(task, WkiRemoteSpawnResult::FAILED, "balanced-no-healthy-system");
+            return WkiRemoteSpawnResult::FAILED;
+        }
+        best_node = PLACEMENT.node_id;
+        balanced_assignment.adopt(best_node);
         if (best_node == WKI_NODE_INVALID) {
             log_spawn_diag(task, WkiRemoteSpawnResult::LOCAL, "balanced-local");
             return WkiRemoteSpawnResult::LOCAL;
@@ -2506,6 +2550,7 @@ auto wki_try_remote_spawn(ker::mod::sched::task::Task* task, const WkiRemoteSpaw
         log_spawn_diag(task, RESULT, "submit-failed", best_node);
         return RESULT;
     }
+    balanced_assignment.commit();
 
     bool const NEEDS_PROXY_PUBLICATION =
         task->sched_queue == ker::mod::sched::task::Task::sched_queue::NONE && task != ker::mod::sched::get_current_task();
@@ -3701,34 +3746,66 @@ auto preferred_remote_placement_score(const RemoteNodeLoad& load, size_t active_
     return static_cast<uint64_t>(load.avg_load_pct) + WKI_REMOTE_PLACEMENT_PENALTY + INFLIGHT_PRESSURE;
 }
 
+constexpr uint16_t WKI_BALANCED_FREE_MEM_RESERVE = 512;
+constexpr uint16_t WKI_BALANCED_FREE_MEM_COMFORT = 4096;
+
+auto balanced_memory_eligible(uint16_t free_mem) -> bool { return free_mem >= WKI_BALANCED_FREE_MEM_RESERVE; }
+
+auto balanced_memory_pressure(uint16_t free_mem) -> uint64_t {
+    if (free_mem >= WKI_BALANCED_FREE_MEM_COMFORT) {
+        return 0;
+    }
+    if (!balanced_memory_eligible(free_mem)) {
+        return 1000;
+    }
+    constexpr uint64_t MAX_HEADROOM_PENALTY = 250;
+    constexpr uint64_t HEADROOM_RANGE = WKI_BALANCED_FREE_MEM_COMFORT - WKI_BALANCED_FREE_MEM_RESERVE;
+    return (static_cast<uint64_t>(WKI_BALANCED_FREE_MEM_COMFORT - free_mem) * MAX_HEADROOM_PENALTY) / HEADROOM_RANGE;
+}
+
 auto balanced_placement_score(uint16_t load_pct, uint16_t num_cpus, uint16_t free_mem, uint64_t inflight) -> uint64_t {
-    constexpr uint16_t FREE_MEM_RESERVE = 512;
     uint64_t const CPUS = std::max<uint64_t>(num_cpus, 1);
     uint64_t const INFLIGHT_PRESSURE = (inflight * 1000ULL) / CPUS;
-    uint64_t const MEMORY_PRESSURE = free_mem < FREE_MEM_RESERVE ? 1000ULL + static_cast<uint64_t>(FREE_MEM_RESERVE - free_mem) : 0;
-    return static_cast<uint64_t>(load_pct) + INFLIGHT_PRESSURE + MEMORY_PRESSURE;
+    return static_cast<uint64_t>(load_pct) + INFLIGHT_PRESSURE + balanced_memory_pressure(free_mem);
+}
+
+auto balanced_candidate_is_starved(uint64_t assignment_seq, uint64_t last_assignment_seq, uint64_t eligible_capacity) -> bool {
+    return assignment_seq >= last_assignment_seq && assignment_seq - last_assignment_seq >= std::max<uint64_t>(eligible_capacity, 1);
 }
 
 // s_compute_lock must be held by caller. WKI_NODE_INVALID denotes the local
-// node and consumes a local reservation until the next measured load sample.
-// A remote result owns a transient RemoteNodeLoad reservation that the caller
-// must release after it has either published a SubmittedTask or abandoned the
-// placement attempt.
-auto wki_balanced_node(uint16_t local_load, uint16_t local_cpus, uint16_t local_runnable, uint16_t local_free_mem) -> uint16_t {
+// node. Both local and remote selections retain capacity-normalized assignment
+// debt until their next measured load sample. A failed remote submission rolls
+// its debt back through BalancedRemoteAssignment.
+auto wki_balanced_node(uint16_t local_load, uint16_t local_cpus, uint16_t local_runnable, uint16_t local_free_mem) -> BalancedPlacement {
     if (g_balanced_local_sample_us != g_cached_local_load_update_us) {
         g_balanced_local_sample_us = g_cached_local_load_update_us;
         g_balanced_local_reservations = 0;
     }
 
-    std::array<uint16_t, WKI_MAX_PEERS + 1> candidates = {};
-    size_t candidate_count = 1;
-    candidates.front() = WKI_NODE_INVALID;
-    uint64_t const LOCAL_PRESSURE = static_cast<uint64_t>(local_runnable) + g_balanced_local_reservations;
-    uint64_t best_score = balanced_placement_score(local_load, local_cpus, local_free_mem, LOCAL_PRESSURE);
+    struct Candidate {
+        uint16_t node_id = WKI_NODE_INVALID;
+        RemoteNodeLoad* remote_load = nullptr;
+        uint64_t score = UINT64_MAX;
+        uint64_t last_assignment_seq = 0;
+    };
+    std::array<Candidate, WKI_MAX_PEERS + 1> eligible = {};
+    size_t eligible_count = 0;
+    uint64_t eligible_capacity = 0;
+    uint64_t const LOCAL_PRESSURE = std::max<uint64_t>(local_runnable, g_balanced_local_reservations);
+    if (balanced_memory_eligible(local_free_mem)) {
+        eligible.at(eligible_count++) = {
+            .node_id = WKI_NODE_INVALID,
+            .remote_load = nullptr,
+            .score = balanced_placement_score(local_load, local_cpus, local_free_mem, LOCAL_PRESSURE),
+            .last_assignment_seq = g_balanced_local_last_assignment_seq,
+        };
+        eligible_capacity += std::max<uint16_t>(local_cpus, 1);
+    }
     uint64_t const NOW = wki_now_us();
 
     for (auto& rl : g_remote_loads) {
-        if (!rl.valid || NOW - rl.last_update_us > (WKI_LOAD_REPORT_INTERVAL_US * 2)) {
+        if (!rl.valid || NOW - rl.last_update_us > (WKI_LOAD_REPORT_INTERVAL_US * 2) || !balanced_memory_eligible(rl.free_mem_pages)) {
             continue;
         }
         auto* peer = wki_peer_find(rl.node_id);
@@ -3736,31 +3813,82 @@ auto wki_balanced_node(uint16_t local_load, uint16_t local_cpus, uint16_t local_
             continue;
         }
         uint64_t const KNOWN_ACTIVE = active_submitted_tasks_for_node_locked(rl.node_id);
-        uint64_t const REMOTE_PRESSURE = std::max<uint64_t>(rl.runnable_tasks, KNOWN_ACTIVE) + rl.placement_reservations;
+        uint64_t const REMOTE_PRESSURE =
+            std::max({static_cast<uint64_t>(rl.runnable_tasks), KNOWN_ACTIVE, static_cast<uint64_t>(rl.balanced_assignments)});
         uint64_t const SCORE = balanced_placement_score(rl.avg_load_pct, rl.num_cpus, rl.free_mem_pages, REMOTE_PRESSURE);
-        if (SCORE < best_score) {
-            best_score = SCORE;
-            candidate_count = 0;
-        }
-        if (SCORE == best_score && candidate_count < candidates.size()) {
-            candidates.at(candidate_count++) = rl.node_id;
+        if (eligible_count < eligible.size()) {
+            eligible.at(eligible_count++) = {
+                .node_id = rl.node_id,
+                .remote_load = &rl,
+                .score = SCORE,
+                .last_assignment_seq = rl.balanced_last_assignment_seq,
+            };
+            eligible_capacity += std::max<uint16_t>(rl.num_cpus, 1);
         }
     }
 
-    uint16_t const SELECTED = candidates.at(g_balanced_placement_cursor % candidate_count);
+    if (eligible_count == 0) {
+        return {};
+    }
+
+    std::array<size_t, WKI_MAX_PEERS + 1> candidates = {};
+    size_t candidate_count = 0;
+    uint64_t oldest_age = 0;
+    for (size_t i = 0; i < eligible_count; ++i) {
+        Candidate const& candidate = eligible.at(i);
+        if (!balanced_candidate_is_starved(g_balanced_assignment_seq, candidate.last_assignment_seq, eligible_capacity)) {
+            continue;
+        }
+        uint64_t const AGE = g_balanced_assignment_seq - candidate.last_assignment_seq;
+        if (AGE > oldest_age) {
+            oldest_age = AGE;
+            candidate_count = 0;
+        }
+        if (AGE == oldest_age) {
+            candidates.at(candidate_count++) = i;
+        }
+    }
+
+    if (candidate_count == 0) {
+        uint64_t best_score = UINT64_MAX;
+        for (size_t i = 0; i < eligible_count; ++i) {
+            uint64_t const SCORE = eligible.at(i).score;
+            if (SCORE < best_score) {
+                best_score = SCORE;
+                candidate_count = 0;
+            }
+            if (SCORE == best_score) {
+                candidates.at(candidate_count++) = i;
+            }
+        }
+    }
+
+    Candidate& selected = eligible.at(candidates.at(g_balanced_placement_cursor % candidate_count));
     ++g_balanced_placement_cursor;
-    if (SELECTED == WKI_NODE_INVALID) {
+    if (g_balanced_assignment_seq == UINT64_MAX) {
+        g_balanced_assignment_seq = 0;
+        g_balanced_local_last_assignment_seq = 0;
+        for (auto& load : g_remote_loads) {
+            load.balanced_last_assignment_seq = 0;
+        }
+    }
+    uint64_t const ASSIGNMENT_SEQ = ++g_balanced_assignment_seq;
+    if (selected.node_id == WKI_NODE_INVALID) {
+        g_balanced_local_last_assignment_seq = ASSIGNMENT_SEQ;
         if (g_balanced_local_reservations != UINT32_MAX) {
             ++g_balanced_local_reservations;
         }
-        return WKI_NODE_INVALID;
+        return {.node_id = WKI_NODE_INVALID, .found = true};
     }
 
-    RemoteNodeLoad* const LOAD = find_remote_load(SELECTED);
-    if (LOAD != nullptr && LOAD->placement_reservations != UINT32_MAX) {
-        ++LOAD->placement_reservations;
+    RemoteNodeLoad* const LOAD = selected.remote_load;
+    if (LOAD != nullptr && LOAD->balanced_assignments != UINT32_MAX) {
+        ++LOAD->balanced_assignments;
     }
-    return SELECTED;
+    if (LOAD != nullptr) {
+        LOAD->balanced_last_assignment_seq = ASSIGNMENT_SEQ;
+    }
+    return {.node_id = selected.node_id, .found = true};
 }
 
 // s_compute_lock must be held by caller. The returned node owns one transient
@@ -3818,6 +3946,21 @@ void wki_release_preferred_remote_node(uint16_t node_id) {
 }
 
 PreferredRemoteReservation::~PreferredRemoteReservation() { wki_release_preferred_remote_node(node_id); }
+
+void wki_rollback_balanced_remote_assignment(uint16_t node_id) {
+    if (node_id == WKI_NODE_INVALID) {
+        return;
+    }
+
+    s_compute_lock.lock();
+    RemoteNodeLoad* const LOAD = find_remote_load(node_id);
+    if (LOAD != nullptr && LOAD->balanced_assignments != 0) {
+        LOAD->balanced_assignments--;
+    }
+    s_compute_lock.unlock();
+}
+
+BalancedRemoteAssignment::~BalancedRemoteAssignment() { wki_rollback_balanced_remote_assignment(node_id); }
 
 }  // namespace
 
@@ -4493,9 +4636,11 @@ auto wki_remote_compute_selftest_balanced_score_accounts_for_capacity() -> bool 
     uint64_t const IDLE = balanced_placement_score(100, 8, 4096, 0);
     uint64_t const ONE_ACTIVE = balanced_placement_score(100, 8, 4096, 1);
     uint64_t const FOUR_CPU_ACTIVE = balanced_placement_score(100, 4, 4096, 1);
-    uint64_t const LOW_MEMORY = balanced_placement_score(100, 8, 128, 0);
+    uint64_t const MEMORY_PRESSURE = balanced_placement_score(100, 8, WKI_BALANCED_FREE_MEM_RESERVE, 0);
 
-    return ONE_ACTIVE > IDLE && FOUR_CPU_ACTIVE > ONE_ACTIVE && LOW_MEMORY > FOUR_CPU_ACTIVE;
+    return ONE_ACTIVE > IDLE && FOUR_CPU_ACTIVE > ONE_ACTIVE && MEMORY_PRESSURE > IDLE && balanced_candidate_is_starved(36, 0, 36) &&
+           !balanced_candidate_is_starved(35, 0, 36) && balanced_memory_eligible(WKI_BALANCED_FREE_MEM_RESERVE) &&
+           !balanced_memory_eligible(WKI_BALANCED_FREE_MEM_RESERVE - 1);
 }
 
 auto wki_remote_compute_selftest_submit_policy_scope_restores_worker() -> bool {
@@ -7257,6 +7402,7 @@ void handle_load_report(const WkiHeader* hdr, const uint8_t* payload, uint16_t p
     rl->avg_load_pct = report->avg_load_pct;
     rl->free_mem_pages = report->free_mem_pages;
     rl->last_update_us = wki_now_us();
+    rl->balanced_assignments = 0;
     s_compute_lock.unlock();
 }
 

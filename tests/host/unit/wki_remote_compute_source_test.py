@@ -387,13 +387,19 @@ def test_balanced_placement_scores_all_healthy_systems() -> None:
         [
             "g_balanced_local_sample_us != g_cached_local_load_update_us",
             "g_balanced_local_reservations = 0",
-            "static_cast<uint64_t>(local_runnable) + g_balanced_local_reservations",
-            "std::max<uint64_t>(rl.runnable_tasks, KNOWN_ACTIVE) + rl.placement_reservations",
+            "balanced_memory_eligible(local_free_mem)",
+            "!balanced_memory_eligible(rl.free_mem_pages)",
+            "std::max<uint64_t>(local_runnable, g_balanced_local_reservations)",
+            "static_cast<uint64_t>(rl.balanced_assignments)",
             "peer->state != PeerState::CONNECTED",
+            "balanced_candidate_is_starved",
+            "eligible_capacity",
+            "balanced_last_assignment_seq",
+            "g_balanced_local_last_assignment_seq",
             "g_balanced_local_reservations",
-            "LOAD->placement_reservations",
+            "LOAD->balanced_assignments",
         ],
-        "balanced placement must score and reserve local and remote capacity",
+        "balanced placement must score assignment debt and bound eligible-system starvation",
     )
 
     spawn = function_body(source, "wki_try_remote_spawn")
@@ -401,7 +407,8 @@ def test_balanced_placement_scores_all_healthy_systems() -> None:
         spawn,
         [
             "WKI_TARGET_FLAG_BALANCED",
-            "best_node = wki_balanced_node(LOCAL_LOAD, LOCAL_CPUS, LOCAL_RUNNABLE, LOCAL_FREE_MEM)",
+            "BalancedPlacement const PLACEMENT = wki_balanced_node(LOCAL_LOAD, LOCAL_CPUS, LOCAL_RUNNABLE, LOCAL_FREE_MEM)",
+            'log_spawn_diag(task, WkiRemoteSpawnResult::FAILED, "balanced-no-healthy-system")',
             'log_spawn_diag(task, WkiRemoteSpawnResult::LOCAL, "balanced-local")',
         ],
         "balanced task policy selection",
@@ -409,15 +416,59 @@ def test_balanced_placement_scores_all_healthy_systems() -> None:
     balanced_branch = spawn[spawn.index("} else if (BALANCED_PLACEMENT)") :]
     require_order(
         balanced_branch,
-        "best_node = wki_balanced_node(LOCAL_LOAD, LOCAL_CPUS, LOCAL_RUNNABLE, LOCAL_FREE_MEM)",
-        "preferred_reservation.adopt(best_node)",
-        "balanced remote selection must transfer its transient reservation",
+        "BalancedPlacement const PLACEMENT = wki_balanced_node(LOCAL_LOAD, LOCAL_CPUS, LOCAL_RUNNABLE, LOCAL_FREE_MEM)",
+        "if (!PLACEMENT.found)",
+        "balanced placement must reject an empty healthy candidate set",
+    )
+    require_order(
+        balanced_branch,
+        "if (!PLACEMENT.found)",
+        "balanced_assignment.adopt(best_node)",
+        "balanced remote selection must transfer its sample-window assignment",
+    )
+    require_order(
+        spawn,
+        "if (tid == 0)",
+        "balanced_assignment.commit()",
+        "balanced assignment debt may commit only after successful submission",
+    )
+    load_report = function_body(source, "handle_load_report")
+    require_tokens(
+        load_report,
+        ["rl->last_update_us = wki_now_us()", "rl->balanced_assignments = 0"],
+        "a fresh remote load sample must retire prior balanced assignment debt",
     )
 
     token = "wki_remote_compute_selftest_balanced_score_accounts_for_capacity"
     require_tokens(source, [f"auto {token}() -> bool"], "balanced placement score selftest implementation")
     require_tokens(header, [f"auto {token}() -> bool;"], "balanced placement score selftest declaration")
     require_tokens(ktest, ["BalancedScoreAccountsForCapacity", token], "balanced placement score KTEST coverage")
+
+
+def test_placement_controllers_run_before_payload_distribution() -> None:
+    source = REMOTE_COMPUTE_CPP.read_text()
+    spawn = function_body(source, "wki_try_remote_spawn")
+    require_tokens(
+        spawn,
+        [
+            "is_placement_control_helper",
+            '"wkictl", "locally", "remotely", "anywhere", "homeward", "on", "forward", "wosid"',
+            'log_spawn_diag(task, WkiRemoteSpawnResult::LOCAL, "placement-control-helper")',
+        ],
+        "placement controller local execution",
+    )
+    require_order(
+        spawn,
+        "if (AUTOMATIC_PLACEMENT)",
+        'log_spawn_diag(task, WkiRemoteSpawnResult::LOCAL, "placement-control-helper")',
+        "only legacy automatic placement may pin placement controllers",
+    )
+    require_order(
+        spawn,
+        'log_spawn_diag(task, WkiRemoteSpawnResult::LOCAL, "placement-control-helper")',
+        "if (REMOTE_RECEIVER && !EXPLICIT_TARGET && !PREFER_REMOTE && !BALANCED_PLACEMENT)",
+        "controller classification must precede receiver forwarding policy",
+    )
 
 
 def test_submitted_task_slots_are_indexed_and_reclaimed() -> None:
@@ -1618,6 +1669,20 @@ def test_receiver_child_owner_spans_interpreter_output_and_publication() -> None
     if "release_unpublished_process(" in exec_body:
         fail("exec_elf_buffer must return with the receiver child owner slot intact")
 
+    boot_read = function_body(TASK_CPP.read_text(), "read_boot_file_fully")
+    require_order(
+        boot_read,
+        "ker::vfs::vfs_stat(path, &preopen_freshness)",
+        "ker::vfs::vfs_open_file(path, OPEN_FLAGS, 0)",
+        "interpreter cache must be consulted before remote open prefetch",
+    )
+    require_order(
+        boot_read,
+        "boot_file_cache_lookup_copy(cache_key.data(), preopen_freshness",
+        "ker::vfs::vfs_open_file(path, OPEN_FLAGS, 0)",
+        "preopen freshness hit must avoid fetching cached remote interpreter bytes",
+    )
+
     work_body = function_body(source, "handle_task_submit_work")
     require_order(
         work_body,
@@ -2399,6 +2464,7 @@ def main() -> None:
     test_remote_load_procfs_uses_locked_snapshot()
     test_preferred_placement_accounts_for_inflight_submissions()
     test_balanced_placement_scores_all_healthy_systems()
+    test_placement_controllers_run_before_payload_distribution()
     test_load_report_uses_cpu_accounting_and_shared_local_cache()
     test_receiver_path_localization_bounds_suffix_scan()
     test_vfs_ref_loader_rejects_null_or_empty_path_before_vfs_use()
