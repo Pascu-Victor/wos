@@ -185,6 +185,7 @@ void xfs_trans_cancel(XfsTransaction* tp);
 #ifdef WOS_SELFTEST
 auto xfs_selftest_transaction_cancel_restores_nlink() -> bool;
 auto xfs_selftest_transaction_retired_ranges_commit_only() -> bool;
+auto xfs_selftest_transaction_cancel_restores_replaced_buffer_alias() -> bool;
 #endif
 
 }  // namespace ker::vfs::xfs

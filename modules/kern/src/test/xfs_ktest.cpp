@@ -83,6 +83,10 @@ KTEST(XFS, TransactionCancelRestoresLinkCount) { KEXPECT_TRUE(ker::vfs::xfs::xfs
 
 KTEST(XFS, TransactionRetiredRangesCommitOnly) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_transaction_retired_ranges_commit_only()); }
 
+KTEST(XFS, TransactionCancelRestoresReplacedBufferAlias) {
+    KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_transaction_cancel_restores_replaced_buffer_alias());
+}
+
 KTEST(XFS, LogRecycledBufferIsDistinct) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_log_recycled_buffer_is_distinct()); }
 
 KTEST(XFS, AgfStructSize) { KEXPECT_EQ(sizeof(ker::vfs::xfs::XfsAgf), static_cast<size_t>(224)); }

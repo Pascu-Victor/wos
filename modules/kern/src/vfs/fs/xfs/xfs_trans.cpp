@@ -419,9 +419,14 @@ auto xfs_trans_capture_buf(XfsTransaction* tp, BufHead* bp) -> int {
     if (tp == nullptr || bp == nullptr || bp->data == nullptr || bp->size == 0 || tp->committed || tp->cancelled) {
         return -EINVAL;
     }
+    XfsTransBufUndo const* span_undo = nullptr;
     for (XfsTransBufUndo const* undo = tp->buf_undo; undo != nullptr; undo = undo->next) {
         if (undo->bp == bp) {
             return 0;
+        }
+        if (span_undo == nullptr && undo->bp != nullptr && undo->bp->bdev == bp->bdev && undo->bp->block_no == bp->block_no &&
+            undo->size == bp->size) {
+            span_undo = undo;
         }
     }
 
@@ -436,9 +441,37 @@ auto xfs_trans_capture_buf(XfsTransaction* tp, BufHead* bp) -> int {
         tp->error = -ENOMEM;
         return -ENOMEM;
     }
+
+    // A pinned metadata buffer can be retired from the cache while a
+    // transaction still owns it, allowing a replacement BufHead for the same
+    // device span.  Every alias must share the first before-image, otherwise
+    // cancellation can restore a mixture of transaction moments.  Seed the
+    // replacement with the transaction's current canonical contents before
+    // its caller mutates it.
+    if (span_undo != nullptr) {
+        BufHead const* current = span_undo->bp;
+        for (int i = 0; i < tp->item_count; ++i) {
+            XfsTransItem const& item = tp->items[i];
+            if (item.type == XfsLogItemType::BUFFER && item.buf.bp != nullptr && item.buf.bp->bdev == bp->bdev &&
+                item.buf.bp->block_no == bp->block_no && item.buf.bp->size == bp->size) {
+                current = item.buf.bp;
+                break;
+            }
+        }
+        if (current == nullptr || current->data == nullptr || span_undo->before_image == nullptr) {
+            delete[] undo->before_image;
+            delete undo;
+            tp->error = -EIO;
+            return -EIO;
+        }
+        __builtin_memcpy(undo->before_image, span_undo->before_image, bp->size);
+        __builtin_memcpy(bp->data, current->data, bp->size);
+    } else {
+        __builtin_memcpy(undo->before_image, bp->data, bp->size);
+    }
+
     bjournal_hold(bp);
     undo->journal_held = true;
-    __builtin_memcpy(undo->before_image, bp->data, bp->size);
     bp->refcount.fetch_add(1, std::memory_order_relaxed);
     undo->bp = bp;
     undo->size = bp->size;
@@ -779,6 +812,73 @@ auto xfs_selftest_transaction_retired_ranges_commit_only() -> bool {
     ok = ok && !has_cached_bdev_range(&dev, BLOCK, COUNT);
     brelse(committed_pinned);
 
+    invalidate_bdev(&dev);
+    return ok;
+}
+
+auto xfs_selftest_transaction_cancel_restores_replaced_buffer_alias() -> bool {
+    constexpr uint64_t BLOCK = 144;
+    constexpr size_t COUNT = 8;
+    constexpr uint8_t ORIGINAL = 0x31;
+    constexpr uint8_t FIRST_MUTATION = 0x52;
+    constexpr uint8_t SECOND_MUTATION = 0x73;
+
+    ker::dev::BlockDevice dev{};
+    dev.block_size = 512;
+    dev.total_blocks = 1024;
+    dev.read_blocks = xfs_retirement_selftest_read;
+    dev.write_blocks = xfs_retirement_selftest_write;
+    invalidate_bdev(&dev);
+
+    XfsMountContext mount{};
+    mount.device = &dev;
+
+    auto filled_with = [](BufHead const* bh, uint8_t value) -> bool {
+        if (bh == nullptr || bh->data == nullptr) {
+            return false;
+        }
+        for (size_t i = 0; i < bh->size; ++i) {
+            if (bh->data[i] != value) {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    BufHead* original = bget_multi(&dev, BLOCK, COUNT);
+    if (original == nullptr) {
+        invalidate_bdev(&dev);
+        return false;
+    }
+    __builtin_memset(original->data, ORIGINAL, original->size);
+
+    XfsTransaction* tp = xfs_trans_alloc(&mount);
+    bool ok = tp != nullptr && xfs_trans_capture_buf(tp, original) == 0;
+    if (ok) {
+        __builtin_memset(original->data, FIRST_MUTATION, original->size);
+        xfs_trans_log_buf_full(tp, original);
+        ok = retire_bdev_range(&dev, BLOCK, COUNT);
+    }
+
+    BufHead* replacement = ok ? bget_multi(&dev, BLOCK, COUNT) : nullptr;
+    ok = ok && replacement != nullptr && replacement != original;
+    if (ok) {
+        ok = xfs_trans_capture_buf(tp, replacement) == 0 && filled_with(replacement, FIRST_MUTATION);
+    }
+    if (ok) {
+        __builtin_memset(replacement->data, SECOND_MUTATION, replacement->size);
+        xfs_trans_log_buf_full(tp, replacement);
+    }
+
+    if (tp != nullptr) {
+        xfs_trans_cancel(tp);
+    }
+    ok = ok && filled_with(original, ORIGINAL) && filled_with(replacement, ORIGINAL);
+
+    if (replacement != nullptr) {
+        brelse(replacement);
+    }
+    brelse(original);
     invalidate_bdev(&dev);
     return ok;
 }
