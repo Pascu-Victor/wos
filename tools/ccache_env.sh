@@ -733,10 +733,35 @@ wos_stage_distributed_build_roots() {
 
     local retained_roots="${WOS_DISTRIBUTED_COMPILER_RETAINED_ROOTS:-}"
     if [ -n "$retained_root" ]; then
+        local canonical_retained_root
+        local immutable_root
+        local canonical_immutable_root
+        if ! canonical_retained_root="$(realpath "$retained_root")"; then
+            echo "ERROR: distributed compiler retained root could not be resolved: $retained_root" >&2
+            return 1
+        fi
+        while IFS= read -r immutable_root; do
+            [ -n "$immutable_root" ] || continue
+            if ! canonical_immutable_root="$(realpath "$immutable_root")"; then
+                echo "ERROR: distributed compiler immutable root could not be resolved: $immutable_root" >&2
+                return 1
+            fi
+            case "$canonical_retained_root" in
+                "$canonical_immutable_root"|"$canonical_immutable_root"/*)
+                    # A generated build can name a nested source directory
+                    # even though an earlier stage cached its immutable
+                    # multi-project parent. Keep the complete cached parent
+                    # active so sibling inputs stay peer-local.
+                    if [ "${#canonical_immutable_root}" -lt "${#canonical_retained_root}" ]; then
+                        canonical_retained_root="$canonical_immutable_root"
+                    fi
+                    ;;
+            esac
+        done <<< "${WOS_DISTRIBUTED_COMPILER_IMMUTABLE_ROOTS:-}"
         if [ -n "$retained_roots" ]; then
             retained_roots+=$'\n'
         fi
-        retained_roots+="$retained_root"
+        retained_roots+="$canonical_retained_root"
     fi
 
     WOS_DISTRIBUTED_COMPILER_RETAINED_ROOTS="$retained_roots" \

@@ -358,12 +358,64 @@ def test_wos_toolchain_stages_configured_build_roots() -> None:
         [
             "wos_stage_distributed_build_roots()",
             'if [ "${WOS_DISTRIBUTED_COMPILER_TRANSPORT:-source}" != staged ]; then',
-            'retained_roots+="$retained_root"',
+            'canonical_retained_root="$(realpath "$retained_root")"',
+            '"$canonical_immutable_root"|"$canonical_immutable_root"/*)',
+            'retained_roots+="$canonical_retained_root"',
             'WOS_DISTRIBUTED_COMPILER_RETAINED_ROOTS="$retained_roots"',
             '"$workspace_root/tools/stage-distributed-compiler-roots.sh" "$@"',
         ],
         "configured distributed compiler root staging helper",
     )
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp = Path(temp_dir)
+        workspace = temp / "workspace"
+        stage_helper = workspace / "tools" / "stage-distributed-compiler-roots.sh"
+        stage_helper.parent.mkdir(parents=True)
+        stage_helper.write_text(
+            "#!/bin/bash\n"
+            "printf 'retained=%s\\n' \"$WOS_DISTRIBUTED_COMPILER_RETAINED_ROOTS\"\n"
+            "printf 'root=%s\\n' \"$@\"\n",
+            encoding="ascii",
+        )
+        stage_helper.chmod(0o755)
+        immutable_root = workspace / "toolchain" / "src" / "multi-project"
+        nested_immutable_root = immutable_root / "core"
+        nested_root = nested_immutable_root / "frontend"
+        build_root = workspace / "toolchain" / "build"
+        nested_root.mkdir(parents=True)
+        build_root.mkdir(parents=True)
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "WOS_DISTRIBUTED_COMPILER_TRANSPORT": "staged",
+                "WOS_DISTRIBUTED_COMPILER_IMMUTABLE_ROOTS": (
+                    f"{nested_immutable_root}\n{immutable_root}"
+                ),
+            }
+        )
+        result = subprocess.run(
+            [
+                "bash",
+                "-c",
+                'source "$1"; wos_stage_distributed_build_roots "$2" "$3" "$4"',
+                "test-promoted-retained-root",
+                str(ROOT / "tools" / "ccache_env.sh"),
+                str(workspace),
+                str(nested_root),
+                str(build_root),
+            ],
+            cwd=ROOT,
+            check=False,
+            text=True,
+            capture_output=True,
+            env=environment,
+        )
+        if result.returncode != 0:
+            fail(f"configured distributed root promotion failed: {result.stderr}")
+        expected = f"retained={immutable_root}\nroot={build_root}\n"
+        if result.stdout != expected:
+            fail(f"configured distributed root did not retain its immutable parent: {result.stdout!r}")
 
     script_orders = {
         "build_busybox.sh": [
