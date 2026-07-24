@@ -3746,6 +3746,8 @@ auto preferred_remote_placement_score(const RemoteNodeLoad& load, size_t active_
 
 constexpr uint16_t WKI_BALANCED_FREE_MEM_RESERVE = 512;
 constexpr uint16_t WKI_BALANCED_FREE_MEM_COMFORT = 4096;
+constexpr uint64_t WKI_BALANCED_QUEUE_HEADROOM_NUMERATOR = 5;
+constexpr uint64_t WKI_BALANCED_QUEUE_HEADROOM_DENOMINATOR = 4;
 
 auto balanced_memory_eligible(uint16_t free_mem) -> bool { return free_mem >= WKI_BALANCED_FREE_MEM_RESERVE; }
 
@@ -3761,9 +3763,19 @@ auto balanced_memory_pressure(uint16_t free_mem) -> uint64_t {
     return (static_cast<uint64_t>(WKI_BALANCED_FREE_MEM_COMFORT - free_mem) * MAX_HEADROOM_PENALTY) / HEADROOM_RANGE;
 }
 
-auto balanced_placement_score(uint16_t load_pct, uint16_t num_cpus, uint16_t free_mem, uint64_t inflight) -> uint64_t {
+auto balanced_inflight_pressure(uint16_t num_cpus, uint64_t inflight) -> uint64_t {
     uint64_t const CPUS = std::max<uint64_t>(num_cpus, 1);
-    uint64_t const INFLIGHT_PRESSURE = (inflight * 1000ULL) / CPUS;
+    uint64_t const QUEUE_CAPACITY =
+        std::max<uint64_t>((CPUS * WKI_BALANCED_QUEUE_HEADROOM_NUMERATOR) / WKI_BALANCED_QUEUE_HEADROOM_DENOMINATOR, 1);
+    // Keep a bounded runnable reserve for tasks that sleep on remote VFS or
+    // IPC. The extra point makes a full reserve strictly more expensive than
+    // a saturated candidate, so selection cannot grow beyond the reserve on
+    // an equal-score tie.
+    return inflight == 0 ? 0 : 1 + ((inflight * 1000ULL) / QUEUE_CAPACITY);
+}
+
+auto balanced_placement_score(uint16_t load_pct, uint16_t num_cpus, uint16_t free_mem, uint64_t inflight) -> uint64_t {
+    uint64_t const INFLIGHT_PRESSURE = balanced_inflight_pressure(num_cpus, inflight);
     return std::max<uint64_t>(load_pct, INFLIGHT_PRESSURE) + balanced_memory_pressure(free_mem);
 }
 
@@ -4642,10 +4654,15 @@ auto wki_remote_compute_selftest_balanced_score_accounts_for_capacity() -> bool 
     uint64_t const OBSERVED_BUSY = balanced_placement_score(500, 8, 4096, 0);
     uint64_t const BUSY_WITH_SMALL_DEBT = balanced_placement_score(500, 8, 4096, 1);
     uint64_t const MEMORY_PRESSURE = balanced_placement_score(100, 8, WKI_BALANCED_FREE_MEM_RESERVE, 0);
+    uint64_t const SATURATED_AT_CAPACITY = balanced_placement_score(1000, 8, 4096, 8);
+    uint64_t const SATURATED_AT_HEADROOM = balanced_placement_score(1000, 8, 4096, 10);
+    uint64_t const SATURATED_BEYOND_HEADROOM = balanced_placement_score(1000, 8, 4096, 11);
 
     return ONE_ACTIVE > IDLE && FOUR_CPU_ACTIVE > ONE_ACTIVE && BUSY_WITH_SMALL_DEBT == OBSERVED_BUSY && MEMORY_PRESSURE > IDLE &&
-           balanced_candidate_is_starved(36, 0, 36) && !balanced_candidate_is_starved(35, 0, 36) &&
-           balanced_memory_eligible(WKI_BALANCED_FREE_MEM_RESERVE) && !balanced_memory_eligible(WKI_BALANCED_FREE_MEM_RESERVE - 1);
+           SATURATED_AT_CAPACITY == 1000 && SATURATED_AT_HEADROOM > SATURATED_AT_CAPACITY &&
+           SATURATED_BEYOND_HEADROOM > SATURATED_AT_HEADROOM && balanced_candidate_is_starved(36, 0, 36) &&
+           !balanced_candidate_is_starved(35, 0, 36) && balanced_memory_eligible(WKI_BALANCED_FREE_MEM_RESERVE) &&
+           !balanced_memory_eligible(WKI_BALANCED_FREE_MEM_RESERVE - 1);
 }
 
 auto wki_remote_compute_selftest_submit_policy_scope_restores_worker() -> bool {

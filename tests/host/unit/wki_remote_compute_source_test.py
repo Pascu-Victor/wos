@@ -402,6 +402,16 @@ def test_balanced_placement_scores_all_healthy_systems() -> None:
         ],
         "balanced placement must score assignment debt and bound eligible-system starvation",
     )
+    score = function_body(source, "balanced_inflight_pressure")
+    require_tokens(
+        score,
+        [
+            "WKI_BALANCED_QUEUE_HEADROOM_NUMERATOR",
+            "WKI_BALANCED_QUEUE_HEADROOM_DENOMINATOR",
+            "inflight == 0 ? 0 : 1 + ((inflight * 1000ULL) / QUEUE_CAPACITY)",
+        ],
+        "balanced placement must retain bounded runnable headroom for blocking tasks",
+    )
 
     spawn = function_body(source, "wki_try_remote_spawn")
     require_tokens(
