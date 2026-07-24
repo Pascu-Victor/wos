@@ -1981,6 +1981,7 @@ struct ReaddirCtx {
     size_t current_index{};
     bool use_cookie{};
     bool found{};
+    int status{};
 };
 
 auto xfs_vfs_dirent_record_size(size_t name_len) -> uint16_t {
@@ -2027,8 +2028,35 @@ void xfs_readdir_fill_vfs_entry(const XfsDirEntry* xde, size_t current_index, bo
     entry->d_name.at(COPY_LEN) = '\0';
 }
 
+auto readdir_entry_visibility(XfsInode* parent, const XfsDirEntry* entry) -> int {
+    if (parent == nullptr || entry == nullptr) {
+        return -EINVAL;
+    }
+
+    XfsDirEntry cached{};
+    int cached_result = 0;
+    if (!xfs_dentry_cache_lookup_parent(parent->mount, parent->ino, entry->name.data(), entry->namelen, &cached, &cached_result) ||
+        cached_result != -ENOENT) {
+        return 1;
+    }
+
+    // Successful removal installs a negative dentry while leaf/node data
+    // blocks can retain an unreachable record. Verify only these exceptional
+    // records against the index so normal readdir stays a linear data scan.
+    return xfs_dir_entry_is_indexed(parent, entry);
+}
+
 auto readdir_callback(const XfsDirEntry* xde, void* ctx_ptr) -> int {
     auto* rctx = static_cast<ReaddirCtx*>(ctx_ptr);
+    int const VISIBILITY = readdir_entry_visibility(rctx->parent, xde);
+    if (VISIBILITY < 0) {
+        rctx->status = VISIBILITY;
+        return 1;
+    }
+    if (VISIBILITY == 0) {
+        return 0;
+    }
+
     bool const MATCH = rctx->use_cookie ? xde->cookie >= rctx->target_cookie : rctx->current_index == rctx->target_index;
     if (MATCH) {
         xfs_dir_observe_entry(rctx->parent, xde);
@@ -2050,6 +2078,7 @@ struct ReaddirBatchCtx {
     size_t current_index{};
     size_t next_request_index{};
     bool use_cookie{};
+    int status{};
 };
 
 auto xfs_readdir_cache_lookup(XfsFileData* xfd, size_t index, DirEntry* entry) -> bool {
@@ -2093,6 +2122,15 @@ auto xfs_readdir_cache_ensure(XfsFileData* xfd) -> XfsReaddirCache* {
 
 auto readdir_batch_callback(const XfsDirEntry* xde, void* ctx_ptr) -> int {
     auto* ctx = static_cast<ReaddirBatchCtx*>(ctx_ptr);
+    int const VISIBILITY = readdir_entry_visibility(ctx->parent, xde);
+    if (VISIBILITY < 0) {
+        ctx->status = VISIBILITY;
+        return 1;
+    }
+    if (VISIBILITY == 0) {
+        return 0;
+    }
+
     bool const MATCH = ctx->use_cookie ? xde->cookie >= ctx->target_cookie : ctx->current_index >= ctx->target_index;
     if (!MATCH) {
         ctx->current_index++;
@@ -2145,6 +2183,9 @@ auto xfs_vfs_readdir(File* f, DirEntry* entry, size_t index) -> int {
         if (RET < 0) {
             return RET;
         }
+        if (ctx.status != 0) {
+            return ctx.status;
+        }
 
         return ctx.found ? 0 : -1;  // -1 = no more entries
     }
@@ -2166,6 +2207,10 @@ auto xfs_vfs_readdir(File* f, DirEntry* entry, size_t index) -> int {
     if (BATCH_RET < 0) {
         cache->count = 0;
         return BATCH_RET;
+    }
+    if (batch_ctx.status != 0) {
+        cache->count = 0;
+        return batch_ctx.status;
     }
     if (xfs_readdir_cache_lookup(xfd, index, entry)) {
         return 0;

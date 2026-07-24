@@ -1259,7 +1259,8 @@ auto dir2_leaf_node_linear_scan(XfsInode* dp, const char* name, uint16_t namelen
 
 // Lookup in leaf/node format: find the name by scanning data blocks
 // using the bmap to resolve block addresses.
-auto dir2_leaf_node_lookup(XfsInode* dp, const char* name, uint16_t namelen, XfsDirEntry* entry) -> int {
+auto dir2_leaf_node_lookup(XfsInode* dp, const char* name, uint16_t namelen, XfsDirEntry* entry, bool allow_unindexed_data_fallback)
+    -> int {
     XfsMountContext* ctx = dp->mount;
 
     // Compute hash
@@ -1386,7 +1387,7 @@ auto dir2_leaf_node_lookup(XfsInode* dp, const char* name, uint16_t namelen, Xfs
         }
 
         if (!found) {
-            if (LEAF_INDEX_FULL) {
+            if (LEAF_INDEX_FULL && allow_unindexed_data_fallback) {
                 if (dir2_leaf_index_known_complete(dp)) {
                     brelse(leaf_bh);
                     return -ENOENT;
@@ -1437,7 +1438,7 @@ auto dir2_leaf_node_lookup(XfsInode* dp, const char* name, uint16_t namelen, Xfs
             brelse(data_bh);
         }
 
-        if (LEAF_INDEX_FULL) {
+        if (LEAF_INDEX_FULL && allow_unindexed_data_fallback) {
             if (dir2_leaf_index_known_complete(dp)) {
                 brelse(leaf_bh);
                 return -ENOENT;
@@ -1483,7 +1484,8 @@ auto dir2_leaf_node_iterate(XfsInode* dp, XfsDirIterFn fn, void* user_ctx) -> in
     return 0;
 }
 
-auto dir2_extent_or_btree_lookup(XfsInode* dp, const char* name, uint16_t namelen, XfsDirEntry* entry) -> int {
+auto dir2_extent_or_btree_lookup(XfsInode* dp, const char* name, uint16_t namelen, XfsDirEntry* entry, bool allow_unindexed_data_fallback)
+    -> int {
     XfsMountContext const* ctx = dp->mount;
 
     BufHead* bh = nullptr;
@@ -1495,7 +1497,7 @@ auto dir2_extent_or_btree_lookup(XfsInode* dp, const char* name, uint16_t namele
         if (dp->size <= ctx->dir_blk_size) {
             return RC != 0 ? RC : -EIO;
         }
-        return dir2_leaf_node_lookup(dp, name, namelen, entry);
+        return dir2_leaf_node_lookup(dp, name, namelen, entry, allow_unindexed_data_fallback);
     }
 
     const auto* hdr = reinterpret_cast<const XfsDir3DataHdr*>(bh->data);
@@ -1507,7 +1509,7 @@ auto dir2_extent_or_btree_lookup(XfsInode* dp, const char* name, uint16_t namele
     }
     if (MAGIC == XFS_DIR3_DATA_MAGIC) {
         brelse(bh);
-        return dir2_leaf_node_lookup(dp, name, namelen, entry);
+        return dir2_leaf_node_lookup(dp, name, namelen, entry, allow_unindexed_data_fallback);
     }
 
     dir2_log_bad_magic("format-detect", dp, 0, bh, MAGIC);
@@ -1515,7 +1517,7 @@ auto dir2_extent_or_btree_lookup(XfsInode* dp, const char* name, uint16_t namele
     if (dp->size <= ctx->dir_blk_size) {
         return -EINVAL;
     }
-    return dir2_leaf_node_lookup(dp, name, namelen, entry);
+    return dir2_leaf_node_lookup(dp, name, namelen, entry, allow_unindexed_data_fallback);
 }
 
 }  // anonymous namespace
@@ -1559,7 +1561,7 @@ auto xfs_dir_lookup_impl(XfsInode* dp, const char* name, uint16_t namelen, XfsDi
 
         case XFS_DINODE_FMT_EXTENTS:
         case XFS_DINODE_FMT_BTREE: {
-            result = dir2_extent_or_btree_lookup(dp, name, namelen, entry);
+            result = dir2_extent_or_btree_lookup(dp, name, namelen, entry, true);
             break;
         }
 
@@ -1593,8 +1595,11 @@ auto dir_entry_index_membership(const XfsDirEntry* observed, int lookup_result, 
     if (lookup_result != 0) {
         return lookup_result;
     }
-    if (indexed == nullptr || indexed->ino != observed->ino || indexed->ftype != observed->ftype) {
+    if (indexed == nullptr) {
         return -EIO;
+    }
+    if (indexed->ino != observed->ino || indexed->ftype != observed->ftype) {
+        return 0;
     }
     return 1;
 }
@@ -1607,8 +1612,23 @@ auto xfs_dir_entry_is_indexed(XfsInode* dp, const XfsDirEntry* observed) -> int 
     }
 
     XfsDirEntry indexed{};
-    int const LOOKUP_RET = xfs_dir_lookup_authoritative(dp, observed->name.data(), observed->namelen, &indexed);
-    return dir_entry_index_membership(observed, LOOKUP_RET, &indexed);
+    int lookup_ret = 0;
+    switch (dp->data_fork.format) {
+        case XFS_DINODE_FMT_LOCAL:
+            lookup_ret = dir2_sf_lookup(dp, observed->name.data(), observed->namelen, &indexed);
+            break;
+        case XFS_DINODE_FMT_EXTENTS:
+        case XFS_DINODE_FMT_BTREE:
+            // A full leaf index may deliberately fall back to a data-area
+            // scan for compatibility during ordinary pathname lookup. That
+            // fallback must not make an unreachable residual data record
+            // authoritative for readdir or rmdir.
+            lookup_ret = dir2_extent_or_btree_lookup(dp, observed->name.data(), observed->namelen, &indexed, false);
+            break;
+        default:
+            return -EINVAL;
+    }
+    return dir_entry_index_membership(observed, lookup_ret, &indexed);
 }
 
 void xfs_dir_observe_entry(XfsInode* dp, const XfsDirEntry* entry) {
@@ -4742,9 +4762,9 @@ auto xfs_selftest_directory_entry_index_membership() -> bool {
     bool const UNINDEXED = dir_entry_index_membership(&observed, -ENOENT, &indexed) == 0;
 
     indexed.ino++;
-    bool const MISMATCH_REJECTED = dir_entry_index_membership(&observed, 0, &indexed) == -EIO;
+    bool const REPLACED_ENTRY_UNINDEXED = dir_entry_index_membership(&observed, 0, &indexed) == 0;
     bool const IO_ERROR_PROPAGATED = dir_entry_index_membership(&observed, -EIO, nullptr) == -EIO;
-    return MATCHED && UNINDEXED && MISMATCH_REJECTED && IO_ERROR_PROPAGATED;
+    return MATCHED && UNINDEXED && REPLACED_ENTRY_UNINDEXED && IO_ERROR_PROPAGATED;
 }
 
 auto xfs_selftest_block_lookup_uses_leaf_index_for_misses() -> bool {
