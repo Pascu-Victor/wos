@@ -186,7 +186,9 @@ peer_has_cached_root() {
     local marker="$3"
     local identity="$4"
 
-    on "$peer" locally sh -eu -c '
+    WOS_DISTRIBUTED_COMPILER_RETAINED_ROOTS= \
+        WOS_DISTRIBUTED_COMPILER_IMMUTABLE_ROOTS= \
+        on "$peer" locally sh -eu -c '
         root=$1
         marker=$2
         identity=$3
@@ -541,7 +543,9 @@ stage_peer() {
                 "${stage_marker_identities[$marker_index]}"
             )
         done
-        if "${command[@]}"; then
+        if WOS_DISTRIBUTED_COMPILER_RETAINED_ROOTS= \
+            WOS_DISTRIBUTED_COMPILER_IMMUTABLE_ROOTS= \
+            "${command[@]}"; then
             return 0
         fi
         if [ "$attempt" -ge "$stage_retries" ]; then

@@ -1300,6 +1300,8 @@ exec {shlex.quote(real_find)} "$@"
         (mock_bin / "on").write_text(
             r'''#!/bin/bash
 set -eu
+[ -z "${WOS_DISTRIBUTED_COMPILER_RETAINED_ROOTS:-}" ]
+[ -z "${WOS_DISTRIBUTED_COMPILER_IMMUTABLE_ROOTS:-}" ]
 printf '%s\n' "$#" >> "$WOS_STAGE_MOCK_ON_ARGC_LOG"
 [ "$1" = wos-1 ]
 shift
