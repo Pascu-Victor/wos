@@ -237,8 +237,8 @@ KTEST(MM, OwnedFrameTrackingMapUnmapPrivateNormalPage) {
     virt::get_owned_frame_stats_snapshot(after_map);
     if (after_map.capacity == 0) {
         KEXPECT_EQ(after_map.entries, before.entries);
-        KEXPECT_TRUE(after_map.track_attempts >= before.track_attempts + 1);
-        KEXPECT_TRUE(after_map.track_skipped >= before.track_skipped + 1);
+        KEXPECT_EQ(after_map.track_attempts, before.track_attempts);
+        KEXPECT_EQ(after_map.track_skipped, before.track_skipped);
     } else {
         KEXPECT_TRUE(after_map.track_added >= before.track_added + 1);
         KEXPECT_TRUE(after_map.entries >= before.entries + 1);
@@ -250,7 +250,7 @@ KTEST(MM, OwnedFrameTrackingMapUnmapPrivateNormalPage) {
     virt::get_owned_frame_stats_snapshot(after_unmap);
     if (after_map.capacity == 0) {
         KEXPECT_EQ(after_unmap.entries, after_map.entries);
-        KEXPECT_TRUE(after_unmap.untrack_missed >= after_map.untrack_missed + 1);
+        KEXPECT_EQ(after_unmap.untrack_missed, after_map.untrack_missed);
     } else {
         KEXPECT_TRUE(after_unmap.untrack_removed >= after_map.untrack_removed + 1);
     }

@@ -1166,7 +1166,6 @@ void owned_frame_insert_private_mapping(PageTable* pagemap, vaddr_t vaddr, uint6
         (void)pagemap;
         (void)vaddr;
         (void)phys_addr;
-        owned_frame_stats.track_skipped.fetch_add(1, std::memory_order_relaxed);
         return;
     }
 
@@ -1217,6 +1216,14 @@ void owned_frame_insert_private_mapping(PageTable* pagemap, vaddr_t vaddr, uint6
 }
 
 void owned_frame_track_private_mapping(PageTable* pagemap, vaddr_t vaddr, paddr_t paddr, uint64_t flags) {
+    if constexpr (!OWNED_FRAME_TRACKING_ENABLED) {
+        (void)pagemap;
+        (void)vaddr;
+        (void)paddr;
+        (void)flags;
+        return;
+    }
+
     uint64_t const PHYS_ADDR = paddr & ~(paging::PAGE_SIZE - 1);
     if (!owned_frame_is_private_candidate(pagemap, vaddr, PHYS_ADDR, flags)) {
         return;
@@ -1235,6 +1242,14 @@ void owned_frame_track_private_mapping(PageTable* pagemap, vaddr_t vaddr, paddr_
 }
 
 void owned_frame_track_fresh_normal_mapping(PageTable* pagemap, vaddr_t vaddr, paddr_t paddr, uint64_t flags) {
+    if constexpr (!OWNED_FRAME_TRACKING_ENABLED) {
+        (void)pagemap;
+        (void)vaddr;
+        (void)paddr;
+        (void)flags;
+        return;
+    }
+
     uint64_t const PHYS_ADDR = paddr & ~(paging::PAGE_SIZE - 1);
     if (!owned_frame_is_private_candidate(pagemap, vaddr, PHYS_ADDR, flags)) {
         return;
@@ -1245,16 +1260,18 @@ void owned_frame_track_fresh_normal_mapping(PageTable* pagemap, vaddr_t vaddr, p
 }
 
 void owned_frame_untrack_mapping(PageTable* pagemap, vaddr_t vaddr, paddr_t paddr) {
+    if constexpr (!OWNED_FRAME_TRACKING_ENABLED) {
+        (void)pagemap;
+        (void)vaddr;
+        (void)paddr;
+        return;
+    }
+
     if (pagemap == nullptr || paddr == 0) {
         return;
     }
 
     owned_frame_stats.untrack_attempts.fetch_add(1, std::memory_order_relaxed);
-    if constexpr (!OWNED_FRAME_TRACKING_ENABLED) {
-        (void)vaddr;
-        owned_frame_stats.untrack_missed.fetch_add(1, std::memory_order_relaxed);
-        return;
-    }
 
     uint64_t const PHYS_ADDR = paddr & ~(paging::PAGE_SIZE - 1);
     uint64_t const PAGE_VADDR = vaddr & ~(paging::PAGE_SIZE - 1);
@@ -1291,6 +1308,13 @@ void owned_frame_untrack_mapping(PageTable* pagemap, vaddr_t vaddr, paddr_t padd
 }
 
 void owned_frame_untrack_leaf(PageTable* pagemap, vaddr_t vaddr, const PageTableEntry& entry) {
+    if constexpr (!OWNED_FRAME_TRACKING_ENABLED) {
+        (void)pagemap;
+        (void)vaddr;
+        (void)entry;
+        return;
+    }
+
     if (entry.frame == 0) {
         return;
     }
@@ -1298,6 +1322,13 @@ void owned_frame_untrack_leaf(PageTable* pagemap, vaddr_t vaddr, const PageTable
 }
 
 void owned_frame_refresh_leaf(PageTable* pagemap, vaddr_t vaddr, const PageTableEntry& entry) {
+    if constexpr (!OWNED_FRAME_TRACKING_ENABLED) {
+        (void)pagemap;
+        (void)vaddr;
+        (void)entry;
+        return;
+    }
+
     if (entry.present == 0 || entry.frame == 0) {
         owned_frame_untrack_leaf(pagemap, vaddr, entry);
         return;
@@ -1313,14 +1344,16 @@ void owned_frame_refresh_leaf(PageTable* pagemap, vaddr_t vaddr, const PageTable
 }
 
 void owned_frame_purge_pagemap(PageTable* pagemap) {
+    if constexpr (!OWNED_FRAME_TRACKING_ENABLED) {
+        (void)pagemap;
+        return;
+    }
+
     if (pagemap == nullptr) {
         return;
     }
 
     owned_frame_stats.purge_calls.fetch_add(1, std::memory_order_relaxed);
-    if constexpr (!OWNED_FRAME_TRACKING_ENABLED) {
-        return;
-    }
 
     uint64_t removed = 0;
     auto& table = owned_frame_table;

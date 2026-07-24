@@ -487,6 +487,55 @@ def test_live_slab_pages_are_not_reused_by_physical_allocator() -> None:
     )
 
 
+def test_page_ref_diagnostics_do_not_share_a_global_hot_counter() -> None:
+    source = PHYS_CPP.read_text()
+    require_tokens(
+        source,
+        [
+            "struct alignas(64) PageRefStatsCounters",
+            "constexpr size_t PAGE_REF_STATS_CPU_CAPACITY = desc::gdt::MAX_CPUS",
+            "std::array<PageRefStatsCounters, PAGE_REF_STATS_CPU_CAPACITY>",
+            "auto page_ref_stats_for_current_cpu() -> PageRefStatsCounters&",
+            "ref_stats.inc_ops.fetch_add(1, std::memory_order_relaxed)",
+            "ref_stats.dec_ops.fetch_add(1, std::memory_order_relaxed)",
+            "for (size_t cpu_id = 0; cpu_id < cpu_count; ++cpu_id)",
+            "out.inc_ops += stats.inc_ops.load(std::memory_order_relaxed)",
+            "out.dec_ops += stats.dec_ops.load(std::memory_order_relaxed)",
+        ],
+        "page-reference diagnostic counters",
+    )
+    for global_counter in [
+        "std::atomic<uint64_t> page_ref_inc_ops",
+        "std::atomic<uint64_t> page_ref_dec_ops",
+        "std::atomic<uint64_t> page_ref_batch_pages",
+    ]:
+        require_absent(source, global_counter, "page-reference diagnostic counters")
+
+
+def test_page_cache_diagnostics_are_cpu_private() -> None:
+    source = PHYS_CPP.read_text()
+    require_tokens(
+        source,
+        [
+            "struct alignas(64) PageCacheStatsCounters",
+            "std::array<PageCacheStatsCounters, desc::gdt::MAX_CPUS>",
+            "auto& cache_stats = page_cache_stats_by_cpu[CPU_ID]",
+            "cache_stats.alloc_hits.fetch_add(1, std::memory_order_relaxed)",
+            "cache_stats.free_hits.fetch_add(1, std::memory_order_relaxed)",
+            "for (size_t cpu_id = 0; cpu_id < cpu_count; ++cpu_id)",
+            "out.alloc_hits += stats.alloc_hits.load(std::memory_order_relaxed)",
+            "out.free_hits += stats.free_hits.load(std::memory_order_relaxed)",
+        ],
+        "page-cache diagnostic counters",
+    )
+    for global_counter in [
+        "std::atomic<uint64_t> page_cache_alloc_hits",
+        "std::atomic<uint64_t> page_cache_free_hits",
+        "std::atomic<uint64_t> page_cache_refill_calls",
+    ]:
+        require_absent(source, global_counter, "page-cache diagnostic counters")
+
+
 def test_kernel_stacks_use_an_early_fixed_slot_pool() -> None:
     phys = PHYS_CPP.read_text()
     phys_hpp = PHYS_HPP.read_text()
@@ -612,6 +661,8 @@ def main() -> None:
     test_allocator_size_rounding_rejects_overflow_and_overmax_requests()
     test_kmalloc_realloc_bounds_small_copy_by_old_slab_size()
     test_live_slab_pages_are_not_reused_by_physical_allocator()
+    test_page_ref_diagnostics_do_not_share_a_global_hot_counter()
+    test_page_cache_diagnostics_are_cpu_private()
     test_kernel_stacks_use_an_early_fixed_slot_pool()
     print("physical memory source invariants hold")
 

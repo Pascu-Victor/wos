@@ -247,57 +247,38 @@ def test_nonfixed_mmap_address_selection_is_reserved_before_mapping() -> None:
 
 def test_owned_frame_tracking_is_disabled_off_the_fault_path() -> None:
     source = VIRT_CPP.read_text()
-    insert_body = function_body(source, "owned_frame_insert_private_mapping")
-    untrack_body = function_body(source, "owned_frame_untrack_mapping")
-    purge_body = function_body(source, "owned_frame_purge_pagemap")
     snapshot_body = function_body(source, "get_owned_frame_stats_snapshot")
 
     require_tokens(source, ["constexpr bool OWNED_FRAME_TRACKING_ENABLED = false;"], "owned frame tracking switch")
     require_tokens(
-        insert_body,
+        (ROOT / "modules/kern/src/test/mm_ktest.cpp").read_text(),
         [
-            "if constexpr (!OWNED_FRAME_TRACKING_ENABLED)",
-            "owned_frame_stats.track_skipped.fetch_add(1, std::memory_order_relaxed);",
-            "return;",
+            "KEXPECT_EQ(after_map.track_attempts, before.track_attempts);",
+            "KEXPECT_EQ(after_map.track_skipped, before.track_skipped);",
+            "KEXPECT_EQ(after_unmap.untrack_missed, after_map.untrack_missed);",
         ],
-        "owned frame insert disabled path",
+        "disabled owned-frame tracking KTEST contract",
     )
-    require_order(
-        insert_body,
-        "if constexpr (!OWNED_FRAME_TRACKING_ENABLED)",
-        "auto& table = owned_frame_table",
-        "owned frame insert must skip shard locks while disabled",
-    )
-
-    require_tokens(
-        untrack_body,
-        [
-            "owned_frame_stats.untrack_attempts.fetch_add(1, std::memory_order_relaxed);",
-            "if constexpr (!OWNED_FRAME_TRACKING_ENABLED)",
-            "owned_frame_stats.untrack_missed.fetch_add(1, std::memory_order_relaxed);",
-            "return;",
-        ],
-        "owned frame untrack disabled path",
-    )
-    require_order(
-        untrack_body,
-        "if constexpr (!OWNED_FRAME_TRACKING_ENABLED)",
-        "auto& table = owned_frame_table",
-        "owned frame untrack must skip shard locks while disabled",
-    )
-
-    require_order(
-        purge_body,
-        "owned_frame_stats.purge_calls.fetch_add(1, std::memory_order_relaxed);",
-        "if constexpr (!OWNED_FRAME_TRACKING_ENABLED)",
-        "owned frame purge must preserve the call counter before returning",
-    )
-    require_order(
-        purge_body,
-        "if constexpr (!OWNED_FRAME_TRACKING_ENABLED)",
-        "auto& table = owned_frame_table",
-        "owned frame purge must skip table scans while disabled",
-    )
+    early_return_entrypoints = {
+        "owned_frame_insert_private_mapping": "auto& table = owned_frame_table",
+        "owned_frame_track_private_mapping": "uint64_t const PHYS_ADDR",
+        "owned_frame_track_fresh_normal_mapping": "uint64_t const PHYS_ADDR",
+        "owned_frame_untrack_mapping": "owned_frame_stats.untrack_attempts.fetch_add",
+        "owned_frame_untrack_leaf": "if (entry.frame == 0)",
+        "owned_frame_refresh_leaf": "if (entry.present == 0",
+        "owned_frame_purge_pagemap": "owned_frame_stats.purge_calls.fetch_add",
+    }
+    for function_name, expensive_token in early_return_entrypoints.items():
+        body = function_body(source, function_name)
+        require_ordered_tokens(
+            body,
+            [
+                "if constexpr (!OWNED_FRAME_TRACKING_ENABLED)",
+                "return;",
+                expensive_token,
+            ],
+            f"{function_name} disabled fast path",
+        )
     require_tokens(
         snapshot_body,
         [".capacity = OWNED_FRAME_TRACKING_ENABLED ? OWNED_FRAME_TABLE_CAPACITY : 0,"],

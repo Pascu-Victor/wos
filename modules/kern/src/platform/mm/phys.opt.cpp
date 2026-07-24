@@ -24,6 +24,7 @@
 #include "platform/asm/tlb.hpp"
 #include "platform/dbg/dbg.hpp"
 #include "platform/init/limine_requests.hpp"
+#include "platform/interrupt/gdt.hpp"
 #include "platform/mm/addr.hpp"
 #include "platform/mm/dyn/kmalloc.hpp"
 #include "platform/mm/mm.hpp"
@@ -280,30 +281,57 @@ auto range_overlaps(PhysRange a, PhysRange b) -> bool { return a.base < b.end &&
 
 auto accounted_pages(uint64_t bytes) -> uint64_t { return bytes / paging::PAGE_SIZE; }
 
-std::atomic<uint64_t> page_ref_inc_ops{0};                     // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-std::atomic<uint64_t> page_ref_inc_cas_retries{0};             // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-std::atomic<uint64_t> page_ref_add_ops{0};                     // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-std::atomic<uint64_t> page_ref_add_refs{0};                    // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-std::atomic<uint64_t> page_ref_add_cas_retries{0};             // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-std::atomic<uint64_t> page_ref_dec_ops{0};                     // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-std::atomic<uint64_t> page_ref_dec_cas_retries{0};             // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-std::atomic<uint64_t> page_ref_dec_zero_candidates{0};         // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-std::atomic<uint64_t> page_ref_dec_zero_pages_freed{0};        // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-std::atomic<uint64_t> page_ref_dec_zero_validation_failed{0};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-std::atomic<uint64_t> page_ref_batch_calls{0};                 // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-std::atomic<uint64_t> page_ref_batch_pages{0};                 // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-std::atomic<uint64_t> page_ref_batch_zero_candidates{0};       // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-std::atomic<uint64_t> page_ref_batch_free_runs{0};             // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-std::atomic<uint64_t> page_ref_batch_pages_freed{0};           // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-std::atomic<uint64_t> page_cache_alloc_hits{0};                // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-std::atomic<uint64_t> page_cache_alloc_misses{0};              // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-std::atomic<uint64_t> page_cache_refill_calls{0};              // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-std::atomic<uint64_t> page_cache_refill_pages{0};              // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-std::atomic<uint64_t> page_cache_free_hits{0};                 // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-std::atomic<uint64_t> page_cache_free_misses{0};               // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-std::atomic<uint64_t> page_cache_drain_calls{0};               // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-std::atomic<uint64_t> page_cache_drain_pages{0};               // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-std::atomic<uint64_t> page_cache_stale_entries{0};             // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+struct alignas(64) PageRefStatsCounters {
+    std::atomic<uint64_t> inc_ops{0};
+    std::atomic<uint64_t> inc_cas_retries{0};
+    std::atomic<uint64_t> add_ops{0};
+    std::atomic<uint64_t> add_refs{0};
+    std::atomic<uint64_t> add_cas_retries{0};
+    std::atomic<uint64_t> dec_ops{0};
+    std::atomic<uint64_t> dec_cas_retries{0};
+    std::atomic<uint64_t> dec_zero_candidates{0};
+    std::atomic<uint64_t> dec_zero_pages_freed{0};
+    std::atomic<uint64_t> dec_zero_validation_failed{0};
+    std::atomic<uint64_t> batch_calls{0};
+    std::atomic<uint64_t> batch_pages{0};
+    std::atomic<uint64_t> batch_zero_candidates{0};
+    std::atomic<uint64_t> batch_free_runs{0};
+    std::atomic<uint64_t> batch_pages_freed{0};
+};
+
+// Keep diagnostic writes on CPU-private cache lines so page refcounting does
+// not serialize on a global statistics line.
+constexpr size_t PAGE_REF_STATS_CPU_CAPACITY = desc::gdt::MAX_CPUS;
+static_assert(sizeof(PageRefStatsCounters) % 64 == 0);
+std::array<PageRefStatsCounters, PAGE_REF_STATS_CPU_CAPACITY>
+    page_ref_stats_by_cpu{};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+
+auto page_ref_stats_for_current_cpu() -> PageRefStatsCounters& {
+    size_t cpu_id = 0;
+    if (per_cpu_ready.load(std::memory_order_acquire)) {
+        cpu_id = static_cast<size_t>(cpu::current_cpu());
+    }
+    if (cpu_id >= page_ref_stats_by_cpu.size()) {
+        cpu_id = 0;
+    }
+    return page_ref_stats_by_cpu[cpu_id];
+}
+
+struct alignas(64) PageCacheStatsCounters {
+    std::atomic<uint64_t> alloc_hits{0};
+    std::atomic<uint64_t> alloc_misses{0};
+    std::atomic<uint64_t> refill_calls{0};
+    std::atomic<uint64_t> refill_pages{0};
+    std::atomic<uint64_t> free_hits{0};
+    std::atomic<uint64_t> free_misses{0};
+    std::atomic<uint64_t> drain_calls{0};
+    std::atomic<uint64_t> drain_pages{0};
+    std::atomic<uint64_t> stale_entries{0};
+};
+
+static_assert(sizeof(PageCacheStatsCounters) % 64 == 0);
+std::array<PageCacheStatsCounters, desc::gdt::MAX_CPUS>
+    page_cache_stats_by_cpu{};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
 auto total_cached_order0_pages_snapshot() -> uint64_t {
     uint64_t total = 0;
@@ -1275,13 +1303,13 @@ void prepare_allocated_block(void* block, uint64_t size, ReturnedPageZeroing zer
     }
 }
 
-void drain_per_cpu_cache_locked(PerCpuPageCache& cache, size_t max_pages) {
+void drain_per_cpu_cache_locked(PerCpuPageCache& cache, PageCacheStatsCounters& stats, size_t max_pages) {
     size_t drained = 0;
     while (cache.count > 0 && drained < max_pages) {
         CachedOrder0Page const ENTRY = cache.pages[--cache.count];
         cache.pages[cache.count] = {};
         if (ENTRY.allocator == nullptr) {
-            page_cache_stale_entries.fetch_add(1, std::memory_order_relaxed);
+            stats.stale_entries.fetch_add(1, std::memory_order_relaxed);
             continue;
         }
 
@@ -1292,23 +1320,23 @@ void drain_per_cpu_cache_locked(PerCpuPageCache& cache, size_t max_pages) {
             drained++;
             continue;
         }
-        page_cache_stale_entries.fetch_add(1, std::memory_order_relaxed);
+        stats.stale_entries.fetch_add(1, std::memory_order_relaxed);
     }
 
     if (drained != 0) {
-        page_cache_drain_calls.fetch_add(1, std::memory_order_relaxed);
-        page_cache_drain_pages.fetch_add(drained, std::memory_order_relaxed);
+        stats.drain_calls.fetch_add(1, std::memory_order_relaxed);
+        stats.drain_pages.fetch_add(drained, std::memory_order_relaxed);
     }
 }
 
-void refill_per_cpu_cache_locked(PerCpuPageCache& cache) {
+void refill_per_cpu_cache_locked(PerCpuPageCache& cache, PageCacheStatsCounters& stats) {
     if (cache.count >= cache.pages.size()) {
         return;
     }
 
     size_t const TARGET = std::min(cache.pages.size(), cache.count + PerCpuPageCache::REFILL_BATCH);
     size_t refilled = 0;
-    page_cache_refill_calls.fetch_add(1, std::memory_order_relaxed);
+    stats.refill_calls.fetch_add(1, std::memory_order_relaxed);
     for (paging::PageZone* zone = zones; zone != nullptr && cache.count < TARGET; zone = zone->next) {
         if (zone->allocator == nullptr) {
             continue;
@@ -1331,7 +1359,7 @@ void refill_per_cpu_cache_locked(PerCpuPageCache& cache) {
     }
 
     if (refilled != 0) {
-        page_cache_refill_pages.fetch_add(refilled, std::memory_order_relaxed);
+        stats.refill_pages.fetch_add(refilled, std::memory_order_relaxed);
     }
 }
 
@@ -1346,9 +1374,10 @@ auto try_alloc_from_per_cpu_cache(uint64_t caller_tag, ReturnedPageZeroing zeroi
     }
 
     PerCpuPageCache& cache = per_cpu_caches[CPU_ID];
+    auto& cache_stats = page_cache_stats_by_cpu[CPU_ID];
     uint64_t const CACHE_FLAGS = cache.lock.lock_irqsave();
     if (cache.count == 0) {
-        refill_per_cpu_cache_locked(cache);
+        refill_per_cpu_cache_locked(cache, cache_stats);
     }
 
     void* page = nullptr;
@@ -1361,17 +1390,17 @@ auto try_alloc_from_per_cpu_cache(uint64_t caller_tag, ReturnedPageZeroing zeroi
             ENTRY.allocator->unlock_irq(FLAGS);
         }
         if (page == nullptr) {
-            page_cache_stale_entries.fetch_add(1, std::memory_order_relaxed);
+            cache_stats.stale_entries.fetch_add(1, std::memory_order_relaxed);
         }
     }
     cache.lock.unlock_irqrestore(CACHE_FLAGS);
 
     if (page == nullptr) {
-        page_cache_alloc_misses.fetch_add(1, std::memory_order_relaxed);
+        cache_stats.alloc_misses.fetch_add(1, std::memory_order_relaxed);
         return nullptr;
     }
 
-    page_cache_alloc_hits.fetch_add(1, std::memory_order_relaxed);
+    cache_stats.alloc_hits.fetch_add(1, std::memory_order_relaxed);
     note_physical_alloc(paging::PAGE_SIZE);
 
     prepare_allocated_block(page, paging::PAGE_SIZE, zeroing);
@@ -1396,9 +1425,10 @@ auto try_cache_freed_order0_page(PageAllocator* allocator, void* page) -> bool {
     }
 
     PerCpuPageCache& cache = per_cpu_caches[CPU_ID];
+    auto& cache_stats = page_cache_stats_by_cpu[CPU_ID];
     uint64_t const CACHE_FLAGS = cache.lock.lock_irqsave();
     if (cache.count >= cache.pages.size()) {
-        drain_per_cpu_cache_locked(cache, PerCpuPageCache::DRAIN_BATCH);
+        drain_per_cpu_cache_locked(cache, cache_stats, PerCpuPageCache::DRAIN_BATCH);
     }
 
     bool cached = false;
@@ -1417,11 +1447,11 @@ auto try_cache_freed_order0_page(PageAllocator* allocator, void* page) -> bool {
     cache.lock.unlock_irqrestore(CACHE_FLAGS);
 
     if (!cached) {
-        page_cache_free_misses.fetch_add(1, std::memory_order_relaxed);
+        cache_stats.free_misses.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
 
-    page_cache_free_hits.fetch_add(1, std::memory_order_relaxed);
+    cache_stats.free_hits.fetch_add(1, std::memory_order_relaxed);
     note_physical_free(paging::PAGE_SIZE);
     return true;
 }
@@ -1972,7 +2002,8 @@ void page_ref_inc(void* page, PageLookupHint* hint) {
         return;
     }
 
-    page_ref_inc_ops.fetch_add(1, std::memory_order_relaxed);
+    auto& ref_stats = page_ref_stats_for_current_cpu();
+    ref_stats.inc_ops.fetch_add(1, std::memory_order_relaxed);
     auto& refcount = alloc->page_refcounts[idx];
     uint32_t old_ref = refcount.load(std::memory_order_acquire);
     for (;;) {
@@ -1987,7 +2018,7 @@ void page_ref_inc(void* page, PageLookupHint* hint) {
         if (refcount.compare_exchange_weak(old_ref, old_ref + 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
             return;
         }
-        page_ref_inc_cas_retries.fetch_add(1, std::memory_order_relaxed);
+        ref_stats.inc_cas_retries.fetch_add(1, std::memory_order_relaxed);
     }
 }
 
@@ -2008,8 +2039,9 @@ void page_ref_add(void* page, uint64_t refs, PageLookupHint* hint) {
         return;
     }
 
-    page_ref_add_ops.fetch_add(1, std::memory_order_relaxed);
-    page_ref_add_refs.fetch_add(refs, std::memory_order_relaxed);
+    auto& ref_stats = page_ref_stats_for_current_cpu();
+    ref_stats.add_ops.fetch_add(1, std::memory_order_relaxed);
+    ref_stats.add_refs.fetch_add(refs, std::memory_order_relaxed);
     auto& refcount = alloc->page_refcounts[idx];
     uint32_t old_ref = refcount.load(std::memory_order_acquire);
     auto const ADD_REFS = static_cast<uint32_t>(refs);
@@ -2025,7 +2057,7 @@ void page_ref_add(void* page, uint64_t refs, PageLookupHint* hint) {
         if (refcount.compare_exchange_weak(old_ref, old_ref + ADD_REFS, std::memory_order_acq_rel, std::memory_order_acquire)) {
             return;
         }
-        page_ref_add_cas_retries.fetch_add(1, std::memory_order_relaxed);
+        ref_stats.add_cas_retries.fetch_add(1, std::memory_order_relaxed);
     }
 }
 
@@ -2046,7 +2078,8 @@ auto page_ref_dec_atomic(void* page, uint32_t& new_ref, ZeroRefPage& zero_ref_pa
         return false;
     }
 
-    page_ref_dec_ops.fetch_add(1, std::memory_order_relaxed);
+    auto& ref_stats = page_ref_stats_for_current_cpu();
+    ref_stats.dec_ops.fetch_add(1, std::memory_order_relaxed);
     auto& refcount = alloc->page_refcounts[idx];
     uint32_t old_ref = refcount.load(std::memory_order_acquire);
     while (old_ref > 0) {
@@ -2054,7 +2087,7 @@ auto page_ref_dec_atomic(void* page, uint32_t& new_ref, ZeroRefPage& zero_ref_pa
         if (refcount.compare_exchange_weak(old_ref, NEXT_REF, std::memory_order_acq_rel, std::memory_order_acquire)) {
             new_ref = NEXT_REF;
             if (NEXT_REF == 0) {
-                page_ref_dec_zero_candidates.fetch_add(1, std::memory_order_relaxed);
+                ref_stats.dec_zero_candidates.fetch_add(1, std::memory_order_relaxed);
                 zero_ref_page = ZeroRefPage{
                     .page = page,
                     .alloc = alloc,
@@ -2063,7 +2096,7 @@ auto page_ref_dec_atomic(void* page, uint32_t& new_ref, ZeroRefPage& zero_ref_pa
             }
             return true;
         }
-        page_ref_dec_cas_retries.fetch_add(1, std::memory_order_relaxed);
+        ref_stats.dec_cas_retries.fetch_add(1, std::memory_order_relaxed);
     }
 
     new_ref = 0;
@@ -2172,10 +2205,11 @@ void note_zero_ref_pages_freed(uint64_t freed_bytes, uint64_t release_operations
     uint64_t const PAGES_FREED = freed_bytes / paging::PAGE_SIZE;
     note_physical_free(freed_bytes, release_operations);
     stats.pages_freed += PAGES_FREED;
-    page_ref_dec_zero_pages_freed.fetch_add(PAGES_FREED, std::memory_order_relaxed);
+    auto& ref_stats = page_ref_stats_for_current_cpu();
+    ref_stats.dec_zero_pages_freed.fetch_add(PAGES_FREED, std::memory_order_relaxed);
     if (batch_mode) {
-        page_ref_batch_free_runs.fetch_add(1, std::memory_order_relaxed);
-        page_ref_batch_pages_freed.fetch_add(PAGES_FREED, std::memory_order_relaxed);
+        ref_stats.batch_free_runs.fetch_add(1, std::memory_order_relaxed);
+        ref_stats.batch_pages_freed.fetch_add(PAGES_FREED, std::memory_order_relaxed);
     }
 }
 
@@ -2184,6 +2218,7 @@ void free_zero_ref_pages(std::span<ZeroRefPage const> pages, PageRefBatchStats& 
         return;
     }
 
+    auto& ref_stats = page_ref_stats_for_current_cpu();
     size_t i = 0;
     while (i < pages.size()) {
         PageAllocator* const ALLOC = pages[i].alloc;
@@ -2202,7 +2237,7 @@ void free_zero_ref_pages(std::span<ZeroRefPage const> pages, PageRefBatchStats& 
         while (group_i < group_end) {
             size_t const RUN_COUNT = count_contiguous_zero_ref_run_locked(pages, group_i);
             if (RUN_COUNT == 0) {
-                page_ref_dec_zero_validation_failed.fetch_add(1, std::memory_order_relaxed);
+                ref_stats.dec_zero_validation_failed.fetch_add(1, std::memory_order_relaxed);
                 group_i++;
                 continue;
             }
@@ -2220,7 +2255,7 @@ void free_zero_ref_pages(std::span<ZeroRefPage const> pages, PageRefBatchStats& 
                 if (free_zero_ref_page_locked(pages[group_i + j], freed_bytes)) {
                     note_zero_ref_pages_freed(freed_bytes, 1, stats, batch_mode);
                 } else {
-                    page_ref_dec_zero_validation_failed.fetch_add(1, std::memory_order_relaxed);
+                    ref_stats.dec_zero_validation_failed.fetch_add(1, std::memory_order_relaxed);
                 }
             }
             group_i += RUN_COUNT;
@@ -2263,8 +2298,9 @@ auto page_ref_dec_batch(std::span<void* const> pages) -> PageRefBatchStats { ret
 
 auto page_ref_dec_batch(std::span<void* const> pages, PageLookupHint* hint) -> PageRefBatchStats {
     PageRefBatchStats stats{};
-    page_ref_batch_calls.fetch_add(1, std::memory_order_relaxed);
-    page_ref_batch_pages.fetch_add(pages.size(), std::memory_order_relaxed);
+    auto& ref_stats = page_ref_stats_for_current_cpu();
+    ref_stats.batch_calls.fetch_add(1, std::memory_order_relaxed);
+    ref_stats.batch_pages.fetch_add(pages.size(), std::memory_order_relaxed);
     if (pages.empty()) {
         return stats;
     }
@@ -2303,7 +2339,7 @@ auto page_ref_dec_batch(std::span<void* const> pages, PageLookupHint* hint) -> P
         if (zero_ref_page.page == nullptr) {
             continue;
         }
-        page_ref_batch_zero_candidates.fetch_add(1, std::memory_order_relaxed);
+        ref_stats.batch_zero_candidates.fetch_add(1, std::memory_order_relaxed);
         verify_zero_ref_page_is_releasable(zero_ref_page, "page_ref_dec_batch");
         zero_ref_pages[zero_ref_count++] = zero_ref_page;
         if (zero_ref_count >= zero_ref_pages.size()) {
@@ -2318,40 +2354,48 @@ auto page_ref_dec_batch(std::span<void* const> pages, PageLookupHint* hint) -> P
 }
 
 void get_page_ref_stats_snapshot(PageRefStatsSnapshot& out) {
-    out = PageRefStatsSnapshot{
-        .inc_ops = page_ref_inc_ops.load(std::memory_order_relaxed),
-        .inc_cas_retries = page_ref_inc_cas_retries.load(std::memory_order_relaxed),
-        .add_ops = page_ref_add_ops.load(std::memory_order_relaxed),
-        .add_refs = page_ref_add_refs.load(std::memory_order_relaxed),
-        .add_cas_retries = page_ref_add_cas_retries.load(std::memory_order_relaxed),
-        .dec_ops = page_ref_dec_ops.load(std::memory_order_relaxed),
-        .dec_cas_retries = page_ref_dec_cas_retries.load(std::memory_order_relaxed),
-        .dec_zero_candidates = page_ref_dec_zero_candidates.load(std::memory_order_relaxed),
-        .dec_zero_pages_freed = page_ref_dec_zero_pages_freed.load(std::memory_order_relaxed),
-        .dec_zero_validation_failed = page_ref_dec_zero_validation_failed.load(std::memory_order_relaxed),
-        .batch_calls = page_ref_batch_calls.load(std::memory_order_relaxed),
-        .batch_pages = page_ref_batch_pages.load(std::memory_order_relaxed),
-        .batch_zero_candidates = page_ref_batch_zero_candidates.load(std::memory_order_relaxed),
-        .batch_free_runs = page_ref_batch_free_runs.load(std::memory_order_relaxed),
-        .batch_pages_freed = page_ref_batch_pages_freed.load(std::memory_order_relaxed),
-    };
+    out = {};
+    size_t cpu_count = std::max<size_t>(num_cpus, 1);
+    cpu_count = std::min(cpu_count, page_ref_stats_by_cpu.size());
+    for (size_t cpu_id = 0; cpu_id < cpu_count; ++cpu_id) {
+        auto const& stats = page_ref_stats_by_cpu[cpu_id];
+        out.inc_ops += stats.inc_ops.load(std::memory_order_relaxed);
+        out.inc_cas_retries += stats.inc_cas_retries.load(std::memory_order_relaxed);
+        out.add_ops += stats.add_ops.load(std::memory_order_relaxed);
+        out.add_refs += stats.add_refs.load(std::memory_order_relaxed);
+        out.add_cas_retries += stats.add_cas_retries.load(std::memory_order_relaxed);
+        out.dec_ops += stats.dec_ops.load(std::memory_order_relaxed);
+        out.dec_cas_retries += stats.dec_cas_retries.load(std::memory_order_relaxed);
+        out.dec_zero_candidates += stats.dec_zero_candidates.load(std::memory_order_relaxed);
+        out.dec_zero_pages_freed += stats.dec_zero_pages_freed.load(std::memory_order_relaxed);
+        out.dec_zero_validation_failed += stats.dec_zero_validation_failed.load(std::memory_order_relaxed);
+        out.batch_calls += stats.batch_calls.load(std::memory_order_relaxed);
+        out.batch_pages += stats.batch_pages.load(std::memory_order_relaxed);
+        out.batch_zero_candidates += stats.batch_zero_candidates.load(std::memory_order_relaxed);
+        out.batch_free_runs += stats.batch_free_runs.load(std::memory_order_relaxed);
+        out.batch_pages_freed += stats.batch_pages_freed.load(std::memory_order_relaxed);
+    }
 }
 
 void get_page_cache_stats_snapshot(PageCacheStatsSnapshot& out) {
-    out = PageCacheStatsSnapshot{
-        .enabled = per_cpu_page_cache_enabled() ? 1U : 0U,
-        .capacity = per_cpu_caches != nullptr ? static_cast<uint64_t>(num_cpus * PerCpuPageCache::CACHE_SIZE) : 0U,
-        .cached_pages = total_cached_order0_pages_snapshot(),
-        .alloc_hits = page_cache_alloc_hits.load(std::memory_order_relaxed),
-        .alloc_misses = page_cache_alloc_misses.load(std::memory_order_relaxed),
-        .refill_calls = page_cache_refill_calls.load(std::memory_order_relaxed),
-        .refill_pages = page_cache_refill_pages.load(std::memory_order_relaxed),
-        .free_hits = page_cache_free_hits.load(std::memory_order_relaxed),
-        .free_misses = page_cache_free_misses.load(std::memory_order_relaxed),
-        .drain_calls = page_cache_drain_calls.load(std::memory_order_relaxed),
-        .drain_pages = page_cache_drain_pages.load(std::memory_order_relaxed),
-        .stale_entries = page_cache_stale_entries.load(std::memory_order_relaxed),
-    };
+    out = {};
+    out.enabled = per_cpu_page_cache_enabled() ? 1U : 0U;
+    out.capacity = per_cpu_caches != nullptr ? static_cast<uint64_t>(num_cpus * PerCpuPageCache::CACHE_SIZE) : 0U;
+    out.cached_pages = total_cached_order0_pages_snapshot();
+    size_t cpu_count = std::max<size_t>(num_cpus, 1);
+    cpu_count = std::min(cpu_count, page_cache_stats_by_cpu.size());
+    for (size_t cpu_id = 0; cpu_id < cpu_count; ++cpu_id) {
+        auto const& stats = page_cache_stats_by_cpu[cpu_id];
+        out.alloc_hits += stats.alloc_hits.load(std::memory_order_relaxed);
+        out.alloc_misses += stats.alloc_misses.load(std::memory_order_relaxed);
+        out.refill_calls += stats.refill_calls.load(std::memory_order_relaxed);
+        out.refill_pages += stats.refill_pages.load(std::memory_order_relaxed);
+        out.free_hits += stats.free_hits.load(std::memory_order_relaxed);
+        out.free_misses += stats.free_misses.load(std::memory_order_relaxed);
+        out.drain_calls += stats.drain_calls.load(std::memory_order_relaxed);
+        out.drain_pages += stats.drain_pages.load(std::memory_order_relaxed);
+        out.stale_entries += stats.stale_entries.load(std::memory_order_relaxed);
+    }
 }
 
 auto page_ref_get(void* page) -> uint32_t { return page_ref_get(page, nullptr); }
