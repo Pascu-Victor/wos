@@ -389,8 +389,9 @@ def test_balanced_placement_scores_all_healthy_systems() -> None:
             "g_balanced_local_reservations = 0",
             "balanced_memory_eligible(local_free_mem)",
             "!balanced_memory_eligible(rl.free_mem_pages)",
-            "std::max<uint64_t>(local_runnable, g_balanced_local_reservations)",
-            "static_cast<uint64_t>(rl.balanced_assignments)",
+            "uint64_t const LOCAL_PRESSURE = g_balanced_local_reservations",
+            "uint64_t const KNOWN_ACTIVE = active_submitted_tasks_for_node_locked(rl.node_id)",
+            "std::max<uint64_t>(KNOWN_ACTIVE, rl.balanced_assignments)",
             "peer->state != PeerState::CONNECTED",
             "balanced_candidate_is_starved",
             "eligible_capacity",
@@ -407,7 +408,7 @@ def test_balanced_placement_scores_all_healthy_systems() -> None:
         spawn,
         [
             "WKI_TARGET_FLAG_BALANCED",
-            "BalancedPlacement const PLACEMENT = wki_balanced_node(LOCAL_LOAD, LOCAL_CPUS, LOCAL_RUNNABLE, LOCAL_FREE_MEM)",
+            "BalancedPlacement const PLACEMENT = wki_balanced_node(LOCAL_LOAD, LOCAL_CPUS, LOCAL_FREE_MEM)",
             'log_spawn_diag(task, WkiRemoteSpawnResult::FAILED, "balanced-no-healthy-system")',
             'log_spawn_diag(task, WkiRemoteSpawnResult::LOCAL, "balanced-local")',
         ],
@@ -416,7 +417,7 @@ def test_balanced_placement_scores_all_healthy_systems() -> None:
     balanced_branch = spawn[spawn.index("} else if (BALANCED_PLACEMENT)") :]
     require_order(
         balanced_branch,
-        "BalancedPlacement const PLACEMENT = wki_balanced_node(LOCAL_LOAD, LOCAL_CPUS, LOCAL_RUNNABLE, LOCAL_FREE_MEM)",
+        "BalancedPlacement const PLACEMENT = wki_balanced_node(LOCAL_LOAD, LOCAL_CPUS, LOCAL_FREE_MEM)",
         "if (!PLACEMENT.found)",
         "balanced placement must reject an empty healthy candidate set",
     )

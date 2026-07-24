@@ -2147,7 +2147,7 @@ struct BalancedPlacement {
     bool found = false;
 };
 
-auto wki_balanced_node(uint16_t local_load, uint16_t local_cpus, uint16_t local_runnable, uint16_t local_free_mem) -> BalancedPlacement;
+auto wki_balanced_node(uint16_t local_load, uint16_t local_cpus, uint16_t local_free_mem) -> BalancedPlacement;
 void wki_release_preferred_remote_node(uint16_t node_id);
 void wki_rollback_balanced_remote_assignment(uint16_t node_id);
 
@@ -2446,12 +2446,10 @@ auto wki_try_remote_spawn(ker::mod::sched::task::Task* task, const WkiRemoteSpaw
     } else if (BALANCED_PLACEMENT) {
         uint16_t const LOCAL_LOAD = compute_local_load();
         uint16_t const LOCAL_CPUS = std::max<uint16_t>(static_cast<uint16_t>(ker::mod::smt::get_core_count()), 1);
-        uint16_t const LOCAL_RUNNABLE =
-            static_cast<uint16_t>(std::min<uint32_t>(ker::mod::sched::get_load_average_snapshot().runnable_tasks, UINT16_MAX));
         uint16_t const LOCAL_FREE_MEM =
             static_cast<uint16_t>(std::min<uint64_t>(ker::mod::mm::phys::get_free_mem_pages() / 256ULL, UINT16_MAX));
         s_compute_lock.lock();
-        BalancedPlacement const PLACEMENT = wki_balanced_node(LOCAL_LOAD, LOCAL_CPUS, LOCAL_RUNNABLE, LOCAL_FREE_MEM);
+        BalancedPlacement const PLACEMENT = wki_balanced_node(LOCAL_LOAD, LOCAL_CPUS, LOCAL_FREE_MEM);
         s_compute_lock.unlock();
         if (!PLACEMENT.found) {
             log_spawn_diag(task, WkiRemoteSpawnResult::FAILED, "balanced-no-healthy-system");
@@ -3766,7 +3764,7 @@ auto balanced_memory_pressure(uint16_t free_mem) -> uint64_t {
 auto balanced_placement_score(uint16_t load_pct, uint16_t num_cpus, uint16_t free_mem, uint64_t inflight) -> uint64_t {
     uint64_t const CPUS = std::max<uint64_t>(num_cpus, 1);
     uint64_t const INFLIGHT_PRESSURE = (inflight * 1000ULL) / CPUS;
-    return static_cast<uint64_t>(load_pct) + INFLIGHT_PRESSURE + balanced_memory_pressure(free_mem);
+    return std::max<uint64_t>(load_pct, INFLIGHT_PRESSURE) + balanced_memory_pressure(free_mem);
 }
 
 auto balanced_candidate_is_starved(uint64_t assignment_seq, uint64_t last_assignment_seq, uint64_t eligible_capacity) -> bool {
@@ -3774,10 +3772,16 @@ auto balanced_candidate_is_starved(uint64_t assignment_seq, uint64_t last_assign
 }
 
 // s_compute_lock must be held by caller. WKI_NODE_INVALID denotes the local
-// node. Both local and remote selections retain capacity-normalized assignment
-// debt until their next measured load sample. A failed remote submission rolls
-// its debt back through BalancedRemoteAssignment.
-auto wki_balanced_node(uint16_t local_load, uint16_t local_cpus, uint16_t local_runnable, uint16_t local_free_mem) -> BalancedPlacement {
+// node. Measured CPU utilization accounts for work that is actually consuming
+// a system, while sample-window assignment debt bridges the delay until the
+// next load report. Accepted remote submissions also bridge a report that
+// resets assignment debt before those tasks finish. Use the larger signal
+// rather than adding both: runnable placement controllers and accepted tasks
+// otherwise describe the same future CPU work twice and make an idle submitter
+// look saturated during a burst. A failed remote submission rolls its debt
+// back through
+// BalancedRemoteAssignment.
+auto wki_balanced_node(uint16_t local_load, uint16_t local_cpus, uint16_t local_free_mem) -> BalancedPlacement {
     if (g_balanced_local_sample_us != g_cached_local_load_update_us) {
         g_balanced_local_sample_us = g_cached_local_load_update_us;
         g_balanced_local_reservations = 0;
@@ -3792,7 +3796,7 @@ auto wki_balanced_node(uint16_t local_load, uint16_t local_cpus, uint16_t local_
     std::array<Candidate, WKI_MAX_PEERS + 1> eligible = {};
     size_t eligible_count = 0;
     uint64_t eligible_capacity = 0;
-    uint64_t const LOCAL_PRESSURE = std::max<uint64_t>(local_runnable, g_balanced_local_reservations);
+    uint64_t const LOCAL_PRESSURE = g_balanced_local_reservations;
     if (balanced_memory_eligible(local_free_mem)) {
         eligible.at(eligible_count++) = {
             .node_id = WKI_NODE_INVALID,
@@ -3813,8 +3817,7 @@ auto wki_balanced_node(uint16_t local_load, uint16_t local_cpus, uint16_t local_
             continue;
         }
         uint64_t const KNOWN_ACTIVE = active_submitted_tasks_for_node_locked(rl.node_id);
-        uint64_t const REMOTE_PRESSURE =
-            std::max({static_cast<uint64_t>(rl.runnable_tasks), KNOWN_ACTIVE, static_cast<uint64_t>(rl.balanced_assignments)});
+        uint64_t const REMOTE_PRESSURE = std::max<uint64_t>(KNOWN_ACTIVE, rl.balanced_assignments);
         uint64_t const SCORE = balanced_placement_score(rl.avg_load_pct, rl.num_cpus, rl.free_mem_pages, REMOTE_PRESSURE);
         if (eligible_count < eligible.size()) {
             eligible.at(eligible_count++) = {
@@ -4636,11 +4639,13 @@ auto wki_remote_compute_selftest_balanced_score_accounts_for_capacity() -> bool 
     uint64_t const IDLE = balanced_placement_score(100, 8, 4096, 0);
     uint64_t const ONE_ACTIVE = balanced_placement_score(100, 8, 4096, 1);
     uint64_t const FOUR_CPU_ACTIVE = balanced_placement_score(100, 4, 4096, 1);
+    uint64_t const OBSERVED_BUSY = balanced_placement_score(500, 8, 4096, 0);
+    uint64_t const BUSY_WITH_SMALL_DEBT = balanced_placement_score(500, 8, 4096, 1);
     uint64_t const MEMORY_PRESSURE = balanced_placement_score(100, 8, WKI_BALANCED_FREE_MEM_RESERVE, 0);
 
-    return ONE_ACTIVE > IDLE && FOUR_CPU_ACTIVE > ONE_ACTIVE && MEMORY_PRESSURE > IDLE && balanced_candidate_is_starved(36, 0, 36) &&
-           !balanced_candidate_is_starved(35, 0, 36) && balanced_memory_eligible(WKI_BALANCED_FREE_MEM_RESERVE) &&
-           !balanced_memory_eligible(WKI_BALANCED_FREE_MEM_RESERVE - 1);
+    return ONE_ACTIVE > IDLE && FOUR_CPU_ACTIVE > ONE_ACTIVE && BUSY_WITH_SMALL_DEBT == OBSERVED_BUSY && MEMORY_PRESSURE > IDLE &&
+           balanced_candidate_is_starved(36, 0, 36) && !balanced_candidate_is_starved(35, 0, 36) &&
+           balanced_memory_eligible(WKI_BALANCED_FREE_MEM_RESERVE) && !balanced_memory_eligible(WKI_BALANCED_FREE_MEM_RESERVE - 1);
 }
 
 auto wki_remote_compute_selftest_submit_policy_scope_restores_worker() -> bool {
