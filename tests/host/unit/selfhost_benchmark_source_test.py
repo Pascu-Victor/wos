@@ -4,6 +4,7 @@ import csv
 import hashlib
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -68,6 +69,7 @@ def test_selfhost_runner_covers_acceptance_flow() -> None:
             'WOS_DISTRIBUTED_COMPILER_STATE="$distributed_compiler_state"',
             'distributed_compiler_transport="${WOS_SELFHOST_DISTRIBUTED_COMPILER_TRANSPORT:-staged}"',
             'WOS_DISTRIBUTED_COMPILER_TRANSPORT="$distributed_compiler_transport"',
+            'WOS_DISTRIBUTED_COMPILER_STAGE_GENERATION="$distributed_stage_generation"',
             'WOS_DISTRIBUTED_COMPILER_JOBS_PER_HOST="$distributed_jobs_per_host"',
             'WOS_DISTRIBUTED_COMPILER_LOCAL_JOBS="$distributed_local_jobs"',
             'WOS_DISTRIBUTED_COMPILER_PREPROCESS_JOBS="$distributed_preprocess_jobs"',
@@ -103,6 +105,10 @@ def test_selfhost_runner_covers_acceptance_flow() -> None:
             'submodule_cmd+=(--jobs "$jobs" --)',
             'submodule_cmd+=("$path")',
             'run_timed_event "clone" "submodules" run_git_http "${submodule_cmd[@]}"',
+            "set_distributed_stage_generation()",
+            'if [ "${#distributed_stage_generation}" -ne 64 ]; then',
+            "time_step clone_sources clone_sources",
+            "set_distributed_stage_generation",
             "--full-history",
             "full_history=0",
             'jobs="${WOS_SELFHOST_JOBS:-32}"',
@@ -316,6 +322,8 @@ def test_wos_toolchain_stages_sources_before_distributed_compiles() -> None:
             'export WOS_DISTRIBUTED_COMPILER_STAGE_BASE="${WOS_DISTRIBUTED_COMPILER_STAGE_BASE:-$(dirname "$WORKSPACE_ROOT")}"',
             'if [ -z "${WOS_DISTRIBUTED_COMPILER_RETAINED_ROOTS:-}" ]; then',
             'export WOS_DISTRIBUTED_COMPILER_RETAINED_ROOTS="$HOST/lib"$\'\\n\'"$SYSROOT/include"',
+            'if [ -n "${WOS_DISTRIBUTED_COMPILER_STAGE_GENERATION:-}" ] &&',
+            'export WOS_DISTRIBUTED_COMPILER_IMMUTABLE_ROOTS="$B/src/llvm-project"',
             'stage_distributed_compiler_roots "$B/src/mlibc" "$HOST/lib" "$SYSROOT/include"',
             'stage_distributed_compiler_roots "$SYSROOT/include"',
             'stage_distributed_compiler_roots "$B/src/llvm-project/compiler-rt"',
@@ -1228,9 +1236,13 @@ exec {shlex.quote(real_find)} "$@"
         (mock_bin / "on").write_text(
             r'''#!/bin/bash
 set -eu
-[ -e "$WOS_STAGE_MOCK_ARCHIVE_READY_MARKER" ]
 [ "$1" = wos-1 ]
 shift
+if [ "$1" = locally ]; then
+    shift
+    exec "$@"
+fi
+[ -e "$WOS_STAGE_MOCK_ARCHIVE_READY_MARKER" ]
 if [ -n "${WOS_STAGE_MOCK_FAILURE_MARKER:-}" ] &&
     [ ! -e "$WOS_STAGE_MOCK_FAILURE_MARKER" ]; then
     : > "$WOS_STAGE_MOCK_FAILURE_MARKER"
@@ -1255,6 +1267,10 @@ exec "$@"
                 "WOS_DISTRIBUTED_COMPILER_STATE": str(state),
                 "WOS_DISTRIBUTED_COMPILER_STAGE_BASE": str(stage_base),
                 "WOS_DISTRIBUTED_COMPILER_RETAINED_ROOTS": str(retained),
+                "WOS_DISTRIBUTED_COMPILER_STAGE_COMPRESSION": "gzip",
+                "WOS_DISTRIBUTED_COMPILER_STAGE_GENERATION": "fixture-generation",
+                "WOS_DISTRIBUTED_COMPILER_IMMUTABLE_ROOTS": str(root),
+                "WOS_DISTRIBUTED_COMPILER_STAGE_CACHE_DIR": str(temp / "peer-cache"),
                 "WOS_DISTRIBUTED_COMPILER_STAGE_RETRY_DELAY_SECONDS": "0",
                 "WOS_STAGE_MOCK_ARCHIVE_FAILURE_MARKER": str(temp / "archive-failed-once"),
                 "WOS_STAGE_MOCK_ARCHIVE_READY_MARKER": str(temp / "archive-ready"),
@@ -1272,6 +1288,16 @@ exec "$@"
         )
         if result.returncode != 0:
             fail(f"distributed root staging failed: {result.stderr}")
+        timing = re.search(
+            r"\[distributed-stage\] peers=1 roots=2 staged_roots=2 reused_roots=0 bytes=\d+ compression=gzip "
+            r"probe_ms=\d+ snapshot_ms=(\d+) transfer_ms=(\d+) total_ms=(\d+)",
+            result.stdout,
+        )
+        if timing is None:
+            fail(f"distributed root staging omitted timing attribution: {result.stdout!r}")
+        snapshot_ms, transfer_ms, total_ms = map(int, timing.groups())
+        if total_ms < snapshot_ms or total_ms < transfer_ms:
+            fail("distributed root staging reported internally inconsistent timing")
         if "root archive changed during attempt 1/3; retrying" not in result.stderr:
             fail("distributed root staging did not retry a transient local archive mutation")
         validation_log = Path(environment["WOS_STAGE_MOCK_VALIDATION_LOG"])
@@ -1288,6 +1314,88 @@ exec "$@"
         staged_link = linked_dir / "abi-bits"
         if staged_link.is_symlink() or (staged_link / "header.h").read_text(encoding="ascii") != "linked\n":
             fail("distributed root staging did not safely dereference an in-tree relative symlink")
+
+        cache_hit = subprocess.run(
+            [str(STAGE_DISTRIBUTED_ROOTS), str(root), str(retained)],
+            cwd=ROOT,
+            check=False,
+            text=True,
+            capture_output=True,
+            env=environment,
+        )
+        if cache_hit.returncode != 0:
+            fail(f"distributed immutable-root cache hit failed: {cache_hit.stderr}")
+        if not re.search(
+            r"\[distributed-stage\] peers=1 roots=2 staged_roots=1 reused_roots=1 bytes=\d+ compression=gzip ",
+            cache_hit.stdout,
+        ):
+            fail(f"distributed immutable-root cache hit was not attributed: {cache_hit.stdout!r}")
+        if (root / "sentinel").read_text(encoding="ascii") != "staged\n":
+            fail("distributed immutable-root cache hit damaged the retained source")
+
+        validation_count = len(validation_log.read_text(encoding="ascii").splitlines())
+        all_cached = subprocess.run(
+            [str(STAGE_DISTRIBUTED_ROOTS), str(root)],
+            cwd=ROOT,
+            check=False,
+            text=True,
+            capture_output=True,
+            env=environment,
+        )
+        if all_cached.returncode != 0:
+            fail(f"distributed all-immutable cache hit failed: {all_cached.stderr}")
+        if not re.search(
+            r"\[distributed-stage\] peers=1 roots=1 staged_roots=0 reused_roots=1 bytes=0 compression=gzip ",
+            all_cached.stdout,
+        ):
+            fail(f"distributed all-immutable cache hit was not attributed: {all_cached.stdout!r}")
+        if len(validation_log.read_text(encoding="ascii").splitlines()) != validation_count:
+            fail("distributed all-immutable cache hit needlessly traversed the source tree")
+
+        generation_miss_environment = environment.copy()
+        generation_miss_environment["WOS_DISTRIBUTED_COMPILER_STAGE_GENERATION"] = "fixture-generation-next"
+        generation_miss = subprocess.run(
+            [str(STAGE_DISTRIBUTED_ROOTS), str(root)],
+            cwd=ROOT,
+            check=False,
+            text=True,
+            capture_output=True,
+            env=generation_miss_environment,
+        )
+        if generation_miss.returncode != 0:
+            fail(f"distributed immutable-root generation replacement failed: {generation_miss.stderr}")
+        if not re.search(
+            r"\[distributed-stage\] peers=1 roots=1 staged_roots=1 reused_roots=0 bytes=\d+ compression=gzip ",
+            generation_miss.stdout,
+        ):
+            fail(f"distributed immutable-root generation mismatch reused stale data: {generation_miss.stdout!r}")
+
+        auto_environment = environment.copy()
+        auto_environment.pop("WOS_DISTRIBUTED_COMPILER_STAGE_GENERATION")
+        auto_environment.pop("WOS_DISTRIBUTED_COMPILER_IMMUTABLE_ROOTS")
+        auto_environment["WOS_DISTRIBUTED_COMPILER_STAGE_COMPRESSION"] = "auto"
+        auto_environment["WOS_DISTRIBUTED_COMPILER_STAGE_COMPRESSION_THRESHOLD_KIB"] = "1048576"
+        auto_raw = subprocess.run(
+            [str(STAGE_DISTRIBUTED_ROOTS), str(root)],
+            cwd=ROOT,
+            check=False,
+            text=True,
+            capture_output=True,
+            env=auto_environment,
+        )
+        if auto_raw.returncode != 0 or " compression=none " not in auto_raw.stdout:
+            fail(f"distributed small-root automatic compression did not select raw tar: {auto_raw.stdout!r} {auto_raw.stderr!r}")
+        auto_environment["WOS_DISTRIBUTED_COMPILER_STAGE_COMPRESSION_THRESHOLD_KIB"] = "0"
+        auto_gzip = subprocess.run(
+            [str(STAGE_DISTRIBUTED_ROOTS), str(root)],
+            cwd=ROOT,
+            check=False,
+            text=True,
+            capture_output=True,
+            env=auto_environment,
+        )
+        if auto_gzip.returncode != 0 or " compression=gzip " not in auto_gzip.stdout:
+            fail(f"distributed large-root automatic compression did not select gzip: {auto_gzip.stdout!r} {auto_gzip.stderr!r}")
 
         next_root = stage_base / "checkout" / "next-phase"
         next_root.mkdir()

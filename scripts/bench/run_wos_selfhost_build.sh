@@ -169,6 +169,7 @@ commit="unknown"
 heartbeat_pid=""
 workdir_lock=""
 distributed_compiler_state=""
+distributed_stage_generation=""
 
 sanitize_selfhost_environment() {
     unset CC CXX CPP LD AR AS NM OBJCOPY OBJDUMP RANLIB READELF STRIP
@@ -938,6 +939,7 @@ run_with_jobs_env() {
             WOS_DISTRIBUTED_COMPILER_HOSTS="$distributed_hosts" \
             WOS_DISTRIBUTED_COMPILER_STATE="$distributed_compiler_state" \
             WOS_DISTRIBUTED_COMPILER_TRANSPORT="$distributed_compiler_transport" \
+            WOS_DISTRIBUTED_COMPILER_STAGE_GENERATION="$distributed_stage_generation" \
             WOS_DISTRIBUTED_COMPILER_JOBS_PER_HOST="$distributed_jobs_per_host" \
             WOS_DISTRIBUTED_COMPILER_LOCAL_JOBS="$distributed_local_jobs" \
             WOS_DISTRIBUTED_COMPILER_PREPROCESS_JOBS="$distributed_preprocess_jobs" \
@@ -1316,6 +1318,32 @@ clone_sources() {
     run_timed_event "clone" "submodule_status" write_submodule_status
 }
 
+set_distributed_stage_generation() {
+    if [ "$mode" != wos ] || [ "$distributed" != 1 ] || [ "$distributed_compiler_transport" != staged ]; then
+        return 0
+    fi
+
+    local generation_line
+    generation_line="$(
+        {
+            printf '%s\n' "$commit"
+            cat "$workdir/submodules.txt"
+        } | sha256sum
+    )"
+    distributed_stage_generation="${generation_line%% *}"
+    if [ "${#distributed_stage_generation}" -ne 64 ]; then
+        echo "ERROR: could not derive immutable distributed source generation" >&2
+        exit 1
+    fi
+    case "$distributed_stage_generation" in
+        *[!0-9a-f]*)
+            echo "ERROR: could not derive immutable distributed source generation" >&2
+            exit 1
+            ;;
+    esac
+    log "distributed_stage_generation=$distributed_stage_generation"
+}
+
 bootstrap_toolchain() {
     if [ "$skip_bootstrap" = "1" ]; then
         log "skip bootstrap_toolchain"
@@ -1505,6 +1533,7 @@ log "target=$target"
 log "git_http_low_speed=${git_http_low_speed_limit}Bps/${git_http_low_speed_time}s"
 log "heartbeat=${heartbeat_interval}s tail=${heartbeat_tail} stall_snapshots=${heartbeat_stall_snapshots} sync=${heartbeat_sync}"
 time_step clone_sources clone_sources
+set_distributed_stage_generation
 time_step bootstrap_toolchain bootstrap_toolchain
 time_step stage_wos_sources stage_wos_sources
 warm_configure_tools
