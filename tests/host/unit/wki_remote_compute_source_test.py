@@ -1514,7 +1514,9 @@ def test_remote_stdio_capture_is_write_only_and_non_tty() -> None:
     exec_body = function_body(source, "finish_remote_exec_task")
     for snippet in [
         "stdin_file->open_flags = 0;",
+        "stdin_file->fs_type = ker::vfs::FSType::TMPFS;",
         "capture_file->open_flags = 1;",
+        "capture_file->fs_type = ker::vfs::FSType::TMPFS;",
         "(void)new_task->fd_table.insert(fd_idx, capture_file)",
     ]:
         if snippet not in exec_body:

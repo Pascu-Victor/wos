@@ -5132,7 +5132,7 @@ auto finish_remote_exec_task(ker::mod::sched::task::Task* new_task) -> ExecResul
         stdin_file->fops = &g_stdin_null_fops;
         stdin_file->pos = 0;
         stdin_file->is_directory = false;
-        stdin_file->fs_type = ker::vfs::FSType::DEVFS;
+        stdin_file->fs_type = ker::vfs::FSType::TMPFS;
         stdin_file->refcount = 1;
         stdin_file->open_flags = 0;
         stdin_file->fd_flags = 0;
@@ -5150,7 +5150,7 @@ auto finish_remote_exec_task(ker::mod::sched::task::Task* new_task) -> ExecResul
         capture_file->fops = &g_capture_fops;
         capture_file->pos = 0;
         capture_file->is_directory = false;
-        capture_file->fs_type = ker::vfs::FSType::DEVFS;
+        capture_file->fs_type = ker::vfs::FSType::TMPFS;
         capture_file->refcount = 1;
         capture_file->open_flags = 1;
         capture_file->fd_flags = 0;

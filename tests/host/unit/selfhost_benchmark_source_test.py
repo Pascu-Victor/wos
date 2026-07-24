@@ -1300,6 +1300,7 @@ exec {shlex.quote(real_find)} "$@"
         (mock_bin / "on").write_text(
             r'''#!/bin/bash
 set -eu
+printf '%s\n' "$#" >> "$WOS_STAGE_MOCK_ON_ARGC_LOG"
 [ "$1" = wos-1 ]
 shift
 if [ "$1" = locally ]; then
@@ -1339,6 +1340,7 @@ exec "$@"
                 "WOS_STAGE_MOCK_ARCHIVE_FAILURE_MARKER": str(temp / "archive-failed-once"),
                 "WOS_STAGE_MOCK_ARCHIVE_READY_MARKER": str(temp / "archive-ready"),
                 "WOS_STAGE_MOCK_VALIDATION_LOG": str(temp / "validation.log"),
+                "WOS_STAGE_MOCK_ON_ARGC_LOG": str(temp / "on-argc.log"),
                 "WOS_STAGE_MOCK_FAILURE_MARKER": str(temp / "stage-failed-once"),
             }
         )
@@ -1479,6 +1481,41 @@ exec "$@"
             fail("distributed root staging retained stale roots from a prior phase")
         if (retained / "sentinel").read_text(encoding="ascii") != "retained\n":
             fail("distributed root staging recopied or damaged a retained root")
+
+        scale_root = stage_base / "checkout" / "scale-root"
+        scale_root.mkdir()
+        (scale_root / "sentinel").write_text("scale\n", encoding="ascii")
+        scale_retained_roots = []
+        for index in range(160):
+            scale_retained = stage_base / "checkout" / "retained" / str(index)
+            scale_retained.mkdir(parents=True)
+            scale_retained_roots.append(scale_retained)
+        scale_environment = environment.copy()
+        scale_environment["WOS_DISTRIBUTED_COMPILER_RETAINED_ROOTS"] = "\n".join(
+            str(path) for path in scale_retained_roots
+        )
+        on_argc_log = Path(environment["WOS_STAGE_MOCK_ON_ARGC_LOG"])
+        on_argc_log.write_text("", encoding="ascii")
+        result = subprocess.run(
+            [str(STAGE_DISTRIBUTED_ROOTS), str(scale_root)],
+            cwd=ROOT,
+            check=False,
+            text=True,
+            capture_output=True,
+            env=scale_environment,
+        )
+        if result.returncode != 0:
+            fail(f"distributed root staging rejected a large active-root set: {result.stderr}")
+        on_arg_counts = [
+            int(line)
+            for line in on_argc_log.read_text(encoding="ascii").splitlines()
+            if line
+        ]
+        if not on_arg_counts or max(on_arg_counts) > 32:
+            fail(
+                "distributed root staging expanded its active-root manifest into "
+                f"remote argv: {on_arg_counts!r}"
+            )
 
         missing_environment = environment.copy()
         missing_environment["WOS_STAGE_MOCK_MISSING_ONLY"] = "1"

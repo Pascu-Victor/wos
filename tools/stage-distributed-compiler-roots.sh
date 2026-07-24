@@ -302,6 +302,7 @@ archive="$stage_dir/roots.$$${archive_suffix}"
 archive_tmp=""
 root_links="$stage_dir/links.$$.list"
 snapshot_stderr="$stage_dir/snapshot.$$.stderr"
+active_manifest="$stage_dir/active-roots.$$.list"
 manifest_tmp=""
 manifest_sorted=""
 cleanup() {
@@ -311,6 +312,7 @@ cleanup() {
     fi
     rm -f -- "$root_links" 2>/dev/null || true
     rm -f -- "$snapshot_stderr" 2>/dev/null || true
+    rm -f -- "$active_manifest" 2>/dev/null || true
     if [ -n "$manifest_tmp" ]; then
         rm -f -- "$manifest_tmp" 2>/dev/null || true
     fi
@@ -458,6 +460,7 @@ while :; do
     archive_attempt=$((archive_attempt + 1))
 done
 snapshot_finished_ms="$(stage_now_ms)"
+printf '%s\n' "${active_roots[@]}" > "$active_manifest"
 
 stage_peer() {
     local peer="$1"
@@ -466,14 +469,15 @@ stage_peer() {
 
     while [ "$attempt" -le "$stage_retries" ]; do
         command=(
-            on "$peer" forward "+$archive" "-$stage_base" -- locally
+            on "$peer" forward "+$archive" "+$active_manifest" "-$stage_base" -- locally
             sh -eu -c '
                 archive=$1
                 base=$2
                 requested_count=$3
                 extract_mode=$4
                 marker_count=$5
-                shift 5
+                active_manifest=$6
+                shift 6
                 requested_index=0
                 while [ "$requested_index" -lt "$requested_count" ]; do
                     root=$1
@@ -517,10 +521,15 @@ stage_peer() {
                     trap - EXIT HUP INT TERM
                     marker_index=$((marker_index + 1))
                 done
-                for root do
+                while IFS= read -r root; do
+                    [ -n "$root" ] || continue
+                    case "$root" in
+                        "$base"/*) ;;
+                        *) exit 66 ;;
+                    esac
                     [ -d "$root" ]
-                done
-            ' sh "$archive" "$stage_base" "${#stage_roots[@]}" "$archive_extract_mode" "${#stage_marker_roots[@]}"
+                done < "$active_manifest"
+            ' sh "$archive" "$stage_base" "${#stage_roots[@]}" "$archive_extract_mode" "${#stage_marker_roots[@]}" "$active_manifest"
         )
         for ((root_index = 0; root_index < ${#stage_roots[@]}; root_index++)); do
             command+=("${stage_roots[$root_index]}" "${stage_root_markers[$root_index]}")
@@ -532,7 +541,6 @@ stage_peer() {
                 "${stage_marker_identities[$marker_index]}"
             )
         done
-        command+=("${active_roots[@]}")
         if "${command[@]}"; then
             return 0
         fi
