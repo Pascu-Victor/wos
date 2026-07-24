@@ -29,6 +29,7 @@ auto scheduler_selftest_idle_steal_scan_expands_for_large_backlog() -> bool;
 auto scheduler_selftest_effectively_idle_current_accepts_rebalance_probe() -> bool;
 auto scheduler_selftest_loadavg_wait_channel_policy() -> bool;
 auto scheduler_selftest_deferred_yield_requires_sched_yield_channel() -> bool;
+auto scheduler_selftest_lazy_executable_resume_range_policy() -> bool;
 }  // namespace ker::mod::sched
 
 KTEST(Sched, VruntimeOrdering) {
@@ -158,6 +159,10 @@ KTEST(SchedulerMetrics, LoadAverageWaitChannelPolicy) { KEXPECT_TRUE(ker::mod::s
 
 KTEST(SchedulerDeferredSwitch, YieldBitRequiresSchedYieldChannel) {
     KEXPECT_TRUE(ker::mod::sched::scheduler_selftest_deferred_yield_requires_sched_yield_channel());
+}
+
+KTEST(SchedulerResume, LazyExecutableFileRangeIsValid) {
+    KEXPECT_TRUE(ker::mod::sched::scheduler_selftest_lazy_executable_resume_range_policy());
 }
 
 KTEST(ContextSwitch, RepairsStaleProcessSyscallResume) {

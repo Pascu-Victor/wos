@@ -1,5 +1,7 @@
 #include "scheduler.hpp"
 
+#include <abi/callnums/vmem.h>
+
 #include <abi/ptrace.hpp>
 #include <algorithm>
 #include <array>
@@ -266,6 +268,28 @@ inline void record_local_proc_first_run(task::Task* task, uint64_t callsite) {
                            perf::next_wki_trace_correlation(), 0, static_cast<uint32_t>(cpu::current_cpu()), callsite);
 }
 
+inline auto lazy_executable_resume_range_contains(const task::LazyVmemRange& range, uint64_t rip) -> bool {
+    return range.kind == task::LazyVmemKind::FILE_BACKED && range.file != nullptr && (range.prot & ker::abi::vmem::PROT_EXEC) != 0 &&
+           rip >= range.start && rip < range.end;
+}
+
+inline auto user_resume_rip_is_lazy_executable(task::Task* task, uint64_t rip) -> bool {
+    if (task == nullptr) {
+        return false;
+    }
+
+    bool covered = false;
+    uint64_t const IRQF = task->lazy_vmem_lock.lock_irqsave();
+    for (const auto& range : task->lazy_vmem_ranges) {
+        if (lazy_executable_resume_range_contains(range, rip)) {
+            covered = true;
+            break;
+        }
+    }
+    task->lazy_vmem_lock.unlock_irqrestore(IRQF);
+    return covered;
+}
+
 inline void validate_user_resume_target(task::Task* task, const char* path) {
     if (task == nullptr || task->pagemap == nullptr || task->type != task::TaskType::PROCESS || task->is_voluntary_blocked()) {
         return;
@@ -275,7 +299,9 @@ inline void validate_user_resume_target(task::Task* task, const char* path) {
     const uint64_t RSP = task->context.frame.rsp;
     const uint64_t RIP_PHYS = mm::virt::translate(task->pagemap, RIP);
     const uint64_t RSP_PHYS = mm::virt::translate(task->pagemap, RSP);
-    const bool RIP_BAD = RIP == 0 || RIP >= 0x0000800000000000ULL || RIP_PHYS == mm::virt::PADDR_INVALID;
+    const bool RIP_CANONICAL = RIP != 0 && RIP < 0x0000800000000000ULL;
+    const bool RIP_LAZY_EXECUTABLE = RIP_CANONICAL && RIP_PHYS == mm::virt::PADDR_INVALID && user_resume_rip_is_lazy_executable(task, RIP);
+    const bool RIP_BAD = !RIP_CANONICAL || (RIP_PHYS == mm::virt::PADDR_INVALID && !RIP_LAZY_EXECUTABLE);
     const bool RSP_BAD = RSP == 0 || RSP >= 0x0000800000000000ULL || RSP_PHYS == mm::virt::PADDR_INVALID;
     if (!RIP_BAD && !RSP_BAD) {
         return;
@@ -8806,6 +8832,33 @@ auto scheduler_selftest_deferred_yield_requires_sched_yield_channel() -> bool {
 
     return deferred_switch_is_sched_yield(&internal_resched) && deferred_switch_is_sched_yield(&sched_yield) &&
            !deferred_switch_is_sched_yield(&waitpid) && !deferred_switch_is_sched_yield(&ptrace);
+}
+
+auto scheduler_selftest_lazy_executable_resume_range_policy() -> bool {
+    task::LazyVmemRange range{
+        .start = 0x40000000,
+        .end = 0x40002000,
+        .prot = ker::abi::vmem::PROT_READ | ker::abi::vmem::PROT_EXEC,
+        .kind = task::LazyVmemKind::FILE_BACKED,
+        .file = reinterpret_cast<ker::vfs::File*>(0x1),
+    };
+
+    bool const START_ACCEPTED = lazy_executable_resume_range_contains(range, range.start);
+    bool const INTERIOR_ACCEPTED = lazy_executable_resume_range_contains(range, range.start + 0x1540);
+    bool const END_REJECTED = !lazy_executable_resume_range_contains(range, range.end);
+    bool const BELOW_REJECTED = !lazy_executable_resume_range_contains(range, range.start - 1);
+
+    range.prot = ker::abi::vmem::PROT_READ;
+    bool const NON_EXEC_REJECTED = !lazy_executable_resume_range_contains(range, range.start);
+    range.prot |= ker::abi::vmem::PROT_EXEC;
+    range.kind = task::LazyVmemKind::ANONYMOUS;
+    bool const ANONYMOUS_REJECTED = !lazy_executable_resume_range_contains(range, range.start);
+    range.kind = task::LazyVmemKind::FILE_BACKED;
+    range.file = nullptr;
+    bool const RELEASED_FILE_REJECTED = !lazy_executable_resume_range_contains(range, range.start);
+
+    return START_ACCEPTED && INTERIOR_ACCEPTED && END_REJECTED && BELOW_REJECTED && NON_EXEC_REJECTED && ANONYMOUS_REJECTED &&
+           RELEASED_FILE_REJECTED;
 }
 #endif
 

@@ -2056,6 +2056,56 @@ def test_deferred_first_run_daemon_starts_on_kernel_thread_stack() -> None:
     )
 
 
+def test_lazy_executable_rip_is_not_reported_as_resume_corruption() -> None:
+    source = SCHEDULER_CPP.read_text()
+    ktest = SCHEDULER_KTEST.read_text()
+    range_body = function_body(source, "lazy_executable_resume_range_contains")
+    task_body = function_body(source, "user_resume_rip_is_lazy_executable")
+    validate_body = function_body(source, "validate_user_resume_target")
+
+    require_tokens(
+        range_body,
+        [
+            "range.kind == task::LazyVmemKind::FILE_BACKED",
+            "range.file != nullptr",
+            "range.prot & ker::abi::vmem::PROT_EXEC",
+            "rip >= range.start",
+            "rip < range.end",
+        ],
+        "lazy executable resume range policy",
+    )
+    require_tokens(
+        task_body,
+        [
+            "task->lazy_vmem_lock.lock_irqsave()",
+            "for (const auto& range : task->lazy_vmem_ranges)",
+            "lazy_executable_resume_range_contains(range, rip)",
+            "task->lazy_vmem_lock.unlock_irqrestore(IRQF)",
+        ],
+        "lazy executable resume range locking",
+    )
+    require_tokens(
+        validate_body,
+        [
+            "const bool RIP_CANONICAL = RIP != 0 && RIP < 0x0000800000000000ULL",
+            "RIP_CANONICAL && RIP_PHYS == mm::virt::PADDR_INVALID",
+            "user_resume_rip_is_lazy_executable(task, RIP)",
+            "const bool RIP_BAD = !RIP_CANONICAL",
+            "RIP_PHYS == mm::virt::PADDR_INVALID && !RIP_LAZY_EXECUTABLE",
+            "const bool RSP_BAD = RSP == 0 || RSP >= 0x0000800000000000ULL || RSP_PHYS == mm::virt::PADDR_INVALID",
+        ],
+        "user resume validation lazy RIP exception",
+    )
+    require_tokens(
+        source + ktest,
+        [
+            "scheduler_selftest_lazy_executable_resume_range_policy()",
+            "KTEST(SchedulerResume, LazyExecutableFileRangeIsValid)",
+        ],
+        "lazy executable resume KTEST coverage",
+    )
+
+
 def test_switch_picker_evicts_unpublishable_runnable_tasks() -> None:
     source = SCHEDULER_CPP.read_text()
     switch_pick_body = function_body(source, "pick_best_eligible_for_switch_locked")
@@ -2275,6 +2325,7 @@ def main() -> None:
     test_context_switch_updates_tss_rsp0_to_task_stack()
     test_deferred_user_switch_commits_after_stack_handoff()
     test_deferred_first_run_daemon_starts_on_kernel_thread_stack()
+    test_lazy_executable_rip_is_not_reported_as_resume_corruption()
     test_switch_picker_evicts_unpublishable_runnable_tasks()
     test_voluntary_blocked_current_cannot_hide_runnable_peer()
     test_runnable_publication_requires_successful_heap_insert()
