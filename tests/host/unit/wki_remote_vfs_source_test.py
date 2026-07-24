@@ -2317,18 +2317,25 @@ def test_remote_open_closes_server_fd_on_local_allocation_failure() -> None:
     )
 
 
-def test_normal_remote_close_flushes_then_sends_without_response_wait() -> None:
+def test_remote_close_waits_only_for_writable_output_publication() -> None:
     source = REMOTE_VFS_CPP.read_text()
+    header = REMOTE_VFS_HPP.read_text()
+    ktest = WKI_DEV_PROXY_KTEST.read_text()
     wire = WIRE_HPP.read_text()
     close_body = function_body(source, "remote_vfs_close")
+    policy_body = function_body(source, "remote_vfs_close_needs_completion")
 
     require_order(
         close_body,
         [
             "ker::mod::sys::MutexGuard io_guard(ctx->io_lock)",
             "flush_status = flush_write_behind(ctx)",
-            "std::array<uint8_t, WKI_VFS_CLOSE_EXTENDED_DATA_LEN> close_req{}",
             "int32_t const REMOTE_FD = ctx->remote_fd",
+            "bool const NEEDS_CLOSE_STATUS = remote_vfs_close_needs_completion(f->open_flags)",
+            "if (NEEDS_CLOSE_STATUS)",
+            "close_status = vfs_proxy_send_and_wait(ctx->proxy, OP_VFS_CLOSE",
+            "sizeof(REMOTE_FD), nullptr, 0)",
+            "std::array<uint8_t, WKI_VFS_CLOSE_EXTENDED_DATA_LEN> close_req{}",
             "memcpy(close_req.data(), &REMOTE_FD, sizeof(REMOTE_FD))",
             "close_req.at(WKI_VFS_CLOSE_FLAGS_OFFSET) = WKI_VFS_CLOSE_FLAG_NO_SUCCESS_RESPONSE",
             "vfs_proxy_send_untracked(ctx->proxy, OP_VFS_CLOSE",
@@ -2336,16 +2343,29 @@ def test_normal_remote_close_flushes_then_sends_without_response_wait() -> None:
             "delete ctx->write_buf",
             "delete ctx;",
             "release_vfs_proxy_open_ref(PROXY)",
-            "return flush_status",
+            "return flush_status != 0 ? flush_status : close_status",
         ],
-        "normal remote close ordering",
+        "remote close publication ordering",
     )
     if close_body.count("ker::mod::sys::MutexGuard io_guard(ctx->io_lock)") != 2:
         fail("both inactive and normal remote close cleanup must serialize per-file storage")
-    if "vfs_proxy_send_and_wait" in close_body:
-        fail("normal remote close must not wait for the owner close response")
-    if "NEEDS_CLOSE_STATUS" in close_body:
-        fail("normal remote close must not branch on access mode for response waiting")
+    require_tokens(
+        policy_body,
+        [
+            "int const ACCESS_MODE = open_flags & 3",
+            "ACCESS_MODE != 0",
+            "ker::vfs::O_CREAT | ker::vfs::O_TRUNC",
+        ],
+        "writable remote close response policy",
+    )
+    require_tokens(
+        header + ktest,
+        [
+            "wki_remote_vfs_selftest_writable_close_wait_policy()",
+            "KTEST(WkiRemoteVfsClose, WritableWaitsForOwnerPublication)",
+        ],
+        "writable remote close KTEST coverage",
+    )
 
     require_tokens(
         wire,
@@ -2851,7 +2871,7 @@ def test_remote_open_refs_delay_proxy_destroy_until_close() -> None:
         [
             "ProxyVfsState* const PROXY = ctx->proxy;",
             "release_vfs_proxy_open_ref(PROXY);",
-            "return flush_status;",
+            "return flush_status != 0 ? flush_status : close_status;",
         ],
         "remote VFS close releases proxy open ref",
     )
@@ -4101,7 +4121,7 @@ def main() -> None:
     test_write_behind_storage_grows_in_allocator_shaped_classes()
     test_message_write_flush_uses_split_send_and_retains_tail()
     test_remote_open_closes_server_fd_on_local_allocation_failure()
-    test_normal_remote_close_flushes_then_sends_without_response_wait()
+    test_remote_close_waits_only_for_writable_output_publication()
     test_export_lookup_returns_locked_snapshot()
     test_rdma_retry_cooldowns_are_saturating()
     test_vfs_attach_ack_requires_expected_cookie_before_completion()

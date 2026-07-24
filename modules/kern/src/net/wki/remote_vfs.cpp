@@ -3152,6 +3152,11 @@ auto flush_write_behind(RemoteFileContext* ctx) -> int {
 // Consumer-side FileOperations
 // -----------------------------------------------------------------------------
 
+auto remote_vfs_close_needs_completion(int open_flags) -> bool {
+    int const ACCESS_MODE = open_flags & 3;
+    return ACCESS_MODE != 0 || (open_flags & (ker::vfs::O_CREAT | ker::vfs::O_TRUNC)) != 0;
+}
+
 auto remote_vfs_close(ker::vfs::File* f) -> int {
     if (f == nullptr || f->private_data == nullptr) {
         return -EBADF;
@@ -3172,6 +3177,7 @@ auto remote_vfs_close(ker::vfs::File* f) -> int {
     }
 
     int flush_status = 0;
+    int close_status = 0;
     {
         ker::mod::sys::MutexGuard io_guard(ctx->io_lock);
 
@@ -3183,18 +3189,24 @@ auto remote_vfs_close(ker::vfs::File* f) -> int {
         invalidate_dir_cache(ctx->proxy, ctx->remote_fd);
         s_vfs_lock.unlock();
 
-        // Pending writes were flushed synchronously above, and this close remains
-        // ordered on the reliable per-mount channel. Legacy four-byte closes need
-        // a response; ordinary closes opt out of the success response because the
-        // local descriptor is gone.
-        std::array<uint8_t, WKI_VFS_CLOSE_EXTENDED_DATA_LEN> close_req{};
         int32_t const REMOTE_FD = ctx->remote_fd;
-        memcpy(close_req.data(), &REMOTE_FD, sizeof(REMOTE_FD));
-        close_req.at(WKI_VFS_CLOSE_FLAGS_OFFSET) = WKI_VFS_CLOSE_FLAG_NO_SUCCESS_RESPONSE;
-        int const SEND_STATUS = vfs_proxy_send_untracked(ctx->proxy, OP_VFS_CLOSE, close_req.data(), close_req.size());
-        if (SEND_STATUS != 0) {
-            ker::mod::dbg::log("[WKI] async remote close send failed: node=0x%04x ch=%u fd=%d rc=%d", ctx->proxy->owner_node,
-                               ctx->proxy->assigned_channel, REMOTE_FD, SEND_STATUS);
+        bool const NEEDS_CLOSE_STATUS = remote_vfs_close_needs_completion(f->open_flags);
+        if (NEEDS_CLOSE_STATUS) {
+            // A successful remote task must not become visible before its routed
+            // writable outputs have completed owner-side close and publication.
+            close_status = vfs_proxy_send_and_wait(ctx->proxy, OP_VFS_CLOSE, reinterpret_cast<const uint8_t*>(&REMOTE_FD),
+                                                   sizeof(REMOTE_FD), nullptr, 0);
+        } else {
+            // Read-only closes carry no output-publication dependency. Keep them
+            // on the one-way path to avoid adding a round trip to source/header I/O.
+            std::array<uint8_t, WKI_VFS_CLOSE_EXTENDED_DATA_LEN> close_req{};
+            memcpy(close_req.data(), &REMOTE_FD, sizeof(REMOTE_FD));
+            close_req.at(WKI_VFS_CLOSE_FLAGS_OFFSET) = WKI_VFS_CLOSE_FLAG_NO_SUCCESS_RESPONSE;
+            int const SEND_STATUS = vfs_proxy_send_untracked(ctx->proxy, OP_VFS_CLOSE, close_req.data(), close_req.size());
+            if (SEND_STATUS != 0) {
+                ker::mod::dbg::log("[WKI] async remote close send failed: node=0x%04x ch=%u fd=%d rc=%d", ctx->proxy->owner_node,
+                                   ctx->proxy->assigned_channel, REMOTE_FD, SEND_STATUS);
+            }
         }
 
         // D6: Free caches
@@ -3206,7 +3218,7 @@ auto remote_vfs_close(ker::vfs::File* f) -> int {
     delete ctx;
     f->private_data = nullptr;
     release_vfs_proxy_open_ref(PROXY);
-    return flush_status;
+    return flush_status != 0 ? flush_status : close_status;
 }
 
 auto remote_vfs_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) -> ssize_t {
@@ -4581,6 +4593,13 @@ auto wki_remote_vfs_selftest_write_behind_growth() -> bool {
         return false;
     }
     return true;
+}
+
+auto wki_remote_vfs_selftest_writable_close_wait_policy() -> bool {
+    return !remote_vfs_close_needs_completion(0) && !remote_vfs_close_needs_completion(ker::vfs::O_CLOEXEC) &&
+           remote_vfs_close_needs_completion(1) && remote_vfs_close_needs_completion(2) &&
+           remote_vfs_close_needs_completion(ker::vfs::O_CREAT) && remote_vfs_close_needs_completion(ker::vfs::O_TRUNC) &&
+           remote_vfs_close_needs_completion(ker::vfs::O_CREAT | ker::vfs::O_CLOEXEC);
 }
 #endif
 

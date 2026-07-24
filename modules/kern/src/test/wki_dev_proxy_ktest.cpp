@@ -69,6 +69,10 @@ KTEST(WkiRemoteVfsWriteBehind, CapacityClassesMatchAllocator) {
 
 KTEST(WkiRemoteVfsWriteBehind, GrowthPreservesPendingData) { KEXPECT_TRUE(ker::net::wki::wki_remote_vfs_selftest_write_behind_growth()); }
 
+KTEST(WkiRemoteVfsClose, WritableWaitsForOwnerPublication) {
+    KEXPECT_TRUE(ker::net::wki::wki_remote_vfs_selftest_writable_close_wait_policy());
+}
+
 KTEST(WkiRemoteVfsReadlinkCache, GenerationInvalidationAndWrap) {
     KEXPECT_TRUE(ker::net::wki::wki_remote_vfs_selftest_readlink_cache_generation_invalidation());
 }

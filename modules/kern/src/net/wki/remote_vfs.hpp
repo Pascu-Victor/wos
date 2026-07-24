@@ -328,6 +328,7 @@ auto wki_remote_vfs_selftest_teardown_quiesces_retiring_slot() -> bool;
 auto wki_remote_vfs_selftest_inactive_slot_rejected() -> bool;
 auto wki_remote_vfs_selftest_write_behind_capacity_classes() -> bool;
 auto wki_remote_vfs_selftest_write_behind_growth() -> bool;
+auto wki_remote_vfs_selftest_writable_close_wait_policy() -> bool;
 auto wki_remote_vfs_selftest_readlink_cache_generation_invalidation() -> bool;
 auto wki_remote_vfs_selftest_multi_rdma_lane_selection() -> bool;
 auto wki_remote_vfs_selftest_lane_round_robin_uses_full_capacity() -> bool;
