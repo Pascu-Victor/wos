@@ -358,9 +358,11 @@ def test_wos_toolchain_stages_configured_build_roots() -> None:
         [
             "wos_stage_distributed_build_roots()",
             'if [ "${WOS_DISTRIBUTED_COMPILER_TRANSPORT:-source}" != staged ]; then',
-            'canonical_retained_root="$(realpath "$retained_root")"',
+            'while IFS= read -r requested_retained_root; do',
+            'canonical_retained_root="$(realpath "$requested_retained_root")"',
             '"$canonical_immutable_root"|"$canonical_immutable_root"/*)',
             'retained_roots+="$canonical_retained_root"',
+            'done <<< "$retained_root"',
             'WOS_DISTRIBUTED_COMPILER_RETAINED_ROOTS="$retained_roots"',
             '"$workspace_root/tools/stage-distributed-compiler-roots.sh" "$@"',
         ],
@@ -382,8 +384,10 @@ def test_wos_toolchain_stages_configured_build_roots() -> None:
         immutable_root = workspace / "toolchain" / "src" / "multi-project"
         nested_immutable_root = immutable_root / "core"
         nested_root = nested_immutable_root / "frontend"
+        second_retained_root = workspace / "toolchain" / "sysroot" / "include"
         build_root = workspace / "toolchain" / "build"
         nested_root.mkdir(parents=True)
+        second_retained_root.mkdir(parents=True)
         build_root.mkdir(parents=True)
         environment = os.environ.copy()
         environment.update(
@@ -398,11 +402,15 @@ def test_wos_toolchain_stages_configured_build_roots() -> None:
             [
                 "bash",
                 "-c",
-                'source "$1"; wos_stage_distributed_build_roots "$2" "$3" "$4"',
+                (
+                    'source "$1"; '
+                    'wos_stage_distributed_build_roots "$2" "$3"$\'\\n\'"$4" "$5"'
+                ),
                 "test-promoted-retained-root",
                 str(ROOT / "tools" / "ccache_env.sh"),
                 str(workspace),
                 str(nested_root),
+                str(second_retained_root),
                 str(build_root),
             ],
             cwd=ROOT,
@@ -413,7 +421,11 @@ def test_wos_toolchain_stages_configured_build_roots() -> None:
         )
         if result.returncode != 0:
             fail(f"configured distributed root promotion failed: {result.stderr}")
-        expected = f"retained={immutable_root}\nroot={build_root}\n"
+        expected = (
+            f"retained={immutable_root}\n"
+            f"{second_retained_root}\n"
+            f"root={build_root}\n"
+        )
         if result.stdout != expected:
             fail(f"configured distributed root did not retain its immutable parent: {result.stdout!r}")
 

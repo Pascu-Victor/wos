@@ -732,12 +732,14 @@ wos_stage_distributed_build_roots() {
     fi
 
     local retained_roots="${WOS_DISTRIBUTED_COMPILER_RETAINED_ROOTS:-}"
-    if [ -n "$retained_root" ]; then
-        local canonical_retained_root
-        local immutable_root
-        local canonical_immutable_root
-        if ! canonical_retained_root="$(realpath "$retained_root")"; then
-            echo "ERROR: distributed compiler retained root could not be resolved: $retained_root" >&2
+    local requested_retained_root
+    local canonical_retained_root
+    local immutable_root
+    local canonical_immutable_root
+    while IFS= read -r requested_retained_root; do
+        [ -n "$requested_retained_root" ] || continue
+        if ! canonical_retained_root="$(realpath "$requested_retained_root")"; then
+            echo "ERROR: distributed compiler retained root could not be resolved: $requested_retained_root" >&2
             return 1
         fi
         while IFS= read -r immutable_root; do
@@ -762,7 +764,7 @@ wos_stage_distributed_build_roots() {
             retained_roots+=$'\n'
         fi
         retained_roots+="$canonical_retained_root"
-    fi
+    done <<< "$retained_root"
 
     WOS_DISTRIBUTED_COMPILER_RETAINED_ROOTS="$retained_roots" \
         "$workspace_root/tools/stage-distributed-compiler-roots.sh" "$@"
