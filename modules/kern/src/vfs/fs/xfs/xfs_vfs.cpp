@@ -5282,13 +5282,30 @@ auto xfs_mkdir_path(const char* fs_path, int mode, XfsMountContext* ctx, ker::vf
 
 namespace {
 
-auto count_real_entries(const XfsDirEntry* entry, void* ctx) -> int {
-    auto* count = static_cast<int*>(ctx);
+struct RmdirDirectoryScan {
+    XfsInode* directory{};
+    int status{};
+    bool indexed_entry_found{};
+};
+
+auto scan_indexed_directory_entries(const XfsDirEntry* entry, void* ctx) -> int {
+    auto* scan = static_cast<RmdirDirectoryScan*>(ctx);
     if (entry->name.at(0) == '.' && (entry->namelen == 1 || (entry->namelen == 2 && entry->name.at(1) == '.'))) {
         return 0;
     }
-    (*count)++;
-    return 0;
+
+    int const MEMBERSHIP = xfs_dir_entry_is_indexed(scan->directory, entry);
+    if (MEMBERSHIP < 0) {
+        scan->status = MEMBERSHIP;
+        return 1;
+    }
+    if (MEMBERSHIP == 0) {
+        // A data-only record cannot be reached by pathname lookup. Reclaim it
+        // with the directory inode instead of making rmdir fail forever.
+        return 0;
+    }
+    scan->indexed_entry_found = true;
+    return 1;
 }
 
 }  // anonymous namespace
@@ -5459,9 +5476,14 @@ auto xfs_rmdir_path(const char* fs_path, XfsMountContext* ctx, size_t known_fs_p
         return -ENOENT;
     }
 
-    int entry_count = 0;
-    xfs_dir_iterate(dir_ip, count_real_entries, &entry_count);
-    if (entry_count > 0) {
+    RmdirDirectoryScan scan{.directory = dir_ip};
+    int const ITERATE_RET = xfs_dir_iterate(dir_ip, scan_indexed_directory_entries, &scan);
+    if (ITERATE_RET < 0 || scan.status != 0) {
+        xfs_inode_release(dir_ip);
+        xfs_inode_release(parent_ip);
+        return ITERATE_RET < 0 ? ITERATE_RET : scan.status;
+    }
+    if (scan.indexed_entry_found) {
         xfs_inode_release(dir_ip);
         xfs_inode_release(parent_ip);
         return -ENOTEMPTY;

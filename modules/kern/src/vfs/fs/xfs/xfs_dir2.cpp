@@ -1581,6 +1581,36 @@ auto xfs_dir_lookup_authoritative(XfsInode* dp, const char* name, uint16_t namel
     return xfs_dir_lookup_impl(dp, name, namelen, entry, false);
 }
 
+namespace {
+
+auto dir_entry_index_membership(const XfsDirEntry* observed, int lookup_result, const XfsDirEntry* indexed) -> int {
+    if (observed == nullptr) {
+        return -EINVAL;
+    }
+    if (lookup_result == -ENOENT) {
+        return 0;
+    }
+    if (lookup_result != 0) {
+        return lookup_result;
+    }
+    if (indexed == nullptr || indexed->ino != observed->ino || indexed->ftype != observed->ftype) {
+        return -EIO;
+    }
+    return 1;
+}
+
+}  // namespace
+
+auto xfs_dir_entry_is_indexed(XfsInode* dp, const XfsDirEntry* observed) -> int {
+    if (dp == nullptr || observed == nullptr || observed->namelen == 0 || observed->namelen > observed->name.size()) {
+        return -EINVAL;
+    }
+
+    XfsDirEntry indexed{};
+    int const LOOKUP_RET = xfs_dir_lookup_authoritative(dp, observed->name.data(), observed->namelen, &indexed);
+    return dir_entry_index_membership(observed, LOOKUP_RET, &indexed);
+}
+
 void xfs_dir_observe_entry(XfsInode* dp, const XfsDirEntry* entry) {
     if (dp == nullptr || entry == nullptr || entry->namelen == 0) {
         return;
@@ -4698,6 +4728,23 @@ auto xfs_selftest_authoritative_lookup_repairs_stale_negative() -> bool {
     bool const CACHE_REPAIRED = xfs_dir_lookup(&dir, "foo", 3, &entry) == 0 && entry.ino == 43;
     xfs_dentry_cache_purge_mount(&mount);
     return STALE_NEGATIVE_OBSERVED && AUTHORITATIVE_FOUND && CACHE_REPAIRED;
+}
+
+auto xfs_selftest_directory_entry_index_membership() -> bool {
+    XfsDirEntry observed{};
+    observed.ino = 43;
+    observed.ftype = XFS_DIR3_FT_REG_FILE;
+    observed.namelen = 3;
+    std::memcpy(observed.name.data(), "foo", observed.namelen);
+
+    XfsDirEntry indexed = observed;
+    bool const MATCHED = dir_entry_index_membership(&observed, 0, &indexed) == 1;
+    bool const UNINDEXED = dir_entry_index_membership(&observed, -ENOENT, &indexed) == 0;
+
+    indexed.ino++;
+    bool const MISMATCH_REJECTED = dir_entry_index_membership(&observed, 0, &indexed) == -EIO;
+    bool const IO_ERROR_PROPAGATED = dir_entry_index_membership(&observed, -EIO, nullptr) == -EIO;
+    return MATCHED && UNINDEXED && MISMATCH_REJECTED && IO_ERROR_PROPAGATED;
 }
 
 auto xfs_selftest_block_lookup_uses_leaf_index_for_misses() -> bool {

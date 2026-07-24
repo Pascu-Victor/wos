@@ -68,6 +68,11 @@ auto xfs_dir_lookup(XfsInode* dp, const char* name, uint16_t namelen, XfsDirEntr
 // reports ENOENT; successful and negative results still repair the cache.
 auto xfs_dir_lookup_authoritative(XfsInode* dp, const char* name, uint16_t namelen, XfsDirEntry* entry) -> int;
 
+// Classify an entry observed by data-area iteration against the authoritative
+// directory index. Returns 1 when the same inode/type is indexed, 0 when the
+// observed record is unreachable, or a negative errno for I/O/corruption.
+auto xfs_dir_entry_is_indexed(XfsInode* dp, const XfsDirEntry* observed) -> int;
+
 // Look up a name already observed for a parent inode without loading that
 // parent inode.  Returns true only when the dentry cache can answer.
 auto xfs_dentry_cache_lookup_parent(XfsMountContext* mount, xfs_ino_t parent_ino, const char* name, uint16_t namelen, XfsDirEntry* entry,
@@ -123,6 +128,7 @@ void xfs_dentry_cache_invalidate_dir(XfsInode* dp);
 #ifdef WOS_SELFTEST
 auto xfs_selftest_dentry_cache_shortform() -> bool;
 auto xfs_selftest_authoritative_lookup_repairs_stale_negative() -> bool;
+auto xfs_selftest_directory_entry_index_membership() -> bool;
 auto xfs_selftest_block_lookup_uses_leaf_index_for_misses() -> bool;
 auto xfs_selftest_leaf_index_complete_marker() -> bool;
 auto xfs_selftest_directory_name_filter() -> bool;

@@ -412,6 +412,42 @@ def test_zero_link_vfs_releases_use_metadata_locked_api() -> None:
         require_order(function_body(source, name), tokens, f"{name} zero-link inode release")
 
 
+def test_rmdir_reclaims_only_authoritatively_unindexed_records() -> None:
+    dir_source = XFS_DIR2_CPP.read_text()
+    vfs_source = XFS_VFS_CPP.read_text()
+    require_order(
+        function_body(dir_source, "xfs_dir_entry_is_indexed"),
+        [
+            "xfs_dir_lookup_authoritative(dp, observed->name.data(), observed->namelen, &indexed)",
+            "dir_entry_index_membership(observed, LOOKUP_RET, &indexed)",
+        ],
+        "directory-entry membership must use an authoritative lookup",
+    )
+    require_order(
+        function_body(vfs_source, "scan_indexed_directory_entries"),
+        [
+            "xfs_dir_entry_is_indexed(scan->directory, entry)",
+            "if (MEMBERSHIP < 0)",
+            "scan->status = MEMBERSHIP;",
+            "if (MEMBERSHIP == 0)",
+            "return 0;",
+            "scan->indexed_entry_found = true;",
+        ],
+        "rmdir scan must propagate errors and ignore only unreachable data records",
+    )
+    require_order(
+        function_body(vfs_source, "xfs_rmdir_path"),
+        [
+            "xfs_dir_iterate(dir_ip, scan_indexed_directory_entries, &scan)",
+            "if (ITERATE_RET < 0 || scan.status != 0)",
+            "if (scan.indexed_entry_found)",
+            "return -ENOTEMPTY;",
+            "xfs_trans_alloc(ctx)",
+        ],
+        "rmdir must reject indexed children before beginning removal",
+    )
+
+
 def main() -> None:
     test_mount_context_has_sleeping_metadata_mutex()
     test_metadata_guard_raii_locks_mount_mutex()
@@ -426,6 +462,7 @@ def main() -> None:
     test_writer_serializes_metadata_but_releases_it_for_data_io()
     test_inode_inactivation_is_serialized_by_metadata_lock()
     test_zero_link_vfs_releases_use_metadata_locked_api()
+    test_rmdir_reclaims_only_authoritatively_unindexed_records()
     print("XFS metadata lock source invariants hold")
 
 
