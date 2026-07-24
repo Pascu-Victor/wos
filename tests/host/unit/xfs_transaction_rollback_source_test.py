@@ -119,11 +119,16 @@ def main() -> None:
         [
             "uint64_t const AG_BASE = static_cast<uint64_t>(AGNO) * mount->ag_blocks;",
             "uint64_t const DEV_BLOCK = (AG_BASE + AGBNO) * DEV_COUNT;",
-            "xfs_free_extent(mount, tp",
+            "xfs_alloc_put_freelist(mount, tp",
             "xfs_trans_retire_bdev_range(tp, DEV_BLOCK, DEV_COUNT)",
         ],
         "BMBT blocks become reusable only with commit-time cache retirement",
     )
+    bmbt_alloc = function_body(bmap, "bmbt_alloc_block")
+    if "xfs_alloc_get_freelist(ip->mount, tp, ip->agno, &agbno)" not in bmbt_alloc:
+        fail("BMBT metadata allocation must use the AGFL instead of re-entering ordinary free-space trees")
+    if "xfs_alloc_extent(" in bmbt_alloc:
+        fail("BMBT metadata allocation must not use the ordinary data-extent allocator")
     require_order(
         function_body(trans, "xfs_trans_commit"),
         ["int const LOG_RC = xfs_log_write", "xfs_trans_cancel(tp);", "return LOG_RC;", "bdirty(item.buf.bp);"],

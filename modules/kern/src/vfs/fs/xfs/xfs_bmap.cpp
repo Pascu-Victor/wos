@@ -150,29 +150,23 @@ auto bmbt_alloc_block(XfsInode* ip, XfsTransaction* tp, uint16_t level, BufHead*
     *out_bh = nullptr;
     *out_fsb = NULLFSBLOCK;
 
-    XfsAllocReq req{};
-    req.agno = ip->agno;
-    req.agbno = 0;
-    req.minlen = 1;
-    req.maxlen = 1;
-    req.alignment = 0;
-
-    XfsAllocResult alloc{};
-    int const RC = xfs_alloc_extent(ip->mount, tp, req, &alloc);
+    // Bmap rebuilds can run after the same transaction has allocated and
+    // mapped a data block.  Do not re-enter the ordinary free-space trees
+    // while rebuilding their caller's extent map: take metadata from the
+    // pre-reserved AGFL, as the generic btree split path does.
+    xfs_agblock_t agbno = NULLAGBLOCK;
+    int const RC = xfs_alloc_get_freelist(ip->mount, tp, ip->agno, &agbno);
     if (RC != 0) {
         return RC;
     }
-    if (alloc.agno >= ip->mount->ag_count || alloc.agbno == NULLAGBLOCK || alloc.agbno >= ip->mount->ag_blocks || alloc.len != 1) {
-        if (alloc.agno < ip->mount->ag_count && alloc.agbno != NULLAGBLOCK && alloc.agbno < ip->mount->ag_blocks && alloc.len != 0) {
-            static_cast<void>(xfs_free_extent(ip->mount, tp, alloc.agno, alloc.agbno, alloc.len));
-        }
+    if (agbno == NULLAGBLOCK || agbno >= ip->mount->ag_blocks) {
         return -EIO;
     }
 
-    xfs_fsblock_t const FSB = xfs_agbno_to_fsbno(alloc.agno, alloc.agbno, ip->mount->ag_blk_log);
+    xfs_fsblock_t const FSB = xfs_agbno_to_fsbno(ip->agno, agbno, ip->mount->ag_blk_log);
     BufHead* bh = xfs_buf_get(ip->mount, FSB);
     if (bh == nullptr) {
-        static_cast<void>(xfs_free_extent(ip->mount, tp, alloc.agno, alloc.agbno, 1));
+        static_cast<void>(xfs_alloc_put_freelist(ip->mount, tp, ip->agno, agbno));
         return -EIO;
     }
 
@@ -214,7 +208,7 @@ auto bmbt_return_block(XfsMountContext* mount, XfsTransaction* tp, xfs_fsblock_t
     }
     uint64_t const DEV_BLOCK = (AG_BASE + AGBNO) * DEV_COUNT;
 
-    int const FREE_RC = xfs_free_extent(mount, tp, AGNO, AGBNO, 1);
+    int const FREE_RC = xfs_alloc_put_freelist(mount, tp, AGNO, AGBNO);
     if (FREE_RC != 0) {
         return FREE_RC;
     }
@@ -1632,7 +1626,7 @@ auto bmap_selftest_init_ag0(XfsMountContext* mount) -> bool {
         agfl_bno[i] = Be32::from_cpu(NULLAGBLOCK);
     }
     for (uint32_t i = 0; i < pag.agf_flcount && i < AGFL_SIZE; i++) {
-        agfl_bno[i] = Be32::from_cpu(static_cast<xfs_agblock_t>(50 + i));
+        agfl_bno[i] = Be32::from_cpu(static_cast<xfs_agblock_t>(500 + i));
     }
     agfl->agfl_crc = Be32{0};
     uint32_t agfl_crc = util::crc32c_block_with_cksum(agfl, mount->sect_size, XFS_AGFL_CRC_OFF);
@@ -1785,8 +1779,8 @@ auto xfs_selftest_bmap_extent_promotion() -> bool {
     pag.agf_freeblks = 256;
     pag.agf_longest = 256;
     pag.agf_flfirst = 0;
-    pag.agf_fllast = 3;
-    pag.agf_flcount = 4;
+    pag.agf_fllast = 63;
+    pag.agf_flcount = 64;
 
     XfsMountContext mount{};
     mount.device = &dev;
@@ -1808,8 +1802,8 @@ auto xfs_selftest_bmap_extent_promotion() -> bool {
         invalidate_bdev(&dev);
         return false;
     }
-    bmap_selftest_init_free_root(&mount, pag.agf_bno_root, XFS_ABTB_CRC_MAGIC, 100, 256);
-    bmap_selftest_init_free_root(&mount, pag.agf_cnt_root, XFS_ABTC_CRC_MAGIC, 100, 256);
+    bmap_selftest_init_free_root(&mount, pag.agf_bno_root, XFS_ABTB_CRC_MAGIC, 200, 256);
+    bmap_selftest_init_free_root(&mount, pag.agf_cnt_root, XFS_ABTC_CRC_MAGIC, 200, 256);
 
     XfsInode inode{};
     inode.ino = 84;
@@ -1907,7 +1901,11 @@ auto xfs_selftest_bmap_extent_promotion() -> bool {
     }
     Be64 promoted_child{};
     __builtin_memcpy(&promoted_child, bmdr_ptr_addr(inode.data_fork.btree.root, BMDR_MAXRECS, 0), sizeof(promoted_child));
-    if (promoted_child.to_cpu() == NULLFSBLOCK) {
+    // File bmap metadata must come from the AGFL.  Allocating it from the
+    // ordinary free-space trees can alias a data extent allocated earlier in
+    // the same directory-growth transaction.
+    constexpr xfs_fsblock_t FIRST_AGFL_BLOCK = 500;
+    if (promoted_child.to_cpu() != FIRST_AGFL_BLOCK || pag.agf_flcount != 63) {
         return cleanup(false);
     }
     if (BMDR_MAXRECS > 1) {
