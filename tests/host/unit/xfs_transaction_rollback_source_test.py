@@ -130,6 +130,11 @@ def main() -> None:
     if "xfs_alloc_extent(" in bmbt_alloc:
         fail("BMBT metadata allocation must not use the ordinary data-extent allocator")
     require_order(
+        bmbt_alloc,
+        ["xfs_buf_get(ip->mount, FSB)", "xfs_trans_capture_buf(tp, bh)", "__builtin_memset(bh->data, 0, bh->size)"],
+        "BMBT allocation captures a possibly stale AGFL alias before overwrite",
+    )
+    require_order(
         function_body(trans, "xfs_trans_commit"),
         ["int const LOG_RC = xfs_log_write", "xfs_trans_cancel(tp);", "return LOG_RC;", "bdirty(item.buf.bp);"],
         "active-log failure cancels before metadata writeback",
@@ -164,6 +169,11 @@ def main() -> None:
         function_body(btree, "xfs_btree_insert"),
         ["xfs_trans_capture_buf(tp, cur->level_at(0).bp)", "std::memmove(base"],
         "btree insert captures its leaf before insertion",
+    )
+    require_order(
+        function_body(btree, "btree_alloc_new_block"),
+        ["xfs_buf_get(mount, ABS_BLOCK)", "xfs_trans_capture_buf(tp, bh)", "__builtin_memset(bh->data, 0, bh->size)"],
+        "generic btree allocation captures a possibly stale AGFL alias before overwrite",
     )
 
     require_order(

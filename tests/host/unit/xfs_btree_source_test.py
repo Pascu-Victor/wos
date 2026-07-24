@@ -111,9 +111,11 @@ def main() -> None:
     require(source, "return -EEXIST;", "duplicate btree key rejection")
     require(
         alloc_source,
-        "free_space_btree_contains_block(mount, agno, BNO_RAW)",
-        "AGFL live free-space-tree block rejection",
+        "allocation_btree_contains_block(mount, agno, BNO_RAW)",
+        "AGFL live allocation-tree block rejection",
     )
+    require(alloc_source, "ag_btree_contains_block<XfsInobtTraits>", "AGFL live inobt block rejection")
+    require(alloc_source, "ag_btree_contains_block<XfsFinobtTraits>", "AGFL live finobt block rejection")
     require(alloc_source, "dropping duplicate active block", "duplicate active AGFL entry rejection")
     if "xfs_alloc_put_freelist(cur->mount, tp, cur->agno" in source:
         fail("btree deletion must not publish retired blocks before transaction-safe deferred retirement")

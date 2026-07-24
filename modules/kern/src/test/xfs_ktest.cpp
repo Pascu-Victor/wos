@@ -95,7 +95,7 @@ KTEST(XFS, BmapSyntheticBtreeLookup) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_
 
 KTEST(XFS, BmapExtentPromotion) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_bmap_extent_promotion()); }
 
-KTEST(XFS, AgflSkipsLiveFreeSpaceBlock) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_agfl_skips_live_free_space_block()); }
+KTEST(XFS, AgflSkipsLiveAllocationBtreeBlocks) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_agfl_skips_live_allocation_btree_blocks()); }
 
 KTEST(XFS, SmallHoleWriteAllocatesOnlyNeededBlocks) {
     constexpr size_t BLOCK_SIZE = 4096;

@@ -715,6 +715,20 @@ auto btree_alloc_new_block(XfsMountContext* mount, XfsTransaction* tp, xfs_agnum
         }
     }
 
+    // The AGFL is persistent state and may contain a stale alias after an
+    // interrupted or previously buggy metadata update.  Capture before
+    // treating the block as fresh so transaction cancellation can restore a
+    // live cached node even if the reachability checks missed an owner.
+    if (xfs_trans_capture_buf(tp, bh) != 0) {
+        brelse(bh);
+        *out_bh = nullptr;
+        if constexpr (Traits::TYPE == XfsBtreeType::SHORT) {
+            return NULLAGBLOCK;
+        } else {
+            return NULLFSBLOCK;
+        }
+    }
+
     // Zero the block and write the header
     __builtin_memset(bh->data, 0, bh->size);
 

@@ -170,6 +170,15 @@ auto bmbt_alloc_block(XfsInode* ip, XfsTransaction* tp, uint16_t level, BufHead*
         return -EIO;
     }
 
+    // Preserve the old contents until commit.  AGFL reachability validation
+    // covers the mounted AG btrees, while this before-image also protects
+    // inode-owned BMBT aliases from destructive reuse on cancellation.
+    int const CAPTURE_RC = xfs_trans_capture_buf(tp, bh);
+    if (CAPTURE_RC != 0) {
+        brelse(bh);
+        return CAPTURE_RC;
+    }
+
     __builtin_memset(bh->data, 0, bh->size);
     auto* hdr = reinterpret_cast<XfsBtreeLblock*>(bh->data);
     hdr->bb_magic = Be32::from_cpu(XFS_BMAP_CRC_MAGIC);
