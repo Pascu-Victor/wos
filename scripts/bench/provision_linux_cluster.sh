@@ -29,6 +29,7 @@ wait_for_ssh() {
   while (( waited < WAIT_TIMEOUT )); do
     echo "  waiting for SSH on ${ssh_target} (${waited}/${WAIT_TIMEOUT}s)"
     if sshpass -p "$REMOTE_PASS" ssh \
+      -F /dev/null \
       -o StrictHostKeyChecking=no \
       -o UserKnownHostsFile=/dev/null \
       -o ConnectTimeout=5 \
@@ -62,11 +63,15 @@ for target in "$@"; do
 
   echo "  SSH is reachable on ${ssh_target}; starting provisioning"
 
-  sshpass -p "$REMOTE_PASS" ssh \
-    -o StrictHostKeyChecking=no \
-    -o UserKnownHostsFile=/dev/null \
-    -o ConnectTimeout=5 \
-    "${ssh_port_args[@]}" \
-    "${REMOTE_USER}@${ssh_target}" \
-    "echo '$REMOTE_PASS' | sudo -S bash -s" < "${BENCH_SCRIPTS}/provision_ubuntu_bench.sh"
+  {
+    printf '%s\n' "$REMOTE_PASS"
+    sed -n '1,$p' "${BENCH_SCRIPTS}/provision_ubuntu_bench.sh"
+  } | sshpass -p "$REMOTE_PASS" ssh \
+      -F /dev/null \
+      -o StrictHostKeyChecking=no \
+      -o UserKnownHostsFile=/dev/null \
+      -o ConnectTimeout=5 \
+      "${ssh_port_args[@]}" \
+      "${REMOTE_USER}@${ssh_target}" \
+      "sudo -S -p '' bash -s"
 done

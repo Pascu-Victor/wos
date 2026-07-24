@@ -16,6 +16,7 @@ REMOTE_PORT="${WOS_LINUX_SSH_PORT:-}"
 
 SFTP_ARGS=(
   -q
+  -F /dev/null
   -o BatchMode=no
   -o StrictHostKeyChecking=no
   -o UserKnownHostsFile=/dev/null

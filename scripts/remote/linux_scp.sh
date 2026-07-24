@@ -13,6 +13,7 @@ REMOTE_PASS="${WOS_LINUX_PASSWORD:-1234}"
 REMOTE_PORT="${WOS_LINUX_SSH_PORT:-}"
 
 SCP_ARGS=(
+  -F /dev/null
   -o StrictHostKeyChecking=no
   -o UserKnownHostsFile=/dev/null
   -o LogLevel=ERROR

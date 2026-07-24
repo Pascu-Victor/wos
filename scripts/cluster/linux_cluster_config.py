@@ -31,6 +31,7 @@ class DomainIdentity:
     nvram_path: str
     tap_name: str
     mac_address: str
+    network_name: str = ""
 
 
 def positive_integer(value: object, context: str) -> int:
@@ -265,24 +266,37 @@ def patch_domain_root(
     interface = devices.find("interface")
     if interface is None:
         raise ValueError("base libvirt XML is missing a network interface")
-    interface.set("type", "ethernet")
     source = interface.find("source")
-    if source is not None:
-        interface.remove(source)
     target = interface.find("target")
-    if target is None:
-        target = ET.SubElement(interface, "target")
-    target.attrib.clear()
-    target.set("dev", identity.tap_name)
-    target.set("managed", "no")
+    if identity.network_name:
+        interface.set("type", "network")
+        if source is None:
+            source = ET.SubElement(interface, "source")
+        source.attrib.clear()
+        source.set("network", identity.network_name)
+        if target is not None:
+            interface.remove(target)
+    else:
+        interface.set("type", "ethernet")
+        if source is not None:
+            interface.remove(source)
+        if target is None:
+            target = ET.SubElement(interface, "target")
+        target.attrib.clear()
+        target.set("dev", identity.tap_name)
+        target.set("managed", "no")
     script = interface.find("script")
     if script is not None:
         interface.remove(script)
     link = interface.find("link")
-    if link is None:
-        link = ET.SubElement(interface, "link")
-    link.attrib.clear()
-    link.set("state", "up")
+    if identity.network_name:
+        if link is not None:
+            interface.remove(link)
+    else:
+        if link is None:
+            link = ET.SubElement(interface, "link")
+        link.attrib.clear()
+        link.set("state", "up")
     mac = interface.find("mac")
     if mac is None:
         raise ValueError("base libvirt XML interface is missing a MAC address")
@@ -329,16 +343,23 @@ def verify_domain_root(
         raise ValueError("defined domain vda path does not match")
 
     interface = devices.find("interface")
-    if interface is None or interface.get("type") != "ethernet":
-        raise ValueError("defined domain Ethernet interface does not match")
+    expected_interface_type = "network" if identity.network_name else "ethernet"
+    if interface is None or interface.get("type") != expected_interface_type:
+        raise ValueError(f"defined domain {expected_interface_type} interface does not match")
+    source = interface.find("source")
     target = interface.find("target")
     mac = interface.find("mac")
     link = interface.find("link")
-    if target is None or target.get("dev") != identity.tap_name or target.get("managed") != "no":
+    if identity.network_name:
+        if source is None or source.get("network") != identity.network_name:
+            raise ValueError("defined domain managed network source does not match")
+        if target is not None:
+            raise ValueError("defined domain managed network retained a fixed TAP target")
+    elif target is None or target.get("dev") != identity.tap_name or target.get("managed") != "no":
         raise ValueError("defined domain TAP target does not match")
     if mac is None or mac.get("address", "").lower() != identity.mac_address.lower():
         raise ValueError("defined domain MAC address does not match")
-    if link is None or link.get("state") != "up":
+    if not identity.network_name and (link is None or link.get("state") != "up"):
         raise ValueError("defined domain interface link state does not match")
 
     if resources is None:
@@ -393,7 +414,9 @@ def add_identity_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--base-disk", required=True)
     parser.add_argument("--disk-path", required=True)
     parser.add_argument("--nvram-path", required=True)
-    parser.add_argument("--tap-name", required=True)
+    network = parser.add_mutually_exclusive_group(required=True)
+    network.add_argument("--tap-name")
+    network.add_argument("--network-name")
     parser.add_argument("--mac-address", required=True)
     parser.add_argument("--cpus", type=int)
     parser.add_argument("--memory-kib", type=int)
@@ -418,8 +441,9 @@ def identity_from_args(args: argparse.Namespace) -> DomainIdentity:
         base_disk=args.base_disk,
         disk_path=args.disk_path,
         nvram_path=args.nvram_path,
-        tap_name=args.tap_name,
+        tap_name=args.tap_name or "",
         mac_address=args.mac_address,
+        network_name=args.network_name or "",
     )
 
 

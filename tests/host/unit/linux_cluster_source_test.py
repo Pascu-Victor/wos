@@ -26,7 +26,7 @@ EXPECTED_LAYOUTS = {
         (1, 11, 10923 * 1024),
         (2, 10, 10922 * 1024),
     ],
-    4: [(node_id, 8, 8192 * 1024) for node_id in range(4)],
+    4: [(node_id, 8, 32768 * 1024) for node_id in range(4)],
 }
 
 
@@ -135,6 +135,14 @@ def test_fixed_resource_resolution(helper) -> None:
         result.stdout.splitlines(),
         ["0\t11\t11185152", "1\t11\t11185152", "2\t10\t11184128"],
         "resource CLI original node IDs",
+    )
+    matched = helper.resolve_node_resources(
+        ROOT / "configs" / "cluster_selfhost_linux_kvm.json", 1
+    )
+    assert_equal(
+        [(resource.node_id, resource.vcpus, resource.memory_kib) for resource in matched],
+        [(0, 36, 98304 * 1024)],
+        "matched Linux KVM self-host resources",
     )
 
 
@@ -264,6 +272,56 @@ def test_configured_domain_patch(helper) -> None:
         assert_equal(verify_result.returncode, 0, "domain verify CLI exit")
 
 
+def test_managed_network_domain_patch(helper) -> None:
+    identity = helper.DomainIdentity(
+        domain_name="wos-linux-perf",
+        base_disk="/var/lib/libvirt/images/ubuntu-base.qcow2",
+        disk_path="/var/lib/libvirt/images/wos-linux-perf.qcow2",
+        nvram_path="/var/lib/libvirt/qemu/nvram/wos-linux-perf_VARS.fd",
+        tap_name="",
+        mac_address="52:54:00:22:34:80",
+        network_name="bridge",
+    )
+    root = ET.fromstring(base_domain_xml())
+    helper.patch_domain_root(root, identity)
+    helper.verify_domain_root(root, identity)
+
+    interface = root.find("./devices/interface")
+    assert_equal(interface.get("type"), "network", "managed interface type")
+    assert_equal(interface.find("source").attrib, {"network": "bridge"}, "managed source")
+    assert_equal(interface.find("target"), None, "managed fixed TAP removal")
+    assert_equal(interface.find("script"), None, "managed script removal")
+    assert_equal(interface.find("link"), None, "managed fixed link removal")
+    assert_equal(interface.find("mac").get("address"), identity.mac_address, "managed MAC")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        xml_path = Path(tmp) / "domain.xml"
+        xml_path.write_text(base_domain_xml(), encoding="utf-8")
+        identity_args = [
+            "--domain-name",
+            identity.domain_name,
+            "--base-disk",
+            identity.base_disk,
+            "--disk-path",
+            identity.disk_path,
+            "--nvram-path",
+            identity.nvram_path,
+            "--network-name",
+            identity.network_name,
+            "--mac-address",
+            identity.mac_address,
+        ]
+        for command in ("patch-domain", "verify-domain"):
+            result = subprocess.run(
+                [sys.executable, str(HELPER_PATH), command, str(xml_path), *identity_args],
+                cwd=ROOT,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            assert_equal(result.returncode, 0, f"managed {command} CLI exit")
+
+
 def test_legacy_domain_patch_and_numa_rejection(helper) -> None:
     identity = domain_identity(helper)
     root = ET.fromstring(base_domain_xml(current_memory=False))
@@ -299,10 +357,13 @@ def test_launcher_source_and_argument_errors() -> None:
     source = LAUNCHER_PATH.read_text(encoding="utf-8")
     for expected in (
         "--cluster-config)",
+        "--libvirt-network)",
         'python3 "$RESOURCE_HELPER" resources',
         'python3 "$RESOURCE_HELPER" patch-domain',
         "dumpxml --inactive",
         'python3 "$RESOURCE_HELPER" verify-domain',
+        "vol-create-as",
+        "--backing-vol",
         '--cpus "${NODE_VCPUS[i]}"',
         '--memory-kib "${NODE_MEMORY_KIB[i]}"',
     ):
@@ -438,6 +499,7 @@ def main() -> None:
         lambda: test_fixed_resource_resolution(helper),
         lambda: test_resource_validation(helper),
         lambda: test_configured_domain_patch(helper),
+        lambda: test_managed_network_domain_patch(helper),
         lambda: test_legacy_domain_patch_and_numa_rejection(helper),
         test_launcher_source_and_argument_errors,
         lambda: test_orchestrator_config_forwarding(orchestrator),

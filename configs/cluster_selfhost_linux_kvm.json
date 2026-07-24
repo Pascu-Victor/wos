@@ -1,0 +1,52 @@
+{
+    "zones": [
+        {
+            "id": "GLOBAL",
+            "debug": false,
+            "mtu": 9000,
+            "nic_model": "virtio-net-pci",
+            "ivshmem": {
+                "enabled": false,
+                "size": "16M",
+                "root_path": "/dev/shm",
+                "topology": "full-mesh"
+            },
+            "bridge": {
+                "stp": false,
+                "ip": null
+            },
+            "vm": {
+                "memory": "98304M",
+                "cpus": 36,
+                "disk0": "disk.qcow2",
+                "disk1": "mountfs.qcow2"
+            }
+        },
+        {
+            "id": 0,
+            "name": "lan",
+            "nodes": 1,
+            "nic_model": "virtio-net-pci",
+            "nic_queues": 2,
+            "vhost": false,
+            "netdev_driver": "dhcp",
+            "bridge": {
+                "ip": "10.10.0.100/24",
+                "dns": "10.10.0.1"
+            }
+        },
+        {
+            "id": 1,
+            "name": "wki",
+            "nodes": 1,
+            "nic_model": "virtio-net-pci",
+            "nic_queues": 8,
+            "vhost": true,
+            "netdev_driver": "wki",
+            "ivshmem": {
+                "enabled": false,
+                "topology": "full-mesh"
+            }
+        }
+    ]
+}
