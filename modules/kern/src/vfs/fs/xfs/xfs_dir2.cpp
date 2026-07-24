@@ -24,6 +24,7 @@
 #include <vfs/fs/xfs/xfs_alloc.hpp>
 #include <vfs/fs/xfs/xfs_bmap.hpp>
 #include <vfs/fs/xfs/xfs_trans.hpp>
+#include <vfs/stat.hpp>
 
 #include "net/endian.hpp"
 #include "vfs/fs/xfs/xfs_format.hpp"
@@ -1585,7 +1586,7 @@ auto xfs_dir_lookup_authoritative(XfsInode* dp, const char* name, uint16_t namel
 
 namespace {
 
-auto dir_entry_index_membership(const XfsDirEntry* observed, int lookup_result, const XfsDirEntry* indexed) -> int {
+auto dir_entry_index_identity_membership(const XfsDirEntry* observed, int lookup_result, const XfsDirEntry* indexed) -> int {
     if (observed == nullptr) {
         return -EINVAL;
     }
@@ -1600,6 +1601,32 @@ auto dir_entry_index_membership(const XfsDirEntry* observed, int lookup_result, 
     }
     if (indexed->ino != observed->ino || indexed->ftype != observed->ftype) {
         return 0;
+    }
+    return 1;
+}
+
+auto dir_entry_index_membership(XfsInode* dp, const XfsDirEntry* observed, int lookup_result, const XfsDirEntry* indexed) -> int {
+    if (dp == nullptr || dp->mount == nullptr) {
+        return -EINVAL;
+    }
+    int const IDENTITY_MEMBERSHIP = dir_entry_index_identity_membership(observed, lookup_result, indexed);
+    if (IDENTITY_MEMBERSHIP != 1) {
+        return IDENTITY_MEMBERSHIP;
+    }
+
+    // A committed unlink can leave an otherwise valid leaf/data record
+    // behind after its target inode has already reached zero links. Pathname
+    // resolution correctly treats that record as absent, and it must not make
+    // readdir resurrect the name or make rmdir report ENOTEMPTY forever.
+    // Preserve hard errors: only an explicitly unavailable/zero-link target
+    // is an unreachable residual.
+    ker::vfs::Stat target_stat{};
+    int const TARGET_STATUS = xfs_inode_stat(dp->mount, indexed->ino, &target_stat, true, true);
+    if (TARGET_STATUS == -ENOENT) {
+        return 0;
+    }
+    if (TARGET_STATUS != 0) {
+        return TARGET_STATUS;
     }
     return 1;
 }
@@ -1628,7 +1655,7 @@ auto xfs_dir_entry_is_indexed(XfsInode* dp, const XfsDirEntry* observed) -> int 
         default:
             return -EINVAL;
     }
-    return dir_entry_index_membership(observed, lookup_ret, &indexed);
+    return dir_entry_index_membership(dp, observed, lookup_ret, &indexed);
 }
 
 void xfs_dir_observe_entry(XfsInode* dp, const XfsDirEntry* entry) {
@@ -4758,12 +4785,12 @@ auto xfs_selftest_directory_entry_index_membership() -> bool {
     std::memcpy(observed.name.data(), "foo", observed.namelen);
 
     XfsDirEntry indexed = observed;
-    bool const MATCHED = dir_entry_index_membership(&observed, 0, &indexed) == 1;
-    bool const UNINDEXED = dir_entry_index_membership(&observed, -ENOENT, &indexed) == 0;
+    bool const MATCHED = dir_entry_index_identity_membership(&observed, 0, &indexed) == 1;
+    bool const UNINDEXED = dir_entry_index_identity_membership(&observed, -ENOENT, &indexed) == 0;
 
     indexed.ino++;
-    bool const REPLACED_ENTRY_UNINDEXED = dir_entry_index_membership(&observed, 0, &indexed) == 0;
-    bool const IO_ERROR_PROPAGATED = dir_entry_index_membership(&observed, -EIO, nullptr) == -EIO;
+    bool const REPLACED_ENTRY_UNINDEXED = dir_entry_index_identity_membership(&observed, 0, &indexed) == 0;
+    bool const IO_ERROR_PROPAGATED = dir_entry_index_identity_membership(&observed, -EIO, nullptr) == -EIO;
     return MATCHED && UNINDEXED && REPLACED_ENTRY_UNINDEXED && IO_ERROR_PROPAGATED;
 }
 

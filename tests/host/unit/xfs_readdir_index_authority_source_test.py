@@ -27,6 +27,12 @@ membership = function_body(DIR2, "auto xfs_dir_entry_is_indexed(")
 assert "dir2_extent_or_btree_lookup" in membership
 assert "&indexed, false" in membership
 assert "xfs_dir_lookup_authoritative" not in membership
+assert "dir_entry_index_membership(dp, observed" in membership
+
+index_membership = function_body(DIR2, "auto dir_entry_index_membership(")
+assert "xfs_inode_stat(dp->mount, indexed->ino" in index_membership
+assert "TARGET_STATUS == -ENOENT" in index_membership
+assert "TARGET_STATUS != 0" in index_membership
 
 visibility = function_body(VFS, "auto readdir_entry_visibility(")
 assert "xfs_dentry_cache_lookup_parent" in visibility
