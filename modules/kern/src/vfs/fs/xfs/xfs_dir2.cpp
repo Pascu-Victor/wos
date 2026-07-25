@@ -338,8 +338,10 @@ constexpr size_t XFS_DENTRY_CACHE_SET_COUNT = 65536;
 constexpr size_t XFS_DENTRY_CACHE_WAYS = 4;
 constexpr size_t XFS_DENTRY_GENERATION_SET_COUNT = 16384;
 constexpr size_t XFS_DENTRY_GENERATION_WAYS = 4;
+constexpr size_t XFS_REMOVED_NAME_FILTER_WORDS = 16;
 static_assert((XFS_DENTRY_CACHE_SET_COUNT & (XFS_DENTRY_CACHE_SET_COUNT - 1)) == 0);
 static_assert((XFS_DENTRY_GENERATION_SET_COUNT & (XFS_DENTRY_GENERATION_SET_COUNT - 1)) == 0);
+static_assert((XFS_REMOVED_NAME_FILTER_WORDS & (XFS_REMOVED_NAME_FILTER_WORDS - 1)) == 0);
 
 struct XfsDentryCacheEntry {
     std::array<char, 256> name{};
@@ -362,6 +364,10 @@ struct XfsDentryCacheSet {
 };
 
 struct XfsDentryGenerationEntry {
+    // Names removed while this directory owns the generation slot. This
+    // no-false-negative summary outlives individual negative dentries, so a
+    // readdir cache miss can still recognize a possible residual record.
+    std::array<uint64_t, XFS_REMOVED_NAME_FILTER_WORDS> removed_name_filter{};
     XfsMountContext* mount{};
     xfs_ino_t parent_ino{};
     uint64_t hash{};
@@ -412,13 +418,13 @@ auto xfs_dentry_hash_name(XfsMountContext* mount, xfs_ino_t parent_ino, const ch
 auto xfs_dentry_next_generation_value() -> uint64_t { return g_xfs_dentry_next_generation.fetch_add(1, std::memory_order_relaxed) + 1; }
 
 auto xfs_dentry_cache_dir_generation_locked(XfsDentryGenerationSet& set, XfsMountContext* mount, xfs_ino_t parent_ino, uint64_t hash)
-    -> uint64_t {
+    -> XfsDentryGenerationEntry* {
     uint64_t const USE_STAMP = ++set.clock;
     XfsDentryGenerationEntry* victim = &set.ways.front();
     for (auto& candidate : set.ways) {
         if (candidate.valid && candidate.hash == hash && candidate.mount == mount && candidate.parent_ino == parent_ino) {
             candidate.last_used = USE_STAMP;
-            return candidate.generation;
+            return &candidate;
         }
         if (!candidate.valid) {
             victim = &candidate;
@@ -429,18 +435,49 @@ auto xfs_dentry_cache_dir_generation_locked(XfsDentryGenerationSet& set, XfsMoun
         }
     }
 
-    uint64_t const GENERATION = xfs_dentry_next_generation_value();
+    for (auto& word : victim->removed_name_filter) {
+        word = 0;
+    }
     victim->mount = mount;
     victim->parent_ino = parent_ino;
     victim->hash = hash;
-    victim->generation = GENERATION;
+    victim->generation = xfs_dentry_next_generation_value();
     victim->last_used = USE_STAMP;
     victim->valid = true;
-    return GENERATION;
+    return victim;
+}
+
+void xfs_removed_name_filter_add(XfsDentryGenerationEntry* generation, const char* name, uint16_t namelen) {
+    if (generation == nullptr || name == nullptr || namelen == 0) {
+        return;
+    }
+    constexpr size_t FILTER_BITS = XFS_REMOVED_NAME_FILTER_WORDS * 64;
+    uint32_t const HASH = xfs_da_hashname(reinterpret_cast<const uint8_t*>(name), namelen);
+    size_t const FIRST_BIT = HASH & (FILTER_BITS - 1);
+    size_t const SECOND_BIT = dir2_name_filter_second_hash(HASH) & (FILTER_BITS - 1);
+    generation->removed_name_filter[FIRST_BIT >> 6U] |= 1ULL << (FIRST_BIT & 63U);
+    generation->removed_name_filter[SECOND_BIT >> 6U] |= 1ULL << (SECOND_BIT & 63U);
+}
+
+auto xfs_removed_name_filter_maybe_contains(const XfsDentryGenerationEntry* generation, const char* name, uint16_t namelen) -> bool {
+    if (generation == nullptr || name == nullptr || namelen == 0) {
+        return false;
+    }
+    constexpr size_t FILTER_BITS = XFS_REMOVED_NAME_FILTER_WORDS * 64;
+    uint32_t const HASH = xfs_da_hashname(reinterpret_cast<const uint8_t*>(name), namelen);
+    size_t const FIRST_BIT = HASH & (FILTER_BITS - 1);
+    size_t const SECOND_BIT = dir2_name_filter_second_hash(HASH) & (FILTER_BITS - 1);
+    uint64_t const FIRST_MASK = 1ULL << (FIRST_BIT & 63U);
+    uint64_t const SECOND_MASK = 1ULL << (SECOND_BIT & 63U);
+    return (generation->removed_name_filter[FIRST_BIT >> 6U] & FIRST_MASK) != 0 &&
+           (generation->removed_name_filter[SECOND_BIT >> 6U] & SECOND_MASK) != 0;
 }
 
 auto xfs_dentry_cache_lookup_impl(XfsMountContext* mount, xfs_ino_t parent_ino, const char* name, uint16_t namelen, XfsDirEntry* entry,
-                                  int* result) -> bool {
+                                  int* result, bool* may_have_removed_record = nullptr) -> bool {
+    if (may_have_removed_record != nullptr) {
+        *may_have_removed_record = false;
+    }
     if (mount == nullptr || parent_ino == NULLFSINO || name == nullptr || entry == nullptr || result == nullptr || namelen >= 256) {
         return false;
     }
@@ -451,7 +488,11 @@ auto xfs_dentry_cache_lookup_impl(XfsMountContext* mount, xfs_ino_t parent_ino, 
     auto& set = g_xfs_dentry_cache.at(HASH & (XFS_DENTRY_CACHE_SET_COUNT - 1));
 
     uint64_t const GENERATION_IRQF = generation_set.lock.lock_irqsave();
-    uint64_t const DIR_GENERATION = xfs_dentry_cache_dir_generation_locked(generation_set, mount, parent_ino, DIR_HASH);
+    XfsDentryGenerationEntry* generation = xfs_dentry_cache_dir_generation_locked(generation_set, mount, parent_ino, DIR_HASH);
+    uint64_t const DIR_GENERATION = generation->generation;
+    if (may_have_removed_record != nullptr) {
+        *may_have_removed_record = xfs_removed_name_filter_maybe_contains(generation, name, namelen);
+    }
     uint64_t const CACHE_IRQF = set.lock.lock_irqsave();
     for (auto& candidate : set.ways) {
         if (!candidate.valid || candidate.hash != HASH || candidate.mount != mount || candidate.parent_ino != parent_ino ||
@@ -503,7 +544,7 @@ void xfs_dentry_cache_store(XfsInode* dp, const char* name, uint16_t namelen, in
     auto& set = g_xfs_dentry_cache.at(HASH & (XFS_DENTRY_CACHE_SET_COUNT - 1));
 
     uint64_t const GENERATION_IRQF = generation_set.lock.lock_irqsave();
-    uint64_t const DIR_GENERATION = xfs_dentry_cache_dir_generation_locked(generation_set, dp->mount, dp->ino, DIR_HASH);
+    uint64_t const DIR_GENERATION = xfs_dentry_cache_dir_generation_locked(generation_set, dp->mount, dp->ino, DIR_HASH)->generation;
     uint64_t const CACHE_IRQF = set.lock.lock_irqsave();
     uint64_t const USE_STAMP = ++set.clock;
     XfsDentryCacheEntry* victim = &set.ways.front();
@@ -539,6 +580,19 @@ void xfs_dentry_cache_store(XfsInode* dp, const char* name, uint16_t namelen, in
     set.lock.unlock_irqrestore(CACHE_IRQF);
     generation_set.lock.unlock_irqrestore(GENERATION_IRQF);
     g_xfs_dentry_stores.fetch_add(1, std::memory_order_relaxed);
+}
+
+void xfs_dentry_cache_note_removed_name(XfsInode* dp, const char* name, uint16_t namelen) {
+    if (dp == nullptr || dp->mount == nullptr || name == nullptr || namelen == 0) {
+        return;
+    }
+
+    uint64_t const DIR_HASH = xfs_dentry_hash_dir(dp->mount, dp->ino);
+    auto& generation_set = g_xfs_dentry_generations.at(DIR_HASH & (XFS_DENTRY_GENERATION_SET_COUNT - 1));
+    uint64_t const IRQF = generation_set.lock.lock_irqsave();
+    XfsDentryGenerationEntry* generation = xfs_dentry_cache_dir_generation_locked(generation_set, dp->mount, dp->ino, DIR_HASH);
+    xfs_removed_name_filter_add(generation, name, namelen);
+    generation_set.lock.unlock_irqrestore(IRQF);
 }
 
 void xfs_dentry_cache_store_added_name(XfsInode* dp, const char* name, uint16_t namelen, xfs_ino_t ino, uint8_t ftype) {
@@ -580,6 +634,9 @@ void xfs_dentry_cache_invalidate_dir_impl(XfsInode* dp) {
         }
     }
 
+    for (auto& word : victim->removed_name_filter) {
+        word = 0;
+    }
     victim->mount = dp->mount;
     victim->parent_ino = dp->ino;
     victim->hash = HASH;
@@ -1530,8 +1587,8 @@ auto dir2_extent_or_btree_lookup(XfsInode* dp, const char* name, uint16_t namele
 void xfs_dentry_cache_invalidate_dir(XfsInode* dp) { xfs_dentry_cache_invalidate_dir_impl(dp); }
 
 auto xfs_dentry_cache_lookup_parent(XfsMountContext* mount, xfs_ino_t parent_ino, const char* name, uint16_t namelen, XfsDirEntry* entry,
-                                    int* result) -> bool {
-    return xfs_dentry_cache_lookup_impl(mount, parent_ino, name, namelen, entry, result);
+                                    int* result, bool* may_have_removed_record) -> bool {
+    return xfs_dentry_cache_lookup_impl(mount, parent_ino, name, namelen, entry, result, may_have_removed_record);
 }
 
 namespace {
@@ -4651,6 +4708,10 @@ auto xfs_dir_removename(XfsInode* dp, const char* name, uint16_t namelen, XfsTra
     if (rc == 0) {
         dp->dir_generation++;
         dir2_leaf_index_note_unknown(dp);
+        // Keep this conservative marker even if the enclosing transaction is
+        // later cancelled. A rollback can make it a false positive, which
+        // costs one lookup; clearing it could resurrect an unindexed record.
+        xfs_dentry_cache_note_removed_name(dp, name, namelen);
         xfs_dentry_cache_store(dp, name, namelen, -ENOENT, nullptr);
     }
     return rc;
@@ -4938,7 +4999,23 @@ auto xfs_selftest_directory_name_filter() -> bool {
                                      xfs_dir_name_filter_known_absent(&dir, "gamma", 5) ||
                                      xfs_dir_name_filter_known_absent(&dir, "delta", 5);
     dir.dir_name_filter_complete = false;
-    return PROVES_ANOTHER_MISS && !xfs_dir_name_filter_known_absent(&dir, "beta", 4);
+    bool const INCOMPLETE_CANNOT_PROVE_MISS = !xfs_dir_name_filter_known_absent(&dir, "beta", 4);
+
+    static XfsDentryGenerationEntry removal_generation{};
+    for (auto& word : removal_generation.removed_name_filter) {
+        word = 0;
+    }
+    if (xfs_removed_name_filter_maybe_contains(&removal_generation, "removed", 7)) {
+        return false;
+    }
+    xfs_removed_name_filter_add(&removal_generation, "removed", 7);
+    if (!xfs_removed_name_filter_maybe_contains(&removal_generation, "removed", 7)) {
+        return false;
+    }
+    bool const REMOVAL_FILTER_DISCRIMINATES = !xfs_removed_name_filter_maybe_contains(&removal_generation, "present-a", 9) ||
+                                              !xfs_removed_name_filter_maybe_contains(&removal_generation, "present-b", 9) ||
+                                              !xfs_removed_name_filter_maybe_contains(&removal_generation, "present-c", 9);
+    return PROVES_ANOTHER_MISS && INCOMPLETE_CANNOT_PROVE_MISS && REMOVAL_FILTER_DISCRIMINATES;
 }
 
 auto xfs_selftest_dentry_cache_keeps_unrelated_dir_hot() -> bool {

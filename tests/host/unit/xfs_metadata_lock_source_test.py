@@ -418,10 +418,10 @@ def test_rmdir_reclaims_only_authoritatively_unindexed_records() -> None:
     require_order(
         function_body(dir_source, "xfs_dir_entry_is_indexed"),
         [
-            "xfs_dir_lookup_authoritative(dp, observed->name.data(), observed->namelen, &indexed)",
-            "dir_entry_index_membership(observed, LOOKUP_RET, &indexed)",
+            "dir2_extent_or_btree_lookup(dp, observed->name.data(), observed->namelen, &indexed, false)",
+            "dir_entry_index_membership(dp, observed, lookup_ret, &indexed)",
         ],
-        "directory-entry membership must use an authoritative lookup",
+        "directory-entry membership must use the authoritative index without data fallback",
     )
     require_order(
         function_body(vfs_source, "scan_indexed_directory_entries"),

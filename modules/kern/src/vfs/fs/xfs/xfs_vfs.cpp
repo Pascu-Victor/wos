@@ -2044,14 +2044,17 @@ auto readdir_entry_visibility(XfsInode* parent, const XfsDirEntry* entry) -> int
 
     XfsDirEntry cached{};
     int cached_result = 0;
-    if (!xfs_dentry_cache_lookup_parent(parent->mount, parent->ino, entry->name.data(), entry->namelen, &cached, &cached_result) ||
-        cached_result != -ENOENT) {
+    bool may_have_removed_record = false;
+    bool const CACHED = xfs_dentry_cache_lookup_parent(parent->mount, parent->ino, entry->name.data(), entry->namelen, &cached,
+                                                       &cached_result, &may_have_removed_record);
+    if (!may_have_removed_record && (!CACHED || cached_result != -ENOENT)) {
         return 1;
     }
 
-    // Successful removal installs a negative dentry while leaf/node data
-    // blocks can retain an unreachable record. Verify only these exceptional
-    // records against the index so normal readdir stays a linear data scan.
+    // Successful removal installs both a negative dentry and a per-directory
+    // summary bit. The dentry is fast but bounded; the generation summary
+    // survives its eviction. Verify only these exceptional records against
+    // the index so normal readdir stays a linear data scan.
     return xfs_dir_entry_is_indexed(parent, entry);
 }
 

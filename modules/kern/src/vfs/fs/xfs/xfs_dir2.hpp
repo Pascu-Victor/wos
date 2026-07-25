@@ -76,7 +76,7 @@ auto xfs_dir_entry_is_indexed(XfsInode* dp, const XfsDirEntry* observed) -> int;
 // Look up a name already observed for a parent inode without loading that
 // parent inode.  Returns true only when the dentry cache can answer.
 auto xfs_dentry_cache_lookup_parent(XfsMountContext* mount, xfs_ino_t parent_ino, const char* name, uint16_t namelen, XfsDirEntry* entry,
-                                    int* result) -> bool;
+                                    int* result, bool* may_have_removed_record = nullptr) -> bool;
 
 // Initialize the no-false-negative name filter for a newly created empty
 // directory, or use it to prove that a name cannot exist. Loaded directories

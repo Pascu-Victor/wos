@@ -36,8 +36,13 @@ assert "TARGET_STATUS != 0" in index_membership
 
 visibility = function_body(VFS, "auto readdir_entry_visibility(")
 assert "xfs_dentry_cache_lookup_parent" in visibility
-assert "cached_result != -ENOENT" in visibility
+assert "&may_have_removed_record" in visibility
+assert "!may_have_removed_record && (!CACHED || cached_result != -ENOENT)" in visibility
 assert "xfs_dir_entry_is_indexed" in visibility
+
+remove = function_body(DIR2, "auto xfs_dir_removename(")
+assert "xfs_dentry_cache_note_removed_name(dp, name, namelen)" in remove
+assert remove.index("xfs_dentry_cache_note_removed_name") < remove.index("xfs_dentry_cache_store")
 
 single = function_body(VFS, "auto readdir_callback(")
 batch = function_body(VFS, "auto readdir_batch_callback(")
