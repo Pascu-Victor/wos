@@ -263,6 +263,7 @@ auto reliable_rx_peer_accepts(uint16_t src_node) -> bool {
 auto message_uses_compute_lifecycle(MsgType type) -> bool {
     switch (type) {
         case MsgType::TASK_SUBMIT:
+        case MsgType::TASK_SUBMIT_FRAGMENT:
         case MsgType::TASK_ACCEPT:
         case MsgType::TASK_REJECT:
             return true;
@@ -271,7 +272,9 @@ auto message_uses_compute_lifecycle(MsgType type) -> bool {
     }
 }
 
-auto message_uses_deferred_compute_rx(MsgType type) -> bool { return type == MsgType::TASK_COMPLETE || type == MsgType::TASK_CANCEL; }
+auto message_uses_deferred_compute_rx(MsgType type) -> bool {
+    return type == MsgType::TASK_COMPLETE || type == MsgType::TASK_CANCEL || type == MsgType::TASK_SUBMIT_FRAGMENT;
+}
 
 auto message_uses_deferred_remotable_rx(MsgType type) -> bool {
     return type == MsgType::RESOURCE_ADVERT || type == MsgType::RESOURCE_WITHDRAW;
@@ -2797,6 +2800,9 @@ void wki_dispatch_reliable_msg(WkiChannel* rx_channel, uint32_t rx_channel_gener
         case MsgType::TASK_SUBMIT:
             detail::handle_task_submit(hdr, payload, payload_len, rx_channel, rx_channel_generation);
             break;
+        case MsgType::TASK_SUBMIT_FRAGMENT:
+            // Fragment frames are admitted to the deferred compute RX workers.
+            break;
         case MsgType::TASK_ACCEPT:
             detail::handle_task_accept(hdr, payload, payload_len, rx_channel, rx_channel_generation);
             break;
@@ -3161,6 +3167,7 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
         case MsgType::CHANNEL_CLOSE:
         // Compute messages
         case MsgType::TASK_SUBMIT:
+        case MsgType::TASK_SUBMIT_FRAGMENT:
         case MsgType::TASK_ACCEPT:
         case MsgType::TASK_REJECT:
         case MsgType::TASK_COMPLETE:

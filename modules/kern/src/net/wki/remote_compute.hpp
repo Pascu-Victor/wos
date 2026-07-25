@@ -418,6 +418,7 @@ auto wki_remote_compute_selftest_placement_score_accounts_for_inflight() -> bool
 auto wki_remote_compute_selftest_balanced_score_accounts_for_capacity() -> bool;
 auto wki_remote_compute_selftest_submit_policy_scope_restores_worker() -> bool;
 auto wki_remote_compute_selftest_submit_context_lengths_are_checked() -> bool;
+auto wki_remote_compute_selftest_submit_fragment_boundaries() -> bool;
 auto wki_remote_compute_selftest_submit_worker_count_is_bounded() -> bool;
 auto wki_remote_compute_selftest_accept_retry_is_fair() -> bool;
 auto wki_remote_compute_selftest_submit_cancel_is_session_scoped() -> bool;

@@ -98,6 +98,7 @@ enum class MsgType : uint8_t {
     TASK_COMPLETE = 0x53,
     TASK_CANCEL = 0x54,
     LOAD_REPORT = 0x55,
+    TASK_SUBMIT_FRAGMENT = 0x56,
 };
 
 // -----------------------------------------------------------------------------
@@ -990,6 +991,15 @@ struct TaskSubmitPayload {
 } __attribute__((packed));
 
 static_assert(sizeof(TaskSubmitPayload) == 20, "TaskSubmitPayload V3 must be 20 bytes");
+
+struct TaskSubmitFragmentPayload {
+    uint32_t task_id;
+    uint16_t total_len;
+    uint16_t offset;
+    // Fragment bytes follow.
+} __attribute__((packed));
+
+static_assert(sizeof(TaskSubmitFragmentPayload) == 8, "TaskSubmitFragmentPayload must be 8 bytes");
 
 // -----------------------------------------------------------------------------
 // TASK_ACCEPT / TASK_REJECT Payload - 16 bytes

@@ -1112,50 +1112,62 @@ def test_task_submit_envelopes_use_bounded_stack_storage() -> None:
     submitters = {
         "wki_task_submit_inline": (
             "auto wki_task_submit_vfs_ref(",
-            "if (TOTAL > WKI_ETH_MAX_PAYLOAD)",
-            "auto msg_len = static_cast<uint16_t>(TOTAL)",
+            "if (TOTAL > UINT16_MAX)",
         ),
         "wki_task_submit_vfs_ref": (
             "auto wki_task_wait(",
-            "if (total > WKI_ETH_MAX_PAYLOAD)",
-            "auto msg_len = static_cast<uint16_t>(total)",
+            "if (TOTAL > UINT16_MAX)",
         ),
     }
-    for function_name, (next_function, size_guard, length_assignment) in submitters.items():
+    for function_name, (next_function, size_guard) in submitters.items():
         body_start = source.index(f"auto {function_name}(")
         body = source[body_start : source.index(next_function, body_start + 1)]
         require_tokens(
             body,
             [
                 size_guard,
-                length_assignment,
+                "auto const MSG_LEN = static_cast<uint16_t>(TOTAL)",
                 "ipc_fd_count != 0 && ipc_fd_map == nullptr",
-                "std::array<uint8_t, WKI_ETH_MAX_PAYLOAD> buf __attribute__((uninitialized));",
-                "reinterpret_cast<TaskSubmitPayload*>(buf.data())",
-                "uint8_t* cursor = buf.data() + sizeof(TaskSubmitPayload)",
-                "MsgType::TASK_SUBMIT, buf.data(),",
+                "std::array<uint8_t, WKI_ETH_MAX_PAYLOAD> small_buf __attribute__((uninitialized));",
+                "std::unique_ptr<uint8_t[]> large_buf",
+                "uint8_t* const BUF = large_buf != nullptr ? large_buf.get() : small_buf.data()",
+                "reinterpret_cast<TaskSubmitPayload*>(BUF)",
+                "uint8_t* cursor = BUF + sizeof(TaskSubmitPayload)",
+                "send_task_submit_payload(target_node, SUBMIT_CHANNEL, TASK_ID, BUF, MSG_LEN)",
             ],
-            f"{function_name} bounded stack envelope",
+            f"{function_name} bounded submit envelope",
         )
         require_order(
             body,
             size_guard,
-            "std::array<uint8_t, WKI_ETH_MAX_PAYLOAD> buf",
+            "std::array<uint8_t, WKI_ETH_MAX_PAYLOAD> small_buf",
             f"{function_name} size check before stack use",
         )
         require_order(
             body,
-            "std::array<uint8_t, WKI_ETH_MAX_PAYLOAD> buf",
-            "MsgType::TASK_SUBMIT, buf.data(),",
+            "std::array<uint8_t, WKI_ETH_MAX_PAYLOAD> small_buf",
+            "send_task_submit_payload(target_node, SUBMIT_CHANNEL, TASK_ID, BUF, MSG_LEN)",
             f"{function_name} build before send",
         )
-        for forbidden in ["new (std::nothrow) uint8_t[msg_len]", "delete[] buf"]:
+        for forbidden in ["delete[] large_buf", "delete[] BUF"]:
             if forbidden in body:
-                fail(f"{function_name} must not heap-own its bounded TASK_SUBMIT envelope: found {forbidden}")
-        if re.search(r"std::array<uint8_t,\s*WKI_ETH_MAX_PAYLOAD>\s+buf\s*(?:\{\}|=\s*\{\})", body):
+                fail(f"{function_name} must use RAII for its large TASK_SUBMIT envelope: found {forbidden}")
+        if re.search(r"std::array<uint8_t,\s*WKI_ETH_MAX_PAYLOAD>\s+small_buf\s*(?:\{\}|=\s*\{\})", body):
             fail(f"{function_name} must not explicitly initialize the unused stack-envelope tail")
-        if re.search(r"MsgType::TASK_SUBMIT,\s*buf\.data\(\),\s*msg_len\)", body) is None:
-            fail(f"{function_name} must send exactly the initialized msg_len prefix")
+
+    fragment_sender = function_body(source, "send_task_submit_payload")
+    require_tokens(
+        fragment_sender,
+        [
+            "if (payload_len <= WKI_ETH_MAX_PAYLOAD)",
+            "MsgType::TASK_SUBMIT, payload, payload_len",
+            "std::array<uint8_t, WKI_ETH_MAX_PAYLOAD> frame{}",
+            "TaskSubmitFragmentPayload",
+            "WKI_TASK_SUBMIT_FRAGMENT_DATA_MAX",
+            "MsgType::TASK_SUBMIT_FRAGMENT",
+        ],
+        "large TASK_SUBMIT fragmentation with unchanged one-frame fast path",
+    )
 
     require_tokens(
         source,
@@ -1790,7 +1802,7 @@ def test_receiver_vfs_ref_submit_uses_bounded_worker_pool() -> None:
         [
             "constexpr size_t WKI_COMPUTE_RX_WORKER_MAX = 4",
             "WKI_COMPUTE_RX_QUEUE_MAX = WKI_CREDITS_RESOURCE * WKI_COMPUTE_RX_WORKER_MAX",
-            "WKI_COMPUTE_RX_PAYLOAD_MAX = sizeof(TaskCompletePayload) + WKI_TASK_MAX_OUTPUT",
+            "WKI_COMPUTE_RX_PAYLOAD_MAX = std::max(sizeof(TaskCompletePayload) + WKI_TASK_MAX_OUTPUT, WKI_ETH_MAX_PAYLOAD)",
             "std::array<PendingComputeRx, WKI_COMPUTE_RX_QUEUE_MAX>",
             "std::array<ComputeRxShard, WKI_COMPUTE_RX_WORKER_MAX>",
             "std::array<bool, WKI_COMPUTE_RX_QUEUE_MAX>",
@@ -2072,9 +2084,9 @@ def test_receiver_vfs_ref_submit_uses_bounded_worker_pool() -> None:
         submit_inline,
         [
             "uint64_t const TOTAL =",
-            "if (TOTAL > WKI_ETH_MAX_PAYLOAD)",
+            "if (TOTAL > UINT16_MAX)",
             "capture_submitter_channel(target_node)",
-            "wki_send_on_channel_generation(target_node, SUBMIT_CHANNEL.channel, SUBMIT_CHANNEL.generation",
+            "send_task_submit_payload(target_node, SUBMIT_CHANNEL, TASK_ID, BUF, MSG_LEN)",
         ],
         "INLINE sender overflow and channel-generation guards",
     )

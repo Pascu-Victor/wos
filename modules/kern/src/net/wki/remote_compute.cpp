@@ -14,6 +14,7 @@
 #include <cstring>
 #include <deque>
 #include <iterator>
+#include <memory>
 #include <net/wki/peer.hpp>
 #include <net/wki/remote_ipc.hpp>
 #include <net/wki/timer_math.hpp>
@@ -68,9 +69,12 @@ constexpr size_t WKI_COMPUTE_RX_WORKER_MAX = 4;
 // busy compile peer borrow unused capacity from idle shards while remaining
 // bounded across four-node bursts.
 constexpr size_t WKI_COMPUTE_RX_QUEUE_MAX = WKI_CREDITS_RESOURCE * WKI_COMPUTE_RX_WORKER_MAX;
-constexpr size_t WKI_COMPUTE_RX_PAYLOAD_MAX = sizeof(TaskCompletePayload) + WKI_TASK_MAX_OUTPUT;
+constexpr size_t WKI_COMPUTE_RX_PAYLOAD_MAX = std::max(sizeof(TaskCompletePayload) + WKI_TASK_MAX_OUTPUT, WKI_ETH_MAX_PAYLOAD);
+constexpr size_t WKI_COMPUTE_SUBMIT_FRAGMENT_MAX = WKI_COMPUTE_SUBMIT_QUEUE_MAX;
+constexpr size_t WKI_TASK_SUBMIT_FRAGMENT_DATA_MAX = WKI_ETH_MAX_PAYLOAD - sizeof(TaskSubmitFragmentPayload);
 static_assert(WKI_COMPUTE_RX_QUEUE_MAX <= UINT16_MAX);
 static_assert(WKI_COMPUTE_RX_PAYLOAD_MAX <= WKI_ETH_MAX_PAYLOAD);
+static_assert(WKI_TASK_SUBMIT_FRAGMENT_DATA_MAX > sizeof(TaskSubmitPayload));
 constexpr size_t WKI_SUBMITTED_TASK_INDEX_BUCKETS = 1024;
 static_assert((WKI_SUBMITTED_TASK_INDEX_BUCKETS & (WKI_SUBMITTED_TASK_INDEX_BUCKETS - 1)) == 0);
 constexpr uint64_t WKI_TASK_SUBMIT_VFS_TIMEOUT_US = 60'000'000;  // Remote binary fetch + launch.
@@ -315,6 +319,17 @@ struct PendingTaskSubmit {
     ComputeSubmitSessionToken session;
 };
 
+struct FragmentedTaskSubmit {
+    bool active = false;
+    uint16_t src_node = WKI_NODE_INVALID;
+    WkiChannel* rx_channel = nullptr;
+    uint32_t rx_channel_generation = 0;
+    uint32_t task_id = 0;
+    uint16_t total_len = 0;
+    uint16_t received_len = 0;
+    uint8_t* payload = nullptr;
+};
+
 struct CancelledTaskSubmit {
     bool active = false;
     uint32_t task_id = 0;
@@ -330,6 +345,10 @@ size_t s_pending_task_submit_head = 0;          // NOLINT(cppcoreguidelines-avoi
 size_t s_pending_task_submit_tail = 0;          // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 size_t s_pending_task_submit_count = 0;         // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 ker::mod::sys::Spinlock s_pending_submit_lock;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::array<FragmentedTaskSubmit, WKI_COMPUTE_SUBMIT_FRAGMENT_MAX>
+    s_fragmented_task_submits{};                        // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+ker::mod::sys::Spinlock s_fragmented_task_submit_lock;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+void release_fragmented_task_submits(uint16_t node_id, WkiChannel* channel = nullptr, uint32_t generation = 0);
 std::array<ker::mod::sched::task::Task*, WKI_COMPUTE_SUBMIT_WORKER_MAX>
     s_compute_submit_tasks{};                        // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 std::atomic<size_t> s_compute_submit_task_count{0};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
@@ -2668,6 +2687,46 @@ auto wki_try_remote_spawn(ker::mod::sched::task::Task* task, const WkiRemoteSpaw
 // Submitter Side - Task Submit (INLINE only in V1)
 // ===============================================================================
 
+namespace {
+
+[[maybe_unused]] constexpr auto task_submit_fragment_count(size_t total_len) -> size_t {
+    return (total_len + WKI_TASK_SUBMIT_FRAGMENT_DATA_MAX - 1) / WKI_TASK_SUBMIT_FRAGMENT_DATA_MAX;
+}
+
+auto send_task_submit_payload(uint16_t target_node, const SubmitterChannelToken& channel, uint32_t task_id, const uint8_t* payload,
+                              uint16_t payload_len) -> int {
+    if (payload == nullptr || payload_len < sizeof(TaskSubmitPayload) || channel.channel == nullptr || channel.generation == 0) {
+        return WKI_ERR_INVALID;
+    }
+    if (payload_len <= WKI_ETH_MAX_PAYLOAD) {
+        return wki_send_on_channel_generation(target_node, channel.channel, channel.generation, MsgType::TASK_SUBMIT, payload, payload_len);
+    }
+
+    // Large exec contexts are uncommon, so keep the ordinary compiler-submit
+    // path to one frame. Reliable-channel ordering makes the bounded fragments
+    // arrive in exact offset order on the receiver's deferred worker.
+    std::array<uint8_t, WKI_ETH_MAX_PAYLOAD> frame{};
+    size_t offset = 0;
+    while (offset < payload_len) {
+        size_t const CHUNK_LEN = std::min<size_t>(payload_len - offset, WKI_TASK_SUBMIT_FRAGMENT_DATA_MAX);
+        auto* fragment = reinterpret_cast<TaskSubmitFragmentPayload*>(frame.data());
+        fragment->task_id = task_id;
+        fragment->total_len = payload_len;
+        fragment->offset = static_cast<uint16_t>(offset);
+        std::memcpy(frame.data() + sizeof(TaskSubmitFragmentPayload), payload + offset, CHUNK_LEN);
+        auto const FRAME_LEN = static_cast<uint16_t>(sizeof(TaskSubmitFragmentPayload) + CHUNK_LEN);
+        int const RC = wki_send_on_channel_generation(target_node, channel.channel, channel.generation, MsgType::TASK_SUBMIT_FRAGMENT,
+                                                      frame.data(), FRAME_LEN);
+        if (RC != WKI_OK) {
+            return RC;
+        }
+        offset += CHUNK_LEN;
+    }
+    return WKI_OK;
+}
+
+}  // namespace
+
 auto wki_task_submit_inline(uint16_t target_node, const void* binary, uint32_t binary_len,
                             const char* const argv[],  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
                             const char* const envp[],  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
@@ -2690,11 +2749,22 @@ auto wki_task_submit_inline(uint16_t target_node, const void* binary, uint32_t b
     uint32_t const IPC_DATA_LEN = static_cast<uint32_t>(ipc_fd_count) * sizeof(WkiIpcFdEntry);
     uint64_t const TOTAL =
         static_cast<uint64_t>(sizeof(TaskSubmitPayload)) + sizeof(uint32_t) + binary_len + context_info.data_len + IPC_DATA_LEN;
-    if (TOTAL > WKI_ETH_MAX_PAYLOAD) {
-        ker::mod::dbg::log("[WKI] Task binary too large for inline submit: %u bytes", binary_len);
+    if (TOTAL > UINT16_MAX) {
+        ker::mod::dbg::log("[WKI] Task inline payload too large: binary=%u context=%u total=%llu", binary_len, context_info.data_len,
+                           TOTAL);
         cleanup_ipc_exports();
         return 0;
     }
+    auto const MSG_LEN = static_cast<uint16_t>(TOTAL);
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
+    std::array<uint8_t, WKI_ETH_MAX_PAYLOAD> small_buf __attribute__((uninitialized));
+    // NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
+    std::unique_ptr<uint8_t[]> large_buf{MSG_LEN > small_buf.size() ? new (std::nothrow) uint8_t[MSG_LEN] : nullptr};
+    if (MSG_LEN > small_buf.size() && large_buf == nullptr) {
+        cleanup_ipc_exports();
+        return 0;
+    }
+    uint8_t* const BUF = large_buf != nullptr ? large_buf.get() : small_buf.data();
 
     SubmitterChannelToken const SUBMIT_CHANNEL = capture_submitter_channel(target_node);
     if (SUBMIT_CHANNEL.channel == nullptr) {
@@ -2740,11 +2810,7 @@ auto wki_task_submit_inline(uint16_t target_node, const void* binary, uint32_t b
 
     // Build TASK_SUBMIT message. Every byte in the transmitted prefix is
     // assigned below; do not pattern-initialize the unused bounded tail.
-    auto msg_len = static_cast<uint16_t>(TOTAL);
-    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
-    std::array<uint8_t, WKI_ETH_MAX_PAYLOAD> buf __attribute__((uninitialized));
-
-    auto* submit = reinterpret_cast<TaskSubmitPayload*>(buf.data());
+    auto* submit = reinterpret_cast<TaskSubmitPayload*>(BUF);
     submit->task_id = TASK_ID;
     submit->delivery_mode = static_cast<uint8_t>(TaskDeliveryMode::INLINE);
     submit->prefer_inline = 1;
@@ -2757,7 +2823,7 @@ auto wki_task_submit_inline(uint16_t target_node, const void* binary, uint32_t b
     submit->reserved = 0;
 
     // INLINE format: {binary_len:u32, binary[binary_len], argv/envp/cwd, identity, policy, ipc_fd_entries[]}
-    uint8_t* cursor = buf.data() + sizeof(TaskSubmitPayload);
+    uint8_t* cursor = BUF + sizeof(TaskSubmitPayload);
     memcpy(cursor, &binary_len, sizeof(uint32_t));
     cursor += sizeof(uint32_t);
     memcpy(cursor, binary, binary_len);
@@ -2788,8 +2854,7 @@ auto wki_task_submit_inline(uint16_t target_node, const void* binary, uint32_t b
     }
     s_compute_lock.unlock();
 
-    int const SEND_RET = wki_send_on_channel_generation(target_node, SUBMIT_CHANNEL.channel, SUBMIT_CHANNEL.generation,
-                                                        MsgType::TASK_SUBMIT, buf.data(), msg_len);
+    int const SEND_RET = send_task_submit_payload(target_node, SUBMIT_CHANNEL, TASK_ID, BUF, MSG_LEN);
 
     if (SEND_RET != WKI_OK) {
         bool claimed_waiter = false;
@@ -2909,12 +2974,24 @@ auto wki_task_submit_vfs_ref(uint16_t target_node, const char* vfs_path,
 
     // TaskSubmitPayload + path_len + path + argv/envp/cwd + identity + policy + IPC fd entries.
     uint32_t const IPC_DATA_LEN = static_cast<uint32_t>(ipc_fd_count) * sizeof(WkiIpcFdEntry);
-    auto total = static_cast<uint32_t>(sizeof(TaskSubmitPayload) + sizeof(uint16_t) + PATH_LEN_WIRE + context_info.data_len + IPC_DATA_LEN);
-    if (total > WKI_ETH_MAX_PAYLOAD) {
-        ker::mod::dbg::log("[WKI] VFS_REF path too large: %u bytes", PATH_LEN_WIRE);
+    uint64_t const TOTAL =
+        static_cast<uint64_t>(sizeof(TaskSubmitPayload)) + sizeof(uint16_t) + PATH_LEN_WIRE + context_info.data_len + IPC_DATA_LEN;
+    if (TOTAL > UINT16_MAX) {
+        ker::mod::dbg::log("[WKI] VFS_REF submit context too large: path=%u context=%u ipc=%u total=%llu", PATH_LEN_WIRE,
+                           context_info.data_len, IPC_DATA_LEN, TOTAL);
         cleanup_ipc_exports();
         return 0;
     }
+    auto const MSG_LEN = static_cast<uint16_t>(TOTAL);
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
+    std::array<uint8_t, WKI_ETH_MAX_PAYLOAD> small_buf __attribute__((uninitialized));
+    // NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
+    std::unique_ptr<uint8_t[]> large_buf{MSG_LEN > small_buf.size() ? new (std::nothrow) uint8_t[MSG_LEN] : nullptr};
+    if (MSG_LEN > small_buf.size() && large_buf == nullptr) {
+        cleanup_ipc_exports();
+        return 0;
+    }
+    uint8_t* const BUF = large_buf != nullptr ? large_buf.get() : small_buf.data();
 
     SubmitterChannelToken const SUBMIT_CHANNEL = capture_submitter_channel(target_node);
     if (SUBMIT_CHANNEL.channel == nullptr) {
@@ -2959,11 +3036,7 @@ auto wki_task_submit_vfs_ref(uint16_t target_node, const char* vfs_path,
 
     // Every byte in the transmitted prefix is assigned below; do not
     // pattern-initialize the unused bounded tail.
-    auto msg_len = static_cast<uint16_t>(total);
-    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
-    std::array<uint8_t, WKI_ETH_MAX_PAYLOAD> buf __attribute__((uninitialized));
-
-    auto* submit = reinterpret_cast<TaskSubmitPayload*>(buf.data());
+    auto* submit = reinterpret_cast<TaskSubmitPayload*>(BUF);
     submit->task_id = TASK_ID;
     submit->delivery_mode = static_cast<uint8_t>(TaskDeliveryMode::VFS_REF);
     submit->prefer_inline = 0;
@@ -2976,7 +3049,7 @@ auto wki_task_submit_vfs_ref(uint16_t target_node, const char* vfs_path,
     submit->reserved = 0;
 
     // VFS_REF format: {path_len:u16, path[path_len], argv/envp/cwd, identity, policy, ipc_fd_entries[]}
-    uint8_t* cursor = buf.data() + sizeof(TaskSubmitPayload);
+    uint8_t* cursor = BUF + sizeof(TaskSubmitPayload);
     memcpy(cursor, &PATH_LEN_WIRE, sizeof(uint16_t));
     cursor += sizeof(uint16_t);
     memcpy(cursor, vfs_path, PATH_LEN_WIRE);
@@ -3007,8 +3080,7 @@ auto wki_task_submit_vfs_ref(uint16_t target_node, const char* vfs_path,
     }
     s_compute_lock.unlock();
 
-    int const SEND_RET = wki_send_on_channel_generation(target_node, SUBMIT_CHANNEL.channel, SUBMIT_CHANNEL.generation,
-                                                        MsgType::TASK_SUBMIT, buf.data(), msg_len);
+    int const SEND_RET = send_task_submit_payload(target_node, SUBMIT_CHANNEL, TASK_ID, BUF, MSG_LEN);
 
     if (SEND_RET != WKI_OK) {
         bool claimed_waiter = false;
@@ -4008,6 +4080,9 @@ void wki_remote_compute_retire_submit_session(uint16_t node_id) {
     }
     if (channel != nullptr && generation != 0) {
         static_cast<void>(wki_channel_close_generation(channel, node_id, WKI_CHAN_RESOURCE, generation));
+        release_fragmented_task_submits(node_id, channel, generation);
+    } else {
+        release_fragmented_task_submits(node_id);
     }
 
     s_compute_lock.lock();
@@ -6633,7 +6708,128 @@ auto classify_compute_rx_payload(MsgType type, const uint8_t* payload, uint16_t 
         return WkiComputeRxAdmission::DEFERRED;
     }
 
+    if (type == MsgType::TASK_SUBMIT_FRAGMENT) {
+        if (payload == nullptr || payload_len <= sizeof(TaskSubmitFragmentPayload)) {
+            return WkiComputeRxAdmission::DISCARD;
+        }
+        TaskSubmitFragmentPayload fragment = {};
+        std::memcpy(&fragment, payload, sizeof(fragment));
+        size_t const CHUNK_LEN = payload_len - sizeof(TaskSubmitFragmentPayload);
+        if (fragment.task_id == 0 || fragment.total_len <= WKI_ETH_MAX_PAYLOAD || fragment.offset >= fragment.total_len ||
+            std::cmp_greater(CHUNK_LEN, fragment.total_len - fragment.offset)) {
+            return WkiComputeRxAdmission::DISCARD;
+        }
+        if (fragment.offset == 0) {
+            if (CHUNK_LEN < sizeof(TaskSubmitPayload)) {
+                return WkiComputeRxAdmission::DISCARD;
+            }
+            TaskSubmitPayload submit = {};
+            std::memcpy(&submit, payload + sizeof(TaskSubmitFragmentPayload), sizeof(submit));
+            if (submit.task_id != fragment.task_id) {
+                return WkiComputeRxAdmission::DISCARD;
+            }
+        }
+        *copy_len = payload_len;
+        return WkiComputeRxAdmission::DEFERRED;
+    }
+
     return WkiComputeRxAdmission::INLINE;
+}
+
+void release_fragmented_task_submits(uint16_t node_id, WkiChannel* channel, uint32_t generation) {
+    std::array<uint8_t*, WKI_COMPUTE_SUBMIT_FRAGMENT_MAX> released = {};
+    size_t released_count = 0;
+
+    s_fragmented_task_submit_lock.lock();
+    for (auto& fragmented : s_fragmented_task_submits) {
+        if (!fragmented.active || fragmented.src_node != node_id) {
+            continue;
+        }
+        if (channel != nullptr && (fragmented.rx_channel != channel || fragmented.rx_channel_generation != generation)) {
+            continue;
+        }
+        released.at(released_count++) = fragmented.payload;
+        fragmented = {};
+    }
+    s_fragmented_task_submit_lock.unlock();
+
+    for (size_t i = 0; i < released_count; ++i) {
+        delete[] released.at(i);
+    }
+}
+
+void handle_task_submit_fragment_work(const WkiHeader& hdr, const uint8_t* payload, uint16_t payload_len, WkiChannel* rx_channel,
+                                      uint32_t rx_channel_generation) {
+    TaskSubmitFragmentPayload fragment = {};
+    std::memcpy(&fragment, payload, sizeof(fragment));
+    auto const* chunk = payload + sizeof(TaskSubmitFragmentPayload);
+    auto const CHUNK_LEN = static_cast<uint16_t>(payload_len - sizeof(TaskSubmitFragmentPayload));
+
+    // NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
+    std::unique_ptr<uint8_t[]> allocation;
+    if (fragment.offset == 0) {
+        allocation.reset(new (std::nothrow) uint8_t[fragment.total_len]);
+        if (allocation == nullptr) {
+            TaskResponsePayload reject = {};
+            reject.task_id = fragment.task_id;
+            reject.status = static_cast<uint8_t>(TaskRejectReason::NO_MEM);
+            wki_send_on_channel_generation(hdr.src_node, rx_channel, rx_channel_generation, MsgType::TASK_REJECT, &reject, sizeof(reject));
+            return;
+        }
+    }
+
+    uint8_t* completed_payload = nullptr;
+    s_fragmented_task_submit_lock.lock();
+    FragmentedTaskSubmit* entry = nullptr;
+    for (auto& candidate : s_fragmented_task_submits) {
+        if (candidate.active && candidate.src_node == hdr.src_node && candidate.rx_channel == rx_channel &&
+            candidate.rx_channel_generation == rx_channel_generation && candidate.task_id == fragment.task_id) {
+            entry = &candidate;
+            break;
+        }
+    }
+
+    if (entry == nullptr && fragment.offset == 0) {
+        for (auto& candidate : s_fragmented_task_submits) {
+            if (!candidate.active) {
+                entry = &candidate;
+                candidate.active = true;
+                candidate.src_node = hdr.src_node;
+                candidate.rx_channel = rx_channel;
+                candidate.rx_channel_generation = rx_channel_generation;
+                candidate.task_id = fragment.task_id;
+                candidate.total_len = fragment.total_len;
+                candidate.received_len = 0;
+                candidate.payload = allocation.release();
+                break;
+            }
+        }
+    }
+
+    bool const ACCEPT = entry != nullptr && entry->total_len == fragment.total_len && entry->received_len == fragment.offset &&
+                        CHUNK_LEN <= static_cast<uint16_t>(entry->total_len - entry->received_len);
+    bool const CAPACITY_REJECTED = entry == nullptr && fragment.offset == 0;
+    if (ACCEPT) {
+        std::memcpy(entry->payload + entry->received_len, chunk, CHUNK_LEN);
+        entry->received_len = static_cast<uint16_t>(entry->received_len + CHUNK_LEN);
+        if (entry->received_len == entry->total_len) {
+            completed_payload = entry->payload;
+            *entry = {};
+        }
+    }
+    s_fragmented_task_submit_lock.unlock();
+
+    if (CAPACITY_REJECTED) {
+        TaskResponsePayload reject = {};
+        reject.task_id = fragment.task_id;
+        reject.status = static_cast<uint8_t>(TaskRejectReason::OVERLOADED);
+        wki_send_on_channel_generation(hdr.src_node, rx_channel, rx_channel_generation, MsgType::TASK_REJECT, &reject, sizeof(reject));
+        return;
+    }
+    if (completed_payload != nullptr) {
+        detail::handle_task_submit(&hdr, completed_payload, fragment.total_len, rx_channel, rx_channel_generation);
+        delete[] completed_payload;
+    }
 }
 
 auto dequeue_compute_rx(size_t worker_index, uint16_t* slot_index) -> bool {
@@ -6685,6 +6881,9 @@ void release_compute_rx_slot(uint16_t slot_index) {
                     } else if (WORK_TYPE == MsgType::TASK_CANCEL) {
                         detail::handle_task_cancel(&work.hdr, work.payload.data(), work.payload_len, work.rx_channel,
                                                    work.rx_channel_generation);
+                    } else if (WORK_TYPE == MsgType::TASK_SUBMIT_FRAGMENT) {
+                        handle_task_submit_fragment_work(work.hdr, work.payload.data(), work.payload_len, work.rx_channel,
+                                                         work.rx_channel_generation);
                     }
                 }
             }
@@ -6922,6 +7121,34 @@ auto wki_remote_compute_selftest_submit_context_lengths_are_checked() -> bool {
     return EXACT_MAX && COMBINED_OVERFLOW && THREE_WAY_OVERFLOW && NULL_OUTPUT_REJECTED;
 }
 
+auto wki_remote_compute_selftest_submit_fragment_boundaries() -> bool {
+    constexpr uint32_t TASK_ID = 0x12A5U;
+    std::array<uint8_t, sizeof(TaskSubmitFragmentPayload) + sizeof(TaskSubmitPayload)> first_frame = {};
+    TaskSubmitFragmentPayload fragment = {
+        .task_id = TASK_ID,
+        .total_len = static_cast<uint16_t>(WKI_ETH_MAX_PAYLOAD + 1),
+        .offset = 0,
+    };
+    TaskSubmitPayload submit = {};
+    submit.task_id = TASK_ID;
+    std::memcpy(first_frame.data(), &fragment, sizeof(fragment));
+    std::memcpy(first_frame.data() + sizeof(fragment), &submit, sizeof(submit));
+
+    uint16_t copy_len = 0;
+    bool const FIRST_VALID =
+        classify_compute_rx_payload(MsgType::TASK_SUBMIT_FRAGMENT, first_frame.data(), static_cast<uint16_t>(first_frame.size()),
+                                    &copy_len) == WkiComputeRxAdmission::DEFERRED &&
+        copy_len == first_frame.size();
+    submit.task_id++;
+    std::memcpy(first_frame.data() + sizeof(fragment), &submit, sizeof(submit));
+    bool const MISMATCH_REJECTED =
+        classify_compute_rx_payload(MsgType::TASK_SUBMIT_FRAGMENT, first_frame.data(), static_cast<uint16_t>(first_frame.size()),
+                                    &copy_len) == WkiComputeRxAdmission::DISCARD;
+
+    return FIRST_VALID && MISMATCH_REJECTED && task_submit_fragment_count(WKI_ETH_MAX_PAYLOAD + 1) == 2 &&
+           task_submit_fragment_count(UINT16_MAX) == 8;
+}
+
 auto wki_remote_compute_selftest_submit_worker_count_is_bounded() -> bool {
     return compute_submit_worker_target(0) == 1 && compute_submit_worker_target(1) == 1 && compute_submit_worker_target(2) == 2 &&
            compute_submit_worker_target(WKI_COMPUTE_SUBMIT_WORKER_MAX) == WKI_COMPUTE_SUBMIT_WORKER_MAX &&
@@ -6930,7 +7157,7 @@ auto wki_remote_compute_selftest_submit_worker_count_is_bounded() -> bool {
 }
 
 auto wki_remote_compute_selftest_rx_admission_is_bounded() -> bool {
-    std::array<uint8_t, WKI_COMPUTE_RX_PAYLOAD_MAX> complete_bytes = {};
+    std::array<uint8_t, sizeof(TaskCompletePayload) + WKI_TASK_MAX_OUTPUT> complete_bytes = {};
     TaskCompletePayload complete = {};
     complete.output_len = WKI_TASK_MAX_OUTPUT;
     std::memcpy(complete_bytes.data(), &complete, sizeof(complete));
