@@ -215,8 +215,8 @@ def test_free_space_allocators_validate_dual_indexes_before_delete() -> None:
             "BNO_TARGET{.startblock = FOUND.startblock, .blockcount = FOUND.blockcount}",
             "XfsBtreeLookup::EQ",
             "same_free_extent(BNO_FOUND.startblock, BNO_FOUND.blockcount, FOUND.startblock, FOUND.blockcount)",
-            "rc = xfs_btree_delete(&cur, tp);",
-            "rc = xfs_btree_delete(&bno_cur, tp);",
+            "rc = delete_btree_record(&cur, tp, &pag->agf_cnt_root, &pag->agf_cnt_level);",
+            "rc = delete_btree_record(&bno_cur, tp, &pag->agf_bno_root, &pag->agf_bno_level);",
         ],
         "AGFL refill must validate bnobt before deleting either free-space record",
     )
@@ -227,8 +227,8 @@ def test_free_space_allocators_validate_dual_indexes_before_delete() -> None:
             "CNT_TARGET{.startblock = FOUND.startblock, .blockcount = FOUND.blockcount}",
             "XfsBtreeLookup::EQ",
             "same_free_extent(CNT_FOUND.startblock, CNT_FOUND.blockcount, FOUND.startblock, FOUND.blockcount)",
-            "rc = xfs_btree_delete(&bno_cur, tp);",
-            "rc = xfs_btree_delete(&cnt_cur, tp);",
+            "rc = delete_btree_record(&bno_cur, tp, &pag->agf_bno_root, &pag->agf_bno_level);",
+            "rc = delete_btree_record(&cnt_cur, tp, &pag->agf_cnt_root, &pag->agf_cnt_level);",
         ],
         "hint allocation must validate cntbt before deleting either free-space record",
     )
@@ -247,8 +247,8 @@ def test_free_space_allocators_validate_dual_indexes_before_delete() -> None:
             "bno_target.blockcount = found.blockcount;",
             "XfsBtreeLookup::EQ",
             "same_free_extent(BNO_FOUND.startblock, BNO_FOUND.blockcount, found.startblock, found.blockcount)",
-            "int delrc = xfs_btree_delete(&cur, tp);",
-            "delrc = xfs_btree_delete(&bno_cur, tp);",
+            "int delrc = delete_btree_record(&cur, tp, &pag->agf_cnt_root, &pag->agf_cnt_level);",
+            "delrc = delete_btree_record(&bno_cur, tp, &pag->agf_bno_root, &pag->agf_bno_level);",
         ],
         "size allocation must validate exact bnobt extent before deleting either free-space record",
     )
@@ -260,8 +260,8 @@ def test_free_space_allocators_validate_dual_indexes_before_delete() -> None:
             "XfsCntbtTraits::IRec const CNT_TARGET",
             "XfsBtreeLookup::EQ",
             "same_free_extent(CNT_REC.startblock, CNT_REC.blockcount, BNO_REC.startblock, BNO_REC.blockcount)",
-            "rc = xfs_btree_delete(&bno_cur, tp);",
-            "return xfs_btree_delete(&cnt_cur, tp);",
+            "rc = delete_btree_record(&bno_cur, tp, &pag->agf_bno_root, &pag->agf_bno_level);",
+            "return delete_btree_record(&cnt_cur, tp, &pag->agf_cnt_root, &pag->agf_cnt_level);",
         ],
         "free-space coalescing must validate both indexes before deleting either record",
     )

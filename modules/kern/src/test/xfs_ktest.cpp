@@ -339,3 +339,5 @@ KTEST(XFS, BtreeLookupRejectsOverMaxDepth) {
 }
 
 KTEST(XFS, BtreeCollapsesSingleChildRoot) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_btree_collapses_single_child_root()); }
+
+KTEST(XFS, BtreeDeleteRebalances) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_btree_delete_rebalances()); }

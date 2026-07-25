@@ -119,20 +119,31 @@ def main() -> None:
     require(alloc_source, "dropping duplicate active block", "duplicate active AGFL entry rejection")
     if "xfs_alloc_put_freelist(cur->mount, tp, cur->agno" in source:
         fail("btree deletion must not publish retired blocks before transaction-safe deferred retirement")
+    require(source, "auto btree_level_minrecs(", "btree minimum occupancy helper")
     require(
         source,
-        "bool preserve_only_leaf = NR == 1 && cur->nlevels > 1;",
-        "sole multi-level leaf preservation predicate",
+        "if (CURRENT_NR >= MIN_RECS) {\n        return 0;\n    }",
+        "non-root minimum occupancy gate",
     )
     require(
         source,
-        "for (int lev = 1; preserve_only_leaf && lev < cur->nlevels; ++lev) {\n        preserve_only_leaf = cur->numrecs(lev) == 1;\n    }",
-        "sole-child check through every internal level",
+        "int const MOVE = RIGHT_NR - MIN_RECS >= NEEDED ? NEEDED : 0;",
+        "right sibling redistribution",
     )
     require(
         source,
-        "if (preserve_only_leaf) {\n            // Every internal level has exactly one child",
-        "empty sole leaf retention before parent removal",
+        "int const MOVE = LEFT_NR - MIN_RECS >= NEEDED ? NEEDED : 0;",
+        "left sibling redistribution",
+    )
+    require(
+        source,
+        "return btree_remove_internal_entry(cur, tp, PARENT_LEVEL, remove_pos, survivor_pos);",
+        "merged child removal and recursive parent rebalance",
+    )
+    require(
+        source,
+        "if (cur->nlevels > 1 && NR - 1 < btree_level_minrecs(cur, 0))",
+        "leaf deletion invokes minimum occupancy repair",
     )
     require(
         source,

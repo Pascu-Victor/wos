@@ -421,6 +421,7 @@ auto xfs_btree_delete(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp, uint64_t 
 
 #ifdef WOS_SELFTEST
 auto xfs_selftest_btree_collapses_single_child_root() -> bool;
+auto xfs_selftest_btree_delete_rebalances() -> bool;
 #endif
 
 }  // namespace ker::vfs::xfs
