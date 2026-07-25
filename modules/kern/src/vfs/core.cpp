@@ -1289,7 +1289,7 @@ auto metadata_cache_note_exact_path_changed(const char* path) -> bool {
 }
 
 auto metadata_cache_has_path_variant(const char* path, size_t path_len, FSType fs_type, uint64_t dev_id, bool follow_final_symlink,
-                                     bool require_directory) -> bool {
+                                     bool require_directory, bool require_success = false) -> bool {
     uint64_t const EPOCH = g_metadata_cache_generation.load(std::memory_order_acquire);
     uint64_t const HASH = metadata_hash_path(path, path_len, follow_final_symlink, require_directory, fs_type, dev_id);
     auto& set = g_metadata_cache[HASH & (METADATA_CACHE_SET_COUNT - 1)];
@@ -1310,6 +1310,10 @@ auto metadata_cache_has_path_variant(const char* path, size_t path_len, FSType f
             continue;
         }
         entry.invalidation_generation = INVALIDATION.checked_generation;
+        if (require_success && entry.result != 0) {
+            set.lock.unlock_irqrestore(IRQF);
+            return false;
+        }
         set.lock.unlock_irqrestore(IRQF);
         return true;
     }
@@ -1329,8 +1333,8 @@ auto metadata_cache_has_file_data_observation(File* file) -> bool {
 
     uint64_t const CURRENT_MOUNT_GENERATION = mount_table_generation_snapshot();
     if (file->mount_dev_id != 0 && file->mount_generation == CURRENT_MOUNT_GENERATION && metadata_cacheable_fs(file->fs_type)) {
-        return metadata_cache_has_path_variant(file->vfs_path, PATH_LEN, file->fs_type, file->mount_dev_id, true, false) ||
-               metadata_cache_has_path_variant(file->vfs_path, PATH_LEN, file->fs_type, file->mount_dev_id, false, false);
+        return metadata_cache_has_path_variant(file->vfs_path, PATH_LEN, file->fs_type, file->mount_dev_id, true, false, true) ||
+               metadata_cache_has_path_variant(file->vfs_path, PATH_LEN, file->fs_type, file->mount_dev_id, false, false, true);
     }
 
     MountRef mount_ref = find_mount_point(file->vfs_path, PATH_LEN);
@@ -1339,8 +1343,8 @@ auto metadata_cache_has_file_data_observation(File* file) -> bool {
         return true;
     }
 
-    return metadata_cache_has_path_variant(file->vfs_path, PATH_LEN, mount->fs_type, mount->dev_id, true, false) ||
-           metadata_cache_has_path_variant(file->vfs_path, PATH_LEN, mount->fs_type, mount->dev_id, false, false);
+    return metadata_cache_has_path_variant(file->vfs_path, PATH_LEN, mount->fs_type, mount->dev_id, true, false, true) ||
+           metadata_cache_has_path_variant(file->vfs_path, PATH_LEN, mount->fs_type, mount->dev_id, false, false, true);
 }
 
 void metadata_cache_mark_file_data_close_refresh_path_current(File* file) {
@@ -2396,7 +2400,7 @@ void metadata_cache_refresh_file_data_on_close(File* file) {
 
     MetadataSnapshotStamp const STAMP = metadata_snapshot_stamp();
     Stat statbuf{};
-    if (vfs_stream_cache_get_file_stat(file, &statbuf) != 0) {
+    if (vfs_stream_cache_get_file_stat(file, &statbuf) != 0 || statbuf.st_nlink == 0) {
         return;
     }
     metadata_cache_store_non_symlink_stat_variants(file->vfs_path, mount->fs_type, mount->dev_id, statbuf, STAMP, PATH_LEN, mount);
@@ -16114,6 +16118,54 @@ auto vfs_selftest_file_data_close_refreshes_created_path_stat() -> bool {
     vfs_get_cache_perf_snapshot(after_empty_lstat);
     ok = ok && after_empty_lstat.metadata_hits > after_empty_close.metadata_hits;
     ok = ok && vfs_unlink(EMPTY_PATH) == 0;
+    return ok;
+}
+
+auto vfs_selftest_file_data_close_does_not_resurrect_removed_path() -> bool {
+    vfs_mkdir("/tmp", 0755);
+
+    constexpr const char* UNLINKED_PATH = "/tmp/ktest_file_data_close_unlinked";
+    constexpr const char* RENAMED_OLD_PATH = "/tmp/ktest_file_data_close_renamed_old";
+    constexpr const char* RENAMED_NEW_PATH = "/tmp/ktest_file_data_close_renamed_new";
+    constexpr char FIRST[] = "first";
+    constexpr char SECOND[] = "second";
+
+    vfs_unlink(UNLINKED_PATH);
+    vfs_unlink(RENAMED_OLD_PATH);
+    vfs_unlink(RENAMED_NEW_PATH);
+
+    auto* unlinked_file = vfs_open_file(UNLINKED_PATH, ker::vfs::O_CREAT | 1, 0644);
+    if (unlinked_file == nullptr || unlinked_file->fops == nullptr || unlinked_file->fops->vfs_write == nullptr) {
+        return false;
+    }
+
+    bool ok = unlinked_file->fops->vfs_write(unlinked_file, FIRST, sizeof(FIRST) - 1, 0) == static_cast<ssize_t>(sizeof(FIRST) - 1);
+    cache_notify_file_data_changed_impl(unlinked_file);
+    ok = ok && vfs_unlink(UNLINKED_PATH) == 0;
+    ok = ok && unlinked_file->fops->vfs_write(unlinked_file, SECOND, sizeof(SECOND) - 1, sizeof(FIRST) - 1) ==
+                   static_cast<ssize_t>(sizeof(SECOND) - 1);
+    cache_notify_file_data_changed_impl(unlinked_file);
+    vfs_put_file(unlinked_file);
+
+    Stat st{};
+    ok = ok && vfs_lstat(UNLINKED_PATH, &st) == -ENOENT;
+
+    auto* renamed_file = vfs_open_file(RENAMED_OLD_PATH, ker::vfs::O_CREAT | 1, 0644);
+    if (renamed_file == nullptr || renamed_file->fops == nullptr || renamed_file->fops->vfs_write == nullptr) {
+        return false;
+    }
+
+    ok = ok && renamed_file->fops->vfs_write(renamed_file, FIRST, sizeof(FIRST) - 1, 0) == static_cast<ssize_t>(sizeof(FIRST) - 1);
+    cache_notify_file_data_changed_impl(renamed_file);
+    ok = ok && vfs_rename(RENAMED_OLD_PATH, RENAMED_NEW_PATH) == 0;
+    ok = ok && renamed_file->fops->vfs_write(renamed_file, SECOND, sizeof(SECOND) - 1, sizeof(FIRST) - 1) ==
+                   static_cast<ssize_t>(sizeof(SECOND) - 1);
+    cache_notify_file_data_changed_impl(renamed_file);
+    vfs_put_file(renamed_file);
+
+    ok = ok && vfs_lstat(RENAMED_OLD_PATH, &st) == -ENOENT;
+    ok = ok && vfs_lstat(RENAMED_NEW_PATH, &st) == 0;
+    ok = ok && vfs_unlink(RENAMED_NEW_PATH) == 0;
     return ok;
 }
 

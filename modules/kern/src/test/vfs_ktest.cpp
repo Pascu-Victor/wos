@@ -49,6 +49,10 @@ KTEST(VFS, FileDataWriteSkipsUncachedPathInvalidation) {
 
 KTEST(VFS, FileDataCloseRefreshesCreatedPathStat) { KEXPECT_TRUE(ker::vfs::vfs_selftest_file_data_close_refreshes_created_path_stat()); }
 
+KTEST(VFS, FileDataCloseDoesNotResurrectRemovedPath) {
+    KEXPECT_TRUE(ker::vfs::vfs_selftest_file_data_close_does_not_resurrect_removed_path());
+}
+
 KTEST(VFS, CreatedOpenPrefillSeedsPathStat) { KEXPECT_TRUE(ker::vfs::vfs_selftest_created_open_prefill_seeds_path_stat()); }
 
 KTEST(VFS, FileMetadataChangeInvalidatesPathStat) { KEXPECT_TRUE(ker::vfs::vfs_selftest_file_metadata_change_invalidates_path_stat()); }

@@ -329,6 +329,7 @@ auto vfs_selftest_file_path_storage() -> bool;
 auto vfs_selftest_file_data_write_invalidates_path_stat() -> bool;
 auto vfs_selftest_file_data_write_skips_uncached_path_invalidation() -> bool;
 auto vfs_selftest_file_data_close_refreshes_created_path_stat() -> bool;
+auto vfs_selftest_file_data_close_does_not_resurrect_removed_path() -> bool;
 auto vfs_selftest_created_open_prefill_seeds_path_stat() -> bool;
 auto vfs_selftest_file_metadata_change_invalidates_path_stat() -> bool;
 auto vfs_selftest_open_create_metadata_hint() -> bool;
