@@ -102,6 +102,15 @@ def main() -> None:
     if min(validation_pos, refill_pos, neighbor_lookup_pos) < 0 or not validation_pos < refill_pos < neighbor_lookup_pos:
         fail("xfs_free_extent must validate before AGFL refill and reopen coalescing cursors after refill")
 
+    for allocator_name in ("alloc_ag_by_hint", "alloc_ag_by_size"):
+        allocator_start = alloc_source.find(f"auto {allocator_name}(")
+        allocator_end = alloc_source.find("\nauto ", allocator_start + 1)
+        allocator = alloc_source[allocator_start:allocator_end]
+        headroom_pos = allocator.find("xfs_alloc_ensure_freelist_headroom(mount, tp, agno)")
+        cursor_pos = allocator.find("XfsBtreeCursor<")
+        if min(allocator_start, headroom_pos, cursor_pos) < 0 or headroom_pos > cursor_pos:
+            fail(f"{allocator_name} must reserve AGFL headroom before opening free-space cursors")
+
     bmap_loop_start = bmap_source.find("while (count < max_extents)")
     bmap_loop = bmap_source[bmap_loop_start : bmap_source.find("return static_cast<int>(count);", bmap_loop_start)]
     if "if (rc == -ENOENT)" not in bmap_loop or "return rc;" not in bmap_loop:

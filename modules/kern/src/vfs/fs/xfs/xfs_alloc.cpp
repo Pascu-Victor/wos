@@ -327,6 +327,10 @@ auto alloc_ag_by_hint(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t
     if (pag->agf_freeblks < req.minlen) {
         return -ENOSPC;
     }
+    int const HEADROOM_RC = xfs_alloc_ensure_freelist_headroom(mount, tp, agno);
+    if (HEADROOM_RC != 0) {
+        return HEADROOM_RC;
+    }
     int const CAPTURE_RC = xfs_trans_capture_perag(tp, agno);
     if (CAPTURE_RC != 0) {
         return CAPTURE_RC;
@@ -448,6 +452,10 @@ auto alloc_ag_by_size(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t
     // Quick check: does this AG have enough free blocks?
     if (pag->agf_freeblks < req.minlen) {
         return -ENOSPC;
+    }
+    int const HEADROOM_RC = xfs_alloc_ensure_freelist_headroom(mount, tp, agno);
+    if (HEADROOM_RC != 0) {
+        return HEADROOM_RC;
     }
     int const CAPTURE_RC = xfs_trans_capture_perag(tp, agno);
     if (CAPTURE_RC != 0) {
@@ -1362,7 +1370,7 @@ auto xfs_selftest_agfl_skips_live_allocation_btree_blocks() -> bool {
     return ok;
 }
 
-auto xfs_selftest_agfl_headroom_drain_is_transactional() -> bool {
+auto xfs_selftest_full_agfl_allocation_drains_transactionally() -> bool {
     constexpr uint32_t BLOCK_SIZE = 4096;
     constexpr uint32_t SECTOR_SIZE = 512;
     constexpr uint32_t AG_BLOCKS = 4096;
@@ -1462,9 +1470,17 @@ auto xfs_selftest_agfl_headroom_drain_is_transactional() -> bool {
     XfsTransaction* tp = xfs_trans_alloc(&mount);
     bool ok = tp != nullptr;
     if (tp != nullptr) {
-        int const RC = xfs_alloc_ensure_freelist_headroom(&mount, tp, 0);
+        XfsAllocReq const REQ{
+            .agno = 0,
+            .agbno = 0,
+            .minlen = 1,
+            .maxlen = 1,
+            .alignment = 0,
+        };
+        XfsAllocResult result{};
+        int const RC = xfs_alloc_extent(&mount, tp, REQ, &result);
         uint32_t const HIGH_WATER = AGFL_SIZE - XFS_AGFL_MUTATION_HEADROOM;
-        ok = RC == 0 && pag.agf_flcount <= HIGH_WATER && pag.agf_freeblks > FREE_LENGTH;
+        ok = RC == 0 && result.agno == 0 && result.len == 1 && pag.agf_flcount <= HIGH_WATER && pag.agf_freeblks > FREE_LENGTH;
         xfs_trans_cancel(tp);
         ok = ok && pag.agf_flcount == AGFL_SIZE && pag.agf_freeblks == FREE_LENGTH;
     }

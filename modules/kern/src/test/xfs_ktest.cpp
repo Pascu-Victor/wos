@@ -101,7 +101,9 @@ KTEST(XFS, BmapExtentPromotion) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_bmap_
 
 KTEST(XFS, AgflSkipsLiveAllocationBtreeBlocks) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_agfl_skips_live_allocation_btree_blocks()); }
 
-KTEST(XFS, AgflHeadroomDrainIsTransactional) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_agfl_headroom_drain_is_transactional()); }
+KTEST(XFS, FullAgflAllocationDrainsTransactionally) {
+    KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_full_agfl_allocation_drains_transactionally());
+}
 
 KTEST(XFS, SmallHoleWriteAllocatesOnlyNeededBlocks) {
     constexpr size_t BLOCK_SIZE = 4096;
