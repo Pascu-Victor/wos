@@ -568,6 +568,15 @@ void xfs_stamp_inode_data_change(XfsInode* ip) {
     ip->dirty = true;
 }
 
+void xfs_stamp_same_size_truncate(XfsFileData* xfd, XfsInode* ip) {
+    if (xfd == nullptr || ip == nullptr) {
+        return;
+    }
+    xfs_recent_write_stat_invalidate(xfd);
+    xfs_stamp_inode_data_change(ip);
+    xfd->close_may_need_inode_commit = true;
+}
+
 void perf_record_xfs_slow_event(ker::mod::perf::WkiPerfLocalXfsOp op, int32_t status, uint32_t latency_us, uint64_t bytes,
                                 uint64_t callsite) {
     if (status >= 0 && latency_us < XFS_SLOW_TRACE_US) {
@@ -2274,7 +2283,13 @@ auto xfs_vfs_truncate(File* f, off_t length) -> int {
     uint64_t const OLD_SIZE = ip->size;
     bool const ZERO_TRUNCATE_RESETS_DATA = new_size == 0 && xfs_truncate_zero_resets_data(OLD_SIZE, ip->nblocks);
     if (new_size == OLD_SIZE && !ZERO_TRUNCATE_RESETS_DATA) {
-        return 0;  // no change
+        // Linux updates mtime/ctime for a successful truncate even when the
+        // requested size already matches. Besides matching that observable
+        // behavior, build tools use repeated O_TRUNC of a zero-byte lock file
+        // as a cheap filesystem clock. Keep the data fork untouched, but
+        // persist the timestamp through the ordinary close/fsync path.
+        xfs_stamp_same_size_truncate(xfd, ip);
+        return 0;
     }
 
     if (ZERO_TRUNCATE_RESETS_DATA) {
@@ -2378,6 +2393,20 @@ auto xfs_selftest_write_alloc_min_blocks(xfs_extlen_t max_blocks, bool extent_pr
 
 auto xfs_selftest_truncate_zero_resets_data(uint64_t old_size, uint64_t nblocks) -> bool {
     return xfs_truncate_zero_resets_data(old_size, nblocks);
+}
+
+auto xfs_selftest_same_size_truncate_stamps_metadata() -> bool {
+    XfsFileData xfd{};
+    XfsInode inode{};
+    inode.mtime = 1;
+    inode.ctime = 2;
+    uint64_t const OLD_MTIME = inode.mtime;
+    uint64_t const OLD_CTIME = inode.ctime;
+
+    xfs_stamp_same_size_truncate(&xfd, &inode);
+
+    return inode.dirty && xfd.close_may_need_inode_commit && inode.mtime != OLD_MTIME && inode.ctime != OLD_CTIME &&
+           inode.mtime == inode.ctime;
 }
 
 auto xfs_selftest_close_should_trim_prealloc(int open_flags, bool created_by_open, bool may_have_eof_prealloc) -> bool {

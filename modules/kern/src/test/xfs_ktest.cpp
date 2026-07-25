@@ -204,6 +204,8 @@ KTEST(XFS, TruncateZeroResetsStaleDataFork) {
     KEXPECT_FALSE(ker::vfs::xfs::xfs_selftest_truncate_zero_resets_data(0, 0));
 }
 
+KTEST(XFS, SameSizeTruncateStampsMetadata) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_same_size_truncate_stamps_metadata()); }
+
 KTEST(XFS, ReadOnlyCloseSkipsPreallocTrim) {
     KEXPECT_FALSE(ker::vfs::xfs::xfs_selftest_close_should_trim_prealloc(0));
     KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_close_should_trim_prealloc(ker::vfs::O_CREAT));
