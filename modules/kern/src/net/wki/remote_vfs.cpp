@@ -5283,10 +5283,12 @@ void handle_vfs_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_ident
             s_vfs_lock.unlock();
 
             if (close_file != nullptr) {
-                if (close_file->fops != nullptr && close_file->fops->vfs_close != nullptr) {
-                    close_file->fops->vfs_close(close_file);
-                }
-                delete close_file;
+                // Remote opens use the ordinary VFS File lifecycle. Closing
+                // only the filesystem backend skips generic close-time path
+                // and metadata-cache publication, so a submitter can retain a
+                // stale negative lookup after a peer creates an output.
+                int const CLOSE_RET = ker::vfs::vfs_close_file(close_file);
+                status = static_cast<int16_t>(std::clamp(CLOSE_RET, SHRT_MIN, SHRT_MAX));
             }
             perf_record_vfs_server_end(SERVER_OP, hdr->src_node, channel_id, CORRELATION, status,
                                        static_cast<uint32_t>(wki_now_us() - LOCAL_STARTED_US), 0, CALLSITE);
@@ -8337,10 +8339,7 @@ void wki_remote_vfs_gc_stale_fds() {
 
         for (auto* file : files_to_close) {
             if (file != nullptr) {
-                if (file->fops != nullptr && file->fops->vfs_close != nullptr) {
-                    file->fops->vfs_close(file);
-                }
-                delete file;
+                static_cast<void>(ker::vfs::vfs_close_file(file));
             }
         }
         wki_peer_lifecycle_release(peer);
@@ -8779,10 +8778,7 @@ void wki_remote_vfs_cleanup_for_peer(uint16_t node_id, bool owner_reboot_proven)
 
     for (auto* file : files_to_close) {
         if (file != nullptr) {
-            if (file->fops != nullptr && file->fops->vfs_close != nullptr) {
-                file->fops->vfs_close(file);
-            }
-            delete file;
+            static_cast<void>(ker::vfs::vfs_close_file(file));
         }
     }
 
