@@ -134,6 +134,21 @@ def main() -> None:
         "if (preserve_only_leaf) {\n            // Every internal level has exactly one child",
         "empty sole leaf retention before parent removal",
     )
+    require(
+        source,
+        "if (cur->numrecs(ROOT_LEVEL) != 1) {\n            break;",
+        "single-child root collapse gate",
+    )
+    require(
+        source,
+        "*new_root = collapsed_root;\n    *new_nlevels = collapsed_levels;",
+        "collapsed root publication",
+    )
+    require(
+        source,
+        "if (child_bp == nullptr || btree_blockno<Traits>(cur, child_bp) != CHILD)",
+        "collapsed child must match the cursor path",
+    )
 
     alloc_extent_start = alloc_source.find("auto xfs_alloc_extent(")
     alloc_extent = alloc_source[alloc_extent_start:]

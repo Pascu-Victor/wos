@@ -1183,6 +1183,63 @@ auto btree_remove_from_parent(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp, i
     return 0;
 }
 
+template <typename Traits>
+auto btree_finish_delete(XfsBtreeCursor<Traits>* cur, uint64_t root_block, uint8_t nlevels, uint64_t* new_root, uint8_t* new_nlevels)
+    -> int {
+    if (cur == nullptr || !valid_btree_depth(nlevels) || new_root == nullptr || new_nlevels == nullptr) {
+        return -EINVAL;
+    }
+
+    *new_root = root_block;
+    *new_nlevels = nlevels;
+
+    // External XFS btree roots are ordinary blocks. Once an internal root has
+    // only one child, make that child the new root instead of retaining a
+    // one-child parent that must later be grown in place. Retired roots stay
+    // out of the AGFL until transaction-safe metadata recycling exists.
+    uint64_t collapsed_root = root_block;
+    uint8_t collapsed_levels = nlevels;
+    while (collapsed_levels > 1) {
+        int const ROOT_LEVEL = static_cast<int>(collapsed_levels - 1);
+        BufHead* root_bp = cur->level_at(ROOT_LEVEL).bp;
+        if (root_bp == nullptr || btree_blockno<Traits>(cur, root_bp) != collapsed_root) {
+            return -EIO;
+        }
+
+        uint16_t disk_level = 0;
+        if constexpr (Traits::TYPE == XfsBtreeType::SHORT) {
+            disk_level = reinterpret_cast<const XfsBtreeSblock*>(root_bp->data)->bb_level.to_cpu();
+        } else {
+            disk_level = reinterpret_cast<const XfsBtreeLblock*>(root_bp->data)->bb_level.to_cpu();
+        }
+        if (disk_level != static_cast<uint16_t>(ROOT_LEVEL)) {
+            return -EIO;
+        }
+        if (cur->numrecs(ROOT_LEVEL) != 1) {
+            break;
+        }
+
+        uint64_t const CHILD = cur->ptr_at(ROOT_LEVEL, 1);
+        constexpr uint64_t NULL_PTR =
+            (Traits::TYPE == XfsBtreeType::SHORT) ? static_cast<uint64_t>(NULLAGBLOCK) : static_cast<uint64_t>(NULLFSBLOCK);
+        if (CHILD == NULL_PTR || CHILD == collapsed_root) {
+            return -EIO;
+        }
+        BufHead* child_bp = cur->level_at(ROOT_LEVEL - 1).bp;
+        if (child_bp == nullptr || btree_blockno<Traits>(cur, child_bp) != CHILD) {
+            return -EIO;
+        }
+
+        collapsed_root = CHILD;
+        collapsed_levels--;
+    }
+
+    *new_root = collapsed_root;
+    *new_nlevels = collapsed_levels;
+    cur->nlevels = collapsed_levels;
+    return 0;
+}
+
 }  // anonymous namespace
 
 template <typename Traits>
@@ -1416,9 +1473,17 @@ auto xfs_btree_insert(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp, const typ
 // ============================================================================
 
 template <typename Traits>
-auto xfs_btree_delete(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp) -> int {
+auto xfs_btree_delete(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp, uint64_t root_block, uint8_t nlevels, uint64_t* new_root,
+                      uint8_t* new_nlevels) -> int {
     using Key = Traits::Key;
     using Rec = Traits::Rec;
+
+    if (cur == nullptr || tp == nullptr || cur->mount == nullptr || !valid_btree_depth(nlevels) || cur->nlevels != nlevels ||
+        new_root == nullptr || new_nlevels == nullptr) {
+        return -EINVAL;
+    }
+    *new_root = root_block;
+    *new_nlevels = nlevels;
 
     int const PTR = cur->level_at(0).ptr;
     int const NR = cur->numrecs(0);
@@ -1486,14 +1551,14 @@ auto xfs_btree_delete(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp) -> int {
             // catastrophically corrupt the free space trees.
             btree_update_crc<Traits>(leaf_bp);
             xfs_trans_log_buf_full(tp, leaf_bp);
-            return 0;
+            return btree_finish_delete<Traits>(cur, root_block, nlevels, new_root, new_nlevels);
         }
 
         if (preserve_only_leaf) {
             // Every internal level has exactly one child, so unlinking this
             // leaf would empty the root.  The next insert can descend through
             // the retained path and will refresh all first keys.
-            return 0;
+            return btree_finish_delete<Traits>(cur, root_block, nlevels, new_root, new_nlevels);
         }
 
         // Non-root leaf - unlink it from the sibling chain and free it.
@@ -1546,7 +1611,11 @@ auto xfs_btree_delete(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp) -> int {
         xfs_trans_log_buf_full(tp, leaf_bp);
 
         // Remove the corresponding key/pointer from the parent
-        return btree_remove_from_parent<Traits>(cur, tp, 1);
+        int const REMOVE_RC = btree_remove_from_parent<Traits>(cur, tp, 1);
+        if (REMOVE_RC != 0) {
+            return REMOVE_RC;
+        }
+        return btree_finish_delete<Traits>(cur, root_block, nlevels, new_root, new_nlevels);
     }
 
     // Adjust cursor position
@@ -1554,8 +1623,61 @@ auto xfs_btree_delete(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp) -> int {
         cur->level_at(0).ptr = NR - 1;
     }
 
-    return 0;
+    return btree_finish_delete<Traits>(cur, root_block, nlevels, new_root, new_nlevels);
 }
+
+#ifdef WOS_SELFTEST
+auto xfs_selftest_btree_collapses_single_child_root() -> bool {
+    constexpr uint32_t BLOCK_SIZE = 1024;
+    constexpr uint32_t SECTOR_SIZE = 256;
+    constexpr uint32_t AG_BLOCKS = 4096;
+    constexpr xfs_agblock_t ROOT_BLOCK = 10;
+    constexpr xfs_agblock_t CHILD_BLOCK = 11;
+
+    XfsMountContext mount{};
+    mount.block_size = BLOCK_SIZE;
+    mount.sect_size = SECTOR_SIZE;
+    mount.ag_blocks = AG_BLOCKS;
+
+    std::array<uint8_t, BLOCK_SIZE> root_data{};
+    std::array<uint8_t, BLOCK_SIZE> child_data{};
+    BufHead root_bp{};
+    root_bp.data = root_data.data();
+    root_bp.size = root_data.size();
+    root_bp.block_no = static_cast<uint64_t>(ROOT_BLOCK) * (BLOCK_SIZE / SECTOR_SIZE);
+    BufHead child_bp{};
+    child_bp.data = child_data.data();
+    child_bp.size = child_data.size();
+    child_bp.block_no = static_cast<uint64_t>(CHILD_BLOCK) * (BLOCK_SIZE / SECTOR_SIZE);
+
+    auto* root_hdr = reinterpret_cast<XfsBtreeSblock*>(root_data.data());
+    root_hdr->bb_magic = Be32::from_cpu(XfsFinobtTraits::MAGIC);
+    root_hdr->bb_level = Be16::from_cpu(1);
+    root_hdr->bb_numrecs = Be16::from_cpu(1);
+    btree_write_ptr<XfsFinobtTraits>(root_data.data(), BLOCK_SIZE, 1, CHILD_BLOCK);
+
+    auto* child_hdr = reinterpret_cast<XfsBtreeSblock*>(child_data.data());
+    child_hdr->bb_magic = Be32::from_cpu(XfsFinobtTraits::MAGIC);
+    child_hdr->bb_level = Be16::from_cpu(0);
+    child_hdr->bb_numrecs = Be16::from_cpu(1);
+
+    XfsBtreeCursor<XfsFinobtTraits> cur;
+    cur.mount = &mount;
+    cur.agno = 0;
+    cur.nlevels = 2;
+    cur.level_at(1).bp = &root_bp;
+    cur.level_at(1).ptr = 1;
+    cur.level_at(0).bp = &child_bp;
+    cur.level_at(0).ptr = 1;
+
+    uint64_t new_root = ROOT_BLOCK;
+    uint8_t new_nlevels = 2;
+    int const RC = btree_finish_delete(&cur, ROOT_BLOCK, 2, &new_root, &new_nlevels);
+    cur.level_at(1).bp = nullptr;
+    cur.level_at(0).bp = nullptr;
+    return RC == 0 && new_root == CHILD_BLOCK && new_nlevels == 1 && cur.nlevels == 1;
+}
+#endif
 
 // ============================================================================
 // Explicit template instantiations for all XFS btree types
@@ -1621,10 +1743,15 @@ template auto xfs_btree_insert<XfsBmbtTraits>(XfsBtreeCursor<XfsBmbtTraits>*, Xf
                                               uint8_t, uint64_t*, uint8_t*) -> int;
 
 // Delete
-template auto xfs_btree_delete<XfsBnobtTraits>(XfsBtreeCursor<XfsBnobtTraits>*, XfsTransaction*) -> int;
-template auto xfs_btree_delete<XfsCntbtTraits>(XfsBtreeCursor<XfsCntbtTraits>*, XfsTransaction*) -> int;
-template auto xfs_btree_delete<XfsInobtTraits>(XfsBtreeCursor<XfsInobtTraits>*, XfsTransaction*) -> int;
-template auto xfs_btree_delete<XfsFinobtTraits>(XfsBtreeCursor<XfsFinobtTraits>*, XfsTransaction*) -> int;
-template auto xfs_btree_delete<XfsBmbtTraits>(XfsBtreeCursor<XfsBmbtTraits>*, XfsTransaction*) -> int;
+template auto xfs_btree_delete<XfsBnobtTraits>(XfsBtreeCursor<XfsBnobtTraits>*, XfsTransaction*, uint64_t, uint8_t, uint64_t*, uint8_t*)
+    -> int;
+template auto xfs_btree_delete<XfsCntbtTraits>(XfsBtreeCursor<XfsCntbtTraits>*, XfsTransaction*, uint64_t, uint8_t, uint64_t*, uint8_t*)
+    -> int;
+template auto xfs_btree_delete<XfsInobtTraits>(XfsBtreeCursor<XfsInobtTraits>*, XfsTransaction*, uint64_t, uint8_t, uint64_t*, uint8_t*)
+    -> int;
+template auto xfs_btree_delete<XfsFinobtTraits>(XfsBtreeCursor<XfsFinobtTraits>*, XfsTransaction*, uint64_t, uint8_t, uint64_t*, uint8_t*)
+    -> int;
+template auto xfs_btree_delete<XfsBmbtTraits>(XfsBtreeCursor<XfsBmbtTraits>*, XfsTransaction*, uint64_t, uint8_t, uint64_t*, uint8_t*)
+    -> int;
 
 }  // namespace ker::vfs::xfs

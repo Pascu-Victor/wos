@@ -339,7 +339,14 @@ auto ialloc_ag(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t agno) 
 
                         if (rec.freecount == 0) {
                             // No more free inodes in this chunk - remove from finobt
-                            urc = xfs_btree_delete(&fi_cur, tp);
+                            uint64_t new_fi_root = pag->agi_free_root;
+                            auto new_fi_level = static_cast<uint8_t>(pag->agi_free_level);
+                            urc = xfs_btree_delete(&fi_cur, tp, pag->agi_free_root, static_cast<uint8_t>(pag->agi_free_level), &new_fi_root,
+                                                   &new_fi_level);
+                            if (urc == 0) {
+                                pag->agi_free_root = static_cast<xfs_agblock_t>(new_fi_root);
+                                pag->agi_free_level = new_fi_level;
+                            }
                         } else {
                             urc = xfs_btree_update(&fi_cur, tp, rec);
                         }

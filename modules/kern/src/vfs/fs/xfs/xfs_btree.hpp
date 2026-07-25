@@ -410,10 +410,17 @@ auto xfs_btree_insert(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp, const typ
                       uint8_t nlevels, uint64_t* new_root, uint8_t* new_nlevels) -> int;
 
 // Delete the record at the current cursor position.
-// Shifts remaining records left.  If a block becomes empty, it is freed and
-// the parent key/pointer is removed (recursively if needed).
+// Shifts remaining records left. If a block becomes empty, the parent
+// key/pointer is removed recursively. A one-child external root is collapsed
+// by returning its only child through new_root/new_nlevels; callers must
+// publish those values in the owning AG header in the same transaction.
 // Returns 0 on success, negative errno on failure.
 template <typename Traits>
-auto xfs_btree_delete(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp) -> int;
+auto xfs_btree_delete(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp, uint64_t root_block, uint8_t nlevels, uint64_t* new_root,
+                      uint8_t* new_nlevels) -> int;
+
+#ifdef WOS_SELFTEST
+auto xfs_selftest_btree_collapses_single_child_root() -> bool;
+#endif
 
 }  // namespace ker::vfs::xfs

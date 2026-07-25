@@ -171,6 +171,23 @@ auto same_free_extent(xfs_agblock_t lhs_start, xfs_extlen_t lhs_len, xfs_agblock
     return lhs_start == rhs_start && lhs_len == rhs_len;
 }
 
+template <typename Traits>
+auto delete_btree_record(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp, xfs_agblock_t* root, uint32_t* nlevels) -> int {
+    if (cur == nullptr || tp == nullptr || root == nullptr || nlevels == nullptr || *nlevels == 0 || *nlevels > UINT8_MAX) {
+        return -EINVAL;
+    }
+
+    uint64_t new_root = *root;
+    auto new_nlevels = static_cast<uint8_t>(*nlevels);
+    int const RC = xfs_btree_delete(cur, tp, *root, static_cast<uint8_t>(*nlevels), &new_root, &new_nlevels);
+    if (RC != 0) {
+        return RC;
+    }
+    *root = static_cast<xfs_agblock_t>(new_root);
+    *nlevels = new_nlevels;
+    return 0;
+}
+
 auto refresh_agf_longest(XfsMountContext* mount, xfs_agnumber_t agno) -> int {
     if (mount == nullptr || mount->per_ag == nullptr || agno >= mount->ag_count) {
         return -EINVAL;
@@ -248,18 +265,13 @@ auto agfl_refill(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t agno
         }
 
         // Delete from cntbt
-        uint64_t new_cnt_root = pag->agf_cnt_root;
-        uint8_t new_cnt_lvl = pag->agf_cnt_level;
-        rc = xfs_btree_delete(&cur, tp);
+        rc = delete_btree_record(&cur, tp, &pag->agf_cnt_root, &pag->agf_cnt_level);
         if (rc != 0) {
             return rc;
         }
-        // Note: btree_delete may shrink the root; pick up updated root after
-        // the delete via the cursor's updated nlevels/levels - but the pag
-        // fields are updated when we write the AGF below.
 
         // Delete from bnobt
-        rc = xfs_btree_delete(&bno_cur, tp);
+        rc = delete_btree_record(&bno_cur, tp, &pag->agf_bno_root, &pag->agf_bno_level);
         if (rc != 0) {
             return rc;
         }
@@ -275,6 +287,8 @@ auto agfl_refill(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t agno
             xfs_extlen_t const REM_LEN = EXT_LEN - 1;
             uint64_t new_bno_root = pag->agf_bno_root;
             uint8_t new_bno_lvl = pag->agf_bno_level;
+            uint64_t new_cnt_root = pag->agf_cnt_root;
+            uint8_t new_cnt_lvl = pag->agf_cnt_level;
 
             XfsBnobtTraits::IRec const REM_BNO{.startblock = REM_START, .blockcount = REM_LEN};
             rc = xfs_btree_insert(&bno_cur, tp, REM_BNO, pag->agf_bno_root, pag->agf_bno_level, &new_bno_root, &new_bno_lvl);
@@ -375,11 +389,11 @@ auto alloc_ag_by_hint(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t
         return -EIO;
     }
 
-    rc = xfs_btree_delete(&bno_cur, tp);
+    rc = delete_btree_record(&bno_cur, tp, &pag->agf_bno_root, &pag->agf_bno_level);
     if (rc != 0) {
         return rc;
     }
-    rc = xfs_btree_delete(&cnt_cur, tp);
+    rc = delete_btree_record(&cnt_cur, tp, &pag->agf_cnt_root, &pag->agf_cnt_level);
     if (rc != 0) {
         return rc;
     }
@@ -555,13 +569,13 @@ auto alloc_ag_by_size(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t
     }
 
     // Delete from cntbt (cursor already positioned)
-    int delrc = xfs_btree_delete(&cur, tp);
+    int delrc = delete_btree_record(&cur, tp, &pag->agf_cnt_root, &pag->agf_cnt_level);
     if (delrc != 0) {
         return delrc;
     }
 
     // Delete from bnobt
-    delrc = xfs_btree_delete(&bno_cur, tp);
+    delrc = delete_btree_record(&bno_cur, tp, &pag->agf_bno_root, &pag->agf_bno_level);
     if (delrc != 0) {
         return delrc;
     }
@@ -678,7 +692,7 @@ auto log_agf_free_space_roots(XfsMountContext* mount, XfsTransaction* tp, xfs_ag
 
 auto delete_free_extent_record(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t agno, xfs_agblock_t startblock,
                                xfs_extlen_t blockcount) -> int {
-    XfsPerAG const* pag = &mount->per_ag[agno];
+    XfsPerAG* pag = &mount->per_ag[agno];
 
     XfsBtreeCursor<XfsBnobtTraits> bno_cur;
     bno_cur.mount = mount;
@@ -707,11 +721,11 @@ auto delete_free_extent_record(XfsMountContext* mount, XfsTransaction* tp, xfs_a
         return -EIO;
     }
 
-    rc = xfs_btree_delete(&bno_cur, tp);
+    rc = delete_btree_record(&bno_cur, tp, &pag->agf_bno_root, &pag->agf_bno_level);
     if (rc != 0) {
         return rc;
     }
-    return xfs_btree_delete(&cnt_cur, tp);
+    return delete_btree_record(&cnt_cur, tp, &pag->agf_cnt_root, &pag->agf_cnt_level);
 }
 
 }  // anonymous namespace
