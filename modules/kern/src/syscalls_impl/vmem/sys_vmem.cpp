@@ -236,6 +236,24 @@ auto lazy_file_mmap_enabled() -> bool {
     return expected != 0;
 }
 
+auto lazy_anon_mmap_enabled() -> bool {
+    static std::atomic<int> s_enabled{-1};
+    int cached = s_enabled.load(std::memory_order_acquire);
+    if (cached >= 0) {
+        return cached != 0;
+    }
+
+    bool const ENABLED = !cmdline_has_token(ker::init::get_kernel_cmdline(), "vmem.no_lazy_anon");
+    int const VALUE = ENABLED ? 1 : 0;
+    int expected = -1;
+    if (s_enabled.compare_exchange_strong(expected, VALUE, std::memory_order_acq_rel, std::memory_order_acquire)) {
+        log::info("lazy anonymous mmap %s", ENABLED ? "enabled" : "disabled by cmdline");
+        return ENABLED;
+    }
+
+    return expected != 0;
+}
+
 auto anon_zero_cow_enabled() -> bool {
     static std::atomic<int> s_enabled{-1};
     int cached = s_enabled.load(std::memory_order_acquire);
@@ -1638,6 +1656,17 @@ auto anon_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags) 
             release_mmap_reservation(task, vaddr, size, HAS_ADDRESS_RESERVATION);
         }
         return RESULT;
+    }
+
+    if (lazy_anon_mmap_enabled() && (flags & ker::abi::vmem::MAP_POPULATE) == 0) {
+        if (!add_shared_vmem_range(task, vaddr, size, prot, flags)) {
+            release_mmap_reservation(task, vaddr, size, HAS_ADDRESS_RESERVATION);
+            return static_cast<uint64_t>(-ker::abi::vmem::VMEM_ENOMEM);
+        }
+        advance_shared_mmap_cursor(task, vaddr, size);
+        record_local_vmem_event(task, ker::mod::perf::WkiPerfLocalVmemOp::ANON_MMAP, ker::mod::perf::WkiPerfPhase::END, NUM_PAGES, 3, 0,
+                                vmem_latency_since(PERF_STARTED_US), vaddr, size, true);
+        return vaddr;
     }
 
     if (!anon_zero_cow_enabled()) {

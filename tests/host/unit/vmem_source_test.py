@@ -12,6 +12,8 @@ PROCESS_CPP = ROOT / "modules" / "kern" / "src" / "syscalls_impl" / "process" / 
 VIRT_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "mm" / "virt.opt.cpp"
 TASK_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "sched" / "task.cpp"
 TASK_HPP = ROOT / "modules" / "kern" / "src" / "platform" / "sched" / "task.hpp"
+VMEM_ABI_HPP = ROOT / "modules" / "kern" / "src" / "abi" / "callnums" / "vmem.h"
+DEBUG_FLAGS_DOC = ROOT / "docs" / "kernel_debug_flags.md"
 
 
 def fail(message: str) -> None:
@@ -428,6 +430,51 @@ def test_user_memory_pressure_does_not_enter_fatal_oom() -> None:
     )
 
 
+def test_default_writable_anon_mmap_is_demand_paged() -> None:
+    vmem = SYS_VMEM_CPP.read_text()
+    abi = VMEM_ABI_HPP.read_text()
+    docs = DEBUG_FLAGS_DOC.read_text()
+    anon_body = function_body(vmem, "anon_allocate")
+    lazy_branch = block_between(
+        anon_body,
+        "if (lazy_anon_mmap_enabled() && (flags & ker::abi::vmem::MAP_POPULATE) == 0)",
+        "if (!anon_zero_cow_enabled())",
+        "default writable anonymous lazy branch",
+    )
+
+    require_tokens(
+        function_body(vmem, "lazy_anon_mmap_enabled"),
+        [
+            'cmdline_has_token(ker::init::get_kernel_cmdline(), "vmem.no_lazy_anon")',
+            'log::info("lazy anonymous mmap %s"',
+        ],
+        "lazy anonymous mmap runtime control",
+    )
+    require_tokens(
+        abi,
+        ["constexpr uint64_t MAP_POPULATE = 0x8000;"],
+        "kernel mmap flag ABI",
+    )
+    require_ordered_tokens(
+        lazy_branch,
+        [
+            "if (!add_shared_vmem_range(task, vaddr, size, prot, flags))",
+            "release_mmap_reservation(task, vaddr, size, HAS_ADDRESS_RESERVATION)",
+            "advance_shared_mmap_cursor(task, vaddr, size)",
+            "WkiPerfLocalVmemOp::ANON_MMAP",
+            "return vaddr;",
+        ],
+        "default writable anonymous mmap demand paging",
+    )
+    if "get_anon_zero_page()" in lazy_branch or "map_same_page_range(" in lazy_branch:
+        fail("default writable anonymous mmap must not prepopulate zero-page PTEs")
+    require_tokens(
+        docs,
+        ["`vmem.no_lazy_anon`"],
+        "lazy anonymous mmap diagnostic documentation",
+    )
+
+
 def test_thread_publication_is_serialized_with_shared_vmem_updates() -> None:
     header = SYS_VMEM_HPP.read_text()
     vmem = SYS_VMEM_CPP.read_text()
@@ -530,6 +577,7 @@ def main() -> None:
     test_cow_write_resolution_serializes_pte_reference_consumption()
     test_page_table_pool_duplicate_release_does_not_fall_through_to_page_free()
     test_user_memory_pressure_does_not_enter_fatal_oom()
+    test_default_writable_anon_mmap_is_demand_paged()
     test_thread_publication_is_serialized_with_shared_vmem_updates()
     print("vmem mmap, owned-frame, and COW invariants hold")
 
