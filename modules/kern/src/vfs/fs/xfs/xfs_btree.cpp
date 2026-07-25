@@ -1227,6 +1227,23 @@ auto btree_finish_delete(XfsBtreeCursor<Traits>* cur, uint64_t root_block, uint8
         }
         BufHead* child_bp = cur->level_at(ROOT_LEVEL - 1).bp;
         if (child_bp == nullptr || btree_blockno<Traits>(cur, child_bp) != CHILD) {
+            // Deleting the cursor's leaf can leave a different sibling as the
+            // root's sole child. Rebind this cursor level to the surviving
+            // child before validating or attempting another collapse.
+            int const READ_RC = cur->read_block(ROOT_LEVEL - 1, CHILD);
+            if (READ_RC != 0) {
+                return READ_RC;
+            }
+            child_bp = cur->level_at(ROOT_LEVEL - 1).bp;
+        }
+
+        uint16_t child_disk_level = 0;
+        if constexpr (Traits::TYPE == XfsBtreeType::SHORT) {
+            child_disk_level = reinterpret_cast<const XfsBtreeSblock*>(child_bp->data)->bb_level.to_cpu();
+        } else {
+            child_disk_level = reinterpret_cast<const XfsBtreeLblock*>(child_bp->data)->bb_level.to_cpu();
+        }
+        if (child_disk_level != static_cast<uint16_t>(ROOT_LEVEL - 1)) {
             return -EIO;
         }
 

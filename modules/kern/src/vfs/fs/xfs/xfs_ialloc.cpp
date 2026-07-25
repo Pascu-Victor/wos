@@ -281,6 +281,8 @@ auto ialloc_ag(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t agno) 
         int rc = xfs_btree_lookup(&cur, pag->agi_root, pag->agi_level, target, XfsBtreeLookup::GE);
         if (rc != 0) {
             if (rc != -ENOENT) {
+                mod::dbg::logger<"xfs">::error("xfs_ialloc: inobt lookup failed ag=%u root=%u levels=%u startino=%u rc=%d freecount=%u",
+                                               agno, pag->agi_root, pag->agi_level, SEARCH_START, rc, pag->agi_freecount);
                 tp->error = rc;
                 return NULLFSINO;
             }
@@ -303,6 +305,8 @@ auto ialloc_ag(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t agno) 
 
                     int const CAPTURE_RC = xfs_trans_capture_perag(tp, agno);
                     if (CAPTURE_RC != 0) {
+                        mod::dbg::logger<"xfs">::error("xfs_ialloc: perag capture failed ag=%u startino=%u rc=%d", agno, rec.startino,
+                                                       CAPTURE_RC);
                         return NULLFSINO;
                     }
 
@@ -318,6 +322,7 @@ auto ialloc_ag(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t agno) 
                     // same tree a second time.
                     int urc = xfs_btree_update(&cur, tp, rec);
                     if (urc != 0) {
+                        mod::dbg::logger<"xfs">::error("xfs_ialloc: inobt update failed ag=%u startino=%u rc=%d", agno, rec.startino, urc);
                         tp->error = urc;
                         return NULLFSINO;
                     }
@@ -333,6 +338,8 @@ auto ialloc_ag(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t agno) 
 
                         urc = xfs_btree_lookup(&fi_cur, pag->agi_free_root, pag->agi_free_level, fi_target, XfsBtreeLookup::EQ);
                         if (urc != 0) {
+                            mod::dbg::logger<"xfs">::error("xfs_ialloc: finobt lookup failed ag=%u root=%u levels=%u startino=%u rc=%d",
+                                                           agno, pag->agi_free_root, pag->agi_free_level, rec.startino, urc);
                             tp->error = urc;
                             return NULLFSINO;
                         }
@@ -351,6 +358,9 @@ auto ialloc_ag(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t agno) 
                             urc = xfs_btree_update(&fi_cur, tp, rec);
                         }
                         if (urc != 0) {
+                            mod::dbg::logger<"xfs">::error("xfs_ialloc: finobt %s failed ag=%u root=%u levels=%u startino=%u rc=%d",
+                                                           rec.freecount == 0 ? "delete" : "update", agno, pag->agi_free_root,
+                                                           pag->agi_free_level, rec.startino, urc);
                             tp->error = urc;
                             return NULLFSINO;
                         }
@@ -360,6 +370,7 @@ auto ialloc_ag(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t agno) 
                     pag->agi_freecount--;
                     urc = log_agi_state(mount, tp, agno, AGINO, true);
                     if (urc != 0) {
+                        mod::dbg::logger<"xfs">::error("xfs_ialloc: AGI log failed ag=%u startino=%u rc=%d", agno, rec.startino, urc);
                         tp->error = urc;
                         return NULLFSINO;
                     }
@@ -379,6 +390,8 @@ auto ialloc_ag(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t agno) 
             rc = xfs_btree_increment(&cur);
             if (rc != 0) {
                 if (rc != -ENOENT) {
+                    mod::dbg::logger<"xfs">::error("xfs_ialloc: inobt increment failed ag=%u root=%u levels=%u rc=%d", agno, pag->agi_root,
+                                                   pag->agi_level, rc);
                     tp->error = rc;
                     return NULLFSINO;
                 }
@@ -408,6 +421,7 @@ auto xfs_ialloc(XfsMountContext* mount, XfsTransaction* tp, [[maybe_unused]] uin
             return INO;
         }
         if (tp != nullptr && tp->error != 0) {
+            mod::dbg::logger<"xfs">::error("xfs_ialloc: aborting after AG %u error=%d", ag, tp->error);
             return NULLFSINO;
         }
     }

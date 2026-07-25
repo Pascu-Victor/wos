@@ -68,8 +68,8 @@ def main() -> None:
     )
     require(
         first_free,
-        "if ((free_mask & inobt_free_mask_for_bit(bit)) != 0)",
-        "first free inode scan uses XFS bit order",
+        "return __builtin_ctzll(free_mask);",
+        "first free inode scan uses the least-significant XFS free bit",
     )
     require(
         source,

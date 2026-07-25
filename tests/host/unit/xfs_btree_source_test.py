@@ -146,8 +146,13 @@ def main() -> None:
     )
     require(
         source,
-        "if (child_bp == nullptr || btree_blockno<Traits>(cur, child_bp) != CHILD)",
-        "collapsed child must match the cursor path",
+        "int const READ_RC = cur->read_block(ROOT_LEVEL - 1, CHILD);",
+        "root collapse rebinds a cursor left on the removed child",
+    )
+    require(
+        source,
+        "if (child_disk_level != static_cast<uint16_t>(ROOT_LEVEL - 1))",
+        "collapsed child level validation",
     )
 
     alloc_extent_start = alloc_source.find("auto xfs_alloc_extent(")
