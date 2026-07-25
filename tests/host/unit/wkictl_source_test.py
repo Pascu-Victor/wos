@@ -162,6 +162,20 @@ def test_wkictl_target_personas_set_expected_policy() -> None:
         "target policy flag parser",
     )
 
+    set_policy = function_body(source, "set_target_policy")
+    require_tokens(
+        set_policy,
+        [
+            'std::strcmp(policy, "local") == 0',
+            'std::strcmp(policy, "remote") == 0 || std::strcmp(policy, "remotely") == 0',
+            'std::strcmp(policy, "balanced") == 0 || std::strcmp(policy, "anywhere") == 0',
+            "flags |= ker::process::WKI_TARGET_FLAG_STRICT",
+            "ker::process::setwkitarget(nullptr, 0, flags)",
+            "ker::process::setwkitarget(hostname, std::strlen(hostname), flags)",
+        ],
+        "shared target policy setter",
+    )
+
 
 def test_wkictl_vfs_forward_and_commands_use_wki_wrappers() -> None:
     source = read_wkictl_source()
@@ -172,9 +186,14 @@ def test_wkictl_vfs_forward_and_commands_use_wki_wrappers() -> None:
             'std::strcmp(argv[command_index], "--clear") == 0',
             "ker::abi::vfs::wki_rule_clear_vfs()",
             "forward: failed to clear inherited VFS rules",
+            'std::strcmp(argv[command_index], "--target") == 0',
+            'std::strcmp(argv[command_index], "--one-shot") == 0',
+            "one_shot && target_policy == nullptr",
             'std::strcmp(arg, "--") == 0',
             "arg[0] == '+' ? ker::abi::vfs::WKI_VFS_ROUTE_HOST : ker::abi::vfs::WKI_VFS_ROUTE_LOCAL",
             "add_forward_operand(arg + 1, ROUTE)",
+            "ker::process::WKI_TARGET_FLAG_ONESHOT",
+            "set_target_policy(target_policy, EXTRA_FLAGS)",
             "return exec_command(argv + command_index)",
         ],
         "forward persona parser",
@@ -228,6 +247,7 @@ def test_wkictl_headers_expose_matching_wki_wrappers() -> None:
             "constexpr uint32_t WKI_TARGET_FLAG_NOINHERIT = 1U << 2",
             "constexpr uint32_t WKI_TARGET_FLAG_REMOTE = 1U << 3",
             "constexpr uint32_t WKI_TARGET_FLAG_BALANCED = 1U << 4",
+            "constexpr uint32_t WKI_TARGET_FLAG_ONESHOT = 1U << 5",
             "inline int64_t setwkitarget",
             "inline int64_t getwkitarget",
         ],

@@ -113,24 +113,12 @@ EOF
 #!/bin/bash
 set -eu
 
-route_file="$1"
-compiler_cwd="$2"
-local_output="$3"
-host_output="$4"
-host_report="$5"
-shift 5
-route_args=()
-while IFS= read -r route_arg; do
-    route_args+=("$route_arg")
-done < "$route_file"
-exec forward --clear "${route_args[@]}" -- locally /usr/bin/bash -c '
-set -eu
 compiler_cwd="$1"
 local_output="$2"
 host_output="$3"
 host_report="$4"
 shift 4
-trap '"'"'rm -f -- "$local_output" 2>/dev/null || true'"'"' EXIT HUP INT TERM
+trap 'rm -f -- "$local_output" 2>/dev/null || true' EXIT HUP INT TERM
 rm -f -- "$local_output"
 cd -- "$compiler_cwd"
 if ! hostname > "$host_report" || ! fsync "$host_report"; then
@@ -157,7 +145,6 @@ if ! fsync "$host_output"; then
     echo "distributed staged compiler output fsync failed" >&2
     exit 1
 fi
-' distributed-staged "$compiler_cwd" "$local_output" "$host_output" "$host_report" "$@"
 EOF
     chmod +x "$distributed_staged_launcher"
 
@@ -401,20 +388,8 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
             echo "ERROR: distributed compiler response directory could not be created" >&2
             exit 1
         fi
-        # Response files remain until the build scratch tree is removed because
-        # peers can retain stale negative VFS lookups after an unlink. Avoid
-        # mkstemp here: mlibc currently scans candidates from .000000 in every
-        # process, so the retained set makes sustained parallel builds perform
-        # an ever-growing number of exclusive creates. Wrapper PIDs are unique
-        # for concurrently active compiler processes, just like the job
-        # directories in the preprocessed transport below.
-        compiler_response="\$compiler_responses/clang.\$\$"
-        if ! compiler_create_shared_file "\$compiler_response"; then
-            echo "ERROR: distributed compiler response file could not be created" >&2
-            exit 1
-        fi
-        # Keep response files until the scratch workdir is removed. Concurrent
-        # forwarded unlink operations can leave peers with stale lookups.
+        compiler_response=""
+        compiler_staged_args=()
         compiler_skip_output_arg=0
         for arg in "\$@"; do
             if [ "\$compiler_transport" = staged ]; then
@@ -428,6 +403,18 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
                         continue
                         ;;
                 esac
+                compiler_staged_args+=("\$arg")
+                continue
+            fi
+            if [ -z "\$compiler_response" ]; then
+                # Source transport still publishes its argv through remote VFS
+                # because the destination is explicitly selected before exec.
+                # Staged transport uses WKI's fragmented task context directly.
+                compiler_response="\$compiler_responses/clang.\$\$"
+                if ! compiler_create_shared_file "\$compiler_response"; then
+                    echo "ERROR: distributed compiler response file could not be created" >&2
+                    exit 1
+                fi
             fi
             if ! printf '%q\n' "\$arg" >> "\$compiler_response"; then
                 echo "ERROR: distributed compiler response file could not be written" >&2
@@ -582,10 +569,7 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
                     *) compiler_dependency_route="\$compiler_dependency_route.d" ;;
                 esac
                 compiler_add_home_route "\$compiler_dependency_route" || exit 1
-                if ! printf '%q\n' -MF "\$compiler_dependency_route" >> "\$compiler_response"; then
-                    echo "ERROR: staged distributed compiler dependency route could not be written" >&2
-                    exit 1
-                fi
+                compiler_staged_args+=(-MF "\$compiler_dependency_route")
             fi
             if [ "\$compiler_has_implicit_module_output" -eq 1 ] && [ -n "\$output_file" ]; then
                 # Clang derives an implicit module filename from -o. Replacing
@@ -602,51 +586,39 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
                 fi
                 exit "\$compiler_status"
             fi
-            # The peer reads this file through remote VFS immediately after
-            # submission. Close-after-append is not a sufficient publication
-            # boundary for an XFS-backed response file under concurrent
-            # staging and compiler traffic.
-            if ! fsync "\$compiler_response"; then
-                compiler_slot_release
-                trap - EXIT HUP INT TERM
-                echo "ERROR: distributed compiler response file could not be published" >&2
-                exit 1
-            fi
-            compiler_route_response="\$compiler_responses/routes.\$\$"
-            if ! compiler_create_shared_file "\$compiler_route_response"; then
-                compiler_slot_release
-                trap - EXIT HUP INT TERM
-                echo "ERROR: staged distributed compiler route file could not be created" >&2
-                exit 1
-            fi
-            if ! printf '%s\n' "\${compiler_route_args[@]}" > "\$compiler_route_response"; then
-                compiler_slot_release
-                trap - EXIT HUP INT TERM
-                echo "ERROR: staged distributed compiler route file could not be written" >&2
-                exit 1
-            fi
-            if ! fsync "\$compiler_route_response"; then
-                compiler_slot_release
-                trap - EXIT HUP INT TERM
-                echo "ERROR: staged distributed compiler route file could not be published" >&2
-                exit 1
-            fi
             # Compile the object into peer-local /tmp, then copy the completed
             # file through the explicit home route. Streaming every object
             # write through remote VFS saturates the submitter and leaves peer
             # CPUs idle. The submitter PID is unique for every simultaneously
             # active wrapper on each possible selected system.
             compiler_remote_output="/tmp/wos-distributed-staged.\$\$.output"
-            # Submit only a fixed launcher, the original cwd, the two output
-            # paths, and the response-file path. Start from the peer's
-            # guaranteed root directory; the launcher installs the route
-            # policy before entering the submitter's build directory.
+            # Install routing and one-shot balanced placement in one system
+            # dispatch. WKI fragments large argv/policy contexts, so the
+            # compiler no longer needs per-job response and route files.
             compiler_remote_command=(
-                forward --clear -- anywhere /usr/bin/locally /usr/bin/timeout
+                forward --clear --target balanced --one-shot "\${compiler_route_args[@]}" -- /usr/bin/timeout
                 -s TERM -k 5 "\$compiler_remote_timeout"
                 /usr/bin/bash "$distributed_staged_launcher"
-                "\$compiler_route_response" "\$PWD" "\$compiler_remote_output" "\$compiler_staged_output" "\$compiler_host_report"
+                "\$PWD" "\$compiler_remote_output" "\$compiler_staged_output" "\$compiler_host_report"
             )
+            # TaskSubmitPayload remains intentionally bounded by uint16_t.
+            # Keep exceptional compiler invocations local instead of turning a
+            # context-size rejection into a remote retry.
+            compiler_submit_context_bytes=1024
+            for compiler_submit_arg in "\${compiler_remote_command[@]}" "\${compiler[@]}" -fno-temp-file "\${compiler_staged_args[@]}"; do
+                compiler_submit_context_bytes="\$((compiler_submit_context_bytes + \${#compiler_submit_arg} + 1))"
+            done
+            if [ "\$compiler_submit_context_bytes" -ge 60000 ]; then
+                compiler_slot_release
+                trap - EXIT HUP INT TERM
+                if "\${compiler[@]}" "\$@"; then
+                    compiler_status=0
+                    compiler_record_success 0 "\${compiler_hosts[0]}"
+                else
+                    compiler_status=\$?
+                fi
+                exit "\$compiler_status"
+            fi
         else
             compiler_remote_command=(
                 on "\$compiler_host" /usr/bin/timeout
@@ -658,8 +630,13 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
                 if [ "\$compiler_transport" = staged ]; then
                     cd / || exit 1
                 fi
-                env -i PATH="\$compiler_remote_path" HOME="\${HOME:-/root}" TMPDIR="\${TMPDIR:-/tmp}" TZ=UTC0 \
-                    "\${compiler_remote_command[@]}" "\${compiler[@]}" -fno-temp-file "@\$compiler_response"
+                if [ "\$compiler_transport" = staged ]; then
+                    env -i PATH="\$compiler_remote_path" HOME="\${HOME:-/root}" TMPDIR="\${TMPDIR:-/tmp}" TZ=UTC0 \
+                        "\${compiler_remote_command[@]}" "\${compiler[@]}" -fno-temp-file "\${compiler_staged_args[@]}"
+                else
+                    env -i PATH="\$compiler_remote_path" HOME="\${HOME:-/root}" TMPDIR="\${TMPDIR:-/tmp}" TZ=UTC0 \
+                        "\${compiler_remote_command[@]}" "\${compiler[@]}" -fno-temp-file "@\$compiler_response"
+                fi
             )
         }
         compiler_remote_attempt=1

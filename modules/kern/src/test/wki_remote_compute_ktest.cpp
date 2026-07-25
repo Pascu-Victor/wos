@@ -43,6 +43,10 @@ KTEST(WkiRemoteCompute, SubmitPolicyScopeRestoresWorker) {
     KEXPECT_TRUE(ker::net::wki::wki_remote_compute_selftest_submit_policy_scope_restores_worker());
 }
 
+KTEST(WkiRemoteCompute, ReceiverSystemPathsAreLocalByDefault) {
+    KEXPECT_TRUE(ker::net::wki::wki_remote_compute_selftest_receiver_system_paths_are_local_by_default());
+}
+
 KTEST(WkiRemoteCompute, SubmitContextLengthsAreCheckedBeforeNarrowing) {
     KEXPECT_TRUE(ker::net::wki::wki_remote_compute_selftest_submit_context_lengths_are_checked());
 }

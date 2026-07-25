@@ -3,6 +3,7 @@
 #include <sys/process.h>
 
 #include <array>
+#include <cerrno>
 #include <cstdint>
 #include <cstring>
 #include <print>
@@ -77,6 +78,32 @@ auto parse_policy_flags(int argc, char** argv, int start, uint32_t base, uint32_
 }  // namespace
 
 namespace wkictl {
+
+auto set_target_policy(const char* policy, uint32_t extra_flags) -> int64_t {
+    if (policy == nullptr || policy[0] == '\0') {
+        return -EINVAL;
+    }
+
+    uint32_t flags = extra_flags;
+    const char* hostname = nullptr;
+    if (std::strcmp(policy, "local") == 0) {
+        flags |= ker::process::WKI_TARGET_FLAG_LOCAL;
+    } else if (std::strcmp(policy, "remote") == 0 || std::strcmp(policy, "remotely") == 0) {
+        flags |= ker::process::WKI_TARGET_FLAG_REMOTE;
+    } else if (std::strcmp(policy, "balanced") == 0 || std::strcmp(policy, "anywhere") == 0) {
+        flags |= ker::process::WKI_TARGET_FLAG_BALANCED;
+    } else if (std::strcmp(policy, "auto") == 0) {
+        if (extra_flags != 0) {
+            return -EINVAL;
+        }
+    } else {
+        hostname = policy;
+        flags |= ker::process::WKI_TARGET_FLAG_STRICT;
+    }
+
+    return hostname == nullptr ? ker::process::setwkitarget(nullptr, 0, flags)
+                               : ker::process::setwkitarget(hostname, std::strlen(hostname), flags);
+}
 
 auto run_locally(int argc, char** argv) -> int {
     if (argc < 2) {

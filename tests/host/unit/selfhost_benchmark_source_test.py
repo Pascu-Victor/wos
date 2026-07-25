@@ -191,10 +191,9 @@ def test_wos_bootstrap_distributes_only_compiler_processes() -> None:
             r'compiler_start_index="\$((1 + compiler_start_index % compiler_remote_host_count))"',
             r'compiler_response="\$compiler_responses/clang.\$\$"',
             r'if ! compiler_create_shared_file "\$compiler_response"; then',
-            r'compiler_route_response="\$compiler_responses/routes.\$\$"',
-            r'if ! compiler_create_shared_file "\$compiler_route_response"; then',
-            r'''printf '%s\n' "\${compiler_route_args[@]}" > "\$compiler_route_response"''',
-            r"forward --clear -- anywhere /usr/bin/locally /usr/bin/timeout",
+            r'compiler_staged_args=()',
+            r'compiler_staged_args+=("\$arg")',
+            r'forward --clear --target balanced --one-shot "\${compiler_route_args[@]}" -- /usr/bin/timeout',
             r'-s TERM -k 5 "\$compiler_remote_timeout"',
             r'compiler_remote_output="/tmp/wos-distributed-staged.\$\$.output"',
             r'compiler_staged_output="\$compiler_responses/output.\$\$"',
@@ -202,7 +201,7 @@ def test_wos_bootstrap_distributes_only_compiler_processes() -> None:
             r'if ! compiler_create_shared_file "\$compiler_staged_output"; then',
             r'if ! compiler_create_shared_file "\$compiler_host_report"; then',
             r'compiler_add_home_route "\$compiler_staged_output"',
-            r'"\$compiler_route_response" "\$PWD" "\$compiler_remote_output" "\$compiler_staged_output" "\$compiler_host_report"',
+            r'"\$PWD" "\$compiler_remote_output" "\$compiler_staged_output" "\$compiler_host_report"',
             '''hostname > "$host_report"''',
             r'IFS= read -r compiler_host < "\$compiler_host_report"',
             '''"$@" -o "$local_output"''',
@@ -219,20 +218,19 @@ def test_wos_bootstrap_distributes_only_compiler_processes() -> None:
             r'elif ! mv -- "\$compiler_staged_output" "\$output_file"; then',
             r'compiler_skip_output_arg=0',
             r'if [ "\$compiler_skip_output_arg" -eq 1 ]; then',
-            r'''printf '%q\n' -MF "\$compiler_dependency_route" >> "\$compiler_response"''',
+            r'compiler_staged_args+=(-MF "\$compiler_dependency_route")',
             "Clang derives an implicit module filename from -o",
             r'-Wp,-MD,*|-Wp,-MMD,*)',
             r'-serialize-diagnostics=*|-fmodule-output=*|-fmodules-cache-path=*)',
+            r'"\${compiler_remote_command[@]}" "\${compiler[@]}" -fno-temp-file "\${compiler_staged_args[@]}"',
             r'"\${compiler_remote_command[@]}" "\${compiler[@]}" -fno-temp-file "@\$compiler_response"',
             r'compiler_jobs_per_host="\${WOS_DISTRIBUTED_COMPILER_JOBS_PER_HOST:-}"',
             r'compiler_local_jobs="\${WOS_DISTRIBUTED_COMPILER_LOCAL_JOBS:-\$compiler_jobs_per_host}"',
             r'compiler_remote_jobs_per_host="\${WOS_DISTRIBUTED_COMPILER_REMOTE_JOBS_PER_HOST:-\$compiler_jobs_per_host}"',
             r'compiler_remote_timeout="\${WOS_DISTRIBUTED_COMPILER_REMOTE_TIMEOUT:-300}"',
             r'compiler_publish_timeout="\${WOS_DISTRIBUTED_COMPILER_PUBLISH_TIMEOUT:-5}"',
-            r'fsync "\$compiler_response"',
-            "distributed compiler response file could not be published",
-            r'fsync "\$compiler_route_response"',
-            "staged distributed compiler route file could not be published",
+            r"compiler_submit_context_bytes=1024",
+            r'if [ "\$compiler_submit_context_bytes" -ge 60000 ]; then',
             r'compiler_run_remote() {',
             r'if [ "\$compiler_status" -ne 127 ] || [ "\$compiler_remote_attempt" -ge 2 ]; then',
             r"distributed compiler launch on \$compiler_host failed with status 127; retrying once",
@@ -1035,30 +1033,16 @@ set -eu
 trace=TRACE_PATH
 printf '%s\n' "$@" > "$trace"
 [ "$1" = --clear ]
+[ "$2" = --target ]
+[ "$3" = balanced ]
+[ "$4" = --one-shot ]
 while [ "$1" != -- ]; do shift; done
 shift
-case "$1" in
-    on) exec "$@" ;;
-    anywhere) exec "$@" ;;
-    locally) shift; exec "$@" ;;
-    *) exit 96 ;;
-esac
+exec "$@"
 '''.replace("TRACE_PATH", shlex.quote(str(trace))),
             encoding="ascii",
         )
         mock_forward.chmod(0o755)
-        mock_anywhere = temp / "anywhere"
-        mock_anywhere.write_text(
-            r'''#!/bin/bash
-set -eu
-[ "$PWD" = / ]
-[ "$1" = /usr/bin/locally ]
-shift
-exec "$@"
-''',
-            encoding="ascii",
-        )
-        mock_anywhere.chmod(0o755)
         mock_hostname = temp / "hostname"
         mock_hostname.write_text("#!/bin/sh\nprintf 'wos-1\\n'\n", encoding="ascii")
         mock_hostname.chmod(0o755)
@@ -1103,7 +1087,10 @@ grep -Fx -- "+$1/explicit.d" "$1/on.args"
 grep -Fx -- "+$1/compile.json" "$1/on.args"
 grep -Fx -- "+$1/diagnostics.dia" "$1/on.args"
 grep -Fx -- "+$1/module-cache" "$1/on.args"
-grep -Fx -- locally "$1/on.args"
+grep -Fx -- --target "$1/on.args"
+grep -Fx -- balanced "$1/on.args"
+grep -Fx -- --one-shot "$1/on.args"
+! grep -Fx -- locally "$1/on.args"
 test "$(cat "$1/compiler-state.successes/1")" = wos-1
 (
     cd "$1/source-root"
@@ -1168,8 +1155,7 @@ def test_wos_bootstrap_retries_unpublished_staged_output_locally() -> None:
 set -eu
 [ "$1" = --clear ]
 while [ "$1" != -- ]; do shift; done
-shift
-exec "$@"
+exit 0
 ''',
             encoding="ascii",
         )

@@ -113,6 +113,21 @@ auto exec_lazy_file_segments_enabled() -> bool {
 
     return expected != 0;
 }
+
+void consume_successful_one_shot_wki_target(ker::mod::sched::task::Task* task, ker::net::wki::WkiRemoteSpawnResult result) {
+    if (task == nullptr || result == ker::net::wki::WkiRemoteSpawnResult::FAILED ||
+        (task->wki_target_flags & ker::mod::sched::task::Task::WKI_TARGET_FLAG_ONESHOT) == 0) {
+        return;
+    }
+
+    task->wki_target_hostname.front() = '\0';
+    task->wki_target_flags = 0;
+    // The rich exec path already made this task's one placement decision.
+    // Prevent scheduler publication from treating the now-cleared policy as a
+    // fresh automatic-placement request.
+    task->wki_skip_legacy_placement = true;
+}
+
 using FdSnapshot = std::array<uint64_t, ker::mod::sched::task::Task::FD_TABLE_SIZE>;
 using LazyVmemKind = ker::mod::sched::task::LazyVmemKind;
 using LazyVmemRange = ker::mod::sched::task::LazyVmemRange;
@@ -1378,6 +1393,26 @@ auto exec_selftest_spawn_dup2_consumes_cloexec_source() -> bool {
     parent.fd_table.remove(DESTINATION_FD);
     return ok;
 }
+
+auto exec_selftest_one_shot_wki_target_consumes_only_on_success() -> bool {
+    ker::mod::sched::task::Task one_shot{};
+    std::strncpy(one_shot.wki_target_hostname.data(), "wos-2", one_shot.wki_target_hostname.size() - 1);
+    one_shot.wki_target_flags = ker::mod::sched::task::Task::WKI_TARGET_FLAG_STRICT | ker::mod::sched::task::Task::WKI_TARGET_FLAG_ONESHOT;
+    consume_successful_one_shot_wki_target(&one_shot, ker::net::wki::WkiRemoteSpawnResult::LOCAL);
+
+    ker::mod::sched::task::Task persistent{};
+    persistent.wki_target_flags = ker::mod::sched::task::Task::WKI_TARGET_FLAG_BALANCED;
+    consume_successful_one_shot_wki_target(&persistent, ker::net::wki::WkiRemoteSpawnResult::REMOTE);
+
+    ker::mod::sched::task::Task failed{};
+    failed.wki_target_flags = ker::mod::sched::task::Task::WKI_TARGET_FLAG_REMOTE | ker::mod::sched::task::Task::WKI_TARGET_FLAG_ONESHOT;
+    consume_successful_one_shot_wki_target(&failed, ker::net::wki::WkiRemoteSpawnResult::FAILED);
+
+    return one_shot.wki_target_hostname.front() == '\0' && one_shot.wki_target_flags == 0 && one_shot.wki_skip_legacy_placement &&
+           persistent.wki_target_flags == ker::mod::sched::task::Task::WKI_TARGET_FLAG_BALANCED &&
+           failed.wki_target_flags ==
+               (ker::mod::sched::task::Task::WKI_TARGET_FLAG_REMOTE | ker::mod::sched::task::Task::WKI_TARGET_FLAG_ONESHOT);
+}
 #endif
 
 auto supports_file_backed_process(vfs::File* file, size_t file_size) -> bool {
@@ -2007,6 +2042,7 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
         .cwd = parent_task->cwd.data(),
     };
     auto remote_result = ker::net::wki::wki_try_remote_spawn(new_task, REMOTE_SPAWN);
+    consume_successful_one_shot_wki_target(new_task, remote_result);
     if (remote_result == ker::net::wki::WkiRemoteSpawnResult::REMOTE) {
         if (!sched::task::release_unpublished_process(parent_task, new_task)) {
             dbg::log("wos_proc_exec: remote publication lost child ownership for PID %x", CHILD_PID);
@@ -2314,6 +2350,7 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
         auto remote_result = ker::net::wki::wki_try_remote_spawn(task, REMOTE_SPAWN);
         end_local_proc_stage(task, perf::WkiPerfLocalProcOp::REMOTE_SPAWN, REMOTE_SPAWN_STAGE, static_cast<int32_t>(remote_result),
                              static_cast<uint64_t>(FILE_SIZE), WOS_PERF_CALLSITE());
+        consume_successful_one_shot_wki_target(task, remote_result);
 
         task->elf_buffer = saved_elf_buffer;
         task->elf_buffer_size = SAVED_ELF_BUFFER_SIZE;

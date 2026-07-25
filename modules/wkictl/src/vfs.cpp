@@ -2,6 +2,7 @@
 
 #include <abi-bits/access.h>
 #include <glob.h>
+#include <sys/process.h>
 #include <sys/stat.h>
 #include <sys/vfs.h>
 #include <unistd.h>
@@ -14,6 +15,7 @@
 #include <print>
 
 #include "wkictl/cli.hpp"
+#include "wkictl/target.hpp"
 
 namespace {
 
@@ -136,14 +138,39 @@ namespace wkictl {
 
 auto run_forward(int argc, char** argv) -> int {
     int command_index = 1;
-    if (command_index < argc && std::strcmp(argv[command_index], "--clear") == 0) {
-        int const CLEAR_RC = ker::abi::vfs::wki_rule_clear_vfs();
-        if (CLEAR_RC < 0) {
-            std::println(stderr, "forward: failed to clear inherited VFS rules: {}", CLEAR_RC);
-            return 1;
+    const char* target_policy = nullptr;
+    bool one_shot = false;
+    while (command_index < argc) {
+        if (std::strcmp(argv[command_index], "--clear") == 0) {
+            int const CLEAR_RC = ker::abi::vfs::wki_rule_clear_vfs();
+            if (CLEAR_RC < 0) {
+                std::println(stderr, "forward: failed to clear inherited VFS rules: {}", CLEAR_RC);
+                return 1;
+            }
+            command_index++;
+            continue;
         }
-        command_index++;
+        if (std::strcmp(argv[command_index], "--target") == 0) {
+            if (++command_index >= argc) {
+                std::println(stderr, "forward: --target requires a placement policy");
+                return 1;
+            }
+            target_policy = argv[command_index++];
+            continue;
+        }
+        if (std::strcmp(argv[command_index], "--one-shot") == 0) {
+            one_shot = true;
+            command_index++;
+            continue;
+        }
+        break;
     }
+
+    if (one_shot && target_policy == nullptr) {
+        std::println(stderr, "forward: --one-shot requires --target");
+        return 1;
+    }
+
     for (; command_index < argc; ++command_index) {
         const char* arg = argv[command_index];
         if (std::strcmp(arg, "--") == 0) {
@@ -156,6 +183,15 @@ auto run_forward(int argc, char** argv) -> int {
 
         uint32_t const ROUTE = arg[0] == '+' ? ker::abi::vfs::WKI_VFS_ROUTE_HOST : ker::abi::vfs::WKI_VFS_ROUTE_LOCAL;
         if (!add_forward_operand(arg + 1, ROUTE)) {
+            return 1;
+        }
+    }
+
+    if (target_policy != nullptr) {
+        uint32_t const EXTRA_FLAGS = one_shot ? ker::process::WKI_TARGET_FLAG_ONESHOT : 0;
+        int64_t const TARGET_RC = set_target_policy(target_policy, EXTRA_FLAGS);
+        if (TARGET_RC < 0) {
+            std::println(stderr, "forward: failed to set '{}' placement policy: {}", target_policy, static_cast<long>(TARGET_RC));
             return 1;
         }
     }

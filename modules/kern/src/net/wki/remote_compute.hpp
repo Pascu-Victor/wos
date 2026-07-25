@@ -417,6 +417,7 @@ auto wki_remote_compute_selftest_load_snapshot_survives_cleanup() -> bool;
 auto wki_remote_compute_selftest_placement_score_accounts_for_inflight() -> bool;
 auto wki_remote_compute_selftest_balanced_score_accounts_for_capacity() -> bool;
 auto wki_remote_compute_selftest_submit_policy_scope_restores_worker() -> bool;
+auto wki_remote_compute_selftest_receiver_system_paths_are_local_by_default() -> bool;
 auto wki_remote_compute_selftest_submit_context_lengths_are_checked() -> bool;
 auto wki_remote_compute_selftest_submit_fragment_boundaries() -> bool;
 auto wki_remote_compute_selftest_submit_worker_count_is_bounded() -> bool;

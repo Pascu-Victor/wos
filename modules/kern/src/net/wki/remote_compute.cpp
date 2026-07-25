@@ -564,6 +564,82 @@ auto task_uses_local_vfs_route_for_path(const ker::mod::sched::task::Task* task,
     return route == static_cast<uint32_t>(ker::mod::sched::task::WkiVfsRoute::LOCAL);
 }
 
+constexpr std::array<const char*, 7> WKI_RECEIVER_LOCAL_SYSTEM_PREFIXES = {
+    "/usr", "/bin", "/sbin", "/lib", "/lib64", "/libexec", "/share",
+};
+
+auto task_vfs_rule_prefix_matches(const char* path, const char* prefix, size_t prefix_len) -> bool {
+    if (path == nullptr || prefix == nullptr || prefix_len == 0 || std::strncmp(path, prefix, prefix_len) != 0) {
+        return false;
+    }
+    if (prefix_len == 1 && prefix[0] == '/') {
+        return true;
+    }
+    return path[prefix_len] == '\0' || path[prefix_len] == '/';
+}
+
+auto explicit_task_vfs_route_for_path(const ker::mod::sched::task::Task* task, const char* path, uint8_t* route_out) -> bool {
+    if (task == nullptr || path == nullptr || route_out == nullptr) {
+        return false;
+    }
+
+    bool found = false;
+    uint16_t best_prefix_len = 0;
+    for (const auto& rule : task->wki_vfs_rules) {
+        if (rule.prefix_len == 0 || rule.prefix_len >= rule.prefix.size() ||
+            !task_vfs_rule_prefix_matches(path, rule.prefix.data(), rule.prefix_len) || (found && rule.prefix_len <= best_prefix_len)) {
+            continue;
+        }
+        found = true;
+        best_prefix_len = rule.prefix_len;
+        *route_out = rule.route;
+    }
+    return found;
+}
+
+auto receiver_local_system_path(const char* path) -> bool {
+    if (path == nullptr) {
+        return false;
+    }
+    return std::ranges::any_of(WKI_RECEIVER_LOCAL_SYSTEM_PREFIXES,
+                               [path](const char* prefix) { return task_vfs_rule_prefix_matches(path, prefix, std::strlen(prefix)); });
+}
+
+auto task_uses_receiver_local_path(const ker::mod::sched::task::Task* task, const char* path) -> bool {
+    uint8_t explicit_route = 0;
+    if (explicit_task_vfs_route_for_path(task, path, &explicit_route)) {
+        return explicit_route == static_cast<uint8_t>(ker::mod::sched::task::WkiVfsRoute::LOCAL);
+    }
+    if (receiver_local_system_path(path)) {
+        return true;
+    }
+    return task_uses_local_vfs_route_for_path(task, path);
+}
+
+auto install_receiver_local_system_rules(ker::mod::sched::task::Task* task) -> bool {
+    if (task == nullptr) {
+        return false;
+    }
+
+    for (const char* const PREFIX : WKI_RECEIVER_LOCAL_SYSTEM_PREFIXES) {
+        size_t const PREFIX_LEN = std::strlen(PREFIX);
+        uint8_t explicit_route = 0;
+        if (explicit_task_vfs_route_for_path(task, PREFIX, &explicit_route)) {
+            continue;
+        }
+
+        ker::mod::sched::task::WkiVfsRule rule{};
+        std::memcpy(rule.prefix.data(), PREFIX, PREFIX_LEN);
+        *std::next(rule.prefix.begin(), static_cast<ptrdiff_t>(PREFIX_LEN)) = '\0';
+        rule.prefix_len = static_cast<uint16_t>(PREFIX_LEN);
+        rule.route = static_cast<uint8_t>(ker::mod::sched::task::WkiVfsRoute::LOCAL);
+        if (!task->wki_vfs_rules.push_back(rule)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 auto submitted_task_bucket(uint32_t task_id) -> size_t {
     return static_cast<size_t>(task_id * 0x9E3779B1U) & (WKI_SUBMITTED_TASK_INDEX_BUCKETS - 1);
 }
@@ -1644,7 +1720,7 @@ struct ScopedSubmitVfsIdentity {
         submitted_task->wki_vfs_rules = std::move(task->wki_vfs_rules);
         task->wki_vfs_rules = std::move(saved_vfs_rules);
         vfs_rules_installed = false;
-        return true;
+        return install_receiver_local_system_rules(submitted_task);
     }
 
     ~ScopedSubmitVfsIdentity() {
@@ -1952,7 +2028,7 @@ auto build_vfs_ref_path(uint16_t target_node, const char* local_path, char* out,
         return true;
     }
 
-    if (task_uses_local_vfs_route_for_path(task, local_path)) {
+    if (task_uses_receiver_local_path(task, local_path)) {
         size_t const LEN = std::strlen(local_path);
         if (LEN + 1 > out_size) {
             return false;
@@ -4796,8 +4872,11 @@ auto wki_remote_compute_selftest_submit_policy_scope_restores_worker() -> bool {
                                       has_only_rule(worker, POLICY_PREFIX, WkiVfsRoute::LOCAL);
         bool const TRANSFERRED = scope.transfer_vfs_rules_to(&submitted);
         bool const WORKER_RULES_RESTORED = has_only_rule(worker, "/worker", WkiVfsRoute::HOST);
-        scope_state_ok =
-            POLICY_INSTALLED && TRANSFERRED && WORKER_RULES_RESTORED && has_only_rule(submitted, POLICY_PREFIX, WkiVfsRoute::LOCAL);
+        uint8_t submitted_lib_route = 0;
+        scope_state_ok = POLICY_INSTALLED && TRANSFERRED && WORKER_RULES_RESTORED &&
+                         explicit_task_vfs_route_for_path(&submitted, POLICY_PREFIX, &submitted_lib_route) &&
+                         submitted_lib_route == static_cast<uint8_t>(WkiVfsRoute::LOCAL) &&
+                         task_uses_receiver_local_path(&submitted, "/usr/bin/clang");
     }
 
     bool const WORKER_IDENTITY_RESTORED =
@@ -4816,6 +4895,46 @@ auto wki_remote_compute_selftest_submit_policy_scope_restores_worker() -> bool {
                                               std::strcmp(worker.wki_submitter_hostname.data(), "worker-host") == 0 &&
                                               has_only_rule(worker, "/worker", WkiVfsRoute::HOST);
     return scope_state_ok && WORKER_IDENTITY_RESTORED && invalid_policy_rejected && WORKER_RESTORED_AFTER_REJECT;
+}
+
+auto wki_remote_compute_selftest_receiver_system_paths_are_local_by_default() -> bool {
+    using ker::mod::sched::task::Task;
+    using ker::mod::sched::task::WkiVfsRoute;
+    using ker::mod::sched::task::WkiVfsRule;
+
+    auto add_rule = [](Task* task, const char* prefix, WkiVfsRoute route) -> bool {
+        WkiVfsRule rule{};
+        size_t const PREFIX_LEN = std::strlen(prefix);
+        if (PREFIX_LEN == 0 || PREFIX_LEN >= rule.prefix.size()) {
+            return false;
+        }
+        std::memcpy(rule.prefix.data(), prefix, PREFIX_LEN);
+        *std::next(rule.prefix.begin(), static_cast<ptrdiff_t>(PREFIX_LEN)) = '\0';
+        rule.prefix_len = static_cast<uint16_t>(PREFIX_LEN);
+        rule.route = static_cast<uint8_t>(route);
+        return task->wki_vfs_rules.push_back(rule);
+    };
+
+    Task defaults{};
+    if (!install_receiver_local_system_rules(&defaults) || !task_uses_receiver_local_path(&defaults, "/usr/bin/clang") ||
+        !task_uses_receiver_local_path(&defaults, "/bin/bash") || !task_uses_receiver_local_path(&defaults, "/lib/libc.so") ||
+        receiver_local_system_path("/workspace/input.cpp")) {
+        return false;
+    }
+
+    Task explicit_host{};
+    if (!add_rule(&explicit_host, "/", WkiVfsRoute::HOST) || !install_receiver_local_system_rules(&explicit_host) ||
+        explicit_host.wki_vfs_rules.size() != 1 || task_uses_receiver_local_path(&explicit_host, "/usr/bin/clang")) {
+        return false;
+    }
+
+    Task mixed{};
+    if (!add_rule(&mixed, "/usr", WkiVfsRoute::HOST) || !install_receiver_local_system_rules(&mixed) ||
+        task_uses_receiver_local_path(&mixed, "/usr/bin/clang") || !task_uses_receiver_local_path(&mixed, "/bin/bash")) {
+        return false;
+    }
+
+    return true;
 }
 #endif
 

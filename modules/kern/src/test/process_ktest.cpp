@@ -26,3 +26,7 @@ KTEST(ExecFdCloexec, SnapshotCollectsMarkedFds) {
 KTEST(ExecSpawnFdActions, Dup2ConsumesCloexecSourceBeforeFinalClose) {
     KEXPECT_TRUE(ker::syscall::process::exec_selftest_spawn_dup2_consumes_cloexec_source());
 }
+
+KTEST(ExecWkiTarget, OneShotConsumesOnlyOnSuccessfulPlacement) {
+    KEXPECT_TRUE(ker::syscall::process::exec_selftest_one_shot_wki_target_consumes_only_on_success());
+}
