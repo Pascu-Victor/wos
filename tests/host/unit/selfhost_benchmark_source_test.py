@@ -1465,6 +1465,20 @@ exec "$@"
         if auto_gzip.returncode != 0 or " compression=gzip " not in auto_gzip.stdout:
             fail(f"distributed large-root automatic compression did not select gzip: {auto_gzip.stdout!r} {auto_gzip.stderr!r}")
 
+        default_environment = auto_environment.copy()
+        default_environment.pop("WOS_DISTRIBUTED_COMPILER_STAGE_COMPRESSION")
+        default_environment.pop("WOS_DISTRIBUTED_COMPILER_STAGE_COMPRESSION_THRESHOLD_KIB")
+        default_raw = subprocess.run(
+            [str(STAGE_DISTRIBUTED_ROOTS), str(root)],
+            cwd=ROOT,
+            check=False,
+            text=True,
+            capture_output=True,
+            env=default_environment,
+        )
+        if default_raw.returncode != 0 or " compression=none " not in default_raw.stdout:
+            fail(f"distributed staging did not default to raw tar: {default_raw.stdout!r} {default_raw.stderr!r}")
+
         next_root = stage_base / "checkout" / "next-phase"
         next_root.mkdir()
         (next_root / "sentinel").write_text("next\n", encoding="ascii")

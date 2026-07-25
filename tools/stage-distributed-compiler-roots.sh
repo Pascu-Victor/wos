@@ -241,7 +241,10 @@ stage_dir="$state.staging"
 manifest="$state.local-roots"
 stage_retries="${WOS_DISTRIBUTED_COMPILER_STAGE_RETRIES:-3}"
 stage_retry_delay="${WOS_DISTRIBUTED_COMPILER_STAGE_RETRY_DELAY_SECONDS:-1}"
-stage_compression="${WOS_DISTRIBUTED_COMPILER_STAGE_COMPRESSION:-auto}"
+# WOS peer staging runs over the local high-throughput cluster transport.
+# Single-threaded gzip costs more wall time than it saves there for large
+# source/build trees; retain auto/gzip as explicit policy overrides.
+stage_compression="${WOS_DISTRIBUTED_COMPILER_STAGE_COMPRESSION:-none}"
 case "$stage_retries" in
     ''|*[!0-9]*|0)
         echo "ERROR: distributed compiler stage retries must be a positive integer" >&2
