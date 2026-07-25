@@ -289,6 +289,64 @@ TEST_F(BufferCacheTest, FailedBwriteMarksCleanBufferDirtyForRetry) {
     dev.private_data = nullptr;
 }
 
+TEST_F(BufferCacheTest, JournalHoldDefersOverlappingAliasWritebackUntilRelease) {
+    RecordingIoState io{};
+    dev.write_blocks = recording_write;
+    dev.private_data = &io;
+
+    constexpr uint64_t BLOCK = 36;
+    BufHead* older_multi = bget_multi(&dev, BLOCK, 2);
+    ASSERT_NE(older_multi, nullptr);
+    memset(older_multi->data, 0x31, older_multi->size);
+    bdirty(older_multi);
+    brelse(older_multi);
+
+    BufHead* newer_single = bget(&dev, BLOCK);
+    ASSERT_NE(newer_single, nullptr);
+    memset(newer_single->data, 0x52, newer_single->size);
+    EXPECT_EQ(bwrite(newer_single), 0);
+    io.write_calls = 0;
+
+    bjournal_hold(newer_single);
+    memset(newer_single->data, 0x73, newer_single->size);
+    EXPECT_EQ(sync_blockdev(&dev), 0);
+    EXPECT_EQ(io.write_calls, 0u);
+    EXPECT_TRUE(has_dirty_bdev_range(&dev, BLOCK, 2));
+
+    bdirty(newer_single);
+    bjournal_release(newer_single);
+    EXPECT_EQ(sync_blockdev(&dev), 0);
+    ASSERT_EQ(io.write_calls, 2u);
+    EXPECT_EQ(io.write_first_bytes[0], 0x73);
+    EXPECT_EQ(io.write_first_bytes[1], 0x73);
+    EXPECT_FALSE(has_dirty_bdev_range(&dev, BLOCK, 2));
+
+    brelse(newer_single);
+    dev.private_data = nullptr;
+}
+
+TEST_F(BufferCacheTest, BwriteRefusesJournalHeldHomeWrite) {
+    RecordingIoState io{};
+    dev.write_blocks = recording_write;
+    dev.private_data = &io;
+
+    constexpr uint64_t BLOCK = 38;
+    BufHead* bh = bget(&dev, BLOCK);
+    ASSERT_NE(bh, nullptr);
+    bh->data[0] = 0xA5;
+    bjournal_hold(bh);
+    EXPECT_EQ(bwrite(bh), -EBUSY);
+    EXPECT_EQ(io.write_calls, 0u);
+    EXPECT_TRUE(has_dirty_bdev_range(&dev, BLOCK, 1));
+
+    bjournal_release(bh);
+    EXPECT_EQ(bwrite(bh), 0);
+    EXPECT_EQ(io.write_calls, 1u);
+    EXPECT_FALSE(has_dirty_bdev_range(&dev, BLOCK, 1));
+    brelse(bh);
+    dev.private_data = nullptr;
+}
+
 TEST_F(BufferCacheTest, BwriteDoesNotClearForeignWritebackMarker) {
     RecordingIoState io{};
     dev.write_blocks = recording_write;

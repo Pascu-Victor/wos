@@ -442,6 +442,12 @@ auto xfs_trans_capture_buf(XfsTransaction* tp, BufHead* bp) -> int {
         return -ENOMEM;
     }
 
+    // Prevent writeback from observing either the capture copy or alias
+    // synchronization below. The hold remains owned by the undo record until
+    // commit/cancel discards it.
+    bjournal_hold(bp);
+    undo->journal_held = true;
+
     // A pinned metadata buffer can be retired from the cache while a
     // transaction still owns it, allowing a replacement BufHead for the same
     // device span.  Every alias must share the first before-image, otherwise
@@ -459,6 +465,8 @@ auto xfs_trans_capture_buf(XfsTransaction* tp, BufHead* bp) -> int {
             }
         }
         if (current == nullptr || current->data == nullptr || span_undo->before_image == nullptr) {
+            bjournal_release(bp);
+            undo->journal_held = false;
             delete[] undo->before_image;
             delete undo;
             tp->error = -EIO;
@@ -470,8 +478,6 @@ auto xfs_trans_capture_buf(XfsTransaction* tp, BufHead* bp) -> int {
         __builtin_memcpy(undo->before_image, bp->data, bp->size);
     }
 
-    bjournal_hold(bp);
-    undo->journal_held = true;
     bp->refcount.fetch_add(1, std::memory_order_relaxed);
     undo->bp = bp;
     undo->size = bp->size;

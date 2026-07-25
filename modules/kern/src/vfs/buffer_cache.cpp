@@ -1238,6 +1238,75 @@ auto range_find_overlap_locked(BufHead* root, dev::BlockDevice* bdev, uint64_t b
     return nullptr;
 }
 
+auto range_find_journal_pending_overlap_locked(BufHead* root, dev::BlockDevice* bdev, uint64_t block_no, size_t count) -> BufHead* {
+    if (root == nullptr || bdev == nullptr || count == 0) {
+        return nullptr;
+    }
+
+    uint64_t const QUERY_LAST = block_range_last_block(block_no, count);
+    if (root->range_left != nullptr && root->range_left->range_subtree_last_block >= block_no) {
+        if (BufHead* found = range_find_journal_pending_overlap_locked(root->range_left, bdev, block_no, count)) {
+            return found;
+        }
+    }
+
+    if (root->bdev == bdev && root->journal_pending.load(std::memory_order_acquire) != 0 && root->block_no <= QUERY_LAST &&
+        range_buffer_last_block(root) >= block_no) {
+        return root;
+    }
+
+    if (root->block_no <= QUERY_LAST) {
+        return range_find_journal_pending_overlap_locked(root->range_right, bdev, block_no, count);
+    }
+    return nullptr;
+}
+
+auto find_overlapping_writeback_locked(const BufHead* source) -> BufHead* {
+    if (source == nullptr || source->bdev == nullptr || source->bdev->block_size == 0 || source->size == 0 ||
+        source->size % source->bdev->block_size != 0) {
+        return nullptr;
+    }
+
+    size_t const COUNT = source->size / source->bdev->block_size;
+    if (!range_index_degraded) {
+        RangeBdevState* state = find_range_bdev_state_locked(source->bdev);
+        return state == nullptr ? nullptr : range_find_overlap_locked(state->tree_root, source->bdev, source->block_no, COUNT, true);
+    }
+
+    for (auto* bucket_head : hash_buckets) {
+        for (BufHead* bh = bucket_head; bh != nullptr; bh = bh->hash_next) {
+            if ((bh->flags & BH_WRITEBACK) != 0 && buffer_overlaps_range(bh, source->bdev, source->block_no, COUNT)) {
+                return bh;
+            }
+        }
+    }
+    return nullptr;
+}
+
+auto has_overlapping_journal_pending_locked(const BufHead* source) -> bool {
+    if (source == nullptr || source->bdev == nullptr || source->bdev->block_size == 0 || source->size == 0 ||
+        source->size % source->bdev->block_size != 0) {
+        return false;
+    }
+
+    size_t const COUNT = source->size / source->bdev->block_size;
+    if (!range_index_degraded) {
+        RangeBdevState* state = find_range_bdev_state_locked(source->bdev);
+        return state != nullptr &&
+               range_find_journal_pending_overlap_locked(state->tree_root, source->bdev, source->block_no, COUNT) != nullptr;
+    }
+
+    for (auto* bucket_head : hash_buckets) {
+        for (BufHead* bh = bucket_head; bh != nullptr; bh = bh->hash_next) {
+            if (bh->journal_pending.load(std::memory_order_acquire) != 0 &&
+                buffer_overlaps_range(bh, source->bdev, source->block_no, COUNT)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 auto cached_buffer_copy_coverage(BufHead* bh, dev::BlockDevice* bdev, uint64_t block_no, size_t count, uint8_t* dst,
                                  std::array<DirtyCoverageInterval, DIRTY_COPY_COVERAGE_MAX_INTERVALS>& coverage, size_t& coverage_count,
                                  bool& coverage_overflow) -> bool {
@@ -1456,7 +1525,7 @@ void discard_clean_overlapping_aliases_locked(BufHead* source) {
 auto cached_alias_can_overlay_range(const BufHead* alias, dev::BlockDevice* bdev, uint64_t block_no, size_t count,
                                     uint64_t min_epoch_exclusive) -> bool {
     if (alias == nullptr || bdev == nullptr || bdev->block_size == 0 || count == 0 || alias->bdev != bdev || alias->data == nullptr ||
-        (alias->flags & BH_VALID) == 0 || alias->dirty_epoch <= min_epoch_exclusive) {
+        alias->retired.load(std::memory_order_acquire) || (alias->flags & BH_VALID) == 0 || alias->dirty_epoch <= min_epoch_exclusive) {
         return false;
     }
     return buffer_overlaps_range(alias, bdev, block_no, count);
@@ -2294,9 +2363,9 @@ auto write_buffer_snapshot_for_epoch(BufHead* bh, uint64_t writeback_dirty_epoch
 auto dirty_writeback_run_can_append_locked(const DirtyWritebackRun& run, const BufHead* bh, const DirtyWritebackFilter& filter,
                                            uint64_t min_epoch_exclusive, uint64_t max_epoch_inclusive) -> bool {
     if (bh == nullptr || !dirty_filter_matches(bh, filter) || bh->dirty_epoch <= min_epoch_exclusive ||
-        bh->dirty_epoch > max_epoch_inclusive || (bh->flags & BH_WRITEBACK) != 0 || has_older_overlapping_dirty_buffer_locked(bh) ||
-        bh->bdev == nullptr || bh->bdev->block_size == 0 || bh->data == nullptr || bh->size == 0 ||
-        (bh->size % bh->bdev->block_size) != 0) {
+        bh->dirty_epoch > max_epoch_inclusive || (bh->flags & BH_WRITEBACK) != 0 || has_overlapping_journal_pending_locked(bh) ||
+        has_older_overlapping_dirty_buffer_locked(bh) || bh->bdev == nullptr || bh->bdev->block_size == 0 || bh->data == nullptr ||
+        bh->size == 0 || (bh->size % bh->bdev->block_size) != 0) {
         return false;
     }
 
@@ -3042,11 +3111,12 @@ void bjournal_hold(BufHead* bh) {
     // Publish the journal hold under the same lock that selects writeback
     // candidates. This closes the window where writeback could observe zero
     // journal owners and claim the buffer while a transaction starts taking
-    // its before-image. A writer that claimed the buffer first must finish
-    // before the caller is allowed to mutate it.
+    // its before-image. Writeback snapshots merge overlapping aliases, so an
+    // already-claimed write on any overlapping buffer must finish before the
+    // caller is allowed to mutate this one.
     uint64_t irqflags = cache_lock.lock_irqsave();
     bh->journal_pending.fetch_add(1, std::memory_order_acq_rel);
-    while ((bh->flags & BH_WRITEBACK) != 0) {
+    while (find_overlapping_writeback_locked(bh) != nullptr) {
         cache_lock.unlock_irqrestore(irqflags);
         ker::mod::sched::kern_yield();
         irqflags = cache_lock.lock_irqsave();
@@ -3081,6 +3151,10 @@ auto bwrite(BufHead* bh) -> int {
             return -EIO;
         }
         mark_buffer_dirty_locked(bh);
+        if (has_overlapping_journal_pending_locked(bh)) {
+            cache_lock.unlock_irqrestore(IRQFLAGS);
+            return -EBUSY;
+        }
         writeback_dirty_epoch = bh->dirty_epoch;
         if ((bh->flags & BH_WRITEBACK) == 0) {
             owned_writeback_epoch = allocate_writeback_epoch();
