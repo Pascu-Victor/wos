@@ -4352,6 +4352,7 @@ auto xfs_open_path(const char* fs_path, int flags, int mode, XfsMountContext* ct
     XfsInode* ip = nullptr;
     bool used_create_lookup = false;
     bool create_missing = false;
+    bool repair_unreachable_create_entry = false;
     bool created_by_open = false;
     bool path_cache_needs_store = true;
     XfsInode* create_parent_ip = nullptr;
@@ -4415,20 +4416,40 @@ auto xfs_open_path(const char* fs_path, int flags, int mode, XfsMountContext* ct
                 XfsDirEntry existing{};
                 int lookup_ret = xfs_dir_lookup(create_parent_ip, create_filename, create_filename_len, &existing);
                 if (lookup_ret == 0) {
-                    if ((flags & O_EXCL_FLAG) != 0) {
+                    ip = xfs_inode_read_known_allocated(ctx, existing.ino);
+                    if (ip != nullptr && ip->nlink == 0) {
+                        xfs_inode_release_metadata_locked(ip);
+                        ip = nullptr;
+                        create_missing = true;
+                        repair_unreachable_create_entry = true;
+                        record_create_lookup(0);
+                    } else if (ip == nullptr) {
+                        ker::vfs::Stat existing_stat{};
+                        int const TARGET_STATUS = xfs_inode_stat(ctx, existing.ino, &existing_stat, true, true);
+                        if (TARGET_STATUS == -ENOENT) {
+                            create_missing = true;
+                            repair_unreachable_create_entry = true;
+                            record_create_lookup(0);
+                        } else {
+                            xfs_inode_release(create_parent_ip);
+                            create_parent_ip = nullptr;
+                            int const OPEN_ERROR = TARGET_STATUS == 0 ? -EIO : TARGET_STATUS;
+                            record_create_lookup(OPEN_ERROR);
+                            xfs_set_open_result(result_out, OPEN_ERROR);
+                            return nullptr;
+                        }
+                    } else if ((flags & O_EXCL_FLAG) != 0) {
+                        xfs_inode_release_metadata_locked(ip);
+                        ip = nullptr;
                         xfs_inode_release(create_parent_ip);
                         create_parent_ip = nullptr;
                         record_create_lookup(-EEXIST);
                         xfs_set_open_result(result_out, -EEXIST);
                         return nullptr;
-                    }
-                    xfs_inode_release(create_parent_ip);
-                    create_parent_ip = nullptr;
-                    record_create_lookup(0);
-                    ip = xfs_inode_read_known_allocated(ctx, existing.ino);
-                    if (ip == nullptr) {
-                        xfs_set_open_result(result_out, -ENOENT);
-                        return nullptr;
+                    } else {
+                        xfs_inode_release(create_parent_ip);
+                        create_parent_ip = nullptr;
+                        record_create_lookup(0);
                     }
                 } else if (lookup_ret == -ENOENT) {
                     create_missing = true;
@@ -4556,6 +4577,18 @@ auto xfs_open_path(const char* fs_path, int flags, int mode, XfsMountContext* ct
 
         xfs_trans_log_inode(tp, new_inode);
         perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::CREATE_INODE_INIT, PERF_INODE_INIT_STARTED_US, 0, 1);
+
+        if (repair_unreachable_create_entry) {
+            int const REMOVE_RC = xfs_dir_removename(create_parent_ip, create_filename, create_filename_len, tp);
+            if (REMOVE_RC != 0) {
+                xfs_trans_cancel(tp);
+                xfs_inode_free_uncached(new_inode);
+                xfs_inode_release(create_parent_ip);
+                record_open_create(REMOVE_RC);
+                xfs_set_open_result(result_out, REMOVE_RC);
+                return nullptr;
+            }
+        }
 
         // Add directory entry
         uint64_t const PERF_DIR_ADD_STARTED_US = perf_xfs_started_us(ker::mod::perf::WkiPerfLocalXfsOp::DIR_ADD);

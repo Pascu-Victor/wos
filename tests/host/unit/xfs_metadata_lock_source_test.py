@@ -302,6 +302,31 @@ def test_known_absent_create_hint_requires_xfs_proof() -> None:
     )
 
 
+def test_create_repairs_only_unreachable_indexed_entries() -> None:
+    open_body = function_body(XFS_VFS_CPP.read_text(), "xfs_open_path")
+    require_order(
+        open_body,
+        [
+            "ip = xfs_inode_read_known_allocated(ctx, existing.ino);",
+            "if (ip != nullptr && ip->nlink == 0)",
+            "xfs_inode_release_metadata_locked(ip);",
+            "repair_unreachable_create_entry = true;",
+            "xfs_inode_stat(ctx, existing.ino, &existing_stat, true, true)",
+            "if (TARGET_STATUS == -ENOENT)",
+            "repair_unreachable_create_entry = true;",
+            "int const OPEN_ERROR = TARGET_STATUS == 0 ? -EIO : TARGET_STATUS;",
+            "else if ((flags & O_EXCL_FLAG) != 0)",
+            "xfs_set_open_result(result_out, -EEXIST);",
+            "xfs_ialloc(ctx, tp",
+            "if (repair_unreachable_create_entry)",
+            "xfs_dir_removename(create_parent_ip, create_filename, create_filename_len, tp)",
+            "xfs_dir_addname(create_parent_ip, create_filename, create_filename_len, NEW_INO",
+            "xfs_trans_commit(tp)",
+        ],
+        "O_CREAT must transactionally replace only an indexed name whose target is explicitly unavailable",
+    )
+
+
 def test_xfs_open_seeds_fstat_snapshot_without_second_metadata_lock() -> None:
     xfs_source = XFS_VFS_CPP.read_text()
     vfs_source = VFS_CORE_CPP.read_text()
@@ -458,6 +483,7 @@ def main() -> None:
     test_xfs_namespace_cache_publication_is_ordered()
     test_reused_directory_inode_starts_with_fresh_dentry_generation()
     test_known_absent_create_hint_requires_xfs_proof()
+    test_create_repairs_only_unreachable_indexed_entries()
     test_xfs_open_seeds_fstat_snapshot_without_second_metadata_lock()
     test_writer_serializes_metadata_but_releases_it_for_data_io()
     test_inode_inactivation_is_serialized_by_metadata_lock()
