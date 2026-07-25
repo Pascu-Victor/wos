@@ -53,6 +53,8 @@ constexpr uint64_t PTE_FRAME_MASK = 0x000FFFFFFFFFF000ULL;
 
 sys::Spinlock cow_pte_lock;
 
+void invalidate_local_tlb_if_current(PageTable* pagemap, vaddr_t vaddr, bool reload_cr3);
+
 // Buffer-cache snapshots need contiguous virtual bytes, not contiguous
 // physical frames. Keep this arena within one kernel-half PML4 slot and back
 // it with order-0 pages. Freed mappings form a reusable warm pool; pressure
@@ -414,6 +416,28 @@ void log_lazy_vmem_fault_state(sched::task::Task* task, uint64_t page_vaddr, con
     }
 }
 
+auto anonymous_lazy_range_allows_fault(sched::task::Task* task, uint64_t page_vaddr, const paging::PageFault& fault, uint64_t& prot)
+    -> bool {
+    if (task == nullptr) {
+        return false;
+    }
+
+    bool allowed = false;
+    uint64_t const IRQF = task->lazy_vmem_lock.lock_irqsave();
+    for (const auto& range : task->lazy_vmem_ranges) {
+        if (range.kind != sched::task::LazyVmemKind::ANONYMOUS || page_vaddr < range.start || page_vaddr >= range.end) {
+            continue;
+        }
+        if (range.prot != 0 && (((range.prot & 0x2ULL) != 0) || fault.writable == 0U)) {
+            prot = range.prot;
+            allowed = true;
+        }
+        break;
+    }
+    task->lazy_vmem_lock.unlock_irqrestore(IRQF);
+    return allowed;
+}
+
 auto handle_lazy_vmem_fault(sched::task::Task* task, uint64_t vaddr, const paging::PageFault& fault, uint64_t fault_rip = 0,
                             uint64_t fault_rsp = 0) -> bool {
     if (task == nullptr || task->pagemap == nullptr) {
@@ -445,19 +469,43 @@ auto handle_lazy_vmem_fault(sched::task::Task* task, uint64_t vaddr, const pagin
             return OK;
         }
 
-        // This may run from a hardware page fault with interrupts disabled and
-        // lazy_vmem_lock held. Failure is process-local; never enter the fatal
-        // allocator dump or a yielding reclaim loop from this context.
+        task->lazy_vmem_lock.unlock_irqrestore(IRQF);
+
+        // This may run from a hardware page fault with interrupts disabled.
+        // Failure is process-local; never enter the fatal allocator dump or a
+        // yielding reclaim loop from this context.
         void* const PAGE = phys::page_alloc_may_fail(paging::PAGE_SIZE, "lazy-vmem");
         if (PAGE == nullptr) {
-            task->lazy_vmem_lock.unlock_irqrestore(IRQF);
             log::error("lazy vmem fault: OOM pid=%lu vaddr=0x%llx", task->pid, static_cast<unsigned long long>(PAGE_VADDR));
             return false;
         }
         std::memset(PAGE, 0, paging::PAGE_SIZE);
         auto const PADDR = reinterpret_cast<uint64_t>(addr::get_phys_pointer(reinterpret_cast<uint64_t>(PAGE)));
-        map_page(task->pagemap, PAGE_VADDR, PADDR, lazy_user_vmem_flags(range.prot));
-        task->lazy_vmem_lock.unlock_irqrestore(IRQF);
+
+        // Threads have independent lazy-range locks even when they share a
+        // pagemap. Serialize the absent-PTE check and install with COW updates
+        // so two simultaneous faults cannot expose different pages at the
+        // same virtual address. Keep the established PTE -> lazy-range lock
+        // order and revalidate metadata after allocating outside both locks.
+        uint64_t current_prot = 0;
+        uint64_t const PTE_IRQF = cow_pte_lock.lock_irqsave();
+        bool const ALLOWED = anonymous_lazy_range_allows_fault(task, PAGE_VADDR, fault, current_prot);
+        bool const ALREADY_MAPPED = translate(task->pagemap, PAGE_VADDR) != PADDR_INVALID;
+        if (ALLOWED && !ALREADY_MAPPED) {
+            map_page(task->pagemap, PAGE_VADDR, PADDR, lazy_user_vmem_flags(current_prot));
+        }
+        cow_pte_lock.unlock_irqrestore(PTE_IRQF);
+
+        if (!ALLOWED || ALREADY_MAPPED) {
+            phys::page_ref_dec(PAGE);
+        }
+        if (!ALLOWED) {
+            log_lazy_vmem_fault_state(task, PAGE_VADDR, fault, "stale", fault_rip, fault_rsp);
+            return false;
+        }
+        if (ALREADY_MAPPED) {
+            invalidate_local_tlb_if_current(task->pagemap, PAGE_VADDR, false);
+        }
         return true;
     }
     task->lazy_vmem_lock.unlock_irqrestore(IRQF);

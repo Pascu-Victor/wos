@@ -425,8 +425,28 @@ def test_user_memory_pressure_does_not_enter_fatal_oom() -> None:
         fail("recoverable COW allocation failure must not halt the kernel")
     require_tokens(
         function_body(virt, "handle_lazy_vmem_fault"),
-        ['page_alloc_may_fail(paging::PAGE_SIZE, "lazy-vmem")'],
-        "IRQ-disabled anonymous lazy fault allocation",
+        [
+            'page_alloc_may_fail(paging::PAGE_SIZE, "lazy-vmem")',
+            "cow_pte_lock.lock_irqsave()",
+            "anonymous_lazy_range_allows_fault(task, PAGE_VADDR, fault, current_prot)",
+            "translate(task->pagemap, PAGE_VADDR) != PADDR_INVALID",
+            "if (ALLOWED && !ALREADY_MAPPED)",
+            "phys::page_ref_dec(PAGE);",
+        ],
+        "IRQ-disabled anonymous lazy fault allocation and shared-pagemap install",
+    )
+    lazy_body = function_body(virt, "handle_lazy_vmem_fault")
+    require_order(
+        lazy_body,
+        "task->lazy_vmem_lock.unlock_irqrestore(IRQF);",
+        'page_alloc_may_fail(paging::PAGE_SIZE, "lazy-vmem")',
+        "lazy anonymous allocation must happen outside the task range lock",
+    )
+    require_order(
+        lazy_body,
+        "cow_pte_lock.lock_irqsave()",
+        "map_page(task->pagemap, PAGE_VADDR, PADDR, lazy_user_vmem_flags(current_prot));",
+        "lazy anonymous PTE install must happen under the shared PTE lock",
     )
 
 
