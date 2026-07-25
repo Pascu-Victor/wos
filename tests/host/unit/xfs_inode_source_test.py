@@ -67,6 +67,7 @@ def main() -> None:
     for needle, description in (
         ("validate_inode_extent_records(", "inode extent preflight helper"),
         ("xfs_validate_allocated_extent(mount, agno, agbno", "non-mutating allocator validation before free"),
+        ("xfs_alloc_ensure_freelist_headroom(mount, tp, agno)", "AGFL headroom before extent free"),
         ("uint32_t const LIST_CAPACITY = ip->nextents + 1;", "btree extent overrun detection capacity"),
         ("std::cmp_not_equal(rc, ip->nextents)", "btree extent count mismatch check"),
         ("free_inode_extent_records(ip, tp, extents", "data free after validation"),
@@ -96,7 +97,7 @@ def main() -> None:
         alloc_source.find("auto xfs_free_extent(") : alloc_source.find("// ============================================================================\n// AGFL")
     ]
     validation_pos = free_extent.find("xfs_validate_allocated_extent(mount, agno, agbno, len)")
-    refill_pos = free_extent.find("if (pag->agf_flcount < XFS_AGFL_MIN)")
+    refill_pos = free_extent.find("if (pag->agf_flcount < agfl_reserve_blocks(mount))")
     neighbor_lookup_pos = free_extent.find("XfsBtreeCursor<XfsBnobtTraits> prev_cur;")
     if min(validation_pos, refill_pos, neighbor_lookup_pos) < 0 or not validation_pos < refill_pos < neighbor_lookup_pos:
         fail("xfs_free_extent must validate before AGFL refill and reopen coalescing cursors after refill")
@@ -105,6 +106,13 @@ def main() -> None:
     bmap_loop = bmap_source[bmap_loop_start : bmap_source.find("return static_cast<int>(count);", bmap_loop_start)]
     if "if (rc == -ENOENT)" not in bmap_loop or "return rc;" not in bmap_loop:
         fail("btree extent listing must return traversal errors instead of a partial count")
+
+    bmbt_return_start = bmap_source.find("auto bmbt_return_block(")
+    bmbt_return = bmap_source[bmbt_return_start : bmap_source.find("auto bmdr_key_addr(", bmbt_return_start)]
+    headroom_pos = bmbt_return.find("xfs_alloc_ensure_freelist_headroom(mount, tp, AGNO)")
+    put_pos = bmbt_return.find("xfs_alloc_put_freelist(mount, tp, AGNO, AGBNO)")
+    if min(headroom_pos, put_pos) < 0 or headroom_pos > put_pos:
+        fail("BMBT retirement must reserve AGFL headroom before returning a block")
 
 
 if __name__ == "__main__":

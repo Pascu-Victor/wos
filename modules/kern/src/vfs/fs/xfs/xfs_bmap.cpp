@@ -217,6 +217,10 @@ auto bmbt_return_block(XfsMountContext* mount, XfsTransaction* tp, xfs_fsblock_t
     }
     uint64_t const DEV_BLOCK = (AG_BASE + AGBNO) * DEV_COUNT;
 
+    int const HEADROOM_RC = xfs_alloc_ensure_freelist_headroom(mount, tp, AGNO);
+    if (HEADROOM_RC != 0) {
+        return HEADROOM_RC;
+    }
     int const FREE_RC = xfs_alloc_put_freelist(mount, tp, AGNO, AGBNO);
     if (FREE_RC != 0) {
         return FREE_RC;

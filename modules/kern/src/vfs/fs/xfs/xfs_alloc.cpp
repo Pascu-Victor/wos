@@ -13,6 +13,7 @@
 #include "xfs_alloc.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
@@ -155,6 +156,16 @@ auto allocation_btree_contains_block(XfsMountContext* mount, xfs_agnumber_t agno
 // finobt, while mapped writes can also split a bmbt. Keep enough reserve for
 // all of those trees instead of only the two free-space indexes.
 constexpr uint32_t XFS_AGFL_MIN = 64;
+constexpr uint32_t XFS_AGFL_MUTATION_HEADROOM = 16;
+constexpr size_t XFS_AGFL_DRAIN_BATCH = 32;
+
+auto agfl_reserve_blocks(const XfsMountContext* mount) -> uint32_t {
+    uint32_t const CAPACITY = xfs_agfl_size(mount);
+    if (CAPACITY <= XFS_AGFL_MUTATION_HEADROOM) {
+        return CAPACITY / 2;
+    }
+    return std::min(XFS_AGFL_MIN, CAPACITY - XFS_AGFL_MUTATION_HEADROOM);
+}
 
 auto same_free_extent(xfs_agblock_t lhs_start, xfs_extlen_t lhs_len, xfs_agblock_t rhs_start, xfs_extlen_t rhs_len) -> bool {
     return lhs_start == rhs_start && lhs_len == rhs_len;
@@ -205,7 +216,8 @@ auto agfl_refill(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t agno
         return CAPTURE_RC;
     }
 
-    while (pag->agf_flcount < XFS_AGFL_MIN && pag->agf_freeblks > 0) {
+    uint32_t const RESERVE = agfl_reserve_blocks(mount);
+    while (pag->agf_flcount < RESERVE && pag->agf_freeblks > 0) {
         // Find and delete the smallest available extent (size >= 1)
         XfsBtreeCursor<XfsCntbtTraits> cur;
         cur.mount = mount;
@@ -319,7 +331,7 @@ auto alloc_ag_by_hint(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t
     if (CAPTURE_RC != 0) {
         return CAPTURE_RC;
     }
-    if (pag->agf_flcount < XFS_AGFL_MIN) {
+    if (pag->agf_flcount < agfl_reserve_blocks(mount)) {
         int const REFILL_RC = agfl_refill(mount, tp, agno);
         if (REFILL_RC != 0) {
             return REFILL_RC;
@@ -444,7 +456,7 @@ auto alloc_ag_by_size(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t
 
     // Ensure the AGFL has enough blocks to cover any btree splits that may
     // occur during this allocation, without re-entering xfs_alloc_extent.
-    if (pag->agf_flcount < XFS_AGFL_MIN) {
+    if (pag->agf_flcount < agfl_reserve_blocks(mount)) {
         int const REFILL_RC = agfl_refill(mount, tp, agno);
         if (REFILL_RC != 0) {
             return REFILL_RC;
@@ -823,7 +835,7 @@ auto xfs_free_extent(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t 
         return CAPTURE_RC;
     }
 
-    if (pag->agf_flcount < XFS_AGFL_MIN) {
+    if (pag->agf_flcount < agfl_reserve_blocks(mount)) {
         int const REFILL_RC = agfl_refill(mount, tp, agno);
         if (REFILL_RC != 0) {
             return REFILL_RC;
@@ -1159,6 +1171,53 @@ auto xfs_alloc_put_freelist(XfsMountContext* mount, XfsTransaction* tp, xfs_agnu
     return 0;
 }
 
+auto xfs_alloc_ensure_freelist_headroom(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t agno) -> int {
+    if (mount == nullptr || tp == nullptr || mount->per_ag == nullptr || agno >= mount->ag_count) {
+        return -EINVAL;
+    }
+
+    uint32_t const CAPACITY = xfs_agfl_size(mount);
+    if (CAPACITY == 0) {
+        return -EIO;
+    }
+    uint32_t const RESERVE = agfl_reserve_blocks(mount);
+    uint32_t const HIGH_WATER = std::max(RESERVE, CAPACITY - std::min(CAPACITY, XFS_AGFL_MUTATION_HEADROOM));
+    XfsPerAG* pag = &mount->per_ag[agno];
+    if (pag->agf_flcount <= HIGH_WATER) {
+        return 0;
+    }
+
+    std::array<xfs_agblock_t, XFS_AGFL_DRAIN_BATCH> drained{};
+    uint32_t attempts = 0;
+    while (pag->agf_flcount > HIGH_WATER) {
+        uint32_t const BEFORE = pag->agf_flcount;
+        size_t const COUNT = std::min(drained.size(), static_cast<size_t>(pag->agf_flcount > RESERVE ? pag->agf_flcount - RESERVE : 0));
+        if (COUNT == 0) {
+            return -ENOSPC;
+        }
+
+        size_t popped = 0;
+        for (; popped < COUNT; ++popped) {
+            int const RC = xfs_alloc_get_freelist(mount, tp, agno, &drained.at(popped));
+            if (RC != 0) {
+                return RC;
+            }
+        }
+        for (size_t i = 0; i < popped; ++i) {
+            int const RC = xfs_free_extent(mount, tp, agno, drained.at(i), 1);
+            if (RC != 0) {
+                return RC;
+            }
+        }
+
+        attempts++;
+        if (pag->agf_flcount >= BEFORE && attempts >= CAPACITY) {
+            return -ENOSPC;
+        }
+    }
+    return 0;
+}
+
 #ifdef WOS_SELFTEST
 namespace {
 
@@ -1298,6 +1357,116 @@ auto xfs_selftest_agfl_skips_live_allocation_btree_blocks() -> bool {
     bool ok = tp != nullptr && xfs_alloc_get_freelist(&mount, tp, 0, &selected) == 0 && selected == SAFE_BLOCK && pag.agf_flcount == 0;
     if (tp != nullptr) {
         xfs_trans_cancel(tp);
+    }
+    invalidate_bdev(&dev);
+    return ok;
+}
+
+auto xfs_selftest_agfl_headroom_drain_is_transactional() -> bool {
+    constexpr uint32_t BLOCK_SIZE = 4096;
+    constexpr uint32_t SECTOR_SIZE = 512;
+    constexpr uint32_t AG_BLOCKS = 4096;
+    constexpr xfs_agblock_t BNO_ROOT = 5;
+    constexpr xfs_agblock_t CNT_ROOT = 6;
+    constexpr xfs_agblock_t FREE_START = 3000;
+    constexpr xfs_extlen_t FREE_LENGTH = 100;
+
+    ker::dev::BlockDevice dev{};
+    dev.block_size = SECTOR_SIZE;
+    dev.total_blocks = static_cast<uint64_t>(AG_BLOCKS) * (BLOCK_SIZE / SECTOR_SIZE);
+    dev.read_blocks = agfl_selftest_read;
+    dev.write_blocks = agfl_selftest_write;
+
+    XfsPerAG pag{};
+    pag.agno = 0;
+    pag.agf_length = AG_BLOCKS;
+    pag.agf_bno_root = BNO_ROOT;
+    pag.agf_cnt_root = CNT_ROOT;
+    pag.agf_bno_level = 1;
+    pag.agf_cnt_level = 1;
+    pag.agf_freeblks = FREE_LENGTH;
+    pag.agf_longest = FREE_LENGTH;
+
+    XfsMountContext mount{};
+    mount.device = &dev;
+    mount.block_size = BLOCK_SIZE;
+    mount.block_log = 12;
+    mount.total_blocks = AG_BLOCKS;
+    mount.ag_count = 1;
+    mount.ag_blocks = AG_BLOCKS;
+    mount.ag_blk_log = 12;
+    mount.sect_size = SECTOR_SIZE;
+    mount.sect_log = 9;
+    mount.per_ag = &pag;
+
+    uint32_t const AGFL_SIZE = xfs_agfl_size(&mount);
+    pag.agf_flfirst = 0;
+    pag.agf_fllast = AGFL_SIZE - 1;
+    pag.agf_flcount = AGFL_SIZE;
+
+    BufHead* ag0 = xfs_buf_get(&mount, 0);
+    BufHead* bno_root = xfs_buf_get(&mount, BNO_ROOT);
+    BufHead* cnt_root = xfs_buf_get(&mount, CNT_ROOT);
+    if (ag0 == nullptr || bno_root == nullptr || cnt_root == nullptr) {
+        if (ag0 != nullptr) {
+            brelse(ag0);
+        }
+        if (bno_root != nullptr) {
+            brelse(bno_root);
+        }
+        if (cnt_root != nullptr) {
+            brelse(cnt_root);
+        }
+        invalidate_bdev(&dev);
+        return false;
+    }
+
+    __builtin_memset(ag0->data, 0, ag0->size);
+    auto* agf = reinterpret_cast<XfsAgf*>(ag0->data + SECTOR_SIZE);
+    agf->agf_magicnum = Be32::from_cpu(XFS_AGF_MAGIC);
+    agf->agf_bno_root = Be32::from_cpu(BNO_ROOT);
+    agf->agf_cnt_root = Be32::from_cpu(CNT_ROOT);
+    agf->agf_bno_level = Be32::from_cpu(1);
+    agf->agf_cnt_level = Be32::from_cpu(1);
+    agf->agf_flfirst = Be32::from_cpu(0);
+    agf->agf_fllast = Be32::from_cpu(AGFL_SIZE - 1);
+    agf->agf_flcount = Be32::from_cpu(AGFL_SIZE);
+    agf->agf_freeblks = Be32::from_cpu(FREE_LENGTH);
+    agf->agf_longest = Be32::from_cpu(FREE_LENGTH);
+
+    auto* agfl = reinterpret_cast<XfsAgfl*>(ag0->data + (3U * SECTOR_SIZE));
+    agfl->agfl_magicnum = Be32::from_cpu(XFS_AGFL_MAGIC);
+    auto* agfl_bno = reinterpret_cast<Be32*>(reinterpret_cast<uint8_t*>(agfl) + sizeof(XfsAgfl));
+    for (uint32_t i = 0; i < AGFL_SIZE; ++i) {
+        agfl_bno[i] = Be32::from_cpu(static_cast<xfs_agblock_t>(500 + i));
+    }
+
+    auto init_free_root = [&](BufHead* bh, uint32_t magic) {
+        __builtin_memset(bh->data, 0, bh->size);
+        auto* hdr = reinterpret_cast<XfsBtreeSblock*>(bh->data);
+        hdr->bb_magic = Be32::from_cpu(magic);
+        hdr->bb_level = Be16::from_cpu(0);
+        hdr->bb_numrecs = Be16::from_cpu(1);
+        hdr->bb_leftsib = Be32::from_cpu(NULLAGBLOCK);
+        hdr->bb_rightsib = Be32::from_cpu(NULLAGBLOCK);
+        auto* rec = reinterpret_cast<XfsAllocRec*>(bh->data + XFS_BTREE_SBLOCK_CRC_LEN);
+        rec->ar_startblock = Be32::from_cpu(FREE_START);
+        rec->ar_blockcount = Be32::from_cpu(FREE_LENGTH);
+    };
+    init_free_root(bno_root, XFS_ABTB_CRC_MAGIC);
+    init_free_root(cnt_root, XFS_ABTC_CRC_MAGIC);
+    brelse(ag0);
+    brelse(bno_root);
+    brelse(cnt_root);
+
+    XfsTransaction* tp = xfs_trans_alloc(&mount);
+    bool ok = tp != nullptr;
+    if (tp != nullptr) {
+        int const RC = xfs_alloc_ensure_freelist_headroom(&mount, tp, 0);
+        uint32_t const HIGH_WATER = AGFL_SIZE - XFS_AGFL_MUTATION_HEADROOM;
+        ok = RC == 0 && pag.agf_flcount <= HIGH_WATER && pag.agf_freeblks > FREE_LENGTH;
+        xfs_trans_cancel(tp);
+        ok = ok && pag.agf_flcount == AGFL_SIZE && pag.agf_freeblks == FREE_LENGTH;
     }
     invalidate_bdev(&dev);
     return ok;

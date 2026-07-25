@@ -50,12 +50,16 @@ inline auto xfs_agfl_size(const XfsMountContext* ctx) -> uint32_t {
 auto xfs_alloc_get_freelist(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t agno, xfs_agblock_t* out_bno) -> int;
 
 // Return one block to the AGFL (e.g. an emptied btree leaf).
-// Falls back to xfs_free_extent if the AGFL is already full.
 // Returns 0 on success.
 auto xfs_alloc_put_freelist(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t agno, xfs_agblock_t bno) -> int;
 
+// Drain AGFL blocks back into the free-space trees before a mutation can fill
+// the on-disk freelist. The caller must not hold a live AG btree cursor.
+auto xfs_alloc_ensure_freelist_headroom(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t agno) -> int;
+
 #ifdef WOS_SELFTEST
 auto xfs_selftest_agfl_skips_live_allocation_btree_blocks() -> bool;
+auto xfs_selftest_agfl_headroom_drain_is_transactional() -> bool;
 #endif
 
 }  // namespace ker::vfs::xfs

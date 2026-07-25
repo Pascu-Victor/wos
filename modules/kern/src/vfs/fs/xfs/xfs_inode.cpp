@@ -542,6 +542,10 @@ auto free_inode_data_extent(XfsInode* ip, XfsTransaction* tp, xfs_fsblock_t star
             return -EIO;
         }
 
+        int const HEADROOM_RC = xfs_alloc_ensure_freelist_headroom(mount, tp, agno);
+        if (HEADROOM_RC != 0) {
+            return HEADROOM_RC;
+        }
         int const RC = xfs_free_extent(mount, tp, agno, agbno, static_cast<xfs_extlen_t>(SPAN));
         if (RC != 0) {
             return RC;
