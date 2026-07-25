@@ -2050,6 +2050,7 @@ auto dir2_read_leaf_block(XfsInode* dp, BufHead** bhp) -> int {
 
 void dir2_recompute_leaf_crc(uint8_t* block, size_t blksize) {
     auto* hdr = reinterpret_cast<XfsDir3LeafHdr*>(block);
+    hdr->info.lsn = Be64{};
     hdr->info.crc = Be32{0};
     uint32_t const CRC = util::crc32c_block_with_cksum(block, blksize, XFS_DA3_CRC_OFF);
     // XFS checksum fields are stored little-endian even when the surrounding
@@ -2059,6 +2060,7 @@ void dir2_recompute_leaf_crc(uint8_t* block, size_t blksize) {
 
 void dir2_recompute_data_crc(uint8_t* block, size_t blksize) {
     auto* hdr = reinterpret_cast<XfsDir3DataHdr*>(block);
+    hdr->hdr.lsn = Be64{};
     hdr->hdr.crc = Be32{0};
     uint32_t const CRC = util::crc32c_block_with_cksum(block, blksize, 4);
     __builtin_memcpy(&hdr->hdr.crc, &CRC, sizeof(CRC));
@@ -2601,6 +2603,7 @@ auto dir2_free_capacity(const XfsMountContext* ctx) -> size_t { return (ctx->dir
 
 void dir2_recompute_free_crc(uint8_t* block, size_t blksize) {
     auto* hdr = reinterpret_cast<XfsDir3FreeHdr*>(block);
+    hdr->hdr.lsn = Be64{};
     hdr->hdr.crc = Be32{0};
     uint32_t const CRC = util::crc32c_block_with_cksum(block, blksize, __builtin_offsetof(XfsDir3BlkHdr, crc));
     __builtin_memcpy(&hdr->hdr.crc, &CRC, sizeof(CRC));
@@ -3074,6 +3077,7 @@ auto dir2_sf_to_block(XfsInode* dp, XfsTransaction* tp) -> int {
     }
 
     // 3f. Compute CRC over the block
+    hdr3->hdr.lsn = Be64{};
     hdr3->hdr.crc = Be32{0};
     uint32_t const CRC = util::crc32c_block_with_cksum(block, BLKSIZE, 4);  // crc at offset 4 in XfsDir3BlkHdr
     __builtin_memcpy(&hdr3->hdr.crc, &CRC, sizeof(CRC));
@@ -3497,6 +3501,7 @@ auto dir2_block_addname(XfsInode* dp, const char* name, uint16_t namelen, xfs_in
     dir2_rebuild_data_bestfree(ctx, block, DATA_START, current_data_end);
 
     // Recompute CRC over the entire block
+    mutable_hdr->hdr.lsn = Be64{};
     mutable_hdr->hdr.crc = Be32{0};
     uint32_t const CRC = util::crc32c_block_with_cksum(block, BLKSIZE, 4);
     __builtin_memcpy(&mutable_hdr->hdr.crc, &CRC, sizeof(CRC));
@@ -4445,6 +4450,7 @@ auto dir2_block_removename(XfsInode* dp, const char* name, uint16_t namelen, Xfs
     }
 
     // Update CRC over the block
+    hdr->hdr.lsn = Be64{};
     hdr->hdr.crc = Be32{0};
     uint32_t const CRC = util::crc32c_block_with_cksum(block, BLKSIZE, 4);
     __builtin_memcpy(&hdr->hdr.crc, &CRC, sizeof(CRC));

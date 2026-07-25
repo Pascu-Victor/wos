@@ -142,6 +142,57 @@ auto xfs_buf_get_multi(XfsMountContext* ctx, uint64_t xfs_block, size_t count) -
     return bget_multi(ctx->device, dev_block, dev_count);
 }
 
+auto xfs_sync_superblock_counters(XfsMountContext* ctx) -> int {
+    if (ctx == nullptr || ctx->device == nullptr || ctx->per_ag == nullptr) {
+        return -EINVAL;
+    }
+    if (ctx->read_only) {
+        return 0;
+    }
+
+    uint64_t inode_count = 0;
+    uint64_t free_inode_count = 0;
+    uint64_t free_block_count = 0;
+    for (xfs_agnumber_t ag = 0; ag < ctx->ag_count; ++ag) {
+        XfsPerAG const& pag = ctx->per_ag[ag];
+        inode_count += pag.agi_count;
+        free_inode_count += pag.agi_freecount;
+        free_block_count += static_cast<uint64_t>(pag.agf_freeblks) + pag.agf_flcount;
+    }
+
+    // Use the filesystem-block alias. AG header traffic also uses this span,
+    // so updating the same cached buffer prevents a stale 4 KiB alias from
+    // overlaying the 512-byte primary superblock during writeback.
+    BufHead* bh = xfs_buf_read(ctx, 0);
+    if (bh == nullptr || bh->data == nullptr || bh->size < ctx->sect_size || ctx->sect_size < sizeof(XfsDsb)) {
+        brelse(bh);
+        return -EIO;
+    }
+
+    auto* dsb = reinterpret_cast<XfsDsb*>(bh->data);
+    if (dsb->sb_magicnum.to_cpu() != XFS_SB_MAGIC) {
+        brelse(bh);
+        return -EIO;
+    }
+
+    dsb->sb_icount = Be64::from_cpu(inode_count);
+    dsb->sb_ifree = Be64::from_cpu(free_inode_count);
+    dsb->sb_fdblocks = Be64::from_cpu(free_block_count);
+    // WOS replays its compact journal without Linux's per-item LSN
+    // suppression.  A home-written clean superblock therefore has no
+    // dependency on an XFS log sequence.
+    dsb->sb_lsn = Be64{};
+    dsb->sb_crc = 0;
+    uint32_t const CRC = util::crc32c_block_with_cksum(dsb, ctx->sect_size, XFS_SB_CRC_OFF);
+    __builtin_memcpy(&dsb->sb_crc, &CRC, sizeof(CRC));
+    __builtin_memcpy(&ctx->raw_sb, dsb, sizeof(ctx->raw_sb));
+
+    bdirty(bh);
+    int const RC = bwrite(bh);
+    brelse(bh);
+    return RC;
+}
+
 namespace {
 
 // Read the AGF for a given AG and populate per_ag fields.
@@ -359,7 +410,7 @@ auto xfs_mount(dev::BlockDevice* device, bool read_only, XfsMountContext** ctx_o
 
     // Check for unsupported incompat features (reflink, rmap, etc.)
     constexpr uint32_t SUPPORTED_INCOMPAT = XFS_SB_FEAT_INCOMPAT_FTYPE | XFS_SB_FEAT_INCOMPAT_SPINODES | XFS_SB_FEAT_INCOMPAT_BIGTIME |
-                                            XFS_SB_FEAT_INCOMPAT_NREXT64 | XFS_SB_FEAT_INCOMPAT_EXCHRANGE | XFS_SB_FEAT_INCOMPAT_PARENT;
+                                            XFS_SB_FEAT_INCOMPAT_NREXT64 | XFS_SB_FEAT_INCOMPAT_EXCHRANGE;
     uint32_t const UNSUPPORTED = ctx->feat_incompat & ~SUPPORTED_INCOMPAT;
     if (UNSUPPORTED != 0) {
         mod::dbg::log("[xfs] unsupported incompat features: 0x%x", UNSUPPORTED);
@@ -368,6 +419,13 @@ auto xfs_mount(dev::BlockDevice* device, bool read_only, XfsMountContext** ctx_o
             return -EINVAL;
         }
         mod::dbg::log("[xfs]   mounting read-only anyway");
+    }
+    constexpr uint32_t SUPPORTED_RO_COMPAT = XFS_SB_FEAT_RO_COMPAT_FINOBT;
+    uint32_t const UNSUPPORTED_RO_COMPAT = ctx->feat_ro_compat & ~SUPPORTED_RO_COMPAT;
+    if (UNSUPPORTED_RO_COMPAT != 0 && !read_only) {
+        mod::dbg::log("[xfs] refusing read-write mount with unsupported ro-compat features: 0x%x", UNSUPPORTED_RO_COMPAT);
+        delete ctx;
+        return -EOPNOTSUPP;
     }
 
     // --- Allocate per-AG state and read AGF/AGI headers ---
@@ -428,10 +486,11 @@ void xfs_unmount(XfsMountContext* ctx) {
         return;
     }
 
+    bool home_metadata_clean = false;
     if (!ctx->read_only) {
-        (void)xfs_sync_mount(ctx);
+        home_metadata_clean = xfs_sync_mount(ctx) == 0;
     }
-    xfs_log_unmount(ctx);
+    xfs_log_unmount(ctx, home_metadata_clean);
 
     if (ctx->root_inode != nullptr) {
         XfsInode* root_inode = ctx->root_inode;

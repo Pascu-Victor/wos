@@ -101,6 +101,7 @@ auto log_agi_state(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t ag
     }
     agi->agi_free_root = Be32::from_cpu(pag->agi_free_root);
     agi->agi_free_level = Be32::from_cpu(pag->agi_free_level);
+    agi->agi_lsn = Be64{};
     agi->agi_crc = Be32{0};
     uint32_t crc = util::crc32c_block_with_cksum(agi, mount->sect_size, XFS_AGI_CRC_OFF);
     __builtin_memcpy(&agi->agi_crc, &crc, sizeof(crc));

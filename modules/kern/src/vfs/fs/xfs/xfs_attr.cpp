@@ -517,6 +517,8 @@ auto btree_get(XfsInode* ip, const uint8_t* name, uint16_t namelen, uint8_t flag
 
 // Build an on-disk CRC for a leaf block (CRC field is at XFS_ATTR3_LEAF_CRC_OFF = 12).
 void attr_leaf_compute_crc(uint8_t* block, size_t block_size) {
+    auto* hdr = reinterpret_cast<XfsAttr3LeafHdr*>(block);
+    hdr->info.lsn = Be64{};
     // Zero the CRC field before computing
     __builtin_memset(block + XFS_ATTR3_LEAF_CRC_OFF, 0, 4);
     uint32_t const CRC = util::crc32c_block_with_cksum(block, block_size, XFS_ATTR3_LEAF_CRC_OFF);

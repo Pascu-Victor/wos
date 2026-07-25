@@ -682,6 +682,7 @@ auto log_agf_free_space_roots(XfsMountContext* mount, XfsTransaction* tp, xfs_ag
     agf->agf_bno_level = Be32::from_cpu(pag->agf_bno_level);
     agf->agf_cnt_level = Be32::from_cpu(pag->agf_cnt_level);
     agf->agf_longest = Be32::from_cpu(pag->agf_longest);
+    agf->agf_lsn = Be64{};
     agf->agf_crc = Be32{0};
     uint32_t crc = util::crc32c_block_with_cksum(agf, mount->sect_size, XFS_AGF_CRC_OFF);
     __builtin_memcpy(&agf->agf_crc, &crc, sizeof(crc));
@@ -1003,6 +1004,7 @@ auto log_agf_freelist(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t
     agf->agf_flfirst = Be32::from_cpu(pag->agf_flfirst);
     agf->agf_fllast = Be32::from_cpu(pag->agf_fllast);
     agf->agf_flcount = Be32::from_cpu(pag->agf_flcount);
+    agf->agf_lsn = Be64{};
     agf->agf_crc = Be32{0};
     uint32_t crc = util::crc32c_block_with_cksum(agf, mount->sect_size, XFS_AGF_CRC_OFF);
     __builtin_memcpy(&agf->agf_crc, &crc, sizeof(crc));
@@ -1014,6 +1016,7 @@ void update_agfl_crc(XfsMountContext* mount, XfsAgfl* agfl) {
     if (mount == nullptr || agfl == nullptr) {
         return;
     }
+    agfl->agfl_lsn = Be64{};
     agfl->agfl_crc = Be32{0};
     uint32_t crc = util::crc32c_block_with_cksum(agfl, mount->sect_size, XFS_AGFL_CRC_OFF);
     __builtin_memcpy(&agfl->agfl_crc, &crc, sizeof(crc));

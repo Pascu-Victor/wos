@@ -101,6 +101,7 @@ struct XfsTransInodeUndo {
     uint64_t size{};
     uint64_t nblocks{};
     uint32_t nextents{};
+    uint16_t mode{};
     uint32_t nlink{};
     bool dirty{};
     uint64_t dir_generation{};

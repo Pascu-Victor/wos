@@ -486,11 +486,13 @@ template <typename Traits>
 void btree_update_crc(BufHead* bp) {
     if constexpr (Traits::TYPE == XfsBtreeType::SHORT) {
         auto* hdr = reinterpret_cast<XfsBtreeSblock*>(bp->data);
+        hdr->bb_lsn = Be64{};
         hdr->bb_crc = 0;
         uint32_t crc = util::crc32c_block_with_cksum(bp->data, bp->size, offsetof(XfsBtreeSblock, bb_crc));
         __builtin_memcpy(&hdr->bb_crc, &crc, sizeof(crc));
     } else {
         auto* hdr = reinterpret_cast<XfsBtreeLblock*>(bp->data);
+        hdr->bb_lsn = Be64{};
         hdr->bb_crc = 0;
         uint32_t crc = util::crc32c_block_with_cksum(bp->data, bp->size, offsetof(XfsBtreeLblock, bb_crc));
         __builtin_memcpy(&hdr->bb_crc, &crc, sizeof(crc));

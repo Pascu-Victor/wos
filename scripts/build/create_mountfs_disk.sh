@@ -70,7 +70,7 @@ wos_qcow_guestfish "create partitioned XFS rootfs qcow image" "$DISK" --rw -a "$
 run
 part-init /dev/sda gpt
 part-add /dev/sda p $PART_START_SECTOR $PART_END_SECTOR
-mkfs xfs /dev/sda1
+debug sh "mkfs.xfs -f -m rmapbt=0,reflink=0,inobtcount=0 -n parent=0 /dev/sda1"
 sync
 mount /dev/sda1 /
 tar-in $STAGING_TAR /

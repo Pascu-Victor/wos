@@ -655,13 +655,28 @@ auto inactivate_unlinked_inode(XfsInode* ip) -> int {
         return -ENOMEM;
     }
 
-    int rc = free_inode_data_extents(ip, tp);
+    int rc = xfs_trans_capture_inode(tp, ip);
+    if (rc != 0) {
+        xfs_trans_cancel(tp);
+        return rc;
+    }
+
+    rc = xfs_inode_truncate_data(ip, tp);
     if (rc != 0) {
         xfs_trans_cancel(tp);
         mod::dbg::logger<"xfs">::error("xfs_inode_release: failed to free data extents for inode %lu rc=%d",
                                        static_cast<unsigned long>(ip->ino), rc);
         return rc;
     }
+
+    // A free inobt bit is not sufficient: XFS repair and inode discovery use
+    // di_mode == 0 to distinguish a free dinode core from an unlinked inode
+    // awaiting inactivation. Persist the cleared core in the same transaction
+    // that returns the inode to the inobt/finobt.
+    ip->size = 0;
+    ip->mode = 0;
+    ip->dirty = true;
+    xfs_trans_log_inode(tp, ip);
 
     rc = xfs_ifree(ip->mount, tp, ip->ino);
     if (rc != 0) {
@@ -1809,6 +1824,7 @@ auto xfs_inode_write(XfsInode* ip, XfsTransaction* tp) -> int {
     }
 
     // Recompute the CRC over the entire inode
+    dip->di_lsn = Be64{};
     dip->di_crc = 0;
     uint32_t const CRC = util::crc32c_block_with_cksum(dip, mount->inode_size, XFS_DINODE_CRC_OFF);
     dip->di_crc = CRC;  // di_crc is stored little-endian on disk

@@ -10,8 +10,17 @@ ROOT = Path(__file__).resolve().parents[3]
 INODE = ROOT / "modules/kern/src/vfs/fs/xfs/xfs_inode.cpp"
 BMAP = ROOT / "modules/kern/src/vfs/fs/xfs/xfs_bmap.cpp"
 ALLOC = ROOT / "modules/kern/src/vfs/fs/xfs/xfs_alloc.cpp"
+IALLOC = ROOT / "modules/kern/src/vfs/fs/xfs/xfs_ialloc.cpp"
+BTREE = ROOT / "modules/kern/src/vfs/fs/xfs/xfs_btree.cpp"
+DIR2 = ROOT / "modules/kern/src/vfs/fs/xfs/xfs_dir2.cpp"
+ATTR = ROOT / "modules/kern/src/vfs/fs/xfs/xfs_attr.cpp"
 FORMAT = ROOT / "modules/kern/src/vfs/fs/xfs/xfs_format.hpp"
 VFS = ROOT / "modules/kern/src/vfs/fs/xfs/xfs_vfs.cpp"
+MOUNT = ROOT / "modules/kern/src/vfs/fs/xfs/xfs_mount.cpp"
+LOG = ROOT / "modules/kern/src/vfs/fs/xfs/xfs_log.cpp"
+TRANS = ROOT / "modules/kern/src/vfs/fs/xfs/xfs_trans.cpp"
+TRANS_HPP = ROOT / "modules/kern/src/vfs/fs/xfs/xfs_trans.hpp"
+CREATE_ROOTFS = ROOT / "scripts/build/create_mountfs_disk.sh"
 
 
 def fail(message: str) -> None:
@@ -22,8 +31,17 @@ def main() -> None:
     source = INODE.read_text()
     bmap_source = BMAP.read_text()
     alloc_source = ALLOC.read_text()
+    ialloc_source = IALLOC.read_text()
+    btree_source = BTREE.read_text()
+    dir2_source = DIR2.read_text()
+    attr_source = ATTR.read_text()
     format_source = FORMAT.read_text()
     vfs_source = VFS.read_text()
+    mount_source = MOUNT.read_text()
+    log_source = LOG.read_text()
+    trans_source = TRANS.read_text()
+    trans_header = TRANS_HPP.read_text()
+    create_rootfs = CREATE_ROOTFS.read_text()
 
     marked_free = 'mod::dbg::logger<"xfs">::debug("xfs_inode_read: inode %lu is marked free"'
     lookup_failed = "if (ALLOCATED < 0) {"
@@ -76,9 +94,122 @@ def main() -> None:
         ("ip->inactivation_started = false;", "failed inactivation can be retried"),
         ("ip->io_lock.lock();", "final inactivation takes inode I/O mutex"),
         ("ip->io_lock.unlock();", "final inactivation releases inode I/O mutex"),
+        ("xfs_trans_capture_inode(tp, ip);", "inactivation rollback snapshot"),
+        ("rc = xfs_inode_truncate_data(ip, tp);", "inactivation clears data fork"),
+        ("ip->mode = 0;", "free dinode mode clear"),
+        ("xfs_trans_log_inode(tp, ip);", "free dinode core logging"),
     ):
         if needle not in source:
             fail(f"missing {description}")
+
+    inactivate_start = source.find("auto inactivate_unlinked_inode(")
+    inactivate_end = source.find("auto count_cached_mount_inodes(", inactivate_start)
+    inactivate = source[inactivate_start:inactivate_end]
+    cursor = 0
+    for token in (
+        "xfs_trans_capture_inode(tp, ip);",
+        "xfs_inode_truncate_data(ip, tp);",
+        "ip->mode = 0;",
+        "xfs_trans_log_inode(tp, ip);",
+        "xfs_ifree(ip->mount, tp, ip->ino);",
+        "xfs_trans_commit(tp);",
+    ):
+        pos = inactivate.find(token, cursor)
+        if pos < 0:
+            fail(f"inactivation lifecycle ordering missing {token!r}")
+        cursor = pos + len(token)
+
+    for needle, description in (
+        ("uint16_t mode{};", "inode undo mode snapshot field"),
+        ("undo->mode = ip->mode;", "inode undo mode capture"),
+        ("undo->ip->mode = undo->mode;", "inode undo mode restore"),
+    ):
+        haystack = trans_header if needle == "uint16_t mode{};" else trans_source
+        if needle not in haystack:
+            fail(f"missing {description}")
+
+    for needle, description in (
+        ("constexpr uint32_t SUPPORTED_RO_COMPAT = XFS_SB_FEAT_RO_COMPAT_FINOBT;", "write-compatible XFS feature allowlist"),
+        ("refusing read-write mount with unsupported ro-compat features", "unsafe XFS feature rejection"),
+        ("auto xfs_sync_superblock_counters(", "lazy superblock counter sync"),
+        ("dsb->sb_icount = Be64::from_cpu(inode_count);", "superblock inode count update"),
+        ("dsb->sb_ifree = Be64::from_cpu(free_inode_count);", "superblock free-inode update"),
+        ("dsb->sb_fdblocks = Be64::from_cpu(free_block_count);", "superblock free-block update"),
+    ):
+        if needle not in mount_source:
+            fail(f"missing {description}")
+
+    supported_start = mount_source.find("constexpr uint32_t SUPPORTED_INCOMPAT")
+    supported_end = mount_source.find("uint32_t const UNSUPPORTED", supported_start)
+    if "XFS_SB_FEAT_INCOMPAT_PARENT" in mount_source[supported_start:supported_end]:
+        fail("read-write feature allowlist must not advertise unmaintained parent pointers")
+    if "xfs_sync_superblock_counters(ctx)" not in vfs_source:
+        fail("mount sync must persist lazy superblock counters after AG metadata")
+    for option in ("rmapbt=0", "reflink=0", "inobtcount=0", "parent=0"):
+        if option not in create_rootfs:
+            fail(f"rootfs mkfs must disable unsupported feature {option}")
+
+    for haystack, needle, description in (
+        (mount_source, "dsb->sb_lsn = Be64{};", "clean superblock LSN"),
+        (source, "dip->di_lsn = Be64{};", "clean dinode LSN"),
+        (ialloc_source, "agi->agi_lsn = Be64{};", "clean AGI LSN"),
+        (alloc_source, "agf->agf_lsn = Be64{};", "clean AGF LSN"),
+        (alloc_source, "agfl->agfl_lsn = Be64{};", "clean AGFL LSN"),
+        (btree_source, "hdr->bb_lsn = Be64{};", "clean short/long btree LSN"),
+        (bmap_source, "hdr->bb_lsn = Be64{};", "clean bmap btree LSN"),
+        (dir2_source, "hdr->info.lsn = Be64{};", "clean directory DA LSN"),
+        (dir2_source, "hdr->hdr.lsn = Be64{};", "clean directory data/free LSN"),
+        (attr_source, "hdr->info.lsn = Be64{};", "clean attribute leaf LSN"),
+    ):
+        if needle not in haystack:
+            fail(f"missing {description}")
+    for needle, description in (
+        ("home_metadata_clean = xfs_sync_mount(ctx) == 0;", "clean-home log discard gate"),
+        ("xfs_log_unmount(ctx, home_metadata_clean);", "clean-home state passed to log teardown"),
+    ):
+        if needle not in mount_source:
+            fail(f"missing {description}")
+    for needle, description in (
+        ("if (home_metadata_clean && FLUSH_RC == 0)", "log clearing only after successful home sync and final flush"),
+        ("auto xfs_log_clear_clean(", "clean log erasure helper"),
+        ("__builtin_memset(bh->data, 0, bh->size);", "complete clean log block erasure"),
+        ("int const RC = bwrite(bh);", "synchronous clean log erasure"),
+    ):
+        if needle not in log_source:
+            fail(f"missing {description}")
+
+    mkdir_start = vfs_source.find("auto xfs_mkdir_path(")
+    mkdir_end = vfs_source.find("// Rmdir", mkdir_start)
+    mkdir_source = vfs_source[mkdir_start:mkdir_end]
+    mkdir_cursor = 0
+    for token in (
+        "if (parent_ip->nlink == UINT32_MAX)",
+        "xfs_dir_addname(parent_ip, dirname, dirname_len, NEW_INO, XFS_DIR3_FT_DIR, tp, true);",
+        "parent_ip->nlink++;",
+        "xfs_trans_log_inode(tp, parent_ip);",
+        "xfs_trans_commit(tp);",
+    ):
+        pos = mkdir_source.find(token, mkdir_cursor)
+        if pos < 0:
+            fail(f"mkdir parent-link lifecycle ordering missing {token!r}")
+        mkdir_cursor = pos + len(token)
+
+    rmdir_start = vfs_source.find("auto xfs_rmdir_path(")
+    rmdir_end = vfs_source.find("// Link", rmdir_start)
+    rmdir_source = vfs_source[rmdir_start:rmdir_end]
+    rmdir_cursor = 0
+    for token in (
+        "if (parent_ip->nlink <= 2)",
+        "xfs_dir_removename(parent_ip, name, namelen, tp);",
+        "parent_ip->nlink--;",
+        "xfs_trans_log_inode(tp, parent_ip);",
+        "dir_ip->nlink = 0;",
+        "xfs_trans_commit(tp);",
+    ):
+        pos = rmdir_source.find(token, rmdir_cursor)
+        if pos < 0:
+            fail(f"rmdir parent-link lifecycle ordering missing {token!r}")
+        rmdir_cursor = pos + len(token)
 
     validate_pos = source.find("validate_inode_extent_records(ip, extents")
     free_pos = source.find("free_inode_extent_records(ip, tp, extents")

@@ -3529,10 +3529,14 @@ auto xfs_sync_mount(XfsMountContext* ctx) -> int {
     XfsMetadataGuard metadata_guard(ctx, true, WOS_PERF_CALLSITE());
     int const LOG_RET = xfs_log_flush(ctx);
     int const BLOCK_RET = sync_blockdev(ctx->device);
+    int const SUPERBLOCK_RET = (LOG_RET == 0 && BLOCK_RET == 0) ? xfs_sync_superblock_counters(ctx) : 0;
     if (INODE_RET != 0) {
         return INODE_RET;
     }
-    return LOG_RET != 0 ? LOG_RET : BLOCK_RET;
+    if (LOG_RET != 0) {
+        return LOG_RET;
+    }
+    return BLOCK_RET != 0 ? BLOCK_RET : SUPERBLOCK_RET;
 }
 
 auto xfs_collect_swap_extents(File* f, ker::mod::mm::swap::SwapExtent** extents_out, size_t* extent_count_out) -> int {
@@ -5275,6 +5279,10 @@ auto xfs_mkdir_path(const char* fs_path, int mode, XfsMountContext* ctx, ker::vf
         xfs_inode_release(parent_ip);
         return LOOKUP_RET;
     }
+    if (parent_ip->nlink == UINT32_MAX) {
+        xfs_inode_release(parent_ip);
+        return -EMLINK;
+    }
 
     // Save before parent_ip is released
     xfs_ino_t const PARENT_INO = parent_ip->ino;
@@ -5356,6 +5364,12 @@ auto xfs_mkdir_path(const char* fs_path, int mode, XfsMountContext* ctx, ker::vf
         xfs_inode_release(parent_ip);
         return rc;
     }
+    // Each child directory contributes its ".." reference to the parent.
+    // xfs_dir_addname() captured the parent before mutating its data fork, so
+    // this link-count update shares the same rollback snapshot.
+    parent_ip->nlink++;
+    parent_ip->dirty = true;
+    xfs_trans_log_inode(tp, parent_ip);
 
     rc = xfs_trans_commit(tp);
     xfs_inode_release(parent_ip);
@@ -5579,6 +5593,10 @@ auto xfs_rmdir_path(const char* fs_path, XfsMountContext* ctx, size_t known_fs_p
         xfs_inode_release(parent_ip);
         return -ENOTDIR;
     }
+    if (parent_ip->nlink <= 2) {
+        xfs_inode_release(parent_ip);
+        return -EIO;
+    }
 
     XfsInode* dir_ip = xfs_inode_read_known_allocated(ctx, de.ino);
     if (dir_ip == nullptr) {
@@ -5622,6 +5640,7 @@ auto xfs_rmdir_path(const char* fs_path, XfsMountContext* ctx, size_t known_fs_p
         return rc;
     }
 
+    parent_ip->nlink--;
     parent_ip->dirty = true;
     xfs_trans_log_inode(tp, parent_ip);
     // The removed directory loses both the parent entry and its self-reference.

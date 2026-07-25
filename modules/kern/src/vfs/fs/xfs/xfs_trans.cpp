@@ -149,6 +149,7 @@ void xfs_trans_restore_undo(XfsTransaction* tp) {
         undo->ip->size = undo->size;
         undo->ip->nblocks = undo->nblocks;
         undo->ip->nextents = undo->nextents;
+        undo->ip->mode = undo->mode;
         undo->ip->nlink = undo->nlink;
         undo->ip->dirty = undo->dirty;
         undo->ip->dir_generation = undo->dir_generation;
@@ -546,6 +547,7 @@ auto xfs_trans_capture_inode(XfsTransaction* tp, XfsInode* ip) -> int {
     undo->size = ip->size;
     undo->nblocks = ip->nblocks;
     undo->nextents = ip->nextents;
+    undo->mode = ip->mode;
     undo->nlink = ip->nlink;
     undo->dirty = ip->dirty;
     undo->dir_generation = ip->dir_generation;

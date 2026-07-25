@@ -138,6 +138,7 @@ auto bmbt_node_ptr_offset(const XfsMountContext* mount, size_t idx) -> size_t {
 
 void bmbt_update_crc(BufHead* bp) {
     auto* hdr = reinterpret_cast<XfsBtreeLblock*>(bp->data);
+    hdr->bb_lsn = Be64{};
     hdr->bb_crc = 0;
     uint32_t crc = util::crc32c_block_with_cksum(bp->data, bp->size, offsetof(XfsBtreeLblock, bb_crc));
     __builtin_memcpy(&hdr->bb_crc, &crc, sizeof(crc));
@@ -1625,6 +1626,7 @@ auto bmap_selftest_init_ag0(XfsMountContext* mount) -> bool {
     agf->agf_freeblks = Be32::from_cpu(pag.agf_freeblks);
     agf->agf_longest = Be32::from_cpu(pag.agf_longest);
     agf->agf_uuid = mount->uuid;
+    agf->agf_lsn = Be64{};
     agf->agf_crc = Be32{0};
     uint32_t agf_crc = util::crc32c_block_with_cksum(agf, mount->sect_size, XFS_AGF_CRC_OFF);
     __builtin_memcpy(&agf->agf_crc, &agf_crc, sizeof(agf_crc));
@@ -1633,6 +1635,7 @@ auto bmap_selftest_init_ag0(XfsMountContext* mount) -> bool {
     agfl->agfl_magicnum = Be32::from_cpu(XFS_AGFL_MAGIC);
     agfl->agfl_seqno = Be32::from_cpu(0);
     agfl->agfl_uuid = mount->uuid;
+    agfl->agfl_lsn = Be64{};
     auto* agfl_bno = reinterpret_cast<Be32*>(reinterpret_cast<uint8_t*>(agfl) + sizeof(XfsAgfl));
     uint32_t const AGFL_SIZE = xfs_agfl_size(mount);
     for (uint32_t i = 0; i < AGFL_SIZE; i++) {

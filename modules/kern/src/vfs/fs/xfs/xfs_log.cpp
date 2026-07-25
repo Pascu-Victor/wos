@@ -40,6 +40,7 @@ constexpr size_t XFS_LOG_STACK_BODY_MAX_BYTES = 4096;
 constexpr size_t XFS_LOG_BATCH_MAX_ITEMS = 8192;
 constexpr uint32_t XFS_LOG_BATCH_MAX_TRANSACTIONS = 256;
 constexpr size_t XFS_LOG_BATCH_MAX_BODY_BYTES = size_t{4} * 1024 * 1024;
+constexpr uint32_t XFS_LOG_CLEAR_CHUNK_BLOCKS = 256;
 ker::mod::sys::Mutex log_write_lock;
 
 class XfsLogWriteGuard {
@@ -353,6 +354,37 @@ auto xfs_log_recover(XfsLog* log) -> int {
     return 0;
 }
 
+auto xfs_log_clear_clean(XfsMountContext* mount, XfsLog* log) -> int {
+    if (mount == nullptr || log == nullptr || log->mount != mount) {
+        return -EINVAL;
+    }
+
+    uint32_t cleared = 0;
+    while (cleared < log->log_blocks) {
+        uint32_t const COUNT = std::min(XFS_LOG_CLEAR_CHUNK_BLOCKS, log->log_blocks - cleared);
+        BufHead* bh = xfs_buf_get_multi(mount, log->log_start + cleared, COUNT);
+        if (bh == nullptr || bh->data == nullptr || bh->size != static_cast<size_t>(COUNT) * mount->block_size) {
+            brelse(bh);
+            return -EIO;
+        }
+        __builtin_memset(bh->data, 0, bh->size);
+        bdirty(bh);
+        int const RC = bwrite(bh);
+        brelse(bh);
+        if (RC != 0) {
+            return RC;
+        }
+        cleared += COUNT;
+    }
+
+    log->head_cycle = 1;
+    log->head_block = 0;
+    log->tail_cycle = 1;
+    log->tail_block = 0;
+    log->clean = true;
+    return 0;
+}
+
 }  // anonymous namespace
 
 auto xfs_log_mount(XfsMountContext* mount) -> int {
@@ -406,13 +438,19 @@ auto xfs_log_mount(XfsMountContext* mount) -> int {
     return 0;
 }
 
-void xfs_log_unmount(XfsMountContext* mount) {
-    static_cast<void>(xfs_log_flush(mount));
+void xfs_log_unmount(XfsMountContext* mount, bool home_metadata_clean) {
+    int const FLUSH_RC = xfs_log_flush(mount);
     XfsLogWriteGuard guard;
     if (active_log == nullptr || active_log->mount != mount) {
         return;
     }
 
+    if (home_metadata_clean && FLUSH_RC == 0) {
+        int const CLEAR_RC = xfs_log_clear_clean(mount, active_log);
+        if (CLEAR_RC != 0) {
+            mod::dbg::log("[xfs log] failed to clear clean log: %d", CLEAR_RC);
+        }
+    }
     active_log->active = false;
     mod::dbg::log("[xfs log] log unmounted");
 

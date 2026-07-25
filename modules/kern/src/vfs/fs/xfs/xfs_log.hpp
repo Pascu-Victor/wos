@@ -39,7 +39,9 @@ struct XfsLog {
 auto xfs_log_mount(XfsMountContext* mount) -> int;
 
 // Shut down the log (call during unmount).
-void xfs_log_unmount(XfsMountContext* mount);
+// Tear down the active log. When home_metadata_clean is true, discard the
+// compact WOS journal after all home metadata has reached disk.
+void xfs_log_unmount(XfsMountContext* mount, bool home_metadata_clean);
 
 // Check if the log needs recovery (contains uncommitted records).
 auto xfs_log_needs_recovery(XfsMountContext* mount) -> bool;

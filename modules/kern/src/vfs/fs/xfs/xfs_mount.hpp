@@ -139,6 +139,10 @@ auto xfs_buf_get(XfsMountContext* ctx, uint64_t xfs_block) -> BufHead*;
 // Use for newly allocated ranges that will be fully overwritten.
 auto xfs_buf_get_multi(XfsMountContext* ctx, uint64_t xfs_block, size_t count) -> BufHead*;
 
+// Persist lazy global counters from the authoritative per-AG state.
+// Caller must hold metadata_lock and must have flushed AG metadata first.
+auto xfs_sync_superblock_counters(XfsMountContext* ctx) -> int;
+
 // Unmount - flush dirty buffers, close journal, free mount context.
 void xfs_unmount(XfsMountContext* ctx);
 
