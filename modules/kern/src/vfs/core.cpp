@@ -9095,7 +9095,7 @@ auto vfs_symlink_resolved_linkpath(const char* target, const char* abs_linkpath,
         }
         std::memcpy(parent_path.data(), fs_path, parent_len);
         parent_path[parent_len] = '\0';
-        parent = ker::vfs::tmpfs::tmpfs_walk_path(tmpfs_root_for_mount(mount), parent_path.data(), true);
+        parent = ker::vfs::tmpfs::tmpfs_walk_path(tmpfs_root_for_mount(mount), parent_path.data(), false);
         link_name = last_slash + 1;
     }
 
@@ -17685,9 +17685,13 @@ auto vfs_selftest_symlinkat_dirfd_creates_relative_symlink() -> bool {
     constexpr const char* DIR_PATH = "/tmp/ktest_symlinkat_dirfd";
     constexpr const char* LINK_PATH = "/tmp/ktest_symlinkat_dirfd/link";
     constexpr const char* ABS_LINK_PATH = "/tmp/ktest_symlinkat_dirfd/abs_link";
+    constexpr const char* MISSING_PARENT_PATH = "/tmp/ktest_symlinkat_missing_parent";
+    constexpr const char* MISSING_LINK_PATH = "/tmp/ktest_symlinkat_missing_parent/link";
     constexpr const char* LINK_NAME = "link";
     constexpr const char* TARGET = "target-name";
 
+    vfs_unlink(MISSING_LINK_PATH);
+    vfs_rmdir(MISSING_PARENT_PATH);
     vfs_unlink(LINK_PATH);
     vfs_unlink(ABS_LINK_PATH);
     vfs_rmdir(DIR_PATH);
@@ -17712,8 +17716,14 @@ auto vfs_selftest_symlinkat_dirfd_creates_relative_symlink() -> bool {
     if (ok) {
         ok = vfs_symlinkat(&task, TARGET, BOGUS_DIRFD, ABS_LINK_PATH) == 0;
     }
+    if (ok) {
+        ok = vfs_symlinkat(&task, TARGET, BOGUS_DIRFD, MISSING_LINK_PATH) == -ENOENT;
+    }
 
     Stat st{};
+    if (ok) {
+        ok = vfs_lstat(MISSING_PARENT_PATH, &st) == -ENOENT && vfs_lstat(MISSING_LINK_PATH, &st) == -ENOENT;
+    }
     VfsCachePerfSnapshot before_link_lstat{};
     VfsCachePerfSnapshot after_link_lstat{};
     VfsCachePerfSnapshot before_abs_lstat{};
