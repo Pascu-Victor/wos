@@ -423,6 +423,26 @@ auto xfs_trans_capture_buf(XfsTransaction* tp, BufHead* bp) -> int {
     XfsTransBufUndo const* span_undo = nullptr;
     for (XfsTransBufUndo const* undo = tp->buf_undo; undo != nullptr; undo = undo->next) {
         if (undo->bp == bp) {
+            // A retired transaction buffer can be reintroduced as a distinct
+            // cache object for the same device span. Logging through that
+            // alias merges into the transaction's first (canonical) buffer,
+            // but later changes through the canonical buffer do not
+            // automatically update the alias. Capture is the before-mutation
+            // boundary, so refresh a reused alias here before its caller can
+            // overwrite newer metadata with stale contents.
+            for (int i = 0; i < tp->item_count; ++i) {
+                XfsTransItem const& item = tp->items[i];
+                if (item.type != XfsLogItemType::BUFFER || item.buf.bp == nullptr || item.buf.bp == bp || item.buf.bp->bdev != bp->bdev ||
+                    item.buf.bp->block_no != bp->block_no || item.buf.bp->size != bp->size) {
+                    continue;
+                }
+                if (item.buf.bp->data == nullptr) {
+                    tp->error = -EIO;
+                    return -EIO;
+                }
+                __builtin_memcpy(bp->data, item.buf.bp->data, bp->size);
+                break;
+            }
             return 0;
         }
         if (span_undo == nullptr && undo->bp != nullptr && undo->bp->bdev == bp->bdev && undo->bp->block_no == bp->block_no &&
@@ -830,6 +850,7 @@ auto xfs_selftest_transaction_cancel_restores_replaced_buffer_alias() -> bool {
     constexpr uint8_t ORIGINAL = 0x31;
     constexpr uint8_t FIRST_MUTATION = 0x52;
     constexpr uint8_t SECOND_MUTATION = 0x73;
+    constexpr uint8_t THIRD_MUTATION = 0x94;
 
     ker::dev::BlockDevice dev{};
     dev.block_size = 512;
@@ -876,6 +897,14 @@ auto xfs_selftest_transaction_cancel_restores_replaced_buffer_alias() -> bool {
     if (ok) {
         __builtin_memset(replacement->data, SECOND_MUTATION, replacement->size);
         xfs_trans_log_buf_full(tp, replacement);
+    }
+    if (ok) {
+        ok = xfs_trans_capture_buf(tp, original) == 0 && filled_with(original, SECOND_MUTATION);
+    }
+    if (ok) {
+        original->data[0] = THIRD_MUTATION;
+        xfs_trans_log_buf(tp, original, 0, 1);
+        ok = xfs_trans_capture_buf(tp, replacement) == 0 && replacement->data[0] == THIRD_MUTATION;
     }
 
     if (tp != nullptr) {
