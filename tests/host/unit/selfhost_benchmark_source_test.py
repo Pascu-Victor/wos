@@ -215,13 +215,19 @@ def test_wos_bootstrap_distributes_only_compiler_processes() -> None:
             r'on "\$compiler_host" /usr/bin/timeout',
             r'for compiler_local_system_root in /usr /bin /lib /lib64 /libexec /share /etc /proc /dev /run /tmp; do',
             r'compiler_add_home_route "\$compiler_state"',
-            r'elif ! mv -- "\$compiler_staged_output" "\$output_file"; then',
+            r'if [ "\$compiler_status" -eq 0 ] && ! mv -- "\$compiler_staged_output" "\$output_file"; then',
+            r"compiler_staged_required_outputs=()",
+            r'compiler_staged_required_outputs+=("\$compiler_arg")',
+            r'compiler_create_shared_file "\$compiler_side_output"',
+            r"compiler_staged_outputs_ready() {",
+            r'fsync "\$compiler_side_output"',
             r'compiler_skip_output_arg=0',
             r'if [ "\$compiler_skip_output_arg" -eq 1 ]; then',
             r'compiler_staged_args+=(-MF "\$compiler_dependency_route")',
             "Clang derives an implicit module filename from -o",
             r'-Wp,-MD,*|-Wp,-MMD,*)',
-            r'-serialize-diagnostics=*|-fmodule-output=*|-fmodules-cache-path=*)',
+            r'-serialize-diagnostics=*|-fmodule-output=*)',
+            r'-fmodules-cache-path=*)',
             r'"\${compiler_remote_command[@]}" "\${compiler[@]}" -fno-temp-file "\${compiler_staged_args[@]}"',
             r'"\${compiler_remote_command[@]}" "\${compiler[@]}" -fno-temp-file "@\$compiler_response"',
             r'compiler_jobs_per_host="\${WOS_DISTRIBUTED_COMPILER_JOBS_PER_HOST:-}"',
@@ -235,10 +241,10 @@ def test_wos_bootstrap_distributes_only_compiler_processes() -> None:
             r'if [ "\$compiler_status" -ne 127 ] || [ "\$compiler_remote_attempt" -ge 2 ]; then',
             r"distributed compiler launch on \$compiler_host failed with status 127; retrying once",
             r'compiler_publish_limit_us="\$((compiler_publish_timeout * 1000000))"',
-            r'''while [ ! -s "\$compiler_staged_output" ] &&''',
+            r"while ! compiler_staged_outputs_ready &&",
             r'compiler_publish_wait_us="\$((compiler_publish_wait_us + compiler_publish_pause_us))"',
-            r'''[ ! -s "\$compiler_staged_output" ]''',
-            "distributed staged compiler returned success without publishing",
+            r"if ! compiler_staged_outputs_ready; then",
+            "distributed staged compiler returned success without publishing all outputs",
             r'compiler_total_jobs="\${WOS_NINJA_JOBS:-\${WOS_BUILD_JOBS:-}}"',
             r'compiler_local_jobs="\$compiler_total_jobs"',
             r'compiler_remote_jobs_per_host="\${WOS_DISTRIBUTED_COMPILER_REMOTE_JOBS_PER_HOST:-1}"',
@@ -1223,8 +1229,92 @@ test ! -e "$1/compiler-state.successes/1"
         )
         if result.returncode != 0:
             fail(f"WOS staged unpublished-output fallback test failed: {result.stderr}")
-        if "returned success without publishing" not in result.stderr:
+        if "returned success without publishing all outputs" not in result.stderr:
             fail("WOS staged compiler did not report its missing published output")
+
+
+def test_wos_bootstrap_retries_unpublished_staged_side_output_locally() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp = Path(temp_dir)
+        source_root = temp / "source-root"
+        source_root.mkdir()
+        (source_root / "input.c").write_text("int unpublished_depfile(void) { return 37; }\n", encoding="ascii")
+        state = temp / "compiler-state"
+        Path(f"{state}.local-roots").write_text(f"{source_root}\n", encoding="ascii")
+        mock_forward = temp / "forward"
+        mock_forward.write_text(
+            r'''#!/bin/bash
+set -eu
+[ "$1" = --clear ]
+dependency=
+while [ "$1" != -- ]; do
+    case "$1" in
+        +*.d) dependency="${1#+}" ;;
+    esac
+    shift
+done
+shift
+"$@"
+status=$?
+if [ "$status" -eq 0 ] && [ -n "$dependency" ]; then
+    rm -f -- "$dependency"
+fi
+exit "$status"
+''',
+            encoding="ascii",
+        )
+        mock_forward.chmod(0o755)
+        mock_hostname = temp / "hostname"
+        mock_hostname.write_text("#!/bin/sh\nprintf 'wos-1\\n'\n", encoding="ascii")
+        mock_hostname.chmod(0o755)
+        mock_fsync = temp / "fsync"
+        mock_fsync.write_text('#!/bin/sh\nexec sync -f "$1"\n', encoding="ascii")
+        mock_fsync.chmod(0o755)
+        system_clang = ROOT / "toolchain" / "host" / "bin" / "clang"
+        resource_dir = ROOT / "toolchain" / "host" / "lib" / "clang" / "22"
+        script = r'''
+set -euo pipefail
+WOS_TARGET_ARCH=x86_64-pc-wos
+source <(sed -n '/^write_clang_wrapper()/,/^}/p' tools/bootstrap.sh)
+write_clang_wrapper "$1/clang" "$2" "$3"
+(
+    cd "$1/source-root"
+    PATH="$1:$PATH" \
+        WOS_DISTRIBUTED_COMPILER=1 \
+        WOS_DISTRIBUTED_COMPILER_HOSTS=wos-0,wos-1 \
+        WOS_DISTRIBUTED_COMPILER_STATE="$1/compiler-state" \
+        WOS_DISTRIBUTED_COMPILER_TRANSPORT=staged \
+        WOS_DISTRIBUTED_COMPILER_JOBS_PER_HOST=1 \
+        WOS_DISTRIBUTED_COMPILER_LOCAL_JOBS=1 \
+        WOS_DISTRIBUTED_COMPILER_REMOTE_JOBS_PER_HOST=1 \
+        WOS_DISTRIBUTED_COMPILER_PUBLISH_TIMEOUT=1 \
+        WOS_NINJA_JOBS=2 \
+        "$1/clang" -MD -MF "$1/output.d" -c input.c -o "$1/output.o"
+)
+test -s "$1/output.o"
+test -s "$1/output.d"
+test "$(cat "$1/compiler-state.successes/0")" = wos-0
+test ! -e "$1/compiler-state.successes/1"
+'''
+        result = subprocess.run(
+            [
+                "bash",
+                "-c",
+                script,
+                "wos-bootstrap-unpublished-side-output-test",
+                temp_dir,
+                str(system_clang),
+                str(resource_dir),
+            ],
+            cwd=ROOT,
+            check=False,
+            text=True,
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            fail(f"WOS staged unpublished-side-output fallback test failed: {result.stderr}")
+        if "returned success without publishing all outputs" not in result.stderr:
+            fail("WOS staged compiler did not report its missing side output")
 
 
 def test_distributed_compiler_root_staging_is_guarded_and_atomic() -> None:
@@ -3105,6 +3195,7 @@ if __name__ == "__main__":
     test_wos_bootstrap_retries_failed_remote_compiler_locally()
     test_wos_bootstrap_staged_compiler_routes_source_and_outputs()
     test_wos_bootstrap_retries_unpublished_staged_output_locally()
+    test_wos_bootstrap_retries_unpublished_staged_side_output_locally()
     test_distributed_compiler_root_staging_is_guarded_and_atomic()
     test_distributed_compiler_hosts_are_validated_before_launch()
     test_selfhost_repeatability_runner_preserves_acceptance_evidence()

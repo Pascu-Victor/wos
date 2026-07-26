@@ -517,6 +517,7 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
             compiler_add_home_route "\$compiler_state" || exit 1
             compiler_add_home_route "\$compiler_responses" || exit 1
             compiler_add_home_route "\$compiler_staged_output" || exit 1
+            compiler_staged_required_outputs=()
             compiler_route_next=""
             compiler_has_explicit_dependency=0
             compiler_has_implicit_dependency=0
@@ -524,9 +525,15 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
             for compiler_arg in "\$@"; do
                 if [ -n "\$compiler_route_next" ]; then
                     compiler_add_home_route "\$compiler_arg" || exit 1
-                    if [ "\$compiler_route_next" = dependency ]; then
-                        compiler_has_explicit_dependency=1
-                    fi
+                    case "\$compiler_route_next" in
+                        dependency)
+                            compiler_has_explicit_dependency=1
+                            compiler_staged_required_outputs+=("\$compiler_arg")
+                            ;;
+                        side-output)
+                            compiler_staged_required_outputs+=("\$compiler_arg")
+                            ;;
+                    esac
                     compiler_route_next=""
                     continue
                 fi
@@ -538,14 +545,23 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
                         compiler_route_next=side-output
                         ;;
                     -MF?*|-MJ?*)
-                        compiler_add_home_route "\${compiler_arg:3}" || exit 1
+                        compiler_side_output="\${compiler_arg:3}"
+                        compiler_add_home_route "\$compiler_side_output" || exit 1
+                        compiler_staged_required_outputs+=("\$compiler_side_output")
                         compiler_has_explicit_dependency=1
                         ;;
                     -Wp,-MD,*|-Wp,-MMD,*)
-                        compiler_add_home_route "\${compiler_arg#*,*,}" || exit 1
+                        compiler_side_output="\${compiler_arg#*,*,}"
+                        compiler_add_home_route "\$compiler_side_output" || exit 1
+                        compiler_staged_required_outputs+=("\$compiler_side_output")
                         compiler_has_explicit_dependency=1
                         ;;
-                    -serialize-diagnostics=*|-fmodule-output=*|-fmodules-cache-path=*)
+                    -serialize-diagnostics=*|-fmodule-output=*)
+                        compiler_side_output="\${compiler_arg#*=}"
+                        compiler_add_home_route "\$compiler_side_output" || exit 1
+                        compiler_staged_required_outputs+=("\$compiler_side_output")
+                        ;;
+                    -fmodules-cache-path=*)
                         compiler_add_home_route "\${compiler_arg#*=}" || exit 1
                         ;;
                     -fmodule-output)
@@ -570,6 +586,7 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
                 esac
                 compiler_add_home_route "\$compiler_dependency_route" || exit 1
                 compiler_staged_args+=(-MF "\$compiler_dependency_route")
+                compiler_staged_required_outputs+=("\$compiler_dependency_route")
             fi
             if [ "\$compiler_has_implicit_module_output" -eq 1 ] && [ -n "\$output_file" ]; then
                 # Clang derives an implicit module filename from -o. Replacing
@@ -586,6 +603,19 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
                 fi
                 exit "\$compiler_status"
             fi
+            # Side outputs such as depfiles are written directly through home
+            # routes. Seed positive dentries on the submitter before dispatch:
+            # otherwise a peer-side create can race a cached negative lookup,
+            # leaving the build with an object but no requested dependency
+            # file. These files are private to the active compiler command.
+            for compiler_side_output in "\${compiler_staged_required_outputs[@]}"; do
+                if ! compiler_create_shared_file "\$compiler_side_output"; then
+                    compiler_slot_release
+                    trap - EXIT HUP INT TERM
+                    echo "ERROR: distributed compiler side output could not be prepared: \$compiler_side_output" >&2
+                    exit 1
+                fi
+            done
             # Compile the object into peer-local /tmp, then copy the completed
             # file through the explicit home route. Streaming every object
             # write through remote VFS saturates the submitter and leaves peer
@@ -663,7 +693,14 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
                 compiler_publish_wait_us=0
                 compiler_publish_limit_us="\$((compiler_publish_timeout * 1000000))"
                 compiler_publish_pause_us=1000
-                while [ ! -s "\$compiler_staged_output" ] &&
+                compiler_staged_outputs_ready() {
+                    [ -s "\$compiler_staged_output" ] || return 1
+                    for compiler_side_output in "\${compiler_staged_required_outputs[@]}"; do
+                        [ -s "\$compiler_side_output" ] || return 1
+                    done
+                    return 0
+                }
+                while ! compiler_staged_outputs_ready &&
                       [ "\$compiler_publish_wait_us" -lt "\$compiler_publish_limit_us" ]; do
                     if [ "\$compiler_slot_has_usleep" -eq 1 ]; then
                         usleep "\$compiler_publish_pause_us"
@@ -676,10 +713,19 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
                         compiler_publish_wait_us="\$((compiler_publish_wait_us + 1000000))"
                     fi
                 done
-                if [ ! -s "\$compiler_staged_output" ]; then
-                    echo "warning: distributed staged compiler returned success without publishing '\$output_file'; retrying locally" >&2
+                if ! compiler_staged_outputs_ready; then
+                    echo "warning: distributed staged compiler returned success without publishing all outputs for '\$output_file'; retrying locally" >&2
                     compiler_status=1
-                elif ! mv -- "\$compiler_staged_output" "\$output_file"; then
+                else
+                    for compiler_side_output in "\${compiler_staged_required_outputs[@]}"; do
+                        if ! fsync "\$compiler_side_output"; then
+                            echo "warning: distributed staged compiler could not fsync side output '\$compiler_side_output'; retrying locally" >&2
+                            compiler_status=1
+                            break
+                        fi
+                    done
+                fi
+                if [ "\$compiler_status" -eq 0 ] && ! mv -- "\$compiler_staged_output" "\$output_file"; then
                     echo "warning: distributed staged compiler could not publish '\$output_file'; retrying locally" >&2
                     compiler_status=1
                 fi
