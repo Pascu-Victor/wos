@@ -105,6 +105,10 @@ KTEST(XFS, FullAgflAllocationDrainsTransactionally) {
     KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_full_agfl_allocation_drains_transactionally());
 }
 
+KTEST(XFS, EmptyAgflRefillRebalances) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_empty_agfl_refill_rebalances()); }
+
+KTEST(XFS, FreeSpaceTreeChurnPreservesTopology) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_free_space_tree_churn_preserves_topology()); }
+
 KTEST(XFS, SmallHoleWriteAllocatesOnlyNeededBlocks) {
     constexpr size_t BLOCK_SIZE = 4096;
     constexpr uint32_t BLOCK_LOG = 12;

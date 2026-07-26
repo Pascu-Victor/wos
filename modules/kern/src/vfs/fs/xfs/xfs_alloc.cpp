@@ -27,6 +27,9 @@
 #include "vfs/fs/xfs/xfs_format.hpp"
 #include "vfs/fs/xfs/xfs_mount.hpp"
 #include "vfs/fs/xfs/xfs_trans.hpp"
+#ifdef WOS_SELFTEST
+#include "vfs/fs/xfs/xfs_log.hpp"
+#endif
 
 namespace ker::vfs::xfs {
 
@@ -701,10 +704,16 @@ auto delete_free_extent_record(XfsMountContext* mount, XfsTransaction* tp, xfs_a
     XfsBnobtTraits::IRec const BNO_TARGET{.startblock = startblock, .blockcount = 0};
     int rc = xfs_btree_lookup(&bno_cur, pag->agf_bno_root, pag->agf_bno_level, BNO_TARGET, XfsBtreeLookup::EQ);
     if (rc != 0) {
+        mod::dbg::logger<"xfs">::error(
+            "delete free extent failed stage=lookup-bnobt agno=%u start=%u len=%u bno_root=%u bno_levels=%u rc=%d", agno, startblock,
+            blockcount, pag->agf_bno_root, pag->agf_bno_level, rc);
         return rc;
     }
     XfsBnobtTraits::IRec const BNO_REC = xfs_btree_get_rec(&bno_cur);
     if (BNO_REC.blockcount != blockcount) {
+        mod::dbg::logger<"xfs">::error(
+            "delete free extent failed stage=match-bnobt agno=%u start=%u expected_len=%u actual_len=%u bno_root=%u bno_levels=%u", agno,
+            startblock, blockcount, BNO_REC.blockcount, pag->agf_bno_root, pag->agf_bno_level);
         return -EIO;
     }
 
@@ -714,19 +723,33 @@ auto delete_free_extent_record(XfsMountContext* mount, XfsTransaction* tp, xfs_a
     XfsCntbtTraits::IRec const CNT_TARGET{.startblock = startblock, .blockcount = blockcount};
     rc = xfs_btree_lookup(&cnt_cur, pag->agf_cnt_root, pag->agf_cnt_level, CNT_TARGET, XfsBtreeLookup::EQ);
     if (rc != 0) {
+        mod::dbg::logger<"xfs">::error(
+            "delete free extent failed stage=lookup-cntbt agno=%u start=%u len=%u cnt_root=%u cnt_levels=%u rc=%d", agno, startblock,
+            blockcount, pag->agf_cnt_root, pag->agf_cnt_level, rc);
         return rc;
     }
 
     XfsCntbtTraits::IRec const CNT_REC = xfs_btree_get_rec(&cnt_cur);
     if (!same_free_extent(CNT_REC.startblock, CNT_REC.blockcount, BNO_REC.startblock, BNO_REC.blockcount)) {
+        mod::dbg::logger<"xfs">::error(
+            "delete free extent failed stage=match-cntbt agno=%u expected_start=%u expected_len=%u actual_start=%u actual_len=%u "
+            "cnt_root=%u cnt_levels=%u",
+            agno, BNO_REC.startblock, BNO_REC.blockcount, CNT_REC.startblock, CNT_REC.blockcount, pag->agf_cnt_root, pag->agf_cnt_level);
         return -EIO;
     }
 
     rc = delete_btree_record(&bno_cur, tp, &pag->agf_bno_root, &pag->agf_bno_level);
     if (rc != 0) {
+        mod::dbg::logger<"xfs">::error("delete free extent failed stage=delete-bnobt agno=%u start=%u len=%u rc=%d", agno, startblock,
+                                       blockcount, rc);
         return rc;
     }
-    return delete_btree_record(&cnt_cur, tp, &pag->agf_cnt_root, &pag->agf_cnt_level);
+    rc = delete_btree_record(&cnt_cur, tp, &pag->agf_cnt_root, &pag->agf_cnt_level);
+    if (rc != 0) {
+        mod::dbg::logger<"xfs">::error("delete free extent failed stage=delete-cntbt agno=%u start=%u len=%u rc=%d", agno, startblock,
+                                       blockcount, rc);
+    }
+    return rc;
 }
 
 }  // anonymous namespace
@@ -844,24 +867,32 @@ auto xfs_free_extent(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t 
     }
 
     XfsPerAG* pag = &mount->per_ag[agno];
+    auto fail = [&](const char* stage, int rc) -> int {
+        mod::dbg::logger<"xfs">::error(
+            "free extent failed stage=%s agno=%u agbno=%u len=%u bno_root=%u bno_levels=%u cnt_root=%u cnt_levels=%u "
+            "freeblks=%u flcount=%u rc=%d",
+            stage, agno, agbno, len, pag->agf_bno_root, pag->agf_bno_level, pag->agf_cnt_root, pag->agf_cnt_level, pag->agf_freeblks,
+            pag->agf_flcount, rc);
+        return rc;
+    };
 
     // Reject a double-free before AGFL refill changes either free-space tree.
     // Refill can shorten or remove the records adjacent to this extent, so the
     // neighbor cursors used for coalescing must be opened only after refill.
     int const VALID_RC = xfs_validate_allocated_extent(mount, agno, agbno, len);
     if (VALID_RC != 0) {
-        return VALID_RC;
+        return fail("validate", VALID_RC);
     }
 
     int const CAPTURE_RC = xfs_trans_capture_perag(tp, agno);
     if (CAPTURE_RC != 0) {
-        return CAPTURE_RC;
+        return fail("capture-perag", CAPTURE_RC);
     }
 
     if (pag->agf_flcount < agfl_reserve_blocks(mount)) {
         int const REFILL_RC = agfl_refill(mount, tp, agno);
         if (REFILL_RC != 0) {
-            return REFILL_RC;
+            return fail("agfl-refill", REFILL_RC);
         }
     }
 
@@ -889,7 +920,7 @@ auto xfs_free_extent(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t 
             merged_len += prev_rec.blockcount;
         }
     } else if (rc != -ENOENT) {
-        return rc;
+        return fail("lookup-prev", rc);
     }
 
     xfs_agblock_t const FREE_END = agbno + len;
@@ -912,19 +943,19 @@ auto xfs_free_extent(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t 
             merged_len += next_rec.blockcount;
         }
     } else if (rc != -ENOENT) {
-        return rc;
+        return fail("lookup-next", rc);
     }
 
     if (merge_prev) {
         rc = delete_free_extent_record(mount, tp, agno, prev_rec.startblock, prev_rec.blockcount);
         if (rc != 0) {
-            return rc;
+            return fail("delete-prev", rc);
         }
     }
     if (merge_next) {
         rc = delete_free_extent_record(mount, tp, agno, next_rec.startblock, next_rec.blockcount);
         if (rc != 0) {
-            return rc;
+            return fail("delete-next", rc);
         }
     }
 
@@ -938,7 +969,7 @@ auto xfs_free_extent(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t 
     XfsBnobtTraits::IRec const BNO_REC{.startblock = merged_start, .blockcount = merged_len};
     rc = xfs_btree_insert(&bno_cur, tp, BNO_REC, pag->agf_bno_root, pag->agf_bno_level, &new_bno_root, &new_bno_lvl);
     if (rc != 0) {
-        return rc;
+        return fail("insert-bnobt", rc);
     }
     pag->agf_bno_root = static_cast<xfs_agblock_t>(new_bno_root);
     pag->agf_bno_level = new_bno_lvl;
@@ -953,7 +984,7 @@ auto xfs_free_extent(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t 
     XfsCntbtTraits::IRec const CNT_REC{.startblock = merged_start, .blockcount = merged_len};
     rc = xfs_btree_insert(&cnt_cur, tp, CNT_REC, pag->agf_cnt_root, pag->agf_cnt_level, &new_cnt_root, &new_cnt_lvl);
     if (rc != 0) {
-        return rc;
+        return fail("insert-cntbt", rc);
     }
     pag->agf_cnt_root = static_cast<xfs_agblock_t>(new_cnt_root);
     pag->agf_cnt_level = new_cnt_lvl;
@@ -963,7 +994,7 @@ auto xfs_free_extent(XfsMountContext* mount, XfsTransaction* tp, xfs_agnumber_t 
 
     int const LOG_RC = log_agf_free_space_roots(mount, tp, agno);
     if (LOG_RC != 0) {
-        return LOG_RC;
+        return fail("log-agf", LOG_RC);
     }
 
 #ifdef XFS_DEBUG
@@ -1246,12 +1277,212 @@ auto xfs_alloc_ensure_freelist_headroom(XfsMountContext* mount, XfsTransaction* 
 #ifdef WOS_SELFTEST
 namespace {
 
-auto agfl_selftest_read(ker::dev::BlockDevice* dev, uint64_t /*block*/, size_t count, void* buffer) -> int {
+struct AgflSelftestBacking {
+    uint8_t* data{};
+    size_t size{};
+};
+
+auto agfl_selftest_read(ker::dev::BlockDevice* dev, uint64_t block, size_t count, void* buffer) -> int {
+    auto* backing = dev != nullptr ? static_cast<AgflSelftestBacking*>(dev->private_data) : nullptr;
+    if (backing != nullptr) {
+        if (buffer == nullptr || block > SIZE_MAX / dev->block_size || count > SIZE_MAX / dev->block_size) {
+            return -EIO;
+        }
+        size_t const OFFSET = static_cast<size_t>(block) * dev->block_size;
+        size_t const BYTES = count * dev->block_size;
+        if (OFFSET > backing->size || BYTES > backing->size - OFFSET) {
+            return -EIO;
+        }
+        __builtin_memcpy(buffer, backing->data + OFFSET, BYTES);
+        return 0;
+    }
     __builtin_memset(buffer, 0, count * dev->block_size);
     return 0;
 }
 
-auto agfl_selftest_write(ker::dev::BlockDevice* /*dev*/, uint64_t /*block*/, size_t /*count*/, const void* /*buffer*/) -> int { return 0; }
+auto agfl_selftest_write(ker::dev::BlockDevice* dev, uint64_t block, size_t count, const void* buffer) -> int {
+    auto* backing = dev != nullptr ? static_cast<AgflSelftestBacking*>(dev->private_data) : nullptr;
+    if (backing == nullptr) {
+        return 0;
+    }
+    if (buffer == nullptr || block > SIZE_MAX / dev->block_size || count > SIZE_MAX / dev->block_size) {
+        return -EIO;
+    }
+    size_t const OFFSET = static_cast<size_t>(block) * dev->block_size;
+    size_t const BYTES = count * dev->block_size;
+    if (OFFSET > backing->size || BYTES > backing->size - OFFSET) {
+        return -EIO;
+    }
+    __builtin_memcpy(backing->data + OFFSET, buffer, BYTES);
+    return 0;
+}
+
+struct FreeTreeDigest {
+    uint32_t records{};
+    uint64_t blocks{};
+    uint64_t sum{};
+    uint64_t xor_value{};
+};
+
+template <typename Traits>
+auto agfl_selftest_validate_two_level_tree(XfsMountContext* mount, xfs_agblock_t root_block, FreeTreeDigest* digest) -> bool {
+    if (mount == nullptr || digest == nullptr) {
+        return false;
+    }
+    *digest = {};
+
+    BufHead* root = xfs_buf_read(mount, root_block);
+    if (root == nullptr) {
+        return false;
+    }
+    const auto* root_hdr = reinterpret_cast<const XfsBtreeSblock*>(root->data);
+    uint32_t const MAX_NODE_RECS = (mount->block_size - Traits::HDR_LEN) / static_cast<uint32_t>(Traits::KEY_LEN + Traits::PTR_LEN);
+    uint32_t const ROOT_RECS = root_hdr->bb_numrecs.to_cpu();
+    if (root_hdr->bb_magic.to_cpu() != Traits::MAGIC || root_hdr->bb_level.to_cpu() != 1 || ROOT_RECS < 2 || ROOT_RECS > MAX_NODE_RECS) {
+        brelse(root);
+        return false;
+    }
+
+    size_t const PTR_BASE = Traits::HDR_LEN + (static_cast<size_t>(MAX_NODE_RECS) * Traits::KEY_LEN);
+    std::array<xfs_agblock_t, 128> children{};
+    if (ROOT_RECS > children.size()) {
+        brelse(root);
+        return false;
+    }
+
+    bool ok = true;
+    xfs_agblock_t previous_child = NULLAGBLOCK;
+    xfs_agblock_t expected_child = NULLAGBLOCK;
+    typename Traits::IRec previous_record{};
+    bool have_previous_record = false;
+    for (uint32_t child_index = 0; ok && child_index < ROOT_RECS; ++child_index) {
+        Be32 child_be{};
+        __builtin_memcpy(&child_be, root->data + PTR_BASE + (static_cast<size_t>(child_index) * Traits::PTR_LEN), sizeof(child_be));
+        xfs_agblock_t const CHILD = child_be.to_cpu();
+        if (CHILD == NULLAGBLOCK || CHILD >= mount->ag_blocks || (child_index > 0 && CHILD != expected_child)) {
+            ok = false;
+            break;
+        }
+        for (uint32_t previous_index = 0; previous_index < child_index; ++previous_index) {
+            if (children[previous_index] == CHILD) {
+                ok = false;
+                break;
+            }
+        }
+        if (!ok) {
+            break;
+        }
+        children[child_index] = CHILD;
+
+        BufHead* leaf = xfs_buf_read(mount, CHILD);
+        if (leaf == nullptr) {
+            ok = false;
+            break;
+        }
+        const auto* leaf_hdr = reinterpret_cast<const XfsBtreeSblock*>(leaf->data);
+        uint32_t const MAX_LEAF_RECS = (mount->block_size - Traits::HDR_LEN) / static_cast<uint32_t>(Traits::REC_LEN);
+        uint32_t const LEAF_RECS = leaf_hdr->bb_numrecs.to_cpu();
+        ok = leaf_hdr->bb_magic.to_cpu() == Traits::MAGIC && leaf_hdr->bb_level.to_cpu() == 0 && LEAF_RECS > 0 &&
+             LEAF_RECS <= MAX_LEAF_RECS && leaf_hdr->bb_leftsib.to_cpu() == previous_child;
+
+        const auto* records = reinterpret_cast<const typename Traits::Rec*>(leaf->data + Traits::HDR_LEN);
+        if (ok) {
+            typename Traits::Key first_key{};
+            Traits::init_key_from_rec(&first_key, &records[0]);
+            const auto* parent_key =
+                reinterpret_cast<const typename Traits::Key*>(root->data + Traits::HDR_LEN + (child_index * Traits::KEY_LEN));
+            typename Traits::IRec const FIRST = Traits::decode_rec(&records[0]);
+            ok = Traits::cmp_key(parent_key, FIRST) == 0;
+        }
+        for (uint32_t record_index = 0; ok && record_index < LEAF_RECS; ++record_index) {
+            typename Traits::IRec const RECORD = Traits::decode_rec(&records[record_index]);
+            typename Traits::Key record_key{};
+            Traits::init_key_from_rec(&record_key, &records[record_index]);
+            if (have_previous_record && Traits::cmp_key(&record_key, previous_record) <= 0) {
+                ok = false;
+                break;
+            }
+            previous_record = RECORD;
+            have_previous_record = true;
+            digest->records++;
+            digest->blocks += RECORD.blockcount;
+            uint64_t const FINGERPRINT = (static_cast<uint64_t>(RECORD.startblock) << 32U) | RECORD.blockcount;
+            digest->sum += FINGERPRINT;
+            digest->xor_value ^= FINGERPRINT;
+        }
+
+        previous_child = CHILD;
+        expected_child = leaf_hdr->bb_rightsib.to_cpu();
+        brelse(leaf);
+    }
+    ok = ok && expected_child == NULLAGBLOCK;
+    brelse(root);
+    return ok;
+}
+
+template <typename Traits>
+auto agfl_selftest_init_two_leaf_tree(XfsMountContext* mount, xfs_agblock_t root_block, xfs_agblock_t left_block, xfs_agblock_t right_block,
+                                      xfs_agblock_t first_free, int records_per_leaf) -> bool {
+    if (mount == nullptr || records_per_leaf <= 0) {
+        return false;
+    }
+    BufHead* root = xfs_buf_get(mount, root_block);
+    BufHead* left = xfs_buf_get(mount, left_block);
+    BufHead* right = xfs_buf_get(mount, right_block);
+    if (root == nullptr || left == nullptr || right == nullptr) {
+        if (root != nullptr) {
+            brelse(root);
+        }
+        if (left != nullptr) {
+            brelse(left);
+        }
+        if (right != nullptr) {
+            brelse(right);
+        }
+        return false;
+    }
+
+    auto init_header = [&](BufHead* bp, uint16_t level, uint16_t numrecs, xfs_agblock_t leftsib, xfs_agblock_t rightsib) {
+        __builtin_memset(bp->data, 0, bp->size);
+        auto* hdr = reinterpret_cast<XfsBtreeSblock*>(bp->data);
+        hdr->bb_magic = Be32::from_cpu(Traits::MAGIC);
+        hdr->bb_level = Be16::from_cpu(level);
+        hdr->bb_numrecs = Be16::from_cpu(numrecs);
+        hdr->bb_leftsib = Be32::from_cpu(leftsib);
+        hdr->bb_rightsib = Be32::from_cpu(rightsib);
+    };
+    init_header(root, 1, 2, NULLAGBLOCK, NULLAGBLOCK);
+    init_header(left, 0, static_cast<uint16_t>(records_per_leaf), NULLAGBLOCK, right_block);
+    init_header(right, 0, static_cast<uint16_t>(records_per_leaf), left_block, NULLAGBLOCK);
+
+    for (int i = 0; i < records_per_leaf * 2; ++i) {
+        typename Traits::IRec const IREC{
+            .startblock = first_free + static_cast<xfs_agblock_t>(i * 2),
+            .blockcount = 1,
+        };
+        BufHead* leaf = i < records_per_leaf ? left : right;
+        int const leaf_index = i % records_per_leaf;
+        Traits::encode_rec(reinterpret_cast<typename Traits::Rec*>(leaf->data + Traits::HDR_LEN) + leaf_index, IREC);
+    }
+
+    uint32_t const MAX_KEYS = (mount->block_size - Traits::HDR_LEN) / static_cast<uint32_t>(Traits::KEY_LEN + Traits::PTR_LEN);
+    size_t const PTR_BASE = Traits::HDR_LEN + (static_cast<size_t>(MAX_KEYS) * Traits::KEY_LEN);
+    auto write_root_entry = [&](int index, xfs_agblock_t startblock, xfs_agblock_t child) {
+        XfsAllocKey key{};
+        key.ar_startblock = Be32::from_cpu(startblock);
+        key.ar_blockcount = Be32::from_cpu(1);
+        __builtin_memcpy(root->data + Traits::HDR_LEN + (static_cast<size_t>(index) * Traits::KEY_LEN), &key, sizeof(key));
+        Be32 const ptr = Be32::from_cpu(child);
+        __builtin_memcpy(root->data + PTR_BASE + (static_cast<size_t>(index) * Traits::PTR_LEN), &ptr, sizeof(ptr));
+    };
+    write_root_entry(0, first_free, left_block);
+    write_root_entry(1, first_free + static_cast<xfs_agblock_t>(records_per_leaf * 2), right_block);
+
+    brelse(root);
+    brelse(left);
+    brelse(right);
+    return true;
+}
 
 }  // namespace
 
@@ -1502,6 +1733,424 @@ auto xfs_selftest_full_agfl_allocation_drains_transactionally() -> bool {
         ok = ok && pag.agf_flcount == AGFL_SIZE && pag.agf_freeblks == FREE_LENGTH;
     }
     invalidate_bdev(&dev);
+    return ok;
+}
+
+auto xfs_selftest_empty_agfl_refill_rebalances() -> bool {
+    constexpr uint32_t BLOCK_SIZE = 4096;
+    constexpr uint32_t SECTOR_SIZE = 512;
+    constexpr uint32_t AG_BLOCKS = 4096;
+    constexpr xfs_agblock_t BNO_ROOT = 5;
+    constexpr xfs_agblock_t BNO_LEFT = 6;
+    constexpr xfs_agblock_t BNO_RIGHT = 7;
+    constexpr xfs_agblock_t CNT_ROOT = 8;
+    constexpr xfs_agblock_t CNT_LEFT = 9;
+    constexpr xfs_agblock_t CNT_RIGHT = 10;
+    constexpr xfs_agblock_t FIRST_FREE = 1000;
+    constexpr int MAX_LEAF_RECS = static_cast<int>((BLOCK_SIZE - XfsBnobtTraits::HDR_LEN) / XfsBnobtTraits::REC_LEN);
+    constexpr int MIN_LEAF_RECS = MAX_LEAF_RECS / 2;
+    constexpr uint32_t INITIAL_FREE = static_cast<uint32_t>(MIN_LEAF_RECS * 2);
+
+    ker::dev::BlockDevice dev{};
+    dev.block_size = SECTOR_SIZE;
+    dev.total_blocks = static_cast<uint64_t>(AG_BLOCKS) * (BLOCK_SIZE / SECTOR_SIZE);
+    dev.read_blocks = agfl_selftest_read;
+    dev.write_blocks = agfl_selftest_write;
+
+    XfsPerAG pag{};
+    pag.agno = 0;
+    pag.agf_length = AG_BLOCKS;
+    pag.agf_bno_root = BNO_ROOT;
+    pag.agf_cnt_root = CNT_ROOT;
+    pag.agf_bno_level = 2;
+    pag.agf_cnt_level = 2;
+    pag.agf_freeblks = INITIAL_FREE;
+    pag.agf_longest = 1;
+
+    XfsMountContext mount{};
+    mount.device = &dev;
+    mount.block_size = BLOCK_SIZE;
+    mount.block_log = 12;
+    mount.total_blocks = AG_BLOCKS;
+    mount.ag_count = 1;
+    mount.ag_blocks = AG_BLOCKS;
+    mount.ag_blk_log = 12;
+    mount.sect_size = SECTOR_SIZE;
+    mount.sect_log = 9;
+    mount.per_ag = &pag;
+
+    BufHead* ag0 = xfs_buf_get(&mount, 0);
+    if (ag0 == nullptr) {
+        invalidate_bdev(&dev);
+        return false;
+    }
+    __builtin_memset(ag0->data, 0, ag0->size);
+    auto* agf = reinterpret_cast<XfsAgf*>(ag0->data + SECTOR_SIZE);
+    agf->agf_magicnum = Be32::from_cpu(XFS_AGF_MAGIC);
+    agf->agf_bno_root = Be32::from_cpu(BNO_ROOT);
+    agf->agf_cnt_root = Be32::from_cpu(CNT_ROOT);
+    agf->agf_bno_level = Be32::from_cpu(2);
+    agf->agf_cnt_level = Be32::from_cpu(2);
+    agf->agf_freeblks = Be32::from_cpu(INITIAL_FREE);
+    agf->agf_longest = Be32::from_cpu(1);
+    auto* agfl = reinterpret_cast<XfsAgfl*>(ag0->data + (3U * SECTOR_SIZE));
+    agfl->agfl_magicnum = Be32::from_cpu(XFS_AGFL_MAGIC);
+    brelse(ag0);
+
+    bool ok = agfl_selftest_init_two_leaf_tree<XfsBnobtTraits>(&mount, BNO_ROOT, BNO_LEFT, BNO_RIGHT, FIRST_FREE, MIN_LEAF_RECS) &&
+              agfl_selftest_init_two_leaf_tree<XfsCntbtTraits>(&mount, CNT_ROOT, CNT_LEFT, CNT_RIGHT, FIRST_FREE, MIN_LEAF_RECS);
+    XfsTransaction* tp = ok ? xfs_trans_alloc(&mount) : nullptr;
+    if (tp == nullptr) {
+        ok = false;
+    } else {
+        uint32_t const RESERVE = agfl_reserve_blocks(&mount);
+        int const RC = agfl_refill(&mount, tp, 0);
+        ok = RC == 0 && pag.agf_flcount == RESERVE && pag.agf_freeblks == INITIAL_FREE - RESERVE && pag.agf_bno_root == BNO_LEFT &&
+             pag.agf_cnt_root == CNT_LEFT && pag.agf_bno_level == 1 && pag.agf_cnt_level == 1;
+        xfs_trans_cancel(tp);
+        ok = ok && pag.agf_flcount == 0 && pag.agf_freeblks == INITIAL_FREE && pag.agf_bno_root == BNO_ROOT &&
+             pag.agf_cnt_root == CNT_ROOT && pag.agf_bno_level == 2 && pag.agf_cnt_level == 2;
+    }
+
+    invalidate_bdev(&dev);
+    return ok;
+}
+
+auto xfs_selftest_free_space_tree_churn_preserves_topology() -> bool {
+    constexpr uint32_t BLOCK_SIZE = 4096;
+    constexpr uint32_t SECTOR_SIZE = 512;
+    constexpr uint32_t AG_BLOCKS = 131072;
+    constexpr xfs_agblock_t BNO_ROOT = 5;
+    constexpr xfs_agblock_t CNT_ROOT = 6;
+    constexpr xfs_agblock_t AGFL_FIRST_BLOCK = 100;
+    constexpr xfs_agblock_t FIRST_FRAGMENT = 1000;
+    constexpr uint32_t FRAGMENT_COUNT = 12000;
+    constexpr uint32_t ALLOCATION_COUNT = 6000;
+    constexpr uint32_t ALLOCATION_CYCLES = 2;
+    constexpr uint32_t BATCH_ALLOCATION_COUNT = ALLOCATION_COUNT;
+    constexpr uint32_t BATCH_CYCLES = 2;
+    constexpr uint32_t CACHE_RESET_INTERVAL = 512;
+    constexpr size_t CACHE_PRESSURE_MAX = size_t{4} * 1024 * 1024;
+    constexpr size_t DIRTY_PRESSURE_TARGET = size_t{64} * 1024;
+    constexpr size_t DIRTY_PRESSURE_HARD_LIMIT = size_t{128} * 1024;
+    constexpr xfs_agblock_t SEED_START = 120000;
+    constexpr xfs_extlen_t SEED_LENGTH = 8000;
+    constexpr xfs_fsblock_t LOG_START = 130000;
+    constexpr uint32_t LOG_BLOCKS = 512;
+
+    ker::dev::BlockDevice dev{};
+    dev.block_size = SECTOR_SIZE;
+    dev.total_blocks = static_cast<uint64_t>(AG_BLOCKS) * (BLOCK_SIZE / SECTOR_SIZE);
+    dev.read_blocks = agfl_selftest_read;
+    dev.write_blocks = agfl_selftest_write;
+    size_t const BACKING_SIZE = static_cast<size_t>(dev.total_blocks) * dev.block_size;
+    auto* backing_data = new (std::nothrow) uint8_t[BACKING_SIZE];
+    if (backing_data == nullptr) {
+        return false;
+    }
+    __builtin_memset(backing_data, 0, BACKING_SIZE);
+    AgflSelftestBacking backing{.data = backing_data, .size = BACKING_SIZE};
+    dev.private_data = &backing;
+
+    XfsPerAG pag{};
+    pag.agno = 0;
+    pag.agf_length = AG_BLOCKS;
+    pag.agf_bno_root = BNO_ROOT;
+    pag.agf_cnt_root = CNT_ROOT;
+    pag.agf_bno_level = 1;
+    pag.agf_cnt_level = 1;
+    pag.agf_freeblks = SEED_LENGTH;
+    pag.agf_longest = SEED_LENGTH;
+
+    XfsMountContext mount{};
+    mount.device = &dev;
+    mount.block_size = BLOCK_SIZE;
+    mount.block_log = 12;
+    mount.total_blocks = AG_BLOCKS;
+    mount.ag_count = 1;
+    mount.ag_blocks = AG_BLOCKS;
+    mount.ag_blk_log = 17;
+    mount.sect_size = SECTOR_SIZE;
+    mount.sect_log = 9;
+    mount.per_ag = &pag;
+    mount.log_start = LOG_START;
+    mount.log_blocks = LOG_BLOCKS;
+
+    uint32_t const AGFL_SIZE = xfs_agfl_size(&mount);
+    pag.agf_flfirst = 0;
+    pag.agf_fllast = AGFL_SIZE - 1;
+    pag.agf_flcount = AGFL_SIZE;
+
+    BufHead* ag0 = xfs_buf_get(&mount, 0);
+    BufHead* bno_root = xfs_buf_get(&mount, BNO_ROOT);
+    BufHead* cnt_root = xfs_buf_get(&mount, CNT_ROOT);
+    if (ag0 == nullptr || bno_root == nullptr || cnt_root == nullptr) {
+        if (ag0 != nullptr) {
+            brelse(ag0);
+        }
+        if (bno_root != nullptr) {
+            brelse(bno_root);
+        }
+        if (cnt_root != nullptr) {
+            brelse(cnt_root);
+        }
+        invalidate_bdev(&dev);
+        delete[] backing_data;
+        return false;
+    }
+
+    __builtin_memset(ag0->data, 0, ag0->size);
+    auto* agf = reinterpret_cast<XfsAgf*>(ag0->data + SECTOR_SIZE);
+    agf->agf_magicnum = Be32::from_cpu(XFS_AGF_MAGIC);
+    agf->agf_bno_root = Be32::from_cpu(BNO_ROOT);
+    agf->agf_cnt_root = Be32::from_cpu(CNT_ROOT);
+    agf->agf_bno_level = Be32::from_cpu(1);
+    agf->agf_cnt_level = Be32::from_cpu(1);
+    agf->agf_flfirst = Be32::from_cpu(0);
+    agf->agf_fllast = Be32::from_cpu(AGFL_SIZE - 1);
+    agf->agf_flcount = Be32::from_cpu(AGFL_SIZE);
+    agf->agf_freeblks = Be32::from_cpu(SEED_LENGTH);
+    agf->agf_longest = Be32::from_cpu(SEED_LENGTH);
+
+    auto* agfl = reinterpret_cast<XfsAgfl*>(ag0->data + (3U * SECTOR_SIZE));
+    agfl->agfl_magicnum = Be32::from_cpu(XFS_AGFL_MAGIC);
+    auto* agfl_bno = reinterpret_cast<Be32*>(reinterpret_cast<uint8_t*>(agfl) + sizeof(XfsAgfl));
+    for (uint32_t i = 0; i < AGFL_SIZE; ++i) {
+        agfl_bno[i] = Be32::from_cpu(AGFL_FIRST_BLOCK + i);
+    }
+
+    auto init_free_root = [&](BufHead* bh, uint32_t magic) {
+        __builtin_memset(bh->data, 0, bh->size);
+        auto* hdr = reinterpret_cast<XfsBtreeSblock*>(bh->data);
+        hdr->bb_magic = Be32::from_cpu(magic);
+        hdr->bb_level = Be16::from_cpu(0);
+        hdr->bb_numrecs = Be16::from_cpu(1);
+        hdr->bb_leftsib = Be32::from_cpu(NULLAGBLOCK);
+        hdr->bb_rightsib = Be32::from_cpu(NULLAGBLOCK);
+        auto* rec = reinterpret_cast<XfsAllocRec*>(bh->data + XFS_BTREE_SBLOCK_CRC_LEN);
+        rec->ar_startblock = Be32::from_cpu(SEED_START);
+        rec->ar_blockcount = Be32::from_cpu(SEED_LENGTH);
+    };
+    init_free_root(bno_root, XFS_ABTB_CRC_MAGIC);
+    init_free_root(cnt_root, XFS_ABTC_CRC_MAGIC);
+    bdirty(ag0);
+    bdirty(bno_root);
+    bdirty(cnt_root);
+    brelse(ag0);
+    brelse(bno_root);
+    brelse(cnt_root);
+    if (sync_bdev_range(&dev, 0, static_cast<size_t>(dev.total_blocks)) != 0) {
+        invalidate_bdev(&dev);
+        delete[] backing_data;
+        return false;
+    }
+    if (xfs_log_mount(&mount) != 0) {
+        invalidate_bdev(&dev);
+        delete[] backing_data;
+        return false;
+    }
+    invalidate_bdev(&dev);
+
+    BufferCacheStats const ORIGINAL_CACHE_STATS = buffer_cache_stats();
+    buffer_cache_selftest_set_limits(CACHE_PRESSURE_MAX, DIRTY_PRESSURE_TARGET, DIRTY_PRESSURE_HARD_LIMIT);
+
+    bool ok = true;
+    uint32_t completed = 0;
+    int last_rc = 0;
+    auto validate_current_trees = [&]() -> bool {
+        if (pag.agf_bno_level != 2 || pag.agf_cnt_level != 2) {
+            return true;
+        }
+        FreeTreeDigest bno_digest{};
+        FreeTreeDigest cnt_digest{};
+        bool const BNO_VALID = agfl_selftest_validate_two_level_tree<XfsBnobtTraits>(&mount, pag.agf_bno_root, &bno_digest);
+        bool const CNT_VALID = agfl_selftest_validate_two_level_tree<XfsCntbtTraits>(&mount, pag.agf_cnt_root, &cnt_digest);
+        return BNO_VALID && CNT_VALID && bno_digest.records == cnt_digest.records && bno_digest.blocks == cnt_digest.blocks &&
+               bno_digest.blocks == pag.agf_freeblks && bno_digest.sum == cnt_digest.sum && bno_digest.xor_value == cnt_digest.xor_value;
+    };
+    auto reset_cache = [&]() -> bool {
+        int rc = xfs_log_flush(&mount);
+        if (rc == 0) {
+            rc = sync_bdev_range(&dev, 0, static_cast<size_t>(dev.total_blocks));
+        }
+        invalidate_bdev(&dev);
+        return rc == 0 && validate_current_trees();
+    };
+    auto account_completed_operation = [&]() {
+        completed++;
+        if ((completed % CACHE_RESET_INTERVAL) == 0 && !reset_cache()) {
+            ok = false;
+            last_rc = -EIO;
+        }
+    };
+    for (uint32_t i = 0; ok && i < FRAGMENT_COUNT; ++i) {
+        XfsTransaction* tp = xfs_trans_alloc(&mount);
+        if (tp == nullptr) {
+            last_rc = -ENOMEM;
+            ok = false;
+            break;
+        }
+        constexpr uint32_t FRAGMENT_LENGTH_VARIANTS = 8;
+        constexpr uint32_t FRAGMENT_MIN_LENGTH = 1;
+        constexpr uint32_t FRAGMENT_CYCLE_BLOCKS = 44;
+        uint32_t const CYCLE = i / FRAGMENT_LENGTH_VARIANTS;
+        uint32_t const OFFSET = i % FRAGMENT_LENGTH_VARIANTS;
+        xfs_extlen_t const LENGTH = FRAGMENT_MIN_LENGTH + OFFSET;
+        xfs_agblock_t const BLOCK = FIRST_FRAGMENT + (CYCLE * FRAGMENT_CYCLE_BLOCKS) + ((OFFSET * (OFFSET + 3U)) / 2U);
+        int rc = xfs_free_extent(&mount, tp, 0, BLOCK, LENGTH);
+        if (rc == 0) {
+            rc = xfs_trans_commit(tp);
+        } else {
+            xfs_trans_cancel(tp);
+        }
+        last_rc = rc;
+        ok = rc == 0;
+        if (ok) {
+            account_completed_operation();
+        }
+    }
+
+    auto* allocations = new (std::nothrow) XfsAllocResult[ALLOCATION_COUNT];
+    if (allocations == nullptr) {
+        ok = false;
+        last_rc = -ENOMEM;
+    }
+    for (uint32_t cycle = 0; ok && cycle < ALLOCATION_CYCLES; ++cycle) {
+        for (uint32_t i = 0; ok && i < ALLOCATION_COUNT; ++i) {
+            XfsTransaction* tp = xfs_trans_alloc(&mount);
+            if (tp == nullptr) {
+                ok = false;
+                last_rc = -ENOMEM;
+                break;
+            }
+            XfsAllocReq const REQ{
+                .agno = 0,
+                .agbno = 0,
+                .minlen = 1,
+                .maxlen = 1,
+                .alignment = 1,
+            };
+            int rc = xfs_alloc_extent(&mount, tp, REQ, &allocations[i]);
+            if (rc == 0) {
+                rc = xfs_trans_commit(tp);
+            } else {
+                xfs_trans_cancel(tp);
+            }
+            last_rc = rc;
+            ok = rc == 0 && allocations[i].agno == 0 && allocations[i].len == 1;
+            if (ok) {
+                account_completed_operation();
+            }
+        }
+        for (uint32_t i = ALLOCATION_COUNT; ok && i > 0; --i) {
+            XfsAllocResult const& ALLOCATION = allocations[i - 1];
+            XfsTransaction* tp = xfs_trans_alloc(&mount);
+            if (tp == nullptr) {
+                ok = false;
+                last_rc = -ENOMEM;
+                break;
+            }
+            int rc = xfs_free_extent(&mount, tp, ALLOCATION.agno, ALLOCATION.agbno, ALLOCATION.len);
+            if (rc == 0) {
+                rc = xfs_trans_commit(tp);
+            } else {
+                xfs_trans_cancel(tp);
+            }
+            last_rc = rc;
+            ok = rc == 0;
+            if (ok) {
+                account_completed_operation();
+            }
+        }
+    }
+
+    for (uint32_t cycle = 0; ok && cycle < BATCH_CYCLES; ++cycle) {
+        XfsTransaction* tp = xfs_trans_alloc(&mount);
+        if (tp == nullptr) {
+            ok = false;
+            last_rc = -ENOMEM;
+            break;
+        }
+        int rc = 0;
+        for (uint32_t i = 0; rc == 0 && i < BATCH_ALLOCATION_COUNT; ++i) {
+            XfsAllocReq const REQ{
+                .agno = 0,
+                .agbno = 0,
+                .minlen = 1,
+                .maxlen = 1,
+                .alignment = 1,
+            };
+            rc = xfs_alloc_extent(&mount, tp, REQ, &allocations[i]);
+        }
+        if (rc == 0) {
+            rc = xfs_trans_commit(tp);
+        } else {
+            xfs_trans_cancel(tp);
+        }
+        last_rc = rc;
+        ok = rc == 0;
+        if (ok) {
+            completed += BATCH_ALLOCATION_COUNT;
+            if (!reset_cache()) {
+                ok = false;
+                last_rc = -EIO;
+            }
+        }
+
+        tp = ok ? xfs_trans_alloc(&mount) : nullptr;
+        if (ok && tp == nullptr) {
+            ok = false;
+            last_rc = -ENOMEM;
+            break;
+        }
+        rc = 0;
+        for (uint32_t i = BATCH_ALLOCATION_COUNT; ok && rc == 0 && i > 0; --i) {
+            XfsAllocResult const& ALLOCATION = allocations[i - 1];
+            rc = xfs_free_extent(&mount, tp, ALLOCATION.agno, ALLOCATION.agbno, ALLOCATION.len);
+        }
+        if (ok && rc == 0) {
+            rc = xfs_trans_commit(tp);
+        } else if (tp != nullptr) {
+            xfs_trans_cancel(tp);
+        }
+        last_rc = rc;
+        ok = ok && rc == 0;
+        if (ok) {
+            completed += BATCH_ALLOCATION_COUNT;
+            if (!reset_cache()) {
+                ok = false;
+                last_rc = -EIO;
+            }
+        }
+    }
+    delete[] allocations;
+
+    FreeTreeDigest bno_digest{};
+    FreeTreeDigest cnt_digest{};
+    bool const BNO_VALID = agfl_selftest_validate_two_level_tree<XfsBnobtTraits>(&mount, pag.agf_bno_root, &bno_digest);
+    bool const CNT_VALID = agfl_selftest_validate_two_level_tree<XfsCntbtTraits>(&mount, pag.agf_cnt_root, &cnt_digest);
+    bool const CONTENTS_MATCH = bno_digest.records == cnt_digest.records && bno_digest.blocks == cnt_digest.blocks &&
+                                bno_digest.blocks == pag.agf_freeblks && bno_digest.sum == cnt_digest.sum &&
+                                bno_digest.xor_value == cnt_digest.xor_value;
+    ok = ok && pag.agf_bno_level == 2 && pag.agf_cnt_level == 2 && BNO_VALID && CNT_VALID && CONTENTS_MATCH;
+    if (!ok) {
+        mod::dbg::logger<"xfs">::error(
+            "free-space churn failed completed=%u rc=%d freeblks=%u flcount=%u "
+            "bno=(root=%u levels=%u valid=%u records=%u blocks=%lu sum=%lu xor=%lu) "
+            "cnt=(root=%u levels=%u valid=%u records=%u blocks=%lu sum=%lu xor=%lu)",
+            completed, last_rc, pag.agf_freeblks, pag.agf_flcount, pag.agf_bno_root, pag.agf_bno_level, BNO_VALID ? 1U : 0U,
+            bno_digest.records, static_cast<unsigned long>(bno_digest.blocks), static_cast<unsigned long>(bno_digest.sum),
+            static_cast<unsigned long>(bno_digest.xor_value), pag.agf_cnt_root, pag.agf_cnt_level, CNT_VALID ? 1U : 0U, cnt_digest.records,
+            static_cast<unsigned long>(cnt_digest.blocks), static_cast<unsigned long>(cnt_digest.sum),
+            static_cast<unsigned long>(cnt_digest.xor_value));
+    }
+
+    xfs_log_unmount(&mount, false);
+    static_cast<void>(sync_bdev_range(&dev, 0, static_cast<size_t>(dev.total_blocks)));
+    buffer_cache_selftest_set_limits(ORIGINAL_CACHE_STATS.max_bytes, ORIGINAL_CACHE_STATS.dirty_target_bytes,
+                                     ORIGINAL_CACHE_STATS.dirty_hard_bytes);
+    invalidate_bdev(&dev);
+    delete[] backing_data;
     return ok;
 }
 #endif

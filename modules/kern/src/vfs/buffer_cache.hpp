@@ -235,6 +235,7 @@ auto reclaim_clean_buffer_cache_for_pressure(size_t byte_budget) -> size_t;
 auto buffer_cache_selftest_choose_cache_max_bytes(uint64_t total_mem) -> size_t;
 auto buffer_cache_selftest_choose_dirty_target_bytes(uint64_t total_mem, size_t max_bytes) -> size_t;
 auto buffer_cache_selftest_choose_dirty_hard_bytes(size_t target_bytes, size_t max_bytes) -> size_t;
+void buffer_cache_selftest_set_limits(size_t max_bytes, size_t dirty_target, size_t dirty_hard);
 #endif
 
 }  // namespace ker::vfs

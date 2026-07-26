@@ -495,6 +495,15 @@ auto bmbt_ceil_div(uint32_t value, uint32_t divisor) -> uint32_t {
     return 1U + ((value - 1U) / divisor);
 }
 
+auto bmbt_balanced_bucket_size(uint32_t item_count, uint32_t bucket_count, uint32_t bucket) -> uint32_t {
+    if (item_count == 0 || bucket_count == 0 || bucket >= bucket_count || bucket_count > item_count) {
+        return 0;
+    }
+    uint32_t const BASE = item_count / bucket_count;
+    uint32_t const REMAINDER = item_count % bucket_count;
+    return BASE + (bucket < REMAINDER ? 1U : 0U);
+}
+
 // Rebuilding a bmbt logs more than the new bmbt blocks: the inode buffer is
 // written during commit, and allocation/freeing can touch AG free-space blocks.
 constexpr uint32_t BMBT_REBUILD_TRANSACTION_HEADROOM = 8;
@@ -867,7 +876,11 @@ auto build_bmbt_tree(XfsInode* ip, XfsTransaction* tp, const XfsBmbtIrec* extent
             return rc;
         }
 
-        uint32_t const RECS = std::min<uint32_t>(LEAF_CAPACITY, extent_count - extent_index);
+        uint32_t const RECS = bmbt_balanced_bucket_size(extent_count, LEAF_COUNT, leaf);
+        if (RECS == 0 || RECS > LEAF_CAPACITY) {
+            cleanup_levels();
+            return -EIO;
+        }
         auto* hdr = reinterpret_cast<XfsBtreeLblock*>(levels[0].bufs[leaf]->data);
         hdr->bb_numrecs = Be16::from_cpu(static_cast<uint16_t>(RECS));
         levels[0].first_recs[leaf] = extents[extent_index];
@@ -911,7 +924,11 @@ auto build_bmbt_tree(XfsInode* ip, XfsTransaction* tp, const XfsBmbtIrec* extent
             }
 
             uint32_t const FIRST_CHILD = child_index;
-            uint32_t const RECS = std::min<uint32_t>(NODE_CAPACITY, child_level.count - child_index);
+            uint32_t const RECS = bmbt_balanced_bucket_size(child_level.count, PARENT_COUNT, parent);
+            if (RECS == 0 || RECS > NODE_CAPACITY) {
+                cleanup_levels();
+                return -EIO;
+            }
             auto* hdr = reinterpret_cast<XfsBtreeLblock*>(parent_level.bufs[parent]->data);
             hdr->bb_numrecs = Be16::from_cpu(static_cast<uint16_t>(RECS));
             parent_level.first_recs[parent] = child_level.first_recs[FIRST_CHILD];
@@ -1915,6 +1932,56 @@ auto xfs_selftest_bmap_extent_promotion() -> bool {
         inode.data_fork.btree.root_size != EXPECTED_ROOT_SIZE || inode.data_fork.btree.root == nullptr) {
         return cleanup(false);
     }
+    auto level_two_occupancy_valid = [&](uint32_t expected_extents) -> bool {
+        if (inode.data_fork.format != XFS_DINODE_FMT_BTREE || inode.data_fork.btree.level != 2 || inode.data_fork.btree.numrecs != 1 ||
+            inode.data_fork.btree.root == nullptr) {
+            return false;
+        }
+
+        Be64 internal_ptr{};
+        __builtin_memcpy(&internal_ptr, bmdr_ptr_addr(inode.data_fork.btree.root, BMDR_MAXRECS, 0), sizeof(internal_ptr));
+        if (internal_ptr.to_cpu() == NULLFSBLOCK) {
+            return false;
+        }
+        BufHead* internal = xfs_buf_read(&mount, internal_ptr.to_cpu());
+        if (internal == nullptr) {
+            return false;
+        }
+        const auto* internal_hdr = reinterpret_cast<const XfsBtreeLblock*>(internal->data);
+        uint32_t const LEAF_COUNT = bmbt_ceil_div(expected_extents, LEAF_CAPACITY);
+        bool ok = internal_hdr->bb_magic.to_cpu() == XFS_BMAP_CRC_MAGIC && internal_hdr->bb_level.to_cpu() == 1 &&
+                  internal_hdr->bb_numrecs.to_cpu() == LEAF_COUNT;
+        uint32_t total_recs = 0;
+        xfs_fsblock_t previous = NULLFSBLOCK;
+        xfs_fsblock_t expected_from_previous = NULLFSBLOCK;
+        for (uint32_t i = 0; ok && i < LEAF_COUNT; i++) {
+            Be64 child_ptr{};
+            __builtin_memcpy(&child_ptr, internal->data + bmbt_node_ptr_offset(&mount, i), sizeof(child_ptr));
+            xfs_fsblock_t const CHILD = child_ptr.to_cpu();
+            if (CHILD == NULLFSBLOCK || (i > 0 && CHILD != expected_from_previous)) {
+                ok = false;
+                break;
+            }
+
+            BufHead* leaf = xfs_buf_read(&mount, CHILD);
+            if (leaf == nullptr) {
+                ok = false;
+                break;
+            }
+            const auto* leaf_hdr = reinterpret_cast<const XfsBtreeLblock*>(leaf->data);
+            uint32_t const RECS = leaf_hdr->bb_numrecs.to_cpu();
+            uint32_t const MIN_RECS = LEAF_CAPACITY / 2U;
+            ok = leaf_hdr->bb_magic.to_cpu() == XFS_BMAP_CRC_MAGIC && leaf_hdr->bb_level.to_cpu() == 0 &&
+                 leaf_hdr->bb_leftsib.to_cpu() == previous && RECS <= LEAF_CAPACITY && (LEAF_COUNT == 1 || RECS >= MIN_RECS);
+            total_recs += RECS;
+            previous = CHILD;
+            expected_from_previous = leaf_hdr->bb_rightsib.to_cpu();
+            brelse(leaf);
+        }
+        ok = ok && total_recs == expected_extents && expected_from_previous == NULLFSBLOCK;
+        brelse(internal);
+        return ok;
+    };
     Be64 promoted_child{};
     __builtin_memcpy(&promoted_child, bmdr_ptr_addr(inode.data_fork.btree.root, BMDR_MAXRECS, 0), sizeof(promoted_child));
     // File bmap metadata must come from the AGFL.  Allocating it from the
@@ -2094,6 +2161,9 @@ auto xfs_selftest_bmap_extent_promotion() -> bool {
     if (inode.data_fork.btree.level != 2 || inode.data_fork.btree.numrecs != 1 || inode.nblocks != 3) {
         return cleanup(false);
     }
+    if (!level_two_occupancy_valid(TARGET_EXTENTS)) {
+        return cleanup(false);
+    }
     Be64 internal_root_ptr{};
     __builtin_memcpy(&internal_root_ptr, bmdr_ptr_addr(inode.data_fork.btree.root, BMDR_MAXRECS, 0), sizeof(internal_root_ptr));
     if (internal_root_ptr.to_cpu() == NULLFSBLOCK) {
@@ -2148,6 +2218,9 @@ auto xfs_selftest_bmap_extent_promotion() -> bool {
     }
 
     if (inode.data_fork.btree.level != expected_bmdr_level(RELOAD_TARGET_EXTENTS) || inode.nblocks != RELOAD_METADATA_BLOCKS) {
+        return cleanup(false);
+    }
+    if (!level_two_occupancy_valid(RELOAD_TARGET_EXTENTS)) {
         return cleanup(false);
     }
 

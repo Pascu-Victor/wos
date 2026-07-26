@@ -60,6 +60,8 @@ auto xfs_alloc_ensure_freelist_headroom(XfsMountContext* mount, XfsTransaction* 
 #ifdef WOS_SELFTEST
 auto xfs_selftest_agfl_skips_live_allocation_btree_blocks() -> bool;
 auto xfs_selftest_full_agfl_allocation_drains_transactionally() -> bool;
+auto xfs_selftest_empty_agfl_refill_rebalances() -> bool;
+auto xfs_selftest_free_space_tree_churn_preserves_topology() -> bool;
 #endif
 
 }  // namespace ker::vfs::xfs

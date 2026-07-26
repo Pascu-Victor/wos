@@ -21,6 +21,7 @@
 #include <platform/ktime/ktime.hpp>
 #include <platform/mm/phys.hpp>
 #include <platform/perf/perf_events.hpp>
+#include <platform/sched/scheduler.hpp>
 #include <platform/sys/mutex.hpp>
 #include <platform/sys/spinlock.hpp>
 #include <util/crc32c.hpp>
@@ -521,13 +522,14 @@ auto free_inode_data_extent(XfsInode* ip, XfsTransaction* tp, xfs_fsblock_t star
     size_t const DEV_COUNT = inode_fsb_to_dev_count(mount, blockcount);
 
     if (mount->device != nullptr) {
-        discard_bdev_range(mount->device, DEV_BLOCK, DEV_COUNT);
-        if (has_dirty_bdev_range(mount->device, DEV_BLOCK, DEV_COUNT)) {
-            int const SYNC_RC = sync_bdev_range(mount->device, DEV_BLOCK, DEV_COUNT);
-            if (SYNC_RC != 0) {
-                return SYNC_RC;
-            }
-            discard_bdev_range(mount->device, DEV_BLOCK, DEV_COUNT);
+        // A file-data alias may still be referenced even after its inode I/O
+        // lock excludes new readers and writers.  Merely discarding
+        // unreferenced buffers would let that alias survive block reuse and
+        // later overwrite allocation-btree metadata.  Retire the complete
+        // range atomically; retry only while an already-issued device write
+        // is finishing.
+        while (!retire_bdev_range(mount->device, DEV_BLOCK, DEV_COUNT)) {
+            ker::mod::sched::kern_yield();
         }
     }
 
@@ -544,20 +546,24 @@ auto free_inode_data_extent(XfsInode* ip, XfsTransaction* tp, xfs_fsblock_t star
 
         int const HEADROOM_RC = xfs_alloc_ensure_freelist_headroom(mount, tp, agno);
         if (HEADROOM_RC != 0) {
+            mod::dbg::logger<"xfs">::error("inode data free failed stage=agfl-headroom ino=%lu agno=%u agbno=%u span=%lu flcount=%u rc=%d",
+                                           static_cast<unsigned long>(ip->ino), agno, agbno, static_cast<unsigned long>(SPAN),
+                                           mount->per_ag != nullptr ? mount->per_ag[agno].agf_flcount : 0, HEADROOM_RC);
             return HEADROOM_RC;
         }
         int const RC = xfs_free_extent(mount, tp, agno, agbno, static_cast<xfs_extlen_t>(SPAN));
         if (RC != 0) {
+            mod::dbg::logger<"xfs">::error(
+                "inode data free failed stage=free-extent ino=%lu agno=%u agbno=%u span=%lu flcount=%u freeblks=%u rc=%d",
+                static_cast<unsigned long>(ip->ino), agno, agbno, static_cast<unsigned long>(SPAN),
+                mount->per_ag != nullptr ? mount->per_ag[agno].agf_flcount : 0,
+                mount->per_ag != nullptr ? mount->per_ag[agno].agf_freeblks : 0, RC);
             return RC;
         }
 
         remaining -= SPAN;
         agno++;
         agbno = 0;
-    }
-
-    if (mount->device != nullptr) {
-        discard_bdev_range(mount->device, DEV_BLOCK, DEV_COUNT);
     }
 
     return 0;

@@ -3808,6 +3808,19 @@ auto buffer_cache_selftest_choose_dirty_target_bytes(uint64_t total_mem, size_t 
 auto buffer_cache_selftest_choose_dirty_hard_bytes(size_t target_bytes, size_t max_bytes) -> size_t {
     return choose_dirty_hard_limit_bytes(target_bytes, max_bytes);
 }
+
+void buffer_cache_selftest_set_limits(size_t max_bytes, size_t dirty_target, size_t dirty_hard) {
+    bool should_writeback = false;
+    uint64_t const IRQFLAGS = cache_lock.lock_irqsave();
+    cache_max_bytes = std::max(max_bytes, static_cast<size_t>(1));
+    dirty_target_bytes = std::min(dirty_target, cache_max_bytes);
+    dirty_hard_limit_bytes = std::clamp(dirty_hard, dirty_target_bytes, cache_max_bytes);
+    should_writeback = dirty_bytes_above_target_locked();
+    cache_lock.unlock_irqrestore(IRQFLAGS);
+    if (should_writeback) {
+        static_cast<void>(request_dirty_writeback());
+    }
+}
 #endif
 
 }  // namespace ker::vfs

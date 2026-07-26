@@ -973,17 +973,24 @@ auto btree_insert_into_parent(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp, i
                               uint64_t left_ptr, uint64_t new_ptr, uint64_t root_block, uint8_t nlevels, uint64_t* new_root,
                               uint8_t* new_nlevels) -> int {
     if (left_ptr == new_ptr) {
-        mod::dbg::log("[xfs btree] split child aliases new child magic=0x%x block=%lu level=%d\n", Traits::MAGIC,
-                      static_cast<unsigned long>(left_ptr), lev);
+        mod::dbg::logger<"xfs">::error("btree parent insert failed reason=child-alias magic=0x%x child=%lu level=%d", Traits::MAGIC,
+                                       static_cast<unsigned long>(left_ptr), lev);
         return -EIO;
     }
     if (lev == cur->nlevels) {
         if (nlevels >= XFS_BTREE_MAXLEVELS) {
+            mod::dbg::logger<"xfs">::error("btree parent insert failed reason=max-depth magic=0x%x root=%lu levels=%u", Traits::MAGIC,
+                                           static_cast<unsigned long>(root_block), nlevels);
             return -EIO;
         }
 
         // Need a new root one level above the current root.
         BufHead const* old_root_bp = cur->level_at(nlevels - 1).bp;
+        if (old_root_bp == nullptr) {
+            mod::dbg::logger<"xfs">::error("btree parent insert failed reason=missing-old-root magic=0x%x root=%lu levels=%u",
+                                           Traits::MAGIC, static_cast<unsigned long>(root_block), nlevels);
+            return -EIO;
+        }
         uint64_t const OWNER = btree_owner(cur);
 
         BufHead* new_root_bp = nullptr;
@@ -1010,6 +1017,9 @@ auto btree_insert_into_parent(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp, i
 
         // Two pointers (layout: after 2 keys)
         if (left_ptr != root_block) {
+            mod::dbg::logger<"xfs">::error(
+                "btree parent insert failed reason=root-child-mismatch magic=0x%x root=%lu left=%lu right=%lu levels=%u", Traits::MAGIC,
+                static_cast<unsigned long>(root_block), static_cast<unsigned long>(left_ptr), static_cast<unsigned long>(new_ptr), nlevels);
             brelse(new_root_bp);
             return -EIO;
         }
@@ -1034,6 +1044,8 @@ auto btree_insert_into_parent(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp, i
     // We have a parent block at level_at(lev)
     BufHead* parent_bp = cur->level_at(lev).bp;
     if (parent_bp == nullptr) {
+        mod::dbg::logger<"xfs">::error("btree parent insert failed reason=missing-parent magic=0x%x root=%lu level=%d levels=%u",
+                                       Traits::MAGIC, static_cast<unsigned long>(root_block), lev, nlevels);
         return -EIO;
     }
     int const CAPTURE_RC = xfs_trans_capture_buf(tp, parent_bp);
@@ -1052,18 +1064,28 @@ auto btree_insert_into_parent(XfsBtreeCursor<Traits>* cur, XfsTransaction* tp, i
     for (int pos = 1; pos <= PARENT_NR; ++pos) {
         uint64_t const CHILD = cur->ptr_at(lev, pos);
         if (CHILD == new_ptr) {
-            mod::dbg::log("[xfs btree] parent already references new child magic=0x%x block=%lu level=%d pos=%d\n", Traits::MAGIC,
-                          static_cast<unsigned long>(new_ptr), lev, pos);
+            mod::dbg::logger<"xfs">::error(
+                "btree parent insert failed reason=new-child-already-indexed magic=0x%x root=%lu child=%lu level=%d pos=%d records=%d",
+                Traits::MAGIC, static_cast<unsigned long>(root_block), static_cast<unsigned long>(new_ptr), lev, pos, PARENT_NR);
             return -EIO;
         }
         if (CHILD == left_ptr) {
             if (left_pos != 0) {
+                mod::dbg::logger<"xfs">::error(
+                    "btree parent insert failed reason=left-child-duplicated magic=0x%x root=%lu child=%lu level=%d first=%d second=%d "
+                    "records=%d",
+                    Traits::MAGIC, static_cast<unsigned long>(root_block), static_cast<unsigned long>(left_ptr), lev, left_pos, pos,
+                    PARENT_NR);
                 return -EIO;
             }
             left_pos = pos;
         }
     }
     if (left_pos == 0) {
+        mod::dbg::logger<"xfs">::error(
+            "btree parent insert failed reason=left-child-missing magic=0x%x root=%lu left=%lu right=%lu level=%d records=%d",
+            Traits::MAGIC, static_cast<unsigned long>(root_block), static_cast<unsigned long>(left_ptr),
+            static_cast<unsigned long>(new_ptr), lev, PARENT_NR);
         return -EIO;
     }
     cur->level_at(lev).ptr = left_pos;

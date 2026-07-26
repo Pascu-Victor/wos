@@ -261,7 +261,8 @@ def test_free_space_allocators_validate_dual_indexes_before_delete() -> None:
             "XfsBtreeLookup::EQ",
             "same_free_extent(CNT_REC.startblock, CNT_REC.blockcount, BNO_REC.startblock, BNO_REC.blockcount)",
             "rc = delete_btree_record(&bno_cur, tp, &pag->agf_bno_root, &pag->agf_bno_level);",
-            "return delete_btree_record(&cnt_cur, tp, &pag->agf_cnt_root, &pag->agf_cnt_level);",
+            "rc = delete_btree_record(&cnt_cur, tp, &pag->agf_cnt_root, &pag->agf_cnt_level);",
+            "return rc;",
         ],
         "free-space coalescing must validate both indexes before deleting either record",
     )

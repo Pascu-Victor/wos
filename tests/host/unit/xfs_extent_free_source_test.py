@@ -46,7 +46,7 @@ def require_order(source: str, tokens: list[str], context: str) -> None:
         cursor = found + len(token)
 
 
-def test_extent_free_drains_dirty_buffers_before_reuse() -> None:
+def test_extent_free_retires_every_cache_alias_before_reuse() -> None:
     source = XFS_INODE.read_text()
     body = function_body(source, "free_inode_data_extent")
 
@@ -55,16 +55,17 @@ def test_extent_free_drains_dirty_buffers_before_reuse() -> None:
         [
             "uint64_t const DEV_BLOCK = inode_fsblock_to_dev_block(mount, startblock);",
             "size_t const DEV_COUNT = inode_fsb_to_dev_count(mount, blockcount);",
-            "sync_bdev_range(mount->device, DEV_BLOCK, DEV_COUNT);",
+            "while (!retire_bdev_range(mount->device, DEV_BLOCK, DEV_COUNT))",
             "xfs_free_extent(mount, tp, agno, agbno, static_cast<xfs_extlen_t>(SPAN));",
-            "discard_bdev_range(mount->device, DEV_BLOCK, DEV_COUNT);",
         ],
-        "extent free must drain dirty buffers before freeing and discard cache after freeing",
+        "extent free must retire pinned, dirty, and overlapping cache aliases before freeing",
     )
+    if "discard_bdev_range(mount->device, DEV_BLOCK, DEV_COUNT)" in body:
+        fail("extent free must not leave pinned aliases reachable through discard-only invalidation")
 
 
 def main() -> None:
-    test_extent_free_drains_dirty_buffers_before_reuse()
+    test_extent_free_retires_every_cache_alias_before_reuse()
 
 
 if __name__ == "__main__":
