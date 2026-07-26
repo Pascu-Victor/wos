@@ -133,7 +133,26 @@ auto memmove(void* __dest, const void* __src, size_t __size) -> void* {
         return __dest;
     }
 
-    if (dst < src || dst >= src + __size) {
+    auto const DST_ADDR = reinterpret_cast<uintptr_t>(dst);
+    auto const SRC_ADDR = reinterpret_cast<uintptr_t>(src);
+    if (DST_ADDR < SRC_ADDR) {
+        if (__size <= SRC_ADDR - DST_ADDR) {
+            return memcpy(__dest, __src, __size);
+        }
+
+        // memcpy_tiny deliberately uses overlapping head/tail stores and
+        // therefore cannot implement an overlapping forward move. Keep the
+        // direction flag clear and copy from low to high addresses.
+        asm volatile(
+            "cld\n\t"
+            "rep movsb\n\t"
+            : "+D"(dst), "+S"(src), "+c"(__size)
+            :
+            : "memory", "cc");
+        return __dest;
+    }
+
+    if (__size <= DST_ADDR - SRC_ADDR) {
         return memcpy(__dest, __src, __size);
     }
 

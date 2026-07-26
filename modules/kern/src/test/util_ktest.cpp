@@ -22,6 +22,64 @@ KTEST(String, StrncmpStopsAtNul) {
     KEXPECT_EQ(runtime_strncmp(lhs.data(), rhs.data(), lhs.size()), 0);
 }
 
+KTEST(Memory, MemmoveForwardOverlapPreservesSource) {
+    using MemmoveFn = void* (*)(void*, const void*, std::size_t);
+    MemmoveFn volatile runtime_memmove = static_cast<MemmoveFn>(&std::memmove);
+
+    bool valid = true;
+    for (size_t size = 1; size <= 128 && valid; ++size) {
+        for (size_t distance = 1; distance < size && valid; ++distance) {
+            std::array<uint8_t, 272> actual{};
+            std::array<uint8_t, 272> expected{};
+            for (size_t i = 0; i < actual.size(); ++i) {
+                actual[i] = static_cast<uint8_t>(i);
+                expected[i] = static_cast<uint8_t>(i);
+            }
+
+            constexpr size_t DST = 8;
+            size_t const SRC = DST + distance;
+            for (size_t i = 0; i < size; ++i) {
+                expected[DST + i] = static_cast<uint8_t>(SRC + i);
+            }
+
+            valid = runtime_memmove(actual.data() + DST, actual.data() + SRC, size) == actual.data() + DST;
+            for (size_t i = 0; i < actual.size() && valid; ++i) {
+                valid = actual[i] == expected[i];
+            }
+        }
+    }
+    KEXPECT_TRUE(valid);
+}
+
+KTEST(Memory, MemmoveBackwardOverlapPreservesSource) {
+    using MemmoveFn = void* (*)(void*, const void*, std::size_t);
+    MemmoveFn volatile runtime_memmove = static_cast<MemmoveFn>(&std::memmove);
+
+    bool valid = true;
+    for (size_t size = 1; size <= 128 && valid; ++size) {
+        for (size_t distance = 1; distance < size && valid; ++distance) {
+            std::array<uint8_t, 272> actual{};
+            std::array<uint8_t, 272> expected{};
+            for (size_t i = 0; i < actual.size(); ++i) {
+                actual[i] = static_cast<uint8_t>(i);
+                expected[i] = static_cast<uint8_t>(i);
+            }
+
+            constexpr size_t SRC = 8;
+            size_t const DST = SRC + distance;
+            for (size_t i = 0; i < size; ++i) {
+                expected[DST + i] = static_cast<uint8_t>(SRC + i);
+            }
+
+            valid = runtime_memmove(actual.data() + DST, actual.data() + SRC, size) == actual.data() + DST;
+            for (size_t i = 0; i < actual.size() && valid; ++i) {
+                valid = actual[i] == expected[i];
+            }
+        }
+    }
+    KEXPECT_TRUE(valid);
+}
+
 // ---------------------------------------------------------------------------
 // Bitmap tests
 // ---------------------------------------------------------------------------
