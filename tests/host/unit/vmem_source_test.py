@@ -450,6 +450,46 @@ def test_user_memory_pressure_does_not_enter_fatal_oom() -> None:
     )
 
 
+def test_file_mmap_cache_is_sharded_without_changing_page_ownership() -> None:
+    vmem = SYS_VMEM_CPP.read_text()
+    require_tokens(
+        vmem,
+        [
+            "constexpr size_t FILE_MMAP_CACHE_LOCK_COUNT = 256",
+            "struct alignas(64) FileMmapCacheLock",
+            "std::array<FileMmapCacheLock, FILE_MMAP_CACHE_LOCK_COUNT> g_file_mmap_cache_locks{}",
+            "size_t const LOCK_INDEX = SET_INDEX & (FILE_MMAP_CACHE_LOCK_COUNT - 1)",
+        ],
+        "sharded file mmap cache",
+    )
+    if re.search(r"\bg_file_mmap_cache_lock\b", vmem) or re.search(r"\bg_file_mmap_cache_clock\b", vmem):
+        fail("file mmap cache must not retain its global lock or timestamp atomic")
+
+    lookup = function_body(vmem, "file_mmap_cache_lookup")
+    require_ordered_tokens(
+        lookup,
+        [
+            "cache_lock.mutex.lock()",
+            "ker::mod::mm::phys::page_ref_inc(entry.page)",
+            "cache_lock.mutex.unlock()",
+            "return page",
+        ],
+        "file mmap cache lookup page ownership",
+    )
+
+    insert = function_body(vmem, "file_mmap_cache_insert_or_discard")
+    require_ordered_tokens(
+        insert,
+        [
+            "ker::mod::mm::phys::page_ref_inc(new_page)",
+            "*page_for_mapping = new_page",
+            "cache_lock.mutex.unlock()",
+            "ker::mod::mm::phys::page_ref_dec(evicted)",
+        ],
+        "file mmap cache insertion page ownership",
+    )
+
+
 def test_default_writable_anon_mmap_is_demand_paged() -> None:
     vmem = SYS_VMEM_CPP.read_text()
     abi = VMEM_ABI_HPP.read_text()

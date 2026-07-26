@@ -991,6 +991,24 @@ def test_private_pagemap_gc_skips_global_sibling_scans() -> None:
     )
 
 
+def test_last_shared_pagemap_publisher_owns_gc_teardown() -> None:
+    source = SCHEDULER_CPP.read_text()
+    body = function_body(source, "detach_next_reclaimable_task_locked")
+
+    require_tokens(
+        body,
+        [
+            "if (cur->pagemap != nullptr && cur->type != task::TaskType::DAEMON)",
+            "should_free_pagemap = !gc_task_has_pagemap_sibling_locked(cur);",
+        ],
+        "last shared-pagemap publisher GC ownership",
+    )
+    if body.count("if (cur->pagemap != nullptr && cur->type != task::TaskType::DAEMON)") < 2:
+        fail("both waitable-zombie and final task teardown must assign shared pagemap ownership to the last publisher")
+    if "cur->type != task::TaskType::DAEMON && !cur->is_thread" in body:
+        fail("the final user thread must be allowed to reclaim a shared pagemap after its process leader is gone")
+
+
 def test_active_registry_uses_cached_dense_slot_for_constant_time_updates() -> None:
     source = SCHEDULER_CPP.read_text()
     task_header = TASK_HPP.read_text()
@@ -2310,6 +2328,7 @@ def main() -> None:
     test_execve_publishes_new_context_before_old_image_teardown()
     test_pagemap_sibling_check_includes_dead_publishers()
     test_private_pagemap_gc_skips_global_sibling_scans()
+    test_last_shared_pagemap_publisher_owns_gc_teardown()
     test_active_registry_uses_cached_dense_slot_for_constant_time_updates()
     test_process_syscall_reschedules_defer_to_syscall_exit()
     test_scheduler_timer_disarm_clears_pending_reschedule_token()

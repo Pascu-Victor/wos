@@ -144,6 +144,65 @@ def test_coredump_file_is_private_writable_and_truncated() -> None:
     )
 
 
+def test_coredump_worker_releases_stolen_elf_buffer() -> None:
+    source = COREDUMP_CPP.read_text()
+
+    require_tokens(
+        source,
+        [
+            "if (req.elf_buffer_shared) {",
+            "ker::net::wki::wki_remote_compute_release_elf_buffer(req.elf_buffer);",
+            "} else {",
+            "delete[] req.elf_buffer;",
+            "req.elf_buffer = nullptr;",
+            "req.elf_buffer_size = 0;",
+            "req.elf_buffer_shared = false;",
+        ],
+        "coredump worker ELF buffer ownership",
+    )
+
+
+def test_coredump_ring_has_explicit_slot_ownership_and_no_sequence_holes() -> None:
+    source = COREDUMP_CPP.read_text()
+    producer = function_body(source, "try_write_for_task")
+    consumer = function_body(source, "coredump_task_fn")
+
+    require_tokens(
+        source,
+        [
+            "enum class CoreDumpSlotState : uint8_t",
+            "EMPTY,",
+            "WRITING,",
+            "READY,",
+            "std::atomic<CoreDumpSlotState> state{CoreDumpSlotState::EMPTY};",
+            "uint32_t g_consume_cursor{0};",
+        ],
+        "coredump ring slot ownership",
+    )
+    require_tokens(
+        producer,
+        [
+            "for (uint32_t offset = 0; offset < RING_SIZE; ++offset)",
+            "candidate.state.compare_exchange_strong(expected, CoreDumpSlotState::WRITING",
+            "slot->state.store(CoreDumpSlotState::EMPTY, std::memory_order_release);",
+            "slot->state.store(CoreDumpSlotState::READY, std::memory_order_release);",
+        ],
+        "coredump producer bounded claim and publication",
+    )
+    require_tokens(
+        consumer,
+        [
+            "for (uint32_t offset = 0; offset < RING_SIZE; ++offset)",
+            "slot.state.load(std::memory_order_acquire) != CoreDumpSlotState::READY",
+            "slot.state.store(CoreDumpSlotState::EMPTY, std::memory_order_release);",
+            "g_consume_cursor = (IDX + 1) % RING_SIZE;",
+        ],
+        "coredump consumer scans around dropped requests",
+    )
+    if ".ready" in source or "g_read_seq" in source:
+        fail("coredump ring must not use a racy ready bit or sequential read sequence")
+
+
 def test_signal_targets_are_user_canonical_on_all_delivery_paths() -> None:
     signal_source = SIGNAL_CPP.read_text()
 
@@ -345,6 +404,8 @@ if __name__ == "__main__":
     test_syscall_signal_delivery_updates_live_gs_scratch()
     test_signal_iret_preserves_restored_user_r11()
     test_coredump_file_is_private_writable_and_truncated()
+    test_coredump_worker_releases_stolen_elf_buffer()
+    test_coredump_ring_has_explicit_slot_ownership_and_no_sequence_holes()
     test_signal_targets_are_user_canonical_on_all_delivery_paths()
     test_interrupt_signal_delivery_is_gated_by_user_return_frame()
     test_synchronous_user_exceptions_can_reach_installed_signal_handlers_before_coredump()

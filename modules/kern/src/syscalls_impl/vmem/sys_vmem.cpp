@@ -151,10 +151,22 @@ enum class FileMmapCacheInsertResult : uint8_t {
 constexpr size_t FILE_MMAP_CACHE_SET_COUNT = 32768;
 constexpr size_t FILE_MMAP_CACHE_WAYS = 4;
 constexpr size_t FILE_MMAP_CACHE_PAGES = FILE_MMAP_CACHE_SET_COUNT * FILE_MMAP_CACHE_WAYS;
+constexpr size_t FILE_MMAP_CACHE_LOCK_COUNT = 256;
 static_assert((FILE_MMAP_CACHE_SET_COUNT & (FILE_MMAP_CACHE_SET_COUNT - 1)) == 0);
+static_assert((FILE_MMAP_CACHE_LOCK_COUNT & (FILE_MMAP_CACHE_LOCK_COUNT - 1)) == 0);
+static_assert(FILE_MMAP_CACHE_LOCK_COUNT <= FILE_MMAP_CACHE_SET_COUNT);
+
+// Faults for unrelated executable and source pages must not bounce one global
+// mutex or timestamp cache line across every CPU. Each set maps to exactly one
+// cache-line-isolated lock and clock, so entry ownership remains unchanged.
+struct alignas(64) FileMmapCacheLock {
+    ker::mod::sys::Mutex mutex;
+    uint64_t clock = 0;
+};
+
+static_assert(sizeof(FileMmapCacheLock) % 64 == 0);
 std::array<FileMmapPageCacheSet, FILE_MMAP_CACHE_SET_COUNT> g_file_mmap_cache{};
-ker::mod::sys::Mutex g_file_mmap_cache_lock;
-std::atomic<uint64_t> g_file_mmap_cache_clock{0};
+std::array<FileMmapCacheLock, FILE_MMAP_CACHE_LOCK_COUNT> g_file_mmap_cache_locks{};
 ker::util::SmallVec<FileMmapRange, 32> g_file_mmap_ranges;
 ker::mod::sys::Mutex g_file_mmap_ranges_lock;
 
@@ -752,35 +764,41 @@ auto protect_shared_vmem_range(ker::mod::sched::task::Task* task, uint64_t vaddr
 }
 
 auto file_mmap_cache_lookup(const FileMmapPageKey& key) -> void* {
-    uint64_t const USE_STAMP = g_file_mmap_cache_clock.fetch_add(1, std::memory_order_relaxed) + 1;
-    auto& set = g_file_mmap_cache.at(file_mmap_key_hash(key) & (FILE_MMAP_CACHE_SET_COUNT - 1));
+    size_t const SET_INDEX = file_mmap_key_hash(key) & (FILE_MMAP_CACHE_SET_COUNT - 1);
+    size_t const LOCK_INDEX = SET_INDEX & (FILE_MMAP_CACHE_LOCK_COUNT - 1);
+    auto& cache_lock = g_file_mmap_cache_locks.at(LOCK_INDEX);
+    auto& set = g_file_mmap_cache.at(SET_INDEX);
 
-    g_file_mmap_cache_lock.lock();
+    cache_lock.mutex.lock();
+    uint64_t const USE_STAMP = ++cache_lock.clock;
     for (auto& entry : set.ways) {
         if (entry.page != nullptr && file_mmap_key_equal(entry.key, key)) {
             entry.last_used = USE_STAMP;
             ker::mod::mm::phys::page_ref_inc(entry.page);
             void* page = entry.page;
-            g_file_mmap_cache_lock.unlock();
+            cache_lock.mutex.unlock();
             return page;
         }
     }
-    g_file_mmap_cache_lock.unlock();
+    cache_lock.mutex.unlock();
 
     return nullptr;
 }
 
 auto file_mmap_cache_insert_or_discard(const FileMmapPageKey& key, void* new_page, void** page_for_mapping) -> FileMmapCacheInsertResult {
-    uint64_t const USE_STAMP = g_file_mmap_cache_clock.fetch_add(1, std::memory_order_relaxed) + 1;
-    auto& set = g_file_mmap_cache.at(file_mmap_key_hash(key) & (FILE_MMAP_CACHE_SET_COUNT - 1));
+    size_t const SET_INDEX = file_mmap_key_hash(key) & (FILE_MMAP_CACHE_SET_COUNT - 1);
+    size_t const LOCK_INDEX = SET_INDEX & (FILE_MMAP_CACHE_LOCK_COUNT - 1);
+    auto& cache_lock = g_file_mmap_cache_locks.at(LOCK_INDEX);
+    auto& set = g_file_mmap_cache.at(SET_INDEX);
 
-    g_file_mmap_cache_lock.lock();
+    cache_lock.mutex.lock();
+    uint64_t const USE_STAMP = ++cache_lock.clock;
     for (auto& entry : set.ways) {
         if (entry.page != nullptr && file_mmap_key_equal(entry.key, key)) {
             entry.last_used = USE_STAMP;
             ker::mod::mm::phys::page_ref_inc(entry.page);
             *page_for_mapping = entry.page;
-            g_file_mmap_cache_lock.unlock();
+            cache_lock.mutex.unlock();
             ker::mod::mm::phys::page_ref_dec(new_page);
             return FileMmapCacheInsertResult::DUPLICATE;
         }
@@ -803,7 +821,7 @@ auto file_mmap_cache_insert_or_discard(const FileMmapPageKey& key, void* new_pag
     victim->last_used = USE_STAMP;
     ker::mod::mm::phys::page_ref_inc(new_page);
     *page_for_mapping = new_page;
-    g_file_mmap_cache_lock.unlock();
+    cache_lock.mutex.unlock();
 
     if (evicted != nullptr) {
         ker::mod::mm::phys::page_ref_dec(evicted);
@@ -2036,15 +2054,18 @@ auto file_mmap_cache_stats() -> FileMmapCacheStats {
     FileMmapCacheStats stats{};
     stats.capacity_pages = FILE_MMAP_CACHE_PAGES;
 
-    g_file_mmap_cache_lock.lock();
-    for (const auto& set : g_file_mmap_cache) {
-        for (const auto& entry : set.ways) {
-            if (entry.page != nullptr) {
-                stats.pages++;
+    for (size_t lock_index = 0; lock_index < FILE_MMAP_CACHE_LOCK_COUNT; ++lock_index) {
+        auto& cache_lock = g_file_mmap_cache_locks.at(lock_index);
+        cache_lock.mutex.lock();
+        for (size_t set_index = lock_index; set_index < FILE_MMAP_CACHE_SET_COUNT; set_index += FILE_MMAP_CACHE_LOCK_COUNT) {
+            for (const auto& entry : g_file_mmap_cache.at(set_index).ways) {
+                if (entry.page != nullptr) {
+                    stats.pages++;
+                }
             }
         }
+        cache_lock.mutex.unlock();
     }
-    g_file_mmap_cache_lock.unlock();
 
     stats.bytes = stats.pages * ker::mod::mm::paging::PAGE_SIZE;
     return stats;

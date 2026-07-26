@@ -7025,7 +7025,11 @@ auto detach_next_reclaimable_task_locked(RunQueue* rq, uint64_t cpu_no) -> GcDet
         }
 
         bool should_free_pagemap = false;
-        if (cur->pagemap != nullptr && cur->type != task::TaskType::DAEMON && !cur->is_thread) {
+        if (cur->pagemap != nullptr && cur->type != task::TaskType::DAEMON) {
+            // The last published task owns shared-pagemap teardown, regardless
+            // of whether that task is the process leader or a user thread. If
+            // the leader reaches GC first, requiring !is_thread here strands
+            // the entire address space after the final thread is reclaimed.
             should_free_pagemap = !gc_task_has_pagemap_sibling_locked(cur);
         }
 
@@ -7293,9 +7297,9 @@ void cleanup_detached_gc_task(GcDetachedTask const& detached, GcTaskTiming& timi
 
     // Free pagemap.
     // - DAEMON tasks use the kernel pagemap - must NOT free it.
-    // - Thread tasks share the owner process's pagemap - must NOT free it here.
-    // - Process tasks free only after detach confirmed no alive/dead sibling still
-    //   references the same pagemap.
+    // - Shared-pagemap tasks free only after detach confirmed no alive/dead
+    //   sibling still references the same pagemap. The last publisher may be
+    //   either the process leader or a user thread.
     if (cur->pagemap != nullptr) {
         uint64_t const START_US = time::get_us();
         if (detached.should_free_pagemap) {

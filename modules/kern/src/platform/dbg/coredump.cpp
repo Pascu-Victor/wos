@@ -372,7 +372,7 @@ struct CoreDumpRequest {
     uint64_t euid;
     uint64_t egid;
     uint64_t task_flags;
-    uint8_t* elf_buffer;  // stolen from task->elf_buffer; retained after write to avoid allocator re-entry during crash handling
+    uint8_t* elf_buffer;  // stolen from task->elf_buffer; released by the coredump task after writing
     size_t elf_buffer_size;
     bool elf_buffer_shared;
     ker::vfs::File* exec_image_file;  // stolen retained reference for file-backed executable streaming
@@ -524,24 +524,35 @@ void release_pinned_user_pages(CoreDumpRequest& req) {
     req.pinned_page_count = 0;
 }
 
+enum class CoreDumpSlotState : uint8_t {
+    EMPTY,
+    WRITING,
+    READY,
+};
+
 struct CoreDumpSlot {
     CoreDumpRequest req{};
-    std::atomic<bool> ready{false};
+    std::atomic<CoreDumpSlotState> state{CoreDumpSlotState::EMPTY};
 };
 
 std::array<CoreDumpSlot, RING_SIZE> g_ring{};
 std::atomic<uint32_t> g_write_seq{0};
-uint32_t g_read_seq{0};  // only touched by coredump task
+uint32_t g_consume_cursor{0};  // only touched by coredump task
 ker::mod::sched::task::Task* g_coredump_task{nullptr};
 
 void perform_coredump(const CoreDumpRequest& req);
 
 [[noreturn]] void coredump_task_fn() {
     while (true) {
-        uint32_t const IDX = g_read_seq % RING_SIZE;
+        bool consumed = false;
+        for (uint32_t offset = 0; offset < RING_SIZE; ++offset) {
+            uint32_t const IDX = (g_consume_cursor + offset) % RING_SIZE;
+            CoreDumpSlot& slot = g_ring.at(IDX);
+            if (slot.state.load(std::memory_order_acquire) != CoreDumpSlotState::READY) {
+                continue;
+            }
 
-        if (g_ring.at(IDX).ready.load(std::memory_order_acquire)) {
-            CoreDumpRequest& req = g_ring.at(IDX).req;
+            CoreDumpRequest& req = slot.req;
 
             // Switch to kernel pagemap: VFS I/O and HHDM page reads require it.
             // (The coredump task is a DAEMON so it already uses the kernel pagemap,
@@ -551,16 +562,18 @@ void perform_coredump(const CoreDumpRequest& req);
             perform_coredump(req);
             release_pinned_user_pages(req);
 
-            // Do not delete a private ELF buffer here. Coredump handling runs on
-            // the crash path and private ELF buffers are often medium allocations;
-            // freeing those here can re-enter fragile allocator state immediately
-            // before GC reclaims the crashed task. Shared cache buffers only need
-            // their cache reference released.
+            // The exception path transferred exclusive ownership of a private
+            // buffer into this request. Release it only here, from the normal
+            // coredump task context after all output and pinned-page reads finish.
             if (req.elf_buffer != nullptr) {
                 if (req.elf_buffer_shared) {
                     ker::net::wki::wki_remote_compute_release_elf_buffer(req.elf_buffer);
+                } else {
+                    delete[] req.elf_buffer;
                 }
                 req.elf_buffer = nullptr;
+                req.elf_buffer_size = 0;
+                req.elf_buffer_shared = false;
             }
             if (req.exec_image_file != nullptr) {
                 ker::vfs::vfs_put_file(req.exec_image_file);
@@ -575,9 +588,13 @@ void perform_coredump(const CoreDumpRequest& req);
                 req.task_ptr = nullptr;
             }
 
-            g_ring.at(IDX).ready.store(false, std::memory_order_release);
-            g_read_seq++;
-        } else {
+            slot.state.store(CoreDumpSlotState::EMPTY, std::memory_order_release);
+            g_consume_cursor = (IDX + 1) % RING_SIZE;
+            consumed = true;
+            break;
+        }
+
+        if (!consumed) {
             ker::mod::sched::kern_block();
         }
     }
@@ -779,12 +796,22 @@ void try_write_for_task(ker::mod::sched::task::Task* task, const ker::mod::cpu::
         return;
     }
 
-    // Claim a ring slot. Wrap around; drop if the consumer hasn't cleared this slot yet.
-    uint32_t const SEQ = g_write_seq.fetch_add(1, std::memory_order_relaxed);
-    uint32_t const IDX = SEQ % RING_SIZE;
-    CoreDumpSlot& slot = g_ring.at(IDX);
+    // Claim any empty ring slot, starting from a round-robin hint. The WRITING
+    // state prevents another exception CPU or the consumer from observing a
+    // partially populated request. A bounded scan keeps this path non-blocking.
+    uint32_t const START = g_write_seq.fetch_add(1, std::memory_order_relaxed) % RING_SIZE;
+    CoreDumpSlot* slot = nullptr;
+    for (uint32_t offset = 0; offset < RING_SIZE; ++offset) {
+        CoreDumpSlot& candidate = g_ring.at((START + offset) % RING_SIZE);
+        auto expected = CoreDumpSlotState::EMPTY;
+        if (candidate.state.compare_exchange_strong(expected, CoreDumpSlotState::WRITING, std::memory_order_acq_rel,
+                                                    std::memory_order_acquire)) {
+            slot = &candidate;
+            break;
+        }
+    }
 
-    if (slot.ready.load(std::memory_order_acquire)) {
+    if (slot == nullptr) {
         log::warn("ring full, dropping coredump for PID %lx", static_cast<unsigned long>(task->pid));
         return;
     }
@@ -795,10 +822,11 @@ void try_write_for_task(ker::mod::sched::task::Task* task, const ker::mod::cpu::
     // task must not walk task->pagemap after the faulting task is allowed to
     // exit. try_acquire fails if task is already EXITING/DEAD.
     if (!task->try_acquire()) {
+        slot->state.store(CoreDumpSlotState::EMPTY, std::memory_order_release);
         return;
     }
 
-    CoreDumpRequest& req = slot.req;
+    CoreDumpRequest& req = slot->req;
     req.gpr = gpr;
     req.frame = frame;
     req.saved_frame = task->context.frame;
@@ -895,7 +923,8 @@ void try_write_for_task(ker::mod::sched::task::Task* task, const ker::mod::cpu::
     std::copy_n(task->wki_submitter_hostname.begin(), req.wki_submitter_hostname.size(), req.wki_submitter_hostname.begin());
 
     // Steal elf_buffer so exit() won't free it before the coredump task writes it.
-    // Private buffers are intentionally retained after writing; see coredump_task_fn().
+    // The coredump task releases private buffers after writing and shared
+    // buffers through the WKI cache reference path.
     req.elf_buffer = task->elf_buffer;
     req.elf_buffer_size = task->elf_buffer_size;
     req.elf_buffer_shared = task->is_elf_buffer_shared;
@@ -915,7 +944,7 @@ void try_write_for_task(ker::mod::sched::task::Task* task, const ker::mod::cpu::
 
     // Publish the slot and wake the coredump task. Safe from CPL=3 exception context:
     // userspace-fault handlers cannot be holding any kernel spinlock.
-    slot.ready.store(true, std::memory_order_release);
+    slot->state.store(CoreDumpSlotState::READY, std::memory_order_release);
     ker::mod::sched::kern_wake(g_coredump_task);
 }
 
