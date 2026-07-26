@@ -681,6 +681,7 @@ stage_distributed_compiler_roots \
     "$B/src/llvm-project/libcxx" \
     "$B/src/llvm-project/libcxxabi" \
     "$B/src/llvm-project/libunwind" \
+    "$B/src/llvm-project/libc" \
     "$SYSROOT/include"
 mkdir -p $B/libcxx-build
 wos_timed_step "configure" "libcxx_runtime" \
@@ -741,7 +742,7 @@ wos_timed_step "generate" "libcxx_runtime_headers" \
     wos_run_in_dir "$B/libcxx-build" \
     ninja -j"$WOS_NINJA_JOBS" generate-cxx-headers generate-cxxabi-headers
 
-libcxx_distributed_source_roots="$B/src/llvm-project/runtimes"$'\n'"$B/src/llvm-project/libcxx"$'\n'"$B/src/llvm-project/libcxxabi"$'\n'"$B/src/llvm-project/libunwind"
+libcxx_distributed_source_roots="$B/src/llvm-project/runtimes"$'\n'"$B/src/llvm-project/libcxx"$'\n'"$B/src/llvm-project/libcxxabi"$'\n'"$B/src/llvm-project/libunwind"$'\n'"$B/src/llvm-project/libc"
 wos_stage_distributed_build_roots \
     "$WORKSPACE_ROOT" "$libcxx_distributed_source_roots" \
     "$B/libcxx-build" "$SYSROOT/include"

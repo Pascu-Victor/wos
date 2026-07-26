@@ -325,6 +325,7 @@ def test_wos_toolchain_stages_sources_before_distributed_compiles() -> None:
             'stage_distributed_compiler_roots "$B/src/mlibc" "$HOST/lib" "$SYSROOT/include"',
             'stage_distributed_compiler_roots "$SYSROOT/include"',
             'stage_distributed_compiler_roots "$B/src/llvm-project/compiler-rt"',
+            '"$B/src/llvm-project/libc"',
             'stage_distributed_compiler_roots "$B/src/cmake" "$SYSROOT/include"',
             'stage_distributed_compiler_roots "$B/src/llvm-project" "$SYSROOT/include"',
         ],
@@ -346,6 +347,14 @@ def test_wos_toolchain_stages_sources_before_distributed_compiles() -> None:
             'WOS_LIBCXX_BUILD_DIR="$B/libcxx-build"',
         ],
         "libc++ generated headers precede configured-root staging",
+    )
+    require_tokens(
+        source,
+        [
+            '"$B/src/llvm-project/libunwind" \\\n    "$B/src/llvm-project/libc" \\\n    "$SYSROOT/include"',
+            '"$B/src/llvm-project/libunwind"$\'\\n\'"$B/src/llvm-project/libc"',
+        ],
+        "libc++ distributed compilation stages LLVM libc shared headers",
     )
 
 
