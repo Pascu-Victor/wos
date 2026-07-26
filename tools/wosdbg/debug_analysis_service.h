@@ -30,6 +30,11 @@ class DebugAnalysisService : public QObject {
     void set_config(const Config& new_config);
     void reload_config();
 
+    // Canonical frontend-neutral capability contract. MCP, CLI, and GUI all
+    // enumerate and invoke tools through these two methods.
+    [[nodiscard]] static QJsonObject tool_catalog();
+    [[nodiscard]] QJsonObject invoke_tool(const QString& name, const QJsonObject& args);
+
     [[nodiscard]] QJsonObject status() const;
     static auto list_logs() -> QJsonObject;
     [[nodiscard]] QJsonObject load_log(const QJsonObject& args);
@@ -65,6 +70,7 @@ class DebugAnalysisService : public QObject {
     [[nodiscard]] QJsonObject recognize_startup_stack(const QJsonObject& args) const;
     [[nodiscard]] QJsonObject correlate_coredump_logs(const QJsonObject& args) const;
     [[nodiscard]] QJsonObject reconstruct_wki_trace(const QJsonObject& args) const;
+    [[nodiscard]] QJsonObject build_distributed_timeline(const QJsonObject& args) const;
     [[nodiscard]] QJsonObject explain_remote_exec_path(const QJsonObject& args) const;
     [[nodiscard]] QJsonObject diagnose_remote_exec_corruption(const QJsonObject& args) const;
 

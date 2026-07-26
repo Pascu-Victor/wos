@@ -11,6 +11,7 @@
 
 #include <QDataStream>
 #include <QDebug>
+#include <QJsonDocument>
 #include <algorithm>
 #include <cstddef>
 #include <utility>
@@ -194,6 +195,19 @@ void LogClient::process_message(MessageType type, QDataStream& in) {
             emit mcp_server_status(running, endpoint, message);
             break;
         }
+        case MessageType::TOOL_CATALOG_RESPONSE: {
+            QByteArray json;
+            in >> json;
+            emit tool_catalog_received(QJsonDocument::fromJson(json).object()["tools"].toArray());
+            break;
+        }
+        case MessageType::TOOL_CALL_RESPONSE: {
+            quint64 request_id;
+            QByteArray json;
+            in >> request_id >> json;
+            emit tool_result_received(request_id, QJsonDocument::fromJson(json).object());
+            break;
+        }
         default:
             break;
     }
@@ -364,4 +378,27 @@ void LogClient::request_mcp_server_status() {
     out.device()->seek(0);
     out << static_cast<quint32>(block.size() - sizeof(quint32));
     socket->write(block);
+}
+
+void LogClient::request_tool_catalog() {
+    QByteArray block;
+    QDataStream out(&block, QIODevice::WriteOnly);
+    out.setVersion(QDataStream::Qt_6_0);
+    out << static_cast<quint32>(0) << static_cast<quint8>(MessageType::TOOL_CATALOG_REQUEST);
+    out.device()->seek(0);
+    out << static_cast<quint32>(block.size() - sizeof(quint32));
+    socket->write(block);
+}
+
+auto LogClient::call_tool(const QString& name, const QJsonObject& arguments) -> quint64 {
+    const quint64 REQUEST_ID = next_tool_request_id++;
+    const QByteArray JSON = QJsonDocument(arguments).toJson(QJsonDocument::Compact);
+    QByteArray block;
+    QDataStream out(&block, QIODevice::WriteOnly);
+    out.setVersion(QDataStream::Qt_6_0);
+    out << static_cast<quint32>(0) << static_cast<quint8>(MessageType::TOOL_CALL_REQUEST) << REQUEST_ID << name << JSON;
+    out.device()->seek(0);
+    out << static_cast<quint32>(block.size() - sizeof(quint32));
+    socket->write(block);
+    return REQUEST_ID;
 }

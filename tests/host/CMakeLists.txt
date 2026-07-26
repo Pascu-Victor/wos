@@ -133,6 +133,10 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/debugserver_source_test.py
 )
 add_test(
+    NAME wosdbg_interface_source_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/wosdbg_interface_source_test.py
+)
+add_test(
     NAME sftp_timeout_source_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/sftp_timeout_source_test.py
 )

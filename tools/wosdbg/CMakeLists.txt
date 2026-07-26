@@ -63,6 +63,10 @@ add_executable(wosdbg
     log_client.cpp
     debug_analysis_service.h
     debug_analysis_service.cpp
+    debug_cli.h
+    debug_cli.cpp
+    debug_tool_panel.h
+    debug_tool_panel.cpp
     mcp_http_server.h
     mcp_http_server.cpp
     config.h

@@ -147,6 +147,40 @@ If the build fails during mountfs disk sync, `sync_rootfs.sh`, `mountfs_disk`, o
 
 Debugging must be done by the user. When runtime/debug information is needed, ask the user to run the kernel or cluster and provide logs/backtraces.
 
+## WOSDBG host debugger
+
+WOSDBG (`tools/wosdbg`, normally built as `tools/build/bin/wosdbg`) is the
+preferred host-side interface for structured WOS execution-log and coredump
+analysis. It has one backend capability catalog exposed through three
+equivalent interfaces:
+
+- MCP at `/mcp` for connected agents.
+- JSON CLI for agents without MCP: start with
+  `tools/build/bin/wosdbg --list-tools`, invoke with `--tool NAME --arguments
+  JSON`, and use `--batch FILE` for stateful multi-call workflows.
+- GUI for interactive work: open the **Analysis Tools** dock to enumerate and
+  invoke the same catalog; the existing log and coredump panels remain useful
+  for manual navigation.
+
+Do not treat MCP as the only complete interface. The GUI, CLI, and MCP call
+`DebugAnalysisService::tool_catalog()` / `invoke_tool()`, so tool additions
+must be made in that shared backend contract and must not add a
+frontend-specific dispatcher.
+
+WOSDBG supports log loading/search/context, coredump extraction and sessions,
+one-shot crash analysis, trap/saved-context backtraces and stack annotation,
+register/address/PTE/source inspection, bounded memory and pointer search,
+disassembly, ELF/build-ID/mapped-page integrity checks, duplicate/chunk
+corruption detection, executable-PTE audits, and WKI/remote-exec analysis.
+For distributed bugs, load every relevant node/resource log in one session and
+use `build_distributed_timeline`, `reconstruct_wki_trace`, and
+`correlate_coredump_logs`; the timeline reports whether global timestamps are
+complete, partial, or unavailable rather than inventing cross-node order.
+
+The canonical usage, batch-reference syntax, all capability groups, MCP
+security settings, and configuration are documented in
+`tools/wosdbg/README.md` and `tools/wosdbg/CONFIG.md`.
+
 ## WOS userspace utilities
 
 Several WOS utilities intentionally use familiar Unix/Linux names. Do not assume GNU coreutils, systemd, upstream `strace`, Linux `perf`, or procps behavior from the command name alone. These are WOS utilities, may have fewer, more, or different options than similarly named tools, and their current local source is the authority.

@@ -12,6 +12,7 @@
 #include <QCoreApplication>
 #include <QDebug>
 #include <QFileInfo>
+#include <QJsonDocument>
 #include <QProcess>
 #include <QRegularExpression>
 #include <algorithm>
@@ -397,6 +398,23 @@ void LogServer::process_message(MessageType type, QDataStream& in) {
             send_mcp_server_status();
             break;
         }
+        case MessageType::TOOL_CATALOG_REQUEST: {
+            send_tool_catalog();
+            break;
+        }
+        case MessageType::TOOL_CALL_REQUEST: {
+            quint64 request_id;
+            QString name;
+            QByteArray json;
+            in >> request_id >> name >> json;
+            const QJsonDocument DOCUMENT = QJsonDocument::fromJson(json);
+            if (!DOCUMENT.isObject()) {
+                send_tool_result(request_id, QJsonObject{{"ok", false}, {"error", "Tool arguments must be a JSON object"}});
+            } else {
+                send_tool_result(request_id, analysis_service->invoke_tool(name, DOCUMENT.object()));
+            }
+            break;
+        }
         default:
             break;
     }
@@ -587,6 +605,34 @@ void LogServer::send_mcp_server_status(const QString& message) {
     out.setVersion(QDataStream::Qt_6_0);
     out << static_cast<quint32>(0) << static_cast<quint8>(MessageType::MCP_SERVER_STATUS_RESPONSE) << is_mcp_listening() << mcp_endpoint()
         << message;
+    out.device()->seek(0);
+    out << static_cast<quint32>(block.size() - sizeof(quint32));
+    clientSocket->write(block);
+}
+
+void LogServer::send_tool_catalog() {
+    if (!clientSocket) {
+        return;
+    }
+    const QByteArray JSON = QJsonDocument(DebugAnalysisService::tool_catalog()).toJson(QJsonDocument::Compact);
+    QByteArray block;
+    QDataStream out(&block, QIODevice::WriteOnly);
+    out.setVersion(QDataStream::Qt_6_0);
+    out << static_cast<quint32>(0) << static_cast<quint8>(MessageType::TOOL_CATALOG_RESPONSE) << JSON;
+    out.device()->seek(0);
+    out << static_cast<quint32>(block.size() - sizeof(quint32));
+    clientSocket->write(block);
+}
+
+void LogServer::send_tool_result(quint64 request_id, const QJsonObject& result) {
+    if (!clientSocket) {
+        return;
+    }
+    const QByteArray JSON = QJsonDocument(result).toJson(QJsonDocument::Compact);
+    QByteArray block;
+    QDataStream out(&block, QIODevice::WriteOnly);
+    out.setVersion(QDataStream::Qt_6_0);
+    out << static_cast<quint32>(0) << static_cast<quint8>(MessageType::TOOL_CALL_RESPONSE) << request_id << JSON;
     out.device()->seek(0);
     out << static_cast<quint32>(block.size() - sizeof(quint32));
     clientSocket->write(block);

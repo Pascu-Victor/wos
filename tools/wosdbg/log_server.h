@@ -56,6 +56,8 @@ class LogServer : public QObject {
     void send_row_for_line_response(int row);
     void send_file_list_response(const QStringList& files);
     void send_mcp_server_status(const QString& message = QString());
+    void send_tool_catalog();
+    void send_tool_result(quint64 request_id, const QJsonObject& result);
 
     void apply_filter(bool hide_structural, const QString& interrupt_filter);
 };

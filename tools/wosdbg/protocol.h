@@ -33,7 +33,11 @@ enum class MessageType : uint8_t {
     START_MCP_SERVER = 20,
     STOP_MCP_SERVER = 21,
     MCP_SERVER_STATUS_REQUEST = 22,
-    MCP_SERVER_STATUS_RESPONSE = 23
+    MCP_SERVER_STATUS_RESPONSE = 23,
+    TOOL_CATALOG_REQUEST = 24,
+    TOOL_CATALOG_RESPONSE = 25,
+    TOOL_CALL_REQUEST = 26,
+    TOOL_CALL_RESPONSE = 27
 };
 
 // Serialization helpers for LogEntry

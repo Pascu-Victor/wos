@@ -1,5 +1,7 @@
 #pragma once
 
+#include <QJsonArray>
+#include <QJsonObject>
 #include <QObject>
 #include <QTcpSocket>
 #include <QTimer>
@@ -37,6 +39,8 @@ class LogClient : public QObject {
     void start_mcp_server(const QString& bind_address = QString(), quint16 port = 0);
     void stop_mcp_server();
     void request_mcp_server_status();
+    void request_tool_catalog();
+    auto call_tool(const QString& name, const QJsonObject& arguments) -> quint64;
 
    signals:
     void search_results(const std::vector<int>& matches);
@@ -53,6 +57,8 @@ class LogClient : public QObject {
     void error_occurred(const QString& error);
     void data_received(int start_line, int count);  // Signal to repaint
     void mcp_server_status(bool running, const QString& endpoint, const QString& message);
+    void tool_catalog_received(const QJsonArray& tools);
+    void tool_result_received(quint64 request_id, const QJsonObject& result);
 
    private slots:
     void on_connected();
@@ -73,6 +79,7 @@ class LogClient : public QObject {
     std::vector<std::pair<int, int>> pending_requests;  // start, count
     QTimer request_timer;
     bool initial_load_pending{false};
+    quint64 next_tool_request_id{1};
 
     void process_message(MessageType type, QDataStream& in);
     void request_data(int start_line, int count);

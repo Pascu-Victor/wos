@@ -56,6 +56,7 @@ class SyntaxHighlightDelegate;
 class VirtualTableView;
 class VirtualTableModel;
 class LogClient;
+class DebugToolPanel;
 
 // Coredump panel forward declarations
 class CoredumpBrowser;
@@ -139,6 +140,7 @@ class QemuLogViewer : public QMainWindow {
     QDockWidget* disassembly_dock = nullptr;
     QDockWidget* details_dock = nullptr;
     QDockWidget* browser_dock = nullptr;  // Coredump browser dock (stored for tabification)
+    QDockWidget* tool_dock = nullptr;
 
     // Search functionality
     std::vector<int> search_matches;
@@ -226,6 +228,7 @@ class QemuLogViewer : public QMainWindow {
 
     // ----- Coredump integration -----
     void setup_coredump_panels();  // Create and wire all coredump dock widgets
+    void setup_tool_panel();       // Schema-driven access to every backend tool
     void open_coredump(const QString& file_path);
     void close_coredump();
     void resolve_symbols_for_coredump();              // Auto-resolve from filename + config
@@ -241,6 +244,7 @@ class QemuLogViewer : public QMainWindow {
     CoredumpMemoryPanel* memory_panel = nullptr;
     CoredumpElfPanel* elf_panel = nullptr;
     CoredumpDisasmPanel* disasm_panel = nullptr;
+    DebugToolPanel* tool_panel = nullptr;
 
     // Coredump state
     std::unique_ptr<wosdbg::CoreDump> current_core_dump;

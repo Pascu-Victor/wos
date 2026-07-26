@@ -3384,6 +3384,306 @@ auto DebugAnalysisService::reconstruct_wki_trace(const QJsonObject& args) const 
     return QJsonObject{{"ok", true}, {"truncated", false}, {"events", events}};
 }
 
+auto DebugAnalysisService::build_distributed_timeline(const QJsonObject& args) const -> QJsonObject {
+    QStringList log_ids;
+    for (const auto& value : args["logIds"].toArray()) {
+        if (!value.toString().isEmpty()) {
+            log_ids << value.toString();
+        }
+    }
+    if (log_ids.isEmpty()) {
+        for (auto it = log_sessions.cbegin(); it != log_sessions.cend(); ++it) {
+            log_ids << it.key();
+        }
+    }
+    if (log_ids.isEmpty()) {
+        return tool_error("No loaded logs. Call wosdbg.load_log first or pass logIds.");
+    }
+
+    const int MAX_EVENTS = bounded_int(args, "maxEvents", 512, 1, 4096);
+    const int CONTEXT = bounded_int(args, "context", 0, 0, 32);
+    const bool EXPAND = args["expandCorrelations"].toBool(true);
+    const QString QUERY = args["query"].toString();
+    QRegularExpression selector;
+    if (!QUERY.isEmpty()) {
+        selector = args["regex"].toBool(false)
+                       ? QRegularExpression(QUERY, QRegularExpression::CaseInsensitiveOption)
+                       : QRegularExpression(QRegularExpression::escape(QUERY), QRegularExpression::CaseInsensitiveOption);
+        if (!selector.isValid()) {
+            return tool_error("Invalid query regex");
+        }
+    } else {
+        selector = QRegularExpression(
+            R"(\b(WKI|VFS_REF|remote_(?:vfs|compute|ipc)|RDMA|request|response|submit|launch|complete|timeout|retry|fence|peer)\b)",
+            QRegularExpression::CaseInsensitiveOption);
+    }
+
+    QSet<QString> requested_keys;
+    for (const auto& value : args["correlationKeys"].toArray()) {
+        if (!value.toString().isEmpty()) {
+            requested_keys.insert(value.toString());
+        }
+    }
+
+    const QRegularExpression IDENTIFIER_RE(
+        R"(\b(cookie|request(?:_?id)?|req(?:_?id)?|task(?:_?id)?|resource(?:_?id)?|rid|peer|pid|fd|channel|sequence|seq)\s*[:=#]\s*([A-Za-z0-9_.:/-]+))",
+        QRegularExpression::CaseInsensitiveOption);
+    const QRegularExpression EXPLICIT_TIME_RE(R"(\b(?:ts|time|timestamp)\s*[:=]\s*([0-9]+(?:\.[0-9]+)?)\s*(ns|us|ms|s)?\b)",
+                                              QRegularExpression::CaseInsensitiveOption);
+    const QRegularExpression BRACKET_TIME_RE(R"(^\s*\[\s*([0-9]+(?:\.[0-9]+)?)\s*(ns|us|ms|s)?\s*\])",
+                                             QRegularExpression::CaseInsensitiveOption);
+
+    auto correlation_fields = [&IDENTIFIER_RE](const QString& text, QSet<QString>* values) {
+        QJsonObject fields;
+        auto it = IDENTIFIER_RE.globalMatch(text);
+        while (it.hasNext()) {
+            const auto MATCH = it.next();
+            const QString NAME = MATCH.captured(1).toLower();
+            const QString VALUE = MATCH.captured(2);
+            fields[NAME] = VALUE;
+            values->insert(QString("%1=%2").arg(NAME, VALUE));
+        }
+        return fields;
+    };
+    auto timestamp_ns = [&EXPLICIT_TIME_RE, &BRACKET_TIME_RE](const QString& text) -> std::optional<double> {
+        auto match = EXPLICIT_TIME_RE.match(text);
+        if (!match.hasMatch()) {
+            match = BRACKET_TIME_RE.match(text);
+        }
+        if (!match.hasMatch()) {
+            return std::nullopt;
+        }
+        bool ok = false;
+        double value = match.captured(1).toDouble(&ok);
+        if (!ok) {
+            return std::nullopt;
+        }
+        const QString UNIT = match.captured(2).toLower();
+        if (UNIT == "s" || UNIT.isEmpty()) {
+            value *= 1'000'000'000.0;
+        } else if (UNIT == "ms") {
+            value *= 1'000'000.0;
+        } else if (UNIT == "us") {
+            value *= 1'000.0;
+        }
+        return value;
+    };
+
+    struct Candidate {
+        QString log_id;
+        QString path;
+        int lane = 0;
+        int row = 0;
+        QString text;
+        QJsonObject entry;
+        QJsonObject fields;
+        QSet<QString> correlation_values;
+        std::optional<double> timestamp;
+        bool direct_match = false;
+        bool context_match = false;
+        bool correlation_match = false;
+    };
+
+    std::vector<Candidate> candidates;
+    QSet<QString> seed_values = requested_keys;
+    int lane = 0;
+    for (const auto& log_id : log_ids) {
+        const auto* session = find_log_session(log_id);
+        if (session == nullptr) {
+            continue;
+        }
+        QSet<int> direct_rows;
+        for (int row = 0; std::cmp_less(row, session->entries.size()); ++row) {
+            const auto& entry = session->entries[static_cast<size_t>(row)];
+            const QString TEXT = QString::fromStdString(entry.original_line + " " + entry.function + " " + entry.assembly);
+            bool direct = selector.match(TEXT).hasMatch();
+            if (!requested_keys.isEmpty()) {
+                direct =
+                    std::ranges::any_of(requested_keys, [&TEXT](const QString& key) { return TEXT.contains(key, Qt::CaseInsensitive); });
+            }
+            if (direct) {
+                direct_rows.insert(row);
+            }
+        }
+        QSet<int> selected_rows = direct_rows;
+        for (const int ROW : direct_rows) {
+            for (int nearby = std::max(0, ROW - CONTEXT); nearby <= std::min(static_cast<int>(session->entries.size()) - 1, ROW + CONTEXT);
+                 ++nearby) {
+                selected_rows.insert(nearby);
+            }
+        }
+        for (const int ROW : selected_rows) {
+            const auto& entry = session->entries[static_cast<size_t>(ROW)];
+            const QString TEXT = QString::fromStdString(entry.original_line + " " + entry.function + " " + entry.assembly);
+            Candidate candidate;
+            candidate.log_id = log_id;
+            candidate.path = session->path;
+            candidate.lane = lane;
+            candidate.row = ROW;
+            candidate.text = TEXT;
+            candidate.entry = log_entry_to_json(entry, false);
+            candidate.direct_match = direct_rows.contains(ROW);
+            candidate.context_match = !direct_rows.contains(ROW);
+            candidate.fields = correlation_fields(TEXT, &candidate.correlation_values);
+            if (candidate.direct_match) {
+                for (const auto& value : candidate.correlation_values) {
+                    if (!value.endsWith("=0") && !value.endsWith("=null") && !value.endsWith("=none")) {
+                        seed_values.insert(value);
+                    }
+                }
+            }
+            candidate.timestamp = timestamp_ns(TEXT);
+            candidates.push_back(std::move(candidate));
+        }
+        ++lane;
+    }
+
+    if (EXPAND && !seed_values.isEmpty()) {
+        lane = 0;
+        for (const auto& log_id : log_ids) {
+            const auto* session = find_log_session(log_id);
+            if (session == nullptr) {
+                continue;
+            }
+            for (int row = 0; std::cmp_less(row, session->entries.size()); ++row) {
+                const bool ALREADY_SELECTED = std::ranges::any_of(
+                    candidates, [&log_id, row](const Candidate& candidate) { return candidate.log_id == log_id && candidate.row == row; });
+                if (ALREADY_SELECTED) {
+                    continue;
+                }
+                const auto& entry = session->entries[static_cast<size_t>(row)];
+                const QString TEXT = QString::fromStdString(entry.original_line + " " + entry.function + " " + entry.assembly);
+                QSet<QString> candidate_values;
+                const QJsonObject FIELDS = correlation_fields(TEXT, &candidate_values);
+                const bool MATCHES_SEED =
+                    std::ranges::any_of(candidate_values, [&seed_values](const QString& key) { return seed_values.contains(key); });
+                if (!MATCHES_SEED) {
+                    continue;
+                }
+                Candidate candidate;
+                candidate.log_id = log_id;
+                candidate.path = session->path;
+                candidate.lane = lane;
+                candidate.row = row;
+                candidate.text = TEXT;
+                candidate.entry = log_entry_to_json(entry, false);
+                candidate.correlation_match = true;
+                candidate.fields = FIELDS;
+                candidate.correlation_values = candidate_values;
+                candidate.timestamp = timestamp_ns(TEXT);
+                candidates.push_back(std::move(candidate));
+            }
+            ++lane;
+        }
+    }
+
+    std::ranges::sort(candidates, [](const Candidate& left, const Candidate& right) {
+        if (left.lane != right.lane) {
+            return left.lane < right.lane;
+        }
+        return left.row < right.row;
+    });
+
+    const bool TRUNCATED = std::cmp_greater(candidates.size(), MAX_EVENTS);
+    if (TRUNCATED) {
+        std::vector<std::vector<Candidate>> by_lane(static_cast<size_t>(log_ids.size()));
+        for (auto& candidate : candidates) {
+            by_lane[static_cast<size_t>(candidate.lane)].push_back(std::move(candidate));
+        }
+        candidates.clear();
+        std::vector<size_t> lane_positions(by_lane.size(), 0);
+        while (std::cmp_less(candidates.size(), MAX_EVENTS)) {
+            bool made_progress = false;
+            for (size_t lane_index = 0; lane_index < by_lane.size() && std::cmp_less(candidates.size(), MAX_EVENTS); ++lane_index) {
+                if (lane_positions[lane_index] >= by_lane[lane_index].size()) {
+                    continue;
+                }
+                candidates.push_back(std::move(by_lane[lane_index][lane_positions[lane_index]++]));
+                made_progress = true;
+            }
+            if (!made_progress) {
+                break;
+            }
+        }
+        std::ranges::sort(candidates, [](const Candidate& left, const Candidate& right) {
+            if (left.lane != right.lane) {
+                return left.lane < right.lane;
+            }
+            return left.row < right.row;
+        });
+    }
+
+    QJsonArray events;
+    QJsonArray lanes;
+    QHash<QString, QSet<QString>> correlation_logs;
+    QHash<QString, int> correlation_counts;
+    int timestamped = 0;
+    for (const auto& log_id : log_ids) {
+        const auto* session = find_log_session(log_id);
+        if (session != nullptr) {
+            lanes.append(QJsonObject{{"logId", log_id}, {"path", session->path}, {"lane", lanes.size()}});
+        }
+    }
+    for (const auto& candidate : candidates) {
+        QString match_kind = "correlation";
+        if (candidate.direct_match) {
+            match_kind = "query";
+        } else if (candidate.context_match) {
+            match_kind = "context";
+        }
+        QJsonObject event{{"logId", candidate.log_id}, {"logPath", candidate.path},       {"lane", candidate.lane}, {"row", candidate.row},
+                          {"entry", candidate.entry},  {"correlation", candidate.fields}, {"match", match_kind}};
+        if (candidate.timestamp) {
+            event["timestampNs"] = *candidate.timestamp;
+            ++timestamped;
+        }
+        events.append(event);
+        for (const auto& value : candidate.correlation_values) {
+            correlation_logs[value].insert(candidate.log_id);
+            ++correlation_counts[value];
+        }
+    }
+
+    QJsonArray cross_log_correlations;
+    for (auto it = correlation_logs.cbegin(); it != correlation_logs.cend(); ++it) {
+        if (it.value().size() < 2) {
+            continue;
+        }
+        cross_log_correlations.append(QJsonObject{{"key", it.key()},
+                                                  {"occurrences", correlation_counts.value(it.key())},
+                                                  {"logIds", QJsonArray::fromStringList(it.value().values())}});
+    }
+
+    QJsonArray clock_ordered_events;
+    std::vector<QJsonObject> timestamped_events;
+    for (const auto& value : events) {
+        if (value.toObject().contains("timestampNs")) {
+            timestamped_events.push_back(value.toObject());
+        }
+    }
+    std::ranges::sort(timestamped_events, [](const QJsonObject& left, const QJsonObject& right) {
+        return left["timestampNs"].toDouble() < right["timestampNs"].toDouble();
+    });
+    for (const auto& event : timestamped_events) {
+        clock_ordered_events.append(event);
+    }
+
+    QString clock_quality = "partial-timestamps";
+    if (timestamped == 0) {
+        clock_quality = "per-log-order-only";
+    } else if (timestamped == events.size()) {
+        clock_quality = "all-events-timestamped";
+    }
+    return QJsonObject{{"ok", true},
+                       {"query", QUERY},
+                       {"lanes", lanes},
+                       {"events", events},
+                       {"clockOrderedEvents", clock_ordered_events},
+                       {"clockQuality", clock_quality},
+                       {"crossLogCorrelations", cross_log_correlations},
+                       {"truncated", TRUNCATED}};
+}
+
 auto DebugAnalysisService::explain_remote_exec_path(const QJsonObject& args) const -> QJsonObject {
     const auto* session = find_dump_session(args["dumpId"].toString());
     if (session == nullptr) {

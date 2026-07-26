@@ -54,14 +54,13 @@ class McpHttpServer : public QObject {
     [[nodiscard]] auto parse_http_request(QTcpSocket* socket) -> std::optional<HttpRequest>;
     void on_socket_disconnected();
     static void send_json(QTcpSocket* socket, const QJsonObject& object, int status = 200, const QByteArray& protocol_version = {},
-                   const QByteArray& session_id = {}, bool close_connection = true);
+                          const QByteArray& session_id = {}, bool close_connection = true);
     static void send_raw(QTcpSocket* socket, const QByteArray& body, const QByteArray& content_type, int status,
                          const QByteArray& protocol_version = {}, const QByteArray& session_id = {}, bool close_connection = true);
     static void send_sse_headers(QTcpSocket* socket, const QByteArray& protocol_version = {}, const QByteArray& session_id = {});
     static void send_sse_event(QTcpSocket* socket, const QByteArray& event_id, const QByteArray& event, const QByteArray& data = {});
     [[nodiscard]] auto handle_json_rpc(const QJsonObject& request) -> QJsonObject;
     [[nodiscard]] auto handle_method(const QString& method, const QJsonObject& params) -> QJsonObject;
-    [[nodiscard]] static auto tool_list() -> QJsonObject;
     [[nodiscard]] auto call_tool(const QJsonObject& params) const -> QJsonObject;
     [[nodiscard]] static auto json_rpc_error(const QJsonValue& id, int code, const QString& message) -> QJsonObject;
     [[nodiscard]] static auto json_rpc_result(const QJsonValue& id, const QJsonObject& result) -> QJsonObject;

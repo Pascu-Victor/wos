@@ -1146,6 +1146,7 @@ void QemuLogViewer::setup_ui() {
     setup_toolbar();
     setup_main_content();
     setup_coredump_panels();
+    setup_tool_panel();
 }
 
 void QemuLogViewer::setup_toolbar() {
@@ -2389,6 +2390,7 @@ void QemuLogViewer::on_table_cell_clicked(int row, int column) {
 #include "coredump_parser.h"
 #include "coredump_register_panel.h"
 #include "coredump_segment_panel.h"
+#include "debug_tool_panel.h"
 #include "elf_symbol_resolver.h"
 
 void QemuLogViewer::setup_coredump_panels() {
@@ -2461,6 +2463,22 @@ void QemuLogViewer::setup_coredump_panels() {
         tabifyDockWidget(hex_dock, memory_panel);
         hex_dock->raise();  // Show hex bytes tab by default
     }
+}
+
+void QemuLogViewer::setup_tool_panel() {
+    tool_panel = new DebugToolPanel(client, this);
+    tool_dock = new QDockWidget("Analysis Tools", this);
+    tool_dock->setObjectName("analysisToolsDock");
+    tool_dock->setWidget(tool_panel);
+    tool_dock->setAllowedAreas(Qt::AllDockWidgetAreas);
+    addDockWidget(Qt::BottomDockWidgetArea, tool_dock);
+    if (details_dock) {
+        tabifyDockWidget(details_dock, tool_dock);
+    }
+    auto* toggle_action = tool_dock->toggleViewAction();
+    toggle_action->setText("Tools");
+    toggle_action->setToolTip("Open the complete shared MCP / CLI / GUI analysis toolset");
+    toolbar->addAction(toggle_action);
 }
 
 void QemuLogViewer::open_coredump(const QString& file_path) {

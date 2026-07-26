@@ -1,79 +1,76 @@
-# QEMU Log Viewer Configuration
+# WOSDBG Configuration
 
-## Configuration File: logview.json
+WOSDBG loads `wosdbg.json`, searching the current working directory and up to
+four parent directories. Relative paths are resolved against the directory
+containing the configuration file.
 
-The QEMU Log Viewer supports a configuration file called `logview.json` in the current working directory. This file allows you to map address ranges to symbol files for enhanced debugging information.
-
-### Configuration Format
+Use [wosdbg.json.example](wosdbg.json.example) as the complete starting point:
 
 ```json
 {
-    "lookups": [
-        {
-            "from": "0x400000",
-            "to": "0x800000",
-            "path": "./build/modules/init/init"
-        },
-        {
-            "from": "0xffffffff80000000",
-            "to": "0xffffffffffffffff",
-            "path": "./build/modules/kern/wos"
-        },
-        {
-            "from": "0x7f0000000000",
-            "to": "0x7fffffffffff",
-            "path": "./toolchain/mlibc-build/libc.so",
-            "offset": "0x7f0000000000"
-        }
-    ]
+  "lookups": [
+    {
+      "from": "0x400000",
+      "to": "0x700000",
+      "path": "./build/modules/init/init"
+    },
+    {
+      "from": "0xffffffff80000000",
+      "to": "0xffffffffffffffff",
+      "path": "./build/modules/kern/wos"
+    }
+  ],
+  "coredumpDirectory": "./coredumps",
+  "binaries": [
+    {"name": "init", "path": "./build/modules/init/init"},
+    {"name": "httpd", "path": "./build/modules/httpd/httpd"}
+  ],
+  "mcp": {
+    "bindAddress": "127.0.0.1",
+    "port": 12346,
+    "allowedCidrs": ["127.0.0.1/32", "::1/128"],
+    "allowedRoots": ["."],
+    "maxEntries": 200,
+    "maxMemoryBytes": 4096,
+    "maxHits": 200,
+    "maxStringLength": 160,
+    "sourceWindowLines": 8,
+    "maxDisassemblyInstructions": 48
+  }
 }
 ```
 
-### Fields
+## Symbol and binary mappings
 
--   **lookups**: Array of address range mappings
--   **from**: Starting address of the range (hex string with 0x prefix)
--   **to**: Ending address of the range (hex string with 0x prefix)
--   **path**: Path to the symbol file (executable, ELF file, etc.)
--   **offset**: (Optional) Runtime load offset for shared libraries. This value is subtracted from the runtime address to get the file-relative address for symbol lookups. For shared libraries loaded at a specific base address, set this to the base address.
+`lookups` maps runtime address ranges to ELF files:
 
-### Address Ranges
+- `from`, `to`: inclusive hexadecimal runtime range.
+- `path`: ELF/symbol file.
+- `offset`: optional runtime load base subtracted before symbol lookup, useful
+  for PIE/shared objects.
 
-Common address ranges for different types of binaries:
+`binaries` maps the executable name encoded in coredump filenames to its local
+ELF. WOSDBG also discovers the embedded ELF, kernel mappings, interpreter, and
+loaded modules when available.
 
--   **User space applications**: `0x400000` to `0x800000`
--   **Kernel space (x86_64)**: `0xffffffff80000000` to `0xffffffffffffffff`
--   **Shared libraries**: `0x7f0000000000` to `0x7fffffffffff`
+`coredumpDirectory` is used by GUI browsing, extraction, CLI, and MCP.
 
-### Load Offset Explained
+## MCP and analysis safety bounds
 
-For position-independent executables (PIE) and shared libraries, the addresses in the QEMU log are runtime virtual addresses where the binary was loaded. The ELF file contains symbols at file-relative addresses (typically starting from 0 for shared objects).
+The `mcp` object also supplies bounds and roots to the shared analysis backend,
+so they apply to MCP, CLI, and the GUI Analysis Tools dock:
 
-To correctly resolve symbols:
-- **Kernel**: Usually linked at a fixed address (`0xffffffff80000000`), no offset needed
-- **Init/user programs**: Linked at a fixed address (`0x400000`), no offset needed  
-- **Shared libraries (libc.so, etc.)**: Loaded at runtime base address. Set `offset` to the load base address so runtime addresses can be converted to file-relative addresses.
+- `bindAddress`, `port`: default MCP listener.
+- `allowedCidrs`: clients permitted to reach MCP. Loopback is the safe default.
+- `allowedRoots`: additional filesystem roots that tools may read. The current
+  workspace, configured coredump directory, and configured symbol/binary
+  directories are also implicit roots.
+- `maxEntries`, `maxHits`, `maxMemoryBytes`, `maxStringLength`,
+  `sourceWindowLines`, `maxDisassemblyInstructions`: response and scan bounds.
 
-### Default Configuration
+Do not expose MCP beyond loopback without deliberately configuring both
+`bindAddress` and `allowedCidrs`. Files outside the effective roots described
+above are rejected by analysis operations.
 
-If no `logview.json` file is found, the application will use these default mappings:
-
-1. `0x400000-0x800000` → `./build/modules/init/init`
-2. `0xffffffff80000000-0xffffffffffffffff` → `./build/modules/kern/wos`
-3. `0x7f0000000000-0x7fffffffffff` → `./build/lib/libc.so`
-
-### Usage
-
-1. Create a `logview.json` file in the directory where you run the log viewer
-2. Configure the address ranges and paths according to your build system
-3. The application will automatically load the configuration on startup
-4. When viewing log entries, the details pane will show symbol file information for addresses that fall within the configured ranges
-
-### Future Enhancements
-
-The configuration system is designed to be extensible. Future versions may include:
-
--   Automatic symbol lookup and resolution
--   Integration with objdump/nm for symbol information
--   Support for multiple symbol file formats
--   Runtime configuration editing through the GUI
+See [README.md](README.md) for GUI, CLI, MCP, batch workflows, and the full
+capability map.

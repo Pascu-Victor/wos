@@ -666,7 +666,7 @@ auto McpHttpServer::handle_method(const QString& method, const QJsonObject& para
         return QJsonObject{};
     }
     if (method == "tools/list") {
-        return tool_list();
+        return DebugAnalysisService::tool_catalog();
     }
     if (method == "tools/call") {
         return call_tool(params);
@@ -688,7 +688,7 @@ auto McpHttpServer::handle_method(const QString& method, const QJsonObject& para
     return QJsonObject{{"_jsonrpcError", QJsonObject{{"code", -32601}, {"message", QString("Method not found: %1").arg(method)}}}};
 }
 
-auto McpHttpServer::tool_list() -> QJsonObject {
+auto DebugAnalysisService::tool_catalog() -> QJsonObject {
     auto schema = [](const QJsonObject& properties, const QJsonArray& required = {}) {
         return QJsonObject{{"type", "object"}, {"properties", properties}, {"required", required}};
     };
@@ -972,6 +972,19 @@ auto McpHttpServer::tool_list() -> QJsonObject {
                                             {"filter", QJsonObject{{"type", "string"}}},
                                             {"maxHits", QJsonObject{{"type", "integer"}}}})}},
         QJsonObject{
+            {"name", "wosdbg.build_distributed_timeline"},
+            {"description",
+             "Build a bounded multi-log incident timeline. Select events with query/regex, expand related events using common "
+             "distributed identifiers (cookie, request, task, resource, peer, pid, fd), and report per-log lanes plus identifiers "
+             "that cross resource boundaries. Timestamped events are globally ordered; logs without clocks retain per-log row order."},
+            {"inputSchema", schema({{"logIds", QJsonObject{{"type", "array"}, {"items", QJsonObject{{"type", "string"}}}}},
+                                    {"query", QJsonObject{{"type", "string"}}},
+                                    {"regex", QJsonObject{{"type", "boolean"}}},
+                                    {"correlationKeys", QJsonObject{{"type", "array"}, {"items", QJsonObject{{"type", "string"}}}}},
+                                    {"expandCorrelations", QJsonObject{{"type", "boolean"}}},
+                                    {"maxEvents", QJsonObject{{"type", "integer"}}},
+                                    {"context", QJsonObject{{"type", "integer"}}}})}},
+        QJsonObject{
             {"name", "wosdbg.explain_remote_exec_path"},
             {"description",
              "Explain the likely source-level path for a /wki/<peer>/... remote executable: remote_compute VFS_REF, exec/VFS "
@@ -1002,84 +1015,88 @@ auto McpHttpServer::tool_result(const QJsonObject& payload) -> QJsonObject {
         {"content", QJsonArray{text_content(text)}}, {"structuredContent", payload}, {"isError", !payload["ok"].toBool(true)}};
 }
 
-auto McpHttpServer::call_tool(const QJsonObject& params) const -> QJsonObject {
-    QString name = params["name"].toString();
-    QJsonObject args = params["arguments"].toObject();
+auto DebugAnalysisService::invoke_tool(const QString& name, const QJsonObject& args) -> QJsonObject {
     QJsonObject payload;
     if (name == "wosdbg.status") {
-        payload = analysis->status();
+        payload = status();
     } else if (name == "wosdbg.extract_coredumps") {
-        payload = analysis->extract_coredumps(args);
+        payload = extract_coredumps(args);
     } else if (name == "wosdbg.list_logs") {
-        payload = DebugAnalysisService::list_logs();
+        payload = list_logs();
     } else if (name == "wosdbg.load_log") {
-        payload = analysis->load_log(args);
+        payload = load_log(args);
     } else if (name == "wosdbg.get_log_entries") {
-        payload = analysis->get_log_entries(args);
+        payload = get_log_entries(args);
     } else if (name == "wosdbg.search_log") {
-        payload = analysis->search_log(args);
+        payload = search_log(args);
     } else if (name == "wosdbg.get_log_context") {
-        payload = analysis->get_log_context(args);
+        payload = get_log_context(args);
     } else if (name == "wosdbg.list_coredumps") {
-        payload = analysis->list_coredumps();
+        payload = list_coredumps();
     } else if (name == "wosdbg.open_coredump") {
-        payload = analysis->open_coredump(args);
+        payload = open_coredump(args);
     } else if (name == "wosdbg.get_crash_summary") {
-        payload = analysis->get_crash_summary(args);
+        payload = get_crash_summary(args);
     } else if (name == "wosdbg.analyze_coredump") {
-        payload = analysis->analyze_coredump(args);
+        payload = analyze_coredump(args);
     } else if (name == "wosdbg.backtrace_coredump") {
-        payload = analysis->backtrace_coredump(args);
+        payload = backtrace_coredump(args);
     } else if (name == "wosdbg.decode_fault_instruction") {
-        payload = analysis->decode_fault_instruction(args);
+        payload = decode_fault_instruction(args);
     } else if (name == "wosdbg.inspect_pte") {
-        payload = analysis->inspect_page_table(args);
+        payload = inspect_page_table(args);
     } else if (name == "wosdbg.annotate_stack") {
-        payload = analysis->annotate_stack(args);
+        payload = annotate_stack(args);
     } else if (name == "wosdbg.describe_registers") {
-        payload = analysis->describe_registers(args);
+        payload = describe_registers(args);
     } else if (name == "wosdbg.follow_register") {
-        payload = analysis->follow_register(args);
+        payload = follow_register(args);
     } else if (name == "wosdbg.search_coredump_memory") {
-        payload = analysis->search_coredump_memory(args);
+        payload = search_coredump_memory(args);
     } else if (name == "wosdbg.find_pointers") {
-        payload = analysis->find_pointers(args);
+        payload = find_pointers(args);
     } else if (name == "wosdbg.get_memory_context") {
-        payload = analysis->get_memory_context(args);
+        payload = get_memory_context(args);
     } else if (name == "wosdbg.disassemble_coredump") {
-        payload = analysis->disassemble_coredump(args);
+        payload = disassemble_coredump(args);
     } else if (name == "wosdbg.resolve_address") {
-        payload = analysis->resolve_address_tool(args);
+        payload = resolve_address_tool(args);
     } else if (name == "wosdbg.verify_embedded_elf") {
-        payload = analysis->verify_embedded_elf(args);
+        payload = verify_embedded_elf(args);
     } else if (name == "wosdbg.check_elf_mapping") {
-        payload = analysis->check_elf_mapping(args);
+        payload = check_elf_mapping(args);
     } else if (name == "wosdbg.find_duplicate_pages") {
-        payload = analysis->find_duplicate_pages(args);
+        payload = find_duplicate_pages(args);
     } else if (name == "wosdbg.analyze_elf_integrity") {
-        payload = analysis->analyze_elf_integrity(args);
+        payload = analyze_elf_integrity(args);
     } else if (name == "wosdbg.elf_layout_summary") {
-        payload = analysis->elf_layout_summary(args);
+        payload = elf_layout_summary(args);
     } else if (name == "wosdbg.compare_expected_disassembly") {
-        payload = analysis->compare_expected_disassembly(args);
+        payload = compare_expected_disassembly(args);
     } else if (name == "wosdbg.scan_chunk_corruption") {
-        payload = analysis->scan_chunk_corruption(args);
+        payload = scan_chunk_corruption(args);
     } else if (name == "wosdbg.audit_executable_ptes") {
-        payload = analysis->audit_executable_ptes(args);
+        payload = audit_executable_ptes(args);
     } else if (name == "wosdbg.recognize_startup_stack") {
-        payload = analysis->recognize_startup_stack(args);
+        payload = recognize_startup_stack(args);
     } else if (name == "wosdbg.correlate_coredump_logs") {
-        payload = analysis->correlate_coredump_logs(args);
+        payload = correlate_coredump_logs(args);
     } else if (name == "wosdbg.reconstruct_wki_trace") {
-        payload = analysis->reconstruct_wki_trace(args);
+        payload = reconstruct_wki_trace(args);
+    } else if (name == "wosdbg.build_distributed_timeline") {
+        payload = build_distributed_timeline(args);
     } else if (name == "wosdbg.explain_remote_exec_path") {
-        payload = analysis->explain_remote_exec_path(args);
+        payload = explain_remote_exec_path(args);
     } else if (name == "wosdbg.diagnose_remote_exec_corruption") {
-        payload = analysis->diagnose_remote_exec_corruption(args);
+        payload = diagnose_remote_exec_corruption(args);
     } else if (name == "wosdbg.get_source_context") {
-        payload = analysis->get_source_context(args);
+        payload = get_source_context(args);
     } else {
         payload = QJsonObject{{"ok", false}, {"error", QString("Unknown tool: %1").arg(name)}};
     }
-    return tool_result(payload);
+    return payload;
+}
+
+auto McpHttpServer::call_tool(const QJsonObject& params) const -> QJsonObject {
+    return tool_result(analysis->invoke_tool(params["name"].toString(), params["arguments"].toObject()));
 }
