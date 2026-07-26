@@ -224,9 +224,9 @@ capture_distributed_serial_evidence() {
 capture_distributed_telemetry() {
     local runner_pid="$1"
     local output="$2"
-    local participant_host snapshot timestamp load_line compute_line running_active index
+    local participant_host snapshot timestamp load_line compute_line channel_line running_active index
 
-    printf 'timestamp_utc\thost\tloadavg_state\twki_compute\n' > "$output"
+    printf 'timestamp_utc\thost\tloadavg_state\twki_compute\twki_channel_bytes\n' > "$output"
     distributed_running_seen=()
     for ((index = 0; index < ${#distributed_hosts[@]}; ++index)); do
         distributed_running_seen+=(0)
@@ -237,10 +237,12 @@ capture_distributed_telemetry() {
         for ((index = 0; index < ${#distributed_hosts[@]}; ++index)); do
             participant_host="${distributed_hosts[$index]}"
             snapshot="$("$WOS_SSH" "$participant_host" \
-                "sed -n '1p' /proc/kcpustate; grep '^wki_compute ' /proc/wki/netdiag" 2>/dev/null || true)"
+                "sed -n '1p' /proc/kcpustate; awk '/^wki_compute / { print } /^wki_channel / { for (i = 1; i <= NF; ++i) { split(\$i, field, \"=\"); if (field[1] == \"bytes_tx\") tx += field[2]; else if (field[1] == \"bytes_rx\") rx += field[2]; } } END { printf \"wki_channel_bytes tx=%.0f rx=%.0f\\n\", tx, rx }' /proc/wki/netdiag" 2>/dev/null || true)"
             load_line="$(printf '%s\n' "$snapshot" | sed -n '1p')"
             compute_line="$(printf '%s\n' "$snapshot" | sed -n '2p')"
-            printf '%s\t%s\t%s\t%s\n' "$timestamp" "$participant_host" "$load_line" "$compute_line" >> "$output"
+            channel_line="$(printf '%s\n' "$snapshot" | sed -n '3p')"
+            printf '%s\t%s\t%s\t%s\t%s\n' \
+                "$timestamp" "$participant_host" "$load_line" "$compute_line" "$channel_line" >> "$output"
             running_active="$(printf '%s\n' "$compute_line" | sed -n 's/.* running_active=\([0-9][0-9]*\).*/\1/p')"
             if [ -n "$running_active" ] && [ "$running_active" -gt 0 ]; then
                 distributed_running_seen[$index]=1
