@@ -419,6 +419,35 @@ def require_exit_waiter_notify_drains_all_batches(exit_cpp: str) -> None:
         fail("exit waitpid notifier must not stop after one fixed-size snapshot")
 
 
+def require_group_exit_scan_survives_registry_removal(exit_cpp: str) -> None:
+    candidate_body = function_body(exit_cpp, "thread_group_exit_request_candidate")
+    for snippet in [
+        "task != request->initiator",
+        "task_alive_for_group_exit_request(task)",
+        "sched_task::same_thread_group(*task, request->process_pid)",
+        "!task->process_exit_requested.load(std::memory_order_acquire)",
+    ]:
+        if snippet not in candidate_body:
+            fail(f"thread-group exit candidate must exclude already-requested or unrelated tasks: {snippet}")
+
+    request_body = function_body(exit_cpp, "request_thread_group_exit")
+    for snippet in [
+        "for (;;)",
+        "find_active_task_lifetime_ref_if(thread_group_exit_request_candidate",
+        "publish_process_exit_request(task, status, wait_status)",
+        "task->release()",
+    ]:
+        if snippet not in request_body:
+            fail(f"thread-group exit must retain and request each sibling through registry mutation: {snippet}")
+
+    for snippet in [
+        "get_active_task_count()",
+        "get_active_task_at_safe(",
+    ]:
+        if snippet in request_body:
+            fail(f"thread-group exit must not index-walk the swap-removing active registry: {snippet}")
+
+
 def require_exit_notify_ready_is_before_address_cleanup(waitpid_cpp: str, scheduler_cpp: str, exit_cpp: str) -> None:
     for source, helper in [
         (waitpid_cpp, "is_waitable_exit"),
@@ -520,6 +549,7 @@ def main() -> None:
     require_interrupted_waitpid_cleans_stale_wait_state(task_hpp, task_cpp, scheduler_cpp, exit_cpp)
     require_exit_completion_respects_publish_fence(exit_cpp)
     require_exit_waiter_notify_drains_all_batches(exit_cpp)
+    require_group_exit_scan_survives_registry_removal(exit_cpp)
     require_exit_notify_ready_is_before_address_cleanup(waitpid_cpp, scheduler_cpp, exit_cpp)
     require_scheduler_waitpid_completion_claims_waiter(task_hpp, waitpid_cpp, scheduler_cpp)
     require_waitpid_uses_stable_active_scans(scheduler_hpp, scheduler_cpp, waitpid_cpp)

@@ -11,6 +11,10 @@ KTEST(ProcessExitWaiters, NotifyDrainsMoreThanOneFixedBatch) {
     KEXPECT_TRUE(ker::syscall::process::process_selftest_exit_waiter_notify_drains_over_batch());
 }
 
+KTEST(ProcessGroupExit, CandidateFilterSelectsOnlyLiveUnrequestedSibling) {
+    KEXPECT_TRUE(ker::syscall::process::process_selftest_group_exit_candidate_filter());
+}
+
 KTEST(ExecFdClone, SkipsCloexecAndRollsBackFailure) {
     KEXPECT_TRUE(ker::syscall::process::exec_selftest_fd_clone_skips_cloexec_and_rolls_back_failure());
 }

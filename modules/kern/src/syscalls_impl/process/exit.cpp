@@ -379,22 +379,43 @@ void publish_process_exit_request(ker::mod::sched::task::Task* task, int status,
     ker::mod::sched::wake_task_for_signal(task);
 }
 
+struct ThreadGroupExitRequest {
+    ker::mod::sched::task::Task* initiator;
+    uint64_t process_pid;
+};
+
+#ifdef WOS_SELFTEST
+ker::mod::sched::task::Task group_exit_selftest_initiator;  // NOLINT
+ker::mod::sched::task::Task group_exit_selftest_candidate;  // NOLINT
+#endif
+
+auto thread_group_exit_request_candidate(ker::mod::sched::task::Task* task, void* context) -> bool {
+    auto* request = static_cast<ThreadGroupExitRequest*>(context);
+    return request != nullptr && task != request->initiator && task_alive_for_group_exit_request(task) &&
+           sched_task::same_thread_group(*task, request->process_pid) && !task->process_exit_requested.load(std::memory_order_acquire);
+}
+
 void request_thread_group_exit(ker::mod::sched::task::Task* initiator, int status, int wait_status) {
     if (initiator == nullptr) {
         return;
     }
 
-    uint64_t const PROCESS_PID = sched_task::process_pid(*initiator);
-    uint32_t const COUNT = ker::mod::sched::get_active_task_count();
-    for (uint32_t i = 0; i < COUNT; i++) {
-        auto* task = ker::mod::sched::get_active_task_at_safe(i);
+    ThreadGroupExitRequest request{
+        .initiator = initiator,
+        .process_pid = sched_task::process_pid(*initiator),
+    };
+    for (;;) {
+        // A sibling may run its exit path immediately after being woken. The
+        // active-task registry removes entries by swapping its final slot into
+        // the vacated index, so an index walk can skip the moved sibling.
+        // Select one unrequested sibling at a time under the registry lock and
+        // retain it through request publication instead.
+        auto* task = ker::mod::sched::find_active_task_lifetime_ref_if(thread_group_exit_request_candidate, static_cast<void*>(&request));
         if (task == nullptr) {
-            continue;
+            break;
         }
 
-        if (task != initiator && sched_task::same_thread_group(*task, PROCESS_PID)) {
-            publish_process_exit_request(task, status, wait_status);
-        }
+        publish_process_exit_request(task, status, wait_status);
         task->release();
     }
 }
@@ -664,6 +685,46 @@ void exit_current_if_process_exit_requested() {
 }
 
 #ifdef WOS_SELFTEST
+auto process_selftest_group_exit_candidate_filter() -> bool {
+    auto& initiator = group_exit_selftest_initiator;
+    auto& candidate = group_exit_selftest_candidate;
+    constexpr uint64_t PROCESS_PID = 700;
+
+    initiator.type = sched_task::TaskType::PROCESS;
+    initiator.pid = PROCESS_PID;
+    initiator.owner_pid = 0;
+    initiator.has_exited = false;
+    initiator.state.store(sched_task::TaskState::ACTIVE, std::memory_order_relaxed);
+
+    candidate.type = sched_task::TaskType::PROCESS;
+    candidate.pid = PROCESS_PID + 1;
+    candidate.owner_pid = PROCESS_PID;
+    candidate.has_exited = false;
+    candidate.state.store(sched_task::TaskState::ACTIVE, std::memory_order_relaxed);
+    candidate.process_exit_requested.store(false, std::memory_order_relaxed);
+
+    ThreadGroupExitRequest request{
+        .initiator = &initiator,
+        .process_pid = PROCESS_PID,
+    };
+    bool const MATCHES_LIVE_SIBLING = thread_group_exit_request_candidate(&candidate, &request);
+
+    candidate.process_exit_requested.store(true, std::memory_order_relaxed);
+    bool const EXCLUDES_REQUESTED = !thread_group_exit_request_candidate(&candidate, &request);
+    candidate.process_exit_requested.store(false, std::memory_order_relaxed);
+
+    candidate.owner_pid = PROCESS_PID + 2;
+    bool const EXCLUDES_OTHER_GROUP = !thread_group_exit_request_candidate(&candidate, &request);
+    candidate.owner_pid = PROCESS_PID;
+
+    candidate.state.store(sched_task::TaskState::DEAD, std::memory_order_relaxed);
+    bool const EXCLUDES_DEAD = !thread_group_exit_request_candidate(&candidate, &request);
+    candidate.state.store(sched_task::TaskState::ACTIVE, std::memory_order_relaxed);
+
+    bool const EXCLUDES_INITIATOR = !thread_group_exit_request_candidate(&initiator, &request);
+    return MATCHES_LIVE_SIBLING && EXCLUDES_REQUESTED && EXCLUDES_OTHER_GROUP && EXCLUDES_DEAD && EXCLUDES_INITIATOR;
+}
+
 auto process_selftest_exit_waiter_notify_drains_over_batch() -> bool {
     ker::mod::sched::task::Task exiting{};
     constexpr size_t WAITER_COUNT = (EXIT_WAITER_NOTIFY_BATCH * 2) + 3;
