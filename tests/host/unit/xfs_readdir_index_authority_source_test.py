@@ -37,6 +37,7 @@ assert "TARGET_STATUS != 0" in index_membership
 visibility = function_body(VFS, "auto readdir_entry_visibility(")
 assert "xfs_dentry_cache_lookup_parent" in visibility
 assert "&may_have_removed_record" in visibility
+assert "xfs_dir_index_known_complete(parent)" in visibility
 assert "!may_have_removed_record && (!CACHED || cached_result != -ENOENT)" in visibility
 assert "xfs_dir_entry_is_indexed" in visibility
 
@@ -62,5 +63,11 @@ batch = function_body(VFS, "auto readdir_batch_callback(")
 for body in (single, batch):
     assert "readdir_entry_visibility" in body
     assert "VISIBILITY == 0" in body
+    assert "residual_seen = true" in body
+
+readdir = function_body(VFS, "auto xfs_vfs_readdir(")
+assert "xfs_dir_index_note_complete(xfd->inode)" in readdir
+assert "!ctx.found && !ctx.residual_seen" in readdir
+assert "cache->count < XFS_READDIR_CACHE_ENTRIES && !batch_ctx.residual_seen" in readdir
 
 print("XFS readdir index-authority source invariants passed")

@@ -73,6 +73,12 @@ auto xfs_dir_lookup_authoritative(XfsInode* dp, const char* name, uint16_t namel
 // observed record is unreachable, or a negative errno for I/O/corruption.
 auto xfs_dir_entry_is_indexed(XfsInode* dp, const XfsDirEntry* observed) -> int;
 
+// A complete data-area scan can prove that every observed record is backed by
+// the authoritative directory index for the current mutation generation.
+// Readdir uses this as a one-generation fast-path certificate.
+auto xfs_dir_index_known_complete(const XfsInode* dp) -> bool;
+void xfs_dir_index_note_complete(XfsInode* dp);
+
 // Look up a name already observed for a parent inode without loading that
 // parent inode.  Returns true only when the dentry cache can answer.
 auto xfs_dentry_cache_lookup_parent(XfsMountContext* mount, xfs_ino_t parent_ino, const char* name, uint16_t namelen, XfsDirEntry* entry,

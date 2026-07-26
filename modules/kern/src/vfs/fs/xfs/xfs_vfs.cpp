@@ -1990,6 +1990,7 @@ struct ReaddirCtx {
     size_t current_index{};
     bool use_cookie{};
     bool found{};
+    bool residual_seen{};
     int status{};
 };
 
@@ -2047,14 +2048,14 @@ auto readdir_entry_visibility(XfsInode* parent, const XfsDirEntry* entry) -> int
     bool may_have_removed_record = false;
     bool const CACHED = xfs_dentry_cache_lookup_parent(parent->mount, parent->ino, entry->name.data(), entry->namelen, &cached,
                                                        &cached_result, &may_have_removed_record);
-    if (!may_have_removed_record && (!CACHED || cached_result != -ENOENT)) {
+    if (xfs_dir_index_known_complete(parent) && !may_have_removed_record && (!CACHED || cached_result != -ENOENT)) {
         return 1;
     }
 
-    // Successful removal installs both a negative dentry and a per-directory
-    // summary bit. The dentry is fast but bounded; the generation summary
-    // survives its eviction. Verify only these exceptional records against
-    // the index so normal readdir stays a linear data scan.
+    // Until a complete scan proves this generation, every data-area record
+    // must agree with the pathname-authoritative index. Successful removal
+    // also installs both a negative dentry and a per-directory summary bit,
+    // which keeps verification enabled for residual records after a proof.
     return xfs_dir_entry_is_indexed(parent, entry);
 }
 
@@ -2066,6 +2067,7 @@ auto readdir_callback(const XfsDirEntry* xde, void* ctx_ptr) -> int {
         return 1;
     }
     if (VISIBILITY == 0) {
+        rctx->residual_seen = true;
         return 0;
     }
 
@@ -2090,6 +2092,7 @@ struct ReaddirBatchCtx {
     size_t current_index{};
     size_t next_request_index{};
     bool use_cookie{};
+    bool residual_seen{};
     int status{};
 };
 
@@ -2140,6 +2143,7 @@ auto readdir_batch_callback(const XfsDirEntry* xde, void* ctx_ptr) -> int {
         return 1;
     }
     if (VISIBILITY == 0) {
+        ctx->residual_seen = true;
         return 0;
     }
 
@@ -2198,6 +2202,9 @@ auto xfs_vfs_readdir(File* f, DirEntry* entry, size_t index) -> int {
         if (ctx.status != 0) {
             return ctx.status;
         }
+        if (!ctx.found && !ctx.residual_seen) {
+            xfs_dir_index_note_complete(xfd->inode);
+        }
 
         return ctx.found ? 0 : -1;  // -1 = no more entries
     }
@@ -2223,6 +2230,9 @@ auto xfs_vfs_readdir(File* f, DirEntry* entry, size_t index) -> int {
     if (batch_ctx.status != 0) {
         cache->count = 0;
         return batch_ctx.status;
+    }
+    if (cache->count < XFS_READDIR_CACHE_ENTRIES && !batch_ctx.residual_seen) {
+        xfs_dir_index_note_complete(xfd->inode);
     }
     if (xfs_readdir_cache_lookup(xfd, index, entry)) {
         return 0;
@@ -2965,6 +2975,10 @@ auto xfs_selftest_readdir_cache_batches_sequential_scan() -> bool {
     dir.data_fork.local.data = data.data();
     dir.data_fork.local.size = static_cast<size_t>(p - data.data());
     dir.size = dir.data_fork.local.size;
+    // This cache-batching fixture has no backing inode table or mount
+    // geometry. Model a directory whose index was already proven so the test
+    // remains focused on batching and generation invalidation.
+    xfs_dir_index_note_complete(&dir);
 
     XfsFileData xfd{};
     xfd.mount = &mount;
@@ -3041,6 +3055,7 @@ auto xfs_selftest_readdir_cache_batches_sequential_scan() -> bool {
     }
 
     dir.dir_generation++;
+    xfs_dir_index_note_complete(&dir);
     DirEntry stale{};
     if (xfs_readdir_cache_lookup(&xfd, first_real.d_off, &stale) || xfd.readdir_cache->count != 0 ||
         xfd.readdir_cache->dir_generation != dir.dir_generation) {

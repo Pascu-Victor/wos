@@ -1715,6 +1715,10 @@ auto xfs_dir_entry_is_indexed(XfsInode* dp, const XfsDirEntry* observed) -> int 
     return dir_entry_index_membership(dp, observed, lookup_ret, &indexed);
 }
 
+auto xfs_dir_index_known_complete(const XfsInode* dp) -> bool { return dir2_leaf_index_known_complete(dp); }
+
+void xfs_dir_index_note_complete(XfsInode* dp) { dir2_leaf_index_note_complete(dp); }
+
 void xfs_dir_observe_entry(XfsInode* dp, const XfsDirEntry* entry) {
     if (dp == nullptr || entry == nullptr || entry->namelen == 0) {
         return;
@@ -4971,14 +4975,14 @@ auto xfs_selftest_block_lookup_uses_leaf_index_for_misses() -> bool {
 auto xfs_selftest_leaf_index_complete_marker() -> bool {
     XfsInode dir{};
     dir.dir_generation = 7;
-    bool ok = !dir2_leaf_index_known_complete(&dir);
-    dir2_leaf_index_note_complete(&dir);
-    ok = ok && dir2_leaf_index_known_complete(&dir);
+    bool ok = !xfs_dir_index_known_complete(&dir);
+    xfs_dir_index_note_complete(&dir);
+    ok = ok && xfs_dir_index_known_complete(&dir);
     dir.dir_generation++;
-    ok = ok && !dir2_leaf_index_known_complete(&dir);
+    ok = ok && !xfs_dir_index_known_complete(&dir);
     dir2_leaf_index_note_complete(&dir);
     dir2_leaf_index_note_unknown(&dir);
-    ok = ok && !dir2_leaf_index_known_complete(&dir);
+    ok = ok && !xfs_dir_index_known_complete(&dir);
 
     std::array<XfsDir2LeafEntry, 2> entries{};
     xfs_dahash_t const ALPHA_HASH = xfs_da_hashname(reinterpret_cast<const uint8_t*>("alpha"), 5);
