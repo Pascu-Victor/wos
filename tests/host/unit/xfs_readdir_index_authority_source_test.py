@@ -44,6 +44,19 @@ remove = function_body(DIR2, "auto xfs_dir_removename(")
 assert "xfs_dentry_cache_note_removed_name(dp, name, namelen)" in remove
 assert remove.index("xfs_dentry_cache_note_removed_name") < remove.index("xfs_dentry_cache_store")
 
+find_data = function_body(DIR2, "auto dir2_leaf_node_find_data_entry(")
+assert "expected_ino == NULLFSINO || dep->inumber.to_cpu() == expected_ino" in find_data
+
+leaf_remove = function_body(DIR2, "auto dir2_leaf_node_removename(")
+assert "bool const INDEXED_ENTRY = rc == 0" in leaf_remove
+assert "rc != 0 && rc != -ENOENT" in leaf_remove
+assert "if (INDEXED_ENTRY)" in leaf_remove
+assert "if (leaf_bh != nullptr)" in leaf_remove
+assert "dir2_make_data_free" in leaf_remove
+
+for caller in ("xfs_unlink_path", "xfs_rmdir_path", "xfs_rename_path"):
+    assert "xfs_dir_removename(" in function_body(VFS, f"auto {caller}(")
+
 single = function_body(VFS, "auto readdir_callback(")
 batch = function_body(VFS, "auto readdir_batch_callback(")
 for body in (single, batch):

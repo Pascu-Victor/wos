@@ -200,7 +200,7 @@ def main() -> None:
     rmdir_cursor = 0
     for token in (
         "if (parent_ip->nlink <= 2)",
-        "xfs_dir_removename(parent_ip, name, namelen, tp);",
+        "xfs_dir_removename(parent_ip, name, namelen, tp, de.ino);",
         "parent_ip->nlink--;",
         "xfs_trans_log_inode(tp, parent_ip);",
         "dir_ip->nlink = 0;",

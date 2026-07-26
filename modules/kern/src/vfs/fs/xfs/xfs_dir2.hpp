@@ -108,9 +108,10 @@ auto xfs_dir_addname(XfsInode* dp, const char* name, uint16_t namelen, xfs_ino_t
 
 // Remove a name from a directory.
 // dp: directory inode, name/namelen: entry name, tp: enclosing transaction.
+// expected_ino optionally selects an exact data-area record during recovery.
 // Returns 0 on success, -ENOENT if not found, negative errno on failure.
 // Supports shortform, block-format, and leaf/node directories.
-auto xfs_dir_removename(XfsInode* dp, const char* name, uint16_t namelen, XfsTransaction* tp) -> int;
+auto xfs_dir_removename(XfsInode* dp, const char* name, uint16_t namelen, XfsTransaction* tp, xfs_ino_t expected_ino = NULLFSINO) -> int;
 
 struct XfsDentryCacheStats {
     uint64_t hits{};

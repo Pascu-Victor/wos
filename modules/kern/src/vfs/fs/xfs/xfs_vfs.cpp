@@ -4357,6 +4357,7 @@ auto xfs_open_path(const char* fs_path, int flags, int mode, XfsMountContext* ct
     bool used_create_lookup = false;
     bool create_missing = false;
     bool repair_unreachable_create_entry = false;
+    xfs_ino_t repair_unreachable_create_ino = NULLFSINO;
     bool created_by_open = false;
     bool path_cache_needs_store = true;
     XfsInode* create_parent_ip = nullptr;
@@ -4426,6 +4427,7 @@ auto xfs_open_path(const char* fs_path, int flags, int mode, XfsMountContext* ct
                         ip = nullptr;
                         create_missing = true;
                         repair_unreachable_create_entry = true;
+                        repair_unreachable_create_ino = existing.ino;
                         record_create_lookup(0);
                     } else if (ip == nullptr) {
                         ker::vfs::Stat existing_stat{};
@@ -4433,6 +4435,7 @@ auto xfs_open_path(const char* fs_path, int flags, int mode, XfsMountContext* ct
                         if (TARGET_STATUS == -ENOENT) {
                             create_missing = true;
                             repair_unreachable_create_entry = true;
+                            repair_unreachable_create_ino = existing.ino;
                             record_create_lookup(0);
                         } else {
                             xfs_inode_release(create_parent_ip);
@@ -4583,7 +4586,8 @@ auto xfs_open_path(const char* fs_path, int flags, int mode, XfsMountContext* ct
         perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::CREATE_INODE_INIT, PERF_INODE_INIT_STARTED_US, 0, 1);
 
         if (repair_unreachable_create_entry) {
-            int const REMOVE_RC = xfs_dir_removename(create_parent_ip, create_filename, create_filename_len, tp);
+            int const REMOVE_RC =
+                xfs_dir_removename(create_parent_ip, create_filename, create_filename_len, tp, repair_unreachable_create_ino);
             if (REMOVE_RC != 0) {
                 xfs_trans_cancel(tp);
                 xfs_inode_free_uncached(new_inode);
@@ -5632,7 +5636,7 @@ auto xfs_rmdir_path(const char* fs_path, XfsMountContext* ctx, size_t known_fs_p
         return rc;
     }
 
-    rc = xfs_dir_removename(parent_ip, name, namelen, tp);
+    rc = xfs_dir_removename(parent_ip, name, namelen, tp, de.ino);
     if (rc != 0) {
         xfs_trans_cancel(tp);
         xfs_inode_release(dir_ip);
@@ -5882,7 +5886,7 @@ auto xfs_rename_path(const char* old_fs_path, const char* new_fs_path, XfsMountC
             xfs_inode_release(old_parent);
             return rc;
         }
-        rc = xfs_dir_removename(new_parent, new_name, new_namelen, tp);
+        rc = xfs_dir_removename(new_parent, new_name, new_namelen, tp, new_de.ino);
         if (rc != 0) {
             xfs_trans_cancel(tp);
             xfs_inode_release(displaced);
@@ -5917,7 +5921,7 @@ auto xfs_rename_path(const char* old_fs_path, const char* new_fs_path, XfsMountC
     }
 
     // Remove old entry
-    rc = xfs_dir_removename(old_parent, old_name, old_namelen, tp);
+    rc = xfs_dir_removename(old_parent, old_name, old_namelen, tp, old_de.ino);
     if (rc != 0) {
         xfs_trans_cancel(tp);
         if (displaced != nullptr) {
@@ -6044,7 +6048,7 @@ auto xfs_unlink_path(const char* fs_path, XfsMountContext* ctx, size_t known_fs_
     }
 
     // Remove from parent directory
-    rc = xfs_dir_removename(parent_ip, filename, filename_len, tp);
+    rc = xfs_dir_removename(parent_ip, filename, filename_len, tp, de.ino);
     if (rc != 0) {
         xfs_trans_cancel(tp);
         xfs_inode_release(target_ip);
