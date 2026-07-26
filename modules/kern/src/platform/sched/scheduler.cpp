@@ -647,6 +647,11 @@ inline auto waitpid_repair_due(const task::Task* waiter, uint64_t now_us) -> boo
     return now_us > LAST_REPAIR_US && now_us - LAST_REPAIR_US >= WAITPID_REPAIR_FALLBACK_MIN_US;
 }
 
+inline auto process_exit_wait_repair_due(const task::Task* waiter) -> bool {
+    return waiter != nullptr && waiter->state.load(std::memory_order_acquire) == task::TaskState::ACTIVE &&
+           waiter->sched_queue == task::Task::sched_queue::WAITING && waiter->process_exit_requested.load(std::memory_order_acquire);
+}
+
 struct WaitpidRepairScanWindow {
     uint32_t start{};
     uint32_t size{};
@@ -4622,7 +4627,15 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
             while (t != nullptr) {
                 auto const WAIT_INDEX = static_cast<uint32_t>(scan_iterations);
                 scan_iterations++;
-                if (TIMED_SCAN && wake_count < PENDING_WAKE_LIMIT && t->wake_at_us != 0 && WAIT_SCAN_NOW_US >= t->wake_at_us) {
+                if (signal_wake_count < PENDING_WAKE_LIMIT && process_exit_wait_repair_due(t)) {
+                    // Group exit publication can race the final transition
+                    // into the wait list after its one-shot signal wake has
+                    // already observed this task as running. Reclassify the
+                    // waiter on a later scheduler tick so that process exit
+                    // cannot leave a futex-blocked sibling pinning the process
+                    // address space indefinitely.
+                    pending_wake_slot(signal_wake, signal_wake_count++) = t;
+                } else if (TIMED_SCAN && wake_count < PENDING_WAKE_LIMIT && t->wake_at_us != 0 && WAIT_SCAN_NOW_US >= t->wake_at_us) {
                     pending_wake_slot(to_wake, wake_count++) = t;
                 } else if (TIMED_SCAN && t->itimer_real_expire_us != 0 && WAIT_SCAN_NOW_US >= t->itimer_real_expire_us &&
                            signal_wake_count < PENDING_WAKE_LIMIT) {
@@ -8486,6 +8499,25 @@ auto scheduler_selftest_waitpid_wait_publication_arms_repair() -> bool {
     return ZERO_STAMP_REPAIR_DUE && ORPHAN_WITH_STALE_LINK_RECOGNIZED && ARMED && LINKED_WAITER_NOT_ORPHANED &&
            UNLINKED_STAMPED_WAITER_RECOGNIZED && PRESERVED && REPAIR_BACKOFF_PRESERVED && REPAIR_SCAN_FAIR &&
            rq->next_wait_deadline_us == 0;
+}
+
+auto scheduler_selftest_process_exit_wait_repair_predicate() -> bool {
+    task::Task waiter{};
+    waiter.state.store(task::TaskState::ACTIVE, std::memory_order_relaxed);
+    waiter.sched_queue = task::Task::sched_queue::WAITING;
+    waiter.process_exit_requested.store(true, std::memory_order_release);
+    bool const REQUESTED_WAITER_REPAIRED = process_exit_wait_repair_due(&waiter);
+
+    waiter.sched_queue = task::Task::sched_queue::RUNNABLE;
+    bool const RUNNABLE_NOT_REPAIRED = !process_exit_wait_repair_due(&waiter);
+    waiter.sched_queue = task::Task::sched_queue::WAITING;
+    waiter.process_exit_requested.store(false, std::memory_order_release);
+    bool const UNREQUESTED_WAITER_NOT_REPAIRED = !process_exit_wait_repair_due(&waiter);
+    waiter.process_exit_requested.store(true, std::memory_order_release);
+    waiter.state.store(task::TaskState::DEAD, std::memory_order_release);
+    bool const DEAD_WAITER_NOT_REPAIRED = !process_exit_wait_repair_due(&waiter);
+
+    return REQUESTED_WAITER_REPAIRED && RUNNABLE_NOT_REPAIRED && UNREQUESTED_WAITER_NOT_REPAIRED && DEAD_WAITER_NOT_REPAIRED;
 }
 
 auto scheduler_selftest_reserved_wake_precedes_handoff_commit() -> bool {

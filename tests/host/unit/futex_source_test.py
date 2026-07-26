@@ -115,22 +115,45 @@ def require_futex_wake_counts_only_claimed_waiters(source: str) -> None:
 
     for name in ["futex_wake", "futex_wake_by_phys"]:
         body = function_body(source, name)
-        claim = body.find("if (!claim_task_waiter(waiter_task, waiter))")
+        claim = body.find("if (claim_task_waiter(waiter_task, waiter))")
         wake = body.find("wake_task_from_event_on_cpu(waiter_task, waiter->task_cpu", claim)
         count = body.find("woken_count++", claim)
+        task_release = body.find("release_waiter_ref(waiter)", count)
         release = body.find("waiter_task->release()", claim)
         if claim < 0:
             fail(f"{name} must claim task->futex_waiter before waking")
         if wake < 0 or count < 0:
             fail(f"{name} must wake/count only after claiming task->futex_waiter")
-        if not (claim < wake < release and claim < count < release):
+        if not (claim < wake < count < task_release < release):
             fail(f"{name} must keep wake/count inside the successful waiter claim branch")
-        stale_branch = body[claim:wake]
-        if "own_waiter = false" not in stale_branch:
-            fail(f"{name} must mark stale waiters as not owned by the wake path")
+        table_release = body.find("release_waiter_ref(waiter)", release)
+        if table_release < release:
+            fail(f"{name} must release the removed table reference after task lookup")
 
     if "futex_selftest_stale_wake_does_not_claim_waiter" not in source:
         fail("KTEST helper must cover stale futex wake ownership")
+
+
+def require_futex_waiter_has_two_owner_lifetime(source: str) -> None:
+    for snippet in [
+        "std::atomic<uint32_t> ref_count{2}",
+        "auto release_waiter_ref(FutexWaiter* waiter) -> bool",
+        "waiter->ref_count.fetch_sub(1, std::memory_order_acq_rel)",
+        "if (PREVIOUS != 1)",
+        "delete waiter;",
+        "void retire_task_waiter_ref(FutexWaiter* waiter)",
+        "if (futex_table.remove(waiter))",
+        "retire_task_waiter_ref(static_cast<FutexWaiter*>(previous_waiter))",
+        "futex_selftest_waiter_two_owner_retirement",
+    ]:
+        if snippet not in source:
+            fail(f"futex waiter two-owner lifetime is missing: {snippet}")
+
+    cleanup = function_body(source, "futex_wait_cleanup_for_task")
+    if cleanup.count("release_waiter_ref(waiter)") != 2:
+        fail("futex task cleanup must retire the table reference when removed and always retire the task-slot reference")
+    if "delete waiter" in cleanup:
+        fail("futex task cleanup must not bypass shared waiter reference ownership")
 
 
 def require_futex_wake_honors_count_argument(source: str) -> None:
@@ -205,15 +228,40 @@ def require_timer_futex_cleanup_outside_runqueue_lock(source: str) -> None:
         fail("process_tasks does not clean timed-out futex waiters after dropping the runqueue lock")
 
 
+def require_process_exit_wait_repair_outside_runqueue_lock(source: str) -> None:
+    predicate = function_body(source, "process_exit_wait_repair_due")
+    for snippet in [
+        "TaskState::ACTIVE",
+        "sched_queue::WAITING",
+        "process_exit_requested.load(std::memory_order_acquire)",
+    ]:
+        if snippet not in predicate:
+            fail(f"process-exit wait repair predicate is missing: {snippet}")
+
+    body = function_body(source, "process_tasks")
+    locked_body, locked_end = braced_block_after(body, "run_queues->this_cpu_locked_void([WAIT_SCAN_NOW_US")
+    if "process_exit_wait_repair_due(t)" not in locked_body:
+        fail("process_tasks must classify exit-requested waiters under the runqueue lock")
+    if "pending_wake_slot(signal_wake, signal_wake_count++) = t;" not in locked_body:
+        fail("process_tasks must queue exit-requested waiters for a post-lock signal wake")
+    if "wake_task_for_signal" in locked_body:
+        fail("process_tasks must not wake exit-requested tasks while the runqueue lock is held")
+    after_lock = body[locked_end:]
+    if "wake_task_for_signal(pending_wake_slot(signal_wake, i))" not in after_lock:
+        fail("process_tasks must wake exit-requested waiters after dropping the runqueue lock")
+
+
 def main() -> None:
     futex_source = FUTEX_CPP.read_text()
     scheduler_source = SCHEDULER_CPP.read_text()
     require_futex_table_init_is_serialized(futex_source)
     require_futex_user_word_alignment_is_validated(futex_source)
     require_futex_wake_counts_only_claimed_waiters(futex_source)
+    require_futex_waiter_has_two_owner_lifetime(futex_source)
     require_futex_wake_honors_count_argument(futex_source)
     require_deferred_switch_futex_cleanup_outside_runqueue_lock(scheduler_source)
     require_timer_futex_cleanup_outside_runqueue_lock(scheduler_source)
+    require_process_exit_wait_repair_outside_runqueue_lock(scheduler_source)
     print("futex source lock-order invariants hold")
 
 

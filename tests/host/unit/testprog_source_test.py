@@ -8,6 +8,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 TESTPROG_MAIN_CPP = ROOT / "modules" / "testprog" / "src" / "main.cpp"
+THREAD_EXIT_STRESS_CPP = ROOT / "modules" / "testprog" / "src" / "thread_exit_stress.cpp"
 NETBENCH_CPP = ROOT / "modules" / "testprog" / "src" / "netbench.cpp"
 PERFBENCH_CPP = ROOT / "modules" / "testprog" / "src" / "perfbench.cpp"
 COWBENCH_CPP = ROOT / "modules" / "testprog" / "src" / "cowbench.cpp"
@@ -1557,6 +1558,36 @@ def test_mandelbench_overlaps_local_compute_with_remote_payload_drain() -> None:
         fail("mandelbench remote waitpid/payload draining must stay on the original fork-parent task")
 
 
+def test_thread_exit_stress_exercises_futex_group_exit() -> None:
+    main_source = TESTPROG_MAIN_CPP.read_text()
+    source = THREAD_EXIT_STRESS_CPP.read_text()
+    require_tokens(
+        main_source,
+        [
+            '#include "thread_exit_stress.hpp"',
+            'std::strcmp(command, "thread-exit-stress") == 0',
+            "run_thread_exit_stress(argc - 2, argv + 2)",
+        ],
+        "thread-exit stress command dispatch",
+    )
+    require_tokens(
+        source,
+        [
+            "pthread_cond_wait(&churn_condition, &churn_mutex)",
+            "pthread_cond_broadcast(&churn_condition)",
+            "start_churn.store(true, std::memory_order_release)",
+            "_Exit(0)",
+        ],
+        "thread-exit futex churn workload",
+    )
+    require_order(
+        source,
+        "start_churn.store(true, std::memory_order_release)",
+        "_Exit(0)",
+        "thread-exit stress begins futex churn before group exit",
+    )
+
+
 def main() -> None:
     test_ping_receive_is_deadline_bounded()
     test_netbench_io_is_deadline_bounded()
@@ -1574,6 +1605,7 @@ def main() -> None:
     test_mandelbench_coalesces_remote_workers_and_keeps_local_compute_local()
     test_mandelbench_worker_payload_rle_is_bounded_and_exact()
     test_mandelbench_overlaps_local_compute_with_remote_payload_drain()
+    test_thread_exit_stress_exercises_futex_group_exit()
     print("testprog ping, netbench, suite, perfbench, cowbench, and mandelbench waits are deadline bounded")
 
 

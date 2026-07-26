@@ -8,7 +8,6 @@
 #include <cstdint>
 #include <ctime>
 #include <new>
-#include <platform/dbg/dbg.hpp>
 #include <platform/ktime/ktime.hpp>
 #include <platform/mm/addr.hpp>
 #include <platform/mm/virt.hpp>
@@ -20,8 +19,6 @@
 
 namespace ker::syscall::futex {
 namespace {
-using log = ker::mod::dbg::logger<"futex">;
-
 // ============================================================================
 // Futex wait queue implementation — hash table keyed by physical address
 // ============================================================================
@@ -31,6 +28,10 @@ struct FutexWaiter {
     uint64_t task_pid{};               // PID of the waiting task
     uint64_t task_cpu{};               // CPU the task was running on
     FutexWaiter* hash_next = nullptr;  // intrusive chain for hash table
+    // A successfully published waiter has two independent owners: its table
+    // entry and Task::futex_waiter. Wake and cancellation paths can retire
+    // those owners concurrently, so deletion belongs to the final releaser.
+    std::atomic<uint32_t> ref_count{2};
 };
 
 struct FutexKeyExtract {
@@ -111,6 +112,30 @@ auto claim_task_waiter(mod::sched::task::Task* task, FutexWaiter* waiter) -> boo
 
     void* expected_waiter = waiter;
     return task->futex_waiter.compare_exchange_strong(expected_waiter, nullptr, std::memory_order_acq_rel, std::memory_order_acquire);
+}
+
+auto release_waiter_ref(FutexWaiter* waiter) -> bool {
+    if (waiter == nullptr) {
+        return false;
+    }
+
+    uint32_t const PREVIOUS = waiter->ref_count.fetch_sub(1, std::memory_order_acq_rel);
+    if (PREVIOUS != 1) {
+        return false;
+    }
+    delete waiter;
+    return true;
+}
+
+void retire_task_waiter_ref(FutexWaiter* waiter) {
+    if (waiter == nullptr) {
+        return;
+    }
+
+    if (futex_table.remove(waiter)) {
+        static_cast<void>(release_waiter_ref(waiter));  // Table reference.
+    }
+    static_cast<void>(release_waiter_ref(waiter));  // Task-slot reference.
 }
 
 }  // namespace
@@ -210,7 +235,7 @@ int64_t futex_wait(const int* addr, int expected, const void* timeout) {
     }
 
     if (previous_waiter != nullptr) {
-        log::warn("wait: PID %x replaced stale waiter %p with %p", current_task->pid, previous_waiter, waiter);
+        retire_task_waiter_ref(static_cast<FutexWaiter*>(previous_waiter));
     }
 
     return 0;
@@ -252,22 +277,18 @@ int64_t futex_wake(int* addr, int count) {  // NOLINT
     int woken_count = 0;
 
     futex_table.remove_by_key_limit(PHYS_ADDR, wake_limit, [&](FutexWaiter* waiter) -> bool {
-        bool own_waiter = true;
         bool claimed_waiter = false;
         auto* waiter_task = mod::sched::find_task_by_pid_safe(waiter->task_pid);
         if (waiter_task != nullptr) {
-            if (!claim_task_waiter(waiter_task, waiter)) {
-                own_waiter = false;
-            } else {
+            if (claim_task_waiter(waiter_task, waiter)) {
                 mod::sched::wake_task_from_event_on_cpu(waiter_task, waiter->task_cpu, mod::sched::EventWakeDeferredSwitch::CANCEL);
                 claimed_waiter = true;
                 woken_count++;
+                static_cast<void>(release_waiter_ref(waiter));  // Task-slot reference.
             }
             waiter_task->release();
         }
-        if (waiter_task == nullptr || own_waiter) {
-            delete waiter;
-        }
+        static_cast<void>(release_waiter_ref(waiter));  // Table reference.
         return claimed_waiter;
     });
 
@@ -284,8 +305,10 @@ void futex_wait_cleanup_for_task(mod::sched::task::Task* task) {
         return;
     }
 
-    futex_table.remove(waiter);
-    delete waiter;
+    if (futex_table.remove(waiter)) {
+        static_cast<void>(release_waiter_ref(waiter));  // Table reference.
+    }
+    static_cast<void>(release_waiter_ref(waiter));  // Task-slot reference.
 }
 
 int64_t futex_wake_by_phys(uint64_t phys_addr, int count) {
@@ -305,22 +328,18 @@ int64_t futex_wake_by_phys(uint64_t phys_addr, int count) {
 
     int woken_count = 0;
     futex_table.remove_by_key_limit(phys_addr, wake_limit, [&](FutexWaiter* waiter) -> bool {
-        bool own_waiter = true;
         bool claimed_waiter = false;
         auto* waiter_task = mod::sched::find_task_by_pid_safe(waiter->task_pid);
         if (waiter_task != nullptr) {
-            if (!claim_task_waiter(waiter_task, waiter)) {
-                own_waiter = false;
-            } else {
+            if (claim_task_waiter(waiter_task, waiter)) {
                 mod::sched::wake_task_from_event_on_cpu(waiter_task, waiter->task_cpu, mod::sched::EventWakeDeferredSwitch::CANCEL);
                 claimed_waiter = true;
                 woken_count++;
+                static_cast<void>(release_waiter_ref(waiter));  // Task-slot reference.
             }
             waiter_task->release();
         }
-        if (waiter_task == nullptr || own_waiter) {
-            delete waiter;
-        }
+        static_cast<void>(release_waiter_ref(waiter));  // Table reference.
         return claimed_waiter;
     });
     return woken_count;
@@ -356,6 +375,17 @@ auto futex_selftest_stale_wake_does_not_claim_waiter() -> bool {
     }
 
     return task.futex_waiter.load(std::memory_order_acquire) == &stale;
+}
+
+auto futex_selftest_waiter_two_owner_retirement() -> bool {
+    auto* waiter = new (std::nothrow) FutexWaiter{};
+    if (waiter == nullptr) {
+        return false;
+    }
+
+    bool const FIRST_OWNER_DELETED = release_waiter_ref(waiter);
+    bool const FINAL_OWNER_DELETED = release_waiter_ref(waiter);
+    return !FIRST_OWNER_DELETED && FINAL_OWNER_DELETED;
 }
 
 auto futex_selftest_wake_count_limit() -> bool {

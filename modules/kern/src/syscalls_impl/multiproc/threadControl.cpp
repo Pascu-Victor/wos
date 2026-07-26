@@ -20,6 +20,7 @@
 #include "abi/callnums/multiproc.h"
 #include "platform/dbg/dbg.hpp"
 #include "platform/smt/smt.hpp"
+#include "syscalls_impl/futex/futex.hpp"
 #include "syscalls_impl/log/sys_log.hpp"
 #include "syscalls_impl/vmem/sys_vmem.hpp"
 
@@ -122,6 +123,7 @@ auto publish_thread_tid_to_tcb(mod::sched::task::Task* parent, uint64_t tcb_va, 
     // Retire any stack-backed waiters created by descriptor/child teardown
     // before the thread becomes DEAD and its kernel stack enters reclamation.
     ker::net::wki::wki_wait_cleanup_for_task(task);
+    ker::syscall::futex::futex_wait_cleanup_for_task(task);
     task->has_exited = true;
     task->exit_status = 0;
     task->exit_notify_ready.store(true, std::memory_order_release);

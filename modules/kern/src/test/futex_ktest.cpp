@@ -7,4 +7,6 @@ KTEST(Futex, RejectsUnalignedUserWord) { KEXPECT_TRUE(ker::syscall::futex::futex
 
 KTEST(Futex, StaleWakeDoesNotClaimWaiter) { KEXPECT_TRUE(ker::syscall::futex::futex_selftest_stale_wake_does_not_claim_waiter()); }
 
+KTEST(Futex, WaiterRetiresAfterBothOwners) { KEXPECT_TRUE(ker::syscall::futex::futex_selftest_waiter_two_owner_retirement()); }
+
 KTEST(Futex, WakeCountLimitIsValidated) { KEXPECT_TRUE(ker::syscall::futex::futex_selftest_wake_count_limit()); }
