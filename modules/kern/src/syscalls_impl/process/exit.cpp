@@ -367,16 +367,35 @@ auto task_alive_for_group_exit_request(ker::mod::sched::task::Task* task) -> boo
            task->state.load(std::memory_order_acquire) == ker::mod::sched::task::TaskState::ACTIVE && !task->has_exited;
 }
 
-void publish_process_exit_request(ker::mod::sched::task::Task* task, int status, int wait_status) {
+auto store_process_exit_request(ker::mod::sched::task::Task* task, int status, int wait_status) -> bool {
     if (!task_alive_for_group_exit_request(task)) {
-        return;
+        return false;
     }
 
     task->requested_process_exit_status.store(status, std::memory_order_relaxed);
     task->requested_process_exit_wait_status.store(wait_status, std::memory_order_relaxed);
     task->process_exit_requested.store(true, std::memory_order_release);
+    return true;
+}
+
+auto copy_pending_process_exit_request(ker::mod::sched::task::Task* source, ker::mod::sched::task::Task* new_sibling) -> bool {
+    if (source == nullptr || new_sibling == nullptr || !source->process_exit_requested.load(std::memory_order_acquire)) {
+        return false;
+    }
+
+    int const STATUS = source->requested_process_exit_status.load(std::memory_order_relaxed);
+    int const WAIT_STATUS = source->requested_process_exit_wait_status.load(std::memory_order_relaxed);
+    return store_process_exit_request(new_sibling, STATUS, WAIT_STATUS);
+}
+
+auto publish_process_exit_request(ker::mod::sched::task::Task* task, int status, int wait_status) -> bool {
+    if (!store_process_exit_request(task, status, wait_status)) {
+        return false;
+    }
+
     task->signal_add_pending_mask(SIGKILL_MASK);
     ker::mod::sched::wake_task_for_signal(task);
+    return true;
 }
 
 struct ThreadGroupExitRequest {
@@ -385,8 +404,10 @@ struct ThreadGroupExitRequest {
 };
 
 #ifdef WOS_SELFTEST
-ker::mod::sched::task::Task group_exit_selftest_initiator;  // NOLINT
-ker::mod::sched::task::Task group_exit_selftest_candidate;  // NOLINT
+ker::mod::sched::task::Task group_exit_selftest_initiator;      // NOLINT
+ker::mod::sched::task::Task group_exit_selftest_candidate;      // NOLINT
+ker::mod::sched::task::Task exit_inheritance_selftest_source;   // NOLINT
+ker::mod::sched::task::Task exit_inheritance_selftest_sibling;  // NOLINT
 #endif
 
 auto thread_group_exit_request_candidate(ker::mod::sched::task::Task* task, void* context) -> bool {
@@ -415,7 +436,7 @@ void request_thread_group_exit(ker::mod::sched::task::Task* initiator, int statu
             break;
         }
 
-        publish_process_exit_request(task, status, wait_status);
+        static_cast<void>(publish_process_exit_request(task, status, wait_status));
         task->release();
     }
 }
@@ -656,6 +677,16 @@ namespace {
 
 }  // namespace
 
+auto inherit_pending_process_exit_request(ker::mod::sched::task::Task* source, ker::mod::sched::task::Task* new_sibling) -> bool {
+    if (!copy_pending_process_exit_request(source, new_sibling)) {
+        return false;
+    }
+
+    new_sibling->signal_add_pending_mask(SIGKILL_MASK);
+    ker::mod::sched::wake_task_for_signal(new_sibling);
+    return true;
+}
+
 void exit_current_if_process_exit_requested() {
     auto* task = ker::mod::sched::get_current_task();
     if (!task_alive_for_group_exit_request(task) || task->unpublished_teardown_in_progress.load(std::memory_order_acquire) ||
@@ -723,6 +754,34 @@ auto process_selftest_group_exit_candidate_filter() -> bool {
 
     bool const EXCLUDES_INITIATOR = !thread_group_exit_request_candidate(&initiator, &request);
     return MATCHES_LIVE_SIBLING && EXCLUDES_REQUESTED && EXCLUDES_OTHER_GROUP && EXCLUDES_DEAD && EXCLUDES_INITIATOR;
+}
+
+auto process_selftest_pending_exit_request_inheritance() -> bool {
+    auto& source = exit_inheritance_selftest_source;
+    auto& sibling = exit_inheritance_selftest_sibling;
+    constexpr int STATUS = 73;
+    constexpr int WAIT_STATUS = STATUS << 8;
+
+    source.type = sched_task::TaskType::PROCESS;
+    source.state.store(sched_task::TaskState::ACTIVE, std::memory_order_relaxed);
+    source.requested_process_exit_status.store(STATUS, std::memory_order_relaxed);
+    source.requested_process_exit_wait_status.store(WAIT_STATUS, std::memory_order_relaxed);
+    source.process_exit_requested.store(true, std::memory_order_release);
+
+    sibling.type = sched_task::TaskType::PROCESS;
+    sibling.state.store(sched_task::TaskState::ACTIVE, std::memory_order_relaxed);
+    bool const COPIED = copy_pending_process_exit_request(&source, &sibling);
+    bool const STATUS_MATCHES = sibling.requested_process_exit_status.load(std::memory_order_relaxed) == STATUS;
+    bool const WAIT_STATUS_MATCHES = sibling.requested_process_exit_wait_status.load(std::memory_order_relaxed) == WAIT_STATUS;
+    bool const REQUESTED = sibling.process_exit_requested.load(std::memory_order_acquire);
+
+    sibling.state.store(sched_task::TaskState::DEAD, std::memory_order_relaxed);
+    bool const REJECTS_DEAD = !copy_pending_process_exit_request(&source, &sibling);
+
+    source.process_exit_requested.store(false, std::memory_order_release);
+    sibling.state.store(sched_task::TaskState::ACTIVE, std::memory_order_relaxed);
+    bool const REJECTS_UNREQUESTED_SOURCE = !copy_pending_process_exit_request(&source, &sibling);
+    return COPIED && STATUS_MATCHES && WAIT_STATUS_MATCHES && REQUESTED && REJECTS_DEAD && REJECTS_UNREQUESTED_SOURCE;
 }
 
 auto process_selftest_exit_waiter_notify_drains_over_batch() -> bool {

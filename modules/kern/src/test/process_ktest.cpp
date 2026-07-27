@@ -15,6 +15,10 @@ KTEST(ProcessGroupExit, CandidateFilterSelectsOnlyLiveUnrequestedSibling) {
     KEXPECT_TRUE(ker::syscall::process::process_selftest_group_exit_candidate_filter());
 }
 
+KTEST(ProcessGroupExit, NewlyPublishedSiblingInheritsPendingRequest) {
+    KEXPECT_TRUE(ker::syscall::process::process_selftest_pending_exit_request_inheritance());
+}
+
 KTEST(ExecFdClone, SkipsCloexecAndRollsBackFailure) {
     KEXPECT_TRUE(ker::syscall::process::exec_selftest_fd_clone_skips_cloexec_and_rolls_back_failure());
 }

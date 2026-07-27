@@ -22,6 +22,7 @@
 #include "platform/smt/smt.hpp"
 #include "syscalls_impl/futex/futex.hpp"
 #include "syscalls_impl/log/sys_log.hpp"
+#include "syscalls_impl/process/exit.hpp"
 #include "syscalls_impl/vmem/sys_vmem.hpp"
 
 namespace ker::syscall::multiproc {
@@ -185,6 +186,7 @@ auto thread_control(abi::multiproc::threadControlOps op, void* arg1, void* arg2,
             if (parent == nullptr || tcb_va == 0) {
                 return static_cast<uint64_t>(-EINVAL);
             }
+            ker::syscall::process::exit_current_if_process_exit_requested();
             if (!mod::mm::virt::ensure_user_page_writable(parent, tcb_va + MLIBC_TCB_TID_OFFSET)) {
                 return static_cast<uint64_t>(-EFAULT);
             }
@@ -218,6 +220,13 @@ auto thread_control(abi::multiproc::threadControlOps op, void* arg1, void* arg2,
                 mod::sched::task::destroy_unpublished_user_thread(t);
                 return static_cast<uint64_t>(-ENOMEM);
             }
+
+            // Group exit can race with THREAD_CREATE after its active-registry
+            // scan has passed this creator but before the new sibling is
+            // published. Inherit the creator's request after publication so
+            // the sibling cannot escape the process-wide exit.
+            static_cast<void>(ker::syscall::process::inherit_pending_process_exit_request(parent, t));
+            ker::syscall::process::exit_current_if_process_exit_requested();
 
             // Return the new thread's PID as the TID; mlibc stores this in tcb->tid
             return t->pid;
