@@ -599,6 +599,17 @@ def test_thread_publication_is_serialized_with_shared_vmem_updates() -> None:
         ],
         "thread lazy-range clone through scheduler publication",
     )
+    inherited_exit_pos = create_case.find("inherit_pending_process_exit_request(parent, t)")
+    saved_pid_pos = create_case.find("thread_pid = t->pid;", inherited_exit_pos)
+    guard_scope_end = create_case.find("\n            }\n", saved_pid_pos)
+    current_exit_pos = create_case.find("exit_current_if_process_exit_requested();", saved_pid_pos)
+    if (
+        inherited_exit_pos < 0
+        or saved_pid_pos < 0
+        or guard_scope_end < 0
+        or current_exit_pos < guard_scope_end
+    ):
+        fail("pending group exit must be checked only after the shared VM publication guard is destroyed")
     require_tokens(
         task_header,
         ["std::atomic<bool> shares_user_pagemap{false};"],

@@ -191,45 +191,52 @@ auto thread_control(abi::multiproc::threadControlOps op, void* arg1, void* arg2,
                 return static_cast<uint64_t>(-EFAULT);
             }
 
-            // Serialize the lazy-range clone through scheduler publication with
-            // shared-address-space mmap/munmap/mprotect metadata propagation.
-            // The new thread must either clone a completed update or be visible
-            // to the next update's active-task snapshot.
-            ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;
-            auto* t = mod::sched::task::Task::create_user_thread(parent, tcb_va, user_sp, enter_va);
-            if (t == nullptr) {
-                return static_cast<uint64_t>(-ENOMEM);
+            uint64_t thread_pid = 0;
+            {
+                // Serialize the lazy-range clone through scheduler publication with
+                // shared-address-space mmap/munmap/mprotect metadata propagation.
+                // The new thread must either clone a completed update or be visible
+                // to the next update's active-task snapshot.
+                ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;
+                auto* t = mod::sched::task::Task::create_user_thread(parent, tcb_va, user_sp, enter_va);
+                if (t == nullptr) {
+                    return static_cast<uint64_t>(-ENOMEM);
+                }
+
+                uint64_t const CPU_COUNT = mod::smt::get_core_count();
+                if (CPU_COUNT == 0) {
+                    mod::sched::task::destroy_unpublished_user_thread(t);
+                    return static_cast<uint64_t>(-ENOMEM);
+                }
+                uint64_t const TARGET_CPU = next_thread_cpu.fetch_add(1, std::memory_order_relaxed) % CPU_COUNT;
+
+                if (!publish_thread_tid_to_tcb(parent, tcb_va, t->pid)) {
+                    mod::sched::task::destroy_unpublished_user_thread(t);
+                    return static_cast<uint64_t>(-EFAULT);
+                }
+                mod::sys::signal::sync_task_signal_mask_cache(t);
+
+                bool const POSTED = mod::sched::post_task_for_cpu(TARGET_CPU, t);
+                if (!POSTED) {
+                    (void)publish_thread_tid_to_tcb(parent, tcb_va, 0);
+                    mod::sched::task::destroy_unpublished_user_thread(t);
+                    return static_cast<uint64_t>(-ENOMEM);
+                }
+
+                // Group exit can race with THREAD_CREATE after its active-registry
+                // scan has passed this creator but before the new sibling is
+                // published. Inherit the creator's request after publication so
+                // the sibling cannot escape the process-wide exit.
+                static_cast<void>(ker::syscall::process::inherit_pending_process_exit_request(parent, t));
+                thread_pid = t->pid;
             }
 
-            uint64_t const CPU_COUNT = mod::smt::get_core_count();
-            if (CPU_COUNT == 0) {
-                mod::sched::task::destroy_unpublished_user_thread(t);
-                return static_cast<uint64_t>(-ENOMEM);
-            }
-            uint64_t const TARGET_CPU = next_thread_cpu.fetch_add(1, std::memory_order_relaxed) % CPU_COUNT;
-
-            if (!publish_thread_tid_to_tcb(parent, tcb_va, t->pid)) {
-                mod::sched::task::destroy_unpublished_user_thread(t);
-                return static_cast<uint64_t>(-EFAULT);
-            }
-            mod::sys::signal::sync_task_signal_mask_cache(t);
-
-            bool const POSTED = mod::sched::post_task_for_cpu(TARGET_CPU, t);
-            if (!POSTED) {
-                (void)publish_thread_tid_to_tcb(parent, tcb_va, 0);
-                mod::sched::task::destroy_unpublished_user_thread(t);
-                return static_cast<uint64_t>(-ENOMEM);
-            }
-
-            // Group exit can race with THREAD_CREATE after its active-registry
-            // scan has passed this creator but before the new sibling is
-            // published. Inherit the creator's request after publication so
-            // the sibling cannot escape the process-wide exit.
-            static_cast<void>(ker::syscall::process::inherit_pending_process_exit_request(parent, t));
+            // wos_proc_exit() does not unwind C++ stack objects. Check only
+            // after the publication guard has released its global mutex.
             ker::syscall::process::exit_current_if_process_exit_requested();
 
             // Return the new thread's PID as the TID; mlibc stores this in tcb->tid
-            return t->pid;
+            return thread_pid;
         }
 
         case abi::multiproc::threadControlOps::THREAD_EXIT: {
