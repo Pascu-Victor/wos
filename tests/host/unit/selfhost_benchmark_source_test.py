@@ -206,8 +206,6 @@ def test_wos_bootstrap_distributes_only_compiler_processes() -> None:
             r'IFS= read -r compiler_host < "\$compiler_host_report"',
             '''"$@" -o "$local_output"''',
             '''cp -- "$local_output" "$host_output"''',
-            '''fsync "$host_output"''',
-            "distributed staged compiler output fsync failed",
             "distributed staged compiler command failed with status",
             "distributed staged compiler output copy failed after",
             r'if [ "\$compiler_transport" = staged ]; then',
@@ -220,7 +218,6 @@ def test_wos_bootstrap_distributes_only_compiler_processes() -> None:
             r'compiler_staged_required_outputs+=("\$compiler_arg")',
             r'compiler_create_shared_file "\$compiler_side_output"',
             r"compiler_staged_outputs_ready() {",
-            r'fsync "\$compiler_side_output"',
             r'compiler_skip_output_arg=0',
             r'if [ "\$compiler_skip_output_arg" -eq 1 ]; then',
             r'compiler_staged_args+=(-MF "\$compiler_dependency_route")',
@@ -309,6 +306,16 @@ def test_wos_bootstrap_distributes_only_compiler_processes() -> None:
         fail("source-mode distributed compiler selection must not serialize through global state")
     if "compiler_lock" in source:
         fail("distributed compiler selection must not serialize through a global spin lock")
+    for stale_durability_barrier in (
+        '''fsync "$host_report"''',
+        '''fsync "$host_output"''',
+        r'fsync "\$compiler_side_output"',
+    ):
+        if stale_durability_barrier in source:
+            fail(
+                "distributed compiler publication must rely on synchronous "
+                "writable remote close, not per-output fsync"
+            )
     if source.count(r'compiler_remote_host_count="\$((\${#compiler_hosts[@]} - 1))"') < 2:
         fail("distributed compiler selection must identify peer capacity independently")
     if source.count(
@@ -1061,9 +1068,6 @@ exec "$@"
         mock_hostname = temp / "hostname"
         mock_hostname.write_text("#!/bin/sh\nprintf 'wos-1\\n'\n", encoding="ascii")
         mock_hostname.chmod(0o755)
-        mock_fsync = temp / "fsync"
-        mock_fsync.write_text('#!/bin/sh\nexec sync -f "$1"\n', encoding="ascii")
-        mock_fsync.chmod(0o755)
         system_clang = ROOT / "toolchain" / "host" / "bin" / "clang"
         resource_dir = ROOT / "toolchain" / "host" / "lib" / "clang" / "22"
         script = r'''
@@ -1183,9 +1187,6 @@ exit 0
             encoding="ascii",
         )
         mock_on.chmod(0o755)
-        mock_fsync = temp / "fsync"
-        mock_fsync.write_text('#!/bin/sh\nexec sync -f "$1"\n', encoding="ascii")
-        mock_fsync.chmod(0o755)
         system_clang = ROOT / "toolchain" / "host" / "bin" / "clang"
         resource_dir = ROOT / "toolchain" / "host" / "lib" / "clang" / "22"
         script = r'''
@@ -1267,9 +1268,6 @@ exit "$status"
         mock_hostname = temp / "hostname"
         mock_hostname.write_text("#!/bin/sh\nprintf 'wos-1\\n'\n", encoding="ascii")
         mock_hostname.chmod(0o755)
-        mock_fsync = temp / "fsync"
-        mock_fsync.write_text('#!/bin/sh\nexec sync -f "$1"\n', encoding="ascii")
-        mock_fsync.chmod(0o755)
         system_clang = ROOT / "toolchain" / "host" / "bin" / "clang"
         resource_dir = ROOT / "toolchain" / "host" / "lib" / "clang" / "22"
         script = r'''
@@ -2425,7 +2423,7 @@ def test_selfhost_runner_preflights_wos_only_self_host_tools() -> None:
         source,
         [
             "require_wos_selfhost_tools()",
-            "sh env make tar sed grep mktemp sha256sum xz yes sleep tail wc stat fsync \\",
+            "sh env make tar sed grep mktemp sha256sum xz yes sleep tail wc stat \\",
             "ld.lld lld llvm-ar llvm-ranlib llvm-nm llvm-objcopy llvm-strip \\",
             "llvm-readelf llvm-objdump llvm-symbolizer llvm-tblgen clang-tblgen \\",
             "llvm-as llvm-dis llvm-link llc opt",

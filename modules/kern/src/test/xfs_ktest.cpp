@@ -89,6 +89,8 @@ KTEST(XFS, TransactionCancelRestoresReplacedBufferAlias) {
 
 KTEST(XFS, LogRecycledBufferIsDistinct) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_log_recycled_buffer_is_distinct()); }
 
+KTEST(XFS, LogCheckpointIsOrderedAndBounded) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_log_checkpoint_is_ordered_and_bounded()); }
+
 KTEST(XFS, AgfStructSize) { KEXPECT_EQ(sizeof(ker::vfs::xfs::XfsAgf), static_cast<size_t>(224)); }
 
 KTEST(XFS, BmbtRecSize) { KEXPECT_EQ(sizeof(ker::vfs::xfs::XfsBmbtRec), static_cast<size_t>(16)); }

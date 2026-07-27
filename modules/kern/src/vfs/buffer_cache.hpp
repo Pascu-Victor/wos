@@ -127,6 +127,10 @@ auto bget_multi(dev::BlockDevice* bdev, uint64_t block_no, size_t count) -> BufH
 // Returns 0 on success, negative errno on failure.
 auto sync_blockdev(dev::BlockDevice* bdev) -> int;
 
+// Flush the block device's volatile write cache without selecting any dirty
+// buffers for writeback. Returns 0 when the device has no flush operation.
+auto flush_blockdev(dev::BlockDevice* bdev) -> int;
+
 // Return true if any dirty cached buffer overlaps a device block range.
 auto has_dirty_bdev_range(dev::BlockDevice* bdev, uint64_t block_no, size_t count) -> bool;
 
@@ -150,6 +154,11 @@ auto copy_cached_bdev_range_if_complete(dev::BlockDevice* bdev, uint64_t block_n
 // Write dirty buffers overlapping a device block range to disk.
 // Returns 0 on success, negative errno on failure.
 auto sync_bdev_range(dev::BlockDevice* bdev, uint64_t block_no, size_t count) -> int;
+
+// Write dirty buffers overlapping a device block range without flushing the
+// device's volatile write cache. The caller must issue flush_blockdev() at the
+// required durability boundary.
+auto writeback_bdev_range(dev::BlockDevice* bdev, uint64_t block_no, size_t count) -> int;
 
 // Request background dirty-cache writeback if dirty bytes exceed the target.
 // This never waits for writeback to complete.
@@ -221,6 +230,7 @@ struct BufferCacheReclaimStats {
     size_t after_bytes;
     size_t freed_buffers;
     size_t freed_bytes;
+    size_t scanned_buffers;
 };
 
 // Drop clean, unreferenced buffers until the logical cache is at or below
@@ -235,6 +245,7 @@ auto reclaim_clean_buffer_cache_for_pressure(size_t byte_budget) -> size_t;
 auto buffer_cache_selftest_choose_cache_max_bytes(uint64_t total_mem) -> size_t;
 auto buffer_cache_selftest_choose_dirty_target_bytes(uint64_t total_mem, size_t max_bytes) -> size_t;
 auto buffer_cache_selftest_choose_dirty_hard_bytes(size_t target_bytes, size_t max_bytes) -> size_t;
+auto buffer_cache_selftest_choose_allocation_reclaim_target_bytes(size_t max_bytes, size_t incoming_bytes) -> size_t;
 void buffer_cache_selftest_set_limits(size_t max_bytes, size_t dirty_target, size_t dirty_hard);
 #endif
 

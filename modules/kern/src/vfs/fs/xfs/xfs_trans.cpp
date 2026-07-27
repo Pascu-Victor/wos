@@ -311,6 +311,11 @@ auto xfs_trans_alloc(XfsMountContext* mount) -> XfsTransaction* {
         mod::dbg::log("[xfs trans] cannot allocate transaction on read-only mount");
         return nullptr;
     }
+    int const PREPARE_RC = xfs_log_prepare_transaction(mount);
+    if (PREPARE_RC != 0) {
+        mod::dbg::log("[xfs trans] cannot prepare log transaction: %d", PREPARE_RC);
+        return nullptr;
+    }
 
     auto* tp = xfs_trans_pool_alloc();
     if (tp == nullptr) {
@@ -730,6 +735,12 @@ auto xfs_trans_commit(XfsTransaction* tp) -> int {
 
     tp->committed = true;
     xfs_trans_discard_undo(tp);
+    int const CHECKPOINT_RC = xfs_log_checkpoint_if_needed(tp->mount);
+    if (CHECKPOINT_RC != 0) {
+        // The transaction is already owned by the retained log batch. Keep
+        // its checkpoint state for the next explicit flush/reservation retry.
+        mod::dbg::log("[xfs trans] deferred ordered checkpoint failed: %d", CHECKPOINT_RC);
+    }
     xfs_trans_discard_retired_ranges(tp);
     xfs_trans_release(tp);
     return RC;

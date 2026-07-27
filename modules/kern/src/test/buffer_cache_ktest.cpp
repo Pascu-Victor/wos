@@ -140,6 +140,7 @@ auto test_hash_key(const ker::dev::BlockDevice* bdev, uint64_t block_no, size_t 
 KTEST(BufferCache, SizingKeepsDirtyLimitsBelowCleanCache) {
     constexpr uint64_t ONE_GIB = uint64_t{1024} * 1024 * 1024;
     constexpr uint64_t THIRTY_TWO_GIB = uint64_t{32} * ONE_GIB;
+    constexpr uint64_t FORTY_EIGHT_GIB = uint64_t{48} * ONE_GIB;
 
     size_t const CACHE_MAX = ker::vfs::buffer_cache_selftest_choose_cache_max_bytes(ONE_GIB);
     size_t const DIRTY_TARGET = ker::vfs::buffer_cache_selftest_choose_dirty_target_bytes(ONE_GIB, CACHE_MAX);
@@ -159,9 +160,63 @@ KTEST(BufferCache, SizingKeepsDirtyLimitsBelowCleanCache) {
     size_t const LARGE_CACHE_MAX = ker::vfs::buffer_cache_selftest_choose_cache_max_bytes(THIRTY_TWO_GIB);
     size_t const LARGE_DIRTY_TARGET = ker::vfs::buffer_cache_selftest_choose_dirty_target_bytes(THIRTY_TWO_GIB, LARGE_CACHE_MAX);
     size_t const LARGE_DIRTY_HARD = ker::vfs::buffer_cache_selftest_choose_dirty_hard_bytes(LARGE_DIRTY_TARGET, LARGE_CACHE_MAX);
-    KEXPECT_EQ(LARGE_CACHE_MAX, static_cast<size_t>(14 * ONE_GIB));
-    KEXPECT_EQ(LARGE_DIRTY_TARGET, static_cast<size_t>(8 * ONE_GIB));
+    KEXPECT_EQ(LARGE_CACHE_MAX, static_cast<size_t>(8 * ONE_GIB));
+    KEXPECT_EQ(LARGE_DIRTY_TARGET, static_cast<size_t>(6 * ONE_GIB));
     KEXPECT_EQ(LARGE_DIRTY_HARD, LARGE_CACHE_MAX);
+
+    size_t const SELFHOST_CACHE_MAX = ker::vfs::buffer_cache_selftest_choose_cache_max_bytes(FORTY_EIGHT_GIB);
+    size_t const SELFHOST_DIRTY_TARGET = ker::vfs::buffer_cache_selftest_choose_dirty_target_bytes(FORTY_EIGHT_GIB, SELFHOST_CACHE_MAX);
+    size_t const SELFHOST_DIRTY_HARD = ker::vfs::buffer_cache_selftest_choose_dirty_hard_bytes(SELFHOST_DIRTY_TARGET, SELFHOST_CACHE_MAX);
+    KEXPECT_EQ(SELFHOST_CACHE_MAX, static_cast<size_t>(8 * ONE_GIB));
+    KEXPECT_EQ(SELFHOST_DIRTY_TARGET, static_cast<size_t>(6 * ONE_GIB));
+    KEXPECT_EQ(SELFHOST_DIRTY_HARD, SELFHOST_CACHE_MAX);
+}
+
+KTEST(BufferCache, FullCacheReclaimsBoundedAllocationBatch) {
+    constexpr size_t ONE_MIB = size_t{1024} * 1024;
+    constexpr size_t CACHE_MAX = size_t{8} * 1024 * ONE_MIB;
+    constexpr size_t PAGE = 4096;
+
+    KEXPECT_EQ(ker::vfs::buffer_cache_selftest_choose_allocation_reclaim_target_bytes(CACHE_MAX, PAGE), CACHE_MAX - size_t{16} * ONE_MIB);
+    KEXPECT_EQ(ker::vfs::buffer_cache_selftest_choose_allocation_reclaim_target_bytes(CACHE_MAX, size_t{2} * ONE_MIB),
+               CACHE_MAX - size_t{16} * ONE_MIB);
+    KEXPECT_EQ(ker::vfs::buffer_cache_selftest_choose_allocation_reclaim_target_bytes(CACHE_MAX, size_t{32} * ONE_MIB),
+               CACHE_MAX - size_t{32} * ONE_MIB);
+    KEXPECT_EQ(ker::vfs::buffer_cache_selftest_choose_allocation_reclaim_target_bytes(CACHE_MAX, CACHE_MAX), static_cast<size_t>(0));
+}
+
+KTEST(BufferCache, ReclaimDoesNotRescanDirtyLruPrefixPerVictim) {
+    constexpr uint64_t BASE_BLOCK = 1400;
+    constexpr size_t DIRTY_COUNT = 8;
+    constexpr size_t CLEAN_COUNT = 64;
+
+    ker::dev::BlockDevice dev = make_null_bdev();
+    ker::vfs::invalidate_bdev(&dev);
+
+    // Remove unrelated clean entries so the scan bound describes the complete
+    // live LRU. Dirty entries from earlier tests are safe and included below.
+    static_cast<void>(ker::vfs::reclaim_clean_buffer_cache(0));
+
+    for (size_t index = 0; index < DIRTY_COUNT; ++index) {
+        ker::vfs::BufHead* bh = ker::vfs::bget(&dev, BASE_BLOCK + index);
+        KREQUIRE_NE(bh, nullptr);
+        ker::vfs::bdirty(bh);
+        ker::vfs::brelse(bh);
+    }
+    for (size_t index = 0; index < CLEAN_COUNT; ++index) {
+        ker::vfs::BufHead* bh = ker::vfs::bget(&dev, BASE_BLOCK + DIRTY_COUNT + index);
+        KREQUIRE_NE(bh, nullptr);
+        ker::vfs::brelse(bh);
+    }
+
+    ker::vfs::BufferCacheStats const BEFORE = ker::vfs::buffer_cache_stats();
+    ker::vfs::BufferCacheReclaimStats const RECLAIM = ker::vfs::reclaim_clean_buffer_cache(0);
+
+    KEXPECT_TRUE(RECLAIM.freed_buffers >= CLEAN_COUNT);
+    KEXPECT_TRUE(RECLAIM.scanned_buffers <= BEFORE.total_buffers + 2 * BEFORE.dirty_buffers);
+
+    KEXPECT_EQ(ker::vfs::sync_bdev_range(&dev, BASE_BLOCK, DIRTY_COUNT), 0);
+    ker::vfs::invalidate_bdev(&dev);
 }
 
 KTEST(BufferCache, BreadHit) {

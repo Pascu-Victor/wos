@@ -290,14 +290,16 @@ constexpr size_t DIRTY_TARGET_MAX_DENOMINATOR = 4;
 constexpr size_t DIRTY_THROTTLE_RESUME_NUMERATOR = 3;
 constexpr size_t DIRTY_THROTTLE_RESUME_DENOMINATOR = 4;
 // Let clean cache grow beyond dirty limits, closer to Linux's page cache shape.
-// Large-memory self-host checkouts need enough dirty headroom to avoid forcing
-// every few hundred MiB of file creation through synchronous writeback.
+// Bound the non-reclaim-integrated cache at a size that keeps its buffer, range
+// index, and LRU working sets practical across repeated large builds. Large
+// systems still retain enough dirty headroom to avoid forcing every few hundred
+// MiB of file creation through synchronous writeback.
 constexpr size_t BUFFER_CACHE_MEMORY_NUMERATOR = 7;
 constexpr size_t BUFFER_CACHE_MEMORY_DENOMINATOR = 16;
 constexpr size_t DIRTY_TARGET_MEMORY_DIVISOR = 8;
 constexpr size_t DIRTY_TARGET_LARGE_MEMORY_DIVISOR = 4;
 constexpr uint64_t DIRTY_TARGET_LARGE_MEMORY_THRESHOLD = uint64_t{8} * 1024 * 1024 * 1024;
-constexpr size_t BUFFER_CACHE_MAX_SIZE = size_t{16} * 1024 * 1024 * 1024;
+constexpr size_t BUFFER_CACHE_MAX_SIZE = size_t{8} * 1024 * 1024 * 1024;
 
 struct DirtyBdevState {
     dev::BlockDevice* bdev{};
@@ -661,6 +663,60 @@ auto is_reclaimable_clean_buffer(const BufHead* bh) -> bool {
     return bh->refcount.load(std::memory_order_relaxed) == 0 && (bh->flags & BLOCKING_FLAGS) == 0;
 }
 
+auto find_reclaimable_lru_buffer(size_t scan_budget = SIZE_MAX, bool honor_second_chance = true, size_t* scanned_out = nullptr)
+    -> BufHead* {
+    size_t const MAX_SCAN = std::min(scan_budget, lru_count);
+    size_t scanned = 0;
+    for (BufHead* cur = lru_tail(); cur != nullptr && cur != &lru_sentinel;) {
+        if (scanned++ >= MAX_SCAN) {
+            break;
+        }
+        if (scanned_out != nullptr) {
+            (*scanned_out)++;
+        }
+        BufHead* prev = cur->lru_prev;
+        if (is_reclaimable_clean_buffer(cur)) {  // NOLINT(clang-analyzer-cplusplus.NewDelete): victims are unlinked before delete.
+            if (honor_second_chance && (cur->flags & BH_LRU_REFERENCED) != 0) {
+                lru_second_chance(cur);
+                cur = prev;
+                continue;
+            }
+            return cur;
+        }
+        // A dirty, writeback, locked, or referenced buffer cannot satisfy this
+        // reclaim pass. Rotate it out of the cold prefix so the next victim
+        // search does not pay for the same failed inspection again.
+        lru_move_to_head(cur);
+        cur = prev;
+    }
+    return nullptr;
+}
+
+auto find_reclaimable_mru_buffer(size_t scan_budget = SIZE_MAX, bool honor_second_chance = true, size_t* scanned_out = nullptr)
+    -> BufHead* {
+    size_t const MAX_SCAN = std::min(scan_budget, lru_count);
+    size_t scanned = 0;
+    for (BufHead* cur = lru_head(); cur != nullptr && cur != &lru_sentinel;) {
+        if (scanned++ >= MAX_SCAN) {
+            break;
+        }
+        if (scanned_out != nullptr) {
+            (*scanned_out)++;
+        }
+        BufHead* next = cur->lru_next;
+        if (is_reclaimable_clean_buffer(cur)) {  // NOLINT(clang-analyzer-cplusplus.NewDelete): victims are unlinked before delete.
+            if (honor_second_chance && (cur->flags & BH_LRU_REFERENCED) != 0) {
+                lru_second_chance(cur);
+                cur = next;
+                continue;
+            }
+            return cur;
+        }
+        cur = next;
+    }
+    return nullptr;
+}
+
 auto buffer_tree_priority_mix(uint64_t value) -> uint64_t {
     value ^= value >> 33U;
     value *= 0xff51afd7ed558ccdULL;
@@ -682,46 +738,6 @@ auto buffer_tree_priority(const BufHead* bh) -> uint64_t {
     return bh->tree_priority != 0 ? bh->tree_priority : buffer_tree_priority_for(bh);
 }
 
-auto find_reclaimable_lru_buffer(size_t scan_budget = SIZE_MAX, bool honor_second_chance = true) -> BufHead* {
-    size_t scanned = 0;
-    for (BufHead* cur = lru_tail(); cur != nullptr && cur != &lru_sentinel;) {
-        if (scanned++ >= scan_budget) {
-            break;
-        }
-        BufHead* prev = cur->lru_prev;
-        if (is_reclaimable_clean_buffer(cur)) {  // NOLINT(clang-analyzer-cplusplus.NewDelete): victims are unlinked before delete.
-            if (honor_second_chance && (cur->flags & BH_LRU_REFERENCED) != 0) {
-                lru_second_chance(cur);
-                cur = prev;
-                continue;
-            }
-            return cur;
-        }
-        cur = prev;
-    }
-    return nullptr;
-}
-
-auto find_reclaimable_mru_buffer(size_t scan_budget = SIZE_MAX, bool honor_second_chance = true) -> BufHead* {
-    size_t scanned = 0;
-    for (BufHead* cur = lru_head(); cur != nullptr && cur != &lru_sentinel;) {
-        if (scanned++ >= scan_budget) {
-            break;
-        }
-        BufHead* next = cur->lru_next;
-        if (is_reclaimable_clean_buffer(cur)) {  // NOLINT(clang-analyzer-cplusplus.NewDelete): victims are unlinked before delete.
-            if (honor_second_chance && (cur->flags & BH_LRU_REFERENCED) != 0) {
-                lru_second_chance(cur);
-                cur = next;
-                continue;
-            }
-            return cur;
-        }
-        cur = next;
-    }
-    return nullptr;
-}
-
 auto cache_allocation_would_exceed_limit_locked(size_t incoming_bytes) -> bool {
     if (incoming_bytes == 0) {
         return false;
@@ -732,18 +748,35 @@ auto cache_allocation_would_exceed_limit_locked(size_t incoming_bytes) -> bool {
     return cache_total_bytes > cache_max_bytes - incoming_bytes;
 }
 
+auto allocation_reclaim_target_bytes(size_t max_bytes, size_t incoming_bytes) -> size_t {
+    if (incoming_bytes >= max_bytes) {
+        return 0;
+    }
+
+    // Once a full cache has paid for an LRU scan, reclaim a bounded batch of
+    // clean buffers. Keeping a small allocation reserve amortizes the global
+    // lock and tree/LRU work across later misses instead of repeating it for
+    // every filesystem block.
+    size_t const HEADROOM = std::max(incoming_bytes, HOT_EVICT_MAX_BYTES);
+    return HEADROOM >= max_bytes ? 0 : max_bytes - HEADROOM;
+}
+
 auto reclaim_clean_cache_locked(size_t target_bytes, size_t byte_budget, size_t victim_budget, size_t scan_budget, bool honor_second_chance)
     -> BufferCacheReclaimStats {
     BufferCacheReclaimStats stats{};
     stats.before_bytes = cache_total_bytes;
     while (cache_total_bytes > target_bytes && stats.freed_bytes < byte_budget && stats.freed_buffers < victim_budget) {
-        BufHead* victim = find_reclaimable_lru_buffer(scan_budget, honor_second_chance);
+        size_t scanned = 0;
+        BufHead* victim = find_reclaimable_lru_buffer(scan_budget, honor_second_chance, &scanned);
+        stats.scanned_buffers += scanned;
         if (victim == nullptr) {
             // Write-heavy workloads can leave dirty/writeback buffers clustered
             // at the cold end. A bounded hot-end fallback prevents rescanning
             // the same unreclaimable tail while clean buffers elsewhere let the
             // cache run far past its target.
-            victim = find_reclaimable_mru_buffer(scan_budget, honor_second_chance);
+            scanned = 0;
+            victim = find_reclaimable_mru_buffer(scan_budget, honor_second_chance, &scanned);
+            stats.scanned_buffers += scanned;
         }
         if (victim == nullptr) {
             break;
@@ -771,9 +804,10 @@ void evict_lru_for_allocation(size_t incoming_bytes) {
         return;
     }
 
-    size_t const TARGET_BYTES = incoming_bytes >= cache_max_bytes ? 0 : cache_max_bytes - incoming_bytes;
+    size_t const TARGET_BYTES = allocation_reclaim_target_bytes(cache_max_bytes, incoming_bytes);
     size_t const OVERAGE = cache_total_bytes > TARGET_BYTES ? cache_total_bytes - TARGET_BYTES : 0;
-    size_t const BYTE_BUDGET = std::clamp(OVERAGE, incoming_bytes, HOT_EVICT_MAX_BYTES);
+    size_t const MAX_RECLAIM_BYTES = std::max(incoming_bytes, HOT_EVICT_MAX_BYTES);
+    size_t const BYTE_BUDGET = std::min(std::max(OVERAGE, incoming_bytes), MAX_RECLAIM_BYTES);
     static_cast<void>(reclaim_clean_cache_locked(TARGET_BYTES, BYTE_BUDGET, HOT_EVICT_MAX_VICTIMS, HOT_EVICT_SCAN_BUDGET, false));
 }
 
@@ -3318,6 +3352,17 @@ auto bget(dev::BlockDevice* bdev, uint64_t block_no) -> BufHead* { return bget_i
 
 auto bget_multi(dev::BlockDevice* bdev, uint64_t block_no, size_t count) -> BufHead* { return bget_multi_impl(bdev, block_no, count); }
 
+auto flush_blockdev(dev::BlockDevice* bdev) -> int {
+    if (bdev == nullptr) {
+        return -EINVAL;
+    }
+
+    uint64_t const STARTED_US = perf_xfs_started_us(ker::mod::perf::WkiPerfLocalXfsOp::BUF_FLUSH);
+    int const RC = dev::block_flush(bdev);
+    perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::BUF_FLUSH, STARTED_US, RC, 0);
+    return RC;
+}
+
 auto sync_blockdev(dev::BlockDevice* bdev) -> int {
     if (bdev == nullptr) {
         return -EINVAL;
@@ -3353,9 +3398,7 @@ auto sync_blockdev(dev::BlockDevice* bdev) -> int {
 
     // Flush the device if it supports it
     if ((wrote_dirty || waited_for_writeback) && bdev->flush != nullptr) {
-        uint64_t const FLUSH_STARTED_US = perf_xfs_started_us(ker::mod::perf::WkiPerfLocalXfsOp::BUF_FLUSH);
-        int const RC = dev::block_flush(bdev);
-        perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::BUF_FLUSH, FLUSH_STARTED_US, RC, 0);
+        int const RC = flush_blockdev(bdev);
         if (RC != 0) {
             result = RC;
         }
@@ -3518,7 +3561,10 @@ void throttle_dirty_buffer_cache(dev::BlockDevice* bdev) {
     }
 }
 
-auto sync_bdev_range(dev::BlockDevice* bdev, uint64_t block_no, size_t count) -> int {
+namespace {
+
+auto writeback_bdev_range_internal(dev::BlockDevice* bdev, uint64_t block_no, size_t count, bool& writeback_activity) -> int {
+    writeback_activity = false;
     if (bdev == nullptr) {
         return -EINVAL;
     }
@@ -3531,8 +3577,6 @@ auto sync_bdev_range(dev::BlockDevice* bdev, uint64_t block_no, size_t count) ->
     }
 
     int result = 0;
-    bool wrote_dirty = false;
-    bool waited_for_foreign_writeback = false;
     uint64_t min_epoch = 0;
 
     DirtyWritebackFilter filter{};
@@ -3545,7 +3589,7 @@ auto sync_bdev_range(dev::BlockDevice* bdev, uint64_t block_no, size_t count) ->
     while (true) {
         DirtyWritebackResult const WB = writeback_dirty_one_after(filter, min_epoch, MAX_EPOCH);
         if (WB.wrote) {
-            wrote_dirty = true;
+            writeback_activity = true;
             min_epoch = WB.dirty_epoch;
             if (WB.status != 0) {
                 result = WB.status;
@@ -3553,15 +3597,28 @@ auto sync_bdev_range(dev::BlockDevice* bdev, uint64_t block_no, size_t count) ->
             continue;
         }
         if (WB.busy) {
-            waited_for_foreign_writeback = true;
+            writeback_activity = true;
             ker::mod::sched::kern_yield();
             continue;
         }
         break;
     }
 
-    if ((wrote_dirty || waited_for_foreign_writeback) && bdev->flush != nullptr) {
-        int const RC = dev::block_flush(bdev);
+    return result;
+}
+
+}  // namespace
+
+auto writeback_bdev_range(dev::BlockDevice* bdev, uint64_t block_no, size_t count) -> int {
+    bool writeback_activity = false;
+    return writeback_bdev_range_internal(bdev, block_no, count, writeback_activity);
+}
+
+auto sync_bdev_range(dev::BlockDevice* bdev, uint64_t block_no, size_t count) -> int {
+    bool writeback_activity = false;
+    int result = writeback_bdev_range_internal(bdev, block_no, count, writeback_activity);
+    if (bdev != nullptr && writeback_activity && bdev->flush != nullptr) {
+        int const RC = flush_blockdev(bdev);
         if (RC != 0) {
             result = RC;
         }
@@ -3807,6 +3864,10 @@ auto buffer_cache_selftest_choose_dirty_target_bytes(uint64_t total_mem, size_t 
 
 auto buffer_cache_selftest_choose_dirty_hard_bytes(size_t target_bytes, size_t max_bytes) -> size_t {
     return choose_dirty_hard_limit_bytes(target_bytes, max_bytes);
+}
+
+auto buffer_cache_selftest_choose_allocation_reclaim_target_bytes(size_t max_bytes, size_t incoming_bytes) -> size_t {
+    return allocation_reclaim_target_bytes(max_bytes, incoming_bytes);
 }
 
 void buffer_cache_selftest_set_limits(size_t max_bytes, size_t dirty_target, size_t dirty_hard) {

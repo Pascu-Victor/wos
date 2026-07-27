@@ -38,7 +38,6 @@ namespace {
 
 constexpr size_t XFS_LOG_STACK_BODY_MAX_BYTES = 4096;
 constexpr size_t XFS_LOG_BATCH_MAX_ITEMS = 8192;
-constexpr uint32_t XFS_LOG_BATCH_MAX_TRANSACTIONS = 256;
 constexpr size_t XFS_LOG_BATCH_MAX_BODY_BYTES = size_t{4} * 1024 * 1024;
 constexpr uint32_t XFS_LOG_CLEAR_CHUNK_BLOCKS = 256;
 ker::mod::sys::Mutex log_write_lock;
@@ -194,12 +193,19 @@ auto xfs_log_find_head_tail(XfsLog* log) -> int {
 // Global log state (one per mounted XFS filesystem at this time)
 XfsLog* active_log = nullptr;
 
+enum class XfsLogBatchPhase : uint8_t {
+    COLLECTING,
+    LOG_STAGED,
+    LOG_DURABLE,
+    HOME_RELEASED,
+};
+
 struct XfsLogBatch {
     XfsMountContext* mount{};
     std::array<XfsTransItem, XFS_LOG_BATCH_MAX_ITEMS> items{};
     size_t item_count{};
     size_t body_bytes{};
-    uint32_t transactions{};
+    XfsLogBatchPhase phase{XfsLogBatchPhase::COLLECTING};
 };
 
 XfsLogBatch* active_batch = nullptr;
@@ -733,7 +739,53 @@ void xfs_log_batch_reset(XfsLogBatch* batch) {
     }
     batch->item_count = 0;
     batch->body_bytes = 0;
-    batch->transactions = 0;
+    batch->phase = XfsLogBatchPhase::COLLECTING;
+}
+
+auto xfs_log_writeback_range(XfsMountContext* mount) -> int {
+    if (mount == nullptr || mount->device == nullptr || mount->device->block_size == 0 || mount->block_size == 0 ||
+        mount->block_size % mount->device->block_size != 0 || mount->log_blocks == 0 || mount->ag_blocks == 0 || mount->ag_blk_log >= 64) {
+        return -EINVAL;
+    }
+
+    auto const AGNO = static_cast<xfs_agnumber_t>(mount->log_start >> mount->ag_blk_log);
+    auto const AGBNO = static_cast<xfs_agblock_t>(mount->log_start & ((uint64_t{1} << mount->ag_blk_log) - 1));
+    if (AGBNO >= mount->ag_blocks || mount->log_blocks > mount->ag_blocks - AGBNO ||
+        static_cast<uint64_t>(AGNO) > UINT64_MAX / mount->ag_blocks) {
+        return -EOVERFLOW;
+    }
+    uint64_t const AG_BASE = static_cast<uint64_t>(AGNO) * mount->ag_blocks;
+    if (AGBNO > UINT64_MAX - AG_BASE) {
+        return -EOVERFLOW;
+    }
+    uint64_t const LINEAR_LOG_START = AG_BASE + AGBNO;
+    size_t const DEV_BLOCKS_PER_FS_BLOCK = mount->block_size / mount->device->block_size;
+    if (LINEAR_LOG_START > UINT64_MAX / DEV_BLOCKS_PER_FS_BLOCK || mount->log_blocks > SIZE_MAX / DEV_BLOCKS_PER_FS_BLOCK) {
+        return -EOVERFLOW;
+    }
+    uint64_t const DEV_BLOCK = LINEAR_LOG_START * DEV_BLOCKS_PER_FS_BLOCK;
+    size_t const DEV_COUNT = static_cast<size_t>(mount->log_blocks) * DEV_BLOCKS_PER_FS_BLOCK;
+    return writeback_bdev_range(mount->device, DEV_BLOCK, DEV_COUNT);
+}
+
+auto xfs_log_writeback_home_item(const XfsTransItem& item) -> int {
+    if (item.type != XfsLogItemType::BUFFER || item.buf.bp == nullptr) {
+        return 0;
+    }
+    BufHead* bp = item.buf.bp;
+    if (bp->bdev == nullptr || bp->bdev->block_size == 0 || bp->size == 0 || bp->size % bp->bdev->block_size != 0) {
+        return -EIO;
+    }
+
+    // The batch already pins the exact home buffer, so write it directly
+    // instead of searching the dirty range tree again for every item. A
+    // retired buffer names storage that may have been recycled since the
+    // transaction committed; retain range lookup for that case so the live
+    // replacement, rather than the stale retired image, reaches disk.
+    if (!bp->retired.load(std::memory_order_acquire)) {
+        return bwrite(bp);
+    }
+    return writeback_bdev_range(bp->bdev, bp->block_no, bp->size / bp->bdev->block_size);
 }
 
 auto xfs_log_batch_flush_locked(XfsMountContext* mount) -> int {
@@ -745,29 +797,72 @@ auto xfs_log_batch_flush_locked(XfsMountContext* mount) -> int {
         return 0;
     }
 
-    int const RC = xfs_log_write_record_locked(mount, active_batch->items.data(), static_cast<int>(active_batch->item_count));
-    if (RC != 0) {
-        // Keep the batch and its journal holds intact.  Metadata must not
-        // become writeback-eligible until a WAL retry succeeds.
-        return RC;
+    if (active_batch->phase == XfsLogBatchPhase::COLLECTING) {
+        int const RC = xfs_log_write_record_locked(mount, active_batch->items.data(), static_cast<int>(active_batch->item_count));
+        if (RC != 0) {
+            // Keep the batch and its journal holds intact. Metadata must not
+            // become writeback-eligible until a WAL retry succeeds.
+            return RC;
+        }
+        active_batch->phase = XfsLogBatchPhase::LOG_STAGED;
     }
+
+    if (active_batch->phase == XfsLogBatchPhase::LOG_STAGED) {
+        int const WRITE_RC = xfs_log_writeback_range(mount);
+        int const FLUSH_RC = flush_blockdev(mount->device);
+        if (WRITE_RC != 0 || FLUSH_RC != 0) {
+            // LOG_STAGED avoids appending a duplicate record on retry. An
+            // unconditional device flush makes a retry valid even when the
+            // earlier write completed but its cache flush failed.
+            return WRITE_RC != 0 ? WRITE_RC : FLUSH_RC;
+        }
+        active_batch->phase = XfsLogBatchPhase::LOG_DURABLE;
+    }
+
+    if (active_batch->phase == XfsLogBatchPhase::LOG_DURABLE) {
+        // The WAL is stable. Release every home-buffer hold before selecting
+        // any range for writeback so overlapping aliases cannot deadlock one
+        // another during the checkpoint.
+        for (size_t i = 0; i < active_batch->item_count; ++i) {
+            XfsTransItem& item = active_batch->items.at(i);
+            if (item.type != XfsLogItemType::BUFFER || item.buf.bp == nullptr) {
+                continue;
+            }
+            bdirty(item.buf.bp);
+            bjournal_release(item.buf.bp);
+        }
+        active_batch->phase = XfsLogBatchPhase::HOME_RELEASED;
+    }
+
+    int result = 0;
+    for (size_t i = 0; i < active_batch->item_count; ++i) {
+        int const RC = xfs_log_writeback_home_item(active_batch->items.at(i));
+        if (RC != 0 && result == 0) {
+            result = RC;
+        }
+    }
+    int const FLUSH_RC = flush_blockdev(mount->device);
+    if (result != 0 || FLUSH_RC != 0) {
+        // Keep references to every checkpoint range. Successful writes are
+        // already clean; failed ranges remain dirty and are retried before a
+        // later transaction may advance the compact log tail.
+        return result != 0 ? result : FLUSH_RC;
+    }
+
     for (size_t i = 0; i < active_batch->item_count; ++i) {
         XfsTransItem& item = active_batch->items.at(i);
-        if (item.type != XfsLogItemType::BUFFER || item.buf.bp == nullptr) {
-            continue;
+        if (item.type == XfsLogItemType::BUFFER && item.buf.bp != nullptr) {
+            brelse(item.buf.bp);
+            item.buf.bp = nullptr;
+            item.type = XfsLogItemType::NONE;
         }
-        bdirty(item.buf.bp);
-        bjournal_release(item.buf.bp);
-        brelse(item.buf.bp);
-        item.buf.bp = nullptr;
-        item.type = XfsLogItemType::NONE;
     }
     xfs_log_batch_reset(active_batch);
-    return RC;
+    return 0;
 }
 
 auto xfs_log_batch_add_locked(const XfsTransItem* items, int item_count) -> int {
-    if (active_batch == nullptr || items == nullptr || item_count < 0) {
+    if (active_batch == nullptr || active_batch->phase != XfsLogBatchPhase::COLLECTING || items == nullptr || item_count < 0) {
         return -EINVAL;
     }
 
@@ -807,8 +902,15 @@ auto xfs_log_batch_add_locked(const XfsTransItem* items, int item_count) -> int 
         dst.buf = items[i].buf;
         active_batch->body_bytes += 16U + LEN;
     }
-    active_batch->transactions++;
     return 0;
+}
+
+auto xfs_log_batch_should_checkpoint(const XfsLogBatch* batch) -> bool {
+    if (batch == nullptr || batch->phase != XfsLogBatchPhase::COLLECTING || batch->item_count == 0) {
+        return batch != nullptr && batch->phase != XfsLogBatchPhase::COLLECTING;
+    }
+    constexpr size_t BODY_RESERVE = XFS_LOG_BATCH_MAX_BODY_BYTES / 2;
+    return batch->body_bytes >= BODY_RESERVE || batch->item_count + XFS_TRANS_MAX_ITEMS > batch->items.size();
 }
 
 }  // anonymous namespace
@@ -834,37 +936,44 @@ auto xfs_log_write(XfsMountContext* mount, const XfsTransItem* items, int item_c
         return -ENODEV;
     }
 
-    int result = 0;
-    bool const FLUSH_BEFORE_ADD =
-        active_batch->item_count != 0 && (active_batch->item_count + dirty_items > active_batch->items.size() ||
-                                          active_batch->body_bytes + transaction_body_bytes > XFS_LOG_BATCH_MAX_BODY_BYTES);
-    if (FLUSH_BEFORE_ADD) {
-        result = xfs_log_batch_flush_locked(mount);
-        if (result != 0) {
-            return result;
-        }
+    if (active_batch->phase != XfsLogBatchPhase::COLLECTING) {
+        // xfs_log_prepare_transaction() resolves pending checkpoints before
+        // transaction mutation. Do not attempt one here: the current
+        // transaction still owns undo holds on its metadata buffers.
+        return -EAGAIN;
     }
 
-    if (dirty_items > active_batch->items.size()) {
-        return result != 0 ? result : -E2BIG;
+    if (dirty_items > active_batch->items.size() - active_batch->item_count) {
+        return -E2BIG;
     }
     int const ADD_RC = xfs_log_batch_add_locked(items, item_count);
     if (ADD_RC != 0) {
-        return result != 0 ? result : ADD_RC;
+        return ADD_RC;
     }
     if (owns_metadata_out != nullptr) {
         *owns_metadata_out = true;
     }
+    return 0;
+}
 
-    if (active_batch->transactions >= XFS_LOG_BATCH_MAX_TRANSACTIONS || active_batch->body_bytes >= XFS_LOG_BATCH_MAX_BODY_BYTES) {
-        int const FLUSH_RC = xfs_log_batch_flush_locked(mount);
-        if (FLUSH_RC != 0) {
-            // The transaction has already been accepted into the retained
-            // batch.  Its metadata remains journal-held for a later retry.
-            mod::dbg::log("[xfs log] deferred batch flush failed: %d", FLUSH_RC);
-        }
+auto xfs_log_prepare_transaction(XfsMountContext* mount) -> int {
+    XfsLogWriteGuard guard;
+    if (mount == nullptr) {
+        return -EINVAL;
     }
-    return result;
+    if (active_log == nullptr || active_log->mount != mount || active_batch == nullptr || active_batch->mount != mount) {
+        return 0;
+    }
+    return xfs_log_batch_should_checkpoint(active_batch) ? xfs_log_batch_flush_locked(mount) : 0;
+}
+
+auto xfs_log_checkpoint_if_needed(XfsMountContext* mount) -> int {
+    XfsLogWriteGuard guard;
+    if (mount == nullptr || active_log == nullptr || active_log->mount != mount || active_batch == nullptr ||
+        active_batch->mount != mount) {
+        return 0;
+    }
+    return xfs_log_batch_should_checkpoint(active_batch) ? xfs_log_batch_flush_locked(mount) : 0;
 }
 
 auto xfs_log_flush(XfsMountContext* mount) -> int {
@@ -885,6 +994,37 @@ auto xfs_log_recycle_selftest_read(ker::dev::BlockDevice* dev, uint64_t /*block*
 }
 
 auto xfs_log_recycle_selftest_write(ker::dev::BlockDevice* /*dev*/, uint64_t /*block*/, size_t /*count*/, const void* /*buffer*/) -> int {
+    return 0;
+}
+
+enum class XfsLogCheckpointSelftestEvent : uint8_t {
+    WRITE,
+    FLUSH,
+};
+
+struct XfsLogCheckpointSelftestState {
+    std::array<XfsLogCheckpointSelftestEvent, 16> events{};
+    std::array<uint64_t, 16> blocks{};
+    size_t event_count{};
+};
+
+auto xfs_log_checkpoint_selftest_write(ker::dev::BlockDevice* dev, uint64_t block, size_t /*count*/, const void* /*buffer*/) -> int {
+    auto* state = static_cast<XfsLogCheckpointSelftestState*>(dev->private_data);
+    if (state == nullptr || state->event_count >= state->events.size()) {
+        return -EIO;
+    }
+    size_t const INDEX = state->event_count++;
+    state->events.at(INDEX) = XfsLogCheckpointSelftestEvent::WRITE;
+    state->blocks.at(INDEX) = block;
+    return 0;
+}
+
+auto xfs_log_checkpoint_selftest_flush(ker::dev::BlockDevice* dev) -> int {
+    auto* state = static_cast<XfsLogCheckpointSelftestState*>(dev->private_data);
+    if (state == nullptr || state->event_count >= state->events.size()) {
+        return -EIO;
+    }
+    state->events.at(state->event_count++) = XfsLogCheckpointSelftestEvent::FLUSH;
     return 0;
 }
 
@@ -952,6 +1092,109 @@ auto xfs_selftest_log_recycled_buffer_is_distinct() -> bool {
     bjournal_release(old);
     brelse(old);
     brelse(old);
+    invalidate_bdev(&dev);
+    return ok;
+}
+
+auto xfs_selftest_log_checkpoint_is_ordered_and_bounded() -> bool {
+    if (active_log != nullptr || active_batch != nullptr) {
+        return false;
+    }
+
+    constexpr uint64_t HOME_BLOCK = 10;
+    constexpr uint64_t UNRELATED_BLOCK = 20;
+    constexpr xfs_fsblock_t LOG_START = 128;
+    constexpr uint32_t LOG_BLOCKS = 64;
+
+    XfsLogCheckpointSelftestState state{};
+    ker::dev::BlockDevice dev{};
+    dev.block_size = 512;
+    dev.total_blocks = 1024;
+    dev.read_blocks = xfs_log_recycle_selftest_read;
+    dev.write_blocks = xfs_log_checkpoint_selftest_write;
+    dev.flush = xfs_log_checkpoint_selftest_flush;
+    dev.private_data = &state;
+    invalidate_bdev(&dev);
+
+    XfsMountContext mount{};
+    mount.device = &dev;
+    mount.block_size = 512;
+    mount.block_log = 9;
+    mount.ag_blocks = 1024;
+    mount.ag_blk_log = 10;
+    mount.log_start = LOG_START;
+    mount.log_blocks = LOG_BLOCKS;
+    mount.sect_size = 512;
+
+    bool ok = xfs_log_mount(&mount) == 0;
+    BufHead* home = ok ? bget(&dev, HOME_BLOCK) : nullptr;
+    BufHead* unrelated = ok ? bget(&dev, UNRELATED_BLOCK) : nullptr;
+    ok = ok && home != nullptr && unrelated != nullptr;
+
+    if (ok) {
+        home->data[0] = 0xA5;
+        unrelated->data[0] = 0x5A;
+        bdirty(unrelated);
+
+        XfsTransItem item{};
+        item.type = XfsLogItemType::BUFFER;
+        item.buf = {
+            .bp = home,
+            .offset = 0,
+            .len = static_cast<uint32_t>(home->size),
+            .dirty = true,
+        };
+        bool owns_metadata = false;
+        ok = xfs_log_write(&mount, &item, 1, &owns_metadata) == 0 && owns_metadata;
+        brelse(home);
+        home = nullptr;
+
+        int const FLUSH_RC = xfs_log_flush(&mount);
+        bool const HOME_DIRTY = has_dirty_bdev_range(&dev, HOME_BLOCK, 1);
+        bool const UNRELATED_DIRTY = has_dirty_bdev_range(&dev, UNRELATED_BLOCK, 1);
+        ok = ok && FLUSH_RC == 0 && !HOME_DIRTY && UNRELATED_DIRTY;
+
+        size_t log_write_index = SIZE_MAX;
+        size_t first_flush_index = SIZE_MAX;
+        size_t home_write_index = SIZE_MAX;
+        size_t second_flush_index = SIZE_MAX;
+        for (size_t i = 0; i < state.event_count; ++i) {
+            if (state.events.at(i) == XfsLogCheckpointSelftestEvent::WRITE && state.blocks.at(i) >= LOG_START &&
+                state.blocks.at(i) < LOG_START + LOG_BLOCKS && log_write_index == SIZE_MAX) {
+                log_write_index = i;
+            } else if (state.events.at(i) == XfsLogCheckpointSelftestEvent::FLUSH && log_write_index != SIZE_MAX &&
+                       first_flush_index == SIZE_MAX) {
+                first_flush_index = i;
+            } else if (state.events.at(i) == XfsLogCheckpointSelftestEvent::WRITE && state.blocks.at(i) == HOME_BLOCK &&
+                       first_flush_index != SIZE_MAX && home_write_index == SIZE_MAX) {
+                home_write_index = i;
+            } else if (state.events.at(i) == XfsLogCheckpointSelftestEvent::FLUSH && home_write_index != SIZE_MAX) {
+                second_flush_index = i;
+                break;
+            }
+        }
+        ok = ok && log_write_index < first_flush_index && first_flush_index < home_write_index && home_write_index < second_flush_index;
+        if (!ok) {
+            mod::dbg::log(
+                "[xfs log selftest] flush=%d home_dirty=%u unrelated_dirty=%u events=%lu log_write=%lu flush1=%lu home_write=%lu "
+                "flush2=%lu",
+                FLUSH_RC, static_cast<unsigned>(HOME_DIRTY), static_cast<unsigned>(UNRELATED_DIRTY),
+                static_cast<unsigned long>(state.event_count), static_cast<unsigned long>(log_write_index),
+                static_cast<unsigned long>(first_flush_index), static_cast<unsigned long>(home_write_index),
+                static_cast<unsigned long>(second_flush_index));
+            for (size_t i = 0; i < state.event_count; ++i) {
+                mod::dbg::log("[xfs log selftest] event[%lu]=%s block=%lu", static_cast<unsigned long>(i),
+                              state.events.at(i) == XfsLogCheckpointSelftestEvent::WRITE ? "write" : "flush",
+                              static_cast<unsigned long>(state.blocks.at(i)));
+            }
+        }
+    }
+
+    brelse(home);
+    brelse(unrelated);
+    if (active_log != nullptr && active_log->mount == &mount) {
+        xfs_log_unmount(&mount, false);
+    }
     invalidate_bdev(&dev);
     return ok;
 }

@@ -3525,14 +3525,13 @@ auto xfs_fsync(File* f) -> int {
     XfsMetadataGuard metadata_guard(xfd->mount, true, WOS_PERF_CALLSITE());
     int const INODE_RET = xfs_commit_dirty_inode(xfd->mount, xfd->inode);
     int const LOG_RET = xfs_log_flush(xfd->mount);
-    int const BLOCK_RET = sync_blockdev(xfd->mount->device);
     if (DATA_RET != 0) {
         return DATA_RET;
     }
     if (INODE_RET != 0) {
         return INODE_RET;
     }
-    return LOG_RET != 0 ? LOG_RET : BLOCK_RET;
+    return LOG_RET;
 }
 
 auto xfs_sync_mount(XfsMountContext* ctx) -> int {

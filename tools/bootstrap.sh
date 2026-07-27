@@ -121,7 +121,7 @@ shift 4
 trap 'rm -f -- "$local_output" 2>/dev/null || true' EXIT HUP INT TERM
 rm -f -- "$local_output"
 cd -- "$compiler_cwd"
-if ! hostname > "$host_report" || ! fsync "$host_report"; then
+if ! hostname > "$host_report"; then
     echo "distributed staged compiler could not publish its selected system" >&2
     exit 1
 fi
@@ -141,10 +141,6 @@ while ! cp -- "$local_output" "$host_output"; do
     sleep 1
     copy_attempt=$((copy_attempt + 1))
 done
-if ! fsync "$host_output"; then
-    echo "distributed staged compiler output fsync failed" >&2
-    exit 1
-fi
 EOF
     chmod +x "$distributed_staged_launcher"
 
@@ -685,11 +681,10 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
         done
         if [ "\$compiler_transport" = staged ]; then
             if [ "\$compiler_status" -eq 0 ]; then
-                # A concurrent WKI exec-proxy completion can reach the
-                # submitter before the peer's local child has copied and
-                # fsynced its object. Keep the wrapper alive until the actual
-                # publication boundary, with only a short grace period so one
-                # missing object cannot retain a Ninja job for minutes.
+                # Writable remote-file close publishes all write-behind data
+                # before the peer can complete. Keep this bounded visibility
+                # check as a defensive guard against completion/report
+                # reordering and malformed successful compiler invocations.
                 compiler_publish_wait_us=0
                 compiler_publish_limit_us="\$((compiler_publish_timeout * 1000000))"
                 compiler_publish_pause_us=1000
@@ -716,14 +711,6 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
                 if ! compiler_staged_outputs_ready; then
                     echo "warning: distributed staged compiler returned success without publishing all outputs for '\$output_file'; retrying locally" >&2
                     compiler_status=1
-                else
-                    for compiler_side_output in "\${compiler_staged_required_outputs[@]}"; do
-                        if ! fsync "\$compiler_side_output"; then
-                            echo "warning: distributed staged compiler could not fsync side output '\$compiler_side_output'; retrying locally" >&2
-                            compiler_status=1
-                            break
-                        fi
-                    done
                 fi
                 if [ "\$compiler_status" -eq 0 ] && ! mv -- "\$compiler_staged_output" "\$output_file"; then
                     echo "warning: distributed staged compiler could not publish '\$output_file'; retrying locally" >&2

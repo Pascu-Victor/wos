@@ -53,11 +53,23 @@ auto xfs_log_needs_recovery(XfsMountContext* mount) -> bool;
 struct XfsTransItem;
 auto xfs_log_write(XfsMountContext* mount, const XfsTransItem* items, int item_count, bool* owns_metadata_out = nullptr) -> int;
 
-// Commit the current metadata group and release its writeback holds.
+// Before a transaction mutates metadata, make sure a previous failed
+// checkpoint is resolved and the current batch has room for a worst-case
+// transaction.
+auto xfs_log_prepare_transaction(XfsMountContext* mount) -> int;
+
+// After a committed transaction releases its undo holds, checkpoint a batch
+// that has reached its bounded item/body capacity threshold.
+auto xfs_log_checkpoint_if_needed(XfsMountContext* mount) -> int;
+
+// Commit the current metadata group with ordered durability: persist the WAL,
+// then checkpoint and persist only the group's home metadata before allowing
+// a later transaction to advance the compact log tail.
 auto xfs_log_flush(XfsMountContext* mount) -> int;
 
 #ifdef WOS_SELFTEST
 auto xfs_selftest_log_recycled_buffer_is_distinct() -> bool;
+auto xfs_selftest_log_checkpoint_is_ordered_and_bounded() -> bool;
 #endif
 
 }  // namespace ker::vfs::xfs
