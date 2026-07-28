@@ -105,7 +105,7 @@ def main() -> None:
     )
     require(
         source,
-        "constexpr size_t BUFFER_CACHE_MAX_SIZE = size_t{4} * 1024 * 1024 * 1024;",
+        "constexpr size_t BUFFER_CACHE_MAX_SIZE = size_t{2} * 1024 * 1024 * 1024;",
         "buffer-cache max cap",
     )
     require(

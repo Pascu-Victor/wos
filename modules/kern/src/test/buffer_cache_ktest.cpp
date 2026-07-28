@@ -139,6 +139,7 @@ auto test_hash_key(const ker::dev::BlockDevice* bdev, uint64_t block_no, size_t 
 
 KTEST(BufferCache, SizingKeepsDirtyLimitsBelowCleanCache) {
     constexpr uint64_t ONE_GIB = uint64_t{1024} * 1024 * 1024;
+    constexpr uint64_t SIXTEEN_GIB = uint64_t{16} * ONE_GIB;
     constexpr uint64_t THIRTY_TWO_GIB = uint64_t{32} * ONE_GIB;
     constexpr uint64_t FORTY_EIGHT_GIB = uint64_t{48} * ONE_GIB;
 
@@ -159,13 +160,22 @@ KTEST(BufferCache, SizingKeepsDirtyLimitsBelowCleanCache) {
     KEXPECT_EQ(FALLBACK_TARGET, ker::vfs::BUFFER_CACHE_DEFAULT_SIZE / 2);
     KEXPECT_EQ(FALLBACK_HARD, ker::vfs::BUFFER_CACHE_DEFAULT_SIZE);
 
+    size_t const WORKER_CACHE_MAX = ker::vfs::buffer_cache_selftest_choose_cache_max_bytes(SIXTEEN_GIB);
+    size_t const WORKER_DIRTY_TARGET = ker::vfs::buffer_cache_selftest_choose_dirty_target_bytes(SIXTEEN_GIB, WORKER_CACHE_MAX);
+    size_t const WORKER_DIRTY_HARD = ker::vfs::buffer_cache_selftest_choose_dirty_hard_bytes(WORKER_DIRTY_TARGET, WORKER_CACHE_MAX);
+    size_t const WORKER_DIRTY_WRITEBACK_RESUME = ker::vfs::buffer_cache_selftest_choose_dirty_writeback_resume_bytes(WORKER_DIRTY_TARGET);
+    KEXPECT_EQ(WORKER_CACHE_MAX, static_cast<size_t>(2 * ONE_GIB));
+    KEXPECT_EQ(WORKER_DIRTY_TARGET, static_cast<size_t>(ONE_GIB));
+    KEXPECT_EQ(WORKER_DIRTY_WRITEBACK_RESUME, static_cast<size_t>(ONE_GIB / 2));
+    KEXPECT_EQ(WORKER_DIRTY_HARD, WORKER_CACHE_MAX);
+
     size_t const LARGE_CACHE_MAX = ker::vfs::buffer_cache_selftest_choose_cache_max_bytes(THIRTY_TWO_GIB);
     size_t const LARGE_DIRTY_TARGET = ker::vfs::buffer_cache_selftest_choose_dirty_target_bytes(THIRTY_TWO_GIB, LARGE_CACHE_MAX);
     size_t const LARGE_DIRTY_HARD = ker::vfs::buffer_cache_selftest_choose_dirty_hard_bytes(LARGE_DIRTY_TARGET, LARGE_CACHE_MAX);
     size_t const LARGE_DIRTY_WRITEBACK_RESUME = ker::vfs::buffer_cache_selftest_choose_dirty_writeback_resume_bytes(LARGE_DIRTY_TARGET);
-    KEXPECT_EQ(LARGE_CACHE_MAX, static_cast<size_t>(4 * ONE_GIB));
-    KEXPECT_EQ(LARGE_DIRTY_TARGET, static_cast<size_t>(2 * ONE_GIB));
-    KEXPECT_EQ(LARGE_DIRTY_WRITEBACK_RESUME, static_cast<size_t>(ONE_GIB));
+    KEXPECT_EQ(LARGE_CACHE_MAX, static_cast<size_t>(2 * ONE_GIB));
+    KEXPECT_EQ(LARGE_DIRTY_TARGET, static_cast<size_t>(ONE_GIB + ONE_GIB / 2));
+    KEXPECT_EQ(LARGE_DIRTY_WRITEBACK_RESUME, static_cast<size_t>(ONE_GIB / 2 + ONE_GIB / 4));
     KEXPECT_EQ(LARGE_DIRTY_HARD, LARGE_CACHE_MAX);
 
     size_t const SELFHOST_CACHE_MAX = ker::vfs::buffer_cache_selftest_choose_cache_max_bytes(FORTY_EIGHT_GIB);
@@ -173,9 +183,9 @@ KTEST(BufferCache, SizingKeepsDirtyLimitsBelowCleanCache) {
     size_t const SELFHOST_DIRTY_HARD = ker::vfs::buffer_cache_selftest_choose_dirty_hard_bytes(SELFHOST_DIRTY_TARGET, SELFHOST_CACHE_MAX);
     size_t const SELFHOST_DIRTY_WRITEBACK_RESUME =
         ker::vfs::buffer_cache_selftest_choose_dirty_writeback_resume_bytes(SELFHOST_DIRTY_TARGET);
-    KEXPECT_EQ(SELFHOST_CACHE_MAX, static_cast<size_t>(4 * ONE_GIB));
-    KEXPECT_EQ(SELFHOST_DIRTY_TARGET, static_cast<size_t>(3 * ONE_GIB));
-    KEXPECT_EQ(SELFHOST_DIRTY_WRITEBACK_RESUME, static_cast<size_t>(ONE_GIB + ONE_GIB / 2));
+    KEXPECT_EQ(SELFHOST_CACHE_MAX, static_cast<size_t>(2 * ONE_GIB));
+    KEXPECT_EQ(SELFHOST_DIRTY_TARGET, static_cast<size_t>(ONE_GIB + ONE_GIB / 2));
+    KEXPECT_EQ(SELFHOST_DIRTY_WRITEBACK_RESUME, static_cast<size_t>(ONE_GIB / 2 + ONE_GIB / 4));
     KEXPECT_EQ(SELFHOST_DIRTY_HARD, SELFHOST_CACHE_MAX);
 }
 

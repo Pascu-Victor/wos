@@ -296,14 +296,14 @@ constexpr size_t DIRTY_THROTTLE_RESUME_DENOMINATOR = 4;
 // index, and LRU working sets practical across repeated large builds. Start
 // asynchronous writeback well below the hard cache limit on large systems so
 // one workload does not leave the next workload to drain several GiB of dirty
-// state. The hard limit remains much higher than the background target, so
-// ordinary bursts still avoid synchronous writeback.
+// state. The hard limit remains above the background target, so ordinary
+// bursts still have bounded headroom before synchronous writeback.
 constexpr size_t BUFFER_CACHE_MEMORY_NUMERATOR = 7;
 constexpr size_t BUFFER_CACHE_MEMORY_DENOMINATOR = 16;
 constexpr size_t DIRTY_TARGET_MEMORY_DIVISOR = 8;
 constexpr size_t DIRTY_TARGET_LARGE_MEMORY_DIVISOR = 16;
 constexpr uint64_t DIRTY_TARGET_LARGE_MEMORY_THRESHOLD = uint64_t{8} * 1024 * 1024 * 1024;
-constexpr size_t BUFFER_CACHE_MAX_SIZE = size_t{4} * 1024 * 1024 * 1024;
+constexpr size_t BUFFER_CACHE_MAX_SIZE = size_t{2} * 1024 * 1024 * 1024;
 
 struct DirtyBdevState {
     dev::BlockDevice* bdev{};
