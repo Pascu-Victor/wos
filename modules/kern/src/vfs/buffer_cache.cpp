@@ -287,6 +287,8 @@ constexpr uint64_t DIRTY_THROTTLE_PARK_TIMEOUT_US = uint64_t{10} * 1000;
 constexpr size_t DIRTY_TARGET_DIVISOR = 2;
 constexpr size_t DIRTY_TARGET_MAX_NUMERATOR = 3;
 constexpr size_t DIRTY_TARGET_MAX_DENOMINATOR = 4;
+constexpr size_t DIRTY_WRITEBACK_RESUME_NUMERATOR = 1;
+constexpr size_t DIRTY_WRITEBACK_RESUME_DENOMINATOR = 2;
 constexpr size_t DIRTY_THROTTLE_RESUME_NUMERATOR = 3;
 constexpr size_t DIRTY_THROTTLE_RESUME_DENOMINATOR = 4;
 // Let clean cache grow beyond dirty limits, closer to Linux's page cache shape.
@@ -403,6 +405,12 @@ auto perf_xfs_started_us() -> uint64_t { return ker::mod::perf::is_local_xfs_rec
 auto dirty_target_bytes_locked() -> size_t { return std::min(dirty_target_bytes, cache_max_bytes); }
 
 auto dirty_hard_limit_bytes_locked() -> size_t { return std::min(dirty_hard_limit_bytes, cache_max_bytes); }
+
+auto choose_dirty_writeback_resume_bytes(size_t target_bytes) -> size_t {
+    return (target_bytes / DIRTY_WRITEBACK_RESUME_DENOMINATOR) * DIRTY_WRITEBACK_RESUME_NUMERATOR;
+}
+
+auto dirty_writeback_resume_bytes_locked() -> size_t { return choose_dirty_writeback_resume_bytes(dirty_target_bytes_locked()); }
 
 auto dirty_throttle_resume_bytes_locked() -> size_t {
     size_t const TARGET = dirty_target_bytes_locked();
@@ -2820,6 +2828,8 @@ auto overlay_newer_cached_aliases_for_buffer_locked(BufHead* bh, uint64_t block_
 
 auto dirty_bytes_above_target_locked() -> bool { return cache_dirty_bytes > dirty_target_bytes_locked(); }
 
+auto dirty_bytes_above_writeback_resume_locked() -> bool { return cache_dirty_bytes > dirty_writeback_resume_bytes_locked(); }
+
 auto ensure_dirty_writeback_wq() -> ker::mod::sched::Workqueue* {
     if (dirty_writeback_wq != nullptr) {
         return dirty_writeback_wq;
@@ -2862,7 +2872,10 @@ void dirty_writeback_worker(void* unused) {
     size_t bytes_since_yield = 0;
     while (true) {
         uint64_t const IRQFLAGS = cache_lock.lock_irqsave();
-        bool const NEEDS_WRITEBACK = dirty_bytes_above_target_locked();
+        // The high target starts writeback. Once running, drain to a lower
+        // watermark so a later write burst does not begin with the cache
+        // already pinned at its writeback threshold.
+        bool const NEEDS_WRITEBACK = dirty_bytes_above_writeback_resume_locked();
         cache_lock.unlock_irqrestore(IRQFLAGS);
         if (!NEEDS_WRITEBACK) {
             break;
@@ -3864,6 +3877,10 @@ auto buffer_cache_selftest_choose_dirty_target_bytes(uint64_t total_mem, size_t 
 
 auto buffer_cache_selftest_choose_dirty_hard_bytes(size_t target_bytes, size_t max_bytes) -> size_t {
     return choose_dirty_hard_limit_bytes(target_bytes, max_bytes);
+}
+
+auto buffer_cache_selftest_choose_dirty_writeback_resume_bytes(size_t target_bytes) -> size_t {
+    return choose_dirty_writeback_resume_bytes(target_bytes);
 }
 
 auto buffer_cache_selftest_choose_allocation_reclaim_target_bytes(size_t max_bytes, size_t incoming_bytes) -> size_t {

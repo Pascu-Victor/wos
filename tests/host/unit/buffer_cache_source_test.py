@@ -105,8 +105,18 @@ def main() -> None:
     )
     require(
         source,
-        "constexpr size_t BUFFER_CACHE_MAX_SIZE = size_t{16} * 1024 * 1024 * 1024;",
+        "constexpr size_t BUFFER_CACHE_MAX_SIZE = size_t{8} * 1024 * 1024 * 1024;",
         "buffer-cache max cap",
+    )
+    require(
+        source,
+        "constexpr size_t DIRTY_WRITEBACK_RESUME_NUMERATOR = 1;",
+        "background writeback low-watermark numerator",
+    )
+    require(
+        source,
+        "constexpr size_t DIRTY_WRITEBACK_RESUME_DENOMINATOR = 2;",
+        "background writeback low-watermark denominator",
     )
     require(
         source,
@@ -154,6 +164,11 @@ def main() -> None:
     )
 
     dirty_worker_body = function_body(source, "dirty_writeback_worker")
+    require(
+        dirty_worker_body,
+        "dirty_bytes_above_writeback_resume_locked()",
+        "background writeback must drain below its high trigger threshold",
+    )
     require_order(
         dirty_worker_body,
         [
@@ -229,7 +244,7 @@ def main() -> None:
         [
             "cache_lock.lock_irqsave()",
             "journal_pending.fetch_add",
-            "while ((bh->flags & BH_WRITEBACK) != 0)",
+            "while (find_overlapping_writeback_locked(bh) != nullptr)",
             "cache_lock.unlock_irqrestore(irqflags)",
             "kern_yield()",
             "cache_lock.lock_irqsave()",
@@ -256,7 +271,7 @@ def main() -> None:
         [
             "cache_total_bytes > target_bytes",
             "stats.freed_bytes < byte_budget",
-            "find_reclaimable_lru_buffer(scan_budget, honor_second_chance)",
+            "find_reclaimable_lru_buffer(scan_budget, honor_second_chance, &scanned)",
             "stats.freed_bytes += victim->size",
             "free_buffer(victim)",
         ],

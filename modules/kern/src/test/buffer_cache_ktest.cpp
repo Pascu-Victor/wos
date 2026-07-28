@@ -145,9 +145,11 @@ KTEST(BufferCache, SizingKeepsDirtyLimitsBelowCleanCache) {
     size_t const CACHE_MAX = ker::vfs::buffer_cache_selftest_choose_cache_max_bytes(ONE_GIB);
     size_t const DIRTY_TARGET = ker::vfs::buffer_cache_selftest_choose_dirty_target_bytes(ONE_GIB, CACHE_MAX);
     size_t const DIRTY_HARD = ker::vfs::buffer_cache_selftest_choose_dirty_hard_bytes(DIRTY_TARGET, CACHE_MAX);
+    size_t const DIRTY_WRITEBACK_RESUME = ker::vfs::buffer_cache_selftest_choose_dirty_writeback_resume_bytes(DIRTY_TARGET);
 
     KEXPECT_EQ(CACHE_MAX, static_cast<size_t>((ONE_GIB / 16) * 7));
     KEXPECT_EQ(DIRTY_TARGET, static_cast<size_t>(ONE_GIB / 8));
+    KEXPECT_EQ(DIRTY_WRITEBACK_RESUME, DIRTY_TARGET / 2);
     KEXPECT_EQ(DIRTY_HARD, CACHE_MAX);
 
     size_t const FALLBACK_MAX = ker::vfs::buffer_cache_selftest_choose_cache_max_bytes(0);
@@ -160,15 +162,20 @@ KTEST(BufferCache, SizingKeepsDirtyLimitsBelowCleanCache) {
     size_t const LARGE_CACHE_MAX = ker::vfs::buffer_cache_selftest_choose_cache_max_bytes(THIRTY_TWO_GIB);
     size_t const LARGE_DIRTY_TARGET = ker::vfs::buffer_cache_selftest_choose_dirty_target_bytes(THIRTY_TWO_GIB, LARGE_CACHE_MAX);
     size_t const LARGE_DIRTY_HARD = ker::vfs::buffer_cache_selftest_choose_dirty_hard_bytes(LARGE_DIRTY_TARGET, LARGE_CACHE_MAX);
+    size_t const LARGE_DIRTY_WRITEBACK_RESUME = ker::vfs::buffer_cache_selftest_choose_dirty_writeback_resume_bytes(LARGE_DIRTY_TARGET);
     KEXPECT_EQ(LARGE_CACHE_MAX, static_cast<size_t>(8 * ONE_GIB));
     KEXPECT_EQ(LARGE_DIRTY_TARGET, static_cast<size_t>(6 * ONE_GIB));
+    KEXPECT_EQ(LARGE_DIRTY_WRITEBACK_RESUME, static_cast<size_t>(3 * ONE_GIB));
     KEXPECT_EQ(LARGE_DIRTY_HARD, LARGE_CACHE_MAX);
 
     size_t const SELFHOST_CACHE_MAX = ker::vfs::buffer_cache_selftest_choose_cache_max_bytes(FORTY_EIGHT_GIB);
     size_t const SELFHOST_DIRTY_TARGET = ker::vfs::buffer_cache_selftest_choose_dirty_target_bytes(FORTY_EIGHT_GIB, SELFHOST_CACHE_MAX);
     size_t const SELFHOST_DIRTY_HARD = ker::vfs::buffer_cache_selftest_choose_dirty_hard_bytes(SELFHOST_DIRTY_TARGET, SELFHOST_CACHE_MAX);
+    size_t const SELFHOST_DIRTY_WRITEBACK_RESUME =
+        ker::vfs::buffer_cache_selftest_choose_dirty_writeback_resume_bytes(SELFHOST_DIRTY_TARGET);
     KEXPECT_EQ(SELFHOST_CACHE_MAX, static_cast<size_t>(8 * ONE_GIB));
     KEXPECT_EQ(SELFHOST_DIRTY_TARGET, static_cast<size_t>(6 * ONE_GIB));
+    KEXPECT_EQ(SELFHOST_DIRTY_WRITEBACK_RESUME, static_cast<size_t>(3 * ONE_GIB));
     KEXPECT_EQ(SELFHOST_DIRTY_HARD, SELFHOST_CACHE_MAX);
 }
 
