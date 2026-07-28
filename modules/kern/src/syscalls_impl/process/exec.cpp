@@ -121,10 +121,15 @@ void consume_successful_one_shot_wki_target(ker::mod::sched::task::Task* task, k
     }
 
     task->wki_target_hostname.front() = '\0';
-    task->wki_target_flags = 0;
-    // The rich exec path already made this task's one placement decision.
-    // Prevent scheduler publication from treating the now-cleared policy as a
-    // fresh automatic-placement request.
+    // One-shot placement selects the system for the payload process tree, not
+    // merely for the first executable in a wrapper chain.  Clearing to
+    // automatic here lets a locally selected payload's fork/exec descendants
+    // move independently, while remotely selected payloads stay receiver-local.
+    // Keep both outcomes symmetric by pinning the successful payload locally.
+    // A later explicit setwkitarget() call can still opt back into fan-out.
+    task->wki_target_flags = ker::mod::sched::task::Task::WKI_TARGET_FLAG_LOCAL;
+    // The rich exec path already made this task's placement decision. Prevent
+    // scheduler publication from attempting the same placement again.
     task->wki_skip_legacy_placement = true;
 }
 
@@ -1408,7 +1413,8 @@ auto exec_selftest_one_shot_wki_target_consumes_only_on_success() -> bool {
     failed.wki_target_flags = ker::mod::sched::task::Task::WKI_TARGET_FLAG_REMOTE | ker::mod::sched::task::Task::WKI_TARGET_FLAG_ONESHOT;
     consume_successful_one_shot_wki_target(&failed, ker::net::wki::WkiRemoteSpawnResult::FAILED);
 
-    return one_shot.wki_target_hostname.front() == '\0' && one_shot.wki_target_flags == 0 && one_shot.wki_skip_legacy_placement &&
+    return one_shot.wki_target_hostname.front() == '\0' &&
+           one_shot.wki_target_flags == ker::mod::sched::task::Task::WKI_TARGET_FLAG_LOCAL && one_shot.wki_skip_legacy_placement &&
            persistent.wki_target_flags == ker::mod::sched::task::Task::WKI_TARGET_FLAG_BALANCED &&
            failed.wki_target_flags ==
                (ker::mod::sched::task::Task::WKI_TARGET_FLAG_REMOTE | ker::mod::sched::task::Task::WKI_TARGET_FLAG_ONESHOT);
