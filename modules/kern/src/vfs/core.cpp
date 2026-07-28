@@ -14173,6 +14173,8 @@ struct PipeState {
     bool write_closed;
     bool read_closed;
     bool direct_write_active;
+    File* read_file;
+    File* write_file;
     // Counts open file-ends (read + write). Initialized to 2; the closer that
     // drives it to 0 is responsible for freeing buf and this struct.
     std::atomic<int> open_ends{2};
@@ -14833,6 +14835,8 @@ auto vfs_pipe_for_task(ker::mod::sched::task::Task* task, int pipefd[2],
     ps->write_closed = false;
     ps->read_closed = false;
     ps->direct_write_active = false;
+    ps->read_file = nullptr;
+    ps->write_file = nullptr;
 
     // Pipe fops - static lambdas converted to function pointers
     static auto pipe_read = [](File* f, void* buf, size_t count, size_t /*offset*/) -> ssize_t {
@@ -15157,6 +15161,7 @@ auto vfs_pipe_for_task(ker::mod::sched::task::Task* task, int pipefd[2],
             write_closed = st->write_closed;
             open_ends_before = st->open_ends.load(std::memory_order_relaxed);
             st->read_closed = true;
+            st->read_file = nullptr;
             if (!st->writers_waiting.empty()) {
                 pipe_collect_waiters_locked(st->writers_waiting, pending_writers, &pending_writers_count);
             }
@@ -15199,6 +15204,7 @@ auto vfs_pipe_for_task(ker::mod::sched::task::Task* task, int pipefd[2],
             read_closed = st->read_closed;
             open_ends_before = st->open_ends.load(std::memory_order_relaxed);
             st->write_closed = true;
+            st->write_file = nullptr;
             if (!st->readers_waiting.empty()) {
                 pipe_collect_waiters_locked(st->readers_waiting, pending_readers, &pending_readers_count);
             }
@@ -15340,6 +15346,8 @@ auto vfs_pipe_for_task(ker::mod::sched::task::Task* task, int pipefd[2],
         return -ENOMEM;
     }
     pipe_init_file(wf, ps, &pipe_write_fops, WRITE_OPEN_FLAGS);
+    ps->read_file = rf;
+    ps->write_file = wf;
 
 #ifdef WOS_SELFTEST
     if (pipe_selftest_should_fail(PipeSelftestFailStage::READ_FD)) {
@@ -15564,6 +15572,8 @@ auto vfs_generate_local_pipe_diag(char* buf, size_t bufsz) -> size_t {
         bool write_closed = false;
         bool direct_write = false;
         int open_ends = 0;
+        int read_refs = 0;
+        int write_refs = 0;
         std::array<uint64_t, MAX_DIAG_WAITERS> reader_waiter_pids{};
         std::array<uint64_t, MAX_DIAG_WAITERS> writer_waiter_pids{};
         std::array<uint64_t, MAX_DIAG_WAITERS> read_poll_waiter_pids{};
@@ -15584,6 +15594,8 @@ auto vfs_generate_local_pipe_diag(char* buf, size_t bufsz) -> size_t {
         write_closed = st->write_closed;
         direct_write = st->direct_write_active;
         open_ends = st->open_ends.load(std::memory_order_relaxed);
+        read_refs = st->read_file != nullptr ? st->read_file->refcount.load(std::memory_order_relaxed) : 0;
+        write_refs = st->write_file != nullptr ? st->write_file->refcount.load(std::memory_order_relaxed) : 0;
         reader_waiter_diag_count = std::min(reader_waiters, MAX_DIAG_WAITERS);
         writer_waiter_diag_count = std::min(writer_waiters, MAX_DIAG_WAITERS);
         read_poll_waiter_diag_count = std::min(read_poll_waiters, MAX_DIAG_WAITERS);
@@ -15603,9 +15615,9 @@ auto vfs_generate_local_pipe_diag(char* buf, size_t bufsz) -> size_t {
         st->lock.unlock_irqrestore(PIPE_IRQF);
 
         pipe_diag_append(buf, bufsz, len, output_truncated,
-                         "pipe=%p open_ends=%d capacity=%llu buffered=%llu read_closed=%u write_closed=%u direct=%u reader_waiters=%llu "
-                         "writer_waiters=%llu poll_waiters=%llu read_fds=%llu write_fds=%llu\n",
-                         static_cast<void*>(st), open_ends, static_cast<unsigned long long>(capacity),
+                         "pipe=%p open_ends=%d read_refs=%d write_refs=%d capacity=%llu buffered=%llu read_closed=%u write_closed=%u "
+                         "direct=%u reader_waiters=%llu writer_waiters=%llu poll_waiters=%llu read_fds=%llu write_fds=%llu\n",
+                         static_cast<void*>(st), open_ends, read_refs, write_refs, static_cast<unsigned long long>(capacity),
                          static_cast<unsigned long long>(buffered), read_closed ? 1U : 0U, write_closed ? 1U : 0U, direct_write ? 1U : 0U,
                          static_cast<unsigned long long>(reader_waiters), static_cast<unsigned long long>(writer_waiters),
                          static_cast<unsigned long long>(poll_waiters), static_cast<unsigned long long>(read_fds),

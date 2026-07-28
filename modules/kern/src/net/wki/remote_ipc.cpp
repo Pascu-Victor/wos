@@ -281,6 +281,7 @@ constexpr int WKI_IPC_FD_ACCESS_MASK = 0x0003;
 constexpr int WKI_IPC_FD_RDWR = 0x0002;
 constexpr int WKI_IPC_O_NONBLOCK = 04000;
 constexpr int WKI_IPC_FD_OPEN_FLAG_MASK = WKI_IPC_FD_ACCESS_MASK | WKI_IPC_O_NONBLOCK;
+static_assert((WKI_IPC_FD_FLAG_PIPE_FLOW_CONTROL & WKI_IPC_FD_OPEN_FLAG_MASK) == 0);
 
 auto ipc_fd_access_mode(int open_flags) -> uint16_t { return static_cast<uint16_t>(open_flags & WKI_IPC_FD_ACCESS_MASK); }
 
@@ -390,6 +391,7 @@ struct PendingPipeChunk {
     const uint8_t* data = nullptr;
     uint16_t len = 0;
     uint16_t offset = 0;
+    uint16_t flow_credit = 0;
     IpcDevOpWork* dev_op_owner = nullptr;
 };
 static_assert(sizeof(PendingPipeChunk) == 24);
@@ -457,6 +459,7 @@ std::array<IpcPeerCleanupEpoch, WKI_MAX_PEERS> g_ipc_peer_cleanup_epochs = {};
 constexpr uint64_t WKI_IPC_PIPE_WRITE_RETRY_US = 1000;
 constexpr uint64_t WKI_IPC_PIPE_READ_POLL_RECHECK_US = 1000;
 constexpr uint32_t WKI_IPC_PIPE_EOF_MAX_SEND_ATTEMPTS = 128;
+constexpr uint32_t WKI_IPC_PIPE_FLOW_MAX_SEND_ATTEMPTS = 128;
 constexpr uint64_t WKI_IPC_DIAG_FIRST_US = 500'000;
 constexpr uint64_t WKI_IPC_DIAG_INTERVAL_US = 1'000'000;
 constexpr size_t WKI_IPC_MAX_POLL_WAKE_WAITERS = 32;
@@ -477,6 +480,7 @@ static_assert(WKI_ETH_MAX_PAYLOAD <= ker::mod::mm::KERNEL_STACK_SIZE / 16);
 static_assert(WKI_IPC_PIPE_DATA_HEADER_SIZE < WKI_IPC_DEV_OP_COALLOC_MIN_PAYLOAD);
 static_assert(WKI_IPC_DEV_OP_TRANSFER_MIN_DATA > 0);
 static_assert(WKI_IPC_EXPORT_PIPE_WRITE_BURST_CALLS > 0);
+static_assert(WKI_IPC_MESSAGE_PIPE_WINDOW >= WKI_IPC_PIPE_DATA_MAX_CHUNK);
 
 auto ipc_dev_op_work_can_back_pipe_chunk(const IpcDevOpWork* work, const uint8_t* data, uint16_t len) -> bool {
     if (work == nullptr || data == nullptr || !work->payload_coallocated || work->payload != reinterpret_cast<const uint8_t*>(work + 1) ||
@@ -712,6 +716,107 @@ void proxy_reschedule_waiters(const std::array<uint64_t, WKI_IPC_MAX_POLL_WAKE_W
 
         ker::mod::sched::wake_task_from_event(waiter, ker::mod::sched::EventWakeDeferredSwitch::CANCEL);
         waiter->release();
+    }
+}
+
+void proxy_wake_message_write_waiters(ProxyIpcState* proxy) {
+    if (proxy == nullptr) {
+        return;
+    }
+
+    for (;;) {
+        std::array<uint64_t, WKI_IPC_MAX_POLL_WAKE_WAITERS> pending = {};
+        size_t pending_count = 0;
+        uint64_t const IRQF = proxy->lock.lock_irqsave();
+        proxy_collect_waiters_locked(proxy->message_write_waiters, pending, &pending_count);
+        proxy->lock.unlock_irqrestore(IRQF);
+        proxy_reschedule_waiters(pending, pending_count);
+        if (pending_count < pending.size()) {
+            return;
+        }
+    }
+}
+
+void proxy_grant_message_write_credits(ProxyIpcState* proxy, uint32_t credits) {
+    if (proxy == nullptr || credits == 0) {
+        return;
+    }
+
+    uint32_t current = proxy->message_write_credits.load(std::memory_order_acquire);
+    for (;;) {
+        uint32_t const ROOM = current < WKI_IPC_MESSAGE_PIPE_WINDOW ? WKI_IPC_MESSAGE_PIPE_WINDOW - current : 0;
+        uint32_t const UPDATED = current + std::min(credits, ROOM);
+        if (proxy->message_write_credits.compare_exchange_weak(current, UPDATED, std::memory_order_acq_rel, std::memory_order_acquire)) {
+            return;
+        }
+    }
+}
+
+auto proxy_reserve_message_write_credits(ProxyIpcState* proxy, size_t requested, bool nonblocking) -> ssize_t {
+    if (proxy == nullptr || requested == 0) {
+        return 0;
+    }
+
+    for (;;) {
+        int32_t const WRITE_ERROR = proxy->message_write_error.load(std::memory_order_acquire);
+        if (WRITE_ERROR != 0) {
+            return WRITE_ERROR;
+        }
+        if (!proxy->active.load(std::memory_order_acquire)) {
+            return -EBADF;
+        }
+
+        uint32_t credits = proxy->message_write_credits.load(std::memory_order_acquire);
+        while (credits != 0) {
+            uint32_t const RESERVED = static_cast<uint32_t>(std::min<size_t>(requested, credits));
+            if (proxy->message_write_credits.compare_exchange_weak(credits, credits - RESERVED, std::memory_order_acq_rel,
+                                                                   std::memory_order_acquire)) {
+                return static_cast<ssize_t>(RESERVED);
+            }
+        }
+
+        if (nonblocking) {
+            return -EAGAIN;
+        }
+        if (current_task_has_deliverable_signal()) {
+            return -EINTR;
+        }
+
+        auto* task = ker::mod::sched::get_current_task();
+        if (task == nullptr) {
+            return -ESRCH;
+        }
+
+        bool registered = false;
+        uint64_t const IRQF = proxy->lock.lock_irqsave();
+        bool const READY = proxy->message_write_error.load(std::memory_order_acquire) != 0 ||
+                           !proxy->active.load(std::memory_order_acquire) ||
+                           proxy->message_write_credits.load(std::memory_order_acquire) != 0;
+        if (!READY) {
+            registered = proxy_register_waiter_locked(proxy->message_write_waiters, task->pid);
+            if (registered) {
+                task->set_wait_channel("wki_proxy_pipe_credit");
+            }
+        }
+        proxy->lock.unlock_irqrestore(IRQF);
+        if (READY) {
+            continue;
+        }
+        if (!registered) {
+            ker::mod::sched::kern_sleep_us(WKI_IPC_PIPE_WRITE_RETRY_US);
+            continue;
+        }
+
+        ker::mod::sched::preemptible_syscall_park("wki_proxy_pipe_credit");
+
+        uint64_t const REMOVE_IRQF = proxy->lock.lock_irqsave();
+        for (size_t i = 0; i < proxy->message_write_waiters.size(); ++i) {
+            if (proxy->message_write_waiters.at(i) == task->pid) {
+                static_cast<void>(proxy->message_write_waiters.remove_at(i));
+                break;
+            }
+        }
+        proxy->lock.unlock_irqrestore(REMOVE_IRQF);
     }
 }
 
@@ -958,6 +1063,68 @@ void free_export_pipe_write_backlog(ExportPipeWriteBacklog* backlog) {
     delete backlog;
 }
 
+auto send_export_pipe_write_flow(uint16_t consumer_node, uint32_t resource_id, uint32_t credit_bytes, int32_t status) -> bool {
+    if (consumer_node == WKI_NODE_INVALID || (credit_bytes == 0 && status == 0)) {
+        return false;
+    }
+
+    constexpr size_t MSG_SIZE = sizeof(DevOpReqPayload) + sizeof(IpcPipeWriteFlowPayload);
+    std::array<uint8_t, MSG_SIZE> msg = {};
+    auto* req = reinterpret_cast<DevOpReqPayload*>(msg.data());
+    req->op_id = OP_PIPE_WRITE_FLOW;
+    req->data_len = sizeof(IpcPipeWriteFlowPayload);
+
+    IpcPipeWriteFlowPayload flow = {
+        .resource_id = resource_id,
+        .credit_bytes = credit_bytes,
+        .status = status,
+    };
+    std::memcpy(msg.data() + sizeof(DevOpReqPayload), &flow, sizeof(flow));
+
+    int ret = WKI_ERR_TX_FAILED;
+    for (uint32_t attempt = 0; attempt < WKI_IPC_PIPE_FLOW_MAX_SEND_ATTEMPTS; ++attempt) {
+        ret = wki_send(consumer_node, WKI_CHAN_RESOURCE, MsgType::DEV_OP_REQ, msg.data(), static_cast<uint16_t>(msg.size()));
+        if (ret == WKI_OK) {
+            return true;
+        }
+        if (ret == WKI_ERR_PEER_FENCED || ret == WKI_ERR_NO_ROUTE || ret == WKI_ERR_INVALID || ret == WKI_ERR_NOT_FOUND) {
+            break;
+        }
+        pause_for_ipc_send_retry(ret, attempt);
+    }
+
+    ker::mod::dbg::logger<"wki">::warn("IPC pipe flow notification failed: peer=0x%04x res=%u credit=%u status=%d ret=%d", consumer_node,
+                                       resource_id, credit_bytes, status, ret);
+    return false;
+}
+
+struct FailedExportPipeWriteRetirement {
+    WkiIpcExport* retired_exports = nullptr;
+    ker::vfs::File* export_file = nullptr;
+    uint16_t consumer_node = WKI_NODE_INVALID;
+    bool message_write_flow_control = false;
+};
+
+// s_ipc_lock must be held. The flush worker owns one temporary File reference
+// in addition to the export's lifetime reference. Return the latter separately
+// so both ownerships are released after dropping the spinlock.
+auto retire_failed_export_pipe_write_locked(ExportPipeWriteBacklog* backlog, WkiIpcExport* exp, ker::vfs::File* acquired_file)
+    -> FailedExportPipeWriteRetirement {
+    FailedExportPipeWriteRetirement retirement;
+    if (backlog == nullptr || exp == nullptr || exp->file != acquired_file) {
+        return retirement;
+    }
+
+    retirement.export_file = exp->file;
+    retirement.consumer_node = exp->consumer_node;
+    retirement.message_write_flow_control = exp->message_write_flow_control;
+    exp->file = nullptr;
+    exp->active = false;
+    erase_export_pipe_write_backlog_locked(backlog);
+    retirement.retired_exports = compact_inactive_exports_locked();
+    return retirement;
+}
+
 auto ensure_export_pipe_write_backlog_locked(WkiIpcExport* exp) -> ExportPipeWriteBacklog* {
     auto* backlog = find_export_pipe_write_backlog_locked(exp);
     if (backlog != nullptr) {
@@ -996,8 +1163,9 @@ void note_export_pipe_data_received_locked(WkiIpcExport* exp, uint16_t len) {
 }
 
 void publish_export_pipe_write_chunk_locked(ExportPipeWriteBacklog* backlog, const uint8_t* data, uint16_t len,
-                                            IpcDevOpWork* transfer_owner, IpcDevOpWork** work_owner) {
-    backlog->chunks.push_back(PendingPipeChunk{.data = data, .len = len, .dev_op_owner = transfer_owner});
+                                            IpcDevOpWork* transfer_owner, IpcDevOpWork** work_owner, bool flow_controlled) {
+    backlog->chunks.push_back(
+        PendingPipeChunk{.data = data, .len = len, .flow_credit = flow_controlled ? len : uint16_t{0}, .dev_op_owner = transfer_owner});
     if (transfer_owner != nullptr) {
         // Publication is the ownership handoff. The flush worker may release
         // the work as soon as s_ipc_lock is dropped, so the deferred worker
@@ -1006,7 +1174,8 @@ void publish_export_pipe_write_chunk_locked(ExportPipeWriteBacklog* backlog, con
     }
 }
 
-auto queue_export_pipe_write_data(uint32_t resource_id, const uint8_t* data, uint16_t len, IpcDevOpWork** work_owner) -> bool {
+auto queue_export_pipe_write_data(uint32_t resource_id, const uint8_t* data, uint16_t len, IpcDevOpWork** work_owner,
+                                  bool flow_controlled = false) -> bool {
     if (data == nullptr || len == 0) {
         return true;
     }
@@ -1037,7 +1206,8 @@ auto queue_export_pipe_write_data(uint32_t resource_id, const uint8_t* data, uin
         return false;
     }
 
-    publish_export_pipe_write_chunk_locked(backlog, TRANSFER_OWNER != nullptr ? data : copy, len, TRANSFER_OWNER, work_owner);
+    publish_export_pipe_write_chunk_locked(backlog, TRANSFER_OWNER != nullptr ? data : copy, len, TRANSFER_OWNER, work_owner,
+                                           flow_controlled);
     backlog->buffered_bytes += len;
     note_export_pipe_data_received_locked(exp, len);
     queue_export_pipe_write_flush_locked(backlog);
@@ -1231,6 +1401,8 @@ auto mark_export_pipe_write_closed(uint32_t resource_id, uint64_t expected_bytes
 
         if (WRITE_RET > 0) {
             auto const ADVANCED = static_cast<uint16_t>(std::cmp_less(WRITE_RET, remaining) ? WRITE_RET : remaining);
+            uint16_t flow_credit = 0;
+            uint16_t flow_consumer = WKI_NODE_INVALID;
             if (rdma_chunk) {
                 auto* header = export_pipe_rdma_header(exp);
                 if (header != nullptr) {
@@ -1247,6 +1419,8 @@ auto mark_export_pipe_write_closed(uint32_t resource_id, uint64_t expected_bytes
                 chunk.offset = static_cast<uint16_t>(chunk.offset + ADVANCED);
                 backlog->buffered_bytes -= ADVANCED;
                 if (chunk.offset == chunk.len) {
+                    flow_credit = chunk.flow_credit;
+                    flow_consumer = exp->consumer_node;
                     release_pending_pipe_chunk(chunk);
                     backlog->chunks.pop_front();
                 }
@@ -1261,9 +1435,13 @@ auto mark_export_pipe_write_closed(uint32_t resource_id, uint64_t expected_bytes
             } else if (!backlog->persistent_for_rdma) {
                 erase_export_pipe_write_backlog_locked(backlog);
             }
+            bool const FREE_BACKLOG = !backlog->persistent_for_rdma && backlog->chunks.empty() && !backlog->close_pending;
             s_ipc_lock.unlock_irqrestore(irqf);
             ipc_release_file_ref(file);
-            if (!backlog->persistent_for_rdma && backlog->chunks.empty() && !backlog->close_pending) {
+            if (flow_credit != 0) {
+                static_cast<void>(send_export_pipe_write_flow(flow_consumer, resource_id, flow_credit, 0));
+            }
+            if (FREE_BACKLOG) {
                 free_export_pipe_write_backlog(backlog);
             }
             continue;
@@ -1291,14 +1469,18 @@ auto mark_export_pipe_write_closed(uint32_t resource_id, uint64_t expected_bytes
         }
 
         ker::mod::dbg::log("[WKI] IPC export pipe write failed: resource_id=%u ret=%ld remaining=%u", resource_id, WRITE_RET, remaining);
-        exp->file = nullptr;
-        exp->active = false;
-        erase_export_pipe_write_backlog_locked(backlog);
-        auto* retired_exports = compact_inactive_exports_locked();
+        FailedExportPipeWriteRetirement const RETIREMENT = retire_failed_export_pipe_write_locked(backlog, exp, file);
         s_ipc_lock.unlock_irqrestore(irqf);
+        if (RETIREMENT.message_write_flow_control) {
+            static_cast<void>(send_export_pipe_write_flow(RETIREMENT.consumer_node, resource_id, 0, static_cast<int32_t>(WRITE_RET)));
+        }
+        // Drop the worker's temporary reference and the distinct reference
+        // formerly owned by the export. Releasing only one leaves a pipe end
+        // alive with no fd/export owner and suppresses EOF indefinitely.
         ipc_release_file_ref(file);
+        ipc_release_file_ref(RETIREMENT.export_file);
         free_export_pipe_write_backlog(backlog);
-        free_retired_exports(retired_exports);
+        free_retired_exports(RETIREMENT.retired_exports);
     }
 }
 
@@ -1800,28 +1982,55 @@ auto proxy_pipe_write(ker::vfs::File* f, const void* buf, size_t count, size_t /
     size_t sent = 0;
     const auto* src = static_cast<const uint8_t*>(buf);
     auto* req = reinterpret_cast<DevOpReqPayload*>(msg.data());
-    req->op_id = OP_PIPE_DATA;
+    bool const MESSAGE_FLOW_CONTROL = proxy->message_write_flow_control;
+    req->op_id = MESSAGE_FLOW_CONTROL ? OP_PIPE_DATA_FLOW : OP_PIPE_DATA;
     std::memcpy(msg.data() + sizeof(DevOpReqPayload), &proxy->resource_id, sizeof(uint32_t));
 
     uint64_t const SEND_STARTED_US = wki_now_us();
     uint64_t last_send_diag_us = 0;
     while (sent < count) {
-        size_t const TO_SEND = std::min(count - sent, MAX_CHUNK);
-        req->data_len = static_cast<uint16_t>(sizeof(uint32_t) + TO_SEND);
-        std::memcpy(msg.data() + HEADER_SIZE, src + sent, TO_SEND);
+        size_t to_send = std::min(count - sent, MAX_CHUNK);
+        uint32_t reserved_credits = 0;
+        if (MESSAGE_FLOW_CONTROL) {
+            ssize_t const RESERVED = proxy_reserve_message_write_credits(proxy, to_send, NONBLOCKING);
+            if (RESERVED <= 0) {
+                return finish(sent != 0 ? static_cast<ssize_t>(sent) : RESERVED, sent);
+            }
+            reserved_credits = static_cast<uint32_t>(RESERVED);
+            to_send = reserved_credits;
+        }
+
+        auto refund_reserved_credits = [&]() {
+            if (reserved_credits == 0) {
+                return;
+            }
+            proxy_grant_message_write_credits(proxy, reserved_credits);
+            reserved_credits = 0;
+            proxy_wake_message_write_waiters(proxy);
+        };
+
+        req->data_len = static_cast<uint16_t>(sizeof(uint32_t) + to_send);
+        std::memcpy(msg.data() + HEADER_SIZE, src + sent, to_send);
 
         int ret = WKI_ERR_TX_FAILED;
         uint32_t attempts = 0;
         while (proxy->active.load(std::memory_order_acquire)) {
+            int32_t const WRITE_ERROR = proxy->message_write_error.load(std::memory_order_acquire);
+            if (WRITE_ERROR != 0) {
+                refund_reserved_credits();
+                return finish(sent != 0 ? static_cast<ssize_t>(sent) : static_cast<ssize_t>(WRITE_ERROR), sent);
+            }
             ret = wki_send(proxy->home_node, WKI_CHAN_IPC_DATA, MsgType::DEV_OP_REQ, msg.data(),
-                           static_cast<uint16_t>(HEADER_SIZE + TO_SEND));
+                           static_cast<uint16_t>(HEADER_SIZE + to_send));
             if (ret == WKI_OK) {
                 break;
             }
             if (NONBLOCKING) {
+                refund_reserved_credits();
                 return finish(sent != 0 ? static_cast<ssize_t>(sent) : ipc_pipe_nonblocking_send_status(ret), sent);
             }
             if (current_task_has_deliverable_signal()) {
+                refund_reserved_credits();
                 return finish(sent != 0 ? static_cast<ssize_t>(sent) : static_cast<ssize_t>(-EINTR), sent);
             }
             uint32_t const ATTEMPT = attempts++;
@@ -1838,12 +2047,14 @@ auto proxy_pipe_write(ker::vfs::File* f, const void* buf, size_t count, size_t /
         }
 
         if (ret != WKI_OK) {
+            refund_reserved_credits();
             return finish(sent != 0 ? static_cast<ssize_t>(sent) : static_cast<ssize_t>(-EIO), sent);
         }
 
-        sent += TO_SEND;
-        proxy->bytes_written.fetch_add(TO_SEND, std::memory_order_acq_rel);
-        g_proxy_write_payload_bytes.fetch_add(TO_SEND, std::memory_order_relaxed);
+        reserved_credits = 0;
+        sent += to_send;
+        proxy->bytes_written.fetch_add(to_send, std::memory_order_acq_rel);
+        g_proxy_write_payload_bytes.fetch_add(to_send, std::memory_order_relaxed);
     }
 
     return finish(static_cast<ssize_t>(sent), sent);
@@ -1890,7 +2101,9 @@ auto proxy_pipe_close(ker::vfs::File* f) -> int {
     }
 
     // Send close to home node with resource_id
-    uint16_t const OP = (f->fops != nullptr && f->fops->vfs_write == nullptr) ? OP_PIPE_CLOSE_READ : OP_PIPE_CLOSE_WRITE;
+    uint16_t const OP = (f->fops != nullptr && f->fops->vfs_write == nullptr)
+                            ? OP_PIPE_CLOSE_READ
+                            : (proxy->message_write_flow_control ? OP_PIPE_CLOSE_WRITE_FLOW : OP_PIPE_CLOSE_WRITE);
 
     constexpr size_t HEADER_SIZE = sizeof(DevOpReqPayload) + sizeof(uint32_t);
     constexpr size_t MAX_CLOSE_SIZE = HEADER_SIZE + sizeof(uint64_t);
@@ -1900,7 +2113,7 @@ auto proxy_pipe_close(ker::vfs::File* f) -> int {
     req->data_len = sizeof(uint32_t);
     std::memcpy(msg.data() + sizeof(DevOpReqPayload), &proxy->resource_id, sizeof(uint32_t));
     uint16_t msg_size = HEADER_SIZE;
-    if (OP == OP_PIPE_CLOSE_WRITE) {
+    if (OP == OP_PIPE_CLOSE_WRITE || OP == OP_PIPE_CLOSE_WRITE_FLOW) {
         uint64_t const EXPECTED_BYTES = proxy->bytes_written.load(std::memory_order_acquire);
         req->data_len = static_cast<uint16_t>(req->data_len + sizeof(EXPECTED_BYTES));
         std::memcpy(msg.data() + HEADER_SIZE, &EXPECTED_BYTES, sizeof(EXPECTED_BYTES));
@@ -1975,8 +2188,12 @@ auto proxy_pipe_poll_check(ker::vfs::File* f, int events) -> int {
         }
     }
     if (HAS_WRITE_SIDE) {
-        // Write end — always writable (sends via wire message)
-        if ((events & dev::pty::POLLOUT) != 0) {
+        int32_t const WRITE_ERROR = proxy->message_write_error.load(std::memory_order_acquire);
+        if (WRITE_ERROR != 0) {
+            ready |= dev::pty::POLLERR;
+        }
+        bool const HAS_CREDIT = !proxy->message_write_flow_control || proxy->message_write_credits.load(std::memory_order_acquire) != 0;
+        if (((events & dev::pty::POLLOUT) != 0) && WRITE_ERROR == 0 && HAS_CREDIT) {
             ready |= dev::pty::POLLOUT;
         }
     }
@@ -2917,13 +3134,15 @@ auto ipc_dev_op_request_cookie(const uint8_t* payload, uint16_t payload_len, uin
 }
 
 auto ipc_dev_op_is_close(uint16_t op_id) -> bool {
-    return op_id == OP_PIPE_CLOSE_READ || op_id == OP_PIPE_CLOSE_WRITE || op_id == OP_PTY_CLOSE || op_id == OP_SOCK_CLOSE;
+    return op_id == OP_PIPE_CLOSE_READ || op_id == OP_PIPE_CLOSE_WRITE || op_id == OP_PIPE_CLOSE_WRITE_FLOW || op_id == OP_PTY_CLOSE ||
+           op_id == OP_SOCK_CLOSE;
 }
 
 auto ipc_dev_op_must_not_drop(uint16_t op_id) -> bool {
-    // OP_PIPE_DATA has no response path; once WKI accepts it, dropping the
-    // deferred work item silently corrupts the byte stream.
-    return op_id == OP_PIPE_DATA || ipc_dev_op_is_close(op_id);
+    // Pipe DATA has no per-packet response path; once WKI accepts it, dropping
+    // the deferred work item silently corrupts the byte stream. The
+    // flow-controlled variant is bounded by application credits.
+    return op_id == OP_PIPE_DATA || op_id == OP_PIPE_DATA_FLOW || ipc_dev_op_is_close(op_id);
 }
 
 void send_ipc_dev_op_error_response(const WkiHeader* hdr, uint16_t op_id, uint32_t resource_id, int16_t status, uint16_t response_cookie) {
@@ -2947,7 +3166,8 @@ auto should_defer_ipc_dev_op(uint16_t op_id, uint32_t resource_id, uint16_t src_
     if (drop_out != nullptr) {
         *drop_out = false;
     }
-    if (op_id == OP_PIPE_DATA) {
+    if (op_id == OP_PIPE_DATA || op_id == OP_PIPE_DATA_FLOW) {
+        bool const FLOW_CONTROLLED = op_id == OP_PIPE_DATA_FLOW;
         bool has_proxy = false;
         bool has_receiving_proxy = false;
         bool has_matching_export = false;
@@ -2967,7 +3187,7 @@ auto should_defer_ipc_dev_op(uint16_t op_id, uint32_t resource_id, uint16_t src_
             proxy_release(proxy);
         }
 
-        if (has_proxy && !has_receiving_proxy && !has_matching_export) {
+        if (!FLOW_CONTROLLED && has_proxy && !has_receiving_proxy && !has_matching_export) {
             if (drop_out != nullptr) {
                 *drop_out = true;
             }
@@ -2977,11 +3197,10 @@ auto should_defer_ipc_dev_op(uint16_t op_id, uint32_t resource_id, uint16_t src_
         // Proxy ring delivery is bounded and wakes local readers. Export-side
         // writes can enter arbitrary file/socket/PTY ops, so defer them. With
         // no proxy, preserve pre-attachment delivery through the worker queue.
-        return !has_receiving_proxy;
+        return FLOW_CONTROLLED || !has_receiving_proxy;
     }
 
-    if (op_id == OP_PIPE_POLL_STATE || op_id == OP_FUTEX_WAKE || op_id == OP_PTY_IOCTL || op_id == OP_PTY_CLOSE ||
-        op_id == OP_PIPE_CLOSE_READ || op_id == OP_PIPE_CLOSE_WRITE || op_id == OP_SOCK_CLOSE) {
+    if (op_id == OP_PIPE_POLL_STATE || op_id == OP_FUTEX_WAKE || op_id == OP_PTY_IOCTL || ipc_dev_op_is_close(op_id)) {
         (void)src_node;
         return true;
     }
@@ -3083,6 +3302,9 @@ auto enqueue_ipc_dev_op_work(const WkiHeader* hdr, const uint8_t* payload, uint1
     uint16_t const REQUEST_COOKIE = ipc_dev_op_request_cookie(payload, payload_len, op_id);
     auto* work = alloc_ipc_dev_op_work(payload_len);
     if (work == nullptr) {
+        if (op_id == OP_PIPE_DATA_FLOW && hdr != nullptr) {
+            static_cast<void>(send_export_pipe_write_flow(hdr->src_node, resource_id, 0, -ENOMEM));
+        }
         send_ipc_dev_op_error_response(hdr, op_id, resource_id, -ENOMEM, REQUEST_COOKIE);
         return false;
     }
@@ -3663,6 +3885,10 @@ auto wki_ipc_export_task_fds(ker::mod::sched::task::Task* task, uint16_t target_
         entry.rdma_offset = 0;
         if (res_type == ResourceType::IPC_PIPE && ACCESS_MODE != 0) {
             setup_export_pipe_rdma(exp, target_node, entry);
+            if (entry.rdma_rkey == 0) {
+                exp->message_write_flow_control = true;
+                entry.reserved1 |= WKI_IPC_FD_FLAG_PIPE_FLOW_CONTROL;
+            }
         }
         count++;
     });
@@ -3803,6 +4029,7 @@ void wki_ipc_attach_task_fds(ker::mod::sched::task::Task* task, const WkiIpcFdEn
         proxy->resource_id = entry.resource_id;
         proxy->assigned_channel = WKI_CHAN_RESOURCE;
         proxy->can_receive_data = ipc_proxy_can_receive_data(RES_TYPE, ACCESS_MODE);
+        proxy->message_write_error.store(0, std::memory_order_relaxed);
 
         // Allocate receive storage only for endpoints whose fops can consume it.
         if (proxy->can_receive_data) {
@@ -3849,6 +4076,10 @@ void wki_ipc_attach_task_fds(ker::mod::sched::task::Task* task, const WkiIpcFdEn
                     proxy->pipe_rdma_writer_active.store(false, std::memory_order_relaxed);
                 }
             }
+            proxy->message_write_flow_control =
+                ACCESS_MODE != 0 && !proxy->pipe_rdma_enabled && (entry.reserved1 & WKI_IPC_FD_FLAG_PIPE_FLOW_CONTROL) != 0;
+            proxy->message_write_credits.store(proxy->message_write_flow_control ? WKI_IPC_MESSAGE_PIPE_WINDOW : 0,
+                                               std::memory_order_relaxed);
             if (ACCESS_MODE == 0) {
                 proxy_file->fops = &g_proxy_pipe_read_fops;
             } else {
@@ -4145,7 +4376,7 @@ void wki_ipc_handle_dev_op_resp(uint16_t src_node, uint16_t channel, const uint8
     uint16_t const OP_ID = resp.op_id;
 
     // Handle pipe close acknowledgement
-    if (OP_ID == OP_PIPE_CLOSE_READ || OP_ID == OP_PIPE_CLOSE_WRITE) {
+    if (OP_ID == OP_PIPE_CLOSE_READ || OP_ID == OP_PIPE_CLOSE_WRITE || OP_ID == OP_PIPE_CLOSE_WRITE_FLOW) {
         // Close acknowledged — no further action needed
         return;
     }
@@ -4292,6 +4523,107 @@ auto wki_ipc_selftest_export_compaction_frees() -> int {
         return -EIO;
     }
     return FREES_AFTER - FREES_BEFORE;
+}
+
+auto wki_ipc_selftest_failed_export_write_releases_all_file_refs() -> int {
+    constexpr uint32_t RESOURCE_ID = 0x6A6B;
+
+    auto* file = new (std::nothrow) ker::vfs::File{};
+    auto* exp = new (std::nothrow) WkiIpcExport{};
+    auto* backlog = new (std::nothrow) ExportPipeWriteBacklog{};
+    if (file == nullptr || exp == nullptr || backlog == nullptr) {
+        delete file;
+        delete exp;
+        delete backlog;
+        return -ENOMEM;
+    }
+
+    file->fops = &g_ipc_selftest_file_ops;
+    // One reference belongs to the export and one models the flush worker's
+    // acquired reference at the point where its write returns a fatal error.
+    file->refcount.store(2, std::memory_order_release);
+    exp->active = true;
+    exp->resource_id = RESOURCE_ID;
+    exp->file = file;
+    backlog->exp = exp;
+    backlog->resource_id = RESOURCE_ID;
+
+    int const EXPORT_FREES_BEFORE = g_ipc_export_selftest_frees.load(std::memory_order_acquire);
+    int const FILE_CLOSES_BEFORE = g_ipc_file_selftest_closes.load(std::memory_order_acquire);
+    FailedExportPipeWriteRetirement retirement;
+    {
+        uint64_t const IRQF = s_ipc_lock.lock_irqsave();
+        g_ipc_exports.push_back(exp);
+        g_export_pipe_write_backlogs.push_back(backlog);
+        retirement = retire_failed_export_pipe_write_locked(backlog, exp, file);
+        s_ipc_lock.unlock_irqrestore(IRQF);
+    }
+
+    ipc_release_file_ref(file);
+    ipc_release_file_ref(retirement.export_file);
+    free_export_pipe_write_backlog(backlog);
+    free_retired_exports(retirement.retired_exports);
+
+    int const EXPORT_FREES = g_ipc_export_selftest_frees.load(std::memory_order_acquire) - EXPORT_FREES_BEFORE;
+    int const FILE_CLOSES = g_ipc_file_selftest_closes.load(std::memory_order_acquire) - FILE_CLOSES_BEFORE;
+    return EXPORT_FREES == 1 && FILE_CLOSES == 1 ? 0 : -EIO;
+}
+
+auto wki_ipc_selftest_message_pipe_flow_updates_proxy() -> int {
+    constexpr uint16_t HOME_NODE = 0x6A6C;
+    constexpr uint32_t RESOURCE_ID = 0x6A6D;
+    constexpr uint32_t INITIAL_CREDITS = WKI_IPC_MESSAGE_PIPE_WINDOW - 32;
+
+    auto* proxy = new (std::nothrow) ProxyIpcState{};
+    if (proxy == nullptr) {
+        return -ENOMEM;
+    }
+    proxy->active.store(true, std::memory_order_release);
+    proxy->home_node = HOME_NODE;
+    proxy->resource_id = RESOURCE_ID;
+    proxy->message_write_flow_control = true;
+    proxy->message_write_credits.store(INITIAL_CREDITS, std::memory_order_release);
+    proxy->refcount.store(1, std::memory_order_release);
+
+    {
+        uint64_t const IRQF = s_ipc_lock.lock_irqsave();
+        g_ipc_proxies.push_back(proxy);
+        s_ipc_lock.unlock_irqrestore(IRQF);
+    }
+
+    auto notify = [&](uint32_t credits, int32_t status) {
+        constexpr size_t MSG_SIZE = sizeof(DevOpReqPayload) + sizeof(IpcPipeWriteFlowPayload);
+        std::array<uint8_t, MSG_SIZE> msg = {};
+        auto* req = reinterpret_cast<DevOpReqPayload*>(msg.data());
+        req->op_id = OP_PIPE_WRITE_FLOW;
+        req->data_len = sizeof(IpcPipeWriteFlowPayload);
+        IpcPipeWriteFlowPayload flow = {
+            .resource_id = RESOURCE_ID,
+            .credit_bytes = credits,
+            .status = status,
+        };
+        std::memcpy(msg.data() + sizeof(DevOpReqPayload), &flow, sizeof(flow));
+        WkiHeader hdr = {};
+        hdr.src_node = HOME_NODE;
+        hdr.channel_id = WKI_CHAN_RESOURCE;
+        handle_ipc_dev_op_req_inline(&hdr, msg.data(), static_cast<uint16_t>(msg.size()), nullptr);
+    };
+
+    notify(64, 0);
+    bool const CREDIT_CAPPED = proxy->message_write_credits.load(std::memory_order_acquire) == WKI_IPC_MESSAGE_PIPE_WINDOW;
+    notify(0, -EPIPE);
+    bool const ERROR_PUBLISHED = proxy->message_write_error.load(std::memory_order_acquire) == -EPIPE &&
+                                 proxy->message_write_credits.load(std::memory_order_acquire) == 0;
+
+    {
+        uint64_t const IRQF = s_ipc_lock.lock_irqsave();
+        static_cast<void>(proxy_unregister_locked(proxy));
+        s_ipc_lock.unlock_irqrestore(IRQF);
+    }
+    proxy->active.store(false, std::memory_order_release);
+    proxy_release(proxy);
+
+    return CREDIT_CAPPED && ERROR_PUBLISHED && ipc_dev_op_must_not_drop(OP_PIPE_DATA_FLOW) ? 0 : -EIO;
 }
 
 auto wki_ipc_selftest_cleanup_for_peer_drains_over_capacity() -> int {
@@ -4572,7 +4904,7 @@ auto wki_ipc_selftest_large_dev_op_work_backs_pipe_chunk() -> int {
         !queue_export_pipe_write_data(UINT32_MAX, DATA, static_cast<uint16_t>(WKI_IPC_PIPE_DATA_MAX_CHUNK), &work) && work == ORIGINAL_WORK;
 
     ExportPipeWriteBacklog backlog{};
-    publish_export_pipe_write_chunk_locked(&backlog, DATA, static_cast<uint16_t>(WKI_IPC_PIPE_DATA_MAX_CHUNK), work, &work);
+    publish_export_pipe_write_chunk_locked(&backlog, DATA, static_cast<uint16_t>(WKI_IPC_PIPE_DATA_MAX_CHUNK), work, &work, false);
     bool const PUBLICATION_VALID = work == nullptr && backlog.chunks.size() == 1 && backlog.chunks.front().data == DATA &&
                                    backlog.chunks.front().len == WKI_IPC_PIPE_DATA_MAX_CHUNK &&
                                    backlog.chunks.front().dev_op_owner == ORIGINAL_WORK;
@@ -5430,6 +5762,7 @@ void wki_ipc_detach_proxy_file(ker::vfs::File* f, ProxyIpcState* proxy) {
 
     auto* reader = proxy->blocked_reader.exchange(nullptr, std::memory_order_acq_rel);
     wake_blocked_ipc_reader(reader);
+    proxy_wake_message_write_waiters(proxy);
     wki_ipc_proxy_wake_poll_waiters(proxy);
     WkiWaitEntry* pending_wait = nullptr;
     {
@@ -5630,6 +5963,7 @@ void drain_ipc_peer_cleanup_batch(IpcPeerCleanupBatch& batch) {
         }
         auto* reader = proxy->blocked_reader.exchange(nullptr, std::memory_order_acq_rel);
         wake_blocked_ipc_reader(reader);
+        proxy_wake_message_write_waiters(proxy);
         wki_ipc_proxy_wake_poll_waiters(proxy);
         if (pending_wait != nullptr) {
             wki_finish_claimed_op(pending_wait, 0);
@@ -5730,10 +6064,43 @@ void handle_ipc_dev_op_req_inline(const WkiHeader* hdr, const uint8_t* payload, 
     uint64_t const IPC_CALLSITE = WOS_PERF_CALLSITE();
     auto const IPC_CORRELATION = static_cast<uint32_t>(hdr->seq_num & UINT16_MAX);
 
-    if (OP_ID == OP_PIPE_DATA) {
+    if (OP_ID == OP_PIPE_WRITE_FLOW) {
+        if (OP_DATA_LEN < sizeof(uint32_t) + sizeof(int32_t)) {
+            return;
+        }
+
+        uint32_t credit_bytes = 0;
+        int32_t status = 0;
+        std::memcpy(&credit_bytes, op_data, sizeof(credit_bytes));
+        std::memcpy(&status, op_data + sizeof(credit_bytes), sizeof(status));
+        if (status > 0) {
+            status = -EIO;
+        }
+
+        uint64_t const IRQF = s_ipc_lock.lock_irqsave();
+        auto* proxy = find_proxy_by_endpoint_locked(hdr->src_node, resource_id);
+        s_ipc_lock.unlock_irqrestore(IRQF);
+        if (proxy == nullptr) {
+            return;
+        }
+
+        if (status != 0) {
+            proxy->message_write_error.store(status, std::memory_order_release);
+            proxy->message_write_credits.store(0, std::memory_order_release);
+        } else if (proxy->message_write_flow_control) {
+            proxy_grant_message_write_credits(proxy, credit_bytes);
+        }
+        proxy_wake_message_write_waiters(proxy);
+        wki_ipc_proxy_wake_poll_waiters(proxy);
+        proxy_release(proxy);
+        return;
+    }
+
+    if (OP_ID == OP_PIPE_DATA || OP_ID == OP_PIPE_DATA_FLOW) {
+        bool const FLOW_CONTROLLED = OP_ID == OP_PIPE_DATA_FLOW;
         IpcPerfTrace pipe_trace(ker::mod::perf::WkiPerfIpcOp::PIPE_DATA, hdr->src_node, hdr->channel_id, IPC_CALLSITE, OP_DATA_LEN,
                                 IPC_CORRELATION);
-        if (OP_DATA_LEN == 0 && queue_export_pipe_rdma_flush(hdr->src_node, resource_id)) {
+        if (!FLOW_CONTROLLED && OP_DATA_LEN == 0 && queue_export_pipe_rdma_flush(hdr->src_node, resource_id)) {
             pipe_trace.finish(0);
             return;
         }
@@ -5746,7 +6113,7 @@ void handle_ipc_dev_op_req_inline(const WkiHeader* hdr, const uint8_t* payload, 
         ker::vfs::File* export_file = nullptr;
         bool export_pty_immediate = false;
         uint64_t const IRQF = s_ipc_lock.lock_irqsave();
-        auto* proxy = find_proxy_by_endpoint_locked(hdr->src_node, resource_id);
+        auto* proxy = FLOW_CONTROLLED ? nullptr : find_proxy_by_endpoint_locked(hdr->src_node, resource_id);
         ProxyIpcState* nonreceiving_proxy = nullptr;
         if (proxy != nullptr && !proxy->can_receive_data) {
             // Node-local resource IDs can collide in opposite directions.
@@ -5755,7 +6122,7 @@ void handle_ipc_dev_op_req_inline(const WkiHeader* hdr, const uint8_t* payload, 
             nonreceiving_proxy = proxy;
             proxy = nullptr;
         }
-        bool const PENDING_BUFFERED = find_pending_pipe_delivery_locked(hdr->src_node, resource_id) != nullptr;
+        bool const PENDING_BUFFERED = !FLOW_CONTROLLED && find_pending_pipe_delivery_locked(hdr->src_node, resource_id) != nullptr;
         bool export_exists = false;
         if (proxy == nullptr) {
             auto* exp = find_export_by_resource_id(resource_id);
@@ -5870,6 +6237,11 @@ void handle_ipc_dev_op_req_inline(const WkiHeader* hdr, const uint8_t* payload, 
         }
 
         if (!export_exists) {
+            if (FLOW_CONTROLLED) {
+                static_cast<void>(send_export_pipe_write_flow(hdr->src_node, resource_id, 0, -EPIPE));
+                pipe_trace.finish(-EPIPE);
+                return;
+            }
             if (HAD_NONRECEIVING_PROXY) {
                 // Do not turn impossible/stale DATA for a write-only proxy
                 // into unbounded pending allocations in RX context.
@@ -5916,15 +6288,22 @@ void handle_ipc_dev_op_req_inline(const WkiHeader* hdr, const uint8_t* payload, 
                 pipe_trace.finish(0, OP_DATA_LEN);
                 return;
             }
-            if (!queue_export_pipe_write_data(resource_id, op_data + written, static_cast<uint16_t>(OP_DATA_LEN - written), work_owner)) {
+            if (!queue_export_pipe_write_data(resource_id, op_data + written, static_cast<uint16_t>(OP_DATA_LEN - written), work_owner,
+                                              FLOW_CONTROLLED)) {
                 ker::mod::dbg::log("[WKI] IPC PTY export backlog queue failed: resource_id=%u written=%u total=%u", resource_id, written,
                                    OP_DATA_LEN);
+                if (FLOW_CONTROLLED) {
+                    static_cast<void>(send_export_pipe_write_flow(hdr->src_node, resource_id, 0, -ENOMEM));
+                }
             }
             pipe_trace.finish(0, OP_DATA_LEN);
             return;
         }
-        if (!queue_export_pipe_write_data(resource_id, op_data, OP_DATA_LEN, work_owner)) {
+        if (!queue_export_pipe_write_data(resource_id, op_data, OP_DATA_LEN, work_owner, FLOW_CONTROLLED)) {
             ker::mod::dbg::log("[WKI] IPC export pipe backlog queue failed: resource_id=%u len=%u", resource_id, OP_DATA_LEN);
+            if (FLOW_CONTROLLED) {
+                static_cast<void>(send_export_pipe_write_flow(hdr->src_node, resource_id, 0, -ENOMEM));
+            }
         }
         pipe_trace.finish(0, OP_DATA_LEN);
         return;
@@ -6151,7 +6530,8 @@ void handle_ipc_dev_op_req_inline(const WkiHeader* hdr, const uint8_t* payload, 
         return;
     }
 
-    if (OP_ID == OP_PIPE_CLOSE_WRITE) {
+    if (OP_ID == OP_PIPE_CLOSE_WRITE || OP_ID == OP_PIPE_CLOSE_WRITE_FLOW) {
+        bool const FLOW_CONTROLLED = OP_ID == OP_PIPE_CLOSE_WRITE_FLOW;
         // Server-side: consumer closed write end — close the real pipe's read end
         // Client-side: home node reports write-end closed (EOF)
         bool has_expected_bytes = false;
@@ -6196,6 +6576,9 @@ void handle_ipc_dev_op_req_inline(const WkiHeader* hdr, const uint8_t* payload, 
             return;
         }
 
+        if (FLOW_CONTROLLED) {
+            return;
+        }
         if (!mark_pending_pipe_write_closed(hdr->src_node, resource_id)) {
             ker::mod::dbg::log("[WKI] IPC pending pipe CLOSE queue failed: resource_id=%u", resource_id);
         }

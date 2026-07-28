@@ -878,6 +878,17 @@ constexpr uint16_t OP_PIPE_CLOSE_READ = 0x0700;
 constexpr uint16_t OP_PIPE_CLOSE_WRITE = 0x0701;
 constexpr uint16_t OP_PIPE_DATA = 0x0702;  // req={resource_id:u32, data[]}
 constexpr uint16_t OP_PIPE_POLL_STATE = 0x0703;
+constexpr uint16_t OP_PIPE_DATA_FLOW = 0x0704;         // req={resource_id:u32, data[]}; application-credit controlled
+constexpr uint16_t OP_PIPE_WRITE_FLOW = 0x0705;        // req={resource_id:u32, credit_bytes:u32, status:i32}
+constexpr uint16_t OP_PIPE_CLOSE_WRITE_FLOW = 0x0706;  // terminal close for a flow-controlled exported writer
+
+struct IpcPipeWriteFlowPayload {
+    uint32_t resource_id;
+    uint32_t credit_bytes;
+    int32_t status;
+} __attribute__((packed));
+
+static_assert(sizeof(IpcPipeWriteFlowPayload) == 12, "IpcPipeWriteFlowPayload must be 12 bytes");
 
 // IPC Eventfd (0x0710–0x071F)
 constexpr uint16_t OP_EVENTFD_CLOSE = 0x0710;
@@ -956,6 +967,8 @@ enum class TaskDeliveryMode : uint8_t {
 };
 
 // IPC fd entry for cross-node task submission — appended to TASK_SUBMIT payload
+constexpr uint16_t WKI_IPC_FD_FLAG_PIPE_FLOW_CONTROL = 0x8000;
+
 struct WkiIpcFdEntry {
     uint16_t local_fd;
     uint16_t res_type;  // ResourceType enum

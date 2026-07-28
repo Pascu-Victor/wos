@@ -26,6 +26,7 @@ constexpr uint16_t WKI_IPC_OP_COOKIE_BYTES = sizeof(uint16_t);
 
 constexpr size_t WKI_IPC_MAX_EXPORTS = 64;
 constexpr size_t WKI_IPC_MAX_PROXIES = 64;
+constexpr uint32_t WKI_IPC_MESSAGE_PIPE_WINDOW = 1024 * 1024;
 
 // RDMA shared region sizes
 constexpr uint32_t WKI_IPC_PIPE_REGION_SIZE = 65536;  // 64 KB pipe ring buffer
@@ -141,6 +142,12 @@ struct ProxyIpcState {
 
     // poll()/epoll_wait() waiters registered on this proxy fd.
     ker::util::SmallVec<uint64_t, 2> poll_waiters;
+    // Message-based write proxies use application credits so transport RX
+    // completion cannot outrun the exported local pipe by an unbounded amount.
+    bool message_write_flow_control = false;
+    std::atomic<uint32_t> message_write_credits{0};
+    std::atomic<int32_t> message_write_error{0};
+    ker::util::SmallVec<uint64_t, 2> message_write_waiters;
 
     ker::mod::sys::Spinlock lock;
 
@@ -208,6 +215,7 @@ struct WkiIpcExport {
     uint16_t assigned_channel = 0;
     uint16_t consumer_node = WKI_NODE_INVALID;
     uint64_t pipe_bytes_received = 0;
+    bool message_write_flow_control = false;
 
     // Optional proxy-write RDMA receive ring.  This is intentionally separate
     // from the local pipe backlog so bulk bytes can arrive without consuming
@@ -346,6 +354,8 @@ void wki_ipc_handle_dev_op_resp(uint16_t src_node, uint16_t channel, const uint8
 #ifdef WOS_SELFTEST
 auto wki_ipc_selftest_poll_state_response_refs() -> int;
 auto wki_ipc_selftest_export_compaction_frees() -> int;
+auto wki_ipc_selftest_failed_export_write_releases_all_file_refs() -> int;
+auto wki_ipc_selftest_message_pipe_flow_updates_proxy() -> int;
 auto wki_ipc_selftest_cleanup_for_peer_drains_over_capacity() -> int;
 auto wki_ipc_selftest_cleanup_for_peer_drains_deferred_dev_ops() -> int;
 auto wki_ipc_selftest_large_dev_op_work_coallocates_payload() -> int;

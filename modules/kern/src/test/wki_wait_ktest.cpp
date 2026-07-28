@@ -188,6 +188,14 @@ KTEST(WkiIpcExportLifetime, CompactionWaitsForBacklogThenFreesExport) {
     KEXPECT_EQ(ker::net::wki::wki_ipc_selftest_export_compaction_frees(), 1);
 }
 
+KTEST(WkiIpcExportLifetime, FatalWriteReleasesWorkerAndExportFileReferences) {
+    KEXPECT_EQ(ker::net::wki::wki_ipc_selftest_failed_export_write_releases_all_file_refs(), 0);
+}
+
+KTEST(WkiIpcMessagePipeFlow, CreditAndErrorNotificationsUpdateWriter) {
+    KEXPECT_EQ(ker::net::wki::wki_ipc_selftest_message_pipe_flow_updates_proxy(), 0);
+}
+
 KTEST(WkiIpcPeerCleanup, FenceCleanupDrainsMoreThanOneFixedBatch) {
     KEXPECT_EQ(ker::net::wki::wki_ipc_selftest_cleanup_for_peer_drains_over_capacity(), 0);
 }
