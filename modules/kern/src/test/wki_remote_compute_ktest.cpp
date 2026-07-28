@@ -39,6 +39,10 @@ KTEST(WkiRemoteCompute, BalancedScoreAccountsForCapacity) {
     KEXPECT_TRUE(ker::net::wki::wki_remote_compute_selftest_balanced_score_accounts_for_capacity());
 }
 
+KTEST(WkiRemoteCompute, AutomaticPolicyIsWorkloadAgnostic) {
+    KEXPECT_TRUE(ker::net::wki::wki_remote_compute_selftest_automatic_policy_is_workload_agnostic());
+}
+
 KTEST(WkiRemoteCompute, SubmitPolicyScopeRestoresWorker) {
     KEXPECT_TRUE(ker::net::wki::wki_remote_compute_selftest_submit_policy_scope_restores_worker());
 }

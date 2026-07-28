@@ -342,10 +342,6 @@ auto wki_local_node_load_pct() -> uint16_t;
 // remote-compute lock so callers never retain a pointer into the load deque.
 auto wki_remote_node_load_snapshot(uint16_t node_id, RemoteNodeLoad* out) -> bool;
 
-// Find the least-loaded remote node (or WKI_NODE_INVALID if none better).
-// local_load: the caller's local load (0-1000) for comparison.
-auto wki_least_loaded_node(uint16_t local_load) -> uint16_t;
-
 // Fencing cleanup
 // Retire receiver-side TASK_SUBMIT admission for a channel/session reset.
 void wki_remote_compute_retire_submit_session(uint16_t node_id);
@@ -416,6 +412,7 @@ auto wki_remote_compute_selftest_task_id_wrap_is_safe() -> bool;
 auto wki_remote_compute_selftest_load_snapshot_survives_cleanup() -> bool;
 auto wki_remote_compute_selftest_placement_score_accounts_for_inflight() -> bool;
 auto wki_remote_compute_selftest_balanced_score_accounts_for_capacity() -> bool;
+auto wki_remote_compute_selftest_automatic_policy_is_workload_agnostic() -> bool;
 auto wki_remote_compute_selftest_submit_policy_scope_restores_worker() -> bool;
 auto wki_remote_compute_selftest_receiver_system_paths_are_local_by_default() -> bool;
 auto wki_remote_compute_selftest_submit_context_lengths_are_checked() -> bool;

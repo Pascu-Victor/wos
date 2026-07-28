@@ -168,6 +168,24 @@ auto cmdline_has_token(const char* cmdline, const char* token) -> bool {
     return false;
 }
 
+auto is_placement_control_helper(const char* name) -> bool {
+    if (name == nullptr || name[0] == '\0') {
+        return false;
+    }
+
+    const char* base = name;
+    for (const char* cursor = name; *cursor != '\0'; ++cursor) {
+        if (*cursor == '/') {
+            base = cursor + 1;
+        }
+    }
+
+    constexpr std::array<const char*, 8> CONTROL_TOOLS = {
+        "wkictl", "locally", "remotely", "anywhere", "homeward", "on", "forward", "wosid",
+    };
+    return std::ranges::any_of(CONTROL_TOOLS, [base](const char* tool) { return std::strcmp(base, tool) == 0; });
+}
+
 auto spawn_diag_enabled() -> bool {
     static std::atomic<int> cached{-1};
     int value = cached.load(std::memory_order_acquire);
@@ -2320,127 +2338,12 @@ auto wki_try_remote_spawn(ker::mod::sched::task::Task* task, const WkiRemoteSpaw
         task->wki_submitter_hostname.front() != '\0' && std::strcmp(task->wki_submitter_hostname.data(), wki_local_hostname()) != 0;
 
     if (AUTOMATIC_PLACEMENT) {
-        auto base_name = [](const char* name) -> const char* {
-            if (name == nullptr || name[0] == '\0') {
-                return "";
-            }
-            const char* base = name;
-            for (const char* cursor = name; *cursor != '\0'; ++cursor) {
-                if (*cursor == '/') {
-                    base = cursor + 1;
-                }
-            }
-            return base;
-        };
-        auto is_git_helper = [&base_name](const char* name) -> bool {
-            const char* base = base_name(name);
-            return std::strcmp(base, "git") == 0 || std::strncmp(base, "git-", 4) == 0;
-        };
-        auto is_toolchain_driver_helper = [&base_name](const char* name) -> bool {
-            const char* base = base_name(name);
-            if (base[0] == '\0') {
-                return false;
-            }
-            constexpr std::array<const char*, 27> EXACT_LOCAL_TOOLS = {
-                "sh",          "bash",    "dash",         "cmake", "ninja",    "make",     "gmake",     "clang-tidy-cache",
-                "cc",          "c++",     "gcc",          "g++",   "clang",    "clang++",  "clang-cpp", "nasm",
-                "as",          "ld",      "ld.lld",       "lld",   "lld-link", "ld64.lld", "wasm-ld",   "llvm-ar",
-                "llvm-ranlib", "llvm-nm", "llvm-objcopy",
-            };
-            for (const char* tool : EXACT_LOCAL_TOOLS) {
-                if (std::strcmp(base, tool) == 0) {
-                    return true;
-                }
-            }
-            if (std::strncmp(base, "llvm-", 5) == 0) {
-                return true;
-            }
-            if (std::strncmp(base, "clang-", 6) == 0) {
-                char const NEXT = base[6];
-                return NEXT >= '0' && NEXT <= '9';
-            }
-            return false;
-        };
-        auto is_placement_control_helper = [&base_name](const char* name) -> bool {
-            const char* base = base_name(name);
-            constexpr std::array<const char*, 8> CONTROL_TOOLS = {
-                "wkictl", "locally", "remotely", "anywhere", "homeward", "on", "forward", "wosid",
-            };
-            return std::ranges::any_of(CONTROL_TOOLS, [base](const char* tool) { return std::strcmp(base, tool) == 0; });
-        };
-        auto path_has_component = [](const char* path, const char* component) -> bool {
-            if (path == nullptr || component == nullptr || component[0] == '\0') {
-                return false;
-            }
-            size_t const COMPONENT_LEN = std::strlen(component);
-            const char* cursor = path;
-            while (*cursor != '\0') {
-                while (*cursor == '/') {
-                    ++cursor;
-                }
-                const char* start = cursor;
-                while (*cursor != '\0' && *cursor != '/') {
-                    ++cursor;
-                }
-                auto const LEN = static_cast<size_t>(cursor - start);
-                if (LEN == COMPONENT_LEN && std::strncmp(start, component, COMPONENT_LEN) == 0) {
-                    return true;
-                }
-            }
-            return false;
-        };
-        auto path_has_component_suffix = [](const char* path, const char* suffix) -> bool {
-            if (path == nullptr || suffix == nullptr || suffix[0] == '\0') {
-                return false;
-            }
-            size_t const SUFFIX_LEN = std::strlen(suffix);
-            const char* cursor = path;
-            while (*cursor != '\0') {
-                while (*cursor == '/') {
-                    ++cursor;
-                }
-                const char* start = cursor;
-                while (*cursor != '\0' && *cursor != '/') {
-                    ++cursor;
-                }
-                auto const LEN = static_cast<size_t>(cursor - start);
-                if (LEN >= SUFFIX_LEN && std::strncmp(cursor - SUFFIX_LEN, suffix, SUFFIX_LEN) == 0) {
-                    return true;
-                }
-            }
-            return false;
-        };
-        auto is_generated_build_tree_executable = [&base_name, &path_has_component, &path_has_component_suffix](const char* path) -> bool {
-            if (path == nullptr || path[0] == '\0') {
-                return false;
-            }
-            if (path_has_component(path, "build") || path_has_component(path, "CMakeFiles") || path_has_component(path, "meson-private")) {
-                return true;
-            }
-            if (path_has_component_suffix(path, "-build")) {
-                return true;
-            }
-            const char* base = base_name(path);
-            return std::strncmp(base, "cmTC_", 5) == 0;
-        };
-        if (is_git_helper(task->name) || is_git_helper(task->exe_path.data()) ||
-            std::strstr(task->exe_path.data(), "/git-core/") != nullptr) {
-            return WkiRemoteSpawnResult::LOCAL;
-        }
-        if (is_toolchain_driver_helper(task->name) || is_toolchain_driver_helper(task->exe_path.data())) {
-            log_spawn_diag(task, WkiRemoteSpawnResult::LOCAL, "toolchain-helper");
-            return WkiRemoteSpawnResult::LOCAL;
-        }
         // Placement controllers must run on the launch system so the policy
         // they apply describes one payload handoff. Migrating the controller
         // first creates an accidental proxy chain before it can request
         // local, named, remote, or balanced placement.
         if (is_placement_control_helper(task->name) || is_placement_control_helper(task->exe_path.data())) {
             log_spawn_diag(task, WkiRemoteSpawnResult::LOCAL, "placement-control-helper");
-            return WkiRemoteSpawnResult::LOCAL;
-        }
-        if (is_generated_build_tree_executable(task->exe_path.data())) {
-            log_spawn_diag(task, WkiRemoteSpawnResult::LOCAL, "generated-build-exe");
             return WkiRemoteSpawnResult::LOCAL;
         }
 
@@ -2538,7 +2441,7 @@ auto wki_try_remote_spawn(ker::mod::sched::task::Task* task, const WkiRemoteSpaw
             log_spawn_diag(task, RESULT, "remote-preferred-no-node");
             return RESULT;
         }
-    } else if (BALANCED_PLACEMENT) {
+    } else if (BALANCED_PLACEMENT || AUTOMATIC_PLACEMENT) {
         uint16_t const LOCAL_LOAD = compute_local_load();
         uint16_t const LOCAL_CPUS = std::max<uint16_t>(static_cast<uint16_t>(ker::mod::smt::get_core_count()), 1);
         uint16_t const LOCAL_FREE_MEM =
@@ -2547,22 +2450,14 @@ auto wki_try_remote_spawn(ker::mod::sched::task::Task* task, const WkiRemoteSpaw
         BalancedPlacement const PLACEMENT = wki_balanced_node(LOCAL_LOAD, LOCAL_CPUS, LOCAL_FREE_MEM);
         s_compute_lock.unlock();
         if (!PLACEMENT.found) {
-            log_spawn_diag(task, WkiRemoteSpawnResult::FAILED, "balanced-no-healthy-system");
-            return WkiRemoteSpawnResult::FAILED;
+            WkiRemoteSpawnResult const RESULT = BALANCED_PLACEMENT ? WkiRemoteSpawnResult::FAILED : WkiRemoteSpawnResult::LOCAL;
+            log_spawn_diag(task, RESULT, AUTOMATIC_PLACEMENT ? "automatic-no-healthy-system" : "balanced-no-healthy-system");
+            return RESULT;
         }
         best_node = PLACEMENT.node_id;
         balanced_assignment.adopt(best_node);
         if (best_node == WKI_NODE_INVALID) {
-            log_spawn_diag(task, WkiRemoteSpawnResult::LOCAL, "balanced-local");
-            return WkiRemoteSpawnResult::LOCAL;
-        }
-    } else {
-        uint16_t const LOCAL_LOAD = compute_local_load();
-        s_compute_lock.lock();
-        best_node = wki_least_loaded_node(LOCAL_LOAD);
-        s_compute_lock.unlock();
-        if (best_node == WKI_NODE_INVALID) {
-            log_spawn_diag(task, WkiRemoteSpawnResult::LOCAL, "automatic-no-node");
+            log_spawn_diag(task, WkiRemoteSpawnResult::LOCAL, AUTOMATIC_PLACEMENT ? "automatic-local" : "balanced-local");
             return WkiRemoteSpawnResult::LOCAL;
         }
     }
@@ -3846,32 +3741,6 @@ auto wki_remote_node_load_snapshot(uint16_t node_id, RemoteNodeLoad* out) -> boo
     return FOUND;
 }
 
-auto wki_least_loaded_node(uint16_t local_load) -> uint16_t {
-    uint16_t best_node = WKI_NODE_INVALID;
-    uint16_t best_load = local_load;
-
-    for (const auto& rl : g_remote_loads) {
-        if (!rl.valid) {
-            continue;
-        }
-
-        // Stale load reports (>1s old) are not considered
-        uint64_t const AGE = wki_now_us() - rl.last_update_us;
-        if (AGE > 1000000) {
-            continue;
-        }
-
-        // Apply remote placement penalty
-        uint16_t const ADJUSTED = rl.avg_load_pct + WKI_REMOTE_PLACEMENT_PENALTY;
-        if (ADJUSTED < best_load) {
-            best_load = ADJUSTED;
-            best_node = rl.node_id;
-        }
-    }
-
-    return best_node;
-}
-
 namespace {
 
 // s_compute_lock must be held by caller.
@@ -4814,6 +4683,12 @@ auto wki_remote_compute_selftest_balanced_score_accounts_for_capacity() -> bool 
            SATURATED_BEYOND_HEADROOM > SATURATED_AT_HEADROOM && balanced_candidate_is_starved(36, 0, 36) &&
            !balanced_candidate_is_starved(35, 0, 36) && balanced_memory_eligible(WKI_BALANCED_FREE_MEM_RESERVE) &&
            !balanced_memory_eligible(WKI_BALANCED_FREE_MEM_RESERVE - 1);
+}
+
+auto wki_remote_compute_selftest_automatic_policy_is_workload_agnostic() -> bool {
+    return is_placement_control_helper("wkictl") && is_placement_control_helper("/usr/bin/anywhere") &&
+           !is_placement_control_helper("/usr/bin/clang") && !is_placement_control_helper("/usr/bin/ninja") &&
+           !is_placement_control_helper("/usr/bin/git") && !is_placement_control_helper("/workspace/build/CMakeFiles/cmTC_probe");
 }
 
 auto wki_remote_compute_selftest_submit_policy_scope_restores_worker() -> bool {

@@ -258,6 +258,43 @@ def build_result(
     if min_nonzero_run_ms and min_nonzero_run_ms > 0:
         run_imbalance = max_run_ms / min_nonzero_run_ms
 
+    aggregate_run_ms = 0.0
+    aggregate_capacity_ms = 0.0
+    utilization_complete = True
+    vm_utilization_pct: list[float] = []
+    for qemu in qemu_rows:
+        vcpu_threads = qemu["vcpu_threads"]
+        vcpu_count = len(vcpu_threads)
+        complete = all(not thread.get("missing", False) for thread in vcpu_threads)
+        run_ms = sum(thread.get("run_ms", 0.0) for thread in vcpu_threads)
+        capacity_ms = wall_ms * vcpu_count
+        utilization_pct = (run_ms * 100.0) / capacity_ms if complete and capacity_ms > 0 else None
+        qemu["utilization"] = {
+            "complete": complete,
+            "vcpu_count": vcpu_count,
+            "run_ms": run_ms,
+            "capacity_ms": capacity_ms,
+            "utilization_pct": utilization_pct,
+        }
+        aggregate_run_ms += run_ms
+        aggregate_capacity_ms += capacity_ms
+        utilization_complete = utilization_complete and complete
+        if utilization_pct is not None:
+            vm_utilization_pct.append(utilization_pct)
+
+    aggregate_utilization_pct = (
+        (aggregate_run_ms * 100.0) / aggregate_capacity_ms
+        if utilization_complete and aggregate_capacity_ms > 0
+        else None
+    )
+    min_vm_utilization_pct = min(vm_utilization_pct) if utilization_complete and vm_utilization_pct else None
+    max_vm_utilization_pct = max(vm_utilization_pct) if utilization_complete and vm_utilization_pct else None
+    normalized_utilization_spread_pct_points = (
+        max_vm_utilization_pct - min_vm_utilization_pct
+        if max_vm_utilization_pct is not None and min_vm_utilization_pct is not None
+        else None
+    )
+
     return {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "wall_ms": wall_ms,
@@ -269,6 +306,13 @@ def build_result(
             "max_wait_ms": max_wait_ms,
             "max_wait_thread": max_wait_thread,
             "run_imbalance_max_over_min_nonzero": run_imbalance,
+            "utilization_complete": utilization_complete,
+            "aggregate_run_ms": aggregate_run_ms,
+            "aggregate_capacity_ms": aggregate_capacity_ms,
+            "aggregate_utilization_pct": aggregate_utilization_pct,
+            "min_vm_utilization_pct": min_vm_utilization_pct,
+            "max_vm_utilization_pct": max_vm_utilization_pct,
+            "normalized_utilization_spread_pct_points": normalized_utilization_spread_pct_points,
         },
     }
 
@@ -300,6 +344,18 @@ def render_text_report(result: dict[str, Any]) -> str:
                 f"run={thread['run_ms']:.2f}ms wait={thread['wait_ms']:.2f}ms "
                 f"slices={thread['slices']}"
             )
+        utilization = qemu["utilization"]
+        if utilization["utilization_pct"] is None:
+            lines.append(
+                "  utilization=unavailable "
+                f"complete={str(utilization['complete']).lower()} "
+                f"run={utilization['run_ms']:.2f}ms capacity={utilization['capacity_ms']:.2f}ms"
+            )
+        else:
+            lines.append(
+                f"  utilization={utilization['utilization_pct']:.2f}% "
+                f"run={utilization['run_ms']:.2f}ms capacity={utilization['capacity_ms']:.2f}ms"
+            )
     lines.append("")
     summary = result["summary"]
     lines.append(
@@ -308,6 +364,20 @@ def render_text_report(result: dict[str, Any]) -> str:
         f"max_wait={summary['max_wait_ms']:.2f}ms "
         f"run_imbalance={summary['run_imbalance_max_over_min_nonzero']}"
     )
+    if summary["aggregate_utilization_pct"] is None:
+        lines.append(
+            "utilization: unavailable "
+            f"complete={str(summary['utilization_complete']).lower()} "
+            f"run={summary['aggregate_run_ms']:.2f}ms capacity={summary['aggregate_capacity_ms']:.2f}ms"
+        )
+    else:
+        lines.append(
+            "utilization: "
+            f"aggregate={summary['aggregate_utilization_pct']:.2f}% "
+            f"min_vm={summary['min_vm_utilization_pct']:.2f}% "
+            f"max_vm={summary['max_vm_utilization_pct']:.2f}% "
+            f"spread={summary['normalized_utilization_spread_pct_points']:.2f}pp"
+        )
     if result["payload"].get("stdout"):
         lines.extend(["", "=== payload stdout ===", result["payload"]["stdout"].rstrip()])
     if result["payload"].get("stderr"):

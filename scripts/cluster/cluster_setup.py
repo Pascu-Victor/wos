@@ -22,6 +22,8 @@ Note: sudo is used internally only for privileged setup/teardown operations.
 import argparse
 import base64
 import concurrent.futures
+import contextlib
+import fcntl
 import hashlib
 import ipaddress
 import json
@@ -932,6 +934,83 @@ def teardown(config: dict):
 
 class NoSetupTopologyError(RuntimeError):
     pass
+
+
+class LaunchConflictError(RuntimeError):
+    pass
+
+
+def cluster_launch_lock_path() -> Path:
+    """Return the per-user, host-wide lock shared by all WOS launch modes."""
+    return Path(tempfile.gettempdir()) / f"wos-cluster-{os.getuid()}.lock"
+
+
+def find_running_wos_qemus(proc_root: Path = Path("/proc")) -> list[tuple[int, str]]:
+    """Find host-visible QEMU processes launched with a WOS hostname."""
+    running: list[tuple[int, str]] = []
+    try:
+        entries = proc_root.iterdir()
+    except OSError:
+        return running
+
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            raw = (entry / "cmdline").read_bytes()
+        except (OSError, PermissionError):
+            continue
+        args = [arg.decode(errors="replace") for arg in raw.split(b"\0") if arg]
+        if not args or "qemu-system" not in Path(args[0]).name:
+            continue
+        command = " ".join(args)
+        marker = "name=opt/wos/hostname,string="
+        marker_index = command.find(marker)
+        if marker_index < 0:
+            continue
+        hostname = command[marker_index + len(marker) :].split()[0]
+        running.append((int(entry.name), hostname))
+
+    return sorted(running)
+
+
+@contextlib.contextmanager
+def cluster_launch_guard(*, reject_running_qemus: bool = True):
+    """Serialize topology changes and optionally reject existing WOS QEMUs."""
+    lock_path = cluster_launch_lock_path()
+    lock_file = lock_path.open("a+", encoding="utf-8")
+    acquired = False
+    try:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            acquired = True
+        except BlockingIOError as exc:
+            lock_file.seek(0)
+            owner = lock_file.read().strip() or "unknown owner"
+            raise LaunchConflictError(
+                f"another WOS cluster launcher is active ({owner}); "
+                "stop it before launching a second topology"
+            ) from exc
+
+        conflicts = find_running_wos_qemus() if reject_running_qemus else []
+        if conflicts:
+            details = ", ".join(
+                f"{hostname} pid={pid}" for pid, hostname in conflicts
+            )
+            raise LaunchConflictError(
+                "existing WOS QEMU processes would clash with this topology: "
+                f"{details}"
+            )
+
+        lock_file.seek(0)
+        lock_file.truncate()
+        lock_file.write(f"pid={os.getpid()}\n")
+        lock_file.flush()
+        yield
+    finally:
+        if acquired:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        lock_file.close()
 
 
 def collect_unique_nodes(config: dict) -> dict:
@@ -2126,6 +2205,22 @@ def launch(
     skip_setup: bool = False,
 ):
     """Setup topology unless requested otherwise, then launch VMs."""
+    with cluster_launch_guard():
+        launch_guarded(
+            config,
+            tcg_level=tcg_level,
+            debug_nodes=debug_nodes,
+            skip_setup=skip_setup,
+        )
+
+
+def launch_guarded(
+    config: dict,
+    tcg_level: str | None = None,
+    debug_nodes: set[int] | None = None,
+    skip_setup: bool = False,
+):
+    """Launch VMs while the caller holds the cluster launch guard."""
     if skip_setup:
         validate_no_setup_topology(config)
         print("=== Skipping cluster topology setup (--no-setup) ===\n")
@@ -2325,25 +2420,36 @@ def main():
         ):
             sys.exit(1)
     elif args.teardown:
-        # Cache sudo credentials once upfront for privileged network operations.
-        ensure_sudo()
-        teardown(config)
-    elif args.launch:
-        if not args.no_setup:
-            ensure_sudo()
         try:
-            launch(
-                config,
-                tcg_level=args.tcg,
-                debug_nodes=set(args.debug_node) if args.debug_node else None,
-                skip_setup=args.no_setup,
-            )
-        except NoSetupTopologyError as exc:
+            with cluster_launch_guard(reject_running_qemus=False):
+                # Cache sudo credentials once upfront for privileged network operations.
+                ensure_sudo()
+                teardown(config)
+        except LaunchConflictError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            sys.exit(1)
+    elif args.launch:
+        try:
+            with cluster_launch_guard():
+                if not args.no_setup:
+                    ensure_sudo()
+                launch_guarded(
+                    config,
+                    tcg_level=args.tcg,
+                    debug_nodes=set(args.debug_node) if args.debug_node else None,
+                    skip_setup=args.no_setup,
+                )
+        except (LaunchConflictError, NoSetupTopologyError) as exc:
             print(f"ERROR: {exc}", file=sys.stderr)
             sys.exit(1)
     else:
-        ensure_sudo()
-        setup(config)
+        try:
+            with cluster_launch_guard():
+                ensure_sudo()
+                setup(config)
+        except LaunchConflictError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            sys.exit(1)
 
 
 if __name__ == "__main__":

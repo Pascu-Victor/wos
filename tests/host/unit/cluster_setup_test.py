@@ -138,6 +138,89 @@ def test_no_setup_topology_rejects_missing_or_stale_links(module) -> None:
             raise AssertionError(f"missing diagnostic {expected!r} in {message!r}")
 
 
+def test_running_wos_qemu_probe_filters_unrelated_processes(module) -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        proc_root = Path(tmp)
+        commands = {
+            101: [
+                "/usr/bin/qemu-system-x86_64",
+                "-name",
+                "guest=OPNsense",
+            ],
+            202: [
+                "qemu-system-x86_64",
+                "-fw_cfg",
+                "name=opt/wos/hostname,string=wos-2",
+            ],
+            303: ["not-qemu", "name=opt/wos/hostname,string=wos-3"],
+        }
+        for pid, args in commands.items():
+            process_dir = proc_root / str(pid)
+            process_dir.mkdir()
+            (process_dir / "cmdline").write_bytes(
+                b"\0".join(arg.encode() for arg in args) + b"\0"
+            )
+
+        assert_equal(
+            module.find_running_wos_qemus(proc_root),
+            [(202, "wos-2")],
+            "running WOS QEMU probe",
+        )
+
+
+def test_cluster_launch_guard_rejects_second_launcher(module) -> None:
+    old_lock_path = module.cluster_launch_lock_path
+    old_find_qemus = module.find_running_wos_qemus
+    with tempfile.TemporaryDirectory() as tmp:
+        module.cluster_launch_lock_path = lambda: Path(tmp) / "launch.lock"
+        module.find_running_wos_qemus = lambda: []
+        try:
+            with module.cluster_launch_guard():
+                try:
+                    with module.cluster_launch_guard():
+                        pass
+                except module.LaunchConflictError as exc:
+                    message = str(exc)
+                else:
+                    raise AssertionError("second cluster launcher was accepted")
+        finally:
+            module.cluster_launch_lock_path = old_lock_path
+            module.find_running_wos_qemus = old_find_qemus
+
+    if "another WOS cluster launcher is active" not in message:
+        raise AssertionError(f"missing launch conflict diagnostic in {message!r}")
+
+
+def test_cluster_launch_guard_rejects_preexisting_wos_qemu(module) -> None:
+    old_lock_path = module.cluster_launch_lock_path
+    old_find_qemus = module.find_running_wos_qemus
+    with tempfile.TemporaryDirectory() as tmp:
+        module.cluster_launch_lock_path = lambda: Path(tmp) / "launch.lock"
+        module.find_running_wos_qemus = lambda: [(4242, "wos-0")]
+        try:
+            try:
+                with module.cluster_launch_guard():
+                    pass
+            except module.LaunchConflictError as exc:
+                message = str(exc)
+            else:
+                raise AssertionError("preexisting WOS QEMU was accepted")
+
+            with module.cluster_launch_guard(reject_running_qemus=False):
+                pass
+
+            module.find_running_wos_qemus = lambda: []
+            with module.cluster_launch_guard():
+                pass
+        finally:
+            module.cluster_launch_lock_path = old_lock_path
+            module.find_running_wos_qemus = old_find_qemus
+
+    for expected in ("existing WOS QEMU processes", "wos-0 pid=4242"):
+        if expected not in message:
+            raise AssertionError(f"missing launch conflict diagnostic {expected!r} in {message!r}")
+
+
 def test_fixed_resource_benchmark_topologies(module) -> None:
     expected_nics = {
         "lan": {
@@ -284,6 +367,9 @@ def main() -> None:
         test_topology_probe_is_timeout_bounded,
         test_no_setup_topology_accepts_configured_links,
         test_no_setup_topology_rejects_missing_or_stale_links,
+        test_running_wos_qemu_probe_filters_unrelated_processes,
+        test_cluster_launch_guard_rejects_second_launcher,
+        test_cluster_launch_guard_rejects_preexisting_wos_qemu,
         test_fixed_resource_benchmark_topologies,
         test_node_overlay_creation_failure_aborts_launch_prep,
         test_launch_one_vm_wraps_overlay_creation_failure_without_popen,

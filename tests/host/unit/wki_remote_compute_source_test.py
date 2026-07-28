@@ -418,13 +418,15 @@ def test_balanced_placement_scores_all_healthy_systems() -> None:
         spawn,
         [
             "WKI_TARGET_FLAG_BALANCED",
+            "} else if (BALANCED_PLACEMENT || AUTOMATIC_PLACEMENT)",
             "BalancedPlacement const PLACEMENT = wki_balanced_node(LOCAL_LOAD, LOCAL_CPUS, LOCAL_FREE_MEM)",
-            'log_spawn_diag(task, WkiRemoteSpawnResult::FAILED, "balanced-no-healthy-system")',
-            'log_spawn_diag(task, WkiRemoteSpawnResult::LOCAL, "balanced-local")',
+            "BALANCED_PLACEMENT ? WkiRemoteSpawnResult::FAILED : WkiRemoteSpawnResult::LOCAL",
+            'AUTOMATIC_PLACEMENT ? "automatic-no-healthy-system" : "balanced-no-healthy-system"',
+            'AUTOMATIC_PLACEMENT ? "automatic-local" : "balanced-local"',
         ],
-        "balanced task policy selection",
+        "system-wide balanced task policy selection",
     )
-    balanced_branch = spawn[spawn.index("} else if (BALANCED_PLACEMENT)") :]
+    balanced_branch = spawn[spawn.index("} else if (BALANCED_PLACEMENT || AUTOMATIC_PLACEMENT)") :]
     require_order(
         balanced_branch,
         "BalancedPlacement const PLACEMENT = wki_balanced_node(LOCAL_LOAD, LOCAL_CPUS, LOCAL_FREE_MEM)",
@@ -455,15 +457,28 @@ def test_balanced_placement_scores_all_healthy_systems() -> None:
     require_tokens(header, [f"auto {token}() -> bool;"], "balanced placement score selftest declaration")
     require_tokens(ktest, ["BalancedScoreAccountsForCapacity", token], "balanced placement score KTEST coverage")
 
+    policy_token = "wki_remote_compute_selftest_automatic_policy_is_workload_agnostic"
+    require_tokens(source, [f"auto {policy_token}() -> bool"], "automatic placement policy selftest implementation")
+    require_tokens(header, [f"auto {policy_token}() -> bool;"], "automatic placement policy selftest declaration")
+    require_tokens(ktest, ["AutomaticPolicyIsWorkloadAgnostic", policy_token], "automatic placement policy KTEST coverage")
+
 
 def test_placement_controllers_run_before_payload_distribution() -> None:
     source = REMOTE_COMPUTE_CPP.read_text()
     spawn = function_body(source, "wki_try_remote_spawn")
     require_tokens(
+        source,
+        [
+            "auto is_placement_control_helper(const char* name) -> bool",
+            '"wkictl", "locally", "remotely", "anywhere", "homeward", "on", "forward", "wosid"',
+        ],
+        "placement controller classification",
+    )
+    require_tokens(
         spawn,
         [
-            "is_placement_control_helper",
-            '"wkictl", "locally", "remotely", "anywhere", "homeward", "on", "forward", "wosid"',
+            "is_placement_control_helper(task->name)",
+            "is_placement_control_helper(task->exe_path.data())",
             'log_spawn_diag(task, WkiRemoteSpawnResult::LOCAL, "placement-control-helper")',
         ],
         "placement controller local execution",
@@ -472,7 +487,7 @@ def test_placement_controllers_run_before_payload_distribution() -> None:
         spawn,
         "if (AUTOMATIC_PLACEMENT)",
         'log_spawn_diag(task, WkiRemoteSpawnResult::LOCAL, "placement-control-helper")',
-        "only legacy automatic placement may pin placement controllers",
+        "only automatic placement may pin placement controllers",
     )
     require_order(
         spawn,
