@@ -80,7 +80,7 @@ KTEST(XFS, SuperblockStructSize) { KEXPECT_EQ(sizeof(ker::vfs::xfs::XfsDsb), sta
 
 KTEST(XFS, InodeStructSize) { KEXPECT_EQ(sizeof(ker::vfs::xfs::XfsDinode), static_cast<size_t>(176)); }
 
-KTEST(XFS, InodeCacheReclaimUsesBatchHysteresis) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_inode_cache_reclaim_hysteresis()); }
+KTEST(XFS, InodeCacheRetentionBoundsHashLoadAndReclaim) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_inode_cache_reclaim_hysteresis()); }
 
 KTEST(XFS, TransactionCancelRestoresLinkCount) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_transaction_cancel_restores_nlink()); }
 

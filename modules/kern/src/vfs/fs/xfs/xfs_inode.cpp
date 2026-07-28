@@ -54,9 +54,14 @@ namespace {
 constexpr size_t ICACHE_BUCKETS = 16384;
 constexpr size_t ICACHE_HASH_MASK = ICACHE_BUCKETS - 1;
 static_assert((ICACHE_BUCKETS & (ICACHE_BUCKETS - 1)) == 0);
-constexpr size_t ICACHE_IDLE_RETAIN_MIN = 65536;
-constexpr size_t ICACHE_IDLE_RETAIN_MAX = 524288;
-constexpr uint64_t ICACHE_IDLE_RETAIN_BYTES_PER_INODE = 32ULL * 1024ULL;
+// Keep the simple chained hash at a bounded average load.  Retaining hundreds
+// of thousands of idle inodes makes every cache hit walk a long chain and also
+// grows the non-returning inode-object arenas to the high-water mark.  Four
+// idle entries per bucket still covers a substantial metadata working set
+// without making repeated large tree walks progressively more expensive.
+constexpr size_t ICACHE_IDLE_RETAIN_MIN = ICACHE_BUCKETS;
+constexpr size_t ICACHE_IDLE_RETAIN_MAX = ICACHE_BUCKETS * 4;
+constexpr uint64_t ICACHE_IDLE_RETAIN_BYTES_PER_INODE = 256ULL * 1024ULL;
 constexpr size_t ICACHE_RECLAIM_BATCH = 256;
 constexpr size_t ICACHE_RECLAIM_BUCKET_BUDGET = 256;
 constexpr uint64_t ALLOC_LOOKUP_WARN_INTERVAL = 4096;
@@ -159,19 +164,22 @@ auto icache_hash(const XfsMountContext* mount, xfs_ino_t ino) -> size_t {
     return static_cast<size_t>(MIXED & ICACHE_HASH_MASK);
 }
 
+auto icache_idle_retain_limit_for_total(uint64_t total_mem) -> size_t {
+    uint64_t scaled = total_mem / ICACHE_IDLE_RETAIN_BYTES_PER_INODE;
+    if (scaled == 0) {
+        scaled = ICACHE_IDLE_RETAIN_MIN;
+    }
+    uint64_t const RETAIN_LIMIT = std::clamp<uint64_t>(scaled, ICACHE_IDLE_RETAIN_MIN, ICACHE_IDLE_RETAIN_MAX);
+    return static_cast<size_t>(std::min<uint64_t>(RETAIN_LIMIT, static_cast<uint64_t>(SIZE_MAX)));
+}
+
 auto icache_idle_retain_limit() -> size_t {
     size_t cached = icache_idle_retain_limit_cached.load(std::memory_order_acquire);
     if (cached != 0) {
         return cached;
     }
 
-    uint64_t const TOTAL_MEM = ker::mod::mm::phys::get_total_mem_bytes();
-    uint64_t scaled = TOTAL_MEM / ICACHE_IDLE_RETAIN_BYTES_PER_INODE;
-    if (scaled == 0) {
-        scaled = ICACHE_IDLE_RETAIN_MIN;
-    }
-    uint64_t const RETAIN_LIMIT = std::clamp<uint64_t>(scaled, ICACHE_IDLE_RETAIN_MIN, ICACHE_IDLE_RETAIN_MAX);
-    cached = static_cast<size_t>(std::min<uint64_t>(RETAIN_LIMIT, static_cast<uint64_t>(SIZE_MAX)));
+    cached = icache_idle_retain_limit_for_total(ker::mod::mm::phys::get_total_mem_bytes());
     icache_idle_retain_limit_cached.store(cached, std::memory_order_release);
     return cached;
 }
@@ -990,11 +998,17 @@ void xfs_inode_cache_stats(XfsInodeCacheStats& out) {
 
 #ifdef WOS_SELFTEST
 auto xfs_selftest_inode_cache_reclaim_hysteresis() -> bool {
+    constexpr uint64_t ONE_GIB = uint64_t{1024} * 1024 * 1024;
     constexpr size_t RETAIN_LIMIT = 1024;
     constexpr size_t TRIGGER = RETAIN_LIMIT + ICACHE_RECLAIM_BATCH;
-    return icache_reclaim_trigger(RETAIN_LIMIT) == TRIGGER && !icache_reclaim_needed(RETAIN_LIMIT, RETAIN_LIMIT) &&
-           !icache_reclaim_needed(TRIGGER, RETAIN_LIMIT) && icache_reclaim_needed(TRIGGER + 1, RETAIN_LIMIT) &&
-           icache_reclaim_trigger(SIZE_MAX) == SIZE_MAX && ICACHE_RECLAIM_BUCKET_BUDGET < ICACHE_BUCKETS;
+    return icache_idle_retain_limit_for_total(0) == ICACHE_IDLE_RETAIN_MIN &&
+           icache_idle_retain_limit_for_total(ONE_GIB) == ICACHE_IDLE_RETAIN_MIN &&
+           icache_idle_retain_limit_for_total(uint64_t{16} * ONE_GIB) == ICACHE_IDLE_RETAIN_MAX &&
+           icache_idle_retain_limit_for_total(uint64_t{32} * ONE_GIB) == ICACHE_IDLE_RETAIN_MAX &&
+           ICACHE_IDLE_RETAIN_MAX / ICACHE_BUCKETS == 4 && icache_reclaim_trigger(RETAIN_LIMIT) == TRIGGER &&
+           !icache_reclaim_needed(RETAIN_LIMIT, RETAIN_LIMIT) && !icache_reclaim_needed(TRIGGER, RETAIN_LIMIT) &&
+           icache_reclaim_needed(TRIGGER + 1, RETAIN_LIMIT) && icache_reclaim_trigger(SIZE_MAX) == SIZE_MAX &&
+           ICACHE_RECLAIM_BUCKET_BUDGET < ICACHE_BUCKETS;
 }
 #endif
 
