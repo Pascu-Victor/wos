@@ -34,6 +34,7 @@
 #include <vfs/buffer_cache.hpp>
 #include <vfs/file.hpp>
 #include <vfs/fs/xfs/xfs_dir2.hpp>
+#include <vfs/fs/xfs/xfs_inode.hpp>
 #include <vfs/mount.hpp>
 #include <vfs/stat.hpp>
 #include <vfs/vfs.hpp>
@@ -2636,6 +2637,22 @@ auto generate_memacc_alloc_totals(char* buf, size_t bufsz) -> size_t {
     append_memacc_dec(p, end, "misses", xfs_dentry.misses);
     append_memacc_dec(p, end, "stores", xfs_dentry.stores);
     append_memacc_dec(p, end, "invalidations", xfs_dentry.invalidations);
+    append_char(p, end, '\n');
+
+    ker::vfs::xfs::XfsInodeCacheStats xfs_inode{};
+    ker::vfs::xfs::xfs_inode_cache_stats(xfs_inode);
+    append_sconst(p, end, "xfs_inode_cache");
+    append_memacc_dec(p, end, "idle", xfs_inode.idle_inodes);
+    append_memacc_dec(p, end, "retain_limit", xfs_inode.retain_limit);
+    append_memacc_dec(p, end, "reclaim_attempts", xfs_inode.reclaim_attempts);
+    append_memacc_dec(p, end, "reclaim_runs", xfs_inode.reclaim_runs);
+    append_memacc_dec(p, end, "reclaim_busy_skips", xfs_inode.reclaim_busy_skips);
+    append_memacc_dec(p, end, "reclaim_buckets", xfs_inode.reclaim_buckets_scanned);
+    append_memacc_dec(p, end, "reclaim_victims", xfs_inode.reclaim_victims);
+    append_memacc_dec(p, end, "reclaim_us", xfs_inode.reclaim_us);
+    append_memacc_dec(p, end, "reclaim_max_us", xfs_inode.reclaim_max_us);
+    append_memacc_dec(p, end, "reclaim_cursor", xfs_inode.reclaim_cursor);
+    append_memacc_dec(p, end, "reclaim_deferred_releases", xfs_inode.reclaim_deferred_releases);
     append_char(p, end, '\n');
 
     auto const FILE_CACHE = ker::syscall::vmem::file_mmap_cache_stats();

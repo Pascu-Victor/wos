@@ -136,6 +136,20 @@ struct XfsInode {
     bool dir_name_filter_complete;
 };
 
+struct XfsInodeCacheStats {
+    uint64_t idle_inodes = 0;
+    uint64_t retain_limit = 0;
+    uint64_t reclaim_attempts = 0;
+    uint64_t reclaim_runs = 0;
+    uint64_t reclaim_busy_skips = 0;
+    uint64_t reclaim_buckets_scanned = 0;
+    uint64_t reclaim_victims = 0;
+    uint64_t reclaim_us = 0;
+    uint64_t reclaim_max_us = 0;
+    uint64_t reclaim_cursor = 0;
+    uint64_t reclaim_deferred_releases = 0;
+};
+
 // Allocate an inode object with all members value-initialized. Use this for
 // parsed on-disk inodes and tests that expect zero defaults.
 auto xfs_inode_alloc_zeroed_object() -> XfsInode*;
@@ -223,9 +237,16 @@ void xfs_icache_init();
 // Purge all cached inodes for a given mount (call at unmount time).
 void xfs_icache_purge(XfsMountContext* mount);
 
+// Snapshot inode-cache occupancy and bounded reclaim activity.
+void xfs_inode_cache_stats(XfsInodeCacheStats& out);
+
 // Commit dirty cached inodes for a mount.  Used by mount-level sync before the
 // block cache is flushed.
 auto xfs_icache_sync_dirty(XfsMountContext* mount) -> int;
+
+#ifdef WOS_SELFTEST
+auto xfs_selftest_inode_cache_reclaim_hysteresis() -> bool;
+#endif
 
 // Helper: compute the filesystem block containing a given inode
 inline auto xfs_inode_block(const XfsMountContext* ctx, xfs_ino_t ino) -> xfs_fsblock_t {

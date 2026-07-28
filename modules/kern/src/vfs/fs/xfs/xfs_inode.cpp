@@ -58,6 +58,7 @@ constexpr size_t ICACHE_IDLE_RETAIN_MIN = 65536;
 constexpr size_t ICACHE_IDLE_RETAIN_MAX = 524288;
 constexpr uint64_t ICACHE_IDLE_RETAIN_BYTES_PER_INODE = 32ULL * 1024ULL;
 constexpr size_t ICACHE_RECLAIM_BATCH = 256;
+constexpr size_t ICACHE_RECLAIM_BUCKET_BUDGET = 256;
 constexpr uint64_t ALLOC_LOOKUP_WARN_INTERVAL = 4096;
 
 struct IcacheBucket {
@@ -70,6 +71,16 @@ bool icache_inited = false;
 std::atomic<uint64_t> alloc_lookup_failure_count{0};
 std::atomic<size_t> icache_idle_count{0};
 std::atomic<size_t> icache_idle_retain_limit_cached{0};
+std::atomic<size_t> icache_reclaim_cursor{0};
+std::atomic<size_t> icache_reclaim_deferred_releases{0};
+std::atomic<bool> icache_reclaim_active{false};
+std::atomic<uint64_t> icache_reclaim_attempts{0};
+std::atomic<uint64_t> icache_reclaim_runs{0};
+std::atomic<uint64_t> icache_reclaim_busy_skips{0};
+std::atomic<uint64_t> icache_reclaim_buckets_scanned{0};
+std::atomic<uint64_t> icache_reclaim_victims{0};
+std::atomic<uint64_t> icache_reclaim_us{0};
+std::atomic<uint64_t> icache_reclaim_max_us{0};
 
 constexpr size_t XFS_INODE_ARENA_BYTES = size_t{256} * 1024;
 constexpr size_t XFS_INODE_STRIDE = (sizeof(XfsInode) + alignof(XfsInode) - 1) & ~(alignof(XfsInode) - 1);
@@ -163,6 +174,24 @@ auto icache_idle_retain_limit() -> size_t {
     cached = static_cast<size_t>(std::min<uint64_t>(RETAIN_LIMIT, static_cast<uint64_t>(SIZE_MAX)));
     icache_idle_retain_limit_cached.store(cached, std::memory_order_release);
     return cached;
+}
+
+auto icache_reclaim_trigger(size_t retain_limit) -> size_t {
+    // Reclaiming as soon as the cache exceeds the limit makes every new idle
+    // inode scan the hash table for a single victim. Leave one batch of
+    // hysteresis so a successful scan amortizes the next batch of releases.
+    if (retain_limit > SIZE_MAX - ICACHE_RECLAIM_BATCH) {
+        return SIZE_MAX;
+    }
+    return retain_limit + ICACHE_RECLAIM_BATCH;
+}
+
+auto icache_reclaim_needed(size_t idle_count, size_t retain_limit) -> bool { return idle_count > icache_reclaim_trigger(retain_limit); }
+
+void update_relaxed_max(std::atomic<uint64_t>& slot, uint64_t value) {
+    uint64_t current = slot.load(std::memory_order_relaxed);
+    while (value > current && !slot.compare_exchange_weak(current, value, std::memory_order_relaxed, std::memory_order_relaxed)) {
+    }
 }
 
 auto perf_xfs_started_us(ker::mod::perf::WkiPerfLocalXfsOp op) -> uint64_t {
@@ -372,14 +401,42 @@ void free_inode(XfsInode* ip) {
 
 void reclaim_idle_inodes() {
     size_t const RETAIN_LIMIT = icache_idle_retain_limit();
-    if (icache_idle_count.load(std::memory_order_relaxed) <= RETAIN_LIMIT) {
+    if (!icache_reclaim_needed(icache_idle_count.load(std::memory_order_relaxed), RETAIN_LIMIT)) {
         return;
     }
 
+    size_t deferred_releases = icache_reclaim_deferred_releases.load(std::memory_order_relaxed);
+    while (deferred_releases != 0) {
+        if (icache_reclaim_deferred_releases.compare_exchange_weak(deferred_releases, deferred_releases - 1, std::memory_order_relaxed,
+                                                                   std::memory_order_relaxed)) {
+            if (deferred_releases > 1) {
+                return;
+            }
+            break;
+        }
+    }
+
+    icache_reclaim_attempts.fetch_add(1, std::memory_order_relaxed);
+    bool expected = false;
+    if (!icache_reclaim_active.compare_exchange_strong(expected, true, std::memory_order_acq_rel, std::memory_order_acquire)) {
+        icache_reclaim_busy_skips.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+
+    uint64_t const STARTED_US = ker::mod::time::get_us();
     std::array<XfsInode*, ICACHE_RECLAIM_BATCH> victims{};
     size_t victim_count = 0;
+    size_t buckets_scanned = 0;
+    size_t const START_BUCKET = icache_reclaim_cursor.load(std::memory_order_relaxed) & ICACHE_HASH_MASK;
 
-    for (auto& bucket : icache) {
+    // Only one caller scans at a time, and each run visits a bounded number of
+    // buckets and detaches one bounded batch. Advancing the cursor guarantees
+    // eventual coverage without making a VFS close or task GC walk all 16K
+    // buckets when most over-limit idle inodes are dirty.
+    while (buckets_scanned < ICACHE_RECLAIM_BUCKET_BUDGET && victim_count < victims.size() &&
+           icache_idle_count.load(std::memory_order_relaxed) > RETAIN_LIMIT) {
+        size_t const BUCKET_INDEX = (START_BUCKET + buckets_scanned) & ICACHE_HASH_MASK;
+        auto& bucket = icache.at(BUCKET_INDEX);
         uint64_t const FLAGS = bucket.lock.lock_irqsave();
         XfsInode** pp = &bucket.head;
         while (*pp != nullptr && victim_count < victims.size() && icache_idle_count.load(std::memory_order_relaxed) > RETAIN_LIMIT) {
@@ -394,15 +451,31 @@ void reclaim_idle_inodes() {
             pp = &ip->hash_next;
         }
         bucket.lock.unlock_irqrestore(FLAGS);
-
-        if (victim_count == victims.size() || icache_idle_count.load(std::memory_order_relaxed) <= RETAIN_LIMIT) {
-            break;
-        }
+        buckets_scanned++;
     }
+    icache_reclaim_cursor.store((START_BUCKET + buckets_scanned) & ICACHE_HASH_MASK, std::memory_order_relaxed);
 
     for (size_t i = 0; i < victim_count; ++i) {
         free_inode(victims.at(i));
     }
+
+    uint64_t const FINISHED_US = ker::mod::time::get_us();
+    uint64_t const ELAPSED_US = FINISHED_US >= STARTED_US ? FINISHED_US - STARTED_US : 0;
+    icache_reclaim_runs.fetch_add(1, std::memory_order_relaxed);
+    icache_reclaim_buckets_scanned.fetch_add(buckets_scanned, std::memory_order_relaxed);
+    icache_reclaim_victims.fetch_add(victim_count, std::memory_order_relaxed);
+    icache_reclaim_us.fetch_add(ELAPSED_US, std::memory_order_relaxed);
+    update_relaxed_max(icache_reclaim_max_us, ELAPSED_US);
+    size_t const REMAINING_IDLE = icache_idle_count.load(std::memory_order_relaxed);
+    size_t deferred_release_count = 0;
+    if (buckets_scanned == ICACHE_RECLAIM_BUCKET_BUDGET && victim_count < victims.size() && REMAINING_IDLE > RETAIN_LIMIT) {
+        // A bounded scan could not drain the excess (commonly because the
+        // remaining idle inodes are dirty). Defer another scan for one batch
+        // so repeated closes retain O(1) amortized reclaim work.
+        deferred_release_count = ICACHE_RECLAIM_BATCH;
+    }
+    icache_reclaim_deferred_releases.store(deferred_release_count, std::memory_order_relaxed);
+    icache_reclaim_active.store(false, std::memory_order_release);
 }
 
 auto inode_fsblock_to_dev_block(XfsMountContext* ctx, xfs_fsblock_t fsbno) -> uint64_t {
@@ -898,6 +971,32 @@ void xfs_icache_purge(XfsMountContext* mount) {
         }
     }
 }
+
+void xfs_inode_cache_stats(XfsInodeCacheStats& out) {
+    out = {
+        .idle_inodes = icache_idle_count.load(std::memory_order_relaxed),
+        .retain_limit = icache_idle_retain_limit(),
+        .reclaim_attempts = icache_reclaim_attempts.load(std::memory_order_relaxed),
+        .reclaim_runs = icache_reclaim_runs.load(std::memory_order_relaxed),
+        .reclaim_busy_skips = icache_reclaim_busy_skips.load(std::memory_order_relaxed),
+        .reclaim_buckets_scanned = icache_reclaim_buckets_scanned.load(std::memory_order_relaxed),
+        .reclaim_victims = icache_reclaim_victims.load(std::memory_order_relaxed),
+        .reclaim_us = icache_reclaim_us.load(std::memory_order_relaxed),
+        .reclaim_max_us = icache_reclaim_max_us.load(std::memory_order_relaxed),
+        .reclaim_cursor = icache_reclaim_cursor.load(std::memory_order_relaxed),
+        .reclaim_deferred_releases = icache_reclaim_deferred_releases.load(std::memory_order_relaxed),
+    };
+}
+
+#ifdef WOS_SELFTEST
+auto xfs_selftest_inode_cache_reclaim_hysteresis() -> bool {
+    constexpr size_t RETAIN_LIMIT = 1024;
+    constexpr size_t TRIGGER = RETAIN_LIMIT + ICACHE_RECLAIM_BATCH;
+    return icache_reclaim_trigger(RETAIN_LIMIT) == TRIGGER && !icache_reclaim_needed(RETAIN_LIMIT, RETAIN_LIMIT) &&
+           !icache_reclaim_needed(TRIGGER, RETAIN_LIMIT) && icache_reclaim_needed(TRIGGER + 1, RETAIN_LIMIT) &&
+           icache_reclaim_trigger(SIZE_MAX) == SIZE_MAX && ICACHE_RECLAIM_BUCKET_BUDGET < ICACHE_BUCKETS;
+}
+#endif
 
 auto xfs_icache_sync_dirty(XfsMountContext* mount) -> int {
     if (mount == nullptr || mount->read_only) {
