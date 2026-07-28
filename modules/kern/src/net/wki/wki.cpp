@@ -2847,7 +2847,9 @@ void wki_dispatch_reliable_msg(WkiChannel* rx_channel, uint32_t rx_channel_gener
     }
 }
 
-auto reliable_dispatch_needs_serial_order(const WkiChannel* ch) -> bool { return ch != nullptr && ch->channel_id == WKI_CHAN_IPC_DATA; }
+auto reliable_dispatch_needs_serial_order(const WkiChannel* ch) -> bool {
+    return ch != nullptr && (ch->channel_id == WKI_CHAN_IPC_DATA || channel_requires_existing_rx_reservation(ch->channel_id));
+}
 
 auto wait_for_reliable_dispatch_turn(WkiChannel* ch, uint32_t generation, uint32_t seq) -> bool {
     if (!reliable_dispatch_needs_serial_order(ch)) {

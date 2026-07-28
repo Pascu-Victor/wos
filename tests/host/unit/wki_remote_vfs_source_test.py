@@ -3286,6 +3286,15 @@ def test_server_fd_and_consumer_rx_use_exact_channel_identity() -> None:
             fail(f"fixed close queue admission contains unsafe operation {unsafe!r}")
 
     rx = function_body(WKI_CPP.read_text(), "wki_rx")
+    ordered_dispatch = function_body(WKI_CPP.read_text(), "reliable_dispatch_needs_serial_order")
+    require_tokens(
+        ordered_dispatch,
+        [
+            "ch->channel_id == WKI_CHAN_IPC_DATA",
+            "channel_requires_existing_rx_reservation(ch->channel_id)",
+        ],
+        "ordinary dynamic resource channels publish handlers in reliable receive order",
+    )
     require_order(
         rx,
         [
