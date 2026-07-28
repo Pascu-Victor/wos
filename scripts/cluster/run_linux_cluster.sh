@@ -277,6 +277,30 @@ if ! command -v python3 >/dev/null 2>&1; then
   echo "ERROR: python3 is required on the host." >&2
   exit 1
 fi
+if ! command -v flock >/dev/null 2>&1; then
+  echo "ERROR: flock is required on the host." >&2
+  exit 1
+fi
+
+# Share the WOS launcher's per-user lock so WOS and Linux comparator
+# topologies cannot start concurrently. A detached Linux launcher releases
+# this descriptor on exit, so the WOS launcher also scans the surviving QEMU
+# guest names before accepting a later launch.
+CLUSTER_LAUNCH_LOCK="${TMPDIR:-/tmp}/wos-cluster-$(id -u).lock"
+exec {CLUSTER_LAUNCH_LOCK_FD}>>"$CLUSTER_LAUNCH_LOCK"
+if ! flock -n "$CLUSTER_LAUNCH_LOCK_FD"; then
+  CLUSTER_LAUNCH_OWNER="$(tr -d '\n' < "$CLUSTER_LAUNCH_LOCK" 2>/dev/null || true)"
+  echo "ERROR: another WOS/Linux benchmark launcher is active (${CLUSTER_LAUNCH_OWNER:-unknown owner})." >&2
+  exit 1
+fi
+printf 'pid=%s linux-kvm\n' "$$" > "$CLUSTER_LAUNCH_LOCK"
+
+RUNNING_WOS_QEMUS="$(pgrep -af 'qemu-system.*name=opt/wos/hostname,string=' || true)"
+if [[ -n "$RUNNING_WOS_QEMUS" ]]; then
+  echo "ERROR: running WOS QEMU processes would clash with the Linux comparator topology:" >&2
+  echo "$RUNNING_WOS_QEMUS" >&2
+  exit 1
+fi
 
 declare -a NODE_VCPUS=()
 declare -a NODE_MEMORY_KIB=()

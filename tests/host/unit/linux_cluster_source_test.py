@@ -366,6 +366,9 @@ def test_launcher_source_and_argument_errors() -> None:
         "--backing-vol",
         '--cpus "${NODE_VCPUS[i]}"',
         '--memory-kib "${NODE_MEMORY_KIB[i]}"',
+        'wos-cluster-$(id -u).lock',
+        'flock -n "$CLUSTER_LAUNCH_LOCK_FD"',
+        "name=opt/wos/hostname,string=",
     ):
         if expected not in source:
             fail(f"Linux launcher is missing configured-resource plumbing {expected!r}")

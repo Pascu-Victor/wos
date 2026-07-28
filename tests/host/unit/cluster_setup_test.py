@@ -153,6 +153,16 @@ def test_running_wos_qemu_probe_filters_unrelated_processes(module) -> None:
                 "name=opt/wos/hostname,string=wos-2",
             ],
             303: ["not-qemu", "name=opt/wos/hostname,string=wos-3"],
+            404: [
+                "/usr/bin/qemu-system-x86_64",
+                "-name",
+                "guest=wos-ubuntu-vm1,debug-threads=on",
+            ],
+            505: [
+                "/usr/bin/qemu-system-x86_64",
+                "-name",
+                "guest=unrelated-linux,debug-threads=on",
+            ],
         }
         for pid, args in commands.items():
             process_dir = proc_root / str(pid)
@@ -163,8 +173,8 @@ def test_running_wos_qemu_probe_filters_unrelated_processes(module) -> None:
 
         assert_equal(
             module.find_running_wos_qemus(proc_root),
-            [(202, "wos-2")],
-            "running WOS QEMU probe",
+            [(202, "wos-2"), (404, "wos-ubuntu-vm1")],
+            "running benchmark QEMU probe",
         )
 
 
@@ -216,7 +226,7 @@ def test_cluster_launch_guard_rejects_preexisting_wos_qemu(module) -> None:
             module.cluster_launch_lock_path = old_lock_path
             module.find_running_wos_qemus = old_find_qemus
 
-    for expected in ("existing WOS QEMU processes", "wos-0 pid=4242"):
+    for expected in ("existing WOS/Linux benchmark QEMU processes", "wos-0 pid=4242"):
         if expected not in message:
             raise AssertionError(f"missing launch conflict diagnostic {expected!r} in {message!r}")
 

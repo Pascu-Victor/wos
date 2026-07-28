@@ -946,7 +946,7 @@ def cluster_launch_lock_path() -> Path:
 
 
 def find_running_wos_qemus(proc_root: Path = Path("/proc")) -> list[tuple[int, str]]:
-    """Find host-visible QEMU processes launched with a WOS hostname."""
+    """Find host-visible QEMU processes owned by WOS benchmark launchers."""
     running: list[tuple[int, str]] = []
     try:
         entries = proc_root.iterdir()
@@ -966,10 +966,23 @@ def find_running_wos_qemus(proc_root: Path = Path("/proc")) -> list[tuple[int, s
         command = " ".join(args)
         marker = "name=opt/wos/hostname,string="
         marker_index = command.find(marker)
-        if marker_index < 0:
+        if marker_index >= 0:
+            hostname = command[marker_index + len(marker) :].split()[0]
+            running.append((int(entry.name), hostname))
             continue
-        hostname = command[marker_index + len(marker) :].split()[0]
-        running.append((int(entry.name), hostname))
+
+        # Linux-under-KVM acceptance guests are launched through libvirt, so
+        # their QEMU process has a libvirt guest name rather than WOS fw_cfg.
+        # Treat those domains as the same exclusive benchmark resource. This
+        # keeps a detached Linux comparator topology from overlapping a later
+        # WOS launch after its shell-side flock has naturally been released.
+        for arg in args:
+            if not arg.startswith("guest="):
+                continue
+            guest_name = arg.removeprefix("guest=").split(",", 1)[0]
+            if guest_name.startswith(("wos-ubuntu-", "wos-linux-")):
+                running.append((int(entry.name), guest_name))
+                break
 
     return sorted(running)
 
@@ -998,7 +1011,7 @@ def cluster_launch_guard(*, reject_running_qemus: bool = True):
                 f"{hostname} pid={pid}" for pid, hostname in conflicts
             )
             raise LaunchConflictError(
-                "existing WOS QEMU processes would clash with this topology: "
+                "existing WOS/Linux benchmark QEMU processes would clash with this topology: "
                 f"{details}"
             )
 
