@@ -397,6 +397,30 @@ auto message_uses_vfs_export_admission(MsgType type, const uint8_t* payload, uin
     }
 }
 
+auto admit_async_vfs_close(MsgType type, const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len, WkiChannel* channel,
+                           uint32_t channel_generation) -> WkiVfsCloseRxAdmission {
+    if (type != MsgType::DEV_OP_REQ || hdr == nullptr || payload == nullptr || channel == nullptr || channel_generation == 0 ||
+        payload_len < sizeof(DevOpReqPayload)) {
+        return WkiVfsCloseRxAdmission::NOT_APPLICABLE;
+    }
+
+    auto const* req = reinterpret_cast<const DevOpReqPayload*>(payload);
+    if (req->op_id != OP_VFS_CLOSE || sizeof(DevOpReqPayload) + req->data_len > payload_len) {
+        return WkiVfsCloseRxAdmission::NOT_APPLICABLE;
+    }
+    const uint8_t* req_data = payload + sizeof(DevOpReqPayload);
+    if (!wki_vfs_close_no_success_response_requested(req_data, req->data_len)) {
+        return WkiVfsCloseRxAdmission::NOT_APPLICABLE;
+    }
+    if (channel->rx_dispatch_seq != hdr->seq_num) {
+        // A prior accepted frame has not completed ordered dispatch into the
+        // worker FIFO yet. Keep this close unconsumed so retransmission cannot
+        // overtake that operation in the server queue.
+        return WkiVfsCloseRxAdmission::RETRY;
+    }
+    return wki_dev_server_admit_async_vfs_close_rx(hdr, payload, payload_len, channel, channel_generation);
+}
+
 class VfsExportRxAdmissionLease {
    public:
     VfsExportRxAdmissionLease() = default;
@@ -2881,6 +2905,14 @@ void wki_dispatch_reliable_msg_ordered(WkiChannel* ch, uint32_t generation, MsgT
     finish_reliable_dispatch_turn(ch, generation, SEQ);
 }
 
+void finish_pre_admitted_reliable_msg_ordered(WkiChannel* ch, uint32_t generation, const WkiHeader* hdr) {
+    uint32_t const SEQ = hdr != nullptr ? hdr->seq_num : 0U;
+    if (!wait_for_reliable_dispatch_turn(ch, generation, SEQ)) {
+        return;
+    }
+    finish_reliable_dispatch_turn(ch, generation, SEQ);
+}
+
 }  // namespace
 
 void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
@@ -3240,6 +3272,12 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
                         return;
                     }
                 }
+                WkiVfsCloseRxAdmission const VFS_CLOSE_ADMISSION =
+                    admit_async_vfs_close(msg, hdr, payload, PAYLOAD_LEN, ch, ch->generation);
+                if (VFS_CLOSE_ADMISSION == WkiVfsCloseRxAdmission::RETRY) {
+                    ch->lock.unlock();
+                    return;
+                }
                 // In-order: advance rx_seq, mark ACK pending
                 ch->rx_seq++;
                 ch->rx_ack_pending = hdr->seq_num;
@@ -3255,7 +3293,10 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
 
                 mark_peer_rx_progress(hdr->src_node);
 
-                if (REMOTABLE_RX && remotable_admission == WkiRemotableRxAdmission::DEFERRED) {
+                if (VFS_CLOSE_ADMISSION == WkiVfsCloseRxAdmission::DEFERRED) {
+                    wki_dev_server_notify_deferred_vfs_op(hdr);
+                    finish_pre_admitted_reliable_msg_ordered(ch, RX_CHANNEL_GENERATION, hdr);
+                } else if (REMOTABLE_RX && remotable_admission == WkiRemotableRxAdmission::DEFERRED) {
                     wki_deferred_work_notify();
                 } else if (REMOTABLE_RX) {
                     // Malformed resource controls are consumed reliably but
@@ -3336,6 +3377,12 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
                             break;
                         }
                     }
+                    WkiVfsCloseRxAdmission const RO_VFS_CLOSE_ADMISSION =
+                        admit_async_vfs_close(RO_MSG, &ch->reorder_head->hdr, ch->reorder_head->data, ch->reorder_head->len, ch,
+                                              ch->reorder_head->channel_generation);
+                    if (RO_VFS_CLOSE_ADMISSION == WkiVfsCloseRxAdmission::RETRY) {
+                        break;
+                    }
 
                     WkiReorderEntry* ro = ch->reorder_head;
                     ch->reorder_head = ro->next;
@@ -3355,7 +3402,10 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
                     uint32_t const RO_CHANNEL_GENERATION = ro->channel_generation;
                     ch->lock.unlock();
 
-                    if (RO_REMOTABLE_RX && ro_remotable_admission == WkiRemotableRxAdmission::DEFERRED) {
+                    if (RO_VFS_CLOSE_ADMISSION == WkiVfsCloseRxAdmission::DEFERRED) {
+                        wki_dev_server_notify_deferred_vfs_op(&RO_HDR);
+                        finish_pre_admitted_reliable_msg_ordered(ch, RO_CHANNEL_GENERATION, &RO_HDR);
+                    } else if (RO_REMOTABLE_RX && ro_remotable_admission == WkiRemotableRxAdmission::DEFERRED) {
                         wki_deferred_work_notify();
                     } else if (RO_REMOTABLE_RX) {
                         // Malformed resource controls are consumed without

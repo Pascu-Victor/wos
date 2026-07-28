@@ -791,6 +791,7 @@ def test_deferred_vfs_ops_retain_their_binding_through_blocking_work() -> None:
     run_body = function_body(source, "run_deferred_vfs_op")
     alloc_body = function_body(source, "deferred_vfs_op_alloc")
     release_body = function_body(source, "deferred_vfs_op_release")
+    regular_run_body = run_body[run_body.index("// queue_vfs_op retained") :]
     queue_required = [
         "DevServerBinding* retained_binding = nullptr",
         "find_binding_by_channel_identity(channel_identity)",
@@ -822,13 +823,18 @@ def test_deferred_vfs_ops_retain_their_binding_through_blocking_work() -> None:
     require_order(queue_body, "deferred_vfs_op_alloc(req_data_len)", "std::memcpy(op->req_data", "VFS allocation before request copy")
     require_order(queue_body, "std::memcpy(op->req_data", "shard->lock.lock_irqsave()", "VFS request copy before FIFO publication")
     require_order(
-        run_body,
+        regular_run_body,
         "channel_identity_matches(RETAINED_BINDING->channel_identity, op->channel_identity)",
         "detail::handle_vfs_op",
         "retained VFS generation validation",
     )
-    require_order(run_body, "detail::handle_vfs_op", "release_binding(RETAINED_BINDING)", "deferred VFS release after handler")
-    require_order(run_body, "release_binding(RETAINED_BINDING)", "deferred_vfs_op_release(op)", "deferred VFS release before request cleanup")
+    require_order(regular_run_body, "detail::handle_vfs_op", "release_binding(RETAINED_BINDING)", "deferred VFS release after handler")
+    require_order(
+        regular_run_body,
+        "release_binding(RETAINED_BINDING)",
+        "deferred_vfs_op_release(op)",
+        "deferred VFS release before request cleanup",
+    )
     for forbidden in [
         "s_server_lock.lock_irqsave()",
         "std::array<char, sizeof(DevServerBinding::vfs_export_path)>",

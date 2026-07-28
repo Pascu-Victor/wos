@@ -1,5 +1,6 @@
 #include <atomic>
 #include <net/wki/dev_proxy.hpp>
+#include <net/wki/dev_server.hpp>
 #include <net/wki/remote_vfs.hpp>
 #include <test/ktest.hpp>
 #include <type_traits>
@@ -71,6 +72,10 @@ KTEST(WkiRemoteVfsWriteBehind, GrowthPreservesPendingData) { KEXPECT_TRUE(ker::n
 
 KTEST(WkiRemoteVfsClose, WritableWaitsForOwnerPublication) {
     KEXPECT_TRUE(ker::net::wki::wki_remote_vfs_selftest_writable_close_wait_policy());
+}
+
+KTEST(WkiRemoteVfsClose, AsyncCloseUsesFixedPreAckAdmission) {
+    KEXPECT_TRUE(ker::net::wki::wki_dev_server_selftest_async_vfs_close_uses_fixed_admission());
 }
 
 KTEST(WkiRemoteVfsReadlinkCache, GenerationInvalidationAndWrap) {

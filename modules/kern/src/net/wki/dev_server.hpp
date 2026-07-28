@@ -280,6 +280,19 @@ auto wki_dev_server_attach_blocked_by_pending_detach(const WkiHeader* hdr, const
 // Drain ACK-admitted explicit detaches in task context.
 void wki_dev_server_process_pending_detaches();
 
+enum class WkiVfsCloseRxAdmission : uint8_t {
+    NOT_APPLICABLE,
+    DEFERRED,
+    RETRY,
+};
+
+// Admit a one-way read-only close into fixed storage and the exact
+// per-channel VFS worker FIFO before reliable RX publishes its ACK. RETRY
+// leaves the frame unconsumed when fixed capacity or a queue lock is busy.
+auto wki_dev_server_admit_async_vfs_close_rx(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len, WkiChannel* rx_channel,
+                                             uint32_t rx_channel_generation) -> WkiVfsCloseRxAdmission;
+void wki_dev_server_notify_deferred_vfs_op(const WkiHeader* hdr);
+
 // Pre-ACK VFS transition admission. Reliable RX acquires this before sequence
 // advancement and releases only after inline handling has transferred any
 // queued VFS operation reference.
@@ -357,6 +370,7 @@ auto wki_dev_server_selftest_binding_lifecycle_flags() -> bool;
 auto wki_dev_server_selftest_attach_ack_failure_defers_cleanup() -> bool;
 auto wki_dev_server_selftest_detach_admission_lifecycle() -> bool;
 auto wki_dev_server_selftest_block_writer_lease_transfer() -> bool;
+auto wki_dev_server_selftest_async_vfs_close_uses_fixed_admission() -> bool;
 #endif
 
 // -----------------------------------------------------------------------------

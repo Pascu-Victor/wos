@@ -14,6 +14,7 @@
 #include <cstring>
 #include <deque>
 #include <iterator>
+#include <map>
 #include <memory>
 #include <net/wki/dev_server.hpp>
 #include <net/wki/remotable.hpp>
@@ -471,8 +472,12 @@ void perf_record_vfs_server_end(uint8_t op, uint16_t peer, uint16_t channel, uin
 // -----------------------------------------------------------------------------
 
 std::deque<VfsExport> g_vfs_exports;                  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-std::deque<RemoteVfsFd> g_remote_fds;                 // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::map<int32_t, RemoteVfsFd> g_remote_fds;          // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 int32_t g_next_remote_fd = 1;                         // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+uint64_t g_remote_fd_opens_total = 0;                 // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+uint64_t g_remote_fd_close_retirements_total = 0;     // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+uint64_t g_remote_fd_async_close_completions = 0;     // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+uint64_t g_remote_fd_async_close_misses = 0;          // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 uint32_t g_next_vfs_resource_id = 0x1000;             // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 uint32_t g_next_vfs_resource_incarnation = 1;         // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 uint64_t g_vfs_export_revision = 2;                   // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
@@ -491,27 +496,53 @@ auto vfs_channel_identity_matches_header(const WkiHeader* hdr, const WkiChannelI
 }
 
 auto find_remote_fd(const WkiChannelIdentity& channel_identity, int32_t fd_id) -> RemoteVfsFd* {
-    for (auto& rfd : g_remote_fds) {
-        if (rfd.active && !rfd.retiring && rfd.fd_id == fd_id && vfs_channel_identity_matches(rfd.channel_identity, channel_identity)) {
-            return &rfd;
-        }
+    auto const IT = g_remote_fds.find(fd_id);
+    if (IT == g_remote_fds.end()) {
+        return nullptr;
+    }
+    auto& rfd = IT->second;
+    if (rfd.active && !rfd.retiring && vfs_channel_identity_matches(rfd.channel_identity, channel_identity)) {
+        return &rfd;
     }
     return nullptr;
 }
 
 auto alloc_remote_fd(const WkiChannelIdentity& channel_identity, ker::vfs::File* file) -> int32_t {
-    int32_t const FD_ID = g_next_remote_fd++;
+    int32_t fd_id = -EMFILE;
+    for (size_t attempt = 0; attempt <= g_remote_fds.size(); ++attempt) {
+        int32_t const CANDIDATE = g_next_remote_fd;
+        g_next_remote_fd = CANDIDATE == INT32_MAX ? 1 : CANDIDATE + 1;
+        if (!g_remote_fds.contains(CANDIDATE)) {
+            fd_id = CANDIDATE;
+            break;
+        }
+    }
+    if (fd_id < 0) {
+        return fd_id;
+    }
 
     RemoteVfsFd rfd;
     rfd.active = true;
     rfd.consumer_node = channel_identity.peer_node_id;
     rfd.channel_identity = channel_identity;
-    rfd.fd_id = FD_ID;
+    rfd.fd_id = fd_id;
     rfd.file = file;
     rfd.last_activity_us = wki_now_us();
 
-    g_remote_fds.push_back(rfd);
-    return FD_ID;
+    g_remote_fds.emplace(fd_id, rfd);
+    g_remote_fd_opens_total++;
+    return fd_id;
+}
+
+void erase_remote_fd_if_retired(const WkiChannelIdentity& channel_identity, int32_t fd_id) {
+    auto const IT = g_remote_fds.find(fd_id);
+    if (IT == g_remote_fds.end()) {
+        return;
+    }
+    auto const& rfd = IT->second;
+    if (rfd.retiring && rfd.file == nullptr && vfs_channel_identity_matches(rfd.channel_identity, channel_identity)) {
+        g_remote_fds.erase(IT);
+    }
 }
 
 // D10: Update last_activity_us on a remote FD
@@ -4114,6 +4145,28 @@ void wki_remote_vfs_cleanup_for_task(uint64_t pid) {
 
 auto wki_remote_vfs_fsync(ker::vfs::File* file) -> int { return remote_vfs_fsync_file(file); }
 
+void wki_remote_vfs_server_diag_snapshot(WkiRemoteVfsServerDiag* out) {
+    if (out == nullptr) {
+        return;
+    }
+
+    WkiRemoteVfsServerDiag snapshot{};
+    s_vfs_lock.lock();
+    snapshot.fd_entries = g_remote_fds.size();
+    for (const auto& [fd_id, rfd] : g_remote_fds) {
+        static_cast<void>(fd_id);
+        snapshot.active_fds += rfd.active && !rfd.retiring ? 1U : 0U;
+        snapshot.retiring_fds += rfd.retiring ? 1U : 0U;
+    }
+    snapshot.opens_total = g_remote_fd_opens_total;
+    snapshot.close_retirements_total = g_remote_fd_close_retirements_total;
+    snapshot.async_close_completions = g_remote_fd_async_close_completions;
+    snapshot.async_close_misses = g_remote_fd_async_close_misses;
+    s_vfs_lock.unlock();
+
+    *out = snapshot;
+}
+
 #ifdef WOS_SELFTEST
 auto wki_remote_vfs_selftest_utimens_wire_path_validation() -> bool {
     constexpr std::array<uint8_t, 8> SAFE_PATH = {'d', 'i', 'r', '/', '.', '.', 'x', 'x'};
@@ -4601,6 +4654,7 @@ auto wki_remote_vfs_selftest_writable_close_wait_policy() -> bool {
            remote_vfs_close_needs_completion(ker::vfs::O_CREAT) && remote_vfs_close_needs_completion(ker::vfs::O_TRUNC) &&
            remote_vfs_close_needs_completion(ker::vfs::O_CREAT | ker::vfs::O_CLOEXEC);
 }
+
 #endif
 
 // -------------------------------------------------------------------------------
@@ -5039,6 +5093,18 @@ void handle_vfs_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_ident
             s_vfs_lock.lock();
             int32_t fd_id = alloc_remote_fd(channel_identity, file);
             s_vfs_lock.unlock();
+            if (fd_id < 0) {
+                static_cast<void>(ker::vfs::vfs_close_file(file));
+                perf_record_vfs_server_end(SERVER_OP, hdr->src_node, channel_id, CORRELATION, fd_id,
+                                           static_cast<uint32_t>(wki_now_us() - LOCAL_STARTED_US), 0, CALLSITE);
+                DevOpRespPayload resp = {};
+                resp.op_id = OP_VFS_OPEN;
+                resp.status = static_cast<int16_t>(fd_id);
+                resp.data_len = 0;
+                resp.reserved = REQ_COOKIE;
+                static_cast<void>(wki_send_on_channel_identity(channel_identity, MsgType::DEV_OP_RESP, &resp, sizeof(resp)));
+                break;
+            }
             open_resp.fd = fd_id;
 
             uint16_t const OPEN_DATA_LEN = (open_resp.has_stat == 0)          ? OPEN_RESP_NO_STAT_LEN
@@ -5068,10 +5134,7 @@ void handle_vfs_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_ident
                     rfd->retiring = true;
                     rfd->active = false;
                 }
-                std::erase_if(g_remote_fds, [&channel_identity, fd_id](const RemoteVfsFd& entry) {
-                    return entry.fd_id == fd_id && entry.retiring && entry.file == nullptr &&
-                           vfs_channel_identity_matches(entry.channel_identity, channel_identity);
-                });
+                erase_remote_fd_if_retired(channel_identity, fd_id);
                 s_vfs_lock.unlock();
 
                 if (orphan != nullptr) {
@@ -5274,12 +5337,15 @@ void handle_vfs_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_ident
                 rfd->file = nullptr;
                 rfd->retiring = true;
                 rfd->active = false;
+                g_remote_fd_close_retirements_total++;
+                if (NO_SUCCESS_RESPONSE) {
+                    g_remote_fd_async_close_completions++;
+                }
                 status = 0;
+            } else if (NO_SUCCESS_RESPONSE) {
+                g_remote_fd_async_close_misses++;
             }
-            std::erase_if(g_remote_fds, [&channel_identity, fd_id](const RemoteVfsFd& entry) {
-                return entry.fd_id == fd_id && entry.retiring && entry.file == nullptr &&
-                       vfs_channel_identity_matches(entry.channel_identity, channel_identity);
-            });
+            erase_remote_fd_if_retired(channel_identity, fd_id);
             s_vfs_lock.unlock();
 
             if (close_file != nullptr) {
@@ -8270,7 +8336,8 @@ void wki_remote_vfs_gc_stale_fds() {
     size_t stale_peer_count = 0;
 
     s_vfs_lock.lock();
-    for (const auto& rfd : g_remote_fds) {
+    for (const auto& [fd_id, rfd] : g_remote_fds) {
+        static_cast<void>(fd_id);
         if (!rfd.active || NOW < rfd.last_activity_us || NOW - rfd.last_activity_us < STALE_FD_TIMEOUT_US) {
             continue;
         }
@@ -8316,7 +8383,8 @@ void wki_remote_vfs_gc_stale_fds() {
         std::deque<ker::vfs::File*> files_to_close;
         uint64_t const CHECK_NOW = wki_now_us();
         s_vfs_lock.lock();
-        for (auto& rfd : g_remote_fds) {
+        for (auto& [fd_id, rfd] : g_remote_fds) {
+            static_cast<void>(fd_id);
             if (!rfd.active || rfd.consumer_node != NODE_ID || CHECK_NOW < rfd.last_activity_us ||
                 CHECK_NOW - rfd.last_activity_us < STALE_FD_TIMEOUT_US) {
                 continue;
@@ -8331,7 +8399,8 @@ void wki_remote_vfs_gc_stale_fds() {
             ker::mod::dbg::log("[WKI] GC stale remote FD %d (consumer 0x%04x)", rfd.fd_id, rfd.consumer_node);
         }
         if (any_removed) {
-            std::erase_if(g_remote_fds, [NODE_ID](const RemoteVfsFd& rfd) {
+            std::erase_if(g_remote_fds, [NODE_ID](const auto& entry) {
+                auto const& rfd = entry.second;
                 return rfd.consumer_node == NODE_ID && rfd.retiring && rfd.file == nullptr;
             });
         }
@@ -8603,7 +8672,8 @@ void wki_remote_vfs_mark_server_fds_for_channel(const WkiChannelIdentity& channe
 
     bool marked = false;
     s_vfs_lock.lock();
-    for (auto& rfd : g_remote_fds) {
+    for (auto& [fd_id, rfd] : g_remote_fds) {
+        static_cast<void>(fd_id);
         if (!rfd.active || !vfs_channel_identity_matches(rfd.channel_identity, channel_identity)) {
             continue;
         }
@@ -8676,14 +8746,18 @@ void wki_remote_vfs_process_pending_server_fd_cleanup() {
         size_t close_count = 0;
 
         s_vfs_lock.lock();
-        for (auto& rfd : g_remote_fds) {
+        for (auto& [fd_id, rfd] : g_remote_fds) {
+            static_cast<void>(fd_id);
             if (!rfd.retiring || rfd.file == nullptr || close_count >= files_to_close.size()) {
                 continue;
             }
             files_to_close.at(close_count++) = rfd.file;
             rfd.file = nullptr;
         }
-        std::erase_if(g_remote_fds, [](const RemoteVfsFd& rfd) { return rfd.retiring && rfd.file == nullptr; });
+        std::erase_if(g_remote_fds, [](const auto& entry) {
+            auto const& rfd = entry.second;
+            return rfd.retiring && rfd.file == nullptr;
+        });
         s_vfs_lock.unlock();
 
         for (size_t i = 0; i < close_count; ++i) {
@@ -8730,7 +8804,8 @@ void wki_remote_vfs_cleanup_for_peer(uint16_t node_id, bool owner_reboot_proven)
     std::deque<PendingProxyTeardown> proxies_to_cleanup;
 
     s_vfs_lock.lock();
-    for (auto& rfd : g_remote_fds) {
+    for (auto& [fd_id, rfd] : g_remote_fds) {
+        static_cast<void>(fd_id);
         if (rfd.consumer_node != node_id) {
             continue;
         }
@@ -8741,8 +8816,10 @@ void wki_remote_vfs_cleanup_for_peer(uint16_t node_id, bool owner_reboot_proven)
         rfd.retiring = true;
         rfd.active = false;
     }
-    std::erase_if(g_remote_fds,
-                  [node_id](const RemoteVfsFd& rfd) { return rfd.consumer_node == node_id && rfd.retiring && rfd.file == nullptr; });
+    std::erase_if(g_remote_fds, [node_id](const auto& entry) {
+        auto const& rfd = entry.second;
+        return rfd.consumer_node == node_id && rfd.retiring && rfd.file == nullptr;
+    });
 
     // Consumer side: fail pending ops and deactivate proxies while the proxy
     // registry is locked.  Cache invalidation and channel close happen later

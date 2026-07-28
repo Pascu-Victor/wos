@@ -62,7 +62,49 @@ struct DeferredVfsOp {
     uint8_t* req_data = nullptr;
     DevServerBinding* retained_binding = nullptr;
     DeferredVfsOp* next = nullptr;
+    bool fixed_async_close = false;
+    std::array<uint8_t, WKI_VFS_CLOSE_EXTENDED_DATA_LEN> fixed_close_data{};
 };
+
+constexpr size_t VFS_ASYNC_CLOSE_WORK_CAPACITY = 1024;
+static_assert(VFS_ASYNC_CLOSE_WORK_CAPACITY >= WKI_MAX_CHANNELS);
+std::array<DeferredVfsOp, VFS_ASYNC_CLOSE_WORK_CAPACITY>
+    s_vfs_async_close_work{};                         // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+DeferredVfsOp* s_vfs_async_close_free = nullptr;      // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+ker::mod::sys::Spinlock s_vfs_async_close_pool_lock;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+
+void init_vfs_async_close_work_pool() {
+    uint64_t const FLAGS = s_vfs_async_close_pool_lock.lock_irqsave();
+    s_vfs_async_close_free = nullptr;
+    for (auto& op : s_vfs_async_close_work) {
+        op = {};
+        op.fixed_async_close = true;
+        op.next = s_vfs_async_close_free;
+        s_vfs_async_close_free = &op;
+    }
+    s_vfs_async_close_pool_lock.unlock_irqrestore(FLAGS);
+}
+
+#ifdef WOS_SELFTEST
+auto try_alloc_vfs_async_close_work() -> DeferredVfsOp* {
+    if (!s_vfs_async_close_pool_lock.try_lock()) {
+        return nullptr;
+    }
+    DeferredVfsOp* op = s_vfs_async_close_free;
+    if (op != nullptr) {
+        s_vfs_async_close_free = op->next;
+    }
+    s_vfs_async_close_pool_lock.unlock();
+    if (op == nullptr) {
+        return nullptr;
+    }
+
+    *op = {};
+    op->fixed_async_close = true;
+    op->req_data = op->fixed_close_data.data();
+    return op;
+}
+#endif
 
 auto deferred_vfs_op_alloc(uint16_t req_data_len) -> DeferredVfsOp* {
     void* const STORAGE = ::operator new(sizeof(DeferredVfsOp) + req_data_len, std::nothrow);
@@ -80,6 +122,15 @@ auto deferred_vfs_op_alloc(uint16_t req_data_len) -> DeferredVfsOp* {
 
 void deferred_vfs_op_release(DeferredVfsOp* op) {
     if (op == nullptr) {
+        return;
+    }
+    if (op->fixed_async_close) {
+        *op = {};
+        op->fixed_async_close = true;
+        uint64_t const FLAGS = s_vfs_async_close_pool_lock.lock_irqsave();
+        op->next = s_vfs_async_close_free;
+        s_vfs_async_close_free = op;
+        s_vfs_async_close_pool_lock.unlock_irqrestore(FLAGS);
         return;
     }
     op->~DeferredVfsOp();
@@ -724,6 +775,15 @@ void run_deferred_vfs_op(void* arg) {
 
     DevServerBinding* const RETAINED_BINDING = op->retained_binding;
 
+    if (op->fixed_async_close) {
+        // Pre-ACK admission already fenced queue capacity and preserved this
+        // channel's FIFO position. OP_VFS_CLOSE does not consume export path
+        // state; exact channel-generation matching remains in remote_vfs.
+        detail::handle_vfs_op(&op->hdr, op->channel_identity, "", "", op->op_id, op->req_data, op->req_data_len);
+        deferred_vfs_op_release(op);
+        return;
+    }
+
     // queue_vfs_op retained an exact published list node. Its channel identity
     // and export strings are immutable after publication, and retirement
     // cannot erase the node until this reference is released.
@@ -812,6 +872,40 @@ auto vfs_worker_for(const WkiHeader* hdr) -> VfsOpWorkerShard* {
         }
     }
     return nullptr;
+}
+
+auto try_queue_pre_admitted_async_close(VfsOpWorkerShard* shard, const WkiHeader* hdr, const WkiChannelIdentity& channel_identity,
+                                        const uint8_t* req_data) -> bool {
+    if (shard == nullptr || hdr == nullptr || req_data == nullptr || !s_vfs_async_close_pool_lock.try_lock()) {
+        return false;
+    }
+    DeferredVfsOp* op = s_vfs_async_close_free;
+    if (op == nullptr || !shard->lock.try_lock()) {
+        s_vfs_async_close_pool_lock.unlock();
+        return false;
+    }
+
+    s_vfs_async_close_free = op->next;
+    *op = {};
+    op->fixed_async_close = true;
+    op->req_data = op->fixed_close_data.data();
+    op->hdr = *hdr;
+    op->channel_identity = channel_identity;
+    op->op_id = OP_VFS_CLOSE;
+    op->req_data_len = WKI_VFS_CLOSE_EXTENDED_DATA_LEN;
+    std::memcpy(op->req_data, req_data, WKI_VFS_CLOSE_EXTENDED_DATA_LEN);
+    op->next = nullptr;
+
+    if (shard->tail != nullptr) {
+        shard->tail->next = op;
+    } else {
+        shard->head = op;
+    }
+    shard->tail = op;
+    shard->pending.fetch_add(1, std::memory_order_relaxed);
+    shard->lock.unlock();
+    s_vfs_async_close_pool_lock.unlock();
+    return true;
 }
 
 auto queue_vfs_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_identity, uint16_t op_id, const uint8_t* req_data,
@@ -1040,6 +1134,8 @@ void wki_dev_server_init() {
         return;
     }
 
+    init_vfs_async_close_work_pool();
+
     using WorkerEntry = void (*)();
     constexpr std::array<WorkerEntry, VFS_OP_WORKER_COUNT> VFS_OP_WORKER_ENTRIES = {
         vfs_op_worker_0,  vfs_op_worker_1,  vfs_op_worker_2,  vfs_op_worker_3,  vfs_op_worker_4,  vfs_op_worker_5,
@@ -1070,6 +1166,42 @@ void wki_dev_server_init() {
     }
     g_dev_server_initialized = true;
     ker::mod::dbg::log("[WKI] Dev server subsystem initialized");
+}
+
+auto wki_dev_server_admit_async_vfs_close_rx(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len, WkiChannel* rx_channel,
+                                             uint32_t rx_channel_generation) -> WkiVfsCloseRxAdmission {
+    if (hdr == nullptr || payload == nullptr || rx_channel == nullptr || rx_channel_generation == 0 ||
+        payload_len < sizeof(DevOpReqPayload)) {
+        return WkiVfsCloseRxAdmission::NOT_APPLICABLE;
+    }
+
+    auto const* req = reinterpret_cast<const DevOpReqPayload*>(payload);
+    if (req->op_id != OP_VFS_CLOSE || sizeof(DevOpReqPayload) + req->data_len > payload_len) {
+        return WkiVfsCloseRxAdmission::NOT_APPLICABLE;
+    }
+    const uint8_t* req_data = payload + sizeof(DevOpReqPayload);
+    if (req->data_len < WKI_VFS_CLOSE_LEGACY_DATA_LEN || !wki_vfs_close_no_success_response_requested(req_data, req->data_len)) {
+        return WkiVfsCloseRxAdmission::NOT_APPLICABLE;
+    }
+
+    WkiChannelIdentity const CHANNEL_IDENTITY = {
+        .channel = rx_channel,
+        .peer_node_id = hdr->src_node,
+        .channel_id = hdr->channel_id,
+        .generation = rx_channel_generation,
+    };
+    VfsOpWorkerShard* const SHARD = vfs_worker_for(hdr);
+    if (!try_queue_pre_admitted_async_close(SHARD, hdr, CHANNEL_IDENTITY, req_data)) {
+        return WkiVfsCloseRxAdmission::RETRY;
+    }
+    return WkiVfsCloseRxAdmission::DEFERRED;
+}
+
+void wki_dev_server_notify_deferred_vfs_op(const WkiHeader* hdr) {
+    VfsOpWorkerShard* const SHARD = vfs_worker_for(hdr);
+    if (SHARD != nullptr) {
+        ker::mod::sched::wake_task_from_event(SHARD->task);
+    }
 }
 
 auto wki_dev_server_vfs_rx_admission_try_acquire() -> bool {
@@ -3342,6 +3474,27 @@ auto wki_dev_server_selftest_deferred_vfs_storage_is_coallocated() -> bool {
     bool const EMPTY_IS_NULL = empty->req_data == nullptr && empty->req_data_len == 0;
     deferred_vfs_op_release(empty);
     return DATA_IS_TRAILING && DATA_PRESERVED && EMPTY_IS_NULL;
+}
+
+auto wki_dev_server_selftest_async_vfs_close_uses_fixed_admission() -> bool {
+    // Kernel selftests run before wki_init(), while the production pool is
+    // initialized by wki_dev_server_init(). Seed it here so this early-boot
+    // test exercises the same allocation/recycle path.
+    init_vfs_async_close_work_pool();
+
+    DeferredVfsOp* first = try_alloc_vfs_async_close_work();
+    if (first == nullptr) {
+        return false;
+    }
+    bool const FIXED_STORAGE =
+        first->fixed_async_close && first->req_data == first->fixed_close_data.data() && first->retained_binding == nullptr;
+    deferred_vfs_op_release(first);
+
+    DeferredVfsOp* second = try_alloc_vfs_async_close_work();
+    bool const RECYCLED = second == first && second != nullptr && second->fixed_async_close &&
+                          second->req_data == second->fixed_close_data.data() && second->retained_binding == nullptr;
+    deferred_vfs_op_release(second);
+    return FIXED_STORAGE && RECYCLED;
 }
 
 auto wki_dev_server_selftest_retirement_ownership_guards() -> bool {

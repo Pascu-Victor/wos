@@ -3031,7 +3031,7 @@ def test_remote_vfs_channel_identity_survives_pool_slot_reuse() -> None:
     require_order(
         cleanup_body,
         [
-            "for (auto& rfd : g_remote_fds)",
+            "for (auto& [fd_id, rfd] : g_remote_fds)",
             "if (rfd.consumer_node != node_id)",
             "if (rfd.file != nullptr)",
             "files_to_close.push_back(rfd.file)",
@@ -3051,7 +3051,8 @@ def test_remote_vfs_channel_identity_survives_pool_slot_reuse() -> None:
     require_tokens(
         source,
         [
-            "entry.fd_id == fd_id && entry.retiring && entry.file == nullptr",
+            "g_remote_fds.find(fd_id)",
+            "rfd.retiring && rfd.file == nullptr && vfs_channel_identity_matches",
             "rfd.consumer_node == NODE_ID && rfd.retiring && rfd.file == nullptr",
             "rfd.consumer_node == node_id && rfd.retiring && rfd.file == nullptr",
         ],
@@ -3213,9 +3214,9 @@ def test_server_fd_and_consumer_rx_use_exact_channel_identity() -> None:
     require_tokens(
         lookup,
         [
+            "g_remote_fds.find(fd_id)",
             "rfd.active",
             "!rfd.retiring",
-            "rfd.fd_id == fd_id",
             "vfs_channel_identity_matches(rfd.channel_identity, channel_identity)",
         ],
         "server FD exact-generation lookup",
@@ -3226,8 +3227,8 @@ def test_server_fd_and_consumer_rx_use_exact_channel_identity() -> None:
         [
             "rfd.consumer_node = channel_identity.peer_node_id",
             "rfd.channel_identity = channel_identity",
-            "rfd.fd_id = FD_ID",
-            "g_remote_fds.push_back(rfd)",
+            "rfd.fd_id = fd_id",
+            "g_remote_fds.emplace(fd_id, rfd)",
         ],
         "server FD exact-generation publication",
     )
@@ -3249,6 +3250,53 @@ def test_server_fd_and_consumer_rx_use_exact_channel_identity() -> None:
         fail("reliable RX server-FD retirement must not allocate or close files")
     if "consumer_node == channel_identity.peer_node_id" in mark_cleanup:
         fail("ordinary binding detach must not close sibling channel generations for the same peer")
+
+    async_close = function_body(dev_server, "wki_dev_server_admit_async_vfs_close_rx")
+    require_order(
+        async_close,
+        [
+            "wki_vfs_close_no_success_response_requested(req_data, req->data_len)",
+            "try_queue_pre_admitted_async_close",
+            "WkiVfsCloseRxAdmission::RETRY",
+            "WkiVfsCloseRxAdmission::DEFERRED",
+        ],
+        "one-way close fixed work admission precedes reliable ACK",
+    )
+    for unsafe in ("operator new", "new ", "vfs_close_file", "dbg::log"):
+        if unsafe in async_close:
+            fail(f"one-way close RX precommit contains unsafe operation {unsafe!r}")
+
+    fixed_queue = function_body(dev_server, "try_queue_pre_admitted_async_close")
+    require_order(
+        fixed_queue,
+        [
+            "s_vfs_async_close_pool_lock.try_lock()",
+            "shard->lock.try_lock()",
+            "s_vfs_async_close_free = op->next",
+            "op->fixed_async_close = true",
+            "op->op_id = OP_VFS_CLOSE",
+            "shard->pending.fetch_add",
+            "shard->lock.unlock()",
+            "s_vfs_async_close_pool_lock.unlock()",
+        ],
+        "fixed close work enters the exact VFS FIFO without allocation or blocking locks",
+    )
+    for unsafe in ("operator new", "new ", "vfs_close_file", "wake_task_from_event"):
+        if unsafe in fixed_queue:
+            fail(f"fixed close queue admission contains unsafe operation {unsafe!r}")
+
+    rx = function_body(WKI_CPP.read_text(), "wki_rx")
+    require_order(
+        rx,
+        [
+            "admit_async_vfs_close(msg, hdr, payload, PAYLOAD_LEN, ch, ch->generation)",
+            "VFS_CLOSE_ADMISSION == WkiVfsCloseRxAdmission::RETRY",
+            "ch->rx_seq++",
+        ],
+        "in-order async close commits before reliable RX sequence publication",
+    )
+    if rx.count("admit_async_vfs_close(") != 2:
+        fail("both direct and reorder reliable RX paths must precommit one-way VFS close")
 
     drain_cleanup = function_body(source, "wki_remote_vfs_process_pending_server_fd_cleanup")
     require_order(

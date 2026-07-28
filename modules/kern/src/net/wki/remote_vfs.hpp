@@ -284,6 +284,16 @@ struct WkiRemoteVfsProxyDiag {
     std::array<char, VFS_EXPORT_PATH_LEN> local_mount_path = {};
 };
 
+struct WkiRemoteVfsServerDiag {
+    uint64_t fd_entries = 0;
+    uint64_t active_fds = 0;
+    uint64_t retiring_fds = 0;
+    uint64_t opens_total = 0;
+    uint64_t close_retirements_total = 0;
+    uint64_t async_close_completions = 0;
+    uint64_t async_close_misses = 0;
+};
+
 // -----------------------------------------------------------------------------
 // Public API
 // -----------------------------------------------------------------------------
@@ -340,6 +350,9 @@ void wki_remote_vfs_cleanup_for_task(uint64_t pid);
 
 // Consumer side: best-effort diagnostic snapshot for /proc/wki/netdiag.
 auto wki_remote_vfs_proxy_diag_snapshot(WkiRemoteVfsProxyDiag* out, size_t max) -> size_t;
+
+// Server-side FD registry telemetry for /proc/wki/netdiag.
+void wki_remote_vfs_server_diag_snapshot(WkiRemoteVfsServerDiag* out);
 
 // Consumer side: unmount a remote VFS
 void wki_remote_vfs_unmount(const char* local_mount_path);

@@ -3360,6 +3360,24 @@ auto generate_wki_netdiag(char* buf, size_t bufsz) -> size_t {
         append_char(p, end, '\n');
     }
 
+    ker::net::wki::WkiRemoteVfsServerDiag vfs_server{};
+    ker::net::wki::wki_remote_vfs_server_diag_snapshot(&vfs_server);
+    append_sconst(p, end, "wki_vfs_server fd_entries=");
+    append_dec64(p, end, vfs_server.fd_entries);
+    append_sconst(p, end, " active=");
+    append_dec64(p, end, vfs_server.active_fds);
+    append_sconst(p, end, " retiring=");
+    append_dec64(p, end, vfs_server.retiring_fds);
+    append_sconst(p, end, " opens_total=");
+    append_dec64(p, end, vfs_server.opens_total);
+    append_sconst(p, end, " close_retirements_total=");
+    append_dec64(p, end, vfs_server.close_retirements_total);
+    append_sconst(p, end, " async_close_completions=");
+    append_dec64(p, end, vfs_server.async_close_completions);
+    append_sconst(p, end, " async_close_misses=");
+    append_dec64(p, end, vfs_server.async_close_misses);
+    append_char(p, end, '\n');
+
     std::array<ker::net::wki::WkiRemoteVfsProxyDiag, ker::net::wki::WKI_REMOTE_VFS_PROXY_DIAG_MAX> vfs_proxies{};
     size_t const VFS_PROXY_COUNT = ker::net::wki::wki_remote_vfs_proxy_diag_snapshot(vfs_proxies.data(), vfs_proxies.size());
     for (size_t i = 0; i < VFS_PROXY_COUNT; ++i) {
