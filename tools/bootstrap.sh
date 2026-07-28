@@ -193,6 +193,20 @@ if [ "\$use_config" -eq 1 ] && [ -f "\$config" ]; then
     compiler+=(--config="\$config")
 fi
 
+compiler_claim_job_tag() {
+    local compiler_claim_responses="\$1"
+    local compiler_claim_attempt
+    local compiler_claim_candidate
+    for ((compiler_claim_attempt = 0; compiler_claim_attempt < 256; compiler_claim_attempt++)); do
+        compiler_claim_candidate="\$\$.\$RANDOM.\$compiler_claim_attempt"
+        if mkdir "\$compiler_claim_responses/.claim.\$compiler_claim_candidate" 2>/dev/null; then
+            printf '%s\n' "\$compiler_claim_candidate"
+            return 0
+        fi
+    done
+    return 1
+    }
+
 if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; then
     IFS=, read -r -a compiler_hosts <<< "\${WOS_DISTRIBUTED_COMPILER_HOSTS:-}"
     if [ "\${#compiler_hosts[@]}" -lt 2 ]; then
@@ -384,6 +398,10 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
             echo "ERROR: distributed compiler response directory could not be created" >&2
             exit 1
         fi
+        compiler_job_tag="\$(compiler_claim_job_tag "\$compiler_responses")" || {
+            echo "ERROR: distributed compiler could not claim a cluster-unique job tag" >&2
+            exit 1
+        }
         compiler_response=""
         compiler_staged_args=()
         compiler_skip_output_arg=0
@@ -406,7 +424,7 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
                 # Source transport still publishes its argv through remote VFS
                 # because the destination is explicitly selected before exec.
                 # Staged transport uses WKI's fragmented task context directly.
-                compiler_response="\$compiler_responses/clang.\$\$"
+                compiler_response="\$compiler_responses/clang.\$compiler_job_tag"
                 if ! compiler_create_shared_file "\$compiler_response"; then
                     echo "ERROR: distributed compiler response file could not be created" >&2
                     exit 1
@@ -437,14 +455,14 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
             # write in the state tree and moving it locally after `anywhere`
             # returns
             # makes final output publication atomic from the build's view.
-            compiler_staged_output="\$compiler_responses/output.\$\$"
+            compiler_staged_output="\$compiler_responses/output.\$compiler_job_tag"
             if ! compiler_create_shared_file "\$compiler_staged_output"; then
                 compiler_slot_release
                 trap - EXIT HUP INT TERM
                 echo "ERROR: staged distributed compiler output file could not be created" >&2
                 exit 1
             fi
-            compiler_host_report="\$compiler_responses/host.\$\$"
+            compiler_host_report="\$compiler_responses/host.\$compiler_job_tag"
             if ! compiler_create_shared_file "\$compiler_host_report"; then
                 compiler_slot_release
                 trap - EXIT HUP INT TERM
@@ -615,9 +633,9 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
             # Compile the object into peer-local /tmp, then copy the completed
             # file through the explicit home route. Streaming every object
             # write through remote VFS saturates the submitter and leaves peer
-            # CPUs idle. The submitter PID is unique for every simultaneously
-            # active wrapper on each possible selected system.
-            compiler_remote_output="/tmp/wos-distributed-staged.\$\$.output"
+            # CPUs idle. The atomically claimed job tag stays unique even when
+            # wrappers on different systems have the same node-local PID.
+            compiler_remote_output="/tmp/wos-distributed-staged.\$compiler_job_tag.output"
             # Install routing and one-shot balanced placement in one system
             # dispatch. WKI fragments large argv/policy contexts, so the
             # compiler no longer needs per-job response and route files.
@@ -990,11 +1008,15 @@ if [ "\${WOS_DISTRIBUTED_COMPILER:-0}" = "1" ] && [ "\$compile_only" -eq 1 ]; th
             echo "ERROR: distributed compiler scratch directories could not be created" >&2
             exit 1
         fi
-        # WOS mktemp currently races when many wrappers create directories at
-        # once. Each wrapper is a distinct process, so its PID provides a
-        # collision-free name without serializing preprocessing.
-        compiler_job_dir="\$compiler_responses/clang-job.\$\$"
-        if ! mkdir "\$compiler_job_dir" 2>/dev/null; then
+        # PIDs are node-local, so multiple distributed wrappers can have the
+        # same \$\$. Claim a bounded random suffix atomically in the shared
+        # response directory before creating private preprocessing state.
+        compiler_job_tag="\$(compiler_claim_job_tag "\$compiler_responses")" || compiler_job_tag=""
+        compiler_job_dir=""
+        if [ -n "\$compiler_job_tag" ]; then
+            compiler_job_dir="\$compiler_responses/clang-job.\$compiler_job_tag"
+        fi
+        if [ -n "\$compiler_job_dir" ] && ! mkdir "\$compiler_job_dir" 2>/dev/null; then
             compiler_job_dir=""
         fi
         trap compiler_slot_release EXIT HUP INT TERM
