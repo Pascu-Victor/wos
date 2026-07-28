@@ -293,15 +293,17 @@ constexpr size_t DIRTY_THROTTLE_RESUME_NUMERATOR = 3;
 constexpr size_t DIRTY_THROTTLE_RESUME_DENOMINATOR = 4;
 // Let clean cache grow beyond dirty limits, closer to Linux's page cache shape.
 // Bound the non-reclaim-integrated cache at a size that keeps its buffer, range
-// index, and LRU working sets practical across repeated large builds. Large
-// systems still retain enough dirty headroom to avoid forcing every few hundred
-// MiB of file creation through synchronous writeback.
+// index, and LRU working sets practical across repeated large builds. Start
+// asynchronous writeback well below the hard cache limit on large systems so
+// one workload does not leave the next workload to drain several GiB of dirty
+// state. The hard limit remains much higher than the background target, so
+// ordinary bursts still avoid synchronous writeback.
 constexpr size_t BUFFER_CACHE_MEMORY_NUMERATOR = 7;
 constexpr size_t BUFFER_CACHE_MEMORY_DENOMINATOR = 16;
 constexpr size_t DIRTY_TARGET_MEMORY_DIVISOR = 8;
-constexpr size_t DIRTY_TARGET_LARGE_MEMORY_DIVISOR = 4;
+constexpr size_t DIRTY_TARGET_LARGE_MEMORY_DIVISOR = 16;
 constexpr uint64_t DIRTY_TARGET_LARGE_MEMORY_THRESHOLD = uint64_t{8} * 1024 * 1024 * 1024;
-constexpr size_t BUFFER_CACHE_MAX_SIZE = size_t{8} * 1024 * 1024 * 1024;
+constexpr size_t BUFFER_CACHE_MAX_SIZE = size_t{4} * 1024 * 1024 * 1024;
 
 struct DirtyBdevState {
     dev::BlockDevice* bdev{};

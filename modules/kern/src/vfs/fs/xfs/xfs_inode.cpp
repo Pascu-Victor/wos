@@ -51,16 +51,16 @@ extern "C" auto __asan_region_is_poisoned(uintptr_t beg, size_t size) -> uintptr
 
 namespace {
 
-constexpr size_t ICACHE_BUCKETS = 16384;
+constexpr size_t ICACHE_BUCKETS = 65536;
 constexpr size_t ICACHE_HASH_MASK = ICACHE_BUCKETS - 1;
 static_assert((ICACHE_BUCKETS & (ICACHE_BUCKETS - 1)) == 0);
-// Keep the simple chained hash at a bounded average load.  Retaining hundreds
+// Keep the simple chained hash at a bounded average load. Retaining hundreds
 // of thousands of idle inodes makes every cache hit walk a long chain and also
-// grows the non-returning inode-object arenas to the high-water mark.  Four
-// idle entries per bucket still covers a substantial metadata working set
-// without making repeated large tree walks progressively more expensive.
-constexpr size_t ICACHE_IDLE_RETAIN_MIN = ICACHE_BUCKETS;
-constexpr size_t ICACHE_IDLE_RETAIN_MAX = ICACHE_BUCKETS * 4;
+// grows the non-returning inode-object arenas to the high-water mark. Preserve
+// the existing 16K-64K retained working set, but give its maximum size one
+// bucket per entry so repeated large tree walks do not settle at load factor 4.
+constexpr size_t ICACHE_IDLE_RETAIN_MIN = 16384;
+constexpr size_t ICACHE_IDLE_RETAIN_MAX = 65536;
 constexpr uint64_t ICACHE_IDLE_RETAIN_BYTES_PER_INODE = 256ULL * 1024ULL;
 constexpr size_t ICACHE_RECLAIM_BATCH = 256;
 constexpr size_t ICACHE_RECLAIM_BUCKET_BUDGET = 256;
@@ -1005,7 +1005,7 @@ auto xfs_selftest_inode_cache_reclaim_hysteresis() -> bool {
            icache_idle_retain_limit_for_total(ONE_GIB) == ICACHE_IDLE_RETAIN_MIN &&
            icache_idle_retain_limit_for_total(uint64_t{16} * ONE_GIB) == ICACHE_IDLE_RETAIN_MAX &&
            icache_idle_retain_limit_for_total(uint64_t{32} * ONE_GIB) == ICACHE_IDLE_RETAIN_MAX &&
-           ICACHE_IDLE_RETAIN_MAX / ICACHE_BUCKETS == 4 && icache_reclaim_trigger(RETAIN_LIMIT) == TRIGGER &&
+           ICACHE_IDLE_RETAIN_MAX / ICACHE_BUCKETS == 1 && icache_reclaim_trigger(RETAIN_LIMIT) == TRIGGER &&
            !icache_reclaim_needed(RETAIN_LIMIT, RETAIN_LIMIT) && !icache_reclaim_needed(TRIGGER, RETAIN_LIMIT) &&
            icache_reclaim_needed(TRIGGER + 1, RETAIN_LIMIT) && icache_reclaim_trigger(SIZE_MAX) == SIZE_MAX &&
            ICACHE_RECLAIM_BUCKET_BUDGET < ICACHE_BUCKETS;
