@@ -201,34 +201,88 @@ for tool in "${WOS_LLVM_REQUIRED_TOOLS[@]}"; do
     WOS_LLVM_BIN_OUTPUTS+=("bin/$tool")
 done
 
-# CMake's object-order targets contain the generated TableGen/VCS inputs for
-# each reachable library without compiling that library's objects. Complete
-# those edges before taking the peer snapshot; the broad llvm-headers and
-# clang-tablegen-targets umbrellas do not cover library-private files such as
-# GenVT.inc, TargetLibraryInfo.inc, AttrDocTable.inc, or VCSVersion.inc.
-WOS_LLVM_GENERATOR_TARGETS=()
-WOS_LLVM_GENERATOR_TARGETS_FILE="$(mktemp "$CLANG_BUILD/wos-generator-targets.XXXXXX")"
-cleanup_generator_targets() {
-    rm -f -- "$WOS_LLVM_GENERATOR_TARGETS_FILE"
+# CMake's object-order targets expose the generated TableGen/VCS inputs for
+# each reachable library. Do not build those phony targets themselves: their
+# transitive order-only edges include the library objects, which would start
+# the distributed compile before CLANG_BUILD has been staged for the peers.
+# Query their direct inputs and build only the generated prerequisites.
+WOS_LLVM_ORDER_TARGETS=()
+WOS_LLVM_GENERATOR_INPUTS=()
+WOS_LLVM_GRAPH_INPUTS_FILE="$(mktemp "$CLANG_BUILD/wos-generator-inputs.XXXXXX")"
+cleanup_generator_inputs() {
+    rm -f -- "$WOS_LLVM_GRAPH_INPUTS_FILE"
 }
-trap cleanup_generator_targets EXIT HUP INT TERM
+trap cleanup_generator_inputs EXIT HUP INT TERM
 ninja -C "$CLANG_BUILD" -t graph "${WOS_LLVM_BIN_OUTPUTS[@]}" |
     sed -n 's/^"[^"]*" \[label="\(cmake_object_order_depends_target_[^"]*\)"\]$/\1/p' |
-    sort -u > "$WOS_LLVM_GENERATOR_TARGETS_FILE"
-while IFS= read -r generator_target; do
-    [ -n "$generator_target" ] || continue
-    WOS_LLVM_GENERATOR_TARGETS+=("$generator_target")
-done < "$WOS_LLVM_GENERATOR_TARGETS_FILE"
-cleanup_generator_targets
-trap - EXIT HUP INT TERM
-if [ "${#WOS_LLVM_GENERATOR_TARGETS[@]}" -eq 0 ]; then
+    sort -u > "$WOS_LLVM_GRAPH_INPUTS_FILE"
+while IFS= read -r order_target; do
+    [ -n "$order_target" ] || continue
+    WOS_LLVM_ORDER_TARGETS+=("$order_target")
+done < "$WOS_LLVM_GRAPH_INPUTS_FILE"
+if [ "${#WOS_LLVM_ORDER_TARGETS[@]}" -eq 0 ]; then
     echo "ERROR: native Clang graph exposed no generator-order targets" >&2
+    exit 1
+fi
+
+ninja -C "$CLANG_BUILD" -t query "${WOS_LLVM_ORDER_TARGETS[@]}" |
+    awk '
+        /^  input:/ {
+            in_inputs = 1
+            next
+        }
+        /^  outputs:/ {
+            in_inputs = 0
+            next
+        }
+        in_inputs && /^    / {
+            dependency = $0
+            sub(/^    (\|\|? )?/, "", dependency)
+            if (dependency != "." &&
+                dependency != "tools/lld/Common/VCSVersion.inc" &&
+                dependency !~ /^cmake_object_order_depends_target_/) {
+                print dependency
+            }
+        }
+    ' |
+    sort -u > "$WOS_LLVM_GRAPH_INPUTS_FILE"
+while IFS= read -r generator_input; do
+    [ -n "$generator_input" ] || continue
+    WOS_LLVM_GENERATOR_INPUTS+=("$generator_input")
+done < "$WOS_LLVM_GRAPH_INPUTS_FILE"
+cleanup_generator_inputs
+trap - EXIT HUP INT TERM
+if [ "${#WOS_LLVM_GENERATOR_INPUTS[@]}" -eq 0 ]; then
+    echo "ERROR: native Clang graph exposed no generated inputs" >&2
+    exit 1
+fi
+
+# lld's VCSVersion custom command has every linked LLVM library as an
+# order-only dependency. Run the same CMake generator directly so asking Ninja
+# for this one header cannot compile the entire library graph before staging.
+WOS_LLD_VCS_VERSION="$CLANG_BUILD/tools/lld/Common/VCSVersion.inc"
+mkdir -p "$(dirname "$WOS_LLD_VCS_VERSION")"
+"$WOS_CMAKE_COMMAND" \
+    -DNAMES=LLD \
+    "-DLLD_SOURCE_DIR=$B/src/llvm-project/lld" \
+    "-DHEADER_FILE=$WOS_LLD_VCS_VERSION" \
+    -DLLVM_FORCE_VC_REVISION= \
+    -DLLVM_FORCE_VC_REPOSITORY= \
+    -P "$LLVM_SRC/cmake/modules/GenerateVersionFromVCS.cmake"
+
+# Fail closed if a future LLVM/CMake graph hides compilation under one of the
+# selected generator inputs. The build root must be staged first in that case.
+if ninja -C "$CLANG_BUILD" -t commands \
+    llvm-headers clang-tablegen-targets ELFOptionsTableGen \
+    "${WOS_LLVM_GENERATOR_INPUTS[@]}" |
+    grep -E '(^|[[:space:]])-c([[:space:]]|$)' > /dev/null; then
+    echo "ERROR: native Clang generator prerequisites include object compilation" >&2
     exit 1
 fi
 
 ninja -C "$CLANG_BUILD" -j"$WOS_LLVM_NINJA_JOBS" \
     llvm-headers clang-tablegen-targets ELFOptionsTableGen \
-    "${WOS_LLVM_GENERATOR_TARGETS[@]}"
+    "${WOS_LLVM_GENERATOR_INPUTS[@]}"
 wos_stage_distributed_build_roots \
     "$WORKSPACE_ROOT" "$LLVM_SRC" \
     "$CLANG_BUILD" "$TARGET_SYSROOT/include"

@@ -587,7 +587,11 @@ def test_wos_toolchain_stages_configured_build_roots() -> None:
         "build_clang_for_wos.sh": [
             'ninja -C "$CLANG_BUILD" -t graph "${WOS_LLVM_BIN_OUTPUTS[@]}"',
             "cmake_object_order_depends_target_",
-            '"${WOS_LLVM_GENERATOR_TARGETS[@]}"',
+            'ninja -C "$CLANG_BUILD" -t query "${WOS_LLVM_ORDER_TARGETS[@]}"',
+            'dependency != "tools/lld/Common/VCSVersion.inc"',
+            '"-DHEADER_FILE=$WOS_LLD_VCS_VERSION"',
+            'grep -E \'(^|[[:space:]])-c([[:space:]]|$)\' > /dev/null',
+            '"${WOS_LLVM_GENERATOR_INPUTS[@]}"',
         ],
     }
     for name, tokens in generator_tokens.items():
@@ -598,6 +602,12 @@ def test_wos_toolchain_stages_configured_build_roots() -> None:
             [tokens[-1], "wos_stage_distributed_build_roots"],
             f"{name} generators precede staging",
         )
+
+    clang_source = (ROOT / "scripts" / "build" / "build_clang_for_wos.sh").read_text()
+    if '"${WOS_LLVM_ORDER_TARGETS[@]}"' in clang_source[
+        clang_source.find('ninja -C "$CLANG_BUILD" -j"$WOS_LLVM_NINJA_JOBS"') :
+    ]:
+        fail("native Clang pre-staging Ninja build must not request object-order targets")
 
 
 def test_wos_bootstrap_repairs_only_link_output_mode() -> None:
