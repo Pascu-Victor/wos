@@ -362,6 +362,7 @@ auto vfs_selftest_faccessat_f_ok_skips_known_non_symlink_probe() -> bool;
 auto vfs_selftest_faccessat_flags() -> bool;
 auto vfs_selftest_mkdirat_dirfd_creates_relative_directory() -> bool;
 auto vfs_selftest_readlinkat_dirfd_reads_relative_symlink() -> bool;
+auto vfs_selftest_readlink_follows_intermediate_symlink() -> bool;
 auto vfs_selftest_symlinkat_dirfd_creates_relative_symlink() -> bool;
 auto vfs_selftest_linkat_dirfd_creates_relative_hardlink() -> bool;
 auto vfs_selftest_chdir_common_local_fast_path_uses_metadata_cache() -> bool;

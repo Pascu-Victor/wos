@@ -119,6 +119,8 @@ KTEST(VFS, MkdiratDirfdCreatesRelativeDirectory) { KEXPECT_TRUE(ker::vfs::vfs_se
 
 KTEST(VFS, ReadlinkatDirfdReadsRelativeSymlink) { KEXPECT_TRUE(ker::vfs::vfs_selftest_readlinkat_dirfd_reads_relative_symlink()); }
 
+KTEST(VFS, ReadlinkFollowsIntermediateSymlink) { KEXPECT_TRUE(ker::vfs::vfs_selftest_readlink_follows_intermediate_symlink()); }
+
 KTEST(VFS, SymlinkatDirfdCreatesRelativeSymlink) { KEXPECT_TRUE(ker::vfs::vfs_selftest_symlinkat_dirfd_creates_relative_symlink()); }
 
 KTEST(VFS, LinkatDirfdCreatesRelativeHardlink) { KEXPECT_TRUE(ker::vfs::vfs_selftest_linkat_dirfd_creates_relative_hardlink()); }

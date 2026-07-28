@@ -9628,12 +9628,42 @@ void vfs_prefill_file_stat_snapshot(File* file, const Stat& statbuf) {
     file->stat_cache_valid = true;
 }
 
-auto vfs_readlink_resolved(const char* path, char* buf, size_t bufsize) -> ssize_t {
+namespace {
+auto vfs_readlink_after_resolving_parent_symlinks(const char* path, char* buf, size_t bufsize, bool apply_task_policy,
+                                                  const ker::mod::sched::task::Task* task_policy, size_t known_path_len = UNKNOWN_PATH_LEN,
+                                                  uint64_t known_path_hash = UNKNOWN_PATH_HASH) -> ssize_t {
     if (path == nullptr || buf == nullptr || bufsize == 0) {
         return -EINVAL;
     }
 
-    return readlink_resolved(path, buf, bufsize);
+    size_t const PATH_LEN = known_path_len != UNKNOWN_PATH_LEN ? known_path_len : std::strlen(path);
+    if (PATH_LEN == 0 || PATH_LEN >= MAX_PATH_LEN) {
+        return PATH_LEN == 0 ? -ENOENT : -ENAMETOOLONG;
+    }
+
+    // readlink(2) leaves the final component untouched, but every directory
+    // component leading to it still follows normal symlink traversal. Passing
+    // an unresolved parent to XFS yields ENOTDIR and, more importantly, makes
+    // that backend-only result look like a logical-path failure to the shared
+    // metadata cache.
+    std::array<char, MAX_PATH_LEN> resolved __attribute__((uninitialized));  // NOLINT(cppcoreguidelines-pro-type-member-init)
+    size_t resolved_len = PATH_LEN;
+    int const RESOLVE_RET =
+        resolve_symlinks(path, resolved.data(), resolved.size(), apply_task_policy, false, PATH_LEN, &resolved_len, nullptr, task_policy);
+    if (RESOLVE_RET < 0) {
+        return RESOLVE_RET;
+    }
+
+    uint64_t const RESOLVED_HASH = known_path_hash != UNKNOWN_PATH_HASH && known_path_len != UNKNOWN_PATH_LEN &&
+                                           resolved_len == known_path_len && std::memcmp(resolved.data(), path, resolved_len + 1) == 0
+                                       ? known_path_hash
+                                       : UNKNOWN_PATH_HASH;
+    return readlink_resolved(resolved.data(), buf, bufsize, resolved_len, RESOLVED_HASH);
+}
+}  // namespace
+
+auto vfs_readlink_resolved(const char* path, char* buf, size_t bufsize) -> ssize_t {
+    return vfs_readlink_after_resolving_parent_symlinks(path, buf, bufsize, false, nullptr);
 }
 
 auto vfs_readlink(const char* path, char* buf, size_t bufsize) -> ssize_t {
@@ -9661,7 +9691,7 @@ auto vfs_readlink(const char* path, char* buf, size_t bufsize) -> ssize_t {
         std::array<char, MAX_PATH_LEN> resolved{};
         size_t resolved_len = abs_path_len;
         int const RESOLVE_RET =
-            resolve_symlinks(abs_path.data(), resolved.data(), resolved.size(), true, true, abs_path_len, &resolved_len);
+            resolve_symlinks(abs_path.data(), resolved.data(), resolved.size(), true, true, abs_path_len, &resolved_len, nullptr, task);
         if (RESOLVE_RET < 0) {
             return RESOLVE_RET;
         }
@@ -9682,7 +9712,7 @@ auto vfs_readlink(const char* path, char* buf, size_t bufsize) -> ssize_t {
         return readlink_resolved(resolved.data(), buf, bufsize, resolved_len, RESOLVED_HASH);
     }
 
-    return readlink_resolved(abs_path.data(), buf, bufsize, abs_path_len, abs_path_hash);
+    return vfs_readlink_after_resolving_parent_symlinks(abs_path.data(), buf, bufsize, true, task, abs_path_len, abs_path_hash);
 }
 
 auto vfs_readlinkat(ker::mod::sched::task::Task* task, int dirfd, const char* pathname, char* buf, size_t bufsize) -> ssize_t {
@@ -9710,7 +9740,7 @@ auto vfs_readlinkat(ker::mod::sched::task::Task* task, int dirfd, const char* pa
         std::array<char, MAX_PATH_LEN> resolved{};
         size_t resolved_len = abs_path_len;
         int const RESOLVE_RET =
-            resolve_symlinks(abs_path.data(), resolved.data(), resolved.size(), true, true, abs_path_len, &resolved_len);
+            resolve_symlinks(abs_path.data(), resolved.data(), resolved.size(), true, true, abs_path_len, &resolved_len, nullptr, task);
         if (RESOLVE_RET < 0) {
             return RESOLVE_RET;
         }
@@ -9731,7 +9761,7 @@ auto vfs_readlinkat(ker::mod::sched::task::Task* task, int dirfd, const char* pa
         return readlink_resolved(resolved.data(), buf, bufsize, resolved_len, RESOLVED_HASH);
     }
 
-    return readlink_resolved(abs_path.data(), buf, bufsize, abs_path_len, abs_path_hash);
+    return vfs_readlink_after_resolving_parent_symlinks(abs_path.data(), buf, bufsize, true, task, abs_path_len, abs_path_hash);
 }
 
 auto vfs_realpath(const char* path, char* buf, size_t bufsize, size_t* len_out) -> int {
@@ -17676,6 +17706,81 @@ auto vfs_selftest_readlinkat_dirfd_reads_relative_symlink() -> bool {
     ok = (vfs_unlink(ABS_LINK_PATH) == 0) && ok;
     ok = (vfs_rmdir(DIR_PATH) == 0) && ok;
     ok = task.fd_table.empty() && ok;
+    return ok;
+}
+
+auto vfs_selftest_readlink_follows_intermediate_symlink() -> bool {
+    constexpr const char* BASE_PATH = "/ktest_readlink_intermediate";
+    constexpr const char* REAL_DIR_PATH = "/ktest_readlink_intermediate/real";
+    constexpr const char* TARGET_PATH = "/ktest_readlink_intermediate/real/target";
+    constexpr const char* INNER_LINK_PATH = "/ktest_readlink_intermediate/real/link";
+    constexpr const char* ALIAS_PATH = "/ktest_readlink_intermediate/alias";
+    constexpr const char* ALIAS_TARGET_PATH = "/ktest_readlink_intermediate/alias/target";
+    constexpr const char* ALIAS_LINK_PATH = "/ktest_readlink_intermediate/alias/link";
+    constexpr const char* INNER_TARGET = "target";
+
+    vfs_unlink(INNER_LINK_PATH);
+    vfs_unlink(TARGET_PATH);
+    vfs_unlink(ALIAS_PATH);
+    vfs_rmdir(REAL_DIR_PATH);
+    vfs_rmdir(BASE_PATH);
+
+    bool ok = vfs_mkdir(BASE_PATH, 0755) == 0 && vfs_mkdir(REAL_DIR_PATH, 0755) == 0;
+
+    auto* target = ok ? vfs_open_file(TARGET_PATH, ker::vfs::O_CREAT | 1, 0644) : nullptr;
+    ok = ok && target != nullptr;
+    if (target != nullptr) {
+        vfs_put_file(target);
+    }
+    ok = ok && vfs_symlink(INNER_TARGET, INNER_LINK_PATH) == 0;
+    ok = ok && vfs_symlink("real", ALIAS_PATH) == 0;
+
+    std::array<char, 32> buf{};
+    VfsCachePerfSnapshot before_nested_readlink{};
+    VfsCachePerfSnapshot after_nested_readlink{};
+    if (ok) {
+        vfs_get_cache_perf_snapshot(before_nested_readlink);
+        ssize_t const READ = vfs_readlink(ALIAS_LINK_PATH, buf.data(), buf.size());
+        vfs_get_cache_perf_snapshot(after_nested_readlink);
+        ok = READ == static_cast<ssize_t>(std::strlen(INNER_TARGET)) &&
+             std::memcmp(buf.data(), INNER_TARGET, static_cast<size_t>(READ)) == 0 &&
+             after_nested_readlink.symlink_hits > before_nested_readlink.symlink_hits;
+    }
+    if (ok) {
+        buf.fill(0);
+        ok = vfs_readlink(ALIAS_TARGET_PATH, buf.data(), buf.size()) == -EINVAL;
+    }
+
+    Stat st{};
+    ok = ok && vfs_stat(ALIAS_LINK_PATH, &st) == 0 && (st.st_mode & static_cast<mode_t>(S_IFMT)) == static_cast<mode_t>(S_IFREG);
+    auto* opened_through_alias = ok ? vfs_open_file(ALIAS_LINK_PATH, 0, 0) : nullptr;
+    ok = ok && opened_through_alias != nullptr;
+    if (opened_through_alias != nullptr) {
+        vfs_put_file(opened_through_alias);
+    }
+
+    ker::mod::sched::task::Task task{};
+    bool const TASK_PATHS_OK = vfs_selftest_initialize_task_paths(task);
+    auto* base_dir = vfs_open_file(BASE_PATH, 0, 0);
+    int const DIRFD = base_dir != nullptr ? vfs_alloc_fd(&task, base_dir) : -1;
+    ok = ok && TASK_PATHS_OK && DIRFD >= 0;
+    if (DIRFD >= 0) {
+        buf.fill(0);
+        ssize_t const READ = vfs_readlinkat(&task, DIRFD, "alias/link", buf.data(), buf.size());
+        ok = ok && READ == static_cast<ssize_t>(std::strlen(INNER_TARGET)) &&
+             std::memcmp(buf.data(), INNER_TARGET, static_cast<size_t>(READ)) == 0;
+        ok = (vfs_release_fd(&task, DIRFD) == 0) && ok;
+    }
+    if (base_dir != nullptr) {
+        vfs_put_file(base_dir);
+    }
+    ok = task.fd_table.empty() && ok;
+
+    ok = (vfs_unlink(INNER_LINK_PATH) == 0) && ok;
+    ok = (vfs_unlink(TARGET_PATH) == 0) && ok;
+    ok = (vfs_unlink(ALIAS_PATH) == 0) && ok;
+    ok = (vfs_rmdir(REAL_DIR_PATH) == 0) && ok;
+    ok = (vfs_rmdir(BASE_PATH) == 0) && ok;
     return ok;
 }
 
