@@ -394,6 +394,7 @@ def test_balanced_placement_scores_all_healthy_systems() -> None:
             "std::max<uint64_t>(KNOWN_ACTIVE, rl.balanced_assignments)",
             "peer->state != PeerState::CONNECTED",
             "balanced_candidate_is_starved",
+            "candidate.capacity",
             "eligible_capacity",
             "balanced_last_assignment_seq",
             "g_balanced_local_last_assignment_seq",

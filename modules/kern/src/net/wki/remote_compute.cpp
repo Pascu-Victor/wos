@@ -3800,8 +3800,11 @@ auto balanced_placement_score(uint16_t load_pct, uint16_t num_cpus, uint16_t fre
     return std::max<uint64_t>(load_pct, INFLIGHT_PRESSURE) + balanced_memory_pressure(free_mem);
 }
 
-auto balanced_candidate_is_starved(uint64_t assignment_seq, uint64_t last_assignment_seq, uint64_t eligible_capacity) -> bool {
-    return assignment_seq >= last_assignment_seq && assignment_seq - last_assignment_seq >= std::max<uint64_t>(eligible_capacity, 1);
+auto balanced_candidate_is_starved(uint64_t assignment_seq, uint64_t last_assignment_seq, uint64_t eligible_capacity,
+                                   uint64_t candidate_capacity) -> bool {
+    uint64_t const CAPACITY = std::max<uint64_t>(candidate_capacity, 1);
+    uint64_t const STARVATION_WINDOW = std::max<uint64_t>((eligible_capacity + CAPACITY - 1) / CAPACITY, 1);
+    return assignment_seq >= last_assignment_seq && assignment_seq - last_assignment_seq >= STARVATION_WINDOW;
 }
 
 // s_compute_lock must be held by caller. WKI_NODE_INVALID denotes the local
@@ -3825,6 +3828,7 @@ auto wki_balanced_node(uint16_t local_load, uint16_t local_cpus, uint16_t local_
         RemoteNodeLoad* remote_load = nullptr;
         uint64_t score = UINT64_MAX;
         uint64_t last_assignment_seq = 0;
+        uint64_t capacity = 1;
     };
     std::array<Candidate, WKI_MAX_PEERS + 1> eligible = {};
     size_t eligible_count = 0;
@@ -3836,6 +3840,7 @@ auto wki_balanced_node(uint16_t local_load, uint16_t local_cpus, uint16_t local_
             .remote_load = nullptr,
             .score = balanced_placement_score(local_load, local_cpus, local_free_mem, LOCAL_PRESSURE),
             .last_assignment_seq = g_balanced_local_last_assignment_seq,
+            .capacity = std::max<uint16_t>(local_cpus, 1),
         };
         eligible_capacity += std::max<uint16_t>(local_cpus, 1);
     }
@@ -3858,6 +3863,7 @@ auto wki_balanced_node(uint16_t local_load, uint16_t local_cpus, uint16_t local_
                 .remote_load = &rl,
                 .score = SCORE,
                 .last_assignment_seq = rl.balanced_last_assignment_seq,
+                .capacity = std::max<uint16_t>(rl.num_cpus, 1),
             };
             eligible_capacity += std::max<uint16_t>(rl.num_cpus, 1);
         }
@@ -3872,7 +3878,8 @@ auto wki_balanced_node(uint16_t local_load, uint16_t local_cpus, uint16_t local_
     uint64_t oldest_age = 0;
     for (size_t i = 0; i < eligible_count; ++i) {
         Candidate const& candidate = eligible.at(i);
-        if (!balanced_candidate_is_starved(g_balanced_assignment_seq, candidate.last_assignment_seq, eligible_capacity)) {
+        if (!balanced_candidate_is_starved(g_balanced_assignment_seq, candidate.last_assignment_seq, eligible_capacity,
+                                           candidate.capacity)) {
             continue;
         }
         uint64_t const AGE = g_balanced_assignment_seq - candidate.last_assignment_seq;
@@ -4687,8 +4694,10 @@ auto wki_remote_compute_selftest_balanced_score_accounts_for_capacity() -> bool 
     return ONE_ACTIVE > IDLE && FOUR_CPU_ACTIVE > ONE_ACTIVE && BUSY_WITH_SMALL_DEBT == OBSERVED_BUSY && MEMORY_PRESSURE > IDLE &&
            SATURATED_AT_CAPACITY == 1000 && SATURATED_AT_HEADROOM > SATURATED_AT_CAPACITY &&
            SATURATED_BEYOND_HEADROOM > SATURATED_AT_HEADROOM && SEVEN_CPU_BELOW_HEADROOM == 1000 &&
-           SEVEN_CPU_AT_HEADROOM > SEVEN_CPU_BELOW_HEADROOM && balanced_candidate_is_starved(36, 0, 36) &&
-           !balanced_candidate_is_starved(35, 0, 36) && balanced_memory_eligible(WKI_BALANCED_FREE_MEM_RESERVE) &&
+           SEVEN_CPU_AT_HEADROOM > SEVEN_CPU_BELOW_HEADROOM && balanced_candidate_is_starved(4, 0, 28, 7) &&
+           !balanced_candidate_is_starved(3, 0, 28, 7) && balanced_candidate_is_starved(28, 0, 28, 1) &&
+           !balanced_candidate_is_starved(27, 0, 28, 1) && balanced_candidate_is_starved(2, 0, 28, 27) &&
+           !balanced_candidate_is_starved(1, 0, 28, 27) && balanced_memory_eligible(WKI_BALANCED_FREE_MEM_RESERVE) &&
            !balanced_memory_eligible(WKI_BALANCED_FREE_MEM_RESERVE - 1);
 }
 
