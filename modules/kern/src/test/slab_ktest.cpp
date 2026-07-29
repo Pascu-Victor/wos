@@ -133,3 +133,58 @@ KTEST(Slab, SlabExpansion) {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Reuse holes in a long retained ownership chain
+// ---------------------------------------------------------------------------
+
+KTEST(Slab, ReuseNonfullSlabsAcrossLongChain) {
+    // The 0x300 class is a hot class in long-running filesystem and process
+    // workloads. Grow enough slabs that a head-to-tail scan would be material,
+    // then create holes throughout the retained chain and require the non-full
+    // list to service another allocation wave.
+    constexpr int N = 512;
+    constexpr int REPLACEMENTS = N / 2;
+    // NOLINTNEXTLINE(misc-const-correctness)
+    void* ptrs[N] = {};
+    // NOLINTNEXTLINE(misc-const-correctness)
+    void* replacements[REPLACEMENTS] = {};
+
+    for (int i = 0; i < N; ++i) {
+        ptrs[i] = km::malloc(0x300);
+        if (KEXPECT_NE(ptrs[i], nullptr)) {
+            static_cast<uint8_t*>(ptrs[i])[0] = static_cast<uint8_t>(i);
+        }
+    }
+
+    for (int i = 0; i < N; i += 2) {
+        if (ptrs[i] != nullptr) {
+            km::free(ptrs[i]);
+            ptrs[i] = nullptr;
+        }
+    }
+
+    for (int i = 0; i < REPLACEMENTS; ++i) {
+        replacements[i] = km::malloc(0x300);
+        if (KEXPECT_NE(replacements[i], nullptr)) {
+            static_cast<uint8_t*>(replacements[i])[0] = static_cast<uint8_t>(i ^ 0xA5);
+        }
+    }
+
+    for (int i = 1; i < N; i += 2) {
+        if (ptrs[i] != nullptr) {
+            KEXPECT_EQ(static_cast<uint8_t*>(ptrs[i])[0], static_cast<uint8_t>(i));
+        }
+    }
+
+    for (void* ptr : ptrs) {
+        if (ptr != nullptr) {
+            km::free(ptr);
+        }
+    }
+    for (void* ptr : replacements) {
+        if (ptr != nullptr) {
+            km::free(ptr);
+        }
+    }
+}

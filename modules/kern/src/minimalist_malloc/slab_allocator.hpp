@@ -25,10 +25,15 @@ struct SlabHeader {
     size_t next_fit_block;
     Slab<slab_size, memory_size>* prev;
     Slab<slab_size, memory_size>* next;
+    Slab<slab_size, memory_size>* nonfull_prev;
+    Slab<slab_size, memory_size>* nonfull_next;
+    bool on_nonfull_list;
     Bitmap<max_blocks> mem_map;
+#ifdef WOS_KMALLOC_DEBUG_INFO
     // Diagnostic tracking per block: last caller address that freed the block and free count
     uintptr_t* last_free_caller;
     unsigned int* free_count;
+#endif
 };
 
 template <size_t size>
@@ -54,11 +59,17 @@ class Slab {
 
     // Static spinlock shared across all slabs of the same size for thread safety
     static inline ker::mod::sys::Spinlock slab_lock;
+    // Slabs stay on the ownership chain for diagnostics and safe magazine
+    // reuse, but allocation must not scan that ever-growing chain. Keep a
+    // separate intrusive list containing only slabs with reusable blocks.
+    static inline Slab* nonfull_head;
+    static inline Slab* ownership_tail;
 
     auto is_address_in_slab(void* address) -> bool;
     auto alloc_in_current_slab(size_t block_index) -> void*;
-    auto alloc_in_new_slab() -> void*;
     void free_from_current_slab(size_t block_index);
+    void link_nonfull_unlocked();
+    void unlink_nonfull_unlocked();
     auto request_untracked_memory_from_os(size_t size) -> void*;
     auto request_memory_from_os(size_t size) -> void*;
     auto free_memory_to_os(void* address, size_t size) -> void;
@@ -92,52 +103,53 @@ void Slab<slab_size, memory_size>::init(Slab* prev) {
     header.size = slab_size;
     header.prev = prev;
     header.next = nullptr;
+    header.nonfull_prev = nullptr;
+    header.nonfull_next = nullptr;
+    header.on_nonfull_list = false;
     header.free_blocks = MAX_BLOCKS;
     header.next_fit_block = 0;
     header.mem_map.init();
+#ifdef WOS_KMALLOC_DEBUG_INFO
     // lazily allocate diagnostic arrays to avoid blowing up header size
     header.last_free_caller = nullptr;
     header.free_count = nullptr;
     // allocate arrays on first use to reduce memory overhead
     // (done below if needed)
+#endif
+    if (prev == nullptr) {
+        nonfull_head = this;
+        ownership_tail = this;
+        header.on_nonfull_list = true;
+    } else {
+        link_nonfull_unlocked();
+    }
 }
 
 template <size_t slab_size, size_t memory_size>
 auto Slab<slab_size, memory_size>::alloc_unlocked() -> void* {
-    Slab* slab = this;
-    while (slab != nullptr) {
-        if (slab->header.magic != MAGIC || slab->header.size != slab_size) {
-            ker::mod::dbg::log("slab: corrupt header slab=%p magic=0x%x size=%u expected_size=%zu free_blocks=%zu prev=%p next=%p", slab,
-                               slab->header.magic, slab->header.size, slab_size, slab->header.free_blocks, slab->header.prev,
-                               slab->header.next);
-            ker::mod::dbg::panic_handler("slab: corrupt slab header");
-        }
-
-        auto block_index = static_cast<size_t>(-1);
-        if (slab->header.free_blocks) {
-            block_index = slab->header.mem_map.find_unused(slab->header.next_fit_block);
-            if (BITMAP_NO_BITS_LEFT != block_index) {
-                return slab->alloc_in_current_slab(block_index);
-            }
-        }
-
-        if (slab->header.next == nullptr) {
-            return nullptr;
-        }
-
-        // Validate before following the pointer — misaligned means page-reuse UAF.
-        auto next_addr = reinterpret_cast<uintptr_t>(slab->header.next);
-        const bool INVALID_DATA = (next_addr & 0xfULL) != 0 || ((next_addr < 0xffff800000000000ULL || next_addr >= 0xffff900000000000ULL) &&
-                                                                (next_addr < 0xffffffff80000000ULL || next_addr >= 0xffffffffc0000000ULL));
-        if (INVALID_DATA) {
-            ker::mod::dbg::log("slab UAF: header.next=0x%llx slab=%p free_blocks=%zu magic=0x%x size=%u",
-                               static_cast<unsigned long long>(next_addr), slab, slab->header.free_blocks, slab->header.magic,
-                               slab->header.size);
-            ker::mod::dbg::panic_handler("slab: corrupt header.next — freed slab page reused");
-        }
-        slab = slab->header.next;
+    Slab* slab = nonfull_head;
+    if (slab == nullptr) {
+        return nullptr;
     }
-    return nullptr;
+
+    if (slab->header.magic != MAGIC || slab->header.size != slab_size || !slab->header.on_nonfull_list || slab->header.free_blocks == 0) {
+        ker::mod::dbg::log(
+            "slab: corrupt non-full head slab=%p magic=0x%x size=%u expected_size=%zu free_blocks=%zu listed=%u prev=%p next=%p", slab,
+            slab->header.magic, slab->header.size, slab_size, slab->header.free_blocks, static_cast<unsigned>(slab->header.on_nonfull_list),
+            slab->header.prev, slab->header.next);
+        ker::mod::dbg::panic_handler("slab: corrupt non-full list");
+    }
+
+    size_t block_index = slab->header.mem_map.find_unused(slab->header.next_fit_block);
+    if (block_index == BITMAP_NO_BITS_LEFT && slab->header.next_fit_block != 0) {
+        block_index = slab->header.mem_map.find_unused();
+    }
+    if (block_index == BITMAP_NO_BITS_LEFT) {
+        ker::mod::dbg::log("slab: non-full slab has no reusable block slab=%p size=%u free_blocks=%zu", slab, slab->header.size,
+                           slab->header.free_blocks);
+        ker::mod::dbg::panic_handler("slab: inconsistent free-block bitmap");
+    }
+    return slab->alloc_in_current_slab(block_index);
 }
 
 template <size_t slab_size, size_t memory_size>
@@ -165,23 +177,18 @@ auto Slab<slab_size, memory_size>::alloc() -> void* {
         return result;
     }
 
-    Slab* tail = this;
-    while (tail->header.next != nullptr) {
-        auto next_addr = reinterpret_cast<uintptr_t>(tail->header.next);
-        const bool INVALID_DATA = (next_addr & 0xfULL) != 0 || ((next_addr < 0xffff800000000000ULL || next_addr >= 0xffff900000000000ULL) &&
-                                                                (next_addr < 0xffffffff80000000ULL || next_addr >= 0xffffffffc0000000ULL));
-        if (INVALID_DATA) {
-            ker::mod::dbg::log("slab UAF: header.next=0x%llx slab=%p free_blocks=%zu magic=0x%x size=%u",
-                               static_cast<unsigned long long>(next_addr), tail, tail->header.free_blocks, tail->header.magic,
-                               tail->header.size);
-            ker::mod::dbg::panic_handler("slab: corrupt header.next — freed slab page reused");
-        }
-        tail = tail->header.next;
+    Slab* tail = ownership_tail;
+    if (tail == nullptr || tail->header.magic != MAGIC || tail->header.size != slab_size || tail->header.next != nullptr) {
+        ker::mod::dbg::log("slab: corrupt ownership tail tail=%p magic=0x%x size=%u expected_size=%zu next=%p", tail,
+                           tail != nullptr ? tail->header.magic : 0, tail != nullptr ? tail->header.size : 0, slab_size,
+                           tail != nullptr ? tail->header.next : nullptr);
+        ker::mod::dbg::panic_handler("slab: corrupt ownership tail");
     }
 
     new_slab->init(tail);
     mark_memory_as_slab(new_slab);
     tail->header.next = new_slab;
+    ownership_tail = new_slab;
     result = new_slab->alloc_in_current_slab(0);
     slab_lock.unlock();
     return result;
@@ -225,10 +232,12 @@ auto Slab<slab_size, memory_size>::free_unlocked(void* address) -> void {
                 ker::mod::dbg::log("  block[%d]=%p slab_ptr=%p used=%d prefix=0x%x", static_cast<unsigned long>(i), &blocks.at(i).data,
                                    reinterpret_cast<void*>(blocks.at(i).slab_ptr), static_cast<int>(header.mem_map.check_used(i)),
                                    static_cast<unsigned long long>(prefix));
+#ifdef WOS_KMALLOC_DEBUG_INFO
                 if (header.free_count != nullptr && header.last_free_caller != nullptr && header.free_count[i] > 0) {
                     ker::mod::dbg::log("    last_free: caller=%p count=%d", reinterpret_cast<void*>(header.last_free_caller[i]),
                                        static_cast<int>(header.free_count[i]));
                 }
+#endif
             }
             // Search neighboring slabs in the chain for this address
             Slab* s = header.prev;
@@ -269,6 +278,37 @@ auto Slab<slab_size, memory_size>::is_address_in_slab(void* address) -> bool {
 }
 
 template <size_t slab_size, size_t memory_size>
+void Slab<slab_size, memory_size>::link_nonfull_unlocked() {
+    assert(!header.on_nonfull_list);
+    assert(header.free_blocks > 0);
+
+    header.nonfull_prev = nullptr;
+    header.nonfull_next = nonfull_head;
+    if (nonfull_head != nullptr) {
+        nonfull_head->header.nonfull_prev = this;
+    }
+    nonfull_head = this;
+    header.on_nonfull_list = true;
+}
+
+template <size_t slab_size, size_t memory_size>
+void Slab<slab_size, memory_size>::unlink_nonfull_unlocked() {
+    assert(header.on_nonfull_list);
+
+    if (header.nonfull_prev != nullptr) {
+        header.nonfull_prev->header.nonfull_next = header.nonfull_next;
+    } else {
+        nonfull_head = header.nonfull_next;
+    }
+    if (header.nonfull_next != nullptr) {
+        header.nonfull_next->header.nonfull_prev = header.nonfull_prev;
+    }
+    header.nonfull_prev = nullptr;
+    header.nonfull_next = nullptr;
+    header.on_nonfull_list = false;
+}
+
+template <size_t slab_size, size_t memory_size>
 auto Slab<slab_size, memory_size>::collect_stats(uint64_t& out_slab_count, uint64_t& out_total_blocks, uint64_t& out_free_blocks) const
     -> void {
     const Slab* s = this;
@@ -299,28 +339,24 @@ void Slab<slab_size, memory_size>::iter_live_blocks_unlocked(void* userdata, voi
 }
 
 template <size_t slab_size, size_t memory_size>
-auto Slab<slab_size, memory_size>::alloc_in_new_slab() -> void* {
-    Slab* new_slab = static_cast<Slab*>(request_memory_from_os(sizeof(Slab)));
-    if (new_slab == nullptr) {
-        return nullptr;
-    }
-    new_slab->init(this);
-    header.next = new_slab;
-    return new_slab->alloc_in_current_slab(0);
-}
-
-template <size_t slab_size, size_t memory_size>
 auto Slab<slab_size, memory_size>::alloc_in_current_slab(size_t block_index) -> void* {
+    assert(header.on_nonfull_list);
+    assert(header.free_blocks > 0);
     header.mem_map.set_used(block_index);
     header.next_fit_block = (block_index + 1) % MAX_BLOCKS;
     header.free_blocks--;
+    if (header.free_blocks == 0) {
+        unlink_nonfull_unlocked();
+    }
     blocks.at(block_index).slab_ptr = reinterpret_cast<uintptr_t>(this);
     return static_cast<void*>(blocks.at(block_index).data.data());
 }
 
 template <size_t slab_size, size_t memory_size>
 void Slab<slab_size, memory_size>::free_from_current_slab(size_t block_index) {
+    bool const WAS_FULL = header.free_blocks == 0;
     header.mem_map.set_unused(block_index);
+#ifdef WOS_KMALLOC_DEBUG_INFO
     // lazily allocate diagnostic arrays if not present
     if (!header.last_free_caller) {
         header.last_free_caller = static_cast<uintptr_t*>(request_memory_from_os(sizeof(uintptr_t) * MAX_BLOCKS));
@@ -340,10 +376,15 @@ void Slab<slab_size, memory_size>::free_from_current_slab(size_t block_index) {
 #pragma clang diagnostic ignored "-Wframe-address"
         header.last_free_caller[block_index] = reinterpret_cast<uintptr_t>(__builtin_return_address(2));
 #pragma clang diagnostic pop
+        header.free_count[block_index]++;
     }
+#endif
 
     header.next_fit_block = block_index;
     header.free_blocks++;
+    if (WAS_FULL) {
+        link_nonfull_unlocked();
+    }
 
     // Keep empty slabs attached to their size class. The small-allocation fast
     // path can defer frees in per-CPU magazines; retaining the slab page avoids
