@@ -3782,8 +3782,12 @@ auto balanced_memory_pressure(uint16_t free_mem) -> uint64_t {
 
 auto balanced_inflight_pressure(uint16_t num_cpus, uint64_t inflight) -> uint64_t {
     uint64_t const CPUS = std::max<uint64_t>(num_cpus, 1);
+    // Round up so every system retains the advertised fractional headroom;
+    // truncation disproportionately removes the reserve from smaller peers.
     uint64_t const QUEUE_CAPACITY =
-        std::max<uint64_t>((CPUS * WKI_BALANCED_QUEUE_HEADROOM_NUMERATOR) / WKI_BALANCED_QUEUE_HEADROOM_DENOMINATOR, 1);
+        std::max<uint64_t>(((CPUS * WKI_BALANCED_QUEUE_HEADROOM_NUMERATOR) + WKI_BALANCED_QUEUE_HEADROOM_DENOMINATOR - 1) /
+                               WKI_BALANCED_QUEUE_HEADROOM_DENOMINATOR,
+                           1);
     // Keep a bounded runnable reserve for tasks that sleep on remote VFS or
     // IPC. The extra point makes a full reserve strictly more expensive than
     // a saturated candidate, so selection cannot grow beyond the reserve on
@@ -4677,10 +4681,13 @@ auto wki_remote_compute_selftest_balanced_score_accounts_for_capacity() -> bool 
     uint64_t const SATURATED_AT_CAPACITY = balanced_placement_score(1000, 8, 4096, 8);
     uint64_t const SATURATED_AT_HEADROOM = balanced_placement_score(1000, 8, 4096, 10);
     uint64_t const SATURATED_BEYOND_HEADROOM = balanced_placement_score(1000, 8, 4096, 11);
+    uint64_t const SEVEN_CPU_BELOW_HEADROOM = balanced_placement_score(1000, 7, 4096, 8);
+    uint64_t const SEVEN_CPU_AT_HEADROOM = balanced_placement_score(1000, 7, 4096, 9);
 
     return ONE_ACTIVE > IDLE && FOUR_CPU_ACTIVE > ONE_ACTIVE && BUSY_WITH_SMALL_DEBT == OBSERVED_BUSY && MEMORY_PRESSURE > IDLE &&
            SATURATED_AT_CAPACITY == 1000 && SATURATED_AT_HEADROOM > SATURATED_AT_CAPACITY &&
-           SATURATED_BEYOND_HEADROOM > SATURATED_AT_HEADROOM && balanced_candidate_is_starved(36, 0, 36) &&
+           SATURATED_BEYOND_HEADROOM > SATURATED_AT_HEADROOM && SEVEN_CPU_BELOW_HEADROOM == 1000 &&
+           SEVEN_CPU_AT_HEADROOM > SEVEN_CPU_BELOW_HEADROOM && balanced_candidate_is_starved(36, 0, 36) &&
            !balanced_candidate_is_starved(35, 0, 36) && balanced_memory_eligible(WKI_BALANCED_FREE_MEM_RESERVE) &&
            !balanced_memory_eligible(WKI_BALANCED_FREE_MEM_RESERVE - 1);
 }

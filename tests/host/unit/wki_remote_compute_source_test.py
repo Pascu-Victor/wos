@@ -408,6 +408,7 @@ def test_balanced_placement_scores_all_healthy_systems() -> None:
         [
             "WKI_BALANCED_QUEUE_HEADROOM_NUMERATOR",
             "WKI_BALANCED_QUEUE_HEADROOM_DENOMINATOR",
+            "+ WKI_BALANCED_QUEUE_HEADROOM_DENOMINATOR - 1",
             "inflight == 0 ? 0 : 1 + ((inflight * 1000ULL) / QUEUE_CAPACITY)",
         ],
         "balanced placement must retain bounded runnable headroom for blocking tasks",
