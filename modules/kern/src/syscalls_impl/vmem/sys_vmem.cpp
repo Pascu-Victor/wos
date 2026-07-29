@@ -1365,12 +1365,6 @@ auto file_mapping_page_flags(uint64_t prot, uint64_t mmap_flags) -> uint64_t {
     return flags;
 }
 
-auto lazy_file_range_matches(const LazyVmemRange& lhs, const LazyVmemRange& rhs, uint64_t page_vaddr) -> bool {
-    return lhs.kind == LazyVmemKind::FILE_BACKED && lhs.start == rhs.start && lhs.end == rhs.end && lhs.prot == rhs.prot &&
-           lhs.flags == rhs.flags && lhs.file == rhs.file && lhs.file_offset == rhs.file_offset && lhs.file_dev == rhs.file_dev &&
-           lhs.file_ino == rhs.file_ino && page_vaddr >= lhs.start && page_vaddr < lhs.end;
-}
-
 auto materialize_lazy_file_page_impl(ker::mod::sched::task::Task* task, const LazyVmemRange& range, uint64_t page_vaddr,
                                      const ker::mod::mm::paging::PageFault& fault) -> bool {
     if (task == nullptr || task->pagemap == nullptr || range.kind != LazyVmemKind::FILE_BACKED || range.file == nullptr) {
@@ -1425,29 +1419,13 @@ auto materialize_lazy_file_page_impl(ker::mod::sched::task::Task* task, const La
         }
     }
 
-    uint64_t const IRQF = task->lazy_vmem_lock.lock_irqsave();
-    bool still_current = false;
-    for (const auto& candidate : task->lazy_vmem_ranges) {
-        if (lazy_file_range_matches(candidate, range, page_vaddr)) {
-            still_current = true;
-            break;
-        }
-    }
-    if (!still_current) {
-        task->lazy_vmem_lock.unlock_irqrestore(IRQF);
-        ker::mod::mm::phys::page_ref_dec(page);
-        return false;
-    }
-
-    if (ker::mod::mm::virt::translate(task->pagemap, page_vaddr) != ker::mod::mm::virt::PADDR_INVALID) {
-        task->lazy_vmem_lock.unlock_irqrestore(IRQF);
-        ker::mod::mm::phys::page_ref_dec(page);
-        return true;
-    }
-
     auto const PADDR = reinterpret_cast<uint64_t>(ker::mod::mm::addr::get_phys_pointer(reinterpret_cast<uint64_t>(page)));
-    ker::mod::mm::virt::map_page(task->pagemap, page_vaddr, PADDR, file_mapping_page_flags(range.prot, range.flags));
-    task->lazy_vmem_lock.unlock_irqrestore(IRQF);
+    auto const INSTALL_RESULT = ker::mod::mm::virt::install_lazy_file_page_if_current(task, range, page_vaddr, PADDR,
+                                                                                      file_mapping_page_flags(range.prot, range.flags));
+    if (INSTALL_RESULT != ker::mod::mm::virt::LazyFilePageInstallResult::MAPPED) {
+        ker::mod::mm::phys::page_ref_dec(page);
+        return INSTALL_RESULT == ker::mod::mm::virt::LazyFilePageInstallResult::ALREADY_MAPPED;
+    }
     return true;
 }
 

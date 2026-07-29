@@ -95,6 +95,12 @@ struct OwnedFrameStatsSnapshot {
     uint64_t purge_removed;
 };
 
+enum class LazyFilePageInstallResult : uint8_t {
+    MAPPED,
+    ALREADY_MAPPED,
+    STALE_RANGE,
+};
+
 struct DestroyUserSpaceBudgetState;
 
 void init(limine_memmap_response* memmap_response, limine_executable_file_response* kernel_file_response,
@@ -152,6 +158,8 @@ void map_range_to_kernel_page_table(Range range, uint64_t flags);
 static constexpr paddr_t PADDR_INVALID = static_cast<paddr_t>(-1);
 
 paddr_t translate(PageTable* page_table, vaddr_t vaddr);
+auto install_lazy_file_page_if_current(sched::task::Task* task, const sched::task::LazyVmemRange& range, vaddr_t page_vaddr,
+                                       paddr_t page_paddr, uint64_t page_flags) -> LazyFilePageInstallResult;
 bool ensure_user_page_writable(sched::task::Task* task, vaddr_t vaddr);
 bool ensure_user_page_mapped(sched::task::Task* task, vaddr_t vaddr);
 auto collect_user_memory_stats(PageTable* page_table) -> UserMemoryStats;

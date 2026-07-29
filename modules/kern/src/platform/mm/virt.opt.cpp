@@ -438,6 +438,12 @@ auto anonymous_lazy_range_allows_fault(sched::task::Task* task, uint64_t page_va
     return allowed;
 }
 
+auto lazy_file_range_matches(const sched::task::LazyVmemRange& lhs, const sched::task::LazyVmemRange& rhs, uint64_t page_vaddr) -> bool {
+    return lhs.kind == sched::task::LazyVmemKind::FILE_BACKED && lhs.start == rhs.start && lhs.end == rhs.end && lhs.prot == rhs.prot &&
+           lhs.flags == rhs.flags && lhs.file == rhs.file && lhs.file_offset == rhs.file_offset && lhs.file_dev == rhs.file_dev &&
+           lhs.file_ino == rhs.file_ino && page_vaddr >= lhs.start && page_vaddr < lhs.end;
+}
+
 auto handle_lazy_vmem_fault(sched::task::Task* task, uint64_t vaddr, const paging::PageFault& fault, uint64_t fault_rip = 0,
                             uint64_t fault_rsp = 0) -> bool {
     if (task == nullptr || task->pagemap == nullptr) {
@@ -2347,6 +2353,36 @@ paddr_t translate(PageTable* page_table, vaddr_t vaddr) {
     }
     uint64_t const PHYS = (pte.frame << paging::PAGE_SHIFT) + (vaddr & (paging::PAGE_SIZE - 1));
     return PHYS;  // Return physical address only
+}
+
+auto install_lazy_file_page_if_current(sched::task::Task* task, const sched::task::LazyVmemRange& range, vaddr_t page_vaddr,
+                                       paddr_t page_paddr, uint64_t page_flags) -> LazyFilePageInstallResult {
+    if (task == nullptr || task->pagemap == nullptr) {
+        return LazyFilePageInstallResult::STALE_RANGE;
+    }
+
+    LazyFilePageInstallResult result = LazyFilePageInstallResult::STALE_RANGE;
+    uint64_t const PTE_IRQF = cow_pte_lock.lock_irqsave();
+    uint64_t const RANGE_IRQF = task->lazy_vmem_lock.lock_irqsave();
+    for (const auto& candidate : task->lazy_vmem_ranges) {
+        if (!lazy_file_range_matches(candidate, range, page_vaddr)) {
+            continue;
+        }
+        if (translate(task->pagemap, page_vaddr) != PADDR_INVALID) {
+            result = LazyFilePageInstallResult::ALREADY_MAPPED;
+        } else {
+            map_page(task->pagemap, page_vaddr, page_paddr, page_flags);
+            result = LazyFilePageInstallResult::MAPPED;
+        }
+        break;
+    }
+    task->lazy_vmem_lock.unlock_irqrestore(RANGE_IRQF);
+    cow_pte_lock.unlock_irqrestore(PTE_IRQF);
+
+    if (result == LazyFilePageInstallResult::ALREADY_MAPPED) {
+        invalidate_local_tlb_if_current(task->pagemap, page_vaddr, false);
+    }
+    return result;
 }
 
 bool ensure_user_page_writable(sched::task::Task* task, vaddr_t vaddr) { return ensure_user_page_writable_for_task(task, vaddr); }
