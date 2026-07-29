@@ -3738,6 +3738,114 @@ auto xfs_find_parent_and_name(const char* fs_path, XfsMountContext* ctx, XfsInod
     return 0;
 }
 
+auto xfs_lookup_namespace_entry_for_mutation(const char* fs_path, XfsMountContext* ctx, XfsInode** parent_out, const char** name_out,
+                                             uint16_t* namelen_out, XfsDirEntry* entry_out, size_t known_fs_path_len = UNKNOWN_XFS_PATH_LEN,
+                                             size_t* fs_path_len_out = nullptr) -> int {
+    // Namespace transactions may roll back after publishing a conservative
+    // negative dentry. Retry only that cache-derived miss without caches so a
+    // later unlink/rmdir sees the restored on-disk entry.
+    bool authoritative_lookup = false;
+    int rc = xfs_find_parent_and_name(fs_path, ctx, parent_out, name_out, namelen_out, nullptr, true, known_fs_path_len, fs_path_len_out);
+    if (rc == -ENOENT) {
+        authoritative_lookup = true;
+        rc = xfs_find_parent_and_name(fs_path, ctx, parent_out, name_out, namelen_out, nullptr, false, known_fs_path_len, fs_path_len_out);
+    }
+    if (rc != 0) {
+        return rc;
+    }
+
+    rc = authoritative_lookup ? xfs_dir_lookup_authoritative(*parent_out, *name_out, *namelen_out, entry_out)
+                              : xfs_dir_lookup(*parent_out, *name_out, *namelen_out, entry_out);
+    if (rc == -ENOENT && !authoritative_lookup) {
+        xfs_inode_release(*parent_out);
+        *parent_out = nullptr;
+        rc = xfs_find_parent_and_name(fs_path, ctx, parent_out, name_out, namelen_out, nullptr, false, known_fs_path_len, fs_path_len_out);
+        if (rc == 0) {
+            rc = xfs_dir_lookup_authoritative(*parent_out, *name_out, *namelen_out, entry_out);
+        }
+    }
+    if (rc != 0 && *parent_out != nullptr) {
+        xfs_inode_release(*parent_out);
+        *parent_out = nullptr;
+    }
+    return rc;
+}
+
+#ifdef WOS_SELFTEST
+auto xfs_selftest_namespace_mutation_lookup_repairs_stale_negative_impl() -> bool {
+    XfsMountContext mount{};
+    mount.inode_size = 512;
+    mount.feat_incompat = XFS_SB_FEAT_INCOMPAT_FTYPE;
+    constexpr xfs_ino_t ROOT_INO = 100;
+    constexpr xfs_ino_t CHILD_INO = 4242;
+    constexpr const char* NAME = "victim";
+    constexpr uint16_t NAME_LEN = sizeof("victim") - 1;
+    mount.root_ino = ROOT_INO;
+
+    xfs_dentry_cache_purge_mount(&mount);
+    auto* data = new (std::nothrow) uint8_t[32];
+    auto* root = new (std::nothrow) XfsInode{};
+    if (data == nullptr || root == nullptr) {
+        delete[] data;
+        delete root;
+        return false;
+    }
+    std::memset(data, 0, 32);
+    auto* hdr = reinterpret_cast<XfsDir2SfHdr*>(data);
+    hdr->count = 0;
+    hdr->i8count = 0;
+    hdr->parent.at(3) = 7;
+
+    root->ino = ROOT_INO;
+    root->mount = &mount;
+    root->mode = 0040755;
+    root->nlink = 2;
+    root->data_fork.format = XFS_DINODE_FMT_LOCAL;
+    root->data_fork.local.data = data;
+    root->data_fork.local.size = 6;
+    root->size = root->data_fork.local.size;
+
+    if (xfs_inode_cache_new(root) != 0) {
+        delete root;
+        delete[] data;
+        return false;
+    }
+
+    XfsDirEntry stale_lookup{};
+    bool ok = xfs_dir_lookup(root, NAME, NAME_LEN, &stale_lookup) == -ENOENT;
+
+    hdr->count = 1;
+    auto* sfep = reinterpret_cast<XfsDir2SfEntry*>(data + xfs_dir2_sf_hdr_size(hdr));
+    sfep->namelen = NAME_LEN;
+    sfep->offset.at(1) = 4;
+    std::memcpy(xfs_dir2_sf_entry_name(sfep), NAME, NAME_LEN);
+    uint8_t* ino_ptr = xfs_dir2_sf_entry_name(sfep) + NAME_LEN;
+    *ino_ptr++ = XFS_DIR3_FT_DIR;
+    ino_ptr[0] = static_cast<uint8_t>((CHILD_INO >> 24U) & 0xffU);
+    ino_ptr[1] = static_cast<uint8_t>((CHILD_INO >> 16U) & 0xffU);
+    ino_ptr[2] = static_cast<uint8_t>((CHILD_INO >> 8U) & 0xffU);
+    ino_ptr[3] = static_cast<uint8_t>(CHILD_INO & 0xffU);
+    root->data_fork.local.size = static_cast<size_t>((ino_ptr + 4) - data);
+    root->size = root->data_fork.local.size;
+
+    XfsInode* parent = nullptr;
+    const char* name = nullptr;
+    uint16_t namelen = 0;
+    XfsDirEntry repaired{};
+    int const LOOKUP_RET = xfs_lookup_namespace_entry_for_mutation(NAME, &mount, &parent, &name, &namelen, &repaired, NAME_LEN);
+    ok = ok && LOOKUP_RET == 0 && parent != nullptr && parent->ino == ROOT_INO && name == NAME && namelen == NAME_LEN &&
+         repaired.ino == CHILD_INO && repaired.ftype == XFS_DIR3_FT_DIR;
+
+    if (parent != nullptr) {
+        xfs_inode_release(parent);
+    }
+    xfs_inode_release(root);
+    xfs_icache_purge(&mount);
+    xfs_dentry_cache_purge_mount(&mount);
+    return ok;
+}
+#endif
+
 auto xfs_cached_parent_dentry_lookup(const char* fs_path, XfsMountContext* ctx, XfsDirEntry* entry, int* lookup_result_out,
                                      size_t known_fs_path_len, size_t* fs_path_len_out) -> bool {
     if (fs_path == nullptr || ctx == nullptr || entry == nullptr || lookup_result_out == nullptr) {
@@ -4853,6 +4961,12 @@ auto xfs_stat_cached_unlocked(const char* fs_path, XfsMountContext* ctx, ker::vf
 
 }  // namespace
 
+#ifdef WOS_SELFTEST
+auto xfs_selftest_namespace_mutation_lookup_repairs_stale_negative() -> bool {
+    return xfs_selftest_namespace_mutation_lookup_repairs_stale_negative_impl();
+}
+#endif
+
 auto xfs_stat(const char* fs_path, ker::vfs::Stat* statbuf, XfsMountContext* ctx, size_t known_fs_path_len, bool require_directory) -> int {
     if (statbuf == nullptr || ctx == nullptr) {
         return -EINVAL;
@@ -5596,15 +5710,9 @@ auto xfs_rmdir_path(const char* fs_path, XfsMountContext* ctx, size_t known_fs_p
     XfsInode* parent_ip = nullptr;
     const char* name = nullptr;
     uint16_t namelen = 0;
-    int rc = xfs_find_parent_and_name(fs_path, ctx, &parent_ip, &name, &namelen, nullptr, true, known_fs_path_len);
-    if (rc != 0) {
-        return rc;
-    }
-
     XfsDirEntry de{};
-    rc = xfs_dir_lookup(parent_ip, name, namelen, &de);
+    int rc = xfs_lookup_namespace_entry_for_mutation(fs_path, ctx, &parent_ip, &name, &namelen, &de, known_fs_path_len);
     if (rc != 0) {
-        xfs_inode_release(parent_ip);
         return rc;
     }
     if (de.ftype != XFS_DIR3_FT_DIR) {
@@ -6003,32 +6111,10 @@ auto xfs_unlink_path(const char* fs_path, XfsMountContext* ctx, size_t known_fs_
     const char* filename = nullptr;
     uint16_t filename_len = 0;
     size_t fs_path_len = UNKNOWN_XFS_PATH_LEN;
-    bool authoritative_lookup = false;
-    int rc = xfs_find_parent_and_name(fs_path, ctx, &parent_ip, &filename, &filename_len, nullptr, true, known_fs_path_len, &fs_path_len);
-    if (rc == -ENOENT) {
-        authoritative_lookup = true;
-        rc = xfs_find_parent_and_name(fs_path, ctx, &parent_ip, &filename, &filename_len, nullptr, false, known_fs_path_len, &fs_path_len);
-    }
-    if (rc != 0) {
-        return rc;
-    }
-
-    // Look up the entry to be deleted (must verify it exists and is a regular file)
     XfsDirEntry de{};
-    rc = authoritative_lookup ? xfs_dir_lookup_authoritative(parent_ip, filename, filename_len, &de)
-                              : xfs_dir_lookup(parent_ip, filename, filename_len, &de);
-    if (rc == -ENOENT && !authoritative_lookup) {
-        xfs_inode_release(parent_ip);
-        parent_ip = nullptr;
-        rc = xfs_find_parent_and_name(fs_path, ctx, &parent_ip, &filename, &filename_len, nullptr, false, known_fs_path_len, &fs_path_len);
-        if (rc == 0) {
-            rc = xfs_dir_lookup_authoritative(parent_ip, filename, filename_len, &de);
-        }
-    }
+    int rc =
+        xfs_lookup_namespace_entry_for_mutation(fs_path, ctx, &parent_ip, &filename, &filename_len, &de, known_fs_path_len, &fs_path_len);
     if (rc != 0) {
-        if (parent_ip != nullptr) {
-            xfs_inode_release(parent_ip);
-        }
         return rc;
     }
 

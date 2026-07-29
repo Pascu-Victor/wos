@@ -282,6 +282,10 @@ KTEST(XFS, CachedParentMissingLookupStaysNegative) {
     KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_cached_parent_missing_lookup_stays_negative());
 }
 
+KTEST(XFS, NamespaceMutationLookupRepairsStaleNegative) {
+    KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_namespace_mutation_lookup_repairs_stale_negative());
+}
+
 KTEST(XFS, ReaddirCacheBatchesSequentialScan) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_readdir_cache_batches_sequential_scan()); }
 
 KTEST(XFS, ReadlinkPathUsesDentryType) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_readlink_path_uses_dentry_type()); }

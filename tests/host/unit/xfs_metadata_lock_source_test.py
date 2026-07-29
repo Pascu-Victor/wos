@@ -185,7 +185,7 @@ def test_sync_flush_is_serialized_after_inode_writeback() -> None:
     )
 
 
-def test_unlink_retries_false_enoent_without_namespace_caches() -> None:
+def test_namespace_mutations_retry_false_enoent_without_namespace_caches() -> None:
     dir_source = XFS_DIR2_CPP.read_text()
     vfs_source = XFS_VFS_CPP.read_text()
     authoritative_body = function_body(dir_source, "xfs_dir_lookup_authoritative")
@@ -203,19 +203,41 @@ def test_unlink_retries_false_enoent_without_namespace_caches() -> None:
     )
 
     require_order(
-        function_body(vfs_source, "xfs_unlink_path"),
+        function_body(vfs_source, "xfs_lookup_namespace_entry_for_mutation"),
         [
             "xfs_find_parent_and_name(fs_path",
             "if (rc == -ENOENT)",
             "nullptr, false, known_fs_path_len",
-            "xfs_dir_lookup_authoritative(parent_ip, filename, filename_len, &de)",
+            "xfs_dir_lookup_authoritative(*parent_out, *name_out, *namelen_out, entry_out)",
             "if (rc == -ENOENT && !authoritative_lookup)",
-            "xfs_inode_release(parent_ip);",
+            "xfs_inode_release(*parent_out);",
             "nullptr, false, known_fs_path_len",
-            "xfs_dir_lookup_authoritative(parent_ip, filename, filename_len, &de)",
-            "xfs_trans_alloc(ctx)",
+            "xfs_dir_lookup_authoritative(*parent_out, *name_out, *namelen_out, entry_out)",
         ],
-        "unlink must retry cache-derived ENOENT authoritatively before starting a transaction",
+        "namespace mutations must retry cache-derived ENOENT authoritatively",
+    )
+    for mutation in ["xfs_unlink_path", "xfs_rmdir_path"]:
+        require_order(
+            function_body(vfs_source, mutation),
+            [
+                "xfs_lookup_namespace_entry_for_mutation(",
+                "if (rc != 0)",
+                "return rc;",
+                "xfs_trans_alloc(ctx)",
+            ],
+            f"{mutation} must repair false ENOENT before starting a transaction",
+        )
+
+    require_order(
+        function_body(vfs_source, "xfs_selftest_namespace_mutation_lookup_repairs_stale_negative_impl"),
+        [
+            "xfs_dir_lookup(root, NAME, NAME_LEN, &stale_lookup) == -ENOENT",
+            "hdr->count = 1",
+            "xfs_lookup_namespace_entry_for_mutation(",
+            "LOOKUP_RET == 0",
+            "repaired.ino == CHILD_INO",
+        ],
+        "namespace mutation selftest must reproduce and repair a stale negative dentry",
     )
 
     walk_body = function_body(vfs_source, "walk_path")

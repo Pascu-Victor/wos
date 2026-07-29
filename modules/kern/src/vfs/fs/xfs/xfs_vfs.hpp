@@ -105,6 +105,7 @@ auto xfs_selftest_path_exists_uses_dentry_type() -> bool;
 auto xfs_selftest_stat_require_directory_uses_dentry_type() -> bool;
 auto xfs_selftest_open_require_directory_uses_dentry_type() -> bool;
 auto xfs_selftest_cached_parent_missing_lookup_stays_negative() -> bool;
+auto xfs_selftest_namespace_mutation_lookup_repairs_stale_negative() -> bool;
 #endif
 
 // Filesystem statistics (statvfs).
