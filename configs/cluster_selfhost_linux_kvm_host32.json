@@ -17,7 +17,7 @@
             },
             "vm": {
                 "memory": "81920M",
-                "cpus": 29,
+                "cpus": 28,
                 "disk0": "disk.qcow2",
                 "disk1": "mountfs.qcow2"
             }
