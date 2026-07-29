@@ -128,6 +128,7 @@ std::array<MountRootFallbackCacheSet, MOUNT_ROOT_FALLBACK_CACHE_SET_COUNT> mount
 
 #ifdef WOS_SELFTEST
 std::atomic<uint64_t> mount_lookup_cache_hits{0};
+std::atomic<uint64_t> mount_lookup_calls{0};
 #endif
 
 auto path_is_under_root(const char* path, const char* root, size_t root_len) -> bool {
@@ -773,6 +774,8 @@ void mount_lookup_cache_reset_for_test() {
 }
 
 auto mount_lookup_cache_hits_for_test() -> uint64_t { return mount_lookup_cache_hits.load(std::memory_order_relaxed); }
+
+auto mount_lookup_calls_for_test() -> uint64_t { return mount_lookup_calls.load(std::memory_order_relaxed); }
 #endif
 
 // Resolve path like resolve_task_path_raw does for mount-table keys:
@@ -1238,6 +1241,10 @@ auto find_mount_point(const char* path, size_t known_path_len) -> MountRef {
     if (path == nullptr) {
         return MountRef{};
     }
+
+#ifdef WOS_SELFTEST
+    mount_lookup_calls.fetch_add(1, std::memory_order_relaxed);
+#endif
 
     size_t const PATH_LEN = mount_lookup_known_path_len(path, known_path_len);
     bool const PATH_LEN_KNOWN = PATH_LEN != UNKNOWN_MOUNT_PATH_LEN;

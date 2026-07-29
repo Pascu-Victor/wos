@@ -96,6 +96,7 @@ void put_mount_point(MountPoint* mount);
 auto mount_point_ref_count_for_test(const MountPoint* mount) -> uint32_t;
 void mount_lookup_cache_reset_for_test();
 auto mount_lookup_cache_hits_for_test() -> uint64_t;
+auto mount_lookup_calls_for_test() -> uint64_t;
 #endif
 
 }  // namespace ker::vfs

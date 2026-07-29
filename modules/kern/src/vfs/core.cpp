@@ -15954,18 +15954,13 @@ auto vfs_selftest_fstat_seeds_path_metadata_cache() -> bool {
     Stat st{};
     bool ok = true;
     vfs_get_cache_perf_snapshot(before_fstat);
-    mount_lookup_cache_reset_for_test();
-    {
-        auto seed_mount_ref = find_mount_point(PATH);
-        ok = ok && seed_mount_ref.get() != nullptr;
-    }
-    uint64_t const MOUNT_CACHE_HITS_BEFORE_FSTAT = mount_lookup_cache_hits_for_test();
+    uint64_t const MOUNT_LOOKUPS_BEFORE_FSTAT = mount_lookup_calls_for_test();
 
     ok = ok && file->mount_dev_id != 0 && vfs_fstat_file(file, &st) == 0 &&
          (st.st_mode & static_cast<mode_t>(S_IFMT)) == static_cast<mode_t>(S_IFREG) && st.st_dev == file->mount_dev_id;
     vfs_get_cache_perf_snapshot(after_fstat);
     ok = ok && after_fstat.fstat_snapshot_stores > before_fstat.fstat_snapshot_stores &&
-         after_fstat.metadata_stores > before_fstat.metadata_stores && mount_lookup_cache_hits_for_test() == MOUNT_CACHE_HITS_BEFORE_FSTAT;
+         after_fstat.metadata_stores > before_fstat.metadata_stores && mount_lookup_calls_for_test() == MOUNT_LOOKUPS_BEFORE_FSTAT;
 
     ok = ok && vfs_lstat(PATH, &st) == 0 && (st.st_mode & static_cast<mode_t>(S_IFMT)) == static_cast<mode_t>(S_IFREG);
     vfs_get_cache_perf_snapshot(after_lstat);
