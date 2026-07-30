@@ -19,6 +19,7 @@
 #include <new>
 #include <platform/dbg/dbg.hpp>
 #include <platform/ktime/ktime.hpp>
+#include <platform/mm/page_alloc.hpp>
 #include <platform/mm/phys.hpp>
 #include <platform/perf/perf_events.hpp>
 #include <platform/sched/scheduler.hpp>
@@ -93,44 +94,71 @@ static_assert(XFS_INODE_STRIDE >= sizeof(XfsInode));
 
 struct XfsInodePoolNode {
     XfsInodePoolNode* next;
+    struct XfsInodePoolArena* arena;
+};
+
+struct XfsInodePoolArena {
+    XfsInodePoolArena* next{};
+    size_t total_slots{};
+    size_t free_slots{};
+    bool permanent_reserve{};
 };
 
 struct XfsInodeObjectPool {
     mod::sys::Spinlock lock;
     XfsInodePoolNode* free_list{};
+    XfsInodePoolArena* arenas{};
+    size_t arena_count{};
 };
 
 XfsInodeObjectPool inode_object_pool{};
 
 void xfs_inode_pool_add_arena_locked(void* arena, size_t bytes) {
-    auto* next = static_cast<uint8_t*>(arena);
-    size_t remaining = bytes;
+    auto* header = new (arena) XfsInodePoolArena{};
+    header->permanent_reserve = inode_object_pool.arena_count == 0;
+    if (header->permanent_reserve &&
+        !ker::mod::mm::phys::page_reassign_owner(arena, ker::mod::mm::PhysicalPageOwner::XFS_INODE_METADATA_RESERVE)) {
+        mod::dbg::panic_handler("XFS failed to account permanent inode arena");
+    }
+    header->next = inode_object_pool.arenas;
+    inode_object_pool.arenas = header;
+    inode_object_pool.arena_count++;
+    constexpr size_t HEADER_BYTES = (sizeof(XfsInodePoolArena) + alignof(XfsInode) - 1) & ~(alignof(XfsInode) - 1);
+    auto* next = static_cast<uint8_t*>(arena) + HEADER_BYTES;
+    size_t remaining = bytes - HEADER_BYTES;
     while (remaining >= XFS_INODE_STRIDE) {
         auto* node = reinterpret_cast<XfsInodePoolNode*>(next);
         node->next = inode_object_pool.free_list;
+        node->arena = header;
         inode_object_pool.free_list = node;
+        header->total_slots++;
+        header->free_slots++;
         next += XFS_INODE_STRIDE;
         remaining -= XFS_INODE_STRIDE;
     }
 }
 
-auto xfs_inode_pool_pop() -> XfsInodePoolNode* {
+auto xfs_inode_pool_pop(XfsInodePoolArena*& out_arena) -> XfsInodePoolNode* {
+    out_arena = nullptr;
     uint64_t const IRQF = inode_object_pool.lock.lock_irqsave();
     XfsInodePoolNode* node = inode_object_pool.free_list;
     if (node != nullptr) {
         inode_object_pool.free_list = node->next;
         node->next = nullptr;
+        out_arena = node->arena;
+        out_arena->free_slots--;
     }
     inode_object_pool.lock.unlock_irqrestore(IRQF);
     return node;
 }
 
-auto xfs_inode_pool_alloc_slot() -> void* {
-    if (XfsInodePoolNode* node = xfs_inode_pool_pop()) {
+auto xfs_inode_pool_alloc_slot(XfsInodePoolArena*& out_arena) -> void* {
+    if (XfsInodePoolNode* node = xfs_inode_pool_pop(out_arena)) {
         return node;
     }
 
-    void* const ARENA = ker::mod::mm::phys::page_alloc_full_overwrite(XFS_INODE_ARENA_BYTES, "xfs_inodes");
+    void* const ARENA = ker::mod::mm::phys::page_alloc_full_overwrite(ker::mod::mm::PhysicalPageOwner::XFS_INODE_METADATA,
+                                                                      XFS_INODE_ARENA_BYTES, "xfs_inodes");
     if (ARENA == nullptr) {
         return nullptr;
     }
@@ -141,6 +169,8 @@ auto xfs_inode_pool_alloc_slot() -> void* {
     if (node != nullptr) {
         inode_object_pool.free_list = node->next;
         node->next = nullptr;
+        out_arena = node->arena;
+        out_arena->free_slots--;
     }
     inode_object_pool.lock.unlock_irqrestore(IRQF);
     return node;
@@ -150,12 +180,44 @@ void xfs_inode_pool_release_slot(XfsInode* ip) {
     if (ip == nullptr) {
         return;
     }
+    auto* arena = static_cast<XfsInodePoolArena*>(ip->pool_arena);
     ip->~XfsInode();
+    if (arena == nullptr) {
+        // Synthetic/selftest inodes may be heap-backed instead of entering
+        // the production physical-page pool.
+        ::operator delete(ip);
+        return;
+    }
     auto* node = reinterpret_cast<XfsInodePoolNode*>(ip);
+    node->arena = arena;
+    void* retired_arena = nullptr;
     uint64_t const IRQF = inode_object_pool.lock.lock_irqsave();
     node->next = inode_object_pool.free_list;
     inode_object_pool.free_list = node;
+    arena->free_slots++;
+    if (arena->free_slots == arena->total_slots && !arena->permanent_reserve) {
+        XfsInodePoolNode** link = &inode_object_pool.free_list;
+        while (*link != nullptr) {
+            if ((*link)->arena == arena) {
+                *link = (*link)->next;
+            } else {
+                link = &(*link)->next;
+            }
+        }
+        XfsInodePoolArena** arena_link = &inode_object_pool.arenas;
+        while (*arena_link != nullptr && *arena_link != arena) {
+            arena_link = &(*arena_link)->next;
+        }
+        if (*arena_link == arena) {
+            *arena_link = arena->next;
+            inode_object_pool.arena_count--;
+            retired_arena = arena;
+        }
+    }
     inode_object_pool.lock.unlock_irqrestore(IRQF);
+    if (retired_arena != nullptr) {
+        ker::mod::mm::phys::page_free(retired_arena);
+    }
 }
 
 auto icache_hash(const XfsMountContext* mount, xfs_ino_t ino) -> size_t {
@@ -407,20 +469,22 @@ void free_inode(XfsInode* ip) {
     xfs_inode_pool_release_slot(ip);
 }
 
-void reclaim_idle_inodes() {
-    size_t const RETAIN_LIMIT = icache_idle_retain_limit();
-    if (!icache_reclaim_needed(icache_idle_count.load(std::memory_order_relaxed), RETAIN_LIMIT)) {
-        return;
+auto reclaim_idle_inodes(size_t retain_limit, bool pressure, size_t max_victims = ICACHE_RECLAIM_BATCH) -> size_t {
+    if (pressure ? icache_idle_count.load(std::memory_order_relaxed) <= retain_limit
+                 : !icache_reclaim_needed(icache_idle_count.load(std::memory_order_relaxed), retain_limit)) {
+        return 0;
     }
 
-    size_t deferred_releases = icache_reclaim_deferred_releases.load(std::memory_order_relaxed);
-    while (deferred_releases != 0) {
-        if (icache_reclaim_deferred_releases.compare_exchange_weak(deferred_releases, deferred_releases - 1, std::memory_order_relaxed,
-                                                                   std::memory_order_relaxed)) {
-            if (deferred_releases > 1) {
-                return;
+    if (!pressure) {
+        size_t deferred_releases = icache_reclaim_deferred_releases.load(std::memory_order_relaxed);
+        while (deferred_releases != 0) {
+            if (icache_reclaim_deferred_releases.compare_exchange_weak(deferred_releases, deferred_releases - 1, std::memory_order_relaxed,
+                                                                       std::memory_order_relaxed)) {
+                if (deferred_releases > 1) {
+                    return 0;
+                }
+                break;
             }
-            break;
         }
     }
 
@@ -428,11 +492,12 @@ void reclaim_idle_inodes() {
     bool expected = false;
     if (!icache_reclaim_active.compare_exchange_strong(expected, true, std::memory_order_acq_rel, std::memory_order_acquire)) {
         icache_reclaim_busy_skips.fetch_add(1, std::memory_order_relaxed);
-        return;
+        return 0;
     }
 
     uint64_t const STARTED_US = ker::mod::time::get_us();
     std::array<XfsInode*, ICACHE_RECLAIM_BATCH> victims{};
+    size_t const VICTIM_LIMIT = std::min(max_victims, victims.size());
     size_t victim_count = 0;
     size_t buckets_scanned = 0;
     size_t const START_BUCKET = icache_reclaim_cursor.load(std::memory_order_relaxed) & ICACHE_HASH_MASK;
@@ -441,13 +506,13 @@ void reclaim_idle_inodes() {
     // buckets and detaches one bounded batch. Advancing the cursor guarantees
     // eventual coverage without making a VFS close or task GC walk all 16K
     // buckets when most over-limit idle inodes are dirty.
-    while (buckets_scanned < ICACHE_RECLAIM_BUCKET_BUDGET && victim_count < victims.size() &&
-           icache_idle_count.load(std::memory_order_relaxed) > RETAIN_LIMIT) {
+    while (buckets_scanned < ICACHE_RECLAIM_BUCKET_BUDGET && victim_count < VICTIM_LIMIT &&
+           icache_idle_count.load(std::memory_order_relaxed) > retain_limit) {
         size_t const BUCKET_INDEX = (START_BUCKET + buckets_scanned) & ICACHE_HASH_MASK;
         auto& bucket = icache.at(BUCKET_INDEX);
         uint64_t const FLAGS = bucket.lock.lock_irqsave();
         XfsInode** pp = &bucket.head;
-        while (*pp != nullptr && victim_count < victims.size() && icache_idle_count.load(std::memory_order_relaxed) > RETAIN_LIMIT) {
+        while (*pp != nullptr && victim_count < VICTIM_LIMIT && icache_idle_count.load(std::memory_order_relaxed) > retain_limit) {
             XfsInode* ip = *pp;
             if (ip->refcount == 0 && ip->nlink != 0 && !ip->dirty && !ip->inactivation_started) {
                 *pp = ip->hash_next;
@@ -476,7 +541,7 @@ void reclaim_idle_inodes() {
     update_relaxed_max(icache_reclaim_max_us, ELAPSED_US);
     size_t const REMAINING_IDLE = icache_idle_count.load(std::memory_order_relaxed);
     size_t deferred_release_count = 0;
-    if (buckets_scanned == ICACHE_RECLAIM_BUCKET_BUDGET && victim_count < victims.size() && REMAINING_IDLE > RETAIN_LIMIT) {
+    if (!pressure && buckets_scanned == ICACHE_RECLAIM_BUCKET_BUDGET && victim_count < victims.size() && REMAINING_IDLE > retain_limit) {
         // A bounded scan could not drain the excess (commonly because the
         // remaining idle inodes are dirty). Defer another scan for one batch
         // so repeated closes retain O(1) amortized reclaim work.
@@ -484,6 +549,7 @@ void reclaim_idle_inodes() {
     }
     icache_reclaim_deferred_releases.store(deferred_release_count, std::memory_order_relaxed);
     icache_reclaim_active.store(false, std::memory_order_release);
+    return victim_count;
 }
 
 auto inode_fsblock_to_dev_block(XfsMountContext* ctx, xfs_fsblock_t fsbno) -> uint64_t {
@@ -1385,20 +1451,49 @@ auto xfs_inode_read_impl(XfsMountContext* mount, xfs_ino_t ino, bool allocation_
 }
 }  // namespace
 
+auto xfs_icache_reclaim_for_pressure(size_t max_inodes) -> size_t {
+    if (max_inodes == 0) {
+        return 0;
+    }
+
+    size_t reclaimed = 0;
+    constexpr size_t FULL_CURSOR_SWEEP_CALLS = (ICACHE_BUCKETS + ICACHE_RECLAIM_BUCKET_BUDGET - 1) / ICACHE_RECLAIM_BUCKET_BUDGET;
+    while (reclaimed < max_inodes) {
+        size_t const SWEEP_BEFORE = reclaimed;
+        for (size_t pass = 0; pass < FULL_CURSOR_SWEEP_CALLS && reclaimed < max_inodes; ++pass) {
+            size_t const BUDGET = max_inodes - reclaimed;
+            reclaimed += reclaim_idle_inodes(0, true, BUDGET);
+            if (icache_idle_count.load(std::memory_order_relaxed) == 0) {
+                break;
+            }
+        }
+        if (icache_idle_count.load(std::memory_order_relaxed) == 0 || reclaimed == SWEEP_BEFORE) {
+            break;
+        }
+    }
+    return reclaimed;
+}
+
 auto xfs_inode_alloc_zeroed_object() -> XfsInode* {
-    void* const SLOT = xfs_inode_pool_alloc_slot();
+    XfsInodePoolArena* arena = nullptr;
+    void* const SLOT = xfs_inode_pool_alloc_slot(arena);
     if (SLOT == nullptr) {
         return nullptr;
     }
-    return new (SLOT) XfsInode{};
+    auto* ip = new (SLOT) XfsInode{};
+    ip->pool_arena = arena;
+    return ip;
 }
 
 auto xfs_inode_alloc_uninitialized_object() -> XfsInode* {
-    void* const SLOT = xfs_inode_pool_alloc_slot();
+    XfsInodePoolArena* arena = nullptr;
+    void* const SLOT = xfs_inode_pool_alloc_slot(arena);
     if (SLOT == nullptr) {
         return nullptr;
     }
-    return new (SLOT) XfsInode;
+    auto* ip = new (SLOT) XfsInode;
+    ip->pool_arena = arena;
+    return ip;
 }
 
 void xfs_inode_free_uncached(XfsInode* ip) {
@@ -1509,7 +1604,7 @@ void release_inode_reference(XfsInode* ip, bool metadata_locked) {
             size_t const IDLE_COUNT = icache_idle_count.fetch_add(1, std::memory_order_relaxed) + 1;
             icache.at(BUCKET).lock.unlock_irqrestore(flags);
             if (IDLE_COUNT > icache_idle_retain_limit()) {
-                reclaim_idle_inodes();
+                static_cast<void>(reclaim_idle_inodes(icache_idle_retain_limit(), false));
             }
             return;
         }

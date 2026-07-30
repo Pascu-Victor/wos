@@ -35,6 +35,7 @@
 #include "fsbench.hpp"
 #include "mandelbench/config.hpp"
 #include "mandelbench/mandelbench_wki.hpp"
+#include "memory_pressure.hpp"
 #include "netbench.hpp"
 #include "perfbench.hpp"
 #include "thread_exit_stress.hpp"
@@ -613,6 +614,10 @@ auto main(int argc, char** argv, char** envp) -> int {
 
     if (command != nullptr && (std::strcmp(command, "fork-cow") == 0 || std::strcmp(command, "cow") == 0)) {
         return run_cowbench(argc - 2, argv + 2);
+    }
+
+    if (command != nullptr && std::strcmp(command, "memory-pressure") == 0) {
+        return run_memory_pressure(argc - 2, argv + 2);
     }
 
     if (command != nullptr && std::strcmp(command, "wki-target") == 0) {

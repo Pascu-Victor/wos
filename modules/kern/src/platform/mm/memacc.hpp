@@ -14,7 +14,8 @@ struct UserMemoryBreakdown {
     uint64_t heap_pages;
     uint64_t mmap_pages;
     uint64_t stack_pages;
-    uint64_t other_pages;
+    uint64_t low_address_pages;
+    uint64_t high_runtime_pages;
     uint64_t rw_pages;
     uint64_t rx_pages;
     uint64_t ro_pages;

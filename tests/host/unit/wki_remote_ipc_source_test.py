@@ -9,6 +9,7 @@ REMOTE_IPC_CPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "remote_ipc
 REMOTE_IPC_SOCKET_CPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "remote_ipc_socket.cpp"
 REMOTE_IPC_HPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "remote_ipc.hpp"
 WKI_WAIT_KTEST = ROOT / "modules" / "kern" / "src" / "test" / "wki_wait_ktest.cpp"
+WKI_WIRE_HPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "wire.hpp"
 
 
 def fail(message: str) -> None:
@@ -848,6 +849,49 @@ def test_ipc_send_retry_backpressure_sleeps_without_yield_livelock() -> None:
             fail(f"IPC send retry backoff is missing {snippet}")
 
 
+def test_retired_exports_fence_and_discard_unattached_deliveries() -> None:
+    remote_ipc = REMOTE_IPC_CPP.read_text()
+    wire = WKI_WIRE_HPP.read_text()
+    required = [
+        "constexpr uint16_t OP_PIPE_DISCARD_PENDING = 0x0707",
+        "any pre-attachment DATA/EOF state that can no longer acquire a proxy owner",
+    ]
+    for snippet in required:
+        if snippet not in wire:
+            fail(f"ordered pending-delivery discard wire contract is missing {snippet!r}")
+
+    cleanup = function_body(remote_ipc, "wki_ipc_cleanup_exported_fds")
+    for snippet in [
+        "direct_discards",
+        "stop_pipe_pump_locked(exp)",
+        "schedule_pending_pipe_discard(consumer_node, resource_id)",
+    ]:
+        if snippet not in cleanup:
+            fail(f"export cleanup is missing ordered pending-delivery retirement {snippet!r}")
+
+    handler = function_body(remote_ipc, "handle_ipc_dev_op_req_inline")
+    require_order(
+        handler,
+        "OP_ID == OP_PIPE_DISCARD_PENDING",
+        "OP_ID == OP_PIPE_DATA || OP_ID == OP_PIPE_DATA_FLOW",
+        "pending-delivery discard dispatch",
+    )
+    if "discard_pending_pipe_delivery(hdr->src_node, resource_id)" not in handler:
+        fail("pending-delivery discard must release the exact peer/resource queue")
+
+    close_begin = handler.find("if (OP_ID == OP_PIPE_CLOSE_READ)")
+    close_end = handler.find("if (OP_ID >= OP_SOCK_ACCEPT", close_begin)
+    if close_begin < 0 or close_end < 0:
+        fail("pipe read-close retirement block is missing")
+    close_read = handler[close_begin:close_end]
+    for snippet in [
+        "bool const DIRECT_DISCARD = pump_task == nullptr",
+        "schedule_pending_pipe_discard(hdr->src_node, resource_id)",
+    ]:
+        if snippet not in close_read:
+            fail(f"pipe read-close retirement must fence late EOF state: {snippet!r}")
+
+
 def test_ipc_selftests_are_declared_and_registered() -> None:
     header = REMOTE_IPC_HPP.read_text()
     ktest = WKI_WAIT_KTEST.read_text()
@@ -866,6 +910,7 @@ def test_ipc_selftests_are_declared_and_registered() -> None:
         "wki_ipc_selftest_attach_insert_failure_preserves_existing_fd",
         "wki_ipc_selftest_dev_op_response_cookie_fences_stale_completion",
         "wki_ipc_selftest_dev_op_response_uses_home_node_identity",
+        "wki_ipc_selftest_discard_retires_unattached_delivery",
     ]
     for token in required:
         if token not in header:
@@ -895,6 +940,7 @@ def main() -> None:
     test_large_deferred_dev_op_payloads_transfer_to_export_backlog()
     test_futex_dev_op_preserves_broadcast_wake_count()
     test_ipc_send_retry_backpressure_sleeps_without_yield_livelock()
+    test_retired_exports_fence_and_discard_unattached_deliveries()
     test_ipc_selftests_are_declared_and_registered()
     print("WKI remote IPC source invariants hold")
 

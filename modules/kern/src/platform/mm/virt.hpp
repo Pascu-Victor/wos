@@ -6,6 +6,7 @@
 #include <platform/acpi/acpi.hpp>
 #include <platform/asm/tlb.hpp>
 #include <platform/mm/addr.hpp>
+#include <platform/mm/page_alloc.hpp>
 #include <platform/mm/paging.hpp>
 #include <platform/mm/phys.hpp>
 #include <platform/mm/tlb_shootdown.hpp>
@@ -130,7 +131,7 @@ void init_pagemap();
 // by independent order-0 physical pages. Call after init_pagemap() and before
 // task pagemaps copy the kernel-half PML4 entries.
 void init_kernel_vmap();
-auto kernel_vmap_alloc(uint64_t size, std::string_view name = "kernel_vmap") -> void*;
+auto kernel_vmap_alloc(PhysicalPageOwner owner, uint64_t size, std::string_view name = {}) -> void*;
 void kernel_vmap_free(void* ptr, uint64_t size);
 [[nodiscard]] auto kernel_vmap_contains(const void* ptr) -> bool;
 // Complete frees deferred by IRQ-disabled callers. Safe contexts may call this

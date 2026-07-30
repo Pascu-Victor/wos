@@ -228,6 +228,10 @@ KTEST(WkiIpcPtyClose, CloseWithoutExportQueuesPendingEof) {
 
 KTEST(WkiIpcPoll, PendingClosePromotesToHup) { KEXPECT_EQ(ker::net::wki::wki_ipc_selftest_pending_close_promotes_on_poll(), 0); }
 
+KTEST(WkiIpcLifecycle, DiscardRetiresUnattachedDelivery) {
+    KEXPECT_EQ(ker::net::wki::wki_ipc_selftest_discard_retires_unattached_delivery(), 0);
+}
+
 KTEST(WkiIpcEpollClose, CloseDropsLookupReference) { KEXPECT_EQ(ker::net::wki::wki_ipc_selftest_epoll_close_releases_lookup_ref(), 0); }
 
 KTEST(WkiIpcExportPipe, NonblockingWriteViewPreservesSourceFlags) {

@@ -96,6 +96,68 @@ struct PageCacheStatsSnapshot {
     uint64_t stale_entries;
 };
 
+enum class PhysicalOwnerReclaimability : uint8_t {
+    OWNER_TEARDOWN,
+    PRESSURE_RECLAIM,
+    PERMANENT,
+    DIAGNOSTIC_LIFETIME,
+};
+
+struct PhysicalOwnerDescriptor {
+    PhysicalPageOwner owner;
+    const char* name;
+    const char* lifetime;
+    PhysicalOwnerReclaimability reclaimability;
+    const char* scaling_bound;
+};
+
+struct PhysicalOwnerSnapshot {
+    uint64_t pages;
+    uint64_t objects;
+};
+
+enum class PhysicalReserveKind : uint8_t {
+    FIRMWARE_RESERVED = 0,
+    ACPI_RECLAIMABLE,
+    ACPI_NVS,
+    BAD_MEMORY,
+    BOOTLOADER_RECLAIMABLE,
+    KERNEL_AND_MODULES,
+    FRAMEBUFFER,
+    FIRMWARE_RESERVED_MAPPED,
+    COUNT,
+};
+
+inline constexpr size_t PHYSICAL_RESERVE_KIND_COUNT = static_cast<size_t>(PhysicalReserveKind::COUNT);
+
+struct PhysicalReserveSnapshot {
+    uint64_t pages;
+    uint64_t objects;
+};
+
+struct PhysicalReserveDescriptor {
+    PhysicalReserveKind kind;
+    const char* name;
+    const char* lifetime;
+    const char* scaling_bound;
+};
+
+struct PhysicalBalanceSnapshot {
+    uint64_t managed_pages;
+    uint64_t free_pages;
+    uint64_t allocator_metadata_pages;
+    uint64_t zone_descriptor_pages;
+    uint64_t per_cpu_page_cache_reserve_pages;
+    uint64_t per_cpu_page_cache_reserve_objects;
+    uint64_t owner_pages;
+    uint64_t identity_pages;
+    uint64_t identity_mismatch_pages;
+    uint64_t untracked_unreclaimable_pages;
+    uint64_t zone_count;
+    std::array<PhysicalOwnerSnapshot, PHYSICAL_PAGE_OWNER_COUNT> owners;
+    std::array<PhysicalReserveSnapshot, PHYSICAL_RESERVE_KIND_COUNT> firmware_reserves;
+};
+
 enum class PageLookupOwner : uint8_t {
     NONE = 0,
     REGULAR_ZONE,
@@ -112,27 +174,30 @@ void set_kernel_cr3(uint64_t cr3);    // Call after initPagemap to set kernel CR
 void init_huge_page_zone_deferred();  // Call after initPagemap to initialize huge page zone
 void init_kernel_stack_pool();        // Reserve contiguous stack slots before runtime fragmentation
 void enable_per_cpu_allocations();    // Call after cpuParamInit to enable per-CPU page caches
-auto page_alloc(uint64_t size = ker::mod::mm::paging::PAGE_SIZE, std::string_view name = "anonymous") -> void*;
-auto page_alloc_full_overwrite(uint64_t size = ker::mod::mm::paging::PAGE_SIZE, std::string_view name = "full_overwrite") -> void*;
-auto page_alloc_full_overwrite_may_fail(uint64_t size = ker::mod::mm::paging::PAGE_SIZE, std::string_view name = "full_overwrite") -> void*;
-auto page_alloc_full_overwrite_page(std::string_view name = "full_overwrite") -> void*;
-auto page_alloc_may_fail(uint64_t size = ker::mod::mm::paging::PAGE_SIZE, std::string_view name = "anonymous") -> void*;
-auto page_alloc_full_overwrite_page_may_fail(std::string_view name = "full_overwrite") -> void*;
+auto page_alloc(PhysicalPageOwner owner, uint64_t size = ker::mod::mm::paging::PAGE_SIZE, std::string_view name = {}) -> void*;
+auto page_alloc_full_overwrite(PhysicalPageOwner owner, uint64_t size = ker::mod::mm::paging::PAGE_SIZE, std::string_view name = {})
+    -> void*;
+auto page_alloc_full_overwrite_may_fail(PhysicalPageOwner owner, uint64_t size = ker::mod::mm::paging::PAGE_SIZE,
+                                        std::string_view name = {}) -> void*;
+auto page_alloc_full_overwrite_page(PhysicalPageOwner owner, std::string_view name = {}) -> void*;
+auto page_alloc_may_fail(PhysicalPageOwner owner, uint64_t size = ker::mod::mm::paging::PAGE_SIZE, std::string_view name = {}) -> void*;
+auto page_alloc_full_overwrite_page_may_fail(PhysicalPageOwner owner, std::string_view name = {}) -> void*;
 inline constexpr uint32_t PAGE_ALLOC_RECLAIM_RETRY_DEFAULT = 2048;
-auto page_alloc_with_reclaim(uint64_t size = ker::mod::mm::paging::PAGE_SIZE, std::string_view name = "anonymous",
+auto page_alloc_with_reclaim(PhysicalPageOwner owner, uint64_t size = ker::mod::mm::paging::PAGE_SIZE, std::string_view name = {},
                              uint32_t retry_count = PAGE_ALLOC_RECLAIM_RETRY_DEFAULT) -> void*;
-auto page_alloc_with_reclaim_may_fail(uint64_t size = ker::mod::mm::paging::PAGE_SIZE, std::string_view name = "anonymous",
+auto page_alloc_with_reclaim_may_fail(PhysicalPageOwner owner, uint64_t size = ker::mod::mm::paging::PAGE_SIZE, std::string_view name = {},
                                       uint32_t retry_count = PAGE_ALLOC_RECLAIM_RETRY_DEFAULT) -> void*;
-auto page_alloc_full_overwrite_page_with_reclaim(std::string_view name = "full_overwrite",
+auto page_alloc_full_overwrite_page_with_reclaim(PhysicalPageOwner owner, std::string_view name = {},
                                                  uint32_t retry_count = PAGE_ALLOC_RECLAIM_RETRY_DEFAULT) -> void*;
-auto page_alloc_full_overwrite_page_with_reclaim_may_fail(std::string_view name = "full_overwrite",
+auto page_alloc_full_overwrite_page_with_reclaim_may_fail(PhysicalPageOwner owner, std::string_view name = {},
                                                           uint32_t retry_count = PAGE_ALLOC_RECLAIM_RETRY_DEFAULT) -> void*;
-auto page_alloc_huge(uint64_t size) -> void*;  // Try the optional huge page zone, if enabled.
+auto page_alloc_huge(PhysicalPageOwner owner, uint64_t size) -> void*;  // Try the optional huge page zone, if enabled.
 auto kernel_stack_alloc(std::string_view name = "kernel_stack") -> void*;
 void page_free(void* page);
 auto can_wait_for_reclaim() -> bool;
 auto page_split_to_order0(void* page) -> bool;
 auto page_mark_kind(void* page, PageKind kind) -> bool;
+auto page_reassign_owner(void* page, PhysicalPageOwner owner) -> bool;
 auto page_kind_get(void* page) -> PageKind;
 auto page_kind_get(void* page, PageLookupHint* hint) -> PageKind;
 auto page_alloc_can_satisfy(uint64_t size, uint64_t reserve_bytes = 0) -> bool;
@@ -176,6 +241,9 @@ auto get_free_mem_pages() -> uint64_t;
 auto get_total_mem_bytes() -> uint64_t;
 
 void get_alloc_stats_snapshot(AllocStatsSnapshot& out);
+void get_physical_balance_snapshot(PhysicalBalanceSnapshot& out);
+auto physical_owner_descriptors() -> std::span<const PhysicalOwnerDescriptor>;
+auto physical_reserve_descriptors() -> std::span<const PhysicalReserveDescriptor>;
 auto snapshot_zones(ZoneSnapshot* out, size_t max_rows) -> size_t;
 
 auto page_caller_stats_available() -> bool;

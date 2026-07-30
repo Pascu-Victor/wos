@@ -25,6 +25,7 @@ set(SOURCES
     src/cowbench.cpp
     src/fsbench.cpp
     src/main.cpp
+    src/memory_pressure.cpp
     src/netbench.cpp
     src/perfbench.cpp
     src/thread_exit_stress.cpp

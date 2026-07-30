@@ -11,6 +11,7 @@
 #include <platform/dbg/dbg.hpp>
 #include <platform/interrupt/gates.hpp>
 #include <platform/mm/addr.hpp>
+#include <platform/mm/page_alloc.hpp>
 #include <platform/mm/phys.hpp>
 #include <platform/mm/virt.hpp>
 
@@ -142,7 +143,8 @@ void read_mac(E1000Device* dev) {
 void init_rx(E1000Device* dev) {
     // Allocate descriptor ring (physically contiguous, 16-byte aligned)
     size_t const RING_SIZE = NUM_RX_DESC * sizeof(E1000RxDesc);
-    auto* descs = static_cast<E1000RxDesc*>(ker::mod::mm::phys::page_alloc(RING_SIZE));
+    auto* descs = static_cast<E1000RxDesc*>(
+        ker::mod::mm::phys::page_alloc(ker::mod::mm::PhysicalPageOwner::DEVICE_E1000, RING_SIZE, "e1000_rx_ring"));
     std::memset(descs, 0, RING_SIZE);
     dev->rx_descs = descs;
 
@@ -178,7 +180,8 @@ void init_rx(E1000Device* dev) {
 // -- Initialize TX ring --------------------------------------------------
 void init_tx(E1000Device* dev) {
     size_t const RING_SIZE = NUM_TX_DESC * sizeof(E1000TxDesc);
-    auto* descs = static_cast<E1000TxDesc*>(ker::mod::mm::phys::page_alloc(RING_SIZE));
+    auto* descs = static_cast<E1000TxDesc*>(
+        ker::mod::mm::phys::page_alloc(ker::mod::mm::PhysicalPageOwner::DEVICE_E1000, RING_SIZE, "e1000_tx_ring"));
     std::memset(descs, 0, RING_SIZE);
     dev->tx_descs = descs;
 

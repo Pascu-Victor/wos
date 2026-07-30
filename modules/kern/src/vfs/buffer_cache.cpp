@@ -21,9 +21,12 @@
 #include <new>
 #include <platform/dbg/dbg.hpp>
 #include <platform/ktime/ktime.hpp>
+#include <platform/mm/page_alloc.hpp>
 #include <platform/mm/paging.hpp>
 #include <platform/mm/phys.hpp>
+#ifndef WOS_HOST_TEST
 #include <platform/mm/virt.hpp>
+#endif
 #include <platform/perf/perf_events.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
@@ -383,12 +386,23 @@ constexpr size_t HOT_EVICT_MAX_BYTES = size_t{16} * 1024 * 1024;
 constexpr size_t BUFHEAD_ARENA_BYTES = size_t{256} * 1024;
 constexpr size_t BUFHEAD_STRIDE = (sizeof(BufHead) + alignof(BufHead) - 1) & ~(alignof(BufHead) - 1);
 
+struct BufHeadPoolArena {
+    BufHeadPoolArena* next{};
+    size_t total_slots{};
+    size_t free_slots{};
+    bool permanent_reserve{};
+};
+
 struct BufHeadPool {
     ker::mod::sys::Spinlock lock;
     BufHead* free_list{};
+    BufHeadPoolArena* arenas{};
+    size_t arena_count{};
 };
 
 BufHeadPool bufhead_pool{};
+
+constexpr size_t BUFHEAD_ARENA_HEADER_BYTES = (sizeof(BufHeadPoolArena) + alignof(BufHead) - 1) & ~(alignof(BufHead) - 1);
 
 struct WritebackSnapshot {
     uint8_t* data = nullptr;
@@ -444,12 +458,25 @@ void perf_record_xfs_count(ker::mod::perf::WkiPerfLocalXfsOp op, uint64_t bytes 
 }
 
 void add_bufhead_arena_to_pool_locked(void* arena, size_t bytes) {
-    auto* next = static_cast<uint8_t*>(arena);
-    size_t remaining = bytes;
+    auto* header = new (arena) BufHeadPoolArena{};
+    header->permanent_reserve = bufhead_pool.arena_count == 0;
+    if (header->permanent_reserve &&
+        !ker::mod::mm::phys::page_reassign_owner(arena, ker::mod::mm::PhysicalPageOwner::BUFFER_CACHE_METADATA_RESERVE)) {
+        ker::mod::dbg::panic_handler("buffer cache failed to account permanent BufHead arena");
+    }
+    header->next = bufhead_pool.arenas;
+    bufhead_pool.arenas = header;
+    bufhead_pool.arena_count++;
+
+    auto* next = static_cast<uint8_t*>(arena) + BUFHEAD_ARENA_HEADER_BYTES;
+    size_t remaining = bytes - BUFHEAD_ARENA_HEADER_BYTES;
     while (remaining >= BUFHEAD_STRIDE) {
         auto* bh = new (next) BufHead{};
+        bh->pool_arena = header;
         bh->hash_next = bufhead_pool.free_list;
         bufhead_pool.free_list = bh;
+        header->total_slots++;
+        header->free_slots++;
         next += BUFHEAD_STRIDE;
         remaining -= BUFHEAD_STRIDE;
     }
@@ -462,6 +489,10 @@ auto alloc_bufhead() -> BufHead* {
         if (bh != nullptr) {
             bufhead_pool.free_list = bh->hash_next;
             bh->hash_next = nullptr;
+            auto* arena = static_cast<BufHeadPoolArena*>(bh->pool_arena);
+            if (arena != nullptr) {
+                arena->free_slots--;
+            }
         }
         bufhead_pool.lock.unlock_irqrestore(IRQFLAGS);
         return bh;
@@ -471,7 +502,8 @@ auto alloc_bufhead() -> BufHead* {
         return bh;
     }
 
-    void* const ARENA = ker::mod::mm::phys::page_alloc_full_overwrite(BUFHEAD_ARENA_BYTES, "buffer_cache_bufheads");
+    void* const ARENA = ker::mod::mm::phys::page_alloc_full_overwrite(ker::mod::mm::PhysicalPageOwner::BUFFER_CACHE_METADATA,
+                                                                      BUFHEAD_ARENA_BYTES, "buffer_cache_bufheads");
     if (ARENA == nullptr) {
         return new (std::nothrow) BufHead{};
     }
@@ -482,6 +514,7 @@ auto alloc_bufhead() -> BufHead* {
     if (bh != nullptr) {
         bufhead_pool.free_list = bh->hash_next;
         bh->hash_next = nullptr;
+        static_cast<BufHeadPoolArena*>(bh->pool_arena)->free_slots--;
     }
     bufhead_pool.lock.unlock_irqrestore(IRQFLAGS);
     return bh;
@@ -491,10 +524,40 @@ void free_bufhead(BufHead* bh) {
     if (bh == nullptr) {
         return;
     }
+    auto* arena = static_cast<BufHeadPoolArena*>(bh->pool_arena);
+    if (arena == nullptr) {
+        delete bh;
+        return;
+    }
+
+    void* retired_arena = nullptr;
     uint64_t const IRQFLAGS = bufhead_pool.lock.lock_irqsave();
     bh->hash_next = bufhead_pool.free_list;
     bufhead_pool.free_list = bh;
+    arena->free_slots++;
+    if (arena->free_slots == arena->total_slots && !arena->permanent_reserve) {
+        BufHead** link = &bufhead_pool.free_list;
+        while (*link != nullptr) {
+            if ((*link)->pool_arena == arena) {
+                *link = (*link)->hash_next;
+            } else {
+                link = &(*link)->hash_next;
+            }
+        }
+        BufHeadPoolArena** arena_link = &bufhead_pool.arenas;
+        while (*arena_link != nullptr && *arena_link != arena) {
+            arena_link = &(*arena_link)->next;
+        }
+        if (*arena_link == arena) {
+            *arena_link = arena->next;
+            bufhead_pool.arena_count--;
+            retired_arena = arena;
+        }
+    }
     bufhead_pool.lock.unlock_irqrestore(IRQFLAGS);
+    if (retired_arena != nullptr) {
+        ker::mod::mm::phys::page_free(retired_arena);
+    }
 }
 
 auto allocate_buffer_data(size_t size, uint32_t& flags) -> uint8_t* {
@@ -504,7 +567,8 @@ auto allocate_buffer_data(size_t size, uint32_t& flags) -> uint8_t* {
     }
 #ifndef WOS_HOST_TEST
     if (size > BUFFER_CACHE_BUDDY_ALLOC_MAX_BYTES) {
-        auto* data = static_cast<uint8_t*>(ker::mod::mm::virt::kernel_vmap_alloc(size, "buffer_cache"));
+        auto* data = static_cast<uint8_t*>(
+            ker::mod::mm::virt::kernel_vmap_alloc(ker::mod::mm::PhysicalPageOwner::BUFFER_CACHE_DATA, size, "buffer_cache"));
         if (data != nullptr) {
             flags |= BH_DATA_VMAP;
         }
@@ -512,7 +576,8 @@ auto allocate_buffer_data(size_t size, uint32_t& flags) -> uint8_t* {
     }
 #endif
     if (size >= ker::mod::mm::paging::PAGE_SIZE && (size % ker::mod::mm::paging::PAGE_SIZE) == 0) {
-        auto* page_data = static_cast<uint8_t*>(ker::mod::mm::phys::page_alloc_full_overwrite_may_fail(size, "buffer_cache"));
+        auto* page_data = static_cast<uint8_t*>(ker::mod::mm::phys::page_alloc_full_overwrite_may_fail(
+            ker::mod::mm::PhysicalPageOwner::BUFFER_CACHE_DATA, size, "buffer_cache"));
         if (page_data != nullptr) {
             flags |= BH_DATA_PAGE_ALLOC;
             return page_data;
@@ -521,7 +586,8 @@ auto allocate_buffer_data(size_t size, uint32_t& flags) -> uint8_t* {
         // Small buffers normally use the buddy allocator to avoid vmap
         // lifecycle overhead. Under fragmentation, retain the same contiguous
         // virtual layout with independent order-0 backing pages.
-        auto* data = static_cast<uint8_t*>(ker::mod::mm::virt::kernel_vmap_alloc(size, "buffer_cache"));
+        auto* data = static_cast<uint8_t*>(
+            ker::mod::mm::virt::kernel_vmap_alloc(ker::mod::mm::PhysicalPageOwner::BUFFER_CACHE_DATA, size, "buffer_cache"));
         if (data != nullptr) {
             flags |= BH_DATA_VMAP;
         }

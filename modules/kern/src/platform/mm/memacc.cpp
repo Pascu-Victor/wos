@@ -42,8 +42,10 @@ void add_region(UserMemoryBreakdown& stats, uint64_t vaddr, uint64_t page_count)
         stats.code_pages += page_count;
     } else if (vaddr >= HEAP_REGION_START && vaddr < HEAP_REGION_END) {
         stats.heap_pages += page_count;
+    } else if (vaddr < CODE_REGION_START) {
+        stats.low_address_pages += page_count;
     } else {
-        stats.other_pages += page_count;
+        stats.high_runtime_pages += page_count;
     }
 }
 

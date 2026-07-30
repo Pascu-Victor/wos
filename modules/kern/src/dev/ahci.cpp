@@ -16,6 +16,7 @@
 #include <new>
 #include <platform/dbg/dbg.hpp>
 #include <platform/mm/addr.hpp>
+#include <platform/mm/page_alloc.hpp>
 #include <platform/mm/paging.hpp>
 #include <platform/mm/phys.hpp>
 #include <platform/sched/scheduler.hpp>
@@ -240,7 +241,8 @@ void port_rebase(volatile HbaPort* port, size_t portno) {
     // Command list entry size = 32 bytes
     // Command list entry maxim count = 32
     // Command list maxium size = 32*32 = 1K per port
-    auto* clb_virt = static_cast<uint8_t*>(ker::mod::mm::phys::page_alloc(CLB_SIZE, "ahci_clb"));
+    auto* clb_virt =
+        static_cast<uint8_t*>(ker::mod::mm::phys::page_alloc(ker::mod::mm::PhysicalPageOwner::DEVICE_AHCI, CLB_SIZE, "ahci_clb"));
     if (clb_virt == nullptr) {
         log::error("failed to allocate CLB kernel allocation");
         hcf();
@@ -260,7 +262,8 @@ void port_rebase(volatile HbaPort* port, size_t portno) {
 
     // FIS offset: 32K+256*portno
     // FIS entry size = 256 bytes per port
-    auto* fb_virt = static_cast<uint8_t*>(ker::mod::mm::phys::page_alloc(FIS_RECEIVE_SIZE, "ahci_fis"));
+    auto* fb_virt =
+        static_cast<uint8_t*>(ker::mod::mm::phys::page_alloc(ker::mod::mm::PhysicalPageOwner::DEVICE_AHCI, FIS_RECEIVE_SIZE, "ahci_fis"));
     if (fb_virt == nullptr) {
         log::error("failed to allocate FIS buffer kernel allocation");
         hcf();
@@ -285,7 +288,8 @@ void port_rebase(volatile HbaPort* port, size_t portno) {
         // 8192 entries × 4KB/page = 32MB per command (ATA sector count is 16-bit = 32MB max).
         constexpr size_t CTB_SIZE = command_table_size(COMMAND_TABLE_PRDT_ENTRY_COUNT);
         cmdheader[i].prdtl = static_cast<uint16_t>(COMMAND_TABLE_PRDT_ENTRY_COUNT);
-        auto* ctb_virt = static_cast<uint8_t*>(ker::mod::mm::phys::page_alloc(CTB_SIZE, "ahci_ctb"));
+        auto* ctb_virt =
+            static_cast<uint8_t*>(ker::mod::mm::phys::page_alloc(ker::mod::mm::PhysicalPageOwner::DEVICE_AHCI, CTB_SIZE, "ahci_ctb"));
         if (ctb_virt == nullptr) {
             log::error("failed to allocate CTB kernel allocation");
             hcf();

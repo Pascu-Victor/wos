@@ -480,7 +480,7 @@ auto handle_lazy_vmem_fault(sched::task::Task* task, uint64_t vaddr, const pagin
         // This may run from a hardware page fault with interrupts disabled.
         // Failure is process-local; never enter the fatal allocator dump or a
         // yielding reclaim loop from this context.
-        void* const PAGE = phys::page_alloc_may_fail(paging::PAGE_SIZE, "lazy-vmem");
+        void* const PAGE = phys::page_alloc_may_fail(PhysicalPageOwner::USER_PRIVATE_MAPPING, paging::PAGE_SIZE, "lazy-vmem");
         if (PAGE == nullptr) {
             log::error("lazy vmem fault: OOM pid=%lu vaddr=0x%llx", task->pid, static_cast<unsigned long long>(PAGE_VADDR));
             return false;
@@ -555,8 +555,9 @@ void record_cow_perf_event(sched::task::Task* task, perf::WkiPerfLocalVmemOp op,
 }
 
 auto alloc_cow_destination_page(bool full_overwrite) -> void* {
-    void* const PAGE = full_overwrite ? phys::page_alloc_full_overwrite_page_with_reclaim_may_fail("cow_copy")
-                                      : phys::page_alloc_with_reclaim_may_fail(paging::PAGE_SIZE, "cow_zero");
+    void* const PAGE = full_overwrite
+                           ? phys::page_alloc_full_overwrite_page_with_reclaim_may_fail(PhysicalPageOwner::USER_PRIVATE_MAPPING, "cow_copy")
+                           : phys::page_alloc_with_reclaim_may_fail(PhysicalPageOwner::USER_PRIVATE_MAPPING, paging::PAGE_SIZE, "cow_zero");
     if (PAGE != nullptr && !full_overwrite) {
         std::memset(PAGE, 0, paging::PAGE_SIZE);
     }
@@ -1093,6 +1094,10 @@ auto try_alloc_page_table_from_pool() -> PageTable* {
     pool.pages[pool.count] = nullptr;
     pool.lock.unlock_irqrestore(FLAGS);
 
+    if (!phys::page_reassign_owner(table, PhysicalPageOwner::PAGE_TABLE)) {
+        log::critical("page-table pool could not restore active ownership page=%p", table);
+        hcf();
+    }
     if (phys::page_kind_get(table) != PageKind::PAGE_TABLE || phys::page_ref_get(table) != 1U) {
         log::critical("page-table pool handed out corrupt page table page=%p", table);
         hcf();
@@ -1131,6 +1136,11 @@ auto try_release_page_table_to_pool(PageTable* table) -> bool {
 
     zero_page_table_for_pool(table);
 
+    if (!phys::page_reassign_owner(table, PhysicalPageOwner::PAGE_TABLE_POOL_RESERVE)) {
+        log::critical("page-table pool could not assign reserve ownership page=%p", table);
+        hcf();
+    }
+
     uint64_t const INSERT_FLAGS = pool.lock.lock_irqsave();
     for (size_t i = 0; i < pool.count; ++i) {
         if (pool.pages.at(i) == table) {
@@ -1143,6 +1153,10 @@ auto try_release_page_table_to_pool(PageTable* table) -> bool {
     if (pool.count >= pool.pages.size()) {
         pool.lock.unlock_irqrestore(INSERT_FLAGS);
         page_table_pool_rejects.fetch_add(1, std::memory_order_relaxed);
+        if (!phys::page_reassign_owner(table, PhysicalPageOwner::PAGE_TABLE)) {
+            log::critical("page-table pool could not restore rejected ownership page=%p", table);
+            hcf();
+        }
         return false;
     }
     pool.pages[pool.count] = table;
@@ -1158,7 +1172,7 @@ auto alloc_zeroed_page_table() -> PageTable* {
         return pooled_table;
     }
 
-    auto* table = static_cast<PageTable*>(phys::page_alloc_with_reclaim(paging::PAGE_SIZE, "page_table"));
+    auto* table = static_cast<PageTable*>(phys::page_alloc_with_reclaim(PhysicalPageOwner::PAGE_TABLE, paging::PAGE_SIZE, "page_table"));
     if (table == nullptr) {
         return nullptr;
     }
@@ -3103,7 +3117,7 @@ auto kernel_vmap_contains(const void* ptr) -> bool {
     return ADDRESS >= KERNEL_VMAP_BASE && ADDRESS - KERNEL_VMAP_BASE < ARENA_BYTES;
 }
 
-auto kernel_vmap_alloc(uint64_t size, std::string_view name) -> void* {
+auto kernel_vmap_alloc(PhysicalPageOwner owner, uint64_t size, std::string_view name) -> void* {
     if (!kernel_vmap_initialized || size == 0 || size > UINT64_MAX - (paging::PAGE_SIZE - 1)) {
         return nullptr;
     }
@@ -3123,7 +3137,7 @@ auto kernel_vmap_alloc(uint64_t size, std::string_view name) -> void* {
         if (entry != nullptr && entry->present != 0 && entry->frame != 0) {
             continue;
         }
-        void* frame = phys::page_alloc_full_overwrite_page_with_reclaim_may_fail(name);
+        void* frame = phys::page_alloc_full_overwrite_page_with_reclaim_may_fail(owner, name);
         if (frame == nullptr) {
             break;
         }
@@ -4411,7 +4425,8 @@ auto deep_copy_user_pagemap_cow(PageTable* src, PageTable* dst) -> bool {
                     uint64_t const PTE_FLAGS = PDE_RAW_VAL & ~(FRAME_MASK | PS_BIT);
 
                     for (size_t i1 = 0; i1 < PML2_ENTRY_NUMBER; i1++) {
-                        auto* sub = phys::page_alloc_with_reclaim_may_fail(paging::PAGE_SIZE, "cow_huge_sub");
+                        auto* sub = phys::page_alloc_with_reclaim_may_fail(PhysicalPageOwner::USER_PRIVATE_MAPPING, paging::PAGE_SIZE,
+                                                                           "cow_huge_sub");
                         if (sub == nullptr) {
                             // OOM: free already-allocated sub-pages and pml1
                             for (size_t j = 0; j < i1; j++) {
@@ -4473,7 +4488,8 @@ auto deep_copy_user_pagemap_cow(PageTable* src, PageTable* dst) -> bool {
                     void* data_virt = reinterpret_cast<void*>(addr::get_virt_pointer(DATA_PHYS));
 
                     if (EAGER_COPY_WRITABLE_PRIVATE && IS_WRITABLE_PRIVATE) {
-                        auto* child_page = phys::page_alloc_full_overwrite_page_with_reclaim_may_fail("fork_copy");
+                        auto* child_page = phys::page_alloc_full_overwrite_page_with_reclaim_may_fail(
+                            PhysicalPageOwner::USER_PRIVATE_MAPPING, "fork_copy");
                         if (child_page == nullptr) {
                             return false;
                         }

@@ -22,6 +22,7 @@
 #include <platform/interrupt/gates.hpp>
 #include <platform/ktime/ktime.hpp>
 #include <platform/mm/addr.hpp>
+#include <platform/mm/page_alloc.hpp>
 #include <platform/mm/phys.hpp>
 #include <platform/mm/virt.hpp>
 #include <platform/sched/task.hpp>
@@ -671,7 +672,7 @@ auto send_mq_ctrl_cmd(VirtIONetDevice* dev, uint16_t queue_pairs) -> bool {
     }
 
     // Allocate a DMA-accessible page: [class][cmd][pairs_lo][pairs_hi][ack]
-    auto* buf = static_cast<uint8_t*>(ker::mod::mm::phys::page_alloc(4096));
+    auto* buf = static_cast<uint8_t*>(ker::mod::mm::phys::page_alloc(ker::mod::mm::PhysicalPageOwner::DEVICE_VIRTIO, 4096, "virtio_net"));
     if (buf == nullptr) {
         return false;
     }

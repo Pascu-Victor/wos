@@ -3,13 +3,15 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <net/netdevice.hpp>
 #include <new>
 #include <platform/dbg/dbg.hpp>
-#include <platform/mm/phys.hpp>
+#include <platform/mm/page_alloc.hpp>
 #include <platform/mm/paging.hpp>
+#include <platform/mm/phys.hpp>
 #include <platform/sys/spinlock.hpp>
 
 #ifdef WOS_NET_PACKET_DEBUG
@@ -30,6 +32,9 @@ constexpr uint32_t REFUSE_DUMP_STRIDE = 64;
 struct PacketChunk {
     PacketBuffer** buffers = nullptr;
     size_t count = 0;
+    size_t free = 0;
+    bool reclaimable = false;
+    bool draining = false;
     PacketChunk* next = nullptr;
 };
 
@@ -50,6 +55,7 @@ auto packet_debug_cpu() -> uint16_t { return static_cast<uint16_t>(ker::mod::cpu
 // Global pool (fallback)
 // ---------------------------------------------------------------------------
 size_t pool_capacity = 0;
+size_t pool_reserve_capacity = 0;
 PacketBuffer* free_list = nullptr;
 PacketChunk* chunk_list = nullptr;
 ker::mod::sys::Spinlock pool_lock;
@@ -87,8 +93,8 @@ constexpr size_t PACKET_BUFFER_ALLOC_BYTES = align_up(sizeof(PacketBuffer), ker:
 static_assert(offsetof(PacketBuffer, storage) == 0, "virtio RX DMA assumes packet storage starts at allocation base");
 static_assert(PACKET_BUFFER_ALLOC_BYTES >= PKT_BUF_SIZE, "packet DMA allocation must cover advertised RX buffer length");
 
-auto alloc_dma_packet_buffer() -> PacketBuffer* {
-    void* mem = ker::mod::mm::phys::page_alloc_may_fail(PACKET_BUFFER_ALLOC_BYTES, "net_packet_buffer");
+auto alloc_dma_packet_buffer(ker::mod::mm::PhysicalPageOwner owner) -> PacketBuffer* {
+    void* mem = ker::mod::mm::phys::page_alloc_may_fail(owner, PACKET_BUFFER_ALLOC_BYTES, "net_packet_buffer");
     if (mem == nullptr) {
         return nullptr;
     }
@@ -176,7 +182,7 @@ void pkt_debug_dump_in_use(size_t avail) {
 }
 #endif
 
-void add_buffers_to_pool(size_t count) {
+void add_buffers_to_pool(size_t count, bool reclaimable) {
     auto* new_buffers = new (std::nothrow) PacketBuffer*[count]{};
     if (new_buffers == nullptr) {
         log::error("Failed to allocate packet pointer table for %zu buffers", count);
@@ -190,8 +196,10 @@ void add_buffers_to_pool(size_t count) {
         return;
     }
     size_t allocated = 0;
+    ker::mod::mm::PhysicalPageOwner const OWNER =
+        reclaimable ? ker::mod::mm::PhysicalPageOwner::NETWORK_PACKET : ker::mod::mm::PhysicalPageOwner::NETWORK_PACKET_RESERVE;
     for (; allocated < count; ++allocated) {
-        new_buffers[allocated] = alloc_dma_packet_buffer();
+        new_buffers[allocated] = alloc_dma_packet_buffer(OWNER);
         if (new_buffers[allocated] == nullptr) {
             break;
         }
@@ -204,20 +212,25 @@ void add_buffers_to_pool(size_t count) {
     }
     chunk->buffers = new_buffers;
     chunk->count = count;
+    chunk->free = count;
+    chunk->reclaimable = reclaimable;
 
     pool_lock.lock();
     chunk->next = chunk_list;
     chunk_list = chunk;
     // Link new buffers into free list
     for (size_t i = 0; i < count; i++) {
+        new_buffers[i]->pool_chunk = chunk;
         new_buffers[i]->next = free_list;
         free_list = new_buffers[i];
     }
     pool_capacity += count;
+    if (!reclaimable) {
+        pool_reserve_capacity += count;
+    }
+    free_count.fetch_add(count, std::memory_order_relaxed);
     size_t const TOTAL = pool_capacity;
     pool_lock.unlock();
-
-    free_count.fetch_add(count, std::memory_order_relaxed);
 
     log::debug("Added %zu packet buffers (total: %zu)", count, TOTAL);
 }
@@ -239,7 +252,7 @@ auto pkt_pool_try_grow(size_t min_free, const char* reason) -> bool {
         size_t const GROW_BY = round_up_growth(std::max(DEFICIT, PKT_POOL_GROW_CHUNK));
         log::debug("Growing packet pool by %zu buffers for %s (free=%zu target=%zu capacity=%zu)", GROW_BY, reason, free_now, min_free,
                    pool_capacity);
-        add_buffers_to_pool(GROW_BY);
+        add_buffers_to_pool(GROW_BY, true);
     }
 
     expand_in_progress.store(false, std::memory_order_release);
@@ -255,6 +268,13 @@ auto pkt_global_alloc() -> PacketBuffer* {
     }
     auto* pkt = free_list;
     free_list = pkt->next;
+    auto* chunk = static_cast<PacketChunk*>(pkt->pool_chunk);
+    if (chunk == nullptr || chunk->free == 0) {
+        ker::mod::dbg::panic_handler("packet pool allocation accounting corrupt");
+        __builtin_unreachable();
+    }
+    chunk->free--;
+    free_count.fetch_sub(1, std::memory_order_relaxed);
     pool_lock.unlock_irqrestore(FLAGS);
     return pkt;
 }
@@ -262,8 +282,17 @@ auto pkt_global_alloc() -> PacketBuffer* {
 // Return to global pool (IRQ-safe - see pkt_global_alloc comment).
 void pkt_global_free(PacketBuffer* pkt) {
     uint64_t const FLAGS = pool_lock.lock_irqsave();
-    pkt->next = free_list;
-    free_list = pkt;
+    auto* chunk = static_cast<PacketChunk*>(pkt->pool_chunk);
+    if (chunk == nullptr || chunk->free >= chunk->count) {
+        ker::mod::dbg::panic_handler("packet pool free accounting corrupt");
+        __builtin_unreachable();
+    }
+    chunk->free++;
+    if (!chunk->draining) {
+        pkt->next = free_list;
+        free_list = pkt;
+        free_count.fetch_add(1, std::memory_order_relaxed);
+    }
     pool_lock.unlock_irqrestore(FLAGS);
 }
 
@@ -275,7 +304,7 @@ void pkt_pool_init() {
     }
 
     // Start with minimum pool size
-    add_buffers_to_pool(PKT_POOL_MIN_SIZE);
+    add_buffers_to_pool(PKT_POOL_MIN_SIZE, false);
     initialized = true;
 }
 
@@ -283,10 +312,14 @@ void pkt_pool_expand_for_nics() {
     // Calculate required size: 1024 buffers per NIC, minimum 1024 total
     size_t const REQUIRED = baseline_pool_capacity();
 
-    // Add more buffers if needed
-    if (REQUIRED > pool_capacity) {
-        size_t const TO_ADD = REQUIRED - pool_capacity;
-        add_buffers_to_pool(TO_ADD);
+    // Runtime growth never substitutes for the configured permanent reserve.
+    // A fully free growth chunk must remain independently reclaimable.
+    uint64_t const FLAGS = pool_lock.lock_irqsave();
+    size_t const RESERVE_CAPACITY = pool_reserve_capacity;
+    pool_lock.unlock_irqrestore(FLAGS);
+    if (REQUIRED > RESERVE_CAPACITY) {
+        size_t const TO_ADD = REQUIRED - RESERVE_CAPACITY;
+        add_buffers_to_pool(TO_ADD, false);
     }
 }
 
@@ -296,10 +329,19 @@ auto pkt_pool_free_count() -> size_t { return free_count.load(std::memory_order_
 
 namespace {
 
-void fill_packet_pool_snapshot_common(PacketPoolSnapshot& snapshot) {
+void fill_packet_pool_snapshot_common_locked(PacketPoolSnapshot& snapshot) {
+    snapshot.capacity = pool_capacity;
+    snapshot.baseline_capacity = pool_reserve_capacity;
     snapshot.free = free_count.load(std::memory_order_relaxed);
-    snapshot.used = snapshot.capacity > snapshot.free ? snapshot.capacity - snapshot.free : 0;
     snapshot.active_capacity = snapshot.capacity;
+    for (PacketChunk const* chunk = chunk_list; chunk != nullptr; chunk = chunk->next) {
+        snapshot.used += chunk->count - chunk->free;
+        if (chunk->draining) {
+            snapshot.active_capacity -= chunk->count;
+            snapshot.draining_buffers += chunk->count;
+            snapshot.draining_free += chunk->free;
+        }
+    }
     snapshot.rx_reserve = PKT_POOL_RX_REFILL_RESERVE;
     snapshot.grow_chunk = PKT_POOL_GROW_CHUNK;
     snapshot.buffer_size = PKT_BUF_SIZE;
@@ -313,46 +355,127 @@ void fill_packet_pool_snapshot_common(PacketPoolSnapshot& snapshot) {
 
 auto pkt_pool_snapshot() -> PacketPoolSnapshot {
     PacketPoolSnapshot snapshot{};
-    snapshot.baseline_capacity = baseline_pool_capacity();
     uint64_t const FLAGS = pool_lock.lock_irqsave();
-    snapshot.capacity = pool_capacity;
+    fill_packet_pool_snapshot_common_locked(snapshot);
     pool_lock.unlock_irqrestore(FLAGS);
-
-    fill_packet_pool_snapshot_common(snapshot);
     return snapshot;
 }
 
 auto pkt_pool_try_snapshot(PacketPoolSnapshot& snapshot) -> bool {
     snapshot = {};
-    snapshot.baseline_capacity = baseline_pool_capacity();
 
     uint64_t flags = 0;
     asm volatile("pushfq; popq %0" : "=r"(flags));
     asm volatile("cli" ::: "memory");
     bool const LOCKED = pool_lock.try_lock();
     if (LOCKED) {
-        snapshot.capacity = pool_capacity;
+        fill_packet_pool_snapshot_common_locked(snapshot);
         pool_lock.unlock();
     }
     if ((flags & 0x200) != 0) {
         asm volatile("sti" ::: "memory");
     }
-
-    fill_packet_pool_snapshot_common(snapshot);
     return LOCKED;
 }
 
 auto pkt_pool_reclaim_free(size_t target_capacity) -> PacketPoolReclaimStats {
     PacketPoolReclaimStats stats{};
-    static_cast<void>(target_capacity);
+    PacketChunk* retired = nullptr;
     uint64_t const FLAGS = pool_lock.lock_irqsave();
+    target_capacity = std::max(target_capacity, pool_reserve_capacity);
+    PacketPoolSnapshot before{};
+    fill_packet_pool_snapshot_common_locked(before);
     stats.before_capacity = pool_capacity;
-    stats.before_free = free_count.load(std::memory_order_relaxed);
+    stats.before_free = before.free;
+    stats.before_draining_buffers = before.draining_buffers;
+    stats.before_draining_free = before.draining_free;
+
+    PacketChunk** chunk_link = &chunk_list;
+    while (*chunk_link != nullptr) {
+        PacketChunk* chunk = *chunk_link;
+        if (!chunk->reclaimable || chunk->free != chunk->count || pool_capacity < chunk->count ||
+            pool_capacity - chunk->count < target_capacity) {
+            chunk_link = &chunk->next;
+            continue;
+        }
+
+        size_t removed = 0;
+        PacketBuffer** free_link = &free_list;
+        while (*free_link != nullptr) {
+            if ((*free_link)->pool_chunk == chunk) {
+                *free_link = (*free_link)->next;
+                removed++;
+            } else {
+                free_link = &(*free_link)->next;
+            }
+        }
+        size_t const EXPECTED_FREE_LIST_BUFFERS = chunk->draining ? 0 : chunk->count;
+        if (removed != EXPECTED_FREE_LIST_BUFFERS) {
+            ker::mod::dbg::panic_handler("packet pool reclaim free-list mismatch");
+        }
+
+        *chunk_link = chunk->next;
+        pool_capacity -= chunk->count;
+        if (!chunk->draining) {
+            free_count.fetch_sub(chunk->count, std::memory_order_relaxed);
+        }
+        stats.freed_chunks++;
+        stats.freed_buffers += chunk->count;
+        chunk->next = retired;
+        retired = chunk;
+    }
+
+    PacketPoolSnapshot after_retire{};
+    fill_packet_pool_snapshot_common_locked(after_retire);
+    size_t projected_capacity = pool_capacity - after_retire.draining_buffers;
+    size_t active_capacity = after_retire.active_capacity;
+    for (PacketChunk* chunk = chunk_list; chunk != nullptr && projected_capacity > target_capacity; chunk = chunk->next) {
+        if (!chunk->reclaimable || chunk->draining || active_capacity < chunk->count ||
+            active_capacity - chunk->count < pool_reserve_capacity) {
+            continue;
+        }
+
+        size_t removed = 0;
+        PacketBuffer** free_link = &free_list;
+        while (*free_link != nullptr) {
+            if ((*free_link)->pool_chunk == chunk) {
+                *free_link = (*free_link)->next;
+                removed++;
+            } else {
+                free_link = &(*free_link)->next;
+            }
+        }
+        if (removed != chunk->free) {
+            ker::mod::dbg::panic_handler("packet pool drain free-list mismatch");
+        }
+
+        chunk->draining = true;
+        free_count.fetch_sub(removed, std::memory_order_relaxed);
+        active_capacity -= chunk->count;
+        projected_capacity -= chunk->count;
+        stats.marked_draining_chunks++;
+        stats.marked_draining_buffers += chunk->count;
+        stats.deactivated_free_buffers += removed;
+    }
+
+    PacketPoolSnapshot after{};
+    fill_packet_pool_snapshot_common_locked(after);
     stats.after_capacity = pool_capacity;
-    stats.after_free = stats.before_free;
+    stats.after_free = after.free;
+    stats.after_draining_buffers = after.draining_buffers;
+    stats.after_draining_free = after.draining_free;
     pool_lock.unlock_irqrestore(FLAGS);
+
+    while (retired != nullptr) {
+        PacketChunk* chunk = retired;
+        retired = retired->next;
+        free_packet_buffer_array(chunk->buffers, chunk->count);
+        delete chunk;
+    }
     return stats;
 }
+
+auto pkt_pool_reclaim_for_pressure() -> size_t { return pkt_pool_reclaim_free(0).freed_buffers; }
 
 void pkt_pool_ensure_free(size_t min_free) { static_cast<void>(pkt_pool_try_grow(min_free, "runtime")); }
 
@@ -378,8 +501,6 @@ auto pkt_alloc() -> PacketBuffer* {
     pkt->debug_free_cpu = 0;
     pkt->debug_free_site = 0;
 #endif
-
-    free_count.fetch_sub(1, std::memory_order_relaxed);
 
     return pkt;
 }
@@ -429,7 +550,6 @@ void pkt_free(PacketBuffer* pkt) {
     pkt->debug_free_site = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
 #endif
     pkt_global_free(pkt);
-    free_count.fetch_add(1, std::memory_order_relaxed);
 }
 
 }  // namespace ker::net

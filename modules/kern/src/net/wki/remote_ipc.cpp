@@ -688,6 +688,35 @@ auto enqueue_proxy_pipe_close_tx(uint16_t home_node, const uint8_t* msg, uint16_
     return true;
 }
 
+void schedule_pending_pipe_discard(uint16_t target_node, uint32_t resource_id) {
+    if (target_node == WKI_NODE_INVALID || resource_id == 0) {
+        return;
+    }
+
+    std::array<uint8_t, sizeof(DevOpReqPayload) + sizeof(uint32_t)> msg{};
+    auto* req = reinterpret_cast<DevOpReqPayload*>(msg.data());
+    req->op_id = OP_PIPE_DISCARD_PENDING;
+    req->data_len = sizeof(uint32_t);
+    std::memcpy(msg.data() + sizeof(DevOpReqPayload), &resource_id, sizeof(resource_id));
+    if (enqueue_proxy_pipe_close_tx(target_node, msg.data(), static_cast<uint16_t>(msg.size()), resource_id, OP_PIPE_DISCARD_PENDING)) {
+        return;
+    }
+
+    // Allocation failure in the asynchronous TX queue must not turn a
+    // retired endpoint into permanent receiver state. Fall back to the same
+    // bounded, allocation-free send loop used for terminal pipe closes.
+    int ret = WKI_ERR_NO_MEM;
+    for (uint32_t attempt = 0; attempt < WKI_IPC_PIPE_EOF_MAX_SEND_ATTEMPTS; ++attempt) {
+        ret = wki_send(target_node, WKI_CHAN_IPC_DATA, MsgType::DEV_OP_REQ, msg.data(), static_cast<uint16_t>(msg.size()));
+        if (ret == WKI_OK || proxy_pipe_close_tx_terminal(ret)) {
+            return;
+        }
+        pause_for_ipc_send_retry(ret, attempt);
+    }
+    ker::mod::dbg::logger<"wki">::warn("IPC pending-discard send failed: target=0x%04x resource_id=%u ret=%d", target_node, resource_id,
+                                       ret);
+}
+
 auto proxy_register_waiter_locked(ker::util::SmallVec<uint64_t, 2>& waiters, uint64_t pid) -> bool {
     for (auto waiter : waiters) {
         if (waiter == pid) {
@@ -985,6 +1014,15 @@ void free_pending_pipe_delivery(PendingPipeDelivery* pending) {
     g_ipc_pending_delivery_selftest_frees.fetch_add(1, std::memory_order_relaxed);
 #endif
     delete pending;
+}
+
+auto discard_pending_pipe_delivery(uint16_t home_node, uint32_t resource_id) -> bool {
+    PendingPipeDelivery* pending = nullptr;
+    uint64_t const IRQF = s_ipc_lock.lock_irqsave();
+    pending = take_pending_pipe_delivery_locked(home_node, resource_id);
+    s_ipc_lock.unlock_irqrestore(IRQF);
+    free_pending_pipe_delivery(pending);
+    return pending != nullptr;
 }
 
 auto find_export_pipe_write_backlog_locked(WkiIpcExport* exp) -> ExportPipeWriteBacklog* {
@@ -2952,10 +2990,16 @@ template <int SLOT>
         ipc_release_file_ref(file);
         WkiIpcExport* retired_exports = nullptr;
         uint64_t const IRQF = s_ipc_lock.lock_irqsave();
+        bool const DISCARD_PENDING = !exp->active;
         release_pipe_pump_slot_locked(*arg, exp);
         retired_exports = compact_inactive_exports_locked();
         s_ipc_lock.unlock_irqrestore(IRQF);
         free_retired_exports(retired_exports);
+        if (DISCARD_PENDING) {
+            // This marker is enqueued only after this pump's final IPC_DATA
+            // send completed. Channel sequencing makes it a teardown fence.
+            schedule_pending_pipe_discard(target, resource_id);
+        }
     }
 }
 
@@ -3135,7 +3179,7 @@ auto ipc_dev_op_request_cookie(const uint8_t* payload, uint16_t payload_len, uin
 
 auto ipc_dev_op_is_close(uint16_t op_id) -> bool {
     return op_id == OP_PIPE_CLOSE_READ || op_id == OP_PIPE_CLOSE_WRITE || op_id == OP_PIPE_CLOSE_WRITE_FLOW || op_id == OP_PTY_CLOSE ||
-           op_id == OP_SOCK_CLOSE;
+           op_id == OP_SOCK_CLOSE || op_id == OP_PIPE_DISCARD_PENDING;
 }
 
 auto ipc_dev_op_must_not_drop(uint16_t op_id) -> bool {
@@ -3495,8 +3539,10 @@ void wki_ipc_cleanup_exported_fds(const WkiIpcFdEntry* map, uint16_t count, uint
 
     std::array<ker::mod::sched::task::Task*, WKI_IPC_MAX_EXPORTS> stopped_pumps = {};
     std::array<ker::vfs::File*, WKI_IPC_MAX_EXPORTS> released_files = {};
+    std::array<uint32_t, WKI_IPC_MAX_EXPORTS> direct_discards = {};
     size_t stopped_pump_count = 0;
     size_t released_file_count = 0;
+    size_t direct_discard_count = 0;
     bool wake_export_pipe_flush = false;
     WkiIpcExport* retired_exports = nullptr;
 
@@ -3504,12 +3550,20 @@ void wki_ipc_cleanup_exported_fds(const WkiIpcFdEntry* map, uint16_t count, uint
     for (uint16_t i = 0; i < count; ++i) {
         auto const& entry = map[i];
         auto* exp = find_export_by_resource_id(entry.resource_id);
-        if (exp == nullptr || !exp->active || exp->consumer_node != consumer_node) {
+        if (exp == nullptr || exp->consumer_node != consumer_node) {
+            if (direct_discard_count < direct_discards.size()) {
+                direct_discards.at(direct_discard_count++) = entry.resource_id;
+            }
             continue;
         }
 
-        if (auto* pump_task = stop_pipe_pump_locked(exp); pump_task != nullptr && stopped_pump_count < stopped_pumps.size()) {
+        auto* pump_task = stop_pipe_pump_locked(exp);
+        if (pump_task != nullptr && stopped_pump_count < stopped_pumps.size()) {
             stopped_pumps.at(stopped_pump_count++) = pump_task;
+        } else if (direct_discard_count < direct_discards.size()) {
+            // No pump can still emit IPC_DATA messages for this endpoint, so
+            // the discard marker may be sent directly after dropping the lock.
+            direct_discards.at(direct_discard_count++) = entry.resource_id;
         }
 
         if (exp->file != nullptr && released_file_count < released_files.size()) {
@@ -3541,6 +3595,9 @@ void wki_ipc_cleanup_exported_fds(const WkiIpcFdEntry* map, uint16_t count, uint
         ipc_release_file_ref(file);
     }
     free_retired_exports(retired_exports);
+    for (uint32_t resource_id : std::span(direct_discards.data(), direct_discard_count)) {
+        schedule_pending_pipe_discard(consumer_node, resource_id);
+    }
 }
 
 void wki_ipc_get_perf_snapshot(WkiIpcPerfSnapshot& out) {
@@ -5076,6 +5133,33 @@ auto wki_ipc_selftest_pending_close_promotes_on_poll() -> int {
     return 0;
 }
 
+auto wki_ipc_selftest_discard_retires_unattached_delivery() -> int {
+    constexpr uint16_t HOME_NODE = 0x7A33;
+    constexpr uint32_t RESOURCE_ID = 0x7A330001U;
+
+    static_cast<void>(discard_pending_pipe_delivery(HOME_NODE, RESOURCE_ID));
+    auto* pending = new (std::nothrow) PendingPipeDelivery{};
+    if (pending == nullptr) {
+        return -ENOMEM;
+    }
+    pending->home_node = HOME_NODE;
+    pending->resource_id = RESOURCE_ID;
+    pending->write_closed = true;
+
+    uint64_t const IRQF = s_ipc_lock.lock_irqsave();
+    g_pending_pipe_deliveries.push_back(pending);
+    s_ipc_lock.unlock_irqrestore(IRQF);
+
+    if (!discard_pending_pipe_delivery(HOME_NODE, RESOURCE_ID)) {
+        return -EIO;
+    }
+
+    uint64_t const VERIFY_IRQF = s_ipc_lock.lock_irqsave();
+    bool const REMAINS = find_pending_pipe_delivery_locked(HOME_NODE, RESOURCE_ID) != nullptr;
+    s_ipc_lock.unlock_irqrestore(VERIFY_IRQF);
+    return REMAINS ? -EIO : 0;
+}
+
 auto wki_ipc_selftest_epoll_close_releases_lookup_ref() -> int {
     constexpr uint32_t RESOURCE_ID = 0x7E7E;
 
@@ -6096,6 +6180,11 @@ void handle_ipc_dev_op_req_inline(const WkiHeader* hdr, const uint8_t* payload, 
         return;
     }
 
+    if (OP_ID == OP_PIPE_DISCARD_PENDING) {
+        static_cast<void>(discard_pending_pipe_delivery(hdr->src_node, resource_id));
+        return;
+    }
+
     if (OP_ID == OP_PIPE_DATA || OP_ID == OP_PIPE_DATA_FLOW) {
         bool const FLOW_CONTROLLED = OP_ID == OP_PIPE_DATA_FLOW;
         IpcPerfTrace pipe_trace(ker::mod::perf::WkiPerfIpcOp::PIPE_DATA, hdr->src_node, hdr->channel_id, IPC_CALLSITE, OP_DATA_LEN,
@@ -6586,12 +6675,16 @@ void handle_ipc_dev_op_req_inline(const WkiHeader* hdr, const uint8_t* payload, 
     }
 
     if (OP_ID == OP_PIPE_CLOSE_READ) {
-        // Consumer closed read end — stop the pump, release the export's file ref.
+        // Consumer closed read end — stop the pump, release the export's file
+        // ref, and fence any EOF that races with proxy detachment. A running
+        // pump emits the discard after its last DATA/CLOSE send; without a
+        // pump there can be no later sender, so emit it directly.
         ker::mod::sched::task::Task* pump_task = nullptr;
         uint64_t const IRQF = s_ipc_lock.lock_irqsave();
         auto* exp = find_export_by_resource_id(resource_id);
         if (exp != nullptr && exp->active) {
             pump_task = stop_pipe_pump_locked(exp);
+            bool const DIRECT_DISCARD = pump_task == nullptr;
             ker::vfs::File* f = exp->file;
             exp->file = nullptr;
             exp->active = false;
@@ -6605,9 +6698,16 @@ void handle_ipc_dev_op_req_inline(const WkiHeader* hdr, const uint8_t* payload, 
                 delete f;
             }
             free_retired_exports(retired_exports);
+            if (DIRECT_DISCARD) {
+                schedule_pending_pipe_discard(hdr->src_node, resource_id);
+            }
             return;
         }
         s_ipc_lock.unlock_irqrestore(IRQF);
+        // An already-retired export can still receive the consumer's ordered
+        // close. Re-send the idempotent fence so a late EOF cannot recreate
+        // ownerless pre-attachment state.
+        schedule_pending_pipe_discard(hdr->src_node, resource_id);
         return;
     }
 

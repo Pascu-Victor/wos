@@ -365,6 +365,7 @@ auto wki_ipc_selftest_inactive_proxy_poll_is_terminal() -> int;
 auto wki_ipc_selftest_pty_proxy_poll_is_bidirectional() -> int;
 auto wki_ipc_selftest_pty_close_without_export_queues_pending() -> int;
 auto wki_ipc_selftest_pending_close_promotes_on_poll() -> int;
+auto wki_ipc_selftest_discard_retires_unattached_delivery() -> int;
 auto wki_ipc_selftest_epoll_close_releases_lookup_ref() -> int;
 auto wki_ipc_selftest_nonblocking_pipe_write_view_preserves_source_flags() -> int;
 auto wki_ipc_selftest_export_pipe_write_burst_is_bounded() -> int;

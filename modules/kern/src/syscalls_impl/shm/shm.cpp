@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <platform/dbg/dbg.hpp>
 #include <platform/mm/addr.hpp>
+#include <platform/mm/page_alloc.hpp>
 #include <platform/mm/paging.hpp>
 #include <platform/mm/phys.hpp>
 #include <platform/mm/virt.hpp>
@@ -166,7 +167,7 @@ auto create_segment(int key, uint64_t size, int shmflg, ker::mod::sched::task::T
         return to_errno(ENOSPC);
     }
 
-    void* backing = ker::mod::mm::phys::page_alloc(size, "sysv-shm");
+    void* backing = ker::mod::mm::phys::page_alloc(ker::mod::mm::PhysicalPageOwner::USER_SHARED_MEMORY, size, "sysv-shm");
     if (backing == nullptr) {
         log::warn("out of physical memory for %llu-byte shared segment", static_cast<unsigned long long>(size));
         return to_errno(ENOMEM);

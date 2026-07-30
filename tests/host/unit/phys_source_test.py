@@ -101,6 +101,21 @@ def test_per_cpu_cache_reservation_uses_selector_not_raw_memmap_base() -> None:
             fail(f"per-CPU cache reservation path still uses raw memmap arithmetic: {token}")
 
 
+def test_cached_page_drain_does_not_release_owner_twice() -> None:
+    source = PAGE_ALLOC_CPP.read_text()
+    body = function_body(source, "release_cached_order0_at")
+    require_order(
+        body,
+        [
+            "cached_order0_count -= 1",
+            "free_count -= 1",
+            "page_flags[page_idx] = FLAG_ALLOC_HEAD",
+            "free_allocated_block(this, page_idx, 0, false)",
+        ],
+        "per-CPU cached page drain owner accounting",
+    )
+
+
 def test_selftest_and_ktest_cover_boot_reservation_edges() -> None:
     phys_cpp = PHYS_CPP.read_text()
     phys_hpp = PHYS_HPP.read_text()
@@ -250,7 +265,7 @@ def test_allocator_size_rounding_rejects_overflow_and_overmax_requests() -> None
             "uint64_t requested_pages = 0",
             "if (!page_alloc_size_within_buddy_limit(size, requested_pages))",
             "return nullptr",
-            "find_free_block(size, CALLER_TAG)",
+            "find_free_block(size, owner, CALLER_TAG)",
             "prepare_allocated_block(block, size, zeroing)",
         ],
         "regular phys allocation must validate before zone search and zeroing",
@@ -280,7 +295,7 @@ def test_allocator_size_rounding_rejects_overflow_and_overmax_requests() -> None
         [
             "if (!page_alloc_size_within_buddy_limit(size, requested_pages))",
             "return nullptr",
-            "find_free_block_huge(size, CALLER_TAG)",
+            "find_free_block_huge(size, owner, CALLER_TAG)",
             "std::memset(block, 0, size)",
         ],
         "huge phys allocation must validate before allocation and zeroing",
@@ -327,22 +342,22 @@ def test_allocator_size_rounding_rejects_overflow_and_overmax_requests() -> None
     require_order(
         function_body(kmalloc, "alloc_large_backing"),
         [
-            'virt::kernel_vmap_alloc(size, "kmalloc_large")',
+            'virt::kernel_vmap_alloc(PhysicalPageOwner::KMALLOC_LARGE, size, "kmalloc_large")',
             "if (alloc_ptr != nullptr)",
             "return alloc_ptr",
-            "phys::page_alloc_huge(size)",
-            'phys::page_alloc_with_reclaim_may_fail(size, "kmalloc_large")',
+            "phys::page_alloc_huge(PhysicalPageOwner::KMALLOC_LARGE, size)",
+            'phys::page_alloc_with_reclaim_may_fail(PhysicalPageOwner::KMALLOC_LARGE, size, "kmalloc_large")',
         ],
         "large kmalloc backing must prefer order-0 virtual mappings before physical-contiguous fallbacks",
     )
     require_tokens(
         function_body(kmalloc, "allocate_debug_block"),
-        ['phys::page_alloc_with_reclaim_may_fail(ALLOC_DEBUG_BLOCK_BYTES, "kmalloc_debug")'],
+        ['phys::page_alloc_with_reclaim_may_fail(PhysicalPageOwner::KMALLOC_DEBUG, ALLOC_DEBUG_BLOCK_BYTES, "kmalloc_debug")'],
         "optional kmalloc debug metadata must fail locally under memory pressure",
     )
     require_tokens(
         function_body(kmalloc, "alloc_medium_backing"),
-        ['phys::page_alloc_with_reclaim_may_fail(size, "kmalloc_medium")'],
+        ['phys::page_alloc_with_reclaim_may_fail(PhysicalPageOwner::KMALLOC_MEDIUM, size, "kmalloc_medium")'],
         "medium kmalloc backing must return allocation failure without halting the system",
     )
 
@@ -576,7 +591,7 @@ def test_kernel_stacks_use_an_early_fixed_slot_pool() -> None:
         function_body(phys, "init_kernel_stack_pool"),
         [
             "while (arena_bytes >= KERNEL_STACK_POOL_MIN_BYTES)",
-            'page_alloc_full_overwrite_may_fail(arena_bytes, "kernel_stack_pool")',
+            'page_alloc_full_overwrite_may_fail(PhysicalPageOwner::KERNEL_STACK_POOL, arena_bytes, "kernel_stack_pool")',
             "arena_bytes /= 2",
             "pool.base = static_cast<uint8_t*>(BACKING)",
             "pool.capacity = arena_bytes / ker::mod::mm::KERNEL_STACK_SIZE",
@@ -593,7 +608,7 @@ def test_kernel_stacks_use_an_early_fixed_slot_pool() -> None:
             "pool.in_use.at(INDEX) = true",
             "pool.lock.unlock_irqrestore(FLAGS)",
             "prepare_allocated_block(stack, ker::mod::mm::KERNEL_STACK_SIZE, ReturnedPageZeroing::ZERO)",
-            "page_alloc_with_reclaim_may_fail(ker::mod::mm::KERNEL_STACK_SIZE, name)",
+            "page_alloc_with_reclaim_may_fail(PhysicalPageOwner::KERNEL_STACK, ker::mod::mm::KERNEL_STACK_SIZE, name)",
         ],
         "kernel stack pool allocation and buddy fallback",
     )
@@ -655,6 +670,7 @@ def test_kernel_stacks_use_an_early_fixed_slot_pool() -> None:
 def main() -> None:
     test_internal_reservation_requires_nonzero_base_and_spare_page()
     test_per_cpu_cache_reservation_uses_selector_not_raw_memmap_base()
+    test_cached_page_drain_does_not_release_owner_twice()
     test_selftest_and_ktest_cover_boot_reservation_edges()
     test_buddy_free_list_repair_rebuilds_from_flags()
     test_direct_page_free_rejects_refcounted_blocks()

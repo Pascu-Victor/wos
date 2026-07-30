@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <cstring>
 #include <mod/io/port/port.hpp>
+#include <platform/mm/page_alloc.hpp>
 #include <platform/mm/phys.hpp>
 
 #include "net/packet.hpp"
@@ -51,7 +52,7 @@ auto virtq_alloc(uint16_t size) -> Virtqueue* {
 
     log::debug("virtq_alloc: size=%u, total=%zu bytes, alloc=%zu bytes", size, TOTAL, ALLOC_BYTES);
 
-    auto* mem = ker::mod::mm::phys::page_alloc(ALLOC_BYTES);
+    auto* mem = ker::mod::mm::phys::page_alloc(ker::mod::mm::PhysicalPageOwner::DEVICE_VIRTIO, ALLOC_BYTES, "virtio_queue");
     if (mem == nullptr) {
         log::warn("virtq_alloc: page_alloc(%zu) failed", ALLOC_BYTES);
         delete vq;

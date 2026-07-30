@@ -20,6 +20,7 @@
 #include <mod/io/serial/serial.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/mm/addr.hpp>
+#include <platform/mm/page_alloc.hpp>
 #include <platform/mm/paging.hpp>
 #include <platform/mm/phys.hpp>
 #include <platform/mm/virt.hpp>
@@ -169,7 +170,7 @@ auto handle_shadow_fault(uint64_t cr2) -> bool {
     s_shadow_map_lock.clear(std::memory_order_release);
 
     // Allocate one zeroed physical page (shadow is 0x00 = accessible by default).
-    void* phys_page = mm::phys::page_alloc(mm::paging::PAGE_SIZE, "kasan shadow fault");
+    void* phys_page = mm::phys::page_alloc(mm::PhysicalPageOwner::KASAN_SHADOW, mm::paging::PAGE_SIZE, "kasan shadow fault");
     if (phys_page == nullptr) {
         log::error("OOM allocating shadow page for cr2=0x%lx", cr2);
         s_shadow_fault_cpus.fetch_and(~CPU_BIT, std::memory_order_release);

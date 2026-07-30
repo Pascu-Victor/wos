@@ -134,6 +134,7 @@ struct XfsTransaction {
 
     XfsMountContext* mount{};
     XfsTransaction* pool_next{};
+    void* pool_arena{};
     std::array<XfsTransItem, XFS_TRANS_INLINE_ITEMS> inline_items{};
     XfsTransItem* items{inline_items.data()};
     int item_capacity{XFS_TRANS_INLINE_ITEMS};

@@ -176,7 +176,8 @@ auto pop_debug_slot_locked() -> AllocDebugInfo* {
 }
 
 auto allocate_debug_block() -> AllocDebugBlock* {
-    return static_cast<AllocDebugBlock*>(phys::page_alloc_with_reclaim_may_fail(ALLOC_DEBUG_BLOCK_BYTES, "kmalloc_debug"));
+    return static_cast<AllocDebugBlock*>(
+        phys::page_alloc_with_reclaim_may_fail(PhysicalPageOwner::KMALLOC_DEBUG, ALLOC_DEBUG_BLOCK_BYTES, "kmalloc_debug"));
 }
 
 auto register_alloc_debug(uintptr_t caller, const char* tag) -> AllocDebugInfo* {
@@ -690,21 +691,23 @@ auto slab_size_to_idx(size_t slab_size) -> SlabClass {
     }
 }
 
-auto alloc_medium_backing(uint64_t size) -> void* { return phys::page_alloc_with_reclaim_may_fail(size, "kmalloc_medium"); }
+auto alloc_medium_backing(uint64_t size) -> void* {
+    return phys::page_alloc_with_reclaim_may_fail(PhysicalPageOwner::KMALLOC_MEDIUM, size, "kmalloc_medium");
+}
 
 auto alloc_large_backing(uint64_t size) -> void* {
     // Large C++ containers require contiguous virtual bytes, not contiguous
     // physical frames. Use the order-0-backed kernel arena first so a
     // fragmented buddy allocator cannot reject multi-megabyte allocations.
-    void* alloc_ptr = virt::kernel_vmap_alloc(size, "kmalloc_large");
+    void* alloc_ptr = virt::kernel_vmap_alloc(PhysicalPageOwner::KMALLOC_LARGE, size, "kmalloc_large");
     if (alloc_ptr != nullptr) {
         return alloc_ptr;
     }
-    alloc_ptr = phys::page_alloc_huge(size);
+    alloc_ptr = phys::page_alloc_huge(PhysicalPageOwner::KMALLOC_LARGE, size);
     if (alloc_ptr != nullptr) {
         return alloc_ptr;
     }
-    return phys::page_alloc_with_reclaim_may_fail(size, "kmalloc_large");
+    return phys::page_alloc_with_reclaim_may_fail(PhysicalPageOwner::KMALLOC_LARGE, size, "kmalloc_large");
 }
 
 auto checked_page_rounded_alloc_size(uint64_t payload_size, uint64_t header_size, uint64_t& out_rounded_size) -> bool {

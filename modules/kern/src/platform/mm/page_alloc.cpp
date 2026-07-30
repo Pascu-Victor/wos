@@ -77,6 +77,32 @@ void store_page_kind(std::atomic<uint8_t>& slot, PageKind kind) {
     slot.store(static_cast<uint8_t>(decode_page_kind(static_cast<uint8_t>(kind))), std::memory_order_release);
 }
 
+void store_page_owner(uint8_t& slot, PhysicalPageOwner owner) { slot = static_cast<uint8_t>(owner); }
+
+auto load_page_owner(const uint8_t& slot) -> PhysicalPageOwner {
+    auto const OWNER = static_cast<PhysicalPageOwner>(slot);
+    return physical_page_owner_is_valid(OWNER) ? OWNER : PhysicalPageOwner::INVALID;
+}
+
+auto owner_index(PhysicalPageOwner owner) -> size_t { return static_cast<size_t>(owner); }
+
+void account_owner_alloc(PageAllocator* alloc, PhysicalPageOwner owner, uint64_t pages, uint64_t objects = 1) {
+    if (!physical_page_owner_is_valid(owner)) {
+        ker::mod::dbg::panic_handler("physical allocation requires a concrete owner");
+    }
+    alloc->owner_pages.at(owner_index(owner)) += pages;
+    alloc->owner_objects.at(owner_index(owner)) += objects;
+}
+
+void account_owner_free(PageAllocator* alloc, PhysicalPageOwner owner, uint64_t pages, uint64_t objects = 1) {
+    if (!physical_page_owner_is_valid(owner) || alloc->owner_pages.at(owner_index(owner)) < pages ||
+        alloc->owner_objects.at(owner_index(owner)) < objects) {
+        ker::mod::dbg::panic_handler("physical owner accounting underflow");
+    }
+    alloc->owner_pages.at(owner_index(owner)) -= pages;
+    alloc->owner_objects.at(owner_index(owner)) -= objects;
+}
+
 auto page_kind_name(PageKind kind) -> const char* {
     switch (kind) {
         case PageKind::UNKNOWN:
@@ -231,6 +257,9 @@ auto free_block_pages_are_reusable(PageAllocator* alloc, uint32_t page_idx, int 
         if (alloc->page_refcounts[CUR_IDX].load(std::memory_order_acquire) != 0) {
             panic_non_reusable_free_block_page(alloc, {.free_head_idx = page_idx, .bad_page_idx = CUR_IDX}, order, reason);
         }
+        if (load_page_owner(alloc->page_owners[CUR_IDX]) != PhysicalPageOwner::INVALID) {
+            panic_non_reusable_free_block_page(alloc, {.free_head_idx = page_idx, .bad_page_idx = CUR_IDX}, order, reason);
+        }
 #ifdef WOS_PHYS_ALLOC_CALLER_STATS
         if (alloc->page_callers[CUR_IDX] != 0) {
             panic_non_reusable_free_block_page(alloc, {.free_head_idx = page_idx, .bad_page_idx = CUR_IDX}, order, reason);
@@ -376,6 +405,9 @@ auto order0_free_head_is_reusable(PageAllocator* alloc, PageAllocator::FreeBlock
     if (alloc->page_refcounts[page_idx].load(std::memory_order_acquire) != 0) {
         return false;
     }
+    if (load_page_owner(alloc->page_owners[page_idx]) != PhysicalPageOwner::INVALID) {
+        return false;
+    }
 #ifdef WOS_PHYS_ALLOC_CALLER_STATS
     if (alloc->page_callers[page_idx] != 0) {
         return false;
@@ -394,7 +426,7 @@ auto allocated_block_has_direct_free_refs(PageAllocator* alloc, uint32_t page_id
     return true;
 }
 
-auto free_allocated_block(PageAllocator* alloc, uint32_t page_idx, int order) -> uint64_t {
+auto free_allocated_block(PageAllocator* alloc, uint32_t page_idx, int order, bool release_owner = true) -> uint64_t {
     if (order < 0 || order > PageAllocator::MAX_ORDER) {
         return 0;
     }
@@ -405,11 +437,25 @@ auto free_allocated_block(PageAllocator* alloc, uint32_t page_idx, int order) ->
     }
 
     uint64_t const FREED_BYTES = static_cast<uint64_t>(BLOCK_SIZE) * paging::PAGE_SIZE;
+    if (release_owner) {
+        PhysicalPageOwner const OWNER = load_page_owner(alloc->page_owners[page_idx]);
+        uint64_t object_count = 0;
+        for (uint32_t i = 0; i < BLOCK_SIZE; ++i) {
+            if (load_page_owner(alloc->page_owners[page_idx + i]) != OWNER) {
+                ker::mod::dbg::panic_handler("physical allocation spans multiple owners");
+            }
+            if ((alloc->page_flags[page_idx + i] & 0xC0) == PageAllocator::FLAG_ALLOC_HEAD) {
+                object_count++;
+            }
+        }
+        account_owner_free(alloc, OWNER, BLOCK_SIZE, object_count);
+    }
 
     // Clear flags for the entire allocation.
     for (uint32_t i = 0; i < BLOCK_SIZE; i++) {
         alloc->page_flags[page_idx + i] = PageAllocator::FLAG_FREE_INTERIOR;
         store_page_kind(alloc->page_kinds[page_idx + i], PageKind::FREE);
+        store_page_owner(alloc->page_owners[page_idx + i], PhysicalPageOwner::INVALID);
         alloc->page_refcounts[page_idx + i].store(0, std::memory_order_release);
 #ifdef WOS_PHYS_ALLOC_CALLER_STATS
         alloc->page_callers[page_idx + i] = 0;
@@ -498,14 +544,18 @@ void PageAllocator::init(uint64_t zone_base, uint64_t size_bytes) {
     // --- lay out metadata at the beginning of the zone ---
 
     // PageAllocator struct occupies bytes [0, sizeof(*this)).
-    // page_flags array immediately after, then page_kinds and page_refcounts.
+    // page_flags array immediately after, then page_kinds, page owners and
+    // page_refcounts.
     uint64_t const FLAGS_OFFSET = sizeof(PageAllocator);
     page_flags = reinterpret_cast<uint8_t*>(zone_base + FLAGS_OFFSET);
 
     uint64_t const KINDS_OFFSET = FLAGS_OFFSET + static_cast<uint64_t>(total_pages);
     page_kinds = reinterpret_cast<std::atomic<uint8_t>*>(zone_base + KINDS_OFFSET);
 
-    uint64_t refcounts_offset = KINDS_OFFSET + (static_cast<uint64_t>(total_pages) * sizeof(std::atomic<uint8_t>));
+    uint64_t const OWNERS_OFFSET = KINDS_OFFSET + (static_cast<uint64_t>(total_pages) * sizeof(std::atomic<uint8_t>));
+    page_owners = reinterpret_cast<uint8_t*>(zone_base + OWNERS_OFFSET);
+
+    uint64_t refcounts_offset = OWNERS_OFFSET + static_cast<uint64_t>(total_pages);
     // Align refcounts to 4-byte boundary for uint32_t access
     refcounts_offset = (refcounts_offset + 3) & ~3ULL;
     page_refcounts = reinterpret_cast<std::atomic<uint32_t>*>(zone_base + refcounts_offset);
@@ -517,6 +567,8 @@ void PageAllocator::init(uint64_t zone_base, uint64_t size_bytes) {
     meta_bytes = CALLERS_OFFSET + (static_cast<uint64_t>(total_pages) * sizeof(uint64_t));
 #endif
     metadata_pages = static_cast<uint32_t>((meta_bytes + paging::PAGE_SIZE - 1) / paging::PAGE_SIZE);
+    owner_pages.fill(0);
+    owner_objects.fill(0);
 
     if (metadata_pages >= total_pages) {
         // Zone too small to hold any usable pages.
@@ -528,6 +580,7 @@ void PageAllocator::init(uint64_t zone_base, uint64_t size_bytes) {
         }
         std::memset(page_flags, FLAG_RESERVED, total_pages);
         fill_page_kinds(page_kinds, total_pages, PageKind::RESERVED);
+        std::memset(page_owners, static_cast<int>(PhysicalPageOwner::INVALID), total_pages);
         zero_page_refcounts(page_refcounts, total_pages);
 #ifdef WOS_PHYS_ALLOC_CALLER_STATS
         std::memset(page_callers, 0, total_pages * sizeof(uint64_t));
@@ -550,6 +603,7 @@ void PageAllocator::init(uint64_t zone_base, uint64_t size_bytes) {
     std::memset(page_flags + metadata_pages, FLAG_FREE_INTERIOR, total_pages - metadata_pages);
     fill_page_kinds(page_kinds, metadata_pages, PageKind::RESERVED);
     fill_page_kinds(page_kinds + metadata_pages, total_pages - metadata_pages, PageKind::FREE);
+    std::memset(page_owners, static_cast<int>(PhysicalPageOwner::INVALID), total_pages);
     zero_page_refcounts(page_refcounts, total_pages);
 #ifdef WOS_PHYS_ALLOC_CALLER_STATS
     std::memset(page_callers, 0, total_pages * sizeof(uint64_t));
@@ -591,7 +645,7 @@ void PageAllocator::init(uint64_t zone_base, uint64_t size_bytes) {
 // alloc
 // ============================================================================
 
-void* PageAllocator::alloc(uint64_t size_bytes, uint64_t caller) {
+void* PageAllocator::alloc(uint64_t size_bytes, PhysicalPageOwner owner, uint64_t caller) {
 #ifndef WOS_PHYS_ALLOC_CALLER_STATS
     (void)caller;
 #endif
@@ -672,17 +726,19 @@ void* PageAllocator::alloc(uint64_t size_bytes, uint64_t caller) {
     // Set refcount to 1 for all pages in the block
     for (uint32_t i = 0; i < BLOCK_SIZE; i++) {
         store_page_kind(page_kinds[page_idx + i], PageKind::NORMAL);
+        store_page_owner(page_owners[page_idx + i], owner);
         page_refcounts[page_idx + i].store(1, std::memory_order_release);
 #ifdef WOS_PHYS_ALLOC_CALLER_STATS
         page_callers[page_idx + i] = caller;
 #endif
     }
 
+    account_owner_alloc(this, owner, BLOCK_SIZE);
     free_count -= BLOCK_SIZE;
     return reinterpret_cast<void*>(base + (static_cast<uint64_t>(page_idx) * paging::PAGE_SIZE));
 }
 
-void* PageAllocator::alloc_order0(uint64_t caller) {
+void* PageAllocator::alloc_order0(PhysicalPageOwner owner, uint64_t caller) {
 #ifndef WOS_PHYS_ALLOC_CALLER_STATS
     (void)caller;
 #endif
@@ -707,10 +763,12 @@ void* PageAllocator::alloc_order0(uint64_t caller) {
 
     page_flags[page_idx] = FLAG_ALLOC_HEAD;
     store_page_kind(page_kinds[page_idx], PageKind::NORMAL);
+    store_page_owner(page_owners[page_idx], owner);
     page_refcounts[page_idx].store(1, std::memory_order_release);
 #ifdef WOS_PHYS_ALLOC_CALLER_STATS
     page_callers[page_idx] = caller;
 #endif
+    account_owner_alloc(this, owner, 1);
     free_count -= 1;
     return page_to_ptr(base, page_idx);
 }
@@ -737,6 +795,7 @@ void* PageAllocator::claim_free_order0_for_cache(uint32_t& out_page_idx) {
 
     page_flags[page_idx] = FLAG_CACHED_ORDER0;
     store_page_kind(page_kinds[page_idx], PageKind::FREE);
+    store_page_owner(page_owners[page_idx], PhysicalPageOwner::INVALID);
     page_refcounts[page_idx].store(0, std::memory_order_release);
 #ifdef WOS_PHYS_ALLOC_CALLER_STATS
     page_callers[page_idx] = 0;
@@ -774,8 +833,11 @@ auto PageAllocator::cache_allocated_order0(void* ptr, uint32_t& out_page_idx) ->
         ker::mod::dbg::panic_handler("page_free called on live kmalloc large alloc");
     }
 
+    PhysicalPageOwner const OWNER = load_page_owner(page_owners[PAGE_IDX]);
+    account_owner_free(this, OWNER, 1);
     page_flags[PAGE_IDX] = FLAG_CACHED_ORDER0;
     store_page_kind(page_kinds[PAGE_IDX], PageKind::FREE);
+    store_page_owner(page_owners[PAGE_IDX], PhysicalPageOwner::INVALID);
     page_refcounts[PAGE_IDX].store(0, std::memory_order_release);
 #ifdef WOS_PHYS_ALLOC_CALLER_STATS
     page_callers[PAGE_IDX] = 0;
@@ -786,7 +848,7 @@ auto PageAllocator::cache_allocated_order0(void* ptr, uint32_t& out_page_idx) ->
     return true;
 }
 
-auto PageAllocator::alloc_cached_order0_at(uint32_t page_idx, uint64_t caller) -> void* {
+auto PageAllocator::alloc_cached_order0_at(uint32_t page_idx, PhysicalPageOwner owner, uint64_t caller) -> void* {
 #ifndef WOS_PHYS_ALLOC_CALLER_STATS
     (void)caller;
 #endif
@@ -794,6 +856,9 @@ auto PageAllocator::alloc_cached_order0_at(uint32_t page_idx, uint64_t caller) -
         return nullptr;
     }
     if (decode_page_kind(page_kinds[page_idx].load(std::memory_order_acquire)) != PageKind::FREE) {
+        return nullptr;
+    }
+    if (load_page_owner(page_owners[page_idx]) != PhysicalPageOwner::INVALID) {
         return nullptr;
     }
     if (page_refcounts[page_idx].load(std::memory_order_acquire) != 0) {
@@ -805,10 +870,12 @@ auto PageAllocator::alloc_cached_order0_at(uint32_t page_idx, uint64_t caller) -
 
     page_flags[page_idx] = FLAG_ALLOC_HEAD;
     store_page_kind(page_kinds[page_idx], PageKind::NORMAL);
+    store_page_owner(page_owners[page_idx], owner);
     page_refcounts[page_idx].store(1, std::memory_order_release);
 #ifdef WOS_PHYS_ALLOC_CALLER_STATS
     page_callers[page_idx] = caller;
 #endif
+    account_owner_alloc(this, owner, 1);
     free_count -= 1;
     cached_order0_count -= 1;
     return page_to_ptr(base, page_idx);
@@ -831,7 +898,10 @@ auto PageAllocator::release_cached_order0_at(uint32_t page_idx) -> uint64_t {
     cached_order0_count -= 1;
     free_count -= 1;
     page_flags[page_idx] = FLAG_ALLOC_HEAD;
-    return free_allocated_block(this, page_idx, 0);
+    // cache_allocated_order0() already removed the former allocation owner
+    // and counted this page as free. Draining only changes its free-list
+    // representation; it must not decrement an owner a second time.
+    return free_allocated_block(this, page_idx, 0, false);
 }
 
 // ============================================================================
@@ -952,7 +1022,15 @@ uint64_t PageAllocator::free_order0_range_at(uint32_t page_idx, uint32_t page_co
     uint32_t cursor = page_idx;
     uint32_t remaining = page_count;
     while (remaining > 0) {
-        int const ORDER = largest_order_for_aligned_run(cursor, remaining);
+        PhysicalPageOwner const OWNER = load_page_owner(page_owners[cursor]);
+        uint32_t same_owner_pages = 1;
+        while (same_owner_pages < remaining && load_page_owner(page_owners[cursor + same_owner_pages]) == OWNER) {
+            same_owner_pages++;
+        }
+        // Refcount batches may combine adjacent order-0 allocations whose
+        // mapping/cache ownership differs. Preserve the batching optimization,
+        // but never collapse distinct owner rows into one accounting release.
+        int const ORDER = largest_order_for_aligned_run(cursor, same_owner_pages);
         uint32_t const BLOCK_SIZE = 1U << ORDER;
         freed_bytes += free_allocated_block(this, cursor, ORDER);
         cursor += BLOCK_SIZE;
@@ -961,7 +1039,7 @@ uint64_t PageAllocator::free_order0_range_at(uint32_t page_idx, uint32_t page_co
     return freed_bytes;
 }
 
-auto PageAllocator::split_allocated_block_to_order0(void* ptr) const -> bool {
+auto PageAllocator::split_allocated_block_to_order0(void* ptr) -> bool {
     if (ptr == nullptr || !ptr_in_zone(this, ptr)) {
         return false;
     }
@@ -990,9 +1068,15 @@ auto PageAllocator::split_allocated_block_to_order0(void* ptr) const -> bool {
     uint64_t const CALLER = page_callers[PAGE_IDX];
 #endif
     PageKind const KIND = decode_page_kind(page_kinds[PAGE_IDX].load(std::memory_order_acquire));
+    PhysicalPageOwner const OWNER = load_page_owner(page_owners[PAGE_IDX]);
+    if (!physical_page_owner_is_valid(OWNER)) {
+        return false;
+    }
+    owner_objects.at(owner_index(OWNER)) += BLOCK_SIZE - 1;
     for (uint32_t i = 0; i < BLOCK_SIZE; ++i) {
         page_flags[PAGE_IDX + i] = FLAG_ALLOC_HEAD;
         store_page_kind(page_kinds[PAGE_IDX + i], KIND);
+        store_page_owner(page_owners[PAGE_IDX + i], OWNER);
         if (page_refcounts[PAGE_IDX + i].load(std::memory_order_acquire) == 0) {
             page_refcounts[PAGE_IDX + i].store(1, std::memory_order_release);
         }
@@ -1031,6 +1115,49 @@ auto PageAllocator::mark_allocated_block_kind(void* ptr, PageKind kind) const ->
 
     for (uint32_t i = 0; i < BLOCK_SIZE; ++i) {
         store_page_kind(page_kinds[PAGE_IDX + i], kind);
+    }
+    return true;
+}
+
+auto PageAllocator::reassign_allocated_block_owner(void* ptr, PhysicalPageOwner owner) -> bool {
+    if (ptr == nullptr || !ptr_in_zone(this, ptr) || !physical_page_owner_is_valid(owner)) {
+        return false;
+    }
+
+    uint32_t const PAGE_IDX = ptr_to_page(base, ptr);
+    if (PAGE_IDX >= total_pages) {
+        return false;
+    }
+    uint8_t const FLAGS = page_flags[PAGE_IDX];
+    if ((FLAGS & 0xC0) != FLAG_ALLOC_HEAD) {
+        return false;
+    }
+    int const ORDER = FLAGS & 0x1F;
+    if (ORDER > MAX_ORDER) {
+        return false;
+    }
+    uint32_t const BLOCK_SIZE = 1U << ORDER;
+    if (PAGE_IDX + BLOCK_SIZE > total_pages) {
+        return false;
+    }
+
+    PhysicalPageOwner const OLD_OWNER = load_page_owner(page_owners[PAGE_IDX]);
+    uint64_t object_count = 0;
+    for (uint32_t i = 0; i < BLOCK_SIZE; ++i) {
+        if (load_page_owner(page_owners[PAGE_IDX + i]) != OLD_OWNER) {
+            return false;
+        }
+        if ((page_flags[PAGE_IDX + i] & 0xC0) == FLAG_ALLOC_HEAD) {
+            object_count++;
+        }
+    }
+    if (OLD_OWNER == owner) {
+        return true;
+    }
+    account_owner_free(this, OLD_OWNER, BLOCK_SIZE, object_count);
+    account_owner_alloc(this, owner, BLOCK_SIZE, object_count);
+    for (uint32_t i = 0; i < BLOCK_SIZE; ++i) {
+        store_page_owner(page_owners[PAGE_IDX + i], owner);
     }
     return true;
 }

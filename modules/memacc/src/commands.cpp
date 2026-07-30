@@ -26,7 +26,7 @@ namespace {
 struct WatchSnapshot {
     uint64_t free_bytes = 0;
     uint64_t used_bytes = 0;
-    uint64_t allocator_bytes = 0;
+    uint64_t tracked_physical_bytes = 0;
     std::unordered_map<uint64_t, uint64_t> proc_bytes;
     std::unordered_map<uint64_t, std::string> proc_names;
 };
@@ -37,7 +37,8 @@ auto collect_watch_snapshot() -> WatchSnapshot {
     if (const Row* summary = first_record(summary_rows, "summary"); summary != nullptr) {
         snap.free_bytes = get_u64(*summary, "free_bytes");
         snap.used_bytes = get_u64(*summary, "used_bytes");
-        snap.allocator_bytes = get_u64(*summary, "allocator_bytes");
+        snap.tracked_physical_bytes = get_u64(*summary, "owner_bytes") + get_u64(*summary, "allocator_metadata_bytes") +
+                                      get_u64(*summary, "zone_descriptor_bytes") + get_u64(*summary, "per_cpu_page_cache_reserve_bytes");
     }
     for (const auto& proc : load_procs()) {
         snap.proc_bytes[proc.pid] = proc.total_bytes;
@@ -67,7 +68,7 @@ void run_watch(const Options& opt) {
         if (prev.has_value()) {
             print_delta_line("free", prev->free_bytes, cur.free_bytes);
             print_delta_line("used", prev->used_bytes, cur.used_bytes);
-            print_delta_line("allocator", prev->allocator_bytes, cur.allocator_bytes);
+            print_delta_line("tracked phys", prev->tracked_physical_bytes, cur.tracked_physical_bytes);
 
             struct Mover {
                 uint64_t pid;
@@ -102,7 +103,7 @@ void run_watch(const Options& opt) {
         } else {
             print_delta_line("free", cur.free_bytes, cur.free_bytes);
             print_delta_line("used", cur.used_bytes, cur.used_bytes);
-            print_delta_line("allocator", cur.allocator_bytes, cur.allocator_bytes);
+            print_delta_line("tracked phys", cur.tracked_physical_bytes, cur.tracked_physical_bytes);
         }
         prev = std::move(cur);
         sleep_seconds(opt.interval_seconds);
@@ -124,7 +125,7 @@ auto normalize_feature(std::string_view feature) -> std::string {
 void usage() {
     std::printf(
         "usage: memacc [dump [--full]|summary|procs|proc <pid>|kernel|allocs|raw [file]|watch [-n sec]|track <feature> <action>|reclaim "
-        "<buffer_cache|packet_pool> [target]]\n");
+        "<buffer_cache|packet_pool|xfs_inode|file_mmap_cache> [target]]\n");
 }
 
 auto run_dump(int argc, char** argv) -> int {
@@ -182,9 +183,20 @@ auto run_allocs(int argc, char** argv) -> int {
 auto run_raw(int argc, char** argv) -> int {
     std::string file = argc >= 3 ? argv[2] : "summary";
     if (file == "all") {
-        constexpr std::array<std::string_view, 12> FILES{
-            "summary",         "zones",        "procs",        "dead",     "alloc_totals",         "slabs",
-            "kmalloc_callers", "kmalloc_live", "page_callers", "features", "reclaim/buffer_cache", "reclaim/packet_pool"};
+        constexpr std::array<std::string_view, 14> FILES{"summary",
+                                                         "zones",
+                                                         "procs",
+                                                         "dead",
+                                                         "alloc_totals",
+                                                         "slabs",
+                                                         "kmalloc_callers",
+                                                         "kmalloc_live",
+                                                         "page_callers",
+                                                         "features",
+                                                         "reclaim/buffer_cache",
+                                                         "reclaim/packet_pool",
+                                                         "reclaim/xfs_inode",
+                                                         "reclaim/file_mmap_cache"};
         for (auto one : FILES) {
             auto text = read_file(memacc_path(one));
             if (text.has_value()) {
@@ -245,6 +257,10 @@ auto run_reclaim(int argc, char** argv) -> int {
         target = "buffer_cache";
     } else if (target_arg == "packet_pool" || target_arg == "packets" || target_arg == "pkt") {
         target = "packet_pool";
+    } else if (target_arg == "xfs_inode" || target_arg == "xfs" || target_arg == "inodes") {
+        target = "xfs_inode";
+    } else if (target_arg == "file_mmap_cache" || target_arg == "file_mmap" || target_arg == "mmap_cache") {
+        target = "file_mmap_cache";
     } else {
         std::printf("memacc: unknown reclaim target '%s'\n", argv[2]);
         return 1;
@@ -297,7 +313,7 @@ auto run_reclaim(int argc, char** argv) -> int {
                     static_cast<unsigned long long>(bytes_to_kib(get_u64(*after, "clean_bytes"))),
                     static_cast<unsigned long long>(bytes_to_kib(get_u64(*after, "dirty_bytes"))),
                     static_cast<unsigned long long>(get_u64(*after, "buffers")));
-    } else {
+    } else if (target == "packet_pool") {
         uint64_t const BEFORE_BYTES = before != nullptr ? get_u64(*before, "total_bytes") : 0;
         uint64_t const BEFORE_CAPACITY = before != nullptr ? get_u64(*before, "capacity") : 0;
         uint64_t const AFTER_BYTES = get_u64(*after, "total_bytes");
@@ -313,6 +329,21 @@ auto run_reclaim(int argc, char** argv) -> int {
             static_cast<unsigned long long>(get_u64(*after, "used")), static_cast<unsigned long long>(get_u64(*after, "baseline_capacity")),
             static_cast<unsigned long long>(get_u64(*after, "draining_buffers")),
             static_cast<unsigned long long>(get_u64(*after, "draining_free")));
+    } else if (target == "xfs_inode") {
+        uint64_t const BEFORE_IDLE = before != nullptr ? get_u64(*before, "idle_inodes") : 0;
+        uint64_t const AFTER_IDLE = get_u64(*after, "idle_inodes");
+        uint64_t const FREED = BEFORE_IDLE >= AFTER_IDLE ? BEFORE_IDLE - AFTER_IDLE : 0;
+        std::printf("xfs_inode before=%llu idle after=%llu idle freed=%llu idle retain_limit=%llu total_reclaim_victims=%llu\n",
+                    static_cast<unsigned long long>(BEFORE_IDLE), static_cast<unsigned long long>(AFTER_IDLE),
+                    static_cast<unsigned long long>(FREED), static_cast<unsigned long long>(get_u64(*after, "retain_limit")),
+                    static_cast<unsigned long long>(get_u64(*after, "reclaim_victims")));
+    } else {
+        uint64_t const BEFORE_PAGES = before != nullptr ? get_u64(*before, "pages") : 0;
+        uint64_t const AFTER_PAGES = get_u64(*after, "pages");
+        uint64_t const FREED = BEFORE_PAGES >= AFTER_PAGES ? BEFORE_PAGES - AFTER_PAGES : 0;
+        std::printf("file_mmap_cache before=%llu pages after=%llu pages released=%llu pages capacity=%llu pages\n",
+                    static_cast<unsigned long long>(BEFORE_PAGES), static_cast<unsigned long long>(AFTER_PAGES),
+                    static_cast<unsigned long long>(FREED), static_cast<unsigned long long>(get_u64(*after, "capacity_pages")));
     }
     return 0;
 }

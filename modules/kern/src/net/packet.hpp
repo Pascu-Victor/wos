@@ -60,6 +60,7 @@ struct PacketPoolReclaimStats {
 
 struct PacketBuffer {
     std::array<uint8_t, PKT_BUF_SIZE> storage{};
+    void* pool_chunk{};    // Private pool ownership; stable for the buffer lifetime
     uint8_t* data{};       // current data pointer
     size_t len{};          // current data length
     PacketBuffer* next{};  // freelist / queue linkage
@@ -110,6 +111,7 @@ auto pkt_pool_free_count() -> size_t;  // Approximate free buffers available
 auto pkt_pool_snapshot() -> PacketPoolSnapshot;
 auto pkt_pool_try_snapshot(PacketPoolSnapshot& snapshot) -> bool;
 auto pkt_pool_reclaim_free(size_t target_capacity) -> PacketPoolReclaimStats;
+auto pkt_pool_reclaim_for_pressure() -> size_t;
 void pkt_pool_ensure_free(size_t min_free);
 auto pkt_alloc() -> PacketBuffer*;
 auto pkt_alloc_tx() -> PacketBuffer*;  // TX-only: fails if pool is low (reserves for RX)

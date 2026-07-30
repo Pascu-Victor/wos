@@ -397,16 +397,18 @@ def test_user_memory_pressure_does_not_enter_fatal_oom() -> None:
     require_tokens(
         function_body(vmem, "file_mmap_cached_page_for_file"),
         [
-            'page_alloc_full_overwrite_page_with_reclaim_may_fail("vmem-file-cache")',
-            'page_alloc_with_reclaim_may_fail(ker::mod::mm::paging::PAGE_SIZE, "vmem-file-cache")',
+            "page_alloc_full_overwrite_page_with_reclaim_may_fail(",
+            'ker::mod::mm::PhysicalPageOwner::USER_FILE_CACHE, "vmem-file-cache")',
+            "page_alloc_with_reclaim_may_fail(ker::mod::mm::PhysicalPageOwner::USER_FILE_CACHE,",
+            'ker::mod::mm::paging::PAGE_SIZE, "vmem-file-cache")',
         ],
         "file mmap cache allocation pressure",
     )
     require_tokens(
         function_body(virt, "alloc_cow_destination_page"),
         [
-            'page_alloc_full_overwrite_page_with_reclaim_may_fail("cow_copy")',
-            'page_alloc_with_reclaim_may_fail(paging::PAGE_SIZE, "cow_zero")',
+            'page_alloc_full_overwrite_page_with_reclaim_may_fail(PhysicalPageOwner::USER_PRIVATE_MAPPING, "cow_copy")',
+            'page_alloc_with_reclaim_may_fail(PhysicalPageOwner::USER_PRIVATE_MAPPING, paging::PAGE_SIZE, "cow_zero")',
         ],
         "COW destination allocation pressure",
     )
@@ -426,7 +428,7 @@ def test_user_memory_pressure_does_not_enter_fatal_oom() -> None:
     require_tokens(
         function_body(virt, "handle_lazy_vmem_fault"),
         [
-            'page_alloc_may_fail(paging::PAGE_SIZE, "lazy-vmem")',
+            'page_alloc_may_fail(PhysicalPageOwner::USER_PRIVATE_MAPPING, paging::PAGE_SIZE, "lazy-vmem")',
             "cow_pte_lock.lock_irqsave()",
             "anonymous_lazy_range_allows_fault(task, PAGE_VADDR, fault, current_prot)",
             "translate(task->pagemap, PAGE_VADDR) != PADDR_INVALID",
@@ -439,7 +441,7 @@ def test_user_memory_pressure_does_not_enter_fatal_oom() -> None:
     require_order(
         lazy_body,
         "task->lazy_vmem_lock.unlock_irqrestore(IRQF);",
-        'page_alloc_may_fail(paging::PAGE_SIZE, "lazy-vmem")',
+        'page_alloc_may_fail(PhysicalPageOwner::USER_PRIVATE_MAPPING, paging::PAGE_SIZE, "lazy-vmem")',
         "lazy anonymous allocation must happen outside the task range lock",
     )
     require_order(
@@ -484,9 +486,18 @@ def test_file_mmap_cache_is_sharded_without_changing_page_ownership() -> None:
             "ker::mod::mm::phys::page_ref_inc(new_page)",
             "*page_for_mapping = new_page",
             "cache_lock.mutex.unlock()",
-            "ker::mod::mm::phys::page_ref_dec(evicted)",
+            "release_file_mmap_cache_page(evicted)",
         ],
         "file mmap cache insertion page ownership",
+    )
+    require_ordered_tokens(
+        function_body(vmem, "release_file_mmap_cache_page"),
+        [
+            "ker::mod::mm::phys::page_ref_get(page) > 1",
+            "ker::mod::mm::phys::page_reassign_owner(page, ker::mod::mm::PhysicalPageOwner::USER_FILE_MAPPING)",
+            "ker::mod::mm::phys::page_ref_dec(page)",
+        ],
+        "file mmap cache eviction ownership transfer",
     )
 
 

@@ -1,5 +1,6 @@
 #include <cstdint>
 #include <platform/dbg/dbg.hpp>
+#include <platform/mm/page_alloc.hpp>
 #include <platform/mm/paging.hpp>
 #include <platform/mm/phys.hpp>
 #include <test/ktest.hpp>
@@ -124,7 +125,8 @@ __attribute__((no_sanitize("address", "undefined", "coverage"))) static auto kco
         return kcov_sort_dedup(pcs, count);
     }
 
-    auto* seen = static_cast<uint64_t*>(ker::mod::mm::phys::page_alloc_may_fail(BITMAP_BYTES, "kcov_seen"));
+    auto* seen = static_cast<uint64_t*>(
+        ker::mod::mm::phys::page_alloc_may_fail(ker::mod::mm::PhysicalPageOwner::KCOV_BUFFER, BITMAP_BYTES, "kcov_seen"));
     if (seen == nullptr) {
         return kcov_sort_dedup(pcs, count);
     }

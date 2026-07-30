@@ -48,6 +48,18 @@ namespace ker::vfs {
 auto reclaim_clean_buffer_cache_for_pressure(size_t byte_budget) -> size_t;
 }
 
+namespace ker::vfs::xfs {
+auto xfs_icache_reclaim_for_pressure(size_t max_inodes) -> size_t;
+}
+
+namespace ker::syscall::vmem {
+auto file_mmap_cache_reclaim(size_t max_pages) -> size_t;
+}
+
+namespace ker::net {
+auto pkt_pool_reclaim_for_pressure() -> size_t;
+}
+
 namespace ker::mod::mm::phys {
 
 namespace {
@@ -226,6 +238,122 @@ uint64_t per_cpu_caches_size = 0;
 // Statistics counters
 uint64_t main_heap_size = 0;
 
+constexpr std::array<PhysicalOwnerDescriptor, PHYSICAL_PAGE_OWNER_COUNT> PHYSICAL_OWNER_DESCRIPTORS = {{
+    {PhysicalPageOwner::INVALID, nullptr, nullptr, PhysicalOwnerReclaimability::PERMANENT, nullptr},
+    {PhysicalPageOwner::USER_PRIVATE_MAPPING, "user_private_mapping", "process address-space lifetime",
+     PhysicalOwnerReclaimability::OWNER_TEARDOWN, "bounded by mapped private pages"},
+    {PhysicalPageOwner::USER_FILE_MAPPING, "user_file_mapping", "mapping lifetime", PhysicalOwnerReclaimability::OWNER_TEARDOWN,
+     "bounded by resident file-mapping pages"},
+    {PhysicalPageOwner::USER_FILE_CACHE, "user_file_cache", "file-cache entry lifetime", PhysicalOwnerReclaimability::PRESSURE_RECLAIM,
+     "bounded by resident cached file pages"},
+    {PhysicalPageOwner::USER_EXECUTABLE_MAPPING, "user_executable_mapping", "process image lifetime",
+     PhysicalOwnerReclaimability::OWNER_TEARDOWN, "bounded by resident executable pages"},
+    {PhysicalPageOwner::USER_THREAD_STACK, "user_thread_stack", "thread lifetime", PhysicalOwnerReclaimability::OWNER_TEARDOWN,
+     "bounded by resident thread-stack pages"},
+    {PhysicalPageOwner::USER_THREAD_TLS, "user_thread_tls", "thread lifetime", PhysicalOwnerReclaimability::OWNER_TEARDOWN,
+     "bounded by resident TLS pages"},
+    {PhysicalPageOwner::USER_SHARED_MEMORY, "user_shared_memory", "shared-memory object lifetime",
+     PhysicalOwnerReclaimability::OWNER_TEARDOWN, "bounded by live shared-memory objects"},
+    {PhysicalPageOwner::ANON_ZERO_PAGE_RESERVE, "anonymous_zero_page_reserve", "boot-to-shutdown shared zero-page reserve",
+     PhysicalOwnerReclaimability::PERMANENT, "exactly one page after first anonymous read mapping"},
+    {PhysicalPageOwner::PAGE_TABLE, "page_table", "address-space or kernel-map lifetime", PhysicalOwnerReclaimability::OWNER_TEARDOWN,
+     "bounded by mapped virtual-address topology"},
+    {PhysicalPageOwner::PAGE_TABLE_POOL_RESERVE, "page_table_pool_reserve", "cached root-page-table lifetime",
+     PhysicalOwnerReclaimability::PERMANENT, "at most 64 pages globally"},
+    {PhysicalPageOwner::PHYSICAL_ALLOCATOR_METADATA, "physical_allocator_runtime_metadata", "allocator lifetime",
+     PhysicalOwnerReclaimability::PERMANENT, "two pages per optional huge-page zone"},
+    {PhysicalPageOwner::KERNEL_STACK, "kernel_stack", "kernel task lifetime", PhysicalOwnerReclaimability::OWNER_TEARDOWN,
+     "one fixed stack allocation per non-pooled task"},
+    {PhysicalPageOwner::KERNEL_STACK_POOL, "kernel_stack_pool", "boot-to-shutdown reserve", PhysicalOwnerReclaimability::PERMANENT,
+     "fixed boot-selected pool capacity"},
+    {PhysicalPageOwner::KMALLOC_SLAB, "kmalloc_slab", "small-object slab lifetime", PhysicalOwnerReclaimability::OWNER_TEARDOWN,
+     "live small objects plus bounded per-CPU magazines"},
+    {PhysicalPageOwner::KMALLOC_MEDIUM, "kmalloc_medium", "medium allocation lifetime", PhysicalOwnerReclaimability::OWNER_TEARDOWN,
+     "buddy-rounded live medium allocations"},
+    {PhysicalPageOwner::KMALLOC_LARGE, "kmalloc_large", "large allocation lifetime", PhysicalOwnerReclaimability::OWNER_TEARDOWN,
+     "buddy-rounded live large allocations"},
+    {PhysicalPageOwner::KMALLOC_DEBUG, "kmalloc_debug", "diagnostic record lifetime", PhysicalOwnerReclaimability::DIAGNOSTIC_LIFETIME,
+     "disabled in normal builds; bounded by tracked allocations"},
+    {PhysicalPageOwner::BUFFER_CACHE_DATA, "buffer_cache_data", "buffer-cache entry lifetime",
+     PhysicalOwnerReclaimability::PRESSURE_RECLAIM, "configured cache byte limit"},
+    {PhysicalPageOwner::BUFFER_CACHE_METADATA_RESERVE, "buffer_cache_metadata_reserve", "boot-to-shutdown allocator reserve",
+     PhysicalOwnerReclaimability::PERMANENT, "one 256 KiB BufHead arena after first use"},
+    {PhysicalPageOwner::BUFFER_CACHE_METADATA, "buffer_cache_metadata", "BufHead object lifetime",
+     PhysicalOwnerReclaimability::PRESSURE_RECLAIM, "arenas containing live buffer objects"},
+    {PhysicalPageOwner::TMPFS_DATA, "tmpfs_data", "tmpfs inode/block lifetime", PhysicalOwnerReclaimability::OWNER_TEARDOWN,
+     "bounded by live tmpfs file data and mount capacity"},
+    {PhysicalPageOwner::XFS_INODE_METADATA_RESERVE, "xfs_inode_metadata_reserve", "boot-to-shutdown allocator reserve",
+     PhysicalOwnerReclaimability::PERMANENT, "one 256 KiB inode-object arena after first use"},
+    {PhysicalPageOwner::XFS_INODE_METADATA, "xfs_inode_metadata", "cached XFS inode lifetime",
+     PhysicalOwnerReclaimability::PRESSURE_RECLAIM, "arenas containing live or cached inodes"},
+    {PhysicalPageOwner::XFS_TRANSACTION_METADATA_RESERVE, "xfs_transaction_metadata_reserve", "boot-to-shutdown allocator reserve",
+     PhysicalOwnerReclaimability::PERMANENT, "one 256 KiB transaction-object arena after first use"},
+    {PhysicalPageOwner::XFS_TRANSACTION_METADATA, "xfs_transaction_metadata", "XFS transaction lifetime",
+     PhysicalOwnerReclaimability::OWNER_TEARDOWN, "arenas containing live concurrent transactions"},
+    {PhysicalPageOwner::WKI_ZONE, "wki_zone", "WKI zone lifetime", PhysicalOwnerReclaimability::OWNER_TEARDOWN,
+     "bounded by live local WKI zones"},
+    {PhysicalPageOwner::NETWORK_PACKET_RESERVE, "network_packet_reserve", "network stack lifetime", PhysicalOwnerReclaimability::PERMANENT,
+     "configured baseline capacity per registered NIC"},
+    {PhysicalPageOwner::NETWORK_PACKET, "network_packet", "dynamic packet-pool or in-flight packet lifetime",
+     PhysicalOwnerReclaimability::PRESSURE_RECLAIM, "growth chunks above baseline plus in-flight packets"},
+    {PhysicalPageOwner::DEVICE_AHCI, "device_ahci_dma", "AHCI controller lifetime", PhysicalOwnerReclaimability::PERMANENT,
+     "fixed command/FIS/table capacity per AHCI port"},
+    {PhysicalPageOwner::DEVICE_VIRTIO, "device_virtio_dma", "virtio device lifetime", PhysicalOwnerReclaimability::PERMANENT,
+     "fixed queue capacity per virtio device"},
+    {PhysicalPageOwner::DEVICE_E1000, "device_e1000_dma", "e1000 device lifetime", PhysicalOwnerReclaimability::PERMANENT,
+     "fixed RX/TX ring capacity per device"},
+    {PhysicalPageOwner::DEVICE_USB, "device_usb_dma", "USB controller/device lifetime", PhysicalOwnerReclaimability::PERMANENT,
+     "bounded by configured controllers, rings, and attached devices"},
+    {PhysicalPageOwner::KASAN_SHADOW, "kasan_shadow", "diagnostic kernel lifetime", PhysicalOwnerReclaimability::DIAGNOSTIC_LIFETIME,
+     "disabled normally; bounded by populated shadow pages"},
+    {PhysicalPageOwner::KCOV_BUFFER, "kcov_buffer", "coverage session lifetime", PhysicalOwnerReclaimability::DIAGNOSTIC_LIFETIME,
+     "disabled normally; bounded by configured coverage buffers"},
+    {PhysicalPageOwner::DEBUGGER, "debugger", "debug session or kernel lifetime", PhysicalOwnerReclaimability::OWNER_TEARDOWN,
+     "bounded by loaded debug metadata"},
+    {PhysicalPageOwner::SELFTEST, "selftest", "individual kernel selftest lifetime", PhysicalOwnerReclaimability::DIAGNOSTIC_LIFETIME,
+     "zero outside isolated selftest builds"},
+}};
+
+static_assert(PHYSICAL_OWNER_DESCRIPTORS.size() == PHYSICAL_PAGE_OWNER_COUNT);
+consteval auto physical_owner_descriptors_are_complete() -> bool {
+    if (PHYSICAL_OWNER_DESCRIPTORS.front().owner != PhysicalPageOwner::INVALID) {
+        return false;
+    }
+    for (size_t i = 1; i < PHYSICAL_OWNER_DESCRIPTORS.size(); ++i) {
+        const auto& descriptor = PHYSICAL_OWNER_DESCRIPTORS.at(i);
+        if (descriptor.owner != static_cast<PhysicalPageOwner>(i) || descriptor.name == nullptr || descriptor.lifetime == nullptr ||
+            descriptor.scaling_bound == nullptr) {
+            return false;
+        }
+    }
+    return true;
+}
+static_assert(physical_owner_descriptors_are_complete());
+
+constexpr std::array<PhysicalReserveDescriptor, PHYSICAL_RESERVE_KIND_COUNT> PHYSICAL_RESERVE_DESCRIPTORS = {{
+    {PhysicalReserveKind::FIRMWARE_RESERVED, "firmware_reserved", "boot_to_shutdown", "firmware_memory_map_ranges"},
+    {PhysicalReserveKind::ACPI_RECLAIMABLE, "acpi_reclaimable_reserved", "boot_to_shutdown", "ACPI_table_storage"},
+    {PhysicalReserveKind::ACPI_NVS, "acpi_nvs_reserved", "boot_to_shutdown", "platform_NVS_storage"},
+    {PhysicalReserveKind::BAD_MEMORY, "hardware_bad_memory", "hardware_lifetime", "firmware_reported_bad_ranges"},
+    {PhysicalReserveKind::BOOTLOADER_RECLAIMABLE, "bootloader_reclaimable_reserved", "boot_to_shutdown", "bootloader_handoff_storage"},
+    {PhysicalReserveKind::KERNEL_AND_MODULES, "kernel_and_boot_modules", "boot_to_shutdown", "linked_kernel_and_boot_module_images"},
+    {PhysicalReserveKind::FRAMEBUFFER, "firmware_framebuffer", "boot_to_shutdown", "configured_scanout_surface"},
+    {PhysicalReserveKind::FIRMWARE_RESERVED_MAPPED, "firmware_reserved_mapped", "boot_to_shutdown", "firmware_mapped_reserved_ranges"},
+}};
+consteval auto physical_reserve_descriptors_are_complete() -> bool {
+    for (size_t i = 0; i < PHYSICAL_RESERVE_DESCRIPTORS.size(); ++i) {
+        const auto& descriptor = PHYSICAL_RESERVE_DESCRIPTORS.at(i);
+        if (descriptor.kind != static_cast<PhysicalReserveKind>(i) || descriptor.name == nullptr || descriptor.lifetime == nullptr ||
+            descriptor.scaling_bound == nullptr) {
+            return false;
+        }
+    }
+    return true;
+}
+static_assert(physical_reserve_descriptors_are_complete());
+
+std::array<PhysicalReserveSnapshot, PHYSICAL_RESERVE_KIND_COUNT> firmware_reserve_snapshot{};
+
 // Huge page zone deferred initialization info
 uint64_t huge_page_base = 0;
 uint64_t huge_page_size = 0;
@@ -268,6 +396,29 @@ auto checked_range_end(uint64_t base, uint64_t length) -> uint64_t {
 auto page_range_from_usable(uint64_t base, uint64_t length) -> PhysRange {
     uint64_t const END = checked_range_end(base, length);
     return {.base = page_align_up(base), .end = page_align_down(END)};
+}
+
+auto reserve_kind_for_limine_type(uint64_t type) -> PhysicalReserveKind {
+    switch (type) {
+        case LIMINE_MEMMAP_RESERVED:
+            return PhysicalReserveKind::FIRMWARE_RESERVED;
+        case LIMINE_MEMMAP_ACPI_RECLAIMABLE:
+            return PhysicalReserveKind::ACPI_RECLAIMABLE;
+        case LIMINE_MEMMAP_ACPI_NVS:
+            return PhysicalReserveKind::ACPI_NVS;
+        case LIMINE_MEMMAP_BAD_MEMORY:
+            return PhysicalReserveKind::BAD_MEMORY;
+        case LIMINE_MEMMAP_BOOTLOADER_RECLAIMABLE:
+            return PhysicalReserveKind::BOOTLOADER_RECLAIMABLE;
+        case LIMINE_MEMMAP_EXECUTABLE_AND_MODULES:
+            return PhysicalReserveKind::KERNEL_AND_MODULES;
+        case LIMINE_MEMMAP_FRAMEBUFFER:
+            return PhysicalReserveKind::FRAMEBUFFER;
+        case LIMINE_MEMMAP_RESERVED_MAPPED:
+            return PhysicalReserveKind::FIRMWARE_RESERVED_MAPPED;
+        default:
+            return PhysicalReserveKind::COUNT;
+    }
 }
 
 auto page_range_from_reserved(uint64_t base, uint64_t length) -> PhysRange {
@@ -710,6 +861,86 @@ void get_alloc_stats_snapshot(AllocStatsSnapshot& out) {
                              .free_mem_bytes = FREE_BYTES};
 }
 
+auto physical_owner_descriptors() -> std::span<const PhysicalOwnerDescriptor> {
+    return std::span<const PhysicalOwnerDescriptor>{PHYSICAL_OWNER_DESCRIPTORS}.subspan(1);
+}
+
+auto physical_reserve_descriptors() -> std::span<const PhysicalReserveDescriptor> {
+    return std::span<const PhysicalReserveDescriptor>{PHYSICAL_RESERVE_DESCRIPTORS};
+}
+
+void get_physical_balance_snapshot(PhysicalBalanceSnapshot& out) {
+    out = {};
+
+    // The zone list is immutable after boot. Acquire every allocator lock in
+    // list order so allocation/free cannot move any page while the fixed-size
+    // balance sheet is copied. No allocation or blocking operation is allowed
+    // in this critical section.
+    constexpr size_t MAX_SNAPSHOT_ZONES = MAX_SANITIZED_RANGES + 1;
+    std::array<PageAllocator*, MAX_SNAPSHOT_ZONES> allocators{};
+    std::array<uint64_t, MAX_SNAPSHOT_ZONES> lock_flags{};
+    size_t allocator_count = 0;
+
+    for (paging::PageZone* zone = zones; zone != nullptr; zone = zone->next) {
+        if (zone->allocator == nullptr) {
+            continue;
+        }
+        if (allocator_count >= allocators.size()) {
+            ker::mod::dbg::panic_handler("physical balance zone bound exceeded");
+        }
+        allocators.at(allocator_count++) = zone->allocator;
+    }
+    size_t const REGULAR_ALLOCATOR_COUNT = allocator_count;
+    if (huge_page_zone != nullptr && huge_page_zone->allocator != nullptr) {
+        bool duplicate = false;
+        for (size_t i = 0; i < allocator_count; ++i) {
+            duplicate |= allocators.at(i) == huge_page_zone->allocator;
+        }
+        if (!duplicate) {
+            if (allocator_count >= allocators.size()) {
+                ker::mod::dbg::panic_handler("physical balance huge-zone bound exceeded");
+            }
+            allocators.at(allocator_count++) = huge_page_zone->allocator;
+        }
+    }
+
+    for (size_t i = 0; i < allocator_count; ++i) {
+        lock_flags.at(i) = allocators.at(i)->lock_irq();
+    }
+
+    for (size_t i = 0; i < allocator_count; ++i) {
+        PageAllocator const* const ALLOCATOR = allocators.at(i);
+        out.managed_pages += ALLOCATOR->total_pages;
+        if (i < REGULAR_ALLOCATOR_COUNT) {
+            // A PageZone descriptor occupies the page immediately before each
+            // regular embedded allocator. The optional huge-zone descriptor
+            // is itself owned allocator runtime metadata in a regular zone.
+            out.managed_pages++;
+            out.zone_descriptor_pages++;
+        }
+        out.free_pages += ALLOCATOR->free_count;
+        out.allocator_metadata_pages += ALLOCATOR->metadata_pages;
+        for (size_t owner_idx = 1; owner_idx < PHYSICAL_PAGE_OWNER_COUNT; ++owner_idx) {
+            out.owners.at(owner_idx).pages += ALLOCATOR->owner_pages.at(owner_idx);
+            out.owners.at(owner_idx).objects += ALLOCATOR->owner_objects.at(owner_idx);
+            out.owner_pages += ALLOCATOR->owner_pages.at(owner_idx);
+        }
+    }
+
+    for (size_t i = allocator_count; i > 0; --i) {
+        allocators.at(i - 1)->unlock_irq(lock_flags.at(i - 1));
+    }
+
+    out.zone_count = allocator_count;
+    out.per_cpu_page_cache_reserve_pages = per_cpu_caches_size / paging::PAGE_SIZE;
+    out.per_cpu_page_cache_reserve_objects = num_cpus;
+    out.identity_pages = out.free_pages + out.allocator_metadata_pages + out.zone_descriptor_pages + out.owner_pages;
+    out.identity_mismatch_pages =
+        out.identity_pages > out.managed_pages ? out.identity_pages - out.managed_pages : out.managed_pages - out.identity_pages;
+    out.untracked_unreclaimable_pages = out.identity_mismatch_pages;
+    out.firmware_reserves = firmware_reserve_snapshot;
+}
+
 auto snapshot_zones(ZoneSnapshot* out, size_t max_rows) -> size_t {
     if (out == nullptr || max_rows == 0) {
         return 0;
@@ -886,7 +1117,7 @@ auto get_zones() -> paging::PageZone* { return zones; }
 
 namespace {
 // Forward declaration
-auto find_free_block(uint64_t size, uint64_t caller = 0) -> void*;
+auto find_free_block(uint64_t size, PhysicalPageOwner owner, uint64_t caller = 0) -> void*;
 
 auto buddy_accounting_size(uint64_t size) -> uint64_t {
     if (size == 0) {
@@ -966,13 +1197,13 @@ auto init_page_zone(uint64_t base, uint64_t len, uint64_t zone_num) -> paging::P
 auto init_huge_page_zone(uint64_t base, uint64_t len) -> paging::PageZone* {
     // Allocate zone structure from regular memory (which is already mapped)
     // Don't use the huge page region itself for metadata since it's not mapped yet
-    auto* zone = static_cast<paging::PageZone*>(find_free_block(paging::PAGE_SIZE));
+    auto* zone = static_cast<paging::PageZone*>(find_free_block(paging::PAGE_SIZE, PhysicalPageOwner::PHYSICAL_ALLOCATOR_METADATA));
     if (zone == nullptr) {
         return nullptr;  // OOM
     }
 
     // Allocate PageAllocator structure from regular memory too
-    auto* allocator = reinterpret_cast<PageAllocator*>(find_free_block(paging::PAGE_SIZE));
+    auto* allocator = reinterpret_cast<PageAllocator*>(find_free_block(paging::PAGE_SIZE, PhysicalPageOwner::PHYSICAL_ALLOCATOR_METADATA));
     if (allocator == nullptr) {
         return nullptr;  // OOM
     }
@@ -994,14 +1225,14 @@ auto init_huge_page_zone(uint64_t base, uint64_t len) -> paging::PageZone* {
     return zone;
 }
 
-auto find_free_block(uint64_t size, uint64_t caller) -> void* {
+auto find_free_block(uint64_t size, PhysicalPageOwner owner, uint64_t caller) -> void* {
     for (paging::PageZone* zone = zones; zone != nullptr; zone = zone->next) {
         if (zone->len < size || zone->allocator == nullptr) {
             continue;
         }
 
         uint64_t const FLAGS = zone->allocator->lock_irq();
-        void* const BLOCK = zone->allocator->alloc(size, caller);
+        void* const BLOCK = zone->allocator->alloc(size, owner, caller);
         zone->allocator->unlock_irq(FLAGS);
         if (BLOCK == nullptr) {
             [[unlikely]] continue;
@@ -1012,14 +1243,14 @@ auto find_free_block(uint64_t size, uint64_t caller) -> void* {
     return nullptr;
 }
 
-auto find_free_order0_block(uint64_t caller) -> void* {
+auto find_free_order0_block(PhysicalPageOwner owner, uint64_t caller) -> void* {
     for (paging::PageZone* zone = zones; zone != nullptr; zone = zone->next) {
         if (zone->len < paging::PAGE_SIZE || zone->allocator == nullptr) {
             continue;
         }
 
         uint64_t const FLAGS = zone->allocator->lock_irq();
-        void* const BLOCK = zone->allocator->alloc_order0(caller);
+        void* const BLOCK = zone->allocator->alloc_order0(owner, caller);
         zone->allocator->unlock_irq(FLAGS);
         if (BLOCK == nullptr) {
             [[unlikely]] continue;
@@ -1030,13 +1261,13 @@ auto find_free_order0_block(uint64_t caller) -> void* {
     return nullptr;
 }
 
-auto find_free_block_huge(uint64_t size, uint64_t caller = 0) -> void* {
+auto find_free_block_huge(uint64_t size, PhysicalPageOwner owner, uint64_t caller = 0) -> void* {
     if (huge_page_zone == nullptr || huge_page_zone->len < size || huge_page_zone->allocator == nullptr) {
         return nullptr;
     }
 
     uint64_t const FLAGS = huge_page_zone->allocator->lock_irq();
-    void* const BLOCK = huge_page_zone->allocator->alloc(size, caller);
+    void* const BLOCK = huge_page_zone->allocator->alloc(size, owner, caller);
     huge_page_zone->allocator->unlock_irq(FLAGS);
     return BLOCK;
 }
@@ -1124,12 +1355,23 @@ void init(limine_memmap_response* memmap_response) {
     size_t reserved_range_count = 0;
     std::array<PhysRange, MAX_SANITIZED_RANGES> accepted_ranges{};
     size_t accepted_range_count = 0;
+    firmware_reserve_snapshot.fill({});
 
     for (size_t i = 0; i < MEMMAP.entry_count; i++) {
         if (MEMMAP.entries[i]->type == LIMINE_MEMMAP_USABLE || MEMMAP.entries[i]->length == 0) {
             continue;
         }
-        append_range(reserved_ranges, reserved_range_count, page_range_from_reserved(MEMMAP.entries[i]->base, MEMMAP.entries[i]->length));
+        PhysRange const RANGE = page_range_from_reserved(MEMMAP.entries[i]->base, MEMMAP.entries[i]->length);
+        append_range(reserved_ranges, reserved_range_count, RANGE);
+        PhysicalReserveKind const KIND = reserve_kind_for_limine_type(MEMMAP.entries[i]->type);
+        if (KIND == PhysicalReserveKind::COUNT) {
+            ker::mod::dbg::panic_handler("unsupported physical reserve memory-map type");
+        }
+        if (RANGE.end > RANGE.base) {
+            auto& snapshot = firmware_reserve_snapshot.at(static_cast<size_t>(KIND));
+            snapshot.pages += (RANGE.end - RANGE.base) / paging::PAGE_SIZE;
+            snapshot.objects++;
+        }
     }
 
     // Initialize per-CPU caches
@@ -1363,7 +1605,7 @@ void refill_per_cpu_cache_locked(PerCpuPageCache& cache, PageCacheStatsCounters&
     }
 }
 
-auto try_alloc_from_per_cpu_cache(uint64_t caller_tag, ReturnedPageZeroing zeroing, void* caller_addr) -> void* {
+auto try_alloc_from_per_cpu_cache(PhysicalPageOwner owner, uint64_t caller_tag, ReturnedPageZeroing zeroing, void* caller_addr) -> void* {
     if (per_cpu_caches == nullptr || !per_cpu_ready.load(std::memory_order_acquire) || !per_cpu_page_cache_enabled()) {
         return nullptr;
     }
@@ -1386,7 +1628,7 @@ auto try_alloc_from_per_cpu_cache(uint64_t caller_tag, ReturnedPageZeroing zeroi
         cache.pages[cache.count] = {};
         if (ENTRY.allocator != nullptr) {
             uint64_t const FLAGS = ENTRY.allocator->lock_irq();
-            page = ENTRY.allocator->alloc_cached_order0_at(ENTRY.page_idx, caller_tag);
+            page = ENTRY.allocator->alloc_cached_order0_at(ENTRY.page_idx, owner, caller_tag);
             ENTRY.allocator->unlock_irq(FLAGS);
         }
         if (page == nullptr) {
@@ -1456,7 +1698,11 @@ auto try_cache_freed_order0_page(PageAllocator* allocator, void* page) -> bool {
     return true;
 }
 
-auto page_alloc_impl(uint64_t size, std::string_view name, ReturnedPageZeroing zeroing, void* caller_addr, bool log_oom) -> void* {
+auto page_alloc_impl(PhysicalPageOwner owner, uint64_t size, std::string_view name, ReturnedPageZeroing zeroing, void* caller_addr,
+                     bool log_oom) -> void* {
+    if (!physical_page_owner_is_valid(owner)) {
+        ker::mod::dbg::panic_handler("physical allocation requires a concrete owner");
+    }
     [[maybe_unused]] uint64_t requested_pages = 0;
     if (!page_alloc_size_within_buddy_limit(size, requested_pages)) {
         return nullptr;
@@ -1471,7 +1717,7 @@ auto page_alloc_impl(uint64_t size, std::string_view name, ReturnedPageZeroing z
     // their allocator/index proof and are transitioned back to allocated state
     // under the owning allocator lock before the page is exposed.
     if (size == paging::PAGE_SIZE) {
-        void* const CACHED_PAGE = try_alloc_from_per_cpu_cache(CALLER_TAG, zeroing, caller_addr);
+        void* const CACHED_PAGE = try_alloc_from_per_cpu_cache(owner, CALLER_TAG, zeroing, caller_addr);
         if (CACHED_PAGE != nullptr) {
             return CACHED_PAGE;
         }
@@ -1480,10 +1726,10 @@ auto page_alloc_impl(uint64_t size, std::string_view name, ReturnedPageZeroing z
     // Slow path: allocate from zones
     void* block = nullptr;
     if (size == paging::PAGE_SIZE) {
-        block = find_free_order0_block(CALLER_TAG);
+        block = find_free_order0_block(owner, CALLER_TAG);
     }
     if (block == nullptr) {
-        block = find_free_block(size, CALLER_TAG);
+        block = find_free_block(size, owner, CALLER_TAG);
     }
 
     if (block == nullptr) {
@@ -1539,8 +1785,8 @@ auto page_alloc_buffer_reclaim_budget(uint64_t requested_pages) -> size_t {
     return static_cast<size_t>(BUDGET);
 }
 
-auto page_alloc_with_reclaim_impl(uint64_t size, std::string_view name, ReturnedPageZeroing zeroing, void* caller_addr,
-                                  uint32_t retry_count, bool log_oom) -> void* {
+auto page_alloc_with_reclaim_impl(PhysicalPageOwner owner, uint64_t size, std::string_view name, ReturnedPageZeroing zeroing,
+                                  void* caller_addr, uint32_t retry_count, bool log_oom) -> void* {
     uint64_t requested_pages = 0;
     if (!page_alloc_size_within_buddy_limit(size, requested_pages)) {
         return nullptr;
@@ -1558,7 +1804,7 @@ auto page_alloc_with_reclaim_impl(uint64_t size, std::string_view name, Returned
     }
 
     for (uint32_t attempt = 0; attempt < retry_count; ++attempt) {
-        void* const PAGE = page_alloc_impl(size, name, zeroing, caller_addr, false);
+        void* const PAGE = page_alloc_impl(owner, size, name, zeroing, caller_addr, false);
         if (PAGE != nullptr) {
             return PAGE;
         }
@@ -1570,6 +1816,15 @@ auto page_alloc_with_reclaim_impl(uint64_t size, std::string_view name, Returned
             if (ker::vfs::reclaim_clean_buffer_cache_for_pressure(page_alloc_buffer_reclaim_budget(requested_pages)) != 0) {
                 continue;
             }
+            if (ker::syscall::vmem::file_mmap_cache_reclaim(32) != 0) {
+                continue;
+            }
+            if (ker::vfs::xfs::xfs_icache_reclaim_for_pressure(32) != 0) {
+                continue;
+            }
+            if (ker::net::pkt_pool_reclaim_for_pressure() != 0) {
+                continue;
+            }
             if (ker::vfs::tmpfs::tmpfs_reclaim_pages(32) != 0) {
                 continue;
             }
@@ -1578,7 +1833,7 @@ auto page_alloc_with_reclaim_impl(uint64_t size, std::string_view name, Returned
         }
     }
 
-    return page_alloc_impl(size, name, zeroing, caller_addr, log_oom);
+    return page_alloc_impl(owner, size, name, zeroing, caller_addr, log_oom);
 }
 
 void dump_page_alloc_oom_header(uint64_t size, void* caller_addr, std::string_view name) {
@@ -1599,45 +1854,45 @@ void write_hex_field(const char* label, uint64_t value) {
 
 }  // namespace
 
-auto page_alloc(uint64_t size, std::string_view name) -> void* {
-    return page_alloc_impl(size, name, ReturnedPageZeroing::ZERO, __builtin_return_address(0), true);
+auto page_alloc(PhysicalPageOwner owner, uint64_t size, std::string_view name) -> void* {
+    return page_alloc_impl(owner, size, name, ReturnedPageZeroing::ZERO, __builtin_return_address(0), true);
 }
 
-auto page_alloc_full_overwrite(uint64_t size, std::string_view name) -> void* {
-    return page_alloc_impl(size, name, ReturnedPageZeroing::FULL_OVERWRITE, __builtin_return_address(0), true);
+auto page_alloc_full_overwrite(PhysicalPageOwner owner, uint64_t size, std::string_view name) -> void* {
+    return page_alloc_impl(owner, size, name, ReturnedPageZeroing::FULL_OVERWRITE, __builtin_return_address(0), true);
 }
 
-auto page_alloc_full_overwrite_may_fail(uint64_t size, std::string_view name) -> void* {
-    return page_alloc_impl(size, name, ReturnedPageZeroing::FULL_OVERWRITE, __builtin_return_address(0), false);
+auto page_alloc_full_overwrite_may_fail(PhysicalPageOwner owner, uint64_t size, std::string_view name) -> void* {
+    return page_alloc_impl(owner, size, name, ReturnedPageZeroing::FULL_OVERWRITE, __builtin_return_address(0), false);
 }
 
-auto page_alloc_full_overwrite_page(std::string_view name) -> void* {
-    return page_alloc_impl(paging::PAGE_SIZE, name, ReturnedPageZeroing::FULL_OVERWRITE, __builtin_return_address(0), true);
+auto page_alloc_full_overwrite_page(PhysicalPageOwner owner, std::string_view name) -> void* {
+    return page_alloc_impl(owner, paging::PAGE_SIZE, name, ReturnedPageZeroing::FULL_OVERWRITE, __builtin_return_address(0), true);
 }
 
-auto page_alloc_may_fail(uint64_t size, std::string_view name) -> void* {
-    return page_alloc_impl(size, name, ReturnedPageZeroing::ZERO, __builtin_return_address(0), false);
+auto page_alloc_may_fail(PhysicalPageOwner owner, uint64_t size, std::string_view name) -> void* {
+    return page_alloc_impl(owner, size, name, ReturnedPageZeroing::ZERO, __builtin_return_address(0), false);
 }
 
-auto page_alloc_full_overwrite_page_may_fail(std::string_view name) -> void* {
-    return page_alloc_impl(paging::PAGE_SIZE, name, ReturnedPageZeroing::FULL_OVERWRITE, __builtin_return_address(0), false);
+auto page_alloc_full_overwrite_page_may_fail(PhysicalPageOwner owner, std::string_view name) -> void* {
+    return page_alloc_impl(owner, paging::PAGE_SIZE, name, ReturnedPageZeroing::FULL_OVERWRITE, __builtin_return_address(0), false);
 }
 
-auto page_alloc_with_reclaim(uint64_t size, std::string_view name, uint32_t retry_count) -> void* {
-    return page_alloc_with_reclaim_impl(size, name, ReturnedPageZeroing::ZERO, __builtin_return_address(0), retry_count, true);
+auto page_alloc_with_reclaim(PhysicalPageOwner owner, uint64_t size, std::string_view name, uint32_t retry_count) -> void* {
+    return page_alloc_with_reclaim_impl(owner, size, name, ReturnedPageZeroing::ZERO, __builtin_return_address(0), retry_count, true);
 }
 
-auto page_alloc_with_reclaim_may_fail(uint64_t size, std::string_view name, uint32_t retry_count) -> void* {
-    return page_alloc_with_reclaim_impl(size, name, ReturnedPageZeroing::ZERO, __builtin_return_address(0), retry_count, false);
+auto page_alloc_with_reclaim_may_fail(PhysicalPageOwner owner, uint64_t size, std::string_view name, uint32_t retry_count) -> void* {
+    return page_alloc_with_reclaim_impl(owner, size, name, ReturnedPageZeroing::ZERO, __builtin_return_address(0), retry_count, false);
 }
 
-auto page_alloc_full_overwrite_page_with_reclaim(std::string_view name, uint32_t retry_count) -> void* {
-    return page_alloc_with_reclaim_impl(paging::PAGE_SIZE, name, ReturnedPageZeroing::FULL_OVERWRITE, __builtin_return_address(0),
+auto page_alloc_full_overwrite_page_with_reclaim(PhysicalPageOwner owner, std::string_view name, uint32_t retry_count) -> void* {
+    return page_alloc_with_reclaim_impl(owner, paging::PAGE_SIZE, name, ReturnedPageZeroing::FULL_OVERWRITE, __builtin_return_address(0),
                                         retry_count, true);
 }
 
-auto page_alloc_full_overwrite_page_with_reclaim_may_fail(std::string_view name, uint32_t retry_count) -> void* {
-    return page_alloc_with_reclaim_impl(paging::PAGE_SIZE, name, ReturnedPageZeroing::FULL_OVERWRITE, __builtin_return_address(0),
+auto page_alloc_full_overwrite_page_with_reclaim_may_fail(PhysicalPageOwner owner, std::string_view name, uint32_t retry_count) -> void* {
+    return page_alloc_with_reclaim_impl(owner, paging::PAGE_SIZE, name, ReturnedPageZeroing::FULL_OVERWRITE, __builtin_return_address(0),
                                         retry_count, false);
 }
 
@@ -1645,7 +1900,7 @@ void init_kernel_stack_pool() {
     size_t arena_bytes = KERNEL_STACK_POOL_BYTES;
     void* backing = nullptr;
     while (arena_bytes >= KERNEL_STACK_POOL_MIN_BYTES) {
-        backing = page_alloc_full_overwrite_may_fail(arena_bytes, "kernel_stack_pool");
+        backing = page_alloc_full_overwrite_may_fail(PhysicalPageOwner::KERNEL_STACK_POOL, arena_bytes, "kernel_stack_pool");
         if (backing != nullptr) {
             break;
         }
@@ -1700,7 +1955,7 @@ auto kernel_stack_alloc(std::string_view name) -> void* {
         return stack;
     }
 
-    return page_alloc_with_reclaim_may_fail(ker::mod::mm::KERNEL_STACK_SIZE, name);
+    return page_alloc_with_reclaim_may_fail(PhysicalPageOwner::KERNEL_STACK, ker::mod::mm::KERNEL_STACK_SIZE, name);
 }
 
 namespace {
@@ -1741,7 +1996,7 @@ auto release_kernel_stack_pool_slot(void* page) -> KernelStackPoolRelease {
 }
 }  // namespace
 
-auto page_alloc_huge(uint64_t size) -> void* {
+auto page_alloc_huge(PhysicalPageOwner owner, uint64_t size) -> void* {
     if (huge_page_zone == nullptr) {
         return nullptr;
     }
@@ -1761,7 +2016,7 @@ auto page_alloc_huge(uint64_t size) -> void* {
 #else
     uint64_t const CALLER_TAG = 0;
 #endif
-    void* block = find_free_block_huge(size, CALLER_TAG);
+    void* block = find_free_block_huge(size, owner, CALLER_TAG);
 
     if (block == nullptr) {
         return nullptr;
@@ -1969,6 +2224,21 @@ auto page_mark_kind(void* page, PageKind kind) -> bool {
 
     uint64_t const FLAGS = alloc->lock_irq();
     bool const OK = alloc->mark_allocated_block_kind(page, kind);
+    alloc->unlock_irq(FLAGS);
+    return OK;
+}
+
+auto page_reassign_owner(void* page, PhysicalPageOwner owner) -> bool {
+    if (page == nullptr || !physical_page_owner_is_valid(owner)) {
+        return false;
+    }
+    PageAllocator* alloc = nullptr;
+    uint32_t idx = 0;
+    if (!find_allocator_for_page(page, alloc, idx) || alloc == nullptr) {
+        return false;
+    }
+    uint64_t const FLAGS = alloc->lock_irq();
+    bool const OK = alloc->reassign_allocated_block_owner(page, owner);
     alloc->unlock_irq(FLAGS);
     return OK;
 }

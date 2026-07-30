@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <platform/mm/paging.hpp>
 
@@ -43,6 +44,7 @@ auto sys_vmem(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4) -
 // addr: address to map (for MAP_FIXED) or 0
 auto sys_vmem_map(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags, uint64_t fd, uint64_t offset) -> uint64_t;
 auto file_mmap_cache_stats() -> FileMmapCacheStats;
+auto file_mmap_cache_reclaim(size_t max_pages) -> size_t;
 auto materialize_lazy_file_page(ker::mod::sched::task::Task* task, const ker::mod::sched::task::LazyVmemRange& range, uint64_t page_vaddr,
                                 const ker::mod::mm::paging::PageFault& fault) -> bool;
 auto clone_file_mmap_ranges_for_pagemap(ker::mod::mm::paging::PageTable* src, ker::mod::mm::paging::PageTable* dst) -> bool;

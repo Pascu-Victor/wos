@@ -3,6 +3,8 @@
 #include <cstdint>
 #include <cstring>
 #include <platform/dbg/dbg.hpp>
+#include <platform/mm/page_alloc.hpp>
+#include <platform/mm/paging.hpp>
 #include <platform/mm/phys.hpp>
 #include <platform/sys/spinlock.hpp>
 
@@ -27,7 +29,8 @@ void init_gdb_debug_info() {
 
 void add_gdb_debug_info(uint64_t pid, const char* name, uint64_t base_addr, uint64_t entry_point) {
     // Allocate memory for the debug info structure
-    auto const DEBUG_INFO_PADDR = reinterpret_cast<uint64_t>(ker::mod::mm::phys::page_alloc());
+    auto const DEBUG_INFO_PADDR = reinterpret_cast<uint64_t>(
+        ker::mod::mm::phys::page_alloc(ker::mod::mm::PhysicalPageOwner::DEBUGGER, ker::mod::mm::paging::PAGE_SIZE, "gdb_debug_info"));
     if (DEBUG_INFO_PADDR == 0) {
         log::error("failed to allocate memory for debug info");
         return;

@@ -16,6 +16,7 @@
 #include "platform/dbg/dbg.hpp"
 #include "platform/ktime/ktime.hpp"
 #include "platform/mm/addr.hpp"
+#include "platform/mm/page_alloc.hpp"
 #include "platform/mm/paging.hpp"
 #include "platform/mm/phys.hpp"
 #include "platform/mm/virt.hpp"
@@ -513,7 +514,8 @@ void process_relocations(const ElfFile& elf, ker::mod::mm::virt::PageTable* page
 #ifdef ELF_DEBUG
                             mod::dbg::log("GOT/PLT entry at 0x%x not mapped; allocating page 0x%x", P, targetPage);
 #endif
-                            auto const NEW_PADDR = reinterpret_cast<uint64_t>(mod::mm::phys::page_alloc());
+                            auto const NEW_PADDR = reinterpret_cast<uint64_t>(mod::mm::phys::page_alloc(
+                                mod::mm::PhysicalPageOwner::USER_EXECUTABLE_MAPPING, mod::mm::paging::PAGE_SIZE, "elf_segment"));
                             if (NEW_PADDR != 0) {
                                 auto const PHYS_PTR_PAGE = hhdm_to_phys(NEW_PADDR);
                                 mod::mm::virt::map_page(pagemap, TARGET_PAGE, PHYS_PTR_PAGE, mod::mm::paging::page_types::USER);
@@ -679,7 +681,8 @@ void process_relocations(const ElfFile& elf, ker::mod::mm::virt::PageTable* page
 #ifdef ELF_DEBUG
                             mod::dbg::log("GOT/PLT entry at 0x%x not mapped; allocating page 0x%x", P, targetPage);
 #endif
-                            auto const NEW_PADDR = reinterpret_cast<uint64_t>(mod::mm::phys::page_alloc());
+                            auto const NEW_PADDR = reinterpret_cast<uint64_t>(mod::mm::phys::page_alloc(
+                                mod::mm::PhysicalPageOwner::USER_EXECUTABLE_MAPPING, mod::mm::paging::PAGE_SIZE, "elf_segment"));
                             if (NEW_PADDR != 0) {
                                 auto const PHYS_PTR = hhdm_to_phys(NEW_PADDR);
                                 mod::mm::virt::map_page(pagemap, TARGET_PAGE, PHYS_PTR, mod::mm::paging::page_types::USER);
@@ -816,7 +819,8 @@ auto load_segment(const ElfFile& elf, ker::mod::mm::virt::PageTable* pagemap, co
         page_hhdm_ptr = reinterpret_cast<uint64_t>(mod::mm::addr::get_virt_pointer(PADDR));
     } else {
         // Allocate a new physical page; allocator returns an HHDM pointer to the page memory
-        auto const NEW_PAGE_HHDM_PTR = reinterpret_cast<uint64_t>(mod::mm::phys::page_alloc());
+        auto const NEW_PAGE_HHDM_PTR = reinterpret_cast<uint64_t>(
+            mod::mm::phys::page_alloc(mod::mm::PhysicalPageOwner::USER_EXECUTABLE_MAPPING, mod::mm::paging::PAGE_SIZE, "elf_segment"));
         page_hhdm_ptr = NEW_PAGE_HHDM_PTR;
         // Map using the physical address corresponding to that HHDM pointer
         auto const PAGE_FLAGS = page_flags_for_program_header(program_header);
@@ -877,7 +881,8 @@ void load_section_headers(const ElfFile& elf, ker::mod::mm::virt::PageTable* pag
     constexpr uint64_t SECTION_HEADERS_VADDR = 0x700000000000ULL;  // High memory area for debug info
 
     for (uint64_t i = 0; i < SECTION_HEADERS_PAGES; i++) {
-        auto const PADDR = reinterpret_cast<uint64_t>(mod::mm::phys::page_alloc());
+        auto const PADDR = reinterpret_cast<uint64_t>(
+            mod::mm::phys::page_alloc(mod::mm::PhysicalPageOwner::USER_EXECUTABLE_MAPPING, mod::mm::paging::PAGE_SIZE, "elf_segment"));
         if (PADDR != ker::mod::mm::virt::PADDR_INVALID) {
             auto const PHYS_PTR = hhdm_to_phys(PADDR);
             mod::mm::virt::map_page(pagemap, SECTION_HEADERS_VADDR + (i * mod::mm::virt::PAGE_SIZE), PHYS_PTR,
@@ -899,7 +904,8 @@ void load_section_headers(const ElfFile& elf, ker::mod::mm::virt::PageTable* pag
     uint64_t const STRING_TABLE_VADDR = 0x700000201000ULL;  // After section headers
 
     for (uint64_t i = 0; i < STRING_TABLE_PAGES; i++) {
-        auto const PADDR = reinterpret_cast<uint64_t>(mod::mm::phys::page_alloc());
+        auto const PADDR = reinterpret_cast<uint64_t>(
+            mod::mm::phys::page_alloc(mod::mm::PhysicalPageOwner::USER_EXECUTABLE_MAPPING, mod::mm::paging::PAGE_SIZE, "elf_segment"));
         if (PADDR != ker::mod::mm::virt::PADDR_INVALID) {
             auto const PHYS_PTR = hhdm_to_phys(PADDR);
             mod::mm::virt::map_page(pagemap, STRING_TABLE_VADDR + (i * mod::mm::virt::PAGE_SIZE), PHYS_PTR,
@@ -1089,7 +1095,8 @@ auto load_elf_impl(ElfFile elf_file, ker::mod::mm::virt::PageTable* pagemap, uin
         // Allocate physical pages for both ELF and program headers
         std::vector<uint64_t> header_phys_addrs;
         for (uint64_t i = 0; i < TOTAL_HEADERS_PAGES; i++) {
-            auto const PADDR = reinterpret_cast<uint64_t>(mod::mm::phys::page_alloc());
+            auto const PADDR = reinterpret_cast<uint64_t>(
+                mod::mm::phys::page_alloc(mod::mm::PhysicalPageOwner::USER_EXECUTABLE_MAPPING, mod::mm::paging::PAGE_SIZE, "elf_segment"));
             if (PADDR == ker::mod::mm::virt::PADDR_INVALID) {
                 mod::dbg::log("ERROR: Failed to allocate physical page for headers");
                 return {.entry_point = 0, .program_header_addr = 0, .elf_header_addr = 0};

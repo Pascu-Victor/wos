@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <defines/defines.hpp>
 #include <new>
+#include <platform/mm/page_alloc.hpp>
 #include <platform/mm/paging.hpp>
 #include <platform/mm/phys.hpp>
 #include <sanitizer/kcov.hpp>
@@ -132,7 +133,8 @@ __attribute__((no_sanitize("coverage"))) int alloc_buffer(size_t num_entries) {
         return -1;  // ENOMEM
     }
 
-    buf->pcs = static_cast<uint64_t*>(ker::mod::mm::phys::page_alloc_may_fail(ALLOC_BYTES, "kcov_buffer"));
+    buf->pcs = static_cast<uint64_t*>(
+        ker::mod::mm::phys::page_alloc_may_fail(ker::mod::mm::PhysicalPageOwner::KCOV_BUFFER, ALLOC_BYTES, "kcov_buffer"));
     if (buf->pcs == nullptr) {
         delete buf;
         return -1;

@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <cstring>
 #include <platform/ktime/ktime.hpp>
+#include <platform/mm/page_alloc.hpp>
 #include <platform/mm/paging.hpp>
 #include <platform/mm/phys.hpp>
 #include <platform/mm/swap.hpp>
@@ -370,12 +371,13 @@ auto allocate_resident_page(TmpNode* node, size_t page_index) -> void* {
     if (!tmpfs_can_allocate_page()) {
         static_cast<void>(reclaim_from_node_locked(node, 1, page_index));
     }
-    void* page = ker::mod::mm::phys::page_alloc_may_fail(DEFAULT_TMPFS_BLOCK_SIZE, "tmpfs_page");
+    void* page =
+        ker::mod::mm::phys::page_alloc_may_fail(ker::mod::mm::PhysicalPageOwner::TMPFS_DATA, DEFAULT_TMPFS_BLOCK_SIZE, "tmpfs_page");
     if (page != nullptr) {
         return page;
     }
     static_cast<void>(reclaim_from_node_locked(node, 4, page_index));
-    return ker::mod::mm::phys::page_alloc_may_fail(DEFAULT_TMPFS_BLOCK_SIZE, "tmpfs_page");
+    return ker::mod::mm::phys::page_alloc_may_fail(ker::mod::mm::PhysicalPageOwner::TMPFS_DATA, DEFAULT_TMPFS_BLOCK_SIZE, "tmpfs_page");
 }
 
 auto ensure_page_resident_locked(TmpNode* node, size_t page_index, TmpPage** out_page) -> int {

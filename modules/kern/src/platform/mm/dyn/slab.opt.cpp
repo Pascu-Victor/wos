@@ -14,7 +14,7 @@ namespace {
 auto slab_page(Slab* slab) -> void* { return reinterpret_cast<void*>(page_align_down(reinterpret_cast<uint64_t>(slab))); }
 
 auto create_slab() -> Slab* {
-    auto* free_slab = static_cast<FreeSlab*>(phys::page_alloc());
+    auto* free_slab = static_cast<FreeSlab*>(phys::page_alloc(PhysicalPageOwner::KMALLOC_SLAB, paging::PAGE_SIZE, "legacy_slab"));
     if (free_slab == nullptr) {
         return nullptr;
     }

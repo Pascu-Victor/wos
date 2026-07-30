@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "platform/mm/addr.hpp"
+#include "platform/mm/page_alloc.hpp"
 #include "platform/mm/phys.hpp"
 #include "platform/sys/spinlock.hpp"
 
@@ -70,7 +71,7 @@ void free_zone_backing(WkiZone* zone) {
 
 auto allocate_zone_backing(uint32_t size) -> void* {
     // Allocate physically contiguous pages from buddy allocator
-    return ker::mod::mm::phys::page_alloc(size);
+    return ker::mod::mm::phys::page_alloc(ker::mod::mm::PhysicalPageOwner::WKI_ZONE, size, "wki_zone");
 }
 
 auto zone_range_valid(uint32_t offset, uint32_t len, uint32_t size) -> bool { return offset <= size && len <= size - offset; }
@@ -344,7 +345,7 @@ auto allocate_roce_zone_backing(WkiTransport* transport, uint32_t size, uint32_t
     if (transport == nullptr || transport->rdma_register_region == nullptr) {
         return nullptr;
     }
-    void* backing = ker::mod::mm::phys::page_alloc(size);
+    void* backing = ker::mod::mm::phys::page_alloc(ker::mod::mm::PhysicalPageOwner::WKI_ZONE, size, "wki_zone");
     if (backing == nullptr) {
         return nullptr;
     }

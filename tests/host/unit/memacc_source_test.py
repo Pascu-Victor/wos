@@ -7,6 +7,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[3]
 MEMACC_IO_CPP = ROOT / "modules" / "memacc" / "src" / "procfs_io.cpp"
 MEMACC_IO_HPP = ROOT / "modules" / "memacc" / "src" / "procfs_io.hpp"
+PROCFS_CPP = ROOT / "modules" / "kern" / "src" / "vfs" / "fs" / "procfs.cpp"
+PHYS_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "mm" / "phys.opt.cpp"
+OOM_DUMP_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "mm" / "oom_dump.cpp"
+PACKET_CPP = ROOT / "modules" / "kern" / "src" / "net" / "packet.cpp"
+VIRT_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "mm" / "virt.opt.cpp"
+VMEM_CPP = ROOT / "modules" / "kern" / "src" / "syscalls_impl" / "vmem" / "sys_vmem.cpp"
 
 
 def fail(message: str) -> None:
@@ -41,6 +47,12 @@ def require_tokens(source: str, tokens: list[str], context: str) -> None:
         fail(f"{context}: missing {', '.join(missing)}")
 
 
+def require_absent(source: str, tokens: list[str], context: str) -> None:
+    present = [token for token in tokens if token in source]
+    if present:
+        fail(f"{context}: forbidden {', '.join(present)}")
+
+
 def test_memacc_reads_are_byte_capped() -> None:
     source = MEMACC_IO_CPP.read_text()
     header = MEMACC_IO_HPP.read_text()
@@ -72,9 +84,138 @@ def test_memacc_reads_are_byte_capped() -> None:
         fail("memacc read_file must not use an uncapped raw buffer loop")
 
 
+def test_physical_balance_is_exact_and_concrete() -> None:
+    procfs = PROCFS_CPP.read_text()
+    summary = function_body(procfs, "generate_memacc_summary")
+    require_tokens(
+        summary,
+        [
+            "get_physical_balance_snapshot(balance)",
+            '"schema", 2',
+            '"identity_mismatch_pages"',
+            '"untracked_unreclaimable_pages"',
+            'append_sconst(p, end, "physical_owner")',
+            '"objects"',
+            '"lifetime"',
+            '"reclaimability"',
+            '"scaling_bound"',
+            '"physical_allocator_embedded_metadata"',
+            '"per_cpu_physical_page_cache_metadata"',
+        ],
+        "exact physical balance export",
+    )
+    require_absent(
+        summary,
+        [
+            "unaccounted_estimate",
+            '"unknown"',
+            '"other"',
+            '"estimated"',
+        ],
+        "physical balance must not contain residual categories",
+    )
+
+    snapshot = function_body(PHYS_CPP.read_text(), "get_physical_balance_snapshot")
+    require_tokens(
+        snapshot,
+        [
+            "allocators.at(i)->lock_irq()",
+            "physical balance zone bound exceeded",
+            "out.identity_pages = out.free_pages + out.allocator_metadata_pages + out.zone_descriptor_pages + out.owner_pages",
+            "out.untracked_unreclaimable_pages = out.identity_mismatch_pages",
+        ],
+        "coherent bounded physical snapshot",
+    )
+    require_tokens(
+        function_body(PHYS_CPP.read_text(), "init"),
+        ['panic_handler("unsupported physical reserve memory-map type")'],
+        "physical reserve accounting must fail closed",
+    )
+
+    oom_dump = function_body(OOM_DUMP_CPP.read_text(), "dump_page_allocations_oom")
+    require_tokens(
+        oom_dump,
+        [
+            "get_physical_balance_snapshot(physical_balance)",
+            '"Managed-page equation: total="',
+            '"Physical-address equation: total="',
+            '" untracked_unreclaimable="',
+            "physical_owner_descriptors()",
+            "physical_reserve_descriptors()",
+        ],
+        "exact emergency physical balance export",
+    )
+    require_absent(
+        oom_dump,
+        ["unaccounted", "unknown physical", "estimated physical"],
+        "emergency physical balance must not contain residual categories",
+    )
+
+
+def test_pressure_reclaim_is_real_and_preserves_network_reserve() -> None:
+    packet = PACKET_CPP.read_text()
+    reclaim = function_body(packet, "pkt_pool_reclaim_free")
+    require_tokens(
+        reclaim,
+        [
+            "target_capacity = std::max(target_capacity, pool_reserve_capacity)",
+            "!chunk->reclaimable || chunk->free != chunk->count",
+            "pool_capacity - chunk->count < target_capacity",
+            "free_count.fetch_sub(chunk->count",
+            "free_packet_buffer_array(chunk->buffers, chunk->count)",
+            "chunk->draining = true",
+            "free_count.fetch_sub(removed",
+            "active_capacity - chunk->count < pool_reserve_capacity",
+            "stats.marked_draining_buffers += chunk->count",
+        ],
+        "packet growth-chunk pressure reclaim",
+    )
+
+    procfs = PROCFS_CPP.read_text()
+    require_tokens(
+        procfs,
+        [
+            '"memacc/reclaim/file_mmap_cache"',
+            "file_mmap_cache_reclaim",
+            '"memacc/reclaim/xfs_inode"',
+            "xfs_icache_reclaim_for_pressure",
+        ],
+        "controlled cache pressure interfaces",
+    )
+
+
+def test_persistent_and_transferred_pages_have_lifetime_owners() -> None:
+    virt = VIRT_CPP.read_text()
+    require_tokens(
+        function_body(virt, "try_alloc_page_table_from_pool"),
+        ["page_reassign_owner(table, PhysicalPageOwner::PAGE_TABLE)"],
+        "active page-table ownership",
+    )
+    require_tokens(
+        function_body(virt, "try_release_page_table_to_pool"),
+        ["page_reassign_owner(table, PhysicalPageOwner::PAGE_TABLE_POOL_RESERVE)"],
+        "page-table pool reserve ownership",
+    )
+
+    vmem = VMEM_CPP.read_text()
+    require_tokens(
+        function_body(vmem, "get_anon_zero_page"),
+        ["PhysicalPageOwner::ANON_ZERO_PAGE_RESERVE"],
+        "anonymous zero-page reserve ownership",
+    )
+    require_tokens(
+        function_body(vmem, "release_file_mmap_cache_page"),
+        ["page_reassign_owner(page, ker::mod::mm::PhysicalPageOwner::USER_FILE_MAPPING)", "page_ref_dec(page)"],
+        "evicted file-cache ownership transfer",
+    )
+
+
 def main() -> None:
     test_memacc_reads_are_byte_capped()
-    print("memacc file reads are byte capped")
+    test_physical_balance_is_exact_and_concrete()
+    test_pressure_reclaim_is_real_and_preserves_network_reserve()
+    test_persistent_and_transferred_pages_have_lifetime_owners()
+    print("memacc reads and exact physical balance invariants hold")
 
 
 if __name__ == "__main__":

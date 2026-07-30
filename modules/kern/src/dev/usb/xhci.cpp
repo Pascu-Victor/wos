@@ -8,6 +8,7 @@
 #include <platform/dbg/dbg.hpp>
 #include <platform/interrupt/gates.hpp>
 #include <platform/mm/addr.hpp>
+#include <platform/mm/page_alloc.hpp>
 #include <platform/mm/phys.hpp>
 #include <platform/mm/virt.hpp>
 #include <utility>
@@ -63,7 +64,7 @@ struct Alloc {
 };
 
 auto alloc_page() -> Alloc {
-    void* v = mod::mm::phys::page_alloc(PAGE_SIZE);
+    void* v = mod::mm::phys::page_alloc(mod::mm::PhysicalPageOwner::DEVICE_USB, PAGE_SIZE, "xhci_page");
     if (v == nullptr) {
         return {.virt = nullptr, .phys = 0};
     }
@@ -74,7 +75,7 @@ auto alloc_page() -> Alloc {
 auto alloc_pages(size_t bytes) -> Alloc {
     // Round up to page
     size_t const ALLOC_BYTES = ((bytes + PAGE_SIZE - 1) / PAGE_SIZE) * PAGE_SIZE;
-    void* v = mod::mm::phys::page_alloc(ALLOC_BYTES);
+    void* v = mod::mm::phys::page_alloc(mod::mm::PhysicalPageOwner::DEVICE_USB, ALLOC_BYTES, "xhci_dma");
     if (v == nullptr) {
         return {.virt = nullptr, .phys = 0};
     }
@@ -546,7 +547,7 @@ auto init_controller(pci::PCIDevice* pci_dev) -> int {
 
     // Allocate controller state
     // NOLINTNEXTLINE(misc-const-correctness): placement-new constructs mutable controller storage.
-    void* hc_storage = mod::mm::phys::page_alloc(sizeof(XhciController));
+    void* hc_storage = mod::mm::phys::page_alloc(mod::mm::PhysicalPageOwner::DEVICE_USB, sizeof(XhciController), "xhci_controller");
     if (hc_storage == nullptr) {
         return -1;
     }

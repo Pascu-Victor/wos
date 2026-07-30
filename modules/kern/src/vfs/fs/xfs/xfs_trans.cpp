@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <new>
 #include <platform/dbg/dbg.hpp>
+#include <platform/mm/page_alloc.hpp>
 #include <platform/mm/phys.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sys/spinlock.hpp>
@@ -32,9 +33,18 @@ namespace {
 constexpr size_t XFS_TRANS_ARENA_BYTES = size_t{256} * 1024;
 constexpr size_t XFS_TRANS_STRIDE = (sizeof(XfsTransaction) + alignof(XfsTransaction) - 1) & ~(alignof(XfsTransaction) - 1);
 
+struct XfsTransactionArena {
+    XfsTransactionArena* next{};
+    size_t total_slots{};
+    size_t free_slots{};
+    bool permanent_reserve{};
+};
+
 struct XfsTransactionPool {
     ker::mod::sys::Spinlock lock;
     XfsTransaction* free_list{};
+    XfsTransactionArena* arenas{};
+    size_t arena_count{};
 };
 
 XfsTransactionPool transaction_pool{};
@@ -236,12 +246,25 @@ void xfs_trans_discard_retired_ranges(XfsTransaction* tp) {
 }
 
 void xfs_trans_add_arena_locked(void* arena, size_t bytes) {
-    auto* next = static_cast<uint8_t*>(arena);
-    size_t remaining = bytes;
+    auto* header = new (arena) XfsTransactionArena{};
+    header->permanent_reserve = transaction_pool.arena_count == 0;
+    if (header->permanent_reserve &&
+        !ker::mod::mm::phys::page_reassign_owner(arena, ker::mod::mm::PhysicalPageOwner::XFS_TRANSACTION_METADATA_RESERVE)) {
+        ker::mod::dbg::panic_handler("XFS failed to account permanent transaction arena");
+    }
+    header->next = transaction_pool.arenas;
+    transaction_pool.arenas = header;
+    transaction_pool.arena_count++;
+    constexpr size_t HEADER_BYTES = (sizeof(XfsTransactionArena) + alignof(XfsTransaction) - 1) & ~(alignof(XfsTransaction) - 1);
+    auto* next = static_cast<uint8_t*>(arena) + HEADER_BYTES;
+    size_t remaining = bytes - HEADER_BYTES;
     while (remaining >= XFS_TRANS_STRIDE) {
         auto* tp = new (next) XfsTransaction{};
+        tp->pool_arena = header;
         tp->pool_next = transaction_pool.free_list;
         transaction_pool.free_list = tp;
+        header->total_slots++;
+        header->free_slots++;
         next += XFS_TRANS_STRIDE;
         remaining -= XFS_TRANS_STRIDE;
     }
@@ -253,6 +276,7 @@ auto xfs_trans_pool_pop() -> XfsTransaction* {
     if (tp != nullptr) {
         transaction_pool.free_list = tp->pool_next;
         tp->pool_next = nullptr;
+        static_cast<XfsTransactionArena*>(tp->pool_arena)->free_slots--;
     }
     transaction_pool.lock.unlock_irqrestore(IRQF);
     return tp;
@@ -264,7 +288,8 @@ auto xfs_trans_pool_alloc() -> XfsTransaction* {
         return tp;
     }
 
-    void* const ARENA = ker::mod::mm::phys::page_alloc_full_overwrite(XFS_TRANS_ARENA_BYTES, "xfs_transactions");
+    void* const ARENA = ker::mod::mm::phys::page_alloc_full_overwrite(ker::mod::mm::PhysicalPageOwner::XFS_TRANSACTION_METADATA,
+                                                                      XFS_TRANS_ARENA_BYTES, "xfs_transactions");
     if (ARENA != nullptr) {
         uint64_t const IRQF = transaction_pool.lock.lock_irqsave();
         xfs_trans_add_arena_locked(ARENA, XFS_TRANS_ARENA_BYTES);
@@ -272,6 +297,7 @@ auto xfs_trans_pool_alloc() -> XfsTransaction* {
         if (tp != nullptr) {
             transaction_pool.free_list = tp->pool_next;
             tp->pool_next = nullptr;
+            static_cast<XfsTransactionArena*>(tp->pool_arena)->free_slots--;
         }
         transaction_pool.lock.unlock_irqrestore(IRQF);
         if (tp != nullptr) {
@@ -288,10 +314,39 @@ void xfs_trans_release(XfsTransaction* tp) {
         return;
     }
     xfs_trans_reset_for_reuse(tp);
+    auto* arena = static_cast<XfsTransactionArena*>(tp->pool_arena);
+    if (arena == nullptr) {
+        delete tp;
+        return;
+    }
+    void* retired_arena = nullptr;
     uint64_t const IRQF = transaction_pool.lock.lock_irqsave();
     tp->pool_next = transaction_pool.free_list;
     transaction_pool.free_list = tp;
+    arena->free_slots++;
+    if (arena->free_slots == arena->total_slots && !arena->permanent_reserve) {
+        XfsTransaction** link = &transaction_pool.free_list;
+        while (*link != nullptr) {
+            if ((*link)->pool_arena == arena) {
+                *link = (*link)->pool_next;
+            } else {
+                link = &(*link)->pool_next;
+            }
+        }
+        XfsTransactionArena** arena_link = &transaction_pool.arenas;
+        while (*arena_link != nullptr && *arena_link != arena) {
+            arena_link = &(*arena_link)->next;
+        }
+        if (*arena_link == arena) {
+            *arena_link = arena->next;
+            transaction_pool.arena_count--;
+            retired_arena = arena;
+        }
+    }
     transaction_pool.lock.unlock_irqrestore(IRQF);
+    if (retired_arena != nullptr) {
+        ker::mod::mm::phys::page_free(retired_arena);
+    }
 }
 
 }  // namespace

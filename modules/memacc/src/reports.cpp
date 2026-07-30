@@ -62,12 +62,30 @@ void print_summary() {
     print_kib_line("used", get_u64(*summary, "used_bytes"));
     print_kib_line("process rss", get_u64(*summary, "process_rss_bytes"));
     print_kib_line("process pte", get_u64(*summary, "process_pte_bytes"));
-    print_kib_line("allocator", get_u64(*summary, "allocator_bytes"));
-    print_kib_line("caches", get_u64(*summary, "cache_bytes"));
-    print_kib_line("unaccounted estimate", get_u64(*summary, "unaccounted_estimate_bytes"));
+    print_kib_line("physical owners", get_u64(*summary, "owner_bytes"));
+    print_kib_line("allocator metadata", get_u64(*summary, "allocator_metadata_bytes"));
+    print_kib_line("zone descriptors", get_u64(*summary, "zone_descriptor_bytes"));
+    print_kib_line("per-CPU page reserve", get_u64(*summary, "per_cpu_page_cache_reserve_bytes"));
+    print_kib_line("firmware/boot reserves", get_u64(*summary, "firmware_reserve_bytes"));
+    std::printf("balance total=%llu identity=%llu mismatch=%llu untracked_unreclaimable=%llu pages\n",
+                static_cast<unsigned long long>(get_u64(*summary, "total_pages")),
+                static_cast<unsigned long long>(get_u64(*summary, "identity_pages")),
+                static_cast<unsigned long long>(get_u64(*summary, "identity_mismatch_pages")),
+                static_cast<unsigned long long>(get_u64(*summary, "untracked_unreclaimable_pages")));
     std::printf("processes %llu, tasks %llu, kernel tasks %llu\n", static_cast<unsigned long long>(get_u64(*summary, "processes")),
                 static_cast<unsigned long long>(get_u64(*summary, "tasks")),
                 static_cast<unsigned long long>(get_u64(*summary, "kernel_tasks")));
+
+    std::printf("\nPhysical owners\n");
+    for (const auto& row : rows) {
+        if (row.record != "physical_owner") {
+            continue;
+        }
+        std::printf("%-34s pages=%10llu bytes=%12llu objects=%10llu reclaim=%s lifetime=%s bound=%s\n", get_string(row, "name").c_str(),
+                    static_cast<unsigned long long>(get_u64(row, "pages")), static_cast<unsigned long long>(get_u64(row, "bytes")),
+                    static_cast<unsigned long long>(get_u64(row, "objects")), get_string(row, "reclaimability").c_str(),
+                    get_string(row, "lifetime").c_str(), get_string(row, "scaling_bound").c_str());
+    }
 
     auto alloc_rows = read_rows("alloc_totals");
     if (const Row* phys = first_record(alloc_rows, "phys"); phys != nullptr) {

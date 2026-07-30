@@ -169,17 +169,17 @@ def main() -> None:
     )
     require(
         ahci_source,
-        'ker::mod::mm::phys::page_alloc(CLB_SIZE, "ahci_clb")',
+        'ker::mod::mm::phys::page_alloc(ker::mod::mm::PhysicalPageOwner::DEVICE_AHCI, CLB_SIZE, "ahci_clb")',
         "AHCI command-list memory must be physically contiguous DMA memory",
     )
     require(
         ahci_source,
-        'ker::mod::mm::phys::page_alloc(FIS_RECEIVE_SIZE, "ahci_fis")',
+        'ker::mod::mm::phys::page_alloc(ker::mod::mm::PhysicalPageOwner::DEVICE_AHCI, FIS_RECEIVE_SIZE, "ahci_fis")',
         "AHCI received-FIS memory must be physically contiguous DMA memory",
     )
     require(
         ahci_source,
-        'ker::mod::mm::phys::page_alloc(CTB_SIZE, "ahci_ctb")',
+        'ker::mod::mm::phys::page_alloc(ker::mod::mm::PhysicalPageOwner::DEVICE_AHCI, CTB_SIZE, "ahci_ctb")',
         "AHCI command-table memory must be physically contiguous DMA memory",
     )
     require(

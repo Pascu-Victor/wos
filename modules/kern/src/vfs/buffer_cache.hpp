@@ -32,6 +32,7 @@ constexpr uint32_t BH_DATA_VMAP = (1U << 8);        // Buffer data uses virtuall
 // Buffer head - represents a single cached block from a block device.
 // Analogous to Linux struct buffer_head / simplified xfs_buf.
 struct BufHead {
+    void* pool_arena{};             // Owning reclaimable metadata arena, or null for heap fallback
     uint8_t* data{};                // Pointer to cached block data
     uint64_t block_no{};            // Block number on the device
     dev::BlockDevice* bdev{};       // Owning block device

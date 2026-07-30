@@ -881,6 +881,9 @@ constexpr uint16_t OP_PIPE_POLL_STATE = 0x0703;
 constexpr uint16_t OP_PIPE_DATA_FLOW = 0x0704;         // req={resource_id:u32, data[]}; application-credit controlled
 constexpr uint16_t OP_PIPE_WRITE_FLOW = 0x0705;        // req={resource_id:u32, credit_bytes:u32, status:i32}
 constexpr uint16_t OP_PIPE_CLOSE_WRITE_FLOW = 0x0706;  // terminal close for a flow-controlled exported writer
+// Ordered after a retired export's final IPC_DATA message. Receivers discard
+// any pre-attachment DATA/EOF state that can no longer acquire a proxy owner.
+constexpr uint16_t OP_PIPE_DISCARD_PENDING = 0x0707;  // req={resource_id:u32}
 
 struct IpcPipeWriteFlowPayload {
     uint32_t resource_id;

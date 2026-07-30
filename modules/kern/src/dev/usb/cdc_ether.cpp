@@ -10,6 +10,7 @@
 #include <new>  // IWYU pragma: keep
 #include <platform/dbg/dbg.hpp>
 #include <platform/mm/addr.hpp>
+#include <platform/mm/page_alloc.hpp>
 #include <platform/mm/phys.hpp>
 #include <platform/mm/virt.hpp>
 
@@ -207,7 +208,7 @@ void setup_bulk_ep(XhciController* hc, UsbDevice* dev, UsbEndpoint* ep, UsbEndpo
 
     // Allocate transfer ring
     size_t const RING_BYTES = XFER_RING_SIZE * sizeof(Trb);
-    auto* ring_virt = ker::mod::mm::phys::page_alloc(RING_BYTES);
+    auto* ring_virt = ker::mod::mm::phys::page_alloc(ker::mod::mm::PhysicalPageOwner::DEVICE_USB, RING_BYTES, "usb_cdc_ring");
     if (ring_virt == nullptr) {
         return;
     }

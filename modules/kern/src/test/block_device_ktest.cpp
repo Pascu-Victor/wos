@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <cstring>
 #include <dev/block_device.hpp>
+#include <platform/mm/page_alloc.hpp>
 #include <platform/mm/phys.hpp>
 #include <test/ktest.hpp>
 #include <utility>
@@ -56,7 +57,9 @@ auto make_chunking_bdev(BlockIoChunkState* state) -> ker::dev::BlockDevice {
     return dev;
 }
 
-auto alloc_io_buffer() -> uint8_t* { return static_cast<uint8_t*>(phys::page_alloc(IO_BYTES, "block_io_chunk_ktest")); }
+auto alloc_io_buffer() -> uint8_t* {
+    return static_cast<uint8_t*>(phys::page_alloc(ker::mod::mm::PhysicalPageOwner::SELFTEST, IO_BYTES, "block_io_chunk_ktest"));
+}
 
 }  // namespace
 

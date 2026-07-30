@@ -7,6 +7,7 @@
 #include <cstring>
 #include <defines/defines.hpp>
 #include <platform/dbg/dbg.hpp>
+#include <platform/mm/page_alloc.hpp>
 #include <platform/mm/phys.hpp>
 #include <platform/sys/spinlock.hpp>
 
@@ -267,9 +268,53 @@ auto Slab<slab_size, memory_size>::free_unlocked(void* address) -> void {
 
 template <size_t slab_size, size_t memory_size>
 auto Slab<slab_size, memory_size>::free(void* address) -> void {
+    Slab* retired = nullptr;
+#ifdef WOS_KMALLOC_DEBUG_INFO
+    uintptr_t* retired_last_free_caller = nullptr;
+    unsigned int* retired_free_count = nullptr;
+#endif
     slab_lock.lock();
     free_unlocked(address);
+    if (header.free_blocks == MAX_BLOCKS && header.prev != nullptr) {
+        if (header.on_nonfull_list) {
+            unlink_nonfull_unlocked();
+        }
+        header.prev->header.next = header.next;
+        if (header.next != nullptr) {
+            header.next->header.prev = header.prev;
+        } else {
+            ownership_tail = header.prev;
+        }
+        header.prev = nullptr;
+        header.next = nullptr;
+#ifdef WOS_KMALLOC_DEBUG_INFO
+        retired_last_free_caller = header.last_free_caller;
+        retired_free_count = header.free_count;
+        header.last_free_caller = nullptr;
+        header.free_count = nullptr;
+#endif
+        header.magic = 0;
+        retired = this;
+    }
     slab_lock.unlock();
+
+    if (retired != nullptr) {
+        // The bitmap can be completely empty only when no per-CPU magazine
+        // retains a block from this slab: magazine-held blocks remain marked
+        // allocated until their batch is flushed through mini_free().
+        (void)ker::mod::mm::phys::page_mark_kind(retired, ker::mod::mm::PageKind::NORMAL);
+        free_memory_to_os(retired, sizeof(Slab));
+#ifdef WOS_KMALLOC_DEBUG_INFO
+        if (retired_last_free_caller != nullptr) {
+            (void)ker::mod::mm::phys::page_mark_kind(retired_last_free_caller, ker::mod::mm::PageKind::NORMAL);
+            free_memory_to_os(retired_last_free_caller, sizeof(uintptr_t) * MAX_BLOCKS);
+        }
+        if (retired_free_count != nullptr) {
+            (void)ker::mod::mm::phys::page_mark_kind(retired_free_count, ker::mod::mm::PageKind::NORMAL);
+            free_memory_to_os(retired_free_count, sizeof(unsigned int) * MAX_BLOCKS);
+        }
+#endif
+    }
 }
 
 template <size_t slab_size, size_t memory_size>
@@ -386,11 +431,9 @@ void Slab<slab_size, memory_size>::free_from_current_slab(size_t block_index) {
         link_nonfull_unlocked();
     }
 
-    // Keep empty slabs attached to their size class. The small-allocation fast
-    // path can defer frees in per-CPU magazines; retaining the slab page avoids
-    // handing a page back to the buddy allocator while stale small-allocation
-    // pointers may still be diagnosed or flushed later. A future shrinker can
-    // reclaim fully empty slabs at a quiescent point.
+    // A magazine-held block remains set in this bitmap. Therefore a non-root
+    // slab that reaches MAX_BLOCKS after this transition has no deferred
+    // pointers on any CPU and can be detached safely by free().
 }
 
 template <size_t slab_size, size_t memory_size>
@@ -403,7 +446,7 @@ auto Slab<slab_size, memory_size>::request_memory_from_os(size_t size) -> void* 
 
 template <size_t slab_size, size_t memory_size>
 auto Slab<slab_size, memory_size>::request_untracked_memory_from_os(size_t size) -> void* {
-    void* address = ker::mod::mm::phys::page_alloc(size);
+    void* address = ker::mod::mm::phys::page_alloc(ker::mod::mm::PhysicalPageOwner::KMALLOC_SLAB, size, "kmalloc_slab");
     if (address == nullptr) {
         ker::mod::dbg::log("Malloc memory expansion failed halting.");
         assert(false);

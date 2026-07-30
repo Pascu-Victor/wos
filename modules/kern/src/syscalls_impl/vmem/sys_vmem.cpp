@@ -18,6 +18,7 @@
 #include <platform/init/limine_requests.hpp>
 #include <platform/ktime/ktime.hpp>
 #include <platform/mm/addr.hpp>
+#include <platform/mm/page_alloc.hpp>
 #include <platform/mm/paging.hpp>
 #include <platform/mm/phys.hpp>
 #include <platform/mm/swap.hpp>
@@ -785,6 +786,17 @@ auto file_mmap_cache_lookup(const FileMmapPageKey& key) -> void* {
     return nullptr;
 }
 
+void release_file_mmap_cache_page(void* page) {
+    if (page == nullptr) {
+        return;
+    }
+    if (ker::mod::mm::phys::page_ref_get(page) > 1 &&
+        !ker::mod::mm::phys::page_reassign_owner(page, ker::mod::mm::PhysicalPageOwner::USER_FILE_MAPPING)) {
+        ker::mod::dbg::panic_handler("file mmap cache could not transfer evicted page ownership");
+    }
+    ker::mod::mm::phys::page_ref_dec(page);
+}
+
 auto file_mmap_cache_insert_or_discard(const FileMmapPageKey& key, void* new_page, void** page_for_mapping) -> FileMmapCacheInsertResult {
     size_t const SET_INDEX = file_mmap_key_hash(key) & (FILE_MMAP_CACHE_SET_COUNT - 1);
     size_t const LOCK_INDEX = SET_INDEX & (FILE_MMAP_CACHE_LOCK_COUNT - 1);
@@ -824,7 +836,7 @@ auto file_mmap_cache_insert_or_discard(const FileMmapPageKey& key, void* new_pag
     cache_lock.mutex.unlock();
 
     if (evicted != nullptr) {
-        ker::mod::mm::phys::page_ref_dec(evicted);
+        release_file_mmap_cache_page(evicted);
         return FileMmapCacheInsertResult::EVICTED;
     }
 
@@ -887,8 +899,10 @@ auto file_mmap_cached_page_for_file(ker::vfs::File* file, const ker::vfs::Stat& 
     bool const FULL_PAGE_READ =
         file_offset < FILE_SIZE && FILE_SIZE - file_offset >= static_cast<uint64_t>(ker::mod::mm::paging::PAGE_SIZE);
     void* const NEW_PAGE = FULL_PAGE_READ
-                               ? ker::mod::mm::phys::page_alloc_full_overwrite_page_with_reclaim_may_fail("vmem-file-cache")
-                               : ker::mod::mm::phys::page_alloc_with_reclaim_may_fail(ker::mod::mm::paging::PAGE_SIZE, "vmem-file-cache");
+                               ? ker::mod::mm::phys::page_alloc_full_overwrite_page_with_reclaim_may_fail(
+                                     ker::mod::mm::PhysicalPageOwner::USER_FILE_CACHE, "vmem-file-cache")
+                               : ker::mod::mm::phys::page_alloc_with_reclaim_may_fail(ker::mod::mm::PhysicalPageOwner::USER_FILE_CACHE,
+                                                                                      ker::mod::mm::paging::PAGE_SIZE, "vmem-file-cache");
     if (NEW_PAGE == nullptr) {
         return false;
     }
@@ -1205,7 +1219,8 @@ auto get_anon_zero_page() -> void* {
         return EXISTING;
     }
 
-    void* const CANDIDATE = ker::mod::mm::phys::page_alloc_with_reclaim_may_fail(ker::mod::mm::paging::PAGE_SIZE, "vmem-zero");
+    void* const CANDIDATE = ker::mod::mm::phys::page_alloc_with_reclaim_may_fail(ker::mod::mm::PhysicalPageOwner::ANON_ZERO_PAGE_RESERVE,
+                                                                                 ker::mod::mm::paging::PAGE_SIZE, "vmem-zero");
     if (CANDIDATE == nullptr) {
         return nullptr;
     }
@@ -1400,7 +1415,8 @@ auto materialize_lazy_file_page_impl(ker::mod::sched::task::Task* task, const La
             return false;
         }
     } else {
-        page = ker::mod::mm::phys::page_alloc_with_reclaim_may_fail(ker::mod::mm::paging::PAGE_SIZE, "vmem-file-lazy");
+        page = ker::mod::mm::phys::page_alloc_with_reclaim_may_fail(ker::mod::mm::PhysicalPageOwner::USER_FILE_MAPPING,
+                                                                    ker::mod::mm::paging::PAGE_SIZE, "vmem-file-lazy");
         if (page == nullptr) {
             return false;
         }
@@ -1458,7 +1474,8 @@ auto materialize_reserved_page(ker::mod::sched::task::Task* task, uint64_t vaddr
         return true;
     }
 
-    void* const PHYS_PAGE = ker::mod::mm::phys::page_alloc_with_reclaim_may_fail(ker::mod::mm::paging::PAGE_SIZE, "vmem-reserve");
+    void* const PHYS_PAGE = ker::mod::mm::phys::page_alloc_with_reclaim_may_fail(ker::mod::mm::PhysicalPageOwner::USER_PRIVATE_MAPPING,
+                                                                                 ker::mod::mm::paging::PAGE_SIZE, "vmem-reserve");
     if (PHYS_PAGE == nullptr) {
         return false;
     }
@@ -1523,7 +1540,8 @@ auto private_anon_allocate(ker::mod::sched::task::Task* task, uint64_t vaddr, ui
 
     for (uint64_t i = 0; i < NUM_PAGES; i++) {
         auto current_vaddr = vaddr + (i * ker::mod::mm::paging::PAGE_SIZE);
-        void* const PHYS_PAGE = ker::mod::mm::phys::page_alloc_with_reclaim_may_fail(ker::mod::mm::paging::PAGE_SIZE, "vmem-anon");
+        void* const PHYS_PAGE = ker::mod::mm::phys::page_alloc_with_reclaim_may_fail(ker::mod::mm::PhysicalPageOwner::USER_PRIVATE_MAPPING,
+                                                                                     ker::mod::mm::paging::PAGE_SIZE, "vmem-anon");
         if (PHYS_PAGE == nullptr) {
             log::error("out of physical memory after mapping %llu/%llu anon pages", static_cast<unsigned long long>(mapped_pages),
                        static_cast<unsigned long long>(NUM_PAGES));
@@ -1948,7 +1966,8 @@ auto file_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags, 
     uint64_t mapped_pages = 0;
     for (uint64_t i = 0; i < NUM_PAGES; i++) {
         auto current_vaddr = vaddr + (i * ker::mod::mm::paging::PAGE_SIZE);
-        void* const PHYS_PAGE = ker::mod::mm::phys::page_alloc_with_reclaim_may_fail(ker::mod::mm::paging::PAGE_SIZE, "vmem-file");
+        void* const PHYS_PAGE = ker::mod::mm::phys::page_alloc_with_reclaim_may_fail(ker::mod::mm::PhysicalPageOwner::USER_FILE_MAPPING,
+                                                                                     ker::mod::mm::paging::PAGE_SIZE, "vmem-file");
         if (PHYS_PAGE == nullptr) {
             ker::vfs::vfs_put_file(eager_file);
             rollback_mapped_pages(task, vaddr, mapped_pages);
@@ -2047,6 +2066,51 @@ auto file_mmap_cache_stats() -> FileMmapCacheStats {
 
     stats.bytes = stats.pages * ker::mod::mm::paging::PAGE_SIZE;
     return stats;
+}
+
+auto file_mmap_cache_reclaim(size_t max_pages) -> size_t {
+    if (max_pages == 0) {
+        return 0;
+    }
+
+    constexpr size_t RELEASE_BATCH = 128;
+    std::array<void*, RELEASE_BATCH> release_pages{};
+    size_t reclaimed = 0;
+
+    for (size_t lock_index = 0; lock_index < FILE_MMAP_CACHE_LOCK_COUNT && reclaimed < max_pages; ++lock_index) {
+        auto& cache_lock = g_file_mmap_cache_locks.at(lock_index);
+        bool more = true;
+        while (more && reclaimed < max_pages) {
+            size_t release_count = 0;
+            more = false;
+            cache_lock.mutex.lock();
+            for (size_t set_index = lock_index; set_index < FILE_MMAP_CACHE_SET_COUNT; set_index += FILE_MMAP_CACHE_LOCK_COUNT) {
+                for (auto& entry : g_file_mmap_cache.at(set_index).ways) {
+                    if (entry.page == nullptr) {
+                        continue;
+                    }
+                    if (release_count == release_pages.size() || reclaimed + release_count == max_pages) {
+                        more = true;
+                        break;
+                    }
+                    release_pages.at(release_count++) = entry.page;
+                    entry = {};
+                }
+                if (more) {
+                    break;
+                }
+            }
+            cache_lock.mutex.unlock();
+
+            for (size_t i = 0; i < release_count; ++i) {
+                release_file_mmap_cache_page(release_pages.at(i));
+                release_pages.at(i) = nullptr;
+            }
+            reclaimed += release_count;
+        }
+    }
+
+    return reclaimed;
 }
 
 auto clone_file_mmap_ranges_for_pagemap(ker::mod::mm::paging::PageTable* src, ker::mod::mm::paging::PageTable* dst) -> bool {

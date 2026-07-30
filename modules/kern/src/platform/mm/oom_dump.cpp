@@ -95,6 +95,20 @@ constexpr uint64_t MMAP_REGION_END = 0x700000000000ULL;    // Up to ELF debug in
 constexpr uint64_t STACK_REGION_START = 0x7F0000000000ULL;
 constexpr uint64_t STACK_REGION_END = 0x800000000000ULL;  // End of canonical user space
 
+auto reclaimability_name(PhysicalOwnerReclaimability reclaimability) -> const char* {
+    switch (reclaimability) {
+        case PhysicalOwnerReclaimability::OWNER_TEARDOWN:
+            return "owner_teardown";
+        case PhysicalOwnerReclaimability::PRESSURE_RECLAIM:
+            return "pressure_reclaim";
+        case PhysicalOwnerReclaimability::PERMANENT:
+            return "permanent_reserve";
+        case PhysicalOwnerReclaimability::DIAGNOSTIC_LIFETIME:
+            return "diagnostic_lifetime";
+    }
+    __builtin_unreachable();
+}
+
 // ============================================================================
 // NUMBER CONVERSION HELPERS (no allocations)
 // ============================================================================
@@ -697,8 +711,14 @@ __attribute__((no_sanitize("address"))) void dump_page_allocations_oom() {
         hcf();
     }
 
-    // Halt all other CPUs immediately so they won't modify global state
-    // while we perform a defensive OOM analysis on this core.
+    // Copy the exact ledger before stopping peers. Taking allocator locks
+    // after an arbitrary peer halt could deadlock if that peer was stopped
+    // inside an allocation/free critical section.
+    PhysicalBalanceSnapshot physical_balance{};
+    get_physical_balance_snapshot(physical_balance);
+
+    // Halt all other CPUs immediately so they won't modify the remaining
+    // diagnostic state while we perform a defensive OOM analysis.
     ker::mod::smt::halt_other_cores();
 
     io::serial::write("\n");
@@ -706,9 +726,7 @@ __attribute__((no_sanitize("address"))) void dump_page_allocations_oom() {
     io::serial::write("║                    OOM PAGE ALLOCATION DUMP                          ║\n");
     io::serial::write("╚══════════════════════════════════════════════════════════════════════╝\n\n");
 
-    // We'll print allocator stats later after the MEMORY SUMMARY so we can
-    // use the computed totals there to refine the unaccounted memory estimate.
-    // For now just call the raw dumps so they appear early in the log for visibility.
+    // Keep logical allocator diagnostics alongside the exact physical ledger.
     mini_malloc::mini_dump_stats();
     ker::mod::mm::dyn::kmalloc::dump_tracked_allocations();
     dump_alloc_stats();  // Dump page allocation counters
@@ -1157,17 +1175,87 @@ __attribute__((no_sanitize("address"))) void dump_page_allocations_oom() {
     }
 
     // ========================================================================
-    // SECTION 5: Unaccounted Memory Analysis
+    // SECTION 5: Exact Physical-Memory Balance
     // ========================================================================
     io::serial::write("┌─────────────────────────────────────────────────────────────────────┐\n");
     io::serial::write("│ MEMORY ACCOUNTING                                                   │\n");
     io::serial::write("└─────────────────────────────────────────────────────────────────────┘\n");
 
-    io::serial::write("Total physical memory: ");
-    io::serial::write(u64_to_dec_no_alloc(total_memory / BYTES_PER_KB, oom_dump_buffer.data(), oom_dump_buffer.size()));
-    io::serial::write(" KB\n");
+    uint64_t const BALANCE_TOTAL_PAGES = physical_balance.managed_pages + physical_balance.per_cpu_page_cache_reserve_pages;
+    uint64_t const BALANCE_IDENTITY_PAGES = physical_balance.identity_pages + physical_balance.per_cpu_page_cache_reserve_pages;
+    uint64_t firmware_reserve_pages = 0;
+    for (const auto& reserve : physical_balance.firmware_reserves) {
+        firmware_reserve_pages += reserve.pages;
+    }
 
-    io::serial::write("Accounted process memory: ");
+    io::serial::write("Managed-page equation: total=");
+    io::serial::write(u64_to_dec_no_alloc(BALANCE_TOTAL_PAGES, oom_dump_buffer.data(), oom_dump_buffer.size()));
+    io::serial::write(" free=");
+    io::serial::write(u64_to_dec_no_alloc(physical_balance.free_pages, oom_dump_buffer.data(), oom_dump_buffer.size()));
+    io::serial::write(" concrete_owners=");
+    io::serial::write(u64_to_dec_no_alloc(physical_balance.owner_pages, oom_dump_buffer.data(), oom_dump_buffer.size()));
+    io::serial::write(" allocator_metadata=");
+    io::serial::write(u64_to_dec_no_alloc(physical_balance.allocator_metadata_pages, oom_dump_buffer.data(), oom_dump_buffer.size()));
+    io::serial::write(" zone_descriptors=");
+    io::serial::write(u64_to_dec_no_alloc(physical_balance.zone_descriptor_pages, oom_dump_buffer.data(), oom_dump_buffer.size()));
+    io::serial::write(" per_cpu_metadata=");
+    io::serial::write(
+        u64_to_dec_no_alloc(physical_balance.per_cpu_page_cache_reserve_pages, oom_dump_buffer.data(), oom_dump_buffer.size()));
+    io::serial::write(" identity=");
+    io::serial::write(u64_to_dec_no_alloc(BALANCE_IDENTITY_PAGES, oom_dump_buffer.data(), oom_dump_buffer.size()));
+    io::serial::write(" mismatch=");
+    io::serial::write(u64_to_dec_no_alloc(physical_balance.identity_mismatch_pages, oom_dump_buffer.data(), oom_dump_buffer.size()));
+    io::serial::write(" untracked_unreclaimable=");
+    io::serial::write(u64_to_dec_no_alloc(physical_balance.untracked_unreclaimable_pages, oom_dump_buffer.data(), oom_dump_buffer.size()));
+    io::serial::write("\n");
+
+    io::serial::write("Physical-address equation: total=");
+    io::serial::write(u64_to_dec_no_alloc(BALANCE_TOTAL_PAGES + firmware_reserve_pages, oom_dump_buffer.data(), oom_dump_buffer.size()));
+    io::serial::write(" managed_identity=");
+    io::serial::write(u64_to_dec_no_alloc(BALANCE_IDENTITY_PAGES, oom_dump_buffer.data(), oom_dump_buffer.size()));
+    io::serial::write(" firmware_reserves=");
+    io::serial::write(u64_to_dec_no_alloc(firmware_reserve_pages, oom_dump_buffer.data(), oom_dump_buffer.size()));
+    io::serial::write("\n\nPhysical owner rows:\n");
+
+    auto write_owner_row = [&](const char* name, uint64_t pages, uint64_t objects, const char* lifetime, const char* reclaimability,
+                               const char* scaling_bound) {
+        io::serial::write("  name=");
+        io::serial::write(name);
+        io::serial::write(" pages=");
+        io::serial::write(u64_to_dec_no_alloc(pages, oom_dump_buffer.data(), oom_dump_buffer.size()));
+        io::serial::write(" bytes=");
+        io::serial::write(u64_to_dec_no_alloc(pages * paging::PAGE_SIZE, oom_dump_buffer.data(), oom_dump_buffer.size()));
+        io::serial::write(" objects=");
+        io::serial::write(u64_to_dec_no_alloc(objects, oom_dump_buffer.data(), oom_dump_buffer.size()));
+        io::serial::write(" lifetime=");
+        io::serial::write(lifetime);
+        io::serial::write(" reclaimability=");
+        io::serial::write(reclaimability);
+        io::serial::write(" scaling_bound=");
+        io::serial::write(scaling_bound);
+        io::serial::write("\n");
+    };
+
+    for (const auto& descriptor : physical_owner_descriptors()) {
+        const auto& owner = physical_balance.owners.at(static_cast<size_t>(descriptor.owner));
+        write_owner_row(descriptor.name, owner.pages, owner.objects, descriptor.lifetime, reclaimability_name(descriptor.reclaimability),
+                        descriptor.scaling_bound);
+    }
+    write_owner_row("physical_allocator_embedded_metadata", physical_balance.allocator_metadata_pages, physical_balance.zone_count,
+                    "boot_to_shutdown", "permanent_reserve", "fixed_bytes_per_managed_page");
+    write_owner_row("physical_zone_descriptors", physical_balance.zone_descriptor_pages, physical_balance.zone_descriptor_pages,
+                    "boot_to_shutdown", "permanent_reserve", "one_page_per_managed_zone");
+    write_owner_row("per_cpu_physical_page_cache_metadata", physical_balance.per_cpu_page_cache_reserve_pages,
+                    physical_balance.per_cpu_page_cache_reserve_objects, "boot_to_shutdown", "permanent_reserve",
+                    "fixed_bytes_per_configured_cpu");
+    for (const auto& descriptor : physical_reserve_descriptors()) {
+        const auto& reserve = physical_balance.firmware_reserves.at(static_cast<size_t>(descriptor.kind));
+        write_owner_row(descriptor.name, reserve.pages, reserve.objects, descriptor.lifetime, "permanent_reserve",
+                        descriptor.scaling_bound);
+    }
+
+    io::serial::write("\nLogical diagnostic totals (not physical balance categories):\n");
+    io::serial::write("  process mappings: ");
     io::serial::write(u64_to_dec_no_alloc(TOTAL_PROCESS_MEM / BYTES_PER_KB, oom_dump_buffer.data(), oom_dump_buffer.size()));
     io::serial::write(" KB\n");
 

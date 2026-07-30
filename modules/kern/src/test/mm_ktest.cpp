@@ -47,8 +47,12 @@ auto entry_for_phys(uint64_t phys_addr, uint64_t flags = paging::page_types::USE
     return paging::create_page_table_entry(phys_addr, flags);
 }
 
+auto alloc_test_pages(uint64_t size = paging::PAGE_SIZE) -> void* {
+    return phys::page_alloc(mm::PhysicalPageOwner::SELFTEST, size, "mm_ktest");
+}
+
 auto alloc_test_page_table() -> paging::PageTable* {
-    auto* table = static_cast<paging::PageTable*>(phys::page_alloc());
+    auto* table = static_cast<paging::PageTable*>(alloc_test_pages());
     if (table == nullptr) {
         return nullptr;
     }
@@ -163,7 +167,7 @@ void expect_alloc_stats_coherent(const phys::AllocStatsSnapshot& snapshot) {
 // ---------------------------------------------------------------------------
 
 KTEST(MM, PageAllocFree) {
-    void* page = phys::page_alloc();
+    void* page = alloc_test_pages();
     KREQUIRE_NE(page, nullptr);
     // Page address must be page-aligned (4 KiB)
     KEXPECT_EQ(is_page_aligned(page), true);
@@ -171,7 +175,7 @@ KTEST(MM, PageAllocFree) {
 }
 
 KTEST(MM, PageAllocWriteReadback) {
-    auto* page = static_cast<uint64_t*>(phys::page_alloc());
+    auto* page = static_cast<uint64_t*>(alloc_test_pages());
     KREQUIRE_NE(page, nullptr);
     page[0] = 0xDEADBEEFCAFEBABEULL;
     page[1] = 0x1234567890ABCDEFULL;
@@ -182,6 +186,32 @@ KTEST(MM, PageAllocWriteReadback) {
 
 KTEST(MM, InternalReservationCarveoutPreservesPageAlignment) {
     KEXPECT_TRUE(phys::selftest_internal_reservation_carveout_preserves_page_alignment());
+}
+
+KTEST(MM, PhysicalOwnerBalanceIsExactAcrossAllocationLifetime) {
+    phys::PhysicalBalanceSnapshot before{};
+    phys::get_physical_balance_snapshot(before);
+    KREQUIRE_EQ(before.identity_mismatch_pages, 0U);
+    KREQUIRE_EQ(before.untracked_unreclaimable_pages, 0U);
+
+    void* allocation = alloc_test_pages(3 * paging::PAGE_SIZE);
+    KREQUIRE_NE(allocation, nullptr);
+
+    phys::PhysicalBalanceSnapshot live{};
+    phys::get_physical_balance_snapshot(live);
+    size_t const OWNER_IDX = static_cast<size_t>(mm::PhysicalPageOwner::SELFTEST);
+    KEXPECT_EQ(live.identity_mismatch_pages, 0U);
+    KEXPECT_EQ(live.untracked_unreclaimable_pages, 0U);
+    KEXPECT_EQ(live.owners.at(OWNER_IDX).pages, before.owners.at(OWNER_IDX).pages + 4);
+    KEXPECT_EQ(live.owners.at(OWNER_IDX).objects, before.owners.at(OWNER_IDX).objects + 1);
+
+    phys::page_free(allocation);
+    phys::PhysicalBalanceSnapshot after{};
+    phys::get_physical_balance_snapshot(after);
+    KEXPECT_EQ(after.identity_mismatch_pages, 0U);
+    KEXPECT_EQ(after.untracked_unreclaimable_pages, 0U);
+    KEXPECT_EQ(after.owners.at(OWNER_IDX).pages, before.owners.at(OWNER_IDX).pages);
+    KEXPECT_EQ(after.owners.at(OWNER_IDX).objects, before.owners.at(OWNER_IDX).objects);
 }
 
 KTEST(MM, PagemapPoolReusesZeroedRootPage) {
@@ -214,6 +244,10 @@ KTEST(MM, PagemapPoolReusesZeroedRootPage) {
     KEXPECT_TRUE(after.releases >= before.releases + 1);
 
     virt::release_pagemap(second);
+    phys::PhysicalBalanceSnapshot final_balance{};
+    phys::get_physical_balance_snapshot(final_balance);
+    KEXPECT_EQ(final_balance.identity_mismatch_pages, 0U);
+    KEXPECT_EQ(final_balance.untracked_unreclaimable_pages, 0U);
 }
 
 KTEST(MM, OwnedFrameTrackingMapUnmapPrivateNormalPage) {
@@ -225,7 +259,7 @@ KTEST(MM, OwnedFrameTrackingMapUnmapPrivateNormalPage) {
     auto* root = virt::create_pagemap();
     KREQUIRE_NE(root, nullptr);
 
-    void* page = phys::page_alloc(paging::PAGE_SIZE, "owned_frame_ktest");
+    void* page = alloc_test_pages();
     if (page == nullptr) {
         virt::release_pagemap(root);
         KREQUIRE_NE(page, nullptr);
@@ -263,7 +297,7 @@ KTEST(MM, MultiplePageAllocFree) {
     constexpr size_t PAGE_COUNT = 8;
     std::array<void*, PAGE_COUNT> pages{};
     for (auto& page : pages) {
-        page = phys::page_alloc();
+        page = alloc_test_pages();
         KEXPECT_NE(page, nullptr);
     }
     // All pages must be distinct
@@ -287,7 +321,7 @@ KTEST(MM, AllocStatsScalarLargeFreeDrift) {
     phys::AllocStatsSnapshot const BEFORE = alloc_stats_snapshot();
     expect_alloc_stats_coherent(BEFORE);
 
-    void* mem = phys::page_alloc(REQUESTED_PAGES * paging::PAGE_SIZE);
+    void* mem = alloc_test_pages(REQUESTED_PAGES * paging::PAGE_SIZE);
     KREQUIRE_NE(mem, nullptr);
 
     phys::AllocStatsSnapshot const AFTER_ALLOC = alloc_stats_snapshot();
@@ -326,7 +360,7 @@ KTEST(MM, AllocStatsScalarLargeFreeDrift) {
 // ---------------------------------------------------------------------------
 
 KTEST(MM, RefCountBasic) {
-    void* page = phys::page_alloc();
+    void* page = alloc_test_pages();
     KREQUIRE_NE(page, nullptr);
     // Initial refcount is 1
     KEXPECT_EQ(phys::page_ref_get(page), 1U);
@@ -341,7 +375,7 @@ KTEST(MM, RefCountBasic) {
 }
 
 KTEST(MM, RefCountDecWithLookupHint) {
-    void* page = phys::page_alloc();
+    void* page = alloc_test_pages();
     KREQUIRE_NE(page, nullptr);
 
     phys::page_ref_inc(page);
@@ -354,7 +388,7 @@ KTEST(MM, RefCountDecWithLookupHint) {
 }
 
 KTEST(MM, LookupHintOwnerMustMatchAllocatorDomain) {
-    void* regular_page = phys::page_alloc();
+    void* regular_page = alloc_test_pages();
     KREQUIRE_NE(regular_page, nullptr);
 
     phys::PageLookupHint hint{};
@@ -365,7 +399,7 @@ KTEST(MM, LookupHintOwnerMustMatchAllocatorDomain) {
     KEXPECT_EQ(phys::page_ref_get(regular_page, &hint), 1U);
     KEXPECT_EQ(hint.owner, phys::PageLookupOwner::REGULAR_ZONE);
 
-    void* huge_page = phys::page_alloc_huge(paging::PAGE_SIZE);
+    void* huge_page = phys::page_alloc_huge(mm::PhysicalPageOwner::SELFTEST, paging::PAGE_SIZE);
     if (huge_page == nullptr) {
         phys::page_free(regular_page);
         return;
@@ -387,7 +421,7 @@ KTEST(MM, LookupHintOwnerMustMatchAllocatorDomain) {
 
 KTEST(MM, RefCountBatchFinalFreeContiguousRun) {
     constexpr size_t PAGE_COUNT = 4;
-    auto* base = static_cast<uint8_t*>(phys::page_alloc(paging::PAGE_SIZE * PAGE_COUNT));
+    auto* base = static_cast<uint8_t*>(alloc_test_pages(paging::PAGE_SIZE * PAGE_COUNT));
     KREQUIRE_NE(base, nullptr);
     KREQUIRE_TRUE(phys::page_split_to_order0(base));
 
@@ -408,7 +442,7 @@ KTEST(MM, RefCountBatchFinalFreeContiguousRun) {
 
 KTEST(MM, RefCountBatchFinalFreeWithLookupHint) {
     constexpr size_t PAGE_COUNT = 4;
-    auto* base = static_cast<uint8_t*>(phys::page_alloc(paging::PAGE_SIZE * PAGE_COUNT));
+    auto* base = static_cast<uint8_t*>(alloc_test_pages(paging::PAGE_SIZE * PAGE_COUNT));
     KREQUIRE_NE(base, nullptr);
     KREQUIRE_TRUE(phys::page_split_to_order0(base));
 
@@ -436,7 +470,7 @@ KTEST(MM, AllocStatsBatchRefDecFreeDrift) {
     phys::AllocStatsSnapshot const BEFORE = alloc_stats_snapshot();
     expect_alloc_stats_coherent(BEFORE);
 
-    auto* base = static_cast<uint8_t*>(phys::page_alloc(paging::PAGE_SIZE * PAGE_COUNT));
+    auto* base = static_cast<uint8_t*>(alloc_test_pages(paging::PAGE_SIZE * PAGE_COUNT));
     KREQUIRE_NE(base, nullptr);
 
     phys::AllocStatsSnapshot const AFTER_ALLOC = alloc_stats_snapshot();
@@ -492,7 +526,7 @@ KTEST(MM, AllocStatsBatchRefDecFreeDrift) {
 
 KTEST(MM, PageKindTracksSplitBatchFree) {
     constexpr size_t PAGE_COUNT = 4;
-    auto* base = static_cast<uint8_t*>(phys::page_alloc(paging::PAGE_SIZE * PAGE_COUNT));
+    auto* base = static_cast<uint8_t*>(alloc_test_pages(paging::PAGE_SIZE * PAGE_COUNT));
     KREQUIRE_NE(base, nullptr);
 
     KREQUIRE_TRUE(phys::page_mark_kind(base, mm::PageKind::PAGE_TABLE));
@@ -521,7 +555,7 @@ KTEST(MM, PageKindTracksSplitBatchFree) {
 
 KTEST(MM, UnsplitLargeAllocationContinuationIsNotLeafFreeable) {
     constexpr size_t PAGE_COUNT = 4;
-    auto* base = static_cast<uint8_t*>(phys::page_alloc(paging::PAGE_SIZE * PAGE_COUNT));
+    auto* base = static_cast<uint8_t*>(alloc_test_pages(paging::PAGE_SIZE * PAGE_COUNT));
     KREQUIRE_NE(base, nullptr);
     KREQUIRE_TRUE(phys::page_mark_kind(base, mm::PageKind::PAGE_TABLE));
 
@@ -546,7 +580,7 @@ KTEST(MM, UnsplitLargeAllocationContinuationIsNotLeafFreeable) {
 
 KTEST(MM, UnsplitLargeAllocationHeadIsNotLeafFreeable) {
     constexpr size_t PAGE_COUNT = 4;
-    auto* base = static_cast<uint8_t*>(phys::page_alloc(paging::PAGE_SIZE * PAGE_COUNT));
+    auto* base = static_cast<uint8_t*>(alloc_test_pages(paging::PAGE_SIZE * PAGE_COUNT));
     KREQUIRE_NE(base, nullptr);
     KREQUIRE_TRUE(phys::page_mark_kind(base, mm::PageKind::PAGE_TABLE));
 
@@ -567,7 +601,7 @@ KTEST(MM, UnsplitLargeAllocationHeadIsNotLeafFreeable) {
 
 KTEST(MM, SplitLargeAllocationMakesAllLeavesIndependentlyFreeable) {
     constexpr size_t PAGE_COUNT = 8;
-    auto* base = static_cast<uint8_t*>(phys::page_alloc(paging::PAGE_SIZE * PAGE_COUNT));
+    auto* base = static_cast<uint8_t*>(alloc_test_pages(paging::PAGE_SIZE * PAGE_COUNT));
     KREQUIRE_NE(base, nullptr);
     KREQUIRE_TRUE(phys::page_mark_kind(base, mm::PageKind::PAGE_TABLE));
 
@@ -605,9 +639,9 @@ KTEST(MM, DestroyUserSpaceSkipsProtectedLeafFrames) {
     TestUserTree tree{};
     KREQUIRE_TRUE(init_test_user_tree(tree));
 
-    void* medium_page = phys::page_alloc();
-    void* large_page = phys::page_alloc();
-    void* unknown_page = phys::page_alloc();
+    void* medium_page = alloc_test_pages();
+    void* large_page = alloc_test_pages();
+    void* unknown_page = alloc_test_pages();
     if (!KEXPECT_NE(medium_page, nullptr) || !KEXPECT_NE(large_page, nullptr) || !KEXPECT_NE(unknown_page, nullptr)) {
         free_live_page(medium_page);
         free_live_page(large_page);
@@ -665,7 +699,7 @@ KTEST(MM, DestroyUserSpaceUnknownMagicProbeIsDiagnosticOnly) {
     TestUserTree tree{};
     KREQUIRE_TRUE(init_test_user_tree(tree));
 
-    void* unknown_page = phys::page_alloc();
+    void* unknown_page = alloc_test_pages();
     if (!KEXPECT_NE(unknown_page, nullptr)) {
         cleanup_test_user_tree(tree);
         return;
@@ -723,8 +757,8 @@ KTEST(MM, DestroyUserSpaceSkipsSlabUnknownAndCorruptNextLevelFrames) {
     auto* root = alloc_test_page_table();
     KREQUIRE_NE(root, nullptr);
 
-    void* slab_page = phys::page_alloc();
-    void* normal_page = phys::page_alloc();
+    void* slab_page = alloc_test_pages();
+    void* normal_page = alloc_test_pages();
     if (!KEXPECT_NE(slab_page, nullptr) || !KEXPECT_NE(normal_page, nullptr)) {
         free_live_page(slab_page);
         free_live_page(normal_page);
@@ -803,7 +837,7 @@ KTEST(MM, RefCountBatchMixedFinalAndNonFinal) {
     constexpr size_t PAGE_COUNT = 4;
     std::array<void*, PAGE_COUNT> pages{};
     for (auto& page : pages) {
-        page = phys::page_alloc();
+        page = alloc_test_pages();
         if (!KEXPECT_NE(page, nullptr)) {
             for (void* allocated_page : pages) {
                 if (allocated_page != nullptr) {
@@ -838,7 +872,7 @@ KTEST(MM, RefCountBatchFlushesMoreThanInternalCap) {
     constexpr size_t PAGE_COUNT = 130;
     std::array<void*, PAGE_COUNT> pages{};
     for (auto& page : pages) {
-        page = phys::page_alloc();
+        page = alloc_test_pages();
         if (!KEXPECT_NE(page, nullptr)) {
             for (void* allocated_page : pages) {
                 if (allocated_page != nullptr) {
@@ -860,8 +894,8 @@ KTEST(MM, RefCountBatchFlushesMoreThanInternalCap) {
 }
 
 KTEST(MM, RefCountBatchDuplicateAndNullEntries) {
-    void* duplicate_page = phys::page_alloc();
-    void* single_page = phys::page_alloc();
+    void* duplicate_page = alloc_test_pages();
+    void* single_page = alloc_test_pages();
     if (!KEXPECT_NE(duplicate_page, nullptr) || !KEXPECT_NE(single_page, nullptr)) {
         if (duplicate_page != nullptr) {
             phys::page_free(duplicate_page);
@@ -890,7 +924,7 @@ KTEST(MM, RefCountBatchDuplicateAndNullEntries) {
 
 KTEST(MM, LargePageAlloc) {
     constexpr uint64_t TWO_PAGES = 8192;
-    void* mem = phys::page_alloc(TWO_PAGES);
+    void* mem = alloc_test_pages(TWO_PAGES);
     KREQUIRE_NE(mem, nullptr);
     KEXPECT_EQ(is_page_aligned(mem), true);
     phys::page_free(mem);
@@ -899,19 +933,19 @@ KTEST(MM, LargePageAlloc) {
 KTEST(MM, StaleMiniSlabMagicOnFreePageDoesNotTripAllocator) {
     constexpr uint32_t MINI_SLAB_MAGIC = 0x8CBEEFC8;
 
-    auto* page = static_cast<uint32_t*>(phys::page_alloc());
+    auto* page = static_cast<uint32_t*>(alloc_test_pages());
     KREQUIRE_NE(page, nullptr);
     page[0] = MINI_SLAB_MAGIC;
     phys::page_free(page);
 
-    auto* fresh_page = static_cast<uint32_t*>(phys::page_alloc());
+    auto* fresh_page = static_cast<uint32_t*>(alloc_test_pages());
     KREQUIRE_NE(fresh_page, nullptr);
     KEXPECT_EQ(fresh_page[0], 0U);
     phys::page_free(fresh_page);
 }
 
 KTEST(MM, PerCpuPageCacheRevivalOrder0FreeResetsMetadata) {
-    void* page = phys::page_alloc();
+    void* page = alloc_test_pages();
     KREQUIRE_NE(page, nullptr);
     KEXPECT_EQ(phys::page_ref_get(page), 1U);
     KEXPECT_EQ(phys::page_kind_get(page), mm::PageKind::NORMAL);
@@ -921,7 +955,7 @@ KTEST(MM, PerCpuPageCacheRevivalOrder0FreeResetsMetadata) {
     KEXPECT_EQ(phys::page_ref_get(page), 0U);
     KEXPECT_EQ(phys::page_kind_get(page), mm::PageKind::FREE);
 
-    void* fresh_page = phys::page_alloc();
+    void* fresh_page = alloc_test_pages();
     KREQUIRE_NE(fresh_page, nullptr);
     KEXPECT_EQ(phys::page_ref_get(fresh_page), 1U);
     KEXPECT_EQ(phys::page_kind_get(fresh_page), mm::PageKind::NORMAL);

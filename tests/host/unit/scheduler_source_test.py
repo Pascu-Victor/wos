@@ -787,7 +787,8 @@ def test_user_thread_tcbs_publish_nonzero_tid_before_user_execution() -> None:
     require_tokens(
         create_thread_body,
         [
-            'mm::phys::page_alloc_with_reclaim_may_fail(mm::paging::PAGE_SIZE, "thread_tls_page")',
+            "mm::phys::page_alloc_with_reclaim_may_fail(mm::PhysicalPageOwner::USER_THREAD_TLS, mm::paging::PAGE_SIZE, "
+            '"thread_tls_page")',
             "free_mapped_user_range(page_table, TLS_VIRT_ADDR, TLS_VIRT_ADDR + offset);",
             "auto const INITIAL_TID = static_cast<uint32_t>(initial_tid);",
             "write_mapped_user_value(page_table, TCB_VIRT_ADDR + 0x18, INITIAL_TID)",
@@ -796,7 +797,7 @@ def test_user_thread_tcbs_publish_nonzero_tid_before_user_execution() -> None:
         "fragmentation-safe initial user TLS and TCB construction",
     )
     forbidden = [
-        'mm::phys::page_alloc(ALIGNED_TOTAL_SIZE, "thread_tls")',
+        'mm::phys::page_alloc(mm::PhysicalPageOwner::USER_THREAD_TLS, ALIGNED_TOTAL_SIZE, "thread_tls")',
         "mm::phys::page_split_to_order0(tls)",
     ]
     present = [token for token in forbidden if token in create_thread_body]

@@ -70,6 +70,7 @@ struct XfsIfork {
 };
 
 struct XfsInode {
+    void* pool_arena{};  // Reclaimable object-pool arena; internal, never persisted
     // Identity
     xfs_ino_t ino;        // absolute inode number
     xfs_agnumber_t agno;  // AG containing this inode
@@ -239,6 +240,10 @@ void xfs_icache_purge(XfsMountContext* mount);
 
 // Snapshot inode-cache occupancy and bounded reclaim activity.
 void xfs_inode_cache_stats(XfsInodeCacheStats& out);
+
+// Detach and free clean idle inodes under controlled memory pressure. The
+// work is bounded by max_inodes and returns the number of inode objects freed.
+auto xfs_icache_reclaim_for_pressure(size_t max_inodes) -> size_t;
 
 // Commit dirty cached inodes for a mount.  Used by mount-level sync before the
 // block cache is flushed.

@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <platform/mm/addr.hpp>
+#include <platform/mm/page_alloc.hpp>
 #include <platform/mm/phys.hpp>
 #include <platform/mm/virt.hpp>
 
@@ -19,7 +20,9 @@ struct Stack {
     uint64_t* sp{};
     uint64_t* base{};
 
-    Stack() : base(static_cast<uint64_t*>(phys::page_alloc(StackSize))) { sp = base + (StackSize / sizeof(uint64_t)); }
+    Stack() : base(static_cast<uint64_t*>(phys::page_alloc(PhysicalPageOwner::KERNEL_STACK, StackSize, "kernel_stack"))) {
+        sp = base + (StackSize / sizeof(uint64_t));
+    }
 
     void free() { phys::page_free(base); }
 };
