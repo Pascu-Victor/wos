@@ -22,6 +22,11 @@ inline void __logVar(const char* format, ...) {
 inline void logString(const char* str) { fprintf(stderr, "%s\n", str); }
 
 template <typename... Args>
+void emergency_log(const char* format, Args... args) {
+    std::fprintf(stderr, format, args...);
+}
+
+template <typename... Args>
 void log(const char* format, Args... args) {
     if (sizeof...(args) == 0) {
         logString(format);

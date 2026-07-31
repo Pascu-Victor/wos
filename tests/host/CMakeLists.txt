@@ -125,6 +125,10 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/memacc_source_test.py
 )
 add_test(
+    NAME wos_memory_balance_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/wos_memory_balance_test.py
+)
+add_test(
     NAME renderbench_source_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/renderbench_source_test.py
 )
@@ -435,6 +439,7 @@ set_tests_properties(
     wkictl_source_test
     perf_source_test
     memacc_source_test
+    wos_memory_balance_test
     renderbench_source_test
     debugserver_source_test
     sftp_timeout_source_test
@@ -578,6 +583,12 @@ wos_add_unit_test(buffer_cache_test
     KERN_SOURCES ${WOS_KERN_SRC}/vfs/buffer_cache.cpp
 )
 target_compile_definitions(buffer_cache_test PRIVATE WOS_HOST_TEST=1)
+
+wos_add_unit_test(physical_balance_test
+    SOURCES      ${CMAKE_CURRENT_SOURCE_DIR}/unit/physical_balance_test.cpp
+    KERN_SOURCES ${WOS_KERN_SRC}/platform/mm/page_alloc.cpp
+)
+target_compile_definitions(physical_balance_test PRIVATE WOS_HOST_TEST=1)
 
 # ---------------------------------------------------------------------------
 # Fuzz targets

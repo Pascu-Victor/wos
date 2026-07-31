@@ -126,6 +126,7 @@ UNIT_TESTS=(
     wkictl_source_test
     perf_source_test
     memacc_source_test
+    wos_memory_balance_test
     renderbench_source_test
     debugserver_source_test
     sftp_timeout_source_test
@@ -207,6 +208,7 @@ UNIT_TESTS=(
     util_list_test
     crc32c_test
     buffer_cache_test
+    physical_balance_test
     vmem_source_test
 )
 

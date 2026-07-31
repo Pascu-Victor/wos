@@ -29,6 +29,7 @@
 #include "platform/mm/dyn/kmalloc.hpp"
 #include "platform/mm/mm.hpp"
 #include "platform/mm/paging.hpp"
+#include "platform/mm/physical_balance.hpp"
 #include "platform/mm/tlb_shootdown.hpp"
 #include "platform/mm/virt.hpp"
 #include "platform/sched/scheduler.hpp"
@@ -321,8 +322,8 @@ consteval auto physical_owner_descriptors_are_complete() -> bool {
     }
     for (size_t i = 1; i < PHYSICAL_OWNER_DESCRIPTORS.size(); ++i) {
         const auto& descriptor = PHYSICAL_OWNER_DESCRIPTORS.at(i);
-        if (descriptor.owner != static_cast<PhysicalPageOwner>(i) || descriptor.name == nullptr || descriptor.lifetime == nullptr ||
-            descriptor.scaling_bound == nullptr) {
+        if (descriptor.owner != static_cast<PhysicalPageOwner>(i) ||
+            !physical_balance_descriptor_is_complete(descriptor.name, descriptor.lifetime, descriptor.scaling_bound)) {
             return false;
         }
     }
@@ -343,8 +344,8 @@ constexpr std::array<PhysicalReserveDescriptor, PHYSICAL_RESERVE_KIND_COUNT> PHY
 consteval auto physical_reserve_descriptors_are_complete() -> bool {
     for (size_t i = 0; i < PHYSICAL_RESERVE_DESCRIPTORS.size(); ++i) {
         const auto& descriptor = PHYSICAL_RESERVE_DESCRIPTORS.at(i);
-        if (descriptor.kind != static_cast<PhysicalReserveKind>(i) || descriptor.name == nullptr || descriptor.lifetime == nullptr ||
-            descriptor.scaling_bound == nullptr) {
+        if (descriptor.kind != static_cast<PhysicalReserveKind>(i) ||
+            !physical_balance_descriptor_is_complete(descriptor.name, descriptor.lifetime, descriptor.scaling_bound)) {
             return false;
         }
     }
@@ -934,9 +935,13 @@ void get_physical_balance_snapshot(PhysicalBalanceSnapshot& out) {
     out.zone_count = allocator_count;
     out.per_cpu_page_cache_reserve_pages = per_cpu_caches_size / paging::PAGE_SIZE;
     out.per_cpu_page_cache_reserve_objects = num_cpus;
-    out.identity_pages = out.free_pages + out.allocator_metadata_pages + out.zone_descriptor_pages + out.owner_pages;
-    out.identity_mismatch_pages =
-        out.identity_pages > out.managed_pages ? out.identity_pages - out.managed_pages : out.managed_pages - out.identity_pages;
+    PhysicalBalanceComponents const COMPONENTS{.managed_pages = out.managed_pages,
+                                               .free_pages = out.free_pages,
+                                               .allocator_metadata_pages = out.allocator_metadata_pages,
+                                               .zone_descriptor_pages = out.zone_descriptor_pages,
+                                               .owner_pages = out.owner_pages};
+    out.identity_pages = physical_balance_identity_pages(COMPONENTS);
+    out.identity_mismatch_pages = physical_balance_mismatch_pages(COMPONENTS);
     out.untracked_unreclaimable_pages = out.identity_mismatch_pages;
     out.firmware_reserves = firmware_reserve_snapshot;
 }

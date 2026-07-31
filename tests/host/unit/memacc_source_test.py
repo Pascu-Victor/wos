@@ -121,7 +121,9 @@ def test_physical_balance_is_exact_and_concrete() -> None:
         [
             "allocators.at(i)->lock_irq()",
             "physical balance zone bound exceeded",
-            "out.identity_pages = out.free_pages + out.allocator_metadata_pages + out.zone_descriptor_pages + out.owner_pages",
+            "PhysicalBalanceComponents const COMPONENTS",
+            "out.identity_pages = physical_balance_identity_pages(COMPONENTS)",
+            "out.identity_mismatch_pages = physical_balance_mismatch_pages(COMPONENTS)",
             "out.untracked_unreclaimable_pages = out.identity_mismatch_pages",
         ],
         "coherent bounded physical snapshot",

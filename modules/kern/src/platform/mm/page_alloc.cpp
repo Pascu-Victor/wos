@@ -508,16 +508,22 @@ auto free_allocated_block(PageAllocator* alloc, uint32_t page_idx, int order, bo
 
 auto PageAllocator::lock_irq() -> uint64_t {
     uint64_t flags = 0;
+#ifndef WOS_HOST_TEST
     asm volatile("pushfq; popq %0" : "=r"(flags));
     asm volatile("cli");
+#endif
 
+#ifndef WOS_HOST_TEST
     uint32_t service_spins = 0;
+#endif
     while (lock_held.exchange(true, std::memory_order_acquire)) {
         for (;;) {
+#ifndef WOS_HOST_TEST
             ++service_spins;
             if ((service_spins & 0xFFU) == 0U) {
                 virt::service_pending_tlb_shootdowns();
             }
+#endif
             asm volatile("pause" ::: "memory");
             if (!lock_held.load(std::memory_order_relaxed)) {
                 break;
@@ -530,10 +536,14 @@ auto PageAllocator::lock_irq() -> uint64_t {
 
 void PageAllocator::unlock_irq(uint64_t flags) {
     lock_held.store(false, std::memory_order_release);
+#ifndef WOS_HOST_TEST
     constexpr uint64_t RFLAGS_INTERRUPT_ENABLE = 0x200;
     if ((flags & RFLAGS_INTERRUPT_ENABLE) != 0) {
         asm volatile("sti");
     }
+#else
+    (void)flags;
+#endif
 }
 
 void PageAllocator::init(uint64_t zone_base, uint64_t size_bytes) {

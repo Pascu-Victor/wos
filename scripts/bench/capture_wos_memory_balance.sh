@@ -5,6 +5,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 WOS_SSH="${WOS_MEMORY_BALANCE_SSH:-$WORKSPACE_ROOT/scripts/remote/wos_ssh.sh}"
+VALIDATOR="${WOS_MEMORY_BALANCE_VALIDATOR:-$SCRIPT_DIR/validate_wos_memory_balance.py}"
 
 systems="wos-0,wos-1,wos-2,wos-3"
 output_dir=""
@@ -235,5 +236,15 @@ for host in "${system_array[@]}"; do
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\tpass\n' "$label" "$timestamp_utc" "$host" "$total_pages" "$free_pages" \
         "$owner_pages" "$identity_pages" "$mismatch_pages" "$untracked_pages" >> "$checkpoint_dir/status.tsv"
 done
+
+validator_args=(
+    --checkpoint-dir "$checkpoint_dir"
+    --label "$label"
+    --systems "$systems"
+)
+if [ "$require_quiescent" -eq 1 ]; then
+    validator_args+=(--require-quiescent)
+fi
+"$VALIDATOR" "${validator_args[@]}"
 
 printf 'checkpoint=%s nodes=%s status=pass evidence=%s\n' "$label" "${#system_array[@]}" "$checkpoint_dir"
