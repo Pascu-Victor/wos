@@ -149,6 +149,25 @@ def test_selftest_and_ktest_cover_boot_reservation_edges() -> None:
     )
 
 
+def test_ktest_covers_executable_mapping_reference_lifetimes() -> None:
+    ktest = MM_KTEST.read_text()
+    require_tokens(
+        ktest,
+        [
+            "KTEST(MM, ReplacingPresentMappingReleasesDisplacedExecutablePage)",
+            "KTEST(MM, BatchedReplacementReleasesDisplacedExecutablePage)",
+            "KTEST(MM, SharedExecutableMappingReturnsToOwnerBaselineAfterBothPagemapsDie)",
+            "KEXPECT_EQ(phys::page_ref_get(first), 0U)",
+            "KEXPECT_EQ(phys::page_ref_get(second), 1U)",
+            "KEXPECT_EQ(after.owners.at(OWNER_IDX).pages, before.owners.at(OWNER_IDX).pages)",
+            "KEXPECT_EQ(after.owners.at(OWNER_IDX).objects, before.owners.at(OWNER_IDX).objects)",
+            "KEXPECT_EQ(after.identity_mismatch_pages, 0U)",
+            "KEXPECT_EQ(after.untracked_unreclaimable_pages, 0U)",
+        ],
+        "executable mapping reference-lifetime KTEST coverage",
+    )
+
+
 def test_buddy_free_list_repair_rebuilds_from_flags() -> None:
     source = PAGE_ALLOC_CPP.read_text()
     free_body = function_body(source, "free_allocated_block")
@@ -672,6 +691,7 @@ def main() -> None:
     test_per_cpu_cache_reservation_uses_selector_not_raw_memmap_base()
     test_cached_page_drain_does_not_release_owner_twice()
     test_selftest_and_ktest_cover_boot_reservation_edges()
+    test_ktest_covers_executable_mapping_reference_lifetimes()
     test_buddy_free_list_repair_rebuilds_from_flags()
     test_direct_page_free_rejects_refcounted_blocks()
     test_allocator_size_rounding_rejects_overflow_and_overmax_requests()

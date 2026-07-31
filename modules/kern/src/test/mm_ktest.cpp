@@ -293,6 +293,115 @@ KTEST(MM, OwnedFrameTrackingMapUnmapPrivateNormalPage) {
     virt::release_pagemap(root);
 }
 
+KTEST(MM, ReplacingPresentMappingReleasesDisplacedExecutablePage) {
+    constexpr uint64_t TEST_VADDR = 0x41000000ULL;
+    size_t const OWNER_IDX = static_cast<size_t>(mm::PhysicalPageOwner::USER_EXECUTABLE_MAPPING);
+
+    phys::PhysicalBalanceSnapshot before{};
+    phys::get_physical_balance_snapshot(before);
+
+    auto* root = virt::create_pagemap();
+    KREQUIRE_NE(root, nullptr);
+    void* first = phys::page_alloc(mm::PhysicalPageOwner::USER_EXECUTABLE_MAPPING, paging::PAGE_SIZE, "mm_replace_first");
+    void* second = phys::page_alloc(mm::PhysicalPageOwner::USER_EXECUTABLE_MAPPING, paging::PAGE_SIZE, "mm_replace_second");
+    KREQUIRE_NE(first, nullptr);
+    KREQUIRE_NE(second, nullptr);
+
+    virt::map_page(root, TEST_VADDR, phys_addr_of(first), paging::page_types::USER_READONLY);
+    virt::map_page(root, TEST_VADDR, phys_addr_of(second), paging::page_types::USER_READONLY);
+
+    phys::PhysicalBalanceSnapshot replaced{};
+    phys::get_physical_balance_snapshot(replaced);
+    KEXPECT_EQ(phys::page_ref_get(first), 0U);
+    KEXPECT_EQ(phys::page_ref_get(second), 1U);
+    KEXPECT_EQ(virt::translate(root, TEST_VADDR), phys_addr_of(second));
+    KEXPECT_EQ(replaced.owners.at(OWNER_IDX).pages, before.owners.at(OWNER_IDX).pages + 1);
+
+    virt::destroy_user_space(root, 0, "mm_ktest", "replace-present");
+    virt::release_pagemap(root);
+
+    phys::PhysicalBalanceSnapshot after{};
+    phys::get_physical_balance_snapshot(after);
+    KEXPECT_EQ(after.owners.at(OWNER_IDX).pages, before.owners.at(OWNER_IDX).pages);
+    KEXPECT_EQ(after.owners.at(OWNER_IDX).objects, before.owners.at(OWNER_IDX).objects);
+    KEXPECT_EQ(after.identity_mismatch_pages, 0U);
+    KEXPECT_EQ(after.untracked_unreclaimable_pages, 0U);
+}
+
+KTEST(MM, BatchedReplacementReleasesDisplacedExecutablePage) {
+    constexpr uint64_t TEST_VADDR = 0x42000000ULL;
+    size_t const OWNER_IDX = static_cast<size_t>(mm::PhysicalPageOwner::USER_EXECUTABLE_MAPPING);
+
+    phys::PhysicalBalanceSnapshot before{};
+    phys::get_physical_balance_snapshot(before);
+
+    auto* root = virt::create_pagemap();
+    KREQUIRE_NE(root, nullptr);
+    void* first = phys::page_alloc(mm::PhysicalPageOwner::USER_EXECUTABLE_MAPPING, paging::PAGE_SIZE, "mm_batch_replace_first");
+    void* second = phys::page_alloc(mm::PhysicalPageOwner::USER_EXECUTABLE_MAPPING, paging::PAGE_SIZE, "mm_batch_replace_second");
+    KREQUIRE_NE(first, nullptr);
+    KREQUIRE_NE(second, nullptr);
+
+    virt::PageMapBatch batch{};
+    virt::init_page_map_batch(&batch, root, paging::page_types::USER_READONLY);
+    virt::map_page_batched(&batch, TEST_VADDR, phys_addr_of(first), paging::page_types::USER_READONLY);
+    virt::map_page_batched(&batch, TEST_VADDR, phys_addr_of(second), paging::page_types::USER_READONLY);
+    virt::flush_page_map_batch(&batch);
+
+    phys::PhysicalBalanceSnapshot replaced{};
+    phys::get_physical_balance_snapshot(replaced);
+    KEXPECT_EQ(phys::page_ref_get(first), 0U);
+    KEXPECT_EQ(phys::page_ref_get(second), 1U);
+    KEXPECT_EQ(virt::translate(root, TEST_VADDR), phys_addr_of(second));
+    KEXPECT_EQ(replaced.owners.at(OWNER_IDX).pages, before.owners.at(OWNER_IDX).pages + 1);
+
+    virt::destroy_user_space(root, 0, "mm_ktest", "replace-present-batched");
+    virt::release_pagemap(root);
+
+    phys::PhysicalBalanceSnapshot after{};
+    phys::get_physical_balance_snapshot(after);
+    KEXPECT_EQ(after.owners.at(OWNER_IDX).pages, before.owners.at(OWNER_IDX).pages);
+    KEXPECT_EQ(after.owners.at(OWNER_IDX).objects, before.owners.at(OWNER_IDX).objects);
+    KEXPECT_EQ(after.identity_mismatch_pages, 0U);
+    KEXPECT_EQ(after.untracked_unreclaimable_pages, 0U);
+}
+
+KTEST(MM, SharedExecutableMappingReturnsToOwnerBaselineAfterBothPagemapsDie) {
+    constexpr uint64_t TEST_VADDR = 0x43000000ULL;
+    size_t const OWNER_IDX = static_cast<size_t>(mm::PhysicalPageOwner::USER_EXECUTABLE_MAPPING);
+
+    phys::PhysicalBalanceSnapshot before{};
+    phys::get_physical_balance_snapshot(before);
+
+    auto* parent = virt::create_pagemap();
+    auto* child = virt::create_pagemap();
+    KREQUIRE_NE(parent, nullptr);
+    KREQUIRE_NE(child, nullptr);
+    void* executable = phys::page_alloc(mm::PhysicalPageOwner::USER_EXECUTABLE_MAPPING, paging::PAGE_SIZE, "mm_shared_executable");
+    KREQUIRE_NE(executable, nullptr);
+    virt::map_page(parent, TEST_VADDR, phys_addr_of(executable), paging::page_types::USER_READONLY);
+    KREQUIRE_TRUE(virt::deep_copy_user_pagemap_cow(parent, child));
+    KEXPECT_EQ(phys::page_ref_get(executable), 2U);
+
+    virt::destroy_user_space(parent, 0, "mm_ktest", "shared-executable-parent");
+    virt::release_pagemap(parent);
+    KEXPECT_EQ(phys::page_ref_get(executable), 1U);
+
+    phys::PhysicalBalanceSnapshot child_live{};
+    phys::get_physical_balance_snapshot(child_live);
+    KEXPECT_EQ(child_live.owners.at(OWNER_IDX).pages, before.owners.at(OWNER_IDX).pages + 1);
+
+    virt::destroy_user_space(child, 0, "mm_ktest", "shared-executable-child");
+    virt::release_pagemap(child);
+
+    phys::PhysicalBalanceSnapshot after{};
+    phys::get_physical_balance_snapshot(after);
+    KEXPECT_EQ(after.owners.at(OWNER_IDX).pages, before.owners.at(OWNER_IDX).pages);
+    KEXPECT_EQ(after.owners.at(OWNER_IDX).objects, before.owners.at(OWNER_IDX).objects);
+    KEXPECT_EQ(after.identity_mismatch_pages, 0U);
+    KEXPECT_EQ(after.untracked_unreclaimable_pages, 0U);
+}
+
 KTEST(MM, MultiplePageAllocFree) {
     constexpr size_t PAGE_COUNT = 8;
     std::array<void*, PAGE_COUNT> pages{};

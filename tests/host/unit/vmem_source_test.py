@@ -390,6 +390,53 @@ def test_page_table_pool_duplicate_release_does_not_fall_through_to_page_free() 
     )
 
 
+def test_mapping_replacement_releases_displaced_reference_after_tlb_flush() -> None:
+    source = VIRT_CPP.read_text()
+    map_body = function_body(source, "map_page")
+    batch_body = function_body(source, "map_page_batched")
+
+    require_tokens(
+        map_body,
+        [
+            "PageTableEntry const OLD_ENTRY = entry;",
+            "bool const REPLACED_PRESENT_FRAME",
+            "drop_present_leaf_ref(OLD_ENTRY);",
+        ],
+        "single-page mapping replacement ownership",
+    )
+    require_ordered_tokens(
+        map_body,
+        [
+            "entry = paging::create_page_table_entry(PADDR, FLAGS);",
+            "shootdown_remote_user_pagemap(page_table, VADDR, path_promoted);",
+            "if (REPLACED_PRESENT_FRAME)",
+            "drop_present_leaf_ref(OLD_ENTRY);",
+        ],
+        "single-page replacement must invalidate before releasing the displaced frame",
+    )
+
+    require_tokens(
+        batch_body,
+        [
+            "PageTableEntry const OLD_ENTRY = entry;",
+            "bool const REPLACED_PRESENT_FRAME",
+            "flush_page_map_batch(batch);",
+            "drop_present_leaf_ref(OLD_ENTRY);",
+        ],
+        "batched mapping replacement ownership",
+    )
+    require_ordered_tokens(
+        batch_body,
+        [
+            "entry = paging::create_page_table_entry(PADDR, FLAGS);",
+            "if (REPLACED_PRESENT_FRAME)",
+            "flush_page_map_batch(batch);",
+            "drop_present_leaf_ref(OLD_ENTRY);",
+        ],
+        "batched replacement must invalidate before releasing the displaced frame",
+    )
+
+
 def test_user_memory_pressure_does_not_enter_fatal_oom() -> None:
     vmem = SYS_VMEM_CPP.read_text()
     virt = VIRT_CPP.read_text()
@@ -658,6 +705,7 @@ def main() -> None:
     test_owned_frame_tracking_is_disabled_off_the_fault_path()
     test_cow_write_resolution_serializes_pte_reference_consumption()
     test_page_table_pool_duplicate_release_does_not_fall_through_to_page_free()
+    test_mapping_replacement_releases_displaced_reference_after_tlb_flush()
     test_user_memory_pressure_does_not_enter_fatal_oom()
     test_default_writable_anon_mmap_is_demand_paged()
     test_thread_publication_is_serialized_with_shared_vmem_updates()

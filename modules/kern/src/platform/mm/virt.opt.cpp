@@ -2724,6 +2724,7 @@ void map_page(PageTable* page_table, const vaddr_t VADDR, const paddr_t PADDR, c
     PageTableEntry& entry = entry_at(pml1, index_of(VADDR, 1));
     PageTableEntry const OLD_ENTRY = entry;
     bool const REPLACED_TRANSLATION = OLD_ENTRY.present != 0 || is_reserved_leaf(OLD_ENTRY);
+    bool const REPLACED_PRESENT_FRAME = OLD_ENTRY.present != 0 && (static_cast<paddr_t>(OLD_ENTRY.frame) << paging::PAGE_SHIFT) != PADDR;
     owned_frame_untrack_leaf(page_table, VADDR, OLD_ENTRY);
     entry = paging::create_page_table_entry(PADDR, FLAGS);
     owned_frame_track_private_mapping(page_table, VADDR, PADDR, FLAGS);
@@ -2731,6 +2732,12 @@ void map_page(PageTable* page_table, const vaddr_t VADDR, const paddr_t PADDR, c
     invalidate_local_tlb_if_current(page_table, VADDR, path_promoted);
     if (path_promoted || REPLACED_TRANSLATION) {
         shootdown_remote_user_pagemap(page_table, VADDR, path_promoted);
+    }
+    // A present PTE owns one reference to its frame. Publish and invalidate the
+    // replacement before dropping that reference so no CPU can retain a stale
+    // translation to a frame that has already returned to the allocator.
+    if (REPLACED_PRESENT_FRAME) {
+        drop_present_leaf_ref(OLD_ENTRY);
     }
 }
 
@@ -2779,10 +2786,19 @@ void map_page_batched(PageMapBatch* batch, const vaddr_t VADDR, const paddr_t PA
     }
 
     PageTableEntry& entry = entry_at(batch->pml1, index_of(VADDR, 1));
+    PageTableEntry const OLD_ENTRY = entry;
+    bool const REPLACED_PRESENT_FRAME = OLD_ENTRY.present != 0 && (static_cast<paddr_t>(OLD_ENTRY.frame) << paging::PAGE_SHIFT) != PADDR;
     owned_frame_untrack_leaf(batch->root, VADDR, entry);
     entry = paging::create_page_table_entry(PADDR, FLAGS);
     owned_frame_track_private_mapping(batch->root, VADDR, PADDR, FLAGS);
     batch->dirty = true;
+    if (REPLACED_PRESENT_FRAME) {
+        // Batched callers normally install absent leaves. A replacement is
+        // still legal, but its old mapping reference cannot be released until
+        // the batched TLB invalidation has completed.
+        flush_page_map_batch(batch);
+        drop_present_leaf_ref(OLD_ENTRY);
+    }
 }
 
 void flush_page_map_batch(PageMapBatch* batch) {

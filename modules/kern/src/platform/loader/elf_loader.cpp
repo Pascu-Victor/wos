@@ -868,58 +868,64 @@ auto load_segment(const ElfFile& elf, ker::mod::mm::virt::PageTable* pagemap, co
     return stats;
 }
 
-void load_section_headers(const ElfFile& elf, ker::mod::mm::virt::PageTable* pagemap, const uint64_t& pid) {
+void load_section_headers(const ElfFile& elf, ker::mod::mm::virt::PageTable* pagemap, const uint64_t& pid,
+                          bool install_primary_image_metadata) {
     (void)pid;
     if (elf.elf_head.e_shnum == 0 || elf.se_head == nullptr || elf.sct_head_str_tab == nullptr || elf.section_names == nullptr) {
         return;
     }
     const char* section_names = elf.section_names;
 
-    // Allocate memory for section headers to preserve them for debugging
-    auto section_headers_size = static_cast<uint64_t>(elf.elf_head.e_shnum * elf.elf_head.e_shentsize);
-    uint64_t const SECTION_HEADERS_PAGES = page_align_up(section_headers_size) / mod::mm::virt::PAGE_SIZE;
-    constexpr uint64_t SECTION_HEADERS_VADDR = 0x700000000000ULL;  // High memory area for debug info
+    // The PID-scoped registry belongs to the primary image. The interpreter is
+    // loaded into the same pagemap and may append section rows below, but must
+    // not remap these fixed virtual addresses or replace the primary image's
+    // header pointers.
+    if (install_primary_image_metadata) {
+        auto section_headers_size = static_cast<uint64_t>(elf.elf_head.e_shnum * elf.elf_head.e_shentsize);
+        uint64_t const SECTION_HEADERS_PAGES = page_align_up(section_headers_size) / mod::mm::virt::PAGE_SIZE;
+        constexpr uint64_t SECTION_HEADERS_VADDR = 0x700000000000ULL;  // High memory area for debug info
 
-    for (uint64_t i = 0; i < SECTION_HEADERS_PAGES; i++) {
-        auto const PADDR = reinterpret_cast<uint64_t>(
-            mod::mm::phys::page_alloc(mod::mm::PhysicalPageOwner::USER_EXECUTABLE_MAPPING, mod::mm::paging::PAGE_SIZE, "elf_segment"));
-        if (PADDR != ker::mod::mm::virt::PADDR_INVALID) {
-            auto const PHYS_PTR = hhdm_to_phys(PADDR);
-            mod::mm::virt::map_page(pagemap, SECTION_HEADERS_VADDR + (i * mod::mm::virt::PAGE_SIZE), PHYS_PTR,
-                                    mod::mm::paging::page_types::USER_READONLY | mod::mm::paging::PAGE_NX);
+        for (uint64_t i = 0; i < SECTION_HEADERS_PAGES; i++) {
+            auto const PADDR = reinterpret_cast<uint64_t>(
+                mod::mm::phys::page_alloc(mod::mm::PhysicalPageOwner::USER_EXECUTABLE_MAPPING, mod::mm::paging::PAGE_SIZE, "elf_segment"));
+            if (PADDR != ker::mod::mm::virt::PADDR_INVALID) {
+                auto const PHYS_PTR = hhdm_to_phys(PADDR);
+                mod::mm::virt::map_page(pagemap, SECTION_HEADERS_VADDR + (i * mod::mm::virt::PAGE_SIZE), PHYS_PTR,
+                                        mod::mm::paging::page_types::USER_READONLY | mod::mm::paging::PAGE_NX);
 
-            // Zero the page
-            std::memset(ptr_from_addr<void>(PADDR), 0, mod::mm::virt::PAGE_SIZE);
-            uint64_t const SOURCE_OFFSET = i * mod::mm::virt::PAGE_SIZE;
-            uint64_t const BYTES_LEFT = section_headers_size - SOURCE_OFFSET;
-            auto const COPY_SIZE = static_cast<size_t>(BYTES_LEFT < mod::mm::virt::PAGE_SIZE ? BYTES_LEFT : mod::mm::virt::PAGE_SIZE);
-            std::memcpy(ptr_from_addr<void>(PADDR), reinterpret_cast<const uint8_t*>(elf.se_head) + SOURCE_OFFSET, COPY_SIZE);
+                // Zero the page
+                std::memset(ptr_from_addr<void>(PADDR), 0, mod::mm::virt::PAGE_SIZE);
+                uint64_t const SOURCE_OFFSET = i * mod::mm::virt::PAGE_SIZE;
+                uint64_t const BYTES_LEFT = section_headers_size - SOURCE_OFFSET;
+                auto const COPY_SIZE = static_cast<size_t>(BYTES_LEFT < mod::mm::virt::PAGE_SIZE ? BYTES_LEFT : mod::mm::virt::PAGE_SIZE);
+                std::memcpy(ptr_from_addr<void>(PADDR), reinterpret_cast<const uint8_t*>(elf.se_head) + SOURCE_OFFSET, COPY_SIZE);
+            }
         }
-    }
-    debug::set_section_headers(pid, ptr_from_addr<Elf64_Shdr>(SECTION_HEADERS_VADDR), SECTION_HEADERS_VADDR, elf.elf_head.e_shnum);
+        debug::set_section_headers(pid, ptr_from_addr<Elf64_Shdr>(SECTION_HEADERS_VADDR), SECTION_HEADERS_VADDR, elf.elf_head.e_shnum);
 
-    // Allocate memory for string table
-    uint64_t const STRING_TABLE_SIZE = elf.section_names_size;
-    uint64_t const STRING_TABLE_PAGES = page_align_up(STRING_TABLE_SIZE) / mod::mm::virt::PAGE_SIZE;
-    uint64_t const STRING_TABLE_VADDR = 0x700000201000ULL;  // After section headers
+        // Allocate memory for string table
+        uint64_t const STRING_TABLE_SIZE = elf.section_names_size;
+        uint64_t const STRING_TABLE_PAGES = page_align_up(STRING_TABLE_SIZE) / mod::mm::virt::PAGE_SIZE;
+        uint64_t const STRING_TABLE_VADDR = 0x700000201000ULL;  // After section headers
 
-    for (uint64_t i = 0; i < STRING_TABLE_PAGES; i++) {
-        auto const PADDR = reinterpret_cast<uint64_t>(
-            mod::mm::phys::page_alloc(mod::mm::PhysicalPageOwner::USER_EXECUTABLE_MAPPING, mod::mm::paging::PAGE_SIZE, "elf_segment"));
-        if (PADDR != ker::mod::mm::virt::PADDR_INVALID) {
-            auto const PHYS_PTR = hhdm_to_phys(PADDR);
-            mod::mm::virt::map_page(pagemap, STRING_TABLE_VADDR + (i * mod::mm::virt::PAGE_SIZE), PHYS_PTR,
-                                    mod::mm::paging::page_types::USER_READONLY | mod::mm::paging::PAGE_NX);
+        for (uint64_t i = 0; i < STRING_TABLE_PAGES; i++) {
+            auto const PADDR = reinterpret_cast<uint64_t>(
+                mod::mm::phys::page_alloc(mod::mm::PhysicalPageOwner::USER_EXECUTABLE_MAPPING, mod::mm::paging::PAGE_SIZE, "elf_segment"));
+            if (PADDR != ker::mod::mm::virt::PADDR_INVALID) {
+                auto const PHYS_PTR = hhdm_to_phys(PADDR);
+                mod::mm::virt::map_page(pagemap, STRING_TABLE_VADDR + (i * mod::mm::virt::PAGE_SIZE), PHYS_PTR,
+                                        mod::mm::paging::page_types::USER_READONLY | mod::mm::paging::PAGE_NX);
 
-            // Zero the page
-            std::memset(ptr_from_addr<void>(PADDR), 0, mod::mm::virt::PAGE_SIZE);
-            uint64_t const SOURCE_OFFSET = i * mod::mm::virt::PAGE_SIZE;
-            uint64_t const BYTES_LEFT = STRING_TABLE_SIZE - SOURCE_OFFSET;
-            auto const COPY_SIZE = static_cast<size_t>(BYTES_LEFT < mod::mm::virt::PAGE_SIZE ? BYTES_LEFT : mod::mm::virt::PAGE_SIZE);
-            std::memcpy(ptr_from_addr<void>(PADDR), section_names + SOURCE_OFFSET, COPY_SIZE);
+                // Zero the page
+                std::memset(ptr_from_addr<void>(PADDR), 0, mod::mm::virt::PAGE_SIZE);
+                uint64_t const SOURCE_OFFSET = i * mod::mm::virt::PAGE_SIZE;
+                uint64_t const BYTES_LEFT = STRING_TABLE_SIZE - SOURCE_OFFSET;
+                auto const COPY_SIZE = static_cast<size_t>(BYTES_LEFT < mod::mm::virt::PAGE_SIZE ? BYTES_LEFT : mod::mm::virt::PAGE_SIZE);
+                std::memcpy(ptr_from_addr<void>(PADDR), section_names + SOURCE_OFFSET, COPY_SIZE);
+            }
         }
+        debug::set_string_table(pid, ptr_from_addr<const char>(STRING_TABLE_VADDR), STRING_TABLE_VADDR, STRING_TABLE_SIZE);
     }
-    debug::set_string_table(pid, ptr_from_addr<const char>(STRING_TABLE_VADDR), STRING_TABLE_VADDR, STRING_TABLE_SIZE);
 
     for (size_t section_index = 0; section_index < elf.elf_head.e_shnum; section_index++) {
         auto const* section_header = section_header_at(elf, section_index);
@@ -1303,7 +1309,7 @@ auto load_elf_impl(ElfFile elf_file, ker::mod::mm::virt::PageTable* pagemap, uin
     }
 
     // Load section headers with debug info
-    load_section_headers(elf_file, pagemap, pid);
+    load_section_headers(elf_file, pagemap, pid, REGISTER_SPECIAL_SYMBOLS);
 
     // Only process relocations for statically-linked binaries.
     // Dynamically-linked ones (PT_INTERP present) have their relocations

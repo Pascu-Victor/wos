@@ -109,8 +109,12 @@ void init(limine_memmap_response* memmap_response, limine_executable_file_respon
 
 static inline auto get_kernel_page_table() -> PageTable* { return reinterpret_cast<PageTable*>(rdcr3()); }
 
+// Installs one mapping reference. Replacing a different present frame releases
+// the displaced mapping reference only after the required TLB invalidation.
 void map_page(PageTable* page_table, vaddr_t vaddr, paddr_t paddr, uint64_t flags);
 void init_page_map_batch(PageMapBatch* batch, PageTable* page_table, uint64_t flags);
+// Batched replacement has the same ownership contract as map_page(); it flushes
+// the current batch before releasing a displaced present frame.
 void map_page_batched(PageMapBatch* batch, vaddr_t vaddr, paddr_t paddr, uint64_t flags);
 void flush_page_map_batch(PageMapBatch* batch);
 void map_same_page_range(PageTable* page_table, vaddr_t vaddr, paddr_t paddr, uint64_t page_count, uint64_t flags);

@@ -322,6 +322,22 @@ def require_loader_does_not_scan_unread_symbol_payloads(loader_source: str) -> N
             fail(f"loader must not touch optional symbol payloads after sparse exec reads: {forbidden}")
 
 
+def require_interpreter_preserves_primary_debug_mappings(loader_source: str) -> None:
+    load_body = function_body_containing(loader_source, "load_elf_impl", "REGISTER_SPECIAL_SYMBOLS")
+    if "load_section_headers(elf_file, pagemap, pid, REGISTER_SPECIAL_SYMBOLS)" not in load_body:
+        fail("ELF loader must identify whether fixed PID debug mappings belong to the primary image")
+
+    section_body = function_body(loader_source, "load_section_headers")
+    gate = section_body.find("if (install_primary_image_metadata)")
+    section_mapping = section_body.find("SECTION_HEADERS_VADDR")
+    string_mapping = section_body.find("STRING_TABLE_VADDR")
+    section_iteration = section_body.find("for (size_t section_index")
+    if gate < 0 or section_mapping <= gate or string_mapping <= gate:
+        fail("fixed PID debug metadata mappings must be gated to the primary image")
+    if section_iteration <= string_mapping:
+        fail("interpreter section rows must remain appendable without replacing primary debug mappings")
+
+
 def require_loader_lazy_file_ranges(loader_source: str) -> None:
     for snippet in [
         "struct ElfLazyLoadRange",
@@ -366,6 +382,7 @@ def main() -> None:
     require_stdio_fallback_access_modes(source)
     require_spawn_actions_snapshot_user_memory_and_preserve_cloexec_sources(source)
     require_loader_does_not_scan_unread_symbol_payloads(loader_source)
+    require_interpreter_preserves_primary_debug_mappings(loader_source)
     require_loader_lazy_file_ranges(loader_source)
     print("exec sparse-read source invariants hold")
 
