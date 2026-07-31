@@ -92,6 +92,7 @@ BUILD_TARGETS = [
     "bash_for_wos",
     "cmake_for_wos",
     "python_for_wos",
+    "doom_ascii_for_wos",
 ]
 
 DEFAULT_SOURCE_SYSROOT = ROOT / "toolchain" / "sysroot"
