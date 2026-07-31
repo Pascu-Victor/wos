@@ -148,6 +148,8 @@ set(WOS_NCURSES_SOURCE_DIR "${CMAKE_SOURCE_DIR}/toolchain/src/ncurses" CACHE PAT
 set(WOS_NCURSES_BUILD_DIR "${CMAKE_SOURCE_DIR}/toolchain/ncurses-build" CACHE PATH "Native WOS ncurses build directory")
 set(WOS_NANO_SOURCE_DIR "${CMAKE_SOURCE_DIR}/toolchain/src/nano" CACHE PATH "GNU nano source directory")
 set(WOS_NANO_BUILD_DIR "${CMAKE_SOURCE_DIR}/toolchain/nano-build" CACHE PATH "Native WOS nano build directory")
+set(WOS_DOOM_ASCII_SOURCE_DIR "${CMAKE_SOURCE_DIR}/toolchain/src/doom-ascii" CACHE PATH "Doom ASCII source directory")
+set(WOS_DOOM_ASCII_BUILD_DIR "${CMAKE_SOURCE_DIR}/toolchain/doom-ascii-build" CACHE PATH "Native WOS Doom ASCII build directory")
 set(WOS_BOOT_DISK "${CMAKE_SOURCE_DIR}/disk.qcow2" CACHE FILEPATH "WOS boot disk image")
 set(WOS_ROOTFS_DISK "${CMAKE_SOURCE_DIR}/mountfs.qcow2" CACHE FILEPATH "WOS rootfs disk image")
 option(WOS_SKIP_LIBCXX_INSTALL "Skip the libc++ install target; useful when an isolated sysroot is pre-seeded" OFF)
@@ -161,6 +163,7 @@ option(WOS_BUILD_NASM_FOR_WOS "Build native WOS NASM and stage it into the rootf
 option(WOS_BUILD_BASH_FOR_WOS "Build native WOS Bash and stage it into the rootfs" ${WOS_PORT_BUILD_DEFAULT})
 option(WOS_BUILD_NCURSES_FOR_WOS "Build static WOS ncursesw for terminal applications" ${WOS_PORT_BUILD_DEFAULT})
 option(WOS_BUILD_NANO_FOR_WOS "Build native WOS nano and stage it into the rootfs" ${WOS_PORT_BUILD_DEFAULT})
+option(WOS_BUILD_DOOM_ASCII_FOR_WOS "Build Doom ASCII and stage it into the rootfs" ${WOS_PORT_BUILD_DEFAULT})
 option(WOS_BUILD_OPENSSL_FOR_WOS "Build static WOS OpenSSL-compatible TLS libraries for curl and HTTPS-capable ports" ${WOS_PORT_BUILD_DEFAULT})
 option(WOS_BUILD_CURL_FOR_WOS "Build native WOS curl and stage it into the rootfs" ${WOS_PORT_BUILD_DEFAULT})
 option(WOS_BUILD_GIT_FOR_WOS "Build native WOS Git and stage it into the rootfs" ${WOS_PORT_BUILD_DEFAULT})
@@ -903,6 +906,47 @@ if(WOS_BUILD_NANO_FOR_WOS)
     list(APPEND WOS_NANO_FOR_WOS_ROOTFS_INPUTS ${NANO_FOR_WOS_STAMP})
 endif()
 
+# --- doom_ascii_for_wos: terminal Doom port for WOS ------------------------
+set(DOOM_ASCII_FOR_WOS_STAMP ${CMAKE_BINARY_DIR}/stamps/doom_ascii_for_wos.stamp)
+set(WOS_DOOM_ASCII_FOR_WOS_ROOTFS_INPUTS)
+if(WOS_BUILD_DOOM_ASCII_FOR_WOS)
+    if(WOS_ASSUME_BOOTSTRAPPED_TOOLCHAIN)
+        wos_add_preseeded_artifact_target(doom_ascii_for_wos ${DOOM_ASCII_FOR_WOS_STAMP} doom_ascii
+            ${WOS_SYSROOT_PATH}/bin/doom-ascii
+            ${WOS_SYSROOT_PATH}/share/doom-ascii/default.cfg
+        )
+    else()
+        wos_glob_recurse(DOOM_ASCII_FOR_WOS_SOURCES
+            ${WOS_DOOM_ASCII_SOURCE_DIR}/src/*.c
+            ${WOS_DOOM_ASCII_SOURCE_DIR}/src/*.h
+        )
+        list(APPEND DOOM_ASCII_FOR_WOS_SOURCES
+            ${WOS_DOOM_ASCII_SOURCE_DIR}/Makefile
+            ${WOS_DOOM_ASCII_SOURCE_DIR}/target.mk
+            ${WOS_DOOM_ASCII_SOURCE_DIR}/src/.default.cfg
+        )
+        add_custom_command(
+            OUTPUT ${DOOM_ASCII_FOR_WOS_STAMP}
+            COMMAND ${CMAKE_COMMAND} -E env
+                    WOS_SYSROOT_PATH=${WOS_SYSROOT_PATH}
+                    WOS_DOOM_ASCII_SOURCE_DIR=${WOS_DOOM_ASCII_SOURCE_DIR}
+                    WOS_DOOM_ASCII_BUILD_DIR=${WOS_DOOM_ASCII_BUILD_DIR}
+                    WOS_USERSPACE_NO_AVX=${WOS_USERSPACE_NO_AVX_ENV}
+                    ${WOS_BUILD_SCRIPTS_DIR}/build_doom_ascii_for_wos.sh
+            COMMAND ${CMAKE_COMMAND} -E touch ${DOOM_ASCII_FOR_WOS_STAMP}
+            WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+            COMMENT "Building Doom ASCII for WOS..."
+            DEPENDS
+                ${WOS_BUILD_SCRIPTS_DIR}/build_doom_ascii_for_wos.sh
+                ${CMAKE_SOURCE_DIR}/toolchain/patches/doom-ascii/wos-clean-exit.patch
+                ${DOOM_ASCII_FOR_WOS_SOURCES}
+                ${MLIBC_STAMP}
+        )
+        add_custom_target(doom_ascii_for_wos DEPENDS ${DOOM_ASCII_FOR_WOS_STAMP})
+    endif()
+    list(APPEND WOS_DOOM_ASCII_FOR_WOS_ROOTFS_INPUTS ${DOOM_ASCII_FOR_WOS_STAMP})
+endif()
+
 if(WOS_BUILD_DISK_IMAGES)
     # --- mountfs_disk: create or delta-sync the XFS rootfs image ------------
     # If mountfs.qcow2 doesn't exist, create it from scratch.
@@ -966,6 +1010,7 @@ if(WOS_BUILD_DISK_IMAGES)
             ${WOS_BASH_FOR_WOS_ROOTFS_INPUTS}
             ${WOS_NCURSES_FOR_WOS_ROOTFS_INPUTS}
             ${WOS_NANO_FOR_WOS_ROOTFS_INPUTS}
+            ${WOS_DOOM_ASCII_FOR_WOS_ROOTFS_INPUTS}
             ${WOS_CURL_FOR_WOS_ROOTFS_INPUTS}
             ${WOS_GIT_FOR_WOS_ROOTFS_INPUTS}
     )
@@ -996,6 +1041,9 @@ if(WOS_BUILD_DISK_IMAGES)
     endif()
     if(WOS_BUILD_NANO_FOR_WOS)
         add_dependencies(mountfs_disk nano_for_wos)
+    endif()
+    if(WOS_BUILD_DOOM_ASCII_FOR_WOS)
+        add_dependencies(mountfs_disk doom_ascii_for_wos)
     endif()
     if(WOS_BUILD_CURL_FOR_WOS)
         add_dependencies(mountfs_disk curl_for_wos)
@@ -1037,7 +1085,7 @@ if(WOS_BUILD_DISK_IMAGES)
     )
     add_custom_target(boot_image DEPENDS ${WOS_BOOT_DISK} ${INITRAMFS_OUTPUT} ${BOOT_IMAGE_STAMP})
 
-    # busybox, dropbear, GNU make, Bash, curl, Git, Ninja, CMake, Python, Meson, NASM, ncurses, and nano are only needed for image creation, not compilation.
+    # External userspace ports are only needed for image creation, not module compilation.
     add_dependencies(boot_image busybox dropbear gnu_make)
     if(WOS_BUILD_NINJA_FOR_WOS)
         add_dependencies(boot_image ninja_for_wos)
@@ -1062,6 +1110,9 @@ if(WOS_BUILD_DISK_IMAGES)
     endif()
     if(WOS_BUILD_NANO_FOR_WOS)
         add_dependencies(boot_image nano_for_wos)
+    endif()
+    if(WOS_BUILD_DOOM_ASCII_FOR_WOS)
+        add_dependencies(boot_image doom_ascii_for_wos)
     endif()
     if(WOS_BUILD_CURL_FOR_WOS)
         add_dependencies(boot_image curl_for_wos)
@@ -1128,6 +1179,9 @@ if(WOS_BUILD_NCURSES_FOR_WOS OR WOS_BUILD_NANO_FOR_WOS)
 endif()
 if(WOS_BUILD_NANO_FOR_WOS)
     add_dependencies(wos_full nano_for_wos)
+endif()
+if(WOS_BUILD_DOOM_ASCII_FOR_WOS)
+    add_dependencies(wos_full doom_ascii_for_wos)
 endif()
 if(WOS_BUILD_OPENSSL_FOR_WOS)
     add_dependencies(wos_full openssl_for_wos)

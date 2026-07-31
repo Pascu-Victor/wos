@@ -1,0 +1,201 @@
+diff --git a/src/doomgeneric_ascii.c b/src/doomgeneric_ascii.c
+index f28534c..73d3529 100644
+--- a/src/doomgeneric_ascii.c
++++ b/src/doomgeneric_ascii.c
+@@ -33,6 +33,7 @@
+ #define WIN32_LEAN_AND_MEAN
+ #include <windows.h>
+ #else
++#include <fcntl.h>
+ #include <termios.h>
+ #include <time.h>
+ #include <unistd.h>
+@@ -77,7 +78,11 @@ static int clock_gettime(const int p, struct timespec *const spec)
+ }
+ 
+ #else
++#if defined(__WOS__)
++#define CLK CLOCK_MONOTONIC
++#else
+ #define CLK CLOCK_REALTIME
++#endif
+ #define dg_random random
+ #endif
+ 
+@@ -179,6 +184,7 @@ static struct timespec input_buffer[256] = { 0 };
+ static struct event_buffer_t event_buffer[EVENT_BUFFER_LEN] = { 0 };
+ static struct event_buffer_t *event_buf_loc;
+ 
++static bool headless;
+ static bool color_enabled;
+ static enum character_set_t character_set = ASCII;
+ static bool gradient_enabled;
+@@ -209,6 +215,8 @@ void DG_AtExit(void)
+ 	mode |= ENABLE_ECHO_INPUT;
+ 	SetConsoleMode(hInputHandle, mode);
+ #else
++	if (headless)
++		return;
+ 	struct termios t;
+ 	if (UNLIKELY(tcgetattr(STDIN_FILENO, &t)))
+ 		return;
+@@ -219,25 +227,30 @@ void DG_AtExit(void)
+ 
+ void DG_Init(void)
+ {
++	headless = M_CheckParm("-headless") > 0
++		|| (M_CheckParm("-timedemo") > 0 && M_CheckParm("-nodraw") > 0);
++
+ #ifdef OS_WINDOWS
+ 	const HANDLE hOutputHandle = GetStdHandle(STD_OUTPUT_HANDLE);
+ 	WINDOWS_CALL(hOutputHandle == INVALID_HANDLE_VALUE, "DG_Init: %s");
+ 	DWORD mode;
+ 	WINDOWS_CALL(!GetConsoleMode(hOutputHandle, &mode), "DG_Init: %s");
+ 	mode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+ 	WINDOWS_CALL(!SetConsoleMode(hOutputHandle, mode), "DG_Init: %s");
+ 
+ 	const HANDLE hInputHandle = GetStdHandle(STD_INPUT_HANDLE);
+ 	WINDOWS_CALL(hInputHandle == INVALID_HANDLE_VALUE, "DG_Init: %s");
+ 	WINDOWS_CALL(!GetConsoleMode(hInputHandle, &mode), "DG_Init: %s");
+ 	mode &= ~(ENABLE_MOUSE_INPUT | ENABLE_WINDOW_INPUT | ENABLE_QUICK_EDIT_MODE
+ 		| ENABLE_ECHO_INPUT);
+ 	WINDOWS_CALL(!SetConsoleMode(hInputHandle, mode), "DG_Init: %s");
+ #else
+-	struct termios t;
+-	CALL(tcgetattr(STDIN_FILENO, &t), "DG_Init: tcgetattr error %d");
+-	t.c_lflag &= ~(ECHO);
+-	CALL(tcsetattr(STDIN_FILENO, TCSANOW, &t), "DG_Init: tcsetattr error %d");
++	if (!headless) {
++		struct termios t;
++		CALL(tcgetattr(STDIN_FILENO, &t), "DG_Init: tcgetattr error %d");
++		t.c_lflag &= ~(ECHO);
++		CALL(tcsetattr(STDIN_FILENO, TCSANOW, &t), "DG_Init: tcsetattr error %d");
++	}
+ #endif
+ 	CALL(atexit(&DG_AtExit), "DG_Init: atexit error %d");
+ 
+@@ -623,6 +636,12 @@ static inline unsigned char convertToDoomKey(const char **const buf)
+ 
+ void DG_ReadInput(void)
+ {
++	if (headless) {
++		memset(event_buffer, '\0', sizeof(struct event_buffer_t[EVENT_BUFFER_LEN]));
++		event_buf_loc = event_buffer;
++		return;
++	}
++
+ 	struct timespec prev_input_buffer[256];
+ 	memcpy(prev_input_buffer, input_buffer, sizeof(struct timespec[256]));
+ 
+@@ -675,7 +694,18 @@ void DG_ReadInput(void)
+ 	newt.c_cc[VTIME] = 0;
+ 	CALL(tcsetattr(STDIN_FILENO, TCSANOW, &newt), "DG_DrawFrame: tcsetattr error %d");
+ 
+-	CALL(read(2, raw_input_buffer, INPUT_BUFFER_LEN - 1U) < 0, "DG_DrawFrame: read error %d");
++#if defined(__WOS__)
++	int old_flags = fcntl(STDIN_FILENO, F_GETFL);
++	CALL(old_flags < 0, "DG_DrawFrame: fcntl(F_GETFL) error %d");
++	CALL(fcntl(STDIN_FILENO, F_SETFL, old_flags | O_NONBLOCK) < 0,
++		"DG_DrawFrame: fcntl(F_SETFL) error %d");
++	ssize_t bytes_read = read(STDIN_FILENO, raw_input_buffer, INPUT_BUFFER_LEN - 1U);
++	if (bytes_read < 0 && errno != EAGAIN && errno != EWOULDBLOCK)
++		I_Error("DG_DrawFrame: read error %d", errno);
++	CALL(fcntl(STDIN_FILENO, F_SETFL, old_flags) < 0, "DG_DrawFrame: fcntl(F_SETFL) error %d");
++#else
++	CALL(read(2, raw_input_buffer, INPUT_BUFFER_LEN - 1U) < 0, "DG_DrawFrame: read error %d");
++#endif
+ 
+	CALL(tcsetattr(STDIN_FILENO, TCSANOW, &oldt), "DG_DrawFrame: tcsetattr error %d");
+ 
+diff --git a/src/doomgeneric.c b/src/doomgeneric.c
+index 7f275d5..a70cbba 100644
+--- a/src/doomgeneric.c
++++ b/src/doomgeneric.c
+@@ -22,20 +22,59 @@
+ 
+ #include <stdlib.h>
+ 
++#if defined(__WOS__)
++#include <sys/ioctl.h>
++#include <unistd.h>
++#endif
++
+ unsigned DOOMGENERIC_RESX = 80;
+ unsigned DOOMGENERIC_RESY = 50;
+ 
+ uint32_t *DG_ScreenBuffer = 0;
+ 
++#if defined(__WOS__)
++static int wos_default_scaling(void)
++{
++	struct winsize terminal = { 0 };
++	if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &terminal) < 0
++		|| terminal.ws_col == 0 || terminal.ws_row < 2)
++		return 10;
++
++	/*
++	 * ASCII pixels are two terminal columns wide. Keep one row free so
++	 * the final newline cannot scroll and tear the frame.
++	 */
++	const unsigned usable_rows = terminal.ws_row - 1U;
++	const unsigned width_scale =
++		(SCREENWIDTH * 2U + terminal.ws_col - 1U) / terminal.ws_col;
++	const unsigned height_scale =
++		(SCREENHEIGHT + usable_rows - 1U) / usable_rows;
++	unsigned scaling = width_scale > height_scale ? width_scale : height_scale;
++
++	/* Match upstream's performance-conscious default on large terminals. */
++	if (scaling < 4U)
++		scaling = 4U;
++
++	return (int)scaling;
++}
++#endif
++
+ void dg_Create()
+ {
+ 	int i;
+ 	i = M_CheckParmWithArgs("-scaling", 1);
+ 	if (i > 0) {
+ 		i = atoi(myargv[i + 1]);
+-		DOOMGENERIC_RESX = SCREENWIDTH / i;
+-		DOOMGENERIC_RESY = SCREENHEIGHT / i;
+ 	}
++#if defined(__WOS__)
++	else
++		i = wos_default_scaling();
++#endif
++
++	if (i > 0) {
++		DOOMGENERIC_RESX = SCREENWIDTH / (unsigned)i;
++		DOOMGENERIC_RESY = SCREENHEIGHT / (unsigned)i;
++	}
+ 
+ 	DG_ScreenBuffer = malloc((unsigned long)DOOMGENERIC_RESX * DOOMGENERIC_RESY * 4);
+ 
+diff --git a/src/i_system.c b/src/i_system.c
+index 6dfbe20..fc22c64 100644
+--- a/src/i_system.c
++++ b/src/i_system.c
+@@ -257,7 +257,9 @@ void I_Quit (void)
+         entry = entry->next;
+     }
+ 
+-#if ORIGCODE
++#if defined(__WOS__)
++    exit(0);
++#elif ORIGCODE
+     SDL_Quit();
+ 
+     exit(0);
+@@ -455,7 +457,9 @@ void I_Error (char *error, ...)
+ #endif
+ 
+     // abort();
+-#if ORIGCODE
++#if defined(__WOS__)
++    exit(-1);
++#elif ORIGCODE
+     SDL_Quit();
+ 
+     exit(-1);

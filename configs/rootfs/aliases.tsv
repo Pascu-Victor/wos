@@ -65,6 +65,10 @@ copy	toolchain/sysroot/bin/ndisasm	/usr/bin/ndisasm
 copy	toolchain/sysroot/bin/nano	/usr/bin/nano
 copy	toolchain/sysroot/bin/rnano	/usr/bin/rnano
 copy	toolchain/sysroot/share/nano	/usr/share/nano
+copy	toolchain/sysroot/bin/doom-ascii	/usr/bin/doom-ascii
+symlink	/usr/bin/doom-ascii	/usr/bin/doom
+copy	toolchain/sysroot/share/doom-ascii	/usr/share/doom-ascii
+copy	configs/rootfs/usr/share/games/doom/doom2.wad	/usr/share/games/doom/doom2.wad
 copy	toolchain/sysroot/share/terminfo	/usr/share/terminfo
 copy	toolchain/sysroot/bin/python3	/usr/bin/python3
 copy	toolchain/sysroot/bin/python	/usr/bin/python

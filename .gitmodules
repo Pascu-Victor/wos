@@ -44,3 +44,4 @@
 [submodule "toolchain/src/doom-ascii"]
 	path = toolchain/src/doom-ascii
 	url = https://github.com/wojciech-graj/doom-ascii.git
+	shallow = true
