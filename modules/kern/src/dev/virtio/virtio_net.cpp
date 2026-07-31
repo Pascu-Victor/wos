@@ -1217,6 +1217,14 @@ auto init_device_modern(ker::dev::pci::PCIDevice* pci_dev) -> int {
     cfg->device_status =
         static_cast<uint8_t>(VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_FEATURES_OK | VIRTIO_STATUS_DRIVER_OK);
 
+    size_t initial_rx_descriptors = 0;
+    for (uint8_t pair_idx = 0; pair_idx < dev->configured_queue_pairs; pair_idx++) {
+        auto* rxq = dev->queue_pairs.at(pair_idx).rxq;
+        if (rxq != nullptr) {
+            initial_rx_descriptors += rxq->num_free;
+        }
+    }
+    ker::net::pkt_pool_reserve_for_rx_descriptors(initial_rx_descriptors);
     fill_rx_queue_for(dev, pair0.rxq);
     for (uint8_t pair_idx = 1; pair_idx < dev->configured_queue_pairs; pair_idx++) {
         auto* rxq = dev->queue_pairs.at(pair_idx).rxq;
@@ -1431,6 +1439,7 @@ auto init_device(ker::dev::pci::PCIDevice* pci_dev) -> int {
 
     write_status(io_base, VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_DRIVER_OK);
 
+    ker::net::pkt_pool_reserve_for_rx_descriptors(pair0.rxq->num_free);
     fill_rx_queue_for(dev, pair0.rxq);
 
     dev->netdev.ops = &virtio_net_ops;

@@ -12,6 +12,7 @@ PHYS_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "mm" / "phys.opt.cpp
 OOM_DUMP_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "mm" / "oom_dump.cpp"
 PACKET_CPP = ROOT / "modules" / "kern" / "src" / "net" / "packet.cpp"
 E1000_CPP = ROOT / "modules" / "kern" / "src" / "dev" / "e1000e" / "e1000e.cpp"
+VIRTIO_NET_CPP = ROOT / "modules" / "kern" / "src" / "dev" / "virtio" / "virtio_net.cpp"
 VIRT_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "mm" / "virt.opt.cpp"
 VMEM_CPP = ROOT / "modules" / "kern" / "src" / "syscalls_impl" / "vmem" / "sys_vmem.cpp"
 
@@ -175,9 +176,32 @@ def test_pressure_reclaim_is_real_and_preserves_network_reserve() -> None:
         ],
         "persistent RX reserve preference with availability fallback",
     )
+    reserve = function_body(packet, "pkt_pool_reserve_for_rx_descriptors")
+    require_tokens(
+        reserve,
+        [
+            "descriptor_count > SIZE_MAX - PKT_POOL_RX_REFILL_RESERVE",
+            "descriptor_count + PKT_POOL_RX_REFILL_RESERVE",
+            "if (!chunk->reclaimable)",
+            "reserve_free += chunk->free",
+            "add_buffers_to_pool(REQUIRED_FREE - reserve_free, false)",
+        ],
+        "boot-time RX descriptor permanent reserve",
+    )
     e1000 = E1000_CPP.read_text()
+    require_tokens(
+        e1000,
+        [
+            "ker::net::pkt_pool_reserve_for_rx_descriptors(NUM_RX_DESC)",
+            "init_rx(dev)",
+        ],
+        "e1000 initial RX reserve ordering",
+    )
     require_tokens(function_body(e1000, "init_rx"), ["ker::net::pkt_alloc_rx()"], "e1000 persistent RX allocation")
     require_tokens(function_body(e1000, "process_rx_budget"), ["ker::net::pkt_alloc_rx()"], "e1000 RX replacement allocation")
+    virtio = VIRTIO_NET_CPP.read_text()
+    if virtio.count("pkt_pool_reserve_for_rx_descriptors") != 2:
+        fail("modern and legacy VirtIO RX initialization must both reserve permanent descriptors")
 
     reclaim = function_body(packet, "pkt_pool_reclaim_free")
     require_tokens(

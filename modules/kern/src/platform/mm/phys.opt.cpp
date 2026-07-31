@@ -294,7 +294,7 @@ constexpr std::array<PhysicalOwnerDescriptor, PHYSICAL_PAGE_OWNER_COUNT> PHYSICA
     {PhysicalPageOwner::WKI_ZONE, "wki_zone", "WKI zone lifetime", PhysicalOwnerReclaimability::OWNER_TEARDOWN,
      "bounded by live local WKI zones"},
     {PhysicalPageOwner::NETWORK_PACKET_RESERVE, "network_packet_reserve", "network stack lifetime", PhysicalOwnerReclaimability::PERMANENT,
-     "configured baseline capacity per registered NIC"},
+     "maximum of configured per-NIC baseline and initial RX descriptor demand plus fixed RX safety reserve"},
     {PhysicalPageOwner::NETWORK_PACKET, "network_packet", "dynamic packet-pool or in-flight packet lifetime",
      PhysicalOwnerReclaimability::PRESSURE_RECLAIM, "growth chunks above baseline plus in-flight packets"},
     {PhysicalPageOwner::DEVICE_AHCI, "device_ahci_dma", "AHCI controller lifetime", PhysicalOwnerReclaimability::PERMANENT,

@@ -331,6 +331,25 @@ void pkt_pool_expand_for_nics() {
     }
 }
 
+void pkt_pool_reserve_for_rx_descriptors(size_t descriptor_count) {
+    if (descriptor_count > SIZE_MAX - PKT_POOL_RX_REFILL_RESERVE) {
+        log::error("RX descriptor packet reserve size overflow (%zu)", descriptor_count);
+        return;
+    }
+    size_t const REQUIRED_FREE = descriptor_count + PKT_POOL_RX_REFILL_RESERVE;
+    size_t reserve_free = 0;
+    uint64_t const FLAGS = pool_lock.lock_irqsave();
+    for (PacketChunk const* chunk = chunk_list; chunk != nullptr; chunk = chunk->next) {
+        if (!chunk->reclaimable) {
+            reserve_free += chunk->free;
+        }
+    }
+    pool_lock.unlock_irqrestore(FLAGS);
+    if (reserve_free < REQUIRED_FREE) {
+        add_buffers_to_pool(REQUIRED_FREE - reserve_free, false);
+    }
+}
+
 auto pkt_pool_size() -> size_t { return pool_capacity; }
 
 auto pkt_pool_free_count() -> size_t { return free_count.load(std::memory_order_relaxed); }

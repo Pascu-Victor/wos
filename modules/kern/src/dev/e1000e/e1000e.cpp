@@ -456,6 +456,7 @@ void init_device(pci::PCIDevice* pci_dev, const char* name) {
     reg_write(dev, REG_RAH, RAH);
 
     // Initialize RX and TX rings
+    ker::net::pkt_pool_reserve_for_rx_descriptors(NUM_RX_DESC);
     init_rx(dev);
     init_tx(dev);
 

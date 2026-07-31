@@ -219,7 +219,8 @@ def test_queues_start_suppressed_and_napi_precedes_irq_registration() -> None:
 
 
 def test_rx_refill_growth_target_does_not_ratchet_from_free_snapshot() -> None:
-    body = function_body(VIRTIO_NET_CPP.read_text(), "fill_rx_queue_for")
+    source = VIRTIO_NET_CPP.read_text()
+    body = function_body(source, "fill_rx_queue_for")
 
     require_order(
         body,
@@ -233,6 +234,8 @@ def test_rx_refill_growth_target_does_not_ratchet_from_free_snapshot() -> None:
         r"\b(?:TARGET_FREE|target_free)\s*=\s*ker::net::pkt_pool_free_count\(\)", body
     ):
         fail("RX refill target must not inherit a racy packet-pool free-count snapshot")
+    if source.count("pkt_pool_reserve_for_rx_descriptors") != 2:
+        fail("modern and legacy VirtIO initialization must reserve RX descriptors before filling queues")
 
 
 def main() -> None:
