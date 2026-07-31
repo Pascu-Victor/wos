@@ -77,6 +77,12 @@ The fixed acceptance sequence is:
    packet, XFS inode, and file-mapping cache reclaim on every node, a bounded
    deferred-free settling interval, and a final exact quiescent checkpoint.
 
+Within that bound, packet-pool reclaim is repeated while a retired growth
+generation still has transient holders. Every attempt is archived, and the
+runner requires each node to reach its permanent baseline with no draining
+generation. A persistent RX/TX holder therefore fails instead of being hidden
+by a fixed sleep or tolerance.
+
 The runner requires every `pressure_reclaim` physical-owner category to contain
 pages during controlled pressure and to release pages by the post-reclaim
 checkpoint. Subsystem-specific endpoint metrics are compared immediately

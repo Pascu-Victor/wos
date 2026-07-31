@@ -467,6 +467,75 @@ def run_reclaim(args: argparse.Namespace, output_dir: Path) -> None:
             )
 
 
+def parse_packet_pool_reclaim_command(text: str, context: str) -> dict[str, int]:
+    lines = [line.strip() for line in text.splitlines() if line.strip().startswith("packet_pool ")]
+    if len(lines) != 1:
+        raise RegressionError(f"{context}: expected one packet_pool reclaim result")
+    values: dict[str, int] = {}
+    for key, raw_value in re.findall(r"(?:^|\s)([a-z_]+)=([0-9]+)(?=\s|$)", lines[0]):
+        if key in values:
+            raise RegressionError(f"{context}: duplicate packet_pool field {key}")
+        values[key] = int(raw_value)
+    for key in ("before", "after", "baseline", "draining", "draining_free"):
+        if key not in values:
+            raise RegressionError(f"{context}: packet_pool result is missing {key}")
+    if values["after"] < values["baseline"]:
+        raise RegressionError(f"{context}: packet_pool capacity fell below its permanent baseline")
+    if values["draining_free"] > values["draining"]:
+        raise RegressionError(f"{context}: packet_pool draining free count exceeds draining capacity")
+    return values
+
+
+def packet_pool_reclaim_complete(values: dict[str, int]) -> bool:
+    return values["after"] == values["baseline"] and values["draining"] == 0
+
+
+def finish_packet_pool_reclaim(args: argparse.Namespace, output_dir: Path, started: float) -> dict[str, Any]:
+    reclaim_dir = output_dir / "reclaim-commands"
+    deadline = started + args.post_reclaim_quiescence_seconds
+    pending = set(args.systems)
+    attempts = {host: 1 for host in args.systems}
+    last: dict[str, dict[str, int]] = {}
+
+    for host in args.systems:
+        path = reclaim_dir / f"{host}-packet_pool.txt"
+        last[host] = parse_packet_pool_reclaim_command(path.read_text(), str(path))
+        if packet_pool_reclaim_complete(last[host]):
+            pending.remove(host)
+
+    while pending:
+        if time.monotonic() >= deadline:
+            states = ", ".join(
+                f"{host}:after={last[host]['after']},baseline={last[host]['baseline']},"
+                f"draining={last[host]['draining']},draining_free={last[host]['draining_free']}"
+                for host in sorted(pending)
+            )
+            raise RegressionError(f"packet_pool reclaim did not finish within {args.post_reclaim_quiescence_seconds}s ({states})")
+        for host in sorted(pending):
+            attempts[host] += 1
+            path = reclaim_dir / f"{host}-packet_pool-attempt-{attempts[host]}.txt"
+            run_command(
+                [str(WOS_SSH), host, "/usr/bin/memacc", "reclaim", "packet_pool", "all"],
+                timeout=args.command_timeout_seconds,
+                stdout_path=path,
+            )
+            last[host] = parse_packet_pool_reclaim_command(path.read_text(), str(path))
+            if packet_pool_reclaim_complete(last[host]):
+                pending.remove(host)
+        if pending:
+            time.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
+
+    remaining = deadline - time.monotonic()
+    if remaining > 0:
+        time.sleep(remaining)
+    return {
+        "attempts": attempts,
+        "final": last,
+        "bound_seconds": args.post_reclaim_quiescence_seconds,
+        "status": "pass",
+    }
+
+
 def inventory(output_dir: Path) -> dict[str, str]:
     result: dict[str, str] = {}
     for path in sorted(output_dir.rglob("*")):
@@ -680,9 +749,11 @@ def main(argv: list[str] | None = None) -> int:
 
         before_reclaim = checkpoint("before-explicit-reclaim", True)
         append_progress(progress_path, "explicit-reclaim", "start")
+        reclaim_started = time.monotonic()
         run_reclaim(args, args.output_dir)
-        append_progress(progress_path, "explicit-reclaim", "commands_pass")
-        time.sleep(args.post_reclaim_quiescence_seconds)
+        manifest["packet_pool_reclaim_completion"] = finish_packet_pool_reclaim(args, args.output_dir, reclaim_started)
+        write_json(args.output_dir / "manifest.json", manifest)
+        append_progress(progress_path, "explicit-reclaim", "commands_pass_and_packet_pool_drained")
         after_reclaim = checkpoint("after-controlled-pressure-reclaim", True)
         manifest["reclaim"] = validate_reclaim(
             pressure_snapshot,

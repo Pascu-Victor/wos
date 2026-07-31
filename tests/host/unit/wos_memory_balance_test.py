@@ -247,6 +247,60 @@ def test_regression_runner_fault_gates(_module) -> None:
     else:
         raise AssertionError("injected >2% accounting overhead was accepted")
 
+    packet_result = regression.parse_packet_pool_reclaim_command(
+        "packet_pool before=4096 buffers after=3072 buffers freed=1024 buffers "
+        "baseline=3072 draining=0 draining_free=0\n",
+        "valid packet reclaim",
+    )
+    if not regression.packet_pool_reclaim_complete(packet_result):
+        raise AssertionError("fully retired packet growth chunk was not accepted")
+    incomplete_packet_result = regression.parse_packet_pool_reclaim_command(
+        "packet_pool before=4096 buffers after=4096 buffers freed=0 buffers "
+        "baseline=3072 draining=1024 draining_free=223\n",
+        "incomplete packet reclaim",
+    )
+    if regression.packet_pool_reclaim_complete(incomplete_packet_result):
+        raise AssertionError("draining packet growth chunk was accepted as complete")
+    try:
+        regression.parse_packet_pool_reclaim_command(
+            "packet_pool before=4096 after=3072 baseline=3072 draining=2 draining_free=3\n",
+            "corrupt packet reclaim",
+        )
+    except regression.RegressionError:
+        pass
+    else:
+        raise AssertionError("corrupt packet drain counters were accepted")
+
+    with tempfile.TemporaryDirectory(prefix="wos-memory-packet-drain-") as temp:
+        root = Path(temp)
+        reclaim_dir = root / "reclaim-commands"
+        reclaim_dir.mkdir()
+        (reclaim_dir / "wos-0-packet_pool.txt").write_text(
+            "packet_pool before=4096 after=4096 baseline=3072 draining=1024 draining_free=1024\n"
+        )
+        original_run_command = regression.run_command
+
+        def complete_packet_reclaim(_command, *, stdout_path=None, **_kwargs):
+            if stdout_path is None:
+                raise AssertionError("packet reclaim attempt did not preserve its output")
+            stdout_path.write_text("packet_pool before=4096 after=3072 baseline=3072 draining=0 draining_free=0\n")
+
+        regression.run_command = complete_packet_reclaim
+        try:
+            completion = regression.finish_packet_pool_reclaim(
+                SimpleNamespace(
+                    systems=["wos-0"],
+                    post_reclaim_quiescence_seconds=0.001,
+                    command_timeout_seconds=1,
+                ),
+                root,
+                regression.time.monotonic(),
+            )
+        finally:
+            regression.run_command = original_run_command
+        if completion["attempts"] != {"wos-0": 2} or completion["status"] != "pass":
+            raise AssertionError("bounded packet-pool reclaim did not retry and complete exactly")
+
     with tempfile.TemporaryDirectory(prefix="wos-memory-boot-id-gate-") as temp:
         root = Path(temp)
         serial_logs = [root / "serial-vm0.log", root / "serial-vm1.log"]
