@@ -11,6 +11,7 @@ PROCFS_CPP = ROOT / "modules" / "kern" / "src" / "vfs" / "fs" / "procfs.cpp"
 PHYS_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "mm" / "phys.opt.cpp"
 OOM_DUMP_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "mm" / "oom_dump.cpp"
 PACKET_CPP = ROOT / "modules" / "kern" / "src" / "net" / "packet.cpp"
+E1000_CPP = ROOT / "modules" / "kern" / "src" / "dev" / "e1000e" / "e1000e.cpp"
 VIRT_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "mm" / "virt.opt.cpp"
 VMEM_CPP = ROOT / "modules" / "kern" / "src" / "syscalls_impl" / "vmem" / "sys_vmem.cpp"
 
@@ -156,6 +157,28 @@ def test_physical_balance_is_exact_and_concrete() -> None:
 
 def test_pressure_reclaim_is_real_and_preserves_network_reserve() -> None:
     packet = PACKET_CPP.read_text()
+    require_tokens(
+        packet,
+        [
+            "PacketBuffer* reserve_free_list",
+            "PacketBuffer* reclaimable_free_list",
+            "auto pkt_global_alloc(bool prefer_reserve)",
+            "auto pkt_alloc_rx()",
+        ],
+        "packet reserve and reclaimable free-list separation",
+    )
+    require_tokens(
+        function_body(packet, "pkt_global_alloc"),
+        [
+            "(prefer_reserve && reserve_free_list != nullptr) || reclaimable_free_list == nullptr",
+            "USE_RESERVE ? &reserve_free_list : &reclaimable_free_list",
+        ],
+        "persistent RX reserve preference with availability fallback",
+    )
+    e1000 = E1000_CPP.read_text()
+    require_tokens(function_body(e1000, "init_rx"), ["ker::net::pkt_alloc_rx()"], "e1000 persistent RX allocation")
+    require_tokens(function_body(e1000, "process_rx_budget"), ["ker::net::pkt_alloc_rx()"], "e1000 RX replacement allocation")
+
     reclaim = function_body(packet, "pkt_pool_reclaim_free")
     require_tokens(
         reclaim,

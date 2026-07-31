@@ -227,6 +227,7 @@ def test_rx_refill_growth_target_does_not_ratchet_from_free_snapshot() -> None:
         "static_cast<size_t>(rxq->num_free) + ker::net::PKT_POOL_RX_REFILL_RESERVE",
         "ker::net::pkt_pool_ensure_free(TARGET_FREE)",
         "size_t const BEFORE_FREE = ker::net::pkt_pool_free_count()",
+        "ker::net::pkt_alloc_rx()",
     )
     if "std::max(TARGET_FREE" in body or re.search(
         r"\b(?:TARGET_FREE|target_free)\s*=\s*ker::net::pkt_pool_free_count\(\)", body

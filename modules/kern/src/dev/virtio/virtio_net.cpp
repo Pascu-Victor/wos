@@ -306,7 +306,7 @@ void fill_rx_queue_for(VirtIONetDevice* dev, Virtqueue* rxq) {
         if (ker::net::pkt_pool_free_count() <= ker::net::PKT_POOL_RX_REFILL_RESERVE) {
             break;
         }
-        auto* pkt = ker::net::pkt_alloc();
+        auto* pkt = ker::net::pkt_alloc_rx();
         if (pkt == nullptr) {
             break;
         }

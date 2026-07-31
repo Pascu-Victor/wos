@@ -114,6 +114,7 @@ auto pkt_pool_reclaim_free(size_t target_capacity) -> PacketPoolReclaimStats;
 auto pkt_pool_reclaim_for_pressure() -> size_t;
 void pkt_pool_ensure_free(size_t min_free);
 auto pkt_alloc() -> PacketBuffer*;
+auto pkt_alloc_rx() -> PacketBuffer*;  // RX descriptor: prefer permanent pool storage
 auto pkt_alloc_tx() -> PacketBuffer*;  // TX-only: fails if pool is low (reserves for RX)
 void pkt_free(PacketBuffer* pkt);
 

@@ -56,7 +56,8 @@ auto packet_debug_cpu() -> uint16_t { return static_cast<uint16_t>(ker::mod::cpu
 // ---------------------------------------------------------------------------
 size_t pool_capacity = 0;
 size_t pool_reserve_capacity = 0;
-PacketBuffer* free_list = nullptr;
+PacketBuffer* reserve_free_list = nullptr;
+PacketBuffer* reclaimable_free_list = nullptr;
 PacketChunk* chunk_list = nullptr;
 ker::mod::sys::Spinlock pool_lock;
 bool initialized = false;
@@ -218,11 +219,14 @@ void add_buffers_to_pool(size_t count, bool reclaimable) {
     pool_lock.lock();
     chunk->next = chunk_list;
     chunk_list = chunk;
-    // Link new buffers into free list
+    // Keep permanent and reclaimable buffers on separate O(1) free lists.
+    // Persistent RX descriptors prefer the permanent list so runtime growth
+    // chunks remain transient and can be released without device traffic.
+    PacketBuffer*& target_free_list = reclaimable ? reclaimable_free_list : reserve_free_list;
     for (size_t i = 0; i < count; i++) {
         new_buffers[i]->pool_chunk = chunk;
-        new_buffers[i]->next = free_list;
-        free_list = new_buffers[i];
+        new_buffers[i]->next = target_free_list;
+        target_free_list = new_buffers[i];
     }
     pool_capacity += count;
     if (!reclaimable) {
@@ -259,15 +263,18 @@ auto pkt_pool_try_grow(size_t min_free, const char* reason) -> bool {
     return free_count.load(std::memory_order_relaxed) >= min_free;
 }
 
-// Allocate from global pool
-auto pkt_global_alloc() -> PacketBuffer* {
+// Allocate from the global pool. Ordinary/transient users preserve the
+// dynamic-first behavior; RX descriptors prefer the permanent reserve.
+auto pkt_global_alloc(bool prefer_reserve) -> PacketBuffer* {
     uint64_t const FLAGS = pool_lock.lock_irqsave();
-    if (free_list == nullptr) {
+    bool const USE_RESERVE = (prefer_reserve && reserve_free_list != nullptr) || reclaimable_free_list == nullptr;
+    PacketBuffer** selected_list = USE_RESERVE ? &reserve_free_list : &reclaimable_free_list;
+    if (*selected_list == nullptr) {
         pool_lock.unlock_irqrestore(FLAGS);
         return nullptr;
     }
-    auto* pkt = free_list;
-    free_list = pkt->next;
+    auto* pkt = *selected_list;
+    *selected_list = pkt->next;
     auto* chunk = static_cast<PacketChunk*>(pkt->pool_chunk);
     if (chunk == nullptr || chunk->free == 0) {
         ker::mod::dbg::panic_handler("packet pool allocation accounting corrupt");
@@ -289,8 +296,9 @@ void pkt_global_free(PacketBuffer* pkt) {
     }
     chunk->free++;
     if (!chunk->draining) {
-        pkt->next = free_list;
-        free_list = pkt;
+        PacketBuffer*& target_free_list = chunk->reclaimable ? reclaimable_free_list : reserve_free_list;
+        pkt->next = target_free_list;
+        target_free_list = pkt;
         free_count.fetch_add(1, std::memory_order_relaxed);
     }
     pool_lock.unlock_irqrestore(FLAGS);
@@ -400,7 +408,7 @@ auto pkt_pool_reclaim_free(size_t target_capacity) -> PacketPoolReclaimStats {
         }
 
         size_t removed = 0;
-        PacketBuffer** free_link = &free_list;
+        PacketBuffer** free_link = chunk->reclaimable ? &reclaimable_free_list : &reserve_free_list;
         while (*free_link != nullptr) {
             if ((*free_link)->pool_chunk == chunk) {
                 *free_link = (*free_link)->next;
@@ -436,7 +444,7 @@ auto pkt_pool_reclaim_free(size_t target_capacity) -> PacketPoolReclaimStats {
         }
 
         size_t removed = 0;
-        PacketBuffer** free_link = &free_list;
+        PacketBuffer** free_link = &reclaimable_free_list;
         while (*free_link != nullptr) {
             if ((*free_link)->pool_chunk == chunk) {
                 *free_link = (*free_link)->next;
@@ -480,7 +488,33 @@ auto pkt_pool_reclaim_for_pressure() -> size_t { return pkt_pool_reclaim_free(0)
 void pkt_pool_ensure_free(size_t min_free) { static_cast<void>(pkt_pool_try_grow(min_free, "runtime")); }
 
 auto pkt_alloc() -> PacketBuffer* {
-    PacketBuffer* pkt = pkt_global_alloc();
+    PacketBuffer* pkt = pkt_global_alloc(false);
+    if (pkt == nullptr) {
+        return nullptr;
+    }
+
+    // Initialize the packet buffer
+    pkt->data = pkt->storage.data() + PKT_HEADROOM;
+    pkt->len = 0;
+    pkt->next = nullptr;
+    pkt->dev = nullptr;
+    pkt->lifetime_ctx = nullptr;
+    pkt->lifetime_release = nullptr;
+    pkt->protocol = 0;
+#ifdef WOS_NET_PACKET_DEBUG
+    pkt->debug_in_use = true;
+    pkt->debug_alloc_cpu = packet_debug_cpu();
+    pkt->debug_alloc_seq = alloc_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+    pkt->debug_alloc_site = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
+    pkt->debug_free_cpu = 0;
+    pkt->debug_free_site = 0;
+#endif
+
+    return pkt;
+}
+
+auto pkt_alloc_rx() -> PacketBuffer* {
+    PacketBuffer* pkt = pkt_global_alloc(true);
     if (pkt == nullptr) {
         return nullptr;
     }

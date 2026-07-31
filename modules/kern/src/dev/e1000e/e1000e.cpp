@@ -150,7 +150,7 @@ void init_rx(E1000Device* dev) {
 
     // Allocate packet buffers and fill descriptors
     for (size_t i = 0; i < NUM_RX_DESC; i++) {
-        auto* pkt = ker::net::pkt_alloc();
+        auto* pkt = ker::net::pkt_alloc_rx();
         if (pkt == nullptr) {
             log::warn("failed to allocate RX buffer %zu", i);
             break;
@@ -229,7 +229,7 @@ int process_rx_budget(E1000Device* dev, int budget) {
                 processed++;
 
                 // Allocate replacement buffer
-                auto* new_pkt = ker::net::pkt_alloc();
+                auto* new_pkt = ker::net::pkt_alloc_rx();
                 if (new_pkt != nullptr) {
                     new_pkt->data = new_pkt->storage.data();
                     new_pkt->len = 0;
