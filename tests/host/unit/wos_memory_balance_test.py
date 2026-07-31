@@ -6,6 +6,7 @@ import importlib.util
 import sys
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -215,6 +216,23 @@ def test_regression_runner_fault_gates(_module) -> None:
     )
     if parsed.workdir != "/root/wos-selfhost-memory-balance":
         raise AssertionError("regression runner default workdir is not an accepted self-host scratch path")
+    delete_commands: list[list[str]] = []
+    original_run_command = regression.run_command
+    regression.run_command = lambda command, **_kwargs: delete_commands.append(command)
+    try:
+        regression.delete_guest_worktree(
+            SimpleNamespace(
+                workdir=parsed.workdir,
+                submitter="wos-0",
+                command_timeout_seconds=30,
+            )
+        )
+    finally:
+        regression.run_command = original_run_command
+    if len(delete_commands) != 1 or len(delete_commands[0]) != 3:
+        raise AssertionError("guest cleanup must send one guarded remote shell command as one SSH argument")
+    if "test ! -L" not in delete_commands[0][2] or "rm -rf --" not in delete_commands[0][2]:
+        raise AssertionError("guest cleanup command lost its directory and symlink guards")
     config = regression.validate_config(ROOT / "configs" / "cluster_selfhost_4_host32.json", ["wos-0", "wos-1", "wos-2", "wos-3"])
     if not config["zones"]:
         raise AssertionError("host32 regression config validation produced no zones")

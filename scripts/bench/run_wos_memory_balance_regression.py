@@ -400,7 +400,7 @@ def delete_guest_worktree(args: argparse.Namespace) -> None:
         f"test -d '{args.workdir}' && test ! -L '{args.workdir}' && "
         f"rm -rf -- '{args.workdir}' && /usr/bin/sync"
     )
-    run_command([str(WOS_SSH), args.submitter, "/usr/bin/bash", "-c", command], timeout=args.command_timeout_seconds)
+    run_command([str(WOS_SSH), args.submitter, command], timeout=args.command_timeout_seconds)
 
 
 def sync_all_nodes(args: argparse.Namespace) -> None:
