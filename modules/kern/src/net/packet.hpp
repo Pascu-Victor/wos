@@ -24,6 +24,8 @@ constexpr size_t PKT_POOL_TX_RESERVE = 256;
 // bulk TX before it has to grow the pool again, while pkt_alloc() can still use
 // the hard reserve for bounded control/liveness frames.
 constexpr size_t PKT_POOL_RX_REFILL_RESERVE = PKT_POOL_TX_RESERVE + PKT_POOL_GROW_CHUNK;
+// Explicit /proc/memacc diagnostic stimulus only; never used by normal growth.
+constexpr size_t PKT_POOL_DIAGNOSTIC_GROW_MAX = 4096;
 
 struct PacketPoolSnapshot {
     size_t capacity = 0;
@@ -113,6 +115,7 @@ auto pkt_pool_snapshot() -> PacketPoolSnapshot;
 auto pkt_pool_try_snapshot(PacketPoolSnapshot& snapshot) -> bool;
 auto pkt_pool_reclaim_free(size_t target_capacity) -> PacketPoolReclaimStats;
 auto pkt_pool_reclaim_for_pressure() -> size_t;
+auto pkt_pool_populate_reclaimable(size_t count) -> bool;
 void pkt_pool_ensure_free(size_t min_free);
 auto pkt_alloc() -> PacketBuffer*;
 auto pkt_alloc_rx() -> PacketBuffer*;  // RX descriptor: prefer permanent pool storage

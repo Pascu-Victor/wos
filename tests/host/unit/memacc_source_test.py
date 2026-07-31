@@ -188,6 +188,15 @@ def test_pressure_reclaim_is_real_and_preserves_network_reserve() -> None:
         ],
         "boot-time RX descriptor permanent reserve",
     )
+    populate = function_body(packet, "pkt_pool_populate_reclaimable")
+    require_tokens(
+        populate,
+        [
+            "count == 0 || count > PKT_POOL_DIAGNOSTIC_GROW_MAX",
+            "add_buffers_to_pool(round_up_growth(count), true)",
+        ],
+        "bounded explicit packet pressure stimulus",
+    )
     e1000 = E1000_CPP.read_text()
     require_tokens(
         e1000,
@@ -224,6 +233,9 @@ def test_pressure_reclaim_is_real_and_preserves_network_reserve() -> None:
     require_tokens(
         procfs,
         [
+            '"grow="',
+            "PKT_POOL_DIAGNOSTIC_GROW_MAX",
+            "pkt_pool_populate_reclaimable",
             '"memacc/reclaim/file_mmap_cache"',
             "file_mmap_cache_reclaim",
             '"memacc/reclaim/xfs_inode"',

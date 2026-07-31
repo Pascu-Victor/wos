@@ -72,7 +72,9 @@ The fixed acceptance sequence is:
    exact quiescent checkpoint.
 4. Five minutes of quiescence and another exact checkpoint.
 5. Controlled anonymous-memory pressure on VM0 and an exact in-pressure
-   checkpoint.
+   checkpoint. The pressure phase explicitly adds one bounded reclaimable
+   packet-pool chunk per node and fails unless the capacity increase is
+   observed, so an otherwise idle pool still exercises its reclaim path.
 6. Pressure release, a quiescent pre-reclaim checkpoint, explicit buffer,
    packet, XFS inode, and file-mapping cache reclaim on every node, a bounded
    deferred-free settling interval, and a final exact quiescent checkpoint.

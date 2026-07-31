@@ -32,6 +32,7 @@ DEFAULT_SYSTEMS = ["wos-0", "wos-1", "wos-2", "wos-3"]
 DEFAULT_SERIAL_LOGS = [ROOT / f"serial-vm{index}.log" for index in range(4)]
 BUILD_RUNS = 3
 MAX_ACCOUNTING_OVERHEAD_PERCENT = 2.0
+PACKET_POOL_PRESSURE_BUFFERS = 256
 PRESSURE_RECLAIM_OWNERS = (
     "user_file_cache",
     "buffer_cache_data",
@@ -467,6 +468,40 @@ def run_reclaim(args: argparse.Namespace, output_dir: Path) -> None:
             )
 
 
+def populate_packet_pool_for_pressure(args: argparse.Namespace, output_dir: Path) -> dict[str, Any]:
+    populate_dir = output_dir / "packet-pool-pressure-populate"
+    populate_dir.mkdir()
+    nodes: dict[str, dict[str, int | str]] = {}
+    for host in args.systems:
+        path = populate_dir / f"{host}.txt"
+        run_command(
+            [
+                str(WOS_SSH),
+                host,
+                "/usr/bin/memacc",
+                "reclaim",
+                "packet_pool",
+                f"grow={PACKET_POOL_PRESSURE_BUFFERS}",
+            ],
+            timeout=args.command_timeout_seconds,
+            stdout_path=path,
+        )
+        values = parse_packet_pool_reclaim_command(path.read_text(), str(path))
+        if values["after"] < values["before"] + PACKET_POOL_PRESSURE_BUFFERS:
+            raise RegressionError(
+                f"{host}: packet-pool pressure stimulus did not add {PACKET_POOL_PRESSURE_BUFFERS} buffers "
+                f"({values['before']} -> {values['after']})"
+            )
+        nodes[host] = {
+            "before": values["before"],
+            "after": values["after"],
+            "added": values["after"] - values["before"],
+            "baseline": values["baseline"],
+            "status": "pass",
+        }
+    return {"requested_buffers_per_node": PACKET_POOL_PRESSURE_BUFFERS, "nodes": nodes, "status": "pass"}
+
+
 def parse_packet_pool_reclaim_command(text: str, context: str) -> dict[str, int]:
     lines = [line.strip() for line in text.splitlines() if line.strip().startswith("packet_pool ")]
     if len(lines) != 1:
@@ -742,6 +777,10 @@ def main(argv: list[str] | None = None) -> int:
 
         append_progress(progress_path, "controlled-pressure", "start", args.pressure_bytes)
         pressure_process = run_pressure(args, args.output_dir)
+        append_progress(progress_path, "packet-pool-pressure-populate", "start", f"buffers={PACKET_POOL_PRESSURE_BUFFERS}")
+        manifest["packet_pool_pressure_population"] = populate_packet_pool_for_pressure(args, args.output_dir)
+        write_json(args.output_dir / "manifest.json", manifest)
+        append_progress(progress_path, "packet-pool-pressure-populate", "pass")
         pressure_snapshot = checkpoint("during-controlled-pressure", False)
         finish_pressure(pressure_process, args.pressure_hold_seconds + args.command_timeout_seconds)
         pressure_process = None

@@ -125,7 +125,7 @@ auto normalize_feature(std::string_view feature) -> std::string {
 void usage() {
     std::printf(
         "usage: memacc [dump [--full]|summary|procs|proc <pid>|kernel|allocs|raw [file]|watch [-n sec]|track <feature> <action>|reclaim "
-        "<buffer_cache|packet_pool|xfs_inode|file_mmap_cache> [target]]\n");
+        "<buffer_cache|packet_pool|xfs_inode|file_mmap_cache> [target|grow=N]]\n");
 }
 
 auto run_dump(int argc, char** argv) -> int {
@@ -275,6 +275,13 @@ auto run_reclaim(int argc, char** argv) -> int {
     if (argc >= 4) {
         std::string_view arg(argv[3]);
         if (arg == "drop" || arg == "all") {
+            command = std::string(arg);
+        } else if (target == "packet_pool" && arg.starts_with("grow=")) {
+            uint64_t grow_count = 0;
+            if (!parse_u64_arg_strict(arg.substr(5), grow_count) || grow_count == 0) {
+                std::printf("memacc: invalid packet growth count '%s'\n", argv[3]);
+                return 1;
+            }
             command = std::string(arg);
         } else {
             uint64_t target_kib = 0;

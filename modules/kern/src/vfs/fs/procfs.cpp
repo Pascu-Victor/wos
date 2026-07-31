@@ -4469,6 +4469,21 @@ auto procfs_write_memacc_reclaim_packet_pool(const char* s, size_t count) -> ssi
         return 0;
     }
 
+    constexpr size_t GROW_PREFIX_LEN = 5;
+    if (count >= GROW_PREFIX_LEN && std::memcmp(s, "grow=", GROW_PREFIX_LEN) == 0) {
+        uint64_t grow_count = 0;
+        if (!procfs_parse_u64_trimmed(s + GROW_PREFIX_LEN, count - GROW_PREFIX_LEN, grow_count)) {
+            return -EINVAL;
+        }
+        if (grow_count == 0 || grow_count > ker::net::PKT_POOL_DIAGNOSTIC_GROW_MAX) {
+            return -ERANGE;
+        }
+        if (!ker::net::pkt_pool_populate_reclaimable(static_cast<size_t>(grow_count))) {
+            return -ENOMEM;
+        }
+        return static_cast<ssize_t>(count);
+    }
+
     uint64_t target_capacity = 0;
     if (procfs_command_equals(s, count, "drop") || procfs_command_equals(s, count, "all") || procfs_command_equals(s, count, "reset")) {
         target_capacity = 0;

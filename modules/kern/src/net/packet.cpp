@@ -183,18 +183,18 @@ void pkt_debug_dump_in_use(size_t avail) {
 }
 #endif
 
-void add_buffers_to_pool(size_t count, bool reclaimable) {
+auto add_buffers_to_pool(size_t count, bool reclaimable) -> bool {
     auto* new_buffers = new (std::nothrow) PacketBuffer*[count]{};
     if (new_buffers == nullptr) {
         log::error("Failed to allocate packet pointer table for %zu buffers", count);
-        return;
+        return false;
     }
 
     auto* chunk = new (std::nothrow) PacketChunk{};
     if (chunk == nullptr) {
         delete[] new_buffers;
         log::error("Failed to allocate packet chunk metadata for %zu buffers", count);
-        return;
+        return false;
     }
     size_t allocated = 0;
     ker::mod::mm::PhysicalPageOwner const OWNER =
@@ -209,7 +209,7 @@ void add_buffers_to_pool(size_t count, bool reclaimable) {
         free_packet_buffer_array(new_buffers, allocated);
         delete chunk;
         log::error("Failed to allocate physically contiguous packet buffers (%zu/%zu)", allocated, count);
-        return;
+        return false;
     }
     chunk->buffers = new_buffers;
     chunk->count = count;
@@ -237,6 +237,7 @@ void add_buffers_to_pool(size_t count, bool reclaimable) {
     pool_lock.unlock();
 
     log::debug("Added %zu packet buffers (total: %zu)", count, TOTAL);
+    return true;
 }
 
 auto pkt_pool_try_grow(size_t min_free, const char* reason) -> bool {
@@ -256,7 +257,7 @@ auto pkt_pool_try_grow(size_t min_free, const char* reason) -> bool {
         size_t const GROW_BY = round_up_growth(std::max(DEFICIT, PKT_POOL_GROW_CHUNK));
         log::debug("Growing packet pool by %zu buffers for %s (free=%zu target=%zu capacity=%zu)", GROW_BY, reason, free_now, min_free,
                    pool_capacity);
-        add_buffers_to_pool(GROW_BY, true);
+        static_cast<void>(add_buffers_to_pool(GROW_BY, true));
     }
 
     expand_in_progress.store(false, std::memory_order_release);
@@ -312,7 +313,7 @@ void pkt_pool_init() {
     }
 
     // Start with minimum pool size
-    add_buffers_to_pool(PKT_POOL_MIN_SIZE, false);
+    static_cast<void>(add_buffers_to_pool(PKT_POOL_MIN_SIZE, false));
     initialized = true;
 }
 
@@ -327,7 +328,7 @@ void pkt_pool_expand_for_nics() {
     pool_lock.unlock_irqrestore(FLAGS);
     if (REQUIRED > RESERVE_CAPACITY) {
         size_t const TO_ADD = REQUIRED - RESERVE_CAPACITY;
-        add_buffers_to_pool(TO_ADD, false);
+        static_cast<void>(add_buffers_to_pool(TO_ADD, false));
     }
 }
 
@@ -346,7 +347,7 @@ void pkt_pool_reserve_for_rx_descriptors(size_t descriptor_count) {
     }
     pool_lock.unlock_irqrestore(FLAGS);
     if (reserve_free < REQUIRED_FREE) {
-        add_buffers_to_pool(REQUIRED_FREE - reserve_free, false);
+        static_cast<void>(add_buffers_to_pool(REQUIRED_FREE - reserve_free, false));
     }
 }
 
@@ -503,6 +504,13 @@ auto pkt_pool_reclaim_free(size_t target_capacity) -> PacketPoolReclaimStats {
 }
 
 auto pkt_pool_reclaim_for_pressure() -> size_t { return pkt_pool_reclaim_free(0).freed_buffers; }
+
+auto pkt_pool_populate_reclaimable(size_t count) -> bool {
+    if (count == 0 || count > PKT_POOL_DIAGNOSTIC_GROW_MAX) {
+        return false;
+    }
+    return add_buffers_to_pool(round_up_growth(count), true);
+}
 
 void pkt_pool_ensure_free(size_t min_free) { static_cast<void>(pkt_pool_try_grow(min_free, "runtime")); }
 

@@ -271,6 +271,48 @@ def test_regression_runner_fault_gates(_module) -> None:
     else:
         raise AssertionError("corrupt packet drain counters were accepted")
 
+    with tempfile.TemporaryDirectory(prefix="wos-memory-packet-populate-") as temp:
+        root = Path(temp)
+        original_run_command = regression.run_command
+
+        def populate_packet_reclaim(_command, *, stdout_path=None, **_kwargs):
+            if stdout_path is None:
+                raise AssertionError("packet population did not preserve its output")
+            stdout_path.write_text("packet_pool before=3072 after=3328 baseline=3072 draining=0 draining_free=0\n")
+
+        regression.run_command = populate_packet_reclaim
+        try:
+            population = regression.populate_packet_pool_for_pressure(
+                SimpleNamespace(systems=["wos-0"], command_timeout_seconds=1),
+                root,
+            )
+        finally:
+            regression.run_command = original_run_command
+        if population["nodes"]["wos-0"]["added"] != regression.PACKET_POOL_PRESSURE_BUFFERS:
+            raise AssertionError("packet pressure population did not prove exact growth")
+
+    with tempfile.TemporaryDirectory(prefix="wos-memory-packet-populate-fault-") as temp:
+        root = Path(temp)
+        original_run_command = regression.run_command
+
+        def underpopulate_packet_reclaim(_command, *, stdout_path=None, **_kwargs):
+            if stdout_path is None:
+                raise AssertionError("packet population did not preserve its output")
+            stdout_path.write_text("packet_pool before=3072 after=3327 baseline=3072 draining=0 draining_free=0\n")
+
+        regression.run_command = underpopulate_packet_reclaim
+        try:
+            regression.populate_packet_pool_for_pressure(
+                SimpleNamespace(systems=["wos-0"], command_timeout_seconds=1),
+                root,
+            )
+        except regression.RegressionError:
+            pass
+        else:
+            raise AssertionError("incomplete packet pressure population was accepted")
+        finally:
+            regression.run_command = original_run_command
+
     with tempfile.TemporaryDirectory(prefix="wos-memory-packet-drain-") as temp:
         root = Path(temp)
         reclaim_dir = root / "reclaim-commands"
