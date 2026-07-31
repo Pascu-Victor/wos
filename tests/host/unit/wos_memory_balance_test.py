@@ -204,6 +204,17 @@ def reclaim_snapshot(pages: int) -> dict:
 
 def test_regression_runner_fault_gates(_module) -> None:
     regression = load_regression()
+    parsed = regression.parse_args(
+        [
+            "--expected-commit",
+            "0123456",
+            "--overhead-baseline-runs-tsv",
+            "baseline.tsv",
+            "--dry-run",
+        ]
+    )
+    if parsed.workdir != "/root/wos-selfhost-memory-balance":
+        raise AssertionError("regression runner default workdir is not an accepted self-host scratch path")
     config = regression.validate_config(ROOT / "configs" / "cluster_selfhost_4_host32.json", ["wos-0", "wos-1", "wos-2", "wos-3"])
     if not config["zones"]:
         raise AssertionError("host32 regression config validation produced no zones")

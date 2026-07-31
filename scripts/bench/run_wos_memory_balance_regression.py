@@ -45,7 +45,7 @@ RECLAIM_TARGETS = (
     ("xfs_inode", "idle_inodes", 0),
     ("file_mmap_cache", "pages", 0),
 )
-SAFE_GUEST_WORKDIR = re.compile(r"/root/[A-Za-z0-9._-]+")
+SAFE_GUEST_WORKDIR = re.compile(r"/root/wos-selfhost-[A-Za-z0-9._-]+")
 SERIAL_BOOT_ID = re.compile(r"WOS version=\S+ boot_id=([0-9a-fA-F]+)")
 
 
@@ -487,7 +487,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--repo", default="https://github.com/Pascu-Victor/wos.git")
     parser.add_argument("--mirror-file", type=Path)
     parser.add_argument("--distdir")
-    parser.add_argument("--workdir", default="/root/wos-memory-balance-selfhost")
+    parser.add_argument("--workdir", default="/root/wos-selfhost-memory-balance")
     parser.add_argument("--jobs", type=int, default=36)
     parser.add_argument("--boot-timeout-seconds", type=int, default=300)
     parser.add_argument("--boot-settle-seconds", type=int, default=30)
@@ -521,6 +521,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             parser.error(f"--{name.replace('_', '-')} must be positive")
     if args.boot_settle_seconds < 0:
         parser.error("--boot-settle-seconds must be nonnegative")
+    if SAFE_GUEST_WORKDIR.fullmatch(args.workdir) is None:
+        parser.error("--workdir must be a normalized /root/wos-selfhost-* scratch path")
     return args
 
 
