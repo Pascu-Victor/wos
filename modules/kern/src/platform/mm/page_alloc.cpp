@@ -9,6 +9,12 @@
 #include <platform/mm/paging.hpp>
 #include <platform/mm/tlb_shootdown.hpp>
 
+#ifdef WOS_SELFTEST
+namespace ker::mod::mm::virt {
+bool selftest_direct_map_contains(const void* ptr);
+}
+#endif
+
 namespace ker::mod::mm {
 
 namespace {
@@ -158,6 +164,11 @@ auto free_head_is_valid(const PageAllocator* alloc, PageAllocator::FreeBlock* bl
 auto free_list_head(PageAllocator* alloc, int order) -> PageAllocator::FreeBlock*& { return alloc->free_list[static_cast<size_t>(order)]; }
 
 void link_free_block_unchecked(PageAllocator* alloc, int order, PageAllocator::FreeBlock* block) {
+#ifdef WOS_SELFTEST
+    if (!virt::selftest_direct_map_contains(block)) {
+        ker::mod::dbg::panic_handler("buddy free-list node lost its HHDM translation");
+    }
+#endif
     auto& head = free_list_head(alloc, order);
     block->prev = nullptr;
     block->next = head;
@@ -176,6 +187,11 @@ auto remove_free_block(PageAllocator* alloc, int order, PageAllocator::FreeBlock
     }
 
     auto& head = free_list_head(alloc, order);
+#ifdef WOS_SELFTEST
+    if (!virt::selftest_direct_map_contains(block)) {
+        ker::mod::dbg::panic_handler("buddy free-list node lost its HHDM translation");
+    }
+#endif
     auto* const PREV = block->prev;
     auto* const NEXT = block->next;
 

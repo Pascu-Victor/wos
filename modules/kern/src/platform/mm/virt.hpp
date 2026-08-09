@@ -163,6 +163,16 @@ void map_range_to_kernel_page_table(Range range, uint64_t flags);
 static constexpr paddr_t PADDR_INVALID = static_cast<paddr_t>(-1);
 
 paddr_t translate(PageTable* page_table, vaddr_t vaddr);
+#ifdef WOS_SELFTEST
+// Low-perturbation allocator guard. Before init_pagemap() completes this is a
+// no-op; afterwards it reports the exact live page-table path for a missing or
+// non-identity HHDM leaf without allocating or attempting a repair.
+bool selftest_direct_map_contains(const void* ptr);
+// Returns true for a page-table page that has been observed in the permanent
+// kernel hierarchy. The registry is append-only so an illegal release remains
+// detectable even after the frame has been returned to the buddy allocator.
+bool selftest_kernel_page_table_frame(const void* ptr);
+#endif
 auto install_lazy_file_page_if_current(sched::task::Task* task, const sched::task::LazyVmemRange& range, vaddr_t page_vaddr,
                                        paddr_t page_paddr, uint64_t page_flags) -> LazyFilePageInstallResult;
 bool ensure_user_page_writable(sched::task::Task* task, vaddr_t vaddr);

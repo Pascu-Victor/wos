@@ -1232,6 +1232,11 @@ auto init_huge_page_zone(uint64_t base, uint64_t len) -> paging::PageZone* {
 
 auto find_free_block(uint64_t size, PhysicalPageOwner owner, uint64_t caller) -> void* {
     for (paging::PageZone* zone = zones; zone != nullptr; zone = zone->next) {
+#ifdef WOS_SELFTEST
+        if (!virt::selftest_direct_map_contains(zone)) {
+            ker::mod::dbg::panic_handler("physical zone descriptor lost its HHDM translation");
+        }
+#endif
         if (zone->len < size || zone->allocator == nullptr) {
             continue;
         }
@@ -1250,6 +1255,11 @@ auto find_free_block(uint64_t size, PhysicalPageOwner owner, uint64_t caller) ->
 
 auto find_free_order0_block(PhysicalPageOwner owner, uint64_t caller) -> void* {
     for (paging::PageZone* zone = zones; zone != nullptr; zone = zone->next) {
+#ifdef WOS_SELFTEST
+        if (!virt::selftest_direct_map_contains(zone)) {
+            ker::mod::dbg::panic_handler("physical zone descriptor lost its HHDM translation");
+        }
+#endif
         if (zone->len < paging::PAGE_SIZE || zone->allocator == nullptr) {
             continue;
         }
@@ -1650,6 +1660,17 @@ auto try_alloc_from_per_cpu_cache(PhysicalPageOwner owner, uint64_t caller_tag, 
     cache_stats.alloc_hits.fetch_add(1, std::memory_order_relaxed);
     note_physical_alloc(paging::PAGE_SIZE);
 
+#ifdef WOS_SELFTEST
+    // The allocator owns this page now, but it has not yet been zeroed or
+    // exposed to the caller. Catch stale free-list/cache membership of a
+    // permanent kernel page-table frame at the last non-destructive point.
+    if (virt::selftest_kernel_page_table_frame(page)) {
+        dbg::emergency_log("allocator reissued permanent kernel page table source=per-cpu-cache page=0x%lx owner=%lu caller=0x%lx\n",
+                           reinterpret_cast<uint64_t>(page), static_cast<uint64_t>(owner), reinterpret_cast<uint64_t>(caller_addr));
+        ker::mod::dbg::panic_handler("physical allocator reissued a permanent kernel page table");
+    }
+#endif
+
     prepare_allocated_block(page, paging::PAGE_SIZE, zeroing);
 
 #ifdef WOS_PHYS_ALLOC_CALLER_STATS
@@ -1764,6 +1785,16 @@ auto page_alloc_impl(PhysicalPageOwner owner, uint64_t size, std::string_view na
         dbg::emergency_log("FATAL: pageAlloc returned invalid HHDM addr: 0x%lx\n", block_addr);
         hcf();
     }
+
+#ifdef WOS_SELFTEST
+    // As above, run before prepare_allocated_block() can erase the table and
+    // turn the first observable symptom into an unrelated missing mapping.
+    if (virt::selftest_kernel_page_table_frame(block)) {
+        dbg::emergency_log("allocator reissued permanent kernel page table source=buddy page=0x%lx owner=%lu caller=0x%lx\n", block_addr,
+                           static_cast<uint64_t>(owner), reinterpret_cast<uint64_t>(caller_addr));
+        ker::mod::dbg::panic_handler("physical allocator reissued a permanent kernel page table");
+    }
+#endif
 
     // Zero outside the lock - the block is exclusively ours now. The owning
     // PageAllocator validates free-block metadata before publishing the block.
@@ -2062,6 +2093,14 @@ void page_free(void* page) {
         return;
     }
 
+#ifdef WOS_SELFTEST
+    if (virt::selftest_kernel_page_table_frame(page)) {
+        dbg::emergency_log("illegal kernel page-table direct free page=0x%lx caller=0x%lx\n", reinterpret_cast<uint64_t>(page),
+                           reinterpret_cast<uint64_t>(__builtin_return_address(0)));
+        ker::mod::dbg::panic_handler("attempted to free a permanent kernel page table");
+    }
+#endif
+
     if (release_kernel_stack_pool_slot(page) != KernelStackPoolRelease::NOT_POOL) {
         return;
     }
@@ -2346,6 +2385,13 @@ struct ZeroRefPage {
 
 auto page_ref_dec_atomic(void* page, uint32_t& new_ref, ZeroRefPage& zero_ref_page, PageLookupHint& hint) -> bool {
     zero_ref_page = {};
+#ifdef WOS_SELFTEST
+    if (virt::selftest_kernel_page_table_frame(page)) {
+        dbg::emergency_log("illegal kernel page-table refdec page=0x%lx caller=0x%lx\n", reinterpret_cast<uint64_t>(page),
+                           reinterpret_cast<uint64_t>(__builtin_return_address(0)));
+        ker::mod::dbg::panic_handler("attempted to decrement a permanent kernel page table");
+    }
+#endif
     PageAllocator* alloc = nullptr;
     uint32_t idx = 0;
     if (!find_allocator_for_page_with_hint(page, hint, alloc, idx)) {

@@ -569,6 +569,10 @@ limine_memmap_response* memmap_response;
 limine_executable_file_response* kernel_file_response;
 limine_executable_address_response* kernel_address_response;
 
+#ifdef WOS_SELFTEST
+void selftest_require_mutable_pagemap_root(PageTable const* root, const char* phase, vaddr_t vaddr = 0);
+#endif
+
 constexpr size_t PAGE_TABLE_POOL_CAPACITY = 64;
 
 struct PageTablePool {
@@ -1094,6 +1098,10 @@ auto try_alloc_page_table_from_pool() -> PageTable* {
     pool.pages[pool.count] = nullptr;
     pool.lock.unlock_irqrestore(FLAGS);
 
+#ifdef WOS_SELFTEST
+    selftest_require_mutable_pagemap_root(table, "page-table-pool-alloc");
+#endif
+
     if (!phys::page_reassign_owner(table, PhysicalPageOwner::PAGE_TABLE)) {
         log::critical("page-table pool could not restore active ownership page=%p", table);
         hcf();
@@ -1595,6 +1603,10 @@ auto resolve_user_write_mapping(sched::task::Task* task, vaddr_t vaddr) -> UserW
         return UserWriteFaultStatus::NOT_WRITABLE;
     }
 
+#ifdef WOS_SELFTEST
+    selftest_require_mutable_pagemap_root(task->pagemap, "resolve-user-write-mapping", vaddr);
+#endif
+
     PageTable* const PAGEMAP = task->pagemap;
     uint64_t const VADDR = vaddr;
     uint64_t const IDX4 = index_of(VADDR, 4);
@@ -2055,6 +2067,10 @@ void refresh_kernel_mappings(PageTable* page_table) {
         return;
     }
 
+#ifdef WOS_SELFTEST
+    selftest_require_mutable_pagemap_root(page_table, "refresh-kernel-mappings");
+#endif
+
     for (size_t i = KERNEL_PML4_START; i < KERNEL_PML4_END; i++) {
         PageTableEntry const& kernel_entry = entry_at(kernel_pagemap, i);
         PageTableEntry& task_entry = entry_at(page_table, i);
@@ -2194,6 +2210,18 @@ void release_pagemap(PageTable* pagemap) {
         page_table_pool_rejects.fetch_add(1, std::memory_order_relaxed);
         return;
     }
+
+#ifdef WOS_SELFTEST
+    // Root pages are recycled directly into the page-table pool, so they do
+    // not necessarily pass through page_free() or page_ref_dec(). Catch a
+    // stale/corrupt root pointer before zero_page_table_for_pool() can erase a
+    // live child of the permanent kernel hierarchy.
+    if (selftest_kernel_page_table_frame(pagemap)) {
+        dbg::emergency_log("illegal kernel page-table root release page=0x%lx caller=0x%lx\n", reinterpret_cast<uint64_t>(pagemap),
+                           reinterpret_cast<uint64_t>(__builtin_return_address(0)));
+        ker::mod::dbg::panic_handler("attempted to recycle a permanent kernel page table as a user root");
+    }
+#endif
 
     owned_frame_purge_pagemap(pagemap);
 
@@ -2369,6 +2397,284 @@ paddr_t translate(PageTable* page_table, vaddr_t vaddr) {
     return PHYS;  // Return physical address only
 }
 
+#ifdef WOS_SELFTEST
+bool direct_map_selftest_ready = false;
+
+namespace {
+
+constexpr size_t SELFTEST_KERNEL_PAGE_TABLE_REGISTRY_CAPACITY = 1U << 15U;
+static_assert((SELFTEST_KERNEL_PAGE_TABLE_REGISTRY_CAPACITY & (SELFTEST_KERNEL_PAGE_TABLE_REGISTRY_CAPACITY - 1U)) == 0U);
+
+std::array<std::atomic<paddr_t>, SELFTEST_KERNEL_PAGE_TABLE_REGISTRY_CAPACITY>
+    selftest_kernel_page_table_registry{};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+
+__attribute__((no_sanitize("address"))) auto selftest_kernel_page_table_hash(paddr_t phys) -> size_t {
+    uint64_t page = phys >> paging::PAGE_SHIFT;
+    page ^= page >> 33U;
+    page *= 0xff51afd7ed558ccdULL;
+    page ^= page >> 33U;
+    return static_cast<size_t>(page) & (SELFTEST_KERNEL_PAGE_TABLE_REGISTRY_CAPACITY - 1U);
+}
+
+__attribute__((no_sanitize("address"))) void selftest_register_kernel_page_table(PageTable const* table) {
+    if (table == nullptr) {
+        return;
+    }
+
+    paddr_t const PHYS = reinterpret_cast<paddr_t>(addr::get_phys_pointer(reinterpret_cast<vaddr_t>(table))) & ~(paging::PAGE_SIZE - 1);
+    if (PHYS == 0) {
+        ker::mod::dbg::panic_handler("kernel page-table registry rejected physical page zero");
+    }
+
+    size_t slot = selftest_kernel_page_table_hash(PHYS);
+    for (size_t probe = 0; probe < selftest_kernel_page_table_registry.size(); ++probe) {
+        auto& candidate = selftest_kernel_page_table_registry.at(slot);
+        paddr_t observed = candidate.load(std::memory_order_acquire);
+        if (observed == PHYS) {
+            return;
+        }
+        if (observed == 0 && candidate.compare_exchange_strong(observed, PHYS, std::memory_order_acq_rel, std::memory_order_acquire)) {
+            return;
+        }
+        slot = (slot + 1U) & (SELFTEST_KERNEL_PAGE_TABLE_REGISTRY_CAPACITY - 1U);
+    }
+
+    ker::mod::dbg::panic_handler("kernel page-table selftest registry exhausted");
+}
+
+__attribute__((no_sanitize("address"))) void selftest_register_kernel_page_table_tree(PageTable const* table, int level, bool root) {
+    if (table == nullptr || level < 1) {
+        return;
+    }
+    selftest_register_kernel_page_table(table);
+    if (level == 1) {
+        return;
+    }
+
+    size_t const FIRST_ENTRY = root ? KERNEL_PML4_START : 0;
+    size_t const LAST_ENTRY = root ? KERNEL_PML4_END : paging::PAGE_TABLE_ENTRIES;
+    for (size_t index = FIRST_ENTRY; index < LAST_ENTRY; ++index) {
+        PageTableEntry const& entry = table->entries.at(index);
+        if (entry.present == 0 || entry.pagesize != 0) {
+            continue;
+        }
+        auto* const CHILD = reinterpret_cast<PageTable const*>(addr::get_virt_pointer(entry.frame << paging::PAGE_SHIFT));
+        selftest_register_kernel_page_table_tree(CHILD, level - 1, false);
+    }
+}
+
+__attribute__((no_sanitize("address"))) void selftest_register_kernel_page_table_path(vaddr_t vaddr) {
+    PageTable const* table = kernel_pagemap;
+    if (table == nullptr) {
+        return;
+    }
+
+    for (int level = 4; level > 1; --level) {
+        selftest_register_kernel_page_table(table);
+        PageTableEntry const& entry = table->entries.at(index_of(vaddr, level));
+        if (entry.present == 0 || entry.pagesize != 0) {
+            return;
+        }
+        table = reinterpret_cast<PageTable const*>(addr::get_virt_pointer(entry.frame << paging::PAGE_SHIFT));
+    }
+    selftest_register_kernel_page_table(table);
+}
+
+__attribute__((no_sanitize("address"))) void selftest_register_kernel_page_tables() {
+    selftest_register_kernel_page_table_tree(kernel_pagemap, 4, true);
+}
+
+}  // namespace
+
+__attribute__((no_sanitize("address"))) bool selftest_kernel_page_table_frame(const void* ptr) {
+    if (!direct_map_selftest_ready || ptr == nullptr) {
+        return false;
+    }
+
+    vaddr_t const VADDR = reinterpret_cast<vaddr_t>(ptr);
+    uint64_t const HHDM_OFFSET = addr::get_hhdm_offset();
+    if (VADDR < HHDM_OFFSET) {
+        return false;
+    }
+    paddr_t const PHYS = (VADDR - HHDM_OFFSET) & ~(paging::PAGE_SIZE - 1);
+    if (PHYS == 0) {
+        return false;
+    }
+
+    size_t slot = selftest_kernel_page_table_hash(PHYS);
+    for (size_t probe = 0; probe < selftest_kernel_page_table_registry.size(); ++probe) {
+        paddr_t const OBSERVED = selftest_kernel_page_table_registry.at(slot).load(std::memory_order_acquire);
+        if (OBSERVED == PHYS) {
+            return true;
+        }
+        if (OBSERVED == 0) {
+            return false;
+        }
+        slot = (slot + 1U) & (SELFTEST_KERNEL_PAGE_TABLE_REGISTRY_CAPACITY - 1U);
+    }
+    return false;
+}
+
+namespace {
+
+__attribute__((no_sanitize("address"))) void selftest_require_mutable_pagemap_root(PageTable const* root, const char* phase,
+                                                                                   vaddr_t vaddr) {
+    if (root == nullptr || root == kernel_pagemap || !selftest_kernel_page_table_frame(root)) {
+        return;
+    }
+
+    dbg::emergency_log("permanent kernel page-table used as mutable pagemap root phase=%s root=0x%lx vaddr=0x%lx caller=0x%lx\n",
+                       phase != nullptr ? phase : "?", reinterpret_cast<uint64_t>(root), vaddr,
+                       reinterpret_cast<uint64_t>(__builtin_return_address(0)));
+    ker::mod::dbg::panic_handler("permanent kernel page table used as a non-kernel pagemap root");
+}
+
+}  // namespace
+
+__attribute__((no_sanitize("address"))) bool selftest_direct_map_contains(const void* ptr) {
+    if (!direct_map_selftest_ready) {
+        return true;
+    }
+    if (ptr == nullptr || kernel_pagemap == nullptr) {
+        return false;
+    }
+
+    vaddr_t const vaddr = reinterpret_cast<vaddr_t>(ptr);
+    uint64_t const hhdm_offset = addr::get_hhdm_offset();
+    if (vaddr < hhdm_offset) {
+        return false;
+    }
+    paddr_t const expected = (vaddr - hhdm_offset) & ~(paging::PAGE_SIZE - 1);
+
+    std::array<uint64_t, 4> raw{};
+    std::array<paddr_t, 3> table_phys{};
+    PageTable const* table = kernel_pagemap;
+    size_t failed_level = 0;
+    paddr_t mapped = PADDR_INVALID;
+    for (int level = 4; level > 1; --level) {
+        size_t const index = (vaddr >> (12 + (9 * (level - 1)))) & 0x1FF;
+        PageTableEntry const& entry = table->entries[index];
+        std::memcpy(&raw.at(static_cast<size_t>(4 - level)), &entry, sizeof(uint64_t));
+        if (entry.present == 0) {
+            failed_level = static_cast<size_t>(level);
+            break;
+        }
+
+        paddr_t const phys = entry.frame << paging::PAGE_SHIFT;
+        if (level == 3 && entry.pagesize != 0) {
+            mapped = phys + (vaddr & (LARGE_PAGE_1G_BYTES - 1));
+            break;
+        }
+        if (level == 2 && entry.pagesize != 0) {
+            mapped = phys + (vaddr & (LARGE_PAGE_2M_BYTES - 1));
+            break;
+        }
+        table_phys.at(static_cast<size_t>(4 - level)) = phys;
+        table = reinterpret_cast<PageTable const*>(addr::get_virt_pointer(phys));
+    }
+
+    if (mapped == PADDR_INVALID && failed_level == 0) {
+        size_t const index = (vaddr >> paging::PAGE_SHIFT) & 0x1FF;
+        PageTableEntry const& entry = table->entries[index];
+        std::memcpy(&raw.at(3), &entry, sizeof(uint64_t));
+        if (entry.present != 0) {
+            mapped = (entry.frame << paging::PAGE_SHIFT) + (vaddr & (paging::PAGE_SIZE - 1));
+        } else {
+            failed_level = 1;
+        }
+    }
+
+    if ((mapped & ~(paging::PAGE_SIZE - 1)) == expected) {
+        return true;
+    }
+
+    dbg::emergency_log(
+        "direct-map pointer audit failed vaddr=0x%lx expected=0x%lx mapped=0x%lx failed_level=%lu "
+        "raw4=0x%lx raw3=0x%lx raw2=0x%lx raw1=0x%lx table3=0x%lx table2=0x%lx table1=0x%lx\n",
+        vaddr, expected, mapped, static_cast<uint64_t>(failed_level), raw.at(0), raw.at(1), raw.at(2), raw.at(3), table_phys.at(0),
+        table_phys.at(1), table_phys.at(2));
+    for (size_t i = 0; i < table_phys.size(); ++i) {
+        if (table_phys.at(i) == 0) {
+            continue;
+        }
+        auto* const table_page = reinterpret_cast<void*>(addr::get_virt_pointer(table_phys.at(i)));
+        dbg::emergency_log("direct-map table level=%lu page=0x%lx kind=%lu ref=%lu\n", static_cast<uint64_t>(3 - i),
+                           reinterpret_cast<uint64_t>(table_page), static_cast<uint64_t>(phys::page_kind_get(table_page)),
+                           static_cast<uint64_t>(phys::page_ref_get(table_page)));
+    }
+    return false;
+}
+
+namespace {
+
+constexpr size_t SELFTEST_DIRECT_MAP_EDGE_PAGES = 8;
+
+__attribute__((no_sanitize("address"))) void selftest_require_direct_map_phys(paddr_t phys, const char* phase) {
+    auto const* ptr = reinterpret_cast<const void*>(addr::get_virt_pointer(phys));
+    if (selftest_direct_map_contains(ptr)) {
+        return;
+    }
+
+    dbg::emergency_log("boot direct-map boundary audit failed phase=%s phys=0x%lx\n", phase != nullptr ? phase : "?", phys);
+    ker::mod::dbg::panic_handler("boot direct-map boundary audit found a missing identity mapping");
+}
+
+__attribute__((no_sanitize("address"))) void selftest_audit_boot_direct_map_boundaries(const char* phase) {
+    if (memmap_response == nullptr) {
+        ker::mod::dbg::panic_handler("boot direct-map boundary audit has no memory map");
+    }
+
+    size_t checked = 0;
+    for (size_t entry_index = 0; entry_index < memmap_response->entry_count; ++entry_index) {
+        Range range{};
+        if (!memmap_page_range(memmap_response->entries[entry_index], range)) {
+            continue;
+        }
+
+        uint64_t const PAGE_COUNT = (range.end - range.start) / paging::PAGE_SIZE;
+        uint64_t const EDGE_PAGES = std::min<uint64_t>(PAGE_COUNT, SELFTEST_DIRECT_MAP_EDGE_PAGES);
+        for (uint64_t page = 0; page < EDGE_PAGES; ++page) {
+            selftest_require_direct_map_phys(range.start + (page * paging::PAGE_SIZE), phase);
+            ++checked;
+        }
+
+        uint64_t const LAST_EDGE_PAGE = PAGE_COUNT > EDGE_PAGES ? PAGE_COUNT - EDGE_PAGES : EDGE_PAGES;
+        for (uint64_t page = LAST_EDGE_PAGE; page < PAGE_COUNT; ++page) {
+            selftest_require_direct_map_phys(range.start + (page * paging::PAGE_SIZE), phase);
+            ++checked;
+        }
+
+        uint64_t boundary = range.start;
+        uint64_t const MISALIGNMENT = boundary % LARGE_PAGE_2M_BYTES;
+        if (MISALIGNMENT != 0) {
+            uint64_t const ADVANCE = LARGE_PAGE_2M_BYTES - MISALIGNMENT;
+            if (boundary > UINT64_MAX - ADVANCE) {
+                continue;
+            }
+            boundary += ADVANCE;
+        }
+
+        while (boundary < range.end) {
+            if (boundary > range.start) {
+                selftest_require_direct_map_phys(boundary - paging::PAGE_SIZE, phase);
+                ++checked;
+            }
+            selftest_require_direct_map_phys(boundary, phase);
+            ++checked;
+            if (boundary > UINT64_MAX - LARGE_PAGE_2M_BYTES) {
+                break;
+            }
+            boundary += LARGE_PAGE_2M_BYTES;
+        }
+    }
+
+    log::info("boot direct-map boundary audit passed: phase=%s samples=%zu", phase != nullptr ? phase : "?", checked);
+}
+
+}  // namespace
+
+#endif
+
 auto install_lazy_file_page_if_current(sched::task::Task* task, const sched::task::LazyVmemRange& range, vaddr_t page_vaddr,
                                        paddr_t page_paddr, uint64_t page_flags) -> LazyFilePageInstallResult {
     if (task == nullptr || task->pagemap == nullptr) {
@@ -2515,7 +2821,7 @@ void init_pagemap() {
                     return "UNKNOWN";
             }
         }();
-        log::debug("memory map entry %d: %x - %x (%s)", i, entry->base, entry->base + entry->length, type_str);
+        log::debug("memory map entry %zu: %lx - %lx (%s)", i, entry->base, entry->base + entry->length, type_str);
     }
 
     BootDirectMapStats direct_map_stats{};
@@ -2639,6 +2945,11 @@ void init_pagemap() {
     log::info("cleared PML4[0] - null derefs will now fault");
 
     switch_to_kernel_pagemap();
+#ifdef WOS_SELFTEST
+    selftest_register_kernel_page_tables();
+    direct_map_selftest_ready = true;
+    selftest_audit_boot_direct_map_boundaries("post-cr3-switch");
+#endif
 }
 
 namespace {
@@ -2709,6 +3020,10 @@ void map_page(PageTable* page_table, const vaddr_t VADDR, const paddr_t PADDR, c
         hcf();
     }
 
+#ifdef WOS_SELFTEST
+    selftest_require_mutable_pagemap_root(page_table, "map-page", VADDR);
+#endif
+
     // PageTable* table = pageTable;
     // for (int i = 4; i > 1; i--) {
     //     table = advancePageTable(table, index_of(vaddr, i), flags);
@@ -2746,6 +3061,10 @@ void init_page_map_batch(PageMapBatch* batch, PageTable* page_table, const uint6
         log::critical("init_page_map_batch: invalid args=<batch: %p, pagemap: %p, flags: %x>", batch, page_table, FLAGS);
         hcf();
     }
+
+#ifdef WOS_SELFTEST
+    selftest_require_mutable_pagemap_root(page_table, "init-page-map-batch");
+#endif
 
     batch->root = page_table;
     batch->pml3 = nullptr;
@@ -2840,6 +3159,11 @@ void reserve_page_range(PageTable* page_table, const vaddr_t VADDR, const uint64
                       static_cast<unsigned long long>(PAGE_COUNT));
         hcf();
     }
+
+#ifdef WOS_SELFTEST
+    selftest_require_mutable_pagemap_root(page_table, "reserve-page-range", VADDR);
+#endif
+
     if (PAGE_COUNT == 0) {
         return;
     }
@@ -2917,6 +3241,10 @@ void unify_page_flags(PageTable* page_table, vaddr_t vaddr, uint64_t flags) {
         hcf();
     }
 
+#ifdef WOS_SELFTEST
+    selftest_require_mutable_pagemap_root(page_table, "unify-page-flags", vaddr);
+#endif
+
     PageTable* table = page_table;
     bool path_promoted = false;
     for (int i = 4; i > 1; i--) {
@@ -2974,6 +3302,10 @@ void unmap_page(PageTable* page_table, vaddr_t vaddr) {
         log::critical("init: failed to get page table in unmap_page");
         hcf();
     }
+
+#ifdef WOS_SELFTEST
+    selftest_require_mutable_pagemap_root(page_table, "unmap-page", vaddr);
+#endif
 
     PageTableEntry* entry = leaf_entry(page_table, vaddr);
     if (entry == nullptr) {
@@ -3074,6 +3406,10 @@ void init_kernel_vmap() {
     }
 
     kernel_vmap_initialized = true;
+#ifdef WOS_SELFTEST
+    selftest_register_kernel_page_tables();
+    selftest_audit_boot_direct_map_boundaries("post-kernel-vmap-init");
+#endif
     log::info("prepared kernel vmap arena: base=%p bytes=%llu pages=%zu", KERNEL_VMAP_BASE, static_cast<unsigned long long>(arena_bytes),
               kernel_vmap_active_pages);
 }
@@ -3216,13 +3552,26 @@ void map_range(PageTable* page_table, Range range, uint64_t flags, uint64_t offs
     }
 }
 
-void map_to_kernel_page_table(vaddr_t vaddr, paddr_t paddr, uint64_t flags) { map_page(kernel_pagemap, vaddr, paddr, flags); }
+void map_to_kernel_page_table(vaddr_t vaddr, paddr_t paddr, uint64_t flags) {
+    map_page(kernel_pagemap, vaddr, paddr, flags);
+#ifdef WOS_SELFTEST
+    selftest_register_kernel_page_table_path(vaddr);
+#endif
+}
 
-void map_range_to_kernel_page_table(Range range, uint64_t flags, uint64_t offset) { map_range(kernel_pagemap, range, flags, offset); }
+void map_range_to_kernel_page_table(Range range, uint64_t flags, uint64_t offset) {
+    map_range(kernel_pagemap, range, flags, offset);
+#ifdef WOS_SELFTEST
+    selftest_register_kernel_page_tables();
+#endif
+}
 
 void map_range_to_kernel_page_table(Range range, uint64_t flags) {
     // no offset assume hhdm
     map_range(kernel_pagemap, range, flags, addr::get_hhdm_offset());
+#ifdef WOS_SELFTEST
+    selftest_register_kernel_page_tables();
+#endif
 }
 
 namespace {
@@ -3282,6 +3631,21 @@ auto phys_to_hhdm_checked(uint64_t phys_addr, FrameProbeCache* cache = nullptr) 
 
     return reinterpret_cast<void*>(VIRT_RAW);
 }
+
+#ifdef WOS_SELFTEST
+__attribute__((no_sanitize("address"))) void selftest_require_user_page_table(PageTable const* root, PageTable const* table, int level,
+                                                                              const char* phase, uint64_t owner_pid, const char* reason) {
+    if (!selftest_kernel_page_table_frame(table)) {
+        return;
+    }
+
+    dbg::emergency_log(
+        "user page-table walk reached permanent kernel frame phase=%s root=0x%lx table=0x%lx level=%lu pid=%lu reason=%s caller=0x%lx\n",
+        phase != nullptr ? phase : "?", reinterpret_cast<uint64_t>(root), reinterpret_cast<uint64_t>(table), static_cast<uint64_t>(level),
+        owner_pid, reason != nullptr ? reason : "?", reinterpret_cast<uint64_t>(__builtin_return_address(0)));
+    ker::mod::dbg::panic_handler("user address-space teardown entered the permanent kernel page-table hierarchy");
+}
+#endif
 
 #ifdef WOS_MM_RECLAIM_MAGIC_PROBES
 auto phys_to_hhdm_for_live_probe(uint64_t phys_addr, PageKind kind, FrameProbeCache* cache = nullptr) -> void* {
@@ -3595,10 +3959,15 @@ void destroy_state_queue_page_table_refdec(DestroyUserSpaceBudgetState& state, v
 }
 
 void collect_page_table_frames(PageTable* table, int level, PageTableFrameSet& frames, DestroyUserSpaceCallStats* stats,
-                               FrameProbeCache* frame_probe_cache = nullptr) {
+                               FrameProbeCache* frame_probe_cache = nullptr, PageTable* root = nullptr, uint64_t owner_pid = 0,
+                               const char* reason = nullptr) {
     if (table == nullptr || level < 1) {
         return;
     }
+
+#ifdef WOS_SELFTEST
+    selftest_require_user_page_table(root != nullptr ? root : table, table, level, "collect", owner_pid, reason);
+#endif
 
     frames.add(reinterpret_cast<uint64_t>(addr::get_phys_pointer(reinterpret_cast<vaddr_t>(table))));
 
@@ -3631,7 +4000,8 @@ void collect_page_table_frames(PageTable* table, int level, PageTableFrameSet& f
         frames.add(PHYS_ADDR);
         auto* next_level = reinterpret_cast<PageTable*>(phys_to_hhdm_checked(PHYS_ADDR, frame_probe_cache));
         if (next_level != nullptr) {
-            collect_page_table_frames(next_level, level - 1, frames, stats, frame_probe_cache);
+            collect_page_table_frames(next_level, level - 1, frames, stats, frame_probe_cache, root != nullptr ? root : table, owner_pid,
+                                      reason);
         }
     }
 }
@@ -3639,6 +4009,9 @@ void collect_page_table_frames(PageTable* table, int level, PageTableFrameSet& f
 auto advance_collect_frames_budgeted(DestroyUserSpaceBudgetState& state, DestroyUserSpaceCallStats& stats) -> bool {
     while (state.stack_size > 0) {
         auto& frame = destroy_state_top(state);
+#ifdef WOS_SELFTEST
+        selftest_require_user_page_table(state.pagemap, frame.table, frame.level, "budget-collect", state.owner_pid, state.reason);
+#endif
         size_t const MAX_ENTRY = frame.level == 4 ? 256 : 512;
         if (frame.next_index >= MAX_ENTRY) {
             destroy_state_pop(state);
@@ -3685,6 +4058,9 @@ auto advance_collect_frames_budgeted(DestroyUserSpaceBudgetState& state, Destroy
 auto advance_free_data_budgeted(DestroyUserSpaceBudgetState& state, DestroyUserSpaceCallStats& stats) -> bool {
     while (state.stack_size > 0) {
         auto& frame = destroy_state_top(state);
+#ifdef WOS_SELFTEST
+        selftest_require_user_page_table(state.pagemap, frame.table, frame.level, "budget-free-data", state.owner_pid, state.reason);
+#endif
         size_t const MAX_ENTRY = frame.level == 4 ? 256 : 512;
         if (frame.next_index >= MAX_ENTRY) {
             destroy_state_pop(state);
@@ -3791,6 +4167,9 @@ auto advance_free_data_budgeted(DestroyUserSpaceBudgetState& state, DestroyUserS
 auto advance_free_page_tables_budgeted(DestroyUserSpaceBudgetState& state, DestroyUserSpaceCallStats& stats) -> bool {
     while (state.stack_size > 0) {
         auto& frame = destroy_state_top(state);
+#ifdef WOS_SELFTEST
+        selftest_require_user_page_table(state.pagemap, frame.table, frame.level, "budget-free-tables", state.owner_pid, state.reason);
+#endif
         size_t const MAX_ENTRY = frame.level == 4 ? 256 : 512;
         if (frame.next_index >= MAX_ENTRY) {
             PageTable* table = frame.table;
@@ -4025,6 +4404,10 @@ void free_user_data_pages(PageTable* table, int level, PageTable* root, const Pa
         return;
     }
 
+#ifdef WOS_SELFTEST
+    selftest_require_user_page_table(root, table, level, "free-data", owner_pid, reason);
+#endif
+
     // For user space, only process entries 0-255 at PML4 level
     const size_t MAX_ENTRY = (level == 4) ? 256 : 512;
 
@@ -4135,10 +4518,15 @@ void free_user_data_pages(PageTable* table, int level, PageTable* root, const Pa
 // level: 4=PML4, 3=PML3, 2=PML2, 1=PML1
 // vaddr_base: accumulated virtual address bits from outer levels (for diagnostics)
 void free_page_table_pages(PageTable* table, int level, DestroyRefdecBatch& page_table_refdec_batch, DestroyUserSpaceCallStats* stats,
-                           uint64_t vaddr_base = 0, FrameProbeCache* frame_probe_cache = nullptr) {
+                           uint64_t vaddr_base = 0, FrameProbeCache* frame_probe_cache = nullptr, PageTable* root = nullptr,
+                           uint64_t owner_pid = 0, const char* reason = nullptr) {
     if (table == nullptr || level < 1) {
         return;
     }
+
+#ifdef WOS_SELFTEST
+    selftest_require_user_page_table(root != nullptr ? root : table, table, level, "free-tables", owner_pid, reason);
+#endif
 
     // For user space, only process entries 0-255 at PML4 level
     const size_t MAX_ENTRY = (level == 4) ? 256 : 512;
@@ -4177,7 +4565,8 @@ void free_page_table_pages(PageTable* table, int level, DestroyRefdecBatch& page
             }
             auto* next_level = reinterpret_cast<PageTable*>(VIRT_RAW);
             entry = paging::purge_page_table_entry();
-            free_page_table_pages(next_level, level - 1, page_table_refdec_batch, stats, ENTRY_VADDR, frame_probe_cache);
+            free_page_table_pages(next_level, level - 1, page_table_refdec_batch, stats, ENTRY_VADDR, frame_probe_cache,
+                                  root != nullptr ? root : table, owner_pid, reason);
             destroy_refdec_batch_queue(page_table_refdec_batch, next_level, stats, DestroyRefdecBatchKind::PAGE_TABLE);
         } else if (level > 1 && entry.pagesize != 0) {
             note_destroy_huge_skip(stats);
@@ -4299,7 +4688,7 @@ void destroy_user_space(PageTable* pagemap, uint64_t owner_pid, const char* owne
     PageTableFrameSet page_table_frames{};
     FrameProbeCache frame_probe_cache{};
     uint64_t phase_start_us = time::get_us();
-    collect_page_table_frames(pagemap, 4, page_table_frames, &stats, &frame_probe_cache);
+    collect_page_table_frames(pagemap, 4, page_table_frames, &stats, &frame_probe_cache, pagemap, owner_pid, reason);
     stats.collect_frames_us = elapsed_us_since(phase_start_us, time::get_us());
 
     phase_start_us = time::get_us();
@@ -4311,7 +4700,7 @@ void destroy_user_space(PageTable* pagemap, uint64_t owner_pid, const char* owne
 
     phase_start_us = time::get_us();
     DestroyRefdecBatch page_table_refdec_batch{};
-    free_page_table_pages(pagemap, 4, page_table_refdec_batch, &stats, 0, &frame_probe_cache);
+    free_page_table_pages(pagemap, 4, page_table_refdec_batch, &stats, 0, &frame_probe_cache, pagemap, owner_pid, reason);
     destroy_refdec_batch_flush(page_table_refdec_batch, &stats, DestroyRefdecBatchKind::PAGE_TABLE);
     stats.free_pt_us = elapsed_us_since(phase_start_us, time::get_us());
 
@@ -4370,6 +4759,11 @@ auto deep_copy_user_pagemap_cow(PageTable* src, PageTable* dst) -> bool {
     //   2. Create the same PTE in dst (read-only + COW)
     //   3. Increment the physical page's refcount
     // Page table pages (PML3/PML2/PML1) are freshly allocated for dst.
+
+#ifdef WOS_SELFTEST
+    selftest_require_mutable_pagemap_root(src, "fork-cow-source");
+    selftest_require_mutable_pagemap_root(dst, "fork-cow-destination");
+#endif
 
     constexpr size_t USER_PML4_ENTRIES = 256;
     bool const EAGER_COPY_WRITABLE_PRIVATE = fork_eager_copy_enabled();
