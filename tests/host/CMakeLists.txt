@@ -237,6 +237,10 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/scheduler_source_test.py
 )
 add_test(
+    NAME kernel_preemption_cpu_local_audit_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/kernel_preemption_cpu_local_audit_test.py
+)
+add_test(
     NAME signal_source_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/signal_source_test.py
 )
@@ -408,6 +412,50 @@ add_test(
     NAME tmpfs_link_source_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/tmpfs_link_source_test.py
 )
+add_test(
+    NAME init_stdio_source_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/init_stdio_source_test.py
+)
+add_test(
+    NAME schedstat_probe_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/schedstat_probe_test.py
+)
+add_test(
+    NAME vfs_backend_open_flags_source_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/vfs_backend_open_flags_source_test.py
+)
+add_test(
+    NAME vfs_mkdir_source_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/vfs_mkdir_source_test.py
+)
+add_test(
+    NAME xfs_block_leaf_slot_source_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/xfs_block_leaf_slot_source_test.py
+)
+add_test(
+    NAME xfs_leaf1_layout_source_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/xfs_leaf1_layout_source_test.py
+)
+add_test(
+    NAME xfs_metadata_crc_source_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/xfs_metadata_crc_source_test.py
+)
+add_test(
+    NAME xfs_node_directory_source_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/xfs_node_directory_source_test.py
+)
+add_test(
+    NAME xfs_readdir_index_authority_source_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/xfs_readdir_index_authority_source_test.py
+)
+add_test(
+    NAME xfs_shortform_offset_source_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/xfs_shortform_offset_source_test.py
+)
+add_test(
+    NAME xfs_transaction_rollback_source_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/xfs_transaction_rollback_source_test.py
+)
 set_tests_properties(
     host_test_manifest_test
     ktest_cov_test
@@ -442,6 +490,7 @@ set_tests_properties(
     wos_memory_balance_test
     renderbench_source_test
     debugserver_source_test
+    wosdbg_interface_source_test
     sftp_timeout_source_test
     netpoll_backlog_source_test
     virtio_net_source_test
@@ -466,6 +515,7 @@ set_tests_properties(
     waitpid_source_test
     exec_source_test
     scheduler_source_test
+    kernel_preemption_cpu_local_audit_test
     signal_source_test
     usercopy_source_test
     kasan_bootstrap_source_test
@@ -509,11 +559,38 @@ set_tests_properties(
     vmem_source_test
     tmpfs_swap_source_test
     tmpfs_link_source_test
+    init_stdio_source_test
+    schedstat_probe_test
+    vfs_backend_open_flags_source_test
+    vfs_mkdir_source_test
+    xfs_block_leaf_slot_source_test
+    xfs_leaf1_layout_source_test
+    xfs_metadata_crc_source_test
+    xfs_node_directory_source_test
+    xfs_readdir_index_authority_source_test
+    xfs_shortform_offset_source_test
+    xfs_transaction_rollback_source_test
     PROPERTIES LABELS "host;source"
 )
 
 wos_add_unit_test(wki_wire_test
     SOURCES     ${CMAKE_CURRENT_SOURCE_DIR}/unit/wki_wire_test.cpp
+)
+
+wos_add_unit_test(saved_frame_class_test
+    SOURCES     ${CMAKE_CURRENT_SOURCE_DIR}/unit/saved_frame_class_test.cpp
+)
+
+wos_add_unit_test(migration_guard_test
+    SOURCES     ${CMAKE_CURRENT_SOURCE_DIR}/unit/migration_guard_test.cpp
+)
+
+wos_add_unit_test(kernel_preemption_policy_test
+    SOURCES     ${CMAKE_CURRENT_SOURCE_DIR}/unit/kernel_preemption_policy_test.cpp
+)
+
+wos_add_unit_test(kernel_vsnprintf_test
+    SOURCES     ${CMAKE_CURRENT_SOURCE_DIR}/unit/kernel_vsnprintf_test.cpp
 )
 
 wos_add_unit_test(wki_routing_test

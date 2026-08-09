@@ -129,6 +129,8 @@ UNIT_TESTS=(
     wos_memory_balance_test
     renderbench_source_test
     debugserver_source_test
+    wosdbg_interface_source_test
+    kernel_vmap_source_test
     sftp_timeout_source_test
     netpoll_backlog_source_test
     virtio_net_source_test
@@ -152,6 +154,7 @@ UNIT_TESTS=(
     waitpid_source_test
     exec_source_test
     scheduler_source_test
+    kernel_preemption_cpu_local_audit_test
     signal_source_test
     usercopy_source_test
     kasan_bootstrap_source_test
@@ -191,9 +194,25 @@ UNIT_TESTS=(
     xfs_write_source_test
     vfs_pread_source_test
     vfs_sendfile_source_test
+    vfs_pipe_source_test
     tmpfs_swap_source_test
     tmpfs_link_source_test
+    init_stdio_source_test
+    schedstat_probe_test
+    vfs_backend_open_flags_source_test
+    vfs_mkdir_source_test
+    xfs_block_leaf_slot_source_test
+    xfs_leaf1_layout_source_test
+    xfs_metadata_crc_source_test
+    xfs_node_directory_source_test
+    xfs_readdir_index_authority_source_test
+    xfs_shortform_offset_source_test
+    xfs_transaction_rollback_source_test
     wki_wire_test
+    saved_frame_class_test
+    migration_guard_test
+    kernel_preemption_policy_test
+    kernel_vsnprintf_test
     wki_routing_test
     data_struct_test
     hashtable_limit_test
