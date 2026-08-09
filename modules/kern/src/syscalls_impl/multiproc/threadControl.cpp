@@ -6,15 +6,15 @@
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <net/wki/remote_compute.hpp>
 #include <net/wki/wki.hpp>
-#include <platform/mm/addr.hpp>
-#include <platform/mm/virt.hpp>
 #include <platform/sched/epoch.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
 #include <platform/sys/context_switch.hpp>
 #include <platform/sys/signal.hpp>
+#include <platform/sys/usercopy.hpp>
 #include <vfs/vfs.hpp>
 
 #include "abi/callnums/multiproc.h"
@@ -29,6 +29,7 @@ namespace ker::syscall::multiproc {
 namespace {
 constexpr uint32_t SOFT_EXCLUSIVE_DAEMON_PENALTY = 7;
 constexpr uint64_t MLIBC_TCB_TID_OFFSET = 0x18;
+static_assert(MLIBC_TCB_TID_OFFSET + sizeof(int) <= mod::sys::signal::WOS_TCB_SIGNAL_CACHE_BYTES);
 std::atomic<uint64_t> next_thread_cpu{0};
 
 auto online_cpu_mask() -> uint64_t {
@@ -87,19 +88,22 @@ auto publish_thread_tid_to_tcb(mod::sched::task::Task* parent, uint64_t tcb_va, 
         return false;
     }
 
-    if (!mod::mm::virt::ensure_user_page_writable(parent, tcb_va + MLIBC_TCB_TID_OFFSET)) {
-        return false;
-    }
-    uint64_t const TID_PHYS = mod::mm::virt::translate(parent->pagemap, tcb_va + MLIBC_TCB_TID_OFFSET);
-    if (TID_PHYS == mod::mm::virt::PADDR_INVALID) {
+    uint64_t tid_user_addr = 0;
+    if (__builtin_add_overflow(tcb_va, MLIBC_TCB_TID_OFFSET, &tid_user_addr) ||
+        !mod::sys::usercopy::range_valid(tid_user_addr, sizeof(int))) {
         return false;
     }
 
-    uint64_t const TID_PAGE = TID_PHYS & ~0xFFFULL;
-    uint64_t const TID_OFFSET = TID_PHYS & 0xFFFULL;
-    auto* tid_ptr = reinterpret_cast<int*>(reinterpret_cast<uint64_t>(mod::mm::addr::get_virt_pointer(TID_PAGE)) + TID_OFFSET);
+    mod::sys::usercopy::StableUserPage tid_page{};
+    // THREAD_CREATE preflights the complete TCB publication range before its
+    // publication guard.  Do not fault or allocate while that mutex is held.
+    if (!mod::sys::usercopy::pin_task_user_page(*parent, tid_user_addr, true, false, tid_page)) {
+        return false;
+    }
+
+    auto* tid_ptr = static_cast<int*>(tid_page.kernel_address());
     __atomic_store_n(tid_ptr, static_cast<int>(tid), __ATOMIC_RELEASE);
-    return true;
+    return tid_page.commit_write();
 }
 }  // namespace
 
@@ -152,15 +156,19 @@ auto publish_thread_tid_to_tcb(mod::sched::task::Task* parent, uint64_t tcb_va, 
     __builtin_unreachable();
 }
 
-auto thread_control(abi::multiproc::threadControlOps op, void* arg1, void* arg2, void* arg3) -> uint64_t {
+auto thread_control(abi::multiproc::threadControlOps op, uint64_t arg1, uint64_t arg2, uint64_t arg3) -> uint64_t {
     switch (op) {
         case abi::multiproc::threadControlOps::SET_TCB: {
-            void* tcb = arg1;
-            uint64_t const RET = mod::smt::set_tcb(tcb);
-            if (RET == 0) {
-                mod::sys::signal::sync_task_signal_mask_cache(mod::sched::get_current_task());
+            auto* task = mod::sched::get_current_task();
+            if (task == nullptr || task->thread == nullptr) {
+                return static_cast<uint64_t>(-ESRCH);
             }
-            return RET;
+            if (arg1 == 0 || !mod::sys::usercopy::ensure_writable(*task, arg1, mod::sys::signal::WOS_TCB_SIGNAL_CACHE_BYTES) ||
+                !mod::sys::usercopy::copy_value_to_task(*task, arg1, arg1) ||
+                !mod::sys::signal::sync_task_signal_mask_cache_at(task, arg1)) {
+                return static_cast<uint64_t>(-EFAULT);
+            }
+            return mod::smt::set_tcb(arg1);
         }
 
         case abi::multiproc::threadControlOps::YIELD: {
@@ -180,14 +188,21 @@ auto thread_control(abi::multiproc::threadControlOps op, void* arg1, void* arg2,
             // arg4 (tid_out) is passed via the a4 register (r8); not yet exposed here -
             // the TID is returned as the syscall return value and mlibc writes it to tid_out.
             auto* parent = mod::sched::get_current_task();
-            auto tcb_va = reinterpret_cast<uint64_t>(arg1);
-            auto user_sp = reinterpret_cast<uint64_t>(arg2);
-            auto enter_va = reinterpret_cast<uint64_t>(arg3);
+            auto tcb_va = arg1;
+            auto user_sp = arg2;
+            auto enter_va = arg3;
             if (parent == nullptr || tcb_va == 0) {
                 return static_cast<uint64_t>(-EINVAL);
             }
             ker::syscall::process::exit_current_if_process_exit_requested();
-            if (!mod::mm::virt::ensure_user_page_writable(parent, tcb_va + MLIBC_TCB_TID_OFFSET)) {
+            uint64_t tid_user_addr = 0;
+            if (__builtin_add_overflow(tcb_va, MLIBC_TCB_TID_OFFSET, &tid_user_addr) ||
+                !mod::sys::usercopy::range_valid(tid_user_addr, sizeof(int)) ||
+                !mod::sys::usercopy::ensure_writable(*parent, tcb_va, mod::sys::signal::WOS_TCB_SIGNAL_CACHE_BYTES)) {
+                return static_cast<uint64_t>(-EFAULT);
+            }
+            std::array<uint64_t, 2> prepared_stack_words{};
+            if (!mod::sys::usercopy::copy_from_task(*parent, user_sp, prepared_stack_words.data(), sizeof(prepared_stack_words))) {
                 return static_cast<uint64_t>(-EFAULT);
             }
 
@@ -198,7 +213,8 @@ auto thread_control(abi::multiproc::threadControlOps op, void* arg1, void* arg2,
                 // The new thread must either clone a completed update or be visible
                 // to the next update's active-task snapshot.
                 ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;
-                auto* t = mod::sched::task::Task::create_user_thread(parent, tcb_va, user_sp, enter_va);
+                auto* t = mod::sched::task::Task::create_user_thread(parent, tcb_va, user_sp, enter_va, prepared_stack_words.at(0),
+                                                                     prepared_stack_words.at(1));
                 if (t == nullptr) {
                     return static_cast<uint64_t>(-ENOMEM);
                 }
@@ -214,7 +230,7 @@ auto thread_control(abi::multiproc::threadControlOps op, void* arg1, void* arg2,
                     mod::sched::task::destroy_unpublished_user_thread(t);
                     return static_cast<uint64_t>(-EFAULT);
                 }
-                mod::sys::signal::sync_task_signal_mask_cache(t);
+                mod::sys::signal::sync_task_signal_mask_cache_mapped(t);
 
                 bool const POSTED = mod::sched::post_task_for_cpu(TARGET_CPU, t);
                 if (!POSTED) {
@@ -244,8 +260,8 @@ auto thread_control(abi::multiproc::threadControlOps op, void* arg1, void* arg2,
         }
 
         case abi::multiproc::threadControlOps::SET_AFFINITY: {
-            auto const TID = reinterpret_cast<uint64_t>(arg1);
-            auto const MASK = reinterpret_cast<uint64_t>(arg2);
+            auto const TID = arg1;
+            auto const MASK = arg2;
 
             auto* task = mod::sched::find_task_by_pid_safe(TID);
             if (task == nullptr) {
@@ -305,7 +321,7 @@ auto thread_control(abi::multiproc::threadControlOps op, void* arg1, void* arg2,
         }
 
         case abi::multiproc::threadControlOps::GET_AFFINITY: {
-            auto const TID = reinterpret_cast<uint64_t>(arg1);
+            auto const TID = arg1;
 
             auto* task = mod::sched::find_task_by_pid_safe(TID);
             if (task == nullptr) {
@@ -333,16 +349,19 @@ auto thread_control(abi::multiproc::threadControlOps op, void* arg1, void* arg2,
 
         case abi::multiproc::threadControlOps::CREATE_DOMAIN: {
             // arg1 = ptr to struct { char name[32]; uint64_t cpu_mask; uint8_t soft_exclusive; uint8_t hard; }
-            auto* req = reinterpret_cast<uint8_t*>(arg1);
-            if (req == nullptr) {
-                return static_cast<uint64_t>(-EINVAL);
+            constexpr size_t REQUEST_SIZE = 42;
+            std::array<uint8_t, REQUEST_SIZE> request{};
+            auto* current_task = mod::sched::get_current_task();
+            if (current_task == nullptr || !mod::sys::usercopy::copy_from_task(*current_task, arg1, request.data(), request.size())) {
+                return static_cast<uint64_t>(-EFAULT);
             }
             std::array<char, 32> name{};
-            __builtin_memcpy(name.data(), req, name.size() - 1);
+            std::memcpy(name.data(), request.data(), name.size() - 1);
             name.at(31) = '\0';
-            uint64_t cpu_mask = *reinterpret_cast<uint64_t*>(req + 32);
-            bool const SOFT_EXCLUSIVE = req[40] != 0;
-            bool const HARD = req[41] != 0;
+            uint64_t cpu_mask = 0;
+            std::memcpy(&cpu_mask, request.data() + 32, sizeof(cpu_mask));
+            bool const SOFT_EXCLUSIVE = request.at(40) != 0;
+            bool const HARD = request.at(41) != 0;
             uint64_t const VALID = online_cpu_mask();
             if ((cpu_mask & VALID) == 0) {
                 return static_cast<uint64_t>(-EINVAL);
@@ -376,9 +395,9 @@ auto thread_control(abi::multiproc::threadControlOps op, void* arg1, void* arg2,
 
         case abi::multiproc::threadControlOps::SET_DOMAIN: {
             // arg1=tid, arg2=domain_id, arg3=hard (0=soft, 1=hard)
-            auto const TID = reinterpret_cast<uint64_t>(arg1);
-            auto const DOMAIN_ID = static_cast<uint32_t>(reinterpret_cast<uint64_t>(arg2));
-            bool const HARD = reinterpret_cast<uint64_t>(arg3) != 0;
+            auto const TID = arg1;
+            auto const DOMAIN_ID = static_cast<uint32_t>(arg2);
+            bool const HARD = arg3 != 0;
             auto* dom = mod::smt::get_cpu_domain(DOMAIN_ID);
             if (dom == nullptr) {
                 return static_cast<uint64_t>(-EINVAL);
@@ -413,20 +432,24 @@ auto thread_control(abi::multiproc::threadControlOps op, void* arg1, void* arg2,
 
         case abi::multiproc::threadControlOps::QUERY_DOMAIN: {
             // arg1=domain_id, arg2=ptr to struct { uint64_t cpu_mask; uint32_t cpu_loads[64]; }
-            auto const DOMAIN_ID = static_cast<uint32_t>(reinterpret_cast<uint64_t>(arg1));
-            auto* out = reinterpret_cast<uint8_t*>(arg2);
-            if (out == nullptr) {
-                return static_cast<uint64_t>(-EINVAL);
-            }
+            auto const DOMAIN_ID = static_cast<uint32_t>(arg1);
             auto* dom = mod::smt::get_cpu_domain(DOMAIN_ID);
             if (dom == nullptr) {
                 return static_cast<uint64_t>(-EINVAL);
             }
-            *reinterpret_cast<uint64_t*>(out) = dom->cpu_mask;
-            auto* loads = reinterpret_cast<uint32_t*>(out + 8);
+
+            constexpr size_t OUTPUT_SIZE = sizeof(uint64_t) + (64 * sizeof(uint32_t));
+            std::array<uint8_t, OUTPUT_SIZE> output{};
+            std::memcpy(output.data(), &dom->cpu_mask, sizeof(dom->cpu_mask));
             uint64_t const CPU_COUNT = mod::smt::get_core_count();
             for (uint64_t cpu = 0; cpu < CPU_COUNT && cpu < 64; ++cpu) {
-                loads[cpu] = ((dom->cpu_mask & (1ULL << cpu)) != 0U) ? mod::sched::get_cpu_load(cpu) : 0;
+                uint32_t const LOAD = ((dom->cpu_mask & (1ULL << cpu)) != 0U) ? mod::sched::get_cpu_load(cpu) : 0;
+                std::memcpy(output.data() + sizeof(uint64_t) + (cpu * sizeof(uint32_t)), &LOAD, sizeof(LOAD));
+            }
+
+            auto* current_task = mod::sched::get_current_task();
+            if (current_task == nullptr || !mod::sys::usercopy::copy_to_task(*current_task, arg2, output.data(), output.size())) {
+                return static_cast<uint64_t>(-EFAULT);
             }
             return 0;
         }

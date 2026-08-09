@@ -185,7 +185,7 @@ void update_thread_group_job_control(uint64_t process_pid, uint64_t session_id, 
     }
 }
 
-auto wos_proc_getgroups(size_t size, uint32_t* list) -> uint64_t {
+auto wos_proc_getgroups(size_t size, uint64_t list_addr) -> uint64_t {
     constexpr size_t GETGROUPS_SIZE_MAX = 0x7FFFFFFFU;
 
     auto* task = ker::mod::sched::get_current_task();
@@ -200,24 +200,26 @@ auto wos_proc_getgroups(size_t size, uint32_t* list) -> uint64_t {
     if (size == 0) {
         return COUNT;
     }
-    if (list == nullptr) {
+    if (list_addr == 0) {
         return static_cast<uint64_t>(-EFAULT);
     }
     if (size < COUNT) {
         return static_cast<uint64_t>(-EINVAL);
     }
 
-    auto const LIST_ADDR = reinterpret_cast<uint64_t>(list);
+    std::array<uint32_t, ker::mod::sched::task::Task::SUPPLEMENTARY_GROUPS_MAX> groups{};
     for (size_t i = 0; i < COUNT; ++i) {
-        uint32_t const GROUP = task->supplementary_groups.at(i);
-        if (!ker::mod::sys::usercopy::copy_value_to_task(*task, LIST_ADDR + (i * sizeof(uint32_t)), GROUP)) {
-            return static_cast<uint64_t>(-EFAULT);
-        }
+        groups.at(i) = task->supplementary_groups.at(i);
+    }
+    size_t const BYTES = COUNT * sizeof(groups.at(0));
+    if (!ker::mod::sys::usercopy::ensure_writable(*task, list_addr, BYTES) ||
+        !ker::mod::sys::usercopy::copy_to_task(*task, list_addr, groups.data(), BYTES)) {
+        return static_cast<uint64_t>(-EFAULT);
     }
     return COUNT;
 }
 
-auto wos_proc_setgroups(size_t size, const uint32_t* list) -> uint64_t {
+auto wos_proc_setgroups(size_t size, uint64_t list_addr) -> uint64_t {
     auto* task = ker::mod::sched::get_current_task();
     if (task == nullptr) {
         return static_cast<uint64_t>(-ESRCH);
@@ -228,18 +230,19 @@ auto wos_proc_setgroups(size_t size, const uint32_t* list) -> uint64_t {
     if (size > ker::mod::sched::task::Task::SUPPLEMENTARY_GROUPS_MAX) {
         return static_cast<uint64_t>(-EINVAL);
     }
-    if (size > 0 && list == nullptr) {
+    if (size > 0 && list_addr == 0) {
+        return static_cast<uint64_t>(-EFAULT);
+    }
+
+    std::array<uint32_t, ker::mod::sched::task::Task::SUPPLEMENTARY_GROUPS_MAX> copied_groups{};
+    size_t const BYTES = size * sizeof(copied_groups.at(0));
+    if (BYTES != 0 && !ker::mod::sys::usercopy::copy_from_task(*task, list_addr, copied_groups.data(), BYTES)) {
         return static_cast<uint64_t>(-EFAULT);
     }
 
     ker::util::SmallVec<uint32_t, ker::mod::sched::task::Task::SUPPLEMENTARY_GROUPS_MAX> groups;
-    auto const LIST_ADDR = reinterpret_cast<uint64_t>(list);
     for (size_t i = 0; i < size; ++i) {
-        uint32_t group = 0;
-        if (!ker::mod::sys::usercopy::copy_value_from_task(*task, LIST_ADDR + (i * sizeof(uint32_t)), group)) {
-            return static_cast<uint64_t>(-EFAULT);
-        }
-        if (!groups.push_back(group)) {
+        if (!groups.push_back(copied_groups.at(i))) {
             return static_cast<uint64_t>(-ENOMEM);
         }
     }
@@ -286,14 +289,14 @@ auto end_local_proc_stage(ker::mod::sched::task::Task* task, ker::mod::perf::Wki
     return ELAPSED_US;
 }
 
-inline void log_unmapped_child_resume_state(const ker::mod::sched::task::Task* parent, const ker::mod::sched::task::Task* child,
+inline void log_unmapped_child_resume_state(const ker::mod::sched::task::Task* parent, ker::mod::sched::task::Task* child,
                                             uint64_t saved_rip, uint64_t saved_rsp, uint64_t saved_flags) {
     if (child == nullptr || child->pagemap == nullptr) {
         return;
     }
 
-    const uint64_t RIP_PHYS = ker::mod::mm::virt::translate(child->pagemap, child->context.frame.rip);
-    const uint64_t RSP_PHYS = ker::mod::mm::virt::translate(child->pagemap, child->context.frame.rsp);
+    const uint64_t RIP_PHYS = ker::mod::sys::usercopy::mapped_physical_address(*child, child->context.frame.rip);
+    const uint64_t RSP_PHYS = ker::mod::sys::usercopy::mapped_physical_address(*child, child->context.frame.rsp);
     const bool RIP_BAD =
         child->context.frame.rip == 0 || child->context.frame.rip >= 0x0000800000000000ULL || RIP_PHYS == ker::mod::mm::virt::PADDR_INVALID;
     const bool RSP_BAD =
@@ -822,8 +825,7 @@ auto wos_proc_sigaltstack(const KernelStackT* ss, KernelStackT* old_ss, ker::mod
 
     uint64_t user_rsp = 0;
     asm volatile("movq %%gs:0x08, %0" : "=r"(user_rsp));
-    bool const ON_STACK = (task->sigaltstack_flags & WOS_SS_DISABLE) == 0 && task->sigaltstack_sp != 0 &&
-                          user_rsp >= task->sigaltstack_sp && user_rsp < task->sigaltstack_sp + task->sigaltstack_size;
+    bool const ON_STACK = (task->sigaltstack_flags & WOS_SS_DISABLE) == 0 && ker::mod::sys::signal::is_on_alt_stack(*task, user_rsp);
 
     if (old_ss != nullptr) {
         KernelStackT old{};
@@ -856,7 +858,12 @@ auto wos_proc_sigaltstack(const KernelStackT* ss, KernelStackT* old_ss, ker::mod
         return 0;
     }
 
-    task->sigaltstack_sp = reinterpret_cast<uint64_t>(new_ss.ss_sp);
+    uint64_t const STACK_ADDR = reinterpret_cast<uint64_t>(new_ss.ss_sp);
+    if (STACK_ADDR == 0 || !ker::mod::sys::usercopy::range_valid(STACK_ADDR, new_ss.ss_size)) {
+        return static_cast<uint64_t>(-EFAULT);
+    }
+
+    task->sigaltstack_sp = STACK_ADDR;
     task->sigaltstack_size = new_ss.ss_size;
     task->sigaltstack_flags = 0;
     return 0;
@@ -1006,6 +1013,14 @@ auto wos_proc_clone_vm(uint64_t args_addr) -> uint64_t {
         return static_cast<uint64_t>(-EFAULT);
     }
 
+    uint64_t child_fsbase = parent->thread != nullptr ? parent->thread->fsbase : 0;
+    if (args.newtls != 0) {
+        child_fsbase = args.newtls;
+    }
+    if (child_fsbase != 0 && !sys::usercopy::ensure_writable(*parent, child_fsbase, sys::signal::WOS_TCB_SIGNAL_CACHE_BYTES)) {
+        return static_cast<uint64_t>(-EFAULT);
+    }
+
     auto const KERNEL_STACK_BASE = alloc_fork_kernel_stack_with_reclaim();
     if (KERNEL_STACK_BASE == 0) {
         return static_cast<uint64_t>(-ENOMEM);
@@ -1043,6 +1058,18 @@ auto wos_proc_clone_vm(uint64_t args_addr) -> uint64_t {
     child->parent_pid = parent->pid;
     child->type = sched::task::TaskType::PROCESS;
     child->cpu = cpu::current_cpu();
+
+    // Publish user-visible TID values before the child can become runnable.
+    // A later construction failure can leave these output slots changed, but
+    // it cannot leave an unreported live child behind after returning an
+    // error. This copy is deliberately before the shared-vmem publication
+    // guard, which is a subsystem publication mutex.
+    int const CHILD_PID = static_cast<int>(child->pid);
+    if ((args.parent_tidptr != 0 && !sys::usercopy::copy_value_to_task(*parent, args.parent_tidptr, CHILD_PID)) ||
+        (args.child_tidptr != 0 && !sys::usercopy::copy_value_to_task(*parent, args.child_tidptr, CHILD_PID))) {
+        cleanup_child();
+        return static_cast<uint64_t>(-EFAULT);
+    }
 
     // Keep the shared-address-space metadata clone and scheduler publication
     // atomic with respect to mmap/munmap/mprotect propagation. Otherwise a
@@ -1106,20 +1133,13 @@ auto wos_proc_clone_vm(uint64_t args_addr) -> uint64_t {
         child_thread->tls_phys_ptr = 0;
         child_thread->stack_phys_ptr = 0;
     }
-    uint64_t fsbase = 0;
-    if (parent->thread != nullptr) {
-        fsbase = parent->thread->fsbase;
-    }
-    if (args.newtls != 0) {
-        fsbase = args.newtls;
-    }
-    child_thread->fsbase = fsbase;
+    child_thread->fsbase = child_fsbase;
     child_thread->stack = args.child_stack;
     child_thread->stack_size = 0;
     child_thread->stack_base_virt = 0;
     child_thread->stack_lowest_backed = 0;
     child->thread = child_thread;
-    ker::mod::sys::signal::sync_task_signal_mask_cache(child);
+    ker::mod::sys::signal::sync_task_signal_mask_cache_mapped(child);
 
     child->context.syscall_kernel_stack = KERNEL_RSP;
     auto* per_cpu = new cpu::PerCpu();
@@ -1154,19 +1174,6 @@ auto wos_proc_clone_vm(uint64_t args_addr) -> uint64_t {
     if (!sched::post_task_balanced(child)) {
         cleanup_child();
         return static_cast<uint64_t>(-ENOMEM);
-    }
-
-    if (args.parent_tidptr != 0) {
-        int const CHILD_PID = static_cast<int>(child->pid);
-        if (!sys::usercopy::copy_value_to_task(*parent, args.parent_tidptr, CHILD_PID)) {
-            return static_cast<uint64_t>(-EFAULT);
-        }
-    }
-    if (args.child_tidptr != 0) {
-        int const CHILD_PID = static_cast<int>(child->pid);
-        if (!sys::usercopy::copy_value_to_task(*parent, args.child_tidptr, CHILD_PID)) {
-            return static_cast<uint64_t>(-EFAULT);
-        }
     }
 
     return child->pid;
@@ -1251,7 +1258,6 @@ auto wos_proc_arch_prctl(int option, uint64_t arg2) -> uint64_t {
         case WOS_ARCH_SET_FS:
             task->thread->fsbase = arg2;
             ker::mod::cpu::wrfsbase(arg2);
-            ker::mod::sys::signal::sync_task_signal_mask_cache(task);
             return 0;
         case WOS_ARCH_GET_FS:
             if (arg2 == 0) {
@@ -1404,7 +1410,7 @@ auto wos_proc_getpriority(int which, int64_t who) -> uint64_t {
     return static_cast<uint64_t>(ENCODED_NICE);
 }
 
-auto wos_proc_setwkitarget(const char* hostname, size_t len, uint32_t flags) -> uint64_t {
+auto wos_proc_setwkitarget(uint64_t hostname_addr, size_t len, uint32_t flags) -> uint64_t {
     auto* task = ker::mod::sched::get_current_task();
     if (task == nullptr) {
         return static_cast<uint64_t>(-ESRCH);
@@ -1419,12 +1425,12 @@ auto wos_proc_setwkitarget(const char* hostname, size_t len, uint32_t flags) -> 
     if (PLACEMENT_FLAGS != 0 && (PLACEMENT_FLAGS & (PLACEMENT_FLAGS - 1U)) != 0) {
         return static_cast<uint64_t>(-EINVAL);
     }
-    if (hostname != nullptr && len != 0 &&
+    if (hostname_addr != 0 && len != 0 &&
         (flags & (ker::mod::sched::task::Task::WKI_TARGET_FLAG_LOCAL | ker::mod::sched::task::Task::WKI_TARGET_FLAG_BALANCED)) != 0) {
         return static_cast<uint64_t>(-EINVAL);
     }
 
-    if (hostname == nullptr || len == 0) {
+    if (hostname_addr == 0 || len == 0) {
         task->wki_target_hostname.front() = '\0';
         task->wki_target_flags = flags;
         return 0;
@@ -1434,35 +1440,41 @@ auto wos_proc_setwkitarget(const char* hostname, size_t len, uint32_t flags) -> 
         return static_cast<uint64_t>(-ENAMETOOLONG);
     }
 
-    if (!ker::mod::sys::usercopy::copy_from_task(*task, reinterpret_cast<uint64_t>(hostname), task->wki_target_hostname.data(), len)) {
+    ker::mod::sched::task::Task::HostnameBuffer hostname{};
+    if (!ker::mod::sys::usercopy::copy_from_task(*task, hostname_addr, hostname.data(), len)) {
         return static_cast<uint64_t>(-EFAULT);
     }
-    mutable_hostname_char(task->wki_target_hostname, len) = '\0';
+    mutable_hostname_char(hostname, len) = '\0';
+    task->wki_target_hostname = hostname;
     task->wki_target_flags = flags;
     return 0;
 }
 
-auto wos_proc_getwkitarget(char* hostname_out, size_t hostname_out_size, uint32_t* flags_out) -> uint64_t {
+auto wos_proc_getwkitarget(uint64_t hostname_out_addr, size_t hostname_out_size, uint64_t flags_out_addr) -> uint64_t {
     auto* task = ker::mod::sched::get_current_task();
     if (task == nullptr) {
         return static_cast<uint64_t>(-ESRCH);
     }
 
-    size_t const LEN = strnlen(task->wki_target_hostname.data(), task->wki_target_hostname.size());
-    if (hostname_out != nullptr) {
+    auto const HOSTNAME = task->wki_target_hostname;
+    uint32_t const FLAGS = task->wki_target_flags;
+    size_t const LEN = strnlen(HOSTNAME.data(), HOSTNAME.size());
+    if (hostname_out_addr != 0) {
         if (hostname_out_size == 0 || LEN + 1 > hostname_out_size) {
             return static_cast<uint64_t>(-ENAMETOOLONG);
         }
-        if (!ker::mod::sys::usercopy::copy_to_task(*task, reinterpret_cast<uint64_t>(hostname_out), task->wki_target_hostname.data(),
-                                                   LEN + 1)) {
+        if (!ker::mod::sys::usercopy::ensure_writable(*task, hostname_out_addr, LEN + 1)) {
             return static_cast<uint64_t>(-EFAULT);
         }
     }
-
-    if (flags_out != nullptr) {
-        if (!ker::mod::sys::usercopy::copy_value_to_task(*task, reinterpret_cast<uint64_t>(flags_out), task->wki_target_flags)) {
-            return static_cast<uint64_t>(-EFAULT);
-        }
+    if (flags_out_addr != 0 && !ker::mod::sys::usercopy::ensure_writable(*task, flags_out_addr, sizeof(FLAGS))) {
+        return static_cast<uint64_t>(-EFAULT);
+    }
+    if (hostname_out_addr != 0 && !ker::mod::sys::usercopy::copy_to_task(*task, hostname_out_addr, HOSTNAME.data(), LEN + 1)) {
+        return static_cast<uint64_t>(-EFAULT);
+    }
+    if (flags_out_addr != 0 && !ker::mod::sys::usercopy::copy_value_to_task(*task, flags_out_addr, FLAGS)) {
+        return static_cast<uint64_t>(-EFAULT);
     }
 
     return LEN;
@@ -1500,12 +1512,10 @@ auto process(abi::process::procmgmt_ops op, uint64_t a2, uint64_t a3, uint64_t a
             wos_proc_exit(static_cast<int>(a2));
             __builtin_unreachable();
         case abi::process::procmgmt_ops::EXEC: {
-            return wos_proc_exec(reinterpret_cast<const char*>(a2), reinterpret_cast<const char* const*>(a3),
-                                 reinterpret_cast<const char* const*>(a4));
+            return wos_proc_exec(a2, a3, a4);
         }
         case abi::process::procmgmt_ops::SPAWN: {
-            return wos_proc_spawn(reinterpret_cast<const char*>(a2), reinterpret_cast<const char* const*>(a3),
-                                  reinterpret_cast<const char* const*>(a4), reinterpret_cast<const abi::process::SpawnOptions*>(a5));
+            return wos_proc_spawn(a2, a3, a4, a5);
         }
         case abi::process::procmgmt_ops::WAITPID: {
             return wos_proc_waitpid(static_cast<int64_t>(a2), reinterpret_cast<int32_t*>(a3), static_cast<int32_t>(a4), a5, gpr);
@@ -1583,7 +1593,10 @@ auto process(abi::process::procmgmt_ops op, uint64_t a2, uint64_t a3, uint64_t a
             if (a2 == 0 || a3 == 0 || a4 == 0) {
                 return static_cast<uint64_t>(-EFAULT);
             }
-            if (!ker::mod::sys::usercopy::copy_value_to_task(*task, a2, task->uid) ||
+            if (!ker::mod::sys::usercopy::ensure_writable(*task, a2, sizeof(task->uid)) ||
+                !ker::mod::sys::usercopy::ensure_writable(*task, a3, sizeof(task->euid)) ||
+                !ker::mod::sys::usercopy::ensure_writable(*task, a4, sizeof(task->suid)) ||
+                !ker::mod::sys::usercopy::copy_value_to_task(*task, a2, task->uid) ||
                 !ker::mod::sys::usercopy::copy_value_to_task(*task, a3, task->euid) ||
                 !ker::mod::sys::usercopy::copy_value_to_task(*task, a4, task->suid)) {
                 return static_cast<uint64_t>(-EFAULT);
@@ -1598,7 +1611,10 @@ auto process(abi::process::procmgmt_ops op, uint64_t a2, uint64_t a3, uint64_t a
             if (a2 == 0 || a3 == 0 || a4 == 0) {
                 return static_cast<uint64_t>(-EFAULT);
             }
-            if (!ker::mod::sys::usercopy::copy_value_to_task(*task, a2, task->gid) ||
+            if (!ker::mod::sys::usercopy::ensure_writable(*task, a2, sizeof(task->gid)) ||
+                !ker::mod::sys::usercopy::ensure_writable(*task, a3, sizeof(task->egid)) ||
+                !ker::mod::sys::usercopy::ensure_writable(*task, a4, sizeof(task->sgid)) ||
+                !ker::mod::sys::usercopy::copy_value_to_task(*task, a2, task->gid) ||
                 !ker::mod::sys::usercopy::copy_value_to_task(*task, a3, task->egid) ||
                 !ker::mod::sys::usercopy::copy_value_to_task(*task, a4, task->sgid)) {
                 return static_cast<uint64_t>(-EFAULT);
@@ -1606,7 +1622,7 @@ auto process(abi::process::procmgmt_ops op, uint64_t a2, uint64_t a3, uint64_t a
             return 0;
         }
         case abi::process::procmgmt_ops::GETGROUPS: {
-            return wos_proc_getgroups(static_cast<size_t>(a2), reinterpret_cast<uint32_t*>(a3));
+            return wos_proc_getgroups(static_cast<size_t>(a2), a3);
         }
         case abi::process::procmgmt_ops::SETUID: {
             auto* task = ker::mod::sched::get_current_task();
@@ -1668,7 +1684,7 @@ auto process(abi::process::procmgmt_ops op, uint64_t a2, uint64_t a3, uint64_t a
             return static_cast<uint64_t>(-EPERM);
         }
         case abi::process::procmgmt_ops::SETGROUPS: {
-            return wos_proc_setgroups(static_cast<size_t>(a2), reinterpret_cast<const uint32_t*>(a3));
+            return wos_proc_setgroups(static_cast<size_t>(a2), a3);
         }
         case abi::process::procmgmt_ops::GETUMASK: {
             auto* task = ker::mod::sched::get_current_task();
@@ -1771,8 +1787,7 @@ auto process(abi::process::procmgmt_ops op, uint64_t a2, uint64_t a3, uint64_t a
         }
         case abi::process::procmgmt_ops::EXECVE: {
             // POSIX replace-process execve
-            return wos_proc_execve(reinterpret_cast<const char*>(a2), reinterpret_cast<const char* const*>(a3),
-                                   reinterpret_cast<const char* const*>(a4), gpr);
+            return wos_proc_execve(a2, a3, a4, gpr);
         }
         case abi::process::procmgmt_ops::GETHOSTNAME: {
             auto bufsize = static_cast<size_t>(a3);
@@ -1816,10 +1831,10 @@ auto process(abi::process::procmgmt_ops op, uint64_t a2, uint64_t a3, uint64_t a
             return wos_proc_getpriority(static_cast<int>(a2), static_cast<int64_t>(a3));
         }
         case abi::process::procmgmt_ops::SETWKITARGET: {
-            return wos_proc_setwkitarget(reinterpret_cast<const char*>(a2), static_cast<size_t>(a3), static_cast<uint32_t>(a4));
+            return wos_proc_setwkitarget(a2, static_cast<size_t>(a3), static_cast<uint32_t>(a4));
         }
         case abi::process::procmgmt_ops::GETWKITARGET: {
-            return wos_proc_getwkitarget(reinterpret_cast<char*>(a2), static_cast<size_t>(a3), reinterpret_cast<uint32_t*>(a4));
+            return wos_proc_getwkitarget(a2, static_cast<size_t>(a3), a4);
         }
         case abi::process::procmgmt_ops::PTRACE: {
             return ker::mod::debug::ptrace::sys_ptrace(static_cast<abi::ptrace::request>(a2), a3, a4, a5, gpr);

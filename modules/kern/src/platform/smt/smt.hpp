@@ -307,7 +307,9 @@ constexpr void exec_on_all_cpus(void (*func)(FuncArgs...), FuncArgs... data) {
 
 auto cpu_count() -> uint64_t;
 
-auto set_tcb(void* tcb) -> uint64_t;
+// Installs an already validated address value. User-memory initialization must
+// be completed by the syscall layer before entering this IRQ-disabled helper.
+auto set_tcb(uint64_t tcb_addr) -> uint64_t;
 
 // Permanently stop all other CPUs. This is a crash/OOM primitive: it sends NMI,
 // fixed IPI, then INIT as a one-way fallback and does not expect CPUs to resume.

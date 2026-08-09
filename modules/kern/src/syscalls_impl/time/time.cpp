@@ -10,6 +10,7 @@
 #include <platform/rtc/rtc.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
+#include <platform/sys/usercopy.hpp>
 #include <platform/tsc/tsc.hpp>
 
 #include "abi/callnums/time.h"
@@ -110,7 +111,7 @@ auto deadline_from_now_us(uint64_t sleep_us) -> uint64_t {
 
 }  // namespace
 
-uint64_t sys_time_get(uint64_t op, void* arg1, void* arg2) {
+auto sys_time_get(uint64_t op, uint64_t arg1, uint64_t arg2) -> uint64_t {
     // op 0 => gettimeofday: arg1 is struct timeval*
     // op 1 => clock_gettime: arg1 is struct timespec*
     // op 2 => nanosleep: arg1 is const struct timespec* (requested), arg2 is struct timespec* (remaining, may be null)
@@ -119,41 +120,40 @@ uint64_t sys_time_get(uint64_t op, void* arg1, void* arg2) {
     switch (static_cast<ker::abi::sys_time_ops>(op)) {
         case ker::abi::sys_time_ops::GETTIMEOFDAY: {
             // CLOCK_REALTIME: RTC wall-clock epoch + TSC monotonic offset
-            if (arg1 == nullptr) {
-                return static_cast<uint64_t>(-1);
+            auto* task = ker::mod::sched::get_current_task();
+            if (task == nullptr || arg1 == 0) {
+                return static_cast<uint64_t>(-EFAULT);
             }
             uint64_t const EPOCH_NS = ker::mod::rtc::get_epoch_ns();
-            auto* tv = reinterpret_cast<timeval*>(arg1);
-            tv->tv_sec = static_cast<long>(EPOCH_NS / 1000000000ULL);
-            tv->tv_usec = static_cast<long>((EPOCH_NS % 1000000000ULL) / 1000ULL);
-            return 0;
+            timeval tv{};
+            tv.tv_sec = static_cast<long>(EPOCH_NS / 1000000000ULL);
+            tv.tv_usec = static_cast<long>((EPOCH_NS % 1000000000ULL) / 1000ULL);
+            return ker::mod::sys::usercopy::copy_value_to_task(*task, arg1, tv) ? 0 : static_cast<uint64_t>(-EFAULT);
         }
 
         case ker::abi::sys_time_ops::CLOCK_GETTIME: {
-            if (arg1 == nullptr) {
-                return static_cast<uint64_t>(-1);
+            auto* task = ker::mod::sched::get_current_task();
+            if (task == nullptr || arg1 == 0) {
+                return static_cast<uint64_t>(-EFAULT);
             }
-            auto* ts = reinterpret_cast<struct timespec*>(arg1);
-            int const CLOCK_ID =
-                static_cast<int>(reinterpret_cast<uint64_t>(arg2));  // 0=CLOCK_REALTIME, 1=CLOCK_MONOTONIC, 3=CLOCK_THREAD_CPUTIME_ID
+            timespec ts{};
+            int const CLOCK_ID = static_cast<int>(arg2);  // 0=CLOCK_REALTIME, 1=CLOCK_MONOTONIC, 3=CLOCK_THREAD_CPUTIME_ID
             if (CLOCK_ID == 0) {
                 // CLOCK_REALTIME: RTC wall-clock epoch (includes NTP offset)
                 uint64_t const EPOCH_NS = ker::mod::rtc::get_epoch_ns();
-                ts->tv_sec = static_cast<long>(EPOCH_NS / 1000000000ULL);
-                ts->tv_nsec = static_cast<long>(EPOCH_NS % 1000000000ULL);
+                ts.tv_sec = static_cast<long>(EPOCH_NS / 1000000000ULL);
+                ts.tv_nsec = static_cast<long>(EPOCH_NS % 1000000000ULL);
             } else if (CLOCK_ID == 2) {
-                auto* task = ker::mod::sched::get_current_task();
                 uint64_t const CPU_NS = process_cpu_time_ns(task);
-                ts->tv_sec = static_cast<long>(CPU_NS / 1000000000ULL);
-                ts->tv_nsec = static_cast<long>(CPU_NS % 1000000000ULL);
+                ts.tv_sec = static_cast<long>(CPU_NS / 1000000000ULL);
+                ts.tv_nsec = static_cast<long>(CPU_NS % 1000000000ULL);
             } else if (CLOCK_ID == 3) {
                 // CLOCK_THREAD_CPUTIME_ID: kernel-tracked on-CPU time for this task.
                 // user_time_us + system_time_us are accumulated by the scheduler's
                 // timer tick handler (process_tasks) each time this task is current.
-                auto* task = ker::mod::sched::get_current_task();
                 uint64_t const CPU_NS = task_cpu_time_ns(task);
-                ts->tv_sec = static_cast<long>(CPU_NS / 1000000000ULL);
-                ts->tv_nsec = static_cast<long>(CPU_NS % 1000000000ULL);
+                ts.tv_sec = static_cast<long>(CPU_NS / 1000000000ULL);
+                ts.tv_nsec = static_cast<long>(CPU_NS % 1000000000ULL);
             } else {
                 // CLOCK_MONOTONIC (and any other id): TSC nanoseconds since boot
                 uint64_t mono_ns = 0;
@@ -162,44 +162,40 @@ uint64_t sys_time_get(uint64_t op, void* arg1, void* arg2) {
                 } else {
                     mono_ns = ker::mod::time::get_us() * 1000ULL;
                 }
-                ts->tv_sec = static_cast<long>(mono_ns / 1000000000ULL);
-                ts->tv_nsec = static_cast<long>(mono_ns % 1000000000ULL);
+                ts.tv_sec = static_cast<long>(mono_ns / 1000000000ULL);
+                ts.tv_nsec = static_cast<long>(mono_ns % 1000000000ULL);
             }
-            return 0;
+            return ker::mod::sys::usercopy::copy_value_to_task(*task, arg1, ts) ? 0 : static_cast<uint64_t>(-EFAULT);
         }
 
         case ker::abi::sys_time_ops::NANOSLEEP: {
-            if (arg1 == nullptr) {
-                return static_cast<uint64_t>(-1);
+            auto* task = ker::mod::sched::get_current_task();
+            if (task == nullptr || arg1 == 0) {
+                return static_cast<uint64_t>(-EFAULT);
             }
-            const auto* req = reinterpret_cast<const struct timespec*>(arg1);
+            timespec req{};
+            if (!ker::mod::sys::usercopy::copy_value_from_task(*task, arg1, req)) {
+                return static_cast<uint64_t>(-EFAULT);
+            }
             uint64_t sleep_us = 0;
-            if (!relative_timespec_to_us(*req, sleep_us)) {
+            if (!relative_timespec_to_us(req, sleep_us)) {
                 return static_cast<uint64_t>(-EINVAL);
             }
-            if (sleep_us > 0) {
-                auto* task = ker::mod::sched::get_current_task();
-                if (task != nullptr) {
-                    // Set wake deadline and use deferred_task_switch to properly block
-                    // (move to wait list). The timer tick wakeup scan will reschedule us
-                    // once wake_at_us is reached.
-                    task->wake_at_us = deadline_from_now_us(sleep_us);
-                    task->set_wait_channel("nanosleep");
-                    task->deferred_task_switch = true;
-                    // Return 0 now - syscall exit path sees deferred_task_switch=true,
-                    // moves task to wait list, switches to next task.
-                } else {
-                    // Pre-scheduler fallback: spin-wait
-                    uint64_t const START = ker::mod::time::get_us();
-                    while (ker::mod::time::get_us() - START < sleep_us) {
-                    }
+            if (arg2 != 0) {
+                timespec const REMAINING{};
+                if (!ker::mod::sys::usercopy::copy_value_to_task(*task, arg2, REMAINING)) {
+                    return static_cast<uint64_t>(-EFAULT);
                 }
             }
-            // Set remaining to zero
-            if (arg2 != nullptr) {
-                auto* rem = reinterpret_cast<struct timespec*>(arg2);
-                rem->tv_sec = 0;
-                rem->tv_nsec = 0;
+            if (sleep_us > 0) {
+                // Set wake deadline and use deferred_task_switch to properly block
+                // (move to wait list). The timer tick wakeup scan will reschedule us
+                // once wake_at_us is reached.
+                task->wake_at_us = deadline_from_now_us(sleep_us);
+                task->set_wait_channel("nanosleep");
+                task->deferred_task_switch = true;
+                // Return 0 now - syscall exit path sees deferred_task_switch=true,
+                // moves task to wait list, switches to next task.
             }
             return 0;
         }
@@ -210,18 +206,20 @@ uint64_t sys_time_get(uint64_t op, void* arg1, void* arg2) {
                 return static_cast<uint64_t>(-1);
             }
 
-            if (arg1 != nullptr) {
-                auto* tms = reinterpret_cast<struct tms*>(arg1);
-                tms->tms_utime = static_cast<long>(us_to_ticks(task->user_time_us));
-                tms->tms_stime = static_cast<long>(us_to_ticks(task->system_time_us));
-                tms->tms_cutime = static_cast<long>(us_to_ticks(task->child_user_time_us));
-                tms->tms_cstime = static_cast<long>(us_to_ticks(task->child_system_time_us));
+            if ((arg1 != 0 && !ker::mod::sys::usercopy::ensure_writable(*task, arg1, sizeof(tms))) ||
+                (arg2 != 0 && !ker::mod::sys::usercopy::ensure_writable(*task, arg2, sizeof(clock_t)))) {
+                return static_cast<uint64_t>(-EFAULT);
             }
 
-            // Return value: elapsed real time in ticks since an arbitrary epoch (system boot)
-            if (arg2 != nullptr) {
-                auto* out = reinterpret_cast<long*>(arg2);
-                *out = static_cast<long>(us_to_ticks(ker::mod::time::get_us()));
+            tms process_times{};
+            process_times.tms_utime = static_cast<clock_t>(us_to_ticks(task->user_time_us));
+            process_times.tms_stime = static_cast<clock_t>(us_to_ticks(task->system_time_us));
+            process_times.tms_cutime = static_cast<clock_t>(us_to_ticks(task->child_user_time_us));
+            process_times.tms_cstime = static_cast<clock_t>(us_to_ticks(task->child_system_time_us));
+            auto const ELAPSED = static_cast<clock_t>(us_to_ticks(ker::mod::time::get_us()));
+            if ((arg1 != 0 && !ker::mod::sys::usercopy::copy_value_to_task(*task, arg1, process_times)) ||
+                (arg2 != 0 && !ker::mod::sys::usercopy::copy_value_to_task(*task, arg2, ELAPSED))) {
+                return static_cast<uint64_t>(-EFAULT);
             }
             return 0;
         }
@@ -235,19 +233,23 @@ uint64_t sys_time_get(uint64_t op, void* arg1, void* arg2) {
                 return static_cast<uint64_t>(-ESRCH);
             }
 
-            int const WHICH = static_cast<int>(reinterpret_cast<uintptr_t>(arg1));
+            int const WHICH = static_cast<int>(arg1);
             if (WHICH != ITIMER_REAL) {
                 return static_cast<uint64_t>(-EINVAL);
             }
 
-            const auto* nv = reinterpret_cast<const Itimerval*>(arg2);
-            if (nv == nullptr) {
+            if (arg2 == 0) {
+                return static_cast<uint64_t>(-EFAULT);
+            }
+            Itimerval new_value{};
+            if (!ker::mod::sys::usercopy::copy_value_from_task(*task, arg2, new_value)) {
                 return static_cast<uint64_t>(-EFAULT);
             }
 
             uint64_t new_val_us = 0;
             uint64_t new_interval_us = 0;
-            if (!relative_timeval_to_us(nv->it_value, new_val_us) || !relative_timeval_to_us(nv->it_interval, new_interval_us)) {
+            if (!relative_timeval_to_us(new_value.it_value, new_val_us) ||
+                !relative_timeval_to_us(new_value.it_interval, new_interval_us)) {
                 return static_cast<uint64_t>(-EINVAL);
             }
 
@@ -269,13 +271,12 @@ uint64_t sys_time_get(uint64_t op, void* arg1, void* arg2) {
                 return static_cast<uint64_t>(-ESRCH);
             }
 
-            int const WHICH = static_cast<int>(reinterpret_cast<uintptr_t>(arg1));
+            int const WHICH = static_cast<int>(arg1);
             if (WHICH != ITIMER_REAL) {
                 return static_cast<uint64_t>(-EINVAL);
             }
 
-            auto* cv = reinterpret_cast<Itimerval*>(arg2);
-            if (cv == nullptr) {
+            if (arg2 == 0) {
                 return static_cast<uint64_t>(-EFAULT);
             }
 
@@ -285,11 +286,12 @@ uint64_t sys_time_get(uint64_t op, void* arg1, void* arg2) {
                 remain_us = task->itimer_real_expire_us - NOW_US;
             }
 
-            cv->it_value.tv_sec = static_cast<long>(remain_us / 1000000ULL);
-            cv->it_value.tv_usec = static_cast<long>(remain_us % 1000000ULL);
-            cv->it_interval.tv_sec = static_cast<long>(task->itimer_real_interval_us / 1000000ULL);
-            cv->it_interval.tv_usec = static_cast<long>(task->itimer_real_interval_us % 1000000ULL);
-            return 0;
+            Itimerval current_value{};
+            current_value.it_value.tv_sec = static_cast<long>(remain_us / 1000000ULL);
+            current_value.it_value.tv_usec = static_cast<long>(remain_us % 1000000ULL);
+            current_value.it_interval.tv_sec = static_cast<long>(task->itimer_real_interval_us / 1000000ULL);
+            current_value.it_interval.tv_usec = static_cast<long>(task->itimer_real_interval_us % 1000000ULL);
+            return ker::mod::sys::usercopy::copy_value_to_task(*task, arg2, current_value) ? 0 : static_cast<uint64_t>(-EFAULT);
         }
 
         default:

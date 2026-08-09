@@ -72,23 +72,20 @@ extern "C" auto syscall_handler(cpu::GPRegs* regs) -> uint64_t {
     uint64_t result = 0;
     switch (callnum) {
         case abi::callnums::SYS_LOG:
-            result = ker::syscall::log::sys_log(static_cast<abi::sys_log::sys_log_ops>(A1), reinterpret_cast<const char*>(A2), A3, A4,
-                                                reinterpret_cast<const char*>(A5), A6);
+            result = ker::syscall::log::sys_log(static_cast<abi::sys_log::sys_log_ops>(A1), A2, A3, A4, A5, A6);
             break;
         case abi::callnums::FUTEX:
             result = ker::syscall::futex::sys_futex(A1, A2, A3, A4);
             break;
         case abi::callnums::THREADING:
             if (A1 >= 0x100) {
-                result =
-                    ker::syscall::multiproc::thread_control(static_cast<abi::multiproc::threadControlOps>(A1), reinterpret_cast<void*>(A2),
-                                                            reinterpret_cast<void*>(A3), reinterpret_cast<void*>(A4));
+                result = ker::syscall::multiproc::thread_control(static_cast<abi::multiproc::threadControlOps>(A1), A2, A3, A4);
             } else {
                 result = ker::syscall::multiproc::thread_info(static_cast<abi::multiproc::threadInfoOps>(A1));
             }
             break;
         case abi::callnums::TIME:
-            result = ker::syscall::time::sys_time_get(A1, reinterpret_cast<void*>(A2), reinterpret_cast<void*>(A3));
+            result = ker::syscall::time::sys_time_get(A1, A2, A3);
             break;
         case abi::callnums::VFS:
             result = ker::syscall::vfs::sys_vfs(A1, A2, A3, A4, A5, A6);

@@ -10,6 +10,7 @@
 #include <platform/mm/phys.hpp>
 #include <platform/mm/virt.hpp>
 #include <platform/smt/smt.hpp>
+#include <platform/sys/usercopy.hpp>
 #include <span>
 #include <test/ktest.hpp>
 
@@ -20,6 +21,7 @@ namespace paging = ker::mod::mm::paging;
 namespace smt = ker::mod::smt;
 namespace virt = ker::mod::mm::virt;
 namespace mm = ker::mod::mm;
+namespace usercopy = ker::mod::sys::usercopy;
 
 namespace {
 
@@ -293,6 +295,221 @@ KTEST(MM, OwnedFrameTrackingMapUnmapPrivateNormalPage) {
     virt::release_pagemap(root);
 }
 
+KTEST(MM, UserPagePinSurvivesUnmapAndRejectsUnsafeLeaves) {
+    constexpr uint64_t WRITABLE_VADDR = 0x44000000ULL;
+    constexpr uint64_t READONLY_VADDR = WRITABLE_VADDR + paging::PAGE_SIZE;
+    constexpr uint64_t SUPERVISOR_VADDR = READONLY_VADDR + paging::PAGE_SIZE;
+
+    auto* root = virt::create_pagemap();
+    KREQUIRE_NE(root, nullptr);
+    void* writable = alloc_test_pages();
+    void* readonly = alloc_test_pages();
+    void* supervisor = alloc_test_pages();
+    KREQUIRE_NE(writable, nullptr);
+    KREQUIRE_NE(readonly, nullptr);
+    KREQUIRE_NE(supervisor, nullptr);
+
+    virt::map_page(root, WRITABLE_VADDR, phys_addr_of(writable), paging::page_types::USER);
+    virt::map_page(root, READONLY_VADDR, phys_addr_of(readonly), paging::page_types::USER_READONLY);
+    virt::map_page(root, SUPERVISOR_VADDR, phys_addr_of(supervisor), paging::page_types::KERNEL);
+
+    virt::UserPagePin pin{};
+    KREQUIRE_TRUE(virt::pin_user_page(root, WRITABLE_VADDR, true, pin));
+    KEXPECT_EQ(phys::page_ref_get(writable), 2U);
+    virt::unmap_page(root, WRITABLE_VADDR);
+    KEXPECT_EQ(phys::page_ref_get(writable), 1U);
+    KEXPECT_FALSE(virt::user_page_pin_still_mapped(pin));
+    static_cast<uint8_t*>(pin.hhdm_page)[0] = 0xA5;
+    KEXPECT_EQ(static_cast<uint8_t*>(pin.hhdm_page)[0], 0xA5);
+    virt::unpin_user_page(pin);
+    KEXPECT_EQ(phys::page_ref_get(writable), 0U);
+
+    KREQUIRE_TRUE(virt::pin_user_page(root, READONLY_VADDR, false, pin));
+    virt::unpin_user_page(pin);
+    KEXPECT_FALSE(virt::pin_user_page(root, READONLY_VADDR, true, pin));
+    KEXPECT_FALSE(virt::pin_user_page(root, SUPERVISOR_VADDR, false, pin));
+
+    virt::unmap_page(root, READONLY_VADDR);
+    virt::unmap_page(root, SUPERVISOR_VADDR);
+    virt::destroy_user_space(root, 0, "mm_ktest", "user-page-pin");
+    virt::release_pagemap(root);
+}
+
+KTEST(MM, UsercopyMappedPinFailsClosedDuringPagemapExclusiveMutation) {
+    auto* root = virt::create_pagemap();
+    KREQUIRE_NE(root, nullptr);
+    KEXPECT_TRUE(virt::selftest_user_pagemap_exclusive_rejects_mapped_pin(root));
+    virt::release_pagemap(root);
+}
+
+KTEST(MM, UsercopyCrossPageProgressIsStableAndBounded) {
+    constexpr uint64_t FIRST_VADDR = 0x45000000ULL;
+    constexpr uint64_t SECOND_VADDR = FIRST_VADDR + paging::PAGE_SIZE;
+    constexpr size_t HALF = 4;
+
+    auto* root = virt::create_pagemap();
+    KREQUIRE_NE(root, nullptr);
+    auto* first = static_cast<uint8_t*>(alloc_test_pages());
+    auto* second = static_cast<uint8_t*>(alloc_test_pages());
+    KREQUIRE_NE(first, nullptr);
+    KREQUIRE_NE(second, nullptr);
+    std::memset(first, 0x11, paging::PAGE_SIZE);
+    std::memset(second, 0x22, paging::PAGE_SIZE);
+    virt::map_page(root, FIRST_VADDR, phys_addr_of(first), paging::page_types::USER);
+    virt::map_page(root, SECOND_VADDR, phys_addr_of(second), paging::page_types::USER);
+
+    ker::mod::sched::task::Task task{};
+    task.type = ker::mod::sched::task::TaskType::PROCESS;
+    task.pagemap = root;
+
+    std::array<uint8_t, HALF * 2> kernel_buffer{};
+    auto read = usercopy::copy_from_task_partial(task, SECOND_VADDR - HALF, kernel_buffer.data(), kernel_buffer.size());
+    KEXPECT_TRUE(read.complete(kernel_buffer.size()));
+    for (size_t i = 0; i < HALF; ++i) {
+        KEXPECT_EQ(kernel_buffer.at(i), 0x11);
+        KEXPECT_EQ(kernel_buffer.at(HALF + i), 0x22);
+    }
+
+    kernel_buffer.fill(0x5A);
+    auto write = usercopy::copy_to_task_partial(task, SECOND_VADDR - HALF, kernel_buffer.data(), kernel_buffer.size());
+    KEXPECT_TRUE(write.complete(kernel_buffer.size()));
+    KEXPECT_EQ(first[paging::PAGE_SIZE - 1], 0x5A);
+    KEXPECT_EQ(second[0], 0x5A);
+    virt::UserPagePin dirty_pin{};
+    KREQUIRE_TRUE(virt::pin_user_page(root, FIRST_VADDR, false, dirty_pin));
+    KEXPECT_TRUE(dirty_pin.dirty);
+    virt::unpin_user_page(dirty_pin);
+    KREQUIRE_TRUE(virt::pin_user_page(root, SECOND_VADDR, false, dirty_pin));
+    KEXPECT_TRUE(dirty_pin.dirty);
+    virt::unpin_user_page(dirty_pin);
+
+    virt::unmap_page(root, SECOND_VADDR);
+    kernel_buffer.fill(0);
+    read = usercopy::copy_from_task_partial(task, SECOND_VADDR - HALF, kernel_buffer.data(), kernel_buffer.size());
+    KEXPECT_TRUE(read.fault);
+    KEXPECT_EQ(read.bytes_copied, HALF);
+    write = usercopy::copy_to_task_partial(task, SECOND_VADDR - HALF, kernel_buffer.data(), kernel_buffer.size());
+    KEXPECT_TRUE(write.fault);
+    KEXPECT_EQ(write.bytes_copied, HALF);
+
+    virt::unmap_page(root, FIRST_VADDR);
+    KEXPECT_EQ(task.detach_pagemap_after_usercopy_quiescence(), root);
+    virt::destroy_user_space(root, 0, "mm_ktest", "usercopy-cross-page");
+    virt::release_pagemap(root);
+}
+
+KTEST(MM, UsercopyRejectsInvalidUnmappedAndReadonlyRanges) {
+    constexpr uint64_t READONLY_VADDR = 0x46000000ULL;
+    constexpr uint64_t UNMAPPED_VADDR = READONLY_VADDR + paging::PAGE_SIZE;
+    constexpr uint64_t USER_LIMIT = usercopy::USER_ADDR_LIMIT;
+
+    auto* root = virt::create_pagemap();
+    KREQUIRE_NE(root, nullptr);
+    auto* readonly = static_cast<uint8_t*>(alloc_test_pages());
+    KREQUIRE_NE(readonly, nullptr);
+    readonly[0] = 0x7C;
+    virt::map_page(root, READONLY_VADDR, phys_addr_of(readonly), paging::page_types::USER_READONLY);
+
+    ker::mod::sched::task::Task task{};
+    task.type = ker::mod::sched::task::TaskType::PROCESS;
+    task.pagemap = root;
+
+    uint8_t kernel_byte = 0;
+    uint8_t const replacement = 0xD3;
+    KEXPECT_FALSE(usercopy::copy_from_task(task, 0, &kernel_byte, sizeof(kernel_byte)));
+    KEXPECT_FALSE(usercopy::copy_to_task(task, 0, &replacement, sizeof(replacement)));
+    KEXPECT_FALSE(usercopy::copy_from_task(task, USER_LIMIT, &kernel_byte, sizeof(kernel_byte)));
+    KEXPECT_FALSE(usercopy::copy_to_task(task, USER_LIMIT, &replacement, sizeof(replacement)));
+    KEXPECT_FALSE(usercopy::copy_from_task(task, UINT64_MAX - 1, &kernel_byte, 4));
+    KEXPECT_FALSE(usercopy::copy_to_task(task, UINT64_MAX - 1, &replacement, 4));
+    KEXPECT_FALSE(usercopy::copy_from_task(task, UNMAPPED_VADDR, &kernel_byte, sizeof(kernel_byte)));
+    KEXPECT_FALSE(usercopy::copy_to_task(task, UNMAPPED_VADDR, &replacement, sizeof(replacement)));
+    KEXPECT_TRUE(usercopy::copy_from_task(task, READONLY_VADDR, &kernel_byte, sizeof(kernel_byte)));
+    KEXPECT_EQ(kernel_byte, 0x7C);
+    KEXPECT_FALSE(usercopy::copy_to_task(task, READONLY_VADDR, &replacement, sizeof(replacement)));
+    KEXPECT_EQ(readonly[0], 0x7C);
+    KEXPECT_TRUE(usercopy::copy_from_task(task, 0, nullptr, 0));
+    KEXPECT_TRUE(usercopy::copy_to_task(task, 0, nullptr, 0));
+
+    virt::unmap_page(root, READONLY_VADDR);
+    KEXPECT_EQ(task.detach_pagemap_after_usercopy_quiescence(), root);
+    virt::destroy_user_space(root, 0, "mm_ktest", "usercopy-invalid-ranges");
+    virt::release_pagemap(root);
+}
+
+KTEST(MM, UsercopyMaterializesLazyAnonymousPages) {
+    constexpr uint64_t LAZY_VADDR = 0x47000000ULL;
+
+    auto* root = virt::create_pagemap();
+    KREQUIRE_NE(root, nullptr);
+    virt::reserve_page_range(root, LAZY_VADDR, 1);
+
+    ker::mod::sched::task::Task task{};
+    task.type = ker::mod::sched::task::TaskType::PROCESS;
+    task.pagemap = root;
+    ker::mod::sched::task::LazyVmemRange const range{
+        .start = LAZY_VADDR,
+        .end = LAZY_VADDR + paging::PAGE_SIZE,
+        .prot = 0x3,
+        .flags = 0x20,
+    };
+    KREQUIRE_TRUE(task.lazy_vmem_ranges.push_back(range));
+
+    std::array<uint8_t, 8> input{0x10, 0x21, 0x32, 0x43, 0x54, 0x65, 0x76, 0x87};
+    std::array<uint8_t, 8> output{};
+    KEXPECT_TRUE(virt::is_page_reserved(root, LAZY_VADDR));
+    KEXPECT_FALSE(usercopy::copy_from_task_mapped(task, LAZY_VADDR, output.data(), output.size()));
+    KREQUIRE_TRUE(usercopy::copy_to_task(task, LAZY_VADDR, input.data(), input.size()));
+    KEXPECT_TRUE(virt::is_page_mapped(root, LAZY_VADDR));
+    KEXPECT_TRUE(usercopy::copy_from_task(task, LAZY_VADDR, output.data(), output.size()));
+    for (size_t i = 0; i < input.size(); ++i) {
+        KEXPECT_EQ(output.at(i), input.at(i));
+    }
+
+    ker::mod::sched::task::release_lazy_vmem_ranges(task);
+    KEXPECT_EQ(task.detach_pagemap_after_usercopy_quiescence(), root);
+    virt::destroy_user_space(root, 0, "mm_ktest", "usercopy-lazy");
+    virt::release_pagemap(root);
+}
+
+KTEST(MM, UsercopyCopyoutResolvesCowWithoutMutatingPeer) {
+    constexpr uint64_t COW_VADDR = 0x48000000ULL;
+
+    auto* parent_root = virt::create_pagemap();
+    auto* child_root = virt::create_pagemap();
+    KREQUIRE_NE(parent_root, nullptr);
+    KREQUIRE_NE(child_root, nullptr);
+    auto* original = static_cast<uint8_t*>(alloc_test_pages());
+    KREQUIRE_NE(original, nullptr);
+    std::memset(original, 0x39, paging::PAGE_SIZE);
+    virt::map_page(parent_root, COW_VADDR, phys_addr_of(original), paging::page_types::USER);
+    KREQUIRE_TRUE(virt::deep_copy_user_pagemap_cow(parent_root, child_root));
+
+    ker::mod::sched::task::Task parent{};
+    parent.type = ker::mod::sched::task::TaskType::PROCESS;
+    parent.pagemap = parent_root;
+    std::array<uint8_t, 4> const replacement{0xA1, 0xB2, 0xC3, 0xD4};
+    KREQUIRE_TRUE(usercopy::copy_to_task(parent, COW_VADDR, replacement.data(), replacement.size()));
+
+    uint64_t const PARENT_PHYS = virt::translate(parent_root, COW_VADDR);
+    uint64_t const CHILD_PHYS = virt::translate(child_root, COW_VADDR);
+    KEXPECT_NE(PARENT_PHYS, virt::PADDR_INVALID);
+    KEXPECT_NE(CHILD_PHYS, virt::PADDR_INVALID);
+    KEXPECT_NE(PARENT_PHYS, CHILD_PHYS);
+    auto const* parent_bytes = reinterpret_cast<const uint8_t*>(addr::get_virt_pointer(PARENT_PHYS));
+    auto const* child_bytes = reinterpret_cast<const uint8_t*>(addr::get_virt_pointer(CHILD_PHYS));
+    for (size_t i = 0; i < replacement.size(); ++i) {
+        KEXPECT_EQ(parent_bytes[i], replacement.at(i));
+        KEXPECT_EQ(child_bytes[i], 0x39);
+    }
+
+    KEXPECT_EQ(parent.detach_pagemap_after_usercopy_quiescence(), parent_root);
+    virt::destroy_user_space(parent_root, 0, "mm_ktest", "usercopy-cow-parent");
+    virt::release_pagemap(parent_root);
+    virt::destroy_user_space(child_root, 0, "mm_ktest", "usercopy-cow-child");
+    virt::release_pagemap(child_root);
+}
+
 KTEST(MM, ReplacingPresentMappingReleasesDisplacedExecutablePage) {
     constexpr uint64_t TEST_VADDR = 0x41000000ULL;
     size_t const OWNER_IDX = static_cast<size_t>(mm::PhysicalPageOwner::USER_EXECUTABLE_MAPPING);
@@ -481,6 +698,18 @@ KTEST(MM, RefCountBasic) {
     KEXPECT_EQ(REMAINING, 1U);
     // Final free
     phys::page_free(page);
+}
+
+KTEST(MM, RefCountTryIncPinsOnlyLivePages) {
+    void* page = alloc_test_pages();
+    KREQUIRE_NE(page, nullptr);
+
+    phys::PageLookupHint hint{};
+    KEXPECT_TRUE(phys::page_ref_try_inc(page, &hint));
+    KEXPECT_EQ(phys::page_ref_get(page, &hint), 2U);
+    KEXPECT_EQ(phys::page_ref_dec(page, &hint), 1U);
+    KEXPECT_EQ(phys::page_ref_dec(page, &hint), 0U);
+    KEXPECT_FALSE(phys::page_ref_try_inc(page, &hint));
 }
 
 KTEST(MM, RefCountDecWithLookupHint) {

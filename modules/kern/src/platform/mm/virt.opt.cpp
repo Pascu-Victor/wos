@@ -52,6 +52,102 @@ constexpr uint64_t LARGE_PAGE_1G_BYTES = LARGE_PAGE_2M_BYTES * paging::PAGE_TABL
 constexpr uint64_t PTE_FRAME_MASK = 0x000FFFFFFFFFF000ULL;
 
 sys::Spinlock cow_pte_lock;
+// Serializes leaf publication/removal with usercopy frame pin acquisition.
+// Never hold this across allocation, fault resolution, memcpy, or shootdown.
+sys::Spinlock user_mapping_pin_lock;
+
+// Page-table roots are shared by user threads and CLONE_VM tasks, so a Task's
+// local close flag alone cannot protect the tree from last-publisher teardown.
+// A striped read/exclusive gate keeps the bounded usercopy hot path allocation
+// free. Safe faulting callers may wait for an unrelated colliding teardown;
+// mapped-only IRQ/scheduler callers fail closed instead.
+constexpr size_t USER_PAGEMAP_ACCESS_GATE_COUNT = 4096;
+constexpr size_t USER_PAGEMAP_ACCESS_GATE_NONE = static_cast<size_t>(-1);
+static_assert((USER_PAGEMAP_ACCESS_GATE_COUNT & (USER_PAGEMAP_ACCESS_GATE_COUNT - 1U)) == 0);
+struct alignas(64) UserPagemapAccessGate {
+    std::atomic<uint32_t> readers{0};
+    std::atomic<bool> teardown{false};
+};
+std::array<UserPagemapAccessGate, USER_PAGEMAP_ACCESS_GATE_COUNT> user_pagemap_access_gates{};
+
+[[nodiscard]] auto user_pagemap_access_gate_index(PageTable* pagemap) -> size_t {
+    return (reinterpret_cast<uintptr_t>(pagemap) >> 12U) & (USER_PAGEMAP_ACCESS_GATE_COUNT - 1U);
+}
+
+[[nodiscard]] auto acquire_user_pagemap_access(PageTable* pagemap, bool wait_for_teardown, size_t& gate_index) -> bool {
+    gate_index = USER_PAGEMAP_ACCESS_GATE_NONE;
+    if (pagemap == nullptr) {
+        return false;
+    }
+
+    size_t const INDEX = user_pagemap_access_gate_index(pagemap);
+    auto& gate = user_pagemap_access_gates.at(INDEX);
+    for (;;) {
+        while (gate.teardown.load(std::memory_order_acquire)) {
+            if (!wait_for_teardown) {
+                return false;
+            }
+            asm volatile("pause" ::: "memory");
+        }
+
+        uint32_t readers = gate.readers.load(std::memory_order_acquire);
+        while (readers != UINT32_MAX) {
+            if (gate.readers.compare_exchange_weak(readers, readers + 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
+                break;
+            }
+        }
+        if (readers == UINT32_MAX) {
+            return false;
+        }
+
+        if (!gate.teardown.load(std::memory_order_acquire)) {
+            gate_index = INDEX;
+            return true;
+        }
+        gate.readers.fetch_sub(1, std::memory_order_acq_rel);
+        if (!wait_for_teardown) {
+            return false;
+        }
+    }
+}
+
+void release_user_pagemap_access(size_t gate_index) {
+    if (gate_index != USER_PAGEMAP_ACCESS_GATE_NONE) {
+        user_pagemap_access_gates.at(gate_index).readers.fetch_sub(1, std::memory_order_acq_rel);
+    }
+}
+
+[[nodiscard]] auto begin_user_pagemap_exclusive(PageTable* pagemap) -> size_t {
+    size_t const INDEX = user_pagemap_access_gate_index(pagemap);
+    auto& gate = user_pagemap_access_gates.at(INDEX);
+    bool expected = false;
+    while (!gate.teardown.compare_exchange_weak(expected, true, std::memory_order_acq_rel, std::memory_order_acquire)) {
+        expected = false;
+        asm volatile("pause" ::: "memory");
+    }
+    while (gate.readers.load(std::memory_order_acquire) != 0) {
+        asm volatile("pause" ::: "memory");
+    }
+    return INDEX;
+}
+
+void end_user_pagemap_exclusive(size_t gate_index) {
+    user_pagemap_access_gates.at(gate_index).teardown.store(false, std::memory_order_release);
+}
+
+class UserPagemapExclusiveScope {
+   public:
+    explicit UserPagemapExclusiveScope(PageTable* pagemap) : gate_index(begin_user_pagemap_exclusive(pagemap)) {}
+    ~UserPagemapExclusiveScope() { end_user_pagemap_exclusive(gate_index); }
+
+    UserPagemapExclusiveScope(const UserPagemapExclusiveScope&) = delete;
+    UserPagemapExclusiveScope(UserPagemapExclusiveScope&&) = delete;
+    auto operator=(const UserPagemapExclusiveScope&) -> UserPagemapExclusiveScope& = delete;
+    auto operator=(UserPagemapExclusiveScope&&) -> UserPagemapExclusiveScope& = delete;
+
+   private:
+    size_t gate_index;
+};
 
 void invalidate_local_tlb_if_current(PageTable* pagemap, vaddr_t vaddr, bool reload_cr3);
 
@@ -1565,6 +1661,44 @@ auto user_page_writable_now_impl(PageTable* pagemap, vaddr_t vaddr) -> bool {
     return user_copy_writable_entry(entry);
 }
 
+auto snapshot_user_page_mapping_locked(PageTable* pagemap, vaddr_t vaddr, bool require_writable, paddr_t& physical_page,
+                                       bool* dirty = nullptr) -> bool {
+    physical_page = PADDR_INVALID;
+    if (dirty != nullptr) {
+        *dirty = false;
+    }
+    if (pagemap == nullptr || vaddr >= 0x0000800000000000ULL) {
+        return false;
+    }
+
+    PageTable const* table = pagemap;
+    for (int level = 4; level > 1; --level) {
+        PageTableEntry const& entry = entry_at(table, index_of(vaddr, level));
+        uint64_t const RAW = pte_raw(entry);
+        if (entry.present == 0 || entry.user == 0 || (require_writable && (entry.writable == 0 || (RAW & paging::PAGE_COW) != 0U))) {
+            return false;
+        }
+        // The physical allocator cannot currently pin a sub-page of a huge
+        // leaf independently, so fail closed instead of guessing ownership.
+        if (level < 4 && entry.pagesize != 0) {
+            return false;
+        }
+        table = reinterpret_cast<PageTable const*>(addr::get_virt_pointer(entry.frame << paging::PAGE_SHIFT));
+    }
+
+    PageTableEntry const& entry = entry_at(table, index_of(vaddr, 1));
+    uint64_t const RAW = pte_raw(entry);
+    if (entry.present == 0 || entry.user == 0 || (require_writable && (entry.writable == 0 || (RAW & paging::PAGE_COW) != 0U))) {
+        return false;
+    }
+
+    physical_page = static_cast<paddr_t>(entry.frame) << paging::PAGE_SHIFT;
+    if (dirty != nullptr) {
+        *dirty = entry.dirty != 0;
+    }
+    return true;
+}
+
 void drop_present_leaf_ref(const PageTableEntry& entry) {
     if (entry.present == 0 || entry.frame == 0) {
         return;
@@ -1655,8 +1789,12 @@ auto resolve_user_write_mapping(sched::task::Task* task, vaddr_t vaddr) -> UserW
         }
 
         uint64_t raw = pte_raw(pte);
-        bool const SYNTHETIC_ANON_COW = (raw & (paging::PAGE_COW | paging::PAGE_WRITE)) == 0U && (raw & paging::PAGE_USER) != 0U &&
-                                        writable_anonymous_range_contains(task, VADDR);
+        bool const WRITABLE_ANON_RANGE = (raw & (paging::PAGE_COW | paging::PAGE_WRITE)) == 0U && (raw & paging::PAGE_USER) != 0U &&
+                                         writable_anonymous_range_contains(task, VADDR);
+        uint64_t const PIN_LOCK_FLAGS = user_mapping_pin_lock.lock_irqsave();
+        raw = pte_raw(pte);
+        bool const SYNTHETIC_ANON_COW =
+            (raw & (paging::PAGE_COW | paging::PAGE_WRITE)) == 0U && (raw & paging::PAGE_USER) != 0U && WRITABLE_ANON_RANGE;
         if (SYNTHETIC_ANON_COW) {
             owned_frame_untrack_leaf(PAGEMAP, VADDR, pte);
             raw |= paging::PAGE_COW;
@@ -1665,11 +1803,13 @@ auto resolve_user_write_mapping(sched::task::Task* task, vaddr_t vaddr) -> UserW
 
         if ((raw & paging::PAGE_COW) == 0U) {
             if ((raw & paging::PAGE_WRITE) == 0U || (raw & paging::PAGE_USER) == 0U) {
+                user_mapping_pin_lock.unlock_irqrestore(PIN_LOCK_FLAGS);
                 cow_pte_lock.unlock_irqrestore(LOCK_FLAGS);
                 return UserWriteFaultStatus::NOT_WRITABLE;
             }
 
             bool const PATH_PROMOTED = promote_user_write_path(pml4e, pml3e, pml2e);
+            user_mapping_pin_lock.unlock_irqrestore(PIN_LOCK_FLAGS);
             cow_pte_lock.unlock_irqrestore(LOCK_FLAGS);
             flush_pagemap_after_update(PAGEMAP, VADDR, PATH_PROMOTED);
             return UserWriteFaultStatus::HANDLED;
@@ -1694,6 +1834,7 @@ auto resolve_user_write_mapping(sched::task::Task* task, vaddr_t vaddr) -> UserW
             raw |= paging::PAGE_WRITE;
             pte = pte_from_raw(raw);
             owned_frame_track_private_mapping(PAGEMAP, VADDR, old_phys, raw);
+            user_mapping_pin_lock.unlock_irqrestore(PIN_LOCK_FLAGS);
             cow_pte_lock.unlock_irqrestore(LOCK_FLAGS);
             flush_pagemap_after_update(PAGEMAP, VADDR, initial_path_promoted);
             record_cow_perf_event(task, cow_op, VADDR, refcount, cow_started_us);
@@ -1704,6 +1845,7 @@ auto resolve_user_write_mapping(sched::task::Task* task, vaddr_t vaddr) -> UserW
         // PTE reference exists. Allocation and memcpy below intentionally run
         // outside the lock; the commit path rechecks the same frame under lock.
         phys::page_ref_inc(old_virt, &cow_lookup);
+        user_mapping_pin_lock.unlock_irqrestore(PIN_LOCK_FLAGS);
         cow_pte_lock.unlock_irqrestore(LOCK_FLAGS);
     }
 
@@ -1723,6 +1865,7 @@ auto resolve_user_write_mapping(sched::task::Task* task, vaddr_t vaddr) -> UserW
     bool final_path_promoted = false;
     {
         uint64_t const LOCK_FLAGS = cow_pte_lock.lock_irqsave();
+        uint64_t const PIN_LOCK_FLAGS = user_mapping_pin_lock.lock_irqsave();
         PageTableEntry& pml4e = entry_at(PAGEMAP, IDX4);
         if (pml4e.present) {
             auto* pml3 = reinterpret_cast<paging::PageTable*>(addr::get_virt_pointer(pml4e.frame << paging::PAGE_SHIFT));
@@ -1749,6 +1892,7 @@ auto resolve_user_write_mapping(sched::task::Task* task, vaddr_t vaddr) -> UserW
                 }
             }
         }
+        user_mapping_pin_lock.unlock_irqrestore(PIN_LOCK_FLAGS);
         cow_pte_lock.unlock_irqrestore(LOCK_FLAGS);
     }
 
@@ -2179,6 +2323,152 @@ bool user_page_mapped_now(PageTable* pagemap, vaddr_t vaddr) { return user_page_
 
 bool user_page_writable_now(PageTable* pagemap, vaddr_t vaddr) { return user_page_writable_now_impl(pagemap, vaddr); }
 
+namespace {
+
+auto pin_user_page_common(sched::task::Task* task, PageTable* pagemap, vaddr_t vaddr, bool require_writable, bool fault_in,
+                          bool wait_for_teardown, UserPagePin& out) -> bool {
+    out = {};
+    size_t access_gate_index = USER_PAGEMAP_ACCESS_GATE_NONE;
+    if (!acquire_user_pagemap_access(pagemap, wait_for_teardown, access_gate_index)) {
+        return false;
+    }
+
+    bool const READY = task == nullptr ||
+                       (task->pagemap == pagemap &&
+                        (!fault_in || (require_writable ? ensure_user_page_writable(task, vaddr) : ensure_user_page_mapped(task, vaddr))));
+    if (!READY || (task != nullptr && task->pagemap != pagemap)) {
+        release_user_pagemap_access(access_gate_index);
+        return false;
+    }
+
+    paddr_t physical_page = PADDR_INVALID;
+    paddr_t confirmed_page = PADDR_INVALID;
+    void* hhdm_page = nullptr;
+    phys::PageLookupHint lookup_hint{};
+    bool ref_acquired = false;
+    bool pinned = false;
+    bool dirty = false;
+
+    uint64_t const LOCK_FLAGS = user_mapping_pin_lock.lock_irqsave();
+    if (snapshot_user_page_mapping_locked(pagemap, vaddr, require_writable, physical_page)) {
+        hhdm_page = reinterpret_cast<void*>(addr::get_virt_pointer(physical_page));
+        ref_acquired = phys::page_ref_try_inc(hhdm_page, &lookup_hint);
+        pinned = ref_acquired && snapshot_user_page_mapping_locked(pagemap, vaddr, require_writable, confirmed_page, &dirty) &&
+                 confirmed_page == physical_page;
+    }
+    user_mapping_pin_lock.unlock_irqrestore(LOCK_FLAGS);
+
+    if (!pinned) {
+        if (ref_acquired) {
+            phys::page_ref_dec(hhdm_page, &lookup_hint);
+        }
+        release_user_pagemap_access(access_gate_index);
+        return false;
+    }
+
+    out = {
+        .pagemap = pagemap,
+        .user_page = page_align_down(vaddr),
+        .physical_page = physical_page,
+        .hhdm_page = hhdm_page,
+        .lookup_hint = lookup_hint,
+        .access_gate_index = access_gate_index,
+        .require_writable = require_writable,
+        .dirty = dirty,
+    };
+    return true;
+}
+
+}  // namespace
+
+auto pin_user_page(PageTable* pagemap, vaddr_t vaddr, bool require_writable, UserPagePin& out, bool wait_for_teardown) -> bool {
+    return pin_user_page_common(nullptr, pagemap, vaddr, require_writable, false, wait_for_teardown, out);
+}
+
+auto pin_user_page_for_task(sched::task::Task* task, PageTable* expected_pagemap, vaddr_t vaddr, bool require_writable, bool fault_in,
+                            UserPagePin& out) -> bool {
+    if (task == nullptr) {
+        out = {};
+        return false;
+    }
+    return pin_user_page_common(task, expected_pagemap, vaddr, require_writable, fault_in, fault_in, out);
+}
+
+auto user_page_pin_still_mapped(const UserPagePin& pin) -> bool {
+    if (pin.pagemap == nullptr || pin.hhdm_page == nullptr || pin.physical_page == PADDR_INVALID ||
+        pin.access_gate_index == USER_PAGEMAP_ACCESS_GATE_NONE) {
+        return false;
+    }
+
+    paddr_t current_page = PADDR_INVALID;
+    uint64_t const LOCK_FLAGS = user_mapping_pin_lock.lock_irqsave();
+    bool const MATCHES = snapshot_user_page_mapping_locked(pin.pagemap, pin.user_page, pin.require_writable, current_page) &&
+                         current_page == pin.physical_page;
+    user_mapping_pin_lock.unlock_irqrestore(LOCK_FLAGS);
+    return MATCHES;
+}
+
+auto user_page_pin_commit_write(const UserPagePin& pin) -> bool {
+    if (pin.pagemap == nullptr || pin.hhdm_page == nullptr || pin.physical_page == PADDR_INVALID || !pin.require_writable ||
+        pin.access_gate_index == USER_PAGEMAP_ACCESS_GATE_NONE) {
+        return false;
+    }
+
+    uint64_t const LOCK_FLAGS = user_mapping_pin_lock.lock_irqsave();
+    PageTable* table = pin.pagemap;
+    bool valid_path = true;
+    for (int level = 4; level > 1; --level) {
+        PageTableEntry& entry = entry_at(table, index_of(pin.user_page, level));
+        uint64_t const RAW = pte_raw(entry);
+        if (entry.present == 0 || entry.user == 0 || entry.writable == 0 || (RAW & paging::PAGE_COW) != 0U ||
+            (level < 4 && entry.pagesize != 0)) {
+            valid_path = false;
+            break;
+        }
+        table = reinterpret_cast<PageTable*>(addr::get_virt_pointer(entry.frame << paging::PAGE_SHIFT));
+    }
+
+    bool committed = false;
+    if (valid_path) {
+        PageTableEntry& entry = entry_at(table, index_of(pin.user_page, 1));
+        uint64_t const RAW = pte_raw(entry);
+        paddr_t const CURRENT_PAGE = static_cast<paddr_t>(entry.frame) << paging::PAGE_SHIFT;
+        if (entry.present != 0 && entry.user != 0 && entry.writable != 0 && (RAW & paging::PAGE_COW) == 0U &&
+            CURRENT_PAGE == pin.physical_page) {
+            // Preserve Accessed/Dirty updates that hardware may publish while
+            // this CPU holds the software leaf-mutation lock.
+            constexpr uint64_t PTE_DIRTY_BIT = 1ULL << 6U;
+            auto* raw_entry = reinterpret_cast<uint64_t*>(&entry);
+            __atomic_fetch_or(raw_entry, PTE_DIRTY_BIT, __ATOMIC_ACQ_REL);
+            committed = true;
+        }
+    }
+    user_mapping_pin_lock.unlock_irqrestore(LOCK_FLAGS);
+    return committed;
+}
+
+void unpin_user_page(UserPagePin& pin) {
+    void* const PAGE = pin.hhdm_page;
+    phys::PageLookupHint lookup_hint = pin.lookup_hint;
+    size_t const ACCESS_GATE_INDEX = pin.access_gate_index;
+    pin = {};
+    if (PAGE != nullptr) {
+        phys::page_ref_dec(PAGE, &lookup_hint);
+    }
+    release_user_pagemap_access(ACCESS_GATE_INDEX);
+}
+
+#ifdef WOS_SELFTEST
+bool selftest_user_pagemap_exclusive_rejects_mapped_pin(PageTable* pagemap) {
+    if (pagemap == nullptr) {
+        return false;
+    }
+    UserPagemapExclusiveScope exclusive(pagemap);
+    UserPagePin pin{};
+    return !pin_user_page(pagemap, 0, false, pin, false) && pin.pagemap == nullptr && pin.hhdm_page == nullptr;
+}
+#endif
+
 void note_tlb_shootdown_cpu_online() {
     uint64_t const CPU_NO = cpu::current_cpu();
     if (!cpu_slot_valid(CPU_NO)) {
@@ -2210,6 +2500,8 @@ void release_pagemap(PageTable* pagemap) {
         page_table_pool_rejects.fetch_add(1, std::memory_order_relaxed);
         return;
     }
+
+    UserPagemapExclusiveScope teardown_scope(pagemap);
 
 #ifdef WOS_SELFTEST
     // Root pages are recycled directly into the page-table pool, so they do
@@ -3036,23 +3328,28 @@ void map_page(PageTable* page_table, const vaddr_t VADDR, const paddr_t PADDR, c
     pml2 = advance_page_table(pml3, index_of(VADDR, 3), FLAGS, &path_promoted);
     pml1 = advance_page_table(pml2, index_of(VADDR, 2), FLAGS, &path_promoted);
 
+    PageTableEntry old_entry{};
+    bool replaced_translation = false;
+    bool replaced_present_frame = false;
+    uint64_t const PIN_LOCK_FLAGS = user_mapping_pin_lock.lock_irqsave();
     PageTableEntry& entry = entry_at(pml1, index_of(VADDR, 1));
-    PageTableEntry const OLD_ENTRY = entry;
-    bool const REPLACED_TRANSLATION = OLD_ENTRY.present != 0 || is_reserved_leaf(OLD_ENTRY);
-    bool const REPLACED_PRESENT_FRAME = OLD_ENTRY.present != 0 && (static_cast<paddr_t>(OLD_ENTRY.frame) << paging::PAGE_SHIFT) != PADDR;
-    owned_frame_untrack_leaf(page_table, VADDR, OLD_ENTRY);
+    old_entry = entry;
+    replaced_translation = old_entry.present != 0 || is_reserved_leaf(old_entry);
+    replaced_present_frame = old_entry.present != 0 && (static_cast<paddr_t>(old_entry.frame) << paging::PAGE_SHIFT) != PADDR;
+    owned_frame_untrack_leaf(page_table, VADDR, old_entry);
     entry = paging::create_page_table_entry(PADDR, FLAGS);
     owned_frame_track_private_mapping(page_table, VADDR, PADDR, FLAGS);
+    user_mapping_pin_lock.unlock_irqrestore(PIN_LOCK_FLAGS);
 
     invalidate_local_tlb_if_current(page_table, VADDR, path_promoted);
-    if (path_promoted || REPLACED_TRANSLATION) {
+    if (path_promoted || replaced_translation) {
         shootdown_remote_user_pagemap(page_table, VADDR, path_promoted);
     }
     // A present PTE owns one reference to its frame. Publish and invalidate the
     // replacement before dropping that reference so no CPU can retain a stale
     // translation to a frame that has already returned to the allocator.
-    if (REPLACED_PRESENT_FRAME) {
-        drop_present_leaf_ref(OLD_ENTRY);
+    if (replaced_present_frame) {
+        drop_present_leaf_ref(old_entry);
     }
 }
 
@@ -3104,19 +3401,23 @@ void map_page_batched(PageMapBatch* batch, const vaddr_t VADDR, const paddr_t PA
         batch->cached_idx2 = IDX2;
     }
 
+    PageTableEntry old_entry{};
+    bool replaced_present_frame = false;
+    uint64_t const PIN_LOCK_FLAGS = user_mapping_pin_lock.lock_irqsave();
     PageTableEntry& entry = entry_at(batch->pml1, index_of(VADDR, 1));
-    PageTableEntry const OLD_ENTRY = entry;
-    bool const REPLACED_PRESENT_FRAME = OLD_ENTRY.present != 0 && (static_cast<paddr_t>(OLD_ENTRY.frame) << paging::PAGE_SHIFT) != PADDR;
+    old_entry = entry;
+    replaced_present_frame = old_entry.present != 0 && (static_cast<paddr_t>(old_entry.frame) << paging::PAGE_SHIFT) != PADDR;
     owned_frame_untrack_leaf(batch->root, VADDR, entry);
     entry = paging::create_page_table_entry(PADDR, FLAGS);
     owned_frame_track_private_mapping(batch->root, VADDR, PADDR, FLAGS);
+    user_mapping_pin_lock.unlock_irqrestore(PIN_LOCK_FLAGS);
     batch->dirty = true;
-    if (REPLACED_PRESENT_FRAME) {
+    if (replaced_present_frame) {
         // Batched callers normally install absent leaves. A replacement is
         // still legal, but its old mapping reference cannot be released until
         // the batched TLB invalidation has completed.
         flush_page_map_batch(batch);
-        drop_present_leaf_ref(OLD_ENTRY);
+        drop_present_leaf_ref(old_entry);
     }
 }
 
@@ -3184,15 +3485,18 @@ void reserve_page_range(PageTable* page_table, const vaddr_t VADDR, const uint64
         PageTable* pml2 = advance_page_table(pml3, index_of(CURRENT_VADDR, 3), TABLE_FLAGS, &path_promoted);
         PageTable* pml1 = advance_page_table(pml2, index_of(CURRENT_VADDR, 2), TABLE_FLAGS, &path_promoted);
 
+        uint64_t const PIN_LOCK_FLAGS = user_mapping_pin_lock.lock_irqsave();
         PageTableEntry& entry = entry_at(pml1, index_of(CURRENT_VADDR, 1));
         uint64_t const OLD_RAW = pte_raw(entry);
         if (OLD_RAW == paging::PAGE_RESERVED) {
+            user_mapping_pin_lock.unlock_irqrestore(PIN_LOCK_FLAGS);
             continue;
         }
 
         PageTableEntry const OLD_ENTRY = entry;
         owned_frame_untrack_leaf(page_table, CURRENT_VADDR, OLD_ENTRY);
         entry = pte_from_raw(paging::PAGE_RESERVED);
+        user_mapping_pin_lock.unlock_irqrestore(PIN_LOCK_FLAGS);
         changed = true;
         flush_pagemap_after_update(page_table, CURRENT_VADDR, path_promoted);
         path_promoted = false;
@@ -3251,11 +3555,13 @@ void unify_page_flags(PageTable* page_table, vaddr_t vaddr, uint64_t flags) {
         table = advance_page_table(table, index_of(vaddr, i), flags, &path_promoted);
     }
 
-    // Get the current page table entry by computing the index first
+    // Get the current page table entry by computing the index first.
     uint64_t const IDX = index_of(vaddr, 1);
+    uint64_t const PIN_LOCK_FLAGS = user_mapping_pin_lock.lock_irqsave();
     PageTableEntry& entry = entry_at(table, IDX);
 
     if (entry.present == 0) {
+        user_mapping_pin_lock.unlock_irqrestore(PIN_LOCK_FLAGS);
         // Page doesn't exist, nothing to modify
         if (path_promoted) {
             flush_pagemap_after_update(page_table, vaddr, true);
@@ -3283,15 +3589,17 @@ void unify_page_flags(PageTable* page_table, vaddr_t vaddr, uint64_t flags) {
     }
 
     owned_frame_refresh_leaf(page_table, vaddr, entry);
+    uint64_t const NEW_RAW = *raw_entry;
+    user_mapping_pin_lock.unlock_irqrestore(PIN_LOCK_FLAGS);
 
-    if (*raw_entry != OLD_RAW || path_promoted) {
+    if (NEW_RAW != OLD_RAW || path_promoted) {
         flush_pagemap_after_update(page_table, vaddr, path_promoted);
     }
 
 #ifdef ELF_DEBUG
     if (vaddr >= 0x501000 && vaddr < 0x580000) {
-        log::debug("unify_page_flags: vaddr=0x%x, flags=0x%x, entry_after=0x%x, nx=%d present=%d", vaddr, flags, *raw_entry,
-                   static_cast<int>((*raw_entry >> NX_BIT_POSITION) & 1U), static_cast<int>(entry.present));
+        log::debug("unify_page_flags: vaddr=0x%x, flags=0x%x, entry_after=0x%x, nx=%d present=%d", vaddr, flags, NEW_RAW,
+                   static_cast<int>((NEW_RAW >> NX_BIT_POSITION) & 1U), static_cast<int>((NEW_RAW & paging::PAGE_PRESENT) != 0U));
     }
 #endif
 }
@@ -3307,17 +3615,21 @@ void unmap_page(PageTable* page_table, vaddr_t vaddr) {
     selftest_require_mutable_pagemap_root(page_table, "unmap-page", vaddr);
 #endif
 
+    uint64_t const PIN_LOCK_FLAGS = user_mapping_pin_lock.lock_irqsave();
     PageTableEntry* entry = leaf_entry(page_table, vaddr);
     if (entry == nullptr) {
+        user_mapping_pin_lock.unlock_irqrestore(PIN_LOCK_FLAGS);
         return;
     }
 
     PageTableEntry const OLD_ENTRY = *entry;
     if (OLD_ENTRY.present == 0 && !is_reserved_leaf(OLD_ENTRY)) {
+        user_mapping_pin_lock.unlock_irqrestore(PIN_LOCK_FLAGS);
         return;
     }
     owned_frame_untrack_leaf(page_table, vaddr, OLD_ENTRY);
     *entry = paging::purge_page_table_entry();
+    user_mapping_pin_lock.unlock_irqrestore(PIN_LOCK_FLAGS);
     flush_pagemap_after_update(page_table, vaddr, false);
     drop_present_leaf_ref(OLD_ENTRY);
 }
@@ -3859,6 +4171,7 @@ struct DestroyUserSpaceBudgetState {
     RefdecBatch refdec_batch{};
     RefdecBatch page_table_refdec_batch{};
     size_t stack_size = 0;
+    size_t access_gate_index = USER_PAGEMAP_ACCESS_GATE_NONE;
 };
 
 namespace {
@@ -4593,6 +4906,7 @@ auto create_destroy_user_space_budget_state(PageTable* pagemap, uint64_t owner_p
         return nullptr;
     }
 
+    state->access_gate_index = begin_user_pagemap_exclusive(pagemap);
     owned_frame_purge_pagemap(pagemap);
     state->pagemap = pagemap;
     state->owner_pid = owner_pid;
@@ -4666,6 +4980,8 @@ void destroy_user_space_budget_state_destroy(DestroyUserSpaceBudgetState* state)
     }
     destroy_state_flush_refdec_batch(*state, nullptr);
     destroy_state_flush_page_table_refdec_batch(*state, nullptr);
+    end_user_pagemap_exclusive(state->access_gate_index);
+    state->access_gate_index = USER_PAGEMAP_ACCESS_GATE_NONE;
     delete state;
 }
 
@@ -4673,6 +4989,7 @@ void destroy_user_space(PageTable* pagemap, uint64_t owner_pid, const char* owne
     if (pagemap == nullptr) {
         return;
     }
+    UserPagemapExclusiveScope teardown_scope(pagemap);
     owned_frame_purge_pagemap(pagemap);
     DestroyUserSpaceCallStats stats{};
 #ifdef ELF_DEBUG
@@ -4764,6 +5081,13 @@ auto deep_copy_user_pagemap_cow(PageTable* src, PageTable* dst) -> bool {
     selftest_require_mutable_pagemap_root(src, "fork-cow-source");
     selftest_require_mutable_pagemap_root(dst, "fork-cow-destination");
 #endif
+
+    // Fork mutates writable source leaves into COW mappings. Drain every
+    // stable usercopy pin on this shared root first and prevent new pins until
+    // the source PTE changes and final TLB shootdown are complete. Otherwise a
+    // copyout pinned as writable before fork could modify the child's newly
+    // shared frame after publication.
+    UserPagemapExclusiveScope source_usercopy_scope(src);
 
     constexpr size_t USER_PML4_ENTRIES = 256;
     bool const EAGER_COPY_WRITABLE_PRIVATE = fork_eager_copy_enabled();

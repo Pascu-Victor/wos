@@ -9,8 +9,7 @@
 #include <ctime>
 #include <new>
 #include <platform/ktime/ktime.hpp>
-#include <platform/mm/addr.hpp>
-#include <platform/mm/virt.hpp>
+#include <platform/mm/paging.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
 #include <platform/sys/spinlock.hpp>
@@ -62,14 +61,14 @@ std::atomic<bool> futex_table_initialized{false};
     return initialized;
 }
 
-auto relative_timeout_us(mod::sched::task::Task& task, const void* timeout, uint64_t& out_us) -> int64_t {
+auto relative_timeout_us(mod::sched::task::Task& task, uint64_t timeout_user_addr, uint64_t& out_us) -> int64_t {
     out_us = 0;
-    if (timeout == nullptr) {
+    if (timeout_user_addr == 0) {
         return 0;
     }
 
     timespec ts{};
-    if (!mod::sys::usercopy::copy_value_from_task(task, reinterpret_cast<uint64_t>(timeout), ts)) {
+    if (!mod::sys::usercopy::copy_value_from_task(task, timeout_user_addr, ts)) {
         return -EFAULT;
     }
     if (ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= NSEC_PER_SEC) {
@@ -94,7 +93,7 @@ auto deadline_from_now_us(uint64_t timeout_us) -> uint64_t {
     return NOW_US + timeout_us;
 }
 
-auto futex_addr_is_aligned(const void* addr) -> bool { return (reinterpret_cast<uintptr_t>(addr) % alignof(int)) == 0; }
+auto futex_addr_is_aligned(uint64_t addr) -> bool { return (addr % alignof(int)) == 0; }
 
 auto futex_wake_limit_from_count(int count, size_t& out_limit) -> int64_t {
     out_limit = 0;
@@ -149,10 +148,10 @@ uint64_t sys_futex(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3) {
 
     switch (futex_op) {
         case abi::futex::futex_ops::FUTEX_WAIT:
-            return static_cast<uint64_t>(futex_wait(reinterpret_cast<int*>(a1), static_cast<int>(a2), reinterpret_cast<const void*>(a3)));
+            return static_cast<uint64_t>(futex_wait(a1, static_cast<int>(a2), a3));
 
         case abi::futex::futex_ops::FUTEX_WAKE:
-            return static_cast<uint64_t>(futex_wake(reinterpret_cast<int*>(a1), static_cast<int>(a2)));
+            return static_cast<uint64_t>(futex_wake(a1, static_cast<int>(a2)));
 
         default:
             return static_cast<uint64_t>(-ENOSYS);
@@ -163,8 +162,8 @@ uint64_t sys_futex(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3) {
 // futex_wait - Block until woken or value changes
 // ============================================================================
 
-int64_t futex_wait(const int* addr, int expected, const void* timeout) {
-    if (!futex_addr_is_aligned(addr)) {
+int64_t futex_wait(uint64_t user_addr, int expected, uint64_t timeout_user_addr) {
+    if (!futex_addr_is_aligned(user_addr)) {
         return -EINVAL;
     }
     if (!ensure_futex_table()) {
@@ -176,29 +175,30 @@ int64_t futex_wait(const int* addr, int expected, const void* timeout) {
         return -EINVAL;
     }
 
-    // Translate user virtual address to physical address for cross-process uniqueness
-    auto user_vaddr = reinterpret_cast<uint64_t>(addr);
-    if (!mod::sys::usercopy::range_valid(user_vaddr, sizeof(int))) {
+    if (!mod::sys::usercopy::range_valid(user_addr, sizeof(int)) ||
+        (user_addr & (mod::mm::paging::PAGE_SIZE - 1)) > mod::mm::paging::PAGE_SIZE - sizeof(int)) {
         return -EFAULT;
     }
-    uint64_t const PHYS_ADDR = mod::mm::virt::translate(current_task->pagemap, user_vaddr);
-    if (PHYS_ADDR == ker::mod::mm::virt::PADDR_INVALID) {
-        return -EFAULT;  // Invalid address
-    }
 
-    // Read the current value at the address via HHDM
-    uint64_t const PHYS_PAGE = PHYS_ADDR & ~0xFFFULL;
-    uint64_t const OFFSET = PHYS_ADDR & 0xFFF;
-    int const* kernel_addr = reinterpret_cast<int*>(reinterpret_cast<uint64_t>(mod::mm::addr::get_virt_pointer(PHYS_PAGE)) + OFFSET);
+    mod::sys::usercopy::StableUserPage futex_page{};
+    if (!mod::sys::usercopy::pin_task_user_page(*current_task, user_addr, false, true, futex_page)) {
+        return -EFAULT;
+    }
+    uint64_t const PHYS_ADDR = futex_page.physical_address();
+    auto const* kernel_addr = static_cast<const int*>(futex_page.kernel_address());
 
     uint64_t timeout_us = 0;
-    int64_t const TIMEOUT_STATUS = relative_timeout_us(*current_task, timeout, timeout_us);
+    int64_t const TIMEOUT_STATUS = relative_timeout_us(*current_task, timeout_user_addr, timeout_us);
     if (TIMEOUT_STATUS != 0) {
         return TIMEOUT_STATUS;
     }
 
-    if (timeout != nullptr && timeout_us == 0) {
-        return *kernel_addr == expected ? -ETIMEDOUT : -EAGAIN;
+    if (timeout_user_addr != 0 && timeout_us == 0) {
+        int const CURRENT_VALUE = __atomic_load_n(kernel_addr, __ATOMIC_ACQUIRE);
+        if (!futex_page.still_mapped()) {
+            return -EFAULT;
+        }
+        return CURRENT_VALUE == expected ? -ETIMEDOUT : -EAGAIN;
     }
 
     // Allocate a waiter node
@@ -215,27 +215,42 @@ int64_t futex_wait(const int* addr, int expected, const void* timeout) {
         delete waiter;
         return -ENOMEM;
     }
+    if (!futex_page.still_mapped()) {
+        delete waiter;
+        return -EFAULT;
+    }
 
     void* previous_waiter = nullptr;
     bool const INSERTED = futex_table.insert_if(
         waiter,
         [kernel_addr, expected]() -> bool {
-            int const CURRENT_VALUE = *kernel_addr;
+            int const CURRENT_VALUE = __atomic_load_n(kernel_addr, __ATOMIC_ACQUIRE);
             return CURRENT_VALUE == expected;
         },
-        [current_task, waiter, timeout, timeout_us, &previous_waiter]() {
+        [current_task, waiter, timeout_user_addr, timeout_us, &previous_waiter]() {
             current_task->set_wait_channel("futex_wait", ker::mod::sched::task::WaitChannelKind::FUTEX);
-            current_task->wake_at_us = timeout != nullptr ? deadline_from_now_us(timeout_us) : 0;
+            current_task->wake_at_us = timeout_user_addr != 0 ? deadline_from_now_us(timeout_us) : 0;
             current_task->deferred_task_switch = true;
             previous_waiter = current_task->futex_waiter.exchange(waiter, std::memory_order_acq_rel);
         });
+    bool const MAPPING_STILL_VALID = futex_page.still_mapped();
     if (!INSERTED) {
         delete waiter;
-        return -EAGAIN;  // Value changed, don't wait
+        return MAPPING_STILL_VALID ? -EAGAIN : -EFAULT;
     }
 
     if (previous_waiter != nullptr) {
         retire_task_waiter_ref(static_cast<FutexWaiter*>(previous_waiter));
+    }
+
+    if (!MAPPING_STILL_VALID) {
+        if (claim_task_waiter(current_task, waiter)) {
+            current_task->deferred_task_switch = false;
+            current_task->wake_at_us = 0;
+            current_task->clear_wait_channel();
+            retire_task_waiter_ref(waiter);
+        }
+        return -EFAULT;
     }
 
     return 0;
@@ -245,14 +260,14 @@ int64_t futex_wait(const int* addr, int expected, const void* timeout) {
 // futex_wake - Wake one or more waiters
 // ============================================================================
 
-int64_t futex_wake(int* addr, int count) {  // NOLINT
+int64_t futex_wake(uint64_t user_addr, int count) {
     size_t wake_limit = 0;
     int64_t const COUNT_STATUS = futex_wake_limit_from_count(count, wake_limit);
     if (COUNT_STATUS != 0 || wake_limit == 0) {
         return COUNT_STATUS;
     }
 
-    if (!futex_addr_is_aligned(addr)) {
+    if (!futex_addr_is_aligned(user_addr)) {
         return -EINVAL;
     }
 
@@ -264,14 +279,18 @@ int64_t futex_wake(int* addr, int count) {  // NOLINT
         return -EINVAL;
     }
 
-    // Translate user virtual address to physical address
-    auto user_vaddr = reinterpret_cast<uint64_t>(addr);
-    if (!mod::sys::usercopy::range_valid(user_vaddr, sizeof(int))) {
+    if (!mod::sys::usercopy::range_valid(user_addr, sizeof(int)) ||
+        (user_addr & (mod::mm::paging::PAGE_SIZE - 1)) > mod::mm::paging::PAGE_SIZE - sizeof(int)) {
         return -EFAULT;
     }
-    uint64_t const PHYS_ADDR = mod::mm::virt::translate(current_task->pagemap, user_vaddr);
-    if (PHYS_ADDR == ker::mod::mm::virt::PADDR_INVALID) {
-        return -EFAULT;  // Invalid address
+
+    mod::sys::usercopy::StableUserPage futex_page{};
+    if (!mod::sys::usercopy::pin_task_user_page(*current_task, user_addr, false, true, futex_page)) {
+        return -EFAULT;
+    }
+    uint64_t const PHYS_ADDR = futex_page.physical_address();
+    if (!futex_page.still_mapped()) {
+        return -EFAULT;
     }
 
     int woken_count = 0;
@@ -352,9 +371,7 @@ auto futex_selftest_table_init_is_serialized() -> bool {
     return FIRST && SECOND && futex_table_initialized.load(std::memory_order_acquire) && futex_table.valid();
 }
 
-auto futex_selftest_addr_alignment_guard() -> bool {
-    return futex_addr_is_aligned(reinterpret_cast<const int*>(0x1000)) && !futex_addr_is_aligned(reinterpret_cast<const int*>(0x1001));
-}
+auto futex_selftest_addr_alignment_guard() -> bool { return futex_addr_is_aligned(0x1000) && !futex_addr_is_aligned(0x1001); }
 
 auto futex_selftest_stale_wake_does_not_claim_waiter() -> bool {
     mod::sched::task::Task task{};

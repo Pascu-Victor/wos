@@ -274,8 +274,17 @@ auto vfs_wki_effective_route_for_path(const ker::mod::sched::task::Task* task, c
 auto vfs_wki_rule_clear() -> int;
 void vfs_wki_load_default_rules();
 
-// File control
-auto vfs_fcntl(int fd, int cmd, uint64_t arg) -> int;
+// File control. Pointer-bearing record-lock commands receive a kernel-owned
+// snapshot; scalar commands continue to use arg and leave flock null.
+struct VfsFlockAbi {
+    int16_t l_type = 0;
+    int16_t l_whence = 0;
+    off_t l_start = 0;
+    off_t l_len = 0;
+    int32_t l_pid = 0;
+};
+static_assert(sizeof(VfsFlockAbi) == 32);
+auto vfs_fcntl(int fd, int cmd, uint64_t arg, VfsFlockAbi* flock = nullptr) -> int;
 
 // IPC file identity helpers (used by WKI remote IPC proxy)
 auto vfs_is_pipe_file(const File* f) -> bool;

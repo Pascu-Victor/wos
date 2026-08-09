@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <cstdint>
 #include <cstring>
 
@@ -10,13 +11,11 @@
 #include "mod/gfx/fb.hpp"
 #include "platform/dbg/dbg.hpp"
 #include "platform/dbg/journal.hpp"
-#include "platform/mm/addr.hpp"
-#include "platform/mm/virt.hpp"
-#include "platform/sched/get_current_pagemap.hpp"
 #include "platform/sched/scheduler.hpp"
 #include "platform/sched/task.hpp"
 #include "platform/sys/mutex.hpp"
 #include "platform/sys/spinlock.hpp"
+#include "platform/sys/usercopy.hpp"
 
 namespace ker::syscall::log {
 
@@ -178,51 +177,39 @@ void nul_terminate_copy(std::array<char, Size>& buf, uint64_t copied, bool trim_
 
 }  // namespace
 
-auto sys_log(ker::abi::sys_log::sys_log_ops op, const char* str, uint64_t len, uint64_t device_or_level, const char* module,
+auto sys_log(ker::abi::sys_log::sys_log_ops op, uint64_t str_user_addr, uint64_t len, uint64_t device_or_level, uint64_t module_user_addr,
              uint64_t cookie) -> uint64_t {
-    auto* current_pagemap = wos_get_current_pagemap();
+    auto* current_task = ker::mod::sched::get_current_task();
 
-    // Helper to safely copy from user/kernel pointer into a kernel buffer.
-    auto safe_copy_to_kernel = [&](const char* src, char* dest, size_t dest_size, uint64_t copy_limit, uint64_t& copied_count) -> bool {
-        if (src == nullptr || dest == nullptr || dest_size == 0) {
+    // A byte-counted log may emit a fully copied prefix when a later page
+    // faults. NUL-terminated inputs are all-or-error because there is no ABI
+    // field with which to report a partial string.
+    auto safe_copy_to_kernel = [&](uint64_t src_user_addr, char* dest, size_t dest_size, uint64_t copy_limit,
+                                   uint64_t& copied_count) -> bool {
+        copied_count = 0;
+        if (src_user_addr == 0 || dest == nullptr || dest_size == 0 || current_task == nullptr) {
             return false;
         }
-        uint64_t copied = 0;
+
         uint64_t const MAX_TO_COPY =
             std::min((copy_limit == 0) ? static_cast<uint64_t>(dest_size) : copy_limit, static_cast<uint64_t>(dest_size));
-        // If src looks like a kernel pointer (high half), we can read directly
-        auto const SRC_ADDR = reinterpret_cast<uint64_t>(src);
-        bool const SRC_IS_KERNEL = (SRC_ADDR & 0xffff800000000000ULL) != 0ULL;
-        while (copied < MAX_TO_COPY) {
-            uint64_t phys = 0;
-            if (SRC_IS_KERNEL) {
-                // direct kernel virtual read
-                phys = reinterpret_cast<uint64_t>(
-                    ker::mod::mm::addr::get_phys_pointer(static_cast<ker::mod::mm::addr::vaddr_t>(SRC_ADDR) + copied));
-                // If getPhysPointer fails, fall back to virtual direct read
-                if (phys == 0) {
-                    dest[copied] = *reinterpret_cast<const char*>(SRC_ADDR + copied);
-                } else {
-                    dest[copied] = *reinterpret_cast<const char*>(ker::mod::mm::addr::get_virt_pointer(phys + 0));
-                }
-            } else {
-                if (!current_pagemap) {
-                    return false;
-                }
-                phys = ker::mod::mm::virt::translate(current_pagemap, static_cast<ker::mod::mm::addr::vaddr_t>(SRC_ADDR + copied));
-                if (phys == ker::mod::mm::virt::PADDR_INVALID) {
-                    break;  // unmapped - stop copying
-                }
-                dest[copied] = *reinterpret_cast<const char*>(ker::mod::mm::addr::get_virt_pointer(phys));
+
+        if (copy_limit == 0) {
+            if (!ker::mod::sys::usercopy::copy_cstring_from_task_strict(*current_task, src_user_addr, dest, dest_size)) {
+                return false;
             }
-            if (dest[copied] == '\0') {
-                copied++;
-                break;
+            size_t text_len = 0;
+            while (text_len + 1 < dest_size && dest[text_len] != '\0') {
+                ++text_len;
             }
-            copied++;
+            copied_count = static_cast<uint64_t>(text_len + 1);
+            return true;
         }
-        copied_count = copied;
-        return true;
+
+        auto const COPY =
+            ker::mod::sys::usercopy::copy_from_task_partial(*current_task, src_user_addr, dest, static_cast<size_t>(MAX_TO_COPY));
+        copied_count = COPY.bytes_copied;
+        return !COPY.fault || COPY.bytes_copied != 0;
     };
 
     switch (op) {
@@ -236,14 +223,14 @@ auto sys_log(ker::abi::sys_log::sys_log_ops op, const char* str, uint64_t len, u
             }
             auto device = static_cast<abi::sys_log::sys_log_device>(device_or_level);
             if (device == abi::sys_log::sys_log_device::SERIAL) {
-                if (str == nullptr) {
-                    return 1;
+                if (str_user_addr == 0) {
+                    return static_cast<uint64_t>(-EFAULT);
                 }
                 std::array<char, MAX_SYSLOG_COPY> buf{};
                 uint64_t copied = 0;
                 if (len == 0) {
-                    if (!safe_copy_to_kernel(str, buf.data(), buf.size(), 0, copied)) {
-                        return 1;
+                    if (!safe_copy_to_kernel(str_user_addr, buf.data(), buf.size(), 0, copied)) {
+                        return static_cast<uint64_t>(-EFAULT);
                     }
                     nul_terminate_copy(buf, copied, true);
                     if (buf.front() == '\0') {
@@ -253,8 +240,8 @@ auto sys_log(ker::abi::sys_log::sys_log_ops op, const char* str, uint64_t len, u
                     mod::dbg::journal::emit(mod::dbg::LogLevel::INFO, "userspace", buf.data(), 0);
                 } else {
                     // Copy exactly 'len' bytes or until an unmapped page
-                    if (!safe_copy_to_kernel(str, buf.data(), buf.size(), len, copied)) {
-                        return 1;
+                    if (!safe_copy_to_kernel(str_user_addr, buf.data(), buf.size(), len, copied)) {
+                        return static_cast<uint64_t>(-EFAULT);
                     }
                     if (copied == 0) {
                         return 0;
@@ -268,8 +255,8 @@ auto sys_log(ker::abi::sys_log::sys_log_ops op, const char* str, uint64_t len, u
                 if constexpr (ker::mod::gfx::fb::WOS_HAS_GFX_FB) {
                     std::array<char, MAX_SYSLOG_COPY> buf{};
                     uint64_t copied = 0;
-                    if (!safe_copy_to_kernel(str, buf.data(), buf.size(), 0, copied)) {
-                        return 1;
+                    if (!safe_copy_to_kernel(str_user_addr, buf.data(), buf.size(), 0, copied)) {
+                        return static_cast<uint64_t>(-EFAULT);
                     }
                     nul_terminate_copy(buf, copied, true);
                     LogBlockGate const GATE(should_gate_log_with_cookie(cookie));
@@ -289,14 +276,14 @@ auto sys_log(ker::abi::sys_log::sys_log_ops op, const char* str, uint64_t len, u
             }
             auto device = static_cast<abi::sys_log::sys_log_device>(device_or_level);
             if (device == abi::sys_log::sys_log_device::SERIAL) {
-                if (str == nullptr) {
-                    return 1;
+                if (str_user_addr == 0) {
+                    return static_cast<uint64_t>(-EFAULT);
                 }
                 std::array<char, MAX_SYSLOG_COPY> buf{};
                 uint64_t copied = 0;
                 if (len == 0) {
-                    if (!safe_copy_to_kernel(str, buf.data(), buf.size(), 0, copied)) {
-                        return 1;
+                    if (!safe_copy_to_kernel(str_user_addr, buf.data(), buf.size(), 0, copied)) {
+                        return static_cast<uint64_t>(-EFAULT);
                     }
                     nul_terminate_copy(buf, copied, true);
                     if (buf.front() == '\0') {
@@ -307,8 +294,8 @@ auto sys_log(ker::abi::sys_log::sys_log_ops op, const char* str, uint64_t len, u
                     LogBlockGate const GATE(should_gate_log_with_cookie(cookie));
                     mod::dbg::journal::emit(mod::dbg::LogLevel::INFO, "userspace", buf.data(), 0);
                 } else {
-                    if (!safe_copy_to_kernel(str, buf.data(), buf.size(), len, copied)) {
-                        return 1;
+                    if (!safe_copy_to_kernel(str_user_addr, buf.data(), buf.size(), len, copied)) {
+                        return static_cast<uint64_t>(-EFAULT);
                     }
                     if (copied == 0) {
                         LogBlockGate const GATE(should_gate_log_with_cookie(cookie));
@@ -324,8 +311,8 @@ auto sys_log(ker::abi::sys_log::sys_log_ops op, const char* str, uint64_t len, u
                 if constexpr (ker::mod::gfx::fb::WOS_HAS_GFX_FB) {
                     std::array<char, MAX_SYSLOG_COPY> buf{};
                     uint64_t copied = 0;
-                    if (!safe_copy_to_kernel(str, buf.data(), buf.size(), 0, copied)) {
-                        return 1;
+                    if (!safe_copy_to_kernel(str_user_addr, buf.data(), buf.size(), 0, copied)) {
+                        return static_cast<uint64_t>(-EFAULT);
                     }
                     nul_terminate_copy(buf, copied, true);
                     LogBlockGate const GATE(should_gate_log_with_cookie(cookie));
@@ -344,19 +331,22 @@ auto sys_log(ker::abi::sys_log::sys_log_ops op, const char* str, uint64_t len, u
             if (cookie != NO_LOG_BLOCK_COOKIE && !current_task_owns_log_block(cookie)) {
                 return 1;
             }
-            if (str == nullptr) {
-                return 1;
+            if (str_user_addr == 0) {
+                return static_cast<uint64_t>(-EFAULT);
             }
             std::array<char, MAX_SYSLOG_COPY> buf{};
             uint64_t copied = 0;
-            if (!safe_copy_to_kernel(str, buf.data(), buf.size(), len, copied)) {
-                return 1;
+            if (!safe_copy_to_kernel(str_user_addr, buf.data(), buf.size(), len, copied)) {
+                return static_cast<uint64_t>(-EFAULT);
             }
             nul_terminate_copy(buf, copied, len == 0);
 
             std::array<char, mod::dbg::journal::JOURNAL_MODULE_MAX> module_buf{};
             uint64_t module_copied = 0;
-            if (module != nullptr && safe_copy_to_kernel(module, module_buf.data(), module_buf.size(), 0, module_copied)) {
+            if (module_user_addr != 0) {
+                if (!safe_copy_to_kernel(module_user_addr, module_buf.data(), module_buf.size(), 0, module_copied)) {
+                    return static_cast<uint64_t>(-EFAULT);
+                }
                 nul_terminate_copy(module_buf, module_copied, true);
             } else {
                 std::memcpy(module_buf.data(), "userspace", sizeof("userspace"));

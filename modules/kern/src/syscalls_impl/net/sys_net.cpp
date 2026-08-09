@@ -57,6 +57,7 @@ constexpr int SELECT_TIMEOUT_MAX_MS = 0x7fffffff;
 constexpr size_t SOCKET_IO_BOUNCE_STACK_CHUNK = 4096;
 constexpr size_t SOCKET_IO_BOUNCE_MAX_CHUNK = size_t{256} * 1024;
 constexpr size_t SOCKADDR_STORAGE_MAX = 28;
+constexpr size_t SOCKET_OPTION_MAX = (size_t{64} * 1024) - 16;
 
 struct KPollFd {
     int32_t fd;
@@ -542,8 +543,9 @@ auto socket_recv_user_bounced(ker::vfs::File* file, ker::net::Socket* sock, uint
     }
 
     auto const BYTES_READ = static_cast<size_t>(RESULT);
-    if (!ker::mod::sys::usercopy::copy_to_task(*task, user_addr, bounce, BYTES_READ)) {
-        return -EFAULT;
+    auto const OUTPUT = ker::mod::sys::usercopy::copy_to_task_partial(*task, user_addr, bounce, BYTES_READ);
+    if (!OUTPUT.complete(BYTES_READ)) {
+        return OUTPUT.bytes_copied != 0 ? static_cast<ssize_t>(OUTPUT.bytes_copied) : static_cast<ssize_t>(-EFAULT);
     }
     return RESULT;
 }
@@ -609,6 +611,21 @@ struct SocketHandle {
             ker::vfs::vfs_put_file(file);
         }
     }
+
+    SocketHandle() = default;
+    SocketHandle(const SocketHandle&) = delete;
+    auto operator=(const SocketHandle&) -> SocketHandle& = delete;
+    SocketHandle(SocketHandle&& other) noexcept : file(std::exchange(other.file, nullptr)), sock(std::exchange(other.sock, nullptr)) {}
+    auto operator=(SocketHandle&& other) noexcept -> SocketHandle& {
+        if (this != &other) {
+            if (file != nullptr) {
+                ker::vfs::vfs_put_file(file);
+            }
+            file = std::exchange(other.file, nullptr);
+            sock = std::exchange(other.sock, nullptr);
+        }
+        return *this;
+    }
 };
 
 struct FileHandle {
@@ -618,6 +635,20 @@ struct FileHandle {
         if (file != nullptr) {
             ker::vfs::vfs_put_file(file);
         }
+    }
+
+    FileHandle() = default;
+    FileHandle(const FileHandle&) = delete;
+    auto operator=(const FileHandle&) -> FileHandle& = delete;
+    FileHandle(FileHandle&& other) noexcept : file(std::exchange(other.file, nullptr)) {}
+    auto operator=(FileHandle&& other) noexcept -> FileHandle& {
+        if (this != &other) {
+            if (file != nullptr) {
+                ker::vfs::vfs_put_file(file);
+            }
+            file = std::exchange(other.file, nullptr);
+        }
+        return *this;
     }
 };
 
@@ -696,6 +727,46 @@ void fill_sockaddr_v4(void* addr_out, size_t* addr_len, uint32_t ip, uint16_t po
         max_len = *addr_len;
     }
     ker::net::socket_fill_sockaddr_v4(addr_out, max_len, addr_len, ip, port);
+}
+
+template <typename Fn>
+auto socket_name_to_user(uint64_t addr_out_addr, uint64_t addr_len_addr, size_t default_capacity, Fn&& fn) -> int {
+    auto* task = ker::mod::sched::get_current_task();
+    if (task == nullptr) {
+        return -ESRCH;
+    }
+    if (addr_out_addr == 0 || addr_len_addr == 0) {
+        return -EFAULT;
+    }
+
+    size_t user_capacity = default_capacity;
+    if (!ker::mod::sys::usercopy::copy_value_from_task(*task, addr_len_addr, user_capacity) ||
+        !ker::mod::sys::usercopy::ensure_writable(*task, addr_len_addr, sizeof(user_capacity))) {
+        return -EFAULT;
+    }
+
+    std::array<uint8_t, SOCKADDR_STORAGE_MAX> address{};
+    size_t const SNAPSHOT_LEN = std::min(user_capacity, address.size());
+    if (SNAPSHOT_LEN != 0 && (!ker::mod::sys::usercopy::ensure_writable(*task, addr_out_addr, SNAPSHOT_LEN) ||
+                              !ker::mod::sys::usercopy::copy_from_task(*task, addr_out_addr, address.data(), SNAPSHOT_LEN))) {
+        return -EFAULT;
+    }
+
+    // Backends treat *addr_len as the writable capacity.  Never advertise the
+    // (possibly enormous) userspace capacity for our fixed kernel snapshot.
+    // They may still replace it with the full sockaddr size for copy-back.
+    size_t returned_len = SNAPSHOT_LEN;
+    int const RESULT = fn(address.data(), &returned_len);
+    if (RESULT < 0) {
+        return RESULT;
+    }
+
+    size_t const COPY_LEN = std::min({user_capacity, returned_len, address.size()});
+    if ((COPY_LEN != 0 && !ker::mod::sys::usercopy::copy_to_task(*task, addr_out_addr, address.data(), COPY_LEN)) ||
+        !ker::mod::sys::usercopy::copy_value_to_task(*task, addr_len_addr, returned_len)) {
+        return -EFAULT;
+    }
+    return 0;
 }
 
 constexpr size_t WOS_NET_IF_NAME_LEN = 16;
@@ -789,6 +860,13 @@ struct WosNetLinkSetReq {
     uint8_t hwaddr[WOS_NET_HWADDR_LEN];
     uint8_t hwaddr_len;
 };
+
+// Keep the kernel's private spellings mechanically locked to the public
+// <wos/netctl.h> wire records. These are copied as complete fixed-size values.
+static_assert(sizeof(WosNetIfInfo) == 52);
+static_assert(sizeof(WosNetAddrInfo) == 76);
+static_assert(sizeof(WosNetAddrReq) == 48);
+static_assert(sizeof(WosNetLinkSetReq) == 68);
 
 auto prefix_to_mask(uint8_t prefix) -> uint32_t {
     if (prefix == 0) {
@@ -957,7 +1035,17 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             if (sock->proto_ops == nullptr || sock->proto_ops->bind == nullptr) {
                 return static_cast<uint64_t>(-ENOSYS);
             }
-            int const RESULT = sock->proto_ops->bind(sock, reinterpret_cast<const void*>(a2), static_cast<size_t>(a3));
+            size_t const ADDR_LEN = static_cast<size_t>(a3);
+            if (ADDR_LEN > SOCKADDR_STORAGE_MAX) {
+                return static_cast<uint64_t>(-EINVAL);
+            }
+            std::array<uint8_t, SOCKADDR_STORAGE_MAX> address{};
+            auto* task = ker::mod::sched::get_current_task();
+            if (ADDR_LEN != 0 && (task == nullptr || !ker::mod::sys::usercopy::copy_from_task(*task, a2, address.data(), ADDR_LEN))) {
+                return static_cast<uint64_t>(task == nullptr ? -ESRCH : -EFAULT);
+            }
+            const void* const ADDR = a2 != 0 ? address.data() : nullptr;
+            int const RESULT = sock->proto_ops->bind(sock, ADDR, ADDR_LEN);
             return static_cast<uint64_t>(RESULT);
         }
 
@@ -985,19 +1073,44 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             if (sock->proto_ops == nullptr || sock->proto_ops->accept == nullptr) {
                 return static_cast<uint64_t>(-ENOSYS);
             }
+            auto* task = ker::mod::sched::get_current_task();
+            if (task == nullptr) {
+                return static_cast<uint64_t>(-ESRCH);
+            }
+            std::array<uint8_t, SOCKADDR_STORAGE_MAX> address{};
+            size_t user_addr_capacity = 0;
+            size_t kernel_addr_capacity = 0;
+            bool const WANTS_ADDRESS = a2 != 0;
+            if (WANTS_ADDRESS) {
+                if (a3 == 0 || !ker::mod::sys::usercopy::copy_value_from_task(*task, a3, user_addr_capacity) ||
+                    !ker::mod::sys::usercopy::ensure_writable(*task, a3, sizeof(user_addr_capacity))) {
+                    return static_cast<uint64_t>(-EFAULT);
+                }
+                kernel_addr_capacity = std::min(user_addr_capacity, address.size());
+                if (kernel_addr_capacity != 0 &&
+                    (!ker::mod::sys::usercopy::ensure_writable(*task, a2, kernel_addr_capacity) ||
+                     !ker::mod::sys::usercopy::copy_from_task(*task, a2, address.data(), kernel_addr_capacity))) {
+                    return static_cast<uint64_t>(-EFAULT);
+                }
+            }
             ker::net::Socket* new_sock = nullptr;
-            auto* addr_len_ptr = reinterpret_cast<size_t*>(a3);
             int const RESULT = run_socket_call<int>(handle.file, sock, 0, [&](int) {
-                return sock->proto_ops->accept(sock, &new_sock, reinterpret_cast<void*>(a2), addr_len_ptr);
+                return sock->proto_ops->accept(sock, &new_sock, WANTS_ADDRESS ? address.data() : nullptr,
+                                               WANTS_ADDRESS ? &kernel_addr_capacity : nullptr);
             });
             if (RESULT < 0 || new_sock == nullptr) {
                 return static_cast<uint64_t>(RESULT);
             }
-            // Set owner PID on accepted socket for wake_socket()
-            auto* cur_task = ker::mod::sched::get_current_task();
-            if (cur_task != nullptr) {
-                new_sock->owner_pid = cur_task->pid;
+            if (WANTS_ADDRESS) {
+                size_t const COPY_LEN = std::min({user_addr_capacity, kernel_addr_capacity, address.size()});
+                if ((COPY_LEN != 0 && !ker::mod::sys::usercopy::copy_to_task(*task, a2, address.data(), COPY_LEN)) ||
+                    !ker::mod::sys::usercopy::copy_value_to_task(*task, a3, kernel_addr_capacity)) {
+                    ker::net::socket_destroy(new_sock);
+                    return static_cast<uint64_t>(-EFAULT);
+                }
             }
+            // Set owner PID on accepted socket for wake_socket()
+            new_sock->owner_pid = task->pid;
 
             int const NEW_FD = allocate_socket_fd(new_sock);
             if (NEW_FD < 0) {
@@ -1017,9 +1130,18 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             if (sock->proto_ops == nullptr || sock->proto_ops->connect == nullptr) {
                 return static_cast<uint64_t>(-ENOSYS);
             }
-            int const RESULT = run_socket_call<int>(handle.file, sock, 0, [&](int flags) {
-                return sock->proto_ops->connect(sock, reinterpret_cast<const void*>(a2), static_cast<size_t>(a3), flags);
-            });
+            size_t const ADDR_LEN = static_cast<size_t>(a3);
+            if (ADDR_LEN > SOCKADDR_STORAGE_MAX) {
+                return static_cast<uint64_t>(-EINVAL);
+            }
+            std::array<uint8_t, SOCKADDR_STORAGE_MAX> address{};
+            auto* task = ker::mod::sched::get_current_task();
+            if (ADDR_LEN != 0 && (task == nullptr || !ker::mod::sys::usercopy::copy_from_task(*task, a2, address.data(), ADDR_LEN))) {
+                return static_cast<uint64_t>(task == nullptr ? -ESRCH : -EFAULT);
+            }
+            const void* const ADDR = a2 != 0 ? address.data() : nullptr;
+            int const RESULT = run_socket_call<int>(handle.file, sock, 0,
+                                                    [&](int flags) { return sock->proto_ops->connect(sock, ADDR, ADDR_LEN, flags); });
             return static_cast<uint64_t>(RESULT);
         }
 
@@ -1036,9 +1158,9 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                     if (file_handle.file->fops == nullptr || file_handle.file->fops->vfs_write == nullptr) {
                         return static_cast<uint64_t>(-ENOSYS);
                     }
-                    auto result = clamp_io_count(
-                        file_handle.file->fops->vfs_write(file_handle.file, reinterpret_cast<const void*>(a2), static_cast<size_t>(a3), 0),
-                        static_cast<size_t>(a3));
+                    auto result = socket_send_user_bounced(
+                        file_handle.file, nullptr, a2, static_cast<size_t>(a3), 0,
+                        [&](const void* buf, size_t len, int) { return file_handle.file->fops->vfs_write(file_handle.file, buf, len, 0); });
                     return static_cast<uint64_t>(result);
                 }
                 return static_cast<uint64_t>(-EBADF);
@@ -1065,9 +1187,9 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                     if (file_handle.file->fops == nullptr || file_handle.file->fops->vfs_read == nullptr) {
                         return static_cast<uint64_t>(-ENOSYS);
                     }
-                    auto result = clamp_io_count(
-                        file_handle.file->fops->vfs_read(file_handle.file, reinterpret_cast<void*>(a2), static_cast<size_t>(a3), 0),
-                        static_cast<size_t>(a3));
+                    auto result = socket_recv_user_bounced(
+                        file_handle.file, nullptr, a2, static_cast<size_t>(a3), 0,
+                        [&](void* buf, size_t len, int) { return file_handle.file->fops->vfs_read(file_handle.file, buf, len, 0); });
                     return static_cast<uint64_t>(result);
                 }
                 return static_cast<uint64_t>(-EBADF);
@@ -1130,15 +1252,21 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             std::array<uint8_t, SOCKADDR_STORAGE_MAX> addr_storage{};
             size_t alen = addr_len_for_domain(sock->domain);
             void* addr_ptr = a5 != 0 ? addr_storage.data() : nullptr;
+            auto* task = ker::mod::sched::get_current_task();
+            if (task == nullptr) {
+                return static_cast<uint64_t>(-ESRCH);
+            }
+            if (a5 != 0 && !ker::mod::sys::usercopy::ensure_writable(*task, a5, alen)) {
+                return static_cast<uint64_t>(-EFAULT);
+            }
             ssize_t const RESULT = socket_recv_user_bounced(
                 handle.file, sock, a2, static_cast<size_t>(a3), static_cast<int>(a4),
                 [&](void* buf, size_t len, int flags) { return sock->proto_ops->recvfrom(sock, buf, len, flags, addr_ptr, &alen); });
             if (RESULT >= 0 && a5 != 0) {
-                auto* task = ker::mod::sched::get_current_task();
-                if (task == nullptr) {
-                    return static_cast<uint64_t>(-ESRCH);
+                if (alen > addr_storage.size()) {
+                    return static_cast<uint64_t>(-EOVERFLOW);
                 }
-                if (alen > addr_storage.size() || !ker::mod::sys::usercopy::copy_to_task(*task, a5, addr_storage.data(), alen)) {
+                if (!ker::mod::sys::usercopy::copy_to_task(*task, a5, addr_storage.data(), alen)) {
                     return static_cast<uint64_t>(-EFAULT);
                 }
             }
@@ -1149,21 +1277,40 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             // a1=fd, a2=level, a3=optname, a4=optval_ptr, a5=optlen
             auto handle = fd_to_socket(a1);
             auto* sock = handle.sock;
+            FileHandle proxy_file;
             if (sock == nullptr) {
-                auto file_handle = fd_to_file(a1);
-                if (file_handle.file != nullptr && ker::net::wki::wki_ipc_is_socket_proxy_file(file_handle.file)) {
-                    int const RESULT =
-                        ker::net::wki::wki_ipc_socket_setsockopt(file_handle.file, static_cast<int>(a2), static_cast<int>(a3),
-                                                                 reinterpret_cast<const void*>(a4), static_cast<size_t>(a5));
-                    return static_cast<uint64_t>(RESULT);
+                proxy_file = fd_to_file(a1);
+                if (proxy_file.file == nullptr || !ker::net::wki::wki_ipc_is_socket_proxy_file(proxy_file.file)) {
+                    return static_cast<uint64_t>(-EBADF);
                 }
-                return static_cast<uint64_t>(-EBADF);
-            }
-            if (sock->proto_ops == nullptr || sock->proto_ops->setsockopt == nullptr) {
+            } else if (sock->proto_ops == nullptr || sock->proto_ops->setsockopt == nullptr) {
                 return static_cast<uint64_t>(-ENOSYS);
             }
-            int const RESULT = sock->proto_ops->setsockopt(sock, static_cast<int>(a2), static_cast<int>(a3),
-                                                           reinterpret_cast<const void*>(a4), static_cast<size_t>(a5));
+
+            size_t const OPTLEN = static_cast<size_t>(a5);
+            if (OPTLEN > SOCKET_OPTION_MAX) {
+                return static_cast<uint64_t>(-EINVAL);
+            }
+            if (OPTLEN != 0 && a4 == 0) {
+                return static_cast<uint64_t>(-EFAULT);
+            }
+            auto* task = ker::mod::sched::get_current_task();
+            if (task == nullptr) {
+                return static_cast<uint64_t>(-ESRCH);
+            }
+            uint8_t stack_option[SOCKET_IO_BOUNCE_STACK_CHUNK];
+            std::unique_ptr<uint8_t[]> heap_option{};
+            uint8_t* const OPTION =
+                OPTLEN != 0 ? socket_bounce_heap_or_stack(heap_option, stack_option, sizeof(stack_option), OPTLEN) : nullptr;
+            if ((OPTLEN != 0 && OPTION == nullptr) ||
+                (OPTLEN != 0 && !ker::mod::sys::usercopy::copy_from_task(*task, a4, OPTION, OPTLEN))) {
+                return static_cast<uint64_t>(OPTION == nullptr ? -ENOMEM : -EFAULT);
+            }
+
+            int const RESULT =
+                sock != nullptr
+                    ? sock->proto_ops->setsockopt(sock, static_cast<int>(a2), static_cast<int>(a3), OPTION, OPTLEN)
+                    : ker::net::wki::wki_ipc_socket_setsockopt(proxy_file.file, static_cast<int>(a2), static_cast<int>(a3), OPTION, OPTLEN);
             return static_cast<uint64_t>(RESULT);
         }
 
@@ -1171,21 +1318,51 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             // a1=fd, a2=level, a3=optname, a4=optval_ptr, a5=optlen_ptr
             auto handle = fd_to_socket(a1);
             auto* sock = handle.sock;
+            FileHandle proxy_file;
             if (sock == nullptr) {
-                auto file_handle = fd_to_file(a1);
-                if (file_handle.file != nullptr && ker::net::wki::wki_ipc_is_socket_proxy_file(file_handle.file)) {
-                    int const RESULT =
-                        ker::net::wki::wki_ipc_socket_getsockopt(file_handle.file, static_cast<int>(a2), static_cast<int>(a3),
-                                                                 reinterpret_cast<void*>(a4), reinterpret_cast<size_t*>(a5));
-                    return static_cast<uint64_t>(RESULT);
+                proxy_file = fd_to_file(a1);
+                if (proxy_file.file == nullptr || !ker::net::wki::wki_ipc_is_socket_proxy_file(proxy_file.file)) {
+                    return static_cast<uint64_t>(-EBADF);
                 }
-                return static_cast<uint64_t>(-EBADF);
-            }
-            if (sock->proto_ops == nullptr || sock->proto_ops->getsockopt == nullptr) {
+            } else if (sock->proto_ops == nullptr || sock->proto_ops->getsockopt == nullptr) {
                 return static_cast<uint64_t>(-ENOSYS);
             }
-            int const RESULT = sock->proto_ops->getsockopt(sock, static_cast<int>(a2), static_cast<int>(a3), reinterpret_cast<void*>(a4),
-                                                           reinterpret_cast<size_t*>(a5));
+
+            auto* task = ker::mod::sched::get_current_task();
+            if (task == nullptr) {
+                return static_cast<uint64_t>(-ESRCH);
+            }
+            size_t option_len = 0;
+            if (!ker::mod::sys::usercopy::copy_value_from_task(*task, a5, option_len) || option_len > SOCKET_OPTION_MAX ||
+                (option_len != 0 && a4 == 0) || !ker::mod::sys::usercopy::ensure_writable(*task, a5, sizeof(option_len)) ||
+                (option_len != 0 && !ker::mod::sys::usercopy::ensure_writable(*task, a4, option_len))) {
+                return static_cast<uint64_t>(option_len > SOCKET_OPTION_MAX ? -EINVAL : -EFAULT);
+            }
+            size_t const OPTION_CAPACITY = option_len;
+
+            uint8_t stack_option[SOCKET_IO_BOUNCE_STACK_CHUNK];
+            std::unique_ptr<uint8_t[]> heap_option{};
+            uint8_t* const OPTION =
+                option_len != 0 ? socket_bounce_heap_or_stack(heap_option, stack_option, sizeof(stack_option), option_len) : nullptr;
+            if ((option_len != 0 && OPTION == nullptr) ||
+                (option_len != 0 && !ker::mod::sys::usercopy::copy_from_task(*task, a4, OPTION, option_len))) {
+                return static_cast<uint64_t>(OPTION == nullptr ? -ENOMEM : -EFAULT);
+            }
+
+            int const RESULT = sock != nullptr
+                                   ? sock->proto_ops->getsockopt(sock, static_cast<int>(a2), static_cast<int>(a3), OPTION, &option_len)
+                                   : ker::net::wki::wki_ipc_socket_getsockopt(proxy_file.file, static_cast<int>(a2), static_cast<int>(a3),
+                                                                              OPTION, &option_len);
+            if (RESULT < 0) {
+                return static_cast<uint64_t>(RESULT);
+            }
+            if (option_len > OPTION_CAPACITY) {
+                return static_cast<uint64_t>(-EOVERFLOW);
+            }
+            if ((option_len != 0 && !ker::mod::sys::usercopy::copy_to_task(*task, a4, OPTION, option_len)) ||
+                !ker::mod::sys::usercopy::copy_value_to_task(*task, a5, option_len)) {
+                return static_cast<uint64_t>(-EFAULT);
+            }
             return static_cast<uint64_t>(RESULT);
         }
 
@@ -1215,8 +1392,9 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             if (sock == nullptr) {
                 auto file_handle = fd_to_file(a1);
                 if (file_handle.file != nullptr && ker::net::wki::wki_ipc_is_socket_proxy_file(file_handle.file)) {
-                    int const RESULT = ker::net::wki::wki_ipc_socket_getpeername(file_handle.file, reinterpret_cast<void*>(a2),
-                                                                                 reinterpret_cast<size_t*>(a3));
+                    int const RESULT = socket_name_to_user(a2, a3, ker::net::SOCKADDR_V4_LEN, [&](void* addr, size_t* len) {
+                        return ker::net::wki::wki_ipc_socket_getpeername(file_handle.file, addr, len);
+                    });
                     return static_cast<uint64_t>(RESULT);
                 }
                 return static_cast<uint64_t>(-EBADF);
@@ -1225,12 +1403,14 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                 if (sock->remote_v4.port == 0 && sock->remote_v4.addr == 0) {
                     return static_cast<uint64_t>(-ENOTCONN);
                 }
-                auto* len_ptr = reinterpret_cast<size_t*>(a3);
-                fill_sockaddr_v4(reinterpret_cast<void*>(a2), len_ptr, sock->remote_v4.addr, sock->remote_v4.port);
+                int const RESULT = socket_name_to_user(a2, a3, ker::net::SOCKADDR_V4_LEN, [&](void* addr, size_t* len) {
+                    fill_sockaddr_v4(addr, len, sock->remote_v4.addr, sock->remote_v4.port);
+                    return 0;
+                });
+                return static_cast<uint64_t>(RESULT);
             } else {
                 return static_cast<uint64_t>(-EAFNOSUPPORT);
             }
-            return 0;
         }
 
         case ker::abi::net::ops::GETSOCKNAME: {
@@ -1241,18 +1421,19 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                 return static_cast<uint64_t>(-EBADF);
             }
             if (sock->domain == 2) {  // AF_INET
-                auto* len_ptr = reinterpret_cast<size_t*>(a3);
-                fill_sockaddr_v4(reinterpret_cast<void*>(a2), len_ptr, sock->local_v4.addr, sock->local_v4.port);
+                int const RESULT = socket_name_to_user(a2, a3, ker::net::SOCKADDR_V4_LEN, [&](void* addr, size_t* len) {
+                    fill_sockaddr_v4(addr, len, sock->local_v4.addr, sock->local_v4.port);
+                    return 0;
+                });
+                return static_cast<uint64_t>(RESULT);
             } else {
                 return static_cast<uint64_t>(-EAFNOSUPPORT);
             }
-            return 0;
         }
 
         case ker::abi::net::ops::IOCTL_NET: {
             // a1=request, a2=arg_ptr
             auto request = static_cast<uint32_t>(a1);
-            auto* arg = reinterpret_cast<uint8_t*>(a2);
 
             // ifreq layout: name[16] + union[16+]
             // sockaddr_in within ifreq: offset 16=sa_family(2), 18=sin_port(2), 20=sin_addr(4)
@@ -1273,6 +1454,28 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             constexpr uint32_t SIOC_SIFTXQLEN = 0x8943;
             constexpr uint32_t SIOC_ADDRT = 0x890B;
             constexpr uint32_t SIOC_DELRT = 0x890C;
+
+            constexpr size_t IFREQ_BYTES = 40;
+            constexpr size_t ROUTE_INPUT_BYTES = 48;
+            std::array<uint8_t, ROUTE_INPUT_BYTES> arg_storage{};
+            auto* task = ker::mod::sched::get_current_task();
+            if (task == nullptr) {
+                return static_cast<uint64_t>(-ESRCH);
+            }
+            size_t const ARG_BYTES = (request == SIOC_ADDRT || request == SIOC_DELRT) ? ROUTE_INPUT_BYTES : IFREQ_BYTES;
+            if (!ker::mod::sys::usercopy::copy_from_task(*task, a2, arg_storage.data(), ARG_BYTES)) {
+                return static_cast<uint64_t>(-EFAULT);
+            }
+            bool const COPIES_OUT = request == SIOC_GIFFLAGS || request == SIOC_GIFADDR || request == SIOC_GIFNETMASK ||
+                                    request == SIOC_GIFHWADDR || request == SIOC_GIFMTU || request == SIOC_GIFINDEX ||
+                                    request == SIOC_GIFTXQLEN;
+            if (COPIES_OUT && !ker::mod::sys::usercopy::ensure_writable(*task, a2, IFREQ_BYTES)) {
+                return static_cast<uint64_t>(-EFAULT);
+            }
+            auto* arg = arg_storage.data();
+            auto copy_ifreq_out = [&]() -> uint64_t {
+                return ker::mod::sys::usercopy::copy_to_task(*task, a2, arg, IFREQ_BYTES) ? 0 : static_cast<uint64_t>(-EFAULT);
+            };
 
             if (request == SIOC_ADDRT || request == SIOC_DELRT) {
                 // rtentry layout (x86_64):
@@ -1371,7 +1574,7 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             switch (request) {
                 case SIOC_GIFFLAGS: {
                     store_unaligned<int16_t>(arg + 16, static_cast<int16_t>(effective_ifflags(dev)));
-                    return 0;
+                    return copy_ifreq_out();
                 }
                 case SIOC_SIFFLAGS: {
                     auto flags = static_cast<uint32_t>(load_unaligned<uint16_t>(arg + 16));
@@ -1387,7 +1590,7 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                     std::memset(arg + 16, 0, 16);
                     store_unaligned<uint16_t>(arg + 16, 2);  // AF_INET
                     store_unaligned<uint32_t>(arg + 20, ker::net::htonl(nif->ipv4_addrs[0].addr));
-                    return 0;
+                    return copy_ifreq_out();
                 }
                 case SIOC_SIFADDR: {
                     uint32_t const ADDR = ker::net::ntohl(load_unaligned<uint32_t>(arg + 20));
@@ -1412,7 +1615,7 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                     std::memset(arg + 16, 0, 16);
                     store_unaligned<uint16_t>(arg + 16, 2);  // AF_INET
                     store_unaligned<uint32_t>(arg + 20, ker::net::htonl(nif->ipv4_addrs[0].netmask));
-                    return 0;
+                    return copy_ifreq_out();
                 }
                 case SIOC_SIFNETMASK: {
                     uint32_t const MASK = ker::net::ntohl(load_unaligned<uint32_t>(arg + 20));
@@ -1432,11 +1635,11 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                     std::memset(arg + 16, 0, 16);
                     store_unaligned<uint16_t>(arg + 16, (dev->link_flags & IFF_LOOPBACK) != 0 ? WOS_ARPHRD_LOOPBACK : WOS_ARPHRD_ETHER);
                     std::memcpy(arg + 18, dev->mac.data(), 6);
-                    return 0;
+                    return copy_ifreq_out();
                 }
                 case SIOC_GIFMTU: {
                     store_unaligned<int32_t>(arg + 16, static_cast<int32_t>(dev->mtu));
-                    return 0;
+                    return copy_ifreq_out();
                 }
                 case SIOC_SIFMTU: {
                     auto const MTU = load_unaligned<int32_t>(arg + 16);
@@ -1448,7 +1651,7 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                 }
                 case SIOC_GIFTXQLEN: {
                     store_unaligned<int32_t>(arg + 16, static_cast<int32_t>(dev->tx_queue_len));
-                    return 0;
+                    return copy_ifreq_out();
                 }
                 case SIOC_SIFTXQLEN: {
                     auto const QLEN = load_unaligned<int32_t>(arg + 16);
@@ -1470,7 +1673,7 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                 }
                 case SIOC_GIFINDEX: {
                     store_unaligned<int32_t>(arg + 16, static_cast<int32_t>(dev->ifindex));
-                    return 0;
+                    return copy_ifreq_out();
                 }
                 default:
                     return static_cast<uint64_t>(-ENOSYS);
@@ -1481,12 +1684,16 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             // a1 = ptr to { char ifname[16]; uint64_t cpu_mask }
             // cpu_mask: each set bit (from LSB) is the CPU for the next queue pair:
             //   pair 0 ← CPU of lowest set bit, pair 1 ← CPU of next set bit, ...
-            auto* req = reinterpret_cast<uint8_t*>(a1);
-            if (req == nullptr) {
-                return static_cast<uint64_t>(-EINVAL);
+            std::array<uint8_t, 24> request{};
+            auto* task = ker::mod::sched::get_current_task();
+            if (task == nullptr) {
+                return static_cast<uint64_t>(-ESRCH);
             }
-            std::string_view const IFNAME(reinterpret_cast<char*>(req), strnlen(reinterpret_cast<char*>(req), 16));
-            auto const CPU_MASK = load_unaligned<uint64_t>(req + 16);
+            if (!ker::mod::sys::usercopy::copy_from_task(*task, a1, request.data(), request.size())) {
+                return static_cast<uint64_t>(-EFAULT);
+            }
+            std::string_view const IFNAME(reinterpret_cast<char*>(request.data()), strnlen(reinterpret_cast<char*>(request.data()), 16));
+            auto const CPU_MASK = load_unaligned<uint64_t>(request.data() + 16);
             auto* dev = ker::net::netdev_find_by_name(IFNAME);
             if (dev == nullptr) {
                 return static_cast<uint64_t>(-ENODEV);
@@ -1506,31 +1713,45 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
         }
 
         case ker::abi::net::ops::NETCTL_IF_LIST: {
-            auto* out = reinterpret_cast<WosNetIfInfo*>(a1);
-            auto* count_ptr = reinterpret_cast<size_t*>(a2);
-            if (count_ptr == nullptr) {
-                return static_cast<uint64_t>(-EINVAL);
+            auto* task = ker::mod::sched::get_current_task();
+            if (task == nullptr) {
+                return static_cast<uint64_t>(-ESRCH);
             }
-            size_t const CAP = *count_ptr;
+            size_t capacity = 0;
+            if (!ker::mod::sys::usercopy::copy_value_from_task(*task, a2, capacity) ||
+                !ker::mod::sys::usercopy::ensure_writable(*task, a2, sizeof(capacity))) {
+                return static_cast<uint64_t>(-EFAULT);
+            }
             size_t const TOTAL = ker::net::netdev_count();
-            size_t const EMIT = (out != nullptr) ? std::min(CAP, TOTAL) : 0;
-            for (size_t i = 0; i < EMIT; i++) {
-                fill_if_info(out[i], ker::net::netdev_at(i));
+            size_t const EMIT = a1 != 0 ? std::min(capacity, TOTAL) : 0;
+            size_t const OUTPUT_BYTES = EMIT * sizeof(WosNetIfInfo);
+            if (OUTPUT_BYTES != 0 && !ker::mod::sys::usercopy::ensure_writable(*task, a1, OUTPUT_BYTES)) {
+                return static_cast<uint64_t>(-EFAULT);
             }
-            *count_ptr = TOTAL;
+            std::array<WosNetIfInfo, ker::net::MAX_NET_DEVICES> output{};
+            for (size_t i = 0; i < EMIT; i++) {
+                fill_if_info(output.at(i), ker::net::netdev_at(i));
+            }
+            if ((OUTPUT_BYTES != 0 && !ker::mod::sys::usercopy::copy_to_task(*task, a1, output.data(), OUTPUT_BYTES)) ||
+                !ker::mod::sys::usercopy::copy_value_to_task(*task, a2, TOTAL)) {
+                return static_cast<uint64_t>(-EFAULT);
+            }
             return 0;
         }
 
         case ker::abi::net::ops::NETCTL_ADDR_LIST: {
-            auto* out = reinterpret_cast<WosNetAddrInfo*>(a1);
-            auto* count_ptr = reinterpret_cast<size_t*>(a2);
-            if (count_ptr == nullptr) {
-                return static_cast<uint64_t>(-EINVAL);
+            auto* task = ker::mod::sched::get_current_task();
+            if (task == nullptr) {
+                return static_cast<uint64_t>(-ESRCH);
+            }
+            size_t capacity = 0;
+            if (!ker::mod::sys::usercopy::copy_value_from_task(*task, a2, capacity) ||
+                !ker::mod::sys::usercopy::ensure_writable(*task, a2, sizeof(capacity))) {
+                return static_cast<uint64_t>(-EFAULT);
             }
 
-            size_t const CAP = *count_ptr;
+            std::array<WosNetAddrInfo, ker::net::MAX_NET_DEVICES * ker::net::MAX_ADDRS_PER_IF> output{};
             size_t total = 0;
-            size_t written = 0;
             for (size_t i = 0; i < ker::net::netdev_count(); i++) {
                 auto* dev = ker::net::netdev_at(i);
                 auto* nif = ker::net::netif_find_by_dev(dev);
@@ -1538,101 +1759,138 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                     continue;
                 }
                 for (size_t j = 0; j < nif->ipv4_addr_count; j++) {
-                    if (out != nullptr && written < CAP) {
-                        auto& info = out[written];
-                        info = {};
-                        info.ifindex = dev->ifindex;
-                        info.family = WOS_AF_INET;
-                        info.prefix_len = mask_to_prefix(nif->ipv4_addrs[j].netmask);
-                        info.scope = (nif->ipv4_addrs[j].addr >> 24) == 127 ? 254 : 0;  // RT_SCOPE_HOST/global
-                        info.flags = WOS_IFA_F_PERMANENT;
-                        copy_cstr_trunc(std::span<char, WOS_NET_IF_NAME_LEN>{info.label}, dev->name.data());
-                        uint32_t addr_be = ker::net::htonl(nif->ipv4_addrs[j].addr);
-                        uint32_t brd_be = ker::net::htonl(nif->ipv4_addrs[j].addr | ~nif->ipv4_addrs[j].netmask);
-                        std::memcpy(info.address, &addr_be, sizeof(addr_be));
-                        std::memcpy(info.local, &addr_be, sizeof(addr_be));
-                        std::memcpy(info.broadcast, &brd_be, sizeof(brd_be));
-                        written++;
-                    }
+                    auto& info = output.at(total);
+                    info.ifindex = dev->ifindex;
+                    info.family = WOS_AF_INET;
+                    info.prefix_len = mask_to_prefix(nif->ipv4_addrs[j].netmask);
+                    info.scope = (nif->ipv4_addrs[j].addr >> 24) == 127 ? 254 : 0;  // RT_SCOPE_HOST/global
+                    info.flags = WOS_IFA_F_PERMANENT;
+                    copy_cstr_trunc(std::span<char, WOS_NET_IF_NAME_LEN>{info.label}, dev->name.data());
+                    uint32_t addr_be = ker::net::htonl(nif->ipv4_addrs[j].addr);
+                    uint32_t brd_be = ker::net::htonl(nif->ipv4_addrs[j].addr | ~nif->ipv4_addrs[j].netmask);
+                    std::memcpy(info.address, &addr_be, sizeof(addr_be));
+                    std::memcpy(info.local, &addr_be, sizeof(addr_be));
+                    std::memcpy(info.broadcast, &brd_be, sizeof(brd_be));
                     total++;
                 }
             }
-            *count_ptr = total;
+
+            size_t const EMIT = a1 != 0 ? std::min(capacity, total) : 0;
+            size_t const OUTPUT_BYTES = EMIT * sizeof(WosNetAddrInfo);
+            if ((OUTPUT_BYTES != 0 && (!ker::mod::sys::usercopy::ensure_writable(*task, a1, OUTPUT_BYTES) ||
+                                       !ker::mod::sys::usercopy::copy_to_task(*task, a1, output.data(), OUTPUT_BYTES))) ||
+                !ker::mod::sys::usercopy::copy_value_to_task(*task, a2, total)) {
+                return static_cast<uint64_t>(-EFAULT);
+            }
             return 0;
         }
 
         case ker::abi::net::ops::NETCTL_ADDR_SET: {
-            const auto* req = reinterpret_cast<const WosNetAddrReq*>(a1);
-            if (req == nullptr || req->family != WOS_AF_INET) {
+            auto* task = ker::mod::sched::get_current_task();
+            WosNetAddrReq req{};
+            if (task == nullptr) {
+                return static_cast<uint64_t>(-ESRCH);
+            }
+            if (!ker::mod::sys::usercopy::copy_value_from_task(*task, a1, req)) {
+                return static_cast<uint64_t>(-EFAULT);
+            }
+            if (req.family != WOS_AF_INET) {
                 return static_cast<uint64_t>(-EINVAL);
             }
-            auto* dev = find_dev_by_ifindex(req->ifindex);
+            auto* dev = find_dev_by_ifindex(req.ifindex);
             if (dev == nullptr) {
                 return static_cast<uint64_t>(-ENODEV);
             }
             uint32_t addr_be = 0;
-            std::memcpy(&addr_be, req->local, sizeof(addr_be));
+            std::memcpy(&addr_be, req.local, sizeof(addr_be));
             if (addr_be == 0) {
-                std::memcpy(&addr_be, req->address, sizeof(addr_be));
+                std::memcpy(&addr_be, req.address, sizeof(addr_be));
             }
             uint32_t const ADDR = ker::net::ntohl(addr_be);
-            uint32_t const MASK = prefix_to_mask(req->prefix_len);
-            int const RET = ker::net::netif_set_ipv4(dev, ADDR, MASK, req->replace != 0);
+            uint32_t const MASK = prefix_to_mask(req.prefix_len);
+            int const RET = ker::net::netif_set_ipv4(dev, ADDR, MASK, req.replace != 0);
             return static_cast<uint64_t>(RET);
         }
 
         case ker::abi::net::ops::NETCTL_ADDR_DEL: {
-            const auto* req = reinterpret_cast<const WosNetAddrReq*>(a1);
-            if (req == nullptr || req->family != WOS_AF_INET) {
+            auto* task = ker::mod::sched::get_current_task();
+            WosNetAddrReq req{};
+            if (task == nullptr) {
+                return static_cast<uint64_t>(-ESRCH);
+            }
+            if (!ker::mod::sys::usercopy::copy_value_from_task(*task, a1, req)) {
+                return static_cast<uint64_t>(-EFAULT);
+            }
+            if (req.family != WOS_AF_INET) {
                 return static_cast<uint64_t>(-EINVAL);
             }
-            auto* dev = find_dev_by_ifindex(req->ifindex);
+            auto* dev = find_dev_by_ifindex(req.ifindex);
             if (dev == nullptr) {
                 return static_cast<uint64_t>(-ENODEV);
             }
             uint32_t addr_be = 0;
-            std::memcpy(&addr_be, req->local, sizeof(addr_be));
+            std::memcpy(&addr_be, req.local, sizeof(addr_be));
             if (addr_be == 0) {
-                std::memcpy(&addr_be, req->address, sizeof(addr_be));
+                std::memcpy(&addr_be, req.address, sizeof(addr_be));
             }
             uint32_t const ADDR = ker::net::ntohl(addr_be);
-            uint32_t const MASK = prefix_to_mask(req->prefix_len);
+            uint32_t const MASK = prefix_to_mask(req.prefix_len);
             int const RET = ker::net::netif_del_ipv4(dev, ADDR, MASK);
             return static_cast<uint64_t>(RET);
         }
 
         case ker::abi::net::ops::NETCTL_LINK_SET: {
-            const auto* req = reinterpret_cast<const WosNetLinkSetReq*>(a1);
-            auto* dev = find_dev_for_link_req(req);
+            auto* task = ker::mod::sched::get_current_task();
+            WosNetLinkSetReq req{};
+            if (task == nullptr) {
+                return static_cast<uint64_t>(-ESRCH);
+            }
+            if (!ker::mod::sys::usercopy::copy_value_from_task(*task, a1, req)) {
+                return static_cast<uint64_t>(-EFAULT);
+            }
+            auto* dev = find_dev_for_link_req(&req);
             if (dev == nullptr) {
                 return static_cast<uint64_t>(-ENODEV);
             }
 
-            if ((req->fields & WOS_NET_LINK_SET_FLAGS) != 0) {
-                apply_ifflags(dev, req->flags, req->flag_mask);
+            if ((req.fields & WOS_NET_LINK_SET_MTU) != 0 && req.mtu == 0) {
+                return static_cast<uint64_t>(-EINVAL);
             }
-            if ((req->fields & WOS_NET_LINK_SET_MTU) != 0) {
-                if (req->mtu == 0) {
+            if ((req.fields & WOS_NET_LINK_SET_HWADDR) != 0 && req.hwaddr_len != 6) {
+                return static_cast<uint64_t>(-EINVAL);
+            }
+            if ((req.fields & WOS_NET_LINK_SET_NAME) != 0) {
+                size_t const NAME_LEN = strnlen(req.new_name, WOS_NET_IF_NAME_LEN);
+                if (NAME_LEN == 0 || NAME_LEN >= WOS_NET_IF_NAME_LEN) {
                     return static_cast<uint64_t>(-EINVAL);
                 }
-                dev->mtu = req->mtu;
+                if (ker::net::netdev_find_by_name(std::string_view(req.new_name, NAME_LEN)) != nullptr) {
+                    return static_cast<uint64_t>(-EEXIST);
+                }
             }
-            if ((req->fields & WOS_NET_LINK_SET_TXQLEN) != 0) {
-                dev->tx_queue_len = req->tx_queue_len;
+
+            if ((req.fields & WOS_NET_LINK_SET_FLAGS) != 0) {
+                apply_ifflags(dev, req.flags, req.flag_mask);
             }
-            if ((req->fields & WOS_NET_LINK_SET_HWADDR) != 0) {
-                int const RET = set_netdev_hwaddr(dev, req->hwaddr, req->hwaddr_len);
+            if ((req.fields & WOS_NET_LINK_SET_MTU) != 0) {
+                dev->mtu = req.mtu;
+            }
+            if ((req.fields & WOS_NET_LINK_SET_TXQLEN) != 0) {
+                dev->tx_queue_len = req.tx_queue_len;
+            }
+            if ((req.fields & WOS_NET_LINK_SET_HWADDR) != 0) {
+                int const RET = set_netdev_hwaddr(dev, req.hwaddr, req.hwaddr_len);
                 if (RET < 0) {
                     return static_cast<uint64_t>(RET);
                 }
             }
-            if ((req->fields & WOS_NET_LINK_SET_NAME) != 0) {
-                int const RET = rename_netdev(dev, req->new_name);
+            if ((req.fields & WOS_NET_LINK_SET_NAME) != 0) {
+                int const RET = rename_netdev(dev, req.new_name);
                 if (RET < 0) {
                     return static_cast<uint64_t>(RET);
                 }
             }
-            if ((req->fields & (WOS_NET_LINK_SET_MTU | WOS_NET_LINK_SET_NAME)) != 0) {
+            if ((req.fields & (WOS_NET_LINK_SET_MTU | WOS_NET_LINK_SET_NAME)) != 0) {
                 ker::net::wki::wki_dev_server_notify_net_changed(dev);
                 ker::net::wki::wki_remotable_notify_net_changed(dev);
             }
@@ -1644,17 +1902,64 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             if (a1 > WOS_FD_SETSIZE) {
                 return static_cast<uint64_t>(-EINVAL);
             }
-            int const RESULT = run_select(static_cast<size_t>(a1), reinterpret_cast<uint8_t*>(a2), reinterpret_cast<uint8_t*>(a3),
-                                          reinterpret_cast<uint8_t*>(a4), reinterpret_cast<const KSelectTimeval*>(a5));
+            auto* task = ker::mod::sched::get_current_task();
+            if (task == nullptr) {
+                return static_cast<uint64_t>(-ESRCH);
+            }
+            std::array<uint8_t, WOS_FD_SET_BYTES> readfds{};
+            std::array<uint8_t, WOS_FD_SET_BYTES> writefds{};
+            std::array<uint8_t, WOS_FD_SET_BYTES> exceptfds{};
+            KSelectTimeval timeout{};
+
+            auto snapshot_fd_set = [&](uint64_t user_addr, std::array<uint8_t, WOS_FD_SET_BYTES>& set) -> bool {
+                return user_addr == 0 || (ker::mod::sys::usercopy::ensure_writable(*task, user_addr, set.size()) &&
+                                          ker::mod::sys::usercopy::copy_from_task(*task, user_addr, set.data(), set.size()));
+            };
+            if (!snapshot_fd_set(a2, readfds) || !snapshot_fd_set(a3, writefds) || !snapshot_fd_set(a4, exceptfds) ||
+                (a5 != 0 && !ker::mod::sys::usercopy::copy_value_from_task(*task, a5, timeout))) {
+                return static_cast<uint64_t>(-EFAULT);
+            }
+
+            int const RESULT = run_select(static_cast<size_t>(a1), a2 != 0 ? readfds.data() : nullptr, a3 != 0 ? writefds.data() : nullptr,
+                                          a4 != 0 ? exceptfds.data() : nullptr, a5 != 0 ? &timeout : nullptr);
+            if (RESULT >= 0 && ((a2 != 0 && !ker::mod::sys::usercopy::copy_to_task(*task, a2, readfds.data(), readfds.size())) ||
+                                (a3 != 0 && !ker::mod::sys::usercopy::copy_to_task(*task, a3, writefds.data(), writefds.size())) ||
+                                (a4 != 0 && !ker::mod::sys::usercopy::copy_to_task(*task, a4, exceptfds.data(), exceptfds.size())))) {
+                return static_cast<uint64_t>(-EFAULT);
+            }
             return static_cast<uint64_t>(RESULT);
         }
 
         case ker::abi::net::ops::POLL: {
             // a1=pollfd_array_ptr, a2=nfds, a3=timeout_ms (-1=block, 0=immediate)
-            auto* fds = reinterpret_cast<KPollFd*>(a1);
-            auto nfds = static_cast<size_t>(a2);
+            size_t const NFDS = static_cast<size_t>(a2);
+            if (NFDS > ker::mod::sched::task::Task::FD_TABLE_SIZE) {
+                return static_cast<uint64_t>(-EINVAL);
+            }
+            auto* task = ker::mod::sched::get_current_task();
+            if (task == nullptr) {
+                return static_cast<uint64_t>(-ESRCH);
+            }
+            size_t const FDS_BYTES = NFDS * sizeof(KPollFd);
+            if (FDS_BYTES != 0 &&
+                (!ker::mod::sys::usercopy::ensure_writable(*task, a1, FDS_BYTES) || !ker::mod::sys::usercopy::range_valid(a1, FDS_BYTES))) {
+                return static_cast<uint64_t>(-EFAULT);
+            }
+            auto* fds = NFDS != 0 ? new (std::nothrow) KPollFd[NFDS] : nullptr;
+            if (NFDS != 0 && fds == nullptr) {
+                return static_cast<uint64_t>(-ENOMEM);
+            }
+            if (FDS_BYTES != 0 && !ker::mod::sys::usercopy::copy_from_task(*task, a1, fds, FDS_BYTES)) {
+                delete[] fds;
+                return static_cast<uint64_t>(-EFAULT);
+            }
             auto timeout = static_cast<int>(static_cast<int64_t>(a3));
-            int const RESULT = run_poll_wait(fds, nfds, timeout, "poll");
+            int const RESULT = run_poll_wait(fds, NFDS, timeout, "poll");
+            if (RESULT >= 0 && FDS_BYTES != 0 && !ker::mod::sys::usercopy::copy_to_task(*task, a1, fds, FDS_BYTES)) {
+                delete[] fds;
+                return static_cast<uint64_t>(-EFAULT);
+            }
+            delete[] fds;
             return static_cast<uint64_t>(RESULT);
         }
 

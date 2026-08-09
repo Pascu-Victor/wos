@@ -8,7 +8,6 @@
 #include "platform/asm/cpu.hpp"
 #include "platform/interrupt/gates.hpp"
 #include "platform/interrupt/gdt.hpp"
-#include "platform/mm/addr.hpp"
 #include "platform/mm/mm.hpp"
 #include "platform/mm/paging.hpp"
 #include "platform/mm/virt.hpp"
@@ -134,17 +133,6 @@ void write_task_syscall_return(Task& task, uint64_t user_rsp, uint64_t user_rip,
     per_cpu->syscall_ret_flags = user_flags;
 }
 
-auto user_range_valid(uint64_t start, size_t size) -> bool {
-    uint64_t const END = start + static_cast<uint64_t>(size);
-    return size != 0 && END >= start && END <= USER_ADDR_LIMIT;
-}
-
-auto user_copy_chunk(size_t remaining, uint64_t user_addr) -> size_t {
-    uint64_t const PAGE_OFFSET = user_addr & (ker::mod::mm::paging::PAGE_SIZE - 1);
-    uint64_t const PAGE_REMAINING = ker::mod::mm::paging::PAGE_SIZE - PAGE_OFFSET;
-    return remaining < PAGE_REMAINING ? remaining : static_cast<size_t>(PAGE_REMAINING);
-}
-
 auto task_stack_contains(const Task& task, uint64_t start, uint64_t end) -> bool {
     if (task.thread == nullptr || task.thread->stack_size == 0) {
         return false;
@@ -155,7 +143,7 @@ auto task_stack_contains(const Task& task, uint64_t start, uint64_t end) -> bool
 }
 
 auto ensure_signal_frame_destination(Task& task, uint64_t frame_addr) -> bool {
-    if (task.pagemap == nullptr || !user_range_valid(frame_addr, sizeof(ker::mod::sys::signal::SignalFrame))) {
+    if (task.pagemap == nullptr || !ker::mod::sys::usercopy::range_valid(frame_addr, sizeof(ker::mod::sys::signal::SignalFrame))) {
         return false;
     }
 
@@ -165,66 +153,40 @@ auto ensure_signal_frame_destination(Task& task, uint64_t frame_addr) -> bool {
         return false;
     }
 
-    uint64_t const PAGE_END = page_align_up(FRAME_END);
-    for (uint64_t page = page_align_down(frame_addr); page < PAGE_END; page += ker::mod::mm::paging::PAGE_SIZE) {
-        if (!ker::mod::mm::virt::ensure_user_page_writable(&task, page)) {
-            return false;
-        }
-    }
-    return true;
+    return ker::mod::sys::usercopy::ensure_writable(task, frame_addr, sizeof(ker::mod::sys::signal::SignalFrame));
 }
 
 auto copy_from_task_user(Task& task, uint64_t user_addr, void* dst, size_t size) -> bool {
-    if (task.pagemap == nullptr || dst == nullptr || !user_range_valid(user_addr, size)) {
-        return false;
-    }
-
-    auto* out = static_cast<uint8_t*>(dst);
-    size_t copied = 0;
-    while (copied < size) {
-        uint64_t const CUR = user_addr + copied;
-        uint64_t const PHYS = ker::mod::mm::virt::translate(task.pagemap, CUR);
-        if (PHYS == ker::mod::mm::virt::PADDR_INVALID) {
-            return false;
-        }
-        size_t const CHUNK = user_copy_chunk(size - copied, CUR);
-        auto const* src = reinterpret_cast<const uint8_t*>(ker::mod::mm::addr::get_virt_pointer(PHYS));
-        std::memcpy(out + copied, src, CHUNK);
-        copied += CHUNK;
-    }
-    return true;
+    return ker::mod::sys::usercopy::copy_from_task(task, user_addr, dst, size);
 }
 
 auto copy_to_task_user(Task& task, uint64_t user_addr, const void* src, size_t size) -> bool {
-    if (task.pagemap == nullptr || src == nullptr || !user_range_valid(user_addr, size)) {
-        return false;
-    }
+    return ker::mod::sys::usercopy::copy_to_task(task, user_addr, src, size);
+}
 
-    auto const* in = static_cast<const uint8_t*>(src);
-    size_t copied = 0;
-    while (copied < size) {
-        uint64_t const CUR = user_addr + copied;
-        if (!ker::mod::mm::virt::ensure_user_page_writable(&task, CUR)) {
-            return false;
-        }
-        uint64_t const PHYS = ker::mod::mm::virt::translate(task.pagemap, CUR);
-        if (PHYS == ker::mod::mm::virt::PADDR_INVALID) {
-            return false;
-        }
-        size_t const CHUNK = user_copy_chunk(size - copied, CUR);
-        auto* dst = reinterpret_cast<uint8_t*>(ker::mod::mm::addr::get_virt_pointer(PHYS));
-        std::memcpy(dst, in + copied, CHUNK);
-        copied += CHUNK;
-    }
-    return true;
+auto copy_from_task_user_mapped(Task& task, uint64_t user_addr, void* dst, size_t size) -> bool {
+    return ker::mod::sys::usercopy::copy_from_task_mapped(task, user_addr, dst, size);
+}
+
+auto copy_to_task_user_mapped(Task& task, uint64_t user_addr, const void* src, size_t size) -> bool {
+    return ker::mod::sys::usercopy::copy_to_task_mapped(task, user_addr, src, size);
 }
 
 auto write_signal_frame(Task& task, uint64_t frame_addr, const ker::mod::sys::signal::SignalFrame& frame) -> bool {
     return ensure_signal_frame_destination(task, frame_addr) && copy_to_task_user(task, frame_addr, &frame, sizeof(frame));
 }
 
+auto write_signal_frame_mapped(Task& task, uint64_t frame_addr, const ker::mod::sys::signal::SignalFrame& frame) -> bool {
+    return ker::mod::sys::usercopy::range_valid(frame_addr, sizeof(frame)) &&
+           copy_to_task_user_mapped(task, frame_addr, &frame, sizeof(frame));
+}
+
 auto read_signal_frame(Task& task, uint64_t frame_addr, ker::mod::sys::signal::SignalFrame& frame) -> bool {
     return copy_from_task_user(task, frame_addr, &frame, sizeof(frame));
+}
+
+auto read_signal_frame_mapped(Task& task, uint64_t frame_addr, ker::mod::sys::signal::SignalFrame& frame) -> bool {
+    return copy_from_task_user_mapped(task, frame_addr, &frame, sizeof(frame));
 }
 
 auto signal_frame_saved_mask_value(const Task& task) -> uint64_t {
@@ -250,27 +212,56 @@ void handle_signal_frame_fault(Task* task) {
 
 namespace ker::mod::sys::signal {
 
-void sync_task_signal_mask_cache(sched::task::Task* task) {
-    if (task == nullptr || task->pagemap == nullptr || task->thread == nullptr || task->thread->fsbase == 0) {
-        return;
+namespace {
+
+auto sync_task_signal_mask_cache_impl(sched::task::Task* task, uint64_t tcb, bool mapped_only) -> bool {
+    if (task == nullptr || task->pagemap == nullptr || tcb == 0) {
+        return false;
     }
 
-    uint64_t const TCB = task->thread->fsbase;
+    static_assert(WOS_TCB_SIGNAL_CACHE_BYTES == WOS_TCB_SIGNAL_MASK_VALID_OFFSET + sizeof(uint32_t));
+    if (!ker::mod::sys::usercopy::range_valid(tcb, WOS_TCB_SIGNAL_CACHE_BYTES)) {
+        return false;
+    }
     uint32_t invalid = 0;
     uint32_t valid = 1;
     uint64_t const MASK = task->signal_mask_bits();
     uint64_t const SEQ = task->signal_mask_next_seq();
 
-    if (!copy_to_task_user(*task, TCB + WOS_TCB_SIGNAL_MASK_VALID_OFFSET, &invalid, sizeof(invalid))) {
+    auto copy_cache_field = [&](uint64_t addr, const void* value, size_t size) -> bool {
+        return mapped_only ? copy_to_task_user_mapped(*task, addr, value, size) : copy_to_task_user(*task, addr, value, size);
+    };
+
+    if (!copy_cache_field(tcb + WOS_TCB_SIGNAL_MASK_VALID_OFFSET, &invalid, sizeof(invalid))) {
+        return false;
+    }
+    if (!copy_cache_field(tcb + WOS_TCB_SIGNAL_MASK_OFFSET, &MASK, sizeof(MASK))) {
+        return false;
+    }
+    if (!copy_cache_field(tcb + WOS_TCB_SIGNAL_MASK_SEQ_OFFSET, &SEQ, sizeof(SEQ))) {
+        return false;
+    }
+    return copy_cache_field(tcb + WOS_TCB_SIGNAL_MASK_VALID_OFFSET, &valid, sizeof(valid));
+}
+
+}  // namespace
+
+void sync_task_signal_mask_cache(sched::task::Task* task) {
+    if (task == nullptr || task->thread == nullptr) {
         return;
     }
-    if (!copy_to_task_user(*task, TCB + WOS_TCB_SIGNAL_MASK_OFFSET, &MASK, sizeof(MASK))) {
+    (void)sync_task_signal_mask_cache_impl(task, task->thread->fsbase, false);
+}
+
+auto sync_task_signal_mask_cache_at(sched::task::Task* task, uint64_t tcb) -> bool {
+    return sync_task_signal_mask_cache_impl(task, tcb, false);
+}
+
+void sync_task_signal_mask_cache_mapped(sched::task::Task* task) {
+    if (task == nullptr || task->thread == nullptr) {
         return;
     }
-    if (!copy_to_task_user(*task, TCB + WOS_TCB_SIGNAL_MASK_SEQ_OFFSET, &SEQ, sizeof(SEQ))) {
-        return;
-    }
-    (void)copy_to_task_user(*task, TCB + WOS_TCB_SIGNAL_MASK_VALID_OFFSET, &valid, sizeof(valid));
+    (void)sync_task_signal_mask_cache_impl(task, task->thread->fsbase, true);
 }
 
 auto restore_deferred_sigreturn(sched::task::Task* task) -> DeferredSigreturnResult {
@@ -290,13 +281,13 @@ auto restore_deferred_sigreturn(sched::task::Task* task) -> DeferredSigreturnRes
 
     uint64_t const FRAME_START = USER_RSP - sizeof(uint64_t);
     SignalFrame frame{};
-    if (!read_signal_frame(*task, FRAME_START, frame) || !signal_return_frame_valid(frame)) {
+    if (!read_signal_frame_mapped(*task, FRAME_START, frame) || !signal_return_frame_valid(frame)) {
         handle_signal_frame_fault(task);
         return DeferredSigreturnResult::FAULT;
     }
 
     task->signal_mask_store(frame.saved_mask);
-    sync_task_signal_mask_cache(task);
+    sync_task_signal_mask_cache_mapped(task);
 
     auto* regs_arr = reinterpret_cast<uint64_t*>(&task->context.regs);
     for (int i = 0; i < 15; i++) {
@@ -446,7 +437,7 @@ auto handle_handoff_non_user_signal_action(Task* task, int signo, unsigned idx, 
             task->signal_clear_pending_mask(1ULL << idx);
             if (task->sigsuspend_active) {
                 task->signal_mask_store(task->signal_frame_saved_mask());
-                sync_task_signal_mask_cache(task);
+                sync_task_signal_mask_cache_mapped(task);
             }
             return true;
         }
@@ -465,7 +456,7 @@ auto handle_handoff_non_user_signal_action(Task* task, int signo, unsigned idx, 
         task->signal_clear_pending_mask(1ULL << idx);
         if (task->sigsuspend_active) {
             task->signal_mask_store(task->signal_frame_saved_mask());
-            sync_task_signal_mask_cache(task);
+            sync_task_signal_mask_cache_mapped(task);
         }
         return true;
     }
@@ -702,7 +693,7 @@ void check_pending_signals_interrupt(cpu::GPRegs& gpr, gates::InterruptFrame& fr
         if (SIGNO == WOS_SIGCHLD || SIGNO == WOS_SIGURG || SIGNO == WOS_SIGWINCH || SIGNO == WOS_SIGCONT) {
             if (task->sigsuspend_active) {
                 task->signal_mask_store(task->signal_frame_saved_mask());
-                sync_task_signal_mask_cache(task);
+                sync_task_signal_mask_cache_mapped(task);
             }
             return;
         }
@@ -724,7 +715,7 @@ void check_pending_signals_interrupt(cpu::GPRegs& gpr, gates::InterruptFrame& fr
         task->signal_clear_pending_mask(1ULL << IDX);
         if (task->sigsuspend_active) {
             task->signal_mask_store(task->signal_frame_saved_mask());
-            sync_task_signal_mask_cache(task);
+            sync_task_signal_mask_cache_mapped(task);
         }
         return;
     }
@@ -751,8 +742,11 @@ void check_pending_signals_interrupt(cpu::GPRegs& gpr, gates::InterruptFrame& fr
         sigframe.saved_regs.at(static_cast<size_t>(i)) = regs_arr[i];
     }
 
-    if (!write_signal_frame(*task, FRAME_ADDR, sigframe)) {
-        handle_signal_frame_fault(task);
+    // Interrupt return cannot fault in a lazy/COW stack page.  Leave an
+    // asynchronous signal pending so a later safe syscall-return path can
+    // construct the frame; a stable mapped-only copy still covers resident
+    // pages without dereferencing the userspace address directly.
+    if (!write_signal_frame_mapped(*task, FRAME_ADDR, sigframe)) {
         return;
     }
     consume_signal_frame_saved_mask(*task);
@@ -766,7 +760,7 @@ void check_pending_signals_interrupt(cpu::GPRegs& gpr, gates::InterruptFrame& fr
     if ((handler.flags & 0x40000000ULL) == 0U) {
         task->signal_add_mask_bits(1ULL << IDX);
     }
-    sync_task_signal_mask_cache(task);
+    sync_task_signal_mask_cache_mapped(task);
     task->in_signal_handler = true;
 }
 
@@ -814,7 +808,7 @@ auto deliver_synchronous_signal_interrupt(cpu::GPRegs& gpr, gates::InterruptFram
         sigframe.saved_regs.at(static_cast<size_t>(i)) = regs_arr[i];
     }
 
-    if (!write_signal_frame(*task, FRAME_ADDR, sigframe)) {
+    if (!write_signal_frame_mapped(*task, FRAME_ADDR, sigframe)) {
         handle_signal_frame_fault(task);
         return false;
     }
@@ -828,7 +822,7 @@ auto deliver_synchronous_signal_interrupt(cpu::GPRegs& gpr, gates::InterruptFram
     if ((handler.flags & 0x40000000ULL) == 0U) {
         task->signal_add_mask_bits(1ULL << IDX);
     }
-    sync_task_signal_mask_cache(task);
+    sync_task_signal_mask_cache_mapped(task);
     task->in_signal_handler = true;
     return true;
 }
@@ -880,8 +874,7 @@ void check_pending_signals_handoff(sched::task::Task* task, cpu::GPRegs& gpr, ga
         sigframe.saved_regs.at(static_cast<size_t>(i)) = regs_arr[i];
     }
 
-    if (!write_signal_frame(*task, FRAME_ADDR, sigframe)) {
-        handle_signal_frame_fault(task);
+    if (!write_signal_frame_mapped(*task, FRAME_ADDR, sigframe)) {
         return;
     }
     consume_signal_frame_saved_mask(*task);
@@ -897,7 +890,7 @@ void check_pending_signals_handoff(sched::task::Task* task, cpu::GPRegs& gpr, ga
     if ((handler.flags & 0x40000000ULL) == 0U) {
         task->signal_add_mask_bits(1ULL << IDX);
     }
-    sync_task_signal_mask_cache(task);
+    sync_task_signal_mask_cache_mapped(task);
     task->in_signal_handler = true;
     task->context.regs = gpr;
     task->context.frame = frame;
@@ -946,7 +939,7 @@ void check_pending_signals_deferred(sched::task::Task* task, DeferredSignalDeliv
         if (SIGNO == WOS_SIGCHLD || SIGNO == WOS_SIGURG || SIGNO == WOS_SIGWINCH || SIGNO == WOS_SIGCONT) {
             if (task->sigsuspend_active) {
                 task->signal_mask_store(task->signal_frame_saved_mask());
-                sync_task_signal_mask_cache(task);
+                sync_task_signal_mask_cache_mapped(task);
             }
             return;
         }
@@ -963,7 +956,7 @@ void check_pending_signals_deferred(sched::task::Task* task, DeferredSignalDeliv
         task->signal_clear_pending_mask(1ULL << IDX);
         if (task->sigsuspend_active) {
             task->signal_mask_store(task->signal_frame_saved_mask());
-            sync_task_signal_mask_cache(task);
+            sync_task_signal_mask_cache_mapped(task);
         }
         return;
     }
@@ -986,8 +979,7 @@ void check_pending_signals_deferred(sched::task::Task* task, DeferredSignalDeliv
         sigframe.saved_regs.at(static_cast<size_t>(i)) = regs_arr[i];
     }
 
-    if (!write_signal_frame(*task, FRAME_ADDR, sigframe)) {
-        handle_signal_frame_fault(task);
+    if (!write_signal_frame_mapped(*task, FRAME_ADDR, sigframe)) {
         return;
     }
     consume_signal_frame_saved_mask(*task);
@@ -1002,7 +994,7 @@ void check_pending_signals_deferred(sched::task::Task* task, DeferredSignalDeliv
     if ((handler.flags & 0x40000000ULL) == 0U) {
         task->signal_add_mask_bits(1ULL << IDX);
     }
-    sync_task_signal_mask_cache(task);
+    sync_task_signal_mask_cache_mapped(task);
     task->in_signal_handler = true;
 }
 

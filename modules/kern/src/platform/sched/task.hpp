@@ -247,7 +247,8 @@ struct Task {
     // tcbVaddr: virtual address of the mlibc TCB (becomes FS base / fsbase).
     // userSp:   prepared stack pointer (sys_prepare_stack pushed entry+user_arg below it).
     // enterThreadVa: virtual address of __mlibc_enter_thread in the process image.
-    static auto create_user_thread(Task* parent, uint64_t tcb_vaddr, uint64_t user_sp, uint64_t enter_thread_va) -> Task*;
+    static auto create_user_thread(Task* parent, uint64_t tcb_vaddr, uint64_t user_sp, uint64_t enter_thread_va, uint64_t entry_va,
+                                   uint64_t user_arg_va) -> Task*;
 
     Task(const Task& task) = delete;
 
@@ -294,6 +295,11 @@ struct Task {
 
     TaskType type{TaskType::DAEMON};
     mm::paging::PageTable* pagemap{};
+    // Usercopy acquires a short-lived access before faulting or pinning one
+    // page. Pagemap replacement/teardown closes the gate and waits for those
+    // accesses before publishing a new root or freeing the old hierarchy.
+    std::atomic<uint32_t> usercopy_pagemap_accesses{0};
+    std::atomic<bool> usercopy_pagemap_closing{false};
     uint64_t entry{};
     void (*kthread_entry)(){};  // Kernel thread entry (DAEMON only), nullptr otherwise
     const char* name{};
@@ -747,6 +753,12 @@ struct Task {
 
     void load_context(cpu::GPRegs* gpr);
     void save_context(cpu::GPRegs* gpr) const;
+
+    [[nodiscard]] auto try_acquire_usercopy_pagemap(mm::paging::PageTable*& out) -> bool;
+    void release_usercopy_pagemap();
+    void quiesce_usercopy_pagemap();
+    [[nodiscard]] auto detach_pagemap_after_usercopy_quiescence() -> mm::paging::PageTable*;
+    [[nodiscard]] auto replace_pagemap_after_usercopy_quiescence(mm::paging::PageTable* replacement) -> mm::paging::PageTable*;
 
     // Try to acquire a reference to this task.
     // Returns false if task is EXITING or DEAD.

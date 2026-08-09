@@ -43,6 +43,17 @@ struct UserMemoryStats {
     uint64_t page_table_pages;
 };
 
+struct UserPagePin {
+    PageTable* pagemap{};
+    vaddr_t user_page{};
+    paddr_t physical_page{static_cast<paddr_t>(-1)};
+    void* hhdm_page{};
+    phys::PageLookupHint lookup_hint{};
+    size_t access_gate_index{static_cast<size_t>(-1)};
+    bool require_writable{};
+    bool dirty{};
+};
+
 struct DestroyUserSpaceStats {
     uint64_t calls;
     uint64_t collect_frames_us_total;
@@ -163,6 +174,17 @@ void map_range_to_kernel_page_table(Range range, uint64_t flags);
 static constexpr paddr_t PADDR_INVALID = static_cast<paddr_t>(-1);
 
 paddr_t translate(PageTable* page_table, vaddr_t vaddr);
+[[nodiscard]] auto pin_user_page(PageTable* pagemap, vaddr_t vaddr, bool require_writable, UserPagePin& out, bool wait_for_teardown = false)
+    -> bool;
+// Acquires the shared pagemap lifetime gate before optional lazy/COW
+// resolution, then transfers that read-side hold into out until unpin.
+[[nodiscard]] auto pin_user_page_for_task(sched::task::Task* task, PageTable* expected_pagemap, vaddr_t vaddr, bool require_writable,
+                                          bool fault_in, UserPagePin& out) -> bool;
+[[nodiscard]] auto user_page_pin_still_mapped(const UserPagePin& pin) -> bool;
+// Linearizes an HHDM write against leaf replacement and records the same PTE
+// dirty state that a hardware write through the user mapping would set.
+[[nodiscard]] auto user_page_pin_commit_write(const UserPagePin& pin) -> bool;
+void unpin_user_page(UserPagePin& pin);
 #ifdef WOS_SELFTEST
 // Low-perturbation allocator guard. Before init_pagemap() completes this is a
 // no-op; afterwards it reports the exact live page-table path for a missing or
@@ -172,6 +194,9 @@ bool selftest_direct_map_contains(const void* ptr);
 // kernel hierarchy. The registry is append-only so an illegal release remains
 // detectable even after the frame has been returned to the buddy allocator.
 bool selftest_kernel_page_table_frame(const void* ptr);
+// Models the teardown/fork writer side of the shared-pagemap gate and proves
+// an IRQ/scheduler-style mapped pin fails closed instead of waiting or walking.
+bool selftest_user_pagemap_exclusive_rejects_mapped_pin(PageTable* pagemap);
 #endif
 auto install_lazy_file_page_if_current(sched::task::Task* task, const sched::task::LazyVmemRange& range, vaddr_t page_vaddr,
                                        paddr_t page_paddr, uint64_t page_flags) -> LazyFilePageInstallResult;

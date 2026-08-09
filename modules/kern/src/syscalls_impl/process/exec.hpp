@@ -17,11 +17,11 @@ struct Stat;
 
 namespace ker::syscall::process {
 
-uint64_t wos_proc_exec(const char* path, const char* const* argv, const char* const* envp);
-uint64_t wos_proc_spawn(const char* path, const char* const* argv, const char* const* envp, const ker::abi::process::SpawnOptions* options);
+uint64_t wos_proc_exec(uint64_t path_addr, uint64_t argv_addr, uint64_t envp_addr);
+uint64_t wos_proc_spawn(uint64_t path_addr, uint64_t argv_addr, uint64_t envp_addr, uint64_t options_addr);
 
 // POSIX execve: replace current process image. On success, does not return.
-uint64_t wos_proc_execve(const char* path, const char* const* argv, const char* const* envp, ker::mod::cpu::GPRegs& gpr);
+uint64_t wos_proc_execve(uint64_t path_addr, uint64_t argv_addr, uint64_t envp_addr, ker::mod::cpu::GPRegs& gpr);
 
 // Creates an unpublished process from a retained executable file using the
 // bounded-metadata/lazy-page ELF path. This function consumes both owned_file

@@ -8,5 +8,5 @@
 
 namespace ker::syscall::multiproc {
 [[noreturn]] void wos_thread_exit_current();
-auto thread_control(ker::abi::multiproc::threadControlOps op, void* arg1, void* arg2, void* arg3) -> uint64_t;
+auto thread_control(ker::abi::multiproc::threadControlOps op, uint64_t arg1, uint64_t arg2, uint64_t arg3) -> uint64_t;
 }  // namespace ker::syscall::multiproc

@@ -899,19 +899,18 @@ void start_smt(boot::HandoverModules& modules, uint64_t kernel_rsp) {
 
 auto cpu_count() -> uint64_t { return g_cpu_count; }
 
-// update fsbase in current thread and switch the fs_base register
-auto set_tcb(void* tcb) -> uint64_t {
+// Update fsbase in the current thread and switch the FS_BASE register. The
+// syscall layer initializes the userspace TCB before entering this helper.
+auto set_tcb(uint64_t tcb_addr) -> uint64_t {
     asm volatile("cli");
     // Use scheduler's getCurrentTask() to get the correct per-CPU task
     auto* current_task = sched::get_current_task();
 #ifdef TASK_DEBUG
     mod::dbg::log("setTcb: task=%s pid=%d tcb=0x%x old_fsbase=0x%x", currentTask->name ? currentTask->name : "null", currentTask->pid,
-                  (uint64_t)tcb, currentTask->thread ? currentTask->thread->fsbase : 0);
+                  tcb_addr, currentTask->thread ? currentTask->thread->fsbase : 0);
 #endif
-    auto const TCB_ADDR = reinterpret_cast<uint64_t>(tcb);
-    current_task->thread->fsbase = TCB_ADDR;
-    *static_cast<uint64_t*>(tcb) = TCB_ADDR;
-    cpu::wrfsbase(TCB_ADDR);
+    current_task->thread->fsbase = tcb_addr;
+    cpu::wrfsbase(tcb_addr);
     asm volatile("sti");
     return 0;
 }

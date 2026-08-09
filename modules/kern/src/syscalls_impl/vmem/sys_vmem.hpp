@@ -48,6 +48,8 @@ auto file_mmap_cache_reclaim(size_t max_pages) -> size_t;
 auto materialize_lazy_file_page(ker::mod::sched::task::Task* task, const ker::mod::sched::task::LazyVmemRange& range, uint64_t page_vaddr,
                                 const ker::mod::mm::paging::PageFault& fault) -> bool;
 auto clone_file_mmap_ranges_for_pagemap(ker::mod::mm::paging::PageTable* src, ker::mod::mm::paging::PageTable* dst) -> bool;
+// The pagemap must be unpublished or all Tasks that published it must have
+// completed usercopy quiescence before teardown starts.
 void release_file_mmap_ranges_for_pagemap(ker::mod::mm::paging::PageTable* pagemap);
 
 }  // namespace ker::syscall::vmem

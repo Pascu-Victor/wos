@@ -18,6 +18,7 @@
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
 #include <platform/sys/spinlock.hpp>
+#include <platform/sys/usercopy.hpp>
 
 namespace ker::syscall::shm {
 namespace {
@@ -60,6 +61,16 @@ int g_next_id = 1;
 auto current_task() -> ker::mod::sched::task::Task* { return ker::mod::sched::get_current_task(); }
 
 auto to_errno(int error) -> uint64_t { return static_cast<uint64_t>(-error); }
+
+auto align_shm_size(uint64_t size, uint64_t& aligned) -> bool {
+    constexpr uint64_t PAGE_MASK = ker::mod::mm::paging::PAGE_SIZE - 1;
+    aligned = 0;
+    if (size == 0 || size > UINT64_MAX - PAGE_MASK) {
+        return false;
+    }
+    aligned = page_align_up(size);
+    return aligned != 0 && aligned <= USER_SPACE_END - USER_SPACE_START;
+}
 
 auto process_pid_for_task(const ker::mod::sched::task::Task* task) -> uint64_t {
     if (task == nullptr) {
@@ -115,18 +126,16 @@ auto range_is_free(ker::mod::sched::task::Task* task, uint64_t addr, uint64_t si
 }
 
 auto find_free_range(ker::mod::sched::task::Task* task, uint64_t size, uint64_t hint) -> uint64_t {
-    if (task == nullptr || task->pagemap == nullptr || size == 0) {
+    if (task == nullptr || task->pagemap == nullptr || size == 0 || size > USER_SPACE_END - USER_SPACE_START) {
         return 0;
     }
 
-    size = page_align_up(size);
-
-    if (hint >= USER_SPACE_START && hint + size <= USER_SPACE_END && range_is_free(task, hint, size)) {
+    if (hint >= USER_SPACE_START && hint <= USER_SPACE_END - size && range_is_free(task, hint, size)) {
         return hint;
     }
 
     uint64_t current = SHM_SEARCH_START;
-    while (current + size <= USER_SPACE_END) {
+    while (current <= USER_SPACE_END - size) {
         if (range_is_free(task, current, size)) {
             return current;
         }
@@ -157,11 +166,11 @@ void maybe_release_destroyed_segment(ShmSegment& segment) {
 }
 
 auto create_segment(int key, uint64_t size, int shmflg, ker::mod::sched::task::Task* task) -> uint64_t {
-    if (size == 0) {
+    uint64_t aligned_size = 0;
+    if (!align_shm_size(size, aligned_size)) {
         return to_errno(EINVAL);
     }
-
-    size = page_align_up(size);
+    size = aligned_size;
     auto* slot = find_free_segment();
     if (slot == nullptr) {
         return to_errno(ENOSPC);
@@ -205,6 +214,14 @@ auto shmget_impl(int key, uint64_t size, int shmflg) -> uint64_t {
         return to_errno(ESRCH);
     }
 
+    uint64_t aligned_size = 0;
+    if (size != 0) {
+        if (!align_shm_size(size, aligned_size)) {
+            return to_errno(EINVAL);
+        }
+        size = aligned_size;
+    }
+
     uint64_t const FLAGS = g_lock.lock_irqsave();
 
     if (key != ker::abi::shm::IPC_PRIVATE) {
@@ -213,7 +230,7 @@ auto shmget_impl(int key, uint64_t size, int shmflg) -> uint64_t {
                 g_lock.unlock_irqrestore(FLAGS);
                 return to_errno(EEXIST);
             }
-            if (size != 0 && page_align_up(size) > existing->size) {
+            if (size != 0 && size > existing->size) {
                 g_lock.unlock_irqrestore(FLAGS);
                 return to_errno(EINVAL);
             }
@@ -248,7 +265,7 @@ auto shmat_impl(int shmid, uint64_t shmaddr, int shmflg) -> uint64_t {
 
     uint64_t const SIZE = segment->size;
     uint64_t const ADDR = shmaddr != 0 ? shmaddr : find_free_range(task, SIZE, 0);
-    if (ADDR == 0 || ADDR % ker::mod::mm::paging::PAGE_SIZE != 0 || ADDR < USER_SPACE_START || ADDR + SIZE > USER_SPACE_END ||
+    if (ADDR == 0 || ADDR % ker::mod::mm::paging::PAGE_SIZE != 0 || ADDR < USER_SPACE_START || ADDR > USER_SPACE_END - SIZE ||
         !range_is_free(task, ADDR, SIZE)) {
         g_lock.unlock_irqrestore(FLAGS);
         return to_errno(EINVAL);
@@ -357,16 +374,14 @@ auto shmctl_impl(int shmid, int cmd, uint64_t buf_addr) -> uint64_t {
             g_lock.unlock_irqrestore(FLAGS);
             return 0;
         case ker::abi::shm::IPC_STAT: {
-            if (buf_addr == 0) {
-                g_lock.unlock_irqrestore(FLAGS);
-                return to_errno(EFAULT);
-            }
             ker::abi::shm::ShmidDs stat{};
             fill_stat(*segment, stat);
             g_lock.unlock_irqrestore(FLAGS);
-            auto* user_buf = reinterpret_cast<ker::abi::shm::ShmidDs*>(buf_addr);
-            *user_buf = stat;
-            return 0;
+            auto* task = current_task();
+            if (task == nullptr || buf_addr == 0) {
+                return to_errno(EFAULT);
+            }
+            return ker::mod::sys::usercopy::copy_value_to_task(*task, buf_addr, stat) ? 0 : to_errno(EFAULT);
         }
         default:
             g_lock.unlock_irqrestore(FLAGS);

@@ -21,9 +21,6 @@
 #include <new>
 #include <platform/init/limine_requests.hpp>
 #include <platform/ktime/ktime.hpp>
-#include <platform/mm/addr.hpp>
-#include <platform/mm/phys.hpp>
-#include <platform/mm/virt.hpp>
 #include <platform/perf/perf_events.hpp>
 #include <platform/power/power.hpp>
 #include <platform/sched/scheduler.hpp>
@@ -250,15 +247,6 @@ struct MetadataInvalidationCheck {
     bool invalidated = true;
     uint64_t checked_generation = 0;
 };
-
-struct VfsFlockAbi {
-    int16_t l_type = 0;
-    int16_t l_whence = 0;
-    off_t l_start = 0;
-    off_t l_len = 0;
-    int32_t l_pid = 0;
-};
-static_assert(sizeof(VfsFlockAbi) == 32);
 
 constexpr int F_GETLK_CMD = 5;
 constexpr int F_SETLK_CMD = 6;
@@ -548,33 +536,6 @@ auto advisory_hash_path(const char* path) -> uint64_t {
         hash *= 1099511628211ULL;
     }
     return hash == 0 ? 1 : hash;
-}
-
-auto advisory_user_copy(uint64_t user_addr, void* kernel_buf, size_t size, bool to_user) -> int {
-    if (size == 0) {
-        return 0;
-    }
-    if (user_addr == 0 || kernel_buf == nullptr) {
-        return -EFAULT;
-    }
-
-    auto* task = ker::mod::sched::get_current_task();
-    if (task == nullptr || task->pagemap == nullptr) {
-        return -EFAULT;
-    }
-
-    bool const OK = to_user ? ker::mod::sys::usercopy::copy_to_task(*task, user_addr, kernel_buf, size)
-                            : ker::mod::sys::usercopy::copy_from_task(*task, user_addr, kernel_buf, size);
-    return OK ? 0 : -EFAULT;
-}
-
-auto advisory_copy_from_user(uint64_t user_addr, VfsFlockAbi& lock) -> int {
-    return advisory_user_copy(user_addr, &lock, sizeof(lock), false);
-}
-
-auto advisory_copy_to_user(uint64_t user_addr, const VfsFlockAbi& lock) -> int {
-    auto copy = lock;
-    return advisory_user_copy(user_addr, &copy, sizeof(copy), true);
 }
 
 auto advisory_build_key(File* file, AdvisoryFileKey& key, Stat* stat_out = nullptr, bool allow_backend_stat = true) -> int {
@@ -8288,11 +8249,12 @@ auto vfs_read_user_bounced(ker::mod::sched::task::Task& task, File* file, void* 
         }
 
         auto const BYTES_READ = static_cast<size_t>(READ_RET);
-        if (!ker::mod::sys::usercopy::copy_to_task(task, USER_BASE + total, BOUNCE_BUFFER, BYTES_READ)) {
+        auto const COPY = ker::mod::sys::usercopy::copy_to_task_partial(task, USER_BASE + total, BOUNCE_BUFFER, BYTES_READ);
+        total += COPY.bytes_copied;
+        if (COPY.fault) {
             return total > 0 ? finish(static_cast<ssize_t>(total)) : -EFAULT;
         }
 
-        total += BYTES_READ;
         if (BYTES_READ < TO_READ) {
             return finish(static_cast<ssize_t>(total));
         }
@@ -8384,6 +8346,9 @@ auto vfs_write_file_direct(File* f, const void* buf, size_t count, size_t* actua
     if ((f->fops == nullptr) || (f->fops->vfs_write == nullptr)) {
         return -EINVAL;
     }
+    if (buf == nullptr && count != 0) {
+        return -EFAULT;
+    }
     ssize_t result = 0;
     size_t append_offset = 0;
     bool const TMPFS_APPEND =
@@ -8453,20 +8418,25 @@ auto vfs_write_user_bounced(ker::mod::sched::task::Task& task, File* file, const
 
     while (total < count) {
         size_t const TO_WRITE = std::min(count - total, BOUNCE_CAPACITY);
-        if (!ker::mod::sys::usercopy::copy_from_task(task, USER_BASE + total, BOUNCE_BUFFER, TO_WRITE)) {
+        auto const COPY = ker::mod::sys::usercopy::copy_from_task_partial(task, USER_BASE + total, BOUNCE_BUFFER, TO_WRITE);
+        if (COPY.bytes_copied == 0 && COPY.fault) {
             return total > 0 ? finish(static_cast<ssize_t>(total)) : -EFAULT;
         }
 
-        ssize_t const WRITE_RET = clamp_io_count(vfs_write_file_direct(file, BOUNCE_BUFFER, TO_WRITE, nullptr), TO_WRITE);
+        size_t const TO_COMMIT = COPY.bytes_copied;
+        ssize_t const WRITE_RET = clamp_io_count(vfs_write_file_direct(file, BOUNCE_BUFFER, TO_COMMIT, nullptr), TO_COMMIT);
         if (WRITE_RET < 0) {
             return total > 0 ? finish(static_cast<ssize_t>(total)) : WRITE_RET;
         }
         if (WRITE_RET == 0) {
+            if (COPY.fault && total == 0) {
+                return -EFAULT;
+            }
             return finish(static_cast<ssize_t>(total));
         }
 
         total += static_cast<size_t>(WRITE_RET);
-        if (std::cmp_less(WRITE_RET, TO_WRITE)) {
+        if (std::cmp_less(WRITE_RET, TO_COMMIT) || COPY.fault) {
             return finish(static_cast<ssize_t>(total));
         }
     }
@@ -12383,20 +12353,25 @@ auto vfs_pwrite_user_bounced(ker::mod::sched::task::Task& task, File* file, cons
 
     while (total < count) {
         size_t const TO_WRITE = std::min(count - total, BOUNCE_CAPACITY);
-        if (!ker::mod::sys::usercopy::copy_from_task(task, USER_BASE + total, BOUNCE_BUFFER, TO_WRITE)) {
+        auto const COPY = ker::mod::sys::usercopy::copy_from_task_partial(task, USER_BASE + total, BOUNCE_BUFFER, TO_WRITE);
+        if (COPY.bytes_copied == 0 && COPY.fault) {
             return total > 0 ? static_cast<ssize_t>(total) : -EFAULT;
         }
 
-        ssize_t const WRITE_RET = clamp_io_count(file->fops->vfs_write(file, BOUNCE_BUFFER, TO_WRITE, offset + total), TO_WRITE);
+        size_t const TO_COMMIT = COPY.bytes_copied;
+        ssize_t const WRITE_RET = clamp_io_count(file->fops->vfs_write(file, BOUNCE_BUFFER, TO_COMMIT, offset + total), TO_COMMIT);
         if (WRITE_RET < 0) {
             return total > 0 ? static_cast<ssize_t>(total) : WRITE_RET;
         }
         if (WRITE_RET == 0) {
+            if (COPY.fault && total == 0) {
+                return -EFAULT;
+            }
             return static_cast<ssize_t>(total);
         }
 
         total += static_cast<size_t>(WRITE_RET);
-        if (std::cmp_less(WRITE_RET, TO_WRITE)) {
+        if (std::cmp_less(WRITE_RET, TO_COMMIT) || COPY.fault) {
             return static_cast<ssize_t>(total);
         }
     }
@@ -14021,7 +13996,7 @@ auto vfs_ftruncate(int fd, off_t length) -> int {
 }
 
 // --- fcntl ---
-auto vfs_fcntl(int fd, int cmd, uint64_t arg) -> int {
+auto vfs_fcntl(int fd, int cmd, uint64_t arg, VfsFlockAbi* flock) -> int {
     auto* task = ker::mod::sched::get_current_task();
     if (task == nullptr) {
         return -ESRCH;
@@ -14091,15 +14066,12 @@ auto vfs_fcntl(int fd, int cmd, uint64_t arg) -> int {
             return 0;
         case F_GETLK_CMD:
         case F_OFD_GETLK_CMD: {
-            VfsFlockAbi flock{};
-            int ret = advisory_copy_from_user(arg, flock);
-            if (ret == 0) {
-                AdvisoryOwnerKind const OWNER_KIND = cmd == F_OFD_GETLK_CMD ? AdvisoryOwnerKind::OPEN_FILE : AdvisoryOwnerKind::PROCESS;
-                ret = advisory_get_lock(f, ker::mod::sched::task::process_pid(*task), OWNER_KIND, AdvisoryLockFamily::RECORD, flock);
+            if (flock == nullptr) {
+                vfs_put_file(f);
+                return -EFAULT;
             }
-            if (ret == 0) {
-                ret = advisory_copy_to_user(arg, flock);
-            }
+            AdvisoryOwnerKind const OWNER_KIND = cmd == F_OFD_GETLK_CMD ? AdvisoryOwnerKind::OPEN_FILE : AdvisoryOwnerKind::PROCESS;
+            int const ret = advisory_get_lock(f, ker::mod::sched::task::process_pid(*task), OWNER_KIND, AdvisoryLockFamily::RECORD, *flock);
             vfs_put_file(f);
             return ret;
         }
@@ -14107,14 +14079,15 @@ auto vfs_fcntl(int fd, int cmd, uint64_t arg) -> int {
         case F_SETLKW_CMD:
         case F_OFD_SETLK_CMD:
         case F_OFD_SETLKW_CMD: {
-            VfsFlockAbi flock{};
-            int ret = advisory_copy_from_user(arg, flock);
-            if (ret == 0) {
-                AdvisoryOwnerKind const OWNER_KIND =
-                    (cmd == F_OFD_SETLK_CMD || cmd == F_OFD_SETLKW_CMD) ? AdvisoryOwnerKind::OPEN_FILE : AdvisoryOwnerKind::PROCESS;
-                bool const WAIT = cmd == F_SETLKW_CMD || cmd == F_OFD_SETLKW_CMD;
-                ret = advisory_set_lock(f, ker::mod::sched::task::process_pid(*task), OWNER_KIND, AdvisoryLockFamily::RECORD, flock, WAIT);
+            if (flock == nullptr) {
+                vfs_put_file(f);
+                return -EFAULT;
             }
+            AdvisoryOwnerKind const OWNER_KIND =
+                (cmd == F_OFD_SETLK_CMD || cmd == F_OFD_SETLKW_CMD) ? AdvisoryOwnerKind::OPEN_FILE : AdvisoryOwnerKind::PROCESS;
+            bool const WAIT = cmd == F_SETLKW_CMD || cmd == F_OFD_SETLKW_CMD;
+            int const ret =
+                advisory_set_lock(f, ker::mod::sched::task::process_pid(*task), OWNER_KIND, AdvisoryLockFamily::RECORD, *flock, WAIT);
             vfs_put_file(f);
             return ret;
         }

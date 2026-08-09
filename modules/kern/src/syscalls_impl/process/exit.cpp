@@ -98,7 +98,7 @@ void validate_waiter_resume_for_exit(ker::mod::sched::task::Task* waiter, ker::m
     }
 
     if (waiter->wait_resume_rip_user_addr != 0) {
-        uint64_t const RIP_PHYS = ker::mod::mm::virt::translate(waiter->pagemap, waiter->wait_resume_rip_user_addr);
+        uint64_t const RIP_PHYS = ker::mod::sys::usercopy::mapped_physical_address(*waiter, waiter->wait_resume_rip_user_addr);
         if (RIP_PHYS == ker::mod::mm::virt::PADDR_INVALID || RIP_PHYS == 0 ||
             (waiter->wait_resume_rip_phys_addr != 0 && waiter->wait_resume_rip_phys_addr != RIP_PHYS)) {
             log::warn(
@@ -113,7 +113,7 @@ void validate_waiter_resume_for_exit(ker::mod::sched::task::Task* waiter, ker::m
     }
 
     if (waiter->wait_resume_rsp_user_addr != 0) {
-        uint64_t const RSP_PHYS = ker::mod::mm::virt::translate(waiter->pagemap, waiter->wait_resume_rsp_user_addr);
+        uint64_t const RSP_PHYS = ker::mod::sys::usercopy::mapped_physical_address(*waiter, waiter->wait_resume_rsp_user_addr);
         if (RSP_PHYS == ker::mod::mm::virt::PADDR_INVALID || RSP_PHYS == 0) {
             log::warn(
                 "waitpid-stack unmapped: waiter=%lu child=%lu path=%s rsp_va=0x%llx old_phys=0x%llx new_phys=0x%llx rip_va=0x%llx "
@@ -329,15 +329,16 @@ void release_exiting_user_address_space(ker::mod::sched::task::Task* task) {
         return;
     }
 
-    auto* pagemap = task->pagemap;
-
     // The task has already transitioned out of ACTIVE, so it will not return to
     // userspace. Switch this CPU away from the exiting address space, then make
     // the Task stop publishing the pagemap before destroying the user half.
     // Waitpid-visible zombie state stays in the Task; scheduler GC still reclaims
     // the thread object, kernel stack, and scratch area after the epoch guard.
     ker::mod::mm::virt::switch_to_kernel_pagemap();
-    task->pagemap = nullptr;
+    auto* pagemap = task->detach_pagemap_after_usercopy_quiescence();
+    if (pagemap == nullptr) {
+        return;
+    }
     ker::syscall::vmem::release_file_mmap_ranges_for_pagemap(pagemap);
     ker::mod::mm::virt::destroy_user_space(pagemap, task->pid, task->name, "process-exit");
     ker::mod::mm::virt::release_pagemap(pagemap);

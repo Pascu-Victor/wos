@@ -2336,6 +2336,32 @@ void page_ref_inc(void* page, PageLookupHint* hint) {
     }
 }
 
+auto page_ref_try_inc(void* page) -> bool { return page_ref_try_inc(page, nullptr); }
+
+auto page_ref_try_inc(void* page, PageLookupHint* hint) -> bool {
+    if (page == nullptr) {
+        return false;
+    }
+
+    PageAllocator* alloc = nullptr;
+    uint32_t idx = 0;
+    if (!find_allocator_for_page_cached(page, hint, alloc, idx)) {
+        return false;
+    }
+
+    auto& ref_stats = page_ref_stats_for_current_cpu();
+    ref_stats.inc_ops.fetch_add(1, std::memory_order_relaxed);
+    auto& refcount = alloc->page_refcounts[idx];
+    uint32_t old_ref = refcount.load(std::memory_order_acquire);
+    while (old_ref != 0 && old_ref != UINT32_MAX) {
+        if (refcount.compare_exchange_weak(old_ref, old_ref + 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
+            return true;
+        }
+        ref_stats.inc_cas_retries.fetch_add(1, std::memory_order_relaxed);
+    }
+    return false;
+}
+
 void page_ref_add(void* page, uint64_t refs) { page_ref_add(page, refs, nullptr); }
 
 void page_ref_add(void* page, uint64_t refs, PageLookupHint* hint) {

@@ -396,12 +396,12 @@ void capture_wait_resume_debug(ker::mod::sched::task::Task* task, ker::mod::cpu:
     }
 
     task->wait_resume_rip_user_addr = gpr.rcx;
-    uint64_t const RIP_PHYS = ker::mod::mm::virt::translate(task->pagemap, gpr.rcx);
+    uint64_t const RIP_PHYS = ker::mod::sys::usercopy::mapped_physical_address(*task, gpr.rcx);
     task->wait_resume_rip_phys_addr = (RIP_PHYS != ker::mod::mm::virt::PADDR_INVALID) ? RIP_PHYS : 0;
 
     task->wait_resume_rsp_user_addr = current_syscall_user_rsp();
     if (task->wait_resume_rsp_user_addr != 0) {
-        uint64_t const RSP_PHYS = ker::mod::mm::virt::translate(task->pagemap, task->wait_resume_rsp_user_addr);
+        uint64_t const RSP_PHYS = ker::mod::sys::usercopy::mapped_physical_address(*task, task->wait_resume_rsp_user_addr);
         task->wait_resume_rsp_phys_addr = (RSP_PHYS != ker::mod::mm::virt::PADDR_INVALID) ? RSP_PHYS : 0;
     } else {
         task->wait_resume_rsp_phys_addr = 0;
@@ -494,7 +494,7 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t ru
         // No exited child yet - block until SIGCHLD wakes us
         if (status != nullptr) {
             current_task->wait_status_user_addr = reinterpret_cast<uint64_t>(status);
-            uint64_t const PHYS = ker::mod::mm::virt::translate(current_task->pagemap, reinterpret_cast<uint64_t>(status));
+            uint64_t const PHYS = ker::mod::sys::usercopy::mapped_physical_address(*current_task, reinterpret_cast<uint64_t>(status), true);
             current_task->wait_status_phys_addr = (PHYS != ker::mod::mm::virt::PADDR_INVALID) ? PHYS : 0;
         } else {
             current_task->wait_status_user_addr = 0;
@@ -502,7 +502,7 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t ru
         }
         if (rusage_vaddr != 0) {
             current_task->wait_rusage_user_addr = rusage_vaddr;
-            uint64_t const PHYS = ker::mod::mm::virt::translate(current_task->pagemap, rusage_vaddr);
+            uint64_t const PHYS = ker::mod::sys::usercopy::mapped_physical_address(*current_task, rusage_vaddr, true);
             current_task->wait_rusage_phys_addr = (PHYS != ker::mod::mm::virt::PADDR_INVALID) ? PHYS : 0;
         } else {
             current_task->wait_rusage_user_addr = 0;
@@ -597,7 +597,7 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t ru
     current_task->wait_options = options;
     if (status != nullptr) {
         current_task->wait_status_user_addr = reinterpret_cast<uint64_t>(status);
-        uint64_t const PHYS = ker::mod::mm::virt::translate(current_task->pagemap, reinterpret_cast<uint64_t>(status));
+        uint64_t const PHYS = ker::mod::sys::usercopy::mapped_physical_address(*current_task, reinterpret_cast<uint64_t>(status), true);
         current_task->wait_status_phys_addr = (PHYS != ker::mod::mm::virt::PADDR_INVALID) ? PHYS : 0;
     } else {
         current_task->wait_status_user_addr = 0;
@@ -605,7 +605,7 @@ auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t ru
     }
     if (rusage_vaddr != 0) {
         current_task->wait_rusage_user_addr = rusage_vaddr;
-        uint64_t const PHYS = ker::mod::mm::virt::translate(current_task->pagemap, rusage_vaddr);
+        uint64_t const PHYS = ker::mod::sys::usercopy::mapped_physical_address(*current_task, rusage_vaddr, true);
         current_task->wait_rusage_phys_addr = (PHYS != ker::mod::mm::virt::PADDR_INVALID) ? PHYS : 0;
     } else {
         current_task->wait_rusage_user_addr = 0;

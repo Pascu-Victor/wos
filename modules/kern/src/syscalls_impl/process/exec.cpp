@@ -61,6 +61,7 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
 
 constexpr int MAX_SHEBANG_DEPTH = 4;
 constexpr size_t EXEC_PATH_MAX = 512;
+constexpr size_t EXEC_ARG_BYTES_MAX = static_cast<size_t>(2) * 1024 * 1024;
 constexpr int WOS_SIGKILL = 9;
 constexpr int WOS_SIGSTOP = 19;
 constexpr uint64_t MAX_SPAWN_ACTIONS = 32;
@@ -546,24 +547,137 @@ struct SpawnOptionsSnapshot {
     }
 };
 
-auto snapshot_spawn_options(ker::mod::sched::task::Task& parent, const ker::abi::process::SpawnOptions* user_options,
-                            SpawnOptionsSnapshot& snapshot) -> bool {
-    if (user_options == nullptr ||
-        !ker::mod::sys::usercopy::copy_value_from_task(parent, reinterpret_cast<uint64_t>(user_options), snapshot.options)) {
-        return false;
+// A syscall entry snapshot owns every byte and pointer that the loader is
+// allowed to traverse. The two-megabyte combined strings/pointer budget
+// matches the ARG_MAX value advertised by mlibc and bounds both hostile
+// unterminated vectors and allocator use.
+struct ExecArgumentsSnapshot {
+    std::array<char, EXEC_PATH_MAX> path{};
+    char* strings{};
+    const char** argv{};
+    const char** envp{};
+    size_t strings_used{};
+    size_t budget_used{};
+
+    ~ExecArgumentsSnapshot() {
+        delete[] argv;
+        delete[] envp;
+        delete[] strings;
+    }
+
+    ExecArgumentsSnapshot() = default;
+    ExecArgumentsSnapshot(const ExecArgumentsSnapshot&) = delete;
+    auto operator=(const ExecArgumentsSnapshot&) -> ExecArgumentsSnapshot& = delete;
+};
+
+auto snapshot_exec_vector(ker::mod::sched::task::Task& task, uint64_t vector_addr, ExecArgumentsSnapshot& snapshot, const char**& out)
+    -> int {
+    if (vector_addr == 0) {
+        if (snapshot.budget_used > EXEC_ARG_BYTES_MAX - sizeof(uint64_t)) {
+            return -E2BIG;
+        }
+        snapshot.budget_used += sizeof(uint64_t);
+        out = nullptr;
+        return 0;
+    }
+
+    ker::util::SmallVec<uint64_t, 16> string_addrs;
+    for (size_t index = 0;; ++index) {
+        if (snapshot.budget_used > EXEC_ARG_BYTES_MAX - sizeof(uint64_t)) {
+            return -E2BIG;
+        }
+
+        uint64_t offset = 0;
+        uint64_t entry_addr = 0;
+        if (__builtin_mul_overflow(static_cast<uint64_t>(index), static_cast<uint64_t>(sizeof(uint64_t)), &offset) ||
+            __builtin_add_overflow(vector_addr, offset, &entry_addr)) {
+            return -EFAULT;
+        }
+
+        uint64_t string_addr = 0;
+        if (!ker::mod::sys::usercopy::copy_value_from_task(task, entry_addr, string_addr)) {
+            return -EFAULT;
+        }
+        snapshot.budget_used += sizeof(uint64_t);
+        if (string_addr == 0) {
+            break;
+        }
+        if (!string_addrs.push_back(string_addr)) {
+            return -ENOMEM;
+        }
+    }
+
+    size_t const COUNT = string_addrs.size();
+    out = new (std::nothrow) const char*[COUNT + 1];
+    if (out == nullptr) {
+        return -ENOMEM;
+    }
+
+    if (COUNT != 0 && snapshot.strings == nullptr) {
+        snapshot.strings = new (std::nothrow) char[EXEC_ARG_BYTES_MAX];
+        if (snapshot.strings == nullptr) {
+            return -ENOMEM;
+        }
+    }
+
+    for (size_t index = 0; index < COUNT; ++index) {
+        size_t const REMAINING = EXEC_ARG_BYTES_MAX - snapshot.budget_used;
+        if (REMAINING == 0) {
+            return -E2BIG;
+        }
+
+        char* const DEST = snapshot.strings + snapshot.strings_used;
+        auto const STATUS = ker::mod::sys::usercopy::copy_cstring_from_task_status(task, string_addrs.at(index), DEST, REMAINING);
+        if (STATUS == ker::mod::sys::usercopy::CStringCopyStatus::FAULT) {
+            return -EFAULT;
+        }
+        if (STATUS == ker::mod::sys::usercopy::CStringCopyStatus::TOO_LONG) {
+            return -E2BIG;
+        }
+
+        size_t const STRING_BYTES = std::strlen(DEST) + 1;
+        out[index] = DEST;
+        snapshot.strings_used += STRING_BYTES;
+        snapshot.budget_used += STRING_BYTES;
+    }
+    out[COUNT] = nullptr;
+    return 0;
+}
+
+auto snapshot_exec_arguments(ker::mod::sched::task::Task& task, uint64_t path_addr, uint64_t argv_addr, uint64_t envp_addr,
+                             ExecArgumentsSnapshot& snapshot) -> int {
+    auto const PATH_STATUS =
+        ker::mod::sys::usercopy::copy_cstring_from_task_status(task, path_addr, snapshot.path.data(), snapshot.path.size());
+    if (PATH_STATUS == ker::mod::sys::usercopy::CStringCopyStatus::FAULT) {
+        return -EFAULT;
+    }
+    if (PATH_STATUS == ker::mod::sys::usercopy::CStringCopyStatus::TOO_LONG) {
+        return -ENAMETOOLONG;
+    }
+
+    int result = snapshot_exec_vector(task, argv_addr, snapshot, snapshot.argv);
+    if (result == 0) {
+        result = snapshot_exec_vector(task, envp_addr, snapshot, snapshot.envp);
+    }
+    return result;
+}
+
+auto snapshot_spawn_options(ker::mod::sched::task::Task& parent, uint64_t user_options_addr, SpawnOptionsSnapshot& snapshot) -> int {
+    if (user_options_addr == 0 || !ker::mod::sys::usercopy::copy_value_from_task(parent, user_options_addr, snapshot.options)) {
+        return -EFAULT;
     }
     if (snapshot.options.size != sizeof(ker::abi::process::SpawnOptions) ||
         snapshot.options.version != ker::abi::process::SPAWN_OPTIONS_VERSION || snapshot.options.reserved0 != 0 ||
         snapshot.options.reserved1 != 0 || (snapshot.options.flags & ~ker::abi::process::SPAWN_SUPPORTED_FLAGS) != 0 ||
         snapshot.options.action_count > MAX_SPAWN_ACTIONS || (snapshot.options.action_count != 0 && snapshot.options.actions == nullptr)) {
-        return false;
+        return -EINVAL;
     }
 
     uint64_t const ACTION_COUNT = snapshot.options.action_count;
     if (ACTION_COUNT != 0 &&
         !ker::mod::sys::usercopy::copy_from_task(parent, reinterpret_cast<uint64_t>(snapshot.options.actions), snapshot.actions.data(),
                                                  ACTION_COUNT * sizeof(ker::abi::process::SpawnFdAction))) {
-        return false;
+        return -EFAULT;
     }
 
     for (uint64_t i = 0; i < ACTION_COUNT; ++i) {
@@ -575,22 +689,26 @@ auto snapshot_spawn_options(ker::mod::sched::task::Task& parent, const ker::abi:
                 break;
             case ker::abi::process::SpawnFdActionType::OPEN: {
                 auto* path = new (std::nothrow) char[EXEC_PATH_MAX];
-                if (path == nullptr || !ker::mod::sys::usercopy::copy_cstring_from_task(parent, reinterpret_cast<uint64_t>(action.path),
-                                                                                        path, EXEC_PATH_MAX)) {
+                if (path == nullptr) {
+                    return -ENOMEM;
+                }
+                auto const PATH_STATUS = ker::mod::sys::usercopy::copy_cstring_from_task_status(
+                    parent, reinterpret_cast<uint64_t>(action.path), path, EXEC_PATH_MAX);
+                if (PATH_STATUS != ker::mod::sys::usercopy::CStringCopyStatus::COMPLETE) {
                     delete[] path;
-                    return false;
+                    return PATH_STATUS == ker::mod::sys::usercopy::CStringCopyStatus::FAULT ? -EFAULT : -ENAMETOOLONG;
                 }
                 fixed_slot(snapshot.owned_paths, static_cast<size_t>(i)) = path;
                 action.path = path;
                 break;
             }
             default:
-                return false;
+                return -EINVAL;
         }
     }
 
     snapshot.options.actions = ACTION_COUNT != 0 ? snapshot.actions.data() : nullptr;
-    return true;
+    return 0;
 }
 
 inline auto local_wki_hostname() -> const char* { return std::begin(ker::net::wki::g_wki.local_hostname); }
@@ -1486,23 +1604,51 @@ auto create_file_backed_process_task(const char* name, vfs::File* owned_file, si
     return new_task;
 }
 
-auto wos_proc_exec(const char* path, const char* const* argv, const char* const* envp) -> uint64_t {
-    return wos_proc_exec_impl(path, argv, envp, nullptr, 0);
+auto wos_proc_exec(uint64_t path_addr, uint64_t argv_addr, uint64_t envp_addr) -> uint64_t {
+    if (ker::mod::power::shutdown_in_progress()) {
+        return static_cast<uint64_t>(-ESHUTDOWN);
+    }
+    auto* parent = ker::mod::sched::get_current_task();
+    if (parent == nullptr) {
+        return static_cast<uint64_t>(-ESRCH);
+    }
+
+    ExecArgumentsSnapshot snapshot;
+    int const SNAPSHOT_RESULT = snapshot_exec_arguments(*parent, path_addr, argv_addr, envp_addr, snapshot);
+    if (SNAPSHOT_RESULT < 0) {
+        return static_cast<uint64_t>(SNAPSHOT_RESULT);
+    }
+    return wos_proc_exec_impl(snapshot.path.data(), snapshot.argv, snapshot.envp, nullptr, 0);
 }
 
-auto wos_proc_spawn(const char* path, const char* const* argv, const char* const* envp, const ker::abi::process::SpawnOptions* options)
-    -> uint64_t {
-    if (options == nullptr) {
-        return wos_proc_exec_impl(path, argv, envp, nullptr, 0);
+auto wos_proc_spawn(uint64_t path_addr, uint64_t argv_addr, uint64_t envp_addr, uint64_t options_addr) -> uint64_t {
+    if (ker::mod::power::shutdown_in_progress()) {
+        return static_cast<uint64_t>(-ESHUTDOWN);
+    }
+    auto* parent = ker::mod::sched::get_current_task();
+    if (parent == nullptr) {
+        return static_cast<uint64_t>(-ESRCH);
     }
 
-    auto* parent = ker::mod::sched::get_current_task();
-    auto* snapshot = new (std::nothrow) SpawnOptionsSnapshot;
-    if (parent == nullptr || snapshot == nullptr || !snapshot_spawn_options(*parent, options, *snapshot)) {
-        delete snapshot;
-        return 0;
+    ExecArgumentsSnapshot arguments;
+    int const ARGUMENT_RESULT = snapshot_exec_arguments(*parent, path_addr, argv_addr, envp_addr, arguments);
+    if (ARGUMENT_RESULT < 0) {
+        return static_cast<uint64_t>(ARGUMENT_RESULT);
     }
-    uint64_t const RESULT = wos_proc_exec_impl(path, argv, envp, &snapshot->options, 0);
+    if (options_addr == 0) {
+        return wos_proc_exec_impl(arguments.path.data(), arguments.argv, arguments.envp, nullptr, 0);
+    }
+
+    auto* snapshot = new (std::nothrow) SpawnOptionsSnapshot;
+    if (snapshot == nullptr) {
+        return static_cast<uint64_t>(-ENOMEM);
+    }
+    int const OPTIONS_RESULT = snapshot_spawn_options(*parent, options_addr, *snapshot);
+    if (OPTIONS_RESULT < 0) {
+        delete snapshot;
+        return static_cast<uint64_t>(OPTIONS_RESULT);
+    }
+    uint64_t const RESULT = wos_proc_exec_impl(arguments.path.data(), arguments.argv, arguments.envp, &snapshot->options, 0);
     delete snapshot;
     return RESULT;
 }
@@ -2093,8 +2239,21 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
 }
 }  // namespace
 
-auto wos_proc_execve(const char* path, const char* const* argv, const char* const* envp, ker::mod::cpu::GPRegs& gpr) -> uint64_t {
-    return wos_proc_execve_impl(path, argv, envp, gpr, 0);
+auto wos_proc_execve(uint64_t path_addr, uint64_t argv_addr, uint64_t envp_addr, ker::mod::cpu::GPRegs& gpr) -> uint64_t {
+    if (ker::mod::power::shutdown_in_progress()) {
+        return static_cast<uint64_t>(-ESHUTDOWN);
+    }
+    auto* task = ker::mod::sched::get_current_task();
+    if (task == nullptr) {
+        return static_cast<uint64_t>(-ESRCH);
+    }
+
+    ExecArgumentsSnapshot snapshot;
+    int const SNAPSHOT_RESULT = snapshot_exec_arguments(*task, path_addr, argv_addr, envp_addr, snapshot);
+    if (SNAPSHOT_RESULT < 0) {
+        return static_cast<uint64_t>(SNAPSHOT_RESULT);
+    }
+    return wos_proc_execve_impl(snapshot.path.data(), snapshot.argv, snapshot.envp, gpr, 0);
 }
 
 namespace {
@@ -2391,7 +2550,6 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
     LocalProcStage const NEW_IMAGE_STAGE = begin_local_proc_stage(task, perf::WkiPerfLocalProcOp::NEW_IMAGE, 0, WOS_PERF_CALLSITE());
     uint8_t* old_elf_buffer = task->elf_buffer;
     vfs::File* old_exec_image_file = task->exec_image_file;
-    auto* old_pagemap = task->pagemap;
     auto* old_thread = task->thread;
     auto* new_pagemap = mm::virt::create_pagemap();
     if (new_pagemap == nullptr) {
@@ -2929,30 +3087,37 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
     }
     end_local_proc_stage(task, perf::WkiPerfLocalProcOp::COMMIT, COMMIT_STAGE, 0, 0, WOS_PERF_CALLSITE());
 
-    auto* old_pagemap_to_destroy = old_pagemap;
     auto* old_thread_to_destroy = old_thread;
-    old_pagemap = nullptr;
     old_thread = nullptr;
 
     // Publish the new execution context before old-image teardown. The release
     // paths below may block or yield, so scheduler/procfs observers must never
     // see task->pagemap/task->thread pointing at storage that is being freed.
-    task->pagemap = new_pagemap;
-    task->thread = new_thread;
-    publish_exec_lazy_ranges(task, new_lazy_ranges);
-    new_lazy_ranges_published = true;
+    mm::paging::PageTable* old_pagemap_to_destroy = nullptr;
+    bool old_pagemap_has_other_publishers = false;
+    {
+        // Prevent a new CLONE_VM/thread publisher from appearing between the
+        // sibling snapshot and the root swap. Existing siblings keep the old
+        // address space alive; exec must never tear a shared root out from
+        // under their execution or stable usercopy pins.
+        ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;
+        old_pagemap_has_other_publishers = mod::sched::task_has_live_pagemap_sibling(task);
+        old_pagemap_to_destroy = task->replace_pagemap_after_usercopy_quiescence(new_pagemap);
+        task->thread = new_thread;
+        publish_exec_lazy_ranges(task, new_lazy_ranges);
+        new_lazy_ranges_published = true;
+    }
 
     auto phys_pagemap = reinterpret_cast<uint64_t>(mm::addr::get_phys_pointer(reinterpret_cast<uint64_t>(new_pagemap)));
     asm volatile("mov %0, %%cr3" : : "r"(phys_pagemap) : "memory");
     ker::mod::sys::context_switch::reset_fpu_state(task);
 
-    // execve() replaces the current image in-place, so the old address space
-    // and thread backing storage must be reclaimed now rather than deferred to
-    // task GC. Otherwise each successful exec leaks another user stack/TLS set
-    // plus the old pagemap's user pages.
+    // execve() replaces the current image in-place. Reclaim an exclusive old
+    // address space now; if CLONE_VM/thread publishers still exist, their
+    // last-publisher GC owns that shared root instead.
     LocalProcStage const DESTROY_OLD_STAGE = begin_local_proc_stage(task, perf::WkiPerfLocalProcOp::DESTROY_OLD, 0, WOS_PERF_CALLSITE());
     ker::syscall::shm::shm_cleanup_for_task(task);
-    if (old_pagemap_to_destroy != nullptr && old_pagemap_to_destroy != new_pagemap) {
+    if (old_pagemap_to_destroy != nullptr && old_pagemap_to_destroy != new_pagemap && !old_pagemap_has_other_publishers) {
         ker::syscall::vmem::release_file_mmap_ranges_for_pagemap(old_pagemap_to_destroy);
         mm::virt::destroy_user_space(old_pagemap_to_destroy, task->pid, task->name, "exec-old-image");
         mm::virt::release_pagemap(old_pagemap_to_destroy);

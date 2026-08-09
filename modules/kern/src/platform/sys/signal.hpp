@@ -30,6 +30,10 @@ constexpr uint64_t USER_RED_ZONE_SIZE = 128;
 constexpr uint64_t WOS_SA_ONSTACK = 0x08000000;
 constexpr uint32_t WOS_SS_ONSTACK = 1;
 constexpr uint32_t WOS_SS_DISABLE = 2;
+// mlibc's TCB signal-cache valid word ends at offset 0x4c.  Callers that
+// publish a new thread under a subsystem mutex preflight this whole prefix so
+// the in-lock refresh can remain mapped-only.
+constexpr size_t WOS_TCB_SIGNAL_CACHE_BYTES = 0x4c;
 
 enum class DeferredSignalDelivery : uint8_t {
     FULL,
@@ -73,5 +77,12 @@ void check_pending_signals_deferred(sched::task::Task* task, DeferredSignalDeliv
 auto restore_deferred_sigreturn(sched::task::Task* task) -> DeferredSigreturnResult;
 void exit_current_on_pending_fatal_default_signal();
 void sync_task_signal_mask_cache(sched::task::Task* task);
+// Normal-context publication helper. It may fault in/COW the supplied TCB
+// pages and reports failure so callers can avoid publishing an unusable base.
+[[nodiscard]] auto sync_task_signal_mask_cache_at(sched::task::Task* task, uint64_t tcb) -> bool;
+// Scheduler/interrupt/publication contexts must not fault in TCB pages.  A
+// failed mapped-only refresh leaves the userspace cache invalid or stale; the
+// authoritative mask remains in Task and a later safe refresh repairs it.
+void sync_task_signal_mask_cache_mapped(sched::task::Task* task);
 
 }  // namespace ker::mod::sys::signal

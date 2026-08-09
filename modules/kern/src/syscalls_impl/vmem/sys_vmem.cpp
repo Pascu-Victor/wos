@@ -27,6 +27,7 @@
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
 #include <platform/sys/mutex.hpp>
+#include <platform/sys/usercopy.hpp>
 #include <util/smallvec.hpp>
 #include <utility>
 #include <vfs/file.hpp>
@@ -43,6 +44,7 @@ constexpr uint64_t USER_SPACE_START = 0x0000000000400000ULL;  // Start after fir
 constexpr uint64_t USER_SPACE_END = 0x00007FFFFFFFFFFFULL;    // Linux canonical address limit
 constexpr uint64_t MMAP_START = 0x0000200000000000ULL;        // mmap base above ASAN shadow, below ELF debug info
 constexpr uint64_t MREMAP_MAYMOVE = 1;
+constexpr size_t SWAP_PATH_MAX = 512;
 
 namespace {
 // Get the current task
@@ -947,24 +949,6 @@ auto file_mmap_cached_page(int fd, const ker::vfs::Stat& st, uint64_t file_offse
     return OK;
 }
 
-auto present_leaf_entry(ker::mod::mm::paging::PageTable* pagemap, uint64_t vaddr) -> ker::mod::mm::paging::PageTableEntry* {
-    if (pagemap == nullptr) {
-        return nullptr;
-    }
-
-    auto* table = pagemap;
-    for (int level = 4; level > 1; --level) {
-        auto& entry = table->entries[page_table_index(vaddr, 12 + (9 * (level - 1)))];
-        if (entry.present == 0 || entry.pagesize != 0) {
-            return nullptr;
-        }
-        table = table_from_entry(entry);
-    }
-
-    auto& entry = table->entries[page_table_index(vaddr, ker::mod::mm::paging::PAGE_SHIFT)];
-    return entry.present != 0 ? &entry : nullptr;
-}
-
 auto collect_file_mmap_sync_ranges(ker::mod::mm::paging::PageTable* pagemap, uint64_t start, uint64_t length,
                                    ker::util::SmallVec<FileMmapSyncRange, 8>& out) -> int {
     uint64_t end = 0;
@@ -1033,7 +1017,43 @@ void release_file_mmap_sync_ranges(ker::util::SmallVec<FileMmapSyncRange, 8>& ra
     }
 }
 
-auto sync_file_mmap_range(ker::mod::mm::paging::PageTable* pagemap, uint64_t start, uint64_t length) -> int {
+enum class FileMmapPageSnapshot : uint8_t {
+    SKIP,
+    READY,
+    FAULT,
+};
+
+auto snapshot_file_mmap_page(ker::mod::mm::paging::PageTable* pagemap, ker::mod::sched::task::Task* live_task, uint64_t page_start,
+                             uint64_t page_delta, size_t size, std::array<uint8_t, ker::mod::mm::paging::PAGE_SIZE>& snapshot)
+    -> FileMmapPageSnapshot {
+    if (live_task != nullptr) {
+        ker::mod::sys::usercopy::StableUserPage pin;
+        if (!ker::mod::sys::usercopy::pin_task_user_page(*live_task, page_start, false, false, pin) || !pin.was_dirty()) {
+            return FileMmapPageSnapshot::SKIP;
+        }
+        std::memcpy(snapshot.data(), static_cast<const uint8_t*>(pin.kernel_address()) + page_delta, size);
+        return pin.still_mapped() ? FileMmapPageSnapshot::READY : FileMmapPageSnapshot::FAULT;
+    }
+
+    // A null live_task is allowed only for an unpublished or usercopy-quiesced
+    // pagemap. The frame reference still keeps the snapshot storage alive while
+    // the leaf is checked, copied, and revalidated.
+    ker::mod::mm::virt::UserPagePin pin{};
+    if (!ker::mod::mm::virt::pin_user_page(pagemap, page_start, false, pin, true)) {
+        return FileMmapPageSnapshot::SKIP;
+    }
+    if (!pin.dirty) {
+        ker::mod::mm::virt::unpin_user_page(pin);
+        return FileMmapPageSnapshot::SKIP;
+    }
+    std::memcpy(snapshot.data(), static_cast<const uint8_t*>(pin.hhdm_page) + page_delta, size);
+    bool const STILL_MAPPED = ker::mod::mm::virt::user_page_pin_still_mapped(pin);
+    ker::mod::mm::virt::unpin_user_page(pin);
+    return STILL_MAPPED ? FileMmapPageSnapshot::READY : FileMmapPageSnapshot::FAULT;
+}
+
+auto sync_file_mmap_range_impl(ker::mod::mm::paging::PageTable* pagemap, ker::mod::sched::task::Task* live_task, uint64_t start,
+                               uint64_t length) -> int {
     ker::util::SmallVec<FileMmapSyncRange, 8> ranges;
     int const COLLECT_RET = collect_file_mmap_sync_ranges(pagemap, start, length, ranges);
     if (COLLECT_RET < 0) {
@@ -1047,26 +1067,32 @@ auto sync_file_mmap_range(ker::mod::mm::paging::PageTable* pagemap, uint64_t sta
         uint64_t page_vaddr = page_align_down(range.sync_start);
         while (page_vaddr < range.sync_end) {
             uint64_t const PAGE_END = page_vaddr + ker::mod::mm::paging::PAGE_SIZE;
-            auto* entry = present_leaf_entry(pagemap, page_vaddr);
-            if (entry != nullptr && entry->dirty != 0) {
-                uint64_t const PAGE_START = page_vaddr;
-                uint64_t const WRITE_START = std::max(PAGE_START, range.sync_start);
-                uint64_t const WRITE_END = std::min(PAGE_END, range.sync_end);
-                if (WRITE_START < WRITE_END) {
-                    uint64_t const PHYS_PAGE = static_cast<uint64_t>(entry->frame) << ker::mod::mm::paging::PAGE_SHIFT;
-                    const auto* const PAGE = reinterpret_cast<const uint8_t*>(ker::mod::mm::addr::get_virt_pointer(PHYS_PAGE));
-                    uint64_t const PAGE_DELTA = WRITE_START - PAGE_START;
-                    uint64_t const FILE_DELTA = WRITE_START - range.mapping_start;
-                    uint64_t const FILE_OFFSET = range.file_offset + FILE_DELTA;
-                    if (FILE_OFFSET < range.file_offset) {
-                        result = -EOVERFLOW;
-                        break;
-                    }
-                    result =
-                        write_file_mapping_bytes(range.file, PAGE + PAGE_DELTA, static_cast<size_t>(WRITE_END - WRITE_START), FILE_OFFSET);
-                    if (result < 0) {
-                        break;
-                    }
+            uint64_t const PAGE_START = page_vaddr;
+            uint64_t const WRITE_START = std::max(PAGE_START, range.sync_start);
+            uint64_t const WRITE_END = std::min(PAGE_END, range.sync_end);
+            std::array<uint8_t, ker::mod::mm::paging::PAGE_SIZE> snapshot{};
+            bool write_snapshot = false;
+            if (WRITE_START < WRITE_END) {
+                uint64_t const PAGE_DELTA = WRITE_START - PAGE_START;
+                size_t const WRITE_SIZE = static_cast<size_t>(WRITE_END - WRITE_START);
+                auto const SNAPSHOT_RESULT = snapshot_file_mmap_page(pagemap, live_task, PAGE_START, PAGE_DELTA, WRITE_SIZE, snapshot);
+                if (SNAPSHOT_RESULT == FileMmapPageSnapshot::FAULT) {
+                    result = -EFAULT;
+                    break;
+                }
+                write_snapshot = SNAPSHOT_RESULT == FileMmapPageSnapshot::READY;
+            }
+
+            if (write_snapshot) {
+                uint64_t const FILE_DELTA = WRITE_START - range.mapping_start;
+                uint64_t const FILE_OFFSET = range.file_offset + FILE_DELTA;
+                if (FILE_OFFSET < range.file_offset) {
+                    result = -EOVERFLOW;
+                    break;
+                }
+                result = write_file_mapping_bytes(range.file, snapshot.data(), static_cast<size_t>(WRITE_END - WRITE_START), FILE_OFFSET);
+                if (result < 0) {
+                    break;
                 }
             }
 
@@ -1085,6 +1111,14 @@ auto sync_file_mmap_range(ker::mod::mm::paging::PageTable* pagemap, uint64_t sta
     }
 
     return 0;
+}
+
+auto sync_file_mmap_range(ker::mod::sched::task::Task& task, uint64_t start, uint64_t length) -> int {
+    return sync_file_mmap_range_impl(task.pagemap, &task, start, length);
+}
+
+auto sync_file_mmap_range_quiesced(ker::mod::mm::paging::PageTable* pagemap, uint64_t start, uint64_t length) -> int {
+    return sync_file_mmap_range_impl(pagemap, nullptr, start, length);
 }
 
 auto register_file_mmap_range(ker::mod::mm::paging::PageTable* pagemap, uint64_t start, uint64_t length, uint64_t file_offset,
@@ -1493,7 +1527,7 @@ void release_fixed_mmap_range(ker::mod::sched::task::Task* task, uint64_t vaddr,
         return;
     }
 
-    int const SYNC_RET = sync_file_mmap_range(task->pagemap, vaddr, size);
+    int const SYNC_RET = sync_file_mmap_range(*task, vaddr, size);
     if (SYNC_RET < 0) {
         log::warn("MAP_FIXED replacement sync failed: pid=%lu vaddr=0x%llx size=0x%llx ret=%d", task->pid,
                   static_cast<unsigned long long>(vaddr), static_cast<unsigned long long>(size), SYNC_RET);
@@ -1779,7 +1813,7 @@ auto anon_free(uint64_t addr, uint64_t size) -> uint64_t {
         return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EINVAL);
     }
 
-    int const SYNC_RET = sync_file_mmap_range(task->pagemap, addr, size);
+    int const SYNC_RET = sync_file_mmap_range(*task, addr, size);
     if (SYNC_RET < 0) {
         return static_cast<uint64_t>(SYNC_RET);
     }
@@ -1801,7 +1835,9 @@ auto anon_free(uint64_t addr, uint64_t size) -> uint64_t {
         bool const IS_RESERVED = !IS_MAPPED && ker::mod::mm::virt::is_page_reserved(task->pagemap, CURRENT_VADDR);
         if (IS_MAPPED || IS_RESERVED) {
             if (is_watched_mmap_vaddr(CURRENT_VADDR)) {
-                const auto PHYS = IS_MAPPED ? ker::mod::mm::virt::translate(task->pagemap, CURRENT_VADDR) : 0;
+                auto const MAPPED_PHYS =
+                    IS_MAPPED ? ker::mod::sys::usercopy::mapped_physical_address(*task, CURRENT_VADDR) : ker::mod::mm::virt::PADDR_INVALID;
+                uint64_t const PHYS = MAPPED_PHYS != ker::mod::mm::virt::PADDR_INVALID ? MAPPED_PHYS : 0;
                 log::warn("watch mmap-unmap: pid=%lu name=%s pagemap=%p vaddr=0x%llx phys=0x%llx size=0x%llx", task->pid, task->name,
                           static_cast<void*>(task->pagemap), static_cast<unsigned long long>(CURRENT_VADDR),
                           static_cast<unsigned long long>(PHYS), static_cast<unsigned long long>(size));
@@ -2166,7 +2202,7 @@ void release_file_mmap_ranges_for_pagemap(ker::mod::mm::paging::PageTable* pagem
             return;
         }
 
-        int const SYNC_RET = sync_file_mmap_range(pagemap, range.start, range.length);
+        int const SYNC_RET = sync_file_mmap_range_quiesced(pagemap, range.start, range.length);
         if (SYNC_RET < 0) {
             log::warn("file mmap release sync failed: pagemap=%p start=0x%llx length=0x%llx ret=%d", static_cast<void*>(pagemap),
                       static_cast<unsigned long long>(range.start), static_cast<unsigned long long>(range.length), SYNC_RET);
@@ -2190,8 +2226,11 @@ auto anon_mremap(uint64_t old_addr, uint64_t old_size, uint64_t new_size, uint64
         return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EINVAL);
     }
 
-    uint64_t const OLD_SIZE = page_align_up(old_size);
-    uint64_t const NEW_SIZE = page_align_up(new_size);
+    uint64_t OLD_SIZE = 0;
+    uint64_t NEW_SIZE = 0;
+    if (align_user_vmem_size(old_size, &OLD_SIZE) < 0 || align_user_vmem_size(new_size, &NEW_SIZE) < 0) {
+        return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EINVAL);
+    }
     if (old_addr + OLD_SIZE > USER_SPACE_END || old_addr + OLD_SIZE < old_addr) {
         return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EINVAL);
     }
@@ -2220,23 +2259,30 @@ auto anon_mremap(uint64_t old_addr, uint64_t old_size, uint64_t new_size, uint64
     for (uint64_t off = 0; off < COPY_SIZE; off += ker::mod::mm::paging::PAGE_SIZE) {
         uint64_t const SRC_VA = old_addr + off;
         uint64_t const DST_VA = NEW_ADDR + off;
-        uint64_t const SRC_PA = ker::mod::mm::virt::translate(task->pagemap, SRC_VA);
-        if (SRC_PA == ker::mod::mm::virt::PADDR_INVALID) {
-            continue;
+
+        ker::mod::sys::usercopy::StableUserPage src_page;
+        if (!ker::mod::sys::usercopy::pin_task_user_page(*task, SRC_VA, false, true, src_page)) {
+            anon_free(NEW_ADDR, NEW_SIZE);
+            return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EFAULT);
         }
         if (!ker::mod::mm::virt::ensure_user_page_writable(task, DST_VA)) {
             anon_free(NEW_ADDR, NEW_SIZE);
             return static_cast<uint64_t>(-ker::abi::vmem::VMEM_ENOMEM);
         }
-        uint64_t const DST_PA = ker::mod::mm::virt::translate(task->pagemap, DST_VA);
-        if (DST_PA == ker::mod::mm::virt::PADDR_INVALID) {
+
+        ker::mod::sys::usercopy::StableUserPage dst_page;
+        if (!ker::mod::sys::usercopy::pin_task_user_page(*task, DST_VA, true, false, dst_page)) {
             anon_free(NEW_ADDR, NEW_SIZE);
             return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EFAULT);
         }
 
-        auto* src = reinterpret_cast<const void*>(ker::mod::mm::addr::get_virt_pointer(SRC_PA));
-        auto* dst = reinterpret_cast<void*>(ker::mod::mm::addr::get_virt_pointer(DST_PA));
-        std::memcpy(dst, src, ker::mod::mm::paging::PAGE_SIZE);
+        std::memcpy(dst_page.kernel_address(), src_page.kernel_address(), ker::mod::mm::paging::PAGE_SIZE);
+        bool const SOURCE_STILL_MAPPED = src_page.still_mapped();
+        bool const DESTINATION_COMMITTED = dst_page.commit_write();
+        if (!SOURCE_STILL_MAPPED || !DESTINATION_COMMITTED) {
+            anon_free(NEW_ADDR, NEW_SIZE);
+            return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EFAULT);
+        }
     }
 
     auto const FREE_RESULT = anon_free(old_addr, OLD_SIZE);
@@ -2255,12 +2301,11 @@ auto mmap_msync(uint64_t addr, uint64_t size, uint64_t /*flags*/) -> uint64_t {
         return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EINVAL);
     }
 
-    size = page_align_up(size);
-    if (size == 0 || addr > USER_SPACE_END - size) {
+    if (align_user_vmem_size(size, &size) < 0 || addr > USER_SPACE_END - size) {
         return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EINVAL);
     }
 
-    int const RET = sync_file_mmap_range(task->pagemap, addr, size);
+    int const RET = sync_file_mmap_range(*task, addr, size);
     return RET < 0 ? static_cast<uint64_t>(RET) : 0;
 }
 
@@ -2355,11 +2400,23 @@ auto sys_vmem(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4) -
             return mmap_msync(a1, a2, a3);
         }
 
-        case ker::abi::vmem::ops::SWAPON:
-            return static_cast<uint64_t>(ker::mod::mm::swap::swapon_path(reinterpret_cast<const char*>(a1), static_cast<int>(a2)));
+        case ker::abi::vmem::ops::SWAPON: {
+            auto* task = get_current_task();
+            std::array<char, SWAP_PATH_MAX> path{};
+            if (task == nullptr || !ker::mod::sys::usercopy::copy_cstring_from_task_strict(*task, a1, path.data(), path.size())) {
+                return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EFAULT);
+            }
+            return static_cast<uint64_t>(ker::mod::mm::swap::swapon_path(path.data(), static_cast<int>(a2)));
+        }
 
-        case ker::abi::vmem::ops::SWAPOFF:
-            return static_cast<uint64_t>(ker::mod::mm::swap::swapoff_path(reinterpret_cast<const char*>(a1)));
+        case ker::abi::vmem::ops::SWAPOFF: {
+            auto* task = get_current_task();
+            std::array<char, SWAP_PATH_MAX> path{};
+            if (task == nullptr || !ker::mod::sys::usercopy::copy_cstring_from_task_strict(*task, a1, path.data(), path.size())) {
+                return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EFAULT);
+            }
+            return static_cast<uint64_t>(ker::mod::mm::swap::swapoff_path(path.data()));
+        }
 
         default:
             log::warn("invalid operation %llu", op);

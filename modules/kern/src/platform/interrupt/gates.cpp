@@ -113,7 +113,7 @@ void log_user_exception_words(ker::mod::sched::task::Task* task, const char* lab
         return;
     }
 
-    if (!ker::mod::sys::usercopy::copy_from_task(*task, addr, words.data(), WORD_BYTES)) {
+    if (!ker::mod::sys::usercopy::copy_from_task_mapped(*task, addr, words.data(), WORD_BYTES)) {
         journal::warn(" userfault %s: unable to copy 64 bytes at addr=0x%lx", label, addr);
         return;
     }
@@ -296,8 +296,8 @@ auto exception_handler(cpu::GPRegs& gpr, InterruptFrame& frame) -> void {
                           gpr.r10, gpr.r11, gpr.r12, gpr.r13, gpr.r14, gpr.r15);
             if (current_task_for_dump != nullptr) {
                 std::array<uint64_t, 8> stack_words{};
-                if (ker::mod::sys::usercopy::copy_from_task(*current_task_for_dump, frame.rsp, stack_words.data(),
-                                                            stack_words.size() * sizeof(stack_words[0]))) {
+                if (ker::mod::sys::usercopy::copy_from_task_mapped(*current_task_for_dump, frame.rsp, stack_words.data(),
+                                                                   stack_words.size() * sizeof(stack_words[0]))) {
                     journal::warn(" userfault stack0: [0]=0x%lx [1]=0x%lx [2]=0x%lx [3]=0x%lx", stack_words[0], stack_words[1],
                                   stack_words[2], stack_words[3]);
                     journal::warn(" userfault stack1: [4]=0x%lx [5]=0x%lx [6]=0x%lx [7]=0x%lx", stack_words[4], stack_words[5],

@@ -309,8 +309,8 @@ inline void validate_user_resume_target(task::Task* task, const char* path) {
 
     const uint64_t RIP = task->context.frame.rip;
     const uint64_t RSP = task->context.frame.rsp;
-    const uint64_t RIP_PHYS = mm::virt::translate(task->pagemap, RIP);
-    const uint64_t RSP_PHYS = mm::virt::translate(task->pagemap, RSP);
+    const uint64_t RIP_PHYS = sys::usercopy::mapped_physical_address(*task, RIP);
+    const uint64_t RSP_PHYS = sys::usercopy::mapped_physical_address(*task, RSP);
     const bool RIP_CANONICAL = RIP != 0 && RIP < 0x0000800000000000ULL;
     const bool RIP_LAZY_EXECUTABLE = RIP_CANONICAL && RIP_PHYS == mm::virt::PADDR_INVALID && user_resume_rip_is_lazy_executable(task, RIP);
     const bool RIP_BAD = !RIP_CANONICAL || (RIP_PHYS == mm::virt::PADDR_INVALID && !RIP_LAZY_EXECUTABLE);
@@ -336,7 +336,7 @@ inline void validate_wait_resume_mapping(task::Task* waiter, task::Task* child, 
     }
 
     if (waiter->wait_resume_rip_user_addr != 0) {
-        uint64_t const RIP_PHYS = mm::virt::translate(waiter->pagemap, waiter->wait_resume_rip_user_addr);
+        uint64_t const RIP_PHYS = sys::usercopy::mapped_physical_address(*waiter, waiter->wait_resume_rip_user_addr);
         if (RIP_PHYS == mm::virt::PADDR_INVALID || RIP_PHYS == 0 ||
             (waiter->wait_resume_rip_phys_addr != 0 && waiter->wait_resume_rip_phys_addr != RIP_PHYS)) {
             wait_log::warn(
@@ -351,7 +351,7 @@ inline void validate_wait_resume_mapping(task::Task* waiter, task::Task* child, 
     }
 
     if (waiter->wait_resume_rsp_user_addr != 0) {
-        uint64_t const RSP_PHYS = mm::virt::translate(waiter->pagemap, waiter->wait_resume_rsp_user_addr);
+        uint64_t const RSP_PHYS = sys::usercopy::mapped_physical_address(*waiter, waiter->wait_resume_rsp_user_addr);
         if (RSP_PHYS == mm::virt::PADDR_INVALID || RSP_PHYS == 0) {
             wait_log::warn(
                 "waitpid-stack unmapped: waiter=%lu child=%lu path=%s rsp_va=0x%llx old_phys=0x%llx new_phys=0x%llx rip_va=0x%llx "
@@ -7582,10 +7582,10 @@ void cleanup_waitable_zombie_resources(GcDetachedTask const& detached, GcTaskTim
     if (cur->pagemap != nullptr) {
         uint64_t const START_US = time::get_us();
         if (detached.should_free_pagemap) {
-            ker::syscall::vmem::release_file_mmap_ranges_for_pagemap(cur->pagemap);
-            mm::virt::destroy_user_space(cur->pagemap, cur->pid, cur->name, "task-zombie-gc");
-            mm::virt::release_pagemap(cur->pagemap);
-            cur->pagemap = nullptr;
+            auto* pagemap = cur->detach_pagemap_after_usercopy_quiescence();
+            ker::syscall::vmem::release_file_mmap_ranges_for_pagemap(pagemap);
+            mm::virt::destroy_user_space(pagemap, cur->pid, cur->name, "task-zombie-gc");
+            mm::virt::release_pagemap(pagemap);
         }
         timing.pagemap_us = elapsed_us_since(START_US, time::get_us());
     }
@@ -7598,6 +7598,13 @@ auto queue_detached_gc_task_cleanup(GcDetachedTask const& detached, uint64_t det
     if (cur == nullptr || cur->pagemap == nullptr || !detached.should_free_pagemap) {
         return false;
     }
+
+    cur->quiesce_usercopy_pagemap();
+
+    // File-backed dirty snapshots may take short-lived mapped page pins. Do
+    // that once, before the budgeted destroy state owns the pagemap's
+    // exclusive usercopy-teardown gate across scheduler slices.
+    ker::syscall::vmem::release_file_mmap_ranges_for_pagemap(cur->pagemap);
 
     auto* pagemap_state = mm::virt::create_destroy_user_space_budget_state(cur->pagemap, cur->pid, cur->name, "task-exit-gc");
     if (pagemap_state == nullptr) {
@@ -7637,7 +7644,6 @@ auto process_deferred_gc_cleanup_slice(GcTaskTiming& timing, uint32_t pagemap_st
     gc_deferred_cleanup_slices.fetch_add(1, std::memory_order_relaxed);
     if (cur->pagemap != nullptr && item->should_free_pagemap && item->pagemap_state != nullptr) {
         uint64_t const START_US = time::get_us();
-        ker::syscall::vmem::release_file_mmap_ranges_for_pagemap(cur->pagemap);
         if (!mm::virt::destroy_user_space_budgeted(item->pagemap_state, pagemap_step_budget)) {
             timing.pagemap_us = elapsed_us_since(START_US, time::get_us());
             timing.total_us = timing.detach_us + timing.pagemap_us;
@@ -7680,12 +7686,12 @@ void cleanup_detached_gc_task(GcDetachedTask const& detached, GcTaskTiming& timi
     //   either the process leader or a user thread.
     if (cur->pagemap != nullptr) {
         uint64_t const START_US = time::get_us();
+        auto* pagemap = cur->detach_pagemap_after_usercopy_quiescence();
         if (detached.should_free_pagemap) {
-            ker::syscall::vmem::release_file_mmap_ranges_for_pagemap(cur->pagemap);
-            mm::virt::destroy_user_space(cur->pagemap, cur->pid, cur->name, "task-exit-gc");
-            mm::virt::release_pagemap(cur->pagemap);
+            ker::syscall::vmem::release_file_mmap_ranges_for_pagemap(pagemap);
+            mm::virt::destroy_user_space(pagemap, cur->pid, cur->name, "task-exit-gc");
+            mm::virt::release_pagemap(pagemap);
         }
-        cur->pagemap = nullptr;
         timing.pagemap_us = elapsed_us_since(START_US, time::get_us());
     }
 

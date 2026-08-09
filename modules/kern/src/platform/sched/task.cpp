@@ -517,10 +517,10 @@ void teardown_unpublished_process_resources(Task* task) {
     task->context.syscall_scratch_area = 0;
 
     if (task->pagemap != nullptr && task->pagemap != mm::virt::get_kernel_pagemap()) {
-        ker::syscall::vmem::release_file_mmap_ranges_for_pagemap(task->pagemap);
-        mm::virt::destroy_user_space(task->pagemap, task->pid, task->name, "unpublished-process");
-        mm::virt::release_pagemap(task->pagemap);
-        task->pagemap = nullptr;
+        auto* pagemap = task->detach_pagemap_after_usercopy_quiescence();
+        ker::syscall::vmem::release_file_mmap_ranges_for_pagemap(pagemap);
+        mm::virt::destroy_user_space(pagemap, task->pid, task->name, "unpublished-process");
+        mm::virt::release_pagemap(pagemap);
     }
 
     delete[] task->name;
@@ -798,6 +798,56 @@ auto task_selftest_waitpid_block_state_clear_resets_fields() -> bool {
            !task.waitpid_completion_claimed.load(std::memory_order_acquire);
 }
 #endif
+
+auto Task::try_acquire_usercopy_pagemap(mm::paging::PageTable*& out) -> bool {
+    out = nullptr;
+    if (state.load(std::memory_order_acquire) != TaskState::ACTIVE || usercopy_pagemap_closing.load(std::memory_order_acquire)) {
+        return false;
+    }
+
+    uint32_t accesses = usercopy_pagemap_accesses.load(std::memory_order_acquire);
+    while (accesses != UINT32_MAX) {
+        if (usercopy_pagemap_accesses.compare_exchange_weak(accesses, accesses + 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
+            break;
+        }
+    }
+    if (accesses == UINT32_MAX) {
+        return false;
+    }
+
+    if (state.load(std::memory_order_acquire) != TaskState::ACTIVE || usercopy_pagemap_closing.load(std::memory_order_acquire) ||
+        pagemap == nullptr) {
+        release_usercopy_pagemap();
+        return false;
+    }
+
+    out = pagemap;
+    return true;
+}
+
+void Task::release_usercopy_pagemap() { usercopy_pagemap_accesses.fetch_sub(1, std::memory_order_acq_rel); }
+
+void Task::quiesce_usercopy_pagemap() {
+    usercopy_pagemap_closing.store(true, std::memory_order_release);
+    while (usercopy_pagemap_accesses.load(std::memory_order_acquire) != 0) {
+        asm volatile("pause" ::: "memory");
+    }
+}
+
+auto Task::detach_pagemap_after_usercopy_quiescence() -> mm::paging::PageTable* {
+    quiesce_usercopy_pagemap();
+    auto* detached = pagemap;
+    pagemap = nullptr;
+    return detached;
+}
+
+auto Task::replace_pagemap_after_usercopy_quiescence(mm::paging::PageTable* replacement) -> mm::paging::PageTable* {
+    quiesce_usercopy_pagemap();
+    auto* replaced = pagemap;
+    pagemap = replacement;
+    usercopy_pagemap_closing.store(false, std::memory_order_release);
+    return replaced;
+}
 
 Task::Task(const char* name, uint64_t elf_start, uint64_t kernel_rsp, TaskType type) {
     // CRITICAL: Copy the name string to kernel heap memory!
@@ -1129,7 +1179,8 @@ auto Task::initialize_process_image(const ker::loader::elf::ElfFileView& elf, co
     return true;
 }
 
-Task* Task::create_user_thread(Task* parent, uint64_t tcb_vaddr, uint64_t user_sp, uint64_t enter_thread_va) {
+Task* Task::create_user_thread(Task* parent, uint64_t tcb_vaddr, uint64_t user_sp, uint64_t enter_thread_va, uint64_t entry_va,
+                               uint64_t user_arg_va) {
     auto const KSTACK_BASE = reinterpret_cast<uint64_t>(mm::phys::kernel_stack_alloc("user_thread_kstack"));
     if (KSTACK_BASE == 0) {
         dbg::log("createUserThread: OOM allocating kernel stack");
@@ -1204,23 +1255,9 @@ Task* Task::create_user_thread(Task* parent, uint64_t tcb_vaddr, uint64_t user_s
     thr->gsbase = reinterpret_cast<uint64_t>(per_cpu);
     auto cleanup_constructed_thread_task = [&]() { destroy_unpublished_user_thread(t); };
 
-    // User-mode interrupt frame: jump straight into __mlibc_enter_thread.
-    // sys_prepare_stack pushed [ user_arg, entry ] below userSp (i.e. at userSp and userSp+8).
-    // Read them out now so the kernel can set RDI/RSI directly, and advance RSP past them.
-    uint64_t entry_va = 0;
-    uint64_t user_arg_va = 0;
-    {
-        // Translate the two words on the prepared stack via the parent pagemap
-        uint64_t const PA_ENTRY = mm::virt::translate(parent->pagemap, user_sp);
-        if (PA_ENTRY != mm::virt::PADDR_INVALID) {
-            entry_va = *reinterpret_cast<uint64_t*>(mm::addr::get_virt_pointer(PA_ENTRY));
-        }
-        uint64_t const PA_ARG = mm::virt::translate(parent->pagemap, user_sp + 8);
-        if (PA_ARG != mm::virt::PADDR_INVALID) {
-            user_arg_va = *reinterpret_cast<uint64_t*>(mm::addr::get_virt_pointer(PA_ARG));
-        }
-    }
-
+    // User-mode interrupt frame: jump straight into __mlibc_enter_thread. The
+    // syscall layer already snapshotted the prepared [entry, user_arg] words
+    // before taking the shared-VM publication mutex.
     t->context.frame.rip = enter_thread_va;  // __mlibc_enter_thread
     t->context.frame.rsp = user_sp + 16;     // skip the two pushed words
     t->context.frame.cs = 0x23;              // user code segment

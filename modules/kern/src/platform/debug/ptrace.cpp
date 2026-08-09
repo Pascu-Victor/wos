@@ -12,9 +12,9 @@
 #include <cstdint>
 #include <cstring>
 #include <net/wki/remote_compute.hpp>
+#include <new>
 #include <platform/dbg/dbg.hpp>
 #include <platform/interrupt/gdt.hpp>
-#include <platform/mm/addr.hpp>
 #include <platform/mm/mm.hpp>
 #include <platform/mm/virt.hpp>
 #include <platform/sched/scheduler.hpp>
@@ -122,27 +122,34 @@ void release_target(Task* target, Task& tracer) {
     }
 }
 
-auto copy_task_memory(Task& target, uint64_t target_addr, void* user_buffer, size_t len, bool write_target, size_t* transferred)
+auto copy_task_memory(Task& target, uint64_t target_addr, void* kernel_buffer, size_t len, bool write_target, size_t* transferred)
     -> uint64_t {
-    if (target.pagemap == nullptr || user_buffer == nullptr) {
+    if (transferred != nullptr) {
+        *transferred = 0;
+    }
+    if (kernel_buffer == nullptr || !ker::mod::sys::usercopy::range_valid(target_addr, len)) {
         return as_error(EFAULT);
     }
 
-    auto* bytes = static_cast<uint8_t*>(user_buffer);
+    auto* bytes = static_cast<uint8_t*>(kernel_buffer);
     size_t done = 0;
     while (done < len) {
         uint64_t const CUR = target_addr + done;
-        uint64_t const PHYS = ker::mod::mm::virt::translate(target.pagemap, CUR);
-        if (PHYS == ker::mod::mm::virt::PADDR_INVALID) {
+        size_t const PAGE_LEFT = ker::mod::mm::paging::PAGE_SIZE - (CUR & (ker::mod::mm::paging::PAGE_SIZE - 1));
+        size_t const CHUNK = std::min(PAGE_LEFT, len - done);
+        ker::mod::sys::usercopy::StableUserPage pin;
+        if (!ker::mod::sys::usercopy::pin_task_user_page(target, CUR, write_target, true, pin)) {
             break;
         }
-        auto* hhdm = reinterpret_cast<uint8_t*>(ker::mod::mm::addr::get_virt_pointer(PHYS));
-        size_t const PAGE_LEFT = 0x1000 - (CUR & 0xfff);
-        size_t const CHUNK = std::min(PAGE_LEFT, len - done);
+        auto* hhdm = static_cast<uint8_t*>(pin.kernel_address());
         if (write_target) {
             std::memcpy(hhdm, bytes + done, CHUNK);
         } else {
             std::memcpy(bytes + done, hhdm, CHUNK);
+        }
+        bool const COMMITTED = write_target ? pin.commit_write() : pin.still_mapped();
+        if (!COMMITTED) {
+            break;
         }
         done += CHUNK;
     }
@@ -151,6 +158,40 @@ auto copy_task_memory(Task& target, uint64_t target_addr, void* user_buffer, siz
         *transferred = done;
     }
     return done == len ? 0 : as_error(EFAULT);
+}
+
+auto write_task_word(Task& target, uint64_t target_addr, uint64_t word) -> uint64_t {
+    if (!ker::mod::sys::usercopy::range_valid(target_addr, sizeof(word))) {
+        return as_error(EFAULT);
+    }
+
+    size_t const FIRST_SIZE =
+        std::min<size_t>(sizeof(word), ker::mod::mm::paging::PAGE_SIZE - (target_addr & (ker::mod::mm::paging::PAGE_SIZE - 1)));
+    ker::mod::sys::usercopy::StableUserPage first_page;
+    if (!ker::mod::sys::usercopy::pin_task_user_page(target, target_addr, true, true, first_page)) {
+        return as_error(EFAULT);
+    }
+
+    ker::mod::sys::usercopy::StableUserPage second_page;
+    if (FIRST_SIZE != sizeof(word) &&
+        !ker::mod::sys::usercopy::pin_task_user_page(target, target_addr + FIRST_SIZE, true, true, second_page)) {
+        return as_error(EFAULT);
+    }
+    if (!first_page.still_mapped() || (second_page.valid() && !second_page.still_mapped())) {
+        return as_error(EFAULT);
+    }
+
+    auto const* bytes = reinterpret_cast<const uint8_t*>(&word);
+    std::memcpy(first_page.kernel_address(), bytes, FIRST_SIZE);
+    if (second_page.valid()) {
+        std::memcpy(second_page.kernel_address(), bytes + FIRST_SIZE, sizeof(word) - FIRST_SIZE);
+    }
+    // Both halves were written through HHDM aliases. Commit each leaf even if
+    // the other half raced an invalidation so every still-live mapping gets
+    // the architectural dirty state expected by msync and VM accounting.
+    bool const FIRST_COMMITTED = first_page.commit_write();
+    bool const SECOND_COMMITTED = !second_page.valid() || second_page.commit_write();
+    return FIRST_COMMITTED && SECOND_COMMITTED ? 0 : as_error(EFAULT);
 }
 
 auto is_user_canonical(uint64_t value) -> bool { return value != 0 && value < 0x0000'8000'0000'0000ULL; }
@@ -492,24 +533,22 @@ void fill_exit_stop_info(Task& target, abi::ptrace::StopInfo& out) {
     out.wait_status = target.exit_status;
 }
 
-auto fill_stop_info(Task& target, uint64_t data) -> uint64_t {
-    auto* out = reinterpret_cast<abi::ptrace::StopInfo*>(data);
-    if (out == nullptr) {
+auto fill_stop_info(Task& tracer, Task& target, uint64_t data) -> uint64_t {
+    if (data == 0) {
         return as_error(EFAULT);
     }
+    abi::ptrace::StopInfo out{};
     if (target_exited(target)) {
-        fill_exit_stop_info(target, *out);
-        return 0;
+        fill_exit_stop_info(target, out);
+    } else {
+        fill_event(target, out.event);
+        out.wait_status = stop_wait_status(target);
+        if (target.ptrace_stopped) {
+            fill_gprs(target, out.regs);
+            out.flags |= abi::ptrace::STOP_INFO_REGS_VALID;
+        }
     }
-
-    std::memset(out, 0, sizeof(*out));
-    fill_event(target, out->event);
-    out->wait_status = stop_wait_status(target);
-    if (target.ptrace_stopped) {
-        fill_gprs(target, out->regs);
-        out->flags |= abi::ptrace::STOP_INFO_REGS_VALID;
-    }
-    return 0;
+    return ker::mod::sys::usercopy::copy_value_to_task(tracer, data, out) ? 0 : as_error(EFAULT);
 }
 
 void clear_tracer_wait_state(Task& tracer) {
@@ -540,7 +579,7 @@ void consume_exit_for_tracer(Task& tracer, Task& target) {
 }
 
 auto syscall_wait(Task& tracer, Task& target, uint64_t data) -> uint64_t {
-    if (reinterpret_cast<abi::ptrace::StopInfo*>(data) == nullptr) {
+    if (data == 0) {
         return as_error(EFAULT);
     }
 
@@ -548,9 +587,15 @@ auto syscall_wait(Task& tracer, Task& target, uint64_t data) -> uint64_t {
     if (ret != 0) {
         return ret;
     }
+    if (!ker::mod::sys::usercopy::ensure_writable(tracer, data, sizeof(abi::ptrace::StopInfo))) {
+        return as_error(EFAULT);
+    }
     if (target_exited(target)) {
-        consume_exit_for_tracer(tracer, target);
-        return fill_stop_info(target, data);
+        ret = fill_stop_info(tracer, target, data);
+        if (ret == 0) {
+            consume_exit_for_tracer(tracer, target);
+        }
+        return ret;
     }
 
     publish_tracer_wait(tracer, target);
@@ -558,12 +603,19 @@ auto syscall_wait(Task& tracer, Task& target, uint64_t data) -> uint64_t {
 
     for (;;) {
         if (target_exited(target)) {
-            consume_exit_for_tracer(tracer, target);
-            return fill_stop_info(target, data);
+            ret = fill_stop_info(tracer, target, data);
+            if (ret == 0) {
+                consume_exit_for_tracer(tracer, target);
+            } else {
+                clear_tracer_wait_state(tracer);
+            }
+            return ret;
         }
         if (target.ptrace_stopped) {
-            ret = fill_stop_info(target, data);
-            target.ptrace_stop_pending = false;
+            ret = fill_stop_info(tracer, target, data);
+            if (ret == 0) {
+                target.ptrace_stop_pending = false;
+            }
             clear_tracer_wait_state(tracer);
             return ret;
         }
@@ -575,49 +627,69 @@ auto syscall_wait(Task& tracer, Task& target, uint64_t data) -> uint64_t {
     }
 }
 
-auto read_regset(Task& target, uint64_t data) -> uint64_t {
-    auto* io = reinterpret_cast<abi::ptrace::RegsetIo*>(data);
-    if (io == nullptr || io->buffer == nullptr) {
+auto read_regset(Task& tracer, Task& target, uint64_t data) -> uint64_t {
+    abi::ptrace::RegsetIo io{};
+    if (!ker::mod::sys::usercopy::copy_value_from_task(tracer, data, io) || io.buffer == nullptr) {
         return as_error(EFAULT);
     }
-    if (io->kind == abi::ptrace::regset::X86_64_GPR) {
-        if (io->size < sizeof(abi::ptrace::X86_64GprState)) {
+    uint64_t const BUFFER_ADDR = reinterpret_cast<uint64_t>(io.buffer);
+    if (io.kind == abi::ptrace::regset::X86_64_GPR) {
+        if (io.size < sizeof(abi::ptrace::X86_64GprState)) {
             return as_error(EINVAL);
         }
-        auto* out = static_cast<abi::ptrace::X86_64GprState*>(io->buffer);
-        fill_gprs(target, *out);
-        io->size = sizeof(abi::ptrace::X86_64GprState);
-        return 0;
-    }
-    if (io->kind == abi::ptrace::regset::X86_64_XSAVE) {
-        if (io->size < ker::mod::sched::task::FxState::XSAVE_AREA_SIZE) {
+        if (!ker::mod::sys::usercopy::ensure_writable(tracer, BUFFER_ADDR, sizeof(abi::ptrace::X86_64GprState)) ||
+            !ker::mod::sys::usercopy::ensure_writable(tracer, data, sizeof(io))) {
+            return as_error(EFAULT);
+        }
+        abi::ptrace::X86_64GprState out{};
+        fill_gprs(target, out);
+        if (!ker::mod::sys::usercopy::copy_value_to_task(tracer, BUFFER_ADDR, out)) {
+            return as_error(EFAULT);
+        }
+        io.size = sizeof(out);
+    } else if (io.kind == abi::ptrace::regset::X86_64_XSAVE) {
+        if (io.size < ker::mod::sched::task::FxState::XSAVE_AREA_SIZE) {
             return as_error(EINVAL);
         }
-        std::memcpy(io->buffer, target.fx_state.aligned(), ker::mod::sched::task::FxState::XSAVE_AREA_SIZE);
-        io->size = ker::mod::sched::task::FxState::XSAVE_AREA_SIZE;
-        return 0;
+        if (!ker::mod::sys::usercopy::ensure_writable(tracer, BUFFER_ADDR, ker::mod::sched::task::FxState::XSAVE_AREA_SIZE) ||
+            !ker::mod::sys::usercopy::ensure_writable(tracer, data, sizeof(io)) ||
+            !ker::mod::sys::usercopy::copy_to_task(tracer, BUFFER_ADDR, target.fx_state.aligned(),
+                                                   ker::mod::sched::task::FxState::XSAVE_AREA_SIZE)) {
+            return as_error(EFAULT);
+        }
+        io.size = ker::mod::sched::task::FxState::XSAVE_AREA_SIZE;
+    } else {
+        return as_error(EINVAL);
     }
-    return as_error(EINVAL);
+    return ker::mod::sys::usercopy::copy_value_to_task(tracer, data, io) ? 0 : as_error(EFAULT);
 }
 
-auto write_regset(Task& target, uint64_t data) -> uint64_t {
-    auto* io = reinterpret_cast<abi::ptrace::RegsetIo*>(data);
-    if (io == nullptr || io->buffer == nullptr) {
+auto write_regset(Task& tracer, Task& target, uint64_t data) -> uint64_t {
+    abi::ptrace::RegsetIo io{};
+    if (!ker::mod::sys::usercopy::copy_value_from_task(tracer, data, io) || io.buffer == nullptr) {
         return as_error(EFAULT);
     }
-    if (io->kind == abi::ptrace::regset::X86_64_GPR) {
-        if (io->size < sizeof(abi::ptrace::X86_64GprState)) {
+    uint64_t const BUFFER_ADDR = reinterpret_cast<uint64_t>(io.buffer);
+    if (io.kind == abi::ptrace::regset::X86_64_GPR) {
+        if (io.size < sizeof(abi::ptrace::X86_64GprState)) {
             return as_error(EINVAL);
         }
-        const auto* in = static_cast<const abi::ptrace::X86_64GprState*>(io->buffer);
-        set_gprs(target, *in);
+        abi::ptrace::X86_64GprState in{};
+        if (!ker::mod::sys::usercopy::copy_value_from_task(tracer, BUFFER_ADDR, in)) {
+            return as_error(EFAULT);
+        }
+        set_gprs(target, in);
         return 0;
     }
-    if (io->kind == abi::ptrace::regset::X86_64_XSAVE) {
-        if (io->size < ker::mod::sched::task::FxState::XSAVE_AREA_SIZE) {
+    if (io.kind == abi::ptrace::regset::X86_64_XSAVE) {
+        if (io.size < ker::mod::sched::task::FxState::XSAVE_AREA_SIZE) {
             return as_error(EINVAL);
         }
-        std::memcpy(target.fx_state.aligned(), io->buffer, ker::mod::sched::task::FxState::XSAVE_AREA_SIZE);
+        std::array<uint8_t, ker::mod::sched::task::FxState::XSAVE_AREA_SIZE> state{};
+        if (!ker::mod::sys::usercopy::copy_from_task(tracer, BUFFER_ADDR, state.data(), state.size())) {
+            return as_error(EFAULT);
+        }
+        std::memcpy(target.fx_state.aligned(), state.data(), state.size());
         target.fx_state.saved = true;
         target.fx_state.live_saved = true;
         target.fx_state.initialized = true;
@@ -626,15 +698,20 @@ auto write_regset(Task& target, uint64_t data) -> uint64_t {
     return as_error(EINVAL);
 }
 
-auto list_threads(Task& target, uint64_t data) -> uint64_t {
-    auto* list = reinterpret_cast<abi::ptrace::ThreadList*>(data);
-    if (list == nullptr || (list->capacity != 0 && list->tids == nullptr)) {
+auto list_threads(Task& tracer, Task& target, uint64_t data) -> uint64_t {
+    abi::ptrace::ThreadList list{};
+    if (!ker::mod::sys::usercopy::copy_value_from_task(tracer, data, list) || (list.capacity != 0 && list.tids == nullptr) ||
+        !ker::mod::sys::usercopy::ensure_writable(tracer, data, sizeof(list))) {
         return as_error(EFAULT);
     }
 
     size_t count = 0;
     uint64_t const GROUP = process_id(target);
     uint64_t const ACTIVE_COUNT = ker::mod::sched::get_active_task_count();
+    auto* tids = ACTIVE_COUNT != 0 ? new (std::nothrow) uint64_t[ACTIVE_COUNT] : nullptr;
+    if (ACTIVE_COUNT != 0 && tids == nullptr) {
+        return as_error(ENOMEM);
+    }
     for (uint64_t idx = 0; idx < ACTIVE_COUNT; ++idx) {
         auto* candidate = ker::mod::sched::get_active_task_at_safe(idx);
         if (candidate == nullptr) {
@@ -642,15 +719,26 @@ auto list_threads(Task& target, uint64_t data) -> uint64_t {
         }
         bool const SAME_GROUP = process_id(*candidate) == GROUP;
         if (SAME_GROUP) {
-            if (count < list->capacity) {
-                list->tids[count] = candidate->pid;
-            }
-            ++count;
+            tids[count++] = candidate->pid;
         }
         candidate->release();
     }
-    list->count = count;
-    return count <= list->capacity ? 0 : as_error(ENOSPC);
+
+    size_t const COPY_COUNT = std::min(count, list.capacity);
+    size_t const COPY_BYTES = COPY_COUNT * sizeof(uint64_t);
+    uint64_t const TIDS_ADDR = reinterpret_cast<uint64_t>(list.tids);
+    if ((COPY_BYTES != 0 && (!ker::mod::sys::usercopy::ensure_writable(tracer, TIDS_ADDR, COPY_BYTES) ||
+                             !ker::mod::sys::usercopy::copy_to_task(tracer, TIDS_ADDR, tids, COPY_BYTES)))) {
+        delete[] tids;
+        return as_error(EFAULT);
+    }
+    delete[] tids;
+
+    list.count = count;
+    if (!ker::mod::sys::usercopy::copy_value_to_task(tracer, data, list)) {
+        return as_error(EFAULT);
+    }
+    return count <= list.capacity ? 0 : as_error(ENOSPC);
 }
 
 auto copy_image_path(char* dst, size_t dst_size, const char* src) -> void {
@@ -705,24 +793,30 @@ auto main_image_text_range(const Task& target, uint64_t load_base, uint64_t& tex
     }
 }
 
-auto list_images(Task& target, uint64_t data) -> uint64_t {
-    auto* list = reinterpret_cast<abi::ptrace::ImageList*>(data);
-    if (list == nullptr || (list->capacity != 0 && list->images == nullptr)) {
+auto list_images(Task& tracer, Task& target, uint64_t data) -> uint64_t {
+    abi::ptrace::ImageList list{};
+    if (!ker::mod::sys::usercopy::copy_value_from_task(tracer, data, list) || (list.capacity != 0 && list.images == nullptr) ||
+        !ker::mod::sys::usercopy::ensure_writable(tracer, data, sizeof(list))) {
         return as_error(EFAULT);
     }
 
     size_t needed = target.interp_base != 0 ? 2 : 1;
-    list->count = needed;
-    if (list->capacity < needed) {
+    list.count = needed;
+    if (list.capacity < needed) {
+        if (!ker::mod::sys::usercopy::copy_value_to_task(tracer, data, list)) {
+            return as_error(EFAULT);
+        }
         return as_error(ENOSPC);
     }
+
+    std::array<abi::ptrace::ImageRecord, 2> images{};
 
     uint64_t const LOAD_BASE = main_image_load_base(target);
     uint64_t text_addr = 0;
     uint64_t text_size = 0;
     main_image_text_range(target, LOAD_BASE, text_addr, text_size);
 
-    auto& main = list->images[0];
+    auto& main = images.at(0);
     std::memset(&main, 0, sizeof(main));
     copy_image_path(static_cast<char*>(main.path), abi::ptrace::ImageRecord::PATH_LEN, target.exe_path.data());
     main.load_base = LOAD_BASE;
@@ -732,7 +826,7 @@ auto list_images(Task& target, uint64_t data) -> uint64_t {
     main.flags = 1U;
 
     if (target.interp_base != 0) {
-        auto& interp = list->images[1];
+        auto& interp = images.at(1);
         std::memset(&interp, 0, sizeof(interp));
         copy_image_path(static_cast<char*>(interp.path), abi::ptrace::ImageRecord::PATH_LEN, "/lib/ld.so");
         interp.load_base = target.interp_base;
@@ -741,52 +835,59 @@ auto list_images(Task& target, uint64_t data) -> uint64_t {
         interp.entry = 0;
         interp.flags = 2U;
     }
+
+    size_t const IMAGE_BYTES = needed * sizeof(images.at(0));
+    uint64_t const IMAGES_ADDR = reinterpret_cast<uint64_t>(list.images);
+    if (!ker::mod::sys::usercopy::ensure_writable(tracer, IMAGES_ADDR, IMAGE_BYTES) ||
+        !ker::mod::sys::usercopy::copy_to_task(tracer, IMAGES_ADDR, images.data(), IMAGE_BYTES) ||
+        !ker::mod::sys::usercopy::copy_value_to_task(tracer, data, list)) {
+        return as_error(EFAULT);
+    }
     return 0;
 }
 
-auto remote_info(Task& target, uint64_t data) -> uint64_t {
-    auto* out = reinterpret_cast<abi::ptrace::RemoteInfo*>(data);
-    if (out == nullptr) {
+auto remote_info(Task& tracer, Task& target, uint64_t data) -> uint64_t {
+    if (data == 0) {
         return as_error(EFAULT);
     }
-    std::memset(out, 0, sizeof(*out));
-    out->is_proxy = target.wki_proxy_task || target.wki_proxy_task_id != 0 ? 1U : 0U;
+    abi::ptrace::RemoteInfo out{};
+    out.is_proxy = target.wki_proxy_task || target.wki_proxy_task_id != 0 ? 1U : 0U;
     if (target.has_exited) {
-        out->state = 2U;
+        out.state = 2U;
     } else {
-        out->state = target.wki_remote_pid != 0 ? 1U : 0U;
+        out.state = target.wki_remote_pid != 0 ? 1U : 0U;
     }
-    out->proxy_pid = target.pid;
-    out->task_id = target.wki_proxy_task_id;
-    out->target_node = PTRACE_REMOTE_NODE_INVALID;
-    out->remote_pid = target.wki_remote_pid;
+    out.proxy_pid = target.pid;
+    out.task_id = target.wki_proxy_task_id;
+    out.target_node = PTRACE_REMOTE_NODE_INVALID;
+    out.remote_pid = target.wki_remote_pid;
     uint16_t proxy_target_node = 0;
-    if (ker::net::wki::wki_proxy_task_remote_info(&target, &proxy_target_node, out->target_hostname.data(), out->target_hostname.size())) {
-        out->target_node = proxy_target_node;
+    if (ker::net::wki::wki_proxy_task_remote_info(&target, &proxy_target_node, out.target_hostname.data(), out.target_hostname.size())) {
+        out.target_node = proxy_target_node;
     }
-    if (out->target_hostname.at(0) == '\0') {
-        std::strncpy(out->target_hostname.data(), target.wki_target_hostname.data(), out->target_hostname.size() - 1);
+    if (out.target_hostname.at(0) == '\0') {
+        std::strncpy(out.target_hostname.data(), target.wki_target_hostname.data(), out.target_hostname.size() - 1);
     }
-    if (out->target_hostname.at(0) == '\0') {
-        std::strncpy(out->target_hostname.data(), target.wki_submitter_hostname.data(), out->target_hostname.size() - 1);
+    if (out.target_hostname.at(0) == '\0') {
+        std::strncpy(out.target_hostname.data(), target.wki_submitter_hostname.data(), out.target_hostname.size() - 1);
     }
-    return 0;
+    return ker::mod::sys::usercopy::copy_value_to_task(tracer, data, out) ? 0 : as_error(EFAULT);
 }
 
-auto set_hw_break(Task& target, uint64_t data, bool enable) -> uint64_t {
-    auto* desc = reinterpret_cast<abi::ptrace::HwBreak*>(data);
-    if (desc == nullptr) {
+auto set_hw_break(Task& tracer, Task& target, uint64_t data, bool enable) -> uint64_t {
+    abi::ptrace::HwBreak desc{};
+    if (!ker::mod::sys::usercopy::copy_value_from_task(tracer, data, desc)) {
         return as_error(EFAULT);
     }
-    if (desc->slot >= target.ptrace_dr_addr.size()) {
+    if (desc.slot >= target.ptrace_dr_addr.size()) {
         return as_error(EINVAL);
     }
     uint64_t length_code = 0;
     if (enable) {
-        if (desc->type == abi::ptrace::hw_break_type::EXECUTE && desc->length != 1) {
+        if (desc.type == abi::ptrace::hw_break_type::EXECUTE && desc.length != 1) {
             return as_error(EINVAL);
         }
-        switch (desc->length) {
+        switch (desc.length) {
             case 1:
                 length_code = 0b00;
                 break;
@@ -802,22 +903,80 @@ auto set_hw_break(Task& target, uint64_t data, bool enable) -> uint64_t {
             default:
                 return as_error(EINVAL);
         }
-        if (desc->type != abi::ptrace::hw_break_type::EXECUTE && (desc->address % desc->length) != 0) {
+        if (desc.type != abi::ptrace::hw_break_type::EXECUTE && (desc.address % desc.length) != 0) {
             return as_error(EINVAL);
         }
     }
 
-    target.ptrace_dr_addr.at(desc->slot) = enable ? desc->address : 0;
-    uint64_t const LOCAL_ENABLE = X86_DR7_LOCAL_ENABLE_MASK << (desc->slot * X86_DR7_SLOT_ENABLE_STRIDE);
-    uint64_t const CONTROL_SHIFT = X86_DR7_SLOT_CONTROL_BASE + (desc->slot * X86_DR7_SLOT_CONTROL_STRIDE);
+    target.ptrace_dr_addr.at(desc.slot) = enable ? desc.address : 0;
+    uint64_t const LOCAL_ENABLE = X86_DR7_LOCAL_ENABLE_MASK << (desc.slot * X86_DR7_SLOT_ENABLE_STRIDE);
+    uint64_t const CONTROL_SHIFT = X86_DR7_SLOT_CONTROL_BASE + (desc.slot * X86_DR7_SLOT_CONTROL_STRIDE);
     target.ptrace_dr7 &= ~LOCAL_ENABLE;
     target.ptrace_dr7 &= ~(X86_DR7_SLOT_CONTROL_MASK << CONTROL_SHIFT);
     if (enable) {
         target.ptrace_dr7 |= X86_DR7_RESERVED_ONES;
         target.ptrace_dr7 |= LOCAL_ENABLE;
-        target.ptrace_dr7 |= ((static_cast<uint64_t>(desc->type) & 0b11ULL) | (length_code << 2U)) << CONTROL_SHIFT;
+        target.ptrace_dr7 |= ((static_cast<uint64_t>(desc.type) & 0b11ULL) | (length_code << 2U)) << CONTROL_SHIFT;
     }
     return 0;
+}
+
+auto transfer_memory(Task& tracer, Task& target, uint64_t data, bool write_target) -> uint64_t {
+    abi::ptrace::MemIo io{};
+    if (!ker::mod::sys::usercopy::copy_value_from_task(tracer, data, io) || io.buffer == nullptr ||
+        !ker::mod::sys::usercopy::range_valid(io.address, io.size) ||
+        !ker::mod::sys::usercopy::range_valid(reinterpret_cast<uint64_t>(io.buffer), io.size) ||
+        !ker::mod::sys::usercopy::ensure_writable(tracer, data, sizeof(io))) {
+        return as_error(EFAULT);
+    }
+
+    constexpr size_t BOUNCE_SIZE = ker::mod::mm::paging::PAGE_SIZE;
+    std::array<uint8_t, BOUNCE_SIZE> bounce{};
+    uint64_t const BUFFER_ADDR = reinterpret_cast<uint64_t>(io.buffer);
+    size_t done = 0;
+    uint64_t result = 0;
+
+    while (done < io.size) {
+        size_t const CHUNK = std::min(BOUNCE_SIZE, io.size - done);
+        if (write_target) {
+            auto const INPUT = ker::mod::sys::usercopy::copy_from_task_partial(tracer, BUFFER_ADDR + done, bounce.data(), CHUNK);
+            if (INPUT.bytes_copied != 0) {
+                size_t target_done = 0;
+                uint64_t const TARGET_RESULT =
+                    copy_task_memory(target, io.address + done, bounce.data(), INPUT.bytes_copied, true, &target_done);
+                done += target_done;
+                if (TARGET_RESULT != 0 || target_done != INPUT.bytes_copied) {
+                    result = TARGET_RESULT != 0 ? TARGET_RESULT : as_error(EFAULT);
+                    break;
+                }
+            }
+            if (INPUT.fault || INPUT.bytes_copied != CHUNK) {
+                result = as_error(EFAULT);
+                break;
+            }
+        } else {
+            size_t target_done = 0;
+            uint64_t const TARGET_RESULT = copy_task_memory(target, io.address + done, bounce.data(), CHUNK, false, &target_done);
+            if (target_done != 0) {
+                auto const OUTPUT = ker::mod::sys::usercopy::copy_to_task_partial(tracer, BUFFER_ADDR + done, bounce.data(), target_done);
+                done += OUTPUT.bytes_copied;
+                if (OUTPUT.fault || OUTPUT.bytes_copied != target_done) {
+                    result = as_error(EFAULT);
+                    break;
+                }
+            }
+            if (TARGET_RESULT != 0 || target_done != CHUNK) {
+                result = TARGET_RESULT != 0 ? TARGET_RESULT : as_error(EFAULT);
+                break;
+            }
+        }
+    }
+
+    io.transferred = done;
+    if (!ker::mod::sys::usercopy::copy_value_to_task(tracer, data, io)) {
+        return as_error(EFAULT);
+    }
+    return result;
 }
 
 auto decode_debug_register_stop(Task& task, uint64_t dr6, abi::ptrace::stop_reason& reason, uint64_t& address) -> void {
@@ -998,13 +1157,13 @@ auto sys_ptrace(abi::ptrace::request req, uint64_t pid, uint64_t addr, uint64_t 
         case abi::ptrace::request::GETREGSET:
             ret = require_traced(*tracer, *target);
             if (ret == 0) {
-                ret = read_regset(*target, data);
+                ret = read_regset(*tracer, *target, data);
             }
             break;
         case abi::ptrace::request::SETREGSET:
             ret = require_traced(*tracer, *target);
             if (ret == 0) {
-                ret = write_regset(*target, data);
+                ret = write_regset(*tracer, *target, data);
             }
             break;
         case abi::ptrace::request::PEEKDATA: {
@@ -1013,11 +1172,8 @@ auto sys_ptrace(abi::ptrace::request req, uint64_t pid, uint64_t addr, uint64_t 
                 uint64_t word = 0;
                 ret = copy_task_memory(*target, addr, &word, sizeof(word), false, nullptr);
                 if (ret == 0) {
-                    auto* out = reinterpret_cast<uint64_t*>(data);
-                    if (out == nullptr) {
+                    if (data == 0 || !ker::mod::sys::usercopy::copy_value_to_task(*tracer, data, word)) {
                         ret = as_error(EFAULT);
-                    } else {
-                        *out = word;
                     }
                 }
             }
@@ -1026,47 +1182,37 @@ auto sys_ptrace(abi::ptrace::request req, uint64_t pid, uint64_t addr, uint64_t 
         case abi::ptrace::request::POKEDATA: {
             ret = require_traced(*tracer, *target);
             if (ret == 0) {
-                uint64_t word = data;
-                ret = copy_task_memory(*target, addr, &word, sizeof(word), true, nullptr);
+                ret = write_task_word(*target, addr, data);
             }
             break;
         }
         case abi::ptrace::request::READ_MEM: {
             ret = require_traced(*tracer, *target);
-            auto* io = reinterpret_cast<abi::ptrace::MemIo*>(data);
-            if (ret == 0 && io == nullptr) {
-                ret = as_error(EFAULT);
-            }
             if (ret == 0) {
-                ret = copy_task_memory(*target, io->address, io->buffer, io->size, false, &io->transferred);
+                ret = transfer_memory(*tracer, *target, data, false);
             }
             break;
         }
         case abi::ptrace::request::WRITE_MEM: {
             ret = require_traced(*tracer, *target);
-            auto* io = reinterpret_cast<abi::ptrace::MemIo*>(data);
-            if (ret == 0 && io == nullptr) {
-                ret = as_error(EFAULT);
-            }
             if (ret == 0) {
-                ret = copy_task_memory(*target, io->address, io->buffer, io->size, true, &io->transferred);
+                ret = transfer_memory(*tracer, *target, data, true);
             }
             break;
         }
         case abi::ptrace::request::LIST_THREADS:
             ret = require_traced(*tracer, *target);
             if (ret == 0) {
-                ret = list_threads(*target, data);
+                ret = list_threads(*tracer, *target, data);
             }
             break;
         case abi::ptrace::request::GETEVENTMSG:
             ret = require_traced(*tracer, *target);
             if (ret == 0) {
-                auto* out = reinterpret_cast<abi::ptrace::Event*>(data);
-                if (out == nullptr) {
+                abi::ptrace::Event event{};
+                fill_event(*target, event);
+                if (data == 0 || !ker::mod::sys::usercopy::copy_value_to_task(*tracer, data, event)) {
                     ret = as_error(EFAULT);
-                } else {
-                    fill_event(*target, *out);
                 }
             }
             break;
@@ -1077,18 +1223,18 @@ auto sys_ptrace(abi::ptrace::request req, uint64_t pid, uint64_t addr, uint64_t 
             }
             break;
         case abi::ptrace::request::GET_REMOTE_INFO:
-            ret = remote_info(*target, data);
+            ret = remote_info(*tracer, *target, data);
             break;
         case abi::ptrace::request::SET_HW_BREAK:
             ret = require_traced(*tracer, *target);
             if (ret == 0) {
-                ret = set_hw_break(*target, data, true);
+                ret = set_hw_break(*tracer, *target, data, true);
             }
             break;
         case abi::ptrace::request::DEL_HW_BREAK:
             ret = require_traced(*tracer, *target);
             if (ret == 0) {
-                ret = set_hw_break(*target, data, false);
+                ret = set_hw_break(*tracer, *target, data, false);
             }
             break;
         case abi::ptrace::request::SYSCALL_WAIT:
@@ -1097,7 +1243,7 @@ auto sys_ptrace(abi::ptrace::request req, uint64_t pid, uint64_t addr, uint64_t 
         case abi::ptrace::request::GET_IMAGES:
             ret = require_traced(*tracer, *target);
             if (ret == 0) {
-                ret = list_images(*target, data);
+                ret = list_images(*tracer, *target, data);
             }
             break;
         case abi::ptrace::request::GET_MAPS:
