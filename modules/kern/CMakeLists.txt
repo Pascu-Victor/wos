@@ -82,11 +82,12 @@ wos_kernel_glob_recurse(CFILES src/*.c)
 wos_kernel_glob_recurse(ASFILES src/*.S)
 wos_kernel_glob_recurse(NASMFILES src/*.asm)
 wos_kernel_glob_recurse(CXXFILES src/*.cpp)
+wos_kernel_glob_recurse(KTEST_SRCS ${CMAKE_CURRENT_SOURCE_DIR}/src/test/*.cpp)
 
 # Exclude test sources unless self-test mode is explicitly enabled.
 # GLOB_RECURSE picks up src/test/*.cpp; strip them in production builds.
 if(NOT WOS_SELFTEST)
-    list(FILTER CXXFILES EXCLUDE REGEX "/src/test/")
+    list(REMOVE_ITEM CXXFILES ${KTEST_SRCS})
 endif()
 
 # Add executable
