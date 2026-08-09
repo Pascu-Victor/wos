@@ -1427,7 +1427,6 @@ void channel_init(WkiChannel* ch, uint16_t peer_node, uint16_t chan_id, Priority
     ch->tx_seq = 0;
     ch->tx_ack = 0;
     ch->rx_seq = 0;
-    ch->rx_baseline_initialized = false;
     ch->rx_dispatch_seq = 0;
     ch->rx_dispatch_waiters.fill(nullptr);
     ch->rx_ack_pending = WKI_ACK_NONE;
@@ -1565,8 +1564,6 @@ auto default_priority_for_channel(uint16_t channel_id) -> PriorityClass {
     // immediate pure ACK for every data frame.
     return (channel_id <= WKI_CHAN_RESOURCE) ? PriorityClass::LATENCY : PriorityClass::THROUGHPUT;
 }
-
-auto channel_allows_initial_resync(uint16_t channel_id) -> bool { return channel_id != WKI_CHAN_IPC_DATA; }
 
 auto channel_requires_existing_rx_reservation(uint16_t channel_id) -> bool {
     return channel_id >= WKI_CHAN_DYNAMIC_BASE && channel_id < WKI_CHAN_DYNAMIC_RESERVED_BASE;
@@ -3232,21 +3229,6 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len) {
                                    static_cast<int>(hdr->seq_num) - static_cast<int>(ch->rx_seq));
             }
 #endif
-
-            // Reconnect resync: if this channel was just recreated locally (all-zero RX state)
-            // but the peer continued its sequence space, adopt the peer's current seq baseline.
-            // This avoids getting stuck buffering every frame as permanently out-of-order.
-            if (channel_allows_initial_resync(hdr->channel_id) && !ch->rx_baseline_initialized && ch->rx_seq == 0 &&
-                ch->bytes_received == 0 && ch->reorder_head == nullptr && hdr->seq_num != 0) {
-                ker::mod::dbg::log("[WKI] Resyncing channel seq: src=0x%04x ch=%u local_rx_seq=0 remote_seq=%u", hdr->src_node,
-                                   hdr->channel_id, hdr->seq_num);
-                ch->rx_seq = hdr->seq_num;
-                ch->rx_dispatch_seq = hdr->seq_num;
-            }
-            // Record observation even when bounded deferred admission below
-            // returns RETRY. Otherwise a later seq=1 frame could trigger the
-            // reconnect baseline heuristic and skip a refused seq=0 frame.
-            ch->rx_baseline_initialized = true;
 
             if (hdr->seq_num == ch->rx_seq) {
                 if (msg == MsgType::DEV_ATTACH_REQ && wki_dev_server_attach_blocked_by_pending_detach(hdr, payload, PAYLOAD_LEN)) {

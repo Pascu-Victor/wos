@@ -315,9 +315,6 @@ struct WkiChannel {
     std::array<ker::mod::sched::task::Task*, WKI_RX_DISPATCH_WAITER_SLOTS> rx_dispatch_waiters = {};
     uint32_t rx_ack_pending = WKI_ACK_NONE;  // highest seq received, or WKI_ACK_NONE before the first consumed frame
     bool ack_pending = false;
-    // Prevent reconnect baseline resync from skipping a first frame that was
-    // observed but deliberately left unconsumed for bounded-queue retry.
-    bool rx_baseline_initialized = false;
     uint64_t ack_pending_since_us = 0;  // time when ack_pending was last set (for delay enforcement)
 
     // Flow control (credits)
