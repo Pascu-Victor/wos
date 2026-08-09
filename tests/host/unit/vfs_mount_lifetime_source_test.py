@@ -299,7 +299,7 @@ def test_remote_mount_is_configured_atomically() -> None:
     require_order(mount_body, "mount->private_data = initial_private_data", "mounts.push_back(mount)", "owner before publication")
     require_order(mount_body, "std::strcmp(existing->path, mount->path) == 0", "mounts.push_back(mount)", "duplicate rejection")
 
-    remote_mount = function_body(REMOTE_VFS_CPP.read_text(), "wki_remote_vfs_mount")
+    remote_mount = function_body(REMOTE_VFS_CPP.read_text(), "mount_vfs_proxy_lane")
     if 'mount_filesystem(local_mount_path, "remote", nullptr, 0, nullptr, state, &g_remote_vfs_fops)' not in remote_mount:
         fail("remote VFS must publish its state/fops in the mount-table insertion transaction")
     if "configure_mount_point_exact" in remote_mount:

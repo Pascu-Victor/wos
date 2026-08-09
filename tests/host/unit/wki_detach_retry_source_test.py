@@ -335,19 +335,30 @@ def test_vfs_detach_reservation_owns_a_lifecycle_ref() -> None:
         ["g_pending_vfs_detach_head", "proxy->detach_attach_cookie", "proxy->detach_incarnation"],
         "VFS allocator scans pending detach tuples",
     )
-    mount = function_body(source, "wki_remote_vfs_mount")
+    mount = function_body(source, "mount_vfs_proxy_lane")
     require_order(
         mount,
         [
             "s_vfs_lock.lock()",
             "vfs_attach_blocked_by_retiring_binding_locked(owner_node, resource_id)",
             "return -EAGAIN",
-            "g_vfs_proxies.push_back",
+            "create_vfs_proxy_state_locked(owner_node, resource_id",
             "if (!state->epoch_reset_pending)",
             "state->active = true",
         ],
         "VFS replacement and in-progress publication cannot cross an epoch marker",
     )
+    create = function_body(source, "create_vfs_proxy_state_locked")
+    require_order(
+        create,
+        ["g_vfs_proxies.push_back", "auto* state = g_vfs_proxies.back().get()", "state->owner_node = owner_node"],
+        "VFS proxy registry publication",
+    )
+    check_pos = mount.find("vfs_attach_blocked_by_retiring_binding_locked(owner_node, resource_id)")
+    rejection_pos = mount.find("return -EAGAIN", check_pos)
+    create_pos = mount.find("create_vfs_proxy_state_locked(owner_node, resource_id", check_pos)
+    if check_pos < 0 or rejection_pos < 0 or create_pos < 0 or "s_vfs_lock.unlock()" in mount[rejection_pos:create_pos]:
+        fail("VFS retirement admission and proxy publication must share one registry-lock transaction")
     admission = function_body(source, "vfs_attach_blocked_by_retiring_binding_locked")
     require_tokens(
         admission,
@@ -408,29 +419,43 @@ def test_vfs_detach_reservation_owns_a_lifecycle_ref() -> None:
     if "send_or_defer_vfs_detach" in failed_attached:
         fail("failed attached VFS rollback must stage inside the registry transition")
 
+    group_claim = function_body(source, "claim_vfs_proxy_group_unmount_locked")
+    require_order(
+        group_claim,
+        [
+            "state->active || state->epoch_reset_pending || state->attach_pending.load(std::memory_order_acquire)",
+            "deactivate_vfs_proxy_locked",
+            "stage_vfs_detach_locked",
+            "if (state->detach_pending)",
+            "state->epoch_reset_pending = false",
+        ],
+        "lane-group unmount consumes marker ownership only after exact staging",
+    )
     for claim_name in ["claim_vfs_proxy_unmount_by_path", "claim_vfs_proxy_unmount_by_generation"]:
         claim = function_body(source, claim_name)
         require_order(
             claim,
             [
                 "s_vfs_lock.lock()",
-                "state->active || state->epoch_reset_pending",
-                "deactivate_vfs_proxy_locked",
-                "stage_vfs_detach_locked",
-                "state->epoch_reset_pending = false",
+                "claim_vfs_proxy_group_unmount_locked(anchor, group)",
                 "s_vfs_lock.unlock()",
             ],
-            f"{claim_name} consumes marker ownership only after exact staging",
+            f"{claim_name} serializes group teardown through the registry lock",
         )
     require_tokens(
         function_body(source, "find_vfs_proxy_by_mount"),
-        ["p->active || p->epoch_reset_pending", "p->mount_configured"],
+        ["p->lane_anchor", "p->mount_configured", "!p->destroy_when_idle", "!p->mount_released"],
         "path-based VFS unmount can claim an epoch-marked mount",
     )
-    unmount_finish = function_body(source, "finish_vfs_proxy_unmount")
+    unmount_finish = function_body(source, "finish_vfs_proxy_lane_teardown")
     require_tokens(unmount_finish, ["teardown.detach_staged", "wki_deferred_work_notify()"], "VFS unmount post-lock notification")
     if "send_or_defer_vfs_detach" in unmount_finish:
         fail("normal VFS unmount must not stage after releasing the registry lock")
+    require_tokens(
+        function_body(source, "finish_vfs_proxy_group_unmount"),
+        ["finish_vfs_proxy_lane_teardown(group.lanes.at(i), group.detach_remote.at(i))"],
+        "VFS group unmount finishes each claimed lane",
+    )
 
     marker = function_body(source, "wki_remote_vfs_mark_epoch_reset")
     require_order(

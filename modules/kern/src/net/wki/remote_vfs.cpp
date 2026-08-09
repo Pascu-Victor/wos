@@ -6520,6 +6520,10 @@ auto mount_vfs_proxy_lane(uint16_t owner_node, uint32_t resource_id, const char*
     // Allocate proxy state
     uint8_t attach_cookie = 0;
     s_vfs_lock.lock();
+    if (vfs_attach_blocked_by_retiring_binding_locked(owner_node, resource_id)) {
+        s_vfs_lock.unlock();
+        return -EAGAIN;
+    }
     auto* state = create_vfs_proxy_state_locked(owner_node, resource_id, RESOURCE_GENERATION, owner_incarnation, BINDING_PEER_BOOT_EPOCH,
                                                 local_mount_path, mount_group_id, lane_index, lane_anchor);
 
