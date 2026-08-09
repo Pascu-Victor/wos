@@ -52,6 +52,7 @@ endif()
 
 # Find Capstone library
 pkg_check_modules(CAPSTONE REQUIRED capstone>=4.0)
+pkg_check_modules(LIBARCHIVE REQUIRED libarchive)
 
 # Add main executable
 add_executable(wosdbg
@@ -77,6 +78,8 @@ add_executable(wosdbg
     virtual_table_integration.cpp
     coredump_parser.h
     coredump_parser.cpp
+    incident_bundle.h
+    incident_bundle.cpp
     elf_symbol_resolver.h
     elf_symbol_resolver.cpp
     coredump_memory.h
@@ -117,6 +120,7 @@ target_link_libraries(wosdbg
     Qt6::Widgets
     Qt6::Network
     ${CAPSTONE_LIBRARIES}
+    ${LIBARCHIVE_LIBRARIES}
     LLVMDemangle
     iberty
     z
@@ -137,6 +141,7 @@ target_link_libraries(wosdbg_worker
 # Include directories for main executable
 target_include_directories(wosdbg PRIVATE
     ${CAPSTONE_INCLUDE_DIRS}
+    ${LIBARCHIVE_INCLUDE_DIRS}
     ${LLVM_INCLUDE_DIRS}
 )
 
@@ -216,3 +221,37 @@ install(FILES "${CMAKE_CURRENT_BINARY_DIR}/wosdbg.desktop"
     DESTINATION share/applications
     OPTIONAL
 )
+
+include(CTest)
+if(BUILD_TESTING)
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    add_test(
+        NAME wosdbg_incident_cli_semantic_test
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/incident_cli_semantic_test.py
+                --wosdbg $<TARGET_FILE:wosdbg>
+                --require-incident-tools
+    )
+    set_tests_properties(wosdbg_incident_cli_semantic_test PROPERTIES TIMEOUT 180)
+endif()
+
+option(WOSDBG_BUILD_FUZZERS "Build bounded WOSDBG parser fuzz targets" OFF)
+if(WOSDBG_BUILD_FUZZERS)
+    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        message(FATAL_ERROR "WOSDBG_BUILD_FUZZERS requires Clang/libFuzzer")
+    endif()
+    add_executable(wosdbg_coredump_parser_fuzz EXCLUDE_FROM_ALL
+        tests/coredump_parser_fuzz.cpp
+        coredump_parser.cpp
+    )
+    target_include_directories(wosdbg_coredump_parser_fuzz PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(wosdbg_coredump_parser_fuzz PRIVATE Qt6::Core)
+    target_compile_options(wosdbg_coredump_parser_fuzz PRIVATE
+        -fsanitize=fuzzer,address,undefined
+        -fno-omit-frame-pointer
+    )
+    target_link_options(wosdbg_coredump_parser_fuzz PRIVATE
+        -fsanitize=fuzzer,address,undefined
+        -fno-omit-frame-pointer
+    )
+endif()

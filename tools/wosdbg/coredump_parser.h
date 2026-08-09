@@ -172,8 +172,49 @@ struct CoreDump {
     [[nodiscard]] bool is_valid() const { return magic == COREDUMP_MAGIC; }
 };
 
+// Hostile-input parsing limits. These defaults are deliberately much larger
+// than the kernel's current bounded diagnostic dump, while still preventing a
+// malformed file from driving unbounded readAll()/reserve() allocations.
+struct CoreDumpParseLimits {
+    uint64_t max_file_bytes = 1024ULL * 1024ULL * 1024ULL;
+    uint64_t max_segments = 65536;
+    uint64_t max_segment_bytes = 1024ULL * 1024ULL * 1024ULL;
+    uint64_t max_embedded_elf_bytes = 512ULL * 1024ULL * 1024ULL;
+};
+
+enum class CoreDumpParseStatus {
+    OK,
+    UNSUPPORTED_VERSION,
+    TRUNCATED,
+    CORRUPT,
+    TOO_LARGE,
+};
+
+struct CoreDumpParseResult {
+    CoreDumpParseStatus status = CoreDumpParseStatus::CORRUPT;
+    std::optional<CoreDump> dump;
+    QString error;
+    uint64_t error_offset = 0;
+    // Version read from the fixed preamble when at least 12 input bytes were
+    // available. This remains useful when status is unsupported, truncated,
+    // corrupt, or too_large; zero means that no version could be read.
+    uint32_t detected_version = 0;
+
+    [[nodiscard]] bool ok() const { return status == CoreDumpParseStatus::OK && dump.has_value(); }
+};
+
+[[nodiscard]] QString core_dump_parse_status_name(CoreDumpParseStatus status);
+
+// Structured variants used by incident validation. They distinguish an
+// unsupported ABI revision from truncation, malformed metadata, and configured
+// size limits. The file overload checks size before reading the file and sets
+// CoreDump::source_filename on success.
+[[nodiscard]] CoreDumpParseResult parse_core_dump_checked(const QByteArray& data, const CoreDumpParseLimits& limits = {});
+[[nodiscard]] CoreDumpParseResult parse_core_dump_checked(const QString& file_path, const CoreDumpParseLimits& limits = {});
+
 // Parse a coredump from raw binary data.
-// Returns std::nullopt on parse failure.
+// Compatibility wrapper: returns std::nullopt on every non-OK structured
+// status. Valid v1-v3 layouts retain their existing representation.
 std::optional<CoreDump> parse_core_dump(const QByteArray& data);
 
 /// Load and parse a coredump from a file path. Sets sourceFilename on success.

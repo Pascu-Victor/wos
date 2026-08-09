@@ -21,6 +21,10 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/cluster_setup_test.py
 )
 add_test(
+    NAME wosincident_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/wosincident_test.py
+)
+add_test(
     NAME cross_os_benchmark_suite_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/cross_os_benchmark_suite_test.py
 )
@@ -477,6 +481,7 @@ set_tests_properties(
     ktest_cov_test
     coverage_summary_test
     cluster_setup_test
+    wosincident_test
     cross_os_benchmark_suite_test
     fixed_resource_scaling_test
     wos_showcase_compile_test

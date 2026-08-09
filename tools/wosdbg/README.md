@@ -37,8 +37,9 @@ The existing log table and coredump panels remain available. Open **Tools** in
 the toolbar to show the **Analysis Tools** dock. It lists the complete shared
 catalog, displays each JSON input schema, prepares required arguments, runs the
 selected tool asynchronously against the active backend, and shows copyable
-structured JSON. Successful `load_log` and `open_coredump` calls are remembered
-so later tools receive the active `logId` or `dumpId`.
+structured JSON. Successful `load_log`, `open_coredump`, and `load_incident`
+calls are remembered so later tools receive the active `logId`, `dumpId`, or
+`incidentId`.
 
 The GUI can also start or stop MCP with **MCP On/Off**. In remote GUI mode, tool
 calls run on the connected WOSDBG server, so its configured roots and sessions
@@ -104,6 +105,26 @@ tools/build/bin/wosdbg --list-resource-templates
 tools/build/bin/wosdbg --read-resource 'wosdbg://coredump/DUMP_ID/summary'
 ```
 
+Validate and replay a portable incident in one stateful batch:
+
+```json
+{
+  "calls": [
+    {"id": "load", "tool": "load_incident",
+     "arguments": {"path": "failure.wosincident"}},
+    {"id": "summary", "tool": "summarize_incident",
+     "arguments": {"incidentId": "$load.incidentId", "maxEvents": 200}},
+    {"id": "inventory", "tool": "get_incident_inventory",
+     "arguments": {"incidentId": "$load.incidentId"}}
+  ]
+}
+```
+
+The loader snapshots bundle content, verifies its content-derived identity and
+member checksums, and uses only bundle-local binaries during replay. See
+[WOS incident bundles](../../docs/wosincident.md) for capture, redaction,
+sharing, and replay guidance.
+
 ## MCP
 
 Start a headless log server and MCP endpoint:
@@ -129,7 +150,8 @@ The catalog is grouped here by debugging job:
 
 - **Sessions and acquisition:** `status`, `list_logs`, `load_log`,
   `get_log_entries`, `search_log`, `get_log_context`, `extract_coredumps`,
-  `list_coredumps`, and `open_coredump`.
+  `list_coredumps`, `open_coredump`, `validate_incident`, `load_incident`,
+  `get_incident_inventory`, and `summarize_incident`.
 - **Crash triage:** `get_crash_summary`, `analyze_coredump`,
   `backtrace_coredump`, `decode_fault_instruction`, `describe_registers`,
   `follow_register`, `annotate_stack`, `inspect_pte`, and

@@ -50,6 +50,12 @@ struct McpSettings {
     int max_string_length = 160;
     int source_window_lines = 8;
     int max_disassembly_instructions = 48;
+    int max_incident_members = 512;
+    qint64 max_incident_member_bytes = 128LL * 1024 * 1024;
+    qint64 max_incident_total_bytes = 512LL * 1024 * 1024;
+    qint64 max_incident_archive_bytes = 256LL * 1024 * 1024;
+    int max_incident_path_length = 512;
+    int max_incident_path_depth = 24;
 };
 
 class Config {

@@ -330,6 +330,21 @@ McpSettings Config::parse_mcp_settings(const QJsonObject& obj) const {
     settings.source_window_lines = std::clamp(obj["sourceWindowLines"].toInt(settings.source_window_lines), 0, 200);
     settings.max_disassembly_instructions =
         std::clamp(obj["maxDisassemblyInstructions"].toInt(settings.max_disassembly_instructions), 1, 512);
+    settings.max_incident_members = std::clamp(obj["maxIncidentMembers"].toInt(settings.max_incident_members), 1, 10000);
+    auto bounded_i64 = [&obj](const char* key, qint64 fallback, qint64 minimum, qint64 maximum) {
+        bool ok = false;
+        const qint64 VALUE = obj[key].toVariant().toLongLong(&ok);
+        return std::clamp(ok ? VALUE : fallback, minimum, maximum);
+    };
+    settings.max_incident_member_bytes =
+        bounded_i64("maxIncidentMemberBytes", settings.max_incident_member_bytes, 4096, 8LL * 1024 * 1024 * 1024);
+    settings.max_incident_total_bytes =
+        bounded_i64("maxIncidentTotalBytes", settings.max_incident_total_bytes, 4096, 64LL * 1024 * 1024 * 1024);
+    settings.max_incident_archive_bytes =
+        bounded_i64("maxIncidentArchiveBytes", settings.max_incident_archive_bytes, 4096, 64LL * 1024 * 1024 * 1024);
+    settings.max_incident_path_length = std::clamp(obj["maxIncidentPathLength"].toInt(settings.max_incident_path_length), 32, 4096);
+    settings.max_incident_path_depth = std::clamp(obj["maxIncidentPathDepth"].toInt(settings.max_incident_path_depth), 1, 128);
+    settings.max_incident_member_bytes = std::min(settings.max_incident_member_bytes, settings.max_incident_total_bytes);
     return settings;
 }
 
@@ -353,6 +368,12 @@ QJsonObject Config::serialize_mcp_settings(const McpSettings& settings) {
     obj["maxStringLength"] = settings.max_string_length;
     obj["sourceWindowLines"] = settings.source_window_lines;
     obj["maxDisassemblyInstructions"] = settings.max_disassembly_instructions;
+    obj["maxIncidentMembers"] = settings.max_incident_members;
+    obj["maxIncidentMemberBytes"] = QString::number(settings.max_incident_member_bytes);
+    obj["maxIncidentTotalBytes"] = QString::number(settings.max_incident_total_bytes);
+    obj["maxIncidentArchiveBytes"] = QString::number(settings.max_incident_archive_bytes);
+    obj["maxIncidentPathLength"] = settings.max_incident_path_length;
+    obj["maxIncidentPathDepth"] = settings.max_incident_path_depth;
     return obj;
 }
 

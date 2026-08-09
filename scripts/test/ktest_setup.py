@@ -18,10 +18,13 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 CLUSTER_SCRIPTS = ROOT / "scripts" / "cluster"
+DEBUG_SCRIPTS = ROOT / "scripts" / "debug"
 sys.path.insert(0, str(CLUSTER_SCRIPTS))
+sys.path.insert(0, str(DEBUG_SCRIPTS))
 
 import cluster_setup  # noqa: E402
 import node_setup  # noqa: E402
+import wosincident  # noqa: E402
 
 
 DIAGNOSTIC_CMAKE_OPTIONS = [
@@ -298,9 +301,32 @@ def main() -> int:
         action="store_true",
         help="Launch the KTEST VM paused with a GDB stub",
     )
+    parser.add_argument(
+        "--incident-output",
+        metavar="PATH",
+        help="Capture launch artifacts into a new .wosincident directory or archive",
+    )
+    parser.add_argument(
+        "--incident-archive",
+        action="store_true",
+        help="With --incident-output, write deterministic USTAR instead of a directory",
+    )
+    parser.add_argument(
+        "--incident-coverage-manifest",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help="Coverage run manifest to import into the incident; may be repeated",
+    )
     args = parser.parse_args()
     if args.no_setup and (args.teardown or args.no_launch or args.build_only):
         parser.error("--no-setup is only valid when launching")
+    if args.incident_archive and not args.incident_output:
+        parser.error("--incident-archive requires --incident-output")
+    if args.incident_coverage_manifest and not args.incident_output:
+        parser.error("incident evidence options require --incident-output")
+    if args.incident_output and (args.teardown or args.no_launch or args.build_only):
+        parser.error("--incident-output is only valid when launching")
 
     config_path = Path(args.config)
     if not config_path.is_absolute():
@@ -316,32 +342,68 @@ def main() -> int:
         cluster_setup.teardown(cluster_config)
         return 0
 
-    if not args.no_build:
-        seed_isolated_sysroot(roots["sysroot"], args.reset_sysroot)
-        configure_build(build_dir, roots, args.cmake_option, args.generator, args.fast, args.ubtrap)
-        build_artifacts(build_dir)
-    if args.build_only:
-        return 0
-
-    if not args.no_package:
-        seed_isolated_sysroot(roots["sysroot"], False)
-        package_disks(spec, build_dir, roots, kernel_cmdline)
-
-    if args.no_launch:
-        cluster_setup.ensure_sudo()
-        cluster_setup.setup(cluster_config)
-        return 0
-
-    if not args.no_setup:
-        cluster_setup.ensure_sudo()
-    debug_nodes = {node_setup.node_id(spec)} if args.debug_node else None
-    cluster_setup.launch(
-        cluster_config,
-        tcg_level=args.tcg,
-        debug_nodes=debug_nodes,
-        skip_setup=args.no_setup,
+    incident_snapshots = (
+        wosincident.snapshot_node_logs([spec], tcg_level=args.tcg, repo_root=ROOT)
+        if args.incident_output
+        else None
     )
-    return 0
+    run_complete = False
+    try:
+        if not args.no_build:
+            seed_isolated_sysroot(roots["sysroot"], args.reset_sysroot)
+            configure_build(build_dir, roots, args.cmake_option, args.generator, args.fast, args.ubtrap)
+            build_artifacts(build_dir)
+        if args.build_only:
+            run_complete = True
+            return 0
+
+        if not args.no_package:
+            seed_isolated_sysroot(roots["sysroot"], False)
+            package_disks(spec, build_dir, roots, kernel_cmdline)
+
+        if args.no_launch:
+            cluster_setup.ensure_sudo()
+            cluster_setup.setup(cluster_config)
+            run_complete = True
+            return 0
+
+        if not args.no_setup:
+            cluster_setup.ensure_sudo()
+        debug_nodes = {node_setup.node_id(spec)} if args.debug_node else None
+        cluster_setup.launch(
+            cluster_config,
+            tcg_level=args.tcg,
+            debug_nodes=debug_nodes,
+            skip_setup=args.no_setup,
+        )
+        run_complete = True
+        return 0
+    finally:
+        if args.incident_output:
+            exception_type, _exception, _traceback = sys.exc_info()
+            wosincident.capture_safely(
+                output=Path(args.incident_output),
+                archive=args.incident_archive,
+                kind="ktest",
+                config=raw_config,
+                config_path=config_path,
+                node_specs=[spec],
+                build_dir=build_dir,
+                tcg_level=args.tcg,
+                profile=wosincident.detect_build_profile(
+                    abs_path(build_dir),
+                    fallback="RelWithDebInfo" if args.fast else "Debug",
+                ),
+                coverage_manifests=[Path(path) for path in args.incident_coverage_manifest],
+                snapshots=incident_snapshots,
+                run_complete=run_complete,
+                run_error=(
+                    None
+                    if exception_type is None
+                    else f"{exception_type.__name__} during KTEST execution"
+                ),
+                repo_root=ROOT,
+            )
 
 
 if __name__ == "__main__":

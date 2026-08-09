@@ -67,6 +67,22 @@ bin/wos-cluster --launch --no-setup
 bin/wos-ktest --no-setup
 ```
 
+The same rootless launches can capture a bounded, portable incident after the
+VM exits or the launch fails:
+
+```sh
+bin/wos-ktest --no-setup \
+  --incident-output test-results/ktest-failure.wosincident
+bin/wos-cluster --launch --no-setup \
+  --incident-output test-results/cluster-failure.wosincident \
+  --incident-archive
+```
+
+Use `bin/wos-incident capture` for standalone capture, coverage-manifest import,
+or an explicit live `/tmp/*_coredump.bin` fetch. See
+[`docs/wosincident.md`](../docs/wosincident.md) for the version 1 format and
+safety limits.
+
 Then collect comparable reports:
 
 ```sh

@@ -34,6 +34,12 @@
         "maxHits": 200,
         "maxStringLength": 160,
         "sourceWindowLines": 8,
-        "maxDisassemblyInstructions": 48
+        "maxDisassemblyInstructions": 48,
+        "maxIncidentMembers": 512,
+        "maxIncidentMemberBytes": "134217728",
+        "maxIncidentTotalBytes": "536870912",
+        "maxIncidentArchiveBytes": "268435456",
+        "maxIncidentPathLength": 512,
+        "maxIncidentPathDepth": 24
     }
 }

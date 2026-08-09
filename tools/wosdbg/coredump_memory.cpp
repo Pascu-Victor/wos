@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <utility>
 #include <vector>
 
@@ -20,7 +21,9 @@ const CoreDumpSegment* find_segment_for_va(const CoreDump& dump, uint64_t va) {
     size_t count = std::min(static_cast<size_t>(dump.segment_count), dump.segments.size());
     for (size_t i = 0; i < count; ++i) {
         const auto& seg = dump.segments[i];
-        if (seg.is_present() && seg.vaddr <= va && va < seg.vaddr_end()) {
+        // Difference-based containment avoids overflowing vaddr + size for a
+        // malformed segment that reached this compatibility API.
+        if (seg.is_present() && va >= seg.vaddr && (va - seg.vaddr) < seg.size) {
             return &seg;
         }
     }
@@ -28,6 +31,10 @@ const CoreDumpSegment* find_segment_for_va(const CoreDump& dump, uint64_t va) {
 }
 
 QByteArray read_va_bytes(const CoreDump& dump, uint64_t vaStart, size_t length) {
+    if (length > static_cast<size_t>(std::numeric_limits<qsizetype>::max()) || length > static_cast<size_t>(dump.raw.size()) ||
+        (length > 0 && static_cast<uint64_t>(length - 1) > std::numeric_limits<uint64_t>::max() - vaStart)) {
+        return {};
+    }
     QByteArray result;
     result.reserve(static_cast<qsizetype>(length));
 
@@ -43,15 +50,25 @@ QByteArray read_va_bytes(const CoreDump& dump, uint64_t vaStart, size_t length) 
         uint64_t seg_offset = va - seg->vaddr;
         uint64_t avail = seg->size - seg_offset;
         size_t to_read = std::min(avail, static_cast<uint64_t>(remaining));
+        if (to_read == 0 || seg_offset > std::numeric_limits<uint64_t>::max() - seg->file_offset) {
+            return {};
+        }
         uint64_t file_off = seg->file_offset + seg_offset;
 
-        if (static_cast<int64_t>(file_off + to_read) > dump.raw.size()) {
+        if (static_cast<uint64_t>(to_read) > std::numeric_limits<uint64_t>::max() - file_off) {
+            return {};
+        }
+        const uint64_t FILE_END = file_off + static_cast<uint64_t>(to_read);
+        if (FILE_END > static_cast<uint64_t>(dump.raw.size()) || file_off > static_cast<uint64_t>(std::numeric_limits<qsizetype>::max()) ||
+            to_read > static_cast<size_t>(std::numeric_limits<qsizetype>::max())) {
             return {};
         }
 
-        result.append(dump.raw.constData() + file_off, static_cast<qsizetype>(to_read));
-        va += to_read;
+        result.append(dump.raw.constData() + static_cast<qsizetype>(file_off), static_cast<qsizetype>(to_read));
         remaining -= to_read;
+        if (remaining > 0) {
+            va += to_read;
+        }
     }
 
     return result;

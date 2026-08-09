@@ -47,6 +47,11 @@ from itertools import combinations
 
 import node_setup
 
+DEBUG_SCRIPTS = Path(__file__).resolve().parents[1] / "debug"
+if str(DEBUG_SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(DEBUG_SCRIPTS))
+import wosincident  # noqa: E402
+
 
 TOPOLOGY_PROBE_TIMEOUT_SECONDS = 5.0
 
@@ -2400,6 +2405,23 @@ def main():
         help="With --launch, start the selected node paused with a GDB stub. May be repeated.",
     )
     parser.add_argument(
+        "--incident-output",
+        metavar="PATH",
+        help="With --launch, capture artifacts into a new .wosincident directory or archive",
+    )
+    parser.add_argument(
+        "--incident-archive",
+        action="store_true",
+        help="With --incident-output, write deterministic USTAR instead of a directory",
+    )
+    parser.add_argument(
+        "--incident-coverage-manifest",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help="Coverage run manifest to import into the incident; may be repeated",
+    )
+    parser.add_argument(
         "--config", default="configs/cluster.json", help="Config file path"
     )
     args = parser.parse_args()
@@ -2417,6 +2439,12 @@ def main():
         parser.error("--debug-node is only valid with --launch")
     if args.no_setup and not args.launch:
         parser.error("--no-setup is only valid with --launch")
+    if args.incident_output and not args.launch:
+        parser.error("--incident-output is only valid with --launch")
+    if args.incident_archive and not args.incident_output:
+        parser.error("--incident-archive requires --incident-output")
+    if args.incident_coverage_manifest and not args.incident_output:
+        parser.error("incident evidence options require --incident-output")
 
     config_path = Path(args.config)
     if not config_path.is_absolute():
@@ -2442,19 +2470,59 @@ def main():
             print(f"ERROR: {exc}", file=sys.stderr)
             sys.exit(1)
     elif args.launch:
+        incident_node_specs = []
+        incident_snapshots = None
+        if args.incident_output:
+            node_infos = collect_unique_nodes(config)
+            incident_node_specs = [
+                cluster_node_spec(node_id, node_infos[node_id], config)
+                for node_id in sorted(node_infos)
+            ]
+            incident_snapshots = wosincident.snapshot_node_logs(
+                incident_node_specs,
+                tcg_level=args.tcg,
+                repo_root=repo_root(),
+            )
+        run_complete = False
         try:
-            with cluster_launch_guard():
-                if not args.no_setup:
-                    ensure_sudo()
-                launch_guarded(
-                    config,
+            try:
+                with cluster_launch_guard():
+                    if not args.no_setup:
+                        ensure_sudo()
+                    launch_guarded(
+                        config,
+                        tcg_level=args.tcg,
+                        debug_nodes=set(args.debug_node) if args.debug_node else None,
+                        skip_setup=args.no_setup,
+                    )
+                run_complete = True
+            except (LaunchConflictError, NoSetupTopologyError) as exc:
+                print(f"ERROR: {exc}", file=sys.stderr)
+                sys.exit(1)
+        finally:
+            if args.incident_output:
+                exception_type, _exception, _traceback = sys.exc_info()
+                wosincident.capture_safely(
+                    output=Path(args.incident_output),
+                    archive=args.incident_archive,
+                    kind="cluster",
+                    config=config,
+                    config_path=config_path,
+                    node_specs=incident_node_specs,
+                    build_dir=Path("build"),
                     tcg_level=args.tcg,
-                    debug_nodes=set(args.debug_node) if args.debug_node else None,
-                    skip_setup=args.no_setup,
+                    coverage_manifests=[
+                        Path(path) for path in args.incident_coverage_manifest
+                    ],
+                    snapshots=incident_snapshots,
+                    run_complete=run_complete,
+                    run_error=(
+                        None
+                        if exception_type is None
+                        else f"{exception_type.__name__} during cluster execution"
+                    ),
+                    repo_root=repo_root(),
                 )
-        except (LaunchConflictError, NoSetupTopologyError) as exc:
-            print(f"ERROR: {exc}", file=sys.stderr)
-            sys.exit(1)
     else:
         try:
             with cluster_launch_guard():

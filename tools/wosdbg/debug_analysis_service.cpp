@@ -62,6 +62,13 @@ constexpr uint64_t K_USER_SPACE_END = 0x0000800000000000ULL;
 
 auto format_hex(uint64_t value) -> QString { return wosdbg::format_u64(value); }
 
+template <typename T>
+auto sorted_hash_keys(const QHash<QString, T>& values) -> QStringList {
+    QStringList keys = values.keys();
+    std::ranges::sort(keys);
+    return keys;
+}
+
 auto entry_type_name(EntryType type) -> QString {
     switch (type) {
         case EntryType::INSTRUCTION:
@@ -739,24 +746,40 @@ auto DebugAnalysisService::tool_error(const QString& message) -> QJsonObject { r
 auto DebugAnalysisService::status() const -> QJsonObject {
     const Config& cfg = (config != nullptr) ? *config : ConfigService::instance().get_config();
     QJsonArray logs;
-    for (auto it = log_sessions.cbegin(); it != log_sessions.cend(); ++it) {
-        logs.append(QJsonObject{{"id", it.key()}, {"path", it.value()->path}, {"entries", static_cast<int>(it.value()->entries.size())}});
+    for (const auto& key : sorted_hash_keys(log_sessions)) {
+        const auto& session = log_sessions[key];
+        logs.append(QJsonObject{{"id", key}, {"path", session->path}, {"entries", static_cast<int>(session->entries.size())}});
     }
 
     QJsonArray dumps;
-    for (auto it = dump_sessions.cbegin(); it != dump_sessions.cend(); ++it) {
-        dumps.append(QJsonObject{{"id", it.key()}, {"path", it.value()->path}});
+    for (const auto& key : sorted_hash_keys(dump_sessions)) {
+        dumps.append(QJsonObject{{"id", key}, {"path", dump_sessions[key]->path}});
     }
 
-    return QJsonObject{{"ok", true},
-                       {"cwd", QDir::currentPath()},
-                       {"coredumpDirectory", cfg.get_coredump_directory()},
-                       {"logSessions", logs},
-                       {"coredumpSessions", dumps},
-                       {"limits", QJsonObject{{"maxEntries", cfg.get_mcp_settings().max_entries},
-                                              {"maxHits", cfg.get_mcp_settings().max_hits},
-                                              {"maxMemoryBytes", cfg.get_mcp_settings().max_memory_bytes},
-                                              {"sourceWindowLines", cfg.get_mcp_settings().source_window_lines}}}};
+    QJsonArray incidents;
+    for (const auto& key : sorted_hash_keys(incident_sessions)) {
+        const auto& session = incident_sessions[key];
+        incidents.append(QJsonObject{{"id", key},
+                                     {"source", session->source_path},
+                                     {"members", static_cast<int>(session->bundle ? session->bundle->members.size() : 0)},
+                                     {"loading", session->loading}});
+    }
+
+    return QJsonObject{
+        {"ok", true},
+        {"cwd", QDir::currentPath()},
+        {"coredumpDirectory", cfg.get_coredump_directory()},
+        {"logSessions", logs},
+        {"coredumpSessions", dumps},
+        {"incidentSessions", incidents},
+        {"limits", QJsonObject{{"maxEntries", cfg.get_mcp_settings().max_entries},
+                               {"maxHits", cfg.get_mcp_settings().max_hits},
+                               {"maxMemoryBytes", cfg.get_mcp_settings().max_memory_bytes},
+                               {"sourceWindowLines", cfg.get_mcp_settings().source_window_lines},
+                               {"maxIncidentMembers", cfg.get_mcp_settings().max_incident_members},
+                               {"maxIncidentMemberBytes", QString::number(cfg.get_mcp_settings().max_incident_member_bytes)},
+                               {"maxIncidentTotalBytes", QString::number(cfg.get_mcp_settings().max_incident_total_bytes)},
+                               {"maxIncidentArchiveBytes", QString::number(cfg.get_mcp_settings().max_incident_archive_bytes)}}}};
 }
 
 auto DebugAnalysisService::allowed_roots() const -> QStringList {
@@ -815,6 +838,595 @@ auto DebugAnalysisService::make_session_id(const QString& prefix, const QString&
     return prefix + "_" + QString::fromLatin1(HASH);
 }
 
+auto DebugAnalysisService::make_content_session_id(const QString& prefix, const QString& content_key) -> QString {
+    const QByteArray HASH = QCryptographicHash::hash(content_key.toUtf8(), QCryptographicHash::Sha256).toHex().left(24);
+    return prefix + "_" + QString::fromLatin1(HASH);
+}
+
+auto DebugAnalysisService::incident_limits() const -> wosdbg::IncidentLimits {
+    const Config& cfg = (config != nullptr) ? *config : ConfigService::instance().get_config();
+    const auto& settings = cfg.get_mcp_settings();
+    wosdbg::IncidentLimits limits;
+    limits.max_members = static_cast<size_t>(settings.max_incident_members);
+    limits.max_member_bytes = static_cast<uint64_t>(settings.max_incident_member_bytes);
+    limits.max_total_bytes = static_cast<uint64_t>(settings.max_incident_total_bytes);
+    limits.max_archive_bytes = static_cast<uint64_t>(settings.max_incident_archive_bytes);
+    limits.max_path_length = static_cast<size_t>(settings.max_incident_path_length);
+    limits.max_path_depth = static_cast<size_t>(settings.max_incident_path_depth);
+    return limits;
+}
+
+auto DebugAnalysisService::incident_validation_to_json(const wosdbg::IncidentBundle& bundle, bool include_inventory) const -> QJsonObject {
+    const Config& cfg = (config != nullptr) ? *config : ConfigService::instance().get_config();
+    QJsonArray issues = wosdbg::incident_issues_to_json(bundle);
+    bool valid = bundle.valid();
+    bool degraded = !valid || !issues.isEmpty();
+    QSet<QString> issue_keys;
+    for (const auto& value : issues) {
+        const QJsonObject issue = value.toObject();
+        issue_keys.insert(issue["code"].toString() + ':' + issue["path"].toString());
+    }
+    auto add_issue = [&](const QString& code, const QString& path, const QString& message, bool fatal) {
+        const QString key = code + ':' + path;
+        if (issue_keys.contains(key)) {
+            return;
+        }
+        issue_keys.insert(key);
+        issues.append(QJsonObject{{"code", code}, {"path", path}, {"message", message}, {"fatal", fatal}});
+        degraded = true;
+        valid = valid && !fatal;
+    };
+
+    QJsonArray coredump_versions;
+    for (const auto& member : bundle.members) {
+        if (member.truncated && (member.kind == "serial-log" || member.kind == "qemu-log" || member.kind == "coverage-log" ||
+                                 member.kind == "telemetry-log" || member.kind == "log")) {
+            add_issue("truncated_log", member.path, "captured log evidence is explicitly truncated", false);
+        }
+        if (member.kind != "coredump" || member.absolute_path.isEmpty()) {
+            continue;
+        }
+        const auto parsed = wosdbg::parse_core_dump_checked(member.absolute_path);
+        coredump_versions.append(static_cast<int>(parsed.detected_version));
+        if (!parsed.ok()) {
+            QString code = "corrupt_coredump";
+            if (parsed.status == wosdbg::CoreDumpParseStatus::UNSUPPORTED_VERSION) {
+                code = "unsupported_coredump_version";
+            } else if (parsed.status == wosdbg::CoreDumpParseStatus::TRUNCATED) {
+                code = "truncated_coredump";
+            } else if (parsed.status == wosdbg::CoreDumpParseStatus::TOO_LARGE) {
+                code = "coredump_too_large";
+            }
+            add_issue(code, member.path, parsed.error, member.required);
+            continue;
+        }
+        if (member.truncated) {
+            add_issue("truncated_coredump", member.path, "captured coredump evidence is explicitly truncated", member.required);
+        }
+        const bool HAS_PRESENT_MAPPING =
+            std::ranges::any_of(parsed.dump->segments, [](const wosdbg::CoreDumpSegment& segment) { return segment.is_present(); });
+        if (!HAS_PRESENT_MAPPING) {
+            add_issue("missing_mapping", member.path, "coredump contains no captured present memory mapping", false);
+        }
+
+        const QString EMBEDDED_BUILD_ID = wosdbg::elf_build_id(parsed.dump->embedded_elf());
+        const wosdbg::IncidentMember* binary = member.binary.isEmpty() ? nullptr : bundle.find_member(member.binary);
+        QString binary_build_id;
+        if (binary != nullptr && !binary->absolute_path.isEmpty()) {
+            binary_build_id = wosdbg::elf_build_id_from_file(binary->absolute_path);
+        }
+        const QString EXPECTED_BUILD_ID = !member.build_id.isEmpty() ? member.build_id : EMBEDDED_BUILD_ID;
+        if (binary != nullptr && !EXPECTED_BUILD_ID.isEmpty() && binary_build_id != EXPECTED_BUILD_ID) {
+            add_issue("build_id_mismatch", member.path, "referenced binary build ID differs from the coredump's expected build ID", false);
+        }
+        if (binary == nullptr && parsed.dump->embedded_elf().isEmpty()) {
+            add_issue("missing_symbols", member.path, "coredump has neither a referenced binary nor an embedded ELF", false);
+        }
+    }
+
+    const QJsonObject CLOCKS = bundle.manifest["clocks"].toObject();
+    const QString CLOCK_QUALITY = CLOCKS["quality"].toString("unavailable");
+    if (CLOCK_QUALITY == "partial") {
+        add_issue("partial_clocks", "manifest.json", "only part of the incident has comparable timestamp evidence", false);
+    } else if (CLOCK_QUALITY == "non-comparable") {
+        add_issue("non_comparable_clocks", "manifest.json", "cross-node clocks are explicitly not comparable", false);
+    }
+
+    const QJsonObject CAPTURE = bundle.manifest["capture"].toObject();
+    degraded = degraded || !CAPTURE["complete"].toBool(true) || !CAPTURE["errors"].toArray().isEmpty() ||
+               !CAPTURE["truncatedMembers"].toArray().isEmpty();
+    const bool ISSUES_TRUNCATED = issues.size() > cfg.get_mcp_settings().max_entries;
+    if (ISSUES_TRUNCATED) {
+        QJsonArray bounded;
+        for (int index = 0; index < cfg.get_mcp_settings().max_entries; ++index) {
+            bounded.append(issues[index]);
+        }
+        issues = bounded;
+    }
+
+    QJsonObject result{{"ok", true},
+                       {"valid", valid},
+                       {"incidentId", bundle.incident_id()},
+                       {"formatVersion", bundle.manifest["version"].toInt()},
+                       {"container", bundle.archive ? "archive" : "directory"},
+                       {"issues", issues},
+                       {"issuesTruncated", ISSUES_TRUNCATED},
+                       {"degraded", degraded},
+                       {"clockQuality", CLOCK_QUALITY},
+                       {"coredumpVersions", coredump_versions}};
+    if (include_inventory) {
+        QJsonObject inventory =
+            wosdbg::incident_inventory_to_json(bundle, 0, static_cast<size_t>(cfg.get_mcp_settings().max_entries), false);
+        inventory["issues"] = issues;
+        result["inventory"] = inventory;
+    } else {
+        result["inventory"] =
+            QJsonObject{{"total", QString::number(bundle.members.size())}, {"count", 0}, {"members", QJsonArray{}}, {"issues", issues}};
+    }
+    return result;
+}
+
+auto DebugAnalysisService::normalize_incident_value(const IncidentSession& session, const QJsonValue& value, bool* response_truncated) const
+    -> QJsonValue {
+    const Config& cfg = (config != nullptr) ? *config : ConfigService::instance().get_config();
+    const int MAX_STRING = cfg.get_mcp_settings().max_string_length;
+    const int MAX_ARRAY = cfg.get_mcp_settings().max_entries;
+    if (value.isString()) {
+        QString text = value.toString();
+        if (session.bundle && !session.bundle->root_path.isEmpty() && starts_with_path_root(text, session.bundle->root_path)) {
+            text = QDir(session.bundle->root_path).relativeFilePath(text);
+        }
+        const QString REPOSITORY_ROOT = QDir::currentPath();
+        if (!REPOSITORY_ROOT.isEmpty()) {
+            text.replace(REPOSITORY_ROOT, "<repo>");
+        }
+        if (text.size() > MAX_STRING) {
+            text = text.left(MAX_STRING) + QString::fromUtf8("\u2026");
+            if (response_truncated != nullptr) {
+                *response_truncated = true;
+            }
+        }
+        return text;
+    }
+    if (value.isArray()) {
+        QJsonArray normalized;
+        const QJsonArray input = value.toArray();
+        const qsizetype count = std::min(input.size(), static_cast<qsizetype>(MAX_ARRAY));
+        for (qsizetype i = 0; i < count; ++i) {
+            normalized.append(normalize_incident_value(session, input[i], response_truncated));
+        }
+        if (count < input.size() && response_truncated != nullptr) {
+            *response_truncated = true;
+        }
+        return normalized;
+    }
+    if (value.isObject()) {
+        QJsonObject normalized;
+        const QJsonObject input = value.toObject();
+        QStringList keys = input.keys();
+        std::ranges::sort(keys);
+        for (const auto& key : keys) {
+            normalized[key] = normalize_incident_value(session, input[key], response_truncated);
+        }
+        return normalized;
+    }
+    return value;
+}
+
+auto DebugAnalysisService::find_incident_session(const QString& id) const -> const IncidentSession* {
+    const auto it = incident_sessions.find(id);
+    return it == incident_sessions.end() ? nullptr : it.value().get();
+}
+
+auto DebugAnalysisService::find_incident_session(const QString& id) -> IncidentSession* {
+    const auto it = incident_sessions.find(id);
+    return it == incident_sessions.end() ? nullptr : it.value().get();
+}
+
+auto DebugAnalysisService::validate_incident(const QJsonObject& args) const -> QJsonObject {
+    const QString PATH = args["path"].toString(args["file"].toString());
+    if (PATH.isEmpty()) {
+        return tool_error("validate_incident requires 'path' or 'file'");
+    }
+    const QString RESOLVED = resolve_path_for_read(PATH);
+    if (!QFileInfo::exists(RESOLVED)) {
+        return tool_error(QString("Incident bundle not found: %1").arg(PATH));
+    }
+    if (!is_path_allowed(RESOLVED)) {
+        return tool_error(QString("Incident bundle is outside allowed roots: %1").arg(RESOLVED));
+    }
+    auto bundle = wosdbg::load_incident_bundle(RESOLVED, incident_limits());
+    if (!bundle) {
+        return tool_error("Incident bundle loader failed without a validation result");
+    }
+    return incident_validation_to_json(*bundle, args["includeInventory"].toBool(true));
+}
+
+auto DebugAnalysisService::load_incident(const QJsonObject& args) -> QJsonObject {
+    const QString PATH = args["path"].toString(args["file"].toString());
+    if (PATH.isEmpty()) {
+        return tool_error("load_incident requires 'path' or 'file'");
+    }
+    const QString RESOLVED = resolve_path_for_read(PATH);
+    if (!QFileInfo::exists(RESOLVED)) {
+        return tool_error(QString("Incident bundle not found: %1").arg(PATH));
+    }
+    if (!is_path_allowed(RESOLVED)) {
+        return tool_error(QString("Incident bundle is outside allowed roots: %1").arg(RESOLVED));
+    }
+
+    auto bundle = wosdbg::load_incident_bundle(RESOLVED, incident_limits());
+    if (!bundle) {
+        return tool_error("Incident bundle loader failed without a validation result");
+    }
+    QJsonObject validation = incident_validation_to_json(*bundle, true);
+    if (!bundle->valid()) {
+        validation["loaded"] = false;
+        return validation;
+    }
+
+    const QString ID = bundle->incident_id();
+    if (incident_sessions.contains(ID)) {
+        const auto& cached = incident_sessions[ID];
+        QJsonObject result = incident_validation_to_json(*cached->bundle, true);
+        result["cached"] = true;
+        result["loaded"] = true;
+        result["loading"] = cached->loading;
+        result["loadedEvidence"] = cached->evidence.size();
+        result["loadIssues"] = cached->load_issues;
+        return result;
+    }
+
+    auto session = std::make_shared<IncidentSession>();
+    session->id = ID;
+    session->source_path = RESOLVED;
+    session->bundle = std::move(bundle);
+    session->loading = true;
+    incident_sessions.insert(ID, session);
+
+    const Config& cfg = (config != nullptr) ? *config : ConfigService::instance().get_config();
+    const bool LOAD_EVIDENCE = args["loadEvidence"].toBool(true);
+    const int MAX_LOGS = bounded_int(args, "maxLogs", cfg.get_mcp_settings().max_entries, 0, cfg.get_mcp_settings().max_entries);
+    const int MAX_DUMPS = bounded_int(args, "maxCoredumps", cfg.get_mcp_settings().max_entries, 0, cfg.get_mcp_settings().max_entries);
+    int loaded_logs = 0;
+    int loaded_dumps = 0;
+
+    auto append_load_issue = [&](const QString& code, const QString& path, const QString& message, bool fatal = false) {
+        session->load_issues.append(QJsonObject{{"code", code}, {"path", path}, {"message", message}, {"fatal", fatal}});
+    };
+    auto node_id_for = [](const wosdbg::IncidentMember& member) {
+        const QJsonValue value = member.metadata["nodeId"];
+        return value.isDouble() ? QString::number(static_cast<qint64>(value.toDouble())) : value.toString(member.node_id);
+    };
+    auto evidence_base = [&](const wosdbg::IncidentMember& member) {
+        return QJsonObject{{"memberPath", member.path},   {"kind", member.kind},           {"nodeId", node_id_for(member)},
+                           {"required", member.required}, {"truncated", member.truncated}, {"state", member.state}};
+    };
+
+    QString kernel_elf_path;
+    QHash<QString, const wosdbg::IncidentMember*> binaries_by_build_id;
+    for (const auto& member : session->bundle->members) {
+        if (member.kind != "binary" || member.absolute_path.isEmpty()) {
+            continue;
+        }
+        QString build_id = member.build_id;
+        if (build_id.isEmpty()) {
+            build_id = wosdbg::elf_build_id_from_file(member.absolute_path);
+        }
+        if (!build_id.isEmpty() && !binaries_by_build_id.contains(build_id)) {
+            binaries_by_build_id.insert(build_id, &member);
+        }
+        if (member.path.startsWith("binaries/kernel/") || member.metadata["role"].toString() == "kernel") {
+            kernel_elf_path = member.absolute_path;
+        }
+        QJsonObject evidence = evidence_base(member);
+        evidence["status"] = build_id.isEmpty() ? "build_id_missing" : "available";
+        evidence["buildId"] = build_id;
+        session->evidence.insert(member.path, evidence);
+    }
+
+    if (LOAD_EVIDENCE) {
+        for (const auto& member : session->bundle->members) {
+            if (member.absolute_path.isEmpty() || member.kind == "binary") {
+                continue;
+            }
+            QJsonObject evidence = evidence_base(member);
+            if (member.truncated) {
+                evidence["degradation"] = "truncated";
+            }
+            if (member.kind == "serial-log" || member.kind == "qemu-log" || member.kind == "telemetry-log" ||
+                member.kind == "coverage-log" || member.kind == "log") {
+                if (loaded_logs >= MAX_LOGS) {
+                    evidence["status"] = "not_loaded_response_bound";
+                    append_load_issue("log_load_limit", member.path, "log was not loaded because the configured request bound was reached");
+                } else {
+                    const QString LOG_ID = make_content_session_id("log", ID + ':' + member.path + ':' + member.sha256);
+                    const QJsonObject result = load_log_file(member.absolute_path, LOG_ID);
+                    if (result["ok"].toBool(false)) {
+                        session->log_ids.insert(member.path, LOG_ID);
+                        evidence["status"] = member.truncated ? "loaded_truncated" : "loaded";
+                        evidence["logId"] = LOG_ID;
+                        evidence["entryCount"] = result["summary"].toObject()["entries"];
+                        ++loaded_logs;
+                    } else {
+                        evidence["status"] = "log_parse_error";
+                        evidence["error"] = result["error"];
+                        append_load_issue("log_parse_error", member.path, result["error"].toString());
+                    }
+                }
+            } else if (member.kind == "coredump") {
+                if (loaded_dumps >= MAX_DUMPS) {
+                    evidence["status"] = "not_loaded_response_bound";
+                    append_load_issue("coredump_load_limit", member.path,
+                                      "coredump was not loaded because the configured request bound was reached");
+                } else {
+                    const auto parsed = wosdbg::parse_core_dump_checked(member.absolute_path);
+                    evidence["parseStatus"] = wosdbg::core_dump_parse_status_name(parsed.status);
+                    evidence["coredumpVersion"] = static_cast<int>(parsed.detected_version);
+                    if (!parsed.error.isEmpty()) {
+                        evidence["parseError"] = parsed.error;
+                        evidence["errorOffset"] = QString::number(parsed.error_offset);
+                    }
+                    if (!parsed.ok()) {
+                        QString code = "corrupt_coredump";
+                        if (parsed.status == wosdbg::CoreDumpParseStatus::UNSUPPORTED_VERSION) {
+                            code = "unsupported_coredump_version";
+                        } else if (parsed.status == wosdbg::CoreDumpParseStatus::TRUNCATED) {
+                            code = "truncated_coredump";
+                        } else if (parsed.status == wosdbg::CoreDumpParseStatus::TOO_LARGE) {
+                            code = "coredump_too_large";
+                        }
+                        evidence["status"] = code;
+                        append_load_issue(code, member.path, parsed.error);
+                    } else {
+                        QString binary_path;
+                        QString expected_build_id = member.build_id;
+                        if (!member.binary.isEmpty()) {
+                            if (const auto* binary = session->bundle->find_member(member.binary); binary != nullptr) {
+                                binary_path = binary->absolute_path;
+                            }
+                        }
+                        const QString EMBEDDED_BUILD_ID = wosdbg::elf_build_id(parsed.dump->embedded_elf());
+                        if (expected_build_id.isEmpty()) {
+                            expected_build_id = EMBEDDED_BUILD_ID;
+                        }
+                        if (binary_path.isEmpty() && !expected_build_id.isEmpty() && binaries_by_build_id.contains(expected_build_id)) {
+                            binary_path = binaries_by_build_id[expected_build_id]->absolute_path;
+                        }
+                        const QString DUMP_ID = make_content_session_id("dump", ID + ':' + member.path + ':' + member.sha256);
+                        const QJsonObject result = open_coredump_file(member.absolute_path, DUMP_ID, binary_path, kernel_elf_path, false);
+                        if (result["ok"].toBool(false)) {
+                            session->dump_ids.insert(member.path, DUMP_ID);
+                            evidence["status"] = member.truncated ? "loaded_truncated" : "loaded";
+                            evidence["dumpId"] = DUMP_ID;
+                            evidence["embeddedBuildId"] = EMBEDDED_BUILD_ID;
+                            const QJsonObject summary = result["summary"].toObject();
+                            evidence["buildIdStatus"] = summary["symbols"].toObject()["buildIdStatus"];
+                            evidence["symbolStatus"] = summary["symbols"].toObject()["symbolStatus"];
+                            if (evidence["buildIdStatus"].toString() == "mismatch") {
+                                append_load_issue("build_id_mismatch", member.path,
+                                                  "matching binary build ID differs from the coredump embedded build ID");
+                            }
+                            if (evidence["symbolStatus"].toString() == "missing") {
+                                append_load_issue("missing_symbols", member.path, "no matching symbols are available");
+                            }
+                            ++loaded_dumps;
+                        } else {
+                            evidence["status"] = "coredump_open_error";
+                            evidence["error"] = result["error"];
+                            append_load_issue("coredump_open_error", member.path, result["error"].toString());
+                        }
+                    }
+                }
+            } else if (member.kind == "coverage-manifest" || member.kind == "config") {
+                QJsonParseError error;
+                const QJsonDocument document = QJsonDocument::fromJson(read_file_bytes_quiet(member.absolute_path), &error);
+                if (error.error == QJsonParseError::NoError && (document.isObject() || document.isArray())) {
+                    evidence["status"] = "available";
+                    evidence["jsonType"] = document.isObject() ? "object" : "array";
+                } else {
+                    evidence["status"] = "invalid_json";
+                    evidence["error"] = error.errorString();
+                    append_load_issue("invalid_json_evidence", member.path, error.errorString());
+                }
+            } else {
+                evidence["status"] = "available";
+            }
+            session->evidence.insert(member.path, evidence);
+        }
+    } else {
+        for (const auto& member : session->bundle->members) {
+            if (!session->evidence.contains(member.path)) {
+                QJsonObject evidence = evidence_base(member);
+                evidence["status"] = "not_loaded";
+                session->evidence.insert(member.path, evidence);
+            }
+        }
+    }
+
+    session->loading = false;
+    validation["cached"] = false;
+    validation["loaded"] = true;
+    validation["loadedLogs"] = loaded_logs;
+    validation["loadedCoredumps"] = loaded_dumps;
+    validation["loadedEvidence"] = session->evidence.size();
+    validation["loadIssues"] = session->load_issues;
+    return validation;
+}
+
+auto DebugAnalysisService::get_incident_inventory(const QJsonObject& args) const -> QJsonObject {
+    const auto* session = find_incident_session(args["incidentId"].toString());
+    if (session == nullptr || !session->bundle) {
+        return tool_error("Unknown incidentId");
+    }
+    const Config& cfg = (config != nullptr) ? *config : ConfigService::instance().get_config();
+    const int START = bounded_int(args, "start", 0, 0, static_cast<int>(session->bundle->members.size()));
+    const int COUNT = bounded_int(args, "count", 100, 1, cfg.get_mcp_settings().max_entries);
+    QJsonObject result = incident_validation_to_json(*session->bundle, false);
+    QJsonObject inventory =
+        wosdbg::incident_inventory_to_json(*session->bundle, static_cast<size_t>(START), static_cast<size_t>(COUNT), false);
+    inventory["issues"] = result["issues"];
+    QJsonArray evidence;
+    const int END = std::min(START + COUNT, static_cast<int>(session->bundle->members.size()));
+    for (int index = START; index < END; ++index) {
+        const QString& path = session->bundle->members[static_cast<size_t>(index)].path;
+        evidence.append(session->evidence.value(path));
+    }
+    result["inventory"] = inventory;
+    result["evidence"] = evidence;
+    result["loadIssues"] = session->load_issues;
+    return result;
+}
+
+auto DebugAnalysisService::summarize_incident(const QJsonObject& args) const -> QJsonObject {
+    const auto* session = find_incident_session(args["incidentId"].toString());
+    if (session == nullptr || !session->bundle) {
+        return tool_error("Unknown incidentId");
+    }
+    if (session->loading) {
+        return tool_error("Incident evidence is still loading");
+    }
+    const Config& cfg = (config != nullptr) ? *config : ConfigService::instance().get_config();
+    const int MAX_EVENTS = bounded_int(args, "maxEvents", 200, 1, cfg.get_mcp_settings().max_entries);
+    const int MAX_ISSUES = bounded_int(args, "maxIssues", 64, 1, cfg.get_mcp_settings().max_entries);
+    const int MAX_COREDUMPS = bounded_int(args, "maxCoredumps", 16, 1, std::min(64, cfg.get_mcp_settings().max_entries));
+
+    QStringList evidence_paths = session->evidence.keys();
+    std::ranges::sort(evidence_paths);
+    QJsonArray evidence;
+    bool degraded = !session->load_issues.isEmpty();
+    for (const auto& path : evidence_paths) {
+        const QJsonObject item = session->evidence[path];
+        const QString status = item["status"].toString();
+        degraded = degraded || (status != "loaded" && status != "available");
+        evidence.append(item);
+    }
+
+    QStringList log_paths = session->log_ids.keys();
+    std::ranges::sort(log_paths);
+    QJsonArray log_ids;
+    QSet<QString> log_nodes;
+    QSet<QString> log_clock_domains;
+    for (const auto& path : log_paths) {
+        log_ids.append(session->log_ids[path]);
+        if (const auto* member = session->bundle->find_member(path); member != nullptr) {
+            const QJsonValue node = member->metadata["nodeId"];
+            if (!node.isUndefined() && !node.isNull()) {
+                log_nodes.insert(node.isDouble() ? QString::number(static_cast<qint64>(node.toDouble())) : node.toString());
+            }
+            const QString domain = member->metadata["clockDomain"].toString();
+            if (!domain.isEmpty()) {
+                log_clock_domains.insert(domain);
+            }
+        }
+    }
+
+    QJsonObject timeline{{"ok", true},
+                         {"events", QJsonArray{}},
+                         {"lanes", QJsonArray{}},
+                         {"clockOrderedEvents", QJsonArray{}},
+                         {"clockQuality", "unavailable"},
+                         {"crossLogCorrelations", QJsonArray{}},
+                         {"truncated", false}};
+    if (args["includeTimeline"].toBool(true) && !log_ids.isEmpty()) {
+        timeline = build_distributed_timeline(QJsonObject{{"logIds", log_ids}, {"maxEvents", MAX_EVENTS}});
+    }
+
+    const QJsonObject CLOCKS = session->bundle->manifest["clocks"].toObject();
+    const QString MANIFEST_CLOCK_QUALITY = CLOCKS["quality"].toString("unavailable");
+    bool domains_comparable = !log_clock_domains.isEmpty();
+    QSet<QString> comparable_domains;
+    for (const auto& value : CLOCKS["domains"].toArray()) {
+        const QJsonObject domain = value.toObject();
+        if (domain["comparableAcrossNodes"].toBool(false) && domain["synchronized"].toBool(false)) {
+            comparable_domains.insert(domain["id"].toString());
+        }
+    }
+    for (const auto& domain : std::as_const(log_clock_domains)) {
+        domains_comparable = domains_comparable && comparable_domains.contains(domain);
+    }
+    const bool MULTI_NODE = log_nodes.size() > 1;
+    const bool GLOBAL_ORDER_ALLOWED = !MULTI_NODE || domains_comparable;
+    const QString OBSERVED_CLOCK_QUALITY = timeline["clockQuality"].toString("unavailable");
+    QString effective_clock_quality = OBSERVED_CLOCK_QUALITY;
+    if (MULTI_NODE && !domains_comparable) {
+        effective_clock_quality = OBSERVED_CLOCK_QUALITY == "per-log-order-only" ? "per-log-order-only" : "partial-timestamps-untrusted";
+        timeline["clockOrderedEvents"] = QJsonArray{};
+    } else if (OBSERVED_CLOCK_QUALITY == "all-events-timestamped") {
+        effective_clock_quality = MULTI_NODE ? "globally-comparable" : "single-node-comparable";
+    }
+    timeline["clockQuality"] = effective_clock_quality;
+    timeline["globalOrderAvailable"] = GLOBAL_ORDER_ALLOWED && OBSERVED_CLOCK_QUALITY == "all-events-timestamped";
+    timeline["manifestClockQuality"] = MANIFEST_CLOCK_QUALITY;
+
+    QStringList dump_paths = session->dump_ids.keys();
+    std::ranges::sort(dump_paths);
+    const bool COREDUMPS_TRUNCATED = dump_paths.size() > MAX_COREDUMPS;
+    dump_paths = dump_paths.mid(0, MAX_COREDUMPS);
+    QJsonArray coredumps;
+    for (const auto& path : dump_paths) {
+        const QString dump_id = session->dump_ids[path];
+        const auto* dump = find_dump_session(dump_id);
+        if (dump == nullptr) {
+            continue;
+        }
+        QJsonArray correlations;
+        int remaining_correlation_hits = std::min(MAX_ISSUES, 64);
+        for (const auto& log_path : log_paths) {
+            if (remaining_correlation_hits == 0) {
+                break;
+            }
+            const QJsonObject result = correlate_coredump_logs(
+                QJsonObject{{"dumpId", dump_id}, {"logId", session->log_ids[log_path]}, {"maxHits", remaining_correlation_hits}});
+            const QJsonArray hits = result["hits"].toArray();
+            if (result["ok"].toBool(false) && !hits.isEmpty()) {
+                correlations.append(QJsonObject{{"logMember", log_path}, {"hits", hits}, {"truncated", result["truncated"]}});
+                remaining_correlation_hits -= hits.size();
+            }
+        }
+        const QJsonObject chunks = scan_chunk_corruption(QJsonObject{{"dumpId", dump_id}, {"maxHits", MAX_ISSUES}});
+        coredumps.append(QJsonObject{{"memberPath", path},
+                                     {"summary", coredump_summary_to_json(*dump)},
+                                     {"chunkCorruption", chunks},
+                                     {"logCorrelations", correlations}});
+    }
+
+    const QJsonObject CAPTURE = session->bundle->manifest["capture"].toObject();
+    degraded = degraded || !CAPTURE["complete"].toBool(true) || !CAPTURE["errors"].toArray().isEmpty() ||
+               !CAPTURE["truncatedMembers"].toArray().isEmpty();
+    const QJsonObject validation = incident_validation_to_json(*session->bundle, true);
+    degraded = degraded || validation["degraded"].toBool(false);
+    QJsonObject semantic{{"format", session->bundle->manifest["format"]},
+                         {"formatVersion", session->bundle->manifest["version"]},
+                         {"manifestIncidentId", session->bundle->incident_id()},
+                         {"source", session->bundle->manifest["source"]},
+                         {"capture", CAPTURE},
+                         {"clocks", CLOCKS},
+                         {"topology", session->bundle->manifest["topology"]},
+                         {"validationIssues", validation["issues"]},
+                         {"loadIssues", session->load_issues},
+                         {"evidence", evidence},
+                         {"timeline", timeline},
+                         {"coredumps", coredumps},
+                         {"coredumpsTruncated", COREDUMPS_TRUNCATED},
+                         {"degraded", degraded}};
+    bool response_truncated = false;
+    semantic = normalize_incident_value(*session, semantic, &response_truncated).toObject();
+    semantic["responseTruncated"] = response_truncated;
+    const QByteArray CANONICAL = QJsonDocument(semantic).toJson(QJsonDocument::Compact);
+    const QString DIGEST = QString::fromLatin1(QCryptographicHash::hash(CANONICAL, QCryptographicHash::Sha256).toHex());
+    QJsonObject result = validation;
+    result["clockQuality"] = MANIFEST_CLOCK_QUALITY;
+    result["evidence"] = semantic["evidence"];
+    result["timeline"] = semantic["timeline"];
+    result["coredumps"] = semantic["coredumps"];
+    result["coredumpsTruncated"] = COREDUMPS_TRUNCATED;
+    result["degraded"] = degraded;
+    result["responseTruncated"] = response_truncated;
+    result["semanticDigest"] = "sha256:" + DIGEST;
+    return result;
+}
+
 auto DebugAnalysisService::list_logs() -> QJsonObject {
     QDir const DIR(QDir::currentPath());
     QStringList files = DIR.entryList({"*.log", "*.txt"}, QDir::Files, QDir::Name);
@@ -849,7 +1461,12 @@ auto DebugAnalysisService::load_log(const QJsonObject& args) -> QJsonObject {
         return tool_error(QString("Log path is outside allowed roots: %1").arg(RESOLVED));
     }
 
-    auto id = make_session_id("log", RESOLVED);
+    return load_log_file(RESOLVED, make_session_id("log", RESOLVED), args["timeoutMs"].toInt(120000));
+}
+
+auto DebugAnalysisService::load_log_file(const QString& resolved_path, const QString& session_id, int timeout_ms) -> QJsonObject {
+    const QString& RESOLVED = resolved_path;
+    const QString& id = session_id;
     if (log_sessions.contains(id)) {
         return QJsonObject{{"ok", true}, {"logId", id}, {"cached", true}, {"summary", log_summary_to_json(*log_sessions[id])}};
     }
@@ -876,7 +1493,7 @@ auto DebugAnalysisService::load_log(const QJsonObject& args) -> QJsonObject {
         error = "Timed out while parsing log";
         loop.quit();
     });
-    timeout.start(args["timeoutMs"].toInt(120000));
+    timeout.start(std::clamp(timeout_ms, 1000, 600000));
     processor.start_processing();
     loop.exec();
 
@@ -1142,7 +1759,39 @@ auto DebugAnalysisService::open_coredump(const QJsonObject& args) -> QJsonObject
         return tool_error(QString("Coredump path is outside allowed roots: %1").arg(RESOLVED));
     }
 
-    QString id = make_session_id("dump", RESOLVED);
+    auto resolve_optional_elf = [&](const QString& raw, const char* label) -> std::optional<QString> {
+        if (raw.isEmpty()) {
+            return QString{};
+        }
+        const QString resolved = resolve_path_for_read(raw);
+        if (!QFileInfo::exists(resolved)) {
+            return std::nullopt;
+        }
+        if (!is_path_allowed(resolved)) {
+            return std::nullopt;
+        }
+        (void)label;
+        return resolved;
+    };
+    const QString BINARY_ARGUMENT = args["elfPath"].toString(args["binaryElfPath"].toString());
+    const QString KERNEL_ARGUMENT = args["kernelElfPath"].toString();
+    const auto BINARY_ELF = resolve_optional_elf(BINARY_ARGUMENT, "binary ELF");
+    const auto KERNEL_ELF = resolve_optional_elf(KERNEL_ARGUMENT, "kernel ELF");
+    if (!BINARY_ELF) {
+        return tool_error(QString("Binary ELF path is missing or outside allowed roots: %1").arg(BINARY_ARGUMENT));
+    }
+    if (!KERNEL_ELF) {
+        return tool_error(QString("Kernel ELF path is missing or outside allowed roots: %1").arg(KERNEL_ARGUMENT));
+    }
+
+    return open_coredump_file(RESOLVED, make_session_id("dump", RESOLVED), *BINARY_ELF, *KERNEL_ELF);
+}
+
+auto DebugAnalysisService::open_coredump_file(const QString& resolved_path, const QString& session_id, const QString& binary_elf_path,
+                                              const QString& kernel_elf_path, bool allow_external_discovery) -> QJsonObject {
+    const QString& RESOLVED = resolved_path;
+    const QString& id = session_id;
+    const Config& cfg = (config != nullptr) ? *config : ConfigService::instance().get_config();
     if (dump_sessions.contains(id)) {
         return QJsonObject{{"ok", true}, {"dumpId", id}, {"cached", true}, {"summary", coredump_summary_to_json(*dump_sessions[id])}};
     }
@@ -1165,14 +1814,17 @@ auto DebugAnalysisService::open_coredump(const QJsonObject& args) -> QJsonObject
     }
 
     QString const BINARY_NAME = wosdbg::parse_binary_name_from_filename(session->dump->source_filename);
-    QString elf_path = cfg.find_elf_path_for_binary(BINARY_NAME);
-    if (elf_path.isEmpty()) {
+    QString elf_path = binary_elf_path;
+    if (elf_path.isEmpty() && allow_external_discovery) {
+        elf_path = cfg.find_elf_path_for_binary(BINARY_NAME);
+    }
+    if (elf_path.isEmpty() && allow_external_discovery) {
         elf_path = first_existing_candidate(default_elf_candidates(session->dump->exe_path));
     }
-    if (elf_path.isEmpty() && !session->embedded_build_id.isEmpty()) {
+    if (elf_path.isEmpty() && allow_external_discovery && !session->embedded_build_id.isEmpty()) {
         elf_path = first_existing_candidate(build_id_debug_candidates(session->embedded_build_id));
     }
-    if (elf_path.isEmpty() && !session->embedded_build_id.isEmpty()) {
+    if (elf_path.isEmpty() && allow_external_discovery && !session->embedded_build_id.isEmpty()) {
         elf_path = first_candidate_with_build_id(default_elf_candidates(session->dump->exe_path), session->embedded_build_id);
     }
     if (!elf_path.isEmpty()) {
@@ -1180,15 +1832,20 @@ auto DebugAnalysisService::open_coredump(const QJsonObject& args) -> QJsonObject
         session->binary_symbols = wosdbg::load_symbols_from_file(elf_path);
         session->binary_sections = wosdbg::load_sections_from_file(elf_path);
         session->binary_build_id = wosdbg::elf_build_id_from_file(elf_path);
+        session->binary_build_id_status = "embedded-build-id-missing";
     }
-    if (!session->binary_build_id.isEmpty() && !session->embedded_build_id.isEmpty()) {
+    if (!session->binary_elf_path.isEmpty() && session->binary_build_id.isEmpty()) {
+        session->binary_build_id_status = "binary-build-id-missing";
+    } else if (!session->binary_build_id.isEmpty() && !session->embedded_build_id.isEmpty()) {
         session->binary_build_id_matches = session->binary_build_id == session->embedded_build_id;
+        session->binary_build_id_status = session->binary_build_id_matches ? "match" : "mismatch";
         if (!session->binary_build_id_matches) {
             session->symbol_warning = QString("local binary build ID %1 does not match coredump embedded build ID %2")
                                           .arg(session->binary_build_id, session->embedded_build_id);
-            const QString BUILD_ID_ELF_PATH = first_existing_candidate(build_id_debug_candidates(session->embedded_build_id));
+            const QString BUILD_ID_ELF_PATH =
+                allow_external_discovery ? first_existing_candidate(build_id_debug_candidates(session->embedded_build_id)) : QString{};
             const QString FALLBACK_ELF_PATH =
-                BUILD_ID_ELF_PATH.isEmpty()
+                allow_external_discovery && BUILD_ID_ELF_PATH.isEmpty()
                     ? first_candidate_with_build_id(default_elf_candidates(session->dump->exe_path), session->embedded_build_id)
                     : BUILD_ID_ELF_PATH;
             if (!FALLBACK_ELF_PATH.isEmpty()) {
@@ -1197,22 +1854,39 @@ auto DebugAnalysisService::open_coredump(const QJsonObject& args) -> QJsonObject
                 session->binary_sections = wosdbg::load_sections_from_file(FALLBACK_ELF_PATH);
                 session->binary_build_id = wosdbg::elf_build_id_from_file(FALLBACK_ELF_PATH);
                 session->binary_build_id_matches = session->binary_build_id == session->embedded_build_id;
+                session->binary_build_id_status = session->binary_build_id_matches ? "match" : "mismatch";
                 session->symbol_warning =
                     QString("configured binary build ID mismatched; using build-id matched ELF %1").arg(FALLBACK_ELF_PATH);
             }
         }
     }
-    for (const auto& lookup : cfg.get_address_lookups()) {
-        if (lookup.symbol_file_path.contains("kern") || lookup.symbol_file_path.contains("wos")) {
-            QString const KERNEL_PATH = cfg.resolve_path(lookup.symbol_file_path);
-            session->kernel_elf_path = KERNEL_PATH;
-            session->kernel_symbols = wosdbg::load_symbols_from_file(KERNEL_PATH);
-            session->kernel_sections = wosdbg::load_sections_from_file(KERNEL_PATH);
-            session->kernel_build_id = wosdbg::elf_build_id_from_file(KERNEL_PATH);
-            break;
+    if (!kernel_elf_path.isEmpty()) {
+        session->kernel_elf_path = kernel_elf_path;
+        session->kernel_symbols = wosdbg::load_symbols_from_file(kernel_elf_path);
+        session->kernel_sections = wosdbg::load_sections_from_file(kernel_elf_path);
+        session->kernel_build_id = wosdbg::elf_build_id_from_file(kernel_elf_path);
+    } else if (allow_external_discovery) {
+        for (const auto& lookup : cfg.get_address_lookups()) {
+            if (lookup.symbol_file_path.contains("kern") || lookup.symbol_file_path.contains("wos")) {
+                QString const KERNEL_PATH = cfg.resolve_path(lookup.symbol_file_path);
+                session->kernel_elf_path = KERNEL_PATH;
+                session->kernel_symbols = wosdbg::load_symbols_from_file(KERNEL_PATH);
+                session->kernel_sections = wosdbg::load_sections_from_file(KERNEL_PATH);
+                session->kernel_build_id = wosdbg::elf_build_id_from_file(KERNEL_PATH);
+                break;
+            }
         }
     }
-    discover_modules(*session);
+    discover_modules(*session, allow_external_discovery);
+    if (session->binary_build_id_status == "mismatch") {
+        session->symbol_status = "build-id-mismatch";
+    } else if (session->binary_symbols) {
+        session->symbol_status = "available";
+    } else if (session->embedded_symbols) {
+        session->symbol_status = "embedded-only";
+    } else if (!session->binary_elf_path.isEmpty()) {
+        session->symbol_status = "binary-has-no-symbols";
+    }
 
     auto* saved = session.get();
     dump_sessions.insert(id, session);
@@ -1304,7 +1978,7 @@ void DebugAnalysisService::add_module(DumpSession& session, const QString& path,
     session.modules.push_back(std::move(module));
 }
 
-void DebugAnalysisService::discover_modules(DumpSession& session) {
+void DebugAnalysisService::discover_modules(DumpSession& session, bool allow_external_discovery) {
     QStringList candidates;
     auto append_candidate = [&](const QString& path) {
         QString const CLEAN = canonical_path_or_absolute(path);
@@ -1315,15 +1989,17 @@ void DebugAnalysisService::discover_modules(DumpSession& session) {
     if (!session.binary_elf_path.isEmpty()) {
         append_candidate(session.binary_elf_path);
     }
-    for (const auto& candidate : default_elf_candidates(session.dump->exe_path)) {
-        if (QFileInfo::exists(candidate)) {
-            append_candidate(candidate);
-        }
-    }
-    if (!session.embedded_build_id.isEmpty()) {
-        for (const auto& candidate : build_id_debug_candidates(session.embedded_build_id)) {
+    if (allow_external_discovery) {
+        for (const auto& candidate : default_elf_candidates(session.dump->exe_path)) {
             if (QFileInfo::exists(candidate)) {
                 append_candidate(candidate);
+            }
+        }
+        if (!session.embedded_build_id.isEmpty()) {
+            for (const auto& candidate : build_id_debug_candidates(session.embedded_build_id)) {
+                if (QFileInfo::exists(candidate)) {
+                    append_candidate(candidate);
+                }
             }
         }
     }
@@ -1498,6 +2174,8 @@ auto DebugAnalysisService::coredump_summary_to_json(const DumpSession& session) 
                                                {"binaryBuildId", session.binary_build_id},
                                                {"embeddedBuildId", session.embedded_build_id},
                                                {"binaryBuildIdMatches", session.binary_build_id_matches},
+                                               {"buildIdStatus", session.binary_build_id_status},
+                                               {"symbolStatus", session.symbol_status},
                                                {"symbolWarning", session.symbol_warning},
                                                {"kernelElfPath", session.kernel_elf_path},
                                                {"kernelBuildId", session.kernel_build_id},
@@ -2856,6 +3534,9 @@ auto DebugAnalysisService::verify_embedded_elf(const QJsonObject& args) const ->
         return tool_error("verify_embedded_elf requires a local ELF path or discoverable build-id match");
     }
     local_path = resolve_path_for_read(local_path);
+    if (!is_path_allowed(local_path)) {
+        return tool_error(QString("ELF path is outside allowed roots: %1").arg(local_path));
+    }
     QByteArray const LOCAL = read_file_bytes_quiet(local_path);
     if (LOCAL.isEmpty()) {
         return tool_error(QString("could not read local ELF: %1").arg(local_path));
@@ -3186,8 +3867,10 @@ auto DebugAnalysisService::scan_chunk_corruption(const QJsonObject& args) const 
             if (!mapping || !mapping->file_backed) {
                 continue;
             }
-            QByteArray const ACTUAL =
-                wosdbg::read_va_bytes(*session->dump, seg.vaddr, static_cast<size_t>(std::min<uint64_t>(seg.size, K_PAGE_SIZE)));
+            const uint64_t IN_LOAD = mapping->elf_vaddr - mapping->segment_vaddr;
+            const uint64_t FILE_BACKED_BYTES = mapping->segment_filesz - IN_LOAD;
+            const uint64_t COMPARE_BYTES = std::min<uint64_t>({seg.size, K_PAGE_SIZE, FILE_BACKED_BYTES});
+            QByteArray const ACTUAL = wosdbg::read_va_bytes(*session->dump, seg.vaddr, static_cast<size_t>(COMPARE_BYTES));
             QByteArray const EXPECTED = bytes_at_file_offset(ELF, mapping->file_offset, ACTUAL.size());
             if (ACTUAL.isEmpty() || EXPECTED.isEmpty() || ACTUAL == EXPECTED) {
                 continue;
@@ -3312,8 +3995,8 @@ auto DebugAnalysisService::correlate_coredump_logs(const QJsonObject& args) cons
     if (!args["logId"].toString().isEmpty()) {
         log_ids << args["logId"].toString();
     } else {
-        for (auto it = log_sessions.cbegin(); it != log_sessions.cend(); ++it) {
-            log_ids << it.key();
+        for (const auto& key : sorted_hash_keys(log_sessions)) {
+            log_ids << key;
         }
     }
     if (log_ids.isEmpty()) {
@@ -3351,8 +4034,8 @@ auto DebugAnalysisService::reconstruct_wki_trace(const QJsonObject& args) const 
     if (!args["logId"].toString().isEmpty()) {
         log_ids << args["logId"].toString();
     } else {
-        for (auto it = log_sessions.cbegin(); it != log_sessions.cend(); ++it) {
-            log_ids << it.key();
+        for (const auto& key : sorted_hash_keys(log_sessions)) {
+            log_ids << key;
         }
     }
     if (log_ids.isEmpty()) {
@@ -3392,8 +4075,8 @@ auto DebugAnalysisService::build_distributed_timeline(const QJsonObject& args) c
         }
     }
     if (log_ids.isEmpty()) {
-        for (auto it = log_sessions.cbegin(); it != log_sessions.cend(); ++it) {
-            log_ids << it.key();
+        for (const auto& key : sorted_hash_keys(log_sessions)) {
+            log_ids << key;
         }
     }
     if (log_ids.isEmpty()) {
@@ -3645,13 +4328,15 @@ auto DebugAnalysisService::build_distributed_timeline(const QJsonObject& args) c
     }
 
     QJsonArray cross_log_correlations;
-    for (auto it = correlation_logs.cbegin(); it != correlation_logs.cend(); ++it) {
-        if (it.value().size() < 2) {
+    for (const auto& key : sorted_hash_keys(correlation_logs)) {
+        const auto& log_set = correlation_logs[key];
+        if (log_set.size() < 2) {
             continue;
         }
-        cross_log_correlations.append(QJsonObject{{"key", it.key()},
-                                                  {"occurrences", correlation_counts.value(it.key())},
-                                                  {"logIds", QJsonArray::fromStringList(it.value().values())}});
+        QStringList correlated_logs = log_set.values();
+        std::ranges::sort(correlated_logs);
+        cross_log_correlations.append(QJsonObject{
+            {"key", key}, {"occurrences", correlation_counts.value(key)}, {"logIds", QJsonArray::fromStringList(correlated_logs)}});
     }
 
     QJsonArray clock_ordered_events;
@@ -3662,7 +4347,22 @@ auto DebugAnalysisService::build_distributed_timeline(const QJsonObject& args) c
         }
     }
     std::ranges::sort(timestamped_events, [](const QJsonObject& left, const QJsonObject& right) {
-        return left["timestampNs"].toDouble() < right["timestampNs"].toDouble();
+        const double left_timestamp = left["timestampNs"].toDouble();
+        const double right_timestamp = right["timestampNs"].toDouble();
+        if (left_timestamp != right_timestamp) {
+            return left_timestamp < right_timestamp;
+        }
+        const int left_lane = left["lane"].toInt();
+        const int right_lane = right["lane"].toInt();
+        if (left_lane != right_lane) {
+            return left_lane < right_lane;
+        }
+        const int left_row = left["row"].toInt();
+        const int right_row = right["row"].toInt();
+        if (left_row != right_row) {
+            return left_row < right_row;
+        }
+        return left["logId"].toString() < right["logId"].toString();
     });
     for (const auto& event : timestamped_events) {
         clock_ordered_events.append(event);
@@ -3976,15 +4676,20 @@ auto DebugAnalysisService::get_source_context(const QJsonObject& args) const -> 
 
 auto DebugAnalysisService::list_resources() const -> QJsonArray {
     QJsonArray resources;
-    for (auto it = log_sessions.cbegin(); it != log_sessions.cend(); ++it) {
-        resources.append(
-            QJsonObject{{"uri", QString("wosdbg://log/%1/summary").arg(it.key())}, {"name", QString("Log %1 summary").arg(it.key())}});
+    for (const auto& key : sorted_hash_keys(log_sessions)) {
+        resources.append(QJsonObject{{"uri", QString("wosdbg://log/%1/summary").arg(key)}, {"name", QString("Log %1 summary").arg(key)}});
     }
-    for (auto it = dump_sessions.cbegin(); it != dump_sessions.cend(); ++it) {
-        resources.append(QJsonObject{{"uri", QString("wosdbg://coredump/%1/summary").arg(it.key())},
-                                     {"name", QString("Coredump %1 summary").arg(it.key())}});
-        resources.append(QJsonObject{{"uri", QString("wosdbg://coredump/%1/registers").arg(it.key())},
-                                     {"name", QString("Coredump %1 registers").arg(it.key())}});
+    for (const auto& key : sorted_hash_keys(dump_sessions)) {
+        resources.append(
+            QJsonObject{{"uri", QString("wosdbg://coredump/%1/summary").arg(key)}, {"name", QString("Coredump %1 summary").arg(key)}});
+        resources.append(
+            QJsonObject{{"uri", QString("wosdbg://coredump/%1/registers").arg(key)}, {"name", QString("Coredump %1 registers").arg(key)}});
+    }
+    for (const auto& key : sorted_hash_keys(incident_sessions)) {
+        resources.append(QJsonObject{{"uri", QString("wosdbg://incident/%1/summary").arg(key)},
+                                     {"name", QString("Incident %1 deterministic summary").arg(key)}});
+        resources.append(
+            QJsonObject{{"uri", QString("wosdbg://incident/%1/inventory").arg(key)}, {"name", QString("Incident %1 inventory").arg(key)}});
     }
     return resources;
 }
@@ -4001,6 +4706,8 @@ auto DebugAnalysisService::list_resource_templates() -> QJsonArray {
         QJsonObject{{"uriTemplate", "wosdbg://coredump/{dumpId}/pte/{address}"}, {"name", "Coredump PTE/mapping info"}},
         QJsonObject{{"uriTemplate", "wosdbg://log/{logId}/summary"}, {"name", "Log summary"}},
         QJsonObject{{"uriTemplate", "wosdbg://log/{logId}/entry/{row}"}, {"name", "Log entry"}},
+        QJsonObject{{"uriTemplate", "wosdbg://incident/{incidentId}/summary"}, {"name", "Incident deterministic summary"}},
+        QJsonObject{{"uriTemplate", "wosdbg://incident/{incidentId}/inventory"}, {"name", "Incident inventory"}},
         QJsonObject{{"uriTemplate", "wosdbg://source/{encodedPath}:{line}"}, {"name", "Source context"}},
     };
 }
@@ -4052,6 +4759,16 @@ auto DebugAnalysisService::read_resource(const QString& uri) const -> QJsonObjec
         }
         if (KIND == "pte" && parts.size() >= 3) {
             return inspect_page_table(QJsonObject{{"dumpId", dump_id}, {"address", parts[2]}});
+        }
+    }
+    if (HOST == "incident" && parts.size() >= 2) {
+        const QString incident_id = parts[0];
+        const QString kind = parts[1];
+        if (kind == "summary") {
+            return summarize_incident(QJsonObject{{"incidentId", incident_id}});
+        }
+        if (kind == "inventory") {
+            return get_incident_inventory(QJsonObject{{"incidentId", incident_id}});
         }
     }
     if (HOST == "source") {

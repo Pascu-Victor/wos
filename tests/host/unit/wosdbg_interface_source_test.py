@@ -6,6 +6,12 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 WOSDBG = ROOT / "tools" / "wosdbg"
+INCIDENT_TOOLS = {
+    "wosdbg.load_incident": "path",
+    "wosdbg.validate_incident": "path",
+    "wosdbg.get_incident_inventory": "incidentId",
+    "wosdbg.summarize_incident": "incidentId",
+}
 
 
 def fail(message: str) -> None:
@@ -65,6 +71,21 @@ def test_backend_catalog_is_the_only_tool_dispatch_contract() -> None:
             f"catalog-only={sorted(catalog_names - dispatch_names)}, "
             f"dispatch-only={sorted(dispatch_names - catalog_names)}"
         )
+    incident_catalog = set(INCIDENT_TOOLS) & catalog_names
+    if incident_catalog and incident_catalog != set(INCIDENT_TOOLS):
+        fail(
+            "incident catalog must be added atomically: "
+            f"present={sorted(incident_catalog)}, "
+            f"missing={sorted(set(INCIDENT_TOOLS) - incident_catalog)}"
+        )
+    if incident_catalog:
+        for name, required_argument in INCIDENT_TOOLS.items():
+            start = catalog.find(f'{{"name", "{name}"}}')
+            if start < 0:
+                fail(f"incident catalog entry is not source-visible: {name}")
+            next_entry = catalog.find('QJsonObject{{"name", "wosdbg.', start + 1)
+            entry = catalog[start : next_entry if next_entry >= 0 else len(catalog)]
+            require_tokens(entry, ['"inputSchema"', "schema(", f'"{required_argument}"'], f"{name} schema")
     require_tokens(
         mcp_source,
         [
@@ -123,16 +144,16 @@ def test_cli_and_gui_use_the_shared_contract() -> None:
         ],
         "append-only GUI protocol",
     )
-    require_tokens(
+    require_tokens(panel, ["tool_catalog_received", "tool_result_received", "suggested_arguments"], "schema-driven GUI")
+    remembered_context = between(
         panel,
-        [
-            "tool_catalog_received",
-            "tool_result_received",
-            "suggested_arguments",
-            'for (const QString& key : {"dumpId", "logId"})',
-        ],
-        "schema-driven GUI",
+        "void DebugToolPanel::remember_context",
+        "void DebugToolPanel::on_tool_result",
     )
+    require_tokens(remembered_context, ['"dumpId"', '"logId"'], "GUI tool-result context")
+    backend_sources = "\n".join(path.read_text() for path in sorted(WOSDBG.glob("*.cpp")))
+    if any(f'{{"name", "{name}"}}' in backend_sources for name in INCIDENT_TOOLS):
+        require_tokens(remembered_context, ['"incidentId"'], "GUI incident context")
     require_tokens(client, ["request_tool_catalog()", "call_tool(const QString& name"], "GUI client")
     require_tokens(
         server,

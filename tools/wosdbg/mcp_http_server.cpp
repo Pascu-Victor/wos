@@ -701,6 +701,33 @@ auto DebugAnalysisService::tool_catalog() -> QJsonObject {
         QJsonObject{{"name", "wosdbg.load_log"},
                     {"description", "Parse a TCG execution log."},
                     {"inputSchema", schema({{"path", QJsonObject{{"type", "string"}}}}, {"path"})}},
+        QJsonObject{
+            {"name", "wosdbg.validate_incident"},
+            {"description", "Safely snapshot and validate a versioned .wosincident directory or archive without loading evidence."},
+            {"inputSchema",
+             schema({{"path", QJsonObject{{"type", "string"}}}, {"includeInventory", QJsonObject{{"type", "boolean"}}}}, {"path"})}},
+        QJsonObject{{"name", "wosdbg.load_incident"},
+                    {"description", "Validate and load a WOS incident session, including bounded incident-local logs and coredumps."},
+                    {"inputSchema", schema({{"path", QJsonObject{{"type", "string"}}},
+                                            {"loadEvidence", QJsonObject{{"type", "boolean"}}},
+                                            {"maxLogs", QJsonObject{{"type", "integer"}}},
+                                            {"maxCoredumps", QJsonObject{{"type", "integer"}}}},
+                                           {"path"})}},
+        QJsonObject{{"name", "wosdbg.get_incident_inventory"},
+                    {"description", "Return a bounded page of validated incident members and their load/degradation states."},
+                    {"inputSchema", schema({{"incidentId", QJsonObject{{"type", "string"}}},
+                                            {"start", QJsonObject{{"type", "integer"}}},
+                                            {"count", QJsonObject{{"type", "integer"}}}},
+                                           {"incidentId"})}},
+        QJsonObject{{"name", "wosdbg.summarize_incident"},
+                    {"description",
+                     "Produce a bounded deterministic incident report with explicit evidence, coredump, correlation, and clock quality."},
+                    {"inputSchema", schema({{"incidentId", QJsonObject{{"type", "string"}}},
+                                            {"maxEvents", QJsonObject{{"type", "integer"}}},
+                                            {"maxIssues", QJsonObject{{"type", "integer"}}},
+                                            {"maxCoredumps", QJsonObject{{"type", "integer"}}},
+                                            {"includeTimeline", QJsonObject{{"type", "boolean"}}}},
+                                           {"incidentId"})}},
         QJsonObject{{"name", "wosdbg.get_log_entries"},
                     {"description", "Return a bounded page of structured log entries."},
                     {"inputSchema", schema({{"logId", QJsonObject{{"type", "string"}}},
@@ -726,7 +753,10 @@ auto DebugAnalysisService::tool_catalog() -> QJsonObject {
                     {"inputSchema", schema({})}},
         QJsonObject{{"name", "wosdbg.open_coredump"},
                     {"description", "Parse and cache a WOS coredump session."},
-                    {"inputSchema", schema({{"path", QJsonObject{{"type", "string"}}}}, {"path"})}},
+                    {"inputSchema", schema({{"path", QJsonObject{{"type", "string"}}},
+                                            {"elfPath", QJsonObject{{"type", "string"}}},
+                                            {"kernelElfPath", QJsonObject{{"type", "string"}}}},
+                                           {"path"})}},
         QJsonObject{{"name", "wosdbg.get_crash_summary"},
                     {"description",
                      "Quick JSON crash summary for an opened coredump: fault metadata, suspicious registers, decoded fault "
@@ -1025,6 +1055,14 @@ auto DebugAnalysisService::invoke_tool(const QString& name, const QJsonObject& a
         payload = list_logs();
     } else if (name == "wosdbg.load_log") {
         payload = load_log(args);
+    } else if (name == "wosdbg.validate_incident") {
+        payload = validate_incident(args);
+    } else if (name == "wosdbg.load_incident") {
+        payload = load_incident(args);
+    } else if (name == "wosdbg.get_incident_inventory") {
+        payload = get_incident_inventory(args);
+    } else if (name == "wosdbg.summarize_incident") {
+        payload = summarize_incident(args);
     } else if (name == "wosdbg.get_log_entries") {
         payload = get_log_entries(args);
     } else if (name == "wosdbg.search_log") {

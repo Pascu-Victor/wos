@@ -35,7 +35,13 @@ Use [wosdbg.json.example](wosdbg.json.example) as the complete starting point:
     "maxHits": 200,
     "maxStringLength": 160,
     "sourceWindowLines": 8,
-    "maxDisassemblyInstructions": 48
+    "maxDisassemblyInstructions": 48,
+    "maxIncidentMembers": 512,
+    "maxIncidentMemberBytes": "134217728",
+    "maxIncidentTotalBytes": "536870912",
+    "maxIncidentArchiveBytes": "268435456",
+    "maxIncidentPathLength": 512,
+    "maxIncidentPathDepth": 24
   }
 }
 ```
@@ -67,6 +73,18 @@ so they apply to MCP, CLI, and the GUI Analysis Tools dock:
   directories are also implicit roots.
 - `maxEntries`, `maxHits`, `maxMemoryBytes`, `maxStringLength`,
   `sourceWindowLines`, `maxDisassemblyInstructions`: response and scan bounds.
+- `maxIncidentMembers`, `maxIncidentMemberBytes`, `maxIncidentTotalBytes`,
+  `maxIncidentArchiveBytes`, `maxIncidentPathLength`, and
+  `maxIncidentPathDepth`: hostile bundle snapshot, expansion, and path bounds.
+  Byte limits may be JSON strings so values are not narrowed by a frontend.
+
+`validate_incident` and `load_incident` first require the input path itself to
+be under an effective `allowedRoots` entry. Archive members are then copied to
+a private snapshot only after rejecting traversal, links, devices, conflicts,
+oversized input/expansion, bad checksums, and a mismatched content-derived
+incident identity. Offline incident replay never searches the host for a
+replacement executable; it uses the exact bundle-local binary association or
+reports missing/mismatched symbols.
 
 Do not expose MCP beyond loopback without deliberately configuring both
 `bindAddress` and `allowedCidrs`. Files outside the effective roots described

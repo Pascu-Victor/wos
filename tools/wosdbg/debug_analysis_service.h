@@ -17,6 +17,7 @@
 
 #include "coredump_parser.h"
 #include "elf_symbol_resolver.h"
+#include "incident_bundle.h"
 #include "log_entry.h"
 
 class Config;
@@ -41,6 +42,11 @@ class DebugAnalysisService : public QObject {
     [[nodiscard]] QJsonObject get_log_entries(const QJsonObject& args) const;
     [[nodiscard]] QJsonObject search_log(const QJsonObject& args) const;
     [[nodiscard]] QJsonObject get_log_context(const QJsonObject& args) const;
+
+    [[nodiscard]] QJsonObject validate_incident(const QJsonObject& args) const;
+    [[nodiscard]] QJsonObject load_incident(const QJsonObject& args);
+    [[nodiscard]] QJsonObject get_incident_inventory(const QJsonObject& args) const;
+    [[nodiscard]] QJsonObject summarize_incident(const QJsonObject& args) const;
 
     [[nodiscard]] QJsonObject extract_coredumps(const QJsonObject& args);
     [[nodiscard]] QJsonObject list_coredumps() const;
@@ -118,8 +124,21 @@ class DebugAnalysisService : public QObject {
         QString kernel_elf_path;
         QString kernel_build_id;
         QString symbol_warning;
-        bool binary_build_id_matches = true;
+        bool binary_build_id_matches = false;
+        QString binary_build_id_status = "missing-binary";
+        QString symbol_status = "missing";
         std::vector<LoadedModule> modules;
+    };
+
+    struct IncidentSession {
+        QString id;
+        QString source_path;
+        std::unique_ptr<wosdbg::IncidentBundle> bundle;
+        QHash<QString, QString> log_ids;
+        QHash<QString, QString> dump_ids;
+        QHash<QString, QJsonObject> evidence;
+        QJsonArray load_issues;
+        bool loading = false;
     };
 
     struct AddressDescription {
@@ -151,11 +170,22 @@ class DebugAnalysisService : public QObject {
     [[nodiscard]] const LogSession* find_log_session(const QString& id) const;
     [[nodiscard]] const DumpSession* find_dump_session(const QString& id) const;
     DumpSession* find_dump_session(const QString& id);
+    [[nodiscard]] const IncidentSession* find_incident_session(const QString& id) const;
+    IncidentSession* find_incident_session(const QString& id);
+    [[nodiscard]] QJsonObject load_log_file(const QString& resolved_path, const QString& session_id, int timeout_ms = 120000);
+    [[nodiscard]] QJsonObject open_coredump_file(const QString& resolved_path, const QString& session_id,
+                                                 const QString& binary_elf_path = QString(), const QString& kernel_elf_path = QString(),
+                                                 bool allow_external_discovery = true);
 
     [[nodiscard]] QString resolve_path_for_read(const QString& path, const QString& fallback_dir = QString()) const;
     [[nodiscard]] bool is_path_allowed(const QString& path) const;
     [[nodiscard]] QStringList allowed_roots() const;
     static QString make_session_id(const QString& prefix, const QString& canonical_path);
+    static QString make_content_session_id(const QString& prefix, const QString& content_key);
+    [[nodiscard]] wosdbg::IncidentLimits incident_limits() const;
+    [[nodiscard]] QJsonObject incident_validation_to_json(const wosdbg::IncidentBundle& bundle, bool include_inventory = true) const;
+    [[nodiscard]] QJsonValue normalize_incident_value(const IncidentSession& session, const QJsonValue& value,
+                                                      bool* response_truncated = nullptr) const;
 
     [[nodiscard]] QJsonObject log_entry_to_json(const LogEntry& entry, bool include_children = true) const;
     static QJsonObject log_summary_to_json(const LogSession& session);
@@ -170,7 +200,7 @@ class DebugAnalysisService : public QObject {
     static std::vector<wosdbg::SectionMap*> section_maps(const DumpSession& session);
     static const DumpSession::LoadedModule* module_for_address(const DumpSession& session, uint64_t address);
     void add_module(DumpSession& session, const QString& path, const QString& role, uint64_t base, bool memory_matched);
-    void discover_modules(DumpSession& session);
+    void discover_modules(DumpSession& session, bool allow_external_discovery = true);
     static std::optional<uint64_t> parse_address_value(const QJsonValue& value);
     static std::optional<uint64_t> resolve_address_argument(const DumpSession& session, const QJsonObject& args,
                                                             const QString& default_register = QString());
@@ -197,4 +227,5 @@ class DebugAnalysisService : public QObject {
     Config* config = nullptr;
     QHash<QString, std::shared_ptr<LogSession>> log_sessions;
     QHash<QString, std::shared_ptr<DumpSession>> dump_sessions;
+    QHash<QString, std::shared_ptr<IncidentSession>> incident_sessions;
 };

@@ -180,7 +180,7 @@ void DebugToolPanel::execute_selected_tool() {
 }
 
 void DebugToolPanel::remember_context(const QJsonObject& result) {
-    for (const QString& key : {"dumpId", "logId"}) {
+    for (const QString& key : {"incidentId", "dumpId", "logId"}) {
         if (!result[key].toString().isEmpty()) {
             context[key] = result[key];
         }
