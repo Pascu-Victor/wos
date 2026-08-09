@@ -955,6 +955,34 @@ auto dir2_sf_iterate(XfsInode* dp, XfsDirIterFn fn, void* user_ctx) -> int {
 // Block-format directory operations
 // ============================================================================
 
+auto dir2_block_linear_lookup(const XfsMountContext* ctx, const uint8_t* block, size_t data_start, size_t data_end, const char* name,
+                              uint16_t namelen, XfsDirEntry* entry) -> int {
+    if (ctx == nullptr || block == nullptr || name == nullptr || entry == nullptr || data_start >= data_end) {
+        return -EINVAL;
+    }
+
+    size_t offset = data_start;
+    while (offset < data_end) {
+        uint16_t free_len = 0;
+        if (dir2_data_unused_at_if_valid(block, offset, data_end, &free_len)) {
+            offset += free_len;
+            continue;
+        }
+
+        const XfsDir2DataEntry* dep = nullptr;
+        size_t dep_size = 0;
+        if (!dir2_data_entry_at_if_valid(ctx, block, offset, data_end, &dep, &dep_size)) {
+            return -EINVAL;
+        }
+        if (dep->namelen == namelen && __builtin_memcmp(xfs_dir2_data_entry_name(dep), name, namelen) == 0) {
+            fill_dir_entry(ctx, dep, entry);
+            return 0;
+        }
+        offset += dep_size;
+    }
+    return offset == data_end ? -ENOENT : -EINVAL;
+}
+
 auto dir2_block_lookup_loaded(XfsInode* dp, BufHead* bh, const char* name, uint16_t namelen, XfsDirEntry* entry, bool log_bad_magic)
     -> int {
     XfsMountContext const* ctx = dp->mount;
@@ -1016,7 +1044,8 @@ auto dir2_block_lookup_loaded(XfsInode* dp, BufHead* bh, const char* name, uint1
     }
 
     if (!found) {
-        return -ENOENT;
+        int const FALLBACK = dir2_block_linear_lookup(ctx, block, DATA_START, DATA_END, name, namelen, entry);
+        return FALLBACK;
     }
 
     // Back up to the first entry with this hash
@@ -1047,7 +1076,7 @@ auto dir2_block_lookup_loaded(XfsInode* dp, BufHead* bh, const char* name, uint1
         }
     }
 
-    return -ENOENT;
+    return dir2_block_linear_lookup(ctx, block, DATA_START, DATA_END, name, namelen, entry);
 }
 
 auto dir2_block_iterate(XfsInode* dp, XfsDirIterFn fn, void* user_ctx) -> int {
@@ -4886,7 +4915,7 @@ auto xfs_selftest_directory_entry_index_membership() -> bool {
     return MATCHED && UNINDEXED && REPLACED_ENTRY_UNINDEXED && IO_ERROR_PROPAGATED;
 }
 
-auto xfs_selftest_block_lookup_uses_leaf_index_for_misses() -> bool {
+auto xfs_selftest_block_lookup_falls_back_for_unindexed_entries() -> bool {
     XfsMountContext mount{};
     mount.block_size = 4096;
     mount.block_log = 12;
@@ -4964,7 +4993,7 @@ auto xfs_selftest_block_lookup_uses_leaf_index_for_misses() -> bool {
     }
 
     entry = {};
-    if (dir2_block_lookup_loaded(&dir, &bh, "beta", 4, &entry, false) != -ENOENT) {
+    if (dir2_block_lookup_loaded(&dir, &bh, "beta", 4, &entry, false) != 0 || entry.ino != 84) {
         return false;
     }
 

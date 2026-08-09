@@ -248,7 +248,9 @@ KTEST(XFS, AuthoritativeLookupRepairsStaleNegative) {
 
 KTEST(XFS, DirectoryEntryIndexMembership) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_directory_entry_index_membership()); }
 
-KTEST(XFS, BlockLookupUsesLeafIndexForMisses) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_block_lookup_uses_leaf_index_for_misses()); }
+KTEST(XFS, BlockLookupFallsBackForUnindexedEntries) {
+    KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_block_lookup_falls_back_for_unindexed_entries());
+}
 
 KTEST(XFS, LeafIndexCompleteMarker) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_leaf_index_complete_marker()); }
 

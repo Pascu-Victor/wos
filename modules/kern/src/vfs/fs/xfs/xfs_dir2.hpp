@@ -136,7 +136,7 @@ void xfs_dentry_cache_invalidate_dir(XfsInode* dp);
 auto xfs_selftest_dentry_cache_shortform() -> bool;
 auto xfs_selftest_authoritative_lookup_repairs_stale_negative() -> bool;
 auto xfs_selftest_directory_entry_index_membership() -> bool;
-auto xfs_selftest_block_lookup_uses_leaf_index_for_misses() -> bool;
+auto xfs_selftest_block_lookup_falls_back_for_unindexed_entries() -> bool;
 auto xfs_selftest_leaf_index_complete_marker() -> bool;
 auto xfs_selftest_directory_name_filter() -> bool;
 auto xfs_selftest_dentry_cache_keeps_unrelated_dir_hot() -> bool;
