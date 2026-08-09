@@ -835,12 +835,31 @@ def test_task_exit_retires_remote_compute_wait_owners() -> None:
             "ker::vfs::vfs_put_file(file)",
             "delete[] task->elf_buffer",
             "threading::destroy_thread(task->thread)",
-            "release_file_mmap_ranges_for_pagemap(task->pagemap)",
+            "auto* pagemap = task->detach_pagemap_after_usercopy_quiescence()",
+            "release_file_mmap_ranges_for_pagemap(pagemap)",
             "mm::virt::destroy_user_space",
             "mm::virt::release_pagemap",
             "mm::phys::page_free",
         ],
         "complete unpublished-process teardown",
+    )
+    require_order(
+        teardown_resources,
+        "task->detach_pagemap_after_usercopy_quiescence()",
+        "release_file_mmap_ranges_for_pagemap(pagemap)",
+        "unpublished teardown must quiesce stable usercopy leases before releasing file mappings",
+    )
+    require_order(
+        teardown_resources,
+        "release_file_mmap_ranges_for_pagemap(pagemap)",
+        "mm::virt::destroy_user_space(pagemap",
+        "unpublished teardown must release file mappings before destroying the detached pagemap",
+    )
+    require_order(
+        teardown_resources,
+        "mm::virt::destroy_user_space(pagemap",
+        "mm::virt::release_pagemap(pagemap)",
+        "unpublished teardown must destroy the detached address space before dropping its root reference",
     )
     exclusive_check = function_body(task_source, "unpublished_process_is_exclusively_owned")
     require_tokens(

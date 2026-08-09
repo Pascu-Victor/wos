@@ -81,26 +81,35 @@ def require_futex_table_init_is_serialized(source: str) -> None:
 
 def require_futex_user_word_alignment_is_validated(source: str) -> None:
     for snippet in [
-        "auto futex_addr_is_aligned(const void* addr) -> bool",
-        "reinterpret_cast<uintptr_t>(addr) % alignof(int)",
+        "auto futex_addr_is_aligned(uint64_t addr) -> bool",
+        "addr % alignof(int)",
         "futex_selftest_addr_alignment_guard",
+        "StableUserPage futex_page",
+        "pin_task_user_page(*current_task, user_addr, false, true, futex_page)",
+        "futex_page.physical_address()",
+        "futex_page.still_mapped()",
+        "__atomic_load_n(kernel_addr, __ATOMIC_ACQUIRE)",
     ]:
         if snippet not in source:
             fail(f"futex alignment guard is missing snippet: {snippet}")
 
     for name in ["futex_wait", "futex_wake"]:
         body = function_body(source, name)
-        guard = body.find("if (!futex_addr_is_aligned(addr))")
-        translate = body.find("mod::mm::virt::translate")
+        guard = body.find("if (!futex_addr_is_aligned(user_addr))")
+        pin = body.find("pin_task_user_page")
         init = body.find("if (!ensure_futex_table())")
         if guard < 0:
             fail(f"{name} must reject unaligned futex words")
-        if translate >= 0 and guard > translate:
-            fail(f"{name} must reject unaligned futex words before address translation")
+        if pin >= 0 and guard > pin:
+            fail(f"{name} must reject unaligned futex words before stable pinning")
         if init >= 0 and guard > init:
             fail(f"{name} must reject unaligned futex words before futex table initialization")
         if "return -EINVAL;" not in body[guard : guard + 120]:
             fail(f"{name} unaligned futex guard must return -EINVAL")
+
+        for forbidden in ["mod::mm::virt::translate", "mod::mm::addr::get_virt_pointer"]:
+            if forbidden in body:
+                fail(f"{name} must not bypass stable usercopy with {forbidden}")
 
 
 def require_futex_wake_counts_only_claimed_waiters(source: str) -> None:
@@ -158,7 +167,7 @@ def require_futex_waiter_has_two_owner_lifetime(source: str) -> None:
 
 def require_futex_wake_honors_count_argument(source: str) -> None:
     sys_body = function_body(source, "sys_futex")
-    if "futex_wake(reinterpret_cast<int*>(a1), static_cast<int>(a2))" not in sys_body:
+    if "futex_wake(a1, static_cast<int>(a2))" not in sys_body:
         fail("FUTEX_WAKE must pass the caller wake count into futex_wake")
 
     limit_body = function_body(source, "futex_wake_limit_from_count")

@@ -6,6 +6,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 CORE_CPP = ROOT / "modules" / "kern" / "src" / "vfs" / "core.cpp"
+VFS_HPP = ROOT / "modules" / "kern" / "src" / "vfs" / "vfs.hpp"
+SYS_VFS_CPP = ROOT / "modules" / "kern" / "src" / "syscalls_impl" / "vfs" / "sys_vfs.cpp"
 WOS_SYSDEPS_CPP = ROOT / "toolchain" / "src" / "mlibc" / "sysdeps" / "wos" / "generic" / "sysdeps.cpp"
 WOS_SYSDEPS_HPP = ROOT / "toolchain" / "src" / "mlibc" / "sysdeps" / "wos" / "include" / "mlibc" / "sysdeps.hpp"
 
@@ -49,11 +51,15 @@ def require_order(source: str, tokens: list[str], context: str) -> None:
 
 def test_kernel_advisory_lock_table_is_real_state() -> None:
     source = CORE_CPP.read_text()
+    header = VFS_HPP.read_text()
+    require_tokens(
+        header,
+        ["struct VfsFlockAbi", "static_assert(sizeof(VfsFlockAbi) == 32)"],
+        "kernel advisory lock ABI snapshot",
+    )
     require_tokens(
         source,
         [
-            "struct VfsFlockAbi",
-            "static_assert(sizeof(VfsFlockAbi) == 32)",
             "constexpr int WOS_FLOCK_CMD = 0x5753464c",
             "enum class AdvisoryLockFamily",
             "enum class AdvisoryOwnerKind",
@@ -74,7 +80,10 @@ def test_kernel_advisory_lock_table_is_real_state() -> None:
 
 def test_kernel_fcntl_implements_posix_and_ofd_locks() -> None:
     source = CORE_CPP.read_text()
-    fcntl_body = function_body(source, r"auto\s+vfs_fcntl\(int\s+fd,\s*int\s+cmd,\s*uint64_t\s+arg\)\s*->\s*int")
+    fcntl_body = function_body(
+        source,
+        r"auto\s+vfs_fcntl\(int\s+fd,\s*int\s+cmd,\s*uint64_t\s+arg,\s*VfsFlockAbi\s*\*\s*flock\)\s*->\s*int",
+    )
     require_tokens(
         fcntl_body,
         [
@@ -84,10 +93,9 @@ def test_kernel_fcntl_implements_posix_and_ofd_locks() -> None:
             "case F_SETLKW_CMD:",
             "case F_OFD_SETLK_CMD:",
             "case F_OFD_SETLKW_CMD:",
-            "advisory_copy_from_user(arg, flock)",
-            "advisory_get_lock(f, ker::mod::sched::task::process_pid(*task), OWNER_KIND, AdvisoryLockFamily::RECORD, flock)",
-            "advisory_copy_to_user(arg, flock)",
-            "advisory_set_lock(f, ker::mod::sched::task::process_pid(*task), OWNER_KIND, AdvisoryLockFamily::RECORD, flock, WAIT)",
+            "flock == nullptr",
+            "advisory_get_lock(f, ker::mod::sched::task::process_pid(*task), OWNER_KIND, AdvisoryLockFamily::RECORD, *flock)",
+            "advisory_set_lock(f, ker::mod::sched::task::process_pid(*task), OWNER_KIND, AdvisoryLockFamily::RECORD, *flock, WAIT)",
             "case WOS_FLOCK_CMD:",
             "advisory_flock(f, static_cast<int>(arg))",
         ],
@@ -103,6 +111,22 @@ def test_kernel_fcntl_implements_posix_and_ofd_locks() -> None:
         ],
         "vfs_fcntl lock command grouping",
     )
+
+    syscall_source = SYS_VFS_CPP.read_text()
+    syscall_fcntl_body = function_body(syscall_source, r"case\s+ops::FCNTL:")
+    require_tokens(
+        syscall_fcntl_body,
+        [
+            "copy_value_from_task(*task, a3, flock)",
+            "ensure_writable(*task, a3, sizeof(flock))",
+            "vfs_fcntl(FD, CMD, 0, &flock)",
+            "copy_value_to_task(*task, a3, flock)",
+        ],
+        "fcntl syscall usercopy boundary",
+    )
+    for forbidden in ["advisory_copy_from_user", "advisory_copy_to_user"]:
+        if forbidden in source:
+            fail(f"VFS core must not access userspace through {forbidden}")
 
     set_body = function_body(
         source,

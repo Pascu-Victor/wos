@@ -1608,9 +1608,11 @@ def test_execve_publishes_new_context_before_old_image_teardown() -> None:
     require_tokens(
         body,
         [
-            "auto* old_pagemap_to_destroy = old_pagemap;",
+            "mm::paging::PageTable* old_pagemap_to_destroy = nullptr;",
             "auto* old_thread_to_destroy = old_thread;",
-            "task->pagemap = new_pagemap;",
+            "ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;",
+            "old_pagemap_has_other_publishers = mod::sched::task_has_live_pagemap_sibling(task);",
+            "old_pagemap_to_destroy = task->replace_pagemap_after_usercopy_quiescence(new_pagemap);",
             "task->thread = new_thread;",
             "mm::virt::release_pagemap(old_pagemap_to_destroy);",
             "mm::virt::release_pagemap(new_pagemap);",
@@ -1619,9 +1621,9 @@ def test_execve_publishes_new_context_before_old_image_teardown() -> None:
     )
     require_order(
         body,
-        "task->pagemap = new_pagemap;",
+        "old_pagemap_to_destroy = task->replace_pagemap_after_usercopy_quiescence(new_pagemap);",
         "ker::syscall::vmem::release_file_mmap_ranges_for_pagemap(old_pagemap_to_destroy);",
-        "execve must stop publishing the old pagemap before old-image teardown can block",
+        "execve must quiesce usercopy and stop publishing the old pagemap before old-image teardown can block",
     )
     require_order(
         body,
@@ -1631,6 +1633,7 @@ def test_execve_publishes_new_context_before_old_image_teardown() -> None:
     )
 
     forbidden = [
+        "task->pagemap = new_pagemap;",
         "mm::phys::page_free(old_pagemap)",
         "mm::phys::page_free(new_pagemap)",
         "mm::virt::switch_to_kernel_pagemap();\n        ker::syscall::vmem::release_file_mmap_ranges_for_pagemap(old_pagemap",

@@ -102,10 +102,14 @@ def test_syscall_layer_keeps_nonblock_call_local() -> None:
     require_order(
         source,
         [
-            "run_socket_call<int>(handle.file, sock, 0, [&](int flags)",
-            "sock->proto_ops->connect(sock, reinterpret_cast<const void*>(a2), static_cast<size_t>(a3), flags)",
+            "case ker::abi::net::ops::CONNECT:",
+            "ker::mod::sys::usercopy::copy_from_task(*task, a2, address.data(), ADDR_LEN)",
+            "run_socket_call<int>(handle.file, sock, 0,",
+            "sock->proto_ops->connect(sock, ADDR, ADDR_LEN, flags)",
+            "case ker::abi::net::ops::SEND:",
             "socket_send_user_bounced(",
             "handle.file, sock, a2, static_cast<size_t>(a3), static_cast<int>(a4)",
+            "case ker::abi::net::ops::RECV:",
             "socket_recv_user_bounced(",
             "handle.file, sock, a2, static_cast<size_t>(a3), static_cast<int>(a4)",
         ],

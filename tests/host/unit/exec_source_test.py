@@ -252,7 +252,7 @@ def require_spawn_actions_snapshot_user_memory_and_preserve_cloexec_sources(sour
     for snippet in [
         "usercopy::copy_value_from_task",
         "usercopy::copy_from_task",
-        "usercopy::copy_cstring_from_task",
+        "usercopy::copy_cstring_from_task_status",
         "snapshot.options.actions = ACTION_COUNT != 0 ? snapshot.actions.data() : nullptr",
     ]:
         if snippet not in snapshot:
@@ -270,13 +270,22 @@ def require_spawn_actions_snapshot_user_memory_and_preserve_cloexec_sources(sour
 
     spawn = function_body(source, "wos_proc_spawn")
     for snippet in [
+        "snapshot_exec_arguments(*parent, path_addr, argv_addr, envp_addr, arguments)",
         "new (std::nothrow) SpawnOptionsSnapshot",
-        "snapshot_spawn_options(*parent, options, *snapshot)",
-        "wos_proc_exec_impl(path, argv, envp, &snapshot->options, 0)",
+        "snapshot_spawn_options(*parent, options_addr, *snapshot)",
+        "wos_proc_exec_impl(arguments.path.data(), arguments.argv, arguments.envp, &snapshot->options, 0)",
         "delete snapshot",
     ]:
         if snippet not in spawn:
             fail(f"spawn syscall must own its options snapshot: {snippet}")
+
+    exec_entry = function_body(source, "wos_proc_exec")
+    for snippet in [
+        "snapshot_exec_arguments(*parent, path_addr, argv_addr, envp_addr, snapshot)",
+        "wos_proc_exec_impl(snapshot.path.data(), snapshot.argv, snapshot.envp, nullptr, 0)",
+    ]:
+        if snippet not in exec_entry:
+            fail(f"exec syscall must deep-snapshot user path/vector memory: {snippet}")
 
     exec_impl = function_body(source, "wos_proc_exec_impl")
     clone_pos = exec_impl.find("clone_exec_fd_table_checked(parent_task, new_task, spawn_options != nullptr)")

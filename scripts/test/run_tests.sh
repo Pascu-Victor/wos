@@ -157,6 +157,10 @@ UNIT_TESTS=(
     kernel_preemption_cpu_local_audit_test
     signal_source_test
     usercopy_source_test
+    net_usercopy_source_test
+    syscall_usercopy_manifest_test
+    syscall_usercopy_raw_access_test
+    usercopy_runtime_probe_source_test
     kasan_bootstrap_source_test
     signal_atomic_source_test
     phys_source_test

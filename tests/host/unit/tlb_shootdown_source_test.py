@@ -238,14 +238,24 @@ def require_flush_helper_reaches_remote_cpus(source: str) -> None:
 
 def require_mapping_mutations_use_shootdown(source: str) -> None:
     map_body = function_body(source, "map_page")
-    for snippet in [
-        "bool const REPLACED_TRANSLATION = OLD_ENTRY.present != 0 || is_reserved_leaf(OLD_ENTRY)",
+    map_order = [
+        "uint64_t const PIN_LOCK_FLAGS = user_mapping_pin_lock.lock_irqsave()",
+        "old_entry = entry",
+        "replaced_translation = old_entry.present != 0 || is_reserved_leaf(old_entry)",
+        "entry = paging::create_page_table_entry(PADDR, FLAGS)",
+        "user_mapping_pin_lock.unlock_irqrestore(PIN_LOCK_FLAGS)",
         "invalidate_local_tlb_if_current(page_table, VADDR, path_promoted)",
-        "if (path_promoted || REPLACED_TRANSLATION)",
+        "if (path_promoted || replaced_translation)",
         "shootdown_remote_user_pagemap(page_table, VADDR, path_promoted)",
-    ]:
-        if snippet not in map_body:
+        "if (replaced_present_frame)",
+        "drop_present_leaf_ref(old_entry)",
+    ]
+    cursor = 0
+    for snippet in map_order:
+        found = map_body.find(snippet, cursor)
+        if found < 0:
             fail(f"map_page must avoid remote waits for pure new mappings but flush replacements: {snippet}")
+        cursor = found + len(snippet)
 
     unmap_body = function_body(source, "unmap_page")
     flush = unmap_body.find("flush_pagemap_after_update(page_table, vaddr, false)")

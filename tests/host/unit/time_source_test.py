@@ -68,10 +68,11 @@ def test_setitimer_timevals_are_checked_and_saturating() -> None:
     )
     require_order(
         setitimer_body,
+        "copy_value_from_task(*task, arg2, new_value)",
         "uint64_t new_val_us = 0",
         "uint64_t new_interval_us = 0",
-        "relative_timeval_to_us(nv->it_value, new_val_us)",
-        "relative_timeval_to_us(nv->it_interval, new_interval_us)",
+        "relative_timeval_to_us(new_value.it_value, new_val_us)",
+        "relative_timeval_to_us(new_value.it_interval, new_interval_us)",
         "return static_cast<uint64_t>(-EINVAL)",
         "if (new_val_us == 0)",
         "task->itimer_real_expire_us = deadline_from_now_us(new_val_us)",
@@ -87,6 +88,38 @@ def test_setitimer_timevals_are_checked_and_saturating() -> None:
     present = [snippet for snippet in forbidden if snippet in setitimer_body]
     if present:
         fail(f"SETITIMER still has wrapping timeval/deadline arithmetic: {present[0]}")
+
+
+def test_time_syscalls_use_common_usercopy() -> None:
+    source = TIME_CPP.read_text()
+    body = function_body(source, "sys_time_get")
+
+    required = [
+        "copy_value_to_task(*task, arg1, tv)",
+        "copy_value_to_task(*task, arg1, ts)",
+        "copy_value_from_task(*task, arg1, req)",
+        "copy_value_to_task(*task, arg2, REMAINING)",
+        "ensure_writable(*task, arg1, sizeof(tms))",
+        "ensure_writable(*task, arg2, sizeof(clock_t))",
+        "copy_value_to_task(*task, arg1, process_times)",
+        "copy_value_to_task(*task, arg2, ELAPSED)",
+        "copy_value_from_task(*task, arg2, new_value)",
+        "copy_value_to_task(*task, arg2, current_value)",
+    ]
+    for snippet in required:
+        if snippet not in body:
+            fail(f"time syscall usercopy contract missing: {snippet}")
+
+    forbidden = [
+        "reinterpret_cast<timeval*>(arg1)",
+        "reinterpret_cast<struct timespec*>(arg1)",
+        "reinterpret_cast<const struct timespec*>(arg1)",
+        "reinterpret_cast<const Itimerval*>(arg2)",
+        "reinterpret_cast<Itimerval*>(arg2)",
+    ]
+    for snippet in forbidden:
+        if snippet in body:
+            fail(f"time syscall still dereferences a raw user pointer: {snippet}")
 
 
 def test_sntp_preserves_fractional_time_and_uses_four_timestamps() -> None:
@@ -115,6 +148,7 @@ def test_sntp_preserves_fractional_time_and_uses_four_timestamps() -> None:
 
 def main() -> None:
     test_setitimer_timevals_are_checked_and_saturating()
+    test_time_syscalls_use_common_usercopy()
     test_sntp_preserves_fractional_time_and_uses_four_timestamps()
     print("time syscall arithmetic and full-precision SNTP invariants hold")
 

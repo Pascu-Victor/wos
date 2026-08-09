@@ -136,9 +136,16 @@ def require_select_is_implemented_on_poll_core() -> None:
     require_order(
         select_case,
         "if (a1 > WOS_FD_SETSIZE)",
+        "std::array<uint8_t, WOS_FD_SET_BYTES> readfds{}",
+        "ker::mod::sys::usercopy::ensure_writable(*task, user_addr, set.size())",
+        "ker::mod::sys::usercopy::copy_from_task(*task, user_addr, set.data(), set.size())",
+        "ker::mod::sys::usercopy::copy_value_from_task(*task, a5, timeout)",
         "run_select(static_cast<size_t>(a1)",
-        "reinterpret_cast<const KSelectTimeval*>(a5)",
+        "a5 != 0 ? &timeout : nullptr",
+        "ker::mod::sys::usercopy::copy_to_task(*task, a2, readfds.data(), readfds.size())",
     )
+    if "reinterpret_cast<const KSelectTimeval*>(a5)" in select_case:
+        fail("select passes a raw userspace timeout into the poll core")
 
     select_timeout_body = function_body(source, "select_timeout_ms")
     require_order(
@@ -166,9 +173,16 @@ def require_select_is_implemented_on_poll_core() -> None:
     poll_case = body_after_marker(source, "case ker::abi::net::ops::POLL:")
     require_order(
         poll_case,
-        "auto* fds = reinterpret_cast<KPollFd*>(a1)",
-        'run_poll_wait(fds, nfds, timeout, "poll")',
+        "size_t const FDS_BYTES = NFDS * sizeof(KPollFd)",
+        "ker::mod::sys::usercopy::ensure_writable(*task, a1, FDS_BYTES)",
+        "new (std::nothrow) KPollFd[NFDS]",
+        "ker::mod::sys::usercopy::copy_from_task(*task, a1, fds, FDS_BYTES)",
+        'run_poll_wait(fds, NFDS, timeout, "poll")',
+        "ker::mod::sys::usercopy::copy_to_task(*task, a1, fds, FDS_BYTES)",
+        "delete[] fds",
     )
+    if "reinterpret_cast<KPollFd*>(a1)" in poll_case:
+        fail("poll passes a raw userspace array into the poll core")
 
 
 def require_preemptible_parking_rechecks_signals() -> None:

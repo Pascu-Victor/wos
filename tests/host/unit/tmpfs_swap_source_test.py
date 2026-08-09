@@ -77,10 +77,10 @@ def test_mount_data_and_tmpfs_size_cap_are_wired() -> None:
         sys_vfs,
         [
             "unsigned long const FLAGS = static_cast<unsigned long>(a4);",
-            "data = reinterpret_cast<const char*>(a5);",
-            "ker::vfs::vfs_mount(source, target, fstype, FLAGS, data)",
+            "copy_optional_path_from_user(a5, data, data_arg)",
+            "ker::vfs::vfs_mount(source_arg, target.data(), fstype.data(), FLAGS, data_arg)",
         ],
-        "kernel mount syscall must forward flags and data",
+        "kernel mount syscall must snapshot and forward flags and data",
     )
     require_tokens(
         mlibc_vfs,
@@ -201,8 +201,9 @@ def test_swapon_swapoff_are_appended_kernel_and_mlibc_abi_ops() -> None:
         [
             "case ker::abi::vmem::ops::SWAPON:",
             "case ker::abi::vmem::ops::SWAPOFF:",
-            "ker::mod::mm::swap::swapon_path(reinterpret_cast<const char*>(a1), static_cast<int>(a2))",
-            "ker::mod::mm::swap::swapoff_path(reinterpret_cast<const char*>(a1))",
+            "copy_cstring_from_task_strict(*task, a1, path.data(), path.size())",
+            "ker::mod::mm::swap::swapon_path(path.data(), static_cast<int>(a2))",
+            "ker::mod::mm::swap::swapoff_path(path.data())",
         ],
         "kernel VMEM swap syscall dispatch",
     )

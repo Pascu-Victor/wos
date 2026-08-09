@@ -254,17 +254,19 @@ def test_user_io_stack_bounces_are_producer_initialized() -> None:
             "if (READ_RET < 0)",
             "if (READ_RET == 0)",
             "auto const BYTES_READ = static_cast<size_t>(READ_RET)",
-            "copy_to_task(task, USER_BASE + total, BOUNCE_BUFFER, BYTES_READ)",
+            "copy_to_task_partial(task, USER_BASE + total, BOUNCE_BUFFER, BYTES_READ)",
+            "total += COPY.bytes_copied",
+            "if (COPY.fault)",
         ],
         "user read bounce initialization",
     )
 
     write_calls = {
         "vfs_write_user_bounced": (
-            "vfs_write_file_direct(file, BOUNCE_BUFFER, TO_WRITE, nullptr)"
+            "vfs_write_file_direct(file, BOUNCE_BUFFER, TO_COMMIT, nullptr)"
         ),
         "vfs_pwrite_user_bounced": (
-            "file->fops->vfs_write(file, BOUNCE_BUFFER, TO_WRITE, offset + total)"
+            "file->fops->vfs_write(file, BOUNCE_BUFFER, TO_COMMIT, offset + total)"
         ),
     }
     for name, backend_call in write_calls.items():
@@ -273,8 +275,9 @@ def test_user_io_stack_bounces_are_producer_initialized() -> None:
             body,
             [
                 declaration,
-                "copy_from_task(task, USER_BASE + total, BOUNCE_BUFFER, TO_WRITE)",
+                "copy_from_task_partial(task, USER_BASE + total, BOUNCE_BUFFER, TO_WRITE)",
                 "return total > 0",
+                "size_t const TO_COMMIT = COPY.bytes_copied",
                 backend_call,
             ],
             f"{name} stack bounce initialization",

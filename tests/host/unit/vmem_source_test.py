@@ -104,7 +104,7 @@ def test_munmap_and_mprotect_reject_overflowing_lengths() -> None:
     require_order(
         anon_free,
         "int const SIZE_RET = align_user_vmem_size(size, &size)",
-        "sync_file_mmap_range(task->pagemap, addr, size)",
+        "sync_file_mmap_range(*task, addr, size)",
         "munmap must validate overflow before side effects",
     )
     if "size = page_align_up(size)" in anon_free:
@@ -398,9 +398,9 @@ def test_mapping_replacement_releases_displaced_reference_after_tlb_flush() -> N
     require_tokens(
         map_body,
         [
-            "PageTableEntry const OLD_ENTRY = entry;",
-            "bool const REPLACED_PRESENT_FRAME",
-            "drop_present_leaf_ref(OLD_ENTRY);",
+            "PageTableEntry old_entry{};",
+            "bool replaced_present_frame",
+            "drop_present_leaf_ref(old_entry);",
         ],
         "single-page mapping replacement ownership",
     )
@@ -409,8 +409,8 @@ def test_mapping_replacement_releases_displaced_reference_after_tlb_flush() -> N
         [
             "entry = paging::create_page_table_entry(PADDR, FLAGS);",
             "shootdown_remote_user_pagemap(page_table, VADDR, path_promoted);",
-            "if (REPLACED_PRESENT_FRAME)",
-            "drop_present_leaf_ref(OLD_ENTRY);",
+            "if (replaced_present_frame)",
+            "drop_present_leaf_ref(old_entry);",
         ],
         "single-page replacement must invalidate before releasing the displaced frame",
     )
@@ -418,10 +418,10 @@ def test_mapping_replacement_releases_displaced_reference_after_tlb_flush() -> N
     require_tokens(
         batch_body,
         [
-            "PageTableEntry const OLD_ENTRY = entry;",
-            "bool const REPLACED_PRESENT_FRAME",
+            "PageTableEntry old_entry{};",
+            "bool replaced_present_frame",
             "flush_page_map_batch(batch);",
-            "drop_present_leaf_ref(OLD_ENTRY);",
+            "drop_present_leaf_ref(old_entry);",
         ],
         "batched mapping replacement ownership",
     )
@@ -429,9 +429,9 @@ def test_mapping_replacement_releases_displaced_reference_after_tlb_flush() -> N
         batch_body,
         [
             "entry = paging::create_page_table_entry(PADDR, FLAGS);",
-            "if (REPLACED_PRESENT_FRAME)",
+            "if (replaced_present_frame)",
             "flush_page_map_batch(batch);",
-            "drop_present_leaf_ref(OLD_ENTRY);",
+            "drop_present_leaf_ref(old_entry);",
         ],
         "batched replacement must invalidate before releasing the displaced frame",
     )
@@ -651,8 +651,11 @@ def test_thread_publication_is_serialized_with_shared_vmem_updates() -> None:
     require_ordered_tokens(
         create_case,
         [
+            "std::array<uint64_t, 2> prepared_stack_words{};",
+            "copy_from_task(*parent, user_sp, prepared_stack_words.data(), sizeof(prepared_stack_words))",
             "ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;",
-            "Task::create_user_thread(parent, tcb_va, user_sp, enter_va)",
+            "Task::create_user_thread(parent, tcb_va, user_sp, enter_va, prepared_stack_words.at(0),",
+            "prepared_stack_words.at(1));",
             "post_task_for_cpu(TARGET_CPU, t)",
         ],
         "thread lazy-range clone through scheduler publication",

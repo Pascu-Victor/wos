@@ -249,6 +249,22 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/usercopy_source_test.py
 )
 add_test(
+    NAME net_usercopy_source_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/net_usercopy_source_test.py
+)
+add_test(
+    NAME syscall_usercopy_manifest_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/syscall_usercopy_manifest_test.py
+)
+add_test(
+    NAME syscall_usercopy_raw_access_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/syscall_usercopy_raw_access_test.py
+)
+add_test(
+    NAME usercopy_runtime_probe_source_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/usercopy_runtime_probe_source_test.py
+)
+add_test(
     NAME kasan_bootstrap_source_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/kasan_bootstrap_source_test.py
 )
@@ -518,6 +534,10 @@ set_tests_properties(
     kernel_preemption_cpu_local_audit_test
     signal_source_test
     usercopy_source_test
+    net_usercopy_source_test
+    syscall_usercopy_manifest_test
+    syscall_usercopy_raw_access_test
+    usercopy_runtime_probe_source_test
     kasan_bootstrap_source_test
     signal_atomic_source_test
     phys_source_test

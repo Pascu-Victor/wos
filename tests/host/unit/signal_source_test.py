@@ -346,6 +346,50 @@ def test_synchronous_user_exceptions_can_reach_installed_signal_handlers_before_
     )
 
 
+def test_interrupt_and_scheduler_signal_paths_use_mapped_only_usercopy() -> None:
+    source = SIGNAL_CPP.read_text()
+
+    require_tokens(
+        source,
+        [
+            "auto write_signal_frame_mapped(",
+            "usercopy::copy_to_task_mapped(task, user_addr, src, size)",
+            "void sync_task_signal_mask_cache_mapped(sched::task::Task* task)",
+        ],
+        "mapped-only signal usercopy helpers",
+    )
+
+    restore = function_body(source, "restore_deferred_sigreturn")
+    require_tokens(
+        restore,
+        ["read_signal_frame_mapped(*task, FRAME_START, frame)", "sync_task_signal_mask_cache_mapped(task)"],
+        "deferred sigreturn must not fault user pages in scheduler context",
+    )
+    if "read_signal_frame(*task" in restore or "sync_task_signal_mask_cache(task)" in restore:
+        fail("deferred sigreturn contains faulting usercopy")
+
+    for name in [
+        "check_pending_signals_interrupt",
+        "deliver_synchronous_signal_interrupt",
+        "check_pending_signals_handoff",
+        "check_pending_signals_deferred",
+    ]:
+        body = function_body(source, name)
+        require_tokens(
+            body,
+            ["write_signal_frame_mapped(*task", "sync_task_signal_mask_cache_mapped(task)"],
+            f"{name} mapped-only usercopy",
+        )
+        if "write_signal_frame(*task" in body or "sync_task_signal_mask_cache(task)" in body:
+            fail(f"{name} contains faulting usercopy")
+
+    interrupt = function_body(source, "check_pending_signals_interrupt")
+    frame_copy = interrupt.find("if (!write_signal_frame_mapped(*task, FRAME_ADDR, sigframe))")
+    frame_commit = interrupt.find("task->signal_clear_pending_mask(1ULL << IDX)", frame_copy)
+    if frame_copy < 0 or frame_commit < frame_copy:
+        fail("an unmapped asynchronous signal frame must remain pending")
+
+
 def test_sigpending_is_wired_through_wos_sysdeps() -> None:
     process_callnums = PROCESS_CALLNUMS.read_text()
     process_source = PROCESS_CPP.read_text()
@@ -423,5 +467,6 @@ if __name__ == "__main__":
     test_signal_targets_are_user_canonical_on_all_delivery_paths()
     test_interrupt_signal_delivery_is_gated_by_user_return_frame()
     test_synchronous_user_exceptions_can_reach_installed_signal_handlers_before_coredump()
+    test_interrupt_and_scheduler_signal_paths_use_mapped_only_usercopy()
     test_sigpending_is_wired_through_wos_sysdeps()
     print("signal syscall return invariants hold")

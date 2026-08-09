@@ -29,6 +29,7 @@ set(SOURCES
     src/netbench.cpp
     src/perfbench.cpp
     src/thread_exit_stress.cpp
+    src/usercopy_negative.cpp
     src/mandelbench/lodepng.cpp
     src/mandelbench/mandelbench.cpp
     src/mandelbench/mandelbench_wki.cpp

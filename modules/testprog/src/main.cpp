@@ -39,6 +39,7 @@
 #include "netbench.hpp"
 #include "perfbench.hpp"
 #include "thread_exit_stress.hpp"
+#include "usercopy_negative.hpp"
 
 namespace {
 
@@ -638,6 +639,10 @@ auto main(int argc, char** argv, char** envp) -> int {
 
     if (command != nullptr && std::strcmp(command, "thread-exit-stress") == 0) {
         return run_thread_exit_stress(argc - 2, argv + 2);
+    }
+
+    if (command != nullptr && std::strcmp(command, "usercopy-negative") == 0) {
+        return run_usercopy_negative();
     }
 
     if (command != nullptr && std::strcmp(command, "mandelbench") == 0) {
