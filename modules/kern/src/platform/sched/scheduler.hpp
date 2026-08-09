@@ -8,6 +8,7 @@
 #include <platform/ktime/ktime.hpp>
 #include <platform/mm/dyn/kmalloc.hpp>
 #include <platform/perf/perf_events.hpp>
+#include <platform/sched/migration_guard.hpp>
 #include <platform/sched/run_heap.hpp>
 #include <platform/sched/task.hpp>
 #include <platform/sys/context_switch.hpp>
@@ -242,11 +243,27 @@ struct SchedulerCpuState {
     bool current_voluntary_block;
     bool current_wants_block;
     bool current_cpu_pinned;
+    uint64_t current_task_cpu;
+    uint8_t current_saved_frame_class;
+    uint8_t current_preemption_frame_class;
+    uint8_t current_preemption_reason;
+    uint64_t current_preemption_source_cpu;
+    uint64_t current_preemption_target_cpu;
     uint32_t current_preempt_depth;
     bool current_preempt_pending;
     uint64_t current_preempt_max_us;
     uint64_t current_preempt_owner;
     uint64_t current_preempt_start_us;
+    uint32_t current_migration_depth;
+    uint32_t current_migration_owner_cpu;
+    uint64_t current_migration_max_us;
+    uint64_t current_migration_owner;
+    uint64_t current_migration_start_us;
+    uint8_t current_migration_frame_class;
+    uint8_t current_migration_reason;
+    uint64_t current_migration_source_cpu;
+    uint64_t current_migration_target_cpu;
+    bool current_scheduler_transition;
     const char* current_wait_channel;
     uint8_t current_wait_kind;
     uint64_t current_perf_wait_callsite;
@@ -261,11 +278,27 @@ struct SchedulerCpuState {
     bool handoff_voluntary_block;
     bool handoff_wants_block;
     bool handoff_cpu_pinned;
+    uint64_t handoff_task_cpu;
+    uint8_t handoff_saved_frame_class;
+    uint8_t handoff_preemption_frame_class;
+    uint8_t handoff_preemption_reason;
+    uint64_t handoff_preemption_source_cpu;
+    uint64_t handoff_preemption_target_cpu;
     uint32_t handoff_preempt_depth;
     bool handoff_preempt_pending;
     uint64_t handoff_preempt_max_us;
     uint64_t handoff_preempt_owner;
     uint64_t handoff_preempt_start_us;
+    uint32_t handoff_migration_depth;
+    uint32_t handoff_migration_owner_cpu;
+    uint64_t handoff_migration_max_us;
+    uint64_t handoff_migration_owner;
+    uint64_t handoff_migration_start_us;
+    uint8_t handoff_migration_frame_class;
+    uint8_t handoff_migration_reason;
+    uint64_t handoff_migration_source_cpu;
+    uint64_t handoff_migration_target_cpu;
+    bool handoff_scheduler_transition;
     const char* handoff_wait_channel;
     uint8_t handoff_wait_kind;
     uint64_t handoff_perf_wait_callsite;
@@ -301,11 +334,26 @@ struct SchedulerRunQueueTaskState {
     bool voluntary_block;
     bool wants_block;
     bool cpu_pinned;
+    uint8_t saved_frame_class;
+    uint8_t preemption_frame_class;
+    uint8_t preemption_reason;
+    uint64_t preemption_source_cpu;
+    uint64_t preemption_target_cpu;
     uint32_t preempt_depth;
     bool preempt_pending;
     uint64_t preempt_owner;
     uint64_t preempt_start_us;
     uint64_t preempt_max_us;
+    uint32_t migration_depth;
+    uint32_t migration_owner_cpu;
+    uint64_t migration_owner;
+    uint64_t migration_start_us;
+    uint64_t migration_max_us;
+    uint8_t migration_frame_class;
+    uint8_t migration_reason;
+    uint64_t migration_source_cpu;
+    uint64_t migration_target_cpu;
+    bool scheduler_transition;
     const char* wait_channel;
     uint8_t wait_kind;
     uint64_t perf_wait_callsite;

@@ -12,9 +12,11 @@
 #include "platform/mm/mm.hpp"
 #include "platform/mm/paging.hpp"
 #include "platform/mm/virt.hpp"
+#include "platform/sched/frame_class.hpp"
 #include "platform/sched/scheduler.hpp"
 #include "platform/sched/task.hpp"
 #include "platform/sched/threading.hpp"
+#include "platform/sys/context_switch.hpp"
 #include "platform/sys/usercopy.hpp"
 #include "syscalls_impl/process/exit.hpp"
 
@@ -272,7 +274,9 @@ void sync_task_signal_mask_cache(sched::task::Task* task) {
 }
 
 auto restore_deferred_sigreturn(sched::task::Task* task) -> DeferredSigreturnResult {
-    if (task == nullptr || task->type != sched::task::TaskType::PROCESS || !task->do_sigreturn) {
+    if (task == nullptr || task->type != sched::task::TaskType::PROCESS || !task->do_sigreturn ||
+        !sched::task::saved_frame_restore_policy(task->context.saved_frame_class).validate_as_user ||
+        !context_switch::saved_frame_class_is_valid(task, task->context.frame)) {
         return DeferredSigreturnResult::NONE;
     }
 
@@ -307,6 +311,8 @@ auto restore_deferred_sigreturn(sched::task::Task* task) -> DeferredSigreturnRes
     task->context.frame.flags = frame.saved_rflags;
     task->context.frame.rsp = frame.saved_rsp;
     task->context.frame.ss = desc::gdt::GDT_USER_DS;
+    ker::mod::sys::context_switch::record_saved_frame_class(task, task->context.frame,
+                                                            sched::task::SavedFrameOrigin::SYNTHETIC_USER_RETURN);
     write_task_syscall_return(*task, frame.saved_rsp, frame.saved_rip, frame.saved_rflags);
 
     task->in_signal_handler = false;
@@ -314,6 +320,15 @@ auto restore_deferred_sigreturn(sched::task::Task* task) -> DeferredSigreturnRes
 }
 
 namespace {
+
+auto interrupt_frame_is_user_return(sched::task::Task* task, const gates::InterruptFrame& frame) -> bool {
+    if (task == nullptr) {
+        return false;
+    }
+    auto const FRAME_CLASS =
+        context_switch::classify_saved_frame(task, frame, sched::task::SavedFrameOrigin::INTERRUPT, task->is_voluntary_blocked());
+    return sched::task::saved_frame_restore_policy(FRAME_CLASS).deliver_signals;
+}
 
 auto is_job_control_stop_signal(int signo) -> bool {
     return signo == WOS_SIGSTOP || signo == WOS_SIGTSTP || signo == WOS_SIGTTIN || signo == WOS_SIGTTOU;
@@ -661,10 +676,8 @@ void check_pending_signals_interrupt(cpu::GPRegs& gpr, gates::InterruptFrame& fr
         return;
     }
 
-    // Only deliver on a direct return to userspace. Voluntary-blocked tasks
-    // can carry a kernel-mode context in frame/gpr and must use the existing
-    // deferred resume path instead.
-    if ((frame.cs & 0x3) != 0x3 || task->is_voluntary_blocked()) {
+    // Only USER_RETURN frames may construct a userspace signal frame.
+    if (!interrupt_frame_is_user_return(task, frame)) {
         return;
     }
 
@@ -763,7 +776,7 @@ auto deliver_synchronous_signal_interrupt(cpu::GPRegs& gpr, gates::InterruptFram
         return false;
     }
 
-    if ((frame.cs & 0x3) != 0x3 || task->is_voluntary_blocked() || task->in_signal_handler) {
+    if (!interrupt_frame_is_user_return(task, frame) || task->in_signal_handler) {
         return false;
     }
     if (signo <= 0) {
@@ -825,7 +838,7 @@ void check_pending_signals_handoff(sched::task::Task* task, cpu::GPRegs& gpr, ga
         return;
     }
 
-    if ((frame.cs & 0x3) != 0x3 || task->is_voluntary_blocked()) {
+    if (!interrupt_frame_is_user_return(task, frame)) {
         return;
     }
 
@@ -888,6 +901,7 @@ void check_pending_signals_handoff(sched::task::Task* task, cpu::GPRegs& gpr, ga
     task->in_signal_handler = true;
     task->context.regs = gpr;
     task->context.frame = frame;
+    ker::mod::sys::context_switch::record_saved_frame_class(task, task->context.frame, sched::task::SavedFrameOrigin::INTERRUPT);
 }
 
 void check_pending_signals_deferred(sched::task::Task* task, DeferredSignalDelivery delivery) {
@@ -899,11 +913,9 @@ void check_pending_signals_deferred(sched::task::Task* task, DeferredSignalDeliv
         ker::syscall::process::exit_current_if_process_exit_requested();
     }
 
-    // A PROCESS can be resumed here with a saved kernel frame when it was
-    // preempted at a voluntary syscall wait point. Signal frames must only be
-    // built on a real user stack; the syscall/interrupt return paths will
-    // deliver the signal once the task reaches a user-mode return boundary.
-    if ((task->context.frame.cs & 0x3) != 0x3 || task->is_voluntary_blocked()) {
+    // Signal frames must only be built from a validated USER_RETURN context.
+    if (!sched::task::saved_frame_restore_policy(task->context.saved_frame_class).deliver_signals ||
+        !context_switch::saved_frame_class_is_valid(task, task->context.frame)) {
         return;
     }
 

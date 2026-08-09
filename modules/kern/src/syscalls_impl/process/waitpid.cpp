@@ -9,6 +9,7 @@
 #include <platform/dbg/dbg.hpp>
 #include <platform/mm/virt.hpp>
 #include <platform/sched/epoch.hpp>
+#include <platform/sched/migration_guard.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
 #include <platform/sys/usercopy.hpp>
@@ -410,6 +411,7 @@ void capture_wait_resume_debug(ker::mod::sched::task::Task* task, ker::mod::cpu:
 }  // namespace
 
 auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t rusage_vaddr, ker::mod::cpu::GPRegs& gpr) -> uint64_t {
+    ker::mod::sched::MigrationGuard const MIGRATION_GUARD;
     ker::mod::sched::EpochGuard const EPOCH_GUARD;
 
     auto* current_task = ker::mod::sched::get_current_task();

@@ -25,6 +25,7 @@
 #include "platform/mm/virt.hpp"
 #include "platform/perf/perf_events.hpp"
 #include "platform/power/power.hpp"
+#include "platform/sched/frame_class.hpp"
 #include "platform/sched/scheduler.hpp"
 #include "platform/sched/task.hpp"
 #include "platform/sched/threading.hpp"
@@ -615,6 +616,8 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
         child->context.frame.int_num = 0;
         child->context.frame.err_code = 0;
     }
+    ker::mod::sys::context_switch::record_saved_frame_class(child, child->context.frame,
+                                                            ker::mod::sched::task::SavedFrameOrigin::SYNTHETIC_USER_RETURN);
 
     log_unmapped_child_resume_state(parent, child, return_rip, user_rsp, return_flags);
 
@@ -1139,6 +1142,8 @@ auto wos_proc_clone_vm(uint64_t args_addr) -> uint64_t {
     child->context.frame.flags = 0x202;
     child->context.frame.cs = desc::gdt::GDT_USER_CS;
     child->context.frame.ss = desc::gdt::GDT_USER_DS;
+    ker::mod::sys::context_switch::record_saved_frame_class(child, child->context.frame,
+                                                            ker::mod::sched::task::SavedFrameOrigin::SYNTHETIC_USER_RETURN);
 
     if (!clone_fd_table_shared_checked(parent, child)) {
         cleanup_child();

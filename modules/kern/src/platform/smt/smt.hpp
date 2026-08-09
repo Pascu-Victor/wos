@@ -64,6 +64,9 @@ class PerCpuVar {
         }
     }
 
+    // References/pointers from these accessors are CPU-local capabilities.
+    // Do not retain them across a potentially preemptible call unless the
+    // caller holds sched::MigrationGuard (or stronger preemption/IRQ exclusion).
     T& get() { return data[cpu::current_cpu()]; }
 
     auto operator->() -> T* { return &data[cpu::current_cpu()]; }
@@ -129,8 +132,10 @@ class PerCpuCrossAccess {
         }
     }
 
-    // Access current CPU's data (no locking needed - only this CPU accesses it)
-    // WARNING: Use thisCpuLocked() if other CPUs might be modifying via withLock!
+    // Access current CPU's data (no locking needed - only this CPU accesses it).
+    // The returned pointer must not cross a potentially preemptible call unless
+    // migration is disabled (or preemption/IRQs are already disabled).
+    // WARNING: Use this_cpu_locked() if other CPUs might modify via with_lock().
     auto this_cpu() -> T* { return &data[cpu::current_cpu()]; }
 
     // Locked access to current CPU's data - use when other CPUs might modify via withLock

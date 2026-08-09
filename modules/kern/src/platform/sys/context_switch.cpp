@@ -11,6 +11,8 @@
 #include <platform/init/limine_requests.hpp>
 #include <platform/ktime/ktime.hpp>
 #include <platform/sched/epoch.hpp>
+#include <platform/sched/frame_class.hpp>
+#include <platform/sched/preemption_policy.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <util/hcf.hpp>
 #ifdef WOS_KASAN
@@ -30,6 +32,7 @@
 
 namespace ker::mod::sys::context_switch {
 extern "C" void wos_kernel_idle_loop();                               // NOLINT(readability-identifier-naming)
+extern "C" void wos_kernel_idle_loop_end();                           // NOLINT(readability-identifier-naming)
 extern "C" void wos_kernel_thread_trampoline();                       // NOLINT(readability-identifier-naming)
 extern "C" [[noreturn]] void wos_enterIdleStack(uint64_t stack_top);  // NOLINT(readability-identifier-naming)
 extern "C" char __kernel_text_start[];                                // NOLINT(readability-identifier-naming)
@@ -60,7 +63,7 @@ inline auto is_kernel_text_pointer(uint64_t rip) -> bool {
     return rip >= TEXT_START && rip < TEXT_END;
 }
 
-inline auto stack_belongs_to_task(sched::task::Task* task, uint64_t rsp) -> bool {
+inline auto stack_belongs_to_task(const sched::task::Task* task, uint64_t rsp) -> bool {
     if (task == nullptr || !valid_kernel_stack(task->context.syscall_kernel_stack)) {
         return false;
     }
@@ -122,11 +125,9 @@ inline void panic_bad_handoff_stack(sched::task::Task* task, const char* reason)
 
 inline void validate_kernel_frame(const gates::InterruptFrame& frame, sched::task::Task* task, const char* path) {
     if (frame.cs == desc::gdt::GDT_USER_CS) {
-        if (task != nullptr && task->type == sched::task::TaskType::PROCESS) {
-            return;
-        }
         dbg::logger<"ctxswitch">::error(
-            "user return frame for non-process: path=%s pid=%lu name=%s type=%u ss=0x%llx rip=0x%llx rsp=0x%llx flags=0x%llx task=%p",
+            "user return frame passed to kernel validator: path=%s pid=%lu name=%s type=%u ss=0x%llx rip=0x%llx rsp=0x%llx "
+            "flags=0x%llx task=%p",
             path != nullptr ? path : "?", task != nullptr ? task->pid : 0, (task != nullptr && task->name != nullptr) ? task->name : "?",
             task != nullptr ? static_cast<unsigned>(task->type) : 0U, static_cast<unsigned long long>(frame.ss),
             static_cast<unsigned long long>(frame.rip), static_cast<unsigned long long>(frame.rsp),
@@ -146,8 +147,7 @@ inline void validate_kernel_frame(const gates::InterruptFrame& frame, sched::tas
 
     const bool RIP_BAD = !is_kernel_text_pointer(frame.rip);
     const bool RSP_BAD = !valid_kernel_stack(frame.rsp);
-    const bool STACK_OWNER_BAD = K_ENABLE_SCHED_VALIDATE_CONTEXT && task != nullptr && task->type != sched::task::TaskType::IDLE &&
-                                 !stack_belongs_to_task(task, frame.rsp);
+    const bool STACK_OWNER_BAD = task != nullptr && task->type != sched::task::TaskType::IDLE && !stack_belongs_to_task(task, frame.rsp);
     const bool FLAGS_BAD = (frame.flags & 0x2ULL) == 0;
     const bool SS_BAD = frame.ss != desc::gdt::GDT_KERN_DS;
     if (!RIP_BAD && !RSP_BAD && !STACK_OWNER_BAD && !FLAGS_BAD && !SS_BAD) {
@@ -198,7 +198,8 @@ inline void validate_user_frame(const gates::InterruptFrame& frame, sched::task:
 
 inline auto is_idle_return_frame(const gates::InterruptFrame& frame, sched::task::Task* task) -> bool {
     return task != nullptr && task->type == sched::task::TaskType::IDLE && frame.cs == desc::gdt::GDT_KERN_CS &&
-           frame.rip == reinterpret_cast<uint64_t>(wos_kernel_idle_loop);
+           sched::task::idle_loop_resume_ip_is_valid(frame.rip, reinterpret_cast<uint64_t>(wos_kernel_idle_loop),
+                                                     reinterpret_cast<uint64_t>(wos_kernel_idle_loop_end));
 }
 
 inline auto is_user_return_frame(const gates::InterruptFrame& frame) -> bool { return (frame.cs & 0x3ULL) == 0x3ULL; }
@@ -252,15 +253,17 @@ void debug_validate_clang_return(const char* path, sched::task::Task* task, cons
         static_cast<unsigned long long>(EXPECTED_R13), static_cast<unsigned long long>(gpr.rbp), static_cast<unsigned long long>(gpr.r12),
         static_cast<unsigned long long>(gpr.r14), static_cast<unsigned long long>(gpr.r15), static_cast<unsigned long long>(gpr.rcx),
         task->in_signal_handler ? 1U : 0U, task->do_sigreturn ? 1U : 0U,
-        static_cast<unsigned long long>(task->sig_pending.load(std::memory_order_acquire)));
+        static_cast<unsigned long long>(task->signal_pending_bits(std::memory_order_acquire)));
 }
 
 inline void check_pending_signals_for_return(cpu::GPRegs& gpr, gates::InterruptFrame& frame) {
-    if (!is_user_return_frame(frame)) {
+    auto* return_task = sched::get_return_task();
+    auto const POLICY = return_task != nullptr ? sched::task::saved_frame_restore_policy(return_task->context.saved_frame_class)
+                                               : sched::task::SavedFrameRestorePolicy{};
+    if (return_task == nullptr || !POLICY.deliver_signals || !saved_frame_class_is_valid(return_task, frame)) {
         return;
     }
 
-    auto* return_task = sched::get_return_task();
     if (return_task == sched::get_current_task()) {
         sys::signal::check_pending_signals_interrupt(gpr, frame);
     } else {
@@ -386,12 +389,146 @@ auto defer_process_reschedule_to_syscall_exit() -> bool {
 
 auto can_request_local_reschedule() -> bool { return current_stack_allows_local_reschedule(); }
 
+void validate_handoff_stack_ownership(const sched::task::Task* outgoing, const sched::task::Task* incoming, const char* path) {
+    bool const OWNERSHIP_CHANGES = outgoing != nullptr && incoming != nullptr && outgoing != incoming;
+    uint64_t const OUTGOING_STACK = outgoing != nullptr ? outgoing->context.syscall_kernel_stack : 0;
+    uint64_t const INCOMING_STACK = incoming != nullptr ? incoming->context.syscall_kernel_stack : 0;
+    if (!sched::handoff_stack_collision(OUTGOING_STACK, INCOMING_STACK, OWNERSHIP_CHANGES)) {
+        return;
+    }
+
+    dbg::logger<"ctxswitch">::error(
+        "kernel stack ownership collision: path=%s outgoing=%p pid=%lu name=%s incoming=%p pid=%lu name=%s stack=0x%llx",
+        path != nullptr ? path : "?", static_cast<const void*>(outgoing), outgoing->pid, outgoing->name != nullptr ? outgoing->name : "?",
+        static_cast<const void*>(incoming), incoming->pid, incoming->name != nullptr ? incoming->name : "?",
+        static_cast<unsigned long long>(INCOMING_STACK));
+    hcf();
+}
+
+auto classify_saved_frame(const sched::task::Task* task, const gates::InterruptFrame& frame, sched::task::SavedFrameOrigin origin,
+                          bool voluntary_process) -> sched::task::SavedFrameClass {
+    using sched::task::SavedFrameClassificationInput;
+    using sched::task::SavedFrameOwner;
+    using sched::task::SavedFrameSelectors;
+
+    if (task == nullptr) {
+        return sched::task::SavedFrameClass::INVALID;
+    }
+
+    SavedFrameClassificationInput input{};
+    input.origin = origin;
+    input.voluntary_process = voluntary_process;
+    input.timer_interrupt = frame.int_num == gates::IRQ0 && frame.err_code == 0;
+
+    switch (task->type) {
+        case sched::task::TaskType::PROCESS:
+            input.owner = SavedFrameOwner::PROCESS;
+            break;
+        case sched::task::TaskType::DAEMON:
+            input.owner = SavedFrameOwner::DAEMON;
+            break;
+        case sched::task::TaskType::IDLE:
+            input.owner = SavedFrameOwner::IDLE;
+            break;
+    }
+
+    if (frame.cs == desc::gdt::GDT_USER_CS && frame.ss == desc::gdt::GDT_USER_DS) {
+        input.selectors = SavedFrameSelectors::USER;
+        input.instruction_pointer_valid = valid_user_resume_scalar(frame.rip);
+        input.stack_pointer_valid = valid_user_resume_scalar(frame.rsp);
+        input.flags_valid = valid_user_rflags(frame.flags);
+    } else if (frame.cs == desc::gdt::GDT_KERN_CS && frame.ss == desc::gdt::GDT_KERN_DS) {
+        input.selectors = SavedFrameSelectors::KERNEL;
+        input.instruction_pointer_valid = is_kernel_text_pointer(frame.rip);
+        input.stack_pointer_valid = stack_belongs_to_task(task, frame.rsp);
+        input.flags_valid = (frame.flags & USER_RFLAGS_FIXED_ONE) != 0;
+    }
+
+    return sched::task::classify_saved_frame(input);
+}
+
+void record_saved_frame_class(sched::task::Task* task, const gates::InterruptFrame& frame, sched::task::SavedFrameOrigin origin) {
+    if (task == nullptr) {
+        return;
+    }
+    task->context.saved_frame_class = classify_saved_frame(task, frame, origin, task->is_voluntary_blocked());
+}
+
+namespace {
+auto classified_frame_is_valid(const sched::task::Task* task, const gates::InterruptFrame& frame, sched::task::SavedFrameClass frame_class)
+    -> bool {
+    if (task == nullptr) {
+        return false;
+    }
+
+    switch (frame_class) {
+        case sched::task::SavedFrameClass::USER_RETURN:
+            return classify_saved_frame(task, frame, sched::task::SavedFrameOrigin::SYNTHETIC_USER_RETURN, false) == frame_class;
+        case sched::task::SavedFrameClass::VOLUNTARY_PARKED_KERNEL:
+            return classify_saved_frame(task, frame, sched::task::SavedFrameOrigin::INTERRUPT, true) == frame_class;
+        case sched::task::SavedFrameClass::TIMER_PREEMPTED_PROCESS_KERNEL:
+            return classify_saved_frame(task, frame, sched::task::SavedFrameOrigin::INTERRUPT, false) == frame_class;
+        case sched::task::SavedFrameClass::DAEMON_KERNEL: {
+            auto const ORIGIN = (frame.int_num == gates::IRQ0 && frame.err_code == 0) ? sched::task::SavedFrameOrigin::INTERRUPT
+                                                                                      : sched::task::SavedFrameOrigin::DAEMON_START;
+            return classify_saved_frame(task, frame, ORIGIN, false) == frame_class;
+        }
+        case sched::task::SavedFrameClass::INVALID:
+            return false;
+    }
+    return false;
+}
+
+void validate_classified_frame_for_restore(sched::task::Task* task, const gates::InterruptFrame& frame,
+                                           sched::task::SavedFrameClass frame_class, const char* path) {
+    if (is_idle_return_frame(frame, task)) {
+        validate_kernel_frame(frame, task, path);
+        return;
+    }
+
+    auto const POLICY = sched::task::saved_frame_restore_policy(frame_class);
+    if (task == nullptr || POLICY.kind == sched::task::SavedFrameRestoreKind::REJECT ||
+        !classified_frame_is_valid(task, frame, frame_class)) {
+        dbg::logger<"ctxswitch">::error(
+            "invalid classified return frame: path=%s pid=%lu name=%s class=%s restore=%s cs=0x%llx ss=0x%llx rip=0x%llx "
+            "rsp=0x%llx flags=0x%llx task=%p",
+            path != nullptr ? path : "?", task != nullptr ? task->pid : 0, (task != nullptr && task->name != nullptr) ? task->name : "?",
+            sched::task::saved_frame_class_name(frame_class), sched::task::saved_frame_restore_kind_name(POLICY.kind),
+            static_cast<unsigned long long>(frame.cs), static_cast<unsigned long long>(frame.ss),
+            static_cast<unsigned long long>(frame.rip), static_cast<unsigned long long>(frame.rsp),
+            static_cast<unsigned long long>(frame.flags), static_cast<void*>(task));
+        hcf();
+    }
+
+    if (POLICY.kind == sched::task::SavedFrameRestoreKind::USER_IRET) {
+        validate_user_frame(frame, task, path);
+        return;
+    }
+    if (POLICY.kind == sched::task::SavedFrameRestoreKind::SAME_CPL_KERNEL_IRET) {
+        validate_kernel_frame(frame, task, path);
+        return;
+    }
+
+    hcf();
+}
+}  // namespace
+
+auto saved_frame_class_is_valid(const sched::task::Task* task, const gates::InterruptFrame& frame) -> bool {
+    return task != nullptr && classified_frame_is_valid(task, frame, task->context.saved_frame_class);
+}
+
+void validate_saved_frame_for_restore(sched::task::Task* task, const gates::InterruptFrame& frame, const char* path) {
+    auto const FRAME_CLASS = task != nullptr ? task->context.saved_frame_class : sched::task::SavedFrameClass::INVALID;
+    validate_classified_frame_for_restore(task, frame, FRAME_CLASS, path);
+}
+
 auto normalize_user_return_flags(uint64_t flags) -> uint64_t { return flags | USER_RFLAGS_REQUIRED_MASK; }
 
 auto valid_user_return_flags(uint64_t flags) -> bool { return valid_user_rflags(flags); }
 
 void normalize_process_user_return_state(sched::task::Task* task) {
-    if (task == nullptr || task->type != sched::task::TaskType::PROCESS || task->is_voluntary_blocked()) {
+    if (task == nullptr || task->type != sched::task::TaskType::PROCESS ||
+        task->context.saved_frame_class != sched::task::SavedFrameClass::USER_RETURN) {
         return;
     }
 
@@ -411,7 +548,9 @@ void normalize_process_user_return_state(sched::task::Task* task) {
 }
 
 auto repair_stale_process_syscall_resume(sched::task::Task* task) -> bool {
-    if (task == nullptr || task->type != sched::task::TaskType::PROCESS || task->is_voluntary_blocked() ||
+    if (task == nullptr || task->type != sched::task::TaskType::PROCESS ||
+        task->context.saved_frame_class == sched::task::SavedFrameClass::VOLUNTARY_PARKED_KERNEL ||
+        task->context.saved_frame_class == sched::task::SavedFrameClass::TIMER_PREEMPTED_PROCESS_KERNEL ||
         task->context.syscall_scratch_area == 0 || task->deferred_task_switch || task->wants_block || task->wait_channel != nullptr) {
         return false;
     }
@@ -455,6 +594,7 @@ auto repair_stale_process_syscall_resume(sched::task::Task* task) -> bool {
     task->context.frame.ss = desc::gdt::GDT_USER_DS;
     scratch->syscall_ret_flags = NORMALIZED_FLAGS;
     task->set_voluntary_blocked(false);
+    record_saved_frame_class(task, task->context.frame, sched::task::SavedFrameOrigin::SYNTHETIC_USER_RETURN);
 
     static std::atomic<uint64_t> repair_count{0};
     uint64_t const N = repair_count.fetch_add(1, std::memory_order_relaxed);
@@ -566,6 +706,13 @@ alignas(64) std::array<uint8_t, cpu::XSAVE_STATIC_AREA_SIZE> initial_fpu_state{}
 std::atomic<int> initial_fpu_state_status{0};
 std::array<std::atomic<sched::task::Task*>, desc::gdt::MAX_CPUS> fpu_owner{};
 std::array<std::atomic<bool>, desc::gdt::MAX_CPUS> timer_fpu_restore_suppressed{};
+std::array<std::atomic<sched::task::Task*>, desc::gdt::MAX_CPUS> timer_fpu_return_task{};
+std::array<std::atomic<uint8_t>, desc::gdt::MAX_CPUS> timer_fpu_return_frame_class{};
+
+struct TimerFpuReturnAuthorization {
+    sched::task::Task* task{};
+    sched::task::SavedFrameClass frame_class{sched::task::SavedFrameClass::INVALID};
+};
 
 auto cmdline_has_token(const char* cmdline, const char* token) -> bool;
 
@@ -591,6 +738,42 @@ auto consume_timer_fpu_restore_suppressed() -> bool {
         return false;
     }
     return slot->exchange(false, std::memory_order_acq_rel);
+}
+
+void clear_timer_fpu_return_authorization() {
+    uint64_t const CPU_ID = cpu::current_cpu();
+    if (CPU_ID >= timer_fpu_return_task.size()) {
+        return;
+    }
+
+    timer_fpu_return_frame_class[static_cast<size_t>(CPU_ID)].store(static_cast<uint8_t>(sched::task::SavedFrameClass::INVALID),
+                                                                    std::memory_order_release);
+    timer_fpu_return_task[static_cast<size_t>(CPU_ID)].store(nullptr, std::memory_order_release);
+}
+
+void set_timer_fpu_return_authorization(sched::task::Task* task, sched::task::SavedFrameClass frame_class) {
+    uint64_t const CPU_ID = cpu::current_cpu();
+    if (CPU_ID >= timer_fpu_return_task.size()) {
+        return;
+    }
+
+    timer_fpu_return_task[static_cast<size_t>(CPU_ID)].store(task, std::memory_order_relaxed);
+    timer_fpu_return_frame_class[static_cast<size_t>(CPU_ID)].store(static_cast<uint8_t>(frame_class), std::memory_order_release);
+}
+
+auto consume_timer_fpu_return_authorization() -> TimerFpuReturnAuthorization {
+    uint64_t const CPU_ID = cpu::current_cpu();
+    if (CPU_ID >= timer_fpu_return_task.size()) {
+        return {};
+    }
+
+    auto const FRAME_CLASS = static_cast<sched::task::SavedFrameClass>(timer_fpu_return_frame_class[static_cast<size_t>(CPU_ID)].exchange(
+        static_cast<uint8_t>(sched::task::SavedFrameClass::INVALID), std::memory_order_acq_rel));
+    auto* task = timer_fpu_return_task[static_cast<size_t>(CPU_ID)].exchange(nullptr, std::memory_order_acq_rel);
+    return {
+        .task = task,
+        .frame_class = FRAME_CLASS,
+    };
 }
 
 auto local_fpu_owner_slot() -> std::atomic<sched::task::Task*>* {
@@ -798,12 +981,27 @@ extern "C" void wos_user_interrupt_restore_fpu(sched::task::Task* saved_task) {
 }
 
 extern "C" void wos_restore_return_task_fpu() {
-    if (consume_timer_fpu_restore_suppressed()) {
-        return;
-    }
-
     auto* task = sched::get_return_task();
-    if (task == nullptr || task->type != sched::task::TaskType::PROCESS) {
+    auto const TIMER_AUTHORIZATION = consume_timer_fpu_return_authorization();
+    auto const DURABLE_FRAME_CLASS = task != nullptr ? task->context.saved_frame_class : sched::task::SavedFrameClass::INVALID;
+    bool const TIMER_AUTHORIZATION_PRESENT =
+        TIMER_AUTHORIZATION.task != nullptr || TIMER_AUTHORIZATION.frame_class != sched::task::SavedFrameClass::INVALID;
+    bool const TIMER_RETURN_MATCHES_TASK = TIMER_AUTHORIZATION.task == task && TIMER_AUTHORIZATION.task != nullptr;
+    auto const FPU_FRAME_CLASS =
+        sched::task::select_user_fpu_restore_frame_class(TIMER_RETURN_MATCHES_TASK, TIMER_AUTHORIZATION.frame_class, DURABLE_FRAME_CLASS);
+    auto const POLICY = sched::task::saved_frame_restore_policy(FPU_FRAME_CLASS);
+    bool const DURABLE_FRAME_VALID = task != nullptr && saved_frame_class_is_valid(task, task->context.frame);
+    bool const FRAME_PROVENANCE_VALID = TIMER_RETURN_MATCHES_TASK || DURABLE_FRAME_VALID;
+    if (task == nullptr || task->type != sched::task::TaskType::PROCESS || (TIMER_AUTHORIZATION_PRESENT && !TIMER_RETURN_MATCHES_TASK) ||
+        !POLICY.restore_user_fpu || !FRAME_PROVENANCE_VALID) {
+        dbg::logger<"ctxswitch">::error(
+            "user FPU restore without user provenance: pid=%lu durable=%s timer=%s timer_task=%p task=%p restore=%s",
+            task != nullptr ? task->pid : 0, sched::task::saved_frame_class_name(DURABLE_FRAME_CLASS),
+            sched::task::saved_frame_class_name(TIMER_AUTHORIZATION.frame_class), static_cast<void*>(TIMER_AUTHORIZATION.task),
+            static_cast<void*>(task), sched::task::saved_frame_restore_kind_name(POLICY.kind));
+        hcf();
+    }
+    if (consume_timer_fpu_restore_suppressed()) {
         return;
     }
     if (local_fpu_owner() == task && !task->fx_state.live_saved) {
@@ -950,6 +1148,16 @@ auto switch_to(cpu::GPRegs& gpr, gates::InterruptFrame& frame, sched::task::Task
         return false;
     }
 
+    validate_handoff_stack_ownership(sched::get_current_task(), next_task, "switchTo-prepare");
+
+    validate_saved_frame_for_restore(next_task, next_task->context.frame, "switchTo-prepare");
+    auto const RESTORE_POLICY = sched::task::saved_frame_restore_policy(next_task->context.saved_frame_class);
+    if (RESTORE_POLICY.kind == sched::task::SavedFrameRestoreKind::USER_IRET) {
+        static_cast<void>(sys::signal::restore_deferred_sigreturn(next_task));
+        normalize_process_user_return_state(next_task);
+        validate_saved_frame_for_restore(next_task, next_task->context.frame, "switchTo-user-state");
+    }
+
     // === POINT OF NO RETURN ===
     // After this point, we MUST complete the context switch.
     // The epoch guard in processTasks ensures the task struct and its resources
@@ -962,70 +1170,23 @@ auto switch_to(cpu::GPRegs& gpr, gates::InterruptFrame& frame, sched::task::Task
     update_debug_task_ptr(next_task, REAL_CPU_ID);
     desc::gdt::set_rsp0(reinterpret_cast<uint64_t*>(next_task->context.syscall_kernel_stack), REAL_CPU_ID);
 
-    // Now safe to modify interrupt frame and registers.
-    if (next_task->type == sched::task::TaskType::DAEMON && !valid_kernel_stack(next_task->context.frame.rsp) &&
-        valid_kernel_stack(next_task->context.syscall_kernel_stack)) {
-        dbg::logger<"ctxswitch">::warn("repairing daemon rsp before switch: pid=%lu name=%s frame_rsp=0x%llx stack=0x%llx", next_task->pid,
-                                       next_task->name != nullptr ? next_task->name : "?",
-                                       static_cast<unsigned long long>(next_task->context.frame.rsp),
-                                       static_cast<unsigned long long>(next_task->context.syscall_kernel_stack));
-        next_task->context.frame.rsp = next_task->context.syscall_kernel_stack;
-    }
-
     // The live GPRegs block sits immediately before the live InterruptFrame on
     // the timer stack. Copy registers first so the return frame is the last
     // thing written before validation and return assembly consumes it.
-    if (next_task->type == sched::task::TaskType::PROCESS && !next_task->is_voluntary_blocked()) {
-        static_cast<void>(repair_stale_process_syscall_resume(next_task));
-        static_cast<void>(sys::signal::restore_deferred_sigreturn(next_task));
-        normalize_process_user_return_state(next_task);
-    }
     gpr = next_task->context.regs;
 
+    // int_num/err_code are not consumed by iretq, but they are provenance for
+    // durable kernel-frame classification. Exit switching uses a zero-filled
+    // carrier frame, so every normalized field must come from the same saved
+    // snapshot as the architectural return target.
+    frame.int_num = next_task->context.frame.int_num;
+    frame.err_code = next_task->context.frame.err_code;
     frame.rip = next_task->context.frame.rip;
     frame.rsp = next_task->context.frame.rsp;
     frame.cs = next_task->context.frame.cs;
     frame.ss = next_task->context.frame.ss;
     frame.flags = next_task->context.frame.flags;
-    validate_kernel_frame(frame, next_task, "switchTo");
-
-    // Validate context before restoring - catch corruption before it causes a crash
-    // in userspace where debugging is much harder.
-    // Only validate user-mode context for PROCESS tasks (IDLE/DAEMON run in ring 0)
-    // Skip validation when voluntary_block is set - the saved context is legitimately
-    // kernel-mode (task was preempted at a safe blocking point like sti;hlt in a syscall).
-    if (next_task->type == sched::task::TaskType::PROCESS && !next_task->is_voluntary_blocked()) {
-        if (frame.cs != desc::gdt::GDT_USER_CS) {
-            dbg::log("switchTo: CORRUPT cs=0x%x (expected 0x%x) PID %x", frame.cs, desc::gdt::GDT_USER_CS, next_task->pid);
-            for (;;) {
-                asm volatile("hlt");
-            };
-        }
-        if (frame.ss != desc::gdt::GDT_USER_DS) {
-            dbg::log("switchTo: CORRUPT ss=0x%x (expected 0x%x) PID %x", frame.ss, desc::gdt::GDT_USER_DS, next_task->pid);
-            for (;;) {
-                asm volatile("hlt");
-            };
-        }
-        if (frame.rip >= 0x800000000000ULL) {
-            dbg::log("switchTo: CORRUPT rip=0x%x (kernel addr?) PID %x", frame.rip, next_task->pid);
-            for (;;) {
-                asm volatile("hlt");
-            };
-        }
-        if (frame.rsp >= 0x800000000000ULL) {
-            dbg::log("switchTo: CORRUPT rsp=0x%x (kernel addr?) PID %x", frame.rsp, next_task->pid);
-            for (;;) {
-                asm volatile("hlt");
-            };
-        }
-        if (!valid_user_rflags(frame.flags)) {
-            dbg::log("switchTo: CORRUPT flags=0x%x PID %x", frame.flags, next_task->pid);
-            for (;;) {
-                asm volatile("hlt");
-            };
-        }
-    }
+    validate_saved_frame_for_restore(next_task, frame, "switchTo-final");
 
     install_task_cpu_bases(next_task, REAL_CPU_ID);
 
@@ -1055,9 +1216,6 @@ constexpr uint64_t APIC_TIMER_MAX_COUNT = 0xFFFFFFFFULL;
 std::atomic<uint64_t> timer_tick_count{0};
 
 constexpr bool K_ENABLE_SCHED_HOT_LOGGING = false;
-
-constexpr auto TIMER_FRAME_USER_CS = desc::gdt::GDT_USER_CS;
-constexpr auto TIMER_FRAME_KERNEL_CS = desc::gdt::GDT_KERN_CS;
 
 [[maybe_unused]]
 constexpr uint64_t HOT_TASK_STREAK_TICKS = 250;
@@ -1225,28 +1383,31 @@ auto scheduler_timer_ticks_for_delta_us(uint64_t delta_us) -> uint64_t {
 }
 }  // namespace
 
+extern "C" void wos_discard_abandoned_return_fpu_state() {
+    // A non-returning exit can be entered from the final timer handoff commit
+    // after that timer has authorized the incoming task's live user frame. The
+    // exit immediately selects another successor, so neither that one-shot
+    // authorization nor its same-task restore suppression may reach the nested
+    // return tail.
+    clear_timer_fpu_return_authorization();
+    set_timer_fpu_restore_suppressed(false);
+}
+
 extern "C" __attribute__((no_sanitize("address", "undefined", "coverage"))) void wos_repair_timer_return_frame(void* stack_ptr) {
-    auto* gpr_ptr = reinterpret_cast<cpu::GPRegs*>(stack_ptr);
     auto* frame_ptr = stack_ptr != nullptr
                           ? reinterpret_cast<gates::InterruptFrame*>(reinterpret_cast<uint8_t*>(stack_ptr) + sizeof(cpu::GPRegs))
                           : nullptr;
     auto* task = sched::get_current_task();
-
-    uint64_t const BAD_CS = frame_ptr != nullptr ? frame_ptr->cs : 0;
-    static std::atomic<uint64_t> repair_count{0};
-
-    if (task != nullptr && gpr_ptr != nullptr && frame_ptr != nullptr &&
-        (task->context.frame.cs == TIMER_FRAME_USER_CS || task->context.frame.cs == TIMER_FRAME_KERNEL_CS)) {
-        repair_count.fetch_add(1, std::memory_order_relaxed);
-        *gpr_ptr = task->context.regs;
-        *frame_ptr = task->context.frame;
-        return;
-    }
+    auto const FRAME_CLASS = task != nullptr ? task->context.saved_frame_class : sched::task::SavedFrameClass::INVALID;
 
     dbg::logger<"ctxswitch">::error(
-        "bad timer return frame: cs=0x%llx rip=0x%llx rsp=0x%llx task=%p pid=%lu saved_cs=0x%llx saved_rip=0x%llx saved_rsp=0x%llx",
-        static_cast<unsigned long long>(BAD_CS), frame_ptr != nullptr ? static_cast<unsigned long long>(frame_ptr->rip) : 0ULL,
-        frame_ptr != nullptr ? static_cast<unsigned long long>(frame_ptr->rsp) : 0ULL, static_cast<void*>(task),
+        "bad timer return frame rejected: class=%s cs=0x%llx ss=0x%llx rip=0x%llx rsp=0x%llx flags=0x%llx task=%p pid=%lu "
+        "saved_cs=0x%llx saved_rip=0x%llx saved_rsp=0x%llx",
+        sched::task::saved_frame_class_name(FRAME_CLASS), frame_ptr != nullptr ? static_cast<unsigned long long>(frame_ptr->cs) : 0ULL,
+        frame_ptr != nullptr ? static_cast<unsigned long long>(frame_ptr->ss) : 0ULL,
+        frame_ptr != nullptr ? static_cast<unsigned long long>(frame_ptr->rip) : 0ULL,
+        frame_ptr != nullptr ? static_cast<unsigned long long>(frame_ptr->rsp) : 0ULL,
+        frame_ptr != nullptr ? static_cast<unsigned long long>(frame_ptr->flags) : 0ULL, static_cast<void*>(task),
         task != nullptr ? task->pid : 0, task != nullptr ? static_cast<unsigned long long>(task->context.frame.cs) : 0ULL,
         task != nullptr ? static_cast<unsigned long long>(task->context.frame.rip) : 0ULL,
         task != nullptr ? static_cast<unsigned long long>(task->context.frame.rsp) : 0ULL);
@@ -1262,25 +1423,11 @@ extern "C" __attribute__((no_sanitize("address", "undefined", "coverage"))) void
         hcf();
     }
 
-    if (frame_ptr->cs == desc::gdt::GDT_USER_CS) {
-        if (gpr_ptr != nullptr) {
-            debug_validate_clang_return("deferred-final", task, *gpr_ptr, *frame_ptr);
-        }
-        validate_user_frame(*frame_ptr, task, "deferred-final");
-        return;
+    if (task != nullptr && sched::task::saved_frame_restore_policy(task->context.saved_frame_class).validate_as_user &&
+        gpr_ptr != nullptr) {
+        debug_validate_clang_return("deferred-final", task, *gpr_ptr, *frame_ptr);
     }
-    if (frame_ptr->cs == desc::gdt::GDT_KERN_CS) {
-        validate_kernel_frame(*frame_ptr, task, "deferred-final");
-        return;
-    }
-
-    dbg::logger<"ctxswitch">::error(
-        "bad deferred return selector: pid=%lu name=%s cs=0x%llx ss=0x%llx rip=0x%llx rsp=0x%llx flags=0x%llx task=%p",
-        task != nullptr ? task->pid : 0, (task != nullptr && task->name != nullptr) ? task->name : "?",
-        static_cast<unsigned long long>(frame_ptr->cs), static_cast<unsigned long long>(frame_ptr->ss),
-        static_cast<unsigned long long>(frame_ptr->rip), static_cast<unsigned long long>(frame_ptr->rsp),
-        static_cast<unsigned long long>(frame_ptr->flags), static_cast<void*>(task));
-    hcf();
+    validate_saved_frame_for_restore(task, *frame_ptr, "deferred-final");
 }
 
 extern "C" __attribute__((no_sanitize("address", "undefined", "coverage"))) void wos_validate_kernel_thread_start(uint64_t stack_top,
@@ -1316,9 +1463,7 @@ extern "C" __attribute__((no_sanitize("address", "undefined", "coverage"))) auto
     if (!valid_kernel_stack(STACK_TOP)) {
         panic_bad_handoff_stack(return_task, "bad-stack-top");
     }
-    if (current_task != nullptr && STACK_TOP == current_task->context.syscall_kernel_stack) {
-        return 0;
-    }
+    validate_handoff_stack_ownership(current_task, return_task, "user-return-stack");
     return STACK_TOP;
 }
 
@@ -1365,6 +1510,7 @@ extern "C" void wos_sched_timer(void* stack_ptr) {
     sched::note_scheduler_timer_interrupt();
     mm::virt::service_pending_tlb_shootdowns();
     set_timer_fpu_restore_suppressed(false);
+    clear_timer_fpu_return_authorization();
 
     // Advance epoch and request garbage collection periodically on CPU 0 only.
     // Task reclamation itself runs in the scheduler GC daemon, never in IRQ.
@@ -1384,8 +1530,11 @@ extern "C" void wos_sched_timer(void* stack_ptr) {
         apic::one_shot_timer(timer_quantum);
         return;
     }
-    auto* const interrupted_task = is_user_return_frame(*frame_ptr) ? sched::get_current_task() : nullptr;
-    bool const INTERRUPTED_USER_PROCESS = interrupted_task != nullptr && interrupted_task->type == sched::task::TaskType::PROCESS;
+    auto* const LIVE_TASK = sched::get_current_task();
+    auto const INTERRUPTED_FRAME_CLASS = classify_saved_frame(LIVE_TASK, *frame_ptr, sched::task::SavedFrameOrigin::INTERRUPT,
+                                                              LIVE_TASK != nullptr && LIVE_TASK->is_voluntary_blocked());
+    auto* const INTERRUPTED_TASK = INTERRUPTED_FRAME_CLASS == sched::task::SavedFrameClass::USER_RETURN ? LIVE_TASK : nullptr;
+    bool const INTERRUPTED_USER_PROCESS = INTERRUPTED_TASK != nullptr;
 
 #ifdef SCHED_DEBUG
     uint64_t t0 = rdtsc();
@@ -1397,9 +1546,18 @@ extern "C" void wos_sched_timer(void* stack_ptr) {
     check_pending_signals_for_return(*gpr_ptr, *frame_ptr);
     auto* return_task = sched::get_return_task();
     debug_validate_clang_return("timer", return_task, *gpr_ptr, *frame_ptr);
-    validate_kernel_frame(*frame_ptr, return_task, "timer-return");
-    if (INTERRUPTED_USER_PROCESS && is_user_return_frame(*frame_ptr) && return_task == interrupted_task &&
-        local_fpu_owner() == return_task) {
+    bool const RETURNING_INTERRUPTED_TASK = return_task != nullptr && return_task == LIVE_TASK;
+    auto const DURABLE_RETURN_FRAME_CLASS =
+        return_task != nullptr ? return_task->context.saved_frame_class : sched::task::SavedFrameClass::INVALID;
+    auto const RETURN_FRAME_CLASS =
+        sched::task::select_timer_return_frame_class(RETURNING_INTERRUPTED_TASK, INTERRUPTED_FRAME_CLASS, DURABLE_RETURN_FRAME_CLASS);
+    validate_classified_frame_for_restore(return_task, *frame_ptr, RETURN_FRAME_CLASS, "timer-return");
+    bool const RETURNING_TO_CLASSIFIED_USER =
+        return_task != nullptr && sched::task::saved_frame_restore_policy(RETURN_FRAME_CLASS).restore_user_fpu;
+    if (RETURNING_TO_CLASSIFIED_USER) {
+        set_timer_fpu_return_authorization(return_task, RETURN_FRAME_CLASS);
+    }
+    if (INTERRUPTED_USER_PROCESS && RETURNING_TO_CLASSIFIED_USER && return_task == INTERRUPTED_TASK && local_fpu_owner() == return_task) {
         set_timer_fpu_restore_suppressed(true);
     }
 
@@ -1546,7 +1704,7 @@ extern "C" void wos_jump_to_next_task_no_save(void* stack_ptr) {
     sched::jump_to_next_task(*gpr_ptr, *frame_ptr);
     check_pending_signals_for_return(*gpr_ptr, *frame_ptr);
     auto* return_task = sched::get_return_task();
-    validate_kernel_frame(*frame_ptr, return_task, "exit-return");
+    validate_saved_frame_for_restore(return_task, *frame_ptr, "exit-return");
 }
 
 void start_sched_timer() {

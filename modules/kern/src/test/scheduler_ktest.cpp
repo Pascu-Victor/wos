@@ -1,4 +1,8 @@
 #include <cstdint>
+#include <platform/sched/frame_class.hpp>
+#include <platform/sched/migration_policy.hpp>
+#include <platform/sched/preemption_diagnostics.hpp>
+#include <platform/sched/preemption_policy.hpp>
 #include <platform/sched/run_heap.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
@@ -72,6 +76,227 @@ KTEST(Sched, SaturatingDeadlineUs) {
     KEXPECT_EQ(saturating_deadline_us(UINT64_MAX - 5ULL, 5), UINT64_MAX);
     KEXPECT_EQ(saturating_deadline_us(UINT64_MAX - 5ULL, 6), UINT64_MAX);
     KEXPECT_EQ(saturating_deadline_us(UINT64_MAX, 1), UINT64_MAX);
+}
+
+KTEST(SchedulerFrameClass, CoversEverySavedFrameKind) {
+    using ker::mod::sched::task::classify_saved_frame;
+    using ker::mod::sched::task::SavedFrameClass;
+    using ker::mod::sched::task::SavedFrameClassificationInput;
+    using ker::mod::sched::task::SavedFrameOrigin;
+    using ker::mod::sched::task::SavedFrameOwner;
+    using ker::mod::sched::task::SavedFrameSelectors;
+
+    auto valid_input = [](SavedFrameOwner owner, SavedFrameOrigin origin, SavedFrameSelectors selectors) {
+        return SavedFrameClassificationInput{
+            .owner = owner,
+            .origin = origin,
+            .selectors = selectors,
+            .instruction_pointer_valid = true,
+            .stack_pointer_valid = true,
+            .flags_valid = true,
+        };
+    };
+
+    auto user = valid_input(SavedFrameOwner::PROCESS, SavedFrameOrigin::SYNTHETIC_USER_RETURN, SavedFrameSelectors::USER);
+    KEXPECT_EQ(classify_saved_frame(user), SavedFrameClass::USER_RETURN);
+
+    auto voluntary = valid_input(SavedFrameOwner::PROCESS, SavedFrameOrigin::INTERRUPT, SavedFrameSelectors::KERNEL);
+    voluntary.timer_interrupt = true;
+    voluntary.voluntary_process = true;
+    KEXPECT_EQ(classify_saved_frame(voluntary), SavedFrameClass::VOLUNTARY_PARKED_KERNEL);
+
+    voluntary.voluntary_process = false;
+    KEXPECT_EQ(classify_saved_frame(voluntary), SavedFrameClass::TIMER_PREEMPTED_PROCESS_KERNEL);
+
+    auto daemon = valid_input(SavedFrameOwner::DAEMON, SavedFrameOrigin::DAEMON_START, SavedFrameSelectors::KERNEL);
+    KEXPECT_EQ(classify_saved_frame(daemon), SavedFrameClass::DAEMON_KERNEL);
+
+    auto invalid = valid_input(SavedFrameOwner::PROCESS, SavedFrameOrigin::INTERRUPT, SavedFrameSelectors::KERNEL);
+    KEXPECT_EQ(classify_saved_frame(invalid), SavedFrameClass::INVALID);
+    invalid.timer_interrupt = true;
+    invalid.stack_pointer_valid = false;
+    KEXPECT_EQ(classify_saved_frame(invalid), SavedFrameClass::INVALID);
+}
+
+KTEST(SchedulerFrameClass, RestorePolicyKeepsKernelFramesOffUserReturnPaths) {
+    using ker::mod::sched::task::saved_frame_restore_policy;
+    using ker::mod::sched::task::SavedFrameClass;
+    using ker::mod::sched::task::SavedFrameRestoreKind;
+
+    auto const USER = saved_frame_restore_policy(SavedFrameClass::USER_RETURN);
+    KEXPECT_EQ(USER.kind, SavedFrameRestoreKind::USER_IRET);
+    KEXPECT_TRUE(USER.validate_as_user);
+    KEXPECT_TRUE(USER.deliver_signals);
+    KEXPECT_TRUE(USER.restore_user_fpu);
+
+    auto const KERNEL = saved_frame_restore_policy(SavedFrameClass::TIMER_PREEMPTED_PROCESS_KERNEL);
+    KEXPECT_EQ(KERNEL.kind, SavedFrameRestoreKind::SAME_CPL_KERNEL_IRET);
+    KEXPECT_FALSE(KERNEL.validate_as_user);
+    KEXPECT_FALSE(KERNEL.deliver_signals);
+    KEXPECT_FALSE(KERNEL.restore_user_fpu);
+
+    KEXPECT_EQ(saved_frame_restore_policy(SavedFrameClass::INVALID).kind, SavedFrameRestoreKind::REJECT);
+}
+
+KTEST(SchedulerPreemption, OrdinaryKernelEligibilityAndRollback) {
+    using ker::mod::sched::decode_migration_diagnostic;
+    using ker::mod::sched::encode_migration_diagnostic;
+    using ker::mod::sched::evaluate_kernel_preemption;
+    using ker::mod::sched::handoff_commit_allowed;
+    using ker::mod::sched::handoff_stack_collision;
+    using ker::mod::sched::KernelPreemptionBlockReason;
+    using ker::mod::sched::KernelPreemptionEligibilityInput;
+    using ker::mod::sched::MigrationDiagnostic;
+    using ker::mod::sched::MigrationRejectionReason;
+    using ker::mod::sched::preempt_disable_transition;
+    using ker::mod::sched::preempt_enable_transition;
+    using ker::mod::sched::preempt_pending_action;
+    using ker::mod::sched::PreemptGuardTransitionError;
+    using ker::mod::sched::PreemptPendingAction;
+    using ker::mod::sched::resolve_kernel_preemption_boot_policy;
+    using ker::mod::sched::task::SavedFrameClass;
+
+    KEXPECT_TRUE(resolve_kernel_preemption_boot_policy({.default_enabled = true}));
+    KEXPECT_TRUE(resolve_kernel_preemption_boot_policy({.force_on = true}));
+    KEXPECT_FALSE(resolve_kernel_preemption_boot_policy({.default_enabled = true, .force_on = true, .force_off = true}));
+
+    KernelPreemptionEligibilityInput input{
+        .frame_class = SavedFrameClass::TIMER_PREEMPTED_PROCESS_KERNEL,
+        .ordinary_process_kernel_enabled = true,
+        .same_cpu_migration_guarded = true,
+    };
+    auto decision = evaluate_kernel_preemption(input);
+    KEXPECT_TRUE(decision.can_switch);
+    KEXPECT_EQ(decision.reason, KernelPreemptionBlockReason::NONE);
+
+    input.preempt_disable_depth = 1;
+    decision = evaluate_kernel_preemption(input);
+    KEXPECT_FALSE(decision.can_switch);
+    KEXPECT_TRUE(decision.record_pending);
+    KEXPECT_EQ(decision.reason, KernelPreemptionBlockReason::PREEMPT_DISABLED);
+
+    input.preempt_disable_depth = 0;
+    input.scheduler_transition_active = true;
+    decision = evaluate_kernel_preemption(input);
+    KEXPECT_FALSE(decision.can_switch);
+    KEXPECT_TRUE(decision.record_pending);
+    KEXPECT_EQ(decision.reason, KernelPreemptionBlockReason::RETURN_TRANSITION);
+
+    input.frame_class = SavedFrameClass::VOLUNTARY_PARKED_KERNEL;
+    input.scheduler_transition_active = false;
+    input.deferred_task_switch = true;
+    input.wants_block = true;
+    decision = evaluate_kernel_preemption(input);
+    KEXPECT_TRUE(decision.can_switch);
+    KEXPECT_FALSE(decision.record_pending);
+    KEXPECT_EQ(decision.reason, KernelPreemptionBlockReason::NONE);
+
+    input.frame_class = SavedFrameClass::USER_RETURN;
+    input.deferred_task_switch = false;
+    input.wants_block = false;
+    input.preempt_disable_depth = 1;
+    decision = evaluate_kernel_preemption(input);
+    KEXPECT_FALSE(decision.can_switch);
+    KEXPECT_TRUE(decision.record_pending);
+    KEXPECT_EQ(decision.reason, KernelPreemptionBlockReason::PREEMPT_DISABLED);
+    KEXPECT_FALSE(handoff_commit_allowed(1, true));
+    KEXPECT_FALSE(handoff_stack_collision(0x1000, 0x1000, false));
+    KEXPECT_FALSE(handoff_stack_collision(0, 0x1000, true));
+    KEXPECT_FALSE(handoff_stack_collision(0x1000, 0x2000, true));
+    KEXPECT_TRUE(handoff_stack_collision(0x1000, 0x1000, true));
+    KEXPECT_TRUE(handoff_commit_allowed(1, false));
+
+    auto transition = preempt_disable_transition(0);
+    KEXPECT_TRUE(transition.outermost);
+    transition = preempt_disable_transition(transition.depth);
+    KEXPECT_EQ(transition.depth, 2U);
+    transition = preempt_enable_transition(transition.depth);
+    KEXPECT_FALSE(transition.outermost);
+    transition = preempt_enable_transition(transition.depth);
+    KEXPECT_TRUE(transition.outermost);
+    KEXPECT_EQ(preempt_enable_transition(0).error, PreemptGuardTransitionError::UNDERFLOW);
+    KEXPECT_EQ(preempt_pending_action(0, true, true), PreemptPendingAction::PRESERVE);
+    KEXPECT_EQ(preempt_pending_action(0, true, false), PreemptPendingAction::SERVICE);
+
+    constexpr MigrationDiagnostic MIGRATION_DIAGNOSTIC{
+        .frame_class = SavedFrameClass::TIMER_PREEMPTED_PROCESS_KERNEL,
+        .reason = MigrationRejectionReason::MIGRATION_DISABLED,
+        .source_cpu = 2,
+        .target_cpu = 3,
+    };
+    constexpr auto DECODED_MIGRATION_DIAGNOSTIC = decode_migration_diagnostic(encode_migration_diagnostic(MIGRATION_DIAGNOSTIC));
+    KEXPECT_EQ(DECODED_MIGRATION_DIAGNOSTIC.reason, MigrationRejectionReason::MIGRATION_DISABLED);
+    KEXPECT_EQ(DECODED_MIGRATION_DIAGNOSTIC.source_cpu, 2U);
+    KEXPECT_EQ(DECODED_MIGRATION_DIAGNOSTIC.target_cpu, 3U);
+}
+
+KTEST(SchedulerMigration, CrossCpuTimerFrameRequiresEveryInvariant) {
+    using ker::mod::sched::CrossCpuMigrationEligibilityInput;
+    using ker::mod::sched::evaluate_cross_cpu_migration;
+    using ker::mod::sched::MigrationRejectionReason;
+    using ker::mod::sched::task::SavedFrameClass;
+
+    CrossCpuMigrationEligibilityInput input{
+        .frame_class = SavedFrameClass::TIMER_PREEMPTED_PROCESS_KERNEL,
+        .source_owner_valid = true,
+        .active = true,
+        .resources_valid = true,
+        .frame_valid = true,
+        .cpu_pin_allows_target = true,
+        .domain_allows_target = true,
+    };
+    auto decision = evaluate_cross_cpu_migration(input);
+    KEXPECT_TRUE(decision.can_migrate);
+    KEXPECT_EQ(decision.reason, MigrationRejectionReason::NONE);
+
+    input.migration_disabled = true;
+    decision = evaluate_cross_cpu_migration(input);
+    KEXPECT_FALSE(decision.can_migrate);
+    KEXPECT_EQ(decision.reason, MigrationRejectionReason::MIGRATION_DISABLED);
+
+    input.migration_disabled = false;
+    input.return_transition = true;
+    decision = evaluate_cross_cpu_migration(input);
+    KEXPECT_FALSE(decision.can_migrate);
+    KEXPECT_EQ(decision.reason, MigrationRejectionReason::RETURN_TRANSITION);
+
+    input.return_transition = false;
+    input.frame_valid = false;
+    decision = evaluate_cross_cpu_migration(input);
+    KEXPECT_FALSE(decision.can_migrate);
+    KEXPECT_EQ(decision.reason, MigrationRejectionReason::INVALID_FRAME);
+}
+
+KTEST(SchedulerMigrationGuard, NestedOwnerAndPlacementContract) {
+    using ker::mod::sched::decode_migration_guard_state;
+    using ker::mod::sched::encode_migration_guard_state;
+    using ker::mod::sched::MIGRATION_CPU_INVALID;
+    using ker::mod::sched::migration_disable_transition;
+    using ker::mod::sched::migration_enable_transition;
+    using ker::mod::sched::migration_guard_target_cpu;
+    using ker::mod::sched::MigrationGuardState;
+    using ker::mod::sched::MigrationGuardTransitionError;
+
+    MigrationGuardState state{.depth = 0, .owner_cpu = MIGRATION_CPU_INVALID};
+    auto transition = migration_disable_transition(state, 2);
+    KEXPECT_EQ(transition.error, MigrationGuardTransitionError::NONE);
+    KEXPECT_TRUE(transition.outermost);
+    KEXPECT_EQ(transition.state.depth, 1U);
+    KEXPECT_EQ(migration_guard_target_cpu(transition.state, 5, 8), 2ULL);
+
+    transition = migration_disable_transition(transition.state, 2);
+    KEXPECT_EQ(transition.error, MigrationGuardTransitionError::NONE);
+    KEXPECT_FALSE(transition.outermost);
+    KEXPECT_EQ(transition.state.depth, 2U);
+    KEXPECT_EQ(decode_migration_guard_state(encode_migration_guard_state(transition.state)).owner_cpu, 2U);
+
+    KEXPECT_EQ(migration_enable_transition(transition.state, 1).error, MigrationGuardTransitionError::WRONG_CPU);
+    transition = migration_enable_transition(transition.state, 2);
+    KEXPECT_EQ(transition.error, MigrationGuardTransitionError::NONE);
+    transition = migration_enable_transition(transition.state, 2);
+    KEXPECT_EQ(transition.error, MigrationGuardTransitionError::NONE);
+    KEXPECT_TRUE(transition.outermost);
+    KEXPECT_EQ(transition.state.owner_cpu, MIGRATION_CPU_INVALID);
 }
 
 // The real CLI -> APIC arm -> STI/HLT boundary cannot run during boot KTEST,

@@ -12,6 +12,9 @@
 #include <platform/mm/paging.hpp>
 // #include <platform/sys/context_switch.hpp>
 #include <platform/interrupt/gates.hpp>
+#include <platform/sched/frame_class.hpp>
+#include <platform/sched/migration_guard.hpp>
+#include <platform/sched/preemption_diagnostics.hpp>
 #include <platform/sched/threading.hpp>
 #include <platform/sys/spinlock.hpp>
 #include <util/radix_tree.hpp>
@@ -194,6 +197,10 @@ struct Context {
     uint64_t error_code;
 
     gates::InterruptFrame frame;
+
+    // Producer-time classification for frame.  This is deliberately stored
+    // rather than reconstructed from mutable state such as voluntary_block.
+    SavedFrameClass saved_frame_class{SavedFrameClass::INVALID};
 } __attribute__((packed));
 
 // FPU/SSE/AVX state saved by xsave or fxsave (must be 64-byte aligned for xsave).
@@ -344,6 +351,27 @@ struct Task {
     uint64_t preempt_disable_start_us = 0;
     uint64_t preempt_disable_max_us = 0;
     uint64_t preempt_disable_owner = 0;
+
+    // Depth and owner CPU are published as one word so cross-CPU selectors
+    // cannot observe a disabled task without its mandatory resume CPU.
+    std::atomic<uint64_t> migration_guard_state{
+        encode_migration_guard_state(MigrationGuardState{.depth = 0, .owner_cpu = MIGRATION_CPU_INVALID})};
+    std::atomic<uint64_t> migration_disable_start_us{0};
+    std::atomic<uint64_t> migration_disable_max_us{0};
+    std::atomic<uint64_t> migration_disable_owner{0};
+
+    // Coherent, allocation-free last-decision records. Timer and placement
+    // paths publish one packed scalar; procfs/debug readers decode it later.
+    mutable std::atomic<uint64_t> preemption_diagnostic{encode_preemption_diagnostic({})};
+    mutable std::atomic<uint64_t> migration_diagnostic{encode_migration_diagnostic({})};
+
+    [[nodiscard]] auto migration_state(std::memory_order order = std::memory_order_acquire) const -> MigrationGuardState {
+        return decode_migration_guard_state(migration_guard_state.load(order));
+    }
+
+    [[nodiscard]] auto is_migration_disabled(std::memory_order order = std::memory_order_acquire) const -> bool {
+        return migration_guard_disabled(migration_state(order));
+    }
 
     // Waitpid state: when this task is waiting for another task to exit.
     uint64_t waiting_for_pid{};            // Encoded waitpid selector: direct PID, any-child sentinel, or process group
@@ -621,6 +649,10 @@ struct Task {
     // has not yet saved the syscall return context. Exit notification may wake
     // the task in this window, but must not write saved registers directly.
     std::atomic<bool> waitpid_publish_pending{false};
+    // True while deferred_task_switch owns the live syscall stack and is
+    // publishing its replacement return state. A timer may record pending
+    // work, but must not switch this task until the transition is complete.
+    std::atomic<bool> scheduler_transition_active{false};
     bool deferred_task_switch{};  // Move to wait queue after syscall returns
     bool yield_switch{};          // Put task in expired queue instead of wait queue
 

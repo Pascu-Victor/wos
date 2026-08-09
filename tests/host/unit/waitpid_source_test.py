@@ -107,14 +107,18 @@ def require_waited_on_is_atomic_claim(task_hpp: str, task_cpp: str, waitpid_cpp:
     if "waited_on = true" in combined or "waited_on = false" in combined:
         fail("process reaping paths must not write waited_on directly")
     required_claim_sites = {
-        "waitpid syscall direct target": (waitpid_cpp, "sched_task::task_try_mark_waited_on(*target_task)"),
-        "waitpid syscall child scan": (waitpid_cpp, "sched_task::task_try_mark_waited_on(*child)"),
-        "exit direct completion": (exit_cpp, "sched_task::task_try_mark_waited_on(*child)"),
-        "scheduler deferred completion": (scheduler_cpp, "task::task_try_mark_waited_on(*child)"),
+        "waitpid syscall direct target": (waitpid_cpp, "ker::mod::sched::try_mark_task_waited_on(*target_task)"),
+        "waitpid syscall child scan": (waitpid_cpp, "ker::mod::sched::try_mark_task_waited_on(*child)"),
+        "exit direct completion": (exit_cpp, "ker::mod::sched::try_mark_task_waited_on(*child)"),
+        "scheduler deferred completion": (scheduler_cpp, "try_mark_task_waited_on(*child)"),
     }
     for label, (source, snippet) in required_claim_sites.items():
         if snippet not in source:
             fail(f"{label} must claim waited_on before completion: {snippet}")
+    claim_body = function_body(scheduler_cpp, "try_mark_task_waited_on")
+    for snippet in ["task::task_try_mark_waited_on(subject)", "active_list_remove(&subject)"]:
+        if snippet not in claim_body:
+            fail(f"central waited_on claim must atomically claim and retire DEAD registry state: {snippet}")
 
 
 def require_wait_any_publish_recheck(waitpid_cpp: str) -> None:
@@ -334,7 +338,7 @@ def require_exit_completion_respects_publish_fence(exit_cpp: str) -> None:
         "sched_task::task_try_claim_waitpid_completion(*waiter)",
         "!waiter_matches_child(waiter, child) || !waiter_context_can_be_completed(waiter)",
         "sched_task::task_release_waitpid_completion_claim(*waiter)",
-        "sched_task::task_try_mark_waited_on(*child)",
+        "ker::mod::sched::try_mark_task_waited_on(*child)",
         "waiter->waitpid_publish_pending.store(false, std::memory_order_release)",
         "waiter->deferred_task_switch = false",
         "waiter->set_voluntary_blocked(false)",

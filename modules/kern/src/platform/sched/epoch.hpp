@@ -68,7 +68,15 @@ class EpochManager {
 class EpochGuard {
    public:
     EpochGuard() : cpu_id(EpochManager::enter_critical()) {}
-    ~EpochGuard() { EpochManager::exit_critical_for_cpu(cpu_id); }
+    ~EpochGuard() { release(); }
+
+    void release() {
+        uint64_t const CPU_ID = cpu_id;
+        cpu_id = UINT64_MAX;
+        if (CPU_ID != UINT64_MAX) {
+            EpochManager::exit_critical_for_cpu(CPU_ID);
+        }
+    }
 
     // Non-copyable, non-movable
     EpochGuard(const EpochGuard&) = delete;
@@ -77,7 +85,7 @@ class EpochGuard {
     auto operator=(EpochGuard&&) -> EpochGuard& = delete;
 
    private:
-    uint64_t cpu_id{};
+    uint64_t cpu_id{UINT64_MAX};
 };
 
 }  // namespace ker::mod::sched

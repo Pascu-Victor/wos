@@ -5,8 +5,16 @@ extern "C" void jump_to_next_task_no_save();
 #include <cstdint>
 #include <platform/asm/cpu.hpp>
 #include <platform/interrupt/gates.hpp>
+#include <platform/sched/frame_class.hpp>
 #include <platform/sched/task.hpp>
 namespace ker::mod::sys::context_switch {
+[[nodiscard]] auto classify_saved_frame(const sched::task::Task* task, const gates::InterruptFrame& frame,
+                                        sched::task::SavedFrameOrigin origin, bool voluntary_process) -> sched::task::SavedFrameClass;
+void record_saved_frame_class(sched::task::Task* task, const gates::InterruptFrame& frame, sched::task::SavedFrameOrigin origin);
+[[nodiscard]] auto saved_frame_class_is_valid(const sched::task::Task* task, const gates::InterruptFrame& frame) -> bool;
+void validate_saved_frame_for_restore(sched::task::Task* task, const gates::InterruptFrame& frame, const char* path);
+void validate_handoff_stack_ownership(const sched::task::Task* outgoing, const sched::task::Task* incoming, const char* path);
+
 // Returns true if switch was successful, false if task validation failed
 // and caller should fall back to idle loop
 auto switch_to(cpu::GPRegs& gpr, gates::InterruptFrame& frame, sched::task::Task* next_task) -> bool;

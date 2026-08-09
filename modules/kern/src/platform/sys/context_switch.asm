@@ -13,6 +13,7 @@ bits 64
 extern wos_commit_handoff_task
 extern wos_user_handoff_stack_top
 extern wos_restore_return_task_fpu
+extern wos_discard_abandoned_return_fpu_state
 
 ; Same-CPL iretq consumes only RIP/CS/RFLAGS, but the scheduler and panic
 ; diagnostics treat the memory below the saved RSP as GPRegs + InterruptFrame.
@@ -311,10 +312,12 @@ extern wos_restore_return_task_fpu
 ; Kernel-mode idle loop - used when there are no user tasks to run
 ; This runs in ring 0 and just halts, waiting for interrupts
 global wos_kernel_idle_loop
+global wos_kernel_idle_loop_end
 wos_kernel_idle_loop:
     sti         ; Enable interrupts
     hlt         ; Halt until interrupt
     jmp wos_kernel_idle_loop  ; Loop forever
+wos_kernel_idle_loop_end:
 
 extern wos_kernel_thread_returned
 global wos_kernel_thread_trampoline
@@ -429,9 +432,10 @@ task_switch_handler:
     call wos_sched_timer
     cli
 
-    ; The C++ scheduler mutates the frame in-place.  If a bad frame selector
-    ; reaches iretq, the CPU raises #GP with little context; repair or panic
-    ; while the saved register/frame block is still easy to inspect.
+    ; The C++ scheduler mutates the frame in-place. If a bad selector survives
+    ; classified validation, reject it before iretq raises #GP with less useful
+    ; context. wos_repair_timer_return_frame is a legacy symbol name; it no
+    ; longer attempts recovery from an invalid return target.
     mov rax, [rsp + GPREGS_SIZE + 24]
     cmp rax, 0x23
     je .return_frame_ready
@@ -458,6 +462,14 @@ extern wos_jump_to_next_task_no_save
 global jump_to_next_task_no_save
 jump_to_next_task_no_save:
     cli
+
+    ; The abandoned return may carry one-shot timer FPU authorization for the
+    ; task that just committed ownership. A pending fatal signal can enter this
+    ; path from that commit before its restore hook runs; discard the old
+    ; authorization before selecting and returning to a different successor.
+    sub rsp, 8
+    call wos_discard_abandoned_return_fpu_state
+    add rsp, 8
 
     ; Push dummy interrupt frame FIRST (will be at higher addresses)
     ; Layout expected by C++: GPRegs at stack_ptr, InterruptFrame at stack_ptr + sizeof(GPRegs)

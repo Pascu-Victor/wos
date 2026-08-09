@@ -8,6 +8,12 @@ ROOT = Path(__file__).resolve().parents[3]
 SCHEDULER_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "sched" / "scheduler.cpp"
 SCHEDULER_HPP = ROOT / "modules" / "kern" / "src" / "platform" / "sched" / "scheduler.hpp"
 TASK_HPP = ROOT / "modules" / "kern" / "src" / "platform" / "sched" / "task.hpp"
+FRAME_CLASS_HPP = ROOT / "modules" / "kern" / "src" / "platform" / "sched" / "frame_class.hpp"
+MIGRATION_GUARD_HPP = ROOT / "modules" / "kern" / "src" / "platform" / "sched" / "migration_guard.hpp"
+EPOCH_HPP = ROOT / "modules" / "kern" / "src" / "platform" / "sched" / "epoch.hpp"
+MIGRATION_POLICY_HPP = ROOT / "modules" / "kern" / "src" / "platform" / "sched" / "migration_policy.hpp"
+PREEMPTION_POLICY_HPP = ROOT / "modules" / "kern" / "src" / "platform" / "sched" / "preemption_policy.hpp"
+PREEMPTION_DIAGNOSTICS_HPP = ROOT / "modules" / "kern" / "src" / "platform" / "sched" / "preemption_diagnostics.hpp"
 CONTEXT_SWITCH_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "sys" / "context_switch.cpp"
 CONTEXT_SWITCH_ASM = ROOT / "modules" / "kern" / "src" / "platform" / "sys" / "context_switch.asm"
 PROCFS_CPP = ROOT / "modules" / "kern" / "src" / "vfs" / "fs" / "procfs.cpp"
@@ -24,6 +30,7 @@ SCHEDULER_KTEST = ROOT / "modules" / "kern" / "src" / "test" / "scheduler_ktest.
 NET_BACKLOG_CPP = ROOT / "modules" / "kern" / "src" / "net" / "backlog.cpp"
 NETPOLL_CPP = ROOT / "modules" / "kern" / "src" / "net" / "netpoll.cpp"
 WKI_REMOTE_IPC_CPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "remote_ipc.cpp"
+WAITPID_CPP = ROOT / "modules" / "kern" / "src" / "syscalls_impl" / "process" / "waitpid.cpp"
 
 
 def fail(message: str) -> None:
@@ -32,7 +39,7 @@ def fail(message: str) -> None:
 
 def function_body(source: str, name: str) -> str:
     match = re.search(
-        rf"\b(?:\[\[nodiscard\]\]\s+)?(?:inline\s+)?(?:auto|bool|void|Thread\*|uint32_t)\s+{name}\([^)]*\)\s*(?:->\s*[A-Za-z0-9_:<>,\s*&]+)?\s*\{{",
+        rf"(?:\[\[[^\]]+\]\]\s+)*(?:inline\s+)?(?:auto|bool|void|Thread\*|uint32_t)\s+{name}\([^)]*\)\s*(?:->\s*[A-Za-z0-9_:<>,\s*&]+)?\s*\{{",
         source,
         flags=re.DOTALL,
     )
@@ -397,8 +404,8 @@ def test_event_wake_rebalances_normal_process_waiters() -> None:
         target_body,
         [
             "event_wake_prefers_waker_cpu(task->cpu_pinned, WAITING, VOLUNTARY_BLOCK)",
-            "return event_wake_rebalance_target_cpu(task, waker_cpu);",
-            "return task->cpu;",
+            "target_cpu = event_wake_rebalance_target_cpu(task, waker_cpu);",
+            "return cross_cpu_migration_target_or_source(task, task->cpu, target_cpu, CORE_COUNT);",
         ],
         "event wake target policy must remain centralized",
     )
@@ -408,9 +415,9 @@ def test_event_wake_rebalances_normal_process_waiters() -> None:
 
 def test_idle_steal_can_migrate_normal_process_work() -> None:
     source = SCHEDULER_CPP.read_text()
+    migration_policy = MIGRATION_POLICY_HPP.read_text()
     mask_body = function_body(source, "task_can_run_on_cpu")
-    kernel_steal_body = function_body(source, "kernel_context_is_migratable")
-    process_steal_body = function_body(source, "process_task_can_idle_steal")
+    task_steal_body = function_body(source, "task_can_idle_steal")
     scan_limit_body = function_body(source, "steal_candidate_scan_limit")
     probe_body = function_body(source, "idle_rebalance_probe_needed_for_idle")
     steal_body = function_body(source, "try_steal_from_peers")
@@ -432,38 +439,38 @@ def test_idle_steal_can_migrate_normal_process_work() -> None:
             "victim_rq_raw->cached_load_process.load(std::memory_order_relaxed) + VICTIM_CURRENT_LOAD",
             "VICTIM_HEAP_SIZE == 0 || (VICTIM_CURRENT_LOAD == 0 && VICTIM_HEAP_SIZE < 2)",
             "current_task_load_for_incoming(victim_rq->current_task, task::TaskType::PROCESS)",
-            "task_can_run_on_cpu(t, stealing_cpu, N)",
-            "t->cpu_pinned || t->domain_hard",
+            "t == victim_current || t == victim_handoff",
             "t->type != task::TaskType::PROCESS && !t->has_run",
-            "process_task_can_idle_steal(t)",
+            "task_can_idle_steal(t, VICTIM_CPU, stealing_cpu, N)",
             "uint32_t const SCAN = steal_candidate_scan_limit(victim_rq->runnable_heap.size)",
             'publish_runnable_task_locked(our_rq, stolen, "work-steal")',
         ],
         "idle steal process eligibility",
     )
     require_tokens(
-        kernel_steal_body,
+        task_steal_body,
         [
-            "task->is_voluntary_blocked()",
-            "task->context.frame.cs == desc::gdt::GDT_KERN_CS",
-            "task->context.frame.ss == desc::gdt::GDT_KERN_DS",
-            "is_kernel_text_pointer(task->context.frame.rip)",
-            "task_kernel_stack_contains(task, task->context.frame.rsp)",
-            '(task->context.frame.flags & 0x2ULL) != 0',
+            "task_cross_cpu_migration_allowed(task, source_cpu, target_cpu, core_count)",
         ],
-        "idle steal voluntary-block kernel context validation",
+        "idle steal centralized cross-CPU validation",
     )
     require_tokens(
-        process_steal_body,
+        migration_policy,
         [
-            "task->type != task::TaskType::PROCESS",
-            "task->thread == nullptr || task->pagemap == nullptr || task->wki_proxy_task_id != 0",
-            "task->preempt_disable_depth != 0 || task->deferred_task_switch || task->wants_block",
-            "task->is_voluntary_blocked()",
-            "return kernel_context_is_migratable(task);",
-            "return user_context_is_canonical(task);",
+            "evaluate_cross_cpu_migration",
+            "input.source_owner_valid",
+            "input.resources_valid",
+            "input.frame_valid",
+            "input.migration_disabled",
+            "input.preempt_disabled",
+            "input.return_transition",
+            "input.cpu_pin_allows_target",
+            "input.domain_allows_target",
+            "input.wki_owned",
+            "case task::SavedFrameClass::TIMER_PREEMPTED_PROCESS_KERNEL:",
+            ".can_migrate = true",
         ],
-        "idle steal process resume context eligibility",
+        "cross-CPU frame and ownership eligibility model",
     )
     require_tokens(
         scan_limit_body,
@@ -493,8 +500,688 @@ def test_idle_steal_can_migrate_normal_process_work() -> None:
         fail("idle steal must not skip every PROCESS task")
     if re.search(r"if\s*\(\s*!\s*t->has_run\s*\)\s*\{\s*continue;", steal_body):
         fail("idle steal must allow cold process placement when the process has a runnable context")
-    if re.search(r"if\s*\(\s*task->is_voluntary_blocked\(\)\s*\)\s*\{\s*return\s+false;", process_steal_body):
-        fail("idle steal must not blanket-ban voluntary-blocked process migration")
+    if "SAME_CPU_KERNEL_FRAME" in source:
+        fail("qualified scheduler placement must not retain the temporary same-CPU timer-frame rejection")
+
+
+def test_saved_frame_class_is_durable_and_drives_return_consumers() -> None:
+    frame_header = FRAME_CLASS_HPP.read_text()
+    task_header = TASK_HPP.read_text()
+    scheduler_source = SCHEDULER_CPP.read_text()
+    context_source = CONTEXT_SWITCH_CPP.read_text()
+    ktest_source = SCHEDULER_KTEST.read_text()
+    timer_body = function_body(scheduler_source, "process_tasks")
+    switch_body = function_body(context_source, "switch_to")
+
+    require_tokens(
+        frame_header,
+        [
+            "enum class SavedFrameClass : uint8_t",
+            "USER_RETURN",
+            "VOLUNTARY_PARKED_KERNEL",
+            "TIMER_PREEMPTED_PROCESS_KERNEL",
+            "DAEMON_KERNEL",
+            "classify_saved_frame(const SavedFrameClassificationInput& input)",
+        ],
+        "saved frame classification model",
+    )
+    require_tokens(
+        task_header,
+        [
+            "gates::InterruptFrame frame;",
+            "SavedFrameClass saved_frame_class{SavedFrameClass::INVALID};",
+        ],
+        "durable Task::Context frame tag",
+    )
+    require_tokens(
+        timer_body,
+        [
+            "auto const LIVE_FRAME_CLASS = sys::context_switch::classify_saved_frame(",
+            "LIVE_FRAME_CLASS != task::SavedFrameClass::USER_RETURN",
+            "evaluate_kernel_preemption({",
+            ".frame_class = LIVE_FRAME_CLASS",
+            "record_saved_frame_class(current_task, current_task->context.frame, task::SavedFrameOrigin::INTERRUPT)",
+        ],
+        "timer producer-time frame classification",
+    )
+    require_tokens(
+        switch_body,
+        [
+            'validate_saved_frame_for_restore(next_task, next_task->context.frame, "switchTo-prepare")',
+            "sched::task::SavedFrameRestoreKind::USER_IRET",
+            'validate_saved_frame_for_restore(next_task, frame, "switchTo-final")',
+        ],
+        "context switch classified-frame consumption",
+    )
+    require_tokens(
+        ktest_source,
+        [
+            "KTEST(SchedulerFrameClass, CoversEverySavedFrameKind)",
+            "SavedFrameClass::TIMER_PREEMPTED_PROCESS_KERNEL",
+        ],
+        "saved frame classifier KTEST coverage",
+    )
+
+
+def test_same_cpu_kernel_preemption_is_policy_gated_and_transition_safe() -> None:
+    policy_header = PREEMPTION_POLICY_HPP.read_text()
+    task_header = TASK_HPP.read_text()
+    scheduler_source = SCHEDULER_CPP.read_text()
+    ktest_source = SCHEDULER_KTEST.read_text()
+    debug_flags = (ROOT / "docs" / "kernel_debug_flags.md").read_text()
+
+    require_tokens(
+        policy_header,
+        [
+            "resolve_kernel_preemption_boot_policy",
+            "if (input.force_off)",
+            "if (input.force_on)",
+            "KernelPreemptionBlockReason::MIGRATION_UNSTABLE",
+            "KernelPreemptionBlockReason::PREEMPT_DISABLED",
+            "KernelPreemptionBlockReason::RETURN_TRANSITION",
+            "task::SavedFrameClass::TIMER_PREEMPTED_PROCESS_KERNEL",
+            "input.ordinary_process_kernel_enabled",
+            "input.same_cpu_migration_guarded",
+            "input.preempt_disable_depth != 0",
+            "input.scheduler_transition_active",
+            "input.deferred_task_switch",
+            "input.waitpid_publish_pending",
+            "ORDINARY_PROCESS_KERNEL && (input.deferred_task_switch || input.wants_block)",
+            ".record_pending = true",
+            ".can_switch = true",
+        ],
+        "class-driven kernel-preemption policy model",
+    )
+    require_order(
+        policy_header,
+        "if (input.force_off)",
+        "if (input.force_on)",
+        "the rollback token must dominate an accidental conflicting enable token",
+    )
+
+    require_tokens(
+        task_header,
+        ["std::atomic<bool> scheduler_transition_active{false};"],
+        "per-task scheduler transition fence",
+    )
+
+    boot_policy_body = function_body(scheduler_source, "scheduler_kernel_preemption_enabled")
+    require_tokens(
+        scheduler_source,
+        [
+            "constexpr bool KERNEL_PREEMPTION_DEFAULT_ENABLED = true;",
+            "begin_scheduler_transition(current_task)",
+            "finish_scheduler_transition(current_task, false)",
+            "finish_scheduler_transition(current_task, true)",
+        ],
+        "default-on kernel-preemption rollout",
+    )
+    require_tokens(
+        boot_policy_body,
+        [
+            "resolve_kernel_preemption_boot_policy({",
+            'cmdline_has_token(CMDLINE, "sched.kpreempt=on")',
+            'cmdline_has_token(CMDLINE, "sched.kpreempt=off")',
+        ],
+        "exact boot-policy token handling",
+    )
+
+    timer_body = function_body(scheduler_source, "process_tasks")
+    require_order(
+        timer_body,
+        "MigrationGuard migration_guard",
+        "evaluate_kernel_preemption({",
+        "timer preemption must stabilize CPU ownership before evaluating an ordinary kernel frame",
+    )
+    require_tokens(
+        timer_body,
+        [
+            "MigrationGuardState const MIGRATION_STATE = current_task->migration_state()",
+            "migration_guard_disabled(MIGRATION_STATE) && MIGRATION_STATE.owner_cpu == cpu::current_cpu()",
+            ".ordinary_process_kernel_enabled = scheduler_kernel_preemption_enabled()",
+            ".scheduler_transition_active = current_task->scheduler_transition_active.load(std::memory_order_acquire)",
+            "KERNEL_PREEMPTION.reason == KernelPreemptionBlockReason::MIGRATION_UNSTABLE",
+            "bool const CAN_PREEMPT_KERNEL = KERNEL_PREEMPTION.can_switch",
+            "bool const CAN_PREEMPT_LIVE_FRAME =",
+            "KERNEL_PREEMPTION.reason == KernelPreemptionBlockReason::NOT_KERNEL_FRAME",
+            "if (CAN_PREEMPT_LIVE_FRAME)",
+            "if (!CAN_PREEMPT_LIVE_FRAME)",
+            "if (KERNEL_PREEMPTION.record_pending)",
+            "current_task->preempt_pending = true",
+        ],
+        "same-CPU timer preemption gate",
+    )
+    if "KERNEL_PREEMPT_SAFE = IS_DAEMON" in timer_body:
+        fail("ordinary process kernel preemption must not retain the voluntary-only gate")
+
+    placement_body = function_body(scheduler_source, "migration_guard_placement")
+    if "TIMER_PREEMPTED_PROCESS_KERNEL" in placement_body:
+        fail("cross-CPU qualification must remove the temporary timer-frame placement guard")
+    require_tokens(
+        MIGRATION_POLICY_HPP.read_text(),
+        [
+            "case task::SavedFrameClass::TIMER_PREEMPTED_PROCESS_KERNEL:",
+            "if (!input.frame_valid)",
+            ".can_migrate = true",
+        ],
+        "validated timer-frame cross-CPU policy",
+    )
+    for placement_consumer, token in (
+        ("move_task_owner_to_cpu", "task_cross_cpu_migration_allowed(task"),
+        ("event_wake_target_cpu", "cross_cpu_migration_target_or_source(task"),
+        ("wake_task_from_event_on_cpu", "cross_cpu_migration_target_or_source(task"),
+        ("reschedule_task_for_cpu_once", "cross_cpu_migration_target_or_source(task"),
+        ("task_can_idle_steal", "task_cross_cpu_migration_allowed(task"),
+    ):
+        require_tokens(
+            function_body(scheduler_source, placement_consumer),
+            [token],
+            f"{placement_consumer} centralized cross-CPU eligibility",
+        )
+
+    begin_body = function_body(scheduler_source, "begin_scheduler_transition")
+    finish_body = function_body(scheduler_source, "finish_scheduler_transition")
+    require_tokens(
+        begin_body,
+        ["task->scheduler_transition_active.exchange(true, std::memory_order_acq_rel)", "hcf()"],
+        "scheduler transition entry fence",
+    )
+    require_tokens(
+        finish_body,
+        [
+            "task->scheduler_transition_active.exchange(false, std::memory_order_acq_rel)",
+            "task->preempt_pending = false",
+            "if (!switched && run_queues != nullptr)",
+            "request_local_reschedule()",
+        ],
+        "scheduler transition completion and pending replay",
+    )
+
+    deferred_body = function_body(scheduler_source, "deferred_task_switch")
+    require_order(
+        deferred_body,
+        "current_task->preempt_disable_depth != 0",
+        "begin_scheduler_transition(current_task)",
+        "deferred switching must reject disabled preemption before entering its transition",
+    )
+    preempt_reject_start = deferred_body.find("current_task->preempt_disable_depth != 0")
+    transition_start = deferred_body.find("begin_scheduler_transition(current_task)")
+    require_tokens(
+        deferred_body[preempt_reject_start:transition_start],
+        ["note_preempt_disabled_block", "hcf()"],
+        "deferred switching must never proceed with a nonzero preempt depth",
+    )
+    require_order(
+        deferred_body,
+        "begin_scheduler_transition(current_task)",
+        "current_task->context.regs = *gpr_ptr",
+        "the transition fence must precede outgoing live-frame publication",
+    )
+    normal_return = deferred_body[deferred_body.find("if (next_task == current_task)") :]
+    require_order(
+        normal_return,
+        "finish_scheduler_transition(current_task, false)",
+        "return;",
+        "same-task deferred completion must replay pending work before returning",
+    )
+    switched_return = deferred_body[deferred_body.find("if (next_task == nullptr || next_task->type == task::TaskType::IDLE)") :]
+    require_order(
+        switched_return,
+        'asm volatile("cli" ::: "memory")',
+        "finish_scheduler_transition(current_task, true)",
+        "a non-returning handoff may lower its transition fence only with interrupts masked",
+    )
+
+    require_tokens(
+        ktest_source,
+        [
+            "KTEST(SchedulerPreemption, OrdinaryKernelEligibilityAndRollback)",
+            "KernelPreemptionBlockReason::PREEMPT_DISABLED",
+            "KernelPreemptionBlockReason::RETURN_TRANSITION",
+        ],
+        "kernel same-CPU preemption KTEST coverage",
+    )
+
+    commit_body = function_body(scheduler_source, "commit_handoff_task_at_return_boundary")
+    require_tokens(
+        commit_body,
+        [
+            "RETURN_RQ->current_task",
+            "RETURN_RQ->handoff_task",
+            'validate_handoff_stack_ownership(LIVE_OUTGOING, RESERVED_INCOMING, "return-boundary-commit")',
+            "handoff_commit_allowed(OUTGOING_PREEMPT_DEPTH, OWNERSHIP_CHANGES)",
+            "KernelPreemptionBlockReason::PREEMPT_DISABLED",
+            "hcf()",
+        ],
+        "final handoff preempt-depth backstop",
+    )
+    require_order(
+        commit_body,
+        'validate_handoff_stack_ownership(LIVE_OUTGOING, RESERVED_INCOMING, "return-boundary-commit")',
+        "run_queues->this_cpu_locked_void",
+        "handoff must reject a shared kernel stack before publishing ownership",
+    )
+    require_order(
+        commit_body,
+        "handoff_commit_allowed(OUTGOING_PREEMPT_DEPTH, OWNERSHIP_CHANGES)",
+        "run_queues->this_cpu_locked_void",
+        "handoff must inspect the caller depth before its own runqueue lock masks it",
+    )
+    require_tokens(
+        debug_flags,
+        ["sched.kpreempt=on", "sched.kpreempt=off", "enabled by default", "exact-token `off`", "wins if both tokens are supplied"],
+        "default-on rollback documentation",
+    )
+
+
+def test_preemption_diagnostics_are_bounded_and_guard_misuse_is_fatal() -> None:
+    policy_header = PREEMPTION_POLICY_HPP.read_text()
+    diagnostics_header = PREEMPTION_DIAGNOSTICS_HPP.read_text()
+    task_header = TASK_HPP.read_text()
+    scheduler_header = SCHEDULER_HPP.read_text()
+    scheduler_source = SCHEDULER_CPP.read_text()
+    procfs_source = PROCFS_CPP.read_text()
+    spinlock_source = (ROOT / "modules" / "kern" / "src" / "platform" / "sys" / "spinlock.cpp").read_text()
+    ktest_source = SCHEDULER_KTEST.read_text()
+
+    require_tokens(
+        policy_header,
+        [
+            "PreemptGuardTransitionError::UNDERFLOW",
+            "PreemptGuardTransitionError::OVERFLOW",
+            "preempt_disable_transition(uint32_t depth)",
+            "preempt_enable_transition(uint32_t depth)",
+            "PreemptPendingAction::PRESERVE",
+            "PreemptPendingAction::SERVICE",
+            "preempt_pending_action(uint32_t depth, bool pending, bool scheduler_transition_active)",
+        ],
+        "preemption guard transition model",
+    )
+    require_tokens(
+        diagnostics_header,
+        [
+            "enum class MigrationRejectionReason : uint8_t",
+            "MIGRATION_DISABLED",
+            "PREEMPT_DISABLED",
+            "RETURN_TRANSITION",
+            "CPU_PINNED",
+            "DOMAIN_RESTRICTED",
+            "WKI_OWNED",
+            "PreemptionDiagnostic",
+            "MigrationDiagnostic",
+            "encode_preemption_diagnostic",
+            "decode_preemption_diagnostic",
+            "encode_migration_diagnostic",
+            "decode_migration_diagnostic",
+        ],
+        "packed scheduler decision diagnostics",
+    )
+    for forbidden in ("new ", "kmalloc", "dbg::", "log::", "Spinlock"):
+        if forbidden in diagnostics_header:
+            fail(f"packed timer-path diagnostics must remain allocation-, lock-, and logger-free: found {forbidden}")
+
+    require_tokens(
+        task_header,
+        [
+            "mutable std::atomic<uint64_t> preemption_diagnostic",
+            "mutable std::atomic<uint64_t> migration_diagnostic",
+        ],
+        "coherent per-task diagnostic publication words",
+    )
+
+    disable_body = function_body(scheduler_source, "preempt_disable_token_at")
+    enable_body = function_body(scheduler_source, "preempt_enable_token_at")
+    require_tokens(
+        disable_body,
+        [
+            "preempt_disable_transition(task->preempt_disable_depth)",
+            "TRANSITION.error != PreemptGuardTransitionError::NONE",
+            "hcf()",
+            "task->preempt_disable_depth = TRANSITION.depth",
+        ],
+        "fatal preemption guard overflow handling",
+    )
+    require_tokens(
+        enable_body,
+        [
+            "preempt_enable_transition(task->preempt_disable_depth)",
+            "TRANSITION.error != PreemptGuardTransitionError::NONE",
+            "hcf()",
+            "task->scheduler_transition_active.load(std::memory_order_acquire)",
+            "task->deferred_task_switch",
+            "task->waitpid_publish_pending.load(std::memory_order_acquire)",
+            "preempt_pending_action(task->preempt_disable_depth, task->preempt_pending, RETURN_TRANSITION)",
+            "PreemptPendingAction::SERVICE",
+            "request_local_reschedule()",
+        ],
+        "balanced outermost enable and pending service",
+    )
+    if "preempt_enable without disable" in enable_body:
+        fail("a non-null preempt guard underflow must be fatal, not warning-only")
+
+    unlock_body = function_body(spinlock_source, "Spinlock::unlock")
+    irq_unlock_body = function_body(spinlock_source, "Spinlock::unlock_irqrestore")
+    require_order(
+        unlock_body,
+        "unlock_ticket(this)",
+        "sched::preempt_enable_token_at",
+        "plain spinlocks must release ownership before outermost preemption enable",
+    )
+    require_order(
+        irq_unlock_body,
+        "unlock_ticket(this)",
+        "sched::preempt_enable_token_at",
+        "IRQ-save spinlocks must release ownership before outermost preemption enable",
+    )
+
+    timer_body = function_body(scheduler_source, "process_tasks")
+    require_tokens(
+        timer_body,
+        [
+            "current_task->preemption_diagnostic.store(",
+            "encode_preemption_diagnostic({",
+            ".frame_class = LIVE_FRAME_CLASS",
+            ".reason = KERNEL_PREEMPTION.reason",
+            ".source_cpu = DIAGNOSTIC_CPU",
+            ".target_cpu = DIAGNOSTIC_CPU",
+            "std::memory_order_relaxed",
+        ],
+        "single-scalar timer preemption trace publication",
+    )
+    record_migration_body = function_body(scheduler_source, "record_migration_outcome")
+    require_tokens(
+        record_migration_body,
+        [
+            "task->migration_diagnostic.store(",
+            "encode_migration_diagnostic({",
+            ".source_cpu = scheduler_diagnostic_cpu(source_cpu)",
+            ".target_cpu = scheduler_diagnostic_cpu(target_cpu)",
+            "std::memory_order_relaxed",
+        ],
+        "single-scalar placement outcome trace publication",
+    )
+    for forbidden in ("new ", "kmalloc", "dbg::", "log::", "with_lock", "lock("):
+        if forbidden in record_migration_body:
+            fail(f"placement outcome publication must not allocate, log, or acquire locks: found {forbidden}")
+
+    require_tokens(
+        scheduler_header,
+        [
+            "uint8_t current_saved_frame_class;",
+            "uint8_t current_preemption_reason;",
+            "uint64_t current_preemption_source_cpu;",
+            "uint64_t current_preemption_target_cpu;",
+            "uint32_t current_migration_depth;",
+            "uint32_t current_migration_owner_cpu;",
+            "uint64_t current_migration_owner;",
+            "uint8_t current_migration_reason;",
+            "uint64_t current_migration_source_cpu;",
+            "uint64_t current_migration_target_cpu;",
+        ],
+        "scheduler diagnostic snapshot surface",
+    )
+    procfs_body = function_body(procfs_source, "generate_kcpustate")
+    require_tokens(
+        procfs_body,
+        [
+            '"frame_class"',
+            '"preempt_frame"',
+            '"preempt_reason"',
+            '"preempt_source_cpu"',
+            '"preempt_target_cpu"',
+            '"migration_depth"',
+            '"migration_owner_cpu"',
+            '"migration_owner"',
+            '"migration_reason"',
+            '"migration_source_cpu"',
+            '"migration_target_cpu"',
+            '"scheduler_transition"',
+        ],
+        "/proc/kcpustate preemption and migration observability",
+    )
+    require_tokens(
+        ktest_source,
+        [
+            "preempt_enable_transition(0).error",
+            "PreemptPendingAction::PRESERVE",
+            "PreemptPendingAction::SERVICE",
+            "encode_migration_diagnostic(MIGRATION_DIAGNOSTIC)",
+        ],
+        "kernel guard and packed-diagnostic selftests",
+    )
+
+
+def test_classified_restore_policy_owns_validation_and_return_boundaries() -> None:
+    frame_header = FRAME_CLASS_HPP.read_text()
+    context_source = CONTEXT_SWITCH_CPP.read_text()
+    scheduler_source = SCHEDULER_CPP.read_text()
+    asm_source = CONTEXT_SWITCH_ASM.read_text()
+
+    require_tokens(
+        frame_header,
+        [
+            "enum class SavedFrameRestoreKind : uint8_t",
+            "USER_IRET",
+            "SAME_CPL_KERNEL_IRET",
+            "SavedFrameRestorePolicy",
+            "saved_frame_restore_policy(SavedFrameClass frame_class)",
+            ".deliver_signals = false",
+            ".restore_user_fpu = false",
+        ],
+        "saved-frame restore policy",
+    )
+
+    validator_body = function_body(context_source, "validate_classified_frame_for_restore")
+    require_tokens(
+        validator_body,
+        [
+            "SavedFrameRestoreKind::REJECT",
+            "!classified_frame_is_valid(task, frame, frame_class)",
+            "SavedFrameRestoreKind::USER_IRET",
+            "validate_user_frame(frame, task, path)",
+            "SavedFrameRestoreKind::SAME_CPL_KERNEL_IRET",
+            "validate_kernel_frame(frame, task, path)",
+            "hcf()",
+        ],
+        "classified return validator",
+    )
+
+    kernel_validator = function_body(context_source, "validate_kernel_frame")
+    require_tokens(
+        kernel_validator,
+        [
+            "user return frame passed to kernel validator",
+            "!stack_belongs_to_task(task, frame.rsp)",
+            "frame.ss != desc::gdt::GDT_KERN_DS",
+        ],
+        "strict kernel-frame validator",
+    )
+    if re.search(r"frame\.cs == desc::gdt::GDT_USER_CS[\s\S]*?TaskType::PROCESS[\s\S]*?return;", kernel_validator):
+        fail("kernel-frame validation must never accept a PROCESS user selector")
+
+    switch_body = function_body(context_source, "switch_to")
+    stack_owner_body = function_body(context_source, "validate_handoff_stack_ownership")
+    require_tokens(
+        stack_owner_body,
+        [
+            "handoff_stack_collision(OUTGOING_STACK, INCOMING_STACK, OWNERSHIP_CHANGES)",
+            "kernel stack ownership collision",
+            "hcf()",
+        ],
+        "fail-closed handoff stack ownership validator",
+    )
+    require_order(
+        switch_body,
+        'validate_handoff_stack_ownership(sched::get_current_task(), next_task, "switchTo-prepare")',
+        'validate_saved_frame_for_restore(next_task, next_task->context.frame, "switchTo-prepare")',
+        "kernel stack ownership must be proved before preparing a context switch",
+    )
+    require_order(
+        switch_body,
+        'validate_saved_frame_for_restore(next_task, next_task->context.frame, "switchTo-prepare")',
+        "// === POINT OF NO RETURN ===",
+        "the classified frame must be validated before context-switch CPU state changes",
+    )
+    require_tokens(
+        switch_body,
+        [
+            "desc::gdt::set_rsp0",
+            "frame.int_num = next_task->context.frame.int_num;",
+            "frame.err_code = next_task->context.frame.err_code;",
+            "install_task_cpu_bases(next_task, REAL_CPU_ID)",
+            "mm::virt::switch_pagemap(next_task)",
+            "restore_debug_registers_for_task(next_task)",
+        ],
+        "target-CPU architectural state installation",
+    )
+    require_order(
+        switch_body,
+        "frame.err_code = next_task->context.frame.err_code;",
+        'validate_saved_frame_for_restore(next_task, frame, "switchTo-final")',
+        "saved frame provenance must be installed before final classified validation",
+    )
+    require_order(
+        switch_body,
+        "install_task_cpu_bases(next_task, REAL_CPU_ID)",
+        "mm::virt::switch_pagemap(next_task)",
+        "GS/FS and TSS state must be installed before the incoming CR3",
+    )
+    if "repair_stale_process_syscall_resume(next_task)" in switch_body or "repairing daemon rsp before switch" in switch_body:
+        fail("classified context restore must reject mismatched frames instead of repairing them")
+
+    deferred_body = function_body(scheduler_source, "deferred_task_switch")
+    require_order(
+        deferred_body,
+        'validate_handoff_stack_ownership(current_task, next_task, "deferred-switch")',
+        "install_task_cpu_bases(next_task, REAL_CPU_ID)",
+        "deferred handoff must reject a shared kernel stack before target CPU state changes",
+    )
+    require_order(
+        deferred_body,
+        'validate_saved_frame_for_restore(next_task, next_task->context.frame, "deferred-prepare")',
+        "install_task_cpu_bases(next_task, REAL_CPU_ID)",
+        "deferred restore must validate the saved frame before CPU-local state changes",
+    )
+    enter_idle_body = function_body(scheduler_source, "enter_idle_loop")
+    require_order(
+        enter_idle_body,
+        'validate_handoff_stack_ownership(current_task, idle_task, "enter-idle")',
+        "wos_enterIdleStack(IDLE_STACK)",
+        "idle handoff must reject a shared kernel stack before changing stacks",
+    )
+    require_order(
+        context_source,
+        'validate_handoff_stack_ownership(current_task, return_task, "user-return-stack")',
+        "return STACK_TOP;",
+        "user handoff stack selection must reject shared ownership before returning the target stack",
+    )
+    require_tokens(
+        deferred_body,
+        [
+            "task::SavedFrameRestoreKind::USER_IRET",
+            "RESTORE_POLICY.deliver_signals",
+            'validate_saved_frame_for_restore(next_task, next_task->context.frame, "deferred-user-state")',
+        ],
+        "deferred classified restore and signal gate",
+    )
+    if "repair_stale_process_syscall_resume(next_task)" in deferred_body:
+        fail("deferred restore must not synthesize a user frame from a classified kernel frame")
+
+    repair_body = function_body(context_source, "wos_repair_timer_return_frame")
+    require_tokens(repair_body, ["bad timer return frame rejected", "hcf()"], "invalid timer-frame rejection")
+    if "*gpr_ptr =" in repair_body or "*frame_ptr =" in repair_body:
+        fail("invalid timer return selectors must not be silently repaired")
+
+    require_tokens(
+        context_source,
+        [
+            "select_timer_return_frame_class(RETURNING_INTERRUPTED_TASK, INTERRUPTED_FRAME_CLASS",
+            'validate_classified_frame_for_restore(return_task, *frame_ptr, RETURN_FRAME_CLASS, "timer-return")',
+            'validate_saved_frame_for_restore(return_task, *frame_ptr, "exit-return")',
+            "select_user_fpu_restore_frame_class(",
+            "TIMER_AUTHORIZATION_PRESENT && !TIMER_RETURN_MATCHES_TASK",
+            "!POLICY.restore_user_fpu",
+            "!POLICY.deliver_signals",
+        ],
+        "final timer/exit/FPU/signal restore gates",
+    )
+
+    timer_body = function_body(context_source, "wos_sched_timer")
+    require_tokens(
+        timer_body,
+        [
+            "return_task != nullptr && return_task == LIVE_TASK",
+            "DURABLE_RETURN_FRAME_CLASS",
+            "RETURN_FRAME_CLASS",
+            "saved_frame_restore_policy(RETURN_FRAME_CLASS).restore_user_fpu",
+            "set_timer_fpu_return_authorization(return_task, RETURN_FRAME_CLASS)",
+        ],
+        "timer live-frame versus durable-handoff provenance selection",
+    )
+    require_order(
+        timer_body,
+        'validate_classified_frame_for_restore(return_task, *frame_ptr, RETURN_FRAME_CLASS, "timer-return")',
+        "set_timer_fpu_return_authorization(return_task, RETURN_FRAME_CLASS)",
+        "timer FPU authorization must be published only after final classified validation",
+    )
+
+    fpu_restore_body = function_body(context_source, "wos_restore_return_task_fpu")
+    require_order(
+        fpu_restore_body,
+        "consume_timer_fpu_return_authorization()",
+        "select_user_fpu_restore_frame_class(",
+        "the final FPU hook must consume the one-shot timer provenance before choosing a return class",
+    )
+
+    discard_body = function_body(context_source, "wos_discard_abandoned_return_fpu_state")
+    require_tokens(
+        discard_body,
+        ["clear_timer_fpu_return_authorization()", "set_timer_fpu_restore_suppressed(false)"],
+        "non-returning exit must discard every abandoned timer FPU return token",
+    )
+    exit_switch_start = asm_source.find("global jump_to_next_task_no_save")
+    exit_switch_end = asm_source.find("global wos_deferred_task_switch_return", exit_switch_start)
+    if exit_switch_start < 0 or exit_switch_end < 0:
+        fail("missing non-returning exit-switch assembly boundary")
+    exit_switch = asm_source[exit_switch_start:exit_switch_end]
+    require_order(
+        exit_switch,
+        "cli",
+        "call wos_discard_abandoned_return_fpu_state",
+        "exit-switch return-state discard must run with interrupts masked",
+    )
+    require_order(
+        exit_switch,
+        "call wos_discard_abandoned_return_fpu_state",
+        "call wos_jump_to_next_task_no_save",
+        "abandoned timer provenance must be gone before selecting a successor",
+    )
+
+    for macro_name in ("build_kernel_return_from_stack", "build_kernel_return_from_ptrs"):
+        start = asm_source.find(f"%macro {macro_name}")
+        end = asm_source.find("%endmacro", start)
+        if start < 0 or end < 0:
+            fail(f"missing {macro_name} same-CPL return macro")
+        macro_body = asm_source[start:end]
+        require_tokens(
+            macro_body,
+            ["IRETQ_KERNEL_FRAME_OFFSET", "call wos_commit_handoff_task", "add rsp, INTERRUPT_FRAME_SIZE", "iretq"],
+            f"{macro_name} same-CPL iret contract",
+        )
+        require_order(
+            macro_body,
+            "mov rsp, r10",
+            "call wos_commit_handoff_task",
+            f"{macro_name} must leave the outgoing stack before publishing transferable ownership",
+        )
+        require_order(
+            macro_body,
+            "call wos_commit_handoff_task",
+            "iretq",
+            f"{macro_name} must commit handoff only in the final return tail",
+        )
+        if "wos_restore_return_task_fpu" in macro_body or "swapgs" in macro_body:
+            fail(f"{macro_name} must not execute user FPU or GS return work")
 
 
 def test_busy_cpus_nudge_idle_peers_to_steal_process_backlog() -> None:
@@ -1325,16 +2012,24 @@ def test_scheduler_cpu_dump_is_cmdline_gated_and_reports_reschedule_state() -> N
     require_tokens(
         dump_body,
         [
+            "cur=%lu(%.32s)",
+            "schedcpu_preempt:",
             "preempt=%u/%u",
             "preempt_max_us=%lu",
+            "schedcpu_migrate:",
+            "migrate=%u/%u",
+            "mframe=%s",
+            "mreject=%s",
+            "schedcpu_wait:",
+            "wait=%.32s",
             "pending=%u",
             "timer=%lu/%lu/%lu",
-            "wake=%lu/%lu",
+            "ipi=%lu/%lu",
             "local=%lu/%lu",
-            "last_tick=%lu",
-            "wait_deadline=%lu",
+            "tick=%lu",
+            "deadline=%lu",
         ],
-        "scheduler CPU dump diagnostic fields",
+        "bounded correlated scheduler CPU dump diagnostic records",
     )
     require_tokens(
         dump_all_body,
@@ -2313,12 +3008,151 @@ def test_active_task_snapshot_holds_one_registry_lock() -> None:
             fail(f"active task snapshot must not allocate or log under the registry lock: {forbidden}")
 
 
+def test_migration_guard_is_atomic_and_dominates_cross_cpu_placement() -> None:
+    source = SCHEDULER_CPP.read_text()
+    task_header = TASK_HPP.read_text()
+    guard_header = MIGRATION_GUARD_HPP.read_text()
+    epoch_header = EPOCH_HPP.read_text()
+    waitpid_source = WAITPID_CPP.read_text()
+
+    require_tokens(
+        task_header,
+        [
+            "std::atomic<uint64_t> migration_guard_state",
+            "std::atomic<uint64_t> migration_disable_start_us",
+            "std::atomic<uint64_t> migration_disable_max_us",
+            "std::atomic<uint64_t> migration_disable_owner",
+            "decode_migration_guard_state(migration_guard_state.load(order))",
+        ],
+        "per-task migration guard state",
+    )
+    require_tokens(
+        guard_header,
+        [
+            "encode_migration_guard_state",
+            "decode_migration_guard_state",
+            "migration_disable_transition",
+            "migration_enable_transition",
+            "migration_guard_target_cpu",
+            "class MigrationGuard",
+            "void release()",
+        ],
+        "migration transition model and RAII API",
+    )
+    require_tokens(
+        epoch_header,
+        ["~EpochGuard() { release(); }", "void release()", "cpu_id = UINT64_MAX"],
+        "idempotent epoch guard release for non-returning handoffs",
+    )
+
+    disable_body = function_body(source, "migration_disable_token_at")
+    require_order(
+        disable_body,
+        "preempt_disable_token_at(caller)",
+        "uint64_t const CPU_NO = cpu::current_cpu()",
+        "migration guard entry must stabilize the current task before capturing its CPU",
+    )
+    require_order(
+        disable_body,
+        "task->migration_disable_owner.store(caller",
+        "task->migration_guard_state.store(encode_migration_guard_state(TRANSITION.state)",
+        "migration guard metadata must precede release publication",
+    )
+    require_order(
+        disable_body,
+        "task->migration_guard_state.store(encode_migration_guard_state(TRANSITION.state)",
+        "preempt_enable_token_at(task, caller)",
+        "migration guard state must be visible before preemption resumes",
+    )
+
+    enable_body = function_body(source, "migration_enable_token_at")
+    require_tokens(
+        enable_body,
+        [
+            "CURRENT_TASK != task",
+            "migration_enable_transition(CURRENT, CPU_NO)",
+            "update_relaxed_max(task->migration_disable_max_us",
+            "task->migration_guard_state.store(encode_migration_guard_state(TRANSITION.state), std::memory_order_release)",
+        ],
+        "migration guard balanced final enable",
+    )
+
+    move_body = function_body(source, "move_task_owner_to_cpu")
+    wake_target_body = function_body(source, "event_wake_target_cpu")
+    wake_body = function_body(source, "wake_task_from_event_on_cpu")
+    reschedule_body = function_body(source, "reschedule_task_for_cpu_once")
+    steal_body = function_body(source, "task_can_idle_steal")
+    cross_cpu_body = function_body(source, "task_cross_cpu_migration_decision")
+    require_tokens(
+        cross_cpu_body,
+        ["migration_guard_disabled(MIGRATION_STATE)", "MIGRATION_STATE.owner_cpu == source_cpu", ".migration_disabled = MIGRATION_DISABLED"],
+        "central cross-CPU migration guard",
+    )
+    require_tokens(move_body, ["task_cross_cpu_migration_allowed(task, OWNER_CPU, target_cpu"], "explicit task migration guard")
+    require_order(
+        wake_target_body,
+        "migration_guard_placement(task",
+        "scheduler_single_process_cpu_target(task",
+        "per-task migration guard must dominate global wake placement policy",
+    )
+    require_tokens(wake_body, ["GUARDED.disabled", "cpu = GUARDED.owner_cpu"], "event wake migration guard")
+    require_order(
+        reschedule_body,
+        "MigrationGuardPlacement const GUARDED",
+        "scheduler_single_process_cpu_target(task",
+        "reschedule placement must apply the task guard before diagnostic policy",
+    )
+    require_tokens(
+        steal_body,
+        ["task_cross_cpu_migration_allowed(task, source_cpu, target_cpu, core_count)"],
+        "idle-steal migration guard",
+    )
+    require_tokens(source, ["assert_task_migration_owner_is_current_cpu(task)"], "handoff/current ownership assertion")
+
+    process_tasks_body = function_body(source, "process_tasks")
+    deferred_body = function_body(source, "deferred_task_switch")
+    require_order(
+        process_tasks_body,
+        "MigrationGuard migration_guard",
+        "EpochGuard epoch_guard",
+        "timer epoch lifetime must first stabilize CPU ownership",
+    )
+    require_order(
+        process_tasks_body,
+        "epoch_guard.release()",
+        "migration_guard.release()",
+        "timer idle handoff must close epoch lifetime before releasing CPU ownership",
+    )
+    require_order(
+        process_tasks_body,
+        "migration_guard.release()",
+        "enter_idle_loop(idle_rq)",
+        "non-returning timer idle handoff must not leak migration-disable depth",
+    )
+    require_order(
+        deferred_body,
+        'asm volatile("cli" ::: "memory")',
+        "migration_guard.release()",
+        "non-returning deferred handoff releases migration only after masking interrupts",
+    )
+    require_order(
+        waitpid_source,
+        "ker::mod::sched::MigrationGuard const MIGRATION_GUARD",
+        "ker::mod::sched::EpochGuard const EPOCH_GUARD",
+        "waitpid epoch lifetime must first stabilize CPU ownership",
+    )
+
+
 def main() -> None:
     test_scheduler_wait_check_arm_halt_is_irq_atomic()
     test_event_wake_cancel_preserves_current_task_wakeup_token()
     test_concurrent_reschedule_requests_have_one_queue_transition_leader()
     test_event_wake_rebalances_normal_process_waiters()
     test_idle_steal_can_migrate_normal_process_work()
+    test_saved_frame_class_is_durable_and_drives_return_consumers()
+    test_same_cpu_kernel_preemption_is_policy_gated_and_transition_safe()
+    test_preemption_diagnostics_are_bounded_and_guard_misuse_is_fatal()
+    test_classified_restore_policy_owns_validation_and_return_boundaries()
     test_busy_cpus_nudge_idle_peers_to_steal_process_backlog()
     test_wait_channel_policy_uses_typed_kinds()
     test_higher_priority_wakeup_bypasses_only_priority_holdoff_guards()
@@ -2350,6 +3184,7 @@ def main() -> None:
     test_voluntary_blocked_current_cannot_hide_runnable_peer()
     test_runnable_publication_requires_successful_heap_insert()
     test_active_task_snapshot_holds_one_registry_lock()
+    test_migration_guard_is_atomic_and_dominates_cross_cpu_placement()
     print("scheduler wake-token and runtime accounting invariants hold")
 
 

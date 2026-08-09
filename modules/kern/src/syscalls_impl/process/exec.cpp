@@ -27,6 +27,7 @@
 #include <platform/mm/phys.hpp>
 #include <platform/perf/perf_events.hpp>
 #include <platform/power/power.hpp>
+#include <platform/sched/frame_class.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
 #include <platform/sys/context_switch.hpp>
@@ -2884,6 +2885,8 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
     task->context.frame.flags = 0x202;
     task->context.frame.int_num = 0;
     task->context.frame.err_code = 0;
+    ker::mod::sys::context_switch::record_saved_frame_class(task, task->context.frame,
+                                                            ker::mod::sched::task::SavedFrameOrigin::SYNTHETIC_USER_RETURN);
 
     // Match the fresh-process entry contract used by wos_asm_enter_usermode:
     // startup code consumes argc/argv/envp from the initial stack, not GPRs.

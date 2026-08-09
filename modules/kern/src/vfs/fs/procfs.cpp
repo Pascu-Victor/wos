@@ -27,6 +27,9 @@
 #include <platform/mm/swap.hpp>
 #include <platform/mm/virt.hpp>
 #include <platform/perf/perf_events.hpp>
+#include <platform/sched/frame_class.hpp>
+#include <platform/sched/preemption_diagnostics.hpp>
+#include <platform/sched/preemption_policy.hpp>
 #include <platform/sched/task.hpp>
 #include <platform/smt/smt.hpp>
 #include <syscalls_impl/vmem/sys_vmem.hpp>
@@ -4098,11 +4101,37 @@ auto generate_kcpustate(char* buf, size_t bufsz) -> size_t {
         append_memacc_bool(p, end, "cur_vblk", state.current_voluntary_block);
         append_memacc_bool(p, end, "cur_wblk", state.current_wants_block);
         append_memacc_bool(p, end, "cur_pinned", state.current_cpu_pinned);
+        append_memacc_dec(p, end, "task_cpu", state.current_task_cpu);
+        append_memacc_str(p, end, "frame_class",
+                          ker::mod::sched::task::saved_frame_class_name(
+                              static_cast<ker::mod::sched::task::SavedFrameClass>(state.current_saved_frame_class)));
+        append_memacc_str(p, end, "preempt_frame",
+                          ker::mod::sched::task::saved_frame_class_name(
+                              static_cast<ker::mod::sched::task::SavedFrameClass>(state.current_preemption_frame_class)));
+        append_memacc_str(p, end, "preempt_reason",
+                          ker::mod::sched::kernel_preemption_block_reason_name(
+                              static_cast<ker::mod::sched::KernelPreemptionBlockReason>(state.current_preemption_reason)));
+        append_memacc_dec(p, end, "preempt_source_cpu", state.current_preemption_source_cpu);
+        append_memacc_dec(p, end, "preempt_target_cpu", state.current_preemption_target_cpu);
         append_memacc_dec(p, end, "preempt_depth", state.current_preempt_depth);
         append_memacc_bool(p, end, "preempt_pending", state.current_preempt_pending);
         append_memacc_dec(p, end, "preempt_max_us", state.current_preempt_max_us);
         append_memacc_hex(p, end, "preempt_owner", state.current_preempt_owner);
         append_memacc_dec(p, end, "preempt_start_us", state.current_preempt_start_us);
+        append_memacc_dec(p, end, "migration_depth", state.current_migration_depth);
+        append_memacc_dec(p, end, "migration_owner_cpu", state.current_migration_owner_cpu);
+        append_memacc_dec(p, end, "migration_max_us", state.current_migration_max_us);
+        append_memacc_hex(p, end, "migration_owner", state.current_migration_owner);
+        append_memacc_dec(p, end, "migration_start_us", state.current_migration_start_us);
+        append_memacc_str(p, end, "migration_frame",
+                          ker::mod::sched::task::saved_frame_class_name(
+                              static_cast<ker::mod::sched::task::SavedFrameClass>(state.current_migration_frame_class)));
+        append_memacc_str(p, end, "migration_reason",
+                          ker::mod::sched::migration_rejection_reason_name(
+                              static_cast<ker::mod::sched::MigrationRejectionReason>(state.current_migration_reason)));
+        append_memacc_dec(p, end, "migration_source_cpu", state.current_migration_source_cpu);
+        append_memacc_dec(p, end, "migration_target_cpu", state.current_migration_target_cpu);
+        append_memacc_bool(p, end, "scheduler_transition", state.current_scheduler_transition);
         append_char(p, end, '\n');
     }
 

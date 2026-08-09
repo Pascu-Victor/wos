@@ -19,7 +19,9 @@
 #include <platform/mm/paging.hpp>
 #include <platform/mm/phys.hpp>
 #include <platform/mm/virt.hpp>
+#include <platform/sched/frame_class.hpp>
 #include <platform/sched/scheduler.hpp>
+#include <platform/sys/context_switch.hpp>
 #include <platform/sys/mutex.hpp>
 #include <syscalls_impl/vmem/sys_vmem.hpp>
 #include <utility>
@@ -1045,6 +1047,7 @@ Task::Task(const char* name, uint64_t elf_start, uint64_t kernel_rsp, TaskType t
     this->context.frame.ss = 0x1b;      // User stack segment (GDT entry 3, RPL=3) NOLINT
     this->context.frame.cs = 0x23;      // User code segment (GDT entry 4, RPL=3) NOLINT
     this->context.frame.flags = 0x202;  // IF (interrupts enabled) + reserved bit 1 NOLINT
+    sys::context_switch::record_saved_frame_class(this, this->context.frame, SavedFrameOrigin::SYNTHETIC_USER_RETURN);
 
     // Initialize important TLS symbols (e.g. SafeStack pointer) now that ELF is loaded and relocations processed
     ker::loader::debug::DebugSymbol const* ssym = ker::loader::debug::get_process_symbol(this->pid, "__safestack_unsafe_stack_ptr");
@@ -1112,6 +1115,7 @@ auto Task::initialize_process_image(const ker::loader::elf::ElfFileView& elf, co
     context.frame.ss = 0x1b;
     context.frame.cs = 0x23;
     context.frame.flags = 0x202;
+    sys::context_switch::record_saved_frame_class(this, context.frame, SavedFrameOrigin::SYNTHETIC_USER_RETURN);
 
     ker::loader::debug::DebugSymbol const* ssym = ker::loader::debug::get_process_symbol(pid, "__safestack_unsafe_stack_ptr");
     if ((ssym != nullptr) && ssym->is_tls_offset) {
@@ -1222,6 +1226,7 @@ Task* Task::create_user_thread(Task* parent, uint64_t tcb_vaddr, uint64_t user_s
     t->context.frame.cs = 0x23;              // user code segment
     t->context.frame.ss = 0x1b;              // user stack segment
     t->context.frame.flags = 0x202;          // IF=1, reserved=1
+    sys::context_switch::record_saved_frame_class(t, t->context.frame, SavedFrameOrigin::SYNTHETIC_USER_RETURN);
     t->context.regs = cpu::GPRegs{};
     t->context.regs.rdi = entry_va;     // arg1: entry function
     t->context.regs.rsi = user_arg_va;  // arg2: user_arg
@@ -1341,6 +1346,7 @@ Task* Task::create_kernel_thread(const char* name, void (*entry_func)()) {
     task->kthread_entry = entry_func;
     task->context.frame.rip = reinterpret_cast<uint64_t>(wos_kernel_thread_trampoline);
     task->context.regs.rdi = reinterpret_cast<uint64_t>(entry_func);
+    sys::context_switch::record_saved_frame_class(task, task->context.frame, SavedFrameOrigin::DAEMON_START);
     return task;
 }
 

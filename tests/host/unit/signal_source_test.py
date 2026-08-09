@@ -228,6 +228,7 @@ def test_signal_targets_are_user_canonical_on_all_delivery_paths() -> None:
 
 def test_interrupt_signal_delivery_is_gated_by_user_return_frame() -> None:
     context_source = CONTEXT_SWITCH_CPP.read_text()
+    signal_source = SIGNAL_CPP.read_text()
     helper_body = function_body(context_source, "check_pending_signals_for_return")
     timer_body = function_body(context_source, "wos_sched_timer")
     exit_body = function_body(context_source, "wos_jump_to_next_task_no_save")
@@ -235,16 +236,18 @@ def test_interrupt_signal_delivery_is_gated_by_user_return_frame() -> None:
     require_tokens(
         context_source,
         [
-            "inline auto is_user_return_frame(const gates::InterruptFrame& frame) -> bool",
             "inline void check_pending_signals_for_return(cpu::GPRegs& gpr, gates::InterruptFrame& frame)",
+            "saved_frame_class_is_valid(return_task, frame)",
         ],
         "context-switch signal return helper",
     )
     require_tokens(
         helper_body,
         [
-            "if (!is_user_return_frame(frame))",
             "auto* return_task = sched::get_return_task();",
+            "saved_frame_restore_policy(return_task->context.saved_frame_class)",
+            "!POLICY.deliver_signals",
+            "!saved_frame_class_is_valid(return_task, frame)",
             "sys::signal::check_pending_signals_interrupt(gpr, frame);",
             "sys::signal::check_pending_signals_handoff(return_task, gpr, frame);",
         ],
@@ -252,16 +255,27 @@ def test_interrupt_signal_delivery_is_gated_by_user_return_frame() -> None:
     )
     require_order(
         helper_body,
-        "if (!is_user_return_frame(frame))",
         "auto* return_task = sched::get_return_task();",
-        "kernel return frames must be rejected before querying scheduler current/return task state",
+        "sys::signal::check_pending_signals_interrupt(gpr, frame);",
+        "the durable return-frame class must be checked before signal delivery",
+    )
+    require_tokens(
+        signal_source,
+        [
+            "auto interrupt_frame_is_user_return(sched::task::Task* task, const gates::InterruptFrame& frame) -> bool",
+            "context_switch::classify_saved_frame(task, frame, sched::task::SavedFrameOrigin::INTERRUPT",
+            "saved_frame_restore_policy(FRAME_CLASS).deliver_signals",
+            "!sched::task::saved_frame_restore_policy(task->context.saved_frame_class).deliver_signals",
+            "!context_switch::saved_frame_class_is_valid(task, task->context.frame)",
+        ],
+        "signal delivery classified user-return gates",
     )
     require_tokens(
         timer_body,
         [
             "sched::process_tasks(*gpr_ptr, *frame_ptr);",
             "check_pending_signals_for_return(*gpr_ptr, *frame_ptr);",
-            'validate_kernel_frame(*frame_ptr, return_task, "timer-return");',
+            'validate_classified_frame_for_restore(return_task, *frame_ptr, RETURN_FRAME_CLASS, "timer-return");',
         ],
         "timer return signal gate",
     )
@@ -270,7 +284,7 @@ def test_interrupt_signal_delivery_is_gated_by_user_return_frame() -> None:
         [
             "sched::jump_to_next_task(*gpr_ptr, *frame_ptr);",
             "check_pending_signals_for_return(*gpr_ptr, *frame_ptr);",
-            'validate_kernel_frame(*frame_ptr, return_task, "exit-return");',
+            'validate_saved_frame_for_restore(return_task, *frame_ptr, "exit-return");',
         ],
         "exit return signal gate",
     )
