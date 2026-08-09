@@ -107,7 +107,7 @@ separate UBSan profiles. Use `WOS_KERNEL_STRICT_WARNINGS=ON` or
 
 Use `bin/wos-ktest` for the isolated kernel selftest VM workflow. It builds,
 packages, and launches a single-node WOS VM with expensive kernel diagnostics
-enabled and the kernel command line set from `configs/node.json` (normally
+enabled and the kernel command line set from `configs/node_ktest.json` (normally
 `--selftest`).
 
 The KTEST workflow must stay separate from the normal WOS build and disk
@@ -134,7 +134,7 @@ Useful KTEST commands:
 The shared per-node VM layout lives in `scripts/cluster/node_setup.py`.
 `scripts/cluster/cluster_setup.py` and `scripts/test/ktest_setup.py` both use
 that layout; avoid duplicating QEMU argument, overlay, hostname, or NIC logic.
-`configs/node.json` is the single-node KTEST spec and should keep the same VM
+`configs/node_ktest.json` is the single-node KTEST spec and should keep the same VM
 spec shape that cluster setup uses.
 
 When KTEST appears not to boot, inspect `ktest-data/serial-vm0.log` and

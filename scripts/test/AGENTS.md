@@ -3,7 +3,7 @@
 `ktest_setup.py` implements the public `bin/wos-ktest` command. It builds,
 packages, and launches an isolated single-node WOS VM for kernel selftests with
 diagnostic CMake options enabled and the kernel command line set from
-`configs/node.json`.
+`configs/node_ktest.json`.
 
 Preserve the isolation contract:
 
@@ -36,7 +36,7 @@ Useful commands:
 For local verification after editing this script, run:
 
 - `python3 -m py_compile scripts/test/ktest_setup.py scripts/cluster/node_setup.py scripts/cluster/cluster_setup.py`
-- `python3 -m json.tool configs/node.json`
+- `python3 -m json.tool configs/node_ktest.json`
 - `bin/wos-ktest --help`
 
 Runtime boot and selftest results are user-run evidence unless the user

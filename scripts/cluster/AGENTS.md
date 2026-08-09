@@ -18,7 +18,7 @@ Node specs are dictionaries with these main sections:
   `queues`, `vhost`, `driver`, and optional bridge metadata
 - `ivshmem`: optional shared-memory devices
 
-The KTEST workflow builds a one-node cluster config from `configs/node.json`
+The KTEST workflow builds a one-node cluster config from `configs/node_ktest.json`
 through `node_setup.cluster_config_from_node_spec()`. Keep that path compatible
 when evolving cluster topology fields.
 

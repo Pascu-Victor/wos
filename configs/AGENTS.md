@@ -1,6 +1,6 @@
 # Config Agent Notes
 
-`node.json` is the single-node VM spec used by `bin/wos-ktest`. Keep its layout
+`node_ktest.json` is the single-node VM spec used by `bin/wos-ktest`. Keep its layout
 compatible with `scripts/cluster/node_setup.py` and the cluster node spec shape:
 top-level `build`, `package`, and `node` sections, with `node.vm` and
 `node.nics` carrying the VM and network configuration.
