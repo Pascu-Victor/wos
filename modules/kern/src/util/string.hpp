@@ -3,6 +3,7 @@
 #include <cstdarg>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <span>
 #include <type_traits>
 #include <utility>
@@ -62,350 +63,327 @@ auto i64_decimal_to_buffer(std::array<char, N>& buf, int64_t value) -> int {
     return len;
 }
 
+namespace detail {
+
+class BoundedFormatWriter {
+   public:
+    BoundedFormatWriter(char* output, size_t capacity) : output_(output), capacity_(capacity) {}
+
+    void append(char value) {
+        size_t const STORED = stored_size();
+        if (STORED < writable_capacity()) {
+            output_[STORED] = value;
+        }
+        advance(1);
+    }
+
+    void append(const char* source, size_t length) {
+        if (source == nullptr || length == 0) {
+            return;
+        }
+
+        size_t const STORED = stored_size();
+        size_t const WRITABLE = writable_capacity();
+        size_t const COPY_LEN = STORED < WRITABLE ? ((length < WRITABLE - STORED) ? length : WRITABLE - STORED) : 0;
+        if (COPY_LEN != 0) {
+            std::memcpy(output_ + STORED, source, COPY_LEN);
+        }
+        advance(length);
+    }
+
+    void append_repeat(char value, size_t count) {
+        size_t const STORED = stored_size();
+        size_t const WRITABLE = writable_capacity();
+        size_t const COPY_LEN = STORED < WRITABLE ? ((count < WRITABLE - STORED) ? count : WRITABLE - STORED) : 0;
+        for (size_t i = 0; i < COPY_LEN; ++i) {
+            output_[STORED + i] = value;
+        }
+        advance(count);
+    }
+
+    void terminate() {
+        if (output_ != nullptr && capacity_ != 0) {
+            output_[stored_size()] = '\0';
+        }
+    }
+
+    [[nodiscard]] auto result() const -> int {
+        if (length_overflow_ || logical_size_ > static_cast<size_t>(std::numeric_limits<int>::max())) {
+            return -1;
+        }
+        return static_cast<int>(logical_size_);
+    }
+
+   private:
+    [[nodiscard]] auto writable_capacity() const -> size_t { return output_ != nullptr && capacity_ != 0 ? capacity_ - 1 : 0; }
+
+    [[nodiscard]] auto stored_size() const -> size_t {
+        size_t const WRITABLE = writable_capacity();
+        return logical_size_ < WRITABLE ? logical_size_ : WRITABLE;
+    }
+
+    void advance(size_t count) {
+        if (count > std::numeric_limits<size_t>::max() - logical_size_) {
+            logical_size_ = std::numeric_limits<size_t>::max();
+            length_overflow_ = true;
+            return;
+        }
+        logical_size_ += count;
+    }
+
+    char* output_{};
+    size_t capacity_{};
+    size_t logical_size_{};
+    bool length_overflow_{};
+};
+
+template <size_t N>
+auto u64_base_to_buffer(std::array<char, N>& buf, uint64_t value, uint32_t base) -> int {
+    constexpr char DIGITS[] = "0123456789abcdef";
+    if (base < 2 || base > 16 || N < 2) {
+        return 0;
+    }
+
+    size_t len = 0;
+    if (value == 0) {
+        buf.at(len++) = '0';
+    } else {
+        std::array<char, N> reverse{};
+        while (value != 0 && len + 1 < N) {
+            reverse.at(len++) = DIGITS[value % base];
+            value /= base;
+        }
+        for (size_t i = 0; i < len; ++i) {
+            buf.at(i) = reverse.at(len - 1 - i);
+        }
+    }
+    buf.at(len) = '\0';
+    return static_cast<int>(len);
+}
+
+}  // namespace detail
+
 template <typename T>
 auto vsnprintf(char* str, T size, const char* format, va_list args) -> int {
     static_assert(std::is_same_v<T, size_t>, "size must be of type size_t");
-    size_t i = 0;
-    size_t j = 0;
-    std::array<char, 64> buf = {};  // no number is bigger than 64 digits in base 10
-
-    while (format[i] != '\0') {
-        if (format[i] == '%') {
-            i++;
-
-            // Parse width specifier
-            int width = 0;
-            bool width_from_arg = false;
-            char pad_char = ' ';
-
-            // Check for zero-padding
-            if (format[i] == '0') {
-                pad_char = '0';
-                i++;
-            }
-
-            // Check for width from argument (*) or numeric width
-            if (format[i] == '*') {
-                width_from_arg = true;
-                i++;
-            } else {
-                while (format[i] >= '0' && format[i] <= '9') {
-                    width = (width * 10) + (format[i] - '0');
-                    i++;
-                }
-            }
-
-            switch (format[i]) {
-                case '.': {
-                    i++;
-                    int precision = 0;
-                    if (format[i] == '*') {
-                        i++;
-                        if (format[i] == 's') {
-                            // %.*s - precision from arg
-                            precision = va_arg(args, int);
-                            const char* s = va_arg(args, const char*);
-                            if (s == nullptr) {
-                                break;
-                            }
-                            // count up to precision chars without calling strlen
-                            size_t slen = 0;
-                            while (std::cmp_less(slen, precision) && s[slen] != '\0') {
-                                slen++;
-                            }
-                            size_t const COPY_LEN = bounded_copy_len(j, slen, size);
-                            if (COPY_LEN > 0) {
-                                strncpy(str + j, s, COPY_LEN);
-                                j += COPY_LEN;
-                            }
-                            break;
-                        }
-                    } else if (format[i] >= '0' && format[i] <= '9') {
-                        // parse numeric precision  e.g. %.11s
-                        while (format[i] >= '0' && format[i] <= '9') {
-                            precision = (precision * 10) + (format[i] - '0');
-                            i++;
-                        }
-                        if (format[i] == 's') {
-                            // %.Ns - fixed numeric precision
-                            const char* s = va_arg(args, const char*);
-                            if (s == nullptr) {
-                                break;
-                            }
-                            size_t slen = 0;
-                            while (std::cmp_less(slen, precision) && s[slen] != '\0') {
-                                slen++;
-                            }
-                            size_t const COPY_LEN = bounded_copy_len(j, slen, size);
-                            if (COPY_LEN > 0) {
-                                strncpy(str + j, s, COPY_LEN);
-                                j += COPY_LEN;
-                            }
-                            break;
-                        }
-                    }
-                    // Unsupported format, treat literally
-                    str[j++] = '%';
-                    str[j++] = '.';
-                    // don't re-print format[i] — it was already consumed by the numeric-precision loop
-                    // Step back so the outer i++ lands on the unrecognised char
-                    i--;
-                    break;
-                }
-                case 'd': {
-                    if (width_from_arg) {
-                        width = va_arg(args, int);
-                    }
-                    int const N = va_arg(args, int);
-                    int const LEN = itoa(N, std::span(buf.data(), buf.size()));
-
-                    // Apply padding
-                    int const PAD_LEN = width - LEN;
-                    if (PAD_LEN > 0 && j + PAD_LEN < size) {
-                        for (int k = 0; k < PAD_LEN; k++) {
-                            str[j++] = pad_char;
-                        }
-                    }
-
-                    strncpy(str + j, buf.data(), size - j);
-                    j += LEN;
-                    break;
-                }
-                case 'l': {
-                    i++;
-                    if (format[i] == 'u') {
-                        // %lu - unsigned long (64-bit on x86_64)
-                        if (width_from_arg) {
-                            width = va_arg(args, int);
-                        }
-                        uint64_t const N = va_arg(args, uint64_t);
-
-                        int const LEN = u64_decimal_to_buffer(buf, N);
-
-                        int const PAD_LEN = width - LEN;
-                        if (PAD_LEN > 0 && j + PAD_LEN < size) {
-                            for (int k = 0; k < PAD_LEN; k++) {
-                                str[j++] = pad_char;
-                            }
-                        }
-
-                        strncpy(str + j, buf.data(), size - j);
-                        j += LEN;
-                    } else if (format[i] == 'x') {
-                        // %lx - unsigned long hex (64-bit on x86_64)
-                        if (width_from_arg) {
-                            width = va_arg(args, int);
-                        }
-                        uint64_t const N = va_arg(args, uint64_t);
-                        int const LEN = u64toh(N, std::span(buf.data(), buf.size()));
-
-                        int const PAD_LEN = width - LEN;
-                        if (PAD_LEN > 0 && j + PAD_LEN < size) {
-                            for (int k = 0; k < PAD_LEN; k++) {
-                                str[j++] = pad_char;
-                            }
-                        }
-
-                        strncpy(str + j, buf.data(), size - j);
-                        j += LEN;
-                    } else if (format[i] == 'd') {
-                        // %ld - signed long (64-bit on x86_64)
-                        if (width_from_arg) {
-                            width = va_arg(args, int);
-                        }
-                        int64_t const SN = va_arg(args, int64_t);
-
-                        int const LEN = i64_decimal_to_buffer(buf, SN);
-
-                        int const PAD_LEN = width - LEN;
-                        if (PAD_LEN > 0 && j + PAD_LEN < size) {
-                            for (int k = 0; k < PAD_LEN; k++) {
-                                str[j++] = pad_char;
-                            }
-                        }
-
-                        strncpy(str + j, buf.data(), size - j);
-                        j += LEN;
-                    } else if (format[i] == 'l') {
-                        i++;
-                        if (format[i] == 'u') {
-                            if (width_from_arg) {
-                                width = va_arg(args, int);
-                            }
-                            uint64_t const N = va_arg(args, uint64_t);
-
-                            // Convert unsigned to decimal string
-                            int const LEN = u64_decimal_to_buffer(buf, N);
-
-                            // Apply padding
-                            int const PAD_LEN = width - LEN;
-                            if (PAD_LEN > 0 && j + PAD_LEN < size) {
-                                for (int k = 0; k < PAD_LEN; k++) {
-                                    str[j++] = pad_char;
-                                }
-                            }
-
-                            strncpy(str + j, buf.data(), size - j);
-                            j += LEN;
-                        } else if (format[i] == 'x') {
-                            if (width_from_arg) {
-                                width = va_arg(args, int);
-                            }
-                            uint64_t const N = va_arg(args, uint64_t);
-                            int const LEN = u64toh(N, std::span(buf.data(), buf.size()));
-
-                            // Apply padding
-                            int const PAD_LEN = width - LEN;
-                            if (PAD_LEN > 0 && j + PAD_LEN < size) {
-                                for (int k = 0; k < PAD_LEN; k++) {
-                                    str[j++] = pad_char;
-                                }
-                            }
-
-                            strncpy(str + j, buf.data(), size - j);
-                            j += LEN;
-                        }
-                    }
-                    break;
-                }
-                case 'x': {
-                    if (width_from_arg) {
-                        width = va_arg(args, int);
-                    }
-                    unsigned int const N = va_arg(args, unsigned int);
-                    int const LEN = u64toh(N, std::span(buf.data(), buf.size()));
-
-                    // Apply padding
-                    int const PAD_LEN = width - LEN;
-                    if (PAD_LEN > 0 && j + PAD_LEN < size) {
-                        for (int k = 0; k < PAD_LEN; k++) {
-                            str[j++] = pad_char;
-                        }
-                    }
-
-                    strncpy(str + j, buf.data(), size - j);
-                    j += LEN;
-                    break;
-                }
-                case 'z': {
-                    // Length modifier for size_t
-                    i++;
-                    if (format[i] == 'u') {
-                        if (width_from_arg) {
-                            width = va_arg(args, int);
-                        }
-                        size_t const N = va_arg(args, size_t);
-
-                        // Convert unsigned to decimal string
-                        int const LEN = u64_decimal_to_buffer(buf, static_cast<uint64_t>(N));
-
-                        // Apply padding
-                        int const PAD_LEN = width - LEN;
-                        if (PAD_LEN > 0 && j + PAD_LEN < size) {
-                            for (int k = 0; k < PAD_LEN; k++) {
-                                str[j++] = pad_char;
-                            }
-                        }
-
-                        strncpy(str + j, buf.data(), size - j);
-                        j += LEN;
-                    } else {
-                        // Unsupported z modifier
-                        str[j++] = '%';
-                        str[j++] = 'z';
-                        str[j++] = format[i];
-                    }
-                    break;
-                }
-                case 'u': {
-                    if (width_from_arg) {
-                        width = va_arg(args, int);
-                    }
-                    unsigned int const N = va_arg(args, unsigned int);
-
-                    // Convert unsigned to decimal string
-                    int const LEN = u64_decimal_to_buffer(buf, static_cast<uint64_t>(N));
-
-                    // Apply padding
-                    int const PAD_LEN = width - LEN;
-                    if (PAD_LEN > 0 && j + PAD_LEN < size) {
-                        for (int k = 0; k < PAD_LEN; k++) {
-                            str[j++] = pad_char;
-                        }
-                    }
-
-                    strncpy(str + j, buf.data(), size - j);
-                    j += LEN;
-                    break;
-                }
-                case 's': {
-                    const char* s = va_arg(args, const char*);
-                    if (s == nullptr) {
-                        // Print "(null)" like standard printf
-                        const char* null_str = "(null)";
-                        size_t const NULL_LEN = 6;
-                        size_t const SPACE_LEFT = (j < size) ? (size - j - 1) : 0;
-                        size_t const TO_COPY = (NULL_LEN < SPACE_LEFT) ? NULL_LEN : SPACE_LEFT;
-                        if (TO_COPY > 0) {
-                            strncpy(str + j, null_str, TO_COPY);
-                            j += TO_COPY;
-                        }
-                        break;
-                    }
-                    size_t const SRC_LEN = strlen(s);
-                    size_t const SPACE_LEFT = (j < size) ? (size - j - 1) : 0;
-                    size_t const TO_COPY = (SRC_LEN < SPACE_LEFT) ? SRC_LEN : SPACE_LEFT;
-                    if (TO_COPY > 0) {
-                        strncpy(str + j, s, TO_COPY);
-                        j += TO_COPY;
-                    }
-                    break;
-                }
-                case 'c': {
-                    char const C = va_arg(args, int);
-                    str[j++] = C;
-                    break;
-                }
-                case 'b': {
-                    int const N = va_arg(args, int);
-                    int const LEN = itoa(N, std::span(buf.data(), buf.size()), 2);
-                    strncpy(str + j, buf.data(), size - j);
-                    j += LEN;
-                    break;
-                }
-                case 'p': {
-                    uint64_t const N = va_arg(args, uint64_t);
-                    str[j++] = '0';
-                    str[j++] = 'x';
-                    int const LEN = u64toh(N, std::span(buf.data(), buf.size()));
-                    strncpy(str + j, buf.data(), size - j);
-                    j += LEN;
-                    break;
-                }
-                case 'h': {
-                    // padded hex byte
-                    uint8_t const N = va_arg(args, int);
-                    int const LEN = u64toh(N, std::span(buf.data(), buf.size()));
-                    if (LEN == 1) {
-                        str[j++] = '0';
-                    }
-                    strncpy(str + j, buf.data(), size - j);
-                    j += LEN;
-                    break;
-                }
-                default:
-                    str[j++] = format[i];
-                    break;
-            }
-        } else {
-            str[j++] = format[i];
-        }
-        i++;
+    detail::BoundedFormatWriter writer(str, size);
+    if (format == nullptr || (str == nullptr && size != 0)) {
+        writer.terminate();
+        return -1;
     }
 
-    str[j] = '\0';
+    size_t i = 0;
+    std::array<char, 64> buf = {};  // no number is bigger than 64 digits in base 10
 
-    return static_cast<int>(j);
+    auto append_padded = [&writer](const char* value, size_t length, int width, char pad_char) {
+        if (width > 0 && static_cast<size_t>(width) > length) {
+            writer.append_repeat(pad_char, static_cast<size_t>(width) - length);
+        }
+        writer.append(value, length);
+    };
+
+    while (format[i] != '\0') {
+        if (format[i] != '%') {
+            writer.append(format[i++]);
+            continue;
+        }
+
+        ++i;
+        if (format[i] == '\0') {
+            writer.append('%');
+            break;
+        }
+
+        int width = 0;
+        bool width_from_arg = false;
+        bool width_overflow = false;
+        char pad_char = ' ';
+        if (format[i] == '0') {
+            pad_char = '0';
+            ++i;
+        }
+        if (format[i] == '*') {
+            width_from_arg = true;
+            ++i;
+        } else {
+            while (format[i] >= '0' && format[i] <= '9') {
+                int const DIGIT = format[i] - '0';
+                if (width > (std::numeric_limits<int>::max() - DIGIT) / 10) {
+                    width_overflow = true;
+                } else if (!width_overflow) {
+                    width = (width * 10) + DIGIT;
+                }
+                ++i;
+            }
+        }
+        if (width_overflow) {
+            writer.terminate();
+            return -1;
+        }
+        if (width_from_arg) {
+            width = va_arg(args, int);
+        }
+
+        if (format[i] == '.') {
+            ++i;
+            int precision = 0;
+            bool precision_from_arg = false;
+            bool precision_overflow = false;
+            if (format[i] == '*') {
+                precision_from_arg = true;
+                ++i;
+            } else {
+                while (format[i] >= '0' && format[i] <= '9') {
+                    int const DIGIT = format[i] - '0';
+                    if (precision > (std::numeric_limits<int>::max() - DIGIT) / 10) {
+                        precision_overflow = true;
+                    } else if (!precision_overflow) {
+                        precision = (precision * 10) + DIGIT;
+                    }
+                    ++i;
+                }
+            }
+            if (precision_overflow) {
+                writer.terminate();
+                return -1;
+            }
+            if (precision_from_arg) {
+                precision = va_arg(args, int);
+            }
+            if (format[i] == 's') {
+                const char* value = va_arg(args, const char*);
+                if (value == nullptr) {
+                    value = "(null)";
+                }
+                size_t length = 0;
+                size_t const LIMIT = precision < 0 ? std::numeric_limits<size_t>::max() : static_cast<size_t>(precision);
+                while (length < LIMIT && value[length] != '\0') {
+                    ++length;
+                }
+                append_padded(value, length, width, pad_char);
+                ++i;
+                continue;
+            }
+            writer.append('%');
+            writer.append('.');
+            if (format[i] != '\0') {
+                writer.append(format[i++]);
+            }
+            continue;
+        }
+
+        switch (format[i]) {
+            case 'd': {
+                int const VALUE = va_arg(args, int);
+                int const LENGTH = i64_decimal_to_buffer(buf, VALUE);
+                append_padded(buf.data(), static_cast<size_t>(LENGTH), width, pad_char);
+                break;
+            }
+            case 'u': {
+                unsigned int const VALUE = va_arg(args, unsigned int);
+                int const LENGTH = u64_decimal_to_buffer(buf, VALUE);
+                append_padded(buf.data(), static_cast<size_t>(LENGTH), width, pad_char);
+                break;
+            }
+            case 'x': {
+                unsigned int const VALUE = va_arg(args, unsigned int);
+                int const LENGTH = detail::u64_base_to_buffer(buf, VALUE, 16);
+                append_padded(buf.data(), static_cast<size_t>(LENGTH), width, pad_char);
+                break;
+            }
+            case 'l': {
+                ++i;
+                bool const LONG_LONG = format[i] == 'l';
+                if (LONG_LONG) {
+                    ++i;
+                }
+                int length = 0;
+                if (format[i] == 'u') {
+                    uint64_t const VALUE = LONG_LONG ? va_arg(args, unsigned long long) : va_arg(args, unsigned long);
+                    length = u64_decimal_to_buffer(buf, VALUE);
+                } else if (format[i] == 'x') {
+                    uint64_t const VALUE = LONG_LONG ? va_arg(args, unsigned long long) : va_arg(args, unsigned long);
+                    length = detail::u64_base_to_buffer(buf, VALUE, 16);
+                } else if (format[i] == 'd') {
+                    int64_t const VALUE = LONG_LONG ? va_arg(args, long long) : va_arg(args, long);
+                    length = i64_decimal_to_buffer(buf, VALUE);
+                } else {
+                    writer.append('%');
+                    writer.append('l');
+                    if (LONG_LONG) {
+                        writer.append('l');
+                    }
+                    if (format[i] != '\0') {
+                        writer.append(format[i]);
+                    }
+                    break;
+                }
+                append_padded(buf.data(), static_cast<size_t>(length), width, pad_char);
+                break;
+            }
+            case 'z': {
+                ++i;
+                if (format[i] == 'u') {
+                    size_t const VALUE = va_arg(args, size_t);
+                    int const LENGTH = u64_decimal_to_buffer(buf, static_cast<uint64_t>(VALUE));
+                    append_padded(buf.data(), static_cast<size_t>(LENGTH), width, pad_char);
+                } else {
+                    writer.append('%');
+                    writer.append('z');
+                    if (format[i] != '\0') {
+                        writer.append(format[i]);
+                    }
+                }
+                break;
+            }
+            case 's': {
+                const char* value = va_arg(args, const char*);
+                if (value == nullptr) {
+                    value = "(null)";
+                }
+                size_t const LENGTH = std::strlen(value);
+                append_padded(value, LENGTH, width, pad_char);
+                break;
+            }
+            case 'c': {
+                char const VALUE = static_cast<char>(va_arg(args, int));
+                append_padded(&VALUE, 1, width, pad_char);
+                break;
+            }
+            case 'b': {
+                unsigned int const VALUE = va_arg(args, unsigned int);
+                int const LENGTH = detail::u64_base_to_buffer(buf, VALUE, 2);
+                append_padded(buf.data(), static_cast<size_t>(LENGTH), width, pad_char);
+                break;
+            }
+            case 'p': {
+                auto* const VALUE = va_arg(args, void*);
+                writer.append('0');
+                writer.append('x');
+                int const LENGTH = detail::u64_base_to_buffer(buf, reinterpret_cast<uintptr_t>(VALUE), 16);
+                writer.append(buf.data(), static_cast<size_t>(LENGTH));
+                break;
+            }
+            case 'h': {
+                uint8_t const VALUE = static_cast<uint8_t>(va_arg(args, int));
+                int const LENGTH = detail::u64_base_to_buffer(buf, VALUE, 16);
+                if (LENGTH == 1) {
+                    writer.append('0');
+                }
+                writer.append(buf.data(), static_cast<size_t>(LENGTH));
+                break;
+            }
+            default:
+                writer.append(format[i]);
+                break;
+        }
+        if (format[i] != '\0') {
+            ++i;
+        }
+    }
+
+    writer.terminate();
+    return writer.result();
 }
 
 }  // namespace ker::util::string
