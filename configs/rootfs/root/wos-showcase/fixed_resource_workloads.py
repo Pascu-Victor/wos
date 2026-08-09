@@ -345,18 +345,26 @@ def module_set_sha256(module_names: Iterable[str]) -> str:
                 f"cannot import Python workload module {module_name}: {exc}"
             ) from exc
         raw_path = getattr(module, "__file__", None)
-        if not isinstance(raw_path, str) or not raw_path:
-            raise WorkloadError(
-                f"Python workload module {module_name} has no file provenance"
-            )
-        path = Path(raw_path)
-        path_bytes = str(path).encode("utf-8")
+        if isinstance(raw_path, str) and raw_path:
+            artifact_path = Path(raw_path)
+            origin = str(artifact_path)
+        else:
+            spec = getattr(module, "__spec__", None)
+            spec_origin = getattr(spec, "origin", None)
+            if spec_origin not in ("built-in", "frozen"):
+                raise WorkloadError(
+                    f"Python workload module {module_name} has no file provenance"
+                )
+            artifact_path = Path(sys.executable)
+            origin = f"{spec_origin}:{artifact_path}"
+
+        origin_bytes = origin.encode("utf-8")
         name_bytes = module_name.encode("ascii")
         digest.update(len(name_bytes).to_bytes(4, "big"))
         digest.update(name_bytes)
-        digest.update(len(path_bytes).to_bytes(4, "big"))
-        digest.update(path_bytes)
-        digest.update(bytes.fromhex(sha256_file(path)))
+        digest.update(len(origin_bytes).to_bytes(4, "big"))
+        digest.update(origin_bytes)
+        digest.update(bytes.fromhex(sha256_file(artifact_path)))
     return digest.hexdigest()
 
 
