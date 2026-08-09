@@ -2321,11 +2321,11 @@ def test_selfhost_cluster_profile_is_single_large_vm() -> None:
         fail("self-host cluster profile must use the normal WOS disks")
 
 
-def test_distributed_cluster_has_plausible_per_core_memory() -> None:
+def test_distributed_cluster_keeps_fixed_total_memory() -> None:
     config = json.loads(DISTRIBUTED_CLUSTER.read_text())
     global_vm = config["zones"][0]["vm"]
-    if global_vm["memory"] != "32768M" or global_vm["cpus"] != 8:
-        fail("distributed benchmark nodes must provide 4 GiB per core")
+    if global_vm["memory"] != "8192M" or global_vm["cpus"] != 8:
+        fail("distributed benchmark nodes must partition 32 GiB and 32 vCPUs evenly")
 
     node_zones = [zone for zone in config["zones"] if zone["id"] != "GLOBAL"]
     if [zone["nodes"] for zone in node_zones] != [4, 4]:
@@ -3225,7 +3225,7 @@ if __name__ == "__main__":
     test_selfhost_runner_records_detailed_historical_timings()
     test_selfhost_runner_timing_avoids_python_when_epochrealtime_exists()
     test_selfhost_runner_keeps_remote_and_scratch_handling_guarded()
-    test_distributed_cluster_has_plausible_per_core_memory()
+    test_distributed_cluster_keeps_fixed_total_memory()
     test_distributed_selfhost_cluster_balances_cpu_and_memory()
     test_selfhost_report_comparator_checks_clone_build_and_total()
     print("WOS self-host benchmark source invariants hold")

@@ -26,7 +26,7 @@ EXPECTED_LAYOUTS = {
         (1, 11, 10923 * 1024),
         (2, 10, 10922 * 1024),
     ],
-    4: [(node_id, 8, 32768 * 1024) for node_id in range(4)],
+    4: [(node_id, 8, 8192 * 1024) for node_id in range(4)],
 }
 
 
