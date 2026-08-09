@@ -2211,22 +2211,18 @@ def test_receiver_vfs_ref_submit_uses_bounded_worker_pool() -> None:
         [
             "constexpr uint32_t WKI_ACK_NONE = UINT32_MAX",
             "uint32_t rx_ack_pending = WKI_ACK_NONE",
-            "bool rx_baseline_initialized = false",
         ],
-        "reliable receive retry and no-ACK sentinel state",
+        "reliable receive no-ACK sentinel state",
     )
     require_tokens(
         channel,
-        ["ch->rx_baseline_initialized = false", "ch->rx_ack_pending = WKI_ACK_NONE"],
-        "channel reset clears receive baseline and cumulative ACK state",
+        ["ch->rx_seq = 0", "ch->rx_ack_pending = WKI_ACK_NONE"],
+        "channel reset clears receive sequence and cumulative ACK state",
     )
     require_tokens(wki, ["ch->rx_ack_pending = WKI_ACK_NONE"], "fresh channels start without a cumulative ACK")
-    require_order(
-        rx_body,
-        "ch->rx_baseline_initialized = true",
-        "wki_remote_compute_admit_rx(msg, hdr, payload, PAYLOAD_LEN, ch, ch->generation)",
-        "first refused sequence pins receive baseline",
-    )
+    if "rx_seq = hdr->seq_num" in rx_body or "Resyncing channel seq" in rx_body:
+        fail("a first future packet must not skip an undispatched reliable sequence")
+    require_order(rx_body, "if (hdr->seq_num == ch->rx_seq)", "else if (seq_after(hdr->seq_num, ch->rx_seq))", "RX sequence classification")
 
     complete_body = function_body(source, "handle_task_complete")
     blocked_body = function_body(source, "wki_proxy_task_blocked")
@@ -2330,9 +2326,14 @@ def test_remote_proxy_signals_never_make_the_local_frame_runnable() -> None:
     reschedule_body = function_body(scheduler, "reschedule_task_for_cpu_once")
     require_order(
         reschedule_body,
-        "if (task->wki_proxy_task_id != 0)",
+        "if (task_is_wki_migration_owned(task))",
         "// Remove from whatever queue the task is in.",
         "proxy park guard must precede every runqueue removal/publication",
+    )
+    require_tokens(
+        function_body(scheduler, "task_is_wki_migration_owned"),
+        ["task->wki_proxy_task_id != 0", "task->wki_proxy_task", "WaitChannelKind::WKI_EXECVE_PROXY"],
+        "central scheduler migration policy must recognize every WKI proxy representation",
     )
     require_tokens(
         function_body(scheduler, "event_wake_can_rebalance_process"),

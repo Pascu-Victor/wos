@@ -235,9 +235,9 @@ def test_proxy_pipe_write_reuses_bounded_stack_frame() -> None:
         "std::array<uint8_t, WKI_ETH_MAX_PAYLOAD> msg __attribute__((uninitialized))",
         "reinterpret_cast<DevOpReqPayload*>(msg.data())",
         "std::memcpy(msg.data() + sizeof(DevOpReqPayload), &proxy->resource_id, sizeof(uint32_t))",
-        "std::memcpy(msg.data() + HEADER_SIZE, src + sent, TO_SEND)",
+        "std::memcpy(msg.data() + HEADER_SIZE, src + sent, to_send)",
         "msg.data(),",
-        "static_cast<uint16_t>(HEADER_SIZE + TO_SEND)",
+        "static_cast<uint16_t>(HEADER_SIZE + to_send)",
     ]
     missing = [token for token in required if token not in body]
     if missing:
@@ -441,11 +441,12 @@ def test_write_only_pipe_proxy_omits_receive_ring() -> None:
 
     defer_body = function_body(remote_ipc, "should_defer_ipc_dev_op")
     defer_required = [
+        "bool const FLOW_CONTROLLED = op_id == OP_PIPE_DATA_FLOW",
         "has_receiving_proxy = proxy->can_receive_data",
         "exp->consumer_node == src_node",
-        "if (has_proxy && !has_receiving_proxy && !has_matching_export)",
+        "if (!FLOW_CONTROLLED && has_proxy && !has_receiving_proxy && !has_matching_export)",
         "*drop_out = true",
-        "return !has_receiving_proxy",
+        "return FLOW_CONTROLLED || !has_receiving_proxy",
     ]
     missing = [token for token in defer_required if token not in defer_body]
     if missing:
@@ -485,7 +486,7 @@ def test_write_only_pipe_proxy_omits_receive_ring() -> None:
     no_export_body = data_body[no_export_start:no_export_end]
     require_order(no_export_body, "if (HAD_NONRECEIVING_PROXY)", "queue_pending_pipe_data(hdr->src_node", "write-only pending allocation guard")
 
-    close_write_start = data_body.find("if (OP_ID == OP_PIPE_CLOSE_WRITE)")
+    close_write_start = data_body.find("if (OP_ID == OP_PIPE_CLOSE_WRITE || OP_ID == OP_PIPE_CLOSE_WRITE_FLOW)")
     close_read_start = data_body.find("if (OP_ID == OP_PIPE_CLOSE_READ)", close_write_start)
     close_write_body = data_body[close_write_start:close_read_start]
     for token in [
@@ -740,7 +741,7 @@ def test_large_deferred_dev_op_payloads_transfer_to_export_backlog() -> None:
         "WKI_IPC_DEV_OP_TRANSFER_MIN_DATA",
         "len < WKI_IPC_DEV_OP_TRANSFER_MIN_DATA",
         "len <= work->payload_len - OFFSET",
-        "queue_export_pipe_write_data(uint32_t resource_id, const uint8_t* data, uint16_t len, IpcDevOpWork** work_owner)",
+        "queue_export_pipe_write_data(uint32_t resource_id, const uint8_t* data, uint16_t len, IpcDevOpWork** work_owner,",
     ]:
         if snippet not in remote_ipc:
             fail(f"large deferred IPC backlog ownership is missing {snippet!r}")
@@ -813,11 +814,22 @@ def test_large_deferred_dev_op_payloads_transfer_to_export_backlog() -> None:
     if len(queue_positions) != 2:
         fail("both PTY-tail and normal export backlog paths must offer deferred work ownership")
     for position in queue_positions:
-        line_end = handler_body.find("\n", position)
-        return_pos = handler_body.find("return;", line_end)
-        if line_end < 0 or return_pos < 0:
+        condition_start = handler_body.rfind("if (!", 0, position)
+        block_start = handler_body.find("{", position)
+        if condition_start < 0 or block_start < 0:
+            fail("export backlog ownership transfer must be guarded by a failed-queue branch")
+        depth = 1
+        block_end = block_start + 1
+        while block_end < len(handler_body) and depth > 0:
+            if handler_body[block_end] == "{":
+                depth += 1
+            elif handler_body[block_end] == "}":
+                depth -= 1
+            block_end += 1
+        return_pos = handler_body.find("return;", block_end)
+        if depth != 0 or return_pos < 0:
             fail("export backlog queue calls must return on their current control-flow branch")
-        suffix = handler_body[line_end:return_pos]
+        suffix = handler_body[block_end:return_pos]
         forbidden = [token for token in ["hdr->", "payload", "op_data"] if token in suffix]
         if forbidden:
             fail("handler dereferences transferred storage after queue publication: " + ", ".join(forbidden))

@@ -111,7 +111,7 @@ def test_tmpfs_file_operations_use_canonical_node() -> None:
     source = TMPFS_CPP.read_text()
     open_path = function_body(
         source,
-        r"auto\s+tmpfs_open_path\(TmpNode\*\s+root,\s*const\s+char\*\s+path,\s*int\s+flags,\s*int\s+mode\)\s*->\s*ker::vfs::File\*",
+        r"auto\s+tmpfs_open_path\(TmpNode\*\s+root,\s*const\s+char\*\s+path,\s*int\s+flags,\s*int\s+mode,\s*int\*\s+result_out\)\s*->\s*ker::vfs::File\*",
         "tmpfs_open_path root",
     )
     read_body = function_body(source, r"auto\s+tmpfs_read\(ker::vfs::File\*\s+f,\s*void\*\s+buf,\s*size_t\s+count,\s*size_t\s+offset\)\s*->\s+ssize_t", "tmpfs_read")
@@ -142,9 +142,13 @@ def test_tmpfs_file_operations_use_canonical_node() -> None:
 
 def test_vfs_link_uses_alias_not_copy() -> None:
     core = CORE_CPP.read_text()
-    link_body = function_body(core, r"auto\s+vfs_link\(const\s+char\*\s+oldpath,\s*const\s+char\*\s+newpath\)\s*->\s+int", "vfs_link")
+    link_body = function_body(
+        core,
+        r"auto\s+vfs_link_resolved_paths\(const\s+char\*\s+old_abs_path,\s*const\s+char\*\s+new_abs_path\)\s*->\s+int",
+        "vfs_link_resolved_paths",
+    )
     stat_helper = function_body(core, r"void\s+fill_tmpfs_node_stat\(uint32_t\s+dev_id,\s*const\s+ker::vfs::tmpfs::TmpNode\*\s+node,\s*Stat\*\s+statbuf\)", "fill_tmpfs_node_stat")
-    unlink_body = function_body(core, r"auto\s+vfs_unlink\(const\s+char\*\s+path\)\s*->\s+int", "vfs_unlink")
+    unlink_body = function_body(core, r"auto\s+vfs_unlink_resolved_path\([^)]*\)\s*->\s+int", "vfs_unlink_resolved_path")
 
     require_order(
         link_body,
@@ -156,7 +160,7 @@ def test_vfs_link_uses_alias_not_copy() -> None:
             "auto* link_node = ker::vfs::tmpfs::tmpfs_create_hardlink(new_parent, new_name, src_node)",
             "ker::vfs::tmpfs::tmpfs_unlock_tree()",
             "metadata_cache_note_path_changed(\"/\", nullptr)",
-            "vfs_cache_notify_path_changed(old_buf.data(), new_buf.data())",
+            "vfs_cache_notify_path_changed(old_abs_path, new_abs_path)",
         ],
         "vfs_link tmpfs hard-link path",
     )

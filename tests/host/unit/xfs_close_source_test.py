@@ -58,8 +58,8 @@ def main() -> None:
         [
             "bool const COMMIT_NEEDED = xfs_close_should_commit_inode",
             "if (COMMIT_NEEDED)",
-            "XfsMetadataGuard metadata_guard(xfd->mount)",
             "MutexGuard guard(xfd->inode->io_lock)",
+            "XfsMetadataGuard metadata_guard(xfd->mount, true, WOS_PERF_CALLSITE())",
             "xfs_commit_dirty_inode(xfd->mount, xfd->inode, TRIM_PREALLOC)",
             "xfs_inode_release(xfd->inode)",
         ],

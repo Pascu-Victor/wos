@@ -794,6 +794,7 @@ RAW_IO_TEST_ALLOWLIST = {
     "test_poll_pipe_timeout_and_wake",
     "test_pty_blocking_read_wake",
     "test_pty_cr_progress_write_coalesced",
+    "test_pty_ansi_escape_transparency",
     "test_remote_ipc_epoll_ctl_add",
     "test_remote_ipc_epoll_pipe_read_then_hup",
     "test_remote_ipc_epoll_wait_pipe_readable",

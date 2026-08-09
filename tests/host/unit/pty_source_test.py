@@ -396,7 +396,7 @@ def test_procfs_fd_links_open_by_retaining_referenced_files() -> None:
     vfs_core_source = VFS_CORE_CPP.read_text()
     procfs_body = function_body(procfs_source, "procfs_open_fd_link_path")
     vfs_helper_body = function_body(vfs_core_source, "vfs_try_open_procfs_fd_link")
-    vfs_open_body = function_body(vfs_core_source, "vfs_open")
+    vfs_open_body = function_body(vfs_core_source, "vfs_open_resolved_for_task")
     vfs_open_file_body = function_body(vfs_core_source, "vfs_open_file_impl")
 
     require_tokens(
@@ -420,7 +420,7 @@ def test_procfs_fd_links_open_by_retaining_referenced_files() -> None:
     require_tokens(
         vfs_helper_body,
         [
-            "resolve_symlinks(path, prefix_resolved.data(), prefix_resolved.size(), apply_task_policy, false)",
+            "resolve_symlinks(path, prefix_resolved.data(), prefix_resolved.size(), apply_task_policy, false, known_path_len)",
             "mount->fs_type != FSType::PROCFS",
             "strip_mount_prefix(mount, prefix_resolved.data())",
             "procfs_open_fd_link_path(fs_relative_path)",
@@ -429,23 +429,23 @@ def test_procfs_fd_links_open_by_retaining_referenced_files() -> None:
     )
     require_order(
         vfs_open_body,
-        "vfs_try_open_procfs_fd_link(path_buffer.data(), !OPEN_LOCAL)",
-        "resolve_symlinks(path_buffer.data(), resolved.data(), resolved.size(), !OPEN_LOCAL",
+        "vfs_try_open_procfs_fd_link(path_buffer.data(), !open_local, mount, path_buffer_len)",
+        "resolve_symlinks(path_buffer.data(), resolved.data(), resolved.size(), !open_local",
         "vfs_open should retain fd links before final symlink resolution",
     )
     require_tokens(
         vfs_open_body,
         [
             "vfs_put_file(fd_link_file);",
-            "vfs_install_open_file(current, fd_link_file)",
-            "current->set_fd_cloexec(static_cast<unsigned>(FD));",
+            "vfs_install_open_file(task, fd_link_file)",
+            "vfs_set_fd_cloexec_for_task(task, FD, true)",
         ],
         "vfs_open direct fd-link install",
     )
     require_order(
         vfs_open_file_body,
-        "vfs_try_open_procfs_fd_link(pathBuffer, apply_task_policy && !OPEN_LOCAL)",
-        "resolve_symlinks(pathBuffer, resolved, MAX_PATH_LEN, apply_task_policy && !OPEN_LOCAL",
+        "vfs_try_open_procfs_fd_link(pathBuffer, apply_task_policy && !OPEN_LOCAL, mount, path_buffer_len)",
+        "resolve_symlinks(pathBuffer, resolved, sizeof(resolved), apply_task_policy && !OPEN_LOCAL",
         "vfs_open_file_impl should retain fd links before final symlink resolution",
     )
     require_tokens(

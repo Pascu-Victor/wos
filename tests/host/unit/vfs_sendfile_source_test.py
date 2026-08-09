@@ -51,7 +51,7 @@ def main() -> None:
         "vfs.hpp",
     )
 
-    write_file_body = function_body(source, "vfs_write_file")
+    write_file_body = function_body(source, "vfs_write_file_direct")
     require(write_file_body, "TMPFS_APPEND", "vfs_write_file")
     require(write_file_body, "XFS_APPEND", "vfs_write_file")
     require(write_file_body, "cache_notify_file_data_changed_impl(f);", "vfs_write_file")

@@ -53,6 +53,7 @@ def main() -> None:
     block_iterate = function_body(source, "auto dir2_block_iterate")
     leaf_lookup = function_body(source, "auto dir2_leaf_node_lookup")
     leaf_scan = function_body(source, "auto dir2_scan_data_block")
+    leaf_linear_scan = function_body(source, "auto dir2_leaf_node_linear_scan")
     leaf_find_data = function_body(source, "auto dir2_leaf_node_find_data_entry")
     leaf_find_free = function_body(source, "auto dir2_leaf_node_find_free_region")
     free_region = function_body(source, "auto dir2_find_free_region")
@@ -60,6 +61,7 @@ def main() -> None:
     block_add = function_body(source, "auto dir2_block_addname")
     block_remove = function_body(source, "auto dir2_block_removename")
     leaf_add = function_body(source, "auto dir2_leaf_node_addname")
+    leaf_remove = function_body(source, "auto dir2_leaf_node_removename")
 
     require(
         source,
@@ -102,7 +104,7 @@ def main() -> None:
         "leaf-index lookup validates dataptr target",
     )
     require(
-        leaf_lookup,
+        leaf_linear_scan,
         "if (!dir2_data_entry_at_if_valid(ctx, block, offset, BLKSIZE, &dep, &dep_size))",
         "leaf linear lookup bounded data-entry validation",
     )
@@ -116,9 +118,10 @@ def main() -> None:
         "if (dir2_data_unused_at_if_valid(block, off, data_end, &candidate_free_len))",
         "generic free-space search validates free records",
     )
-    require(
+    require_order(
         leaf_find_free,
-        "if (dir2_find_free_region(ctx, block, DATA_START, DATA_END, need_len, &free_off, &free_len))",
+        "int const FREE_RC = dir2_find_free_region(ctx, block, DATA_START, DATA_END, need_len, &free_off, &free_len)",
+        "if (FREE_RC == 0)",
         "leaf free-space search uses validated free-region helper",
     )
     require(source, "auto dir2_block_to_leaf(XfsInode* dp, XfsTransaction* tp) -> int", "block-to-leaf converter")
@@ -153,16 +156,35 @@ def main() -> None:
     require(source, "auto dir2_leaf_alloc_data_block(XfsInode* dp, XfsTransaction* tp", "leaf data block allocation")
     require(source, "auto const NEW_DB = static_cast<xfs_dir2_db_t>(dir2_data_block_count(dp))", "append data block selection")
     require(source, "dir2_alloc_mapped_dir_block(dp, tp, dir2_db_to_fsbno(ctx, NEW_DB), &disk_block)", "mapped data block allocation")
-    require(source, "if (rc == -ENOSPC) {\n        rc = dir2_leaf_alloc_data_block", "leaf add ENOSPC data growth")
+    require_order(
+        leaf_add,
+        "if (rc == -ENOSPC)",
+        "rc = dir2_leaf_alloc_data_block(dp, tp, &data_bh, &db, &free_off, &free_len)",
+        "leaf add ENOSPC data growth",
+    )
     require(leaf_add, "rc = dir2_leaf_preflight_index_slot(ctx, leaf_hdr);", "leaf add index preflight")
     require(leaf_add, "if (rc != 0) {\n        brelse(leaf_bh);\n        return rc;", "full or malformed leaf rejection")
     require(leaf_add, "rc = dir2_leaf_ensure_stale_slot(ctx, leaf_hdr);", "leaf add slot ensure")
     require(leaf_add, "rc = dir2_leaf_prepare_stale_insert(leaf_hdr, HASH, &stale_idx, &insert_pos);", "leaf add sorted slot preparation")
     require(leaf_add, "dir2_leaf_reuse_stale_entry(leaf_hdr, HASH, DATAPTR", "leaf add index update")
-    require(source, "goto linear_scan", "leaf lookup linear fallback")
-    require(source, "bool const LEAF_INDEX_FULL = leaf_count >= LEAF_CAPACITY", "full leaf lookup detection")
-    require(source, "if (LEAF_INDEX_FULL) {\n                goto linear_scan;\n            }", "full leaf lookup data scan")
-    require(source, "if (rc == 0) {\n        auto* lep = dir2_leaf_entries(leaf_hdr)", "leaf removal tolerates unindexed entries")
+    require(leaf_lookup, "bool const LEAF_INDEX_FULL = leaf_count >= LEAF_CAPACITY", "full leaf lookup detection")
+    require(
+        leaf_lookup,
+        "if (LEAF_INDEX_FULL && allow_unindexed_data_fallback)",
+        "full leaf lookup fallback guard",
+    )
+    require(
+        leaf_lookup,
+        "dir2_leaf_node_linear_scan(dp, name, namelen, entry, lep, leaf_count, true)",
+        "full leaf lookup data scan",
+    )
+    require(leaf_lookup, "dir2_leaf_index_known_complete(dp)", "complete leaf index fast miss")
+    require(leaf_remove, "bool const INDEXED_ENTRY = rc == 0", "leaf removal tracks indexed entries")
+    require(
+        leaf_remove,
+        "if (INDEXED_ENTRY) {\n        auto* lep = dir2_leaf_entries(leaf_hdr)",
+        "leaf removal tolerates unindexed entries",
+    )
     require(
         block_add,
         "if (static_cast<size_t>(STALE_COUNT) != ACTUAL_STALE) {\n        brelse(bh);\n        return -EINVAL;\n    }",
@@ -170,16 +192,16 @@ def main() -> None:
     )
     require(
         block_add,
-        "if (STALE_COUNT == 0) {\n        size_t const NEW_LEAF_BYTES",
+        "if (STALE_COUNT == 0 && IS_TAIL_FREE) {\n                usable_len = usable_len >= LEAF_SLOT_SIZE ? usable_len - LEAF_SLOT_SIZE : 0;",
         "block add preflight for leaf-slot growth",
     )
     require(
         block_add,
-        "if (found_offset + NEED_LEN > NEW_LEAF_START) {\n            brelse(bh);\n            return -ENOSPC;\n        }",
+        "if (!found_free || (STALE_COUNT == 0 && (!found_tail_free || static_cast<size_t>(tail_free_len) < LEAF_SLOT_SIZE)))",
         "block add non-mutating ENOSPC return",
     )
     require(block_add, "uint16_t found_free_len = 0;", "block add stores validated free length")
-    require(block_add, "uint16_t const OLD_FREE_LEN = found_free_len;", "block add reuses validated free length")
+    require(block_add, "uint16_t old_free_len = found_free_len;", "block add reuses validated free length")
     require(
         block_remove,
         "if (OFF < DATA_START || !dir2_data_entry_at_if_valid(ctx, block, OFF, DATA_END, &dep, &dep_size))",
@@ -192,7 +214,7 @@ def main() -> None:
     )
     require_order(
         block_add,
-        "if (found_offset + NEED_LEN > NEW_LEAF_START)",
+        "if (!found_free || (STALE_COUNT == 0 && (!found_tail_free || static_cast<size_t>(tail_free_len) < LEAF_SLOT_SIZE)))",
         "auto* dep = reinterpret_cast<XfsDir2DataEntry*>(block + found_offset);",
         "block add must prove leaf growth space before writing data entry",
     )

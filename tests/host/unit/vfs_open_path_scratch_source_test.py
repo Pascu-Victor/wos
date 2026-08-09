@@ -1582,7 +1582,7 @@ def test_stat_impl_symlink_scratch_is_initialized_by_resolver() -> None:
     if brace_depth_at(resolver, initial_production_pos) != 0:
         fail("resolve_symlinks initial destination production must remain unconditional")
     policy_pos = resolver.find("if (apply_task_policy)", initial_production_pos + len(initial_production))
-    effective_task_setup = """auto* effective_task_policy = task_policy;
+    effective_task_setup = """const ker::mod::sched::task::Task* effective_task_policy = task_policy;
     if (effective_task_policy == nullptr && ker::mod::sched::can_query_current_task()) {
         effective_task_policy = ker::mod::sched::get_current_task();
     }"""

@@ -80,17 +80,36 @@ def test_syscall_layer_keeps_nonblock_call_local() -> None:
     if "fn()" in runner:
         fail("run_socket_call must pass effective flags to every protocol callback")
 
+    send_bounced = function_body(source, "socket_send_user_bounced")
+    require_order(
+        send_bounced,
+        [
+            "run_socket_call<ssize_t>(file, sock, call_flags, [&](int flags)",
+            "fn(bounce, TO_COPY, flags)",
+        ],
+        "socket send bounce propagates effective flags",
+    )
+    recv_bounced = function_body(source, "socket_recv_user_bounced")
+    require_order(
+        recv_bounced,
+        [
+            "run_socket_call<ssize_t>(file, sock, call_flags, [&](int flags)",
+            "fn(bounce, TO_READ, flags)",
+        ],
+        "socket receive bounce propagates effective flags",
+    )
+
     require_order(
         source,
         [
             "run_socket_call<int>(handle.file, sock, 0, [&](int flags)",
             "sock->proto_ops->connect(sock, reinterpret_cast<const void*>(a2), static_cast<size_t>(a3), flags)",
-            "run_socket_call<ssize_t>(handle.file, sock, static_cast<int>(a4), [&](int flags)",
-            "sock->proto_ops->send(sock, reinterpret_cast<const void*>(a2), static_cast<size_t>(a3), flags)",
-            "run_socket_call<ssize_t>(handle.file, sock, static_cast<int>(a4), [&](int flags)",
-            "sock->proto_ops->recv(sock, reinterpret_cast<void*>(a2), static_cast<size_t>(a3), flags)",
+            "socket_send_user_bounced(",
+            "handle.file, sock, a2, static_cast<size_t>(a3), static_cast<int>(a4)",
+            "socket_recv_user_bounced(",
+            "handle.file, sock, a2, static_cast<size_t>(a3), static_cast<int>(a4)",
         ],
-        "socket syscall dispatch propagates effective flags",
+        "socket syscall dispatch forwards per-call flags through bounce helpers",
     )
 
 

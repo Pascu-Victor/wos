@@ -31,7 +31,7 @@ def test_tmpfs_open_preserves_flags() -> None:
     require(source, "auto create_root_file_with_flags(TmpNode* root, int open_flags) -> ker::vfs::File*", "tmpfs root helper")
     require(source, "auto create_root_file(TmpNode* root) -> ker::vfs::File*", "tmpfs public root helper")
     require(source, "f->open_flags = open_flags;", "tmpfs root open flags")
-    if source.count("return create_root_file_with_flags(root, flags);") < 2:
+    if source.count("create_root_file_with_flags(root, flags)") < 2:
         fail("tmpfs root opens must pass caller flags into create_root_file_with_flags")
     require(source, "f->open_flags = flags;", "tmpfs non-root open flags")
     require(source, "f->fd_flags = 0;", "tmpfs fd flags")

@@ -230,15 +230,16 @@ def test_blocking_socket_send_progress_runs_network_checkpoint() -> None:
         "socket VFS write progress checkpoint",
     )
 
+    send_bounced = function_body(source, "socket_send_user_bounced")
     require_tokens(
-        source,
+        send_bounced,
         [
-            "checkpoint_blocking_socket_send_progress(handle.file, sock, static_cast<int>(a4), CLAMPED);",
+            "checkpoint_blocking_socket_send_progress(file, sock, call_flags, RESULT);",
         ],
-        "socket send syscall progress checkpoint",
+        "socket send bounce progress checkpoint",
     )
-    if source.count("checkpoint_blocking_socket_send_progress(handle.file, sock, static_cast<int>(a4), CLAMPED);") < 2:
-        fail("SEND and SENDTO must both run the blocking socket send progress checkpoint")
+    if source.count("ssize_t const RESULT = socket_send_user_bounced(") != 2:
+        fail("SEND and SENDTO must both use the checkpointed socket send bounce helper")
 
 
 def main() -> None:

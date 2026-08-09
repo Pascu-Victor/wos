@@ -138,12 +138,21 @@ def test_advisory_locks_are_released_on_close_lifetimes() -> None:
     source = CORE_CPP.read_text()
     destroy_body = function_body(source, r"auto\s+vfs_destroy_file\(File\s*\*\s*f\)\s*->\s*int")
     close_body = function_body(source, r"auto\s+vfs_close\(int\s+fd\)\s*->\s*int")
+    close_taken_body = function_body(
+        source,
+        r"auto\s+vfs_close_taken_file\(ker::mod::sched::task::Task\*\s+caller,\s*ker::mod::sched::task::Task\*\s+table_task,\s*File\*\s+file,\s*size_t\s+fd_count,\s*uint64_t\s+callsite\)\s*->\s*int",
+    )
     dup2_body = function_body(source, r"auto\s+vfs_dup2\(int\s+oldfd,\s*int\s+newfd,\s*int\s+flags\)\s*->\s*int")
     require_tokens(destroy_body, ["advisory_release_file_owner_locks(f);"], "file-owner advisory lock cleanup")
     require_tokens(
-        close_body,
-        ["advisory_release_process_locks_for_file(ker::mod::sched::task::process_pid(*t), f);"],
+        close_taken_body,
+        ["advisory_release_process_locks_for_file(ker::mod::sched::task::process_pid(*caller), file);"],
         "process advisory lock cleanup",
+    )
+    require_tokens(
+        close_body,
+        ["vfs_close_taken_file(t, table_task, f, FD_COUNT, reinterpret_cast<uint64_t>(__builtin_return_address(0)))"],
+        "close cleanup helper dispatch",
     )
     require_tokens(
         dup2_body,
