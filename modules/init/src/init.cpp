@@ -1,18 +1,15 @@
 #include <sys/logging.h>
 #include <sys/process.h>
 #include <sys/vfs.h>
-#include <sys/wait.h>
 #include <time.h>  // NOLINT(modernize-deprecated-headers): WOS POSIX sleep declarations live here.
 
 #include <array>
 #include <cerrno>
 #include <cstdint>
 #include <ctime>
-#include <utility>
 
 #include "env.h"
 #include "fstab.h"
-#include "network.h"
 #include "services.h"
 #include "shutdown.h"
 #include "sys/multiproc.h"
@@ -145,37 +142,24 @@ auto main(int argc, char** argv) -> int {
     ker::abi::vfs::mkdir("/var", 0755);
     ker::abi::vfs::mkdir("/var/log", 0755);
     ker::abi::vfs::mkdir("/var/log/journal", 0755);
-    start_journald();
-    if (!start_network()) {
-        init_log::critical("init[%llu]: network startup failed; stopping init before launching network-dependent services",
+    if (!start_service_supervisor()) {
+        init_log::critical("init[%llu]: service supervisor initialization failed; PID 1 remains alive for reaping and shutdown",
                            static_cast<unsigned long long>(CPUNO));
-        return 1;
     }
-    start_httpd();
-    start_dropbear();
-    // start_testd();
 
-    // Keep init alive, reap orphaned zombie children, and poll scheduled
-    // shutdown state without blocking forever in waitpid().
+    // Keep init alive, drive the nonblocking service model, reap all direct or
+    // adopted children centrally, and poll scheduled shutdown state.
     for (;;) {
         ShutdownAction const ACTION = shutdown_poll();
         if (ACTION != ShutdownAction::NONE) {
             shutdown_perform(ACTION);
         }
 
-        int32_t reap_status = 0;
-        for (;;) {
-            auto reap_pid = ker::process::waitpid(-1, &reap_status, WNOHANG, nullptr);
-            if (reap_pid > 0) {
-                note_service_reaped(static_cast<uint64_t>(reap_pid));
-                continue;
-            }
-            break;
-        }
+        service_supervisor_tick();
 
         struct timespec const IDLE_SLEEP{
             .tv_sec = 0,
-            .tv_nsec = 100L * 1000L * 1000L,
+            .tv_nsec = SERVICE_SUPERVISOR_TICK_MS * 1000L * 1000L,
         };
         nanosleep(&IDLE_SLEEP, nullptr);
     }

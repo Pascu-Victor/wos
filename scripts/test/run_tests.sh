@@ -120,7 +120,12 @@ UNIT_TESTS=(
     top_source_test
     time_source_test
     init_source_test
+    service_manifest_config_source_test
+    init_supervisor_docs_source_test
     shutdown_source_test
+    init_control_source_test
+    init_supervisor_test
+    wos_resolve_test
     pty_source_test
     strace_source_test
     journal_source_test

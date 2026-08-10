@@ -970,6 +970,7 @@ if(WOS_BUILD_DISK_IMAGES)
         $<TARGET_FILE:journal_lib>
         $<TARGET_FILE:wkictl>
         $<TARGET_FILE:powerctl>
+        $<TARGET_FILE:servicectl>
         $<TARGET_FILE:renderbench>
         $<TARGET_FILE:strace>
         $<TARGET_FILE:sftpserver>
@@ -994,6 +995,7 @@ if(WOS_BUILD_DISK_IMAGES)
             ${WOS_BUILD_SCRIPTS_DIR}/rootfs_qcow_xfs_delta.py
             ${WOS_BUILD_SCRIPTS_DIR}/sync_rootfs.sh
             ${CMAKE_SOURCE_DIR}/configs/system.conf
+            ${CMAKE_SOURCE_DIR}/configs/wos-services.conf
             ${CMAKE_SOURCE_DIR}/configs/vfstab
             ${WOS_ROOTFS_CONFIG_INPUTS}
             ${WOS_MODULE_TARGET_FILES}
@@ -1075,6 +1077,7 @@ if(WOS_BUILD_DISK_IMAGES)
             ${CMAKE_SOURCE_DIR}/configs/disks.conf
             ${CMAKE_SOURCE_DIR}/configs/netdevs.conf
             ${CMAKE_SOURCE_DIR}/configs/system.conf
+            ${CMAKE_SOURCE_DIR}/configs/wos-services.conf
             ${CMAKE_SOURCE_DIR}/configs/vfstab
             ${CMAKE_SOURCE_DIR}/modules/kern/limine.conf
             $<TARGET_FILE:wos>

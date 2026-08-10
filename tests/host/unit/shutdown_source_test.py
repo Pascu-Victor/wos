@@ -8,6 +8,7 @@ ROOT = Path(__file__).resolve().parents[3]
 POWERCTL_CPP = ROOT / "modules" / "powerctl" / "src" / "main.cpp"
 INIT_SHUTDOWN_CPP = ROOT / "modules" / "init" / "src" / "shutdown.cpp"
 INIT_SERVICES_CPP = ROOT / "modules" / "init" / "src" / "services.cpp"
+INIT_SUPERVISOR_MODEL_CPP = ROOT / "modules" / "init" / "src" / "supervisor_model.cpp"
 INIT_FSTAB_CPP = ROOT / "modules" / "init" / "src" / "fstab.cpp"
 INIT_WRAPPERS_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "init" / "init_wrappers.cpp"
 POWER_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "power" / "power.cpp"
@@ -142,6 +143,7 @@ def test_init_owns_scheduled_shutdown_and_service_sync_order() -> None:
     shutdown_source = INIT_SHUTDOWN_CPP.read_text()
     fstab_source = INIT_FSTAB_CPP.read_text()
     services_source = INIT_SERVICES_CPP.read_text()
+    model_source = INIT_SUPERVISOR_MODEL_CPP.read_text()
 
     require_tokens(
         fstab_source,
@@ -218,16 +220,31 @@ def test_init_owns_scheduled_shutdown_and_service_sync_order() -> None:
     require_tokens(
         services_source,
         [
-            "ServiceKind::NETWORK",
-            "ServiceKind::NORMAL",
-            "ServiceKind::JOURNAL",
-            "stop_services_by_kind(ServiceKind::NETWORK)",
-            "stop_services_by_kind(ServiceKind::NORMAL)",
-            "stop_services_by_kind(ServiceKind::JOURNAL)",
-            "wait_for_child_exit(static_cast<int64_t>(service.pid), &status, SERVICE_TERM_TIMEOUT_MS)",
-            "wait_for_child_timeout(static_cast<int64_t>(service.pid), &status, SERVICE_KILL_TIMEOUT_MS)",
+            "supervisor_begin_shutdown(runtime.model",
+            "wait_for_shutdown_phase(false)",
+            "supervisor_begin_journal_shutdown(runtime.model",
+            "wait_for_shutdown_phase(true)",
+            "shutdown_phase_budget_ms",
+            "FAILED_RUNTIME_SHUTDOWN_MS",
+            "force_stop_phase",
+            "signal_service_group(ACTION, SIGKILL)",
+            "SupervisorActionKind::NON_JOURNAL_SHUTDOWN_COMPLETE",
+            "SupervisorActionKind::SHUTDOWN_COMPLETE",
         ],
-        "init service shutdown sequencing",
+        "bounded two-phase supervisor shutdown sequencing",
+    )
+    require_tokens(
+        model_source,
+        [
+            "model.topology->stop_order",
+            "SupervisorStopReason::SHUTDOWN",
+            "SupervisorActionKind::SEND_TERM",
+            "SupervisorActionKind::SEND_KILL",
+            "SupervisorActionKind::CLOSE_OUTPUT",
+            "SupervisorShutdownPhase::WAITING_FOR_JOURNAL",
+            "SupervisorShutdownPhase::JOURNAL",
+        ],
+        "model reverse-dependency stop and bounded escalation",
     )
 
 

@@ -116,6 +116,10 @@ alignment, overflow, and ownership validation before page-table mutation.
 | `PROCESS` | `SIGPENDING` | `out` | fixed 128-byte signal-set record | no | none | one complete copyout |
 | `PROCESS` | `GETPRIORITY` | `none` | n/a | n/a | none | scalar query |
 | `PROCESS` | `SPAWN` | `in` | EXEC deep snapshot plus fixed options, at most 32 action records, and bounded action paths | options yes; path no | none | deep snapshot finishes before process allocation/publication |
+| `PROCESS` | `INIT_CONTROL_SUBMIT` | `in` | one fixed 128-byte versioned request | no | none | copies, validates, canonicalizes, and authenticates the request before enqueueing it under the mailbox lock |
+| `PROCESS` | `INIT_CONTROL_RECEIVE` | `out` | one fixed 128-byte versioned request | no | destination prefix may be written on fault; the request remains queued | snapshots the oldest request under lock, copies out without the lock, and dequeues only after complete copyout |
+| `PROCESS` | `INIT_STATUS_PUBLISH` | `in` | one fixed 4160-byte versioned snapshot with at most 16 services and four transitions per service | no | none | copies, validates, and sanitizes the complete snapshot before atomically replacing status under lock |
+| `PROCESS` | `INIT_STATUS_READ` | `out` | one fixed 4160-byte versioned snapshot | no | destination prefix may be written on fault; broker state is unchanged | snapshots complete status under lock, then performs one copyout without the lock |
 
 Command details: `PR_SET_NAME` consumes exactly 16 bytes into a kernel buffer;
 `PR_GET_NAME` produces exactly 16 bytes. `PR_GET_PDEATHSIG` produces one

@@ -7,7 +7,6 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[3]
 INIT_CPP = ROOT / "modules" / "init" / "src" / "init.cpp"
 SERVICES_CPP = ROOT / "modules" / "init" / "src" / "services.cpp"
-NETWORK_CPP = ROOT / "modules" / "init" / "src" / "network.cpp"
 
 
 def fail(message: str) -> None:
@@ -42,118 +41,172 @@ def require_tokens(source: str, tokens: list[str], context: str) -> None:
         fail(f"{context}: missing {', '.join(missing)}")
 
 
-def test_dropbear_keygen_wait_is_deadline_bounded() -> None:
+def forbid_tokens(source: str, tokens: list[str], context: str) -> None:
+    present = [token for token in tokens if token in source]
+    if present:
+        fail(f"{context}: forbidden {', '.join(present)}")
+
+
+def require_order(source: str, snippets: list[str], context: str) -> None:
+    cursor = 0
+    for snippet in snippets:
+        found = source.find(snippet, cursor)
+        if found < 0:
+            fail(f"{context}: missing ordered snippet {snippet}")
+        cursor = found + len(snippet)
+
+
+def test_manifest_load_and_failed_mode_are_bounded() -> None:
     source = SERVICES_CPP.read_text()
     require_tokens(
         source,
         [
-            "DROPBEAR_KEYGEN_TIMEOUT_MS",
-            "CHILD_WAIT_POLL_US",
-            "wait_for_child_timeout",
-            "reap_child_after_timeout",
-            "ker::process::kill(pid, SIGKILL)",
+            'SERVICE_MANIFEST_PATH[] = "/etc/wos-services.conf"',
+            "std::array<char, MAX_MANIFEST_BYTES> manifest_bytes",
+            "while (size < runtime.manifest_bytes.size())",
+            "read_extra = ::read(FD, &extra, 1)",
+            "parse_service_manifest",
+            "validate_service_manifest",
+            "resolve_enablement",
+            "EnablementKind::PATH_EXISTS",
+            "EnablementKind::PATH_MISSING",
+            "runtime.failed = true",
+            "publish_status(runtime.now_ms)",
         ],
-        "init service timeout surface",
-    )
-    if "ker::process::waitpid(static_cast<int64_t>(KEYGEN_PID), &exit_code, 0, nullptr)" in source:
-        fail("dropbear key generation must not block init with waitpid(..., 0)")
-
-    wait_body = function_body(source, "wait_for_child_timeout")
-    require_tokens(
-        wait_body,
-        [
-            "ker::process::waitpid(pid, status, WNOHANG, nullptr)",
-            "START_NS != 0 && monotonic_ns() - START_NS <= TIMEOUT_NS",
-            "START_NS == 0 && waited_us <= static_cast<uint64_t>(timeout_ms) * 1000ULL",
-            "usleep(CHILD_WAIT_POLL_US)",
-            "reap_child_after_timeout(pid)",
-        ],
-        "init child wait timeout helper",
+        "bounded manifest load and failed-supervisor status",
     )
 
-    reap_body = function_body(source, "reap_child_after_timeout")
-    require_tokens(
-        reap_body,
-        [
-            "ker::process::kill(pid, SIGKILL)",
-            "ker::process::waitpid(pid, &reap_status, WNOHANG, nullptr)",
-            "usleep(CHILD_WAIT_POLL_US)",
-        ],
-        "init child timeout reap helper",
-    )
-
-    dropbear_body = function_body(source, "start_dropbear")
-    require_tokens(
-        dropbear_body,
-        [
-            "wait_for_child_timeout(static_cast<int64_t>(KEYGEN_PID), &exit_code, DROPBEAR_KEYGEN_TIMEOUT_MS)",
-            "dropbearkey did not exit within %ums; continuing boot",
-        ],
-        "dropbear keygen timeout plumbing",
-    )
-
-
-def test_network_startup_poll_is_deadline_bounded() -> None:
-    source = NETWORK_CPP.read_text()
-    require_tokens(
-        source,
-        [
-            "POLL_FAILURE_TIMEOUT_SECS",
-            "NETD_KILL_REAP_RETRIES",
-            "terminate_netd_after_startup_timeout",
-            "ker::process::kill(netd_pid, SIGKILL)",
-        ],
-        "init network timeout surface",
-    )
-    start_body = function_body(source, "start_network")
-    require_tokens(
+    start_body = function_body(source, "start_service_supervisor")
+    require_order(
         start_body,
         [
-            "ELAPSED_SECS >= POLL_FAILURE_TIMEOUT_SECS",
-            "eth0 not configured after %ld seconds; failing network startup",
-            "eth0 did not receive a non-zero IPv4 address before the startup timeout",
-            "terminate_netd_after_startup_timeout(static_cast<int64_t>(NETD_PID))",
-            "close(POLL_SOCK)",
-            "return false",
+            "restore_init_wki_target()",
+            "read_manifest(manifest_size)",
+            "parse_service_manifest",
+            "validate_service_manifest",
+            "initialize_supervisor",
+            "advance_model(runtime.now_ms)",
+            "publish_status(runtime.now_ms)",
         ],
-        "init network startup timeout path",
-    )
-
-    timeout_body = function_body(source, "terminate_netd_after_startup_timeout")
-    require_tokens(
-        timeout_body,
-        [
-            "ker::process::kill(netd_pid, SIGKILL)",
-            "ker::process::waitpid(netd_pid, &status, WNOHANG, nullptr)",
-            "REAPED == netd_pid || (REAPED < 0 && REAPED != -EINTR)",
-            "nanosleep(&POLL_SLEEP, nullptr)",
-        ],
-        "init network netd timeout reap",
+        "manifest validation precedes service actions and status publication",
     )
 
 
-def test_dropbear_uses_interactive_priority() -> None:
+def test_spawn_has_exec_report_pgid_wki_and_fixed_vectors() -> None:
     source = SERVICES_CPP.read_text()
+    spawn_body = function_body(source, "spawn_service")
     require_tokens(
         source,
         [
-            "constexpr int INTERACTIVE_SERVICE_NICE = -5",
+            "INIT_WKI_TARGET_FLAGS = ker::process::WKI_TARGET_FLAG_LOCAL | ker::process::WKI_TARGET_FLAG_NOINHERIT",
+            "SERVICE_WKI_TARGET_FLAGS = ker::process::WKI_TARGET_FLAG_LOCAL",
+            "std::array<const char*, MAX_ARGUMENTS + 1> arguments",
+            "std::array<const char*, MAX_RUNTIME_ENVIRONMENT> environment",
+            "manifest_overrides_environment",
+            "F_DUPFD_CLOEXEC",
+            "move_above_standard_io(pipefd.at(PIPE_READ))",
+            "move_above_standard_io(pipefd.at(PIPE_WRITE))",
+            "set_nonblocking(pipefd.at(PIPE_READ))",
+            "set_close_on_exec(pipefd.at(PIPE_WRITE))",
+            "ExecFailureReport",
+            "report_child_failure",
+            "ChildFailureStage::EXEC",
         ],
-        "dropbear interactive priority constant",
+        "fixed spawn and CLOEXEC report-pipe surface",
     )
-    dropbear_body = function_body(source, "start_dropbear")
     require_tokens(
-        dropbear_body,
+        spawn_body,
         [
-            'register_service("dropbear", DROPBEAR_PID, ServiceKind::NETWORK)',
-            "ker::process::setpriority(PRIO_PROCESS, static_cast<int64_t>(DROPBEAR_PID), INTERACTIVE_SERVICE_NICE)",
-            "dropbear spawned as PID %llu",
-            "failed to raise dropbear priority",
+            "ker::process::setwkitarget(nullptr, 0, SERVICE_WKI_TARGET_FLAGS)",
+            "ker::process::fork()",
+            "restore_init_wki_target()",
+            "ker::process::setpgid(0, 0)",
+            "ker::process::setpgid(PID, PID)",
+            "ker::process::getpgid(PID)",
+            "OBSERVED_PGID != PID",
+            "retain_cleanup_child()",
+            "ker::process::setpriority(PRIO_PROCESS, 0, spec.priority)",
+            "ker::process::execve(spec.executable.c_str(), arguments.data(), environment.data())",
         ],
-        "dropbear service registration",
+        "generation-owned child setup",
     )
-    if "BACKGROUND_SERVICE_NICE" in dropbear_body:
-        fail("dropbear must not be lowered to background priority; SSH is the benchmark control channel")
+    require_order(
+        spawn_body,
+        [
+            "ker::process::setwkitarget(nullptr, 0, SERVICE_WKI_TARGET_FLAGS)",
+            "ker::process::fork()",
+            "restore_init_wki_target()",
+        ],
+        "PID 1 restores LOCAL|NOINHERIT immediately after fork",
+    )
+
+
+def test_tick_owns_reaping_exec_order_drains_probes_and_control() -> None:
+    source = SERVICES_CPP.read_text()
+    tick_body = function_body(source, "service_supervisor_tick")
+    require_tokens(
+        source,
+        [
+            "MAX_REAPS_PER_TICK",
+            "ker::process::waitpid(-1, &status, WNOHANG, nullptr)",
+            "reaped unknown/adopted child",
+            "process_exec_report",
+            "OUTPUT_READ_BYTES_PER_TICK",
+            "drain_service_output",
+            "ker::logging::logEx(name.c_str()",
+            "leader_reaped",
+            "service_group_gone(slot)",
+            "SupervisorEventKind::QUIESCED",
+            "SupervisorResult::STALE_GENERATION",
+            "ignore_stale_event",
+            "MAX_STALE_EVENT_LOGS",
+            "ker::process::kill(-slot.pgid, signal)",
+            "network_probe_begin",
+            "network_probe_poll",
+            "network_probe_dump_diagnostics",
+            "index <= control_abi::MAILBOX_CAPACITY",
+            "ker::process::init_control_receive",
+            "ker::process::init_status_publish",
+            "snapshot.sequence = 0",
+            "control_abi::MAX_TRANSITION_HISTORY",
+        ],
+        "central tick ownership surface",
+    )
+    if source.count("ker::process::waitpid(-1, &status, WNOHANG, nullptr)") != 1:
+        fail("services runtime must contain exactly one central waitpid(-1, WNOHANG) call")
+    require_order(
+        tick_body,
+        [
+            "process_exec_report(service, NOW_MS)",
+            "drain_service_output(service)",
+            "poll_network_probes(NOW_MS)",
+            "reap_children(NOW_MS)",
+            "drain_control_mailbox(NOW_MS)",
+            "advance_model(NOW_MS)",
+            "publish_status(NOW_MS)",
+        ],
+        "exec outcome precedes reap and every tick publishes status",
+    )
+    forbid_tokens(source, ["DRAIN_PID", "spawn_with_journal_stdio"], "PID 1 must own output drains without drain children")
+
+
+def test_root_init_drives_common_supervisor_without_hardcoded_services() -> None:
+    source = INIT_CPP.read_text()
+    require_tokens(
+        source,
+        [
+            "start_service_supervisor()",
+            "service_supervisor_tick()",
+            "SERVICE_SUPERVISOR_TICK_MS * 1000L * 1000L",
+            "service supervisor initialization failed; PID 1 remains alive for reaping and shutdown",
+        ],
+        "root init supervisor loop",
+    )
+    forbid_tokens(
+        source,
+        ["start_journald()", "start_network()", "start_httpd()", "start_dropbear()", "start_testd()"],
+        "root init no longer hardcodes service launch order",
+    )
 
 
 def test_pivot_root_retries_transient_busy_mount_refs() -> None:
@@ -167,7 +220,7 @@ def test_pivot_root_retries_transient_busy_mount_refs() -> None:
             "pivot_root_with_busy_retry",
             "ret = ker::abi::vfs::pivot_root_vfs(ROOTFS_MOUNTPOINT, OLD_ROOT_MOUNTPOINT)",
             "if (ret != -EBUSY)",
-            "init_log::warn(\"init[%llu]: pivot_root busy (attempt %d/%d), retrying\"",
+            'init_log::warn("init[%llu]: pivot_root busy (attempt %d/%d), retrying"',
             "sleep_ms(PIVOT_ROOT_RETRY_MS)",
             "int const PIVOT_RET = pivot_root_with_busy_retry(CPUNO)",
             "pivot_root failed (ret=%d), continuing with initramfs root",
@@ -178,10 +231,11 @@ def test_pivot_root_retries_transient_busy_mount_refs() -> None:
 
 def main() -> None:
     test_pivot_root_retries_transient_busy_mount_refs()
-    test_dropbear_keygen_wait_is_deadline_bounded()
-    test_dropbear_uses_interactive_priority()
-    test_network_startup_poll_is_deadline_bounded()
-    print("init dropbear key generation and network readiness waits are deadline bounded")
+    test_manifest_load_and_failed_mode_are_bounded()
+    test_spawn_has_exec_report_pgid_wki_and_fixed_vectors()
+    test_tick_owns_reaping_exec_order_drains_probes_and_control()
+    test_root_init_drives_common_supervisor_without_hardcoded_services()
+    print("init declarative supervisor source invariants hold")
 
 
 if __name__ == "__main__":

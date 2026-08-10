@@ -199,6 +199,21 @@ def test_strace_names_spawn_syscall() -> None:
     )
 
 
+def test_strace_names_init_control_syscalls() -> None:
+    source = read_strace_sources()
+    for operation, name in [
+        ("INIT_CONTROL_SUBMIT", "init_control_submit"),
+        ("INIT_CONTROL_RECEIVE", "init_control_receive"),
+        ("INIT_STATUS_PUBLISH", "init_status_publish"),
+        ("INIT_STATUS_READ", "init_status_read"),
+    ]:
+        require_tokens(
+            source,
+            [f"case ker::abi::process::procmgmt_ops::{operation}:", f'return "{name}";'],
+            "strace init-control syscall names",
+        )
+
+
 def main() -> None:
     test_strace_startup_wait_is_deadline_bounded()
     test_strace_proxy_startup_cleanup_reaps_tracee()
@@ -206,6 +221,7 @@ def main() -> None:
     test_strace_trace_loop_uses_ptrace_syscall_wait()
     test_strace_names_process_priority_syscalls()
     test_strace_names_spawn_syscall()
+    test_strace_names_init_control_syscalls()
     print("strace startup waits are deadline bounded")
 
 

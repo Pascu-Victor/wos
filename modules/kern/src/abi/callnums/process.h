@@ -49,6 +49,10 @@ enum class procmgmt_ops : uint64_t {
     SIGPENDING,     // 41
     GETPRIORITY,    // 42
     SPAWN,          // 43 - WOS fast posix_spawn-style create-process path
+    INIT_CONTROL_SUBMIT = 44,
+    INIT_CONTROL_RECEIVE = 45,
+    INIT_STATUS_PUBLISH = 46,
+    INIT_STATUS_READ = 47,
 };
 
 enum class SpawnFdActionType : uint32_t {

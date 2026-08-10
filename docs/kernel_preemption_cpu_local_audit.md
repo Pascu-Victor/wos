@@ -93,6 +93,7 @@ resumes, and none of these sites retains a runqueue pointer or treats a cached
 - `modules/kern/src/syscalls_impl/log/sys_log.cpp` — **refactored**.
 - `modules/kern/src/syscalls_impl/multiproc/threadControl.cpp` — **refactored**.
 - `modules/kern/src/syscalls_impl/net/sys_net.cpp` — **refactored**.
+- `modules/kern/src/syscalls_impl/process/init_control.cpp` — **refactored**. Current-task use is stable caller identity for PID/euid authorization and usercopy; no CPU-local pointer is retained.
 - `modules/kern/src/syscalls_impl/process/getpid.cpp` — **refactored**.
 - `modules/kern/src/syscalls_impl/process/getppid.cpp` — **refactored**.
 - `modules/kern/src/syscalls_impl/shm/shm.cpp` — **refactored**.

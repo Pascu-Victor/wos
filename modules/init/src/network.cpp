@@ -8,13 +8,9 @@
 #include <callnums/sys_log.h>
 #include <fcntl.h>
 #include <net/if.h>
-#include <signal.h>  // NOLINT(modernize-deprecated-headers): WOS signal constants live here.
 #include <sys/ioctl.h>
 #include <sys/logging.h>
-#include <sys/process.h>
 #include <sys/socket.h>
-#include <sys/wait.h>
-#include <time.h>  // NOLINT(modernize-deprecated-headers): WOS POSIX clock declarations live here.
 #include <unistd.h>
 #include <wos/netctl.h>
 
@@ -24,37 +20,17 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <ctime>
-
-#include "env.h"
-#include "services.h"
-#include "sys/multiproc.h"
 
 namespace {
 using init_log = wos::journal<"init">;
 using init_net_log = wos::journal<"init_net">;
 
-constexpr const char* NET_IFNAME = "eth0";
-constexpr long POLL_FIRST_DIAGNOSTIC_SECS = 45;
-constexpr long POLL_STATUS_INTERVAL_SECS = 60;
-constexpr long POLL_FAILURE_TIMEOUT_SECS = 180;
-constexpr long POLL_INTERVAL_MS = 50;
-constexpr uint32_t NETD_KILL_REAP_RETRIES = 1000;
 constexpr size_t IF_DEBUG_CAP = 16;
 constexpr size_t ADDR_DEBUG_CAP = 32;
 constexpr size_t JOURNAL_READ_BATCH = 16;
+constexpr size_t JOURNAL_DUMP_RECORD_CAP = 4096;
 constexpr size_t JOURNAL_RECORD_SIZE = sizeof(ker::abi::sys_log::JournalRecord);
 constexpr size_t NETDEV_STATS_BUF_SIZE = 1024;
-
-struct PollDebug {
-    uint64_t attempts = 0;
-    uint64_t addr_successes = 0;
-    uint64_t addr_zero_results = 0;
-    uint64_t addr_failures = 0;
-    int first_errno = 0;
-    int last_errno = 0;
-    uint32_t last_addr = 0;
-};
 
 void copy_ifreq_name(struct ifreq& ifr, const char* ifname) {
     std::memset(&ifr, 0, sizeof(ifr));
@@ -129,7 +105,7 @@ void replay_journal_record(const ker::abi::sys_log::JournalRecord& rec) {
 }
 
 void dump_journal_snapshot() {
-    int fd = ::open("/dev/journal", O_RDONLY);
+    int fd = ::open("/dev/journal", O_RDONLY | O_CLOEXEC | O_NONBLOCK);
     if (fd < 0) {
         int const ERR = errno;
         init_net_log::critical("unable to open /dev/journal for failure dump: errno=%d (%s)", ERR, strerror(ERR));
@@ -138,13 +114,18 @@ void dump_journal_snapshot() {
 
     uint64_t latest_sequence = 0;
     uint64_t record_count = 0;
+    size_t records_scanned = 0;
     std::array<ker::abi::sys_log::JournalRecord, JOURNAL_READ_BATCH> batch{};
-    for (;;) {
+    while (records_scanned < JOURNAL_DUMP_RECORD_CAP) {
         ssize_t const N = ::read(fd, batch.data(), batch.size() * JOURNAL_RECORD_SIZE);
         if (N <= 0) {
             break;
         }
-        size_t const RECORDS = static_cast<size_t>(N) / JOURNAL_RECORD_SIZE;
+        size_t const RECORDS = std::min(static_cast<size_t>(N) / JOURNAL_RECORD_SIZE, JOURNAL_DUMP_RECORD_CAP - records_scanned);
+        if (RECORDS == 0) {
+            break;
+        }
+        records_scanned += RECORDS;
         for (size_t i = 0; i < RECORDS; i++) {
             auto const& rec = batch.at(i);
             if (!valid_journal_record(rec)) {
@@ -163,19 +144,24 @@ void dump_journal_snapshot() {
         return;
     }
 
-    fd = ::open("/dev/journal", O_RDONLY);
+    fd = ::open("/dev/journal", O_RDONLY | O_CLOEXEC | O_NONBLOCK);
     if (fd < 0) {
         int const ERR = errno;
         init_net_log::critical("unable to reopen /dev/journal for failure dump: errno=%d (%s)", ERR, strerror(ERR));
         return;
     }
 
-    for (;;) {
+    records_scanned = 0;
+    while (records_scanned < JOURNAL_DUMP_RECORD_CAP) {
         ssize_t const N = ::read(fd, batch.data(), batch.size() * JOURNAL_RECORD_SIZE);
         if (N <= 0) {
             break;
         }
-        size_t const RECORDS = static_cast<size_t>(N) / JOURNAL_RECORD_SIZE;
+        size_t const RECORDS = std::min(static_cast<size_t>(N) / JOURNAL_RECORD_SIZE, JOURNAL_DUMP_RECORD_CAP - records_scanned);
+        if (RECORDS == 0) {
+            break;
+        }
+        records_scanned += RECORDS;
         for (size_t i = 0; i < RECORDS; i++) {
             auto const& rec = batch.at(i);
             if (!valid_journal_record(rec) || rec.sequence > latest_sequence) {
@@ -187,71 +173,75 @@ void dump_journal_snapshot() {
     ::close(fd);
 }
 
-void dump_ioctl_state(int sock) {
+void dump_ioctl_state(int sock, const char* interface_name) {
     if (sock < 0) {
         init_net_log::critical("no AF_INET/SOCK_DGRAM socket available for ioctl probes");
         return;
     }
+    if (interface_name == nullptr || interface_name[0] == '\0') {
+        init_net_log::critical("no interface name available for ioctl probes");
+        return;
+    }
 
     struct ifreq ifr{};
-    copy_ifreq_name(ifr, NET_IFNAME);
+    copy_ifreq_name(ifr, interface_name);
     if (ioctl(sock, SIOCGIFFLAGS, &ifr) == 0) {
-        init_net_log::critical("%s SIOCGIFFLAGS flags=0x%x", NET_IFNAME, static_cast<unsigned>(ifr.ifr_flags));
+        init_net_log::critical("%s SIOCGIFFLAGS flags=0x%x", interface_name, static_cast<unsigned>(ifr.ifr_flags));
     } else {
         int const ERR = errno;
-        init_net_log::critical("%s SIOCGIFFLAGS failed errno=%d (%s)", NET_IFNAME, ERR, strerror(ERR));
+        init_net_log::critical("%s SIOCGIFFLAGS failed errno=%d (%s)", interface_name, ERR, strerror(ERR));
     }
 
-    copy_ifreq_name(ifr, NET_IFNAME);
+    copy_ifreq_name(ifr, interface_name);
     if (ioctl(sock, SIOCGIFINDEX, &ifr) == 0) {
-        init_net_log::critical("%s SIOCGIFINDEX ifindex=%d", NET_IFNAME, ifr.ifr_ifindex);
+        init_net_log::critical("%s SIOCGIFINDEX ifindex=%d", interface_name, ifr.ifr_ifindex);
     } else {
         int const ERR = errno;
-        init_net_log::critical("%s SIOCGIFINDEX failed errno=%d (%s)", NET_IFNAME, ERR, strerror(ERR));
+        init_net_log::critical("%s SIOCGIFINDEX failed errno=%d (%s)", interface_name, ERR, strerror(ERR));
     }
 
-    copy_ifreq_name(ifr, NET_IFNAME);
+    copy_ifreq_name(ifr, interface_name);
     if (ioctl(sock, SIOCGIFMTU, &ifr) == 0) {
-        init_net_log::critical("%s SIOCGIFMTU mtu=%d", NET_IFNAME, ifr.ifr_mtu);
+        init_net_log::critical("%s SIOCGIFMTU mtu=%d", interface_name, ifr.ifr_mtu);
     } else {
         int const ERR = errno;
-        init_net_log::critical("%s SIOCGIFMTU failed errno=%d (%s)", NET_IFNAME, ERR, strerror(ERR));
+        init_net_log::critical("%s SIOCGIFMTU failed errno=%d (%s)", interface_name, ERR, strerror(ERR));
     }
 
-    copy_ifreq_name(ifr, NET_IFNAME);
+    copy_ifreq_name(ifr, interface_name);
     if (ioctl(sock, SIOCGIFHWADDR, &ifr) == 0) {
         auto const* mac = reinterpret_cast<const unsigned char*>(ifr.ifr_hwaddr.sa_data);
-        init_net_log::critical("%s SIOCGIFHWADDR family=%u mac=%02x:%02x:%02x:%02x:%02x:%02x", NET_IFNAME,
+        init_net_log::critical("%s SIOCGIFHWADDR family=%u mac=%02x:%02x:%02x:%02x:%02x:%02x", interface_name,
                                static_cast<unsigned>(ifr.ifr_hwaddr.sa_family), static_cast<unsigned>(mac[0]),
                                static_cast<unsigned>(mac[1]), static_cast<unsigned>(mac[2]), static_cast<unsigned>(mac[3]),
                                static_cast<unsigned>(mac[4]), static_cast<unsigned>(mac[5]));
     } else {
         int const ERR = errno;
-        init_net_log::critical("%s SIOCGIFHWADDR failed errno=%d (%s)", NET_IFNAME, ERR, strerror(ERR));
+        init_net_log::critical("%s SIOCGIFHWADDR failed errno=%d (%s)", interface_name, ERR, strerror(ERR));
     }
 
-    copy_ifreq_name(ifr, NET_IFNAME);
+    copy_ifreq_name(ifr, interface_name);
     if (ioctl(sock, SIOCGIFADDR, &ifr) == 0) {
         auto* addr = reinterpret_cast<struct sockaddr_in*>(&ifr.ifr_addr);
         std::array<char, INET_ADDRSTRLEN> ip_str{};
         inet_ntop(AF_INET, &addr->sin_addr, ip_str.data(), ip_str.size());
-        init_net_log::critical("%s SIOCGIFADDR family=%u addr=%s raw=0x%x", NET_IFNAME, static_cast<unsigned>(addr->sin_family),
+        init_net_log::critical("%s SIOCGIFADDR family=%u addr=%s raw=0x%x", interface_name, static_cast<unsigned>(addr->sin_family),
                                ip_str.data(), static_cast<unsigned>(ntohl(addr->sin_addr.s_addr)));
     } else {
         int const ERR = errno;
-        init_net_log::critical("%s SIOCGIFADDR failed errno=%d (%s)", NET_IFNAME, ERR, strerror(ERR));
+        init_net_log::critical("%s SIOCGIFADDR failed errno=%d (%s)", interface_name, ERR, strerror(ERR));
     }
 
-    copy_ifreq_name(ifr, NET_IFNAME);
+    copy_ifreq_name(ifr, interface_name);
     if (ioctl(sock, SIOCGIFNETMASK, &ifr) == 0) {
         auto* addr = reinterpret_cast<struct sockaddr_in*>(&ifr.ifr_netmask);
         std::array<char, INET_ADDRSTRLEN> mask_str{};
         inet_ntop(AF_INET, &addr->sin_addr, mask_str.data(), mask_str.size());
-        init_net_log::critical("%s SIOCGIFNETMASK family=%u mask=%s raw=0x%x", NET_IFNAME, static_cast<unsigned>(addr->sin_family),
+        init_net_log::critical("%s SIOCGIFNETMASK family=%u mask=%s raw=0x%x", interface_name, static_cast<unsigned>(addr->sin_family),
                                mask_str.data(), static_cast<unsigned>(ntohl(addr->sin_addr.s_addr)));
     } else {
         int const ERR = errno;
-        init_net_log::critical("%s SIOCGIFNETMASK failed errno=%d (%s)", NET_IFNAME, ERR, strerror(ERR));
+        init_net_log::critical("%s SIOCGIFNETMASK failed errno=%d (%s)", interface_name, ERR, strerror(ERR));
     }
 }
 
@@ -343,169 +333,127 @@ void dump_netdev_stats_file(const char* path) {
     }
 }
 
-void dump_netdev_stats() {
-    dump_netdev_stats_file("/dev/net/eth0");
-    dump_netdev_stats_file("/dev/net/eth1");
-}
-
-void dump_network_failure_debug(const char* reason, uint64_t netd_pid, const PollDebug* poll, int sock) {
-    init_net_log::critical("=== begin network startup diagnostic dump ===");
-    init_net_log::critical("reason=%s netd_pid=%llu poll_socket=%d", reason != nullptr ? reason : "(unknown)",
-                           static_cast<unsigned long long>(netd_pid), sock);
-    if (poll != nullptr) {
-        std::array<char, INET_ADDRSTRLEN> last_ip{};
-        struct in_addr last_addr{};
-        last_addr.s_addr = poll->last_addr;
-        inet_ntop(AF_INET, &last_addr, last_ip.data(), last_ip.size());
-        init_log::critical(
-            "pol_netl attempts=%llu addr_successes=%llu zero_addr_results=%llu addr_failures=%llu last_addr=%s raw=0x%x "
-            "first_diagnostic_secs=%ld",
-            static_cast<unsigned long long>(poll->attempts), static_cast<unsigned long long>(poll->addr_successes),
-            static_cast<unsigned long long>(poll->addr_zero_results), static_cast<unsigned long long>(poll->addr_failures), last_ip.data(),
-            static_cast<unsigned>(ntohl(poll->last_addr)), POLL_FIRST_DIAGNOSTIC_SECS);
-        init_net_log::critical("poll first_errno=%d (%s)", poll->first_errno,
-                               poll->first_errno != 0 ? strerror(poll->first_errno) : "none");
-        init_net_log::critical("poll last_errno=%d (%s)", poll->last_errno, poll->last_errno != 0 ? strerror(poll->last_errno) : "none");
-    }
-    dump_ioctl_state(sock);
-    dump_netctl_state();
-    dump_netdev_stats();
-    dump_journal_snapshot();
-    init_net_log::critical("=== end network startup diagnostic dump ===");
-}
-
-void terminate_netd_after_startup_timeout(int64_t netd_pid) {
-    if (netd_pid <= 0) {
+void dump_netdev_stats(const char* interface_name) {
+    if (interface_name == nullptr || interface_name[0] == '\0') {
+        init_net_log::critical("no interface name available for /dev/net diagnostics");
         return;
     }
 
-    (void)ker::process::kill(netd_pid, SIGKILL);
-    for (uint32_t retry = 0; retry < NETD_KILL_REAP_RETRIES; retry++) {
-        int32_t status = 0;
-        int64_t const REAPED = ker::process::waitpid(netd_pid, &status, WNOHANG, nullptr);
-        if (REAPED == netd_pid || (REAPED < 0 && REAPED != -EINTR)) {
-            return;
-        }
-        struct timespec const POLL_SLEEP{
-            .tv_sec = 0,
-            .tv_nsec = POLL_INTERVAL_MS * 1000L * 1000L,
-        };
-        nanosleep(&POLL_SLEEP, nullptr);
+    std::array<char, sizeof("/dev/net/") + IFNAMSIZ> path{};
+    int const WRITTEN = std::snprintf(path.data(), path.size(), "/dev/net/%s", interface_name);
+    if (WRITTEN < 0 || static_cast<size_t>(WRITTEN) >= path.size()) {
+        init_net_log::critical("interface name is too long for /dev/net diagnostics");
+        return;
     }
+    dump_netdev_stats_file(path.data());
 }
+
 }  // namespace
 
-auto start_network() -> bool {
-    uint64_t const CPUNO = ker::multiproc::currentThreadId();
+auto network_probe_begin(NetworkProbe& probe, const char* interface_name) -> bool {
+    network_probe_reset(probe);
 
-    init_log::info("init[%llu]: spawning netd (DHCP daemon)", static_cast<unsigned long long>(CPUNO));
-    std::array<const char*, 2> netd_argv = {"/sbin/netd", nullptr};
-    InitEnv netd_env = make_init_env();
-    uint64_t const NETD_PID = spawn_local_service("/sbin/netd", netd_argv.data(), netd_env.envp.data());
-    if (NETD_PID == 0) {
-        init_log::error("init[%llu]: failed to spawn netd", static_cast<unsigned long long>(CPUNO));
-        dump_network_failure_debug("failed to spawn /sbin/netd", NETD_PID, nullptr, -1);
+    size_t const NAME_LEN = bounded_string_length(interface_name, probe.interface_name.size());
+    if (interface_name == nullptr || NAME_LEN == 0) {
+        probe.open_errno = EINVAL;
+        errno = probe.open_errno;
         return false;
     }
-    init_log::info("init[%llu]: netd spawned as PID %llu", static_cast<unsigned long long>(CPUNO),
-                   static_cast<unsigned long long>(NETD_PID));
-    register_service("netd", NETD_PID, ServiceKind::NETWORK);
+    if (NAME_LEN >= probe.interface_name.size()) {
+        probe.open_errno = ENAMETOOLONG;
+        errno = probe.open_errno;
+        return false;
+    }
+    std::memcpy(probe.interface_name.data(), interface_name, NAME_LEN);
+    probe.interface_name.at(NAME_LEN) = '\0';
 
-    // Poll eth0 for IP address readiness (wait for DHCP to complete)
-    int const POLL_SOCK = socket(AF_INET, SOCK_DGRAM, 0);
-    if (POLL_SOCK < 0) {
+    int const SOCKET_FD = socket(AF_INET, SOCK_DGRAM, 0);
+    if (SOCKET_FD < 0) {
+        probe.open_errno = errno;
+        return false;
+    }
+
+    int const FD_FLAGS = fcntl(SOCKET_FD, F_GETFD);
+    if (FD_FLAGS < 0 || fcntl(SOCKET_FD, F_SETFD, FD_FLAGS | FD_CLOEXEC) < 0) {
         int const ERR = errno;
-        init_log::error("init[%llu]: failed to create network poll socket: errno=%d (%s)", static_cast<unsigned long long>(CPUNO), ERR,
-                        strerror(ERR));
-        dump_network_failure_debug("failed to create AF_INET/SOCK_DGRAM poll socket", NETD_PID, nullptr, -1);
+        (void)::close(SOCKET_FD);
+        probe.open_errno = ERR;
+        errno = ERR;
         return false;
     }
 
-    struct timespec poll_start{};
-    if (clock_gettime(CLOCK_MONOTONIC, &poll_start) != 0) {
-        int const ERR = errno;
-        init_log::error("init[%llu]: failed to read network poll start time: errno=%d (%s)", static_cast<unsigned long long>(CPUNO), ERR,
-                        strerror(ERR));
-        dump_network_failure_debug("clock_gettime(CLOCK_MONOTONIC) failed before network poll", NETD_PID, nullptr, POLL_SOCK);
-        close(POLL_SOCK);
-        return false;
-    }
-
-    PollDebug poll{};
-    bool diagnostic_dumped = false;
-    long next_status_secs = POLL_FIRST_DIAGNOSTIC_SECS + POLL_STATUS_INTERVAL_SECS;
-    for (;;) {
-        poll.attempts++;
-
-        struct ifreq ifr{};
-        copy_ifreq_name(ifr, NET_IFNAME);
-        if (ioctl(POLL_SOCK, SIOCGIFADDR, &ifr) == 0) {
-            poll.addr_successes++;
-            auto* addr = reinterpret_cast<struct sockaddr_in*>(&ifr.ifr_addr);
-            poll.last_addr = addr->sin_addr.s_addr;
-            if (addr->sin_addr.s_addr != 0) {
-                std::array<char, INET_ADDRSTRLEN> ip_str{};
-                inet_ntop(AF_INET, &addr->sin_addr, ip_str.data(), ip_str.size());
-                init_log::info("init[%llu]: eth0 configured with IP %s", static_cast<unsigned long long>(CPUNO), ip_str.data());
-                break;
-            }
-            poll.addr_zero_results++;
-        } else {
-            int const ERR = errno;
-            poll.addr_failures++;
-            if (poll.first_errno == 0) {
-                poll.first_errno = ERR;
-            }
-            poll.last_errno = ERR;
-        }
-
-        struct timespec now{};
-        if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
-            int const ERR = errno;
-            init_log::error("init[%llu]: failed to read network poll time: errno=%d (%s)", static_cast<unsigned long long>(CPUNO), ERR,
-                            strerror(ERR));
-            dump_network_failure_debug("clock_gettime(CLOCK_MONOTONIC) failed during network poll", NETD_PID, &poll, POLL_SOCK);
-            close(POLL_SOCK);
-            return false;
-        }
-        long const ELAPSED_SECS = now.tv_sec - poll_start.tv_sec;
-        if (!diagnostic_dumped && ELAPSED_SECS >= POLL_FIRST_DIAGNOSTIC_SECS) {
-            init_log::warn("init[%llu]: eth0 not configured after polling for %ld seconds; continuing to wait",
-                           static_cast<unsigned long long>(CPUNO), POLL_FIRST_DIAGNOSTIC_SECS);
-            dump_network_failure_debug("eth0 has not received a non-zero IPv4 address yet; continuing to wait", NETD_PID, &poll, POLL_SOCK);
-            diagnostic_dumped = true;
-        } else if (diagnostic_dumped && ELAPSED_SECS >= next_status_secs) {
-            init_log::warn("init[%llu]: still waiting for eth0 IPv4 configuration after %ld seconds",
-                           static_cast<unsigned long long>(CPUNO), ELAPSED_SECS);
-            next_status_secs += POLL_STATUS_INTERVAL_SECS;
-        }
-        if (ELAPSED_SECS >= POLL_FAILURE_TIMEOUT_SECS) {
-            init_log::critical("init[%llu]: eth0 not configured after %ld seconds; failing network startup",
-                               static_cast<unsigned long long>(CPUNO), POLL_FAILURE_TIMEOUT_SECS);
-            dump_network_failure_debug("eth0 did not receive a non-zero IPv4 address before the startup timeout", NETD_PID, &poll,
-                                       POLL_SOCK);
-            terminate_netd_after_startup_timeout(static_cast<int64_t>(NETD_PID));
-            close(POLL_SOCK);
-            return false;
-        }
-
-        int32_t netd_status = 0;
-        auto const NETD_PID_SIGNED = static_cast<int64_t>(NETD_PID);
-        int64_t const NETD_REAPED = ker::process::waitpid(NETD_PID_SIGNED, &netd_status, WNOHANG, nullptr);
-        if (NETD_REAPED == NETD_PID_SIGNED) {
-            init_log::critical("init[%llu]: netd exited before eth0 IPv4 configuration (status=%d)", static_cast<unsigned long long>(CPUNO),
-                               netd_status);
-            dump_network_failure_debug("netd exited before eth0 received a non-zero IPv4 address", NETD_PID, &poll, POLL_SOCK);
-            close(POLL_SOCK);
-            return false;
-        }
-
-        struct timespec const POLL_SLEEP{
-            .tv_sec = 0,
-            .tv_nsec = POLL_INTERVAL_MS * 1000L * 1000L,
-        };
-        nanosleep(&POLL_SLEEP, nullptr);
-    }
-    close(POLL_SOCK);
+    probe.socket_fd = SOCKET_FD;
     return true;
+}
+
+auto network_probe_poll(NetworkProbe& probe) -> NetworkProbeResult {
+    if (probe.socket_fd < 0 || probe.interface_name.front() == '\0') {
+        int const ERR = probe.open_errno != 0 ? probe.open_errno : EBADF;
+        if (probe.first_errno == 0) {
+            probe.first_errno = ERR;
+        }
+        probe.last_errno = ERR;
+        errno = ERR;
+        return NetworkProbeResult::ERROR;
+    }
+
+    probe.attempts++;
+    struct ifreq ifr{};
+    copy_ifreq_name(ifr, probe.interface_name.data());
+    if (ioctl(probe.socket_fd, SIOCGIFADDR, &ifr) != 0) {
+        int const ERR = errno;
+        probe.addr_failures++;
+        if (probe.first_errno == 0) {
+            probe.first_errno = ERR;
+        }
+        probe.last_errno = ERR;
+        return NetworkProbeResult::ERROR;
+    }
+
+    probe.addr_successes++;
+    auto const* addr = reinterpret_cast<const struct sockaddr_in*>(&ifr.ifr_addr);
+    probe.last_ipv4 = addr->sin_addr.s_addr;
+    if (probe.last_ipv4 == 0) {
+        probe.addr_zero_results++;
+        return NetworkProbeResult::PENDING;
+    }
+    return NetworkProbeResult::READY;
+}
+
+void network_probe_dump_diagnostics(const NetworkProbe& probe, const char* reason, uint64_t service_pid) {
+    init_net_log::critical("=== begin network readiness diagnostic dump ===");
+    init_net_log::critical("reason=%s service_pid=%llu interface=%s poll_socket=%d open_errno=%d (%s)",
+                           reason != nullptr ? reason : "(unknown)", static_cast<unsigned long long>(service_pid),
+                           probe.interface_name.front() != '\0' ? probe.interface_name.data() : "(unset)", probe.socket_fd,
+                           probe.open_errno, probe.open_errno != 0 ? strerror(probe.open_errno) : "none");
+
+    std::array<char, INET_ADDRSTRLEN> last_ip{};
+    struct in_addr last_addr{};
+    last_addr.s_addr = probe.last_ipv4;
+    inet_ntop(AF_INET, &last_addr, last_ip.data(), last_ip.size());
+    init_log::critical("network poll attempts=%llu addr_successes=%llu zero_addr_results=%llu addr_failures=%llu last_addr=%s raw=0x%x",
+                       static_cast<unsigned long long>(probe.attempts), static_cast<unsigned long long>(probe.addr_successes),
+                       static_cast<unsigned long long>(probe.addr_zero_results), static_cast<unsigned long long>(probe.addr_failures),
+                       last_ip.data(), static_cast<unsigned>(ntohl(probe.last_ipv4)));
+    init_net_log::critical("poll first_errno=%d (%s)", probe.first_errno, probe.first_errno != 0 ? strerror(probe.first_errno) : "none");
+    init_net_log::critical("poll last_errno=%d (%s)", probe.last_errno, probe.last_errno != 0 ? strerror(probe.last_errno) : "none");
+
+    dump_ioctl_state(probe.socket_fd, probe.interface_name.data());
+    dump_netctl_state();
+    dump_netdev_stats(probe.interface_name.data());
+    dump_journal_snapshot();
+    init_net_log::critical("=== end network readiness diagnostic dump ===");
+}
+
+void network_probe_close(NetworkProbe& probe) {
+    int const SOCKET_FD = probe.socket_fd;
+    probe.socket_fd = -1;
+    if (SOCKET_FD >= 0) {
+        (void)::close(SOCKET_FD);
+    }
+}
+
+void network_probe_reset(NetworkProbe& probe) {
+    network_probe_close(probe);
+    probe = NetworkProbe{};
 }

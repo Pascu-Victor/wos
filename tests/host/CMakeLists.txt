@@ -101,8 +101,24 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/init_source_test.py
 )
 add_test(
+    NAME service_manifest_config_source_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/service_manifest_config_source_test.py
+)
+add_test(
+    NAME init_supervisor_docs_source_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/init_supervisor_docs_source_test.py
+)
+add_test(
     NAME shutdown_source_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/shutdown_source_test.py
+)
+add_test(
+    NAME init_control_source_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/init_control_source_test.py
+)
+add_test(
+    NAME wos_resolve_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/wos_resolve_test.py
 )
 add_test(
     NAME pty_source_test
@@ -501,7 +517,11 @@ set_tests_properties(
     top_source_test
     time_source_test
     init_source_test
+    service_manifest_config_source_test
+    init_supervisor_docs_source_test
     shutdown_source_test
+    init_control_source_test
+    wos_resolve_test
     pty_source_test
     strace_source_test
     journal_source_test
@@ -660,6 +680,15 @@ wos_add_unit_test(renderbench_options_test
 target_include_directories(renderbench_options_test PRIVATE
     ${WOS_ROOT}/modules/renderbench/src
     ${WOS_ROOT}/modules/testprog/src
+)
+
+wos_add_unit_test(init_supervisor_test
+    SOURCES      ${CMAKE_CURRENT_SOURCE_DIR}/unit/init_supervisor_test.cpp
+    KERN_SOURCES ${WOS_ROOT}/modules/init/src/service_manifest.cpp
+                 ${WOS_ROOT}/modules/init/src/supervisor_model.cpp
+)
+target_include_directories(init_supervisor_test PRIVATE
+    ${WOS_ROOT}/modules/init/src
 )
 
 wos_add_unit_test(bitmap_test

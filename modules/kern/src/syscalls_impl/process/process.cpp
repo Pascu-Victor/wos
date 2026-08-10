@@ -37,6 +37,7 @@
 #include "syscalls_impl/process/exit.hpp"
 #include "syscalls_impl/process/getpid.hpp"
 #include "syscalls_impl/process/getppid.hpp"
+#include "syscalls_impl/process/init_control.hpp"
 #include "syscalls_impl/process/waitpid.hpp"
 #include "syscalls_impl/shm/shm.hpp"
 #include "syscalls_impl/vmem/sys_vmem.hpp"
@@ -1516,6 +1517,18 @@ auto process(abi::process::procmgmt_ops op, uint64_t a2, uint64_t a3, uint64_t a
         }
         case abi::process::procmgmt_ops::SPAWN: {
             return wos_proc_spawn(a2, a3, a4, a5);
+        }
+        case abi::process::procmgmt_ops::INIT_CONTROL_SUBMIT: {
+            return wos_proc_init_control_submit(a2);
+        }
+        case abi::process::procmgmt_ops::INIT_CONTROL_RECEIVE: {
+            return wos_proc_init_control_receive(a2);
+        }
+        case abi::process::procmgmt_ops::INIT_STATUS_PUBLISH: {
+            return wos_proc_init_status_publish(a2);
+        }
+        case abi::process::procmgmt_ops::INIT_STATUS_READ: {
+            return wos_proc_init_status_read(a2);
         }
         case abi::process::procmgmt_ops::WAITPID: {
             return wos_proc_waitpid(static_cast<int64_t>(a2), reinterpret_cast<int32_t*>(a3), static_cast<int32_t>(a4), a5, gpr);

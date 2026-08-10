@@ -8,7 +8,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 VM_LOG_RE = re.compile(r"serial-vm(?P<vm>\d+)\.log$")
-IP_RE = re.compile(r"eth0 configured with IP (?P<ip>\d+\.\d+\.\d+\.\d+)")
+IP_RE = re.compile(r"eth0 configured(?: with IP |: ip=)(?P<ip>\d+\.\d+\.\d+\.\d+)")
 HOST_RE = re.compile(r"hostname='(?P<hostname>[^']+)'")
 
 

@@ -10,6 +10,7 @@ SYSROOT_DIR="${WOS_SYSROOT_PATH:-toolchain/sysroot}"
 INIT_BINARY="$BUILD_DIR/modules/init/init"
 INITRAMFS_OUT="$BUILD_DIR/initramfs.cpio"
 ROOTFS_DISK="${WOS_ROOTFS_DISK:-mountfs.qcow2}"
+SERVICE_MANIFEST="$CWD/configs/wos-services.conf"
 READELF="${WOS_READELF:-}"
 INITRAMFS_TMP=""
 INITRAMFS_MTIME="${SOURCE_DATE_EPOCH:-0}"
@@ -177,6 +178,13 @@ mkdir -p "$INITRAMFS_DIR/lib"
 cp "$INIT_BINARY" "$INITRAMFS_DIR/sbin/init"
 echo "  initramfs: added /sbin/init ($(du -h "$INIT_BINARY" | cut -f1))"
 stage_init_dynamic_runtime
+
+if [ ! -f "$SERVICE_MANIFEST" ]; then
+    echo "ERROR: service manifest not found at $SERVICE_MANIFEST" >&2
+    exit 1
+fi
+cp "$SERVICE_MANIFEST" "$INITRAMFS_DIR/etc/wos-services.conf"
+echo "  initramfs: added /etc/wos-services.conf from configs/wos-services.conf"
 
 # Generate /etc/hostname from system configuration
 if [ -f "configs/system.conf" ]; then

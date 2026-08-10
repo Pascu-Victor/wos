@@ -7,8 +7,10 @@ set(CXXFILES
     src/init.cpp
     src/fstab.cpp
     src/network.cpp
+    src/service_manifest.cpp
     src/services.cpp
     src/shutdown.cpp
+    src/supervisor_model.cpp
 )
 
 add_executable(${TARGET} ${CXXFILES})
