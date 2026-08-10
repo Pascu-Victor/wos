@@ -3,6 +3,7 @@
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QString>
+#include <QStringList>
 #include <QTemporaryDir>
 #include <cstddef>
 #include <cstdint>
@@ -23,6 +24,7 @@ struct IncidentLimits {
     size_t max_path_length = 512;
     size_t max_path_depth = 24;
     uint64_t max_expansion_ratio = 200;
+    QStringList allowed_roots;
 };
 
 // Stable machine-readable validation finding. Callers should branch on code,
@@ -69,12 +71,13 @@ struct IncidentBundle {
     [[nodiscard]] const IncidentMember* find_member(const QString& path) const;
 };
 
-// The caller remains responsible for checking that source_path itself is under
-// DebugAnalysisService's effective allowedRoots. This loader then treats every
-// byte/member as hostile: it rejects unsafe names and node types, snapshots
-// regular files into a private QTemporaryDir, validates manifest.json format
-// "wosincident" version 1, checks declared sizes/SHA-256 values and required
-// members, sorts inventory by path, and never executes bundle content.
+// When limits.allowed_roots is non-empty, the loader verifies the already-open
+// source descriptor against those canonical roots before reading bundle bytes.
+// It then treats every byte/member as hostile: it rejects unsafe names and node
+// types, snapshots regular files into a private QTemporaryDir, validates
+// manifest.json format "wosincident" version 1, checks declared sizes/SHA-256
+// values and required members, sorts inventory by path, and never executes
+// bundle content.
 //
 // A non-null bundle is returned even when validation fails so callers can
 // expose stable issue codes. Its snapshot is owned by IncidentBundle::storage
@@ -83,7 +86,7 @@ struct IncidentBundle {
 
 [[nodiscard]] QJsonObject incident_issue_to_json(const IncidentIssue& issue);
 [[nodiscard]] QJsonObject incident_member_to_json(const IncidentMember& member, bool include_absolute_path = false);
-[[nodiscard]] QJsonArray incident_issues_to_json(const IncidentBundle& bundle);
+[[nodiscard]] QJsonArray incident_issues_to_json(const IncidentBundle& bundle, size_t count = 200);
 [[nodiscard]] QJsonObject incident_inventory_to_json(const IncidentBundle& bundle, size_t start = 0, size_t count = 200,
                                                      bool include_absolute_paths = false);
 

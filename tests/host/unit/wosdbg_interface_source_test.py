@@ -71,21 +71,16 @@ def test_backend_catalog_is_the_only_tool_dispatch_contract() -> None:
             f"catalog-only={sorted(catalog_names - dispatch_names)}, "
             f"dispatch-only={sorted(dispatch_names - catalog_names)}"
         )
-    incident_catalog = set(INCIDENT_TOOLS) & catalog_names
-    if incident_catalog and incident_catalog != set(INCIDENT_TOOLS):
-        fail(
-            "incident catalog must be added atomically: "
-            f"present={sorted(incident_catalog)}, "
-            f"missing={sorted(set(INCIDENT_TOOLS) - incident_catalog)}"
-        )
-    if incident_catalog:
-        for name, required_argument in INCIDENT_TOOLS.items():
-            start = catalog.find(f'{{"name", "{name}"}}')
-            if start < 0:
-                fail(f"incident catalog entry is not source-visible: {name}")
-            next_entry = catalog.find('QJsonObject{{"name", "wosdbg.', start + 1)
-            entry = catalog[start : next_entry if next_entry >= 0 else len(catalog)]
-            require_tokens(entry, ['"inputSchema"', "schema(", f'"{required_argument}"'], f"{name} schema")
+    missing_incident_tools = set(INCIDENT_TOOLS) - catalog_names
+    if missing_incident_tools:
+        fail(f"incident catalog is incomplete: missing={sorted(missing_incident_tools)}")
+    for name, required_argument in INCIDENT_TOOLS.items():
+        start = catalog.find(f'{{"name", "{name}"}}')
+        if start < 0:
+            fail(f"incident catalog entry is not source-visible: {name}")
+        next_entry = catalog.find('QJsonObject{{"name", "wosdbg.', start + 1)
+        entry = catalog[start : next_entry if next_entry >= 0 else len(catalog)]
+        require_tokens(entry, ['"inputSchema"', "schema(", f'"{required_argument}"'], f"{name} schema")
     require_tokens(
         mcp_source,
         [
@@ -152,8 +147,7 @@ def test_cli_and_gui_use_the_shared_contract() -> None:
     )
     require_tokens(remembered_context, ['"dumpId"', '"logId"'], "GUI tool-result context")
     backend_sources = "\n".join(path.read_text() for path in sorted(WOSDBG.glob("*.cpp")))
-    if any(f'{{"name", "{name}"}}' in backend_sources for name in INCIDENT_TOOLS):
-        require_tokens(remembered_context, ['"incidentId"'], "GUI incident context")
+    require_tokens(remembered_context, ['"incidentId"'], "GUI incident context")
     require_tokens(client, ["request_tool_catalog()", "call_tool(const QString& name"], "GUI client")
     require_tokens(
         server,
@@ -187,6 +181,40 @@ def test_distributed_timeline_is_bounded_and_clock_honest() -> None:
             "std::vector<std::vector<Candidate>> by_lane",
         ],
         "distributed timeline bounds/correlation/clock semantics",
+    )
+
+
+def test_incident_assurance_exercises_compiled_frontend_adapters() -> None:
+    semantic_test = (WOSDBG / "tests" / "incident_cli_semantic_test.py").read_text()
+    cmake = (WOSDBG / "CMakeLists.txt").read_text()
+    require_tokens(
+        semantic_test,
+        [
+            "class GuiWireClient",
+            "GUI_TOOL_CATALOG_REQUEST = 24",
+            "GUI_TOOL_CALL_REQUEST = 26",
+            '"tools/list"',
+            '"tools/call"',
+            "check_runtime_interface_parity",
+            "summary_projection(cli_summary)",
+            "summary_projection(mcp_summary)",
+            "summary_projection(gui_summary)",
+            "check_relocated_host_config_independence",
+            "check_cache_policy_upgrade",
+            "run_seeded_property_smoke",
+            '"semanticProjectionVersion"',
+            '"semantic"',
+        ],
+        "compiled CLI/MCP/GUI incident assurance",
+    )
+    require_tokens(
+        cmake,
+        [
+            "wosdbg_incident_cli_semantic_test",
+            "tests/incident_cli_semantic_test.py",
+            "--require-incident-tools",
+        ],
+        "mandatory incident semantic CTest registration",
     )
 
 
@@ -227,6 +255,7 @@ def main() -> None:
     test_backend_catalog_is_the_only_tool_dispatch_contract()
     test_cli_and_gui_use_the_shared_contract()
     test_distributed_timeline_is_bounded_and_clock_honest()
+    test_incident_assurance_exercises_compiled_frontend_adapters()
     test_agent_and_user_docs_cover_all_interfaces()
     print("WOSDBG MCP, CLI, and GUI share one bounded analysis contract")
 

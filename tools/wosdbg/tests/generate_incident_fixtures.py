@@ -138,6 +138,25 @@ def minimal_elf(build_id: bytes) -> bytes:
     return bytes(image)
 
 
+def elf_with_displaced_chunk(build_id: bytes, chunk_offset: int = PAGE_SIZE) -> tuple[bytes, bytes]:
+    """Return a valid ELF plus deterministic bytes displaced by one chunk.
+
+    The ELF's PT_LOAD extent remains the original compact image.  Extra bytes at
+    ``chunk_offset`` are nevertheless part of the owned binary buffer, allowing
+    WOSDBG's corruption scanner to prove that captured PT_LOAD bytes came from a
+    different, chunk-aligned file offset rather than merely differing at random.
+    """
+
+    base = minimal_elf(build_id)
+    if chunk_offset < len(base):
+        raise ValueError("chunk offset must follow the compact ELF image")
+    displaced = bytes(((index * 73) + 19) & 0xFF for index in range(len(base)))
+    image = base + bytes(chunk_offset - len(base)) + displaced
+    if image.find(displaced) != chunk_offset:
+        raise AssertionError("displaced corruption pattern is not unique at its intended chunk offset")
+    return image, displaced
+
+
 def build_coredump(
     version: int,
     embedded_elf: bytes,
@@ -145,6 +164,7 @@ def build_coredump(
     pid: int = 42,
     node_number: int = 0,
     with_segment: bool = True,
+    captured_page_prefix: bytes | None = None,
 ) -> bytes:
     """Build a canonical coredump using the local v1-v3 on-disk layouts."""
 
@@ -279,6 +299,8 @@ def build_coredump(
             segment_table += struct.pack("<QQ", 0x5, 0x3000 + node_number * PAGE_SIZE)
         page_data = bytearray((index + node_number) & 0xFF for index in range(PAGE_SIZE))
         page_data[: min(len(embedded_elf), PAGE_SIZE)] = embedded_elf[:PAGE_SIZE]
+        if captured_page_prefix is not None:
+            page_data[: min(len(captured_page_prefix), PAGE_SIZE)] = captured_page_prefix[:PAGE_SIZE]
         page = bytes(page_data)
     return header + segment_table + page + embedded_elf
 
@@ -494,6 +516,7 @@ def base_artifacts(
     log_final_newline: bool = True,
     log_truncated: bool = False,
     log_clock_domains: dict[int, str] | None = None,
+    captured_page_prefix: bytes | None = None,
 ) -> list[Artifact]:
     embedded = minimal_elf(BUILD_ID_A) if elf is None else elf
     local_binary = embedded if binary_elf is None else binary_elf
@@ -505,7 +528,14 @@ def base_artifacts(
         node_info = nodes[min(index, len(nodes) - 1)]
         node_id = int(node_info["id"])
         dump_name = f"artifacts/coredumps/{node_id}-v{version}.bin"
-        dump = build_coredump(version, embedded, pid=42 + index, node_number=index, with_segment=with_segment)
+        dump = build_coredump(
+            version,
+            embedded,
+            pid=42 + index,
+            node_number=index,
+            with_segment=with_segment,
+            captured_page_prefix=captured_page_prefix,
+        )
         result.append(
             Artifact(
                 dump_name,
@@ -557,6 +587,22 @@ def case_record(
     coredump_versions: list[int] | None = None,
     max_events: int | None = None,
     timeline_clock_quality: str | None = None,
+    inventory_page: tuple[int, int] | None = None,
+    max_coredumps: int | None = None,
+    max_issues: int | None = None,
+    max_serialized_bytes: int | None = None,
+    min_chunk_corruption_hits: int | None = None,
+    chunk_size: int | None = None,
+    global_order_available: bool | None = None,
+    references_complete: bool | None = None,
+    build_id_checks: dict[str, str] | None = None,
+    build_ids: dict[str, str] | None = None,
+    binary_quarantined: bool | None = None,
+    issue_count: int | None = None,
+    issues_returned: int | None = None,
+    issues_truncated: bool | None = None,
+    summary_degraded: bool | None = None,
+    summary_issue_codes: list[str] | None = None,
 ) -> dict[str, Any]:
     expected: dict[str, Any] = {
         "valid": valid,
@@ -572,6 +618,38 @@ def case_record(
         expected["maxEvents"] = max_events
     if timeline_clock_quality is not None:
         expected["timelineClockQuality"] = timeline_clock_quality
+    if inventory_page is not None:
+        expected["inventoryPage"] = {"start": inventory_page[0], "count": inventory_page[1]}
+    if max_coredumps is not None:
+        expected["maxCoredumps"] = max_coredumps
+    if max_issues is not None:
+        expected["maxIssues"] = max_issues
+    if max_serialized_bytes is not None:
+        expected["maxSerializedBytes"] = max_serialized_bytes
+    if min_chunk_corruption_hits is not None:
+        expected["minChunkCorruptionHits"] = min_chunk_corruption_hits
+    if chunk_size is not None:
+        expected["chunkSize"] = chunk_size
+    if global_order_available is not None:
+        expected["globalOrderAvailable"] = global_order_available
+    if references_complete is not None:
+        expected["referencesComplete"] = references_complete
+    if build_id_checks is not None:
+        expected["buildIdChecks"] = build_id_checks
+    if build_ids is not None:
+        expected["buildIds"] = build_ids
+    if binary_quarantined is not None:
+        expected["binaryQuarantined"] = binary_quarantined
+    if issue_count is not None:
+        expected["issueCount"] = issue_count
+    if issues_returned is not None:
+        expected["issuesReturned"] = issues_returned
+    if issues_truncated is not None:
+        expected["issuesTruncated"] = issues_truncated
+    if summary_degraded is not None:
+        expected["summaryDegraded"] = summary_degraded
+    if summary_issue_codes is not None:
+        expected["summaryIssueCodes"] = summary_issue_codes
     return {
         "name": name,
         "path": path.relative_to(root).as_posix(),
@@ -706,6 +784,113 @@ def generate_loader_cases(root: Path) -> list[dict[str, Any]]:
         )
     )
 
+    missing_domain_name = "distributed-missing-clock-domain"
+    missing_domain_artifacts = [
+        dataclasses.replace(artifact, clock_domain=None)
+        if artifact.kind == "serial-log" and artifact.node_id == 1
+        else artifact
+        for artifact in base_artifacts(
+            [3, 3],
+            nodes=two_nodes,
+            log_clock_domains={0: "fixture-global", 1: "fixture-global"},
+        )
+    ]
+    missing_domain_manifest = make_manifest(
+        missing_domain_name,
+        missing_domain_artifacts,
+        nodes=two_nodes,
+        clock_quality="complete",
+        clock_domains=[clock_domain("fixture-global", [0, 1], True)],
+        source_kind="cluster",
+        profile="cluster-fixture",
+    )
+    missing_domain_path = write_directory_bundle(
+        root, missing_domain_name, missing_domain_manifest, missing_domain_artifacts
+    )
+    cases.append(
+        case_record(
+            missing_domain_name,
+            missing_domain_path,
+            root,
+            workflow="full",
+            valid=True,
+            degraded=True,
+            issue_codes=["manifest_log_clock_domain_missing"],
+            clock_quality="complete",
+            coredump_versions=[3, 3],
+            timeline_clock_quality="partial-timestamps-untrusted",
+            global_order_available=False,
+            references_complete=False,
+        )
+    )
+
+    unknown_domain_name = "distributed-unknown-clock-domain"
+    unknown_domain_artifacts = base_artifacts(
+        [3, 3],
+        nodes=two_nodes,
+        log_clock_domains={0: "fixture-global", 1: "absent-domain"},
+    )
+    unknown_domain_manifest = make_manifest(
+        unknown_domain_name,
+        unknown_domain_artifacts,
+        nodes=two_nodes,
+        clock_quality="complete",
+        clock_domains=[clock_domain("fixture-global", [0, 1], True)],
+        source_kind="cluster",
+        profile="cluster-fixture",
+    )
+    unknown_domain_path = write_archive_bundle(
+        root, unknown_domain_name, unknown_domain_manifest, unknown_domain_artifacts
+    )
+    cases.append(
+        case_record(
+            unknown_domain_name,
+            unknown_domain_path,
+            root,
+            workflow="validate-invalid",
+            valid=False,
+            degraded=True,
+            issue_codes=["manifest_log_clock_domain_reference_invalid"],
+            coredump_versions=[3, 3],
+        )
+    )
+
+    unknown_node_name = "distributed-unknown-log-node"
+    unknown_node_artifacts = [
+        dataclasses.replace(artifact, node_id=99, clock_domain=None)
+        if artifact.kind == "serial-log" and artifact.node_id == 1
+        else artifact
+        for artifact in base_artifacts(
+            [3, 3],
+            nodes=two_nodes,
+            log_clock_domains={0: "fixture-global", 1: "fixture-global"},
+        )
+    ]
+    unknown_node_manifest = make_manifest(
+        unknown_node_name,
+        unknown_node_artifacts,
+        nodes=two_nodes,
+        clock_quality="complete",
+        clock_domains=[clock_domain("fixture-global", [0, 1], True)],
+        source_kind="cluster",
+        profile="cluster-fixture",
+    )
+    unknown_node_path = write_directory_bundle(
+        root, unknown_node_name, unknown_node_manifest, unknown_node_artifacts
+    )
+    cases.append(
+        case_record(
+            unknown_node_name,
+            unknown_node_path,
+            root,
+            workflow="validate-invalid",
+            valid=False,
+            degraded=True,
+            issue_codes=["manifest_log_clock_domain_missing", "manifest_member_node_reference_invalid"],
+            coredump_versions=[3, 3],
+        )
+    )
+
     missing_symbols_name = "missing-symbols"
     missing_symbols_artifacts = base_artifacts(
         [3], nodes=one_node, elf=b"", include_binary=False, with_segment=True
@@ -778,10 +963,155 @@ def generate_loader_cases(root: Path) -> list[dict[str, Any]]:
             workflow="full",
             valid=True,
             degraded=True,
-            issue_codes=["build_id_mismatch"],
+            issue_codes=[
+                "build_id_mismatch",
+                "declared_binary_build_id_mismatch",
+                "embedded_binary_build_id_mismatch",
+            ],
             clock_quality="complete",
             coredump_versions=[3],
             timeline_clock_quality="single-node-comparable",
+            build_id_checks={
+                "declaredEmbedded": "compatible",
+                "declaredBinary": "mismatch",
+                "embeddedBinary": "mismatch",
+            },
+            build_ids={
+                "declaredBuildId": BUILD_ID_A.hex(),
+                "embeddedBuildId": BUILD_ID_A.hex(),
+                "binaryBuildId": BUILD_ID_B.hex(),
+            },
+            binary_quarantined=True,
+        )
+    )
+
+    declared_mismatch_name = "declared-embedded-build-id-mismatch"
+    declared_mismatch_artifacts = [
+        dataclasses.replace(artifact, build_id=BUILD_ID_B.hex()) if artifact.kind == "coredump" else artifact
+        for artifact in base_artifacts([3], nodes=one_node, include_binary=False)
+    ]
+    declared_mismatch_manifest = make_manifest(
+        declared_mismatch_name,
+        declared_mismatch_artifacts,
+        nodes=one_node,
+        clock_quality="complete",
+        clock_domains=complete_clock,
+    )
+    declared_mismatch_path = write_directory_bundle(
+        root, declared_mismatch_name, declared_mismatch_manifest, declared_mismatch_artifacts
+    )
+    cases.append(
+        case_record(
+            declared_mismatch_name,
+            declared_mismatch_path,
+            root,
+            workflow="full",
+            valid=True,
+            degraded=True,
+            issue_codes=["build_id_mismatch", "declared_embedded_build_id_mismatch"],
+            clock_quality="complete",
+            coredump_versions=[3],
+            timeline_clock_quality="single-node-comparable",
+            build_id_checks={
+                "declaredEmbedded": "mismatch",
+                "declaredBinary": "compatible",
+                "embeddedBinary": "compatible",
+            },
+            build_ids={
+                "declaredBuildId": BUILD_ID_B.hex(),
+                "embeddedBuildId": BUILD_ID_A.hex(),
+                "binaryBuildId": "",
+            },
+            binary_quarantined=True,
+        )
+    )
+
+    chunk_name = "chunk-corruption"
+    chunk_elf, displaced_chunk = elf_with_displaced_chunk(BUILD_ID_A)
+    chunk_artifacts = base_artifacts(
+        [3],
+        nodes=one_node,
+        elf=chunk_elf,
+        binary_elf=chunk_elf,
+        captured_page_prefix=displaced_chunk,
+    )
+    chunk_manifest = make_manifest(
+        chunk_name,
+        chunk_artifacts,
+        nodes=one_node,
+        clock_quality="complete",
+        clock_domains=complete_clock,
+    )
+    chunk_path = write_archive_bundle(root, chunk_name, chunk_manifest, chunk_artifacts)
+    cases.append(
+        case_record(
+            chunk_name,
+            chunk_path,
+            root,
+            workflow="full",
+            valid=True,
+            degraded=False,
+            issue_codes=[],
+            summary_degraded=True,
+            summary_issue_codes=["corrupt_chunk"],
+            clock_quality="complete",
+            coredump_versions=[3],
+            timeline_clock_quality="single-node-comparable",
+            min_chunk_corruption_hits=1,
+            chunk_size=PAGE_SIZE,
+        )
+    )
+
+    issue_budget_name = "issue-budget-overrun"
+    issue_budget_elf, issue_budget_displaced = elf_with_displaced_chunk(BUILD_ID_A)
+    issue_budget_artifacts = [
+        dataclasses.replace(artifact, clock_domain=None)
+        if artifact.kind == "serial-log" and artifact.node_id == 1
+        else artifact
+        for artifact in base_artifacts(
+            [3, 3],
+            nodes=two_nodes,
+            elf=issue_budget_elf,
+            binary_elf=issue_budget_elf,
+            log_clock_domains={0: "fixture-global", 1: "fixture-global"},
+            captured_page_prefix=issue_budget_displaced,
+        )
+    ]
+    issue_budget_artifacts.append(
+        Artifact("artifacts/binaries/no-build-id.elf", "binary", b"not-an-elf\n", build_id="")
+    )
+    issue_budget_manifest = make_manifest(
+        issue_budget_name,
+        issue_budget_artifacts,
+        nodes=two_nodes,
+        clock_quality="complete",
+        clock_domains=[clock_domain("fixture-global", [0, 1], True)],
+        source_kind="cluster",
+        profile="cluster-fixture",
+    )
+    issue_budget_path = write_archive_bundle(
+        root, issue_budget_name, issue_budget_manifest, issue_budget_artifacts
+    )
+    cases.append(
+        case_record(
+            issue_budget_name,
+            issue_budget_path,
+            root,
+            workflow="full",
+            valid=True,
+            degraded=True,
+            issue_codes=["binary_build_id_missing", "manifest_log_clock_domain_missing"],
+            clock_quality="complete",
+            coredump_versions=[3, 3],
+            timeline_clock_quality="partial-timestamps-untrusted",
+            max_issues=2,
+            min_chunk_corruption_hits=2,
+            chunk_size=PAGE_SIZE,
+            global_order_available=False,
+            references_complete=False,
+            issue_count=4,
+            issues_returned=2,
+            issues_truncated=True,
         )
     )
 
@@ -904,10 +1234,10 @@ def generate_loader_cases(root: Path) -> list[dict[str, Any]]:
             workflow="full",
             valid=True,
             degraded=True,
-            issue_codes=["truncated_log"],
+            issue_codes=["partial_clocks", "truncated_log"],
             clock_quality="partial",
             coredump_versions=[3],
-            timeline_clock_quality="single-node-comparable",
+            timeline_clock_quality="partial-timestamps-untrusted",
         )
     )
 
@@ -970,6 +1300,10 @@ def generate_loader_cases(root: Path) -> list[dict[str, Any]]:
             coredump_versions=[3, 3],
             max_events=8,
             timeline_clock_quality="globally-comparable",
+            inventory_page=(1, 2),
+            max_coredumps=1,
+            max_issues=1,
+            max_serialized_bytes=128 * 1024,
         )
     )
     return cases
@@ -994,6 +1328,24 @@ def generate_security_cases(root: Path) -> list[dict[str, Any]]:
     target_dir = root / "security"
     target_dir.mkdir(parents=True, exist_ok=True)
     cases: list[dict[str, Any]] = []
+
+    for name, target, is_directory in (
+        ("source-directory-symlink", "../bundles/valid-single-v3.wosincident", True),
+        ("source-archive-symlink", "../archives/valid-single-v3-archive.wosincident", False),
+    ):
+        path = target_dir / f"{name}.wosincident"
+        path.symlink_to(target, target_is_directory=is_directory)
+        cases.append(
+            case_record(
+                name,
+                path,
+                root,
+                workflow="load-reject",
+                valid=False,
+                degraded=None,
+                issue_codes=["source_symlink_rejected"],
+            )
+        )
 
     def add_raw(name: str, unsafe_info: tarfile.TarInfo, data: bytes | None, issue: str) -> None:
         manifest, artifacts = security_manifest(name)
@@ -1178,6 +1530,8 @@ def verify_generated_tree(root: Path) -> None:
             path = root / case["path"]
             if not path.exists():
                 raise AssertionError(f"fixture path is missing: {path}")
+            if case["name"].startswith("source-") and case["name"].endswith("-symlink") and not path.is_symlink():
+                raise AssertionError(f"{case['name']}: top-level source fixture is not a symlink")
 
     for case in index["loaderCases"]:
         bundle = root / case["path"]
@@ -1216,11 +1570,19 @@ def verify_generated_tree(root: Path) -> None:
 
 def tree_digest(root: Path) -> str:
     digest = hashlib.sha256()
-    for path in sorted(candidate for candidate in root.rglob("*") if candidate.is_file()):
+    for path in sorted(root.rglob("*")):
+        if path.is_symlink():
+            kind = b"L"
+            data = str(path.readlink()).encode("utf-8")
+        elif path.is_file():
+            kind = b"F"
+            data = path.read_bytes()
+        else:
+            continue
         relative = path.relative_to(root).as_posix().encode("utf-8")
         digest.update(struct.pack("<Q", len(relative)))
         digest.update(relative)
-        data = path.read_bytes()
+        digest.update(kind)
         digest.update(struct.pack("<Q", len(data)))
         digest.update(data)
     return digest.hexdigest()

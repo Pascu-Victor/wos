@@ -15,6 +15,7 @@
 #include <QSet>
 #include <QtGlobal>
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <cmath>
 #include <cstring>
@@ -47,7 +48,8 @@ struct LoadContext {
     QHash<QString, SnapshotFile> files;
     QSet<QString> seen_paths;
     QSet<QString> file_paths;
-    size_t entry_count = 0;
+    size_t regular_file_count = 0;
+    size_t directory_entry_count = 0;
     uint64_t total_bytes = 0;
     uint64_t archive_bytes = 0;
 };
@@ -132,11 +134,29 @@ auto normalize_member_path(const QString& raw_path, bool directory, const Incide
 }
 
 auto register_entry(LoadContext& context, const QString& path, bool directory) -> bool {
-    ++context.entry_count;
-    if (context.entry_count > context.limits.max_members) {
-        add_issue(context, "member_count_exceeded", QString("bundle contains more than %1 entries").arg(context.limits.max_members), path,
-                  true, QJsonObject{{"limit", QString::number(context.limits.max_members)}});
-        return false;
+    if (directory) {
+        ++context.directory_entry_count;
+        const size_t MAX_DIRECTORIES =
+            context.limits.max_path_depth != 0 &&
+                    context.limits.max_members > std::numeric_limits<size_t>::max() / context.limits.max_path_depth
+                ? std::numeric_limits<size_t>::max()
+                : context.limits.max_members * context.limits.max_path_depth;
+        if (context.directory_entry_count > MAX_DIRECTORIES) {
+            add_issue(context, "directory_entry_count_exceeded",
+                      QString("bundle contains more than %1 bounded directory entries").arg(MAX_DIRECTORIES), path, true,
+                      QJsonObject{{"limit", QString::number(MAX_DIRECTORIES)}});
+            return false;
+        }
+    } else {
+        ++context.regular_file_count;
+        const size_t MAX_REGULAR_FILES =
+            context.limits.max_members == std::numeric_limits<size_t>::max() ? context.limits.max_members : context.limits.max_members + 1;
+        if (context.regular_file_count > MAX_REGULAR_FILES) {
+            add_issue(context, "member_count_exceeded",
+                      QString("bundle contains more than %1 evidence files plus manifest.json").arg(context.limits.max_members), path, true,
+                      QJsonObject{{"limit", QString::number(context.limits.max_members)}});
+            return false;
+        }
     }
     if (context.seen_paths.contains(path)) {
         add_issue(context, "duplicate_member", "bundle contains a duplicate normalized member path", path);
@@ -279,6 +299,41 @@ auto stat_changed(const struct stat& before, const struct stat& after) -> bool {
 #endif
 }
 
+auto descriptor_source_is_allowed(LoadContext& context, int descriptor, const QString& source_path) -> bool {
+    if (context.limits.allowed_roots.isEmpty()) {
+        return true;
+    }
+#ifdef Q_OS_LINUX
+    const QString DESCRIPTOR_PATH = QString("/proc/self/fd/%1").arg(descriptor);
+    const QString OPENED_PATH = QFileInfo(DESCRIPTOR_PATH).canonicalFilePath();
+    if (OPENED_PATH.isEmpty()) {
+        add_issue(context, "source_identity_unavailable", "could not resolve the already-open incident source before reading it",
+                  source_path);
+        return false;
+    }
+    const QString CLEAN_OPENED = QDir::cleanPath(OPENED_PATH);
+    for (const auto& root : context.limits.allowed_roots) {
+        const QString CLEAN_ROOT = QDir::cleanPath(root);
+        QString root_prefix = CLEAN_ROOT;
+        if (!root_prefix.endsWith('/')) {
+            root_prefix += '/';
+        }
+        if (CLEAN_OPENED == CLEAN_ROOT || CLEAN_OPENED.startsWith(root_prefix)) {
+            context.bundle.source_path = CLEAN_OPENED;
+            return true;
+        }
+    }
+    add_issue(context, "source_outside_allowed_root", "the already-open incident source is outside the effective allowed roots",
+              source_path);
+    return false;
+#else
+    Q_UNUSED(descriptor);
+    add_issue(context, "source_identity_unavailable", "descriptor-bound allowed-root verification is unavailable on this host",
+              source_path);
+    return false;
+#endif
+}
+
 auto copy_directory_file(LoadContext& context, int directory_fd, const QByteArray& name, const QString& path, const struct stat& expected)
     -> bool {
     if (expected.st_nlink > 1) {
@@ -374,6 +429,11 @@ auto copy_directory_file(LoadContext& context, int directory_fd, const QByteArra
 }
 
 auto snapshot_directory_at(LoadContext& context, int directory_fd, const QString& relative_prefix) -> bool {
+    struct stat directory_before{};
+    if (::fstat(directory_fd, &directory_before) != 0 || !S_ISDIR(directory_before.st_mode)) {
+        add_issue(context, "directory_changed", "incident directory could not be securely inspected before enumeration", relative_prefix);
+        return false;
+    }
     const int ITERATOR_FD = ::dup(directory_fd);
     if (ITERATOR_FD < 0) {
         add_issue(context, "directory_read_failed", "could not duplicate directory descriptor", relative_prefix);
@@ -433,6 +493,12 @@ auto snapshot_directory_at(LoadContext& context, int directory_fd, const QString
                           QString("could not open child directory: %1").arg(QString::fromLocal8Bit(std::strerror(errno))), path);
                 return false;
             }
+            struct stat child_opened{};
+            if (::fstat(child.get(), &child_opened) != 0 || !S_ISDIR(child_opened.st_mode) || child_opened.st_dev != info.st_dev ||
+                child_opened.st_ino != info.st_ino || stat_changed(info, child_opened)) {
+                add_issue(context, "directory_changed", "child directory changed while being opened", path);
+                return false;
+            }
             if (!QDir().mkpath(QDir(context.bundle.root_path).absoluteFilePath(path)) ||
                 !snapshot_directory_at(context, child.get(), path)) {
                 return false;
@@ -447,6 +513,11 @@ auto snapshot_directory_at(LoadContext& context, int directory_fd, const QString
             return false;
         }
     }
+    struct stat directory_after{};
+    if (::fstat(directory_fd, &directory_after) != 0 || stat_changed(directory_before, directory_after)) {
+        add_issue(context, "directory_changed", "incident directory changed while it was snapshotted", relative_prefix);
+        return false;
+    }
     return true;
 }
 
@@ -456,6 +527,9 @@ auto snapshot_directory(LoadContext& context, const QString& source_path) -> boo
     if (!root.valid()) {
         add_issue(context, "directory_open_failed",
                   QString("could not securely open incident directory: %1").arg(QString::fromLocal8Bit(std::strerror(errno))));
+        return false;
+    }
+    if (!descriptor_source_is_allowed(context, root.get(), source_path)) {
         return false;
     }
     return snapshot_directory_at(context, root.get(), {});
@@ -509,6 +583,9 @@ auto snapshot_archive(LoadContext& context, const QString& source_path) -> bool 
     if (!source.valid()) {
         add_issue(context, "archive_open_failed",
                   QString("could not securely open archive: %1").arg(QString::fromLocal8Bit(std::strerror(errno))));
+        return false;
+    }
+    if (!descriptor_source_is_allowed(context, source.get(), source_path)) {
         return false;
     }
     struct stat source_info{};
@@ -746,6 +823,24 @@ auto member_node_id(const QJsonObject& object, QString* node_id) -> bool {
     return false;
 }
 
+auto manifest_id(const QJsonValue& value, QString* id) -> bool {
+    if (value.isString()) {
+        *id = value.toString();
+        return !id->isEmpty();
+    }
+    uint64_t numeric = 0;
+    if (json_uint64(value, &numeric)) {
+        *id = QString::number(numeric);
+        return true;
+    }
+    id->clear();
+    return false;
+}
+
+auto is_log_kind(const QString& kind) -> bool {
+    return kind == "serial-log" || kind == "qemu-log" || kind == "telemetry-log" || kind == "coverage-log" || kind == "log";
+}
+
 void validate_manifest(LoadContext& context) {
     const auto MANIFEST_IT = context.files.constFind("manifest.json");
     if (MANIFEST_IT == context.files.cend()) {
@@ -804,6 +899,139 @@ void validate_manifest(LoadContext& context) {
         }
     }
 
+    const QJsonValue LIMITS_VALUE = context.bundle.manifest.value("limits");
+    if (!LIMITS_VALUE.isUndefined()) {
+        if (!LIMITS_VALUE.isObject()) {
+            add_issue(context, "manifest_limits_invalid", "manifest limits must be an object when present", "manifest.json");
+        } else {
+            static constexpr std::array<const char*, 5> LIMIT_KEYS = {"maxMembers", "maxFileBytes", "maxTotalBytes", "maxPathBytes",
+                                                                      "maxManifestBytes"};
+            const QJsonObject LIMITS = LIMITS_VALUE.toObject();
+            for (const char* key : LIMIT_KEYS) {
+                uint64_t value = 0;
+                if (!json_uint64(LIMITS[key], &value) || value == 0) {
+                    add_issue(context, "manifest_limit_invalid", "capture limit must be a positive JSON-safe integer", "manifest.json",
+                              true, QJsonObject{{"field", key}});
+                }
+            }
+        }
+    }
+
+    QSet<QString> topology_node_ids;
+    const QJsonValue TOPOLOGY_VALUE = context.bundle.manifest["topology"];
+    if (!TOPOLOGY_VALUE.isObject()) {
+        add_issue(context, "manifest_topology_invalid", "manifest topology must be an object", "manifest.json");
+    } else {
+        const QJsonValue NODES_VALUE = TOPOLOGY_VALUE.toObject()["nodes"];
+        if (!NODES_VALUE.isArray()) {
+            add_issue(context, "manifest_topology_nodes_invalid", "manifest topology.nodes must be an array", "manifest.json");
+        } else {
+            const QJsonArray NODES = NODES_VALUE.toArray();
+            for (qsizetype index = 0; index < NODES.size(); ++index) {
+                const QString LOCATION = QString("topology.nodes[%1]").arg(index);
+                if (!NODES[index].isObject()) {
+                    add_issue(context, "manifest_topology_node_invalid", "topology node must be an object", LOCATION);
+                    continue;
+                }
+                QString node_id;
+                if (!manifest_id(NODES[index].toObject()["id"], &node_id)) {
+                    add_issue(context, "manifest_topology_node_id_invalid",
+                              "topology node id must be a non-empty string or JSON-safe integer", LOCATION);
+                } else if (topology_node_ids.contains(node_id)) {
+                    add_issue(context, "manifest_topology_node_duplicate", "topology node id must be unique", LOCATION, true,
+                              QJsonObject{{"nodeId", node_id}});
+                } else {
+                    topology_node_ids.insert(node_id);
+                }
+            }
+        }
+    }
+
+    QSet<QString> clock_domain_ids;
+    QHash<QString, QSet<QString>> clock_domain_nodes;
+    const QJsonValue CLOCKS_VALUE = context.bundle.manifest["clocks"];
+    if (!CLOCKS_VALUE.isObject()) {
+        add_issue(context, "manifest_clocks_invalid", "manifest clocks must be an object", "manifest.json");
+    } else {
+        const QJsonObject CLOCKS = CLOCKS_VALUE.toObject();
+        static const QSet<QString> CLOCK_QUALITIES = {"complete", "partial", "non-comparable", "single-node-unsynchronized", "unavailable"};
+        const QString QUALITY = CLOCKS["quality"].toString();
+        if (!CLOCKS["quality"].isString() || !CLOCK_QUALITIES.contains(QUALITY)) {
+            add_issue(context, "manifest_clock_quality_invalid", "manifest clocks.quality is not a supported version 1 value",
+                      "manifest.json", true, QJsonObject{{"quality", QUALITY}});
+        }
+        if (!CLOCKS["domains"].isArray()) {
+            add_issue(context, "manifest_clock_domains_invalid", "manifest clocks.domains must be an array", "manifest.json");
+        } else {
+            const QJsonArray DOMAINS = CLOCKS["domains"].toArray();
+            for (qsizetype index = 0; index < DOMAINS.size(); ++index) {
+                const QString LOCATION = QString("clocks.domains[%1]").arg(index);
+                if (!DOMAINS[index].isObject()) {
+                    add_issue(context, "manifest_clock_domain_invalid", "clock domain must be an object", LOCATION);
+                    continue;
+                }
+                const QJsonObject DOMAIN = DOMAINS[index].toObject();
+                const QString DOMAIN_ID = DOMAIN["id"].toString();
+                if (!DOMAIN["id"].isString() || DOMAIN_ID.isEmpty()) {
+                    add_issue(context, "manifest_clock_domain_id_invalid", "clock domain id must be a non-empty string", LOCATION);
+                    continue;
+                }
+                if (clock_domain_ids.contains(DOMAIN_ID)) {
+                    add_issue(context, "manifest_clock_domain_duplicate", "clock domain id must be unique", LOCATION, true,
+                              QJsonObject{{"clockDomain", DOMAIN_ID}});
+                    continue;
+                }
+                clock_domain_ids.insert(DOMAIN_ID);
+                if (!DOMAIN["synchronized"].isBool() || !DOMAIN["comparableAcrossNodes"].isBool()) {
+                    add_issue(context, "manifest_clock_domain_flags_invalid",
+                              "clock domain synchronized and comparableAcrossNodes fields must be booleans", LOCATION);
+                }
+
+                QSet<QString> domain_nodes;
+                const bool HAS_NODE_ID = !DOMAIN["nodeId"].isUndefined();
+                const bool HAS_NODE_IDS = !DOMAIN["nodeIds"].isUndefined();
+                if (HAS_NODE_ID == HAS_NODE_IDS) {
+                    add_issue(context, "manifest_clock_domain_nodes_invalid", "clock domain must contain exactly one of nodeId or nodeIds",
+                              LOCATION);
+                } else if (HAS_NODE_ID) {
+                    QString node_id;
+                    if (!manifest_id(DOMAIN["nodeId"], &node_id)) {
+                        add_issue(context, "manifest_clock_domain_node_id_invalid",
+                                  "clock domain nodeId must be a non-empty string or JSON-safe integer", LOCATION);
+                    } else {
+                        domain_nodes.insert(node_id);
+                    }
+                } else if (!DOMAIN["nodeIds"].isArray() || DOMAIN["nodeIds"].toArray().isEmpty()) {
+                    add_issue(context, "manifest_clock_domain_node_ids_invalid", "clock domain nodeIds must be a non-empty array",
+                              LOCATION);
+                } else {
+                    const QJsonArray NODE_IDS = DOMAIN["nodeIds"].toArray();
+                    for (const auto& node_value : NODE_IDS) {
+                        QString node_id;
+                        if (!manifest_id(node_value, &node_id)) {
+                            add_issue(context, "manifest_clock_domain_node_id_invalid",
+                                      "clock domain nodeIds entries must be non-empty strings or JSON-safe integers", LOCATION);
+                            continue;
+                        }
+                        if (domain_nodes.contains(node_id)) {
+                            add_issue(context, "manifest_clock_domain_node_duplicate", "clock domain nodeIds must be unique", LOCATION,
+                                      true, QJsonObject{{"nodeId", node_id}});
+                        }
+                        domain_nodes.insert(node_id);
+                    }
+                }
+                for (const auto& node_id : std::as_const(domain_nodes)) {
+                    if (!topology_node_ids.contains(node_id)) {
+                        add_issue(context, "manifest_clock_domain_node_reference_invalid",
+                                  "clock domain refers to a node absent from topology", LOCATION, true,
+                                  QJsonObject{{"clockDomain", DOMAIN_ID}, {"nodeId", node_id}});
+                    }
+                }
+                clock_domain_nodes.insert(DOMAIN_ID, domain_nodes);
+            }
+        }
+    }
+
     if (!context.bundle.manifest["members"].isArray()) {
         add_issue(context, "manifest_members_invalid", "manifest members must be an array", "manifest.json");
         return;
@@ -849,6 +1077,9 @@ void validate_manifest(LoadContext& context) {
         member.sha256 = OBJECT["sha256"].toString();
         if (!member_node_id(OBJECT, &member.node_id)) {
             add_issue(context, "manifest_member_node_id_invalid", "member nodeId must be a non-empty string or JSON-safe integer", path);
+        } else if (!member.node_id.isEmpty() && !topology_node_ids.contains(member.node_id)) {
+            add_issue(context, "manifest_member_node_reference_invalid", "member nodeId is absent from manifest topology", path, true,
+                      QJsonObject{{"nodeId", member.node_id}});
         }
         member.build_id = OBJECT["buildId"].toString();
         member.binary = OBJECT["binary"].toString();
@@ -890,6 +1121,25 @@ void validate_manifest(LoadContext& context) {
                 add_issue(context, "manifest_binary_path_invalid", reason, path);
             } else {
                 member.binary = binary;
+            }
+        }
+        if (is_log_kind(member.kind)) {
+            const QJsonValue CLOCK_DOMAIN_VALUE = OBJECT["clockDomain"];
+            if (!CLOCK_DOMAIN_VALUE.isUndefined()) {
+                const QString CLOCK_DOMAIN = CLOCK_DOMAIN_VALUE.toString();
+                if (!CLOCK_DOMAIN_VALUE.isString() || CLOCK_DOMAIN.isEmpty()) {
+                    add_issue(context, "manifest_log_clock_domain_invalid", "log clockDomain must be a non-empty string", path);
+                } else if (!clock_domain_ids.contains(CLOCK_DOMAIN)) {
+                    add_issue(context, "manifest_log_clock_domain_reference_invalid",
+                              "log clockDomain is absent from manifest clocks.domains", path, true,
+                              QJsonObject{{"clockDomain", CLOCK_DOMAIN}});
+                } else if (!member.node_id.isEmpty() && !clock_domain_nodes[CLOCK_DOMAIN].contains(member.node_id)) {
+                    add_issue(context, "manifest_log_clock_domain_node_mismatch", "log nodeId is outside the referenced clock domain", path,
+                              true, QJsonObject{{"clockDomain", CLOCK_DOMAIN}, {"nodeId", member.node_id}});
+                }
+            } else if (!member.node_id.isEmpty()) {
+                add_issue(context, "manifest_log_clock_domain_missing", "node-associated log does not declare a clockDomain", path, false,
+                          QJsonObject{{"nodeId", member.node_id}});
             }
         }
 
@@ -984,7 +1234,8 @@ std::unique_ptr<IncidentBundle> load_incident_bundle(const QString& source_path,
                         .files = {},
                         .seen_paths = {},
                         .file_paths = {},
-                        .entry_count = 0,
+                        .regular_file_count = 0,
+                        .directory_entry_count = 0,
                         .total_bytes = 0,
                         .archive_bytes = 0};
 
@@ -1039,10 +1290,11 @@ QJsonObject incident_member_to_json(const IncidentMember& member, bool include_a
     return object;
 }
 
-QJsonArray incident_issues_to_json(const IncidentBundle& bundle) {
+QJsonArray incident_issues_to_json(const IncidentBundle& bundle, size_t count) {
     QJsonArray issues;
-    for (const auto& issue : bundle.issues) {
-        issues.append(incident_issue_to_json(issue));
+    const size_t END = std::min(bundle.issues.size(), count);
+    for (size_t index = 0; index < END; ++index) {
+        issues.append(incident_issue_to_json(bundle.issues[index]));
     }
     return issues;
 }
@@ -1055,6 +1307,7 @@ QJsonObject incident_inventory_to_json(const IncidentBundle& bundle, size_t star
     for (size_t index = BEGIN; index < END; ++index) {
         members.append(incident_member_to_json(bundle.members[index], include_absolute_paths));
     }
+    const size_t ISSUE_LIMIT = 200;
     return QJsonObject{{"ok", bundle.valid()},
                        {"incidentId", bundle.incident_id()},
                        {"sourcePath", bundle.source_path},
@@ -1063,7 +1316,9 @@ QJsonObject incident_inventory_to_json(const IncidentBundle& bundle, size_t star
                        {"count", QString::number(members.size())},
                        {"total", QString::number(bundle.members.size())},
                        {"members", members},
-                       {"issues", incident_issues_to_json(bundle)}};
+                       {"issues", incident_issues_to_json(bundle, ISSUE_LIMIT)},
+                       {"issueCount", QString::number(bundle.issues.size())},
+                       {"issuesTruncated", bundle.issues.size() > ISSUE_LIMIT}};
 }
 
 }  // namespace wosdbg

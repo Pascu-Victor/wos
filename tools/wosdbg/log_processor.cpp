@@ -61,7 +61,7 @@ void LogProcessor::split_file_into_chunks() {
     }
 
     // Determine number of worker processes
-    total_workers = std::max(4, QThread::idealThreadCount());
+    total_workers = std::clamp(QThread::idealThreadCount(), 4, 16);
 
     // Get file size for better chunk estimation
     qint64 file_size = file.size();

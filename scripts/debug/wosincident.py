@@ -50,6 +50,7 @@ DEFAULT_MAX_FILE_BYTES = 128 * 1024 * 1024
 DEFAULT_MAX_TOTAL_BYTES = 240 * 1024 * 1024
 DEFAULT_MAX_PATH_BYTES = 240
 DEFAULT_MAX_METADATA_BYTES = 8 * 1024 * 1024
+DEFAULT_MAX_MANIFEST_BYTES = 1024 * 1024
 LIVE_FETCH_TIMEOUT_SECONDS = 45.0
 
 ALLOWED_KINDS = {
@@ -93,6 +94,9 @@ PRIVATE_KEY_BEGIN_RE = re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----")
 PRIVATE_KEY_END_RE = re.compile(r"-----END [A-Z0-9 ]*PRIVATE KEY-----")
 BUILD_ID_RE = re.compile(r"Build ID:\s*([0-9a-fA-F]+)")
 HOST_RE = re.compile(r"[A-Za-z0-9._-]{1,255}\Z")
+LIVE_COREDUMP_NAME_RE = re.compile(
+    r"[A-Za-z0-9][A-Za-z0-9._-]*_coredump\.bin\Z"
+)
 
 # Explicit executable allowlist.  Coredump v3 embeds the crashing executable;
 # these host binaries provide kernel and common userspace symbols without
@@ -137,6 +141,16 @@ class CaptureLimits:
         ):
             if value <= 0:
                 raise IncidentError(f"{name} must be positive")
+
+    def effective(self) -> "CaptureLimits":
+        """Clamp requested limits to the writer's loader-compatible ceilings."""
+        self.validate()
+        return CaptureLimits(
+            max_members=min(self.max_members, DEFAULT_MAX_MEMBERS),
+            max_file_bytes=min(self.max_file_bytes, DEFAULT_MAX_FILE_BYTES),
+            max_total_bytes=min(self.max_total_bytes, DEFAULT_MAX_TOTAL_BYTES),
+            max_path_bytes=min(self.max_path_bytes, DEFAULT_MAX_PATH_BYTES),
+        )
 
 
 @dataclass(frozen=True)
@@ -365,7 +379,7 @@ class IncidentBuilder:
         allowed_roots: Iterable[Path],
         limits: CaptureLimits,
     ) -> None:
-        limits.validate()
+        limits = limits.effective()
         self.staging = staging
         self.allowed_roots = [root.resolve() for root in allowed_roots]
         self.limits = limits
@@ -656,7 +670,11 @@ class IncidentBuilder:
             and after.st_size > before.st_size
             and end <= before.st_size
         )
-        if not append_only_growth and (
+        if append_only_growth:
+            # The copied bytes end at the pre-read snapshot boundary.  Preserve
+            # that bounded snapshot, but report that newer bytes were omitted.
+            truncated = True
+        elif (
             before.st_dev != after.st_dev
             or before.st_ino != after.st_ino
             or before.st_size != after.st_size
@@ -756,6 +774,12 @@ def _snapshot_start(path: Path, snapshots: dict[str, SourceSnapshot] | None) -> 
         and metadata.st_ino == snapshot.inode
         and metadata.st_size >= snapshot.size
     ):
+        if (
+            metadata.st_size == snapshot.size
+            and metadata.st_mtime_ns != snapshot.mtime_ns
+        ):
+            # A same-inode, same-size rewrite has no append-only suffix.
+            return 0
         return snapshot.size
     return 0
 
@@ -787,18 +811,100 @@ def topology_manifest(node_specs: Iterable[dict[str, Any]]) -> dict[str, Any]:
     return {"nodes": sorted(nodes, key=lambda node: node["id"])}
 
 
-def _coverage_source_path(value: str, manifest_path: Path, repo_root: Path) -> Path:
+def _coverage_source_path(value: str, manifest_path: Path) -> Path:
     path = Path(value)
     if path.is_absolute():
         return path
-    manifest_relative = manifest_path.parent / path
-    if manifest_relative.exists():
-        return manifest_relative
-    return repo_root / path
+    return manifest_path.parent / path
 
 
 def _coverage_member_component(name: str, fallback: str) -> str:
     return _safe_component(name, fallback=fallback)
+
+
+def _read_stable_regular_bytes(
+    builder: IncidentBuilder,
+    source: Path,
+    *,
+    required: bool,
+    max_bytes: int,
+) -> tuple[Path, bytes] | None:
+    """Read one bounded regular source through a stable open descriptor."""
+    resolved = builder._resolve_source(source, required=required)
+    if resolved is None:
+        return None
+    source_name = _source_name(resolved)
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(resolved, flags)
+    except OSError:
+        builder.error(
+            "unreadable", source_name, "source cannot be opened", required=required
+        )
+        return None
+
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            builder.error(
+                "unsafe-type",
+                source_name,
+                "only regular files are collected",
+                required=required,
+            )
+            return None
+        if before.st_size > max_bytes:
+            builder.error(
+                "size-limit",
+                source_name,
+                "source exceeds the metadata byte limit",
+                required=required,
+            )
+            return None
+
+        chunks: list[bytes] = []
+        unread = max_bytes + 1
+        while unread:
+            chunk = os.read(descriptor, min(unread, 1024 * 1024))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            unread -= len(chunk)
+        after = os.fstat(descriptor)
+    except OSError:
+        builder.error(
+            "unreadable",
+            source_name,
+            "source changed or became unreadable",
+            required=required,
+        )
+        return None
+    finally:
+        os.close(descriptor)
+
+    data = b"".join(chunks)
+    if len(data) > max_bytes:
+        builder.error(
+            "size-limit",
+            source_name,
+            "source exceeds the metadata byte limit",
+            required=required,
+        )
+        return None
+    if (
+        before.st_dev != after.st_dev
+        or before.st_ino != after.st_ino
+        or before.st_size != after.st_size
+        or before.st_mtime_ns != after.st_mtime_ns
+        or len(data) != before.st_size
+    ):
+        builder.error(
+            "changed", source_name, "source changed during capture", required=required
+        )
+        return None
+    return resolved, data
 
 
 def _consume_coverage_manifest(
@@ -808,16 +914,18 @@ def _consume_coverage_manifest(
     index: int,
     repo_root: Path,
 ) -> None:
-    resolved = builder._resolve_source(manifest_path, required=True)
-    if resolved is None:
+    stable_source = _read_stable_regular_bytes(
+        builder,
+        manifest_path,
+        required=True,
+        max_bytes=min(builder.limits.max_file_bytes, DEFAULT_MAX_METADATA_BYTES),
+    )
+    if stable_source is None:
         return
+    resolved, data = stable_source
     try:
-        if resolved.stat().st_size > min(
-            builder.limits.max_file_bytes, DEFAULT_MAX_METADATA_BYTES
-        ):
-            raise IncidentError("coverage manifest exceeds the per-file limit")
-        document = json.loads(resolved.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError, IncidentError):
+        document = json.loads(data.decode("utf-8"))
+    except (UnicodeError, ValueError, RecursionError):
         builder.error(
             "invalid-coverage-manifest",
             _source_name(resolved),
@@ -845,8 +953,16 @@ def _consume_coverage_manifest(
         redact=False,
     )
 
-    artifacts = document.get("artifacts", {})
-    if isinstance(artifacts, dict):
+    artifacts = document.get("artifacts")
+    if not isinstance(artifacts, dict):
+        builder.error(
+            "invalid-coverage-manifest",
+            _source_name(resolved),
+            "coverage artifacts must be an object",
+            required=True,
+        )
+        artifacts = {}
+    else:
         if len(artifacts) > builder.limits.max_members:
             builder.error(
                 "member-limit",
@@ -858,9 +974,17 @@ def _consume_coverage_manifest(
         for artifact_name, artifact_value in sorted(
             artifacts.items(), key=lambda item: str(item[0])
         ):
-            if not isinstance(artifact_value, str):
+            if artifact_value is None:
                 continue
-            source = _coverage_source_path(artifact_value, resolved, repo_root)
+            if not isinstance(artifact_value, str):
+                builder.error(
+                    "invalid-coverage-artifact",
+                    str(artifact_name),
+                    "coverage artifact path must be a string or null",
+                    required=True,
+                )
+                continue
+            source = _coverage_source_path(artifact_value, resolved)
             suffix = source.suffix.lower()
             if suffix not in {".info", ".json", ".log", ".profdata", ".profraw"}:
                 builder.error(
@@ -879,8 +1003,16 @@ def _consume_coverage_manifest(
                 required=True,
             )
 
-    ranges = document.get("external_log_ranges", [])
-    if isinstance(ranges, list):
+    ranges = document.get("external_log_ranges")
+    if not isinstance(ranges, list):
+        builder.error(
+            "invalid-coverage-manifest",
+            _source_name(resolved),
+            "coverage external_log_ranges must be a list",
+            required=True,
+        )
+        ranges = []
+    else:
         if len(ranges) > builder.limits.max_members:
             builder.error(
                 "member-limit",
@@ -898,10 +1030,14 @@ def _consume_coverage_manifest(
                     required=True,
                 )
                 continue
-            try:
-                start = int(item.get("start_offset", 0))
-                end = int(item["end_offset"])
-            except (KeyError, TypeError, ValueError):
+            start_value = item.get("start_offset", 0)
+            end_value = item.get("end_offset")
+            if (
+                not isinstance(start_value, int)
+                or isinstance(start_value, bool)
+                or not isinstance(end_value, int)
+                or isinstance(end_value, bool)
+            ):
                 builder.error(
                     "invalid-log-range",
                     f"range-{range_index}",
@@ -909,6 +1045,8 @@ def _consume_coverage_manifest(
                     required=True,
                 )
                 continue
+            start = start_value
+            end = end_value
             if start < 0 or end < start:
                 builder.error(
                     "invalid-log-range",
@@ -917,7 +1055,7 @@ def _consume_coverage_manifest(
                     required=True,
                 )
                 continue
-            source = _coverage_source_path(item["path"], resolved, repo_root)
+            source = _coverage_source_path(item["path"], resolved)
             node_match = re.search(r"(?:serial|qemu)-vm(\d+)", source.name)
             node_id = int(node_match.group(1)) if node_match else None
             if node_id is None:
@@ -945,8 +1083,8 @@ def _live_target(value: str) -> tuple[str, str, str]:
     remote_path = PurePosixPath(remote)
     if (
         remote_path.parent != PurePosixPath("/tmp")
-        or not remote_path.name.endswith("_coredump.bin")
-        or remote_path.name in {"", ".", ".."}
+        or LIVE_COREDUMP_NAME_RE.fullmatch(remote_path.name) is None
+        or len(remote_path.name.encode("utf-8")) > 255
     ):
         raise IncidentError(
             "live coredump target must name one /tmp/*_coredump.bin file"
@@ -1049,8 +1187,10 @@ def _clock_manifest(members: list[dict[str, Any]]) -> dict[str, Any]:
     return {"quality": quality, "domains": ordered}
 
 
-def _write_deterministic_ustar(staging: Path, destination: Path) -> None:
-    with tarfile.open(destination, "x", format=tarfile.USTAR_FORMAT) as archive:
+def _write_deterministic_ustar(staging: Path, destination: io.BufferedWriter) -> None:
+    with tarfile.open(
+        fileobj=destination, mode="w", format=tarfile.USTAR_FORMAT
+    ) as archive:
         paths: list[Path] = []
         for path in sorted(staging.rglob("*")):
             metadata = path.lstat()
@@ -1115,13 +1255,15 @@ def _publish(staging: Path, output: Path, *, archive: bool) -> None:
         suffix=".tar",
         dir=output_parent,
     )
-    os.close(descriptor)
     temporary = Path(temporary_name)
-    temporary.unlink()
     try:
-        _write_deterministic_ustar(staging, temporary)
+        with os.fdopen(descriptor, "wb") as destination:
+            descriptor = -1
+            _write_deterministic_ustar(staging, destination)
         _rename_noreplace(temporary, output)
     finally:
+        if descriptor >= 0:
+            os.close(descriptor)
         if temporary.exists():
             temporary.unlink()
 
@@ -1149,7 +1291,7 @@ def capture_incident(
     """Capture an incident and atomically publish it at ``output``."""
     if kind not in {"ktest", "cluster"}:
         raise IncidentError("incident source kind must be 'ktest' or 'cluster'")
-    limits.validate()
+    limits = limits.effective()
     repo_root = repo_root.resolve()
     output = _absolute(output, repo_root)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -1330,6 +1472,13 @@ def capture_incident(
                     member["path"] for member in builder.members if member["truncated"]
                 ),
             },
+            "limits": {
+                "maxMembers": limits.max_members,
+                "maxFileBytes": limits.max_file_bytes,
+                "maxTotalBytes": limits.max_total_bytes,
+                "maxPathBytes": limits.max_path_bytes,
+                "maxManifestBytes": DEFAULT_MAX_MANIFEST_BYTES,
+            },
             "clocks": _clock_manifest(builder.members),
             "topology": topology_manifest(node_specs),
             "members": builder.members,
@@ -1340,7 +1489,10 @@ def capture_incident(
         manifest["incidentId"] = (
             "sha256:" + hashlib.sha256(_canonical_json(identity_payload)).hexdigest()
         )
-        (staging / MANIFEST_NAME).write_bytes(_manifest_bytes(manifest))
+        encoded_manifest = _manifest_bytes(manifest)
+        if len(encoded_manifest) > DEFAULT_MAX_MANIFEST_BYTES:
+            raise IncidentError("incident manifest exceeds the loader-compatible limit")
+        (staging / MANIFEST_NAME).write_bytes(encoded_manifest)
         _publish(staging, output, archive=archive)
         published = True
         return manifest

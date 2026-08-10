@@ -138,6 +138,12 @@ class DebugAnalysisService : public QObject {
         QHash<QString, QString> dump_ids;
         QHash<QString, QJsonObject> evidence;
         QJsonArray load_issues;
+        int load_issue_count = 0;
+        bool load_issues_truncated = false;
+        bool load_evidence = true;
+        int max_logs = 0;
+        int max_coredumps = 0;
+        uint64_t sequence = 0;
         bool loading = false;
     };
 
@@ -172,18 +178,22 @@ class DebugAnalysisService : public QObject {
     DumpSession* find_dump_session(const QString& id);
     [[nodiscard]] const IncidentSession* find_incident_session(const QString& id) const;
     IncidentSession* find_incident_session(const QString& id);
-    [[nodiscard]] QJsonObject load_log_file(const QString& resolved_path, const QString& session_id, int timeout_ms = 120000);
+    void erase_incident_session(const QString& id);
+    [[nodiscard]] QJsonObject load_log_file(const QString& resolved_path, const QString& session_id, int timeout_ms = 120000,
+                                            bool allow_external_symbols = true);
     [[nodiscard]] QJsonObject open_coredump_file(const QString& resolved_path, const QString& session_id,
                                                  const QString& binary_elf_path = QString(), const QString& kernel_elf_path = QString(),
                                                  bool allow_external_discovery = true);
 
-    [[nodiscard]] QString resolve_path_for_read(const QString& path, const QString& fallback_dir = QString()) const;
+    [[nodiscard]] QString resolve_path_for_read(const QString& path, const QString& fallback_dir = QString(),
+                                                bool canonicalize = true) const;
     [[nodiscard]] bool is_path_allowed(const QString& path) const;
     [[nodiscard]] QStringList allowed_roots() const;
     static QString make_session_id(const QString& prefix, const QString& canonical_path);
     static QString make_content_session_id(const QString& prefix, const QString& content_key);
     [[nodiscard]] wosdbg::IncidentLimits incident_limits() const;
-    [[nodiscard]] QJsonObject incident_validation_to_json(const wosdbg::IncidentBundle& bundle, bool include_inventory = true) const;
+    [[nodiscard]] QJsonObject incident_validation_to_json(const wosdbg::IncidentBundle& bundle, bool include_inventory = true,
+                                                          int max_issues = -1) const;
     [[nodiscard]] QJsonValue normalize_incident_value(const IncidentSession& session, const QJsonValue& value,
                                                       bool* response_truncated = nullptr) const;
 
@@ -228,4 +238,5 @@ class DebugAnalysisService : public QObject {
     QHash<QString, std::shared_ptr<LogSession>> log_sessions;
     QHash<QString, std::shared_ptr<DumpSession>> dump_sessions;
     QHash<QString, std::shared_ptr<IncidentSession>> incident_sessions;
+    uint64_t incident_session_sequence = 0;
 };

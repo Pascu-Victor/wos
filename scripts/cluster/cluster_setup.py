@@ -54,6 +54,7 @@ import wosincident  # noqa: E402
 
 
 TOPOLOGY_PROBE_TIMEOUT_SECONDS = 5.0
+MAX_REPORTED_VM_FAILURES = 32
 
 # ---------------------------------------------------------------------------
 # Config loading and resolution
@@ -2145,6 +2146,42 @@ class LaunchResult:
     lines: list[str]
 
 
+class VmExitError(RuntimeError):
+    def __init__(self, failures: list[tuple[int, int]]):
+        self.failures = sorted(failures)
+        shown = self.failures[:MAX_REPORTED_VM_FAILURES]
+        details = ", ".join(
+            f"VM{node_id} exit={returncode}"
+            for node_id, returncode in shown
+        )
+        if len(self.failures) > len(shown):
+            details += f", +{len(self.failures) - len(shown)} more"
+        super().__init__(f"one or more WOS VMs exited unsuccessfully: {details}")
+
+
+def incident_launch_error(error: BaseException) -> str:
+    """Return bounded launch context suitable for an incident manifest."""
+    if isinstance(error, VmExitError):
+        return str(error)
+    if isinstance(error, LaunchError):
+        return (
+            f"VM{error.node_id} launch failed "
+            f"({type(error.cause).__name__})"
+        )
+    return f"{type(error).__name__} during cluster execution"
+
+
+def wait_for_launched_vms(results: list[LaunchResult]) -> None:
+    """Reap every launched VM and reject any nonzero QEMU exit status."""
+    failures: list[tuple[int, int]] = []
+    for result in sorted(results, key=lambda item: item.node_id):
+        returncode = result.process.wait()
+        if returncode != 0:
+            failures.append((result.node_id, returncode))
+    if failures:
+        raise VmExitError(failures)
+
+
 def launch_one_vm(
     node_id: int,
     node_info: dict,
@@ -2248,6 +2285,7 @@ def launch_guarded(
 
     nodes = collect_unique_nodes(config)
     pids = []
+    launch_results: list[LaunchResult] = []
     pids_lock = threading.Lock()
     stopping = threading.Event()
 
@@ -2281,6 +2319,16 @@ def launch_guarded(
                 except OSError:
                     pass
 
+        # SIGKILL is asynchronous. Reap the children before incident capture so
+        # their serial/QEMU logs have reached a stable final boundary.
+        reap_deadline = time.monotonic() + 1.0
+        for p in running:
+            remaining = max(0.0, reap_deadline - time.monotonic())
+            try:
+                p.wait(timeout=remaining)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+
     def shutdown(signum, frame):
         stopping.set()
         print("\n=== Shutting down cluster ===")
@@ -2313,6 +2361,7 @@ def launch_guarded(
             try:
                 for future in concurrent.futures.as_completed(futures):
                     result = future.result()
+                    launch_results.append(result)
                     for line in result.lines:
                         print(line)
             except LaunchError as exc:
@@ -2323,7 +2372,7 @@ def launch_guarded(
                 for future in futures:
                     future.cancel()
                 stop_all_vms()
-                sys.exit(1)
+                raise
             except KeyboardInterrupt:
                 shutdown(None, None)
     except KeyboardInterrupt:
@@ -2332,14 +2381,12 @@ def launch_guarded(
     print(f"\n=== {len(pids)} VMs launched ===")
     print("Press Ctrl+C to stop all VMs.\n", flush=True)
 
-    # Wait for all VMs
-    with pids_lock:
-        launched = list(pids)
-    for p in launched:
-        try:
-            p.wait()
-        except KeyboardInterrupt:
-            shutdown(None, None)
+    # Wait for and reap all VMs. A nonzero QEMU status is a failed source run,
+    # so launchers must not mark the resulting incident complete.
+    try:
+        wait_for_launched_vms(launch_results)
+    except KeyboardInterrupt:
+        shutdown(None, None)
 
 
 # ---------------------------------------------------------------------------
@@ -2484,6 +2531,7 @@ def main():
                 repo_root=repo_root(),
             )
         run_complete = False
+        captured_run_error = None
         try:
             try:
                 with cluster_launch_guard():
@@ -2496,7 +2544,13 @@ def main():
                         skip_setup=args.no_setup,
                     )
                 run_complete = True
-            except (LaunchConflictError, NoSetupTopologyError) as exc:
+            except (
+                LaunchConflictError,
+                NoSetupTopologyError,
+                LaunchError,
+                VmExitError,
+            ) as exc:
+                captured_run_error = incident_launch_error(exc)
                 print(f"ERROR: {exc}", file=sys.stderr)
                 sys.exit(1)
         finally:
@@ -2517,9 +2571,13 @@ def main():
                     snapshots=incident_snapshots,
                     run_complete=run_complete,
                     run_error=(
-                        None
-                        if exception_type is None
-                        else f"{exception_type.__name__} during cluster execution"
+                        captured_run_error
+                        if captured_run_error is not None
+                        else (
+                            None
+                            if exception_type is None
+                            else f"{exception_type.__name__} during cluster execution"
+                        )
                     ),
                     repo_root=repo_root(),
                 )

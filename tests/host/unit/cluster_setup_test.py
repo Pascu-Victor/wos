@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 
+import contextlib
 import importlib.util
+import io
 import subprocess
 import sys
 import tempfile
@@ -371,6 +373,124 @@ def test_launch_one_vm_wraps_overlay_creation_failure_without_popen(module) -> N
     assert_equal(popen_called, False, "QEMU must not launch after overlay prep failure")
 
 
+def test_wait_for_launched_vms_reaps_and_reports_nonzero_nodes(module) -> None:
+    class FakeProcess:
+        def __init__(self, returncode: int):
+            self.returncode = returncode
+            self.wait_calls = 0
+
+        def wait(self, timeout=None):
+            if timeout is not None:
+                raise AssertionError("normal VM wait unexpectedly used a timeout")
+            self.wait_calls += 1
+            return self.returncode
+
+    processes = [FakeProcess(0), FakeProcess(7), FakeProcess(-9)]
+    results = [
+        module.LaunchResult(node_id=node_id, process=process, lines=[])
+        for node_id, process in zip((2, 0, 1), processes, strict=True)
+    ]
+    try:
+        module.wait_for_launched_vms(results)
+    except module.VmExitError as exc:
+        assert_equal(exc.failures, [(0, 7), (1, -9)], "failed VM statuses")
+        for expected in ("VM0 exit=7", "VM1 exit=-9"):
+            if expected not in str(exc):
+                raise AssertionError(f"missing VM exit diagnostic {expected!r}: {exc}")
+        assert_equal(
+            module.incident_launch_error(exc),
+            "one or more WOS VMs exited unsuccessfully: VM0 exit=7, VM1 exit=-9",
+            "incident VM exit diagnostic",
+        )
+    else:
+        raise AssertionError("nonzero VM exit statuses were accepted")
+    assert_equal(
+        [process.wait_calls for process in processes],
+        [1, 1, 1],
+        "all launched VMs reaped",
+    )
+
+    successful = FakeProcess(0)
+    module.wait_for_launched_vms(
+        [module.LaunchResult(node_id=3, process=successful, lines=[])]
+    )
+    assert_equal(successful.wait_calls, 1, "successful VM reaped")
+    launch_error = module.LaunchError(
+        node_id=4,
+        lines=[],
+        cause=RuntimeError("do not copy this detail into the incident"),
+    )
+    assert_equal(
+        module.incident_launch_error(launch_error),
+        "VM4 launch failed (RuntimeError)",
+        "sanitized incident launch diagnostic",
+    )
+    bounded = module.VmExitError([(node_id, 1) for node_id in range(40)])
+    if "+8 more" not in str(bounded) or "VM39" in str(bounded):
+        raise AssertionError(f"VM failure diagnostic is not bounded: {bounded}")
+
+
+def test_cluster_main_preserves_vm_exit_error_for_incident(module) -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        tmp = Path(temporary)
+        config_path = tmp / "cluster.json"
+        config_path.write_text('{"zones":[{"id":"GLOBAL"}]}')
+        captured: dict = {}
+
+        old_argv = sys.argv
+        old_collect_unique_nodes = module.collect_unique_nodes
+        old_cluster_node_spec = module.cluster_node_spec
+        old_snapshot_node_logs = module.wosincident.snapshot_node_logs
+        old_capture_safely = module.wosincident.capture_safely
+        old_cluster_launch_guard = module.cluster_launch_guard
+        old_launch_guarded = module.launch_guarded
+        module.collect_unique_nodes = lambda _config: {0: {}}
+        module.cluster_node_spec = lambda *_args, **_kwargs: {"id": 0}
+        module.wosincident.snapshot_node_logs = lambda *_args, **_kwargs: {}
+        module.wosincident.capture_safely = lambda **kwargs: captured.update(kwargs)
+        module.cluster_launch_guard = lambda **_kwargs: contextlib.nullcontext()
+
+        def fail_launch(*_args, **_kwargs):
+            raise module.VmExitError([(0, 7)])
+
+        module.launch_guarded = fail_launch
+        sys.argv = [
+            str(CLUSTER_SETUP),
+            "--launch",
+            "--no-setup",
+            "--config",
+            str(config_path),
+            "--incident-output",
+            str(tmp / "failure.wosincident"),
+        ]
+        diagnostics = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(diagnostics):
+                try:
+                    module.main()
+                except SystemExit as exc:
+                    assert_equal(exc.code, 1, "cluster VM failure exit code")
+                else:
+                    raise AssertionError("cluster VM failure did not exit nonzero")
+        finally:
+            sys.argv = old_argv
+            module.collect_unique_nodes = old_collect_unique_nodes
+            module.cluster_node_spec = old_cluster_node_spec
+            module.wosincident.snapshot_node_logs = old_snapshot_node_logs
+            module.wosincident.capture_safely = old_capture_safely
+            module.cluster_launch_guard = old_cluster_launch_guard
+            module.launch_guarded = old_launch_guarded
+
+        assert_equal(captured.get("run_complete"), False, "failed cluster run status")
+        if "VM0 exit=7" not in diagnostics.getvalue():
+            raise AssertionError("cluster VM failure was not printed")
+        assert_equal(
+            captured.get("run_error"),
+            "one or more WOS VMs exited unsuccessfully: VM0 exit=7",
+            "captured cluster VM failure",
+        )
+
+
 def main() -> None:
     module = load_module()
     tests = [
@@ -383,6 +503,8 @@ def main() -> None:
         test_fixed_resource_benchmark_topologies,
         test_node_overlay_creation_failure_aborts_launch_prep,
         test_launch_one_vm_wraps_overlay_creation_failure_without_popen,
+        test_wait_for_launched_vms_reaps_and_reports_nonzero_nodes,
+        test_cluster_main_preserves_vm_exit_error_for_incident,
     ]
     for test in tests:
         test(module)
