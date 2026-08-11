@@ -57,13 +57,24 @@ def enum_members(path: Path, enum_name: str) -> set[str]:
     body = re.sub(r"//[^\n]*", "", match.group(1))
     body = re.sub(r"/\*.*?\*/", "", body, flags=re.DOTALL)
     members: set[str] = set()
+    compatibility_aliases: list[tuple[str, str]] = []
     for entry in body.split(","):
-        name = entry.split("=", maxsplit=1)[0].strip()
+        parts = entry.split("=", maxsplit=1)
+        name = parts[0].strip()
         if not name:
             continue
         if re.fullmatch(r"[A-Z][A-Z0-9_]*", name) is None:
+            if len(parts) == 2 and re.fullmatch(r"[a-z][a-z0-9_]*", name):
+                compatibility_aliases.append((name, parts[1].strip()))
+                continue
             fail(f"unparsed {enum_name} member {name!r} in {path.relative_to(ROOT)}")
         members.add(name)
+    for alias, target in compatibility_aliases:
+        if target not in members:
+            fail(
+                f"compatibility alias {alias!r} targets unknown member {target!r} "
+                f"in {path.relative_to(ROOT)}"
+            )
     return members
 
 

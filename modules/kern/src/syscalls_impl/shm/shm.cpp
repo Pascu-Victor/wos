@@ -354,8 +354,8 @@ void fill_stat(const ShmSegment& segment, ker::abi::shm::ShmidDs& out) {
     out.shm_atime = 0;
     out.shm_dtime = 0;
     out.shm_ctime = 0;
-    out.shm_cpid = static_cast<int32_t>(segment.creator_pid);
-    out.shm_lpid = static_cast<int32_t>(segment.last_pid);
+    out.shm_cpid = static_cast<int64_t>(segment.creator_pid);
+    out.shm_lpid = static_cast<int64_t>(segment.last_pid);
     out.shm_nattch = segment.attach_count;
 }
 

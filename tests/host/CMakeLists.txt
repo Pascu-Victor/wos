@@ -201,6 +201,10 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/mlibc_vfs_source_test.py
 )
 add_test(
+    NAME mlibc_conformance_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/mlibc_conformance_test.py
+)
+add_test(
     NAME netd_dns_source_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/netd_dns_source_test.py
 )
@@ -546,6 +550,7 @@ set_tests_properties(
     mlibc_dns_source_test
     mlibc_spawn_source_test
     mlibc_vfs_source_test
+    mlibc_conformance_test
     netd_dns_source_test
     socket_ring_source_test
     socket_nonblock_source_test
@@ -638,6 +643,11 @@ wos_add_unit_test(migration_guard_test
 wos_add_unit_test(kernel_preemption_policy_test
     SOURCES     ${CMAKE_CURRENT_SOURCE_DIR}/unit/kernel_preemption_policy_test.cpp
 )
+
+wos_add_unit_test(wos_abi_parity_test
+    SOURCES     ${CMAKE_CURRENT_SOURCE_DIR}/unit/wos_abi_parity_test.cpp
+)
+target_include_directories(wos_abi_parity_test PRIVATE ${WOS_ROOT})
 
 wos_add_unit_test(kernel_vsnprintf_test
     SOURCES     ${CMAKE_CURRENT_SOURCE_DIR}/unit/kernel_vsnprintf_test.cpp

@@ -24,7 +24,11 @@ def is_ipv4(value: str) -> bool:
 
 def collect_nodes() -> list[dict[str, str]]:
     nodes: list[dict[str, str]] = []
-    for path in sorted(ROOT.glob("serial-vm*.log")):
+    log_paths = [
+        *sorted(ROOT.glob("serial-vm*.log")),
+        *sorted((ROOT / "ktest-data").glob("serial-vm*.log")),
+    ]
+    for path in log_paths:
         match = VM_LOG_RE.search(path.name)
         if not match:
             continue

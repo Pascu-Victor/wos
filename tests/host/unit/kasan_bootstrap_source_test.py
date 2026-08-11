@@ -73,6 +73,19 @@ def test_selftest_ap_bootstrap_is_excluded_from_kasan() -> None:
         ],
         "early KASAN/UBSan/KCOV exclusion options",
     )
+    require_order(
+        cmake,
+        [
+            "set(KASAN_EXCLUDED_COMPILE_OPTIONS",
+            "-fno-sanitize=all",
+            "-fno-sanitize-coverage=trace-pc",
+            "if(WOS_KCFI)",
+            "list(APPEND KASAN_EXCLUDED_COMPILE_OPTIONS -fsanitize=kcfi)",
+            "endif()",
+            "set(KASAN_EXCLUDED_SRCS",
+        ],
+        "early sanitizer exclusions must retain KCFI callback metadata",
+    )
 
     body = cmake_list_body(cmake, "KASAN_EXCLUDED_SRCS")
     entry = "src/platform/smt/smt.cpp"

@@ -54,6 +54,7 @@ struct __attribute__((packed)) JournalRecord {
 };
 
 static_assert(sizeof(JournalRecord) == 608, "JournalRecord ABI size changed");
+static_assert(alignof(JournalRecord) == 1, "JournalRecord ABI alignment changed");
 static_assert(offsetof(JournalRecord, magic) == 0, "JournalRecord::magic offset changed");
 static_assert(offsetof(JournalRecord, version) == 4, "JournalRecord::version offset changed");
 static_assert(offsetof(JournalRecord, header_size) == 6, "JournalRecord::header_size offset changed");

@@ -96,6 +96,7 @@ BUILD_TARGETS = [
     "cmake_for_wos",
     "python_for_wos",
     "doom_ascii_for_wos",
+    "mlibc_conformance",
 ]
 
 DEFAULT_SOURCE_SYSROOT = ROOT / "toolchain" / "sysroot"
@@ -202,6 +203,7 @@ def configure_build(
         "-DCMAKE_MODULE_LINKER_FLAGS:STRING=",
         "-DWOS_BUILD_BASH_FOR_WOS=ON",
         "-DWOS_BUILD_PYTHON_FOR_WOS=ON",
+        "-DWOS_BUILD_MLIBC_CONFORMANCE=ON",
         "-DWOS_SKIP_LIBCXX_INSTALL=ON",
         *diagnostic_cmake_options(fast, ubtrap),
         *extra_cmake_options,

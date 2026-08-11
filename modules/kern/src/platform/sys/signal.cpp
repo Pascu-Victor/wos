@@ -289,10 +289,8 @@ auto restore_deferred_sigreturn(sched::task::Task* task) -> DeferredSigreturnRes
     task->signal_mask_store(frame.saved_mask);
     sync_task_signal_mask_cache_mapped(task);
 
-    auto* regs_arr = reinterpret_cast<uint64_t*>(&task->context.regs);
-    for (int i = 0; i < 15; i++) {
-        regs_arr[i] = frame.saved_regs.at(static_cast<size_t>(i));
-    }
+    static_assert(sizeof(task->context.regs) == sizeof(frame.saved_regs));
+    std::memcpy(&task->context.regs, frame.saved_regs.data(), sizeof(task->context.regs));
     task->context.regs.rax = frame.saved_retval;
 
     task->context.frame.int_num = 0;
@@ -319,6 +317,17 @@ auto interrupt_frame_is_user_return(sched::task::Task* task, const gates::Interr
     auto const FRAME_CLASS =
         context_switch::classify_saved_frame(task, frame, sched::task::SavedFrameOrigin::INTERRUPT, task->is_voluntary_blocked());
     return sched::task::saved_frame_restore_policy(FRAME_CLASS).deliver_signals;
+}
+
+auto synchronous_signal_can_recover_on_alt_stack(const sched::task::Task& task, const gates::InterruptFrame& frame,
+                                                 const sched::task::Task::SigHandler& handler) -> bool {
+    // A synchronous fault can itself make the interrupted RSP invalid.  That
+    // is precisely the condition SA_ONSTACK is meant to recover from, so
+    // validate every other user-return field and let the mapped alternate
+    // stack provide the signal-frame destination.
+    return frame.cs == desc::gdt::GDT_USER_CS && frame.ss == desc::gdt::GDT_USER_DS && user_pointer_valid(frame.rip) &&
+           user_rflags_valid(frame.flags) && (handler.flags & WOS_SA_ONSTACK) != 0 && (task.sigaltstack_flags & WOS_SS_DISABLE) == 0 &&
+           !is_on_alt_stack(task, frame.rsp);
 }
 
 auto is_job_control_stop_signal(int signo) -> bool {
@@ -737,10 +746,8 @@ void check_pending_signals_interrupt(cpu::GPRegs& gpr, gates::InterruptFrame& fr
     sigframe.saved_rflags = frame.flags;
     sigframe.saved_retval = gpr.rax;
 
-    const auto* regs_arr = reinterpret_cast<const uint64_t*>(&gpr);
-    for (int i = 0; i < 15; i++) {
-        sigframe.saved_regs.at(static_cast<size_t>(i)) = regs_arr[i];
-    }
+    static_assert(sizeof(gpr) == sizeof(sigframe.saved_regs));
+    std::memcpy(sigframe.saved_regs.data(), &gpr, sizeof(gpr));
 
     // Interrupt return cannot fault in a lazy/COW stack page.  Leave an
     // asynchronous signal pending so a later safe syscall-return path can
@@ -770,7 +777,7 @@ auto deliver_synchronous_signal_interrupt(cpu::GPRegs& gpr, gates::InterruptFram
         return false;
     }
 
-    if (!interrupt_frame_is_user_return(task, frame) || task->in_signal_handler) {
+    if (task->in_signal_handler) {
         return false;
     }
     if (signo <= 0) {
@@ -785,6 +792,9 @@ auto deliver_synchronous_signal_interrupt(cpu::GPRegs& gpr, gates::InterruptFram
     auto const IDX = SIGNO - 1;
     auto& handler = task->sig_handlers.at(IDX);
     if (!is_user_signal_handler(handler) || (task->signal_mask_bits() & (1ULL << IDX)) != 0) {
+        return false;
+    }
+    if (!interrupt_frame_is_user_return(task, frame) && !synchronous_signal_can_recover_on_alt_stack(*task, frame, handler)) {
         return false;
     }
     if (!user_signal_target_valid(handler)) {
@@ -803,10 +813,8 @@ auto deliver_synchronous_signal_interrupt(cpu::GPRegs& gpr, gates::InterruptFram
     sigframe.saved_rflags = frame.flags;
     sigframe.saved_retval = gpr.rax;
 
-    const auto* regs_arr = reinterpret_cast<const uint64_t*>(&gpr);
-    for (int i = 0; i < 15; i++) {
-        sigframe.saved_regs.at(static_cast<size_t>(i)) = regs_arr[i];
-    }
+    static_assert(sizeof(gpr) == sizeof(sigframe.saved_regs));
+    std::memcpy(sigframe.saved_regs.data(), &gpr, sizeof(gpr));
 
     if (!write_signal_frame_mapped(*task, FRAME_ADDR, sigframe)) {
         handle_signal_frame_fault(task);
@@ -869,10 +877,8 @@ void check_pending_signals_handoff(sched::task::Task* task, cpu::GPRegs& gpr, ga
     sigframe.saved_rflags = frame.flags;
     sigframe.saved_retval = gpr.rax;
 
-    const auto* regs_arr = reinterpret_cast<const uint64_t*>(&gpr);
-    for (int i = 0; i < 15; i++) {
-        sigframe.saved_regs.at(static_cast<size_t>(i)) = regs_arr[i];
-    }
+    static_assert(sizeof(gpr) == sizeof(sigframe.saved_regs));
+    std::memcpy(sigframe.saved_regs.data(), &gpr, sizeof(gpr));
 
     if (!write_signal_frame_mapped(*task, FRAME_ADDR, sigframe)) {
         return;
@@ -974,10 +980,8 @@ void check_pending_signals_deferred(sched::task::Task* task, DeferredSignalDeliv
     sigframe.saved_rflags = frame.flags;
     sigframe.saved_retval = gpr.rax;
 
-    const auto* regs_arr = reinterpret_cast<const uint64_t*>(&gpr);
-    for (int i = 0; i < 15; i++) {
-        sigframe.saved_regs.at(static_cast<size_t>(i)) = regs_arr[i];
-    }
+    static_assert(sizeof(gpr) == sizeof(sigframe.saved_regs));
+    std::memcpy(sigframe.saved_regs.data(), &gpr, sizeof(gpr));
 
     if (!write_signal_frame_mapped(*task, FRAME_ADDR, sigframe)) {
         return;

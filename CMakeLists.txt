@@ -116,6 +116,7 @@ add_subdirectory(modules)
 
 set(WOS_SYSROOT_PATH "${CMAKE_SOURCE_DIR}/toolchain/sysroot" CACHE PATH "WOS target sysroot")
 set(WOS_MLIBC_BUILD_DIR "${CMAKE_SOURCE_DIR}/toolchain/mlibc-build" CACHE PATH "mlibc build directory")
+set(WOS_MLIBC_CONFORMANCE_STAGE_DIR "${CMAKE_BINARY_DIR}/mlibc-conformance-stage" CACHE PATH "Staged WOS mlibc conformance payload")
 set(WOS_LIBCXX_BUILD_DIR "${CMAKE_SOURCE_DIR}/toolchain/libcxx-build" CACHE PATH "libc++ build directory")
 set(WOS_BUSYBOX_BUILD_DIR "${CMAKE_SOURCE_DIR}/toolchain/busybox-build" CACHE PATH "BusyBox build directory")
 set(WOS_BUSYBOX_INSTALL_DIR "${CMAKE_SOURCE_DIR}/toolchain/busybox-install" CACHE PATH "BusyBox install staging directory")
@@ -153,6 +154,11 @@ set(WOS_DOOM_ASCII_BUILD_DIR "${CMAKE_SOURCE_DIR}/toolchain/doom-ascii-build" CA
 set(WOS_BOOT_DISK "${CMAKE_SOURCE_DIR}/disk.qcow2" CACHE FILEPATH "WOS boot disk image")
 set(WOS_ROOTFS_DISK "${CMAKE_SOURCE_DIR}/mountfs.qcow2" CACHE FILEPATH "WOS rootfs disk image")
 option(WOS_SKIP_LIBCXX_INSTALL "Skip the libc++ install target; useful when an isolated sysroot is pre-seeded" OFF)
+set(WOS_BUILD_MLIBC_CONFORMANCE_DEFAULT ON)
+if(WOS_NATIVE_SYSTEM_BUILD)
+    set(WOS_BUILD_MLIBC_CONFORMANCE_DEFAULT OFF)
+endif()
+option(WOS_BUILD_MLIBC_CONFORMANCE "Cross-build and stage the versioned WOS mlibc conformance baseline" ${WOS_BUILD_MLIBC_CONFORMANCE_DEFAULT})
 option(WOS_BUILD_CLANG_FOR_WOS "Build a native WOS clang/lld toolchain and stage it into the rootfs" ${WOS_PORT_BUILD_DEFAULT})
 option(WOS_BUILD_NINJA_FOR_WOS "Build a native WOS Ninja and stage it into the rootfs" ${WOS_PORT_BUILD_DEFAULT})
 option(WOS_BUILD_CMAKE_FOR_HOST "Build host-side CMake from the WOS fork and install it into toolchain/host" ${WOS_BUILD_CMAKE_FOR_HOST_DEFAULT})
@@ -263,6 +269,48 @@ else()
         DEPENDS ${WOS_BUILD_SCRIPTS_DIR}/build_mlibc.sh ${MLIBC_SOURCES}
     )
     add_custom_target(mlibc DEPENDS ${MLIBC_STAMP})
+endif()
+
+# --- mlibc_conformance: cross-build and stage the audited libc corpus ------
+set(WOS_MLIBC_CONFORMANCE_ROOTFS_INPUTS)
+if(WOS_BUILD_MLIBC_CONFORMANCE)
+    find_program(WOS_LOCALEDEF_EXECUTABLE NAMES localedef REQUIRED)
+    wos_glob_recurse(MLIBC_CONFORMANCE_SOURCES
+        ${CMAKE_SOURCE_DIR}/toolchain/src/mlibc/tests/*.c
+        ${CMAKE_SOURCE_DIR}/toolchain/src/mlibc/tests/*.cpp
+        ${CMAKE_SOURCE_DIR}/toolchain/src/mlibc/tests/*.h
+        ${CMAKE_SOURCE_DIR}/toolchain/src/mlibc/tests/meson.build
+    )
+    set(MLIBC_CONFORMANCE_MANIFEST ${CMAKE_SOURCE_DIR}/tests/conformance/mlibc/baseline-v1.json)
+    set(MLIBC_CONFORMANCE_RUNNER ${CMAKE_SOURCE_DIR}/scripts/test/mlibc_conformance.py)
+    set(MLIBC_CONFORMANCE_STAMP ${CMAKE_BINARY_DIR}/stamps/mlibc_conformance.stamp)
+    add_custom_command(
+        OUTPUT ${MLIBC_CONFORMANCE_STAMP}
+        COMMAND ${CMAKE_COMMAND} -E env
+                WOS_SYSROOT_PATH=${WOS_SYSROOT_PATH}
+                WOS_MLIBC_BUILD_DIR=${WOS_MLIBC_BUILD_DIR}
+                WOS_MLIBC_BUILD_TESTS=1
+                WOS_MLIBC_BUILD_HOST_TESTS=0
+                ${WOS_BUILD_SCRIPTS_DIR}/build_mlibc.sh ${CMAKE_BUILD_TYPE}
+        COMMAND python3 ${MLIBC_CONFORMANCE_RUNNER}
+                --manifest ${MLIBC_CONFORMANCE_MANIFEST}
+                stage
+                --build-dir ${WOS_MLIBC_BUILD_DIR}
+                --output-dir ${WOS_MLIBC_CONFORMANCE_STAGE_DIR}
+                --localedef ${WOS_LOCALEDEF_EXECUTABLE}
+        COMMAND ${CMAKE_COMMAND} -E touch ${MLIBC_CONFORMANCE_STAMP}
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        COMMENT "Cross-building and staging the WOS mlibc conformance baseline..."
+        DEPENDS
+            ${MLIBC_STAMP}
+            ${WOS_BUILD_SCRIPTS_DIR}/build_mlibc.sh
+            ${MLIBC_CONFORMANCE_MANIFEST}
+            ${MLIBC_CONFORMANCE_RUNNER}
+            ${MLIBC_CONFORMANCE_SOURCES}
+        VERBATIM
+    )
+    add_custom_target(mlibc_conformance DEPENDS ${MLIBC_CONFORMANCE_STAMP})
+    list(APPEND WOS_MLIBC_CONFORMANCE_ROOTFS_INPUTS ${MLIBC_CONFORMANCE_STAMP})
 endif()
 
 # --- libcxx: build and install libc++ ---------------------------------------
@@ -1015,6 +1063,7 @@ if(WOS_BUILD_DISK_IMAGES)
             ${WOS_DOOM_ASCII_FOR_WOS_ROOTFS_INPUTS}
             ${WOS_CURL_FOR_WOS_ROOTFS_INPUTS}
             ${WOS_GIT_FOR_WOS_ROOTFS_INPUTS}
+            ${WOS_MLIBC_CONFORMANCE_ROOTFS_INPUTS}
     )
     add_custom_target(mountfs_disk DEPENDS ${WOS_ROOTFS_DISK} ${MOUNTFS_STAMP})
     if(WOS_BUILD_CLANG_FOR_WOS)
@@ -1052,6 +1101,9 @@ if(WOS_BUILD_DISK_IMAGES)
     endif()
     if(WOS_BUILD_GIT_FOR_WOS)
         add_dependencies(mountfs_disk git_for_wos)
+    endif()
+    if(WOS_BUILD_MLIBC_CONFORMANCE)
+        add_dependencies(mountfs_disk mlibc_conformance)
     endif()
 
     # --- boot_image: create the boot disk + initramfs ----------------------
@@ -1147,6 +1199,9 @@ add_dependencies(wos_full
     gnu_make
     wos_tools_build_always
 )
+if(WOS_BUILD_MLIBC_CONFORMANCE)
+    add_dependencies(wos_full mlibc_conformance)
+endif()
 if(WOS_BUILD_DISK_IMAGES)
     add_dependencies(wos_full
         mountfs_disk

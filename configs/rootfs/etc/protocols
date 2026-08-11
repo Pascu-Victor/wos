@@ -1,0 +1,12 @@
+# Minimal protocol database required by WOS libc and networking utilities.
+hopopt  0   HOPOPT
+icmp    1   ICMP
+igmp    2   IGMP
+tcp     6   TCP
+udp     17  UDP
+ipv6    41  IPv6
+gre     47  GRE
+esp     50  ESP
+ah      51  AH
+ipv6-icmp 58 IPv6-ICMP
+raw     255 RAW

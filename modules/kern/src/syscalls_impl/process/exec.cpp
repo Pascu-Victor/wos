@@ -2108,16 +2108,27 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
     }
     envp_addrs[envp_count] = 0;
 
+    // AT_EXECFN must refer to storage in the new image. In particular, ld.so
+    // uses it to derive $ORIGIN before libc has initialized /proc helpers.
+    uint64_t const EXECFN_ADDR = push_string(path);
+    if (EXECFN_ADDR == 0) {
+        dbg::log("wos_proc_exec: Failed to push AT_EXECFN string");
+        delete[] envp_addrs;
+        delete[] argv_addrs;
+        cleanup_unpublished_task();
+        return 0;
+    }
+
     // Align to 16 bytes after string data, accounting for structured data parity.
     // Structured data: auxv (variable) + envp array + argv array + argc.
-    // auxv: 4 core pairs (8 qwords) + optional AT_BASE pair (2 qwords) + AT_NULL pair (2 qwords)
+    // auxv: 6 core pairs + optional AT_BASE pair + AT_NULL pair.
     {
         constexpr uint64_t ALIGNMENT = 16;
         uint64_t const CURRENT_ADDR = user_stack_virt - current_virt_offset;
         uint64_t const ALIGNED = CURRENT_ADDR & ~(ALIGNMENT - 1);
         current_virt_offset += (CURRENT_ADDR - ALIGNED);
 
-        constexpr size_t AUXV_QWORDS_BASE = 12;  // 5 core pairs (PAGESZ,ENTRY,PHDR,PHENT,PHNUM) + AT_NULL pair
+        constexpr size_t AUXV_QWORDS_BASE = 14;  // 6 core pairs (including EXECFN) + AT_NULL pair
         const size_t AUXV_QWORDS = AUXV_QWORDS_BASE + (new_task->interp_base != 0 ? 2 : 0);
         size_t const STRUCTURED_QWORDS = AUXV_QWORDS + (envp_count + 1) + (argv_count + 1) + 1;
         if (STRUCTURED_QWORDS % 2 != 0) {
@@ -2136,6 +2147,7 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
         constexpr uint64_t AT_PAGESZ = 6;
         constexpr uint64_t AT_BASE = 7;
         constexpr uint64_t AT_ENTRY = 9;
+        constexpr uint64_t AT_EXECFN = 31;
 
         // Build auxv dynamically: always include core entries, conditionally add AT_BASE
         bool built_correct_auxv = true;
@@ -2154,6 +2166,8 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
             built_correct_auxv &= auxv.push_back(AT_BASE);
             built_correct_auxv &= auxv.push_back(new_task->interp_base);
         }
+        built_correct_auxv &= auxv.push_back(AT_EXECFN);
+        built_correct_auxv &= auxv.push_back(EXECFN_ADDR);
         built_correct_auxv &= auxv.push_back(AT_NULL);
         built_correct_auxv &= auxv.push_back(0);
 
@@ -2875,6 +2889,17 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
     }
     envp_addrs[envp_count] = 0;
 
+    // Keep the pathname in the replacement image so AT_EXECFN never points
+    // back into the old address space destroyed by a successful execve().
+    uint64_t const EXECFN_ADDR = push_string(exec_path);
+    if (EXECFN_ADDR == 0) {
+        delete[] envp_addrs;
+        delete[] argv_addrs;
+        cleanup_new_image();
+        free_kernel_arg_env_once();
+        return static_cast<uint64_t>(-E2BIG);
+    }
+
     // Free kernel copies of argv/envp strings
     free_kernel_arg_env_once();
 
@@ -2885,7 +2910,7 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
         uint64_t const ALIGNED = CURRENT_ADDR & ~(ALIGNMENT - 1);
         current_virt_offset += (CURRENT_ADDR - ALIGNED);
 
-        constexpr size_t AUXV_BASE_QWORDS = 12;  // 5 core pairs (PAGESZ,ENTRY,PHDR,PHENT,PHNUM) + AT_NULL pair
+        constexpr size_t AUXV_BASE_QWORDS = 14;  // 6 core pairs (including EXECFN) + AT_NULL pair
         size_t const AUXV_QWORDS = AUXV_BASE_QWORDS + (new_interp_base != 0 ? 2 : 0);
         size_t const STRUCTURED_QWORDS = AUXV_QWORDS + (envp_count + 1) + (argv_count + 1) + 1;
         if (STRUCTURED_QWORDS % 2 != 0) {
@@ -2903,6 +2928,7 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
         constexpr uint64_t AT_PAGESZ = 6;
         constexpr uint64_t AT_BASE = 7;
         constexpr uint64_t AT_ENTRY = 9;
+        constexpr uint64_t AT_EXECFN = 31;
         bool built_correct_auxv = true;
         ker::util::SmallVec<uint64_t, 16> auxv;
         built_correct_auxv &= auxv.push_back(AT_PAGESZ);
@@ -2919,6 +2945,8 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
             built_correct_auxv &= auxv.push_back(AT_BASE);
             built_correct_auxv &= auxv.push_back(new_interp_base);
         }
+        built_correct_auxv &= auxv.push_back(AT_EXECFN);
+        built_correct_auxv &= auxv.push_back(EXECFN_ADDR);
         built_correct_auxv &= auxv.push_back(AT_NULL);
         built_correct_auxv &= auxv.push_back(0);
 
@@ -3061,8 +3089,8 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
     if (new_thread != nullptr) {
         uint64_t const TCB_PADDR = mm::virt::translate(new_pagemap, new_thread->fsbase);
         if (TCB_PADDR != mm::virt::PADDR_INVALID) {
-            auto* tcb_self = reinterpret_cast<uint64_t*>(mm::addr::get_virt_pointer(TCB_PADDR));
-            *tcb_self = new_thread->fsbase;
+            void* const TCB_SELF = mm::addr::get_virt_pointer(TCB_PADDR);
+            std::memcpy(TCB_SELF, &new_thread->fsbase, sizeof(new_thread->fsbase));
         }
     }
 

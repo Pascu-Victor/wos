@@ -1,0 +1,2259 @@
+{
+  "schema_version": 1,
+  "baseline_id": "wos-mlibc-v1",
+  "selection": {
+    "rule": "Select every test case registered by the current mlibc ANSI, POSIX, Linux, Linux-wrapper, and RTLD Meson declarations. ANSI, POSIX, and RTLD are active because the WOS mlibc configuration enables their required option surface. Linux and Linux-wrapper cases remain selected but are reviewed unsupported because WOS declares linux_option unsupported; active-suite cases whose required WosSysdepTags or compiler features are absent are also reviewed unsupported rather than discovered from runtime failures.",
+    "active_options": {
+      "ansi": true,
+      "posix": true,
+      "linux": false,
+      "linux-wrappers": false,
+      "rtld": true
+    }
+  },
+  "max_output_bytes": 65536,
+  "cases": [
+    {
+      "id": "ansi/abs",
+      "feature_group": "ansi.core",
+      "prerequisites": [
+        "mlibc-option:ansi",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/ansi-abs"
+    },
+    {
+      "id": "ansi/alloc",
+      "feature_group": "ansi.stdlib",
+      "prerequisites": [
+        "mlibc-option:ansi",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/ansi-alloc"
+    },
+    {
+      "id": "ansi/asctime",
+      "feature_group": "ansi.time",
+      "prerequisites": [
+        "mlibc-option:ansi",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/ansi-asctime"
+    },
+    {
+      "id": "ansi/btowc",
+      "feature_group": "ansi.multibyte",
+      "prerequisites": [
+        "mlibc-option:ansi",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/ansi-btowc"
+    },
+    {
+      "id": "ansi/calloc",
+      "feature_group": "ansi.stdlib",
+      "prerequisites": [
+        "mlibc-option:ansi",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/ansi-calloc"
+    },
+    {
+      "id": "ansi/creal-cimag",
+      "feature_group": "ansi.core",
+      "prerequisites": [
+        "mlibc-option:ansi",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/ansi-creal-cimag"
+    },
+    {
+      "id": "ansi/fenv",
+      "feature_group": "ansi.stdio",
+      "prerequisites": [
+        "mlibc-option:ansi",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/ansi-fenv"
+    },
+    {
+      "id": "ansi/fgetpos",
+      "feature_group": "ansi.stdio",
+      "prerequisites": [
+        "mlibc-option:ansi",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/ansi-fgetpos"
+    },
+    {
+      "id": "ansi/fgetws",
+      "feature_group": "ansi.multibyte",
+      "prerequisites": [
+        "mlibc-option:ansi",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/ansi-fgetws"
+    },
+    {
+      "id": "ansi/fopen",
+      "feature_group": "ansi.stdio",
+      "prerequisites": [
+        "mlibc-option:ansi",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/ansi-fopen"
+    },
+    {
+      "id": "ansi/fputs",
+      "feature_group": "ansi.stdio",
+      "prerequisites": [
+        "mlibc-option:ansi",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/ansi-fputs"
+    },
+    {
+      "id": "ansi/fputwc",
+      "feature_group": "ansi.multibyte",
+      "prerequisites": [
+        "mlibc-option:ansi",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/ansi-fputwc"
+    },
+    {
+      "id": "ansi/freopen",
+      "feature_group": "ansi.stdio",
+      "prerequisites": [
+        "mlibc-option:ansi",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/ansi-freopen"
+    },
+    {
+      "id": "ansi/ftell",
+      "feature_group": "ansi.stdio",
+      "prerequisites": [
+        "mlibc-option:ansi",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/ansi-ftell"
+    },
+    {
+      "id": "ansi/fwscanf",
+      "feature_group": "ansi.multibyte",
+      "prerequisites": [
+        "mlibc-option:ansi",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/ansi-fwscanf"
+    },
+    {
+      "id": "ansi/locale",
+      "feature_group": "ansi.core",
+      "prerequisites": [
+        "mlibc-option:ansi",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/ansi-locale"
+    },
+    {
+      "id": "ansi/longjmp",
+      "feature_group": "ansi.core",
+      "prerequisites": [
+        "mlibc-option:ansi",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/ansi-longjmp"
+    },
+    {
+      "id": "ansi/mblen",
+      "feature_group": "ansi.multibyte",
+      "prerequisites": [
+        "mlibc-option:ansi",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/ansi-mblen"
+    },
+    {
+      "id": "ansi/mbrlen",
+      "feature_group": "ansi.multibyte",
+      "prerequisites": [
+        "mlibc-option:ansi",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/ansi-mbrlen"
+    },
+    {
+      "id": "ansi/mbrtoc32",
+      "feature_group": "ansi.multibyte",
+      "prerequisites": [
+        "mlibc-option:ansi",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/ansi-mbrtoc32"
+    },
+    {
+      "id": "ansi/mbrtowc",
+      "feature_group": "ansi.multibyte",
+      "prerequisites": [
+        "mlibc-option:ansi",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/ansi-mbrtowc"
+    },
+    {
+      "id": "ansi/mbsnrtowcs",
+      "feature_group": "ansi.multibyte",
+      "prerequisites": [
+        "mlibc-option:ansi",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/ansi-mbsnrtowcs"
+    },
+    {
+      "id": "ansi/mbsrtowcs",
+      "feature_group": "ansi.multibyte",
+      "prerequisites": [
+        "mlibc-option:ansi",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/ansi-mbsrtowcs"
+    },
+    {
+      "id": "ansi/mbstowcs",
+      "feature_group": "ansi.multibyte",
+      "prerequisites": [
+        "mlibc-option:ansi",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/ansi-mbstowcs"
+    },
+    {
+      "id": "ansi/nanosleep",
+      "feature_group": "ansi.time",
+      "prerequisites": [
+        "mlibc-option:ansi",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/ansi-nanosleep"
+    },
+    {
+      "id": "ansi/qsort",
+      "feature_group": "ansi.stdlib",
+      "prerequisites": [
+        "mlibc-option:ansi",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/ansi-qsort"
+    },
+    {
+      "id": "ansi/snprintf",
+      "feature_group": "ansi.core",
+      "prerequisites": [
+        "mlibc-option:ansi",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/ansi-snprintf"
+    },
+    {
+      "id": "ansi/sprintf",
+      "feature_group": "ansi.core",
+      "prerequisites": [
+        "mlibc-option:ansi",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/ansi-sprintf"
+    },
+    {
+      "id": "ansi/sscanf",
+      "feature_group": "ansi.core",
+      "prerequisites": [
+        "mlibc-option:ansi",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/ansi-sscanf"
+    },
+    {
+      "id": "ansi/strchr",
+      "feature_group": "ansi.core",
+      "prerequisites": [
+        "mlibc-option:ansi",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/ansi-strchr"
+    },
+    {
+      "id": "ansi/strftime",
+      "feature_group": "ansi.time",
+      "prerequisites": [
+        "mlibc-option:ansi",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/ansi-strftime"
+    },
+    {
+      "id": "ansi/strrchr",
+      "feature_group": "ansi.core",
+      "prerequisites": [
+        "mlibc-option:ansi",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/ansi-strrchr"
+    },
+    {
+      "id": "ansi/strtof",
+      "feature_group": "ansi.stdlib",
+      "prerequisites": [
+        "mlibc-option:ansi",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/ansi-strtof"
+    },
+    {
+      "id": "ansi/strtol",
+      "feature_group": "ansi.stdlib",
+      "prerequisites": [
+        "mlibc-option:ansi",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/ansi-strtol"
+    },
+    {
+      "id": "ansi/strxfrm",
+      "feature_group": "ansi.core",
+      "prerequisites": [
+        "mlibc-option:ansi",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/ansi-strxfrm"
+    },
+    {
+      "id": "ansi/swprintf",
+      "feature_group": "ansi.multibyte",
+      "prerequisites": [
+        "mlibc-option:ansi",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/ansi-swprintf"
+    },
+    {
+      "id": "ansi/swscanf",
+      "feature_group": "ansi.multibyte",
+      "prerequisites": [
+        "mlibc-option:ansi",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/ansi-swscanf"
+    },
+    {
+      "id": "ansi/timegm",
+      "feature_group": "ansi.time",
+      "prerequisites": [
+        "mlibc-option:ansi",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/ansi-timegm"
+    },
+    {
+      "id": "ansi/tmpfile",
+      "feature_group": "ansi.stdio",
+      "prerequisites": [
+        "mlibc-option:ansi",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/ansi-tmpfile"
+    },
+    {
+      "id": "ansi/tz",
+      "feature_group": "ansi.time",
+      "prerequisites": [
+        "mlibc-option:ansi",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/ansi-tz",
+      "invocations": [
+        {
+          "name": "utc0",
+          "environment": {
+            "TZ": "UTC0"
+          },
+          "expected_stdout": "UTC UTC 0 0\nUTC offset: 0:00\n"
+        },
+        {
+          "name": "gmt0",
+          "environment": {
+            "TZ": "GMT0"
+          },
+          "expected_stdout": "GMT GMT 0 0\nUTC offset: 0:00\n"
+        },
+        {
+          "name": "colon-utc0",
+          "environment": {
+            "TZ": ":UTC0"
+          },
+          "expected_stdout": "UTC UTC 0 0\nUTC offset: 0:00\n"
+        },
+        {
+          "name": "est",
+          "environment": {
+            "TZ": "EST+5"
+          },
+          "expected_stdout": "EST EST 18000 0\nUTC offset: -5:00\n"
+        },
+        {
+          "name": "eet",
+          "environment": {
+            "TZ": "EET-2"
+          },
+          "expected_stdout": "EET EET -7200 0\nUTC offset: 2:00\n"
+        },
+        {
+          "name": "numeric",
+          "environment": {
+            "TZ": "<+03>-03"
+          },
+          "expected_stdout": "+03 +03 -10800 0\nUTC offset: 3:00\n"
+        },
+        {
+          "name": "npt",
+          "environment": {
+            "TZ": "NPT-05:45"
+          },
+          "expected_stdout": "NPT NPT -20700 0\nUTC offset: 5:45\n"
+        },
+        {
+          "name": "nst",
+          "environment": {
+            "TZ": "NST+03:30NDT"
+          },
+          "expected_stdout": "NST NDT 12600 1\nUTC offset: -2:30\n"
+        },
+        {
+          "name": "nz",
+          "environment": {
+            "TZ": "NZST-12NZDT-13,M9.5.0,M4.1.0/3"
+          },
+          "expected_stdout": "NZST NZDT -43200 1\nUTC offset: 12:00\n"
+        },
+        {
+          "name": "quoted-no-rule",
+          "environment": {
+            "TZ": "<PST-8>+8<PDT-7>+7"
+          },
+          "expected_stdout": "PST-8 PDT-7 28800 1\nUTC offset: -7:00\n"
+        },
+        {
+          "name": "quoted-rule",
+          "environment": {
+            "TZ": "<PST-8>+8<PDT-7>+7,M3.2.0,M11.1.0"
+          },
+          "expected_stdout": "PST-8 PDT-7 28800 1\nUTC offset: -7:00\n"
+        }
+      ]
+    },
+    {
+      "id": "ansi/ungetc",
+      "feature_group": "ansi.stdio",
+      "prerequisites": [
+        "mlibc-option:ansi",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/ansi-ungetc"
+    },
+    {
+      "id": "ansi/ungetwc",
+      "feature_group": "ansi.multibyte",
+      "prerequisites": [
+        "mlibc-option:ansi",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/ansi-ungetwc"
+    },
+    {
+      "id": "ansi/utf8",
+      "feature_group": "ansi.multibyte",
+      "prerequisites": [
+        "mlibc-option:ansi",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/ansi-utf8"
+    },
+    {
+      "id": "ansi/wcsftime",
+      "feature_group": "ansi.multibyte",
+      "prerequisites": [
+        "mlibc-option:ansi",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/ansi-wcsftime"
+    },
+    {
+      "id": "ansi/wcsnrtombs",
+      "feature_group": "ansi.multibyte",
+      "prerequisites": [
+        "mlibc-option:ansi",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/ansi-wcsnrtombs"
+    },
+    {
+      "id": "ansi/wcsrtombs",
+      "feature_group": "ansi.multibyte",
+      "prerequisites": [
+        "mlibc-option:ansi",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/ansi-wcsrtombs"
+    },
+    {
+      "id": "ansi/wcstof",
+      "feature_group": "ansi.multibyte",
+      "prerequisites": [
+        "mlibc-option:ansi",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/ansi-wcstof"
+    },
+    {
+      "id": "ansi/wctrans",
+      "feature_group": "ansi.multibyte",
+      "prerequisites": [
+        "mlibc-option:ansi",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/ansi-wctrans"
+    },
+    {
+      "id": "ansi/wctype",
+      "feature_group": "ansi.multibyte",
+      "prerequisites": [
+        "mlibc-option:ansi",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/ansi-wctype"
+    },
+    {
+      "id": "ansi/wmemcmp",
+      "feature_group": "ansi.core",
+      "prerequisites": [
+        "mlibc-option:ansi",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/ansi-wmemcmp"
+    },
+    {
+      "id": "linux-wrappers/rt_sigqueueinfo",
+      "feature_group": "linux-wrappers.disabled",
+      "prerequisites": [
+        "mlibc-option:linux-wrappers",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "unsupported",
+      "rationale": "The WOS mlibc configuration declares linux-wrappers unsupported and builds with linux_option=disabled; this case is retained visibly for corpus coverage."
+    },
+    {
+      "id": "linux-wrappers/rt_tgsigqueueinfo",
+      "feature_group": "linux-wrappers.disabled",
+      "prerequisites": [
+        "mlibc-option:linux-wrappers",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "unsupported",
+      "rationale": "The WOS mlibc configuration declares linux-wrappers unsupported and builds with linux_option=disabled; this case is retained visibly for corpus coverage."
+    },
+    {
+      "id": "linux/cpuset",
+      "feature_group": "linux.disabled",
+      "prerequisites": [
+        "mlibc-option:linux",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "unsupported",
+      "rationale": "The WOS mlibc configuration declares linux unsupported and builds with linux_option=disabled; this case is retained visibly for corpus coverage."
+    },
+    {
+      "id": "linux/getifaddrs",
+      "feature_group": "linux.disabled",
+      "prerequisites": [
+        "mlibc-option:linux",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "unsupported",
+      "rationale": "The WOS mlibc configuration declares linux unsupported and builds with linux_option=disabled; this case is retained visibly for corpus coverage."
+    },
+    {
+      "id": "linux/malloc-usable-size",
+      "feature_group": "linux.disabled",
+      "prerequisites": [
+        "mlibc-option:linux",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "unsupported",
+      "rationale": "The WOS mlibc configuration declares linux unsupported and builds with linux_option=disabled; this case is retained visibly for corpus coverage."
+    },
+    {
+      "id": "linux/pidfd",
+      "feature_group": "linux.disabled",
+      "prerequisites": [
+        "mlibc-option:linux",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "unsupported",
+      "rationale": "The WOS mlibc configuration declares linux unsupported and builds with linux_option=disabled; this case is retained visibly for corpus coverage."
+    },
+    {
+      "id": "linux/ppoll",
+      "feature_group": "linux.disabled",
+      "prerequisites": [
+        "mlibc-option:linux",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "unsupported",
+      "rationale": "The WOS mlibc configuration declares linux unsupported and builds with linux_option=disabled; this case is retained visibly for corpus coverage."
+    },
+    {
+      "id": "linux/process_vm_readv_writev",
+      "feature_group": "linux.disabled",
+      "prerequisites": [
+        "mlibc-option:linux",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "unsupported",
+      "rationale": "The WOS mlibc configuration declares linux unsupported and builds with linux_option=disabled; this case is retained visibly for corpus coverage."
+    },
+    {
+      "id": "linux/pthread_attr",
+      "feature_group": "linux.disabled",
+      "prerequisites": [
+        "mlibc-option:linux",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "unsupported",
+      "rationale": "The WOS mlibc configuration declares linux unsupported and builds with linux_option=disabled; this case is retained visibly for corpus coverage."
+    },
+    {
+      "id": "linux/pthread_setname_np",
+      "feature_group": "linux.disabled",
+      "prerequisites": [
+        "mlibc-option:linux",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "unsupported",
+      "rationale": "The WOS mlibc configuration declares linux unsupported and builds with linux_option=disabled; this case is retained visibly for corpus coverage."
+    },
+    {
+      "id": "linux/timerfd",
+      "feature_group": "linux.disabled",
+      "prerequisites": [
+        "mlibc-option:linux",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "unsupported",
+      "rationale": "The WOS mlibc configuration declares linux unsupported and builds with linux_option=disabled; this case is retained visibly for corpus coverage."
+    },
+    {
+      "id": "linux/utmp",
+      "feature_group": "linux.disabled",
+      "prerequisites": [
+        "mlibc-option:linux",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "unsupported",
+      "rationale": "The WOS mlibc configuration declares linux unsupported and builds with linux_option=disabled; this case is retained visibly for corpus coverage."
+    },
+    {
+      "id": "linux/utmpx",
+      "feature_group": "linux.disabled",
+      "prerequisites": [
+        "mlibc-option:linux",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "unsupported",
+      "rationale": "The WOS mlibc configuration declares linux unsupported and builds with linux_option=disabled; this case is retained visibly for corpus coverage."
+    },
+    {
+      "id": "linux/xattr",
+      "feature_group": "linux.disabled",
+      "prerequisites": [
+        "mlibc-option:linux",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "unsupported",
+      "rationale": "The WOS mlibc configuration declares linux unsupported and builds with linux_option=disabled; this case is retained visibly for corpus coverage."
+    },
+    {
+      "id": "posix/abort",
+      "feature_group": "posix.signals",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-abort",
+      "invocations": [
+        {
+          "name": "sigabrt",
+          "accepted_returncodes": [
+            134
+          ]
+        }
+      ]
+    },
+    {
+      "id": "posix/accept4",
+      "feature_group": "posix.network",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-accept4"
+    },
+    {
+      "id": "posix/access",
+      "feature_group": "posix.vfs",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-access"
+    },
+    {
+      "id": "posix/alarm",
+      "feature_group": "posix.signals",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-alarm"
+    },
+    {
+      "id": "posix/basename",
+      "feature_group": "posix.core",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-basename"
+    },
+    {
+      "id": "posix/dprintf",
+      "feature_group": "posix.vfs",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-dprintf"
+    },
+    {
+      "id": "posix/environment",
+      "feature_group": "posix.process",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-environment"
+    },
+    {
+      "id": "posix/fdopen",
+      "feature_group": "posix.vfs",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-fdopen"
+    },
+    {
+      "id": "posix/ffs",
+      "feature_group": "posix.core",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-ffs"
+    },
+    {
+      "id": "posix/flockfile",
+      "feature_group": "posix.vfs",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-flockfile"
+    },
+    {
+      "id": "posix/fmemopen",
+      "feature_group": "posix.vfs",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-fmemopen"
+    },
+    {
+      "id": "posix/fopencookie",
+      "feature_group": "posix.vfs",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-fopencookie"
+    },
+    {
+      "id": "posix/getaddrinfo",
+      "feature_group": "posix.network",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-getaddrinfo"
+    },
+    {
+      "id": "posix/getcwd",
+      "feature_group": "posix.vfs",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-getcwd"
+    },
+    {
+      "id": "posix/getdelim",
+      "feature_group": "posix.vfs",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-getdelim"
+    },
+    {
+      "id": "posix/gethostbyname",
+      "feature_group": "posix.network",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-gethostbyname"
+    },
+    {
+      "id": "posix/getlogin_r",
+      "feature_group": "posix.core",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-getlogin_r"
+    },
+    {
+      "id": "posix/getnameinfo",
+      "feature_group": "posix.network",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-getnameinfo"
+    },
+    {
+      "id": "posix/getparam",
+      "feature_group": "posix.process",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "mlibc-tag:GetParam",
+        "mlibc-tag:SetParam",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "unsupported",
+      "rationale": "WOS does not expose the mlibc GetParam or SetParam scheduler sysdeps; the generic API therefore returns ENOSYS by design."
+    },
+    {
+      "id": "posix/getservbyname",
+      "feature_group": "posix.network",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-getservbyname"
+    },
+    {
+      "id": "posix/getservbyport",
+      "feature_group": "posix.network",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-getservbyport"
+    },
+    {
+      "id": "posix/getsubopt",
+      "feature_group": "posix.core",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-getsubopt"
+    },
+    {
+      "id": "posix/getwchar",
+      "feature_group": "posix.core",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-getwchar"
+    },
+    {
+      "id": "posix/grp",
+      "feature_group": "posix.vfs",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-grp"
+    },
+    {
+      "id": "posix/if_indextoname",
+      "feature_group": "posix.network",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-if_indextoname"
+    },
+    {
+      "id": "posix/index",
+      "feature_group": "posix.core",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-index"
+    },
+    {
+      "id": "posix/inet_aton",
+      "feature_group": "posix.network",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-inet_aton"
+    },
+    {
+      "id": "posix/inet_ntop",
+      "feature_group": "posix.network",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-inet_ntop"
+    },
+    {
+      "id": "posix/inet_pton",
+      "feature_group": "posix.network",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-inet_pton"
+    },
+    {
+      "id": "posix/jrand48",
+      "feature_group": "posix.core",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-jrand48"
+    },
+    {
+      "id": "posix/lfind",
+      "feature_group": "posix.core",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-lfind"
+    },
+    {
+      "id": "posix/locale",
+      "feature_group": "posix.core",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-locale"
+    },
+    {
+      "id": "posix/lsearch",
+      "feature_group": "posix.core",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-lsearch"
+    },
+    {
+      "id": "posix/memccpy",
+      "feature_group": "posix.core",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-memccpy"
+    },
+    {
+      "id": "posix/memrchr",
+      "feature_group": "posix.core",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-memrchr"
+    },
+    {
+      "id": "posix/mkstemp",
+      "feature_group": "posix.vfs",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-mkstemp"
+    },
+    {
+      "id": "posix/nftw",
+      "feature_group": "posix.vfs",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-nftw"
+    },
+    {
+      "id": "posix/nice",
+      "feature_group": "posix.process",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "mlibc-tag:Nice",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "unsupported",
+      "rationale": "mlibc's nice() implementation requires the Nice sysdep, which WosSysdepTags does not expose; WOS priority get/set coverage remains separate."
+    },
+    {
+      "id": "posix/open_memstream",
+      "feature_group": "posix.vfs",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-open_memstream"
+    },
+    {
+      "id": "posix/pause",
+      "feature_group": "posix.signals",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "mlibc-tag:Pause",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "unsupported",
+      "rationale": "mlibc's pause() path requires the Pause sysdep, which WosSysdepTags does not expose; Sigsuspend coverage remains separate."
+    },
+    {
+      "id": "posix/popen",
+      "feature_group": "posix.process",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-popen"
+    },
+    {
+      "id": "posix/posix-timer",
+      "feature_group": "posix.time",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "mlibc-tag:TimerCreate",
+        "mlibc-tag:TimerDelete",
+        "mlibc-tag:TimerGettime",
+        "mlibc-tag:TimerSettime",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "unsupported",
+      "rationale": "WOS does not expose the mlibc TimerCreate, TimerSettime, TimerGettime, or TimerDelete sysdeps."
+    },
+    {
+      "id": "posix/posix_memalign",
+      "feature_group": "posix.core",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-posix_memalign"
+    },
+    {
+      "id": "posix/posix_spawn",
+      "feature_group": "posix.process",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-posix_spawn"
+    },
+    {
+      "id": "posix/protoent",
+      "feature_group": "posix.network",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-protoent"
+    },
+    {
+      "id": "posix/pthread_atfork",
+      "feature_group": "posix.threads",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-pthread_atfork"
+    },
+    {
+      "id": "posix/pthread_attr",
+      "feature_group": "posix.threads",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-pthread_attr"
+    },
+    {
+      "id": "posix/pthread_barrier",
+      "feature_group": "posix.threads",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-pthread_barrier"
+    },
+    {
+      "id": "posix/pthread_cancel",
+      "feature_group": "posix.threads",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "mlibc-tag:Tgkill",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "unsupported",
+      "rationale": "Cross-thread pthread cancellation requires the Tgkill sysdep, which WosSysdepTags does not expose."
+    },
+    {
+      "id": "posix/pthread_cleanup",
+      "feature_group": "posix.threads",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-pthread_cleanup"
+    },
+    {
+      "id": "posix/pthread_cond",
+      "feature_group": "posix.threads",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-pthread_cond"
+    },
+    {
+      "id": "posix/pthread_cond_signal",
+      "feature_group": "posix.threads",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-pthread_cond_signal"
+    },
+    {
+      "id": "posix/pthread_create",
+      "feature_group": "posix.threads",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-pthread_create"
+    },
+    {
+      "id": "posix/pthread_key",
+      "feature_group": "posix.threads",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-pthread_key"
+    },
+    {
+      "id": "posix/pthread_kill",
+      "feature_group": "posix.threads",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "mlibc-tag:Tgkill",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "unsupported",
+      "rationale": "pthread_kill() dispatches through the Tgkill sysdep, which WosSysdepTags does not expose."
+    },
+    {
+      "id": "posix/pthread_mutex",
+      "feature_group": "posix.threads",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-pthread_mutex"
+    },
+    {
+      "id": "posix/pthread_once",
+      "feature_group": "posix.threads",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-pthread_once"
+    },
+    {
+      "id": "posix/pthread_rwlock",
+      "feature_group": "posix.threads",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-pthread_rwlock"
+    },
+    {
+      "id": "posix/pthread_rwlock_timedrdlock",
+      "feature_group": "posix.threads",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-pthread_rwlock_timedrdlock"
+    },
+    {
+      "id": "posix/pthread_rwlock_timedwrlock",
+      "feature_group": "posix.threads",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-pthread_rwlock_timedwrlock"
+    },
+    {
+      "id": "posix/pthread_schedparam",
+      "feature_group": "posix.threads",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "mlibc-tag:GetSchedparam",
+        "mlibc-tag:SetSchedparam",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "unsupported",
+      "rationale": "WOS does not expose the mlibc per-thread GetSchedparam or SetSchedparam sysdeps."
+    },
+    {
+      "id": "posix/pthread_spin",
+      "feature_group": "posix.threads",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-pthread_spin"
+    },
+    {
+      "id": "posix/pthread_thread_local",
+      "feature_group": "posix.threads",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-pthread_thread_local"
+    },
+    {
+      "id": "posix/pwd",
+      "feature_group": "posix.vfs",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-pwd"
+    },
+    {
+      "id": "posix/readv-writev",
+      "feature_group": "posix.vfs",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-readv-writev"
+    },
+    {
+      "id": "posix/realpath",
+      "feature_group": "posix.vfs",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-realpath"
+    },
+    {
+      "id": "posix/regex",
+      "feature_group": "posix.core",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-regex"
+    },
+    {
+      "id": "posix/rindex",
+      "feature_group": "posix.core",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-rindex"
+    },
+    {
+      "id": "posix/rlimits",
+      "feature_group": "posix.vfs",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-rlimits"
+    },
+    {
+      "id": "posix/sched_setscheduler",
+      "feature_group": "posix.process",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "mlibc-tag:GetScheduler",
+        "mlibc-tag:SetScheduler",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "unsupported",
+      "rationale": "WOS does not expose the mlibc GetScheduler or SetScheduler policy sysdeps; priority APIs are covered separately."
+    },
+    {
+      "id": "posix/search",
+      "feature_group": "posix.core",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-search"
+    },
+    {
+      "id": "posix/select",
+      "feature_group": "posix.vfs",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-select"
+    },
+    {
+      "id": "posix/semaphore",
+      "feature_group": "posix.threads",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-semaphore"
+    },
+    {
+      "id": "posix/setpriority",
+      "feature_group": "posix.process",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-setpriority"
+    },
+    {
+      "id": "posix/shm",
+      "feature_group": "posix.vfs",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-shm"
+    },
+    {
+      "id": "posix/sig2str",
+      "feature_group": "posix.signals",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-sig2str"
+    },
+    {
+      "id": "posix/sigaltstack",
+      "feature_group": "posix.signals",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-sigaltstack"
+    },
+    {
+      "id": "posix/sigqueue",
+      "feature_group": "posix.signals",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "mlibc-tag:Sigqueue",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "unsupported",
+      "rationale": "Queued signal values require the Sigqueue sysdep, which WosSysdepTags does not expose."
+    },
+    {
+      "id": "posix/sigsetjmp",
+      "feature_group": "posix.signals",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-sigsetjmp"
+    },
+    {
+      "id": "posix/sigsuspend",
+      "feature_group": "posix.signals",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "mlibc-tag:Sigsuspend",
+        "mlibc-tag:Tgkill",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "unsupported",
+      "rationale": "The case wakes sigsuspend through pthread_kill(), which requires the absent Tgkill sysdep even though WOS exposes Sigsuspend itself."
+    },
+    {
+      "id": "posix/sigtimedwait",
+      "feature_group": "posix.signals",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "mlibc-tag:Sigtimedwait",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "unsupported",
+      "rationale": "Synchronous timed signal dequeue requires the Sigtimedwait sysdep, which WosSysdepTags does not expose."
+    },
+    {
+      "id": "posix/strdupa",
+      "feature_group": "posix.core",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-strdupa"
+    },
+    {
+      "id": "posix/strfmon",
+      "feature_group": "posix.core",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-strfmon"
+    },
+    {
+      "id": "posix/strncpy",
+      "feature_group": "posix.core",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-strncpy"
+    },
+    {
+      "id": "posix/swab",
+      "feature_group": "posix.core",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-swab"
+    },
+    {
+      "id": "posix/system",
+      "feature_group": "posix.process",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-system"
+    },
+    {
+      "id": "posix/time",
+      "feature_group": "posix.time",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-time"
+    },
+    {
+      "id": "posix/timer",
+      "feature_group": "posix.time",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-timer"
+    },
+    {
+      "id": "posix/usershell",
+      "feature_group": "posix.vfs",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-usershell"
+    },
+    {
+      "id": "posix/vfork",
+      "feature_group": "posix.process",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-vfork"
+    },
+    {
+      "id": "posix/waitid",
+      "feature_group": "posix.process",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "mlibc-tag:Waitid",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "unsupported",
+      "rationale": "Populating POSIX siginfo_t child status requires the Waitid sysdep, which WosSysdepTags does not expose; waitpid remains covered."
+    },
+    {
+      "id": "posix/wcpcpy",
+      "feature_group": "posix.core",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-wcpcpy"
+    },
+    {
+      "id": "posix/wcpncpy",
+      "feature_group": "posix.core",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-wcpncpy"
+    },
+    {
+      "id": "posix/wcsdup",
+      "feature_group": "posix.core",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-wcsdup"
+    },
+    {
+      "id": "posix/wcslcat",
+      "feature_group": "posix.core",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-wcslcat"
+    },
+    {
+      "id": "posix/wcslcpy",
+      "feature_group": "posix.core",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-wcslcpy"
+    },
+    {
+      "id": "posix/wcsncasecmp",
+      "feature_group": "posix.core",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-wcsncasecmp"
+    },
+    {
+      "id": "posix/wcwidth",
+      "feature_group": "posix.core",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-wcwidth"
+    },
+    {
+      "id": "posix/wordexp",
+      "feature_group": "posix.vfs",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:wos"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/posix-wordexp"
+    },
+    {
+      "id": "rtld/destroy1",
+      "feature_group": "rtld.dynamic-loader",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:dynamic-loader"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/rtld/rtld-destroy1"
+    },
+    {
+      "id": "rtld/destroy2",
+      "feature_group": "rtld.dynamic-loader",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:dynamic-loader"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/rtld/rtld-destroy2"
+    },
+    {
+      "id": "rtld/dl_iterate_phdr",
+      "feature_group": "rtld.dynamic-loader",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:dynamic-loader"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/rtld/rtld-dl_iterate_phdr"
+    },
+    {
+      "id": "rtld/dladdr_local",
+      "feature_group": "rtld.dynamic-loader",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:dynamic-loader"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/rtld/rtld-dladdr_local"
+    },
+    {
+      "id": "rtld/dt_symbolic",
+      "feature_group": "rtld.dynamic-loader",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:dynamic-loader"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/rtld/rtld-dt_symbolic"
+    },
+    {
+      "id": "rtld/fail-load",
+      "feature_group": "rtld.dynamic-loader",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:dynamic-loader"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/rtld/rtld-fail-load"
+    },
+    {
+      "id": "rtld/ifunc",
+      "feature_group": "rtld.dynamic-loader",
+      "prerequisites": [
+        "compiler-feature:gnu-ifunc",
+        "mlibc-option:posix",
+        "runtime:dynamic-loader"
+      ],
+      "timeout_seconds": 10,
+      "expected": "unsupported",
+      "rationale": "Clang does not expose the GNU IFUNC attribute for the x86_64-pc-wos target, so the resolver symbol cannot be represented without changing the compiler or ABI contract."
+    },
+    {
+      "id": "rtld/ifunc-dlopen",
+      "feature_group": "rtld.dynamic-loader",
+      "prerequisites": [
+        "compiler-feature:gnu-ifunc",
+        "mlibc-option:posix",
+        "runtime:dynamic-loader"
+      ],
+      "timeout_seconds": 10,
+      "expected": "unsupported",
+      "rationale": "Clang does not expose the GNU IFUNC attribute for the x86_64-pc-wos target; dlopen coverage remains provided by the other RTLD cases."
+    },
+    {
+      "id": "rtld/ld_library_path",
+      "feature_group": "rtld.dynamic-loader",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:dynamic-loader"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/rtld/rtld-ld_library_path",
+      "invocations": [
+        {
+          "name": "library-path",
+          "environment": {
+            "LD_LIBRARY_PATH": "/usr/libexec/wos-mlibc-conformance/cases/rtld/ld_library_path"
+          }
+        }
+      ]
+    },
+    {
+      "id": "rtld/no-dt_symbolic",
+      "feature_group": "rtld.dynamic-loader",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:dynamic-loader"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/rtld/rtld-no-dt_symbolic"
+    },
+    {
+      "id": "rtld/noload-promote",
+      "feature_group": "rtld.dynamic-loader",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:dynamic-loader"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/rtld/rtld-noload-promote"
+    },
+    {
+      "id": "rtld/preinit",
+      "feature_group": "rtld.dynamic-loader",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:dynamic-loader"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/rtld/rtld-preinit"
+    },
+    {
+      "id": "rtld/promote-lib",
+      "feature_group": "rtld.dynamic-loader",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:dynamic-loader"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/rtld/rtld-promote-lib"
+    },
+    {
+      "id": "rtld/relr",
+      "feature_group": "rtld.dynamic-loader",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:dynamic-loader"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/rtld/rtld-relr"
+    },
+    {
+      "id": "rtld/rtld_next",
+      "feature_group": "rtld.dynamic-loader",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:dynamic-loader"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/rtld/rtld-rtld_next"
+    },
+    {
+      "id": "rtld/scope1",
+      "feature_group": "rtld.dynamic-loader",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:dynamic-loader"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/rtld/rtld-scope1"
+    },
+    {
+      "id": "rtld/scope2",
+      "feature_group": "rtld.dynamic-loader",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:dynamic-loader"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/rtld/rtld-scope2"
+    },
+    {
+      "id": "rtld/scope3",
+      "feature_group": "rtld.dynamic-loader",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:dynamic-loader"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/rtld/rtld-scope3"
+    },
+    {
+      "id": "rtld/scope4",
+      "feature_group": "rtld.dynamic-loader",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:dynamic-loader"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/rtld/rtld-scope4"
+    },
+    {
+      "id": "rtld/scope5",
+      "feature_group": "rtld.dynamic-loader",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:dynamic-loader"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/rtld/rtld-scope5"
+    },
+    {
+      "id": "rtld/search-order",
+      "feature_group": "rtld.dynamic-loader",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:dynamic-loader"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/rtld/rtld-search-order",
+      "invocations": [
+        {
+          "name": "empty-library-path",
+          "environment": {
+            "LD_LIBRARY_PATH": ""
+          }
+        }
+      ]
+    },
+    {
+      "id": "rtld/soname",
+      "feature_group": "rtld.dynamic-loader",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:dynamic-loader"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/rtld/rtld-soname"
+    },
+    {
+      "id": "rtld/symver",
+      "feature_group": "rtld.dynamic-loader",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:dynamic-loader"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/rtld/rtld-symver"
+    },
+    {
+      "id": "rtld/tls_align",
+      "feature_group": "rtld.dynamic-loader",
+      "prerequisites": [
+        "mlibc-option:posix",
+        "runtime:dynamic-loader"
+      ],
+      "timeout_seconds": 10,
+      "expected": "pass",
+      "artifact": "cases/rtld/rtld-tls_align"
+    }
+  ],
+  "port_smokes": [
+    {
+      "id": "busybox",
+      "timeout_seconds": 10,
+      "command": [
+        "/usr/bin/busybox",
+        "printf",
+        "busybox-conformance-smoke\\n"
+      ],
+      "rationale": "Exercises the installed BusyBox multicall binary and basic libc stdio/write behavior."
+    },
+    {
+      "id": "dropbear",
+      "timeout_seconds": 10,
+      "command": [
+        "/usr/bin/dropbear",
+        "-V"
+      ],
+      "rationale": "Exercises the installed Dropbear binary, loader, option parsing, and version output without opening a listener."
+    },
+    {
+      "id": "bash",
+      "timeout_seconds": 10,
+      "command": [
+        "/usr/bin/bash",
+        "--noprofile",
+        "--norc",
+        "-c",
+        "printf 'bash-conformance-smoke\\n'"
+      ],
+      "rationale": "Exercises dynamic loading plus bounded Bash parsing and builtin output."
+    },
+    {
+      "id": "python",
+      "timeout_seconds": 20,
+      "command": [
+        "/usr/bin/python3",
+        "-c",
+        "import json; print(json.dumps({'wos':'python-conformance-smoke'}, sort_keys=True))"
+      ],
+      "rationale": "Exercises the installed CPython runtime and a standard-library extension-free module."
+    },
+    {
+      "id": "cmake",
+      "timeout_seconds": 60,
+      "command": [
+        "/usr/bin/cmake",
+        "--version"
+      ],
+      "rationale": "Exercises the installed native CMake executable and its startup/runtime dependencies."
+    },
+    {
+      "id": "git",
+      "timeout_seconds": 30,
+      "command": [
+        "/usr/bin/git",
+        "--version"
+      ],
+      "rationale": "Exercises the installed Git executable and bounded version-query path without repository or network mutation."
+    }
+  ]
+}

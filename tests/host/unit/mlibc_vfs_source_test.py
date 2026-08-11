@@ -6,6 +6,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 WOS_VFS_H = ROOT / "toolchain" / "src" / "mlibc" / "sysdeps" / "wos" / "include" / "sys" / "vfs.h"
+WOS_VFS_CALLNUMS = ROOT / "toolchain" / "src" / "mlibc" / "sysdeps" / "wos" / "include" / "callnums" / "vfs.h"
 WOS_SYSDEPS_CPP = ROOT / "toolchain" / "src" / "mlibc" / "sysdeps" / "wos" / "generic" / "sysdeps.cpp"
 WOS_FD_H = ROOT / "toolchain" / "src" / "mlibc" / "options" / "wos" / "include" / "wos" / "fd.h"
 WOS_FD_CPP = ROOT / "toolchain" / "src" / "mlibc" / "options" / "wos" / "generic" / "fd.cpp"
@@ -119,7 +120,7 @@ def test_mlibc_vfs_wrappers_pass_fd_creation_flags_to_kernel() -> None:
     require_tokens(
         dup2_body,
         [
-            "static_cast<uint64_t>(ops::dup2)",
+            "static_cast<uint64_t>(ops::DUP2)",
             "static_cast<uint64_t>(oldfd)",
             "static_cast<uint64_t>(newfd)",
             "static_cast<uint64_t>(flags)",
@@ -131,7 +132,7 @@ def test_mlibc_vfs_wrappers_pass_fd_creation_flags_to_kernel() -> None:
     require_tokens(
         pipe_body,
         [
-            "static_cast<uint64_t>(ops::pipe)",
+            "static_cast<uint64_t>(ops::PIPE)",
             "reinterpret_cast<uint64_t>(pipefd)",
             "static_cast<uint64_t>(flags)",
         ],
@@ -164,7 +165,11 @@ def test_wos_fstat_close_abi_consumes_each_fd_once() -> None:
     )
 
     mlibc_vfs = WOS_VFS_H.read_text()
-    require_order(mlibc_vfs, ["\tfchownat,", "\tfstat_close,"], "mlibc fstat-close operation mirror")
+    require_order(
+        WOS_VFS_CALLNUMS.read_text(),
+        ["\tFCHOWNAT,", "\tFSTAT_CLOSE,"],
+        "mlibc fstat-close operation mirror",
+    )
     low_level_body = function_body(
         mlibc_vfs,
         r"static\s+inline\s+int\s+fstat_close_fd\(int\s+fd,\s*void\s+\*statbuf,\s*int\s+\*stat_result\)",
@@ -172,7 +177,7 @@ def test_wos_fstat_close_abi_consumes_each_fd_once() -> None:
     require_tokens(
         low_level_body,
         [
-            "static_cast<uint64_t>(ops::fstat_close)",
+            "static_cast<uint64_t>(ops::FSTAT_CLOSE)",
             "static_cast<uint64_t>(fd)",
             "reinterpret_cast<uint64_t>(statbuf)",
             "reinterpret_cast<uint64_t>(stat_result)",
@@ -273,14 +278,18 @@ def test_wos_metadata_batch_abi_preflights_before_effects() -> None:
 
     mlibc_vfs = WOS_VFS_H.read_text()
     require_tokens(
+        WOS_VFS_CALLNUMS.read_text(),
+        ["static_assert(static_cast<uint64_t>(ops::METADATA_BATCH) == 62)"],
+        "mlibc metadata-batch operation mirror",
+    )
+    require_tokens(
         mlibc_vfs,
         [
-            "static_assert(static_cast<uint64_t>(ops::metadata_batch) == 62)",
             "static_assert(sizeof(metadata_batch_entry) == 16)",
             "static_assert(offsetof(metadata_batch_result, statbuf) == 8)",
             "static_assert(sizeof(metadata_batch_result) == 152)",
             "callers must not replay mutating entries",
-            "static_cast<uint64_t>(ops::metadata_batch)",
+            "static_cast<uint64_t>(ops::METADATA_BATCH)",
         ],
         "mlibc metadata-batch ABI mirror",
     )
@@ -348,7 +357,7 @@ def test_pselect_uses_dense_pollfds_and_handles_empty_sets() -> None:
             "if (timeout_ms == 0)",
             "if (timeout_ms < 0)",
             "ker::process::sigsuspend(wait_mask)",
-            "ker::abi::sys_time_ops::nanosleep",
+            "ker::abi::sys_time_ops::NANOSLEEP",
             "ker::process::sigprocmask(SIG_SETMASK, sigmask, &old_mask)",
             "ker::process::sigprocmask(SIG_SETMASK, &old_mask, nullptr)",
         ],
@@ -466,7 +475,7 @@ def test_utimensat_reaches_real_vfs_timestamp_updates() -> None:
     )
 
     header = WOS_VFS_H.read_text()
-    require_order(header, ["statat,", "utimensat,"], "WOS mlibc VFS op enum")
+    require_order(WOS_VFS_CALLNUMS.read_text(), ["\tSTATAT,", "\tUTIMENSAT,"], "WOS mlibc VFS op enum")
     wrapper_body = function_body(
         header,
         r"static\s+inline\s+int\s+utimensat_path\(int\s+dirfd,\s*const\s+char\s+\*path,\s*const\s+void\s+\*times,\s*int\s+flags\)",
@@ -474,7 +483,7 @@ def test_utimensat_reaches_real_vfs_timestamp_updates() -> None:
     require_tokens(
         wrapper_body,
         [
-            "static_cast<uint64_t>(ops::utimensat)",
+            "static_cast<uint64_t>(ops::UTIMENSAT)",
             "static_cast<uint64_t>(dirfd)",
             "reinterpret_cast<uint64_t>(path)",
             "reinterpret_cast<uint64_t>(times)",

@@ -276,6 +276,13 @@ if(WOS_KASAN)
         -fno-sanitize=all
         -fno-sanitize-coverage=trace-pc
     )
+    # -fno-sanitize=all also disables KCFI and removes the type hashes that
+    # instrumented indirect callers validate.  Early-runtime files still
+    # participate in callback tables (for example, journal CharDeviceOps), so
+    # retain KCFI metadata while keeping memory/UB sanitizers and KCOV off.
+    if(WOS_KCFI)
+        list(APPEND KASAN_EXCLUDED_COMPILE_OPTIONS -fsanitize=kcfi)
+    endif()
     set(KASAN_EXCLUDED_SRCS
         # Early boot / logging (runs before any shadow pages exist)
         src/platform/dbg/dbg.cpp

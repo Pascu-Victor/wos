@@ -14,6 +14,7 @@ SYS_VMEM_CPP = ROOT / "modules" / "kern" / "src" / "syscalls_impl" / "vmem" / "s
 KERNEL_VMEM_ABI = ROOT / "modules" / "kern" / "src" / "abi" / "callnums" / "vmem.h"
 MLIBC_VFS_H = ROOT / "toolchain" / "src" / "mlibc" / "sysdeps" / "wos" / "include" / "sys" / "vfs.h"
 MLIBC_VMEM_H = ROOT / "toolchain" / "src" / "mlibc" / "sysdeps" / "wos" / "include" / "sys" / "vmem.h"
+MLIBC_VMEM_CALLNUMS_H = ROOT / "toolchain" / "src" / "mlibc" / "sysdeps" / "wos" / "include" / "callnums" / "vmem.h"
 MLIBC_SYSDEPS_CPP = ROOT / "toolchain" / "src" / "mlibc" / "sysdeps" / "wos" / "generic" / "sysdeps.cpp"
 MLIBC_SYSDEPS_HPP = ROOT / "toolchain" / "src" / "mlibc" / "sysdeps" / "wos" / "include" / "mlibc" / "sysdeps.hpp"
 MLIBC_SWAP_H = ROOT / "toolchain" / "src" / "mlibc" / "options" / "wos" / "include" / "sys" / "swap.h"
@@ -177,6 +178,7 @@ def test_swap_backings_are_local_block_or_xfs_and_swapoff_checks_use() -> None:
 def test_swapon_swapoff_are_appended_kernel_and_mlibc_abi_ops() -> None:
     kernel_abi = KERNEL_VMEM_ABI.read_text()
     mlibc_vmem = MLIBC_VMEM_H.read_text()
+    mlibc_vmem_callnums = MLIBC_VMEM_CALLNUMS_H.read_text()
     sys_vmem = SYS_VMEM_CPP.read_text()
     sysdeps_cpp = MLIBC_SYSDEPS_CPP.read_text()
     sysdeps_hpp = MLIBC_SYSDEPS_HPP.read_text()
@@ -186,11 +188,20 @@ def test_swapon_swapoff_are_appended_kernel_and_mlibc_abi_ops() -> None:
     require_order(kernel_abi, "MSYNC,", "SWAPON,", "kernel VMEM ABI appends SWAPON after MSYNC")
     require_order(kernel_abi, "SWAPON,", "SWAPOFF,", "kernel VMEM ABI appends SWAPOFF after SWAPON")
     require_tokens(
+        mlibc_vmem_callnums,
+        [
+            "MSYNC = 4,",
+            "SWAPON = 5,",
+            "SWAPOFF = 6,",
+            "msync = MSYNC,",
+            "swapon = SWAPON,",
+            "swapoff = SWAPOFF,",
+        ],
+        "mlibc VMEM operation ABI",
+    )
+    require_tokens(
         mlibc_vmem,
         [
-            "msync = 4,",
-            "swapon = 5,",
-            "swapoff = 6,",
             "static inline int64_t swapon(const char *path, int flags)",
             "static inline int64_t swapoff(const char *path)",
         ],

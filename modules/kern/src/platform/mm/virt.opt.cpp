@@ -569,6 +569,15 @@ auto handle_lazy_vmem_fault(sched::task::Task* task, uint64_t vaddr, const pagin
                 ker::vfs::vfs_retain_file(file_range.file);
             }
             task->lazy_vmem_lock.unlock_irqrestore(IRQF);
+#ifdef WOS_KASAN
+            if (kasan::is_enabled()) {
+                // This translation unit is intentionally excluded from KASAN
+                // instrumentation, so its stack slots can retain stale shadow
+                // poison.  The materializer is instrumented and must receive
+                // an addressable snapshot.
+                kasan::unpoison_range(&file_range, sizeof(file_range));
+            }
+#endif
             bool const OK = ker::syscall::vmem::materialize_lazy_file_page(task, file_range, PAGE_VADDR, fault);
             if (file_range.file != nullptr) {
                 ker::vfs::vfs_put_file(file_range.file);

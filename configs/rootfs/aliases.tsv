@@ -1,5 +1,7 @@
 # action<TAB>source<TAB>target[<TAB>mode for copy-mode]
 copy	configs/rootfs/etc/services	/etc/services
+copy	configs/rootfs/etc/protocols	/etc/protocols
+copy	configs/rootfs/etc/hosts	/etc/hosts
 copy	configs/rootfs/etc/resolv.conf	/etc/resolv.conf
 copy	configs/rootfs/etc/inputrc	/etc/inputrc
 copy	configs/rootfs/etc/termcap	/etc/termcap
@@ -96,6 +98,7 @@ copy-glob	toolchain/sysroot/bin/verify-uselistorder	/usr/bin
 copy-glob	toolchain/sysroot/bin/wasm-ld	/usr/bin
 copy-glob	toolchain/sysroot/bin/yaml2obj	/usr/bin
 copy	toolchain/sysroot/bin/x86_64-pc-wos.cfg	/usr/bin/x86_64-pc-wos.cfg
+copy	build/mlibc-conformance-stage	/usr/libexec/wos-mlibc-conformance
 copy	toolchain/sysroot/lib/clang	/usr/lib/clang
 copy	toolchain/sysroot/bin/cmake	/usr/bin/cmake
 copy	toolchain/sysroot/bin/ctest	/usr/bin/ctest

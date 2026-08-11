@@ -33,6 +33,11 @@ def main() -> None:
             "hostname='wos-1'\neth0 configured with IP 10.10.0.236\n",
             encoding="utf-8",
         )
+        (root / "ktest-data").mkdir()
+        (root / "ktest-data" / "serial-vm0.log").write_text(
+            "hostname='wos-ktest'\neth0 configured: ip=10.10.0.237 mask=255.255.255.0\n",
+            encoding="utf-8",
+        )
 
         expected = {
             "vm0": "10.10.0.235",
@@ -40,6 +45,8 @@ def main() -> None:
             "wos-0.wos": "10.10.0.235",
             "vm1": "10.10.0.236",
             "wos-1": "10.10.0.236",
+            "wos-ktest": "10.10.0.237",
+            "wos-ktest.wos": "10.10.0.237",
             "10.10.0.99": "10.10.0.99",
             "unknown": "unknown",
         }
@@ -51,7 +58,7 @@ def main() -> None:
         if resolver.resolve_path("/wki/vm0/tmp/file") != "/wki/wos-0/tmp/file":
             raise AssertionError("VM path aliases must still resolve through the matching hostname")
 
-    print("WOS resolver accepts legacy and current netd IPv4 log formats")
+    print("WOS resolver accepts cluster and isolated KTEST logs in both netd IPv4 formats")
 
 
 if __name__ == "__main__":

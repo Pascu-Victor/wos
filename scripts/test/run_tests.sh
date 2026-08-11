@@ -146,6 +146,8 @@ UNIT_TESTS=(
     mlibc_dns_source_test
     mlibc_spawn_source_test
     mlibc_vfs_source_test
+    mlibc_conformance_test
+    wos_abi_parity_test
     netd_dns_source_test
     socket_ring_source_test
     socket_nonblock_source_test

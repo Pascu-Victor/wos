@@ -205,8 +205,13 @@ def test_allocator_is_decoupled_and_boot_hooks_are_safe() -> None:
     cmake = (ROOT / "modules" / "kern" / "CMakeLists.txt").read_text()
     require_order(mm_init, ["phys::init(memmap_request.response)", "reclaim::init()", "virt::init("], "early coordinator init")
     require_order(smt, ["sched::start_gc_worker()", "mm::reclaim::start_worker()"], "post-scheduler worker start")
-    kasan_block = re.search(r"if\(WOS_KASAN\)(?P<body>.*?)endif\(\)", cmake, re.DOTALL)
-    if kasan_block is None or "src/platform/mm/reclaim.cpp" not in kasan_block.group("body"):
+    kasan_sources_start = cmake.find("set(KASAN_EXCLUDED_SRCS")
+    kasan_sources_end = cmake.find("\n    )", kasan_sources_start)
+    if (
+        kasan_sources_start < 0
+        or kasan_sources_end < 0
+        or "src/platform/mm/reclaim.cpp" not in cmake[kasan_sources_start:kasan_sources_end]
+    ):
         fail("early reclaim coordinator must remain excluded from KASAN instrumentation")
 
 

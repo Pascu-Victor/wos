@@ -12,6 +12,13 @@ enum class ops : uint64_t {
     MSYNC,
     SWAPON,
     SWAPOFF,
+    anon_allocate = ANON_ALLOCATE,
+    anon_free = ANON_FREE,
+    protect = PROTECT,
+    mremap = MREMAP,
+    msync = MSYNC,
+    swapon = SWAPON,
+    swapoff = SWAPOFF,
 };
 
 // Protection flags (matching Linux mmap)

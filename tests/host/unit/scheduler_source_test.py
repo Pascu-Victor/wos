@@ -2191,10 +2191,11 @@ def test_loadavg_does_not_count_interruptible_wait_channels() -> None:
         blocked_body,
         [
             "task->sched_queue != task::Task::sched_queue::WAITING",
-            "task->wait_channel == nullptr",
             "task->ptrace_stopped",
+            "char const* const WAIT_CHANNEL = task->wait_channel",
+            "WAIT_CHANNEL == nullptr",
             "task->wait_channel_kind == task::WaitChannelKind::GENERIC",
-            'std::strcmp(task->wait_channel, "dirty_bcache") == 0',
+            'std::strcmp(WAIT_CHANNEL, "dirty_bcache") == 0',
         ],
         "loadavg blocked classifier must not count every named wait channel",
     )

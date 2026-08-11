@@ -12,5 +12,11 @@ enum class sys_time_ops : uint64_t {
     TIMES = 3,
     SETITIMER = 4,
     GETITIMER = 5,
+    gettimeofday = GETTIMEOFDAY,
+    clock_gettime = CLOCK_GETTIME,
+    nanosleep = NANOSLEEP,
+    times = TIMES,
+    setitimer = SETITIMER,
+    getitimer = GETITIMER,
 };
 }  // namespace ker::abi

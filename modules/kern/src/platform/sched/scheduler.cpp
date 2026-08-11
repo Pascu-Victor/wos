@@ -8315,7 +8315,12 @@ auto loadavg_task_is_runnable(task::Task const* task) -> bool {
 }
 
 auto loadavg_wait_channel_counts_as_uninterruptible(task::Task const* task) -> bool {
-    if (task == nullptr || task->sched_queue != task::Task::sched_queue::WAITING || task->wait_channel == nullptr || task->ptrace_stopped) {
+    if (task == nullptr || task->sched_queue != task::Task::sched_queue::WAITING || task->ptrace_stopped) {
+        return false;
+    }
+
+    char const* const WAIT_CHANNEL = task->wait_channel;
+    if (WAIT_CHANNEL == nullptr) {
         return false;
     }
 
@@ -8323,7 +8328,7 @@ auto loadavg_wait_channel_counts_as_uninterruptible(task::Task const* task) -> b
     // waits, not every named interruptible sleep. WOS currently names ordinary
     // waitpid/poll/pipe/futex sleeps, so classify only known I/O throttle waits
     // as blocked load until the scheduler grows an explicit D-state bit.
-    return task->wait_channel_kind == task::WaitChannelKind::GENERIC && std::strcmp(task->wait_channel, "dirty_bcache") == 0;
+    return task->wait_channel_kind == task::WaitChannelKind::GENERIC && std::strcmp(WAIT_CHANNEL, "dirty_bcache") == 0;
 }
 }  // namespace
 

@@ -847,8 +847,13 @@ auto wos_proc_sigaltstack(const KernelStackT* ss, KernelStackT* old_ss, ker::mod
         return 0;
     }
 
-    uint64_t const STACK_ADDR = reinterpret_cast<uint64_t>(new_ss.ss_sp);
+    auto const STACK_ADDR = reinterpret_cast<uint64_t>(new_ss.ss_sp);
     if (STACK_ADDR == 0 || !ker::mod::sys::usercopy::range_valid(STACK_ADDR, new_ss.ss_size)) {
+        return static_cast<uint64_t>(-EFAULT);
+    }
+    uint64_t const ALT_STACK_TOP = STACK_ADDR + new_ss.ss_size;
+    uint64_t const FRAME_ADDR = ker::mod::sys::signal::signal_frame_address(ALT_STACK_TOP);
+    if (!ker::mod::sys::usercopy::ensure_writable(*task, FRAME_ADDR, sizeof(ker::mod::sys::signal::SignalFrame))) {
         return static_cast<uint64_t>(-EFAULT);
     }
 

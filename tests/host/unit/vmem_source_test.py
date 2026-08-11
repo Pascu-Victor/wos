@@ -499,6 +499,22 @@ def test_user_memory_pressure_does_not_enter_fatal_oom() -> None:
     )
 
 
+def test_kasan_excluded_lazy_file_snapshot_is_unpoisoned_after_unlock() -> None:
+    lazy_body = function_body(VIRT_CPP.read_text(), "handle_lazy_vmem_fault")
+    require_ordered_tokens(
+        lazy_body,
+        [
+            "auto file_range = range;",
+            "ker::vfs::vfs_retain_file(file_range.file);",
+            "task->lazy_vmem_lock.unlock_irqrestore(IRQF);",
+            "if (kasan::is_enabled())",
+            "kasan::unpoison_range(&file_range, sizeof(file_range));",
+            "ker::syscall::vmem::materialize_lazy_file_page(task, file_range, PAGE_VADDR, fault)",
+        ],
+        "KASAN-excluded lazy file snapshot boundary",
+    )
+
+
 def test_file_mmap_cache_is_sharded_without_changing_page_ownership() -> None:
     vmem = SYS_VMEM_CPP.read_text()
     require_tokens(
@@ -710,6 +726,7 @@ def main() -> None:
     test_page_table_pool_duplicate_release_does_not_fall_through_to_page_free()
     test_mapping_replacement_releases_displaced_reference_after_tlb_flush()
     test_user_memory_pressure_does_not_enter_fatal_oom()
+    test_kasan_excluded_lazy_file_snapshot_is_unpoisoned_after_unlock()
     test_default_writable_anon_mmap_is_demand_paged()
     test_thread_publication_is_serialized_with_shared_vmem_updates()
     print("vmem mmap, owned-frame, and COW invariants hold")
