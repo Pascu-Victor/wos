@@ -30,6 +30,7 @@
 #include "platform/mm/mm.hpp"
 #include "platform/mm/paging.hpp"
 #include "platform/mm/physical_balance.hpp"
+#include "platform/mm/reclaim.hpp"
 #include "platform/mm/tlb_shootdown.hpp"
 #include "platform/mm/virt.hpp"
 #include "platform/sched/scheduler.hpp"
@@ -40,26 +41,6 @@ namespace {
 // Forward declaration - we'll get kernel pagemap physical address once during init
 uint64_t kernel_cr3 = 0;
 }  // anonymous namespace
-
-namespace ker::vfs::tmpfs {
-auto tmpfs_reclaim_pages(size_t target_pages) -> size_t;
-}
-
-namespace ker::vfs {
-auto reclaim_clean_buffer_cache_for_pressure(size_t byte_budget) -> size_t;
-}
-
-namespace ker::vfs::xfs {
-auto xfs_icache_reclaim_for_pressure(size_t max_inodes) -> size_t;
-}
-
-namespace ker::syscall::vmem {
-auto file_mmap_cache_reclaim(size_t max_pages) -> size_t;
-}
-
-namespace ker::net {
-auto pkt_pool_reclaim_for_pressure() -> size_t;
-}
 
 namespace ker::mod::mm::phys {
 
@@ -97,10 +78,6 @@ constexpr size_t MAX_ZONE_LOOKUP_ENTRIES = 128;
 std::array<ZoneLookupEntry, MAX_ZONE_LOOKUP_ENTRIES> regular_zone_lookup{};
 size_t regular_zone_lookup_count = 0;
 bool regular_zone_lookup_ready = false;
-constexpr size_t PAGE_ALLOC_BUFFER_RECLAIM_MIN_BYTES = size_t{8} * 1024 * 1024;
-constexpr size_t PAGE_ALLOC_BUFFER_RECLAIM_MAX_BYTES = size_t{64} * 1024 * 1024;
-constexpr uint64_t PAGE_ALLOC_RECLAIM_RESERVE_BYTES = uint64_t{256} * 1024 * 1024;
-
 // Runtime task creation must not depend on an order-7 block surviving in the
 // general buddy allocator. A build workload can leave gigabytes free while
 // fragmenting every regular zone below the 512 KiB kernel-stack order.
@@ -281,7 +258,7 @@ constexpr std::array<PhysicalOwnerDescriptor, PHYSICAL_PAGE_OWNER_COUNT> PHYSICA
      PhysicalOwnerReclaimability::PERMANENT, "one 256 KiB BufHead arena after first use"},
     {PhysicalPageOwner::BUFFER_CACHE_METADATA, "buffer_cache_metadata", "BufHead object lifetime",
      PhysicalOwnerReclaimability::PRESSURE_RECLAIM, "arenas containing live buffer objects"},
-    {PhysicalPageOwner::TMPFS_DATA, "tmpfs_data", "tmpfs inode/block lifetime", PhysicalOwnerReclaimability::OWNER_TEARDOWN,
+    {PhysicalPageOwner::TMPFS_DATA, "tmpfs_data", "tmpfs inode/block lifetime", PhysicalOwnerReclaimability::PRESSURE_RECLAIM,
      "bounded by live tmpfs file data and mount capacity"},
     {PhysicalPageOwner::XFS_INODE_METADATA_RESERVE, "xfs_inode_metadata_reserve", "boot-to-shutdown allocator reserve",
      PhysicalOwnerReclaimability::PERMANENT, "one 256 KiB inode-object arena after first use"},
@@ -997,6 +974,37 @@ auto snapshot_zones(ZoneSnapshot* out, size_t max_rows) -> size_t {
         }
 
         out[rows++] = snap;
+    }
+    return rows;
+}
+
+auto snapshot_reclaim_zones(ReclaimZoneSnapshot* out, size_t max_rows) -> size_t {
+    if (out == nullptr || max_rows == 0) {
+        return 0;
+    }
+
+    size_t rows = 0;
+    for (paging::PageZone const* zone = zones; zone != nullptr && rows < max_rows; zone = zone->next) {
+        if (zone->allocator == nullptr) {
+            continue;
+        }
+
+        auto* const ALLOCATOR = zone->allocator;
+        uint64_t const FLAGS = ALLOCATOR->lock_irq();
+        int largest_free_order = -1;
+        for (int order = PageAllocator::MAX_ORDER; order >= 0; --order) {
+            if (ALLOCATOR->free_list.at(static_cast<size_t>(order)) != nullptr) {
+                largest_free_order = order;
+                break;
+            }
+        }
+        out[rows++] = ReclaimZoneSnapshot{
+            .zone = zone->zone_num,
+            .total_pages = ALLOCATOR->usable_pages,
+            .free_pages = ALLOCATOR->free_count,
+            .largest_free_order = largest_free_order,
+        };
+        ALLOCATOR->unlock_irq(FLAGS);
     }
     return rows;
 }
@@ -1729,8 +1737,9 @@ auto page_alloc_impl(PhysicalPageOwner owner, uint64_t size, std::string_view na
     if (!physical_page_owner_is_valid(owner)) {
         ker::mod::dbg::panic_handler("physical allocation requires a concrete owner");
     }
+    int requested_order = 0;
     [[maybe_unused]] uint64_t requested_pages = 0;
-    if (!page_alloc_size_within_buddy_limit(size, requested_pages)) {
+    if (!page_alloc_order_for_size(size, requested_order, requested_pages)) {
         return nullptr;
     }
 #ifdef WOS_PHYS_ALLOC_CALLER_STATS
@@ -1745,6 +1754,7 @@ auto page_alloc_impl(PhysicalPageOwner owner, uint64_t size, std::string_view na
     if (size == paging::PAGE_SIZE) {
         void* const CACHED_PAGE = try_alloc_from_per_cpu_cache(owner, CALLER_TAG, zeroing, caller_addr);
         if (CACHED_PAGE != nullptr) {
+            reclaim::note_allocation(0, 1);
             return CACHED_PAGE;
         }
     }
@@ -1803,68 +1813,61 @@ auto page_alloc_impl(PhysicalPageOwner owner, uint64_t size, std::string_view na
 #ifdef WOS_PHYS_ALLOC_CALLER_STATS
     record_page_alloc_caller(caller_addr, requested_pages);
 #endif
+    reclaim::note_allocation(static_cast<uint8_t>(requested_order), std::max<uint64_t>(requested_pages, 1));
     return block;
 }
 
-auto can_wait_for_reclaim() -> bool {
+auto can_wait_for_reclaim_impl() -> bool {
     // Reclaim wait loops eventually enter kern_yield(), which is only safe from
     // a normal task context. Exception handlers such as the COW page-fault path
     // arrive with IF cleared; yielding there can hand the CPU to the timer
     // interrupt and later attempt an iretq back into an in-flight fault frame.
-    return sched::has_run_queues() && sched::preempt_count() == 0 && sched::interrupts_enabled();
-}
-
-auto page_alloc_buffer_reclaim_budget(uint64_t requested_pages) -> size_t {
-    uint64_t const REQUEST_BYTES = requested_pages * paging::PAGE_SIZE;
-    uint64_t const BUDGET =
-        std::clamp<uint64_t>(REQUEST_BYTES * 16, PAGE_ALLOC_BUFFER_RECLAIM_MIN_BYTES, PAGE_ALLOC_BUFFER_RECLAIM_MAX_BYTES);
-    return static_cast<size_t>(BUDGET);
+    if (!sched::has_run_queues() || !sched::can_query_current_task() || sched::preempt_count() != 0 || !sched::interrupts_enabled() ||
+        io::serial::is_panic_mode()) {
+        return false;
+    }
+    auto* const CURRENT = sched::get_current_task();
+    return CURRENT != nullptr && !CURRENT->scheduler_transition_active.load(std::memory_order_acquire) && !CURRENT->deferred_task_switch &&
+           !CURRENT->wants_block && !CURRENT->waitpid_publish_pending.load(std::memory_order_acquire);
 }
 
 auto page_alloc_with_reclaim_impl(PhysicalPageOwner owner, uint64_t size, std::string_view name, ReturnedPageZeroing zeroing,
                                   void* caller_addr, uint32_t retry_count, bool log_oom) -> void* {
+    int requested_order = 0;
     uint64_t requested_pages = 0;
-    if (!page_alloc_size_within_buddy_limit(size, requested_pages)) {
+    if (!page_alloc_order_for_size(size, requested_order, requested_pages)) {
         return nullptr;
     }
+    requested_pages = std::max<uint64_t>(requested_pages, 1);
 
-    bool const CAN_RECLAIM = can_wait_for_reclaim();
-    if (CAN_RECLAIM && !page_alloc_can_satisfy(size, PAGE_ALLOC_RECLAIM_RESERVE_BYTES)) {
-        // Kernel-vmap users cache stable order-0 mappings so hot allocation
-        // cycles avoid a global TLB shootdown. Under physical pressure, purge
-        // those free mappings before asking subsystems to evict live objects.
-        virt::drain_kernel_vmap_frees();
-        if (!page_alloc_can_satisfy(size, PAGE_ALLOC_RECLAIM_RESERVE_BYTES)) {
-            static_cast<void>(ker::vfs::reclaim_clean_buffer_cache_for_pressure(PAGE_ALLOC_BUFFER_RECLAIM_MAX_BYTES));
-        }
+    bool const CAN_RECLAIM = can_wait_for_reclaim_impl();
+    uint32_t const RECLAIM_PASS_LIMIT = std::min(retry_count, reclaim::DIRECT_RECLAIM_MAX_PASSES);
+    uint32_t reclaim_passes = 0;
+    bool nested_reclaim = false;
+    if (CAN_RECLAIM && RECLAIM_PASS_LIMIT != 0) {
+        reclaim::ReclaimRunResult const PREFLIGHT = reclaim::reclaim_for_allocation(static_cast<uint8_t>(requested_order), requested_pages);
+        nested_reclaim = PREFLIGHT.recursion_avoided;
+        reclaim_passes++;
     }
 
-    for (uint32_t attempt = 0; attempt < retry_count; ++attempt) {
+    for (uint32_t attempt = 0; attempt < RECLAIM_PASS_LIMIT; ++attempt) {
         void* const PAGE = page_alloc_impl(owner, size, name, zeroing, caller_addr, false);
         if (PAGE != nullptr) {
             return PAGE;
         }
-        if (!CAN_RECLAIM) {
+        if (!CAN_RECLAIM || nested_reclaim || reclaim_passes >= RECLAIM_PASS_LIMIT) {
             break;
         }
-        uint32_t const RECLAIMED = sched::reclaim_memory_pressure();
-        if (RECLAIMED == 0) {
-            if (ker::vfs::reclaim_clean_buffer_cache_for_pressure(page_alloc_buffer_reclaim_budget(requested_pages)) != 0) {
-                continue;
+        reclaim::ReclaimRunResult const RECLAIM = reclaim::reclaim_for_allocation(static_cast<uint8_t>(requested_order), requested_pages);
+        reclaim_passes++;
+        if (!RECLAIM.made_progress) {
+            reclaim::request_background(static_cast<uint8_t>(requested_order), requested_pages);
+            // A shrinker that allocates may re-enter this path. The
+            // coordinator detects that recursion; do not yield or retry while
+            // the outer callback may still hold subsystem locks.
+            if (RECLAIM.recursion_avoided) {
+                break;
             }
-            if (ker::syscall::vmem::file_mmap_cache_reclaim(32) != 0) {
-                continue;
-            }
-            if (ker::vfs::xfs::xfs_icache_reclaim_for_pressure(32) != 0) {
-                continue;
-            }
-            if (ker::net::pkt_pool_reclaim_for_pressure() != 0) {
-                continue;
-            }
-            if (ker::vfs::tmpfs::tmpfs_reclaim_pages(32) != 0) {
-                continue;
-            }
-            sched::request_gc_memory_pressure();
             sched::kern_yield_impl(reinterpret_cast<uint64_t>(caller_addr));
         }
     }
@@ -1889,6 +1892,8 @@ void write_hex_field(const char* label, uint64_t value) {
 }
 
 }  // namespace
+
+auto can_wait_for_reclaim() -> bool { return can_wait_for_reclaim_impl(); }
 
 auto page_alloc(PhysicalPageOwner owner, uint64_t size, std::string_view name) -> void* {
     return page_alloc_impl(owner, size, name, ReturnedPageZeroing::ZERO, __builtin_return_address(0), true);

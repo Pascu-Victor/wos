@@ -21,6 +21,7 @@
 #include <platform/ktime/ktime.hpp>
 #include <platform/mm/page_alloc.hpp>
 #include <platform/mm/phys.hpp>
+#include <platform/mm/reclaim.hpp>
 #include <platform/perf/perf_events.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sys/mutex.hpp>
@@ -87,6 +88,7 @@ std::atomic<uint64_t> icache_reclaim_buckets_scanned{0};
 std::atomic<uint64_t> icache_reclaim_victims{0};
 std::atomic<uint64_t> icache_reclaim_us{0};
 std::atomic<uint64_t> icache_reclaim_max_us{0};
+std::atomic<bool> icache_shrinker_registered{false};
 
 constexpr size_t XFS_INODE_ARENA_BYTES = size_t{256} * 1024;
 constexpr size_t XFS_INODE_STRIDE = (sizeof(XfsInode) + alignof(XfsInode) - 1) & ~(alignof(XfsInode) - 1);
@@ -469,7 +471,15 @@ void free_inode(XfsInode* ip) {
     xfs_inode_pool_release_slot(ip);
 }
 
-auto reclaim_idle_inodes(size_t retain_limit, bool pressure, size_t max_victims = ICACHE_RECLAIM_BATCH) -> size_t {
+auto reclaim_idle_inodes(size_t retain_limit, bool pressure, size_t max_victims = ICACHE_RECLAIM_BATCH,
+                         size_t max_buckets = ICACHE_RECLAIM_BUCKET_BUDGET, size_t max_objects = SIZE_MAX, size_t* scanned_out = nullptr)
+    -> size_t {
+    if (scanned_out != nullptr) {
+        *scanned_out = 0;
+    }
+    if (max_victims == 0 || max_buckets == 0 || max_objects == 0) {
+        return 0;
+    }
     if (pressure ? icache_idle_count.load(std::memory_order_relaxed) <= retain_limit
                  : !icache_reclaim_needed(icache_idle_count.load(std::memory_order_relaxed), retain_limit)) {
         return 0;
@@ -500,20 +510,24 @@ auto reclaim_idle_inodes(size_t retain_limit, bool pressure, size_t max_victims 
     size_t const VICTIM_LIMIT = std::min(max_victims, victims.size());
     size_t victim_count = 0;
     size_t buckets_scanned = 0;
+    size_t objects_scanned = 0;
     size_t const START_BUCKET = icache_reclaim_cursor.load(std::memory_order_relaxed) & ICACHE_HASH_MASK;
 
     // Only one caller scans at a time, and each run visits a bounded number of
     // buckets and detaches one bounded batch. Advancing the cursor guarantees
     // eventual coverage without making a VFS close or task GC walk all 16K
     // buckets when most over-limit idle inodes are dirty.
-    while (buckets_scanned < ICACHE_RECLAIM_BUCKET_BUDGET && victim_count < VICTIM_LIMIT &&
+    size_t const BUCKET_LIMIT = std::min(max_buckets, ICACHE_RECLAIM_BUCKET_BUDGET);
+    while (buckets_scanned < BUCKET_LIMIT && objects_scanned < max_objects && victim_count < VICTIM_LIMIT &&
            icache_idle_count.load(std::memory_order_relaxed) > retain_limit) {
         size_t const BUCKET_INDEX = (START_BUCKET + buckets_scanned) & ICACHE_HASH_MASK;
         auto& bucket = icache.at(BUCKET_INDEX);
         uint64_t const FLAGS = bucket.lock.lock_irqsave();
         XfsInode** pp = &bucket.head;
-        while (*pp != nullptr && victim_count < VICTIM_LIMIT && icache_idle_count.load(std::memory_order_relaxed) > retain_limit) {
+        while (*pp != nullptr && objects_scanned < max_objects && victim_count < VICTIM_LIMIT &&
+               icache_idle_count.load(std::memory_order_relaxed) > retain_limit) {
             XfsInode* ip = *pp;
+            objects_scanned++;
             if (ip->refcount == 0 && ip->nlink != 0 && !ip->dirty && !ip->inactivation_started) {
                 *pp = ip->hash_next;
                 ip->hash_next = nullptr;
@@ -549,6 +563,9 @@ auto reclaim_idle_inodes(size_t retain_limit, bool pressure, size_t max_victims 
     }
     icache_reclaim_deferred_releases.store(deferred_release_count, std::memory_order_relaxed);
     icache_reclaim_active.store(false, std::memory_order_release);
+    if (scanned_out != nullptr) {
+        *scanned_out = objects_scanned;
+    }
     return victim_count;
 }
 
@@ -1001,6 +1018,44 @@ auto parse_ifork(XfsIfork* fork, uint8_t fmt, const uint8_t* data_ptr, size_t da
     return 0;
 }
 
+auto xfs_inode_reclaim_count(void*, const ker::mod::mm::reclaim::ReclaimRequest&) -> ker::mod::mm::reclaim::ReclaimCount {
+    return {.reclaimable = icache_idle_count.load(std::memory_order_relaxed)};
+}
+
+auto xfs_inode_reclaim_scan(void*, const ker::mod::mm::reclaim::ReclaimRequest& request) -> ker::mod::mm::reclaim::ReclaimScanResult {
+    size_t const VICTIM_BUDGET = static_cast<size_t>(std::min<uint64_t>(request.budget_units, ICACHE_RECLAIM_BATCH));
+    size_t const SCAN_BUDGET = static_cast<size_t>(std::min<uint64_t>(request.scan_budget_units, ICACHE_RECLAIM_BUCKET_BUDGET));
+    size_t scanned = 0;
+    size_t const RECLAIMED = reclaim_idle_inodes(0, true, VICTIM_BUDGET, ICACHE_RECLAIM_BUCKET_BUDGET, SCAN_BUDGET, &scanned);
+    return {
+        .scanned = scanned,
+        .reclaimed = RECLAIMED,
+        .has_more = icache_idle_count.load(std::memory_order_relaxed) != 0,
+    };
+}
+
+void register_xfs_inode_shrinker() {
+    bool expected = false;
+    if (!icache_shrinker_registered.compare_exchange_strong(expected, true, std::memory_order_acq_rel, std::memory_order_acquire)) {
+        return;
+    }
+    ker::mod::mm::reclaim::Shrinker const SHRINKER{
+        .name = "xfs_inode",
+        .unit = ker::mod::mm::reclaim::ReclaimUnit::OBJECTS,
+        .scan_unit = ker::mod::mm::reclaim::ReclaimUnit::OBJECTS,
+        .rank = 4,
+        .min_priority = ker::mod::mm::reclaim::ReclaimPriority::LOW,
+        .capabilities = ker::mod::mm::reclaim::RECLAIM_MAY_BLOCK,
+        .max_batch_units = ICACHE_RECLAIM_BATCH,
+        .max_scan_units = ICACHE_RECLAIM_BUCKET_BUDGET,
+        .count = xfs_inode_reclaim_count,
+        .scan = xfs_inode_reclaim_scan,
+    };
+    if (!ker::mod::mm::reclaim::register_shrinker(SHRINKER)) {
+        icache_shrinker_registered.store(false, std::memory_order_release);
+    }
+}
+
 }  // anonymous namespace
 
 // ============================================================================
@@ -1009,12 +1064,14 @@ auto parse_ifork(XfsIfork* fork, uint8_t fmt, const uint8_t* data_ptr, size_t da
 
 void xfs_icache_init() {
     if (icache_inited) {
+        register_xfs_inode_shrinker();
         return;
     }
     for (auto& i : icache) {
         i.head = nullptr;
     }
     icache_inited = true;
+    register_xfs_inode_shrinker();
 }
 
 void xfs_icache_purge(XfsMountContext* mount) {

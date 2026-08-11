@@ -1,8 +1,10 @@
 # MM Owned-Frame And Reclaim Backlog Design Notes
 
-Status: backlog instrumentation implemented (`?`). Conservative owned-frame
-tracking source slice implemented (`?`). No owned-frame reclaim consumption or
-background-worker behavior change.
+Status: historical scheduler-GC and owned-frame design record. The current
+MM-owned coordinator, background worker, direct-reclaim policy, adapter ranks,
+and telemetry are documented in `docs/unified_memory_reclaim.md`. Sections
+below that describe allocator-to-scheduler direct calls are retained as design
+history and are superseded by that contract.
 
 Date: 2026-06-08
 
@@ -196,11 +198,10 @@ steps and keeps state in `DestroyUserSpaceBudgetState`.
   pagemap steps. This is intentionally smaller than idle fast-reap but much
   larger than ordinary foreground cleanup, targeting COW variance where old
   address spaces were being split across many tiny destroy-user-space slices.
-- Allocation pressure now has a stronger opt-in path: callers using
-  `phys::page_alloc_with_reclaim()` run one exclusive scheduler-GC pressure pass
-  before yielding, instead of only waking `sched_gc` and hoping it wins the race.
-  The exclusive guard is required because deferred pagemap cleanup is still a
-  single global linked queue.
+- Allocation pressure now enters the MM reclaim coordinator. Scheduler GC is a
+  ranked shrinker behind pending kernel-vmap frees, while the allocator has no
+  scheduler-specific call. Scheduler's exclusive pass still serializes its
+  deferred pagemap cleanup queue.
 - Fork producers also apply pressure backoff before child creation when the
   dead-task backlog is high or free pages fall below the low watermark. This is
   the first line of defense for COW storms, because COW write-fault handlers can
@@ -465,12 +466,12 @@ memory. The live userspace RSS view was therefore misleading; most pressure was
 dead address-space cleanup that had not caught up yet.
 
 The fork producer now applies a stricter admission contract before creating a
-child task. In normal syscall context it runs foreground pressure reclaim while
-free pages are below the low watermark. If reclaim reports no completed cleanup
-for `64` yield cycles and the free-page watermark is still not restored,
-`fork()` returns `-ENOMEM` before any child state is materialized. That
-intentionally moves the pathological sustained pressure failure mode from kernel
-allocator OOM to a userspace-visible fork failure.
+child task. In normal syscall context it runs at most the coordinator's eight
+direct passes while order-0 global headroom is below the low watermark. It does
+not require an order-7 block at admission because `kernel_stack_alloc()` first
+uses the fixed stack reserve; its buddy fallback performs the actual
+order-aware reclaim. Persistent pressure returns `-ENOMEM` before any child
+state is materialized.
 
 The next dump showed why raw dead-list length is not enough: CPU0 held `16661`
 dead tasks and exited `testprog` rows accounted for `77082620 KB`, but many of
@@ -501,7 +502,12 @@ writes, matching the OOM dump's no-allocation contract. The runtime success
 criterion is that spam-COW failures produce the full page allocation dump rather
 than stopping after the first OOM line.
 
-## Background Reclaim Design Direction
+## Historical Background Reclaim Design Direction
+
+This staged plan predates the unified coordinator. The current implementation
+keeps scheduler task detach ownership unchanged and registers its bounded
+serial cleanup pass as one MM shrinker; it does not transfer pagemap cleanup to
+parallel workers.
 
 Do not jump straight to parallel reclaim. A safe sequence is:
 

@@ -170,6 +170,7 @@ UNIT_TESTS=(
     kasan_bootstrap_source_test
     signal_atomic_source_test
     phys_source_test
+    reclaim_source_test
     tlb_shootdown_source_test
     wki_timer_source_test
     wki_wait_source_test
@@ -238,6 +239,7 @@ UNIT_TESTS=(
     crc32c_test
     buffer_cache_test
     physical_balance_test
+    reclaim_policy_test
     vmem_source_test
 )
 

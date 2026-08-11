@@ -4251,8 +4251,14 @@ auto wki_remote_vfs_selftest_multi_rdma_lane_selection() -> bool {
 }
 
 auto wki_remote_vfs_selftest_lane_round_robin_uses_full_capacity() -> bool {
-    ProxyVfsState anchor{};
-    std::array<ProxyVfsState, VFS_PROXY_LANE_COUNT - 1> auxiliaries{};
+    // ProxyVfsState contains a large readlink cache. Eight automatic fixtures
+    // exceed the kernel stack while KTEST still runs on the Limine boot stack.
+    std::unique_ptr<ProxyVfsState[]> lanes{new (std::nothrow) ProxyVfsState[VFS_PROXY_LANE_COUNT]{}};
+    if (lanes == nullptr) {
+        return false;
+    }
+
+    auto& anchor = lanes[0];
     anchor.active = true;
     anchor.lane_anchor = true;
     anchor.lanes_ready = true;
@@ -4261,12 +4267,12 @@ auto wki_remote_vfs_selftest_lane_round_robin_uses_full_capacity() -> bool {
     anchor.lanes.at(0) = &anchor;
     anchor.lane_count = VFS_PROXY_LANE_COUNT;
 
-    for (size_t index = 0; index < auxiliaries.size(); ++index) {
-        auto& lane = auxiliaries.at(index);
+    for (size_t index = 1; index < VFS_PROXY_LANE_COUNT; ++index) {
+        auto& lane = lanes[index];
         lane.active = true;
         lane.mount_group_id = anchor.mount_group_id;
-        lane.lane_index = static_cast<uint8_t>(index + 1);
-        anchor.lanes.at(index + 1) = &lane;
+        lane.lane_index = static_cast<uint8_t>(index);
+        anchor.lanes.at(index) = &lane;
     }
 
     for (size_t index = 0; index < VFS_PROXY_LANE_COUNT; ++index) {

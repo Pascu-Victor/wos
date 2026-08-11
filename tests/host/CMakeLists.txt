@@ -297,6 +297,10 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/phys_source_test.py
 )
 add_test(
+    NAME reclaim_source_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/reclaim_source_test.py
+)
+add_test(
     NAME tlb_shootdown_source_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/tlb_shootdown_source_test.py
 )
@@ -566,6 +570,7 @@ set_tests_properties(
     kasan_bootstrap_source_test
     signal_atomic_source_test
     phys_source_test
+    reclaim_source_test
     tlb_shootdown_source_test
     wki_timer_source_test
     wki_wait_source_test
@@ -720,6 +725,10 @@ wos_add_unit_test(physical_balance_test
     KERN_SOURCES ${WOS_KERN_SRC}/platform/mm/page_alloc.cpp
 )
 target_compile_definitions(physical_balance_test PRIVATE WOS_HOST_TEST=1)
+
+wos_add_unit_test(reclaim_policy_test
+    SOURCES      ${CMAKE_CURRENT_SOURCE_DIR}/unit/reclaim_policy_test.cpp
+)
 
 # ---------------------------------------------------------------------------
 # Fuzz targets

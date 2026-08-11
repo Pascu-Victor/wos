@@ -45,6 +45,11 @@ struct RunQueue {
     uint64_t last_tick_us{0};
     uint64_t next_wait_deadline_us{0};
     uint32_t waitpid_repair_scan_cursor{0};
+    // Dead-list scans are bounded under memory pressure. This cursor is valid
+    // only while the task remains in dead_list and is protected by this
+    // runqueue's lock; it prevents an unreclaimable prefix from starving later
+    // entries across coordinator passes.
+    task::Task* gc_reclaim_scan_cursor{nullptr};
 
     // Linux-style CPU accounting buckets, stored in microseconds. These are
     // updated from timer/IRQ paths, so keep them allocation-free and lock-free.

@@ -53,6 +53,16 @@ struct ZoneSnapshot {
     bool free_count_mismatch;
 };
 
+// Lightweight allocator-policy view. Unlike ZoneSnapshot this does not scan
+// page metadata; it only samples counters and buddy heads under each owning
+// allocator lock, so the reclaim worker can evaluate watermarks cheaply.
+struct ReclaimZoneSnapshot {
+    uint64_t zone;
+    uint64_t total_pages;
+    uint64_t free_pages;
+    int largest_free_order;
+};
+
 struct CallerPageStat {
     uint64_t caller;
     uint64_t pages;
@@ -182,7 +192,9 @@ auto page_alloc_full_overwrite_may_fail(PhysicalPageOwner owner, uint64_t size =
 auto page_alloc_full_overwrite_page(PhysicalPageOwner owner, std::string_view name = {}) -> void*;
 auto page_alloc_may_fail(PhysicalPageOwner owner, uint64_t size = ker::mod::mm::paging::PAGE_SIZE, std::string_view name = {}) -> void*;
 auto page_alloc_full_overwrite_page_may_fail(PhysicalPageOwner owner, std::string_view name = {}) -> void*;
-inline constexpr uint32_t PAGE_ALLOC_RECLAIM_RETRY_DEFAULT = 2048;
+// Direct reclaim is deliberately bounded. Longer recovery belongs to the
+// background coordinator worker rather than an allocator caller.
+inline constexpr uint32_t PAGE_ALLOC_RECLAIM_RETRY_DEFAULT = 8;
 auto page_alloc_with_reclaim(PhysicalPageOwner owner, uint64_t size = ker::mod::mm::paging::PAGE_SIZE, std::string_view name = {},
                              uint32_t retry_count = PAGE_ALLOC_RECLAIM_RETRY_DEFAULT) -> void*;
 auto page_alloc_with_reclaim_may_fail(PhysicalPageOwner owner, uint64_t size = ker::mod::mm::paging::PAGE_SIZE, std::string_view name = {},
@@ -247,6 +259,7 @@ void get_physical_balance_snapshot(PhysicalBalanceSnapshot& out);
 auto physical_owner_descriptors() -> std::span<const PhysicalOwnerDescriptor>;
 auto physical_reserve_descriptors() -> std::span<const PhysicalReserveDescriptor>;
 auto snapshot_zones(ZoneSnapshot* out, size_t max_rows) -> size_t;
+auto snapshot_reclaim_zones(ReclaimZoneSnapshot* out, size_t max_rows) -> size_t;
 
 auto page_caller_stats_available() -> bool;
 auto page_caller_stats_enabled() -> bool;

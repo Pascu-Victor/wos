@@ -24,6 +24,7 @@
 #include <platform/mm/page_alloc.hpp>
 #include <platform/mm/paging.hpp>
 #include <platform/mm/phys.hpp>
+#include <platform/mm/reclaim.hpp>
 #ifndef WOS_HOST_TEST
 #include <platform/mm/virt.hpp>
 #endif
@@ -270,6 +271,9 @@ std::atomic<bool> dirty_writeback_queued{false};
 std::atomic<bool> dirty_writeback_wq_creating{false};
 
 bool cache_initialized = false;
+#ifndef WOS_HOST_TEST
+std::atomic<bool> buffer_cache_shrinker_registered{false};
+#endif
 
 constexpr size_t DIRTY_WRITEBACK_BUDGET = 1024;
 constexpr size_t DIRTY_WRITEBACK_YIELD_BYTES = size_t{16} * 1024 * 1024;
@@ -837,25 +841,34 @@ auto allocation_reclaim_target_bytes(size_t max_bytes, size_t incoming_bytes) ->
     return HEADROOM >= max_bytes ? 0 : max_bytes - HEADROOM;
 }
 
-auto reclaim_clean_cache_locked(size_t target_bytes, size_t byte_budget, size_t victim_budget, size_t scan_budget, bool honor_second_chance)
-    -> BufferCacheReclaimStats {
+auto reclaim_clean_cache_locked(size_t target_bytes, size_t byte_budget, size_t victim_budget, size_t total_scan_budget,
+                                bool honor_second_chance) -> BufferCacheReclaimStats {
     BufferCacheReclaimStats stats{};
     stats.before_bytes = cache_total_bytes;
-    while (cache_total_bytes > target_bytes && stats.freed_bytes < byte_budget && stats.freed_buffers < victim_budget) {
+    while (cache_total_bytes > target_bytes && stats.freed_bytes < byte_budget && stats.freed_buffers < victim_budget &&
+           stats.scanned_buffers < total_scan_budget) {
+        size_t const scan_budget = total_scan_budget - stats.scanned_buffers;
         size_t scanned = 0;
         BufHead* victim = find_reclaimable_lru_buffer(scan_budget, honor_second_chance, &scanned);
         stats.scanned_buffers += scanned;
-        if (victim == nullptr) {
+        if (victim == nullptr && stats.scanned_buffers < total_scan_budget) {
             // Write-heavy workloads can leave dirty/writeback buffers clustered
             // at the cold end. A bounded hot-end fallback prevents rescanning
             // the same unreclaimable tail while clean buffers elsewhere let the
             // cache run far past its target.
             scanned = 0;
-            victim = find_reclaimable_mru_buffer(scan_budget, honor_second_chance, &scanned);
+            victim = find_reclaimable_mru_buffer(total_scan_budget - stats.scanned_buffers, honor_second_chance, &scanned);
             stats.scanned_buffers += scanned;
         }
         if (victim == nullptr) {
             break;
+        }
+        if (victim->size > byte_budget - stats.freed_bytes) {
+            // A successful callback may not exceed its native-byte budget.
+            // Rotate an oversized victim so the remaining scan can look for a
+            // smaller buffer without repeatedly inspecting the same tail.
+            lru_move_to_head(victim);
+            continue;
         }
         stats.freed_buffers++;
         stats.freed_bytes += victim->size;
@@ -2985,6 +2998,60 @@ void dirty_writeback_worker(void* unused) {
     drain_deferred_data_buffer_frees_if_over_limit();
 }
 
+#ifndef WOS_HOST_TEST
+auto buffer_cache_reclaim_count(void*, const ker::mod::mm::reclaim::ReclaimRequest&) -> ker::mod::mm::reclaim::ReclaimCount {
+    if (!cache_initialized) {
+        return {};
+    }
+    uint64_t const IRQFLAGS = cache_lock.lock_irqsave();
+    size_t const CLEAN_BYTES = cache_total_bytes >= cache_dirty_bytes ? cache_total_bytes - cache_dirty_bytes : 0;
+    ker::mod::mm::reclaim::ReclaimCount const COUNT{.reclaimable = CLEAN_BYTES, .dirty = cache_dirty_bytes};
+    cache_lock.unlock_irqrestore(IRQFLAGS);
+    return COUNT;
+}
+
+auto buffer_cache_reclaim_scan(void*, const ker::mod::mm::reclaim::ReclaimRequest& request) -> ker::mod::mm::reclaim::ReclaimScanResult {
+    size_t const BYTE_BUDGET = static_cast<size_t>(std::min<uint64_t>(request.budget_units, SIZE_MAX));
+    size_t const SCAN_BUDGET = static_cast<size_t>(std::min<uint64_t>(request.scan_budget_units, SIZE_MAX));
+    if (!cache_initialized || BYTE_BUDGET == 0 || SCAN_BUDGET == 0) {
+        return {};
+    }
+    uint64_t const IRQFLAGS = cache_lock.lock_irqsave();
+    size_t const TARGET_BYTES = cache_total_bytes > BYTE_BUDGET ? cache_total_bytes - BYTE_BUDGET : 0;
+    BufferCacheReclaimStats const STATS = reclaim_clean_cache_locked(TARGET_BYTES, BYTE_BUDGET, SCAN_BUDGET, SCAN_BUDGET, false);
+    bool const HAS_MORE = cache_total_bytes > cache_dirty_bytes;
+    cache_lock.unlock_irqrestore(IRQFLAGS);
+#ifndef WOS_HOST_TEST
+    size_t const VMAP_PAGE_BUDGET =
+        std::max<size_t>(1, BYTE_BUDGET / ker::mod::mm::paging::PAGE_SIZE + (BYTE_BUDGET % ker::mod::mm::paging::PAGE_SIZE != 0 ? 1 : 0));
+    static_cast<void>(ker::mod::mm::virt::drain_kernel_vmap_frees_bounded(VMAP_PAGE_BUDGET));
+#endif
+    return {.scanned = STATS.scanned_buffers, .reclaimed = STATS.freed_bytes, .has_more = HAS_MORE};
+}
+
+void register_buffer_cache_shrinker() {
+    bool expected = false;
+    if (!buffer_cache_shrinker_registered.compare_exchange_strong(expected, true, std::memory_order_acq_rel, std::memory_order_acquire)) {
+        return;
+    }
+    ker::mod::mm::reclaim::Shrinker const SHRINKER{
+        .name = "buffer_cache",
+        .unit = ker::mod::mm::reclaim::ReclaimUnit::BYTES,
+        .scan_unit = ker::mod::mm::reclaim::ReclaimUnit::OBJECTS,
+        .rank = 2,
+        .min_priority = ker::mod::mm::reclaim::ReclaimPriority::LOW,
+        .capabilities = ker::mod::mm::reclaim::RECLAIM_MAY_BLOCK,
+        .max_batch_units = size_t{64} * 1024 * 1024,
+        .max_scan_units = HOT_EVICT_SCAN_BUDGET,
+        .count = buffer_cache_reclaim_count,
+        .scan = buffer_cache_reclaim_scan,
+    };
+    if (!ker::mod::mm::reclaim::register_shrinker(SHRINKER)) {
+        buffer_cache_shrinker_registered.store(false, std::memory_order_release);
+    }
+}
+#endif
+
 }  // anonymous namespace
 
 // ---------------------------------------------------------------------------
@@ -2993,6 +3060,9 @@ void dirty_writeback_worker(void* unused) {
 
 void buffer_cache_init() {
     if (cache_initialized) {
+#ifndef WOS_HOST_TEST
+        register_buffer_cache_shrinker();
+#endif
         return;
     }
     uint64_t const TOTAL_MEM = ker::mod::mm::phys::get_total_mem_bytes();
@@ -3028,6 +3098,9 @@ void buffer_cache_init() {
     stat_range_copy_overflow.store(0, std::memory_order_relaxed);
     stat_range_copy_degraded.store(0, std::memory_order_relaxed);
     cache_initialized = true;
+#ifndef WOS_HOST_TEST
+    register_buffer_cache_shrinker();
+#endif
     log::info("initialized (max %lu bytes)", static_cast<uint64_t>(cache_max_bytes));
 }
 

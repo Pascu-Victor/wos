@@ -22,6 +22,7 @@
 #include "platform/mm/mm.hpp"
 #include "platform/mm/paging.hpp"
 #include "platform/mm/phys.hpp"
+#include "platform/mm/reclaim.hpp"
 #include "platform/mm/virt.hpp"
 #include "platform/perf/perf_events.hpp"
 #include "platform/power/power.hpp"
@@ -80,9 +81,7 @@ namespace ker::syscall::process {
 namespace {
 using fork_log = ker::mod::dbg::logger<"fork">;
 using process_log = ker::mod::dbg::logger<"process">;
-constexpr uint32_t FORK_GC_NO_PROGRESS_YIELD_LIMIT = 64;
-constexpr uint64_t FORK_GC_FREE_PAGE_LOW_WATERMARK_DIVISOR = 32;
-constexpr uint64_t FORK_GC_FREE_PAGE_LOW_WATERMARK_MIN = 4096;
+constexpr uint8_t FORK_ADMISSION_ORDER = 0;
 
 #ifdef WOS_SELFTEST
 std::atomic<bool> g_process_selftest_force_fd_clone_insert_failure{false};
@@ -322,39 +321,28 @@ auto alloc_fork_kernel_stack_with_reclaim() -> uint64_t {
     return reinterpret_cast<uint64_t>(ker::mod::mm::phys::kernel_stack_alloc("fork_kstack"));
 }
 
-auto fork_free_page_low_watermark() -> uint64_t {
-    uint64_t const TOTAL_PAGES = ker::mod::mm::phys::get_total_mem_bytes() / ker::mod::mm::paging::PAGE_SIZE;
-    uint64_t const SCALED_WATERMARK = TOTAL_PAGES / FORK_GC_FREE_PAGE_LOW_WATERMARK_DIVISOR;
-    return SCALED_WATERMARK > FORK_GC_FREE_PAGE_LOW_WATERMARK_MIN ? SCALED_WATERMARK : FORK_GC_FREE_PAGE_LOW_WATERMARK_MIN;
-}
-
-auto fork_should_reclaim_for_pressure(uint64_t free_pages) -> bool { return free_pages < fork_free_page_low_watermark(); }
-
-auto fork_pressure_has_emergency_headroom(uint64_t free_pages) -> bool { return free_pages >= fork_free_page_low_watermark(); }
-
 auto throttle_fork_for_reclaim_pressure(uint64_t callsite) -> bool {
-    if (!ker::mod::sched::has_run_queues() || ker::mod::sched::preempt_count() != 0 || !ker::mod::sched::interrupts_enabled()) {
+    if (!ker::mod::mm::phys::can_wait_for_reclaim()) {
         return true;
     }
 
-    uint32_t no_progress_yields = 0;
-    for (;;) {
-        uint64_t const FREE_PAGES = ker::mod::mm::phys::get_free_mem_pages();
-        if (!fork_should_reclaim_for_pressure(FREE_PAGES)) {
+    constexpr uint64_t STACK_PAGES = ker::mod::mm::KERNEL_STACK_SIZE / ker::mod::mm::paging::PAGE_SIZE;
+    for (uint32_t attempt = 0; attempt < ker::mod::mm::reclaim::DIRECT_RECLAIM_MAX_PASSES; ++attempt) {
+        // Admission protects global page headroom without requiring an
+        // order-sized buddy block: kernel_stack_alloc() consumes the reserved
+        // stack pool first and its buddy fallback performs order-aware reclaim.
+        auto const PRESSURE = ker::mod::mm::reclaim::pressure_for_order(FORK_ADMISSION_ORDER);
+        if (PRESSURE == ker::mod::mm::reclaim::PressureLevel::NONE) {
             return true;
         }
 
-        if (ker::mod::sched::reclaim_memory_pressure() == 0) {
-            ker::mod::sched::request_gc_memory_pressure();
+        auto const RESULT = ker::mod::mm::reclaim::reclaim_for_allocation(FORK_ADMISSION_ORDER, STACK_PAGES);
+        if (!RESULT.made_progress) {
+            ker::mod::mm::reclaim::request_background(FORK_ADMISSION_ORDER, STACK_PAGES);
             ker::mod::sched::kern_yield_impl(callsite);
-            ++no_progress_yields;
-            if (no_progress_yields >= FORK_GC_NO_PROGRESS_YIELD_LIMIT) {
-                return fork_pressure_has_emergency_headroom(ker::mod::mm::phys::get_free_mem_pages());
-            }
-        } else {
-            no_progress_yields = 0;
         }
     }
+    return ker::mod::mm::reclaim::pressure_for_order(FORK_ADMISSION_ORDER) == ker::mod::mm::reclaim::PressureLevel::NONE;
 }
 
 void snapshot_fpu_state_for_fork(ker::mod::sched::task::Task* parent, ker::mod::sched::task::Task* child) {

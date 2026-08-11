@@ -21,6 +21,7 @@
 #include <platform/mm/page_alloc.hpp>
 #include <platform/mm/paging.hpp>
 #include <platform/mm/phys.hpp>
+#include <platform/mm/reclaim.hpp>
 #include <platform/mm/swap.hpp>
 #include <platform/mm/virt.hpp>
 #include <platform/perf/perf_events.hpp>
@@ -170,6 +171,9 @@ struct alignas(64) FileMmapCacheLock {
 static_assert(sizeof(FileMmapCacheLock) % 64 == 0);
 std::array<FileMmapPageCacheSet, FILE_MMAP_CACHE_SET_COUNT> g_file_mmap_cache{};
 std::array<FileMmapCacheLock, FILE_MMAP_CACHE_LOCK_COUNT> g_file_mmap_cache_locks{};
+std::atomic<uint64_t> g_file_mmap_cache_pages{0};
+std::atomic<uint64_t> g_file_mmap_cache_scan_cursor{0};
+std::atomic<bool> g_file_mmap_cache_shrinker_registered{false};
 ker::util::SmallVec<FileMmapRange, 32> g_file_mmap_ranges;
 ker::mod::sys::Mutex g_file_mmap_ranges_lock;
 
@@ -835,6 +839,9 @@ auto file_mmap_cache_insert_or_discard(const FileMmapPageKey& key, void* new_pag
     victim->last_used = USE_STAMP;
     ker::mod::mm::phys::page_ref_inc(new_page);
     *page_for_mapping = new_page;
+    if (evicted == nullptr) {
+        g_file_mmap_cache_pages.fetch_add(1, std::memory_order_relaxed);
+    }
     cache_lock.mutex.unlock();
 
     if (evicted != nullptr) {
@@ -2084,22 +2091,11 @@ auto materialize_lazy_file_page(ker::mod::sched::task::Task* task, const ker::mo
 }
 
 auto file_mmap_cache_stats() -> FileMmapCacheStats {
-    FileMmapCacheStats stats{};
-    stats.capacity_pages = FILE_MMAP_CACHE_PAGES;
-
-    for (size_t lock_index = 0; lock_index < FILE_MMAP_CACHE_LOCK_COUNT; ++lock_index) {
-        auto& cache_lock = g_file_mmap_cache_locks.at(lock_index);
-        cache_lock.mutex.lock();
-        for (size_t set_index = lock_index; set_index < FILE_MMAP_CACHE_SET_COUNT; set_index += FILE_MMAP_CACHE_LOCK_COUNT) {
-            for (const auto& entry : g_file_mmap_cache.at(set_index).ways) {
-                if (entry.page != nullptr) {
-                    stats.pages++;
-                }
-            }
-        }
-        cache_lock.mutex.unlock();
-    }
-
+    FileMmapCacheStats stats{
+        .pages = g_file_mmap_cache_pages.load(std::memory_order_relaxed),
+        .bytes = 0,
+        .capacity_pages = FILE_MMAP_CACHE_PAGES,
+    };
     stats.bytes = stats.pages * ker::mod::mm::paging::PAGE_SIZE;
     return stats;
 }
@@ -2138,6 +2134,10 @@ auto file_mmap_cache_reclaim(size_t max_pages) -> size_t {
             }
             cache_lock.mutex.unlock();
 
+            if (release_count != 0) {
+                g_file_mmap_cache_pages.fetch_sub(release_count, std::memory_order_relaxed);
+            }
+
             for (size_t i = 0; i < release_count; ++i) {
                 release_file_mmap_cache_page(release_pages.at(i));
                 release_pages.at(i) = nullptr;
@@ -2147,6 +2147,85 @@ auto file_mmap_cache_reclaim(size_t max_pages) -> size_t {
     }
 
     return reclaimed;
+}
+
+namespace {
+struct FileMmapBoundedReclaimResult {
+    size_t reclaimed{};
+    size_t scanned{};
+};
+
+auto file_mmap_cache_reclaim_bounded(size_t max_pages, size_t scan_budget) -> FileMmapBoundedReclaimResult {
+    FileMmapBoundedReclaimResult result{};
+    if (max_pages == 0 || scan_budget == 0) {
+        return result;
+    }
+
+    size_t const MAX_SCAN = std::min(scan_budget, FILE_MMAP_CACHE_PAGES);
+    uint64_t const START = g_file_mmap_cache_scan_cursor.fetch_add(MAX_SCAN, std::memory_order_relaxed);
+    while (result.scanned < MAX_SCAN && result.reclaimed < max_pages) {
+        size_t const SLOT = static_cast<size_t>((START + result.scanned) % FILE_MMAP_CACHE_PAGES);
+        size_t const SET_INDEX = SLOT / FILE_MMAP_CACHE_WAYS;
+        size_t const WAY_INDEX = SLOT % FILE_MMAP_CACHE_WAYS;
+        size_t const LOCK_INDEX = SET_INDEX & (FILE_MMAP_CACHE_LOCK_COUNT - 1);
+        auto& cache_lock = g_file_mmap_cache_locks.at(LOCK_INDEX);
+        void* page = nullptr;
+
+        cache_lock.mutex.lock();
+        auto& entry = g_file_mmap_cache.at(SET_INDEX).ways.at(WAY_INDEX);
+        result.scanned++;
+        if (entry.page != nullptr) {
+            page = entry.page;
+            entry = {};
+            g_file_mmap_cache_pages.fetch_sub(1, std::memory_order_relaxed);
+        }
+        cache_lock.mutex.unlock();
+
+        if (page != nullptr) {
+            release_file_mmap_cache_page(page);
+            result.reclaimed++;
+        }
+    }
+    return result;
+}
+
+auto file_mmap_cache_reclaim_count(void*, const ker::mod::mm::reclaim::ReclaimRequest&) -> ker::mod::mm::reclaim::ReclaimCount {
+    return {.reclaimable = g_file_mmap_cache_pages.load(std::memory_order_relaxed)};
+}
+
+auto file_mmap_cache_reclaim_scan(void*, const ker::mod::mm::reclaim::ReclaimRequest& request) -> ker::mod::mm::reclaim::ReclaimScanResult {
+    size_t const PAGE_BUDGET = static_cast<size_t>(std::min<uint64_t>(request.budget_units, SIZE_MAX));
+    size_t const SCAN_BUDGET = static_cast<size_t>(std::min<uint64_t>(request.scan_budget_units, SIZE_MAX));
+    FileMmapBoundedReclaimResult const RESULT = file_mmap_cache_reclaim_bounded(PAGE_BUDGET, SCAN_BUDGET);
+    return {
+        .scanned = RESULT.scanned,
+        .reclaimed = RESULT.reclaimed,
+        .has_more = g_file_mmap_cache_pages.load(std::memory_order_relaxed) != 0,
+    };
+}
+}  // namespace
+
+void file_mmap_cache_register_shrinker() {
+    bool expected = false;
+    if (!g_file_mmap_cache_shrinker_registered.compare_exchange_strong(expected, true, std::memory_order_acq_rel,
+                                                                       std::memory_order_acquire)) {
+        return;
+    }
+    ker::mod::mm::reclaim::Shrinker const SHRINKER{
+        .name = "file_mmap_cache",
+        .unit = ker::mod::mm::reclaim::ReclaimUnit::PAGES,
+        .scan_unit = ker::mod::mm::reclaim::ReclaimUnit::PAGES,
+        .rank = 3,
+        .min_priority = ker::mod::mm::reclaim::ReclaimPriority::LOW,
+        .capabilities = ker::mod::mm::reclaim::RECLAIM_MAY_BLOCK,
+        .max_batch_units = 128,
+        .max_scan_units = 4096,
+        .count = file_mmap_cache_reclaim_count,
+        .scan = file_mmap_cache_reclaim_scan,
+    };
+    if (!ker::mod::mm::reclaim::register_shrinker(SHRINKER)) {
+        g_file_mmap_cache_shrinker_registered.store(false, std::memory_order_release);
+    }
 }
 
 auto clone_file_mmap_ranges_for_pagemap(ker::mod::mm::paging::PageTable* src, ker::mod::mm::paging::PageTable* dst) -> bool {

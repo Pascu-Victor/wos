@@ -55,6 +55,7 @@ def main() -> None:
     require_order(
         function_body(mm_source, "init"),
         [
+            "reclaim::init()",
             "virt::init_pagemap()",
             "phys::set_kernel_cr3",
             "virt::init_kernel_vmap()",
@@ -73,6 +74,12 @@ def main() -> None:
             "advance_page_table(pml3, index_of(VADDR, 3), FLAGS)",
             "advance_page_table(pml2, index_of(VADDR, 2), FLAGS)",
             "kernel_vmap_initialized = true",
+            'SHRINKER{',
+            '.name = "kernel_vmap"',
+            ".rank = 0",
+            ".min_priority = reclaim::ReclaimPriority::LOW",
+            ".capabilities = reclaim::RECLAIM_MAY_BLOCK",
+            "reclaim::register_shrinker(SHRINKER)",
         ],
         "vmap initialization must prepare all runtime page-table paths",
     )
@@ -134,15 +141,37 @@ def main() -> None:
     )
 
     require_order(
-        function_body(source, "drain_kernel_vmap_frees"),
+        function_body(source, "drain_kernel_vmap_frees_bounded"),
         [
             "!kernel_vmap_context_can_drain()",
             "kernel_vmap_draining.compare_exchange_strong",
-            "find_pending_kernel_vmap_run(first_page, page_count)",
+            "REMAINING = max_pages - stats.reclaimed_pages",
+            "find_pending_kernel_vmap_run(REMAINING, first_page, page_count)",
             "release_kernel_vmap_mappings(START, page_count)",
             "release_kernel_vmap_span(first_page, page_count, true)",
+            "stats.reclaimed_pages += page_count",
         ],
-        "deferred frees must shoot down only from a safe single drainer",
+        "bounded deferred frees must shoot down only from a safe single drainer",
+    )
+
+    require_order(
+        function_body(source, "drain_kernel_vmap_frees"),
+        [
+            "kernel_vmap_context_can_drain()",
+            "drain_kernel_vmap_frees_bounded(SIZE_MAX)",
+            "STATS.failed || !STATS.has_more || STATS.reclaimed_pages == 0",
+        ],
+        "legacy vmap drain wrapper must retain complete safe-context behavior",
+    )
+
+    require_order(
+        function_body(source, "kernel_vmap_pending_free_pages"),
+        [
+            "kernel_vmap_lock.lock_irqsave()",
+            "kernel_vmap_pending_pages",
+            "kernel_vmap_lock.unlock_irqrestore(FLAGS)",
+        ],
+        "vmap shrinker count must be exact and lock-bounded",
     )
 
     require_order(

@@ -97,7 +97,8 @@ quiescent build/WKI active or pending counters.
 
 Every checkpoint contains:
 
-- the coherent `memacc raw all` output and derived summary;
+- the sequential `memacc raw all` capture and its internally coherent summary
+  section;
 - WKI, IPC, scheduler, and `meminfo` snapshots;
 - `status.tsv`;
 - canonical `snapshot.json`;

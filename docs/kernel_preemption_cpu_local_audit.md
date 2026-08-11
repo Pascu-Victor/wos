@@ -87,6 +87,7 @@ resumes, and none of these sites retains a runqueue pointer or treats a cached
 - `modules/kern/src/net/wki/remote_ipc_socket.cpp` — **refactored**.
 - `modules/kern/src/net/wki/remote_vfs.cpp` — **refactored**.
 - `modules/kern/src/platform/debug/ptrace.cpp` — **refactored / preemption-protected**. Target scratch pointers are target-owned storage; direct GS reads are bounded syscall snapshots.
+- `modules/kern/src/platform/mm/reclaim.cpp` — **refactored**. The current task is converted to a stable identity token solely to distinguish recursive reclaim from cross-task lease contention; it is never used as a CPU or runqueue proxy.
 - `modules/kern/src/platform/power/power.cpp` — **refactored**.
 - `modules/kern/src/platform/sys/signal.cpp` — **refactored / preemption-protected**. Task scratch storage is task-owned; GS-sensitive return work occurs at the validated return boundary.
 - `modules/kern/src/syscalls_impl/futex/futex.cpp` — **refactored**.

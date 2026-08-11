@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdint>
 #include <cstdio>
 #include <string_view>
 
@@ -44,6 +45,35 @@ void print_raw_row(const Row& row) {
         std::printf(" %s=%s", kv.first.c_str(), kv.second.c_str());
     }
     std::printf("\n");
+}
+
+void print_reclaim_coordinator() {
+    auto const ROWS = read_rows("reclaim/coordinator");
+    const Row* coordinator = first_record(ROWS, "reclaim_coordinator");
+    if (coordinator == nullptr) {
+        return;
+    }
+
+    std::printf("reclaim pressure=%s attempts=%llu scans=%llu physical=%llu pages failures=%llu recursion=%llu latency_max=%llu us\n",
+                get_string(*coordinator, "pressure").c_str(), static_cast<unsigned long long>(get_u64(*coordinator, "attempts")),
+                static_cast<unsigned long long>(get_u64(*coordinator, "scans")),
+                static_cast<unsigned long long>(get_u64(*coordinator, "reclaimed_pages")),
+                static_cast<unsigned long long>(get_u64(*coordinator, "failures")),
+                static_cast<unsigned long long>(get_u64(*coordinator, "recursion_avoided")),
+                static_cast<unsigned long long>(get_u64(*coordinator, "latency_max_us")));
+    for (const auto& row : ROWS) {
+        if (row.record != "reclaim_shrinker") {
+            continue;
+        }
+        std::printf("  %-20s scans=%llu reclaimed=%llu %s physical=%llu pages available=%llu dirty=%llu pinned=%llu reserved=%llu\n",
+                    get_string(row, "name").c_str(), static_cast<unsigned long long>(get_u64(row, "scan_calls")),
+                    static_cast<unsigned long long>(get_u64(row, "reclaimed_units")), get_string(row, "unit").c_str(),
+                    static_cast<unsigned long long>(get_u64(row, "reclaimed_pages")),
+                    static_cast<unsigned long long>(get_u64(row, "count_reclaimable")),
+                    static_cast<unsigned long long>(get_u64(row, "count_dirty")),
+                    static_cast<unsigned long long>(get_u64(row, "count_pinned")),
+                    static_cast<unsigned long long>(get_u64(row, "count_reserved")));
+    }
 }
 
 }  // namespace
@@ -131,6 +161,7 @@ void print_kernel() {
                         static_cast<unsigned long long>(get_u64(row, "dead")));
         }
     }
+    print_reclaim_coordinator();
 }
 
 void print_dump(const Options& opt) {
@@ -162,6 +193,9 @@ void print_dump(const Options& opt) {
     if (!opt.full) {
         return;
     }
+
+    std::printf("\nReclaim coordinator\n");
+    print_reclaim_coordinator();
 
     std::printf("\nDead queues\n");
     auto dead_text = read_file(memacc_path("dead"));

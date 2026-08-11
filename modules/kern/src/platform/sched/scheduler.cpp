@@ -22,6 +22,7 @@
 #include <platform/loader/debug_info.hpp>
 #include <platform/loader/gdb_interface.hpp>
 #include <platform/mm/mm.hpp>
+#include <platform/mm/reclaim.hpp>
 #include <platform/mm/virt.hpp>
 
 #include "epoch.hpp"
@@ -1610,6 +1611,8 @@ std::atomic<bool> scheduler_gc_worker_started{false};             // NOLINT(cppc
 std::atomic<task::Task*> scheduler_gc_task{nullptr};              // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 std::atomic<bool> scheduler_gc_memory_pressure_requested{false};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 std::atomic<bool> scheduler_gc_reclaim_active{false};             // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::atomic<bool> scheduler_gc_shrinker_registered{false};        // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+void register_scheduler_gc_shrinker();
 std::array<std::atomic<uint64_t>, desc::gdt::MAX_CPUS>
     preempt_stall_last_log_us{};                                    // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 std::atomic<int> preempt_stall_enabled_cache{-1};                   // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
@@ -3909,6 +3912,8 @@ void init() {
         dbg::log("WARNING: No free interrupt vector for scheduler wake IPI");
     }
     mm::virt::init_tlb_shootdown();
+    register_scheduler_gc_shrinker();
+    ker::syscall::vmem::file_mmap_cache_register_shrinker();
 }
 
 void setup_queues() {
@@ -3926,6 +3931,8 @@ void setup_queues() {
         dbg::log("WARNING: No free interrupt vector for scheduler wake IPI");
     }
     mm::virt::init_tlb_shootdown();
+    register_scheduler_gc_shrinker();
+    ker::syscall::vmem::file_mmap_cache_register_shrinker();
 }
 
 void percpu_init() {
@@ -7272,7 +7279,7 @@ auto gc_task_has_pagemap_sibling_locked(task::Task* cur) -> bool {
     return false;
 }
 
-auto detach_next_reclaimable_task_locked(RunQueue* rq, uint64_t cpu_no) -> GcDetachedTask {
+auto detach_next_reclaimable_task_locked(RunQueue* rq, uint64_t cpu_no, uint64_t scan_budget, uint64_t* scanned) -> GcDetachedTask {
     if (rq == nullptr) {
         return {};
     }
@@ -7280,9 +7287,17 @@ auto detach_next_reclaimable_task_locked(RunQueue* rq, uint64_t cpu_no) -> GcDet
     (void)cpu_no;
 #endif
 
-    task::Task* cur = rq->dead_list.head;
-    while (cur != nullptr) {
-        task::Task* next = cur->sched_next;
+    task::Task* cur = rq->gc_reclaim_scan_cursor != nullptr ? rq->gc_reclaim_scan_cursor : rq->dead_list.head;
+    uint32_t remaining = rq->dead_list.count;
+    while (cur != nullptr && remaining-- != 0) {
+        if (scanned != nullptr && *scanned >= scan_budget) {
+            break;
+        }
+        if (scanned != nullptr) {
+            (*scanned)++;
+        }
+        task::Task* next = cur->sched_next != nullptr ? cur->sched_next : rq->dead_list.head;
+        rq->gc_reclaim_scan_cursor = next;
 
         if (cur->state.load(std::memory_order_acquire) != task::TaskState::DEAD) {
             cur = next;
@@ -7398,6 +7413,9 @@ auto detach_next_reclaimable_task_locked(RunQueue* rq, uint64_t cpu_no) -> GcDet
         if (!task_looks_valid) {
             while (rq->dead_list.remove(cur)) {
             }
+            if (rq->gc_reclaim_scan_cursor == cur) {
+                rq->gc_reclaim_scan_cursor = rq->dead_list.head;
+            }
             dbg::log("GC: Leaking corrupted task %p to avoid crash", cur);
             return {.counted_without_cleanup = true};
         }
@@ -7412,6 +7430,9 @@ auto detach_next_reclaimable_task_locked(RunQueue* rq, uint64_t cpu_no) -> GcDet
         }
 
         while (rq->dead_list.remove(cur)) {
+        }
+        if (rq->gc_reclaim_scan_cursor == cur) {
+            rq->gc_reclaim_scan_cursor = rq->dead_list.head;
         }
         cur->sched_queue = task::Task::sched_queue::NONE;
 
@@ -7698,9 +7719,12 @@ void cleanup_detached_gc_task(GcDetachedTask const& detached, GcTaskTiming& timi
     cleanup_task_after_pagemap(cur, timing, CLEANUP_START_US);
 }
 
-auto gc_expired_tasks_budgeted_impl(uint32_t max_tasks, uint64_t max_work_us, uint32_t pagemap_step_budget, bool* time_budget_exhausted,
-                                    bool* has_pending_work) -> uint32_t {
-    if (max_tasks == 0 || run_queues == nullptr) {
+auto gc_expired_tasks_budgeted_impl(uint32_t max_tasks, uint64_t max_work_us, uint32_t pagemap_step_budget, uint64_t max_scan_tasks,
+                                    uint64_t* scanned_out, bool* time_budget_exhausted, bool* has_pending_work) -> uint32_t {
+    if (scanned_out != nullptr) {
+        *scanned_out = 0;
+    }
+    if (max_tasks == 0 || max_scan_tasks == 0 || run_queues == nullptr) {
         if (has_pending_work != nullptr) {
             *has_pending_work = gc_deferred_cleanup_has_work();
         }
@@ -7712,14 +7736,17 @@ auto gc_expired_tasks_budgeted_impl(uint32_t max_tasks, uint64_t max_work_us, ui
     uint64_t const START_US = max_work_us != 0 ? time::get_us() : 0;
     bool hit_time_budget = false;
     uint32_t reclaimed = 0;
-    for (uint64_t cpu_no = 0; cpu_no < smt::get_core_count() && reclaimed < max_tasks && !hit_time_budget; ++cpu_no) {
-        while (reclaimed < max_tasks && !hit_time_budget) {
+    uint64_t scanned = 0;
+    for (uint64_t cpu_no = 0; cpu_no < smt::get_core_count() && reclaimed < max_tasks && scanned < max_scan_tasks && !hit_time_budget;
+         ++cpu_no) {
+        while (reclaimed < max_tasks && scanned < max_scan_tasks && !hit_time_budget) {
             if (gc_time_budget_expired(START_US, max_work_us)) {
                 hit_time_budget = true;
                 break;
             }
 
             if (gc_deferred_cleanup_has_work()) {
+                scanned++;
                 GcTaskTiming timing{};
                 bool const COMPLETED = process_deferred_gc_cleanup_slice(timing, pagemap_step_budget);
                 note_gc_task_timing(timing);
@@ -7734,8 +7761,9 @@ auto gc_expired_tasks_budgeted_impl(uint32_t max_tasks, uint64_t max_work_us, ui
 
             GcDetachedTask detached{};
             uint64_t const DETACH_START_US = time::get_us();
-            run_queues->with_lock_void(
-                cpu_no, [&detached, cpu_no](RunQueue* rq) -> void { detached = detach_next_reclaimable_task_locked(rq, cpu_no); });
+            run_queues->with_lock_void(cpu_no, [&detached, cpu_no, max_scan_tasks, &scanned](RunQueue* rq) -> void {
+                detached = detach_next_reclaimable_task_locked(rq, cpu_no, max_scan_tasks, &scanned);
+            });
 
             GcTaskTiming timing{.detach_us = elapsed_us_since(DETACH_START_US, time::get_us())};
             if (detached.counted_without_cleanup) {
@@ -7775,6 +7803,9 @@ auto gc_expired_tasks_budgeted_impl(uint32_t max_tasks, uint64_t max_work_us, ui
     if (time_budget_exhausted != nullptr) {
         *time_budget_exhausted = hit_time_budget;
     }
+    if (scanned_out != nullptr) {
+        *scanned_out = scanned;
+    }
     if (has_pending_work != nullptr) {
         *has_pending_work = gc_deferred_cleanup_has_work();
     }
@@ -7784,7 +7815,7 @@ auto gc_expired_tasks_budgeted_impl(uint32_t max_tasks, uint64_t max_work_us, ui
 }  // namespace
 
 auto gc_expired_tasks_budgeted(uint32_t max_tasks) -> uint32_t {
-    return gc_expired_tasks_budgeted_impl(max_tasks, 0, SCHED_GC_PAGEMAP_STEP_BUDGET, nullptr, nullptr);
+    return gc_expired_tasks_budgeted_impl(max_tasks, 0, SCHED_GC_PAGEMAP_STEP_BUDGET, UINT64_MAX, nullptr, nullptr, nullptr);
 }
 
 void gc_expired_tasks() { (void)gc_expired_tasks_budgeted(UINT32_MAX); }
@@ -7813,6 +7844,7 @@ void note_gc_pass_result(uint32_t reclaimed, uint64_t elapsed_us) {
 
 struct GcPassResult {
     uint32_t reclaimed = 0;
+    uint64_t scanned = 0;
     bool time_budget_exhausted = false;
     bool has_pending_work = false;
     bool ran = false;
@@ -7822,7 +7854,8 @@ auto gc_pass_needs_followup(GcPassResult const& result, uint32_t reclaim_budget)
     return result.has_pending_work || result.reclaimed >= reclaim_budget || (result.time_budget_exhausted && result.reclaimed != 0);
 }
 
-auto run_gc_reclaim_pass_exclusive(uint32_t reclaim_budget, uint64_t work_budget_us, uint32_t pagemap_step_budget) -> GcPassResult {
+auto run_gc_reclaim_pass_exclusive(uint32_t reclaim_budget, uint64_t work_budget_us, uint32_t pagemap_step_budget,
+                                   uint64_t scan_budget = UINT64_MAX) -> GcPassResult {
     bool expected = false;
     if (!scheduler_gc_reclaim_active.compare_exchange_strong(expected, true, std::memory_order_acq_rel, std::memory_order_acquire)) {
         return {};
@@ -7830,8 +7863,8 @@ auto run_gc_reclaim_pass_exclusive(uint32_t reclaim_budget, uint64_t work_budget
 
     uint64_t const START_US = time::get_us();
     GcPassResult result{.ran = true};
-    result.reclaimed = gc_expired_tasks_budgeted_impl(reclaim_budget, work_budget_us, pagemap_step_budget, &result.time_budget_exhausted,
-                                                      &result.has_pending_work);
+    result.reclaimed = gc_expired_tasks_budgeted_impl(reclaim_budget, work_budget_us, pagemap_step_budget, scan_budget, &result.scanned,
+                                                      &result.time_budget_exhausted, &result.has_pending_work);
     uint64_t const END_US = time::get_us();
     note_gc_pass_result(result.reclaimed, END_US >= START_US ? END_US - START_US : 0);
     scheduler_gc_reclaim_active.store(false, std::memory_order_release);
@@ -7969,6 +8002,67 @@ auto reclaim_memory_pressure() -> uint32_t {
     }
     return PASS.reclaimed;
 }
+
+namespace {
+auto scheduler_gc_reclaim_count(void*, const mm::reclaim::ReclaimRequest&) -> mm::reclaim::ReclaimCount {
+    if (run_queues == nullptr) {
+        return {};
+    }
+    uint64_t pending = gc_deferred_cleanup_depth.load(std::memory_order_relaxed);
+    for (uint64_t cpu_no = 0; cpu_no < smt::get_core_count(); ++cpu_no) {
+        pending += run_queues->with_lock(cpu_no, [](RunQueue* rq) -> uint64_t { return rq != nullptr ? rq->dead_list.count : 0; });
+    }
+    return {.reclaimable = pending};
+}
+
+auto scheduler_gc_reclaim_scan(void*, const mm::reclaim::ReclaimRequest& request) -> mm::reclaim::ReclaimScanResult {
+    uint32_t const TASK_BUDGET = static_cast<uint32_t>(std::min<uint64_t>(request.budget_units, UINT32_MAX));
+    uint64_t const SCAN_BUDGET = request.scan_budget_units;
+    if (TASK_BUDGET == 0 || SCAN_BUDGET == 0 || run_queues == nullptr) {
+        return {};
+    }
+
+    uint64_t work_budget_us = SCHED_GC_PRESSURE_WORK_BUDGET_US;
+    if (request.deadline_us != 0) {
+        uint64_t const NOW_US = time::get_us();
+        if (NOW_US >= request.deadline_us) {
+            return {.has_more = true};
+        }
+        work_budget_us = std::min(work_budget_us, request.deadline_us - NOW_US);
+    }
+    GcPassResult const PASS =
+        run_gc_reclaim_pass_exclusive(TASK_BUDGET, work_budget_us, SCHED_GC_PRESSURE_PAGEMAP_STEP_BUDGET, SCAN_BUDGET);
+    if (!PASS.ran) {
+        request_gc_memory_pressure();
+    } else if (gc_pass_needs_followup(PASS, TASK_BUDGET)) {
+        request_gc_memory_pressure();
+    }
+    bool const HAS_MORE = scheduler_gc_reclaim_count(nullptr, request).reclaimable != 0;
+    return {.scanned = PASS.scanned, .reclaimed = PASS.reclaimed, .has_more = HAS_MORE};
+}
+
+void register_scheduler_gc_shrinker() {
+    bool expected = false;
+    if (!scheduler_gc_shrinker_registered.compare_exchange_strong(expected, true, std::memory_order_acq_rel, std::memory_order_acquire)) {
+        return;
+    }
+    mm::reclaim::Shrinker const SHRINKER{
+        .name = "scheduler_gc",
+        .unit = mm::reclaim::ReclaimUnit::OBJECTS,
+        .scan_unit = mm::reclaim::ReclaimUnit::OBJECTS,
+        .rank = 1,
+        .min_priority = mm::reclaim::ReclaimPriority::NORMAL,
+        .capabilities = mm::reclaim::RECLAIM_MAY_BLOCK | mm::reclaim::RECLAIM_MAY_IO | mm::reclaim::RECLAIM_MAY_ALLOCATE,
+        .max_batch_units = SCHED_GC_PRESSURE_RECLAIM_BUDGET,
+        .max_scan_units = 4096,
+        .count = scheduler_gc_reclaim_count,
+        .scan = scheduler_gc_reclaim_scan,
+    };
+    if (!mm::reclaim::register_shrinker(SHRINKER)) {
+        scheduler_gc_shrinker_registered.store(false, std::memory_order_release);
+    }
+}
+}  // namespace
 
 void start_gc_worker() {
     bool expected = false;
@@ -9033,6 +9127,7 @@ auto scheduler_selftest_concurrent_reschedule_requests_are_serialized() -> bool 
         rq.total_weight = 0;
         rq.min_vruntime = 0;
         rq.next_wait_deadline_us = 0;
+        rq.gc_reclaim_scan_cursor = nullptr;
         rq.cached_load_default.store(0, std::memory_order_relaxed);
         rq.cached_load_process.store(0, std::memory_order_relaxed);
         rq.cached_current_load_default.store(0, std::memory_order_relaxed);

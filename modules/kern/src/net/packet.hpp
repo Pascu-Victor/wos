@@ -29,12 +29,14 @@ constexpr size_t PKT_POOL_DIAGNOSTIC_GROW_MAX = 4096;
 
 struct PacketPoolSnapshot {
     size_t capacity = 0;
+    size_t chunk_count = 0;
     size_t free = 0;
     size_t used = 0;
     size_t rx_reserve = 0;
     size_t grow_chunk = 0;
     size_t buffer_size = 0;
     size_t object_size = 0;
+    size_t physical_pages_per_buffer = 0;
     size_t headroom = 0;
     size_t baseline_capacity = 0;
     size_t active_capacity = 0;
@@ -55,21 +57,27 @@ struct PacketPoolReclaimStats {
     size_t after_draining_free = 0;
     size_t freed_chunks = 0;
     size_t freed_buffers = 0;
+    size_t freed_pages = 0;
+    size_t scanned_chunks = 0;
+    size_t inspected_free_buffers = 0;
     size_t marked_draining_chunks = 0;
     size_t marked_draining_buffers = 0;
     size_t deactivated_free_buffers = 0;
+    bool has_more = false;
 };
 
 struct PacketBuffer {
     std::array<uint8_t, PKT_BUF_SIZE> storage{};
-    void* pool_chunk{};    // Private pool ownership; stable for the buffer lifetime
-    uint8_t* data{};       // current data pointer
-    size_t len{};          // current data length
-    PacketBuffer* next{};  // freelist / queue linkage
-    NetDevice* dev{};      // source/dest device
-    void* lifetime_ctx{};  // optional owner released when pkt_free() consumes the buffer
+    void* pool_chunk{};         // Private pool ownership; stable for the buffer lifetime
+    uint8_t* data{};            // current data pointer
+    size_t len{};               // current data length
+    PacketBuffer* next{};       // freelist / queue linkage
+    PacketBuffer* pool_prev{};  // private O(1) unlink while the buffer is on a pool freelist
+    NetDevice* dev{};           // source/dest device
+    void* lifetime_ctx{};       // optional owner released when pkt_free() consumes the buffer
     void (*lifetime_release)(void*) = nullptr;
     uint16_t protocol{};        // EtherType (host byte order)
+    bool pool_linked{};         // private pool freelist membership
     proto::MacAddress src_mac;  // incoming source MAC (for reply use)
 #ifdef WOS_NET_PACKET_DEBUG
     bool debug_in_use = false;
@@ -113,6 +121,8 @@ auto pkt_pool_size() -> size_t;                                     // Get curre
 auto pkt_pool_free_count() -> size_t;                               // Approximate free buffers available
 auto pkt_pool_snapshot() -> PacketPoolSnapshot;
 auto pkt_pool_try_snapshot(PacketPoolSnapshot& snapshot) -> bool;
+[[nodiscard]] auto pkt_pool_reclaimable_pages() -> size_t;
+auto pkt_pool_reclaim_bounded(size_t target_capacity, size_t max_free_chunks, size_t max_inspect_chunks) -> PacketPoolReclaimStats;
 auto pkt_pool_reclaim_free(size_t target_capacity) -> PacketPoolReclaimStats;
 auto pkt_pool_reclaim_for_pressure() -> size_t;
 auto pkt_pool_populate_reclaimable(size_t count) -> bool;

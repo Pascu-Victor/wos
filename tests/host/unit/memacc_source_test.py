@@ -11,10 +11,13 @@ PROCFS_CPP = ROOT / "modules" / "kern" / "src" / "vfs" / "fs" / "procfs.cpp"
 PHYS_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "mm" / "phys.opt.cpp"
 OOM_DUMP_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "mm" / "oom_dump.cpp"
 PACKET_CPP = ROOT / "modules" / "kern" / "src" / "net" / "packet.cpp"
+NET_CPP = ROOT / "modules" / "kern" / "src" / "net" / "net.cpp"
 E1000_CPP = ROOT / "modules" / "kern" / "src" / "dev" / "e1000e" / "e1000e.cpp"
 VIRTIO_NET_CPP = ROOT / "modules" / "kern" / "src" / "dev" / "virtio" / "virtio_net.cpp"
 VIRT_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "mm" / "virt.opt.cpp"
 VMEM_CPP = ROOT / "modules" / "kern" / "src" / "syscalls_impl" / "vmem" / "sys_vmem.cpp"
+MEMACC_COMMANDS_CPP = ROOT / "modules" / "memacc" / "src" / "commands.cpp"
+MEMACC_REPORTS_CPP = ROOT / "modules" / "memacc" / "src" / "reports.cpp"
 
 
 def fail(message: str) -> None:
@@ -216,17 +219,49 @@ def test_pressure_reclaim_is_real_and_preserves_network_reserve() -> None:
     require_tokens(
         reclaim,
         [
-            "target_capacity = std::max(target_capacity, pool_reserve_capacity)",
-            "!chunk->reclaimable || chunk->free != chunk->count",
-            "pool_capacity - chunk->count < target_capacity",
-            "free_count.fetch_sub(chunk->count",
-            "free_packet_buffer_array(chunk->buffers, chunk->count)",
-            "chunk->draining = true",
-            "free_count.fetch_sub(removed",
-            "active_capacity - chunk->count < pool_reserve_capacity",
-            "stats.marked_draining_buffers += chunk->count",
+            "pkt_pool_reclaim_bounded(target_capacity, SIZE_MAX, SIZE_MAX)",
         ],
-        "packet growth-chunk pressure reclaim",
+        "legacy packet reclaim wrapper",
+    )
+    bounded_reclaim = function_body(packet, "pkt_pool_reclaim_bounded")
+    require_tokens(
+        bounded_reclaim,
+        [
+            "target_capacity = std::max(target_capacity, pool_reserve_capacity)",
+            "INSPECTION_LIMIT = std::min(max_inspect_chunks, pool_chunk_count)",
+            "stats.scanned_chunks < INSPECTION_LIMIT",
+            "stats.freed_chunks < max_free_chunks",
+            "unlink_packet_free_locked(pkt, chunk)",
+            "stats.inspected_free_buffers++",
+            "stats.freed_pages += CHUNK_PAGES",
+            "chunk->draining || (active_capacity >= chunk->count && active_capacity - chunk->count >= target_capacity)",
+            "chunk->draining = true",
+            "active_capacity - chunk->count >= target_capacity",
+            "free_packet_buffer_array(chunk->buffers, chunk->count)",
+        ],
+        "bounded packet growth-chunk pressure reclaim",
+    )
+    require_tokens(
+        function_body(packet, "packet_pool_reclaim_count"),
+        ["pool_reclaimable_chunks", "pool_full_reclaimable_chunks", "pool_chunk_count"],
+        "constant-time packet shrinker count categories",
+    )
+    require_tokens(
+        function_body(packet, "pkt_pool_init"),
+        [
+            "if (initialized)",
+            '.name = "packet_pool"',
+            ".rank = 5",
+            ".min_priority = ker::mod::mm::reclaim::ReclaimPriority::NORMAL",
+            ".max_batch_units = 1",
+            "register_shrinker(SHRINKER)",
+        ],
+        "idempotent real-boot packet shrinker registration",
+    )
+    require_tokens(
+        function_body(NET_CPP.read_text(), "init"),
+        ["pkt_pool_init()"],
+        "network boot must reach packet shrinker registration",
     )
 
     procfs = PROCFS_CPP.read_text()
@@ -237,11 +272,62 @@ def test_pressure_reclaim_is_real_and_preserves_network_reserve() -> None:
             "PKT_POOL_DIAGNOSTIC_GROW_MAX",
             "pkt_pool_populate_reclaimable",
             '"memacc/reclaim/file_mmap_cache"',
-            "file_mmap_cache_reclaim",
             '"memacc/reclaim/xfs_inode"',
-            "xfs_icache_reclaim_for_pressure",
+            '"memacc/reclaim/coordinator"',
+            '"zone_watermark"',
+            '"reclaim_shrinker"',
+            '"count_reclaimable"',
+            '"count_dirty"',
+            '"count_pinned"',
+            '"count_reserved"',
+            '"count_unreclaimable"',
+            '"scanned_pages"',
+            '"scanned_bytes"',
+            '"scanned_objects"',
+            '"reported_pages"',
+            '"reported_bytes"',
+            '"reported_objects"',
+            '"reclaimed_pages"',
+            '"reclaimed_bytes"',
+            '"explicit_requests"',
+            '"explicit_completions"',
+            '"explicit_rejections"',
+            '"chunk_count"',
         ],
-        "controlled cache pressure interfaces",
+        "coordinator-routed pressure and additive telemetry interfaces",
+    )
+    require_tokens(
+        function_body(procfs, "procfs_request_explicit_reclaim"),
+        ["ReclaimContext::EXPLICIT", "request_explicit(REQUEST, shrinker)"],
+        "manual reclaim worker routing",
+    )
+    for writer, shrinker, forbidden in (
+        ("procfs_write_memacc_reclaim_buffer_cache", "buffer_cache", "reclaim_clean_buffer_cache("),
+        ("procfs_write_memacc_reclaim_packet_pool", "packet_pool", "pkt_pool_reclaim_free("),
+        ("procfs_write_memacc_reclaim_xfs_inode", "xfs_inode", "xfs_icache_reclaim_for_pressure("),
+        ("procfs_write_memacc_reclaim_file_mmap_cache", "file_mmap_cache", "file_mmap_cache_reclaim("),
+    ):
+        body = function_body(procfs, writer)
+        require_tokens(body, ["procfs_request_explicit_reclaim", f'"{shrinker}"'], f"{shrinker} targeted coordinator write")
+        require_absent(body, [forbidden], f"{shrinker} procfs pressure bypass")
+
+    require_tokens(
+        function_body(procfs, "procfs_write_memacc_reclaim_packet_pool"),
+        ["BEFORE.capacity > TARGET_CAPACITY", "BEFORE.capacity - TARGET_CAPACITY"],
+        "packet reclaim must revisit fully returned draining chunks",
+    )
+
+    commands = MEMACC_COMMANDS_CPP.read_text()
+    reports = MEMACC_REPORTS_CPP.read_text()
+    require_tokens(
+        commands,
+        ['"reclaim/coordinator"', "read_explicit_reclaim_progress", "wait_for_explicit_reclaim", '"explicit_completions"'],
+        "memacc raw-all capture and bounded explicit completion wait",
+    )
+    require_tokens(
+        function_body(reports, "print_reclaim_coordinator"),
+        ['read_rows("reclaim/coordinator")', '"reclaim_coordinator"', '"reclaim_shrinker"'],
+        "memacc concise coordinator report",
     )
 
 

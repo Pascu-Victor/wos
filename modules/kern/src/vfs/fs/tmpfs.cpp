@@ -14,6 +14,7 @@
 #include <platform/mm/page_alloc.hpp>
 #include <platform/mm/paging.hpp>
 #include <platform/mm/phys.hpp>
+#include <platform/mm/reclaim.hpp>
 #include <platform/mm/swap.hpp>
 #include <platform/sys/mutex.hpp>
 #include <platform/sys/spinlock.hpp>
@@ -75,6 +76,9 @@ TmpNode* root_node = nullptr;                   // NOLINT(cppcoreguidelines-avoi
 ker::mod::sys::Spinlock tmpfs_lock;             // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 ker::mod::sys::Mutex tmpfs_node_registry_lock;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 ker::util::SmallVec<TmpNode*, 64> tmpfs_nodes;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::atomic<uint64_t> tmpfs_resident_pages{0};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::atomic<uint64_t> tmpfs_reclaim_node_cursor{0};
+std::atomic<bool> tmpfs_shrinker_registered{false};
 }  // namespace
 
 // --- Internal helpers ---
@@ -251,7 +255,10 @@ void register_tmp_node(TmpNode* node) {
         return;
     }
     ker::mod::sys::MutexGuard guard(tmpfs_node_registry_lock);
-    static_cast<void>(tmpfs_nodes.push_back(node));
+    node->reclaim_registered = tmpfs_nodes.push_back(node);
+    if (node->reclaim_registered && node->resident_pages != 0) {
+        tmpfs_resident_pages.fetch_add(node->resident_pages, std::memory_order_relaxed);
+    }
 }
 
 void unregister_tmp_node(TmpNode* node) {
@@ -259,7 +266,11 @@ void unregister_tmp_node(TmpNode* node) {
         return;
     }
     ker::mod::sys::MutexGuard guard(tmpfs_node_registry_lock);
-    static_cast<void>(tmpfs_nodes.remove(node));
+    if (node->reclaim_registered) {
+        static_cast<void>(tmpfs_nodes.remove(node));
+        tmpfs_resident_pages.fetch_sub(node->resident_pages, std::memory_order_relaxed);
+        node->reclaim_registered = false;
+    }
 }
 
 auto mount_try_charge(TmpNode* node) -> bool {
@@ -312,8 +323,16 @@ auto ensure_page_descriptors(TmpNode* node, size_t required_pages) -> bool {
 }
 
 void release_page_locked(TmpNode* node, TmpPage& page, bool uncharge) {
-    if (page.state == TmpPageState::RESIDENT && page.data != nullptr) {
-        ker::mod::mm::phys::page_free(page.data);
+    if (page.state == TmpPageState::RESIDENT) {
+        if (page.data != nullptr) {
+            ker::mod::mm::phys::page_free(page.data);
+        }
+        if (node != nullptr && node->resident_pages != 0) {
+            node->resident_pages--;
+            if (node->reclaim_registered) {
+                tmpfs_resident_pages.fetch_sub(1, std::memory_order_relaxed);
+            }
+        }
     } else if (page.state == TmpPageState::SWAPPED && ker::mod::mm::swap::slot_valid(page.swap_slot)) {
         static_cast<void>(ker::mod::mm::swap::free_slot(page.swap_slot));
     }
@@ -348,23 +367,125 @@ auto evict_page_locked(TmpNode* node, size_t index) -> int {
     page.data = nullptr;
     page.swap_slot = slot;
     page.state = TmpPageState::SWAPPED;
+    if (node->resident_pages != 0) {
+        node->resident_pages--;
+        if (node->reclaim_registered) {
+            tmpfs_resident_pages.fetch_sub(1, std::memory_order_relaxed);
+        }
+    }
     return 0;
 }
 
-auto reclaim_from_node_locked(TmpNode* node, size_t target_pages, size_t skip_index = static_cast<size_t>(-1)) -> size_t {
-    if (node == nullptr || target_pages == 0 || !ker::mod::mm::swap::swap_available()) {
-        return 0;
+struct TmpfsReclaimResult {
+    size_t reclaimed{};
+    size_t scanned{};
+};
+
+auto reclaim_from_node_locked_bounded(TmpNode* node, size_t target_pages, size_t scan_budget, size_t skip_index = static_cast<size_t>(-1))
+    -> TmpfsReclaimResult {
+    TmpfsReclaimResult result{};
+    if (node == nullptr || target_pages == 0 || scan_budget == 0 || node->page_count == 0 || !ker::mod::mm::swap::swap_available()) {
+        return result;
     }
-    size_t reclaimed = 0;
-    for (size_t i = 0; i < node->page_count && reclaimed < target_pages; ++i) {
-        if (i == skip_index) {
+    size_t const START = node->reclaim_cursor % node->page_count;
+    size_t const MAX_SCAN = std::min(scan_budget, node->page_count);
+    while (result.scanned < MAX_SCAN && result.reclaimed < target_pages) {
+        size_t const INDEX = (START + result.scanned) % node->page_count;
+        result.scanned++;
+        if (INDEX == skip_index) {
             continue;
         }
-        if (evict_page_locked(node, i) == 0) {
-            reclaimed++;
+        if (evict_page_locked(node, INDEX) == 0) {
+            result.reclaimed++;
         }
     }
-    return reclaimed;
+    node->reclaim_cursor = (START + result.scanned) % node->page_count;
+    return result;
+}
+
+auto reclaim_from_node_locked(TmpNode* node, size_t target_pages, size_t skip_index = static_cast<size_t>(-1)) -> size_t {
+    return reclaim_from_node_locked_bounded(node, target_pages, SIZE_MAX, skip_index).reclaimed;
+}
+
+auto tmpfs_reclaim_bounded(size_t target_pages, size_t scan_budget) -> TmpfsReclaimResult {
+    TmpfsReclaimResult result{};
+    if (target_pages == 0 || scan_budget == 0 || !ker::mod::mm::swap::swap_available()) {
+        return result;
+    }
+
+    size_t const NODE_BUDGET = scan_budget;
+    uint64_t const START = tmpfs_reclaim_node_cursor.fetch_add(NODE_BUDGET, std::memory_order_relaxed);
+    size_t nodes_examined = 0;
+    while (nodes_examined < NODE_BUDGET && result.scanned < scan_budget && result.reclaimed < target_pages) {
+        TmpNode* node = nullptr;
+        tmpfs_node_registry_lock.lock();
+        size_t const NODE_COUNT = tmpfs_nodes.size();
+        if (NODE_COUNT != 0) {
+            size_t const INDEX = static_cast<size_t>((START + nodes_examined) % NODE_COUNT);
+            node = tmpfs_nodes.at(INDEX);
+            if (node != nullptr && !node->io_lock.try_lock()) {
+                node = nullptr;
+            }
+        }
+        nodes_examined++;
+        tmpfs_node_registry_lock.unlock();
+
+        if (node == nullptr) {
+            continue;
+        }
+        TmpNode* canonical = tmpfs_canonical_node(node);
+        if (canonical == node && node->type == TmpNodeType::FILE) {
+            TmpfsReclaimResult const NODE_RESULT =
+                reclaim_from_node_locked_bounded(node, target_pages - result.reclaimed, scan_budget - result.scanned);
+            result.reclaimed += NODE_RESULT.reclaimed;
+            result.scanned += NODE_RESULT.scanned;
+        }
+        node->io_lock.unlock();
+    }
+    return result;
+}
+
+auto tmpfs_reclaim_count(void*, const ker::mod::mm::reclaim::ReclaimRequest&) -> ker::mod::mm::reclaim::ReclaimCount {
+    uint64_t const RESIDENT = tmpfs_resident_pages.load(std::memory_order_relaxed);
+    ker::mod::mm::swap::SwapStats stats{};
+    ker::mod::mm::swap::get_stats(&stats);
+    uint64_t const FREE_SLOTS = stats.free_bytes / DEFAULT_TMPFS_BLOCK_SIZE;
+    uint64_t const RECLAIMABLE = std::min(RESIDENT, FREE_SLOTS);
+    return {.reclaimable = RECLAIMABLE, .unreclaimable = RESIDENT - RECLAIMABLE};
+}
+
+auto tmpfs_reclaim_scan(void*, const ker::mod::mm::reclaim::ReclaimRequest& request) -> ker::mod::mm::reclaim::ReclaimScanResult {
+    size_t const PAGE_BUDGET = static_cast<size_t>(std::min<uint64_t>(request.budget_units, SIZE_MAX));
+    size_t const SCAN_BUDGET = static_cast<size_t>(std::min<uint64_t>(request.scan_budget_units, SIZE_MAX));
+    TmpfsReclaimResult const RESULT = tmpfs_reclaim_bounded(PAGE_BUDGET, SCAN_BUDGET);
+    return {
+        .scanned = RESULT.scanned,
+        .reclaimed = RESULT.reclaimed,
+        .has_more = tmpfs_resident_pages.load(std::memory_order_relaxed) != 0,
+    };
+}
+
+void register_tmpfs_shrinker() {
+    bool expected = false;
+    if (!tmpfs_shrinker_registered.compare_exchange_strong(expected, true, std::memory_order_acq_rel, std::memory_order_acquire)) {
+        return;
+    }
+    ker::mod::mm::reclaim::Shrinker const SHRINKER{
+        .name = "tmpfs",
+        .unit = ker::mod::mm::reclaim::ReclaimUnit::PAGES,
+        .scan_unit = ker::mod::mm::reclaim::ReclaimUnit::PAGES,
+        .rank = 6,
+        .min_priority = ker::mod::mm::reclaim::ReclaimPriority::CRITICAL,
+        .capabilities =
+            ker::mod::mm::reclaim::RECLAIM_MAY_BLOCK | ker::mod::mm::reclaim::RECLAIM_MAY_IO | ker::mod::mm::reclaim::RECLAIM_MAY_ALLOCATE,
+        .max_batch_units = 32,
+        .max_scan_units = 4096,
+        .count = tmpfs_reclaim_count,
+        .scan = tmpfs_reclaim_scan,
+    };
+    if (!ker::mod::mm::reclaim::register_shrinker(SHRINKER)) {
+        tmpfs_shrinker_registered.store(false, std::memory_order_release);
+    }
 }
 
 auto allocate_resident_page(TmpNode* node, size_t page_index) -> void* {
@@ -416,6 +537,10 @@ auto ensure_page_resident_locked(TmpNode* node, size_t page_index, TmpPage** out
     page.state = TmpPageState::RESIDENT;
     page.data = data;
     page.swap_slot = ker::mod::mm::swap::invalid_slot();
+    node->resident_pages++;
+    if (node->reclaim_registered) {
+        tmpfs_resident_pages.fetch_add(1, std::memory_order_relaxed);
+    }
     *out_page = &page;
     return 0;
 }
@@ -937,6 +1062,7 @@ void register_tmpfs() {
     if (root_node == nullptr) {
         root_node = create_root_node_internal();
     }
+    register_tmpfs_shrinker();
 }
 
 auto create_root_node() -> TmpNode* { return create_root_node_internal(); }

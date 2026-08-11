@@ -291,6 +291,7 @@ if(WOS_KASAN)
         src/platform/mm/addr.opt.cpp
         src/platform/mm/paging.opt.cpp
         src/platform/mm/page_alloc.cpp
+        src/platform/mm/reclaim.cpp
         src/platform/mm/dyn/kmalloc.opt.cpp
         src/platform/mm/dyn/slab.opt.cpp
         src/minimalist_malloc/mini_malloc.cpp

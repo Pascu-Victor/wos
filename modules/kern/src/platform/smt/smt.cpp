@@ -29,6 +29,7 @@
 #include "platform/mm/mm.hpp"
 #include "platform/mm/paging.hpp"
 #include "platform/mm/phys.hpp"
+#include "platform/mm/reclaim.hpp"
 #include "platform/mm/virt.hpp"
 #include "platform/sched/scheduler.hpp"
 #include "platform/sched/task.hpp"
@@ -851,6 +852,7 @@ void start_smt(boot::HandoverModules& modules, uint64_t kernel_rsp) {
     dbg::log("Creating init task(s) from handover modules");
     create_init_tasks(modules);
     sched::start_gc_worker();
+    mm::reclaim::start_worker();
 
     // Start the TCP timer as a kernel thread (DAEMON) instead of running it in interrupt context
     ker::net::proto::tcp_timer_thread_start();

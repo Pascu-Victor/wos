@@ -107,6 +107,14 @@ struct OwnedFrameStatsSnapshot {
     uint64_t purge_removed;
 };
 
+struct KernelVmapReclaimStats {
+    size_t scanned_pages{};
+    size_t reclaimed_pages{};
+    bool has_more{};
+    bool failed{};
+    bool unsafe_context{};
+};
+
 enum class LazyFilePageInstallResult : uint8_t {
     MAPPED,
     ALREADY_MAPPED,
@@ -149,6 +157,11 @@ void init_kernel_vmap();
 auto kernel_vmap_alloc(PhysicalPageOwner owner, uint64_t size, std::string_view name = {}) -> void*;
 void kernel_vmap_free(void* ptr, uint64_t size);
 [[nodiscard]] auto kernel_vmap_contains(const void* ptr) -> bool;
+// Exact deferred backing pages that a safe-context drain can return.
+[[nodiscard]] auto kernel_vmap_pending_free_pages() -> size_t;
+// Release at most max_pages deferred mappings. The PTE invalidation, global
+// TLB shootdown, and physical-reference release ordering is unchanged.
+[[nodiscard]] auto drain_kernel_vmap_frees_bounded(size_t max_pages) -> KernelVmapReclaimStats;
 // Complete frees deferred by IRQ-disabled callers. Safe contexts may call this
 // opportunistically; it is a no-op while IRQs or preemption are disabled.
 void drain_kernel_vmap_frees();

@@ -281,11 +281,13 @@ def test_allocator_size_rounding_rejects_overflow_and_overmax_requests() -> None
     require_order(
         phys_alloc_body,
         [
+            "int requested_order = 0",
             "uint64_t requested_pages = 0",
-            "if (!page_alloc_size_within_buddy_limit(size, requested_pages))",
+            "if (!page_alloc_order_for_size(size, requested_order, requested_pages))",
             "return nullptr",
             "find_free_block(size, owner, CALLER_TAG)",
             "prepare_allocated_block(block, size, zeroing)",
+            "reclaim::note_allocation(static_cast<uint8_t>(requested_order)",
         ],
         "regular phys allocation must validate before zone search and zeroing",
     )
@@ -299,13 +301,43 @@ def test_allocator_size_rounding_rejects_overflow_and_overmax_requests() -> None
     require_order(
         reclaim_body,
         [
+            "int requested_order = 0",
             "uint64_t requested_pages = 0",
-            "if (!page_alloc_size_within_buddy_limit(size, requested_pages))",
+            "if (!page_alloc_order_for_size(size, requested_order, requested_pages))",
             "return nullptr",
-            "virt::drain_kernel_vmap_frees()",
-            "for (uint32_t attempt = 0; attempt < retry_count; ++attempt)",
+            "RECLAIM_PASS_LIMIT = std::min(retry_count, reclaim::DIRECT_RECLAIM_MAX_PASSES)",
+            "reclaim::reclaim_for_allocation(static_cast<uint8_t>(requested_order), requested_pages)",
+            "attempt < RECLAIM_PASS_LIMIT",
+            "reclaim_passes >= RECLAIM_PASS_LIMIT",
+            "reclaim::request_background(static_cast<uint8_t>(requested_order), requested_pages)",
         ],
-        "reclaim allocation must reject invalid sizes before reclaim retries",
+        "reclaim allocation must reject invalid sizes and use bounded coordinator retries",
+    )
+    require_order(
+        reclaim_body,
+        [
+            "reclaim::ReclaimRunResult const PREFLIGHT =",
+            "nested_reclaim = PREFLIGHT.recursion_avoided",
+            "if (!CAN_RECLAIM || nested_reclaim || reclaim_passes >= RECLAIM_PASS_LIMIT)",
+            "if (RECLAIM.recursion_avoided)",
+            "sched::kern_yield_impl(reinterpret_cast<uint64_t>(caller_addr))",
+        ],
+        "nested allocator reclaim must leave the outer shrinker without retrying or yielding under subsystem locks",
+    )
+    for subsystem_call in (
+        "virt::drain_kernel_vmap_frees",
+        "sched::reclaim_memory_pressure",
+        "reclaim_clean_buffer_cache_for_pressure",
+        "file_mmap_cache_reclaim",
+        "xfs_icache_reclaim_for_pressure",
+        "pkt_pool_reclaim_for_pressure",
+        "tmpfs_reclaim_pages",
+    ):
+        require_absent(reclaim_body, subsystem_call, "physical allocator reclaim isolation")
+    require_tokens(
+        PHYS_HPP.read_text(),
+        ["PAGE_ALLOC_RECLAIM_RETRY_DEFAULT = 8"],
+        "direct reclaim retry cap",
     )
 
     huge_body = function_body(phys, "page_alloc_huge")

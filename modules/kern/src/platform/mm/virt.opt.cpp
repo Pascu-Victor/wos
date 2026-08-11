@@ -35,6 +35,8 @@
 #include "platform/mm/page_alloc.hpp"
 #include "platform/mm/paging.hpp"
 #include "platform/mm/phys.hpp"
+#include "platform/mm/reclaim.hpp"
+#include "platform/mm/reclaim_policy.hpp"
 #include "platform/sched/threading.hpp"
 #include "syscalls_impl/vmem/sys_vmem.hpp"
 #include "util/hcf.hpp"
@@ -290,7 +292,10 @@ auto queue_kernel_vmap_free(size_t first_page, size_t page_count) -> bool {
     return true;
 }
 
-auto find_pending_kernel_vmap_run(size_t& first_page, size_t& page_count) -> bool {
+auto find_pending_kernel_vmap_run(size_t max_pages, size_t& first_page, size_t& page_count) -> bool {
+    if (max_pages == 0) {
+        return false;
+    }
     uint64_t const FLAGS = kernel_vmap_lock.lock_irqsave();
     size_t page = kernel_vmap_pending_first_page;
     while (page < kernel_vmap_active_pages && !kernel_vmap_pending_bit_is_set(page)) {
@@ -303,7 +308,7 @@ auto find_pending_kernel_vmap_run(size_t& first_page, size_t& page_count) -> boo
     }
 
     first_page = page;
-    while (page < kernel_vmap_active_pages && kernel_vmap_pending_bit_is_set(page)) {
+    while (page < kernel_vmap_active_pages && kernel_vmap_pending_bit_is_set(page) && page - first_page < max_pages) {
         kernel_vmap_bit_set(page);
         ++page;
     }
@@ -3684,6 +3689,25 @@ auto kernel_vmap_context_can_drain() -> bool {
     return sched::has_run_queues() && sched::preempt_count() == 0 && sched::interrupts_enabled();
 }
 
+auto kernel_vmap_reclaim_count(void* /*opaque*/, const reclaim::ReclaimRequest& /*request*/) -> reclaim::ReclaimCount {
+    return {.reclaimable = kernel_vmap_pending_free_pages()};
+}
+
+auto kernel_vmap_reclaim_scan(void* /*opaque*/, const reclaim::ReclaimRequest& request) -> reclaim::ReclaimScanResult {
+    uint64_t budget_pages = request.budget_units;
+    if (request.scan_budget_units != 0) {
+        budget_pages = std::min(budget_pages, request.scan_budget_units);
+    }
+    size_t const BUDGET = budget_pages > SIZE_MAX ? SIZE_MAX : static_cast<size_t>(budget_pages);
+    auto const STATS = drain_kernel_vmap_frees_bounded(BUDGET);
+    return {
+        .scanned = STATS.scanned_pages,
+        .reclaimed = STATS.reclaimed_pages,
+        .has_more = STATS.has_more,
+        .failed = STATS.failed,
+    };
+}
+
 }  // namespace
 
 void init_kernel_vmap() {
@@ -3718,6 +3742,21 @@ void init_kernel_vmap() {
     }
 
     kernel_vmap_initialized = true;
+    constexpr reclaim::Shrinker SHRINKER{
+        .name = "kernel_vmap",
+        .unit = reclaim::ReclaimUnit::PAGES,
+        .scan_unit = reclaim::ReclaimUnit::PAGES,
+        .rank = 0,
+        .min_priority = reclaim::ReclaimPriority::LOW,
+        .capabilities = reclaim::RECLAIM_MAY_BLOCK,
+        .max_batch_units = 512,
+        .max_scan_units = 512,
+        .count = kernel_vmap_reclaim_count,
+        .scan = kernel_vmap_reclaim_scan,
+    };
+    if (!reclaim::register_shrinker(SHRINKER)) {
+        log::critical("failed to register kernel-vmap reclaim shrinker");
+    }
 #ifdef WOS_SELFTEST
     selftest_register_kernel_page_tables();
     selftest_audit_boot_direct_map_boundaries("post-kernel-vmap-init");
@@ -3726,41 +3765,65 @@ void init_kernel_vmap() {
               kernel_vmap_active_pages);
 }
 
-void drain_kernel_vmap_frees() {
-    if (!kernel_vmap_initialized || !kernel_vmap_context_can_drain()) {
-        return;
+auto kernel_vmap_pending_free_pages() -> size_t {
+    if (!kernel_vmap_initialized) {
+        return 0;
+    }
+    uint64_t const FLAGS = kernel_vmap_lock.lock_irqsave();
+    size_t const PENDING = kernel_vmap_pending_pages;
+    kernel_vmap_lock.unlock_irqrestore(FLAGS);
+    return PENDING;
+}
+
+auto drain_kernel_vmap_frees_bounded(size_t max_pages) -> KernelVmapReclaimStats {
+    KernelVmapReclaimStats stats{};
+    if (!kernel_vmap_initialized || max_pages == 0) {
+        stats.has_more = kernel_vmap_pending_free_pages() != 0;
+        return stats;
+    }
+    if (!kernel_vmap_context_can_drain()) {
+        stats.has_more = kernel_vmap_pending_free_pages() != 0;
+        stats.unsafe_context = stats.has_more;
+        return stats;
     }
 
     bool expected = false;
     if (!kernel_vmap_draining.compare_exchange_strong(expected, true, std::memory_order_acq_rel, std::memory_order_relaxed)) {
-        return;
+        stats.has_more = kernel_vmap_pending_free_pages() != 0;
+        return stats;
     }
 
-    while (true) {
+    while (stats.reclaimed_pages < max_pages) {
         size_t first_page = 0;
         size_t page_count = 0;
-        bool failed = false;
-        while (find_pending_kernel_vmap_run(first_page, page_count)) {
-            vaddr_t const START = KERNEL_VMAP_BASE + (first_page * paging::PAGE_SIZE);
-            if (!release_kernel_vmap_mappings(START, page_count)) {
-                log::critical("failed to release deferred kernel vmap run: ptr=%p pages=%zu", START, page_count);
-                failed = true;
-                break;
-            }
-            if (!release_kernel_vmap_span(first_page, page_count, true)) {
-                log::critical("kernel vmap pending bitmap mismatch: ptr=%p pages=%zu", START, page_count);
-                failed = true;
-                break;
-            }
+        size_t const REMAINING = max_pages - stats.reclaimed_pages;
+        if (!find_pending_kernel_vmap_run(REMAINING, first_page, page_count)) {
+            break;
         }
-
-        kernel_vmap_draining.store(false, std::memory_order_release);
-        if (failed || !kernel_vmap_context_can_drain() || !kernel_vmap_has_pending_frees()) {
-            return;
+        stats.scanned_pages += page_count;
+        vaddr_t const START = KERNEL_VMAP_BASE + (first_page * paging::PAGE_SIZE);
+        if (!release_kernel_vmap_mappings(START, page_count)) {
+            log::critical("failed to release deferred kernel vmap run: ptr=%p pages=%zu", START, page_count);
+            stats.failed = true;
+            break;
         }
+        if (!release_kernel_vmap_span(first_page, page_count, true)) {
+            log::critical("kernel vmap pending bitmap mismatch: ptr=%p pages=%zu", START, page_count);
+            stats.failed = true;
+            break;
+        }
+        stats.reclaimed_pages += page_count;
+    }
 
-        expected = false;
-        if (!kernel_vmap_draining.compare_exchange_strong(expected, true, std::memory_order_acq_rel, std::memory_order_relaxed)) {
+    kernel_vmap_draining.store(false, std::memory_order_release);
+    stats.has_more = kernel_vmap_has_pending_frees();
+    return stats;
+}
+
+void drain_kernel_vmap_frees() {
+    while (kernel_vmap_context_can_drain()) {
+        auto const STATS = drain_kernel_vmap_frees_bounded(SIZE_MAX);
+        if (STATS.failed || !STATS.has_more || STATS.reclaimed_pages == 0) {
             return;
         }
     }

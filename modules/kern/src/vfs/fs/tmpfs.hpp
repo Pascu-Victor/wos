@@ -34,6 +34,10 @@ struct TmpNode {
     size_t page_count = 0;
     // Materialized pages charged to the mount.
     size_t charged_pages = 0;
+    // Resident pages currently reachable by the global pressure scanner.
+    size_t resident_pages = 0;
+    size_t reclaim_cursor = 0;
+    bool reclaim_registered = false;
     TmpfsMount* mount = nullptr;
     std::array<char, TMPFS_NAME_MAX> name{};  // Owned name copy
     TmpNodeType type = TmpNodeType::FILE;

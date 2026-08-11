@@ -1,5 +1,5 @@
 #!/bin/bash
-# Capture and validate one coherent physical-memory checkpoint on each WOS node.
+# Capture and validate one exact physical-memory checkpoint on each WOS node.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -164,10 +164,11 @@ for host in "${system_array[@]}"; do
     cpustate_file="$checkpoint_dir/$host-kcpustate.txt"
     meminfo_file="$checkpoint_dir/$host-meminfo.txt"
 
-    # `raw all` takes one internally coherent memacc snapshot. Derive the
-    # summary evidence from that same read so both the balance equation and
-    # quiescence checks describe one bounded instant; a preceding remote
-    # summary process would itself appear transiently on the dead queue.
+    # `raw all` reads procfs endpoints sequentially. Its summary section is one
+    # internally coherent physical-accounting snapshot and is authoritative for
+    # the exact balance equation; derive it from this output so a second remote
+    # memacc process does not itself appear transiently on the dead queue. The
+    # remaining sections are bounded adjacent observations, not one atomic view.
     "$WOS_SSH" "$host" /usr/bin/memacc raw all > "$all_file"
     awk '
         NR == 1 && $0 == "== summary ==" { in_summary = 1; next }

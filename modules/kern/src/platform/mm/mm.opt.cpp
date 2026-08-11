@@ -7,6 +7,7 @@
 
 #include "platform/mm/addr.hpp"
 #include "platform/mm/phys.hpp"
+#include "platform/mm/reclaim.hpp"
 #include "platform/mm/virt.hpp"
 
 namespace {
@@ -48,6 +49,7 @@ void init() {
     log::info("memory manager initialized");
     phys::init(memmap_request.response);
     log::info("physical memory manager initialized");
+    reclaim::init();
     virt::init(memmap_request.response, kernel_file_request.response, kernel_address_request.response);
     log::info("virtual memory manager initialized");
     virt::init_pagemap();

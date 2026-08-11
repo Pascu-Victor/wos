@@ -3944,6 +3944,7 @@ def test_capability_gated_vfs_data_lanes_bound_rdma_buffers() -> None:
     lane_mount = function_body(source, "mount_vfs_proxy_lane")
     capability = function_body(wki, "wki_peer_capability_negotiated")
     lane_selftest = function_body(source, "wki_remote_vfs_selftest_multi_rdma_lane_selection")
+    round_robin_selftest = function_body(source, "wki_remote_vfs_selftest_lane_round_robin_uses_full_capacity")
 
     require_tokens(
         wire,
@@ -4049,6 +4050,19 @@ def test_capability_gated_vfs_data_lanes_bound_rdma_buffers() -> None:
         ],
         "selector selftest covers O_RDWR direction matching, auxiliary selection, cooldown, and message fallback",
     )
+    require_tokens(
+        round_robin_selftest,
+        [
+            "std::unique_ptr<ProxyVfsState[]> lanes",
+            "new (std::nothrow) ProxyVfsState[VFS_PROXY_LANE_COUNT]{}",
+            "if (lanes == nullptr)",
+            "auto& anchor = lanes[0]",
+            "for (size_t index = 1; index < VFS_PROXY_LANE_COUNT; ++index)",
+        ],
+        "full-capacity selector selftest keeps its large lane fixtures off the kernel stack",
+    )
+    if "ProxyVfsState anchor{}" in round_robin_selftest or "std::array<ProxyVfsState" in round_robin_selftest:
+        fail("full-capacity selector selftest must not restore its oversized automatic fixture")
     require_tokens(
         WKI_DEV_PROXY_KTEST.read_text(),
         [

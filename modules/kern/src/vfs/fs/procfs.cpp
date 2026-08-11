@@ -19,11 +19,14 @@
 #include <net/packet.hpp>
 #include <net/proto/tcp.hpp>
 #include <new>
+#include <platform/dbg/dbg.hpp>
 #include <platform/ktime/ktime.hpp>
 #include <platform/mm/addr.hpp>
 #include <platform/mm/dyn/kmalloc.hpp>
 #include <platform/mm/memacc.hpp>
 #include <platform/mm/phys.hpp>
+#include <platform/mm/reclaim.hpp>
+#include <platform/mm/reclaim_policy.hpp>
 #include <platform/mm/swap.hpp>
 #include <platform/mm/virt.hpp>
 #include <platform/perf/perf_events.hpp>
@@ -32,6 +35,7 @@
 #include <platform/sched/preemption_policy.hpp>
 #include <platform/sched/task.hpp>
 #include <platform/smt/smt.hpp>
+#include <string_view>
 #include <syscalls_impl/vmem/sys_vmem.hpp>
 #include <utility>
 #include <vfs/buffer_cache.hpp>
@@ -652,22 +656,6 @@ auto procfs_readdir(File* f, DirEntry* buf, size_t count) -> int {
             std::memcpy(buf->d_name.data(), "pipes", 6);
             return 0;
         }
-        if (count == 4) {
-            buf->d_ino = 44;
-            buf->d_off = 5;
-            buf->d_reclen = sizeof(DirEntry);
-            buf->d_type = DT_REG;
-            std::memcpy(buf->d_name.data(), "xfs_inode", 10);
-            return 0;
-        }
-        if (count == 5) {
-            buf->d_ino = 45;
-            buf->d_off = 6;
-            buf->d_reclen = sizeof(DirEntry);
-            buf->d_type = DT_REG;
-            std::memcpy(buf->d_name.data(), "file_mmap_cache", 16);
-            return 0;
-        }
         return -ENOENT;
     }
 
@@ -724,23 +712,20 @@ auto procfs_readdir(File* f, DirEntry* buf, size_t count) -> int {
     }
 
     if (pfd->node.type == ProcNodeType::MEMACC_RECLAIM_DIR) {
-        if (count == 2) {
-            buf->d_ino = 42;
-            buf->d_off = 3;
-            buf->d_reclen = sizeof(DirEntry);
-            buf->d_type = DT_REG;
-            std::memcpy(buf->d_name.data(), "buffer_cache", 13);
-            return 0;
+        constexpr std::array<const char*, 5> ENTRIES{
+            "buffer_cache", "packet_pool", "xfs_inode", "file_mmap_cache", "coordinator",
+        };
+        size_t const INDEX = count - 2;
+        if (INDEX >= ENTRIES.size()) {
+            return -ENOENT;
         }
-        if (count == 3) {
-            buf->d_ino = 43;
-            buf->d_off = 4;
-            buf->d_reclen = sizeof(DirEntry);
-            buf->d_type = DT_REG;
-            std::memcpy(buf->d_name.data(), "packet_pool", 12);
-            return 0;
-        }
-        return -ENOENT;
+        buf->d_ino = 42 + INDEX;
+        buf->d_off = count + 1;
+        buf->d_reclen = sizeof(DirEntry);
+        buf->d_type = DT_REG;
+        std::strncpy(buf->d_name.data(), ENTRIES.at(INDEX), buf->d_name.size() - 1);
+        buf->d_name[buf->d_name.size() - 1] = '\0';
+        return 0;
     }
 
     return -ENOENT;
@@ -2138,6 +2123,11 @@ void append_memacc_dec(char*& p, const char* end, const char* key, uint64_t valu
     append_dec64(p, end, value);
 }
 
+void append_memacc_sdec(char*& p, const char* end, const char* key, int64_t value) {
+    append_memacc_key(p, end, key);
+    append_sdec64(p, end, value);
+}
+
 void append_memacc_hex(char*& p, const char* end, const char* key, uint64_t value) {
     append_memacc_key(p, end, key);
     append_hex64(p, end, value);
@@ -3012,6 +3002,7 @@ auto generate_memacc_reclaim_packet_pool(char* buf, size_t bufsz) -> size_t {
     append_sconst(p, end, "reclaim");
     append_memacc_str(p, end, "name", "packet_pool");
     append_memacc_dec(p, end, "capacity", POOL.capacity);
+    append_memacc_dec(p, end, "chunk_count", POOL.chunk_count);
     append_memacc_dec(p, end, "baseline_capacity", POOL.baseline_capacity);
     append_memacc_dec(p, end, "active_capacity", POOL.active_capacity);
     append_memacc_dec(p, end, "free", POOL.free);
@@ -3020,6 +3011,8 @@ auto generate_memacc_reclaim_packet_pool(char* buf, size_t bufsz) -> size_t {
     append_memacc_dec(p, end, "draining_free", POOL.draining_free);
     append_memacc_dec(p, end, "buffer_size", POOL.buffer_size);
     append_memacc_dec(p, end, "object_size", POOL.object_size);
+    append_memacc_dec(p, end, "physical_pages_per_buffer", POOL.physical_pages_per_buffer);
+    append_memacc_dec(p, end, "physical_bytes_per_buffer", POOL.physical_pages_per_buffer * ker::mod::mm::paging::PAGE_SIZE);
     append_memacc_dec(p, end, "total_bytes", POOL.capacity * POOL.object_size);
     append_memacc_dec(p, end, "active_bytes", POOL.active_capacity * POOL.object_size);
     append_memacc_dec(p, end, "free_bytes", POOL.free * POOL.object_size);
@@ -3027,7 +3020,12 @@ auto generate_memacc_reclaim_packet_pool(char* buf, size_t bufsz) -> size_t {
     append_memacc_dec(p, end, "draining_bytes", POOL.draining_buffers * POOL.object_size);
     append_memacc_dec(p, end, "draining_free_bytes", POOL.draining_free * POOL.object_size);
     append_memacc_dec(p, end, "rx_reserve", POOL.rx_reserve);
+    append_memacc_dec(p, end, "tx_reserve", ker::net::PKT_POOL_TX_RESERVE);
+    append_memacc_dec(p, end, "permanent_reserve", POOL.baseline_capacity);
     append_memacc_dec(p, end, "grow_chunk", POOL.grow_chunk);
+    append_memacc_dec(p, end, "minimum_reclaim_quantum_buffers", POOL.grow_chunk);
+    append_memacc_dec(p, end, "minimum_reclaim_quantum_pages", POOL.grow_chunk * POOL.physical_pages_per_buffer);
+    append_memacc_bool(p, end, "reclaim_chunk_size_variable", true);
     append_memacc_dec(p, end, "default_target_capacity", std::max(POOL.baseline_capacity, POOL.used + POOL.rx_reserve + POOL.grow_chunk));
     append_char(p, end, '\n');
     *p = '\0';
@@ -3059,6 +3057,111 @@ auto generate_memacc_reclaim_file_mmap_cache(char* buf, size_t bufsz) -> size_t 
     append_memacc_dec(p, end, "bytes", CACHE.bytes);
     append_memacc_dec(p, end, "capacity_pages", CACHE.capacity_pages);
     append_char(p, end, '\n');
+    *p = '\0';
+    return static_cast<size_t>(p - buf);
+}
+
+auto generate_memacc_reclaim_coordinator(char* buf, size_t bufsz) -> size_t {
+    namespace reclaim = ker::mod::mm::reclaim;
+    char* p = buf;
+    char const* end = buf + bufsz - 1;
+
+    reclaim::GlobalStatsSnapshot global{};
+    reclaim::get_global_stats(global);
+    uint64_t attempts = reclaim::saturating_add(global.direct_attempts, global.background_attempts);
+    attempts = reclaim::saturating_add(attempts, global.explicit_attempts);
+
+    append_sconst(p, end, "reclaim_coordinator");
+    append_memacc_dec(p, end, "schema", 1);
+    append_memacc_str(p, end, "pressure", reclaim::pressure_name(global.current_pressure));
+    append_memacc_dec(p, end, "attempts", attempts);
+    append_memacc_dec(p, end, "direct_attempts", global.direct_attempts);
+    append_memacc_dec(p, end, "background_attempts", global.background_attempts);
+    append_memacc_dec(p, end, "explicit_attempts", global.explicit_attempts);
+    append_memacc_dec(p, end, "explicit_requests", global.explicit_requests);
+    append_memacc_dec(p, end, "explicit_completions", global.explicit_completions);
+    append_memacc_dec(p, end, "explicit_rejections", global.explicit_rejections);
+    append_memacc_dec(p, end, "scans", global.callbacks);
+    append_memacc_dec(p, end, "callbacks", global.callbacks);
+    append_memacc_dec(p, end, "scanned_pages", global.scanned_pages);
+    append_memacc_dec(p, end, "scanned_bytes", global.scanned_bytes);
+    append_memacc_dec(p, end, "scanned_objects", global.scanned_objects);
+    append_memacc_dec(p, end, "reported_pages", global.reported_pages);
+    append_memacc_dec(p, end, "reported_bytes", global.reported_bytes);
+    append_memacc_dec(p, end, "reported_objects", global.reported_objects);
+    append_memacc_dec(p, end, "reclaimed_pages", global.reclaimed_pages);
+    append_memacc_dec(p, end, "reclaimed_bytes", reclaim::saturating_mul(global.reclaimed_pages, ker::mod::mm::paging::PAGE_SIZE));
+    append_memacc_dec(p, end, "no_progress", global.no_progress);
+    append_memacc_dec(p, end, "failures", global.failures);
+    append_memacc_dec(p, end, "recursion_avoided", global.recursion_avoided);
+    append_memacc_dec(p, end, "lease_contention", global.lease_contention);
+    append_memacc_dec(p, end, "unsafe_context_skips", global.unsafe_context_skips);
+    append_memacc_dec(p, end, "capability_skips", global.capability_skips);
+    append_memacc_dec(p, end, "cooldown_skips", global.cooldown_skips);
+    append_memacc_dec(p, end, "latency_us", global.latency_us);
+    append_memacc_dec(p, end, "latency_max_us", global.latency_max_us);
+    append_memacc_dec(p, end, "low_transitions", global.low_transitions);
+    append_memacc_dec(p, end, "critical_transitions", global.critical_transitions);
+    append_memacc_dec(p, end, "recovered_transitions", global.recovered_transitions);
+    append_memacc_dec(p, end, "worker_wakeups", global.worker_wakeups);
+    append_memacc_dec(p, end, "worker_no_progress", global.worker_no_progress);
+    append_char(p, end, '\n');
+
+    std::array<reclaim::ZoneWatermarkSnapshot, reclaim::MAX_WATERMARK_ZONES> zones{};
+    size_t const ZONE_ROWS = reclaim::snapshot_zone_watermarks(zones.data(), zones.size(), 0);
+    for (size_t i = 0; i < ZONE_ROWS; ++i) {
+        auto const& zone = zones.at(i);
+        append_sconst(p, end, "zone_watermark");
+        append_memacc_dec(p, end, "zone", zone.zone);
+        append_memacc_dec(p, end, "total_pages", zone.total_pages);
+        append_memacc_dec(p, end, "free_pages", zone.free_pages);
+        append_memacc_dec(p, end, "critical_pages", zone.critical_pages);
+        append_memacc_dec(p, end, "low_pages", zone.low_pages);
+        append_memacc_dec(p, end, "high_pages", zone.high_pages);
+        append_memacc_sdec(p, end, "largest_free_order", zone.largest_free_order);
+        append_memacc_dec(p, end, "requested_order", zone.requested_order);
+        append_memacc_str(p, end, "pressure", reclaim::pressure_name(zone.level));
+        append_char(p, end, '\n');
+    }
+
+    std::array<reclaim::ShrinkerStatsSnapshot, reclaim::MAX_SHRINKERS> shrinkers{};
+    size_t const SHRINKER_ROWS = reclaim::snapshot_shrinker_stats(shrinkers.data(), shrinkers.size());
+    for (size_t i = 0; i < SHRINKER_ROWS; ++i) {
+        auto const& shrinker = shrinkers.at(i);
+        append_sconst(p, end, "reclaim_shrinker");
+        append_memacc_str(p, end, "name", shrinker.name);
+        append_memacc_str(p, end, "unit", reclaim::unit_name(shrinker.unit));
+        append_memacc_str(p, end, "scan_unit", reclaim::unit_name(shrinker.scan_unit));
+        if (std::strcmp(shrinker.name, "packet_pool") == 0) {
+            append_memacc_str(p, end, "unit_kind", "chunks");
+            append_memacc_str(p, end, "scan_unit_kind", "chunks");
+            append_memacc_dec(p, end, "minimum_quantum_pages",
+                              ker::net::PKT_POOL_GROW_CHUNK * ker::net::pkt_pool_snapshot().physical_pages_per_buffer);
+            append_memacc_bool(p, end, "variable_quantum", true);
+        }
+        append_memacc_dec(p, end, "rank", shrinker.rank);
+        append_memacc_str(p, end, "min_priority", reclaim::priority_name(shrinker.min_priority));
+        append_memacc_dec(p, end, "capabilities", shrinker.capabilities);
+        append_memacc_dec(p, end, "count_calls", shrinker.count_calls);
+        append_memacc_dec(p, end, "scan_calls", shrinker.scan_calls);
+        append_memacc_dec(p, end, "scanned_units", shrinker.scanned_units);
+        append_memacc_dec(p, end, "reclaimed_units", shrinker.reclaimed_units);
+        append_memacc_dec(p, end, "reclaimed_pages", shrinker.reclaimed_pages);
+        append_memacc_dec(p, end, "reclaimed_bytes", reclaim::saturating_mul(shrinker.reclaimed_pages, ker::mod::mm::paging::PAGE_SIZE));
+        append_memacc_dec(p, end, "no_progress", shrinker.no_progress);
+        append_memacc_dec(p, end, "failures", shrinker.failures);
+        append_memacc_dec(p, end, "context_skips", shrinker.context_skips);
+        append_memacc_dec(p, end, "cooldown_skips", shrinker.cooldown_skips);
+        append_memacc_dec(p, end, "latency_us", shrinker.latency_us);
+        append_memacc_dec(p, end, "latency_max_us", shrinker.latency_max_us);
+        append_memacc_dec(p, end, "count_reclaimable", shrinker.last_count.reclaimable);
+        append_memacc_dec(p, end, "count_dirty", shrinker.last_count.dirty);
+        append_memacc_dec(p, end, "count_pinned", shrinker.last_count.pinned);
+        append_memacc_dec(p, end, "count_reserved", shrinker.last_count.reserved);
+        append_memacc_dec(p, end, "count_unreclaimable", shrinker.last_count.unreclaimable);
+        append_char(p, end, '\n');
+    }
+
     *p = '\0';
     return static_cast<size_t>(p - buf);
 }
@@ -4193,7 +4296,8 @@ auto procfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
              pfd->node.type == ProcNodeType::MEMACC_RECLAIM_BUFFER_CACHE_FILE ||
              pfd->node.type == ProcNodeType::MEMACC_RECLAIM_PACKET_POOL_FILE ||
              pfd->node.type == ProcNodeType::MEMACC_RECLAIM_XFS_INODE_FILE ||
-             pfd->node.type == ProcNodeType::MEMACC_RECLAIM_FILE_MMAP_CACHE_FILE);
+             pfd->node.type == ProcNodeType::MEMACC_RECLAIM_FILE_MMAP_CACHE_FILE ||
+             pfd->node.type == ProcNodeType::MEMACC_RECLAIM_COORDINATOR_FILE);
         size_t alloc_sz = MAX_PROCFS_BUF;
         if (IS_MEMACC || IS_MAPS) {
             alloc_sz = MAX_MEMACC_BUF;
@@ -4323,6 +4427,9 @@ auto procfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
                 break;
             case ProcNodeType::MEMACC_RECLAIM_FILE_MMAP_CACHE_FILE:
                 pfd->content_len = generate_memacc_reclaim_file_mmap_cache(pfd->content, MAX_PROCFS_BUF);
+                break;
+            case ProcNodeType::MEMACC_RECLAIM_COORDINATOR_FILE:
+                pfd->content_len = generate_memacc_reclaim_coordinator(pfd->content, MAX_MEMACC_BUF);
                 break;
             case ProcNodeType::EXE_LINK: {
                 auto* task = ker::mod::sched::find_task_by_pid_safe(pfd->node.pid);
@@ -4472,6 +4579,19 @@ auto procfs_write_memacc_track(ProcNodeType type, const char* s, size_t count) -
     return static_cast<ssize_t>(count);
 }
 
+auto procfs_request_explicit_reclaim(std::string_view shrinker, uint64_t target_pages, uint64_t budget_units = 0) -> bool {
+    ker::mod::mm::reclaim::ReclaimRequest const REQUEST{
+        .context = ker::mod::mm::reclaim::ReclaimContext::EXPLICIT,
+        .priority = ker::mod::mm::reclaim::ReclaimPriority::CRITICAL,
+        .target_pages = std::max<uint64_t>(target_pages, 1),
+        .budget_units = budget_units,
+        .may_block = true,
+        .may_io = true,
+        .may_allocate = true,
+    };
+    return ker::mod::mm::reclaim::request_explicit(REQUEST, shrinker);
+}
+
 auto procfs_write_memacc_reclaim_buffer_cache(const char* s, size_t count) -> ssize_t {
     if (count == 0) {
         return 0;
@@ -4489,7 +4609,15 @@ auto procfs_write_memacc_reclaim_buffer_cache(const char* s, size_t count) -> ss
     if (target_bytes > static_cast<uint64_t>(SIZE_MAX)) {
         return -EOVERFLOW;
     }
-    ker::vfs::reclaim_clean_buffer_cache(static_cast<size_t>(target_bytes));
+    auto const BEFORE = ker::vfs::buffer_cache_stats();
+    if (BEFORE.total_bytes > target_bytes) {
+        uint64_t const TO_RECLAIM = BEFORE.total_bytes - target_bytes;
+        uint64_t const TARGET_PAGES =
+            (TO_RECLAIM / ker::mod::mm::paging::PAGE_SIZE) + ((TO_RECLAIM % ker::mod::mm::paging::PAGE_SIZE) != 0 ? 1 : 0);
+        if (!procfs_request_explicit_reclaim("buffer_cache", TARGET_PAGES, TO_RECLAIM)) {
+            return -EBUSY;
+        }
+    }
     return static_cast<ssize_t>(count);
 }
 
@@ -4525,7 +4653,18 @@ auto procfs_write_memacc_reclaim_packet_pool(const char* s, size_t count) -> ssi
     if (target_capacity > static_cast<uint64_t>(SIZE_MAX)) {
         return -EOVERFLOW;
     }
-    ker::net::pkt_pool_reclaim_free(static_cast<size_t>(target_capacity));
+    auto const REQUESTED_CAPACITY = static_cast<size_t>(target_capacity);
+    auto const BEFORE = ker::net::pkt_pool_snapshot();
+    size_t const TARGET_CAPACITY = std::max(REQUESTED_CAPACITY, BEFORE.baseline_capacity);
+    if (BEFORE.capacity > TARGET_CAPACITY) {
+        size_t const BUFFERS = BEFORE.capacity - TARGET_CAPACITY;
+        uint64_t const CHUNKS = (BUFFERS + ker::net::PKT_POOL_GROW_CHUNK - 1) / ker::net::PKT_POOL_GROW_CHUNK;
+        uint64_t const TARGET_PAGES = ker::mod::mm::reclaim::saturating_mul(
+            CHUNKS, static_cast<uint64_t>(ker::net::PKT_POOL_GROW_CHUNK * BEFORE.physical_pages_per_buffer));
+        if (!procfs_request_explicit_reclaim("packet_pool", TARGET_PAGES, CHUNKS)) {
+            return -EBUSY;
+        }
+    }
     return static_cast<ssize_t>(count);
 }
 
@@ -4545,7 +4684,12 @@ auto procfs_write_memacc_reclaim_xfs_inode(const char* s, size_t count) -> ssize
     if (max_inodes > static_cast<uint64_t>(SIZE_MAX)) {
         return -EOVERFLOW;
     }
-    static_cast<void>(ker::vfs::xfs::xfs_icache_reclaim_for_pressure(static_cast<size_t>(max_inodes)));
+    ker::vfs::xfs::XfsInodeCacheStats before{};
+    ker::vfs::xfs::xfs_inode_cache_stats(before);
+    uint64_t const BUDGET = std::min(max_inodes, before.idle_inodes);
+    if (BUDGET != 0 && !procfs_request_explicit_reclaim("xfs_inode", BUDGET, BUDGET)) {
+        return -EBUSY;
+    }
     return static_cast<ssize_t>(count);
 }
 
@@ -4565,7 +4709,11 @@ auto procfs_write_memacc_reclaim_file_mmap_cache(const char* s, size_t count) ->
     if (max_pages > static_cast<uint64_t>(SIZE_MAX)) {
         return -EOVERFLOW;
     }
-    static_cast<void>(ker::syscall::vmem::file_mmap_cache_reclaim(static_cast<size_t>(max_pages)));
+    auto const BEFORE = ker::syscall::vmem::file_mmap_cache_stats();
+    uint64_t const BUDGET = std::min(max_pages, BEFORE.pages);
+    if (BUDGET != 0 && !procfs_request_explicit_reclaim("file_mmap_cache", BUDGET, BUDGET)) {
+        return -EBUSY;
+    }
     return static_cast<ssize_t>(count);
 }
 
@@ -5207,6 +5355,9 @@ auto procfs_open_path(const char* path, int flags, int mode) -> File* {
     }
     if (strcmp(path, "memacc/reclaim/file_mmap_cache") == 0) {
         return make_file(ProcNodeType::MEMACC_RECLAIM_FILE_MMAP_CACHE_FILE, 0, false);
+    }
+    if (strcmp(path, "memacc/reclaim/coordinator") == 0) {
+        return make_file(ProcNodeType::MEMACC_RECLAIM_COORDINATOR_FILE, 0, false);
     }
 
     // /proc/self -> symlink to /proc/<pid>

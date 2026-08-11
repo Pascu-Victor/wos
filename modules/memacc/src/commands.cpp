@@ -53,6 +53,38 @@ void sleep_seconds(int seconds) {
     }
 }
 
+struct ExplicitReclaimProgress {
+    uint64_t requests{};
+    uint64_t completions{};
+};
+
+auto read_explicit_reclaim_progress() -> std::optional<ExplicitReclaimProgress> {
+    auto rows = read_rows("reclaim/coordinator");
+    const Row* coordinator = first_record(rows, "reclaim_coordinator");
+    if (coordinator == nullptr) {
+        return std::nullopt;
+    }
+    return ExplicitReclaimProgress{
+        .requests = get_u64(*coordinator, "explicit_requests"),
+        .completions = get_u64(*coordinator, "explicit_completions"),
+    };
+}
+
+auto wait_for_explicit_reclaim(uint64_t sequence) -> bool {
+    constexpr uint32_t POLL_ATTEMPTS = 1000;
+    constexpr long POLL_NANOSECONDS = 10'000'000;
+    for (uint32_t attempt = 0; attempt < POLL_ATTEMPTS; ++attempt) {
+        auto const PROGRESS = read_explicit_reclaim_progress();
+        if (PROGRESS.has_value() && PROGRESS->completions >= sequence) {
+            return true;
+        }
+        timespec remaining{.tv_sec = 0, .tv_nsec = POLL_NANOSECONDS};
+        while (nanosleep(&remaining, &remaining) != 0 && errno == EINTR) {
+        }
+    }
+    return false;
+}
+
 void print_delta_line(const char* label, uint64_t old_value, uint64_t new_value) {
     int64_t const DELTA = static_cast<int64_t>(new_value) - static_cast<int64_t>(old_value);
     std::printf("%-12s %12llu KiB  delta %+lld KiB\n", label, static_cast<unsigned long long>(bytes_to_kib(new_value)),
@@ -183,7 +215,7 @@ auto run_allocs(int argc, char** argv) -> int {
 auto run_raw(int argc, char** argv) -> int {
     std::string file = argc >= 3 ? argv[2] : "summary";
     if (file == "all") {
-        constexpr std::array<std::string_view, 14> FILES{"summary",
+        constexpr std::array<std::string_view, 15> FILES{"summary",
                                                          "zones",
                                                          "procs",
                                                          "dead",
@@ -196,7 +228,8 @@ auto run_raw(int argc, char** argv) -> int {
                                                          "reclaim/buffer_cache",
                                                          "reclaim/packet_pool",
                                                          "reclaim/xfs_inode",
-                                                         "reclaim/file_mmap_cache"};
+                                                         "reclaim/file_mmap_cache",
+                                                         "reclaim/coordinator"};
         for (auto one : FILES) {
             auto text = read_file(memacc_path(one));
             if (text.has_value()) {
@@ -270,6 +303,7 @@ auto run_reclaim(int argc, char** argv) -> int {
     std::string path = memacc_path(PROC_FILE);
     auto before_rows = read_rows(PROC_FILE);
     const Row* before = first_record(before_rows, "reclaim");
+    auto const EXPLICIT_BEFORE = read_explicit_reclaim_progress();
 
     std::string command = "drop";
     if (argc >= 4) {
@@ -301,6 +335,16 @@ auto run_reclaim(int argc, char** argv) -> int {
     if (!write_file(path, command)) {
         std::printf("memacc: failed to write %s\n", path.c_str());
         return 1;
+    }
+
+    if (EXPLICIT_BEFORE.has_value()) {
+        auto const EXPLICIT_AFTER = read_explicit_reclaim_progress();
+        if (EXPLICIT_AFTER.has_value() && EXPLICIT_AFTER->requests > EXPLICIT_BEFORE->requests &&
+            EXPLICIT_AFTER->completions < EXPLICIT_AFTER->requests && !wait_for_explicit_reclaim(EXPLICIT_AFTER->requests)) {
+            std::printf("memacc: timed out waiting for reclaim worker sequence %llu\n",
+                        static_cast<unsigned long long>(EXPLICIT_AFTER->requests));
+            return 1;
+        }
     }
 
     auto after_rows = read_rows(PROC_FILE);
