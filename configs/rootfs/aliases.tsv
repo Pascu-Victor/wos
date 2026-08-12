@@ -15,6 +15,7 @@ copy	build/modules/top/top	/usr/bin/top
 copy	build/modules/memacc/memacc	/usr/bin/memacc
 copy	build/modules/renderbench/renderbench	/usr/bin/renderbench
 copy-mode	configs/drive/srv/wos_userland_suite.sh	/usr/bin/wos-userland-suite	755
+copy-mode	configs/drive/srv/coproc.sh	/usr/bin/coproc	755
 copy	configs/rootfs/root/wos-showcase	/root/wos-showcase
 symlink	/root/wos-showcase/run-all.sh	/root/run-wos-showcase
 symlink	/root/wos-showcase	/wos-showcase

@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 
+import json
 import re
+import subprocess
+import sys
 from pathlib import Path
 
 
@@ -8,6 +11,7 @@ ROOT = Path(__file__).resolve().parents[3]
 WKICTL_SRC_DIR = ROOT / "modules" / "wkictl" / "src"
 WKICTL_INCLUDE_DIR = ROOT / "modules" / "wkictl" / "include"
 ALIASES = ROOT / "configs" / "rootfs" / "aliases.tsv"
+COPROC_COMMAND = ROOT / "configs" / "drive" / "srv" / "coproc.sh"
 PROCESS_HEADER = ROOT / "toolchain" / "src" / "mlibc" / "sysdeps" / "wos" / "include" / "sys" / "process.h"
 VFS_HEADER = ROOT / "toolchain" / "src" / "mlibc" / "sysdeps" / "wos" / "include" / "sys" / "vfs.h"
 
@@ -95,6 +99,81 @@ def test_wkictl_installed_aliases_match_persona_dispatch() -> None:
         ],
         "wkictl basename dispatch",
     )
+
+
+def test_external_coproc_preserves_argv_stdio_and_status() -> None:
+    aliases = alias_targets()
+    if aliases.get("/usr/bin/coproc") != ("copy-mode", "configs/drive/srv/coproc.sh"):
+        fail(f"rootfs alias mismatch for /usr/bin/coproc: got {aliases.get('/usr/bin/coproc')!r}")
+    if "copy-mode\tconfigs/drive/srv/coproc.sh\t/usr/bin/coproc\t755" not in ALIASES.read_text():
+        fail("external coproc must be installed executable at /usr/bin/coproc")
+
+    child = """
+import json
+import sys
+
+payload = sys.stdin.read()
+print(json.dumps(sys.argv[1:]))
+print(payload, end="")
+print("coproc-stderr", file=sys.stderr)
+raise SystemExit(23)
+"""
+    arguments = ["space value", "$(printf not-expanded)", "semi;colon"]
+    result = subprocess.run(
+        ["bash", str(COPROC_COMMAND), "--", sys.executable, "-c", child, *arguments],
+        input="coproc-stdin\n",
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    expected_stdout = f"{json.dumps(arguments)}\ncoproc-stdin\n"
+    if result.returncode != 23:
+        fail(f"external coproc returned {result.returncode}, expected 23; stderr={result.stderr!r}")
+    if result.stdout != expected_stdout:
+        fail(f"external coproc stdout mismatch: got {result.stdout!r}, expected {expected_stdout!r}")
+    if result.stderr != "coproc-stderr\n":
+        fail(f"external coproc stderr mismatch: got {result.stderr!r}")
+
+    usage = subprocess.run(
+        ["bash", str(COPROC_COMMAND)],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    if usage.returncode != 64 or usage.stdout or usage.stderr != "usage: coproc <command> [args...]\n":
+        fail(
+            "external coproc usage mismatch: "
+            f"status={usage.returncode} stdout={usage.stdout!r} stderr={usage.stderr!r}"
+        )
+
+    signal_child = """
+import os
+import signal
+
+def terminate(signum, frame):
+    del signum, frame
+    print("child-term", flush=True)
+    raise SystemExit(0)
+
+signal.signal(signal.SIGTERM, terminate)
+print("child-ready", flush=True)
+os.kill(os.getppid(), signal.SIGTERM)
+signal.pause()
+"""
+    signaled = subprocess.run(
+        ["bash", str(COPROC_COMMAND), sys.executable, "-c", signal_child],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    if signaled.returncode != 143 or signaled.stdout != "child-ready\nchild-term\n" or signaled.stderr:
+        fail(
+            "external coproc signal forwarding mismatch: "
+            f"status={signaled.returncode} stdout={signaled.stdout!r} stderr={signaled.stderr!r}"
+        )
 
 
 def test_wkictl_target_personas_set_expected_policy() -> None:
@@ -269,6 +348,7 @@ def test_wkictl_headers_expose_matching_wki_wrappers() -> None:
 
 def main() -> None:
     test_wkictl_installed_aliases_match_persona_dispatch()
+    test_external_coproc_preserves_argv_stdio_and_status()
     test_wkictl_target_personas_set_expected_policy()
     test_wkictl_vfs_forward_and_commands_use_wki_wrappers()
     test_wkictl_headers_expose_matching_wki_wrappers()
