@@ -16,6 +16,8 @@
 #include <platform/sys/usercopy.hpp>
 #include <platform/sys/userspace.hpp>
 #include <utility>
+
+#include "scheduler_transition.hpp"
 // Debug helpers
 #include <net/wki/remote_compute.hpp>
 #include <platform/init/limine_requests.hpp>
@@ -158,6 +160,8 @@ inline auto restore_gc_protected_idle_task(task::Task* task) -> bool {
     task->state.store(task::TaskState::ACTIVE, std::memory_order_release);
     task->death_epoch.store(0, std::memory_order_release);
     task->gc_queued.store(false, std::memory_order_release);
+    // Named idle-repair exception: idle tasks never use ordinary transition
+    // membership, and an attempted dead enqueue must restore their NONE tag.
     task->sched_queue = task::Task::sched_queue::NONE;
     return true;
 }
@@ -822,6 +826,278 @@ inline auto run_heap_entry(RunHeap& heap, uint32_t index) -> task::Task*& {
     return heap.entries[static_cast<size_t>(index)];
 }
 
+#ifdef WOS_SCHED_TRANSITION_VALIDATION
+constexpr uint64_t TRANSITION_CPU_UNKNOWN = UINT64_MAX;
+constexpr uint32_t TRANSITION_LIST_SCAN_LIMIT = 8192;
+
+struct TransitionFailureSlot {
+    // 0 = empty, 1 = writer owns the slot, 2 = immutable snapshot ready.
+    std::atomic<uint8_t> state{0};
+    TransitionFailure failure{};
+};
+
+std::array<TransitionFailureSlot, desc::gdt::MAX_CPUS + 1>
+    transition_failure_slots{};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+
+inline auto transition_failure_slot_index(uint64_t cpu_no) -> size_t {
+    return cpu_no < desc::gdt::MAX_CPUS ? static_cast<size_t>(cpu_no) : desc::gdt::MAX_CPUS;
+}
+
+auto transition_runqueue_cpu_locked(RunQueue const* rq) -> uint64_t {
+    if (rq == nullptr || run_queues == nullptr) {
+        return TRANSITION_CPU_UNKNOWN;
+    }
+    uint64_t const CORE_COUNT = std::min<uint64_t>(smt::get_core_count(), desc::gdt::MAX_CPUS);
+    for (uint64_t cpu_no = 0; cpu_no < CORE_COUNT; ++cpu_no) {
+        if (run_queues->that_cpu(cpu_no) == rq) {
+            return cpu_no;
+        }
+    }
+    return TRANSITION_CPU_UNKNOWN;
+}
+
+void record_transition_failure_locked(TransitionFailure const& failure) {
+    auto& slot = transition_failure_slots[transition_failure_slot_index(failure.cpu)];
+    uint8_t expected = 0;
+    if (!slot.state.compare_exchange_strong(expected, 1, std::memory_order_acquire, std::memory_order_relaxed)) {
+        return;
+    }
+    slot.failure = failure;
+    slot.state.store(2, std::memory_order_release);
+}
+
+auto validate_transition_boundary_locked(RunQueue* rq, TransitionPhase phase, task::Task* focus = nullptr) -> uint64_t {
+    if (rq == nullptr) {
+        return 0;
+    }
+
+    uint64_t const CPU_NO = transition_runqueue_cpu_locked(rq);
+    uint64_t violations = 0;
+    uint8_t inspection_flags = 0;
+    task::Task* offender = nullptr;
+    auto note = [&](TransitionInvariant invariant, task::Task* candidate = nullptr) {
+        violations |= transition_invariant_bit(invariant);
+        if (offender == nullptr && candidate != nullptr) {
+            offender = candidate;
+        }
+    };
+
+    __int128 expected_weight = 0;
+    __int128 expected_weighted_vruntime = 0;
+    uint32_t const HEAP_SCAN = std::min<uint32_t>(rq->runnable_heap.size, PER_CPU_HEAP_CAP);
+    if (rq->runnable_heap.size > PER_CPU_HEAP_CAP) {
+        note(TransitionInvariant::HEAP_SIZE);
+    }
+    for (uint32_t index = 0; index < HEAP_SCAN; ++index) {
+        task::Task* entry = run_heap_entry(rq->runnable_heap, index);
+        if (entry == nullptr) {
+            note(TransitionInvariant::HEAP_NULL_ENTRY);
+            continue;
+        }
+        if (entry->heap_index != static_cast<int32_t>(index)) {
+            note(TransitionInvariant::HEAP_INDEX, entry);
+        }
+        if (CPU_NO != TRANSITION_CPU_UNKNOWN && entry->cpu != CPU_NO) {
+            note(TransitionInvariant::HEAP_OWNER, entry);
+        }
+        if (entry->sched_queue != task::Task::sched_queue::RUNNABLE) {
+            note(TransitionInvariant::HEAP_QUEUE_TAG, entry);
+        }
+        if (!entry->scheduler_published.load(std::memory_order_acquire) && phase != TransitionPhase::PREPUBLICATION) {
+            note(TransitionInvariant::HEAP_UNPUBLISHED, entry);
+        }
+        if (entry == rq->idle_task || entry->type == task::TaskType::IDLE) {
+            note(TransitionInvariant::HEAP_IDLE, entry);
+        }
+        if (entry->state.load(std::memory_order_acquire) != task::TaskState::ACTIVE) {
+            note(TransitionInvariant::HEAP_STATE, entry);
+        }
+        expected_weight += static_cast<__int128>(entry->sched_weight);
+        expected_weighted_vruntime +=
+            (static_cast<__int128>(entry->vruntime) - static_cast<__int128>(rq->min_vruntime)) * entry->sched_weight;
+    }
+
+    constexpr __int128 I64_MIN_VALUE = -(static_cast<__int128>(1) << 63);
+    constexpr __int128 I64_MAX_VALUE = (static_cast<__int128>(1) << 63) - 1;
+    if (expected_weight < I64_MIN_VALUE || expected_weight > I64_MAX_VALUE || rq->total_weight != static_cast<int64_t>(expected_weight)) {
+        note(TransitionInvariant::EEVDF_TOTAL_WEIGHT);
+    }
+    if (expected_weighted_vruntime < I64_MIN_VALUE || expected_weighted_vruntime > I64_MAX_VALUE ||
+        rq->total_weighted_vruntime != static_cast<int64_t>(expected_weighted_vruntime)) {
+        note(TransitionInvariant::EEVDF_WEIGHTED_VRUNTIME);
+    }
+
+    uint32_t wait_observed = 0;
+    uint32_t const WAIT_LIMIT =
+        std::min<uint32_t>(rq->wait_list.count < TRANSITION_LIST_SCAN_LIMIT ? rq->wait_list.count + 1 : TRANSITION_LIST_SCAN_LIMIT,
+                           TRANSITION_LIST_SCAN_LIMIT);
+    task::Task* wait_task = rq->wait_list.head;
+    while (wait_task != nullptr && wait_observed < WAIT_LIMIT) {
+        if (CPU_NO != TRANSITION_CPU_UNKNOWN && wait_task->cpu != CPU_NO) {
+            note(TransitionInvariant::WAIT_OWNER, wait_task);
+        }
+        if (wait_task->sched_queue != task::Task::sched_queue::WAITING) {
+            note(TransitionInvariant::WAIT_QUEUE_TAG, wait_task);
+            note(TransitionInvariant::LIST_MEMBERSHIP_CONFLICT, wait_task);
+        }
+        if (rq->runnable_heap.contains(wait_task)) {
+            note(TransitionInvariant::WAIT_HEAP_OVERLAP, wait_task);
+        }
+        if (!wait_task->scheduler_published.load(std::memory_order_acquire) && phase != TransitionPhase::PREPUBLICATION) {
+            note(TransitionInvariant::WAIT_UNPUBLISHED, wait_task);
+        }
+        if (wait_task == rq->idle_task || wait_task->type == task::TaskType::IDLE) {
+            note(TransitionInvariant::WAIT_IDLE, wait_task);
+        }
+        if (wait_task->state.load(std::memory_order_acquire) != task::TaskState::ACTIVE) {
+            note(TransitionInvariant::WAIT_STATE, wait_task);
+        }
+        wait_task = wait_task->sched_next;
+        ++wait_observed;
+    }
+    if (wait_task != nullptr && rq->wait_list.count < TRANSITION_LIST_SCAN_LIMIT) {
+        note(TransitionInvariant::WAIT_SCAN_BOUND, wait_task);
+        note(TransitionInvariant::WAIT_COUNT, rq->wait_list.head);
+    } else if (wait_task != nullptr) {
+        inspection_flags |= transition_inspection_bit(TransitionInspection::WAIT_LIST_TRUNCATED);
+    } else if (wait_observed != rq->wait_list.count) {
+        note(TransitionInvariant::WAIT_COUNT, rq->wait_list.head);
+    }
+
+    uint32_t dead_observed = 0;
+    uint32_t const DEAD_LIMIT =
+        std::min<uint32_t>(rq->dead_list.count < TRANSITION_LIST_SCAN_LIMIT ? rq->dead_list.count + 1 : TRANSITION_LIST_SCAN_LIMIT,
+                           TRANSITION_LIST_SCAN_LIMIT);
+    uint64_t const CURRENT_EPOCH = EpochManager::current_epoch();
+    task::Task* dead_task = rq->dead_list.head;
+    while (dead_task != nullptr && dead_observed < DEAD_LIMIT) {
+        if (dead_task->sched_queue != task::Task::sched_queue::DEAD_GC) {
+            note(TransitionInvariant::DEAD_QUEUE_TAG, dead_task);
+            note(TransitionInvariant::LIST_MEMBERSHIP_CONFLICT, dead_task);
+        }
+        if (rq->runnable_heap.contains(dead_task)) {
+            note(TransitionInvariant::DEAD_HEAP_OVERLAP, dead_task);
+        }
+        if (dead_task->state.load(std::memory_order_acquire) != task::TaskState::DEAD) {
+            note(TransitionInvariant::DEAD_STATE, dead_task);
+        }
+        if (!dead_task->gc_queued.load(std::memory_order_acquire)) {
+            note(TransitionInvariant::DEAD_GC_FLAG, dead_task);
+        }
+        if (dead_task->death_epoch.load(std::memory_order_acquire) > CURRENT_EPOCH) {
+            note(TransitionInvariant::DEAD_EPOCH, dead_task);
+        }
+        if (dead_task->ref_count.load(std::memory_order_acquire) == 0) {
+            note(TransitionInvariant::DEAD_REFCOUNT, dead_task);
+        }
+        if (!dead_task->scheduler_published.load(std::memory_order_acquire)) {
+            note(TransitionInvariant::DEAD_UNPUBLISHED, dead_task);
+        }
+        if (dead_task == rq->idle_task || dead_task->type == task::TaskType::IDLE) {
+            note(TransitionInvariant::DEAD_IDLE, dead_task);
+        }
+        dead_task = dead_task->sched_next;
+        ++dead_observed;
+    }
+    if (dead_task != nullptr && rq->dead_list.count < TRANSITION_LIST_SCAN_LIMIT) {
+        note(TransitionInvariant::DEAD_SCAN_BOUND, dead_task);
+        note(TransitionInvariant::DEAD_COUNT, rq->dead_list.head);
+    } else if (dead_task != nullptr) {
+        inspection_flags |= transition_inspection_bit(TransitionInspection::DEAD_LIST_TRUNCATED);
+    } else if (dead_observed != rq->dead_list.count) {
+        note(TransitionInvariant::DEAD_COUNT, rq->dead_list.head);
+    }
+
+    if (rq->current_task != nullptr) {
+        if (CPU_NO != TRANSITION_CPU_UNKNOWN && rq->current_task->cpu != CPU_NO) {
+            note(TransitionInvariant::CURRENT_OWNER, rq->current_task);
+        }
+        if (rq->current_task->type == task::TaskType::IDLE && rq->current_task != rq->idle_task) {
+            note(TransitionInvariant::CURRENT_IDLE_MISMATCH, rq->current_task);
+        }
+        if (!rq->current_task->scheduler_published.load(std::memory_order_acquire)) {
+            note(TransitionInvariant::CURRENT_UNPUBLISHED, rq->current_task);
+        }
+        task::TaskState const CURRENT_STATE = rq->current_task->state.load(std::memory_order_acquire);
+        bool const EXIT_PHASE = phase == TransitionPhase::EXITING_CURRENT || phase == TransitionPhase::HANDOFF_RESERVED;
+        if (CURRENT_STATE != task::TaskState::ACTIVE && !EXIT_PHASE) {
+            note(TransitionInvariant::CURRENT_STATE, rq->current_task);
+        }
+    }
+    if (rq->handoff_task != nullptr) {
+        if (CPU_NO != TRANSITION_CPU_UNKNOWN && rq->handoff_task->cpu != CPU_NO) {
+            note(TransitionInvariant::HANDOFF_OWNER, rq->handoff_task);
+        }
+        if (rq->handoff_task->type == task::TaskType::IDLE && rq->handoff_task != rq->idle_task) {
+            note(TransitionInvariant::HANDOFF_IDLE_MISMATCH, rq->handoff_task);
+        }
+        if (rq->handoff_task->state.load(std::memory_order_acquire) != task::TaskState::ACTIVE) {
+            note(TransitionInvariant::RESERVED_DEAD, rq->handoff_task);
+        }
+        if (!rq->handoff_task->scheduler_published.load(std::memory_order_acquire)) {
+            note(TransitionInvariant::HANDOFF_UNPUBLISHED, rq->handoff_task);
+        }
+    }
+    if (rq->idle_task != nullptr) {
+        bool const IDLE_OWNER_BAD = CPU_NO != TRANSITION_CPU_UNKNOWN && rq->idle_task->cpu != CPU_NO;
+        bool const IDLE_LIFECYCLE_BAD = rq->idle_task->state.load(std::memory_order_acquire) != task::TaskState::ACTIVE ||
+                                        !rq->idle_task->scheduler_published.load(std::memory_order_acquire);
+        if (IDLE_OWNER_BAD || IDLE_LIFECYCLE_BAD || rq->idle_task->heap_index >= 0 || rq->idle_task->sched_next != nullptr ||
+            rq->idle_task->sched_queue != task::Task::sched_queue::NONE || rq->idle_task->gc_queued.load(std::memory_order_acquire)) {
+            note(TransitionInvariant::IDLE_MEMBERSHIP, rq->idle_task);
+        }
+    }
+
+    if (violations == 0) {
+        return 0;
+    }
+    if (offender == nullptr) {
+        offender = focus;
+    }
+
+    TransitionFailure failure{
+        .violations = violations,
+        .cpu = CPU_NO,
+        .task_address = reinterpret_cast<uint64_t>(offender),
+        .task_pid = offender != nullptr ? offender->pid : 0,
+        .task_owner_cpu = offender != nullptr ? offender->cpu : UINT64_MAX,
+        .current_address = reinterpret_cast<uint64_t>(rq->current_task),
+        .handoff_address = reinterpret_cast<uint64_t>(rq->handoff_task),
+        .idle_address = reinterpret_cast<uint64_t>(rq->idle_task),
+        .death_epoch = offender != nullptr ? offender->death_epoch.load(std::memory_order_acquire) : 0,
+        .observed_total_weight = static_cast<uint64_t>(rq->total_weight),
+        .observed_total_weighted_vruntime = static_cast<uint64_t>(rq->total_weighted_vruntime),
+        .expected_total_weight = static_cast<uint64_t>(expected_weight),
+        .expected_total_weighted_vruntime = static_cast<uint64_t>(expected_weighted_vruntime),
+        .heap_size = rq->runnable_heap.size,
+        .wait_count = rq->wait_list.count,
+        .dead_count = rq->dead_list.count,
+        .wait_scanned = wait_observed,
+        .dead_scanned = dead_observed,
+        .task_ref_count = offender != nullptr ? offender->ref_count.load(std::memory_order_acquire) : 0,
+        .task_heap_index = offender != nullptr ? offender->heap_index : -1,
+        .phase = static_cast<uint8_t>(phase),
+        .task_state =
+            static_cast<uint8_t>(offender != nullptr ? static_cast<uint8_t>(offender->state.load(std::memory_order_acquire)) : 0U),
+        .task_queue = static_cast<uint8_t>(offender != nullptr ? static_cast<uint8_t>(offender->sched_queue) : 0U),
+        .task_published = static_cast<uint8_t>(offender != nullptr && offender->scheduler_published.load(std::memory_order_acquire)),
+        .task_gc_queued = static_cast<uint8_t>(offender != nullptr && offender->gc_queued.load(std::memory_order_acquire)),
+        .current_is_handoff = static_cast<uint8_t>(rq->current_task != nullptr && rq->current_task == rq->handoff_task),
+        .inspection_flags = inspection_flags,
+        .reserved = {},
+    };
+    record_transition_failure_locked(failure);
+    return violations;
+}
+#else
+inline auto validate_transition_boundary_locked(RunQueue* rq, TransitionPhase phase, task::Task* focus = nullptr) -> uint64_t {
+    (void)rq;
+    (void)phase;
+    (void)focus;
+    return 0;
+}
+#endif
+
 // Vector allocated at init time for scheduler wake IPIs.
 // Must not conflict with device driver IRQ allocations.
 uint8_t wake_ipi_vector = 0;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
@@ -1315,10 +1591,22 @@ inline void assert_task_migration_owner_is_current_cpu(task::Task const* task) {
     }
 }
 
-inline void publish_current_task(RunQueue* rq, task::Task* task) {
+inline void transition_publish_current_locked(RunQueue* rq, task::Task* task) {
     if (rq == nullptr) {
         return;
     }
+    assert_task_migration_owner_is_current_cpu(task);
+    rq->current_task = task;
+    update_current_load_cache(rq, task);
+    validate_transition_boundary_locked(rq, TransitionPhase::STABLE, task);
+}
+
+inline void publish_current_task_boot_exception(RunQueue* rq, task::Task* task) {
+    if (rq == nullptr) {
+        return;
+    }
+    // Named boot exception: before scheduler return paths are live, the local
+    // bootstrap CPU is the sole writer and does not hold the cross-CPU lock.
     assert_task_migration_owner_is_current_cpu(task);
     rq->current_task = task;
     update_current_load_cache(rq, task);
@@ -1342,6 +1630,27 @@ inline void remove_from_sums(RunQueue* rq, task::Task* t) {
     rq->cached_load_process.fetch_sub(task_load_for_incoming(t, task::TaskType::PROCESS), std::memory_order_relaxed);
 }
 
+[[nodiscard]] inline auto transition_detach_runnable_locked(RunQueue* rq, task::Task* t,
+                                                            TransitionPhase phase = TransitionPhase::DETACHED_TRANSFER) -> bool {
+    (void)phase;
+    if (rq == nullptr || t == nullptr || !rq->runnable_heap.contains(t)) {
+        return false;
+    }
+    if (!rq->runnable_heap.remove(t)) {
+        return false;
+    }
+    remove_from_sums(rq, t);
+    return true;
+}
+
+inline void transition_mark_detached_locked(RunQueue* rq, task::Task* t, TransitionPhase phase = TransitionPhase::DETACHED_TRANSFER) {
+    if (t == nullptr) {
+        return;
+    }
+    t->sched_queue = task::Task::sched_queue::NONE;
+    validate_transition_boundary_locked(rq, phase, t);
+}
+
 inline auto remove_from_heap_by_scan_locked(RunQueue* rq, task::Task* task) -> bool {
     if (rq == nullptr || task == nullptr) {
         return false;
@@ -1353,6 +1662,8 @@ inline auto remove_from_heap_by_scan_locked(RunQueue* rq, task::Task* task) -> b
             continue;
         }
 
+        // Named corruption-repair exception: RunHeap owns heap_index during
+        // normal transitions, but a scan must repair it before removal.
         task->heap_index = static_cast<int32_t>(idx);
         if (!rq->runnable_heap.remove(task)) {
             return false;
@@ -1457,7 +1768,7 @@ inline auto pick_best_eligible_for_switch_locked(RunQueue* rq, int64_t avg_vrunt
             return nullptr;
         }
         if (next != nullptr) {
-            next->sched_queue = task::Task::sched_queue::NONE;
+            transition_mark_detached_locked(rq, next);
         }
     }
     return nullptr;
@@ -1479,7 +1790,7 @@ inline auto pick_exit_switch_candidate_locked(RunQueue* rq, task::Task* exiting_
             return nullptr;
         }
         if (candidate != nullptr) {
-            candidate->sched_queue = task::Task::sched_queue::NONE;
+            transition_mark_detached_locked(rq, candidate);
         }
     }
 
@@ -1568,7 +1879,7 @@ inline void recompute_wait_deadline_locked(RunQueue* rq) {
     rq->next_wait_deadline_us = next_deadline;
 }
 
-inline void wait_list_push_locked(RunQueue* rq, task::Task* t) {
+inline void transition_attach_wait_locked(RunQueue* rq, task::Task* t) {
     if (rq == nullptr || t == nullptr) {
         return;
     }
@@ -1576,7 +1887,8 @@ inline void wait_list_push_locked(RunQueue* rq, task::Task* t) {
     note_wait_deadline_locked(rq, t);
 }
 
-inline auto wait_list_remove_locked(RunQueue* rq, task::Task* t) -> bool {
+inline auto transition_detach_wait_locked(RunQueue* rq, task::Task* t, TransitionPhase phase = TransitionPhase::DETACHED_TRANSFER) -> bool {
+    (void)phase;
     if (rq == nullptr || t == nullptr) {
         return false;
     }
@@ -1588,9 +1900,18 @@ inline auto wait_list_remove_locked(RunQueue* rq, task::Task* t) -> bool {
     return REMOVED;
 }
 
-inline void wait_list_remove_all_locked(RunQueue* rq, task::Task* t) {
-    while (wait_list_remove_locked(rq, t)) {
+inline void transition_detach_all_wait_locked(RunQueue* rq, task::Task* t, TransitionPhase phase = TransitionPhase::DETACHED_TRANSFER) {
+    while (transition_detach_wait_locked(rq, t, phase)) {
     }
+}
+
+inline void transition_make_waiting_locked(RunQueue* rq, task::Task* t, TransitionPhase phase = TransitionPhase::STABLE) {
+    if (rq == nullptr || t == nullptr) {
+        return;
+    }
+    t->sched_queue = task::Task::sched_queue::WAITING;
+    transition_attach_wait_locked(rq, t);
+    validate_transition_boundary_locked(rq, phase, t);
 }
 
 inline void repair_stale_wait_membership_locked(RunQueue* rq, task::Task* t) {
@@ -1598,16 +1919,21 @@ inline void repair_stale_wait_membership_locked(RunQueue* rq, task::Task* t) {
         return;
     }
 
-    wait_list_remove_all_locked(rq, t);
+    transition_detach_all_wait_locked(rq, t);
+    // Named repair-by-scan exception: authoritative heap membership wins over
+    // a stale wait-list tag.
     t->sched_queue = task::Task::sched_queue::RUNNABLE;
     t->wants_block = false;
     t->wake_at_us = 0;
     finish_wait_metadata_for_runqueue(t);
+    validate_transition_boundary_locked(rq, TransitionPhase::STABLE, t);
 }
 
-[[nodiscard]] inline auto publish_runnable_task_locked(RunQueue* rq, task::Task* t, const char* reason) -> bool {
+enum class RunnableTransitionResult : uint8_t { PUBLISHED, INVALID, STALE_INDEX, HEAP_FULL };
+
+[[nodiscard]] inline auto transition_make_runnable_locked(RunQueue* rq, task::Task* t) -> RunnableTransitionResult {
     if (rq == nullptr || t == nullptr) {
-        return false;
+        return RunnableTransitionResult::INVALID;
     }
 
     if (rq->runnable_heap.contains(t)) {
@@ -1616,23 +1942,16 @@ inline void repair_stale_wait_membership_locked(RunQueue* rq, task::Task* t) {
             update_current_load_cache(rq, t);
         }
         t->scheduler_published.store(true, std::memory_order_release);
-        return true;
+        validate_transition_boundary_locked(rq, TransitionPhase::STABLE, t);
+        return RunnableTransitionResult::PUBLISHED;
     }
 
     if (t->heap_index >= 0) {
-        dbg::logger<"sched">::error("runnable publish refused: reason=%s pid=%lu name=%s cpu=%lu heap_index=%d queue=%d",
-                                    reason != nullptr ? reason : "?", t->pid, task_name_for_log(t), t->cpu, t->heap_index,
-                                    static_cast<int>(t->sched_queue));
-        dbg::panic_handler("scheduler: runnable publish refused with stale heap index");
-        return false;
+        return RunnableTransitionResult::STALE_INDEX;
     }
 
     if (!rq->runnable_heap.insert(t)) {
-        dbg::logger<"sched">::error("runnable heap full: reason=%s pid=%lu name=%s cpu=%lu size=%u cap=%u",
-                                    reason != nullptr ? reason : "?", t->pid, task_name_for_log(t), t->cpu, rq->runnable_heap.size,
-                                    PER_CPU_HEAP_CAP);
-        dbg::panic_handler("scheduler: runnable heap full");
-        return false;
+        return RunnableTransitionResult::HEAP_FULL;
     }
 
     add_to_sums(rq, t);
@@ -1641,7 +1960,31 @@ inline void repair_stale_wait_membership_locked(RunQueue* rq, task::Task* t) {
         update_current_load_cache(rq, t);
     }
     t->scheduler_published.store(true, std::memory_order_release);
-    return true;
+    validate_transition_boundary_locked(rq, TransitionPhase::STABLE, t);
+    return RunnableTransitionResult::PUBLISHED;
+}
+
+[[nodiscard]] inline auto publish_runnable_task_locked(RunQueue* rq, task::Task* t, const char* reason) -> bool {
+    RunnableTransitionResult const RESULT = transition_make_runnable_locked(rq, t);
+    if (RESULT == RunnableTransitionResult::PUBLISHED) {
+        return true;
+    }
+    if (RESULT == RunnableTransitionResult::INVALID) {
+        return false;
+    }
+    // Preserve the pre-existing publication failure diagnostics outside the
+    // allocation-free transition primitive itself.
+    if (RESULT == RunnableTransitionResult::STALE_INDEX) {
+        dbg::logger<"sched">::error("runnable publish refused: reason=%s pid=%lu name=%s cpu=%lu heap_index=%d queue=%d",
+                                    reason != nullptr ? reason : "?", t->pid, task_name_for_log(t), t->cpu, t->heap_index,
+                                    static_cast<int>(t->sched_queue));
+        dbg::panic_handler("scheduler: runnable publish refused with stale heap index");
+        return false;
+    }
+    dbg::logger<"sched">::error("runnable heap full: reason=%s pid=%lu name=%s cpu=%lu size=%u cap=%u", reason != nullptr ? reason : "?",
+                                t->pid, task_name_for_log(t), t->cpu, rq->runnable_heap.size, PER_CPU_HEAP_CAP);
+    dbg::panic_handler("scheduler: runnable heap full");
+    return false;
 }
 
 inline auto runqueue_task_is_reserved_locked(RunQueue* rq, task::Task const* task) -> bool {
@@ -1677,12 +2020,47 @@ inline auto runqueue_owns_task_locked(RunQueue* rq, task::Task* task) -> bool {
            wait_list_contains_locked(rq, task);
 }
 
-inline void reserve_handoff_task_locked(RunQueue* rq, task::Task* task, uint64_t start_us) {
-    panic_if_task_reserved_on_other_cpu(task, "reserve-handoff");
-    assert_task_migration_owner_is_current_cpu(task);
+inline void transition_reserve_handoff_locked(RunQueue* rq, task::Task* task, uint64_t start_us) {
+    if (rq == nullptr || task == nullptr) {
+        return;
+    }
     task->cpu = cpu::current_cpu();
     rq->handoff_task = task;
     rq->current_task_start_us = start_us;
+    validate_transition_boundary_locked(rq, TransitionPhase::HANDOFF_RESERVED, task);
+}
+
+inline void reserve_handoff_task_locked(RunQueue* rq, task::Task* task, uint64_t start_us) {
+    panic_if_task_reserved_on_other_cpu(task, "reserve-handoff");
+    assert_task_migration_owner_is_current_cpu(task);
+    transition_reserve_handoff_locked(rq, task, start_us);
+}
+
+inline auto transition_commit_handoff_locked(RunQueue* rq, task::Task* incoming) -> task::Task* {
+    if (rq == nullptr || incoming == nullptr || rq->handoff_task != incoming) {
+        return nullptr;
+    }
+    task::Task* const OUTGOING = rq->current_task;
+    incoming->cpu = cpu::current_cpu();
+    transition_publish_current_locked(rq, incoming);
+    // Named assembly-delimited exception: return assembly calls this only
+    // after it has installed the incoming stack.
+    rq->handoff_task = nullptr;
+    validate_transition_boundary_locked(rq, TransitionPhase::STABLE, incoming);
+    return OUTGOING;
+}
+
+inline auto transition_cancel_handoff_locked(RunQueue* rq, task::Task* expected) -> bool {
+    if (rq == nullptr || rq->handoff_task != expected) {
+        return false;
+    }
+    rq->handoff_task = nullptr;
+    TransitionPhase const PHASE =
+        rq->current_task != nullptr && rq->current_task->state.load(std::memory_order_acquire) != task::TaskState::ACTIVE
+            ? TransitionPhase::EXITING_CURRENT
+            : TransitionPhase::STABLE;
+    validate_transition_boundary_locked(rq, PHASE, expected);
+    return true;
 }
 
 inline auto compute_wakeup_floor_vruntime(RunQueue* rq, task::Task* t, uint64_t now_us, task::WaitChannelKind wait_channel) -> int64_t;
@@ -1702,7 +2080,7 @@ void requeue_woken_outgoing_task_locked(RunQueue* rq, task::Task* outgoing, uint
     }
 
     task::WaitChannelKind const WAIT_CHANNEL = outgoing->wait_channel_kind;
-    wait_list_remove_all_locked(rq, outgoing);
+    transition_detach_all_wait_locked(rq, outgoing);
     outgoing->wants_block = false;
     outgoing->wake_at_us = 0;
     finish_wait_metadata_for_runqueue(outgoing);
@@ -1754,11 +2132,8 @@ void commit_handoff_task_at_return_boundary() {
             return;
         }
 
-        outgoing = rq->current_task;
-        task->cpu = cpu::current_cpu();
-        publish_current_task(rq, task);
+        outgoing = transition_commit_handoff_locked(rq, task);
         debug_task_slot(cpu::current_cpu()) = task;
-        rq->handoff_task = nullptr;
         requeue_woken_outgoing_task_locked(rq, outgoing, NOW_US);
     });
 
@@ -1776,11 +2151,7 @@ void commit_handoff_task_at_return_boundary() {
 }
 
 void clear_handoff_task(task::Task* task) {
-    run_queues->this_cpu_locked_void([task](RunQueue* rq) {
-        if (rq->handoff_task == task) {
-            rq->handoff_task = nullptr;
-        }
-    });
+    run_queues->this_cpu_locked_void([task](RunQueue* rq) { (void)transition_cancel_handoff_locked(rq, task); });
 }
 
 void set_task_nice_impl(task::Task* task, int nice) {
@@ -2532,8 +2903,11 @@ bool post_task_for_cpu_impl(uint64_t cpu_no, task::Task* task, bool release_rese
             existing_idle = rq->idle_task;
             if (existing_idle == nullptr || existing_idle == task) {
                 rq->idle_task = task;
+                // Named initial-publication exception: idle tasks never enter
+                // a runnable or wait membership transition.
                 task->sched_queue = task::Task::sched_queue::NONE;
                 task->scheduler_published.store(true, std::memory_order_release);
+                validate_transition_boundary_locked(rq, TransitionPhase::STABLE, task);
             }
         });
 
@@ -2979,6 +3353,34 @@ void account_task_runtime_delta(task::Task* task, uint64_t now_us, uint64_t delt
 
 }  // namespace
 
+auto read_scheduler_transition_failure(uint64_t cpu_no, TransitionFailure& out) -> bool {
+#ifdef WOS_SCHED_TRANSITION_VALIDATION
+    if (cpu_no >= desc::gdt::MAX_CPUS) {
+        return false;
+    }
+    auto const& slot = transition_failure_slots[transition_failure_slot_index(cpu_no)];
+    if (slot.state.load(std::memory_order_acquire) != 2) {
+        return false;
+    }
+    out = slot.failure;
+    return slot.state.load(std::memory_order_acquire) == 2;
+#else
+    (void)cpu_no;
+    (void)out;
+    return false;
+#endif
+}
+
+void clear_scheduler_transition_failure(uint64_t cpu_no) {
+#ifdef WOS_SCHED_TRANSITION_VALIDATION
+    if (cpu_no < desc::gdt::MAX_CPUS) {
+        transition_failure_slots[transition_failure_slot_index(cpu_no)].state.store(0, std::memory_order_release);
+    }
+#else
+    (void)cpu_no;
+#endif
+}
+
 void request_local_timer_recheck() { request_local_reschedule(); }
 
 void set_task_nice(task::Task* task, int nice) { set_task_nice_impl(task, nice); }
@@ -3133,8 +3535,7 @@ auto post_task_waiting(task::Task* task) -> bool {
         }
 
         task->last_sleep_start_us = time::get_us();
-        task->sched_queue = task::Task::sched_queue::WAITING;
-        wait_list_push_locked(rq, task);
+        transition_make_waiting_locked(rq, task, TransitionPhase::PREPUBLICATION);
 
         // Proxy identity and all constructed Task state must become visible
         // before PID/active lookups can acquire this pointer. Keep the
@@ -3144,16 +3545,17 @@ auto post_task_waiting(task::Task* task) -> bool {
         published = register_fresh_task_visibility(task);
         if (published) {
             task->scheduler_published.store(true, std::memory_order_release);
+            validate_transition_boundary_locked(rq, TransitionPhase::STABLE, task);
             return;
         }
 
         // Registration made no global writes on failure. The runqueue lock
         // has remained held since insertion, so removal must succeed and false
         // once again means a completely unpublished NONE task.
-        if (!wait_list_remove_locked(rq, task)) [[unlikely]] {
+        if (!transition_detach_wait_locked(rq, task)) [[unlikely]] {
             dbg::panic_handler("scheduler: fresh waiting publication rollback lost task");
         }
-        task->sched_queue = task::Task::sched_queue::NONE;
+        transition_mark_detached_locked(rq, task, TransitionPhase::PREPUBLICATION);
         task->last_sleep_start_us = 0;
     });
 
@@ -3327,12 +3729,11 @@ auto move_task_owner_to_cpu(task::Task* task, uint64_t target_cpu, bool pin_to_t
             bool moved_waiting = false;
             bool moved_runnable = false;
             if (IN_WAIT) {
-                moved_waiting = wait_list_remove_locked(owner_rq, task);
+                moved_waiting = transition_detach_wait_locked(owner_rq, task);
             }
             if (IN_HEAP) {
-                moved_runnable = owner_rq->runnable_heap.remove(task);
+                moved_runnable = transition_detach_runnable_locked(owner_rq, task);
                 if (moved_runnable) {
-                    remove_from_sums(owner_rq, task);
                     moved_waiting = false;
                 }
             }
@@ -3346,8 +3747,7 @@ auto move_task_owner_to_cpu(task::Task* task, uint64_t target_cpu, bool pin_to_t
             }
 
             if (moved_waiting) {
-                task->sched_queue = task::Task::sched_queue::WAITING;
-                wait_list_push_locked(target_rq, task);
+                transition_make_waiting_locked(target_rq, task);
                 result.moved = true;
                 return;
             }
@@ -3643,13 +4043,12 @@ void remove_current_task() {
 
         // Remove from heap if present
         if (task->sched_queue == task::Task::sched_queue::RUNNABLE && rq->runnable_heap.contains(task)) {
-            remove_from_sums(rq, task);
-            rq->runnable_heap.remove(task);
+            (void)transition_detach_runnable_locked(rq, task, TransitionPhase::EXITING_CURRENT);
         }
 
         // Keep current_task pointing at the live stack owner until the final
         // return boundary moves the CPU away from this task's stack.
-        task->sched_queue = task::Task::sched_queue::NONE;
+        transition_mark_detached_locked(rq, task, TransitionPhase::EXITING_CURRENT);
         return task;
     });
 
@@ -3750,7 +4149,7 @@ void wake_kernel_thread_for_shutdown(task::Task* task) {
         }
 
         bool removed_wait = false;
-        while (wait_list_remove_locked(rq, task)) {
+        while (transition_detach_wait_locked(rq, task)) {
             removed_wait = true;
         }
         if (!removed_wait && task->sched_queue != task::Task::sched_queue::WAITING) {
@@ -4015,19 +4414,16 @@ auto debug_stop_task(task::Task* task) -> bool {
                 return;
             }
             if (rq->runnable_heap.contains(task)) {
-                remove_from_sums(rq, task);
-                rq->runnable_heap.remove(task);
+                (void)transition_detach_runnable_locked(rq, task);
                 task->last_sleep_start_us = time::get_us();
-                task->sched_queue = task::Task::sched_queue::WAITING;
                 task->set_wait_channel("ptrace", task::WaitChannelKind::PTRACE);
-                wait_list_push_locked(rq, task);
+                transition_make_waiting_locked(rq, task);
                 found = true;
                 return;
             }
-            if (wait_list_remove_locked(rq, task)) {
-                task->sched_queue = task::Task::sched_queue::WAITING;
+            if (transition_detach_wait_locked(rq, task)) {
                 task->set_wait_channel("ptrace", task::WaitChannelKind::PTRACE);
-                wait_list_push_locked(rq, task);
+                transition_make_waiting_locked(rq, task);
                 found = true;
             }
         });
@@ -4104,7 +4500,7 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
             update_relaxed_max(rq->wait_list_scan_max, scan_iterations);
             for (uint32_t i = 0; i < wake_count; i++) {
                 task::Task* w = pending_wake_slot(to_wake, i);
-                wait_list_remove_locked(rq, w);
+                transition_detach_wait_locked(rq, w);
                 // Mark freshly woken: inhibits immediate wakeup-preemption (see process_tasks guard).
                 bool const LOW_LATENCY_HANDOFF = is_low_latency_handoff_wait_channel(w->wait_channel_kind);
                 w->just_woke = !LOW_LATENCY_HANDOFF;
@@ -4181,11 +4577,9 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
                 return nullptr;
             }
             if (t->ptrace_stopped) {
-                remove_from_sums(rq, t);
-                rq->runnable_heap.remove(t);
-                t->sched_queue = task::Task::sched_queue::WAITING;
+                (void)transition_detach_runnable_locked(rq, t);
                 t->set_wait_channel("ptrace", task::WaitChannelKind::PTRACE);
-                wait_list_push_locked(rq, t);
+                transition_make_waiting_locked(rq, t);
                 return nullptr;
             }
             if (t->type == task::TaskType::PROCESS && (t->thread == nullptr || t->pagemap == nullptr)) {
@@ -4198,7 +4592,6 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
             // current_task must continue to match the live stack until
             // switch_to() has patched the return frame for this timer tick.
             reserve_handoff_task_locked(rq, t, time::get_us());
-            // (runnable_heap.size already decremented by remove above)
             return t;
         });
 
@@ -4390,12 +4783,10 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
             current_task->last_sleep_start_us = NOW_US;
             uint64_t const WAKE_AT_US = current_task->wake_at_us;
             if (rq->runnable_heap.contains(current_task)) {
-                remove_from_sums(rq, current_task);
-                rq->runnable_heap.remove(current_task);
+                (void)transition_detach_runnable_locked(rq, current_task);
             }
-            wait_list_remove_all_locked(rq, current_task);
-            current_task->sched_queue = task::Task::sched_queue::WAITING;
-            wait_list_push_locked(rq, current_task);
+            transition_detach_all_wait_locked(rq, current_task);
+            transition_make_waiting_locked(rq, current_task);
             // Perf: task going to sleep (wants_block)
             perf::record_sleep(static_cast<uint32_t>(cpu::current_cpu()), current_task->pid, WAKE_AT_US, perf_sleep_flags(WAKE_AT_US),
                                current_task->last_run_us, perf_wait_callsite(current_task), current_task->wait_channel);
@@ -4406,11 +4797,9 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
             current_task->last_run_us = current_task->slice_used_ns / 1000U;
             note_perf_wait_callsite(current_task, current_task->context.frame.rip);
             current_task->last_sleep_start_us = NOW_US;
-            remove_from_sums(rq, current_task);
-            rq->runnable_heap.remove(current_task);
-            current_task->sched_queue = task::Task::sched_queue::WAITING;
+            (void)transition_detach_runnable_locked(rq, current_task);
             current_task->set_wait_channel("ptrace", task::WaitChannelKind::PTRACE);
-            wait_list_push_locked(rq, current_task);
+            transition_make_waiting_locked(rq, current_task);
             blocked_current_task = true;
         }
 
@@ -4437,11 +4826,9 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
             return nullptr;
         }
         if (next->ptrace_stopped) {
-            remove_from_sums(rq, next);
-            rq->runnable_heap.remove(next);
-            next->sched_queue = task::Task::sched_queue::WAITING;
+            (void)transition_detach_runnable_locked(rq, next);
             next->set_wait_channel("ptrace", task::WaitChannelKind::PTRACE);
-            wait_list_push_locked(rq, next);
+            transition_make_waiting_locked(rq, next);
             return nullptr;
         }
 
@@ -4609,7 +4996,8 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
 
     if (!sys::context_switch::switch_to(gpr, frame, next_task)) {
         clear_handoff_task(next_task);
-        publish_current_task(rq, original_task);
+        run_queues->this_cpu_locked_void(
+            [original_task](RunQueue* locked_rq) { transition_publish_current_locked(locked_rq, original_task); });
         debug_task_slot(cpu::current_cpu()) = original_task;
     } else {
         if (POSTSITCH_RESTORE_INFLATE) {
@@ -4666,8 +5054,8 @@ void jump_to_next_task(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFra
             }
             // The intrusive wait list owns schedNext, so detach by actual
             // membership rather than trusting sched_queue to still be accurate.
-            wait_list_remove_locked(rq, exiting_task);
-            exiting_task->sched_queue = task::Task::sched_queue::NONE;
+            transition_detach_wait_locked(rq, exiting_task);
+            transition_mark_detached_locked(rq, exiting_task, TransitionPhase::EXITING_CURRENT);
         }
 
         // Pick next task from heap
@@ -4758,14 +5146,14 @@ void start_scheduler() {
         auto* t = rq->runnable_heap.pick_best_eligible(AVG);
         if (t != nullptr && t->type != task::TaskType::IDLE && (t->type == task::TaskType::DAEMON || t->thread != nullptr)) {
             t->cpu = cpu::current_cpu();
-            publish_current_task(rq, t);
+            transition_publish_current_locked(rq, t);
         }
         return t;
     });
 
     if (first_task == nullptr || first_task->type == task::TaskType::IDLE) {
         // Set idle task as current while waiting
-        publish_current_task(rq, rq->idle_task);
+        publish_current_task_boot_exception(rq, rq->idle_task);
         scheduler_task_context_ready_mask.fetch_or(1ULL << cpu::current_cpu(), std::memory_order_acq_rel);
 
         for (;;) {
@@ -4796,7 +5184,7 @@ void start_scheduler() {
                 }
 
                 candidate->cpu = cpu::current_cpu();
-                publish_current_task(rq, candidate);
+                transition_publish_current_locked(rq, candidate);
                 return candidate;
             });
 
@@ -4814,7 +5202,7 @@ void start_scheduler() {
     record_local_proc_first_run(first_task, WOS_PERF_CALLSITE());
     first_task->has_run = true;
     first_task->cpu = cpu::current_cpu();
-    publish_current_task(rq, first_task);
+    publish_current_task_boot_exception(rq, first_task);
 
     // Set up GS/FS MSRs for the first task
     uint64_t const REAL_CPU_ID = cpu::current_cpu();
@@ -5033,15 +5421,13 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
         } else {
             // Block: remove from heap, add to wait list
             if (rq->runnable_heap.contains(current_task)) {
-                remove_from_sums(rq, current_task);
-                rq->runnable_heap.remove(current_task);
+                (void)transition_detach_runnable_locked(rq, current_task);
             }
             current_task->last_run_us = current_task->slice_used_ns / 1000U;
             note_perf_wait_callsite(current_task, current_task->context.frame.rip);
             current_task->last_sleep_start_us = NOW_US;
             uint64_t const WAKE_AT_US = current_task->wake_at_us;
-            current_task->sched_queue = task::Task::sched_queue::WAITING;
-            wait_list_push_locked(rq, current_task);
+            transition_make_waiting_locked(rq, current_task);
             perf::record_sleep(static_cast<uint32_t>(cpu::current_cpu()), current_task->pid, WAKE_AT_US, perf_sleep_flags(WAKE_AT_US),
                                current_task->last_run_us, perf_wait_callsite(current_task), current_task->wait_channel);
             notify_wki_proxy_blocked = current_task->wki_proxy_task_id != 0;
@@ -5090,7 +5476,7 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
 
                 if (woke && current_task->sched_queue == task::Task::sched_queue::WAITING) {
                     task::WaitChannelKind const WAIT_KIND = current_task->wait_channel_kind;
-                    wait_list_remove_locked(rq, current_task);
+                    transition_detach_wait_locked(rq, current_task);
                     current_task->wants_block = false;
                     current_task->wake_at_us = 0;
                     finish_wait_metadata_for_runqueue(current_task);
@@ -5251,14 +5637,12 @@ void place_task_in_wait_queue(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::Inter
         uint64_t const NOW_US = time::get_us();
         // Remove from heap
         if (rq->runnable_heap.contains(current_task)) {
-            remove_from_sums(rq, current_task);
-            rq->runnable_heap.remove(current_task);
+            (void)transition_detach_runnable_locked(rq, current_task);
         }
         current_task->last_run_us = current_task->slice_used_ns / 1000U;
         current_task->perf_wait_callsite = current_task->context.frame.rip;
         current_task->last_sleep_start_us = NOW_US;
-        current_task->sched_queue = task::Task::sched_queue::WAITING;
-        wait_list_push_locked(rq, current_task);
+        transition_make_waiting_locked(rq, current_task);
 
         // Pick next
         if (rq->runnable_heap.size == 0) {
@@ -5433,13 +5817,12 @@ void reschedule_task_for_cpu_once(uint64_t cpu_no, task::Task* task) {
                 return;
             }
             cpu_no = cross_cpu_migration_target_or_source(task, LAST_CPU, cpu_no, NCPUS_RESCHED);
-            if (IN_WAIT && wait_list_remove_locked(rq, task)) {
+            if (IN_WAIT && transition_detach_wait_locked(rq, task)) {
                 found_owner_cpu = LAST_CPU;
                 found_and_removed = true;
             }
             if (IN_HEAP) {
-                remove_from_sums(rq, task);
-                rq->runnable_heap.remove(task);
+                (void)transition_detach_runnable_locked(rq, task);
                 found_owner_cpu = LAST_CPU;
                 found_and_removed = true;
             }
@@ -5480,7 +5863,7 @@ void reschedule_task_for_cpu_once(uint64_t cpu_no, task::Task* task) {
                             return;
                         }
                         cpu_no = cross_cpu_migration_target_or_source(task, search_cpu, cpu_no, NCPUS_RESCHED);
-                        if (IN_WAIT && wait_list_remove_locked(rq, task)) {
+                        if (IN_WAIT && transition_detach_wait_locked(rq, task)) {
                             found_owner_cpu = search_cpu;
                             found_and_removed = true;
 #ifdef SCHED_DEBUG
@@ -5492,8 +5875,7 @@ void reschedule_task_for_cpu_once(uint64_t cpu_no, task::Task* task) {
                             dbg::log("RESCHED: PID %x found in CPU %d heap (idx=%d), removing", task->pid, static_cast<int>(search_cpu),
                                      task->heap_index);
 #endif
-                            remove_from_sums(rq, task);
-                            rq->runnable_heap.remove(task);
+                            (void)transition_detach_runnable_locked(rq, task);
                             found_owner_cpu = search_cpu;
                             found_and_removed = true;
                         }
@@ -6092,6 +6474,40 @@ auto signal_visible_processes_except(uint64_t excluded_pid, uint64_t excluded_ow
 // Garbage collection
 // ============================================================================
 
+namespace {
+
+inline void transition_enqueue_dead_locked(RunQueue* rq, task::Task* task) {
+    if (rq == nullptr || task == nullptr) {
+        return;
+    }
+    task->sched_queue = task::Task::sched_queue::DEAD_GC;
+    rq->dead_list.push(task);
+    validate_transition_boundary_locked(rq, TransitionPhase::DEAD_ENQUEUE, task);
+}
+
+[[nodiscard]] inline auto transition_detach_dead_locked(RunQueue* rq, task::Task* task, bool preserve_queue_tag = false) -> bool {
+    if (rq == nullptr || task == nullptr) {
+        return false;
+    }
+    bool removed = false;
+    while (rq->dead_list.remove(task)) {
+        removed = true;
+    }
+    if (!removed) {
+        return false;
+    }
+    if (rq->gc_reclaim_scan_cursor == task) {
+        rq->gc_reclaim_scan_cursor = rq->dead_list.head;
+    }
+    if (!preserve_queue_tag) {
+        task->sched_queue = task::Task::sched_queue::NONE;
+    }
+    validate_transition_boundary_locked(rq, TransitionPhase::GC_DETACH, task);
+    return true;
+}
+
+}  // namespace
+
 void insert_into_dead_list(task::Task* task) {
     if (task == nullptr) {
         return;
@@ -6129,10 +6545,9 @@ void insert_into_dead_list(task::Task* task) {
         if (runqueue_task_is_reserved_locked(rq, task)) {
             found_current = true;
         }
-        wait_list_remove_all_locked(rq, task);
+        transition_detach_all_wait_locked(rq, task);
         while (rq->runnable_heap.contains(task)) {
-            remove_from_sums(rq, task);
-            rq->runnable_heap.remove(task);
+            (void)transition_detach_runnable_locked(rq, task, TransitionPhase::DEAD_ENQUEUE);
         }
     };
 
@@ -6156,8 +6571,7 @@ void insert_into_dead_list(task::Task* task) {
         return;
     }
 
-    task->sched_queue = task::Task::sched_queue::DEAD_GC;
-    run_queues->with_lock_void(0, [task](RunQueue* rq) { rq->dead_list.push(task); });
+    run_queues->with_lock_void(0, [task](RunQueue* rq) { transition_enqueue_dead_locked(rq, task); });
     if (!ker::syscall::process::child_events::is_waitable_zombie(*task)) {
         active_list_remove(task);
     }
@@ -6445,11 +6859,10 @@ auto detach_next_reclaimable_task_locked(RunQueue* rq, uint64_t cpu_no, uint64_t
         }
 
         if (!task_looks_valid) {
-            while (rq->dead_list.remove(cur)) {
-            }
-            if (rq->gc_reclaim_scan_cursor == cur) {
-                rq->gc_reclaim_scan_cursor = rq->dead_list.head;
-            }
+            // Named corrupted-task leak exception: preserve DEAD_GC after
+            // detaching so no path can mistake this deliberately leaked Task
+            // for a reusable scheduler object.
+            (void)transition_detach_dead_locked(rq, cur, true);
             dbg::log("GC: Leaking corrupted task %p to avoid crash", cur);
             return {.counted_without_cleanup = true};
         }
@@ -6463,12 +6876,7 @@ auto detach_next_reclaimable_task_locked(RunQueue* rq, uint64_t cpu_no, uint64_t
             should_free_pagemap = !gc_task_has_pagemap_sibling_locked(cur);
         }
 
-        while (rq->dead_list.remove(cur)) {
-        }
-        if (rq->gc_reclaim_scan_cursor == cur) {
-            rq->gc_reclaim_scan_cursor = rq->dead_list.head;
-        }
-        cur->sched_queue = task::Task::sched_queue::NONE;
+        (void)transition_detach_dead_locked(rq, cur);
 
         // Once the task is out of the registries, no new pid/active-list lookup
         // can acquire it while the heavy cleanup runs outside the runqueue lock.
@@ -8000,7 +8408,88 @@ alignas(RunQueue) SchedulerRunQueueStorage scheduler_reschedule_selftest_second_
 RunQueue* scheduler_reschedule_selftest_first_rq{};                                         // NOLINT
 RunQueue* scheduler_reschedule_selftest_second_rq{};                                        // NOLINT
 task::Task scheduler_reschedule_selftest_target;                                            // NOLINT
+#ifdef WOS_SCHED_TRANSITION_VALIDATION
+alignas(RunQueue) SchedulerRunQueueStorage scheduler_transition_validator_selftest_storage{};  // NOLINT
+RunQueue* scheduler_transition_validator_selftest_rq{};                                        // NOLINT
+task::Task scheduler_transition_validator_selftest_runnable;                                   // NOLINT
+task::Task scheduler_transition_validator_selftest_waiting;                                    // NOLINT
+#endif
 }  // namespace
+
+auto scheduler_selftest_transition_validator_detects_corruption() -> bool {
+#ifdef WOS_SCHED_TRANSITION_VALIDATION
+    if (scheduler_transition_validator_selftest_rq == nullptr) {
+        scheduler_transition_validator_selftest_rq =
+            ::new (static_cast<void*>(scheduler_transition_validator_selftest_storage.data())) RunQueue{};
+    }
+
+    auto& rq = *scheduler_transition_validator_selftest_rq;
+    auto& runnable = scheduler_transition_validator_selftest_runnable;
+    auto& waiting = scheduler_transition_validator_selftest_waiting;
+
+    rq.runnable_heap.init();
+    rq.wait_list.init();
+    rq.dead_list.init();
+    rq.current_task = nullptr;  // Named selftest mutation exception.
+    rq.handoff_task = nullptr;  // Named selftest mutation exception.
+    rq.idle_task = nullptr;
+    rq.total_weighted_vruntime = 0;
+    rq.total_weight = 0;
+    rq.min_vruntime = 0;
+    rq.next_wait_deadline_us = 0;
+    rq.gc_reclaim_scan_cursor = nullptr;
+    rq.cached_load_default.store(0, std::memory_order_relaxed);
+    rq.cached_load_process.store(0, std::memory_order_relaxed);
+    rq.cached_current_load_default.store(0, std::memory_order_relaxed);
+    rq.cached_current_load_process.store(0, std::memory_order_relaxed);
+
+    runnable.state.store(task::TaskState::ACTIVE, std::memory_order_relaxed);
+    runnable.type = task::TaskType::DAEMON;
+    runnable.pid = 1;
+    runnable.cpu = 0;
+    runnable.heap_index = -1;
+    runnable.sched_next = nullptr;
+    runnable.sched_queue = task::Task::sched_queue::NONE;  // Named selftest mutation exception.
+    runnable.scheduler_published.store(false, std::memory_order_relaxed);
+    runnable.gc_queued.store(false, std::memory_order_relaxed);
+    runnable.sched_weight = 1024;
+    runnable.vruntime = 5;
+    runnable.vdeadline = 10;
+
+    waiting.state.store(task::TaskState::ACTIVE, std::memory_order_relaxed);
+    waiting.type = task::TaskType::DAEMON;
+    waiting.pid = 2;
+    waiting.cpu = 0;
+    waiting.heap_index = -1;
+    waiting.sched_next = nullptr;
+    waiting.sched_queue = task::Task::sched_queue::NONE;  // Named selftest mutation exception.
+    waiting.scheduler_published.store(true, std::memory_order_relaxed);
+    waiting.gc_queued.store(false, std::memory_order_relaxed);
+
+    if (!publish_runnable_task_locked(&rq, &runnable, "transition-validator-selftest")) {
+        return false;
+    }
+    transition_make_waiting_locked(&rq, &waiting);
+    if (validate_transition_boundary_locked(&rq, TransitionPhase::STABLE) != 0) {
+        return false;
+    }
+
+    runnable.heap_index = -1;  // Named corruption injection exception.
+    ++rq.wait_list.count;      // Named corruption injection exception.
+    ++rq.total_weight;         // Named corruption injection exception.
+    uint64_t const VIOLATIONS = validate_transition_boundary_locked(&rq, TransitionPhase::STABLE, &runnable);
+    uint64_t const EXPECTED = transition_invariant_bit(TransitionInvariant::HEAP_INDEX) |
+                              transition_invariant_bit(TransitionInvariant::WAIT_COUNT) |
+                              transition_invariant_bit(TransitionInvariant::EEVDF_TOTAL_WEIGHT);
+
+    runnable.heap_index = 0;
+    --rq.wait_list.count;
+    --rq.total_weight;
+    return (VIOLATIONS & EXPECTED) == EXPECTED && validate_transition_boundary_locked(&rq, TransitionPhase::STABLE) == 0;
+#else
+    return true;
+#endif
+}
 
 auto scheduler_selftest_handoff_preserves_runnable_event_token() -> bool {
     RunQueue rq{};
@@ -8026,7 +8515,7 @@ auto scheduler_selftest_reserved_wake_precedes_handoff_commit() -> bool {
     outgoing.wake_at_us = 10;
     outgoing.set_voluntary_blocked(true);
     outgoing.set_wait_channel("kern_sleep", task::WaitChannelKind::GENERIC);
-    wait_list_push_locked(&rq, &outgoing);
+    transition_attach_wait_locked(&rq, &outgoing);
     rq.current_task = &outgoing;
     rq.handoff_task = &successor;
 
@@ -8116,8 +8605,7 @@ auto scheduler_selftest_concurrent_reschedule_requests_are_serialized() -> bool 
     uint64_t second_cpu = UINT64_MAX;
     bool const SECOND_CONSUMED = consume_reschedule_request(&target, second_cpu);
 
-    remove_from_sums(&first_rq, &target);
-    bool const REMOVED_FIRST = first_rq.runnable_heap.remove(&target);
+    bool const REMOVED_FIRST = transition_detach_runnable_locked(&first_rq, &target);
     target.cpu = second_cpu;
     bool const SECOND_PUBLISHED = publish_runnable_task_locked(&second_rq, &target, "reschedule-selftest-second");
     bool const LEADER_RELEASED = !retain_or_reacquire_reschedule_leader(&target);
@@ -8281,7 +8769,7 @@ auto scheduler_selftest_load_balance_nudge_needs_process_backlog() -> bool {
     current.type = task::TaskType::PROCESS;
     current.pid = 1;
     current.sched_weight = 1024;
-    publish_current_task(&rq, &current);
+    transition_publish_current_locked(&rq, &current);
 
     bool const CURRENT_ONLY_REJECTED = !runqueue_has_stealable_process_backlog(&rq);
 
@@ -8318,7 +8806,7 @@ auto scheduler_selftest_effectively_idle_current_accepts_rebalance_probe() -> bo
     current.pid = 1;
     current.sched_weight = 1024;
     current.heap_index = -1;
-    publish_current_task(&rq, &current);
+    transition_publish_current_locked(&rq, &current);
 
     current.set_voluntary_blocked(true);
     bool const VOLUNTARY_EMPTY_ACCEPTED = runqueue_accepts_rebalance_probe(&rq);

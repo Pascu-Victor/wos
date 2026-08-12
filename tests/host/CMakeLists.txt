@@ -649,6 +649,10 @@ wos_add_unit_test(kernel_preemption_policy_test
     SOURCES     ${CMAKE_CURRENT_SOURCE_DIR}/unit/kernel_preemption_policy_test.cpp
 )
 
+wos_add_unit_test(scheduler_transition_model_test
+    SOURCES     ${CMAKE_CURRENT_SOURCE_DIR}/unit/scheduler_transition_model_test.cpp
+)
+
 wos_add_unit_test(wos_abi_parity_test
     SOURCES     ${CMAKE_CURRENT_SOURCE_DIR}/unit/wos_abi_parity_test.cpp
 )

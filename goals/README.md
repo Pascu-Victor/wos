@@ -25,7 +25,7 @@ contract behind it. These files do not activate Goal Mode by themselves.
 | 01  | [Fault-safe syscall user access](01-syscall-usercopy-safety.md)                      | syscall ABI, usercopy, VFS, sockets                         | 10, 11 when changing the same ABI wrappers    | Done        |
 | 02  | [Unified memory-pressure coordinator](02-unified-memory-reclaim.md)                  | allocator, caches, swap, reclaim                            | other allocator/reclaim rewrites              | Done        |
 | 03  | [Event-driven child lifecycle](03-process-child-events.md)                           | waitpid, exit, ptrace, scheduler                            | 04 or 16 in shared Task/deferred-switch code  | Done        |
-| 04  | [Executable scheduler transition model](04-scheduler-transition-model.md)            | EEVDF transitions, migration, handoff                       | 03, 16, and other scheduler restructures      | Not started |
+| 04  | [Executable scheduler transition model](04-scheduler-transition-model.md)            | EEVDF transitions, migration, handoff                       | 03, 16, and other scheduler restructures      | Done        |
 | 05  | [Asynchronous xHCI hotplug lifecycle](05-xhci-hotplug-lifecycle.md)                  | IRQ, USB DMA, CDC netdevice teardown                        | other USB/netdevice lifetime rewrites         | Done        |
 | 06  | [Production IPv6 dual stack](06-ipv6-dual-stack.md)                                  | TCP/UDP, NDP, routing, netd                                 | broad socket or network-stack rewrites        | Not started |
 | 07  | [Mount-scoped crash-consistent XFS journal](07-xfs-crash-consistency.md)             | XFS log, buffer cache, block I/O                            | 10 when changing XFS transactions             | Not started |
@@ -44,7 +44,7 @@ contract behind it. These files do not activate Goal Mode by themselves.
 The portfolio `Status` column is the canonical goal-selection filter. Do not
 select, reload, or rescan a row marked `Done`; its completion record and current
 source remain available only for later regression work. Completed goals are
-currently 01, 02, 03, 05, 11, 12, 14, and 16. Select only a row whose status is `Not started` (or a
+currently 01, 02, 03, 04, 05, 11, 12, 14, and 16. Select only a row whose status is `Not started` (or a
 future explicit in-progress state).
 
 ## How to use a goal

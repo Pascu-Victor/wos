@@ -226,6 +226,7 @@ UNIT_TESTS=(
     saved_frame_class_test
     migration_guard_test
     kernel_preemption_policy_test
+    scheduler_transition_model_test
     kernel_vsnprintf_test
     wki_routing_test
     data_struct_test

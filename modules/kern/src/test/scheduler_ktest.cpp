@@ -5,6 +5,7 @@
 #include <platform/sched/preemption_policy.hpp>
 #include <platform/sched/run_heap.hpp>
 #include <platform/sched/scheduler.hpp>
+#include <platform/sched/scheduler_transition_model.hpp>
 #include <platform/sched/task.hpp>
 #include <platform/sys/context_switch.hpp>
 #include <test/ktest.hpp>
@@ -20,6 +21,7 @@ static constexpr uint32_t WEIGHT_NICE_P5 = 335;   // nice=+5 (lower prio)
 static constexpr uint32_t WEIGHT_NICE_N5 = 3121;  // nice=-5 (higher prio)
 
 namespace ker::mod::sched {
+auto scheduler_selftest_transition_validator_detects_corruption() -> bool;
 auto scheduler_selftest_handoff_preserves_runnable_event_token() -> bool;
 auto scheduler_selftest_reserved_wake_precedes_handoff_commit() -> bool;
 auto scheduler_selftest_concurrent_reschedule_requests_are_serialized() -> bool;
@@ -378,6 +380,117 @@ KTEST(SchedulerDeferredSwitch, YieldBitRequiresSchedYieldChannel) {
 
 KTEST(SchedulerResume, LazyExecutableFileRangeIsValid) {
     KEXPECT_TRUE(ker::mod::sched::scheduler_selftest_lazy_executable_resume_range_policy());
+}
+
+// ---------------------------------------------------------------------------
+// Deterministic scheduler transition model.
+//
+// KTEST parks secondary CPUs, so live SMP interleavings are not available in
+// this environment.  The shared freestanding model explores the same bounded
+// fake-CPU transitions as the host test and checks invariants after every step.
+// ---------------------------------------------------------------------------
+
+KTEST(SchedulerTransitionModel, EventBeforeParkWake) {
+    auto const RESULT = ker::mod::sched::model::run_scenario(ker::mod::sched::model::Scenario::EVENT_BEFORE_PARK);
+    KREQUIRE_TRUE(RESULT.passed);
+    KEXPECT_EQ(RESULT.violations, 0ULL);
+    KEXPECT_TRUE(RESULT.steps > 0U);
+}
+
+KTEST(SchedulerTransitionModel, EventAfterParkWake) {
+    auto const RESULT = ker::mod::sched::model::run_scenario(ker::mod::sched::model::Scenario::EVENT_AFTER_PARK);
+    KREQUIRE_TRUE(RESULT.passed);
+    KEXPECT_EQ(RESULT.violations, 0ULL);
+    KEXPECT_TRUE(RESULT.steps > 0U);
+}
+
+KTEST(SchedulerTransitionModel, DuplicateReschedule) {
+    auto const RESULT = ker::mod::sched::model::run_scenario(ker::mod::sched::model::Scenario::DUPLICATE_RESCHEDULE);
+    KEXPECT_TRUE(RESULT.passed);
+    KEXPECT_EQ(RESULT.violations, 0ULL);
+    KEXPECT_TRUE(RESULT.steps > 0U);
+    KEXPECT_TRUE(RESULT.rejected > 0U);
+}
+
+KTEST(SchedulerTransitionModel, HandoffWake) {
+    auto const RESULT = ker::mod::sched::model::run_scenario(ker::mod::sched::model::Scenario::HANDOFF_WAKE);
+    KREQUIRE_TRUE(RESULT.passed);
+    KEXPECT_EQ(RESULT.violations, 0ULL);
+    KEXPECT_TRUE(RESULT.steps > 0U);
+}
+
+KTEST(SchedulerTransitionModel, LocalMigration) {
+    auto const RESULT = ker::mod::sched::model::run_scenario(ker::mod::sched::model::Scenario::LOCAL_MIGRATION);
+    KREQUIRE_TRUE(RESULT.passed);
+    KEXPECT_EQ(RESULT.violations, 0ULL);
+    KEXPECT_TRUE(RESULT.steps > 0U);
+}
+
+KTEST(SchedulerTransitionModel, TwoCpuMigration) {
+    auto const RESULT = ker::mod::sched::model::run_scenario(ker::mod::sched::model::Scenario::TWO_CPU_MIGRATION);
+    KEXPECT_TRUE(RESULT.passed);
+    KEXPECT_EQ(RESULT.violations, 0ULL);
+    KEXPECT_TRUE(RESULT.steps > 0U);
+    KEXPECT_TRUE(RESULT.ipis_sent > 0U);
+    KEXPECT_EQ(RESULT.ipis_sent, RESULT.ipis_delivered);
+}
+
+KTEST(SchedulerTransitionModel, PinRejection) {
+    auto const RESULT = ker::mod::sched::model::run_scenario(ker::mod::sched::model::Scenario::PIN_REJECTION);
+    KEXPECT_TRUE(RESULT.passed);
+    KEXPECT_EQ(RESULT.violations, 0ULL);
+    KEXPECT_TRUE(RESULT.steps > 0U);
+    KEXPECT_TRUE(RESULT.rejected > 0U);
+}
+
+KTEST(SchedulerTransitionModel, DomainRejection) {
+    auto const RESULT = ker::mod::sched::model::run_scenario(ker::mod::sched::model::Scenario::DOMAIN_REJECTION);
+    KEXPECT_TRUE(RESULT.passed);
+    KEXPECT_EQ(RESULT.violations, 0ULL);
+    KEXPECT_TRUE(RESULT.steps > 0U);
+    KEXPECT_TRUE(RESULT.rejected > 0U);
+}
+
+KTEST(SchedulerTransitionModel, PreemptPendingAndService) {
+    auto const RESULT = ker::mod::sched::model::run_scenario(ker::mod::sched::model::Scenario::PREEMPT_PENDING);
+    KREQUIRE_TRUE(RESULT.passed);
+    KEXPECT_EQ(RESULT.violations, 0ULL);
+    KEXPECT_TRUE(RESULT.steps > 0U);
+}
+
+KTEST(SchedulerTransitionModel, ExitDeadAndGc) {
+    auto const RESULT = ker::mod::sched::model::run_scenario(ker::mod::sched::model::Scenario::EXIT_GC);
+    KREQUIRE_TRUE(RESULT.passed);
+    KEXPECT_EQ(RESULT.violations, 0ULL);
+    KEXPECT_TRUE(RESULT.steps > 0U);
+}
+
+KTEST(SchedulerTransitionModel, BoundedExplorationIsReplayable) {
+    auto const FIRST = ker::mod::sched::model::explore_bounded();
+    KEXPECT_TRUE(FIRST.passed);
+    KEXPECT_EQ(FIRST.violations, 0ULL);
+    KEXPECT_TRUE(FIRST.states > 0U);
+    KEXPECT_TRUE(FIRST.traces > 0U);
+    KEXPECT_TRUE(FIRST.max_depth > 0U);
+    KEXPECT_NE(FIRST.replay_seed, 0ULL);
+
+    auto const REPLAY = ker::mod::sched::model::explore_bounded(FIRST.replay_seed);
+    KEXPECT_TRUE(REPLAY.passed);
+    KEXPECT_EQ(REPLAY.violations, FIRST.violations);
+    KEXPECT_EQ(REPLAY.states, FIRST.states);
+    KEXPECT_EQ(REPLAY.traces, FIRST.traces);
+    KEXPECT_EQ(REPLAY.max_depth, FIRST.max_depth);
+    KEXPECT_EQ(REPLAY.replay_seed, FIRST.replay_seed);
+}
+
+KTEST(SchedulerTransitionModel, NegativeInvariantChecksAreDetected) {
+    constexpr uint64_t COVERAGE = ker::mod::sched::model::negative_invariant_coverage();
+    KEXPECT_EQ(COVERAGE & ker::mod::sched::model::REQUIRED_INVARIANTS, ker::mod::sched::model::REQUIRED_INVARIANTS);
+    KEXPECT_TRUE(ker::mod::sched::model::negative_invariant_detection());
+}
+
+KTEST(SchedulerTransitionValidator, DetectsAndClearsCorruption) {
+    KEXPECT_TRUE(ker::mod::sched::scheduler_selftest_transition_validator_detects_corruption());
 }
 
 KTEST(ContextSwitch, RepairsStaleProcessSyscallResume) {

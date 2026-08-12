@@ -875,7 +875,9 @@ def test_task_exit_retires_remote_compute_wait_owners() -> None:
         ["std::atomic<bool> scheduler_published{false}"],
         "monotonic scheduler-publication marker",
     )
-    runnable_post = function_body(scheduler_source, "publish_runnable_task_locked")
+    # Queue-tag/publication ordering is owned by the locked transition
+    # primitive; the legacy wrapper only adds diagnostics after failure.
+    runnable_post = function_body(scheduler_source, "transition_make_runnable_locked")
     require_order(
         runnable_post[runnable_post.find("rq->runnable_heap.insert(t)") :],
         "t->sched_queue = task::Task::sched_queue::RUNNABLE",
@@ -1344,24 +1346,24 @@ def test_proxy_waiting_publication_is_transactional() -> None:
             "task->heap_index >= 0",
             "task->sched_next != nullptr",
             "task == get_current_task()",
-            "wait_list_push_locked(rq, task)",
+            "transition_make_waiting_locked(rq, task, TransitionPhase::PREPUBLICATION)",
             "published = register_fresh_task_visibility(task)",
-            "if (!wait_list_remove_locked(rq, task))",
-            "task->sched_queue = task::Task::sched_queue::NONE",
+            "if (!transition_detach_wait_locked(rq, task))",
+            "transition_mark_detached_locked(rq, task, TransitionPhase::PREPUBLICATION)",
             "return published",
         ],
         "transactional fresh WAITING publication",
     )
     require_order(
         publication,
-        "wait_list_push_locked(rq, task)",
+        "transition_make_waiting_locked(rq, task, TransitionPhase::PREPUBLICATION)",
         "published = register_fresh_task_visibility(task)",
         "wait-list park before global task visibility",
     )
     require_order(
         publication,
         "published = register_fresh_task_visibility(task)",
-        "if (!wait_list_remove_locked(rq, task))",
+        "if (!transition_detach_wait_locked(rq, task))",
         "failed registration before wait-list rollback",
     )
     if "pid_table_insert(task)" in publication or "active_list_insert(task)" in publication:
