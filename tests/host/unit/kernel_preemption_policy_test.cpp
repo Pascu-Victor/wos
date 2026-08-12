@@ -88,12 +88,11 @@ TEST(KernelPreemptionPolicy, TemporaryUnsafeRegionsRecordPendingWork) {
     EXPECT_TRUE(decision.record_pending);
     EXPECT_EQ(decision.reason, KernelPreemptionBlockReason::PREEMPT_DISABLED);
 
-    for (int conflict = 0; conflict < 4; ++conflict) {
+    for (int conflict = 0; conflict < 3; ++conflict) {
         input = ordinary_kernel_input();
         input.scheduler_transition_active = conflict == 0;
         input.deferred_task_switch = conflict == 1;
         input.wants_block = conflict == 2;
-        input.waitpid_publish_pending = conflict == 3;
         decision = evaluate_kernel_preemption(input);
         EXPECT_FALSE(decision.can_switch);
         EXPECT_TRUE(decision.record_pending);

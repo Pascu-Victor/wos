@@ -883,9 +883,12 @@ void try_write_for_task(ker::mod::sched::task::Task* task, const ker::mod::cpu::
     req.vdeadline = static_cast<uint64_t>(task->vdeadline);
     req.wake_at_us = task->wake_at_us;
     req.wait_channel_addr = reinterpret_cast<uint64_t>(task->wait_channel);
-    req.waiting_for_pid = task->waiting_for_pid;
-    req.wait_status_user_addr = task->wait_status_user_addr;
-    req.wait_rusage_user_addr = task->wait_rusage_user_addr;
+    // Preserve the append-only v3 coredump layout. Child waits now live in an
+    // intrusive process queue whose lock must not be acquired from an
+    // exception/coredump capture path, so legacy address fields are zero.
+    req.waiting_for_pid = 0;
+    req.wait_status_user_addr = 0;
+    req.wait_rusage_user_addr = 0;
     req.sig_pending = task->signal_pending_bits();
     req.sig_mask = task->signal_mask_bits();
     req.ptrace_tracer_pid = task->ptrace_tracer_pid;
@@ -898,7 +901,10 @@ void try_write_for_task(ker::mod::sched::task::Task* task, const ker::mod::cpu::
     req.task_flags |= task->is_elf_buffer_shared ? TASK_FLAG_IS_ELF_BUFFER_SHARED : 0;
     req.task_flags |= task->has_run ? TASK_FLAG_HAS_RUN : 0;
     req.task_flags |= task->has_exited ? TASK_FLAG_HAS_EXITED : 0;
-    req.task_flags |= ker::mod::sched::task::task_waited_on(*task) ? TASK_FLAG_WAITED_ON : 0;
+    req.task_flags |= task->has_exited && task->child_membership_state.load(std::memory_order_acquire) ==
+                                              ker::mod::sched::task::ChildMembershipState::UNLINKED
+                          ? TASK_FLAG_WAITED_ON
+                          : 0;
     req.task_flags |= task->deferred_task_switch ? TASK_FLAG_DEFERRED_TASK_SWITCH : 0;
     req.task_flags |= task->yield_switch ? TASK_FLAG_YIELD_SWITCH : 0;
     req.task_flags |= task->is_voluntary_blocked() ? TASK_FLAG_VOLUNTARY_BLOCK : 0;

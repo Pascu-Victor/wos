@@ -34,8 +34,8 @@
 #include <platform/sched/task.hpp>
 #include <platform/sched/threading.hpp>
 #include <platform/smt/smt.hpp>
-#include <platform/sys/usercopy.hpp>
 #include <string_view>
+#include <syscalls_impl/process/child_events.hpp>
 #include <syscalls_impl/process/exec.hpp>
 #include <util/errno_name.hpp>
 #include <util/hcf.hpp>
@@ -59,7 +59,6 @@ namespace {
 
 constexpr uint32_t WKI_LATENCY_DAEMON_SLICE_NS = 2'000'000;
 constexpr int WKI_LATENCY_DAEMON_NICE = -5;
-constexpr auto WAIT_ANY_CHILD = static_cast<uint64_t>(-1);
 constexpr uint16_t WKI_LOAD_REPORT_MAX_CPUS = 64;
 constexpr size_t WKI_COMPUTE_SUBMIT_WORKER_MAX = 8;
 constexpr size_t WKI_COMPUTE_SUBMIT_QUEUE_MAX = 64;
@@ -517,7 +516,6 @@ constexpr uint64_t WKI_EXEC_CACHE_INFLIGHT_WAIT_US = 1000;
 constexpr uint64_t WKI_VFS_LOAD_BACKOFF_POLL_US = 10000;
 constexpr int32_t WKI_SIGKILL_NUM = 9;
 constexpr int32_t WKI_SIGTERM_NUM = 15;
-constexpr uint64_t WKI_SIGCHLD_NUM = 17;
 constexpr int32_t WKI_WAIT_STATUS_SIGNAL_MASK = 0x7f;
 constexpr int32_t WKI_WAIT_STATUS_STOPPED = 0x7f;
 
@@ -1399,58 +1397,6 @@ auto normalize_local_exit_status_for_wire(int32_t exit_status) -> int32_t {
     }
 }
 
-auto proxy_waiter_context_can_be_completed(ker::mod::sched::task::Task* waiter) -> bool {
-    return waiter != nullptr && !waiter->deferred_task_switch && !waiter->waitpid_publish_pending.load(std::memory_order_acquire);
-}
-
-auto write_proxy_wait_status(ker::mod::sched::task::Task* waiter, int32_t wait_status) -> bool {
-    if (waiter == nullptr || waiter->wait_status_user_addr == 0 || waiter->pagemap == nullptr) {
-        if (waiter != nullptr) {
-            waiter->wait_status_user_addr = 0;
-            waiter->wait_status_phys_addr = 0;
-        }
-        return true;
-    }
-
-    bool const OK = ker::mod::sys::usercopy::copy_value_to_task_mapped(*waiter, waiter->wait_status_user_addr, wait_status);
-    waiter->wait_status_user_addr = 0;
-    waiter->wait_status_phys_addr = 0;
-    return OK;
-}
-
-auto proxy_matches_waiter(ker::mod::sched::task::Task* waiter, ker::mod::sched::task::Task* proxy) -> bool {
-    if (waiter == nullptr || proxy == nullptr || proxy->is_thread || proxy->parent_pid != waiter->pid) {
-        return false;
-    }
-    return waiter->waiting_for_pid == WAIT_ANY_CHILD || waiter->waiting_for_pid == proxy->pid;
-}
-
-auto try_complete_proxy_wait(ker::mod::sched::task::Task* waiter, ker::mod::sched::task::Task* proxy, int32_t wait_status) -> bool {
-    if (!proxy_matches_waiter(waiter, proxy) || !proxy_waiter_context_can_be_completed(waiter)) {
-        return false;
-    }
-    if (!ker::mod::sched::task::task_try_claim_waitpid_completion(*waiter)) {
-        return false;
-    }
-    if (!proxy_matches_waiter(waiter, proxy) || !proxy_waiter_context_can_be_completed(waiter)) {
-        ker::mod::sched::task::task_release_waitpid_completion_claim(*waiter);
-        return false;
-    }
-    if (!ker::mod::sched::task::task_try_mark_waited_on(*proxy)) {
-        ker::mod::sched::task::task_release_waitpid_completion_claim(*waiter);
-        return false;
-    }
-
-    ker::mod::sched::task::task_accumulate_waited_child_times(*waiter, *proxy);
-    waiter->context.regs.rax = proxy->pid;
-    if (!write_proxy_wait_status(waiter, wait_status)) {
-        waiter->context.regs.rax = static_cast<uint64_t>(-EFAULT);
-    }
-    waiter->waitpid_publish_pending.store(false, std::memory_order_release);
-    ker::mod::sched::task::task_clear_waitpid_block_state(*waiter);
-    return true;
-}
-
 void cleanup_proxy_resources(ker::mod::sched::task::Task* task) {
     if (task == nullptr || task->is_thread) {
         return;
@@ -1504,34 +1450,6 @@ void write_proxy_output(ker::mod::sched::task::Task* proxy, const uint8_t* outpu
 #endif
 }
 
-void wake_proxy_waiters(ker::mod::sched::task::Task* proxy, int32_t exit_status) {
-    if (proxy == nullptr) {
-        return;
-    }
-
-    int32_t const WAIT_STATUS = encode_remote_wait_status(exit_status);
-    uint64_t const WAITER_LOCK_FLAGS = proxy->exit_waiters_lock.lock_irqsave();
-    size_t const WAITER_COUNT = proxy->awaitee_on_exit.size();
-    std::array<uint64_t, 16> waiting_pids{};
-    size_t const WAITING_PIDS_CAP = waiting_pids.size();
-    for (size_t i = 0; i < WAITER_COUNT && i < WAITING_PIDS_CAP; ++i) {
-        waiting_pids.at(i) = proxy->awaitee_on_exit.at(i);
-    }
-    proxy->awaitee_on_exit.clear();
-    proxy->exit_waiters_lock.unlock_irqrestore(WAITER_LOCK_FLAGS);
-
-    for (size_t i = 0; i < WAITER_COUNT && i < WAITING_PIDS_CAP; ++i) {
-        uint64_t const WAITING_PID = waiting_pids.at(i);
-        auto* waiting_task = ker::mod::sched::find_task_by_pid_safe(WAITING_PID);
-        if (waiting_task != nullptr) {
-            (void)try_complete_proxy_wait(waiting_task, proxy, WAIT_STATUS);
-            uint64_t const CPU = ker::mod::sched::get_least_loaded_cpu();
-            ker::mod::sched::reschedule_task_for_cpu(CPU, waiting_task);
-            waiting_task->release();
-        }
-    }
-}
-
 void finalize_proxy_task(ker::mod::sched::task::Task* proxy, int32_t exit_status, const uint8_t* output_data, uint16_t output_len,
                          uint32_t task_id) {
     if (proxy == nullptr) {
@@ -1558,46 +1476,18 @@ void finalize_proxy_task(ker::mod::sched::task::Task* proxy, int32_t exit_status
 
     cleanup_proxy_resources(proxy);
 
-    // Publish the proxy in the dead registry before notifying waiters. A
-    // TASK_COMPLETE can race a parent that is still committing its waitpid
-    // park. If that early completion is fenced by deferred_task_switch, the
-    // scheduler's retry must be able to discover the now-waitable child.
+    // The proxy is now stable: output replay and all potentially blocking
+    // resource cleanup completed, and the encoded status/rusage snapshot can
+    // no longer change. Publish one immutable process child event before dead
+    // list insertion; child-event waiter registration owns the publish/park
+    // race and the scheduler only provides generic wakeup.
     proxy->death_epoch.store(ker::mod::sched::EpochManager::current_epoch(), std::memory_order_release);
     proxy->state.store(ker::mod::sched::task::TaskState::DEAD, std::memory_order_release);
-    ker::mod::sched::insert_into_dead_list(proxy);
-
-    // Send SIGCHLD to parent and wake it if blocked in waitpid(-1, ...).
-    // The normal exit path (wos_proc_exit) does this, but proxy tasks never
-    // go through wos_proc_exit — they are finalized here when TASK_COMPLETE
-    // arrives.  Notification must follow dead-list publication so a parent
-    // whose direct completion is still publish-fenced can repair the wait.
-    if (!proxy->is_thread && proxy->parent_pid != 0) {
-        auto* parent = ker::mod::sched::find_task_by_pid_safe(proxy->parent_pid);
-        if (parent != nullptr) {
-            parent->signal_add_pending_mask(1ULL << (WKI_SIGCHLD_NUM - 1));
-
-            if (parent->waiting_for_pid == WAIT_ANY_CHILD && try_complete_proxy_wait(parent, proxy, WAIT_STATUS)) {
-                uint64_t cpu = parent->cpu;
-                if (cpu >= ker::mod::smt::get_core_count()) {
-                    cpu = ker::mod::sched::get_least_loaded_cpu();
-                }
-                ker::mod::sched::reschedule_task_for_cpu(cpu, parent);
-            } else if (parent->deferred_task_switch || parent->is_voluntary_blocked()) {
-                uint64_t cpu = parent->cpu;
-                if (cpu >= ker::mod::smt::get_core_count()) {
-                    cpu = ker::mod::sched::get_least_loaded_cpu();
-                }
-                ker::mod::sched::reschedule_task_for_cpu(cpu, parent);
-            } else if ((parent->signal_deliverable_bits() & (1ULL << (WKI_SIGCHLD_NUM - 1))) != 0 &&
-                       parent->sched_queue == ker::mod::sched::task::Task::sched_queue::WAITING &&
-                       parent->wait_channel_is(ker::mod::sched::task::WaitChannelKind::SIGSUSPEND)) {
-                ker::mod::sched::wake_task_for_signal(parent);
-            }
-            parent->release();
-        }
+    if (!ker::syscall::process::child_events::publish_exit(*proxy)) {
+        ker::mod::dbg::panic_handler("WKI remote compute: failed to publish proxy child exit event");
+        hcf();
     }
-
-    wake_proxy_waiters(proxy, exit_status);
+    ker::mod::sched::insert_into_dead_list(proxy);
 }
 
 struct SubmitContextInfo {
@@ -2553,12 +2443,19 @@ auto wki_try_remote_spawn(ker::mod::sched::task::Task* task, const WkiRemoteSpaw
         task->set_wait_channel("wki_execve_proxy", ker::mod::sched::task::WaitChannelKind::WKI_EXECVE_PROXY);
         proxy_ready = ker::mod::sched::post_task_waiting(task);
         if (!proxy_ready) {
+            ker::syscall::process::child_events::abort_publication(*task);
             task->clear_wait_channel();
             task->wki_proxy_task = false;
             task->wki_proxy_task_id = 0;
             abandon_submitted_task_after_proxy_publish_failure(tid);
             log_spawn_diag(task, WkiRemoteSpawnResult::FAILED, "proxy-publication-failed", best_node);
             return WkiRemoteSpawnResult::FAILED;
+        }
+        if (!ker::syscall::process::child_events::commit_publication(*task)) [[unlikely]] {
+            // post_task_waiting() already exposed the proxy and the remote
+            // submit cannot be replayed safely. Preserve the REMOTE outcome;
+            // the caller still owns a recovery reference until handoff.
+            ker::mod::dbg::log("[WKI] proxy lifecycle commit completed concurrently: task_id=%u pid=0x%lx", tid, task->pid);
         }
     }
 
@@ -4303,37 +4200,59 @@ auto wki_remote_compute_selftest_cleanup_marks_unready_proxy_failure() -> bool {
 }
 
 auto wki_remote_compute_selftest_proxy_wait_completion_respects_publish_fence() -> bool {
-    ker::mod::sched::task::Task waiter{};
-    ker::mod::sched::task::Task stale_waiter{};
+    using ChildMembershipState = ker::mod::sched::task::ChildMembershipState;
+    using ProbeResult = ker::syscall::process::child_events::ProbeResult;
+
+    ker::mod::sched::task::Task parent{};
     ker::mod::sched::task::Task proxy{};
 
-    waiter.pid = 0x7A21;
-    stale_waiter.pid = waiter.pid;
+    parent.pid = 0x7A21;
     proxy.pid = 0x7A22;
-    proxy.parent_pid = waiter.pid;
-    ker::mod::sched::task::task_clear_waited_on(proxy);
+    proxy.pgid = 0x7A20;
+    proxy.exit_status = 0x1234;
+    proxy.user_time_us = 123;
+    proxy.system_time_us = 456;
 
-    waiter.context.regs.rax = 0xBAD0;
-    waiter.waiting_for_pid = proxy.pid;
-    waiter.deferred_task_switch = false;
-    waiter.waitpid_publish_pending.store(true, std::memory_order_release);
+    if (!ker::syscall::process::child_events::begin_publication(parent, proxy)) {
+        return false;
+    }
+    if (!ker::syscall::process::child_events::commit_publication(proxy)) {
+        ker::syscall::process::child_events::abort_publication(proxy);
+        return false;
+    }
 
-    bool const BLOCKED_WHILE_PUBLISHING = !try_complete_proxy_wait(&waiter, &proxy, 0x1234) &&
-                                          !ker::mod::sched::task::task_waited_on(proxy) && waiter.context.regs.rax == 0xBAD0 &&
-                                          waiter.waiting_for_pid == proxy.pid;
+    ker::syscall::process::child_events::ClaimedEvent before_publish{};
+    bool const REGISTERED_BEFORE_PUBLISH = ker::syscall::process::child_events::claim_or_register(
+                                               parent, parent, proxy.pid, 0, true, before_publish) == ProbeResult::WOULD_BLOCK;
 
-    waiter.waitpid_publish_pending.store(false, std::memory_order_release);
-    bool const COMPLETED_AFTER_PUBLISH = try_complete_proxy_wait(&waiter, &proxy, 0x1234) && ker::mod::sched::task::task_waited_on(proxy) &&
-                                         waiter.context.regs.rax == proxy.pid && waiter.waiting_for_pid == 0;
+    // These stack-local Tasks are lifecycle fixtures, not scheduler tasks.
+    // Prevent the generic event wake from publishing the parent as runnable.
+    parent.state.store(ker::mod::sched::task::TaskState::EXITING, std::memory_order_release);
+    bool const PUBLISHED = ker::syscall::process::child_events::publish_exit(proxy);
 
-    ker::mod::sched::task::task_clear_waited_on(proxy);
-    stale_waiter.context.regs.rax = 0xCAFE;
-    stale_waiter.waiting_for_pid = proxy.pid + 1;
-    bool const REJECTED_STALE_SPECIFIC_WAIT = !try_complete_proxy_wait(&stale_waiter, &proxy, 0x1234) &&
-                                              !ker::mod::sched::task::task_waited_on(proxy) && stale_waiter.context.regs.rax == 0xCAFE &&
-                                              stale_waiter.waiting_for_pid == proxy.pid + 1;
+    ker::syscall::process::child_events::ClaimedEvent first_claim{};
+    bool const FIRST_CLAIMED =
+        ker::syscall::process::child_events::claim_or_register(parent, parent, proxy.pid, 0, false, first_claim) == ProbeResult::CLAIMED;
+    bool const SNAPSHOT_PRESERVED = FIRST_CLAIMED && first_claim.subject_pid == proxy.pid && first_claim.process_group == proxy.pgid &&
+                                    first_claim.status == proxy.exit_status && first_claim.user_time_us == proxy.user_time_us &&
+                                    first_claim.system_time_us == proxy.system_time_us;
+    uint64_t const FIRST_COOKIE = first_claim.claim_cookie;
+    ker::syscall::process::child_events::release_claim(parent, first_claim);
 
-    return BLOCKED_WHILE_PUBLISHING && COMPLETED_AFTER_PUBLISH && REJECTED_STALE_SPECIFIC_WAIT;
+    ker::syscall::process::child_events::ClaimedEvent retry_claim{};
+    bool const RETRY_CLAIMED =
+        ker::syscall::process::child_events::claim_or_register(parent, parent, proxy.pid, 0, false, retry_claim) == ProbeResult::CLAIMED;
+    bool const RETRY_IS_SAME_EVENT = RETRY_CLAIMED && retry_claim.node == first_claim.node && retry_claim.claim_cookie != FIRST_COOKIE &&
+                                     retry_claim.status == first_claim.status;
+    bool const CONSUMED = RETRY_CLAIMED && ker::syscall::process::child_events::commit_claim(parent, parent, retry_claim, false);
+
+    ker::syscall::process::child_events::ClaimedEvent stale_claim{};
+    bool const REJECTED_STALE_SPECIFIC_WAIT = ker::syscall::process::child_events::claim_or_register(
+                                                  parent, parent, proxy.pid + 1, 0, false, stale_claim) == ProbeResult::NO_CHILD;
+
+    return REGISTERED_BEFORE_PUBLISH && PUBLISHED && SNAPSHOT_PRESERVED && RETRY_IS_SAME_EVENT && CONSUMED &&
+           REJECTED_STALE_SPECIFIC_WAIT && proxy.child_membership_state.load(std::memory_order_acquire) == ChildMembershipState::UNLINKED &&
+           parent.child_user_time_us == proxy.user_time_us && parent.child_system_time_us == proxy.system_time_us;
 }
 
 auto wki_remote_compute_selftest_task_wait_consumes_completed_row() -> bool {

@@ -48,6 +48,7 @@
 #include "platform/mm/paging.hpp"
 #include "platform/mm/virt.hpp"
 #include "platform/sched/threading.hpp"
+#include "syscalls_impl/process/child_events.hpp"
 #include "syscalls_impl/shm/shm.hpp"
 #include "syscalls_impl/vmem/sys_vmem.hpp"
 #include "vfs/stat.hpp"
@@ -1883,6 +1884,7 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
     }
     uint64_t const CHILD_PID = new_task->pid;
     auto cleanup_unpublished_task = [&]() {
+        child_events::abort_publication(*new_task);
         if (!sched::task::destroy_owned_unpublished_process(parent_task, new_task)) {
             dbg::panic_handler("wos_proc_exec: lost unpublished child ownership during teardown");
             hcf();
@@ -1918,8 +1920,6 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
     dbg::log("wos_proc_exec: Task constructor completed successfully");
     dbg::log("wos_proc_exec: Entry point = 0x%x, RIP = 0x%x", new_task->entry, new_task->context.frame.rip);
 #endif
-
-    new_task->parent_pid = PARENT_PID;
 
     // Inherit process execution context from the parent before applying
     // executable-specific overrides such as setuid/setgid.
@@ -2005,7 +2005,7 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
     }
 
 #ifdef EXEC_DEBUG
-    dbg::log("wos_proc_exec: Task created with PID: %x, parent: %x", new_task->pid, new_task->parent_pid);
+    dbg::log("wos_proc_exec: Task created with PID: %x, parent: %x", new_task->pid, PARENT_PID);
 #endif
 
     uint64_t user_stack_virt = new_task->thread->stack;
@@ -2208,6 +2208,11 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
         .envp = envp,
         .cwd = parent_task->cwd.data(),
     };
+    if (!child_events::begin_publication(*parent_task, *new_task)) {
+        cleanup_unpublished_task();
+        return 0;
+    }
+
     auto remote_result = ker::net::wki::wki_try_remote_spawn(new_task, REMOTE_SPAWN);
     consume_successful_one_shot_wki_target(new_task, remote_result);
     if (remote_result == ker::net::wki::WkiRemoteSpawnResult::REMOTE) {
@@ -2235,6 +2240,12 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
         dbg::log("wos_proc_exec: Failed to post task to scheduler");
         cleanup_unpublished_task();
         return 0;
+    }
+
+    // A legacy scheduler placement hook can turn this nominally local post
+    // into a WKI proxy; that path commits inside wki_try_remote_spawn().
+    if (!new_task->wki_proxy_task && !child_events::commit_publication(*new_task)) [[unlikely]] {
+        exec_log::error("local publication lifecycle commit completed concurrently for PID %x", CHILD_PID);
     }
 
 #ifdef EXEC_DEBUG

@@ -6,6 +6,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[3]
 FUTEX_CPP = ROOT / "modules" / "kern" / "src" / "syscalls_impl" / "futex" / "futex.cpp"
 SCHEDULER_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "sched" / "scheduler.cpp"
+EXIT_CPP = ROOT / "modules" / "kern" / "src" / "syscalls_impl" / "process" / "exit.cpp"
 
 
 def fail(message: str) -> None:
@@ -237,27 +238,22 @@ def require_timer_futex_cleanup_outside_runqueue_lock(source: str) -> None:
         fail("process_tasks does not clean timed-out futex waiters after dropping the runqueue lock")
 
 
-def require_process_exit_wait_repair_outside_runqueue_lock(source: str) -> None:
-    predicate = function_body(source, "process_exit_wait_repair_due")
+def require_process_exit_uses_one_shot_generic_wakes(source: str, exit_source: str) -> None:
+    publish = function_body(exit_source, "publish_process_exit_request")
     for snippet in [
-        "TaskState::ACTIVE",
-        "sched_queue::WAITING",
-        "process_exit_requested.load(std::memory_order_acquire)",
+        "store_process_exit_request(task, status, wait_status)",
+        "task->signal_add_pending_mask(SIGKILL_MASK)",
+        "ker::mod::sched::wake_task_for_signal(task)",
+        "ker::mod::sched::wake_task_from_event(task)",
     ]:
-        if snippet not in predicate:
-            fail(f"process-exit wait repair predicate is missing: {snippet}")
+        if snippet not in publish:
+            fail(f"process exit request is missing one-shot wake publication: {snippet}")
+    if publish.find("store_process_exit_request") > publish.find("wake_task_from_event"):
+        fail("process exit request must publish state before its generic wake token")
 
-    body = function_body(source, "process_tasks")
-    locked_body, locked_end = braced_block_after(body, "run_queues->this_cpu_locked_void([WAIT_SCAN_NOW_US")
-    if "process_exit_wait_repair_due(t)" not in locked_body:
-        fail("process_tasks must classify exit-requested waiters under the runqueue lock")
-    if "pending_wake_slot(signal_wake, signal_wake_count++) = t;" not in locked_body:
-        fail("process_tasks must queue exit-requested waiters for a post-lock signal wake")
-    if "wake_task_for_signal" in locked_body:
-        fail("process_tasks must not wake exit-requested tasks while the runqueue lock is held")
-    after_lock = body[locked_end:]
-    if "wake_task_for_signal(pending_wake_slot(signal_wake, i))" not in after_lock:
-        fail("process_tasks must wake exit-requested waiters after dropping the runqueue lock")
+    for forbidden in ["process_exit_wait_repair_due", "waitpid_repair", "orphaned_waitpid"]:
+        if forbidden in source:
+            fail(f"scheduler must not periodically repair process/waitpid exits: {forbidden}")
 
 
 def main() -> None:
@@ -270,7 +266,7 @@ def main() -> None:
     require_futex_wake_honors_count_argument(futex_source)
     require_deferred_switch_futex_cleanup_outside_runqueue_lock(scheduler_source)
     require_timer_futex_cleanup_outside_runqueue_lock(scheduler_source)
-    require_process_exit_wait_repair_outside_runqueue_lock(scheduler_source)
+    require_process_exit_uses_one_shot_generic_wakes(scheduler_source, EXIT_CPP.read_text())
     print("futex source lock-order invariants hold")
 
 

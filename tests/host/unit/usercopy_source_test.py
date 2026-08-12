@@ -324,20 +324,27 @@ def require_process_syscalls_use_usercopy(source: str) -> None:
 
 def require_waitpid_outputs_are_preflighted(source: str) -> None:
     for snippet in [
-        "waitpid_outputs_writable",
-        "usercopy::ensure_writable(task, reinterpret_cast<uint64_t>(status), sizeof(*status))",
-        "usercopy::ensure_writable(task, rusage_vaddr, sizeof(KernRusage))",
-        "write_status_to_user",
-        "write_rusage_to_user",
+        "outputs_writable",
+        "usercopy::ensure_writable(waiter, reinterpret_cast<uint64_t>(status), sizeof(*status))",
+        "usercopy::ensure_writable(waiter, rusage_vaddr, sizeof(KernRusage))",
+        "copy_outputs",
+        "usercopy::copy_value_to_task(waiter, reinterpret_cast<uint64_t>(status), claimed.status)",
+        "usercopy::copy_value_to_task(waiter, rusage_vaddr, rusage)",
     ]:
         if snippet not in source:
             fail(f"waitpid output handling missing snippet: {snippet}")
 
     body = function_body(source, "wos_proc_waitpid")
-    preflight = body.find("waitpid_outputs_writable(*current_task, status, rusage_vaddr)")
-    first_claim = body.find("claim_exited_child")
+    preflight = body.find("outputs_writable(*waiter, status, rusage_vaddr)")
+    first_claim = body.find("events::claim_or_register")
     if preflight < 0 or first_claim < 0 or preflight > first_claim:
         fail("waitpid must validate output pointers before claiming/consuming children")
+
+    copy = body.find("copy_outputs(*waiter, status, rusage_vaddr, claimed)", first_claim)
+    commit = body.find("events::commit_claim", copy)
+    release = body.find("events::release_claim(*waiter, claimed)", copy)
+    if min(copy, commit, release) < 0 or copy > commit or copy > release:
+        fail("waitpid must usercopy before commit and release a failed-copy claim")
 
     if "*status =" in source or "fill_rusage(PHYS" in source or "get_virt_pointer(rusage" in source:
         fail("waitpid must not write status/rusage through raw user pointers or physical aliases")
@@ -352,25 +359,24 @@ def require_deferred_waiters_use_usercopy() -> None:
         "remote_compute": REMOTE_COMPUTE_CPP.read_text(),
     }
     for label, source in files.items():
-        if "wait_status_user_addr" in source and "usercopy::copy_value_to_task" not in source:
-            fail(f"{label} wait-status completion must use usercopy")
+        if "wait_status_user_addr" in source:
+            fail(f"{label} must not retain deferred waitpid output pointers")
         forbidden = ["STATUS_PHYS", "RUSAGE_PHYS", "get_virt_pointer(STATUS_PHYS)", "get_virt_pointer(RUSAGE_PHYS)"]
         for snippet in forbidden:
             if snippet in source:
                 fail(f"{label} still writes waitpid output through physical alias: {snippet}")
 
-    for source, name in [
-        (EXIT_CPP.read_text(), "complete_exit_wait"),
-        (SCHEDULER_CPP.read_text(), "complete_waitpid_exit_for_scheduler"),
-        (SCHEDULER_CPP.read_text(), "complete_registered_waitpid_exit_for_scheduler"),
-        (SCHEDULER_CPP.read_text(), "complete_waitpid_ptrace_stop_for_scheduler"),
-        (SIGNAL_CPP.read_text(), "complete_waitpid_stop_waiter"),
-        (PTRACE_CPP.read_text(), "complete_trace_wait"),
-        (REMOTE_COMPUTE_CPP.read_text(), "try_complete_proxy_wait"),
-    ]:
-        body = function_body(source, name)
-        if "static_cast<uint64_t>(-EFAULT)" not in body:
-            fail(f"{name} must report EFAULT when deferred output copy fails")
+    combined = "\n".join(files.values())
+    for forbidden in ["complete_exit_wait", "complete_waitpid", "complete_waitpid_stop_waiter", "try_complete_proxy_wait"]:
+        if forbidden in combined:
+            fail(f"waitpid output must not be copied by an asynchronous producer: {forbidden}")
+
+    ptrace_exit = function_body(PTRACE_CPP.read_text(), "consume_exit_for_tracer")
+    copy = ptrace_exit.find("fill_stop_info(tracer, target, data)")
+    commit = ptrace_exit.find("child_events::commit_claim", copy)
+    release = ptrace_exit.find("child_events::release_claim(tracer, claimed)", copy)
+    if min(copy, commit, release) < 0 or copy > commit or copy > release:
+        fail("ptrace rich wait must copy its output before committing and release a failed-copy claim")
 
 
 def require_futex_timeout_and_address_usercopy(source: str) -> None:

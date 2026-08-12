@@ -1828,7 +1828,7 @@ auto can_wait_for_reclaim_impl() -> bool {
     }
     auto* const CURRENT = sched::get_current_task();
     return CURRENT != nullptr && !CURRENT->scheduler_transition_active.load(std::memory_order_acquire) && !CURRENT->deferred_task_switch &&
-           !CURRENT->wants_block && !CURRENT->waitpid_publish_pending.load(std::memory_order_acquire);
+           !CURRENT->wants_block;
 }
 
 auto page_alloc_with_reclaim_impl(PhysicalPageOwner owner, uint64_t size, std::string_view name, ReturnedPageZeroing zeroing,

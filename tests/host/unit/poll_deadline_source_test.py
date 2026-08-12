@@ -7,6 +7,7 @@ ROOT = Path(__file__).resolve().parents[3]
 EPOLL_CPP = ROOT / "modules" / "kern" / "src" / "vfs" / "epoll.cpp"
 SYS_NET_CPP = ROOT / "modules" / "kern" / "src" / "syscalls_impl" / "net" / "sys_net.cpp"
 EXIT_CPP = ROOT / "modules" / "kern" / "src" / "syscalls_impl" / "process" / "exit.cpp"
+CHILD_EVENTS_CPP = ROOT / "modules" / "kern" / "src" / "syscalls_impl" / "process" / "child_events.cpp"
 SCHEDULER_HPP = ROOT / "modules" / "kern" / "src" / "platform" / "sched" / "scheduler.hpp"
 
 
@@ -213,22 +214,14 @@ def require_preemptible_parking_rechecks_signals() -> None:
 
 
 def require_sigchld_wakes_interruptible_waits() -> None:
-    exit_source = EXIT_CPP.read_text()
-    notify_body = body_after_marker(exit_source, "void notify_parent_after_exit_ready")
-    if "parent->sig_pending & ~parent->sig_mask & SIGCHLD_MASK" in notify_body:
-        fail("SIGCHLD notification bypasses signal disposition checks")
+    notify_body = body_after_marker(CHILD_EVENTS_CPP.read_text(), "void deliver_wake")
     require_order(
         notify_body,
-        "parent->signal_add_pending_mask(SIGCHLD_MASK)",
-        "bool wake_parent = false",
-        "bool signal_wake_parent = false",
-        "task_can_be_interrupted_by_signal(parent)",
-        "parent->has_interrupting_signal_pending()",
-        "if (wake_parent)",
-        "reschedule_on_task_cpu(parent)",
-        "else if (signal_wake_parent)",
-        "ker::mod::sched::wake_task_for_signal(parent)",
+        "wake.signal_owner->signal_add_pending_mask(1ULL << (SIGCHLD_NUMBER - 1U))",
+        "ker::mod::sched::wake_task_from_event(wake.signal_owner)",
     )
+    if "g_lifecycle_lock" in notify_body:
+        fail("SIGCHLD event delivery must run after dropping the lifecycle lock")
 
 
 def main() -> None:

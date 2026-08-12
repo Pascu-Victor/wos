@@ -76,6 +76,10 @@ void check_pending_signals_handoff(sched::task::Task* task, cpu::GPRegs& gpr, ga
 void check_pending_signals_deferred(sched::task::Task* task, DeferredSignalDelivery delivery);
 auto restore_deferred_sigreturn(sched::task::Task* task) -> DeferredSigreturnResult;
 void exit_current_on_pending_fatal_default_signal();
+// Apply SIGCONT/SIGKILL job-control resume semantics at signal-generation or
+// delivery boundaries. Returns false only while transition backpressure keeps
+// the task stopped.
+[[nodiscard]] auto resume_job_control_for_pending_signal(sched::task::Task* task) -> bool;
 void sync_task_signal_mask_cache(sched::task::Task* task);
 // Normal-context publication helper. It may fault in/COW the supplied TCB
 // pages and reports failure so callers can avoid publishing an unusable base.

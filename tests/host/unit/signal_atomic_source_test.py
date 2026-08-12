@@ -9,6 +9,7 @@ TASK_HPP = ROOT / "modules" / "kern" / "src" / "platform" / "sched" / "task.hpp"
 SIGNAL_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "sys" / "signal.cpp"
 PROCESS_CPP = ROOT / "modules" / "kern" / "src" / "syscalls_impl" / "process" / "process.cpp"
 EXIT_CPP = ROOT / "modules" / "kern" / "src" / "syscalls_impl" / "process" / "exit.cpp"
+CHILD_EVENTS_CPP = ROOT / "modules" / "kern" / "src" / "syscalls_impl" / "process" / "child_events.cpp"
 SCHEDULER_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "sched" / "scheduler.cpp"
 REMOTE_COMPUTE_CPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "remote_compute.cpp"
 
@@ -76,6 +77,7 @@ def test_kernel_cpp_uses_signal_helpers() -> None:
 def test_signal_producers_use_atomic_fetch_or_helpers() -> None:
     process_cpp = PROCESS_CPP.read_text()
     exit_cpp = EXIT_CPP.read_text()
+    child_events_cpp = CHILD_EVENTS_CPP.read_text()
     scheduler_cpp = SCHEDULER_CPP.read_text()
     remote_compute_cpp = REMOTE_COMPUTE_CPP.read_text()
 
@@ -85,9 +87,9 @@ def test_signal_producers_use_atomic_fetch_or_helpers() -> None:
         "kill pending publication",
     )
     require(
-        function_body(exit_cpp, "notify_parent_after_exit_ready"),
-        "parent->signal_add_pending_mask(SIGCHLD_MASK);",
-        "exit SIGCHLD publication",
+        function_body(child_events_cpp, "deliver_wake"),
+        "wake.signal_owner->signal_add_pending_mask(1ULL << (SIGCHLD_NUMBER - 1U));",
+        "child-event SIGCHLD publication",
     )
     require(
         function_body(exit_cpp, "publish_process_exit_request"),
@@ -99,10 +101,12 @@ def test_signal_producers_use_atomic_fetch_or_helpers() -> None:
     if scheduler_cpp.count("signal_add_pending_mask(1ULL << (14 - 1))") < 2:
         fail("scheduler SIGALRM timer paths must publish pending bits with atomic helpers")
     require(
-        remote_compute_cpp,
-        "parent->signal_add_pending_mask(1ULL << (WKI_SIGCHLD_NUM - 1));",
-        "remote compute SIGCHLD publication",
+        function_body(remote_compute_cpp, "finalize_proxy_task"),
+        "child_events::publish_exit(*proxy)",
+        "remote compute routes SIGCHLD through the child-event producer",
     )
+    if "WKI_SIGCHLD_NUM" in remote_compute_cpp:
+        fail("remote compute must not publish a second out-of-band SIGCHLD")
 
 
 def test_signal_consumers_use_atomic_clear_helpers() -> None:

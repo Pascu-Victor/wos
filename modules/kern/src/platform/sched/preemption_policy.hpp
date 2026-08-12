@@ -41,7 +41,6 @@ struct KernelPreemptionEligibilityInput {
     bool scheduler_transition_active{};
     bool deferred_task_switch{};
     bool wants_block{};
-    bool waitpid_publish_pending{};
 };
 
 struct KernelPreemptionEligibility {
@@ -64,8 +63,7 @@ struct KernelPreemptionEligibility {
             };
         }
 
-        bool const RETURN_TRANSITION =
-            input.scheduler_transition_active || input.deferred_task_switch || input.wants_block || input.waitpid_publish_pending;
+        bool const RETURN_TRANSITION = input.scheduler_transition_active || input.deferred_task_switch || input.wants_block;
         if (RETURN_TRANSITION) {
             return {
                 .kernel_frame = false,
@@ -122,7 +120,7 @@ struct KernelPreemptionEligibility {
     }
 
     bool const ORDINARY_RETURN_TRANSITION = ORDINARY_PROCESS_KERNEL && (input.deferred_task_switch || input.wants_block);
-    bool const RETURN_TRANSITION = input.scheduler_transition_active || input.waitpid_publish_pending || ORDINARY_RETURN_TRANSITION;
+    bool const RETURN_TRANSITION = input.scheduler_transition_active || ORDINARY_RETURN_TRANSITION;
     if (RETURN_TRANSITION) {
         return {
             .kernel_frame = true,

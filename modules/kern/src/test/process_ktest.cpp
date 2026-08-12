@@ -7,10 +7,6 @@ KTEST(ProcessFdClone, FailedInsertReleasesFileRef) {
     KEXPECT_TRUE(ker::syscall::process::process_selftest_fd_clone_failure_releases_refs());
 }
 
-KTEST(ProcessExitWaiters, NotifyDrainsMoreThanOneFixedBatch) {
-    KEXPECT_TRUE(ker::syscall::process::process_selftest_exit_waiter_notify_drains_over_batch());
-}
-
 KTEST(ProcessGroupExit, CandidateFilterSelectsOnlyLiveUnrequestedSibling) {
     KEXPECT_TRUE(ker::syscall::process::process_selftest_group_exit_candidate_filter());
 }

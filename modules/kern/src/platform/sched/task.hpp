@@ -187,6 +187,59 @@ enum class WaitChannelKind : uint8_t {
     PTRACE,
 };
 
+struct Task;
+
+// Storage for the process-owned parent/child registry.  These nodes live in
+// Task so exit, signal, and trap paths can publish lifecycle changes without
+// allocating.  All non-atomic fields are protected by child_events.cpp's
+// lifecycle lock; scheduler code may only inspect child_membership_state.
+enum class ChildMembershipState : uint8_t {
+    UNLINKED,
+    PUBLISHING,
+    LIVE,
+    ZOMBIE,
+};
+
+enum class ChildEventKind : uint8_t {
+    EXIT,
+    PTRACE_STOP,
+    JOB_CONTROL_STOP,
+    CONTINUED,
+};
+
+enum class ChildEventAudience : uint8_t {
+    PARENT,
+    TRACER,
+};
+
+struct ChildEvent {
+    Task* queue_owner{};
+    Task* subject{};
+    ChildEvent* next{};
+    Task* claimed_by{};
+    uint64_t sequence{};
+    uint64_t claim_cookie{};
+    uint64_t subject_pid{};
+    uint64_t process_group{};
+    uint64_t user_time_us{};
+    uint64_t system_time_us{};
+    int32_t status{};
+    ChildEventKind kind{ChildEventKind::EXIT};
+    ChildEventAudience audience{ChildEventAudience::PARENT};
+    bool queued{};
+};
+
+struct ChildWaitRegistration {
+    Task* queue_owner{};
+    Task* waiter{};
+    ChildWaitRegistration* next{};
+    uint64_t selector{};
+    uint64_t generation{};
+    int32_t options{};
+    bool registered{};
+    bool notified{};
+};
+
 struct Context {
     uint64_t syscall_kernel_stack;
     uint64_t syscall_scratch_area;  // Small scratch area for syscall handler (RIP, RSP, RFLAGS, DS, ES)
@@ -319,6 +372,47 @@ struct Task {
     uint64_t pid{};
     uint64_t parent_pid{};  // Parent process ID (0 for orphaned/init processes)
 
+    // Authoritative process-lifecycle topology.  parent_pid remains the public
+    // scalar ABI/cache; these links determine waitability and reparenting.
+    std::atomic<ChildMembershipState> child_membership_state{ChildMembershipState::UNLINKED};
+    // Monotonic for one publication attempt.  This lets the creator commit a
+    // child that ran, exited, and was reaped between scheduler visibility and
+    // the caller-side commit without treating successful publication as a
+    // rollback failure.
+    bool child_publication_established{};
+    Task* child_parent{};
+    Task* child_sibling_prev{};
+    Task* child_sibling_next{};
+    Task* child_list_head{};
+
+    // Events and waiters owned by this process.  Each producer has dedicated
+    // storage, so an unsafe-context publication never allocates or overwrites
+    // an unconsumed event.  Stop/continue transitions apply backpressure when
+    // their corresponding node is still queued.
+    ChildEvent* child_event_head{};
+    ChildEvent* child_event_tail{};
+    ChildWaitRegistration* child_waiter_head{};
+    ChildWaitRegistration child_wait_registration{};
+    ChildEvent* child_claimed_event{};
+    ChildEvent child_parent_exit_event{};
+    ChildEvent child_tracer_exit_event{};
+    ChildEvent child_ptrace_stop_event{};
+    ChildEvent child_job_stop_event{};
+    ChildEvent child_continued_event{};
+    // At most one status per audience/owner may be in the claim/usercopy
+    // transaction.  Keeping this on the subject makes matching linear while
+    // still allowing distinct parent and tracer owners to consume safely.
+    ChildEvent* child_parent_claimed_event{};
+    ChildEvent* child_tracer_claimed_event{};
+
+    // Explicit ptrace ownership mirrors parent/child membership and lets
+    // waitpid determine whether a tracer has potential events without a global
+    // task scan.
+    Task* child_tracer{};
+    Task* child_tracee_prev{};
+    Task* child_tracee_next{};
+    Task* child_tracee_head{};
+
     // ELF buffer for cleanup and auxv metadata.
     uint8_t* elf_buffer{};
     size_t elf_buffer_size{};
@@ -378,21 +472,6 @@ struct Task {
     [[nodiscard]] auto is_migration_disabled(std::memory_order order = std::memory_order_acquire) const -> bool {
         return migration_guard_disabled(migration_state(order));
     }
-
-    // Waitpid state: when this task is waiting for another task to exit.
-    uint64_t waiting_for_pid{};            // Encoded waitpid selector: direct PID, any-child sentinel, or process group
-    int32_t wait_options{};                // waitpid option bits active for the current block
-    uint64_t wait_status_user_addr{};      // Userspace virtual address of status variable (for waitpid)
-    uint64_t wait_status_phys_addr{};      // Last translated physical address (debug; may change after COW)
-    uint64_t wait_rusage_user_addr{};      // Userspace virtual address of rusage struct (for wait3/wait4)
-    uint64_t wait_rusage_phys_addr{};      // Last translated physical address (debug; may change after COW)
-    uint64_t wait_resume_rip_user_addr{};  // Userspace RIP expected when returning from waitpid
-    uint64_t wait_resume_rip_phys_addr{};  // Last translated physical address for wait_resume_rip_user_addr
-    uint64_t wait_resume_rsp_user_addr{};  // Userspace RSP expected when returning from waitpid
-    uint64_t wait_resume_rsp_phys_addr{};  // Last translated physical address for wait_resume_rsp_user_addr (debug; may change after COW)
-    uint64_t waitpid_last_repair_us{};     // Last fallback waitpid repair attempt while still blocked.
-    std::atomic<uint64_t> waitpid_claim_observed_us{0};   // First timer observation of a continuously held completion claim.
-    std::atomic<bool> waitpid_completion_claimed{false};  // One scheduler/exit completion per blocked waitpid.
 
     // Signal state.
     std::atomic<uint64_t> sig_pending{0};   // Bit N = signal N+1 is pending, signals 1-64
@@ -543,10 +622,6 @@ struct Task {
     // Per-fd close-on-exec bitmap (POSIX FD_CLOEXEC is per-fd, not per-file).
     FdCloexecBitmap fd_cloexec{};
 
-    // List of task IDs waiting for this task to exit. When this task exits,
-    // all tasks in this list will be rescheduled on their respective CPUs.
-    ker::util::SmallVec<uint64_t, 4> awaitee_on_exit;
-
     // WKI: explicit task-local VFS rules layered over defaults from /etc/vfstab.
     ker::util::SmallVec<WkiVfsRule, 4> wki_vfs_rules;
 
@@ -577,6 +652,7 @@ struct Task {
     int exit_status{};
     std::atomic<bool> jobctl_stopped{false};
     std::atomic<bool> jobctl_stop_pending{false};
+    std::atomic<bool> jobctl_stop_publish_deferred{false};
     uint32_t jobctl_stop_signal = 0;
     uint32_t preempt_disable_depth = 0;
     uint32_t sched_weight{};   // 1024 = default (nice 0)
@@ -596,8 +672,6 @@ struct Task {
     // use an unpublished-process destruction path, even after it is detached.
     std::atomic<bool> scheduler_published{false};
     mod::sys::Spinlock fd_table_lock;
-    mod::sys::Spinlock exit_waiters_lock;
-
     uint16_t program_header_count = 0;     // Number of program headers (AT_PHNUM)
     uint16_t program_header_ent_size = 0;  // Size of each program header entry (AT_PHENT)
 
@@ -648,13 +722,8 @@ struct Task {
     // status/accounting are stable, and waitpid may reap while later memory
     // cleanup continues.
     std::atomic<bool> exit_notify_ready{false};
-    std::atomic<bool> waited_on{false};  // Set when waitpid atomically claims the exit status.
     std::atomic<bool> zombie_resources_reclaiming{false};
     std::atomic<bool> zombie_resources_reclaimed{false};
-    // True while waitpid has begun publishing wait metadata but deferred_task_switch
-    // has not yet saved the syscall return context. Exit notification may wake
-    // the task in this window, but must not write saved registers directly.
-    std::atomic<bool> waitpid_publish_pending{false};
     // True while deferred_task_switch owns the live syscall stack and is
     // publishing its replacement return state. A timer may record pending
     // work, but must not switch this task until the transition is complete.
@@ -829,15 +898,6 @@ void destroy_unpublished_user_thread(Task* task);
 [[nodiscard]] auto clone_lazy_vmem_ranges(Task& dst, Task& src) -> bool;
 void release_lazy_vmem_ranges(Task& task);
 
-[[nodiscard]] inline auto task_waited_on(const Task& task) -> bool { return task.waited_on.load(std::memory_order_acquire); }
-
-inline void task_clear_waited_on(Task& task) { task.waited_on.store(false, std::memory_order_relaxed); }
-
-[[nodiscard]] inline auto task_try_mark_waited_on(Task& task) -> bool {
-    bool expected = false;
-    return task.waited_on.compare_exchange_strong(expected, true, std::memory_order_acq_rel, std::memory_order_acquire);
-}
-
 inline void task_accumulate_waited_child_times(Task& parent, const Task& child) {
     if (child.parent_pid != parent.pid) {
         return;
@@ -853,40 +913,11 @@ inline void task_accumulate_waited_child_times(Task& parent, const Task& child) 
     return task.system_time_us + task.child_system_time_us;
 }
 
-inline void task_clear_waitpid_block_state(Task& task) {
-    task.waiting_for_pid = 0;
-    task.wait_options = 0;
-    task.wait_status_user_addr = 0;
-    task.wait_status_phys_addr = 0;
-    task.wait_rusage_user_addr = 0;
-    task.wait_rusage_phys_addr = 0;
-    task.wait_resume_rip_user_addr = 0;
-    task.wait_resume_rip_phys_addr = 0;
-    task.wait_resume_rsp_user_addr = 0;
-    task.wait_resume_rsp_phys_addr = 0;
-    task.waitpid_last_repair_us = 0;
-    task.waitpid_claim_observed_us.store(0, std::memory_order_release);
-    task.clear_wait_channel();
-    task.waitpid_completion_claimed.store(false, std::memory_order_release);
-}
-
-[[nodiscard]] inline auto task_try_claim_waitpid_completion(Task& task) -> bool {
-    bool expected = false;
-    return task.waitpid_completion_claimed.compare_exchange_strong(expected, true, std::memory_order_acq_rel, std::memory_order_acquire);
-}
-
-inline void task_release_waitpid_completion_claim(Task& task) {
-    task.waitpid_claim_observed_us.store(0, std::memory_order_release);
-    task.waitpid_completion_claimed.store(false, std::memory_order_release);
-}
-
 #ifdef WOS_SELFTEST
 auto task_selftest_fd_clone_failure_releases_refs() -> bool;
 auto task_selftest_destroy_unpublished_user_thread_releases_refs() -> bool;
 auto task_selftest_unpublished_process_owner_releases_resources() -> bool;
 auto task_selftest_owned_unpublished_process_teardown_releases_resources() -> bool;
 auto task_selftest_published_process_refuses_unpublished_teardown() -> bool;
-auto task_selftest_waited_on_claim_is_single_winner() -> bool;
-auto task_selftest_waitpid_block_state_clear_resets_fields() -> bool;
 #endif
 }  // namespace ker::mod::sched::task

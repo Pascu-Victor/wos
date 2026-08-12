@@ -760,43 +760,6 @@ auto task_selftest_published_process_refuses_unpublished_teardown() -> bool {
     return REFUSED && INITIAL_REF_REMAINS && OWNER_CLEARED;
 }
 
-auto task_selftest_waited_on_claim_is_single_winner() -> bool {
-    Task task{};
-    task_clear_waited_on(task);
-
-    bool const FIRST = task_try_mark_waited_on(task);
-    bool const SECOND = task_try_mark_waited_on(task);
-    bool const OBSERVED = task_waited_on(task);
-    task_clear_waited_on(task);
-
-    return FIRST && !SECOND && OBSERVED && !task_waited_on(task);
-}
-
-auto task_selftest_waitpid_block_state_clear_resets_fields() -> bool {
-    Task task{};
-    task.waiting_for_pid = 123;
-    task.wait_status_user_addr = 1;
-    task.wait_status_phys_addr = 2;
-    task.wait_rusage_user_addr = 3;
-    task.wait_rusage_phys_addr = 4;
-    task.wait_resume_rip_user_addr = 5;
-    task.wait_resume_rip_phys_addr = 6;
-    task.wait_resume_rsp_user_addr = 7;
-    task.wait_resume_rsp_phys_addr = 8;
-    task.waitpid_last_repair_us = 9;
-    task.waitpid_claim_observed_us.store(10, std::memory_order_relaxed);
-    task.waitpid_completion_claimed.store(true, std::memory_order_relaxed);
-    task.set_wait_channel("waitpid", WaitChannelKind::WAITPID);
-
-    task_clear_waitpid_block_state(task);
-
-    return task.waiting_for_pid == 0 && task.wait_status_user_addr == 0 && task.wait_status_phys_addr == 0 &&
-           task.wait_rusage_user_addr == 0 && task.wait_rusage_phys_addr == 0 && task.wait_resume_rip_user_addr == 0 &&
-           task.wait_resume_rip_phys_addr == 0 && task.wait_resume_rsp_user_addr == 0 && task.wait_resume_rsp_phys_addr == 0 &&
-           task.waitpid_last_repair_us == 0 && task.waitpid_claim_observed_us.load(std::memory_order_acquire) == 0 &&
-           task.wait_channel == nullptr && task.wait_channel_kind == WaitChannelKind::NONE &&
-           !task.waitpid_completion_claimed.load(std::memory_order_acquire);
-}
 #endif
 
 auto Task::try_acquire_usercopy_pagemap(mm::paging::PageTable*& out) -> bool {
@@ -872,15 +835,11 @@ Task::Task(const char* name, uint64_t elf_start, uint64_t kernel_rsp, TaskType t
     this->has_exited = false;  // Task hasn't exited yet
     this->jobctl_stopped.store(false, std::memory_order_relaxed);
     this->jobctl_stop_pending.store(false, std::memory_order_relaxed);
+    this->jobctl_stop_publish_deferred.store(false, std::memory_order_relaxed);
     this->jobctl_stop_signal = 0;
     this->exit_notify_ready.store(false, std::memory_order_relaxed);
-    task_clear_waited_on(*this);
     this->zombie_resources_reclaiming.store(false, std::memory_order_relaxed);
     this->zombie_resources_reclaimed.store(false, std::memory_order_relaxed);
-    this->waitpid_publish_pending.store(false, std::memory_order_relaxed);
-    this->waitpid_last_repair_us = 0;
-    this->waitpid_claim_observed_us.store(0, std::memory_order_relaxed);
-    this->waitpid_completion_claimed.store(false, std::memory_order_relaxed);
     this->deferred_task_switch = false;  // No deferred switch by default
     this->yield_switch = false;
     this->kthread_entry = nullptr;
@@ -889,14 +848,6 @@ Task::Task(const char* name, uint64_t elf_start, uint64_t kernel_rsp, TaskType t
     this->preempt_disable_start_us = 0;
     this->preempt_disable_max_us = 0;
     this->preempt_disable_owner = 0;
-
-    // Waitpid state
-    this->waiting_for_pid = 0;
-    this->wait_options = 0;
-    this->wait_status_user_addr = 0;
-    this->wait_status_phys_addr = 0;
-    this->wait_rusage_user_addr = 0;
-    this->wait_rusage_phys_addr = 0;
 
     // Process time accounting
     this->start_time_us = 0;  // Will be set when task is first scheduled
@@ -1314,24 +1265,14 @@ Task* Task::create_user_thread(Task* parent, uint64_t tcb_vaddr, uint64_t user_s
     t->has_exited = false;
     t->exit_notify_ready.store(false, std::memory_order_relaxed);
     t->exit_status = 0;
-    task_clear_waited_on(*t);
-    t->waitpid_last_repair_us = 0;
-    t->waitpid_claim_observed_us.store(0, std::memory_order_relaxed);
-    t->waitpid_completion_claimed.store(false, std::memory_order_relaxed);
     t->zombie_resources_reclaiming.store(false, std::memory_order_relaxed);
     t->zombie_resources_reclaimed.store(false, std::memory_order_relaxed);
-    t->waitpid_publish_pending.store(false, std::memory_order_relaxed);
     t->deferred_task_switch = false;
     t->yield_switch = false;
     t->set_voluntary_blocked(false);
-    t->waiting_for_pid = 0;
-    t->wait_options = 0;
-    t->wait_status_user_addr = 0;
-    t->wait_status_phys_addr = 0;
-    t->wait_rusage_user_addr = 0;
-    t->wait_rusage_phys_addr = 0;
     t->jobctl_stopped.store(false, std::memory_order_relaxed);
     t->jobctl_stop_pending.store(false, std::memory_order_relaxed);
+    t->jobctl_stop_publish_deferred.store(false, std::memory_order_relaxed);
     t->jobctl_stop_signal = 0;
     t->vruntime = 0;
     t->vdeadline = 0;

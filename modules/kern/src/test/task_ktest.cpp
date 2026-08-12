@@ -55,9 +55,3 @@ KTEST(TaskProcessCleanup, OwnedUnpublishedTeardownReleasesResources) {
 KTEST(TaskProcessCleanup, PublishedProcessRefusesUnpublishedTeardown) {
     KEXPECT_TRUE(ker::mod::sched::task::task_selftest_published_process_refuses_unpublished_teardown());
 }
-
-KTEST(TaskWaitedOn, ClaimIsSingleWinner) { KEXPECT_TRUE(ker::mod::sched::task::task_selftest_waited_on_claim_is_single_winner()); }
-
-KTEST(TaskWaitpid, ClearBlockStateResetsFields) {
-    KEXPECT_TRUE(ker::mod::sched::task::task_selftest_waitpid_block_state_clear_resets_fields());
-}

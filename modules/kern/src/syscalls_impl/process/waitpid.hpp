@@ -1,21 +1,35 @@
 #pragma once
+
 #include <cstdint>
 #include <platform/asm/cpu.hpp>
 
 namespace ker::syscall::process {
 
-// Mirror of POSIX struct rusage (x86-64 layout, only the fields we populate).
-// Matches toolchain/src/mlibc/abis/wos/resource.h.
+// Exact x86-64 WOS/POSIX struct rusage layout.  Child-event snapshots populate
+// the two timeval fields; every other field is deliberately zero-initialized.
 struct KernRusage {
-    // struct timeval ru_utime
     int64_t ru_utime_sec;
     int64_t ru_utime_usec;
-    // struct timeval ru_stime
     int64_t ru_stime_sec;
     int64_t ru_stime_usec;
-    // remaining fields (ru_maxrss … ru_nivcsw) - zero-initialised by caller, not filled here
+    int64_t ru_maxrss;
+    int64_t ru_ixrss;
+    int64_t ru_idrss;
+    int64_t ru_isrss;
+    int64_t ru_minflt;
+    int64_t ru_majflt;
+    int64_t ru_nswap;
+    int64_t ru_inblock;
+    int64_t ru_oublock;
+    int64_t ru_msgsnd;
+    int64_t ru_msgrcv;
+    int64_t ru_nsignals;
+    int64_t ru_nvcsw;
+    int64_t ru_nivcsw;
 };
 
-// rusage_vaddr: user-space virtual address of struct rusage to fill (0 if unused)
+static_assert(sizeof(KernRusage) == 144);
+
 auto wos_proc_waitpid(int64_t pid, int32_t* status, int32_t options, uint64_t rusage_vaddr, ker::mod::cpu::GPRegs& gpr) -> uint64_t;
+
 }  // namespace ker::syscall::process

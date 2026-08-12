@@ -34,6 +34,7 @@
 #include "platform/sys/signal.hpp"
 #include "platform/sys/usercopy.hpp"
 #include "release.hpp"
+#include "syscalls_impl/process/child_events.hpp"
 #include "syscalls_impl/process/exec.hpp"
 #include "syscalls_impl/process/exit.hpp"
 #include "syscalls_impl/process/getpid.hpp"
@@ -177,7 +178,7 @@ void update_thread_group_job_control(uint64_t process_pid, uint64_t session_id, 
             continue;
         }
         task->session_id = session_id;
-        task->pgid = pgid;
+        child_events::update_process_group(*task, pgid);
         if (detach_tty) {
             task->controlling_tty = -1;
         }
@@ -404,7 +405,6 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     }
 
     child->pid = sched::task::get_next_pid();
-    child->parent_pid = parent->pid;
     child->type = sched::task::TaskType::PROCESS;
     child->cpu = cpu::current_cpu();
     child->has_run = false;
@@ -412,7 +412,6 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     child->exit_in_progress = false;
     child->has_exited = false;
     child->exit_notify_ready.store(false, std::memory_order_relaxed);
-    sched::task::task_clear_waited_on(*child);
     child->zombie_resources_reclaiming.store(false, std::memory_order_relaxed);
     child->zombie_resources_reclaimed.store(false, std::memory_order_relaxed);
     child->deferred_task_switch = false;
@@ -423,11 +422,9 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     child->elf_buffer_size = 0;
     child->is_elf_buffer_shared = false;
     child->mmap_next.store(parent->mmap_next.load(std::memory_order_relaxed), std::memory_order_relaxed);
-    child->waiting_for_pid = 0;
-    child->wait_options = 0;
-    child->wait_status_phys_addr = 0;
     child->jobctl_stopped.store(false, std::memory_order_relaxed);
     child->jobctl_stop_pending.store(false, std::memory_order_relaxed);
+    child->jobctl_stop_publish_deferred.store(false, std::memory_order_relaxed);
     child->jobctl_stop_signal = 0;
 
     // EEVDF scheduling fields - start fresh
@@ -652,8 +649,26 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
         return finish_fork(-ENOMEM);
     }
 
+    // Establish authoritative process ownership before either scheduler or
+    // legacy WKI placement can make the child visible.
+    if (!child_events::begin_publication(*parent, *child)) {
+        child_events::abort_publication(*child);
+        release_cloned_fd_table_refs(child);
+        delete child->thread;
+        delete reinterpret_cast<cpu::PerCpu*>(child->context.syscall_scratch_area);
+        ker::syscall::shm::shm_cleanup_for_task(child);
+        ker::syscall::vmem::release_file_mmap_ranges_for_pagemap(child->pagemap);
+        mm::virt::destroy_user_space(child->pagemap, child->pid, child->name, "fork-child-publication-fail");
+        mm::phys::page_free(child->pagemap);
+        delete[] child->name;
+        mm::phys::page_free(reinterpret_cast<void*>(KERNEL_STACK_BASE));
+        delete child;
+        return finish_fork(-ENOMEM);
+    }
+
     // --- Enqueue child ---
     if (!sched::post_task_balanced(child)) {
+        child_events::abort_publication(*child);
         // Undo FD refcount increments
         release_cloned_fd_table_refs(child);
 
@@ -667,6 +682,12 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
         mm::phys::page_free(reinterpret_cast<void*>(KERNEL_STACK_BASE));
         delete child;
         return finish_fork(-ENOMEM);
+    }
+    if (!child_events::commit_publication(*child)) [[unlikely]] {
+        // Scheduler publication is irreversible at this call site. Preserve
+        // the successful fork result so userspace cannot retry and duplicate
+        // a child that is already runnable (or already exited/reaped).
+        process_log::error("fork: lifecycle commit completed concurrently for published child PID %x", child->pid);
     }
     record_local_proc_event(child, perf::WkiPerfLocalProcOp::FORK, perf::WkiPerfPhase::POINT, perf::next_wki_trace_correlation(), 0,
                             static_cast<uint32_t>(child->cpu), WOS_PERF_CALLSITE());
@@ -1028,6 +1049,7 @@ auto wos_proc_clone_vm(uint64_t args_addr) -> uint64_t {
     }
 
     auto cleanup_child = [&]() {
+        child_events::abort_publication(*child);
         release_cloned_fd_table_refs(child);
         delete child->thread;
         delete reinterpret_cast<cpu::PerCpu*>(child->context.syscall_scratch_area);
@@ -1049,7 +1071,6 @@ auto wos_proc_clone_vm(uint64_t args_addr) -> uint64_t {
     }
 
     child->pid = sched::task::get_next_pid();
-    child->parent_pid = parent->pid;
     child->type = sched::task::TaskType::PROCESS;
     child->cpu = cpu::current_cpu();
 
@@ -1165,9 +1186,19 @@ auto wos_proc_clone_vm(uint64_t args_addr) -> uint64_t {
     }
     child->fd_cloexec = parent->fd_cloexec;
 
+    if (!child_events::begin_publication(*parent, *child)) {
+        cleanup_child();
+        return static_cast<uint64_t>(-ENOMEM);
+    }
+
     if (!sched::post_task_balanced(child)) {
         cleanup_child();
         return static_cast<uint64_t>(-ENOMEM);
+    }
+    if (!child_events::commit_publication(*child)) [[unlikely]] {
+        // The scheduler has already accepted the child, so returning failure
+        // would hide a live process and invite a duplicate userspace retry.
+        process_log::error("clone-vm: lifecycle commit completed concurrently for published child PID %x", child->pid);
     }
 
     return child->pid;

@@ -22,6 +22,7 @@
 #include "platform/smt/smt.hpp"
 #include "syscalls_impl/futex/futex.hpp"
 #include "syscalls_impl/log/sys_log.hpp"
+#include "syscalls_impl/process/child_events.hpp"
 #include "syscalls_impl/process/exit.hpp"
 #include "syscalls_impl/vmem/sys_vmem.hpp"
 
@@ -129,28 +130,12 @@ auto publish_thread_tid_to_tcb(mod::sched::task::Task* parent, uint64_t tcb_va, 
     // before the thread becomes DEAD and its kernel stack enters reclamation.
     ker::net::wki::wki_wait_cleanup_for_task(task);
     ker::syscall::futex::futex_wait_cleanup_for_task(task);
+    ker::syscall::process::child_events::cancel_wait(*task);
     task->has_exited = true;
     task->exit_status = 0;
     task->exit_notify_ready.store(true, std::memory_order_release);
     task->death_epoch.store(mod::sched::EpochManager::current_epoch(), std::memory_order_release);
     task->state.store(mod::sched::task::TaskState::DEAD, std::memory_order_release);
-
-    uint64_t const WAITER_LOCK_FLAGS = task->exit_waiters_lock.lock_irqsave();
-    const size_t WAITER_COUNT = task->awaitee_on_exit.size();
-    std::array<uint64_t, 16> waiting_pids{};
-    const size_t WAITING_PIDS_CAP = waiting_pids.size();
-    for (size_t i = 0; i < WAITER_COUNT && i < WAITING_PIDS_CAP; ++i) {
-        waiting_pids.at(i) = task->awaitee_on_exit.at(i);
-    }
-    task->exit_waiters_lock.unlock_irqrestore(WAITER_LOCK_FLAGS);
-
-    for (size_t i = 0; i < WAITER_COUNT && i < WAITING_PIDS_CAP; i++) {
-        auto* waiter = mod::sched::find_task_by_pid_safe(waiting_pids.at(i));
-        if (waiter != nullptr) {
-            mod::sched::reschedule_task_for_cpu(waiter->cpu, waiter);
-            waiter->release();
-        }
-    }
 
     jump_to_next_task_no_save();
     __builtin_unreachable();

@@ -16,7 +16,6 @@ auto inherit_pending_process_exit_request(ker::mod::sched::task::Task* source, k
 #ifdef WOS_SELFTEST
 auto process_selftest_group_exit_candidate_filter() -> bool;
 auto process_selftest_pending_exit_request_inheritance() -> bool;
-auto process_selftest_exit_waiter_notify_drains_over_batch() -> bool;
 #endif
 
 }  // namespace ker::syscall::process

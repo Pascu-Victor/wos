@@ -17,6 +17,7 @@
 #include "platform/sched/threading.hpp"
 #include "platform/sys/context_switch.hpp"
 #include "platform/sys/usercopy.hpp"
+#include "syscalls_impl/process/child_events.hpp"
 #include "syscalls_impl/process/exit.hpp"
 
 namespace {
@@ -40,9 +41,6 @@ constexpr int WOS_SIGCONT = 18;
 constexpr int WOS_SIGTSTP = 20;
 constexpr int WOS_SIGTTIN = 21;
 constexpr int WOS_SIGTTOU = 22;
-constexpr uint64_t WAIT_ANY_CHILD = static_cast<uint64_t>(-1);
-constexpr int WOS_WSTOPPED = 2;
-constexpr int STOP_STATUS_LOW = 0x7f;
 
 // Stack offsets for the pushed GP registers in syscall.asm (pushq macro).
 // After pushq, RSP points to r15. Offsets from RSP:
@@ -264,6 +262,57 @@ void sync_task_signal_mask_cache_mapped(sched::task::Task* task) {
     (void)sync_task_signal_mask_cache_impl(task, task->thread->fsbase, true);
 }
 
+auto resume_job_control_for_pending_signal(sched::task::Task* task) -> bool {
+    if (task == nullptr || !task->jobctl_stopped.load(std::memory_order_acquire)) {
+        return true;
+    }
+
+    uint32_t const STOP_SIGNAL = task->jobctl_stop_signal;
+    if (task->jobctl_stop_publish_deferred.load(std::memory_order_acquire) && !task->jobctl_stop_pending.load(std::memory_order_acquire) &&
+        STOP_SIGNAL > 0 && STOP_SIGNAL <= 64) {
+        uint64_t const STOP_MASK = 1ULL << (STOP_SIGNAL - 1U);
+        if ((task->signal_pending_bits() & STOP_MASK) != 0) {
+            // The allocation-free event slot was busy when the task first
+            // stopped.  Keep SIGCONT behind this transition until publication
+            // succeeds, preserving stop/continue order without dropping the
+            // actual stopped state.
+            task->jobctl_stop_pending.store(true, std::memory_order_release);
+            if (!ker::syscall::process::child_events::publish_job_control_stop(*task, STOP_SIGNAL)) {
+                task->jobctl_stop_pending.store(false, std::memory_order_release);
+                return false;
+            }
+            task->jobctl_stop_publish_deferred.store(false, std::memory_order_release);
+            task->signal_clear_pending_mask(STOP_MASK);
+        }
+    }
+
+    constexpr uint64_t SIGCONT_MASK = 1ULL << (WOS_SIGCONT - 1);
+    constexpr uint64_t SIGKILL_MASK = 1ULL << (WOS_SIGKILL - 1);
+    uint64_t const PENDING = task->signal_pending_bits();
+    bool const KILLED = (PENDING & SIGKILL_MASK) != 0;
+    bool const CONTINUED = (PENDING & SIGCONT_MASK) != 0;
+    if (!CONTINUED && !KILLED) {
+        return false;
+    }
+
+    // A continued transition is observable even when SIGCONT is blocked or
+    // ignored. Keep the task stopped if its embedded continued-event slot is
+    // still occupied; this preserves transition order without allocating in a
+    // scheduler/interrupt signal-generation context. SIGKILL resumes without
+    // producing a continued event.
+    if (!KILLED && CONTINUED && !ker::syscall::process::child_events::publish_continued(*task)) {
+        return false;
+    }
+
+    task->jobctl_stopped.store(false, std::memory_order_release);
+    task->jobctl_stop_publish_deferred.store(false, std::memory_order_release);
+    task->set_voluntary_blocked(false);
+    task->wants_block = false;
+    task->wake_at_us = 0;
+    task->clear_wait_channel();
+    return true;
+}
+
 auto restore_deferred_sigreturn(sched::task::Task* task) -> DeferredSigreturnResult {
     if (task == nullptr || task->type != sched::task::TaskType::PROCESS || !task->do_sigreturn ||
         !sched::task::saved_frame_restore_policy(task->context.saved_frame_class).validate_as_user ||
@@ -351,69 +400,11 @@ auto task_owns_current_kernel_stack(Task* task) -> bool {
     return rsp > STACK_BASE && rsp <= STACK_TOP;
 }
 
-auto job_control_stop_status(int signo) -> int32_t { return static_cast<int32_t>((static_cast<uint32_t>(signo) << 8U) | STOP_STATUS_LOW); }
-
-auto waitpid_waiter_matches_stopped_child(Task& waiter, Task& stopped) -> bool {
-    return waiter.waiting_for_pid == stopped.pid || waiter.waiting_for_pid == WAIT_ANY_CHILD;
-}
-
-auto waitpid_waiter_context_can_be_completed(Task& waiter) -> bool {
-    return !waiter.deferred_task_switch && !waiter.waitpid_publish_pending.load(std::memory_order_acquire);
-}
-
-void clear_waitpid_wait_state(Task& waiter) {
-    waiter.waitpid_publish_pending.store(false, std::memory_order_release);
-    ker::mod::sched::task::task_clear_waitpid_block_state(waiter);
-}
-
-auto complete_waitpid_stop_waiter(Task& waiter, Task& stopped, int signo) -> bool {
-    if (!waitpid_waiter_matches_stopped_child(waiter, stopped)) {
-        return false;
-    }
-    if ((waiter.wait_options & WOS_WSTOPPED) == 0 || !waitpid_waiter_context_can_be_completed(waiter)) {
-        return false;
-    }
-
-    bool output_ok = true;
-    if (waiter.wait_status_user_addr != 0 && waiter.pagemap != nullptr) {
-        int32_t const STATUS = job_control_stop_status(signo);
-        output_ok = ker::mod::sys::usercopy::copy_value_to_task_mapped(waiter, waiter.wait_status_user_addr, STATUS);
-    }
-
-    uint64_t const WAITER_LOCK_FLAGS = stopped.exit_waiters_lock.lock_irqsave();
-    (void)stopped.awaitee_on_exit.remove(waiter.pid);
-    stopped.exit_waiters_lock.unlock_irqrestore(WAITER_LOCK_FLAGS);
-
-    waiter.context.regs.rax = output_ok ? stopped.pid : static_cast<uint64_t>(-EFAULT);
-    clear_waitpid_wait_state(waiter);
-    waiter.deferred_task_switch = false;
-    waiter.set_voluntary_blocked(false);
-    waiter.wants_block = false;
-    stopped.jobctl_stop_pending.store(false, std::memory_order_release);
-    ker::mod::sched::reschedule_task_for_cpu(waiter.cpu, &waiter);
-    return true;
-}
-
-void notify_parent_of_job_control_stop(Task& stopped, int signo) {
-    if (stopped.parent_pid == 0) {
-        return;
-    }
-
-    auto* parent = ker::mod::sched::find_task_by_pid_safe(stopped.parent_pid);
-    if (parent == nullptr) {
-        return;
-    }
-
-    parent->signal_add_pending_mask(1ULL << (WOS_SIGCHLD - 1));
-    bool const COMPLETED_WAIT = complete_waitpid_stop_waiter(*parent, stopped, signo);
-    if (!COMPLETED_WAIT) {
-        ker::mod::sched::wake_task_for_signal(parent);
-    }
-    parent->release();
-}
-
 void park_current_job_control_stop(Task& task) {
     while (task.jobctl_stopped.load(std::memory_order_acquire) && !task.has_exited) {
+        if (resume_job_control_for_pending_signal(&task)) {
+            continue;
+        }
         sched::preemptible_syscall_park("job_stop", sched::task::WaitChannelKind::GENERIC);
     }
 }
@@ -422,13 +413,22 @@ auto apply_job_control_stop(Task* task, int signo, bool park_current) -> bool {
     if (task == nullptr) {
         return true;
     }
+    if (task->jobctl_stopped.load(std::memory_order_acquire)) {
+        return true;
+    }
 
     task->jobctl_stop_signal = static_cast<uint32_t>(signo);
     task->jobctl_stopped.store(true, std::memory_order_release);
     task->jobctl_stop_pending.store(true, std::memory_order_release);
+    task->jobctl_stop_publish_deferred.store(false, std::memory_order_release);
+    bool const PUBLISHED = ker::syscall::process::child_events::publish_job_control_stop(*task, static_cast<uint32_t>(signo));
+    if (!PUBLISHED) {
+        task->jobctl_stop_pending.store(false, std::memory_order_release);
+        task->jobctl_stop_publish_deferred.store(true, std::memory_order_release);
+        task->signal_add_pending_mask(1ULL << (signo - 1));
+    }
     task->set_wait_channel("job_stop", sched::task::WaitChannelKind::GENERIC);
     task->set_voluntary_blocked(true);
-    notify_parent_of_job_control_stop(*task, signo);
 
     if (park_current && sched::get_current_task() == task) {
         park_current_job_control_stop(*task);
@@ -437,7 +437,7 @@ auto apply_job_control_stop(Task* task, int signo, bool park_current) -> bool {
     } else {
         static_cast<void>(sched::debug_stop_task(task));
     }
-    return true;
+    return PUBLISHED;
 }
 
 auto handle_handoff_non_user_signal_action(Task* task, int signo, unsigned idx, const Task::SigHandler& handler) -> bool {
@@ -451,8 +451,10 @@ auto handle_handoff_non_user_signal_action(Task* task, int signo, unsigned idx, 
             return true;
         }
         if (is_job_control_stop_signal(signo)) {
-            task->signal_clear_pending_mask(1ULL << idx);
-            return apply_job_control_stop(task, signo, false);
+            if (apply_job_control_stop(task, signo, false)) {
+                task->signal_clear_pending_mask(1ULL << idx);
+            }
+            return true;
         }
 
         // Handoff return can run while current_task is still the outgoing stack
@@ -477,9 +479,12 @@ auto handle_handoff_non_user_signal_action(Task* task, int signo, unsigned idx, 
 
 void exit_current_on_pending_fatal_default_signal() {
     auto* task = sched::get_current_task();
-    if (task == nullptr || task->type != sched::task::TaskType::PROCESS || task->in_signal_handler || task->exit_in_progress ||
-        task->has_exited || task->unpublished_teardown_in_progress.load(std::memory_order_acquire) ||
+    if (task == nullptr || task->type != sched::task::TaskType::PROCESS || task->exit_in_progress || task->has_exited ||
+        task->unpublished_teardown_in_progress.load(std::memory_order_acquire) ||
         task->state.load(std::memory_order_acquire) != sched::task::TaskState::ACTIVE || !task_owns_current_kernel_stack(task)) {
+        return;
+    }
+    if (!resume_job_control_for_pending_signal(task) || task->in_signal_handler) {
         return;
     }
 
@@ -510,6 +515,10 @@ extern "C" auto check_pending_signals(uint8_t* stack_base) -> uint64_t {
     auto* task = sched::get_current_task();
     if (task == nullptr) {
         return 0;
+    }
+
+    if (!resume_job_control_for_pending_signal(task)) {
+        park_current_job_control_stop(*task);
     }
 
     ker::syscall::process::exit_current_if_process_exit_requested();
@@ -673,6 +682,9 @@ extern "C" auto check_pending_signals(uint8_t* stack_base) -> uint64_t {
 void check_pending_signals_interrupt(cpu::GPRegs& gpr, gates::InterruptFrame& frame) {
     auto* task = sched::get_current_task();
     if (task == nullptr || task->type != sched::task::TaskType::PROCESS) {
+        return;
+    }
+    if (!resume_job_control_for_pending_signal(task)) {
         return;
     }
 
@@ -839,6 +851,9 @@ void check_pending_signals_handoff(sched::task::Task* task, cpu::GPRegs& gpr, ga
     if (task == nullptr || task->type != sched::task::TaskType::PROCESS) {
         return;
     }
+    if (!resume_job_control_for_pending_signal(task)) {
+        return;
+    }
 
     if (!interrupt_frame_is_user_return(task, frame)) {
         return;
@@ -905,6 +920,9 @@ void check_pending_signals_handoff(sched::task::Task* task, cpu::GPRegs& gpr, ga
 
 void check_pending_signals_deferred(sched::task::Task* task, DeferredSignalDelivery delivery) {
     if (task == nullptr || task->type != sched::task::TaskType::PROCESS) {
+        return;
+    }
+    if (!resume_job_control_for_pending_signal(task)) {
         return;
     }
 

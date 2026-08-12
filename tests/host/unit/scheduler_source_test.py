@@ -585,13 +585,14 @@ def test_same_cpu_kernel_preemption_is_policy_gated_and_transition_safe() -> Non
             "input.preempt_disable_depth != 0",
             "input.scheduler_transition_active",
             "input.deferred_task_switch",
-            "input.waitpid_publish_pending",
             "ORDINARY_PROCESS_KERNEL && (input.deferred_task_switch || input.wants_block)",
             ".record_pending = true",
             ".can_switch = true",
         ],
         "class-driven kernel-preemption policy model",
     )
+    if "waitpid_publish_pending" in policy_header:
+        fail("kernel-preemption policy must not depend on removed waitpid publication state")
     require_order(
         policy_header,
         "if (input.force_off)",
@@ -849,7 +850,6 @@ def test_preemption_diagnostics_are_bounded_and_guard_misuse_is_fatal() -> None:
             "hcf()",
             "task->scheduler_transition_active.load(std::memory_order_acquire)",
             "task->deferred_task_switch",
-            "task->waitpid_publish_pending.load(std::memory_order_acquire)",
             "preempt_pending_action(task->preempt_disable_depth, task->preempt_pending, RETURN_TRANSITION)",
             "PreemptPendingAction::SERVICE",
             "request_local_reschedule()",
@@ -1755,37 +1755,26 @@ def test_active_registry_uses_cached_dense_slot_for_constant_time_updates() -> N
     detach_body = function_body(source, "detach_next_reclaimable_task_locked")
     require_order(
         detach_body,
-        "if (task::task_waited_on(*cur))",
+        "if (!ker::syscall::process::child_events::is_waitable_zombie(*cur))",
         "uint64_t const DEATH_EPOCH = cur->death_epoch.load(std::memory_order_acquire);",
-        "waited zombies must leave the active scan index before heavy cleanup becomes reclaimable",
+        "reaped tasks must leave the active scan index before final cleanup",
     )
     require_tokens(
         detach_body,
-        ["if (task::task_waited_on(*cur))", "active_list_remove(cur);"],
-        "waited zombie early active-registry detachment",
-    )
-
-    waited_claim_body = function_body(source, "try_mark_task_waited_on")
-    require_order(
-        waited_claim_body,
-        "task::task_try_mark_waited_on(subject)",
-        "active_list_remove(&subject);",
-        "wait-status ownership must be claimed before retiring active scan visibility",
-    )
-    require_tokens(
-        waited_claim_body,
         [
-            "subject.state.load(std::memory_order_acquire) == task::TaskState::DEAD",
-            "active_list_remove(&subject);",
+            "child_events::is_waitable_zombie(*cur)",
+            "zombie_resources_reclaiming.compare_exchange_strong",
+            ".zombie_resources_only = true",
+            "uint32_t const RC = cur->ref_count.load(std::memory_order_acquire)",
         ],
-        "immediate waited zombie active-registry retirement",
+        "explicit zombie resource/final reclamation split",
     )
     dead_enqueue_body = function_body(source, "insert_into_dead_list")
     require_order(
         dead_enqueue_body,
         "rq->dead_list.push(task)",
-        "active_list_remove(task);",
-        "already-waited exits must retain dead-list visibility before leaving the active scan index",
+        "if (!ker::syscall::process::child_events::is_waitable_zombie(*task))",
+        "dead-list publication must precede lifecycle-aware active registry removal",
     )
 
 
@@ -2295,31 +2284,40 @@ def test_procfs_exposes_scheduler_cpu_state_snapshot() -> None:
     )
 
 
-def test_procfs_status_exposes_waitpid_exit_debug_state() -> None:
+def test_procfs_status_exposes_child_lifecycle_debug_state() -> None:
     source = PROCFS_CPP.read_text()
     body = function_body(source, "generate_status")
 
     require_tokens(
         body,
         [
+            "child_events::diagnostics(*task)",
+            "WaitingForPid",
+            "CHILD_DIAGNOSTICS.registered_selector",
             "WaitpidCompletionClaimed",
-            "task->waitpid_completion_claimed.load(std::memory_order_acquire)",
+            "CHILD_DIAGNOSTICS.claim_active",
             "WaitpidLastRepairUs",
-            "task->waitpid_last_repair_us",
+            "append_int(0)",
+            "ChildEventCount",
+            "CHILD_DIAGNOSTICS.owned_event_count",
+            "ChildWaiterCount",
+            "CHILD_DIAGNOSTICS.owned_waiter_count",
+            "ChildMembershipState",
+            "CHILD_DIAGNOSTICS.membership",
             "ExitInProgress",
             "task->exit_in_progress ? \"1\" : \"0\"",
             "ExitNotifyReady",
             "task->exit_notify_ready.load(std::memory_order_acquire)",
             "WaitedOn",
-            "task->waited_on.load(std::memory_order_acquire)",
+            "CHILD_DIAGNOSTICS.membership == ker::mod::sched::task::ChildMembershipState::UNLINKED",
             "WakeupPending",
             "task->wakeup_pending.load(std::memory_order_acquire)",
         ],
-        "procfs waitpid/exit diagnostic state",
+        "procfs child lifecycle diagnostic state",
     )
 
 
-def test_handoff_waitpid_wake_queues_out_of_lock_repair() -> None:
+def test_handoff_event_wake_uses_the_generic_token() -> None:
     source = SCHEDULER_CPP.read_text()
     requeue_body = function_body(source, "requeue_woken_outgoing_task_locked")
     commit_body = function_body(source, "commit_handoff_task_at_return_boundary")
@@ -2328,43 +2326,32 @@ def test_handoff_waitpid_wake_queues_out_of_lock_repair() -> None:
     ktest_source = SCHEDULER_KTEST.read_text()
 
     require_tokens(
-        source,
-        ["task::Task*& waitpid_repair_task"],
-        "handoff waitpid wake repair parameter",
-    )
-    require_tokens(
         requeue_body,
         [
+            "outgoing->sched_queue != task::Task::sched_queue::WAITING",
             "outgoing->wakeup_pending.exchange(false, std::memory_order_acquire)",
-            "is_waitpid_wait_channel(WAIT_CHANNEL) && outgoing->waiting_for_pid != 0",
-            "outgoing->try_acquire()",
-            "waitpid_repair_task = outgoing",
+            "wait_list_remove_all_locked(rq, outgoing)",
+            "outgoing->wants_block = false",
+            'publish_runnable_task_locked(rq, outgoing, "requeue-woken-outgoing")',
         ],
-        "handoff waitpid wake must preserve a repair reference",
+        "generic handoff event token consumption",
     )
     require_order(
         requeue_body,
         "outgoing->sched_queue != task::Task::sched_queue::WAITING",
         "outgoing->wakeup_pending.exchange(false, std::memory_order_acquire)",
-        "runnable handoff tasks must retain event-before-park wake tokens",
+        "runnable handoff tasks retain event-before-park wake tokens",
     )
     require_tokens(
         commit_body,
         [
-            "task::Task* waitpid_repair_task = nullptr;",
-            "requeue_woken_outgoing_task_locked(rq, outgoing, NOW_US, waitpid_repair_task);",
-            "if (waitpid_repair_task != nullptr)",
-            "reschedule_task_for_cpu(target_cpu, waitpid_repair_task);",
-            "waitpid_repair_task->release();",
+            "requeue_woken_outgoing_task_locked(rq, outgoing, NOW_US);",
         ],
-        "handoff waitpid wake repair must run after runqueue unlock",
+        "handoff commit generic wake requeue",
     )
-    require_order(
-        commit_body,
-        "run_queues->this_cpu_locked_void",
-        "if (waitpid_repair_task != nullptr)",
-        "waitpid handoff repair must run outside the runqueue lock callback",
-    )
+    for forbidden in ["waitpid_repair", "waiting_for_pid", "complete_waitpid"]:
+        if forbidden in requeue_body + commit_body:
+            fail(f"handoff wake path must remain subsystem-neutral: {forbidden}")
     require_tokens(
         reserved_wake_body,
         [
@@ -2396,10 +2383,6 @@ def test_handoff_waitpid_wake_queues_out_of_lock_repair() -> None:
             ["reserved_wake = publish_reserved_task_wakeup_locked(rq, task)"],
             "reserved-task wake must be published before releasing the owner runqueue lock",
         )
-    current_branch = reschedule_body[reschedule_body.find("if (is_current_on_some_cpu)") :]
-    current_branch = current_branch[: current_branch.find("if (is_waitpid_wait_channel")]
-    if "task->wakeup_pending.store(true" in current_branch:
-        fail("reserved-task wake token must not be delayed until after the owner runqueue lock is released")
     require_tokens(
         source,
         [
@@ -2420,191 +2403,37 @@ def test_handoff_waitpid_wake_queues_out_of_lock_repair() -> None:
     )
 
 
-def test_timer_waitpid_repair_rechecks_stranded_waiters_without_sigchld() -> None:
+def test_scheduler_has_no_waitpid_completion_or_repair_engine() -> None:
     source = SCHEDULER_CPP.read_text()
-    repair_due_body = function_body(source, "waitpid_repair_due")
     wait_deadline_body = function_body(source, "task_wait_deadline_us")
-    wait_list_push_body = function_body(source, "wait_list_push_locked")
-    orphan_predicate_body = function_body(source, "orphaned_waitpid_candidate_locked")
-    orphan_repair_body = function_body(source, "repair_one_orphaned_waitpid_from_registry")
     timer_body = function_body(source, "process_tasks")
-    reschedule_body = function_body(source, "reschedule_task_for_cpu_once")
-    scan_window_body = function_body(source, "waitpid_repair_scan_window")
-    scan_contains_body = function_body(source, "waitpid_repair_scan_window_contains")
-
-    require_tokens(
-        source,
-        [
-            "WAITPID_REPAIR_FALLBACK_MIN_US = 50'000ULL",
-            "WAITPID_COMPLETION_CLAIM_LEASE_US = 1'000'000ULL",
-        ],
-        "waitpid fallback repair threshold",
-    )
-    claim_recovery_body = function_body(source, "recover_stalled_waitpid_completion_claim")
-    require_tokens(
-        claim_recovery_body,
-        [
-            "waiter->waitpid_completion_claimed.load(std::memory_order_acquire)",
-            "waiter->waitpid_claim_observed_us.compare_exchange_strong",
-            "now_us - observed_us < WAITPID_COMPLETION_CLAIM_LEASE_US",
-            "waiter->waitpid_completion_claimed.compare_exchange_strong(expected, false",
-            "waiter->waitpid_claim_observed_us.store(0, std::memory_order_release)",
-        ],
-        "stalled waitpid completion claim recovery lease",
-    )
-    require_tokens(
-        repair_due_body,
-        [
-            "waiter->wait_channel_is(task::WaitChannelKind::WAITPID)",
-            "waiter->waiting_for_pid == 0",
-            "bool const SIGCHLD_PENDING = (waiter->signal_pending_bits() & SIGCHLD_MASK) != 0;",
-            "if (SIGCHLD_PENDING)",
-            "waiter->waitpid_last_repair_us != 0 ? waiter->waitpid_last_repair_us : waiter->last_sleep_start_us",
-            "if (LAST_REPAIR_US == 0)",
-            "return true;",
-            "now_us - LAST_REPAIR_US >= WAITPID_REPAIR_FALLBACK_MIN_US",
-        ],
-        "waitpid fallback repair predicate",
-    )
+    forbidden = [
+        "complete_waitpid",
+        "waitpid_repair_due",
+        "WAITPID_REPAIR_FALLBACK",
+        "WAITPID_COMPLETION_CLAIM_LEASE",
+        "recover_stalled_waitpid_completion_claim",
+        "orphaned_waitpid",
+        "waiting_for_pid",
+        "waitpid_publish_pending",
+        "waitpid_completion_claimed",
+    ]
+    present = [token for token in forbidden if token in source]
+    if present:
+        fail(f"scheduler must not own waitpid completion/repair state: {', '.join(present)}")
     require_tokens(
         wait_deadline_body,
-        [
-            "t->wait_channel_is(task::WaitChannelKind::WAITPID)",
-            "t->waiting_for_pid != 0",
-            "t->waitpid_last_repair_us != 0 ? t->waitpid_last_repair_us : t->last_sleep_start_us",
-            "LAST_REPAIR_US + WAITPID_REPAIR_FALLBACK_MIN_US",
-            "min_nonzero_deadline(min_nonzero_deadline(t->wake_at_us, t->itimer_real_expire_us), waitpid_repair_deadline_us)",
-        ],
-        "waitpid repair must arm wait-list deadline without timed wake",
-    )
-    require_tokens(
-        wait_list_push_body,
-        [
-            "t->wait_channel_is(task::WaitChannelKind::WAITPID)",
-            "t->waiting_for_pid != 0",
-            "t->last_sleep_start_us == 0",
-            "t->last_sleep_start_us = NOW_US != 0 ? NOW_US : 1;",
-            "note_wait_deadline_locked(rq, t);",
-        ],
-        "every waitpid wait-list publication must carry a fallback repair deadline",
-    )
-    require_tokens(
-        scan_window_body,
-        [
-            "cursor % wait_count",
-            "std::min<uint32_t>(wait_count, static_cast<uint32_t>(PENDING_WAKE_LIMIT))",
-        ],
-        "bounded rotating waitpid repair window",
-    )
-    require_tokens(
-        scan_contains_body,
-        [
-            "index >= window.start ? index - window.start : wait_count - window.start + index",
-            "ROTATED_INDEX < window.size",
-        ],
-        "wrapping waitpid repair window membership",
-    )
-    require_tokens(
-        orphan_predicate_body,
-        [
-            "candidate->scheduler_published.load(std::memory_order_acquire)",
-            "candidate->sched_queue == task::Task::sched_queue::WAITING",
-            "candidate->wait_channel_is(task::WaitChannelKind::WAITPID)",
-            "candidate->waiting_for_pid != 0",
-            "!candidate->deferred_task_switch",
-            "!runqueue_task_is_reserved_locked(rq, candidate)",
-            "!rq->runnable_heap.contains(candidate)",
-            "!wait_list_contains_locked(rq, candidate)",
-        ],
-        "orphaned waitpid repair signature",
-    )
-    if "candidate->sched_next" in orphan_predicate_body:
-        fail("stale intrusive linkage must not hide an ownerless waitpid task from the registry audit")
-    require_tokens(
-        orphan_repair_body,
-        [
-            "ORPHANED_WAITPID_SCAN_INTERVAL_US",
-            "orphaned_waitpid_next_scan_us.compare_exchange_strong",
-            "ORPHANED_WAITPID_SCAN_BATCH",
-            "get_active_task_at_safe(INDEX)",
-            "orphaned_waitpid_candidate_locked(rq, candidate)",
-            "reschedule_task_for_cpu(OWNER_CPU, candidate)",
-            "candidate->release()",
-        ],
-        "bounded active-registry audit for ownerless waitpid tasks",
-    )
-    require_tokens(
-        timer_body,
-        ["repair_one_orphaned_waitpid_from_registry();"],
-        "timer must audit the impossible unlinked waitpid signature",
+        ["min_nonzero_deadline(t->wake_at_us, t->itimer_real_expire_us)"],
+        "subsystem-neutral wait deadline",
     )
     require_tokens(
         timer_body,
         [
-            "uint64_t const WAIT_SCAN_NOW_US = time::get_us();",
-            "waitpid_repair_scan_window(WAIT_COUNT, rq->waitpid_repair_scan_cursor)",
-            "while (t != nullptr)",
-            "TIMED_SCAN && wake_count < PENDING_WAKE_LIMIT",
-            "waitpid_repair_scan_window_contains(WAITPID_REPAIR_WINDOW, WAIT_INDEX, WAIT_COUNT)",
-            "waitpid_repair_due(t, WAIT_SCAN_NOW_US) && t->try_acquire()",
-            "t->waitpid_last_repair_us = WAIT_SCAN_NOW_US;",
-            "rq->waitpid_repair_scan_cursor = waitpid_repair_next_scan_cursor(WAITPID_REPAIR_WINDOW, WAIT_COUNT);",
-            "recover_stalled_waitpid_completion_claim(waiter, WAIT_SCAN_NOW_US)",
-            "if (complete_or_preserve_waitpid_block(waiter))",
-            "reschedule_task_for_cpu(target_cpu, waiter);",
-            "waiter->release();",
+            "t->wake_at_us != 0 && WAIT_SCAN_NOW_US >= t->wake_at_us",
+            "t->itimer_real_expire_us != 0 && WAIT_SCAN_NOW_US >= t->itimer_real_expire_us",
+            "recompute_wait_deadline_locked(rq)",
         ],
-        "timer waitpid fallback repair flow",
-    )
-    require_order(
-        timer_body,
-        "t->waitpid_last_repair_us = WAIT_SCAN_NOW_US;",
-        "recompute_wait_deadline_locked(rq);",
-        "unresolved waitpid repairs must update their backoff before deadline recompute",
-    )
-    require_order(
-        timer_body,
-        "if (complete_or_preserve_waitpid_block(waiter))",
-        "reschedule_task_for_cpu(target_cpu, waiter);",
-        "waitpid fallback repair must only wake after the wait resolves",
-    )
-    require_order(
-        timer_body,
-        "recover_stalled_waitpid_completion_claim(waiter, WAIT_SCAN_NOW_US)",
-        "if (complete_or_preserve_waitpid_block(waiter))",
-        "timer repair must reclaim a leased-out claim before rechecking waitpid completion",
-    )
-    repair_completion_body = timer_body[timer_body.find("for (uint32_t i = 0; i < waitpid_repair_count; ++i)") :]
-    if "waiter->waitpid_last_repair_us = WAIT_SCAN_NOW_US;" in repair_completion_body:
-        fail("waitpid repair backoff must be stamped while holding the runqueue lock")
-
-    waitpid_requeue_start = reschedule_body.find(
-        "if (is_waitpid_wait_channel(task->wait_channel_kind) && task->waiting_for_pid != 0 && !complete_or_preserve_waitpid_block(task))"
-    )
-    waitpid_requeue_end = reschedule_body.find("// Insert into target CPU", waitpid_requeue_start)
-    if waitpid_requeue_start < 0 or waitpid_requeue_end < 0:
-        fail("waitpid preserve requeue branch not found")
-    waitpid_requeue_body = reschedule_body[waitpid_requeue_start:waitpid_requeue_end]
-    require_tokens(
-        waitpid_requeue_body,
-        [
-            "bool const ORPHANED_WAITPID",
-            "!found_and_removed && task->scheduler_published.load(std::memory_order_acquire)",
-            "task->sched_queue == task::Task::sched_queue::WAITING",
-            "if (found_and_removed || ORPHANED_WAITPID)",
-            "if (task->last_sleep_start_us == 0)",
-            "task->last_sleep_start_us = time::get_us();",
-            "wait_list_push_locked(rq, task);",
-        ],
-        "waitpid preserve requeue must keep fallback repair armed",
-    )
-    if "task->sched_next" in waitpid_requeue_body:
-        fail("stale intrusive linkage must not prevent waitpid owner-scan recovery")
-    require_order(
-        waitpid_requeue_body,
-        "task->last_sleep_start_us = time::get_us();",
-        "wait_list_push_locked(rq, task);",
-        "waitpid requeue must restore the sleep timestamp before publishing to the wait list",
+        "generic timer wait handling",
     )
 
 
@@ -3017,7 +2846,6 @@ def test_migration_guard_is_atomic_and_dominates_cross_cpu_placement() -> None:
     task_header = TASK_HPP.read_text()
     guard_header = MIGRATION_GUARD_HPP.read_text()
     epoch_header = EPOCH_HPP.read_text()
-    waitpid_source = WAITPID_CPP.read_text()
 
     require_tokens(
         task_header,
@@ -3139,12 +2967,6 @@ def test_migration_guard_is_atomic_and_dominates_cross_cpu_placement() -> None:
         "migration_guard.release()",
         "non-returning deferred handoff releases migration only after masking interrupts",
     )
-    require_order(
-        waitpid_source,
-        "ker::mod::sched::MigrationGuard const MIGRATION_GUARD",
-        "ker::mod::sched::EpochGuard const EPOCH_GUARD",
-        "waitpid epoch lifetime must first stabilize CPU ownership",
-    )
 
 
 def main() -> None:
@@ -3177,9 +2999,9 @@ def main() -> None:
     test_cpu_accounting_snapshot_projects_live_current_runtime()
     test_loadavg_does_not_count_interruptible_wait_channels()
     test_procfs_exposes_scheduler_cpu_state_snapshot()
-    test_procfs_status_exposes_waitpid_exit_debug_state()
-    test_handoff_waitpid_wake_queues_out_of_lock_repair()
-    test_timer_waitpid_repair_rechecks_stranded_waiters_without_sigchld()
+    test_procfs_status_exposes_child_lifecycle_debug_state()
+    test_handoff_event_wake_uses_the_generic_token()
+    test_scheduler_has_no_waitpid_completion_or_repair_engine()
     test_context_switch_updates_tss_rsp0_to_task_stack()
     test_deferred_user_switch_commits_after_stack_handoff()
     test_deferred_first_run_daemon_starts_on_kernel_thread_stack()

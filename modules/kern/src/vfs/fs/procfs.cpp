@@ -36,6 +36,7 @@
 #include <platform/sched/task.hpp>
 #include <platform/smt/smt.hpp>
 #include <string_view>
+#include <syscalls_impl/process/child_events.hpp>
 #include <syscalls_impl/vmem/sys_vmem.hpp>
 #include <utility>
 #include <vfs/buffer_cache.hpp>
@@ -838,23 +839,30 @@ auto generate_status(uint64_t pid, char* buf, size_t bufsz, bool thread_view) ->
         append("-");
     }
 
-    // Blocking state flags
+    // Blocking and process-child lifecycle state.
+    auto const CHILD_DIAGNOSTICS = ker::syscall::process::child_events::diagnostics(*task);
     append("\nDeferredSwitch:\t");
     append(task->deferred_task_switch ? "1" : "0");
     append("\nVoluntaryBlock:\t");
     append(task->is_voluntary_blocked() ? "1" : "0");
     append("\nWaitingForPid:\t");
-    append_int(task->waiting_for_pid);
+    append_int(CHILD_DIAGNOSTICS.registered_selector);
     append("\nWaitpidCompletionClaimed:\t");
-    append(task->waitpid_completion_claimed.load(std::memory_order_acquire) ? "1" : "0");
+    append(CHILD_DIAGNOSTICS.claim_active ? "1" : "0");
     append("\nWaitpidLastRepairUs:\t");
-    append_int(task->waitpid_last_repair_us);
+    append_int(0);
+    append("\nChildEventCount:\t");
+    append_int(CHILD_DIAGNOSTICS.owned_event_count);
+    append("\nChildWaiterCount:\t");
+    append_int(CHILD_DIAGNOSTICS.owned_waiter_count);
+    append("\nChildMembershipState:\t");
+    append_int(static_cast<uint64_t>(CHILD_DIAGNOSTICS.membership));
     append("\nExitInProgress:\t");
     append(task->exit_in_progress ? "1" : "0");
     append("\nExitNotifyReady:\t");
     append(task->exit_notify_ready.load(std::memory_order_acquire) ? "1" : "0");
     append("\nWaitedOn:\t");
-    append(task->waited_on.load(std::memory_order_acquire) ? "1" : "0");
+    append(task->has_exited && CHILD_DIAGNOSTICS.membership == ker::mod::sched::task::ChildMembershipState::UNLINKED ? "1" : "0");
     append("\nWakeupPending:\t");
     append(task->wakeup_pending.load(std::memory_order_acquire) ? "1" : "0");
 

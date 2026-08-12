@@ -82,66 +82,61 @@ def test_peer_cleanup_marks_all_targeted_submits_terminal_failure() -> None:
 
 def test_proxy_wait_completion_respects_waitpid_publish_fence() -> None:
     source = REMOTE_COMPUTE_CPP.read_text()
-    predicate = function_body(source, "proxy_waiter_context_can_be_completed")
-    for snippet in [
-        "!waiter->deferred_task_switch",
-        "!waiter->waitpid_publish_pending.load(std::memory_order_acquire)",
-    ]:
-        if snippet not in predicate:
-            fail(f"proxy waiter completion predicate must preserve waitpid publish fence: {snippet}")
-
-    completion = function_body(source, "try_complete_proxy_wait")
-    for snippet in [
-        "proxy_matches_waiter(waiter, proxy)",
-        "proxy_waiter_context_can_be_completed(waiter)",
-        "ker::mod::sched::task::task_try_claim_waitpid_completion(*waiter)",
-        "ker::mod::sched::task::task_release_waitpid_completion_claim(*waiter)",
-        "ker::mod::sched::task::task_try_mark_waited_on(*proxy)",
-        "write_proxy_wait_status(waiter, wait_status)",
-        "waiter->waitpid_publish_pending.store(false, std::memory_order_release)",
-        "ker::mod::sched::task::task_clear_waitpid_block_state(*waiter)",
-    ]:
-        if snippet not in completion:
-            fail(f"proxy wait completion must use the fenced single-result helper: {snippet}")
-
-    match_body = function_body(source, "proxy_matches_waiter")
-    for snippet in [
-        "proxy->parent_pid != waiter->pid",
-        "waiter->waiting_for_pid == WAIT_ANY_CHILD || waiter->waiting_for_pid == proxy->pid",
-    ]:
-        if snippet not in match_body:
-            fail(f"proxy wait completion must reject stale specific waiters: {snippet}")
-
-    wake_body = function_body(source, "wake_proxy_waiters")
-    if "try_complete_proxy_wait(waiting_task, proxy, WAIT_STATUS)" not in wake_body:
-        fail("explicit proxy waiters must complete through the publish-fenced helper")
-
     finalize_body = function_body(source, "finalize_proxy_task")
-    if "parent->waiting_for_pid == WAIT_ANY_CHILD && try_complete_proxy_wait(parent, proxy, WAIT_STATUS)" not in finalize_body:
-        fail("parent wait-any proxy completion must complete through the publish-fenced helper")
-    if "parent->waiting_for_pid == WAIT_ANY_CHILD && !parent->deferred_task_switch" in finalize_body:
-        fail("parent wait-any proxy completion must not bypass waitpid_publish_pending")
     require_order(
         finalize_body,
         "cleanup_proxy_resources(proxy)",
-        "ker::mod::sched::insert_into_dead_list(proxy)",
-        "proxy resources must be released before the exit becomes observable",
+        "ker::syscall::process::child_events::publish_exit(*proxy)",
+        "proxy resources must be stable before the immutable exit event",
     )
     require_order(
         finalize_body,
+        "ker::syscall::process::child_events::publish_exit(*proxy)",
         "ker::mod::sched::insert_into_dead_list(proxy)",
-        "parent->signal_add_pending_mask",
-        "proxy exit must be globally waitable before parent notification",
+        "proxy exit event must precede dead-list insertion",
     )
-    require_order(
+    require_tokens(
         finalize_body,
-        "ker::mod::sched::insert_into_dead_list(proxy)",
-        "wake_proxy_waiters(proxy, exit_status)",
-        "specific proxy waiters must wake after dead-list publication",
+        [
+            "proxy->has_exited = true",
+            "proxy->exit_notify_ready.store(true, std::memory_order_release)",
+            'panic_handler("WKI remote compute: failed to publish proxy child exit event")',
+        ],
+        "remote proxy exit publication",
     )
 
+    spawn_body = function_body(source, "wki_try_remote_spawn")
+    require_tokens(
+        spawn_body,
+        [
+            "child_events::abort_publication(*task)",
+            "child_events::commit_publication(*task)",
+        ],
+        "remote proxy transactional membership",
+    )
+
+    for forbidden in [
+        "proxy_waiter_context_can_be_completed",
+        "try_complete_proxy_wait",
+        "wake_proxy_waiters",
+        "waitpid_publish_pending",
+        "waiting_for_pid",
+        "awaitee_on_exit",
+    ]:
+        if forbidden in source:
+            fail(f"WKI must not complete waitpid outside the process child-event queue: {forbidden}")
+
     if "wki_remote_compute_selftest_proxy_wait_completion_respects_publish_fence" not in source:
-        fail("remote-compute KTEST selftest must cover proxy wait publish fencing")
+        fail("remote-compute KTEST selftest must cover proxy child-event publication")
+    for snippet in [
+        "REGISTERED_BEFORE_PUBLISH",
+        "SNAPSHOT_PRESERVED",
+        "RETRY_IS_SAME_EVENT",
+        "REJECTED_STALE_SPECIFIC_WAIT",
+        "parent.child_user_time_us == proxy.user_time_us",
+    ]:
+        if snippet not in source:
+            fail(f"remote-compute KTEST selftest is missing child-event coverage: {snippet}")
     if "REJECTED_STALE_SPECIFIC_WAIT" not in source:
         fail("remote-compute KTEST selftest must cover stale specific waiters")
 
@@ -988,15 +983,9 @@ def test_task_exit_retires_remote_compute_wait_owners() -> None:
     )
 
     reschedule = function_body(scheduler_source, "reschedule_task_for_cpu_once")
-    waitpid_repair_start = reschedule.find("if (is_waitpid_wait_channel")
-    final_insert_start = reschedule.find("// Insert into target CPU's heap", waitpid_repair_start)
-    waitpid_repair = reschedule[waitpid_repair_start:final_insert_start]
-    require_order(
-        waitpid_repair,
-        "task->state.load(std::memory_order_acquire) != task::TaskState::ACTIVE",
-        "wait_list_push_locked(rq, task)",
-        "waitpid repair must revalidate lifecycle under the owner runqueue lock",
-    )
+    for forbidden in ["is_waitpid_wait_channel", "waiting_for_pid", "complete_waitpid", "waitpid_repair"]:
+        if forbidden in reschedule:
+            fail(f"generic reschedule path must not own waitpid repair state: {forbidden}")
     final_lock_start = reschedule.rfind("run_queues->with_lock_void(cpu_no")
     final_lock_end = reschedule.find("if (!published_runnable)", final_lock_start)
     final_publication = reschedule[final_lock_start:final_lock_end]
