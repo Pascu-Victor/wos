@@ -100,6 +100,7 @@ UNIT_TESTS=(
     ktest_cov_test
     coverage_summary_test
     cluster_setup_test
+    xhci_lifecycle_source_test
     wosincident_test
     cross_os_benchmark_suite_test
     fixed_resource_scaling_test

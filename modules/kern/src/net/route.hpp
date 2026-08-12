@@ -15,6 +15,7 @@ struct RouteEntry {
     proto::IPv4Address gateway;
     uint32_t metric{};
     NetDevice* dev{};
+    NetDeviceIdentity dev_identity{};
     // Set before publication and immutable thereafter. Current membership is
     // internal to the route registry, not represented by this snapshot bit.
     bool valid{};

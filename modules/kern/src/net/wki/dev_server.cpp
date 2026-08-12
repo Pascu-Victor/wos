@@ -319,15 +319,15 @@ auto find_block_device_by_resource_id(uint32_t resource_id) -> ker::dev::BlockDe
     return ker::dev::block_device_at(static_cast<size_t>(resource_id));
 }
 
-auto find_net_device_by_resource_id(uint32_t resource_id) -> ker::net::NetDevice* {
+auto find_net_device_by_resource_id(uint32_t resource_id) -> ker::net::NetDeviceRef {
     size_t const COUNT = ker::net::netdev_count();
     for (size_t i = 0; i < COUNT; i++) {
-        ker::net::NetDevice* ndev = ker::net::netdev_at(i);
-        if (ndev != nullptr && ndev->ifindex == resource_id) {
+        ker::net::NetDeviceRef ndev = ker::net::netdev_at_ref(i);
+        if (ndev && ndev->ifindex == resource_id) {
             return ndev;
         }
     }
-    return nullptr;
+    return {};
 }
 
 auto decode_attach_resource_incarnation(uint16_t consumer_node, ResourceType resource_type, const uint8_t* payload, uint16_t payload_len,
@@ -1974,6 +1974,35 @@ void wki_dev_server_detach_all_for_peer(uint16_t node_id) {
     }
 }
 
+void wki_dev_server_detach_all_for_netdev(ker::net::NetDevice* dev) {
+    if (dev == nullptr) {
+        return;
+    }
+
+    for (;;) {
+        bool found = false;
+        uint64_t const FLAGS = s_server_lock.lock_irqsave();
+        for (auto& binding : g_bindings) {
+            if (binding.resource_type != ResourceType::NET || binding.net_dev != dev) {
+                continue;
+            }
+            found = true;
+            if (binding.active && !binding.retiring.load(std::memory_order_acquire)) {
+                mark_binding_retiring_locked(binding);
+                binding.detach_cleanup_pending = true;
+                binding.detach_cleanup_claimed = false;
+            }
+        }
+        s_server_lock.unlock_irqrestore(FLAGS);
+
+        if (!found) {
+            break;
+        }
+        wki_dev_server_process_pending_detaches();
+        ker::mod::sched::kern_yield();
+    }
+}
+
 // -----------------------------------------------------------------------------
 // RX handlers
 // -----------------------------------------------------------------------------
@@ -2347,15 +2376,17 @@ void handle_dev_attach_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
         }
     } else if (res_type == ResourceType::NET) {
         // Find the net device
-        ker::net::NetDevice* ndev = find_net_device_by_resource_id(req->resource_id);
-        if (ndev == nullptr) {
+        ker::net::NetDeviceRef ndev_ref = find_net_device_by_resource_id(req->resource_id);
+        ker::net::NetDevice* ndev = ndev_ref.get();
+        if (!ndev_ref) {
             ack.status = static_cast<uint8_t>(DevAttachStatus::NOT_FOUND);
             wki_send(hdr->src_node, WKI_CHAN_RESOURCE, MsgType::DEV_ATTACH_ACK, &ack, sizeof(ack));
             return;
         }
 
         // Check remotable
-        if (ndev->remotable == nullptr || !ndev->remotable->can_remote()) {
+        auto const* remotable_ops = ndev->remotable;
+        if (remotable_ops == nullptr || !remotable_ops->can_remote()) {
             ack.status = static_cast<uint8_t>(DevAttachStatus::NOT_REMOTABLE);
             wki_send(hdr->src_node, WKI_CHAN_RESOURCE, MsgType::DEV_ATTACH_ACK, &ack, sizeof(ack));
             return;
@@ -2384,7 +2415,7 @@ void handle_dev_attach_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
         }
 
         // Call on_remote_attach
-        int const ATTACH_RET = ndev->remotable->on_remote_attach(hdr->src_node);
+        int const ATTACH_RET = remotable_ops->on_remote_attach(hdr->src_node);
         if (ATTACH_RET != 0) {
             static_cast<void>(wki_channel_close_generation(channel_identity.channel, channel_identity.peer_node_id,
                                                            channel_identity.channel_id, channel_identity.generation));
@@ -2403,15 +2434,35 @@ void handle_dev_attach_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
         binding.resource_id = req->resource_id;
         binding.attach_cookie = req->attach_cookie;
         binding.net_dev = ndev;
+        binding.net_dev_ref = std::move(ndev_ref);
         record_binding_net_state(binding, capture_net_state(ndev));
 
+        bool published = false;
         {
-            uint64_t const SRV_FLAGS = s_server_lock.lock_irqsave();
-            g_bindings.push_back(std::move(binding));
-            // Publish the hook in the same binding critical section so cleanup
-            // cannot observe or remove a partially published NET attachment.
-            ndev->wki_rx_forward.store(wki_dev_server_forward_net_rx, std::memory_order_release);
-            s_server_lock.unlock_irqrestore(SRV_FLAGS);
+            // Registry membership is the outer publication lease. Teardown
+            // either removes the device first, or observes this complete
+            // binding when it subsequently drains NET users.
+            ker::net::NetDeviceRegistryLease const REGISTRATION;
+            if (REGISTRATION.contains(ndev)) {
+                uint64_t const SRV_FLAGS = s_server_lock.lock_irqsave();
+                g_bindings.push_back(std::move(binding));
+                // Publish the hook in the same binding critical section so cleanup
+                // cannot observe or remove a partially published NET attachment.
+                ndev->wki_rx_forward.store(wki_dev_server_forward_net_rx, std::memory_order_release);
+                s_server_lock.unlock_irqrestore(SRV_FLAGS);
+                published = true;
+            }
+        }
+        if (!published) {
+            remotable_ops->on_remote_detach(hdr->src_node);
+            static_cast<void>(wki_channel_close_generation(channel_identity.channel, channel_identity.peer_node_id,
+                                                           channel_identity.channel_id, channel_identity.generation));
+            ack = {};
+            ack.status = static_cast<uint8_t>(DevAttachStatus::STALE_RESOURCE);
+            ack.reserved = req->attach_cookie;
+            ack.resource_id = req->resource_id;
+            static_cast<void>(wki_send(hdr->src_node, WKI_CHAN_RESOURCE, MsgType::DEV_ATTACH_ACK, &ack, sizeof(ack)));
+            return;
         }
 
         // V2: Send extended NET attach ACK with owner NIC info

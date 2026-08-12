@@ -42,13 +42,28 @@ void write_ipv4_header(PacketBuffer* pkt, IPv4Address src, IPv4Address dst, uint
     hdr->checksum = checksum_compute(hdr, sizeof(IPv4Header));
 }
 
-auto deliver_local_or_emit(PacketBuffer* pkt, IPv4Address dst, NetDevice* out_dev, IPv4Address next_hop) -> int {
+auto pin_packet_netdev(PacketBuffer* pkt, NetDeviceIdentity identity) -> bool {
+    if (pkt == nullptr || !identity.valid()) {
+        return false;
+    }
+    if (pkt->retained_netdev.valid() && pkt->retained_netdev != identity) {
+        pkt_release_netdev(pkt);
+    }
+    return pkt_retain_netdev(pkt, identity);
+}
+
+auto deliver_local_or_emit(PacketBuffer* pkt, IPv4Address dst, NetDevice* out_dev, IPv4Address next_hop,
+                           NetDeviceIdentity out_identity = {}) -> int {
     // Packets destined to one of our own interface addresses should be
     // reinjected locally instead of depending on NIC/ARP self-delivery.
     if (auto* local_nif = netif_find_by_ipv4(dst); local_nif != nullptr && local_nif->dev != nullptr) {
-        pkt->dev = local_nif->dev;
-        pkt->src_mac = local_nif->dev->mac;
-        ipv4_rx(local_nif->dev, pkt);
+        if (!pin_packet_netdev(pkt, local_nif->dev_identity)) {
+            pkt_free(pkt);
+            return -1;
+        }
+        NetDevice* const LOCAL_DEV = local_nif->dev_identity.device;
+        pkt->src_mac = LOCAL_DEV->mac;
+        ipv4_rx(LOCAL_DEV, pkt);
         return 0;  // pkt ownership transferred to ipv4_rx()
     }
 
@@ -56,6 +71,14 @@ auto deliver_local_or_emit(PacketBuffer* pkt, IPv4Address dst, NetDevice* out_de
         pkt_free(pkt);
         return -1;
     }
+    if (!out_identity.valid()) {
+        out_identity = netdev_registered_identity(out_dev);
+    }
+    if (!pin_packet_netdev(pkt, out_identity)) {
+        pkt_free(pkt);
+        return -1;
+    }
+    out_dev = out_identity.device;
 
     // If the device is loopback, bypass ARP
     if (std::strcmp(out_dev->name.data(), "lo") == 0) {
@@ -184,15 +207,18 @@ auto ipv4_tx(PacketBuffer* pkt, IPv4Address src, IPv4Address dst, uint8_t proto,
     // Route the packet
     auto* route = route_lookup(dst);
     NetDevice* out_dev = nullptr;
+    NetDeviceIdentity out_identity{};
 
-    if (route != nullptr && route->dev != nullptr) {
-        out_dev = route->dev;
+    if (route != nullptr && route->dev_identity.valid()) {
+        out_identity = route->dev_identity;
+        out_dev = out_identity.device;
     } else if (dst.is_broadcast()) {
         // Broadcast fallback: no route needed, use first UP non-loopback device
         for (size_t i = 0; i < netdev_count(); i++) {
-            auto* d = netdev_at(i);
-            if (d != nullptr && d->state == 1 && std::strcmp(d->name.data(), "lo") != 0) {
-                out_dev = d;
+            NetDeviceRef ref = netdev_at_ref(i);
+            if (ref && ref->state == 1 && std::strcmp(ref->name.data(), "lo") != 0) {
+                out_identity = ref.identity();
+                out_dev = out_identity.device;
                 break;
             }
         }
@@ -205,7 +231,7 @@ auto ipv4_tx(PacketBuffer* pkt, IPv4Address src, IPv4Address dst, uint8_t proto,
         next_hop = route->gateway;
     }
 
-    return deliver_local_or_emit(pkt, dst, out_dev, next_hop);
+    return deliver_local_or_emit(pkt, dst, out_dev, next_hop, out_identity);
 }
 
 auto ipv4_tx_on_dev(PacketBuffer* pkt, NetDevice* out_dev, IPv4Address src, IPv4Address dst, uint8_t proto, uint8_t ttl) -> int {
@@ -222,7 +248,11 @@ auto ipv4_tx_on_dev(PacketBuffer* pkt, NetDevice* out_dev, IPv4Address src, IPv4
         next_hop = route->gateway;
     }
 
-    return deliver_local_or_emit(pkt, dst, out_dev, next_hop);
+    NetDeviceIdentity identity = pkt->retained_netdev;
+    if (!identity.valid() || identity.device != out_dev) {
+        identity = netdev_registered_identity(out_dev);
+    }
+    return deliver_local_or_emit(pkt, dst, out_dev, next_hop, identity);
 }
 
 auto ipv4_tx_auto(PacketBuffer* pkt, IPv4Address dst, uint8_t proto) -> int {
@@ -232,7 +262,7 @@ auto ipv4_tx_auto(PacketBuffer* pkt, IPv4Address dst, uint8_t proto) -> int {
 
     // Route to determine source address
     auto* route = route_lookup(dst);
-    if (route == nullptr || route->dev == nullptr) {
+    if (route == nullptr || !route->dev_identity.valid()) {
         // Broadcast fallback: send via first UP non-loopback device with src=0.0.0.0
         if (dst.is_broadcast()) {
             return ipv4_tx(pkt, IPv4Address::any(), dst, proto, IPV4_DEFAULT_TTL);
@@ -245,11 +275,16 @@ auto ipv4_tx_auto(PacketBuffer* pkt, IPv4Address dst, uint8_t proto) -> int {
     }
 
 #ifdef DEBUG_IPV4
-    log::debug("ipv4_tx_auto: route found, dev=%s", route->dev->name.data());
+    log::debug("ipv4_tx_auto: route found, dev=%s", route->dev_identity.device->name.data());
 #endif
 
+    NetDeviceRef route_ref = netdev_try_retain(route->dev_identity);
+    if (!route_ref) {
+        pkt_free(pkt);
+        return -1;
+    }
     // Get the first IPv4 address on the outgoing interface
-    auto* nif = netif_find_by_dev(route->dev);
+    auto* nif = netif_find_by_dev(route_ref.get());
     if (nif == nullptr || nif->ipv4_addr_count == 0) {
         // Broadcast fallback: no address configured yet (e.g. pre-DHCP)
         if (dst.is_broadcast()) {

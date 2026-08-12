@@ -176,12 +176,12 @@ auto has_local_subnet_overlap(uint32_t remote_ip, uint32_t remote_mask) -> bool 
 
     size_t const NDEV_COUNT = ker::net::netdev_count();
     for (size_t i = 0; i < NDEV_COUNT; i++) {
-        ker::net::NetDevice* dev = ker::net::netdev_at(i);
-        if (dev == nullptr) {
+        ker::net::NetDeviceRef dev = ker::net::netdev_at_ref(i);
+        if (!dev) {
             continue;
         }
 
-        auto* nif = ker::net::netif_find_by_dev(dev);
+        auto* nif = ker::net::netif_find_by_dev(dev.get());
         if (nif == nullptr) {
             continue;
         }
@@ -212,13 +212,13 @@ auto local_ipv4_configuration_pending() -> bool {
     bool found_candidate = false;
     size_t const NDEV_COUNT = ker::net::netdev_count();
     for (size_t i = 0; i < NDEV_COUNT; i++) {
-        ker::net::NetDevice* dev = ker::net::netdev_at(i);
-        if (!is_local_l3_candidate(dev)) {
+        ker::net::NetDeviceRef dev = ker::net::netdev_at_ref(i);
+        if (!dev || !is_local_l3_candidate(dev.get())) {
             continue;
         }
 
         found_candidate = true;
-        auto* nif = ker::net::netif_find_by_dev(dev);
+        auto* nif = ker::net::netif_find_by_dev(dev.get());
         if (nif != nullptr && nif->ipv4_addr_count != 0) {
             return false;
         }
@@ -755,9 +755,9 @@ void wki_resource_process_pending_adverts() {
             size_t const COUNT = ker::net::netdev_count();
             while (peer.resource_advert_index < COUNT) {
                 size_t const INDEX = peer.resource_advert_index;
-                ker::net::NetDevice* ndev = ker::net::netdev_at(INDEX);
-                if (ndev != nullptr && ndev->remotable != nullptr && ndev->remotable->can_remote() &&
-                    send_net_resource_advert_to_peer(peer.node_id, ndev, ndev->ifindex) != WKI_OK) {
+                ker::net::NetDeviceRef ndev = ker::net::netdev_at_ref(INDEX);
+                if (ndev && ndev->remotable != nullptr && ndev->remotable->can_remote() &&
+                    send_net_resource_advert_to_peer(peer.node_id, ndev.get(), ndev->ifindex) != WKI_OK) {
                     break;
                 }
                 peer.resource_advert_index++;
@@ -781,6 +781,26 @@ void wki_remotable_notify_net_changed(ker::net::NetDevice* dev) {
             continue;
         }
         request_resource_snapshot(peer);
+    }
+}
+
+void wki_remotable_withdraw_net(uint32_t ifindex) {
+    if (!g_remotable_initialized || ifindex == 0) {
+        return;
+    }
+
+    ResourceAdvertPayload withdraw = {};
+    withdraw.node_id = g_wki.my_node_id;
+    withdraw.resource_type = static_cast<uint16_t>(ResourceType::NET);
+    withdraw.resource_id = ifindex;
+    withdraw.flags = 0;
+    withdraw.name_len = 0;
+
+    for (auto& peer : g_wki.peers) {
+        if (peer.node_id == WKI_NODE_INVALID || peer.state != PeerState::CONNECTED) {
+            continue;
+        }
+        static_cast<void>(wki_send(peer.node_id, WKI_CHAN_CONTROL, MsgType::RESOURCE_WITHDRAW, &withdraw, sizeof(withdraw)));
     }
 }
 
@@ -1703,7 +1723,7 @@ void wki_remotable_process_pending_net_attaches() {
                 continue;
             }
 
-            if (ker::net::netdev_find_by_name(pending.nic_name.data()) != nullptr) {
+            if (ker::net::netdev_find_by_name_ref(pending.nic_name.data())) {
                 log::debug("Skipping duplicate NET auto-attach name: %s node=0x%04x res_id=%u", pending.nic_name.data(), pending.node_id,
                            pending.resource_id);
                 continue;

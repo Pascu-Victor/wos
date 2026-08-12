@@ -110,6 +110,7 @@ auto netif_get(NetDevice* dev) -> NetInterface* {
         // teardown's subsequent netif_del_for_dev().
         NetDeviceRegistryLease const REGISTRATION;
         if (REGISTRATION.contains(dev)) {
+            nif->dev_identity = {.device = dev, .generation = dev->lifetime_generation.load(std::memory_order_acquire)};
             uint64_t const FLAGS = interface_registry_lock.lock_irqsave();
             if (auto* existing = find_live_interface(dev, std::memory_order_relaxed); existing != nullptr) {
                 result = existing;

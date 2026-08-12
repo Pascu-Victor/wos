@@ -942,24 +942,24 @@ void fill_if_info(WosNetIfInfo& out, ker::net::NetDevice* dev) {
     std::fill_n(out.broadcast, 6, 0xff);
 }
 
-auto find_dev_by_ifindex(uint32_t ifindex) -> ker::net::NetDevice* {
+auto find_dev_by_ifindex(uint32_t ifindex) -> ker::net::NetDeviceRef {
     for (size_t i = 0; i < ker::net::netdev_count(); i++) {
-        auto* dev = ker::net::netdev_at(i);
-        if (dev != nullptr && dev->ifindex == ifindex) {
-            return dev;
+        auto dev_ref = ker::net::netdev_at_ref(i);
+        if (dev_ref && dev_ref->ifindex == ifindex) {
+            return dev_ref;
         }
     }
-    return nullptr;
+    return {};
 }
 
-auto find_dev_for_link_req(const WosNetLinkSetReq* req) -> ker::net::NetDevice* {
+auto find_dev_for_link_req(const WosNetLinkSetReq* req) -> ker::net::NetDeviceRef {
     if (req == nullptr) {
-        return nullptr;
+        return {};
     }
     if (req->ifindex != 0) {
         return find_dev_by_ifindex(req->ifindex);
     }
-    return ker::net::netdev_find_by_name(std::string_view(req->ifname, strnlen(req->ifname, WOS_NET_IF_NAME_LEN)));
+    return ker::net::netdev_find_by_name_ref(std::string_view(req->ifname, strnlen(req->ifname, WOS_NET_IF_NAME_LEN)));
 }
 
 auto rename_netdev(ker::net::NetDevice* dev, const char* new_name) -> int {
@@ -967,7 +967,8 @@ auto rename_netdev(ker::net::NetDevice* dev, const char* new_name) -> int {
     if (dev == nullptr || LEN == 0 || LEN >= WOS_NET_IF_NAME_LEN) {
         return -EINVAL;
     }
-    if (ker::net::netdev_find_by_name(std::string_view(new_name, LEN)) != nullptr) {
+    auto existing_ref = ker::net::netdev_find_by_name_ref(std::string_view(new_name, LEN));
+    if (existing_ref && existing_ref.get() != dev) {
         return -EEXIST;
     }
     dev->name.fill('\0');
@@ -1501,10 +1502,11 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                     // destination/mask. Falling back to an arbitrary UP device
                     // can bind the route to a proxy NIC and hijack local
                     // traffic on overlapping subnets.
-                    ker::net::NetDevice* rdev = nullptr;
+                    ker::net::NetDeviceRef rdev_ref{};
                     if (gw != 0) {
                         for (size_t i = 0; i < ker::net::netdev_count(); i++) {
-                            auto* d = ker::net::netdev_at(i);
+                            auto candidate = ker::net::netdev_at_ref(i);
+                            auto* d = candidate.get();
                             if (d == nullptr || d->state != 1 || std::strcmp(d->name.data(), "lo") == 0) {
                                 continue;
                             }
@@ -1513,14 +1515,15 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                                 uint32_t const DEV_IP = nif->ipv4_addrs[0].addr;
                                 uint32_t const DEV_MASK = nif->ipv4_addrs[0].netmask;
                                 if ((DEV_IP & DEV_MASK) == (gw & DEV_MASK)) {
-                                    rdev = d;
+                                    rdev_ref = std::move(candidate);
                                     break;
                                 }
                             }
                         }
                     } else {
                         for (size_t i = 0; i < ker::net::netdev_count(); i++) {
-                            auto* d = ker::net::netdev_at(i);
+                            auto candidate = ker::net::netdev_at_ref(i);
+                            auto* d = candidate.get();
                             if (d == nullptr || d->state != 1 || std::strcmp(d->name.data(), "lo") == 0) {
                                 continue;
                             }
@@ -1531,32 +1534,33 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                             for (size_t j = 0; j < nif->ipv4_addr_count; j++) {
                                 uint32_t const DEV_IP = nif->ipv4_addrs[j].addr;
                                 if ((DEV_IP & mask) == (dst & mask)) {
-                                    rdev = d;
+                                    rdev_ref = std::move(candidate);
                                     break;
                                 }
                             }
-                            if (rdev != nullptr) {
+                            if (rdev_ref) {
                                 break;
                             }
                         }
                     }
                     // Gateway routes can still fall back to the first
                     // non-loopback UP device if there is only one usable path.
-                    if (rdev == nullptr) {
+                    if (!rdev_ref) {
                         if (gw != 0) {
                             for (size_t i = 0; i < ker::net::netdev_count(); i++) {
-                                auto* d = ker::net::netdev_at(i);
+                                auto candidate = ker::net::netdev_at_ref(i);
+                                auto* d = candidate.get();
                                 if (d != nullptr && d->state == 1 && std::strcmp(d->name.data(), "lo") != 0) {
-                                    rdev = d;
+                                    rdev_ref = std::move(candidate);
                                     break;
                                 }
                             }
                         }
                     }
-                    if (rdev == nullptr) {
+                    if (!rdev_ref) {
                         return static_cast<uint64_t>(-ENODEV);
                     }
-                    int const RET = ker::net::route_add(dst, mask, gw, 0, rdev);
+                    int const RET = ker::net::route_add(dst, mask, gw, 0, rdev_ref.get());
                     return static_cast<uint64_t>(RET);
                 }
                 int const RET = ker::net::route_del(dst, mask);
@@ -1566,10 +1570,11 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             // All other SIOC* ioctls use ifreq: name at offset 0, data at offset 16
             std::string_view const IFNAME(reinterpret_cast<char*>(arg), strnlen(reinterpret_cast<char*>(arg), 16));
 
-            auto* dev = ker::net::netdev_find_by_name(IFNAME);
-            if (dev == nullptr) {
+            auto dev_ref = ker::net::netdev_find_by_name_ref(IFNAME);
+            if (!dev_ref) {
                 return static_cast<uint64_t>(-ENODEV);
             }
+            auto* dev = dev_ref.get();
 
             switch (request) {
                 case SIOC_GIFFLAGS: {
@@ -1694,10 +1699,11 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             }
             std::string_view const IFNAME(reinterpret_cast<char*>(request.data()), strnlen(reinterpret_cast<char*>(request.data()), 16));
             auto const CPU_MASK = load_unaligned<uint64_t>(request.data() + 16);
-            auto* dev = ker::net::netdev_find_by_name(IFNAME);
-            if (dev == nullptr) {
+            auto dev_ref = ker::net::netdev_find_by_name_ref(IFNAME);
+            if (!dev_ref) {
                 return static_cast<uint64_t>(-ENODEV);
             }
+            auto* dev = dev_ref.get();
             if (dev->ops == nullptr || dev->ops->set_queue_cpu == nullptr) {
                 return static_cast<uint64_t>(-ENOSYS);
             }
@@ -1730,7 +1736,8 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             }
             std::array<WosNetIfInfo, ker::net::MAX_NET_DEVICES> output{};
             for (size_t i = 0; i < EMIT; i++) {
-                fill_if_info(output.at(i), ker::net::netdev_at(i));
+                auto dev_ref = ker::net::netdev_at_ref(i);
+                fill_if_info(output.at(i), dev_ref.get());
             }
             if ((OUTPUT_BYTES != 0 && !ker::mod::sys::usercopy::copy_to_task(*task, a1, output.data(), OUTPUT_BYTES)) ||
                 !ker::mod::sys::usercopy::copy_value_to_task(*task, a2, TOTAL)) {
@@ -1753,7 +1760,8 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             std::array<WosNetAddrInfo, ker::net::MAX_NET_DEVICES * ker::net::MAX_ADDRS_PER_IF> output{};
             size_t total = 0;
             for (size_t i = 0; i < ker::net::netdev_count(); i++) {
-                auto* dev = ker::net::netdev_at(i);
+                auto dev_ref = ker::net::netdev_at_ref(i);
+                auto* dev = dev_ref.get();
                 auto* nif = ker::net::netif_find_by_dev(dev);
                 if (dev == nullptr || nif == nullptr) {
                     continue;
@@ -1797,10 +1805,11 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             if (req.family != WOS_AF_INET) {
                 return static_cast<uint64_t>(-EINVAL);
             }
-            auto* dev = find_dev_by_ifindex(req.ifindex);
-            if (dev == nullptr) {
+            auto dev_ref = find_dev_by_ifindex(req.ifindex);
+            if (!dev_ref) {
                 return static_cast<uint64_t>(-ENODEV);
             }
+            auto* dev = dev_ref.get();
             uint32_t addr_be = 0;
             std::memcpy(&addr_be, req.local, sizeof(addr_be));
             if (addr_be == 0) {
@@ -1824,10 +1833,11 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             if (req.family != WOS_AF_INET) {
                 return static_cast<uint64_t>(-EINVAL);
             }
-            auto* dev = find_dev_by_ifindex(req.ifindex);
-            if (dev == nullptr) {
+            auto dev_ref = find_dev_by_ifindex(req.ifindex);
+            if (!dev_ref) {
                 return static_cast<uint64_t>(-ENODEV);
             }
+            auto* dev = dev_ref.get();
             uint32_t addr_be = 0;
             std::memcpy(&addr_be, req.local, sizeof(addr_be));
             if (addr_be == 0) {
@@ -1848,10 +1858,11 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             if (!ker::mod::sys::usercopy::copy_value_from_task(*task, a1, req)) {
                 return static_cast<uint64_t>(-EFAULT);
             }
-            auto* dev = find_dev_for_link_req(&req);
-            if (dev == nullptr) {
+            auto dev_ref = find_dev_for_link_req(&req);
+            if (!dev_ref) {
                 return static_cast<uint64_t>(-ENODEV);
             }
+            auto* dev = dev_ref.get();
 
             if ((req.fields & WOS_NET_LINK_SET_MTU) != 0 && req.mtu == 0) {
                 return static_cast<uint64_t>(-EINVAL);
@@ -1864,7 +1875,8 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                 if (NAME_LEN == 0 || NAME_LEN >= WOS_NET_IF_NAME_LEN) {
                     return static_cast<uint64_t>(-EINVAL);
                 }
-                if (ker::net::netdev_find_by_name(std::string_view(req.new_name, NAME_LEN)) != nullptr) {
+                auto existing_ref = ker::net::netdev_find_by_name_ref(std::string_view(req.new_name, NAME_LEN));
+                if (existing_ref && existing_ref.get() != dev) {
                     return static_cast<uint64_t>(-EEXIST);
                 }
             }

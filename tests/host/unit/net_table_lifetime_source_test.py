@@ -357,7 +357,7 @@ def test_wki_rx_forward_hook_is_atomic_and_loaded_once_per_packet() -> None:
     )
     require_tokens(
         cdc_ether,
-        ["cdc.netdev.wki_rx_forward.store(nullptr, std::memory_order_release)"],
+        ["cdc->netdev.wki_rx_forward.store(nullptr, std::memory_order_release)"],
         "CDC teardown WKI hook retirement",
     )
 

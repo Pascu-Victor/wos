@@ -1,21 +1,26 @@
 #include "cdc_ether.hpp"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
+#include <cerrno>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <net/netdevice.hpp>
+#include <net/netif.hpp>
 #include <net/packet.hpp>
+#include <net/proto/arp.hpp>
+#include <net/route.hpp>
+#include <net/wki/dev_server.hpp>
 #include <net/wki/remotable.hpp>
 #include <new>  // IWYU pragma: keep
 #include <platform/dbg/dbg.hpp>
-#include <platform/mm/addr.hpp>
-#include <platform/mm/page_alloc.hpp>
-#include <platform/mm/phys.hpp>
-#include <platform/mm/virt.hpp>
+#include <platform/sched/scheduler.hpp>
+#include <platform/sched/task.hpp>
+#include <utility>
 
 #include "dev/usb/xhci.hpp"
-#include "util/hcf.hpp"
 
 namespace ker::dev::usb {
 
@@ -23,7 +28,18 @@ using log = ker::mod::dbg::logger<"cdc">;
 
 namespace {
 
-// WKI remotable ops for CDC-Ether devices
+constexpr size_t MAX_CDC_DEVICES = 4;
+constexpr uint8_t USB_REQ_SET_INTERFACE = 0x0B;
+constexpr uint8_t CDC_REQ_SET_ETHERNET_PACKET_FILTER = 0x43;
+constexpr uint16_t CDC_PACKET_FILTER_ALL = 0x000F;
+constexpr uint16_t QEMU_USB_NET_VENDOR = 0x0525;
+constexpr uint16_t QEMU_USB_NET_PRODUCT = 0xA4A2;
+constexpr size_t ETHERNET_FRAME_OVERHEAD = 18;
+
+std::array<CdcEtherDevice, MAX_CDC_DEVICES> cdc_devices{};
+std::array<mod::sched::task::Task*, MAX_CDC_DEVICES> cdc_rx_tasks{};
+std::array<std::atomic<bool>, MAX_CDC_DEVICES> cdc_rx_pending{};
+
 auto remotable_can_remote() -> bool { return true; }
 auto remotable_can_share() -> bool { return true; }
 auto remotable_can_passthrough() -> bool { return false; }
@@ -33,7 +49,8 @@ auto remotable_on_attach(uint16_t node_id) -> int {
 }
 void remotable_on_detach(uint16_t node_id) { log::trace("remote detach from 0x%04x", node_id); }
 void remotable_on_fault(uint16_t node_id) { log::trace("remote fault for 0x%04x", node_id); }
-const ker::net::wki::RemotableOps S_REMOTABLE_OPS = {
+
+const net::wki::RemotableOps S_REMOTABLE_OPS = {
     .can_remote = remotable_can_remote,
     .can_share = remotable_can_share,
     .can_passthrough = remotable_can_passthrough,
@@ -42,58 +59,71 @@ const ker::net::wki::RemotableOps S_REMOTABLE_OPS = {
     .on_remote_fault = remotable_on_fault,
 };
 
-constexpr size_t MAX_CDC_DEVICES = 4;
-std::array<CdcEtherDevice, MAX_CDC_DEVICES> cdc_devices = {};
-size_t cdc_count = 0;
-
-auto virt_to_phys(void* v) -> uint64_t {
-    auto addr = reinterpret_cast<uint64_t>(v);
-    if (addr >= 0xffffffff80000000ULL) {
-        uint64_t const PHYS = ker::mod::mm::virt::translate(ker::mod::mm::virt::get_kernel_pagemap(), addr);
-        if (PHYS == ker::mod::mm::virt::PADDR_INVALID) {
-            log::error("virt_to_phys failed for kernel address 0x%lx", addr);
-            hcf();
-        }
-        return PHYS;
+void release_cdc_io(CdcEtherDevice& cdc) {
+    if (!cdc_io_release(cdc)) {
+        log::error("unbalanced CDC I/O release");
     }
-    return reinterpret_cast<uint64_t>(ker::mod::mm::addr::get_phys_pointer(addr));
 }
 
-// NetDevice operations for CDC Ethernet
-int cdc_open(ker::net::NetDevice* netdev) {
+void wake_cdc_rx(size_t index) {
+    cdc_rx_pending.at(index).store(true, std::memory_order_release);
+    if (cdc_rx_tasks.at(index) != nullptr) {
+        mod::sched::wake_task_from_event(cdc_rx_tasks.at(index));
+    }
+}
+
+auto cdc_index(const CdcEtherDevice& cdc) -> size_t { return static_cast<size_t>(&cdc - cdc_devices.data()); }
+
+int cdc_open(net::NetDevice* netdev) {
+    auto* cdc = netdev != nullptr ? static_cast<CdcEtherDevice*>(netdev->private_data) : nullptr;
+    if (cdc == nullptr || cdc->state.load(std::memory_order_acquire) != CdcEtherState::LIVE) {
+        return -ENODEV;
+    }
     netdev->state = 1;
+    wake_cdc_rx(cdc_index(*cdc));
     return 0;
 }
 
-void cdc_close(ker::net::NetDevice* netdev) { netdev->state = 0; }
+void cdc_close(net::NetDevice* netdev) {
+    if (netdev != nullptr) {
+        netdev->state = 0;
+    }
+}
 
-int cdc_start_xmit(ker::net::NetDevice* netdev, ker::net::PacketBuffer* pkt) {
-    auto* cdc = static_cast<CdcEtherDevice*>(netdev->private_data);
-    if (cdc == nullptr || !cdc->active || pkt == nullptr) {
-        if (pkt != nullptr) {
-            ker::net::pkt_free(pkt);
-        }
-        return -1;
+int cdc_start_xmit(net::NetDevice* netdev, net::PacketBuffer* pkt) {
+    if (pkt == nullptr) {
+        return -EINVAL;
+    }
+    auto* cdc = netdev != nullptr ? static_cast<CdcEtherDevice*>(netdev->private_data) : nullptr;
+    net::NetDeviceRef netdev_ref = net::netdev_retain_registered(netdev);
+    if (cdc == nullptr || !netdev_ref || !cdc_io_try_acquire(*cdc)) {
+        net::pkt_free(pkt);
+        return -ENODEV;
     }
 
-    // Submit bulk OUT transfer
-    int const RET = xhci_bulk_transfer(cdc->hc, cdc->usb_dev->slot_id, &cdc->bulk_out, pkt->data, pkt->len);
-    if (RET == 0) {
+    XhciController* const HC = cdc->hc;
+    UsbDevice* const USB_DEV = cdc->usb_dev;
+    UsbEndpoint* const BULK_OUT = cdc->bulk_out;
+    size_t const LENGTH = pkt->len;
+    int result = -ENODEV;
+    if (HC != nullptr && USB_DEV != nullptr && BULK_OUT != nullptr) {
+        result = xhci_bulk_transfer(HC, USB_DEV->slot_id, BULK_OUT, pkt->data, LENGTH);
+    }
+    if (result == 0) {
         netdev->tx_packets++;
-        netdev->tx_bytes += pkt->len;
+        netdev->tx_bytes += LENGTH;
     } else {
         netdev->tx_dropped++;
     }
 
-    ker::net::pkt_free(pkt);
-    return RET;
+    release_cdc_io(*cdc);
+    net::pkt_free(pkt);
+    return result;
 }
 
-void cdc_set_mac(ker::net::NetDevice* /*unused*/, const uint8_t* /*unused*/) {
-    // MAC is read from device descriptor
-}
+void cdc_set_mac(net::NetDevice* /*unused*/, const uint8_t* /*unused*/) {}
 
-ker::net::NetDeviceOps const CDC_OPS = {
+const net::NetDeviceOps CDC_OPS = {
     .open = cdc_open,
     .close = cdc_close,
     .start_xmit = cdc_start_xmit,
@@ -101,272 +131,350 @@ ker::net::NetDeviceOps const CDC_OPS = {
     .set_queue_cpu = nullptr,
 };
 
-// Find bulk IN and OUT endpoints from config descriptor
-auto find_bulk_endpoints(uint8_t* config_data, size_t config_len, uint8_t data_iface, UsbEndpointDescriptor** ep_in,
-                         UsbEndpointDescriptor** ep_out) -> bool {
-    *ep_in = nullptr;
-    *ep_out = nullptr;
+struct BulkEndpointPair {
+    UsbEndpointDescriptor in{};
+    UsbEndpointDescriptor out{};
+    uint8_t alternate_setting{};
+    bool found_in{};
+    bool found_out{};
+};
 
-    bool in_target_iface = false;
+auto find_control_interface(const uint8_t* config_data, size_t config_len, uint8_t fallback) -> uint8_t {
     size_t offset = 0;
-
     while (offset + 2 <= config_len) {
-        uint8_t const LEN = config_data[offset];
+        uint8_t const LENGTH = config_data[offset];
         uint8_t const TYPE = config_data[offset + 1];
-        if (LEN == 0) {
+        if (LENGTH < 2 || offset + LENGTH > config_len) {
             break;
         }
-        if (offset + LEN > config_len) {
-            break;
+        if (TYPE == USB_DESC_INTERFACE && LENGTH >= sizeof(UsbInterfaceDescriptor)) {
+            auto const* interface = reinterpret_cast<const UsbInterfaceDescriptor*>(config_data + offset);
+            if (interface->b_interface_class == USB_CLASS_CDC &&
+                (interface->b_interface_sub_class == CDC_SUBCLASS_ECM || interface->b_interface_sub_class == CDC_SUBCLASS_NCM)) {
+                return interface->b_interface_number;
+            }
         }
+        offset += LENGTH;
+    }
+    return fallback;
+}
 
-        if (TYPE == USB_DESC_INTERFACE) {
-            auto* iface = reinterpret_cast<UsbInterfaceDescriptor*>(config_data + offset);
-            in_target_iface = (iface->b_interface_number == data_iface);
-        } else if (TYPE == USB_DESC_ENDPOINT && in_target_iface) {
-            auto* ep = reinterpret_cast<UsbEndpointDescriptor*>(config_data + offset);
-            uint8_t const EP_TYPE = ep->bm_attributes & USB_EP_TYPE_MASK;
-            if (EP_TYPE == USB_EP_TYPE_BULK) {
-                if ((ep->b_endpoint_address & USB_EP_DIR_IN) != 0) {
-                    *ep_in = ep;
+auto find_data_interface(const uint8_t* config_data, size_t config_len, uint8_t control_iface) -> uint8_t {
+    size_t offset = 0;
+    while (offset + 2 <= config_len) {
+        uint8_t const LENGTH = config_data[offset];
+        uint8_t const TYPE = config_data[offset + 1];
+        if (LENGTH < 2 || offset + LENGTH > config_len) {
+            break;
+        }
+        if (TYPE == CDC_CS_INTERFACE && LENGTH >= 5 && config_data[offset + 2] == CDC_UNION_TYPE &&
+            config_data[offset + 3] == control_iface) {
+            return config_data[offset + 4];
+        }
+        offset += LENGTH;
+    }
+    return static_cast<uint8_t>(control_iface + 1U);
+}
+
+auto find_bulk_endpoints(const uint8_t* config_data, size_t config_len, uint8_t data_iface) -> BulkEndpointPair {
+    BulkEndpointPair pair{};
+    bool target_interface = false;
+    uint8_t alternate_setting = 0;
+    size_t offset = 0;
+    while (offset + 2 <= config_len) {
+        uint8_t const LENGTH = config_data[offset];
+        uint8_t const TYPE = config_data[offset + 1];
+        if (LENGTH < 2 || offset + LENGTH > config_len) {
+            break;
+        }
+        if (TYPE == USB_DESC_INTERFACE && LENGTH >= sizeof(UsbInterfaceDescriptor)) {
+            if (pair.found_in && pair.found_out) {
+                return pair;
+            }
+            auto const* interface = reinterpret_cast<const UsbInterfaceDescriptor*>(config_data + offset);
+            target_interface = interface->b_interface_number == data_iface;
+            alternate_setting = interface->b_alternate_setting;
+            if (target_interface) {
+                pair = {.alternate_setting = alternate_setting};
+            }
+        } else if (TYPE == USB_DESC_ENDPOINT && target_interface && LENGTH >= sizeof(UsbEndpointDescriptor)) {
+            auto const* endpoint = reinterpret_cast<const UsbEndpointDescriptor*>(config_data + offset);
+            if ((endpoint->bm_attributes & USB_EP_TYPE_MASK) == USB_EP_TYPE_BULK) {
+                if ((endpoint->b_endpoint_address & USB_EP_DIR_IN) != 0) {
+                    pair.in = *endpoint;
+                    pair.found_in = true;
                 } else {
-                    *ep_out = ep;
+                    pair.out = *endpoint;
+                    pair.found_out = true;
                 }
+                pair.alternate_setting = alternate_setting;
             }
         }
-
-        offset += LEN;
+        offset += LENGTH;
     }
-
-    return (*ep_in != nullptr) && (*ep_out != nullptr);
+    return pair;
 }
 
-// Find CDC Ethernet functional descriptor to get MAC address
-[[maybe_unused]]
-auto find_cdc_ether_desc(const uint8_t* config_data, size_t config_len, uint8_t* mac_string_idx) -> bool {
-    size_t offset = 0;
-    while (offset + 2 <= config_len) {
-        uint8_t const LEN = config_data[offset];
-        uint8_t const TYPE = config_data[offset + 1];
-        if (LEN == 0) {
-            break;
-        }
-        if (offset + LEN > config_len) {
-            break;
-        }
-
-        if (TYPE == CDC_CS_INTERFACE && LEN >= 4) {
-            uint8_t const SUBTYPE = config_data[offset + 2];
-            if (SUBTYPE == CDC_ETHERNET_TYPE && LEN >= 6) {
-                // iMACAddress is at offset+3
-                *mac_string_idx = config_data[offset + 3];
-                return true;
-            }
-        }
-
-        offset += LEN;
+auto cdc_probe(UsbDevice* dev, UsbInterfaceDescriptor* interface) -> bool {
+    if (dev == nullptr || interface == nullptr) {
+        return false;
     }
-    return false;
-}
-
-// Find the data interface number from CDC Union descriptor
-uint8_t find_data_interface(const uint8_t* config_data, size_t config_len, uint8_t control_iface) {
-    size_t offset = 0;
-    while (offset + 2 <= config_len) {
-        uint8_t const LEN = config_data[offset];
-        uint8_t const TYPE = config_data[offset + 1];
-        if (LEN == 0) {
-            break;
-        }
-        if (offset + LEN > config_len) {
-            break;
-        }
-
-        if (TYPE == CDC_CS_INTERFACE && LEN >= 5) {
-            uint8_t const SUBTYPE = config_data[offset + 2];
-            if (SUBTYPE == CDC_UNION_TYPE) {
-                uint8_t const MASTER = config_data[offset + 3];
-                uint8_t const SLAVE = config_data[offset + 4];
-                if (MASTER == control_iface) {
-                    return SLAVE;
-                }
-            }
-        }
-
-        offset += LEN;
-    }
-    // Fallback: data interface is typically control + 1
-    return control_iface + 1;
-}
-
-// Set up xHCI transfer ring for a bulk endpoint
-void setup_bulk_ep(XhciController* hc, UsbDevice* dev, UsbEndpoint* ep, UsbEndpointDescriptor* ep_desc) {
-    ep->address = ep_desc->b_endpoint_address;
-    ep->type = USB_EP_TYPE_BULK;
-    ep->max_packet = ep_desc->w_max_packet_size;
-    ep->interval = ep_desc->b_interval;
-
-    // Allocate transfer ring
-    size_t const RING_BYTES = XFER_RING_SIZE * sizeof(Trb);
-    auto* ring_virt = ker::mod::mm::phys::page_alloc(ker::mod::mm::PhysicalPageOwner::DEVICE_USB, RING_BYTES, "usb_cdc_ring");
-    if (ring_virt == nullptr) {
-        return;
-    }
-    std::memset(ring_virt, 0, RING_BYTES);
-
-    ep->ring = static_cast<Trb*>(ring_virt);
-    ep->ring_phys = virt_to_phys(ring_virt);
-    ep->ring_enqueue = 0;
-    ep->ring_cycle = true;
-
-    // Configure endpoint in xHCI input context
-    uint8_t const DCI = ((ep->address & 0x80) != 0) ? ((2 * (ep->address & 0x0F)) + 1) : (2 * (ep->address & 0x0F));
-
-    auto* ictx = dev->input_ctx;
-    *ictx = InputContext{};
-    ictx->add_flags = (1 << 0) | (1U << DCI);  // Slot + this EP
-    ictx->drop_flags = 0;
-
-    // Copy current slot context
-    ictx->slot = dev->dev_ctx->slot;
-    // Update context entries to include this DCI
-    uint32_t const CTX_ENTRIES = (ictx->slot.data[0] >> 27) & 0x1F;
-    if (DCI > CTX_ENTRIES) {
-        ictx->slot.data[0] &= ~(0x1FU << 27);
-        ictx->slot.data[0] |= (static_cast<uint32_t>(DCI) << 27);
-    }
-
-    // Set up endpoint context
-    auto* ep_ctx = &ictx->ep[DCI - 1];
-    // EP Type: Bulk OUT = 2, Bulk IN = 6
-    uint32_t const EP_TYPE = ((ep->address & 0x80) != 0) ? 6U : 2U;
-    ep_ctx->data[1] = (EP_TYPE << 3) | (static_cast<uint32_t>(ep->max_packet) << 16);
-    ep_ctx->data[2] = static_cast<uint32_t>(ep->ring_phys) | 1;  // DCS=1
-    ep_ctx->data[3] = static_cast<uint32_t>(ep->ring_phys >> 32);
-    ep_ctx->data[4] = ep->max_packet;  // Average TRB length
-
-    configure_endpoint(hc, dev->slot_id, dev->input_ctx_phys);
-}
-
-// CDC Ethernet class driver probe
-bool cdc_probe(UsbDevice* dev, UsbInterfaceDescriptor* iface) {
-    // Match CDC Communications class with ECM/NCM subclass
-    if (iface->b_interface_class == USB_CLASS_CDC &&
-        (iface->b_interface_sub_class == CDC_SUBCLASS_ECM || iface->b_interface_sub_class == CDC_SUBCLASS_NCM)) {
+    if (interface->b_interface_class == USB_CLASS_CDC &&
+        (interface->b_interface_sub_class == CDC_SUBCLASS_ECM || interface->b_interface_sub_class == CDC_SUBCLASS_NCM)) {
         return true;
     }
-    // Also match CDC Data class (some devices present data interface first)
-    // Match QEMU usb-net which uses vendor=0x0525 product=0xa4a2
-    if (dev->vendor_id == 0x0525 && dev->product_id == 0xa4a2) {
-        return true;
-    }
-    // RTL8153: vendor=0x0BDA product=0x8153
-    if (dev->vendor_id == 0x0BDA && dev->product_id == 0x8153) {
-        return true;
-    }
-    return false;
+    return dev->vendor_id == 0x0BDA && dev->product_id == 0x8153;
 }
 
-// CDC Ethernet class driver attach
-int cdc_attach(UsbDevice* dev, UsbInterfaceDescriptor* iface, uint8_t* config_data, size_t config_len) {
-    if (cdc_count >= MAX_CDC_DEVICES) {
-        return -1;
+auto reserve_cdc_slot() -> CdcEtherDevice* {
+    for (size_t index = 0; index < cdc_devices.size(); ++index) {
+        if (cdc_rx_tasks.at(index) == nullptr) {
+            continue;
+        }
+        auto& cdc = cdc_devices.at(index);
+        CdcEtherState expected = CdcEtherState::FREE;
+        if (!cdc.state.compare_exchange_strong(expected, CdcEtherState::PREPARING, std::memory_order_acq_rel, std::memory_order_acquire)) {
+            continue;
+        }
+        cdc.netdev.~NetDevice();
+        new (&cdc.netdev) net::NetDevice{};
+        cdc.usb_dev = nullptr;
+        cdc.hc = nullptr;
+        cdc.bulk_in = nullptr;
+        cdc.bulk_out = nullptr;
+        cdc.retire_token = {};
+        cdc.io_readers.store(0, std::memory_order_relaxed);
+        cdc.control_iface = 0;
+        cdc.data_iface = 0;
+        cdc.data_alt = 0;
+        cdc.quiesce_proven = false;
+        return &cdc;
+    }
+    return nullptr;
+}
+
+auto cdc_attach(UsbDevice* dev, UsbInterfaceDescriptor* interface, uint8_t* config_data, size_t config_len) -> int {
+    if (dev == nullptr || dev->controller == nullptr || interface == nullptr || config_data == nullptr) {
+        return -EINVAL;
+    }
+    CdcEtherDevice* const CDC = reserve_cdc_slot();
+    if (CDC == nullptr) {
+        return -ENOSPC;
     }
 
-    // Find controller - use the first registered xHCI controller.
-    auto* hc = xhci_default_controller();
-    if (hc == nullptr) {
-        return -1;
+    CDC->usb_dev = dev;
+    CDC->hc = dev->controller;
+    CDC->control_iface = find_control_interface(config_data, config_len, interface->b_interface_number);
+    CDC->data_iface = find_data_interface(config_data, config_len, CDC->control_iface);
+    BulkEndpointPair const ENDPOINTS = find_bulk_endpoints(config_data, config_len, CDC->data_iface);
+    if (!ENDPOINTS.found_in || !ENDPOINTS.found_out) {
+        CDC->state.store(CdcEtherState::FREE, std::memory_order_release);
+        return -ENODEV;
     }
 
-    auto* cdc = new (&cdc_devices.at(cdc_count)) CdcEtherDevice{};
-    cdc->usb_dev = dev;
-    cdc->hc = hc;
-
-    // Find data interface
-    uint8_t const DATA_IFACE = find_data_interface(config_data, config_len, iface->b_interface_number);
-    cdc->data_iface = DATA_IFACE;
-
-    // Find bulk endpoints on the data interface
-    UsbEndpointDescriptor* ep_in = nullptr;
-    UsbEndpointDescriptor* ep_out = nullptr;
-    if (!find_bulk_endpoints(config_data, config_len, DATA_IFACE, &ep_in, &ep_out)) {
-        log::warn("no bulk endpoints found");
-        return -1;
+    int const RESULT = xhci_configure_bulk_endpoints(dev, ENDPOINTS.in, ENDPOINTS.out, &CDC->bulk_in, &CDC->bulk_out);
+    if (RESULT != 0) {
+        CDC->state.store(CdcEtherState::FREE, std::memory_order_release);
+        return RESULT;
     }
+    CDC->data_alt = ENDPOINTS.alternate_setting;
 
-    log::debug("bulk_in=0x%02x bulk_out=0x%02x", ep_in->b_endpoint_address, ep_out->b_endpoint_address);
-
-    // Set up bulk endpoints
-    setup_bulk_ep(hc, dev, &cdc->bulk_in, ep_in);
-    setup_bulk_ep(hc, dev, &cdc->bulk_out, ep_out);
-
-    // Generate a MAC address (use device VID/PID + index for uniqueness)
-    cdc->netdev.mac.at(0) = 0x02;  // locally administered
-    cdc->netdev.mac.at(1) = static_cast<uint8_t>(dev->vendor_id >> 8);
-    cdc->netdev.mac.at(2) = static_cast<uint8_t>(dev->vendor_id);
-    cdc->netdev.mac.at(3) = static_cast<uint8_t>(dev->product_id >> 8);
-    cdc->netdev.mac.at(4) = static_cast<uint8_t>(dev->product_id);
-    cdc->netdev.mac.at(5) = static_cast<uint8_t>(cdc_count);
-
-    // Register as network device
-    cdc->netdev.ops = &CDC_OPS;
-    cdc->netdev.mtu = 1500;
-    cdc->netdev.state = 1;
-    cdc->netdev.private_data = cdc;
-    cdc->netdev.name.at(0) = '\0';  // Auto-assign
-    cdc->netdev.remotable = &S_REMOTABLE_OPS;
-    cdc->active = true;
-
-    ker::net::netdev_register(&cdc->netdev);
-
-    log::info("%s MAC=%02x:%02x:%02x:%02x:%02x:%02x ready", cdc->netdev.name.data(), cdc->netdev.mac.at(0), cdc->netdev.mac.at(1),
-              cdc->netdev.mac.at(2), cdc->netdev.mac.at(3), cdc->netdev.mac.at(4), cdc->netdev.mac.at(5));
-
-    cdc_count++;
+    CDC->netdev.mac.at(0) = 0x02;
+    CDC->netdev.mac.at(1) = static_cast<uint8_t>(dev->vendor_id >> 8U);
+    CDC->netdev.mac.at(2) = static_cast<uint8_t>(dev->vendor_id);
+    CDC->netdev.mac.at(3) = static_cast<uint8_t>(dev->product_id >> 8U);
+    CDC->netdev.mac.at(4) = static_cast<uint8_t>(dev->product_id);
+    CDC->netdev.mac.at(5) = static_cast<uint8_t>(cdc_index(*CDC));
+    CDC->netdev.ops = &CDC_OPS;
+    CDC->netdev.mtu = 1500;
+    CDC->netdev.private_data = CDC;
+    CDC->netdev.remotable = &S_REMOTABLE_OPS;
+    dev->driver_data = CDC;
+    CDC->state.store(CdcEtherState::PREPARED, std::memory_order_release);
     return 0;
 }
 
-void cdc_detach(UsbDevice* dev) {
-    if (dev == nullptr) {
-        return;
+auto cdc_publish(UsbDevice* dev) -> int {
+    auto* cdc = dev != nullptr ? static_cast<CdcEtherDevice*>(dev->driver_data) : nullptr;
+    if (cdc == nullptr || cdc->state.load(std::memory_order_acquire) != CdcEtherState::PREPARED) {
+        return -EINVAL;
     }
 
-    for (size_t i = 0; i < cdc_count; i++) {
-        auto& cdc = cdc_devices.at(i);
-        if (!cdc.active || cdc.usb_dev != dev) {
+    if (cdc->data_alt != 0) {
+        UsbSetupPacket set_interface = {
+            .bm_request_type = 0x01,
+            .b_request = USB_REQ_SET_INTERFACE,
+            .w_value = cdc->data_alt,
+            .w_index = cdc->data_iface,
+            .w_length = 0,
+        };
+        int const RESULT = xhci_control_transfer(cdc->hc, dev->slot_id, &set_interface, nullptr, 0, false);
+        if (RESULT != 0) {
+            return RESULT;
+        }
+    }
+
+    UsbSetupPacket packet_filter = {
+        .bm_request_type = 0x21,
+        .b_request = CDC_REQ_SET_ETHERNET_PACKET_FILTER,
+        .w_value = CDC_PACKET_FILTER_ALL,
+        .w_index = cdc->control_iface,
+        .w_length = 0,
+    };
+    int const FILTER_RESULT = xhci_control_transfer(cdc->hc, dev->slot_id, &packet_filter, nullptr, 0, false);
+    bool const QEMU_USB_NET = dev->vendor_id == QEMU_USB_NET_VENDOR && dev->product_id == QEMU_USB_NET_PRODUCT;
+    if (FILTER_RESULT != 0 && !QEMU_USB_NET) {
+        return FILTER_RESULT;
+    }
+    if (FILTER_RESULT != 0) {
+        log::warn("QEMU usb-net rejected SET_ETHERNET_PACKET_FILTER; continuing with its default filter");
+    }
+
+    if (net::netdev_register(&cdc->netdev) != 0) {
+        return -ENOSPC;
+    }
+    cdc->netdev.state = 1;
+    cdc->state.store(CdcEtherState::LIVE, std::memory_order_release);
+    wake_cdc_rx(cdc_index(*cdc));
+    log::info("%s MAC=%02x:%02x:%02x:%02x:%02x:%02x ready", cdc->netdev.name.data(), cdc->netdev.mac.at(0), cdc->netdev.mac.at(1),
+              cdc->netdev.mac.at(2), cdc->netdev.mac.at(3), cdc->netdev.mac.at(4), cdc->netdev.mac.at(5));
+    return 0;
+}
+
+auto cdc_quiesce(UsbDevice* dev) -> bool {
+    auto* cdc = dev != nullptr ? static_cast<CdcEtherDevice*>(dev->driver_data) : nullptr;
+    if (cdc == nullptr) {
+        return true;
+    }
+    CdcEtherState const PREVIOUS = cdc->state.exchange(CdcEtherState::RETIRING, std::memory_order_acq_rel);
+    if (PREVIOUS == CdcEtherState::FREE || PREVIOUS == CdcEtherState::RETIRING) {
+        return PREVIOUS == CdcEtherState::FREE || cdc->quiesce_proven;
+    }
+    if (PREVIOUS != CdcEtherState::LIVE) {
+        cdc->quiesce_proven = true;
+        return true;
+    }
+
+    cdc->netdev.state = 0;
+    if (cdc->netdev.wki_transport) {
+        log::error("%s is an active WKI transport; quarantining its USB slot", cdc->netdev.name.data());
+        return false;
+    }
+    uint32_t const IFINDEX = cdc->netdev.ifindex;
+    if (net::netdev_unregister_begin(&cdc->netdev, cdc->retire_token) != 0) {
+        log::error("%s failed to begin netdevice retirement", cdc->netdev.name.data());
+        return false;
+    }
+    net::wki::wki_remotable_withdraw_net(IFINDEX);
+    net::wki::wki_dev_server_detach_all_for_netdev(&cdc->netdev);
+    cdc->netdev.wki_rx_forward.store(nullptr, std::memory_order_release);
+    cdc->netdev.remotable = nullptr;
+    static_cast<void>(net::route_del_for_dev(&cdc->netdev));
+    static_cast<void>(net::netif_del_for_dev(&cdc->netdev));
+    net::proto::arp_forget_device(cdc->retire_token.identity);
+    cdc->quiesce_proven = true;
+    return true;
+}
+
+void cdc_detach(UsbDevice* dev) {
+    auto* cdc = dev != nullptr ? static_cast<CdcEtherDevice*>(dev->driver_data) : nullptr;
+    if (cdc == nullptr) {
+        return;
+    }
+    while (cdc->io_readers.load(std::memory_order_acquire) != 0) {
+        mod::sched::kern_yield();
+    }
+    if (cdc->retire_token.valid()) {
+        net::netdev_unregister_wait(cdc->retire_token);
+    }
+
+    log::info("%s detached", cdc->netdev.name.data());
+    dev->driver_data = nullptr;
+    cdc->usb_dev = nullptr;
+    cdc->hc = nullptr;
+    cdc->bulk_in = nullptr;
+    cdc->bulk_out = nullptr;
+    cdc->retire_token = {};
+    cdc->quiesce_proven = false;
+    cdc->state.store(CdcEtherState::FREE, std::memory_order_release);
+}
+
+template <size_t Index>
+[[noreturn]] void cdc_rx_worker() {
+    auto& cdc = cdc_devices.at(Index);
+    for (;;) {
+        if (cdc.state.load(std::memory_order_acquire) != CdcEtherState::LIVE) {
+            if (!cdc_rx_pending.at(Index).exchange(false, std::memory_order_acq_rel)) {
+                mod::sched::kern_block();
+            }
+            continue;
+        }
+        if (!cdc_io_try_acquire(cdc)) {
+            mod::sched::kern_yield();
             continue;
         }
 
-        cdc.active = false;
-        cdc.netdev.state = 0;
-        cdc.netdev.remotable = nullptr;
-        cdc.netdev.wki_rx_forward.store(nullptr, std::memory_order_release);
-        ker::net::netdev_unregister(&cdc.netdev);
-
-        // TODO: Add xHCI stop/drop-endpoint or disable-slot support before freeing
-        // bulk rings; the controller may still have endpoint contexts pointing here.
-        // TODO: Add netdev lifetime/refcount synchronization before recycling this
-        // static CDC slot after unregister.
-        if (dev->driver_data == &cdc) {
-            dev->driver_data = nullptr;
+        net::NetDeviceRef netdev_ref = net::netdev_retain_registered(&cdc.netdev);
+        net::PacketBuffer* packet = net::pkt_alloc_rx();
+        int result = -ENODEV;
+        size_t actual = 0;
+        if (netdev_ref && packet != nullptr && cdc.hc != nullptr && cdc.usb_dev != nullptr && cdc.bulk_in != nullptr) {
+            size_t const CAPACITY = std::min(packet->tailroom(), static_cast<size_t>(cdc.netdev.mtu) + ETHERNET_FRAME_OVERHEAD);
+            result = xhci_bulk_transfer(cdc.hc, cdc.usb_dev->slot_id, cdc.bulk_in, packet->data, CAPACITY, &actual, true);
         }
-        cdc.usb_dev = nullptr;
-        cdc.hc = nullptr;
-        return;
+
+        bool const PUBLISH = result == 0 && actual != 0 && cdc.state.load(std::memory_order_acquire) == CdcEtherState::LIVE && netdev_ref;
+        if (PUBLISH) {
+            packet->len = actual;
+            if (net::pkt_adopt_netdev_ref(packet, std::move(netdev_ref))) {
+                net::netdev_rx(&cdc.netdev, packet);
+                packet = nullptr;
+            }
+        }
+        if (packet != nullptr) {
+            net::pkt_free(packet);
+        }
+        release_cdc_io(cdc);
+        if (result != 0 && cdc.state.load(std::memory_order_acquire) == CdcEtherState::LIVE) {
+            mod::sched::kern_yield();
+        }
     }
 }
+
+using WorkerEntry = void (*)();
+constexpr std::array<WorkerEntry, MAX_CDC_DEVICES> CDC_RX_WORKERS = {
+    cdc_rx_worker<0>,
+    cdc_rx_worker<1>,
+    cdc_rx_worker<2>,
+    cdc_rx_worker<3>,
+};
 
 UsbClassDriver cdc_driver = {
     .name = "cdc-ether",
     .probe = cdc_probe,
     .attach = cdc_attach,
+    .publish = cdc_publish,
+    .quiesce = cdc_quiesce,
     .detach = cdc_detach,
     .next = nullptr,
 };
 
 }  // namespace
 
-void cdc_ether_init() { usb_register_class_driver(&cdc_driver); }
+void cdc_ether_init() {
+    size_t workers = 0;
+    for (size_t index = 0; index < cdc_rx_tasks.size(); ++index) {
+        auto* task = mod::sched::task::Task::create_kernel_thread("cdc_rx", CDC_RX_WORKERS.at(index));
+        if (task == nullptr || !mod::sched::post_task_balanced(task)) {
+            log::error("failed to start CDC RX worker %zu", index);
+            continue;
+        }
+        cdc_rx_tasks.at(index) = task;
+        ++workers;
+    }
+    if (workers != 0) {
+        usb_register_class_driver(&cdc_driver);
+    }
+}
 
 }  // namespace ker::dev::usb

@@ -11,8 +11,10 @@
 #include <platform/ktime/ktime.hpp>
 #include <platform/mm/virt.hpp>
 #include <platform/sched/epoch.hpp>
+#include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
 #include <platform/smt/smt.hpp>
+#include <platform/sys/spinlock.hpp>
 
 #ifdef WOS_KCOV_PANIC_TRACE
 #include <sanitizer/kcov.hpp>
@@ -26,7 +28,6 @@
 #include "platform/asm/msr.hpp"
 #include "platform/mm/paging.hpp"
 #include "platform/perf/perf_events.hpp"
-#include "platform/sched/scheduler.hpp"
 #include "platform/sys/signal.hpp"
 #include "platform/sys/usercopy.hpp"
 #include "util/hcf.hpp"
@@ -46,20 +47,71 @@ constexpr uint16_t IRQ_KIND_CONTEXT = 1;
 constexpr uint16_t IRQ_KIND_LEGACY = 2;
 constexpr uint16_t IRQ_KIND_UNHANDLED = 3;
 
-std::array<interruptHandler_t, INTERRUPT_VECTOR_COUNT> interrupt_handlers{};
+std::array<std::atomic<interruptHandler_t>, INTERRUPT_VECTOR_COUNT> interrupt_handlers{};
+static_assert(std::atomic<interruptHandler_t>::is_always_lock_free, "legacy IRQ dispatch must stay lock-free");
 std::atomic<bool> panic_lock{false};
 std::atomic<int64_t> panic_lock_owner{-1};
 
-// Context-based IRQ handlers (parallel array)
+constexpr uint32_t IRQ_CONTEXT_RETIRING = uint32_t{1} << 31U;
+constexpr uint32_t IRQ_CONTEXT_READER_MASK = IRQ_CONTEXT_RETIRING - 1U;
+
+// Context fields are initialized before lifecycle is release-published.  Once
+// retirement starts they remain immutable until every admitted IRQ handler has
+// released its reader count.
 struct IrqContext {
     irq_handler_fn handler = nullptr;
     void* data = nullptr;
     const char* name = nullptr;
+    std::atomic<uint32_t> lifecycle{IRQ_CONTEXT_RETIRING};
 };
 std::array<IrqContext, INTERRUPT_VECTOR_COUNT> irq_contexts{};
+static_assert(std::atomic<uint32_t>::is_always_lock_free, "IRQ lifecycle admission must stay lock-free");
+
+enum class VectorState : uint8_t {
+    FREE,
+    RESERVED,
+    LEGACY,
+    CONTEXT,
+    RETIRING,
+};
+
+std::array<VectorState, INTERRUPT_VECTOR_COUNT> vector_states{};
+sys::Spinlock irq_registry_lock;
 
 // Next vector to try for allocation (48+ to avoid legacy ISA range)
-uint8_t next_alloc_vector = DYNAMIC_VECTOR_BEGIN;
+uint16_t next_alloc_vector = DYNAMIC_VECTOR_BEGIN;
+
+struct IrqDispatchSnapshot {
+    irq_handler_fn handler = nullptr;
+    void* data = nullptr;
+};
+
+auto irq_context_try_admit(IrqContext& context, IrqDispatchSnapshot& snapshot) -> bool {
+    uint32_t state = context.lifecycle.load(std::memory_order_acquire);
+    for (;;) {
+        if ((state & IRQ_CONTEXT_RETIRING) != 0U || (state & IRQ_CONTEXT_READER_MASK) == IRQ_CONTEXT_READER_MASK) {
+            return false;
+        }
+        if (context.lifecycle.compare_exchange_weak(state, state + 1U, std::memory_order_acq_rel, std::memory_order_acquire)) {
+            snapshot.handler = context.handler;
+            snapshot.data = context.data;
+            if (snapshot.handler != nullptr) {
+                return true;
+            }
+            context.lifecycle.fetch_sub(1U, std::memory_order_release);
+            snapshot = {};
+            return false;
+        }
+    }
+}
+
+void irq_context_release(IrqContext& context) { context.lifecycle.fetch_sub(1U, std::memory_order_release); }
+
+void wait_for_irq_context_readers(IrqContext& context) {
+    while ((context.lifecycle.load(std::memory_order_acquire) & IRQ_CONTEXT_READER_MASK) != 0U) {
+        sched::kern_yield();
+    }
+}
 
 [[nodiscard]] constexpr auto is_kernel_pointer_range(uintptr_t addr) -> bool {
     return (addr >= HHDM_BEGIN && addr < HHDM_END) || (addr >= KERNEL_STATIC_BEGIN && addr < KERNEL_STATIC_END);
@@ -671,8 +723,10 @@ extern "C" void iterrupt_handler(cpu::GPRegs gpr, InterruptFrame frame) {
     uint64_t const IRQ_ACCOUNT_STARTED_US = time::get_us();
     uint64_t const IRQ_STARTED_US = TRACE_IRQ ? IRQ_ACCOUNT_STARTED_US : 0;
 
-    if (irq_contexts.at(VECTOR).handler != nullptr) {
-        irq_contexts.at(VECTOR).handler(static_cast<uint8_t>(frame.int_num), irq_contexts.at(VECTOR).data);
+    IrqDispatchSnapshot context_snapshot{};
+    if (irq_context_try_admit(irq_contexts.at(VECTOR), context_snapshot)) {
+        context_snapshot.handler(static_cast<uint8_t>(frame.int_num), context_snapshot.data);
+        irq_context_release(irq_contexts.at(VECTOR));
         ker::mod::apic::eoi();
         uint64_t const IRQ_ACCOUNT_FINISHED_US = time::get_us();
         sched::account_irq_time_us(IRQ_ACCOUNT_FINISHED_US >= IRQ_ACCOUNT_STARTED_US ? IRQ_ACCOUNT_FINISHED_US - IRQ_ACCOUNT_STARTED_US
@@ -683,9 +737,10 @@ extern "C" void iterrupt_handler(cpu::GPRegs gpr, InterruptFrame frame) {
 
     uint16_t irq_kind = IRQ_KIND_LEGACY;
     int32_t irq_status = 0;
-    if (interrupt_handlers.at(VECTOR) != nullptr) {
-        interrupt_handlers.at(VECTOR)(gpr, frame);
-    } else if (is_irq(frame.int_num)) {
+    auto const LEGACY_HANDLER = interrupt_handlers.at(VECTOR).load(std::memory_order_acquire);
+    if (LEGACY_HANDLER != nullptr) {
+        LEGACY_HANDLER(gpr, frame);
+    } else if (is_irq(frame.int_num) || frame.int_num >= DYNAMIC_VECTOR_BEGIN) {
         // Unexpected hardware IRQ with no handler - log and ignore.
         journal::warn("UNHANDLED IRQ: vector=0x%x", static_cast<unsigned>(frame.int_num));
         irq_kind = IRQ_KIND_UNHANDLED;
@@ -709,38 +764,105 @@ void set_interrupt_handler(uint8_t int_num, interruptHandler_t handler) {
         journal::error("setInterruptHandler: vector 32 is reserved for timer");
         return;
     }
-    if (interrupt_handlers.at(int_num) != nullptr) {
+
+    if (handler == nullptr) {
+        journal::error("setInterruptHandler: vector %u has a null handler", static_cast<unsigned>(int_num));
+        return;
+    }
+
+    uint64_t const IRQF = irq_registry_lock.lock_irqsave();
+    auto& state = vector_states.at(int_num);
+    if ((state != VectorState::FREE && state != VectorState::RESERVED) ||
+        interrupt_handlers.at(int_num).load(std::memory_order_relaxed) != nullptr) {
+        irq_registry_lock.unlock_irqrestore(IRQF);
         journal::error("setInterruptHandler: vector %u already set", static_cast<unsigned>(int_num));
         return;
     }
-    interrupt_handlers.at(int_num) = handler;
+    interrupt_handlers.at(int_num).store(handler, std::memory_order_release);
+    state = VectorState::LEGACY;
+    irq_registry_lock.unlock_irqrestore(IRQF);
 }
 
-void remove_interrupt_handler(uint8_t int_num) { interrupt_handlers.at(int_num) = nullptr; }
+void remove_interrupt_handler(uint8_t int_num) {
+    uint64_t const IRQF = irq_registry_lock.lock_irqsave();
+    if (vector_states.at(int_num) == VectorState::LEGACY) {
+        interrupt_handlers.at(int_num).store(nullptr, std::memory_order_release);
+        vector_states.at(int_num) = VectorState::FREE;
+    }
+    irq_registry_lock.unlock_irqrestore(IRQF);
+}
 
-auto is_interrupt_handler_set(uint8_t int_num) -> bool { return interrupt_handlers.at(int_num) != nullptr; }
+auto is_interrupt_handler_set(uint8_t int_num) -> bool { return interrupt_handlers.at(int_num).load(std::memory_order_acquire) != nullptr; }
 
 auto request_irq(uint8_t vector, irq_handler_fn handler, void* data, const char* name) -> int {
     if (vector == TIMER_VECTOR) {
         journal::error("requestIrq: vector 32 is reserved for timer");
         return -1;
     }
-    if (interrupt_handlers.at(vector) != nullptr || irq_contexts.at(vector).handler != nullptr) {
-        journal::error("requestIrq: vector %d already in use (handler=%p context_handler=%p)", vector, interrupt_handlers.at(vector),
-                       irq_contexts.at(vector).handler);
+    if (handler == nullptr) {
+        journal::error("requestIrq: vector %d has a null handler", vector);
         return -1;
     }
-    journal::info("requestIrq: vector=%d name=%s", vector, name);
-    irq_contexts.at(vector).handler = handler;
-    irq_contexts.at(vector).data = data;
-    irq_contexts.at(vector).name = name;
+
+    uint64_t const IRQF = irq_registry_lock.lock_irqsave();
+    auto& state = vector_states.at(vector);
+    auto& context = irq_contexts.at(vector);
+    if ((state != VectorState::FREE && state != VectorState::RESERVED) ||
+        interrupt_handlers.at(vector).load(std::memory_order_relaxed) != nullptr) {
+        auto const LEGACY_HANDLER = interrupt_handlers.at(vector).load(std::memory_order_relaxed);
+        auto const CONTEXT_HANDLER = context.handler;
+        irq_registry_lock.unlock_irqrestore(IRQF);
+        journal::error("requestIrq: vector %d already in use (handler=%p context_handler=%p)", vector, LEGACY_HANDLER, CONTEXT_HANDLER);
+        return -1;
+    }
+
+    context.handler = handler;
+    context.data = data;
+    context.name = name;
+    context.lifecycle.store(0, std::memory_order_release);
+    state = VectorState::CONTEXT;
+    irq_registry_lock.unlock_irqrestore(IRQF);
+
+    journal::info("requestIrq: vector=%d name=%s", vector, name != nullptr ? name : "?");
     return 0;
 }
 
 void free_irq(uint8_t vector) {
-    irq_contexts.at(vector).handler = nullptr;
-    irq_contexts.at(vector).data = nullptr;
-    irq_contexts.at(vector).name = nullptr;
+    auto& context = irq_contexts.at(vector);
+
+    for (;;) {
+        uint64_t const IRQF = irq_registry_lock.lock_irqsave();
+        auto& state = vector_states.at(vector);
+        if (state == VectorState::FREE || state == VectorState::LEGACY) {
+            irq_registry_lock.unlock_irqrestore(IRQF);
+            return;
+        }
+        if (state == VectorState::RESERVED) {
+            state = VectorState::FREE;
+            irq_registry_lock.unlock_irqrestore(IRQF);
+            return;
+        }
+        if (state == VectorState::RETIRING) {
+            irq_registry_lock.unlock_irqrestore(IRQF);
+            sched::kern_yield();
+            continue;
+        }
+
+        state = VectorState::RETIRING;
+        context.lifecycle.fetch_or(IRQ_CONTEXT_RETIRING, std::memory_order_acq_rel);
+        irq_registry_lock.unlock_irqrestore(IRQF);
+        break;
+    }
+
+    wait_for_irq_context_readers(context);
+
+    uint64_t const IRQF = irq_registry_lock.lock_irqsave();
+    context.handler = nullptr;
+    context.data = nullptr;
+    context.name = nullptr;
+    context.lifecycle.store(IRQ_CONTEXT_RETIRING, std::memory_order_release);
+    vector_states.at(vector) = VectorState::FREE;
+    irq_registry_lock.unlock_irqrestore(IRQF);
 }
 
 auto allocate_vector() -> uint8_t {
@@ -750,19 +872,52 @@ auto allocate_vector() -> uint8_t {
     // (isr32 -> task_switch_handler). NEVER allocate it.
     // Vectors 33-47 are reserved for legacy ISA IRQs.
     // Vectors 48-255 are available for MSI/dynamic allocation.
-    for (size_t v = next_alloc_vector; v < interrupt_handlers.size(); v++) {
-        if (interrupt_handlers.at(v) == nullptr && irq_contexts.at(v).handler == nullptr) {
-            next_alloc_vector = static_cast<uint8_t>(v + 1);
-            return static_cast<uint8_t>(v);
+    constexpr uint16_t DYNAMIC_VECTOR_COUNT = INTERRUPT_VECTOR_COUNT - DYNAMIC_VECTOR_BEGIN;
+    uint64_t const IRQF = irq_registry_lock.lock_irqsave();
+    for (uint16_t offset = 0; offset < DYNAMIC_VECTOR_COUNT; ++offset) {
+        uint16_t const VECTOR = DYNAMIC_VECTOR_BEGIN + ((next_alloc_vector - DYNAMIC_VECTOR_BEGIN + offset) % DYNAMIC_VECTOR_COUNT);
+        if (vector_states.at(VECTOR) == VectorState::FREE) {
+            vector_states.at(VECTOR) = VectorState::RESERVED;
+            next_alloc_vector = VECTOR == INTERRUPT_VECTOR_COUNT - 1U ? DYNAMIC_VECTOR_BEGIN : VECTOR + 1U;
+            irq_registry_lock.unlock_irqrestore(IRQF);
+            return static_cast<uint8_t>(VECTOR);
         }
     }
-    // Wrap around and search from 48
-    for (uint16_t v = DYNAMIC_VECTOR_BEGIN; v < next_alloc_vector; v++) {
-        if (interrupt_handlers.at(v) == nullptr && irq_contexts.at(v).handler == nullptr) {
-            return static_cast<uint8_t>(v);
-        }
-    }
+    irq_registry_lock.unlock_irqrestore(IRQF);
     return 0;  // No free vector found
 }
+
+#ifdef WOS_SELFTEST
+auto irq_selftest_retirement_admission() -> bool {
+    IrqContext context{};
+    context.handler = +[](uint8_t, void*) {};
+    context.data = &context;
+    context.lifecycle.store(0, std::memory_order_release);
+
+    IrqDispatchSnapshot first{};
+    if (!irq_context_try_admit(context, first) || first.handler == nullptr || first.data != &context) {
+        return false;
+    }
+
+    context.lifecycle.fetch_or(IRQ_CONTEXT_RETIRING, std::memory_order_acq_rel);
+    IrqDispatchSnapshot late{};
+    bool const LATE_ADMITTED = irq_context_try_admit(context, late);
+    irq_context_release(context);
+    return !LATE_ADMITTED && context.lifecycle.load(std::memory_order_acquire) == IRQ_CONTEXT_RETIRING;
+}
+
+auto irq_selftest_vector_reservation() -> bool {
+    uint8_t const FIRST = allocate_vector();
+    uint8_t const SECOND = allocate_vector();
+    bool const DISTINCT = FIRST != 0 && SECOND != 0 && FIRST != SECOND;
+    if (FIRST != 0) {
+        free_irq(FIRST);
+    }
+    if (SECOND != 0) {
+        free_irq(SECOND);
+    }
+    return DISTINCT;
+}
+#endif
 
 }  // namespace ker::mod::gates

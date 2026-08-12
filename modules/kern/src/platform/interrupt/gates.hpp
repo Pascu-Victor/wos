@@ -51,7 +51,19 @@ bool is_interrupt_handler_set(uint8_t int_num);
 // Context-based IRQ handler (for device drivers with private_data)
 using irq_handler_fn = void (*)(uint8_t vector, void* private_data);
 auto request_irq(uint8_t vector, irq_handler_fn handler, void* data, const char* name) -> int;
+// The device must stop its interrupt source before calling free_irq().  This
+// task-context operation closes handler admission and waits for handlers that
+// already acquired private_data; it never waits while holding the IRQ registry
+// lock and must not be called by an IRQ handler.
 void free_irq(uint8_t vector);
-auto allocate_vector() -> uint8_t;  // find free vector >= 48
+// Reserve a free vector >= 48.  A successful request_irq() or
+// set_interrupt_handler() consumes the reservation; free_irq() releases an
+// unused context reservation.
+auto allocate_vector() -> uint8_t;
+
+#ifdef WOS_SELFTEST
+auto irq_selftest_retirement_admission() -> bool;
+auto irq_selftest_vector_reservation() -> bool;
+#endif
 
 }  // namespace ker::mod::gates

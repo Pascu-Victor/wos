@@ -11,6 +11,7 @@
 #include <net/proto/ipv4.hpp>
 #include <net/proto/ipv6.hpp>
 #include <platform/dbg/dbg.hpp>
+#include <platform/sched/scheduler.hpp>
 #include <platform/smt/smt.hpp>
 #include <string_view>
 
@@ -26,18 +27,70 @@ std::array<NetDevice*, MAX_NET_DEVICES> devices = {};
 size_t device_count = 0;
 uint32_t next_ifindex = 1;
 uint32_t next_eth_index = 0;
+uint64_t next_lifetime_generation = 1;
 mod::sys::Spinlock devices_lock;
+
+constexpr uint32_t NETDEV_LIFETIME_RETIRING = uint32_t{1} << 31U;
+constexpr uint32_t NETDEV_LIFETIME_READER_MASK = NETDEV_LIFETIME_RETIRING - 1U;
 
 constexpr uint32_t IFF_BROADCAST = 0x0002;
 constexpr uint32_t IFF_LOOPBACK = 0x0008;
 constexpr uint32_t IFF_MULTICAST = 0x1000;
 
 auto is_loopback_name(const std::array<char, NETDEV_NAME_LEN>& name) -> bool { return std::string_view(name.data()) == "lo"; }
+
+auto next_registration_generation_locked() -> uint64_t {
+    uint64_t const GENERATION = next_lifetime_generation++;
+    if (next_lifetime_generation == 0) {
+        next_lifetime_generation = 1;
+    }
+    return GENERATION;
+}
+
+auto registered_identity_locked(NetDevice* dev) -> NetDeviceIdentity {
+    if (dev == nullptr) {
+        return {};
+    }
+    for (size_t i = 0; i < device_count; ++i) {
+        if (devices.at(i) == dev) {
+            return {.device = dev, .generation = dev->lifetime_generation.load(std::memory_order_acquire)};
+        }
+    }
+    return {};
+}
 }  // namespace
+
+NetDeviceRef::~NetDeviceRef() { reset(); }
+
+NetDeviceRef::NetDeviceRef(NetDeviceRef&& other) noexcept : identity_(other.take_identity()) {}
+
+auto NetDeviceRef::operator=(NetDeviceRef&& other) noexcept -> NetDeviceRef& {
+    if (this != &other) {
+        reset();
+        identity_ = other.take_identity();
+    }
+    return *this;
+}
+
+auto NetDeviceRef::take_identity() -> NetDeviceIdentity {
+    NetDeviceIdentity const IDENTITY = identity_;
+    identity_ = {};
+    return IDENTITY;
+}
+
+void NetDeviceRef::reset() {
+    NetDeviceIdentity const IDENTITY = take_identity();
+    netdev_release_identity(IDENTITY);
+}
 
 auto netdev_register(NetDevice* dev) -> int {
     devices_lock.lock();
     if (dev == nullptr || device_count >= MAX_NET_DEVICES) {
+        devices_lock.unlock();
+        return -1;
+    }
+
+    if (registered_identity_locked(dev).valid() || dev->lifetime_readers.load(std::memory_order_acquire) != NETDEV_LIFETIME_RETIRING) {
         devices_lock.unlock();
         return -1;
     }
@@ -75,6 +128,9 @@ auto netdev_register(NetDevice* dev) -> int {
         }
     }
 
+    uint64_t const GENERATION = next_registration_generation_locked();
+    dev->lifetime_generation.store(GENERATION, std::memory_order_relaxed);
+    dev->lifetime_readers.store(0, std::memory_order_release);
     devices.at(device_count) = dev;
     device_count++;
     devices_lock.unlock();
@@ -88,6 +144,17 @@ auto netdev_register(NetDevice* dev) -> int {
 }
 
 auto netdev_unregister(NetDevice* dev) -> int {
+    NetDeviceRetireToken token{};
+    int const RESULT = netdev_unregister_begin(dev, token);
+    if (RESULT != 0) {
+        return RESULT;
+    }
+    netdev_unregister_wait(token);
+    return 0;
+}
+
+auto netdev_unregister_begin(NetDevice* dev, NetDeviceRetireToken& token) -> int {
+    token = {};
     if (dev == nullptr) {
         return -1;
     }
@@ -97,6 +164,14 @@ auto netdev_unregister(NetDevice* dev) -> int {
         if (devices.at(i) != dev) {
             continue;
         }
+
+        uint64_t const GENERATION = dev->lifetime_generation.load(std::memory_order_acquire);
+        uint32_t const PREVIOUS = dev->lifetime_readers.fetch_or(NETDEV_LIFETIME_RETIRING, std::memory_order_acq_rel);
+        if ((PREVIOUS & NETDEV_LIFETIME_RETIRING) != 0U || GENERATION == 0) {
+            devices_lock.unlock();
+            return -1;
+        }
+        token.identity = {.device = dev, .generation = GENERATION};
 
         for (size_t j = i + 1; j < device_count; j++) {
             devices.at(j - 1) = devices.at(j);
@@ -108,6 +183,75 @@ auto netdev_unregister(NetDevice* dev) -> int {
     }
     devices_lock.unlock();
     return -1;
+}
+
+void netdev_unregister_wait(const NetDeviceRetireToken& token) {
+    if (!token.valid()) {
+        return;
+    }
+
+    NetDevice* const DEV = token.identity.device;
+    if (DEV->lifetime_generation.load(std::memory_order_acquire) != token.identity.generation ||
+        (DEV->lifetime_readers.load(std::memory_order_acquire) & NETDEV_LIFETIME_RETIRING) == 0U) {
+        log::error("netdev_unregister_wait: stale generation");
+        return;
+    }
+
+    while ((DEV->lifetime_readers.load(std::memory_order_acquire) & NETDEV_LIFETIME_READER_MASK) != 0U) {
+        ker::mod::sched::kern_yield();
+    }
+}
+
+auto netdev_registered_identity(NetDevice* dev) -> NetDeviceIdentity {
+    devices_lock.lock();
+    NetDeviceIdentity const IDENTITY = registered_identity_locked(dev);
+    devices_lock.unlock();
+    return IDENTITY;
+}
+
+auto netdev_try_retain(NetDeviceIdentity identity) -> NetDeviceRef {
+    if (!identity.valid() || identity.device->lifetime_generation.load(std::memory_order_acquire) != identity.generation) {
+        return {};
+    }
+
+    auto& readers = identity.device->lifetime_readers;
+    uint32_t state = readers.load(std::memory_order_acquire);
+    for (;;) {
+        if ((state & NETDEV_LIFETIME_RETIRING) != 0U || (state & NETDEV_LIFETIME_READER_MASK) == NETDEV_LIFETIME_READER_MASK) {
+            return {};
+        }
+        if (readers.compare_exchange_weak(state, state + 1U, std::memory_order_acq_rel, std::memory_order_acquire)) {
+            if (identity.device->lifetime_generation.load(std::memory_order_acquire) == identity.generation) {
+                return NetDeviceRef(identity);
+            }
+            readers.fetch_sub(1U, std::memory_order_release);
+            return {};
+        }
+    }
+}
+
+auto netdev_retain_registered(NetDevice* dev) -> NetDeviceRef { return netdev_try_retain(netdev_registered_identity(dev)); }
+
+void netdev_release_identity(NetDeviceIdentity identity) {
+    if (!identity.valid()) {
+        return;
+    }
+    if (identity.device->lifetime_generation.load(std::memory_order_acquire) != identity.generation) {
+        log::error("netdev_release_identity: stale generation");
+        return;
+    }
+
+    auto& readers = identity.device->lifetime_readers;
+    uint32_t state = readers.load(std::memory_order_relaxed);
+    for (;;) {
+        if ((state & NETDEV_LIFETIME_READER_MASK) == 0U) {
+            log::error("netdev_release_identity: unbalanced release");
+            return;
+        }
+        if (readers.compare_exchange_weak(state, state - 1U, std::memory_order_release, std::memory_order_relaxed)) {
+            return;
+        }
+    }
 }
 
 auto netdev_find_by_name(const std::string_view NAME) -> NetDevice* {
@@ -124,6 +268,24 @@ auto netdev_find_by_name(const std::string_view NAME) -> NetDevice* {
     }
     devices_lock.unlock();
     return nullptr;
+}
+
+auto netdev_find_by_name_ref(const std::string_view NAME) -> NetDeviceRef {
+    if (NAME.empty()) {
+        return {};
+    }
+    devices_lock.lock();
+    for (size_t i = 0; i < device_count; ++i) {
+        NetDevice* const DEV = devices.at(i);
+        if (std::string_view(DEV->name.data()) == NAME) {
+            NetDeviceRef result =
+                netdev_try_retain({.device = DEV, .generation = DEV->lifetime_generation.load(std::memory_order_acquire)});
+            devices_lock.unlock();
+            return result;
+        }
+    }
+    devices_lock.unlock();
+    return {};
 }
 
 NetDeviceRegistryLease::NetDeviceRegistryLease() : irq_flags_(devices_lock.lock_irqsave()) {}
@@ -165,6 +327,18 @@ auto netdev_at(size_t i) -> NetDevice* {
     NetDevice* dev = devices.at(i);
     devices_lock.unlock();
     return dev;
+}
+
+auto netdev_at_ref(size_t i) -> NetDeviceRef {
+    devices_lock.lock();
+    if (i >= device_count) {
+        devices_lock.unlock();
+        return {};
+    }
+    NetDevice* const DEV = devices.at(i);
+    NetDeviceRef result = netdev_try_retain({.device = DEV, .generation = DEV->lifetime_generation.load(std::memory_order_acquire)});
+    devices_lock.unlock();
+    return result;
 }
 
 auto netdev_snapshot(NetDeviceSnapshot* out, size_t max) -> size_t {

@@ -275,6 +275,7 @@ auto init_device(pci::PCIDevice* pci_dev) -> int {
         idev->irq_vector = vector;
         int const MSI_RET = pci::pci_enable_msi(pci_dev, vector);
         if (MSI_RET != 0) {
+            ker::mod::gates::free_irq(vector);
             vector = pci_dev->interrupt_line + 32;
             idev->irq_vector = vector;
         }

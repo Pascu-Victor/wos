@@ -1,0 +1,91 @@
+# WOS long-running goal portfolio
+
+These files are candidate contracts for improving WOS. Each one is deliberately
+large enough to occupy a primary integration agent and several bounded
+subagents for roughly one to two continuous weeks. That horizon is a planning
+signal, not a completion condition: a goal is complete only when its stated
+evidence exists and all required checks pass.
+
+The contracts follow OpenAI's [six-part Goal pattern](https://developers.openai.com/cookbook/examples/codex/using_goals_in_codex):
+
+1. outcome;
+2. verification surface;
+3. constraints;
+4. boundaries;
+5. iteration policy; and
+6. blocked stop condition.
+
+Every file contains a copy-pastable `/goal` command and the expanded execution
+contract behind it. These files do not activate Goal Mode by themselves.
+
+## Portfolio
+
+| ID  | Goal                                                                                 | Primary surfaces                                            | Avoid concurrent ownership with               | Status      |
+| --- | ------------------------------------------------------------------------------------ | ----------------------------------------------------------- | --------------------------------------------- | ----------- |
+| 01  | [Fault-safe syscall user access](01-syscall-usercopy-safety.md)                      | syscall ABI, usercopy, VFS, sockets                         | 10, 11 when changing the same ABI wrappers    | Done        |
+| 02  | [Unified memory-pressure coordinator](02-unified-memory-reclaim.md)                  | allocator, caches, swap, reclaim                            | other allocator/reclaim rewrites              | Done        |
+| 03  | [Event-driven child lifecycle](03-process-child-events.md)                           | waitpid, exit, ptrace, scheduler                            | 04 or 16 in shared Task/deferred-switch code  | Not started |
+| 04  | [Executable scheduler transition model](04-scheduler-transition-model.md)            | EEVDF transitions, migration, handoff                       | 03, 16, and other scheduler restructures      | Not started |
+| 05  | [Asynchronous xHCI hotplug lifecycle](05-xhci-hotplug-lifecycle.md)                  | IRQ, USB DMA, CDC netdevice teardown                        | other USB/netdevice lifetime rewrites         | Done        |
+| 06  | [Production IPv6 dual stack](06-ipv6-dual-stack.md)                                  | TCP/UDP, NDP, routing, netd                                 | broad socket or network-stack rewrites        | Not started |
+| 07  | [Mount-scoped crash-consistent XFS journal](07-xfs-crash-consistency.md)             | XFS log, buffer cache, block I/O                            | 10 when changing XFS transactions             | Not started |
+| 08  | [Deterministic WKI chaos and recovery](08-wki-chaos-recovery.md)                     | WKI transport, peers, every remote service                  | 09 and broad WKI lifecycle changes            | Not started |
+| 09  | [Authenticated WKI peer sessions](09-wki-authenticated-sessions.md)                  | WKI wire protocol, admission, authorization                 | 08 until transport hooks are coordinated      | Not started |
+| 10  | [End-to-end extended attributes](10-end-to-end-xattrs.md)                            | libc, syscall/VFS, XFS, remote VFS                          | 01, 07, 11 on shared surfaces                 | Not started |
+| 11  | [libc and syscall-ABI conformance gate](11-libc-syscall-conformance.md)              | mlibc, syscall ABI, target test runner                      | 01, 10, or 13 on shared wrappers/ABI mirrors  | Done        |
+| 12  | [Reproducible WOSDBG incident bundles](12-wosdbg-incident-bundles.md)                | KTEST/cluster capture, WOSDBG                               | 13 on shared ingestion schemas                | Done        |
+| 13  | [Versioned structured telemetry](13-structured-telemetry.md)                         | journal, perf, strace, WOSDBG                               | 11 or 12 on shared ABI/ingestion formats      | Not started |
+| 14  | [Declarative bounded init supervisor](14-declarative-init-supervisor.md)             | PID 1, service lifecycle, shutdown                          | other init/service ownership rewrites         | Done        |
+| 15  | [Randomized and hardened userspace layouts](15-userspace-address-space-hardening.md) | ELF/exec, VM, TLS, ptrace/debugging                         | 01, 04, 11 on loader/VM/ABI surfaces          | Not started |
+| 16  | [PREEMPT_NOBLOCK default kernel preemption](16-preempt-noblock-kernel-preemption.md) | timer preemption, kernel frames, migration, return assembly | 03 or 04 on shared scheduler/Task transitions | Done        |
+
+## Status authority
+
+The portfolio `Status` column is the canonical goal-selection filter. Do not
+select, reload, or rescan a row marked `Done`; its completion record and current
+source remain available only for later regression work. Completed goals are
+currently 01, 02, 05, 11, 12, 14, and 16. Select only a row whose status is `Not started` (or a
+future explicit in-progress state).
+
+## How to use a goal
+
+1. Skip every portfolio row marked `Done`, then re-read the current local source
+   and path-specific instructions for the selected unfinished goal. The evidence
+   below was collected on 2026-08-08 and may become stale in this fast-moving
+   repository.
+2. Use a dedicated thread and preferably a dedicated worktree for one goal.
+3. Paste that file's `/goal` block. Do not turn the week estimate into a token or
+   time budget; completion remains evidence-based.
+4. Give subagents bounded reconnaissance, test, or non-overlapping implementation
+   workstreams. The primary agent owns the impact map, critical-path patch
+   contract, integration, and final verification.
+5. Before editing critical code, write the repository-required patch contract.
+   Re-run it whenever the design or file set materially changes.
+6. Keep an iteration ledger: hypothesis, patch, focused evidence, regressions,
+   next action. Never broaden into unrelated cleanup merely to keep working.
+7. WOS runtime debugging can be run rootlessly by appending `--no-setup` to
+   `wos-ktest` or `wos-cluster`. Physical-hardware checks remain user-run.
+
+## Portfolio rules
+
+- Goals are individually valid; the numeric order is not a mandatory roadmap.
+- Overlap warnings identify ownership conflicts, not hard dependencies. If two
+  goals touch the same critical path, serialize them or explicitly merge their
+  patch contracts.
+- Existing ABI and wire formats stay compatible unless a goal explicitly
+  defines version negotiation, migration, and negative compatibility tests.
+- A partial implementation, elapsed time, exhausted context, or passing build is
+  never sufficient on its own. The completion contract in the selected file is
+  authoritative.
+- If the local tree invalidates a premise, update the contract before acting.
+  Do not implement a stale plan because it is written here.
+
+## Reconnaissance note
+
+The current `scripts/test/ktest_setup.py` defaults to
+`configs/node_ktest.json`, while some repository instructions still name
+`configs/node.json`. Goal executors must follow the local script and reconcile
+that documentation discrepancy when their work touches KTEST configuration.
+
+This directory is intentionally ignored by the root `.gitignore`; it is local
+planning material unless a later task explicitly chooses to publish it.

@@ -1175,7 +1175,7 @@ auto wki_remote_net_attach(uint16_t owner_node, uint32_t resource_id, const char
         s_net_proxy_lock.unlock();
         return dev;
     }
-    if (ker::net::netdev_find_by_name(local_name) != nullptr) {
+    if (ker::net::netdev_find_by_name_ref(local_name)) {
         s_net_proxy_lock.unlock();
         return nullptr;
     }

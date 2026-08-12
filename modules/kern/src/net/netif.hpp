@@ -24,6 +24,7 @@ struct IPv6Addr {
 
 struct NetInterface {
     NetDevice* dev = nullptr;
+    NetDeviceIdentity dev_identity{};
     std::array<IPv4Addr, MAX_ADDRS_PER_IF> ipv4_addrs = {};
     size_t ipv4_addr_count = 0;
     std::array<IPv6Addr, MAX_ADDRS_PER_IF> ipv6_addrs = {};

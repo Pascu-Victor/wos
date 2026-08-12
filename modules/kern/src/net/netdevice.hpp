@@ -62,6 +62,45 @@ struct NetDevice {
     uint64_t tx_bytes = 0;
     uint64_t rx_dropped = 0;
     uint64_t tx_dropped = 0;
+
+    // Internal registration lifetime. Admission is lock-free so packets and
+    // other users can retain a device without taking the registry lock.
+    std::atomic<uint64_t> lifetime_generation{0};
+    std::atomic<uint32_t> lifetime_readers{uint32_t{1} << 31U};
+};
+
+static_assert(std::atomic<uint64_t>::is_always_lock_free, "NetDevice generations must stay lock-free");
+static_assert(std::atomic<uint32_t>::is_always_lock_free, "NetDevice retention must stay lock-free");
+
+class NetDeviceRef {
+   public:
+    NetDeviceRef() = default;
+    ~NetDeviceRef();
+
+    NetDeviceRef(const NetDeviceRef&) = delete;
+    auto operator=(const NetDeviceRef&) -> NetDeviceRef& = delete;
+    NetDeviceRef(NetDeviceRef&& other) noexcept;
+    auto operator=(NetDeviceRef&& other) noexcept -> NetDeviceRef&;
+
+    [[nodiscard]] auto get() const -> NetDevice* { return identity_.device; }
+    [[nodiscard]] auto operator->() const -> NetDevice* { return get(); }
+    [[nodiscard]] explicit operator bool() const { return identity_.valid(); }
+    [[nodiscard]] auto identity() const -> NetDeviceIdentity { return identity_; }
+    [[nodiscard]] auto take_identity() -> NetDeviceIdentity;
+    void reset();
+
+   private:
+    explicit NetDeviceRef(NetDeviceIdentity identity) : identity_(identity) {}
+
+    NetDeviceIdentity identity_{};
+
+    friend auto netdev_try_retain(NetDeviceIdentity identity) -> NetDeviceRef;
+};
+
+struct NetDeviceRetireToken {
+    NetDeviceIdentity identity{};
+
+    [[nodiscard]] auto valid() const -> bool { return identity.valid(); }
 };
 
 struct NetDeviceSnapshot {
@@ -105,15 +144,30 @@ class NetDeviceRegistryLease {
 // Register a new network device (assigns ifindex, auto-names "ethN" if name is empty)
 auto netdev_register(NetDevice* dev) -> int;
 
-// Unregister a network device. The caller must ensure no RX/TX path is still
-// using the device storage before freeing it.
+// Unregister and drain retained users. This is a task-context operation.
 auto netdev_unregister(NetDevice* dev) -> int;
+
+// Two-phase retirement is available to teardown paths that must first unpublish
+// the device, release their own retained objects, and only then wait. Neither
+// phase waits with the registry lock held; netdev_unregister_wait() must run in
+// task context.
+auto netdev_unregister_begin(NetDevice* dev, NetDeviceRetireToken& token) -> int;
+void netdev_unregister_wait(const NetDeviceRetireToken& token);
+
+// Generation-qualified registration retention. A stale identity never admits
+// a reader after storage at the same address has been registered again.
+auto netdev_registered_identity(NetDevice* dev) -> NetDeviceIdentity;
+auto netdev_try_retain(NetDeviceIdentity identity) -> NetDeviceRef;
+auto netdev_retain_registered(NetDevice* dev) -> NetDeviceRef;
+void netdev_release_identity(NetDeviceIdentity identity);
 
 // Lookup
 auto netdev_find_by_name(std::string_view name) -> NetDevice*;
+auto netdev_find_by_name_ref(std::string_view name) -> NetDeviceRef;
 auto netdev_is_registered(const NetDevice* dev) -> bool;
 auto netdev_count() -> size_t;
 auto netdev_at(size_t i) -> NetDevice*;
+auto netdev_at_ref(size_t i) -> NetDeviceRef;
 auto netdev_snapshot(NetDeviceSnapshot* out, size_t max) -> size_t;
 
 // Called by drivers when a packet is received

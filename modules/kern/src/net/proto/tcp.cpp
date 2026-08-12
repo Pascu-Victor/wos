@@ -390,8 +390,9 @@ int tcp_connect(Socket* sock, const void* addr_raw, size_t addr_len, int flags) 
     // Resolve local IP from the outgoing interface if not explicitly bound.
     if (cb->local_ip == 0) {
         auto* route = ker::net::route_lookup(ip);
-        if (route != nullptr && route->dev != nullptr) {
-            auto* nif = ker::net::netif_find_by_dev(route->dev);
+        ker::net::NetDeviceRef route_ref = route != nullptr ? ker::net::netdev_try_retain(route->dev_identity) : ker::net::NetDeviceRef{};
+        if (route_ref) {
+            auto* nif = ker::net::netif_find_by_dev(route_ref.get());
             if (nif != nullptr && nif->ipv4_addr_count > 0) {
                 cb->local_ip = nif->ipv4_addrs.front().addr;
                 sock->local_v4.addr = cb->local_ip;

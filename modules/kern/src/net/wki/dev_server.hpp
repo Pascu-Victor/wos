@@ -4,13 +4,13 @@
 #include <cstdint>
 #include <dev/block_device.hpp>
 #include <net/address.hpp>
+#include <net/netdevice.hpp>
 #include <net/wki/remotable.hpp>
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
 #include <utility>
 
 namespace ker::net {
-struct NetDevice;
 struct PacketBuffer;
 }  // namespace ker::net
 
@@ -56,6 +56,8 @@ struct DevServerBinding {
     // auxiliary RPC bindings. This is local server state, not a wire field.
     bool vfs_lane_anchor = true;
     net::NetDevice* net_dev = nullptr;
+    // Keeps the exact netdevice registration alive until binding retirement.
+    net::NetDeviceRef net_dev_ref{};
     NetRxFilter net_rx_filter;  // D12: per-binding RX filter
 
     // V2: RX backpressure credit tracking [V2 A5.6]
@@ -130,6 +132,7 @@ struct DevServerBinding {
           vfs_export_revision_seen(o.vfs_export_revision_seen),
           vfs_lane_anchor(o.vfs_lane_anchor),
           net_dev(o.net_dev),
+          net_dev_ref(std::move(o.net_dev_ref)),
           net_rx_filter(o.net_rx_filter),
           net_rx_credits(o.net_rx_credits),
           net_nic_opened(o.net_nic_opened),
@@ -201,6 +204,7 @@ struct DevServerBinding {
             // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-array-to-pointer-decay)
             __builtin_memcpy(vfs_export_name, o.vfs_export_name, sizeof(vfs_export_name));
             net_dev = o.net_dev;
+            net_dev_ref = std::move(o.net_dev_ref);
             net_rx_filter = o.net_rx_filter;
             net_rx_credits = o.net_rx_credits;
             net_nic_opened = o.net_nic_opened;
@@ -260,6 +264,11 @@ void wki_dev_server_init();
 // peer's lifecycle lease; the function joins every other binding cleanup owner
 // and returns only after no same-peer binding row remains.
 void wki_dev_server_detach_all_for_peer(uint16_t node_id);
+
+// Close admission and synchronously retire every binding that names this local
+// network device.  Must run in task context while the NetDevice storage and its
+// remotable callbacks are still valid.
+void wki_dev_server_detach_all_for_netdev(net::NetDevice* dev);
 
 // Connected epoch resets are split across RX and task context. The mark phase
 // is allocation-free/nonblocking; cleanup drains exact binding generations and

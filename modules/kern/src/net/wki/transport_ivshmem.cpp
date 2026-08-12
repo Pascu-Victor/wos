@@ -573,6 +573,7 @@ void wki_ivshmem_transport_init() {
     if (vector != 0) {
         int const MSI_RET = dev::pci::pci_enable_msi(found_dev, vector);
         if (MSI_RET != 0) {
+            ker::mod::gates::free_irq(vector);
             vector = found_dev->interrupt_line + 32;
         }
         ker::mod::gates::request_irq(vector, ivshmem_wki_irq, &s_ivshmem_priv, "wki-ivshmem");

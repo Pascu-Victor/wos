@@ -203,6 +203,12 @@ def cleanup_node_logs(spec: dict):
     if serial_log.exists():
         serial_log.unlink()
 
+    usb_hotplug = spec["vm"].get("usb_hotplug", {})
+    if isinstance(usb_hotplug, dict) and usb_hotplug.get("enabled", False):
+        qmp_socket = Path(usb_hotplug.get("qmp_socket", f"qmp-vm{nid}.sock"))
+        if qmp_socket.exists() or qmp_socket.is_socket():
+            qmp_socket.unlink()
+
 
 def build_qemu_args(
     spec: dict,
@@ -270,6 +276,22 @@ def build_qemu_args(
         "-D",
         str(qemu_log),
     ]
+
+    usb_hotplug = vm_cfg.get("usb_hotplug", {})
+    if isinstance(usb_hotplug, dict) and usb_hotplug.get("enabled", False):
+        qmp_socket = Path(usb_hotplug.get("qmp_socket", f"qmp-vm{nid}.sock"))
+        qmp_socket.parent.mkdir(parents=True, exist_ok=True)
+        xhci_id = str(usb_hotplug.get("controller_id", "xhci"))
+        usb2_ports = int(usb_hotplug.get("usb2_ports", 4))
+        usb3_ports = int(usb_hotplug.get("usb3_ports", 4))
+        args.extend(
+            [
+                "-device",
+                f"qemu-xhci,id={xhci_id},p2={usb2_ports},p3={usb3_ports}",
+                "-qmp",
+                f"unix:{qmp_socket},server=on,wait=off",
+            ]
+        )
 
     for nic_idx, nic in enumerate(spec.get("nics", [])):
         nic_model = nic.get("model", nic.get("nic_model", "virtio-net-pci"))

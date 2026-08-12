@@ -1116,6 +1116,7 @@ auto init_device_modern(ker::dev::pci::PCIDevice* pci_dev) -> int {
         return -1;
     }
     pair0.irq_vector = vector;
+    uint8_t allocated_pair_vectors = 1;
 
     if (want_mq) {
         for (uint8_t pair_idx = 1; pair_idx < target_queue_pairs; pair_idx++) {
@@ -1127,6 +1128,7 @@ auto init_device_modern(ker::dev::pci::PCIDevice* pci_dev) -> int {
                 break;
             }
             pair.irq_vector = PAIR_VECTOR;
+            allocated_pair_vectors = static_cast<uint8_t>(pair_idx + 1U);
         }
         want_mq = target_queue_pairs >= MIN_MQ_QUEUE_PAIRS;
     }
@@ -1190,13 +1192,21 @@ auto init_device_modern(ker::dev::pci::PCIDevice* pci_dev) -> int {
         want_mq = false;
         int const MSI_RET = ker::dev::pci::pci_enable_msi(pci_dev, vector, net_cpu_for_pair(CORE_COUNT, 0));
         if (MSI_RET != 0) {
+            ker::mod::gates::free_irq(vector);
             vector = pci_dev->interrupt_line + 32;
             pair0.irq_vector = vector;
             ker::mod::ioapic::route_irq(pci_dev->interrupt_line, vector, 0);
         }
     }
 
-    dev->configured_queue_pairs = (want_mq && dev->msix_enabled) ? target_queue_pairs : SINGLE_QUEUE_PAIRS;
+    uint8_t const RETAINED_PAIR_VECTORS = (want_mq && dev->msix_enabled) ? target_queue_pairs : SINGLE_QUEUE_PAIRS;
+    for (uint8_t pair_idx = RETAINED_PAIR_VECTORS; pair_idx < allocated_pair_vectors; ++pair_idx) {
+        auto& pair = dev->queue_pairs.at(pair_idx);
+        ker::mod::gates::free_irq(pair.irq_vector);
+        pair.irq_vector = 0;
+    }
+
+    dev->configured_queue_pairs = RETAINED_PAIR_VECTORS;
     dev->num_queue_pairs = dev->configured_queue_pairs;
 
     if ((our_lo & VIRTIO_NET_F_MAC) != 0 && devcfg_va != nullptr) {
@@ -1412,6 +1422,7 @@ auto init_device(ker::dev::pci::PCIDevice* pci_dev) -> int {
     if (!dev->msix_enabled) {
         int const MSI_RET = ker::dev::pci::pci_enable_msi(pci_dev, vector, net_cpu_for_pair(CORE_COUNT, 0));
         if (MSI_RET != 0) {
+            ker::mod::gates::free_irq(vector);
             vector = pci_dev->interrupt_line + 32;
             pair0.irq_vector = vector;
             ker::mod::ioapic::route_irq(pci_dev->interrupt_line, vector, 0);

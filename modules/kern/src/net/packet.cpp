@@ -669,6 +669,7 @@ auto pkt_alloc() -> PacketBuffer* {
     pkt->dev = nullptr;
     pkt->lifetime_ctx = nullptr;
     pkt->lifetime_release = nullptr;
+    pkt->retained_netdev = {};
     pkt->protocol = 0;
 #ifdef WOS_NET_PACKET_DEBUG
     pkt->debug_in_use = true;
@@ -695,6 +696,7 @@ auto pkt_alloc_rx() -> PacketBuffer* {
     pkt->dev = nullptr;
     pkt->lifetime_ctx = nullptr;
     pkt->lifetime_release = nullptr;
+    pkt->retained_netdev = {};
     pkt->protocol = 0;
 #ifdef WOS_NET_PACKET_DEBUG
     pkt->debug_in_use = true;
@@ -734,6 +736,55 @@ auto pkt_alloc_tx() -> PacketBuffer* {
     return pkt;
 }
 
+auto pkt_retain_netdev(PacketBuffer* pkt, NetDeviceIdentity identity) -> bool {
+    if (pkt == nullptr || !identity.valid()) {
+        return false;
+    }
+    if (pkt->retained_netdev.valid()) {
+        return pkt->retained_netdev == identity;
+    }
+
+    NetDeviceRef ref = netdev_try_retain(identity);
+    if (!ref) {
+        return false;
+    }
+    pkt->retained_netdev = ref.take_identity();
+    pkt->dev = identity.device;
+    return true;
+}
+
+auto pkt_adopt_netdev_ref(PacketBuffer* pkt, NetDeviceRef ref) -> bool {
+    if (pkt == nullptr || !ref) {
+        return false;
+    }
+
+    NetDeviceIdentity const IDENTITY = ref.identity();
+    if (pkt->retained_netdev.valid()) {
+        if (pkt->retained_netdev != IDENTITY) {
+            return false;
+        }
+        ref.reset();
+        pkt->dev = IDENTITY.device;
+        return true;
+    }
+
+    pkt->retained_netdev = ref.take_identity();
+    pkt->dev = IDENTITY.device;
+    return true;
+}
+
+void pkt_release_netdev(PacketBuffer* pkt) {
+    if (pkt == nullptr) {
+        return;
+    }
+    NetDeviceIdentity const IDENTITY = pkt->retained_netdev;
+    pkt->retained_netdev = {};
+    if (pkt->dev == IDENTITY.device) {
+        pkt->dev = nullptr;
+    }
+    netdev_release_identity(IDENTITY);
+}
+
 void pkt_free(PacketBuffer* pkt) {
     if (pkt == nullptr) {
         return;
@@ -741,11 +792,15 @@ void pkt_free(PacketBuffer* pkt) {
 
     auto* release = pkt->lifetime_release;
     void* release_ctx = pkt->lifetime_ctx;
+    NetDeviceIdentity const RETAINED_NETDEV = pkt->retained_netdev;
     pkt->lifetime_release = nullptr;
     pkt->lifetime_ctx = nullptr;
+    pkt->retained_netdev = {};
+    pkt->dev = nullptr;
     if (release != nullptr) {
         release(release_ctx);
     }
+    netdev_release_identity(RETAINED_NETDEV);
 
 #ifdef WOS_NET_PACKET_DEBUG
     pkt->debug_in_use = false;

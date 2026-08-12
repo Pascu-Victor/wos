@@ -50,6 +50,11 @@ void arp_rx(NetDevice* dev, PacketBuffer* pkt);
 // Returns -1 if pending (sends ARP request, queues pkt for later).
 auto arp_resolve(NetDevice* dev, IPv4Address ip, MacAddress& dst_mac, PacketBuffer* pending_pkt) -> int;
 
+// Drop unresolved packets pinned to a retiring netdevice registration.  The
+// exact generation is required so reused driver storage cannot cancel packets
+// owned by a later registration at the same address.
+void arp_forget_device(NetDeviceIdentity identity);
+
 // Learn MAC address from incoming packets (dynamic ARP learning)
 void arp_learn(IPv4Address ip, const MacAddress& mac);
 

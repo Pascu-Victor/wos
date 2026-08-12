@@ -46,6 +46,11 @@ using log = ker::mod::dbg::logger<"devfs">;
 ker::mod::sys::Spinlock g_wki_lock;          // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 ker::mod::sys::Mutex g_pts_namespace_mutex;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
+struct NetStatsDeviceContext {
+    ker::net::NetDeviceIdentity identity{};
+    std::array<char, ker::net::NETDEV_NAME_LEN> name{};
+};
+
 class OptionalWkiLock {
    public:
     explicit OptionalWkiLock(bool enabled) : locked(enabled) {
@@ -953,10 +958,11 @@ void devfs_populate_net_nodes() {
 
     size_t const COUNT = ker::net::netdev_count();
     for (size_t i = 0; i < COUNT; i++) {
-        auto* netdev = ker::net::netdev_at(i);
-        if (netdev == nullptr) {
+        auto netdev_ref = ker::net::netdev_at_ref(i);
+        if (!netdev_ref) {
             continue;
         }
+        auto* netdev = netdev_ref.get();
 
         // Skip if node already exists
         if (find_child(net_dir, netdev->name.data()) != nullptr) {
@@ -969,9 +975,19 @@ void devfs_populate_net_nodes() {
             continue;
         }
 
-        // Allocate a Device struct to hold the netdev pointer
+        // Store the exact registration identity rather than a raw pointer: a
+        // hotplug slot may later reconstruct a different NIC at this address.
+        auto* context = new NetStatsDeviceContext();
+        if (context == nullptr) {
+            delete node;
+            continue;
+        }
+        context->identity = netdev_ref.identity();
+        context->name = netdev->name;
+
         auto* dev = new ker::dev::Device();
         if (dev == nullptr) {
+            delete context;
             delete node;
             continue;
         }
@@ -988,7 +1004,12 @@ void devfs_populate_net_nodes() {
                 if (df->device == nullptr || df->device->private_data == nullptr) {
                     return -EINVAL;
                 }
-                auto* nd = static_cast<ker::net::NetDevice*>(df->device->private_data);
+                auto* context = static_cast<NetStatsDeviceContext*>(df->device->private_data);
+                auto netdev_ref = ker::net::netdev_try_retain(context->identity);
+                if (!netdev_ref) {
+                    return -ENODEV;
+                }
+                auto* nd = netdev_ref.get();
 
                 // Format stats into a temporary buffer
                 std::array<char, 512> stats{};
@@ -1098,9 +1119,9 @@ void devfs_populate_net_nodes() {
 
         dev->major = 10;
         dev->minor = static_cast<unsigned>(200 + i);
-        dev->name = netdev->name.data();
+        dev->name = context->name.data();
         dev->type = ker::dev::DeviceType::CHAR;
-        dev->private_data = netdev;
+        dev->private_data = context;
         dev->char_ops = &net_stats_ops;
 
         node->device = dev;

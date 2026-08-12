@@ -475,6 +475,7 @@ void init_device(pci::PCIDevice* pci_dev, const char* name) {
     if (MSI_RESULT != 0) {
         // Use legacy IRQ
         log::warn("MSI not available, using legacy IRQ %d", pci_dev->interrupt_line);
+        ker::mod::gates::free_irq(vector);
         vector = pci_dev->interrupt_line + 32;  // IRQ line + ISA offset
         dev->irq_vector = vector;
     }

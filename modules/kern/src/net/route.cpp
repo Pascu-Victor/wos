@@ -118,23 +118,34 @@ auto route_add(proto::IPv4Address dest, proto::IPv4Address netmask, proto::IPv4A
     route->valid = true;
 
     bool published = false;
-    uint64_t const FLAGS = route_registry_lock.lock_irqsave();
-    size_t const LIVE_COUNT = route_live_count.load(std::memory_order_relaxed);
-    if (LIVE_COUNT < MAX_ROUTES) {
-        size_t const SCAN_LIMIT = route_scan_limit.load(std::memory_order_relaxed);
-        size_t const SLOT = find_free_route_slot_locked(SCAN_LIMIT);
-        if (SLOT < MAX_ROUTES) {
-            storage->next = route_storage;
-            route_storage = storage;
-            live_routes.at(SLOT).store(route, std::memory_order_release);
-            if (SLOT == SCAN_LIMIT) {
-                route_scan_limit.store(SCAN_LIMIT + 1, std::memory_order_release);
+    {
+        // Registration is the outer lock, matching netif publication. If a
+        // route wins this lease, unregister's later route_del_for_dev() must
+        // observe it; otherwise publication is refused.
+        NetDeviceRegistryLease const REGISTRATION;
+        if (dev == nullptr || REGISTRATION.contains(dev)) {
+            if (dev != nullptr) {
+                route->dev_identity = {.device = dev, .generation = dev->lifetime_generation.load(std::memory_order_acquire)};
             }
-            route_live_count.store(LIVE_COUNT + 1, std::memory_order_release);
-            published = true;
+            uint64_t const FLAGS = route_registry_lock.lock_irqsave();
+            size_t const LIVE_COUNT = route_live_count.load(std::memory_order_relaxed);
+            if (LIVE_COUNT < MAX_ROUTES) {
+                size_t const SCAN_LIMIT = route_scan_limit.load(std::memory_order_relaxed);
+                size_t const SLOT = find_free_route_slot_locked(SCAN_LIMIT);
+                if (SLOT < MAX_ROUTES) {
+                    storage->next = route_storage;
+                    route_storage = storage;
+                    live_routes.at(SLOT).store(route, std::memory_order_release);
+                    if (SLOT == SCAN_LIMIT) {
+                        route_scan_limit.store(SCAN_LIMIT + 1, std::memory_order_release);
+                    }
+                    route_live_count.store(LIVE_COUNT + 1, std::memory_order_release);
+                    published = true;
+                }
+            }
+            route_registry_lock.unlock_irqrestore(FLAGS);
         }
     }
-    route_registry_lock.unlock_irqrestore(FLAGS);
 
     if (!published) {
         delete storage;

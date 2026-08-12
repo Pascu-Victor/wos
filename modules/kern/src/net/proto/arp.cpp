@@ -92,24 +92,29 @@ void send_arp_reply(NetDevice* dev, const MacAddress& dst_mac, IPv4Address dst_i
     eth_tx(dev, pkt, dst_mac, ETH_TYPE_ARP);
 }
 
-void flush_pending(ArpEntry* entry, NetDevice* dev) {
-    for (uint8_t i = 0; i < entry->pending_count; i++) {
-        if (auto* pending = entry->pending.at(i); pending != nullptr) {
-            eth_tx(dev, pending, entry->mac, ETH_TYPE_IPV4);
-            entry->pending.at(i) = nullptr;
-        }
+auto take_pending(ArpEntry* entry, std::array<PacketBuffer*, ARP_PENDING_QUEUE_SIZE>& pending) -> uint8_t {
+    uint8_t const PENDING_COUNT = entry->pending_count;
+    for (uint8_t index = 0; index < PENDING_COUNT; ++index) {
+        pending.at(index) = entry->pending.at(index);
+        entry->pending.at(index) = nullptr;
     }
     entry->pending_count = 0;
+    return PENDING_COUNT;
 }
 
-void free_pending(ArpEntry* entry) {
-    for (uint8_t i = 0; i < entry->pending_count; i++) {
-        if (auto* pending = entry->pending.at(i); pending != nullptr) {
-            pkt_free(pending);
-            entry->pending.at(i) = nullptr;
+void flush_pending(const std::array<PacketBuffer*, ARP_PENDING_QUEUE_SIZE>& pending, uint8_t pending_count, NetDevice* dev,
+                   const MacAddress& mac) {
+    for (uint8_t index = 0; index < pending_count; ++index) {
+        if (auto* packet = pending.at(index); packet != nullptr) {
+            eth_tx(dev, packet, mac, ETH_TYPE_IPV4);
         }
     }
-    entry->pending_count = 0;
+}
+
+void free_pending(const std::array<PacketBuffer*, ARP_PENDING_QUEUE_SIZE>& pending, uint8_t pending_count) {
+    for (uint8_t index = 0; index < pending_count; ++index) {
+        pkt_free(pending.at(index));
+    }
 }
 
 }  // namespace
@@ -136,6 +141,9 @@ void arp_rx(NetDevice* dev, PacketBuffer* pkt) {
 
     IPv4Address const SENDER_IP = IPv4Address::from_network_order(arp->sender_ip);
     IPv4Address const TARGET_IP = IPv4Address::from_network_order(arp->target_ip);
+    std::array<PacketBuffer*, ARP_PENDING_QUEUE_SIZE> pending{};
+    uint8_t pending_count = 0;
+    MacAddress resolved_mac{};
 
     // arp_lock must be irqsave: arp_resolve is called from the inline IRQ
     // path (tcp_send_ack -> ipv4_tx -> arp_resolve).  If a non-irqsave holder
@@ -151,11 +159,17 @@ void arp_rx(NetDevice* dev, PacketBuffer* pkt) {
         entry->request_time_ms = 0;
 
         if (WAS_INCOMPLETE) {
-            flush_pending(entry, dev);
+            resolved_mac = entry->mac;
+            pending_count = take_pending(entry, pending);
         }
     }
 
     arp_lock.unlock_irqrestore(FLAGS);
+
+    // Driver transmit may block in task context (for example, waiting for an
+    // xHCI transfer event).  Packet release callbacks are similarly external
+    // to the ARP cache, so neither may run under the IRQ-safe cache lock.
+    flush_pending(pending, pending_count, dev, resolved_mac);
 
     uint16_t const OPCODE = ntohs(arp->opcode);
     if (OPCODE == ARP_OP_REQUEST) {
@@ -217,6 +231,9 @@ auto arp_resolve(NetDevice* dev, IPv4Address ip, MacAddress& dst_mac, PacketBuff
             log::debug("arp_resolve: cache_alloc failed");
 #endif
             arp_lock.unlock_irqrestore(FLAGS);
+            if (pending_pkt != nullptr) {
+                pkt_free(pending_pkt);
+            }
             return -1;
         }
         entry->state = ArpState::INCOMPLETE;
@@ -231,16 +248,19 @@ auto arp_resolve(NetDevice* dev, IPv4Address ip, MacAddress& dst_mac, PacketBuff
 #ifdef DEBUG_ARP
         log::debug("arp_resolve: TIMEOUT, freeing %u pending packets", entry->pending_count);
 #endif
-        free_pending(entry);
+        std::array<PacketBuffer*, ARP_PENDING_QUEUE_SIZE> expired{};
+        uint8_t const EXPIRED_COUNT = take_pending(entry, expired);
         entry->state = ArpState::FREE;
         arp_lock.unlock_irqrestore(FLAGS);
+        free_pending(expired, EXPIRED_COUNT);
         if (pending_pkt != nullptr) {
             pkt_free(pending_pkt);
         }
         return -1;
     }
 
-    if (pending_pkt != nullptr && entry->pending_count < 64) {
+    PacketBuffer* dropped = nullptr;
+    if (pending_pkt != nullptr && entry->pending_count < ARP_PENDING_QUEUE_SIZE) {
 #ifdef DEBUG_ARP
         log::debug("arp_resolve: queueing packet, pending_count now=%u", entry->pending_count + 1);
 #endif
@@ -249,7 +269,7 @@ auto arp_resolve(NetDevice* dev, IPv4Address ip, MacAddress& dst_mac, PacketBuff
 #ifdef DEBUG_ARP
         log::debug("arp_resolve: queue FULL, dropping packet");
 #endif
-        pkt_free(pending_pkt);
+        dropped = pending_pkt;
     }
 
     if (entry->request_time_ms == 0) {
@@ -258,12 +278,54 @@ auto arp_resolve(NetDevice* dev, IPv4Address ip, MacAddress& dst_mac, PacketBuff
 
     arp_lock.unlock_irqrestore(FLAGS);
 
+    pkt_free(dropped);
+
     auto* nif = netif_find_by_dev(dev);
     if (nif != nullptr && nif->ipv4_addr_count > 0) {
         send_arp_request(dev, ip, nif->ipv4_addrs.front().addr);
     }
 
     return -1;
+}
+
+void arp_forget_device(NetDeviceIdentity identity) {
+    if (!identity.valid()) {
+        return;
+    }
+
+    std::array<PacketBuffer*, ARP_PENDING_QUEUE_SIZE> dropped{};
+    for (auto& entry : cache) {
+        uint8_t dropped_count = 0;
+        uint64_t const FLAGS = arp_lock.lock_irqsave();
+        uint8_t retained_count = 0;
+        uint8_t const PREVIOUS_COUNT = entry.pending_count;
+        for (uint8_t index = 0; index < PREVIOUS_COUNT; ++index) {
+            PacketBuffer* const PENDING = entry.pending.at(index);
+            if (PENDING == nullptr) {
+                continue;
+            }
+            if (PENDING->retained_netdev == identity) {
+                dropped.at(dropped_count++) = PENDING;
+                continue;
+            }
+            entry.pending.at(retained_count++) = PENDING;
+        }
+        for (uint8_t index = retained_count; index < PREVIOUS_COUNT; ++index) {
+            entry.pending.at(index) = nullptr;
+        }
+        entry.pending_count = retained_count;
+        if (entry.state == ArpState::INCOMPLETE && retained_count == 0) {
+            entry.ip = {};
+            entry.mac = MacAddress::zero();
+            entry.request_time_ms = 0;
+            entry.state = ArpState::FREE;
+        }
+        arp_lock.unlock_irqrestore(FLAGS);
+
+        for (uint8_t index = 0; index < dropped_count; ++index) {
+            pkt_free(dropped.at(index));
+        }
+    }
 }
 
 void arp_learn(IPv4Address ip, const MacAddress& mac) {

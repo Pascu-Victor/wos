@@ -141,19 +141,19 @@ auto binding_accepts_dev(const UdpBinding* binding, NetDevice const* dev) -> boo
     return BOUND_IFINDEX == 0 || (dev != nullptr && dev->ifindex == BOUND_IFINDEX);
 }
 
-auto netdev_find_by_ifindex(uint32_t ifindex) -> NetDevice* {
+auto netdev_find_by_ifindex(uint32_t ifindex) -> NetDeviceRef {
     if (ifindex == 0) {
-        return nullptr;
+        return {};
     }
 
     size_t const COUNT = netdev_count();
     for (size_t i = 0; i < COUNT; i++) {
-        auto* dev = netdev_at(i);
-        if (dev != nullptr && dev->ifindex == ifindex) {
+        NetDeviceRef dev = netdev_at_ref(i);
+        if (dev && dev->ifindex == ifindex) {
             return dev;
         }
     }
-    return nullptr;
+    return {};
 }
 
 auto first_ipv4_or_any(NetDevice* dev) -> IPv4Address {
@@ -275,7 +275,12 @@ auto udp_sendto(Socket* sock, const void* buf, size_t len, int /*unused*/, const
     uint32_t const SRC = sock->local_v4.addr;
     int tx_ret = -1;
     if (sock->bound_ifindex != 0) {
-        auto* bound_dev = netdev_find_by_ifindex(sock->bound_ifindex);
+        NetDeviceRef bound_ref = netdev_find_by_ifindex(sock->bound_ifindex);
+        auto* bound_dev = bound_ref.get();
+        if (!bound_ref || !pkt_adopt_netdev_ref(pkt, std::move(bound_ref))) {
+            pkt_free(pkt);
+            return -1;
+        }
         IPv4Address const BOUND_SRC = SRC == 0 ? first_ipv4_or_any(bound_dev) : IPv4Address(SRC);
         tx_ret = ipv4_tx_on_dev(pkt, bound_dev, BOUND_SRC, ip, IPPROTO_UDP, UDP_IPV4_TTL);
     } else if (SRC == 0) {
@@ -384,8 +389,8 @@ int udp_setsockopt(Socket* sock, int level, int optname, const void* optval, siz
             return 0;
         }
 
-        auto* dev = netdev_find_by_name(ifname.data());
-        if (dev == nullptr) {
+        NetDeviceRef dev = netdev_find_by_name_ref(ifname.data());
+        if (!dev) {
             return -1;
         }
         sock->bound_ifindex = dev->ifindex;

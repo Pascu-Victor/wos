@@ -13,6 +13,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[3]
 CLUSTER_SETUP = ROOT / "scripts" / "cluster" / "cluster_setup.py"
 CLUSTER_DIR = CLUSTER_SETUP.parent
+USB_HOTPLUG = ROOT / "scripts" / "test" / "usb_hotplug_stress.py"
 BENCHMARK_LAYOUTS = {
     1: [(32, 32768)],
     2: [(16, 16384), (16, 16384)],
@@ -27,6 +28,15 @@ def load_module():
     spec = importlib.util.spec_from_file_location("cluster_setup", CLUSTER_SETUP)
     if spec is None or spec.loader is None:
         raise AssertionError(f"failed to load {CLUSTER_SETUP}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_usb_hotplug_module():
+    spec = importlib.util.spec_from_file_location("usb_hotplug_stress", USB_HOTPLUG)
+    if spec is None or spec.loader is None:
+        raise AssertionError(f"failed to load {USB_HOTPLUG}")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -334,6 +344,66 @@ def test_node_overlay_creation_failure_aborts_launch_prep(module) -> None:
         raise AssertionError(f"overlay creation failure was not logged: {lines!r}")
 
 
+def test_usb_hotplug_qemu_args_and_qmp_device_shape(module) -> None:
+    node_setup = module.node_setup
+    old_prepare = node_setup.prepare_node_overlays
+    old_cleanup = node_setup.cleanup_node_logs
+    node_setup.prepare_node_overlays = lambda _spec, log=print: (Path("disk0-overlay"), Path("disk1-overlay"))
+    node_setup.cleanup_node_logs = lambda _spec: None
+    try:
+        args = node_setup.build_qemu_args(
+            {
+                "id": 7,
+                "vm": {
+                    "usb_hotplug": {
+                        "enabled": True,
+                        "controller_id": "usbctl",
+                        "usb2_ports": 2,
+                        "usb3_ports": 3,
+                        "qmp_socket": "state/qmp-vm7.sock",
+                    }
+                },
+            },
+            log=lambda _line: None,
+        )
+    finally:
+        node_setup.prepare_node_overlays = old_prepare
+        node_setup.cleanup_node_logs = old_cleanup
+
+    device_index = args.index("qemu-xhci,id=usbctl,p2=2,p3=3")
+    assert_equal(args[device_index - 1], "-device", "xHCI QEMU option")
+    qmp_index = args.index("unix:state/qmp-vm7.sock,server=on,wait=off")
+    assert_equal(args[qmp_index - 1], "-qmp", "QMP QEMU option")
+
+    hotplug = load_usb_hotplug_module()
+
+    class FakeClient:
+        def __init__(self):
+            self.calls = []
+
+        def execute(self, command, arguments=None):
+            self.calls.append((command, arguments))
+
+    client = FakeClient()
+    hotplug.add_usb_net(client, "usbnet9", "usbhot9", "usbctl", "52:54:00:12:34:99")
+    assert_equal(
+        client.calls,
+        [
+            (
+                "device_add",
+                {
+                    "driver": "usb-net",
+                    "id": "usbnet9",
+                    "bus": "usbctl.0",
+                    "netdev": "usbhot9",
+                    "mac": "52:54:00:12:34:99",
+                },
+            )
+        ],
+        "QMP usb-net request",
+    )
+
+
 def test_launch_one_vm_wraps_overlay_creation_failure_without_popen(module) -> None:
     old_build_qemu_args = module.build_qemu_args
     old_popen = module.subprocess.Popen
@@ -502,6 +572,7 @@ def main() -> None:
         test_cluster_launch_guard_rejects_preexisting_wos_qemu,
         test_fixed_resource_benchmark_topologies,
         test_node_overlay_creation_failure_aborts_launch_prep,
+        test_usb_hotplug_qemu_args_and_qmp_device_shape,
         test_launch_one_vm_wraps_overlay_creation_failure_without_popen,
         test_wait_for_launched_vms_reaps_and_reports_nonzero_nodes,
         test_cluster_main_preserves_vm_exit_error_for_incident,

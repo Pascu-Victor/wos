@@ -192,15 +192,15 @@ void epoch_manager_init() { mod::sched::EpochManager::init(); }
 
 void wki_eth_transport_init() {
     // Prefer config-assigned NIC; fall back to eth1 then eth0
-    auto* wki_dev = ker::util::netdevconf::find_device("wki");
-    if (wki_dev == nullptr) {
-        wki_dev = net::netdev_find_by_name("eth1");
+    auto wki_dev_ref = ker::util::netdevconf::find_device("wki");
+    if (!wki_dev_ref) {
+        wki_dev_ref = net::netdev_find_by_name_ref("eth1");
     }
-    if (wki_dev == nullptr) {
-        wki_dev = net::netdev_find_by_name("eth0");
+    if (!wki_dev_ref) {
+        wki_dev_ref = net::netdev_find_by_name_ref("eth0");
     }
-    if (wki_dev != nullptr) {
-        net::wki::wki_eth_transport_init(wki_dev);
+    if (wki_dev_ref) {
+        net::wki::wki_eth_transport_init(wki_dev_ref.get());
         net::wki::wki_peer_send_hello_broadcast();
     }
 }
@@ -211,7 +211,8 @@ void ipv6_linklocal_init() {
     // Assign IPv6 link-local addresses to all registered NICs that are not
     // claimed as WKI transport (WKI manages its own transport NIC).
     for (size_t i = 0; i < net::netdev_count(); i++) {
-        auto* dev = net::netdev_at(i);
+        auto dev_ref = net::netdev_at_ref(i);
+        auto* dev = dev_ref.get();
         if (dev == nullptr || dev->wki_transport) {
             continue;
         }

@@ -17,9 +17,9 @@ namespace ker::util::netdevconf {
 constexpr const char* NETDEVS_PATH = "/etc/netdevs";
 constexpr size_t BUF_SIZE = 512;
 
-auto find_device(const char* driver) -> net::NetDevice* {
+auto find_device(const char* driver) -> net::NetDeviceRef {
     if (driver == nullptr) {
-        return nullptr;
+        return {};
     }
     std::string_view const DRIVER_NAME{driver};
     auto* f = ker::vfs::vfs_open_file(NETDEVS_PATH, 0, 0);
@@ -28,7 +28,7 @@ auto find_device(const char* driver) -> net::NetDevice* {
             f->fops->vfs_close(f);
         }
         ker::mod::dbg::log("[netdevconf] %s not found, using hardcoded defaults", NETDEVS_PATH);
-        return nullptr;
+        return {};
     }
 
     std::array<char, BUF_SIZE> buf{};
@@ -37,7 +37,7 @@ auto find_device(const char* driver) -> net::NetDevice* {
         f->fops->vfs_close(f);
     }
     if (N <= 0) {
-        return nullptr;
+        return {};
     }
     buf[static_cast<size_t>(N)] = '\0';  // NOLINT(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
 
@@ -95,18 +95,18 @@ auto find_device(const char* driver) -> net::NetDevice* {
             std::copy_n(ifname_start, COPY_LEN, ifname.data());
             ifname[COPY_LEN] = '\0';  // NOLINT(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
 
-            auto* dev = net::netdev_find_by_name(ifname.data());
-            if (dev != nullptr) {
+            auto dev_ref = net::netdev_find_by_name_ref(ifname.data());
+            if (dev_ref) {
                 ker::mod::dbg::log("[netdevconf] assigned %s -> driver '%s'", ifname.data(), driver);
             } else {
                 ker::mod::dbg::log("[netdevconf] %s: device '%s' not found", NETDEVS_PATH, ifname.data());
             }
-            return dev;
+            return dev_ref;
         }
     }
 
     ker::mod::dbg::log("[netdevconf] no entry for driver '%s' in %s", driver, NETDEVS_PATH);
-    return nullptr;
+    return {};
 }
 
 }  // namespace ker::util::netdevconf

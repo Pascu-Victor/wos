@@ -27,7 +27,14 @@
             "overlay_dir": "ktest-data/overlays",
             "serial_log": "ktest-data/serial-vm0.log",
             "qemu_log": "ktest-data/qemu-vm0.log",
-            "tcg_log": "ktest-data/qemu-vm0-cpu%d.log"
+            "tcg_log": "ktest-data/qemu-vm0-cpu%d.log",
+            "usb_hotplug": {
+                "enabled": true,
+                "controller_id": "xhci",
+                "usb2_ports": 4,
+                "usb3_ports": 4,
+                "qmp_socket": "ktest-data/qmp-vm0.sock"
+            }
         },
         "nics": [
             {

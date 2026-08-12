@@ -9,6 +9,19 @@ namespace ker::net {
 
 // Forward declaration
 struct NetDevice;
+class NetDeviceRef;
+
+// A pointer alone cannot distinguish a registered device from a later device
+// reconstructed at the same address.  Retained users carry the registration
+// generation as part of the identity.
+struct NetDeviceIdentity {
+    NetDevice* device = nullptr;
+    uint64_t generation = 0;
+
+    [[nodiscard]] constexpr auto valid() const -> bool { return device != nullptr && generation != 0; }
+    [[nodiscard]] friend constexpr auto operator==(const NetDeviceIdentity&, const NetDeviceIdentity&) -> bool = default;
+};
+
 constexpr size_t PKT_BUF_SIZE = 10240;  // supports jumbo frames (9000 MTU + headers)
 constexpr size_t PKT_HEADROOM = 128;    // room for VirtIO + Ethernet + headroom
 // Minimum pool size (used before NIC count is known)
@@ -76,9 +89,10 @@ struct PacketBuffer {
     NetDevice* dev{};           // source/dest device
     void* lifetime_ctx{};       // optional owner released when pkt_free() consumes the buffer
     void (*lifetime_release)(void*) = nullptr;
-    uint16_t protocol{};        // EtherType (host byte order)
-    bool pool_linked{};         // private pool freelist membership
-    proto::MacAddress src_mac;  // incoming source MAC (for reply use)
+    NetDeviceIdentity retained_netdev{};  // independently retained registration backing dev
+    uint16_t protocol{};                  // EtherType (host byte order)
+    bool pool_linked{};                   // private pool freelist membership
+    proto::MacAddress src_mac;            // incoming source MAC (for reply use)
 #ifdef WOS_NET_PACKET_DEBUG
     bool debug_in_use = false;
     uint16_t debug_alloc_cpu = 0;
@@ -130,6 +144,11 @@ void pkt_pool_ensure_free(size_t min_free);
 auto pkt_alloc() -> PacketBuffer*;
 auto pkt_alloc_rx() -> PacketBuffer*;  // RX descriptor: prefer permanent pool storage
 auto pkt_alloc_tx() -> PacketBuffer*;  // TX-only: fails if pool is low (reserves for RX)
+// Attach an independently retained NetDevice registration to a packet. These
+// compose with lifetime_release/lifetime_ctx and are released by pkt_free().
+auto pkt_retain_netdev(PacketBuffer* pkt, NetDeviceIdentity identity) -> bool;
+auto pkt_adopt_netdev_ref(PacketBuffer* pkt, NetDeviceRef ref) -> bool;
+void pkt_release_netdev(PacketBuffer* pkt);
 void pkt_free(PacketBuffer* pkt);
 
 }  // namespace ker::net

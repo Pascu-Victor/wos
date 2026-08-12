@@ -131,6 +131,11 @@ void wki_remotable_process_pending_net_attaches();
 // Push a changed local NET resource advert to all connected peers.
 void wki_remotable_notify_net_changed(net::NetDevice* dev);
 
+// Reliably withdraw a retired local NET resource.  The ifindex is monotonic
+// and the payload owns no NetDevice pointer, so the caller may drain and reuse
+// driver storage after this task-context call has queued the wire copies.
+void wki_remotable_withdraw_net(uint32_t ifindex);
+
 // -----------------------------------------------------------------------------
 // Internal - RX message handlers (called from wki.cpp dispatch)
 // -----------------------------------------------------------------------------

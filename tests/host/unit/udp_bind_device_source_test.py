@@ -80,8 +80,8 @@ def test_so_bindtodevice_stores_ifindex() -> None:
         [
             "if (level == SOL_SOCKET_LEVEL && optname == SO_BINDTODEVICE)",
             "sock->bound_ifindex = 0",
-            "auto* dev = netdev_find_by_name(ifname.data())",
-            "if (dev == nullptr)",
+            "NetDeviceRef dev = netdev_find_by_name_ref(ifname.data())",
+            "if (!dev)",
             "sock->bound_ifindex = dev->ifindex",
         ],
         "UDP SO_BINDTODEVICE handling",
@@ -96,7 +96,9 @@ def test_udp_sendto_bound_device_tx_precedes_route_auto() -> None:
         [
             "uint32_t const SRC = sock->local_v4.addr",
             "if (sock->bound_ifindex != 0)",
-            "auto* bound_dev = netdev_find_by_ifindex(sock->bound_ifindex)",
+            "NetDeviceRef bound_ref = netdev_find_by_ifindex(sock->bound_ifindex)",
+            "auto* bound_dev = bound_ref.get()",
+            "pkt_adopt_netdev_ref(pkt, std::move(bound_ref))",
             "IPv4Address const BOUND_SRC = SRC == 0 ? first_ipv4_or_any(bound_dev) : IPv4Address(SRC)",
             "tx_ret = ipv4_tx_on_dev(pkt, bound_dev, BOUND_SRC, ip, IPPROTO_UDP, UDP_IPV4_TTL)",
             "} else if (SRC == 0)",
@@ -280,7 +282,9 @@ def test_ipv4_forced_tx_preserves_requested_device() -> None:
             "auto* route = route_lookup(dst)",
             "route->dev == out_dev",
             "next_hop = route->gateway",
-            "return deliver_local_or_emit(pkt, dst, out_dev, next_hop)",
+            "NetDeviceIdentity identity = pkt->retained_netdev",
+            "identity = netdev_registered_identity(out_dev)",
+            "return deliver_local_or_emit(pkt, dst, out_dev, next_hop, identity)",
         ],
         "forced-device IPv4 transmit",
     )

@@ -1,9 +1,12 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <dev/pci.hpp>
+#include <dev/usb/xhci_lifecycle.hpp>
+#include <limits>
 #include <platform/sys/spinlock.hpp>
 
 namespace ker::dev::usb {
@@ -100,6 +103,8 @@ constexpr uint32_t TRB_ADDRESS_DEVICE = (11 << TRB_TYPE_SHIFT);
 constexpr uint32_t TRB_CONFIG_ENDPOINT = (12 << TRB_TYPE_SHIFT);
 constexpr uint32_t TRB_EVALUATE_CTX = (13 << TRB_TYPE_SHIFT);
 constexpr uint32_t TRB_RESET_ENDPOINT = (14 << TRB_TYPE_SHIFT);
+constexpr uint32_t TRB_STOP_ENDPOINT = (15 << TRB_TYPE_SHIFT);
+constexpr uint32_t TRB_SET_TR_DEQUEUE = (16 << TRB_TYPE_SHIFT);
 
 // Event TRB types
 constexpr uint32_t TRB_TRANSFER_EVENT = (32 << TRB_TYPE_SHIFT);
@@ -109,8 +114,11 @@ constexpr uint32_t TRB_PORT_STATUS_CHG = (34 << TRB_TYPE_SHIFT);
 // TRB control flags
 constexpr uint32_t TRB_CYCLE = (1 << 0);
 constexpr uint32_t TRB_TOGGLE_CYCLE = (1 << 1);
-constexpr uint32_t TRB_IOC = (1 << 5);      // Interrupt on Completion
-constexpr uint32_t TRB_IDT = (1 << 6);      // Immediate Data
+constexpr uint32_t TRB_ENT = (1 << 1);  // Evaluate Next TRB after a short transfer
+constexpr uint32_t TRB_IOC = (1 << 5);  // Interrupt on Completion
+constexpr uint32_t TRB_IDT = (1 << 6);  // Immediate Data
+constexpr uint32_t TRB_CHAIN = (1 << 4);
+constexpr uint32_t TRB_ISP = (1 << 2);      // Interrupt on Short Packet
 constexpr uint32_t TRB_DIR_IN = (1 << 16);  // Data direction IN (for setup TRB)
 
 // TRB completion codes (bits 31:24 of status in event TRB)
@@ -164,6 +172,8 @@ constexpr size_t EVENT_RING_SIZE = 256;
 constexpr size_t XFER_RING_SIZE = 256;
 constexpr size_t MAX_XHCI_SLOTS = 64;
 constexpr size_t MAX_XHCI_PORTS = 16;
+constexpr size_t MAX_USB_ENDPOINT_CONTEXTS = 32;  // EP0 plus DCI 2..31.
+constexpr size_t INVALID_REQUEST_INDEX = std::numeric_limits<size_t>::max();
 
 // -- USB device speed --
 constexpr uint8_t USB_SPEED_FULL = 1;
@@ -265,6 +275,18 @@ constexpr uint8_t USB_CLASS_CDC = 0x02;
 constexpr uint8_t USB_CLASS_VENDOR = 0xFF;
 
 // -- USB Device (high-level) --
+struct XhciController;
+struct UsbClassDriver;
+
+enum class UsbDeviceState : uint8_t {
+    DISCONNECTED,
+    ENUMERATING,
+    CONFIGURED,
+    DISCONNECTING,
+    FAILED,
+    REUSABLE,
+};
+
 struct UsbEndpoint {
     uint8_t address;  // endpoint address (with direction bit)
     uint8_t type;     // control/bulk/interrupt/isochronous
@@ -274,9 +296,20 @@ struct UsbEndpoint {
     uint64_t ring_phys;
     size_t ring_enqueue;
     bool ring_cycle;
+    uint8_t dci;
+    bool configured;
+    ker::mod::sys::Spinlock ring_lock;
+    std::atomic<bool> accepting{false};
+    std::atomic<bool> request_busy{false};
+    std::atomic<size_t> request_index{INVALID_REQUEST_INDEX};
+    std::atomic<uint32_t> request_generation{0};
+    void* request_dma{};
+    size_t request_dma_len{};
+    bool request_dir_in{};
 };
 
 struct UsbDevice {
+    XhciController* controller;
     uint8_t slot_id;
     uint8_t port;
     uint8_t speed;
@@ -286,25 +319,48 @@ struct UsbDevice {
     uint8_t device_subclass;
     uint8_t device_protocol;
     uint8_t max_packet0;
-    std::array<UsbEndpoint, 16> endpoints{};
+    std::array<UsbEndpoint, MAX_USB_ENDPOINT_CONTEXTS> endpoints{};
     uint8_t num_endpoints;
-    DeviceContext* dev_ctx;
-    InputContext* input_ctx;
+    void* dev_ctx;
+    uint64_t dev_ctx_phys;
+    void* input_ctx;
     uint64_t input_ctx_phys;
     void* driver_data;
-    bool active;
+    UsbClassDriver* bound_driver;
+    uint32_t configured_dcis;
+    uint64_t port_generation;
+    xhci_lifecycle::EnumerationStage enumeration_stage{xhci_lifecycle::EnumerationStage::NONE};
+    std::atomic<UsbDeviceState> state{UsbDeviceState::DISCONNECTED};
 };
 
 // -- Class Driver Registration --
 struct UsbClassDriver {
     const char* name;
     bool (*probe)(UsbDevice*, UsbInterfaceDescriptor*);
+    // Prepare hardware/class storage without externally publishing the class.
     int (*attach)(UsbDevice*, UsbInterfaceDescriptor*, uint8_t* config_desc, size_t config_len);
+    // Publish class-visible state only after USB SET_CONFIGURATION succeeds.
+    int (*publish)(UsbDevice*);
+    // Close new class I/O and retire external users before endpoint teardown.
+    // False leaves the slot and its backing storage quarantined.
+    bool (*quiesce)(UsbDevice*);
     void (*detach)(UsbDevice*);
     UsbClassDriver* next;
 };
 
 void usb_register_class_driver(UsbClassDriver* drv);
+
+struct XhciPort {
+    ker::mod::sys::Spinlock event_lock;
+    std::atomic<uint64_t> event_sequence{0};
+    std::atomic<uint64_t> event_generation{0};
+    std::atomic<uint32_t> latest_portsc{0};
+    std::atomic<uint32_t> pending_changes{0};
+    std::atomic<bool> recovery_requested{false};
+    xhci_lifecycle::PortLifecycle lifecycle{};
+    uint8_t slot_id{};
+    uint8_t speed{};
+};
 
 // -- xHCI Controller --
 struct XhciController {
@@ -344,14 +400,23 @@ struct XhciController {
     // Scratchpad
     uint64_t* scratchpad_array;
     uint64_t scratchpad_array_phys;
+    std::array<void*, 1024> scratchpad_buffers{};
+    uint16_t scratchpad_count{};
 
     // Devices
-    std::array<UsbDevice, MAX_XHCI_SLOTS> devices{};
+    // Slot IDs are 1-based and MaxSlots may legally be 64.
+    std::array<UsbDevice, MAX_XHCI_SLOTS + 1> devices{};
+    std::array<XhciPort, MAX_XHCI_PORTS + 1> ports{};
 
-    // Command completion
-    volatile bool cmd_done;
-    volatile uint32_t cmd_result;
-    volatile uint32_t cmd_slot_id;
+    // Opaque FixedRequestTable owned by xhci.cpp.  Request/event storage is
+    // fixed-capacity so IRQ completion never allocates.
+    void* request_table{};
+    std::atomic<bool> command_busy{false};
+    std::atomic<bool> command_quarantined{false};
+    std::atomic<size_t> command_request_index{INVALID_REQUEST_INDEX};
+    std::atomic<uint32_t> command_request_generation{0};
+    std::atomic<uint32_t> pending_ports{0};
+    std::atomic<bool> worker_queued{false};
 };
 
 auto xhci_init() -> int;
@@ -359,8 +424,11 @@ auto xhci_default_controller() -> XhciController*;
 
 // Internal: used by USB core for transfers
 auto xhci_control_transfer(XhciController* hc, uint8_t slot_id, UsbSetupPacket* setup, void* data, size_t len, bool dir_in) -> int;
-auto xhci_bulk_transfer(XhciController* hc, uint8_t slot_id, UsbEndpoint* ep, void* data, size_t len) -> int;
+auto xhci_bulk_transfer(XhciController* hc, uint8_t slot_id, UsbEndpoint* ep, void* data, size_t len, size_t* actual = nullptr,
+                        bool allow_idle_wait = false) -> int;
 
 auto configure_endpoint(XhciController* hc, uint8_t slot_id, uint64_t input_ctx_phys) -> int;
+auto xhci_configure_bulk_endpoints(UsbDevice* dev, const UsbEndpointDescriptor& ep_in, const UsbEndpointDescriptor& ep_out,
+                                   UsbEndpoint** bulk_in, UsbEndpoint** bulk_out) -> int;
 
 }  // namespace ker::dev::usb
