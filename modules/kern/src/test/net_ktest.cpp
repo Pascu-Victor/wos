@@ -332,7 +332,9 @@ KTEST(NetDeviceLifetime, ArpPendingPacketIsCancelledBeforeRetirementWait) {
     }
 
     constexpr uint32_t RETIRING = uint32_t{1} << 31U;
-    KEXPECT_EQ(g_ktest_arp_dev.lifetime_readers.load(std::memory_order_acquire), RETIRING | 1U);
+    // begin() now centrally forgets all route/interface/ARP/NDP state before
+    // returning, so queued packet references cannot block retirement.
+    KEXPECT_EQ(g_ktest_arp_dev.lifetime_readers.load(std::memory_order_acquire), RETIRING);
     ker::net::proto::arp_forget_device(token.identity);
     KEXPECT_EQ(g_ktest_arp_dev.lifetime_readers.load(std::memory_order_acquire), RETIRING);
     ker::net::netdev_unregister_wait(token);
@@ -391,11 +393,10 @@ KTEST(Net, UdpSendRejectsOversizeBeforePacketCopy) {
     }
 
     ker::net::Socket sock{};
+    sock.domain = ker::net::SOCKADDR_V4_FAMILY;
     sock.state = ker::net::SocketState::CONNECTED;
-    sock.local_v4.addr = 0x0A000001;
-    sock.local_v4.port = 1234;
-    sock.remote_v4.addr = 0x0A000002;
-    sock.remote_v4.port = 4321;
+    sock.local = ker::net::SocketEndpoint::ipv4(ker::net::proto::IPv4Address{0x0A000001}, 1234);
+    sock.remote = ker::net::SocketEndpoint::ipv4(ker::net::proto::IPv4Address{0x0A000002}, 4321);
 
     uint8_t one_byte = 0;
     size_t const OVERSIZE = ker::net::PKT_BUF_SIZE - ker::net::PKT_HEADROOM + 1;
@@ -411,6 +412,8 @@ KTEST(Net, UdpSendtoRejectsOversizeBeforeAutobindAndCopy) {
     }
 
     ker::net::Socket sock{};
+    sock.domain = ker::net::SOCKADDR_V4_FAMILY;
+    sock.local = ker::net::SocketEndpoint::ipv4();
     uint8_t addr[ker::net::SOCKADDR_V4_LEN]{};
     bool const FILLED = ker::net::socket_fill_sockaddr_v4(addr, sizeof(addr), nullptr, 0x0A000002, 4321);
     KEXPECT_TRUE(FILLED);
@@ -422,5 +425,5 @@ KTEST(Net, UdpSendtoRejectsOversizeBeforeAutobindAndCopy) {
     size_t const OVERSIZE = ker::net::PKT_BUF_SIZE - ker::net::PKT_HEADROOM + 1;
     ssize_t const RET = ops->sendto(&sock, &one_byte, OVERSIZE, 0, addr, sizeof(addr));
     KEXPECT_EQ(RET, static_cast<ssize_t>(-EMSGSIZE));
-    KEXPECT_EQ(sock.local_v4.port, static_cast<uint16_t>(0));
+    KEXPECT_EQ(sock.local.port, static_cast<uint16_t>(0));
 }

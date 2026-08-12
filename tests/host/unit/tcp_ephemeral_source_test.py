@@ -6,6 +6,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 TCP_CPP = ROOT / "modules" / "kern" / "src" / "net" / "proto" / "tcp.cpp"
+TCP_HPP = ROOT / "modules" / "kern" / "src" / "net" / "proto" / "tcp.hpp"
 TCP_INPUT_CPP = ROOT / "modules" / "kern" / "src" / "net" / "proto" / "tcp_input.cpp"
 
 
@@ -47,6 +48,7 @@ def require_order(source: str, tokens: list[str], context: str) -> None:
 
 def main() -> None:
     source = TCP_CPP.read_text()
+    header = TCP_HPP.read_text()
     input_source = TCP_INPUT_CPP.read_text()
     reserve_body = function_body(source, "reserve_ephemeral_port_for_connect")
     connect_body = function_body(source, "tcp_connect")
@@ -57,11 +59,12 @@ def main() -> None:
     require(source, "ker::mod::time::get_us()", "ephemeral time seed")
     require(source, "reinterpret_cast<uintptr_t>(&tcp_ephemeral_port)", "ephemeral address seed")
     require(source, "tcp_next_ephemeral_port", "ephemeral wrap helper")
-    require(source, "auto tcp_generate_iss(uint32_t local_ip, uint16_t local_port, uint32_t remote_ip, uint16_t remote_port)", "ISS helper")
-    require(source, "tcp_iss_tuple_hash(local_ip, local_port, remote_ip, remote_port)", "ISS tuple hash")
+    require(source, "auto tcp_generate_iss(const SocketEndpoint& local, const SocketEndpoint& remote) -> uint32_t", "ISS helper")
+    require(source, "tcp_iss_tuple_hash(local, remote)", "ISS tuple hash")
+    require(header, "tcp_generate_iss(uint32_t local_ip, uint16_t local_port, uint32_t remote_ip, uint16_t remote_port)", "IPv4 ISS compatibility helper")
     require(source, "ker::mod::time::get_us() / 4U", "ISS time clock")
     require(source, "iss_counter.fetch_add(64000U", "ISS serial")
-    require(source, "cb->iss = tcp_generate_iss(cb->local_ip, cb->local_port, cb->remote_ip, cb->remote_port)", "active ISS")
+    require(source, "cb->iss = tcp_generate_iss(cb->local, cb->remote)", "active ISS")
     require_order(
         reserve_body,
         [
@@ -73,13 +76,13 @@ def main() -> None:
             "for (uint32_t attempts = 0; attempts < TCP_EPHEMERAL_PORT_COUNT; attempts++)",
             "uint16_t const PORT = tcp_ephemeral_port",
             "tcp_ephemeral_port = tcp_next_ephemeral_port(tcp_ephemeral_port)",
-            "if (tcp_binding_conflicts_locked(local_ip, PORT))",
+            "local.port = PORT",
+            "if (tcp_binding_conflicts_locked(sock, local))",
             "continue",
             "slot->cb = cb",
-            "slot->local_ip = local_ip",
-            "slot->local_port = PORT",
-            "cb->local_port = PORT",
-            "sock->local_v4.port = PORT",
+            "slot->local = local",
+            "cb->local = local",
+            "sock->local = local",
             "tcp_bind_lock.unlock()",
             "return 0",
             "tcp_bind_lock.unlock()",
@@ -90,13 +93,15 @@ def main() -> None:
     require_order(
         connect_body,
         [
-            "if (cb->local_ip == 0)",
-            "ker::net::route_lookup(ip)",
-            "if (cb->local_port == 0)",
-            "int const BIND_RET = reserve_ephemeral_port_for_connect(sock, cb, cb->local_ip)",
+            "if ((remote.is_ipv4() || remote.is_v4_mapped()) && cb->local.is_unspecified())",
+            "ker::net::route_lookup(remote.ipv4_address())",
+            "if (remote.is_ipv6() && !remote.is_v4_mapped())",
+            "ipv6_route_resolve(remote.ipv6_address(), requested_ptr, IFINDEX, route)",
+            "if (cb->local.port == 0)",
+            "int const BIND_RET = reserve_ephemeral_port_for_connect(sock, cb, cb->local)",
             "if (BIND_RET != 0)",
             "return BIND_RET",
-            "cb->remote_ip = ip",
+            "cb->remote = remote",
             "tcp_insert_cb(cb)",
         ],
         "tcp_connect resolves local IP before reserving ephemeral port",
@@ -107,7 +112,7 @@ def main() -> None:
         fail("TCP ISS must not use the old boot-fixed xorshift stream")
     require(
         input_source,
-        "child_cb->iss = tcp_generate_iss(child_cb->local_ip, child_cb->local_port, child_cb->remote_ip, child_cb->remote_port)",
+        "child_cb->iss = tcp_generate_iss(child_cb->local, child_cb->remote)",
         "passive ISS",
     )
     if "0xDEADBEEF" in input_source:

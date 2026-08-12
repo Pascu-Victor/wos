@@ -175,6 +175,9 @@ constexpr uint16_t WKI_CAP_VFS_MULTI_RDMA_LANES = 0x0008;
 // Both peers understand the bounded metadata-batch request/response framing.
 // The HELLO payload layout is unchanged; this is an additive capability bit.
 constexpr uint16_t WKI_CAP_VFS_METADATA_BATCH = 0x0010;
+// Both peers understand the fixed, append-only IPv6 state suffix carried by
+// NET resource adverts, attach ACKs, and state notifications.
+constexpr uint16_t WKI_CAP_NET_IPV6_STATE = 0x0020;
 
 // Hostname constants
 constexpr size_t WKI_HOSTNAME_MAX = 64;  // Matches Linux HOST_NAME_MAX (including NUL)
@@ -349,6 +352,104 @@ struct ResourceAdvertNetPayload {
 } __attribute__((packed));
 
 static_assert(sizeof(ResourceAdvertNetPayload) == 32, "ResourceAdvertNetPayload must be 32 bytes");
+
+constexpr uint16_t WKI_NET_IPV6_STATE_VERSION_1 = 1;
+constexpr size_t WKI_NET_IPV6_STATE_MAX_ADDRS = 8;
+
+struct NetIpv6StateEntry {
+    std::array<uint8_t, 16> address{};
+    uint8_t prefix_len{};
+    uint8_t scope{};
+    uint16_t flags{};
+} __attribute__((packed));
+
+static_assert(sizeof(NetIpv6StateEntry) == 20, "NetIpv6StateEntry must be 20 bytes");
+
+struct NetIpv6StateSuffix {
+    uint16_t version{};
+    uint16_t length{};
+    uint8_t count{};
+    std::array<uint8_t, 3> reserved{};
+    std::array<NetIpv6StateEntry, WKI_NET_IPV6_STATE_MAX_ADDRS> entries{};
+} __attribute__((packed));
+
+static_assert(sizeof(NetIpv6StateSuffix) == 168, "NetIpv6StateSuffix must be 168 bytes");
+static_assert(offsetof(NetIpv6StateSuffix, entries) == 8, "NetIpv6StateSuffix entries offset must stay wire-compatible");
+
+constexpr uint16_t WKI_NET_IPV6_ADDR_F_DADFAILED = 0x0008;
+constexpr uint16_t WKI_NET_IPV6_ADDR_F_DEPRECATED = 0x0020;
+constexpr uint16_t WKI_NET_IPV6_ADDR_F_TENTATIVE = 0x0040;
+constexpr uint16_t WKI_NET_IPV6_ADDR_F_PERMANENT = 0x0080;
+constexpr uint16_t WKI_NET_IPV6_ADDR_F_NOPREFIXROUTE = 0x0200;
+constexpr uint16_t WKI_NET_IPV6_ADDR_STATE_MASK =
+    WKI_NET_IPV6_ADDR_F_DADFAILED | WKI_NET_IPV6_ADDR_F_DEPRECATED | WKI_NET_IPV6_ADDR_F_TENTATIVE;
+constexpr uint16_t WKI_NET_IPV6_ADDR_KNOWN_FLAGS =
+    WKI_NET_IPV6_ADDR_STATE_MASK | WKI_NET_IPV6_ADDR_F_PERMANENT | WKI_NET_IPV6_ADDR_F_NOPREFIXROUTE;
+
+constexpr auto wki_net_ipv6_address_scope(const std::array<uint8_t, 16>& address) -> uint8_t {
+    bool loopback = address.back() == 1;
+    for (size_t i = 0; i + 1 < address.size(); ++i) {
+        loopback = loopback && address.at(i) == 0;
+    }
+    if (loopback) {
+        return 254;
+    }
+    if (address.at(0) == 0xFE && (address.at(1) & 0xC0U) == 0x80U) {
+        return 253;
+    }
+    return 0;
+}
+
+constexpr auto wki_net_ipv6_state_valid(const NetIpv6StateSuffix& state) -> bool {
+    if (state.version != WKI_NET_IPV6_STATE_VERSION_1 || state.length != sizeof(NetIpv6StateSuffix) ||
+        state.count > WKI_NET_IPV6_STATE_MAX_ADDRS || state.reserved != std::array<uint8_t, 3>{}) {
+        return false;
+    }
+    for (size_t i = 0; i < state.count; ++i) {
+        auto const& entry = state.entries.at(i);
+        uint16_t const STATE_FLAGS = entry.flags & WKI_NET_IPV6_ADDR_STATE_MASK;
+        bool nonzero = false;
+        for (uint8_t byte : entry.address) {
+            nonzero = nonzero || byte != 0;
+        }
+        if ((entry.flags & ~WKI_NET_IPV6_ADDR_KNOWN_FLAGS) != 0 ||
+            (STATE_FLAGS != 0 && (STATE_FLAGS & static_cast<uint16_t>(STATE_FLAGS - 1)) != 0) || !nonzero ||
+            entry.address.front() == 0xFF || entry.prefix_len > 128 || entry.scope != wki_net_ipv6_address_scope(entry.address)) {
+            return false;
+        }
+    }
+    for (size_t i = state.count; i < state.entries.size(); ++i) {
+        if (state.entries.at(i).address != std::array<uint8_t, 16>{} || state.entries.at(i).prefix_len != 0 ||
+            state.entries.at(i).scope != 0 || state.entries.at(i).flags != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+constexpr auto wki_net_ipv6_state_has_usable_address(const NetIpv6StateSuffix& state) -> bool {
+    if (!wki_net_ipv6_state_valid(state)) {
+        return false;
+    }
+    for (size_t i = 0; i < state.count; ++i) {
+        auto const& entry = state.entries.at(i);
+        if ((entry.flags & (WKI_NET_IPV6_ADDR_F_DADFAILED | WKI_NET_IPV6_ADDR_F_TENTATIVE)) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+constexpr auto wki_net_ipv6_extended_length_valid(bool negotiated, size_t actual_length, size_t legacy_length) -> bool {
+    return actual_length == legacy_length + (negotiated ? sizeof(NetIpv6StateSuffix) : 0);
+}
+
+constexpr auto wki_net_ipv6_state_empty() -> NetIpv6StateSuffix {
+    NetIpv6StateSuffix state{};
+    state.version = WKI_NET_IPV6_STATE_VERSION_1;
+    state.length = sizeof(NetIpv6StateSuffix);
+    return state;
+}
 
 inline auto resource_advert_name(ResourceAdvertPayload* p) -> char* {
     return reinterpret_cast<char*>(reinterpret_cast<uint8_t*>(p) + sizeof(ResourceAdvertPayload));

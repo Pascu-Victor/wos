@@ -8,10 +8,11 @@
 #include <net/address.hpp>
 #include <net/checksum.hpp>
 #include <net/endian.hpp>
-#include <net/netpoll.hpp>
 #include <net/net_trace.hpp>
+#include <net/netpoll.hpp>
 #include <net/packet.hpp>
 #include <net/proto/ipv4.hpp>
+#include <net/proto/ipv6.hpp>
 #include <new>
 #include <platform/dbg/dbg.hpp>
 #include <utility>
@@ -24,7 +25,6 @@ namespace ker::net::proto {
 using log = ker::mod::dbg::logger<"tcp">;
 
 namespace {
-constexpr auto TCP_IPV4_TTL = static_cast<uint8_t>(IPV4_DEFAULT_TTL);
 constexpr size_t TCP_OOO_MAX_BYTES = static_cast<size_t>(1024U) * 1024U;
 constexpr size_t TCP_OOO_MAX_SEGMENTS = 512;
 constexpr uint16_t TCP_DIAG_SSH_PORT = 22;
@@ -104,7 +104,7 @@ void drain_retransmit_queue(TcpCB* cb) {
     cb->retransmit_tail = nullptr;
 #ifdef TCP_DEBUG
     if (n > 0) {
-        log::debug("drain_rtx: freed %zu entries port=%u pool_free=%zu", n, cb->local_port, ker::net::pkt_pool_free_count());
+        log::debug("drain_rtx: freed %zu entries port=%u pool_free=%zu", n, cb->local.port, ker::net::pkt_pool_free_count());
     }
 #endif
 }
@@ -176,14 +176,14 @@ auto queue_in_order_payload(TcpCB* cb, Socket* sock, const uint8_t* payload, siz
     if (FREE < payload_len) {
         tcp_refresh_receive_window(cb);
 #ifdef TCP_DEBUG
-        log::trace("rx full: port=%u free=%zu payload=%zu rcv_nxt=%u", cb->local_port, FREE, payload_len, cb->rcv_nxt);
+        log::trace("rx full: port=%u free=%zu payload=%zu rcv_nxt=%u", cb->local.port, FREE, payload_len, cb->rcv_nxt);
 #endif
         return false;
     }
 
     ssize_t const WRITTEN = sock->rcvbuf.write(payload, payload_len);
     if (std::cmp_not_equal(WRITTEN, payload_len)) {
-        log::warn("rx partial queue write port=%u written=%zd payload=%zu free=%zu", cb->local_port, WRITTEN, payload_len, FREE);
+        log::warn("rx partial queue write port=%u written=%zd payload=%zu free=%zu", cb->local.port, WRITTEN, payload_len, FREE);
         if (WRITTEN <= 0) {
             tcp_refresh_receive_window(cb);
             return false;
@@ -531,7 +531,8 @@ auto discard_orphaned_payload(TcpCB* cb, size_t payload_len, uint32_t seg_seq) -
 }
 
 // Handle SYN on a listening socket.
-void handle_listen_syn(TcpCB* listener, const TcpHeader* hdr, IPv4Address src_ip, IPv4Address dst_ip) {
+void handle_listen_syn(TcpCB* listener, const TcpHeader* hdr, const SocketEndpoint& source, const SocketEndpoint& destination,
+                       uint32_t ingress_mtu) {
     Socket* listen_sock = listener->socket;
     if (listen_sock == nullptr) {
         return;
@@ -545,7 +546,7 @@ void handle_listen_syn(TcpCB* listener, const TcpHeader* hdr, IPv4Address src_ip
 
     if (!CAN_CREATE_CHILD) {
         if (std::cmp_greater_equal(AQ_COUNT, BACKLOG)) {
-            log::warn("accept queue full port=%u aq=%zu backlog=%d", listener->local_port, AQ_COUNT, BACKLOG);
+            log::warn("accept queue full port=%u aq=%zu backlog=%d", listener->local.port, AQ_COUNT, BACKLOG);
         }
         return;
     }
@@ -564,16 +565,23 @@ void handle_listen_syn(TcpCB* listener, const TcpHeader* hdr, IPv4Address src_ip
 
     child_cb->socket = child;
 
-    child_cb->local_ip = dst_ip;
-    child_cb->local_port = listener->local_port;
-    child_cb->remote_ip = src_ip;
-    child_cb->remote_port = ntohs(hdr->src_port);
+    SocketEndpoint const CHILD_SOURCE = tcp_endpoint_for_socket_domain(listen_sock->domain, source);
+    SocketEndpoint const CHILD_DESTINATION = tcp_endpoint_for_socket_domain(listen_sock->domain, destination);
 
-    child->local_v4.addr = dst_ip;
-    child->local_v4.port = listener->local_port;
-    child->remote_v4.addr = src_ip;
-    child->remote_v4.port = ntohs(hdr->src_port);
+    child_cb->local = CHILD_DESTINATION;
+    child_cb->local.port = listener->local.port;
+    child_cb->remote = CHILD_SOURCE;
+    child_cb->remote.port = ntohs(hdr->src_port);
+    child_cb->rcv_mss = tcp_receive_mss_for_path(child_cb->remote, ingress_mtu);
 
+    child->local = child_cb->local;
+    child->remote = child_cb->remote;
+    child->ipv6_v6only = listener->socket != nullptr && listener->socket->ipv6_v6only;
+    child->bound_ifindex = listen_sock->bound_ifindex;
+    child->reuse_addr = listen_sock->reuse_addr;
+    child->reuse_port = listen_sock->reuse_port;
+    child->ipv6_unicast_hops = listen_sock->ipv6_unicast_hops;
+    child->ipv6_multicast_hops = listen_sock->ipv6_multicast_hops;
     child->nonblock = listen_sock->nonblock;
 
     child_cb->irs = ntohl(hdr->seq);
@@ -581,7 +589,7 @@ void handle_listen_syn(TcpCB* listener, const TcpHeader* hdr, IPv4Address src_ip
     child_cb->rcv_wnd = child->rcvbuf.capacity;
     child_cb->rcv_wscale = tcp_wscale_for_buf(child->rcvbuf.capacity);
 
-    child_cb->iss = tcp_generate_iss(child_cb->local_ip, child_cb->local_port, child_cb->remote_ip, child_cb->remote_port);
+    child_cb->iss = tcp_generate_iss(child_cb->local, child_cb->remote);
     child_cb->snd_una = child_cb->iss;
     child_cb->snd_nxt = child_cb->iss + 1;
     // SYN window is not scaled (RFC 1323).
@@ -600,8 +608,8 @@ void handle_listen_syn(TcpCB* listener, const TcpHeader* hdr, IPv4Address src_ip
 }
 }  // namespace
 
-void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload, size_t payload_len, IPv4Address src_ip,
-                         IPv4Address dst_ip) {
+void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload, size_t payload_len, const SocketEndpoint& source,
+                         const SocketEndpoint& destination, uint32_t ingress_mtu) {
     NET_TRACE_SPAN(SPAN_TCP_PROCESS);
     uint8_t flags = hdr->flags;
     uint32_t const SEG_SEQ = ntohl(hdr->seq);
@@ -610,8 +618,9 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
 
     // Build ACK/wake decisions under lock, execute after unlock.
     PacketBuffer* deferred_ack = nullptr;
-    uint32_t defer_local = 0;
-    uint32_t defer_remote = 0;
+    SocketEndpoint defer_local{};
+    SocketEndpoint defer_remote{};
+    uint32_t defer_bound_ifindex = 0;
     bool defer_ack_pending = false;
     bool deferred_wake = false;
     uint64_t cb_lock_flags = 0;
@@ -622,6 +631,7 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
             pkt_free(deferred_ack);
         }
         deferred_ack = tcp_build_ack(cb, &defer_local, &defer_remote);
+        defer_bound_ifindex = cb->socket != nullptr ? cb->socket->bound_ifindex : 0;
         if (deferred_ack == nullptr) {
             defer_ack_pending = true;
         }
@@ -653,18 +663,21 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
 
     cb_lock_flags = cb->lock.lock_irqsave();
 
-    if (((flags & (TCP_FIN | TCP_RST)) != 0) && tcp_diag_ssh_tuple(cb->local_port, cb->remote_port)) {
+    if (((flags & (TCP_FIN | TCP_RST)) != 0) && tcp_diag_ssh_tuple(cb->local.port, cb->remote.port)) {
         size_t rcvbuf_used = 0;
         size_t rcvbuf_capacity = 0;
         if (cb->socket != nullptr) {
             rcvbuf_used = cb->socket->rcvbuf.available();
             rcvbuf_capacity = cb->socket->rcvbuf.capacity;
         }
-        log::warn("tcp-close-rx state=%u local=0x%08x:%u remote=0x%08x:%u flags=0x%x seq=%u ack=%u payload=%zu "
-                  "rcv_nxt=%u rcv_wnd=%u snd_una=%u snd_nxt=%u snd_wnd=%u rcvbuf=%zu/%zu ooo=%zu",
-                  static_cast<unsigned>(cb->state), cb->local_ip, cb->local_port, cb->remote_ip, cb->remote_port, flags, SEG_SEQ,
-                  seg_ack, payload_len, cb->rcv_nxt, cb->rcv_wnd, cb->snd_una, cb->snd_nxt, cb->snd_wnd, rcvbuf_used,
-                  rcvbuf_capacity, cb->ooo_bytes.load(std::memory_order_acquire));
+        log::warn(
+            "tcp-close-rx state=%u local=0x%08x:%u remote=0x%08x:%u flags=0x%x seq=%u ack=%u payload=%zu "
+            "rcv_nxt=%u rcv_wnd=%u snd_una=%u snd_nxt=%u snd_wnd=%u rcvbuf=%zu/%zu ooo=%zu",
+            static_cast<unsigned>(cb->state),
+            cb->local.is_ipv4() || cb->local.is_v4_mapped() ? cb->local.ipv4_address().to_host_order() : 0, cb->local.port,
+            cb->remote.is_ipv4() || cb->remote.is_v4_mapped() ? cb->remote.ipv4_address().to_host_order() : 0, cb->remote.port, flags,
+            SEG_SEQ, seg_ack, payload_len, cb->rcv_nxt, cb->rcv_wnd, cb->snd_una, cb->snd_nxt, cb->snd_wnd, rcvbuf_used, rcvbuf_capacity,
+            cb->ooo_bytes.load(std::memory_order_acquire));
     }
 
     switch (cb->state) {
@@ -724,16 +737,15 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
 
                     // Release cb->lock before tcp_find_listener (takes tcb_list_lock).
                     Socket* child_sock = cb->socket;
-                    uint32_t const SAVED_LOCAL_IP = cb->local_ip;
-                    uint16_t const SAVED_LOCAL_PORT = cb->local_port;
+                    SocketEndpoint const SAVED_LOCAL = cb->local;
                     cb->lock.unlock_irqrestore(cb_lock_flags);
 
                     if (child_sock != nullptr) {
-                        TcpCB* listener = tcp_find_listener(SAVED_LOCAL_IP, SAVED_LOCAL_PORT);
+                        TcpCB* listener = tcp_find_listener(SAVED_LOCAL, child_sock->bound_ifindex);
                         bool child_enqueued = false;
                         Socket* listener_sock_to_wake = nullptr;
 #ifdef TCP_DEBUG
-                        log::debug("SYN_RCVD->ESTAB: port=%u listener=%p owner_pid=%lu", SAVED_LOCAL_PORT, static_cast<void*>(listener),
+                        log::debug("SYN_RCVD->ESTAB: port=%u listener=%p owner_pid=%lu", SAVED_LOCAL.port, static_cast<void*>(listener),
                                    (listener != nullptr && listener->socket != nullptr) ? listener->socket->owner_pid : 0UL);
 #endif
                         if (listener != nullptr && listener->socket != nullptr) {
@@ -758,7 +770,7 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
                             lsock->lock.unlock_irqrestore(LSOCK_FLAGS);
                         } else {
 #ifdef TCP_DEBUG
-                            log::debug("SYN_RCVD->ESTAB: no listener found for port=%u", SAVED_LOCAL_PORT);
+                            log::debug("SYN_RCVD->ESTAB: no listener found for port=%u", SAVED_LOCAL.port);
 #endif
                         }
                         if (listener != nullptr) {
@@ -783,7 +795,7 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
                         build_deferred_ack();
                         cb->lock.unlock_irqrestore(cb_lock_flags);
                         if (deferred_ack != nullptr) {
-                            if (ipv4_tx(deferred_ack, defer_local, defer_remote, IPPROTO_TCP, TCP_IPV4_TTL) < 0) {
+                            if (tcp_transmit_prebuilt(deferred_ack, defer_local, defer_remote, defer_bound_ifindex) < 0) {
                                 cb_lock_flags = cb->lock.lock_irqsave();
                                 cb->ack_pending = true;
                                 tcp_timer_arm(cb);
@@ -840,7 +852,7 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
                         deferred_wake = true;
                     }
                     if (!payload_result.accepted && !payload_result.queued_out_of_order && SEG_SEQ == cb->rcv_nxt) {
-                        log::warn("rcvbuf full port=%u avail=%zu cap=%zu pktlen=%zu", cb->local_port, cb->socket->rcvbuf.available(),
+                        log::warn("rcvbuf full port=%u avail=%zu cap=%zu pktlen=%zu", cb->local.port, cb->socket->rcvbuf.available(),
                                   cb->socket->rcvbuf.capacity, payload_len);
                     }
                 }
@@ -984,9 +996,11 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
                 tcp_cb_release(cb);
 
                 uint16_t const L_PORT = ntohs(hdr->dst_port);
-                TcpCB* listener = tcp_find_listener(dst_ip, L_PORT);
+                SocketEndpoint listen_local = destination;
+                listen_local.port = L_PORT;
+                TcpCB* listener = tcp_find_listener(listen_local, cb->socket != nullptr ? cb->socket->bound_ifindex : 0);
                 if (listener != nullptr) {
-                    handle_listen_syn(listener, hdr, src_ip, dst_ip);
+                    handle_listen_syn(listener, hdr, source, destination, ingress_mtu);
                     tcp_cb_release(listener);
                 }
                 return;
@@ -1036,8 +1050,9 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
             }
             if ((flags & TCP_ACK) != 0 && seg_ack == cb->snd_nxt) {
                 PacketBuffer* closing_ack = deferred_ack;
-                uint32_t const CLOSING_ACK_LOCAL = defer_local;
-                uint32_t const CLOSING_ACK_REMOTE = defer_remote;
+                SocketEndpoint const CLOSING_ACK_LOCAL = defer_local;
+                SocketEndpoint const CLOSING_ACK_REMOTE = defer_remote;
+                uint32_t const CLOSING_ACK_IFINDEX = defer_bound_ifindex;
                 deferred_ack = nullptr;
                 defer_ack_pending = false;
 
@@ -1047,7 +1062,7 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
                 }
                 cb->lock.unlock_irqrestore(cb_lock_flags);
                 if (closing_ack != nullptr) {
-                    static_cast<void>(ipv4_tx(closing_ack, CLOSING_ACK_LOCAL, CLOSING_ACK_REMOTE, IPPROTO_TCP, TCP_IPV4_TTL));
+                    static_cast<void>(tcp_transmit_prebuilt(closing_ack, CLOSING_ACK_LOCAL, CLOSING_ACK_REMOTE, CLOSING_ACK_IFINDEX));
                 }
                 tcp_free_cb(cb);
                 tcp_cb_release(cb);
@@ -1066,9 +1081,11 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
                 tcp_cb_release(cb);
 
                 uint16_t const L_PORT = ntohs(hdr->dst_port);
-                TcpCB* listener = tcp_find_listener(dst_ip, L_PORT);
+                SocketEndpoint listen_local = destination;
+                listen_local.port = L_PORT;
+                TcpCB* listener = tcp_find_listener(listen_local, cb->socket != nullptr ? cb->socket->bound_ifindex : 0);
                 if (listener != nullptr) {
-                    handle_listen_syn(listener, hdr, src_ip, dst_ip);
+                    handle_listen_syn(listener, hdr, source, destination, ingress_mtu);
                     tcp_cb_release(listener);
                 }
                 return;
@@ -1088,7 +1105,7 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
 
     // Send deferred ACK outside cb->lock.
     if (deferred_ack != nullptr) {
-        if (ipv4_tx(deferred_ack, defer_local, defer_remote, IPPROTO_TCP, TCP_IPV4_TTL) < 0) {
+        if (tcp_transmit_prebuilt(deferred_ack, defer_local, defer_remote, defer_bound_ifindex) < 0) {
             cb_lock_flags = cb->lock.lock_irqsave();
             cb->ack_pending = true;
             tcp_timer_arm(cb);
@@ -1109,9 +1126,9 @@ void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload
     tcp_cb_release(cb);
 }
 
-void tcp_rx(NetDevice* dev, PacketBuffer* pkt, IPv4Address src_ip, IPv4Address dst_ip) {
-    (void)dev;
-
+namespace {
+void tcp_rx_checked(PacketBuffer* pkt, SocketEndpoint source, SocketEndpoint destination, bool allow_mapped_fallback,
+                    uint32_t ingress_ifindex, uint32_t ingress_mtu) {
     if (pkt->len < sizeof(TcpHeader)) {
         pkt_free(pkt);
         return;
@@ -1124,29 +1141,44 @@ void tcp_rx(NetDevice* dev, PacketBuffer* pkt, IPv4Address src_ip, IPv4Address d
         return;
     }
 
-    uint16_t const COMPUTED = pseudo_header_checksum(src_ip, dst_ip, IPPROTO_TCP, pkt->data, pkt->len);
-    if (COMPUTED != 0 && COMPUTED != 0xFFFF) {
-        pkt_free(pkt);
-        return;
-    }
-
     uint16_t const DST_PORT = ntohs(hdr->dst_port);
     uint16_t const SRC_PORT = ntohs(hdr->src_port);
+    destination.port = DST_PORT;
+    source.port = SRC_PORT;
 
     const uint8_t* payload = pkt->data + HDR_LEN;
     size_t const PAYLOAD_LEN = pkt->len - HDR_LEN;
 
-    TcpCB* cb = tcp_find_cb(dst_ip, DST_PORT, src_ip, SRC_PORT);
+    TcpCB* cb = tcp_find_cb(destination, source, ingress_ifindex);
+    if (cb == nullptr && allow_mapped_fallback) {
+        SocketEndpoint const MAPPED_LOCAL = SocketEndpoint::mapped_ipv4(destination.ipv4_address(), DST_PORT);
+        SocketEndpoint const MAPPED_REMOTE = SocketEndpoint::mapped_ipv4(source.ipv4_address(), SRC_PORT);
+        cb = tcp_find_cb(MAPPED_LOCAL, MAPPED_REMOTE, ingress_ifindex);
+        if (cb != nullptr) {
+            destination = MAPPED_LOCAL;
+            source = MAPPED_REMOTE;
+        }
+    }
     if (cb != nullptr) {
-        tcp_process_segment(cb, hdr, payload, PAYLOAD_LEN, src_ip, dst_ip);
+        tcp_process_segment(cb, hdr, payload, PAYLOAD_LEN, source, destination, ingress_mtu);
         pkt_free(pkt);
         return;
     }
 
     if ((hdr->flags & TCP_SYN) != 0 && (hdr->flags & TCP_ACK) == 0) {
-        TcpCB* listener = tcp_find_listener(dst_ip, DST_PORT);
+        TcpCB* listener = tcp_find_listener(destination, ingress_ifindex);
+        if (listener == nullptr && allow_mapped_fallback) {
+            destination = SocketEndpoint::mapped_ipv4(destination.ipv4_address(), DST_PORT);
+            source = SocketEndpoint::mapped_ipv4(source.ipv4_address(), SRC_PORT);
+            listener = tcp_find_listener(destination, ingress_ifindex);
+        }
         if (listener != nullptr) {
-            handle_listen_syn(listener, hdr, src_ip, dst_ip);
+            if (allow_mapped_fallback && listener->socket != nullptr && listener->socket->domain == SOCKADDR_V6_FAMILY &&
+                source.is_ipv4()) {
+                destination = SocketEndpoint::mapped_ipv4(destination.ipv4_address(), DST_PORT);
+                source = SocketEndpoint::mapped_ipv4(source.ipv4_address(), SRC_PORT);
+            }
+            handle_listen_syn(listener, hdr, source, destination, ingress_mtu);
             tcp_cb_release(listener);
             pkt_free(pkt);
             return;
@@ -1158,7 +1190,9 @@ void tcp_rx(NetDevice* dev, PacketBuffer* pkt, IPv4Address src_ip, IPv4Address d
         if ((hdr->flags & TCP_ACK) != 0) {
             // RST replies intentionally reverse the incoming tuple.
             // NOLINTNEXTLINE(readability-suspicious-call-argument)
-            tcp_send_rst(dst_ip, src_ip, DST_PORT, SRC_PORT, ntohl(hdr->ack), 0, 0);
+            SocketEndpoint reply_source = destination;
+            SocketEndpoint reply_destination = source;
+            tcp_send_rst(reply_source, reply_destination, ntohl(hdr->ack), 0, 0, ingress_ifindex);
         } else {
             uint32_t ack_seq = ntohl(hdr->seq) + static_cast<uint32_t>(PAYLOAD_LEN);
             if ((hdr->flags & TCP_SYN) != 0) {
@@ -1169,11 +1203,69 @@ void tcp_rx(NetDevice* dev, PacketBuffer* pkt, IPv4Address src_ip, IPv4Address d
             }
             // RST replies intentionally reverse the incoming tuple.
             // NOLINTNEXTLINE(readability-suspicious-call-argument)
-            tcp_send_rst(dst_ip, src_ip, DST_PORT, SRC_PORT, 0, ack_seq, TCP_ACK);
+            SocketEndpoint reply_source = destination;
+            SocketEndpoint reply_destination = source;
+            tcp_send_rst(reply_source, reply_destination, 0, ack_seq, TCP_ACK, ingress_ifindex);
         }
     }
 
     pkt_free(pkt);
+}
+}  // namespace
+
+void tcp_rx(NetDevice* dev, PacketBuffer* pkt, IPv4Address src_ip, IPv4Address dst_ip) {
+    if (pkt == nullptr || pseudo_header_checksum(src_ip, dst_ip, IPPROTO_TCP, pkt->data, pkt->len) != 0) {
+        pkt_free(pkt);
+        return;
+    }
+    tcp_rx_checked(pkt, SocketEndpoint::ipv4(src_ip), SocketEndpoint::ipv4(dst_ip), true, dev != nullptr ? dev->ifindex : 0,
+                   dev != nullptr ? dev->mtu : 0);
+}
+
+void tcp_rx_v6(NetDevice* dev, PacketBuffer* pkt, const IPv6RxInfo& info) {
+    if (pkt == nullptr ||
+        checksum_pseudo_ipv6(info.src, info.dst, IPV6_PROTO_TCP, static_cast<uint32_t>(pkt->len), pkt->data, pkt->len) != 0) {
+        pkt_free(pkt);
+        return;
+    }
+    uint32_t const SCOPE_ID = dev != nullptr ? dev->ifindex : 0;
+    tcp_rx_checked(pkt, SocketEndpoint::ipv6(info.src, 0, SCOPE_ID), SocketEndpoint::ipv6(info.dst, 0, SCOPE_ID), false, SCOPE_ID,
+                   dev != nullptr ? dev->mtu : 0);
+}
+
+void tcp_error_v6(const IPv6Address& local_addr, uint16_t local_port, const IPv6Address& remote_addr, uint16_t remote_port, uint8_t type,
+                  uint8_t code, uint32_t mtu, uint32_t scope_id) {
+    SocketEndpoint const LOCAL = SocketEndpoint::ipv6(local_addr, local_port, scope_id);
+    SocketEndpoint const REMOTE = SocketEndpoint::ipv6(remote_addr, remote_port, scope_id);
+    TcpCB* cb = tcp_find_cb(LOCAL, REMOTE, scope_id);
+    if (cb == nullptr) {
+        return;
+    }
+    Socket* wake_sock = nullptr;
+    uint64_t const FLAGS = cb->lock.lock_irqsave();
+    if (type == 2) {
+        if (mtu > sizeof(IPv6Header) + sizeof(TcpHeader)) {
+            uint16_t const NEW_MSS = static_cast<uint16_t>(std::min<size_t>(UINT16_MAX, mtu - sizeof(IPv6Header) - sizeof(TcpHeader)));
+            cb->snd_mss = std::min(cb->snd_mss, NEW_MSS);
+        }
+        if (cb->socket != nullptr) {
+            cb->socket->pending_error.store(EMSGSIZE, std::memory_order_release);
+        }
+    } else if (cb->socket != nullptr) {
+        cb->socket->pending_error.store(type == 1 && code == 4 ? ECONNREFUSED : EHOSTUNREACH, std::memory_order_release);
+        if (cb->state == TcpState::SYN_SENT) {
+            cb->state = TcpState::CLOSED;
+        }
+    }
+    if (cb->socket != nullptr && socket_try_acquire(cb->socket)) {
+        wake_sock = cb->socket;
+    }
+    cb->lock.unlock_irqrestore(FLAGS);
+    if (wake_sock != nullptr) {
+        socket_wake_waiters(wake_sock);
+        socket_release(wake_sock);
+    }
+    tcp_cb_release(cb);
 }
 
 }  // namespace ker::net::proto

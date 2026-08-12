@@ -16,6 +16,7 @@
 #include <net/netif.hpp>
 #include <net/netpoll.hpp>
 #include <net/route.hpp>
+#include <net/route6.hpp>
 #include <net/socket.hpp>
 #include <net/wki/dev_server.hpp>
 #include <net/wki/remotable.hpp>
@@ -56,7 +57,9 @@ constexpr int64_t SELECT_USEC_PER_SEC = 1000000;
 constexpr int SELECT_TIMEOUT_MAX_MS = 0x7fffffff;
 constexpr size_t SOCKET_IO_BOUNCE_STACK_CHUNK = 4096;
 constexpr size_t SOCKET_IO_BOUNCE_MAX_CHUNK = size_t{256} * 1024;
-constexpr size_t SOCKADDR_STORAGE_MAX = 28;
+// Match the userspace sockaddr_storage ABI. Individual protocol parsers still
+// require their exact minimum/family-specific lengths.
+constexpr size_t SOCKADDR_STORAGE_MAX = 128;
 constexpr size_t SOCKET_OPTION_MAX = (size_t{64} * 1024) - 16;
 
 struct KPollFd {
@@ -720,13 +723,18 @@ auto addr_len_for_domain(int domain) -> size_t {
     return 16;  // sizeof(sockaddr_in) with padding
 }
 
-// Fill a sockaddr_in from socket local address
-void fill_sockaddr_v4(void* addr_out, size_t* addr_len, uint32_t ip, uint16_t port) {
-    size_t max_len = ker::net::SOCKADDR_V4_LEN;
-    if (addr_len != nullptr) {
-        max_len = *addr_len;
+auto copy_sockaddr_io_v1_from_user(ker::mod::sched::task::Task& task, uint64_t user_addr, ker::abi::net::SockaddrIoV1& io) -> int {
+    if (user_addr == 0 || !ker::mod::sys::usercopy::copy_value_from_task(task, user_addr, io)) {
+        return -EFAULT;
     }
-    ker::net::socket_fill_sockaddr_v4(addr_out, max_len, addr_len, ip, port);
+    if (io.size < sizeof(io) || io.version != ker::abi::net::SOCKADDR_IO_VERSION_1 || io.reserved != 0 ||
+        io.address_length > SOCKADDR_STORAGE_MAX) {
+        return -EINVAL;
+    }
+    if (io.address == 0 && io.address_length != 0) {
+        return -EINVAL;
+    }
+    return 0;
 }
 
 template <typename Fn>
@@ -783,9 +791,28 @@ constexpr uint32_t IFF_MULTICAST = 0x1000;
 constexpr uint32_t IFF_LOWER_UP = 0x10000;
 
 constexpr uint16_t WOS_AF_INET = 2;
+constexpr uint16_t WOS_AF_INET6 = 10;
+constexpr int WOS_SOCK_STREAM = 1;
+constexpr int WOS_SOCK_DGRAM = 2;
+constexpr int WOS_SOCK_RAW = 3;
+constexpr int WOS_SOCK_TYPE_MASK = 0x0F;
+constexpr int WOS_IPPROTO_TCP = 6;
+constexpr int WOS_IPPROTO_UDP = 17;
 constexpr uint16_t WOS_ARPHRD_ETHER = 1;
 constexpr uint16_t WOS_ARPHRD_LOOPBACK = 772;
+constexpr uint32_t WOS_IFA_F_DADFAILED = 0x08;
+constexpr uint32_t WOS_IFA_F_DEPRECATED = 0x20;
+constexpr uint32_t WOS_IFA_F_TENTATIVE = 0x40;
 constexpr uint32_t WOS_IFA_F_PERMANENT = 0x80;
+constexpr uint32_t WOS_IFA_F_NOPREFIXROUTE = 0x200;
+constexpr uint32_t WOS_IFA_F_AUTOCONF = 0x00010000;
+constexpr uint32_t WOS_IFA_F_NODAD = 0x00020000;
+constexpr uint32_t WOS_IPV6_ADDR_STATE_FLAGS = WOS_IFA_F_DADFAILED | WOS_IFA_F_DEPRECATED | WOS_IFA_F_TENTATIVE;
+constexpr uint32_t WOS_IPV6_ADDR_INPUT_FLAGS = WOS_IFA_F_PERMANENT | WOS_IFA_F_NOPREFIXROUTE | WOS_IFA_F_AUTOCONF | WOS_IFA_F_NODAD;
+
+constexpr uint16_t WOS_NETCTL_VERSION_1 = 1;
+constexpr uint32_t WOS_NET_ROUTE_F_GATEWAY = 1U << 0;
+constexpr uint32_t WOS_NET_ROUTE_F_AUTOCONF = 1U << 1;
 
 constexpr uint32_t WOS_NET_LINK_SET_FLAGS = 1U << 0;
 constexpr uint32_t WOS_NET_LINK_SET_MTU = 1U << 1;
@@ -848,6 +875,31 @@ struct WosNetAddrReq {
     uint8_t replace;
 };
 
+struct WosNetAddrReqV2 {
+    uint32_t size;
+    uint16_t version;
+    uint16_t reserved;
+    WosNetAddrReq address;
+    uint32_t preferred_lifetime_s;
+    uint32_t valid_lifetime_s;
+};
+
+struct WosNetRouteRecord {
+    uint32_t size;
+    uint16_t version;
+    uint16_t family;
+    uint32_t ifindex;
+    uint32_t metric;
+    uint32_t flags;
+    uint8_t prefix_len;
+    uint8_t scope;
+    uint16_t reserved;
+    uint8_t destination[WOS_NET_ADDR_LEN];
+    uint8_t gateway[WOS_NET_ADDR_LEN];
+    uint32_t lifetime_s;
+    uint32_t reserved2;
+};
+
 struct WosNetLinkSetReq {
     uint32_t ifindex;
     char ifname[WOS_NET_IF_NAME_LEN];
@@ -866,6 +918,8 @@ struct WosNetLinkSetReq {
 static_assert(sizeof(WosNetIfInfo) == 52);
 static_assert(sizeof(WosNetAddrInfo) == 76);
 static_assert(sizeof(WosNetAddrReq) == 48);
+static_assert(sizeof(WosNetAddrReqV2) == 64);
+static_assert(sizeof(WosNetRouteRecord) == 64);
 static_assert(sizeof(WosNetLinkSetReq) == 68);
 
 auto prefix_to_mask(uint8_t prefix) -> uint32_t {
@@ -885,6 +939,78 @@ auto mask_to_prefix(uint32_t mask) -> uint8_t {
         mask <<= 1;
     }
     return prefix;
+}
+
+auto netctl_lifetime_deadline_ms(uint32_t lifetime_s) -> uint64_t {
+    if (lifetime_s == UINT32_MAX) {
+        return UINT64_MAX;
+    }
+    uint64_t const NOW_MS = ker::mod::time::get_ms();
+    uint64_t const DELTA_MS = static_cast<uint64_t>(lifetime_s) * 1000U;
+    return UINT64_MAX - NOW_MS < DELTA_MS ? UINT64_MAX : NOW_MS + DELTA_MS;
+}
+
+auto netctl_remaining_lifetime_s(uint64_t expires_at_ms, uint64_t now_ms) -> uint32_t {
+    if (expires_at_ms == UINT64_MAX) {
+        return UINT32_MAX;
+    }
+    if (expires_at_ms <= now_ms) {
+        return 0;
+    }
+    uint64_t const REMAINING_MS = expires_at_ms - now_ms;
+    uint64_t const ROUNDED_SECONDS = (REMAINING_MS + 999U) / 1000U;
+    return static_cast<uint32_t>(std::min<uint64_t>(ROUNDED_SECONDS, UINT32_MAX - 1U));
+}
+
+auto netctl_bytes_all_zero(const uint8_t* bytes, size_t length) -> bool {
+    return std::all_of(bytes, bytes + length, [](uint8_t byte) { return byte == 0; });
+}
+
+auto netctl_ipv6_scope(const ker::net::proto::IPv6Address& address) -> uint8_t {
+    if (address.is_loopback()) {
+        return 254;
+    }
+    return address.is_link_local_unicast() ? 253 : 0;
+}
+
+auto netctl_parse_ipv6_address_request(const WosNetAddrReq& request, ker::net::proto::IPv6Address& address) -> int {
+    bool const ADDRESS_PRESENT = !netctl_bytes_all_zero(request.address, WOS_NET_ADDR_LEN);
+    bool const LOCAL_PRESENT = !netctl_bytes_all_zero(request.local, WOS_NET_ADDR_LEN);
+    if (request.prefix_len > 128 || request.replace > 1 || (request.flags & WOS_IPV6_ADDR_STATE_FLAGS) != 0 ||
+        (request.flags & ~WOS_IPV6_ADDR_INPUT_FLAGS) != 0 ||
+        (ADDRESS_PRESENT && LOCAL_PRESENT && std::memcmp(request.address, request.local, WOS_NET_ADDR_LEN) != 0)) {
+        return -EINVAL;
+    }
+
+    std::memcpy(address.data(), LOCAL_PRESENT ? request.local : request.address, address.size());
+    if (address.is_unspecified() || address.is_multicast() || request.scope != netctl_ipv6_scope(address)) {
+        return -EINVAL;
+    }
+    return 0;
+}
+
+auto netctl_ipv6_route_scope(const ker::net::proto::IPv6Address& destination, uint8_t prefix_len,
+                             const ker::net::proto::IPv6Address& gateway) -> uint8_t {
+    if ((prefix_len == 128 && destination.is_loopback()) || gateway.is_loopback()) {
+        return 254;
+    }
+    if (destination.is_link_local_unicast() || gateway.is_link_local_unicast()) {
+        return 253;
+    }
+    return 0;
+}
+
+auto socket_protocol_supported(int type, int protocol) -> bool {
+    switch (type & WOS_SOCK_TYPE_MASK) {
+        case WOS_SOCK_STREAM:
+            return protocol == 0 || protocol == WOS_IPPROTO_TCP;
+        case WOS_SOCK_DGRAM:
+            return protocol == 0 || protocol == WOS_IPPROTO_UDP;
+        case WOS_SOCK_RAW:
+            return protocol > 0 && protocol <= UINT8_MAX;
+        default:
+            return false;
+    }
 }
 
 auto effective_ifflags(ker::net::NetDevice* dev) -> uint32_t {
@@ -1005,6 +1131,13 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             int const DOMAIN = static_cast<int>(a1);
             int const TYPE = static_cast<int>(a2);
             int const PROTOCOL = static_cast<int>(a3);
+
+            if (DOMAIN != WOS_AF_INET && DOMAIN != WOS_AF_INET6) {
+                return static_cast<uint64_t>(-EAFNOSUPPORT);
+            }
+            if (!socket_protocol_supported(TYPE, PROTOCOL)) {
+                return static_cast<uint64_t>(-EPROTONOSUPPORT);
+            }
 
             auto* sock = ker::net::socket_create(DOMAIN, TYPE, PROTOCOL);
             if (sock == nullptr) {
@@ -1274,6 +1407,94 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             return static_cast<uint64_t>(RESULT);
         }
 
+        case ker::abi::net::ops::SENDTO_EX: {
+            // a1=fd, a2=buf, a3=len, a4=flags, a5=SockaddrIoV1*
+            auto handle = fd_to_socket(a1);
+            auto* sock = handle.sock;
+            if (sock == nullptr) {
+                return static_cast<uint64_t>(-EBADF);
+            }
+            if (sock->proto_ops == nullptr || sock->proto_ops->sendto == nullptr) {
+                return static_cast<uint64_t>(-ENOSYS);
+            }
+            auto* task = ker::mod::sched::get_current_task();
+            if (task == nullptr) {
+                return static_cast<uint64_t>(-ESRCH);
+            }
+
+            ker::abi::net::SockaddrIoV1 io{};
+            int const IO_RESULT = copy_sockaddr_io_v1_from_user(*task, a5, io);
+            if (IO_RESULT < 0) {
+                return static_cast<uint64_t>(IO_RESULT);
+            }
+
+            std::array<uint8_t, SOCKADDR_STORAGE_MAX> address{};
+            const void* address_ptr = nullptr;
+            size_t const ADDRESS_LEN = static_cast<size_t>(io.address_length);
+            if (ADDRESS_LEN != 0) {
+                if (!ker::mod::sys::usercopy::copy_from_task(*task, io.address, address.data(), ADDRESS_LEN)) {
+                    return static_cast<uint64_t>(-EFAULT);
+                }
+                address_ptr = address.data();
+            }
+
+            ssize_t const RESULT = socket_send_user_bounced(
+                handle.file, sock, a2, static_cast<size_t>(a3), static_cast<int>(a4), [&](const void* buf, size_t len, int flags) {
+                    return sock->proto_ops->sendto(sock, buf, len, flags, address_ptr, ADDRESS_LEN);
+                });
+            return static_cast<uint64_t>(RESULT);
+        }
+
+        case ker::abi::net::ops::RECVFROM_EX: {
+            // a1=fd, a2=buf, a3=len, a4=flags, a5=SockaddrIoV1*
+            auto handle = fd_to_socket(a1);
+            auto* sock = handle.sock;
+            if (sock == nullptr) {
+                return static_cast<uint64_t>(-EBADF);
+            }
+            if (sock->proto_ops == nullptr || sock->proto_ops->recvfrom == nullptr) {
+                return static_cast<uint64_t>(-ENOSYS);
+            }
+            auto* task = ker::mod::sched::get_current_task();
+            if (task == nullptr) {
+                return static_cast<uint64_t>(-ESRCH);
+            }
+
+            ker::abi::net::SockaddrIoV1 io{};
+            int const IO_RESULT = copy_sockaddr_io_v1_from_user(*task, a5, io);
+            if (IO_RESULT < 0) {
+                return static_cast<uint64_t>(IO_RESULT);
+            }
+            if (io.address != 0 && io.result_length == 0) {
+                return static_cast<uint64_t>(-EINVAL);
+            }
+
+            size_t const ADDRESS_CAPACITY = static_cast<size_t>(io.address_length);
+            if ((ADDRESS_CAPACITY != 0 && !ker::mod::sys::usercopy::ensure_writable(*task, io.address, ADDRESS_CAPACITY)) ||
+                (io.result_length != 0 && !ker::mod::sys::usercopy::ensure_writable(*task, io.result_length, sizeof(uint64_t)))) {
+                return static_cast<uint64_t>(-EFAULT);
+            }
+
+            std::array<uint8_t, SOCKADDR_STORAGE_MAX> address{};
+            size_t address_len = ADDRESS_CAPACITY;
+            void* address_ptr = io.address != 0 ? address.data() : nullptr;
+            ssize_t const RESULT = socket_recv_user_bounced(
+                handle.file, sock, a2, static_cast<size_t>(a3), static_cast<int>(a4), [&](void* buf, size_t len, int flags) {
+                    return sock->proto_ops->recvfrom(sock, buf, len, flags, address_ptr, &address_len);
+                });
+            if (RESULT < 0) {
+                return static_cast<uint64_t>(RESULT);
+            }
+
+            size_t const COPY_LEN = std::min(ADDRESS_CAPACITY, address_len);
+            uint64_t const FULL_LEN = address_len;
+            if ((COPY_LEN != 0 && !ker::mod::sys::usercopy::copy_to_task(*task, io.address, address.data(), COPY_LEN)) ||
+                (io.result_length != 0 && !ker::mod::sys::usercopy::copy_value_to_task(*task, io.result_length, FULL_LEN))) {
+                return static_cast<uint64_t>(-EFAULT);
+            }
+            return static_cast<uint64_t>(RESULT);
+        }
+
         case ker::abi::net::ops::SETSOCKOPT: {
             // a1=fd, a2=level, a3=optname, a4=optval_ptr, a5=optlen
             auto handle = fd_to_socket(a1);
@@ -1400,18 +1621,15 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                 }
                 return static_cast<uint64_t>(-EBADF);
             }
-            if (sock->domain == 2) {  // AF_INET
-                if (sock->remote_v4.port == 0 && sock->remote_v4.addr == 0) {
-                    return static_cast<uint64_t>(-ENOTCONN);
-                }
-                int const RESULT = socket_name_to_user(a2, a3, ker::net::SOCKADDR_V4_LEN, [&](void* addr, size_t* len) {
-                    fill_sockaddr_v4(addr, len, sock->remote_v4.addr, sock->remote_v4.port);
-                    return 0;
-                });
-                return static_cast<uint64_t>(RESULT);
-            } else {
-                return static_cast<uint64_t>(-EAFNOSUPPORT);
+            if (sock->remote.port == 0 && sock->remote.is_unspecified()) {
+                return static_cast<uint64_t>(-ENOTCONN);
             }
+            size_t const DEFAULT_CAPACITY = sock->domain == WOS_AF_INET6 ? ker::net::SOCKADDR_V6_LEN : ker::net::SOCKADDR_V4_LEN;
+            int const RESULT = socket_name_to_user(a2, a3, DEFAULT_CAPACITY, [&](void* addr, size_t* len) {
+                size_t const CAPACITY = *len;
+                return ker::net::socket_fill_sockaddr(sock->remote, addr, CAPACITY, len);
+            });
+            return static_cast<uint64_t>(RESULT);
         }
 
         case ker::abi::net::ops::GETSOCKNAME: {
@@ -1421,15 +1639,12 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             if (sock == nullptr) {
                 return static_cast<uint64_t>(-EBADF);
             }
-            if (sock->domain == 2) {  // AF_INET
-                int const RESULT = socket_name_to_user(a2, a3, ker::net::SOCKADDR_V4_LEN, [&](void* addr, size_t* len) {
-                    fill_sockaddr_v4(addr, len, sock->local_v4.addr, sock->local_v4.port);
-                    return 0;
-                });
-                return static_cast<uint64_t>(RESULT);
-            } else {
-                return static_cast<uint64_t>(-EAFNOSUPPORT);
-            }
+            size_t const DEFAULT_CAPACITY = sock->domain == WOS_AF_INET6 ? ker::net::SOCKADDR_V6_LEN : ker::net::SOCKADDR_V4_LEN;
+            int const RESULT = socket_name_to_user(a2, a3, DEFAULT_CAPACITY, [&](void* addr, size_t* len) {
+                size_t const CAPACITY = *len;
+                return ker::net::socket_fill_sockaddr(sock->local, addr, CAPACITY, len);
+            });
+            return static_cast<uint64_t>(RESULT);
         }
 
         case ker::abi::net::ops::IOCTL_NET: {
@@ -1757,7 +1972,7 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                 return static_cast<uint64_t>(-EFAULT);
             }
 
-            std::array<WosNetAddrInfo, ker::net::MAX_NET_DEVICES * ker::net::MAX_ADDRS_PER_IF> output{};
+            std::array<WosNetAddrInfo, ker::net::MAX_NET_DEVICES * ker::net::MAX_ADDRS_PER_IF * 2> output{};
             size_t total = 0;
             for (size_t i = 0; i < ker::net::netdev_count(); i++) {
                 auto dev_ref = ker::net::netdev_at_ref(i);
@@ -1781,6 +1996,22 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                     std::memcpy(info.broadcast, &brd_be, sizeof(brd_be));
                     total++;
                 }
+
+                std::array<ker::net::IPv6Addr, ker::net::MAX_ADDRS_PER_IF> ipv6{};
+                size_t const IPV6_COUNT = ker::net::netif_ipv6_snapshot(dev, ipv6.data(), ipv6.size());
+                for (size_t j = 0; j < std::min(IPV6_COUNT, ipv6.size()); ++j) {
+                    auto& info = output.at(total);
+                    auto const& address = ipv6.at(j);
+                    info.ifindex = dev->ifindex;
+                    info.family = WOS_AF_INET6;
+                    info.prefix_len = address.prefix_len;
+                    info.scope = address.addr.is_loopback() ? 254 : (address.addr.is_link_local() ? 253 : 0);
+                    info.flags = address.flags;
+                    copy_cstr_trunc(std::span<char, WOS_NET_IF_NAME_LEN>{info.label}, dev->name.data());
+                    std::memcpy(info.address, address.addr.data(), address.addr.size());
+                    std::memcpy(info.local, address.addr.data(), address.addr.size());
+                    total++;
+                }
             }
 
             size_t const EMIT = a1 != 0 ? std::min(capacity, total) : 0;
@@ -1802,14 +2033,27 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             if (!ker::mod::sys::usercopy::copy_value_from_task(*task, a1, req)) {
                 return static_cast<uint64_t>(-EFAULT);
             }
-            if (req.family != WOS_AF_INET) {
-                return static_cast<uint64_t>(-EINVAL);
-            }
             auto dev_ref = find_dev_by_ifindex(req.ifindex);
             if (!dev_ref) {
                 return static_cast<uint64_t>(-ENODEV);
             }
             auto* dev = dev_ref.get();
+            if (req.family == WOS_AF_INET6) {
+                ker::net::proto::IPv6Address address{};
+                int const PARSE_RESULT = netctl_parse_ipv6_address_request(req, address);
+                if (PARSE_RESULT < 0) {
+                    return static_cast<uint64_t>(PARSE_RESULT);
+                }
+                uint32_t flags = req.flags;
+                if (flags == 0) {
+                    flags = WOS_IFA_F_PERMANENT | WOS_IFA_F_NODAD;
+                }
+                int const RET = ker::net::netif_set_ipv6(dev, address, req.prefix_len, flags, UINT64_MAX, UINT64_MAX, req.replace != 0);
+                return static_cast<uint64_t>(RET);
+            }
+            if (req.family != WOS_AF_INET || req.prefix_len > 32) {
+                return static_cast<uint64_t>(-EINVAL);
+            }
             uint32_t addr_be = 0;
             std::memcpy(&addr_be, req.local, sizeof(addr_be));
             if (addr_be == 0) {
@@ -1830,14 +2074,23 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             if (!ker::mod::sys::usercopy::copy_value_from_task(*task, a1, req)) {
                 return static_cast<uint64_t>(-EFAULT);
             }
-            if (req.family != WOS_AF_INET) {
-                return static_cast<uint64_t>(-EINVAL);
-            }
             auto dev_ref = find_dev_by_ifindex(req.ifindex);
             if (!dev_ref) {
                 return static_cast<uint64_t>(-ENODEV);
             }
             auto* dev = dev_ref.get();
+            if (req.family == WOS_AF_INET6) {
+                ker::net::proto::IPv6Address address{};
+                int const PARSE_RESULT = netctl_parse_ipv6_address_request(req, address);
+                if (PARSE_RESULT < 0) {
+                    return static_cast<uint64_t>(PARSE_RESULT);
+                }
+                int const RET = ker::net::netif_del_ipv6(dev, address, req.prefix_len);
+                return static_cast<uint64_t>(RET);
+            }
+            if (req.family != WOS_AF_INET || req.prefix_len > 32) {
+                return static_cast<uint64_t>(-EINVAL);
+            }
             uint32_t addr_be = 0;
             std::memcpy(&addr_be, req.local, sizeof(addr_be));
             if (addr_be == 0) {
@@ -1846,6 +2099,118 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             uint32_t const ADDR = ker::net::ntohl(addr_be);
             uint32_t const MASK = prefix_to_mask(req.prefix_len);
             int const RET = ker::net::netif_del_ipv4(dev, ADDR, MASK);
+            return static_cast<uint64_t>(RET);
+        }
+
+        case ker::abi::net::ops::NETCTL_ADDR_SET_V2: {
+            auto* task = ker::mod::sched::get_current_task();
+            WosNetAddrReqV2 req{};
+            if (task == nullptr) {
+                return static_cast<uint64_t>(-ESRCH);
+            }
+            if (!ker::mod::sys::usercopy::copy_value_from_task(*task, a1, req)) {
+                return static_cast<uint64_t>(-EFAULT);
+            }
+            if (req.size != sizeof(req) || req.version != WOS_NETCTL_VERSION_1 || req.reserved != 0 || req.address.family != WOS_AF_INET6 ||
+                req.address.prefix_len > 128 || req.preferred_lifetime_s > req.valid_lifetime_s) {
+                return static_cast<uint64_t>(-EINVAL);
+            }
+            auto dev_ref = find_dev_by_ifindex(req.address.ifindex);
+            if (!dev_ref) {
+                return static_cast<uint64_t>(-ENODEV);
+            }
+            ker::net::proto::IPv6Address address{};
+            int const PARSE_RESULT = netctl_parse_ipv6_address_request(req.address, address);
+            if (PARSE_RESULT < 0) {
+                return static_cast<uint64_t>(PARSE_RESULT);
+            }
+            uint64_t const PREFERRED_UNTIL = netctl_lifetime_deadline_ms(req.preferred_lifetime_s);
+            uint64_t const VALID_UNTIL = netctl_lifetime_deadline_ms(req.valid_lifetime_s);
+            int const RET = ker::net::netif_set_ipv6(dev_ref.get(), address, req.address.prefix_len, req.address.flags, PREFERRED_UNTIL,
+                                                     VALID_UNTIL, req.address.replace != 0);
+            return static_cast<uint64_t>(RET);
+        }
+
+        case ker::abi::net::ops::NETCTL_ROUTE_LIST: {
+            auto* task = ker::mod::sched::get_current_task();
+            if (task == nullptr) {
+                return static_cast<uint64_t>(-ESRCH);
+            }
+            size_t capacity = 0;
+            if (!ker::mod::sys::usercopy::copy_value_from_task(*task, a2, capacity) ||
+                !ker::mod::sys::usercopy::ensure_writable(*task, a2, sizeof(capacity))) {
+                return static_cast<uint64_t>(-EFAULT);
+            }
+
+            std::array<ker::net::IPv6RouteSnapshot, ker::net::MAX_IPV6_ROUTES> snapshots{};
+            size_t const TOTAL = ker::net::route6_snapshot(snapshots.data(), snapshots.size());
+            size_t const EMIT = a1 != 0 ? std::min({capacity, TOTAL, snapshots.size()}) : 0;
+            size_t const OUTPUT_BYTES = EMIT * sizeof(WosNetRouteRecord);
+            if (OUTPUT_BYTES != 0 && !ker::mod::sys::usercopy::ensure_writable(*task, a1, OUTPUT_BYTES)) {
+                return static_cast<uint64_t>(-EFAULT);
+            }
+
+            std::array<WosNetRouteRecord, ker::net::MAX_IPV6_ROUTES> output{};
+            uint64_t const NOW_MS = ker::mod::time::get_ms();
+            for (size_t i = 0; i < EMIT; ++i) {
+                auto& row = output.at(i);
+                auto const& route = snapshots.at(i);
+                row.size = sizeof(row);
+                row.version = WOS_NETCTL_VERSION_1;
+                row.family = WOS_AF_INET6;
+                row.ifindex = route.ifindex;
+                row.metric = route.metric;
+                row.flags = route.flags & (WOS_NET_ROUTE_F_GATEWAY | WOS_NET_ROUTE_F_AUTOCONF);
+                row.prefix_len = route.prefix_len;
+                row.scope = netctl_ipv6_route_scope(route.prefix, route.prefix_len, route.gateway);
+                std::memcpy(row.destination, route.prefix.data(), route.prefix.size());
+                std::memcpy(row.gateway, route.gateway.data(), route.gateway.size());
+                row.lifetime_s = netctl_remaining_lifetime_s(route.expires_at_ms, NOW_MS);
+            }
+            if ((OUTPUT_BYTES != 0 && !ker::mod::sys::usercopy::copy_to_task(*task, a1, output.data(), OUTPUT_BYTES)) ||
+                !ker::mod::sys::usercopy::copy_value_to_task(*task, a2, TOTAL)) {
+                return static_cast<uint64_t>(-EFAULT);
+            }
+            return 0;
+        }
+
+        case ker::abi::net::ops::NETCTL_ROUTE_SET:
+        case ker::abi::net::ops::NETCTL_ROUTE_DEL: {
+            auto* task = ker::mod::sched::get_current_task();
+            WosNetRouteRecord req{};
+            if (task == nullptr) {
+                return static_cast<uint64_t>(-ESRCH);
+            }
+            if (!ker::mod::sys::usercopy::copy_value_from_task(*task, a1, req)) {
+                return static_cast<uint64_t>(-EFAULT);
+            }
+            constexpr uint32_t ALLOWED_FLAGS = WOS_NET_ROUTE_F_GATEWAY | WOS_NET_ROUTE_F_AUTOCONF;
+            if (req.size != sizeof(req) || req.version != WOS_NETCTL_VERSION_1 || req.family != WOS_AF_INET6 || req.prefix_len > 128 ||
+                req.reserved != 0 || req.reserved2 != 0 || (req.flags & ~ALLOWED_FLAGS) != 0) {
+                return static_cast<uint64_t>(-EINVAL);
+            }
+            auto dev_ref = find_dev_by_ifindex(req.ifindex);
+            if (!dev_ref) {
+                return static_cast<uint64_t>(-ENODEV);
+            }
+            ker::net::proto::IPv6Address destination{};
+            ker::net::proto::IPv6Address gateway{};
+            std::memcpy(destination.data(), req.destination, destination.size());
+            std::memcpy(gateway.data(), req.gateway, gateway.size());
+            bool const HAS_GATEWAY = (req.flags & WOS_NET_ROUTE_F_GATEWAY) != 0;
+            uint8_t const EXPECTED_SCOPE = netctl_ipv6_route_scope(destination, req.prefix_len, gateway);
+            if (destination.is_multicast() || gateway.is_multicast() || HAS_GATEWAY == gateway.is_unspecified() ||
+                destination != destination.masked(req.prefix_len) || req.scope != EXPECTED_SCOPE) {
+                return static_cast<uint64_t>(-EINVAL);
+            }
+            ker::net::IPv6RouteSpec spec{.prefix = destination,
+                                         .gateway = gateway,
+                                         .prefix_len = req.prefix_len,
+                                         .metric = req.metric,
+                                         .flags = req.flags,
+                                         .expires_at_ms = netctl_lifetime_deadline_ms(req.lifetime_s),
+                                         .dev_identity = dev_ref.identity()};
+            int const RET = net_op == ker::abi::net::ops::NETCTL_ROUTE_SET ? ker::net::route6_add(spec) : ker::net::route6_del(spec);
             return static_cast<uint64_t>(RET);
         }
 

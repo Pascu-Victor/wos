@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstddef>
@@ -11,6 +12,8 @@
 #include <platform/sys/spinlock.hpp>
 
 namespace ker::net::proto {
+
+struct IPv6RxInfo;
 
 struct TcpHeader {
     uint16_t src_port{};
@@ -88,16 +91,40 @@ constexpr uint8_t TCP_OOO_ACK_PROBE_MAX_COUNT = 64;
 // Per-send syscall burst before returning a partial count; not an in-flight cap.
 constexpr uint32_t TCP_SEND_BURST_BYTES = 1024U * 1024U;
 
+// MSS advertised to a peer is bounded by both the ingress path MTU and the
+// largest packet this stack can represent. Native IPv6 needs 40 more bytes of
+// network header than its payload, in addition to the base TCP header.
+[[nodiscard]] inline auto tcp_receive_mss_for_path(const SocketEndpoint& peer, uint32_t mtu) -> uint16_t {
+    bool const NATIVE_IPV6 = peer.is_ipv6() && !peer.is_v4_mapped();
+    size_t const NETWORK_HEADER = NATIVE_IPV6 ? 40U : 20U;
+    size_t const OVERHEAD = NETWORK_HEADER + sizeof(TcpHeader);
+    size_t const FALLBACK = NATIVE_IPV6 ? 1220U : 536U;
+    size_t const MTU_PAYLOAD = mtu == 0 ? FALLBACK : (mtu > OVERHEAD ? static_cast<size_t>(mtu) - OVERHEAD : 1U);
+    size_t const BUFFER_PAYLOAD = PKT_BUF_SIZE - PKT_HEADROOM - OVERHEAD;
+    return static_cast<uint16_t>(std::min({static_cast<size_t>(UINT16_MAX), MTU_PAYLOAD, BUFFER_PAYLOAD}));
+}
+
+// Normalize an on-wire endpoint to the address family exposed by a socket.
+// In particular, a dual-stack AF_INET6 listener must retain accepted IPv4
+// peers as ::ffff endpoints so hash lookup and sockaddr reporting agree.
+inline auto tcp_endpoint_for_socket_domain(int domain, const SocketEndpoint& endpoint) -> SocketEndpoint {
+    if (domain == SOCKADDR_V6_FAMILY && endpoint.is_ipv4()) {
+        return SocketEndpoint::mapped_ipv4(endpoint.ipv4_address(), endpoint.port);
+    }
+    if (domain == SOCKADDR_V4_FAMILY && endpoint.is_v4_mapped()) {
+        return SocketEndpoint::ipv4(endpoint.ipv4_address(), endpoint.port);
+    }
+    return endpoint;
+}
+
 struct TcpCB {
     TcpState state = TcpState::CLOSED;
 
     // Reference count.
     std::atomic<uint32_t> refcnt = 1;
 
-    uint32_t local_ip = 0;
-    uint32_t remote_ip = 0;
-    uint16_t local_port = 0;
-    uint16_t remote_port = 0;
+    SocketEndpoint local{};
+    SocketEndpoint remote{};
 
     uint32_t snd_una = 0;  // oldest unACKed sequence number
     uint32_t snd_nxt = 0;  // next sequence number to send
@@ -173,12 +200,20 @@ struct TcpHashBucket {
     ker::mod::sys::Spinlock lock;
 };
 
-inline auto tcp_hash_4tuple(uint32_t lip, uint16_t lp, uint32_t rip, uint16_t rp) -> uint32_t {
-    // Exclude local_ip so INADDR_ANY lookups and inserts share buckets.
-    (void)lip;
-    uint32_t h = rip ^ (static_cast<uint32_t>(lp) << 16 | rp);
+inline auto tcp_hash_tuple(const SocketEndpoint& local, const SocketEndpoint& remote) -> uint32_t {
+    // Exclude the local address so wildcard listeners/connections and concrete
+    // destinations share the lookup bucket, but retain family and both ports.
+    uint32_t h = static_cast<uint32_t>(remote.family) ^ (static_cast<uint32_t>(local.port) << 16U) ^ remote.port;
+    for (uint8_t const BYTE : remote.address) {
+        h ^= BYTE;
+        h *= 0x01000193U;
+    }
     h *= 0x9e3779b9U;
     return h;
+}
+
+inline auto tcp_hash_4tuple(uint32_t lip, uint16_t lp, uint32_t rip, uint16_t rp) -> uint32_t {
+    return tcp_hash_tuple(SocketEndpoint::ipv4(IPv4Address{lip}, lp), SocketEndpoint::ipv4(IPv4Address{rip}, rp));
 }
 
 inline auto tcp_hash_listener(uint16_t lp) -> uint32_t { return static_cast<uint32_t>(lp) * 0x9e3779b9U; }
@@ -189,6 +224,7 @@ constexpr size_t TCP_CONN_SNAPSHOT_MAX = 128;
 
 struct TcpListenerSnapshot {
     uint32_t local_ip = 0;
+    SocketEndpoint local{};
     uint16_t local_port = 0;
     uint8_t state = 0;
     uint64_t owner_pid = 0;
@@ -203,6 +239,8 @@ struct TcpListenerSnapshot {
 struct TcpConnSnapshot {
     uint32_t local_ip = 0;
     uint32_t remote_ip = 0;
+    SocketEndpoint local{};
+    SocketEndpoint remote{};
     uint16_t local_port = 0;
     uint16_t remote_port = 0;
     uint8_t state = 0;
@@ -220,6 +258,9 @@ struct TcpConnSnapshot {
 };
 
 void tcp_rx(NetDevice* dev, PacketBuffer* pkt, IPv4Address src_ip, IPv4Address dst_ip);
+void tcp_rx_v6(NetDevice* dev, PacketBuffer* pkt, const IPv6RxInfo& info);
+void tcp_error_v6(const IPv6Address& local_addr, uint16_t local_port, const IPv6Address& remote_addr, uint16_t remote_port, uint8_t type,
+                  uint8_t code, uint32_t mtu, uint32_t scope_id);
 void tcp_timer_tick(uint64_t now_ms);
 [[noreturn]] void tcp_timer_thread();
 void tcp_timer_thread_start();
@@ -230,18 +271,24 @@ void tcp_timer_arm(TcpCB* cb);
 void tcp_timer_disarm(TcpCB* cb);
 auto get_tcp_proto_ops() -> SocketProtoOps*;
 
-auto tcp_generate_iss(uint32_t local_ip, uint16_t local_port, uint32_t remote_ip, uint16_t remote_port) -> uint32_t;
+auto tcp_generate_iss(const SocketEndpoint& local, const SocketEndpoint& remote) -> uint32_t;
+inline auto tcp_generate_iss(uint32_t local_ip, uint16_t local_port, uint32_t remote_ip, uint16_t remote_port) -> uint32_t {
+    return tcp_generate_iss(SocketEndpoint::ipv4(IPv4Address{local_ip}, local_port),
+                            SocketEndpoint::ipv4(IPv4Address{remote_ip}, remote_port));
+}
 auto tcp_send_segment(TcpCB* cb, uint8_t flags, const void* data, size_t len) -> bool;
-void tcp_send_rst(IPv4Address src_ip, IPv4Address dst_ip, uint16_t src_port, uint16_t dst_port, uint32_t seq, uint32_t ack, uint8_t flags);
+void tcp_send_rst(const SocketEndpoint& source, const SocketEndpoint& destination, uint32_t seq, uint32_t ack, uint8_t flags,
+                  uint32_t bound_ifindex = 0);
 auto tcp_send_ack(TcpCB* cb) -> bool;
+auto tcp_transmit_prebuilt(PacketBuffer* pkt, const SocketEndpoint& local, const SocketEndpoint& remote, uint32_t bound_ifindex = 0) -> int;
 
 // Build ACK without sending; caller holds cb->lock.
-auto tcp_build_ack(TcpCB* cb, uint32_t* out_local, uint32_t* out_remote) -> PacketBuffer*;
+auto tcp_build_ack(TcpCB* cb, SocketEndpoint* out_local, SocketEndpoint* out_remote) -> PacketBuffer*;
 // Build a keepalive probe (ACK with seq = snd_una - 1); caller holds cb->lock.
-auto tcp_build_keepalive_probe(TcpCB* cb, uint32_t* out_local, uint32_t* out_remote) -> PacketBuffer*;
+auto tcp_build_keepalive_probe(TcpCB* cb, SocketEndpoint* out_local, SocketEndpoint* out_remote) -> PacketBuffer*;
 
-void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload, size_t payload_len, IPv4Address src_ip,
-                         IPv4Address dst_ip);
+void tcp_process_segment(TcpCB* cb, const TcpHeader* hdr, const uint8_t* payload, size_t payload_len, const SocketEndpoint& source,
+                         const SocketEndpoint& destination, uint32_t ingress_mtu = 0);
 
 auto tcp_alloc_cb() -> TcpCB*;
 void tcp_insert_cb(TcpCB* cb);
@@ -252,8 +299,14 @@ void tcp_cb_acquire(TcpCB* cb);
 void tcp_cb_release(TcpCB* cb);
 void tcp_destroy_unaccepted_child(Socket* child);
 void tcp_drain_accept_queue(Socket* listener);
-auto tcp_find_cb(uint32_t local_ip, uint16_t local_port, uint32_t remote_ip, uint16_t remote_port) -> TcpCB*;
-auto tcp_find_listener(uint32_t local_ip, uint16_t local_port) -> TcpCB*;
+auto tcp_find_cb(const SocketEndpoint& local, const SocketEndpoint& remote, uint32_t ingress_ifindex = 0) -> TcpCB*;
+auto tcp_find_listener(const SocketEndpoint& local, uint32_t ingress_ifindex = 0) -> TcpCB*;
+inline auto tcp_find_cb(uint32_t local_ip, uint16_t local_port, uint32_t remote_ip, uint16_t remote_port) -> TcpCB* {
+    return tcp_find_cb(SocketEndpoint::ipv4(IPv4Address{local_ip}, local_port), SocketEndpoint::ipv4(IPv4Address{remote_ip}, remote_port));
+}
+inline auto tcp_find_listener(uint32_t local_ip, uint16_t local_port) -> TcpCB* {
+    return tcp_find_listener(SocketEndpoint::ipv4(IPv4Address{local_ip}, local_port));
+}
 auto tcp_listener_snapshot(TcpListenerSnapshot* out, size_t max) -> size_t;
 auto tcp_conn_snapshot(TcpConnSnapshot* out, size_t max) -> size_t;
 

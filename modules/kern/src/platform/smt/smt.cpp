@@ -13,6 +13,7 @@
 #include <new>
 
 #include "mod/io/serial/serial.hpp"
+#include "net/proto/ndp.hpp"
 #include "net/proto/tcp.hpp"
 #include "net/wki/peer.hpp"
 #include "net/wki/remote_compute.hpp"
@@ -856,6 +857,11 @@ void start_smt(boot::HandoverModules& modules, uint64_t kernel_rsp) {
 
     // Start the TCP timer as a kernel thread (DAEMON) instead of running it in interrupt context
     ker::net::proto::tcp_timer_thread_start();
+
+    // NDP retries, address lifetimes/DAD, and IPv6 route expiry are serviced
+    // from task context. The thread is posted now and cannot run until after
+    // the remaining init phases have called ndp_init().
+    ker::net::proto::ndp_timer_thread_start();
 
     // Start the WKI timer as a kernel thread (heartbeats, fencing, retransmit, load reports)
     ker::net::wki::wki_timer_thread_start();

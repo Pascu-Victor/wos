@@ -1,8 +1,8 @@
-#include "netd/daemon.hpp"
-
 #include <unistd.h>
 
 #include <cstddef>
+
+#include "netd/daemon.hpp"
 
 namespace {
 
@@ -23,5 +23,5 @@ auto main(int argc, char** argv) -> int {
     (void)argc;
     (void)argv;
     netd_boot_trace("netd-boot: main entered\n");
-    return netd::run_dhcp_client();
+    return netd::run_network_daemon();
 }

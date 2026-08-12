@@ -69,6 +69,7 @@ struct DevServerBinding {
     proto::MacAddress net_last_real_mac;
     uint16_t net_last_link_state = 0;
     uint32_t net_last_mtu = 1500;
+    NetIpv6StateSuffix net_last_ipv6 = wki_net_ipv6_state_empty();
 
     // RDMA block ring state (Phase 2: shared memory SQ/CQ for block I/O)
     uint32_t blk_zone_id = 0;
@@ -142,6 +143,7 @@ struct DevServerBinding {
           net_last_real_mac(o.net_last_real_mac),
           net_last_link_state(o.net_last_link_state),
           net_last_mtu(o.net_last_mtu),
+          net_last_ipv6(o.net_last_ipv6),
           blk_zone_id(o.blk_zone_id),
           blk_zone_ptr(o.blk_zone_ptr),
           blk_rdma_active(o.blk_rdma_active),
@@ -214,6 +216,7 @@ struct DevServerBinding {
             net_last_real_mac = o.net_last_real_mac;
             net_last_link_state = o.net_last_link_state;
             net_last_mtu = o.net_last_mtu;
+            net_last_ipv6 = o.net_last_ipv6;
             blk_zone_id = o.blk_zone_id;
             blk_zone_ptr = o.blk_zone_ptr;
             blk_rdma_active = o.blk_rdma_active;

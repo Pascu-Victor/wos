@@ -107,7 +107,7 @@ class PeerLifecycleLease {
 };
 
 constexpr size_t REMOTABLE_RX_QUEUE_CAPACITY = WKI_CREDITS_CONTROL;
-constexpr size_t REMOTABLE_RX_PAYLOAD_MAX = sizeof(ResourceAdvertNetPayload) + UINT8_MAX;
+constexpr size_t REMOTABLE_RX_PAYLOAD_MAX = sizeof(ResourceAdvertNetPayload) + UINT8_MAX + sizeof(NetIpv6StateSuffix);
 struct PendingResourceRx {
     MsgType type = MsgType::RESOURCE_ADVERT;
     WkiHeader hdr = {};
@@ -128,6 +128,7 @@ struct NetAdvertState {
     proto::MacAddress real_mac;
     uint16_t link_state = 0;
     uint32_t mtu = 1500;
+    NetIpv6StateSuffix ipv6 = wki_net_ipv6_state_empty();
 };
 
 // Unlocked helper - caller must hold s_remotable_lock
@@ -335,6 +336,33 @@ auto capture_net_advert_state(ker::net::NetDevice* dev) -> NetAdvertState {
         state.ipv4_addr = nif->ipv4_addrs.front().addr;
         state.ipv4_mask = nif->ipv4_addrs.front().netmask;
     }
+    if (nif != nullptr) {
+        std::array<ker::net::IPv6Addr, WKI_NET_IPV6_STATE_MAX_ADDRS> addresses{};
+        size_t const COUNT = ker::net::netif_ipv6_snapshot(dev, addresses.data(), addresses.size());
+        state.ipv6.count = static_cast<uint8_t>(std::min(COUNT, addresses.size()));
+        for (size_t i = 0; i < state.ipv6.count; ++i) {
+            auto const& address = addresses.at(i);
+            auto& entry = state.ipv6.entries.at(i);
+            entry.address = address.addr.bytes;
+            entry.prefix_len = address.prefix_len;
+            entry.scope = wki_net_ipv6_address_scope(entry.address);
+            uint32_t flags = address.flags;
+            switch (address.state) {
+                case ker::net::IPv6Addr::State::TENTATIVE:
+                    flags |= ker::net::IPV6_ADDR_F_TENTATIVE;
+                    break;
+                case ker::net::IPv6Addr::State::PREFERRED:
+                    break;
+                case ker::net::IPv6Addr::State::DEPRECATED:
+                    flags |= ker::net::IPV6_ADDR_F_DEPRECATED;
+                    break;
+                case ker::net::IPv6Addr::State::DADFAILED:
+                    flags |= ker::net::IPV6_ADDR_F_DADFAILED;
+                    break;
+            }
+            entry.flags = static_cast<uint16_t>(flags & UINT16_MAX);
+        }
+    }
 
     state.real_mac = dev->mac;
     state.link_state = static_cast<uint16_t>(dev->state != 0 ? 1 : 0);
@@ -342,7 +370,9 @@ auto capture_net_advert_state(ker::net::NetDevice* dev) -> NetAdvertState {
     return state;
 }
 
-auto net_resource_ready(const DiscoveredResource& res) -> bool { return res.net_ipv4_addr != 0 && res.net_ipv4_mask != 0; }
+auto net_resource_ready(const DiscoveredResource& res) -> bool {
+    return (res.net_ipv4_addr != 0 && res.net_ipv4_mask != 0) || wki_net_ipv6_state_has_usable_address(res.net_ipv6);
+}
 
 void update_net_resource_fields(DiscoveredResource& res, const ResourceAdvertNetPayload& adv) {
     res.net_ipv4_addr = adv.ipv4_addr;
@@ -350,6 +380,10 @@ void update_net_resource_fields(DiscoveredResource& res, const ResourceAdvertNet
     res.net_real_mac = adv.real_mac;
     res.net_link_state = adv.link_state;
     res.net_mtu = adv.mtu != 0 ? adv.mtu : 1500;
+}
+
+auto net_ipv6_state_equal(const NetIpv6StateSuffix& lhs, const NetIpv6StateSuffix& rhs) -> bool {
+    return std::memcmp(&lhs, &rhs, sizeof(lhs)) == 0;
 }
 
 auto decode_resource_incarnation(uint16_t peer_node, ResourceType type, const uint8_t* payload, uint16_t payload_len,
@@ -602,8 +636,9 @@ auto send_net_resource_advert_to_peer(uint16_t peer_node, ker::net::NetDevice* n
         name_len++;
     }
 
-    auto total_len = static_cast<uint16_t>(sizeof(ResourceAdvertNetPayload) + name_len);
-    std::array<uint8_t, sizeof(ResourceAdvertNetPayload) + 64> buf{};
+    bool const WITH_IPV6 = wki_peer_capability_negotiated(peer_node, WKI_CAP_NET_IPV6_STATE);
+    auto total_len = static_cast<uint16_t>(sizeof(ResourceAdvertNetPayload) + name_len + (WITH_IPV6 ? sizeof(NetIpv6StateSuffix) : 0));
+    std::array<uint8_t, sizeof(ResourceAdvertNetPayload) + 64 + sizeof(NetIpv6StateSuffix)> buf{};
 
     auto* adv = reinterpret_cast<ResourceAdvertNetPayload*>(buf.data());
     adv->node_id = g_wki.my_node_id;
@@ -630,6 +665,9 @@ auto send_net_resource_advert_to_peer(uint16_t peer_node, ker::net::NetDevice* n
 
     adv->name_len = name_len;
     memcpy(buf.data() + sizeof(ResourceAdvertNetPayload), ndev->name.data(), name_len);
+    if (WITH_IPV6) {
+        memcpy(buf.data() + sizeof(ResourceAdvertNetPayload) + name_len, &STATE.ipv6, sizeof(STATE.ipv6));
+    }
 
     return wki_send(peer_node, WKI_CHAN_CONTROL, MsgType::RESOURCE_ADVERT, buf.data(), total_len);
 }
@@ -996,8 +1034,22 @@ void handle_resource_advert(const WkiHeader* hdr, const uint8_t* payload, uint16
 
     size_t const BASE_AND_NAME_SIZE = header_size + adv->name_len;
     ResourceIncarnationToken owner_incarnation = {};
-    if (BASE_AND_NAME_SIZE > payload_len ||
-        !decode_resource_incarnation(hdr->src_node, type, payload, payload_len, BASE_AND_NAME_SIZE, &owner_incarnation)) {
+    NetIpv6StateSuffix net_ipv6 = wki_net_ipv6_state_empty();
+    if (BASE_AND_NAME_SIZE > payload_len) {
+        return;
+    }
+    if (type == ResourceType::NET) {
+        bool const WITH_IPV6 = wki_peer_capability_negotiated(hdr->src_node, WKI_CAP_NET_IPV6_STATE);
+        if (!wki_net_ipv6_extended_length_valid(WITH_IPV6, payload_len, BASE_AND_NAME_SIZE)) {
+            return;
+        }
+        if (WITH_IPV6) {
+            std::memcpy(&net_ipv6, payload + BASE_AND_NAME_SIZE, sizeof(net_ipv6));
+            if (!wki_net_ipv6_state_valid(net_ipv6)) {
+                return;
+            }
+        }
+    } else if (!decode_resource_incarnation(hdr->src_node, type, payload, payload_len, BASE_AND_NAME_SIZE, &owner_incarnation)) {
         return;
     }
 
@@ -1016,6 +1068,7 @@ void handle_resource_advert(const WkiHeader* hdr, const uint8_t* payload, uint16
     }
     if (net_adv != nullptr) {
         update_net_resource_fields(res, *net_adv);
+        res.net_ipv6 = net_ipv6;
         memcpy(static_cast<void*>(res.name), resource_advert_name(net_adv), copy_len);
     } else {
         memcpy(static_cast<void*>(res.name), resource_advert_name(adv), copy_len);
@@ -1082,7 +1135,7 @@ void handle_resource_advert(const WkiHeader* hdr, const uint8_t* payload, uint16
         if (type == ResourceType::NET) {
             net_fields_changed = existing->net_ipv4_addr != res.net_ipv4_addr || existing->net_ipv4_mask != res.net_ipv4_mask ||
                                  existing->net_real_mac != res.net_real_mac || existing->net_link_state != res.net_link_state ||
-                                 existing->net_mtu != res.net_mtu;
+                                 existing->net_mtu != res.net_mtu || !net_ipv6_state_equal(existing->net_ipv6, res.net_ipv6);
         }
 
         if (!NAME_CHANGED && !FLAGS_CHANGED && !INCARNATION_CHANGED && !net_fields_changed) {
@@ -1121,6 +1174,7 @@ void handle_resource_advert(const WkiHeader* hdr, const uint8_t* payload, uint16
             existing->net_real_mac = res.net_real_mac;
             existing->net_link_state = res.net_link_state;
             existing->net_mtu = res.net_mtu;
+            existing->net_ipv6 = res.net_ipv6;
         }
 
         if (REPLACEMENT_GENERATION) {
@@ -1212,8 +1266,8 @@ void handle_resource_advert(const WkiHeader* hdr, const uint8_t* payload, uint16
     ker::vfs::devfs::devfs_wki_add_resource(adv->node_id, adv->resource_type, adv->resource_id, res.generation, adv->flags,
                                             static_cast<const char*>(res.name));
 
-    ker::mod::dbg::log("[WKI] Discovered resource: node=0x%04x type=%u id=%u name=%s", adv->node_id, adv->resource_type, adv->resource_id,
-                       static_cast<const char*>(res.name));
+    ker::mod::dbg::log("[WKI] Discovered resource: node=0x%04x type=%u id=%u name=%s ipv6=%u", adv->node_id, adv->resource_type,
+                       adv->resource_id, static_cast<const char*>(res.name), static_cast<unsigned>(res.net_ipv6.count));
 }
 
 void handle_resource_withdraw(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len) {
@@ -1352,6 +1406,16 @@ auto classify_remotable_rx(MsgType type, uint16_t peer_node, const uint8_t* payl
     ResourceIncarnationToken token = {};
     if (payload_len < HEADER_SIZE || BASE_AND_NAME_SIZE > payload_len || payload_len > REMOTABLE_RX_PAYLOAD_MAX) {
         return WkiRemotableRxAdmission::DISCARD;
+    }
+    if (RESOURCE_TYPE == ResourceType::NET) {
+        bool const WITH_IPV6 = wki_peer_capability_negotiated(peer_node, WKI_CAP_NET_IPV6_STATE);
+        if (!wki_net_ipv6_extended_length_valid(WITH_IPV6, payload_len, BASE_AND_NAME_SIZE)) {
+            return WkiRemotableRxAdmission::DISCARD;
+        }
+        // NET does not carry a ResourceIncarnationToken. The deferred handler
+        // validates the negotiated suffix itself after this bounded copy.
+        *copy_len = payload_len;
+        return WkiRemotableRxAdmission::DEFERRED;
     }
     WkiRemotableRxAdmission const ADMISSION = decode_for_admission(RESOURCE_TYPE, BASE_AND_NAME_SIZE, &token);
     if (ADMISSION != WkiRemotableRxAdmission::DEFERRED) {
@@ -1729,7 +1793,8 @@ void wki_remotable_process_pending_net_attaches() {
                 continue;
             }
 
-            if (g_wki.nic_policy == WkiNicPolicy::ATTACH_SPARSE && local_ipv4_configuration_pending()) {
+            if (g_wki.nic_policy == WkiNicPolicy::ATTACH_SPARSE && remote_ipv4_addr != 0 && remote_ipv4_mask != 0 &&
+                local_ipv4_configuration_pending()) {
                 defer_net_attach_for_local_ipv4(pending);
                 log::debug("Deferring NET auto-attach: %s waits for local IPv4 configuration", pending.nic_name.data());
                 continue;
@@ -1786,14 +1851,16 @@ void wki_remotable_process_pending_net_attaches() {
 
             // V2: ATTACH_SPARSE post-attach subnet overlap check
             if (g_wki.nic_policy == WkiNicPolicy::ATTACH_SPARSE) {
-                if (proxy_state == nullptr || proxy_state->owner_ipv4_addr == 0 || proxy_state->owner_ipv4_mask == 0) {
+                if (proxy_state == nullptr || ((proxy_state->owner_ipv4_addr == 0 || proxy_state->owner_ipv4_mask == 0) &&
+                                               !wki_net_ipv6_state_has_usable_address(proxy_state->owner_ipv6))) {
                     wki_remote_net_detach(proxy_dev);
-                    log::debug("Dropping stale NET auto-attach: %s from %s/%s is still missing IPv4 after ready advert",
+                    log::debug("Dropping stale NET auto-attach: %s from %s/%s is still missing L3 state after ready advert",
                                pending.nic_name.data(), pending.hostname.data(), pending.remote_name.data());
                     continue;
                 }
 
-                if (has_local_subnet_overlap(proxy_state->owner_ipv4_addr, proxy_state->owner_ipv4_mask)) {
+                if (proxy_state->owner_ipv4_addr != 0 && proxy_state->owner_ipv4_mask != 0 &&
+                    has_local_subnet_overlap(proxy_state->owner_ipv4_addr, proxy_state->owner_ipv4_mask)) {
                     ker::mod::dbg::log("[WKI] Skipping remote NIC %s from %s: subnet overlap", pending.nic_name.data(),
                                        pending.hostname.data());
                     wki_remote_net_detach(proxy_dev);

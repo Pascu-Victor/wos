@@ -7,6 +7,94 @@
 
 namespace netd {
 
+namespace {
+
+auto parse_policy(const char* text, InterfacePolicy& out) -> bool {
+    if (std::strcmp(text, "dhcp") == 0) {
+        out = InterfacePolicy::DHCP;
+        return true;
+    }
+    if (std::strcmp(text, "linklocal") == 0) {
+        out = InterfacePolicy::LINKLOCAL;
+        return true;
+    }
+    if (std::strcmp(text, "wki") == 0) {
+        out = InterfacePolicy::WKI;
+        return true;
+    }
+    if (std::strcmp(text, "unmanaged") == 0) {
+        out = InterfacePolicy::UNMANAGED;
+        return true;
+    }
+    return false;
+}
+
+}  // namespace
+
+auto load_interface_configs(std::span<InterfaceConfig> out) -> size_t {
+    if (out.empty()) {
+        return 0;
+    }
+
+    FILE* file = std::fopen("/etc/netdevs", "r");
+    if (file == nullptr) {
+        return 0;
+    }
+
+    size_t count = 0;
+    std::array<char, 128> line{};
+    while (count < out.size() && std::fgets(line.data(), static_cast<int>(line.size()), file) != nullptr) {
+        const char* cursor = line.data();
+        while (*cursor == ' ' || *cursor == '\t') {
+            ++cursor;
+        }
+        if (*cursor == '#' || *cursor == '\n' || *cursor == '\r' || *cursor == '\0') {
+            continue;
+        }
+
+        std::array<char, INTERFACE_NAME_CAPACITY> ifname{};
+        std::array<char, 32> driver{};
+        std::array<char, 2> trailing{};
+        if (std::sscanf(cursor, "%15s %31s %1s", ifname.data(), driver.data(), trailing.data()) != 2) {
+            continue;
+        }
+        InterfacePolicy policy{};
+        if (!parse_policy(driver.data(), policy)) {
+            continue;
+        }
+
+        bool duplicate = false;
+        for (size_t i = 0; i < count; ++i) {
+            if (std::strcmp(out[i].ifname.data(), ifname.data()) == 0) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (duplicate) {
+            continue;
+        }
+        out[count].ifname = ifname;
+        out[count].policy = policy;
+        ++count;
+    }
+    std::fclose(file);
+    return count;
+}
+
+auto interface_policy_name(InterfacePolicy policy) -> const char* {
+    switch (policy) {
+        case InterfacePolicy::DHCP:
+            return "dhcp";
+        case InterfacePolicy::LINKLOCAL:
+            return "linklocal";
+        case InterfacePolicy::WKI:
+            return "wki";
+        case InterfacePolicy::UNMANAGED:
+            return "unmanaged";
+    }
+    return "unknown";
+}
+
 auto find_ifname_for_driver(const char* driver, const char* fallback) -> const char* {
     static std::array<char, 16> s_ifname{};
 

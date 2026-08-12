@@ -407,6 +407,18 @@ auto subop_name(uint64_t callnum, uint64_t op) -> std::string_view {
                     return "netctl_addr_del";
                 case ker::abi::net::ops::NETCTL_LINK_SET:
                     return "netctl_link_set";
+                case ker::abi::net::ops::SENDTO_EX:
+                    return "sendto_ex";
+                case ker::abi::net::ops::RECVFROM_EX:
+                    return "recvfrom_ex";
+                case ker::abi::net::ops::NETCTL_ADDR_SET_V2:
+                    return "netctl_addr_set_v2";
+                case ker::abi::net::ops::NETCTL_ROUTE_LIST:
+                    return "netctl_route_list";
+                case ker::abi::net::ops::NETCTL_ROUTE_SET:
+                    return "netctl_route_set";
+                case ker::abi::net::ops::NETCTL_ROUTE_DEL:
+                    return "netctl_route_del";
             }
             break;
         case ker::abi::callnums::vmem:

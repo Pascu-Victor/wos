@@ -996,6 +996,7 @@ struct NetStateSnapshot {
     proto::MacAddress real_mac;
     uint16_t link_state = 0;
     uint32_t mtu = 1500;
+    NetIpv6StateSuffix ipv6 = wki_net_ipv6_state_empty();
 };
 
 auto has_net_binding_for_dev(ker::net::NetDevice* dev) -> bool;
@@ -1047,6 +1048,33 @@ auto capture_net_state(ker::net::NetDevice* ndev) -> NetStateSnapshot {
         snap.ipv4_addr = primary_ipv4.addr;
         snap.ipv4_mask = primary_ipv4.netmask;
     }
+    if (nif != nullptr) {
+        std::array<ker::net::IPv6Addr, WKI_NET_IPV6_STATE_MAX_ADDRS> addresses{};
+        size_t const COUNT = ker::net::netif_ipv6_snapshot(ndev, addresses.data(), addresses.size());
+        snap.ipv6.count = static_cast<uint8_t>(std::min(COUNT, addresses.size()));
+        for (size_t i = 0; i < snap.ipv6.count; ++i) {
+            auto const& address = addresses.at(i);
+            auto& entry = snap.ipv6.entries.at(i);
+            entry.address = address.addr.bytes;
+            entry.prefix_len = address.prefix_len;
+            entry.scope = wki_net_ipv6_address_scope(entry.address);
+            uint32_t flags = address.flags;
+            switch (address.state) {
+                case ker::net::IPv6Addr::State::TENTATIVE:
+                    flags |= ker::net::IPV6_ADDR_F_TENTATIVE;
+                    break;
+                case ker::net::IPv6Addr::State::PREFERRED:
+                    break;
+                case ker::net::IPv6Addr::State::DEPRECATED:
+                    flags |= ker::net::IPV6_ADDR_F_DEPRECATED;
+                    break;
+                case ker::net::IPv6Addr::State::DADFAILED:
+                    flags |= ker::net::IPV6_ADDR_F_DADFAILED;
+                    break;
+            }
+            entry.flags = static_cast<uint16_t>(flags & UINT16_MAX);
+        }
+    }
 
     return snap;
 }
@@ -1066,9 +1094,11 @@ void record_binding_net_state(DevServerBinding& binding, const NetStateSnapshot&
     binding.net_last_real_mac = snap.real_mac;
     binding.net_last_link_state = snap.link_state;
     binding.net_last_mtu = snap.mtu;
+    binding.net_last_ipv6 = snap.ipv6;
 }
 
-void build_net_attach_ack(DevAttachAckNetPayload& ack, ker::net::NetDevice* ndev, uint32_t resource_id, uint16_t assigned_channel) {
+void build_net_attach_ack(DevAttachAckNetPayload& ack, NetIpv6StateSuffix& ipv6, ker::net::NetDevice* ndev, uint32_t resource_id,
+                          uint16_t assigned_channel) {
     ack.status = static_cast<uint8_t>(DevAttachStatus::OK);
     ack.assigned_channel = assigned_channel;
     ack.resource_id = resource_id;
@@ -1079,6 +1109,19 @@ void build_net_attach_ack(DevAttachAckNetPayload& ack, ker::net::NetDevice* ndev
     ack.ipv4_addr = SNAP.ipv4_addr;
     ack.ipv4_mask = SNAP.ipv4_mask;
     ack.mtu = SNAP.mtu;
+    ipv6 = SNAP.ipv6;
+}
+
+auto send_net_attach_ack(uint16_t consumer_node, const DevAttachAckNetPayload& ack, const NetIpv6StateSuffix& ipv6) -> int {
+    bool const WITH_IPV6 = wki_peer_capability_negotiated(consumer_node, WKI_CAP_NET_IPV6_STATE);
+    std::array<uint8_t, sizeof(DevAttachAckNetPayload) + sizeof(NetIpv6StateSuffix)> payload{};
+    std::memcpy(payload.data(), &ack, sizeof(ack));
+    uint16_t payload_len = sizeof(ack);
+    if (WITH_IPV6) {
+        std::memcpy(payload.data() + sizeof(ack), &ipv6, sizeof(ipv6));
+        payload_len = static_cast<uint16_t>(payload_len + sizeof(ipv6));
+    }
+    return wki_send(consumer_node, WKI_CHAN_RESOURCE, MsgType::DEV_ATTACH_ACK, payload.data(), payload_len);
 }
 
 // s_server_lock must be held by caller.
@@ -1732,7 +1775,8 @@ void wki_dev_server_notify_net_changed(ker::net::NetDevice* dev) {
         }
 
         bool const CHANGED = !b.net_state_valid || b.net_last_ipv4_addr != SNAP.ipv4_addr || b.net_last_ipv4_mask != SNAP.ipv4_mask ||
-                             b.net_last_real_mac != SNAP.real_mac || b.net_last_link_state != SNAP.link_state || b.net_last_mtu != SNAP.mtu;
+                             b.net_last_real_mac != SNAP.real_mac || b.net_last_link_state != SNAP.link_state ||
+                             b.net_last_mtu != SNAP.mtu || std::memcmp(&b.net_last_ipv6, &SNAP.ipv6, sizeof(SNAP.ipv6)) != 0;
         if (!CHANGED) {
             continue;
         }
@@ -1751,21 +1795,25 @@ void wki_dev_server_notify_net_changed(ker::net::NetDevice* dev) {
         return;
     }
 
-    std::array<uint8_t, sizeof(DevOpReqPayload) + sizeof(NetNotifyHeader) + sizeof(NetStateNotifyPayload)> msg{};
+    std::array<uint8_t, sizeof(DevOpReqPayload) + sizeof(NetNotifyHeader) + sizeof(NetStateNotifyPayload) + sizeof(NetIpv6StateSuffix)>
+        msg{};
     auto* req = reinterpret_cast<DevOpReqPayload*>(msg.data());
     req->op_id = OP_NET_STATE_NOTIFY;
-    req->data_len = sizeof(NetNotifyHeader) + sizeof(NetStateNotifyPayload);
     auto* notify = reinterpret_cast<NetNotifyHeader*>(msg.data() + sizeof(DevOpReqPayload));
     notify->magic = WKI_NET_NOTIFY_MAGIC;
-    notify->data_len = sizeof(NetStateNotifyPayload);
     auto* state = reinterpret_cast<NetStateNotifyPayload*>(msg.data() + sizeof(DevOpReqPayload) + sizeof(NetNotifyHeader));
     fill_net_state_payload(*state, SNAP);
+    std::memcpy(msg.data() + sizeof(DevOpReqPayload) + sizeof(NetNotifyHeader) + sizeof(NetStateNotifyPayload), &SNAP.ipv6,
+                sizeof(SNAP.ipv6));
 
     for (size_t i = 0; i < target_count; i++) {
         const auto& target = targets.at(i);
+        bool const WITH_IPV6 = wki_peer_capability_negotiated(target.channel_identity.peer_node_id, WKI_CAP_NET_IPV6_STATE);
+        notify->data_len = static_cast<uint16_t>(sizeof(NetStateNotifyPayload) + (WITH_IPV6 ? sizeof(NetIpv6StateSuffix) : 0));
+        req->data_len = static_cast<uint16_t>(sizeof(NetNotifyHeader) + notify->data_len);
         notify->attach_cookie = target.attach_cookie;
-        static_cast<void>(
-            wki_send_on_channel_identity(target.channel_identity, MsgType::DEV_OP_REQ, msg.data(), static_cast<uint16_t>(msg.size())));
+        static_cast<void>(wki_send_on_channel_identity(target.channel_identity, MsgType::DEV_OP_REQ, msg.data(),
+                                                       static_cast<uint16_t>(sizeof(DevOpReqPayload) + req->data_len)));
     }
 }
 
@@ -2395,10 +2443,11 @@ void handle_dev_attach_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
         if (auto existing = find_existing_net_binding(hdr->src_node, req->resource_id, req->attach_cookie);
             existing.found && existing.net_dev != nullptr) {
             DevAttachAckNetPayload existing_ack = {};
-            build_net_attach_ack(existing_ack, existing.net_dev, req->resource_id, existing.assigned_channel);
+            NetIpv6StateSuffix existing_ipv6 = wki_net_ipv6_state_empty();
+            build_net_attach_ack(existing_ack, existing_ipv6, existing.net_dev, req->resource_id, existing.assigned_channel);
             existing_ack.attach_cookie = existing.attach_cookie;
 
-            int const ACK_RET = wki_send(hdr->src_node, WKI_CHAN_RESOURCE, MsgType::DEV_ATTACH_ACK, &existing_ack, sizeof(existing_ack));
+            int const ACK_RET = send_net_attach_ack(hdr->src_node, existing_ack, existing_ipv6);
             if (ACK_RET != WKI_OK) {
                 ker::mod::dbg::log("[WKI] NET attach ACK resend failed: node=0x%04x err=%d", hdr->src_node, ACK_RET);
             }
@@ -2467,7 +2516,8 @@ void handle_dev_attach_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
 
         // V2: Send extended NET attach ACK with owner NIC info
         DevAttachAckNetPayload net_ack = {};
-        build_net_attach_ack(net_ack, ndev, req->resource_id, ch->channel_id);
+        NetIpv6StateSuffix net_ipv6 = wki_net_ipv6_state_empty();
+        build_net_attach_ack(net_ack, net_ipv6, ndev, req->resource_id, ch->channel_id);
         net_ack.attach_cookie = req->attach_cookie;
         uint32_t netmask = net_ack.ipv4_mask;
         uint32_t bit_count = 0;
@@ -2479,7 +2529,7 @@ void handle_dev_attach_req(const WkiHeader* hdr, const uint8_t* payload, uint16_
                            ch->channel_id, (net_ack.ipv4_addr >> 24) & 0xFF, (net_ack.ipv4_addr >> 16) & 0xFF,
                            (net_ack.ipv4_addr >> 8) & 0xFF, net_ack.ipv4_addr & 0xFF, bit_count);
 
-        int const ACK_RET = wki_send(hdr->src_node, WKI_CHAN_RESOURCE, MsgType::DEV_ATTACH_ACK, &net_ack, sizeof(net_ack));
+        int const ACK_RET = send_net_attach_ack(hdr->src_node, net_ack, net_ipv6);
         if (ACK_RET != WKI_OK) {
             ker::mod::dbg::log("[WKI] NET attach ACK send failed: node=0x%04x err=%d", hdr->src_node, ACK_RET);
             static_cast<void>(defer_attach_ack_failure_cleanup(hdr->src_node, ResourceType::NET, req->resource_id, channel_identity));

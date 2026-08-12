@@ -96,7 +96,7 @@ def test_raw_socket_packets_keep_complete_receive_records() -> None:
     source = RAW_CPP.read_text()
     if "struct RawRecvRecord" not in source:
         fail("raw sockets must keep a fixed receive record before each packet")
-    if "static_assert(sizeof(RawRecvRecord) == 8)" not in source:
+    if "static_assert(sizeof(RawRecvRecord) == 28)" not in source:
         fail("raw receive record size must stay fixed")
 
     recvfrom = function_body(source, "raw_recvfrom")
@@ -106,25 +106,25 @@ def test_raw_socket_packets_keep_complete_receive_records() -> None:
             "sock->rcvbuf.available() < sizeof(RawRecvRecord)",
             "sock->rcvbuf.read(&record, sizeof(record))",
             "size_t const PACKET_LEN = record.packet_len",
-            "sock->rcvbuf.available() < PACKET_LEN",
-            "size_t const TO_COPY = len < PACKET_LEN ? len : PACKET_LEN",
+            "PACKET_LEN > sock->rcvbuf.capacity || sock->rcvbuf.available() < PACKET_LEN",
+            "socket_fill_sockaddr_endpoint(addr_out, CAPACITY, addr_len, record.source)",
+            "size_t const TO_COPY = std::min(len, PACKET_LEN)",
             "sock->rcvbuf.read(buf, TO_COPY)",
             "size_t remaining = PACKET_LEN - TO_COPY",
             "sock->rcvbuf.read(discard.data(), CHUNK)",
-            "socket_fill_sockaddr_v4(addr_out, *addr_len, nullptr, record.src_ip, 0)",
         ],
         "raw recvfrom complete packet consumption",
     )
 
-    deliver = function_body(source, "raw_deliver")
+    deliver = function_body(source, "deliver_raw_frame")
     require_order(
         deliver,
         [
-            "constexpr size_t PREPEND_LEN = sizeof(RawRecvRecord) + sizeof(IPv4Header)",
-            "auto* frame = pkt->push(PREPEND_LEN)",
-            "record->packet_len = static_cast<uint16_t>(sizeof(IPv4Header) + PAYLOAD_LEN)",
-            "if (sock->rcvbuf.available() + pkt->len > sock->rcvbuf.capacity)",
-            "sock->rcvbuf.write(pkt->data, pkt->len)",
+            "RawRecvRecord record{.packet_len = static_cast<uint16_t>(pkt->len), .source = source}",
+            "!raw_delivery_endpoint_matches",
+            "sock->rcvbuf.free_space() < sizeof(record) + pkt->len",
+            "sock->rcvbuf.write_pair(&record, sizeof(record), pkt->data, pkt->len)",
+            "std::cmp_equal(WRITTEN, sizeof(record) + pkt->len)",
         ],
         "raw deliver complete packet enqueue",
     )

@@ -72,10 +72,11 @@ def require_recv_window_ack_is_locked(problems: list[str]) -> None:
             "cb->rcv_wnd = tcp_receive_window_space(cb, sock)",
             "tcp_build_ack(cb, &ack_local, &ack_remote)",
             "cb->lock.unlock_irqrestore(FLAGS)",
-            "ipv4_tx(ack_pkt, ack_local, ack_remote, 6, 64)",
-            "cb->lock.lock_irqsave()",
+            "tcp_transmit_prebuilt(ack_pkt, ack_local, ack_remote, sock->bound_ifindex) < 0",
+            "uint64_t const RETRY_FLAGS = cb->lock.lock_irqsave()",
             "cb->ack_pending = true",
             "tcp_timer_arm(cb)",
+            "cb->lock.unlock_irqrestore(RETRY_FLAGS)",
         ],
         "locked recv-window ACK snapshot",
     )

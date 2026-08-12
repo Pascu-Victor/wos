@@ -1,0 +1,67 @@
+{
+    "build": {
+        "dir": "build-ktest",
+        "sysroot": "ktest-data/sysroot",
+        "mlibc_build": "ktest-data/mlibc-build",
+        "busybox_build": "ktest-data/busybox-build",
+        "busybox_install": "ktest-data/busybox-install",
+        "dropbear_build": "ktest-data/dropbear-build",
+        "make_build": "ktest-data/make-build",
+        "bash_build": "ktest-data/bash-build",
+        "cmake_build": "ktest-data/cmake-wos-build",
+        "python_build": "ktest-data/python-build"
+    },
+    "package": {
+        "kernel_cmdline": "--selftest"
+    },
+    "node": {
+        "id": 0,
+        "hostname": "wos-ktest-ipv6",
+        "debug": false,
+        "mtu": 9000,
+        "vm": {
+            "memory": "8G",
+            "cpus": 8,
+            "disk0": "ktest-data/disk.qcow2",
+            "disk1": "ktest-data/mountfs.qcow2",
+            "overlay_dir": "ktest-data/overlays",
+            "serial_log": "ktest-data/serial-vm0.log",
+            "qemu_log": "ktest-data/qemu-vm0.log",
+            "tcg_log": "ktest-data/qemu-vm0-cpu%d.log",
+            "usb_hotplug": {
+                "enabled": false
+            }
+        },
+        "nics": [
+            {
+                "name": "lan",
+                "zone_id": 0,
+                "tap": "wos-lan-N0",
+                "mac": "52:54:00:10:00:00",
+                "model": "virtio-net-pci",
+                "queues": 2,
+                "vhost": false,
+                "driver": "dhcp",
+                "bridge": {
+                    "stp": false,
+                    "ip": "10.10.0.100/24",
+                    "dns": "10.10.0.1"
+                }
+            },
+            {
+                "name": "wki",
+                "zone_id": 1,
+                "tap": "wos-wki-N0",
+                "mac": "52:54:00:11:00:00",
+                "model": "virtio-net-pci",
+                "queues": 2,
+                "vhost": false,
+                "driver": "wki",
+                "bridge": {
+                    "stp": false,
+                    "ip": null
+                }
+            }
+        ]
+    }
+}

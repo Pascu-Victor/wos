@@ -1130,7 +1130,7 @@ void wki_init() {
     g_wki.transports = nullptr;
     g_wki.transport_count = 0;
     g_wki.my_lsa_seq = 0;
-    g_wki.capabilities = WKI_CAP_RESOURCE_INCARNATION | WKI_CAP_VFS_MULTI_RDMA_LANES | WKI_CAP_VFS_METADATA_BATCH;
+    g_wki.capabilities = WKI_CAP_RESOURCE_INCARNATION | WKI_CAP_VFS_MULTI_RDMA_LANES | WKI_CAP_VFS_METADATA_BATCH | WKI_CAP_NET_IPV6_STATE;
     g_wki.initialized = true;
 
     // Init routing subsystem (LSDB, routing table)

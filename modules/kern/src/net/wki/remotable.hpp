@@ -54,6 +54,9 @@ struct DiscoveredResource {
     proto::MacAddress net_real_mac;
     uint16_t net_link_state = 0;
     uint32_t net_mtu = 1500;
+    // Capability-gated informational owner state. Snapshot visitors may
+    // inspect it; consumers must never install these addresses/routes locally.
+    NetIpv6StateSuffix net_ipv6 = wki_net_ipv6_state_empty();
     char name[DISCOVERED_RESOURCE_NAME_LEN] = {};  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
     bool valid = false;
 };

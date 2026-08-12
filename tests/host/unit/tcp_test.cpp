@@ -5,9 +5,20 @@
 
 #include <gtest/gtest.h>
 
+#include <net/proto/raw.hpp>
 #include <net/proto/tcp.hpp>
 
 using namespace ker::net::proto;
+using ker::net::PKT_BUF_SIZE;
+using ker::net::PKT_HEADROOM;
+using ker::net::SOCKADDR_V6_FAMILY;
+using ker::net::socket_effective_endpoint_scope;
+using ker::net::socket_endpoint_requires_interface_address;
+using ker::net::socket_endpoint_scope_agrees_with_ifindex;
+using ker::net::socket_state_allows_explicit_bind;
+using ker::net::SocketEndpoint;
+using ker::net::SocketState;
+using ker::net::proto::raw_delivery_endpoint_matches;
 
 // =============================================================================
 // TCP Header Layout
@@ -233,6 +244,127 @@ TEST(TcpHash, ListenerBasic) {
 }
 
 TEST(TcpHash, ListenerDeterministic) { EXPECT_EQ(tcp_hash_listener(8080), tcp_hash_listener(8080)); }
+
+TEST(TcpHash, DualStackAcceptedTupleUsesMappedFamilyConsistently) {
+    SocketEndpoint const WIRE_LOCAL = SocketEndpoint::ipv4(IPv4Address{0x7F000001}, 8080);
+    SocketEndpoint const WIRE_REMOTE = SocketEndpoint::ipv4(IPv4Address{0x7F000001}, 49152);
+
+    SocketEndpoint const CHILD_LOCAL = tcp_endpoint_for_socket_domain(SOCKADDR_V6_FAMILY, WIRE_LOCAL);
+    SocketEndpoint const CHILD_REMOTE = tcp_endpoint_for_socket_domain(SOCKADDR_V6_FAMILY, WIRE_REMOTE);
+    EXPECT_TRUE(CHILD_LOCAL.is_v4_mapped());
+    EXPECT_TRUE(CHILD_REMOTE.is_v4_mapped());
+    EXPECT_EQ(CHILD_LOCAL.family, SOCKADDR_V6_FAMILY);
+    EXPECT_EQ(CHILD_REMOTE.family, SOCKADDR_V6_FAMILY);
+    EXPECT_EQ(CHILD_LOCAL.port, WIRE_LOCAL.port);
+    EXPECT_EQ(CHILD_REMOTE.port, WIRE_REMOTE.port);
+
+    // Established lookup maps later IPv4 packets the same way before hashing.
+    SocketEndpoint const LOOKUP_LOCAL = tcp_endpoint_for_socket_domain(SOCKADDR_V6_FAMILY, WIRE_LOCAL);
+    SocketEndpoint const LOOKUP_REMOTE = tcp_endpoint_for_socket_domain(SOCKADDR_V6_FAMILY, WIRE_REMOTE);
+    EXPECT_EQ(tcp_hash_tuple(CHILD_LOCAL, CHILD_REMOTE), tcp_hash_tuple(LOOKUP_LOCAL, LOOKUP_REMOTE));
+}
+
+TEST(SocketEndpoint, ScopeIsRetainedOnlyForScopedIPv6Addresses) {
+    IPv6Address global{};
+    global.bytes = {0x20, 0x01, 0x0D, 0xB8};
+    EXPECT_EQ(SocketEndpoint::ipv6(global, 80, 7).scope_id, 0u);
+
+    IPv6Address link_local{};
+    link_local.bytes = {0xFE, 0x80};
+    EXPECT_EQ(SocketEndpoint::ipv6(link_local, 80, 7).scope_id, 7u);
+
+    IPv6Address link_multicast{};
+    link_multicast.bytes = {0xFF, 0x02};
+    EXPECT_EQ(SocketEndpoint::ipv6(link_multicast, 80, 7).scope_id, 7u);
+
+    IPv6Address global_multicast{};
+    global_multicast.bytes = {0xFF, 0x0E};
+    EXPECT_EQ(SocketEndpoint::ipv6(global_multicast, 80, 7).scope_id, 0u);
+}
+
+TEST(SocketEndpoint, ScopedAddressMustAgreeWithBoundInterface) {
+    IPv6Address link_local{};
+    link_local.bytes = {0xFE, 0x80};
+    SocketEndpoint const SCOPED = SocketEndpoint::ipv6(link_local, 80, 7);
+
+    EXPECT_TRUE(socket_endpoint_scope_agrees_with_ifindex(SCOPED, 0));
+    EXPECT_TRUE(socket_endpoint_scope_agrees_with_ifindex(SCOPED, 7));
+    EXPECT_FALSE(socket_endpoint_scope_agrees_with_ifindex(SCOPED, 8));
+}
+
+TEST(SocketEndpoint, ScopedPeerRequiresUnambiguousLiveZoneCandidate) {
+    IPv6Address link_local{};
+    link_local.bytes = {0xFE, 0x80};
+    SocketEndpoint const UNSCOPED_PEER = SocketEndpoint::ipv6(link_local, 80);
+    SocketEndpoint const EXPLICIT_PEER = SocketEndpoint::ipv6(link_local, 80, 7);
+    uint32_t effective_scope = UINT32_MAX;
+
+    EXPECT_EQ(socket_effective_endpoint_scope(UNSCOPED_PEER, 0, 0, effective_scope), -EADDRNOTAVAIL);
+    EXPECT_EQ(socket_effective_endpoint_scope(UNSCOPED_PEER, 7, 0, effective_scope), 0);
+    EXPECT_EQ(effective_scope, 7u);
+    EXPECT_EQ(socket_effective_endpoint_scope(UNSCOPED_PEER, 0, 9, effective_scope), 0);
+    EXPECT_EQ(effective_scope, 9u);
+    EXPECT_EQ(socket_effective_endpoint_scope(EXPLICIT_PEER, 8, 0, effective_scope), -EINVAL);
+    EXPECT_EQ(socket_effective_endpoint_scope(EXPLICIT_PEER, 0, 8, effective_scope), -EINVAL);
+}
+
+TEST(SocketEndpoint, InterfaceOwnershipAppliesToConcreteNativeIPv6Only) {
+    IPv6Address global{};
+    global.bytes = {0x20, 0x01, 0x0D, 0xB8};
+    EXPECT_TRUE(socket_endpoint_requires_interface_address(SocketEndpoint::ipv6(global, 80)));
+    EXPECT_TRUE(socket_endpoint_requires_interface_address(SocketEndpoint::ipv6(IPv6Address::loopback(), 80)));
+    EXPECT_FALSE(socket_endpoint_requires_interface_address(SocketEndpoint::ipv6({}, 80)));
+    EXPECT_FALSE(socket_endpoint_requires_interface_address(SocketEndpoint::mapped_ipv4(IPv4Address{0x7F000001}, 80)));
+    EXPECT_FALSE(socket_endpoint_requires_interface_address(SocketEndpoint::ipv4(IPv4Address{0x7F000001}, 80)));
+}
+
+TEST(SocketState, ExplicitBindIsSingleShot) {
+    EXPECT_TRUE(socket_state_allows_explicit_bind(SocketState::UNBOUND));
+    EXPECT_FALSE(socket_state_allows_explicit_bind(SocketState::BOUND));
+    EXPECT_FALSE(socket_state_allows_explicit_bind(SocketState::LISTENING));
+    EXPECT_FALSE(socket_state_allows_explicit_bind(SocketState::CONNECTING));
+    EXPECT_FALSE(socket_state_allows_explicit_bind(SocketState::CONNECTED));
+    EXPECT_FALSE(socket_state_allows_explicit_bind(SocketState::CLOSED));
+}
+
+TEST(RawDelivery, FiltersInterfaceLocalAddressAndConnectedPeer) {
+    IPv6Address local_address{};
+    local_address.bytes = {0xFE, 0x80};
+    local_address.bytes.at(15) = 1;
+    IPv6Address peer_address{};
+    peer_address.bytes = {0xFE, 0x80};
+    peer_address.bytes.at(15) = 2;
+    IPv6Address other_peer_address = peer_address;
+    other_peer_address.bytes.at(15) = 3;
+    SocketEndpoint const LOCAL = SocketEndpoint::ipv6(local_address, 0, 7);
+    SocketEndpoint const PEER = SocketEndpoint::ipv6(peer_address, 0, 7);
+    SocketEndpoint const OTHER_PEER = SocketEndpoint::ipv6(other_peer_address, 0, 7);
+    IPv6Address multicast_address{};
+    multicast_address.bytes = {0xFF, 0x02};
+    multicast_address.bytes.at(15) = 1;
+    SocketEndpoint const MULTICAST = SocketEndpoint::ipv6(multicast_address, 0, 7);
+
+    EXPECT_TRUE(raw_delivery_endpoint_matches(LOCAL, PEER, true, 7, 7, PEER, LOCAL));
+    EXPECT_FALSE(raw_delivery_endpoint_matches(LOCAL, PEER, true, 7, 8, PEER, LOCAL));
+    EXPECT_FALSE(raw_delivery_endpoint_matches(LOCAL, PEER, true, 7, 7, OTHER_PEER, LOCAL));
+    EXPECT_FALSE(raw_delivery_endpoint_matches(LOCAL, PEER, true, 7, 7, PEER, OTHER_PEER));
+    EXPECT_TRUE(raw_delivery_endpoint_matches(LOCAL, PEER, false, 7, 7, OTHER_PEER, MULTICAST));
+    EXPECT_TRUE(raw_delivery_endpoint_matches(SocketEndpoint::ipv6(), {}, false, 0, 7, OTHER_PEER, LOCAL));
+}
+
+TEST(TcpMss, AccountsForIPv6AndPacketCapacity) {
+    IPv6Address global{};
+    global.bytes = {0x20, 0x01, 0x0D, 0xB8};
+    SocketEndpoint const NATIVE_V6 = SocketEndpoint::ipv6(global, 80);
+    SocketEndpoint const MAPPED_V4 = SocketEndpoint::mapped_ipv4(IPv4Address{0x7F000001}, 80);
+
+    EXPECT_EQ(tcp_receive_mss_for_path(NATIVE_V6, 1500), 1440u);
+    EXPECT_EQ(tcp_receive_mss_for_path(NATIVE_V6, 1280), 1220u);
+    EXPECT_EQ(tcp_receive_mss_for_path(NATIVE_V6, 0), 1220u);
+    EXPECT_EQ(tcp_receive_mss_for_path(NATIVE_V6, 50), 1u);
+    EXPECT_EQ(tcp_receive_mss_for_path(MAPPED_V4, 1500), 1460u);
+    EXPECT_EQ(tcp_receive_mss_for_path(NATIVE_V6, UINT16_MAX), PKT_BUF_SIZE - PKT_HEADROOM - 60u);
+}
 
 // =============================================================================
 // TcpCB Default State

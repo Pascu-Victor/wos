@@ -114,6 +114,21 @@ ABI_ENUM_EQUAL(KernelNet::NETCTL_ADDR_LIST, LibcNet::NETCTL_ADDR_LIST);
 ABI_ENUM_EQUAL(KernelNet::NETCTL_ADDR_SET, LibcNet::NETCTL_ADDR_SET);
 ABI_ENUM_EQUAL(KernelNet::NETCTL_ADDR_DEL, LibcNet::NETCTL_ADDR_DEL);
 ABI_ENUM_EQUAL(KernelNet::NETCTL_LINK_SET, LibcNet::NETCTL_LINK_SET);
+ABI_ENUM_EQUAL(KernelNet::SENDTO_EX, LibcNet::SENDTO_EX);
+ABI_ENUM_EQUAL(KernelNet::RECVFROM_EX, LibcNet::RECVFROM_EX);
+ABI_ENUM_EQUAL(KernelNet::NETCTL_ADDR_SET_V2, LibcNet::NETCTL_ADDR_SET_V2);
+ABI_ENUM_EQUAL(KernelNet::NETCTL_ROUTE_LIST, LibcNet::NETCTL_ROUTE_LIST);
+ABI_ENUM_EQUAL(KernelNet::NETCTL_ROUTE_SET, LibcNet::NETCTL_ROUTE_SET);
+ABI_ENUM_EQUAL(KernelNet::NETCTL_ROUTE_DEL, LibcNet::NETCTL_ROUTE_DEL);
+
+using KernelSockaddrIo = kernel_ker::abi::net::SockaddrIoV1;
+using LibcSockaddrIo = libc_ker::abi::net::SockaddrIoV1;
+ABI_TYPE_EQUAL(KernelSockaddrIo, LibcSockaddrIo);
+ABI_OFFSET_EQUAL(KernelSockaddrIo, LibcSockaddrIo, size);
+ABI_OFFSET_EQUAL(KernelSockaddrIo, LibcSockaddrIo, version);
+ABI_OFFSET_EQUAL(KernelSockaddrIo, LibcSockaddrIo, address);
+ABI_OFFSET_EQUAL(KernelSockaddrIo, LibcSockaddrIo, address_length);
+ABI_OFFSET_EQUAL(KernelSockaddrIo, LibcSockaddrIo, result_length);
 
 using KernelPower = kernel_ker::abi::power::ops;
 using LibcPower = libc_ker::abi::power::ops;

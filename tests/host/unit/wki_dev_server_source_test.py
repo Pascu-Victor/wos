@@ -108,7 +108,9 @@ def test_state_notify_sends_notify_cookie_envelope() -> None:
         ".attach_cookie = b.attach_cookie",
         "notify->magic = WKI_NET_NOTIFY_MAGIC",
         "notify->attach_cookie = target.attach_cookie",
-        "notify->data_len = sizeof(NetStateNotifyPayload)",
+        "wki_peer_capability_negotiated(target.channel_identity.peer_node_id, WKI_CAP_NET_IPV6_STATE)",
+        "notify->data_len = static_cast<uint16_t>(sizeof(NetStateNotifyPayload) + (WITH_IPV6 ? sizeof(NetIpv6StateSuffix) : 0))",
+        "req->data_len = static_cast<uint16_t>(sizeof(NetNotifyHeader) + notify->data_len)",
     ]
     missing = [token for token in required if token not in body]
     if missing:

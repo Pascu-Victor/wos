@@ -8,6 +8,9 @@ set(CXXFILES
     src/dhcp.cpp
     src/interface.cpp
     src/main.cpp
+    src/manager.cpp
+    src/ra.cpp
+    src/ra_worker.cpp
     src/recv.cpp
     src/resolver.cpp
     src/time.cpp

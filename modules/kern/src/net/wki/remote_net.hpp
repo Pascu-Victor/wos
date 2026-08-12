@@ -97,6 +97,7 @@ struct ProxyNetState {
     proto::MacAddress owner_real_mac;
     uint16_t owner_link_state = 0;
     uint32_t owner_mtu = 1500;
+    NetIpv6StateSuffix owner_ipv6 = wki_net_ipv6_state_empty();
 
     // V2: RX backpressure credit tracking [V2 A5.6]
     uint16_t rx_credits_remaining = 0;  // credits granted to server (server-side tracking)

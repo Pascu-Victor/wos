@@ -33,6 +33,8 @@
 #include "asan_crasher.hpp"
 #include "cowbench.hpp"
 #include "fsbench.hpp"
+#include "ipv6_net.hpp"
+#include "ipv6_ra.hpp"
 #include "mandelbench/config.hpp"
 #include "mandelbench/mandelbench_wki.hpp"
 #include "memory_pressure.hpp"
@@ -611,6 +613,14 @@ auto main(int argc, char** argv, char** envp) -> int {
 
     if (command != nullptr && (std::strcmp(command, "netbench-server") == 0 || std::strcmp(command, "netbench-client") == 0)) {
         return run_netbench(argc - 1, argv + 1);
+    }
+
+    if (command != nullptr && std::strcmp(command, "ipv6-ra") == 0) {
+        return run_ipv6_ra(argc - 1, argv + 1);
+    }
+
+    if (command != nullptr && std::strcmp(command, "ipv6-net") == 0) {
+        return run_ipv6_net(argc - 1, argv + 1);
     }
 
     if (command != nullptr && (std::strcmp(command, "fork-cow") == 0 || std::strcmp(command, "cow") == 0)) {

@@ -54,6 +54,7 @@
 #include <platform/sched/scheduler.hpp>
 #include <platform/smt/smt.hpp>
 #include <platform/sys/syscall.hpp>
+#include <string_view>
 #include <util/hostname.hpp>
 #include <util/netdevconf.hpp>
 #include <vfs/fs/devfs.hpp>
@@ -213,11 +214,11 @@ void ipv6_linklocal_init() {
     for (size_t i = 0; i < net::netdev_count(); i++) {
         auto dev_ref = net::netdev_at_ref(i);
         auto* dev = dev_ref.get();
-        if (dev == nullptr || dev->wki_transport) {
+        if (dev == nullptr || dev->wki_transport || std::string_view(dev->name.data()) == "lo") {
             continue;
         }
         net::proto::IPv6Address const LL_ADDR = net::proto::ipv6_make_link_local(dev->mac);
-        net::netif_add_ipv6(dev, LL_ADDR, 64);
+        static_cast<void>(net::netif_set_ipv6(dev, LL_ADDR, 64, net::IPV6_ADDR_F_PERMANENT, UINT64_MAX, UINT64_MAX, false));
     }
 }
 

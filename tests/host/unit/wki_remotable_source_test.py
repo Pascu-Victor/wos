@@ -196,6 +196,23 @@ def test_resource_rx_survives_same_boot_channel_reset_without_acking_unknown_epo
     )
 
 
+def test_net_ipv6_advert_admission_bypasses_incarnation_and_is_exact() -> None:
+    source = REMOTABLE_CPP.read_text()
+    classify = function_body(source, "classify_remotable_rx")
+    require_order(
+        classify,
+        [
+            "RESOURCE_TYPE == ResourceType::NET",
+            "wki_peer_capability_negotiated(peer_node, WKI_CAP_NET_IPV6_STATE)",
+            "wki_net_ipv6_extended_length_valid(WITH_IPV6, payload_len, BASE_AND_NAME_SIZE)",
+            "*copy_len = payload_len",
+            "return WkiRemotableRxAdmission::DEFERRED",
+            "decode_for_admission(RESOURCE_TYPE, BASE_AND_NAME_SIZE",
+        ],
+        "NET advert exact capability length is admitted before incarnation decoding",
+    )
+
+
 def test_pending_net_attach_is_generation_and_epoch_fenced() -> None:
     source = REMOTABLE_CPP.read_text()
     required = [
@@ -335,6 +352,8 @@ def test_same_incarnation_block_advert_revives_exact_generation() -> None:
 def main() -> None:
     test_deferred_retry_deadlines_are_saturating()
     test_resource_snapshots_are_coalesced_after_control_stream_drain()
+    test_resource_rx_survives_same_boot_channel_reset_without_acking_unknown_epoch()
+    test_net_ipv6_advert_admission_bypasses_incarnation_and_is_exact()
     test_pending_net_attach_is_generation_and_epoch_fenced()
     test_pending_vfs_mount_waits_for_detach_ack_without_spending_retries()
     test_pending_vfs_mount_prepares_only_the_local_host_directory()

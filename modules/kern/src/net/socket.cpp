@@ -6,6 +6,8 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <net/netdevice.hpp>
+#include <net/netif.hpp>
 #include <net/proto/raw.hpp>
 #include <net/proto/tcp.hpp>
 #include <net/proto/udp.hpp>
@@ -62,6 +64,115 @@ void socket_delete_waiters(SocketWaiter* waiters) {
     }
 }
 }  // namespace
+
+auto socket_prepare_endpoint_scope(const Socket* sock, SocketEndpoint& endpoint, bool local_bind) -> int {
+    if (sock == nullptr) {
+        return -EINVAL;
+    }
+    if (!endpoint.is_ipv6() || endpoint.is_v4_mapped()) {
+        return 0;
+    }
+
+    if (local_bind && !endpoint.is_unspecified() && endpoint.ipv6_address().is_multicast()) {
+        return -EADDRNOTAVAIL;
+    }
+
+    auto device_for_ifindex = [](uint32_t ifindex) -> NetDeviceRef {
+        size_t const COUNT = netdev_count();
+        for (size_t i = 0; i < COUNT; ++i) {
+            NetDeviceRef device = netdev_at_ref(i);
+            if (device && device->ifindex == ifindex) {
+                return device;
+            }
+        }
+        return {};
+    };
+    auto address_is_usable_on = [&endpoint](NetDevice* device) -> bool {
+        IPv6Addr address{};
+        return device != nullptr && netif_ipv6_find(device, endpoint.ipv6_address(), address) &&
+               (address.state == IPv6Addr::State::PREFERRED || address.state == IPv6Addr::State::DEPRECATED);
+    };
+
+    if (!endpoint.is_scoped_ipv6()) {
+        if (!local_bind) {
+            return 0;
+        }
+        if (endpoint.is_unspecified()) {
+            return sock->bound_ifindex == 0 || device_for_ifindex(sock->bound_ifindex) ? 0 : -ENODEV;
+        }
+        if (sock->bound_ifindex != 0) {
+            NetDeviceRef device = device_for_ifindex(sock->bound_ifindex);
+            if (!device) {
+                return -ENODEV;
+            }
+            return address_is_usable_on(device.get()) ? 0 : -EADDRNOTAVAIL;
+        }
+
+        size_t owners = 0;
+        size_t const COUNT = netdev_count();
+        for (size_t i = 0; i < COUNT; ++i) {
+            NetDeviceRef device = netdev_at_ref(i);
+            if (device && address_is_usable_on(device.get())) {
+                ++owners;
+                if (owners > 1) {
+                    return -EADDRNOTAVAIL;
+                }
+            }
+        }
+        return owners == 1 ? 0 : -EADDRNOTAVAIL;
+    }
+
+    uint32_t scope_id = 0;
+    uint32_t const LOCAL_SCOPE_ID = !local_bind && sock->local.is_scoped_ipv6() ? sock->local.scope_id : 0;
+    int const SCOPE_RESULT = socket_effective_endpoint_scope(endpoint, sock->bound_ifindex, LOCAL_SCOPE_ID, scope_id);
+    if (SCOPE_RESULT < 0) {
+        return SCOPE_RESULT;
+    }
+
+    NetDeviceRef device = device_for_ifindex(scope_id);
+    if (!device) {
+        return -ENODEV;
+    }
+    if (local_bind && !address_is_usable_on(device.get())) {
+        return -EADDRNOTAVAIL;
+    }
+
+    endpoint = SocketEndpoint::ipv6(endpoint.ipv6_address(), endpoint.port, scope_id);
+    return 0;
+}
+
+auto socket_validate_bound_interface(const Socket* sock, uint32_t ifindex) -> int {
+    if (sock == nullptr || ifindex == 0) {
+        return -EINVAL;
+    }
+
+    NetDeviceRef device{};
+    size_t const COUNT = netdev_count();
+    for (size_t i = 0; i < COUNT; ++i) {
+        NetDeviceRef candidate = netdev_at_ref(i);
+        if (candidate && candidate->ifindex == ifindex) {
+            device = static_cast<NetDeviceRef&&>(candidate);
+            break;
+        }
+    }
+    if (!device) {
+        return -ENODEV;
+    }
+    if (!socket_endpoint_scope_agrees_with_ifindex(sock->local, ifindex) ||
+        !socket_endpoint_scope_agrees_with_ifindex(sock->remote, ifindex)) {
+        return -EINVAL;
+    }
+    if (!socket_endpoint_requires_interface_address(sock->local)) {
+        return 0;
+    }
+
+    IPv6Addr address{};
+    if (sock->local.ipv6_address().is_multicast() || !netif_ipv6_find(device.get(), sock->local.ipv6_address(), address) ||
+        (address.state != IPv6Addr::State::PREFERRED && address.state != IPv6Addr::State::DEPRECATED)) {
+        return -EADDRNOTAVAIL;
+    }
+    return 0;
+}
 
 auto RingBuffer::write(const void* buf, size_t len) -> ssize_t {
     // Lock-free SPSC producer path (NAPI worker, single writer).
@@ -123,18 +234,29 @@ auto RingBuffer::read(void* buf, size_t len) -> ssize_t {
 }
 
 auto socket_create(int domain, int type, int protocol) -> Socket* {
+    if (domain != SOCKADDR_V4_FAMILY && domain != SOCKADDR_V6_FAMILY) {
+        return nullptr;
+    }
+    int const BASE_TYPE = type & SOCK_TYPE_MASK;
+    bool const PROTOCOL_SUPPORTED = (BASE_TYPE == SOCK_STREAM_TYPE && (protocol == 0 || protocol == 6)) ||
+                                    (BASE_TYPE == SOCK_DGRAM_TYPE && (protocol == 0 || protocol == 17)) ||
+                                    (BASE_TYPE == SOCK_RAW_TYPE && protocol > 0 && protocol <= UINT8_MAX);
+    if (!PROTOCOL_SUPPORTED) {
+        return nullptr;
+    }
     auto* sock = new (std::nothrow) Socket{};
     if (sock == nullptr) {
         return nullptr;
     }
 
-    int const BASE_TYPE = type & SOCK_TYPE_MASK;
     sock->nonblock = (type & SOCK_NONBLOCK) != 0;
 
     sock->domain = domain;
     sock->type = static_cast<uint8_t>(BASE_TYPE);
     sock->protocol = protocol;
     sock->state = SocketState::UNBOUND;
+    sock->local = domain == SOCKADDR_V6_FAMILY ? SocketEndpoint::ipv6() : SocketEndpoint::ipv4();
+    sock->remote = domain == SOCKADDR_V6_FAMILY ? SocketEndpoint::ipv6() : SocketEndpoint::ipv4();
 
     // Assign protocol-specific ops
     // TODO: Extract me into enums
@@ -144,23 +266,39 @@ auto socket_create(int domain, int type, int protocol) -> Socket* {
         rcvbuf_size = TCP_RCVBUF_SIZE;
         // Allocate TCP control block
         auto* cb = proto::tcp_alloc_cb();
-        if (cb != nullptr) {
-            cb->socket = sock;
-            sock->proto_data = cb;
+        if (cb == nullptr) {
+            delete sock;
+            return nullptr;
         }
+        cb->socket = sock;
+        cb->local = sock->local;
+        cb->remote = sock->remote;
+        sock->proto_data = cb;
     } else if (BASE_TYPE == SOCK_DGRAM_TYPE) {
         sock->proto_ops = proto::get_udp_proto_ops();
         rcvbuf_size = UDP_RCVBUF_SIZE;
     } else if (BASE_TYPE == SOCK_RAW_TYPE) {
         sock->proto_ops = proto::get_raw_proto_ops();
         rcvbuf_size = RAW_RCVBUF_SIZE;
-        // Auto-bind raw sockets to receive packets
-        if (sock->proto_ops != nullptr && sock->proto_ops->bind != nullptr) {
-            sock->proto_ops->bind(sock, nullptr, 0);
-        }
     }
 
     if (socket_init_buffers(sock, rcvbuf_size) < 0) {
+        if (sock->proto_data != nullptr) {
+            auto* cb = static_cast<proto::TcpCB*>(sock->proto_data);
+            cb->socket = nullptr;
+            proto::tcp_cb_release(cb);
+            sock->proto_data = nullptr;
+        }
+        delete sock;
+        return nullptr;
+    }
+
+    // Raw receive registration happens only after all fallible construction.
+    // This prevents the global registry from observing a socket whose receive
+    // buffer allocation failed, and propagates bounded-registry exhaustion.
+    if (BASE_TYPE == SOCK_RAW_TYPE &&
+        (sock->proto_ops == nullptr || sock->proto_ops->bind == nullptr || sock->proto_ops->bind(sock, nullptr, 0) < 0)) {
+        delete[] sock->rcvbuf.data;
         delete sock;
         return nullptr;
     }
@@ -173,8 +311,37 @@ void socket_destroy(Socket* sock) {
         return;
     }
 
+    bool expected = false;
+    if (!sock->closing.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+        return;
+    }
     if (sock->proto_ops != nullptr && sock->proto_ops->close != nullptr) {
         sock->proto_ops->close(sock);
+    }
+
+    socket_release(sock);
+}
+
+auto socket_try_acquire(Socket* sock) -> bool {
+    if (sock == nullptr || sock->closing.load(std::memory_order_acquire)) {
+        return false;
+    }
+    uint32_t refs = sock->refcount.load(std::memory_order_relaxed);
+    while (refs != 0) {
+        if (sock->refcount.compare_exchange_weak(refs, refs + 1, std::memory_order_acquire, std::memory_order_relaxed)) {
+            if (sock->closing.load(std::memory_order_acquire)) {
+                socket_release(sock);
+                return false;
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+void socket_release(Socket* sock) {
+    if (sock == nullptr || sock->refcount.fetch_sub(1, std::memory_order_acq_rel) != 1) {
+        return;
     }
 
     delete[] sock->rcvbuf.data;

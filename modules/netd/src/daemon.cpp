@@ -14,7 +14,6 @@
 #include <cstring>
 #include <utility>
 
-#include "netd/config.hpp"
 #include "netd/dhcp.hpp"
 #include "netd/interface.hpp"
 #include "netd/log.hpp"
@@ -42,8 +41,10 @@ void boot_trace(const char* message) {
 
 }  // namespace
 
-auto run_dhcp_client() -> int {
-    const char* ifname = find_ifname_for_driver("dhcp", "eth0");
+auto run_dhcp_client(const char* ifname) -> int {
+    if (ifname == nullptr || ifname[0] == '\0') {
+        return 1;
+    }
     boot_trace("netd-boot: run_dhcp_client entered\n");
     logger::info("netd: starting DHCP client for %s", ifname);
     boot_trace("netd-boot: after startup log\n");

@@ -7,9 +7,14 @@
 #include <cstring>
 #include <net/backlog.hpp>
 #include <net/net_trace.hpp>
+#include <net/netif.hpp>
+#include <net/proto/arp.hpp>
 #include <net/proto/ethernet.hpp>
 #include <net/proto/ipv4.hpp>
 #include <net/proto/ipv6.hpp>
+#include <net/proto/ndp.hpp>
+#include <net/route.hpp>
+#include <net/route6.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/smt/smt.hpp>
@@ -57,6 +62,22 @@ auto registered_identity_locked(NetDevice* dev) -> NetDeviceIdentity {
         }
     }
     return {};
+}
+
+void retire_network_state(const NetDeviceRetireToken& token) {
+    if (!token.valid()) {
+        return;
+    }
+
+    NetDevice* const DEV = token.identity.device;
+    // The registry row is already unpublished, so no new route/interface/NDP
+    // publication can win against this retirement. Release queued packets
+    // before unregister_wait(), because each one may own a device reference.
+    static_cast<void>(route_del_for_dev(DEV));
+    static_cast<void>(route6_del_for_dev(token.identity));
+    static_cast<void>(netif_del_for_dev(DEV));
+    proto::arp_forget_device(token.identity);
+    proto::ndp_forget_device(token.identity);
 }
 }  // namespace
 
@@ -179,6 +200,7 @@ auto netdev_unregister_begin(NetDevice* dev, NetDeviceRetireToken& token) -> int
         device_count--;
         devices.at(device_count) = nullptr;
         devices_lock.unlock();
+        retire_network_state(token);
         return 0;
     }
     devices_lock.unlock();

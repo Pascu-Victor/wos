@@ -6765,19 +6765,25 @@ void handle_ipc_dev_op_req_inline(const WkiHeader* hdr, const uint8_t* payload, 
             if (f != nullptr) {
                 auto* sock = static_cast<ker::net::Socket*>(f->private_data);
                 if (sock != nullptr) {
-                    // Serialize peer addr as: [family:u16][addr:u32][port:u16] (AF_INET)
-                    struct {
-                        uint16_t family;
-                        uint32_t addr;
-                        uint16_t port;
-                    } __attribute__((packed)) peer_addr = {};
-                    static_assert(sizeof(peer_addr) == 8);
-                    peer_addr.family = static_cast<uint16_t>(sock->domain);
-                    peer_addr.addr = sock->remote_v4.addr;
-                    peer_addr.port = sock->remote_v4.port;
-                    std::memcpy(resp_buf.data() + RESP_HEADER + RID_SIZE, &peer_addr, sizeof(peer_addr));
-                    resp->data_len = static_cast<uint16_t>(RID_SIZE + sizeof(peer_addr));
-                    resp->status = 0;
+                    auto const& remote = sock->remote;
+                    if (remote.is_ipv4() || remote.is_v4_mapped()) {
+                        // The remote-IPC socket wire record remains IPv4-only;
+                        // dual-stack mapped endpoints are projected to AF_INET.
+                        struct {
+                            uint16_t family;
+                            uint32_t addr;
+                            uint16_t port;
+                        } __attribute__((packed)) peer_addr = {};
+                        static_assert(sizeof(peer_addr) == 8);
+                        peer_addr.family = ker::net::SOCKADDR_V4_FAMILY;
+                        peer_addr.addr = remote.ipv4_address().to_host_order();
+                        peer_addr.port = remote.port;
+                        std::memcpy(resp_buf.data() + RESP_HEADER + RID_SIZE, &peer_addr, sizeof(peer_addr));
+                        resp->data_len = static_cast<uint16_t>(RID_SIZE + sizeof(peer_addr));
+                        resp->status = 0;
+                    } else {
+                        resp->status = -EAFNOSUPPORT;
+                    }
                 } else {
                     resp->status = -ENOTSOCK;
                 }

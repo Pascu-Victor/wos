@@ -52,6 +52,7 @@
     X(test_file_write_read)                               \
     X(test_mmap_file)                                     \
     X(test_tcp_loopback)                                  \
+    X(test_ipv6_loopback)                                 \
     X(test_tcp_nonblocking_connect_refused)               \
     X(test_journal_device_userspace_record)               \
     X(test_wki_target_policy_syscalls)                    \

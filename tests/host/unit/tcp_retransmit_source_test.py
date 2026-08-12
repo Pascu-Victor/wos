@@ -154,8 +154,8 @@ def test_receiver_sack_advertises_and_reports_out_of_order_block() -> None:
             "!cb->sack_permitted",
             "uint32_t left_edge = 0",
             "if (cb->ooo_head != nullptr)",
-            "left_edge = seg->seq",
-            "right_edge = seg->seq + static_cast<uint32_t>(seg->len)",
+            "left_edge = cb->ooo_head->seq",
+            "right_edge = cb->ooo_head->seq + static_cast<uint32_t>(cb->ooo_head->len)",
             "} else if (cb->ooo_fin_pending)",
             "left_edge = cb->ooo_fin_seq",
             "right_edge = cb->ooo_fin_seq + 1",
@@ -170,17 +170,34 @@ def test_receiver_sack_advertises_and_reports_out_of_order_block() -> None:
         "single-block SACK ACK helper",
     )
 
-    build_ack = function_body(output_source, "tcp_build_ack")
+    build_control = function_body(output_source, "tcp_build_control_locked")
     require_order(
-        build_ack,
+        build_control,
         [
             "write_sack_option_locked(cb, options.data(), options.size())",
             "size_t const HDR_LEN = sizeof(TcpHeader) + OPTS_LEN",
             "std::memcpy(payload + sizeof(TcpHeader), options.data(), OPTS_LEN)",
-            "hdr->data_offset = static_cast<uint8_t>((HDR_LEN / 4) << 4)",
-            "pseudo_header_checksum(cb->local_ip, cb->remote_ip, 6, pkt->data, pkt->len)",
+            "hdr->data_offset = static_cast<uint8_t>((HDR_LEN / 4U) << 4U)",
+            "*out_local = cb->local",
+            "*out_remote = cb->remote",
+            "return pkt",
         ],
-        "SACK option included in ACK checksum",
+        "SACK option included in ACK packet",
+    )
+    build_ack = function_body(output_source, "tcp_build_ack")
+    if "tcp_build_control_locked(cb, cb->snd_nxt, TCP_ACK, true, out_local, out_remote)" not in build_ack:
+        fail("tcp_build_ack must request SACK options from the family-neutral control builder")
+
+    transmit = function_body(output_source, "tcp_transmit_prebuilt")
+    require_order(
+        transmit,
+        [
+            "hdr->checksum = 0",
+            "if (remote.is_ipv4() || remote.is_v4_mapped())",
+            "pseudo_header_checksum(SRC, DST, IPV6_PROTO_TCP, pkt->data, pkt->len)",
+            "checksum_pseudo_ipv6(route.source, remote.ipv6_address(), IPV6_PROTO_TCP",
+        ],
+        "family-neutral ACK checksum",
     )
 
 
@@ -203,7 +220,8 @@ def test_tcp_poll_reports_all_recv_eof_states() -> None:
         poll_check,
         [
             "return POLLERR | POLLHUP",
-            "bool const READ_EOF = tcp_read_eof_state(STATE)",
+            "bool const READ_EOF = sock->read_shutdown || tcp_read_eof_state(STATE)",
+            "bool const FULL_HUP = tcp_hup_state(STATE)",
             "bool const CONNECT_FAILED = STATE == TcpState::CLOSED && sock->state == SocketState::CONNECTING",
             "sock->rcvbuf.available() > 0 || READ_EOF",
             "ready |= POLLRDHUP",

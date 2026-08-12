@@ -26,7 +26,10 @@ using init_log = wos::journal<"init">;
 using init_net_log = wos::journal<"init_net">;
 
 constexpr size_t IF_DEBUG_CAP = 16;
-constexpr size_t ADDR_DEBUG_CAP = 32;
+constexpr size_t IPV4_ADDRS_PER_INTERFACE_CAP = 8;
+constexpr size_t IPV6_ADDRS_PER_INTERFACE_CAP = 8;
+constexpr size_t ADDR_DEBUG_CAP = IF_DEBUG_CAP * (IPV4_ADDRS_PER_INTERFACE_CAP + IPV6_ADDRS_PER_INTERFACE_CAP);
+static_assert(ADDR_DEBUG_CAP == 256);
 constexpr size_t JOURNAL_READ_BATCH = 16;
 constexpr size_t JOURNAL_DUMP_RECORD_CAP = 4096;
 constexpr size_t JOURNAL_RECORD_SIZE = sizeof(ker::abi::sys_log::JournalRecord);
@@ -49,6 +52,49 @@ auto bounded_string_length(const char* text, size_t limit) -> size_t {
         len++;
     }
     return len;
+}
+
+auto nonzero_address(const uint8_t* address, size_t length) -> bool {
+    for (size_t i = 0; i < length; ++i) {
+        if (address[i] != 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+auto interface_has_usable_global_ipv6(const char* interface_name) -> bool {
+    std::array<wos_net_if_info, IF_DEBUG_CAP> interfaces{};
+    size_t interface_count = interfaces.size();
+    if (wos_net_if_list(interfaces.data(), &interface_count) != 0) {
+        return false;
+    }
+
+    uint32_t ifindex = 0;
+    for (size_t i = 0; i < std::min(interface_count, interfaces.size()); ++i) {
+        if (std::strncmp(interfaces[i].name, interface_name, WOS_NET_IF_NAME_LEN) == 0) {
+            ifindex = interfaces[i].ifindex;
+            break;
+        }
+    }
+    if (ifindex == 0) {
+        return false;
+    }
+
+    std::array<wos_net_addr_info, ADDR_DEBUG_CAP> addresses{};
+    size_t address_count = addresses.size();
+    if (wos_net_addr_list(addresses.data(), &address_count) != 0) {
+        return false;
+    }
+    for (size_t i = 0; i < std::min(address_count, addresses.size()); ++i) {
+        auto const& address = addresses[i];
+        const uint8_t* local = nonzero_address(address.local, WOS_NET_ADDR_LEN) ? address.local : address.address;
+        if (address.ifindex == ifindex && address.family == AF_INET6 && address.scope == 0 &&
+            (address.flags & (WOS_NET_ADDR_F_TENTATIVE | WOS_NET_ADDR_F_DADFAILED)) == 0 && nonzero_address(local, WOS_NET_ADDR_LEN)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 auto journal_level_name(uint8_t level) -> const char* {
@@ -289,6 +335,13 @@ void dump_netctl_state() {
                                static_cast<unsigned long long>(i), addr.ifindex, WOS_NET_IF_NAME_LEN, addr.label,
                                static_cast<unsigned>(addr.prefix_len), static_cast<unsigned>(addr.scope), addr.flags, local.data(),
                                broadcast.data());
+        } else if (addr.family == AF_INET6) {
+            std::array<char, INET6_ADDRSTRLEN> local{};
+            const uint8_t* raw = nonzero_address(addr.local, WOS_NET_ADDR_LEN) ? addr.local : addr.address;
+            inet_ntop(AF_INET6, raw, local.data(), local.size());
+            init_net_log::critical("addr[%llu] ifindex=%u label=%.*s family=AF_INET6 prefix=%u scope=%u flags=0x%x local=%s",
+                                   static_cast<unsigned long long>(i), addr.ifindex, WOS_NET_IF_NAME_LEN, addr.label,
+                                   static_cast<unsigned>(addr.prefix_len), static_cast<unsigned>(addr.scope), addr.flags, local.data());
         } else {
             init_net_log::critical("addr[%llu] ifindex=%u label=%.*s family=%u prefix=%u scope=%u flags=0x%x",
                                    static_cast<unsigned long long>(i), addr.ifindex, WOS_NET_IF_NAME_LEN, addr.label,
@@ -402,6 +455,9 @@ auto network_probe_poll(NetworkProbe& probe) -> NetworkProbeResult {
     copy_ifreq_name(ifr, probe.interface_name.data());
     if (ioctl(probe.socket_fd, SIOCGIFADDR, &ifr) != 0) {
         int const ERR = errno;
+        if (interface_has_usable_global_ipv6(probe.interface_name.data())) {
+            return NetworkProbeResult::READY;
+        }
         probe.addr_failures++;
         if (probe.first_errno == 0) {
             probe.first_errno = ERR;
@@ -415,6 +471,9 @@ auto network_probe_poll(NetworkProbe& probe) -> NetworkProbeResult {
     probe.last_ipv4 = addr->sin_addr.s_addr;
     if (probe.last_ipv4 == 0) {
         probe.addr_zero_results++;
+        if (interface_has_usable_global_ipv6(probe.interface_name.data())) {
+            return NetworkProbeResult::READY;
+        }
         return NetworkProbeResult::PENDING;
     }
     return NetworkProbeResult::READY;

@@ -148,9 +148,10 @@ auto netdev_register(NetDevice* dev) -> int;
 auto netdev_unregister(NetDevice* dev) -> int;
 
 // Two-phase retirement is available to teardown paths that must first unpublish
-// the device, release their own retained objects, and only then wait. Neither
-// phase waits with the registry lock held; netdev_unregister_wait() must run in
-// task context.
+// the device, release their own retained objects, and only then wait. begin()
+// also retires route/interface and ARP/NDP state so queued packets cannot pin
+// the retiring registration. Neither phase waits with the registry lock held;
+// netdev_unregister_wait() must run in task context.
 auto netdev_unregister_begin(NetDevice* dev, NetDeviceRetireToken& token) -> int;
 void netdev_unregister_wait(const NetDeviceRetireToken& token);
 

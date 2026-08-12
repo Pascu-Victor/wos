@@ -196,8 +196,9 @@ def test_closing_states_ack_retransmitted_fin() -> None:
             "build_deferred_ack()",
             "if ((flags & TCP_ACK) != 0 && seg_ack == cb->snd_nxt)",
             "PacketBuffer* closing_ack = deferred_ack",
+            "uint32_t const CLOSING_ACK_IFINDEX = defer_bound_ifindex",
             "if (closing_ack != nullptr)",
-            "ipv4_tx(closing_ack, CLOSING_ACK_LOCAL, CLOSING_ACK_REMOTE, IPPROTO_TCP, TCP_IPV4_TTL)",
+            "tcp_transmit_prebuilt(closing_ack, CLOSING_ACK_LOCAL, CLOSING_ACK_REMOTE, CLOSING_ACK_IFINDEX)",
         ],
         "LAST_ACK duplicate FIN ACK",
     )

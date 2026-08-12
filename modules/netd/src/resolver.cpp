@@ -55,7 +55,7 @@ void write_resolv_conf(const DhcpLease& lease) {
     if (lease.search_domains[0] != '\0') {
         fprintf(file, "search %s\n", lease.search_domains.data());
     } else if (lease.domain_name[0] != '\0') {
-            fprintf(file, "domain %s\n", lease.domain_name.data());
+        fprintf(file, "domain %s\n", lease.domain_name.data());
     }
 
     boot_trace("netd-boot: resolver after writes\n");

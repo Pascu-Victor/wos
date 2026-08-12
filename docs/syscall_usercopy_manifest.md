@@ -226,15 +226,17 @@ forwarding a raw userspace address into a device backend.
 | ABI family | Operation | Access | Maximum / bound | Nullable | Partial progress | Irreversible-effect ordering |
 | --- | --- | --- | --- | --- | --- | --- |
 | `NET` | `SOCKET` | `none` | n/a | n/a | none | creates descriptor from scalar arguments |
-| `NET` | `BIND` | `in` | sockaddr length at most 28 bytes | yes only for zero length | none | address snapshot precedes bind |
+| `NET` | `BIND` | `in` | sockaddr length at most 128 bytes; family parser requires its exact minimum | yes only for zero length | none | address snapshot precedes bind |
 | `NET` | `LISTEN` | `none` | n/a | n/a | none | scalar socket mutation |
 | `NET` | `ACCEPT` | `in/out` | size_t capacity plus sockaddr prefix at most 28 bytes | address pair yes; length required when address requested | none | address outputs preflight before accept; accepted socket is destroyed on copy failure |
-| `NET` | `CONNECT` | `in` | sockaddr length at most 28 bytes | yes only for zero length | none | snapshot precedes connect |
+| `NET` | `CONNECT` | `in` | sockaddr length at most 128 bytes; family parser requires its exact minimum | yes only for zero length | none | snapshot precedes connect |
 | `NET` | `SEND` | `in` | explicit length in chunks up to 256 KiB | yes only for zero length | returns bytes already sent | each chunk snapshots before protocol call |
 | `NET` | `RECV` | `out` | explicit length in chunks up to 256 KiB | yes only for zero length | returns bytes already copied | each chunk preflights before protocol receive; copied bytes are committed monotonically |
 | `NET` | `CLOSE` | `none` | n/a | n/a | none | closes descriptor |
 | `NET` | `SENDTO` | `in` | explicit data length plus optional domain sockaddr at most 28 bytes | address yes; data only for zero length | returns bytes already sent | address snapshot and each data chunk precede send |
 | `NET` | `RECVFROM` | `out` | explicit data length plus optional domain sockaddr at most 28 bytes | address yes; data only for zero length | returns bytes already copied | output ranges preflight before receive; backend address over-report is `-EOVERFLOW` |
+| `NET` | `SENDTO_EX` | `in` | fixed 32-byte descriptor, explicit data length, and optional sockaddr at most 128 bytes | address yes only for zero address length; data only for zero length | returns bytes already sent | descriptor/address snapshots and data chunk snapshot precede send |
+| `NET` | `RECVFROM_EX` | `in/out` | fixed 32-byte descriptor, explicit data length, optional sockaddr capacity at most 128 bytes, and optional 8-byte result length | address/result pair yes when no address requested; data only for zero length | returns bytes already copied | every output range is preflighted before receive; full sockaddr length is reported separately from the copied prefix |
 | `NET` | `SETSOCKOPT` | `in` | option length at most 65520 bytes | yes only for zero length | none | full option snapshot precedes protocol mutation |
 | `NET` | `GETSOCKOPT` | `in/out` | size_t capacity plus option bytes at most 65520 | option yes only for zero capacity; length no | none | full output capacity preflight precedes backend; over-report is `-EOVERFLOW` |
 | `NET` | `SHUTDOWN` | `none` | n/a | n/a | none | scalar socket mutation |
@@ -245,10 +247,14 @@ forwarding a raw userspace address into a device backend.
 | `NET` | `IOCTL_NET` | `in/out` | closed command request of 40-byte ifreq or 48-byte route record | no | none | input snapshot and output preflight precede net-device/route mutation |
 | `NET` | `SET_DEV_CPU_AFFINITY` | `in` | fixed 24-byte request | no | none | snapshot precedes queue-affinity changes |
 | `NET` | `NETCTL_IF_LIST` | `in/out` | size_t capacity plus at most `MAX_NET_DEVICES` 52-byte records | record array yes for count query; capacity no | none | capacity/output preflight precedes complete list copyout |
-| `NET` | `NETCTL_ADDR_LIST` | `in/out` | size_t capacity plus at most `MAX_NET_DEVICES*MAX_ADDRS_PER_IF` 76-byte records | record array yes for count query; capacity no | none | capacity/output preflight precedes complete list copyout |
+| `NET` | `NETCTL_ADDR_LIST` | `in/out` | size_t capacity plus at most `2*MAX_NET_DEVICES*MAX_ADDRS_PER_IF` 76-byte IPv4/IPv6 records | record array yes for count query; capacity no | none | capacity/output preflight precedes complete list copyout |
 | `NET` | `NETCTL_ADDR_SET` | `in` | fixed 48-byte request | no | none | snapshot/validation precede address mutation |
 | `NET` | `NETCTL_ADDR_DEL` | `in` | fixed 48-byte request | no | none | snapshot/validation precede address mutation |
 | `NET` | `NETCTL_LINK_SET` | `in` | fixed 68-byte request | no | none | snapshot/validation precede link mutation |
+| `NET` | `NETCTL_ADDR_SET_V2` | `in` | fixed versioned 64-byte request | no | none | complete snapshot and reserved/flag/scope/lifetime validation precede IPv6 address mutation |
+| `NET` | `NETCTL_ROUTE_LIST` | `in/out` | size_t capacity plus at most 64 fixed 64-byte IPv6 route records | record array yes for count query; capacity no | none | capacity/output preflight precedes complete bounded route snapshot copyout |
+| `NET` | `NETCTL_ROUTE_SET` | `in` | fixed versioned 64-byte request | no | none | complete snapshot and reserved/flag/prefix/scope/gateway validation precede route publication |
+| `NET` | `NETCTL_ROUTE_DEL` | `in` | fixed versioned 64-byte request | no | none | complete snapshot and reserved/flag/prefix/scope/gateway validation precede route removal |
 
 ## Virtual memory
 

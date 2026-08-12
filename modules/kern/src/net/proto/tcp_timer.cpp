@@ -45,8 +45,9 @@ constexpr uint64_t TCP_TIMER_MS_TO_US = 1000;
 
 struct DeferredRetransmit {
     PacketBuffer* pkt;
-    uint32_t local_ip;
-    uint32_t remote_ip;
+    SocketEndpoint local;
+    SocketEndpoint remote;
+    uint32_t bound_ifindex;
     uint32_t seq_end;
     TcpCB* cb;
     TcpCB* ack_cb;
@@ -88,8 +89,9 @@ auto retransmit_segment(TcpCB* cb, RetransmitEntry* entry, std::array<DeferredRe
 
     auto& deferred_entry = deferred.at(deferred_count);
     deferred_entry.pkt = pkt;
-    deferred_entry.local_ip = cb->local_ip;
-    deferred_entry.remote_ip = cb->remote_ip;
+    deferred_entry.local = cb->local;
+    deferred_entry.remote = cb->remote;
+    deferred_entry.bound_ifindex = cb->socket != nullptr ? cb->socket->bound_ifindex : 0;
     deferred_entry.seq_end = entry->seq + static_cast<uint32_t>(entry->len);
     tcp_cb_acquire(cb);
     deferred_entry.cb = cb;
@@ -306,8 +308,7 @@ void tcp_timer_tick(uint64_t now_ms) {
         auto* next_free = to_free->timer_next;
         to_free->timer_next = nullptr;
         // hash_next still has the original bucket chain.
-        uint32_t const IDX =
-            tcp_hash_4tuple(to_free->local_ip, to_free->local_port, to_free->remote_ip, to_free->remote_port) % TCB_HASH_SIZE;
+        uint32_t const IDX = tcp_hash_tuple(to_free->local, to_free->remote) % TCB_HASH_SIZE;
         auto& bucket = tcb_hash.at(IDX);
         bool removed_from_hash = false;
         bucket.lock.lock();
@@ -339,15 +340,16 @@ void tcp_timer_tick(uint64_t now_ms) {
             deferred_count < MAX_DEFERRED_RETRANSMITS) {
             rcb->delayed_ack_deadline = 0;
             rcb->segs_pending_ack = 0;
-            uint32_t ack_local = 0;
-            uint32_t ack_remote = 0;
+            SocketEndpoint ack_local{};
+            SocketEndpoint ack_remote{};
             auto* ack_pkt = tcp_build_ack(rcb, &ack_local, &ack_remote);
             if (ack_pkt != nullptr) {
                 tcp_cb_acquire(rcb);
                 deferred.at(deferred_count++) = {
                     .pkt = ack_pkt,
-                    .local_ip = ack_local,
-                    .remote_ip = ack_remote,
+                    .local = ack_local,
+                    .remote = ack_remote,
+                    .bound_ifindex = rcb->socket != nullptr ? rcb->socket->bound_ifindex : 0,
                     .seq_end = 0,
                     .cb = nullptr,
                     .ack_cb = rcb,
@@ -358,15 +360,16 @@ void tcp_timer_tick(uint64_t now_ms) {
         }
 
         if (rcb->ack_pending && rcb->state == TcpState::ESTABLISHED && deferred_count < MAX_DEFERRED_RETRANSMITS) {
-            uint32_t ack_local = 0;
-            uint32_t ack_remote = 0;
+            SocketEndpoint ack_local{};
+            SocketEndpoint ack_remote{};
             auto* ack_pkt = tcp_build_ack(rcb, &ack_local, &ack_remote);
             if (ack_pkt != nullptr) {
                 tcp_cb_acquire(rcb);
                 deferred.at(deferred_count++) = {
                     .pkt = ack_pkt,
-                    .local_ip = ack_local,
-                    .remote_ip = ack_remote,
+                    .local = ack_local,
+                    .remote = ack_remote,
+                    .bound_ifindex = rcb->socket != nullptr ? rcb->socket->bound_ifindex : 0,
                     .seq_end = 0,
                     .cb = nullptr,
                     .ack_cb = rcb,
@@ -379,15 +382,16 @@ void tcp_timer_tick(uint64_t now_ms) {
                 rcb->ooo_ack_deadline = 0;
                 rcb->ooo_ack_probes = 0;
             } else if (deferred_count < MAX_DEFERRED_RETRANSMITS) {
-                uint32_t ack_local = 0;
-                uint32_t ack_remote = 0;
+                SocketEndpoint ack_local{};
+                SocketEndpoint ack_remote{};
                 auto* ack_pkt = tcp_build_ack(rcb, &ack_local, &ack_remote);
                 if (ack_pkt != nullptr) {
                     tcp_cb_acquire(rcb);
                     deferred.at(deferred_count++) = {
                         .pkt = ack_pkt,
-                        .local_ip = ack_local,
-                        .remote_ip = ack_remote,
+                        .local = ack_local,
+                        .remote = ack_remote,
+                        .bound_ifindex = rcb->socket != nullptr ? rcb->socket->bound_ifindex : 0,
                         .seq_end = 0,
                         .cb = nullptr,
                         .ack_cb = rcb,
@@ -425,14 +429,15 @@ void tcp_timer_tick(uint64_t now_ms) {
                     sockets_to_wake.at(wake_count++) = rcb->socket;
                 }
             } else {
-                uint32_t ka_local = 0;
-                uint32_t ka_remote = 0;
+                SocketEndpoint ka_local{};
+                SocketEndpoint ka_remote{};
                 auto* ka_pkt = tcp_build_keepalive_probe(rcb, &ka_local, &ka_remote);
                 if (ka_pkt != nullptr) {
                     deferred.at(deferred_count++) = {
                         .pkt = ka_pkt,
-                        .local_ip = ka_local,
-                        .remote_ip = ka_remote,
+                        .local = ka_local,
+                        .remote = ka_remote,
+                        .bound_ifindex = rcb->socket != nullptr ? rcb->socket->bound_ifindex : 0,
                         .seq_end = 0,
                         .cb = nullptr,
                         .ack_cb = nullptr,
@@ -506,7 +511,7 @@ void tcp_timer_tick(uint64_t now_ms) {
                 continue;
             }
         }
-        tx_res = ipv4_tx(deferred_entry.pkt, deferred_entry.local_ip, deferred_entry.remote_ip, 6, 64);
+        tx_res = tcp_transmit_prebuilt(deferred_entry.pkt, deferred_entry.local, deferred_entry.remote, deferred_entry.bound_ifindex);
 
         if (deferred_entry.cb != nullptr) {
             tcp_cb_release(deferred_entry.cb);

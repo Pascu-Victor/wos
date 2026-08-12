@@ -4,6 +4,87 @@
 #include <test/ktest.hpp>
 #include <vfs/stat.hpp>
 
+KTEST(WkiWire, NetIpv6CapabilityUsesExactAdditiveSuffix) {
+    using namespace ker::net::wki;
+
+    KEXPECT_EQ(WKI_CAP_NET_IPV6_STATE, static_cast<uint16_t>(0x0020));
+    KEXPECT_EQ(sizeof(NetIpv6StateEntry), static_cast<size_t>(20));
+    KEXPECT_EQ(sizeof(NetIpv6StateSuffix), static_cast<size_t>(168));
+    KEXPECT_EQ(offsetof(NetIpv6StateSuffix, entries), static_cast<size_t>(8));
+
+    NetIpv6StateSuffix suffix = wki_net_ipv6_state_empty();
+    KEXPECT_TRUE(wki_net_ipv6_state_valid(suffix));
+    suffix.count = static_cast<uint8_t>(WKI_NET_IPV6_STATE_MAX_ADDRS + 1);
+    KEXPECT_FALSE(wki_net_ipv6_state_valid(suffix));
+    suffix = wki_net_ipv6_state_empty();
+    suffix.version++;
+    KEXPECT_FALSE(wki_net_ipv6_state_valid(suffix));
+    suffix = wki_net_ipv6_state_empty();
+    suffix.count = 1;
+    suffix.entries.at(0).address.at(0) = 0x20;
+    suffix.entries.at(0).address.at(1) = 0x01;
+    suffix.entries.at(0).prefix_len = 129;
+    KEXPECT_FALSE(wki_net_ipv6_state_valid(suffix));
+    suffix = wki_net_ipv6_state_empty();
+    suffix.entries.at(1).flags = 1;
+    KEXPECT_FALSE(wki_net_ipv6_state_valid(suffix));
+
+    suffix = wki_net_ipv6_state_empty();
+    suffix.count = 1;
+    suffix.entries.at(0).prefix_len = 64;
+    KEXPECT_FALSE(wki_net_ipv6_state_valid(suffix));
+    suffix.entries.at(0).address.at(0) = 0xFF;
+    suffix.entries.at(0).address.at(1) = 0x02;
+    KEXPECT_FALSE(wki_net_ipv6_state_valid(suffix));
+    suffix.entries.at(0).address = {};
+    suffix.entries.at(0).address.at(0) = 0x20;
+    suffix.entries.at(0).scope = 253;
+    KEXPECT_FALSE(wki_net_ipv6_state_valid(suffix));
+    suffix.entries.at(0).scope = 0;
+    KEXPECT_TRUE(wki_net_ipv6_state_valid(suffix));
+    suffix.entries.at(0).address = {};
+    suffix.entries.at(0).address.at(0) = 0xFE;
+    suffix.entries.at(0).address.at(1) = 0x80;
+    KEXPECT_FALSE(wki_net_ipv6_state_valid(suffix));
+    suffix.entries.at(0).scope = 253;
+    KEXPECT_TRUE(wki_net_ipv6_state_valid(suffix));
+    suffix.entries.at(0).address = {};
+    suffix.entries.at(0).address.at(15) = 1;
+    suffix.entries.at(0).scope = 0;
+    KEXPECT_FALSE(wki_net_ipv6_state_valid(suffix));
+    suffix.entries.at(0).scope = 254;
+    KEXPECT_TRUE(wki_net_ipv6_state_valid(suffix));
+
+    constexpr size_t LEGACY_ACK = sizeof(DevAttachAckNetPayload);
+    KEXPECT_TRUE(wki_net_ipv6_extended_length_valid(false, LEGACY_ACK, LEGACY_ACK));
+    KEXPECT_FALSE(wki_net_ipv6_extended_length_valid(false, LEGACY_ACK + sizeof(NetIpv6StateSuffix), LEGACY_ACK));
+    KEXPECT_TRUE(wki_net_ipv6_extended_length_valid(true, LEGACY_ACK + sizeof(NetIpv6StateSuffix), LEGACY_ACK));
+    KEXPECT_FALSE(wki_net_ipv6_extended_length_valid(true, LEGACY_ACK + sizeof(NetIpv6StateSuffix) + 1, LEGACY_ACK));
+
+    suffix = wki_net_ipv6_state_empty();
+    suffix.count = 1;
+    suffix.entries.at(0).address.at(0) = 0x20;
+    suffix.entries.at(0).address.at(1) = 0x01;
+    suffix.entries.at(0).prefix_len = 64;
+    suffix.entries.at(0).flags = WKI_NET_IPV6_ADDR_F_TENTATIVE;
+    KEXPECT_FALSE(wki_net_ipv6_state_has_usable_address(suffix));
+    suffix.entries.at(0).flags = WKI_NET_IPV6_ADDR_F_DADFAILED;
+    KEXPECT_FALSE(wki_net_ipv6_state_has_usable_address(suffix));
+    suffix.entries.at(0).flags = 0x0001;
+    KEXPECT_FALSE(wki_net_ipv6_state_valid(suffix));
+    suffix.entries.at(0).flags = WKI_NET_IPV6_ADDR_F_DADFAILED | WKI_NET_IPV6_ADDR_F_TENTATIVE;
+    KEXPECT_FALSE(wki_net_ipv6_state_valid(suffix));
+    suffix.entries.at(0).flags = WKI_NET_IPV6_ADDR_F_TENTATIVE | WKI_NET_IPV6_ADDR_F_DEPRECATED;
+    KEXPECT_FALSE(wki_net_ipv6_state_valid(suffix));
+    suffix.entries.at(0).flags = WKI_NET_IPV6_ADDR_F_DADFAILED | WKI_NET_IPV6_ADDR_F_DEPRECATED;
+    KEXPECT_FALSE(wki_net_ipv6_state_valid(suffix));
+    suffix.entries.at(0).flags = WKI_NET_IPV6_ADDR_F_DEPRECATED | WKI_NET_IPV6_ADDR_F_PERMANENT | WKI_NET_IPV6_ADDR_F_NOPREFIXROUTE;
+    KEXPECT_TRUE(wki_net_ipv6_state_valid(suffix));
+    KEXPECT_TRUE(wki_net_ipv6_state_has_usable_address(suffix));
+    suffix.entries.at(0).flags = 0;
+    KEXPECT_TRUE(wki_net_ipv6_state_has_usable_address(suffix));
+}
+
 KTEST(WkiWire, VfsMultiRdmaCapabilityAndAuxFlagPreserveLayouts) {
     using namespace ker::net::wki;
 

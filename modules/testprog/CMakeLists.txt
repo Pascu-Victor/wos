@@ -24,6 +24,8 @@ set(SOURCES
     src/asan_crasher.cpp
     src/cowbench.cpp
     src/fsbench.cpp
+    src/ipv6_net.cpp
+    src/ipv6_ra.cpp
     src/main.cpp
     src/memory_pressure.cpp
     src/netbench.cpp

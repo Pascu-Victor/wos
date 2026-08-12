@@ -61,6 +61,16 @@ struct IPv6Address {
     // NOLINTNEXTLINE(cppcoreguidelines-avoid-magic-numbers,readability-magic-numbers)
     [[nodiscard]] constexpr auto is_link_local_multicast() const -> bool { return bytes.at(0) == 0xFF && bytes.at(1) == 0x02; }
 
+    [[nodiscard]] constexpr auto is_link_local_unicast() const -> bool { return bytes.at(0) == 0xFE && (bytes.at(1) & 0xC0U) == 0x80U; }
+
+    [[nodiscard]] constexpr auto is_link_local() const -> bool { return is_link_local_unicast() || is_link_local_multicast(); }
+
+    [[nodiscard]] constexpr auto is_loopback() const -> bool { return *this == loopback(); }
+
+    [[nodiscard]] constexpr auto multicast_scope() const -> uint8_t {
+        return is_multicast() ? static_cast<uint8_t>(bytes.at(1) & 0x0FU) : 0;
+    }
+
     [[nodiscard]] constexpr auto is_unspecified() const -> bool {
         return std::ranges::all_of(bytes, [](uint8_t byte) -> bool { return byte == 0; });
     }
@@ -74,6 +84,59 @@ struct IPv6Address {
         // NOLINTNEXTLINE(cppcoreguidelines-avoid-magic-numbers,readability-magic-numbers)
         addr.bytes.at(15) = 1;
         return addr;
+    }
+
+    [[nodiscard]] constexpr auto matches_prefix(const IPv6Address& prefix, uint8_t prefix_len) const -> bool {
+        if (prefix_len > 128) {
+            return false;
+        }
+        size_t const FULL_BYTES = prefix_len / 8U;
+        uint8_t const REMAINING_BITS = static_cast<uint8_t>(prefix_len % 8U);
+        for (size_t i = 0; i < FULL_BYTES; ++i) {
+            if (bytes.at(i) != prefix.bytes.at(i)) {
+                return false;
+            }
+        }
+        if (REMAINING_BITS == 0) {
+            return true;
+        }
+        uint8_t const MASK = static_cast<uint8_t>(0xFFU << (8U - REMAINING_BITS));
+        return (bytes.at(FULL_BYTES) & MASK) == (prefix.bytes.at(FULL_BYTES) & MASK);
+    }
+
+    [[nodiscard]] constexpr auto masked(uint8_t prefix_len) const -> IPv6Address {
+        IPv6Address result = *this;
+        if (prefix_len > 128) {
+            return {};
+        }
+        size_t const FULL_BYTES = prefix_len / 8U;
+        uint8_t const REMAINING_BITS = static_cast<uint8_t>(prefix_len % 8U);
+        if (REMAINING_BITS != 0) {
+            uint8_t const MASK = static_cast<uint8_t>(0xFFU << (8U - REMAINING_BITS));
+            result.bytes.at(FULL_BYTES) &= MASK;
+        }
+        size_t const FIRST_ZERO = FULL_BYTES + (REMAINING_BITS != 0 ? 1U : 0U);
+        for (size_t i = FIRST_ZERO; i < SIZE_BYTES; ++i) {
+            result.bytes.at(i) = 0;
+        }
+        return result;
+    }
+
+    [[nodiscard]] constexpr auto common_prefix_length(const IPv6Address& other) const -> uint8_t {
+        uint8_t count = 0;
+        for (size_t i = 0; i < SIZE_BYTES; ++i) {
+            uint8_t difference = static_cast<uint8_t>(bytes.at(i) ^ other.bytes.at(i));
+            if (difference == 0) {
+                count = static_cast<uint8_t>(count + 8U);
+                continue;
+            }
+            while ((difference & 0x80U) == 0) {
+                ++count;
+                difference = static_cast<uint8_t>(difference << 1U);
+            }
+            break;
+        }
+        return count;
     }
 } __attribute__((packed));
 

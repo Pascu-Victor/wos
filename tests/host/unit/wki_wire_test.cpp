@@ -23,6 +23,130 @@ TEST(WkiWire, HeartbeatPayloadIs16Bytes) { EXPECT_EQ(sizeof(HeartbeatPayload), 1
 
 TEST(WkiWire, PeerGoodbyePayloadIs8Bytes) { EXPECT_EQ(sizeof(PeerGoodbyePayload), 8u); }
 
+TEST(WkiWire, NetIpv6CapabilityUsesExactAdditiveSuffix) {
+    EXPECT_EQ(WKI_CAP_NET_IPV6_STATE, 0x0020u);
+    EXPECT_EQ(sizeof(NetIpv6StateEntry), 20u);
+    EXPECT_EQ(sizeof(NetIpv6StateSuffix), 168u);
+    EXPECT_EQ(offsetof(NetIpv6StateSuffix, entries), 8u);
+
+    NetIpv6StateSuffix suffix = wki_net_ipv6_state_empty();
+    EXPECT_TRUE(wki_net_ipv6_state_valid(suffix));
+    suffix.count = WKI_NET_IPV6_STATE_MAX_ADDRS;
+    for (size_t i = 0; i < suffix.count; ++i) {
+        suffix.entries.at(i).address.at(0) = 0x20;
+        suffix.entries.at(i).address.at(1) = 0x01;
+        suffix.entries.at(i).address.at(15) = static_cast<uint8_t>(i + 1);
+        suffix.entries.at(i).prefix_len = 64;
+    }
+    EXPECT_TRUE(wki_net_ipv6_state_valid(suffix));
+    suffix.count++;
+    EXPECT_FALSE(wki_net_ipv6_state_valid(suffix));
+    suffix = wki_net_ipv6_state_empty();
+    suffix.length--;
+    EXPECT_FALSE(wki_net_ipv6_state_valid(suffix));
+    suffix = wki_net_ipv6_state_empty();
+    suffix.reserved.at(1) = 1;
+    EXPECT_FALSE(wki_net_ipv6_state_valid(suffix));
+    suffix = wki_net_ipv6_state_empty();
+    suffix.count = 1;
+    suffix.entries.at(0).address.at(0) = 0x20;
+    suffix.entries.at(0).address.at(1) = 0x01;
+    suffix.entries.at(0).prefix_len = 129;
+    EXPECT_FALSE(wki_net_ipv6_state_valid(suffix));
+    suffix.entries.at(0).prefix_len = 64;
+    suffix.entries.at(0).scope = 1;
+    EXPECT_FALSE(wki_net_ipv6_state_valid(suffix));
+    suffix = wki_net_ipv6_state_empty();
+    suffix.entries.at(7).address.at(15) = 1;
+    EXPECT_FALSE(wki_net_ipv6_state_valid(suffix));
+}
+
+TEST(WkiWire, NetIpv6CapabilityRejectsInvalidAddressScopePairs) {
+    NetIpv6StateSuffix suffix = wki_net_ipv6_state_empty();
+    suffix.count = 1;
+    suffix.entries.at(0).prefix_len = 64;
+    EXPECT_FALSE(wki_net_ipv6_state_valid(suffix));  // :: is not an interface address
+
+    suffix.entries.at(0).address.at(0) = 0xFF;
+    suffix.entries.at(0).address.at(1) = 0x02;
+    EXPECT_FALSE(wki_net_ipv6_state_valid(suffix));
+
+    suffix.entries.at(0).address = {};
+    suffix.entries.at(0).address.at(0) = 0x20;
+    suffix.entries.at(0).address.at(1) = 0x01;
+    suffix.entries.at(0).scope = 253;
+    EXPECT_FALSE(wki_net_ipv6_state_valid(suffix));
+    suffix.entries.at(0).scope = 0;
+    EXPECT_TRUE(wki_net_ipv6_state_valid(suffix));
+
+    suffix.entries.at(0).address = {};
+    suffix.entries.at(0).address.at(0) = 0xFE;
+    suffix.entries.at(0).address.at(1) = 0x80;
+    EXPECT_FALSE(wki_net_ipv6_state_valid(suffix));
+    suffix.entries.at(0).scope = 253;
+    EXPECT_TRUE(wki_net_ipv6_state_valid(suffix));
+
+    suffix.entries.at(0).address = {};
+    suffix.entries.at(0).address.at(15) = 1;
+    suffix.entries.at(0).scope = 0;
+    EXPECT_FALSE(wki_net_ipv6_state_valid(suffix));
+    suffix.entries.at(0).scope = 254;
+    EXPECT_TRUE(wki_net_ipv6_state_valid(suffix));
+}
+
+TEST(WkiWire, NetIpv6CompatibilityRequiresExactNegotiatedLengths) {
+    constexpr size_t NAME_LENGTH = 7;
+    constexpr size_t ADVERT_LEGACY = sizeof(ResourceAdvertNetPayload) + NAME_LENGTH;
+    constexpr size_t ACK_LEGACY = sizeof(DevAttachAckNetPayload);
+    constexpr size_t NOTIFY_LEGACY = sizeof(NetNotifyHeader) + sizeof(NetStateNotifyPayload);
+
+    for (size_t legacy : {ADVERT_LEGACY, ACK_LEGACY, NOTIFY_LEGACY}) {
+        EXPECT_TRUE(wki_net_ipv6_extended_length_valid(false, legacy, legacy));
+        EXPECT_FALSE(wki_net_ipv6_extended_length_valid(false, legacy + sizeof(NetIpv6StateSuffix), legacy));
+        EXPECT_FALSE(wki_net_ipv6_extended_length_valid(false, legacy + 1, legacy));
+        EXPECT_FALSE(wki_net_ipv6_extended_length_valid(true, legacy, legacy));
+        EXPECT_TRUE(wki_net_ipv6_extended_length_valid(true, legacy + sizeof(NetIpv6StateSuffix), legacy));
+        EXPECT_FALSE(wki_net_ipv6_extended_length_valid(true, legacy + sizeof(NetIpv6StateSuffix) + 1, legacy));
+    }
+}
+
+TEST(WkiWire, NetIpv6ReadinessRejectsTentativeAndDadFailedOnlyState) {
+    NetIpv6StateSuffix suffix = wki_net_ipv6_state_empty();
+    EXPECT_FALSE(wki_net_ipv6_state_has_usable_address(suffix));
+    suffix.count = 1;
+    suffix.entries.at(0).address.at(0) = 0x20;
+    suffix.entries.at(0).address.at(1) = 0x01;
+    suffix.entries.at(0).prefix_len = 64;
+    suffix.entries.at(0).flags = WKI_NET_IPV6_ADDR_F_TENTATIVE;
+    EXPECT_FALSE(wki_net_ipv6_state_has_usable_address(suffix));
+    suffix.entries.at(0).flags = WKI_NET_IPV6_ADDR_F_DADFAILED;
+    EXPECT_FALSE(wki_net_ipv6_state_has_usable_address(suffix));
+    suffix.entries.at(0).flags = 0;
+    EXPECT_TRUE(wki_net_ipv6_state_has_usable_address(suffix));
+    suffix.entries.at(0).flags = WKI_NET_IPV6_ADDR_F_DEPRECATED;
+    EXPECT_TRUE(wki_net_ipv6_state_has_usable_address(suffix));
+}
+
+TEST(WkiWire, NetIpv6CapabilityRejectsUnknownAndContradictoryFlags) {
+    NetIpv6StateSuffix suffix = wki_net_ipv6_state_empty();
+    suffix.count = 1;
+    suffix.entries.at(0).address.at(0) = 0x20;
+    suffix.entries.at(0).address.at(1) = 0x01;
+    suffix.entries.at(0).prefix_len = 64;
+
+    suffix.entries.at(0).flags = 0x0001;
+    EXPECT_FALSE(wki_net_ipv6_state_valid(suffix));
+    suffix.entries.at(0).flags = WKI_NET_IPV6_ADDR_F_DADFAILED | WKI_NET_IPV6_ADDR_F_TENTATIVE;
+    EXPECT_FALSE(wki_net_ipv6_state_valid(suffix));
+    suffix.entries.at(0).flags = WKI_NET_IPV6_ADDR_F_TENTATIVE | WKI_NET_IPV6_ADDR_F_DEPRECATED;
+    EXPECT_FALSE(wki_net_ipv6_state_valid(suffix));
+    suffix.entries.at(0).flags = WKI_NET_IPV6_ADDR_F_DADFAILED | WKI_NET_IPV6_ADDR_F_DEPRECATED;
+    EXPECT_FALSE(wki_net_ipv6_state_valid(suffix));
+    suffix.entries.at(0).flags = WKI_NET_IPV6_ADDR_F_DEPRECATED | WKI_NET_IPV6_ADDR_F_PERMANENT | WKI_NET_IPV6_ADDR_F_NOPREFIXROUTE;
+    EXPECT_TRUE(wki_net_ipv6_state_valid(suffix));
+    EXPECT_TRUE(wki_net_ipv6_state_has_usable_address(suffix));
+}
+
 TEST(WkiWire, VfsMultiRdmaCapabilityAndAuxFlagPreserveLayouts) {
     EXPECT_EQ(WKI_CAP_VFS_MULTI_RDMA_LANES, 0x0008u);
     EXPECT_EQ(DEV_ATTACH_VFS_AUX_LANE, 0x80u);

@@ -14,6 +14,7 @@
 #include <net/netpoll.hpp>
 #include <net/packet.hpp>
 #include <net/proto/ipv4.hpp>
+#include <net/proto/ipv6.hpp>
 #include <net/route.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/ktime/ktime.hpp>
@@ -37,8 +38,7 @@ using log = ker::mod::dbg::logger<"tcp">;
 
 struct TcpBinding {
     TcpCB* cb = nullptr;
-    uint32_t local_ip = 0;
-    uint16_t local_port = 0;
+    SocketEndpoint local{};
 };
 
 std::array<TcpBinding, MAX_TCP_BINDINGS> tcp_bindings = {};
@@ -53,13 +53,16 @@ uint16_t tcp_ephemeral_port = TCP_EPHEMERAL_PORT_FIRST;
 bool tcp_ephemeral_seeded = false;
 
 constexpr int TCP_SHUT_RD = 0;
-constexpr int TCP_SHUT_WR = 1;
 constexpr int TCP_SHUT_RDWR = 2;
 constexpr int POLLIN = 0x0001;
 constexpr int POLLOUT = 0x0004;
 constexpr int POLLERR = 0x0008;
 constexpr int POLLHUP = 0x0010;
 constexpr int POLLRDHUP = 0x2000;
+constexpr int SOL_SOCKET_LEVEL = 1;
+constexpr int SOL_IPV6_LEVEL = 41;
+constexpr int IPV6_V6ONLY = 26;
+constexpr int SO_BINDTODEVICE = 25;
 constexpr uint16_t TCP_DIAG_SSH_PORT = 22;
 
 auto defer_socket_wait(Socket* sock) -> bool { return socket_defer_wait(sock, "tcp_wait"); }
@@ -69,16 +72,18 @@ auto tcp_diag_ssh_tuple(uint16_t local_port, uint16_t remote_port) -> bool {
 }
 
 void tcp_diag_log_local_close(const char* op, Socket* sock, TcpCB* cb, TcpState old_state, TcpState next_state, int how, bool send_fin) {
-    if (sock == nullptr || cb == nullptr || !tcp_diag_ssh_tuple(cb->local_port, cb->remote_port)) {
+    if (sock == nullptr || cb == nullptr || !tcp_diag_ssh_tuple(cb->local.port, cb->remote.port)) {
         return;
     }
 
     log::warn(
         "tcp-close-local op=%s how=%d state=%u current=%u next=%u local=0x%08x:%u remote=0x%08x:%u send_fin=%u "
         "rcv_nxt=%u rcv_wnd=%u snd_una=%u snd_nxt=%u snd_wnd=%u rcvbuf=%zu/%zu owner=%llu",
-        op, how, static_cast<unsigned>(old_state), static_cast<unsigned>(cb->state), static_cast<unsigned>(next_state), cb->local_ip,
-        cb->local_port, cb->remote_ip, cb->remote_port, send_fin ? 1U : 0U, cb->rcv_nxt, cb->rcv_wnd, cb->snd_una, cb->snd_nxt, cb->snd_wnd,
-        sock->rcvbuf.available(), sock->rcvbuf.capacity, static_cast<unsigned long long>(sock->owner_pid));
+        op, how, static_cast<unsigned>(old_state), static_cast<unsigned>(cb->state), static_cast<unsigned>(next_state),
+        cb->local.is_ipv4() || cb->local.is_v4_mapped() ? cb->local.ipv4_address().to_host_order() : 0, cb->local.port,
+        cb->remote.is_ipv4() || cb->remote.is_v4_mapped() ? cb->remote.ipv4_address().to_host_order() : 0, cb->remote.port,
+        send_fin ? 1U : 0U, cb->rcv_nxt, cb->rcv_wnd, cb->snd_una, cb->snd_nxt, cb->snd_wnd, sock->rcvbuf.available(),
+        sock->rcvbuf.capacity, static_cast<unsigned long long>(sock->owner_pid));
 }
 
 std::atomic<uint32_t> iss_counter{0x12345678};
@@ -105,9 +110,13 @@ void seed_tcp_iss_secret_once() {
     iss_secret_seeded = true;
 }
 
-auto tcp_iss_tuple_hash(uint32_t local_ip, uint16_t local_port, uint32_t remote_ip, uint16_t remote_port) -> uint32_t {
-    uint64_t tuple = (static_cast<uint64_t>(local_ip) << 32U) | remote_ip;
-    tuple ^= (static_cast<uint64_t>(local_port) << 48U) | (static_cast<uint64_t>(remote_port) << 16U);
+auto tcp_iss_tuple_hash(const SocketEndpoint& local, const SocketEndpoint& remote) -> uint32_t {
+    uint64_t tuple = (static_cast<uint64_t>(local.family) << 48U) | (static_cast<uint64_t>(local.port) << 32U) |
+                     (static_cast<uint64_t>(remote.family) << 16U) | remote.port;
+    for (size_t i = 0; i < local.address.size(); ++i) {
+        tuple = tcp_mix64(tuple ^ (static_cast<uint64_t>(local.address.at(i)) << ((i % 8U) * 8U)));
+        tuple = tcp_mix64(tuple ^ (static_cast<uint64_t>(remote.address.at(i)) << (((i + 3U) % 8U) * 8U)));
+    }
     return static_cast<uint32_t>(tcp_mix64(tuple ^ iss_secret));
 }
 
@@ -160,9 +169,30 @@ auto tcp_next_ephemeral_port(uint16_t port) -> uint16_t {
     return port == TCP_EPHEMERAL_PORT_LAST ? TCP_EPHEMERAL_PORT_FIRST : static_cast<uint16_t>(port + 1);
 }
 
-auto tcp_binding_conflicts_locked(uint32_t local_ip, uint16_t local_port) -> bool {
-    return std::ranges::any_of(tcp_bindings, [local_ip, local_port](const TcpBinding& b) -> bool {
-        return b.cb != nullptr && b.local_port == local_port && (b.local_ip == local_ip || b.local_ip == 0 || local_ip == 0);
+auto tcp_netdev_find_by_ifindex(uint32_t ifindex) -> NetDeviceRef {
+    if (ifindex == 0) {
+        return {};
+    }
+    size_t const COUNT = netdev_count();
+    for (size_t i = 0; i < COUNT; ++i) {
+        NetDeviceRef dev = netdev_at_ref(i);
+        if (dev && dev->ifindex == ifindex) {
+            return dev;
+        }
+    }
+    return {};
+}
+
+auto tcp_binding_conflicts_locked(const Socket* sock, const SocketEndpoint& local) -> bool {
+    return std::ranges::any_of(tcp_bindings, [sock, &local](const TcpBinding& binding) -> bool {
+        if (binding.cb == nullptr || binding.cb->socket == nullptr) {
+            return false;
+        }
+        const Socket* existing = binding.cb->socket;
+        bool const INTERFACES_OVERLAP =
+            existing->bound_ifindex == 0 || sock->bound_ifindex == 0 || existing->bound_ifindex == sock->bound_ifindex;
+        return INTERFACES_OVERLAP && socket_endpoints_bind_conflict(binding.local, existing->ipv6_v6only, local, sock->ipv6_v6only) &&
+               !(existing->reuse_port && sock->reuse_port);
     });
 }
 
@@ -175,7 +205,7 @@ auto tcp_free_binding_slot_locked() -> TcpBinding* {
     return nullptr;
 }
 
-auto reserve_ephemeral_port_for_connect(Socket* sock, TcpCB* cb, uint32_t local_ip) -> int {
+auto reserve_ephemeral_port_for_connect(Socket* sock, TcpCB* cb, SocketEndpoint local) -> int {
     if (sock == nullptr || cb == nullptr) {
         return -EINVAL;
     }
@@ -192,17 +222,15 @@ auto reserve_ephemeral_port_for_connect(Socket* sock, TcpCB* cb, uint32_t local_
     for (uint32_t attempts = 0; attempts < TCP_EPHEMERAL_PORT_COUNT; attempts++) {
         uint16_t const PORT = tcp_ephemeral_port;
         tcp_ephemeral_port = tcp_next_ephemeral_port(tcp_ephemeral_port);
-        if (tcp_binding_conflicts_locked(local_ip, PORT)) {
+        local.port = PORT;
+        if (tcp_binding_conflicts_locked(sock, local)) {
             continue;
         }
 
         slot->cb = cb;
-        slot->local_ip = local_ip;
-        slot->local_port = PORT;
-        cb->local_ip = local_ip;
-        cb->local_port = PORT;
-        sock->local_v4.addr = local_ip;
-        sock->local_v4.port = PORT;
+        slot->local = local;
+        cb->local = local;
+        sock->local = local;
         tcp_bind_lock.unlock();
         return 0;
     }
@@ -217,8 +245,8 @@ void maybe_send_recv_window_update(TcpCB* cb, Socket* sock) {
     }
 
     PacketBuffer* ack_pkt = nullptr;
-    uint32_t ack_local = 0;
-    uint32_t ack_remote = 0;
+    SocketEndpoint ack_local{};
+    SocketEndpoint ack_remote{};
 
     uint64_t const FLAGS = cb->lock.lock_irqsave();
     uint32_t const OLD_WND = cb->rcv_wnd;
@@ -235,7 +263,7 @@ void maybe_send_recv_window_update(TcpCB* cb, Socket* sock) {
     }
     cb->lock.unlock_irqrestore(FLAGS);
 
-    if (ack_pkt != nullptr && ipv4_tx(ack_pkt, ack_local, ack_remote, 6, 64) < 0) {
+    if (ack_pkt != nullptr && tcp_transmit_prebuilt(ack_pkt, ack_local, ack_remote, sock->bound_ifindex) < 0) {
         uint64_t const RETRY_FLAGS = cb->lock.lock_irqsave();
         cb->ack_pending = true;
         tcp_timer_arm(cb);
@@ -244,10 +272,19 @@ void maybe_send_recv_window_update(TcpCB* cb, Socket* sock) {
 }
 
 int tcp_bind(Socket* sock, const void* addr_raw, size_t addr_len) {
-    uint16_t port = 0;
-    uint32_t ip = 0;
-    if (!socket_parse_sockaddr_v4(addr_raw, addr_len, &ip, &port)) {
-        return -1;
+    SocketEndpoint local{};
+    if (sock == nullptr || !socket_state_allows_explicit_bind(sock->state)) {
+        return -EINVAL;
+    }
+    if (!socket_parse_sockaddr_endpoint(sock->domain, addr_raw, addr_len, &local)) {
+        return -EINVAL;
+    }
+    if (local.is_v4_mapped() && sock->ipv6_v6only) {
+        return -EAFNOSUPPORT;
+    }
+    int const SCOPE_RESULT = socket_prepare_endpoint_scope(sock, local, true);
+    if (SCOPE_RESULT < 0) {
+        return SCOPE_RESULT;
     }
 
     auto* cb = static_cast<TcpCB*>(sock->proto_data);
@@ -257,13 +294,24 @@ int tcp_bind(Socket* sock, const void* addr_raw, size_t addr_len) {
 
     tcp_bind_lock.lock();
 
-    if (!sock->reuse_port) {
-        for (auto& b : tcp_bindings) {
-            if (b.cb != nullptr && b.local_port == port && (b.local_ip == ip || b.local_ip == 0 || ip == 0)) {
-                tcp_bind_lock.unlock();
-                return -1;
+    if (local.port == 0) {
+        seed_tcp_ephemeral_port_once();
+        bool reserved = false;
+        for (uint32_t attempts = 0; attempts < TCP_EPHEMERAL_PORT_COUNT; ++attempts) {
+            local.port = tcp_ephemeral_port;
+            tcp_ephemeral_port = tcp_next_ephemeral_port(tcp_ephemeral_port);
+            if (!tcp_binding_conflicts_locked(sock, local)) {
+                reserved = true;
+                break;
             }
         }
+        if (!reserved) {
+            tcp_bind_lock.unlock();
+            return -EADDRNOTAVAIL;
+        }
+    } else if (tcp_binding_conflicts_locked(sock, local)) {
+        tcp_bind_lock.unlock();
+        return -EADDRINUSE;
     }
 
     TcpBinding* slot = nullptr;
@@ -275,17 +323,13 @@ int tcp_bind(Socket* sock, const void* addr_raw, size_t addr_len) {
     }
     if (slot == nullptr) {
         tcp_bind_lock.unlock();
-        return -1;
+        return -ENOBUFS;
     }
 
     slot->cb = cb;
-    slot->local_ip = ip;
-    slot->local_port = port;
-
-    cb->local_ip = ip;
-    cb->local_port = port;
-    sock->local_v4.addr = ip;
-    sock->local_v4.port = port;
+    slot->local = local;
+    cb->local = local;
+    sock->local = local;
     sock->state = SocketState::BOUND;
     cb->state = TcpState::CLOSED;
 
@@ -294,9 +338,31 @@ int tcp_bind(Socket* sock, const void* addr_raw, size_t addr_len) {
 }
 
 int tcp_listen(Socket* sock, int backlog) {
+    if (sock == nullptr) {
+        return -EINVAL;
+    }
     auto* cb = static_cast<TcpCB*>(sock->proto_data);
     if (cb == nullptr) {
         return -ENOTCONN;
+    }
+    if (cb->state == TcpState::LISTEN) {
+        sock->backlog = (backlog > 0 && backlog < 128) ? backlog : 128;
+        return 0;
+    }
+    if (cb->state != TcpState::CLOSED || (sock->state != SocketState::UNBOUND && sock->state != SocketState::BOUND)) {
+        return -EINVAL;
+    }
+
+    SocketEndpoint local = cb->local;
+    int const SCOPE_RESULT = socket_prepare_endpoint_scope(sock, local, true);
+    if (SCOPE_RESULT < 0) {
+        return SCOPE_RESULT;
+    }
+    if (local.port == 0) {
+        int const BIND_RESULT = reserve_ephemeral_port_for_connect(sock, cb, local);
+        if (BIND_RESULT < 0) {
+            return BIND_RESULT;
+        }
     }
 
     cb->state = TcpState::LISTEN;
@@ -334,11 +400,12 @@ int tcp_accept(Socket* sock, Socket** new_sock_out, void* addr_out, size_t* addr
     sock->aq_count--;
     sock->lock.unlock();
 
-    if (addr_out != nullptr && addr_len != nullptr && *addr_len >= SOCKADDR_V4_MIN_LEN) {
-        socket_fill_sockaddr_v4(addr_out, *addr_len, addr_len, child->remote_v4.addr, child->remote_v4.port);
+    if (addr_out != nullptr && addr_len != nullptr) {
+        size_t const CAPACITY = *addr_len;
+        static_cast<void>(socket_fill_sockaddr_endpoint(addr_out, CAPACITY, addr_len, child->remote));
     }
 #ifdef TCP_DEBUG
-    log::debug("tcp_accept: dequeued child=%p remote_port=%u", static_cast<void*>(child), child->remote_v4.port);
+    log::debug("tcp_accept: dequeued child=%p remote_port=%u", static_cast<void*>(child), child->remote.port);
 #endif
     *new_sock_out = child;
     return 0;
@@ -380,42 +447,71 @@ int tcp_connect(Socket* sock, const void* addr_raw, size_t addr_len, int flags) 
         return -ECONNREFUSED;
     }
 
-    // First connect call
-    uint16_t port = 0;
-    uint32_t ip = 0;
-    if (!socket_parse_sockaddr_v4(addr_raw, addr_len, &ip, &port)) {
-        return -1;
+    // First connect call.
+    SocketEndpoint remote{};
+    if (!socket_parse_sockaddr_endpoint(sock->domain, addr_raw, addr_len, &remote) || remote.port == 0) {
+        return -EINVAL;
+    }
+    if (remote.is_v4_mapped() && sock->ipv6_v6only) {
+        return -EAFNOSUPPORT;
+    }
+    int const SCOPE_RESULT = socket_prepare_endpoint_scope(sock, remote, false);
+    if (SCOPE_RESULT < 0) {
+        return SCOPE_RESULT;
     }
 
-    // Resolve local IP from the outgoing interface if not explicitly bound.
-    if (cb->local_ip == 0) {
-        auto* route = ker::net::route_lookup(ip);
-        ker::net::NetDeviceRef route_ref = route != nullptr ? ker::net::netdev_try_retain(route->dev_identity) : ker::net::NetDeviceRef{};
-        if (route_ref) {
-            auto* nif = ker::net::netif_find_by_dev(route_ref.get());
-            if (nif != nullptr && nif->ipv4_addr_count > 0) {
-                cb->local_ip = nif->ipv4_addrs.front().addr;
-                sock->local_v4.addr = cb->local_ip;
-            }
+    // Resolve the source before constructing the SYN/checksum.
+    if ((remote.is_ipv4() || remote.is_v4_mapped()) && cb->local.is_unspecified()) {
+        auto* route = ker::net::route_lookup(remote.ipv4_address());
+        NetDeviceRef route_ref = sock->bound_ifindex != 0 ? tcp_netdev_find_by_ifindex(sock->bound_ifindex)
+                                                          : (route != nullptr ? netdev_try_retain(route->dev_identity) : NetDeviceRef{});
+        if (!route_ref) {
+            return -EHOSTUNREACH;
         }
+        auto* nif = netif_find_by_dev(route_ref.get());
+        if (nif == nullptr || nif->ipv4_addr_count == 0) {
+            return -EADDRNOTAVAIL;
+        }
+        cb->local = sock->domain == SOCKADDR_V6_FAMILY ? SocketEndpoint::mapped_ipv4(nif->ipv4_addrs.front().addr, cb->local.port)
+                                                       : SocketEndpoint::ipv4(nif->ipv4_addrs.front().addr, cb->local.port);
+        sock->local = cb->local;
+    }
+    if (remote.is_ipv6() && !remote.is_v4_mapped()) {
+        IPv6Address requested{};
+        const IPv6Address* requested_ptr = nullptr;
+        if (!cb->local.is_unspecified()) {
+            requested = cb->local.ipv6_address();
+            requested_ptr = &requested;
+        }
+        IPv6OutputRoute route{};
+        uint32_t const IFINDEX = sock->bound_ifindex != 0 ? sock->bound_ifindex : remote.scope_id;
+        int const ROUTE_RESULT = ipv6_route_resolve(remote.ipv6_address(), requested_ptr, IFINDEX, route);
+        if (ROUTE_RESULT < 0) {
+            return ROUTE_RESULT;
+        }
+        uint32_t const ROUTE_IFINDEX = route.device ? route.device->ifindex : 0;
+        if (cb->local.is_unspecified()) {
+            cb->local = SocketEndpoint::ipv6(route.source, cb->local.port, ROUTE_IFINDEX);
+            sock->local = cb->local;
+        }
+        remote = SocketEndpoint::ipv6(remote.ipv6_address(), remote.port, ROUTE_IFINDEX);
+        cb->rcv_mss = tcp_receive_mss_for_path(remote, route.mtu);
     }
 
     // Auto-bind if not already bound.  Reserve under tcp_bind_lock before the
     // TCB is published so concurrent connects cannot claim the same local port.
-    if (cb->local_port == 0) {
-        int const BIND_RET = reserve_ephemeral_port_for_connect(sock, cb, cb->local_ip);
+    if (cb->local.port == 0) {
+        int const BIND_RET = reserve_ephemeral_port_for_connect(sock, cb, cb->local);
         if (BIND_RET != 0) {
             return BIND_RET;
         }
     }
 
-    cb->remote_ip = ip;
-    cb->remote_port = port;
-    sock->remote_v4.addr = ip;
-    sock->remote_v4.port = port;
+    cb->remote = remote;
+    sock->remote = remote;
 
     // Generate ISS and send SYN
-    cb->iss = tcp_generate_iss(cb->local_ip, cb->local_port, cb->remote_ip, cb->remote_port);
+    cb->iss = tcp_generate_iss(cb->local, cb->remote);
     cb->snd_una = cb->iss;
     cb->snd_nxt = cb->iss + 1;
     cb->rcv_wnd = sock->rcvbuf.capacity;
@@ -426,7 +522,17 @@ int tcp_connect(Socket* sock, const void* addr_raw, size_t addr_len, int flags) 
     // Insert into hash table now that endpoints are set
     tcp_insert_cb(cb);
 
-    tcp_send_segment(cb, TCP_SYN, nullptr, 0);
+    if (!tcp_send_segment(cb, TCP_SYN, nullptr, 0)) {
+        tcp_free_cb(cb);
+        cb->lock.lock();
+        cb->state = TcpState::CLOSED;
+        cb->remote = sock->domain == SOCKADDR_V6_FAMILY ? SocketEndpoint::ipv6() : SocketEndpoint::ipv4();
+        cb->lock.unlock();
+        sock->remote = cb->remote;
+        sock->state = SocketState::BOUND;
+        int const TRANSMIT_ERROR = sock->pending_error.exchange(0, std::memory_order_acq_rel);
+        return TRANSMIT_ERROR != 0 ? -TRANSMIT_ERROR : -EIO;
+    }
 
     if (NONBLOCKING) {
         return -EINPROGRESS;
@@ -446,6 +552,16 @@ int tcp_connect(Socket* sock, const void* addr_raw, size_t addr_len, int flags) 
 }
 
 auto tcp_send(Socket* sock, const void* buf, size_t len, int flags) -> ssize_t {
+    if (sock == nullptr || buf == nullptr) {
+        return -EINVAL;
+    }
+    if (sock->write_shutdown) {
+        return -EPIPE;
+    }
+    int const PENDING_ERROR = sock->pending_error.exchange(0, std::memory_order_acq_rel);
+    if (PENDING_ERROR != 0) {
+        return -PENDING_ERROR;
+    }
     auto* cb = static_cast<TcpCB*>(sock->proto_data);
     if (cb == nullptr) {
         return -ENOTCONN;
@@ -488,6 +604,7 @@ auto tcp_send(Socket* sock, const void* buf, size_t len, int flags) -> ssize_t {
         if (cb->snd_mss > 0) {
             chunk = std::min<size_t>(chunk, cb->snd_mss);
         }
+        chunk = std::min<size_t>(chunk, PKT_BUF_SIZE - PKT_HEADROOM - sizeof(TcpHeader));
 
         if (chunk == 0) {
             cb->lock.unlock();
@@ -527,6 +644,10 @@ auto tcp_send(Socket* sock, const void* buf, size_t len, int flags) -> ssize_t {
             if (sent > 0) {
                 return static_cast<ssize_t>(sent);
             }
+            int const TRANSMIT_ERROR = sock->pending_error.exchange(0, std::memory_order_acq_rel);
+            if (TRANSMIT_ERROR != 0) {
+                return -TRANSMIT_ERROR;
+            }
             if (NONBLOCKING) {
                 return -EAGAIN;
             }
@@ -542,6 +663,12 @@ auto tcp_send(Socket* sock, const void* buf, size_t len, int flags) -> ssize_t {
 }
 
 auto tcp_recv(Socket* sock, void* buf, size_t len, int flags) -> ssize_t {
+    if (sock == nullptr || buf == nullptr) {
+        return -EINVAL;
+    }
+    if (sock->read_shutdown) {
+        return 0;
+    }
     auto* cb = static_cast<TcpCB*>(sock->proto_data);
     if (cb == nullptr) {
         return -1;
@@ -713,8 +840,7 @@ void tcp_close_op(Socket* sock) {
     for (auto& b : tcp_bindings) {
         if (b.cb == cb) {
             b.cb = nullptr;
-            b.local_ip = 0;
-            b.local_port = 0;
+            b.local = {};
         }
     }
     tcp_bind_lock.unlock();
@@ -730,18 +856,22 @@ void tcp_close_op(Socket* sock) {
 }
 
 int tcp_shutdown_op(Socket* sock, int how) {
-    (void)how;
     auto* cb = static_cast<TcpCB*>(sock->proto_data);
     if (cb == nullptr) {
         return -ENOTCONN;
     }
 
-    if (how == TCP_SHUT_RD) {
-        return 0;
-    }
-    if (how != TCP_SHUT_WR && how != TCP_SHUT_RDWR) {
+    if (how < TCP_SHUT_RD || how > TCP_SHUT_RDWR) {
         return -EINVAL;
     }
+    if (how == TCP_SHUT_RD || how == TCP_SHUT_RDWR) {
+        sock->read_shutdown = true;
+    }
+    if (how == TCP_SHUT_RD) {
+        socket_wake_waiters(sock);
+        return 0;
+    }
+    sock->write_shutdown = true;
 
     for (;;) {
         cb->lock.lock();
@@ -752,6 +882,7 @@ int tcp_shutdown_op(Socket* sock, int how) {
                 cb->lock.lock();
                 cb->state = TcpState::FIN_WAIT_1;
                 cb->lock.unlock();
+                socket_wake_waiters(sock);
                 return 0;
             }
         } else if (cb->state == TcpState::CLOSE_WAIT) {
@@ -761,6 +892,7 @@ int tcp_shutdown_op(Socket* sock, int how) {
                 cb->lock.lock();
                 cb->state = TcpState::LAST_ACK;
                 cb->lock.unlock();
+                socket_wake_waiters(sock);
                 return 0;
             }
         } else {
@@ -777,22 +909,57 @@ int tcp_shutdown_op(Socket* sock, int how) {
     }
 }
 
-int tcp_setsockopt_op(Socket* sock, int /*unused*/, int optname, const void* optval, size_t optlen) {
+int tcp_setsockopt_op(Socket* sock, int level, int optname, const void* optval, size_t optlen) {
     int optint = 0;
     if (optval != nullptr && optlen >= sizeof(optint)) {
         std::memcpy(&optint, optval, sizeof(optint));
     }
 
-    if (optname == 2 && optlen >= sizeof(int)) {  // SO_REUSEADDR
+    if (level == SOL_IPV6_LEVEL && optname == IPV6_V6ONLY) {
+        if (sock->domain != SOCKADDR_V6_FAMILY) {
+            return -ENOPROTOOPT;
+        }
+        if (optval == nullptr || optlen < sizeof(int) || sock->state != SocketState::UNBOUND || sock->local.port != 0) {
+            return -EINVAL;
+        }
+        sock->ipv6_v6only = optint != 0;
+        return 0;
+    }
+
+    if (level == SOL_SOCKET_LEVEL && optname == SO_BINDTODEVICE) {
+        if (optval == nullptr || optlen == 0) {
+            sock->bound_ifindex = 0;
+            return 0;
+        }
+        std::array<char, NETDEV_NAME_LEN> ifname{};
+        size_t const COPY_LEN = std::min(optlen, ifname.size() - 1);
+        std::memcpy(ifname.data(), optval, COPY_LEN);
+        if (ifname.front() == '\0') {
+            sock->bound_ifindex = 0;
+            return 0;
+        }
+        NetDeviceRef dev = netdev_find_by_name_ref(ifname.data());
+        if (!dev) {
+            return -ENODEV;
+        }
+        int const INTERFACE_RESULT = socket_validate_bound_interface(sock, dev->ifindex);
+        if (INTERFACE_RESULT < 0) {
+            return INTERFACE_RESULT;
+        }
+        sock->bound_ifindex = dev->ifindex;
+        return 0;
+    }
+
+    if (level == SOL_SOCKET_LEVEL && optname == 2 && optlen >= sizeof(int)) {  // SO_REUSEADDR
         sock->reuse_addr = optint != 0;
     }
-    if (optname == 15 && optlen >= sizeof(int)) {  // SO_REUSEPORT
+    if (level == SOL_SOCKET_LEVEL && optname == 15 && optlen >= sizeof(int)) {  // SO_REUSEPORT
         sock->reuse_port = optint != 0;
     }
-    if (optname == 8 && optlen >= sizeof(int)) {  // SO_RCVBUF
+    if (level == SOL_SOCKET_LEVEL && optname == 8 && optlen >= sizeof(int)) {  // SO_RCVBUF
         socket_resize_rcvbuf(sock, static_cast<size_t>(optint));
     }
-    if (optname == 9 && optlen >= sizeof(int)) {  // SO_KEEPALIVE
+    if (level == SOL_SOCKET_LEVEL && optname == 9 && optlen >= sizeof(int)) {  // SO_KEEPALIVE
         auto* cb = static_cast<TcpCB*>(sock->proto_data);
         if (cb != nullptr) {
             uint64_t const FLAGS = cb->lock.lock_irqsave();
@@ -810,15 +977,22 @@ int tcp_setsockopt_op(Socket* sock, int /*unused*/, int optname, const void* opt
     return 0;
 }
 
-int tcp_getsockopt_op(Socket* sock, int /*unused*/, int optname, void* optval, size_t* optlen) {
+int tcp_getsockopt_op(Socket* sock, int level, int optname, void* optval, size_t* optlen) {
+    if (level == SOL_IPV6_LEVEL && optname == IPV6_V6ONLY && sock->domain == SOCKADDR_V6_FAMILY && optval != nullptr && optlen != nullptr &&
+        *optlen >= sizeof(int)) {
+        int const VALUE = sock->ipv6_v6only ? 1 : 0;
+        std::memcpy(optval, &VALUE, sizeof(VALUE));
+        *optlen = sizeof(VALUE);
+        return 0;
+    }
     if (optname == 4 && optval != nullptr && optlen != nullptr && *optlen >= sizeof(int)) {  // SO_ERROR
-        int value = 0;
+        int value = sock->pending_error.exchange(0, std::memory_order_acq_rel);
         auto* cb = static_cast<TcpCB*>(sock->proto_data);
         if (cb != nullptr) {
             uint64_t const FLAGS = cb->lock.lock_irqsave();
-            if (cb->state == TcpState::SYN_SENT) {
+            if (value == 0 && cb->state == TcpState::SYN_SENT) {
                 value = EINPROGRESS;
-            } else if (cb->state == TcpState::CLOSED && sock->state == SocketState::CONNECTING) {
+            } else if (value == 0 && cb->state == TcpState::CLOSED && sock->state == SocketState::CONNECTING) {
                 value = ECONNREFUSED;
             }
             cb->lock.unlock_irqrestore(FLAGS);
@@ -846,7 +1020,7 @@ int tcp_poll_check_op(Socket* sock, int events) {
 
     uint64_t const FLAGS = cb->lock.lock_irqsave();
     TcpState const STATE = cb->state;
-    bool const READ_EOF = tcp_read_eof_state(STATE);
+    bool const READ_EOF = sock->read_shutdown || tcp_read_eof_state(STATE);
     bool const FULL_HUP = tcp_hup_state(STATE);
     bool const CONNECT_FAILED = STATE == TcpState::CLOSED && sock->state == SocketState::CONNECTING;
 
@@ -862,14 +1036,14 @@ int tcp_poll_check_op(Socket* sock, int events) {
         ready |= POLLRDHUP;
     }
     if ((events & POLLOUT) != 0) {
-        bool const CAN_SEND = STATE == TcpState::ESTABLISHED || STATE == TcpState::CLOSE_WAIT;
+        bool const CAN_SEND = !sock->write_shutdown && (STATE == TcpState::ESTABLISHED || STATE == TcpState::CLOSE_WAIT);
         bool const HAS_SEND_CREDIT = CAN_SEND && tcp_send_available_bytes(cb) > 0;
         if (HAS_SEND_CREDIT || CONNECT_FAILED) {
             ready |= POLLOUT;
         }
     }
 
-    if (CONNECT_FAILED) {
+    if (CONNECT_FAILED || sock->pending_error.load(std::memory_order_acquire) != 0) {
         ready |= POLLERR;
     }
     if (FULL_HUP) {
@@ -901,11 +1075,11 @@ auto get_tcp_proto_ops() -> SocketProtoOps* { return &tcp_ops; }
 
 auto tcp_now_ms() -> uint64_t { return ker::mod::time::get_us() / 1000; }
 
-auto tcp_generate_iss(uint32_t local_ip, uint16_t local_port, uint32_t remote_ip, uint16_t remote_port) -> uint32_t {
+auto tcp_generate_iss(const SocketEndpoint& local, const SocketEndpoint& remote) -> uint32_t {
     seed_tcp_iss_secret_once();
     auto const CLOCK = static_cast<uint32_t>(ker::mod::time::get_us() / 4U);
     uint32_t const SERIAL = iss_counter.fetch_add(64000U, std::memory_order_relaxed);
-    return CLOCK + SERIAL + tcp_iss_tuple_hash(local_ip, local_port, remote_ip, remote_port);
+    return CLOCK + SERIAL + tcp_iss_tuple_hash(local, remote);
 }
 
 auto tcp_alloc_cb() -> TcpCB* {
@@ -914,7 +1088,7 @@ auto tcp_alloc_cb() -> TcpCB* {
 }
 
 void tcp_insert_cb(TcpCB* cb) {
-    uint32_t const IDX = tcp_hash_4tuple(cb->local_ip, cb->local_port, cb->remote_ip, cb->remote_port) % TCB_HASH_SIZE;
+    uint32_t const IDX = tcp_hash_tuple(cb->local, cb->remote) % TCB_HASH_SIZE;
     auto& bucket = tcb_hash.at(IDX);
     bucket.lock.lock();
     // Hash membership owns a ref so lookups can safely retain under the bucket lock.
@@ -925,7 +1099,7 @@ void tcp_insert_cb(TcpCB* cb) {
 }
 
 void tcp_insert_listener(TcpCB* cb) {
-    uint32_t const IDX = tcp_hash_listener(cb->local_port) % LISTENER_HASH_SIZE;
+    uint32_t const IDX = tcp_hash_listener(cb->local.port) % LISTENER_HASH_SIZE;
     auto& bucket = listener_hash.at(IDX);
     bucket.lock.lock();
     // Listener-table membership owns a ref independent of the owning socket.
@@ -936,7 +1110,7 @@ void tcp_insert_listener(TcpCB* cb) {
 }
 
 void tcp_remove_listener(TcpCB* cb) {
-    uint32_t const IDX = tcp_hash_listener(cb->local_port) % LISTENER_HASH_SIZE;
+    uint32_t const IDX = tcp_hash_listener(cb->local.port) % LISTENER_HASH_SIZE;
     auto& bucket = listener_hash.at(IDX);
     bool removed = false;
     bucket.lock.lock();
@@ -1059,7 +1233,7 @@ void tcp_free_cb(TcpCB* cb) {
 
     tcp_timer_disarm(cb);
 
-    uint32_t const IDX = tcp_hash_4tuple(cb->local_ip, cb->local_port, cb->remote_ip, cb->remote_port) % TCB_HASH_SIZE;
+    uint32_t const IDX = tcp_hash_tuple(cb->local, cb->remote) % TCB_HASH_SIZE;
     auto& bucket = tcb_hash.at(IDX);
     bool removed = false;
     bucket.lock.lock();
@@ -1080,14 +1254,16 @@ void tcp_free_cb(TcpCB* cb) {
     }
 }
 
-auto tcp_find_cb(uint32_t local_ip, uint16_t local_port, uint32_t remote_ip, uint16_t remote_port) -> TcpCB* {
+auto tcp_find_cb(const SocketEndpoint& local, const SocketEndpoint& remote, uint32_t ingress_ifindex) -> TcpCB* {
     NET_TRACE_SPAN(SPAN_TCP_FIND_CB);
-    uint32_t const IDX = tcp_hash_4tuple(local_ip, local_port, remote_ip, remote_port) % TCB_HASH_SIZE;
+    uint32_t const IDX = tcp_hash_tuple(local, remote) % TCB_HASH_SIZE;
     auto& bucket = tcb_hash.at(IDX);
     bucket.lock.lock();
     for (auto* cb = bucket.head; cb != nullptr; cb = cb->hash_next) {
-        if (cb->local_port == local_port && cb->remote_port == remote_port && (cb->local_ip == local_ip || cb->local_ip == 0) &&
-            cb->remote_ip == remote_ip) {
+        bool const INTERFACE_MATCHES =
+            ingress_ifindex == 0 || cb->socket == nullptr || cb->socket->bound_ifindex == 0 || cb->socket->bound_ifindex == ingress_ifindex;
+        if (INTERFACE_MATCHES && socket_endpoint_matches(cb->local, local, cb->socket != nullptr && cb->socket->ipv6_v6only) &&
+            cb->remote.port == remote.port && socket_endpoint_address_equal(cb->remote, remote)) {
             tcp_cb_acquire(cb);
             bucket.lock.unlock();
             return cb;
@@ -1097,12 +1273,15 @@ auto tcp_find_cb(uint32_t local_ip, uint16_t local_port, uint32_t remote_ip, uin
     return nullptr;
 }
 
-auto tcp_find_listener(uint32_t local_ip, uint16_t local_port) -> TcpCB* {
-    uint32_t const IDX = tcp_hash_listener(local_port) % LISTENER_HASH_SIZE;
+auto tcp_find_listener(const SocketEndpoint& local, uint32_t ingress_ifindex) -> TcpCB* {
+    uint32_t const IDX = tcp_hash_listener(local.port) % LISTENER_HASH_SIZE;
     auto& bucket = listener_hash.at(IDX);
     bucket.lock.lock();
     for (auto* cb = bucket.head; cb != nullptr; cb = cb->hash_next) {
-        if (cb->state == TcpState::LISTEN && cb->local_port == local_port && (cb->local_ip == local_ip || cb->local_ip == 0)) {
+        bool const INTERFACE_MATCHES =
+            ingress_ifindex == 0 || cb->socket == nullptr || cb->socket->bound_ifindex == 0 || cb->socket->bound_ifindex == ingress_ifindex;
+        if (INTERFACE_MATCHES && cb->state == TcpState::LISTEN &&
+            socket_endpoint_matches(cb->local, local, cb->socket != nullptr && cb->socket->ipv6_v6only)) {
             tcp_cb_acquire(cb);
             bucket.lock.unlock();
             return cb;
@@ -1126,8 +1305,9 @@ auto tcp_listener_snapshot(TcpListenerSnapshot* out, size_t max) -> size_t {
             }
 
             auto& row = out[count++];
-            row.local_ip = cb->local_ip;
-            row.local_port = cb->local_port;
+            row.local = cb->local;
+            row.local_ip = cb->local.is_ipv4() || cb->local.is_v4_mapped() ? cb->local.ipv4_address().to_host_order() : 0;
+            row.local_port = cb->local.port;
             row.state = static_cast<uint8_t>(cb->state);
             row.rcv_wnd = cb->rcv_wnd;
             row.refcount = cb->refcnt.load(std::memory_order_acquire);
@@ -1162,10 +1342,12 @@ auto tcp_conn_snapshot(TcpConnSnapshot* out, size_t max) -> size_t {
             }
 
             auto& row = out[count++];
-            row.local_ip = cb->local_ip;
-            row.local_port = cb->local_port;
-            row.remote_ip = cb->remote_ip;
-            row.remote_port = cb->remote_port;
+            row.local = cb->local;
+            row.remote = cb->remote;
+            row.local_ip = cb->local.is_ipv4() || cb->local.is_v4_mapped() ? cb->local.ipv4_address().to_host_order() : 0;
+            row.local_port = cb->local.port;
+            row.remote_ip = cb->remote.is_ipv4() || cb->remote.is_v4_mapped() ? cb->remote.ipv4_address().to_host_order() : 0;
+            row.remote_port = cb->remote.port;
             row.state = static_cast<uint8_t>(cb->state);
             row.rcv_nxt = cb->rcv_nxt;
             row.rcv_wnd = cb->rcv_wnd;

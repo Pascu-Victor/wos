@@ -31,7 +31,10 @@ auto add_little_endian_words(uint32_t sum, std::span<const uint8_t> bytes) -> ui
 
 auto add_ipv6_address_words(uint32_t sum, const proto::IPv6Address& addr) -> uint32_t {
     for (size_t i = 0; i < proto::IPv6Address::SIZE_BYTES; i += 2) {
-        sum += (static_cast<uint16_t>(addr.bytes.at(i)) << 8U) | addr.bytes.at(i + 1);
+        // Keep the accumulator in the same host-word representation used for
+        // packet bytes below.  The returned uint16_t is written directly into
+        // a packed network header on little-endian WOS targets.
+        sum += static_cast<uint16_t>(addr.bytes.at(i)) | (static_cast<uint16_t>(addr.bytes.at(i + 1)) << 8U);
     }
     return sum;
 }

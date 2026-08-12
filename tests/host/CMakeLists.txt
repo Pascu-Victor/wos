@@ -209,8 +209,24 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/mlibc_conformance_test.py
 )
 add_test(
+    NAME mlibc_wos_net_config_source_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/mlibc_wos_net_config_source_test.py
+)
+add_test(
+    NAME busybox_wos_ipv6_netlink_source_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/busybox_wos_ipv6_netlink_source_test.py
+)
+add_test(
     NAME netd_dns_source_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/netd_dns_source_test.py
+)
+add_test(
+    NAME netd_ra_worker_source_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/netd_ra_worker_source_test.py
+)
+add_test(
+    NAME init_ipv6_readiness_source_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/init_ipv6_readiness_source_test.py
 )
 add_test(
     NAME socket_ring_source_test
@@ -556,7 +572,11 @@ set_tests_properties(
     mlibc_spawn_source_test
     mlibc_vfs_source_test
     mlibc_conformance_test
+    mlibc_wos_net_config_source_test
+    busybox_wos_ipv6_netlink_source_test
     netd_dns_source_test
+    netd_ra_worker_source_test
+    init_ipv6_readiness_source_test
     socket_ring_source_test
     socket_nonblock_source_test
     socket_waiter_source_test
@@ -636,6 +656,12 @@ set_tests_properties(
 wos_add_unit_test(wki_wire_test
     SOURCES     ${CMAKE_CURRENT_SOURCE_DIR}/unit/wki_wire_test.cpp
 )
+
+wos_add_unit_test(netd_ra_test
+    SOURCES     ${CMAKE_CURRENT_SOURCE_DIR}/unit/netd_ra_test.cpp
+                ${WOS_ROOT}/modules/netd/src/ra.cpp
+)
+target_include_directories(netd_ra_test PRIVATE ${WOS_ROOT}/modules/netd/include)
 
 wos_add_unit_test(saved_frame_class_test
     SOURCES     ${CMAKE_CURRENT_SOURCE_DIR}/unit/saved_frame_class_test.cpp

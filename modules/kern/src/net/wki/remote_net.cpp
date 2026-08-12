@@ -625,7 +625,7 @@ auto send_or_defer_net_detach(ProxyNetState* state, uint16_t owner_node, uint32_
     return STAGED ? WKI_OK : WKI_ERR_BUSY;
 }
 
-void apply_owner_net_state(ProxyNetState* state, const NetStateNotifyPayload& notify) {
+void apply_owner_net_state(ProxyNetState* state, const NetStateNotifyPayload& notify, const NetIpv6StateSuffix& ipv6) {
     if (state == nullptr) {
         return;
     }
@@ -635,6 +635,7 @@ void apply_owner_net_state(ProxyNetState* state, const NetStateNotifyPayload& no
     state->owner_real_mac = notify.real_mac;
     state->owner_link_state = notify.link_state;
     state->owner_mtu = notify.mtu != 0 ? notify.mtu : state->owner_mtu;
+    state->owner_ipv6 = ipv6;
 
     state->netdev.state = static_cast<uint8_t>(state->owner_link_state != 0 ? 1 : 0);
     if (notify.mtu != 0) {
@@ -1571,11 +1572,26 @@ void wki_remote_net_detach_resource_generation(uint16_t owner_node, uint32_t res
 namespace detail {
 
 void handle_net_attach_ack(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len) {
-    if (payload_len < sizeof(DevAttachAckPayload)) {
+    if (hdr == nullptr || payload_len < sizeof(DevAttachAckPayload)) {
         return;
     }
 
     const auto* ack = reinterpret_cast<const DevAttachAckPayload*>(payload);
+    NetIpv6StateSuffix ipv6 = wki_net_ipv6_state_empty();
+    if (ack->status == static_cast<uint8_t>(DevAttachStatus::OK)) {
+        bool const WITH_IPV6 = wki_peer_capability_negotiated(hdr->src_node, WKI_CAP_NET_IPV6_STATE);
+        if (!wki_net_ipv6_extended_length_valid(WITH_IPV6, payload_len, sizeof(DevAttachAckNetPayload))) {
+            return;
+        }
+        if (WITH_IPV6) {
+            std::memcpy(&ipv6, payload + sizeof(DevAttachAckNetPayload), sizeof(ipv6));
+            if (!wki_net_ipv6_state_valid(ipv6)) {
+                return;
+            }
+        }
+    } else if (payload_len != sizeof(DevAttachAckPayload)) {
+        return;
+    }
 
     ProxyNetState* state = acquire_net_proxy_by_attach(hdr->src_node, ack->resource_id, ack->reserved);
     if (state == nullptr) {
@@ -1594,14 +1610,16 @@ void handle_net_attach_ack(const WkiHeader* hdr, const uint8_t* payload, uint16_
     state->attach_channel = ack->assigned_channel;
     state->attach_max_op_size = ack->max_op_size;
 
-    // V2: Extract NET extension fields if present
-    if (payload_len >= sizeof(DevAttachAckNetPayload)) {
+    // V2: Successful NET ACKs always carry the legacy NET extension. IPv6 is
+    // an exact capability-gated suffix and never mutates local address state.
+    if (ack->status == static_cast<uint8_t>(DevAttachStatus::OK)) {
         const auto* net_ack = reinterpret_cast<const DevAttachAckNetPayload*>(payload);
         state->owner_ipv4_addr = net_ack->ipv4_addr;
         state->owner_ipv4_mask = net_ack->ipv4_mask;
         state->owner_real_mac = net_ack->real_mac;
         state->owner_link_state = net_ack->link_state;
         state->owner_mtu = net_ack->mtu != 0 ? net_ack->mtu : state->owner_mtu;
+        state->owner_ipv6 = ipv6;
     }
 
     state->attach_expected_cookie = 0;
@@ -1758,14 +1776,27 @@ void handle_net_state_notify(const WkiHeader* hdr, const WkiChannelIdentity& cha
 
     const auto* notify = reinterpret_cast<const NetNotifyHeader*>(data);
     const auto* state_payload = reinterpret_cast<const NetStateNotifyPayload*>(data + sizeof(NetNotifyHeader));
+    bool const WITH_IPV6 = wki_peer_capability_negotiated(hdr->src_node, WKI_CAP_NET_IPV6_STATE);
+    uint16_t const EXPECTED_STATE_SIZE =
+        static_cast<uint16_t>(sizeof(NetStateNotifyPayload) + (WITH_IPV6 ? sizeof(NetIpv6StateSuffix) : 0));
+    NetIpv6StateSuffix ipv6 = wki_net_ipv6_state_empty();
     state->lock.lock();
     if (!wki_net_notify_header_matches_expected(state->attach_cookie, *notify) || !wki_net_notify_payload_fits(data_len, *notify) ||
-        notify->data_len != sizeof(NetStateNotifyPayload)) {
+        notify->data_len != EXPECTED_STATE_SIZE ||
+        !wki_net_ipv6_extended_length_valid(WITH_IPV6, data_len, sizeof(NetNotifyHeader) + sizeof(NetStateNotifyPayload))) {
         state->lock.unlock();
         release_net_proxy(state);
         return;
     }
-    apply_owner_net_state(state, *state_payload);
+    if (WITH_IPV6) {
+        std::memcpy(&ipv6, data + sizeof(NetNotifyHeader) + sizeof(NetStateNotifyPayload), sizeof(ipv6));
+        if (!wki_net_ipv6_state_valid(ipv6)) {
+            state->lock.unlock();
+            release_net_proxy(state);
+            return;
+        }
+    }
+    apply_owner_net_state(state, *state_payload, ipv6);
     state->lock.unlock();
     release_net_proxy(state);
 }

@@ -6,6 +6,9 @@
 
 namespace ker::net {
 
+constexpr size_t PKT_BUF_SIZE = 10240;
+constexpr size_t PKT_HEADROOM = 128;
+
 struct NetDevice;
 
 struct PacketBuffer {

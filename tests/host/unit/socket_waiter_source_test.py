@@ -238,8 +238,18 @@ def test_blocking_socket_send_progress_runs_network_checkpoint() -> None:
         ],
         "socket send bounce progress checkpoint",
     )
-    if source.count("ssize_t const RESULT = socket_send_user_bounced(") != 2:
-        fail("SEND and SENDTO must both use the checkpointed socket send bounce helper")
+    send_cases = (
+        ("SEND", "RECV"),
+        ("SENDTO", "RECVFROM"),
+        ("SENDTO_EX", "RECVFROM_EX"),
+    )
+    for operation, following in send_cases:
+        start_token = f"case ker::abi::net::ops::{operation}:"
+        end_token = f"case ker::abi::net::ops::{following}:"
+        start = source.find(start_token)
+        end = source.find(end_token, start + len(start_token))
+        if start < 0 or end < 0 or "socket_send_user_bounced(" not in source[start:end]:
+            fail(f"{operation} must use the checkpointed socket send bounce helper")
 
 
 def main() -> None:

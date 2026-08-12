@@ -148,8 +148,12 @@ UNIT_TESTS=(
     mlibc_spawn_source_test
     mlibc_vfs_source_test
     mlibc_conformance_test
+    mlibc_wos_net_config_source_test
+    busybox_wos_ipv6_netlink_source_test
     wos_abi_parity_test
     netd_dns_source_test
+    netd_ra_worker_source_test
+    init_ipv6_readiness_source_test
     socket_ring_source_test
     socket_nonblock_source_test
     socket_waiter_source_test
@@ -223,6 +227,7 @@ UNIT_TESTS=(
     xfs_shortform_offset_source_test
     xfs_transaction_rollback_source_test
     wki_wire_test
+    netd_ra_test
     saved_frame_class_test
     migration_guard_test
     kernel_preemption_policy_test

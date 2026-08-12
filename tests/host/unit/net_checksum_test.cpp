@@ -107,3 +107,21 @@ TEST(ChecksumPseudoIPv6, SelfValidating) {
     uint16_t verify = ker::net::checksum_pseudo_ipv6(src_addr, dst_addr, 6, 4, segment, 4);
     EXPECT_EQ(verify, 0x0000u);
 }
+
+TEST(ChecksumPseudoIPv6, IndependentUdpVector) {
+    // RFC-style network-byte-order vector, independently summed as 16-bit
+    // big-endian words.  The wire checksum is 0x9f47; WOS returns the host
+    // word 0x479f because callers store it directly into packed headers.
+    std::array<uint8_t, 16> src = {0x20, 0x01, 0x0D, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
+    std::array<uint8_t, 16> dst = {0x20, 0x01, 0x0D, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2};
+    uint8_t udp[] = {0x04, 0xD2, 0x00, 0x50, 0x00, 0x08, 0x00, 0x00};
+
+    uint16_t const CHECKSUM = ker::net::checksum_pseudo_ipv6(
+        ker::net::proto::IPv6Address::from_bytes(src), ker::net::proto::IPv6Address::from_bytes(dst), 17, sizeof(udp), udp, sizeof(udp));
+    EXPECT_EQ(CHECKSUM, 0x479Fu);
+
+    memcpy(udp + 6, &CHECKSUM, sizeof(CHECKSUM));
+    EXPECT_EQ(ker::net::checksum_pseudo_ipv6(ker::net::proto::IPv6Address::from_bytes(src), ker::net::proto::IPv6Address::from_bytes(dst),
+                                             17, sizeof(udp), udp, sizeof(udp)),
+              0x0000u);
+}
