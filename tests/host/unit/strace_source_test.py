@@ -172,6 +172,70 @@ def test_strace_trace_loop_uses_ptrace_syscall_wait() -> None:
         fail("strace steady trace loop should use ptrace SYSCALL_WAIT, not raw waitpid polling")
 
 
+def test_strace_structured_option_propagates_to_remote_helpers() -> None:
+    source = read_strace_sources()
+    require_tokens(
+        source,
+        [
+            'ARG == "--structured"',
+            "options.structured = true",
+            'static std::array<char, sizeof("--structured")>',
+            "if (options.structured)",
+            "helper_argv.push_back(structured_arg())",
+            "append_trace_options(helper_argv, options",
+            "--wos-remote-command",
+            "--wos-remote-attach",
+        ],
+        "strace structured remote option propagation",
+    )
+
+
+def test_strace_structured_events_are_bounded_typed_and_atomic() -> None:
+    source = read_strace_sources()
+    cmake = (ROOT / "modules" / "strace" / "CMakeLists.txt").read_text()
+    require_tokens(
+        source,
+        [
+            'make_envelope("strace", 1, "strace.syscall"',
+            '"strace.signal"',
+            '"strace.process.fork"',
+            '"strace.process.exec"',
+            '"strace.process.termination"',
+            '"node_id"',
+            '"observer.monotonic"',
+            '"syscall_id"',
+            '"syscall_sequence"',
+            '"display_utf8"',
+            '"display_bytes_hex"',
+            "CANDIDATE + WIDTH > RAW_SIZE",
+            "next_syscall_sequence++",
+            "MAX_STRUCTURED_RECORD_BYTES = 4096",
+            "write(FD, line.data(), line.size())",
+            "written < 0 && errno == EINTR",
+            "output.write_failed = true",
+        ],
+        "strace structured event and write contract",
+    )
+    require_tokens(
+        function_body(source, "trace_loop"),
+        [
+            "emit_structured_syscall",
+            "emit_structured_signal",
+            "emit_structured_fork",
+            "emit_structured_exec",
+            "emit_structured_termination",
+            "options.structured",
+        ],
+        "strace structured trace-loop seams",
+    )
+    require_tokens(
+        function_body(source, "emit_deferred_syscall_without_exit_stop"),
+        ["emit_structured_syscall(output, pid, tid, pending, std::nullopt, OBSERVED_AT, DISPLAY, false, true)"],
+        "strace deferred syscall pairing metadata",
+    )
+    require_tokens(cmake, ["src/structured_output.cpp", "wos::telemetry"], "strace shared telemetry codec linkage")
+
+
 def test_strace_names_process_priority_syscalls() -> None:
     source = read_strace_sources()
     require_tokens(
@@ -219,6 +283,8 @@ def main() -> None:
     test_strace_proxy_startup_cleanup_reaps_tracee()
     test_strace_tracee_is_pinned_local_before_startup_stop()
     test_strace_trace_loop_uses_ptrace_syscall_wait()
+    test_strace_structured_option_propagates_to_remote_helpers()
+    test_strace_structured_events_are_bounded_typed_and_atomic()
     test_strace_names_process_priority_syscalls()
     test_strace_names_spawn_syscall()
     test_strace_names_init_control_syscalls()

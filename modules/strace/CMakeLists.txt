@@ -15,6 +15,7 @@ set(STRACE_SOURCES
     src/output.cpp
     src/ptrace_client.cpp
     src/remote.cpp
+    src/structured_output.cpp
     src/time_format.cpp
     src/trace.cpp
 )
@@ -33,4 +34,4 @@ set_target_properties(strace PROPERTIES
     LINK_FLAGS "-Wl,-z,now -Wl,--no-dynamic-linker"
 )
 
-target_link_libraries(strace c++abi c++ c unwind)
+target_link_libraries(strace wos::telemetry c++abi c++ c unwind)

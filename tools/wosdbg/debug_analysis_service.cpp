@@ -41,6 +41,7 @@
 #include "elf_symbol_resolver.h"
 #include "log_entry.h"
 #include "log_processor.h"
+#include "telemetry_log.h"
 #include "x86.h"
 
 namespace {
@@ -571,12 +572,17 @@ auto disassemble_bytes_json(const QByteArray& bytes, uint64_t address, int instr
 }
 
 auto log_entry_excerpt(const LogEntry& entry) -> QJsonObject {
-    return QJsonObject{{"line", entry.line_number},
+    QJsonObject result{{"line", entry.line_number},
                        {"type", entry_type_name(entry.type)},
                        {"address", QString::fromStdString(entry.address)},
                        {"function", QString::fromStdString(entry.function)},
                        {"assembly", QString::fromStdString(entry.assembly)},
                        {"text", QString::fromStdString(entry.original_line)}};
+    if (entry.has_telemetry_envelope) {
+        result["telemetryEnvelope"] = entry.telemetry_envelope;
+        result["telemetryJson"] = QString::fromStdString(entry.telemetry_json);
+    }
+    return result;
 }
 
 auto task_type_name(uint64_t value) -> QString {
@@ -1238,6 +1244,14 @@ auto DebugAnalysisService::load_incident(const QJsonObject& args) -> QJsonObject
         const QJsonValue value = member.metadata["nodeId"];
         return value.isDouble() ? QString::number(static_cast<qint64>(value.toDouble())) : value.toString(member.node_id);
     };
+    QHash<QString, QJsonObject> manifest_clock_domains;
+    for (const auto& value : session->bundle->manifest["clocks"].toObject()["domains"].toArray()) {
+        const QJsonObject domain = value.toObject();
+        const QString id = domain["id"].toString();
+        if (!id.isEmpty()) {
+            manifest_clock_domains.insert(id, domain);
+        }
+    }
     auto evidence_base = [&](const wosdbg::IncidentMember& member) {
         return QJsonObject{{"memberPath", member.path},
                            {"kind", member.kind},
@@ -1323,6 +1337,13 @@ auto DebugAnalysisService::load_incident(const QJsonObject& args) -> QJsonObject
                     const QString LOG_ID = make_content_session_id("log", ID + ':' + member.path + ':' + member.sha256);
                     const QJsonObject result = load_log_file(member.absolute_path, LOG_ID, 120000, false);
                     if (result["ok"].toBool(false)) {
+                        if (auto* loaded_session = find_log_session(LOG_ID); loaded_session != nullptr) {
+                            loaded_session->node_id = node_id_for(member);
+                            loaded_session->clock_domain = member.metadata["clockDomain"].toString();
+                            const QJsonObject clock = manifest_clock_domains.value(loaded_session->clock_domain);
+                            loaded_session->clock_synchronized = clock["synchronized"].toBool(false);
+                            loaded_session->clock_comparable_across_nodes = clock["comparableAcrossNodes"].toBool(false);
+                        }
                         session->log_ids.insert(member.path, LOG_ID);
                         evidence["status"] = member.truncated ? "loaded_truncated" : "loaded";
                         evidence["logId"] = LOG_ID;
@@ -1571,6 +1592,7 @@ auto DebugAnalysisService::summarize_incident(const QJsonObject& args) const -> 
                          {"events", QJsonArray{}},
                          {"lanes", QJsonArray{}},
                          {"clockOrderedEvents", QJsonArray{}},
+                         {"clockPartitions", QJsonArray{}},
                          {"clockQuality", "unavailable"},
                          {"crossLogCorrelations", QJsonArray{}},
                          {"truncated", false}};
@@ -1754,7 +1776,7 @@ auto DebugAnalysisService::summarize_incident(const QJsonObject& args) const -> 
 
 auto DebugAnalysisService::list_logs() -> QJsonObject {
     QDir const DIR(QDir::currentPath());
-    QStringList files = DIR.entryList({"*.log", "*.txt"}, QDir::Files, QDir::Name);
+    QStringList files = DIR.entryList({"*.log", "*.txt", "*.jsonl"}, QDir::Files, QDir::Name);
     std::ranges::sort(files, [](const QString& a, const QString& b) {
         const bool A_MODIFIED = a.contains(".modified.");
         const bool B_MODIFIED = b.contains(".modified.");
@@ -1802,6 +1824,20 @@ auto DebugAnalysisService::load_log_file(const QString& resolved_path, const QSt
     session->path = RESOLVED;
     session->display_name = QFileInfo(RESOLVED).fileName();
 
+    auto telemetry = load_telemetry_jsonl(RESOLVED);
+    if (telemetry.recognized) {
+        if (!telemetry.error.isEmpty()) {
+            return tool_error(QString("Structured telemetry rejected: %1").arg(telemetry.error));
+        }
+        session->entries = std::move(telemetry.entries);
+        session->node_id = telemetry.node_id;
+        session->clock_domain = telemetry.clock_domain;
+        session->telemetry_input = true;
+        auto* saved = session.get();
+        log_sessions.insert(id, session);
+        return QJsonObject{{"ok", true}, {"logId", id}, {"cached", false}, {"summary", log_summary_to_json(*saved)}};
+    }
+
     LogProcessor processor(RESOLVED);
     if (allow_external_symbols) {
         processor.set_config_path(QDir::current().absoluteFilePath("wosdbg.json"));
@@ -1840,6 +1876,11 @@ auto DebugAnalysisService::find_log_session(const QString& id) const -> const Lo
     return it == log_sessions.end() ? nullptr : it.value().get();
 }
 
+auto DebugAnalysisService::find_log_session(const QString& id) -> LogSession* {
+    auto it = log_sessions.find(id);
+    return it == log_sessions.end() ? nullptr : it.value().get();
+}
+
 auto DebugAnalysisService::log_entry_to_json(const LogEntry& entry, bool include_children) const -> QJsonObject {
     QJsonObject obj{{"lineNumber", entry.line_number},
                     {"type", entry_type_name(entry.type)},
@@ -1853,6 +1894,22 @@ auto DebugAnalysisService::log_entry_to_json(const LogEntry& entry, bool include
                     {"sourceLine", entry.source_line},
                     {"interruptNumber", QString::fromStdString(entry.interrupt_number)},
                     {"cpuStateInfo", QString::fromStdString(entry.cpu_state_info)}};
+    if (entry.has_telemetry_envelope) {
+        obj["telemetryEnvelope"] = entry.telemetry_envelope;
+        obj["telemetryJson"] = QString::fromStdString(entry.telemetry_json);
+        const QJsonObject IDENTITY = entry.telemetry_envelope["identity"].toObject();
+        QJsonArray missing_identity;
+        for (const auto* field : {"boot_id", "node_id", "pid", "tid", "cpu"}) {
+            if (!IDENTITY.contains(field)) {
+                missing_identity.append(field);
+            }
+        }
+        obj["missingIdentityFields"] = missing_identity;
+        const QJsonObject CLOCK = entry.telemetry_envelope["clock"].toObject();
+        obj["clockDomain"] = CLOCK["domain"];
+        obj["clockQuality"] = CLOCK["quality"];
+        obj["correlation"] = entry.telemetry_envelope["correlation"];
+    }
     if (include_children && !entry.child_entries.empty()) {
         QJsonArray children;
         for (const auto& child : entry.child_entries) {
@@ -1866,18 +1923,28 @@ auto DebugAnalysisService::log_entry_to_json(const LogEntry& entry, bool include
 auto DebugAnalysisService::log_summary_to_json(const LogSession& session) -> QJsonObject {
     int instructions = 0;
     int interrupts = 0;
+    int telemetry_records = 0;
     for (const auto& entry : session.entries) {
         if (entry.type == EntryType::INSTRUCTION) {
             ++instructions;
         } else if (entry.type == EntryType::INTERRUPT) {
             ++interrupts;
         }
+        if (entry.has_telemetry_envelope) {
+            ++telemetry_records;
+        }
     }
     return QJsonObject{{"id", session.id},
                        {"path", session.path},
+                       {"nodeId", session.node_id},
+                       {"clockDomain", session.clock_domain},
+                       {"clockSynchronized", session.clock_synchronized},
+                       {"clockComparableAcrossNodes", session.clock_comparable_across_nodes},
                        {"entries", static_cast<int>(session.entries.size())},
                        {"instructions", instructions},
-                       {"interrupts", interrupts}};
+                       {"interrupts", interrupts},
+                       {"telemetryRecords", telemetry_records},
+                       {"inputFormat", session.telemetry_input ? "wos-telemetry-jsonl" : "legacy-text"}};
 }
 
 int DebugAnalysisService::bounded_int(const QJsonObject& args, const QString& key, int fallback, int min_value, int max_value) {
@@ -4581,7 +4648,7 @@ auto DebugAnalysisService::build_distributed_timeline(const QJsonObject& args) c
     const QRegularExpression BRACKET_TIME_RE(R"(^\s*\[\s*([0-9]+(?:\.[0-9]+)?)\s*(ns|us|ms|s)?\s*\])",
                                              QRegularExpression::CaseInsensitiveOption);
 
-    auto correlation_fields = [&IDENTIFIER_RE](const QString& text, QSet<QString>* values) {
+    auto legacy_correlation_fields = [&IDENTIFIER_RE](const QString& text, QSet<QString>* values) {
         QJsonObject fields;
         auto it = IDENTIFIER_RE.globalMatch(text);
         while (it.hasNext()) {
@@ -4593,7 +4660,38 @@ auto DebugAnalysisService::build_distributed_timeline(const QJsonObject& args) c
         }
         return fields;
     };
-    auto timestamp_ns = [&EXPLICIT_TIME_RE, &BRACKET_TIME_RE](const QString& text) -> std::optional<double> {
+    auto exact_json_value = [](const QJsonValue& value) {
+        if (value.isString()) {
+            return value.toString();
+        }
+        if (value.isBool()) {
+            return value.toBool() ? QString("true") : QString("false");
+        }
+        if (value.isDouble()) {
+            return QString::number(value.toDouble(), 'g', 17);
+        }
+        if (value.isNull()) {
+            return QString("null");
+        }
+        if (value.isObject()) {
+            return QString::fromUtf8(QJsonDocument(value.toObject()).toJson(QJsonDocument::Compact));
+        }
+        if (value.isArray()) {
+            return QString::fromUtf8(QJsonDocument(value.toArray()).toJson(QJsonDocument::Compact));
+        }
+        return QString{};
+    };
+    auto structured_correlation_fields = [&exact_json_value](const LogEntry& entry, QSet<QString>* values) {
+        const QJsonObject fields = entry.telemetry_envelope["correlation"].toObject();
+        for (auto it = fields.constBegin(); it != fields.constEnd(); ++it) {
+            const QString VALUE = exact_json_value(it.value());
+            if (!VALUE.isEmpty()) {
+                values->insert(QString("%1=%2").arg(it.key(), VALUE));
+            }
+        }
+        return fields;
+    };
+    auto legacy_timestamp_ns = [&EXPLICIT_TIME_RE, &BRACKET_TIME_RE](const QString& text) -> std::optional<uint64_t> {
         auto match = EXPLICIT_TIME_RE.match(text);
         if (!match.hasMatch()) {
             match = BRACKET_TIME_RE.match(text);
@@ -4601,20 +4699,115 @@ auto DebugAnalysisService::build_distributed_timeline(const QJsonObject& args) c
         if (!match.hasMatch()) {
             return std::nullopt;
         }
-        bool ok = false;
-        double value = match.captured(1).toDouble(&ok);
-        if (!ok) {
+        const QStringList PARTS = match.captured(1).split('.');
+        bool integer_ok = false;
+        const uint64_t INTEGER = PARTS[0].toULongLong(&integer_ok, 10);
+        if (!integer_ok || PARTS.size() > 2) {
             return std::nullopt;
         }
         const QString UNIT = match.captured(2).toLower();
+        uint64_t multiplier = 1;
+        int fractional_digits = 0;
         if (UNIT == "s" || UNIT.isEmpty()) {
-            value *= 1'000'000'000.0;
+            multiplier = 1'000'000'000ULL;
+            fractional_digits = 9;
         } else if (UNIT == "ms") {
-            value *= 1'000'000.0;
+            multiplier = 1'000'000ULL;
+            fractional_digits = 6;
         } else if (UNIT == "us") {
-            value *= 1'000.0;
+            multiplier = 1'000ULL;
+            fractional_digits = 3;
+        } else if (UNIT != "ns") {
+            return std::nullopt;
         }
-        return value;
+        QString fractional = PARTS.size() == 2 ? PARTS[1] : QString{};
+        fractional = fractional.left(fractional_digits).leftJustified(fractional_digits, '0');
+        bool fractional_ok = true;
+        const uint64_t FRACTION = fractional.isEmpty() ? 0 : fractional.toULongLong(&fractional_ok, 10);
+        if (!fractional_ok || INTEGER > (std::numeric_limits<uint64_t>::max() - FRACTION) / multiplier) {
+            return std::nullopt;
+        }
+        return (INTEGER * multiplier) + FRACTION;
+    };
+    auto structured_timestamp_ns = [](const LogEntry& entry) -> std::optional<uint64_t> {
+        const QJsonObject CLOCK = entry.telemetry_envelope["clock"].toObject();
+        bool value_ok = false;
+        const uint64_t VALUE = CLOCK["value"].toString().toULongLong(&value_ok, 10);
+        if (!value_ok) {
+            return std::nullopt;
+        }
+        const QString UNIT = CLOCK["unit"].toString().toLower();
+        uint64_t multiplier = 0;
+        if (UNIT == "ns") {
+            multiplier = 1;
+        } else if (UNIT == "us") {
+            multiplier = 1'000ULL;
+        } else if (UNIT == "ms") {
+            multiplier = 1'000'000ULL;
+        } else if (UNIT == "s") {
+            multiplier = 1'000'000'000ULL;
+        } else {
+            return std::nullopt;
+        }
+        if (VALUE > std::numeric_limits<uint64_t>::max() / multiplier) {
+            return std::nullopt;
+        }
+        return VALUE * multiplier;
+    };
+    auto clock_partition_for = [](const LogSession& session) {
+        if (session.clock_domain.isEmpty()) {
+            return QString("log:%1").arg(session.id);
+        }
+        if (session.clock_synchronized && session.clock_comparable_across_nodes) {
+            return QString("domain:%1").arg(session.clock_domain);
+        }
+        if (!session.node_id.isEmpty()) {
+            return QString("node:%1/domain:%2").arg(session.node_id, session.clock_domain);
+        }
+        return QString("log:%1/domain:%2").arg(session.id, session.clock_domain);
+    };
+    struct StructuredClockEvidence {
+        QString partition;
+        bool comparable = false;
+    };
+    auto structured_clock_evidence = [](const LogSession& session, const LogEntry& entry, int row) {
+        StructuredClockEvidence result;
+        const QJsonObject IDENTITY = entry.telemetry_envelope["identity"].toObject();
+        const QJsonObject CLOCK = entry.telemetry_envelope["clock"].toObject();
+        QString node = IDENTITY["node_id"].toString();
+        if (node.isEmpty()) {
+            node = IDENTITY["node"].toString();
+        }
+        if (node.isEmpty()) {
+            node = session.node_id;
+        }
+        const QString BOOT = IDENTITY["boot_id"].toString();
+        QString domain = CLOCK["domain"].toString();
+        if (domain.isEmpty()) {
+            domain = session.clock_domain;
+        }
+        const QString QUALITY = CLOCK["quality"].toString();
+        const bool MANIFEST_PROVEN = session.clock_synchronized && session.clock_comparable_across_nodes &&
+                                     (session.clock_domain.isEmpty() || session.clock_domain == domain);
+        if (node.isEmpty() || domain.isEmpty() || (QUALITY.isEmpty() && !MANIFEST_PROVEN)) {
+            result.partition = QString("log:%1/entry:%2/unproven-clock").arg(session.id).arg(row);
+            return result;
+        }
+        const bool RECOGNIZED_QUALITY =
+            QUALITY.isEmpty() || QUALITY == "local" || QUALITY == "local_observer" || QUALITY == "synchronized" || QUALITY == "global";
+        if (!RECOGNIZED_QUALITY) {
+            result.partition = QString("log:%1/entry:%2/unrecognized-quality").arg(session.id).arg(row);
+            return result;
+        }
+        if (MANIFEST_PROVEN) {
+            result.partition = QString("domain:%1").arg(domain);
+            result.comparable = true;
+            return result;
+        }
+        result.partition = BOOT.isEmpty() ? QString("log:%1/node:%2/domain:%3").arg(session.id, node, domain)
+                                          : QString("boot:%1/node:%2/domain:%3").arg(BOOT, node, domain);
+        result.comparable = true;
+        return result;
     };
 
     struct Candidate {
@@ -4626,7 +4819,9 @@ auto DebugAnalysisService::build_distributed_timeline(const QJsonObject& args) c
         QJsonObject entry;
         QJsonObject fields;
         QSet<QString> correlation_values;
-        std::optional<double> timestamp;
+        QString clock_partition;
+        bool clock_comparable = true;
+        std::optional<uint64_t> timestamp;
         bool direct_match = false;
         bool context_match = false;
         bool correlation_match = false;
@@ -4644,10 +4839,15 @@ auto DebugAnalysisService::build_distributed_timeline(const QJsonObject& args) c
         for (int row = 0; std::cmp_less(row, session->entries.size()); ++row) {
             const auto& entry = session->entries[static_cast<size_t>(row)];
             const QString TEXT = QString::fromStdString(entry.original_line + " " + entry.function + " " + entry.assembly);
+            QSet<QString> entry_correlation_values;
+            if (entry.has_telemetry_envelope) {
+                (void)structured_correlation_fields(entry, &entry_correlation_values);
+            }
             bool direct = selector.match(TEXT).hasMatch();
             if (!requested_keys.isEmpty()) {
-                direct =
-                    std::ranges::any_of(requested_keys, [&TEXT](const QString& key) { return TEXT.contains(key, Qt::CaseInsensitive); });
+                direct = std::ranges::any_of(requested_keys, [&TEXT, &entry_correlation_values](const QString& key) {
+                    return entry_correlation_values.contains(key) || TEXT.contains(key, Qt::CaseInsensitive);
+                });
             }
             if (direct) {
                 direct_rows.insert(row);
@@ -4668,11 +4868,19 @@ auto DebugAnalysisService::build_distributed_timeline(const QJsonObject& args) c
             candidate.path = session->path;
             candidate.lane = lane;
             candidate.row = ROW;
+            if (entry.has_telemetry_envelope) {
+                const auto CLOCK_EVIDENCE = structured_clock_evidence(*session, entry, ROW);
+                candidate.clock_partition = CLOCK_EVIDENCE.partition;
+                candidate.clock_comparable = CLOCK_EVIDENCE.comparable;
+            } else {
+                candidate.clock_partition = clock_partition_for(*session);
+            }
             candidate.text = TEXT;
             candidate.entry = log_entry_to_json(entry, false);
             candidate.direct_match = direct_rows.contains(ROW);
             candidate.context_match = !direct_rows.contains(ROW);
-            candidate.fields = correlation_fields(TEXT, &candidate.correlation_values);
+            candidate.fields = entry.has_telemetry_envelope ? structured_correlation_fields(entry, &candidate.correlation_values)
+                                                            : legacy_correlation_fields(TEXT, &candidate.correlation_values);
             if (candidate.direct_match) {
                 for (const auto& value : candidate.correlation_values) {
                     if (!value.endsWith("=0") && !value.endsWith("=null") && !value.endsWith("=none")) {
@@ -4680,7 +4888,7 @@ auto DebugAnalysisService::build_distributed_timeline(const QJsonObject& args) c
                     }
                 }
             }
-            candidate.timestamp = timestamp_ns(TEXT);
+            candidate.timestamp = entry.has_telemetry_envelope ? structured_timestamp_ns(entry) : legacy_timestamp_ns(TEXT);
             candidates.push_back(std::move(candidate));
         }
         ++lane;
@@ -4702,7 +4910,8 @@ auto DebugAnalysisService::build_distributed_timeline(const QJsonObject& args) c
                 const auto& entry = session->entries[static_cast<size_t>(row)];
                 const QString TEXT = QString::fromStdString(entry.original_line + " " + entry.function + " " + entry.assembly);
                 QSet<QString> candidate_values;
-                const QJsonObject FIELDS = correlation_fields(TEXT, &candidate_values);
+                const QJsonObject FIELDS = entry.has_telemetry_envelope ? structured_correlation_fields(entry, &candidate_values)
+                                                                        : legacy_correlation_fields(TEXT, &candidate_values);
                 const bool MATCHES_SEED =
                     std::ranges::any_of(candidate_values, [&seed_values](const QString& key) { return seed_values.contains(key); });
                 if (!MATCHES_SEED) {
@@ -4713,12 +4922,19 @@ auto DebugAnalysisService::build_distributed_timeline(const QJsonObject& args) c
                 candidate.path = session->path;
                 candidate.lane = lane;
                 candidate.row = row;
+                if (entry.has_telemetry_envelope) {
+                    const auto CLOCK_EVIDENCE = structured_clock_evidence(*session, entry, row);
+                    candidate.clock_partition = CLOCK_EVIDENCE.partition;
+                    candidate.clock_comparable = CLOCK_EVIDENCE.comparable;
+                } else {
+                    candidate.clock_partition = clock_partition_for(*session);
+                }
                 candidate.text = TEXT;
                 candidate.entry = log_entry_to_json(entry, false);
                 candidate.correlation_match = true;
                 candidate.fields = FIELDS;
                 candidate.correlation_values = candidate_values;
-                candidate.timestamp = timestamp_ns(TEXT);
+                candidate.timestamp = entry.has_telemetry_envelope ? structured_timestamp_ns(entry) : legacy_timestamp_ns(TEXT);
                 candidates.push_back(std::move(candidate));
             }
             ++lane;
@@ -4766,10 +4982,18 @@ auto DebugAnalysisService::build_distributed_timeline(const QJsonObject& args) c
     QHash<QString, QSet<QString>> correlation_logs;
     QHash<QString, int> correlation_counts;
     int timestamped = 0;
+    bool all_clocks_comparable = true;
     for (const auto& log_id : log_ids) {
         const auto* session = find_log_session(log_id);
         if (session != nullptr) {
-            lanes.append(QJsonObject{{"logId", log_id}, {"path", session->path}, {"lane", lanes.size()}});
+            lanes.append(QJsonObject{{"logId", log_id},
+                                     {"path", session->path},
+                                     {"lane", lanes.size()},
+                                     {"nodeId", session->node_id},
+                                     {"clockDomain", session->clock_domain},
+                                     {"clockPartition", clock_partition_for(*session)},
+                                     {"clockSynchronized", session->clock_synchronized},
+                                     {"clockComparableAcrossNodes", session->clock_comparable_across_nodes}});
         }
     }
     for (const auto& candidate : candidates) {
@@ -4779,13 +5003,20 @@ auto DebugAnalysisService::build_distributed_timeline(const QJsonObject& args) c
         } else if (candidate.context_match) {
             match_kind = "context";
         }
-        QJsonObject event{{"logId", candidate.log_id}, {"logPath", candidate.path},       {"lane", candidate.lane}, {"row", candidate.row},
-                          {"entry", candidate.entry},  {"correlation", candidate.fields}, {"match", match_kind}};
+        QJsonObject event{{"logId", candidate.log_id},
+                          {"logPath", candidate.path},
+                          {"lane", candidate.lane},
+                          {"row", candidate.row},
+                          {"entry", candidate.entry},
+                          {"correlation", candidate.fields},
+                          {"clockPartition", candidate.clock_partition},
+                          {"match", match_kind}};
         if (candidate.timestamp) {
-            event["timestampNs"] = *candidate.timestamp;
+            event["timestampNs"] = QString::number(*candidate.timestamp);
             ++timestamped;
         }
         events.append(event);
+        all_clocks_comparable = all_clocks_comparable && candidate.clock_comparable;
         for (const auto& value : candidate.correlation_values) {
             correlation_logs[value].insert(candidate.log_id);
             ++correlation_counts[value];
@@ -4804,16 +5035,16 @@ auto DebugAnalysisService::build_distributed_timeline(const QJsonObject& args) c
             {"key", key}, {"occurrences", correlation_counts.value(key)}, {"logIds", QJsonArray::fromStringList(correlated_logs)}});
     }
 
-    QJsonArray clock_ordered_events;
-    std::vector<QJsonObject> timestamped_events;
+    QHash<QString, std::vector<QJsonObject>> timestamped_by_partition;
     for (const auto& value : events) {
-        if (value.toObject().contains("timestampNs")) {
-            timestamped_events.push_back(value.toObject());
+        const QJsonObject event = value.toObject();
+        if (event.contains("timestampNs")) {
+            timestamped_by_partition[event["clockPartition"].toString()].push_back(event);
         }
     }
-    std::ranges::sort(timestamped_events, [](const QJsonObject& left, const QJsonObject& right) {
-        const double left_timestamp = left["timestampNs"].toDouble();
-        const double right_timestamp = right["timestampNs"].toDouble();
+    auto timestamp_less = [](const QJsonObject& left, const QJsonObject& right) {
+        const uint64_t left_timestamp = left["timestampNs"].toString().toULongLong();
+        const uint64_t right_timestamp = right["timestampNs"].toString().toULongLong();
         if (left_timestamp != right_timestamp) {
             return left_timestamp < right_timestamp;
         }
@@ -4828,23 +5059,39 @@ auto DebugAnalysisService::build_distributed_timeline(const QJsonObject& args) c
             return left_row < right_row;
         }
         return left["logId"].toString() < right["logId"].toString();
-    });
-    for (const auto& event : timestamped_events) {
-        clock_ordered_events.append(event);
+    };
+    QJsonArray clock_partitions;
+    for (const auto& partition : sorted_hash_keys(timestamped_by_partition)) {
+        auto partition_events = timestamped_by_partition.value(partition);
+        std::ranges::sort(partition_events, timestamp_less);
+        QJsonArray ordered;
+        for (const auto& event : partition_events) {
+            ordered.append(event);
+        }
+        clock_partitions.append(QJsonObject{{"id", partition}, {"events", ordered}});
     }
 
+    const bool GLOBAL_ORDER_AVAILABLE = timestamped == events.size() && timestamped_by_partition.size() == 1 && all_clocks_comparable;
+    QJsonArray clock_ordered_events;
+    if (GLOBAL_ORDER_AVAILABLE && !clock_partitions.isEmpty()) {
+        clock_ordered_events = clock_partitions.first().toObject()["events"].toArray();
+    }
     QString clock_quality = "partial-timestamps";
     if (timestamped == 0) {
         clock_quality = "per-log-order-only";
-    } else if (timestamped == events.size()) {
+    } else if (GLOBAL_ORDER_AVAILABLE) {
         clock_quality = "all-events-timestamped";
+    } else if (timestamped == events.size()) {
+        clock_quality = "partitioned-clock-domains";
     }
     return QJsonObject{{"ok", true},
                        {"query", QUERY},
                        {"lanes", lanes},
                        {"events", events},
                        {"clockOrderedEvents", clock_ordered_events},
+                       {"clockPartitions", clock_partitions},
                        {"clockQuality", clock_quality},
+                       {"globalOrderAvailable", GLOBAL_ORDER_AVAILABLE},
                        {"crossLogCorrelations", cross_log_correlations},
                        {"truncated", TRUNCATED}};
 }

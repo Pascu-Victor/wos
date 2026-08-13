@@ -33,12 +33,15 @@ int run_all_trace_command(int argc, char** argv);
 int run_vmem_trace_command(int argc, char** argv);
 int run_run_command(int argc, char** argv);
 int run_show_map_command(int argc, char** argv);
+int run_data_info_command(int argc, char** argv);
+int run_data_convert_command(int argc, char** argv);
+int run_data_export_command(int argc, char** argv);
 int run_help_command(int argc, char** argv);
 
-constexpr std::array<CommandSpec, 24> COMMANDS = {{
+constexpr std::array<CommandSpec, 27> COMMANDS = {{
     {.name = "stat", .args = "[ms=1000]", .summary = "CPU% per process over a sampling window", .handler = run_stat_command},
     {.name = "record",
-     .args = "[ms=1000] [--filter=<filters>]",
+     .args = "[ms=1000] [--filter=<filters>] [--structured]",
      .summary = "Record kernel perf events to perf.data",
      .handler = run_record_command},
     {.name = "report",
@@ -91,10 +94,22 @@ constexpr std::array<CommandSpec, 24> COMMANDS = {{
      .handler = run_all_trace_command},
     {.name = "vmem-trace", .args = "[n=200] [filters]", .summary = "Raw local vmem trace events", .handler = run_vmem_trace_command},
     {.name = "run",
-     .args = "[--filter=<filters>] [--time=FMT] <cmd> [args]",
+     .args = "[--filter=<filters>] [--time=FMT] [--structured] <cmd> [args]",
      .summary = "Trace a command and descendants",
      .handler = run_run_command},
     {.name = "show-map", .args = "", .summary = "Show PID to command map from perf.data", .handler = run_show_map_command},
+    {.name = "data-info",
+     .args = "[path=perf.data]",
+     .summary = "Inspect perf.data format, version, and integrity",
+     .handler = run_data_info_command},
+    {.name = "data-convert",
+     .args = "[path=perf.data]",
+     .summary = "Atomically convert legacy perf.data to structured v1",
+     .handler = run_data_convert_command},
+    {.name = "data-export",
+     .args = "[path=perf.data]",
+     .summary = "Write validated typed telemetry JSONL to stdout",
+     .handler = run_data_export_command},
     {.name = "help", .args = "[filters]", .summary = "Show this screen or detailed filter help", .handler = run_help_command},
 }};
 
@@ -179,16 +194,21 @@ int run_stat_command(int argc, char** argv) {
 int run_record_command(int argc, char** argv) {
     int ms = DEFAULT_SAMPLE_MS;
     const char* filter = nullptr;
+    bool structured = false;
     for (int i = 2; i < argc; ++i) {
         std::string_view const ARG(argv[i]);
         if (ARG.starts_with("--filter=")) {
             filter = argv[i] + 9;
+        } else if (ARG == "--structured") {
+            structured = true;
+        } else if (!ARG.empty() && ARG.front() == '-') {
+            std::println("perf record: unrecognized argument '{}'", argv[i]);
+            return 1;
         } else {
             ms = static_cast<int>(strtol(argv[i], nullptr, PARSE_BASE_DECIMAL));
         }
     }
-    cmd_record(ms, filter);
-    return 0;
+    return cmd_record(ms, filter, structured) ? 0 : 1;
 }
 
 int run_report_command(int argc, char** argv) {
@@ -412,13 +432,39 @@ int run_run_command(int argc, char** argv) {
         std::println("perf run: usage: perf run <program> [args...]");
         return 1;
     }
-    cmd_run(argc - 2, argv + 2);
-    return 0;
+    return cmd_run(argc - 2, argv + 2) ? 0 : 1;
 }
 
 int run_show_map_command(int /*argc*/, char** /*argv*/) {
     cmd_show_map();
     return 0;
+}
+
+int run_data_info_command(int argc, char** argv) {
+    if (argc > 3) {
+        std::println("perf data-info: usage: perf data-info [path]");
+        return 1;
+    }
+    std::string_view const PATH = argc == 3 ? std::string_view(argv[2]) : PERF_DATA_FILE;
+    return cmd_data_info(PATH) ? 0 : 1;
+}
+
+int run_data_convert_command(int argc, char** argv) {
+    if (argc > 3) {
+        std::println("perf data-convert: usage: perf data-convert [path]");
+        return 1;
+    }
+    std::string_view const PATH = argc == 3 ? std::string_view(argv[2]) : PERF_DATA_FILE;
+    return finalize_structured_perf_data(PATH) ? 0 : 1;
+}
+
+int run_data_export_command(int argc, char** argv) {
+    if (argc > 3) {
+        std::println(stderr, "perf data-export: usage: perf data-export [path]");
+        return 1;
+    }
+    std::string_view const PATH = argc == 3 ? std::string_view(argv[2]) : PERF_DATA_FILE;
+    return cmd_data_export(PATH) ? 0 : 1;
 }
 
 int run_help_command(int argc, char** argv) {

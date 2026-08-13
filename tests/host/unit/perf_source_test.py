@@ -9,6 +9,8 @@ PERF_SRC_DIR = ROOT / "modules" / "perf" / "src"
 PROCFS_CPP = ROOT / "modules" / "kern" / "src" / "vfs" / "fs" / "procfs.cpp"
 PROCFS_HPP = ROOT / "modules" / "kern" / "src" / "vfs" / "fs" / "procfs.hpp"
 MEMACC_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "mm" / "memacc.cpp"
+PERF_EVENTS_HPP = ROOT / "modules" / "kern" / "src" / "platform" / "perf" / "perf_events.hpp"
+PERF_CMAKE = ROOT / "modules" / "perf" / "CMakeLists.txt"
 
 
 def fail(message: str) -> None:
@@ -250,11 +252,187 @@ def test_runtime_image_observability_is_authoritative_and_append_only() -> None:
     )
 
 
+def test_structured_perf_is_opt_in_atomic_and_legacy_projected() -> None:
+    source = read_perf_source()
+    cmake = PERF_CMAKE.read_text()
+    perf_events = PERF_EVENTS_HPP.read_text()
+
+    require_tokens(
+        perf_events,
+        [
+            "struct PerfEvent",
+            "uint64_t ts_ns",
+            "uint64_t pid",
+            "static_assert(sizeof(PerfEvent) == 48",
+        ],
+        "unchanged hot PerfEvent contract",
+    )
+    require_tokens(
+        cmake,
+        ["src/perf_data.cpp", "src/perf_event_json.cpp", "wos::telemetry"],
+        "perf shared telemetry build integration",
+    )
+    require_tokens(
+        source,
+        [
+            'MAGIC{"WOSPERF\\0", 8}',
+            "CONTAINER_MAJOR = 1",
+            "MAX_CONTAINER_BYTES",
+            "wos::telemetry::encode_container",
+            "wos::telemetry::decode_container",
+            "wos::telemetry::crc32c",
+            'ARG == "--structured"',
+            '.name = "data-info"',
+            '.name = "data-convert"',
+            '.name = "data-export"',
+        ],
+        "structured perf surface",
+    )
+
+    read_file_body = function_body(source, "read_file")
+    require_tokens(
+        read_file_body,
+        [
+            "path == PERF_DATA_FILE",
+            "perf_data::load(path)",
+            "std::move(loaded.file->legacy_snapshot)",
+            "return read_fd(fd, initial_capacity, read_limit_for_path(path))",
+        ],
+        "transparent exact legacy projection",
+    )
+
+    require_tokens(source, ["auto cmd_record(int ms, const char* filter, bool structured) -> bool"], "opt-in perf record signature")
+    record_body = function_body(source, "cmd_record")
+    require_tokens(
+        record_body,
+        ["return !structured || finalize_structured_perf_data()"],
+        "opt-in perf record failure propagation",
+    )
+    run_body = function_body(source, "cmd_run")
+    require_tokens(
+        run_body,
+        ['ARG == "--structured"', "if (structured && !finalize_structured_perf_data())", "return output_ok"],
+        "opt-in perf run failure propagation",
+    )
+    typed_body = function_body(source, "build_typed_perf_events")
+    require_tokens(
+        typed_body,
+        ["result.jsonl.size() >= perf_data::MAX_TYPED_EVENTS_BYTES"],
+        "typed perf payload checked subtraction",
+    )
+
+    convert_body = function_body(source, "convert_legacy_file_atomic")
+    require_tokens(
+        convert_body,
+        [
+            "O_WRONLY | O_CREAT | O_EXCL",
+            "write_all_checked",
+            "fsync(temp_fd)",
+            "close(temp_fd)",
+            "rename(temp_path.c_str(), owned_path.c_str())",
+            "unlink(temp_path.c_str())",
+        ],
+        "atomic structured conversion",
+    )
+    parse_body = function_body(source, "parse")
+    require_tokens(
+        parse_body,
+        [
+            "PARTIAL_MAGIC",
+            "HAS_MAGIC",
+            "validate_legacy_text(bytes, format, legacy_error)",
+            "unknown required structured section",
+        ],
+        "corruption must not fall back to legacy",
+    )
+    legacy_body = function_body(source, "validate_legacy_text")
+    require_tokens(
+        legacy_body,
+        [
+            "legacy raw event input ends with a partial record",
+            "legacy section payload ends with a partial record",
+            "legacy section markers are nested or mismatched",
+        ],
+        "partial legacy rejection",
+    )
+    export_body = function_body(source, "cmd_data_export")
+    require_tokens(
+        export_body,
+        [
+            "perf_data::load(path)",
+            "typed_events_jsonl",
+            "build_typed_perf_events",
+            "write(STDOUT_FILENO",
+            "errno == EINTR",
+        ],
+        "validated WOSDBG JSONL export",
+    )
+
+
+def test_typed_perf_mapping_is_truthful() -> None:
+    source = read_perf_source()
+    mapper = function_body(source, "serialize_typed_perf_event")
+    require_tokens(
+        mapper,
+        [
+            '"node_id"',
+            '"pid"',
+            '"cpu"',
+            '"boot_monotonic"',
+            '"thread_identity_quality"',
+            '"unavailable_in_legacy_kperf"',
+            '"instance_id"',
+        ],
+        "typed perf event mapping",
+    )
+    require_tokens(
+        source,
+        ['"perf.sample"', '"perf.switch"', '"perf.wake"', '"perf.sleep"', '"perf.container_stat"', '"perf.wki"'],
+        "typed perf event kinds",
+    )
+    if 'identity.emplace("tid"' in mapper or '{"tid"' in mapper:
+        fail("legacy /proc/kperf conversion must not invent a distinct TID")
+
+
+def test_kernel_kperf_formatter_is_transactionally_bounded() -> None:
+    procfs = PROCFS_CPP.read_text()
+    writer = procfs[procfs.find("class PerfEventTextWriter") : procfs.find("// Generate content for /proc/kperf")]
+    require_tokens(
+        writer,
+        [
+            "if (cursor_ >= end_)",
+            "complete_ = false",
+            "append_dec(0U - static_cast<uint64_t>(value))",
+            "[[nodiscard]] auto complete() const -> bool",
+        ],
+        "bounded /proc/kperf event writer",
+    )
+
+    formatter = function_body(procfs, "generate_kperf")
+    require_tokens(
+        formatter,
+        [
+            "char* const EVENT_START = p",
+            "PerfEventTextWriter writer(p, end)",
+            "writer.append('\\n')",
+            "if (!writer.complete())",
+            "p = EVENT_START",
+            "output_full = true",
+        ],
+        "transactional /proc/kperf formatter",
+    )
+    if "*p++" in formatter:
+        fail("/proc/kperf formatting must not bypass the bounded event writer")
+
+
 def main() -> None:
     test_perf_reads_are_byte_capped()
     test_perf_run_waits_for_descendant_process_group()
     test_runtime_image_observability_is_authoritative_and_append_only()
-    print("perf reads, runtime images, and append-only perf.data mapping are guarded")
+    test_structured_perf_is_opt_in_atomic_and_legacy_projected()
+    test_typed_perf_mapping_is_truthful()
+    test_kernel_kperf_formatter_is_transactionally_bounded()
+    print("perf reads, runtime images, and structured perf compatibility are guarded")
 
 
 if __name__ == "__main__":

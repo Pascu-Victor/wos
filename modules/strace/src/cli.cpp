@@ -1,10 +1,15 @@
 #include "cli.hpp"
 
 #include <array>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <print>
 #include <string>
+#include <string_view>
+#include <vector>
+
+#include "common.hpp"
 
 namespace wos::strace {
 namespace {
@@ -21,6 +26,11 @@ auto output_separately_arg() -> char* {
 
 auto output_arg() -> char* {
     static std::array<char, sizeof("-o")> arg{"-o"};
+    return arg.data();
+}
+
+auto structured_arg() -> char* {
+    static std::array<char, sizeof("--structured")> arg{"--structured"};
     return arg.data();
 }
 
@@ -90,6 +100,9 @@ auto remote_command_flag_arg() -> char* {
 
 void append_trace_options(std::vector<char*>& helper_argv, const TraceOptions& options, char* output_path_arg) {
     append_timestamp_option(helper_argv, options);
+    if (options.structured) {
+        helper_argv.push_back(structured_arg());
+    }
     if (options.output_separately) {
         helper_argv.push_back(output_separately_arg());
     } else if (options.follow_forks) {
@@ -102,7 +115,9 @@ void append_trace_options(std::vector<char*>& helper_argv, const TraceOptions& o
 }
 
 void usage() {
-    std::println(stderr, "usage: strace [-f|-ff|--output-separately] [-o file] [-t|-tt|-ttt|-tttt] [-p pid] command [args...]");
+    std::println(stderr,
+                 "usage: strace [-f|-ff|--output-separately] [-o file] [--structured] [-t|-tt|-ttt|-tttt] [-p pid] command "
+                 "[args...]");
 }
 
 auto command_basename(const char* path) -> std::string_view {
@@ -138,6 +153,10 @@ auto parse_trace_option(int argc, char** argv, int& arg_index, TraceOptions& opt
     if (ARG == "-ff" || ARG == "--output-separately") {
         options.follow_forks = true;
         options.output_separately = true;
+        return true;
+    }
+    if (ARG == "--structured") {
+        options.structured = true;
         return true;
     }
     if (ARG == "-o") {

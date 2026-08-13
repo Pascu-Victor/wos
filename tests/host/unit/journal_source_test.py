@@ -138,8 +138,9 @@ def test_journal_tool_validates_and_filters_records() -> None:
     require_tokens(
         load_body,
         [
-            "read_journal_record(fd, rec)",
+            "read_journal_record(fd, rec, &partial_record)",
             "if (valid_record(rec))",
+            "partial_record && invalid_seen != nullptr",
         ],
         "journal record loading",
     )
@@ -179,6 +180,7 @@ def test_journal_io_retries_interrupted_syscalls() -> None:
             "continue;",
             "N <= 0",
             "done += static_cast<size_t>(N)",
+            "partial_record != nullptr && done != 0",
         ],
         "journal interrupted record reads",
     )
@@ -190,7 +192,8 @@ def test_journal_io_retries_interrupted_syscalls() -> None:
             "read(fd, batch.data(), batch.size() * sizeof(JournalRecord))",
             "N < 0 && errno == EINTR",
             "continue;",
-            "count = static_cast<size_t>(N) / sizeof(JournalRecord)",
+            "BYTES % sizeof(JournalRecord)",
+            "count = BYTES / sizeof(JournalRecord)",
             "return count > 0",
         ],
         "journal interrupted batch reads",
@@ -210,6 +213,7 @@ def test_journal_daemon_and_cli_dispatch_are_covered() -> None:
             'ARG == "-u" || ARG == "-m"',
             'ARG == "-n"',
             'ARG == "--since"',
+            'ARG == "--structured"',
         ],
         "journal CLI parser",
     )
@@ -231,9 +235,11 @@ def test_journal_daemon_and_cli_dispatch_are_covered() -> None:
     require_tokens(
         query_body,
         [
-            "load_records_from_fd(FILE, records)",
-            "load_records_from_fd(DEV, live)",
-            "read_journal_batch(DEV, batch, records)",
+            "load_records_from_fd(FILE, records, &invalid_seen)",
+            "load_records_from_fd(DEV, live, &invalid_seen)",
+            "read_journal_batch(DEV, batch, records, &malformed_batch)",
+            "opts.structured && invalid_seen",
+            "opts.structured && !valid_record(rec)",
         ],
         "journal query/follow reads",
     )
@@ -249,6 +255,54 @@ def test_journal_daemon_and_cli_dispatch_are_covered() -> None:
         ],
         "journal basename dispatch",
     )
+
+
+def test_journal_structured_export_is_opt_in_and_lossless() -> None:
+    source = JOURNAL_MAIN.read_text()
+    structured_body = function_body(source, "structured_record")
+    require_tokens(
+        structured_body,
+        [
+            '"boot_id", telemetry::Value::unsigned_integer(rec.boot_id)',
+            "if (!node_identity().empty())",
+            'identity.emplace("node_id", node_identity())',
+            '"pid", telemetry::Value::unsigned_integer(rec.pid)',
+            '"tid", telemetry::Value::unsigned_integer(rec.tid)',
+            '"cpu", telemetry::Value::number',
+            '"domain", telemetry::Value("boot_monotonic")',
+            '"quality", telemetry::Value("local")',
+            '"journal_sequence", telemetry::Value::unsigned_integer(rec.sequence)',
+            '"magic", telemetry::Value::unsigned_integer(rec.magic)',
+            '"record_version", telemetry::Value::number',
+            '"header_size", telemetry::Value::number',
+            '"reserved0", telemetry::Value(std::move(reserved0))',
+            '"flags", telemetry::Value::unsigned_integer(rec.flags)',
+            '"message_len", telemetry::Value::number',
+            '"reserved1", telemetry::Value::number',
+            '"message", std::move(message_value)',
+            '"message_bytes_hex", telemetry::Value(hex_bytes(message.data(), message.size()))',
+            '"raw_record_hex", telemetry::Value(hex_bytes(&rec, sizeof(rec)))',
+            '"journal", rec.version, "journal.record"',
+            "telemetry::serialize",
+        ],
+        "lossless journal telemetry envelope",
+    )
+
+    emit_body = function_body(source, "emit_record")
+    require_tokens(
+        emit_body,
+        [
+            "if (!opts.structured)",
+            "return print_record(rec)",
+            "structured_record(rec)",
+            "write_all(STDOUT_FILENO",
+        ],
+        "opt-in journal structured output",
+    )
+
+    daemon_body = function_body(source, "run_daemon")
+    if "structured_record" in daemon_body or "emit_record" in daemon_body:
+        fail("journald raw persistence path must not be changed by structured query output")
 
 
 def test_libjournal_exports_match_syslog_ops() -> None:
@@ -280,6 +334,7 @@ def main() -> None:
     test_journal_tool_validates_and_filters_records()
     test_journal_io_retries_interrupted_syscalls()
     test_journal_daemon_and_cli_dispatch_are_covered()
+    test_journal_structured_export_is_opt_in_and_lossless()
     test_libjournal_exports_match_syslog_ops()
     print("journal ABI, CLI, daemon, and libjournal source checks passed")
 

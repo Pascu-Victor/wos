@@ -106,6 +106,8 @@ option(WOS_BUILD_WOSDBG "Build the Qt6-based wosdbg debugger tools" ${WOS_BUILD_
 # Enable color output for clang
 add_compile_options(-fdiagnostics-color=always)
 
+add_subdirectory("${WOS_WORKSPACE_ROOT}/shared/telemetry" "${CMAKE_CURRENT_BINARY_DIR}/shared/telemetry")
+
 # Set the runtime output directory for all targets to build/bin directory
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/build/bin)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_DEBUG ${CMAKE_SOURCE_DIR}/build/bin)

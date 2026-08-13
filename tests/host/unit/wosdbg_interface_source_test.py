@@ -159,6 +159,79 @@ def test_cli_and_gui_use_the_shared_contract() -> None:
     )
 
 
+def test_telemetry_metadata_does_not_change_legacy_gui_wire_layout() -> None:
+    entry = (WOSDBG / "log_entry.h").read_text()
+    protocol = (WOSDBG / "protocol.h").read_text()
+    service = (WOSDBG / "debug_analysis_service.cpp").read_text()
+    require_tokens(
+        entry,
+        ["has_telemetry_envelope", "telemetry_envelope"],
+        "backend-local telemetry metadata",
+    )
+    writer = between(protocol, "inline auto operator<<", "inline auto operator>>")
+    reader = between(protocol, "inline auto operator>>", "// Serialization helpers for AddressLookup")
+    if "telemetry" in writer or "telemetry" in reader:
+        fail("telemetry metadata must not change the existing QDataStream LogEntry layout")
+    require_tokens(
+        service,
+        [
+            'obj["telemetryEnvelope"] = entry.telemetry_envelope',
+            'obj["telemetryJson"] = QString::fromStdString(entry.telemetry_json)',
+            'obj["missingIdentityFields"] = missing_identity',
+        ],
+        "backend telemetry envelope exposure",
+    )
+
+
+def test_telemetry_jsonl_uses_shared_bounded_parser_and_preserves_legacy_path() -> None:
+    parser = (WOSDBG / "telemetry_log.cpp").read_text()
+    service = (WOSDBG / "debug_analysis_service.cpp").read_text()
+    cmake = (WOSDBG / "CMakeLists.txt").read_text()
+    semantic = (WOSDBG / "tests" / "telemetry_jsonl_semantic_test.py").read_text()
+    require_tokens(
+        parser,
+        [
+            "wos::telemetry::parse",
+            "wos::telemetry::validate_envelope",
+            "wos::telemetry::serialize",
+            "MAX_TELEMETRY_FILE_BYTES",
+            "MAX_TELEMETRY_LINE_BYTES",
+            "MAX_TELEMETRY_RECORDS",
+            "entry.telemetry_json",
+            '"node_id"',
+        ],
+        "bounded shared telemetry JSONL parser",
+    )
+    require_tokens(
+        service,
+        [
+            "load_telemetry_jsonl(RESOLVED)",
+            "if (telemetry.recognized)",
+            "LogProcessor processor(RESOLVED)",
+            "Structured telemetry rejected",
+        ],
+        "structured-first and legacy-compatible log loading",
+    )
+    require_tokens(
+        cmake,
+        ["telemetry_log.cpp", "wos::telemetry", "wosdbg_telemetry_jsonl_semantic_test"],
+        "compiled telemetry ingestion assurance",
+    )
+    require_tokens(
+        semantic,
+        [
+            '"18446744073709551611"',
+            '"future_extension"',
+            '"mixed_timeline"',
+            '"missing_timeline"',
+            '"legacy-text"',
+            '"duplicate.jsonl"',
+            '"oversized.jsonl"',
+        ],
+        "telemetry JSONL semantic cases",
+    )
+
+
 def test_distributed_timeline_is_bounded_and_clock_honest() -> None:
     service = (WOSDBG / "debug_analysis_service.cpp").read_text()
     timeline = between(
@@ -178,6 +251,15 @@ def test_distributed_timeline_is_bounded_and_clock_honest() -> None:
             "per-log-order-only",
             "partial-timestamps",
             "all-events-timestamped",
+            "partitioned-clock-domains",
+            "clockPartitions",
+            "globalOrderAvailable",
+            "clock_partition_for",
+            "structured_correlation_fields",
+            "structured_timestamp_ns",
+            "structured_clock_evidence",
+            "unproven-clock",
+            "unrecognized-quality",
             "std::vector<std::vector<Candidate>> by_lane",
         ],
         "distributed timeline bounds/correlation/clock semantics",
@@ -283,6 +365,8 @@ def test_agent_and_user_docs_cover_all_interfaces() -> None:
 def main() -> None:
     test_backend_catalog_is_the_only_tool_dispatch_contract()
     test_cli_and_gui_use_the_shared_contract()
+    test_telemetry_metadata_does_not_change_legacy_gui_wire_layout()
+    test_telemetry_jsonl_uses_shared_bounded_parser_and_preserves_legacy_path()
     test_distributed_timeline_is_bounded_and_clock_honest()
     test_coredump_module_identity_requires_dump_evidence()
     test_incident_assurance_exercises_compiled_frontend_adapters()

@@ -15,7 +15,9 @@
 #include <cstdint>
 #include <cstdio>
 #include <format>
+#include <optional>
 #include <print>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -23,6 +25,7 @@
 #include "output.hpp"
 #include "ptrace_client.hpp"
 #include "remote.hpp"
+#include "structured_output.hpp"
 #include "time_format.hpp"
 
 namespace wos::strace {
@@ -129,12 +132,21 @@ auto fork_child_from_syscall_result(const PendingSyscall& pending, int64_t resul
     return true;
 }
 
-void emit_deferred_syscall_without_exit_stop(const TraceOptions& options, TraceOutput& output, uint64_t pid,
+void emit_deferred_syscall_without_exit_stop(const TraceOptions& options, TraceOutput& output, uint64_t pid, uint64_t tid,
                                              const PendingSyscall& pending) {
     if (!pending.valid) {
         return;
     }
-    emit_trace_line(options, output, pid, pending.entered_at, std::format("{} = ? <deferred>", format_entry(pid, pending)));
+    const std::string DISPLAY = std::format("{} = ? <deferred>", format_entry(pid, pending));
+    if (options.structured) {
+        const timespec OBSERVED_AT = current_monotonic();
+        emit_structured_syscall(output, pid, tid, pending, std::nullopt, OBSERVED_AT, DISPLAY, false, true);
+        if (is_exec_syscall(pending)) {
+            emit_structured_exec(output, pid, tid, pending, "exit_unobserved", std::nullopt, OBSERVED_AT);
+        }
+    } else {
+        emit_trace_line(options, output, pid, pending.entered_at, DISPLAY);
+    }
 }
 
 void spawn_follow_helper(TraceState& state, TraceOutput& output, uint64_t child_pid, const TraceOptions& options) {
@@ -176,6 +188,7 @@ auto trace_loop(uint64_t pid, const TraceOptions& options, bool kill_on_setup_fa
     TraceState state{};
     std::unordered_map<uint64_t, PendingSyscall> pending;
     pending.reserve(8);
+    uint64_t next_syscall_sequence = 1;
 
     (void)ptrace_call(ker::abi::ptrace::request::SETOPTIONS, pid, 0, TRACE_SYSGOOD_OPTION);
 
@@ -191,10 +204,12 @@ auto trace_loop(uint64_t pid, const TraceOptions& options, bool kill_on_setup_fa
 
         if ((stop.flags & ker::abi::ptrace::STOP_INFO_EXITED) != 0) {
             for (auto& entry : pending) {
-                emit_deferred_syscall_without_exit_stop(options, output, pid, entry.second);
+                emit_deferred_syscall_without_exit_stop(options, output, pid, entry.first, entry.second);
                 entry.second.valid = false;
             }
-            if (WIFEXITED(stop.wait_status)) {
+            if (options.structured) {
+                emit_structured_termination(output, pid, stop.event.tid, stop.wait_status, current_monotonic());
+            } else if (WIFEXITED(stop.wait_status)) {
                 emit_trace_line(options, output, pid, current_realtime(options),
                                 std::format("+++ exited with {} +++", WEXITSTATUS(stop.wait_status)));
             } else if (WIFSIGNALED(stop.wait_status)) {
@@ -205,21 +220,23 @@ auto trace_loop(uint64_t pid, const TraceOptions& options, bool kill_on_setup_fa
                                 std::format("+++ exited with status {:#x} +++", stop.wait_status));
             }
             reap_follow_helpers(state, true);
+            const bool WRITE_FAILED = output.write_failed;
             close_trace_output(output);
-            return state.helper_status;
+            return WRITE_FAILED ? 1 : state.helper_status;
         }
 
         auto const& event = stop.event;
         if (event.reason == ker::abi::ptrace::stop_reason::SYSCALL_ENTER) {
             auto it = pending.try_emplace(event.tid).first;
             if (it->second.valid) {
-                emit_deferred_syscall_without_exit_stop(options, output, pid, it->second);
+                emit_deferred_syscall_without_exit_stop(options, output, pid, event.tid, it->second);
                 it->second.valid = false;
             }
             if ((stop.flags & ker::abi::ptrace::STOP_INFO_REGS_VALID) != 0) {
                 auto const& regs = stop.regs;
                 it->second = PendingSyscall{
                     .valid = true,
+                    .sequence = next_syscall_sequence++,
                     .callnum = regs.rax,
                     .a1 = regs.rdi,
                     .a2 = regs.rsi,
@@ -230,6 +247,9 @@ auto trace_loop(uint64_t pid, const TraceOptions& options, bool kill_on_setup_fa
                     .entered_at = current_realtime(options),
                     .duration_started_at = current_monotonic(),
                 };
+                if (options.structured && is_exec_syscall(it->second)) {
+                    emit_structured_exec(output, pid, event.tid, it->second, "begin", std::nullopt, it->second.duration_started_at);
+                }
             }
         } else if (event.reason == ker::abi::ptrace::stop_reason::SYSCALL_EXIT) {
             if ((stop.flags & ker::abi::ptrace::STOP_INFO_REGS_VALID) != 0) {
@@ -237,23 +257,47 @@ auto trace_loop(uint64_t pid, const TraceOptions& options, bool kill_on_setup_fa
                 auto it = pending.find(event.tid);
                 if (it != pending.end() && it->second.valid) {
                     timespec const EXITED_AT = current_monotonic();
-                    emit_trace_line(options, output, pid, it->second.entered_at,
-                                    std::format("{} = {}{}", format_entry(pid, it->second), format_result(RESULT),
-                                                format_duration_suffix(it->second.duration_started_at, EXITED_AT)));
-                    if (options.follow_forks) {
-                        uint64_t child_pid = 0;
-                        if (fork_child_from_syscall_result(it->second, RESULT, child_pid)) {
+                    const std::string DISPLAY = std::format("{} = {}{}", format_entry(pid, it->second), format_result(RESULT),
+                                                            format_duration_suffix(it->second.duration_started_at, EXITED_AT));
+                    if (options.structured) {
+                        emit_structured_syscall(output, pid, event.tid, it->second, RESULT, EXITED_AT, DISPLAY, true, false);
+                    } else {
+                        emit_trace_line(options, output, pid, it->second.entered_at, DISPLAY);
+                    }
+                    uint64_t child_pid = 0;
+                    if (fork_child_from_syscall_result(it->second, RESULT, child_pid)) {
+                        if (options.structured) {
+                            emit_structured_fork(output, pid, event.tid, child_pid, it->second, EXITED_AT);
+                        }
+                        if (options.follow_forks) {
                             spawn_follow_helper(state, output, child_pid, options);
                         }
                     }
+                    if (options.structured && is_exec_syscall(it->second)) {
+                        emit_structured_exec(output, pid, event.tid, it->second, RESULT >= 0 ? "complete" : "failed", RESULT, EXITED_AT);
+                    }
                     it->second.valid = false;
                 } else {
-                    emit_trace_line(options, output, pid, current_realtime(options),
-                                    std::format("{} = {}", callnum_name(event.message), format_result(RESULT)));
+                    const std::string DISPLAY = std::format("{} = {}", callnum_name(event.message), format_result(RESULT));
+                    if (options.structured) {
+                        const timespec OBSERVED_AT = current_monotonic();
+                        PendingSyscall unpaired{.valid = true,
+                                                .sequence = next_syscall_sequence++,
+                                                .callnum = event.message,
+                                                .entered_at = {},
+                                                .duration_started_at = OBSERVED_AT};
+                        emit_structured_syscall(output, pid, event.tid, unpaired, RESULT, OBSERVED_AT, DISPLAY, false, false);
+                    } else {
+                        emit_trace_line(options, output, pid, current_realtime(options), DISPLAY);
+                    }
                 }
             }
         } else {
-            emit_trace_line(options, output, pid, current_realtime(options), std::format("--- stopped by signal {} ---", event.signal));
+            if (options.structured) {
+                emit_structured_signal(output, pid, event.tid, event.signal, current_monotonic());
+            } else {
+                emit_trace_line(options, output, pid, current_realtime(options), std::format("--- stopped by signal {} ---", event.signal));
+            }
         }
     }
 }

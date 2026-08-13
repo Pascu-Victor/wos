@@ -1419,7 +1419,7 @@ void QemuLogViewer::load_log_files() {
 
     QDir dir(".");
     QStringList filters;
-    filters << "*.log";
+    filters << "*.log" << "*.jsonl";
 
     auto files = dir.entryList(filters, QDir::Files, QDir::Name);
 

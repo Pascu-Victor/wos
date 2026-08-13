@@ -3892,9 +3892,68 @@ auto generate_wki_netdiag(char* buf, size_t bufsz) -> size_t {
     return static_cast<size_t>(p - buf);
 }
 
-void append_perf_callsite(char*& p, char* end, uint64_t callsite) {
+class PerfEventTextWriter {
+   public:
+    PerfEventTextWriter(char*& cursor, char* end) : cursor_(cursor), end_(end) {}
+
+    void append(char value) {
+        if (!complete_) {
+            return;
+        }
+        if (cursor_ >= end_) {
+            complete_ = false;
+            return;
+        }
+        *cursor_++ = value;
+    }
+
+    void append(const char* value) {
+        while (complete_ && *value != '\0') {
+            append(*value++);
+        }
+    }
+
+    void append_dec(uint64_t value) {
+        std::array<char, 20> digits{};
+        size_t count = 0;
+        do {
+            digits.at(count++) = static_cast<char>('0' + (value % 10U));
+            value /= 10U;
+        } while (value != 0);
+        while (count > 0) {
+            append(digits.at(--count));
+        }
+    }
+
+    void append_signed(int64_t value) {
+        if (value < 0) {
+            append('-');
+            append_dec(0U - static_cast<uint64_t>(value));
+            return;
+        }
+        append_dec(static_cast<uint64_t>(value));
+    }
+
+    void append_hex(uint64_t value) {
+        constexpr std::array<char, 16> HEX_DIGITS{'0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f'};
+        append('0');
+        append('x');
+        for (int shift = 60; shift >= 0; shift -= 4) {
+            append(HEX_DIGITS.at(static_cast<size_t>((value >> shift) & 0xfU)));
+        }
+    }
+
+    [[nodiscard]] auto complete() const -> bool { return complete_; }
+
+   private:
+    char*& cursor_;
+    char* end_;
+    bool complete_ = true;
+};
+
+void append_perf_callsite(PerfEventTextWriter& writer, uint64_t callsite) {
     if (callsite == 0) {
-        append_sconst(p, end, "?");
+        writer.append('?');
         return;
     }
 
@@ -3907,16 +3966,14 @@ void append_perf_callsite(char*& p, char* end, uint64_t callsite) {
                     base = cur + 1;
                 }
             }
-            append_sconst(p, end, base);
-            if (p + 1 < end) {
-                *p++ = ':';
-            }
-            append_dec64(p, end, info->line);
+            writer.append(base);
+            writer.append(':');
+            writer.append_dec(info->line);
             return;
         }
     }
 
-    append_hex64(p, end, callsite);
+    writer.append_hex(callsite);
 }
 
 // Generate content for /proc/kperf
@@ -3933,9 +3990,12 @@ auto generate_kperf(char* buf, size_t bufsz) -> size_t {
 
     std::array<ker::mod::perf::PerfEvent, 64> batch{};
     size_t n = 0;
-    while ((n = ker::mod::perf::drain_events(batch.data(), 64, UINT32_MAX)) > 0) {
+    bool output_full = false;
+    while (!output_full && (n = ker::mod::perf::drain_events(batch.data(), 64, UINT32_MAX)) > 0) {
         for (size_t i = 0; i < n; ++i) {
             const auto& ev = batch[i];
+            char* const EVENT_START = p;
+            PerfEventTextWriter writer(p, end);
             // Determine event letter
             char letter = '?';
             switch (static_cast<ker::mod::perf::PerfEventType>(ev.type)) {
@@ -3958,56 +4018,47 @@ auto generate_kperf(char* buf, size_t bufsz) -> size_t {
                     letter = 'K';
                     break;
             }
-            if (p + 2 >= end) {
-                break;
-            }
-            *p++ = letter;
-            *p++ = ' ';
-            append_dec64(p, end, ev.ts_ns);
-            *p++ = ' ';
-            append_dec64(p, end, ev.cpu);
-            *p++ = ' ';
+            writer.append(letter);
+            writer.append(' ');
+            writer.append_dec(ev.ts_ns);
+            writer.append(' ');
+            writer.append_dec(ev.cpu);
+            writer.append(' ');
             // Type-specific fields
             if (static_cast<ker::mod::perf::PerfEventType>(ev.type) == ker::mod::perf::PerfEventType::SAMPLE) {
-                append_dec64(p, end, ev.pid);
-                *p++ = ' ';
-                append_hex64(p, end, ev.data);  // RIP
-                *p++ = ' ';
-                if (ev.lag_v < 0 && p + 1 < end) {
-                    *p++ = '-';
-                }
-                append_dec64(p, end, static_cast<uint64_t>(ev.lag_v >= 0 ? ev.lag_v : -ev.lag_v));
-                *p++ = ' ';
-                append_dec64(p, end, ev.flags);
+                writer.append_dec(ev.pid);
+                writer.append(' ');
+                writer.append_hex(ev.data);  // RIP
+                writer.append(' ');
+                writer.append_signed(ev.lag_v);
+                writer.append(' ');
+                writer.append_dec(ev.flags);
             } else if (static_cast<ker::mod::perf::PerfEventType>(ev.type) == ker::mod::perf::PerfEventType::SWITCH) {
-                append_dec64(p, end, ev.pid);  // prev
-                *p++ = ' ';
-                append_dec64(p, end, ev.data);  // next
-                *p++ = ' ';
-                append_dec64(p, end, static_cast<uint64_t>(ev.lag_v >= 0 ? ev.lag_v : 0U));
-                *p++ = ' ';
-                append_dec64(p, end, ev.flags);
-                *p++ = ' ';
-                append_dec64(p, end, ev.aux);
-                *p++ = ' ';
-                append_perf_callsite(p, end, ev.callsite);
+                writer.append_dec(ev.pid);  // prev
+                writer.append(' ');
+                writer.append_dec(ev.data);  // next
+                writer.append(' ');
+                writer.append_dec(static_cast<uint64_t>(ev.lag_v >= 0 ? ev.lag_v : 0U));
+                writer.append(' ');
+                writer.append_dec(ev.flags);
+                writer.append(' ');
+                writer.append_dec(ev.aux);
+                writer.append(' ');
+                append_perf_callsite(writer, ev.callsite);
             } else if (static_cast<ker::mod::perf::PerfEventType>(ev.type) == ker::mod::perf::PerfEventType::CONTAINER_STAT) {
                 // CONTAINER_STAT: C <ts> <cpu> <pid> <subsys_name> <flags> <count> <capacity> <callsite>
                 auto const SUBSYS_ID = static_cast<uint8_t>(ev.data >> 32);
-                append_dec64(p, end, ev.pid);
-                *p++ = ' ';
-                append_sconst(p, end, ker::mod::perf::subsystem_name(static_cast<ker::mod::perf::PerfSubsystem>(SUBSYS_ID)));
-                *p++ = ' ';
-                append_dec64(p, end, ev.flags);
-                *p++ = ' ';
-                if (ev.lag_v < 0 && p + 1 < end) {
-                    *p++ = '-';
-                }
-                append_dec64(p, end, static_cast<uint64_t>(ev.lag_v >= 0 ? ev.lag_v : -ev.lag_v));
-                *p++ = ' ';
-                append_dec64(p, end, ev.aux);
-                *p++ = ' ';
-                append_perf_callsite(p, end, ev.callsite);
+                writer.append_dec(ev.pid);
+                writer.append(' ');
+                writer.append(ker::mod::perf::subsystem_name(static_cast<ker::mod::perf::PerfSubsystem>(SUBSYS_ID)));
+                writer.append(' ');
+                writer.append_dec(ev.flags);
+                writer.append(' ');
+                writer.append_signed(ev.lag_v);
+                writer.append(' ');
+                writer.append_dec(ev.aux);
+                writer.append(' ');
+                append_perf_callsite(writer, ev.callsite);
             } else if (static_cast<ker::mod::perf::PerfEventType>(ev.type) == ker::mod::perf::PerfEventType::WKI) {
                 ker::mod::perf::WkiPerfScope scope = ker::mod::perf::WkiPerfScope::NONE;
                 ker::mod::perf::WkiPerfPhase phase = ker::mod::perf::WkiPerfPhase::POINT;
@@ -4016,55 +4067,52 @@ auto generate_kperf(char* buf, size_t bufsz) -> size_t {
                 uint16_t channel = 0;
                 ker::mod::perf::wki_unpack_event_data(ev.data, scope, op, phase, peer, channel);
 
-                append_dec64(p, end, ev.pid);
-                *p++ = ' ';
-                append_sconst(p, end, ker::mod::perf::wki_scope_name(scope));
-                *p++ = ' ';
-                append_sconst(p, end, ker::mod::perf::wki_op_name(scope, op));
-                *p++ = ' ';
-                append_sconst(p, end, ker::mod::perf::wki_phase_name(phase));
-                *p++ = ' ';
-                append_dec64(p, end, peer);
-                *p++ = ' ';
-                append_dec64(p, end, channel);
-                *p++ = ' ';
-                append_dec64(p, end, ker::mod::perf::wki_unpack_trace_correlation(ev.lag_v));
-                *p++ = ' ';
-                if (ker::mod::perf::wki_unpack_trace_status(ev.lag_v) < 0 && p + 1 < end) {
-                    *p++ = '-';
-                }
-                append_dec64(p, end,
-                             static_cast<uint64_t>(ker::mod::perf::wki_unpack_trace_status(ev.lag_v) < 0
-                                                       ? -ker::mod::perf::wki_unpack_trace_status(ev.lag_v)
-                                                       : ker::mod::perf::wki_unpack_trace_status(ev.lag_v)));
-                *p++ = ' ';
-                append_dec64(p, end, ev.aux);
-                *p++ = ' ';
+                writer.append_dec(ev.pid);
+                writer.append(' ');
+                writer.append(ker::mod::perf::wki_scope_name(scope));
+                writer.append(' ');
+                writer.append(ker::mod::perf::wki_op_name(scope, op));
+                writer.append(' ');
+                writer.append(ker::mod::perf::wki_phase_name(phase));
+                writer.append(' ');
+                writer.append_dec(peer);
+                writer.append(' ');
+                writer.append_dec(channel);
+                writer.append(' ');
+                writer.append_dec(ker::mod::perf::wki_unpack_trace_correlation(ev.lag_v));
+                writer.append(' ');
+                writer.append_signed(ker::mod::perf::wki_unpack_trace_status(ev.lag_v));
+                writer.append(' ');
+                writer.append_dec(ev.aux);
+                writer.append(' ');
                 if (scope == ker::mod::perf::WkiPerfScope::LOCAL_VMEM ||
                     (scope == ker::mod::perf::WkiPerfScope::LOCAL_LOADER &&
                      (op == static_cast<uint8_t>(ker::mod::perf::WkiPerfLocalLoaderOp::PT_LOAD_MAIN) ||
                       op == static_cast<uint8_t>(ker::mod::perf::WkiPerfLocalLoaderOp::PT_LOAD_INTERP)))) {
-                    append_hex64(p, end, ev.callsite);
+                    writer.append_hex(ev.callsite);
                 } else {
-                    append_perf_callsite(p, end, ev.callsite);
+                    append_perf_callsite(writer, ev.callsite);
                 }
             } else {
                 // WAKE or SLEEP
-                append_dec64(p, end, ev.pid);
-                *p++ = ' ';
-                append_dec64(p, end, ev.data);  // wakeAtUs
-                *p++ = ' ';
-                append_dec64(p, end, ev.aux);
-                *p++ = ' ';
-                append_dec64(p, end, ev.flags);
-                *p++ = ' ';
-                append_perf_callsite(p, end, ev.callsite);
-                *p++ = ' ';
+                writer.append_dec(ev.pid);
+                writer.append(' ');
+                writer.append_dec(ev.data);  // wakeAtUs
+                writer.append(' ');
+                writer.append_dec(ev.aux);
+                writer.append(' ');
+                writer.append_dec(ev.flags);
+                writer.append(' ');
+                append_perf_callsite(writer, ev.callsite);
+                writer.append(' ');
                 auto const* wait_channel = reinterpret_cast<const char*>(static_cast<uint64_t>(ev.lag_v));
-                append_sconst(p, end, wait_channel != nullptr ? wait_channel : "-");
+                writer.append(wait_channel != nullptr ? wait_channel : "-");
             }
-            if (p + 1 < end) {
-                *p++ = '\n';
+            writer.append('\n');
+            if (!writer.complete()) {
+                p = EVENT_START;
+                output_full = true;
+                break;
             }
         }
         if (n < 64) {

@@ -60,6 +60,8 @@ add_executable(wosdbg
     wosdbg.h
     wosdbg.cpp
     log_processor.cpp
+    telemetry_log.h
+    telemetry_log.cpp
     log_server.cpp
     log_client.cpp
     debug_analysis_service.h
@@ -119,6 +121,7 @@ target_link_libraries(wosdbg
     Qt6::Core
     Qt6::Widgets
     Qt6::Network
+    wos::telemetry
     ${CAPSTONE_LIBRARIES}
     ${LIBARCHIVE_LIBRARIES}
     LLVMDemangle
@@ -233,6 +236,13 @@ if(BUILD_TESTING)
                 --require-incident-tools
     )
     set_tests_properties(wosdbg_incident_cli_semantic_test PROPERTIES TIMEOUT 180)
+    add_test(
+        NAME wosdbg_telemetry_jsonl_semantic_test
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/telemetry_jsonl_semantic_test.py
+                --wosdbg $<TARGET_FILE:wosdbg>
+    )
+    set_tests_properties(wosdbg_telemetry_jsonl_semantic_test PROPERTIES TIMEOUT 120)
 endif()
 
 option(WOSDBG_BUILD_FUZZERS "Build bounded WOSDBG parser fuzz targets" OFF)

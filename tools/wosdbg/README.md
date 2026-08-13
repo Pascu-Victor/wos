@@ -167,13 +167,17 @@ The catalog is grouped here by debugging job:
   `reconstruct_wki_trace`, `build_distributed_timeline`,
   `explain_remote_exec_path`, and `diagnose_remote_exec_corruption`.
 
+`load_log` also accepts bounded `wos.telemetry` JSONL records from journal,
+perf, and strace. It retains the canonical envelope and exact decimal identity,
+timestamp, and correlation strings while preserving the legacy text loader.
+
 `build_distributed_timeline` accepts multiple loaded logs, selects direct query
 matches, optionally includes nearby context, expands normalized distributed
 identifiers (`cookie`, request/task/resource IDs, peer, PID, FD, channel, and
 sequence), and reports:
 
 - per-log lanes and stable row positions;
-- timestamp-ordered events when log clocks are present;
+- timestamp-ordered events within explicit clock partitions;
 - explicit clock quality when only per-log ordering is trustworthy;
 - identifiers observed across more than one log/resource;
 - bounded/truncated status, with fair sampling across lanes.

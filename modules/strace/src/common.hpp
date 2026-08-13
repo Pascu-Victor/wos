@@ -20,11 +20,13 @@ struct TraceOptions {
     bool follow_forks = false;
     bool output_separately = false;
     bool append_output = false;
+    bool structured = false;
     std::string output_path;
 };
 
 struct PendingSyscall {
     bool valid = false;
+    uint64_t sequence = 0;
     uint64_t callnum = 0;
     uint64_t a1 = 0;
     uint64_t a2 = 0;

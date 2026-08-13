@@ -344,6 +344,8 @@ if(WOS_UASAN)
     endforeach()
 endif()
 
+add_subdirectory("${WOS_REPO_ROOT}/shared/telemetry" "${CMAKE_CURRENT_BINARY_DIR}/shared/telemetry")
+
 add_subdirectory(init)
 add_subdirectory(testprog)
 add_subdirectory(testd)

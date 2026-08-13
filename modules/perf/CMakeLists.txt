@@ -24,6 +24,8 @@ set(SOURCES
     src/data.cpp
     src/main.cpp
     src/map.cpp
+    src/perf_data.cpp
+    src/perf_event_json.cpp
     src/run.cpp
     src/sched.cpp
     src/support.cpp
@@ -38,4 +40,4 @@ set_target_properties(perf PROPERTIES
     LINK_FLAGS "-Wl,-z,now -Wl,--no-dynamic-linker"
 )
 
-target_link_libraries(perf c++abi c++ c unwind)
+target_link_libraries(perf wos::telemetry c++abi c++ c unwind)

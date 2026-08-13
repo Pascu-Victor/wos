@@ -1002,19 +1002,19 @@ auto DebugAnalysisService::tool_catalog() -> QJsonObject {
                     {"inputSchema", schema({{"logId", QJsonObject{{"type", "string"}}},
                                             {"filter", QJsonObject{{"type", "string"}}},
                                             {"maxHits", QJsonObject{{"type", "integer"}}}})}},
-        QJsonObject{
-            {"name", "wosdbg.build_distributed_timeline"},
-            {"description",
-             "Build a bounded multi-log incident timeline. Select events with query/regex, expand related events using common "
-             "distributed identifiers (cookie, request, task, resource, peer, pid, fd), and report per-log lanes plus identifiers "
-             "that cross resource boundaries. Timestamped events are globally ordered; logs without clocks retain per-log row order."},
-            {"inputSchema", schema({{"logIds", QJsonObject{{"type", "array"}, {"items", QJsonObject{{"type", "string"}}}}},
-                                    {"query", QJsonObject{{"type", "string"}}},
-                                    {"regex", QJsonObject{{"type", "boolean"}}},
-                                    {"correlationKeys", QJsonObject{{"type", "array"}, {"items", QJsonObject{{"type", "string"}}}}},
-                                    {"expandCorrelations", QJsonObject{{"type", "boolean"}}},
-                                    {"maxEvents", QJsonObject{{"type", "integer"}}},
-                                    {"context", QJsonObject{{"type", "integer"}}}})}},
+        QJsonObject{{"name", "wosdbg.build_distributed_timeline"},
+                    {"description",
+                     "Build a bounded multi-log incident timeline. Select events with query/regex, expand related events using common "
+                     "distributed identifiers (cookie, request, task, resource, peer, pid, fd), and report per-log lanes plus identifiers "
+                     "that cross resource boundaries. Timestamped events are ordered within proven clock partitions; a global order is "
+                     "returned only when manifest and record metadata prove comparability."},
+                    {"inputSchema", schema({{"logIds", QJsonObject{{"type", "array"}, {"items", QJsonObject{{"type", "string"}}}}},
+                                            {"query", QJsonObject{{"type", "string"}}},
+                                            {"regex", QJsonObject{{"type", "boolean"}}},
+                                            {"correlationKeys", QJsonObject{{"type", "array"}, {"items", QJsonObject{{"type", "string"}}}}},
+                                            {"expandCorrelations", QJsonObject{{"type", "boolean"}}},
+                                            {"maxEvents", QJsonObject{{"type", "integer"}}},
+                                            {"context", QJsonObject{{"type", "integer"}}}})}},
         QJsonObject{
             {"name", "wosdbg.explain_remote_exec_path"},
             {"description",

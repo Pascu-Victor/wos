@@ -135,4 +135,5 @@ enable_testing()
 # Subdirectories
 # ---------------------------------------------------------------------------
 
+add_subdirectory("${WOS_ROOT}/shared/telemetry" "${CMAKE_CURRENT_BINARY_DIR}/shared/telemetry")
 add_subdirectory(host)

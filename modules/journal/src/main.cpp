@@ -14,9 +14,12 @@
 #include <cstdlib>
 #include <cstring>
 #include <iterator>
+#include <optional>
+#include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
+#include <wos/telemetry.hpp>
 
 #include "callnums/sys_log.h"
 
@@ -156,7 +159,10 @@ auto valid_record(const JournalRecord& rec) -> bool {
     return bounded_string_length(rec.message, static_cast<size_t>(rec.message_len) + 1) == rec.message_len;
 }
 
-auto read_journal_record(int fd, JournalRecord& rec) -> bool {
+auto read_journal_record(int fd, JournalRecord& rec, bool* partial_record = nullptr) -> bool {
+    if (partial_record != nullptr) {
+        *partial_record = false;
+    }
     auto* out = reinterpret_cast<char*>(&rec);
     size_t done = 0;
     while (done < sizeof(rec)) {
@@ -165,6 +171,9 @@ auto read_journal_record(int fd, JournalRecord& rec) -> bool {
             continue;
         }
         if (N <= 0) {
+            if (partial_record != nullptr && done != 0) {
+                *partial_record = true;
+            }
             return false;
         }
         done += static_cast<size_t>(N);
@@ -172,8 +181,11 @@ auto read_journal_record(int fd, JournalRecord& rec) -> bool {
     return true;
 }
 
-auto read_journal_batch(int fd, std::array<JournalRecord, 16>& batch, size_t& count) -> bool {
+auto read_journal_batch(int fd, std::array<JournalRecord, 16>& batch, size_t& count, bool* malformed_batch = nullptr) -> bool {
     count = 0;
+    if (malformed_batch != nullptr) {
+        *malformed_batch = false;
+    }
     for (;;) {
         ssize_t const N = read(fd, batch.data(), batch.size() * sizeof(JournalRecord));
         if (N < 0 && errno == EINTR) {
@@ -182,7 +194,11 @@ auto read_journal_batch(int fd, std::array<JournalRecord, 16>& batch, size_t& co
         if (N <= 0) {
             return false;
         }
-        count = static_cast<size_t>(N) / sizeof(JournalRecord);
+        const size_t BYTES = static_cast<size_t>(N);
+        if (malformed_batch != nullptr && (BYTES % sizeof(JournalRecord)) != 0) {
+            *malformed_batch = true;
+        }
+        count = BYTES / sizeof(JournalRecord);
         return count > 0;
     }
 }
@@ -195,6 +211,7 @@ struct Options {
     const char* module = nullptr;
     size_t tail = 0;
     uint64_t since_us = 0;
+    bool structured = false;
 };
 
 auto record_matches(const JournalRecord& rec, const Options& opts) -> bool {
@@ -237,14 +254,121 @@ auto print_record(const JournalRecord& rec) -> bool {
     return write_all(STDOUT_FILENO, line.data(), cursor);
 }
 
-void load_records_from_fd(int fd, std::vector<JournalRecord>& records) {
+auto node_identity() -> const std::string& {
+    static const std::string NAME = [] {
+        std::array<char, 256> hostname{};
+        if (gethostname(hostname.data(), hostname.size() - 1) != 0 || hostname.front() == '\0') {
+            return std::string{};
+        }
+        return std::string(hostname.data(), bounded_string_length(hostname.data(), hostname.size()));
+    }();
+    return NAME;
+}
+
+auto hex_bytes(const void* data, size_t size) -> std::string {
+    constexpr std::string_view DIGITS = "0123456789abcdef";
+    const auto* bytes = static_cast<const unsigned char*>(data);
+    std::string result(size * 2, '0');
+    for (size_t index = 0; index < size; ++index) {
+        result[index * 2] = DIGITS[bytes[index] >> 4U];
+        result[index * 2 + 1] = DIGITS[bytes[index] & 0x0fU];
+    }
+    return result;
+}
+
+auto telemetry_text(std::string_view text, bool& valid_utf8) -> wos::telemetry::Value {
+    const auto probe = wos::telemetry::serialize(wos::telemetry::Value(text));
+    valid_utf8 = static_cast<bool>(probe);
+    return valid_utf8 ? wos::telemetry::Value(text) : wos::telemetry::Value(nullptr);
+}
+
+auto structured_record(const JournalRecord& rec) -> std::optional<std::string> {
+    namespace telemetry = wos::telemetry;
+
+    telemetry::Value::Object identity{
+        {"boot_id", telemetry::Value::unsigned_integer(rec.boot_id)},
+        {"pid", telemetry::Value::unsigned_integer(rec.pid)},
+        {"tid", telemetry::Value::unsigned_integer(rec.tid)},
+        {"cpu", telemetry::Value::number(telemetry::decimal_u64_string(rec.cpu))},
+    };
+    if (!node_identity().empty()) {
+        identity.emplace("node_id", node_identity());
+    }
+    telemetry::Value::Object clock{
+        {"domain", telemetry::Value("boot_monotonic")},
+        {"value", telemetry::Value::unsigned_integer(rec.monotonic_us)},
+        {"unit", telemetry::Value("us")},
+        {"quality", telemetry::Value("local")},
+    };
+    telemetry::Value::Object correlation{
+        {"journal_sequence", telemetry::Value::unsigned_integer(rec.sequence)},
+    };
+    telemetry::Value::Array reserved0;
+    reserved0.reserve(std::size(rec.reserved0));
+    for (const auto value : rec.reserved0) {
+        reserved0.push_back(telemetry::Value::number(telemetry::decimal_u64_string(value)));
+    }
+    const std::string module(rec.module, bounded_string_length(rec.module, ker::abi::sys_log::JOURNAL_MODULE_MAX));
+    const std::string message(rec.message, rec.message_len);
+    bool module_utf8 = false;
+    bool message_utf8 = false;
+    auto module_value = telemetry_text(module, module_utf8);
+    auto message_value = telemetry_text(message, message_utf8);
+    telemetry::Value::Object payload{
+        {"magic", telemetry::Value::unsigned_integer(rec.magic)},
+        {"record_version", telemetry::Value::number(telemetry::decimal_u64_string(rec.version))},
+        {"header_size", telemetry::Value::number(telemetry::decimal_u64_string(rec.header_size))},
+        {"sequence", telemetry::Value::unsigned_integer(rec.sequence)},
+        {"boot_id", telemetry::Value::unsigned_integer(rec.boot_id)},
+        {"monotonic_us", telemetry::Value::unsigned_integer(rec.monotonic_us)},
+        {"pid", telemetry::Value::unsigned_integer(rec.pid)},
+        {"tid", telemetry::Value::unsigned_integer(rec.tid)},
+        {"cpu", telemetry::Value::number(telemetry::decimal_u64_string(rec.cpu))},
+        {"level", telemetry::Value::number(telemetry::decimal_u64_string(rec.level))},
+        {"level_name", telemetry::Value(level_name(rec.level))},
+        {"reserved0", telemetry::Value(std::move(reserved0))},
+        {"flags", telemetry::Value::unsigned_integer(rec.flags)},
+        {"module", std::move(module_value)},
+        {"module_utf8", telemetry::Value(module_utf8)},
+        {"module_bytes_hex", telemetry::Value(hex_bytes(module.data(), module.size()))},
+        {"message_len", telemetry::Value::number(telemetry::decimal_u64_string(rec.message_len))},
+        {"reserved1", telemetry::Value::number(telemetry::decimal_u64_string(rec.reserved1))},
+        {"message", std::move(message_value)},
+        {"message_utf8", telemetry::Value(message_utf8)},
+        {"message_bytes_hex", telemetry::Value(hex_bytes(message.data(), message.size()))},
+        {"raw_record_hex", telemetry::Value(hex_bytes(&rec, sizeof(rec)))},
+    };
+    auto encoded = telemetry::serialize(telemetry::make_envelope("journal", rec.version, "journal.record", std::move(identity),
+                                                                 std::move(clock), std::move(correlation), std::move(payload)));
+    if (!encoded) {
+        return std::nullopt;
+    }
+    encoded.text->push_back('\n');
+    return std::move(*encoded.text);
+}
+
+auto emit_record(const JournalRecord& rec, const Options& opts) -> bool {
+    if (!opts.structured) {
+        return print_record(rec);
+    }
+    auto line = structured_record(rec);
+    return line && write_all(STDOUT_FILENO, line->data(), line->size());
+}
+
+void load_records_from_fd(int fd, std::vector<JournalRecord>& records, bool* invalid_seen = nullptr) {
     JournalRecord rec{};
     for (;;) {
-        if (!read_journal_record(fd, rec)) {
+        bool partial_record = false;
+        if (!read_journal_record(fd, rec, &partial_record)) {
+            if (partial_record && invalid_seen != nullptr) {
+                *invalid_seen = true;
+            }
             break;
         }
         if (valid_record(rec)) {
             records.push_back(rec);
+        } else if (invalid_seen != nullptr) {
+            *invalid_seen = true;
         }
     }
 }
@@ -326,7 +450,8 @@ auto run_daemon() -> int {
 }
 
 void usage() {
-    constexpr std::string_view USAGE = "usage: journalctl [-k] [-p level] [-u module|-m module] [-n count] [-f] [--since usec]\n";
+    constexpr std::string_view USAGE =
+        "usage: journalctl [-k] [-p level] [-u module|-m module] [-n count] [-f] [--since usec] [--structured]\n";
     (void)write_all(STDOUT_FILENO, USAGE.data(), USAGE.size());
 }
 
@@ -349,6 +474,8 @@ auto parse_args(int argc, char** argv, Options& opts) -> bool {
             opts.tail = static_cast<size_t>(strtoull(argv[++i], nullptr, 10));
         } else if (ARG == "--since" && i + 1 < argc) {
             opts.since_us = static_cast<uint64_t>(strtoull(argv[++i], nullptr, 10));
+        } else if (ARG == "--structured") {
+            opts.structured = true;
         } else {
             return false;
         }
@@ -358,12 +485,13 @@ auto parse_args(int argc, char** argv, Options& opts) -> bool {
 
 auto run_query(const Options& opts) -> int {
     std::vector<JournalRecord> records;
+    bool invalid_seen = false;
     uint64_t persisted_boot = 0;
     uint64_t persisted_latest = 0;
 
     int const FILE = open(JOURNAL_FILE, O_RDONLY);
     if (FILE >= 0) {
-        load_records_from_fd(FILE, records);
+        load_records_from_fd(FILE, records, &invalid_seen);
         close(FILE);
         for (const auto& rec : records) {
             persisted_boot = rec.boot_id;
@@ -374,13 +502,21 @@ auto run_query(const Options& opts) -> int {
     int const DEV = open(JOURNAL_DEVICE, O_RDONLY);
     if (DEV >= 0) {
         std::vector<JournalRecord> live;
-        load_records_from_fd(DEV, live);
+        load_records_from_fd(DEV, live, &invalid_seen);
         for (const auto& rec : live) {
             if (rec.boot_id == persisted_boot && rec.sequence <= persisted_latest) {
                 continue;
             }
             records.push_back(rec);
         }
+    }
+
+    if (opts.structured && invalid_seen) {
+        std::fprintf(stderr, "journalctl: structured export rejected an unsupported or malformed JournalRecord\n");
+        if (DEV >= 0) {
+            close(DEV);
+        }
+        return 1;
     }
 
     std::vector<JournalRecord> filtered;
@@ -395,7 +531,7 @@ auto run_query(const Options& opts) -> int {
         start = filtered.size() - opts.tail;
     }
     for (auto it = std::next(filtered.cbegin(), static_cast<ptrdiff_t>(start)); it != filtered.cend(); ++it) {
-        if (!print_record(*it)) {
+        if (!emit_record(*it, opts)) {
             report_errno("journalctl: failed to write output");
             if (DEV >= 0) {
                 close(DEV);
@@ -408,14 +544,30 @@ auto run_query(const Options& opts) -> int {
         for (;;) {
             std::array<JournalRecord, 16> batch{};
             size_t records = 0;
-            if (!read_journal_batch(DEV, batch, records)) {
+            bool malformed_batch = false;
+            if (!read_journal_batch(DEV, batch, records, &malformed_batch)) {
+                if (opts.structured && malformed_batch) {
+                    std::fprintf(stderr, "journalctl: structured follow rejected a partial JournalRecord batch\n");
+                    close(DEV);
+                    return 1;
+                }
                 sleep_short();
                 continue;
             }
+            if (opts.structured && malformed_batch) {
+                std::fprintf(stderr, "journalctl: structured follow rejected a partial JournalRecord batch\n");
+                close(DEV);
+                return 1;
+            }
             for (size_t i = 0; i < records; i++) {
                 const auto& rec = *std::next(batch.begin(), static_cast<ptrdiff_t>(i));
+                if (opts.structured && !valid_record(rec)) {
+                    std::fprintf(stderr, "journalctl: structured follow rejected an unsupported or malformed JournalRecord\n");
+                    close(DEV);
+                    return 1;
+                }
                 if (record_matches(rec, opts)) {
-                    if (!print_record(rec)) {
+                    if (!emit_record(rec, opts)) {
                         report_errno("journalctl: failed to write output");
                         close(DEV);
                         return 1;
@@ -439,6 +591,10 @@ int main(int argc, char** argv) {  // NOLINT(bugprone-exception-escape): userspa
         opts.daemon = true;
     }
     if (!parse_args(argc, argv, opts)) {
+        usage();
+        return 1;
+    }
+    if (opts.daemon && opts.structured) {
         usage();
         return 1;
     }

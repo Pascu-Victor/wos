@@ -1,5 +1,6 @@
 #pragma once
 
+#include <QJsonObject>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -28,6 +29,13 @@ struct LogEntry {
     // Source code mapping
     std::string source_file;
     int source_line{0};
+
+    // Canonical telemetry metadata is retained by local/backend parsers. The
+    // legacy GUI QDataStream projection intentionally does not serialize
+    // these fields, keeping that protocol byte-for-byte compatible.
+    bool has_telemetry_envelope{false};
+    std::string telemetry_json;
+    QJsonObject telemetry_envelope;
 
     LogEntry() = default;
 };

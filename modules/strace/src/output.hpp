@@ -14,6 +14,7 @@ struct TraceOutput {
     FILE* stream = stdout;
     bool close_stream = false;
     bool valid = true;
+    bool write_failed = false;
 };
 
 auto open_trace_output(uint64_t pid, const TraceOptions& options) -> TraceOutput;

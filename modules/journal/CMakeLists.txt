@@ -29,7 +29,7 @@ target_link_options(journal PRIVATE
     "-Wl,-z,now"
 )
 
-target_link_libraries(journal PRIVATE c++abi c++ c unwind)
+target_link_libraries(journal PRIVATE wos::telemetry c++abi c++ c unwind)
 
 add_library(journal_lib SHARED src/journal_lib.cpp)
 set_target_properties(journal_lib PROPERTIES

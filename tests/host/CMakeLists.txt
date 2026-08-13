@@ -781,6 +781,20 @@ wos_add_unit_test(reclaim_policy_test
     SOURCES      ${CMAKE_CURRENT_SOURCE_DIR}/unit/reclaim_policy_test.cpp
 )
 
+wos_add_unit_test(telemetry_test
+    SOURCES      ${CMAKE_CURRENT_SOURCE_DIR}/unit/telemetry_test.cpp
+)
+target_link_libraries(telemetry_test PRIVATE wos::telemetry)
+
+wos_add_unit_test(perf_data_test
+    SOURCES
+        ${CMAKE_CURRENT_SOURCE_DIR}/unit/perf_data_test.cpp
+        ${WOS_ROOT}/modules/perf/src/perf_data.cpp
+        ${WOS_ROOT}/modules/perf/src/perf_event_json.cpp
+)
+target_include_directories(perf_data_test PRIVATE ${WOS_ROOT}/modules/perf/src)
+target_link_libraries(perf_data_test PRIVATE wos::telemetry)
+
 # ---------------------------------------------------------------------------
 # Fuzz targets
 # ---------------------------------------------------------------------------
@@ -808,3 +822,16 @@ wos_add_fuzz_target(wki_routing_fuzz
 wos_add_fuzz_target(slab_fuzz
     SOURCES     ${CMAKE_CURRENT_SOURCE_DIR}/fuzz/slab_fuzz.cpp
 )
+
+wos_add_fuzz_target(telemetry_fuzz
+    SOURCES     ${CMAKE_CURRENT_SOURCE_DIR}/fuzz/telemetry_fuzz.cpp
+)
+target_link_libraries(telemetry_fuzz PRIVATE wos::telemetry)
+
+wos_add_fuzz_target(perf_data_fuzz
+    SOURCES
+        ${CMAKE_CURRENT_SOURCE_DIR}/fuzz/perf_data_fuzz.cpp
+        ${WOS_ROOT}/modules/perf/src/perf_data.cpp
+)
+target_include_directories(perf_data_fuzz PRIVATE ${WOS_ROOT}/modules/perf/src)
+target_link_libraries(perf_data_fuzz PRIVATE wos::telemetry)

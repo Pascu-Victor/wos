@@ -96,7 +96,7 @@ void LogServer::on_new_connection() {
 
     QDir dir(QDir::currentPath());
     QStringList filters;
-    filters << "*.log" << "*.txt";
+    filters << "*.log" << "*.txt" << "*.jsonl";
     QStringList files = dir.entryList(filters, QDir::Files, QDir::Name);
 
     std::ranges::sort(files, [](const QString& a, const QString& b) {
@@ -366,7 +366,7 @@ void LogServer::process_message(MessageType type, QDataStream& in) {
         case MessageType::REQUEST_FILE_LIST: {
             QDir dir(QDir::currentPath());
             QStringList filters;
-            filters << "*.log" << "*.txt";
+            filters << "*.log" << "*.txt" << "*.jsonl";
             QStringList files = dir.entryList(filters, QDir::Files, QDir::Name);
 
             std::ranges::sort(files, [](const QString& a, const QString& b) {

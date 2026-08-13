@@ -89,6 +89,11 @@ class DebugAnalysisService : public QObject {
         QString id;
         QString path;
         QString display_name;
+        QString node_id;
+        QString clock_domain;
+        bool clock_synchronized = false;
+        bool clock_comparable_across_nodes = false;
+        bool telemetry_input = false;
         std::vector<LogEntry> entries;
     };
 
@@ -177,6 +182,7 @@ class DebugAnalysisService : public QObject {
     };
 
     [[nodiscard]] const LogSession* find_log_session(const QString& id) const;
+    LogSession* find_log_session(const QString& id);
     [[nodiscard]] const DumpSession* find_dump_session(const QString& id) const;
     DumpSession* find_dump_session(const QString& id);
     [[nodiscard]] const IncidentSession* find_incident_session(const QString& id) const;

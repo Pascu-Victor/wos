@@ -11,6 +11,38 @@
 #include "perf.hpp"
 
 namespace perf {
+namespace {
+
+auto perf_node_name() -> const std::string& {
+    static const std::string NAME = [] {
+        std::array<char, 256> hostname{};
+        if (gethostname(hostname.data(), hostname.size() - 1) != 0 || hostname.front() == '\0') {
+            return std::string{};
+        }
+        return std::string(hostname.data());
+    }();
+    return NAME;
+}
+
+auto legacy_event_body(std::string_view snapshot, bool sectioned, std::string& error) -> std::optional<std::string_view> {
+    if (!sectioned) {
+        return snapshot;
+    }
+    std::size_t const START = snapshot.find(SECTION_EVENTS);
+    if (START == std::string_view::npos) {
+        error = "legacy perf.data has no EVENTS section";
+        return std::nullopt;
+    }
+    std::size_t const BODY_START = START + SECTION_EVENTS.size();
+    std::size_t const END = snapshot.find(SECTION_EVENTS_END, BODY_START);
+    if (END == std::string_view::npos) {
+        error = "legacy EVENTS section is unterminated";
+        return std::nullopt;
+    }
+    return snapshot.substr(BODY_START, END - BODY_START);
+}
+
+}  // namespace
 
 auto parse_proc_map_section(std::string_view buffer) -> std::vector<ProcMapEntry> {
     std::vector<ProcMapEntry> entries;
@@ -564,6 +596,68 @@ auto next_event(std::string_view text, std::size_t& pos, bool sectioned, EventIn
         }
     }
     return false;
+}
+
+auto build_typed_perf_events(std::string_view legacy_snapshot, std::string& error) -> std::optional<TypedPerfEvents> {
+    bool const SECTIONED = legacy_snapshot.starts_with(SECTION_HEADER);
+    auto body = legacy_event_body(legacy_snapshot, SECTIONED, error);
+    if (!body.has_value()) {
+        return std::nullopt;
+    }
+
+    std::optional<int64_t> const REALTIME_OFFSET = parse_timebase_offset(legacy_snapshot, SECTIONED);
+    TypedPerfEvents result;
+    std::size_t pos = 0;
+    while (pos < body->size()) {
+        std::string_view const LINE = next_line(*body, pos);
+        if (LINE.empty()) {
+            continue;
+        }
+        EventInfo event{};
+        if (!parse_event_line(LINE, event)) {
+            error = "legacy EVENTS section contains an invalid event record";
+            return std::nullopt;
+        }
+        if (result.record_count >= perf_data::MAX_TYPED_EVENT_RECORDS) {
+            error = "legacy EVENTS section exceeds the event-count limit";
+            return std::nullopt;
+        }
+
+        TypedEventRecord const RECORD{
+            .type = event.type,
+            .ts_ns = event.ts_ns,
+            .cpu = event.cpu,
+            .pid = event.pid,
+            .other_pid = event.other_pid,
+            .data = event.data,
+            .callsite = event.callsite,
+            .subsystem = event.subsys_name,
+            .scope = event.scope_name,
+            .operation = event.op_name,
+            .phase = event.phase_name,
+            .lag = event.lag,
+            .flags = event.flags,
+            .aux = event.aux,
+            .peer = event.peer,
+            .channel = event.channel,
+            .correlation = event.correlation,
+            .status = event.status,
+            .wait_channel = event.wait_channel,
+        };
+        auto serialized = serialize_typed_perf_event(RECORD, REALTIME_OFFSET, perf_node_name(), error);
+        if (!serialized.has_value()) {
+            return std::nullopt;
+        }
+        if (result.jsonl.size() >= perf_data::MAX_TYPED_EVENTS_BYTES ||
+            serialized->size() > perf_data::MAX_TYPED_EVENTS_BYTES - result.jsonl.size() - 1) {
+            error = "typed-events payload exceeds the byte limit";
+            return std::nullopt;
+        }
+        result.jsonl += *serialized;
+        result.jsonl.push_back('\n');
+        ++result.record_count;
+    }
+    return result;
 }
 
 auto comm_of_pid(const std::vector<ProcMapEntry>& proc_map, uint64_t pid) -> std::string_view {

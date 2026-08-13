@@ -235,6 +235,16 @@ auto read_fd(ScopedFd& fd, std::size_t initial_capacity, std::size_t max_bytes) 
 }
 
 auto read_file(std::string_view path, std::size_t initial_capacity) -> std::optional<std::string> {
+    if (path == PERF_DATA_FILE) {
+        auto loaded = perf_data::load(path);
+        if (loaded.status != perf_data::LoadStatus::OK || !loaded.file.has_value()) {
+            if (loaded.status == perf_data::LoadStatus::FORMAT_ERROR) {
+                std::println(stderr, "perf: rejected {}: {}", path, loaded.error);
+            }
+            return std::nullopt;
+        }
+        return std::move(loaded.file->legacy_snapshot);
+    }
     ScopedFd fd = open_readonly(path);
     if (!fd.valid()) {
         return std::nullopt;
@@ -707,11 +717,11 @@ void write_section_image_map(int fd, const std::vector<TrackedProc>* tracked) {
     write_all(fd, SECTION_IMAGE_MAP_END);
 }
 
-void save_perf_data() {
+auto save_perf_data() -> bool {
     ScopedFd const FD = open_write_trunc(PERF_DATA_FILE);
     if (!FD.valid()) {
         std::println("perf: cannot write {}", PERF_DATA_FILE);
-        return;
+        return false;
     }
 
     write_section_timebase(FD.get());
@@ -731,6 +741,99 @@ void save_perf_data() {
         std::println("perf: saved to {} ({} event bytes, {} summary bytes, {} IPC bytes, {} diag bytes)", PERF_DATA_FILE, event_bytes,
                      SUMMARY_BYTES, IPC_BYTES, DIAG_BYTES);
     }
+    return true;
+}
+
+auto finalize_structured_perf_data(std::string_view path) -> bool {
+    auto loaded = perf_data::load(path);
+    if (loaded.status != perf_data::LoadStatus::OK || !loaded.file.has_value()) {
+        std::println("perf: cannot create structured {}: {}", path,
+                     loaded.error.empty() ? "cannot read completed legacy snapshot" : loaded.error);
+        return false;
+    }
+    if (loaded.file->format == perf_data::Format::STRUCTURED_V1) {
+        std::println("perf: cannot create structured {}: input is already structured", path);
+        return false;
+    }
+
+    std::string error;
+    auto typed = build_typed_perf_events(loaded.file->legacy_snapshot, error);
+    if (!typed.has_value()) {
+        std::println("perf: cannot create structured {}: {}", path, error);
+        return false;
+    }
+    if (!perf_data::convert_legacy_file_atomic(path, typed->jsonl, typed->record_count, error)) {
+        std::println("perf: cannot create structured {}: {}", path, error);
+        return false;
+    }
+    std::println("perf: structured {} v{}.{} finalized atomically ({} typed events)", path, perf_data::CONTAINER_MAJOR,
+                 perf_data::CONTAINER_MINOR, typed->record_count);
+    return true;
+}
+
+auto cmd_data_export(std::string_view path) -> bool {
+    auto loaded = perf_data::load(path);
+    if (loaded.status != perf_data::LoadStatus::OK || !loaded.file.has_value()) {
+        std::println(stderr, "perf data-export: {}: {}", path, loaded.error.empty() ? "cannot read input" : loaded.error);
+        return false;
+    }
+
+    std::string output;
+    if (loaded.file->format == perf_data::Format::STRUCTURED_V1) {
+        output = std::move(loaded.file->typed_events_jsonl);
+    } else {
+        std::string error;
+        auto typed = build_typed_perf_events(loaded.file->legacy_snapshot, error);
+        if (!typed.has_value()) {
+            std::println(stderr, "perf data-export: {}: {}", path, error);
+            return false;
+        }
+        output = std::move(typed->jsonl);
+    }
+
+    std::size_t written = 0;
+    while (written < output.size()) {
+        ssize_t const count = write(STDOUT_FILENO, output.data() + written, output.size() - written);
+        if (count < 0 && errno == EINTR) {
+            continue;
+        }
+        if (count <= 0) {
+            std::println(stderr, "perf data-export: stdout write failed: {}", count < 0 ? strerror(errno) : "no progress");
+            return false;
+        }
+        written += static_cast<std::size_t>(count);
+    }
+    return true;
+}
+
+auto cmd_data_info(std::string_view path) -> bool {
+    auto loaded = perf_data::load(path);
+    if (loaded.status != perf_data::LoadStatus::OK || !loaded.file.has_value()) {
+        std::println("perf data-info: {}: {}", path, loaded.error.empty() ? "cannot read input" : loaded.error);
+        return false;
+    }
+
+    const auto& file = *loaded.file;
+    std::println("path: {}", path);
+    std::println("format: {}", perf_data::format_name(file.format));
+    std::println("encoded_bytes: {}", file.encoded_bytes);
+    std::println("legacy_snapshot_bytes: {}", file.legacy_snapshot.size());
+    if (file.format != perf_data::Format::STRUCTURED_V1) {
+        std::println("container_version: n/a");
+        std::println("integrity: not-present");
+        return true;
+    }
+
+    std::println("container_version: {}.{}", file.container_major, file.container_minor);
+    std::println("integrity: ok");
+    std::println("typed_event_records: {}", file.typed_event_records);
+    std::println("sections: {}", file.sections.size());
+    for (const auto& section : file.sections) {
+        std::println("  type={} name={} flags={:#x} bytes={} records={} crc32c={:08x}", section.type,
+                     perf_data::section_type_name(section.type), section.flags, section.payload_bytes, section.record_count,
+                     section.payload_crc32c);
+    }
+    return true;
 }
 
 void set_recording_enabled(bool enabled, const char* filter) {
@@ -797,7 +900,7 @@ void cmd_stat(int ms) {
     }
 }
 
-void cmd_record(int ms, const char* filter) {
+auto cmd_record(int ms, const char* filter, bool structured) -> bool {
     if (ms < 1) {
         ms = DEFAULT_SAMPLE_MS;
     }
@@ -805,7 +908,7 @@ void cmd_record(int ms, const char* filter) {
     ScopedFd const CONTROL_FD = open_writeonly(KPERFCTL_PATH);
     if (!CONTROL_FD.valid()) {
         std::println("perf: cannot open /proc/kperfctl");
-        return;
+        return false;
     }
 
     if (filter != nullptr) {
@@ -879,8 +982,10 @@ void cmd_record(int ms, const char* filter) {
     std::println("perf: recording stopped.");
 
     if (!data_fd.valid()) {
-        save_perf_data();
-        return;
+        if (!save_perf_data()) {
+            return false;
+        }
+        return !structured || finalize_structured_perf_data();
     }
 
     auto events = read_file(KPERF_PATH, PERF_DRAIN_CAPACITY);
@@ -924,6 +1029,8 @@ void cmd_record(int ms, const char* filter) {
         std::println("perf: saved to {} ({} event bytes, {} summary bytes, {} IPC bytes, {} diag bytes)", PERF_DATA_FILE, total_event_bytes,
                      SUMMARY_BYTES, IPC_BYTES, DIAG_BYTES);
     }
+    data_fd.reset();
+    return !structured || finalize_structured_perf_data();
 }
 
 }  // namespace perf

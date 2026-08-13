@@ -131,20 +131,28 @@ auto read_shebang(const char* path) -> std::string {
 
 }  // namespace
 
-void cmd_run(int argc, char** argv) {
+auto cmd_run(int argc, char** argv) -> bool {
     if (argc < 1) {
         std::println("perf run: no command specified");
-        return;
+        return false;
     }
 
     // Parse --filter=... option (strip from argv before exec)
     const char* filter = "switch,wake,sleep";  // default: no container spam
+    bool structured = false;
+    bool options_done = false;
     WkiDisplayOptions display_options{};
     std::vector<char*> cmd_argv;
     for (int i = 0; i < argc; i++) {
         std::string_view const ARG(argv[i]);
-        if (ARG.starts_with("--filter=")) {
+        if (options_done) {
+            cmd_argv.push_back(argv[i]);
+        } else if (ARG == "--") {
+            options_done = true;
+        } else if (ARG.starts_with("--filter=")) {
             filter = argv[i] + 9;
+        } else if (ARG == "--structured") {
+            structured = true;
         } else if (parse_display_arg(ARG, display_options)) {
             continue;
         } else {
@@ -156,14 +164,14 @@ void cmd_run(int argc, char** argv) {
 
     if (argc < 1) {
         std::println("perf run: no command specified");
-        return;
+        return false;
     }
 
     // Resolve the command to a full path (PATH search)
     std::string resolved = resolve_command(argv[0]);
     if (resolved.empty()) {
         std::println("perf run: command not found: {}", argv[0]);
-        return;
+        return false;
     }
 
     // Check if this is a script with a shebang - if so, wrap with the interpreter
@@ -174,7 +182,7 @@ void cmd_run(int argc, char** argv) {
         std::string interp_resolved = resolve_command(interp.c_str());
         if (interp_resolved.empty()) {
             std::println("perf run: interpreter not found: {} (from shebang in {})", interp, resolved);
-            return;
+            return false;
         }
         interp = std::move(interp_resolved);
 
@@ -215,7 +223,7 @@ void cmd_run(int argc, char** argv) {
     if (child_pid < 0) {
         std::println("perf run: fork failed ({})", child_pid);
         set_recording_enabled(false);
-        return;
+        return false;
     }
 
     ker::process::setpgid(child_pid, child_pid);
@@ -251,6 +259,7 @@ void cmd_run(int argc, char** argv) {
     };
 
     ScopedFd data_fd = open_write_trunc(PERF_DATA_FILE);
+    bool output_ok = data_fd.valid();
     if (data_fd.valid()) {
         write_section_timebase(data_fd.get());
         write_all(data_fd.get(), SECTION_EVENTS);
@@ -461,11 +470,16 @@ void cmd_run(int argc, char** argv) {
             std::println("perf: saved to {} ({} event bytes, {} summary bytes, {} IPC bytes, {} diag bytes)", PERF_DATA_FILE,
                          total_event_bytes, SUMMARY_BYTES, IPC_BYTES, DIAG_BYTES);
         }
+        data_fd.reset();
+        if (structured && !finalize_structured_perf_data()) {
+            output_ok = false;
+        }
     } else {
         std::println("perf: cannot write {}", PERF_DATA_FILE);
     }
 
     cmd_sched(DEFAULT_MAX_EVENTS, display_options);
+    return output_ok;
 }
 
 }  // namespace perf

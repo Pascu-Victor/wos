@@ -28,6 +28,9 @@
 #include <utility>
 #include <vector>
 
+#include "perf_data.hpp"
+#include "perf_event_json.hpp"
+
 namespace perf {
 
 constexpr uint8_t FLAG_USER_MODE = 0x01;
@@ -239,6 +242,11 @@ struct EventInfo {
     uint64_t correlation{};
     int32_t status{};
     std::string wait_channel;
+};
+
+struct TypedPerfEvents {
+    std::string jsonl;
+    uint64_t record_count{};
 };
 
 struct WkiSummaryRow {
@@ -483,7 +491,7 @@ auto write_section_contstat(int fd) -> ssize_t;
 auto write_section_memacc_alloc_totals(int fd) -> ssize_t;
 void write_section_peer_map(int fd);
 void write_section_image_map(int fd, const std::vector<TrackedProc>* tracked = nullptr);
-void save_perf_data();
+auto save_perf_data() -> bool;
 void set_recording_enabled(bool enabled, const char* filter = nullptr);
 
 auto parse_proc_map_section(std::string_view buffer) -> std::vector<ProcMapEntry>;
@@ -505,6 +513,7 @@ auto parse_ipc_stats_line(std::string_view line, IpcStatsSnapshot& out) -> bool;
 auto parse_ipc_stats_section(std::string_view buffer, bool sectioned) -> std::optional<IpcStatsSnapshot>;
 auto parse_event_line(std::string_view line, EventInfo& out) -> bool;
 auto next_event(std::string_view text, std::size_t& pos, bool sectioned, EventInfo& out) -> bool;
+auto build_typed_perf_events(std::string_view legacy_snapshot, std::string& error) -> std::optional<TypedPerfEvents>;
 auto comm_of_pid(const std::vector<ProcMapEntry>& proc_map, uint64_t pid) -> std::string_view;
 auto format_pid_name(uint64_t pid, const std::vector<ProcMapEntry>& proc_map) -> std::string;
 auto display_callsite(std::string_view callsite) -> std::string_view;
@@ -540,7 +549,7 @@ auto current_proc_map() -> std::vector<ProcMapEntry>;
 auto wki_view_name(WkiDataView view) -> std::string_view;
 auto wki_trace_matches(const EventInfo& event, const WkiTraceFilter& filter) -> bool;
 void cmd_stat(int ms);
-void cmd_record(int ms, const char* filter = nullptr);
+auto cmd_record(int ms, const char* filter = nullptr, bool structured = false) -> bool;
 void cmd_sched(int max_events, const WkiDisplayOptions& display_options);
 void cmd_cpustat();
 void cmd_contstat();
@@ -551,8 +560,11 @@ void cmd_checkout_report(int limit);
 void cmd_wki_launch(int limit, const WkiDisplayOptions& display_options);
 void cmd_wki_tail(int limit, const WkiTraceFilter& filter, const WkiDisplayOptions& display_options, WkiDataView view);
 void cmd_wki_trace(int max_events, const WkiTraceFilter& filter, const WkiDisplayOptions& display_options, WkiDataView view);
-void cmd_run(int argc, char** argv);
+auto cmd_run(int argc, char** argv) -> bool;
 void cmd_show_map();
+auto cmd_data_info(std::string_view path) -> bool;
+auto finalize_structured_perf_data(std::string_view path = PERF_DATA_FILE) -> bool;
+auto cmd_data_export(std::string_view path) -> bool;
 
 auto parse_time_display_format(std::string_view value, TimeDisplayFormat& out) -> bool;
 auto parse_display_arg(std::string_view arg, WkiDisplayOptions& display_options) -> bool;
