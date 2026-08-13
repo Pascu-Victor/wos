@@ -289,7 +289,7 @@ struct Task {
     Task(Task&&) = delete;
     auto operator=(const Task&) -> Task& = delete;
     auto operator=(Task&&) -> Task& = delete;
-    Task(const char* name, uint64_t elf_start, uint64_t kernel_rsp, TaskType type);
+    Task(const char* name, uint64_t elf_start, size_t elf_size, uint64_t kernel_rsp, TaskType type);
     auto initialize_process_image(const ker::loader::elf::ElfFileView& elf, const ker::loader::elf::ElfLoadOptions& options) -> bool;
 
     // Factory for kernel threads (DAEMON tasks).
@@ -341,7 +341,10 @@ struct Task {
     static constexpr uint32_t WKI_TARGET_FLAGS_ALL = WKI_TARGET_FLAG_STRICT | WKI_TARGET_FLAG_LOCAL | WKI_TARGET_FLAG_NOINHERIT |
                                                      WKI_TARGET_FLAG_REMOTE | WKI_TARGET_FLAG_BALANCED | WKI_TARGET_FLAG_ONESHOT;
     static constexpr uint64_t PERSONALITY_ADDR_NO_RANDOMIZE = 0x0040000;
-    static constexpr uint64_t DEFAULT_PERSONALITY = PERSONALITY_ADDR_NO_RANDOMIZE;
+    // Production process placement is always randomized.  Keep the Linux ABI
+    // value above for personality(2) compatibility, but never make a
+    // deterministic layout the default (or a production fallback).
+    static constexpr uint64_t DEFAULT_PERSONALITY = 0;
 
     // Lock-free lifecycle management (epoch-based reclamation).
     alignas(8) std::atomic<TaskState> state{TaskState::ACTIVE};
@@ -423,7 +426,16 @@ struct Task {
     uint64_t exec_image_size{};
     uint64_t program_header_addr{};  // Virtual address of program headers (AT_PHDR)
     uint64_t elf_header_addr{};      // Virtual address of ELF header (AT_EHDR)
-    uint64_t interp_base = 0;        // Load base of dynamic linker (AT_BASE), 0 if statically linked
+    uint64_t image_load_base{};      // Authoritative main-image runtime load bias
+    uint64_t image_vaddr_start{};    // Authoritative main PT_LOAD extent [start,end)
+    uint64_t image_vaddr_end{};
+    uint64_t interp_base = 0;       // Load base of dynamic linker (AT_BASE), 0 if statically linked
+    uint64_t interp_vaddr_start{};  // Authoritative interpreter PT_LOAD extent [start,end)
+    uint64_t interp_vaddr_end{};
+    // Userspace address of the protected 16-byte AT_RANDOM payload.  This is
+    // internal metadata used to redact the bytes from coredumps; the value is
+    // never part of a public task or coredump ABI.
+    uint64_t at_random_addr{};
     // Task construction records PT_INTERP without doing VFS I/O. Runtime
     // process creators load it only after publishing fatal-exit ownership.
     InterpPathBuffer pending_interp_path{};

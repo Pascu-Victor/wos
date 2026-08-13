@@ -32,6 +32,7 @@
 #include "platform/mm/phys.hpp"
 #include "platform/mm/reclaim.hpp"
 #include "platform/mm/virt.hpp"
+#include "platform/random/entropy.hpp"
 #include "platform/sched/scheduler.hpp"
 #include "platform/sched/task.hpp"
 #include "platform/sys/syscall.hpp"
@@ -268,7 +269,7 @@ void cpu_param_init(uint64_t cpu_no, uint64_t stack_top) {
     // Create idle task for this CPU. Do not reuse the AP bootstrap stack: idle
     // becomes the long-lived scheduler context for this CPU.
     uint64_t const IDLE_STACK_TOP = allocate_kernel_stack_top("ap-idle-stack");
-    auto* idle_task = new sched::task::Task("idle", 0, IDLE_STACK_TOP, sched::task::TaskType::IDLE);
+    auto* idle_task = new sched::task::Task("idle", 0, 0, IDLE_STACK_TOP, sched::task::TaskType::IDLE);
     sched::post_task(idle_task);
 
     // Atomically increment the counter of initialized CPUs
@@ -339,8 +340,8 @@ void create_init_tasks(boot::HandoverModules& mod_struct) {
     for (uint64_t i = 0; i < mod_struct.count; i++) {
         const auto& module = mod_struct.modules[i];
         uint64_t const TASK_KERNEL_RSP = allocate_kernel_stack_top("init-task-stack");
-        auto* new_task =
-            new sched::task::Task(module.name, reinterpret_cast<uint64_t>(module.entry), TASK_KERNEL_RSP, sched::task::TaskType::PROCESS);
+        auto* new_task = new sched::task::Task(module.name, reinterpret_cast<uint64_t>(module.entry), module.size, TASK_KERNEL_RSP,
+                                               sched::task::TaskType::PROCESS);
 
         // The pre-scheduler boot path cannot receive a fatal task handoff, but
         // it must still run the PT_INTERP stage split out of Task construction.
@@ -440,6 +441,19 @@ void create_init_tasks(boot::HandoverModules& mod_struct) {
         // Push program name as argv[0]
         uint64_t const ARGV0 = push_string(module.name);
 
+        std::array<uint8_t, 16> at_random{};
+        if (!random::entropy::get_bytes(at_random.data(), at_random.size())) {
+            dbg::log("FATAL: entropy unavailable while creating init task");
+            hcf();
+        }
+        uint64_t const AT_RANDOM_ADDR = push_to_stack(at_random.data(), at_random.size());
+        std::memset(at_random.data(), 0, at_random.size());
+        if (AT_RANDOM_ADDR == 0) {
+            dbg::log("FATAL: failed to install AT_RANDOM for init task");
+            hcf();
+        }
+        new_task->at_random_addr = AT_RANDOM_ADDR;
+
         // Align stack to 16 bytes
         // no return address to push, so just align
         constexpr uint64_t ALIGNMENT = 16;
@@ -453,9 +467,10 @@ void create_init_tasks(boot::HandoverModules& mod_struct) {
         constexpr uint64_t AT_PAGESZ = 6;
         constexpr uint64_t AT_BASE = 7;
         constexpr uint64_t AT_ENTRY = 9;
+        constexpr uint64_t AT_RANDOM = 25;
         constexpr uint64_t AT_NULL = 0;
 
-        std::array<uint64_t, 14> auxv_entries{};
+        std::array<uint64_t, 16> auxv_entries{};
         size_t auxv_entry_count = 0;
         auto push_auxv_entry = [&](uint64_t key, uint64_t value) {
             auxv_entries[auxv_entry_count++] = key;
@@ -467,6 +482,7 @@ void create_init_tasks(boot::HandoverModules& mod_struct) {
         push_auxv_entry(AT_PHDR, new_task->program_header_addr);
         push_auxv_entry(AT_PHENT, new_task->program_header_ent_size);
         push_auxv_entry(AT_PHNUM, new_task->program_header_count);
+        push_auxv_entry(AT_RANDOM, AT_RANDOM_ADDR);
         if (new_task->interp_base != 0) {
             push_auxv_entry(AT_BASE, new_task->interp_base);
         }
@@ -891,7 +907,7 @@ void start_smt(boot::HandoverModules& modules, uint64_t kernel_rsp) {
     dbg::log("All CPUs started, starting scheduler on BSP");
     // Create idle task for BSP (gets PID 0 like all idle tasks)
     uint64_t const IDLE_STACK_TOP = allocate_kernel_stack_top("bsp-idle-stack");
-    auto* idle_task = new sched::task::Task("idle", 0, IDLE_STACK_TOP, sched::task::TaskType::IDLE);
+    auto* idle_task = new sched::task::Task("idle", 0, 0, IDLE_STACK_TOP, sched::task::TaskType::IDLE);
     sched::post_task(idle_task);
 
     // BSP will participate in the atomic counter via cpuParamInit-style logic

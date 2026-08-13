@@ -18,6 +18,7 @@
 #include <platform/mm/mm.hpp>
 #include <platform/mm/paging.hpp>
 #include <platform/mm/phys.hpp>
+#include <platform/mm/user_layout.hpp>
 #include <platform/mm/virt.hpp>
 #include <platform/sched/frame_class.hpp>
 #include <platform/sched/scheduler.hpp>
@@ -266,12 +267,13 @@ auto clone_user_thread_fds_checked(Task* parent, Task* child) -> bool {
 }
 #endif
 
-auto read_boot_file_fully(const char* path, uint8_t** out_buf) -> bool {
-    if (path == nullptr || out_buf == nullptr) {
+auto read_boot_file_fully(const char* path, uint8_t** out_buf, size_t* out_size) -> bool {
+    if (path == nullptr || out_buf == nullptr || out_size == nullptr) {
         return false;
     }
 
     *out_buf = nullptr;
+    *out_size = 0;
 
     auto* current_task = ker::mod::sched::can_query_current_task() ? ker::mod::sched::get_current_task() : nullptr;
     [[maybe_unused]] auto const* task_name = (current_task != nullptr && current_task->name != nullptr) ? current_task->name : "?";
@@ -293,6 +295,7 @@ auto read_boot_file_fully(const char* path, uint8_t** out_buf) -> bool {
     if (HAVE_PREOPEN_FRESHNESS) {
         size_t cached_size = 0;
         if (boot_file_cache_lookup_copy(cache_key.data(), preopen_freshness, out_buf, &cached_size)) {
+            *out_size = cached_size;
             if constexpr (TRACE_INTERP) {
                 dbg::log("read_boot_file_fully: preopen cache hit key='%s' task=%s pid=0x%lx size=%zu", cache_key.data(), task_name,
                          static_cast<unsigned long>(current_task != nullptr ? current_task->pid : 0), cached_size);
@@ -338,6 +341,7 @@ auto read_boot_file_fully(const char* path, uint8_t** out_buf) -> bool {
     if (HAVE_FRESHNESS) {
         size_t cached_size = 0;
         if (boot_file_cache_lookup_copy(cache_key.data(), freshness, out_buf, &cached_size)) {
+            *out_size = cached_size;
             release_boot_file(file);
             if constexpr (TRACE_INTERP) {
                 dbg::log("read_boot_file_fully: cache hit key='%s' task=%s pid=0x%lx size=%zu", cache_key.data(), task_name,
@@ -401,6 +405,7 @@ auto read_boot_file_fully(const char* path, uint8_t** out_buf) -> bool {
     }
 
     *out_buf = buf;
+    *out_size = BOOT_FILE_SIZE;
     return true;
 }
 
@@ -591,15 +596,21 @@ auto complete_unpublished_process_construction(Task* task) -> bool {
     }
 
     uint8_t* interp_buf = nullptr;
-    if (!read_boot_file_fully(task->pending_interp_path.data(), &interp_buf)) {
+    size_t interp_size = 0;
+    if (!read_boot_file_fully(task->pending_interp_path.data(), &interp_buf, &interp_size)) {
         dbg::log("Failed to open interpreter '%s' for task %s", task->pending_interp_path.data(), task->name);
         return false;
     }
 
-    constexpr uint64_t INTERP_BASE = 0x40000000ULL;
+    loader::elf::ElfLoadOptions const INTERP_OPTIONS{
+        .register_special_symbols = false,
+        .base_address = 0,
+        .lazy_file_ranges = nullptr,
+        .debug_registry_pid = 0,
+        .image_role = mm::user_layout::ImageRole::INTERPRETER,
+    };
     loader::elf::ElfLoadResult const INTERP_RESULT =
-        loader::elf::load_elf(reinterpret_cast<loader::elf::ElfFile*>(interp_buf), task->pagemap, task->pid, "ld.so",
-                              false /* don't register debug symbols for interp */, INTERP_BASE);
+        loader::elf::load_elf(interp_buf, interp_size, task->pagemap, task->pid, "ld.so", INTERP_OPTIONS);
     delete[] interp_buf;
     if (INTERP_RESULT.entry_point == 0) {
         dbg::log("Failed to load interpreter ELF '%s'", task->pending_interp_path.data());
@@ -607,7 +618,9 @@ auto complete_unpublished_process_construction(Task* task) -> bool {
     }
 
     task->context.frame.rip = INTERP_RESULT.entry_point;
-    task->interp_base = INTERP_BASE;
+    task->interp_base = INTERP_RESULT.load_base;
+    task->interp_vaddr_start = INTERP_RESULT.image_start;
+    task->interp_vaddr_end = INTERP_RESULT.image_end;
     task->pending_interp_path.fill('\0');
     return true;
 }
@@ -812,7 +825,7 @@ auto Task::replace_pagemap_after_usercopy_quiescence(mm::paging::PageTable* repl
     return replaced;
 }
 
-Task::Task(const char* name, uint64_t elf_start, uint64_t kernel_rsp, TaskType type) {
+Task::Task(const char* name, uint64_t elf_start, size_t elf_size, uint64_t kernel_rsp, TaskType type) {
     // CRITICAL: Copy the name string to kernel heap memory!
     // The passed 'name' might point to Limine boot memory or user memory
     // which won't be mapped when we switch pagemaps.
@@ -983,26 +996,29 @@ Task::Task(const char* name, uint64_t elf_start, uint64_t kernel_rsp, TaskType t
     // Add compiler memory barrier to ensure elfStart is fully visible
     __asm__ volatile("mfence" ::: "memory");
 
-    // Validate ELF magic bytes before proceeding
-    auto* elf_header = reinterpret_cast<uint8_t*>(elf_start);
-
-    if (elf_header[0] != 0x7F || elf_header[1] != 'E' || elf_header[2] != 'L' || elf_header[3] != 'F') {
-        dbg::log("ERROR: Invalid ELF magic at 0x%p: [0x%x 0x%x 0x%x 0x%x]", reinterpret_cast<void*>(elf_start), elf_header[0],
-                 elf_header[1], elf_header[2], elf_header[3]);
-        dbg::log("Expected ELF magic: [0x7F 'E' 'L' 'F'] = [0x7F 0x45 0x4C 0x46]");
-        hcf();
+    auto const* elf_data = reinterpret_cast<const uint8_t*>(elf_start);
+    ker::loader::elf::TlsModule actual_tls_info{};
+    if (!loader::elf::inspect_tls(elf_data, elf_size, actual_tls_info)) {
+        dbg::log("ERROR: Invalid bounded ELF source for task %s (size=%zu)", name, elf_size);
+        fail_process_construction();
+        return;
     }
 
-    // FIXED: Parse ELF first to get actual TLS size, then create thread
-    ker::loader::elf::TlsModule const ACTUAL_TLS_INFO = loader::elf::extract_tls_info(reinterpret_cast<void*>(elf_start));
     this->thread =
-        threading::create_thread(ker::mod::mm::USER_STACK_SIZE, ACTUAL_TLS_INFO.tls_size, this->pagemap, this->pid, ACTUAL_TLS_INFO);
+        threading::create_thread(ker::mod::mm::USER_STACK_SIZE, actual_tls_info.tls_size, this->pagemap, this->pid, actual_tls_info);
     if (this->thread == nullptr) {
         dbg::log("Failed to create thread for task %s - OOM", name);
         // Preserve the pagemap for unpublished-process cleanup.
         this->entry = 0;
         return;
     }
+    uint64_t mmap_cursor = 0;
+    if (!mm::user_layout::choose_mmap_cursor(mmap_cursor)) {
+        dbg::log("Failed to seed mmap placement for task %s", name);
+        fail_process_construction();
+        return;
+    }
+    this->mmap_next.store(mmap_cursor, std::memory_order_relaxed);
 
     // Allocate a KERNEL-space PerCpu structure for syscall scratch area
     // This must be in kernel memory, not user memory! The user's gsbase/TLS is separate.
@@ -1014,8 +1030,7 @@ Task::Task(const char* name, uint64_t elf_start, uint64_t kernel_rsp, TaskType t
 
     this->context.frame.rsp = this->thread->stack;
 
-    loader::elf::ElfLoadResult elf_result =
-        loader::elf::load_elf(reinterpret_cast<loader::elf::ElfFile*>(elf_start), this->pagemap, this->pid, this->name);
+    loader::elf::ElfLoadResult elf_result = loader::elf::load_elf(elf_data, elf_size, this->pagemap, this->pid, this->name);
     if (elf_result.entry_point == 0) {
         dbg::log("Failed to load ELF for task %s", name);
         fail_process_construction();
@@ -1025,6 +1040,9 @@ Task::Task(const char* name, uint64_t elf_start, uint64_t kernel_rsp, TaskType t
     this->context.frame.rip = elf_result.entry_point;
     this->program_header_addr = elf_result.program_header_addr;
     this->elf_header_addr = elf_result.elf_header_addr;
+    this->image_load_base = elf_result.load_base;
+    this->image_vaddr_start = elf_result.image_start;
+    this->image_vaddr_end = elf_result.image_end;
     this->program_header_count = elf_result.program_header_count;
     this->program_header_ent_size = elf_result.program_header_ent_size;
 
@@ -1071,12 +1089,22 @@ auto Task::initialize_process_image(const ker::loader::elf::ElfFileView& elf, co
         return false;
     }
 
-    ker::loader::elf::TlsModule const TLS_INFO = loader::elf::extract_tls_info(elf);
+    ker::loader::elf::TlsModule TLS_INFO{};
+    if (!loader::elf::inspect_tls(elf, TLS_INFO)) {
+        dbg::log("Invalid file-backed ELF for task %s", name);
+        return false;
+    }
     thread = threading::create_thread(ker::mod::mm::USER_STACK_SIZE, TLS_INFO.tls_size, pagemap, pid, TLS_INFO);
     if (thread == nullptr) {
         dbg::log("Failed to create thread for task %s - OOM", name);
         return false;
     }
+    uint64_t mmap_cursor = 0;
+    if (!mm::user_layout::choose_mmap_cursor(mmap_cursor)) {
+        dbg::log("Failed to seed mmap placement for task %s", name);
+        return false;
+    }
+    mmap_next.store(mmap_cursor, std::memory_order_relaxed);
 
     auto* per_cpu = new cpu::PerCpu();
     if (per_cpu == nullptr) {
@@ -1096,6 +1124,9 @@ auto Task::initialize_process_image(const ker::loader::elf::ElfFileView& elf, co
     context.frame.rip = ELF_RESULT.entry_point;
     program_header_addr = ELF_RESULT.program_header_addr;
     elf_header_addr = ELF_RESULT.elf_header_addr;
+    image_load_base = ELF_RESULT.load_base;
+    image_vaddr_start = ELF_RESULT.image_start;
+    image_vaddr_end = ELF_RESULT.image_end;
     program_header_count = ELF_RESULT.program_header_count;
     program_header_ent_size = ELF_RESULT.program_header_ent_size;
 
@@ -1165,9 +1196,15 @@ Task* Task::create_user_thread(Task* parent, uint64_t tcb_vaddr, uint64_t user_s
     t->entry = parent->entry;
     t->program_header_addr = parent->program_header_addr;
     t->elf_header_addr = parent->elf_header_addr;
+    t->image_load_base = parent->image_load_base;
+    t->image_vaddr_start = parent->image_vaddr_start;
+    t->image_vaddr_end = parent->image_vaddr_end;
     t->program_header_count = parent->program_header_count;
     t->program_header_ent_size = parent->program_header_ent_size;
     t->interp_base = parent->interp_base;
+    t->interp_vaddr_start = parent->interp_vaddr_start;
+    t->interp_vaddr_end = parent->interp_vaddr_end;
+    t->at_random_addr = parent->at_random_addr;
     t->mmap_next.store(parent->mmap_next.load(std::memory_order_relaxed), std::memory_order_relaxed);
     if (!clone_lazy_vmem_ranges(*t, *parent)) {
         delete[] t->name;
@@ -1189,6 +1226,14 @@ Task* Task::create_user_thread(Task* parent, uint64_t tcb_vaddr, uint64_t user_s
     thr->stack = user_sp;
     thr->stack_size = stack_size;
     thr->stack_base_virt = stack_base;
+    // The kernel-managed initial stack/TLS/SafeStack reservation belongs to
+    // the shared address space, not only to its initial Thread object. Keep
+    // that immutable protection metadata visible when this sibling issues VM
+    // syscalls so it cannot replace a guard with MAP_FIXED.
+    if (parent->thread != nullptr) {
+        thr->layout_base_virt = parent->thread->layout_base_virt;
+        thr->layout_size = parent->thread->layout_size;
+    }
     thr->tls_size = 0;
     thr->tls_base_virt = 0;
     thr->tls_phys_ptr = 0;
@@ -1320,7 +1365,7 @@ Task* Task::create_kernel_thread(const char* name, void (*entry_func)()) {
     }
     uint64_t const KERNEL_RSP = stack_base + ker::mod::mm::KERNEL_STACK_SIZE;
 
-    auto* task = new Task(name, 0, KERNEL_RSP, TaskType::DAEMON);
+    auto* task = new Task(name, 0, 0, KERNEL_RSP, TaskType::DAEMON);
     task->kthread_entry = entry_func;
     task->context.frame.rip = reinterpret_cast<uint64_t>(wos_kernel_thread_trampoline);
     task->context.regs.rdi = reinterpret_cast<uint64_t>(entry_func);

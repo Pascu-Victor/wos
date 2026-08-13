@@ -15,6 +15,7 @@
 #include <platform/dbg/dbg.hpp>
 #include <platform/interrupt/gates.hpp>
 #include <platform/ktime/ktime.hpp>
+#include <platform/loader/runtime_images.hpp>
 #include <platform/mm/addr.hpp>
 #include <platform/mm/paging.hpp>
 #include <platform/mm/phys.hpp>
@@ -28,12 +29,15 @@ namespace {
 using log = ker::mod::dbg::logger<"cdmp">;
 
 constexpr uint64_t COREDUMP_MAGIC = 0x504d55444f43534fULL;  // "WOSCODMP" little-endian-ish identifier
-constexpr uint32_t COREDUMP_VERSION = 3;
+constexpr uint32_t COREDUMP_VERSION = 4;
 constexpr size_t MAX_PINNED_USER_PAGES = 16;
 constexpr int64_t STACK_PAGES_BELOW_RSP = 2;
 constexpr int64_t STACK_PAGES_ABOVE_RSP = 2;
 constexpr uint64_t USER_CANONICAL_TOP = 0x0000800000000000ULL;
 constexpr uint64_t SNAPSHOT_FLAG_PINNED_DIAGNOSTIC_PAGES = 1ULL << 1;
+constexpr uint64_t AT_RANDOM_SIZE = 16;
+constexpr uint64_t MLIBC_TCB_STACK_CANARY_OFFSET = 0x28;
+constexpr uint64_t STACK_CANARY_SIZE = sizeof(uint64_t);
 
 // x86-64 canonical address check: bits[63:47] must all be the same.
 // For kernel HHDM addresses (bit 47 set) the upper 17 bits are all 1s.
@@ -167,6 +171,13 @@ struct CoreDumpHeader {
     uint64_t euid;
     uint64_t egid;
     uint64_t task_flags;
+
+    // Version 4 exact runtime-image catalog. The table follows the segment
+    // table and precedes page payloads; older header fields remain append-only.
+    uint64_t module_count;
+    uint64_t module_entry_size;
+    uint64_t module_table_offset;
+    uint64_t module_snapshot_status;
 } __attribute__((packed));
 
 constexpr uint64_t TASK_FLAG_IS_THREAD = 1ULL << 0;
@@ -202,6 +213,22 @@ struct CoreDumpSegment {
     uint64_t pte_flags;
     uint64_t phys_addr;
 } __attribute__((packed));
+
+struct CoreDumpModule {
+    uint64_t load_base;
+    uint64_t image_start;
+    uint64_t image_end;
+    uint64_t text_start;
+    uint64_t text_end;
+    uint64_t entry;
+    uint64_t dynamic_addr;
+    uint32_t flags;
+    uint8_t build_id_size;
+    uint8_t reserved[3];
+    uint8_t build_id[ker::loader::runtime::BUILD_ID_MAX];
+    char path[ker::loader::runtime::IMAGE_PATH_MAX];
+} __attribute__((packed));
+static_assert(sizeof(CoreDumpModule) == 352);
 
 struct PinnedCoreDumpPage {
     uint64_t vaddr;
@@ -372,6 +399,10 @@ struct CoreDumpRequest {
     uint64_t euid;
     uint64_t egid;
     uint64_t task_flags;
+    uint64_t at_random_addr;
+    std::array<ker::loader::runtime::RuntimeImage, ker::loader::runtime::MAX_IMAGES> runtime_images{};
+    size_t runtime_image_count = 0;
+    ker::loader::runtime::SnapshotStatus runtime_image_status = ker::loader::runtime::SnapshotStatus::UNAVAILABLE;
     uint8_t* elf_buffer;  // stolen from task->elf_buffer; released by the coredump task after writing
     size_t elf_buffer_size;
     bool elf_buffer_shared;
@@ -445,6 +476,29 @@ auto lookup_user_page(ker::mod::mm::paging::PageTable* pagemap, uint64_t vaddr, 
     return true;
 }
 
+auto read_mapped_user_memory(void* opaque, uint64_t address, void* destination, size_t size) -> bool {
+    auto* pagemap = static_cast<ker::mod::mm::paging::PageTable*>(opaque);
+    auto* output = static_cast<uint8_t*>(destination);
+    while (size != 0) {
+        ker::mod::mm::virt::UserPagePin pin{};
+        if (!ker::mod::mm::virt::pin_user_page(pagemap, address, false, pin, false)) {
+            return false;
+        }
+        size_t const PAGE_OFFSET = static_cast<size_t>(address & (ker::mod::mm::paging::PAGE_SIZE - 1));
+        size_t const CHUNK = std::min(size, ker::mod::mm::paging::PAGE_SIZE - PAGE_OFFSET);
+        std::memcpy(output, static_cast<const uint8_t*>(pin.hhdm_page) + PAGE_OFFSET, CHUNK);
+        bool const STILL_MAPPED = ker::mod::mm::virt::user_page_pin_still_mapped(pin);
+        ker::mod::mm::virt::unpin_user_page(pin);
+        if (!STILL_MAPPED) {
+            return false;
+        }
+        output += CHUNK;
+        address += CHUNK;
+        size -= CHUNK;
+    }
+    return true;
+}
+
 void pin_user_page_for_coredump(CoreDumpRequest& req, ker::mod::mm::paging::PageTable* pagemap, uint64_t vaddr, SegmentType type) {
     if (!is_user_vaddr(vaddr)) {
         return;
@@ -466,25 +520,30 @@ void pin_user_page_for_coredump(CoreDumpRequest& req, ker::mod::mm::paging::Page
         return;
     }
 
+    ker::mod::mm::virt::UserPagePin pin{};
+    if (!ker::mod::mm::virt::pin_user_page(pagemap, PAGE_VADDR, false, pin, false)) {
+        return;
+    }
+
     uint64_t phys_page = 0;
     uint64_t pte_flags = 0;
-    if (!lookup_user_page(pagemap, PAGE_VADDR, phys_page, pte_flags)) {
+    if (!lookup_user_page(pagemap, PAGE_VADDR, phys_page, pte_flags) || phys_page != pin.physical_page ||
+        !ker::mod::mm::virt::user_page_pin_still_mapped(pin)) {
+        ker::mod::mm::virt::unpin_user_page(pin);
         return;
     }
 
-    auto* page_ptr = phys_to_hhdm_checked(phys_page);
-    if (page_ptr == nullptr) {
-        return;
-    }
-
-    ker::mod::mm::phys::page_ref_inc(page_ptr);
+    // Retain one reference for the asynchronous writer before releasing the
+    // short-lived mapping-stability pin.
+    ker::mod::mm::phys::page_ref_inc(pin.hhdm_page);
     req.pinned_pages.at(req.pinned_page_count++) = PinnedCoreDumpPage{
         .vaddr = PAGE_VADDR,
-        .phys_addr = phys_page,
+        .phys_addr = pin.physical_page,
         .pte_flags = pte_flags,
         .type = TYPE,
         .present = 1,
     };
+    ker::mod::mm::virt::unpin_user_page(pin);
 }
 
 void pin_stack_window_for_coredump(CoreDumpRequest& req, ker::mod::mm::paging::PageTable* pagemap, uint64_t rsp) {
@@ -632,7 +691,10 @@ void perform_coredump(const CoreDumpRequest& req) {
     constexpr uint64_t PAGE = ker::mod::mm::paging::PAGE_SIZE;
     uint64_t const SEG_COUNT = req.pinned_page_count;
     std::array<CoreDumpSegment, MAX_PINNED_USER_PAGES> segs{};
-    uint64_t next_offset = sizeof(CoreDumpHeader) + (SEG_COUNT * sizeof(CoreDumpSegment));
+    std::array<CoreDumpModule, ker::loader::runtime::MAX_IMAGES> modules{};
+    uint64_t const MODULE_COUNT = req.runtime_image_count;
+    uint64_t const MODULE_TABLE_OFFSET = sizeof(CoreDumpHeader) + (SEG_COUNT * sizeof(CoreDumpSegment));
+    uint64_t next_offset = MODULE_TABLE_OFFSET + (MODULE_COUNT * sizeof(CoreDumpModule));
     for (size_t i = 0; i < SEG_COUNT; ++i) {
         auto const& pinned = req.pinned_pages.at(i);
         auto& seg = segs.at(i);
@@ -644,6 +706,21 @@ void perform_coredump(const CoreDumpRequest& req) {
         seg.phys_addr = pinned.phys_addr;
         seg.type = pinned.type != 0 ? pinned.type : static_cast<uint32_t>(SegmentType::MEMORY_PAGE);
         next_offset += PAGE;
+    }
+    for (size_t i = 0; i < MODULE_COUNT; ++i) {
+        auto const& source = req.runtime_images.at(i);
+        auto& module = modules.at(i);
+        module.load_base = source.load_base;
+        module.image_start = source.image_start;
+        module.image_end = source.image_end;
+        module.text_start = source.text_start;
+        module.text_end = source.text_end;
+        module.entry = source.entry;
+        module.dynamic_addr = source.dynamic_addr;
+        module.flags = source.flags;
+        module.build_id_size = source.build_id_size;
+        std::copy(source.build_id.begin(), source.build_id.end(), std::begin(module.build_id));
+        std::copy(source.path.begin(), source.path.end(), std::begin(module.path));
     }
 
     CoreDumpHeader hdr{};
@@ -729,9 +806,14 @@ void perform_coredump(const CoreDumpRequest& req) {
     hdr.euid = req.euid;
     hdr.egid = req.egid;
     hdr.task_flags = req.task_flags;
+    hdr.module_count = MODULE_COUNT;
+    hdr.module_entry_size = sizeof(CoreDumpModule);
+    hdr.module_table_offset = MODULE_TABLE_OFFSET;
+    hdr.module_snapshot_status = static_cast<uint64_t>(req.runtime_image_status);
 
     bool ok = write_all(FD, &hdr, sizeof(hdr));
     ok = ok && (SEG_COUNT == 0 || write_all(FD, segs.data(), SEG_COUNT * sizeof(CoreDumpSegment)));
+    ok = ok && (MODULE_COUNT == 0 || write_all(FD, modules.data(), MODULE_COUNT * sizeof(CoreDumpModule)));
 
     for (uint64_t i = 0; ok && i < SEG_COUNT; ++i) {
         if (segs.at(i).present == 0) {
@@ -742,7 +824,37 @@ void perform_coredump(const CoreDumpRequest& req) {
             ok = false;
             continue;
         }
-        ok = write_all(FD, page_ptr, PAGE);
+
+        uint64_t const PAGE_START = segs.at(i).vaddr;
+        uint64_t const PAGE_END = PAGE_START + PAGE;
+        auto overlaps_page = [PAGE_START, PAGE_END](uint64_t start, uint64_t size) {
+            return start != 0 && size != 0 && start <= UINT64_MAX - size && start < PAGE_END && start + size > PAGE_START;
+        };
+        uint64_t const TCB_CANARY_ADDR =
+            req.thread_fs_base <= UINT64_MAX - MLIBC_TCB_STACK_CANARY_OFFSET ? req.thread_fs_base + MLIBC_TCB_STACK_CANARY_OFFSET : 0;
+        bool const REDACT_AT_RANDOM = overlaps_page(req.at_random_addr, AT_RANDOM_SIZE);
+        bool const REDACT_TCB_CANARY = overlaps_page(TCB_CANARY_ADDR, STACK_CANARY_SIZE);
+        if (!REDACT_AT_RANDOM && !REDACT_TCB_CANARY) {
+            ok = write_all(FD, page_ptr, PAGE);
+            continue;
+        }
+
+        // Never mutate the pinned user page. Redact only the writer-task copy,
+        // including split-page ranges, and keep the append-only coredump ABI intact.
+        std::array<uint8_t, PAGE> redacted{};
+        std::memcpy(redacted.data(), page_ptr, PAGE);
+        auto redact_range = [&](uint64_t start, uint64_t size) {
+            if (!overlaps_page(start, size)) {
+                return;
+            }
+            uint64_t const REDACT_START = std::max(start, PAGE_START);
+            uint64_t const REDACT_END = std::min(start + size, PAGE_END);
+            std::fill(redacted.begin() + static_cast<ptrdiff_t>(REDACT_START - PAGE_START),
+                      redacted.begin() + static_cast<ptrdiff_t>(REDACT_END - PAGE_START), 0);
+        };
+        redact_range(req.at_random_addr, AT_RANDOM_SIZE);
+        redact_range(TCB_CANARY_ADDR, STACK_CANARY_SIZE);
+        ok = write_all(FD, redacted.data(), PAGE);
     }
 
     if (ok && req.exec_image_file != nullptr && req.exec_image_size != 0) {
@@ -917,6 +1029,24 @@ void try_write_for_task(ker::mod::sched::task::Task* task, const ker::mod::cpu::
     req.task_flags |= task->domain_hard ? TASK_FLAG_DOMAIN_HARD : 0;
     req.task_flags |= task->wki_prefer_inline ? TASK_FLAG_WKI_PREFER_INLINE : 0;
     req.task_flags |= task->wki_skip_legacy_placement ? TASK_FLAG_WKI_SKIP_LEGACY_PLACEMENT : 0;
+    req.at_random_addr = task->at_random_addr;
+    ker::loader::runtime::SnapshotSource const IMAGE_SOURCE{
+        .program_header_addr = task->program_header_addr,
+        .program_header_count = task->program_header_count,
+        .program_header_ent_size = task->program_header_ent_size,
+        .main_elf_header_addr = task->elf_header_addr,
+        .main_load_base = task->image_load_base,
+        .main_image_start = task->image_vaddr_start,
+        .main_image_end = task->image_vaddr_end,
+        .main_entry = task->entry,
+        .interpreter_base = task->interp_base,
+        .interpreter_image_start = task->interp_vaddr_start,
+        .interpreter_image_end = task->interp_vaddr_end,
+        .main_path = task->exe_path.data(),
+        .interpreter_path = "/lib/ld.so",
+    };
+    req.runtime_image_status = ker::loader::runtime::snapshot_images(read_mapped_user_memory, task->pagemap, IMAGE_SOURCE,
+                                                                     req.runtime_images, req.runtime_image_count);
     req.user_rsp = frame.rsp;
     req.timestamp = ker::mod::time::get_ticks();
     req.task_ptr = task;

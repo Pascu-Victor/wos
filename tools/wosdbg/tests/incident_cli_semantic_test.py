@@ -1150,7 +1150,7 @@ def run_seeded_property_smoke(
     rng = random.Random(0x574F53444247)
     version_cases = [
         next(case for case in index["loaderCases"] if case["name"] == f"valid-single-v{version}")
-        for version in (1, 2, 3)
+        for version in (1, 2, 3, 4)
     ]
     archive_seed = (fixture_root / next(
         case["path"] for case in index["loaderCases"] if case["name"] == "valid-single-v3-archive"

@@ -229,7 +229,7 @@ option(WOS_UASAN "Enable AddressSanitizer instrumentation for WOS userspace modu
 set(WOS_UASAN_RUNTIME_DIR "" CACHE PATH "Clang runtime directory containing WOS AddressSanitizer libraries")
 option(WOS_USERSPACE_COVERAGE "Enable LLVM source-based coverage instrumentation for WOS userspace modules" OFF)
 option(WOS_USERSPACE_NO_AVX "Build WOS userspace without AVX for FPU-state diagnostics" OFF)
-option(WOS_DYNAMIC_USERSPACE_PIE "Build dynamic WOS userspace executables as PIE" OFF)
+option(WOS_DYNAMIC_USERSPACE_PIE "Build dynamic WOS userspace executables as PIE" ON)
 option(WOS_DYNAMIC_USERSPACE_NO_PLT "Use GOT calls instead of PLT stubs for dynamic WOS userspace executables" OFF)
 
 set(WOS_SYSROOT_COMPILE_OPTIONS "--sysroot=${SYSROOT_PATH}")

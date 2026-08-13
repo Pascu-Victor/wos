@@ -1,0 +1,7 @@
+{"kind":"wos-aslr-layout-v1","pid":549,"mainLoadBias":"0xa200000","interpreterLoadBias":"0x60e00000","codeAddress":"0xa212190","stackAddress":"0x7c7e91800ca7","tlsAddress":"0x254e3fd3cb18","heapAddress":"0x254e40ebffc0","anonymousMappingAddress":"0x254e41e7e000","atRandomAddress":"0x7c7e91800e81","relroAddress":"0xa25f000","atRandomPresent":true,"result":"pass"}
+{"kind":"wos-aslr-protection-v1","test":"anonymous-nx","result":"pass","waitStatus":11}
+{"kind":"wos-aslr-protection-v1","test":"stack-nx","result":"pass","waitStatus":11}
+{"kind":"wos-aslr-protection-v1","test":"initial-stack-guard","result":"pass","waitStatus":11}
+{"kind":"wos-aslr-protection-v1","test":"guard-vm-mutation-rejected","result":"pass","waitStatus":0}
+{"kind":"wos-aslr-protection-v1","test":"pthread-guard","result":"pass","waitStatus":11}
+{"kind":"wos-aslr-protection-v1","test":"relro-read-only","result":"pass","waitStatus":11}

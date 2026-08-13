@@ -681,6 +681,50 @@ auto find_runtime_base_by_bytes(const wosdbg::CoreDump& dump, const QByteArray& 
     return std::nullopt;
 }
 
+auto runtime_base_matches_dump(const wosdbg::CoreDump& dump, const QByteArray& elf, const wosdbg::ElfImageInfo& info, uint64_t base)
+    -> bool {
+    if (!info.valid || info.load_segments.empty() || elf.isEmpty()) {
+        return false;
+    }
+
+    const auto* elf_data = elf.constData();
+    const auto ELF_SIZE = static_cast<uint64_t>(elf.size());
+    for (const auto& dump_seg : dump.segments) {
+        if (!dump_seg.is_present()) {
+            continue;
+        }
+        for (const auto& load : info.load_segments) {
+            if (base > UINT64_MAX - load.vaddr) {
+                continue;
+            }
+            uint64_t const RUNTIME_START = base + load.vaddr;
+            if (load.filesz == 0 || RUNTIME_START > UINT64_MAX - load.filesz) {
+                continue;
+            }
+            uint64_t const RUNTIME_END = RUNTIME_START + load.filesz;
+            if (dump_seg.vaddr < RUNTIME_START || dump_seg.vaddr >= RUNTIME_END) {
+                continue;
+            }
+
+            uint64_t const IN_LOAD = dump_seg.vaddr - RUNTIME_START;
+            if (load.offset > ELF_SIZE || IN_LOAD > ELF_SIZE - load.offset) {
+                continue;
+            }
+            uint64_t const FILE_OFFSET = load.offset + IN_LOAD;
+            uint64_t const AVAILABLE = std::min<uint64_t>({128, RUNTIME_END - dump_seg.vaddr, ELF_SIZE - FILE_OFFSET});
+            if (AVAILABLE < 32) {
+                continue;
+            }
+            QByteArray const DUMP_BYTES = wosdbg::read_va_bytes(dump, dump_seg.vaddr, static_cast<size_t>(AVAILABLE));
+            if (static_cast<uint64_t>(DUMP_BYTES.size()) == AVAILABLE &&
+                std::memcmp(DUMP_BYTES.constData(), elf_data + FILE_OFFSET, static_cast<size_t>(AVAILABLE)) == 0) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 auto source_with_llvm_symbolizer(const QString& object_path, uint64_t object_relative_address) -> QJsonObject {
     if (object_path.isEmpty() || !QFileInfo::exists(object_path)) {
         return {};
@@ -2091,6 +2135,18 @@ auto DebugAnalysisService::open_coredump_file(const QString& resolved_path, cons
     session->display_name = QFileInfo(RESOLVED).fileName();
     session->dump = std::move(dump);
 
+    auto load_main_symbol_sources = [&](const QString& path) {
+        const auto INFO = wosdbg::elf_image_info_from_file(path);
+        const auto BIAS = wosdbg::elf_load_bias_from_runtime_entry(INFO, session->dump->task_entry);
+        if (!BIAS) {
+            session->binary_symbols.reset();
+            session->binary_sections.reset();
+            return;
+        }
+        session->binary_symbols = wosdbg::load_symbols_from_file(path, *BIAS);
+        session->binary_sections = wosdbg::load_sections_from_file(path, *BIAS);
+    };
+
     if (!session->dump->embedded_elf().isEmpty()) {
         session->embedded_build_id = wosdbg::elf_build_id(session->dump->embedded_elf());
         session->embedded_symbols = wosdbg::load_symbols_from_core_dump(*session->dump);
@@ -2113,8 +2169,7 @@ auto DebugAnalysisService::open_coredump_file(const QString& resolved_path, cons
     }
     if (!elf_path.isEmpty()) {
         session->binary_elf_path = elf_path;
-        session->binary_symbols = wosdbg::load_symbols_from_file(elf_path);
-        session->binary_sections = wosdbg::load_sections_from_file(elf_path);
+        load_main_symbol_sources(elf_path);
         session->binary_build_id = wosdbg::elf_build_id_from_file(elf_path);
         session->binary_build_id_status = "embedded-build-id-missing";
     }
@@ -2134,8 +2189,7 @@ auto DebugAnalysisService::open_coredump_file(const QString& resolved_path, cons
                     : BUILD_ID_ELF_PATH;
             if (!FALLBACK_ELF_PATH.isEmpty()) {
                 session->binary_elf_path = FALLBACK_ELF_PATH;
-                session->binary_symbols = wosdbg::load_symbols_from_file(FALLBACK_ELF_PATH);
-                session->binary_sections = wosdbg::load_sections_from_file(FALLBACK_ELF_PATH);
+                load_main_symbol_sources(FALLBACK_ELF_PATH);
                 session->binary_build_id = wosdbg::elf_build_id_from_file(FALLBACK_ELF_PATH);
                 session->binary_build_id_matches = session->binary_build_id == session->embedded_build_id;
                 session->binary_build_id_status = session->binary_build_id_matches ? "match" : "mismatch";
@@ -2190,14 +2244,17 @@ auto DebugAnalysisService::find_dump_session(const QString& id) -> DumpSession* 
 auto DebugAnalysisService::module_json(const DumpSession::LoadedModule& module) -> QJsonObject {
     return QJsonObject{{"name", module.name},
                        {"path", module.path},
+                       {"recordedPath", module.recorded_path},
                        {"role", module.role},
                        {"base", format_hex(module.base)},
                        {"end", format_hex(module.end)},
                        {"objectStart", format_hex(module.base + module.first_load_vaddr)},
                        {"buildId", module.build_id},
+                       {"identityStatus", module.identity_status},
                        {"addressModel", module.address_model},
                        {"alternatePaths", QJsonArray::fromStringList(module.alternate_paths)},
                        {"memoryMatched", module.memory_matched},
+                       {"exactMapping", module.exact_mapping},
                        {"symbols", module.symbols ? module.symbols->count() : 0}};
 }
 
@@ -2208,31 +2265,55 @@ auto DebugAnalysisService::module_elf_bytes(const DumpSession& session, const Du
     return read_file_bytes_quiet(module.path);
 }
 
-void DebugAnalysisService::add_module(DumpSession& session, const QString& path, const QString& role, uint64_t base, bool memory_matched) {
+void DebugAnalysisService::add_module(DumpSession& session, const QString& path, const QString& role, uint64_t base, bool memory_matched,
+                                      const wosdbg::CoreDumpModule* recorded) {
     QString resolved = path;
     if (!resolved.startsWith("embedded:")) {
         resolved = resolve_path_for_read(path);
-        if (resolved.isEmpty() || !QFileInfo::exists(resolved)) {
+    }
+    bool const FILE_AVAILABLE = resolved.startsWith("embedded:") || (!resolved.isEmpty() && QFileInfo::exists(resolved));
+    QByteArray const ELF = !FILE_AVAILABLE                    ? QByteArray{}
+                           : resolved.startsWith("embedded:") ? session.dump->embedded_elf()
+                                                              : read_file_bytes_quiet(resolved);
+    wosdbg::ElfImageInfo const INFO = wosdbg::elf_image_info(ELF);
+    if (recorded == nullptr && (!INFO.valid || INFO.load_segments.empty())) {
+        return;
+    }
+    const uint64_t BIAS = recorded != nullptr ? recorded->load_base : INFO.type == 3 ? base : 0;
+    const QString ACTUAL_BUILD_ID = wosdbg::elf_build_id(ELF);
+    const QString RECORDED_BUILD_ID = recorded != nullptr ? recorded->build_id_hex().toLower() : QString{};
+    const QString BUILD_ID = !RECORDED_BUILD_ID.isEmpty() ? RECORDED_BUILD_ID : ACTUAL_BUILD_ID;
+    bool const EMBEDDED = resolved.startsWith("embedded:");
+    bool const BUILD_ID_MATCHED_MAIN = role == "main" && !session.embedded_build_id.isEmpty() &&
+                                       ACTUAL_BUILD_ID.compare(session.embedded_build_id, Qt::CaseInsensitive) == 0;
+    bool const BUILD_ID_MATCHED_RECORDED =
+        !RECORDED_BUILD_ID.isEmpty() && !ACTUAL_BUILD_ID.isEmpty() && RECORDED_BUILD_ID.compare(ACTUAL_BUILD_ID, Qt::CaseInsensitive) == 0;
+    bool const SYMBOL_SOURCE_TRUSTED =
+        FILE_AVAILABLE && (EMBEDDED || memory_matched || role == "kernel" || BUILD_ID_MATCHED_MAIN || BUILD_ID_MATCHED_RECORDED);
+    uint64_t first = 0;
+    uint64_t end = 0;
+    if (recorded != nullptr) {
+        if (recorded->image_start < BIAS || recorded->image_start >= recorded->image_end) {
+            return;
+        }
+        first = recorded->image_start - BIAS;
+        end = recorded->image_end;
+    } else {
+        first = UINT64_MAX;
+        for (const auto& load : INFO.load_segments) {
+            if (BIAS > UINT64_MAX - load.vaddr || BIAS + load.vaddr > UINT64_MAX - load.memsz) {
+                return;
+            }
+            first = std::min(first, load.vaddr);
+            end = std::max(end, BIAS + load.vaddr + load.memsz);
+        }
+        if (first == UINT64_MAX || end == 0) {
             return;
         }
     }
-    QByteArray const ELF = resolved.startsWith("embedded:") ? session.dump->embedded_elf() : read_file_bytes_quiet(resolved);
-    wosdbg::ElfImageInfo const INFO = wosdbg::elf_image_info(ELF);
-    if (!INFO.valid || INFO.load_segments.empty()) {
-        return;
-    }
-    const uint64_t BIAS = INFO.type == 3 ? base : 0;
-    const QString BUILD_ID = wosdbg::elf_build_id(ELF);
-    uint64_t first = UINT64_MAX;
-    uint64_t end = 0;
-    for (const auto& load : INFO.load_segments) {
-        first = std::min(first, load.vaddr);
-        end = std::max(end, BIAS + load.vaddr + load.memsz);
-    }
-    if (first == UINT64_MAX || end == 0) {
-        return;
-    }
-    const QString NAME = resolved.startsWith("embedded:") ? QFileInfo(session.dump->exe_path).fileName() : QFileInfo(resolved).fileName();
+    QString const RECORDED_PATH = recorded != nullptr ? recorded->path : QString{};
+    const QString NAME =
+        EMBEDDED ? QFileInfo(session.dump->exe_path).fileName() : QFileInfo(FILE_AVAILABLE ? resolved : RECORDED_PATH).fileName();
     for (auto& existing : session.modules) {
         const bool SAME_BUILD = !BUILD_ID.isEmpty() && existing.build_id == BUILD_ID && existing.base == BIAS;
         const bool SAME_IDENTITY = existing.name == NAME && existing.role == role && existing.base == BIAS;
@@ -2241,28 +2322,115 @@ void DebugAnalysisService::add_module(DumpSession& session, const QString& path,
                 existing.alternate_paths << resolved;
             }
             existing.memory_matched = existing.memory_matched || memory_matched;
+            existing.exact_mapping = existing.exact_mapping || recorded != nullptr;
+            if (recorded != nullptr) {
+                existing.recorded_path = RECORDED_PATH;
+                existing.first_load_vaddr = first;
+                existing.end = end;
+                existing.build_id = BUILD_ID;
+                existing.identity_status = BUILD_ID_MATCHED_RECORDED      ? "recorded-build-id-match"
+                                           : !RECORDED_BUILD_ID.isEmpty() ? "recorded-build-id-unresolved"
+                                                                          : existing.identity_status;
+            }
+            if (SYMBOL_SOURCE_TRUSTED && !existing.symbols) {
+                existing.symbols = wosdbg::parse_elf_symtab(ELF, BIAS);
+                existing.sections = wosdbg::parse_elf_sections(ELF, BIAS);
+            }
             return;
         }
     }
     DumpSession::LoadedModule module;
     module.name = NAME.isEmpty() ? role : NAME;
-    module.path = resolved;
+    module.path = FILE_AVAILABLE ? resolved : RECORDED_PATH;
+    module.recorded_path = RECORDED_PATH;
     module.role = role;
     module.base = BIAS;
     module.end = end;
     module.first_load_vaddr = first;
     module.build_id = BUILD_ID;
+    module.identity_status = BUILD_ID_MATCHED_RECORDED ? "recorded-build-id-match"
+                             : !RECORDED_BUILD_ID.isEmpty()
+                                 ? (FILE_AVAILABLE ? "recorded-build-id-mismatch" : "recorded-build-id-unresolved")
+                             : memory_matched ? "memory-match"
+                             : EMBEDDED       ? "embedded"
+                                              : "unverified";
     module.address_model = INFO.type == 3 ? "runtime = elf_vaddr + load_base" : "absolute ELF virtual addresses";
     if (role == "kernel") {
         module.address_model = "absolute linked kernel virtual addresses";
     }
     module.memory_matched = memory_matched;
-    module.symbols = wosdbg::parse_elf_symtab(ELF, BIAS);
-    module.sections = wosdbg::parse_elf_sections(ELF, BIAS);
+    module.exact_mapping = recorded != nullptr;
+    if (SYMBOL_SOURCE_TRUSTED) {
+        module.symbols = wosdbg::parse_elf_symtab(ELF, BIAS);
+        module.sections = wosdbg::parse_elf_sections(ELF, BIAS);
+    }
     session.modules.push_back(std::move(module));
 }
 
 void DebugAnalysisService::discover_modules(DumpSession& session, bool allow_external_discovery) {
+    if (!session.dump->modules.empty()) {
+        constexpr uint32_t IMAGE_MAIN = 1U << 0;
+        constexpr uint32_t IMAGE_INTERPRETER = 1U << 1;
+        auto catalog_candidates = [&](const wosdbg::CoreDumpModule& module) {
+            QStringList candidates;
+            QString guest_path = module.path;
+            while (guest_path.startsWith('/')) {
+                guest_path.remove(0, 1);
+            }
+            if (!guest_path.isEmpty()) {
+                candidates << QDir::current().absoluteFilePath(QString("toolchain/sysroot/%1").arg(guest_path));
+                candidates << QDir::current().absoluteFilePath(QString("ktest-data/sysroot/%1").arg(guest_path));
+            }
+            QString const BASENAME = QFileInfo(module.path).fileName();
+            if (!BASENAME.isEmpty()) {
+                candidates << QDir::current().absoluteFilePath(QString("toolchain/mlibc-build/%1").arg(BASENAME));
+                candidates << QDir::current().absoluteFilePath(QString("ktest-data/mlibc-build/%1").arg(BASENAME));
+                const Config& cfg = (config != nullptr) ? *config : ConfigService::instance().get_config();
+                QString const CONFIGURED = cfg.find_elf_path_for_binary(BASENAME);
+                if (!CONFIGURED.isEmpty()) {
+                    candidates << CONFIGURED;
+                }
+            }
+            candidates << default_elf_candidates(module.path);
+            candidates << build_id_debug_candidates(module.build_id_hex());
+            candidates.removeDuplicates();
+            return candidates;
+        };
+
+        for (const auto& recorded : session.dump->modules) {
+            QString role = "shared-object";
+            if ((recorded.flags & IMAGE_MAIN) != 0U) {
+                role = "main";
+            } else if ((recorded.flags & IMAGE_INTERPRETER) != 0U) {
+                role = "interpreter";
+            }
+
+            QString selected;
+            if (role == "main" && !session.dump->embedded_elf().isEmpty() &&
+                (recorded.build_id.isEmpty() || recorded.build_id_hex().compare(session.embedded_build_id, Qt::CaseInsensitive) == 0)) {
+                selected = "embedded:main";
+            } else if (allow_external_discovery) {
+                QStringList const CANDIDATES = catalog_candidates(recorded);
+                selected = recorded.build_id.isEmpty() ? first_existing_candidate(CANDIDATES)
+                                                       : first_candidate_with_build_id(CANDIDATES, recorded.build_id_hex());
+            }
+
+            bool memory_matched = false;
+            if (!selected.isEmpty() && !selected.startsWith("embedded:") && recorded.build_id.isEmpty()) {
+                QByteArray const ELF = read_file_bytes_quiet(selected);
+                memory_matched = runtime_base_matches_dump(*session.dump, ELF, wosdbg::elf_image_info(ELF), recorded.load_base);
+            }
+            add_module(session, selected, role, recorded.load_base, memory_matched, &recorded);
+        }
+        if (!session.kernel_elf_path.isEmpty()) {
+            add_module(session, session.kernel_elf_path, "kernel", 0, true);
+        }
+        std::ranges::sort(session.modules, [](const DumpSession::LoadedModule& a, const DumpSession::LoadedModule& b) {
+            return a.base + a.first_load_vaddr < b.base + b.first_load_vaddr;
+        });
+        return;
+    }
+
     QStringList candidates;
     auto append_candidate = [&](const QString& path) {
         QString const CLEAN = canonical_path_or_absolute(path);
@@ -2289,7 +2457,10 @@ void DebugAnalysisService::discover_modules(DumpSession& session, bool allow_ext
     }
 
     if (!session.dump->embedded_elf().isEmpty()) {
-        add_module(session, "embedded:main", "main", 0, true);
+        const auto INFO = wosdbg::elf_image_info(session.dump->embedded_elf());
+        if (auto base = wosdbg::elf_load_bias_from_runtime_entry(INFO, session.dump->task_entry)) {
+            add_module(session, "embedded:main", "main", *base, true);
+        }
     }
 
     for (const auto& path : std::as_const(candidates)) {
@@ -2312,6 +2483,13 @@ void DebugAnalysisService::discover_modules(DumpSession& session, bool allow_ext
         } else if (path == session.binary_elf_path) {
             role = "main";
         }
+        if (role == "main") {
+            auto main_base = wosdbg::elf_load_bias_from_runtime_entry(info, session.dump->task_entry);
+            if (!main_base) {
+                continue;
+            }
+            base = *main_base;
+        }
         if (info.type == 3) {
             if (base == 0) {
                 if (auto discovered = find_runtime_base_by_bytes(*session.dump, ELF, info)) {
@@ -2321,7 +2499,10 @@ void DebugAnalysisService::discover_modules(DumpSession& session, bool allow_ext
                     continue;
                 }
             } else {
-                matched = !wosdbg::elf_bytes_at_runtime_va(ELF, base + info.load_segments.front().vaddr, base, 16).empty();
+                // A kernel-recorded bias establishes placement, but it does not
+                // prove that this host file is the mapped object. Only label it
+                // memory-matched after comparing bytes captured in the dump.
+                matched = runtime_base_matches_dump(*session.dump, ELF, info, base);
             }
         }
         add_module(session, path, role, base, matched);

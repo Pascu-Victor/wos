@@ -160,11 +160,16 @@ constexpr uint64_t V2_SCALAR_BYTES = 13ULL * 8ULL;
 constexpr uint64_t V2_PATH_BYTES = 256ULL * 3ULL;
 constexpr uint64_t V3_STRING_BYTES = 64ULL * 3ULL;
 constexpr uint64_t V3_SCALAR_BYTES = 36ULL * 8ULL;
+constexpr uint64_t V4_SCALAR_BYTES = 4ULL * 8ULL;
 constexpr uint64_t SEGMENT_ENTRY_SIZE_V1 = 32;
 constexpr uint64_t SEGMENT_ENTRY_SIZE_V2 = 48;
 constexpr uint64_t MAX_SEGMENT_ENTRY_SIZE = 4096;
+constexpr uint64_t MODULE_ENTRY_SIZE_V4 = 352;
+constexpr uint64_t MAX_MODULE_ENTRY_SIZE = 4096;
+constexpr uint64_t MODULE_BUILD_ID_MAX = 32;
 constexpr uint64_t V2_HEADER_SIZE = MIN_HEADER_SIZE + V2_SCALAR_BYTES + V2_PATH_BYTES;
 constexpr uint64_t V3_HEADER_SIZE = V2_HEADER_SIZE + V3_STRING_BYTES + V3_SCALAR_BYTES;
+constexpr uint64_t V4_HEADER_SIZE = V3_HEADER_SIZE + V4_SCALAR_BYTES;
 
 struct FileRange {
     uint64_t start;
@@ -245,9 +250,9 @@ CoreDumpParseResult parse_core_dump_checked(const QByteArray& data, const CoreDu
         return fail(CoreDumpParseStatus::CORRUPT,
                     QString("bad coredump magic %1; expected %2").arg(format_u64(dump.magic), format_u64(COREDUMP_MAGIC)));
     }
-    if (dump.version < 1 || dump.version > 3) {
+    if (dump.version < 1 || dump.version > 4) {
         return fail(CoreDumpParseStatus::UNSUPPORTED_VERSION,
-                    QString("unsupported coredump version %1; supported versions are 1-3").arg(dump.version), 8);
+                    QString("unsupported coredump version %1; supported versions are 1-4").arg(dump.version), 8);
     }
     if (dump.header_size < MIN_HEADER_SIZE) {
         return fail(CoreDumpParseStatus::CORRUPT,
@@ -257,7 +262,10 @@ CoreDumpParseResult parse_core_dump_checked(const QByteArray& data, const CoreDu
         return fail(CoreDumpParseStatus::TRUNCATED,
                     QString("header_size %1 extends beyond %2-byte file").arg(dump.header_size).arg(DATA_SIZE), DATA_SIZE);
     }
-    const uint64_t VERSION_HEADER_SIZE = dump.version == 1 ? MIN_HEADER_SIZE : dump.version == 2 ? V2_HEADER_SIZE : V3_HEADER_SIZE;
+    const uint64_t VERSION_HEADER_SIZE = dump.version == 1   ? MIN_HEADER_SIZE
+                                         : dump.version == 2 ? V2_HEADER_SIZE
+                                         : dump.version == 3 ? V3_HEADER_SIZE
+                                                             : V4_HEADER_SIZE;
     if (dump.header_size < VERSION_HEADER_SIZE) {
         return fail(CoreDumpParseStatus::CORRUPT,
                     QString("v%1 header_size %2 is smaller than the required %3 bytes")
@@ -416,6 +424,16 @@ CoreDumpParseResult parse_core_dump_checked(const QByteArray& data, const CoreDu
             dump.egid = read_le<uint64_t>(d + off);
             off += 8;
             dump.task_flags = read_le<uint64_t>(d + off);
+            off += 8;
+            if (dump.version >= 4 && dump.header_size >= off + V4_SCALAR_BYTES) {
+                dump.module_count = read_le<uint64_t>(d + off);
+                off += 8;
+                dump.module_entry_size = read_le<uint64_t>(d + off);
+                off += 8;
+                dump.module_table_offset = read_le<uint64_t>(d + off);
+                off += 8;
+                dump.module_snapshot_status = read_le<uint64_t>(d + off);
+            }
         }
     }
     if (dump.segment_entry_size < SEGMENT_ENTRY_SIZE_V1 || dump.segment_entry_size > MAX_SEGMENT_ENTRY_SIZE) {
@@ -445,6 +463,76 @@ CoreDumpParseResult parse_core_dump_checked(const QByteArray& data, const CoreDu
     if (table_end > DATA_SIZE) {
         return fail(CoreDumpParseStatus::TRUNCATED, QString("segment table ends at %1 beyond %2-byte file").arg(table_end).arg(DATA_SIZE),
                     DATA_SIZE);
+    }
+
+    uint64_t metadata_end = table_end;
+    if (dump.version >= 4) {
+        if (dump.module_entry_size < MODULE_ENTRY_SIZE_V4 || dump.module_entry_size > MAX_MODULE_ENTRY_SIZE) {
+            return fail(CoreDumpParseStatus::CORRUPT,
+                        QString("module entry size %1 is outside supported range %2-%3")
+                            .arg(dump.module_entry_size)
+                            .arg(MODULE_ENTRY_SIZE_V4)
+                            .arg(MAX_MODULE_ENTRY_SIZE),
+                        dump.module_table_offset);
+        }
+        if (dump.module_count > limits.max_modules) {
+            return fail(CoreDumpParseStatus::TOO_LARGE,
+                        QString("module count %1 exceeds limit %2").arg(dump.module_count).arg(limits.max_modules),
+                        dump.module_table_offset);
+        }
+        if (dump.module_table_offset < table_end) {
+            return fail(CoreDumpParseStatus::CORRUPT, "module table overlaps the header or segment table", dump.module_table_offset);
+        }
+        uint64_t module_table_bytes = 0;
+        if (!checked_mul(dump.module_count, dump.module_entry_size, &module_table_bytes) ||
+            !checked_add(dump.module_table_offset, module_table_bytes, &metadata_end)) {
+            return fail(CoreDumpParseStatus::CORRUPT, "module table range overflows uint64", dump.module_table_offset);
+        }
+        if (metadata_end > DATA_SIZE) {
+            return fail(CoreDumpParseStatus::TRUNCATED,
+                        QString("module table ends at %1 beyond %2-byte file").arg(metadata_end).arg(DATA_SIZE), DATA_SIZE);
+        }
+        if (dump.module_snapshot_status > 4) {
+            return fail(CoreDumpParseStatus::CORRUPT, QString("module snapshot status %1 is invalid").arg(dump.module_snapshot_status),
+                        dump.module_table_offset);
+        }
+
+        dump.modules.reserve(static_cast<size_t>(dump.module_count));
+        for (uint64_t i = 0; i < dump.module_count; ++i) {
+            uint64_t const MOFF_U64 = dump.module_table_offset + (i * dump.module_entry_size);
+            size_t const MOFF = static_cast<size_t>(MOFF_U64);
+            CoreDumpModule module{};
+            module.load_base = read_le<uint64_t>(d + MOFF);
+            module.image_start = read_le<uint64_t>(d + MOFF + 8);
+            module.image_end = read_le<uint64_t>(d + MOFF + 16);
+            module.text_start = read_le<uint64_t>(d + MOFF + 24);
+            module.text_end = read_le<uint64_t>(d + MOFF + 32);
+            module.entry = read_le<uint64_t>(d + MOFF + 40);
+            module.dynamic_addr = read_le<uint64_t>(d + MOFF + 48);
+            module.flags = read_le<uint32_t>(d + MOFF + 56);
+            uint8_t const BUILD_ID_SIZE = static_cast<uint8_t>(d[MOFF + 60]);
+            if (BUILD_ID_SIZE > MODULE_BUILD_ID_MAX) {
+                return fail(CoreDumpParseStatus::CORRUPT,
+                            QString("module %1 build-ID size %2 exceeds %3").arg(i).arg(BUILD_ID_SIZE).arg(MODULE_BUILD_ID_MAX),
+                            MOFF_U64 + 60);
+            }
+            if (module.image_start >= module.image_end || module.image_end > 0x0000800000000000ULL) {
+                return fail(CoreDumpParseStatus::CORRUPT, QString("module %1 has an invalid runtime image range").arg(i), MOFF_U64 + 8);
+            }
+            bool const EMPTY_TEXT = module.text_start == 0 && module.text_end == 0;
+            bool const VALID_TEXT =
+                module.text_start >= module.image_start && module.text_start < module.text_end && module.text_end <= module.image_end;
+            if (!EMPTY_TEXT && !VALID_TEXT) {
+                return fail(CoreDumpParseStatus::CORRUPT, QString("module %1 has an invalid executable range").arg(i), MOFF_U64 + 24);
+            }
+            module.build_id = QByteArray(d + MOFF + 64, BUILD_ID_SIZE);
+            size_t path_offset = MOFF + 96;
+            if (std::memchr(d + path_offset, '\0', 256) == nullptr) {
+                return fail(CoreDumpParseStatus::CORRUPT, QString("module %1 path is not NUL terminated").arg(i), MOFF_U64 + 96);
+            }
+            module.path = parse_c_string(d, path_offset, 256);
+            dump.modules.push_back(std::move(module));
+        }
     }
 
     dump.segments.reserve(static_cast<size_t>(dump.segment_count));
@@ -483,8 +571,8 @@ CoreDumpParseResult parse_core_dump_checked(const QByteArray& data, const CoreDu
             if (!checked_add(seg.file_offset, seg.size, &payload_end)) {
                 return fail(CoreDumpParseStatus::CORRUPT, QString("segment %1 file range overflows").arg(i), SOFF_U64 + 16);
             }
-            if (seg.file_offset < table_end) {
-                return fail(CoreDumpParseStatus::CORRUPT, QString("segment %1 payload overlaps header or segment table").arg(i),
+            if (seg.file_offset < metadata_end) {
+                return fail(CoreDumpParseStatus::CORRUPT, QString("segment %1 payload overlaps coredump metadata tables").arg(i),
                             SOFF_U64 + 16);
             }
             if (payload_end > DATA_SIZE) {
@@ -519,8 +607,8 @@ CoreDumpParseResult parse_core_dump_checked(const QByteArray& data, const CoreDu
         if (dump.elf_offset == 0 || !checked_add(dump.elf_offset, dump.elf_size, &elf_end)) {
             return fail(CoreDumpParseStatus::CORRUPT, "embedded ELF range is invalid", dump.elf_offset);
         }
-        if (dump.elf_offset < table_end) {
-            return fail(CoreDumpParseStatus::CORRUPT, "embedded ELF overlaps header or segment table", dump.elf_offset);
+        if (dump.elf_offset < metadata_end) {
+            return fail(CoreDumpParseStatus::CORRUPT, "embedded ELF overlaps coredump metadata tables", dump.elf_offset);
         }
         if (elf_end > DATA_SIZE) {
             return fail(CoreDumpParseStatus::TRUNCATED, QString("embedded ELF ends at %1 beyond %2-byte file").arg(elf_end).arg(DATA_SIZE),

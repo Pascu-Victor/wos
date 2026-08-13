@@ -2,9 +2,12 @@
 
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <platform/dbg/dbg.hpp>
 #include <platform/loader/elf_loader.hpp>
+#include <platform/mm/user_layout.hpp>
 #include <platform/mm/virt.hpp>
+#include <platform/random/entropy.hpp>
 #include <platform/sys/spinlock.hpp>
 #include <util/list.hpp>
 
@@ -31,6 +34,23 @@ auto min_u64(uint64_t a, uint64_t b) -> uint64_t { return a < b ? a : b; }
 
 auto max_u64(uint64_t a, uint64_t b) -> uint64_t { return a > b ? a : b; }
 
+auto checked_add(uint64_t lhs, uint64_t rhs, uint64_t& result) -> bool {
+    if (lhs > std::numeric_limits<uint64_t>::max() - rhs) {
+        return false;
+    }
+    result = lhs + rhs;
+    return true;
+}
+
+auto checked_page_align_up(uint64_t value, uint64_t& result) -> bool {
+    constexpr uint64_t MASK = mm::paging::PAGE_SIZE - 1;
+    if (value > std::numeric_limits<uint64_t>::max() - MASK) {
+        return false;
+    }
+    result = (value + MASK) & ~MASK;
+    return true;
+}
+
 auto stack_top(const Thread* thread) -> uint64_t {
     if (thread == nullptr || thread->stack_size == 0) {
         return 0;
@@ -46,11 +66,25 @@ void free_mapped_user_range(mm::paging::PageTable* page_table, uint64_t start, u
     uint64_t const LOW = page_align_down(start);
     uint64_t const HIGH = page_align_up(end);
     for (uint64_t addr = LOW; addr < HIGH; addr += mm::paging::PAGE_SIZE) {
-        if (mm::virt::translate(page_table, addr) == mm::virt::PADDR_INVALID) {
+        if (!mm::virt::is_page_mapped_or_reserved(page_table, addr)) {
             continue;
         }
         mm::virt::unmap_page(page_table, addr);
     }
+}
+
+auto map_zeroed_user_range(mm::paging::PageTable* page_table, uint64_t start, uint64_t size, const char* allocation_name) -> bool {
+    for (uint64_t offset = 0; offset < size; offset += mm::paging::PAGE_SIZE) {
+        void* page =
+            mm::phys::page_alloc_with_reclaim_may_fail(mm::PhysicalPageOwner::USER_THREAD_TLS, mm::paging::PAGE_SIZE, allocation_name);
+        if (page == nullptr) {
+            return false;
+        }
+        std::memset(page, 0, mm::paging::PAGE_SIZE);
+        auto const PHYS = reinterpret_cast<uint64_t>(mm::addr::get_phys_pointer(reinterpret_cast<uint64_t>(page)));
+        mm::virt::map_page(page_table, start + offset, PHYS, mm::paging::page_types::USER | mm::paging::PAGE_NX);
+    }
+    return true;
 }
 
 auto write_mapped_user_bytes(mm::paging::PageTable* page_table, uint64_t vaddr, const void* source, size_t size) -> bool {
@@ -108,8 +142,9 @@ bool ensure_stack_backing(Thread* thread, mm::paging::PageTable* page_table, uin
             return false;
         }
 
+        std::memset(page, 0, mm::paging::PAGE_SIZE);
         auto const PHYS = reinterpret_cast<uint64_t>(mm::addr::get_phys_pointer(reinterpret_cast<uint64_t>(page)));
-        mm::virt::map_page(page_table, addr, PHYS, mm::paging::page_types::USER);
+        mm::virt::map_page(page_table, addr, PHYS, mm::paging::page_types::USER | mm::paging::PAGE_NX);
     }
 
     if (thread->stack_lowest_backed == 0 || LOW < thread->stack_lowest_backed) {
@@ -158,52 +193,83 @@ bool handle_lazy_stack_fault(Thread* thread, mm::paging::PageTable* page_table, 
 
 Thread* create_thread(uint64_t stack_size, uint64_t tls_size, mm::paging::PageTable* page_table, uint64_t initial_tid,
                       const ker::loader::elf::TlsModule& tls_info) {
+    if (page_table == nullptr) {
+        return nullptr;
+    }
+
     auto* thread = new Thread();
     if (thread == nullptr) {
         log::error("create_thread: failed to allocate Thread object");
         return nullptr;
     }
-    thread->stack_size = stack_size;
-    thread->tls_size = tls_size;
 
     // Use the actual TLS size from PT_TLS segment if available, otherwise use provided size
     uint64_t const ACTUAL_TLS_SIZE = (tls_info.tls_size > 0) ? tls_info.tls_size : tls_size;
 
-    // Allocate memory for TLS + TCB + SafeStack
     // TCB structure is ~136 bytes + stack canary + padding
     uint64_t const TCB_SIZE = 256;          // Extra space for mlibc's Tcb structure
     uint64_t const SAFESTACK_SIZE = 65536;  // 64KB for SafeStack unsafe stack
-    uint64_t const TOTAL_TLS_SIZE = ACTUAL_TLS_SIZE + TCB_SIZE + SAFESTACK_SIZE;
-    uint64_t const ALIGNED_TOTAL_SIZE = page_align_up(TOTAL_TLS_SIZE);
-
-    // Keep the user ABI contiguous while backing the mapping with independent
-    // order-0 pages. Process creation only needs a contiguous virtual TLS
-    // range; requiring one physical run makes fork/exec fail under harmless
-    // buddy fragmentation.
-    uint64_t const TLS_VIRT_ADDR = 0x7FFF00000000ULL - ALIGNED_TOTAL_SIZE;
-    uint64_t const STACK_VIRT_ADDR = TLS_VIRT_ADDR - stack_size;
-    thread->magic = 0xDEADBEEF;
-
-    for (uint64_t offset = 0; offset < ALIGNED_TOTAL_SIZE; offset += mm::paging::PAGE_SIZE) {
-        void* tls_page =
-            mm::phys::page_alloc_with_reclaim_may_fail(mm::PhysicalPageOwner::USER_THREAD_TLS, mm::paging::PAGE_SIZE, "thread_tls_page");
-        if (tls_page == nullptr) {
-            log::error("create_thread: failed to allocate TLS page offset=%llu total=%llu", static_cast<unsigned long long>(offset),
-                       static_cast<unsigned long long>(ALIGNED_TOTAL_SIZE));
-            free_mapped_user_range(page_table, TLS_VIRT_ADDR, TLS_VIRT_ADDR + offset);
-            delete thread;
-            return nullptr;
-        }
-        std::memset(tls_page, 0, mm::paging::PAGE_SIZE);
-        auto const TLS_PHYS = reinterpret_cast<uint64_t>(mm::addr::get_phys_pointer(reinterpret_cast<uint64_t>(tls_page)));
-        mm::virt::map_page(page_table, TLS_VIRT_ADDR + offset, TLS_PHYS, mm::paging::page_types::USER);
+    uint64_t const GUARD_SIZE = mm::paging::PAGE_SIZE;
+    uint64_t aligned_stack_size = 0;
+    uint64_t tls_and_tcb_size = 0;
+    uint64_t aligned_tls_size = 0;
+    uint64_t layout_size = 0;
+    bool const SIZES_VALID = stack_size != 0 && checked_page_align_up(stack_size, aligned_stack_size) &&
+                             checked_add(ACTUAL_TLS_SIZE, TCB_SIZE, tls_and_tcb_size) &&
+                             checked_page_align_up(tls_and_tcb_size, aligned_tls_size) &&
+                             checked_add(GUARD_SIZE, aligned_stack_size, layout_size) &&
+                             checked_add(layout_size, GUARD_SIZE, layout_size) && checked_add(layout_size, aligned_tls_size, layout_size) &&
+                             checked_add(layout_size, GUARD_SIZE, layout_size) && checked_add(layout_size, SAFESTACK_SIZE, layout_size) &&
+                             checked_add(layout_size, GUARD_SIZE, layout_size) && aligned_stack_size > sizeof(cpu::PerCpu);
+    if (!SIZES_VALID) {
+        log::error("create_thread: invalid stack/TLS layout sizes");
+        delete thread;
+        return nullptr;
     }
+
+    uint64_t layout_base = 0;
+    if (!mm::user_layout::choose_thread_region(page_table, layout_size, layout_base)) {
+        log::error("create_thread: failed to select a collision-free user layout");
+        delete thread;
+        return nullptr;
+    }
+
+    uint64_t const STACK_VIRT_ADDR = layout_base + GUARD_SIZE;
+    uint64_t const STACK_TOP = STACK_VIRT_ADDR + aligned_stack_size;
+    uint64_t const TLS_VIRT_ADDR = STACK_TOP + GUARD_SIZE;
+    uint64_t const TLS_END = TLS_VIRT_ADDR + aligned_tls_size;
+    uint64_t const SAFESTACK_VIRT_ADDR = TLS_END + GUARD_SIZE;
+    uint64_t const SAFESTACK_END = SAFESTACK_VIRT_ADDR + SAFESTACK_SIZE;
+
+    uint64_t stack_canary = 0;
+    if (!random::entropy::get_bytes(&stack_canary, sizeof(stack_canary))) {
+        log::error("create_thread: entropy unavailable for stack canary");
+        delete thread;
+        return nullptr;
+    }
+    // A NUL low byte preserves the conventional string-overflow tripwire
+    // without exposing or logging any of the remaining random canary bytes.
+    stack_canary &= ~0xFFULL;
+    if (stack_canary == 0) {
+        stack_canary = 0x100;
+    }
+
+    // Reserve the whole region before backing it. Interior non-present stack
+    // pages remain occupied address space, while the four designated guard
+    // pages stay permanently non-present.
+    mm::virt::reserve_page_range(page_table, layout_base, layout_size / mm::paging::PAGE_SIZE);
+    if (!map_zeroed_user_range(page_table, TLS_VIRT_ADDR, aligned_tls_size, "thread_tls_page") ||
+        !map_zeroed_user_range(page_table, SAFESTACK_VIRT_ADDR, SAFESTACK_SIZE, "thread_safestack_page")) {
+        log::error("create_thread: failed to allocate TLS/SafeStack pages");
+        free_mapped_user_range(page_table, layout_base, layout_base + layout_size);
+        delete thread;
+        return nullptr;
+    }
+
+    thread->magic = 0xDEADBEEF;
 
     // TCB goes at the TOP of the TLS area (highest address)
     uint64_t const TCB_VIRT_ADDR = TLS_VIRT_ADDR + ACTUAL_TLS_SIZE;
-
-    // SafeStack area goes after the TCB
-    uint64_t const SAFESTACK_VIRT_ADDR = TLS_VIRT_ADDR + ACTUAL_TLS_SIZE + TCB_SIZE;
 
     // Initialize the TCB according to mlibc's Tcb structure
     // Set up minimal TCB structure for mlibc
@@ -222,18 +288,17 @@ Thread* create_thread(uint64_t stack_size, uint64_t tls_size, mm::paging::PageTa
     uint64_t const DTV_POINTERS = 0;
     auto const INITIAL_TID = static_cast<uint32_t>(initial_tid);
     uint32_t const DID_EXIT = 0;
-    uint64_t const STACK_CANARY = 0x3000000018ULL;
     uint32_t const CANCEL_BITS = 0;
     bool const TCB_INITIALIZED = write_mapped_user_value(page_table, TCB_VIRT_ADDR, SELF_POINTER) &&
                                  write_mapped_user_value(page_table, TCB_VIRT_ADDR + 0x08, DTV_SIZE) &&
                                  write_mapped_user_value(page_table, TCB_VIRT_ADDR + 0x10, DTV_POINTERS) &&
                                  write_mapped_user_value(page_table, TCB_VIRT_ADDR + 0x18, INITIAL_TID) &&
                                  write_mapped_user_value(page_table, TCB_VIRT_ADDR + 0x1C, DID_EXIT) &&
-                                 write_mapped_user_value(page_table, TCB_VIRT_ADDR + 0x28, STACK_CANARY) &&
+                                 write_mapped_user_value(page_table, TCB_VIRT_ADDR + 0x28, stack_canary) &&
                                  write_mapped_user_value(page_table, TCB_VIRT_ADDR + 0x30, CANCEL_BITS);
     if (!TCB_INITIALIZED) {
         log::error("create_thread: failed to initialize mapped TCB");
-        free_mapped_user_range(page_table, TLS_VIRT_ADDR, TLS_VIRT_ADDR + ALIGNED_TOTAL_SIZE);
+        free_mapped_user_range(page_table, layout_base, layout_base + layout_size);
         delete thread;
         return nullptr;
     }
@@ -248,27 +313,30 @@ Thread* create_thread(uint64_t stack_size, uint64_t tls_size, mm::paging::PageTa
 
     // Set up key TLS variables:
     // 1. SafeStack pointer at the standard location (offset 0 in TLS segment)
-    uint64_t const SAFESTACK_TOP = SAFESTACK_VIRT_ADDR + SAFESTACK_SIZE;
-
-    uint64_t const SAFESTACK_PTR_VALUE = SAFESTACK_TOP - 512;  // Leave 512 bytes safety margin from top
+    uint64_t const SAFESTACK_PTR_VALUE = SAFESTACK_END - 512;  // Leave 512 bytes safety margin from top
     if (!write_mapped_user_value(page_table, TLS_VIRT_ADDR, SAFESTACK_PTR_VALUE)) {
         log::error("create_thread: failed to initialize SafeStack pointer");
-        free_mapped_user_range(page_table, TLS_VIRT_ADDR, TLS_VIRT_ADDR + ALIGNED_TOTAL_SIZE);
+        free_mapped_user_range(page_table, layout_base, layout_base + layout_size);
         delete thread;
         return nullptr;
     }
 
     // Save TLS mapping info into the Thread object for later initialization
-    thread->tls_size = ALIGNED_TOTAL_SIZE;
+    // Preserve the existing diagnostic extent semantics: tls_size covers the
+    // complete TLS/TCB/SafeStack area (now including its interior guard).
+    thread->tls_size = SAFESTACK_END - TLS_VIRT_ADDR;
     thread->tls_base_virt = TLS_VIRT_ADDR;
     thread->safestack_ptr_value = SAFESTACK_PTR_VALUE;
+    thread->layout_base_virt = layout_base;
+    thread->layout_size = layout_size;
 
     // Stack grows downward, so thread->stack points near the TOP of the reserved stack.
     // The actual syscall scratch area lives in kernel memory on Task::context.
     uint64_t const SCRATCH_AREA_SIZE = sizeof(cpu::PerCpu);
-    thread->stack = STACK_VIRT_ADDR + stack_size - SCRATCH_AREA_SIZE;  // Stack starts above scratch area
+    thread->stack = STACK_TOP - SCRATCH_AREA_SIZE;
+    thread->stack_size = aligned_stack_size;
     thread->stack_base_virt = STACK_VIRT_ADDR;
-    thread->stack_lowest_backed = STACK_VIRT_ADDR + stack_size;
+    thread->stack_lowest_backed = STACK_TOP;
     thread->fsbase = TCB_VIRT_ADDR;
     // User GS_BASE points at the base of the reserved stack range.
     thread->gsbase = STACK_VIRT_ADDR;
@@ -277,17 +345,14 @@ Thread* create_thread(uint64_t stack_size, uint64_t tls_size, mm::paging::PageTa
     thread->tls_phys_ptr = 0;
     thread->stack_phys_ptr = 0;
 
-    uint64_t const STACK_TOP = STACK_VIRT_ADDR + stack_size;
-    uint64_t const INITIAL_STACK_BYTES = min_u64(STACK_INITIAL_BACKING_BYTES, stack_size);
+    uint64_t const INITIAL_STACK_BYTES = min_u64(STACK_INITIAL_BACKING_BYTES, aligned_stack_size);
     bool const INITIAL_STACK_OK = ensure_stack_backing(thread, page_table, STACK_TOP - INITIAL_STACK_BYTES, STACK_TOP) &&
                                   ensure_stack_backing(thread, page_table, STACK_VIRT_ADDR, STACK_VIRT_ADDR + mm::paging::PAGE_SIZE);
     if (!INITIAL_STACK_OK) {
         log::error("create_thread: failed to lazily back initial stack windows stack=0x%llx size=%llu initial=%llu",
                    static_cast<unsigned long long>(STACK_VIRT_ADDR), static_cast<unsigned long long>(stack_size),
                    static_cast<unsigned long long>(INITIAL_STACK_BYTES));
-        free_mapped_user_range(page_table, TLS_VIRT_ADDR, TLS_VIRT_ADDR + ALIGNED_TOTAL_SIZE);
-        free_mapped_user_range(page_table, STACK_TOP - INITIAL_STACK_BYTES, STACK_TOP);
-        free_mapped_user_range(page_table, STACK_VIRT_ADDR, STACK_VIRT_ADDR + mm::paging::PAGE_SIZE);
+        free_mapped_user_range(page_table, layout_base, layout_base + layout_size);
         thread->tls_phys_ptr = 0;
         delete thread;
         return nullptr;
@@ -298,6 +363,19 @@ Thread* create_thread(uint64_t stack_size, uint64_t tls_size, mm::paging::PageTa
     active_threads.push_back(thread);
     active_threads_lock.unlock();
     return thread;
+}
+
+auto range_overlaps_initial_layout(const Thread* thread, uint64_t start, uint64_t size) -> bool {
+    if (thread == nullptr || thread->layout_size == 0 || size == 0) {
+        return false;
+    }
+
+    uint64_t end = 0;
+    uint64_t layout_end = 0;
+    if (!checked_add(start, size, end) || !checked_add(thread->layout_base_virt, thread->layout_size, layout_end)) {
+        return true;
+    }
+    return start < layout_end && thread->layout_base_virt < end;
 }
 
 void destroy_thread(Thread* thread) {

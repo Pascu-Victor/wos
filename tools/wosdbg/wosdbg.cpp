@@ -2581,8 +2581,11 @@ void QemuLogViewer::resolve_symbols_for_coredump() {
     QString elf_path = cfg.find_elf_path_for_binary(binary_name);
 
     if (!elf_path.isEmpty()) {
-        core_dump_symtab = wosdbg::load_symbols_from_file(elf_path);
-        core_dump_sections = wosdbg::load_sections_from_file(elf_path);
+        const auto INFO = wosdbg::elf_image_info_from_file(elf_path);
+        if (auto bias = wosdbg::elf_load_bias_from_runtime_entry(INFO, current_core_dump->task_entry)) {
+            core_dump_symtab = wosdbg::load_symbols_from_file(elf_path, *bias);
+            core_dump_sections = wosdbg::load_sections_from_file(elf_path, *bias);
+        }
     }
 
     // 2. Try embedded ELF in the coredump itself

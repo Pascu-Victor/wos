@@ -90,6 +90,7 @@ constexpr std::string_view PERF_DATA_FILE = "perf.data";
 constexpr std::string_view PROC_ROOT = "/proc/";
 constexpr std::string_view PROC_STAT_SUFFIX = "/stat";
 constexpr std::string_view PROC_CMDLINE_SUFFIX = "/cmdline";
+constexpr std::string_view PROC_IMAGES_SUFFIX = "/images";
 constexpr std::string_view PROC_TASK_SUFFIX = "/task";
 constexpr std::string_view KPERF_PATH = "/proc/kperf";
 constexpr std::string_view KPERFCTL_PATH = "/proc/kperfctl";
@@ -116,6 +117,8 @@ constexpr std::string_view SECTION_PROC_MAP = "--- SECTION PROC_MAP ---\n";
 constexpr std::string_view SECTION_PROC_MAP_END = "--- END PROC_MAP ---\n";
 constexpr std::string_view SECTION_PEER_MAP = "--- SECTION PEER_MAP ---\n";
 constexpr std::string_view SECTION_PEER_MAP_END = "--- END PEER_MAP ---\n";
+constexpr std::string_view SECTION_IMAGE_MAP = "--- SECTION IMAGE_MAP ---\n";
+constexpr std::string_view SECTION_IMAGE_MAP_END = "--- END IMAGE_MAP ---\n";
 constexpr std::string_view END_PREFIX = "--- END";
 constexpr std::string_view REALTIME_OFFSET_NS_KEY = "realtime_offset_ns=";
 constexpr std::string_view UNKNOWN_CALLSITE = "?";
@@ -200,6 +203,20 @@ struct StatInfo {
 struct ProcMapEntry {
     uint64_t pid{};
     std::string comm;
+};
+
+struct ImageMapEntry {
+    uint64_t pid{};
+    uint64_t load_base{};
+    uint64_t image_start{};
+    uint64_t image_end{};
+    uint64_t text_start{};
+    uint64_t text_end{};
+    uint64_t entry{};
+    uint64_t dynamic_addr{};
+    uint32_t flags{};
+    std::string build_id;
+    std::string path;
 };
 
 struct EventInfo {
@@ -383,6 +400,7 @@ struct TrackedProc {
     uint64_t pid{};
     std::string comm;
     std::string cmdline;
+    std::string image_map;
     uint64_t last_utime{};
     uint64_t last_stime{};
 };
@@ -452,6 +470,7 @@ auto parse_stat(std::string_view buf, StatInfo& out) -> bool;
 auto collect_stats() -> std::vector<StatInfo>;
 auto collect_main_stats() -> std::vector<StatInfo>;
 auto read_cmdline(uint64_t pid) -> std::string;
+auto read_proc_images(uint64_t pid) -> std::string;
 auto proc_map_line(uint64_t pid, std::string_view comm, std::string_view cmdline) -> std::string;
 auto peer_map_line(uint64_t peer, std::string_view hostname) -> std::string;
 void write_section_timebase(int fd);
@@ -463,10 +482,13 @@ auto write_section_ipc_stats(int fd) -> ssize_t;
 auto write_section_contstat(int fd) -> ssize_t;
 auto write_section_memacc_alloc_totals(int fd) -> ssize_t;
 void write_section_peer_map(int fd);
+void write_section_image_map(int fd, const std::vector<TrackedProc>* tracked = nullptr);
 void save_perf_data();
 void set_recording_enabled(bool enabled, const char* filter = nullptr);
 
 auto parse_proc_map_section(std::string_view buffer) -> std::vector<ProcMapEntry>;
+auto parse_image_map_line(std::string_view line, ImageMapEntry& out) -> bool;
+auto parse_image_map_section(std::string_view buffer) -> std::vector<ImageMapEntry>;
 auto extract_value(std::string_view line, std::string_view key) -> std::string_view;
 auto parse_peer_map_line(std::string_view line, WkiPeerMapEntry& out) -> bool;
 auto parse_peer_map_section(std::string_view buffer) -> std::vector<WkiPeerMapEntry>;

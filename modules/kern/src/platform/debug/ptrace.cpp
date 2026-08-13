@@ -1,7 +1,5 @@
 #include "ptrace.hpp"
 
-#include <extern/elf.h>
-
 #include <abi/ptrace.hpp>
 #include <algorithm>
 #include <array>
@@ -15,12 +13,14 @@
 #include <new>
 #include <platform/dbg/dbg.hpp>
 #include <platform/interrupt/gdt.hpp>
+#include <platform/loader/runtime_images.hpp>
 #include <platform/mm/mm.hpp>
 #include <platform/mm/virt.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
 #include <platform/sys/usercopy.hpp>
 #include <syscalls_impl/process/child_events.hpp>
+#include <syscalls_impl/vmem/sys_vmem.hpp>
 #ifdef WOS_SELFTEST
 #include <platform/mm/phys.hpp>
 #endif
@@ -747,45 +747,32 @@ auto copy_image_path(char* dst, size_t dst_size, const char* src) -> void {
     std::strncpy(dst, src, dst_size - 1);
 }
 
-auto main_image_load_base(const Task& target) -> uint64_t {
-    if (target.elf_buffer == nullptr || target.elf_buffer_size < sizeof(Elf64_Ehdr)) {
-        return target.elf_header_addr;
-    }
-    auto const* ehdr = reinterpret_cast<const Elf64_Ehdr*>(target.elf_buffer);
-    return ehdr->e_type == ET_DYN ? target.elf_header_addr : 0;
+auto read_runtime_image_memory(void* opaque, uint64_t address, void* destination, size_t size) -> bool {
+    auto* target = static_cast<Task*>(opaque);
+    return target != nullptr && ker::mod::sys::usercopy::copy_from_task_mapped(*target, address, destination, size);
 }
 
-auto main_image_text_range(const Task& target, uint64_t load_base, uint64_t& text_addr, uint64_t& text_size) -> void {
-    text_addr = load_base;
-    text_size = 0;
-    if (target.elf_buffer == nullptr || target.elf_buffer_size < sizeof(Elf64_Ehdr)) {
-        return;
-    }
-
-    auto const* ehdr = reinterpret_cast<const Elf64_Ehdr*>(target.elf_buffer);
-    if (ehdr->e_phoff == 0 || ehdr->e_phentsize < sizeof(Elf64_Phdr) ||
-        ehdr->e_phoff + (static_cast<uint64_t>(ehdr->e_phnum) * ehdr->e_phentsize) > target.elf_buffer_size) {
-        return;
-    }
-
-    bool found = false;
-    uint64_t start = UINT64_MAX;
-    uint64_t end = 0;
-    for (Elf64_Half i = 0; i < ehdr->e_phnum; ++i) {
-        auto const* ph =
-            reinterpret_cast<const Elf64_Phdr*>(target.elf_buffer + ehdr->e_phoff + (static_cast<uint64_t>(i) * ehdr->e_phentsize));
-        if (ph->p_type != PT_LOAD || (ph->p_flags & PF_X) == 0) {
-            continue;
-        }
-        found = true;
-        start = std::min(start, ph->p_vaddr + load_base);
-        end = std::max(end, ph->p_vaddr + ph->p_memsz + load_base);
-    }
-
-    if (found && end >= start) {
-        text_addr = start;
-        text_size = end - start;
-    }
+auto snapshot_target_images(Task& target, std::array<ker::loader::runtime::RuntimeImage, ker::loader::runtime::MAX_IMAGES>& runtime_images,
+                            size_t& needed) -> ker::loader::runtime::SnapshotStatus {
+    // Match exec/fork/mmap publication so the kernel-owned extents and every
+    // target-memory read describe one address space.
+    ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;
+    ker::loader::runtime::SnapshotSource const SOURCE{
+        .program_header_addr = target.program_header_addr,
+        .program_header_count = target.program_header_count,
+        .program_header_ent_size = target.program_header_ent_size,
+        .main_elf_header_addr = target.elf_header_addr,
+        .main_load_base = target.image_load_base,
+        .main_image_start = target.image_vaddr_start,
+        .main_image_end = target.image_vaddr_end,
+        .main_entry = target.entry,
+        .interpreter_base = target.interp_base,
+        .interpreter_image_start = target.interp_vaddr_start,
+        .interpreter_image_end = target.interp_vaddr_end,
+        .main_path = target.exe_path.data(),
+        .interpreter_path = "/lib/ld.so",
+    };
+    return ker::loader::runtime::snapshot_images(read_runtime_image_memory, &target, SOURCE, runtime_images, needed);
 }
 
 auto list_images(Task& tracer, Task& target, uint64_t data) -> uint64_t {
@@ -795,49 +782,118 @@ auto list_images(Task& tracer, Task& target, uint64_t data) -> uint64_t {
         return as_error(EFAULT);
     }
 
-    size_t needed = target.interp_base != 0 ? 2 : 1;
+    auto* runtime_images = new (std::nothrow) std::array<ker::loader::runtime::RuntimeImage, ker::loader::runtime::MAX_IMAGES>;
+    if (runtime_images == nullptr) {
+        return as_error(ENOMEM);
+    }
+    size_t needed = 0;
+    (void)snapshot_target_images(target, *runtime_images, needed);
+    if (needed == 0) {
+        delete runtime_images;
+        return as_error(EIO);
+    }
     list.count = needed;
     if (list.capacity < needed) {
+        delete runtime_images;
         if (!ker::mod::sys::usercopy::copy_value_to_task(tracer, data, list)) {
             return as_error(EFAULT);
         }
         return as_error(ENOSPC);
     }
 
-    std::array<abi::ptrace::ImageRecord, 2> images{};
-
-    uint64_t const LOAD_BASE = main_image_load_base(target);
-    uint64_t text_addr = 0;
-    uint64_t text_size = 0;
-    main_image_text_range(target, LOAD_BASE, text_addr, text_size);
-
-    auto& main = images.at(0);
-    std::memset(&main, 0, sizeof(main));
-    copy_image_path(static_cast<char*>(main.path), abi::ptrace::ImageRecord::PATH_LEN, target.exe_path.data());
-    main.load_base = LOAD_BASE;
-    main.text_addr = text_addr;
-    main.text_size = text_size;
-    main.entry = target.entry;
-    main.flags = 1U;
-
-    if (target.interp_base != 0) {
-        auto& interp = images.at(1);
-        std::memset(&interp, 0, sizeof(interp));
-        copy_image_path(static_cast<char*>(interp.path), abi::ptrace::ImageRecord::PATH_LEN, "/lib/ld.so");
-        interp.load_base = target.interp_base;
-        interp.text_addr = target.interp_base;
-        interp.text_size = 0;
-        interp.entry = 0;
-        interp.flags = 2U;
+    auto* images = new (std::nothrow) abi::ptrace::ImageRecord[needed]{};
+    if (images == nullptr) {
+        delete runtime_images;
+        return as_error(ENOMEM);
     }
+    for (size_t i = 0; i < needed; ++i) {
+        auto const& runtime = runtime_images->at(i);
+        auto& image = images[i];
+        copy_image_path(static_cast<char*>(image.path), abi::ptrace::ImageRecord::PATH_LEN, runtime.path.data());
+        image.load_base = runtime.load_base;
+        image.text_addr = runtime.text_start;
+        image.text_size = runtime.text_end >= runtime.text_start ? runtime.text_end - runtime.text_start : 0;
+        image.entry = runtime.entry;
+        image.flags = runtime.flags;
+    }
+    delete runtime_images;
 
-    size_t const IMAGE_BYTES = needed * sizeof(images.at(0));
+    size_t const IMAGE_BYTES = needed * sizeof(images[0]);
     uint64_t const IMAGES_ADDR = reinterpret_cast<uint64_t>(list.images);
     if (!ker::mod::sys::usercopy::ensure_writable(tracer, IMAGES_ADDR, IMAGE_BYTES) ||
-        !ker::mod::sys::usercopy::copy_to_task(tracer, IMAGES_ADDR, images.data(), IMAGE_BYTES) ||
+        !ker::mod::sys::usercopy::copy_to_task(tracer, IMAGES_ADDR, images, IMAGE_BYTES) ||
         !ker::mod::sys::usercopy::copy_value_to_task(tracer, data, list)) {
+        delete[] images;
         return as_error(EFAULT);
     }
+    delete[] images;
+    return 0;
+}
+
+auto list_image_catalog(Task& tracer, Task& target, uint64_t data) -> uint64_t {
+    abi::ptrace::ImageCatalogList list{};
+    if (!ker::mod::sys::usercopy::copy_value_from_task(tracer, data, list) ||
+        !ker::mod::sys::usercopy::ensure_writable(tracer, data, sizeof(list))) {
+        return as_error(EFAULT);
+    }
+    if (list.version != abi::ptrace::IMAGE_CATALOG_VERSION || list.record_size != sizeof(abi::ptrace::ImageCatalogRecord) ||
+        (list.capacity != 0 && list.images == nullptr)) {
+        return as_error(EINVAL);
+    }
+
+    auto* runtime_images = new (std::nothrow) std::array<ker::loader::runtime::RuntimeImage, ker::loader::runtime::MAX_IMAGES>;
+    if (runtime_images == nullptr) {
+        return as_error(ENOMEM);
+    }
+    size_t needed = 0;
+    auto const STATUS = snapshot_target_images(target, *runtime_images, needed);
+    list.count = needed;
+    list.snapshot_status = static_cast<abi::ptrace::image_snapshot_status>(STATUS);
+    list.reserved = 0;
+    if (needed == 0) {
+        delete runtime_images;
+        (void)ker::mod::sys::usercopy::copy_value_to_task(tracer, data, list);
+        return as_error(EIO);
+    }
+    if (list.capacity < needed) {
+        delete runtime_images;
+        if (!ker::mod::sys::usercopy::copy_value_to_task(tracer, data, list)) {
+            return as_error(EFAULT);
+        }
+        return as_error(ENOSPC);
+    }
+
+    auto* images = new (std::nothrow) abi::ptrace::ImageCatalogRecord[needed]{};
+    if (images == nullptr) {
+        delete runtime_images;
+        return as_error(ENOMEM);
+    }
+    for (size_t i = 0; i < needed; ++i) {
+        auto const& runtime = runtime_images->at(i);
+        auto& image = images[i];
+        copy_image_path(static_cast<char*>(image.path), abi::ptrace::ImageCatalogRecord::PATH_LEN, runtime.path.data());
+        image.load_base = runtime.load_base;
+        image.image_start = runtime.image_start;
+        image.image_end = runtime.image_end;
+        image.text_addr = runtime.text_start;
+        image.text_size = runtime.text_end >= runtime.text_start ? runtime.text_end - runtime.text_start : 0;
+        image.entry = runtime.entry;
+        image.dynamic_addr = runtime.dynamic_addr;
+        image.flags = runtime.flags;
+        image.build_id_size = runtime.build_id_size;
+        std::memcpy(static_cast<uint8_t*>(image.build_id), runtime.build_id.data(), sizeof(image.build_id));
+    }
+    delete runtime_images;
+
+    size_t const IMAGE_BYTES = needed * sizeof(images[0]);
+    uint64_t const IMAGES_ADDR = reinterpret_cast<uint64_t>(list.images);
+    if (!ker::mod::sys::usercopy::ensure_writable(tracer, IMAGES_ADDR, IMAGE_BYTES) ||
+        !ker::mod::sys::usercopy::copy_to_task(tracer, IMAGES_ADDR, images, IMAGE_BYTES) ||
+        !ker::mod::sys::usercopy::copy_value_to_task(tracer, data, list)) {
+        delete[] images;
+        return as_error(EFAULT);
+    }
+    delete[] images;
     return 0;
 }
 
@@ -1254,6 +1310,12 @@ auto sys_ptrace(abi::ptrace::request req, uint64_t pid, uint64_t addr, uint64_t 
             ret = require_traced(*tracer, *target);
             if (ret == 0) {
                 ret = list_images(*tracer, *target, data);
+            }
+            break;
+        case abi::ptrace::request::GET_IMAGE_CATALOG:
+            ret = require_traced(*tracer, *target);
+            if (ret == 0) {
+                ret = list_image_catalog(*tracer, *target, data);
             }
             break;
         case abi::ptrace::request::GET_MAPS:

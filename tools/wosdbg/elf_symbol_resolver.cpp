@@ -30,6 +30,9 @@ using std::string;
 static constexpr uint8_t ELF_MAGIC[] = {0x7f, 'E', 'L', 'F'};
 static constexpr uint32_t PT_LOAD = 1;
 static constexpr uint32_t PT_INTERP = 3;
+static constexpr uint16_t ET_EXEC = 2;
+static constexpr uint16_t ET_DYN = 3;
+static constexpr uint32_t PF_X = 1;
 static constexpr uint32_t SHT_SYMTAB = 2;
 static constexpr uint32_t SHT_NOTE = 7;
 static constexpr uint32_t SHT_DYNSYM = 11;
@@ -484,6 +487,31 @@ ElfImageInfo elf_image_info(const QByteArray& elf_bytes) {
     return info;
 }
 
+std::optional<uint64_t> elf_load_bias_from_runtime_entry(const ElfImageInfo& info, uint64_t runtime_entry) {
+    if (!info.valid || info.load_segments.empty()) {
+        return std::nullopt;
+    }
+
+    bool entry_is_executable = false;
+    for (const auto& load : info.load_segments) {
+        if ((load.flags & PF_X) != 0 && info.entry >= load.vaddr && (info.entry - load.vaddr) < load.memsz) {
+            entry_is_executable = true;
+            break;
+        }
+    }
+    if (!entry_is_executable) {
+        return std::nullopt;
+    }
+
+    if (info.type == ET_EXEC) {
+        return runtime_entry == info.entry ? std::optional<uint64_t>{0} : std::nullopt;
+    }
+    if (info.type != ET_DYN || runtime_entry < info.entry) {
+        return std::nullopt;
+    }
+    return runtime_entry - info.entry;
+}
+
 // File-based loading
 static QByteArray read_file_bytes(const QString& path) {
     QFile file(path);
@@ -547,7 +575,8 @@ std::unique_ptr<SymbolTable> load_symbols_from_core_dump(const CoreDump& dump) {
     if (elf.isEmpty()) {
         return nullptr;
     }
-    return parse_elf_symtab(elf);
+    auto bias = elf_load_bias_from_runtime_entry(elf_image_info(elf), dump.task_entry);
+    return bias ? parse_elf_symtab(elf, *bias) : nullptr;
 }
 
 std::unique_ptr<SectionMap> load_sections_from_core_dump(const CoreDump& dump) {
@@ -555,7 +584,8 @@ std::unique_ptr<SectionMap> load_sections_from_core_dump(const CoreDump& dump) {
     if (elf.isEmpty()) {
         return nullptr;
     }
-    return parse_elf_sections(elf);
+    auto bias = elf_load_bias_from_runtime_entry(elf_image_info(elf), dump.task_entry);
+    return bias ? parse_elf_sections(elf, *bias) : nullptr;
 }
 
 // Address resolution

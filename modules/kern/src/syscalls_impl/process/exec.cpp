@@ -25,8 +25,10 @@
 #include <platform/loader/elf_loader.hpp>
 #include <platform/mm/mm.hpp>
 #include <platform/mm/phys.hpp>
+#include <platform/mm/user_layout.hpp>
 #include <platform/perf/perf_events.hpp>
 #include <platform/power/power.hpp>
+#include <platform/random/entropy.hpp>
 #include <platform/sched/frame_class.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
@@ -66,6 +68,8 @@ constexpr size_t EXEC_ARG_BYTES_MAX = static_cast<size_t>(2) * 1024 * 1024;
 constexpr int WOS_SIGKILL = 9;
 constexpr int WOS_SIGSTOP = 19;
 constexpr uint64_t MAX_SPAWN_ACTIONS = 32;
+constexpr size_t AT_RANDOM_BYTES = 16;
+constexpr uint64_t EXEC_DEBUG_STAGING_BIT = 1ULL << 63U;
 using exec_log = ker::mod::dbg::logger<"exec">;
 
 auto exec_cmdline_has_token(const char* cmdline, const char* token) -> bool {
@@ -1118,18 +1122,15 @@ auto append_exec_lazy_file_ranges(LazyVmemRangeVec& out, const loader::elf::ElfL
     return true;
 }
 
-void publish_exec_lazy_ranges(ker::mod::sched::task::Task* task, LazyVmemRangeVec& new_ranges) {
+void swap_exec_lazy_ranges(ker::mod::sched::task::Task* task, LazyVmemRangeVec& new_ranges, LazyVmemRangeVec& old_ranges) {
     if (task == nullptr) {
-        release_lazy_file_refs(new_ranges);
         return;
     }
 
-    LazyVmemRangeVec old_ranges;
     uint64_t const IRQF = task->lazy_vmem_lock.lock_irqsave();
     old_ranges = std::move(task->lazy_vmem_ranges);
     task->lazy_vmem_ranges = std::move(new_ranges);
     task->lazy_vmem_lock.unlock_irqrestore(IRQF);
-    release_lazy_file_refs(old_ranges);
 }
 
 auto read_file_range_fully(int fd, uint8_t* dst, size_t file_size, uint64_t offset, uint64_t size, const char* path, size_t& bytes_read)
@@ -1566,7 +1567,7 @@ auto create_file_backed_process_task(const char* name, vfs::File* owned_file, si
         return nullptr;
     }
 
-    auto* new_task = new mod::sched::task::Task(name, 0, kernel_rsp, mod::sched::task::TaskType::PROCESS);  // NOLINT
+    auto* new_task = new mod::sched::task::Task(name, 0, 0, kernel_rsp, mod::sched::task::TaskType::PROCESS);  // NOLINT
     if (new_task == nullptr) {
         release_inputs();
         return nullptr;
@@ -1834,8 +1835,9 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
     volatile uint64_t canary1 = 0xDEAD'BEEF'CAFE'BABEULL;  // NOLINT
     volatile uint64_t canary2 = 0x1234'5678'9ABC'DEF0ULL;  // NOLINT
 
-    auto* new_task = new sched::task::Task(process_name, FILE_BACKED_ELF ? 0 : reinterpret_cast<uint64_t>(elf_buffer), KERNEL_RSP,
-                                           sched::task::TaskType::PROCESS);
+    auto* new_task =
+        new sched::task::Task(process_name, FILE_BACKED_ELF ? 0 : reinterpret_cast<uint64_t>(elf_buffer),
+                              FILE_BACKED_ELF ? 0 : static_cast<size_t>(FILE_SIZE), KERNEL_RSP, sched::task::TaskType::PROCESS);
 
     // Check canaries for stack corruption
     if (canary1 != 0xDEAD'BEEF'CAFE'BABEULL || canary2 != 0x1234'5678'9ABC'DEF0ULL) {  // NOLINT
@@ -2119,16 +2121,34 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
         return 0;
     }
 
+    std::array<uint8_t, AT_RANDOM_BYTES> at_random{};
+    if (!mod::random::entropy::get_bytes(at_random.data(), at_random.size())) {
+        delete[] envp_addrs;
+        delete[] argv_addrs;
+        cleanup_unpublished_task();
+        return 0;
+    }
+    uint64_t const AT_RANDOM_ADDR = push_to_stack(at_random.data(), at_random.size());
+    std::memset(at_random.data(), 0, at_random.size());
+    if (AT_RANDOM_ADDR == 0) {
+        delete[] envp_addrs;
+        delete[] argv_addrs;
+        cleanup_unpublished_task();
+        return 0;
+    }
+    new_task->at_random_addr = AT_RANDOM_ADDR;
+
     // Align to 16 bytes after string data, accounting for structured data parity.
     // Structured data: auxv (variable) + envp array + argv array + argc.
-    // auxv: 6 core pairs + optional AT_BASE pair + AT_NULL pair.
+    // auxv: 7 core pairs (including AT_RANDOM and EXECFN), optional
+    // AT_BASE pair, and the AT_NULL pair.
     {
         constexpr uint64_t ALIGNMENT = 16;
         uint64_t const CURRENT_ADDR = user_stack_virt - current_virt_offset;
         uint64_t const ALIGNED = CURRENT_ADDR & ~(ALIGNMENT - 1);
         current_virt_offset += (CURRENT_ADDR - ALIGNED);
 
-        constexpr size_t AUXV_QWORDS_BASE = 14;  // 6 core pairs (including EXECFN) + AT_NULL pair
+        constexpr size_t AUXV_QWORDS_BASE = 16;
         const size_t AUXV_QWORDS = AUXV_QWORDS_BASE + (new_task->interp_base != 0 ? 2 : 0);
         size_t const STRUCTURED_QWORDS = AUXV_QWORDS + (envp_count + 1) + (argv_count + 1) + 1;
         if (STRUCTURED_QWORDS % 2 != 0) {
@@ -2147,11 +2167,12 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
         constexpr uint64_t AT_PAGESZ = 6;
         constexpr uint64_t AT_BASE = 7;
         constexpr uint64_t AT_ENTRY = 9;
+        constexpr uint64_t AT_RANDOM = 25;
         constexpr uint64_t AT_EXECFN = 31;
 
         // Build auxv dynamically: always include core entries, conditionally add AT_BASE
         bool built_correct_auxv = true;
-        ker::util::SmallVec<uint64_t, 16> auxv;
+        ker::util::SmallVec<uint64_t, 20> auxv;
         built_correct_auxv &= auxv.push_back(AT_PAGESZ);
         built_correct_auxv &= auxv.push_back(mod::mm::paging::PAGE_SIZE);
         built_correct_auxv &= auxv.push_back(AT_ENTRY);
@@ -2166,6 +2187,8 @@ auto wos_proc_exec_impl(const char* path, const char* const* argv, const char* c
             built_correct_auxv &= auxv.push_back(AT_BASE);
             built_correct_auxv &= auxv.push_back(new_task->interp_base);
         }
+        built_correct_auxv &= auxv.push_back(AT_RANDOM);
+        built_correct_auxv &= auxv.push_back(AT_RANDOM_ADDR);
         built_correct_auxv &= auxv.push_back(AT_EXECFN);
         built_correct_auxv &= auxv.push_back(EXECFN_ADDR);
         built_correct_auxv &= auxv.push_back(AT_NULL);
@@ -2576,6 +2599,14 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
     uint8_t* old_elf_buffer = task->elf_buffer;
     vfs::File* old_exec_image_file = task->exec_image_file;
     auto* old_thread = task->thread;
+    uint64_t const DEBUG_STAGING_PID = task->pid | EXEC_DEBUG_STAGING_BIT;
+    if (DEBUG_STAGING_PID == task->pid) {
+        release_exec_file_once();
+        delete[] elf_buffer;
+        free_kernel_arg_env_once();
+        return static_cast<uint64_t>(-EOVERFLOW);
+    }
+    loader::debug::unregister_process(DEBUG_STAGING_PID);
     auto* new_pagemap = mm::virt::create_pagemap();
     if (new_pagemap == nullptr) {
         end_local_proc_stage(task, perf::WkiPerfLocalProcOp::NEW_IMAGE, NEW_IMAGE_STAGE, -ENOMEM, 0, WOS_PERF_CALLSITE());
@@ -2591,14 +2622,18 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
     }
 
     // --- Create new thread (user stack + TLS) ---
-    ker::loader::elf::TlsModule const TLS_INFO =
-        FILE_BACKED_ELF ? loader::elf::extract_tls_info(prepared_elf.view) : loader::elf::extract_tls_info(static_cast<void*>(elf_buffer));
-    auto* new_thread =
-        mod::sched::threading::create_thread(ker::mod::mm::USER_STACK_SIZE, TLS_INFO.tls_size, new_pagemap, task->pid, TLS_INFO);
+    ker::loader::elf::TlsModule tls_info{};
+    bool const ELF_CONTRACT_VALID = FILE_BACKED_ELF ? loader::elf::inspect_tls(prepared_elf.view, tls_info)
+                                                    : loader::elf::inspect_tls(elf_buffer, static_cast<size_t>(FILE_SIZE), tls_info);
+    auto* new_thread = ELF_CONTRACT_VALID ? mod::sched::threading::create_thread(ker::mod::mm::USER_STACK_SIZE, tls_info.tls_size,
+                                                                                 new_pagemap, task->pid, tls_info)
+                                          : nullptr;
+    uint64_t new_mmap_cursor = 0;
     char* new_name = nullptr;
     LazyVmemRangeVec new_lazy_ranges;
     bool new_lazy_ranges_published = false;
     auto cleanup_new_image = [&]() {
+        loader::debug::unregister_process(DEBUG_STAGING_PID);
         release_exec_file_once();
         if (!new_lazy_ranges_published) {
             release_lazy_file_refs(new_lazy_ranges);
@@ -2624,19 +2659,25 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
             elf_buffer = nullptr;
         }
     };
+    if (!ELF_CONTRACT_VALID) {
+        end_local_proc_stage(task, perf::WkiPerfLocalProcOp::NEW_IMAGE, NEW_IMAGE_STAGE, -ENOEXEC, 0, WOS_PERF_CALLSITE());
+        cleanup_new_image();
+        free_kernel_arg_env_once();
+        return static_cast<uint64_t>(-ENOEXEC);
+    }
     if (new_thread == nullptr) {
         end_local_proc_stage(task, perf::WkiPerfLocalProcOp::NEW_IMAGE, NEW_IMAGE_STAGE, -ENOMEM, 0, WOS_PERF_CALLSITE());
         cleanup_new_image();
         free_kernel_arg_env_once();
         return static_cast<uint64_t>(-ENOMEM);
     }
+    if (!mod::mm::user_layout::choose_mmap_cursor(new_mmap_cursor)) {
+        end_local_proc_stage(task, perf::WkiPerfLocalProcOp::NEW_IMAGE, NEW_IMAGE_STAGE, -EIO, 0, WOS_PERF_CALLSITE());
+        cleanup_new_image();
+        free_kernel_arg_env_once();
+        return static_cast<uint64_t>(-EIO);
+    }
     end_local_proc_stage(task, perf::WkiPerfLocalProcOp::NEW_IMAGE, NEW_IMAGE_STAGE, 0, 0, WOS_PERF_CALLSITE());
-
-    // execve() reuses the same PID. The loader debug registry is keyed by PID,
-    // so we must discard the old image's symbol metadata before registering the
-    // new ELF or lookups like __safestack_unsafe_stack_ptr can resolve against
-    // stale offsets from the previous process image.
-    loader::debug::unregister_process(task->pid);
 
     // --- Load ELF into new pagemap ---
     LocalProcStage const LOAD_ELF_STAGE = begin_local_proc_stage(task, perf::WkiPerfLocalProcOp::LOAD_ELF,
@@ -2646,11 +2687,13 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
         .register_special_symbols = true,
         .base_address = 0,
         .lazy_file_ranges = EXEC_LAZY_FILE_SEGMENTS ? &main_loader_lazy_ranges : nullptr,
+        .debug_registry_pid = DEBUG_STAGING_PID,
+        .image_role = mod::mm::user_layout::ImageRole::MAIN,
     };
     loader::elf::ElfLoadResult elf_result =
-        FILE_BACKED_ELF ? loader::elf::load_elf(prepared_elf.view, new_pagemap, task->pid, task->name, MAIN_LOAD_OPTIONS)
-                        : loader::elf::load_elf(reinterpret_cast<loader::elf::ElfFile*>(elf_buffer), new_pagemap, task->pid, task->name,
-                                                MAIN_LOAD_OPTIONS);
+        FILE_BACKED_ELF
+            ? loader::elf::load_elf(prepared_elf.view, new_pagemap, task->pid, task->name, MAIN_LOAD_OPTIONS)
+            : loader::elf::load_elf(elf_buffer, static_cast<size_t>(FILE_SIZE), new_pagemap, task->pid, task->name, MAIN_LOAD_OPTIONS);
     if (elf_result.entry_point == 0) {
 #ifdef EXEC_DEBUG
         dbg::log("wos_proc_execve: ELF load failed for '%s'", exec_path);
@@ -2678,13 +2721,16 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
     uint64_t new_initial_rip = elf_result.entry_point;
     uint64_t const NEW_PROGRAM_HEADER_ADDR = elf_result.program_header_addr;
     uint64_t const NEW_ELF_HEADER_ADDR = elf_result.elf_header_addr;
+    uint64_t const NEW_IMAGE_VADDR_START = elf_result.image_start;
+    uint64_t const NEW_IMAGE_VADDR_END = elf_result.image_end;
     uint16_t const NEW_PROGRAM_HEADER_COUNT = elf_result.program_header_count;
     uint16_t const NEW_PROGRAM_HEADER_ENT_SIZE = elf_result.program_header_ent_size;
     uint64_t new_interp_base = 0;
+    uint64_t new_interp_vaddr_start = 0;
+    uint64_t new_interp_vaddr_end = 0;
 
     // If the binary requests a dynamic linker (PT_INTERP), load it.
     if (elf_result.has_interp) {
-        constexpr uint64_t INTERP_BASE = 0x40000000ULL;
         const char* const INTERP_PATH = std::begin(elf_result.interp_path);
         LocalProcStage const LOAD_INTERP_STAGE =
             begin_local_proc_stage(task, perf::WkiPerfLocalProcOp::LOAD_INTERP, 0, WOS_PERF_CALLSITE());
@@ -2748,11 +2794,13 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
         loader::elf::ElfLazyLoadRangeVec interp_loader_lazy_ranges;
         loader::elf::ElfLoadOptions const INTERP_LOAD_OPTIONS{
             .register_special_symbols = false,
-            .base_address = INTERP_BASE,
+            .base_address = 0,
             .lazy_file_ranges = INTERP_LAZY_FILE_SEGMENTS ? &interp_loader_lazy_ranges : nullptr,
+            .debug_registry_pid = DEBUG_STAGING_PID,
+            .image_role = mod::mm::user_layout::ImageRole::INTERPRETER,
         };
-        loader::elf::ElfLoadResult const INTERP_RESULT = loader::elf::load_elf(reinterpret_cast<loader::elf::ElfFile*>(interp_buf),
-                                                                               new_pagemap, task->pid, "ld.so", INTERP_LOAD_OPTIONS);
+        loader::elf::ElfLoadResult const INTERP_RESULT =
+            loader::elf::load_elf(interp_buf, static_cast<size_t>(INTERP_SIZE), new_pagemap, task->pid, "ld.so", INTERP_LOAD_OPTIONS);
 
         if (INTERP_RESULT.entry_point == 0) {
             release_interp_file_once();
@@ -2778,7 +2826,9 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
 
         // Override entry point to the interpreter — ld.so reads AT_ENTRY from auxv
         new_initial_rip = INTERP_RESULT.entry_point;
-        new_interp_base = INTERP_BASE;
+        new_interp_base = INTERP_RESULT.load_base;
+        new_interp_vaddr_start = INTERP_RESULT.image_start;
+        new_interp_vaddr_end = INTERP_RESULT.image_end;
 
         delete[] interp_buf;
     }
@@ -2911,6 +2961,24 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
         return static_cast<uint64_t>(-E2BIG);
     }
 
+    std::array<uint8_t, AT_RANDOM_BYTES> at_random{};
+    if (!mod::random::entropy::get_bytes(at_random.data(), at_random.size())) {
+        delete[] envp_addrs;
+        delete[] argv_addrs;
+        cleanup_new_image();
+        free_kernel_arg_env_once();
+        return static_cast<uint64_t>(-EIO);
+    }
+    uint64_t const NEW_AT_RANDOM_ADDR = push_to_stack(at_random.data(), at_random.size());
+    std::memset(at_random.data(), 0, at_random.size());
+    if (NEW_AT_RANDOM_ADDR == 0) {
+        delete[] envp_addrs;
+        delete[] argv_addrs;
+        cleanup_new_image();
+        free_kernel_arg_env_once();
+        return static_cast<uint64_t>(-E2BIG);
+    }
+
     // Free kernel copies of argv/envp strings
     free_kernel_arg_env_once();
 
@@ -2921,7 +2989,7 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
         uint64_t const ALIGNED = CURRENT_ADDR & ~(ALIGNMENT - 1);
         current_virt_offset += (CURRENT_ADDR - ALIGNED);
 
-        constexpr size_t AUXV_BASE_QWORDS = 14;  // 6 core pairs (including EXECFN) + AT_NULL pair
+        constexpr size_t AUXV_BASE_QWORDS = 16;
         size_t const AUXV_QWORDS = AUXV_BASE_QWORDS + (new_interp_base != 0 ? 2 : 0);
         size_t const STRUCTURED_QWORDS = AUXV_QWORDS + (envp_count + 1) + (argv_count + 1) + 1;
         if (STRUCTURED_QWORDS % 2 != 0) {
@@ -2939,9 +3007,10 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
         constexpr uint64_t AT_PAGESZ = 6;
         constexpr uint64_t AT_BASE = 7;
         constexpr uint64_t AT_ENTRY = 9;
+        constexpr uint64_t AT_RANDOM = 25;
         constexpr uint64_t AT_EXECFN = 31;
         bool built_correct_auxv = true;
-        ker::util::SmallVec<uint64_t, 16> auxv;
+        ker::util::SmallVec<uint64_t, 20> auxv;
         built_correct_auxv &= auxv.push_back(AT_PAGESZ);
         built_correct_auxv &= auxv.push_back(mm::paging::PAGE_SIZE);
         built_correct_auxv &= auxv.push_back(AT_ENTRY);
@@ -2956,6 +3025,8 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
             built_correct_auxv &= auxv.push_back(AT_BASE);
             built_correct_auxv &= auxv.push_back(new_interp_base);
         }
+        built_correct_auxv &= auxv.push_back(AT_RANDOM);
+        built_correct_auxv &= auxv.push_back(NEW_AT_RANDOM_ADDR);
         built_correct_auxv &= auxv.push_back(AT_EXECFN);
         built_correct_auxv &= auxv.push_back(EXECFN_ADDR);
         built_correct_auxv &= auxv.push_back(AT_NULL);
@@ -2999,22 +3070,152 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
     }
     end_local_proc_stage(task, perf::WkiPerfLocalProcOp::STACK_SETUP, STACK_SETUP_STAGE, 0, current_virt_offset, WOS_PERF_CALLSITE());
 
-    LocalProcStage const COMMIT_STAGE = begin_local_proc_stage(task, perf::WkiPerfLocalProcOp::COMMIT, 0, WOS_PERF_CALLSITE());
+    // Freshly spawned processes rewrite fs:[0] just before the first usermode
+    // entry. execve() bypasses that path, so prepare the replacement TCB before
+    // publishing any part of the image. Missing backing is a failed exec, not a
+    // silent TLS/SafeStack fallback.
+    uint64_t const TCB_PADDR = mm::virt::translate(new_pagemap, new_thread->fsbase);
+    if (TCB_PADDR == mm::virt::PADDR_INVALID) {
+        cleanup_new_image();
+        return static_cast<uint64_t>(-EIO);
+    }
+    void* const TCB_SELF = mm::addr::get_virt_pointer(TCB_PADDR);
+    std::memcpy(TCB_SELF, &new_thread->fsbase, sizeof(new_thread->fsbase));
 
-    // exec only closes FD_CLOEXEC descriptors after the new image is ready;
-    // failed execve() must leave the original process image intact.
-    // Snapshot descriptors first because vfs_close() mutates fd_table.
+    auto* const SSYM = loader::debug::get_process_symbol(DEBUG_STAGING_PID, "__safestack_unsafe_stack_ptr");
+    if (SSYM != nullptr && SSYM->is_tls_offset) {
+        if (SSYM->raw_value > UINT64_MAX - new_thread->tls_base_virt) {
+            cleanup_new_image();
+            return static_cast<uint64_t>(-ENOEXEC);
+        }
+        uint64_t const DEST_VADDR = new_thread->tls_base_virt + SSYM->raw_value;
+        uint64_t const DEST_PADDR = mm::virt::translate(new_pagemap, DEST_VADDR);
+        if (DEST_PADDR == mm::virt::PADDR_INVALID) {
+            cleanup_new_image();
+            return static_cast<uint64_t>(-ENOEXEC);
+        }
+        auto* dest_ptr = static_cast<uint64_t*>(mm::addr::get_virt_pointer(DEST_PADDR));
+        *dest_ptr = new_thread->safestack_ptr_value;
+    }
+
+    LocalProcStage const COMMIT_STAGE = begin_local_proc_stage(task, perf::WkiPerfLocalProcOp::COMMIT, 0, WOS_PERF_CALLSITE());
+    uint64_t const NEW_RSP = user_stack_virt - current_virt_offset;
+    auto* old_thread_to_destroy = old_thread;
+    const char* old_name_to_destroy = nullptr;
+    LazyVmemRangeVec old_lazy_ranges;
+
+    // Publish the pagemap, all mapping metadata, and the execution context as
+    // one shared-VM transaction. Procfs, ptrace, mmap, fork, and thread
+    // creation take the same guard and therefore cannot observe a mixed image.
+    // No old-image storage is released until after the guard is dropped.
+    mm::paging::PageTable* old_pagemap_to_destroy = nullptr;
+    bool old_pagemap_has_other_publishers = false;
+    bool commit_published = false;
+    {
+        // Prevent a new CLONE_VM/thread publisher from appearing between the
+        // sibling snapshot and the root swap. Existing siblings keep the old
+        // address space alive; exec must never tear a shared root out from
+        // under their execution or stable usercopy pins.
+        ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;
+        old_pagemap_has_other_publishers = mod::sched::task_has_live_pagemap_sibling(task);
+        commit_published = loader::debug::publish_staged_process(DEBUG_STAGING_PID, task->pid, new_name);
+        if (commit_published) {
+            task->entry = NEW_EXEC_ENTRY;
+            task->program_header_addr = NEW_PROGRAM_HEADER_ADDR;
+            task->elf_header_addr = NEW_ELF_HEADER_ADDR;
+            task->image_load_base = elf_result.load_base;
+            task->image_vaddr_start = NEW_IMAGE_VADDR_START;
+            task->image_vaddr_end = NEW_IMAGE_VADDR_END;
+            task->program_header_count = NEW_PROGRAM_HEADER_COUNT;
+            task->program_header_ent_size = NEW_PROGRAM_HEADER_ENT_SIZE;
+            task->elf_buffer = elf_buffer;
+            task->elf_buffer_size = ELF_BUFFER_SIZE;
+            task->is_elf_buffer_shared = false;
+            task->elf_buffer_complete = ELF_BUFFER_COMPLETE;
+            task->exec_image_file = FILE_BACKED_ELF ? exec_file : nullptr;
+            task->exec_image_size = FILE_BACKED_ELF ? static_cast<uint64_t>(FILE_SIZE) : 0;
+            task->interp_base = new_interp_base;
+            task->interp_vaddr_start = new_interp_vaddr_start;
+            task->interp_vaddr_end = new_interp_vaddr_end;
+            task->at_random_addr = NEW_AT_RANDOM_ADDR;
+            task->mmap_next.store(new_mmap_cursor, std::memory_order_relaxed);
+
+            size_t path_len = std::strlen(exec_path);
+            if (path_len >= sched::task::Task::EXE_PATH_MAX) {
+                path_len = sched::task::Task::EXE_PATH_MAX - 1;
+            }
+            task->exe_path.fill('\0');
+            std::memcpy(task->exe_path.data(), exec_path, path_len);
+
+            old_name_to_destroy = task->name;
+            task->name = new_name;
+            new_name = nullptr;
+
+            if ((exec_stat.st_mode & 04000) != 0U) {
+                task->euid = exec_stat.st_uid;
+                task->suid = exec_stat.st_uid;
+            }
+            if ((exec_stat.st_mode & 02000) != 0U) {
+                task->egid = exec_stat.st_gid;
+                task->sgid = exec_stat.st_gid;
+            }
+
+            task->signal_pending_store(0, std::memory_order_relaxed);
+            task->in_signal_handler = false;
+            task->do_sigreturn = false;
+            for (auto& sh : task->sig_handlers) {
+                sh = {.handler = 0, .flags = 0, .restorer = 0, .mask = 0};
+            }
+
+            task->context.frame.rip = new_initial_rip;
+            task->context.frame.rsp = NEW_RSP;
+            task->context.frame.ss = 0x1b;
+            task->context.frame.cs = 0x23;
+            task->context.frame.flags = 0x202;
+            task->context.frame.int_num = 0;
+            task->context.frame.err_code = 0;
+            ker::mod::sys::context_switch::record_saved_frame_class(task, task->context.frame,
+                                                                    ker::mod::sched::task::SavedFrameOrigin::SYNTHETIC_USER_RETURN);
+
+            // Match the fresh-process entry contract used by wos_asm_enter_usermode:
+            // startup code consumes argc/argv/envp from the initial stack, not GPRs.
+            task->context.regs = cpu::GPRegs();
+            task->context.regs.rdi = new_initial_rip;
+            task->context.regs.rsi = NEW_RSP;
+
+            old_pagemap_to_destroy = task->replace_pagemap_after_usercopy_quiescence(new_pagemap);
+            task->thread = new_thread;
+            swap_exec_lazy_ranges(task, new_lazy_ranges, old_lazy_ranges);
+            new_lazy_ranges_published = true;
+        }
+    }
+    if (!commit_published) {
+        end_local_proc_stage(task, perf::WkiPerfLocalProcOp::COMMIT, COMMIT_STAGE, -EIO, 0, WOS_PERF_CALLSITE());
+        cleanup_new_image();
+        return static_cast<uint64_t>(-EIO);
+    }
+
+    elf_buffer = nullptr;
+    if (FILE_BACKED_ELF) {
+        exec_file = nullptr;
+    }
+    delete[] old_name_to_destroy;
+    release_lazy_file_refs(old_lazy_ranges);
+
+    // exec only closes FD_CLOEXEC descriptors after the replacement image is
+    // committed; failed execve() therefore leaves the original descriptor
+    // table intact. Snapshot first because vfs_close() mutates fd_table.
     for (;;) {
         FdSnapshot fds{};
         size_t const FD_COUNT = collect_cloexec_fds_locked(task, fds);
         if (FD_COUNT == 0) {
             break;
         }
-
         for (size_t i = 0; i < FD_COUNT; ++i) {
             vfs::vfs_close(static_cast<int>(fixed_slot(fds, i)));
         }
     }
+    static_cast<void>(ensure_exec_stdio_fallbacks(task));
 
     if (old_elf_buffer != nullptr) {
         if (!ker::net::wki::wki_remote_compute_release_elf_buffer(old_elf_buffer)) {
@@ -3025,131 +3226,20 @@ auto wos_proc_execve_impl(const char* path, const char* const* argv, const char*
         vfs::vfs_put_file(old_exec_image_file);
     }
 
-    task->entry = NEW_EXEC_ENTRY;
-    task->program_header_addr = NEW_PROGRAM_HEADER_ADDR;
-    task->elf_header_addr = NEW_ELF_HEADER_ADDR;
-    task->program_header_count = NEW_PROGRAM_HEADER_COUNT;
-    task->program_header_ent_size = NEW_PROGRAM_HEADER_ENT_SIZE;
-    task->elf_buffer = elf_buffer;
-    task->elf_buffer_size = ELF_BUFFER_SIZE;
-    task->is_elf_buffer_shared = false;
-    task->elf_buffer_complete = ELF_BUFFER_COMPLETE;
-    task->exec_image_file = FILE_BACKED_ELF ? exec_file : nullptr;
-    task->exec_image_size = FILE_BACKED_ELF ? static_cast<uint64_t>(FILE_SIZE) : 0;
-    if (FILE_BACKED_ELF) {
-        exec_file = nullptr;
-    }
-    task->interp_base = new_interp_base;
-    task->mmap_next.store(0, std::memory_order_relaxed);
-
-    {
-        size_t path_len = std::strlen(exec_path);
-        if (path_len >= sched::task::Task::EXE_PATH_MAX) {
-            path_len = sched::task::Task::EXE_PATH_MAX - 1;
-        }
-        std::memcpy(task->exe_path.data(), exec_path, path_len);
-        fixed_slot(task->exe_path, path_len) = '\0';
-    }
-
-    delete[] task->name;
-    task->name = new_name;
-    new_name = nullptr;
-
-    if ((exec_stat.st_mode & 04000) != 0U) {
-        task->euid = exec_stat.st_uid;
-        task->suid = exec_stat.st_uid;
-    }
-    if ((exec_stat.st_mode & 02000) != 0U) {
-        task->egid = exec_stat.st_gid;
-        task->sgid = exec_stat.st_gid;
-    }
-
-    task->signal_pending_store(0, std::memory_order_relaxed);
-    task->in_signal_handler = false;
-    task->do_sigreturn = false;
-    for (auto& sh : task->sig_handlers) {
-        sh = {.handler = 0, .flags = 0, .restorer = 0, .mask = 0};
-    }
-
-    static_cast<void>(ensure_exec_stdio_fallbacks(task));
-
-    // --- Set up the task context to jump to the new binary ---
-    uint64_t const NEW_RSP = user_stack_virt - current_virt_offset;
-    task->context.frame.rip = new_initial_rip;
-    task->context.frame.rsp = NEW_RSP;
-    task->context.frame.ss = 0x1b;
-    task->context.frame.cs = 0x23;
-    task->context.frame.flags = 0x202;
-    task->context.frame.int_num = 0;
-    task->context.frame.err_code = 0;
-    ker::mod::sys::context_switch::record_saved_frame_class(task, task->context.frame,
-                                                            ker::mod::sched::task::SavedFrameOrigin::SYNTHETIC_USER_RETURN);
-
-    // Match the fresh-process entry contract used by wos_asm_enter_usermode:
-    // startup code consumes argc/argv/envp from the initial stack, not GPRs.
-    task->context.regs = cpu::GPRegs();
-    task->context.regs.rdi = new_initial_rip;
-    task->context.regs.rsi = NEW_RSP;
     (void)argc;
     (void)ARGV_PTR;
     (void)ENVP_PTR;
 
-    // Freshly spawned processes rewrite fs:[0] just before the first usermode
-    // entry. execve() bypasses that path, so repair the initial TCB self-pointer
-    // here before any TLS access in ld.so / libc.
-    if (new_thread != nullptr) {
-        uint64_t const TCB_PADDR = mm::virt::translate(new_pagemap, new_thread->fsbase);
-        if (TCB_PADDR != mm::virt::PADDR_INVALID) {
-            void* const TCB_SELF = mm::addr::get_virt_pointer(TCB_PADDR);
-            std::memcpy(TCB_SELF, &new_thread->fsbase, sizeof(new_thread->fsbase));
-        }
-    }
-
-    // Initialize SafeStack TLS symbol if present
-    auto* ssym = loader::debug::get_process_symbol(task->pid, "__safestack_unsafe_stack_ptr");
-    if (new_thread != nullptr && (ssym != nullptr) && ssym->is_tls_offset) {
-        uint64_t const DEST_VADDR = new_thread->tls_base_virt + ssym->raw_value;
-        uint64_t const DEST_PADDR = mm::virt::translate(new_pagemap, DEST_VADDR);
-        if (DEST_PADDR != mm::virt::PADDR_INVALID) {
-            auto* dest_ptr = static_cast<uint64_t*>(mm::addr::get_virt_pointer(DEST_PADDR));
-            *dest_ptr = new_thread->safestack_ptr_value;
-        }
-    }
-
-    // execve() returns directly via sysret instead of re-entering through the
-    // scheduler, so we must refresh the live CPU's user TLS bases here.
-    // Otherwise the CPU would keep the old image's FS_BASE / user GS_BASE and
-    // immediately fault in the new process when libc touches TLS.
-    if (new_thread != nullptr) {
-        cpu::wrfsbase(new_thread->fsbase);
-        cpu_set_msr(IA32_KERNEL_GS_BASE, new_thread->gsbase);
-    }
-    end_local_proc_stage(task, perf::WkiPerfLocalProcOp::COMMIT, COMMIT_STAGE, 0, 0, WOS_PERF_CALLSITE());
-
-    auto* old_thread_to_destroy = old_thread;
-    old_thread = nullptr;
-
-    // Publish the new execution context before old-image teardown. The release
-    // paths below may block or yield, so scheduler/procfs observers must never
-    // see task->pagemap/task->thread pointing at storage that is being freed.
-    mm::paging::PageTable* old_pagemap_to_destroy = nullptr;
-    bool old_pagemap_has_other_publishers = false;
-    {
-        // Prevent a new CLONE_VM/thread publisher from appearing between the
-        // sibling snapshot and the root swap. Existing siblings keep the old
-        // address space alive; exec must never tear a shared root out from
-        // under their execution or stable usercopy pins.
-        ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;
-        old_pagemap_has_other_publishers = mod::sched::task_has_live_pagemap_sibling(task);
-        old_pagemap_to_destroy = task->replace_pagemap_after_usercopy_quiescence(new_pagemap);
-        task->thread = new_thread;
-        publish_exec_lazy_ranges(task, new_lazy_ranges);
-        new_lazy_ranges_published = true;
-    }
-
     auto phys_pagemap = reinterpret_cast<uint64_t>(mm::addr::get_phys_pointer(reinterpret_cast<uint64_t>(new_pagemap)));
     asm volatile("mov %0, %%cr3" : : "r"(phys_pagemap) : "memory");
     ker::mod::sys::context_switch::reset_fpu_state(task);
+
+    // execve() returns directly via sysret instead of re-entering through the
+    // scheduler, so refresh the live CPU's user TLS bases after the new CR3 is
+    // active and before any new-image TLS access in userspace.
+    cpu::wrfsbase(new_thread->fsbase);
+    cpu_set_msr(IA32_KERNEL_GS_BASE, new_thread->gsbase);
+    end_local_proc_stage(task, perf::WkiPerfLocalProcOp::COMMIT, COMMIT_STAGE, 0, 0, WOS_PERF_CALLSITE());
 
     // execve() replaces the current image in-place. Reclaim an exclusive old
     // address space now; if CLONE_VM/thread publishers still exist, their

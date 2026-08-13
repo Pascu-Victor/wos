@@ -17,8 +17,10 @@
 #include <platform/mm/virt.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
+#include <platform/sched/threading.hpp>
 #include <platform/sys/spinlock.hpp>
 #include <platform/sys/usercopy.hpp>
+#include <syscalls_impl/vmem/sys_vmem.hpp>
 
 namespace ker::syscall::shm {
 namespace {
@@ -47,6 +49,7 @@ struct ShmSegment {
 
 struct ShmAttachment {
     bool active = false;
+    bool publishing = false;
     uint64_t pid = 0;
     int shmid = -1;
     uint64_t addr = 0;
@@ -105,7 +108,8 @@ auto find_free_segment() -> ShmSegment* {
 }
 
 auto find_free_attachment() -> ShmAttachment* {
-    auto* it = std::ranges::find_if(g_attachments, [](const ShmAttachment& attachment) -> bool { return !attachment.active; });
+    auto* it = std::ranges::find_if(g_attachments,
+                                    [](const ShmAttachment& attachment) -> bool { return !attachment.active && !attachment.publishing; });
     return it != g_attachments.end() ? &*it : nullptr;
 }
 
@@ -116,9 +120,64 @@ auto find_attachment(uint64_t pid, uint64_t addr) -> ShmAttachment* {
     return it != g_attachments.end() ? &*it : nullptr;
 }
 
+struct SharedLayoutOverlapQuery {
+    ker::mod::mm::paging::PageTable* pagemap = nullptr;
+    uint64_t start = 0;
+    uint64_t size = 0;
+};
+
+auto task_has_overlapping_initial_layout(ker::mod::sched::task::Task* candidate, void* opaque) -> bool {
+    auto* query = static_cast<SharedLayoutOverlapQuery*>(opaque);
+    return candidate != nullptr && query != nullptr && candidate->pagemap == query->pagemap &&
+           ker::mod::sched::threading::range_overlaps_initial_layout(candidate->thread, query->start, query->size);
+}
+
+// The caller holds SharedVmemPublicationGuard, so a matching Task cannot
+// publish a new pagemap/thread pair while the scheduler registry is queried.
+auto range_overlaps_shared_initial_layout(ker::mod::sched::task::Task* task, uint64_t addr, uint64_t size) -> bool {
+    if (task == nullptr || task->pagemap == nullptr || size == 0) {
+        return true;
+    }
+    if (ker::mod::sched::threading::range_overlaps_initial_layout(task->thread, addr, size)) {
+        return true;
+    }
+
+    SharedLayoutOverlapQuery query{.pagemap = task->pagemap, .start = addr, .size = size};
+    auto* owner = ker::mod::sched::find_active_task_lifetime_ref_if(task_has_overlapping_initial_layout, &query);
+    if (owner == nullptr) {
+        return false;
+    }
+    owner->release();
+    return true;
+}
+
+auto range_overlaps_lazy_vmem(ker::mod::sched::task::Task* task, uint64_t addr, uint64_t size) -> bool {
+    if (task == nullptr || size == 0 || addr > UINT64_MAX - size) {
+        return true;
+    }
+
+    uint64_t const END = addr + size;
+    bool overlaps = false;
+    uint64_t const FLAGS = task->lazy_vmem_lock.lock_irqsave();
+    for (const auto& range : task->lazy_vmem_ranges) {
+        if (addr < range.end && range.start < END) {
+            overlaps = true;
+            break;
+        }
+    }
+    task->lazy_vmem_lock.unlock_irqrestore(FLAGS);
+    return overlaps;
+}
+
 auto range_is_free(ker::mod::sched::task::Task* task, uint64_t addr, uint64_t size) -> bool {
-    for (uint64_t current = addr; current < addr + size; current += ker::mod::mm::paging::PAGE_SIZE) {
-        if (ker::mod::mm::virt::is_page_mapped(task->pagemap, current)) {
+    if (task == nullptr || task->pagemap == nullptr || size == 0 || addr > USER_SPACE_END - size ||
+        range_overlaps_shared_initial_layout(task, addr, size) || range_overlaps_lazy_vmem(task, addr, size)) {
+        return false;
+    }
+
+    uint64_t const END = addr + size;
+    for (uint64_t current = addr; current < END; current += ker::mod::mm::paging::PAGE_SIZE) {
+        if (ker::mod::mm::virt::is_page_mapped_or_reserved(task->pagemap, current)) {
             return false;
         }
     }
@@ -162,6 +221,58 @@ void release_segment(ShmSegment& segment) {
 void maybe_release_destroyed_segment(ShmSegment& segment) {
     if (segment.active && segment.marked_destroy && segment.attach_count == 0) {
         release_segment(segment);
+    }
+}
+
+void abandon_attachment_publication(ShmAttachment* attachment) {
+    if (attachment == nullptr) {
+        return;
+    }
+
+    uint64_t const FLAGS = g_lock.lock_irqsave();
+    if (!attachment->publishing) {
+        g_lock.unlock_irqrestore(FLAGS);
+        return;
+    }
+
+    auto* segment = find_segment_by_id(attachment->shmid);
+    *attachment = {};
+    if (segment != nullptr) {
+        if (segment->attach_count > 0) {
+            segment->attach_count--;
+        }
+        maybe_release_destroyed_segment(*segment);
+    }
+    g_lock.unlock_irqrestore(FLAGS);
+}
+
+void rollback_attachment_pages(ker::mod::sched::task::Task* task, const ShmSegment* segment, uint64_t addr, uint64_t mapped_pages) {
+    if (task == nullptr || task->pagemap == nullptr || segment == nullptr) {
+        return;
+    }
+
+    for (uint64_t i = 0; i < mapped_pages; ++i) {
+        uint64_t const PAGE_ADDR = addr + (i * ker::mod::mm::paging::PAGE_SIZE);
+        if (ker::mod::mm::virt::translate(task->pagemap, PAGE_ADDR) == backing_paddr(*segment, i)) {
+            ker::mod::mm::virt::unmap_page(task->pagemap, PAGE_ADDR);
+        }
+    }
+}
+
+void detach_attachments_for_pid_locked(uint64_t pid) {
+    for (auto& attachment : g_attachments) {
+        if (!attachment.active || attachment.pid != pid) {
+            continue;
+        }
+
+        auto* segment = find_segment_by_id(attachment.shmid);
+        attachment = {};
+        if (segment != nullptr) {
+            if (segment->attach_count > 0) {
+                segment->attach_count--;
+            }
+            maybe_release_destroyed_segment(*segment);
+        }
     }
 }
 
@@ -256,17 +367,12 @@ auto shmat_impl(int shmid, uint64_t shmaddr, int shmflg) -> uint64_t {
         return to_errno(ESRCH);
     }
 
+    // This sleepable publication mutex must precede g_lock. Page-table
+    // construction may reclaim/yield, so g_lock is released before mapping.
+    ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;
     uint64_t const FLAGS = g_lock.lock_irqsave();
     auto* segment = find_segment_by_id(shmid);
     if (segment == nullptr || segment->marked_destroy) {
-        g_lock.unlock_irqrestore(FLAGS);
-        return to_errno(EINVAL);
-    }
-
-    uint64_t const SIZE = segment->size;
-    uint64_t const ADDR = shmaddr != 0 ? shmaddr : find_free_range(task, SIZE, 0);
-    if (ADDR == 0 || ADDR % ker::mod::mm::paging::PAGE_SIZE != 0 || ADDR < USER_SPACE_START || ADDR > USER_SPACE_END - SIZE ||
-        !range_is_free(task, ADDR, SIZE)) {
         g_lock.unlock_irqrestore(FLAGS);
         return to_errno(EINVAL);
     }
@@ -277,41 +383,61 @@ auto shmat_impl(int shmid, uint64_t shmaddr, int shmflg) -> uint64_t {
         return to_errno(ENOSPC);
     }
 
+    uint64_t const SIZE = segment->size;
+    uint64_t const PAGE_COUNT = segment->page_count;
+    uint64_t const PROCESS_PID = process_pid_for_task(task);
+    *attachment = {
+        .active = false,
+        .publishing = true,
+        .pid = PROCESS_PID,
+        .shmid = segment->id,
+        .addr = 0,
+        .size = SIZE,
+    };
+    // Pin the segment while g_lock is dropped for address selection and
+    // page-table publication. A failed publication decrements this count.
+    segment->attach_count++;
+    g_lock.unlock_irqrestore(FLAGS);
+
+    uint64_t const ADDR = shmaddr != 0 ? shmaddr : find_free_range(task, SIZE, 0);
+    if (ADDR == 0 || ADDR % ker::mod::mm::paging::PAGE_SIZE != 0 || ADDR < USER_SPACE_START || ADDR > USER_SPACE_END - SIZE ||
+        !range_is_free(task, ADDR, SIZE)) {
+        abandon_attachment_publication(attachment);
+        return to_errno(EINVAL);
+    }
+
     uint64_t page_flags = ker::mod::mm::paging::PAGE_PRESENT | ker::mod::mm::paging::PAGE_USER | ker::mod::mm::paging::PAGE_SHARED;
     if ((shmflg & ker::abi::shm::SHM_RDONLY) == 0) {
         page_flags |= ker::mod::mm::paging::PAGE_WRITE;
     }
 
-    for (uint64_t i = 0; i < segment->page_count; ++i) {
+    uint64_t mapped_pages = 0;
+    for (uint64_t i = 0; i < PAGE_COUNT; ++i) {
+        uint64_t const PAGE_ADDR = ADDR + (i * ker::mod::mm::paging::PAGE_SIZE);
+        // A direct publisher that does not yet participate in the shared-VM
+        // mutex must not turn this transaction into a replacement mapping.
+        if (ker::mod::mm::virt::is_page_mapped_or_reserved(task->pagemap, PAGE_ADDR)) {
+            rollback_attachment_pages(task, segment, ADDR, mapped_pages);
+            abandon_attachment_publication(attachment);
+            return to_errno(EINVAL);
+        }
         auto* page = backing_page(*segment, i);
         ker::mod::mm::phys::page_ref_inc(page);
-        ker::mod::mm::virt::map_page(task->pagemap, ADDR + (i * ker::mod::mm::paging::PAGE_SIZE), backing_paddr(*segment, i), page_flags);
+        ker::mod::mm::virt::map_page(task->pagemap, PAGE_ADDR, backing_paddr(*segment, i), page_flags);
+        mapped_pages++;
     }
 
-    *attachment = {
-        .active = true,
-        .pid = process_pid_for_task(task),
-        .shmid = segment->id,
-        .addr = ADDR,
-        .size = SIZE,
-    };
-    segment->attach_count++;
-    segment->last_pid = process_pid_for_task(task);
-
-    g_lock.unlock_irqrestore(FLAGS);
+    uint64_t const COMMIT_FLAGS = g_lock.lock_irqsave();
+    attachment->addr = ADDR;
+    attachment->publishing = false;
+    attachment->active = true;
+    segment->last_pid = PROCESS_PID;
+    g_lock.unlock_irqrestore(COMMIT_FLAGS);
     return ADDR;
 }
 
-void detach_attachment(ShmAttachment& attachment, ker::mod::sched::task::Task* task, bool unmap_pages) {
+void detach_attachment_locked(ShmAttachment& attachment, ker::mod::sched::task::Task* task) {
     auto* segment = find_segment_by_id(attachment.shmid);
-    if (unmap_pages && task != nullptr && task->pagemap != nullptr) {
-        for (uint64_t addr = attachment.addr; addr < attachment.addr + attachment.size; addr += ker::mod::mm::paging::PAGE_SIZE) {
-            if (ker::mod::mm::virt::is_page_mapped(task->pagemap, addr)) {
-                ker::mod::mm::virt::unmap_page(task->pagemap, addr);
-            }
-        }
-    }
-
     if (segment != nullptr) {
         if (segment->attach_count > 0) {
             segment->attach_count--;
@@ -329,6 +455,7 @@ auto shmdt_impl(uint64_t shmaddr) -> uint64_t {
         return to_errno(ESRCH);
     }
 
+    ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;
     uint64_t const FLAGS = g_lock.lock_irqsave();
     auto* attachment = find_attachment(process_pid_for_task(task), shmaddr);
     if (attachment == nullptr) {
@@ -336,8 +463,23 @@ auto shmdt_impl(uint64_t shmaddr) -> uint64_t {
         return to_errno(EINVAL);
     }
 
-    detach_attachment(*attachment, task, true);
+    ShmAttachment const DETACHED = *attachment;
+    auto* segment = find_segment_by_id(DETACHED.shmid);
     g_lock.unlock_irqrestore(FLAGS);
+
+    for (uint64_t i = 0; segment != nullptr && i < segment->page_count; ++i) {
+        uint64_t const ADDR = DETACHED.addr + (i * ker::mod::mm::paging::PAGE_SIZE);
+        if (ker::mod::mm::virt::translate(task->pagemap, ADDR) == backing_paddr(*segment, i)) {
+            ker::mod::mm::virt::unmap_page(task->pagemap, ADDR);
+        }
+    }
+
+    uint64_t const DETACH_FLAGS = g_lock.lock_irqsave();
+    attachment = find_attachment(process_pid_for_task(task), shmaddr);
+    if (attachment != nullptr) {
+        detach_attachment_locked(*attachment, task);
+    }
+    g_lock.unlock_irqrestore(DETACH_FLAGS);
     return 0;
 }
 
@@ -406,7 +548,7 @@ auto sys_shm(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t /*a4*/
     }
 }
 
-auto shm_clone_for_fork(ker::mod::sched::task::Task* parent, ker::mod::sched::task::Task* child) -> bool {
+auto shm_clone_for_fork_locked(ker::mod::sched::task::Task* parent, ker::mod::sched::task::Task* child) -> bool {
     if (parent == nullptr || child == nullptr) {
         return true;
     }
@@ -420,8 +562,8 @@ auto shm_clone_for_fork(ker::mod::sched::task::Task* parent, ker::mod::sched::ta
         auto* segment = find_segment_by_id(parent_attachment.shmid);
         auto* child_attachment = find_free_attachment();
         if (segment == nullptr || child_attachment == nullptr) {
+            detach_attachments_for_pid_locked(child->pid);
             g_lock.unlock_irqrestore(FLAGS);
-            shm_cleanup_for_task(child);
             return false;
         }
 
@@ -439,12 +581,9 @@ void shm_cleanup_for_task(ker::mod::sched::task::Task* task) {
     }
 
     uint64_t const PID = process_pid_for_task(task);
+    ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;
     uint64_t const FLAGS = g_lock.lock_irqsave();
-    for (auto& attachment : g_attachments) {
-        if (attachment.active && attachment.pid == PID) {
-            detach_attachment(attachment, task, false);
-        }
-    }
+    detach_attachments_for_pid_locked(PID);
     g_lock.unlock_irqrestore(FLAGS);
 }
 

@@ -421,7 +421,6 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     child->elf_buffer = nullptr;
     child->elf_buffer_size = 0;
     child->is_elf_buffer_shared = false;
-    child->mmap_next.store(parent->mmap_next.load(std::memory_order_relaxed), std::memory_order_relaxed);
     child->jobctl_stopped.store(false, std::memory_order_relaxed);
     child->jobctl_stop_pending.store(false, std::memory_order_relaxed);
     child->jobctl_stop_publish_deferred.store(false, std::memory_order_relaxed);
@@ -460,12 +459,6 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
             ? child->pid
             : 0;
     if (!child->wki_vfs_rules.clone_from(parent->wki_vfs_rules)) {
-        delete[] child->name;
-        mm::phys::page_free(reinterpret_cast<void*>(KERNEL_STACK_BASE));
-        delete child;
-        return finish_fork(-ENOMEM);
-    }
-    if (!sched::task::clone_lazy_vmem_ranges(*child, *parent)) {
         delete[] child->name;
         mm::phys::page_free(reinterpret_cast<void*>(KERNEL_STACK_BASE));
         delete child;
@@ -520,18 +513,35 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     // Copy kernel mappings
     mm::virt::copy_kernel_mappings(child);
 
-    // Deep-copy user pages with COW
-    if (!mm::virt::deep_copy_user_pagemap_cow(parent->pagemap, child->pagemap)) {
-        mm::virt::destroy_user_space(child->pagemap, child->pid, child->name, "fork-cow-fail");
-        mm::phys::page_free(child->pagemap);
-        delete[] child->name;
-        mm::phys::page_free(reinterpret_cast<void*>(KERNEL_STACK_BASE));
-        delete child;
-        return finish_fork(-ENOMEM);
+    // Snapshot every address-space surface under one publication boundary.
+    // Cleanup is deliberately deferred until after the sleepable guard drops:
+    // file-range release may perform VFS writeback.
+    bool fork_vm_snapshot_ok = false;
+    {
+        ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;
+        child->entry = parent->entry;
+        child->program_header_addr = parent->program_header_addr;
+        child->elf_header_addr = parent->elf_header_addr;
+        child->image_load_base = parent->image_load_base;
+        child->image_vaddr_start = parent->image_vaddr_start;
+        child->image_vaddr_end = parent->image_vaddr_end;
+        child->program_header_count = parent->program_header_count;
+        child->program_header_ent_size = parent->program_header_ent_size;
+        child->interp_base = parent->interp_base;
+        child->interp_vaddr_start = parent->interp_vaddr_start;
+        child->interp_vaddr_end = parent->interp_vaddr_end;
+        child->at_random_addr = parent->at_random_addr;
+        child->mmap_next.store(parent->mmap_next.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        fork_vm_snapshot_ok = sched::task::clone_lazy_vmem_ranges(*child, *parent) &&
+                              mm::virt::deep_copy_user_pagemap_cow(parent->pagemap, child->pagemap) &&
+                              ker::syscall::shm::shm_clone_for_fork_locked(parent, child) &&
+                              ker::syscall::vmem::clone_file_mmap_ranges_for_pagemap_locked(parent->pagemap, child->pagemap);
     }
-
-    if (!ker::syscall::shm::shm_clone_for_fork(parent, child)) {
-        mm::virt::destroy_user_space(child->pagemap, child->pid, child->name, "fork-shm-clone-fail");
+    if (!fork_vm_snapshot_ok) {
+        ker::syscall::shm::shm_cleanup_for_task(child);
+        ker::syscall::vmem::release_file_mmap_ranges_for_pagemap(child->pagemap);
+        sched::task::release_lazy_vmem_ranges(*child);
+        mm::virt::destroy_user_space(child->pagemap, child->pid, child->name, "fork-vm-snapshot-fail");
         mm::phys::page_free(child->pagemap);
         delete[] child->name;
         mm::phys::page_free(reinterpret_cast<void*>(KERNEL_STACK_BASE));
@@ -546,6 +556,8 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
         auto* child_thread = new sched::threading::Thread();
         if (child_thread == nullptr) {
             ker::syscall::shm::shm_cleanup_for_task(child);
+            ker::syscall::vmem::release_file_mmap_ranges_for_pagemap(child->pagemap);
+            sched::task::release_lazy_vmem_ranges(*child);
             mm::virt::destroy_user_space(child->pagemap, child->pid, child->name, "fork-thread-alloc-fail");
             mm::phys::page_free(child->pagemap);
             delete[] child->name;
@@ -613,19 +625,14 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     // Child returns 0 from fork
     child->context.regs.rax = 0;
 
-    // Copy entry and ELF metadata pointers
-    child->entry = parent->entry;
-    child->program_header_addr = parent->program_header_addr;
-    child->elf_header_addr = parent->elf_header_addr;
-    child->program_header_count = parent->program_header_count;
-    child->program_header_ent_size = parent->program_header_ent_size;
-
     // --- Clone file descriptors ---
     if (!clone_fd_table_shared_checked(parent, child)) {
         release_cloned_fd_table_refs(child);
         delete child->thread;
         delete reinterpret_cast<cpu::PerCpu*>(child->context.syscall_scratch_area);
         ker::syscall::shm::shm_cleanup_for_task(child);
+        ker::syscall::vmem::release_file_mmap_ranges_for_pagemap(child->pagemap);
+        sched::task::release_lazy_vmem_ranges(*child);
         mm::virt::destroy_user_space(child->pagemap, child->pid, child->name, "fork-fd-clone-fail");
         mm::phys::page_free(child->pagemap);
         delete[] child->name;
@@ -636,19 +643,6 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
 
     child->fd_cloexec = parent->fd_cloexec;
 
-    if (!ker::syscall::vmem::clone_file_mmap_ranges_for_pagemap(parent->pagemap, child->pagemap)) {
-        release_cloned_fd_table_refs(child);
-        delete child->thread;
-        delete reinterpret_cast<cpu::PerCpu*>(child->context.syscall_scratch_area);
-        ker::syscall::shm::shm_cleanup_for_task(child);
-        mm::virt::destroy_user_space(child->pagemap, child->pid, child->name, "fork-mmap-clone-fail");
-        mm::phys::page_free(child->pagemap);
-        delete[] child->name;
-        mm::phys::page_free(reinterpret_cast<void*>(KERNEL_STACK_BASE));
-        delete child;
-        return finish_fork(-ENOMEM);
-    }
-
     // Establish authoritative process ownership before either scheduler or
     // legacy WKI placement can make the child visible.
     if (!child_events::begin_publication(*parent, *child)) {
@@ -658,6 +652,7 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
         delete reinterpret_cast<cpu::PerCpu*>(child->context.syscall_scratch_area);
         ker::syscall::shm::shm_cleanup_for_task(child);
         ker::syscall::vmem::release_file_mmap_ranges_for_pagemap(child->pagemap);
+        sched::task::release_lazy_vmem_ranges(*child);
         mm::virt::destroy_user_space(child->pagemap, child->pid, child->name, "fork-child-publication-fail");
         mm::phys::page_free(child->pagemap);
         delete[] child->name;
@@ -676,6 +671,7 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
         delete reinterpret_cast<cpu::PerCpu*>(child->context.syscall_scratch_area);
         ker::syscall::shm::shm_cleanup_for_task(child);
         ker::syscall::vmem::release_file_mmap_ranges_for_pagemap(child->pagemap);
+        sched::task::release_lazy_vmem_ranges(*child);
         mm::virt::destroy_user_space(child->pagemap, child->pid, child->name, "fork-post-task-fail");
         mm::phys::page_free(child->pagemap);
         delete[] child->name;
@@ -1095,9 +1091,15 @@ auto wos_proc_clone_vm(uint64_t args_addr) -> uint64_t {
     child->entry = parent->entry;
     child->program_header_addr = parent->program_header_addr;
     child->elf_header_addr = parent->elf_header_addr;
+    child->image_load_base = parent->image_load_base;
+    child->image_vaddr_start = parent->image_vaddr_start;
+    child->image_vaddr_end = parent->image_vaddr_end;
     child->program_header_count = parent->program_header_count;
     child->program_header_ent_size = parent->program_header_ent_size;
     child->interp_base = parent->interp_base;
+    child->interp_vaddr_start = parent->interp_vaddr_start;
+    child->interp_vaddr_end = parent->interp_vaddr_end;
+    child->at_random_addr = parent->at_random_addr;
     child->mmap_next.store(parent->mmap_next.load(std::memory_order_relaxed), std::memory_order_relaxed);
     child->sched_weight = parent->sched_weight;
     child->sched_nice = parent->sched_nice;

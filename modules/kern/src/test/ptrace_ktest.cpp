@@ -12,6 +12,7 @@ KTEST(PtraceAbi, RequestNumbers) {
     KEXPECT_EQ(static_cast<uint64_t>(ker::abi::ptrace::request::ATTACH), static_cast<uint64_t>(16));
     KEXPECT_EQ(static_cast<uint64_t>(ker::abi::ptrace::request::GET_REMOTE_INFO), static_cast<uint64_t>(0x5705));
     KEXPECT_EQ(static_cast<uint64_t>(ker::abi::ptrace::request::SYSCALL_WAIT), static_cast<uint64_t>(0x5708));
+    KEXPECT_EQ(static_cast<uint64_t>(ker::abi::ptrace::request::GET_IMAGE_CATALOG), static_cast<uint64_t>(0x5709));
 }
 
 KTEST(PtraceAbi, StructSizes) {
@@ -22,6 +23,8 @@ KTEST(PtraceAbi, StructSizes) {
     KEXPECT_EQ(sizeof(ker::abi::ptrace::StopInfo), static_cast<size_t>(224));
     KEXPECT_EQ(sizeof(ker::abi::ptrace::ImageRecord), static_cast<size_t>(296));
     KEXPECT_EQ(sizeof(ker::abi::ptrace::ImageList), static_cast<size_t>(24));
+    KEXPECT_EQ(sizeof(ker::abi::ptrace::ImageCatalogRecord), static_cast<size_t>(352));
+    KEXPECT_EQ(sizeof(ker::abi::ptrace::ImageCatalogList), static_cast<size_t>(40));
     KEXPECT_EQ(sizeof(ker::abi::ptrace::Event), static_cast<size_t>(40));
     KEXPECT_EQ(sizeof(ker::abi::ptrace::RemoteInfo), static_cast<size_t>(104));
     KEXPECT_EQ(sizeof(ker::abi::ptrace::HwBreak), static_cast<size_t>(32));

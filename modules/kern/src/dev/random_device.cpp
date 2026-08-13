@@ -2,60 +2,16 @@
 
 #include <bits/ssize_t.h>
 
-#include <cstdint>
-#include <cstring>
+#include <cstddef>
 #include <vfs/file.hpp>
 
 #include "dev/device.hpp"
 #include "platform/dbg/dbg.hpp"
+#include "platform/random/entropy.hpp"
 
 namespace ker::dev::random_device {
 
 namespace {
-
-// Fill buffer with random bytes using RDRAND instruction.
-// Returns true if all bytes were filled successfully.
-bool rdrand_fill(uint8_t* buf, size_t count) {
-    size_t offset = 0;
-
-    // Fill 8 bytes at a time
-    while (offset + 8 <= count) {
-        uint64_t val = 0;
-        // NOLINTNEXTLINE(misc-const-correctness)
-        int ok = 0;
-        // Try RDRAND up to 10 times (Intel recommends retries)
-        for (int attempt = 0; attempt < 10; attempt++) {
-            asm volatile("rdrand %0; setc %1" : "=r"(val), "=qm"(ok));
-            if (ok != 0) {
-                break;
-            }
-        }
-        if (ok == 0) {
-            return false;
-        }
-        std::memcpy(buf + offset, &val, 8);
-        offset += 8;
-    }
-
-    // Fill remaining bytes
-    if (offset < count) {
-        uint64_t val = 0;
-        // NOLINTNEXTLINE(misc-const-correctness)
-        int ok = 0;
-        for (int attempt = 0; attempt < 10; attempt++) {
-            asm volatile("rdrand %0; setc %1" : "=r"(val), "=qm"(ok));
-            if (ok != 0) {
-                break;
-            }
-        }
-        if (ok == 0) {
-            return false;
-        }
-        std::memcpy(buf + offset, &val, count - offset);
-    }
-
-    return true;
-}
 
 // --- /dev/urandom operations ---
 
@@ -70,16 +26,20 @@ ssize_t urandom_read(ker::vfs::File* /*file*/, void* buf, size_t count) {
         return 0;
     }
 
-    if (!rdrand_fill(static_cast<uint8_t*>(buf), count)) {
-        // RDRAND failed - should not normally happen on modern CPUs
+    if (!ker::mod::random::entropy::get_bytes(buf, count)) {
         return -1;
     }
 
     return static_cast<ssize_t>(count);
 }
 
-ssize_t urandom_write(ker::vfs::File* /*file*/, const void* /*buf*/, size_t count) {
-    // Writing to /dev/urandom is allowed but data is discarded
+ssize_t urandom_write(ker::vfs::File* /*file*/, const void* buf, size_t count) {
+    if (count == 0) {
+        return 0;
+    }
+    if (buf == nullptr || !ker::mod::random::entropy::mix_bytes(buf, count)) {
+        return -1;
+    }
     return static_cast<ssize_t>(count);
 }
 
@@ -108,21 +68,12 @@ Device urandom_dev = {
 }  // anonymous namespace
 
 void random_device_init() {
-    // Check RDRAND support via CPUID (leaf 1, ECX bit 30)
-    // Written by inline asm output constraints.
-    // NOLINTBEGIN(misc-const-correctness)
-    uint32_t eax = 0;
-    uint32_t ebx = 0;
-    uint32_t ecx = 0;
-    uint32_t edx = 0;
-    // NOLINTEND(misc-const-correctness)
-    asm volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(1));
-    if ((ecx & (1U << 30)) == 0U) {
-        ker::mod::dbg::logger<"random_device">::warn("RDRAND not supported, /dev/urandom unavailable");
+    if (!ker::mod::random::entropy::initialize()) {
+        ker::mod::dbg::logger<"random_device">::warn("Hardware entropy unavailable; kernel DRBG and /dev/urandom disabled");
         return;
     }
 
-    ker::mod::dbg::logger<"random_device">::info("Initializing /dev/urandom (RDRAND)");
+    ker::mod::dbg::logger<"random_device">::info("Kernel DRBG ready; initializing /dev/urandom");
     dev_register(&urandom_dev);
 }
 

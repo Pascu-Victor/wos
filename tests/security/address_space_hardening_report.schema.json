@@ -1,0 +1,149 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://wos.invalid/schemas/address-space-hardening-report-v1.json",
+  "title": "WOS userspace address-space hardening verification report",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "goal",
+    "generatedAt",
+    "commands",
+    "layoutSamples",
+    "entropySummary",
+    "protectionTests",
+    "malformedElfTests",
+    "compatibilityGates",
+    "artifacts",
+    "limitations"
+  ],
+  "properties": {
+    "$schema": { "type": "string" },
+    "schemaVersion": { "const": 1 },
+    "goal": { "const": 15 },
+    "generatedAt": { "type": ["string", "null"], "format": "date-time" },
+    "commands": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/command" }
+    },
+    "layoutSamples": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/layoutSample" }
+    },
+    "entropySummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["minimumSamples", "samplesCollected", "fields", "atRandomBytesRecorded"],
+      "properties": {
+        "minimumSamples": { "type": "integer", "minimum": 2 },
+        "samplesCollected": { "type": "integer", "minimum": 0 },
+        "fields": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/entropyField" }
+        },
+        "atRandomBytesRecorded": { "const": false }
+      }
+    },
+    "protectionTests": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/testResult" }
+    },
+    "malformedElfTests": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/testResult" }
+    },
+    "compatibilityGates": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/testResult" }
+    },
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "path"],
+        "properties": {
+          "kind": { "type": "string", "minLength": 1 },
+          "path": { "type": "string", "minLength": 1 },
+          "sha256": { "type": ["string", "null"], "pattern": "^[0-9a-f]{64}$" }
+        }
+      }
+    },
+    "limitations": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    }
+  },
+  "$defs": {
+    "status": { "enum": ["not-run", "pass", "fail", "blocked"] },
+    "address": { "type": "string", "pattern": "^0x[0-9a-f]+$" },
+    "command": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["purpose", "command", "status"],
+      "properties": {
+        "purpose": { "type": "string", "minLength": 1 },
+        "command": { "type": "string", "minLength": 1 },
+        "status": { "$ref": "#/$defs/status" },
+        "exitCode": { "type": ["integer", "null"] },
+        "outputArtifact": { "type": ["string", "null"] }
+      }
+    },
+    "layoutSample": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "context",
+        "node",
+        "pid",
+        "mainLoadBias",
+        "interpreterLoadBias",
+        "codeAddress",
+        "stackAddress",
+        "tlsAddress",
+        "heapAddress",
+        "anonymousMappingAddress",
+        "atRandomAddress",
+        "relroAddress",
+        "atRandomPresent",
+        "result"
+      ],
+      "properties": {
+        "context": { "enum": ["local", "remote"] },
+        "node": { "type": "string", "minLength": 1 },
+        "pid": { "type": "integer", "minimum": 1 },
+        "mainLoadBias": { "$ref": "#/$defs/address" },
+        "interpreterLoadBias": { "$ref": "#/$defs/address" },
+        "codeAddress": { "$ref": "#/$defs/address" },
+        "stackAddress": { "$ref": "#/$defs/address" },
+        "tlsAddress": { "$ref": "#/$defs/address" },
+        "heapAddress": { "$ref": "#/$defs/address" },
+        "anonymousMappingAddress": { "$ref": "#/$defs/address" },
+        "atRandomAddress": { "$ref": "#/$defs/address" },
+        "relroAddress": { "$ref": "#/$defs/address" },
+        "atRandomPresent": { "type": "boolean" },
+        "result": { "enum": ["pass", "fail"] }
+      }
+    },
+    "entropyField": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["distinctValues", "allDistinct"],
+      "properties": {
+        "distinctValues": { "type": "integer", "minimum": 0 },
+        "allDistinct": { "type": ["boolean", "null"] }
+      }
+    },
+    "testResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "context", "status", "evidence"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "context": { "type": "string", "minLength": 1 },
+        "status": { "$ref": "#/$defs/status" },
+        "evidence": { "type": ["string", "null"] }
+      }
+    }
+  }
+}

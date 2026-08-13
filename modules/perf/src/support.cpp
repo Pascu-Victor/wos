@@ -526,6 +526,11 @@ auto read_cmdline(uint64_t pid) -> std::string {
     return *raw;
 }
 
+auto read_proc_images(uint64_t pid) -> std::string {
+    auto snapshot = read_file(build_proc_path(pid, PROC_IMAGES_SUFFIX), PROC_READ_CAPACITY);
+    return snapshot.has_value() ? std::move(*snapshot) : std::string{};
+}
+
 auto proc_map_line(uint64_t pid, std::string_view comm, std::string_view cmdline) -> std::string {
     std::string line = "pid=";
     line += std::to_string(pid);
@@ -669,6 +674,39 @@ void write_section_peer_map(int fd) {
     write_all(fd, SECTION_PEER_MAP_END);
 }
 
+void write_image_map_snapshot(int fd, uint64_t pid, std::string_view snapshot) {
+    std::size_t pos = 0;
+    while (pos < snapshot.size()) {
+        std::string_view const LINE = next_line(snapshot, pos);
+        if (LINE.empty()) {
+            continue;
+        }
+        std::string output = "pid=";
+        output += std::to_string(pid);
+        output += ' ';
+        output += LINE;
+        output += '\n';
+        write_all(fd, output);
+    }
+}
+
+void write_section_image_map(int fd, const std::vector<TrackedProc>* tracked) {
+    write_all(fd, SECTION_IMAGE_MAP);
+    auto const LIVE = collect_main_stats();
+    for (const auto& stat : LIVE) {
+        write_image_map_snapshot(fd, stat.pid, read_proc_images(stat.pid));
+    }
+    if (tracked != nullptr) {
+        for (const auto& proc : *tracked) {
+            bool const IS_LIVE = std::ranges::any_of(LIVE, [&](const StatInfo& stat) { return stat.pid == proc.pid; });
+            if (!IS_LIVE) {
+                write_image_map_snapshot(fd, proc.pid, proc.image_map);
+            }
+        }
+    }
+    write_all(fd, SECTION_IMAGE_MAP_END);
+}
+
 void save_perf_data() {
     ScopedFd const FD = open_write_trunc(PERF_DATA_FILE);
     if (!FD.valid()) {
@@ -685,6 +723,7 @@ void save_perf_data() {
     ssize_t const CONTSTAT_BYTES = write_section_contstat(FD.get());
     ssize_t const MEMACC_BYTES = write_section_memacc_alloc_totals(FD.get());
     ssize_t const DIAG_BYTES = CONTSTAT_BYTES + MEMACC_BYTES;
+    write_section_image_map(FD.get());
 
     if (event_bytes <= 0 && SUMMARY_BYTES <= 0 && IPC_BYTES <= 0 && DIAG_BYTES <= 0) {
         std::println("perf: ring buffer empty - PROC_MAP saved, no events");
@@ -788,9 +827,13 @@ void cmd_record(int ms, const char* filter) {
     // that exit before the final proc-map snapshot are still resolved.
     std::vector<TrackedProc> tracked;
     auto upsert_tracked = [&](const StatInfo& stat) {
+        std::string image_map = read_proc_images(stat.pid);
         for (auto& proc : tracked) {
             if (proc.pid == stat.pid) {
                 proc.comm = stat.comm;
+                if (!image_map.empty()) {
+                    proc.image_map = std::move(image_map);
+                }
                 return;
             }
         }
@@ -798,6 +841,7 @@ void cmd_record(int ms, const char* filter) {
             .pid = stat.pid,
             .comm = stat.comm,
             .cmdline = read_cmdline(stat.pid),
+            .image_map = std::move(image_map),
         });
     };
 
@@ -872,6 +916,7 @@ void cmd_record(int ms, const char* filter) {
         }
     }
     write_all(data_fd.get(), SECTION_PROC_MAP_END);
+    write_section_image_map(data_fd.get(), &tracked);
 
     if (total_event_bytes <= 0 && SUMMARY_BYTES <= 0 && IPC_BYTES <= 0 && DIAG_BYTES <= 0) {
         std::println("perf: ring buffer empty - PROC_MAP saved, no events");

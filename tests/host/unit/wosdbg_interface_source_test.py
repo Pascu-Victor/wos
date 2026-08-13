@@ -184,6 +184,35 @@ def test_distributed_timeline_is_bounded_and_clock_honest() -> None:
     )
 
 
+def test_coredump_module_identity_requires_dump_evidence() -> None:
+    service = (WOSDBG / "debug_analysis_service.cpp").read_text()
+    matcher = between(
+        service,
+        "auto runtime_base_matches_dump",
+        "auto source_with_llvm_symbolizer",
+    )
+    require_tokens(
+        matcher,
+        [
+            "wosdbg::read_va_bytes",
+            "RUNTIME_START",
+            "FILE_OFFSET",
+            "std::memcmp",
+            "AVAILABLE < 32",
+        ],
+        "coredump module byte identity",
+    )
+    if "matched = !wosdbg::elf_bytes_at_runtime_va" in service:
+        fail("WOSDBG must not compare an interpreter candidate with its own file bytes")
+    require_tokens(
+        service,
+        [
+            "matched = runtime_base_matches_dump(*session.dump, ELF, info, base)",
+            "SYMBOL_SOURCE_TRUSTED",
+            "if (SYMBOL_SOURCE_TRUSTED)",
+        ],
+        "unmatched module symbol quarantine",
+    )
 def test_incident_assurance_exercises_compiled_frontend_adapters() -> None:
     semantic_test = (WOSDBG / "tests" / "incident_cli_semantic_test.py").read_text()
     cmake = (WOSDBG / "CMakeLists.txt").read_text()
@@ -255,6 +284,7 @@ def main() -> None:
     test_backend_catalog_is_the_only_tool_dispatch_contract()
     test_cli_and_gui_use_the_shared_contract()
     test_distributed_timeline_is_bounded_and_clock_honest()
+    test_coredump_module_identity_requires_dump_evidence()
     test_incident_assurance_exercises_compiled_frontend_adapters()
     test_agent_and_user_docs_cover_all_interfaces()
     print("WOSDBG MCP, CLI, and GUI share one bounded analysis contract")

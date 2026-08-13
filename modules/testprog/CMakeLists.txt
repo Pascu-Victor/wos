@@ -21,6 +21,7 @@ include_directories(
 
 # Source files
 set(SOURCES
+    src/aslr_hardening.cpp
     src/asan_crasher.cpp
     src/cowbench.cpp
     src/fsbench.cpp
@@ -50,7 +51,7 @@ endif()
 
 # Linker settings
 set_target_properties(testprog PROPERTIES
-    LINK_FLAGS "-Wl,-z,now -Wl,--no-dynamic-linker"
+    LINK_FLAGS "-Wl,-z,now -Wl,-z,relro -Wl,--no-dynamic-linker"
 )
 
 target_link_libraries(testprog c++abi c++ c unwind)

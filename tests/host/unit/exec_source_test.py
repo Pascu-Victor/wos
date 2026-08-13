@@ -9,6 +9,7 @@ ELF_LOADER_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "loader" / "el
 TASK_HPP = ROOT / "modules" / "kern" / "src" / "platform" / "sched" / "task.hpp"
 COREDUMP_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "dbg" / "coredump.cpp"
 REMOTE_COMPUTE_CPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "remote_compute.cpp"
+MLIBC_RTLD_MAIN_CPP = ROOT / "toolchain" / "src" / "mlibc" / "options" / "rtld" / "generic" / "main.cpp"
 
 
 def fail(message: str) -> None:
@@ -179,7 +180,7 @@ def require_callers_use_sparse_reader(source: str) -> None:
         "append_exec_lazy_file_ranges(new_lazy_ranges, main_loader_lazy_ranges, exec_file, exec_stat)",
         "vfs::File* interp_file = vfs::vfs_get_file_retain(task, INTERP_FD)",
         "append_exec_lazy_file_ranges(new_lazy_ranges, interp_loader_lazy_ranges, interp_file, interp_stat)",
-        "publish_exec_lazy_ranges(task, new_lazy_ranges)",
+        "swap_exec_lazy_ranges(task, new_lazy_ranges, old_lazy_ranges)",
         "new_lazy_ranges_published = true",
     ]:
         if snippet not in source:
@@ -333,18 +334,54 @@ def require_loader_does_not_scan_unread_symbol_payloads(loader_source: str) -> N
 
 def require_interpreter_preserves_primary_debug_mappings(loader_source: str) -> None:
     load_body = function_body_containing(loader_source, "load_elf_impl", "REGISTER_SPECIAL_SYMBOLS")
-    if "load_section_headers(elf_file, pagemap, pid, REGISTER_SPECIAL_SYMBOLS)" not in load_body:
-        fail("ELF loader must identify whether fixed PID debug mappings belong to the primary image")
+    if "load_section_headers(elf_file, pagemap, DEBUG_PID, debug_metadata_plan)" not in load_body:
+        fail("ELF loader must route primary-image debug mappings through the selected registry PID")
+    for snippet in [
+        "uint64_t const DEBUG_PID = options.debug_registry_pid != 0 ? options.debug_registry_pid : pid",
+        "bool const IS_PRIMARY_IMAGE = options.image_role == mod::mm::user_layout::ImageRole::MAIN",
+    ]:
+        if snippet not in load_body:
+            fail(f"staged debug registry and explicit image role missing: {snippet}")
 
     section_body = function_body(loader_source, "load_section_headers")
-    gate = section_body.find("if (install_primary_image_metadata)")
-    section_mapping = section_body.find("SECTION_HEADERS_VADDR")
-    string_mapping = section_body.find("STRING_TABLE_VADDR")
+    gate = section_body.find("if (metadata_plan.install)")
+    section_mapping = section_body.find("DEBUG_SECTION_HEADERS_VADDR")
+    string_mapping = section_body.find("DEBUG_STRING_TABLE_VADDR")
     section_iteration = section_body.find("for (size_t section_index")
     if gate < 0 or section_mapping <= gate or string_mapping <= gate:
         fail("fixed PID debug metadata mappings must be gated to the primary image")
     if section_iteration <= string_mapping:
         fail("interpreter section rows must remain appendable without replacing primary debug mappings")
+
+
+def require_bounded_contiguous_loader(loader_source: str) -> None:
+    header = (ROOT / "modules" / "kern" / "src" / "platform" / "loader" / "elf_loader.hpp").read_text()
+    task_source = (ROOT / "modules" / "kern" / "src" / "platform" / "sched" / "task.cpp").read_text()
+    remote_source = REMOTE_COMPUTE_CPP.read_text()
+    for forbidden in ["load_elf(ElfFile*", "extract_tls_info(void*", "elf.logical_size = std::numeric_limits<uint64_t>::max()"]:
+        if forbidden in header + loader_source:
+            fail(f"unbounded contiguous ELF API survived: {forbidden}")
+    for snippet in [
+        "load_elf(const uint8_t* data, size_t size",
+        "parse_elf(const uint8_t* base, uint64_t size, ElfFile& elf)",
+        "inspect_tls(const uint8_t* data, size_t size, TlsModule& out)",
+        "load_elf(interp_buf, interp_size",
+        "reinterpret_cast<uint64_t>(elf_buffer), binary_len, KERNEL_RSP",
+    ]:
+        if snippet not in header + loader_source + task_source + remote_source:
+            fail(f"bounded ELF length propagation missing: {snippet}")
+
+
+def require_remote_execfn_auxv() -> None:
+    source = REMOTE_COMPUTE_CPP.read_text()
+    for snippet in [
+        "AT_EXECFN_ADDR = push_string(new_task->exe_path.data())",
+        "constexpr uint64_t AT_EXECFN = 31",
+        "append_auxv(AT_EXECFN, AT_EXECFN_ADDR)",
+        "size_t const AUXV_QWORDS = 18 + (new_task->interp_base != 0 ? 2 : 0)",
+    ]:
+        if snippet not in source:
+            fail(f"WKI receiver AT_EXECFN invariant missing: {snippet}")
 
 
 def require_loader_lazy_file_ranges(loader_source: str) -> None:
@@ -360,7 +397,7 @@ def require_loader_lazy_file_ranges(loader_source: str) -> None:
 
     load_body = function_body_containing(loader_source, "load_elf_impl", "ENABLE_LAZY_FILE_RANGES")
     for snippet in [
-        "options.lazy_file_ranges != nullptr && (has_dynamic_interp || BASE_ADDRESS != 0)",
+        "options.lazy_file_ranges != nullptr && (has_dynamic_interp || !IS_PRIMARY_IMAGE)",
         "lazy_load_page_range(current_header, j, elf_file.load_base, lazy_range)",
         "!pt_load_page_overlaps_other_segment(elf_file, current_header, lazy_range.vaddr)",
         "!mod::mm::virt::is_page_mapped(pagemap, lazy_range.vaddr)",
@@ -382,6 +419,29 @@ def require_loader_lazy_file_ranges(loader_source: str) -> None:
             fail(f"loader lazy page policy must stay conservative: {snippet}")
 
 
+def require_coredump_entropy_redaction() -> None:
+    source = COREDUMP_CPP.read_text()
+    body = function_body(source, "perform_coredump")
+    for snippet in [
+        "REDACT_AT_RANDOM = overlaps_page(req.at_random_addr, AT_RANDOM_SIZE)",
+        "REDACT_TCB_CANARY = overlaps_page(TCB_CANARY_ADDR, STACK_CANARY_SIZE)",
+        "redact_range(req.at_random_addr, AT_RANDOM_SIZE)",
+        "redact_range(TCB_CANARY_ADDR, STACK_CANARY_SIZE)",
+    ]:
+        if snippet not in body:
+            fail(f"coredump entropy redaction invariant missing: {snippet}")
+
+
+def require_rtld_self_relocation_is_single_pass() -> None:
+    source = MLIBC_RTLD_MAIN_CPP.read_text()
+    for snippet in [
+        "relocateSelf() completed before interpreterMain()",
+        "ldso_soname, frg::string<MemoryAllocator>{getAllocator()}, ldso_base, _DYNAMIC, 0",
+    ]:
+        if snippet not in source:
+            fail(f"initial ld.so must be older than the first normal relocation transaction: {snippet}")
+
+
 def main() -> None:
     source = EXEC_CPP.read_text()
     loader_source = ELF_LOADER_CPP.read_text()
@@ -392,7 +452,11 @@ def main() -> None:
     require_spawn_actions_snapshot_user_memory_and_preserve_cloexec_sources(source)
     require_loader_does_not_scan_unread_symbol_payloads(loader_source)
     require_interpreter_preserves_primary_debug_mappings(loader_source)
+    require_bounded_contiguous_loader(loader_source)
+    require_remote_execfn_auxv()
     require_loader_lazy_file_ranges(loader_source)
+    require_coredump_entropy_redaction()
+    require_rtld_self_relocation_is_single_pass()
     print("exec sparse-read source invariants hold")
 
 

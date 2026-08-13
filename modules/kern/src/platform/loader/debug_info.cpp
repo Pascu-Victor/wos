@@ -1,5 +1,6 @@
 #include "debug_info.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <platform/dbg/dbg.hpp>
@@ -139,6 +140,41 @@ void set_string_table(uint64_t pid, const char* strtab, uint64_t strtab_addr, ui
         }
     }
     debug_registry_lock.unlock();
+}
+
+auto publish_staged_process(uint64_t staging_pid, uint64_t final_pid, const char* final_name) -> bool {
+    if (staging_pid == final_pid) {
+        return false;
+    }
+
+    debug_registry_lock.lock();
+    size_t staged_index = debug_registry.size();
+    for (size_t i = 0; i < debug_registry.size(); ++i) {
+        if (debug_registry.at(i).pid == staging_pid) {
+            staged_index = i;
+            break;
+        }
+    }
+    if (staged_index == debug_registry.size()) {
+        debug_registry_lock.unlock();
+        return false;
+    }
+
+    for (size_t i = 0; i < debug_registry.size();) {
+        if (debug_registry.at(i).pid == final_pid) {
+            debug_registry.erase(debug_registry.begin() + static_cast<std::ptrdiff_t>(i));
+            if (i < staged_index) {
+                --staged_index;
+            }
+            continue;
+        }
+        ++i;
+    }
+
+    debug_registry.at(staged_index).pid = final_pid;
+    debug_registry.at(staged_index).name = final_name;
+    debug_registry_lock.unlock();
+    return true;
 }
 
 ProcessDebugInfo* get_process_debug_info(uint64_t pid) {

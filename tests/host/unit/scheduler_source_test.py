@@ -454,17 +454,25 @@ def test_user_thread_tcbs_publish_nonzero_tid_before_user_execution() -> None:
         "threading create_thread TID contract",
     )
     create_thread_body = function_body(threading_source, "create_thread")
+    map_zeroed_body = function_body(threading_source, "map_zeroed_user_range")
     require_tokens(
         create_thread_body,
         [
-            "mm::phys::page_alloc_with_reclaim_may_fail(mm::PhysicalPageOwner::USER_THREAD_TLS, mm::paging::PAGE_SIZE, "
-            '"thread_tls_page")',
-            "free_mapped_user_range(page_table, TLS_VIRT_ADDR, TLS_VIRT_ADDR + offset);",
+            'map_zeroed_user_range(page_table, TLS_VIRT_ADDR, aligned_tls_size, "thread_tls_page")',
+            "free_mapped_user_range(page_table, layout_base, layout_base + layout_size)",
             "auto const INITIAL_TID = static_cast<uint32_t>(initial_tid);",
             "write_mapped_user_value(page_table, TCB_VIRT_ADDR + 0x18, INITIAL_TID)",
             "thread->tls_phys_ptr = 0;",
         ],
         "fragmentation-safe initial user TLS and TCB construction",
+    )
+    require_tokens(
+        map_zeroed_body,
+        [
+            "mm::phys::page_alloc_with_reclaim_may_fail(mm::PhysicalPageOwner::USER_THREAD_TLS, mm::paging::PAGE_SIZE, allocation_name)",
+            "mm::paging::page_types::USER | mm::paging::PAGE_NX",
+        ],
+        "page-granular NX TLS and SafeStack construction",
     )
     for forbidden in [
         'mm::phys::page_alloc(mm::PhysicalPageOwner::USER_THREAD_TLS, ALIGNED_TOTAL_SIZE, "thread_tls")',
@@ -476,12 +484,16 @@ def test_user_thread_tcbs_publish_nonzero_tid_before_user_execution() -> None:
     require_order(
         task_source,
         "this->pid = sched::task::get_next_pid();",
-        "threading::create_thread(ker::mod::mm::USER_STACK_SIZE, ACTUAL_TLS_INFO.tls_size, this->pagemap, this->pid",
+        "threading::create_thread(ker::mod::mm::USER_STACK_SIZE, actual_tls_info.tls_size, this->pagemap, this->pid",
         "fresh process must allocate a PID before building the initial TCB",
     )
     require_tokens(
         exec_source,
-        ["mod::sched::threading::create_thread(ker::mod::mm::USER_STACK_SIZE, TLS_INFO.tls_size, new_pagemap, task->pid"],
+        [
+            "loader::elf::inspect_tls(elf_buffer, static_cast<size_t>(FILE_SIZE), tls_info)",
+            "mod::sched::threading::create_thread(ker::mod::mm::USER_STACK_SIZE, tls_info.tls_size",
+            "new_pagemap, task->pid, tls_info",
+        ],
         "execve replacement TCB tid publication",
     )
     require_order(

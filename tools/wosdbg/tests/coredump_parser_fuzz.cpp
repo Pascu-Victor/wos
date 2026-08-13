@@ -34,8 +34,8 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
 
     const auto& dump = *result.dump;
     const uint64_t raw_size = static_cast<uint64_t>(dump.raw.size());
-    if (!dump.is_valid() || dump.version < 1 || dump.version > 3 || result.detected_version != dump.version ||
-        dump.segment_count != dump.segments.size()) {
+    if (!dump.is_valid() || dump.version < 1 || dump.version > 4 || result.detected_version != dump.version ||
+        dump.segment_count != dump.segments.size() || dump.module_count != dump.modules.size()) {
         invariant_failure();
     }
     if (dump.elf_size != 0 && !checked_range(dump.elf_offset, dump.elf_size, raw_size)) {

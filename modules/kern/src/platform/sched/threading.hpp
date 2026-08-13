@@ -19,6 +19,12 @@ struct Thread {
     uint64_t stack_base_virt{};
     uint64_t stack_lowest_backed{};
 
+    // Complete kernel-managed initial-thread reservation, including stack,
+    // TLS, SafeStack, and the guard pages between/around them. mmap(MAP_FIXED)
+    // must not replace any part of this range.
+    uint64_t layout_base_virt{};
+    uint64_t layout_size{};
+
     uint64_t tls_size{};
     uint64_t tls_base_virt{};
     uint64_t safestack_ptr_value{};
@@ -39,6 +45,7 @@ Thread* create_thread(uint64_t stack_size, uint64_t tls_size, mm::paging::PageTa
 void destroy_thread(Thread* thread);
 bool ensure_stack_backing(Thread* thread, mm::paging::PageTable* page_table, uint64_t start, uint64_t end);
 bool handle_lazy_stack_fault(Thread* thread, mm::paging::PageTable* page_table, uint64_t fault_addr, uint64_t rsp);
+auto range_overlaps_initial_layout(const Thread* thread, uint64_t start, uint64_t size) -> bool;
 
 // OOM diagnostics - get count of active threads
 auto get_active_thread_count() -> uint64_t;

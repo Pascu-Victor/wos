@@ -7,6 +7,7 @@
 #include <platform/dbg/dbg.hpp>
 #include <platform/mm/mm.hpp>
 #include <platform/mm/paging.hpp>
+#include <platform/mm/user_layout.hpp>
 #include <platform/mm/virt.hpp>
 #include <util/smallvec.hpp>
 
@@ -19,10 +20,18 @@ struct TlsModule {
     uint64_t tcb_offset;  // Offset to TCB within TLS
 };
 
+// Initial TLS is eagerly materialized for the first thread. Keep a generous
+// bound for legitimate large static TLS images while preventing a hostile ELF
+// header from turning task construction into an unbounded physical allocation.
+inline constexpr uint64_t MAX_INITIAL_TLS_SIZE = 64ULL * 1024 * 1024;
+
 using Elf64Entry = uint64_t;
 
 struct ElfLoadResult {
     uint64_t entry_point{};              // Program entry point
+    uint64_t load_base{};                // Runtime load bias (zero for fixed ET_EXEC)
+    uint64_t image_start{};              // First runtime PT_LOAD page (inclusive)
+    uint64_t image_end{};                // Last runtime PT_LOAD page (exclusive)
     uint64_t program_header_addr{};      // Virtual address of program headers (for AT_PHDR)
     uint64_t elf_header_addr{};          // Virtual address of ELF header (for AT_EHDR)
     uint16_t program_header_count{};     // Number of program headers (for AT_PHNUM)
@@ -48,6 +57,10 @@ struct ElfLoadOptions {
     bool register_special_symbols = true;
     uint64_t base_address = 0;
     ElfLazyLoadRangeVec* lazy_file_ranges = nullptr;
+    // Zero selects pid. exec transactions can stage debug rows under a
+    // synthetic identifier and rekey them only when the new image commits.
+    uint64_t debug_registry_pid = 0;
+    ker::mod::mm::user_layout::ImageRole image_role = ker::mod::mm::user_layout::ImageRole::MAIN;
 };
 
 // Exact, positional read used by file-backed ELF views. Implementations must
@@ -60,9 +73,9 @@ using ElfReadAt = auto (*)(void* context, uint64_t offset, void* destination, si
 // remain alive for the duration of load_elf(). Arrays contain e_phnum/e_shnum
 // native Elf64 entries; section_names contains the complete shstrtab payload.
 //
-// contiguous_base is optional. Dynamic images do not need it. It is only used
-// by the legacy static-relocation implementation, which needs random access to
-// relocation and symbol-table contents not represented by this view.
+// contiguous_base is optional. Dynamic images do not need it. The fail-closed
+// static-relocation pass uses it for bounded random access to relocation and
+// symbol-table contents not represented by this view.
 struct ElfFileView {
     Elf64_Ehdr elf_header{};
     const Elf64_Phdr* program_headers{};
@@ -91,18 +104,19 @@ struct ElfFile {
     TlsModule tls_info;  // TLS information for this ELF
 };
 
-auto load_elf(ElfFile* elf, ker::mod::mm::virt::PageTable* pagemap, uint64_t pid, const char* process_name,
+auto load_elf(const uint8_t* data, size_t size, ker::mod::mm::virt::PageTable* pagemap, uint64_t pid, const char* process_name,
               bool register_special_symbols = true, uint64_t base_address = 0) -> ElfLoadResult;
-auto load_elf(ElfFile* elf, ker::mod::mm::virt::PageTable* pagemap, uint64_t pid, const char* process_name, const ElfLoadOptions& options)
-    -> ElfLoadResult;
+auto load_elf(const uint8_t* data, size_t size, ker::mod::mm::virt::PageTable* pagemap, uint64_t pid, const char* process_name,
+              const ElfLoadOptions& options) -> ElfLoadResult;
 auto load_elf(const ElfFileView& elf, ker::mod::mm::virt::PageTable* pagemap, uint64_t pid, const char* process_name,
               bool register_special_symbols = true, uint64_t base_address = 0) -> ElfLoadResult;
 auto load_elf(const ElfFileView& elf, ker::mod::mm::virt::PageTable* pagemap, uint64_t pid, const char* process_name,
               const ElfLoadOptions& options) -> ElfLoadResult;
 
-// Extract TLS information from ELF without fully loading it
-auto extract_tls_info(void* elf_data) -> TlsModule;
-auto extract_tls_info(const ElfFileView& elf) -> TlsModule;
+// Validate the complete bounded ELF source and extract its initial TLS
+// contract. A valid ELF without PT_TLS succeeds with an empty module.
+auto inspect_tls(const uint8_t* data, size_t size, TlsModule& out) -> bool;
+auto inspect_tls(const ElfFileView& elf, TlsModule& out) -> bool;
 
 // Remove the global getter - TLS info should be passed per-process
 // TlsModule getTlsModule();

@@ -29,7 +29,7 @@ the fixtures to land before production support without concealing missing
 coverage in an integration run. Useful narrower invocations are `--mode
 collector`, `--mode security`, `--mode property`, and `--case
 'valid-single-*'`. Property mode applies a fixed-seed, bounded set of coredump
-v1-v3 and USTAR mutations; adjust it with `--property-smoke-runs N`. An
+v1-v4 and USTAR mutations; adjust it with `--property-smoke-runs N`. An
 existing corpus may be supplied with `--fixtures PATH`.
 
 The semantic suite is registered as `wosdbg_incident_cli_semantic_test` in the
@@ -84,8 +84,9 @@ focused host tests rather than duplicated here.
   a WOSDBG build.
 
 Synthetic ELF64 images contain a deterministic GNU build ID and symbol table.
-Synthetic coredumps use the local v1-v3 byte layouts; the unsupported v4 case
-retains a v3-shaped body so rejection tests the version gate, not random bytes.
+Synthetic coredumps use the local v1-v4 byte layouts. The v4 fixture includes
+an exact runtime-image record with its build ID; the unsupported v5 case
+retains a v4-shaped body so rejection tests the version gate, not random bytes.
 
 ## Shared tool/result contract asserted
 
@@ -138,7 +139,7 @@ One headless WOSDBG server is also exercised through its actual MCP HTTP and Qt
 the CLI catalog, and incident load/summary results from all three interfaces
 must have identical normalized semantics and `semanticDigest` values.
 
-The fixed-seed property smoke alternates valid v1-v3 coredump seeds with
+The fixed-seed property smoke alternates valid v1-v4 coredump seeds with
 truncation, header/version, range, and byte mutations, and mutates both USTAR
 headers and bodies. Every mutation is replayed in two fresh backend processes;
 it must return deterministic structured JSON without a crash, hang, or unstable

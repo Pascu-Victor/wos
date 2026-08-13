@@ -29,6 +29,7 @@
 #include <platform/mm/phys.hpp>
 #include <platform/mm/virt.hpp>
 #include <platform/perf/perf_events.hpp>
+#include <platform/random/entropy.hpp>
 #include <platform/sched/epoch.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
@@ -5203,7 +5204,7 @@ auto exec_elf_buffer(uint8_t* elf_buffer, uint32_t binary_len, bool shared_elf_b
     // PT_INTERP without entering VFS; the worker must first publish a recovery
     // owner for every resource now attached to the child.
     auto* new_task = new ker::mod::sched::task::Task(  // NOLINT(cppcoreguidelines-owning-memory)
-        "wki-remote", reinterpret_cast<uint64_t>(elf_buffer), KERNEL_RSP, ker::mod::sched::task::TaskType::PROCESS);
+        "wki-remote", reinterpret_cast<uint64_t>(elf_buffer), binary_len, KERNEL_RSP, ker::mod::sched::task::TaskType::PROCESS);
 
     if (new_task == nullptr) {
         ker::mod::mm::phys::page_free(reinterpret_cast<void*>(stack_base));
@@ -6252,13 +6253,35 @@ void handle_task_submit_work(uint16_t src_node, const uint8_t* payload, uint16_t
         }
         envp_addrs[submit->envc] = 0;
 
+        uint64_t const AT_EXECFN_ADDR = push_string(new_task->exe_path.data());
+        if (AT_EXECFN_ADDR == 0) {
+            delete[] argv_addrs;
+            delete[] envp_addrs;
+            return false;
+        }
+
+        std::array<uint8_t, 16> at_random{};
+        if (!ker::mod::random::entropy::get_bytes(at_random.data(), at_random.size())) {
+            delete[] argv_addrs;
+            delete[] envp_addrs;
+            return false;
+        }
+        uint64_t const AT_RANDOM_ADDR = push_to_stack(at_random.data(), at_random.size());
+        std::memset(at_random.data(), 0, at_random.size());
+        if (AT_RANDOM_ADDR == 0) {
+            delete[] argv_addrs;
+            delete[] envp_addrs;
+            return false;
+        }
+        new_task->at_random_addr = AT_RANDOM_ADDR;
+
         // Align to 16 bytes
         constexpr uint64_t ALIGN = 16;
         uint64_t const CUR = user_stack_top - stack_offset;
         uint64_t const ALIGNED = CUR & ~(ALIGN - 1);
         stack_offset += (CUR - ALIGNED);
 
-        size_t const AUXV_QWORDS = 14 + (new_task->interp_base != 0 ? 2 : 0);
+        size_t const AUXV_QWORDS = 18 + (new_task->interp_base != 0 ? 2 : 0);
         size_t const STRUCTURED_QWORDS =
             AUXV_QWORDS + (static_cast<size_t>(submit->envc) + 1) + (static_cast<size_t>(submit->argc) + 1) + 1;
         if (STRUCTURED_QWORDS % 2 != 0) {
@@ -6279,9 +6302,11 @@ void handle_task_submit_work(uint16_t src_node, const uint8_t* payload, uint16_t
         constexpr uint64_t AT_PAGESZ = 6;
         constexpr uint64_t AT_BASE = 7;
         constexpr uint64_t AT_ENTRY = 9;
+        constexpr uint64_t AT_RANDOM = 25;
+        constexpr uint64_t AT_EXECFN = 31;
         constexpr uint64_t AT_EHDR = 33;
 
-        std::array<uint64_t, 16> auxv = {};
+        std::array<uint64_t, 22> auxv = {};
         size_t auxv_count = 0;
         auto append_auxv = [&](uint64_t key, uint64_t value) {
             *std::next(auxv.begin(), static_cast<ptrdiff_t>(auxv_count++)) = key;
@@ -6294,6 +6319,8 @@ void handle_task_submit_work(uint16_t src_node, const uint8_t* payload, uint16_t
         append_auxv(AT_PHENT, new_task->program_header_ent_size);
         append_auxv(AT_PHNUM, new_task->program_header_count);
         append_auxv(AT_EHDR, new_task->elf_header_addr);
+        append_auxv(AT_RANDOM, AT_RANDOM_ADDR);
+        append_auxv(AT_EXECFN, AT_EXECFN_ADDR);
         if (new_task->interp_base != 0) {
             append_auxv(AT_BASE, new_task->interp_base);
         }

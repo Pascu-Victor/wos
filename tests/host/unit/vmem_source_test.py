@@ -12,6 +12,9 @@ PROCESS_CPP = ROOT / "modules" / "kern" / "src" / "syscalls_impl" / "process" / 
 VIRT_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "mm" / "virt.opt.cpp"
 TASK_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "sched" / "task.cpp"
 TASK_HPP = ROOT / "modules" / "kern" / "src" / "platform" / "sched" / "task.hpp"
+THREADING_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "sched" / "threading.cpp"
+THREADING_HPP = ROOT / "modules" / "kern" / "src" / "platform" / "sched" / "threading.hpp"
+SHM_CPP = ROOT / "modules" / "kern" / "src" / "syscalls_impl" / "shm" / "shm.cpp"
 VMEM_ABI_HPP = ROOT / "modules" / "kern" / "src" / "abi" / "callnums" / "vmem.h"
 DEBUG_FLAGS_DOC = ROOT / "docs" / "kernel_debug_flags.md"
 
@@ -125,7 +128,7 @@ def test_munmap_and_mprotect_reject_overflowing_lengths() -> None:
     require_order(
         protect,
         "int const SIZE_RET = align_user_vmem_size(size, &size)",
-        "protect_shared_vmem_range(task, ADDR, size, PROT)",
+        "protect_shared_vmem_range_locked(task, ADDR, size, PROT)",
         "mprotect must validate overflow before side effects",
     )
     if "size = page_align_up(size)" in protect:
@@ -134,7 +137,7 @@ def test_munmap_and_mprotect_reject_overflowing_lengths() -> None:
 
 def test_nonfixed_mmap_address_selection_is_reserved_before_mapping() -> None:
     source = SYS_VMEM_CPP.read_text()
-    reserve_body = function_body(source, "reserve_free_mmap_range")
+    reserve_body = function_body(source, "reserve_free_mmap_range_locked")
     anon_body = function_body(source, "anon_allocate")
     file_body = function_body(source, "file_allocate")
 
@@ -142,7 +145,7 @@ def test_nonfixed_mmap_address_selection_is_reserved_before_mapping() -> None:
         source,
         [
             "ker::mod::sys::Mutex g_shared_vmem_publication_lock;",
-            "release_mmap_reservation(task, vaddr, size, HAS_ADDRESS_RESERVATION)",
+            "release_mmap_reservation_locked(task, vaddr, size, HAS_ADDRESS_RESERVATION)",
         ],
         "mmap address reservation surface",
     )
@@ -151,7 +154,6 @@ def test_nonfixed_mmap_address_selection_is_reserved_before_mapping() -> None:
     require_tokens(
         reserve_body,
         [
-            "SharedVmemPublicationGuard publication_guard;",
             "uint64_t const VADDR = find_free_range(task, size, hint)",
             "update_shared_vmem_ranges_locked(",
             "add_lazy_vmem_range(candidate, VADDR, size, 0, 0)",
@@ -182,7 +184,8 @@ def test_nonfixed_mmap_address_selection_is_reserved_before_mapping() -> None:
         require_tokens(
             body,
             [
-                "reserve_free_mmap_range(task, size, hint, vaddr)",
+                "SharedVmemPublicationGuard publication_guard;",
+                "reserve_free_mmap_range_locked(task, size, hint, vaddr)",
                 "bool const HAS_ADDRESS_RESERVATION = !IS_FIXED;",
             ],
             f"{body_name} non-fixed reservation path",
@@ -190,14 +193,14 @@ def test_nonfixed_mmap_address_selection_is_reserved_before_mapping() -> None:
 
     require_order(
         file_body,
-        "reserve_free_mmap_range(task, size, hint, vaddr)",
+        "reserve_free_mmap_range_locked(task, size, hint, vaddr)",
         "if (file_mmap_can_share(st, prot))",
         "file mmap must reserve the address before eager file mapping",
     )
     require_order(
         file_body,
-        "release_mmap_reservation(task, vaddr, size, HAS_ADDRESS_RESERVATION)",
-        "advance_shared_mmap_cursor(task, vaddr, size)",
+        "release_mmap_reservation_locked(task, vaddr, size, HAS_ADDRESS_RESERVATION)",
+        "advance_shared_mmap_cursor_locked(task, vaddr, size)",
         "file mmap reservation must be dropped only after page tables occupy the range",
     )
 
@@ -210,8 +213,8 @@ def test_nonfixed_mmap_address_selection_is_reserved_before_mapping() -> None:
     require_ordered_tokens(
         noreserve_block,
         [
-            "if (!add_shared_vmem_range(task, vaddr, size, prot, flags))",
-            "release_mmap_reservation(task, vaddr, size, HAS_ADDRESS_RESERVATION)",
+            "if (!add_shared_vmem_range_locked(task, vaddr, size, prot, flags))",
+            "release_mmap_reservation_locked(task, vaddr, size, HAS_ADDRESS_RESERVATION)",
             "return static_cast<uint64_t>(-ker::abi::vmem::VMEM_ENOMEM)",
         ],
         "anonymous lazy metadata failure must release non-fixed reservation",
@@ -220,11 +223,11 @@ def test_nonfixed_mmap_address_selection_is_reserved_before_mapping() -> None:
     require_ordered_tokens(
         anon_body,
         [
-            "uint64_t const RESULT = private_anon_allocate(task, vaddr, size, prot, hint, flags)",
+            "uint64_t const RESULT = private_anon_allocate_locked(task, vaddr, size, prot, hint, flags)",
             "int const RESULT_STATUS = perf_status_from_vmem_result(RESULT)",
             "record_local_vmem_event",
             "if (RESULT_STATUS != 0)",
-            "release_mmap_reservation(task, vaddr, size, HAS_ADDRESS_RESERVATION)",
+            "release_mmap_reservation_locked(task, vaddr, size, HAS_ADDRESS_RESERVATION)",
             "return RESULT",
         ],
         "private anonymous failure must release non-fixed reservation",
@@ -232,18 +235,169 @@ def test_nonfixed_mmap_address_selection_is_reserved_before_mapping() -> None:
 
     zero_page_block = block_between(
         anon_body,
-        "auto const ZERO_PADDR",
         "ker::mod::mm::phys::page_ref_add(ZERO_PAGE, NUM_PAGES)",
+        "advance_shared_mmap_cursor_locked(task, vaddr, size)",
         "anonymous zero-page metadata branch",
     )
     require_ordered_tokens(
         zero_page_block,
         [
-            "if (!add_shared_vmem_range(task, vaddr, size, prot, flags))",
-            "release_mmap_reservation(task, vaddr, size, HAS_ADDRESS_RESERVATION)",
+            "map_same_page_range(task->pagemap, vaddr, ZERO_PADDR, NUM_PAGES, PAGE_FLAGS)",
+            "if (!add_shared_vmem_range_locked(task, vaddr, size, prot, flags))",
+            "rollback_mapped_pages(task, vaddr, NUM_PAGES)",
+            "release_mmap_reservation_locked(task, vaddr, size, HAS_ADDRESS_RESERVATION)",
             "return static_cast<uint64_t>(-ker::abi::vmem::VMEM_ENOMEM)",
         ],
         "zero-page anonymous metadata failure must release non-fixed reservation",
+    )
+
+    private_anon = function_body(source, "private_anon_allocate_locked")
+    require_ordered_tokens(
+        private_anon,
+        [
+            "map_page(task->pagemap, current_vaddr, PADDR, PAGE_FLAGS)",
+            "if (!add_shared_vmem_range_locked(task, vaddr, size, prot, flags))",
+            "rollback_mapped_pages(task, vaddr, mapped_pages)",
+        ],
+        "eager private anonymous mapping publication and rollback",
+    )
+
+
+def test_kernel_managed_initial_layout_cannot_be_replaced() -> None:
+    vmem = SYS_VMEM_CPP.read_text()
+    task_source = TASK_CPP.read_text()
+    threading_source = THREADING_CPP.read_text()
+    threading_header = THREADING_HPP.read_text()
+
+    require_tokens(
+        threading_header,
+        [
+            "uint64_t layout_base_virt{};",
+            "uint64_t layout_size{};",
+            "range_overlaps_initial_layout(const Thread* thread, uint64_t start, uint64_t size)",
+        ],
+        "kernel-managed initial layout metadata",
+    )
+    require_tokens(
+        threading_source,
+        [
+            "mm::virt::reserve_page_range(page_table, layout_base, layout_size / mm::paging::PAGE_SIZE)",
+            "thread->layout_base_virt = layout_base",
+            "thread->layout_size = layout_size",
+        ],
+        "guarded initial layout reservation",
+    )
+    require_tokens(
+        task_source,
+        [
+            "thr->layout_base_virt = parent->thread->layout_base_virt",
+            "thr->layout_size = parent->thread->layout_size",
+        ],
+        "shared-address-space layout metadata inheritance",
+    )
+
+    overlap_helper = function_body(vmem, "overlaps_kernel_managed_user_layout_locked")
+    require_tokens(
+        overlap_helper,
+        [
+            "ker::mod::sched::threading::range_overlaps_initial_layout(task->thread, start, size)",
+            "find_active_task_lifetime_ref_if(task_has_overlapping_kernel_managed_layout, &query)",
+            "owner->release();",
+        ],
+        "shared-pagemap-wide VM guard-range check",
+    )
+    for function_name in ["anon_allocate", "file_allocate", "anon_free"]:
+        body = function_body(vmem, function_name)
+        require_order(
+            body,
+            "SharedVmemPublicationGuard publication_guard;",
+            "overlaps_kernel_managed_user_layout_locked(task,",
+            f"{function_name} guard-range check must hold shared VM publication",
+        )
+        if "overlaps_kernel_managed_user_layout_locked(task," not in body:
+            fail(f"{function_name} must reject overlap with the kernel-managed initial layout")
+    protect = block_between(
+        vmem,
+        "case ker::abi::vmem::ops::PROTECT:",
+        "case ker::abi::vmem::ops::MREMAP:",
+        "mprotect syscall case",
+    )
+    require_order(
+        protect,
+        "SharedVmemPublicationGuard publication_guard;",
+        "overlaps_kernel_managed_user_layout_locked(task, ADDR, size)",
+        "mprotect guard-range check must hold shared VM publication",
+    )
+    if "overlaps_kernel_managed_user_layout_locked(task, ADDR, size)" not in protect:
+        fail("mprotect must not materialize or weaken kernel-managed guard pages")
+
+
+def test_sysv_shm_publication_respects_vm_reservations_and_guards() -> None:
+    shm = SHM_CPP.read_text()
+
+    range_check = function_body(shm, "range_is_free")
+    require_tokens(
+        range_check,
+        [
+            "range_overlaps_shared_initial_layout(task, addr, size)",
+            "range_overlaps_lazy_vmem(task, addr, size)",
+            "is_page_mapped_or_reserved(task->pagemap, current)",
+        ],
+        "SysV SHM occupied-range check",
+    )
+
+    layout_check = function_body(shm, "range_overlaps_shared_initial_layout")
+    require_tokens(
+        layout_check,
+        [
+            "range_overlaps_initial_layout(task->thread, addr, size)",
+            "find_active_task_lifetime_ref_if(task_has_overlapping_initial_layout, &query)",
+            "owner->release();",
+        ],
+        "SysV SHM shared-pagemap guard check",
+    )
+
+    attach = function_body(shm, "shmat_impl")
+    require_ordered_tokens(
+        attach,
+        [
+            "SharedVmemPublicationGuard publication_guard;",
+            "g_lock.lock_irqsave();",
+            ".publishing = true,",
+            "segment->attach_count++;",
+            "g_lock.unlock_irqrestore(FLAGS);",
+            "is_page_mapped_or_reserved(task->pagemap, PAGE_ADDR)",
+            "map_page(task->pagemap, PAGE_ADDR",
+            "attachment->publishing = false;",
+            "attachment->active = true;",
+        ],
+        "SysV SHM check/reserve/publish transaction",
+    )
+    require_tokens(
+        attach,
+        ["rollback_attachment_pages(task, segment, ADDR, mapped_pages);", "abandon_attachment_publication(attachment);"],
+        "SysV SHM partial-publication rollback",
+    )
+    require_tokens(
+        function_body(shm, "rollback_attachment_pages"),
+        ["translate(task->pagemap, PAGE_ADDR) == backing_paddr(*segment, i)"],
+        "SysV SHM rollback must not unmap a replacement publisher's page",
+    )
+
+    detach = function_body(shm, "shmdt_impl")
+    require_ordered_tokens(
+        detach,
+        [
+            "SharedVmemPublicationGuard publication_guard;",
+            "g_lock.lock_irqsave();",
+            "ShmAttachment const DETACHED = *attachment;",
+            "g_lock.unlock_irqrestore(FLAGS);",
+            "translate(task->pagemap, ADDR) == backing_paddr(*segment, i)",
+            "unmap_page(task->pagemap, ADDR);",
+            "g_lock.lock_irqsave();",
+            "detach_attachment_locked(*attachment, task);",
+        ],
+        "SysV SHM detach lock order",
     )
 
 
@@ -592,9 +746,9 @@ def test_default_writable_anon_mmap_is_demand_paged() -> None:
     require_ordered_tokens(
         lazy_branch,
         [
-            "if (!add_shared_vmem_range(task, vaddr, size, prot, flags))",
-            "release_mmap_reservation(task, vaddr, size, HAS_ADDRESS_RESERVATION)",
-            "advance_shared_mmap_cursor(task, vaddr, size)",
+            "if (!add_shared_vmem_range_locked(task, vaddr, size, prot, flags))",
+            "release_mmap_reservation_locked(task, vaddr, size, HAS_ADDRESS_RESERVATION)",
+            "advance_shared_mmap_cursor_locked(task, vaddr, size)",
             "WkiPerfLocalVmemOp::ANON_MMAP",
             "return vaddr;",
         ],
@@ -626,11 +780,12 @@ def test_thread_publication_is_serialized_with_shared_vmem_updates() -> None:
         ],
         "shared VM publication guard API",
     )
-    require_tokens(
-        function_body(vmem, "update_shared_vmem_ranges"),
-        ["SharedVmemPublicationGuard publication_guard;", "update_shared_vmem_ranges_locked(task, std::move(update))"],
-        "shared VM metadata update serialization",
-    )
+    for function_name in ["anon_allocate", "file_allocate", "anon_free"]:
+        require_tokens(
+            function_body(vmem, function_name),
+            ["SharedVmemPublicationGuard publication_guard;"],
+            f"{function_name} shared VM transaction serialization",
+        )
     require_tokens(
         function_body(vmem, "update_shared_vmem_ranges_locked"),
         [
@@ -718,9 +873,60 @@ def test_thread_publication_is_serialized_with_shared_vmem_updates() -> None:
     )
 
 
+def test_fork_snapshots_all_vm_surfaces_under_one_publication_guard() -> None:
+    process = PROCESS_CPP.read_text()
+    vmem = SYS_VMEM_CPP.read_text()
+    fork = function_body(process, "wos_proc_fork")
+    snapshot = block_between(
+        fork,
+        "bool fork_vm_snapshot_ok = false;",
+        "if (!fork_vm_snapshot_ok)",
+        "regular fork VM snapshot",
+    )
+    require_ordered_tokens(
+        snapshot,
+        [
+            "SharedVmemPublicationGuard publication_guard;",
+            "child->mmap_next.store(parent->mmap_next.load(std::memory_order_relaxed)",
+            "clone_lazy_vmem_ranges(*child, *parent)",
+            "deep_copy_user_pagemap_cow(parent->pagemap, child->pagemap)",
+            "shm_clone_for_fork_locked(parent, child)",
+            "clone_file_mmap_ranges_for_pagemap_locked(parent->pagemap, child->pagemap)",
+        ],
+        "coherent regular fork VM snapshot",
+    )
+    if "release_file_mmap_ranges_for_pagemap" in snapshot or "shm_cleanup_for_task" in snapshot:
+        fail("regular fork rollback must run after dropping the shared VM publication guard")
+
+    failed_snapshot = block_between(
+        fork,
+        "if (!fork_vm_snapshot_ok)",
+        "// --- Clone thread metadata ---",
+        "regular fork VM snapshot rollback",
+    )
+    require_ordered_tokens(
+        failed_snapshot,
+        [
+            "shm_cleanup_for_task(child)",
+            "release_file_mmap_ranges_for_pagemap(child->pagemap)",
+            "release_lazy_vmem_ranges(*child)",
+            "destroy_user_space(child->pagemap",
+        ],
+        "regular fork VM snapshot rollback",
+    )
+    if fork.count("sched::task::release_lazy_vmem_ranges(*child);") < 5:
+        fail("every post-snapshot regular fork failure must release cloned lazy VM references")
+
+    file_clone = function_body(vmem, "clone_file_mmap_ranges_for_pagemap_locked")
+    if "release_file_mmap_ranges_for_pagemap(dst)" in file_clone:
+        fail("file mmap clone rollback may block and must not run under the fork publication guard")
+
+
 def main() -> None:
     test_munmap_and_mprotect_reject_overflowing_lengths()
     test_nonfixed_mmap_address_selection_is_reserved_before_mapping()
+    test_kernel_managed_initial_layout_cannot_be_replaced()
+    test_sysv_shm_publication_respects_vm_reservations_and_guards()
     test_owned_frame_tracking_is_disabled_off_the_fault_path()
     test_cow_write_resolution_serializes_pte_reference_consumption()
     test_page_table_pool_duplicate_release_does_not_fall_through_to_page_free()
@@ -729,6 +935,7 @@ def main() -> None:
     test_kasan_excluded_lazy_file_snapshot_is_unpoisoned_after_unlock()
     test_default_writable_anon_mmap_is_demand_paged()
     test_thread_publication_is_serialized_with_shared_vmem_updates()
+    test_fork_snapshots_all_vm_surfaces_under_one_publication_guard()
     print("vmem mmap, owned-frame, and COW invariants hold")
 
 

@@ -107,6 +107,12 @@ QString elf_build_id_from_file(const QString& path);
 ElfImageInfo elf_image_info(const QByteArray& elf);
 ElfImageInfo elf_image_info_from_file(const QString& path);
 
+// Derive the exact runtime load bias for a main executable from the entry
+// address captured by the kernel. ET_EXEC images have bias zero; ET_DYN images
+// use runtime_entry - e_entry after validating that e_entry belongs to an
+// executable PT_LOAD segment.
+std::optional<uint64_t> elf_load_bias_from_runtime_entry(const ElfImageInfo& info, uint64_t runtime_entry);
+
 // Load symbols/sections from a coredump's embedded ELF
 std::unique_ptr<SymbolTable> load_symbols_from_core_dump(const CoreDump& dump);
 std::unique_ptr<SectionMap> load_sections_from_core_dump(const CoreDump& dump);

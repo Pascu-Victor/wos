@@ -39,11 +39,12 @@ static QTableWidgetItem* make_addr_item(uint64_t addr, const std::vector<wosdbg:
     QString text = wosdbg::format_address(addr, sym_tables, section_maps);
     auto* item = make_item(text);
     item->setData(Qt::UserRole, QVariant::fromValue(addr));
-    // Color code addresses: code addresses in blue, stack in green
-    if (addr >= 0x400000 && addr <= 0xFFFFFF) {
-        item->setForeground(QColor(100, 149, 237));  // Cornflower blue
-    } else if (addr >= 0xffffffff80000000ULL) {
+    // Color code addresses using loaded symbol/section ranges rather than a
+    // fixed executable base; PIE images can move on every exec.
+    if (addr >= 0xffffffff80000000ULL) {
         item->setForeground(QColor(144, 238, 144));  // Light green (kernel)
+    } else if (wosdbg::resolve_address(addr, sym_tables, section_maps)) {
+        item->setForeground(QColor(100, 149, 237));  // Cornflower blue
     } else if ((addr >> 40) == 0x7ffe || (addr >> 40) == 0x7fff) {
         item->setForeground(QColor(255, 200, 100));  // Orange (stack)
     }

@@ -70,6 +70,11 @@ void set_program_headers(uint64_t pid, Elf64_Phdr* phdrs, uint64_t phdrs_addr, u
 void set_section_headers(uint64_t pid, Elf64_Shdr* shdrs, uint64_t shdrs_addr, uint16_t count);
 void set_string_table(uint64_t pid, const char* strtab, uint64_t strtab_addr, uint64_t size);
 
+// Atomically replace a live PID's debug row with a fully constructed staging
+// row.  Exec uses this only after the replacement image is ready, so a failed
+// exec never destroys the old image's symbol metadata.
+auto publish_staged_process(uint64_t staging_pid, uint64_t final_pid, const char* final_name) -> bool;
+
 ProcessDebugInfo* get_process_debug_info(uint64_t pid);
 void print_debug_info(uint64_t pid);
 DebugSymbol* get_process_symbol(uint64_t pid, const char* name);

@@ -1,0 +1,95 @@
+{
+  "$schema": "./address_space_hardening_report.schema.json",
+  "schemaVersion": 1,
+  "goal": 15,
+  "generatedAt": null,
+  "commands": [
+    {
+      "purpose": "normal Build WOS",
+      "command": "source .vscode/wos-env.sh && scripts/dev/build_wos.sh",
+      "status": "not-run",
+      "exitCode": null,
+      "outputArtifact": null
+    },
+    {
+      "purpose": "isolated diagnostic selftests and local runtime probe",
+      "command": "bin/wos-ktest --no-setup",
+      "status": "not-run",
+      "exitCode": null,
+      "outputArtifact": "ktest-data/serial-vm0.log"
+    },
+    {
+      "purpose": "rootless multi-node remote-exec compatibility probe",
+      "command": "bin/wos-cluster --config configs/cluster_selfhost_4_host32.json --launch --no-setup",
+      "status": "not-run",
+      "exitCode": null,
+      "outputArtifact": null
+    },
+    {
+      "purpose": "emit one address-layout sample without entropy bytes",
+      "command": "/usr/bin/testprog aslr-hardening report",
+      "status": "not-run",
+      "exitCode": null,
+      "outputArtifact": null
+    },
+    {
+      "purpose": "emit one WKI remote-exec address-layout sample without entropy bytes",
+      "command": "remotely /usr/bin/testprog aslr-hardening report",
+      "status": "not-run",
+      "exitCode": null,
+      "outputArtifact": null
+    },
+    {
+      "purpose": "run disposable NX, guard, and RELRO fault probes",
+      "command": "/usr/bin/testprog aslr-hardening all",
+      "status": "not-run",
+      "exitCode": null,
+      "outputArtifact": null
+    }
+  ],
+  "layoutSamples": [],
+  "entropySummary": {
+    "minimumSamples": 32,
+    "samplesCollected": 0,
+    "fields": {
+      "mainLoadBias": { "distinctValues": 0, "allDistinct": null },
+      "interpreterLoadBias": { "distinctValues": 0, "allDistinct": null },
+      "stackAddress": { "distinctValues": 0, "allDistinct": null },
+      "tlsAddress": { "distinctValues": 0, "allDistinct": null },
+      "anonymousMappingAddress": { "distinctValues": 0, "allDistinct": null },
+      "atRandomAddress": { "distinctValues": 0, "allDistinct": null }
+    },
+    "atRandomBytesRecorded": false
+  },
+  "protectionTests": [
+    { "name": "anonymous-nx", "context": "local", "status": "not-run", "evidence": null },
+    { "name": "stack-nx", "context": "local", "status": "not-run", "evidence": null },
+    { "name": "initial-stack-guard", "context": "local", "status": "not-run", "evidence": null },
+    { "name": "pthread-guard", "context": "local", "status": "not-run", "evidence": null },
+    { "name": "relro-read-only", "context": "local", "status": "not-run", "evidence": null }
+  ],
+  "malformedElfTests": [
+    { "name": "writable-executable-load-segment", "context": "kernel-loader", "status": "not-run", "evidence": null },
+    { "name": "writable-executable-dso-segment", "context": "rtld", "status": "not-run", "evidence": null },
+    { "name": "executable-gnu-stack", "context": "kernel-loader", "status": "not-run", "evidence": null },
+    { "name": "overlapping-contradictory-load-segments", "context": "kernel-loader", "status": "not-run", "evidence": null },
+    { "name": "overlapping-same-permission-load-segments", "context": "kernel-loader", "status": "not-run", "evidence": null },
+    { "name": "tls-file-image-outside-load-segment", "context": "kernel-loader", "status": "not-run", "evidence": null }
+  ],
+  "compatibilityGates": [
+    { "name": "static-executable", "context": "local", "status": "not-run", "evidence": null },
+    { "name": "dynamic-executable", "context": "local", "status": "not-run", "evidence": null },
+    { "name": "ptrace-image-bias", "context": "local", "status": "not-run", "evidence": null },
+    { "name": "ptrace-image-catalog", "context": "local", "status": "not-run", "evidence": null },
+    { "name": "coredump-at-random-redaction", "context": "local", "status": "not-run", "evidence": null },
+    { "name": "coredump-v4-module-catalog", "context": "local", "status": "not-run", "evidence": null },
+    { "name": "wosdbg-pie-symbolization", "context": "host", "status": "not-run", "evidence": null },
+    { "name": "proc-image-catalog", "context": "local", "status": "not-run", "evidence": null },
+    { "name": "perf-image-map", "context": "local", "status": "not-run", "evidence": null },
+    { "name": "memacc-image-catalog", "context": "local", "status": "not-run", "evidence": null },
+    { "name": "zero-fill-tls-alignment-tail", "context": "kernel-loader", "status": "not-run", "evidence": null },
+    { "name": "wki-remote-exec", "context": "remote", "status": "not-run", "evidence": null }
+  ],
+  "artifacts": [],
+  "limitations": []
+}

@@ -98,12 +98,15 @@ class DebugAnalysisService : public QObject {
             QString path;
             QString role;
             QString build_id;
+            QString recorded_path;
+            QString identity_status;
             QString address_model;
             QStringList alternate_paths;
             uint64_t base = 0;
             uint64_t end = 0;
             uint64_t first_load_vaddr = 0;
             bool memory_matched = false;
+            bool exact_mapping = false;
             std::unique_ptr<wosdbg::SymbolTable> symbols;
             std::unique_ptr<wosdbg::SectionMap> sections;
         };
@@ -209,7 +212,8 @@ class DebugAnalysisService : public QObject {
     static std::vector<wosdbg::SymbolTable*> symbol_tables(const DumpSession& session);
     static std::vector<wosdbg::SectionMap*> section_maps(const DumpSession& session);
     static const DumpSession::LoadedModule* module_for_address(const DumpSession& session, uint64_t address);
-    void add_module(DumpSession& session, const QString& path, const QString& role, uint64_t base, bool memory_matched);
+    void add_module(DumpSession& session, const QString& path, const QString& role, uint64_t base, bool memory_matched,
+                    const wosdbg::CoreDumpModule* recorded = nullptr);
     void discover_modules(DumpSession& session, bool allow_external_discovery = true);
     static std::optional<uint64_t> parse_address_value(const QJsonValue& value);
     static std::optional<uint64_t> resolve_address_argument(const DumpSession& session, const QJsonObject& args,

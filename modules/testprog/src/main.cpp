@@ -31,6 +31,7 @@
 #include <span>
 
 #include "asan_crasher.hpp"
+#include "aslr_hardening.hpp"
 #include "cowbench.hpp"
 #include "fsbench.hpp"
 #include "ipv6_net.hpp"
@@ -645,6 +646,10 @@ auto main(int argc, char** argv, char** envp) -> int {
 
     if (command != nullptr && std::strcmp(command, "asan-crasher") == 0) {
         return run_asan_crasher(argc - 2, argv + 2);
+    }
+
+    if (command != nullptr && std::strcmp(command, "aslr-hardening") == 0) {
+        return run_aslr_hardening(argc - 2, argv + 2);
     }
 
     if (command != nullptr && std::strcmp(command, "thread-exit-stress") == 0) {

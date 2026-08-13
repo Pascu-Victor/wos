@@ -33,6 +33,7 @@ enum class request : uint64_t {
     SET_HW_BREAK = 0x5706,
     DEL_HW_BREAK = 0x5707,
     SYSCALL_WAIT = 0x5708,
+    GET_IMAGE_CATALOG = 0x5709,
 };
 
 // NOLINTNEXTLINE(performance-enum-size)
@@ -126,6 +127,45 @@ struct ImageList {
     size_t count;
 };
 
+inline constexpr uint32_t IMAGE_CATALOG_VERSION = 1;
+
+// NOLINTNEXTLINE(performance-enum-size)
+enum class image_snapshot_status : uint32_t {
+    COMPLETE = 0,
+    STATIC_IMAGE = 1,
+    UNAVAILABLE = 2,
+    INCONSISTENT = 3,
+    TRUNCATED = 4,
+};
+
+// Versioned successor to ImageRecord. GET_IMAGES and its 296-byte records are
+// retained unchanged for existing tracers.
+struct ImageCatalogRecord {
+    static constexpr size_t PATH_LEN = 256;
+    static constexpr size_t BUILD_ID_LEN = 32;
+    char path[PATH_LEN];
+    uint64_t load_base;
+    uint64_t image_start;
+    uint64_t image_end;
+    uint64_t text_addr;
+    uint64_t text_size;
+    uint64_t entry;
+    uint64_t dynamic_addr;
+    uint32_t flags;
+    uint32_t build_id_size;
+    uint8_t build_id[BUILD_ID_LEN];
+};
+
+struct ImageCatalogList {
+    uint32_t version;
+    uint32_t record_size;
+    ImageCatalogRecord* images;
+    size_t capacity;
+    size_t count;
+    image_snapshot_status snapshot_status;
+    uint32_t reserved;
+};
+
 struct Event {
     stop_reason reason;
     uint32_t signal;
@@ -164,10 +204,12 @@ struct HwBreak {
     uint32_t reserved;
 };
 
-static_assert(sizeof(X86_64GprState) == 176);  // NOLINT
-static_assert(sizeof(StopInfo) == 224);        // NOLINT
-static_assert(sizeof(ImageRecord) == 296);     // NOLINT
-static_assert(sizeof(Event) == 40);            // NOLINT
-static_assert(sizeof(RemoteInfo) == 104);      // NOLINT
+static_assert(sizeof(X86_64GprState) == 176);      // NOLINT
+static_assert(sizeof(StopInfo) == 224);            // NOLINT
+static_assert(sizeof(ImageRecord) == 296);         // NOLINT
+static_assert(sizeof(ImageCatalogRecord) == 352);  // NOLINT
+static_assert(sizeof(ImageCatalogList) == 40);     // NOLINT
+static_assert(sizeof(Event) == 40);                // NOLINT
+static_assert(sizeof(RemoteInfo) == 104);          // NOLINT
 
 }  // namespace ker::abi::ptrace

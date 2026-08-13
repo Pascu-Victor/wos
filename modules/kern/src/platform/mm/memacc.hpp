@@ -1,5 +1,7 @@
 #pragma once
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
 #include <platform/mm/paging.hpp>
 
@@ -21,6 +23,18 @@ struct UserMemoryBreakdown {
     uint64_t ro_pages;
 };
 
-auto collect_user_memory_breakdown(paging::PageTable* page_table) -> UserMemoryBreakdown;
+struct UserImageRange {
+    uint64_t start{};
+    uint64_t end{};
+};
+
+struct UserMemoryLayout {
+    static constexpr size_t MAX_IMAGE_RANGES = 32;
+
+    std::array<UserImageRange, MAX_IMAGE_RANGES> images{};
+    size_t image_count{};
+};
+
+auto collect_user_memory_breakdown(paging::PageTable* page_table, const UserMemoryLayout& layout) -> UserMemoryBreakdown;
 
 }  // namespace ker::mod::mm::memacc

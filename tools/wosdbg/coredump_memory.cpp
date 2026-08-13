@@ -107,26 +107,19 @@ QString annotate_qword(uint64_t va, uint64_t value, const CoreDump& dump, const 
         notes << "[zero]";
     } else if (value > 0 && value < 0x1000) {
         notes << QString("[small: %1]").arg(value);
-    } else if (value >= 0x400000 && value <= 0xFFFFFF) {
-        auto sym = resolve_address(value, sym_tables, section_maps);
-        if (sym) {
-            notes << QString("[code: %1]").arg(QString::fromStdString(*sym));
-        } else {
-            notes << "[code addr?]";
-        }
-    } else if ((value >> 40) == 0x7ffe || (value >> 40) == 0x7fff) {
-        notes << "[stack ptr?]";
     } else if (value == dump.trap_frame.rip) {
         notes << "[== trap RIP]";
     } else if (value == dump.saved_frame.rip) {
         notes << "[== saved RIP]";
-    }
-    // Also resolve kernel-range addresses
-    else if (value >= 0xffffffff80000000ULL) {
+    } else if (value >= 0xffffffff80000000ULL) {
         auto sym = resolve_address(value, sym_tables, section_maps);
         if (sym) {
             notes << QString("[kernel: %1]").arg(QString::fromStdString(*sym));
         }
+    } else if (auto sym = resolve_address(value, sym_tables, section_maps)) {
+        notes << QString("[code: %1]").arg(QString::fromStdString(*sym));
+    } else if ((value >> 40) == 0x7ffe || (value >> 40) == 0x7fff) {
+        notes << "[stack ptr?]";
     }
 
     return notes.join("  ");

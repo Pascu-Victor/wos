@@ -69,6 +69,21 @@ struct CoreDumpSegment {
     [[nodiscard]] bool is_present() const { return present != 0; }
 };
 
+struct CoreDumpModule {
+    uint64_t load_base{};
+    uint64_t image_start{};
+    uint64_t image_end{};
+    uint64_t text_start{};
+    uint64_t text_end{};
+    uint64_t entry{};
+    uint64_t dynamic_addr{};
+    uint32_t flags{};
+    QByteArray build_id;
+    QString path;
+
+    [[nodiscard]] QString build_id_hex() const { return QString::fromLatin1(build_id.toHex()); }
+};
+
 // Full parsed coredump
 struct CoreDump {
     // Header fields
@@ -149,6 +164,10 @@ struct CoreDump {
     uint64_t euid = 0;
     uint64_t egid = 0;
     uint64_t task_flags = 0;
+    uint64_t module_count = 0;
+    uint64_t module_entry_size = 0;
+    uint64_t module_table_offset = 0;
+    uint64_t module_snapshot_status = 0;
     QString exe_path;
     QString cwd;
     QString root;
@@ -158,6 +177,7 @@ struct CoreDump {
 
     // Segment table
     std::vector<CoreDumpSegment> segments;
+    std::vector<CoreDumpModule> modules;
 
     // Raw file bytes (segments reference file offsets into this)
     QByteArray raw;
@@ -178,6 +198,7 @@ struct CoreDump {
 struct CoreDumpParseLimits {
     uint64_t max_file_bytes = 1024ULL * 1024ULL * 1024ULL;
     uint64_t max_segments = 65536;
+    uint64_t max_modules = 1024;
     uint64_t max_segment_bytes = 1024ULL * 1024ULL * 1024ULL;
     uint64_t max_embedded_elf_bytes = 512ULL * 1024ULL * 1024ULL;
 };
@@ -214,7 +235,7 @@ struct CoreDumpParseResult {
 
 // Parse a coredump from raw binary data.
 // Compatibility wrapper: returns std::nullopt on every non-OK structured
-// status. Valid v1-v3 layouts retain their existing representation.
+// status. Valid v1-v4 layouts retain their existing representation.
 std::optional<CoreDump> parse_core_dump(const QByteArray& data);
 
 /// Load and parse a coredump from a file path. Sets sourceFilename on success.

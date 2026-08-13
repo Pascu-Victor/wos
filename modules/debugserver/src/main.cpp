@@ -684,23 +684,66 @@ auto write_memory_binary_packet(Session& session, std::string_view packet) -> st
     return write_memory_exact(session, addr, buffer.data(), buffer.size()) ? "OK" : "E14";
 }
 
-auto get_images(Session& session, std::vector<ker::abi::ptrace::ImageRecord>& images) -> bool {
-    images.assign(8, ker::abi::ptrace::ImageRecord{});
+auto get_legacy_images(Session& session, std::vector<ker::abi::ptrace::ImageCatalogRecord>& images) -> bool {
+    std::vector<ker::abi::ptrace::ImageRecord> legacy(8);
     ker::abi::ptrace::ImageList list{
-        .images = images.data(),
-        .capacity = images.size(),
+        .images = legacy.data(),
+        .capacity = legacy.size(),
         .count = 0,
     };
     int64_t result = ker::process::ptrace(static_cast<uint64_t>(ker::abi::ptrace::request::GET_IMAGES), session.pid, 0,
                                           reinterpret_cast<uint64_t>(&list));
-    if (result == -ENOSPC && list.count > images.size()) {
-        images.assign(list.count, ker::abi::ptrace::ImageRecord{});
-        list.images = images.data();
-        list.capacity = images.size();
+    if (result == -ENOSPC && list.count > legacy.size()) {
+        legacy.assign(list.count, ker::abi::ptrace::ImageRecord{});
+        list.images = legacy.data();
+        list.capacity = legacy.size();
         result = ker::process::ptrace(static_cast<uint64_t>(ker::abi::ptrace::request::GET_IMAGES), session.pid, 0,
                                       reinterpret_cast<uint64_t>(&list));
     }
     if (result < 0) {
+        images.clear();
+        return false;
+    }
+    legacy.resize(std::min(list.count, legacy.size()));
+    images.assign(legacy.size(), ker::abi::ptrace::ImageCatalogRecord{});
+    for (size_t i = 0; i < legacy.size(); ++i) {
+        auto const& source = legacy.at(i);
+        auto& destination = images.at(i);
+        std::copy_n(&source.path[0], sizeof(source.path), &destination.path[0]);
+        destination.load_base = source.load_base;
+        destination.text_addr = source.text_addr;
+        destination.text_size = source.text_size;
+        destination.entry = source.entry;
+        destination.flags = source.flags;
+    }
+    return true;
+}
+
+auto get_images(Session& session, std::vector<ker::abi::ptrace::ImageCatalogRecord>& images) -> bool {
+    images.assign(8, ker::abi::ptrace::ImageCatalogRecord{});
+    ker::abi::ptrace::ImageCatalogList list{
+        .version = ker::abi::ptrace::IMAGE_CATALOG_VERSION,
+        .record_size = sizeof(ker::abi::ptrace::ImageCatalogRecord),
+        .images = images.data(),
+        .capacity = images.size(),
+        .count = 0,
+        .snapshot_status = ker::abi::ptrace::image_snapshot_status::UNAVAILABLE,
+        .reserved = 0,
+    };
+    int64_t result = ker::process::ptrace(static_cast<uint64_t>(ker::abi::ptrace::request::GET_IMAGE_CATALOG), session.pid, 0,
+                                          reinterpret_cast<uint64_t>(&list));
+    if (result == -ENOSPC && list.count > images.size()) {
+        images.assign(list.count, ker::abi::ptrace::ImageCatalogRecord{});
+        list.images = images.data();
+        list.capacity = images.size();
+        result = ker::process::ptrace(static_cast<uint64_t>(ker::abi::ptrace::request::GET_IMAGE_CATALOG), session.pid, 0,
+                                      reinterpret_cast<uint64_t>(&list));
+    }
+    if (result == -EINVAL || result == -ENOSYS) {
+        return get_legacy_images(session, images);
+    }
+    if (result < 0 || (list.snapshot_status != ker::abi::ptrace::image_snapshot_status::COMPLETE &&
+                       list.snapshot_status != ker::abi::ptrace::image_snapshot_status::STATIC_IMAGE)) {
         images.clear();
         return false;
     }
@@ -709,7 +752,7 @@ auto get_images(Session& session, std::vector<ker::abi::ptrace::ImageRecord>& im
 }
 
 auto main_load_base(Session& session, uint64_t& load_base) -> bool {
-    std::vector<ker::abi::ptrace::ImageRecord> images;
+    std::vector<ker::abi::ptrace::ImageCatalogRecord> images;
     if (!get_images(session, images) || images.empty()) {
         return false;
     }
@@ -742,16 +785,16 @@ auto xml_escape(std::string_view text) -> std::string {
     return out;
 }
 
-auto image_path(const ker::abi::ptrace::ImageRecord& image) -> std::string_view {
+auto image_path(const ker::abi::ptrace::ImageCatalogRecord& image) -> std::string_view {
     size_t len = 0;
-    while (len < ker::abi::ptrace::ImageRecord::PATH_LEN && image.path[len] != '\0') {
+    while (len < ker::abi::ptrace::ImageCatalogRecord::PATH_LEN && image.path[len] != '\0') {
         ++len;
     }
-    return {image.path, len};
+    return {&image.path[0], len};
 }
 
 auto libraries_svr4_xml(Session& session) -> std::string {
-    std::vector<ker::abi::ptrace::ImageRecord> images;
+    std::vector<ker::abi::ptrace::ImageCatalogRecord> images;
     if (!get_images(session, images)) {
         return R"xml(<?xml version="1.0"?><library-list-svr4 version="1.0"/>)xml";
     }
@@ -759,7 +802,8 @@ auto libraries_svr4_xml(Session& session) -> std::string {
     std::string out = R"xml(<?xml version="1.0"?><library-list-svr4 version="1.0">)xml";
     for (const auto& image : images) {
         std::string const PATH = xml_escape(image_path(image));
-        out += std::format(R"xml(<library name="{}" lm="0x0" l_addr="0x{:x}" l_ld="0x0"/>)xml", PATH, image.load_base);
+        out +=
+            std::format(R"xml(<library name="{}" lm="0x0" l_addr="0x{:x}" l_ld="0x{:x}"/>)xml", PATH, image.load_base, image.dynamic_addr);
     }
     out += "</library-list-svr4>";
     return out;

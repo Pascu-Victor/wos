@@ -1,4 +1,15 @@
+#include <algorithm>
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
 #include "perf.hpp"
+
 namespace perf {
 
 auto parse_proc_map_section(std::string_view buffer) -> std::vector<ProcMapEntry> {
@@ -38,6 +49,63 @@ auto parse_proc_map_section(std::string_view buffer) -> std::vector<ProcMapEntry
         entries.push_back(ProcMapEntry{.pid = parse_u64(PID_TEXT), .comm = std::string(COMM_TEXT)});
     }
 
+    return entries;
+}
+
+auto parse_image_map_line(std::string_view line, ImageMapEntry& out) -> bool {
+    if (!line.starts_with("pid=") || !line.contains(" image ")) {
+        return false;
+    }
+
+    constexpr std::array<std::string_view, 10> REQUIRED_KEYS{
+        "pid=", " base=", " start=", " end=", " text_start=", " text_end=", " entry=", " dynamic=", " flags=", " build_id=",
+    };
+    if (std::ranges::any_of(REQUIRED_KEYS, [&](std::string_view key) { return !line.contains(key); })) {
+        return false;
+    }
+    std::size_t const PATH_POS = line.find(" path=");
+    if (PATH_POS == std::string_view::npos) {
+        return false;
+    }
+
+    out = {};
+    out.pid = parse_u64(extract_value(line, "pid="), 0);
+    out.load_base = parse_u64(extract_value(line, " base="), 0);
+    out.image_start = parse_u64(extract_value(line, " start="), 0);
+    out.image_end = parse_u64(extract_value(line, " end="), 0);
+    out.text_start = parse_u64(extract_value(line, " text_start="), 0);
+    out.text_end = parse_u64(extract_value(line, " text_end="), 0);
+    out.entry = parse_u64(extract_value(line, " entry="), 0);
+    out.dynamic_addr = parse_u64(extract_value(line, " dynamic="), 0);
+    out.flags = parse_u32(extract_value(line, " flags="), 0);
+    out.build_id = std::string(extract_value(line, " build_id="));
+    out.path = percent_decode(line.substr(PATH_POS + std::string_view(" path=").size()));
+    return out.image_start < out.image_end && out.text_start <= out.text_end;
+}
+
+auto parse_image_map_section(std::string_view buffer) -> std::vector<ImageMapEntry> {
+    std::vector<ImageMapEntry> entries;
+    std::size_t const HEADER_POS = buffer.find(SECTION_IMAGE_MAP);
+    if (HEADER_POS == std::string_view::npos) {
+        return entries;
+    }
+
+    std::size_t pos = buffer.find('\n', HEADER_POS);
+    if (pos == std::string_view::npos) {
+        return entries;
+    }
+    ++pos;
+
+    while (pos < buffer.size()) {
+        std::string_view const LINE = next_line(buffer, pos);
+        if (LINE.starts_with(END_PREFIX)) {
+            break;
+        }
+        ImageMapEntry entry{};
+        if (parse_image_map_line(LINE, entry)) {
+            entries.push_back(std::move(entry));
+        }
+    }
     return entries;
 }
 

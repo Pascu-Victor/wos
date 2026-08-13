@@ -227,11 +227,15 @@ void cmd_run(int argc, char** argv) {
 
     std::vector<TrackedProc> tracked;
     auto upsert_tracked = [&](const StatInfo& stat) {
+        std::string image_map = read_proc_images(stat.pid);
         for (auto& proc : tracked) {
             if (proc.pid == stat.pid) {
                 proc.last_utime = stat.utime;
                 proc.last_stime = stat.stime;
                 proc.comm = stat.comm;
+                if (!image_map.empty()) {
+                    proc.image_map = std::move(image_map);
+                }
                 return;
             }
         }
@@ -240,6 +244,7 @@ void cmd_run(int argc, char** argv) {
             .pid = stat.pid,
             .comm = stat.comm,
             .cmdline = read_cmdline(stat.pid),
+            .image_map = std::move(image_map),
             .last_utime = stat.utime,
             .last_stime = stat.stime,
         });
@@ -448,6 +453,7 @@ void cmd_run(int argc, char** argv) {
         }
 
         write_all(data_fd.get(), SECTION_PROC_MAP_END);
+        write_section_image_map(data_fd.get(), &tracked);
 
         if (total_event_bytes <= 0 && SUMMARY_BYTES <= 0 && IPC_BYTES <= 0 && DIAG_BYTES <= 0) {
             std::println("perf: ring buffer empty - PROC_MAP saved, no events");

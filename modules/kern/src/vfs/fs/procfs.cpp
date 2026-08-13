@@ -2,7 +2,6 @@
 
 #include <bits/off_t.h>
 #include <bits/ssize_t.h>
-#include <extern/elf.h>
 
 #include <algorithm>
 #include <array>
@@ -21,6 +20,7 @@
 #include <new>
 #include <platform/dbg/dbg.hpp>
 #include <platform/ktime/ktime.hpp>
+#include <platform/loader/runtime_images.hpp>
 #include <platform/mm/addr.hpp>
 #include <platform/mm/dyn/kmalloc.hpp>
 #include <platform/mm/memacc.hpp>
@@ -35,6 +35,7 @@
 #include <platform/sched/preemption_policy.hpp>
 #include <platform/sched/task.hpp>
 #include <platform/smt/smt.hpp>
+#include <platform/sys/usercopy.hpp>
 #include <string_view>
 #include <syscalls_impl/process/child_events.hpp>
 #include <syscalls_impl/vmem/sys_vmem.hpp>
@@ -504,7 +505,8 @@ auto procfs_readdir(File* f, DirEntry* buf, size_t count) -> int {
         // /proc/<pid> and /proc/<pid>/task/<tid>: index 2 = "stat", 3 = "status", 4 = "statm",
         // 5 = "cmdline", 6 = "exe", 7 = "cwd", 8 = "root", 9 = "fd", 10 = "wki_launcher",
         // 11 = "wki_runner", 12 = "wki_remote_pid", 13 = "maps". Top-level process dirs
-        // additionally expose "task" at index 14.
+        // additionally expose "task" at index 14 and append "images" at index 15;
+        // thread directories append their image-catalog alias at index 14.
         if (count == 2) {
             buf->d_ino = 10;
             buf->d_off = 3;
@@ -607,6 +609,16 @@ auto procfs_readdir(File* f, DirEntry* buf, size_t count) -> int {
             buf->d_reclen = sizeof(DirEntry);
             buf->d_type = DT_DIR;
             std::memcpy(buf->d_name.data(), "task", 5);
+            return 0;
+        }
+        bool const IS_IMAGES_ENTRY =
+            (pfd->node.type == ProcNodeType::PID_DIR && count == 15) || (pfd->node.type == ProcNodeType::TASK_TID_DIR && count == 14);
+        if (IS_IMAGES_ENTRY) {
+            buf->d_ino = 27;
+            buf->d_off = count + 1;
+            buf->d_reclen = sizeof(DirEntry);
+            buf->d_type = DT_REG;
+            std::memcpy(buf->d_name.data(), "images", 7);
             return 0;
         }
         return -ENOENT;  // No more entries
@@ -1086,13 +1098,138 @@ auto procfs_map_perms(const ker::mod::mm::paging::PageTableEntry& entry) -> std:
     };
 }
 
+auto read_proc_runtime_image_memory(void* opaque, uint64_t address, void* destination, size_t size) -> bool {
+    auto* task = static_cast<ker::mod::sched::task::Task*>(opaque);
+    return task != nullptr && ker::mod::sys::usercopy::copy_from_task_mapped(*task, address, destination, size);
+}
+
+auto snapshot_proc_runtime_images(ker::mod::sched::task::Task& task,
+                                  std::array<ker::loader::runtime::RuntimeImage, ker::loader::runtime::MAX_IMAGES>& images, size_t& count)
+    -> ker::loader::runtime::SnapshotStatus {
+    ker::loader::runtime::SnapshotSource const SOURCE{
+        .program_header_addr = task.program_header_addr,
+        .program_header_count = task.program_header_count,
+        .program_header_ent_size = task.program_header_ent_size,
+        .main_elf_header_addr = task.elf_header_addr,
+        .main_load_base = task.image_load_base,
+        .main_image_start = task.image_vaddr_start,
+        .main_image_end = task.image_vaddr_end,
+        .main_entry = task.entry,
+        .interpreter_base = task.interp_base,
+        .interpreter_image_start = task.interp_vaddr_start,
+        .interpreter_image_end = task.interp_vaddr_end,
+        .main_path = task.exe_path.data(),
+        .interpreter_path = "/lib/ld.so",
+    };
+    return ker::loader::runtime::snapshot_images(read_proc_runtime_image_memory, &task, SOURCE, images, count);
+}
+
+auto runtime_image_status_name(ker::loader::runtime::SnapshotStatus status) -> const char* {
+    using SnapshotStatus = ker::loader::runtime::SnapshotStatus;
+    switch (status) {
+        case SnapshotStatus::COMPLETE:
+            return "complete";
+        case SnapshotStatus::STATIC_IMAGE:
+            return "static";
+        case SnapshotStatus::UNAVAILABLE:
+            return "unavailable";
+        case SnapshotStatus::INCONSISTENT:
+            return "inconsistent";
+        case SnapshotStatus::TRUNCATED:
+            return "truncated";
+    }
+    return "unavailable";
+}
+
+auto encode_runtime_image_path(const std::array<char, ker::loader::runtime::IMAGE_PATH_MAX>& path)
+    -> std::array<char, (ker::loader::runtime::IMAGE_PATH_MAX * 3) + 1> {
+    constexpr std::array<char, 16> HEX_DIGITS{'0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'A', 'B', 'C', 'D', 'E', 'F'};
+    std::array<char, (ker::loader::runtime::IMAGE_PATH_MAX * 3) + 1> encoded{};
+    size_t out = 0;
+    for (char raw : path) {
+        auto const BYTE = static_cast<uint8_t>(raw);
+        if (BYTE == 0) {
+            break;
+        }
+        if (BYTE <= static_cast<uint8_t>(' ') || BYTE == static_cast<uint8_t>('%') || BYTE >= 0x7fU) {
+            encoded.at(out++) = '%';
+            encoded.at(out++) = HEX_DIGITS.at(BYTE >> 4U);
+            encoded.at(out++) = HEX_DIGITS.at(BYTE & 0x0fU);
+        } else {
+            encoded.at(out++) = raw;
+        }
+    }
+    return encoded;
+}
+
+// Generate the authoritative runtime image catalog for profilers and debuggers.
+auto generate_images(uint64_t pid, char* buf, size_t bufsz) -> size_t {
+    auto* task = ker::mod::sched::find_task_by_pid_safe(pid);
+    if (task == nullptr) {
+        return 0;
+    }
+    if (bufsz == 0) {
+        task->release();
+        return 0;
+    }
+
+    std::array<ker::loader::runtime::RuntimeImage, ker::loader::runtime::MAX_IMAGES> images{};
+    size_t image_count = 0;
+    ker::loader::runtime::SnapshotStatus status = ker::loader::runtime::SnapshotStatus::UNAVAILABLE;
+    {
+        ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;
+        if (task->pagemap != nullptr) {
+            status = snapshot_proc_runtime_images(*task, images, image_count);
+        }
+    }
+    task->release();
+
+    size_t off = 0;
+    auto append_format = [&](const char* format, auto... args) {
+        if (off >= bufsz - 1) {
+            return;
+        }
+        int const LEN = std::snprintf(buf + off, bufsz - off, format, args...);
+        if (LEN > 0) {
+            off += std::min(static_cast<size_t>(LEN), bufsz - off - 1);
+        }
+    };
+
+    append_format("status=%s count=%llu\n", runtime_image_status_name(status), static_cast<unsigned long long>(image_count));
+    constexpr std::array<char, 16> HEX_DIGITS{'0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f'};
+    for (size_t i = 0; i < image_count; ++i) {
+        auto const& image = images.at(i);
+        auto const ENCODED_PATH = encode_runtime_image_path(image.path);
+        std::array<char, (ker::loader::runtime::BUILD_ID_MAX * 2) + 2> build_id{};
+        if (image.build_id_size == 0) {
+            build_id.at(0) = '-';
+        } else {
+            size_t const BUILD_ID_SIZE = std::min<size_t>(image.build_id_size, ker::loader::runtime::BUILD_ID_MAX);
+            for (size_t byte = 0; byte < BUILD_ID_SIZE; ++byte) {
+                build_id.at(byte * 2) = HEX_DIGITS.at(image.build_id.at(byte) >> 4U);
+                build_id.at((byte * 2) + 1) = HEX_DIGITS.at(image.build_id.at(byte) & 0x0fU);
+            }
+        }
+        append_format(
+            "image base=0x%016llx start=0x%016llx end=0x%016llx text_start=0x%016llx text_end=0x%016llx "
+            "entry=0x%016llx dynamic=0x%016llx flags=0x%08x build_id=%s path=%s\n",
+            static_cast<unsigned long long>(image.load_base), static_cast<unsigned long long>(image.image_start),
+            static_cast<unsigned long long>(image.image_end), static_cast<unsigned long long>(image.text_start),
+            static_cast<unsigned long long>(image.text_end), static_cast<unsigned long long>(image.entry),
+            static_cast<unsigned long long>(image.dynamic_addr), image.flags, build_id.data(), ENCODED_PATH.data());
+    }
+    buf[off] = '\0';
+    return off;
+}
+
 // Generate Linux-style /proc/<pid>/maps rows for sanitizer runtimes.
 auto generate_maps(uint64_t pid, char* buf, size_t bufsz) -> size_t {
     auto* task = ker::mod::sched::find_task_by_pid_safe(pid);
-    if (task == nullptr || task->pagemap == nullptr) {
-        if (task != nullptr) {
-            task->release();
-        }
+    if (task == nullptr) {
+        return 0;
+    }
+    if (bufsz == 0) {
+        task->release();
         return 0;
     }
 
@@ -1107,129 +1244,161 @@ auto generate_maps(uint64_t pid, char* buf, size_t bufsz) -> size_t {
     constexpr uint64_t PML2_SHIFT = 21;
     constexpr uint64_t PML1_SHIFT = 12;
 
-    auto* image_task = task;
-    ker::mod::sched::task::Task* owner_task = nullptr;
-    if (task->owner_pid != 0) {
-        owner_task = ker::mod::sched::find_task_by_pid_safe(task->owner_pid);
-        if (owner_task != nullptr && owner_task->pagemap == task->pagemap) {
-            image_task = owner_task;
-        }
-    }
-
-    auto executable_load_base = [](const ker::mod::sched::task::Task* t) -> uint64_t {
-        if (t == nullptr || t->elf_buffer == nullptr || t->elf_buffer_size < sizeof(Elf64_Ehdr)) {
-            return 0;
-        }
-        const auto* elf = reinterpret_cast<const Elf64_Ehdr*>(t->elf_buffer);
-        if (elf->e_ident[EI_MAG0] != ELFMAG0 || elf->e_ident[EI_MAG1] != ELFMAG1 || elf->e_ident[EI_MAG2] != ELFMAG2 ||
-            elf->e_ident[EI_MAG3] != ELFMAG3 || elf->e_ident[EI_CLASS] != ELFCLASS64) {
-            return 0;
-        }
-        if (elf->e_type != ET_EXEC && elf->e_type != ET_DYN) {
-            return 0;
-        }
-        if (t->entry < elf->e_entry) {
-            return 0;
-        }
-        return t->entry - elf->e_entry;
-    };
-
-    const char* const EXE_PATH = (image_task->exe_path[0] != '\0') ? image_task->exe_path.data() : "";
-    uint64_t const EXE_LOAD_BASE = executable_load_base(image_task);
+    std::array<ker::loader::runtime::RuntimeImage, ker::loader::runtime::MAX_IMAGES> images{};
+    size_t image_count = 0;
 
     size_t off = 0;
     uint64_t range_start = 0;
     uint64_t range_end = 0;
     std::array<char, 5> range_perms{};
+    size_t range_image = ker::loader::runtime::MAX_IMAGES;
     bool have_range = false;
 
     auto append_range = [&]() {
         if (!have_range || off >= bufsz - 1) {
             return;
         }
-        bool const HAS_PATH = range_perms[2] == 'x' && EXE_PATH[0] != '\0';
-        uint64_t const MAP_OFFSET = HAS_PATH && range_start >= EXE_LOAD_BASE ? range_start - EXE_LOAD_BASE : 0;
+        auto const* image = range_image < image_count ? &images.at(range_image) : nullptr;
+        const char* const IMAGE_PATH = image != nullptr ? image->path.data() : "";
+        bool const HAS_PATH = IMAGE_PATH[0] != '\0';
+        // RuntimeImage has authoritative extents but not PT_LOAD p_offset.
+        // Keep the legacy field parseable without presenting a virtual offset
+        // as a file offset.
+        constexpr uint64_t MAP_OFFSET = 0;
         int const LEN =
             std::snprintf(buf + off, bufsz - off, "%012llx-%012llx %s %08llx 00:00 0%s%s\n", static_cast<unsigned long long>(range_start),
                           static_cast<unsigned long long>(range_end), range_perms.data(), static_cast<unsigned long long>(MAP_OFFSET),
-                          HAS_PATH ? " " : "", HAS_PATH ? EXE_PATH : "");
+                          HAS_PATH ? " " : "", HAS_PATH ? IMAGE_PATH : "");
         if (LEN <= 0) {
             return;
         }
         off += std::min(static_cast<size_t>(LEN), bufsz - off - 1);
     };
 
-    auto emit_leaf = [&](uint64_t vaddr, uint64_t page_count, const PageTableEntry& entry) {
-        auto const PERMS = procfs_map_perms(entry);
-        uint64_t const END = vaddr + (page_count * PAGE_SIZE);
-        if (have_range && range_end == vaddr && range_perms == PERMS) {
-            range_end = END;
+    auto image_at = [&](uint64_t address) -> size_t {
+        for (size_t i = 0; i < image_count; ++i) {
+            auto const& image = images.at(i);
+            if ((image.flags & ker::loader::runtime::IMAGE_EXACT_MAPPING) != 0U && image.image_start < image.image_end &&
+                address >= image.image_start && address < image.image_end) {
+                return i;
+            }
+        }
+        return ker::loader::runtime::MAX_IMAGES;
+    };
+
+    auto next_image_boundary = [&](uint64_t address, uint64_t end) -> uint64_t {
+        uint64_t next = end;
+        for (size_t i = 0; i < image_count; ++i) {
+            auto const& image = images.at(i);
+            if ((image.flags & ker::loader::runtime::IMAGE_EXACT_MAPPING) == 0U || image.image_start >= image.image_end) {
+                continue;
+            }
+            if (image.image_start > address && image.image_start < next) {
+                next = image.image_start;
+            }
+            if (image.image_end > address && image.image_end < next) {
+                next = image.image_end;
+            }
+        }
+        return next;
+    };
+
+    auto emit_segment = [&](uint64_t start, uint64_t end, const std::array<char, 5>& perms, size_t image_index) {
+        if (have_range && range_end == start && range_perms == perms && range_image == image_index) {
+            range_end = end;
             return;
         }
 
         append_range();
-        range_start = vaddr;
-        range_end = END;
-        range_perms = PERMS;
+        range_start = start;
+        range_end = end;
+        range_perms = perms;
+        range_image = image_index;
         have_range = true;
     };
 
-    auto* pagemap = task->pagemap;
-    for (size_t i4 = 0; i4 < USER_PML4_ENTRIES; ++i4) {
-        const auto& pml4e = pagemap->entries.at(i4);
-        if (pml4e.present == 0) {
-            continue;
+    auto emit_leaf = [&](uint64_t vaddr, uint64_t page_count, const PageTableEntry& entry) {
+        if (page_count > (UINT64_MAX - vaddr) / PAGE_SIZE) {
+            return;
         }
+        auto const PERMS = procfs_map_perms(entry);
+        uint64_t const END = vaddr + (page_count * PAGE_SIZE);
+        uint64_t current = vaddr;
+        while (current < END) {
+            uint64_t const NEXT = next_image_boundary(current, END);
+            emit_segment(current, NEXT, PERMS, image_at(current));
+            current = NEXT;
+        }
+    };
 
-        auto* pml3 = procfs_page_table_from_entry(pml4e);
-        for (size_t i3 = 0; i3 < pml3->entries.size(); ++i3) {
-            const auto& pml3e = pml3->entries.at(i3);
-            if (pml3e.present == 0) {
-                continue;
-            }
-            uint64_t const VADDR_1G = (static_cast<uint64_t>(i4) << PML4_SHIFT) | (static_cast<uint64_t>(i3) << PML3_SHIFT);
-            if (pml3e.pagesize != 0) {
-                if (pml3e.user != 0) {
-                    emit_leaf(VADDR_1G, PAGES_PER_1G, pml3e);
-                }
-                continue;
-            }
+    bool has_pagemap = false;
+    {
+        ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;
+        auto* pagemap = task->pagemap;
+        if (pagemap != nullptr) {
+            has_pagemap = true;
+            (void)snapshot_proc_runtime_images(*task, images, image_count);
 
-            auto* pml2 = procfs_page_table_from_entry(pml3e);
-            for (size_t i2 = 0; i2 < pml2->entries.size(); ++i2) {
-                const auto& pml2e = pml2->entries.at(i2);
-                if (pml2e.present == 0) {
-                    continue;
-                }
-                uint64_t const VADDR_2M = VADDR_1G | (static_cast<uint64_t>(i2) << PML2_SHIFT);
-                if (pml2e.pagesize != 0) {
-                    if (pml2e.user != 0) {
-                        emit_leaf(VADDR_2M, PAGES_PER_2M, pml2e);
-                    }
+            for (size_t i4 = 0; i4 < USER_PML4_ENTRIES; ++i4) {
+                const auto& pml4e = pagemap->entries.at(i4);
+                if (pml4e.present == 0) {
                     continue;
                 }
 
-                auto* pml1 = procfs_page_table_from_entry(pml2e);
-                for (size_t i1 = 0; i1 < pml1->entries.size(); ++i1) {
-                    const auto& pte = pml1->entries.at(i1);
-                    if (pte.present == 0 && !procfs_is_reserved_leaf(pte)) {
+                auto* pml3 = procfs_page_table_from_entry(pml4e);
+                for (size_t i3 = 0; i3 < pml3->entries.size(); ++i3) {
+                    const auto& pml3e = pml3->entries.at(i3);
+                    if (pml3e.present == 0) {
                         continue;
                     }
-                    if (pte.present != 0 && pte.user == 0) {
+                    uint64_t const VADDR_1G = (static_cast<uint64_t>(i4) << PML4_SHIFT) | (static_cast<uint64_t>(i3) << PML3_SHIFT);
+                    if (pml3e.pagesize != 0) {
+                        if (pml3e.user != 0) {
+                            emit_leaf(VADDR_1G, PAGES_PER_1G, pml3e);
+                        }
                         continue;
                     }
-                    uint64_t const VADDR = VADDR_2M | (static_cast<uint64_t>(i1) << PML1_SHIFT);
-                    emit_leaf(VADDR, 1, pte);
+
+                    auto* pml2 = procfs_page_table_from_entry(pml3e);
+                    for (size_t i2 = 0; i2 < pml2->entries.size(); ++i2) {
+                        const auto& pml2e = pml2->entries.at(i2);
+                        if (pml2e.present == 0) {
+                            continue;
+                        }
+                        uint64_t const VADDR_2M = VADDR_1G | (static_cast<uint64_t>(i2) << PML2_SHIFT);
+                        if (pml2e.pagesize != 0) {
+                            if (pml2e.user != 0) {
+                                emit_leaf(VADDR_2M, PAGES_PER_2M, pml2e);
+                            }
+                            continue;
+                        }
+
+                        auto* pml1 = procfs_page_table_from_entry(pml2e);
+                        for (size_t i1 = 0; i1 < pml1->entries.size(); ++i1) {
+                            const auto& pte = pml1->entries.at(i1);
+                            if (pte.present == 0 && !procfs_is_reserved_leaf(pte)) {
+                                continue;
+                            }
+                            if (pte.present != 0 && pte.user == 0) {
+                                continue;
+                            }
+                            uint64_t const VADDR = VADDR_2M | (static_cast<uint64_t>(i1) << PML1_SHIFT);
+                            emit_leaf(VADDR, 1, pte);
+                        }
+                    }
                 }
             }
         }
+    }
+
+    if (!has_pagemap) {
+        buf[0] = '\0';
+        task->release();
+        return 0;
     }
 
     append_range();
     buf[off] = '\0';
-    if (owner_task != nullptr) {
-        owner_task->release();
-    }
     task->release();
     return off;
 }
@@ -2262,6 +2431,25 @@ constexpr uint64_t MEMACC_PAGE_BYTES = ker::mod::mm::paging::PAGE_SIZE;
 
 auto pages_to_bytes(uint64_t pages) -> uint64_t { return pages * MEMACC_PAGE_BYTES; }
 
+// Caller holds SharedVmemPublicationGuard, keeping image metadata and pagemap
+// publication coherent while the bounded userspace loader catalog is read.
+auto task_memacc_layout_locked(ker::mod::sched::task::Task& task) -> ker::mod::mm::memacc::UserMemoryLayout {
+    static_assert(ker::mod::mm::memacc::UserMemoryLayout::MAX_IMAGE_RANGES >= ker::loader::runtime::MAX_IMAGES);
+    std::array<ker::loader::runtime::RuntimeImage, ker::loader::runtime::MAX_IMAGES> images{};
+    size_t image_count = 0;
+    (void)snapshot_proc_runtime_images(task, images, image_count);
+
+    ker::mod::mm::memacc::UserMemoryLayout layout{};
+    for (size_t i = 0; i < image_count && layout.image_count < layout.images.size(); ++i) {
+        auto const& image = images.at(i);
+        if ((image.flags & ker::loader::runtime::IMAGE_EXACT_MAPPING) == 0U || image.image_start >= image.image_end) {
+            continue;
+        }
+        layout.images.at(layout.image_count++) = {.start = image.image_start, .end = image.image_end};
+    }
+    return layout;
+}
+
 struct MemaccProcessTotals {
     uint64_t task_count;
     uint64_t process_count;
@@ -2311,7 +2499,9 @@ auto collect_memacc_process_totals() -> MemaccProcessTotals {
         }
         if (ker::mod::sched::task::process_visible(*task)) {
             totals.process_count++;
-            add_process_totals(totals, ker::mod::mm::memacc::collect_user_memory_breakdown(task->pagemap));
+            ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;
+            auto const LAYOUT = task_memacc_layout_locked(*task);
+            add_process_totals(totals, ker::mod::mm::memacc::collect_user_memory_breakdown(task->pagemap, LAYOUT));
         }
         task->release();
     }
@@ -2524,33 +2714,37 @@ auto generate_memacc_procs(char* buf, size_t bufsz) -> size_t {
             continue;
         }
 
-        auto const MEM = ker::mod::mm::memacc::collect_user_memory_breakdown(task->pagemap);
-        append_sconst(p, end, "proc");
-        append_memacc_dec(p, end, "pid", task->pid);
-        append_memacc_dec(p, end, "ppid", task->parent_pid);
-        append_memacc_dec(p, end, "uid", task->uid);
-        append_memacc_dec(p, end, "gid", task->gid);
-        append_memacc_str(p, end, "state", task_state_name(task));
-        append_memacc_str(p, end, "queue", task_queue_name(task->sched_queue));
-        append_memacc_dec(p, end, "cpu", task->cpu);
-        append_memacc_str(p, end, "type", task_type_name(task->type));
-        append_memacc_str(p, end, "name", task_short_name(task));
-        append_memacc_str(p, end, "cmd", task_command_name(task));
-        append_memacc_dec(p, end, "virt_bytes", pages_to_bytes(MEM.virtual_pages));
-        append_memacc_dec(p, end, "rss_bytes", pages_to_bytes(MEM.resident_pages));
-        append_memacc_dec(p, end, "shr_bytes", pages_to_bytes(MEM.shared_pages));
-        append_memacc_dec(p, end, "pte_bytes", pages_to_bytes(MEM.page_table_pages));
-        append_memacc_dec(p, end, "code_bytes", pages_to_bytes(MEM.code_pages));
-        append_memacc_dec(p, end, "heap_bytes", pages_to_bytes(MEM.heap_pages));
-        append_memacc_dec(p, end, "mmap_bytes", pages_to_bytes(MEM.mmap_pages));
-        append_memacc_dec(p, end, "stack_bytes", pages_to_bytes(MEM.stack_pages));
-        append_memacc_dec(p, end, "low_address_bytes", pages_to_bytes(MEM.low_address_pages));
-        append_memacc_dec(p, end, "high_runtime_bytes", pages_to_bytes(MEM.high_runtime_pages));
-        append_memacc_dec(p, end, "rw_bytes", pages_to_bytes(MEM.rw_pages));
-        append_memacc_dec(p, end, "rx_bytes", pages_to_bytes(MEM.rx_pages));
-        append_memacc_dec(p, end, "ro_bytes", pages_to_bytes(MEM.ro_pages));
-        append_memacc_hex(p, end, "pagemap", reinterpret_cast<uint64_t>(task->pagemap));
-        append_char(p, end, '\n');
+        {
+            ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;
+            auto const LAYOUT = task_memacc_layout_locked(*task);
+            auto const MEM = ker::mod::mm::memacc::collect_user_memory_breakdown(task->pagemap, LAYOUT);
+            append_sconst(p, end, "proc");
+            append_memacc_dec(p, end, "pid", task->pid);
+            append_memacc_dec(p, end, "ppid", task->parent_pid);
+            append_memacc_dec(p, end, "uid", task->uid);
+            append_memacc_dec(p, end, "gid", task->gid);
+            append_memacc_str(p, end, "state", task_state_name(task));
+            append_memacc_str(p, end, "queue", task_queue_name(task->sched_queue));
+            append_memacc_dec(p, end, "cpu", task->cpu);
+            append_memacc_str(p, end, "type", task_type_name(task->type));
+            append_memacc_str(p, end, "name", task_short_name(task));
+            append_memacc_str(p, end, "cmd", task_command_name(task));
+            append_memacc_dec(p, end, "virt_bytes", pages_to_bytes(MEM.virtual_pages));
+            append_memacc_dec(p, end, "rss_bytes", pages_to_bytes(MEM.resident_pages));
+            append_memacc_dec(p, end, "shr_bytes", pages_to_bytes(MEM.shared_pages));
+            append_memacc_dec(p, end, "pte_bytes", pages_to_bytes(MEM.page_table_pages));
+            append_memacc_dec(p, end, "code_bytes", pages_to_bytes(MEM.code_pages));
+            append_memacc_dec(p, end, "heap_bytes", pages_to_bytes(MEM.heap_pages));
+            append_memacc_dec(p, end, "mmap_bytes", pages_to_bytes(MEM.mmap_pages));
+            append_memacc_dec(p, end, "stack_bytes", pages_to_bytes(MEM.stack_pages));
+            append_memacc_dec(p, end, "low_address_bytes", pages_to_bytes(MEM.low_address_pages));
+            append_memacc_dec(p, end, "high_runtime_bytes", pages_to_bytes(MEM.high_runtime_pages));
+            append_memacc_dec(p, end, "rw_bytes", pages_to_bytes(MEM.rw_pages));
+            append_memacc_dec(p, end, "rx_bytes", pages_to_bytes(MEM.rx_pages));
+            append_memacc_dec(p, end, "ro_bytes", pages_to_bytes(MEM.ro_pages));
+            append_memacc_hex(p, end, "pagemap", reinterpret_cast<uint64_t>(task->pagemap));
+            append_char(p, end, '\n');
+        }
         task->release();
     }
 
@@ -4289,7 +4483,7 @@ auto procfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
         constexpr size_t MAX_PROCFS_BUF = 4096;
         constexpr size_t MAX_KPERF_BUF = 65536;  // 64 KiB for event streams
         constexpr size_t MAX_MEMACC_BUF = 262144;
-        bool const IS_MAPS = pfd->node.type == ProcNodeType::MAPS_FILE;
+        bool const IS_RUNTIME_MAP = pfd->node.type == ProcNodeType::MAPS_FILE || pfd->node.type == ProcNodeType::IMAGES_FILE;
         bool const IS_KPERF = (pfd->node.type == ProcNodeType::KPERF_FILE || pfd->node.type == ProcNodeType::KWKISTAT_FILE ||
                                pfd->node.type == ProcNodeType::KCPUSTAT_FILE || pfd->node.type == ProcNodeType::KCPUSTATE_FILE ||
                                pfd->node.type == ProcNodeType::KCONTSTAT_FILE || pfd->node.type == ProcNodeType::KIPCSTAT_FILE ||
@@ -4307,7 +4501,7 @@ auto procfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
              pfd->node.type == ProcNodeType::MEMACC_RECLAIM_FILE_MMAP_CACHE_FILE ||
              pfd->node.type == ProcNodeType::MEMACC_RECLAIM_COORDINATOR_FILE);
         size_t alloc_sz = MAX_PROCFS_BUF;
-        if (IS_MEMACC || IS_MAPS) {
+        if (IS_MEMACC || IS_RUNTIME_MAP) {
             alloc_sz = MAX_MEMACC_BUF;
         } else if (IS_KPERF) {
             alloc_sz = MAX_KPERF_BUF;
@@ -4332,6 +4526,9 @@ auto procfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
                 break;
             case ProcNodeType::MAPS_FILE:
                 pfd->content_len = generate_maps(pfd->node.pid, pfd->content, MAX_MEMACC_BUF);
+                break;
+            case ProcNodeType::IMAGES_FILE:
+                pfd->content_len = generate_images(pfd->node.pid, pfd->content, MAX_MEMACC_BUF);
                 break;
             case ProcNodeType::MOUNTS_FILE:
                 pfd->content_len = generate_mounts(pfd->content, MAX_PROCFS_BUF);
@@ -4468,6 +4665,7 @@ auto procfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
             case ProcNodeType::STAT_FILE:
             case ProcNodeType::STATM_FILE:
             case ProcNodeType::MAPS_FILE:
+            case ProcNodeType::IMAGES_FILE:
                 return true;
             default:
                 return false;
@@ -5204,6 +5402,9 @@ auto procfs_open_path(const char* path, int flags, int mode) -> File* {
         if (strcmp(task_sub, "maps") == 0) {
             return make_file(ProcNodeType::MAPS_FILE, TID_VALUE, false);
         }
+        if (strcmp(task_sub, "images") == 0) {
+            return make_file(ProcNodeType::IMAGES_FILE, TID_VALUE, false);
+        }
         if (strcmp(task_sub, "wki_launcher") == 0) {
             return make_file(ProcNodeType::WKI_LAUNCHER_FILE, TID_VALUE, false);
         }
@@ -5411,6 +5612,10 @@ auto procfs_open_path(const char* path, int flags, int mode) -> File* {
     if (strcmp(path, "self/maps") == 0) {
         return make_file(ProcNodeType::MAPS_FILE, SELF_PID, false);
     }
+    // /proc/self/images
+    if (strcmp(path, "self/images") == 0) {
+        return make_file(ProcNodeType::IMAGES_FILE, SELF_PID, false);
+    }
     // /proc/self/wki_launcher
     if (strcmp(path, "self/wki_launcher") == 0) {
         return make_file(ProcNodeType::WKI_LAUNCHER_FILE, SELF_PID, false);
@@ -5510,6 +5715,9 @@ auto procfs_open_path(const char* path, int flags, int mode) -> File* {
     }
     if (strcmp(sub, "maps") == 0) {
         return make_file(ProcNodeType::MAPS_FILE, static_cast<uint64_t>(PID), false);
+    }
+    if (strcmp(sub, "images") == 0) {
+        return make_file(ProcNodeType::IMAGES_FILE, static_cast<uint64_t>(PID), false);
     }
     if (strcmp(sub, "wki_launcher") == 0) {
         return make_file(ProcNodeType::WKI_LAUNCHER_FILE, static_cast<uint64_t>(PID), false);

@@ -36,7 +36,7 @@ contract behind it. These files do not activate Goal Mode by themselves.
 | 12  | [Reproducible WOSDBG incident bundles](12-wosdbg-incident-bundles.md)                | KTEST/cluster capture, WOSDBG                               | 13 on shared ingestion schemas                | Done        |
 | 13  | [Versioned structured telemetry](13-structured-telemetry.md)                         | journal, perf, strace, WOSDBG                               | 11 or 12 on shared ABI/ingestion formats      | Not started |
 | 14  | [Declarative bounded init supervisor](14-declarative-init-supervisor.md)             | PID 1, service lifecycle, shutdown                          | other init/service ownership rewrites         | Done        |
-| 15  | [Randomized and hardened userspace layouts](15-userspace-address-space-hardening.md) | ELF/exec, VM, TLS, ptrace/debugging                         | 01, 04, 11 on loader/VM/ABI surfaces          | Not started |
+| 15  | [Randomized and hardened userspace layouts](15-userspace-address-space-hardening.md) | ELF/exec, VM, TLS, ptrace/debugging                         | 01, 04, 11 on loader/VM/ABI surfaces          | Done        |
 | 16  | [PREEMPT_NOBLOCK default kernel preemption](16-preempt-noblock-kernel-preemption.md) | timer preemption, kernel frames, migration, return assembly | 03 or 04 on shared scheduler/Task transitions | Done        |
 
 ## Status authority
@@ -44,7 +44,7 @@ contract behind it. These files do not activate Goal Mode by themselves.
 The portfolio `Status` column is the canonical goal-selection filter. Do not
 select, reload, or rescan a row marked `Done`; its completion record and current
 source remain available only for later regression work. Completed goals are
-currently 01, 02, 03, 04, 05, 06, 07, 11, 12, 14, and 16. Select only a row whose status is `Not started` (or a
+currently 01, 02, 03, 04, 05, 06, 07, 11, 12, 14, 15, and 16. Select only a row whose status is `Not started` (or a
 future explicit in-progress state).
 
 ## How to use a goal

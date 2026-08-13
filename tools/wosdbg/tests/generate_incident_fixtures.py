@@ -166,7 +166,7 @@ def build_coredump(
     with_segment: bool = True,
     captured_page_prefix: bytes | None = None,
 ) -> bytes:
-    """Build a canonical coredump using the local v1-v3 on-disk layouts."""
+    """Build a canonical coredump using the local v1-v4 on-disk layouts."""
 
     if version == 1:
         header_size = 488
@@ -174,15 +174,22 @@ def build_coredump(
     elif version == 2:
         header_size = 1360
         segment_entry_size = 48
-    else:
-        # Unsupported-version fixtures deliberately retain the v3 shape.
+    elif version == 3:
         header_size = 1840
+        segment_entry_size = 48
+    else:
+        # Unsupported-version fixtures deliberately retain the latest shape.
+        header_size = 1872
         segment_entry_size = 48
 
     segment_count = 1 if with_segment else 0
     segment_table_offset = header_size
     segment_bytes = segment_count * segment_entry_size
-    memory_offset = header_size + segment_bytes
+    module_count = 1 if version >= 4 else 0
+    module_entry_size = 352 if version >= 4 else 0
+    module_table_offset = header_size + segment_bytes if version >= 4 else 0
+    module_bytes = module_count * module_entry_size
+    memory_offset = header_size + segment_bytes + module_bytes
     elf_offset = memory_offset + (PAGE_SIZE if with_segment else 0) if embedded_elf else 0
     trap_rip = ELF_LOAD_BASE + 0x80
     trap_rsp = 0x7FFF00001000 + node_number * 0x10000
@@ -288,10 +295,13 @@ def build_coredump(
         if len(rich_task_values) != 36:
             raise AssertionError("v3 rich task fixture must contain exactly 36 uint64 values")
         header += struct.pack("<36Q", *rich_task_values)
+    if version >= 4:
+        header += struct.pack("<4Q", module_count, module_entry_size, module_table_offset, 0)
     if len(header) != header_size:
         raise AssertionError(f"v{version} header has size {len(header)}, expected {header_size}")
 
     segment_table = b""
+    module_table = b""
     page = b""
     if with_segment:
         segment_table = struct.pack("<QQQII", ELF_LOAD_BASE, PAGE_SIZE, memory_offset, 3, 1)
@@ -302,7 +312,27 @@ def build_coredump(
         if captured_page_prefix is not None:
             page_data[: min(len(captured_page_prefix), PAGE_SIZE)] = captured_page_prefix[:PAGE_SIZE]
         page = bytes(page_data)
-    return header + segment_table + page + embedded_elf
+    if version >= 4:
+        build_id = bytes.fromhex(sha_build_id(embedded_elf))
+        if len(build_id) > 32:
+            raise ValueError("fixture build ID exceeds the coredump v4 module limit")
+        module_table = struct.pack(
+            "<7QIB3x32s256s",
+            0,
+            ELF_LOAD_BASE,
+            ELF_LOAD_BASE + PAGE_SIZE,
+            ELF_LOAD_BASE,
+            ELF_LOAD_BASE + PAGE_SIZE,
+            trap_rip,
+            0,
+            1 | 8 | (16 if build_id else 0),
+            len(build_id),
+            build_id + bytes(32 - len(build_id)),
+            fixed_c_string("/bin/fixture-app", 256),
+        )
+        if len(module_table) != module_entry_size:
+            raise AssertionError("v4 module fixture has an unexpected size")
+    return header + segment_table + module_table + page + embedded_elf
 
 
 @dataclasses.dataclass(frozen=True)
@@ -665,7 +695,7 @@ def generate_loader_cases(root: Path) -> list[dict[str, Any]]:
     two_nodes = [node(0, "wos-0"), node(1, "wos-1")]
     complete_clock = [clock_domain("fixture-global-node0", [0], True)]
 
-    for version, container in ((1, "directory"), (2, "archive"), (3, "directory")):
+    for version, container in ((1, "directory"), (2, "archive"), (3, "directory"), (4, "archive")):
         name = f"valid-single-v{version}"
         artifacts = base_artifacts([version], nodes=one_node)
         manifest = make_manifest(
@@ -1115,8 +1145,8 @@ def generate_loader_cases(root: Path) -> list[dict[str, Any]]:
         )
     )
 
-    unsupported_name = "unsupported-coredump-v4"
-    unsupported_artifacts = base_artifacts([4], nodes=one_node)
+    unsupported_name = "unsupported-coredump-v5"
+    unsupported_artifacts = base_artifacts([5], nodes=one_node)
     unsupported_manifest = make_manifest(
         unsupported_name,
         unsupported_artifacts,
@@ -1134,7 +1164,7 @@ def generate_loader_cases(root: Path) -> list[dict[str, Any]]:
             valid=False,
             degraded=True,
             issue_codes=["unsupported_coredump_version"],
-            coredump_versions=[4],
+            coredump_versions=[5],
         )
     )
 
@@ -1559,7 +1589,7 @@ def verify_generated_tree(root: Path) -> None:
                 raise AssertionError(f"{case['name']}: sourceName is not a basename")
             if member["kind"] == "coredump" and not member["truncated"] and case["name"] != "corrupt-coredump":
                 version, header_size = parse_coredump_preamble(data)
-                if version in {1, 2, 3} and header_size not in {488, 1360, 1840}:
+                if version in {1, 2, 3, 4} and header_size not in {488, 1360, 1840, 1872}:
                     raise AssertionError(f"{case['name']}: unexpected coredump header size")
         expected_mismatches = 1 if case["name"] == "checksum-failure" else 0
         if checksum_mismatches != expected_mismatches:
