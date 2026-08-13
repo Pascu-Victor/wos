@@ -228,6 +228,9 @@ def package_disks(spec: dict, build_dir: Path, roots: dict[str, Path], kernel_cm
     env["WOS_BOOT_DISK"] = str(boot_disk)
     env["WOS_ROOTFS_DISK"] = str(rootfs_disk)
     env["WOS_KERNEL_CMDLINE"] = kernel_cmdline
+    # Give the kernel selftest suite two independent disposable XFS devices.
+    # Normal create_mountfs_disk.sh callers retain the single-partition layout.
+    env["WOS_KTEST_SECOND_XFS"] = "1"
 
     print(
         "Packaging isolated KTEST disks "

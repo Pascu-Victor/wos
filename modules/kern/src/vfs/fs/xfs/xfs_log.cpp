@@ -18,93 +18,143 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <dev/block_device.hpp>
 #include <new>
 #include <platform/dbg/dbg.hpp>
 #include <platform/ktime/ktime.hpp>
 #include <platform/perf/perf_events.hpp>
 #include <platform/sys/mutex.hpp>
-#include <util/crc32c.hpp>
-#include <utility>
 #include <vfs/buffer_cache.hpp>
 #include <vfs/fs/xfs/xfs_trans.hpp>
 
 #include "net/endian.hpp"
 #include "vfs/fs/xfs/xfs_format.hpp"
+#include "vfs/fs/xfs/xfs_log_codec.hpp"
 #include "vfs/fs/xfs/xfs_mount.hpp"
 
 namespace ker::vfs::xfs {
 
+enum class XfsLogBatchPhase : uint8_t {
+    COLLECTING,
+    LOG_STAGED,
+    LOG_DURABLE,
+    HOME_RELEASED,
+};
+
+struct XfsLogBatch {
+    XfsMountContext* mount{};
+    std::array<XfsTransItem, 8192> items{};
+    size_t item_count{};
+    size_t body_bytes{};
+    XfsLogBatchPhase phase{XfsLogBatchPhase::COLLECTING};
+};
+
 namespace {
 
 constexpr size_t XFS_LOG_STACK_BODY_MAX_BYTES = 4096;
-constexpr size_t XFS_LOG_BATCH_MAX_ITEMS = 8192;
 constexpr size_t XFS_LOG_BATCH_MAX_BODY_BYTES = size_t{4} * 1024 * 1024;
-constexpr uint32_t XFS_LOG_CLEAR_CHUNK_BLOCKS = 256;
-ker::mod::sys::Mutex log_write_lock;
+constexpr size_t XFS_LOG_MAX_BODY_BYTES = XFS_LOG_BATCH_MAX_BODY_BYTES + sizeof(WosLogBodyHeader);
 
 class XfsLogWriteGuard {
    public:
-    XfsLogWriteGuard() {
+    explicit XfsLogWriteGuard(XfsMountContext* mount) : lock(mount != nullptr ? &mount->journal_lock : nullptr) {
+        if (lock == nullptr) {
+            return;
+        }
         constexpr int ADAPTIVE_SPIN_LIMIT = 4096;
         for (int i = 0; i < ADAPTIVE_SPIN_LIMIT; ++i) {
-            if (log_write_lock.try_lock()) {
+            if (lock->try_lock()) {
                 return;
             }
             asm volatile("pause" ::: "memory");
         }
-        log_write_lock.lock();
+        lock->lock();
     }
 
-    ~XfsLogWriteGuard() { log_write_lock.unlock(); }
+    ~XfsLogWriteGuard() {
+        if (lock != nullptr) {
+            lock->unlock();
+        }
+    }
 
     XfsLogWriteGuard(const XfsLogWriteGuard&) = delete;
     XfsLogWriteGuard(XfsLogWriteGuard&&) = delete;
     auto operator=(const XfsLogWriteGuard&) -> XfsLogWriteGuard& = delete;
     auto operator=(XfsLogWriteGuard&&) -> XfsLogWriteGuard& = delete;
+
+   private:
+    ker::mod::sys::Mutex* lock;
 };
 
-auto xfs_log_serialize_body(const XfsTransItem* items, int item_count, uint8_t* body_buf, size_t body_capacity) -> int {
-    if (items == nullptr || body_buf == nullptr || item_count < 0) {
-        return -EINVAL;
-    }
+auto xfs_uuid_equal(const XfsUuidT& lhs, const XfsUuidT& rhs) -> bool {
+    return __builtin_memcmp(lhs.b.data(), rhs.b.data(), lhs.b.size()) == 0;
+}
 
-    size_t pos = 0;
-    for (int i = 0; i < item_count; i++) {
-        if (items[i].type == XfsLogItemType::BUFFER && items[i].buf.dirty) {
-            uint64_t blk = items[i].buf.bp->block_no;
-            uint32_t off = items[i].buf.offset;
-            uint32_t len = items[i].buf.len;
-            size_t const ITEM_BYTES = 8 + 4 + 4 + static_cast<size_t>(len);
-            if (pos > body_capacity || ITEM_BYTES > body_capacity - pos) {
-                return -EOVERFLOW;
-            }
-            __builtin_memcpy(body_buf + pos, &blk, 8);
-            pos += 8;
-            __builtin_memcpy(body_buf + pos, &off, 4);
-            pos += 4;
-            __builtin_memcpy(body_buf + pos, &len, 4);
-            pos += 4;
-            __builtin_memcpy(body_buf + pos, items[i].buf.bp->data + off, len);
-            pos += len;
-        }
+auto xfs_log_blocks_per_fs_block(const XfsMountContext* mount) -> uint32_t {
+    if (mount == nullptr || mount->block_size < XLOG_HEADER_SIZE || mount->block_size % XLOG_HEADER_SIZE != 0) {
+        return 0;
     }
+    return mount->block_size / XLOG_HEADER_SIZE;
+}
+
+auto xfs_log_make_lsn(const XfsLog* log, uint32_t cycle, uint32_t fs_block) -> uint64_t {
+    uint32_t const RATIO = xfs_log_blocks_per_fs_block(log != nullptr ? log->mount : nullptr);
+    return (static_cast<uint64_t>(cycle) << 32) | (static_cast<uint64_t>(fs_block) * RATIO);
+}
+
+auto xfs_log_lsn_to_position(const XfsLog* log, uint64_t lsn, uint32_t* cycle, uint32_t* fs_block) -> int {
+    uint32_t const RATIO = xfs_log_blocks_per_fs_block(log != nullptr ? log->mount : nullptr);
+    uint32_t const BASIC_BLOCK = static_cast<uint32_t>(lsn);
+    if (RATIO == 0 || cycle == nullptr || fs_block == nullptr || BASIC_BLOCK % RATIO != 0 || BASIC_BLOCK / RATIO >= log->log_blocks ||
+        static_cast<uint32_t>(lsn >> 32) == 0) {
+        return -EUCLEAN;
+    }
+    *cycle = static_cast<uint32_t>(lsn >> 32);
+    *fs_block = BASIC_BLOCK / RATIO;
     return 0;
 }
 
-auto xfs_log_write_header_bytes(const XlogRecHeader& hdr, uint8_t* dst, uint32_t block_size) -> int {
-    if (dst == nullptr || block_size == 0) {
+auto xfs_log_record_fs_blocks(const XfsMountContext* mount, size_t body_bytes, uint32_t* blocks_out) -> int {
+    if (mount == nullptr || blocks_out == nullptr || mount->block_size < XLOG_HEADER_SIZE || body_bytes > SIZE_MAX - XLOG_HEADER_SIZE) {
         return -EINVAL;
     }
-
-    size_t write_len = sizeof(XlogRecHeader);
-    write_len = std::min<size_t>(write_len, block_size);
-    __builtin_memcpy(dst, &hdr, write_len);
-
-    auto* on_disk_hdr = reinterpret_cast<XlogRecHeader*>(dst);
-    on_disk_hdr->h_crc = 0;
-    uint32_t const HDR_CRC = util::crc32c_compute(dst, write_len);
-    on_disk_hdr->h_crc = HDR_CRC;  // little-endian on disk
+    size_t const RECORD_BYTES = XLOG_HEADER_SIZE + body_bytes;
+    size_t const BLOCKS = (RECORD_BYTES + mount->block_size - 1) / mount->block_size;
+    if (BLOCKS == 0 || BLOCKS > UINT32_MAX) {
+        return -EOVERFLOW;
+    }
+    *blocks_out = static_cast<uint32_t>(BLOCKS);
     return 0;
+}
+
+auto xfs_log_serialize_body(const XfsTransItem* items, int item_count, uint64_t lsn, uint8_t* body, size_t body_bytes, uint32_t logops)
+    -> int {
+    int rc = wos_log_body_begin(body, body_bytes, 0, logops, lsn, body_bytes);
+    if (rc != 0) {
+        return rc;
+    }
+    size_t offset = sizeof(WosLogBodyHeader);
+    uint32_t emitted = 0;
+    for (int i = 0; i < item_count; ++i) {
+        if (items[i].type != XfsLogItemType::BUFFER || !items[i].buf.dirty) {
+            continue;
+        }
+        BufHead const* bp = items[i].buf.bp;
+        if (bp == nullptr || bp->bdev == nullptr || bp->bdev->block_size == 0 || bp->size == 0 || bp->size % bp->bdev->block_size != 0 ||
+            bp->size / bp->bdev->block_size > UINT32_MAX) {
+            return -EIO;
+        }
+        rc = wos_log_body_append_buffer(body, body_bytes, &offset, bp->block_no, static_cast<uint32_t>(bp->size / bp->bdev->block_size),
+                                        items[i].buf.offset, bp->data + items[i].buf.offset, items[i].buf.len);
+        if (rc != 0) {
+            return rc;
+        }
+        emitted++;
+    }
+    if (emitted != logops) {
+        return -EUCLEAN;
+    }
+    return wos_log_body_finalize(body, body_bytes, offset);
 }
 
 void xfs_log_advance_head(XfsLog* log, uint32_t old_head, uint32_t new_head) {
@@ -121,242 +171,491 @@ void xfs_log_advance_head(XfsLog* log, uint32_t old_head, uint32_t new_head) {
     log->clean = false;
 }
 
-// Scan the log to find head and tail positions.
-// Returns 0 on success, fills head/tail_cycle/block fields in the log struct.
-auto xfs_log_find_head_tail(XfsLog* log) -> int {
-    XfsMountContext* ctx = log->mount;
+enum class XfsLoadedLogKind : uint8_t {
+    WOS_DIRTY,
+    WOS_CLEAN,
+    STANDARD_CLEAN,
+    FOREIGN_DIRTY,
+};
 
-    // Read the first log sector to check if the log has any valid records
-    BufHead* bh = xfs_buf_read(ctx, log->log_start);
-    if (bh == nullptr) {
-        mod::dbg::log("[xfs log] failed to read log block 0\n");
-        return -EIO;
+struct XfsLoadedLogRecord {
+    XlogRecHeader header{};
+    uint8_t* body{};
+    size_t body_bytes{};
+    uint64_t start_byte{};
+    uint32_t record_blocks{};
+    uint32_t next_cycle{};
+    uint32_t next_block{};
+    XfsLoadedLogKind kind{XfsLoadedLogKind::FOREIGN_DIRTY};
+};
+
+void xfs_log_release_record(XfsLoadedLogRecord& record) {
+    delete[] record.body;
+    record.body = nullptr;
+    record.body_bytes = 0;
+}
+
+auto xfs_log_copy_bytes(XfsLog* log, uint64_t start_byte, void* destination, size_t bytes) -> int {
+    if (log == nullptr || log->mount == nullptr || destination == nullptr || log->mount->block_size == 0 || log->log_blocks == 0 ||
+        log->log_blocks > UINT64_MAX / log->mount->block_size) {
+        return -EINVAL;
+    }
+    uint64_t const LOG_BYTES = static_cast<uint64_t>(log->log_blocks) * log->mount->block_size;
+    if (start_byte >= LOG_BYTES || bytes > LOG_BYTES) {
+        return -EUCLEAN;
+    }
+    auto* output = static_cast<uint8_t*>(destination);
+    size_t copied = 0;
+    while (copied < bytes) {
+        uint64_t const POSITION = (start_byte + copied) % LOG_BYTES;
+        uint32_t const FS_BLOCK = static_cast<uint32_t>(POSITION / log->mount->block_size);
+        size_t const BLOCK_OFFSET = static_cast<size_t>(POSITION % log->mount->block_size);
+        size_t const CHUNK = std::min(bytes - copied, static_cast<size_t>(log->mount->block_size) - BLOCK_OFFSET);
+        BufHead* bh = xfs_buf_read(log->mount, log->log_start + FS_BLOCK);
+        if (bh == nullptr || bh->data == nullptr || bh->size < log->mount->block_size) {
+            brelse(bh);
+            return -EIO;
+        }
+        __builtin_memcpy(output + copied, bh->data + BLOCK_OFFSET, CHUNK);
+        brelse(bh);
+        copied += CHUNK;
+    }
+    return 0;
+}
+
+auto xfs_log_standard_clean_unmount(const XfsLoadedLogRecord& record) -> bool {
+    if (record.header.h_num_logops.to_cpu() != 1 || record.body_bytes != XLOG_HEADER_SIZE || record.body == nullptr) {
+        return false;
+    }
+    Be32 packed_cycle{};
+    Be32 operation_bytes{};
+    Be16 operation_reserved{};
+    __builtin_memcpy(&packed_cycle, record.body, sizeof(packed_cycle));
+    __builtin_memcpy(&operation_bytes, record.body + 4, sizeof(operation_bytes));
+    __builtin_memcpy(&operation_reserved, record.body + 10, sizeof(operation_reserved));
+    uint16_t unmount_magic = 0;
+    __builtin_memcpy(&unmount_magic, record.body + 12, sizeof(unmount_magic));
+    // h_cycle_data[0] preserves the original operation transaction id while
+    // the first payload word is overwritten with the cycle.  The id is
+    // deliberately opaque (mkfs.xfs commonly uses 0xb0c0d0d0 and the kernel
+    // uses a random ticket id), so it is not part of the clean predicate.
+    uint32_t const OPERATION_BYTES = operation_bytes.to_cpu();
+    return packed_cycle.to_cpu() == record.header.h_cycle.to_cpu() && (OPERATION_BYTES == 0 || OPERATION_BYTES == 8) &&
+           record.body[8] == XFS_LOG && record.body[9] == XLOG_UNMOUNT_TRANS && operation_reserved.to_cpu() == 0 &&
+           unmount_magic == XLOG_UNMOUNT_TYPE;
+}
+
+auto xfs_log_stale_header(const XfsLog* log, const XlogRecHeader& header, uint64_t start_byte) -> bool {
+    if (log == nullptr || log->mount == nullptr || header.h_magicno.to_cpu() != XLOG_HEADER_MAGIC_NUM ||
+        header.h_version.to_cpu() != XLOG_VERSION_2 || header.h_len.to_cpu() != 0 || header.h_crc != 0 ||
+        header.h_prev_block.to_cpu() != 0 || header.h_num_logops.to_cpu() != 0 || header.h_fmt.to_cpu() != XLOG_FMT_LINUX_LE ||
+        !xfs_uuid_equal(header.h_fs_uuid, log->mount->uuid) || header.h_size.to_cpu() != 0 || header.h_pad0 != 0 ||
+        static_cast<uint32_t>(header.h_lsn.to_cpu() >> 32) != header.h_cycle.to_cpu() ||
+        static_cast<uint32_t>(header.h_lsn.to_cpu()) != start_byte / XLOG_HEADER_SIZE) {
+        return false;
+    }
+    uint64_t const LOG_BASIC_BLOCKS = static_cast<uint64_t>(log->log_blocks) * xfs_log_blocks_per_fs_block(log->mount);
+    uint64_t const TAIL_LSN = header.h_tail_lsn.to_cpu();
+    if (static_cast<uint32_t>(TAIL_LSN >> 32) == 0 || static_cast<uint32_t>(TAIL_LSN) >= LOG_BASIC_BLOCKS) {
+        return false;
+    }
+    for (Be32 const& cycle_data : header.h_cycle_data) {
+        if (cycle_data.to_cpu() != 0) {
+            return false;
+        }
+    }
+    for (uint8_t const byte : header.h_reserved) {
+        if (byte != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+auto xfs_log_load_record(XfsLog* log, uint64_t start_byte, XfsLoadedLogRecord* record) -> int {
+    if (log == nullptr || log->mount == nullptr || record == nullptr || start_byte % XLOG_HEADER_SIZE != 0) {
+        return -EINVAL;
+    }
+    *record = {};
+    record->start_byte = start_byte;
+    int rc = xfs_log_copy_bytes(log, start_byte, &record->header, sizeof(record->header));
+    if (rc != 0) {
+        return rc;
+    }
+    XlogRecHeader const& HEADER = record->header;
+    uint32_t const RATIO = xfs_log_blocks_per_fs_block(log->mount);
+    if (RATIO == 0 || HEADER.h_magicno.to_cpu() != XLOG_HEADER_MAGIC_NUM || HEADER.h_version.to_cpu() != XLOG_VERSION_2 ||
+        HEADER.h_fmt.to_cpu() != XLOG_FMT_LINUX_LE || !xfs_uuid_equal(HEADER.h_fs_uuid, log->mount->uuid) || HEADER.h_cycle.to_cpu() == 0 ||
+        static_cast<uint32_t>(HEADER.h_lsn.to_cpu() >> 32) != HEADER.h_cycle.to_cpu() ||
+        static_cast<uint32_t>(HEADER.h_lsn.to_cpu()) != start_byte / XLOG_HEADER_SIZE) {
+        return -EUCLEAN;
+    }
+    uint64_t const LOG_BASIC_BLOCKS = static_cast<uint64_t>(log->log_blocks) * RATIO;
+    uint64_t const TAIL_LSN = HEADER.h_tail_lsn.to_cpu();
+    if (static_cast<uint32_t>(TAIL_LSN >> 32) == 0 || static_cast<uint32_t>(TAIL_LSN) >= LOG_BASIC_BLOCKS) {
+        return -EUCLEAN;
+    }
+    size_t const BODY_BYTES = HEADER.h_len.to_cpu();
+    uint64_t const LOG_BYTES = static_cast<uint64_t>(log->log_blocks) * log->mount->block_size;
+    if (BODY_BYTES == 0 || BODY_BYTES > XFS_LOG_MAX_BODY_BYTES || BODY_BYTES > LOG_BYTES - XLOG_HEADER_SIZE) {
+        return -EUCLEAN;
+    }
+    record->body = new (std::nothrow) uint8_t[BODY_BYTES];
+    if (record->body == nullptr) {
+        return -ENOMEM;
+    }
+    record->body_bytes = BODY_BYTES;
+    rc = xfs_log_copy_bytes(log, (start_byte + XLOG_HEADER_SIZE) % LOG_BYTES, record->body, BODY_BYTES);
+    if (rc != 0) {
+        xfs_log_release_record(*record);
+        return rc;
     }
 
-    const auto* hdr = reinterpret_cast<const XlogRecHeader*>(bh->data);
+    Be32 body_magic{};
+    if (BODY_BYTES >= sizeof(body_magic)) {
+        __builtin_memcpy(&body_magic, record->body, sizeof(body_magic));
+    }
+    if (body_magic.to_cpu() == WOS_XLOG_BODY_MAGIC) {
+        if (start_byte % log->mount->block_size != 0 || HEADER.h_crc == 0) {
+            xfs_log_release_record(*record);
+            return -EUCLEAN;
+        }
+        uint32_t record_blocks = 0;
+        rc = xfs_log_record_fs_blocks(log->mount, BODY_BYTES, &record_blocks);
+        if (rc != 0 || record_blocks >= log->log_blocks || HEADER.h_size.to_cpu() != record_blocks * log->mount->block_size ||
+            wos_log_record_crc(HEADER, record->body, BODY_BYTES) != HEADER.h_crc) {
+            xfs_log_release_record(*record);
+            return -EUCLEAN;
+        }
+        WosLogBodyCursor cursor{};
+        rc = wos_log_body_cursor_init(record->body, BODY_BYTES, HEADER.h_lsn.to_cpu(), &cursor);
+        if (rc == 0 && cursor.item_count != HEADER.h_num_logops.to_cpu()) {
+            rc = -EUCLEAN;
+        }
+        while (rc == 0 && cursor.emitted < cursor.item_count) {
+            WosLogBufferItemView item{};
+            rc = wos_log_body_cursor_next(&cursor, &item);
+        }
+        if (rc == 0) {
+            rc = wos_log_body_cursor_finish(&cursor);
+        }
+        if (rc != 0) {
+            xfs_log_release_record(*record);
+            return rc;
+        }
+        record->kind = (cursor.flags & WOS_XLOG_BODY_FLAG_CLEAN) != 0 ? XfsLoadedLogKind::WOS_CLEAN : XfsLoadedLogKind::WOS_DIRTY;
+        record->record_blocks = record_blocks;
+    } else {
+        if (HEADER.h_crc != 0 && wos_log_record_crc(HEADER, record->body, BODY_BYTES) != HEADER.h_crc) {
+            xfs_log_release_record(*record);
+            return -EUCLEAN;
+        }
+        record->kind = xfs_log_standard_clean_unmount(*record) ? XfsLoadedLogKind::STANDARD_CLEAN : XfsLoadedLogKind::FOREIGN_DIRTY;
+        rc = xfs_log_record_fs_blocks(log->mount, BODY_BYTES, &record->record_blocks);
+        if (rc != 0) {
+            xfs_log_release_record(*record);
+            return rc;
+        }
+    }
 
-    if (hdr->h_magicno.to_cpu() != XLOG_HEADER_MAGIC_NUM) {
-        // No valid log record at position 0 - log is clean (never used or
-        // was cleanly unmounted with log cleared)
+    uint32_t const START_BLOCK = static_cast<uint32_t>(start_byte / log->mount->block_size);
+    uint64_t const UNWRAPPED_NEXT = static_cast<uint64_t>(START_BLOCK) + record->record_blocks;
+    record->next_cycle = HEADER.h_cycle.to_cpu() + static_cast<uint32_t>(UNWRAPPED_NEXT / log->log_blocks);
+    record->next_block = static_cast<uint32_t>(UNWRAPPED_NEXT % log->log_blocks);
+    return 0;
+}
+
+// Scan every XFS basic-block boundary. A dirty/unknown latest record is never
+// inferred clean, and an erased log is accepted only when every byte is zero.
+// Linux may place exact empty headers in front of the head to invalidate stale
+// writes; those markers are not records and are recognized byte-strictly.
+auto xfs_log_find_head_tail(XfsLog* log) -> int {
+    if (log == nullptr || log->mount == nullptr || log->log_blocks == 0 || xfs_log_blocks_per_fs_block(log->mount) == 0) {
+        return -EINVAL;
+    }
+    bool any_nonzero = false;
+    bool found = false;
+    uint64_t latest_lsn = 0;
+    XfsLoadedLogKind latest_kind = XfsLoadedLogKind::FOREIGN_DIRTY;
+    uint32_t latest_next_cycle = 1;
+    uint32_t latest_next_block = 0;
+    uint64_t latest_tail_lsn = 0;
+
+    for (uint32_t fs_block = 0; fs_block < log->log_blocks; ++fs_block) {
+        BufHead* bh = xfs_buf_read(log->mount, log->log_start + fs_block);
+        if (bh == nullptr || bh->data == nullptr || bh->size < log->mount->block_size) {
+            brelse(bh);
+            return -EIO;
+        }
+        for (size_t i = 0; i < log->mount->block_size; ++i) {
+            any_nonzero = any_nonzero || bh->data[i] != 0;
+        }
+        for (size_t offset = 0; offset < log->mount->block_size; offset += XLOG_HEADER_SIZE) {
+            Be32 magic{};
+            __builtin_memcpy(&magic, bh->data + offset, sizeof(magic));
+            if (magic.to_cpu() != XLOG_HEADER_MAGIC_NUM) {
+                continue;
+            }
+            uint64_t const START_BYTE = static_cast<uint64_t>(fs_block) * log->mount->block_size + offset;
+            XlogRecHeader raw_header{};
+            __builtin_memcpy(&raw_header, bh->data + offset, sizeof(raw_header));
+            if (xfs_log_stale_header(log, raw_header, START_BYTE)) {
+                continue;
+            }
+            brelse(bh);
+            XfsLoadedLogRecord candidate{};
+            int const RC = xfs_log_load_record(log, START_BYTE, &candidate);
+            if (RC != 0) {
+                mod::dbg::log("[xfs log] invalid record at byte %lu: %d", static_cast<unsigned long>(START_BYTE), RC);
+                return RC;
+            }
+            uint64_t const LSN = candidate.header.h_lsn.to_cpu();
+            if (!found || LSN > latest_lsn) {
+                found = true;
+                latest_lsn = LSN;
+                latest_kind = candidate.kind;
+                latest_next_cycle = candidate.next_cycle;
+                latest_next_block = candidate.next_block;
+                latest_tail_lsn = candidate.header.h_tail_lsn.to_cpu();
+            }
+            xfs_log_release_record(candidate);
+            bh = xfs_buf_read(log->mount, log->log_start + fs_block);
+            if (bh == nullptr || bh->data == nullptr || bh->size < log->mount->block_size) {
+                brelse(bh);
+                return -EIO;
+            }
+        }
+        brelse(bh);
+    }
+
+    if (!found) {
+        if (any_nonzero) {
+            return -EUCLEAN;
+        }
         log->head_cycle = 1;
         log->head_block = 0;
         log->tail_cycle = 1;
         log->tail_block = 0;
         log->clean = true;
-        brelse(bh);
         return 0;
     }
-
-    // Read head and tail from the first valid log record
-    uint32_t const HEAD_CYCLE = hdr->h_cycle.to_cpu();
-    uint64_t const TAIL_LSN = hdr->h_tail_lsn.to_cpu();
-    auto tail_cycle = static_cast<uint32_t>(TAIL_LSN >> 32);
-    auto tail_block = static_cast<uint32_t>(TAIL_LSN);
-
-    brelse(bh);
-
-    // Scan forward to find the actual log head (last valid record)
-    // For now, do a simplified scan: check if the last block has the same cycle
-    uint32_t const LAST_BLOCK = log->log_blocks - 1;
-    BufHead* last_bh = xfs_buf_read(ctx, log->log_start + LAST_BLOCK);
-    if (last_bh == nullptr) {
-        mod::dbg::log("[xfs log] failed to read last log block\n");
-        return -EIO;
+    if (latest_kind == XfsLoadedLogKind::FOREIGN_DIRTY) {
+        return -EOPNOTSUPP;
     }
-
-    // The first 4 bytes of each log block contain the cycle number
-    Be32 last_cycle_be{};
-    __builtin_memcpy(&last_cycle_be, last_bh->data, sizeof(Be32));
-    uint32_t const LAST_CYCLE = last_cycle_be.to_cpu();
-    brelse(last_bh);
-
-    if (LAST_CYCLE == HEAD_CYCLE) {
-        // Log wraps but head is somewhere; for simplicity, treat as needing
-        // a more thorough scan.
-        log->head_cycle = HEAD_CYCLE;
-        log->head_block = 0;
-        log->tail_cycle = tail_cycle;
-        log->tail_block = tail_block;
-        log->clean = (HEAD_CYCLE == tail_cycle && tail_block == 0);
-    } else {
-        // Head and last block have different cycles - log has wrapped
-        log->head_cycle = LAST_CYCLE;
-        log->head_block = 0;
-        log->tail_cycle = tail_cycle;
-        log->tail_block = tail_block;
-        log->clean = false;
+    log->head_cycle = latest_next_cycle;
+    log->head_block = latest_next_block;
+    if (latest_kind == XfsLoadedLogKind::WOS_CLEAN || latest_kind == XfsLoadedLogKind::STANDARD_CLEAN) {
+        log->tail_cycle = log->head_cycle;
+        log->tail_block = log->head_block;
+        log->clean = true;
+        return 0;
     }
-
+    int const TAIL_RC = xfs_log_lsn_to_position(log, latest_tail_lsn, &log->tail_cycle, &log->tail_block);
+    if (TAIL_RC != 0) {
+        return TAIL_RC;
+    }
+    log->clean = false;
     return 0;
 }
 
-// Global log state (one per mounted XFS filesystem at this time)
-XfsLog* active_log = nullptr;
-
-enum class XfsLogBatchPhase : uint8_t {
-    COLLECTING,
-    LOG_STAGED,
-    LOG_DURABLE,
-    HOME_RELEASED,
-};
-
-struct XfsLogBatch {
-    XfsMountContext* mount{};
-    std::array<XfsTransItem, XFS_LOG_BATCH_MAX_ITEMS> items{};
-    size_t item_count{};
-    size_t body_bytes{};
-    XfsLogBatchPhase phase{XfsLogBatchPhase::COLLECTING};
-};
-
-XfsLogBatch* active_batch = nullptr;
-
-// Replay a single log record starting at the given block.
-// Reads the header, then reads body blocks and replays buffer modifications.
-// Returns the block number after this record (next record start), or -1 on error.
-auto replay_log_record(XfsLog* log, uint32_t block) -> int {
-    XfsMountContext* ctx = log->mount;
-    uint32_t const BLOCK_SIZE = ctx->block_size;
-
-    uint64_t const DISK_BLOCK = log->log_start + block;
-    BufHead* hdr_bh = xfs_buf_read(ctx, DISK_BLOCK);
-    if (hdr_bh == nullptr) {
-        mod::dbg::log("[xfs log recover] failed to read log block %u", block);
-        return -1;
+auto xfs_log_device_span(const XfsLog* log, uint64_t* start, size_t* count) -> int {
+    if (log == nullptr || log->mount == nullptr || start == nullptr || count == nullptr || log->mount->device == nullptr ||
+        log->mount->device->block_size == 0 || log->mount->block_size == 0 ||
+        log->mount->block_size % log->mount->device->block_size != 0 || log->mount->ag_blocks == 0 || log->mount->ag_blk_log >= 64) {
+        return -EINVAL;
     }
-
-    const auto* hdr = reinterpret_cast<const XlogRecHeader*>(hdr_bh->data);
-    if (hdr->h_magicno.to_cpu() != XLOG_HEADER_MAGIC_NUM) {
-        brelse(hdr_bh);
-        return -1;
+    XfsMountContext const* mount = log->mount;
+    auto const AGNO = static_cast<xfs_agnumber_t>(log->log_start >> mount->ag_blk_log);
+    auto const AGBNO = static_cast<xfs_agblock_t>(log->log_start & ((uint64_t{1} << mount->ag_blk_log) - 1));
+    if (AGBNO >= mount->ag_blocks || log->log_blocks > mount->ag_blocks - AGBNO ||
+        static_cast<uint64_t>(AGNO) > UINT64_MAX / mount->ag_blocks) {
+        return -EOVERFLOW;
     }
-
-    uint32_t const BODY_SIZE = hdr->h_len.to_cpu();
-    uint32_t const NUM_LOGOPS = hdr->h_num_logops.to_cpu();
-    brelse(hdr_bh);
-
-    if (BODY_SIZE == 0 || NUM_LOGOPS == 0) {
-        // Empty record - advance past header
-        return static_cast<int>((block + 1) % log->log_blocks);
+    uint64_t const AG_BASE = static_cast<uint64_t>(AGNO) * mount->ag_blocks;
+    size_t const RATIO = mount->block_size / mount->device->block_size;
+    if (AGBNO > UINT64_MAX - AG_BASE || AG_BASE + AGBNO > UINT64_MAX / RATIO || log->log_blocks > SIZE_MAX / RATIO) {
+        return -EOVERFLOW;
     }
-
-    // Read body data
-    uint32_t const DATA_BLOCKS = (BODY_SIZE + BLOCK_SIZE - 1) / BLOCK_SIZE;
-    auto* body_buf = new (std::nothrow) uint8_t[static_cast<size_t>(DATA_BLOCKS) * BLOCK_SIZE];
-    if (body_buf == nullptr) {
-        return -1;
-    }
-
-    uint32_t cur_block = (block + 1) % log->log_blocks;
-    uint32_t body_offset = 0;
-
-    for (uint32_t b = 0; b < DATA_BLOCKS; b++) {
-        uint64_t const DATA_DISK_BLOCK = log->log_start + cur_block;
-        BufHead* data_bh = xfs_buf_read(ctx, DATA_DISK_BLOCK);
-        if (data_bh == nullptr) {
-            delete[] body_buf;
-            return -1;
-        }
-
-        uint32_t chunk = BODY_SIZE - body_offset;
-        chunk = std::min(chunk, BLOCK_SIZE);
-        __builtin_memcpy(body_buf + body_offset, data_bh->data, chunk);
-        brelse(data_bh);
-
-        body_offset += chunk;
-        cur_block = (cur_block + 1) % log->log_blocks;
-    }
-
-    // Replay buffer modifications from the body
-    // Format per buffer item: block_no(8B) + offset(4B) + len(4B) + data(lenB)
-    // Format per inode item: ino(8B) - we skip inode items during recovery
-    uint32_t pos = 0;
-    uint32_t replayed = 0;
-
-    while (pos < BODY_SIZE && replayed < NUM_LOGOPS) {
-        // Peek ahead to determine item type
-        // Buffer items: need at least 16B header (8+4+4)
-        // Inode items: need at least 8B
-        if (pos + 16 <= BODY_SIZE) {
-            // Try as buffer item
-            uint64_t blk_no = 0;
-            uint32_t off = 0;
-            uint32_t len = 0;
-            __builtin_memcpy(&blk_no, body_buf + pos, 8);
-            __builtin_memcpy(&off, body_buf + pos + 8, 4);
-            __builtin_memcpy(&len, body_buf + pos + 12, 4);
-
-            // Sanity check: len should be reasonable
-            if (len > 0 && len <= BLOCK_SIZE * 4 && pos + 16 + len <= BODY_SIZE) {
-                // Replay this buffer modification
-                BufHead* target_bh = bread(ctx->device, blk_no);
-                if (target_bh != nullptr) {
-                    if (off + len <= target_bh->size) {
-                        __builtin_memcpy(target_bh->data + off, body_buf + pos + 16, len);
-                        bdirty(target_bh);
-                        int const WRC = bwrite(target_bh);
-                        if (WRC == 0) {
-                            replayed++;
-                        }
-                    }
-                }
-                pos += 16 + len;
-                continue;
-            }
-        }
-
-        // Otherwise, treat as inode item (8 bytes) or skip
-        if (pos + 8 <= BODY_SIZE) {
-            pos += 8;
-            replayed++;
-        } else {
-            break;
-        }
-    }
-
-    delete[] body_buf;
-
-    mod::dbg::log("[xfs log recover] replayed %u/%u ops from log block %u", replayed, NUM_LOGOPS, block);
-
-    return static_cast<int>(cur_block);
+    *start = (AG_BASE + AGBNO) * RATIO;
+    *count = static_cast<size_t>(log->log_blocks) * RATIO;
+    return 0;
 }
 
-// Recover the log by scanning from tail to head and replaying all records.
-auto xfs_log_recover(XfsLog* log) -> int {
-    mod::dbg::log("[xfs log recover] starting recovery: tail=%u.%u head=%u.%u", log->tail_cycle, log->tail_block, log->head_cycle,
-                  log->head_block);
+auto xfs_log_item_is_valid_target(const XfsLog* log, const WosLogBufferItemView& item) -> bool {
+    if (log == nullptr || log->mount == nullptr || log->mount->device == nullptr || log->mount->device->block_size == 0 ||
+        item.target_blocks == 0 || item.target_block > log->mount->device->total_blocks ||
+        item.target_blocks > log->mount->device->total_blocks - item.target_block ||
+        item.target_blocks > SIZE_MAX / log->mount->device->block_size) {
+        return false;
+    }
+    size_t const TARGET_BYTES = static_cast<size_t>(item.target_blocks) * log->mount->device->block_size;
+    if (item.data_offset > TARGET_BYTES || item.data_bytes > TARGET_BYTES - item.data_offset) {
+        return false;
+    }
+    uint64_t log_start = 0;
+    size_t log_count = 0;
+    if (xfs_log_device_span(log, &log_start, &log_count) != 0 || log_count > UINT64_MAX - log_start) {
+        return false;
+    }
+    uint64_t const ITEM_END = item.target_block + item.target_blocks;
+    uint64_t const LOG_END = log_start + log_count;
+    return ITEM_END <= log_start || item.target_block >= LOG_END;
+}
 
-    uint32_t cur_block = log->tail_block;
-    uint32_t cur_cycle = log->tail_cycle;
-    int records = 0;
-
-    while (cur_cycle < log->head_cycle || (cur_cycle == log->head_cycle && cur_block < log->head_block)) {
-        int const NEXT = replay_log_record(log, cur_block);
-        if (NEXT < 0) {
-            mod::dbg::log("[xfs log recover] failed at block %u, stopping", cur_block);
+auto xfs_log_process_record(XfsLog* log, XfsLoadedLogRecord& record, bool replay) -> int {
+    if (record.kind != XfsLoadedLogKind::WOS_DIRTY) {
+        return -EUCLEAN;
+    }
+    WosLogBodyCursor cursor{};
+    int rc = wos_log_body_cursor_init(record.body, record.body_bytes, record.header.h_lsn.to_cpu(), &cursor);
+    while (rc == 0 && cursor.emitted < cursor.item_count) {
+        WosLogBufferItemView item{};
+        rc = wos_log_body_cursor_next(&cursor, &item);
+        if (rc != 0) {
             break;
+        }
+        if (!xfs_log_item_is_valid_target(log, item)) {
+            rc = -EUCLEAN;
+            break;
+        }
+        if (!replay) {
+            continue;
+        }
+        BufHead* target = item.target_blocks == 1 ? bread(log->mount->device, item.target_block)
+                                                  : bread_multi(log->mount->device, item.target_block, item.target_blocks);
+        if (target == nullptr || target->data == nullptr ||
+            target->size != static_cast<size_t>(item.target_blocks) * log->mount->device->block_size) {
+            brelse(target);
+            rc = -EIO;
+            break;
+        }
+        __builtin_memcpy(target->data + item.data_offset, item.data, item.data_bytes);
+        bdirty(target);
+        rc = bwrite(target);
+        brelse(target);
+    }
+    return rc != 0 ? rc : wos_log_body_cursor_finish(&cursor);
+}
+
+auto xfs_log_walk_recovery(XfsLog* log, bool replay) -> int {
+    uint32_t cycle = log->tail_cycle;
+    uint32_t block = log->tail_block;
+    uint32_t records = 0;
+    while (cycle != log->head_cycle || block != log->head_block) {
+        XfsLoadedLogRecord record{};
+        int rc = xfs_log_load_record(log, static_cast<uint64_t>(block) * log->mount->block_size, &record);
+        if (rc != 0) {
+            return rc;
+        }
+        if (record.header.h_lsn.to_cpu() != xfs_log_make_lsn(log, cycle, block)) {
+            xfs_log_release_record(record);
+            return -EUCLEAN;
+        }
+        rc = xfs_log_process_record(log, record, replay);
+        if (rc == 0) {
+            cycle = record.next_cycle;
+            block = record.next_block;
+        }
+        xfs_log_release_record(record);
+        if (rc != 0) {
+            return rc;
         }
         records++;
-
-        auto next_block = static_cast<uint32_t>(NEXT);
-        if (next_block < cur_block) {
-            cur_cycle++;  // wrapped around
-        }
-        cur_block = next_block;
-
-        // Safety: don't loop forever
-        if (std::cmp_greater(records, log->log_blocks)) {
-            mod::dbg::log("[xfs log recover] too many records, aborting");
-            break;
+        if (records > log->log_blocks) {
+            return -EUCLEAN;
         }
     }
+    return records == 0 ? -EUCLEAN : 0;
+}
 
-    mod::dbg::log("[xfs log recover] recovery complete: %d records replayed", records);
+auto xfs_log_write_image(XfsLog* log, const uint8_t* image, uint32_t record_blocks) -> int {
+    if (log == nullptr || log->mount == nullptr || image == nullptr || record_blocks == 0) {
+        return -EINVAL;
+    }
+    uint64_t device_start = 0;
+    size_t device_count = 0;
+    int const SPAN_RC = xfs_log_device_span(log, &device_start, &device_count);
+    if (SPAN_RC != 0) {
+        return SPAN_RC;
+    }
+    size_t const RATIO = log->mount->block_size / log->mount->device->block_size;
+    if (RATIO == 0 || record_blocks > SIZE_MAX / RATIO || static_cast<size_t>(record_blocks) * RATIO > device_count) {
+        return -EOVERFLOW;
+    }
 
-    // Mark log as clean
-    log->clean = true;
-    log->tail_block = log->head_block;
-    log->tail_cycle = log->head_cycle;
+    uint32_t remaining = record_blocks;
+    uint32_t image_block = 0;
+    uint32_t log_block = log->head_block;
+    while (remaining != 0) {
+        uint32_t const CHUNK_BLOCKS = std::min(remaining, log->log_blocks - log_block);
+        size_t const DEVICE_BLOCKS = static_cast<size_t>(CHUNK_BLOCKS) * RATIO;
+        uint64_t const DEVICE_BLOCK = device_start + static_cast<uint64_t>(log_block) * RATIO;
+        int const RC = ker::dev::block_write(log->mount->device, DEVICE_BLOCK, DEVICE_BLOCKS,
+                                             image + static_cast<size_t>(image_block) * log->mount->block_size);
+        if (RC != 0) {
+            return RC;
+        }
+        remaining -= CHUNK_BLOCKS;
+        image_block += CHUNK_BLOCKS;
+        log_block = 0;
+    }
+    return 0;
+}
 
+auto xfs_log_write_record(XfsLog* log, const uint8_t* body, size_t body_bytes, uint32_t logops, bool enforce_space,
+                          bool standard_clean = false) -> int {
+    if (log == nullptr || log->mount == nullptr || body == nullptr || body_bytes == 0 || body_bytes > UINT32_MAX) {
+        return -EINVAL;
+    }
+    uint32_t record_blocks = 0;
+    int rc = xfs_log_record_fs_blocks(log->mount, body_bytes, &record_blocks);
+    if (rc != 0 || record_blocks >= log->log_blocks) {
+        return rc != 0 ? rc : -ENOSPC;
+    }
+    uint32_t const HEAD = log->head_block;
+    if (enforce_space) {
+        uint32_t const AVAILABLE = HEAD >= log->tail_block ? log->log_blocks - HEAD + log->tail_block : log->tail_block - HEAD;
+        if (record_blocks >= AVAILABLE) {
+            return -ENOSPC;
+        }
+    }
+    size_t const IMAGE_BYTES = static_cast<size_t>(record_blocks) * log->mount->block_size;
+    auto* image = new (std::nothrow) uint8_t[IMAGE_BYTES];
+    if (image == nullptr) {
+        return -ENOMEM;
+    }
+    __builtin_memset(image, 0, IMAGE_BYTES);
+    XlogRecHeader header{};
+    uint64_t const LSN = xfs_log_make_lsn(log, log->head_cycle, HEAD);
+    header.h_magicno = Be32::from_cpu(XLOG_HEADER_MAGIC_NUM);
+    header.h_cycle = Be32::from_cpu(log->head_cycle);
+    header.h_version = Be32::from_cpu(XLOG_VERSION_2);
+    header.h_len = Be32::from_cpu(static_cast<uint32_t>(body_bytes));
+    header.h_lsn = Be64::from_cpu(LSN);
+    header.h_tail_lsn = Be64::from_cpu(xfs_log_make_lsn(log, log->tail_cycle, log->tail_block));
+    header.h_prev_block = Be32::from_cpu(log->tail_block * xfs_log_blocks_per_fs_block(log->mount));
+    header.h_num_logops = Be32::from_cpu(logops);
+    header.h_fmt = Be32::from_cpu(XLOG_FMT_LINUX_LE);
+    header.h_fs_uuid = log->mount->uuid;
+    // Linux normally uses a 32KiB v2 iclog. The log head is still advanced by
+    // the one header BB plus h_len data BBs; h_size describes the reusable
+    // in-core buffer capacity, not the bytes written for this record.
+    constexpr uint32_t STANDARD_ICLOG_BYTES = 32U * 1024U;
+    header.h_size = Be32::from_cpu(standard_clean ? STANDARD_ICLOG_BYTES : static_cast<uint32_t>(IMAGE_BYTES));
+    if (standard_clean) {
+        header.h_cycle_data.at(0) = Be32{};
+    }
+    header.h_crc = wos_log_record_crc(header, body, body_bytes);
+    __builtin_memcpy(image, &header, sizeof(header));
+    __builtin_memcpy(image + XLOG_HEADER_SIZE, body, body_bytes);
+
+    rc = xfs_log_write_image(log, image, record_blocks);
+    delete[] image;
+    if (rc != 0) {
+        return rc;
+    }
+    uint32_t const NEXT = (HEAD + record_blocks) % log->log_blocks;
+    xfs_log_advance_head(log, HEAD, NEXT);
     return 0;
 }
 
@@ -364,31 +663,99 @@ auto xfs_log_clear_clean(XfsMountContext* mount, XfsLog* log) -> int {
     if (mount == nullptr || log == nullptr || log->mount != mount) {
         return -EINVAL;
     }
-
-    uint32_t cleared = 0;
-    while (cleared < log->log_blocks) {
-        uint32_t const COUNT = std::min(XFS_LOG_CLEAR_CHUNK_BLOCKS, log->log_blocks - cleared);
-        BufHead* bh = xfs_buf_get_multi(mount, log->log_start + cleared, COUNT);
-        if (bh == nullptr || bh->data == nullptr || bh->size != static_cast<size_t>(COUNT) * mount->block_size) {
-            brelse(bh);
-            return -EIO;
-        }
-        __builtin_memset(bh->data, 0, bh->size);
-        bdirty(bh);
-        int const RC = bwrite(bh);
-        brelse(bh);
-        if (RC != 0) {
-            return RC;
-        }
-        cleared += COUNT;
+    std::array<uint8_t, XLOG_HEADER_SIZE> body{};
+    // Standard v2 XFS unmount operation. xlog_pack_data replaces the first
+    // payload word (oh_tid) with the BE cycle and stores the original word in
+    // h_cycle_data[0]. We use an all-zero transaction id, so the saved word is
+    // already represented by the zeroed outer header.
+    Be32 const PACKED_CYCLE = Be32::from_cpu(log->head_cycle);
+    Be32 const PAYLOAD_BYTES = Be32::from_cpu(8);
+    __builtin_memcpy(body.data(), &PACKED_CYCLE, sizeof(PACKED_CYCLE));
+    __builtin_memcpy(body.data() + 4, &PAYLOAD_BYTES, sizeof(PAYLOAD_BYTES));
+    body.at(8) = XFS_LOG;
+    body.at(9) = XLOG_UNMOUNT_TRANS;
+    uint16_t const UNMOUNT_MAGIC = XLOG_UNMOUNT_TYPE;
+    __builtin_memcpy(body.data() + 12, &UNMOUNT_MAGIC, sizeof(UNMOUNT_MAGIC));
+    int rc = xfs_log_write_record(log, body.data(), body.size(), 1, false, true);
+    if (rc == 0) {
+        rc = flush_blockdev(mount->device);
     }
-
-    log->head_cycle = 1;
-    log->head_block = 0;
-    log->tail_cycle = 1;
-    log->tail_block = 0;
+    if (rc != 0) {
+        log->clean = false;
+        return rc;
+    }
+    log->tail_cycle = log->head_cycle;
+    log->tail_block = log->head_block;
     log->clean = true;
     return 0;
+}
+
+// Validate the complete active chain before touching home metadata, then replay
+// the exact same bounded chain.  Raw post-images are inherently idempotent.
+auto xfs_log_recover(XfsLog* log) -> int {
+    mod::dbg::log("[xfs log recover] starting recovery: tail=%u.%u head=%u.%u", log->tail_cycle, log->tail_block, log->head_cycle,
+                  log->head_block);
+    int rc = xfs_log_walk_recovery(log, false);
+    if (rc == 0) {
+        rc = xfs_log_walk_recovery(log, true);
+    }
+    if (rc == 0) {
+        rc = flush_blockdev(log->mount->device);
+    }
+    if (rc == 0) {
+        rc = xfs_log_clear_clean(log->mount, log);
+    }
+    if (rc != 0) {
+        log->clean = false;
+        mod::dbg::log("[xfs log recover] recovery failed closed: %d", rc);
+        return rc;
+    }
+    mod::dbg::log("[xfs log recover] recovery complete");
+    return 0;
+}
+
+// Drop mount-owned journal state without initiating any I/O.  A batch retains
+// one buffer reference per item, plus a journal hold until HOME_RELEASED.
+void xfs_log_abandon_locked(XfsMountContext* mount) {
+    if (mount == nullptr) {
+        return;
+    }
+    XfsLogBatch* batch = mount->log_batch;
+    if (batch != nullptr) {
+        bool const HAS_JOURNAL_HOLDS = batch->phase != XfsLogBatchPhase::HOME_RELEASED;
+        for (size_t i = 0; i < batch->item_count; ++i) {
+            XfsTransItem& item = batch->items.at(i);
+            if (item.type != XfsLogItemType::BUFFER || item.buf.bp == nullptr) {
+                continue;
+            }
+            if (HAS_JOURNAL_HOLDS) {
+                bjournal_release(item.buf.bp);
+            }
+            brelse(item.buf.bp);
+            item.buf.bp = nullptr;
+            item.type = XfsLogItemType::NONE;
+        }
+        delete batch;
+        mount->log_batch = nullptr;
+    }
+    if (mount->log != nullptr) {
+        mount->log->active = false;
+        delete mount->log;
+        mount->log = nullptr;
+    }
+}
+
+auto xfs_log_mark_clean_locked(XfsMountContext* mount) -> int {
+    if (mount == nullptr || mount->log == nullptr || mount->log->mount != mount || mount->log_batch == nullptr ||
+        mount->log_batch->mount != mount || !mount->log->active) {
+        return -ENODEV;
+    }
+    if (mount->log_batch->item_count != 0 || mount->log_batch->phase != XfsLogBatchPhase::COLLECTING) {
+        return -EBUSY;
+    }
+    // Even an already-clean log needs the caller-visible final durability
+    // barrier.  For a dirty log, xfs_log_clear_clean includes that barrier.
+    return mount->log->clean ? flush_blockdev(mount->device) : xfs_log_clear_clean(mount, mount->log);
 }
 
 }  // anonymous namespace
@@ -400,6 +767,10 @@ auto xfs_log_mount(XfsMountContext* mount) -> int {
     if (mount->log_blocks == 0) {
         mod::dbg::log("[xfs log] no log area configured");
         return -EINVAL;
+    }
+    XfsLogWriteGuard guard(mount);
+    if (mount->log != nullptr || mount->log_batch != nullptr) {
+        return -EBUSY;
     }
 
     auto* log = new XfsLog{};
@@ -418,7 +789,9 @@ auto xfs_log_mount(XfsMountContext* mount) -> int {
 
     if (!log->clean) {
         if (mount->read_only) {
-            mod::dbg::log("[xfs log] log is dirty but mount is read-only - recovery deferred");
+            mod::dbg::log("[xfs log] rejecting dirty read-only mount");
+            delete log;
+            return -EROFS;
         } else {
             mod::dbg::log("[xfs log] log is dirty - recovery needed");
             int const RRC = xfs_log_recover(log);
@@ -439,38 +812,50 @@ auto xfs_log_mount(XfsMountContext* mount) -> int {
     }
     batch->mount = mount;
     log->active = true;
-    active_log = log;
-    active_batch = batch;
+    mount->log = log;
+    mount->log_batch = batch;
     return 0;
 }
 
-void xfs_log_unmount(XfsMountContext* mount, bool home_metadata_clean) {
-    int const FLUSH_RC = xfs_log_flush(mount);
-    XfsLogWriteGuard guard;
-    if (active_log == nullptr || active_log->mount != mount) {
-        return;
+auto xfs_log_unmount(XfsMountContext* mount, bool home_metadata_clean) -> int {
+    if (mount == nullptr) {
+        return -EINVAL;
     }
-
-    if (home_metadata_clean && FLUSH_RC == 0) {
-        int const CLEAR_RC = xfs_log_clear_clean(mount, active_log);
-        if (CLEAR_RC != 0) {
-            mod::dbg::log("[xfs log] failed to clear clean log: %d", CLEAR_RC);
+    if (home_metadata_clean) {
+        int const FLUSH_RC = xfs_log_flush(mount);
+        if (FLUSH_RC != 0) {
+            return FLUSH_RC;
         }
     }
-    active_log->active = false;
-    mod::dbg::log("[xfs log] log unmounted");
 
-    delete active_log;
-    active_log = nullptr;
-    delete active_batch;
-    active_batch = nullptr;
+    XfsLogWriteGuard guard(mount);
+    if (mount->log == nullptr || mount->log->mount != mount || mount->log_batch == nullptr || mount->log_batch->mount != mount) {
+        return !mount->mounted ? 0 : -ENODEV;
+    }
+    if (home_metadata_clean) {
+        int const CLEAN_RC = xfs_log_mark_clean_locked(mount);
+        if (CLEAN_RC != 0) {
+            // Preserve all state so the caller can retry the failed sync or
+            // clean-marker publication.  Never erase a dirty log on error.
+            return CLEAN_RC;
+        }
+    }
+    xfs_log_abandon_locked(mount);
+    mod::dbg::log("[xfs log] log unmounted");
+    return 0;
+}
+
+auto xfs_log_mark_clean(XfsMountContext* mount) -> int {
+    XfsLogWriteGuard guard(mount);
+    return xfs_log_mark_clean_locked(mount);
 }
 
 auto xfs_log_needs_recovery(XfsMountContext* mount) -> bool {
-    if (active_log == nullptr || active_log->mount != mount) {
+    XfsLogWriteGuard guard(mount);
+    if (mount == nullptr || mount->log == nullptr || mount->log->mount != mount) {
         return false;
     }
-    return !active_log->clean;
+    return !mount->log->clean || (mount->log_batch != nullptr && mount->log_batch->item_count != 0);
 }
 
 namespace {
@@ -481,13 +866,13 @@ auto xfs_log_write_record_locked(XfsMountContext* mount, const XfsTransItem* ite
                                                        static_cast<uint8_t>(ker::mod::perf::WkiPerfLocalXfsOp::LOG_WRITE))
             ? ker::mod::time::get_us()
             : 0;
-    if (mount == nullptr || active_log == nullptr || active_log->mount != mount) {
+    if (mount == nullptr || mount->log == nullptr || mount->log->mount != mount) {
         return -EINVAL;
     }
-    if (!active_log->active) {
+    if (!mount->log->active) {
         return -EINVAL;
     }
-    XfsLog* log = active_log;
+    XfsLog* log = mount->log;
     uint64_t perf_body_bytes = 0;
     uint64_t perf_block_bytes = 0;
     auto finish_log_write = [&](int status) -> int {
@@ -502,184 +887,60 @@ auto xfs_log_write_record_locked(XfsMountContext* mount, const XfsTransItem* ite
         return status;
     };
 
-    // Compute total body size: for each buffer item, store block_no (8B) +
-    // offset (4B) + len (4B) + data (len B). INODE transaction items are
-    // commit-time inputs only: xfs_inode_write() logs their concrete inode
-    // buffers before this point, and recovery replays those buffer records.
-    uint32_t body_size = 0;
+    // INODE transaction items are commit-time inputs only: xfs_inode_write()
+    // logs their concrete inode buffers before this point, and recovery
+    // replays those buffer records.
+    size_t body_size = sizeof(WosLogBodyHeader);
     uint32_t num_logops = 0;
     for (int i = 0; i < item_count; i++) {
-        if (items[i].type == XfsLogItemType::BUFFER && items[i].buf.dirty) {
-            body_size += 8 + 4 + 4 + items[i].buf.len;
-            num_logops++;
+        if (items[i].type != XfsLogItemType::BUFFER || !items[i].buf.dirty) {
+            continue;
         }
+        BufHead const* bp = items[i].buf.bp;
+        uint32_t const OFFSET = items[i].buf.offset;
+        uint32_t const LEN = items[i].buf.len;
+        if (bp == nullptr || OFFSET > bp->size || LEN > bp->size - OFFSET || body_size > SIZE_MAX - sizeof(WosLogBufferItemHeader) - LEN) {
+            return finish_log_write(-EIO);
+        }
+        body_size += sizeof(WosLogBufferItemHeader) + LEN;
+        ++num_logops;
     }
 
     if (num_logops == 0) {
         return finish_log_write(0);  // nothing to log
     }
+    if (body_size > XFS_LOG_MAX_BODY_BYTES || body_size > UINT32_MAX) {
+        return finish_log_write(-E2BIG);
+    }
     perf_body_bytes = body_size;
-
-    // Number of blocks needed: header (1) + data blocks
-    uint32_t const BLOCK_SIZE = mount->block_size;
-    uint32_t const DATA_BLOCKS = (body_size + BLOCK_SIZE - 1) / BLOCK_SIZE;
-    uint32_t const TOTAL_BLOCKS = 1 + DATA_BLOCKS;  // header block + data
-    perf_block_bytes = static_cast<uint64_t>(TOTAL_BLOCKS) * BLOCK_SIZE;
-
-    if (TOTAL_BLOCKS > log->log_blocks) {
-        mod::dbg::log("[xfs log] transaction too large for log (%u blocks needed, %u available)", TOTAL_BLOCKS, log->log_blocks);
-        return finish_log_write(-ENOSPC);
-    }
-
-    // Check if we have enough space before wrapping
-    uint32_t const HEAD = log->head_block;
-    uint32_t avail = 0;
-    if (HEAD >= log->tail_block) {
-        avail = log->log_blocks - HEAD + log->tail_block;
-    } else {
-        avail = log->tail_block - HEAD;
-    }
-    if (TOTAL_BLOCKS >= avail) {
-        mod::dbg::log("[xfs log] log full (%u blocks needed, %u available)", TOTAL_BLOCKS, avail);
-        return finish_log_write(-ENOSPC);
-    }
-
-    // Build the log record header
-    XlogRecHeader hdr{};
-    hdr.h_magicno = Be32::from_cpu(XLOG_HEADER_MAGIC_NUM);
-    hdr.h_cycle = Be32::from_cpu(log->head_cycle);
-    hdr.h_version = Be32::from_cpu(2);
-    hdr.h_len = Be32::from_cpu(body_size);
-
-    uint64_t const LSN = (static_cast<uint64_t>(log->head_cycle) << 32) | HEAD;
-    hdr.h_lsn = Be64::from_cpu(LSN);
-
-    uint64_t const TAIL_LSN = (static_cast<uint64_t>(log->tail_cycle) << 32) | log->tail_block;
-    hdr.h_tail_lsn = Be64::from_cpu(TAIL_LSN);
-    hdr.h_num_logops = Be32::from_cpu(num_logops);
-    hdr.h_fmt = Be32::from_cpu(1);  // XLOG_FMT_LINUX_LE
-
-    // Copy filesystem UUID
-    hdr.h_fs_uuid = mount->uuid;
-    hdr.h_size = Be32::from_cpu(BLOCK_SIZE);
-
-    uint64_t const HDR_DISK_BLOCK = log->log_start + HEAD;
-    uint32_t cur_block = (HEAD + 1) % log->log_blocks;
-    uint32_t body_offset = 0;
-
-    if (DATA_BLOCKS == 1 && HEAD <= log->log_blocks - TOTAL_BLOCKS) {
-        BufHead* record_bh = xfs_buf_get_multi(mount, HDR_DISK_BLOCK, TOTAL_BLOCKS);
-        if (record_bh == nullptr) {
-            return finish_log_write(-EIO);
-        }
-
-        int rc = xfs_log_write_header_bytes(hdr, record_bh->data, BLOCK_SIZE);
-        if (rc == 0) {
-            uint8_t* body_dst = record_bh->data + BLOCK_SIZE;
-            rc = xfs_log_serialize_body(items, item_count, body_dst, BLOCK_SIZE);
-        }
-        if (rc != 0) {
-            brelse(record_bh);
-            return finish_log_write(rc);
-        }
-
-        bdirty(record_bh);
-        brelse(record_bh);
-        cur_block = (HEAD + TOTAL_BLOCKS) % log->log_blocks;
-        xfs_log_advance_head(log, HEAD, cur_block);
-        return finish_log_write(0);
-    }
-
-    // Write header block - use xfs_buf_get (not xfs_buf_read) since we
-    // immediately zero and overwrite the entire block; no need to read from disk.
-    BufHead* hdr_bh = xfs_buf_get(mount, HDR_DISK_BLOCK);
-    if (hdr_bh == nullptr) {
-        return finish_log_write(-EIO);
-    }
-
-    int const HEADER_RC = xfs_log_write_header_bytes(hdr, hdr_bh->data, BLOCK_SIZE);
-    if (HEADER_RC != 0) {
-        brelse(hdr_bh);
-        return finish_log_write(HEADER_RC);
-    }
-
-    bdirty(hdr_bh);
-    brelse(hdr_bh);
-
-    if (DATA_BLOCKS == 1) {
-        uint64_t const DATA_DISK_BLOCK = log->log_start + cur_block;
-        BufHead* data_bh = xfs_buf_get(mount, DATA_DISK_BLOCK);
-        if (data_bh == nullptr) {
-            return finish_log_write(-EIO);
-        }
-        int const SERIALIZE_RC = xfs_log_serialize_body(items, item_count, data_bh->data, BLOCK_SIZE);
-        if (SERIALIZE_RC != 0) {
-            brelse(data_bh);
-            return finish_log_write(SERIALIZE_RC);
-        }
-        bdirty(data_bh);
-        brelse(data_bh);
-        cur_block = (cur_block + 1) % log->log_blocks;
-        xfs_log_advance_head(log, HEAD, cur_block);
-        return finish_log_write(0);
-    }
-
-    if (DATA_BLOCKS != 0 && BLOCK_SIZE > SIZE_MAX / DATA_BLOCKS) {
-        return finish_log_write(-EOVERFLOW);
-    }
-
-    size_t const BODY_BUFFER_BYTES = static_cast<size_t>(DATA_BLOCKS) * BLOCK_SIZE;
     // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init): serialized before any byte is read.
     std::array<uint8_t, XFS_LOG_STACK_BODY_MAX_BYTES> stack_body_buf;
     auto* body_buf = stack_body_buf.data();
     bool heap_body_buf = false;
-    if (BODY_BUFFER_BYTES > stack_body_buf.size()) {
-        body_buf = new (std::nothrow) uint8_t[BODY_BUFFER_BYTES];
+    if (body_size > stack_body_buf.size()) {
+        body_buf = new (std::nothrow) uint8_t[body_size];
         heap_body_buf = true;
     }
     if (body_buf == nullptr) {
         return finish_log_write(-ENOMEM);
     }
 
-    int const SERIALIZE_RC = xfs_log_serialize_body(items, item_count, body_buf, BODY_BUFFER_BYTES);
-    if (SERIALIZE_RC != 0) {
-        if (heap_body_buf) {
-            delete[] body_buf;
-        }
-        return finish_log_write(SERIALIZE_RC);
-    }
-
-    // Write body data block by block
-    while (body_offset < body_size) {
-        uint64_t const DATA_DISK_BLOCK = log->log_start + cur_block;
-        // Use xfs_buf_get - we zero+overwrite the full block, no read needed.
-        BufHead* data_bh = xfs_buf_get(mount, DATA_DISK_BLOCK);
-        if (data_bh == nullptr) {
-            if (heap_body_buf) {
-                delete[] body_buf;
-            }
-            return finish_log_write(-EIO);
-        }
-
-        uint32_t chunk = body_size - body_offset;
-        chunk = std::min(chunk, BLOCK_SIZE);
-        __builtin_memcpy(data_bh->data, body_buf + body_offset, chunk);
-
-        bdirty(data_bh);
-        brelse(data_bh);
-
-        body_offset += chunk;
-        cur_block = (cur_block + 1) % log->log_blocks;
+    uint64_t const LSN = xfs_log_make_lsn(log, log->head_cycle, log->head_block);
+    int rc = xfs_log_serialize_body(items, item_count, LSN, body_buf, body_size, num_logops);
+    if (rc == 0) {
+        rc = xfs_log_write_record(log, body_buf, body_size, num_logops, true);
     }
 
     if (heap_body_buf) {
         delete[] body_buf;
     }
-
-    // Advance the log head
-    xfs_log_advance_head(log, HEAD, cur_block);
-
-    return finish_log_write(0);
+    if (rc == 0) {
+        uint32_t record_blocks = 0;
+        if (xfs_log_record_fs_blocks(mount, body_size, &record_blocks) == 0) {
+            perf_block_bytes = static_cast<uint64_t>(record_blocks) * mount->block_size;
+        }
+    }
+    return finish_log_write(rc);
 }
 
 auto xfs_log_item_matches_buffer(const XfsTransItem& item, const BufHead* bp) -> bool {
@@ -722,11 +983,11 @@ auto xfs_log_transaction_shape(const XfsTransItem* items, int item_count, size_t
         uint32_t const OFFSET = items[i].buf.offset;
         uint32_t const LEN = items[i].buf.len;
         if (bp == nullptr || bp->retired.load(std::memory_order_acquire) || OFFSET > bp->size || LEN > bp->size - OFFSET ||
-            body_bytes > SIZE_MAX - 16U - LEN) {
+            body_bytes > SIZE_MAX - sizeof(WosLogBufferItemHeader) - LEN) {
             return -EIO;
         }
         dirty_items++;
-        body_bytes += 16U + LEN;
+        body_bytes += sizeof(WosLogBufferItemHeader) + LEN;
     }
     *dirty_items_out = dirty_items;
     *body_bytes_out = body_bytes;
@@ -740,32 +1001,6 @@ void xfs_log_batch_reset(XfsLogBatch* batch) {
     batch->item_count = 0;
     batch->body_bytes = 0;
     batch->phase = XfsLogBatchPhase::COLLECTING;
-}
-
-auto xfs_log_writeback_range(XfsMountContext* mount) -> int {
-    if (mount == nullptr || mount->device == nullptr || mount->device->block_size == 0 || mount->block_size == 0 ||
-        mount->block_size % mount->device->block_size != 0 || mount->log_blocks == 0 || mount->ag_blocks == 0 || mount->ag_blk_log >= 64) {
-        return -EINVAL;
-    }
-
-    auto const AGNO = static_cast<xfs_agnumber_t>(mount->log_start >> mount->ag_blk_log);
-    auto const AGBNO = static_cast<xfs_agblock_t>(mount->log_start & ((uint64_t{1} << mount->ag_blk_log) - 1));
-    if (AGBNO >= mount->ag_blocks || mount->log_blocks > mount->ag_blocks - AGBNO ||
-        static_cast<uint64_t>(AGNO) > UINT64_MAX / mount->ag_blocks) {
-        return -EOVERFLOW;
-    }
-    uint64_t const AG_BASE = static_cast<uint64_t>(AGNO) * mount->ag_blocks;
-    if (AGBNO > UINT64_MAX - AG_BASE) {
-        return -EOVERFLOW;
-    }
-    uint64_t const LINEAR_LOG_START = AG_BASE + AGBNO;
-    size_t const DEV_BLOCKS_PER_FS_BLOCK = mount->block_size / mount->device->block_size;
-    if (LINEAR_LOG_START > UINT64_MAX / DEV_BLOCKS_PER_FS_BLOCK || mount->log_blocks > SIZE_MAX / DEV_BLOCKS_PER_FS_BLOCK) {
-        return -EOVERFLOW;
-    }
-    uint64_t const DEV_BLOCK = LINEAR_LOG_START * DEV_BLOCKS_PER_FS_BLOCK;
-    size_t const DEV_COUNT = static_cast<size_t>(mount->log_blocks) * DEV_BLOCKS_PER_FS_BLOCK;
-    return writeback_bdev_range(mount->device, DEV_BLOCK, DEV_COUNT);
 }
 
 auto xfs_log_writeback_home_item(const XfsTransItem& item) -> int {
@@ -789,81 +1024,126 @@ auto xfs_log_writeback_home_item(const XfsTransItem& item) -> int {
 }
 
 auto xfs_log_batch_flush_locked(XfsMountContext* mount) -> int {
-    if (active_batch == nullptr || active_batch->mount != mount) {
+    XfsLogBatch* batch = mount != nullptr ? mount->log_batch : nullptr;
+    if (batch == nullptr || batch->mount != mount) {
         return -EINVAL;
     }
-    if (active_batch->item_count == 0) {
-        xfs_log_batch_reset(active_batch);
+    if (batch->item_count == 0) {
+        xfs_log_batch_reset(batch);
         return 0;
     }
 
-    if (active_batch->phase == XfsLogBatchPhase::COLLECTING) {
-        int const RC = xfs_log_write_record_locked(mount, active_batch->items.data(), static_cast<int>(active_batch->item_count));
+    if (batch->phase == XfsLogBatchPhase::COLLECTING) {
+        // Persist file data while journal holds still exclude every home
+        // metadata buffer from writeback.  This preserves ordered-data
+        // semantics before the WAL is made durable.
+        int const DATA_RC = sync_blockdev_file_data(mount->device);
+        if (DATA_RC != 0) {
+            return DATA_RC;
+        }
+        int const RC = xfs_log_write_record_locked(mount, batch->items.data(), static_cast<int>(batch->item_count));
         if (RC != 0) {
             // Keep the batch and its journal holds intact. Metadata must not
             // become writeback-eligible until a WAL retry succeeds.
             return RC;
         }
-        active_batch->phase = XfsLogBatchPhase::LOG_STAGED;
+        batch->phase = XfsLogBatchPhase::LOG_STAGED;
     }
 
-    if (active_batch->phase == XfsLogBatchPhase::LOG_STAGED) {
-        int const WRITE_RC = xfs_log_writeback_range(mount);
+    if (batch->phase == XfsLogBatchPhase::LOG_STAGED) {
         int const FLUSH_RC = flush_blockdev(mount->device);
-        if (WRITE_RC != 0 || FLUSH_RC != 0) {
+        if (FLUSH_RC != 0) {
             // LOG_STAGED avoids appending a duplicate record on retry. An
             // unconditional device flush makes a retry valid even when the
             // earlier write completed but its cache flush failed.
-            return WRITE_RC != 0 ? WRITE_RC : FLUSH_RC;
+            return FLUSH_RC;
         }
-        active_batch->phase = XfsLogBatchPhase::LOG_DURABLE;
+        batch->phase = XfsLogBatchPhase::LOG_DURABLE;
     }
 
-    if (active_batch->phase == XfsLogBatchPhase::LOG_DURABLE) {
+    if (batch->phase == XfsLogBatchPhase::LOG_DURABLE) {
         // The WAL is stable. Release every home-buffer hold before selecting
         // any range for writeback so overlapping aliases cannot deadlock one
         // another during the checkpoint.
-        for (size_t i = 0; i < active_batch->item_count; ++i) {
-            XfsTransItem& item = active_batch->items.at(i);
+        for (size_t i = 0; i < batch->item_count; ++i) {
+            XfsTransItem& item = batch->items.at(i);
             if (item.type != XfsLogItemType::BUFFER || item.buf.bp == nullptr) {
                 continue;
             }
             bdirty(item.buf.bp);
             bjournal_release(item.buf.bp);
         }
-        active_batch->phase = XfsLogBatchPhase::HOME_RELEASED;
+        batch->phase = XfsLogBatchPhase::HOME_RELEASED;
     }
 
-    int result = 0;
-    for (size_t i = 0; i < active_batch->item_count; ++i) {
-        int const RC = xfs_log_writeback_home_item(active_batch->items.at(i));
-        if (RC != 0 && result == 0) {
-            result = RC;
+    for (size_t i = 0; i < batch->item_count; ++i) {
+        int const RC = xfs_log_writeback_home_item(batch->items.at(i));
+        if (RC != 0) {
+            // Do not submit or flush later home images after an earlier
+            // checkpoint write failed. The durable WAL remains authoritative,
+            // and a retry restarts the retained HOME_RELEASED batch.
+            return RC;
         }
     }
     int const FLUSH_RC = flush_blockdev(mount->device);
-    if (result != 0 || FLUSH_RC != 0) {
+    if (FLUSH_RC != 0) {
         // Keep references to every checkpoint range. Successful writes are
         // already clean; failed ranges remain dirty and are retried before a
         // later transaction may advance the compact log tail.
-        return result != 0 ? result : FLUSH_RC;
+        return FLUSH_RC;
     }
 
-    for (size_t i = 0; i < active_batch->item_count; ++i) {
-        XfsTransItem& item = active_batch->items.at(i);
+    // Every home image covered by the retained WAL is now durable.  Future
+    // records may reuse that ring space; their on-disk tail LSN will still
+    // point at their own start so a crash before the next home checkpoint
+    // replays exactly the newest outstanding batch.
+    mount->log->tail_cycle = mount->log->head_cycle;
+    mount->log->tail_block = mount->log->head_block;
+
+    for (size_t i = 0; i < batch->item_count; ++i) {
+        XfsTransItem& item = batch->items.at(i);
         if (item.type == XfsLogItemType::BUFFER && item.buf.bp != nullptr) {
             brelse(item.buf.bp);
             item.buf.bp = nullptr;
             item.type = XfsLogItemType::NONE;
         }
     }
-    xfs_log_batch_reset(active_batch);
+    xfs_log_batch_reset(batch);
     return 0;
 }
 
-auto xfs_log_batch_add_locked(const XfsTransItem* items, int item_count) -> int {
-    if (active_batch == nullptr || active_batch->phase != XfsLogBatchPhase::COLLECTING || items == nullptr || item_count < 0) {
+auto xfs_log_batch_add_locked(XfsMountContext* mount, const XfsTransItem* items, int item_count) -> int {
+    XfsLogBatch* batch = mount != nullptr ? mount->log_batch : nullptr;
+    if (batch == nullptr || batch->phase != XfsLogBatchPhase::COLLECTING || items == nullptr || item_count < 0) {
         return -EINVAL;
+    }
+
+    // Validate the complete input before acquiring any reference or journal
+    // hold.  After this preflight, the loop below has no failure path, so the
+    // transaction either transfers all metadata to the batch or none of it.
+    size_t dirty_items = 0;
+    size_t ignored_body_bytes = 0;
+    int const SHAPE_RC = xfs_log_transaction_shape(items, item_count, &dirty_items, &ignored_body_bytes);
+    if (SHAPE_RC != 0) {
+        return SHAPE_RC;
+    }
+    if (dirty_items > batch->items.size() - batch->item_count) {
+        return -E2BIG;
+    }
+    size_t worst_case_growth = 0;
+    for (int i = 0; i < item_count; ++i) {
+        if (items[i].type != XfsLogItemType::BUFFER || !items[i].buf.dirty) {
+            continue;
+        }
+        BufHead const* bp = items[i].buf.bp;
+        if (bp->size > SIZE_MAX - sizeof(WosLogBufferItemHeader) ||
+            worst_case_growth > SIZE_MAX - sizeof(WosLogBufferItemHeader) - bp->size) {
+            return -E2BIG;
+        }
+        worst_case_growth += sizeof(WosLogBufferItemHeader) + bp->size;
+    }
+    if (batch->body_bytes > XFS_LOG_BATCH_MAX_BODY_BYTES || worst_case_growth > XFS_LOG_BATCH_MAX_BODY_BYTES - batch->body_bytes) {
+        return -E2BIG;
     }
 
     for (int i = 0; i < item_count; ++i) {
@@ -874,10 +1154,7 @@ auto xfs_log_batch_add_locked(const XfsTransItem* items, int item_count) -> int 
         BufHead* bp = items[i].buf.bp;
         uint32_t const OFFSET = items[i].buf.offset;
         uint32_t const LEN = items[i].buf.len;
-        if (bp->retired.load(std::memory_order_acquire)) {
-            return -EIO;
-        }
-        if (XfsTransItem* existing = xfs_log_batch_find_item(active_batch, bp)) {
+        if (XfsTransItem* existing = xfs_log_batch_find_item(batch, bp)) {
             if (existing->buf.bp != bp) {
                 __builtin_memcpy(existing->buf.bp->data + OFFSET, bp->data + OFFSET, LEN);
             }
@@ -888,19 +1165,16 @@ auto xfs_log_batch_add_locked(const XfsTransItem* items, int item_count) -> int 
             uint32_t const END = std::max(OLD_END, NEW_END);
             existing->buf.offset = START;
             existing->buf.len = END - START;
-            active_batch->body_bytes += existing->buf.len - OLD_LEN;
+            batch->body_bytes += existing->buf.len - OLD_LEN;
             continue;
         }
 
-        if (active_batch->item_count >= active_batch->items.size()) {
-            return -E2BIG;
-        }
         bp->refcount.fetch_add(1, std::memory_order_relaxed);
         bjournal_hold(bp);
-        XfsTransItem& dst = active_batch->items.at(active_batch->item_count++);
+        XfsTransItem& dst = batch->items.at(batch->item_count++);
         dst.type = XfsLogItemType::BUFFER;
         dst.buf = items[i].buf;
-        active_batch->body_bytes += 16U + LEN;
+        batch->body_bytes += sizeof(WosLogBufferItemHeader) + LEN;
     }
     return 0;
 }
@@ -930,23 +1204,27 @@ auto xfs_log_write(XfsMountContext* mount, const XfsTransItem* items, int item_c
         return 0;
     }
 
-    XfsLogWriteGuard guard;
-    if (mount == nullptr || active_log == nullptr || active_log->mount != mount || !active_log->active || active_batch == nullptr ||
-        active_batch->mount != mount) {
+    XfsLogWriteGuard guard(mount);
+    XfsLogBatch* batch = mount != nullptr ? mount->log_batch : nullptr;
+    if (mount == nullptr || mount->log == nullptr || mount->log->mount != mount || !mount->log->active || batch == nullptr ||
+        batch->mount != mount) {
         return -ENODEV;
     }
 
-    if (active_batch->phase != XfsLogBatchPhase::COLLECTING) {
+    if (batch->phase != XfsLogBatchPhase::COLLECTING) {
         // xfs_log_prepare_transaction() resolves pending checkpoints before
         // transaction mutation. Do not attempt one here: the current
         // transaction still owns undo holds on its metadata buffers.
         return -EAGAIN;
     }
 
-    if (dirty_items > active_batch->items.size() - active_batch->item_count) {
+    if (dirty_items > batch->items.size() - batch->item_count) {
         return -E2BIG;
     }
-    int const ADD_RC = xfs_log_batch_add_locked(items, item_count);
+    if (batch->body_bytes > XFS_LOG_BATCH_MAX_BODY_BYTES || transaction_body_bytes > XFS_LOG_BATCH_MAX_BODY_BYTES - batch->body_bytes) {
+        return -E2BIG;
+    }
+    int const ADD_RC = xfs_log_batch_add_locked(mount, items, item_count);
     if (ADD_RC != 0) {
         return ADD_RC;
     }
@@ -957,35 +1235,45 @@ auto xfs_log_write(XfsMountContext* mount, const XfsTransItem* items, int item_c
 }
 
 auto xfs_log_prepare_transaction(XfsMountContext* mount) -> int {
-    XfsLogWriteGuard guard;
+    XfsLogWriteGuard guard(mount);
     if (mount == nullptr) {
         return -EINVAL;
     }
-    if (active_log == nullptr || active_log->mount != mount || active_batch == nullptr || active_batch->mount != mount) {
-        return 0;
+    if (mount->log == nullptr || mount->log->mount != mount || mount->log_batch == nullptr || mount->log_batch->mount != mount) {
+        return mount->mounted ? -ENODEV : 0;
     }
-    return xfs_log_batch_should_checkpoint(active_batch) ? xfs_log_batch_flush_locked(mount) : 0;
+    return xfs_log_batch_should_checkpoint(mount->log_batch) ? xfs_log_batch_flush_locked(mount) : 0;
 }
 
 auto xfs_log_checkpoint_if_needed(XfsMountContext* mount) -> int {
-    XfsLogWriteGuard guard;
-    if (mount == nullptr || active_log == nullptr || active_log->mount != mount || active_batch == nullptr ||
-        active_batch->mount != mount) {
-        return 0;
-    }
-    return xfs_log_batch_should_checkpoint(active_batch) ? xfs_log_batch_flush_locked(mount) : 0;
+    // Post-commit checkpointing can publish allocation metadata before the
+    // caller copies newly allocated file data.  The next reservation or an
+    // explicit sync performs the ordered data-sync/checkpoint instead.
+    return mount == nullptr ? -EINVAL : 0;
 }
 
 auto xfs_log_flush(XfsMountContext* mount) -> int {
-    XfsLogWriteGuard guard;
-    if (mount == nullptr || active_log == nullptr || active_log->mount != mount || active_batch == nullptr ||
-        active_batch->mount != mount) {
+    XfsLogWriteGuard guard(mount);
+    if (mount == nullptr || mount->log == nullptr || mount->log->mount != mount || mount->log_batch == nullptr ||
+        mount->log_batch->mount != mount) {
         return -EINVAL;
     }
     return xfs_log_batch_flush_locked(mount);
 }
 
 #ifdef WOS_SELFTEST
+auto xfs_selftest_log_crash_forget(XfsMountContext* mount) -> bool {
+    XfsLogWriteGuard guard(mount);
+    if (mount == nullptr || mount->log == nullptr || mount->log->mount != mount || mount->log_batch == nullptr ||
+        mount->log_batch->mount != mount) {
+        return false;
+    }
+    // Model sudden power loss: abandon volatile journal ownership without
+    // checkpoint, clean-marker publication, writeback, or device flush.
+    xfs_log_abandon_locked(mount);
+    return true;
+}
+
 namespace {
 
 auto xfs_log_recycle_selftest_read(ker::dev::BlockDevice* dev, uint64_t /*block*/, size_t count, void* buffer) -> int {
@@ -1081,7 +1369,7 @@ auto xfs_selftest_log_recycled_buffer_is_distinct() -> bool {
         size_t dirty_items = 0;
         size_t body_bytes = 0;
         ok = ok && xfs_log_transaction_shape(&replacement_item, 1, &dirty_items, &body_bytes) == 0 && dirty_items == 1 &&
-             body_bytes == 16U + replacement->size;
+             body_bytes == sizeof(WosLogBufferItemHeader) + replacement->size;
         brelse(replacement);
     }
 
@@ -1097,12 +1385,9 @@ auto xfs_selftest_log_recycled_buffer_is_distinct() -> bool {
 }
 
 auto xfs_selftest_log_checkpoint_is_ordered_and_bounded() -> bool {
-    if (active_log != nullptr || active_batch != nullptr) {
-        return false;
-    }
-
     constexpr uint64_t HOME_BLOCK = 10;
     constexpr uint64_t UNRELATED_BLOCK = 20;
+    constexpr uint64_t DATA_BLOCK = 30;
     constexpr xfs_fsblock_t LOG_START = 128;
     constexpr uint32_t LOG_BLOCKS = 64;
 
@@ -1129,12 +1414,15 @@ auto xfs_selftest_log_checkpoint_is_ordered_and_bounded() -> bool {
     bool ok = xfs_log_mount(&mount) == 0;
     BufHead* home = ok ? bget(&dev, HOME_BLOCK) : nullptr;
     BufHead* unrelated = ok ? bget(&dev, UNRELATED_BLOCK) : nullptr;
-    ok = ok && home != nullptr && unrelated != nullptr;
+    BufHead* data = ok ? bget(&dev, DATA_BLOCK, BufferReadClass::FILE_DATA) : nullptr;
+    ok = ok && home != nullptr && unrelated != nullptr && data != nullptr;
 
     if (ok) {
         home->data[0] = 0xA5;
         unrelated->data[0] = 0x5A;
+        data->data[0] = 0x3C;
         bdirty(unrelated);
+        bdirty(data);
 
         XfsTransItem item{};
         item.type = XfsLogItemType::BUFFER;
@@ -1152,15 +1440,24 @@ auto xfs_selftest_log_checkpoint_is_ordered_and_bounded() -> bool {
         int const FLUSH_RC = xfs_log_flush(&mount);
         bool const HOME_DIRTY = has_dirty_bdev_range(&dev, HOME_BLOCK, 1);
         bool const UNRELATED_DIRTY = has_dirty_bdev_range(&dev, UNRELATED_BLOCK, 1);
-        ok = ok && FLUSH_RC == 0 && !HOME_DIRTY && UNRELATED_DIRTY;
+        bool const DATA_DIRTY = has_dirty_bdev_range(&dev, DATA_BLOCK, 1);
+        ok = ok && FLUSH_RC == 0 && !HOME_DIRTY && UNRELATED_DIRTY && !DATA_DIRTY;
 
+        size_t data_write_index = SIZE_MAX;
+        size_t data_flush_index = SIZE_MAX;
         size_t log_write_index = SIZE_MAX;
         size_t first_flush_index = SIZE_MAX;
         size_t home_write_index = SIZE_MAX;
         size_t second_flush_index = SIZE_MAX;
         for (size_t i = 0; i < state.event_count; ++i) {
-            if (state.events.at(i) == XfsLogCheckpointSelftestEvent::WRITE && state.blocks.at(i) >= LOG_START &&
-                state.blocks.at(i) < LOG_START + LOG_BLOCKS && log_write_index == SIZE_MAX) {
+            if (state.events.at(i) == XfsLogCheckpointSelftestEvent::WRITE && state.blocks.at(i) == DATA_BLOCK &&
+                data_write_index == SIZE_MAX) {
+                data_write_index = i;
+            } else if (state.events.at(i) == XfsLogCheckpointSelftestEvent::FLUSH && data_write_index != SIZE_MAX &&
+                       data_flush_index == SIZE_MAX) {
+                data_flush_index = i;
+            } else if (state.events.at(i) == XfsLogCheckpointSelftestEvent::WRITE && state.blocks.at(i) >= LOG_START &&
+                       state.blocks.at(i) < LOG_START + LOG_BLOCKS && log_write_index == SIZE_MAX) {
                 log_write_index = i;
             } else if (state.events.at(i) == XfsLogCheckpointSelftestEvent::FLUSH && log_write_index != SIZE_MAX &&
                        first_flush_index == SIZE_MAX) {
@@ -1173,13 +1470,15 @@ auto xfs_selftest_log_checkpoint_is_ordered_and_bounded() -> bool {
                 break;
             }
         }
-        ok = ok && log_write_index < first_flush_index && first_flush_index < home_write_index && home_write_index < second_flush_index;
+        ok = ok && data_write_index < data_flush_index && data_flush_index < log_write_index && log_write_index < first_flush_index &&
+             first_flush_index < home_write_index && home_write_index < second_flush_index;
         if (!ok) {
             mod::dbg::log(
-                "[xfs log selftest] flush=%d home_dirty=%u unrelated_dirty=%u events=%lu log_write=%lu flush1=%lu home_write=%lu "
-                "flush2=%lu",
-                FLUSH_RC, static_cast<unsigned>(HOME_DIRTY), static_cast<unsigned>(UNRELATED_DIRTY),
-                static_cast<unsigned long>(state.event_count), static_cast<unsigned long>(log_write_index),
+                "[xfs log selftest] flush=%d home_dirty=%u unrelated_dirty=%u data_dirty=%u events=%lu data_write=%lu "
+                "data_flush=%lu log_write=%lu flush1=%lu home_write=%lu flush2=%lu",
+                FLUSH_RC, static_cast<unsigned>(HOME_DIRTY), static_cast<unsigned>(UNRELATED_DIRTY), static_cast<unsigned>(DATA_DIRTY),
+                static_cast<unsigned long>(state.event_count), static_cast<unsigned long>(data_write_index),
+                static_cast<unsigned long>(data_flush_index), static_cast<unsigned long>(log_write_index),
                 static_cast<unsigned long>(first_flush_index), static_cast<unsigned long>(home_write_index),
                 static_cast<unsigned long>(second_flush_index));
             for (size_t i = 0; i < state.event_count; ++i) {
@@ -1192,7 +1491,8 @@ auto xfs_selftest_log_checkpoint_is_ordered_and_bounded() -> bool {
 
     brelse(home);
     brelse(unrelated);
-    if (active_log != nullptr && active_log->mount == &mount) {
+    brelse(data);
+    if (mount.log != nullptr && mount.log->mount == &mount) {
         xfs_log_unmount(&mount, false);
     }
     invalidate_bdev(&dev);

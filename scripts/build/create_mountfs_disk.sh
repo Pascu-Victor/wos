@@ -78,6 +78,19 @@ mkdir-p /oldroot
 sync
 _EOF_
 
+if [ "${WOS_KTEST_SECOND_XFS:-0}" = "1" ]; then
+    KTEST_PART_START_SECTOR=$((PART_END_SECTOR + 1))
+    KTEST_PART_SIZE_MIB=8192
+    KTEST_PART_END_SECTOR=$((KTEST_PART_START_SECTOR + (KTEST_PART_SIZE_MIB * 1024 * 1024 / SECTOR_SIZE) - 1))
+    echo "Creating isolated KTEST secondary XFS partition (${KTEST_PART_SIZE_MIB} MiB)"
+    wos_qcow_guestfish "add isolated KTEST secondary XFS partition" "$DISK" --rw -a "$DISK" <<_EOF_
+run
+part-add /dev/sda p $KTEST_PART_START_SECTOR $KTEST_PART_END_SECTOR
+debug sh "mkfs.xfs -f -m rmapbt=0,reflink=0,inobtcount=0 -n parent=0 /dev/sda2"
+sync
+_EOF_
+fi
+
 rm -f "$STAGING_TAR"
 
 echo ""

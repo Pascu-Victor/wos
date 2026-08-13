@@ -238,6 +238,7 @@ UNIT_TESTS=(
     hashtable_limit_test
     tcp_test
     xfs_format_test
+    xfs_log_codec_test
     wki_channel_test
     wki_peer_liveness_test
     wki_event_test

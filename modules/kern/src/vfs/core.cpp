@@ -2972,6 +2972,28 @@ auto vfs_file_set_path(File* file, const char* path) -> bool {
     return true;
 }
 
+class MountOpenFileReservation {
+   public:
+    explicit MountOpenFileReservation(MountPoint* mount) : mount_(retain_mount_for_open_file(mount) ? mount : nullptr) {}
+    MountOpenFileReservation(const MountOpenFileReservation&) = delete;
+    auto operator=(const MountOpenFileReservation&) -> MountOpenFileReservation& = delete;
+    ~MountOpenFileReservation() { release_mount_from_open_file(mount_); }
+
+    explicit operator bool() const { return mount_ != nullptr; }
+
+    auto attach(File* file) -> bool {
+        if (mount_ == nullptr || file == nullptr || file->mount_owner != nullptr) {
+            return false;
+        }
+        file->mount_owner = mount_;
+        mount_ = nullptr;
+        return true;
+    }
+
+   private:
+    MountPoint* mount_ = nullptr;
+};
+
 auto vfs_destroy_file(File* f) -> int {
     if (f == nullptr) {
         return 0;
@@ -2999,6 +3021,9 @@ auto vfs_destroy_file(File* f) -> int {
     }
     vfs_file_clear_path(f);
     f->private_data = nullptr;
+    MountPoint* const MOUNT_OWNER = f->mount_owner;
+    f->mount_owner = nullptr;
+    release_mount_from_open_file(MOUNT_OWNER);
     delete f;
     return close_result;
 }
@@ -6738,13 +6763,7 @@ void release_open_file(File* file) {
     if (file == nullptr) {
         return;
     }
-
-    if (file->fops != nullptr && file->fops->vfs_close != nullptr) {
-        file->fops->vfs_close(file);
-    }
-
-    vfs_file_clear_path(file);
-    delete file;
+    static_cast<void>(vfs_destroy_file(file));
 }
 
 void load_vfs_rules_from_buffer(char* buffer) {
@@ -7644,7 +7663,7 @@ auto vfs_open_resolved_for_task(ker::mod::sched::task::Task* task, const char* r
     // Avoid probing each path component with client-side READLINK RPCs here:
     // they are redundant and can fail independently of the real open.
     auto mount_ref = find_mount_point(path_buffer.data(), path_buffer_len);
-    MountPoint const* mount = mount_ref.get();
+    MountPoint* mount = mount_ref.get();
     bool const REMOTE_MOUNT = (mount != nullptr && mount->fs_type == FSType::REMOTE);
     bool path_changed_by_symlink = false;
     uint64_t metadata_store_epoch_before_symlink = 0;
@@ -7767,6 +7786,12 @@ auto vfs_open_resolved_for_task(ker::mod::sched::task::Task* task, const char* r
     vfs_apply_xfs_known_absent_hint(path_buffer.data(), mount, flags, OPEN_REQUIRE_DIRECTORY, path_buffer_len, path_buffer_hash,
                                     backend_flags);
 
+    MountOpenFileReservation mount_file_reservation{mount};
+    if (!mount_file_reservation) {
+        log_loader_path_event("mount-retiring", raw_path, path_buffer.data(), mount, -EBUSY);
+        return -EBUSY;
+    }
+
     ker::vfs::File* f = nullptr;
     int backend_open_result = -ENOSYS;
     XfsNamespacePublicationGuard namespace_publication_guard(mount, (backend_flags & (ker::vfs::O_CREAT | ker::vfs::O_TRUNC)) != 0);
@@ -7833,6 +7858,10 @@ auto vfs_open_resolved_for_task(ker::mod::sched::task::Task* task, const char* r
         vfs_open_store_missing_metadata_result(path_buffer.data(), mount, flags, OPEN_REQUIRE_DIRECTORY, backend_open_result,
                                                path_buffer_len, path_buffer_hash);
         return OPEN_RESULT;
+    }
+    if (!mount_file_reservation.attach(f)) {
+        vfs_destroy_file(f);
+        return -EIO;
     }
     if ((path_requires_directory || flags_require_directory) && !f->is_directory) {
         vfs_open_store_missing_metadata_result(path_buffer.data(), mount, flags, OPEN_REQUIRE_DIRECTORY, -ENOTDIR, path_buffer_len,
@@ -19493,7 +19522,7 @@ static auto vfs_open_file_impl(const char* path, int flags, int mode, bool resol
     }
 
     auto mount_ref = find_mount_point(pathBuffer, path_buffer_len);
-    MountPoint const* mount = mount_ref.get();
+    MountPoint* mount = mount_ref.get();
     bool const REMOTE_MOUNT = mount != nullptr && mount->fs_type == FSType::REMOTE;
     bool path_changed_by_symlink = false;
     uint64_t metadata_store_epoch_before_symlink = 0;
@@ -19585,6 +19614,11 @@ static auto vfs_open_file_impl(const char* path, int flags, int mode, bool resol
     }
     vfs_apply_xfs_known_absent_hint(pathBuffer, mount, flags, OPEN_REQUIRE_DIRECTORY, path_buffer_len, path_buffer_hash, backend_flags);
 
+    MountOpenFileReservation mount_file_reservation{mount};
+    if (!mount_file_reservation) {
+        return nullptr;
+    }
+
     File* f = nullptr;
     int backend_open_result = -ENOSYS;
     XfsNamespacePublicationGuard namespace_publication_guard(mount, (backend_flags & (ker::vfs::O_CREAT | ker::vfs::O_TRUNC)) != 0);
@@ -19637,6 +19671,11 @@ static auto vfs_open_file_impl(const char* path, int flags, int mode, bool resol
 
     if (f == nullptr && ACCMODE == 0 && (backend_flags & ker::vfs::O_CREAT) == 0) {
         f = create_synthetic_mount_dir_file(pathBuffer, mount->fs_type);
+    }
+
+    if (f != nullptr && !mount_file_reservation.attach(f)) {
+        vfs_destroy_file(f);
+        return nullptr;
     }
 
     if (f != nullptr && OPEN_REQUIRE_DIRECTORY && !f->is_directory) {

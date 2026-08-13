@@ -105,6 +105,18 @@ auto xfs_buf_read_data(XfsMountContext* ctx, uint64_t xfs_block) -> BufHead* {
     return bread_multi(ctx->device, dev_block, dev_count, BufferReadClass::FILE_DATA);
 }
 
+auto xfs_buf_get_data(XfsMountContext* ctx, uint64_t xfs_block) -> BufHead* {
+    uint64_t dev_block = 0;
+    size_t dev_count = 0;
+    if (!xfs_device_block_span(ctx, xfs_block, 1, dev_block, dev_count)) {
+        return nullptr;
+    }
+    if (dev_count <= 1) {
+        return bget(ctx->device, dev_block, BufferReadClass::FILE_DATA);
+    }
+    return bget_multi(ctx->device, dev_block, dev_count, BufferReadClass::FILE_DATA);
+}
+
 // Read multiple contiguous XFS filesystem blocks.
 auto xfs_buf_read_multi(XfsMountContext* ctx, uint64_t xfs_block, size_t count) -> BufHead* {
     uint64_t dev_block = 0;
@@ -125,9 +137,9 @@ auto xfs_buf_get(XfsMountContext* ctx, uint64_t xfs_block) -> BufHead* {
         return nullptr;
     }
     if (dev_count <= 1) {
-        return bget(ctx->device, dev_block);
+        return bget(ctx->device, dev_block, BufferReadClass::FILESYSTEM_METADATA);
     }
-    return bget_multi(ctx->device, dev_block, dev_count);
+    return bget_multi(ctx->device, dev_block, dev_count, BufferReadClass::FILESYSTEM_METADATA);
 }
 
 auto xfs_buf_get_multi(XfsMountContext* ctx, uint64_t xfs_block, size_t count) -> BufHead* {
@@ -137,9 +149,9 @@ auto xfs_buf_get_multi(XfsMountContext* ctx, uint64_t xfs_block, size_t count) -
         return nullptr;
     }
     if (dev_count <= 1) {
-        return bget(ctx->device, dev_block);
+        return bget(ctx->device, dev_block, BufferReadClass::FILESYSTEM_METADATA);
     }
-    return bget_multi(ctx->device, dev_block, dev_count);
+    return bget_multi(ctx->device, dev_block, dev_count, BufferReadClass::FILESYSTEM_METADATA);
 }
 
 auto xfs_sync_superblock_counters(XfsMountContext* ctx) -> int {
@@ -428,10 +440,22 @@ auto xfs_mount(dev::BlockDevice* device, bool read_only, XfsMountContext** ctx_o
         return -EOPNOTSUPP;
     }
 
+    // Recovery must finish before AG headers or inodes enter the cache.  A
+    // post-replay mount built from pre-recovery buffers would otherwise expose
+    // stale metadata even though the journal reported success.
+    int const LOG_MOUNT_RC = xfs_log_mount(ctx);
+    if (LOG_MOUNT_RC != 0) {
+        mod::dbg::log("[xfs] log mount failed: %d", LOG_MOUNT_RC);
+        static_cast<void>(xfs_log_unmount(ctx, false));
+        delete ctx;
+        return LOG_MOUNT_RC;
+    }
+
     // --- Allocate per-AG state and read AGF/AGI headers ---
     ctx->per_ag = new (std::nothrow) XfsPerAG[ctx->ag_count]{};
     if (ctx->per_ag == nullptr) {
         mod::dbg::log("[xfs] OOM allocating per-AG state (%u AGs)", ctx->ag_count);
+        static_cast<void>(xfs_log_unmount(ctx, false));
         delete ctx;
         return -ENOMEM;
     }
@@ -441,6 +465,7 @@ auto xfs_mount(dev::BlockDevice* device, bool read_only, XfsMountContext** ctx_o
         if (rc != 0) {
             mod::dbg::log("[xfs] failed to read AGF for AG %u", ag);
             delete[] ctx->per_ag;
+            static_cast<void>(xfs_log_unmount(ctx, false));
             delete ctx;
             return rc;
         }
@@ -449,6 +474,7 @@ auto xfs_mount(dev::BlockDevice* device, bool read_only, XfsMountContext** ctx_o
         if (rc != 0) {
             mod::dbg::log("[xfs] failed to read AGI for AG %u", ag);
             delete[] ctx->per_ag;
+            static_cast<void>(xfs_log_unmount(ctx, false));
             delete ctx;
             return rc;
         }
@@ -459,6 +485,7 @@ auto xfs_mount(dev::BlockDevice* device, bool read_only, XfsMountContext** ctx_o
         mod::dbg::log("[xfs] failed to read root inode %lu", static_cast<unsigned long>(ctx->root_ino));
         xfs_icache_purge(ctx);
         delete[] ctx->per_ag;
+        static_cast<void>(xfs_log_unmount(ctx, false));
         delete ctx;
         return -EINVAL;
     }
@@ -481,16 +508,12 @@ auto xfs_mount(dev::BlockDevice* device, bool read_only, XfsMountContext** ctx_o
     return 0;
 }
 
-void xfs_unmount(XfsMountContext* ctx) {
+namespace {
+
+void xfs_destroy_mount_context(XfsMountContext* ctx) {
     if (ctx == nullptr) {
         return;
     }
-
-    bool home_metadata_clean = false;
-    if (!ctx->read_only) {
-        home_metadata_clean = xfs_sync_mount(ctx) == 0;
-    }
-    xfs_log_unmount(ctx, home_metadata_clean);
 
     if (ctx->root_inode != nullptr) {
         XfsInode* root_inode = ctx->root_inode;
@@ -515,6 +538,37 @@ void xfs_unmount(XfsMountContext* ctx) {
     mod::dbg::log("[xfs] unmounted");
 
     delete ctx;
+}
+
+}  // namespace
+
+auto xfs_unmount(XfsMountContext* ctx) -> int {
+    if (ctx == nullptr) {
+        return 0;
+    }
+
+    bool home_metadata_clean = false;
+    if (!ctx->read_only) {
+        int const SYNC_RC = xfs_sync_mount(ctx);
+        if (SYNC_RC != 0) {
+            return SYNC_RC;
+        }
+        home_metadata_clean = true;
+    }
+    int const LOG_RC = xfs_log_unmount(ctx, home_metadata_clean);
+    if (LOG_RC != 0) {
+        return LOG_RC;
+    }
+    xfs_destroy_mount_context(ctx);
+    return 0;
+}
+
+void xfs_unmount_force(XfsMountContext* ctx) {
+    if (ctx == nullptr) {
+        return;
+    }
+    static_cast<void>(xfs_log_unmount(ctx, false));
+    xfs_destroy_mount_context(ctx);
 }
 
 }  // namespace ker::vfs::xfs

@@ -21,6 +21,14 @@ TEST(XfsFormat, AgfSize) { static_assert(sizeof(XfsAgf) == 224); }
 TEST(XfsFormat, AgiSize) { static_assert(sizeof(XfsAgi) == 344); }
 TEST(XfsFormat, BmbtRecSize) { static_assert(sizeof(XfsBmbtRec) == 16); }
 TEST(XfsFormat, AllocRecSize) { static_assert(sizeof(XfsAllocRec) == 8); }
+TEST(XfsFormat, LogRecordHeaderMatchesOneBasicBlock) {
+    EXPECT_EQ(sizeof(XlogRecHeader), XLOG_HEADER_SIZE);
+    EXPECT_EQ(sizeof(XlogRecHeader), static_cast<size_t>(512));
+    EXPECT_EQ(offsetof(XlogRecHeader, h_fmt), static_cast<size_t>(300));
+    EXPECT_EQ(offsetof(XlogRecHeader, h_fs_uuid), static_cast<size_t>(304));
+    EXPECT_EQ(offsetof(XlogRecHeader, h_size), static_cast<size_t>(320));
+    EXPECT_EQ(XLOG_REC_CRC_HEADER_BYTES, static_cast<size_t>(328));
+}
 
 // =============================================================================
 // Magic Numbers

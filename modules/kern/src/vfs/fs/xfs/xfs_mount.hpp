@@ -9,6 +9,7 @@
 // Reference: reference/xfs/xfs_mount.h, reference/xfs/xfs_mount.c,
 //            reference/xfs/libxfs/xfs_sb.c, reference/xfs/xfs_super.c
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <dev/block_device.hpp>
@@ -23,6 +24,8 @@
 namespace ker::vfs::xfs {
 
 struct XfsInode;
+struct XfsLog;
+struct XfsLogBatch;
 
 // Per-AG in-memory state (read from AGF + AGI at mount time)
 struct XfsPerAG {
@@ -102,6 +105,18 @@ struct XfsMountContext {
     // because XFS metadata paths can issue disk I/O.
     mod::sys::Mutex metadata_lock;
 
+    // Journal ownership and serialization are mount-scoped.  Keeping these
+    // pointers here prevents one mounted filesystem from displacing another
+    // filesystem's log or checkpoint state.
+    mod::sys::Mutex journal_lock;
+    XfsLog* log;
+    XfsLogBatch* log_batch;
+
+    // Advanced after every accepted metadata mutation, including the mapped
+    // write fast path.  sync uses it to repeat until it observes a stable
+    // checkpoint boundary rather than missing an inode dirtied mid-scan.
+    std::atomic<uint64_t> mutation_sequence;
+
     // Filesystem UUIDs
     XfsUuidT uuid;
     XfsUuidT meta_uuid;
@@ -128,6 +143,10 @@ auto xfs_buf_read(XfsMountContext* ctx, uint64_t xfs_block) -> BufHead*;
 // from filesystem metadata.
 auto xfs_buf_read_data(XfsMountContext* ctx, uint64_t xfs_block) -> BufHead*;
 
+// Get a newly allocated filesystem block as ordinary file data so ordered
+// journal checkpoints can distinguish it from metadata home buffers.
+auto xfs_buf_get_data(XfsMountContext* ctx, uint64_t xfs_block) -> BufHead*;
+
 // Read `count` contiguous XFS filesystem blocks.
 auto xfs_buf_read_multi(XfsMountContext* ctx, uint64_t xfs_block, size_t count) -> BufHead*;
 
@@ -143,8 +162,13 @@ auto xfs_buf_get_multi(XfsMountContext* ctx, uint64_t xfs_block, size_t count) -
 // Caller must hold metadata_lock and must have flushed AG metadata first.
 auto xfs_sync_superblock_counters(XfsMountContext* ctx) -> int;
 
-// Unmount - flush dirty buffers, close journal, free mount context.
-void xfs_unmount(XfsMountContext* ctx);
+// Unmount after a durable sync. On failure the context remains fully live so
+// the published mount can be retried.
+auto xfs_unmount(XfsMountContext* ctx) -> int;
+
+// Destroy a context that was never published in the VFS mount table. This is
+// failure-path cleanup only and never claims that dirty state became durable.
+void xfs_unmount_force(XfsMountContext* ctx);
 
 // Check if a feature is enabled
 inline bool xfs_has_ftype(const XfsMountContext* ctx) { return (ctx->feat_incompat & XFS_SB_FEAT_INCOMPAT_FTYPE) != 0; }

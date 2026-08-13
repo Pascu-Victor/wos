@@ -389,13 +389,16 @@ def test_shutdown_unmount_is_exact_deepest_first_and_root_last() -> None:
             "sync_mount_for_shutdown",
             "wait_for_mount_refs_to_drain_bounded",
             "mp->retiring.store(true, std::memory_order_release)",
-            "mounts.remove_at(0)",
-            "destroy_mount(mp)",
+            "complete_retired_mount_teardown",
+            "rollback_mount_retirement",
+            "destroy_mount_private_data(mount, false)",
+            "destroy_mount_storage(mount)",
         ],
         "shutdown mount ordering helpers",
     )
-    require_order(body, "sync_mount_for_shutdown(mp)", "wait_for_mount_refs_to_drain_bounded(mp)", "sync before ref drain")
-    require_order(body, "wait_for_mount_refs_to_drain_bounded(mp)", "destroy_mount(mp)", "ref drain before destroy")
+    require_order(body, "sync_mount_for_shutdown(mp)", "complete_retired_mount_teardown(mp, true", "sync before safe teardown")
+    if "mounts.remove_at" in body:
+        fail("shutdown must keep retiring mounts published until references and backend teardown complete")
     if "resolve_mount_path" in body:
         fail("shutdown_unmount_all_exact() must consume exact mount paths, not current-task path resolution")
     require_tokens(

@@ -28,6 +28,7 @@ constexpr uint32_t BH_DIRTY_INDEXED = (1U << 5);    // Buffer is present in the 
 constexpr uint32_t BH_RANGE_INDEXED = (1U << 6);    // Buffer is present in the cached range index
 constexpr uint32_t BH_LRU_REFERENCED = (1U << 7);   // Clean eviction should give this buffer a second chance
 constexpr uint32_t BH_DATA_VMAP = (1U << 8);        // Buffer data uses virtually-contiguous order-0 backing pages
+constexpr uint32_t BH_FILE_DATA = (1U << 9);        // Buffer has been used for ordinary file contents
 
 // Buffer head - represents a single cached block from a block device.
 // Analogous to Linux struct buffer_head / simplified xfs_buf.
@@ -118,18 +119,24 @@ void bdirty(BufHead* bh);
 // Use for blocks that are about to be fully overwritten (newly allocated).
 // The buffer data is uninitialized; the caller must write valid content before
 // calling bdirty() / bwrite(). Returns a referenced BufHead* on success.
-auto bget(dev::BlockDevice* bdev, uint64_t block_no) -> BufHead*;
+auto bget(dev::BlockDevice* bdev, uint64_t block_no, BufferReadClass read_class = BufferReadClass::GENERIC) -> BufHead*;
 
 // Like bget but for count contiguous device blocks (analogous to bread_multi).
 // Returns a single BufHead whose data covers count * block_size bytes.
-auto bget_multi(dev::BlockDevice* bdev, uint64_t block_no, size_t count) -> BufHead*;
+auto bget_multi(dev::BlockDevice* bdev, uint64_t block_no, size_t count, BufferReadClass read_class = BufferReadClass::GENERIC) -> BufHead*;
 
 // Write all dirty buffers for a given block device to disk.
 // Returns 0 on success, negative errno on failure.
 auto sync_blockdev(dev::BlockDevice* bdev) -> int;
 
+// Write and durably flush only buffers known to contain ordinary file data.
+// Ordered journals use this before publishing their WAL without selecting
+// unrelated filesystem metadata for premature home writeback.
+auto sync_blockdev_file_data(dev::BlockDevice* bdev) -> int;
+
 // Flush the block device's volatile write cache without selecting any dirty
-// buffers for writeback. Returns 0 when the device has no flush operation.
+// buffers for writeback. A device without an explicit durability callback
+// returns -EOPNOTSUPP rather than falsely claiming persistence.
 auto flush_blockdev(dev::BlockDevice* bdev) -> int;
 
 // Return true if any dirty cached buffer overlaps a device block range.

@@ -286,7 +286,10 @@ auto block_flush(BlockDevice* bdev) -> int {
     }
 
     if (bdev->flush == nullptr) {
-        return 0;  // No-op if not implemented
+        // A caller asking for a durability barrier must never receive a
+        // false-success result.  Devices whose writes are inherently durable
+        // (for example the RAM disk) advertise an explicit no-op callback.
+        return -EOPNOTSUPP;
     }
 
     return normalize_io_result(bdev->flush(bdev));

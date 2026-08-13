@@ -708,6 +708,12 @@ wos_add_unit_test(xfs_format_test
     SOURCES     ${CMAKE_CURRENT_SOURCE_DIR}/unit/xfs_format_test.cpp
 )
 
+wos_add_unit_test(xfs_log_codec_test
+    SOURCES      ${CMAKE_CURRENT_SOURCE_DIR}/unit/xfs_log_codec_test.cpp
+    KERN_SOURCES ${WOS_KERN_SRC}/vfs/fs/xfs/xfs_log_codec.cpp
+                 ${WOS_KERN_SRC}/util/crc32c.cpp
+)
+
 wos_add_unit_test(wki_channel_test
     SOURCES      ${CMAKE_CURRENT_SOURCE_DIR}/unit/wki_channel_test.cpp
     KERN_SOURCES ${WOS_KERN_SRC}/net/wki/channel.cpp

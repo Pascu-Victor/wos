@@ -333,6 +333,7 @@ struct DirtyWritebackFilter {
     uint64_t block_no{};
     size_t count{};
     bool use_range{};
+    bool require_file_data{};
 };
 
 struct DirtyWritebackResult {
@@ -995,7 +996,6 @@ auto read_blocks_with_retry(dev::BlockDevice* bdev, uint64_t block_no, size_t co
         if (attempt < MAX_ATTEMPTS) {
             log::warn("transient read failure on %s block=%llu count=%zu rc=%d attempt=%d/%d", bdev->name.data(),
                       static_cast<unsigned long long>(block_no), count, RC, attempt, MAX_ATTEMPTS);
-            ker::mod::sched::kern_yield();
             continue;
         }
         log::warn("read failed on %s block=%llu count=%zu rc=%d after %d attempts", bdev->name.data(),
@@ -1006,6 +1006,20 @@ auto read_blocks_with_retry(dev::BlockDevice* bdev, uint64_t block_no, size_t co
     account_disk_read(read_class, BYTES);
     perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::BUF_DISK_READ, STARTED_US, rc, BYTES);
     return rc;
+}
+
+void apply_buffer_read_class(BufHead* bh, BufferReadClass read_class) {
+    if (bh == nullptr) {
+        return;
+    }
+    if (read_class == BufferReadClass::FILE_DATA) {
+        bh->flags |= BH_FILE_DATA;
+    } else if (read_class == BufferReadClass::FILESYSTEM_METADATA) {
+        // A physical block can be freed as file data and later reused as
+        // metadata. Its old tag must not make journaled metadata eligible for
+        // the ordered-data pre-WAL writeback pass.
+        bh->flags &= ~BH_FILE_DATA;
+    }
 }
 
 // Read the block data from disk into an already-allocated buffer.
@@ -2097,6 +2111,9 @@ auto dirty_filter_matches(const BufHead* bh, const DirtyWritebackFilter& filter)
     if (filter.use_range && !buffer_overlaps_range(bh, filter.bdev, filter.block_no, filter.count)) {
         return false;
     }
+    if (filter.require_file_data && (bh->flags & BH_FILE_DATA) == 0) {
+        return false;
+    }
     return true;
 }
 
@@ -3120,6 +3137,7 @@ auto bread(dev::BlockDevice* bdev, uint64_t block_no, BufferReadClass read_class
     // 1. Lookup in cache
     BufHead* bh = hash_lookup(bdev, block_no, bdev->block_size);
     if (bh != nullptr) {
+        apply_buffer_read_class(bh, read_class);
         bh->refcount.fetch_add(1, std::memory_order_relaxed);
         lru_touch(bh);
         stat_hits++;
@@ -3147,6 +3165,7 @@ auto bread(dev::BlockDevice* bdev, uint64_t block_no, BufferReadClass read_class
         log::error("OOM allocating buffer for block %lu", block_no);
         return nullptr;
     }
+    apply_buffer_read_class(bh, read_class);
 
     if (PERF_ALLOC_STARTED_US != 0) {
         ker::mod::perf::record_local_xfs_summary(ker::mod::perf::WkiPerfLocalXfsOp::BUF_ALLOC, 0, PERF_ALLOC_US, true, bdev->block_size);
@@ -3168,6 +3187,7 @@ auto bread(dev::BlockDevice* bdev, uint64_t block_no, BufferReadClass read_class
     irqflags = cache_lock.lock_irqsave();
     BufHead* existing = hash_lookup(bdev, block_no, bdev->block_size);
     if (existing != nullptr) {
+        apply_buffer_read_class(existing, read_class);
         existing->refcount.fetch_add(1, std::memory_order_relaxed);
         lru_touch(existing);
         static_cast<void>(overlay_newer_cached_aliases_for_buffer_locked(existing, block_no, 1));
@@ -3209,6 +3229,7 @@ auto bread_multi(dev::BlockDevice* bdev, uint64_t block_no, size_t count, Buffer
 
     BufHead* bh = hash_lookup(bdev, block_no, total_size);
     if (bh != nullptr) {
+        apply_buffer_read_class(bh, read_class);
         bh->refcount.fetch_add(1, std::memory_order_relaxed);
         lru_touch(bh);
         stat_hits++;
@@ -3230,6 +3251,7 @@ auto bread_multi(dev::BlockDevice* bdev, uint64_t block_no, size_t count, Buffer
         perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::BUF_READ_MISS, PERF_STARTED_US, -ENOMEM, 0);
         return nullptr;
     }
+    apply_buffer_read_class(bh, read_class);
     uint32_t const PERF_ALLOC_US = PERF_ALLOC_STARTED_US != 0 ? perf_elapsed_since_us(PERF_ALLOC_STARTED_US) : 0;
 
     if (PERF_ALLOC_STARTED_US != 0) {
@@ -3254,6 +3276,7 @@ auto bread_multi(dev::BlockDevice* bdev, uint64_t block_no, size_t count, Buffer
     irqflags = cache_lock.lock_irqsave();
     BufHead* existing = hash_lookup(bdev, block_no, total_size);
     if (existing != nullptr) {
+        apply_buffer_read_class(existing, read_class);
         existing->refcount.fetch_add(1, std::memory_order_relaxed);
         lru_touch(existing);
         static_cast<void>(overlay_newer_cached_aliases_for_buffer_locked(existing, block_no, count));
@@ -3375,7 +3398,7 @@ void bdirty(BufHead* bh) {
 }
 
 namespace {
-auto bget_impl(dev::BlockDevice* bdev, uint64_t block_no) -> BufHead* {
+auto bget_impl(dev::BlockDevice* bdev, uint64_t block_no, BufferReadClass read_class) -> BufHead* {
     if (bdev == nullptr) {
         return nullptr;
     }
@@ -3390,6 +3413,7 @@ auto bget_impl(dev::BlockDevice* bdev, uint64_t block_no) -> BufHead* {
     // If the block is already cached, return it (caller will overwrite).
     BufHead* bh = hash_lookup(bdev, block_no, bdev->block_size);
     if (bh != nullptr) {
+        apply_buffer_read_class(bh, read_class);
         bh->refcount.fetch_add(1, std::memory_order_relaxed);
         lru_touch(bh);
         cache_lock.unlock_irqrestore(irqflags);
@@ -3413,10 +3437,12 @@ auto bget_impl(dev::BlockDevice* bdev, uint64_t block_no) -> BufHead* {
         return nullptr;
     }
     bh->flags |= BH_VALID;  // Mark valid without disk read
+    apply_buffer_read_class(bh, read_class);
 
     irqflags = cache_lock.lock_irqsave();
     BufHead* existing = hash_lookup(bdev, block_no, bdev->block_size);
     if (existing != nullptr) {
+        apply_buffer_read_class(existing, read_class);
         existing->refcount.fetch_add(1, std::memory_order_relaxed);
         lru_touch(existing);
         cache_lock.unlock_irqrestore(irqflags);
@@ -3435,12 +3461,12 @@ auto bget_impl(dev::BlockDevice* bdev, uint64_t block_no) -> BufHead* {
     return bh;
 }
 
-auto bget_multi_impl(dev::BlockDevice* bdev, uint64_t block_no, size_t count) -> BufHead* {
+auto bget_multi_impl(dev::BlockDevice* bdev, uint64_t block_no, size_t count, BufferReadClass read_class) -> BufHead* {
     if (bdev == nullptr || count == 0) {
         return nullptr;
     }
     if (count == 1) {
-        return bget_impl(bdev, block_no);
+        return bget_impl(bdev, block_no, read_class);
     }
     uint64_t const PERF_STARTED_US = perf_xfs_started_us();
 
@@ -3458,6 +3484,7 @@ auto bget_multi_impl(dev::BlockDevice* bdev, uint64_t block_no, size_t count) ->
     // If already cached, return it (caller will overwrite contents).
     BufHead* bh = hash_lookup(bdev, block_no, total_size);
     if (bh != nullptr) {
+        apply_buffer_read_class(bh, read_class);
         bh->refcount.fetch_add(1, std::memory_order_relaxed);
         lru_touch(bh);
         cache_lock.unlock_irqrestore(irqflags);
@@ -3476,11 +3503,13 @@ auto bget_multi_impl(dev::BlockDevice* bdev, uint64_t block_no, size_t count) ->
         perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::BUF_GET_MISS, PERF_STARTED_US, -ENOMEM, 0);
         return nullptr;
     }
+    apply_buffer_read_class(bh, read_class);
     uint32_t const PERF_ALLOC_US = PERF_ALLOC_STARTED_US != 0 ? perf_elapsed_since_us(PERF_ALLOC_STARTED_US) : 0;
 
     irqflags = cache_lock.lock_irqsave();
     BufHead* existing = hash_lookup(bdev, block_no, total_size);
     if (existing != nullptr) {
+        apply_buffer_read_class(existing, read_class);
         existing->refcount.fetch_add(1, std::memory_order_relaxed);
         lru_touch(existing);
         cache_lock.unlock_irqrestore(irqflags);
@@ -3502,9 +3531,13 @@ auto bget_multi_impl(dev::BlockDevice* bdev, uint64_t block_no, size_t count) ->
 
 }  // namespace
 
-auto bget(dev::BlockDevice* bdev, uint64_t block_no) -> BufHead* { return bget_impl(bdev, block_no); }
+auto bget(dev::BlockDevice* bdev, uint64_t block_no, BufferReadClass read_class) -> BufHead* {
+    return bget_impl(bdev, block_no, read_class);
+}
 
-auto bget_multi(dev::BlockDevice* bdev, uint64_t block_no, size_t count) -> BufHead* { return bget_multi_impl(bdev, block_no, count); }
+auto bget_multi(dev::BlockDevice* bdev, uint64_t block_no, size_t count, BufferReadClass read_class) -> BufHead* {
+    return bget_multi_impl(bdev, block_no, count, read_class);
+}
 
 auto flush_blockdev(dev::BlockDevice* bdev) -> int {
     if (bdev == nullptr) {
@@ -3528,14 +3561,11 @@ auto sync_blockdev(dev::BlockDevice* bdev) -> int {
     DirtyWritebackFilter filter{};
     filter.bdev = bdev;
 
-    bool wrote_dirty = false;
-    bool waited_for_writeback = false;
     uint64_t min_epoch = 0;
     uint64_t const MAX_EPOCH = max_matching_dirty_epoch(filter);
     while (true) {
         DirtyWritebackResult const WB = writeback_dirty_one_after(filter, min_epoch, MAX_EPOCH);
         if (WB.wrote) {
-            wrote_dirty = true;
             min_epoch = WB.dirty_epoch;
             if (WB.status != 0) {
                 result = WB.status;
@@ -3543,19 +3573,61 @@ auto sync_blockdev(dev::BlockDevice* bdev) -> int {
             continue;
         }
         if (WB.busy) {
-            waited_for_writeback = true;
             ker::mod::sched::kern_yield();
             continue;
         }
         break;
     }
 
-    // Flush the device if it supports it
-    if ((wrote_dirty || waited_for_writeback) && bdev->flush != nullptr) {
-        int const RC = flush_blockdev(bdev);
-        if (RC != 0) {
-            result = RC;
+    // Always publish a durability barrier, even when this pass found no
+    // dirty buffers. Earlier background writeback may already have submitted
+    // data that an ordered journal checkpoint depends on. A missing barrier
+    // is an error rather than evidence that those writes are stable.
+    int const FLUSH_RC = flush_blockdev(bdev);
+    if (FLUSH_RC != 0 && result == 0) {
+        result = FLUSH_RC;
+    }
+
+    perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::SYNC_BLOCKDEV, STARTED_US, result, 0);
+    return result;
+}
+
+auto sync_blockdev_file_data(dev::BlockDevice* bdev) -> int {
+    if (bdev == nullptr) {
+        return -EINVAL;
+    }
+
+    uint64_t const STARTED_US = perf_xfs_started_us(ker::mod::perf::WkiPerfLocalXfsOp::SYNC_BLOCKDEV);
+    int result = 0;
+
+    DirtyWritebackFilter filter{};
+    filter.bdev = bdev;
+    filter.require_file_data = true;
+
+    uint64_t min_epoch = 0;
+    uint64_t const MAX_EPOCH = max_matching_dirty_epoch(filter);
+    while (true) {
+        DirtyWritebackResult const WB = writeback_dirty_one_after(filter, min_epoch, MAX_EPOCH);
+        if (WB.wrote) {
+            min_epoch = WB.dirty_epoch;
+            if (WB.status != 0) {
+                result = WB.status;
+            }
+            continue;
         }
+        if (WB.busy) {
+            ker::mod::sched::kern_yield();
+            continue;
+        }
+        break;
+    }
+
+    // A data buffer may already have reached a volatile device cache through
+    // background writeback. The barrier is therefore required even when no
+    // dirty file-data buffer was selected by this pass.
+    int const FLUSH_RC = flush_blockdev(bdev);
+    if (FLUSH_RC != 0 && result == 0) {
+        result = FLUSH_RC;
     }
 
     perf_record_xfs_stage(ker::mod::perf::WkiPerfLocalXfsOp::SYNC_BLOCKDEV, STARTED_US, result, 0);

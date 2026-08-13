@@ -5237,9 +5237,7 @@ void handle_vfs_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_ident
                         ssize_t hr = test_file->fops->vfs_read(test_file, hbuf, 16, 0);
                         ker::mod::dbg::log("[WKI-SRV] VERIFY /etc/hostname: bytes=%ld fs_type=%d data=[%02x %02x %02x %02x]",
                                            static_cast<long>(hr), static_cast<int>(test_file->fs_type), hbuf[0], hbuf[1], hbuf[2], hbuf[3]);
-                        if (test_file->fops->vfs_close != nullptr) {
-                            test_file->fops->vfs_close(test_file);
-                        }
+                        static_cast<void>(ker::vfs::vfs_close_file(test_file));
                     }
                 }
             }

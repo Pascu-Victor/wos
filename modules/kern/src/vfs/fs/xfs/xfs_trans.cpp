@@ -367,7 +367,10 @@ auto xfs_trans_alloc(XfsMountContext* mount) -> XfsTransaction* {
         return nullptr;
     }
     int const PREPARE_RC = xfs_log_prepare_transaction(mount);
-    if (PREPARE_RC != 0) {
+    // A published read-write mount must never mutate metadata without its
+    // journal.  Unmounted synthetic contexts are retained for focused helper
+    // tests that exercise transaction rollback without an on-disk log.
+    if (PREPARE_RC != 0 && (PREPARE_RC != -ENODEV || mount->mounted)) {
         mod::dbg::log("[xfs trans] cannot prepare log transaction: %d", PREPARE_RC);
         return nullptr;
     }
@@ -765,7 +768,7 @@ auto xfs_trans_commit(XfsTransaction* tp) -> int {
     // journal before flushing any data.  This ensures recoverability.
     bool log_owns_metadata = false;
     int const LOG_RC = xfs_log_write(tp->mount, tp->items, tp->item_count, &log_owns_metadata);
-    if (LOG_RC != 0 && LOG_RC != -ENODEV) {
+    if (LOG_RC != 0 && (LOG_RC != -ENODEV || tp->mount->mounted)) {
         mod::dbg::log("[xfs trans] log write failed: %d", LOG_RC);
         if (!log_owns_metadata) {
             xfs_trans_cancel(tp);
@@ -789,6 +792,7 @@ auto xfs_trans_commit(XfsTransaction* tp) -> int {
     }
 
     tp->committed = true;
+    tp->mount->mutation_sequence.fetch_add(1, std::memory_order_release);
     xfs_trans_discard_undo(tp);
     int const CHECKPOINT_RC = xfs_log_checkpoint_if_needed(tp->mount);
     if (CHECKPOINT_RC != 0) {

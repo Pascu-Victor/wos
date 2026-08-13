@@ -34,12 +34,15 @@ auto null_read(BlockDevice* dev, uint64_t /*blk*/, size_t count, void* buf) -> i
 
 auto null_write(BlockDevice* /*dev*/, uint64_t /*blk*/, size_t /*count*/, const void* /*buf*/) -> int { return 0; }
 
+auto null_flush(BlockDevice* /*dev*/) -> int { return 0; }
+
 BlockDevice make_null_bdev(size_t block_size = 512, uint64_t total_blocks = 1024) {
     BlockDevice d{};
     d.block_size = block_size;
     d.total_blocks = total_blocks;
     d.read_blocks = null_read;
     d.write_blocks = null_write;
+    d.flush = null_flush;
     return d;
 }
 
@@ -286,6 +289,66 @@ TEST_F(BufferCacheTest, FailedBwriteMarksCleanBufferDirtyForRetry) {
     EXPECT_EQ(io.last_write_count, 1u);
     EXPECT_EQ(io.last_write[0], 0x7E);
     EXPECT_FALSE(has_dirty_bdev_range(&dev, BLOCK_NO, 1));
+    dev.private_data = nullptr;
+}
+
+TEST_F(BufferCacheTest, OrderedFileDataSyncExcludesUnrelatedDirtyBuffers) {
+    RecordingIoState io{};
+    dev.write_blocks = recording_write;
+    dev.flush = recording_flush;
+    dev.private_data = &io;
+
+    constexpr uint64_t METADATA_BLOCK = 40;
+    constexpr uint64_t DATA_BLOCK = 80;
+    BufHead* metadata = bget(&dev, METADATA_BLOCK, BufferReadClass::FILESYSTEM_METADATA);
+    BufHead* data = bget(&dev, DATA_BLOCK, BufferReadClass::FILE_DATA);
+    ASSERT_NE(metadata, nullptr);
+    ASSERT_NE(data, nullptr);
+    metadata->data[0] = 0xA5;
+    data->data[0] = 0x5A;
+    bdirty(metadata);
+    bdirty(data);
+    brelse(metadata);
+    brelse(data);
+
+    EXPECT_EQ(sync_blockdev_file_data(&dev), 0);
+    ASSERT_EQ(io.write_calls, 1u);
+    EXPECT_EQ(io.write_blocks[0], DATA_BLOCK);
+    EXPECT_EQ(io.flush_calls, 1u);
+    EXPECT_TRUE(has_dirty_bdev_range(&dev, METADATA_BLOCK, 1));
+    EXPECT_FALSE(has_dirty_bdev_range(&dev, DATA_BLOCK, 1));
+
+    EXPECT_EQ(sync_blockdev(&dev), 0);
+    ASSERT_EQ(io.write_calls, 2u);
+    EXPECT_EQ(io.write_blocks[1], METADATA_BLOCK);
+    EXPECT_EQ(io.flush_calls, 2u);
+    EXPECT_FALSE(has_dirty_bdev_range(&dev, METADATA_BLOCK, 1));
+    dev.private_data = nullptr;
+}
+
+TEST_F(BufferCacheTest, MetadataReuseClearsFileDataWritebackClassification) {
+    RecordingIoState io{};
+    dev.write_blocks = recording_write;
+    dev.flush = recording_flush;
+    dev.private_data = &io;
+
+    constexpr uint64_t REUSED_BLOCK = 96;
+    BufHead* reused = bget(&dev, REUSED_BLOCK, BufferReadClass::FILE_DATA);
+    ASSERT_NE(reused, nullptr);
+    reused->data[0] = 0xC3;
+    bdirty(reused);
+    brelse(reused);
+
+    reused = bget(&dev, REUSED_BLOCK, BufferReadClass::FILESYSTEM_METADATA);
+    ASSERT_NE(reused, nullptr);
+    EXPECT_EQ(reused->flags & BH_FILE_DATA, 0u);
+    brelse(reused);
+
+    EXPECT_EQ(sync_blockdev_file_data(&dev), 0);
+    EXPECT_EQ(io.write_calls, 0u);
+    EXPECT_TRUE(has_dirty_bdev_range(&dev, REUSED_BLOCK, 1));
+    EXPECT_EQ(sync_blockdev(&dev), 0);
+    EXPECT_EQ(io.write_calls, 1u);
     dev.private_data = nullptr;
 }
 

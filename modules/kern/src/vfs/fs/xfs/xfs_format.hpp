@@ -819,10 +819,13 @@ static_assert(sizeof(XfsParentRec) == 12);
 
 constexpr uint32_t XLOG_HEADER_MAGIC_NUM = 0xFEEDbabe;
 constexpr size_t XLOG_HEADER_SIZE = 512;
+constexpr uint32_t XLOG_VERSION_2 = 2;
+constexpr uint32_t XLOG_FMT_LINUX_LE = 1;
 
 // Log clients
 constexpr uint8_t XFS_TRANSACTION = 0x69;
 constexpr uint8_t XFS_LOG = 0xAA;
+constexpr uint8_t XLOG_UNMOUNT_TRANS = 0x20;
 
 // Unmount magic
 constexpr uint16_t XLOG_UNMOUNT_TYPE = 0x556E;
@@ -831,24 +834,32 @@ constexpr uint16_t XLOG_UNMOUNT_TYPE = 0x556E;
 inline auto xlog_lsn_cycle(xfs_lsn_t lsn) -> uint32_t { return static_cast<uint32_t>(static_cast<uint64_t>(lsn) >> 32); }
 inline auto xlog_lsn_block(xfs_lsn_t lsn) -> uint32_t { return static_cast<uint32_t>(lsn); }
 
-// Log record header (512 bytes on disk)
+// Log record header.  The fixed v2 header occupies one 512-byte XFS basic
+// block even when the filesystem block size is larger.  Keep the fields and
+// padding byte-exact: existing mkfs.xfs clean-unmount records use this ABI.
 struct XlogRecHeader {
-    Be32 h_magicno;                      // XLOG_HEADER_MAGIC_NUM
-    Be32 h_cycle;                        // log cycle of this record
-    Be32 h_version;                      // log version (2)
-    Be32 h_len;                          // length of the log body (bytes)
-    Be64 h_lsn;                          // cycle.block of this record
-    Be64 h_tail_lsn;                     // oldest active log record
-    uint32_t h_crc;                      // CRC (little-endian)
-    Be32 h_prev_block;                   // block of previous record
-    Be32 h_num_logops;                   // number of log operations in body
-    std::array<Be32, 246> h_cycle_data;  // cycle data from data blocks
-                                         // (replaces first word of each block)
-    Be32 h_fmt;                          // log format
-    XfsUuidT h_fs_uuid;                  // filesystem UUID
-    Be32 h_size;                         // iclog size
+    Be32 h_magicno;                     // XLOG_HEADER_MAGIC_NUM
+    Be32 h_cycle;                       // log cycle of this record
+    Be32 h_version;                     // log version (2)
+    Be32 h_len;                         // length of the log body (bytes)
+    Be64 h_lsn;                         // cycle.block of this record
+    Be64 h_tail_lsn;                    // oldest active log record
+    uint32_t h_crc;                     // CRC (little-endian)
+    Be32 h_prev_block;                  // block of previous record
+    Be32 h_num_logops;                  // number of log operations in body
+    std::array<Be32, 64> h_cycle_data;  // saved first word of each data BB
+                                        // (replaces first word of each block)
+    Be32 h_fmt;                         // log format
+    XfsUuidT h_fs_uuid;                 // filesystem UUID
+    Be32 h_size;                        // iclog size
+    uint32_t h_pad0;
+    std::array<uint8_t, 184> h_reserved;
 } __attribute__((packed));
-static_assert(sizeof(XlogRecHeader) == 1052);
+static_assert(sizeof(XlogRecHeader) == XLOG_HEADER_SIZE);
+static_assert(offsetof(XlogRecHeader, h_fmt) == 300);
+static_assert(offsetof(XlogRecHeader, h_fs_uuid) == 304);
+static_assert(offsetof(XlogRecHeader, h_size) == 320);
+constexpr size_t XLOG_REC_CRC_HEADER_BYTES = offsetof(XlogRecHeader, h_pad0) + sizeof(uint32_t);
 
 // Log item header (precedes each logged item in the log body)
 struct XfsLogIovec {

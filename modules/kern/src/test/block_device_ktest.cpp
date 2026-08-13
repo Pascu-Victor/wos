@@ -1,3 +1,4 @@
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -6,6 +7,7 @@
 #include <platform/mm/phys.hpp>
 #include <test/ktest.hpp>
 #include <utility>
+#include <vfs/buffer_cache.hpp>
 
 namespace {
 
@@ -91,6 +93,12 @@ KTEST(BlockDevice, SixteenMiBWriteStaysSingleDriverRequest) {
     KEXPECT_EQ(state.max_count, IO_BLOCKS);
 
     phys::page_free(buffer);
+}
+
+KTEST(BlockDevice, MissingFlushFailsInsteadOfClaimingDurability) {
+    ker::dev::BlockDevice dev{};
+    KEXPECT_EQ(ker::dev::block_flush(&dev), -EOPNOTSUPP);
+    KEXPECT_EQ(ker::vfs::sync_blockdev(&dev), -EOPNOTSUPP);
 }
 
 KTEST(BlockWriterLease, RemoteIsExclusiveWhileLocalMountsMayCoexist) {

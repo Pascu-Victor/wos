@@ -448,8 +448,11 @@ def main() -> None:
         ("xfs_buf_read", "bread(ctx->device, dev_block, BufferReadClass::FILESYSTEM_METADATA)"),
         ("xfs_buf_read_data", "bread(ctx->device, dev_block, BufferReadClass::FILE_DATA)"),
         ("xfs_buf_read_multi", "bread_multi(ctx->device, dev_block, dev_count, BufferReadClass::FILESYSTEM_METADATA)"),
-        ("xfs_buf_get", "bget(ctx->device, dev_block)"),
-        ("xfs_buf_get_multi", "bget_multi(ctx->device, dev_block, dev_count)"),
+        ("xfs_buf_get", "bget(ctx->device, dev_block, BufferReadClass::FILESYSTEM_METADATA)"),
+        (
+            "xfs_buf_get_multi",
+            "bget_multi(ctx->device, dev_block, dev_count, BufferReadClass::FILESYSTEM_METADATA)",
+        ),
     ]:
         body = function_body(xfs_mount, name)
         require_order(

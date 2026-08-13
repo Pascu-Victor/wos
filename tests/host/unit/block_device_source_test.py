@@ -12,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[3]
 BLOCK_DEVICE = ROOT / "modules/kern/src/dev/block_device.cpp"
 BLOCK_DEVICE_HPP = ROOT / "modules/kern/src/dev/block_device.hpp"
 BLOCK_DEVICE_KTEST = ROOT / "modules/kern/src/test/block_device_ktest.cpp"
+BUFFER_CACHE = ROOT / "modules/kern/src/vfs/buffer_cache.cpp"
 AHCI = ROOT / "modules/kern/src/dev/ahci.cpp"
 
 
@@ -99,6 +100,35 @@ def main() -> None:
         body = function_body(block_source, name)
         require(body, "normalize_io_result(", f"{name} must normalize driver errors")
         require_absent(body, "return -1;", f"{name} must not leak raw -1")
+
+    flush_body = function_body(block_source, "block_flush")
+    require(
+        flush_body,
+        "return -EOPNOTSUPP;",
+        "a missing flush callback must not claim that volatile writes are durable",
+    )
+    require(
+        block_ktest,
+        "KTEST(BlockDevice, MissingFlushFailsInsteadOfClaimingDurability)",
+        "missing durability barriers require executable coverage",
+    )
+    require(
+        block_ktest,
+        "KEXPECT_EQ(ker::vfs::sync_blockdev(&dev), -EOPNOTSUPP);",
+        "a clean buffer-cache sync must still test its device durability barrier",
+    )
+    buffer_cache_source = BUFFER_CACHE.read_text()
+    sync_body = function_body(buffer_cache_source, "sync_blockdev")
+    require(
+        sync_body,
+        "int const FLUSH_RC = flush_blockdev(bdev);",
+        "sync_blockdev must issue a durability barrier even after background writeback emptied the dirty set",
+    )
+    require_absent(
+        sync_body,
+        "bdev->flush != nullptr",
+        "sync_blockdev must not silently skip an unsupported durability barrier",
+    )
 
     register_body = function_body(block_source, "block_device_register")
     unregister_body = function_body(block_source, "block_device_unregister")

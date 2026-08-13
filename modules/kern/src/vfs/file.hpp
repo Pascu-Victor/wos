@@ -11,6 +11,8 @@
 
 namespace ker::vfs {
 
+struct MountPoint;
+
 // O_CLOEXEC: set the close-on-exec flag on the new FD (Linux value)
 constexpr int O_CLOEXEC = 02000000;
 // O_CREAT: create file if it does not exist
@@ -68,6 +70,10 @@ struct File {
     bool close_may_change_metadata = false;
     uint32_t mount_dev_id = 0;
     uint64_t mount_generation = 0;
+    // One ownership pin per File object, independent of descriptor-table
+    // references. The backend close hook must finish before this pin is
+    // released so mount-private data stays live through final close.
+    MountPoint* mount_owner = nullptr;
 
     // Mount-overlay directory listing support
     const char* vfs_path{};  // Absolute VFS path, set by VFS open helpers

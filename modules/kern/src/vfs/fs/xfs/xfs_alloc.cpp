@@ -1317,6 +1317,8 @@ auto agfl_selftest_write(ker::dev::BlockDevice* dev, uint64_t block, size_t coun
     return 0;
 }
 
+auto agfl_selftest_flush(ker::dev::BlockDevice* /*dev*/) -> int { return 0; }
+
 struct FreeTreeDigest {
     uint32_t records{};
     uint64_t blocks{};
@@ -1504,6 +1506,7 @@ auto xfs_selftest_agfl_skips_live_allocation_btree_blocks() -> bool {
     dev.total_blocks = static_cast<uint64_t>(AG_BLOCKS) * (BLOCK_SIZE / SECTOR_SIZE);
     dev.read_blocks = agfl_selftest_read;
     dev.write_blocks = agfl_selftest_write;
+    dev.flush = agfl_selftest_flush;
 
     XfsPerAG pag{};
     pag.agno = 0;
@@ -1632,6 +1635,7 @@ auto xfs_selftest_full_agfl_allocation_drains_transactionally() -> bool {
     dev.total_blocks = static_cast<uint64_t>(AG_BLOCKS) * (BLOCK_SIZE / SECTOR_SIZE);
     dev.read_blocks = agfl_selftest_read;
     dev.write_blocks = agfl_selftest_write;
+    dev.flush = agfl_selftest_flush;
 
     XfsPerAG pag{};
     pag.agno = 0;
@@ -1756,6 +1760,7 @@ auto xfs_selftest_empty_agfl_refill_rebalances() -> bool {
     dev.total_blocks = static_cast<uint64_t>(AG_BLOCKS) * (BLOCK_SIZE / SECTOR_SIZE);
     dev.read_blocks = agfl_selftest_read;
     dev.write_blocks = agfl_selftest_write;
+    dev.flush = agfl_selftest_flush;
 
     XfsPerAG pag{};
     pag.agno = 0;
@@ -1843,6 +1848,7 @@ auto xfs_selftest_free_space_tree_churn_preserves_topology() -> bool {
     dev.total_blocks = static_cast<uint64_t>(AG_BLOCKS) * (BLOCK_SIZE / SECTOR_SIZE);
     dev.read_blocks = agfl_selftest_read;
     dev.write_blocks = agfl_selftest_write;
+    dev.flush = agfl_selftest_flush;
     size_t const BACKING_SIZE = static_cast<size_t>(dev.total_blocks) * dev.block_size;
     auto* backing_data = new (std::nothrow) uint8_t[BACKING_SIZE];
     if (backing_data == nullptr) {

@@ -7,6 +7,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[3]
 MOUNT_HPP = ROOT / "modules" / "kern" / "src" / "vfs" / "mount.hpp"
 MOUNT_CPP = ROOT / "modules" / "kern" / "src" / "vfs" / "mount.cpp"
+FILE_HPP = ROOT / "modules" / "kern" / "src" / "vfs" / "file.hpp"
 CORE_CPP = ROOT / "modules" / "kern" / "src" / "vfs" / "core.cpp"
 REMOTE_VFS_CPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "remote_vfs.cpp"
 PROCFS_CPP = ROOT / "modules" / "kern" / "src" / "vfs" / "fs" / "procfs.cpp"
@@ -231,6 +232,7 @@ def test_mount_lookup_returns_raii_refs() -> None:
     required = [
         "class MountRef",
         "std::atomic<uint32_t> refs{0}",
+        "std::atomic<uint32_t> open_files{0}",
         "std::atomic<bool> retiring{false}",
         "auto find_mount_point(const char* path, size_t known_path_len = UNKNOWN_MOUNT_PATH_LEN) -> MountRef;",
         "auto get_mount_at(size_t index) -> MountRef;",
@@ -241,26 +243,72 @@ def test_mount_lookup_returns_raii_refs() -> None:
         fail("mount lifetime API is missing retained-ref tokens: " + ", ".join(missing))
 
 
-def test_unmount_retires_removes_then_waits_before_destroy() -> None:
+def test_open_files_pin_mount_through_backend_close() -> None:
+    header = MOUNT_HPP.read_text()
+    file_header = FILE_HPP.read_text()
+    source = MOUNT_CPP.read_text()
+    core = CORE_CPP.read_text()
+
+    for token in ("auto retain_mount_for_open_file(MountPoint* mount) -> bool;", "void release_mount_from_open_file(MountPoint* mount);"):
+        if token not in header:
+            fail(f"missing mount/open-file ownership API: {token}")
+    if "MountPoint* mount_owner = nullptr;" not in file_header:
+        fail("File must retain its owning MountPoint independently of fd aliases")
+
+    retain = function_body(source, "retain_mount_for_open_file")
+    release = function_body(source, "release_mount_from_open_file")
+    destroy = function_body(core, "vfs_destroy_file")
+    require_sequence(
+        retain,
+        ["mount_lock.lock()", "!mount->retiring.load(std::memory_order_acquire)", "mount->open_files.fetch_add", "mount_lock.unlock()"],
+        "open-file mount reservation",
+    )
+    require_sequence(
+        release,
+        ["mount_lock.lock()", "mount->open_files.load(std::memory_order_acquire)", "mount->open_files.store(OPEN_FILES - 1", "mount_lock.unlock()"],
+        "open-file mount release",
+    )
+    require_sequence(
+        destroy,
+        ["f->fops->vfs_close(f)", "MountPoint* const MOUNT_OWNER = f->mount_owner", "release_mount_from_open_file(MOUNT_OWNER)", "delete f"],
+        "backend close before mount ownership release",
+    )
+
+    for name in ("vfs_open_resolved_for_task", "vfs_open_file_impl"):
+        body = function_body(core, name)
+        require_order(body, "MountOpenFileReservation mount_file_reservation{mount}", "switch (mount->fs_type)", f"{name} reserve before backend open")
+        require_order(body, "switch (mount->fs_type)", "mount_file_reservation.attach(f)", f"{name} attach backend result")
+
+
+def test_unmount_retires_in_table_then_drains_before_destroy() -> None:
     source = MOUNT_CPP.read_text()
     body = function_body(source, "unmount_filesystem_impl")
     required = [
         "mp->retiring.store(true, std::memory_order_release);",
-        "mounts.remove_at(i);",
         "mount_lock.unlock();",
-        "wait_for_mount_refs_to_drain(removed_mount);",
-        "destroy_mount(removed_mount);",
+        "complete_retired_mount_teardown(retiring_mount, false, &mount_count_after_remove)",
     ]
     missing = [token for token in required if token not in body]
     if missing:
         fail("unmount_filesystem() is missing retained teardown tokens: " + ", ".join(missing))
-    require_order(body, "mp->retiring.store", "mounts.remove_at(i);", "mount retire/remove")
-    remove_pos = body.find("mounts.remove_at(i);")
-    unlock_after_remove = body.find("mount_lock.unlock();", remove_pos)
-    wait_pos = body.find("wait_for_mount_refs_to_drain(removed_mount);")
-    if remove_pos < 0 or unlock_after_remove < remove_pos or wait_pos < unlock_after_remove:
-        fail("unmount must remove under mount_lock, unlock, then drain retained refs")
-    require_order(body, "wait_for_mount_refs_to_drain(removed_mount);", "destroy_mount(removed_mount);", "wait before free")
+    if "mounts.remove_at" in body:
+        fail("explicit unmount must keep the retiring tombstone published while references and backend teardown drain")
+    require_order(body, "mount_lock.unlock()", "complete_retired_mount_teardown", "retire before teardown outside mount lock")
+
+    teardown = function_body(source, "complete_retired_mount_teardown")
+    require_sequence(
+        teardown,
+        [
+            "wait_for_mount_refs_to_drain(mount)",
+            "mount->open_files.load(std::memory_order_acquire)",
+            "destroy_mount_private_data(mount, false)",
+            "mounts.remove_at(REMOVE_INDEX)",
+            "destroy_mount_storage(mount)",
+        ],
+        "retiring mount teardown",
+    )
+    if "rollback_mount_retirement(mount)" not in teardown:
+        fail("failed backend teardown must make the intact mount usable for retry")
 
     conditional_body = function_body(source, "unmount_filesystem_if_private_data")
     if "unmount_filesystem_impl(path, expected_private_data, true)" not in conditional_body:
@@ -272,16 +320,33 @@ def test_unmount_retires_removes_then_waits_before_destroy() -> None:
     owner_required = [
         "MP->private_data != expected_private_data",
         "MP->retiring.store(true, std::memory_order_release)",
-        "mounts.remove_at(i)",
         "mount_lock.unlock()",
-        "wait_for_mount_refs_to_drain(owned_mount)",
-        "destroy_mount(owned_mount)",
+        "complete_retired_mount_teardown(owned_mount, false, &mount_count_after_remove)",
     ]
     missing = [token for token in owner_required if token not in owner_body]
     if missing:
         fail("owner-identity unmount is missing stable teardown tokens: " + ", ".join(missing))
-    require_order(owner_body, "MP->private_data != expected_private_data", "mounts.remove_at(i)", "owner match before removal")
-    require_order(owner_body, "mount_lock.unlock()", "wait_for_mount_refs_to_drain(owned_mount)", "owner wait outside mount lock")
+    require_order(owner_body, "MP->private_data != expected_private_data", "MP->retiring.store", "owner match before retirement")
+    require_order(owner_body, "mount_lock.unlock()", "complete_retired_mount_teardown", "owner teardown outside mount lock")
+
+
+def test_mount_initialization_reserves_exact_path() -> None:
+    source = MOUNT_CPP.read_text()
+    mount_body = function_body(source, "mount_filesystem")
+    required = [
+        "std::array<MountInitialization, MAX_MOUNT_INITIALIZATIONS> mount_initializations{}",
+        "mount_path_initializing_locked",
+        "MountInitializationReservation initialization_reservation",
+        "initialization_reservation.acquire(mount->path, PIVOT_EPOCH)",
+        "initialization_reservation.active_locked()",
+        "initialization_reservation.commit_locked()",
+    ]
+    missing = [token for token in required if token not in source and token not in mount_body]
+    if missing:
+        fail("same-path mount initialization reservation is missing: " + ", ".join(missing))
+    require_order(mount_body, "initialization_reservation.acquire", "fat32_init_device", "reserve before FAT initialization")
+    require_order(mount_body, "initialization_reservation.acquire", "xfs_vfs_init_device", "reserve before XFS recovery")
+    require_order(mount_body, "mounts.push_back(mount)", "initialization_reservation.commit_locked()", "publish before reservation release")
 
 
 def test_remote_mount_is_configured_atomically() -> None:
@@ -289,15 +354,15 @@ def test_remote_mount_is_configured_atomically() -> None:
     required = [
         "mount->private_data = initial_private_data",
         "mount->fops = initial_fops",
-        "mount->fs_type == FSType::REMOTE",
-        "std::strcmp(existing->path, mount->path) == 0",
+        "MountInitializationReservation initialization_reservation",
+        "mount_path_occupied_locked(mount->path)",
         "mounts.push_back(mount)",
     ]
     missing = [token for token in required if token not in mount_body]
     if missing:
         fail("remote mount publication is missing atomic owner/path tokens: " + ", ".join(missing))
     require_order(mount_body, "mount->private_data = initial_private_data", "mounts.push_back(mount)", "owner before publication")
-    require_order(mount_body, "std::strcmp(existing->path, mount->path) == 0", "mounts.push_back(mount)", "duplicate rejection")
+    require_order(mount_body, "mount_path_occupied_locked(mount->path)", "mounts.push_back(mount)", "duplicate rejection")
 
     remote_mount = function_body(REMOTE_VFS_CPP.read_text(), "mount_vfs_proxy_lane")
     if 'mount_filesystem(local_mount_path, "remote", nullptr, 0, nullptr, state, &g_remote_vfs_fops)' not in remote_mount:
@@ -317,7 +382,7 @@ def test_writable_block_mount_holds_lease_until_destroy() -> None:
     required = [
         "bool const BLOCK_RW_FS",
         "mount->block_writer_lease.try_acquire(device, ker::dev::BlockWriterLeaseOwner::LOCAL_MOUNT)",
-        "destroy_mount(mount)",
+        "destroy_mount(mount, true)",
         "mounts.push_back(mount)",
     ]
     missing = [token for token in required if token not in mount_body]
@@ -326,8 +391,8 @@ def test_writable_block_mount_holds_lease_until_destroy() -> None:
     require_order(mount_body, "mount->block_writer_lease.try_acquire", "fat32_init_device", "lease before FAT initialization")
     require_order(mount_body, "mount->block_writer_lease.try_acquire", "xfs_vfs_init_device", "lease before XFS initialization")
     require_order(mount_body, "mount->block_writer_lease.try_acquire", "mounts.push_back(mount)", "lease before mount publication")
-    if "delete mount;" not in destroy_body:
-        fail("destroy_mount() must destroy the MountPoint and its writer lease")
+    if "destroy_mount_storage(mount)" not in destroy_body:
+        fail("destroy_mount() must release MountPoint storage and its writer lease after backend teardown")
     if "block_writer_lease.release" in source:
         fail("local writer lease must release only through MountPoint destruction after ref drain")
 
@@ -361,6 +426,7 @@ def test_pivot_rewrites_are_transactional_and_gate_publication() -> None:
         fail("remap_mounts_for_pivot() must fail instead of rewriting paths with active refs")
     required_remap = [
         "mount_pivot_epoch.store(ODD_EPOCH, std::memory_order_release)",
+        "mp->retiring.load(std::memory_order_acquire)",
         "ker::util::SmallVec<PivotMountReplacement, 8> replacements",
         "mount_generation.load(std::memory_order_acquire) != TABLE_GENERATION",
         "replacements.push_back(REPLACEMENT)",
@@ -372,6 +438,7 @@ def test_pivot_rewrites_are_transactional_and_gate_publication() -> None:
     missing = [token for token in required_remap if token not in remap_body]
     if missing:
         fail("pivot remap transaction is missing: " + ", ".join(missing))
+    require_order(remap_body, "mp->retiring.load(std::memory_order_acquire)", "path_is_under_root", "retirement fences every pivot path")
     require_order(remap_body, "ker::util::SmallVec<PivotMountReplacement, 8> replacements", "bump_mount_generation_locked()", "allocate before commit")
     require_order(remap_body, "mount_has_active_refs_locked(replacement.mount)", "delete[] mp->path", "final ref check before commit")
     collision_pos = remap_body.find("bool target_collision = false;")
@@ -514,7 +581,9 @@ def test_iteration_users_use_snapshots_when_possible() -> None:
 def main() -> None:
     test_mount_path_scratch_is_fully_produced_before_use()
     test_mount_lookup_returns_raii_refs()
-    test_unmount_retires_removes_then_waits_before_destroy()
+    test_open_files_pin_mount_through_backend_close()
+    test_unmount_retires_in_table_then_drains_before_destroy()
+    test_mount_initialization_reserves_exact_path()
     test_remote_mount_is_configured_atomically()
     test_writable_block_mount_holds_lease_until_destroy()
     test_pivot_rewrites_are_transactional_and_gate_publication()

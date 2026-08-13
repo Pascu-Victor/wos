@@ -34,6 +34,9 @@ struct XfsLog {
     bool active;  // true if log writer is running
 };
 
+// Batches are mount-owned but opaque outside the log implementation.
+struct XfsLogBatch;
+
 // Initialize and recover the log (call during mount, after superblock is read).
 // Returns 0 on success, negative errno on failure.
 auto xfs_log_mount(XfsMountContext* mount) -> int;
@@ -41,7 +44,11 @@ auto xfs_log_mount(XfsMountContext* mount) -> int;
 // Shut down the log (call during unmount).
 // Tear down the active log. When home_metadata_clean is true, discard the
 // compact WOS journal after all home metadata has reached disk.
-void xfs_log_unmount(XfsMountContext* mount, bool home_metadata_clean);
+auto xfs_log_unmount(XfsMountContext* mount, bool home_metadata_clean) -> int;
+
+// Publish a clean log only after all home metadata is durable.  The current
+// batch must already be empty; success includes the final device flush.
+auto xfs_log_mark_clean(XfsMountContext* mount) -> int;
 
 // Check if the log needs recovery (contains uncommitted records).
 auto xfs_log_needs_recovery(XfsMountContext* mount) -> bool;
@@ -70,6 +77,7 @@ auto xfs_log_flush(XfsMountContext* mount) -> int;
 #ifdef WOS_SELFTEST
 auto xfs_selftest_log_recycled_buffer_is_distinct() -> bool;
 auto xfs_selftest_log_checkpoint_is_ordered_and_bounded() -> bool;
+auto xfs_selftest_log_crash_forget(XfsMountContext* mount) -> bool;
 #endif
 
 }  // namespace ker::vfs::xfs

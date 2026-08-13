@@ -961,17 +961,7 @@ void free_retired_exports(WkiIpcExport* retired) {
     }
 }
 
-void ipc_release_file_ref(ker::vfs::File* file) {
-    if (file == nullptr) {
-        return;
-    }
-    if (file->refcount.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-        if (file->fops != nullptr && file->fops->vfs_close != nullptr) {
-            file->fops->vfs_close(file);
-        }
-        delete file;
-    }
-}
+void ipc_release_file_ref(ker::vfs::File* file) { ker::vfs::vfs_put_file(file); }
 
 auto find_pending_pipe_delivery_locked(uint16_t home_node, uint32_t resource_id) -> PendingPipeDelivery* {
     for (auto* pending : g_pending_pipe_deliveries) {
@@ -6691,12 +6681,7 @@ void handle_ipc_dev_op_req_inline(const WkiHeader* hdr, const uint8_t* payload, 
             auto* retired_exports = compact_inactive_exports_locked();
             s_ipc_lock.unlock_irqrestore(IRQF);
             wake_pipe_pump(pump_task);
-            if (f != nullptr && f->refcount.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-                if (f->fops != nullptr && f->fops->vfs_close != nullptr) {
-                    f->fops->vfs_close(f);
-                }
-                delete f;
-            }
+            ipc_release_file_ref(f);
             free_retired_exports(retired_exports);
             if (DIRECT_DISCARD) {
                 schedule_pending_pipe_discard(hdr->src_node, resource_id);

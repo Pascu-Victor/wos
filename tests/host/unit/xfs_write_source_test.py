@@ -145,12 +145,12 @@ def main() -> None:
     require_order(
         write_body,
         [
-            "ssize_t const MAPPED_FAST_RET = try_mapped_write_without_metadata_lock();",
+            "XfsMetadataGuard metadata_guard(ctx, true, WOS_PERF_CALLSITE());",
+            "ssize_t const MAPPED_FAST_RET = try_mapped_write_with_existing_extent();",
             "if (MAPPED_FAST_RET != -EAGAIN)",
             "return finish_write(MAPPED_FAST_RET);",
-            "XfsMetadataGuard metadata_guard(ctx, true, WOS_PERF_CALLSITE());",
         ],
-        "mapped writes must try the lockless path before acquiring the metadata lock for allocation or inode updates",
+        "mapped writes must enter the mount mutation barrier before changing inode size or timestamps",
     )
     require_absent(
         source,
@@ -166,8 +166,8 @@ def main() -> None:
     require_absent(write_body, "xfs_full_block_write_can_write_direct", "regular file write extent path")
     require(
         buffered_body,
-        "BufHead* bp = bget_multi(ctx->device, DEV_BLOCK, DEV_COUNT)",
-        "full-block regular file writes must stay buffered",
+        "BufHead* bp = bget_multi(ctx->device, DEV_BLOCK, DEV_COUNT, BufferReadClass::FILE_DATA)",
+        "full-block regular file writes must stay buffered and be classified for pre-WAL data writeback",
     )
     require(
         buffered_body,
@@ -181,8 +181,8 @@ def main() -> None:
     )
     require(
         buffered_body,
-        "BufHead* bp = fresh_allocation ? xfs_buf_get(ctx, current_disk_block) : xfs_buf_read_data(ctx, current_disk_block)",
-        "fresh partial regular-file writes must avoid reading old data",
+        "BufHead* bp = fresh_allocation ? xfs_buf_get_data(ctx, current_disk_block) : xfs_buf_read_data(ctx, current_disk_block)",
+        "fresh partial regular-file writes must avoid old-data reads and retain file-data classification",
     )
     require(
         buffered_body,

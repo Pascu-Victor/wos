@@ -100,6 +100,8 @@ auto block_device_find_by_name(const char* name) -> BlockDevice*;
 // Helper functions for block I/O
 auto block_read(BlockDevice* bdev, uint64_t block, size_t count, void* buffer) -> int;
 auto block_write(BlockDevice* bdev, uint64_t block, size_t count, const void* buffer) -> int;
+// Issue a durability barrier. Returns -EOPNOTSUPP when the device does not
+// advertise one; callers must not infer durability from a missing callback.
 auto block_flush(BlockDevice* bdev) -> int;
 
 // Partition block device management

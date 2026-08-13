@@ -405,8 +405,8 @@ def test_writer_serializes_metadata_but_releases_it_for_data_io() -> None:
     require_order(
         writer,
         [
-            "try_mapped_write_without_metadata_lock();",
             "XfsMetadataGuard metadata_guard(ctx",
+            "try_mapped_write_with_existing_extent();",
             "ret = xfs_trans_commit(tp);",
             "metadata_guard.unlock();",
             "bool const WROTE = write_extent_data(DISK_BLOCK +",

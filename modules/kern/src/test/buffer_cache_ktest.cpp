@@ -24,6 +24,8 @@ auto null_read(ker::dev::BlockDevice* dev, uint64_t /*block*/, size_t count, voi
 
 auto null_write(ker::dev::BlockDevice* /*dev*/, uint64_t /*block*/, size_t /*count*/, const void* /*buffer*/) -> int { return 0; }
 
+auto null_flush(ker::dev::BlockDevice* /*dev*/) -> int { return 0; }
+
 struct RecordingWriteState {
     size_t write_calls = 0;
     uint64_t last_write_block = 0;
@@ -122,6 +124,7 @@ auto make_null_bdev() -> ker::dev::BlockDevice {
     d.total_blocks = 2048;
     d.read_blocks = null_read;
     d.write_blocks = null_write;
+    d.flush = null_flush;
     return d;
 }
 
@@ -315,6 +318,66 @@ KTEST(BufferCache, FailedBwriteMarksCleanBufferDirtyForRetry) {
     KEXPECT_EQ(ker::vfs::sync_blockdev(&dev), 0);
     KEXPECT_EQ(io.write_calls, static_cast<size_t>(1));
     KEXPECT_FALSE(ker::vfs::has_dirty_bdev_range(&dev, BLOCK_NO, 1));
+    ker::vfs::invalidate_bdev(&dev);
+}
+
+KTEST(BufferCache, OrderedFileDataSyncExcludesUnrelatedDirtyBuffers) {
+    ker::dev::BlockDevice dev = make_null_bdev();
+    RecordingWriteState io{};
+    dev.write_blocks = recording_write;
+    dev.private_data = &io;
+    ker::vfs::invalidate_bdev(&dev);
+
+    constexpr uint64_t METADATA_BLOCK = 40;
+    constexpr uint64_t DATA_BLOCK = 80;
+    ker::vfs::BufHead* metadata = ker::vfs::bget(&dev, METADATA_BLOCK, ker::vfs::BufferReadClass::FILESYSTEM_METADATA);
+    ker::vfs::BufHead* data = ker::vfs::bget(&dev, DATA_BLOCK, ker::vfs::BufferReadClass::FILE_DATA);
+    KREQUIRE_NE(metadata, nullptr);
+    KREQUIRE_NE(data, nullptr);
+    metadata->data[0] = 0xA5;
+    data->data[0] = 0x5A;
+    ker::vfs::bdirty(metadata);
+    ker::vfs::bdirty(data);
+    ker::vfs::brelse(metadata);
+    ker::vfs::brelse(data);
+
+    KEXPECT_EQ(ker::vfs::sync_blockdev_file_data(&dev), 0);
+    KEXPECT_EQ(io.write_calls, static_cast<size_t>(1));
+    KEXPECT_EQ(io.write_blocks[0], DATA_BLOCK);
+    KEXPECT_TRUE(ker::vfs::has_dirty_bdev_range(&dev, METADATA_BLOCK, 1));
+    KEXPECT_FALSE(ker::vfs::has_dirty_bdev_range(&dev, DATA_BLOCK, 1));
+
+    KEXPECT_EQ(ker::vfs::sync_blockdev(&dev), 0);
+    KEXPECT_EQ(io.write_calls, static_cast<size_t>(2));
+    KEXPECT_EQ(io.write_blocks[1], METADATA_BLOCK);
+    KEXPECT_FALSE(ker::vfs::has_dirty_bdev_range(&dev, METADATA_BLOCK, 1));
+    ker::vfs::invalidate_bdev(&dev);
+}
+
+KTEST(BufferCache, MetadataReuseClearsFileDataWritebackClassification) {
+    ker::dev::BlockDevice dev = make_null_bdev();
+    RecordingWriteState io{};
+    dev.write_blocks = recording_write;
+    dev.private_data = &io;
+    ker::vfs::invalidate_bdev(&dev);
+
+    constexpr uint64_t REUSED_BLOCK = 96;
+    ker::vfs::BufHead* reused = ker::vfs::bget(&dev, REUSED_BLOCK, ker::vfs::BufferReadClass::FILE_DATA);
+    KREQUIRE_NE(reused, nullptr);
+    reused->data[0] = 0xC3;
+    ker::vfs::bdirty(reused);
+    ker::vfs::brelse(reused);
+
+    reused = ker::vfs::bget(&dev, REUSED_BLOCK, ker::vfs::BufferReadClass::FILESYSTEM_METADATA);
+    KREQUIRE_NE(reused, nullptr);
+    KEXPECT_EQ(reused->flags & ker::vfs::BH_FILE_DATA, 0U);
+    ker::vfs::brelse(reused);
+
+    KEXPECT_EQ(ker::vfs::sync_blockdev_file_data(&dev), 0);
+    KEXPECT_EQ(io.write_calls, static_cast<size_t>(0));
+    KEXPECT_TRUE(ker::vfs::has_dirty_bdev_range(&dev, REUSED_BLOCK, 1));
+    KEXPECT_EQ(ker::vfs::sync_blockdev(&dev), 0);
+    KEXPECT_EQ(io.write_calls, static_cast<size_t>(1));
     ker::vfs::invalidate_bdev(&dev);
 }
 

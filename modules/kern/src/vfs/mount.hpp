@@ -17,11 +17,12 @@ struct MountPoint {
     FSType fs_type{};                 // Filesystem type enum
     ker::dev::BlockDevice* device{};  // Associated block device
     ker::dev::BlockWriterLease block_writer_lease{};
-    FileOperations* fops{};         // Filesystem operations
-    void* private_data{};           // Filesystem-specific data
-    uint32_t dev_id{};              // Unique synthetic st_dev for this mount
-    bool read_only{};               // True when this mount must reject filesystem mutations
-    std::atomic<uint32_t> refs{0};  // Active users that outlive mount_lock
+    FileOperations* fops{};               // Filesystem operations
+    void* private_data{};                 // Filesystem-specific data
+    uint32_t dev_id{};                    // Unique synthetic st_dev for this mount
+    bool read_only{};                     // True when this mount must reject filesystem mutations
+    std::atomic<uint32_t> refs{0};        // Active users that outlive mount_lock
+    std::atomic<uint32_t> open_files{0};  // File objects whose backend state belongs to this mount
     std::atomic<bool> retiring{false};
 };
 
@@ -91,9 +92,12 @@ auto get_mount_count() -> size_t;
 auto get_mount_at(size_t index) -> MountRef;
 auto get_mount_snapshot_at(size_t index, MountSnapshot* out) -> bool;
 void put_mount_point(MountPoint* mount);
+auto retain_mount_for_open_file(MountPoint* mount) -> bool;
+void release_mount_from_open_file(MountPoint* mount);
 
 #ifdef WOS_SELFTEST
 auto mount_point_ref_count_for_test(const MountPoint* mount) -> uint32_t;
+auto mount_point_open_file_count_for_test(const MountPoint* mount) -> uint32_t;
 void mount_lookup_cache_reset_for_test();
 auto mount_lookup_cache_hits_for_test() -> uint64_t;
 auto mount_lookup_calls_for_test() -> uint64_t;

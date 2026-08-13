@@ -164,16 +164,18 @@ def main() -> None:
         if needle not in haystack:
             fail(f"missing {description}")
     for needle, description in (
-        ("home_metadata_clean = xfs_sync_mount(ctx) == 0;", "clean-home log discard gate"),
-        ("xfs_log_unmount(ctx, home_metadata_clean);", "clean-home state passed to log teardown"),
+        ("int const SYNC_RC = xfs_sync_mount(ctx);", "retryable clean-home log publication gate"),
+        ("int const LOG_RC = xfs_log_unmount(ctx, home_metadata_clean);", "clean-home state passed to retryable log teardown"),
     ):
         if needle not in mount_source:
             fail(f"missing {description}")
     for needle, description in (
-        ("if (home_metadata_clean && FLUSH_RC == 0)", "log clearing only after successful home sync and final flush"),
-        ("auto xfs_log_clear_clean(", "clean log erasure helper"),
-        ("__builtin_memset(bh->data, 0, bh->size);", "complete clean log block erasure"),
-        ("int const RC = bwrite(bh);", "synchronous clean log erasure"),
+        ("if (home_metadata_clean)", "clean marker publication only after successful home sync"),
+        ("auto xfs_log_mark_clean_locked(", "locked clean marker publication helper"),
+        ("auto xfs_log_clear_clean(", "standard clean-unmount record helper"),
+        ("int rc = xfs_log_write_record(log, body.data(), body.size(), 1, false, true);", "standard clean-unmount record write"),
+        ("rc = flush_blockdev(mount->device);", "clean record durability barrier"),
+        ("log->clean = false;", "failed publication remains dirty and retryable"),
     ):
         if needle not in log_source:
             fail(f"missing {description}")

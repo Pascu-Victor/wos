@@ -24,8 +24,8 @@ auto find_device(const char* driver) -> net::NetDeviceRef {
     std::string_view const DRIVER_NAME{driver};
     auto* f = ker::vfs::vfs_open_file(NETDEVS_PATH, 0, 0);
     if (f == nullptr || f->fops == nullptr || f->fops->vfs_read == nullptr) {
-        if (f != nullptr && f->fops != nullptr && f->fops->vfs_close != nullptr) {
-            f->fops->vfs_close(f);
+        if (f != nullptr) {
+            static_cast<void>(ker::vfs::vfs_close_file(f));
         }
         ker::mod::dbg::log("[netdevconf] %s not found, using hardcoded defaults", NETDEVS_PATH);
         return {};
@@ -33,9 +33,7 @@ auto find_device(const char* driver) -> net::NetDeviceRef {
 
     std::array<char, BUF_SIZE> buf{};
     ssize_t const N = f->fops->vfs_read(f, buf.data(), buf.size() - 1, 0);
-    if (f->fops->vfs_close != nullptr) {
-        f->fops->vfs_close(f);
-    }
+    static_cast<void>(ker::vfs::vfs_close_file(f));
     if (N <= 0) {
         return {};
     }

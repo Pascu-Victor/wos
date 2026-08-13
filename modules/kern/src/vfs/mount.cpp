@@ -34,6 +34,12 @@ namespace ker::vfs {
 // Mount point registry
 namespace {
 ker::util::SmallVec<MountPoint*, 8> mounts;
+struct MountInitialization {
+    std::array<char, MOUNT_PATH_MAX> path{};
+    bool active = false;
+};
+constexpr size_t MAX_MOUNT_INITIALIZATIONS = 64;
+std::array<MountInitialization, MAX_MOUNT_INITIALIZATIONS> mount_initializations{};
 mod::sys::Spinlock mount_lock;  // Protects mounts and mount_count
 std::atomic<uint64_t> mount_generation{1};
 // Even values admit mount-table publication. remap_mounts_for_pivot() makes
@@ -296,7 +302,8 @@ auto apply_current_task_root_prefix(const char* path, char* out, size_t outsize)
 }
 
 auto mount_has_active_refs_locked(const MountPoint* mount) -> bool {
-    return mount != nullptr && mount->refs.load(std::memory_order_acquire) != 0;
+    return mount != nullptr && (mount->refs.load(std::memory_order_acquire) != 0 ||
+                                mount->open_files.load(std::memory_order_acquire) != 0 || mount->retiring.load(std::memory_order_acquire));
 }
 
 auto retain_mount_locked(MountPoint* mount) -> bool {
@@ -308,6 +315,103 @@ auto retain_mount_locked(MountPoint* mount) -> bool {
 }
 
 void bump_mount_generation_locked() { mount_generation.fetch_add(1, std::memory_order_acq_rel); }
+
+constexpr size_t MOUNT_INDEX_NONE = static_cast<size_t>(-1);
+
+auto mount_index_locked(const MountPoint* mount) -> size_t {
+    for (size_t i = 0; i < mounts.size(); ++i) {
+        if (mounts.at(i) == mount) {
+            return i;
+        }
+    }
+    return MOUNT_INDEX_NONE;
+}
+
+auto mount_path_occupied_locked(const char* path) -> bool {
+    if (path == nullptr) {
+        return false;
+    }
+    for (auto* mount : mounts) {
+        if (mount != nullptr && mount->path != nullptr && std::strcmp(mount->path, path) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+auto mount_path_initializing_locked(const char* path) -> bool {
+    if (path == nullptr) {
+        return false;
+    }
+    for (const auto& initialization : mount_initializations) {
+        if (initialization.active && std::strcmp(initialization.path.data(), path) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+class MountInitializationReservation {
+   public:
+    MountInitializationReservation() = default;
+    MountInitializationReservation(const MountInitializationReservation&) = delete;
+    auto operator=(const MountInitializationReservation&) -> MountInitializationReservation& = delete;
+    ~MountInitializationReservation() { reset(); }
+
+    auto acquire(const char* path, uint64_t pivot_epoch) -> int {
+        if (path == nullptr || index_ != MOUNT_INDEX_NONE) {
+            return -EINVAL;
+        }
+        size_t const PATH_LEN = std::strlen(path);
+        if (PATH_LEN >= MOUNT_PATH_MAX) {
+            return -ENAMETOOLONG;
+        }
+
+        mount_lock.lock();
+        if (mount_pivot_epoch.load(std::memory_order_acquire) != pivot_epoch || mount_path_occupied_locked(path) ||
+            mount_path_initializing_locked(path)) {
+            mount_lock.unlock();
+            return -EBUSY;
+        }
+        for (size_t i = 0; i < mount_initializations.size(); ++i) {
+            auto& initialization = mount_initializations.at(i);
+            if (initialization.active) {
+                continue;
+            }
+            std::memcpy(initialization.path.data(), path, PATH_LEN + 1);
+            initialization.active = true;
+            index_ = i;
+            mount_lock.unlock();
+            return 0;
+        }
+        mount_lock.unlock();
+        return -EAGAIN;
+    }
+
+    auto active_locked() const -> bool { return index_ < mount_initializations.size() && mount_initializations.at(index_).active; }
+
+    void commit_locked() {
+        if (!active_locked()) {
+            return;
+        }
+        auto& initialization = mount_initializations.at(index_);
+        initialization.active = false;
+        initialization.path.at(0) = '\0';
+        index_ = MOUNT_INDEX_NONE;
+    }
+
+    void reset() {
+        if (index_ == MOUNT_INDEX_NONE) {
+            return;
+        }
+        mount_lock.lock();
+        commit_locked();
+        mount_lock.unlock();
+    }
+
+   private:
+    size_t index_ = MOUNT_INDEX_NONE;
+};
 
 auto mount_lookup_known_path_len(const char* path, size_t known_path_len) -> size_t {
     if (known_path_len != UNKNOWN_MOUNT_PATH_LEN) {
@@ -575,18 +679,27 @@ void mount_root_fallback_cache_store(const char* path, size_t component_len, Mou
     set.lock.unlock();
 }
 
-void destroy_mount_private_data(MountPoint* mount) {
+auto destroy_mount_private_data(MountPoint* mount, bool force) -> int {
     if (mount == nullptr || mount->private_data == nullptr) {
-        return;
+        return 0;
     }
 
     switch (mount->fs_type) {
         case FSType::FAT32:
             ker::vfs::fat32::fat32_unmount(static_cast<ker::vfs::fat32::FAT32MountContext*>(mount->private_data));
             break;
-        case FSType::XFS:
-            ker::vfs::xfs::xfs_unmount(static_cast<ker::vfs::xfs::XfsMountContext*>(mount->private_data));
+        case FSType::XFS: {
+            auto* context = static_cast<ker::vfs::xfs::XfsMountContext*>(mount->private_data);
+            if (force) {
+                ker::vfs::xfs::xfs_unmount_force(context);
+            } else {
+                int const RET = ker::vfs::xfs::xfs_unmount(context);
+                if (RET != 0) {
+                    return RET;
+                }
+            }
             break;
+        }
         case FSType::TMPFS:
             ker::vfs::tmpfs::destroy_mount_context(static_cast<ker::vfs::tmpfs::TmpfsMount*>(mount->private_data));
             break;
@@ -594,16 +707,28 @@ void destroy_mount_private_data(MountPoint* mount) {
             break;
     }
     mount->private_data = nullptr;
+    return 0;
 }
 
-void destroy_mount(MountPoint* mount) {
+void destroy_mount_storage(MountPoint* mount) {
     if (mount == nullptr) {
         return;
     }
-    destroy_mount_private_data(mount);
     delete[] mount->path;
     delete[] mount->fstype;
     delete mount;
+}
+
+auto destroy_mount(MountPoint* mount, bool force = false) -> int {
+    if (mount == nullptr) {
+        return 0;
+    }
+    int const RET = destroy_mount_private_data(mount, force);
+    if (RET != 0) {
+        return RET;
+    }
+    destroy_mount_storage(mount);
+    return 0;
 }
 
 void wait_for_mount_refs_to_drain(MountPoint* mount) {
@@ -634,6 +759,78 @@ auto wait_for_mount_refs_to_drain_bounded(MountPoint* mount) -> bool {
         }
     }
     return mount->refs.load(std::memory_order_acquire) == 0;
+}
+
+void rollback_mount_retirement(MountPoint* mount) {
+    if (mount == nullptr) {
+        return;
+    }
+    mount_lock.lock();
+    if (mount_index_locked(mount) != MOUNT_INDEX_NONE && mount->retiring.load(std::memory_order_acquire)) {
+        mount->retiring.store(false, std::memory_order_release);
+        bump_mount_generation_locked();
+    }
+    mount_lock.unlock();
+}
+
+auto complete_retired_mount_teardown(MountPoint* mount, bool bounded_ref_wait, size_t* mount_count_after_remove) -> int {
+    if (mount == nullptr) {
+        return -EINVAL;
+    }
+
+    bool refs_drained = true;
+    if (bounded_ref_wait) {
+        refs_drained = wait_for_mount_refs_to_drain_bounded(mount);
+    } else {
+        wait_for_mount_refs_to_drain(mount);
+    }
+    if (!refs_drained) {
+        log::warn("unmount busy: path=%s refs=%u", mount->path != nullptr ? mount->path : "?", mount->refs.load(std::memory_order_acquire));
+        rollback_mount_retirement(mount);
+        return -EBUSY;
+    }
+
+    mount_lock.lock();
+    size_t const INDEX = mount_index_locked(mount);
+    if (INDEX == MOUNT_INDEX_NONE || !mount->retiring.load(std::memory_order_acquire)) {
+        mount_lock.unlock();
+        return -ENOENT;
+    }
+    uint32_t const OPEN_FILES = mount->open_files.load(std::memory_order_acquire);
+    if (OPEN_FILES != 0) {
+        mount->retiring.store(false, std::memory_order_release);
+        bump_mount_generation_locked();
+        mount_lock.unlock();
+        log::warn("unmount busy: path=%s open_files=%u", mount->path != nullptr ? mount->path : "?", OPEN_FILES);
+        return -EBUSY;
+    }
+    mount_lock.unlock();
+
+    // The mount stays published as an unretainable tombstone while backend
+    // closeout performs blocking I/O. A failed XFS teardown leaves its
+    // context live, so reopening publication makes the failure retryable.
+    int const DESTROY_RET = destroy_mount_private_data(mount, false);
+    if (DESTROY_RET != 0) {
+        rollback_mount_retirement(mount);
+        return DESTROY_RET;
+    }
+
+    mount_lock.lock();
+    size_t const REMOVE_INDEX = mount_index_locked(mount);
+    if (REMOVE_INDEX == MOUNT_INDEX_NONE) {
+        mount_lock.unlock();
+        log::warn("unmount lost retiring mount after backend teardown");
+        return -EIO;
+    }
+    mounts.remove_at(REMOVE_INDEX);
+    bump_mount_generation_locked();
+    if (mount_count_after_remove != nullptr) {
+        *mount_count_after_remove = mounts.size();
+    }
+    mount_lock.unlock();
+
+    destroy_mount_storage(mount);
+    return 0;
 }
 
 auto sync_mount_for_shutdown(MountPoint* mount) -> int {
@@ -716,6 +913,35 @@ void put_mount_point(MountPoint* mount) {
     }
 }
 
+auto retain_mount_for_open_file(MountPoint* mount) -> bool {
+    if (mount == nullptr) {
+        return false;
+    }
+
+    mount_lock.lock();
+    bool const RETAINED =
+        mount_index_locked(mount) != MOUNT_INDEX_NONE && mount->path != nullptr && !mount->retiring.load(std::memory_order_acquire);
+    if (RETAINED) {
+        mount->open_files.fetch_add(1, std::memory_order_acq_rel);
+    }
+    mount_lock.unlock();
+    return RETAINED;
+}
+
+void release_mount_from_open_file(MountPoint* mount) {
+    if (mount == nullptr) {
+        return;
+    }
+    mount_lock.lock();
+    uint32_t const OPEN_FILES = mount->open_files.load(std::memory_order_acquire);
+    if (OPEN_FILES != 0) {
+        mount->open_files.store(OPEN_FILES - 1, std::memory_order_release);
+    } else {
+        log::warn("open-file mount pin released twice: path=%s", mount->path != nullptr ? mount->path : "?");
+    }
+    mount_lock.unlock();
+}
+
 auto MountRef::operator=(MountRef&& other) noexcept -> MountRef& {
     if (this != &other) {
         put_mount_point(mount_);
@@ -741,6 +967,13 @@ auto mount_point_ref_count_for_test(const MountPoint* mount) -> uint32_t {
         return 0;
     }
     return mount->refs.load(std::memory_order_acquire);
+}
+
+auto mount_point_open_file_count_for_test(const MountPoint* mount) -> uint32_t {
+    if (mount == nullptr) {
+        return 0;
+    }
+    return mount->open_files.load(std::memory_order_acquire);
 }
 
 void mount_lookup_cache_reset_for_test() {
@@ -869,23 +1102,45 @@ auto mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevic
         return PATH_RET;
     }
 
+    // Reject an existing or retiring exact-path mount before filesystem
+    // initialization. Retiring mounts remain in the table specifically so a
+    // replacement cannot run recovery against their still-owned storage.
+    mount_lock.lock();
+    if (mount_pivot_epoch.load(std::memory_order_acquire) != PIVOT_EPOCH) {
+        mount_lock.unlock();
+        return -EBUSY;
+    }
+    if (mount_path_occupied_locked(resolved.data()) || mount_path_initializing_locked(resolved.data())) {
+        mount_lock.unlock();
+        vfs_debug_log("mount_filesystem: mount path already occupied\n");
+        return -EBUSY;
+    }
+    mount_lock.unlock();
+
     auto* mount = new MountPoint;
 
     // Copy resolved path and fstype into kernel heap.
     size_t const PATH_LEN = std::strlen(resolved.data());
     auto* path_copy = new char[PATH_LEN + 1];
     if (path_copy == nullptr) {
-        destroy_mount(mount);
+        static_cast<void>(destroy_mount(mount, true));
         return -ENOMEM;
     }
     std::memcpy(path_copy, resolved.data(), PATH_LEN + 1);
     mount->path = path_copy;
     mount->path_len = PATH_LEN;
 
+    MountInitializationReservation initialization_reservation;
+    int const RESERVATION_RET = initialization_reservation.acquire(mount->path, PIVOT_EPOCH);
+    if (RESERVATION_RET != 0) {
+        static_cast<void>(destroy_mount(mount, true));
+        return RESERVATION_RET;
+    }
+
     size_t const FSTYPE_LEN = std::strlen(fstype);
     auto* fstype_copy = new char[FSTYPE_LEN + 1];
     if (fstype_copy == nullptr) {
-        destroy_mount(mount);
+        static_cast<void>(destroy_mount(mount, true));
         return -ENOMEM;
     }
     std::memcpy(fstype_copy, fstype, FSTYPE_LEN + 1);
@@ -901,7 +1156,7 @@ auto mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevic
     if (BLOCK_RW_FS && device != nullptr && !ker::dev::block_device_is_read_only(device) &&
         !mount->block_writer_lease.try_acquire(device, ker::dev::BlockWriterLeaseOwner::LOCAL_MOUNT)) {
         vfs_debug_log("mount_filesystem: block device has a remote writer lease\n");
-        destroy_mount(mount);
+        static_cast<void>(destroy_mount(mount, true));
         return -EBUSY;
     }
 
@@ -910,7 +1165,7 @@ auto mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevic
         // FAT32 filesystem
         if (device == nullptr) {
             vfs_debug_log("mount_filesystem: FAT32 requires a block device\n");
-            destroy_mount(mount);
+            static_cast<void>(destroy_mount(mount, true));
             return -EINVAL;
         }
 
@@ -932,7 +1187,7 @@ auto mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevic
         auto* context = ker::vfs::fat32::fat32_init_device(device, partition_start_lba);
         if (context == nullptr) {
             vfs_debug_log("mount_filesystem: FAT32 initialization failed\n");
-            destroy_mount(mount);
+            static_cast<void>(destroy_mount(mount, true));
             return -EIO;
         }
 
@@ -951,7 +1206,7 @@ auto mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevic
             if (!ROOT_COMPAT) {
                 ker::vfs::tmpfs::tmpfs_free_node(root);
             }
-            destroy_mount(mount);
+            static_cast<void>(destroy_mount(mount, true));
             return tmpfs_error != 0 ? tmpfs_error : -ENOMEM;
         }
         mount->fops = ker::vfs::tmpfs::get_tmpfs_fops();
@@ -970,20 +1225,20 @@ auto mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevic
         // XFS filesystem
         if (device == nullptr) {
             vfs_debug_log("mount_filesystem: XFS requires a block device\n");
-            destroy_mount(mount);
+            static_cast<void>(destroy_mount(mount, true));
             return -EINVAL;
         }
         auto* xfs_ctx = ker::vfs::xfs::xfs_vfs_init_device(device);
         if (xfs_ctx == nullptr) {
             vfs_debug_log("mount_filesystem: XFS initialization failed\n");
-            destroy_mount(mount);
+            static_cast<void>(destroy_mount(mount, true));
             return -EIO;
         }
         mount->private_data = xfs_ctx;
         mount->fops = ker::vfs::xfs::get_xfs_fops();
     } else {
         vfs_debug_log("mount_filesystem: unknown filesystem type\n");
-        destroy_mount(mount);
+        static_cast<void>(destroy_mount(mount, true));
         return -ENODEV;
     }
 
@@ -992,30 +1247,27 @@ auto mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevic
     if (mount_pivot_epoch.load(std::memory_order_acquire) != PIVOT_EPOCH) {
         mount_lock.unlock();
         vfs_debug_log("mount_filesystem: pivot namespace changed before publication\n");
-        destroy_mount(mount);
+        static_cast<void>(destroy_mount(mount, true));
         return -EBUSY;
     }
-    if (mount->fs_type == FSType::REMOTE) {
-        for (auto* existing : mounts) {
-            if (existing != nullptr && existing->path != nullptr && std::strcmp(existing->path, mount->path) == 0) {
-                mount_lock.unlock();
-                vfs_debug_log("mount_filesystem: remote mount path already occupied\n");
-                destroy_mount(mount);
-                return -EBUSY;
-            }
-        }
+    if (!initialization_reservation.active_locked() || mount_path_occupied_locked(mount->path)) {
+        mount_lock.unlock();
+        vfs_debug_log("mount_filesystem: mount path already occupied before publication\n");
+        static_cast<void>(destroy_mount(mount, true));
+        return -EBUSY;
+    }
+    if (!mounts.push_back(mount)) {
+        mount_lock.unlock();
+        vfs_debug_log("mount_filesystem: mount table full (OOM)\n");
+        static_cast<void>(destroy_mount(mount, true));
+        return -ENOMEM;
     }
     mount->dev_id = next_dev_id++;
     if (mount->fs_type == FSType::XFS && mount->private_data != nullptr) {
         static_cast<ker::vfs::xfs::XfsMountContext*>(mount->private_data)->dev_id = mount->dev_id;
     }
+    initialization_reservation.commit_locked();
     bump_mount_generation_locked();
-    if (!mounts.push_back(mount)) {
-        mount_lock.unlock();
-        vfs_debug_log("mount_filesystem: mount table full (OOM)\n");
-        destroy_mount(mount);
-        return -ENOMEM;
-    }
     mount_count_after_insert = mounts.size();
     mount_lock.unlock();
 
@@ -1044,9 +1296,9 @@ auto unmount_filesystem_impl(const char* path, const void* expected_private_data
         return -EINVAL;
     }
 
-    MountPoint* removed_mount = nullptr;
+    MountPoint* retiring_mount = nullptr;
     size_t mount_count_after_remove = 0;
-    while (removed_mount == nullptr) {
+    while (retiring_mount == nullptr) {
         uint64_t const PIVOT_EPOCH = wait_for_stable_mount_pivot_epoch();
 
         // Resolve again after every pivot retry so the task-root prefix and
@@ -1069,21 +1321,25 @@ auto unmount_filesystem_impl(const char* path, const void* expected_private_data
             if (!PATH_MATCHES || !OWNER_MATCHES) {
                 continue;
             }
+            if (mp->retiring.load(std::memory_order_acquire)) {
+                mount_lock.unlock();
+                return -EBUSY;
+            }
             mp->retiring.store(true, std::memory_order_release);
             bump_mount_generation_locked();
-            mounts.remove_at(i);
-            mount_count_after_remove = mounts.size();
-            removed_mount = mp;
+            retiring_mount = mp;
             break;
         }
         mount_lock.unlock();
-        if (removed_mount == nullptr) {
+        if (retiring_mount == nullptr) {
             return -ENOENT;
         }
     }
 
-    wait_for_mount_refs_to_drain(removed_mount);
-    destroy_mount(removed_mount);
+    int const UNMOUNT_RET = complete_retired_mount_teardown(retiring_mount, false, &mount_count_after_remove);
+    if (UNMOUNT_RET != 0) {
+        return UNMOUNT_RET;
+    }
 
     ker::mod::perf::record_container_stat(0, 0, ker::mod::perf::PerfSubsystem::MOUNT_TABLE, 0, ker::mod::perf::PERF_FLAG_CT_REMOVE,
                                           static_cast<int64_t>(mount_count_after_remove), 0, 0);
@@ -1132,13 +1388,15 @@ auto unmount_filesystem_by_private_data(const void* expected_private_data) -> in
             if (MP == nullptr || MP->private_data != expected_private_data) {
                 continue;
             }
+            if (MP->retiring.load(std::memory_order_acquire)) {
+                mount_lock.unlock();
+                return -EBUSY;
+            }
             if (MP->path != nullptr) {
                 std::snprintf(mounted_path.data(), mounted_path.size(), "%s", MP->path);
             }
             MP->retiring.store(true, std::memory_order_release);
             bump_mount_generation_locked();
-            mounts.remove_at(i);
-            mount_count_after_remove = mounts.size();
             owned_mount = MP;
             break;
         }
@@ -1148,8 +1406,10 @@ auto unmount_filesystem_by_private_data(const void* expected_private_data) -> in
         }
     }
 
-    wait_for_mount_refs_to_drain(owned_mount);
-    destroy_mount(owned_mount);
+    int const UNMOUNT_RET = complete_retired_mount_teardown(owned_mount, false, &mount_count_after_remove);
+    if (UNMOUNT_RET != 0) {
+        return UNMOUNT_RET;
+    }
     ker::mod::perf::record_container_stat(0, 0, ker::mod::perf::PerfSubsystem::MOUNT_TABLE, 0, ker::mod::perf::PERF_FLAG_CT_REMOVE,
                                           static_cast<int64_t>(mount_count_after_remove), 0, 0);
 
@@ -1192,18 +1452,28 @@ auto shutdown_unmount_all_exact(const char* root_path) -> int {
         delete[] pending;
         return -EBUSY;
     }
-    while (!mounts.empty() && pending_count < COUNT) {
-        auto* mp = mounts.at(0);
-        if (mp != nullptr) {
-            mp->retiring.store(true, std::memory_order_release);
-            pending[pending_count++] = mp;
+    for (size_t i = 0; i < mounts.size() && pending_count < COUNT; ++i) {
+        auto* mp = mounts.at(i);
+        if (mp == nullptr) {
+            continue;
         }
-        bump_mount_generation_locked();
-        mounts.remove_at(0);
+        if (mp->retiring.load(std::memory_order_acquire)) {
+            if (result == 0) {
+                result = -EBUSY;
+            }
+            continue;
+        }
+        mp->retiring.store(true, std::memory_order_release);
+        pending[pending_count++] = mp;
     }
-    if (!mounts.empty()) {
-        log::warn("shutdown unmount table changed while snapshotting; %lu mounts remain", static_cast<unsigned long>(mounts.size()));
-        result = -EAGAIN;
+    if (pending_count != 0) {
+        bump_mount_generation_locked();
+    }
+    if (mounts.size() > COUNT) {
+        log::warn("shutdown mount table changed while snapshotting; %lu mounts now published", static_cast<unsigned long>(mounts.size()));
+        if (result == 0) {
+            result = -EAGAIN;
+        }
     }
     mount_lock.unlock();
 
@@ -1216,21 +1486,26 @@ auto shutdown_unmount_all_exact(const char* root_path) -> int {
         }
 
         int const SYNC_RET = sync_mount_for_shutdown(mp);
-        if (SYNC_RET != 0 && result == 0) {
-            result = SYNC_RET;
-        }
-
-        if (!wait_for_mount_refs_to_drain_bounded(mp)) {
-            log::warn("shutdown unmount busy: path=%s refs=%u", mp->path != nullptr ? mp->path : "?",
-                      mp->refs.load(std::memory_order_acquire));
+        if (SYNC_RET != 0) {
             if (result == 0) {
-                result = -EBUSY;
+                result = SYNC_RET;
             }
+            rollback_mount_retirement(mp);
             continue;
         }
 
-        log::info("shutdown unmounted %s", mp->path != nullptr ? mp->path : "?");
-        destroy_mount(mp);
+        std::array<char, MAX_MOUNT_PATH> mounted_path{};
+        if (mp->path != nullptr) {
+            std::snprintf(mounted_path.data(), mounted_path.size(), "%s", mp->path);
+        }
+        int const UNMOUNT_RET = complete_retired_mount_teardown(mp, true, nullptr);
+        if (UNMOUNT_RET != 0) {
+            if (result == 0) {
+                result = UNMOUNT_RET;
+            }
+            continue;
+        }
+        log::info("shutdown unmounted %s", mounted_path.data());
     }
 
     delete[] pending;
@@ -1339,6 +1614,9 @@ auto configure_mount_point_exact(const char* path, FSType expected_type, void* p
             if (mp == nullptr || mp->path == nullptr) {
                 continue;
             }
+            if (mp->retiring.load(std::memory_order_acquire)) {
+                continue;
+            }
             if (mp->fs_type != expected_type) {
                 continue;
             }
@@ -1385,6 +1663,11 @@ auto remap_mounts_for_pivot(const char* new_root, const char* put_old) -> int {
     for (auto* mp : mounts) {
         if (mp == nullptr || mp->path == nullptr) {
             continue;
+        }
+        if (mp->retiring.load(std::memory_order_acquire)) {
+            mount_pivot_epoch.store(ODD_EPOCH + 1, std::memory_order_release);
+            mount_lock.unlock();
+            return -EBUSY;
         }
         if (std::strcmp(mp->path, new_root) == 0) {
             new_mount = mp;

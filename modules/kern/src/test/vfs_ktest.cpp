@@ -162,7 +162,7 @@ KTEST(VFS, CreateAndStat) {
 
     ker::vfs::File* f = ker::vfs::vfs_open_file("/tmp/ktest_create", ker::vfs::O_CREAT | 1, 0644);
     KREQUIRE_NE(f, nullptr);
-    ker::vfs::tmpfs::tmpfs_fops_close(f);
+    static_cast<void>(ker::vfs::vfs_close_file(f));
 
     ker::vfs::Stat st{};
     KEXPECT_EQ(ker::vfs::vfs_stat("/tmp/ktest_create", &st), 0);
@@ -189,7 +189,7 @@ KTEST(VFS, UtimensatUpdatesTmpfsTimestamps) {
 
     ker::vfs::File* f = ker::vfs::vfs_open_file(PATH, ker::vfs::O_CREAT | 1, 0644);
     KREQUIRE_NE(f, nullptr);
-    ker::vfs::tmpfs::tmpfs_fops_close(f);
+    static_cast<void>(ker::vfs::vfs_close_file(f));
 
     ker::vfs::Timespec times[2] = {
         {.tv_sec = 1234, .tv_nsec = 567},
@@ -261,7 +261,7 @@ KTEST(VFS, MetadataCacheInvalidatesPathMutation) {
 
     ker::vfs::File* f = ker::vfs::vfs_open_file(PATH, ker::vfs::O_CREAT | 1, 0644);
     KREQUIRE_NE(f, nullptr);
-    ker::vfs::tmpfs::tmpfs_fops_close(f);
+    static_cast<void>(ker::vfs::vfs_close_file(f));
 
     KEXPECT_EQ(ker::vfs::vfs_stat(PATH, &st), 0);
     KEXPECT_TRUE((st.st_mode & ker::vfs::S_IFREG) != 0U);
@@ -515,7 +515,7 @@ KTEST(VFS, WriteRead) {
     }
     ssize_t const NW = ker::vfs::tmpfs::tmpfs_write(wf, static_cast<const void*>(wbuf), 128, 0);
     KEXPECT_EQ(NW, static_cast<ssize_t>(128));
-    ker::vfs::tmpfs::tmpfs_fops_close(wf);
+    static_cast<void>(ker::vfs::vfs_close_file(wf));
 
     ker::vfs::File* rf = ker::vfs::vfs_open_file("/tmp/ktest_wr", 0, 0);
     KREQUIRE_NE(rf, nullptr);
@@ -523,7 +523,7 @@ KTEST(VFS, WriteRead) {
     uint8_t rbuf[128] = {};
     ssize_t const NR = ker::vfs::tmpfs::tmpfs_read(rf, static_cast<void*>(rbuf), 128, 0);
     KEXPECT_EQ(NR, static_cast<ssize_t>(128));
-    ker::vfs::tmpfs::tmpfs_fops_close(rf);
+    static_cast<void>(ker::vfs::vfs_close_file(rf));
 
     bool match = true;
     for (int i = 0; i < 128; ++i) {
@@ -559,7 +559,7 @@ KTEST(VFS, TmpfsRejectedWritePreservesExistingData) {
     KEXPECT_EQ(READ, static_cast<ssize_t>(DATA_LEN));
     KEXPECT_TRUE(memcmp(static_cast<const void*>(rbuf), static_cast<const void*>(DATA), DATA_LEN) == 0);
 
-    ker::vfs::tmpfs::tmpfs_fops_close(f);
+    static_cast<void>(ker::vfs::vfs_close_file(f));
     ker::vfs::vfs_unlink(PATH);
 }
 
@@ -574,13 +574,13 @@ KTEST(VFS, TmpfsOpenTruncatesExistingFile) {
     KREQUIRE_NE(f, nullptr);
     ssize_t const OLD_WRITE = ker::vfs::tmpfs::tmpfs_write(f, static_cast<const void*>(OLD), sizeof(OLD) - 1, 0);
     KEXPECT_EQ(OLD_WRITE, static_cast<ssize_t>(sizeof(OLD) - 1));
-    ker::vfs::tmpfs::tmpfs_fops_close(f);
+    static_cast<void>(ker::vfs::vfs_close_file(f));
 
     f = ker::vfs::vfs_open_file(PATH, ker::vfs::O_CREAT | ker::vfs::O_TRUNC | 1, 0644);
     KREQUIRE_NE(f, nullptr);
     ssize_t const NEW_WRITE = ker::vfs::tmpfs::tmpfs_write(f, static_cast<const void*>(NEW), sizeof(NEW) - 1, 0);
     KEXPECT_EQ(NEW_WRITE, static_cast<ssize_t>(sizeof(NEW) - 1));
-    ker::vfs::tmpfs::tmpfs_fops_close(f);
+    static_cast<void>(ker::vfs::vfs_close_file(f));
 
     f = ker::vfs::vfs_open_file(PATH, 0, 0);
     KREQUIRE_NE(f, nullptr);
@@ -588,16 +588,16 @@ KTEST(VFS, TmpfsOpenTruncatesExistingFile) {
     ssize_t const READ = ker::vfs::tmpfs::tmpfs_read(f, static_cast<void*>(rbuf), sizeof(rbuf), 0);
     KEXPECT_EQ(READ, static_cast<ssize_t>(sizeof(NEW) - 1));
     KEXPECT_TRUE(memcmp(static_cast<const void*>(rbuf), static_cast<const void*>(NEW), sizeof(NEW) - 1) == 0);
-    ker::vfs::tmpfs::tmpfs_fops_close(f);
+    static_cast<void>(ker::vfs::vfs_close_file(f));
 
     f = ker::vfs::vfs_open_file(PATH, ker::vfs::O_TRUNC | 1, 0644);
     KREQUIRE_NE(f, nullptr);
-    ker::vfs::tmpfs::tmpfs_fops_close(f);
+    static_cast<void>(ker::vfs::vfs_close_file(f));
 
     f = ker::vfs::vfs_open_file(PATH, 0, 0);
     KREQUIRE_NE(f, nullptr);
     KEXPECT_EQ(ker::vfs::tmpfs::tmpfs_read(f, static_cast<void*>(rbuf), sizeof(rbuf), 0), static_cast<ssize_t>(0));
-    ker::vfs::tmpfs::tmpfs_fops_close(f);
+    static_cast<void>(ker::vfs::vfs_close_file(f));
 
     ker::vfs::vfs_unlink(PATH);
 }
@@ -607,7 +607,7 @@ KTEST(VFS, Unlink) {
 
     ker::vfs::File* f = ker::vfs::vfs_open_file("/tmp/ktest_unlink", ker::vfs::O_CREAT | 1, 0644);
     KREQUIRE_NE(f, nullptr);
-    ker::vfs::tmpfs::tmpfs_fops_close(f);
+    static_cast<void>(ker::vfs::vfs_close_file(f));
 
     KEXPECT_EQ(ker::vfs::vfs_unlink("/tmp/ktest_unlink"), 0);
 
@@ -720,7 +720,7 @@ KTEST(VFS, RealpathFastPathFollowsSimpleSymlink) {
     KEXPECT_EQ(ker::vfs::vfs_symlink(TARGET, LINK), 0);
     ker::vfs::File* file = ker::vfs::vfs_open_file(FILE_PATH, ker::vfs::O_CREAT | 1, 0644);
     KREQUIRE_NE(file, nullptr);
-    ker::vfs::tmpfs::tmpfs_fops_close(file);
+    static_cast<void>(ker::vfs::vfs_close_file(file));
 
     char buf[512]{};
     KEXPECT_EQ(ker::vfs::vfs_realpath(LINK, buf, sizeof(buf)), 0);
@@ -773,7 +773,7 @@ KTEST(VFS, TmpfsMountHasSeparateRoot) {
 
     ker::vfs::File* root_file = ker::vfs::vfs_open_file(ROOT_ONLY_FILE, ker::vfs::O_CREAT | 1, 0644);
     KREQUIRE_NE(root_file, nullptr);
-    ker::vfs::tmpfs::tmpfs_fops_close(root_file);
+    static_cast<void>(ker::vfs::vfs_close_file(root_file));
 
     KEXPECT_EQ(ker::vfs::vfs_mkdir(MOUNTPOINT, 0755), 0);
     KEXPECT_EQ(ker::vfs::mount_filesystem(MOUNTPOINT, "tmpfs", nullptr), 0);
@@ -781,12 +781,12 @@ KTEST(VFS, TmpfsMountHasSeparateRoot) {
     ker::vfs::File* inherited_tmp = ker::vfs::vfs_open_file(MOUNTED_TMP_DIR, 0, 0);
     KEXPECT_EQ(inherited_tmp, nullptr);
     if (inherited_tmp != nullptr) {
-        ker::vfs::tmpfs::tmpfs_fops_close(inherited_tmp);
+        static_cast<void>(ker::vfs::vfs_close_file(inherited_tmp));
     }
 
     ker::vfs::File* mount_file = ker::vfs::vfs_open_file(MOUNT_FILE, ker::vfs::O_CREAT | 1, 0644);
     KREQUIRE_NE(mount_file, nullptr);
-    ker::vfs::tmpfs::tmpfs_fops_close(mount_file);
+    static_cast<void>(ker::vfs::vfs_close_file(mount_file));
 
     ker::vfs::Stat st{};
     KEXPECT_EQ(ker::vfs::vfs_stat(MOUNT_FILE, &st), 0);
@@ -835,6 +835,46 @@ KTEST(VFS, MountLookupRefsFencePathMutation) {
 
     mount_ref.reset();
     KEXPECT_EQ(ker::vfs::mount_point_ref_count_for_test(mount), static_cast<uint32_t>(0));
+    KEXPECT_EQ(ker::vfs::unmount_filesystem(MOUNTPOINT), 0);
+    ker::vfs::vfs_rmdir(MOUNTPOINT);
+}
+
+KTEST(VFS, OpenFilePinsMountUntilBackendClose) {
+    constexpr const char* MOUNTPOINT = "/tmp/ktest_mount_open_file";
+    constexpr const char* FILE_PATH = "/tmp/ktest_mount_open_file/file";
+
+    ker::vfs::vfs_mkdir("/tmp", 0755);
+    ker::vfs::unmount_filesystem(MOUNTPOINT);
+    ker::vfs::vfs_rmdir(MOUNTPOINT);
+    KEXPECT_EQ(ker::vfs::vfs_mkdir(MOUNTPOINT, 0755), 0);
+    KREQUIRE_EQ(ker::vfs::mount_filesystem(MOUNTPOINT, "tmpfs", nullptr), 0);
+    KEXPECT_EQ(ker::vfs::mount_filesystem(MOUNTPOINT, "tmpfs", nullptr), -EBUSY);
+
+    ker::vfs::File* file = ker::vfs::vfs_open_file(FILE_PATH, ker::vfs::O_CREAT | 1, 0644);
+    KREQUIRE_NE(file, nullptr);
+
+    ker::vfs::MountRef mount_ref = ker::vfs::find_mount_point(FILE_PATH);
+    KREQUIRE_TRUE(static_cast<bool>(mount_ref));
+    ker::vfs::MountPoint* mount = mount_ref.get();
+    uint32_t const MOUNT_DEV_ID = mount->dev_id;
+    KEXPECT_EQ(file->mount_owner, mount);
+    KEXPECT_EQ(ker::vfs::mount_point_open_file_count_for_test(mount), static_cast<uint32_t>(1));
+    mount_ref.reset();
+
+    KEXPECT_EQ(ker::vfs::unmount_filesystem(MOUNTPOINT), -EBUSY);
+    ker::vfs::MountRef after_busy = ker::vfs::find_mount_point(FILE_PATH);
+    KREQUIRE_TRUE(static_cast<bool>(after_busy));
+    KEXPECT_EQ(after_busy->dev_id, MOUNT_DEV_ID);
+    KEXPECT_FALSE(after_busy->retiring.load(std::memory_order_acquire));
+    KEXPECT_EQ(ker::vfs::mount_point_open_file_count_for_test(after_busy.get()), static_cast<uint32_t>(1));
+    after_busy.reset();
+
+    KEXPECT_EQ(ker::vfs::vfs_close_file(file), 0);
+    ker::vfs::MountRef after_close = ker::vfs::find_mount_point(MOUNTPOINT);
+    KREQUIRE_TRUE(static_cast<bool>(after_close));
+    KEXPECT_EQ(ker::vfs::mount_point_open_file_count_for_test(after_close.get()), static_cast<uint32_t>(0));
+    after_close.reset();
+
     KEXPECT_EQ(ker::vfs::unmount_filesystem(MOUNTPOINT), 0);
     ker::vfs::vfs_rmdir(MOUNTPOINT);
 }
@@ -894,7 +934,7 @@ KTEST(VFS, AppendMode) {
     KEXPECT_EQ(NW1, static_cast<ssize_t>(L1));
     ssize_t const NW2 = ker::vfs::tmpfs::tmpfs_write(f, static_cast<const void*>(CHUNK2), L2, L1);
     KEXPECT_EQ(NW2, static_cast<ssize_t>(L2));
-    ker::vfs::tmpfs::tmpfs_fops_close(f);
+    static_cast<void>(ker::vfs::vfs_close_file(f));
 
     ker::vfs::File* rf = ker::vfs::vfs_open_file("/tmp/ktest_append", 0, 0);
     KREQUIRE_NE(rf, nullptr);
@@ -902,7 +942,7 @@ KTEST(VFS, AppendMode) {
     char rbuf[32] = {};
     ssize_t const NR = ker::vfs::tmpfs::tmpfs_read(rf, static_cast<void*>(rbuf), L1 + L2, 0);
     KEXPECT_EQ(NR, static_cast<ssize_t>(L1 + L2));
-    ker::vfs::tmpfs::tmpfs_fops_close(rf);
+    static_cast<void>(ker::vfs::vfs_close_file(rf));
 
     KEXPECT_TRUE(memcmp(static_cast<const void*>(rbuf), "Hello, World!", L1 + L2) == 0);
 
@@ -937,8 +977,8 @@ KTEST(VFS, TmpfsAppendUsesCurrentEnd) {
     KEXPECT_EQ(READ, static_cast<ssize_t>(FIRST_LEN + SECOND_LEN));
     KEXPECT_TRUE(memcmp(static_cast<const void*>(rbuf), "one\ntwo\n", FIRST_LEN + SECOND_LEN) == 0);
 
-    ker::vfs::tmpfs::tmpfs_fops_close(second);
-    ker::vfs::tmpfs::tmpfs_fops_close(first);
+    static_cast<void>(ker::vfs::vfs_close_file(second));
+    static_cast<void>(ker::vfs::vfs_close_file(first));
     ker::vfs::vfs_unlink("/tmp/ktest_append_current_end");
 }
 
@@ -976,8 +1016,6 @@ KTEST(VFS, WriteReadAligned4K) {
     }
     KEXPECT_TRUE(ok);
 
-    if (f->fops->vfs_close != nullptr) {
-        f->fops->vfs_close(f);
-    }
+    static_cast<void>(ker::vfs::vfs_close_file(f));
     ker::vfs::vfs_unlink("/tmp/ktest_aligned4k");
 }

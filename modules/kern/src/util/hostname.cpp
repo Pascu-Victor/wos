@@ -69,8 +69,8 @@ void init() {
     // Priority 2: /etc/hostname from VFS
     auto* f = ker::vfs::vfs_open_file("/etc/hostname", 0, 0);
     if (f == nullptr || f->fops == nullptr || f->fops->vfs_read == nullptr) {
-        if (f != nullptr && f->fops != nullptr && f->fops->vfs_close != nullptr) {
-            f->fops->vfs_close(f);
+        if (f != nullptr) {
+            static_cast<void>(ker::vfs::vfs_close_file(f));
         }
         ker::mod::dbg::log("[hostname] No /etc/hostname, using default '%s'", s_hostname.data());
         return;
@@ -78,9 +78,7 @@ void init() {
 
     std::array<char, HOSTNAME_MAX + 16> buf{};
     ssize_t const N = f->fops->vfs_read(f, buf.data(), buf.size() - 1, 0);
-    if (f->fops->vfs_close != nullptr) {
-        f->fops->vfs_close(f);
-    }
+    static_cast<void>(ker::vfs::vfs_close_file(f));
     if (N <= 0) {
         return;
     }

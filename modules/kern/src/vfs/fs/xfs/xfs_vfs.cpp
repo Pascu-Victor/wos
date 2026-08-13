@@ -1514,7 +1514,7 @@ auto xfs_vfs_write_locked(File* f, const void* buf, size_t count, size_t offset,
                     size_t const BATCH_BYTES = BATCH_BLOCKS << ctx->block_log;
                     uint64_t const DEV_BLOCK = xfs_fsblock_to_dev_block(ctx, current_disk_block);
                     size_t const DEV_COUNT = xfs_fsb_to_dev_count(ctx, static_cast<xfs_filblks_t>(BATCH_BLOCKS));
-                    BufHead* bp = bget_multi(ctx->device, DEV_BLOCK, DEV_COUNT);
+                    BufHead* bp = bget_multi(ctx->device, DEV_BLOCK, DEV_COUNT, BufferReadClass::FILE_DATA);
                     if (bp == nullptr) {
                         ok = false;
                         break;
@@ -1537,7 +1537,7 @@ auto xfs_vfs_write_locked(File* f, const void* buf, size_t count, size_t offset,
             }
 
             size_t const CHUNK = std::min(ctx->block_size - block_off, remaining_bytes);
-            BufHead* bp = fresh_allocation ? xfs_buf_get(ctx, current_disk_block) : xfs_buf_read_data(ctx, current_disk_block);
+            BufHead* bp = fresh_allocation ? xfs_buf_get_data(ctx, current_disk_block) : xfs_buf_read_data(ctx, current_disk_block);
             if (bp == nullptr) {
                 ok = false;
                 break;
@@ -1566,7 +1566,7 @@ auto xfs_vfs_write_locked(File* f, const void* buf, size_t count, size_t offset,
         return buffered_write(disk_block, initial_block_off, bytes, src_offset, fresh_allocation);
     };
 
-    auto try_mapped_write_without_metadata_lock = [&]() -> ssize_t {
+    auto try_mapped_write_with_existing_extent = [&]() -> ssize_t {
         if (ip->nblocks == 0) {
             return -EAGAIN;
         }
@@ -1615,6 +1615,7 @@ auto xfs_vfs_write_locked(File* f, const void* buf, size_t count, size_t offset,
         if (ip->dirty) {
             xfd->close_may_need_inode_commit = true;
         }
+        ctx->mutation_sequence.fetch_add(1, std::memory_order_release);
         ker::vfs::Stat recent_write_stat{};
         if (xfs_inode_fill_stat(ip, &recent_write_stat) == 0) {
             xfs_recent_write_stat_store(xfd, recent_write_stat);
@@ -1623,12 +1624,15 @@ auto xfs_vfs_write_locked(File* f, const void* buf, size_t count, size_t offset,
         return static_cast<ssize_t>(total_written);
     };
 
-    ssize_t const MAPPED_FAST_RET = try_mapped_write_without_metadata_lock();
+    // Even already-mapped writes can change inode size and timestamps.  Keep
+    // them inside the mount mutation barrier so sync/unmount cannot publish a
+    // clean journal between the inode scan and this fast path dirtying it.
+    XfsMetadataGuard metadata_guard(ctx, true, WOS_PERF_CALLSITE());
+    ssize_t const MAPPED_FAST_RET = try_mapped_write_with_existing_extent();
     if (MAPPED_FAST_RET != -EAGAIN) {
         return finish_write(MAPPED_FAST_RET);
     }
 
-    XfsMetadataGuard metadata_guard(ctx, true, WOS_PERF_CALLSITE());
     auto relock_if_more_metadata_needed = [&]() {
         if (total_written < count) {
             metadata_guard.lock();
@@ -3522,16 +3526,15 @@ auto xfs_fsync(File* f) -> int {
     }
     ker::mod::sys::MutexGuard guard(xfd->inode->io_lock);
     int const DATA_RET = sync_inode_data_buffers(xfd->mount, xfd->inode, xfd->inode->size);
-    XfsMetadataGuard metadata_guard(xfd->mount, true, WOS_PERF_CALLSITE());
-    int const INODE_RET = xfs_commit_dirty_inode(xfd->mount, xfd->inode);
-    int const LOG_RET = xfs_log_flush(xfd->mount);
     if (DATA_RET != 0) {
         return DATA_RET;
     }
+    XfsMetadataGuard metadata_guard(xfd->mount, true, WOS_PERF_CALLSITE());
+    int const INODE_RET = xfs_commit_dirty_inode(xfd->mount, xfd->inode);
     if (INODE_RET != 0) {
         return INODE_RET;
     }
-    return LOG_RET;
+    return xfs_log_flush(xfd->mount);
 }
 
 auto xfs_sync_mount(XfsMountContext* ctx) -> int {
@@ -3539,18 +3542,48 @@ auto xfs_sync_mount(XfsMountContext* ctx) -> int {
         return -EINVAL;
     }
 
-    int const INODE_RET = xfs_icache_sync_dirty(ctx);
-    XfsMetadataGuard metadata_guard(ctx, true, WOS_PERF_CALLSITE());
-    int const LOG_RET = xfs_log_flush(ctx);
-    int const BLOCK_RET = sync_blockdev(ctx->device);
-    int const SUPERBLOCK_RET = (LOG_RET == 0 && BLOCK_RET == 0) ? xfs_sync_superblock_counters(ctx) : 0;
-    if (INODE_RET != 0) {
-        return INODE_RET;
+    for (;;) {
+        uint64_t const MUTATION_SNAPSHOT = ctx->mutation_sequence.load(std::memory_order_acquire);
+        int const INODE_RET = xfs_icache_sync_dirty(ctx);
+        if (INODE_RET != 0) {
+            return INODE_RET;
+        }
+
+        XfsMetadataGuard metadata_guard(ctx, true, WOS_PERF_CALLSITE());
+        if (ctx->mutation_sequence.load(std::memory_order_acquire) != MUTATION_SNAPSHOT) {
+            // Dirty inode commits performed by the scan (or a write that won
+            // the race before this barrier) joined the journal only after the
+            // data-durability snapshot.  Repeat before checkpointing them.
+            continue;
+        }
+        int const LOG_RET = xfs_log_flush(ctx);
+        if (LOG_RET != 0) {
+            return LOG_RET;
+        }
+        int const BLOCK_RET = sync_blockdev(ctx->device);
+        if (BLOCK_RET != 0) {
+            return BLOCK_RET;
+        }
+        int const SUPERBLOCK_RET = xfs_sync_superblock_counters(ctx);
+        if (SUPERBLOCK_RET != 0) {
+            return SUPERBLOCK_RET;
+        }
+        int const COUNTER_FLUSH_RET = flush_blockdev(ctx->device);
+        if (COUNTER_FLUSH_RET != 0) {
+            return COUNTER_FLUSH_RET;
+        }
+        int const CLEAN_RET = xfs_log_mark_clean(ctx);
+        if (CLEAN_RET != 0) {
+            return CLEAN_RET;
+        }
+
+        // metadata_lock excludes mutation while the checkpoint is published;
+        // a mutation completed during the preceding inode scan advances the
+        // sequence and forces another complete pass.
+        if (ctx->mutation_sequence.load(std::memory_order_acquire) == MUTATION_SNAPSHOT) {
+            return 0;
+        }
     }
-    if (LOG_RET != 0) {
-        return LOG_RET;
-    }
-    return BLOCK_RET != 0 ? BLOCK_RET : SUPERBLOCK_RET;
 }
 
 auto xfs_collect_swap_extents(File* f, ker::mod::mm::swap::SwapExtent** extents_out, size_t* extent_count_out) -> int {
@@ -6183,14 +6216,6 @@ auto xfs_vfs_init_device(dev::BlockDevice* device) -> XfsMountContext* {
     int ret = xfs_mount(device, dev::block_device_is_read_only(device), &ctx);
     if (ret != 0) {
         log::error("mount failed with error %d", ret);
-        return nullptr;
-    }
-
-    // Initialize the log
-    ret = xfs_log_mount(ctx);
-    if (ret != 0) {
-        log::error("log mount failed");
-        xfs_unmount(ctx);
         return nullptr;
     }
 
