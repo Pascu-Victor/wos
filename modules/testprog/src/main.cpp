@@ -43,6 +43,7 @@
 #include "perfbench.hpp"
 #include "thread_exit_stress.hpp"
 #include "usercopy_negative.hpp"
+#include "wki_chaos_workload.hpp"
 
 namespace {
 
@@ -638,6 +639,10 @@ auto main(int argc, char** argv, char** envp) -> int {
 
     if (command != nullptr && std::strcmp(command, "wki-vfs") == 0) {
         return handle_wki_vfs_command(argc, argv);
+    }
+
+    if (command != nullptr && std::strcmp(command, "wki-chaos-workload") == 0) {
+        return run_wki_chaos_workload(argc - 1, argv + 1);
     }
 
     if (command != nullptr && std::strcmp(command, "perf") == 0) {

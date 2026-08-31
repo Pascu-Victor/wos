@@ -10,6 +10,10 @@ WKI_CPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "wki.cpp"
 WKI_HPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "wki.hpp"
 REMOTABLE_CPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "remotable.cpp"
 REMOTE_VFS_CPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "remote_vfs.cpp"
+ROUTING_CPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "routing.cpp"
+TRANSPORT_ETH_CPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "transport_eth.cpp"
+NETDEVCONF_CPP = ROOT / "modules" / "kern" / "src" / "util" / "netdevconf.cpp"
+INIT_WRAPPERS_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "init" / "init_wrappers.cpp"
 WIRE_HPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "wire.hpp"
 WKI_PEER_LIVENESS_KTEST = ROOT / "modules" / "kern" / "src" / "test" / "wki_peer_liveness_ktest.cpp"
 
@@ -110,6 +114,7 @@ def test_hello_boot_epoch_fences_connected_broadcast_restarts() -> None:
         "void hello_set_boot_epoch(HelloPayload* hello, uint32_t epoch)",
         "auto hello_boot_epoch(const HelloPayload* hello) -> uint32_t",
         "auto peer_note_remote_boot_epoch_locked(WkiPeer* peer, uint32_t remote_epoch) -> bool",
+        "auto peer_remote_epoch_reset_is_proven_locked(",
         "auto hello_boot_epoch_matches_peer(const WkiPeer* peer, uint32_t remote_epoch) -> bool",
     ]
     missing = [token for token in required_source_tokens if token not in source]
@@ -138,15 +143,15 @@ def test_hello_boot_epoch_fences_connected_broadcast_restarts() -> None:
     )
     require_order(
         handle_hello,
-        "remote_boot_epoch_changed = peer_note_remote_boot_epoch_locked(peer, REMOTE_BOOT_EPOCH)",
-        "if (remote_boot_epoch_changed)",
-        "HELLO must record boot epoch before reset decision",
+        "remote_session_epoch_reset = peer_remote_epoch_reset_is_proven_locked(peer, REMOTE_BOOT_EPOCH, remote_channel_epoch)",
+        "peer_note_remote_boot_epoch_locked(peer, REMOTE_BOOT_EPOCH)",
+        "HELLO must classify the prior session before recording its first epoch",
     )
     require_order(
         handle_hello,
-        "if (remote_boot_epoch_changed)",
+        "if (remote_session_epoch_reset)",
         "wki_channels_close_for_peer(peer_node)",
-        "HELLO boot epoch change must close stale channels",
+        "HELLO proven session change must close stale channels",
     )
     require_order(
         handle_hello,
@@ -162,15 +167,15 @@ def test_hello_boot_epoch_fences_connected_broadcast_restarts() -> None:
     )
     require_order(
         handle_hello_ack,
-        "remote_boot_epoch_changed = peer_note_remote_boot_epoch_locked(peer, REMOTE_BOOT_EPOCH)",
-        "if (remote_boot_epoch_changed && !WAS_FENCED)",
-        "HELLO_ACK must record boot epoch before reset decision",
+        "remote_session_epoch_reset = peer_remote_epoch_reset_is_proven_locked(peer, REMOTE_BOOT_EPOCH, remote_channel_epoch)",
+        "peer_note_remote_boot_epoch_locked(peer, REMOTE_BOOT_EPOCH)",
+        "HELLO_ACK must classify the prior session before recording its first epoch",
     )
     require_order(
         handle_hello_ack,
-        "if (remote_boot_epoch_changed && !WAS_FENCED)",
+        "if (remote_session_epoch_reset && !WAS_FENCED)",
         "wki_channels_close_for_peer(peer_node)",
-        "HELLO_ACK boot epoch change must close stale channels",
+        "HELLO_ACK proven session change must close stale channels",
     )
     require_order(
         handle_hello_ack,
@@ -214,18 +219,22 @@ def test_hello_boot_epoch_fences_connected_broadcast_restarts() -> None:
         "HelloEpochWordsAreIndependent",
         "RemoteBootEpochDetectsRestart",
         "BootEpochAdvancesLocalChannelEpoch",
+        "InitialChannelEpochFencesPreHandshakeStream",
+        "InitialEpochObservationPreservesAckedStream",
         "wki_peer_selftest_hello_epoch_words_are_independent",
         "wki_peer_selftest_remote_boot_epoch_detects_restart",
         "wki_peer_selftest_boot_epoch_advances_local_channel_epoch",
+        "wki_peer_selftest_initial_channel_epoch_fences_pre_handshake_stream",
+        "wki_peer_selftest_initial_epoch_observation_preserves_acked_stream",
     ]:
         if token not in ktest_source:
             fail(f"peer boot epoch KTEST is missing {token}")
 
     for handler_name in ["handle_hello", "handle_hello_ack"]:
         body = function_body(source, handler_name)
-        channel_reset = body.find("else if (remote_channel_epoch_changed")
+        channel_reset = body.find("if (remote_session_epoch_reset")
         if channel_reset < 0 or body.find("resync_connected_peer = !newly_connected", channel_reset) < 0:
-            fail(f"{handler_name} channel epoch reset must re-advertise current resources")
+            fail(f"{handler_name} proven epoch reset must re-advertise current resources")
 
     require_order(
         handle_hello,
@@ -248,7 +257,7 @@ def test_connected_epoch_reset_retires_vfs_before_channel_reuse() -> None:
     for handler_name in ["handle_hello", "handle_hello_ack"]:
         body = function_body(source, handler_name)
         required = [
-            "!WAS_FENCED && (remote_boot_epoch_changed || remote_channel_epoch_changed)",
+            "!WAS_FENCED && remote_session_epoch_reset",
             "wki_dev_server_mark_epoch_reset(peer_node)",
             "wki_remote_vfs_mark_epoch_reset(peer_node)",
             "peer->vfs_reset_invalidate_discovery.store(true, std::memory_order_release)",
@@ -645,9 +654,121 @@ def test_forwarding_recomputes_checksum_after_ttl_decrement() -> None:
     require_order(
         body,
         "fwd_hdr->checksum = wki_frame_checksum(*fwd_hdr, fwd_frame + WKI_HEADER_SIZE)",
-        "fwd_transport->tx(fwd_transport, NEXT_HOP, fwd_frame, len)",
+        "wki_transport_send(fwd_transport, NEXT_HOP, fwd_frame, len)",
         "forwarding must transmit only after checksum refresh",
     )
+
+
+def test_routed_lsa_peer_identity_handshake_does_not_promote_origin_to_neighbor() -> None:
+    peer_source = PEER_CPP.read_text()
+    routing_source = ROUTING_CPP.read_text()
+    transport_source = TRANSPORT_ETH_CPP.read_text()
+    wki_source = WKI_CPP.read_text()
+
+    routed_hello = function_body(peer_source, "wki_peer_send_routed_hello")
+    for token in [
+        "hello.hostname = g_wki.local_hostname",
+        "hello_set_boot_epoch(&hello, g_wki.local_boot_epoch)",
+        "wki_send_raw(dst_node, MsgType::HELLO, &hello, sizeof(hello), WKI_FLAG_PRIORITY)",
+    ]:
+        if token not in routed_hello:
+            fail(f"routed HELLO must reuse the established identity payload and raw routed send: {token}")
+
+    handle_lsa = function_body(routing_source, "handle_lsa")
+    require_order(
+        handle_lsa,
+        "wki_routing_recompute();",
+        "probe_routed_peer(lsa->origin_node);",
+        "LSA must compute SPF before probing the far endpoint identity",
+    )
+    timer = function_body(routing_source, "wki_routing_timer_tick")
+    for token in ["ROUTED_HELLO_PROBE_INTERVAL_US", "probe_routed_peer(probe_nodes.at(i))"]:
+        if token not in timer:
+            fail(f"lost routed HELLOs must have a bounded periodic retry: {token}")
+
+    contact = function_body(transport_source, "eth_rx_needs_peer_contact_update")
+    require_order(
+        contact,
+        "wki_peer_frame_was_forwarded(hdr)",
+        "static_cast<MsgType>(hdr->msg_type)",
+        "forwarded origins must be rejected before direct Ethernet contact learning",
+    )
+
+    find_transport = function_body(wki_source, "find_transport_for_peer")
+    if "peer->is_direct && (peer->transport != nullptr)" not in find_transport:
+        fail("a routed peer must not bypass current-SPF next-hop transport selection")
+
+    for handler_name in ["handle_hello", "handle_hello_ack"]:
+        handler = function_body(peer_source, handler_name)
+        for token in [
+            "wki_peer_hello_path(hdr, ROUTE_VALID, route.hop_count, peer != nullptr && peer->is_direct)",
+            "HELLO_PATH == WkiPeerHelloPath::UNRESOLVED",
+            "HELLO_PATH == WkiPeerHelloPath::ROUTED",
+            "peer->next_hop = route.next_hop",
+            "peer->hop_count = route.hop_count",
+            "if (peer_is_direct)",
+        ]:
+            if token not in handler:
+                fail(f"{handler_name} is missing routed peer classification token: {token}")
+        require_order(
+            handler,
+            "HELLO_PATH == WkiPeerHelloPath::UNRESOLVED",
+            "if (peer == nullptr)",
+            f"{handler_name} must reject an early routed HELLO before allocating or promoting a peer",
+        )
+
+
+def test_all_configured_wki_nics_are_claimed_before_peer_discovery() -> None:
+    config_source = NETDEVCONF_CPP.read_text()
+    init_body = function_body(INIT_WRAPPERS_CPP.read_text(), "wki_eth_transport_init")
+    transport_source = TRANSPORT_ETH_CPP.read_text()
+
+    find_devices = function_body(config_source, "find_devices")
+    for token in [
+        'fw_cfg_read_file(NETDEVS_FW_CFG_PATH, buf.data(), buf.size() - 1)',
+        "if (bytes_read > 0)",
+        "while (*pos != '\\0')",
+        "if (DRIVER_TOKEN == DRIVER_NAME)",
+        "devices[device_count++] = std::move(dev_ref);",
+        "return device_count;",
+    ]:
+        if token not in find_devices:
+            fail(f"multi-NIC /etc/netdevs enumeration is missing {token}")
+    if "return dev_ref;" in find_devices:
+        fail("multi-NIC /etc/netdevs enumeration must not stop after the first match")
+    require_order(
+        find_devices,
+        "fw_cfg_read_file(NETDEVS_FW_CFG_PATH, buf.data(), buf.size() - 1)",
+        "vfs_open_file(NETDEVS_PATH, 0, 0)",
+        "per-node fw_cfg NIC policy must take precedence over the shared initramfs fallback",
+    )
+
+    for token in [
+        'find_devices("wki", wki_dev_refs)',
+        "for (size_t i = 0; i < wki_dev_count; ++i)",
+        "wki_eth_transport_claim(wki_dev_refs.at(i).get());",
+        "wki_eth_transport_init(wki_dev_refs.front().get());",
+        "wki_peer_send_hello_broadcast();",
+    ]:
+        if token not in init_body:
+            fail(f"multi-NIC WKI boot claim is missing {token}")
+    require_order(
+        init_body,
+        "wki_eth_transport_claim(wki_dev_refs.at(i).get());",
+        "wki_eth_transport_init(wki_dev_refs.front().get());",
+        "all configured WKI NICs must be claimed before primary transport initialization",
+    )
+    require_order(
+        init_body,
+        "wki_eth_transport_init(wki_dev_refs.front().get());",
+        "wki_peer_send_hello_broadcast();",
+        "peer discovery must begin only after all WKI NIC ownership is established",
+    )
+
+    claim = function_body(transport_source, "wki_eth_transport_claim")
+    for token in ["netdev->remotable = nullptr;", "netdev->wki_transport = true;"]:
+        if token not in claim:
+            fail(f"WKI NIC claim is missing {token}")
 
 
 def test_ipc_data_acks_after_ordered_dispatch() -> None:
@@ -807,9 +928,32 @@ def test_fence_drains_deferred_vfs_bindings_before_remote_fd_cleanup() -> None:
     require_order(
         body,
         "wki_dev_server_detach_all_for_peer(fenced_id)",
-        "wki_remote_vfs_cleanup_for_peer(fenced_id, false)",
+        "wki_remote_vfs_cleanup_for_peer(fenced_id, owner_identity_replaced)",
         "peer fence must drain retained VFS handlers before closing their remote FDs",
     )
+
+
+def test_fenced_logical_successor_terminalizes_old_detach_identity() -> None:
+    peer_source = PEER_CPP.read_text()
+    disconnect = function_body(peer_source, "wki_peer_disconnect_impl")
+    for token in [
+        "peer->retired_hostname = fenced_hostname",
+        "reconcile_fenced_hostname_replacements_locked(fenced_hostname)",
+        "owner_identity_replaced = peer->replacement_node_id.load(std::memory_order_acquire) != WKI_NODE_INVALID",
+        "wki_remote_vfs_cleanup_for_peer(fenced_id, owner_identity_replaced)",
+        "wki_remote_net_cleanup_for_peer(fenced_id, owner_identity_replaced)",
+    ]:
+        if token not in disconnect:
+            fail(f"peer replacement cleanup is missing {token}")
+
+    invalidation = function_body(WKI_CPP.read_text(), "wki_peer_remote_boot_epoch_invalidated")
+    for token in [
+        "PEER->replacement_node_id.load(std::memory_order_acquire)",
+        "REPLACEMENT_NODE != WKI_NODE_INVALID",
+        "CURRENT_EPOCH != expected_epoch",
+    ]:
+        if token not in invalidation:
+            fail(f"deferred detach identity invalidation is missing {token}")
 
 
 def main() -> None:
@@ -822,10 +966,13 @@ def main() -> None:
     test_shutdown_uses_graceful_goodbye_not_fence()
     test_ack_only_frames_do_not_refresh_peer_liveness()
     test_forwarding_recomputes_checksum_after_ttl_decrement()
+    test_routed_lsa_peer_identity_handshake_does_not_promote_origin_to_neighbor()
+    test_all_configured_wki_nics_are_claimed_before_peer_discovery()
     test_ipc_data_acks_after_ordered_dispatch()
     test_ipc_data_ordered_dispatch_wait_uses_explicit_daemon_wake()
     test_cross_channel_ack_scan_uses_allocated_range_bounds()
     test_fence_drains_deferred_vfs_bindings_before_remote_fd_cleanup()
+    test_fenced_logical_successor_terminalizes_old_detach_identity()
     print("WKI peer source invariants hold")
 
 

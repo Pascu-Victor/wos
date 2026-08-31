@@ -46,9 +46,12 @@ enum class ProcNodeType : uint8_t {
     WKI_PEERS_FILE,       // /proc/wki/peers -> WKI topology rows
     WKI_NETDIAG_FILE,     // /proc/wki/netdiag -> network packet/listener/channel diagnostics
     WKI_PIPES_FILE,       // /proc/wki/pipes -> local pipe owner diagnostics
-    MEMACC_DIR,           // /proc/memacc
-    MEMACC_TRACK_DIR,     // /proc/memacc/track
-    MEMACC_RECLAIM_DIR,   // /proc/memacc/reclaim
+    WKI_CHAOS_FILE,       // /proc/wki/chaos -> deterministic WKI fault injection control and trace
+    // /proc/wki/chaos_workload -> gated live-scenario workload bridge
+    WKI_CHAOS_WORKLOAD_FILE,
+    MEMACC_DIR,          // /proc/memacc
+    MEMACC_TRACK_DIR,    // /proc/memacc/track
+    MEMACC_RECLAIM_DIR,  // /proc/memacc/reclaim
     MEMACC_SUMMARY_FILE,
     MEMACC_ZONES_FILE,
     MEMACC_PROCS_FILE,

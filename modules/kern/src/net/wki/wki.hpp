@@ -86,6 +86,12 @@ constexpr uint16_t WKI_REORDER_EVENT_BUS = WKI_CREDITS_EVENT_BUS;
 constexpr uint16_t WKI_REORDER_RESOURCE = 1024;
 constexpr uint16_t WKI_REORDER_DYNAMIC = WKI_CREDITS_DYNAMIC;
 constexpr uint16_t WKI_REORDER_IPC_DATA = WKI_CREDITS_IPC_DATA;
+// One global fixed pool can absorb the largest supported single-channel
+// reorder window without allocating in RX/NAPI context. Other channels share
+// the same bound and recover through the existing duplicate-ACK path when it
+// is exhausted.
+constexpr uint16_t WKI_REORDER_POOL_CAPACITY = WKI_REORDER_RESOURCE;
+constexpr uint16_t WKI_REORDER_POOL_INVALID_SLOT = 0;
 
 // -----------------------------------------------------------------------------
 // Error codes
@@ -126,14 +132,27 @@ constexpr uint16_t WKI_NET_RX_CREDITS = 64;
 // Transport Abstraction (Layer 1)
 // -----------------------------------------------------------------------------
 
-// RX callback type: called by transport when a frame arrives
-using WkiRxHandler = void (*)(WkiTransport* transport, const void* data, uint16_t len);
+// Optional ingress identity copied by the chaos boundary before a transport's
+// receive storage expires. Non-Ethernet transports leave this absent.
+struct WkiRxMetadata {
+    bool has_src_mac = false;
+    proto::MacAddress src_mac = {};
+};
+
+// RX callback type: called by transport when a frame arrives.
+using WkiRxHandler = void (*)(WkiTransport* transport, const void* data, uint16_t len, const WkiRxMetadata* metadata);
 
 struct WkiTransport {
     const char* name;  // "eth0", "ivshmem0", etc.
     uint16_t mtu;      // max payload excluding WKI header
     bool rdma_capable;
     void* private_data;
+    uint16_t chaos_id = 0;  // stable local registration id; never transmitted
+    // Deferred chaos delivery holds this count while invoking the original
+    // callback. Transport teardown marks unregistering, discards queued work,
+    // and waits for the bounded callback to leave before storage can vanish.
+    std::atomic<uint32_t> chaos_in_flight{0};
+    std::atomic<bool> chaos_unregistering{false};
 
     // Transmit a frame to a direct neighbor (copies data into a new PacketBuffer)
     int (*tx)(WkiTransport* self, uint16_t neighbor_id, const void* data, uint16_t len);
@@ -195,6 +214,12 @@ struct WkiPeer {
 
     // V2: Hostname identity [V2 A1.5]
     std::array<char, WKI_HOSTNAME_MAX> hostname;  // UTF-8, NUL-terminated if shorter than WKI_HOSTNAME_MAX
+    // A fenced random node ID can be superseded by exactly one connected peer
+    // carrying its former logical hostname. Keep the retired name for the
+    // fence-first ordering and publish the proven replacement so deferred
+    // detach reservations can terminalize without crossing identities.
+    std::array<char, WKI_HOSTNAME_MAX> retired_hostname = {};
+    std::atomic<uint16_t> replacement_node_id{WKI_NODE_INVALID};
 
     // Routing (for non-direct peers)
     uint16_t next_hop = WKI_NODE_INVALID;
@@ -290,6 +315,8 @@ struct WkiReorderEntry {
     uint8_t msg_type = 0;
     uint32_t seq = 0;
     uint32_t channel_generation = 0;
+    // One-based fixed-pool slot token; zero is never a reserved slot.
+    uint16_t pool_slot = WKI_REORDER_POOL_INVALID_SLOT;
     WkiReorderEntry* next = nullptr;
 };
 
@@ -329,6 +356,10 @@ struct WkiChannel {
     WkiRetransmitEntry* retransmit_head = nullptr;
     WkiRetransmitEntry* retransmit_tail = nullptr;
     uint32_t retransmit_count = 0;
+    // Published while one snapshot owner performs transport TX outside the
+    // channel lock. Timer and waiter-driven progress can race, so they must
+    // not concurrently retransmit and back off the same queue head.
+    bool retransmit_in_progress = false;
 
     // Reorder buffer
     WkiReorderEntry* reorder_head = nullptr;
@@ -337,6 +368,9 @@ struct WkiChannel {
     // Duplicate ACK tracking (for fast retransmit)
     uint32_t last_dup_ack = 0;
     uint8_t dup_ack_count = 0;
+    // One unchanged cumulative ACK gap may trigger fast recovery once. The
+    // RTO owns further retries until ACK progress exposes a different head.
+    uint32_t fast_retransmit_seq = WKI_ACK_NONE;
 
     // Statistics
     uint64_t bytes_sent = 0;
@@ -394,6 +428,7 @@ struct WkiChannelDiag {
     uint16_t channel_id = 0;
     uint8_t priority = 0;
     bool active = false;
+    uint32_t generation = 0;
     uint32_t tx_seq = 0;
     uint32_t tx_ack = 0;
     uint32_t rx_seq = 0;
@@ -402,10 +437,52 @@ struct WkiChannelDiag {
     uint16_t tx_credits = 0;
     uint16_t rx_credits = 0;
     uint32_t retransmit_count = 0;
+    bool retransmit_in_progress = false;
+    uint32_t retransmit_head_seq = WKI_ACK_NONE;
+    uint8_t retransmit_head_type = 0;
+    uint32_t retransmit_head_retries = 0;
+    uint32_t retransmit_rto_us = 0;
+    uint64_t retransmit_deadline_us = 0;
+    uint64_t retransmit_head_send_time_us = 0;
+    uint32_t fast_retransmit_seq = WKI_ACK_NONE;
+    uint8_t duplicate_ack_count = 0;
     uint32_t reorder_count = 0;
+    uint32_t reorder_head_seq = WKI_ACK_NONE;
+    uint8_t reorder_head_type = 0;
+    uint16_t rx_dispatch_waiter_count = 0;
     uint32_t retransmits = 0;
     uint64_t bytes_sent = 0;
     uint64_t bytes_received = 0;
+};
+
+constexpr size_t WKI_PEER_DIAG_MAX = WKI_MAX_PEERS;
+
+struct WkiPeerDiag {
+    uint16_t node_id = WKI_NODE_INVALID;
+    PeerState state = PeerState::UNKNOWN;
+    bool direct = false;
+    uint16_t next_hop = WKI_NODE_INVALID;
+    uint8_t hop_count = 0;
+    uint32_t local_channel_epoch = 0;
+    uint32_t remote_channel_epoch = 0;
+    uint32_t remote_boot_epoch = 0;
+    uint16_t replacement_node_id = WKI_NODE_INVALID;
+    uint32_t lifecycle_state = 0;
+    bool compute_reset_cleanup_pending = false;
+    bool vfs_reset_rebind_pending = false;
+    bool block_resume_pending = false;
+    bool vfs_reset_invalidate_discovery = false;
+    bool vfs_reset_owner_reboot_proven = false;
+    uint64_t resource_advert_request = 0;
+    uint64_t resource_advert_active_request = 0;
+    uint64_t resource_advert_index = 0;
+    uint8_t resource_advert_stage = 0;
+    uint64_t last_heartbeat = 0;
+    uint64_t last_rx_activity = 0;
+    uint64_t last_tx_activity = 0;
+    uint64_t fence_defer_until_us = 0;
+    uint64_t connected_time = 0;
+    uint64_t hello_sent_time = 0;
 };
 
 // -----------------------------------------------------------------------------
@@ -555,8 +632,10 @@ auto wki_send_raw(uint16_t dst_node, MsgType msg_type, const void* payload, uint
 // Public API - RX Dispatch (called by transport layer)
 // -----------------------------------------------------------------------------
 
-// Main RX entry point - called when a WKI frame arrives from any transport
-void wki_rx(WkiTransport* transport, const void* data, uint16_t len);
+// Registered transports first pass through wki_chaos_rx_ingress(). This is the
+// established core RX entrypoint used after that boundary chooses delivery.
+// The default preserves direct/internal callers without ingress metadata.
+void wki_rx(WkiTransport* transport, const void* data, uint16_t len, const WkiRxMetadata* metadata = nullptr);
 
 // -----------------------------------------------------------------------------
 // Public API - Channel Management
@@ -589,6 +668,7 @@ void wki_channels_close_for_peer(uint16_t node_id);
 
 // Snapshot active channels for diagnostics. Values are approximate but bounded.
 auto wki_channel_diag_snapshot(WkiChannelDiag* out, size_t max) -> size_t;
+auto wki_peer_diag_snapshot(WkiPeerDiag* out, size_t max) -> size_t;
 
 // -----------------------------------------------------------------------------
 // Public API - Timer Tick (called from timer interrupt / periodic thread)
@@ -683,6 +763,27 @@ struct WkiWaitEntry {
     uint16_t diag_cookie = 0;
 };
 
+constexpr size_t WKI_WAIT_DIAG_MAX = 256;
+constexpr size_t WKI_WAIT_DIAG_NAME_MAX = 32;
+
+struct WkiWaitDiag {
+    uintptr_t entry_address = 0;
+    uint8_t state = WkiWaitEntry::PENDING;
+    bool retirement_pending = false;
+    uint64_t task_pid = 0;
+    uint64_t deadline_us = 0;
+    int result = 0;
+    std::array<char, WKI_WAIT_DIAG_NAME_MAX> diag_name = {};
+    uint64_t diag_callsite = 0;
+    uint64_t diag_arg0 = 0;
+    uint64_t diag_arg1 = 0;
+    uint32_t diag_resource_id = 0;
+    uint16_t diag_op_id = 0;
+    uint16_t diag_peer = WKI_NODE_INVALID;
+    uint16_t diag_channel = 0;
+    uint16_t diag_cookie = 0;
+};
+
 // Default operation timeout: 15 seconds (allows for CPU-loaded VFS servers)
 constexpr uint64_t WKI_OP_TIMEOUT_US = 15'000'000;
 
@@ -719,6 +820,7 @@ void wki_wait_timeout_scan(uint64_t now_us);
 
 // Unlink all pending wait entries belonging to task. Called on task exit.
 void wki_wait_cleanup_for_task(ker::mod::sched::task::Task* task);
+auto wki_wait_diag_snapshot(WkiWaitDiag* out, size_t max) -> size_t;
 
 #ifdef WOS_SELFTEST
 void wki_selftest_wait_list_link(WkiWaitEntry* entry);

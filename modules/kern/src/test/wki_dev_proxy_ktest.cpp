@@ -26,8 +26,55 @@ KTEST(WkiDevProxyAttachFailure, ErasesExactProxy) {
 
 KTEST(WkiDevProxyRdmaSqWait, StopsOnFenceOrInactive) { KEXPECT_TRUE(ker::net::wki::wki_dev_proxy_selftest_rdma_sq_wait_stops_on_fence()); }
 
+KTEST(WkiDevProxyRdmaBatch, InvalidLaterRangeHasNoPartialPublication) {
+    KEXPECT_TRUE(ker::net::wki::wki_dev_proxy_selftest_batch_validation_is_atomic());
+}
+
+KTEST(WkiDevProxyRdmaCompletion, OldEpochTagCannotMatchOrFreeSuccessor) {
+    KEXPECT_TRUE(ker::net::wki::wki_dev_proxy_selftest_old_rdma_tag_cannot_match_successor());
+}
+
+KTEST(WkiDevProxyRdmaRing, FixedLayoutAndIndicesRejectCorruptPeerState) {
+    using namespace ker::net::wki;
+
+    BlkRingGeometry geometry = {.sq_depth = BLK_RING_DEFAULT_SQ_DEPTH,
+                                .cq_depth = BLK_RING_DEFAULT_CQ_DEPTH,
+                                .data_slot_count = BLK_RING_DEFAULT_DATA_SLOTS,
+                                .data_slot_size = BLK_RING_DEFAULT_DATA_SLOT_SIZE,
+                                .block_size = 512,
+                                .total_blocks = 8192,
+                                .server_ready = 1};
+    BlkRingIndices indices = {};
+    KEXPECT_TRUE(blk_ring_layout_valid(geometry));
+    KEXPECT_TRUE(blk_ring_indices_valid(indices, geometry));
+
+    indices.sq_head = geometry.sq_depth;
+    KEXPECT_FALSE(blk_ring_indices_valid(indices, geometry));
+    indices = {};
+    indices.cq_tail = geometry.cq_depth;
+    KEXPECT_FALSE(blk_ring_indices_valid(indices, geometry));
+
+    geometry = {.sq_depth = BLK_RING_DEFAULT_SQ_DEPTH,
+                .cq_depth = BLK_RING_DEFAULT_CQ_DEPTH,
+                .data_slot_count = BLK_RING_DEFAULT_DATA_SLOTS,
+                .data_slot_size = BLK_RING_DEFAULT_DATA_SLOT_SIZE,
+                .block_size = 512,
+                .total_blocks = 8192,
+                .server_ready = 1};
+    geometry.data_slot_size++;
+    KEXPECT_FALSE(blk_ring_layout_valid(geometry));
+    geometry.data_slot_size = BLK_RING_DEFAULT_DATA_SLOT_SIZE;
+    geometry.block_size = geometry.data_slot_size + 1;
+    KEXPECT_FALSE(blk_ring_layout_valid(geometry));
+    KEXPECT_EQ(blk_ring_next_index(BLK_RING_DEFAULT_SQ_DEPTH - 1, BLK_RING_DEFAULT_SQ_DEPTH), 0U);
+}
+
 KTEST(WkiRemoteVfsAttachAck, CookieFencesStaleMountCompletion) {
     KEXPECT_TRUE(ker::net::wki::wki_remote_vfs_selftest_attach_ack_cookie_fences_stale_completion());
+}
+
+KTEST(WkiRemoteVfsPeerCleanup, PendingAttachWaitIsIncluded) {
+    KEXPECT_TRUE(ker::net::wki::wki_remote_vfs_selftest_peer_cleanup_includes_pending_attach());
 }
 
 KTEST(WkiRemoteVfsUtimens, WirePathValidationRejectsEscapes) {

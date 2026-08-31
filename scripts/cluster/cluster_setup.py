@@ -55,6 +55,7 @@ import wosincident  # noqa: E402
 
 TOPOLOGY_PROBE_TIMEOUT_SECONDS = 5.0
 MAX_REPORTED_VM_FAILURES = 32
+MAX_CLUSTER_NODE_ID = 255
 
 # ---------------------------------------------------------------------------
 # Config loading and resolution
@@ -63,7 +64,9 @@ MAX_REPORTED_VM_FAILURES = 32
 
 def load_config(path: str) -> dict:
     with open(path) as f:
-        return json.load(f)
+        config = json.load(f)
+    validate_cluster_config(config)
+    return config
 
 
 def find_global(zones: list) -> dict:
@@ -93,7 +96,7 @@ def resolve_config(global_cfg: dict, zone_cfg: dict, node_cfg: dict = None) -> d
 
     # Merge zone-level overrides
     for key in zone_cfg:
-        if key in ("id", "name", "nodes", "nodes_config"):
+        if key in ("id", "name", "nodes", "node_ids", "nodes_config"):
             continue
         if isinstance(zone_cfg[key], dict) and isinstance(result.get(key), dict):
             result[key] = merge_section(result[key], zone_cfg[key])
@@ -119,6 +122,148 @@ def get_node_config(zone_cfg: dict, node_id: int) -> dict:
         if nc.get("id") == node_id:
             return nc
     return {}
+
+
+def _node_count(value, where: str) -> int:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < 1
+        or value > MAX_CLUSTER_NODE_ID + 1
+    ):
+        raise ValueError(f"{where} must be an integer in [1, {MAX_CLUSTER_NODE_ID + 1}]")
+    return value
+
+
+def zone_node_ids(zone_cfg: dict) -> list[int]:
+    """Resolve one non-GLOBAL zone's stable global node IDs.
+
+    Legacy ``nodes: N`` zones retain their exact ``0..N-1`` membership. An
+    explicit ``node_ids`` array replaces that implicit range; when both fields
+    are present, ``nodes`` remains a count and must match the array length.
+    """
+    if not isinstance(zone_cfg, dict):
+        raise ValueError("cluster zone must be an object")
+    if zone_cfg.get("id") == "GLOBAL":
+        if "node_ids" in zone_cfg:
+            raise ValueError("GLOBAL zone must not define node_ids")
+        return []
+
+    if "node_ids" not in zone_cfg:
+        count = _node_count(
+            zone_cfg.get("nodes", 2), f"zone {zone_name(zone_cfg)} nodes"
+        )
+        return list(range(count))
+
+    raw_ids = zone_cfg["node_ids"]
+    if not isinstance(raw_ids, list) or not raw_ids:
+        raise ValueError(f"zone {zone_name(zone_cfg)} node_ids must be a non-empty array")
+    node_ids: list[int] = []
+    for index, value in enumerate(raw_ids):
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value < 0
+            or value > MAX_CLUSTER_NODE_ID
+        ):
+            raise ValueError(
+                f"zone {zone_name(zone_cfg)} node_ids[{index}] must be an integer in [0, {MAX_CLUSTER_NODE_ID}]"
+            )
+        node_ids.append(value)
+    if len(set(node_ids)) != len(node_ids):
+        raise ValueError(f"zone {zone_name(zone_cfg)} node_ids must not contain duplicates")
+    node_ids.sort()
+
+    if "nodes" in zone_cfg:
+        count = _node_count(zone_cfg["nodes"], f"zone {zone_name(zone_cfg)} nodes")
+        if count != len(node_ids):
+            raise ValueError(
+                f"zone {zone_name(zone_cfg)} nodes={count} disagrees with {len(node_ids)} explicit node_ids"
+            )
+    return node_ids
+
+
+def validate_cluster_config(config: dict) -> None:
+    """Validate the bounded cluster membership schema before side effects."""
+    if not isinstance(config, dict) or not isinstance(config.get("zones"), list):
+        raise ValueError("cluster config root must contain a zones array")
+    zones = config["zones"]
+    if any(not isinstance(zone, dict) for zone in zones):
+        raise ValueError("cluster config zones must be objects")
+    if sum(zone.get("id") == "GLOBAL" for zone in zones) != 1:
+        raise ValueError("cluster config must define exactly one GLOBAL zone")
+
+    seen_zone_ids: set[str | int] = set()
+    global_cfg = find_global(zones)
+    if "qemu_netdev" in global_cfg:
+        raise ValueError("GLOBAL zone must not define qemu_netdev; configure it per zone")
+    socket_endpoints: dict[tuple[str, int], str] = {}
+    for zone in zones:
+        zone_id = zone.get("id")
+        if zone_id != "GLOBAL" and (
+            isinstance(zone_id, bool)
+            or not isinstance(zone_id, int)
+            or zone_id < 0
+            or zone_id > 255
+        ):
+            raise ValueError("non-GLOBAL cluster zone id must be an integer in [0, 255]")
+        if zone_id in seen_zone_ids:
+            raise ValueError("cluster config zone ids must be unique")
+        seen_zone_ids.add(zone_id)
+
+    for zone in zones:
+        if zone.get("id") == "GLOBAL":
+            zone_node_ids(zone)
+            continue
+        members = zone_node_ids(zone)
+        effective = resolve_config(global_cfg, zone)
+        backend = effective.get("qemu_netdev")
+        if backend is not None:
+            normalized_backend = node_setup.normalize_qemu_netdev(
+                backend,
+                queues=effective.get("nic_queues", 1),
+                vhost=bool(effective.get("vhost", False)),
+                where=f"zone {zone_name(zone)} qemu_netdev",
+            )
+            if effective.get("ivshmem", {}).get("enabled", False):
+                raise ValueError(
+                    f"zone {zone_name(zone)} socket-mcast backend requires ivshmem.enabled=false"
+                )
+            endpoint = (normalized_backend["address"], normalized_backend["port"])
+            prior = socket_endpoints.get(endpoint)
+            if prior is not None:
+                raise ValueError(
+                    f"zone {zone_name(zone)} socket-mcast endpoint collides with zone {prior}"
+                )
+            socket_endpoints[endpoint] = zone_name(zone)
+        overrides = zone.get("nodes_config", [])
+        if not isinstance(overrides, list) or any(
+            not isinstance(item, dict) for item in overrides
+        ):
+            raise ValueError(f"zone {zone_name(zone)} nodes_config must be an array of objects")
+        override_ids: list[int] = []
+        for index, override in enumerate(overrides):
+            node_id = override.get("id")
+            if isinstance(node_id, bool) or not isinstance(node_id, int):
+                raise ValueError(
+                    f"zone {zone_name(zone)} nodes_config[{index}].id must be an integer"
+                )
+            if node_id not in members:
+                raise ValueError(
+                    f"zone {zone_name(zone)} node override id {node_id} is outside membership {members}"
+                )
+            override_ids.append(node_id)
+        if len(set(override_ids)) != len(override_ids):
+            raise ValueError(f"zone {zone_name(zone)} contains duplicate node override ids")
+
+        # Parse enabled explicit links during preflight so setup cannot mutate
+        # host topology before discovering a bad endpoint.
+        ivshmem_links(zone, members)
+
+
+def zone_uses_socket_netdev(global_cfg: dict, zone_cfg: dict) -> bool:
+    backend = resolve_config(global_cfg, zone_cfg).get("qemu_netdev")
+    return isinstance(backend, dict) and backend.get("type") == "socket-mcast"
 
 
 # ---------------------------------------------------------------------------
@@ -154,29 +299,57 @@ def mac_addr(zone_id: int, node_id: int, seq: int = 0) -> str:
 # ---------------------------------------------------------------------------
 
 
-def ivshmem_links(zone_cfg: dict, num_nodes: int) -> list:
-    """Return list of (nodeA, nodeB) pairs based on topology."""
+def ivshmem_links(zone_cfg: dict, node_ids: list[int] | int | None = None) -> list:
+    """Return global node-ID pairs for the configured ivshmem topology."""
     ivshmem = zone_cfg.get("ivshmem", {})
     if not ivshmem.get("enabled", False):
         return []
 
+    if node_ids is None:
+        members = zone_node_ids(zone_cfg)
+    elif isinstance(node_ids, bool):
+        raise ValueError("ivshmem node membership must not be boolean")
+    elif isinstance(node_ids, int):
+        # Preserve the helper's legacy count-shaped call contract.
+        members = list(range(_node_count(node_ids, f"zone {zone_name(zone_cfg)} nodes")))
+    else:
+        members = list(node_ids)
+
     topology = ivshmem.get("topology", "full-mesh")
 
     if topology == "full-mesh":
-        return list(combinations(range(num_nodes), 2))
+        return [(min(a, b), max(a, b)) for a, b in combinations(members, 2)]
     elif topology == "ring":
-        pairs = [(i, (i + 1) % num_nodes) for i in range(num_nodes)]
+        pairs = [(members[i], members[(i + 1) % len(members)]) for i in range(len(members))]
         return [(min(a, b), max(a, b)) for a, b in pairs]
     elif topology == "star":
-        return [(0, i) for i in range(1, num_nodes)]
+        return [(members[0], node_id) for node_id in members[1:]]
     elif topology == "pairs":
         explicit = ivshmem.get("ivshmem_links", [])
-        return [(min(a, b), max(a, b)) for a, b in explicit]
+        if not isinstance(explicit, list):
+            raise ValueError(f"zone {zone_name(zone_cfg)} ivshmem_links must be an array")
+        pairs: list[tuple[int, int]] = []
+        for index, link in enumerate(explicit):
+            if (
+                not isinstance(link, list)
+                or len(link) != 2
+                or any(isinstance(item, bool) or not isinstance(item, int) for item in link)
+            ):
+                raise ValueError(f"zone {zone_name(zone_cfg)} ivshmem_links[{index}] must contain two node IDs")
+            node_a, node_b = link
+            if node_a == node_b or node_a not in members or node_b not in members:
+                raise ValueError(
+                    f"zone {zone_name(zone_cfg)} ivshmem link {link} must join two distinct member nodes"
+                )
+            pairs.append((min(node_a, node_b), max(node_a, node_b)))
+        if len(set(pairs)) != len(pairs):
+            raise ValueError(f"zone {zone_name(zone_cfg)} ivshmem_links must not contain duplicate pairs")
+        return pairs
     else:
         print(
             f"WARNING: Unknown ivshmem topology '{topology}', defaulting to full-mesh"
         )
-        return list(combinations(range(num_nodes), 2))
+        return [(min(a, b), max(a, b)) for a, b in combinations(members, 2)]
 
 
 # ---------------------------------------------------------------------------
@@ -681,42 +854,58 @@ def inject_into_overlay(
 
 
 def setup(config: dict):
+    validate_cluster_config(config)
     zones = [z for z in config["zones"] if z.get("id") != "GLOBAL"]
     global_cfg = find_global(config["zones"])
+    tap_zones = [
+        zone_cfg
+        for zone_cfg in zones
+        if not zone_uses_socket_netdev(global_cfg, zone_cfg)
+    ]
     uses_multiqueue_tap = any(
         resolve_config(global_cfg, zone_cfg).get("nic_queues", 1) > 1
-        for zone_cfg in zones
+        for zone_cfg in tap_zones
     )
 
     print("=== Setting up cluster topology ===\n")
 
     # Disable bridge netfilter so iptables doesn't filter bridged traffic
     # (DHCP, ICMP, ARP all need to pass through bridges unfiltered)
-    run("modprobe br_netfilter 2>/dev/null || true", quiet=True, privileged=True)
-    if uses_multiqueue_tap:
-        run("modprobe vhost_net 2>/dev/null || true", quiet=True, privileged=True)
-        ensure_vhost_net_available()
-    run(
-        "sysctl -q -w net.bridge.bridge-nf-call-iptables=0", quiet=True, privileged=True
-    )
-    run(
-        "sysctl -q -w net.bridge.bridge-nf-call-ip6tables=0",
-        quiet=True,
-        privileged=True,
-    )
-    run(
-        "sysctl -q -w net.bridge.bridge-nf-call-arptables=0",
-        quiet=True,
-        privileged=True,
-    )
+    if tap_zones:
+        run("modprobe br_netfilter 2>/dev/null || true", quiet=True, privileged=True)
+        if uses_multiqueue_tap:
+            run("modprobe vhost_net 2>/dev/null || true", quiet=True, privileged=True)
+            ensure_vhost_net_available()
+        run(
+            "sysctl -q -w net.bridge.bridge-nf-call-iptables=0", quiet=True, privileged=True
+        )
+        run(
+            "sysctl -q -w net.bridge.bridge-nf-call-ip6tables=0",
+            quiet=True,
+            privileged=True,
+        )
+        run(
+            "sysctl -q -w net.bridge.bridge-nf-call-arptables=0",
+            quiet=True,
+            privileged=True,
+        )
 
     for zone_cfg in zones:
         zname = zone_name(zone_cfg)
-        num_nodes = zone_cfg.get("nodes", 2)
+        node_ids = zone_node_ids(zone_cfg)
         effective = resolve_config(global_cfg, zone_cfg)
         mtu = effective.get("mtu", 9000)
 
-        print(f"--- Zone: {zname} ({num_nodes} nodes) ---")
+        print(f"--- Zone: {zname} ({len(node_ids)} nodes: {node_ids}) ---")
+
+        if zone_uses_socket_netdev(global_cfg, zone_cfg):
+            backend = effective["qemu_netdev"]
+            print(
+                "  Rootless QEMU socket multicast: "
+                f"{backend['address']}:{backend['port']} (no bridge/TAP setup)"
+            )
+            print()
+            continue
 
         # Create bridge
         br = bridge_name(zone_cfg)
@@ -769,7 +958,7 @@ def setup(config: dict):
         # Create TAP devices
         real_user = os.environ.get("SUDO_USER") or pwd.getpwuid(os.getuid()).pw_name
         real_uid = pwd.getpwnam(real_user).pw_uid
-        for node_id in range(num_nodes):
+        for node_id in node_ids:
             tap = tap_name(zone_cfg, node_id)
             queue_count = effective.get("nic_queues", 1)
             need_mq = queue_count > 1
@@ -817,7 +1006,7 @@ def setup(config: dict):
                 raise RuntimeError(f"TAP {tap} is not multi_queue but nic_queues={queue_count}")
 
         # Create ivshmem backing files (pre-created so both VMs share the same file)
-        links = ivshmem_links(zone_cfg, num_nodes)
+        links = ivshmem_links(zone_cfg, node_ids)
         if links:
             ivshmem_cfg = effective.get("ivshmem", {})
             root_path = ivshmem_cfg.get("root_path", "/dev/shm")
@@ -842,9 +1031,7 @@ def setup(config: dict):
     # Generate persistent SSH host keys for all unique nodes
     all_node_ids = set()
     for zone_cfg in zones:
-        num_nodes = zone_cfg.get("nodes", 2)
-        for nid in range(num_nodes):
-            all_node_ids.add(nid)
+        all_node_ids.update(zone_node_ids(zone_cfg))
 
     print("--- SSH Host Keys ---")
     ensure_ssh_host_keys(sorted(all_node_ids))
@@ -859,6 +1046,7 @@ def setup(config: dict):
 
 
 def teardown(config: dict):
+    validate_cluster_config(config)
     zones = [z for z in config["zones"] if z.get("id") != "GLOBAL"]
     global_cfg = find_global(config["zones"])
 
@@ -866,10 +1054,15 @@ def teardown(config: dict):
 
     for zone_cfg in zones:
         zname = zone_name(zone_cfg)
-        num_nodes = zone_cfg.get("nodes", 2)
+        node_ids = zone_node_ids(zone_cfg)
         effective = resolve_config(global_cfg, zone_cfg)
 
         print(f"--- Zone: {zname} ---")
+
+        if zone_uses_socket_netdev(global_cfg, zone_cfg):
+            print("  No host bridge/TAP topology for QEMU socket multicast")
+            print()
+            continue
 
         # Detach uplink from bridge before deleting
         bridge_cfg = effective.get("bridge", {})
@@ -884,7 +1077,7 @@ def teardown(config: dict):
             print(f"  Detached uplink: {uplink}")
 
         # Delete TAP devices
-        for node_id in range(num_nodes):
+        for node_id in node_ids:
             tap = tap_name(zone_cfg, node_id)
             if link_exists(tap):
                 run(f"ip link set {tap} down", check=False, quiet=True, privileged=True)
@@ -900,7 +1093,7 @@ def teardown(config: dict):
             print(f"  Deleted bridge: {br}")
 
         # Delete ivshmem files
-        links = ivshmem_links(zone_cfg, num_nodes)
+        links = ivshmem_links(zone_cfg, node_ids)
         if links:
             ivshmem_cfg = effective.get("ivshmem", {})
             root_path = ivshmem_cfg.get("root_path", "/dev/shm")
@@ -915,8 +1108,7 @@ def teardown(config: dict):
     # Remove overlay directories derived from this config's VM specs.
     overlay_dirs = set()
     for zone_cfg in zones:
-        num_nodes = zone_cfg.get("nodes", 2)
-        for node_id in range(num_nodes):
+        for node_id in zone_node_ids(zone_cfg):
             node_override = get_node_config(zone_cfg, node_id)
             effective = resolve_config(global_cfg, zone_cfg, node_override)
             vm_cfg = effective.get("vm", {})
@@ -1034,13 +1226,13 @@ def cluster_launch_guard(*, reject_running_qemus: bool = True):
 
 def collect_unique_nodes(config: dict) -> dict:
     """Build a map: node_id -> list of (zone_cfg, effective_cfg, node_cfg)."""
+    validate_cluster_config(config)
     zones = [z for z in config["zones"] if z.get("id") != "GLOBAL"]
     global_cfg = find_global(config["zones"])
 
     nodes = {}
     for zone_cfg in zones:
-        num_nodes = zone_cfg.get("nodes", 2)
-        for node_id in range(num_nodes):
+        for node_id in zone_node_ids(zone_cfg):
             node_override = get_node_config(zone_cfg, node_id)
             effective = resolve_config(global_cfg, zone_cfg, node_override)
             if node_id not in nodes:
@@ -1084,14 +1276,17 @@ def link_master(link: dict) -> str | None:
 
 def validate_no_setup_topology(config: dict) -> None:
     """Validate the already-created topology before rootless VM launch."""
+    validate_cluster_config(config)
     zones = [z for z in config["zones"] if z.get("id") != "GLOBAL"]
     global_cfg = find_global(config["zones"])
     failures: list[str] = []
 
     for zone_cfg in zones:
         zname = zone_name(zone_cfg)
-        num_nodes = int(zone_cfg.get("nodes", 2))
+        node_ids = zone_node_ids(zone_cfg)
         effective = resolve_config(global_cfg, zone_cfg)
+        if zone_uses_socket_netdev(global_cfg, zone_cfg):
+            continue
         bridge = bridge_name(zone_cfg)
         bridge_link = link_json(bridge)
         if bridge_link is None:
@@ -1099,7 +1294,7 @@ def validate_no_setup_topology(config: dict) -> None:
         elif not link_is_up(bridge_link):
             failures.append(f"bridge {bridge} for zone {zname} is not UP")
 
-        for node_id in range(num_nodes):
+        for node_id in node_ids:
             tap = tap_name(zone_cfg, node_id)
             tap_link = link_json(tap)
             if tap_link is None:
@@ -2074,26 +2269,26 @@ def cluster_node_spec(node_id: int, node_info: dict, config: dict) -> dict:
         zone_id = zone_cfg["id"]
         node_override = get_node_config(zone_cfg, node_id)
         zone_eff = resolve_config(global_cfg, zone_cfg, node_override)
-        spec["nics"].append(
-            {
-                "name": zone_name(zone_cfg),
-                "zone_id": zone_id,
-                "tap": tap_name(zone_cfg, node_id),
-                "mac": mac_addr(zone_id, node_id, 0),
-                "model": zone_eff.get("nic_model", "virtio-net-pci"),
-                "queues": zone_eff.get("nic_queues", 1),
-                "vhost": bool(zone_eff.get("vhost", False)),
-                "driver": zone_eff.get("netdev_driver", "unmanaged"),
-            }
-        )
+        nic = {
+            "name": zone_name(zone_cfg),
+            "zone_id": zone_id,
+            "tap": tap_name(zone_cfg, node_id),
+            "mac": mac_addr(zone_id, node_id, 0),
+            "model": zone_eff.get("nic_model", "virtio-net-pci"),
+            "queues": zone_eff.get("nic_queues", 1),
+            "vhost": bool(zone_eff.get("vhost", False)),
+            "driver": zone_eff.get("netdev_driver", "unmanaged"),
+        }
+        if "qemu_netdev" in zone_eff:
+            nic["qemu_netdev"] = deepcopy(zone_eff["qemu_netdev"])
+        spec["nics"].append(nic)
 
     # Add ivshmem devices - one per ivshmem link involving this node.
     # Pre-created /dev/shm files avoid BAR placement issues with hugepages
     # on hosts with above-4G decoding enabled.
     for zone_cfg in node_info["zones"]:
         zone_eff = resolve_config(global_cfg, zone_cfg)
-        num_nodes = zone_cfg.get("nodes", 2)
-        links = ivshmem_links(zone_cfg, num_nodes)
+        links = ivshmem_links(zone_cfg, zone_node_ids(zone_cfg))
         ivshmem_cfg = zone_eff.get("ivshmem", {})
         root_path = ivshmem_cfg.get("root_path", "/dev/shm")
         size_str = ivshmem_cfg.get("size", "16M")

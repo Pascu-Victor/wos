@@ -7,6 +7,13 @@
 
 namespace ker::net::wki {
 
+struct WkiHeader;
+struct WkiTransport;
+
+// Claim a config-assigned WKI NIC before peer discovery can snapshot local
+// resources. Claiming does not register a transport or send any traffic.
+void wki_eth_transport_claim(net::NetDevice* netdev);
+
 // Initialize the Ethernet WKI transport on the given NIC.
 // Called from main.cpp during boot after NIC drivers are probed.
 void wki_eth_transport_init(net::NetDevice* netdev);
@@ -28,5 +35,13 @@ auto wki_eth_get_netdev() -> net::NetDevice*;
 // own control/bulk frames may not be leaving the NIC, a missing heartbeat is not
 // strong enough evidence to tear down a peer.
 auto wki_eth_recent_tx_pressure(uint64_t now_us) -> bool;
+
+// Make an injected transport failure participate in the same local-observation
+// safety window as a concrete Ethernet enqueue failure.
+void wki_eth_note_injected_tx_failure(WkiTransport* transport, const void* data, uint16_t len);
+
+// Apply direct-peer ingress identity only after the chaos boundary elects to
+// deliver a frame. This keeps injected drops from refreshing peer contact.
+void wki_eth_note_rx_contact(WkiTransport* transport, const WkiHeader* header, const proto::MacAddress& src_mac);
 
 }  // namespace ker::net::wki

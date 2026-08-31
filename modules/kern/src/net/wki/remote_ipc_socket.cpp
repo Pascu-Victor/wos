@@ -75,26 +75,6 @@ auto socket_proxy_from_file(ker::vfs::File* file) -> ProxyIpcState* {
 // Helpers
 // ---------------------------------------------------------------------------
 
-// Fire-and-forget stream op (no response needed, e.g. OP_SOCK_CLOSE).
-auto send_socket_op(ProxyIpcState* proxy, uint16_t op_id) -> int {
-    if (proxy == nullptr || !proxy->active.load(std::memory_order_acquire)) {
-        return -EBADF;
-    }
-    if (proxy->home_node == WKI_NODE_INVALID) {
-        return -EHOSTUNREACH;
-    }
-
-    constexpr size_t HEADER_SIZE = sizeof(DevOpReqPayload) + sizeof(uint32_t);
-    std::array<uint8_t, HEADER_SIZE> msg = {};
-    auto* req = reinterpret_cast<DevOpReqPayload*>(msg.data());
-    req->op_id = op_id;
-    req->data_len = sizeof(uint32_t);
-    std::memcpy(msg.data() + sizeof(DevOpReqPayload), &proxy->resource_id, sizeof(uint32_t));
-
-    int const TX = wki_send(proxy->home_node, WKI_CHAN_IPC_DATA, MsgType::DEV_OP_REQ, msg.data(), static_cast<uint16_t>(msg.size()));
-    return TX == WKI_OK ? 0 : -EIO;
-}
-
 // Synchronous control op — sends request with optional extra payload, waits for
 // response, copies response data into resp_buf up to resp_max bytes.
 // Returns 0 on success or a negative errno.
@@ -327,7 +307,15 @@ auto proxy_socket_close(ker::vfs::File* f) -> int {
     if (proxy == nullptr) {
         return 0;
     }
-    (void)send_socket_op(proxy, OP_SOCK_CLOSE);
+
+    constexpr size_t MSG_SIZE = sizeof(DevOpReqPayload) + sizeof(uint32_t);
+    std::array<uint8_t, MSG_SIZE> msg = {};
+    auto* req = reinterpret_cast<DevOpReqPayload*>(msg.data());
+    req->op_id = OP_SOCK_CLOSE;
+    req->data_len = sizeof(uint32_t);
+    std::memcpy(msg.data() + sizeof(DevOpReqPayload), &proxy->resource_id, sizeof(proxy->resource_id));
+
+    wki_ipc_send_proxy_close(proxy, msg.data(), static_cast<uint16_t>(msg.size()), proxy->resource_id, OP_SOCK_CLOSE);
     wki_ipc_detach_proxy_file(f, proxy);
     return 0;
 }

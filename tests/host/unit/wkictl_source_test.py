@@ -53,6 +53,13 @@ def require_tokens(source: str, tokens: list[str], context: str) -> None:
         fail(f"{context}: missing {', '.join(missing)}")
 
 
+def require_order(source: str, before: str, after: str, context: str) -> None:
+    before_pos = source.find(before)
+    after_pos = source.find(after)
+    if before_pos < 0 or after_pos < 0 or before_pos >= after_pos:
+        fail(f"{context}: expected {before!r} before {after!r}")
+
+
 def alias_targets() -> dict[str, tuple[str, str]]:
     targets: dict[str, tuple[str, str]] = {}
     for line in ALIASES.read_text().splitlines():
@@ -278,6 +285,136 @@ def test_wkictl_vfs_forward_and_commands_use_wki_wrappers() -> None:
         "forward persona parser",
     )
 
+
+def test_wkictl_chaos_adapter_is_bounded_and_procfs_gated() -> None:
+    source = read_wkictl_source()
+    dispatch = function_body(source, "run_wkictl")
+    require_tokens(
+        dispatch,
+        [
+            'std::strcmp(argv[1], "chaos") == 0',
+            "return wkictl::handle_chaos(argc, argv)",
+        ],
+        "wkictl chaos dispatch",
+    )
+
+    handler = function_body(source, "handle_chaos")
+    require_tokens(
+        handler,
+        [
+            "WKI_CHAOS_ARGUMENT_MAX + 2",
+            "valid_verb(argv[2])",
+            "valid_token(token)",
+            "WKI_CHAOS_COMMAND_MAX - 1 - SEPARATOR - TOKEN_LENGTH",
+            "open(WKI_CHAOS_PATH, O_WRONLY)",
+            "write_command(FD, command.data(), length)",
+            'std::strcmp(argv[2], "wait") == 0',
+            "parse_wait_request(argc, argv, &request)",
+            "return wait_for_rule(request)",
+            '"       rule selectors include op=<u16|*> and neighbor_host/src_host/dst_host=<hostname>\\n"',
+            '"payload_xor=<nonzero-u8>\\n"',
+        ],
+        "bounded wkictl chaos command",
+    )
+    valid_verb = function_body(source, "valid_verb")
+    require_tokens(
+        valid_verb,
+        ['"clear"', '"disable"', '"enable"', '"heal"', '"release"', '"rule"', '"wait"'],
+        "wkictl chaos verb allowlist",
+    )
+    valid_token = function_body(source, "valid_token")
+    require_tokens(
+        valid_token,
+        ["*cursor == '='", "*cursor == '*'", "return false"],
+        "wkictl chaos token allowlist",
+    )
+
+    wait_parser = function_body(source, "parse_wait_request")
+    require_tokens(
+        wait_parser,
+        [
+            "argc != 6",
+            '"id"',
+            '"applied"',
+            '"matched"',
+            '"timeout_ms"',
+            "!have_id",
+            "!have_applied",
+            "!have_timeout",
+            "out->applied != 0",
+            "out->timeout_ms <= WKI_CHAOS_WAIT_MAX_MS",
+        ],
+        "strict wkictl chaos wait parser",
+    )
+    wait_body = function_body(source, "wait_for_rule")
+    require_tokens(
+        wait_body,
+        [
+            "WKI_CHAOS_SNAPSHOT_MAX + 1",
+            "monotonic_ms()",
+            "DEADLINE",
+            "read_chaos_snapshot",
+            "snapshot_wait_state",
+            "SnapshotWaitState::READY",
+            "SnapshotWaitState::INVALID",
+            "REMAINING_MS",
+            "nanosleep",
+        ],
+        "bounded wkictl chaos wait loop",
+    )
+    snapshot_parser = function_body(source, "snapshot_wait_state")
+    require_tokens(
+        snapshot_parser,
+        [
+            'row_is(line, LINE_LEN, "wki_chaos")',
+            'row_is(line, LINE_LEN, "wki_chaos_rule")',
+            'row_is(line, LINE_LEN, "wki_chaos_end")',
+            'u32_field(line, LINE_LEN, "schema", &schema)',
+            'u32_field(line, LINE_LEN, "runtime_control", &runtime_control)',
+            'u32_field(line, LINE_LEN, "queue_overflow", &queue_overflow)',
+            'u32_field(line, LINE_LEN, "trace_overflow", &trace_overflow)',
+            'u32_field(line, LINE_LEN, "stream_overflow", &stream_overflow)',
+            'u32_field(line, LINE_LEN, "invalid", &invalid)',
+            "applied > request.applied",
+            "applied < request.applied",
+            'std::strcmp(action.data(), "delay") == 0',
+            'std::strcmp(action.data(), "reorder") == 0',
+            "queued < request.applied",
+            "newline + 1 != snapshot + size",
+        ],
+        "fail-closed wkictl chaos snapshot parser",
+    )
+
+    procfs = (ROOT / "modules" / "kern" / "src" / "vfs" / "fs" / "procfs.cpp").read_text()
+    require_tokens(
+        procfs,
+        [
+            "ProcNodeType::WKI_CHAOS_FILE",
+            "snapshot.runtime_control_allowed",
+            "return -EPERM",
+            "wki_chaos_configure(command, count)",
+        ],
+        "kernel chaos boot gate",
+    )
+    chaos_generator = function_body(procfs, "generate_wki_chaos")
+    require_tokens(
+        chaos_generator,
+        [
+            "wki_chaos_capture(&snapshot",
+            "snapshot.active_rule_count",
+            "rule_count",
+            "snapshot.trace_count",
+            "trace_count",
+            "counters.coalesced",
+            "row.coalesced_count",
+            'chaos_outcome_name(row.outcome)',
+        ],
+        "single-generation chaos proc snapshot",
+    )
+    for split_snapshot_call in ("wki_chaos_snapshot(", "wki_chaos_rule_snapshot(", "wki_chaos_trace_snapshot("):
+        if split_snapshot_call in chaos_generator:
+            fail(f"chaos proc snapshot must use one atomic capture, found {split_snapshot_call}")
+
     add_operand = function_body(source, "add_forward_operand")
     require_tokens(
         add_operand,
@@ -312,6 +449,43 @@ def test_wkictl_vfs_forward_and_commands_use_wki_wrappers() -> None:
             'std::strcmp(argv[2], "probe") == 0',
         ],
         "wkictl vfs command handling",
+    )
+
+
+def test_wkictl_chaos_hostname_selectors_are_strict_and_canonical() -> None:
+    source = read_wkictl_source()
+    selector = function_body(source, "chaos_peer_selector")
+    require_tokens(
+        selector,
+        [
+            'SelectorName{"neighbor", "neighbor_host", ChaosPeerSelector::NEIGHBOR}',
+            'SelectorName{"src", "src_host", ChaosPeerSelector::SRC}',
+            'SelectorName{"dst", "dst_host", ChaosPeerSelector::DST}',
+            "*hostname_alias = true",
+        ],
+        "chaos hostname selector allowlist",
+    )
+
+    handler = function_body(source, "handle_chaos")
+    require_tokens(
+        handler,
+        [
+            "std::array<std::array<char, 32>, WKI_CHAOS_ARGUMENT_MAX> resolved_peer_tokens{}",
+            "std::array<bool, 3> have_peer_selector{}",
+            'std::strcmp(argv[2], "rule") != 0',
+            "have_peer_selector.at(SELECTOR_INDEX)",
+            "wkictl::resolve_peer_hostname(HOSTNAME, &node_id)",
+            'std::snprintf(resolved.data(), resolved.size(), "%s=%u"',
+            '"wkictl chaos: {} and {}_host are mutually exclusive and singular"',
+            "emitted_token = resolved.data()",
+        ],
+        "strict bounded hostname-to-node selector rewrite",
+    )
+    require_order(
+        handler,
+        "wkictl::resolve_peer_hostname(HOSTNAME, &node_id)",
+        "open(WKI_CHAOS_PATH, O_WRONLY)",
+        "hostname resolution before procfs mutation",
     )
 
 
@@ -351,6 +525,8 @@ def main() -> None:
     test_external_coproc_preserves_argv_stdio_and_status()
     test_wkictl_target_personas_set_expected_policy()
     test_wkictl_vfs_forward_and_commands_use_wki_wrappers()
+    test_wkictl_chaos_adapter_is_bounded_and_procfs_gated()
+    test_wkictl_chaos_hostname_selectors_are_strict_and_canonical()
     test_wkictl_headers_expose_matching_wki_wrappers()
     print("wkictl alias, persona, and WKI wrapper source checks passed")
 

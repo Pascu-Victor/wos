@@ -1,0 +1,74 @@
+{
+    "zones": [
+        {
+            "id": "GLOBAL",
+            "debug": false,
+            "mtu": 9000,
+            "nic_model": "virtio-net-pci",
+            "ivshmem": {
+                "enabled": false,
+                "size": "16M",
+                "root_path": "/tmp/wos-wki-chaos-ivshmem",
+                "topology": "full-mesh"
+            },
+            "bridge": {
+                "stp": false,
+                "ip": null
+            },
+            "vm": {
+                "memory": "4G",
+                "cpus": 4,
+                "disk0": "wki-chaos-data/disk.qcow2",
+                "disk1": "wki-chaos-data/mountfs.qcow2"
+            }
+        },
+        {
+            "id": 0,
+            "name": "lan",
+            "nodes": 2,
+            "nic_queues": 2,
+            "vhost": false,
+            "netdev_driver": "dhcp",
+            "bridge": {
+                "ip": "10.10.0.100/24",
+                "dns": "10.10.0.1"
+            },
+            "nodes_config": [
+                {
+                    "id": 0,
+                    "hostname": "wos-0",
+                    "vm": {
+                        "overlay_dir": "wki-chaos-data/ivshmem-overlays",
+                        "serial_log": "wki-chaos-data/ivshmem-serial-vm0.log",
+                        "qemu_log": "wki-chaos-data/ivshmem-qemu-vm0.log",
+                        "qmp_socket": "wki-chaos-data/ivshmem-qmp-vm0.sock"
+                    }
+                },
+                {
+                    "id": 1,
+                    "hostname": "wos-1",
+                    "vm": {
+                        "overlay_dir": "wki-chaos-data/ivshmem-overlays",
+                        "serial_log": "wki-chaos-data/ivshmem-serial-vm1.log",
+                        "qemu_log": "wki-chaos-data/ivshmem-qemu-vm1.log",
+                        "qmp_socket": "wki-chaos-data/ivshmem-qmp-vm1.sock"
+                    }
+                }
+            ]
+        },
+        {
+            "id": 1,
+            "name": "wki",
+            "nodes": 2,
+            "nic_queues": 2,
+            "vhost": false,
+            "netdev_driver": "wki",
+            "ivshmem": {
+                "enabled": true,
+                "size": "16M",
+                "root_path": "/tmp/wos-wki-chaos-ivshmem",
+                "topology": "full-mesh"
+            }
+        }
+    ]
+}

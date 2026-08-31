@@ -320,7 +320,14 @@ def test_net_notify_handlers_validate_cookie_envelope() -> None:
 def test_net_rx_credit_accounting_uses_proxy_lock() -> None:
     source = REMOTE_NET_CPP.read_text()
     source_without_helpers = source
-    for helper_name in ("set_net_rx_credits_locked", "consume_net_rx_credit_locked"):
+    # Snapshotting copies the counter under the same proxy lock but does not
+    # mutate it. Remove that read-only assignment along with the two mutation
+    # helpers before asserting that no other assignment sites exist.
+    for helper_name in (
+        "set_net_rx_credits_locked",
+        "consume_net_rx_credit_locked",
+        "wki_remote_net_diag_snapshot",
+    ):
         source_without_helpers = source_without_helpers.replace(function_body(source, helper_name), "")
     helper = function_body(source, "consume_net_rx_credit_locked")
     rx_body = function_body(source, "handle_net_rx_notify")
@@ -744,6 +751,56 @@ def test_channel_reuse_generation_guards_unlock_tx_relock_paths() -> None:
             fail(f"{name} is missing channel reuse generation guards: " + ", ".join(missing))
 
 
+def test_retransmit_snapshot_has_one_owner_across_progress_paths() -> None:
+    source = WKI_CPP.read_text()
+    header = WKI_HPP.read_text()
+    capture = function_body(source, "capture_retransmit_head_snapshot")
+    timer_single = function_body(source, "wki_timer_tick_single")
+    timer_all = function_body(source, "wki_timer_tick")
+
+    if "bool retransmit_in_progress = false;" not in header:
+        fail("WkiChannel must carry an exclusive retransmit snapshot claim")
+    require_order(capture, "!ch->retransmit_in_progress", "ch->retransmit_in_progress = true;", "retransmit claim publication")
+    require_order(capture, "ch->retransmit_in_progress = true;", "ch->lock.unlock();", "claim before unlock")
+    for token in [
+        "release_retransmit_claim_after_capture_failure",
+        "release_retransmit_snapshot_claim_locked(ch, generation)",
+    ]:
+        if token not in capture:
+            fail(f"retransmit snapshot capture must release failed claims via {token}")
+
+    for name, body in (("wki_timer_tick_single", timer_single), ("wki_timer_tick", timer_all)):
+        if "release_retransmit_snapshot_claim_locked(ch, retransmit.generation);" not in body:
+            fail(f"{name} must release its exact generation-fenced retransmit claim")
+
+    fast_send = source.find("if (retransmit_snapshot_present(fast_retransmit))")
+    fast_release = source.find("release_retransmit_snapshot_claim_locked(ch, fast_retransmit.generation);", fast_send)
+    if fast_send < 0 or fast_release < fast_send:
+        fail("fast retransmit must release its exact generation-fenced claim")
+
+
+def test_fast_retransmit_fires_once_per_unchanged_ack_gap() -> None:
+    source = WKI_CPP.read_text()
+    header = WKI_HPP.read_text()
+    rx = function_body(source, "wki_rx")
+
+    if "uint32_t fast_retransmit_seq = WKI_ACK_NONE;" not in header:
+        fail("WkiChannel must remember which queue head already used fast recovery")
+    require_order(rx, "ch->fast_retransmit_seq = WKI_ACK_NONE;", "while ((ch->retransmit_head", "ACK progress rearms fast recovery")
+    require_order(
+        rx,
+        "if (ch->fast_retransmit_seq != rt->seq)",
+        "ch->fast_retransmit_seq = rt->seq;",
+        "one fast retransmit per head",
+    )
+    require_order(
+        rx,
+        "ch->fast_retransmit_seq = rt->seq;",
+        "need_fast_retransmit = true;",
+        "record head before unlocked fast retransmit",
+    )
+
+
 def test_block_ring_binding_lifetime_is_retained_outside_server_lock() -> None:
     source = DEV_SERVER_CPP.read_text()
     header = (ROOT / "modules" / "kern" / "src" / "net" / "wki" / "dev_server.hpp").read_text()
@@ -772,9 +829,15 @@ def test_block_ring_binding_lifetime_is_retained_outside_server_lock() -> None:
         if token not in header:
             fail(f"DevServerBinding lifecycle state is missing {token}")
 
-    require_order(post_body, "binding = find_binding_by_zone_id(zone_id);", "retain_binding_locked(binding)", "zone post retain")
-    require_order(post_body, "retain_binding_locked(binding)", "blk_ring_server_poll(binding);", "zone post poll")
-    require_order(post_body, "blk_ring_server_poll(binding);", "release_binding(binding);", "zone post release")
+    for token in [
+        "find_binding_by_zone_id(zone_id)",
+        "binding->blk_sq_notified = true",
+        "wki_deferred_work_notify()",
+    ]:
+        if token not in post_body:
+            fail(f"zone post must perform bounded admission into task-context polling: missing {token!r}")
+    if "blk_ring_server_poll" in post_body or "retain_binding_locked" in post_body:
+        fail("zone post must not retain or poll a block ring from RX/NAPI context")
 
     require_order(pending_body, "retain_binding_locked(&b)", "wki_zone_create", "pending zone retain before blocking create")
     require_order(pending_body, "wki_zone_create", "binding_still_active", "pending zone revalidation after blocking create")
@@ -785,22 +848,69 @@ def test_block_ring_binding_lifetime_is_retained_outside_server_lock() -> None:
     require_order(poll_body, "blk_ring_server_poll(binding);", "release_binding(binding);", "ring poll release")
 
 
+def test_block_message_ops_use_fixed_rx_admission_and_task_context_io() -> None:
+    source = DEV_SERVER_CPP.read_text()
+    header = DEV_SERVER_HPP.read_text()
+    ktest = WKI_DEV_SERVER_KTEST.read_text()
+    dispatch = function_body(source, "handle_dev_op_req")
+    queue = function_body(source, "queue_block_op")
+    worker = function_body(source, "run_deferred_block_op")
+    run = function_body(source, "run_deferred_vfs_op")
+
+    if any(token in dispatch for token in ["ker::dev::block_read", "ker::dev::block_write", "ker::dev::block_flush", "new (std::nothrow)"]):
+        fail("block message dispatch must not allocate or issue block I/O in RX/NAPI context")
+    for token in [
+        "queue_block_op(hdr, CHANNEL_IDENTITY, req->op_id, req_data, REQ_DATA_LEN)",
+        "send_block_status_response(CHANNEL_IDENTITY, req->op_id, -ENOMEM, REQUEST_COOKIE)",
+    ]:
+        if token not in dispatch:
+            fail(f"block RX dispatch is missing fixed-pool admission behavior: {token!r}")
+
+    for token in [
+        "try_alloc_block_op_work()",
+        "retain_binding_locked(binding)",
+        "std::memcpy(op->req_data, req_data, req_data_len)",
+        "shard->lock.try_lock()",
+        "wake_task_from_event(shard->task)",
+    ]:
+        if token not in queue:
+            fail(f"block RX admission is missing bounded copy/enqueue behavior: {token!r}")
+    if "deferred_vfs_op_alloc" in queue or "operator new" in queue:
+        fail("block RX admission must use fixed storage without dynamic allocation")
+
+    for token in ["ker::dev::block_read", "ker::dev::block_write", "ker::dev::block_flush"]:
+        if token not in worker:
+            fail(f"block task-context worker is missing {token!r}")
+    require_order(run, "if (op->fixed_block_op)", "run_deferred_block_op(op)", "fixed block worker dispatch")
+    require_order(run, "run_deferred_block_op(op)", "release_binding(RETAINED_BINDING)", "block binding lifetime")
+
+    if "wki_dev_server_selftest_block_ops_use_fixed_admission()" not in header:
+        fail("fixed block admission selftest must be declared")
+    for token in [
+        "KTEST(WkiDevServerBlockRx, UsesBoundedFixedAdmissionBeforeTaskContextIo)",
+        "wki_dev_server_selftest_block_ops_use_fixed_admission()",
+    ]:
+        if token not in ktest:
+            fail(f"fixed block admission KTEST coverage is missing {token!r}")
+
+
 def test_deferred_vfs_ops_retain_their_binding_through_blocking_work() -> None:
     source = DEV_SERVER_CPP.read_text()
     header = DEV_SERVER_HPP.read_text()
     ktest = WKI_DEV_SERVER_KTEST.read_text()
-    queue_body = function_body(source, "queue_vfs_op")
+    queue_body = function_body(source, "try_queue_pre_admitted_vfs_op")
     run_body = function_body(source, "run_deferred_vfs_op")
-    alloc_body = function_body(source, "deferred_vfs_op_alloc")
     release_body = function_body(source, "deferred_vfs_op_release")
-    regular_run_body = run_body[run_body.index("// queue_vfs_op retained") :]
+    regular_run_body = run_body[run_body.index("// Pre-ACK admission retained") :]
     queue_required = [
-        "DevServerBinding* retained_binding = nullptr",
+        "s_vfs_op_pool_lock.try_lock()",
+        "shard->lock.try_lock()",
+        "s_server_lock.try_lock()",
         "find_binding_by_channel_identity(channel_identity)",
-        "retain_binding_locked(binding)",
-        "retained_binding = binding",
-        "if (retained_binding == nullptr)",
+        "retain_binding_locked(retained_binding)",
+        "op->fixed_vfs_op = true",
         "op->retained_binding = retained_binding",
+        "std::memcpy(op->req_data, req_data, req_data_len)",
     ]
     missing = [token for token in queue_required if token not in queue_body]
     if missing:
@@ -820,10 +930,9 @@ def test_deferred_vfs_ops_retain_their_binding_through_blocking_work() -> None:
     if missing:
         fail("deferred VFS worker must consume the retained binding: " + ", ".join(missing))
 
-    require_order(queue_body, "retain_binding_locked(binding)", "deferred_vfs_op_alloc(req_data_len)", "VFS retain before allocation/enqueue")
-    require_order(queue_body, "retain_binding_locked(binding)", "op->retained_binding = retained_binding", "VFS retained pointer transfer")
-    require_order(queue_body, "deferred_vfs_op_alloc(req_data_len)", "std::memcpy(op->req_data", "VFS allocation before request copy")
-    require_order(queue_body, "std::memcpy(op->req_data", "shard->lock.lock_irqsave()", "VFS request copy before FIFO publication")
+    require_order(queue_body, "retain_binding_locked(retained_binding)", "op->retained_binding = retained_binding", "VFS retained pointer transfer")
+    require_order(queue_body, "s_vfs_op_free = op->next", "std::memcpy(op->req_data", "VFS fixed reservation before request copy")
+    require_order(queue_body, "std::memcpy(op->req_data", "shard->pending.fetch_add", "VFS request copy before FIFO publication")
     require_order(
         regular_run_body,
         "channel_identity_matches(RETAINED_BINDING->channel_identity, op->channel_identity)",
@@ -844,20 +953,15 @@ def test_deferred_vfs_ops_retain_their_binding_through_blocking_work() -> None:
         "std::memcpy(export_path.data()",
         "std::memcpy(export_name.data()",
     ]:
-        if forbidden in run_body:
+        if forbidden in regular_run_body:
             fail(f"retained VFS binding identity must be consumed directly without a locked snapshot: found {forbidden}")
 
-    for token in [
-        "::operator new(sizeof(DeferredVfsOp) + req_data_len, std::nothrow)",
-        "new (STORAGE) DeferredVfsOp{}",
-        "op->req_data = reinterpret_cast<uint8_t*>(op + 1)",
-    ]:
-        if token not in alloc_body:
-            fail(f"deferred VFS coallocation helper is missing {token}")
-    require_order(release_body, "op->~DeferredVfsOp()", "::operator delete(op)", "deferred VFS placement destruction")
-    for forbidden in ["new (std::nothrow) DeferredVfsOp", "new (std::nothrow) uint8_t[req_data_len]"]:
+    for token in ["if (op->fixed_vfs_op)", "s_vfs_op_pool_lock.lock_irqsave()", "s_vfs_op_free = op"]:
+        if token not in release_body:
+            fail(f"deferred VFS fixed-pool release is missing {token}")
+    for forbidden in ["operator new", "new (std::nothrow)", "lock_irqsave()"]:
         if forbidden in queue_body:
-            fail(f"deferred VFS enqueue must use one exact coallocation: found {forbidden}")
+            fail(f"deferred VFS RX admission must be fixed and try-only: found {forbidden}")
     for forbidden in ["delete[] op->req_data", "delete op"]:
         if forbidden in run_body:
             fail(f"deferred VFS worker must use the common coallocation release: found {forbidden}")
@@ -865,9 +969,9 @@ def test_deferred_vfs_ops_retain_their_binding_through_blocking_work() -> None:
     selftest_token = "wki_dev_server_selftest_deferred_vfs_storage_is_coallocated"
     if f"auto {selftest_token}() -> bool" not in source or f"auto {selftest_token}() -> bool;" not in header:
         fail("deferred VFS coallocation selftest must be implemented and declared")
-    for token in ["DeferredRequestStorageIsCoallocated", selftest_token]:
+    for token in ["DeferredRequestStorageIsFixedBoundedAndRecycled", selftest_token]:
         if token not in ktest:
-            fail(f"deferred VFS coallocation KTEST coverage is missing {token}")
+            fail(f"deferred VFS fixed-storage KTEST coverage is missing {token}")
 
 
 def test_path_utimens_is_deferred_without_reclassifying_invalidate() -> None:
@@ -896,10 +1000,15 @@ def test_path_utimens_is_deferred_without_reclassifying_invalidate() -> None:
     classifier_pos = handler.find("bool const IS_VFS_OP = is_vfs_op(req->op_id)")
     if classifier_pos < 0 or classifier_pos >= dispatch_pos:
         fail("VFS opcode classification must precede deferred dispatch")
-    queue_pos = dispatch.find("queue_vfs_op(hdr, CHANNEL_IDENTITY")
+    queue_pos = dispatch.find("send_vfs_error_response(CHANNEL_IDENTITY, req->op_id, -EAGAIN")
     return_pos = dispatch.rfind("return;")
     if queue_pos < 0 or return_pos <= queue_pos:
-        fail("deferred VFS dispatch must return from RX after queue admission")
+        fail("VFS fallback dispatch must fail without filesystem work or allocation")
+
+    rx_admission = function_body(source, "wki_dev_server_admit_vfs_op_rx")
+    for token in ["try_queue_pre_admitted_vfs_op", "WkiVfsOpRxAdmission::RETRY", "WkiVfsOpRxAdmission::DEFERRED"]:
+        if token not in rx_admission:
+            fail(f"VFS reliable pre-ACK admission is missing {token}")
 
     if admission.count("op_id <= OP_VFS_METADATA_BATCH") != 2:
         fail("VFS request and response admission must include path utimens during export rebuild/drain")
@@ -934,11 +1043,13 @@ def test_metadata_batch_is_capability_gated_preflighted_and_worker_executed() ->
     if "WKI_CAP_VFS_METADATA_BATCH" not in function_body(wki_source, "wki_init"):
         fail("metadata batch capability must be advertised in HELLO")
 
-    capability_pos = rx_handler.find("wki_peer_capability_negotiated(hdr->src_node, WKI_CAP_VFS_METADATA_BATCH)")
-    unsupported_pos = rx_handler.find("-EOPNOTSUPP", capability_pos)
-    queue_pos = rx_handler.find("queue_vfs_op(hdr, CHANNEL_IDENTITY")
-    if min(capability_pos, unsupported_pos, queue_pos) < 0 or not capability_pos < unsupported_pos < queue_pos:
-        fail("metadata batch must reject unnegotiated peers before deferred queue admission")
+    capability_pos = worker.find("wki_peer_capability_negotiated(op->hdr.src_node, WKI_CAP_VFS_METADATA_BATCH)")
+    unsupported_pos = worker.find("-EOPNOTSUPP", capability_pos)
+    execute_pos = worker.find("handle_vfs_metadata_batch_op", unsupported_pos)
+    if min(capability_pos, unsupported_pos, execute_pos) < 0 or not capability_pos < unsupported_pos < execute_pos:
+        fail("metadata batch must reject unnegotiated peers in task context before execution")
+    if "wki_peer_capability_negotiated" in rx_handler:
+        fail("metadata batch RX admission must remain bounded and side-effect free")
 
     if "if (op->op_id == OP_VFS_METADATA_BATCH)" not in worker or "handle_vfs_metadata_batch_op" not in worker:
         fail("metadata batch must execute only from the deferred VFS worker")
@@ -1038,7 +1149,7 @@ def test_epoch_cleanup_and_deferred_vfs_are_channel_generation_fenced() -> None:
     marker = function_body(source, "wki_dev_server_mark_epoch_reset")
     cleanup = function_body(source, "wki_dev_server_cleanup_epoch_reset_for_peer")
     handler = function_body(source, "handle_dev_op_req")
-    queue = function_body(source, "queue_vfs_op")
+    queue = function_body(source, "try_queue_pre_admitted_vfs_op")
     worker = function_body(source, "run_deferred_vfs_op")
     worker_index = function_body(source, "vfs_worker_index")
     worker_dequeue = function_body(source, "vfs_worker_dequeue")
@@ -1083,7 +1194,6 @@ def test_epoch_cleanup_and_deferred_vfs_are_channel_generation_fenced() -> None:
         ".channel = rx_channel",
         ".generation = rx_channel_generation",
         "find_binding_by_channel_identity(CHANNEL_IDENTITY)",
-        "queue_vfs_op(hdr, CHANNEL_IDENTITY",
     ]:
         if token not in handler:
             fail(f"DEV_OP_REQ generation admission is missing {token}")
@@ -1093,7 +1203,7 @@ def test_epoch_cleanup_and_deferred_vfs_are_channel_generation_fenced() -> None:
     for token in ["src_node", "channel_id", "VFS_OP_WORKER_COUNT"]:
         if token not in worker_index:
             fail(f"VFS worker shard identity is missing {token}")
-    require_order(queue, "auto* shard = vfs_worker_for(hdr)", "shard->tail->next = op", "VFS per-channel FIFO enqueue")
+    require_order(queue, "shard->lock.try_lock()", "shard->tail->next = op", "VFS per-channel FIFO enqueue")
     require_order(worker_dequeue, "DeferredVfsOp* op = shard.head", "shard.head = op->next", "VFS FIFO dequeue")
     if "op_id >= OP_VFS_OPEN && op_id <= OP_VFS_READ_BULK" not in source or "constexpr uint16_t OP_VFS_CLOSE" not in WIRE_HPP.read_text():
         fail("OP_VFS_CLOSE must share the per-channel deferred VFS FIFO with read/write operations")
@@ -1243,6 +1353,51 @@ def test_detach_admission_has_ktest_coverage() -> None:
             fail(f"detach admission KTEST coverage is missing {token!r}")
 
 
+def test_block_attach_honors_disable_rdma_without_weakening_accelerated_mode() -> None:
+    source = DEV_SERVER_CPP.read_text()
+    header = DEV_SERVER_HPP.read_text()
+    ktest = WKI_DEV_SERVER_KTEST.read_text()
+    attach = function_body(source, "handle_dev_attach_req")
+    plan = function_body(source, "make_block_attach_rdma_plan")
+
+    for token in [
+        "if ((attach_mode & DEV_ATTACH_DISABLE_RDMA) != 0)",
+        "return {};",
+        ".rdma_flags = DEV_ATTACH_RDMA_BLK_RING",
+        "plan.rdma_flags |= DEV_ATTACH_RDMA_BULK",
+    ]:
+        if token not in plan:
+            fail(f"block attach RDMA plan is missing {token!r}")
+    for token in [
+        "make_block_attach_rdma_plan(req->attach_mode, hdr->src_node, req->resource_id, PEER_HAS_RDMA_TRANSPORT)",
+        "binding.blk_zone_id = RDMA_PLAN.zone_id",
+        "binding.blk_zone_pending = RDMA_PLAN.zone_pending",
+        "binding.blk_attach_ack_pending = RDMA_PLAN.zone_pending",
+        "ack.rdma_flags = RDMA_PLAN.rdma_flags",
+        "ack.blk_zone_id = RDMA_PLAN.zone_id",
+        "wki_deferred_work_notify()",
+    ]:
+        if token not in attach:
+            fail(f"block attach must apply the exact RDMA plan: missing {token!r}")
+    worker = function_body(source, "wki_dev_server_process_pending_zones")
+    require_order(
+        worker,
+        "ring_hdr->server_ready = 1",
+        "publish_deferred_block_attach_ack(binding, true)",
+        "block attach ACK must follow complete ring publication",
+    )
+    if "publish_deferred_block_attach_ack(binding, false)" not in worker:
+        fail("failed deferred RDMA creation must publish an explicit message-only fallback ACK")
+    if "info.ready = binding.resource_type != ResourceType::BLOCK || !binding.blk_attach_ack_pending" not in source:
+        fail("duplicate block attach requests must not expose an optimistic pending ACK")
+    for token in [
+        "auto wki_dev_server_selftest_block_attach_honors_disable_rdma() -> bool;",
+        "wki_dev_server_selftest_block_attach_honors_disable_rdma()",
+    ]:
+        if token not in header and token not in ktest:
+            fail(f"block attach disable-RDMA coverage is missing {token!r}")
+
+
 def test_vfs_two_lane_rdma_keeps_anchor_identity_independent_and_tears_down_regions() -> None:
     source = DEV_SERVER_CPP.read_text()
     header = DEV_SERVER_HPP.read_text()
@@ -1369,7 +1524,10 @@ def main() -> None:
     test_peer_channel_close_clears_index_before_unlocking_pool()
     test_reliable_rx_does_not_autocreate_allocated_dynamic_channels()
     test_channel_reuse_generation_guards_unlock_tx_relock_paths()
+    test_retransmit_snapshot_has_one_owner_across_progress_paths()
+    test_fast_retransmit_fires_once_per_unchanged_ack_gap()
     test_block_ring_binding_lifetime_is_retained_outside_server_lock()
+    test_block_message_ops_use_fixed_rx_admission_and_task_context_io()
     test_deferred_vfs_ops_retain_their_binding_through_blocking_work()
     test_path_utimens_is_deferred_without_reclassifying_invalidate()
     test_metadata_batch_is_capability_gated_preflighted_and_worker_executed()
@@ -1377,6 +1535,7 @@ def main() -> None:
     test_epoch_cleanup_and_deferred_vfs_are_channel_generation_fenced()
     test_attach_ack_failure_defers_exact_cleanup_outside_rx()
     test_detach_admission_has_ktest_coverage()
+    test_block_attach_honors_disable_rdma_without_weakening_accelerated_mode()
     test_vfs_two_lane_rdma_keeps_anchor_identity_independent_and_tears_down_regions()
     print("WKI dev server source invariants hold")
 

@@ -29,6 +29,12 @@ auto wki_retransmit_entry_alloc(size_t frame_len) -> WkiRetransmitEntry*;
 // wki_retransmit_entry_alloc().
 void wki_retransmit_entry_release(WkiChannel* ch, WkiRetransmitEntry* entry);
 
+// Reserve/release one entry from the fixed global RX reorder pool. The
+// allocator performs a bounded atomic bitmap scan and never allocates or
+// blocks, so callers may use it while holding WkiChannel::lock in RX context.
+auto wki_reorder_entry_reserve(uint16_t payload_len) -> WkiReorderEntry*;
+void wki_reorder_entry_release(WkiReorderEntry* entry);
+
 // Reset a channel to initial state (used during reconnection)
 void wki_channel_reset(WkiChannel* ch);
 

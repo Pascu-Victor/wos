@@ -339,9 +339,13 @@ def main() -> None:
     require_discoverable_test_source_names()
 
     unit_cpp_files = sorted((HOST_DIR / "unit").glob("*_test.cpp"))
+    unit_bench_files = sorted((HOST_DIR / "unit").glob("*_bench.cpp"))
     unit_py_files = sorted((HOST_DIR / "unit").glob("*_test.py"))
     fuzz_cpp_files = sorted((HOST_DIR / "fuzz").glob("*_fuzz.cpp"))
-    existing = {str(path.relative_to(HOST_DIR)) for path in unit_cpp_files + unit_py_files + fuzz_cpp_files}
+    existing = {
+        str(path.relative_to(HOST_DIR))
+        for path in unit_cpp_files + unit_bench_files + unit_py_files + fuzz_cpp_files
+    }
 
     require_registered_test_sources_define_entrypoints(unit_cpp_files, fuzz_cpp_files)
 

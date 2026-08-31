@@ -1,0 +1,543 @@
+{
+  "format": "wos.wki-chaos-matrix",
+  "version": 1,
+  "lanes": [
+    {
+      "id": "host-model",
+      "kind": "host-model",
+      "description": "Deterministic host model and replay contract checks"
+    },
+    {
+      "id": "ktest-model",
+      "kind": "ktest-model",
+      "description": "Isolated KTEST model and focused lifecycle checks"
+    },
+    {
+      "id": "ethernet",
+      "kind": "live",
+      "description": "Live multi-node Ethernet WKI message transport"
+    },
+    {
+      "id": "ivshmem",
+      "kind": "live",
+      "description": "Live negotiated RDMA over an ivshmem transport"
+    },
+    {
+      "id": "roce",
+      "kind": "live",
+      "description": "Live negotiated RDMA over a RoCE transport"
+    }
+  ],
+  "scenarios": [
+    {
+      "id": "C1",
+      "title": "submit_accept_cancel_epoch",
+      "execution": "live-ready",
+      "fixed_seed": "0xc100000000000001",
+      "deadline_ms": 120000,
+      "required_lanes": [
+        "host-model",
+        "ktest-model",
+        "ethernet"
+      ],
+      "prerequisites": {
+        "min_nodes": 2,
+        "transports": [
+          "ethernet-message"
+        ],
+        "chaos_boot_opt_in": true,
+        "qmp": false
+      },
+      "phases": {
+        "setup": [
+          "Capture complete baseline snapshots on submitter and receiver",
+          "Enable the test-only injector with the fixed seed"
+        ],
+        "workload": [
+          "Submit one remote task and retain submit-session/task lifetime identity"
+        ],
+        "fault": [
+          "Hold receiver-side TASK_SUBMIT publication",
+          "Cancel only after one receiver worker is proven blocked",
+          "Count the exact TASK_CANCEL frame before releasing publication"
+        ],
+        "heal": [
+          "Release the compute publication gate after CANCEL is applied",
+          "Require the cancelled child to terminate and clear all rules"
+        ],
+        "snapshot": [
+          "Capture compute ownership, channel, waiter, packet-pool, peer, chaos, pipe, and IPC diagnostics"
+        ],
+        "convergence": [
+          "Require two stable complete post-heal snapshots within the fixed deadline"
+        ]
+      },
+      "invariant": {
+        "signature": "compute.session_owner",
+        "postconditions": [
+          "Exactly one submit-session owner and one Task lifetime reference",
+          "CANCEL wins before receiver publication for the matching session",
+          "Both stack waiters complete exactly once"
+        ]
+      }
+    },
+    {
+      "id": "C2",
+      "title": "complete_partition_reboot",
+      "execution": "live-ready",
+      "fixed_seed": "0xc200000000000002",
+      "deadline_ms": 180000,
+      "required_lanes": [
+        "host-model",
+        "ktest-model",
+        "ethernet"
+      ],
+      "prerequisites": {
+        "min_nodes": 2,
+        "transports": [
+          "ethernet-message"
+        ],
+        "chaos_boot_opt_in": true,
+        "qmp": true
+      },
+      "phases": {
+        "setup": [
+          "Capture complete baseline snapshots",
+          "Enable the injector and generic rootless QMP socket"
+        ],
+        "workload": [
+          "Run a remote task through exit while retaining its task and output identities"
+        ],
+        "fault": [
+          "Hold the old TASK_COMPLETE on the surviving submitter RX path",
+          "Reset the task owner only after the exact held-frame barrier",
+          "Prove SSH recovery plus a changed connected peer boot epoch"
+        ],
+        "heal": [
+          "Publish a replacement task session after recovery",
+          "Deliver the recorded stale COMPLETE while the successor exists"
+        ],
+        "snapshot": [
+          "Capture completion queues, task/output/IPC ownership, epochs, channels, peers, chaos, and packet pool"
+        ],
+        "convergence": [
+          "Require two stable complete post-reboot snapshots within the fixed deadline"
+        ]
+      },
+      "invariant": {
+        "signature": "compute.stale_complete",
+        "postconditions": [
+          "Completion queues stay bounded and session-scoped",
+          "A stale COMPLETE cannot finish a reused task ID",
+          "Task, output, and IPC exports release exactly once"
+        ]
+      }
+    },
+    {
+      "id": "V1",
+      "title": "vfs_mutation_response_close",
+      "execution": "live-ready",
+      "fixed_seed": "0xa110000000000001",
+      "deadline_ms": 120000,
+      "required_lanes": [
+        "host-model",
+        "ktest-model",
+        "ethernet"
+      ],
+      "prerequisites": {
+        "min_nodes": 2,
+        "transports": [
+          "ethernet-message"
+        ],
+        "chaos_boot_opt_in": true,
+        "qmp": false
+      },
+      "phases": {
+        "setup": [
+          "Mount one remote VFS export and capture complete baseline ownership snapshots"
+        ],
+        "workload": [
+          "Issue WRITE, UTIMENS, and RENAME followed by CLOSE"
+        ],
+        "fault": [
+          "Delay the exact WRITE and UTIMENS responses",
+          "Duplicate the exact WRITE request",
+          "Reorder the exact RENAME response and count the CLOSE request"
+        ],
+        "heal": [
+          "Release each response only after its applied barrier",
+          "Complete and verify CLOSE after all mutation checkpoints"
+        ],
+        "snapshot": [
+          "Capture mutation cookies, proxy/server FDs, pending operations, refs, channels, chaos, and packet pool"
+        ],
+        "convergence": [
+          "Require two stable complete post-close snapshots within the fixed deadline"
+        ]
+      },
+      "invariant": {
+        "signature": "vfs.mutation_once",
+        "postconditions": [
+          "Each mutation is applied once",
+          "A response cookie cannot finish a successor operation",
+          "Close follows mutation and the server FD closes once"
+        ]
+      }
+    },
+    {
+      "id": "V2",
+      "title": "vfs_multilane_partition_close",
+      "execution": "live-ready",
+      "fixed_seed": "0xa120000000000002",
+      "deadline_ms": 120000,
+      "required_lanes": [
+        "host-model",
+        "ktest-model",
+        "ethernet"
+      ],
+      "prerequisites": {
+        "min_nodes": 2,
+        "transports": [
+          "ethernet-message"
+        ],
+        "chaos_boot_opt_in": true,
+        "qmp": false
+      },
+      "phases": {
+        "setup": [
+          "Open eight remote files and capture complete baseline ownership snapshots"
+        ],
+        "workload": [
+          "Write and fsync one deterministic byte through each remote file"
+        ],
+        "fault": [
+          "Partition the first exact WRITE request until an applied barrier",
+          "Hold the first exact CLOSE request while all lane FDs remain owned"
+        ],
+        "heal": [
+          "Heal the WRITE partition and finish every lane operation",
+          "Release the held CLOSE and close all eight lane FDs"
+        ],
+        "snapshot": [
+          "Capture every lane, open-file ownership, channels, peers, and exact chaos counters"
+        ],
+        "convergence": [
+          "Require two stable complete post-detach snapshots within the fixed deadline"
+        ]
+      },
+      "invariant": {
+        "signature": "vfs.multilane_close",
+        "postconditions": [
+          "All eight remote lane writes complete exactly once",
+          "The held CLOSE cannot strand the remaining lane FDs",
+          "All open-file and lifecycle references converge after close"
+        ]
+      }
+    },
+    {
+      "id": "I1",
+      "title": "ipc_pipe_data_close",
+      "execution": "live-ready",
+      "fixed_seed": "0x1101000000000001",
+      "deadline_ms": 120000,
+      "required_lanes": [
+        "host-model",
+        "ktest-model",
+        "ethernet"
+      ],
+      "prerequisites": {
+        "min_nodes": 2,
+        "transports": [
+          "ethernet-message"
+        ],
+        "chaos_boot_opt_in": true,
+        "qmp": false
+      },
+      "phases": {
+        "setup": [
+          "Open a remote pipe and capture complete baseline pipe, IPC, channel, chaos, and packet snapshots"
+        ],
+        "workload": [
+          "Stream a fixed byte sequence and close with expected_bytes"
+        ],
+        "fault": [
+          "Lose, reorder, and duplicate DATA",
+          "Delay CLOSE(expected_bytes)",
+          "Close the reader and exercise discard"
+        ],
+        "heal": [
+          "Release held DATA and CLOSE deterministically",
+          "Clear injection and complete teardown"
+        ],
+        "snapshot": [
+          "Capture exact byte counters, backlog ownership, credits, pumps, files, proxies, queues, channels, and chaos"
+        ],
+        "convergence": [
+          "Require two stable complete post-close snapshots within the fixed deadline"
+        ]
+      },
+      "invariant": {
+        "signature": "ipc.byte_stream",
+        "postconditions": [
+          "The reader observes exact bytes with no early EOF",
+          "No backlog becomes ownerless and credits remain bounded",
+          "Pump, file, proxy references and queues reach zero"
+        ]
+      }
+    },
+    {
+      "id": "I2",
+      "title": "ipc_control_epoch_reuse",
+      "execution": "live-ready",
+      "fixed_seed": "0x1102000000000002",
+      "deadline_ms": 180000,
+      "required_lanes": [
+        "host-model",
+        "ktest-model",
+        "ethernet"
+      ],
+      "prerequisites": {
+        "min_nodes": 2,
+        "transports": [
+          "ethernet-message"
+        ],
+        "chaos_boot_opt_in": true,
+        "qmp": true
+      },
+      "phases": {
+        "setup": [
+          "Create a connected socket control session and capture complete baseline ownership snapshots"
+        ],
+        "workload": [
+          "Issue one cookie-scoped control operation and retain its waiter identity"
+        ],
+        "fault": [
+          "Hold the old socket GETPEERNAME request on the surviving home-node RX path",
+          "Reset the remote waiter after the exact applied barrier",
+          "Prove SSH recovery plus a changed connected peer boot epoch"
+        ],
+        "heal": [
+          "Publish a successor socket-control session after peer recovery",
+          "Deliver the old control request while the successor exists"
+        ],
+        "snapshot": [
+          "Capture cookies, cleanup epochs, waiters, refs, queues, peer/channel epochs, chaos, and packet pool"
+        ],
+        "convergence": [
+          "Require two stable complete post-reuse snapshots within the fixed deadline"
+        ]
+      },
+      "invariant": {
+        "signature": "ipc.stale_control",
+        "postconditions": [
+          "Only the matching cookie completes",
+          "References wake and release exactly once",
+          "Cleanup epoch rejects old work and the successor is unchanged"
+        ]
+      }
+    },
+    {
+      "id": "N1",
+      "title": "net_attach_route_detach",
+      "execution": "live-ready",
+      "fixed_seed": "0x4e31000000000001",
+      "deadline_ms": 180000,
+      "required_lanes": [
+        "host-model",
+        "ktest-model",
+        "ethernet"
+      ],
+      "prerequisites": {
+        "min_nodes": 3,
+        "transports": [
+          "ethernet-message"
+        ],
+        "chaos_boot_opt_in": true,
+        "qmp": true
+      },
+      "phases": {
+        "setup": [
+          "Attach one remote net device through a three-node route and capture complete baseline snapshots"
+        ],
+        "workload": [
+          "Keep one exact managed remote-net attachment active while its periodic OP_NET_GET_STATS traffic crosses the routed middle node"
+        ],
+        "fault": [
+          "Drop exactly two every-second OP_NET_GET_STATS requests with an applied=2 barrier",
+          "Use QMP set_link to bring down only node 1's wki-b route leg after the periodic-rule barrier"
+        ],
+        "heal": [
+          "Restore the selected wki-b link and poll the exact managed binding to readiness",
+          "Detach the exact owner/resource/generation binding"
+        ],
+        "snapshot": [
+          "Capture attach cookies, channel generations, netdev instances, PacketBuffers, forwarding, credits, peers, and chaos"
+        ],
+        "convergence": [
+          "Require two stable complete post-detach snapshots on all three nodes within the fixed deadline"
+        ]
+      },
+      "invariant": {
+        "signature": "net.binding_owner",
+        "postconditions": [
+        "The managed attachment retains one nonzero cookie and channel generation across the bounded route flap",
+        "The exact OP_NET_GET_STATS periodic rule reaches applied=2 before link-down",
+        "Exact detach proves zero active matches",
+          "PacketBuffer delta returns to baseline and forwarding plus credits converge"
+        ]
+      }
+    },
+    {
+      "id": "B1",
+      "title": "block_message_corruption",
+      "execution": "live-ready",
+      "fixed_seed": "0xb100000000000001",
+      "deadline_ms": 120000,
+      "required_lanes": [
+        "host-model",
+        "ktest-model",
+        "ethernet"
+      ],
+      "prerequisites": {
+        "min_nodes": 2,
+        "transports": [
+          "ethernet-message"
+        ],
+        "chaos_boot_opt_in": true,
+        "qmp": false
+      },
+      "phases": {
+        "setup": [
+          "Attach a message-mode remote block device and capture complete geometry, owner, and packet baselines"
+        ],
+        "workload": [
+          "Read one fixed scratch block, issue one exact message-mode WRITE, verify the baseline after rejection, and restore the scratch block"
+        ],
+        "fault": [
+          "Corrupt the low byte of the WRITE request block count at payload offset 12 with a valid checksum",
+          "Require the exact corruption rule to reach applied=1"
+        ],
+        "heal": [
+          "Prove the corrupted WRITE was rejected without changing storage",
+          "Restore the captured baseline and detach the exact binding"
+        ],
+        "snapshot": [
+          "Capture checked geometry, exact binding identity, operation statuses, channels, chaos, and packet pool"
+        ],
+        "convergence": [
+          "Require two stable complete post-detach snapshots within the fixed deadline"
+        ]
+      },
+      "invariant": {
+        "signature": "block.message_bounds",
+        "postconditions": [
+        "The corrupted WRITE has a negative status while the adapter exits zero only after safe rejection proof",
+        "Verification observes the unchanged baseline and restoration succeeds",
+        "The message-only binding is exact and detached with no RDMA fields claimed"
+        ]
+      }
+    },
+    {
+      "id": "B2",
+      "title": "block_rdma_sqe_doorbell",
+      "execution": "live-ready",
+      "fixed_seed": "0xb200000000000002",
+      "deadline_ms": 180000,
+      "required_lanes": [
+        "host-model",
+        "ktest-model",
+        "ivshmem",
+        "roce"
+      ],
+      "prerequisites": {
+        "min_nodes": 2,
+        "transports": [
+          "ivshmem-rdma",
+          "roce-rdma"
+        ],
+        "chaos_boot_opt_in": true,
+        "qmp": false
+      },
+      "phases": {
+        "setup": [
+          "Negotiate RDMA SQ and CQ over the selected transport and capture complete lease, tag, slot, and packet baselines"
+        ],
+        "workload": [
+          "Run fixed scratch-block I/O through the active ivshmem or RoCE SQ/CQ lane"
+        ],
+        "fault": [
+          "Corrupt the exact WRITE SQE block-count byte and require a proven-safe rejection",
+          "Duplicate one exact WRITE doorbell and require normal idempotent completion"
+        ],
+        "heal": [
+          "Clear between the SQE and doorbell schedules",
+          "Restore the scratch block and detach after each bounded operation"
+        ],
+        "snapshot": [
+          "Capture exact binding epochs, RDMA lane, ring geometry and indices, slot/tag bitmaps, channels, and chaos"
+        ],
+        "convergence": [
+          "Require two stable complete post-detach snapshots independently on ivshmem and RoCE within the fixed deadline"
+        ]
+      },
+      "invariant": {
+        "signature": "block.rdma_owner",
+        "postconditions": [
+        "The workload records the selected lane as exactly ivshmem or RoCE, and the matrix requires independent evidence from both topologies",
+        "Geometry and indices remain valid, SQ/CQ are quiescent, and slot/tag bitmaps return to zero",
+        "Old epoch-qualified CQE fencing remains a required KTEST proof and is not inferred from live sequence counters"
+        ]
+      }
+    },
+    {
+      "id": "X1",
+      "title": "mixed_owner_reset_composition",
+      "execution": "live-ready",
+      "fixed_seed": "0xf100000000000001",
+      "deadline_ms": 300000,
+      "required_lanes": [
+        "host-model",
+        "ktest-model",
+        "ethernet"
+      ],
+      "prerequisites": {
+        "min_nodes": 3,
+        "transports": [
+          "ethernet-message"
+        ],
+        "chaos_boot_opt_in": true,
+        "qmp": true
+      },
+      "phases": {
+        "setup": [
+          "Clear workload/injector state, capture complete all-node baselines, and establish compute publication plus an exact managed NET binding"
+        ],
+        "workload": [
+          "Hold compute TASK_COMPLETE and IPC socket-control old-session tails while using exact NET, post-reset block, and VFS adapters across three nodes"
+        ],
+        "fault": [
+          "Reset the owner only after exact compute and IPC rules both reach applied=1",
+          "Retain old-session tails only for the compute and IPC operations that expose checkpointed successors"
+        ],
+        "heal": [
+          "Wait for SSH readiness and a changed connected peer boot epoch before advancing old children",
+          "Publish compute and IPC successors before releasing their stale tails, reject the old NET tuple, then prove successor NET, block, and VFS bindings"
+        ],
+        "snapshot": [
+          "Capture service owners, exact binding epochs/cookies, queue/reference gauges, channels, peers, chaos, and packet pool on all nodes"
+        ],
+        "convergence": [
+          "Require bounded complete all-node convergence after workload clear precedes injector clear"
+        ]
+      },
+      "invariant": {
+        "signature": "cross_service.successor_fence",
+        "postconditions": [
+        "Compute and IPC old children fail after the owner reset while both successors complete after stale-tail release",
+        "The old managed NET tuple is rejected; the successor NET tuple binds exactly and detaches",
+        "Post-reset block I/O verifies/restores one scratch block and exact VFS unmount completes; queues, refs, and packet pool converge"
+        ]
+      }
+    }
+  ]
+}

@@ -71,7 +71,7 @@
     X(test_remote_ipc_epoll_wait_pipe_hup)                \
     X(test_remote_ipc_epoll_pipe_preclosed_hup)           \
     X(test_remote_ipc_epoll_pipe_read_then_hup)           \
-    X(test_remote_ipc_epoll_ctl_add)
+    X(test_wki_epoll_owner_pinned_local)
 // NOLINTEND(cppcoreguidelines-macro-usage)
 
 #define TESTD_DECLARE_SPEC(fn) \

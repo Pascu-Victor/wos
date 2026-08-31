@@ -24,8 +24,10 @@ KTEST(WkiChannel, ResetClearsPostFenceReliabilityState) {
     ch.srtt_us = 123;
     ch.rttvar_us = 456;
     ch.retransmit_deadline = std::numeric_limits<uint64_t>::max();
+    ch.retransmit_in_progress = true;
     ch.last_dup_ack = 96;
     ch.dup_ack_count = ker::net::wki::WKI_FAST_RETRANSMIT_THRESH;
+    ch.fast_retransmit_seq = 41;
     ch.bytes_sent = 111;
     ch.bytes_received = 222;
     ch.retransmits = 3;
@@ -40,8 +42,8 @@ KTEST(WkiChannel, ResetClearsPostFenceReliabilityState) {
     ch.retransmit_tail = rt;
     ch.retransmit_count = 1;
 
-    auto* ro = new ker::net::wki::WkiReorderEntry{};
-    ro->data = new uint8_t[2]{};
+    auto* ro = ker::net::wki::wki_reorder_entry_reserve(2);
+    KREQUIRE_NE(ro, nullptr);
     ro->len = 2;
     ro->seq = 100;
     ch.reorder_head = ro;
@@ -66,10 +68,12 @@ KTEST(WkiChannel, ResetClearsPostFenceReliabilityState) {
     KEXPECT_EQ(ch.retransmit_head, nullptr);
     KEXPECT_EQ(ch.retransmit_tail, nullptr);
     KEXPECT_EQ(ch.retransmit_count, 0U);
+    KEXPECT_FALSE(ch.retransmit_in_progress);
     KEXPECT_EQ(ch.reorder_head, nullptr);
     KEXPECT_EQ(ch.reorder_count, 0U);
     KEXPECT_EQ(ch.last_dup_ack, 0U);
     KEXPECT_EQ(ch.dup_ack_count, 0U);
+    KEXPECT_EQ(ch.fast_retransmit_seq, ker::net::wki::WKI_ACK_NONE);
     KEXPECT_EQ(ch.rto_us, ker::net::wki::WKI_INITIAL_RTO_US);
     KEXPECT_EQ(ch.srtt_us, 0U);
     KEXPECT_EQ(ch.rttvar_us, 0U);
@@ -130,8 +134,8 @@ KTEST(WkiChannel, CloseRetiresChannelAndClearsQueuedState) {
     ch.retransmit_tail = rt;
     ch.retransmit_count = 1;
 
-    auto* ro = new ker::net::wki::WkiReorderEntry{};
-    ro->data = new uint8_t[8]{};
+    auto* ro = ker::net::wki::wki_reorder_entry_reserve(8);
+    KREQUIRE_NE(ro, nullptr);
     ro->len = 8;
     ro->seq = 10;
     ch.reorder_head = ro;
@@ -194,6 +198,25 @@ KTEST(WkiChannel, HeapRetransmitEntryOwnsContiguousExactFrameStorage) {
 
     ker::net::wki::wki_retransmit_entry_release(nullptr, entry);
     KEXPECT_EQ(ker::net::wki::wki_retransmit_entry_alloc(ker::net::wki::WKI_MAX_FRAME_SIZE + 1), nullptr);
+}
+
+KTEST(WkiChannel, FixedReorderPoolOwnsMaximumPayloadAndReusesReleasedSlot) {
+    auto* entry = ker::net::wki::wki_reorder_entry_reserve(ker::net::wki::WKI_ETH_MAX_PAYLOAD);
+    KREQUIRE_NE(entry, nullptr);
+    KEXPECT_NE(entry->data, nullptr);
+    KEXPECT_NE(entry->pool_slot, ker::net::wki::WKI_REORDER_POOL_INVALID_SLOT);
+    uint16_t const SLOT = entry->pool_slot;
+    entry->data[0] = 0x12;
+    entry->data[ker::net::wki::WKI_ETH_MAX_PAYLOAD - 1] = 0x34;
+    KEXPECT_EQ(entry->data[0], 0x12);
+    KEXPECT_EQ(entry->data[ker::net::wki::WKI_ETH_MAX_PAYLOAD - 1], 0x34);
+    ker::net::wki::wki_reorder_entry_release(entry);
+
+    auto* reused = ker::net::wki::wki_reorder_entry_reserve(1);
+    KREQUIRE_NE(reused, nullptr);
+    KEXPECT_EQ(reused->pool_slot, SLOT);
+    ker::net::wki::wki_reorder_entry_release(reused);
+    KEXPECT_EQ(ker::net::wki::wki_reorder_entry_reserve(static_cast<uint16_t>(ker::net::wki::WKI_ETH_MAX_PAYLOAD + 1)), nullptr);
 }
 
 KTEST(WkiSend, SplitPayloadValidatesAndFlattensInOrder) { KEXPECT_TRUE(ker::net::wki::wki_selftest_split_payload_validation_and_copy()); }

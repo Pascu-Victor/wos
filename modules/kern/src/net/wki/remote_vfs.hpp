@@ -275,12 +275,41 @@ constexpr size_t WKI_REMOTE_VFS_PROXY_DIAG_MAX = 128;
 struct WkiRemoteVfsProxyDiag {
     uint16_t owner_node = WKI_NODE_INVALID;
     uint16_t assigned_channel = 0;
+    uint32_t assigned_channel_generation = 0;
     uint32_t resource_id = 0;
+    uint64_t resource_generation = 0;
+    uint32_t owner_boot_epoch = 0;
+    uint32_t resource_incarnation = 0;
+    uint32_t binding_peer_boot_epoch = 0;
+    uint64_t mount_group_id = 0;
+    uint8_t lane_index = 0;
+    uint8_t lane_count = 0;
+    bool lane_anchor = false;
+    bool lanes_ready = false;
     bool active = false;
+    bool epoch_reset_pending = false;
     bool op_pending = false;
     uint16_t op_expected_id = 0;
     uint16_t op_expected_seq = 0;
+    uint64_t op_generation = 0;
+    uint64_t op_waiter_pid = 0;
+    uint64_t op_retiring_waiter_pid = 0;
+    uint32_t op_slot_waiter_count = 0;
     bool attach_pending = false;
+    uint8_t attach_expected_cookie = 0;
+    uint8_t binding_attach_cookie = 0;
+    bool detach_pending = false;
+    bool detach_retry_in_progress = false;
+    uint32_t detach_peer_boot_epoch = 0;
+    uint32_t open_file_refs = 0;
+    uint32_t lifecycle_refs = 0;
+    bool destroy_when_idle = false;
+    bool mount_configured = false;
+    bool mount_released = false;
+    bool resources_releasing = false;
+    bool resources_released = false;
+    bool rdma_capable = false;
+    bool bulk_rdma_capable = false;
     std::array<char, VFS_EXPORT_PATH_LEN> local_mount_path = {};
 };
 
@@ -343,6 +372,7 @@ auto wki_remote_vfs_selftest_readlink_cache_generation_invalidation() -> bool;
 auto wki_remote_vfs_selftest_multi_rdma_lane_selection() -> bool;
 auto wki_remote_vfs_selftest_lane_round_robin_uses_full_capacity() -> bool;
 auto wki_remote_vfs_selftest_lane_pressure_precedes_rdma() -> bool;
+auto wki_remote_vfs_selftest_peer_cleanup_includes_pending_attach() -> bool;
 #endif
 
 // Task-exit hook: release a task's active proxy operation or queued slot wait.

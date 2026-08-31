@@ -385,6 +385,8 @@ KTEST(Net, ArpPendingFlushRunsOutsideCacheLock) {
 
 KTEST(NetBacklog, EnqueueWakeModeClassifiesEmptyTransition) { KEXPECT_TRUE(ker::net::backlog_selftest_enqueue_wake_mode_classification()); }
 
+KTEST(NetBacklog, RoceFlowHashPreservesFrameOrder) { KEXPECT_TRUE(ker::net::backlog_selftest_roce_flow_hash_preserves_frame_order()); }
+
 KTEST(Net, UdpSendRejectsOversizeBeforePacketCopy) {
     auto* ops = ker::net::proto::get_udp_proto_ops();
     KEXPECT_NE(ops, nullptr);

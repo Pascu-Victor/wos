@@ -127,6 +127,8 @@ def test_deferred_work_reentrancy_guard_prevents_recursive_blocking_work() -> No
         [
             "std::atomic<bool> s_timer_deferred_running{false}",
             "std::atomic<mod::sched::task::Task*> s_timer_deferred_task{nullptr}",
+            "std::atomic<bool> s_auto_attach_deferred_running{false}",
+            "std::atomic<mod::sched::task::Task*> s_auto_attach_deferred_task{nullptr}",
         ],
         "WKI timer deferred guard globals",
     )
@@ -159,6 +161,7 @@ def test_deferred_work_reentrancy_guard_prevents_recursive_blocking_work() -> No
         [
             "task != nullptr",
             "s_timer_deferred_task.load(std::memory_order_acquire) == task",
+            "s_auto_attach_deferred_task.load(std::memory_order_acquire) == task",
         ],
         "timer deferred waiter identity check",
     )
@@ -171,10 +174,65 @@ def test_deferred_work_reentrancy_guard_prevents_recursive_blocking_work() -> No
             "if (!deferred.try_enter())",
             "return",
             "wki_dev_server_process_pending_zones()",
+            "wki_dev_server_process_pending_detaches()",
+            "wki_remote_vfs_process_pending_server_fd_cleanup()",
+            "wki_remote_net_poll_stats()",
+            "notify_auto_attach_work()",
+        ],
+        "deferred block-zone priority and guarded entry",
+    )
+
+    for forbidden in ["wki_remotable_process_pending_mounts()", "wki_remotable_process_pending_net_attaches()"]:
+        if forbidden in deferred_body:
+            fail(f"protocol-service worker must not run blocking client work: {forbidden}")
+
+    auto_attach_body = function_body(source, "process_deferred_auto_attach_work")
+    require_order(
+        auto_attach_body,
+        [
+            "AutoAttachDeferredGuard deferred",
+            "if (!deferred.try_enter())",
+            "return",
             "wki_remotable_process_pending_mounts()",
             "wki_remotable_process_pending_net_attaches()",
         ],
-        "deferred blocking work guarded entry",
+        "auto-attach blocking work guarded entry",
+    )
+
+
+def test_blocking_client_work_has_independent_worker_and_wakeup() -> None:
+    source = WKI_CPP.read_text()
+    notify_body = function_body(source, "notify_deferred_work")
+    core_worker_body = function_body(source, "wki_deferred_work_thread")
+    auto_worker_body = function_body(source, "wki_auto_attach_work_thread")
+    start_body = function_body(source, "wki_deferred_work_thread_start")
+
+    require_order(
+        notify_body,
+        [
+            "s_deferred_work_pending.store(true, std::memory_order_release)",
+            "mod::sched::wake_task_from_event(s_deferred_work_task)",
+            "notify_auto_attach_work()",
+        ],
+        "coalesced core and auto-attach notification",
+    )
+    require_tokens(
+        core_worker_body,
+        ["s_deferred_work_pending.exchange(false, std::memory_order_acq_rel)", "process_deferred_blocking_work()"],
+        "protocol-service worker",
+    )
+    require_tokens(
+        auto_worker_body,
+        ["s_auto_attach_work_pending.exchange(false, std::memory_order_acq_rel)", "process_deferred_auto_attach_work()"],
+        "auto-attach worker",
+    )
+    require_tokens(
+        start_body,
+        [
+            'create_kernel_thread("wki_deferred", wki_deferred_work_thread)',
+            'create_kernel_thread("wki_autoattach", wki_auto_attach_work_thread)',
+        ],
+        "independent worker creation",
     )
 
 
@@ -213,6 +271,7 @@ def main() -> None:
     test_remote_net_stats_poll_is_scheduled()
     test_timer_scans_only_published_channel_prefix()
     test_deferred_work_reentrancy_guard_prevents_recursive_blocking_work()
+    test_blocking_client_work_has_independent_worker_and_wakeup()
     test_deferred_waiter_uses_spin_yield_instead_of_self_blocking()
     test_remote_net_stats_poll_has_cadence_guard()
     print("WKI timer source invariants hold")

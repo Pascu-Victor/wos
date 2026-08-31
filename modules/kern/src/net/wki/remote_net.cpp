@@ -1437,6 +1437,69 @@ auto wki_remote_net_has_proxy(uint16_t owner_node, uint32_t resource_id) -> bool
     return FOUND;
 }
 
+auto wki_remote_net_diag_snapshot(WkiRemoteNetDiagRow* rows, size_t capacity, size_t* total) -> size_t {
+    size_t row_count = 0;
+    size_t total_rows = 0;
+    s_net_proxy_lock.lock();
+    for (const auto& storage : g_net_proxy_storage) {
+        auto* state = storage.get();
+        if (state == nullptr) {
+            continue;
+        }
+        total_rows++;
+        if (rows == nullptr || row_count >= capacity) {
+            continue;
+        }
+        auto& row = rows[row_count++];  // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
+        row.owner_node = state->owner_node;
+        row.assigned_channel = state->assigned_channel;
+        row.channel_generation = state->channel_identity.generation;
+        row.resource_id = state->resource_id;
+        row.resource_generation = state->resource_generation;
+        row.refs = state->refs.load(std::memory_order_acquire);
+        row.active = state->active;
+        row.attaching = state->attaching;
+        row.netdev_registered = state->netdev_registered;
+        row.ever_published = state->ever_published;
+        row.epoch_reset_pending = state->epoch_reset_pending;
+        row.cleanup_started = state->cleanup_started;
+        row.cleanup_complete = state->cleanup_complete;
+        row.retiring = state->retiring.load(std::memory_order_acquire);
+        row.attach_pending = state->attach_pending.load(std::memory_order_acquire);
+        row.attach_cookie = state->attach_cookie;
+        row.binding_peer_boot_epoch = state->binding_peer_boot_epoch;
+        row.detach_pending = state->detach_pending;
+        row.detach_retry_in_progress = state->detach_retry_in_progress;
+        row.detach_attach_cookie = state->detach_attach_cookie;
+        row.detach_peer_boot_epoch = state->detach_peer_boot_epoch;
+        row.rx_credits_remaining = state->rx_credits_remaining;
+        row.rx_packets = state->netdev.rx_packets;
+        row.rx_bytes = state->netdev.rx_bytes;
+        row.rx_dropped = state->netdev.rx_dropped;
+        row.tx_packets = state->netdev.tx_packets;
+        row.tx_bytes = state->netdev.tx_bytes;
+        row.tx_dropped = state->netdev.tx_dropped;
+        // Never wait for an operation while holding the registry lock. A
+        // contended detail lock makes this row explicitly incomplete instead
+        // of publishing a racy waiter/cookie tuple as convergence evidence.
+        row.detail_complete = state->lock.try_lock();
+        if (row.detail_complete) {
+            row.op_pending = state->op_pending.load(std::memory_order_acquire);
+            row.op_expected_id = state->op_expected_id;
+            row.op_expected_seq = state->op_expected_seq;
+            row.op_waiter_owned = state->op_wait_entry != nullptr;
+            row.attach_waiter_owned = state->attach_wait_entry != nullptr;
+            row.attach_expected_cookie = state->attach_expected_cookie;
+            state->lock.unlock();
+        }
+    }
+    s_net_proxy_lock.unlock();
+    if (total != nullptr) {
+        *total = total_rows;
+    }
+    return row_count;
+}
+
 void wki_remote_net_detach(ker::net::NetDevice* proxy_dev) {
     uint16_t owner_node{};
     uint32_t resource_id{};

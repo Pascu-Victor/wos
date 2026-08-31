@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cstdint>
+#include <limits>
 
 namespace ker::net::wki {
 
@@ -33,6 +34,7 @@ constexpr uint32_t BLK_RING_DEFAULT_SQ_DEPTH = 64;
 constexpr uint32_t BLK_RING_DEFAULT_CQ_DEPTH = 64;
 constexpr uint32_t BLK_RING_DEFAULT_DATA_SLOTS = 64;
 constexpr uint32_t BLK_RING_DEFAULT_DATA_SLOT_SIZE = 65536;  // 64KB per slot
+constexpr uint32_t BLK_RING_MAX_BULK_TRANSFER = 2 * 1024 * 1024;
 
 // -----------------------------------------------------------------------------
 // Submission Queue Entry - consumer writes, server reads
@@ -121,6 +123,131 @@ struct BlkRingHeader {
 } __attribute__((packed));
 
 static_assert(sizeof(BlkRingHeader) == 64, "BlkRingHeader must be exactly 64 bytes");
+
+// -----------------------------------------------------------------------------
+// Validation helpers
+// -----------------------------------------------------------------------------
+
+struct BlkTransferValidation {
+    bool valid = false;
+    uint32_t bytes = 0;
+};
+
+constexpr auto blk_lba_range_valid(uint64_t lba, uint64_t block_count, uint64_t total_blocks) -> bool {
+    return lba <= total_blocks && block_count <= total_blocks - lba;
+}
+
+// Validate both the logical-block range and the byte multiplication before a
+// caller allocates or accesses a transfer buffer.  A zero-block operation is
+// valid at any in-range LBA, matching the local block-device API; the shared
+// ring validator below rejects zero-length READ/WRITE descriptors explicitly.
+constexpr auto blk_validate_transfer(uint64_t lba, uint32_t block_count, uint64_t block_size, uint64_t total_blocks, uint64_t max_bytes)
+    -> BlkTransferValidation {
+    if (block_size == 0 || !blk_lba_range_valid(lba, block_count, total_blocks)) {
+        return {};
+    }
+    if (block_count != 0 && block_size > std::numeric_limits<uint64_t>::max() / block_count) {
+        return {};
+    }
+
+    uint64_t const BYTES = static_cast<uint64_t>(block_count) * block_size;
+    if (BYTES > max_bytes || BYTES > std::numeric_limits<uint32_t>::max()) {
+        return {};
+    }
+    return {.valid = true, .bytes = static_cast<uint32_t>(BYTES)};
+}
+
+struct BlkRingGeometry {
+    uint32_t sq_depth = 0;
+    uint32_t cq_depth = 0;
+    uint32_t data_slot_count = 0;
+    uint32_t data_slot_size = 0;
+    uint32_t block_size = 0;
+    uint64_t total_blocks = 0;
+    uint8_t server_ready = 0;
+};
+
+struct BlkRingIndices {
+    uint32_t sq_head = 0;
+    uint32_t sq_tail = 0;
+    uint32_t cq_head = 0;
+    uint32_t cq_tail = 0;
+};
+
+inline auto blk_ring_geometry_snapshot(const BlkRingHeader* hdr) -> BlkRingGeometry {
+    if (hdr == nullptr) {
+        return {};
+    }
+    const volatile BlkRingHeader* shared = hdr;
+    return {.sq_depth = shared->sq_depth,
+            .cq_depth = shared->cq_depth,
+            .data_slot_count = shared->data_slot_count,
+            .data_slot_size = shared->data_slot_size,
+            .block_size = shared->block_size,
+            .total_blocks = shared->total_blocks,
+            .server_ready = shared->server_ready};
+}
+
+inline auto blk_ring_indices_snapshot(const BlkRingHeader* hdr) -> BlkRingIndices {
+    if (hdr == nullptr) {
+        return {};
+    }
+    const volatile BlkRingHeader* shared = hdr;
+    return {.sq_head = shared->sq_head, .sq_tail = shared->sq_tail, .cq_head = shared->cq_head, .cq_tail = shared->cq_tail};
+}
+
+// Block rings currently have one fixed, server-created layout.  Requiring the
+// exact negotiated values prevents a corrupt remote-writable header from
+// redirecting queue or data-slot accesses outside that allocation.
+constexpr auto blk_ring_layout_valid(const BlkRingGeometry& geometry) -> bool {
+    return geometry.server_ready == 1 && geometry.sq_depth == BLK_RING_DEFAULT_SQ_DEPTH && geometry.cq_depth == BLK_RING_DEFAULT_CQ_DEPTH &&
+           geometry.data_slot_count == BLK_RING_DEFAULT_DATA_SLOTS && geometry.data_slot_size == BLK_RING_DEFAULT_DATA_SLOT_SIZE &&
+           geometry.block_size != 0 && geometry.block_size <= geometry.data_slot_size;
+}
+
+constexpr auto blk_ring_geometry_valid(const BlkRingGeometry& geometry, uint64_t expected_block_size, uint64_t expected_total_blocks)
+    -> bool {
+    return blk_ring_layout_valid(geometry) && expected_block_size != 0 && expected_block_size <= std::numeric_limits<uint32_t>::max() &&
+           geometry.block_size == static_cast<uint32_t>(expected_block_size) && geometry.total_blocks == expected_total_blocks;
+}
+
+constexpr auto blk_ring_indices_valid(const BlkRingIndices& indices, const BlkRingGeometry& geometry) -> bool {
+    return geometry.sq_depth != 0 && geometry.cq_depth != 0 && indices.sq_head < geometry.sq_depth && indices.sq_tail < geometry.sq_depth &&
+           indices.cq_head < geometry.cq_depth && indices.cq_tail < geometry.cq_depth;
+}
+
+constexpr auto blk_ring_next_index(uint32_t index, uint32_t depth) -> uint32_t { return index + 1 == depth ? 0 : index + 1; }
+
+struct BlkSqValidation {
+    bool valid = false;
+    uint32_t bytes = 0;
+};
+
+constexpr auto blk_validate_sq_entry(const BlkSqEntry& entry, const BlkRingGeometry& geometry) -> BlkSqValidation {
+    switch (static_cast<BlkOpcode>(entry.opcode)) {
+        case BlkOpcode::READ:
+        case BlkOpcode::WRITE: {
+            if (entry.block_count == 0 || entry.data_slot >= geometry.data_slot_count) {
+                return {};
+            }
+            BlkTransferValidation const TRANSFER =
+                blk_validate_transfer(entry.lba, entry.block_count, geometry.block_size, geometry.total_blocks, geometry.data_slot_size);
+            return {.valid = TRANSFER.valid, .bytes = TRANSFER.bytes};
+        }
+        case BlkOpcode::FLUSH:
+            return {.valid = true, .bytes = 0};
+        case BlkOpcode::BULK_READ:
+        case BlkOpcode::BULK_WRITE: {
+            if (entry.data_slot == 0 || entry.block_count == 0) {
+                return {};
+            }
+            BlkTransferValidation const TRANSFER =
+                blk_validate_transfer(entry.lba, entry.block_count, geometry.block_size, geometry.total_blocks, BLK_RING_MAX_BULK_TRANSFER);
+            return {.valid = TRANSFER.valid, .bytes = TRANSFER.bytes};
+        }
+    }
+    return {};
+}
 
 // -----------------------------------------------------------------------------
 // Offset calculations - compute layout within a zone

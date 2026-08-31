@@ -8,6 +8,7 @@ ROOT = Path(__file__).resolve().parents[3]
 ZONE_CPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "zone.cpp"
 ZONE_HPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "zone.hpp"
 WKI_WAIT_KTEST = ROOT / "modules" / "kern" / "src" / "test" / "wki_wait_ktest.cpp"
+WKI_CPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "wki.cpp"
 
 
 def fail(message: str) -> None:
@@ -359,6 +360,70 @@ def test_operation_cookie_validation_is_declared_and_covered_by_ktest() -> None:
     )
 
 
+def test_zone_create_backing_setup_is_bounded_out_of_rx_context() -> None:
+    source = ZONE_CPP.read_text()
+    header = ZONE_HPP.read_text()
+    wki_source = WKI_CPP.read_text()
+    request_rx = function_body(source, "handle_zone_create_req")
+    ack_rx = function_body(source, "handle_zone_create_ack")
+    request_worker = function_body(source, "process_zone_create_request")
+    ack_worker = function_body(source, "process_zone_create_ack")
+    zero_backing = function_body(source, "zero_ivshmem_zone_backing")
+
+    require_tokens(
+        source,
+        [
+            "constexpr size_t WKI_ZONE_CREATE_WORK_CAPACITY = WKI_MAX_ZONES * 2",
+            "std::array<ZoneCreateWork, WKI_ZONE_CREATE_WORK_CAPACITY>",
+            "s_zone_create_work_lock.lock_irqsave()",
+            "s_zone_create_work_pending.store(true, std::memory_order_release)",
+        ],
+        "fixed bounded zone-create work admission",
+    )
+    require_tokens(request_rx, ["enqueue_zone_create_work(work)"], "zone-create request RX admission")
+    require_tokens(ack_rx, ["enqueue_zone_create_work(work)"], "zone-create ACK RX admission")
+    reject_tokens(
+        request_rx + ack_rx,
+        ["prepare_zone_backing", "allocate_zone_backing", "memset(", "s_zone_table_lock.lock()", "wki_wait_for_op"],
+        "zone-create RX allocation/blocking boundary",
+    )
+
+    require_order(
+        request_worker,
+        "s_zone_table_lock.unlock()",
+        "prepare_zone_backing(SRC_NODE, request.size, true)",
+        "responder backing allocation outside table lock",
+    )
+    require_order(
+        ack_worker,
+        "s_zone_table_lock.unlock()",
+        "prepare_zone_backing(header.src_node, zone_size, ack_payload.rkey != 0)",
+        "initiator backing allocation outside table lock",
+    )
+    require_tokens(
+        zero_backing,
+        ['"rep stosq\\n\\t"', "mod::sched::kern_yield()"],
+        "wide yieldable ivshmem security clear",
+    )
+    require_order(
+        zero_backing,
+        "remaining_words -= words",
+        '"rep stosq\\n\\t"',
+        "rep stosq count must be retired before the instruction consumes RCX",
+    )
+    require_tokens(header, ["void wki_zone_worker_start();"], "zone worker API")
+    require_tokens(
+        function_body(source, "wki_zone_worker_start"),
+        ["task->slice_ns = WKI_ZONE_WORK_SLICE_NS", "mod::sched::set_task_nice(task, WKI_ZONE_WORK_NICE)"],
+        "zone protocol-service worker priority",
+    )
+    require_tokens(
+        function_body(wki_source, "wki_deferred_work_thread_start"),
+        ["wki_zone_worker_start()"],
+        "zone worker startup",
+    )
+
+
 def main() -> None:
     test_timeout_retirement_helper_marks_inactive_under_table_lock()
     test_timeout_cleanup_clears_pending_waiters()
@@ -368,6 +433,7 @@ def main() -> None:
     test_timeout_retirement_is_declared_and_covered_by_ktest()
     test_range_validation_is_declared_and_covered_by_ktest()
     test_operation_cookie_validation_is_declared_and_covered_by_ktest()
+    test_zone_create_backing_setup_is_bounded_out_of_rx_context()
     print("WKI zone source invariants hold")
 
 

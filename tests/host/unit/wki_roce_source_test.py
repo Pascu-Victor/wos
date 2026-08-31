@@ -103,6 +103,21 @@ def test_registered_region_waits_use_shared_deadline_helper() -> None:
         )
 
 
+def test_tagged_completion_query_is_bounded_and_cookie_exact() -> None:
+    body = function_body(TRANSPORT_ROCE_CPP.read_text(), "wki_roce_region_tagged_write_complete")
+    require_tokens(
+        body,
+        [
+            "len == 0 ? region_is_registered(rkey)",
+            "region_tagged_write_received_at_least(rkey, cookie, len)",
+        ],
+        "bounded tagged completion query",
+    )
+    for forbidden in ["while", "napi_poll_all_pending", "backlog_drain_all_pending_inline", "wki_now_us"]:
+        if forbidden in body:
+            fail(f"tagged completion query must not wait or drive unrelated work: found {forbidden}")
+
+
 def test_read_response_copies_each_chunk_while_region_lock_is_held() -> None:
     source = TRANSPORT_ROCE_CPP.read_text()
     copy_chunk = function_body(source, "region_copy_read_chunk")
@@ -147,6 +162,7 @@ def main() -> None:
     test_roce_wait_deadlines_are_saturating()
     test_temporary_read_completion_wait_is_deadline_bounded()
     test_registered_region_waits_use_shared_deadline_helper()
+    test_tagged_completion_query_is_bounded_and_cookie_exact()
     test_read_response_copies_each_chunk_while_region_lock_is_held()
     print("WKI RoCE source invariants hold")
 

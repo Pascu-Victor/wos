@@ -10,6 +10,7 @@ REMOTE_IPC_SOCKET_CPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "rem
 REMOTE_IPC_HPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "remote_ipc.hpp"
 WKI_WAIT_KTEST = ROOT / "modules" / "kern" / "src" / "test" / "wki_wait_ktest.cpp"
 WKI_WIRE_HPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "wire.hpp"
+WKI_CPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "wki.cpp"
 
 
 def fail(message: str) -> None:
@@ -107,6 +108,42 @@ def test_pipe_pump_reuses_worker_stack_frame() -> None:
     ]:
         if assertion not in remote_ipc:
             fail(f"pipe pump stack frame bound is missing {assertion!r}")
+
+
+def test_stopped_pipe_pump_publishes_discard_fence() -> None:
+    remote_ipc = REMOTE_IPC_CPP.read_text()
+    collect = function_body(remote_ipc, "collect_pipe_pump_retirement_locked")
+    finish = function_body(remote_ipc, "finish_pipe_pump_retirement")
+    pump = function_body(remote_ipc, "pipe_pump_thread_fn")
+
+    for token in [
+        "retirement.target = exp->consumer_node",
+        "retirement.resource_id = exp->resource_id",
+        "retirement.discard_pending = !exp->active",
+        "release_pipe_pump_slot_locked(pump_arg, exp)",
+        "compact_inactive_exports_locked()",
+    ]:
+        if token not in collect:
+            fail(f"stopped pump retirement is missing {token!r}")
+    require_order(collect, "retirement.discard_pending = !exp->active", "release_pipe_pump_slot_locked", "pump discard fence")
+    for token in [
+        "free_retired_exports(retirement.retired_exports)",
+        "if (retirement.discard_pending)",
+        "schedule_pending_pipe_discard(retirement.target, retirement.resource_id)",
+    ]:
+        if token not in finish:
+            fail(f"stopped pump finisher is missing {token!r}")
+    if pump.count("collect_pipe_pump_retirement_locked(*arg, exp)") != 2 or pump.count("finish_pipe_pump_retirement(RETIREMENT)") != 2:
+        fail("both pre-read and post-read pump exits must publish the same retirement fence")
+
+    flush = function_body(remote_ipc, "export_pipe_write_flush_thread_loop")
+    for token in [
+        "bool const DIRECT_DISCARD = pump_task == nullptr",
+        "schedule_pending_pipe_discard(CONSUMER_NODE, resource_id)",
+    ]:
+        if token not in flush:
+            fail(f"no-pump close retirement is missing {token!r}")
+    require_order(flush, "s_ipc_lock.unlock_irqrestore(irqf)", "schedule_pending_pipe_discard(CONSUMER_NODE, resource_id)", "close discard fence")
 
 
 def test_inactive_proxy_poll_reports_terminal_readiness() -> None:
@@ -452,17 +489,28 @@ def test_write_only_pipe_proxy_omits_receive_ring() -> None:
     if missing:
         fail("IPC DATA admission must inline receivers, defer exports/pre-attach data, and drop invalid nonreceivers: " + ", ".join(missing))
 
+    admission_body = function_body(remote_ipc, "wki_ipc_admit_dev_op_rx")
+    admission_required = [
+        "WkiIpcDevOpRxAdmission::DISCARD",
+        "if (req.op_id == OP_EPOLL_CTL)",
+        "WkiIpcDevOpRxAdmission::INLINE",
+        "try_enqueue_ipc_dev_op_work_rx",
+        "WkiIpcDevOpRxAdmission::RETRY",
+        "WkiIpcDevOpRxAdmission::DEFERRED",
+    ]
+    missing = [token for token in admission_required if token not in admission_body]
+    if missing:
+        fail("IPC reliable RX must reserve bounded deferred work before ACK: " + ", ".join(missing))
+
     dispatch_body = function_body(remote_ipc, "handle_ipc_dev_op_req")
     dispatch_required = [
-        "bool drop = false",
-        "should_defer_ipc_dev_op(req.op_id, resource_id, hdr->src_node, &drop)",
-        "if (drop)",
+        "if (req.op_id != OP_EPOLL_CTL)",
         "handle_ipc_dev_op_req_inline(hdr, payload, payload_len, nullptr)",
     ]
     missing = [token for token in dispatch_required if token not in dispatch_body]
     if missing:
-        fail("IPC DEV_OP dispatch must apply the no-allocation DATA drop decision: " + ", ".join(missing))
-    require_order(dispatch_body, "if (drop)", "handle_ipc_dev_op_req_inline", "invalid IPC DATA admission")
+        fail("IPC inline dispatch must be restricted to bounded epoll_ctl: " + ", ".join(missing))
+    require_order(dispatch_body, "if (req.op_id != OP_EPOLL_CTL)", "handle_ipc_dev_op_req_inline", "bounded IPC inline dispatch")
 
     data_body = function_body(remote_ipc, "handle_ipc_dev_op_req_inline")
     data_required = [
@@ -578,13 +626,14 @@ def test_dev_op_response_cookies_fence_stale_waiters() -> None:
     if "wki_ipc_consume_pending_wait_response" not in remote_ipc:
         fail("proxy control waiters must consume and clear side-band responses through the shared helper")
 
+    cookie_classes = function_body(remote_ipc, "ipc_op_uses_response_cookie")
+    if "op_id != OP_SOCK_CLOSE" not in cookie_classes:
+        fail("fire-and-forget socket close must not be rejected for omitting a response cookie")
+
     server_body = function_body(remote_ipc, "handle_ipc_dev_op_req_inline")
     server_required = [
         "ipc_op_uses_response_cookie(OP_ID)",
         "std::memcpy(&request_cookie, op_data, WKI_IPC_OP_COOKIE_BYTES)",
-        "resp.reserved = response_cookie",
-        "send_ipc_dev_op_error_response(hdr, op_id, resource_id, -ENOMEM, REQUEST_COOKIE)",
-        "send_ipc_dev_op_error_response(hdr, op_id, resource_id, -EAGAIN, REQUEST_COOKIE)",
         "resp->reserved = request_cookie",
         "ctl_resp.reserved = request_cookie",
         "wake_resp.reserved = request_cookie",
@@ -593,6 +642,10 @@ def test_dev_op_response_cookies_fence_stale_waiters() -> None:
     missing = [token for token in server_required if token not in remote_ipc]
     if missing:
         fail("home-side IPC control responses must echo request cookies: " + ", ".join(missing))
+
+    admission = function_body(remote_ipc, "wki_ipc_admit_dev_op_rx")
+    if "WkiIpcDevOpRxAdmission::RETRY" not in admission:
+        fail("IPC admission exhaustion must withhold ACK instead of synthesizing a stale-cookie error")
 
     socket_body = function_body(remote_socket, "send_socket_op_sync")
     pty_body = function_body(remote_ipc, "proxy_pty_ioctl")
@@ -640,19 +693,22 @@ def test_peer_cleanup_drains_deferred_dev_op_work() -> None:
     if missing:
         fail("deferred IPC DEV_OP work must carry peer cleanup epoch fencing: " + ", ".join(missing))
 
-    enqueue_body = function_body(remote_ipc, "enqueue_ipc_dev_op_work")
-    if "work->cleanup_epoch = ipc_peer_cleanup_epoch_locked(hdr->src_node)" not in enqueue_body:
+    enqueue_body = function_body(remote_ipc, "try_enqueue_ipc_dev_op_work_rx")
+    if "work->cleanup_epoch = PEER_EPOCH->epoch" not in enqueue_body:
         fail("deferred IPC DEV_OP enqueue must snapshot the source peer cleanup epoch")
 
     worker_body = function_body(remote_ipc, "ipc_dev_op_worker_thread_fn")
     require_order(
         worker_body,
-        "bool const FENCED = ipc_dev_op_work_is_fenced_locked(work)",
-        "handle_ipc_dev_op_req_inline(&work->hdr, work->payload, work->payload_len, &work)",
+        "claimed = work != nullptr && claim_ipc_dev_op_worker_locked(work)",
+        "handle_ipc_dev_op_req_inline(&work->hdr, work->payload, work->payload_len, &work, &retry)",
         "worker stale work check",
     )
-    if "free_ipc_dev_op_work(work);" not in worker_body[worker_body.find("bool const FENCED") :]:
+    if "free_ipc_dev_op_work(work);" not in worker_body[worker_body.find("claimed = work != nullptr") :]:
         fail("deferred IPC DEV_OP worker must free stale work without handling it")
+    for token in ["release_ipc_dev_op_worker_locked(SRC_NODE)", "ipc_dev_op_queue_push_front_locked", "kern_sleep_us"]:
+        if token not in worker_body:
+            fail(f"IPC worker must retain and retry accepted must-not-drop work: missing {token}")
 
     batch = remote_ipc[remote_ipc.find("struct IpcPeerCleanupBatch") : remote_ipc.find("auto export_needs_peer_cleanup_locked")]
     for snippet in [
@@ -667,7 +723,8 @@ def test_peer_cleanup_drains_deferred_dev_op_work() -> None:
         "for (auto& queue : g_ipc_dev_op_queues)",
         "work->hdr.src_node != node_id",
         "batch.detached_dev_ops.at(batch.detached_dev_op_count++) = work",
-        "it = queue.erase(it)",
+        "queue.count--",
+        "work->next = nullptr",
     ]:
         if snippet not in collect_body:
             fail(f"peer cleanup must drain queued deferred DEV_OP work for the fenced peer: {snippet}")
@@ -682,6 +739,12 @@ def test_peer_cleanup_drains_deferred_dev_op_work() -> None:
     require_order(
         cleanup_body,
         "begin_ipc_peer_dev_op_cleanup_locked(node_id)",
+        "ipc_peer_active_workers_locked(node_id) == 0",
+        "cleanup active-worker drain",
+    )
+    require_order(
+        cleanup_body,
+        "ipc_peer_active_workers_locked(node_id) == 0",
         "collect_ipc_peer_cleanup_batch_locked(node_id, batch)",
         "cleanup begin epoch",
     )
@@ -691,46 +754,107 @@ def test_peer_cleanup_drains_deferred_dev_op_work() -> None:
         "end_ipc_peer_dev_op_cleanup_locked(node_id)",
         "cleanup end epoch",
     )
+    pump_pending = cleanup_body.find("bool const STOPPED_PUMP_PENDING = batch.stopped_pump_count != 0")
+    batch_drain = cleanup_body.find("drain_ipc_peer_cleanup_batch(batch)", pump_pending)
+    pump_guard = cleanup_body.find("if (STOPPED_PUMP_PENDING)", batch_drain)
+    pump_reschedule = cleanup_body.find("ker::mod::sched::kern_yield()", batch_drain)
+    cleanup_end = cleanup_body.find("end_ipc_peer_dev_op_cleanup_locked(node_id)", pump_reschedule)
+    if pump_pending < 0 or batch_drain < 0 or pump_guard < 0 or pump_reschedule < pump_guard or cleanup_end < 0:
+        fail("peer cleanup must reschedule only stopped pipe pumps while cleanup admission remains fenced")
+
+
+def test_ipc_dev_ops_are_reserved_before_reliable_ack() -> None:
+    wki = WKI_CPP.read_text()
+    remote_ipc = REMOTE_IPC_CPP.read_text()
+    rx = function_body(wki, "wki_rx")
+    admission = function_body(remote_ipc, "wki_ipc_admit_dev_op_rx")
+    enqueue = function_body(remote_ipc, "try_enqueue_ipc_dev_op_work_rx")
+
+    require_order(
+        rx,
+        "admit_ipc_dev_op(msg, hdr, payload, PAYLOAD_LEN, ch, ch->generation)",
+        "IPC_DEV_OP_ADMISSION == WkiIpcDevOpRxAdmission::RETRY",
+        "IPC direct admission result",
+    )
+    require_order(
+        rx,
+        "IPC_DEV_OP_ADMISSION == WkiIpcDevOpRxAdmission::RETRY",
+        "ch->rx_seq++",
+        "IPC RETRY must precede reliable sequence publication",
+    )
+    if rx.count("admit_ipc_dev_op(") != 2:
+        fail("direct and reorder reliable RX paths must both pre-admit IPC DEV_OP work")
+    for token in [
+        "if (req.op_id == OP_EPOLL_CTL)",
+        "WkiIpcDevOpRxAdmission::INLINE",
+        "try_enqueue_ipc_dev_op_work_rx",
+    ]:
+        if token not in admission:
+            fail(f"IPC epoll/deferred admission split is missing {token}")
+    for token in [
+        "s_ipc_lock.try_lock()",
+        "s_ipc_dev_op_pool_lock.try_lock()",
+        "work->channel_identity =",
+        "IpcPeerCleanupEpoch* const PEER_EPOCH = ipc_peer_cleanup_slot_locked(hdr->src_node, true)",
+        "work->cleanup_epoch = PEER_EPOCH->epoch",
+        "std::memcpy(work->payload, payload, payload_len)",
+        "ipc_dev_op_queue_push_back_locked(queue, work)",
+    ]:
+        if token not in enqueue:
+            fail(f"IPC fixed pre-ACK reservation is missing {token}")
+    for forbidden in ["operator new", "new (std::nothrow)", "lock_irqsave", "kern_", "vfs_", "rdma_"]:
+        if forbidden in enqueue:
+            fail(f"IPC RX reservation contains unsafe operation {forbidden!r}")
 
 
 def test_large_deferred_dev_op_payloads_are_coallocated() -> None:
     remote_ipc = REMOTE_IPC_CPP.read_text()
     for snippet in [
+        "struct IpcDevOpStorage",
+        "std::array<uint8_t, WKI_ETH_MAX_PAYLOAD> payload",
         "bool payload_coallocated = false",
-        "static_assert(sizeof(IpcDevOpWork) == 56)",
-        "WKI_IPC_DEV_OP_COALLOC_MIN_PAYLOAD = 8192",
-        "payload_len <= WKI_ETH_MAX_PAYLOAD",
+        "bool fixed_pool = false",
+        "bool pipe_chunk_transferable = false",
+        "WKI_IPC_DEV_OP_MAX_PENDING = 256",
+        "WKI_IPC_DEV_OP_TRANSFER_RESERVE = WKI_IPC_DEV_OP_WORKER_COUNT * 2",
+        "std::array<IpcDevOpStorage, WKI_IPC_DEV_OP_MAX_PENDING> g_ipc_dev_op_work",
+        "size_t g_ipc_dev_op_free_count = 0",
     ]:
         if snippet not in remote_ipc:
-            fail(f"large deferred IPC DEV_OP storage policy is missing {snippet!r}")
+            fail(f"bounded deferred IPC DEV_OP storage policy is missing {snippet!r}")
 
-    alloc_body = function_body(remote_ipc, "alloc_ipc_dev_op_work")
+    alloc_body = function_body(remote_ipc, "take_ipc_dev_op_work_locked")
     for snippet in [
-        "payload_len >= WKI_IPC_DEV_OP_COALLOC_MIN_PAYLOAD",
-        "sizeof(IpcDevOpWork) + (COALLOCATE_PAYLOAD ? payload_len : 0)",
-        "::operator new(STORAGE_SIZE, std::nothrow)",
-        "new (STORAGE) IpcDevOpWork{}",
-        "work->payload = reinterpret_cast<uint8_t*>(work + 1)",
-        "new (std::nothrow) uint8_t[payload_len]",
+        "payload_len > WKI_ETH_MAX_PAYLOAD",
+        "IpcDevOpWork* work = g_ipc_dev_op_free",
+        "g_ipc_dev_op_free = work->next",
+        "work->payload = storage->payload.data()",
+        "work->payload_coallocated = true",
+        "work->fixed_pool = true",
+        "work->pipe_chunk_transferable = g_ipc_dev_op_free_count >= WKI_IPC_DEV_OP_TRANSFER_RESERVE",
     ]:
         if snippet not in alloc_body:
-            fail(f"deferred IPC DEV_OP allocator is missing {snippet!r}")
+            fail(f"deferred IPC fixed allocator is missing {snippet!r}")
+    for forbidden in ("operator new", "new (std::nothrow)", "lock_irqsave"):
+        if forbidden in function_body(remote_ipc, "try_enqueue_ipc_dev_op_work_rx"):
+            fail(f"IPC RX admission must be allocation-free and try-only: found {forbidden!r}")
 
     release_body = function_body(remote_ipc, "free_ipc_dev_op_work")
     for snippet in [
-        "if (!work->payload_coallocated)",
-        "delete[] work->payload",
-        "work->~IpcDevOpWork()",
-        "::operator delete(work)",
+        "if (!work->fixed_pool)",
+        "work->payload = storage->payload.data()",
+        "s_ipc_dev_op_pool_lock.lock_irqsave()",
+        "work->next = g_ipc_dev_op_free",
+        "g_ipc_dev_op_free = work",
+        "++g_ipc_dev_op_free_count",
     ]:
         if snippet not in release_body:
             fail(f"deferred IPC DEV_OP release is missing {snippet!r}")
 
-    enqueue_body = function_body(remote_ipc, "enqueue_ipc_dev_op_work")
-    if "alloc_ipc_dev_op_work(payload_len)" not in enqueue_body:
-        fail("deferred IPC DEV_OP enqueue must use the shared storage allocator")
-    if "new (std::nothrow) IpcDevOpWork" in enqueue_body or "new (std::nothrow) uint8_t[payload_len]" in enqueue_body:
-        fail("deferred IPC DEV_OP enqueue must not allocate the descriptor and large payload separately")
+    enqueue_body = function_body(remote_ipc, "try_enqueue_ipc_dev_op_work_rx")
+    for snippet in ["s_ipc_lock.try_lock()", "s_ipc_dev_op_pool_lock.try_lock()", "take_ipc_dev_op_work_locked(payload_len)"]:
+        if snippet not in enqueue_body:
+            fail(f"deferred IPC RX enqueue is missing {snippet!r}")
 
 
 def test_large_deferred_dev_op_payloads_transfer_to_export_backlog() -> None:
@@ -741,6 +865,7 @@ def test_large_deferred_dev_op_payloads_transfer_to_export_backlog() -> None:
         "WKI_IPC_DEV_OP_TRANSFER_MIN_DATA",
         "len < WKI_IPC_DEV_OP_TRANSFER_MIN_DATA",
         "len <= work->payload_len - OFFSET",
+        "!work->pipe_chunk_transferable",
         "queue_export_pipe_write_data(uint32_t resource_id, const uint8_t* data, uint16_t len, IpcDevOpWork** work_owner,",
     ]:
         if snippet not in remote_ipc:
@@ -792,7 +917,7 @@ def test_large_deferred_dev_op_payloads_transfer_to_export_backlog() -> None:
         fail("export backlog owner publication must complete before releasing s_ipc_lock")
 
     worker_body = function_body(remote_ipc, "ipc_dev_op_worker_thread_fn")
-    worker_call = "handle_ipc_dev_op_req_inline(&work->hdr, work->payload, work->payload_len, &work)"
+    worker_call = "handle_ipc_dev_op_req_inline(&work->hdr, work->payload, work->payload_len, &work, &retry)"
     worker_call_pos = worker_body.find(worker_call)
     if worker_call_pos < 0:
         fail("deferred IPC worker must offer its work item to the inline handler")
@@ -904,13 +1029,74 @@ def test_retired_exports_fence_and_discard_unattached_deliveries() -> None:
             fail(f"pipe read-close retirement must fence late EOF state: {snippet!r}")
 
 
+def test_socket_close_uses_reliable_proxy_close_queue() -> None:
+    remote_ipc = REMOTE_IPC_CPP.read_text()
+    remote_socket = REMOTE_IPC_SOCKET_CPP.read_text()
+    header = REMOTE_IPC_HPP.read_text()
+
+    if "void wki_ipc_send_proxy_close(" not in header:
+        fail("socket close must be able to share the bounded reliable proxy-close sender")
+
+    shared_sender = function_body(remote_ipc, "wki_ipc_send_proxy_close")
+    if "send_proxy_pipe_close(proxy, msg, msg_size, resource_id, op_id)" not in shared_sender:
+        fail("shared proxy-close API must delegate to the copied-message retry queue")
+
+    close_body = function_body(remote_socket, "proxy_socket_close")
+    for snippet in [
+        "req->op_id = OP_SOCK_CLOSE",
+        "std::memcpy(msg.data() + sizeof(DevOpReqPayload), &proxy->resource_id",
+        "wki_ipc_send_proxy_close(proxy, msg.data()",
+        "wki_ipc_detach_proxy_file(f, proxy)",
+    ]:
+        if snippet not in close_body:
+            fail(f"socket close is missing reliable terminal publication {snippet!r}")
+    require_order(close_body, "wki_ipc_send_proxy_close", "wki_ipc_detach_proxy_file", "socket close publication")
+    if "wki_send(" in close_body or "send_socket_op(" in close_body:
+        fail("socket close must not bypass the copied-message retry queue")
+    if "WKI_IPC_OP_COOKIE_BYTES" in close_body:
+        fail("fire-and-forget socket close must retain its resource-only wire payload")
+
+
+def test_remote_exec_fd_handoff_transfers_only_the_pinned_owner() -> None:
+    remote_ipc = REMOTE_IPC_CPP.read_text()
+    export_body = function_body(remote_ipc, "wki_ipc_export_task_fds")
+    for snippet in [
+        "file->refcount.fetch_add(1, std::memory_order_acq_rel)",
+        "handoff_out[count] = WkiIpcTaskFdHandoff",
+    ]:
+        if snippet not in export_body:
+            fail(f"IPC export must pin exact local fd identity before remote submit: {snippet!r}")
+
+    commit_body = function_body(remote_ipc, "wki_ipc_commit_task_fd_handoff")
+    for snippet in [
+        "task->fd_table_lock.lock_irqsave()",
+        "task->fd_table.lookup(entry.local_fd) == entry.file",
+        "task->fd_table.remove(entry.local_fd)",
+        "task->clear_fd_cloexec(entry.local_fd)",
+        "ipc_release_file_ref(removed)",
+        "ipc_release_file_ref(entry.file)",
+    ]:
+        if snippet not in commit_body:
+            fail(f"accepted IPC fd handoff is missing exact-owner transfer: {snippet!r}")
+    require_order(commit_body, "task->fd_table.remove(entry.local_fd)", "task->fd_table_lock.unlock_irqrestore(IRQF)", "fd removal publication")
+    require_order(commit_body, "task->fd_table_lock.unlock_irqrestore(IRQF)", "ipc_release_file_ref(removed)", "fd owner release")
+    if "s_ipc_lock" in commit_body:
+        fail("accepted IPC fd handoff must not nest the fd-table and IPC locks")
+
+    release_body = function_body(remote_ipc, "wki_ipc_release_task_fd_handoff")
+    if "fd_table" in release_body or "ipc_release_file_ref(file)" not in release_body:
+        fail("abandoned IPC fd handoff must drop only temporary identity pins")
+
+
 def test_ipc_selftests_are_declared_and_registered() -> None:
     header = REMOTE_IPC_HPP.read_text()
     ktest = WKI_WAIT_KTEST.read_text()
     required = [
         "wki_ipc_selftest_cleanup_for_peer_drains_deferred_dev_ops",
+        "wki_ipc_selftest_task_fd_handoff_transfers_exact_owner",
         "wki_ipc_selftest_large_dev_op_work_coallocates_payload",
         "wki_ipc_selftest_large_dev_op_work_backs_pipe_chunk",
+        "wki_ipc_selftest_dev_op_work_pool_is_bounded",
         "wki_ipc_selftest_poll_wake_drains_over_capacity",
         "wki_ipc_selftest_inactive_proxy_poll_is_terminal",
         "wki_ipc_selftest_epoll_close_releases_lookup_ref",
@@ -923,6 +1109,7 @@ def test_ipc_selftests_are_declared_and_registered() -> None:
         "wki_ipc_selftest_dev_op_response_cookie_fences_stale_completion",
         "wki_ipc_selftest_dev_op_response_uses_home_node_identity",
         "wki_ipc_selftest_discard_retires_unattached_delivery",
+        "wki_ipc_selftest_stopped_pump_publishes_discard_fence",
     ]
     for token in required:
         if token not in header:
@@ -936,6 +1123,7 @@ def main() -> None:
     test_proxy_poll_wake_cancels_deferred_switch_without_losing_wake_token()
     test_pipe_pump_read_waiter_uses_event_block_fast_path()
     test_pipe_pump_reuses_worker_stack_frame()
+    test_stopped_pipe_pump_publishes_discard_fence()
     test_inactive_proxy_poll_reports_terminal_readiness()
     test_epoll_close_releases_lookup_ref_after_detach()
     test_proxy_lookup_is_peer_scoped()
@@ -948,11 +1136,14 @@ def main() -> None:
     test_attach_fd_install_is_transactional()
     test_dev_op_response_cookies_fence_stale_waiters()
     test_peer_cleanup_drains_deferred_dev_op_work()
+    test_ipc_dev_ops_are_reserved_before_reliable_ack()
     test_large_deferred_dev_op_payloads_are_coallocated()
     test_large_deferred_dev_op_payloads_transfer_to_export_backlog()
     test_futex_dev_op_preserves_broadcast_wake_count()
     test_ipc_send_retry_backpressure_sleeps_without_yield_livelock()
     test_retired_exports_fence_and_discard_unattached_deliveries()
+    test_socket_close_uses_reliable_proxy_close_queue()
+    test_remote_exec_fd_handoff_transfers_only_the_pinned_owner()
     test_ipc_selftests_are_declared_and_registered()
     print("WKI remote IPC source invariants hold")
 

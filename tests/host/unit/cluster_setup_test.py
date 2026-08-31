@@ -3,6 +3,7 @@
 import contextlib
 import importlib.util
 import io
+import json
 import subprocess
 import sys
 import tempfile
@@ -14,6 +15,12 @@ ROOT = Path(__file__).resolve().parents[3]
 CLUSTER_SETUP = ROOT / "scripts" / "cluster" / "cluster_setup.py"
 CLUSTER_DIR = CLUSTER_SETUP.parent
 USB_HOTPLUG = ROOT / "scripts" / "test" / "usb_hotplug_stress.py"
+WKI_CHAOS_CONFIGS = {
+    "ethernet": ROOT / "configs" / "cluster_wki_chaos.json",
+    "ivshmem": ROOT / "configs" / "cluster_wki_chaos_ivshmem.json",
+    "roce": ROOT / "configs" / "cluster_wki_chaos_roce.json",
+}
+ROUTED_WKI_CHAOS_CONFIG = ROOT / "configs" / "cluster_wki_chaos_routed.json"
 BENCHMARK_LAYOUTS = {
     1: [(32, 32768)],
     2: [(16, 16384), (16, 16384)],
@@ -68,6 +75,29 @@ def sample_config() -> dict:
                 "bridge": {"ip": "10.10.0.100/24"},
             },
             {"id": 1, "name": "wki", "nodes": 2, "nic_queues": 1},
+        ]
+    }
+
+
+def routed_sample_config() -> dict:
+    return {
+        "zones": [
+            {"id": "GLOBAL", "nic_queues": 1},
+            {"id": 0, "name": "lan", "nodes": 3, "nic_queues": 1},
+            {
+                "id": 1,
+                "name": "wki-a",
+                "nodes": 2,
+                "node_ids": [0, 1],
+                "nic_queues": 1,
+            },
+            {
+                "id": 2,
+                "name": "wki-b",
+                "nodes": 2,
+                "node_ids": [1, 2],
+                "nic_queues": 1,
+            },
         ]
     }
 
@@ -148,6 +178,134 @@ def test_no_setup_topology_rejects_missing_or_stale_links(module) -> None:
     ):
         if expected not in message:
             raise AssertionError(f"missing diagnostic {expected!r} in {message!r}")
+
+
+def test_zone_node_ids_preserve_legacy_and_validate_explicit_membership(module) -> None:
+    assert_equal(
+        module.zone_node_ids({"id": 7, "name": "legacy", "nodes": 3}),
+        [0, 1, 2],
+        "legacy contiguous membership",
+    )
+    assert_equal(
+        module.zone_node_ids(
+            {"id": 7, "name": "explicit", "nodes": 2, "node_ids": [2, 1]}
+        ),
+        [1, 2],
+        "explicit global node membership",
+    )
+    assert_equal(
+        module.ivshmem_links(
+            {
+                "id": 7,
+                "name": "explicit",
+                "node_ids": [1, 3],
+                "ivshmem": {"enabled": True, "topology": "full-mesh"},
+            }
+        ),
+        [(1, 3)],
+        "ivshmem uses explicit global node IDs",
+    )
+
+    invalid_zones = [
+        ({"id": 1, "name": "empty", "node_ids": []}, "non-empty array"),
+        ({"id": 1, "name": "bool", "node_ids": [True]}, "must be an integer"),
+        (
+            {"id": 1, "name": "duplicate", "node_ids": [1, 1]},
+            "must not contain duplicates",
+        ),
+        (
+            {"id": 1, "name": "mismatch", "nodes": 3, "node_ids": [1, 2]},
+            "disagrees with 2 explicit node_ids",
+        ),
+    ]
+    for zone, expected in invalid_zones:
+        try:
+            module.zone_node_ids(zone)
+        except ValueError as exc:
+            if expected not in str(exc):
+                raise AssertionError(f"wrong membership error for {zone!r}: {exc}") from exc
+        else:
+            raise AssertionError(f"invalid zone membership was accepted: {zone!r}")
+
+    invalid_configs = [
+        {
+            "zones": [
+                {"id": "GLOBAL"},
+                {
+                    "id": 1,
+                    "name": "override",
+                    "node_ids": [1, 2],
+                    "nodes_config": [{"id": 0}],
+                },
+            ]
+        },
+        {"zones": [{"id": "GLOBAL", "node_ids": [0]}]},
+        {"zones": [{"id": "GLOBAL"}, {"id": [1], "nodes": 1}]},
+    ]
+    for config in invalid_configs:
+        try:
+            module.validate_cluster_config(config)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"invalid explicit-membership config was accepted: {config!r}")
+
+    with tempfile.TemporaryDirectory() as temporary:
+        invalid_path = Path(temporary) / "invalid-cluster.json"
+        invalid_path.write_text(json.dumps(invalid_configs[0]))
+        try:
+            module.load_config(invalid_path)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("load_config accepted an invalid explicit-membership schema")
+
+
+def test_no_setup_topology_uses_only_explicit_zone_members(module) -> None:
+    links = {
+        "wos-lan-br": up_link(),
+        "wos-wki-a-br": up_link(),
+        "wos-wki-b-br": up_link(),
+        "wos-lan-N0": up_link("wos-lan-br"),
+        "wos-lan-N1": up_link("wos-lan-br"),
+        "wos-lan-N2": up_link("wos-lan-br"),
+        "wos-wki-a-N0": up_link("wos-wki-a-br"),
+        "wos-wki-a-N1": up_link("wos-wki-a-br"),
+        "wos-wki-b-N1": up_link("wos-wki-b-br"),
+        "wos-wki-b-N2": up_link("wos-wki-b-br"),
+    }
+    probes: list[str] = []
+    old_link_json = module.link_json
+    old_tap_has_multiqueue = module.tap_has_multiqueue
+
+    def probe(name: str):
+        probes.append(name)
+        return links.get(name)
+
+    module.link_json = probe
+    module.tap_has_multiqueue = lambda _name: True
+    try:
+        module.validate_no_setup_topology(routed_sample_config())
+        missing = dict(links)
+        missing.pop("wos-wki-b-N2")
+        module.link_json = lambda name: missing.get(name)
+        try:
+            module.validate_no_setup_topology(routed_sample_config())
+        except module.NoSetupTopologyError as exc:
+            message = str(exc)
+        else:
+            raise AssertionError("missing explicit-member TAP was accepted")
+    finally:
+        module.link_json = old_link_json
+        module.tap_has_multiqueue = old_tap_has_multiqueue
+
+    expected_probes = set(links)
+    assert_equal(set(probes), expected_probes, "rootless explicit-membership probes")
+    for forbidden in ("wos-wki-a-N2", "wos-wki-b-N0"):
+        if forbidden in probes:
+            raise AssertionError(f"--no-setup probed non-member TAP {forbidden}")
+    if "missing TAP wos-wki-b-N2 for node 2 zone wki-b" not in message:
+        raise AssertionError(f"missing explicit-member diagnostic: {message!r}")
 
 
 def test_running_wos_qemu_probe_filters_unrelated_processes(module) -> None:
@@ -404,6 +562,269 @@ def test_usb_hotplug_qemu_args_and_qmp_device_shape(module) -> None:
     )
 
 
+def test_generic_qmp_socket_is_opt_in_and_independent_of_usb(module) -> None:
+    node_setup = module.node_setup
+    assert_equal(node_setup.qmp_socket_path({"id": 4}), None, "default QMP socket")
+    assert_equal(
+        node_setup.qmp_socket_path(
+            {"id": 4, "vm": {"usb_hotplug": {"enabled": True}}}
+        ),
+        Path("qmp-vm4.sock"),
+        "legacy USB QMP socket",
+    )
+    assert_equal(
+        node_setup.qmp_socket_path(
+            {
+                "id": 4,
+                "vm": {
+                    "qmp_socket": "state/generic.sock",
+                    "usb_hotplug": {
+                        "enabled": True,
+                        "qmp_socket": "state/legacy.sock",
+                    },
+                },
+            }
+        ),
+        Path("state/generic.sock"),
+        "generic QMP socket precedence",
+    )
+
+    old_prepare = node_setup.prepare_node_overlays
+    old_cleanup = node_setup.cleanup_node_logs
+    node_setup.prepare_node_overlays = lambda _spec, log=print: (
+        Path("disk0-overlay"),
+        Path("disk1-overlay"),
+    )
+    node_setup.cleanup_node_logs = lambda _spec: None
+    try:
+        args = node_setup.build_qemu_args(
+            {"id": 4, "vm": {"qmp_socket": "state/qmp-vm4.sock"}},
+            log=lambda _line: None,
+        )
+    finally:
+        node_setup.prepare_node_overlays = old_prepare
+        node_setup.cleanup_node_logs = old_cleanup
+    assert_equal(args.count("-qmp"), 1, "generic QMP option count")
+    qmp_index = args.index("unix:state/qmp-vm4.sock,server=on,wait=off")
+    assert_equal(args[qmp_index - 1], "-qmp", "generic QMP QEMU option")
+    if any("qemu-xhci" in arg for arg in args):
+        raise AssertionError("generic QMP unexpectedly enabled xHCI")
+
+
+def test_wki_chaos_transport_configs_use_isolated_artifacts(module) -> None:
+    expected_nodes = {"ethernet": 3, "ivshmem": 2, "roce": 2}
+    qmp_paths: set[str] = set()
+    for lane, path in WKI_CHAOS_CONFIGS.items():
+        config = module.load_config(path)
+        global_zone = module.find_global(config["zones"])
+        assert_equal(
+            global_zone["vm"]["disk0"],
+            "wki-chaos-data/disk.qcow2",
+            f"{lane} isolated boot disk",
+        )
+        assert_equal(
+            global_zone["vm"]["disk1"],
+            "wki-chaos-data/mountfs.qcow2",
+            f"{lane} isolated rootfs disk",
+        )
+        nodes = module.collect_unique_nodes(config)
+        assert_equal(len(nodes), expected_nodes[lane], f"{lane} node count")
+        for node_id, node in nodes.items():
+            socket_path = node["effective"]["vm"].get("qmp_socket")
+            if not socket_path or not socket_path.startswith(f"wki-chaos-data/{lane}-qmp-vm"):
+                raise AssertionError(
+                    f"{lane} node {node_id} has a missing or non-isolated QMP path: {socket_path!r}"
+                )
+            if socket_path in qmp_paths:
+                raise AssertionError(f"duplicate chaos QMP path {socket_path!r}")
+            qmp_paths.add(socket_path)
+
+        wki_zone = next(zone for zone in config["zones"] if zone.get("name") == "wki")
+        assert_equal(wki_zone["netdev_driver"], "wki", f"{lane} WKI NIC driver")
+        assert_equal(
+            bool(wki_zone.get("ivshmem", {}).get("enabled", False)),
+            lane == "ivshmem",
+            f"{lane} shared-memory selection",
+        )
+
+
+def test_routed_wki_chaos_config_resolves_overlap_and_specs(module) -> None:
+    config = module.load_config(ROUTED_WKI_CHAOS_CONFIG)
+    global_zone = module.find_global(config["zones"])
+    assert_equal(global_zone["vm"]["disk0"], "wki-chaos-data/disk.qcow2", "routed boot disk")
+    assert_equal(global_zone["vm"]["disk1"], "wki-chaos-data/mountfs.qcow2", "routed rootfs disk")
+
+    zones = {
+        zone["name"]: zone
+        for zone in config["zones"]
+        if zone.get("id") != "GLOBAL"
+    }
+    assert_equal(module.zone_node_ids(zones["lan"]), [0, 1, 2], "routed LAN members")
+    assert_equal(module.zone_node_ids(zones["wki-a"]), [0, 1], "routed WKI-A members")
+    assert_equal(module.zone_node_ids(zones["wki-b"]), [1, 2], "routed WKI-B members")
+    assert_equal(
+        zones["wki-a"]["qemu_netdev"],
+        {
+            "type": "socket-mcast",
+            "address": "239.192.87.1",
+            "port": 47801,
+            "localaddr": "127.0.0.1",
+        },
+        "routed WKI-A rootless backend",
+    )
+    assert_equal(
+        zones["wki-b"]["qemu_netdev"],
+        {
+            "type": "socket-mcast",
+            "address": "239.192.87.2",
+            "port": 47802,
+            "localaddr": "127.0.0.1",
+        },
+        "routed WKI-B rootless backend",
+    )
+
+    nodes = module.collect_unique_nodes(config)
+    assert_equal(sorted(nodes), [0, 1, 2], "routed unique node IDs")
+    expected_zone_names = {
+        0: ["lan", "wki-a"],
+        1: ["lan", "wki-a", "wki-b"],
+        2: ["lan", "wki-b"],
+    }
+    qmp_paths: set[str] = set()
+    for node_id in sorted(nodes):
+        spec = module.cluster_node_spec(node_id, nodes[node_id], config)
+        assert_equal(spec["hostname"], f"wos-{node_id}", f"routed node {node_id} hostname")
+        assert_equal(
+            [nic["name"] for nic in spec["nics"]],
+            expected_zone_names[node_id],
+            f"routed node {node_id} NIC membership/order",
+        )
+        assert_equal(
+            [nic["tap"] for nic in spec["nics"]],
+            [f"wos-{name}-N{node_id}" for name in expected_zone_names[node_id]],
+            f"routed node {node_id} TAP naming",
+        )
+        backends = {
+            nic["name"]: nic.get("qemu_netdev")
+            for nic in spec["nics"]
+        }
+        assert_equal(backends["lan"], None, f"routed node {node_id} LAN remains TAP-backed")
+        for name in set(expected_zone_names[node_id]) - {"lan"}:
+            assert_equal(
+                backends[name],
+                zones[name]["qemu_netdev"],
+                f"routed node {node_id} {name} socket group",
+            )
+        socket_path = spec["vm"].get("qmp_socket")
+        if socket_path != f"wki-chaos-data/routed-qmp-vm{node_id}.sock":
+            raise AssertionError(f"routed node {node_id} QMP path is not isolated: {socket_path!r}")
+        if socket_path in qmp_paths:
+            raise AssertionError(f"duplicate routed QMP path {socket_path!r}")
+        qmp_paths.add(socket_path)
+
+
+def test_socket_multicast_backend_validation_qemu_and_no_setup(module) -> None:
+    config = module.load_config(ROUTED_WKI_CHAOS_CONFIG)
+    nodes = module.collect_unique_nodes(config)
+    node1 = module.cluster_node_spec(1, nodes[1], config)
+    node_setup = module.node_setup
+    old_prepare = node_setup.prepare_node_overlays
+    old_cleanup = node_setup.cleanup_node_logs
+    node_setup.prepare_node_overlays = lambda _spec, log=print: (
+        Path("disk0-overlay"), Path("disk1-overlay")
+    )
+    node_setup.cleanup_node_logs = lambda _spec: None
+    try:
+        args = node_setup.build_qemu_args(node1, log=lambda _line: None)
+    finally:
+        node_setup.prepare_node_overlays = old_prepare
+        node_setup.cleanup_node_logs = old_cleanup
+    netdevs = [args[index + 1] for index, token in enumerate(args) if token == "-netdev"]
+    assert_equal(
+        netdevs,
+        [
+            "tap,id=net0,ifname=wos-lan-N1,script=no,downscript=no,vnet_hdr=off,queues=2",
+            "socket,id=net1,mcast=239.192.87.1:47801,localaddr=127.0.0.1",
+            "socket,id=net2,mcast=239.192.87.2:47802,localaddr=127.0.0.1",
+        ],
+        "node1 joins distinct routed multicast groups",
+    )
+    fw_cfg = [args[index + 1] for index, token in enumerate(args) if token == "-fw_cfg"]
+    if "name=opt/wos/netdevs,string=eth0 dhcp;eth1 wki;eth2 wki" not in fw_cfg:
+        raise AssertionError(f"node1 early netdev policy is missing from fw_cfg: {fw_cfg!r}")
+    assert_equal(
+        node_setup.netdevs_content(node1).splitlines()[-3:],
+        ["eth0 dhcp", "eth1 wki", "eth2 wki"],
+        "node1 fw_cfg and rootfs netdev policy share one assignment source",
+    )
+
+    probed: list[str] = []
+    old_link_json = module.link_json
+    old_tap_has_multiqueue = module.tap_has_multiqueue
+    lan_links = {
+        "wos-lan-br": up_link(),
+        "wos-lan-N0": up_link("wos-lan-br"),
+        "wos-lan-N1": up_link("wos-lan-br"),
+        "wos-lan-N2": up_link("wos-lan-br"),
+    }
+
+    def probe(name):
+        probed.append(name)
+        return lan_links.get(name)
+
+    module.link_json = probe
+    module.tap_has_multiqueue = lambda _name: True
+    try:
+        module.validate_no_setup_topology(config)
+    finally:
+        module.link_json = old_link_json
+        module.tap_has_multiqueue = old_tap_has_multiqueue
+    if any("wki-a" in name or "wki-b" in name for name in probed):
+        raise AssertionError(f"--no-setup probed socket-backed host links: {probed!r}")
+
+    invalid_cases = [
+        ("address", "127.0.0.1", "multicast IPv4"),
+        ("port", 0, "integer in [1, 65535]"),
+        ("localaddr", "::1", "must be an IPv4 address"),
+    ]
+    for key, value, diagnostic in invalid_cases:
+        invalid = json.loads(json.dumps(config))
+        invalid["zones"][2]["qemu_netdev"][key] = value
+        try:
+            module.validate_cluster_config(invalid)
+        except ValueError as exc:
+            if diagnostic not in str(exc):
+                raise AssertionError(f"missing socket validation diagnostic: {exc}") from exc
+        else:
+            raise AssertionError(f"invalid socket multicast {key} was accepted")
+
+    legacy_backend = {
+        "type": "socket-mcast",
+        "address": "239.192.87.3",
+        "port": 47803,
+    }
+    assert_equal(
+        node_setup.normalize_qemu_netdev(
+            legacy_backend,
+            queues=1,
+            vhost=False,
+            where="legacy qemu_netdev",
+        ),
+        legacy_backend,
+        "socket multicast localaddr remains optional",
+    )
+
+    collision = json.loads(json.dumps(config))
+    collision["zones"][3]["qemu_netdev"] = dict(collision["zones"][2]["qemu_netdev"])
+    try:
+        module.validate_cluster_config(collision)
+    except ValueError as exc:
+        if "collides with zone" not in str(exc):
+            raise AssertionError(f"missing endpoint collision diagnostic: {exc}") from exc
+    else:
+        raise AssertionError("duplicate socket multicast endpoints were accepted")
+
+
 def test_launch_one_vm_wraps_overlay_creation_failure_without_popen(module) -> None:
     old_build_qemu_args = module.build_qemu_args
     old_popen = module.subprocess.Popen
@@ -567,12 +988,18 @@ def main() -> None:
         test_topology_probe_is_timeout_bounded,
         test_no_setup_topology_accepts_configured_links,
         test_no_setup_topology_rejects_missing_or_stale_links,
+        test_zone_node_ids_preserve_legacy_and_validate_explicit_membership,
+        test_no_setup_topology_uses_only_explicit_zone_members,
         test_running_wos_qemu_probe_filters_unrelated_processes,
         test_cluster_launch_guard_rejects_second_launcher,
         test_cluster_launch_guard_rejects_preexisting_wos_qemu,
         test_fixed_resource_benchmark_topologies,
         test_node_overlay_creation_failure_aborts_launch_prep,
         test_usb_hotplug_qemu_args_and_qmp_device_shape,
+        test_generic_qmp_socket_is_opt_in_and_independent_of_usb,
+        test_wki_chaos_transport_configs_use_isolated_artifacts,
+        test_routed_wki_chaos_config_resolves_overlap_and_specs,
+        test_socket_multicast_backend_validation_qemu_and_no_setup,
         test_launch_one_vm_wraps_overlay_creation_failure_without_popen,
         test_wait_for_launched_vms_reaps_and_reports_nonzero_nodes,
         test_cluster_main_preserves_vm_exit_error_for_incident,

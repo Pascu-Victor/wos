@@ -100,6 +100,7 @@ UNIT_TESTS=(
     ktest_cov_test
     coverage_summary_test
     cluster_setup_test
+    wki_chaos_test
     xhci_lifecycle_source_test
     wosincident_test
     cross_os_benchmark_suite_test
@@ -199,6 +200,7 @@ UNIT_TESTS=(
     wki_routing_source_test
     wki_remote_compute_source_test
     wki_remote_vfs_source_test
+    wki_chaos_workload_source_test
     vfs_open_path_scratch_source_test
     vfs_mount_lifetime_source_test
     vfs_advisory_lock_source_test
@@ -229,6 +231,8 @@ UNIT_TESTS=(
     xfs_shortform_offset_source_test
     xfs_transaction_rollback_source_test
     wki_wire_test
+    wki_block_validation_test
+    wki_peer_resolver_test
     netd_ra_test
     saved_frame_class_test
     migration_guard_test
@@ -242,6 +246,7 @@ UNIT_TESTS=(
     xfs_format_test
     xfs_log_codec_test
     wki_channel_test
+    wki_chaos_model_test
     wki_peer_liveness_test
     wki_event_test
     renderbench_options_test

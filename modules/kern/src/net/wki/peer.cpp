@@ -12,6 +12,7 @@
 #include <net/netpoll.hpp>
 #include <net/packet.hpp>
 #include <net/proto/tcp.hpp>
+#include <net/wki/chaos.hpp>
 #include <net/wki/dev_proxy.hpp>
 #include <net/wki/dev_server.hpp>
 #include <net/wki/event.hpp>
@@ -322,6 +323,41 @@ auto next_channel_epoch(uint32_t epoch) -> uint32_t {
     return epoch == 0 ? 1 : epoch;
 }
 
+auto initial_channel_epoch(uint32_t boot_epoch) -> uint32_t { return boot_epoch == 0 ? 1 : boot_epoch; }
+
+void peer_seed_local_channel_epoch(WkiPeer* peer, uint32_t boot_epoch) {
+    if (peer == nullptr) {
+        return;
+    }
+
+    peer->lock.lock();
+    if (peer->local_channel_epoch == 0) {
+        peer->local_channel_epoch = initial_channel_epoch(boot_epoch);
+    }
+    peer->lock.unlock();
+}
+
+auto effective_remote_channel_epoch_locked(const WkiPeer* peer, uint32_t wire_epoch, uint32_t boot_epoch) -> uint32_t {
+    if (wire_epoch != 0) {
+        return wire_epoch;
+    }
+    if (peer == nullptr || boot_epoch == 0) {
+        return 0;
+    }
+
+    // Broadcast HELLOs predate the channel-epoch extension and intentionally
+    // leave its reserved word at zero.  On the first observation of a boot,
+    // use that already-unique boot epoch as the initial channel epoch.  This
+    // prevents reliable traffic from being ACKed and then invalidated when a
+    // later direct HELLO finally supplies the peer's first nonzero epoch.
+    // A zero epoch from the same known boot remains a periodic beacon and must
+    // never regress an established per-peer channel epoch.
+    if (peer->remote_boot_epoch == 0 || peer->remote_boot_epoch != boot_epoch) {
+        return boot_epoch;
+    }
+    return 0;
+}
+
 void peer_advance_local_channel_epoch(WkiPeer* peer) {
     if (peer == nullptr) {
         return;
@@ -338,6 +374,7 @@ auto peer_note_remote_channel_epoch_locked(WkiPeer* peer, uint32_t remote_epoch)
     }
 
     peer->remote_channel_epoch = remote_epoch;
+    wki_chaos_peer_epoch_update(peer->node_id, peer->remote_boot_epoch, peer->remote_channel_epoch);
     return true;
 }
 
@@ -347,11 +384,23 @@ auto peer_note_remote_boot_epoch_locked(WkiPeer* peer, uint32_t remote_epoch) ->
     }
 
     peer->remote_boot_epoch = remote_epoch;
+    wki_chaos_peer_epoch_update(peer->node_id, peer->remote_boot_epoch, peer->remote_channel_epoch);
     return true;
 }
 
 auto peer_remote_boot_epoch_change_is_proven_locked(const WkiPeer* peer, uint32_t remote_epoch) -> bool {
     return peer != nullptr && peer->remote_boot_epoch != 0 && remote_epoch != 0 && peer->remote_boot_epoch != remote_epoch;
+}
+
+auto peer_remote_epoch_reset_is_proven_locked(const WkiPeer* peer, uint32_t remote_boot_epoch, uint32_t remote_channel_epoch) -> bool {
+    if (peer == nullptr) {
+        return false;
+    }
+
+    bool const BOOT_CHANGE_PROVEN = peer_remote_boot_epoch_change_is_proven_locked(peer, remote_boot_epoch);
+    bool const CHANNEL_CHANGE_PROVEN =
+        peer->remote_channel_epoch != 0 && remote_channel_epoch != 0 && peer->remote_channel_epoch != remote_channel_epoch;
+    return BOOT_CHANGE_PROVEN || CHANNEL_CHANGE_PROVEN;
 }
 
 auto hello_boot_epoch_matches_peer(const WkiPeer* peer, uint32_t remote_epoch) -> bool {
@@ -398,6 +447,81 @@ template <size_t N>
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
 auto hostname_equals(const std::array<char, N>& hostname, const char* other) -> bool {
     return std::strcmp(hostname.data(), other) == 0;
+}
+
+auto retire_fenced_hostname_locked(WkiPeer* peer, uint16_t fenced_id, const std::array<char, WKI_HOSTNAME_MAX>& disconnected_hostname)
+    -> bool {
+    if (peer == nullptr || peer->node_id != fenced_id || peer->state != PeerState::FENCED ||
+        !hostname_equals(peer->hostname, disconnected_hostname.data())) {
+        return false;
+    }
+
+    std::array<char, WKI_HOSTNAME_MAX> fallback{};
+    set_fallback_hostname(fallback, fenced_id);
+    if (peer->hostname == fallback) {
+        return false;
+    }
+    peer->hostname = fallback;
+    return true;
+}
+
+struct HostnameSuccessorScan {
+    uint16_t node_id = WKI_NODE_INVALID;
+    bool ambiguous = false;
+};
+
+void consider_hostname_successor(HostnameSuccessorScan& scan, const WkiPeer& candidate, uint16_t fenced_id,
+                                 const std::array<char, WKI_HOSTNAME_MAX>& hostname) {
+    if (candidate.node_id == WKI_NODE_INVALID || candidate.node_id == fenced_id || candidate.state != PeerState::CONNECTED ||
+        !hostname_equals(candidate.hostname, hostname.data())) {
+        return;
+    }
+    if (scan.node_id != WKI_NODE_INVALID) {
+        scan.ambiguous = true;
+        return;
+    }
+    scan.node_id = candidate.node_id;
+}
+
+auto find_unique_hostname_successor_locked(uint16_t fenced_id, const std::array<char, WKI_HOSTNAME_MAX>& hostname) -> uint16_t {
+    HostnameSuccessorScan scan{};
+    for (auto const& candidate : g_wki.peers) {
+        consider_hostname_successor(scan, candidate, fenced_id, hostname);
+    }
+    return scan.ambiguous ? WKI_NODE_INVALID : scan.node_id;
+}
+
+// Caller holds peer_lock. Once a unique logical successor is observed, the
+// proof is monotonic for the fenced lifecycle even if that successor later
+// disconnects. This is a local identity tombstone; it is never sent on wire.
+auto reconcile_fenced_hostname_replacements_locked(const std::array<char, WKI_HOSTNAME_MAX>& hostname) -> bool {
+    uint16_t const SUCCESSOR = find_unique_hostname_successor_locked(WKI_NODE_INVALID, hostname);
+    if (SUCCESSOR == WKI_NODE_INVALID) {
+        return false;
+    }
+
+    bool changed = false;
+    for (auto& candidate : g_wki.peers) {
+        if (candidate.node_id == WKI_NODE_INVALID || candidate.node_id == SUCCESSOR || candidate.state != PeerState::FENCED ||
+            !hostname_equals(candidate.retired_hostname, hostname.data()) ||
+            candidate.replacement_node_id.load(std::memory_order_relaxed) != WKI_NODE_INVALID) {
+            continue;
+        }
+        candidate.replacement_node_id.store(SUCCESSOR, std::memory_order_release);
+        changed = true;
+    }
+    return changed;
+}
+
+void reconcile_fenced_hostname_replacements(const std::array<char, WKI_HOSTNAME_MAX>& hostname) {
+    g_wki.peer_lock.lock();
+    bool const CHANGED = reconcile_fenced_hostname_replacements_locked(hostname);
+    g_wki.peer_lock.unlock();
+    if (CHANGED) {
+        // VFS, NET, and BLOCK deferred detach workers re-evaluate their exact
+        // old-node reservations in task context.
+        wki_deferred_work_notify();
+    }
 }
 
 auto free_mem_wire_units() -> uint16_t {
@@ -469,7 +593,30 @@ void wki_peer_send_hello(WkiTransport* transport, uint16_t dst_node) {
 
     memcpy(frame.data() + WKI_HEADER_SIZE, &hello, sizeof(hello));
 
-    transport->tx(transport, dst_node, frame.data(), FRAME_LEN);
+    static_cast<void>(wki_transport_send(transport, dst_node, frame.data(), FRAME_LEN));
+}
+
+void wki_peer_send_routed_hello(uint16_t dst_node) {
+    if (dst_node == WKI_NODE_INVALID || dst_node == WKI_NODE_BROADCAST || dst_node == g_wki.my_node_id) {
+        return;
+    }
+
+    HelloPayload hello = {};
+    hello.magic = WKI_HELLO_MAGIC;
+    hello.protocol_version = WKI_VERSION;
+    hello.node_id = g_wki.my_node_id;
+    hello.mac_addr = g_wki.my_mac;
+    hello.capabilities = g_wki.capabilities;
+    hello.heartbeat_interval_ms = WKI_DEFAULT_HEARTBEAT_INTERVAL_MS;
+    hello.max_channels = g_wki.max_channels;
+    hello.rdma_zone_bitmap = g_wki.rdma_zone_bitmap;
+    hello.hostname = g_wki.local_hostname;
+    hello_set_boot_epoch(&hello, g_wki.local_boot_epoch);
+    if (WkiPeer* peer = wki_peer_find(dst_node); peer != nullptr) {
+        hello_set_channel_epoch(&hello, peer->local_channel_epoch);
+    }
+
+    static_cast<void>(wki_send_raw(dst_node, MsgType::HELLO, &hello, sizeof(hello), WKI_FLAG_PRIORITY));
 }
 
 void wki_peer_send_hello_ack(WkiPeer* peer) {
@@ -584,16 +731,25 @@ void handle_hello(WkiTransport* transport, const WkiHeader* hdr, const uint8_t* 
     bool log_hostname_collision = false;
     bool log_reconnecting = false;
     bool log_connected = false;
-    bool remote_boot_epoch_changed = false;
     bool remote_boot_epoch_change_proven = false;
-    bool remote_channel_epoch_changed = false;
+    bool remote_session_epoch_reset = false;
     bool resync_connected_peer = false;
     uint32_t const REMOTE_BOOT_EPOCH = hello_boot_epoch(hello);
-    uint32_t const REMOTE_CHANNEL_EPOCH = hello_channel_epoch(hello);
+    uint32_t const WIRE_REMOTE_CHANNEL_EPOCH = hello_channel_epoch(hello);
+    uint32_t remote_channel_epoch = 0;
+    RoutingEntry route{};
+    bool const ROUTE_VALID = wki_routing_lookup(peer_node, &route) && route.valid;
+    bool peer_is_direct = false;
 
     g_wki.peer_lock.lock();
 
     WkiPeer* peer = wki_peer_find(peer_node);
+    WkiPeerHelloPath const HELLO_PATH = wki_peer_hello_path(hdr, ROUTE_VALID, route.hop_count, peer != nullptr && peer->is_direct);
+    if (HELLO_PATH == WkiPeerHelloPath::UNRESOLVED) {
+        g_wki.peer_lock.unlock();
+        return;
+    }
+    bool const ROUTED_HELLO = HELLO_PATH == WkiPeerHelloPath::ROUTED;
     // Periodic broadcast HELLOs are discovery beacons. Once a direct peer is
     // already connected, refresh contact state but do not make every node ACK.
     if (peer != nullptr && IS_BROADCAST_HELLO && peer->state == PeerState::CONNECTED && peer->is_direct &&
@@ -632,7 +788,14 @@ void handle_hello(WkiTransport* transport, const WkiHeader* hdr, const uint8_t* 
         return;
     }
 
+    peer_seed_local_channel_epoch(peer, g_wki.local_boot_epoch);
+    remote_channel_epoch = effective_remote_channel_epoch_locked(peer, WIRE_REMOTE_CHANNEL_EPOCH, REMOTE_BOOT_EPOCH);
+
     bool const WAS_FENCED = (peer->state == PeerState::FENCED);
+    if (WAS_FENCED) {
+        peer->retired_hostname = {};
+        peer->replacement_node_id.store(WKI_NODE_INVALID, std::memory_order_release);
+    }
 
     // Update peer info
     peer->mac = hello->mac_addr;
@@ -643,16 +806,26 @@ void handle_hello(WkiTransport* transport, const WkiHeader* hdr, const uint8_t* 
     peer->capabilities = hello->capabilities;
     peer->max_channels = hello->max_channels;
     peer->rdma_zone_bitmap = hello->rdma_zone_bitmap;
-    peer->is_direct = true;
-    peer->hop_count = 1;
-    peer->link_cost = 1;
+    if (peer->is_direct || !ROUTED_HELLO) {
+        peer->is_direct = true;
+        peer->next_hop = WKI_NODE_INVALID;
+        peer->hop_count = 1;
+        peer->link_cost = 1;
+    } else {
+        peer->is_direct = false;
+        peer->next_hop = route.next_hop;
+        peer->hop_count = route.hop_count;
+        peer->link_cost = static_cast<uint16_t>(std::min<uint32_t>(route.cost, 0xFFFF));
+    }
+    peer_is_direct = peer->is_direct;
     peer->last_heartbeat = wki_now_us();
     peer->last_rx_activity = peer->last_heartbeat;
     peer->missed_beats = 0;
     peer->fence_defer_until_us = 0;
     remote_boot_epoch_change_proven = peer_remote_boot_epoch_change_is_proven_locked(peer, REMOTE_BOOT_EPOCH);
-    remote_boot_epoch_changed = peer_note_remote_boot_epoch_locked(peer, REMOTE_BOOT_EPOCH);
-    remote_channel_epoch_changed = peer_note_remote_channel_epoch_locked(peer, REMOTE_CHANNEL_EPOCH);
+    remote_session_epoch_reset = peer_remote_epoch_reset_is_proven_locked(peer, REMOTE_BOOT_EPOCH, remote_channel_epoch);
+    peer_note_remote_boot_epoch_locked(peer, REMOTE_BOOT_EPOCH);
+    peer_note_remote_channel_epoch_locked(peer, remote_channel_epoch);
 
     // V2: Copy hostname from HELLO payload
     peer->hostname = hello->hostname;
@@ -723,30 +896,31 @@ void handle_hello(WkiTransport* transport, const WkiHeader* hdr, const uint8_t* 
 
     // Keep peer_lock strictly for peer-table mutation. Neighbor updates and
     // journal emission can take other locks and must not run under peer_lock.
-    wki_eth_neighbor_add(peer_node, hello->mac_addr);
+    if (peer_is_direct) {
+        wki_eth_neighbor_add(peer_node, hello->mac_addr);
+    }
 
     if (log_reconnecting) {
         log::info("Peer 0x%04x '%s' reconnecting (was fenced)", peer_node, log_hostname.data());
     } else if (log_connected) {
-        log::info("Peer 0x%04x '%s' connected (direct, transport=%s)", peer_node, log_hostname.data(), log_transport_name);
+        log::info("Peer 0x%04x '%s' connected (%s, transport=%s)", peer_node, log_hostname.data(), peer_is_direct ? "direct" : "routed",
+                  log_transport_name);
     }
     if (log_hostname_collision) {
         log::warn("Hostname collision with 0x%04x, falling back to '%s'", peer_node, local_hostname_fallback.data());
     }
-    if (remote_boot_epoch_changed || remote_channel_epoch_changed || WAS_FENCED) {
+    if (remote_session_epoch_reset || WAS_FENCED) {
         wki_remote_compute_retire_submit_session(peer_node);
         peer->compute_reset_cleanup_pending.store(true, std::memory_order_release);
         wki_timer_notify();
     }
-    bool const CONNECTED_EPOCH_RESET = !WAS_FENCED && (remote_boot_epoch_changed || remote_channel_epoch_changed);
+    bool const CONNECTED_EPOCH_RESET = !WAS_FENCED && remote_session_epoch_reset;
     if (CONNECTED_EPOCH_RESET) {
         // Dynamic channel generations are part of both consumer proxies and
         // owner-side bindings. Mark both terminal before the reusable pool is
         // reset; the timer worker performs blocking drain/teardown.
-        if (remote_boot_epoch_changed) {
-            peer->vfs_reset_invalidate_discovery.store(true, std::memory_order_release);
-        }
         if (remote_boot_epoch_change_proven) {
+            peer->vfs_reset_invalidate_discovery.store(true, std::memory_order_release);
             peer->vfs_reset_owner_reboot_proven.store(true, std::memory_order_release);
         }
         // Close reliable RESOURCE/DEV admission before any marker scan. A
@@ -759,18 +933,19 @@ void handle_hello(WkiTransport* transport, const WkiHeader* hdr, const uint8_t* 
         wki_remote_net_mark_epoch_reset(peer_node);
         wki_timer_notify();
     }
-    if (remote_boot_epoch_changed) {
-        log::info("Peer 0x%04x boot epoch changed to %u; resetting stale channel state", peer_node, REMOTE_BOOT_EPOCH);
-        if (!WAS_FENCED) {
-            // We may have accepted reliable traffic before learning this boot
-            // epoch. Tell the sender to retire its matching sequence stream so
-            // it replays a current resource snapshot on a fresh channel.
-            peer_advance_local_channel_epoch(peer);
+    if (remote_session_epoch_reset) {
+        if (remote_boot_epoch_change_proven) {
+            log::info("Peer 0x%04x boot epoch changed to %u; resetting stale channel state", peer_node, REMOTE_BOOT_EPOCH);
+            if (!WAS_FENCED) {
+                // We may have accepted reliable traffic before learning this
+                // boot epoch. Tell the sender to retire its matching sequence
+                // stream so it replays a current resource snapshot on a fresh
+                // channel.
+                peer_advance_local_channel_epoch(peer);
+            }
+        } else {
+            log::info("Peer 0x%04x channel epoch advanced to %u; resetting stale channel state", peer_node, remote_channel_epoch);
         }
-        wki_channels_close_for_peer(peer_node);
-        resync_connected_peer = !newly_connected && !WAS_FENCED;
-    } else if (remote_channel_epoch_changed) {
-        log::info("Peer 0x%04x channel epoch advanced to %u; resetting stale channel state", peer_node, REMOTE_CHANNEL_EPOCH);
         wki_channels_close_for_peer(peer_node);
         resync_connected_peer = !newly_connected && !WAS_FENCED;
     }
@@ -811,13 +986,17 @@ void handle_hello(WkiTransport* transport, const WkiHeader* hdr, const uint8_t* 
         }
     }
 
+    if (newly_connected) {
+        reconcile_fenced_hostname_replacements(log_hostname);
+    }
+
     // Every HELLO that reaches the full handshake path is also an explicit
     // resource snapshot request. Stable broadcast beacons return above, so
     // post-cleanup direct HELLOs can resynchronize without periodic replay.
     wki_resource_advertise_to_peer(peer_node);
 }
 
-void handle_hello_ack(WkiTransport* transport, const WkiHeader* /*hdr*/, const uint8_t* payload, uint16_t payload_len) {
+void handle_hello_ack(WkiTransport* transport, const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len) {
     if (payload_len < sizeof(HelloPayload)) {
         return;
     }
@@ -832,16 +1011,25 @@ void handle_hello_ack(WkiTransport* transport, const WkiHeader* /*hdr*/, const u
 
     uint16_t peer_node = ack->node_id;
     std::array<char, WKI_HOSTNAME_MAX> log_hostname{};
-    bool remote_channel_epoch_changed = false;
-    bool remote_boot_epoch_changed = false;
     bool remote_boot_epoch_change_proven = false;
+    bool remote_session_epoch_reset = false;
     bool resync_connected_peer = false;
-    uint32_t const REMOTE_CHANNEL_EPOCH = hello_channel_epoch(ack);
+    uint32_t const WIRE_REMOTE_CHANNEL_EPOCH = hello_channel_epoch(ack);
     uint32_t const REMOTE_BOOT_EPOCH = hello_boot_epoch(ack);
+    uint32_t remote_channel_epoch = 0;
+    RoutingEntry route{};
+    bool const ROUTE_VALID = wki_routing_lookup(peer_node, &route) && route.valid;
+    bool peer_is_direct = false;
 
     g_wki.peer_lock.lock();
 
     WkiPeer* peer = wki_peer_find(peer_node);
+    WkiPeerHelloPath const HELLO_PATH = wki_peer_hello_path(hdr, ROUTE_VALID, route.hop_count, peer != nullptr && peer->is_direct);
+    if (HELLO_PATH == WkiPeerHelloPath::UNRESOLVED) {
+        g_wki.peer_lock.unlock();
+        return;
+    }
+    bool const ROUTED_HELLO = HELLO_PATH == WkiPeerHelloPath::ROUTED;
     if (peer == nullptr) {
         peer = wki_peer_alloc(peer_node);
         if (peer == nullptr) {
@@ -855,6 +1043,9 @@ void handle_hello_ack(WkiTransport* transport, const WkiHeader* /*hdr*/, const u
         return;
     }
 
+    peer_seed_local_channel_epoch(peer, g_wki.local_boot_epoch);
+    remote_channel_epoch = effective_remote_channel_epoch_locked(peer, WIRE_REMOTE_CHANNEL_EPOCH, REMOTE_BOOT_EPOCH);
+
     peer->mac = ack->mac_addr;
     // Prefer RDMA-capable (ivshmem) transport over Ethernet per spec
     //   ivshmem > RoCE > Ethernet.  Only upgrade, never downgrade.
@@ -864,8 +1055,18 @@ void handle_hello_ack(WkiTransport* transport, const WkiHeader* /*hdr*/, const u
     peer->capabilities = ack->capabilities;
     peer->max_channels = ack->max_channels;
     peer->rdma_zone_bitmap = ack->rdma_zone_bitmap;
-    peer->is_direct = true;
-    peer->hop_count = 1;
+    if (peer->is_direct || !ROUTED_HELLO) {
+        peer->is_direct = true;
+        peer->next_hop = WKI_NODE_INVALID;
+        peer->hop_count = 1;
+        peer->link_cost = 1;
+    } else {
+        peer->is_direct = false;
+        peer->next_hop = route.next_hop;
+        peer->hop_count = route.hop_count;
+        peer->link_cost = static_cast<uint16_t>(std::min<uint32_t>(route.cost, 0xFFFF));
+    }
+    peer_is_direct = peer->is_direct;
 
     // V2: Copy hostname from HELLO_ACK payload
     peer->hostname = ack->hostname;
@@ -881,14 +1082,14 @@ void handle_hello_ack(WkiTransport* transport, const WkiHeader* /*hdr*/, const u
     } else {
         peer->rdma_transport = wki_roce_transport_get();
     }
-    peer->link_cost = 1;
     peer->last_heartbeat = wki_now_us();
     peer->last_rx_activity = peer->last_heartbeat;
     peer->missed_beats = 0;
     peer->fence_defer_until_us = 0;
     remote_boot_epoch_change_proven = peer_remote_boot_epoch_change_is_proven_locked(peer, REMOTE_BOOT_EPOCH);
-    remote_boot_epoch_changed = peer_note_remote_boot_epoch_locked(peer, REMOTE_BOOT_EPOCH);
-    remote_channel_epoch_changed = peer_note_remote_channel_epoch_locked(peer, REMOTE_CHANNEL_EPOCH);
+    remote_session_epoch_reset = peer_remote_epoch_reset_is_proven_locked(peer, REMOTE_BOOT_EPOCH, remote_channel_epoch);
+    peer_note_remote_boot_epoch_locked(peer, REMOTE_BOOT_EPOCH);
+    peer_note_remote_channel_epoch_locked(peer, remote_channel_epoch);
 
     // Negotiate heartbeat interval
     uint16_t proposed = ack->heartbeat_interval_ms;
@@ -910,31 +1111,35 @@ void handle_hello_ack(WkiTransport* transport, const WkiHeader* /*hdr*/, const u
     HelloAckPeerTransition const STATE_TRANSITION = apply_hello_ack_peer_state_locked(peer, wki_now_us());
     bool newly_connected = STATE_TRANSITION == HelloAckPeerTransition::CONNECTED;
     bool const WAS_FENCED = STATE_TRANSITION == HelloAckPeerTransition::RECONNECTING;
+    if (WAS_FENCED) {
+        peer->retired_hostname = {};
+        peer->replacement_node_id.store(WKI_NODE_INVALID, std::memory_order_release);
+    }
     copy_hostname_for_log(log_hostname, peer->hostname);
     const char* log_transport_name = peer->transport != nullptr ? peer->transport->name : "?";
 
     g_wki.peer_lock.unlock();
 
-    wki_eth_neighbor_add(peer_node, ack->mac_addr);
+    if (peer_is_direct) {
+        wki_eth_neighbor_add(peer_node, ack->mac_addr);
+    }
 
     if (WAS_FENCED) {
         log::info("Peer 0x%04x '%s' reconnecting from HELLO_ACK (was fenced)", peer_node, log_hostname.data());
     }
 
-    if (remote_boot_epoch_changed || remote_channel_epoch_changed || WAS_FENCED) {
+    if (remote_session_epoch_reset || WAS_FENCED) {
         wki_remote_compute_retire_submit_session(peer_node);
         peer->compute_reset_cleanup_pending.store(true, std::memory_order_release);
         wki_timer_notify();
     }
 
-    bool const CONNECTED_EPOCH_RESET = !WAS_FENCED && (remote_boot_epoch_changed || remote_channel_epoch_changed);
+    bool const CONNECTED_EPOCH_RESET = !WAS_FENCED && remote_session_epoch_reset;
     if (CONNECTED_EPOCH_RESET) {
         // See handle_hello(): stop new operations before channel slots can be
         // reused, then leave blocking teardown to the timer worker.
-        if (remote_boot_epoch_changed) {
-            peer->vfs_reset_invalidate_discovery.store(true, std::memory_order_release);
-        }
         if (remote_boot_epoch_change_proven) {
+            peer->vfs_reset_invalidate_discovery.store(true, std::memory_order_release);
             peer->vfs_reset_owner_reboot_proven.store(true, std::memory_order_release);
         }
         peer->vfs_reset_rebind_pending.store(true, std::memory_order_release);
@@ -945,21 +1150,25 @@ void handle_hello_ack(WkiTransport* transport, const WkiHeader* /*hdr*/, const u
         wki_timer_notify();
     }
 
-    if (remote_boot_epoch_changed && !WAS_FENCED) {
-        log::info("Peer 0x%04x boot epoch changed to %u; resetting stale channel state", peer_node, REMOTE_BOOT_EPOCH);
-        // HELLO_ACK does not normally elicit a response. Advance our epoch and
-        // send a direct HELLO below so the peer observes the reciprocal reset.
-        peer_advance_local_channel_epoch(peer);
-        wki_channels_close_for_peer(peer_node);
-        resync_connected_peer = !newly_connected;
-    } else if (remote_channel_epoch_changed && !WAS_FENCED) {
-        log::info("Peer 0x%04x channel epoch advanced to %u; resetting stale channel state", peer_node, REMOTE_CHANNEL_EPOCH);
+    if (remote_session_epoch_reset && !WAS_FENCED) {
+        if (remote_boot_epoch_change_proven) {
+            log::info("Peer 0x%04x boot epoch changed to %u; resetting stale channel state", peer_node, REMOTE_BOOT_EPOCH);
+            // HELLO_ACK does not normally elicit a response. Advance our epoch
+            // and send a HELLO below so the peer observes the reciprocal reset.
+            peer_advance_local_channel_epoch(peer);
+        } else {
+            log::info("Peer 0x%04x channel epoch advanced to %u; resetting stale channel state", peer_node, remote_channel_epoch);
+        }
         wki_channels_close_for_peer(peer_node);
         resync_connected_peer = !newly_connected;
     }
 
-    if (remote_boot_epoch_changed && !WAS_FENCED) {
-        wki_peer_send_hello(transport, peer_node);
+    if (remote_boot_epoch_change_proven && !WAS_FENCED) {
+        if (peer_is_direct) {
+            wki_peer_send_hello(transport, peer_node);
+        } else {
+            wki_peer_send_routed_hello(peer_node);
+        }
     }
 
     bool reconnected = false;
@@ -987,8 +1196,8 @@ void handle_hello_ack(WkiTransport* transport, const WkiHeader* /*hdr*/, const u
     if (newly_connected || resync_connected_peer) {
         if (!reconnected) {
             if (newly_connected) {
-                log::info("Peer 0x%04x '%s' connected (HELLO_ACK received, transport=%s)", peer_node, log_hostname.data(),
-                          log_transport_name);
+                log::info("Peer 0x%04x '%s' connected (HELLO_ACK received, %s, transport=%s)", peer_node, log_hostname.data(),
+                          peer_is_direct ? "direct" : "routed", log_transport_name);
             } else {
                 log::info("Peer 0x%04x '%s' resyncing after boot epoch change", peer_node, log_hostname.data());
             }
@@ -1003,6 +1212,10 @@ void handle_hello_ack(WkiTransport* transport, const WkiHeader* /*hdr*/, const u
             // Emit NODE_JOIN event
             wki_event_publish(EVENT_CLASS_SYSTEM, EVENT_SYSTEM_NODE_JOIN, &peer_node, sizeof(peer_node));
         }
+    }
+
+    if (newly_connected) {
+        reconcile_fenced_hostname_replacements(log_hostname);
     }
 
     // A HELLO_ACK confirms that the peer has processed our latest HELLO and
@@ -1078,6 +1291,87 @@ auto wki_peer_selftest_boot_epoch_advances_local_channel_epoch() -> bool {
     bool const WRAP_SKIPS_ZERO = peer.local_channel_epoch == 1;
 
     return ZERO_ADVANCES_TO_ONE && WRAP_SKIPS_ZERO;
+}
+
+auto wki_peer_selftest_initial_channel_epoch_fences_pre_handshake_stream() -> bool {
+    constexpr uint32_t LOCAL_BOOT_EPOCH = 0x10203040;
+    constexpr uint32_t REMOTE_BOOT_EPOCH = 0x50607080;
+    WkiPeer peer{};
+
+    peer_seed_local_channel_epoch(&peer, LOCAL_BOOT_EPOCH);
+    bool const LOCAL_EPOCH_SEEDED = peer.local_channel_epoch == LOCAL_BOOT_EPOCH;
+    bool const FIRST_BROADCAST_DERIVED = effective_remote_channel_epoch_locked(&peer, 0, REMOTE_BOOT_EPOCH) == REMOTE_BOOT_EPOCH;
+
+    peer.remote_boot_epoch = REMOTE_BOOT_EPOCH;
+    peer.remote_channel_epoch = REMOTE_BOOT_EPOCH;
+    bool const PERIODIC_ZERO_IGNORED = effective_remote_channel_epoch_locked(&peer, 0, REMOTE_BOOT_EPOCH) == 0;
+    bool const EXPLICIT_EPOCH_PRESERVED = effective_remote_channel_epoch_locked(&peer, 7, REMOTE_BOOT_EPOCH) == 7;
+    bool const REBOOT_DERIVES_NEW_EPOCH = effective_remote_channel_epoch_locked(&peer, 0, REMOTE_BOOT_EPOCH + 1) == REMOTE_BOOT_EPOCH + 1;
+
+    peer_seed_local_channel_epoch(&peer, LOCAL_BOOT_EPOCH + 1);
+    bool const EXISTING_LOCAL_EPOCH_PRESERVED = peer.local_channel_epoch == LOCAL_BOOT_EPOCH;
+
+    return LOCAL_EPOCH_SEEDED && FIRST_BROADCAST_DERIVED && PERIODIC_ZERO_IGNORED && EXPLICIT_EPOCH_PRESERVED && REBOOT_DERIVES_NEW_EPOCH &&
+           EXISTING_LOCAL_EPOCH_PRESERVED;
+}
+
+auto wki_peer_selftest_initial_epoch_observation_preserves_acked_stream() -> bool {
+    constexpr uint32_t BOOT_EPOCH = 0x10203040;
+    constexpr uint32_t CHANNEL_EPOCH = 0x50607080;
+    WkiPeer peer{};
+
+    bool const FIRST_OBSERVATION_PRESERVED = !peer_remote_epoch_reset_is_proven_locked(&peer, BOOT_EPOCH, CHANNEL_EPOCH);
+
+    peer.remote_boot_epoch = BOOT_EPOCH;
+    peer.remote_channel_epoch = CHANNEL_EPOCH;
+    bool const SAME_SESSION_PRESERVED = !peer_remote_epoch_reset_is_proven_locked(&peer, BOOT_EPOCH, CHANNEL_EPOCH);
+    bool const BOOT_CHANGE_RESETS = peer_remote_epoch_reset_is_proven_locked(&peer, BOOT_EPOCH + 1, CHANNEL_EPOCH);
+    bool const CHANNEL_CHANGE_RESETS = peer_remote_epoch_reset_is_proven_locked(&peer, BOOT_EPOCH, CHANNEL_EPOCH + 1);
+    bool const ZERO_BEACON_PRESERVED = !peer_remote_epoch_reset_is_proven_locked(&peer, 0, 0);
+
+    return FIRST_OBSERVATION_PRESERVED && SAME_SESSION_PRESERVED && BOOT_CHANGE_RESETS && CHANNEL_CHANGE_RESETS && ZERO_BEACON_PRESERVED;
+}
+
+auto wki_peer_selftest_fenced_hostname_retires_to_node_identity() -> bool {
+    WkiPeer peer{};
+    peer.node_id = 0x7203;
+    peer.state = PeerState::FENCED;
+    std::snprintf(peer.hostname.data(), peer.hostname.size(), "%s", "wos-1");
+    auto disconnected_hostname = peer.hostname;
+
+    bool const RETIRED = retire_fenced_hostname_locked(&peer, peer.node_id, disconnected_hostname);
+    bool const FALLBACK_MATCHES = std::strcmp(peer.hostname.data(), "node-7203") == 0;
+    bool const IDEMPOTENT = !retire_fenced_hostname_locked(&peer, peer.node_id, peer.hostname);
+
+    peer.state = PeerState::CONNECTED;
+    std::snprintf(peer.hostname.data(), peer.hostname.size(), "%s", "wos-1");
+    bool const CONNECTED_PRESERVED =
+        !retire_fenced_hostname_locked(&peer, peer.node_id, peer.hostname) && std::strcmp(peer.hostname.data(), "wos-1") == 0;
+
+    HostnameSuccessorScan scan{};
+    WkiPeer successor{};
+    successor.node_id = 0x7204;
+    successor.state = PeerState::CONNECTED;
+    std::snprintf(successor.hostname.data(), successor.hostname.size(), "%s", "wos-1");
+    consider_hostname_successor(scan, successor, 0x7203, disconnected_hostname);
+    bool const UNIQUE_SUCCESSOR = scan.node_id == successor.node_id && !scan.ambiguous;
+
+    WkiPeer fenced_duplicate{};
+    fenced_duplicate.node_id = 0x7205;
+    fenced_duplicate.state = PeerState::FENCED;
+    std::snprintf(fenced_duplicate.hostname.data(), fenced_duplicate.hostname.size(), "%s", "wos-1");
+    consider_hostname_successor(scan, fenced_duplicate, 0x7203, disconnected_hostname);
+    bool const FENCED_CANDIDATE_IGNORED = scan.node_id == successor.node_id && !scan.ambiguous;
+
+    WkiPeer ambiguous_successor{};
+    ambiguous_successor.node_id = 0x7206;
+    ambiguous_successor.state = PeerState::CONNECTED;
+    std::snprintf(ambiguous_successor.hostname.data(), ambiguous_successor.hostname.size(), "%s", "wos-1");
+    consider_hostname_successor(scan, ambiguous_successor, 0x7203, disconnected_hostname);
+    bool const AMBIGUOUS_REJECTED = scan.ambiguous;
+
+    return RETIRED && FALLBACK_MATCHES && IDEMPOTENT && CONNECTED_PRESERVED && UNIQUE_SUCCESSOR && FENCED_CANDIDATE_IGNORED &&
+           AMBIGUOUS_REJECTED;
 }
 #endif
 
@@ -1347,6 +1641,22 @@ void wki_peer_disconnect_impl(WkiPeer* peer, PeerDisconnectKind kind, bool notif
     peer->local_channel_epoch = next_channel_epoch(peer->local_channel_epoch);
     peer->lock.unlock();
 
+    // A WOS reboot receives a new random node ID while retaining its logical
+    // hostname. Record the old name before retirement, then recognize only an
+    // already-connected, unique, different-ID successor. If fencing wins the
+    // race, the successor's HELLO performs the same reconciliation later.
+    bool replacement_changed = false;
+    bool owner_identity_replaced = false;
+    g_wki.peer_lock.lock();
+    peer->retired_hostname = fenced_hostname;
+    peer->replacement_node_id.store(WKI_NODE_INVALID, std::memory_order_release);
+    replacement_changed = reconcile_fenced_hostname_replacements_locked(fenced_hostname);
+    owner_identity_replaced = peer->replacement_node_id.load(std::memory_order_acquire) != WKI_NODE_INVALID;
+    g_wki.peer_lock.unlock();
+    if (replacement_changed) {
+        wki_deferred_work_notify();
+    }
+
     if (kind == PeerDisconnectKind::FENCE) {
         log::warn("FENCED peer 0x%04x", fenced_id);
     } else {
@@ -1371,10 +1681,10 @@ void wki_peer_disconnect_impl(WkiPeer* peer, PeerDisconnectKind kind, bool notif
     wki_dev_proxy_suspend_for_peer(fenced_id);
 
     // Clean up remote VFS proxies and server FDs for this peer
-    wki_remote_vfs_cleanup_for_peer(fenced_id, false);
+    wki_remote_vfs_cleanup_for_peer(fenced_id, owner_identity_replaced);
 
     // Clean up remote NIC proxies for this peer
-    wki_remote_net_cleanup_for_peer(fenced_id, false);
+    wki_remote_net_cleanup_for_peer(fenced_id, owner_identity_replaced);
 
     // Clean up remote compute tasks and load cache for this peer
     wki_remote_compute_cleanup_for_peer(fenced_id);
@@ -1410,8 +1720,30 @@ void wki_peer_disconnect_impl(WkiPeer* peer, PeerDisconnectKind kind, bool notif
         }
     }
 
-    // V2: Remove fenced peer from /dev/nodes/
+    // V2: Remove fenced peer from /dev/nodes/ using the stable name that was
+    // registered before disconnect. A reboot may already have connected a
+    // successor with the same hostname but a new random node ID, so recreate
+    // that unique successor entry after retiring the old alias.
     vfs::devfs::devfs_nodes_remove_peer(fenced_hostname.data());
+
+    bool hostname_retired = false;
+    uint16_t successor_node = WKI_NODE_INVALID;
+    g_wki.peer_lock.lock();
+    hostname_retired = retire_fenced_hostname_locked(peer, fenced_id, fenced_hostname);
+    replacement_changed = reconcile_fenced_hostname_replacements_locked(fenced_hostname);
+    successor_node = find_unique_hostname_successor_locked(fenced_id, fenced_hostname);
+    g_wki.peer_lock.unlock();
+
+    if (replacement_changed) {
+        wki_deferred_work_notify();
+    }
+
+    if (hostname_retired) {
+        log::info("Retired hostname '%s' from fenced peer 0x%04x", fenced_hostname.data(), fenced_id);
+    }
+    if (successor_node != WKI_NODE_INVALID) {
+        vfs::devfs::devfs_nodes_add_peer(fenced_hostname.data(), successor_node);
+    }
 
     // Invalidate discovered resources from fenced peer
     wki_resources_invalidate_for_peer(fenced_id);

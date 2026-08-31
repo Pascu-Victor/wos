@@ -552,6 +552,7 @@ def test_submitted_task_slots_are_indexed_and_reclaimed() -> None:
             "task.result_owner_task == nullptr",
             "task.local_task == nullptr",
             "task.pending_proxy_output == nullptr",
+            "task.handoff_pin_count == 0",
         ],
         "consumer-pinned submitted-task reclamation",
     )
@@ -610,6 +611,9 @@ def test_submitted_task_slots_are_indexed_and_reclaimed() -> None:
             "bool result_handle_owned = false",
             "ker::mod::sched::task::Task* result_owner_task = nullptr",
             "bool reclaim_requested = false",
+            "std::array<WkiIpcTaskFdHandoff, 16> ipc_fd_handoff",
+            "uint16_t handoff_pin_count = 0",
+            "wki_remote_compute_selftest_task_exit_releases_handoff_pins",
             "wki_remote_compute_selftest_submitted_slots_reclaim_safely",
             "wki_remote_compute_selftest_task_id_wrap_is_safe",
         ],
@@ -620,6 +624,8 @@ def test_submitted_task_slots_are_indexed_and_reclaimed() -> None:
         [
             "SubmittedSlotsReclaimSafely",
             "TaskIdWrapIsSafe",
+            "TaskExitReleasesHandoffPins",
+            "wki_remote_compute_selftest_task_exit_releases_handoff_pins",
             "wki_remote_compute_selftest_submitted_slots_reclaim_safely",
             "wki_remote_compute_selftest_task_id_wrap_is_safe",
         ],
@@ -658,6 +664,7 @@ def test_task_exit_retires_remote_compute_wait_owners() -> None:
             "submitted.complete_pending.store(false",
             "submitted_ipc_cleanup_snapshot_locked(&submitted)",
             "submitted.ipc_fd_count = 0",
+            "take_submitted_ipc_handoff_locked(&submitted)",
             "submitted.active = false",
             "consume_submitted_task_result_locked(&submitted)",
             "wki_claim_op(waiter)",
@@ -665,6 +672,7 @@ def test_task_exit_retires_remote_compute_wait_owners() -> None:
             "wki_quiesce_claimed_op(waiter)",
             "send_task_cancel_request",
             "cleanup_submitted_ipc_exports(ipc_cleanup)",
+            "release_submitted_ipc_handoff(handoff_cleanup)",
             "delete[] discarded_output",
         ],
         "task-exit remote-compute ownership retirement",
@@ -674,6 +682,7 @@ def test_task_exit_retires_remote_compute_wait_owners() -> None:
         "wki_claim_op(waiter)",
         "send_task_cancel_request",
         "cleanup_submitted_ipc_exports(ipc_cleanup)",
+        "release_submitted_ipc_handoff(handoff_cleanup)",
         "delete[] discarded_output",
     ]:
         if unlock_pos < 0 or cleanup.find(unlocked_action) <= unlock_pos:
@@ -929,10 +938,10 @@ def test_task_exit_retires_remote_compute_wait_owners() -> None:
         complete_construction,
         [
             "task->pending_interp_path.front() == '\\0'",
-            "read_boot_file_fully(task->pending_interp_path.data(), &interp_buf)",
+            "read_boot_file_fully(task->pending_interp_path.data(), &interp_buf, &interp_size)",
             "loader::elf::load_elf",
             "task->context.frame.rip = INTERP_RESULT.entry_point",
-            "task->interp_base = INTERP_BASE",
+            "task->interp_base = INTERP_RESULT.load_base",
         ],
         "post-construction PT_INTERP stage",
     )
@@ -2503,6 +2512,82 @@ def test_remote_task_exit_wakes_exact_completion_monitor() -> None:
     )
 
 
+def test_accepted_remote_spawn_commits_ipc_fd_ownership() -> None:
+    source = REMOTE_COMPUTE_CPP.read_text()
+    body = function_body(source, "wki_try_remote_spawn")
+    require_tokens(
+        body,
+        [
+            "std::array<WkiIpcTaskFdHandoff, 16> ipc_fd_handoff",
+            "wki_ipc_export_task_fds(task, best_node, ipc_fd_map.data(), &ipc_fd_count, ipc_fd_handoff.data())",
+            "wki_ipc_release_task_fd_handoff(ipc_fd_handoff.data(), ipc_fd_count)",
+            "ipc_fd_count, ipc_fd_handoff.data()",
+        ],
+        "remote IPC fd ownership handoff",
+    )
+    fallback = body.find("if (vfs_ref_submit_attempted)")
+    reexport = body.find("wki_ipc_export_task_fds", fallback)
+    release = body.find("wki_ipc_release_task_fd_handoff", fallback)
+    if fallback < 0 or release < fallback or reexport < release:
+        fail("VFS_REF fallback must release old identity pins before re-export")
+    failed_start = body.find("if (tid == 0) {")
+    failed_end = body.find("balanced_assignment.commit()", failed_start)
+    if failed_start < 0 or failed_end < 0:
+        fail("remote submission failure block is missing")
+    failed = body[failed_start:failed_end]
+    require_order(
+        failed,
+        "wki_ipc_cleanup_exported_fds(ipc_fd_map.data(), ipc_fd_count, best_node)",
+        "wki_ipc_release_task_fd_handoff(ipc_fd_handoff.data(), ipc_fd_count)",
+        "failed remote submission cleanup",
+    )
+    if "wki_ipc_commit_task_fd_handoff" in body:
+        fail("remote spawn must not keep accepted handoff pins on its interruptible caller stack")
+
+    submit_sections = {
+        "inline": source[source.index("auto wki_task_submit_inline(") : source.index("auto wki_task_submit_vfs_ref(")],
+        "vfs_ref": source[source.index("auto wki_task_submit_vfs_ref(") : source.index("auto wki_task_wait(")],
+    }
+    for mode, submit in submit_sections.items():
+        require_tokens(
+            submit,
+            [
+                "remember_submitted_ipc_handoff(st, ipc_fd_handoff, ipc_fd_count)",
+                "publish_submitted_task_locked(std::move(st))",
+                "wki_wait_for_op(&wait",
+                "take_submitted_ipc_handoff_locked(task_ptr)",
+                "wki_ipc_commit_task_fd_handoff(local_task, handoff_cleanup.handoff.data(), handoff_cleanup.count)",
+                "release_submitted_ipc_handoff(handoff_cleanup)",
+            ],
+            f"durable {mode} IPC fd handoff",
+        )
+        require_order(
+            submit,
+            "remember_submitted_ipc_handoff(st, ipc_fd_handoff, ipc_fd_count)",
+            "wki_wait_for_op(&wait",
+            f"{mode} identity pins must move to the submitted row before the interruptible wait",
+        )
+
+    cleanup = function_body(source, "wki_remote_compute_cleanup_for_task")
+    require_order(
+        cleanup,
+        "take_submitted_ipc_handoff_locked(&submitted)",
+        "release_submitted_ipc_handoff(handoff_cleanup)",
+        "fatal task cleanup must release pins taken from durable storage",
+    )
+    selftest = function_body(source, "wki_remote_compute_selftest_task_exit_releases_handoff_pins")
+    require_tokens(
+        selftest,
+        [
+            "remember_submitted_ipc_handoff(submitted, handoff.data()",
+            "wki_remote_compute_cleanup_for_task(&exiting_task)",
+            "pinned_file.refcount.load(std::memory_order_acquire) == 1",
+            "ROW_RETIRED",
+        ],
+        "interrupted submit handoff-pin KTEST",
+    )
+
+
 def main() -> None:
     test_peer_cleanup_marks_all_targeted_submits_terminal_failure()
     test_proxy_wait_completion_respects_waitpid_publish_fence()
@@ -2532,6 +2617,7 @@ def main() -> None:
     test_remote_proxy_signals_never_make_the_local_frame_runnable()
     test_submitted_proxy_rows_hold_task_lifetime_until_finalization()
     test_remote_task_exit_wakes_exact_completion_monitor()
+    test_accepted_remote_spawn_commits_ipc_fd_ownership()
     print("WKI remote compute source invariants hold")
 
 

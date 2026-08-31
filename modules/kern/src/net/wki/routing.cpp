@@ -2,6 +2,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <net/wki/peer.hpp>
 #include <net/wki/routing.hpp>
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
@@ -20,6 +21,7 @@ using log = ker::mod::dbg::logger<"wki">;
 namespace {
 
 constexpr uint16_t INVALID_INDEX = WKI_NODE_BROADCAST;
+constexpr uint64_t ROUTED_HELLO_PROBE_INTERVAL_US = 1'000'000;
 
 std::array<LsdbEntry, WKI_MAX_PEERS> s_lsdb;              // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 std::array<RoutingEntry, WKI_MAX_PEERS> s_routing_table;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
@@ -27,6 +29,7 @@ ker::mod::sys::Spinlock s_routing_lock;                   // NOLINT(cppcoreguide
 uint64_t s_last_own_lsa_time = 0;                         // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 bool s_routing_initialized = false;                       // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 bool s_lsa_pending = false;                               // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+uint64_t s_last_routed_hello_probe_us = 0;                // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
 // -----------------------------------------------------------------------------
 // LSDB management (caller must hold s_routing_lock)
@@ -141,6 +144,23 @@ void flood_lsa(const void* payload, uint16_t payload_len, uint16_t exclude_node,
         wki_send(peer.node_id, WKI_CHAN_CONTROL, MsgType::LSA, payload, payload_len);
     }
 }
+
+void probe_routed_peer(uint16_t dst_node) {
+    if (dst_node == WKI_NODE_INVALID || dst_node == WKI_NODE_BROADCAST || dst_node == g_wki.my_node_id) {
+        return;
+    }
+
+    WkiPeer const* peer = wki_peer_find(dst_node);
+    if (peer != nullptr && (peer->is_direct || peer->state == PeerState::CONNECTED)) {
+        return;
+    }
+
+    RoutingEntry route{};
+    if (!wki_routing_lookup(dst_node, &route) || !route.valid || route.hop_count <= 1) {
+        return;
+    }
+    wki_peer_send_routed_hello(dst_node);
+}
 }  // namespace
 
 // -----------------------------------------------------------------------------
@@ -161,6 +181,7 @@ void wki_routing_init() {
 
     s_last_own_lsa_time = 0;
     s_lsa_pending = false;
+    s_last_routed_hello_probe_us = 0;
     s_routing_initialized = true;
 }
 
@@ -297,6 +318,11 @@ void handle_lsa(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_l
 
     // Recompute routing table with new topology data
     wki_routing_recompute();
+
+    // LSA topology carries node IDs but deliberately keeps its established
+    // wire layout. Use the existing HELLO payload over the computed route to
+    // learn the far endpoint's hostname, boot epoch, and capabilities.
+    probe_routed_peer(lsa->origin_node);
 
     // Flood to all direct neighbors except the one that sent this to us
     flood_lsa(payload, payload_len, hdr->src_node, true);
@@ -526,6 +552,22 @@ void wki_routing_timer_tick(uint64_t now_us) {
     uint64_t const MIN_INTERVAL_US{static_cast<uint64_t>(WKI_LSA_MIN_INTERVAL_MS) * 1000};
     if (s_lsa_pending && now_us - s_last_own_lsa_time >= MIN_INTERVAL_US) {
         wki_lsa_generate_and_flood();
+    }
+
+    std::array<uint16_t, WKI_MAX_PEERS> probe_nodes{};
+    size_t probe_count = 0;
+    if (s_last_routed_hello_probe_us == 0 || now_us - s_last_routed_hello_probe_us >= ROUTED_HELLO_PROBE_INTERVAL_US) {
+        s_routing_lock.lock();
+        for (auto const& route : s_routing_table) {
+            if (route.valid && route.hop_count > 1 && probe_count < probe_nodes.size()) {
+                probe_nodes.at(probe_count++) = route.dst_node;
+            }
+        }
+        s_last_routed_hello_probe_us = now_us;
+        s_routing_lock.unlock();
+    }
+    for (size_t i = 0; i < probe_count; ++i) {
+        probe_routed_peer(probe_nodes.at(i));
     }
 
     // LSDB aging is currently disabled; keep the scan so the intended scope stays obvious.

@@ -1,13 +1,33 @@
 #include <algorithm>
+#include <array>
+#include <atomic>
+#include <bit>
 #include <cstdint>
 #include <cstring>
 #include <net/wki/channel.hpp>
+#include <net/wki/chaos.hpp>
 #include <net/wki/timer_math.hpp>
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
 #include <new>
 
 namespace ker::net::wki {
+
+namespace {
+
+constexpr size_t REORDER_BITMAP_WORD_BITS = sizeof(uint64_t) * 8;
+constexpr size_t REORDER_BITMAP_WORDS = WKI_REORDER_POOL_CAPACITY / REORDER_BITMAP_WORD_BITS;
+static_assert(WKI_REORDER_POOL_CAPACITY % REORDER_BITMAP_WORD_BITS == 0);
+
+struct WkiReorderPoolSlot {
+    WkiReorderEntry entry = {};
+    std::array<uint8_t, WKI_ETH_MAX_PAYLOAD> payload = {};
+};
+
+std::array<WkiReorderPoolSlot, WKI_REORDER_POOL_CAPACITY> s_reorder_pool;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::array<std::atomic<uint64_t>, REORDER_BITMAP_WORDS> s_reorder_bitmap;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+
+}  // namespace
 
 auto wki_retransmit_entry_alloc(size_t frame_len) -> WkiRetransmitEntry* {
     if (frame_len > WKI_MAX_FRAME_SIZE) {
@@ -36,6 +56,49 @@ void wki_retransmit_entry_release(WkiChannel* ch, WkiRetransmitEntry* entry) {
 
     entry->~WkiRetransmitEntry();
     ::operator delete(entry);
+}
+
+auto wki_reorder_entry_reserve(uint16_t payload_len) -> WkiReorderEntry* {
+    if (payload_len > WKI_ETH_MAX_PAYLOAD) {
+        return nullptr;
+    }
+
+    for (size_t word_index = 0; word_index < s_reorder_bitmap.size(); ++word_index) {
+        auto& bitmap = s_reorder_bitmap.at(word_index);
+        uint64_t observed = bitmap.load(std::memory_order_relaxed);
+        while (observed != UINT64_MAX) {
+            uint64_t const AVAILABLE = ~observed;
+            auto const BIT_INDEX = static_cast<size_t>(std::countr_zero(AVAILABLE));
+            uint64_t const MASK = 1ULL << BIT_INDEX;
+            if (!bitmap.compare_exchange_weak(observed, observed | MASK, std::memory_order_acquire, std::memory_order_relaxed)) {
+                continue;
+            }
+
+            size_t const SLOT_INDEX = (word_index * REORDER_BITMAP_WORD_BITS) + BIT_INDEX;
+            auto& slot = s_reorder_pool.at(SLOT_INDEX);
+            slot.entry = {};
+            slot.entry.data = slot.payload.data();
+            slot.entry.pool_slot = static_cast<uint16_t>(SLOT_INDEX + 1);
+            return &slot.entry;
+        }
+    }
+    return nullptr;
+}
+
+void wki_reorder_entry_release(WkiReorderEntry* entry) {
+    if (entry == nullptr || entry->pool_slot == WKI_REORDER_POOL_INVALID_SLOT || entry->pool_slot > s_reorder_pool.size()) {
+        return;
+    }
+    size_t const SLOT_INDEX = entry->pool_slot - 1;
+    auto& slot = s_reorder_pool.at(SLOT_INDEX);
+    if (entry != &slot.entry) {
+        return;
+    }
+
+    size_t const WORD_INDEX = SLOT_INDEX / REORDER_BITMAP_WORD_BITS;
+    size_t const BIT_INDEX = SLOT_INDEX % REORDER_BITMAP_WORD_BITS;
+    slot.entry = {};
+    s_reorder_bitmap.at(WORD_INDEX).fetch_and(~(1ULL << BIT_INDEX), std::memory_order_release);
 }
 
 // -----------------------------------------------------------------------------
@@ -72,7 +135,7 @@ void wki_channel_send_ack(WkiChannel* ch) {
         return;
     }
 
-    peer->transport->tx(peer->transport, NEXT_HOP, &ack, WKI_HEADER_SIZE);
+    static_cast<void>(wki_transport_send(peer->transport, NEXT_HOP, &ack, WKI_HEADER_SIZE));
     ch->ack_pending = false;
     ch->dup_ack_count = 0;
 }
@@ -119,7 +182,7 @@ auto wki_channel_retransmit(WkiChannel* ch) -> int {
         return WKI_ERR_NO_ROUTE;
     }
 
-    int const RET = peer->transport->tx(peer->transport, NEXT_HOP, rt->data, rt->len);
+    int const RET = wki_transport_send(peer->transport, NEXT_HOP, rt->data, rt->len);
     if (RET < 0) {
         return WKI_ERR_TX_FAILED;
     }
@@ -155,11 +218,10 @@ void wki_channel_reset(WkiChannel* ch) {
     }
 
     // Free reorder buffer
-    WkiReorderEntry const* ro = ch->reorder_head;
+    WkiReorderEntry* ro = ch->reorder_head;
     while (ro != nullptr) {
-        WkiReorderEntry const* next = ro->next;
-        delete[] ro->data;
-        delete ro;
+        WkiReorderEntry* next = ro->next;
+        wki_reorder_entry_release(ro);
         ro = next;
     }
 
@@ -175,10 +237,12 @@ void wki_channel_reset(WkiChannel* ch) {
     ch->retransmit_head = nullptr;
     ch->retransmit_tail = nullptr;
     ch->retransmit_count = 0;
+    ch->retransmit_in_progress = false;
     ch->reorder_head = nullptr;
     ch->reorder_count = 0;
     ch->last_dup_ack = 0;
     ch->dup_ack_count = 0;
+    ch->fast_retransmit_seq = WKI_ACK_NONE;
     ch->rto_us = WKI_INITIAL_RTO_US;
     ch->srtt_us = 0;
     ch->rttvar_us = 0;

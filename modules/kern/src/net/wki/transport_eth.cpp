@@ -328,6 +328,9 @@ auto eth_rx_needs_peer_contact_update(WkiTransport* transport, const WkiHeader* 
     if (wki_version(hdr->version_flags) != WKI_VERSION) {
         return false;
     }
+    if (wki_peer_frame_was_forwarded(hdr)) {
+        return false;
+    }
 
     auto const MSG = static_cast<MsgType>(hdr->msg_type);
     if (MSG == MsgType::HELLO || MSG == MsgType::HELLO_ACK) {
@@ -350,6 +353,18 @@ auto eth_rx_needs_peer_contact_update(WkiTransport* transport, const WkiHeader* 
 
 }  // namespace
 
+void wki_eth_note_rx_contact(WkiTransport* transport, const WkiHeader* header, const proto::MacAddress& src_mac) {
+    if (eth_rx_needs_peer_contact_update(transport, header, src_mac)) {
+        wki_peer_note_rx_contact(transport, header->src_node, src_mac);
+    }
+}
+
+void wki_eth_note_injected_tx_failure(WkiTransport* transport, const void* data, uint16_t len) {
+    if (transport != nullptr && transport->tx == eth_wki_tx) {
+        note_wki_tx_failure(is_wki_control_reserve_frame(data, len));
+    }
+}
+
 void wki_eth_rx(net::NetDevice* dev, net::PacketBuffer* pkt) {
     // The Ethernet header has already been stripped by eth_rx().
     // pkt->data points to the WKI header. pkt->src_mac has the sender's MAC.
@@ -370,14 +385,9 @@ void wki_eth_rx(net::NetDevice* dev, net::PacketBuffer* pkt) {
     // peer, so HELLO_ACK and resource adverts go back on the right interface.
     WkiTransport* transport = get_or_create_eth_transport(dev);
     auto* priv = static_cast<EthTransportPrivate*>(transport->private_data);
-    const auto* hdr = reinterpret_cast<const WkiHeader*>(pkt->data);
-
-    if (eth_rx_needs_peer_contact_update(transport, hdr, pkt->src_mac)) {
-        wki_peer_note_rx_contact(transport, hdr->src_node, pkt->src_mac);
-    }
-
     if (priv->rx_handler != nullptr) {
-        priv->rx_handler(transport, pkt->data, static_cast<uint16_t>(pkt->len));
+        WkiRxMetadata const METADATA{.has_src_mac = true, .src_mac = pkt->src_mac};
+        priv->rx_handler(transport, pkt->data, static_cast<uint16_t>(pkt->len), &METADATA);
     }
 
     pkt_free(pkt);
@@ -386,8 +396,17 @@ void wki_eth_rx(net::NetDevice* dev, net::PacketBuffer* pkt) {
 // -----------------------------------------------------------------------------
 // Initialization
 // -----------------------------------------------------------------------------
+void wki_eth_transport_claim(net::NetDevice* netdev) {
+    if (netdev == nullptr) {
+        return;
+    }
+
+    netdev->remotable = nullptr;
+    netdev->wki_transport = true;
+}
+
 void wki_eth_transport_init(net::NetDevice* netdev) {
-    if (s_eth_initialized) {
+    if (s_eth_initialized || netdev == nullptr) {
         return;
     }
 
@@ -421,8 +440,7 @@ void wki_eth_transport_init(net::NetDevice* netdev) {
 
     // Mark this NIC as WKI-owned so it is not advertised to peers as a
     // remotable NET resource and not eligible for remote-attach.
-    netdev->remotable = nullptr;
-    netdev->wki_transport = true;
+    wki_eth_transport_claim(netdev);
 
     // Register with WKI core
     wki_transport_register(&s_eth_transport);

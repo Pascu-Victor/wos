@@ -2,6 +2,7 @@
 
 #include <array>
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <dev/block_device.hpp>
 #include <net/wki/blk_ring.hpp>
@@ -11,6 +12,13 @@
 #include <platform/sys/spinlock.hpp>
 
 namespace ker::net::wki {
+
+struct WkiChaosBlockKey;
+
+enum class WkiBlockAttachRdmaPolicy : uint8_t {
+    ALLOW = 0,
+    DISABLE = 1,
+};
 
 // -----------------------------------------------------------------------------
 // Configuration
@@ -43,6 +51,12 @@ struct ProxyBlockState {
     bool cleanup_in_progress = false;
     bool resume_pending = false;
     bool resume_in_progress = false;
+    // Delayed chaos doorbells retain the exact published binding without
+    // taking io_lock: the submitting I/O intentionally holds that lock while
+    // waiting for the notification. Teardown fences new retains, then waits
+    // for this bounded task-context reference to drain before clearing RDMA
+    // identity or zone state.
+    std::atomic<uint32_t> chaos_doorbell_refs{0};
     // Same-boot reconnect must receive an ACK for the old exact detach before
     // replacing binding_attach_cookie. Protected by the proxy registry lock.
     bool resume_after_detach = false;
@@ -91,7 +105,11 @@ struct ProxyBlockState {
 
     // RDMA block ring state (Phase 3: shared memory SQ/CQ for block I/O)
     bool rdma_attached = false;
+    // Preserve the caller's attach policy across same-binding reconnects.
+    // This maps to the existing DEV_ATTACH_DISABLE_RDMA wire bit.
+    bool rdma_disabled = false;
     uint32_t rdma_zone_id = 0;
+    uint32_t rdma_zone_size = 0;
     void* rdma_zone_ptr = nullptr;
     uint64_t data_slot_bitmap = 0;  // 1 = slot in use (max 64 slots)
 
@@ -104,12 +122,14 @@ struct ProxyBlockState {
     // Per-tag completion tracking for async SQ pipeline.
     // Indexed by tag (0..TAG_POOL_SIZE-1). Tags are allocated from tag_bitmap.
     struct TagCompletion {
+        uint32_t wire_tag = 0;
         bool pending = false;    // SQE posted, awaiting CQE
         bool completed = false;  // CQE received
         BlkCqEntry cqe = {};
     };
     static constexpr uint32_t TAG_POOL_SIZE = 64;  // matches SQ depth
-    uint64_t tag_bitmap = 0;                       // 1 = tag in use (bit index = tag value)
+    uint32_t rdma_tag_epoch = 1;                   // qualifies slot tags across ring replacement
+    uint64_t tag_bitmap = 0;                       // 1 = tag slot in use
     std::array<TagCompletion, TAG_POOL_SIZE> tag_completions = {};
 
     // Read-ahead cache - prefetches a full RDMA data slot worth of blocks
@@ -134,6 +154,52 @@ struct ProxyBlockState {
     mod::sys::Spinlock lock;
 };
 
+constexpr size_t WKI_DEV_PROXY_DIAG_MAX = 128;
+
+struct WkiDevProxyDiagRow {
+    uint16_t owner_node = WKI_NODE_INVALID;
+    uint16_t assigned_channel = 0;
+    uint32_t channel_generation = 0;
+    uint32_t resource_id = 0;
+    uint64_t resource_generation = 0;
+    ResourceIncarnationToken binding_incarnation = {};
+    uint32_t binding_peer_boot_epoch = 0;
+    bool lifecycle_detail_complete = false;
+    bool io_detail_complete = false;
+    bool active = false;
+    bool fenced = false;
+    bool ever_published = false;
+    bool epoch_reset_pending = false;
+    bool cleanup_in_progress = false;
+    bool resume_pending = false;
+    bool resume_in_progress = false;
+    bool resume_after_detach = false;
+    bool resume_detach_confirmed = false;
+    bool op_pending = false;
+    uint16_t op_expected_id = 0;
+    uint16_t op_expected_seq = 0;
+    bool op_waiter_owned = false;
+    bool attach_pending = false;
+    bool attach_waiter_owned = false;
+    uint8_t attach_expected_cookie = 0;
+    uint8_t binding_attach_cookie = 0;
+    bool detach_pending = false;
+    bool detach_retry_in_progress = false;
+    uint8_t detach_attach_cookie = 0;
+    uint32_t detach_peer_boot_epoch = 0;
+    bool rdma_attached = false;
+    bool rdma_roce = false;
+    uint32_t rdma_zone_id = 0;
+    uint64_t data_slot_bitmap = 0;
+    uint64_t tag_bitmap = 0;
+    BlkRingGeometry ring_geometry = {};
+    BlkRingIndices ring_indices = {};
+    bool ring_geometry_valid = false;
+    bool ring_indices_valid = false;
+    bool bulk_capable = false;
+    uint32_t bulk_max_transfer = 0;
+};
+
 // -----------------------------------------------------------------------------
 // Public API
 // -----------------------------------------------------------------------------
@@ -145,7 +211,8 @@ void wki_dev_proxy_init();
 // On success, registers a proxy BlockDevice and returns a pointer to it.
 // On failure, returns nullptr.
 auto wki_dev_proxy_attach_block(uint16_t owner_node, uint32_t resource_id, uint64_t expected_resource_generation,
-                                const ResourceIncarnationToken& expected_owner_incarnation, const char* local_name) -> dev::BlockDevice*;
+                                const ResourceIncarnationToken& expected_owner_incarnation, const char* local_name,
+                                WkiBlockAttachRdmaPolicy rdma_policy = WkiBlockAttachRdmaPolicy::ALLOW) -> dev::BlockDevice*;
 
 // Detach a proxy block device. Sends DEV_DETACH to the owner.
 void wki_dev_proxy_detach_block(dev::BlockDevice* proxy_bdev);
@@ -182,6 +249,14 @@ void wki_dev_proxy_fence_timeout_tick(uint64_t now_us);
 // Retry a bounded, rotating batch of detach frames from task context.
 void wki_dev_proxy_process_pending_detaches();
 
+// Snapshot all retained proxy rows. Detail completeness is explicit when a
+// nonblocking lock attempt cannot observe one internally consistent tuple.
+auto wki_dev_proxy_diag_snapshot(WkiDevProxyDiagRow* rows, size_t capacity, size_t* total) -> size_t;
+
+// Deferred test-only block notification delivery. Re-resolves and validates
+// the copied ring identity before invoking the normal notification path.
+auto wki_dev_proxy_chaos_deliver_doorbell(const WkiChaosBlockKey& key) -> bool;
+
 // Block range descriptor for batch I/O operations
 struct BlockRange {
     uint64_t lba;
@@ -213,6 +288,8 @@ auto wki_dev_proxy_bulk_write(dev::BlockDevice* bdev, uint64_t lba, uint32_t blo
 auto wki_dev_proxy_selftest_attach_ack_cookie_fences_stale_completion() -> bool;
 auto wki_dev_proxy_selftest_failed_attach_erases_exact_proxy() -> bool;
 auto wki_dev_proxy_selftest_rdma_sq_wait_stops_on_fence() -> bool;
+auto wki_dev_proxy_selftest_batch_validation_is_atomic() -> bool;
+auto wki_dev_proxy_selftest_old_rdma_tag_cannot_match_successor() -> bool;
 
 // -----------------------------------------------------------------------------
 // Internal - RX message handlers (called from wki.cpp dispatch)

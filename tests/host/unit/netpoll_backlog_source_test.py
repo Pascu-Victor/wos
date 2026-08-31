@@ -289,10 +289,40 @@ def test_backlog_handler_and_enqueue_lost_wake_guards() -> None:
     )
 
 
+def test_roce_flow_hash_preserves_transport_order() -> None:
+    source = BACKLOG_CPP.read_text()
+    body = function_body(source, "backlog_flow_hash")
+    require_tokens(
+        body,
+        [
+            "ETHERTYPE == proto::ETH_TYPE_WKI",
+            "pkt->len >= sizeof(proto::EthernetHeader) + sizeof(wki::WkiHeader)",
+            "hdr->src_node",
+            "hdr->dst_node",
+            "hdr->channel_id",
+        ],
+        "WKI channel flow steering",
+    )
+    if "ETHERTYPE == proto::ETH_TYPE_WKI_ROCE" in body:
+        fail("RoCE payload bytes must not be parsed as WkiHeader steering fields")
+
+    selftest = function_body(source, "backlog_selftest_roce_flow_hash_preserves_frame_order")
+    require_tokens(
+        selftest,
+        [
+            "eth->ethertype = htons(proto::ETH_TYPE_WKI_ROCE)",
+            "uint64_t const EXPECTED_QUEUE = backlog_flow_hash(&first, BACKLOG_SNAPSHOT_MAX_CPUS)",
+            "backlog_flow_hash(&second, BACKLOG_SNAPSHOT_MAX_CPUS) != EXPECTED_QUEUE",
+        ],
+        "RoCE payload-independent flow hash selftest",
+    )
+
+
 def main() -> None:
     test_napi_worker_and_scheduler_lost_wake_guards()
     test_napi_inline_poll_rearms_on_races_and_budget_exhaustion()
     test_backlog_handler_and_enqueue_lost_wake_guards()
+    test_roce_flow_hash_preserves_transport_order()
     print("netpoll/backlog lost-wake guards are source covered")
 
 

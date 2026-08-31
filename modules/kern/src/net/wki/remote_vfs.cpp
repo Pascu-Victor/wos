@@ -7137,19 +7137,48 @@ auto wki_remote_vfs_proxy_diag_snapshot(WkiRemoteVfsProxyDiag* out, size_t max) 
     size_t count = 0;
     s_vfs_lock.lock();
     for (const auto& proxy : g_vfs_proxies) {
-        if (proxy == nullptr || !proxy->lane_anchor || !proxy->active || count >= max) {
+        if (proxy == nullptr || count >= max) {
             continue;
         }
 
         auto& row = out[count++];
         row.owner_node = proxy->owner_node;
         row.assigned_channel = proxy->assigned_channel;
+        row.assigned_channel_generation = proxy->assigned_channel_generation;
         row.resource_id = proxy->resource_id;
+        row.resource_generation = proxy->resource_generation;
+        row.owner_boot_epoch = proxy->owner_incarnation.owner_boot_epoch;
+        row.resource_incarnation = proxy->owner_incarnation.resource_incarnation;
+        row.binding_peer_boot_epoch = proxy->binding_peer_boot_epoch;
+        row.mount_group_id = proxy->mount_group_id;
+        row.lane_index = proxy->lane_index;
+        row.lane_count = proxy->lane_count;
+        row.lane_anchor = proxy->lane_anchor;
+        row.lanes_ready = proxy->lanes_ready;
         row.active = proxy->active;
+        row.epoch_reset_pending = proxy->epoch_reset_pending;
         row.op_pending = proxy->op_pending.load(std::memory_order_acquire);
         row.op_expected_id = proxy->op_expected_id;
         row.op_expected_seq = proxy->op_expected_seq;
+        row.op_generation = proxy->op_generation;
+        row.op_waiter_pid = proxy->op_waiter_pid;
+        row.op_retiring_waiter_pid = proxy->op_retiring_waiter_pid;
+        row.op_slot_waiter_count = static_cast<uint32_t>(proxy->op_slot_waiter_count);
         row.attach_pending = proxy->attach_pending.load(std::memory_order_acquire);
+        row.attach_expected_cookie = proxy->attach_expected_cookie;
+        row.binding_attach_cookie = proxy->binding_attach_cookie;
+        row.detach_pending = proxy->detach_pending;
+        row.detach_retry_in_progress = proxy->detach_retry_in_progress;
+        row.detach_peer_boot_epoch = proxy->detach_peer_boot_epoch;
+        row.open_file_refs = proxy->open_file_refs.load(std::memory_order_acquire);
+        row.lifecycle_refs = proxy->lifecycle_refs;
+        row.destroy_when_idle = proxy->destroy_when_idle;
+        row.mount_configured = proxy->mount_configured;
+        row.mount_released = proxy->mount_released;
+        row.resources_releasing = proxy->resources_releasing;
+        row.resources_released = proxy->resources_released;
+        row.rdma_capable = proxy->rdma_capable;
+        row.bulk_rdma_capable = proxy->bulk_rdma_capable;
         row.local_mount_path = proxy->local_mount_path;
     }
     s_vfs_lock.unlock();
@@ -7297,8 +7326,11 @@ auto wki_remote_vfs_open_path(const char* fs_relative_path, int flags, int mode,
     uint32_t valid_prefetched_bytes = 0;
     if (send_open_prefetch && open_resp_len >= OPEN_RESP_WITH_PREFETCH_LEN && open_resp.prefetched_bytes > 0 &&
         open_resp.prefetched_bytes <= OPEN_PREFETCH_LEN) {
-        if (wki_roce_region_wait_tagged_write(state->rdma_bulk_rkey, tagged_receive.cookie, open_resp.prefetched_bytes,
-                                              VFS_PROXY_OP_TIMEOUT_US)) {
+        // The server transmits every prefetch frame before enqueueing this
+        // response on the same NIC. Once the response is consumed, waiting
+        // cannot recover a dropped raw-RoCE frame; fail the optional prefetch
+        // immediately and let ordinary reliable VFS reads service the file.
+        if (wki_roce_region_tagged_write_complete(state->rdma_bulk_rkey, tagged_receive.cookie, open_resp.prefetched_bytes)) {
             valid_prefetched_bytes = open_resp.prefetched_bytes;
             remote_vfs_rdma_note_success(state->bulk_rdma_failure_count, state->bulk_rdma_retry_after_us);
             remote_vfs_rdma_note_success(state->rdma_read_failure_count, state->rdma_read_retry_after_us);
@@ -8673,6 +8705,34 @@ void wki_remote_vfs_rebuild_exports() {
 // Fencing Cleanup
 // -------------------------------------------------------------------------------
 
+namespace {
+auto vfs_proxy_requires_peer_cleanup(const ProxyVfsState* state, uint16_t node_id) -> bool {
+    return state != nullptr && state->owner_node == node_id &&
+           (state->active || state->epoch_reset_pending || state->attach_pending.load(std::memory_order_acquire));
+}
+}  // namespace
+
+#ifdef WOS_SELFTEST
+auto wki_remote_vfs_selftest_peer_cleanup_includes_pending_attach() -> bool {
+    ProxyVfsState state = {};
+    state.owner_node = 0x5101;
+    if (vfs_proxy_requires_peer_cleanup(nullptr, state.owner_node) || vfs_proxy_requires_peer_cleanup(&state, 0x5102) ||
+        vfs_proxy_requires_peer_cleanup(&state, state.owner_node)) {
+        return false;
+    }
+
+    state.attach_pending.store(true, std::memory_order_release);
+    bool const PENDING_ATTACH_INCLUDED = vfs_proxy_requires_peer_cleanup(&state, state.owner_node);
+    state.attach_pending.store(false, std::memory_order_release);
+    state.active = true;
+    bool const ACTIVE_INCLUDED = vfs_proxy_requires_peer_cleanup(&state, state.owner_node);
+    state.active = false;
+    state.epoch_reset_pending = true;
+    bool const EPOCH_MARKER_INCLUDED = vfs_proxy_requires_peer_cleanup(&state, state.owner_node);
+    return PENDING_ATTACH_INCLUDED && ACTIVE_INCLUDED && EPOCH_MARKER_INCLUDED;
+}
+#endif
+
 void wki_remote_vfs_mark_server_fds_for_channel(const WkiChannelIdentity& channel_identity) {
     if (channel_identity.channel == nullptr || channel_identity.generation == 0) {
         return;
@@ -8834,7 +8894,7 @@ void wki_remote_vfs_cleanup_for_peer(uint16_t node_id, bool owner_reboot_proven)
     // because they can take other subsystem locks.
     for (auto& proxy : g_vfs_proxies) {
         auto* p = proxy.get();
-        if (p == nullptr || p->owner_node != node_id || (!p->active && !p->epoch_reset_pending)) {
+        if (!vfs_proxy_requires_peer_cleanup(p, node_id)) {
             continue;
         }
 

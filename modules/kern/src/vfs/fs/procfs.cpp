@@ -48,8 +48,16 @@
 #include <vfs/stat.hpp>
 #include <vfs/vfs.hpp>
 
+#include "net/wki/blk_ring.hpp"
+#include "net/wki/chaos.hpp"
+#include "net/wki/chaos_model.hpp"
+#include "net/wki/chaos_workload.hpp"
+#include "net/wki/dev_proxy.hpp"
+#include "net/wki/dev_server.hpp"
+#include "net/wki/remotable.hpp"
 #include "net/wki/remote_compute.hpp"
 #include "net/wki/remote_ipc.hpp"
+#include "net/wki/remote_net.hpp"
 #include "net/wki/remote_vfs.hpp"
 #include "net/wki/wire.hpp"
 #include "net/wki/wki.hpp"
@@ -667,6 +675,22 @@ auto procfs_readdir(File* f, DirEntry* buf, size_t count) -> int {
             buf->d_reclen = sizeof(DirEntry);
             buf->d_type = DT_REG;
             std::memcpy(buf->d_name.data(), "pipes", 6);
+            return 0;
+        }
+        if (count == 5) {
+            buf->d_ino = 24;
+            buf->d_off = 6;
+            buf->d_reclen = sizeof(DirEntry);
+            buf->d_type = DT_REG;
+            std::memcpy(buf->d_name.data(), "chaos", 6);
+            return 0;
+        }
+        if (count == 6) {
+            buf->d_ino = 25;
+            buf->d_off = 7;
+            buf->d_reclen = sizeof(DirEntry);
+            buf->d_type = DT_REG;
+            std::memcpy(buf->d_name.data(), "chaos_workload", 15);
             return 0;
         }
         return -ENOENT;
@@ -2174,8 +2198,164 @@ auto ipc_diag_kind_name(ker::net::wki::WkiIpcDiagKind kind) -> const char* {
             return "export_backlog";
         case ker::net::wki::WkiIpcDiagKind::PROXY_CLOSE:
             return "proxy_close";
+        case ker::net::wki::WkiIpcDiagKind::PENDING_DELIVERY:
+            return "pending_delivery";
+        case ker::net::wki::WkiIpcDiagKind::DEV_OP_WORK:
+            return "dev_op_work";
+        case ker::net::wki::WkiIpcDiagKind::PEER_CLEANUP:
+            return "peer_cleanup";
     }
     return "unknown";
+}
+
+auto resource_diag_kind_name(ker::net::wki::WkiResourceDiagKind kind) -> const char* {
+    switch (kind) {
+        case ker::net::wki::WkiResourceDiagKind::DISCOVERED:
+            return "discovered";
+        case ker::net::wki::WkiResourceDiagKind::PENDING_VFS_MOUNT:
+            return "pending_vfs_mount";
+        case ker::net::wki::WkiResourceDiagKind::PENDING_NET_ATTACH:
+            return "pending_net_attach";
+        case ker::net::wki::WkiResourceDiagKind::PENDING_RX:
+            return "pending_rx";
+    }
+    return "unknown";
+}
+
+auto chaos_direction_name(ker::net::wki::WkiChaosDirection direction) -> const char* {
+    switch (direction) {
+        case ker::net::wki::WkiChaosDirection::TX:
+            return "tx";
+        case ker::net::wki::WkiChaosDirection::RX:
+            return "rx";
+    }
+    return "unknown";
+}
+
+auto chaos_surface_name(ker::net::wki::WkiChaosSurface surface) -> const char* {
+    switch (surface) {
+        case ker::net::wki::WkiChaosSurface::FRAME:
+            return "frame";
+        case ker::net::wki::WkiChaosSurface::BLOCK_DOORBELL:
+            return "blk_doorbell";
+        case ker::net::wki::WkiChaosSurface::BLOCK_SQE:
+            return "blk_sqe";
+    }
+    return "unknown";
+}
+
+auto chaos_block_origin_name(ker::net::wki::WkiChaosBlockOrigin origin) -> const char* {
+    switch (origin) {
+        case ker::net::wki::WkiChaosBlockOrigin::PROXY:
+            return "proxy";
+        case ker::net::wki::WkiChaosBlockOrigin::SERVER:
+            return "server";
+    }
+    return "unknown";
+}
+
+auto chaos_block_lane_name(ker::net::wki::WkiChaosBlockLane lane) -> const char* {
+    switch (lane) {
+        case ker::net::wki::WkiChaosBlockLane::IVSHMEM:
+            return "ivshmem";
+        case ker::net::wki::WkiChaosBlockLane::ROCE:
+            return "roce";
+    }
+    return "unknown";
+}
+
+auto chaos_action_name(ker::net::wki::WkiChaosAction action) -> const char* {
+    switch (action) {
+        case ker::net::wki::WkiChaosAction::PASS:
+            return "pass";
+        case ker::net::wki::WkiChaosAction::DROP:
+            return "drop";
+        case ker::net::wki::WkiChaosAction::DUPLICATE:
+            return "duplicate";
+        case ker::net::wki::WkiChaosAction::DELAY:
+            return "delay";
+        case ker::net::wki::WkiChaosAction::REORDER:
+            return "reorder";
+        case ker::net::wki::WkiChaosAction::CORRUPT:
+            return "corrupt";
+        case ker::net::wki::WkiChaosAction::FAIL:
+            return "fail";
+        case ker::net::wki::WkiChaosAction::PARTITION:
+            return "partition";
+        case ker::net::wki::WkiChaosAction::RELEASE:
+            return "release";
+    }
+    return "unknown";
+}
+
+auto chaos_corrupt_mode_name(ker::net::wki::WkiChaosCorruptMode mode) -> const char* {
+    switch (mode) {
+        case ker::net::wki::WkiChaosCorruptMode::CHECKSUM:
+            return "checksum";
+        case ker::net::wki::WkiChaosCorruptMode::PAYLOAD_XOR:
+            return "payload";
+    }
+    return "unknown";
+}
+
+auto chaos_outcome_name(ker::net::wki::WkiChaosOutcome outcome) -> const char* {
+    switch (outcome) {
+        case ker::net::wki::WkiChaosOutcome::PASSED:
+            return "passed";
+        case ker::net::wki::WkiChaosOutcome::DROPPED:
+            return "dropped";
+        case ker::net::wki::WkiChaosOutcome::DUPLICATED:
+            return "duplicated";
+        case ker::net::wki::WkiChaosOutcome::QUEUED:
+            return "queued";
+        case ker::net::wki::WkiChaosOutcome::FAILED:
+            return "failed";
+        case ker::net::wki::WkiChaosOutcome::RELEASED:
+            return "released";
+        case ker::net::wki::WkiChaosOutcome::QUEUE_OVERFLOW:
+            return "queue_overflow";
+        case ker::net::wki::WkiChaosOutcome::STREAM_OVERFLOW:
+            return "stream_overflow";
+        case ker::net::wki::WkiChaosOutcome::TRANSPORT_REMOVED:
+            return "transport_removed";
+        case ker::net::wki::WkiChaosOutcome::CORRUPTED:
+            return "corrupted";
+        case ker::net::wki::WkiChaosOutcome::COALESCED:
+            return "coalesced";
+        case ker::net::wki::WkiChaosOutcome::HEALED:
+            return "healed";
+    }
+    return "unknown";
+}
+
+void append_block_ring_diag(char*& p, const char* end, const ker::net::wki::BlkRingGeometry& geometry,
+                            const ker::net::wki::BlkRingIndices& indices, bool geometry_valid, bool indices_valid) {
+    append_sconst(p, end, " ring_ready=");
+    append_dec64(p, end, geometry.server_ready);
+    append_sconst(p, end, " sq_depth=");
+    append_dec64(p, end, geometry.sq_depth);
+    append_sconst(p, end, " cq_depth=");
+    append_dec64(p, end, geometry.cq_depth);
+    append_sconst(p, end, " slots=");
+    append_dec64(p, end, geometry.data_slot_count);
+    append_sconst(p, end, " slot_size=");
+    append_dec64(p, end, geometry.data_slot_size);
+    append_sconst(p, end, " block_size=");
+    append_dec64(p, end, geometry.block_size);
+    append_sconst(p, end, " total_blocks=");
+    append_dec64(p, end, geometry.total_blocks);
+    append_sconst(p, end, " sq_head=");
+    append_dec64(p, end, indices.sq_head);
+    append_sconst(p, end, " sq_tail=");
+    append_dec64(p, end, indices.sq_tail);
+    append_sconst(p, end, " cq_head=");
+    append_dec64(p, end, indices.cq_head);
+    append_sconst(p, end, " cq_tail=");
+    append_dec64(p, end, indices.cq_tail);
+    append_sconst(p, end, " geometry_valid=");
+    append_bool01(p, end, geometry_valid);
+    append_sconst(p, end, " indices_valid=");
+    append_bool01(p, end, indices_valid);
 }
 
 auto ipc_resource_type_name(uint16_t raw_type) -> const char* {
@@ -3403,7 +3583,334 @@ void append_virtqueue_diag(char*& p, const char* end, const char* prefix, const 
     append_dec64(p, end, q.last_used_idx);
 }
 
-auto generate_wki_netdiag(char* buf, size_t bufsz) -> size_t {
+auto generate_wki_chaos(char* buf, size_t bufsz) -> size_t {
+    if (bufsz == 0) {
+        return 0;
+    }
+
+    char* p = buf;
+    char const* end = buf + bufsz - 1;
+    auto* rules = new (std::nothrow) ker::net::wki::WkiChaosRuleRow[ker::net::wki::WKI_CHAOS_MAX_RULES];
+    auto* trace = new (std::nothrow) ker::net::wki::WkiChaosTraceRow[ker::net::wki::WKI_CHAOS_MAX_TRACE_ROWS];
+    if (rules == nullptr || trace == nullptr) {
+        append_sconst(p, end, "wki_chaos_snapshot allocation_failed=1\n");
+        delete[] rules;
+        delete[] trace;
+        *p = '\0';
+        return static_cast<size_t>(p - buf);
+    }
+
+    ker::net::wki::WkiChaosSnapshot snapshot{};
+    size_t rule_count = 0;
+    size_t trace_count = 0;
+    if (!ker::net::wki::wki_chaos_capture(&snapshot, rules, ker::net::wki::WKI_CHAOS_MAX_RULES, &rule_count, trace,
+                                          ker::net::wki::WKI_CHAOS_MAX_TRACE_ROWS, &trace_count)) {
+        append_sconst(p, end, "wki_chaos supported=0 snapshot_failed=1\n");
+        delete[] rules;
+        delete[] trace;
+        *p = '\0';
+        return static_cast<size_t>(p - buf);
+    }
+
+    append_sconst(p, end, "wki_chaos schema=");
+    append_dec64(p, end, snapshot.schema_version);
+    append_sconst(p, end, " supported=");
+    append_bool01(p, end, snapshot.supported);
+    append_sconst(p, end, " runtime_control=");
+    append_bool01(p, end, snapshot.runtime_control_allowed);
+    append_sconst(p, end, " enabled=");
+    append_bool01(p, end, snapshot.enabled);
+    append_sconst(p, end, " seed=");
+    append_dec64(p, end, snapshot.seed);
+    append_sconst(p, end, " rules=");
+    append_dec64(p, end, snapshot.active_rule_count);
+    append_sconst(p, end, " queued=");
+    append_dec64(p, end, snapshot.queued_frame_count + snapshot.queued_block_event_count);
+    append_sconst(p, end, " queued_frames=");
+    append_dec64(p, end, snapshot.queued_frame_count);
+    append_sconst(p, end, " queued_block_events=");
+    append_dec64(p, end, snapshot.queued_block_event_count);
+    append_sconst(p, end, " trace_rows=");
+    append_dec64(p, end, snapshot.trace_count);
+    append_sconst(p, end, " first_event=");
+    append_dec64(p, end, snapshot.trace_first_event_id);
+    append_sconst(p, end, " last_event=");
+    append_dec64(p, end, snapshot.trace_last_event_id);
+    append_sconst(p, end, " queue_overflow=");
+    append_bool01(p, end, snapshot.queue_overflow);
+    append_sconst(p, end, " trace_overflow=");
+    append_bool01(p, end, snapshot.trace_overflow);
+    append_sconst(p, end, " stream_overflow=");
+    append_bool01(p, end, snapshot.stream_overflow);
+    append_sconst(p, end, " invalid=");
+    append_bool01(p, end, snapshot.invalid);
+    append_char(p, end, '\n');
+
+    const auto& counters = snapshot.counters;
+    append_sconst(p, end, "wki_chaos_counters observed=");
+    append_dec64(p, end, counters.observed);
+    append_sconst(p, end, " matched=");
+    append_dec64(p, end, counters.matched);
+    append_sconst(p, end, " passed=");
+    append_dec64(p, end, counters.passed);
+    append_sconst(p, end, " dropped=");
+    append_dec64(p, end, counters.dropped);
+    append_sconst(p, end, " duplicated=");
+    append_dec64(p, end, counters.duplicated);
+    append_sconst(p, end, " delayed=");
+    append_dec64(p, end, counters.delayed);
+    append_sconst(p, end, " reordered=");
+    append_dec64(p, end, counters.reordered);
+    append_sconst(p, end, " corrupted=");
+    append_dec64(p, end, counters.corrupted);
+    append_sconst(p, end, " failed=");
+    append_dec64(p, end, counters.failed);
+    append_sconst(p, end, " released=");
+    append_dec64(p, end, counters.released);
+    append_sconst(p, end, " coalesced=");
+    append_dec64(p, end, counters.coalesced);
+    append_char(p, end, '\n');
+
+    for (size_t i = 0; i < rule_count; ++i) {
+        const auto& rule = rules[i];  // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
+        append_sconst(p, end, "wki_chaos_rule id=");
+        append_dec64(p, end, rule.id);
+        append_sconst(p, end, " active=");
+        append_bool01(p, end, rule.active);
+        append_sconst(p, end, " surface=");
+        append_sconst(p, end, chaos_surface_name(rule.surface));
+        append_sconst(p, end, " direction=");
+        append_sconst(p, end, chaos_direction_name(rule.direction));
+        append_sconst(p, end, " action=");
+        append_sconst(p, end, chaos_action_name(rule.action));
+        append_sconst(p, end, " match_transport=");
+        append_bool01(p, end, rule.match_transport);
+        append_sconst(p, end, " transport=");
+        append_dec64(p, end, rule.transport_id);
+        append_sconst(p, end, " match_neighbor=");
+        append_bool01(p, end, rule.match_neighbor);
+        append_sconst(p, end, " neighbor=");
+        append_hex16(p, end, rule.neighbor);
+        append_sconst(p, end, " match_src=");
+        append_bool01(p, end, rule.match_src);
+        append_sconst(p, end, " src=");
+        append_hex16(p, end, rule.src_node);
+        append_sconst(p, end, " match_dst=");
+        append_bool01(p, end, rule.match_dst);
+        append_sconst(p, end, " dst=");
+        append_hex16(p, end, rule.dst_node);
+        append_sconst(p, end, " match_channel=");
+        append_bool01(p, end, rule.match_channel);
+        append_sconst(p, end, " channel=");
+        append_dec64(p, end, rule.channel_id);
+        append_sconst(p, end, " match_type=");
+        append_bool01(p, end, rule.match_type);
+        append_sconst(p, end, " type=");
+        append_dec64(p, end, rule.msg_type);
+        append_sconst(p, end, " match_op=");
+        append_bool01(p, end, rule.match_op);
+        append_sconst(p, end, " op=");
+        append_hex16(p, end, rule.op_id);
+        append_sconst(p, end, " match_origin=");
+        append_bool01(p, end, rule.match_block_origin);
+        append_sconst(p, end, " origin=");
+        append_sconst(p, end, chaos_block_origin_name(rule.block_origin));
+        append_sconst(p, end, " match_lane=");
+        append_bool01(p, end, rule.match_block_lane);
+        append_sconst(p, end, " lane=");
+        append_sconst(p, end, chaos_block_lane_name(rule.block_lane));
+        append_sconst(p, end, " match_zone=");
+        append_bool01(p, end, rule.match_zone);
+        append_sconst(p, end, " zone=");
+        append_dec64(p, end, rule.zone_id);
+        append_sconst(p, end, " match_resource=");
+        append_bool01(p, end, rule.match_resource);
+        append_sconst(p, end, " resource=");
+        append_dec64(p, end, rule.resource_id);
+        append_sconst(p, end, " match_ring_generation=");
+        append_bool01(p, end, rule.match_ring_generation);
+        append_sconst(p, end, " ring_generation=");
+        append_dec64(p, end, rule.ring_generation);
+        append_sconst(p, end, " match_ring_index=");
+        append_bool01(p, end, rule.match_ring_index);
+        append_sconst(p, end, " ring_index=");
+        append_dec64(p, end, rule.ring_index);
+        append_sconst(p, end, " match_cookie=");
+        append_bool01(p, end, rule.match_cookie);
+        append_sconst(p, end, " cookie=");
+        append_dec64(p, end, rule.operation_cookie);
+        append_sconst(p, end, " match_blk_op=");
+        append_bool01(p, end, rule.match_block_opcode);
+        append_sconst(p, end, " blk_op=");
+        append_dec64(p, end, rule.block_opcode);
+        append_sconst(p, end, " match_seq=");
+        append_bool01(p, end, rule.match_seq);
+        append_sconst(p, end, " seq=");
+        append_dec64(p, end, rule.seq_num);
+        append_sconst(p, end, " match_occurrence=");
+        append_bool01(p, end, rule.match_occurrence);
+        append_sconst(p, end, " occurrence=");
+        append_dec64(p, end, rule.occurrence);
+        append_sconst(p, end, " after=");
+        append_dec64(p, end, rule.after);
+        append_sconst(p, end, " every=");
+        append_dec64(p, end, rule.every);
+        append_sconst(p, end, " limit=");
+        append_dec64(p, end, rule.limit);
+        append_sconst(p, end, " chance_permyriad=");
+        append_dec64(p, end, rule.chance_permyriad);
+        append_sconst(p, end, " corrupt_mode=");
+        append_sconst(p, end, chaos_corrupt_mode_name(rule.corrupt_mode));
+        append_sconst(p, end, " payload_offset=");
+        append_dec64(p, end, rule.payload_offset);
+        append_sconst(p, end, " payload_xor=");
+        append_dec64(p, end, rule.payload_xor);
+        append_sconst(p, end, " sqe_offset=");
+        append_dec64(p, end, rule.sqe_offset);
+        append_sconst(p, end, " sqe_xor=");
+        append_dec64(p, end, rule.sqe_xor);
+        append_sconst(p, end, " applied=");
+        append_dec64(p, end, rule.applied);
+        append_char(p, end, '\n');
+    }
+
+    for (size_t i = 0; i < trace_count; ++i) {
+        const auto& row = trace[i];  // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
+        append_sconst(p, end, "wki_chaos_trace event=");
+        append_dec64(p, end, row.event_id);
+        append_sconst(p, end, " release_order=");
+        append_dec64(p, end, row.release_order);
+        append_sconst(p, end, " queued_event=");
+        append_dec64(p, end, row.queued_event_id);
+        append_sconst(p, end, " surface=");
+        append_sconst(p, end, chaos_surface_name(row.surface));
+        if (row.surface == ker::net::wki::WkiChaosSurface::FRAME) {
+            append_sconst(p, end, " direction=");
+            append_sconst(p, end, chaos_direction_name(row.key.direction));
+            append_sconst(p, end, " transport=");
+            append_dec64(p, end, row.key.transport_id);
+            append_sconst(p, end, " neighbor=");
+            append_hex16(p, end, row.key.neighbor);
+            append_sconst(p, end, " src=");
+            append_hex16(p, end, row.key.src_node);
+            append_sconst(p, end, " dst=");
+            append_hex16(p, end, row.key.dst_node);
+            append_sconst(p, end, " channel=");
+            append_dec64(p, end, row.key.channel_id);
+            append_sconst(p, end, " type=");
+            append_dec64(p, end, row.key.msg_type);
+            append_sconst(p, end, " seq=");
+            append_dec64(p, end, row.key.seq_num);
+            append_sconst(p, end, " ack=");
+            append_dec64(p, end, row.key.ack_num);
+            append_sconst(p, end, " len=");
+            append_dec64(p, end, row.key.frame_len);
+            append_sconst(p, end, " payload_len=");
+            append_dec64(p, end, row.key.payload_len);
+            append_sconst(p, end, " frame_valid=");
+            append_bool01(p, end, row.key.frame_valid);
+            append_sconst(p, end, " dev_op_valid=");
+            append_bool01(p, end, row.key.dev_op_valid);
+            append_sconst(p, end, " op=");
+            append_hex16(p, end, row.key.dev_op_id);
+            append_sconst(p, end, " occurrence=");
+            append_dec64(p, end, row.key.stream_occurrence);
+            append_sconst(p, end, " stable_hash=");
+            append_hex64(p, end, row.key.stable_hash);
+        } else {
+            append_sconst(p, end, " direction=");
+            append_sconst(p, end, chaos_direction_name(row.block_key.direction));
+            append_sconst(p, end, " origin=");
+            append_sconst(p, end, chaos_block_origin_name(row.block_key.origin));
+            append_sconst(p, end, " lane=");
+            append_sconst(p, end, chaos_block_lane_name(row.block_key.lane));
+            append_sconst(p, end, " transport=");
+            append_dec64(p, end, row.block_key.transport_id);
+            append_sconst(p, end, " neighbor=");
+            append_hex16(p, end, row.block_key.neighbor);
+            append_sconst(p, end, " zone=");
+            append_dec64(p, end, row.block_key.zone_id);
+            append_sconst(p, end, " resource=");
+            append_dec64(p, end, row.block_key.resource_id);
+            append_sconst(p, end, " ring_generation=");
+            append_dec64(p, end, row.block_key.ring_generation);
+            append_sconst(p, end, " ring_index=");
+            append_dec64(p, end, row.block_key.ring_index);
+            append_sconst(p, end, " cookie=");
+            append_dec64(p, end, row.block_key.operation_cookie);
+            append_sconst(p, end, " blk_op=");
+            append_dec64(p, end, row.block_key.block_opcode);
+            append_sconst(p, end, " attach_cookie=");
+            append_dec64(p, end, row.block_key.attach_cookie);
+            append_sconst(p, end, " channel_generation=");
+            append_dec64(p, end, row.block_key.channel_generation);
+            append_sconst(p, end, " owner_boot=");
+            append_dec64(p, end, row.block_key.owner_boot_epoch);
+            append_sconst(p, end, " incarnation=");
+            append_dec64(p, end, row.block_key.resource_incarnation);
+            append_sconst(p, end, " descriptor_len=");
+            append_dec64(p, end, row.block_key.descriptor_len);
+            append_sconst(p, end, " delivery_deadline_us=");
+            append_dec64(p, end, row.block_key.delivery_deadline_us);
+            append_sconst(p, end, " occurrence=");
+            append_dec64(p, end, row.block_key.stream_occurrence);
+            append_sconst(p, end, " stable_hash=");
+            append_hex64(p, end, row.block_key.stable_hash);
+        }
+        append_sconst(p, end, " rule=");
+        append_dec64(p, end, row.rule_id);
+        append_sconst(p, end, " action=");
+        append_sconst(p, end, chaos_action_name(row.action));
+        append_sconst(p, end, " outcome=");
+        append_sconst(p, end, chaos_outcome_name(row.outcome));
+        append_sconst(p, end, " transport_result=");
+        append_sdec64(p, end, row.transport_result);
+        append_sconst(p, end, " coalesced=");
+        append_dec64(p, end, row.coalesced_count);
+        append_sconst(p, end, " checksum_before=");
+        append_dec64(p, end, row.checksum_before);
+        append_sconst(p, end, " checksum_after=");
+        append_dec64(p, end, row.checksum_after);
+        append_sconst(p, end, " corrupt_mode=");
+        append_sconst(p, end, chaos_corrupt_mode_name(row.corruption.mode));
+        append_sconst(p, end, " payload_offset=");
+        append_dec64(p, end, row.corruption.payload_offset);
+        append_sconst(p, end, " payload_xor=");
+        append_dec64(p, end, row.corruption.payload_xor);
+        append_sconst(p, end, " byte_before=");
+        append_dec64(p, end, row.corruption.byte_before);
+        append_sconst(p, end, " byte_after=");
+        append_dec64(p, end, row.corruption.byte_after);
+        append_sconst(p, end, " payload_changed=");
+        append_bool01(p, end, row.corruption.payload_changed);
+        append_sconst(p, end, " sqe_offset=");
+        append_dec64(p, end, row.block_corruption.sqe_offset);
+        append_sconst(p, end, " sqe_xor=");
+        append_dec64(p, end, row.block_corruption.sqe_xor);
+        append_sconst(p, end, " sqe_byte_before=");
+        append_dec64(p, end, row.block_corruption.byte_before);
+        append_sconst(p, end, " sqe_byte_after=");
+        append_dec64(p, end, row.block_corruption.byte_after);
+        append_sconst(p, end, " sqe_changed=");
+        append_bool01(p, end, row.block_corruption.changed);
+        append_sconst(p, end, " local_boot=");
+        append_dec64(p, end, row.local_boot_epoch);
+        append_sconst(p, end, " peer_boot=");
+        append_dec64(p, end, row.peer_boot_epoch);
+        append_sconst(p, end, " peer_channel_epoch=");
+        append_dec64(p, end, row.peer_channel_epoch);
+        append_char(p, end, '\n');
+    }
+    delete[] rules;
+    delete[] trace;
+    append_sconst(p, end, "wki_chaos_end complete=1\n");
+    *p = '\0';
+    return static_cast<size_t>(p - buf);
+}
+
+// This is the canonical text snapshot aggregator for the network/WKI state
+// graph. Keeping one append cursor makes truncation atomic and parseable.
+auto generate_wki_netdiag(char* buf, size_t bufsz) -> size_t {  // NOLINT(readability-function-size)
     if (bufsz == 0) {
         return 0;
     }
@@ -3670,12 +4177,22 @@ auto generate_wki_netdiag(char* buf, size_t bufsz) -> size_t {
     size_t const IPC_DIAG_ROW_COUNT = ker::net::wki::wki_ipc_diag_snapshot(ipc_diag_rows.data(), ipc_diag_rows.size(), &ipc_diag_counts);
     append_sconst(p, end, "wki_ipc_diag_counts exports=");
     append_dec64(p, end, ipc_diag_counts.exports);
+    append_sconst(p, end, " active_exports=");
+    append_dec64(p, end, ipc_diag_counts.active_exports);
     append_sconst(p, end, " proxies=");
     append_dec64(p, end, ipc_diag_counts.proxies);
+    append_sconst(p, end, " active_proxies=");
+    append_dec64(p, end, ipc_diag_counts.active_proxies);
     append_sconst(p, end, " export_backlogs=");
     append_dec64(p, end, ipc_diag_counts.export_backlogs);
     append_sconst(p, end, " proxy_close_queue=");
     append_dec64(p, end, ipc_diag_counts.proxy_close_queue);
+    append_sconst(p, end, " pending_deliveries=");
+    append_dec64(p, end, ipc_diag_counts.pending_deliveries);
+    append_sconst(p, end, " dev_op_work=");
+    append_dec64(p, end, ipc_diag_counts.dev_op_work);
+    append_sconst(p, end, " peer_cleanup_slots=");
+    append_dec64(p, end, ipc_diag_counts.peer_cleanup_slots);
     append_sconst(p, end, " truncated=");
     append_dec64(p, end, ipc_diag_counts.truncated);
     append_char(p, end, '\n');
@@ -3733,6 +4250,32 @@ auto generate_wki_netdiag(char* buf, size_t bufsz) -> size_t {
         append_dec64(p, end, row.msg_size);
         append_sconst(p, end, " attempts=");
         append_dec64(p, end, row.attempts);
+        append_sconst(p, end, " seq=");
+        append_dec64(p, end, row.sequence);
+        append_sconst(p, end, " refs=");
+        append_sdec64(p, end, row.refcount);
+        append_sconst(p, end, " pending_wait=");
+        append_bool01(p, end, row.has_pending_wait);
+        append_sconst(p, end, " pending_op=");
+        append_dec64(p, end, row.pending_wait_op);
+        append_sconst(p, end, " pending_cookie=");
+        append_dec64(p, end, row.pending_wait_cookie);
+        append_sconst(p, end, " cleanup_epoch=");
+        append_dec64(p, end, row.cleanup_epoch);
+        append_sconst(p, end, " cleanup_active=");
+        append_bool01(p, end, row.cleanup_active);
+        append_sconst(p, end, " fenced=");
+        append_bool01(p, end, row.fenced);
+        append_sconst(p, end, " credits=");
+        append_dec64(p, end, row.message_write_credits);
+        append_sconst(p, end, " write_error=");
+        append_sdec64(p, end, row.message_write_error);
+        append_sconst(p, end, " write_waiters=");
+        append_dec64(p, end, row.message_write_waiters);
+        append_sconst(p, end, " rdma=");
+        append_bool01(p, end, row.pipe_rdma_enabled);
+        append_sconst(p, end, " rdma_writer=");
+        append_bool01(p, end, row.pipe_rdma_writer_active);
         append_char(p, end, '\n');
     }
 
@@ -3765,16 +4308,42 @@ auto generate_wki_netdiag(char* buf, size_t bufsz) -> size_t {
         append_dec64(p, end, row.local_pid);
         append_sconst(p, end, " local_task=");
         append_hex64(p, end, row.local_task_ptr);
+        append_sconst(p, end, " ch_gen=");
+        append_dec64(p, end, row.channel_generation);
+        append_sconst(p, end, " session_epoch=");
+        append_dec64(p, end, row.submit_session_epoch);
         append_sconst(p, end, " active=");
         append_bool01(p, end, row.active);
         append_sconst(p, end, " response_pending=");
         append_bool01(p, end, row.response_pending);
         append_sconst(p, end, " complete_pending=");
         append_bool01(p, end, row.complete_pending);
+        append_sconst(p, end, " response_waiter=");
+        append_bool01(p, end, row.response_waiter_owned);
+        append_sconst(p, end, " response_consumer=");
+        append_bool01(p, end, row.response_consumer_owned);
+        append_sconst(p, end, " complete_waiter=");
+        append_bool01(p, end, row.complete_waiter_owned);
+        append_sconst(p, end, " complete_consumer=");
+        append_bool01(p, end, row.complete_consumer_owned);
         append_sconst(p, end, " proxy_ready=");
         append_bool01(p, end, row.proxy_ready);
         append_sconst(p, end, " has_local_task=");
         append_bool01(p, end, row.has_local_task);
+        append_sconst(p, end, " published=");
+        append_bool01(p, end, row.published);
+        append_sconst(p, end, " accept_pending=");
+        append_bool01(p, end, row.accept_pending);
+        append_sconst(p, end, " discard_completion=");
+        append_bool01(p, end, row.discard_completion);
+        append_sconst(p, end, " terminate=");
+        append_bool01(p, end, row.termination_requested);
+        append_sconst(p, end, " result_owned=");
+        append_bool01(p, end, row.result_handle_owned);
+        append_sconst(p, end, " result_owner=");
+        append_bool01(p, end, row.has_result_owner);
+        append_sconst(p, end, " reclaim=");
+        append_bool01(p, end, row.reclaim_requested);
         append_sconst(p, end, " exit=");
         append_sdec64(p, end, row.exit_status);
         append_sconst(p, end, " accepted_age_us=");
@@ -3783,9 +4352,320 @@ auto generate_wki_netdiag(char* buf, size_t bufsz) -> size_t {
         append_dec64(p, end, row.complete_age_us);
         append_sconst(p, end, " ipc_fds=");
         append_dec64(p, end, row.ipc_fd_count);
+        append_sconst(p, end, " ipc_handoff_pins=");
+        append_dec64(p, end, row.ipc_handoff_pin_count);
         append_sconst(p, end, " output_len=");
         append_dec64(p, end, row.output_len);
+        append_sconst(p, end, " pending_output_len=");
+        append_dec64(p, end, row.pending_proxy_output_len);
         append_char(p, end, '\n');
+    }
+
+    ker::net::wki::WkiResourceDiagCounts resource_counts{};
+    std::array<ker::net::wki::WkiResourceDiagRow, ker::net::wki::WKI_RESOURCE_DIAG_MAX> resource_rows{};
+    size_t const RESOURCE_ROW_COUNT =
+        ker::net::wki::wki_resource_diag_snapshot(resource_rows.data(), resource_rows.size(), &resource_counts);
+    append_sconst(p, end, "wki_resource_counts discovered=");
+    append_dec64(p, end, resource_counts.discovered);
+    append_sconst(p, end, " pending_vfs_mounts=");
+    append_dec64(p, end, resource_counts.pending_vfs_mounts);
+    append_sconst(p, end, " pending_net_attaches=");
+    append_dec64(p, end, resource_counts.pending_net_attaches);
+    append_sconst(p, end, " pending_rx=");
+    append_dec64(p, end, resource_counts.pending_rx);
+    append_sconst(p, end, " truncated=");
+    append_dec64(p, end, resource_counts.truncated);
+    append_char(p, end, '\n');
+    for (size_t i = 0; i < RESOURCE_ROW_COUNT; ++i) {
+        const auto& row = resource_rows.at(i);
+        append_sconst(p, end, "wki_resource kind=");
+        append_sconst(p, end, resource_diag_kind_name(row.kind));
+        append_sconst(p, end, " node=");
+        append_hex16(p, end, row.node_id);
+        append_sconst(p, end, " type=");
+        append_sconst(p, end, ipc_resource_type_name(static_cast<uint16_t>(row.resource_type)));
+        append_sconst(p, end, " id=");
+        append_dec64(p, end, row.resource_id);
+        append_sconst(p, end, " generation=");
+        append_dec64(p, end, row.generation);
+        append_sconst(p, end, " owner_boot=");
+        append_dec64(p, end, row.owner_incarnation.owner_boot_epoch);
+        append_sconst(p, end, " incarnation=");
+        append_dec64(p, end, row.owner_incarnation.resource_incarnation);
+        append_sconst(p, end, " flags=");
+        append_dec64(p, end, row.flags);
+        append_sconst(p, end, " valid=");
+        append_bool01(p, end, row.valid);
+        append_sconst(p, end, " force_remount=");
+        append_bool01(p, end, row.force_remount);
+        append_sconst(p, end, " retry=");
+        append_dec64(p, end, row.retry_count);
+        append_sconst(p, end, " next_attempt_us=");
+        append_dec64(p, end, row.next_attempt_us);
+        append_sconst(p, end, " msg_type=");
+        append_dec64(p, end, static_cast<uint8_t>(row.msg_type));
+        append_sconst(p, end, " ch=");
+        append_dec64(p, end, row.channel_id);
+        append_sconst(p, end, " ch_gen=");
+        append_dec64(p, end, row.channel_generation);
+        append_sconst(p, end, " seq=");
+        append_dec64(p, end, row.sequence);
+        append_sconst(p, end, " payload_len=");
+        append_dec64(p, end, row.payload_len);
+        append_char(p, end, '\n');
+    }
+
+    auto* net_proxy_rows = new (std::nothrow) ker::net::wki::WkiRemoteNetDiagRow[ker::net::wki::WKI_REMOTE_NET_DIAG_MAX];
+    if (net_proxy_rows != nullptr) {
+        size_t net_proxy_total = 0;
+        size_t const NET_PROXY_COUNT =
+            ker::net::wki::wki_remote_net_diag_snapshot(net_proxy_rows, ker::net::wki::WKI_REMOTE_NET_DIAG_MAX, &net_proxy_total);
+        append_sconst(p, end, "wki_net_proxy_counts total=");
+        append_dec64(p, end, net_proxy_total);
+        append_sconst(p, end, " returned=");
+        append_dec64(p, end, NET_PROXY_COUNT);
+        append_sconst(p, end, " truncated=");
+        append_bool01(p, end, net_proxy_total > NET_PROXY_COUNT);
+        append_char(p, end, '\n');
+        for (size_t i = 0; i < NET_PROXY_COUNT; ++i) {
+            const auto& row = net_proxy_rows[i];  // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
+            append_sconst(p, end, "wki_net_proxy owner=");
+            append_hex16(p, end, row.owner_node);
+            append_sconst(p, end, " resource=");
+            append_dec64(p, end, row.resource_id);
+            append_sconst(p, end, " generation=");
+            append_dec64(p, end, row.resource_generation);
+            append_sconst(p, end, " ch=");
+            append_dec64(p, end, row.assigned_channel);
+            append_sconst(p, end, " ch_gen=");
+            append_dec64(p, end, row.channel_generation);
+            append_sconst(p, end, " refs=");
+            append_dec64(p, end, row.refs);
+            append_sconst(p, end, " active=");
+            append_bool01(p, end, row.active);
+            append_sconst(p, end, " attaching=");
+            append_bool01(p, end, row.attaching);
+            append_sconst(p, end, " registered=");
+            append_bool01(p, end, row.netdev_registered);
+            append_sconst(p, end, " published=");
+            append_bool01(p, end, row.ever_published);
+            append_sconst(p, end, " epoch_reset=");
+            append_bool01(p, end, row.epoch_reset_pending);
+            append_sconst(p, end, " cleanup_started=");
+            append_bool01(p, end, row.cleanup_started);
+            append_sconst(p, end, " cleanup_complete=");
+            append_bool01(p, end, row.cleanup_complete);
+            append_sconst(p, end, " retiring=");
+            append_bool01(p, end, row.retiring);
+            append_sconst(p, end, " detail_complete=");
+            append_bool01(p, end, row.detail_complete);
+            append_sconst(p, end, " op_pending=");
+            append_bool01(p, end, row.op_pending);
+            append_sconst(p, end, " op_id=");
+            append_dec64(p, end, row.op_expected_id);
+            append_sconst(p, end, " op_seq=");
+            append_dec64(p, end, row.op_expected_seq);
+            append_sconst(p, end, " op_waiter=");
+            append_bool01(p, end, row.op_waiter_owned);
+            append_sconst(p, end, " attach_pending=");
+            append_bool01(p, end, row.attach_pending);
+            append_sconst(p, end, " attach_waiter=");
+            append_bool01(p, end, row.attach_waiter_owned);
+            append_sconst(p, end, " attach_cookie=");
+            append_dec64(p, end, row.attach_cookie);
+            append_sconst(p, end, " expected_cookie=");
+            append_dec64(p, end, row.attach_expected_cookie);
+            append_sconst(p, end, " peer_boot=");
+            append_dec64(p, end, row.binding_peer_boot_epoch);
+            append_sconst(p, end, " detach_pending=");
+            append_bool01(p, end, row.detach_pending);
+            append_sconst(p, end, " detach_retry=");
+            append_bool01(p, end, row.detach_retry_in_progress);
+            append_sconst(p, end, " detach_cookie=");
+            append_dec64(p, end, row.detach_attach_cookie);
+            append_sconst(p, end, " detach_boot=");
+            append_dec64(p, end, row.detach_peer_boot_epoch);
+            append_sconst(p, end, " credits=");
+            append_dec64(p, end, row.rx_credits_remaining);
+            append_sconst(p, end, " rx_packets=");
+            append_dec64(p, end, row.rx_packets);
+            append_sconst(p, end, " tx_packets=");
+            append_dec64(p, end, row.tx_packets);
+            append_sconst(p, end, " drops=");
+            append_dec64(p, end, row.rx_dropped + row.tx_dropped);
+            append_char(p, end, '\n');
+        }
+        delete[] net_proxy_rows;
+    } else {
+        append_sconst(p, end, "wki_net_proxy_counts allocation_failed=1\n");
+    }
+
+    auto* block_proxy_rows = new (std::nothrow) ker::net::wki::WkiDevProxyDiagRow[ker::net::wki::WKI_DEV_PROXY_DIAG_MAX];
+    if (block_proxy_rows != nullptr) {
+        size_t block_proxy_total = 0;
+        size_t const BLOCK_PROXY_COUNT =
+            ker::net::wki::wki_dev_proxy_diag_snapshot(block_proxy_rows, ker::net::wki::WKI_DEV_PROXY_DIAG_MAX, &block_proxy_total);
+        append_sconst(p, end, "wki_block_proxy_counts total=");
+        append_dec64(p, end, block_proxy_total);
+        append_sconst(p, end, " returned=");
+        append_dec64(p, end, BLOCK_PROXY_COUNT);
+        append_sconst(p, end, " truncated=");
+        append_bool01(p, end, block_proxy_total > BLOCK_PROXY_COUNT);
+        append_char(p, end, '\n');
+        for (size_t i = 0; i < BLOCK_PROXY_COUNT; ++i) {
+            const auto& row = block_proxy_rows[i];  // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
+            append_sconst(p, end, "wki_block_proxy owner=");
+            append_hex16(p, end, row.owner_node);
+            append_sconst(p, end, " resource=");
+            append_dec64(p, end, row.resource_id);
+            append_sconst(p, end, " generation=");
+            append_dec64(p, end, row.resource_generation);
+            append_sconst(p, end, " owner_boot=");
+            append_dec64(p, end, row.binding_incarnation.owner_boot_epoch);
+            append_sconst(p, end, " incarnation=");
+            append_dec64(p, end, row.binding_incarnation.resource_incarnation);
+            append_sconst(p, end, " ch=");
+            append_dec64(p, end, row.assigned_channel);
+            append_sconst(p, end, " ch_gen=");
+            append_dec64(p, end, row.channel_generation);
+            append_sconst(p, end, " lifecycle_detail=");
+            append_bool01(p, end, row.lifecycle_detail_complete);
+            append_sconst(p, end, " io_detail=");
+            append_bool01(p, end, row.io_detail_complete);
+            append_sconst(p, end, " active=");
+            append_bool01(p, end, row.active);
+            append_sconst(p, end, " fenced=");
+            append_bool01(p, end, row.fenced);
+            append_sconst(p, end, " published=");
+            append_bool01(p, end, row.ever_published);
+            append_sconst(p, end, " epoch_reset=");
+            append_bool01(p, end, row.epoch_reset_pending);
+            append_sconst(p, end, " cleanup=");
+            append_bool01(p, end, row.cleanup_in_progress);
+            append_sconst(p, end, " resume_pending=");
+            append_bool01(p, end, row.resume_pending);
+            append_sconst(p, end, " resume_active=");
+            append_bool01(p, end, row.resume_in_progress);
+            append_sconst(p, end, " resume_after_detach=");
+            append_bool01(p, end, row.resume_after_detach);
+            append_sconst(p, end, " detach_confirmed=");
+            append_bool01(p, end, row.resume_detach_confirmed);
+            append_sconst(p, end, " op_pending=");
+            append_bool01(p, end, row.op_pending);
+            append_sconst(p, end, " op_id=");
+            append_dec64(p, end, row.op_expected_id);
+            append_sconst(p, end, " op_seq=");
+            append_dec64(p, end, row.op_expected_seq);
+            append_sconst(p, end, " op_waiter=");
+            append_bool01(p, end, row.op_waiter_owned);
+            append_sconst(p, end, " attach_pending=");
+            append_bool01(p, end, row.attach_pending);
+            append_sconst(p, end, " attach_waiter=");
+            append_bool01(p, end, row.attach_waiter_owned);
+            append_sconst(p, end, " binding_cookie=");
+            append_dec64(p, end, row.binding_attach_cookie);
+            append_sconst(p, end, " detach_pending=");
+            append_bool01(p, end, row.detach_pending);
+            append_sconst(p, end, " detach_cookie=");
+            append_dec64(p, end, row.detach_attach_cookie);
+            append_sconst(p, end, " rdma=");
+            append_bool01(p, end, row.rdma_attached);
+            append_sconst(p, end, " roce=");
+            append_bool01(p, end, row.rdma_roce);
+            append_sconst(p, end, " zone=");
+            append_dec64(p, end, row.rdma_zone_id);
+            append_sconst(p, end, " data_slots=");
+            append_hex64(p, end, row.data_slot_bitmap);
+            append_sconst(p, end, " tags=");
+            append_hex64(p, end, row.tag_bitmap);
+            append_block_ring_diag(p, end, row.ring_geometry, row.ring_indices, row.ring_geometry_valid, row.ring_indices_valid);
+            append_sconst(p, end, " bulk=");
+            append_bool01(p, end, row.bulk_capable);
+            append_sconst(p, end, " bulk_max=");
+            append_dec64(p, end, row.bulk_max_transfer);
+            append_char(p, end, '\n');
+        }
+        delete[] block_proxy_rows;
+    } else {
+        append_sconst(p, end, "wki_block_proxy_counts allocation_failed=1\n");
+    }
+
+    auto* server_rows = new (std::nothrow) ker::net::wki::WkiDevServerDiagRow[ker::net::wki::WKI_DEV_SERVER_DIAG_MAX];
+    if (server_rows != nullptr) {
+        size_t server_total = 0;
+        size_t const SERVER_COUNT =
+            ker::net::wki::wki_dev_server_diag_snapshot(server_rows, ker::net::wki::WKI_DEV_SERVER_DIAG_MAX, &server_total);
+        append_sconst(p, end, "wki_server_binding_counts total=");
+        append_dec64(p, end, server_total);
+        append_sconst(p, end, " returned=");
+        append_dec64(p, end, SERVER_COUNT);
+        append_sconst(p, end, " truncated=");
+        append_bool01(p, end, server_total > SERVER_COUNT);
+        append_char(p, end, '\n');
+        for (size_t i = 0; i < SERVER_COUNT; ++i) {
+            const auto& row = server_rows[i];  // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
+            append_sconst(p, end, "wki_server_binding consumer=");
+            append_hex16(p, end, row.consumer_node);
+            append_sconst(p, end, " type=");
+            append_sconst(p, end, ipc_resource_type_name(static_cast<uint16_t>(row.resource_type)));
+            append_sconst(p, end, " resource=");
+            append_dec64(p, end, row.resource_id);
+            append_sconst(p, end, " owner_boot=");
+            append_dec64(p, end, row.resource_incarnation.owner_boot_epoch);
+            append_sconst(p, end, " incarnation=");
+            append_dec64(p, end, row.resource_incarnation.resource_incarnation);
+            append_sconst(p, end, " cookie=");
+            append_dec64(p, end, row.attach_cookie);
+            append_sconst(p, end, " ch=");
+            append_dec64(p, end, row.assigned_channel);
+            append_sconst(p, end, " ch_gen=");
+            append_dec64(p, end, row.channel_generation);
+            append_sconst(p, end, " refs=");
+            append_dec64(p, end, row.refs);
+            append_sconst(p, end, " active=");
+            append_bool01(p, end, row.active);
+            append_sconst(p, end, " retiring=");
+            append_bool01(p, end, row.retiring);
+            append_sconst(p, end, " epoch_reset=");
+            append_bool01(p, end, row.epoch_reset_pending);
+            append_sconst(p, end, " cleanup_pending=");
+            append_bool01(p, end, row.detach_cleanup_pending);
+            append_sconst(p, end, " cleanup_claimed=");
+            append_bool01(p, end, row.detach_cleanup_claimed);
+            append_sconst(p, end, " readonly=");
+            append_bool01(p, end, row.block_read_only);
+            append_sconst(p, end, " writer_lease=");
+            append_bool01(p, end, row.block_writer_lease_owned);
+            append_sconst(p, end, " rdma=");
+            append_bool01(p, end, row.blk_rdma_active);
+            append_sconst(p, end, " roce=");
+            append_bool01(p, end, row.blk_roce);
+            append_sconst(p, end, " zone_pending=");
+            append_bool01(p, end, row.blk_zone_pending);
+            append_sconst(p, end, " sq_notified=");
+            append_bool01(p, end, row.blk_sq_notified);
+            append_sconst(p, end, " poll_active=");
+            append_bool01(p, end, row.blk_poll_active);
+            append_sconst(p, end, " zone=");
+            append_dec64(p, end, row.blk_zone_id);
+            append_sconst(p, end, " ring_stable=");
+            append_bool01(p, end, row.ring_snapshot_stable);
+            append_block_ring_diag(p, end, row.ring_geometry, row.ring_indices, row.ring_geometry_valid, row.ring_indices_valid);
+            append_sconst(p, end, " vfs_anchor=");
+            append_bool01(p, end, row.vfs_lane_anchor);
+            append_sconst(p, end, " export_revision=");
+            append_dec64(p, end, row.vfs_export_publication_revision);
+            append_sconst(p, end, " seen_revision=");
+            append_dec64(p, end, row.vfs_export_revision_seen);
+            append_sconst(p, end, " nic_open=");
+            append_bool01(p, end, row.net_nic_opened);
+            append_sconst(p, end, " net_credits=");
+            append_dec64(p, end, row.net_rx_credits);
+            append_char(p, end, '\n');
+        }
+        delete[] server_rows;
+    } else {
+        append_sconst(p, end, "wki_server_binding_counts allocation_failed=1\n");
     }
 
     ker::net::wki::WkiRemoteVfsServerDiag vfs_server{};
@@ -3816,16 +4696,74 @@ auto generate_wki_netdiag(char* buf, size_t bufsz) -> size_t {
         append_dec64(p, end, proxy.resource_id);
         append_sconst(p, end, " ch=");
         append_dec64(p, end, proxy.assigned_channel);
+        append_sconst(p, end, " ch_gen=");
+        append_dec64(p, end, proxy.assigned_channel_generation);
+        append_sconst(p, end, " res_gen=");
+        append_dec64(p, end, proxy.resource_generation);
+        append_sconst(p, end, " owner_boot=");
+        append_dec64(p, end, proxy.owner_boot_epoch);
+        append_sconst(p, end, " incarnation=");
+        append_dec64(p, end, proxy.resource_incarnation);
+        append_sconst(p, end, " binding_boot=");
+        append_dec64(p, end, proxy.binding_peer_boot_epoch);
+        append_sconst(p, end, " group=");
+        append_dec64(p, end, proxy.mount_group_id);
+        append_sconst(p, end, " lane=");
+        append_dec64(p, end, proxy.lane_index);
+        append_sconst(p, end, " lanes=");
+        append_dec64(p, end, proxy.lane_count);
+        append_sconst(p, end, " anchor=");
+        append_bool01(p, end, proxy.lane_anchor);
+        append_sconst(p, end, " lanes_ready=");
+        append_bool01(p, end, proxy.lanes_ready);
         append_sconst(p, end, " active=");
         append_bool01(p, end, proxy.active);
+        append_sconst(p, end, " epoch_reset=");
+        append_bool01(p, end, proxy.epoch_reset_pending);
         append_sconst(p, end, " op_pending=");
         append_bool01(p, end, proxy.op_pending);
         append_sconst(p, end, " op_id=");
         append_dec64(p, end, proxy.op_expected_id);
         append_sconst(p, end, " op_seq=");
         append_dec64(p, end, proxy.op_expected_seq);
+        append_sconst(p, end, " op_gen=");
+        append_dec64(p, end, proxy.op_generation);
+        append_sconst(p, end, " op_waiter=");
+        append_dec64(p, end, proxy.op_waiter_pid);
+        append_sconst(p, end, " retiring_waiter=");
+        append_dec64(p, end, proxy.op_retiring_waiter_pid);
+        append_sconst(p, end, " slot_waiters=");
+        append_dec64(p, end, proxy.op_slot_waiter_count);
         append_sconst(p, end, " attach_pending=");
         append_bool01(p, end, proxy.attach_pending);
+        append_sconst(p, end, " attach_cookie=");
+        append_dec64(p, end, proxy.attach_expected_cookie);
+        append_sconst(p, end, " binding_cookie=");
+        append_dec64(p, end, proxy.binding_attach_cookie);
+        append_sconst(p, end, " detach_pending=");
+        append_bool01(p, end, proxy.detach_pending);
+        append_sconst(p, end, " detach_retry=");
+        append_bool01(p, end, proxy.detach_retry_in_progress);
+        append_sconst(p, end, " detach_boot=");
+        append_dec64(p, end, proxy.detach_peer_boot_epoch);
+        append_sconst(p, end, " open_refs=");
+        append_dec64(p, end, proxy.open_file_refs);
+        append_sconst(p, end, " lifecycle_refs=");
+        append_dec64(p, end, proxy.lifecycle_refs);
+        append_sconst(p, end, " destroy_when_idle=");
+        append_bool01(p, end, proxy.destroy_when_idle);
+        append_sconst(p, end, " mounted=");
+        append_bool01(p, end, proxy.mount_configured);
+        append_sconst(p, end, " mount_released=");
+        append_bool01(p, end, proxy.mount_released);
+        append_sconst(p, end, " resources_releasing=");
+        append_bool01(p, end, proxy.resources_releasing);
+        append_sconst(p, end, " resources_released=");
+        append_bool01(p, end, proxy.resources_released);
+        append_sconst(p, end, " rdma=");
+        append_bool01(p, end, proxy.rdma_capable);
+        append_sconst(p, end, " bulk_rdma=");
+        append_bool01(p, end, proxy.bulk_rdma_capable);
         append_sconst(p, end, " mount=");
         append_sconst(p, end, proxy.local_mount_path.data());
         append_char(p, end, '\n');
@@ -3836,10 +4774,119 @@ auto generate_wki_netdiag(char* buf, size_t bufsz) -> size_t {
         append_char(p, end, '\n');
     }
 
-    std::array<ker::net::wki::WkiChannelDiag, ker::net::wki::WKI_CHANNEL_DIAG_MAX> channels{};
-    size_t const CHANNEL_COUNT = ker::net::wki::wki_channel_diag_snapshot(channels.data(), channels.size());
+    auto* peers = new (std::nothrow) ker::net::wki::WkiPeerDiag[ker::net::wki::WKI_PEER_DIAG_MAX];
+    if (peers != nullptr) {
+        size_t const PEER_COUNT = ker::net::wki::wki_peer_diag_snapshot(peers, ker::net::wki::WKI_PEER_DIAG_MAX);
+        for (size_t i = 0; i < PEER_COUNT; ++i) {
+            const auto& peer = peers[i];  // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
+            append_sconst(p, end, "wki_peer_lifecycle peer=");
+            append_hex16(p, end, peer.node_id);
+            append_sconst(p, end, " state=");
+            append_sconst(p, end, peer_state_name(peer.state));
+            append_sconst(p, end, " direct=");
+            append_bool01(p, end, peer.direct);
+            append_sconst(p, end, " next_hop=");
+            append_hex16(p, end, peer.next_hop);
+            append_sconst(p, end, " hops=");
+            append_dec64(p, end, peer.hop_count);
+            append_sconst(p, end, " local_channel_epoch=");
+            append_dec64(p, end, peer.local_channel_epoch);
+            append_sconst(p, end, " remote_channel_epoch=");
+            append_dec64(p, end, peer.remote_channel_epoch);
+            append_sconst(p, end, " remote_boot_epoch=");
+            append_dec64(p, end, peer.remote_boot_epoch);
+            append_sconst(p, end, " replacement=");
+            append_hex16(p, end, peer.replacement_node_id);
+            append_sconst(p, end, " lifecycle=");
+            append_dec64(p, end, peer.lifecycle_state);
+            append_sconst(p, end, " compute_cleanup=");
+            append_bool01(p, end, peer.compute_reset_cleanup_pending);
+            append_sconst(p, end, " vfs_rebind=");
+            append_bool01(p, end, peer.vfs_reset_rebind_pending);
+            append_sconst(p, end, " block_resume=");
+            append_bool01(p, end, peer.block_resume_pending);
+            append_sconst(p, end, " invalidate_discovery=");
+            append_bool01(p, end, peer.vfs_reset_invalidate_discovery);
+            append_sconst(p, end, " owner_reboot=");
+            append_bool01(p, end, peer.vfs_reset_owner_reboot_proven);
+            append_sconst(p, end, " advert_request=");
+            append_dec64(p, end, peer.resource_advert_request);
+            append_sconst(p, end, " advert_active=");
+            append_dec64(p, end, peer.resource_advert_active_request);
+            append_sconst(p, end, " advert_index=");
+            append_dec64(p, end, peer.resource_advert_index);
+            append_sconst(p, end, " advert_stage=");
+            append_dec64(p, end, peer.resource_advert_stage);
+            append_sconst(p, end, " heartbeat_us=");
+            append_dec64(p, end, peer.last_heartbeat);
+            append_sconst(p, end, " rx_us=");
+            append_dec64(p, end, peer.last_rx_activity);
+            append_sconst(p, end, " tx_us=");
+            append_dec64(p, end, peer.last_tx_activity);
+            append_sconst(p, end, " fence_defer_us=");
+            append_dec64(p, end, peer.fence_defer_until_us);
+            append_sconst(p, end, " connected_us=");
+            append_dec64(p, end, peer.connected_time);
+            append_sconst(p, end, " hello_us=");
+            append_dec64(p, end, peer.hello_sent_time);
+            append_char(p, end, '\n');
+        }
+        delete[] peers;
+    } else {
+        append_sconst(p, end, "wki_peer_lifecycle allocation_failed=1\n");
+    }
+
+    auto* waits = new (std::nothrow) ker::net::wki::WkiWaitDiag[ker::net::wki::WKI_WAIT_DIAG_MAX];
+    if (waits != nullptr) {
+        size_t const WAIT_COUNT = ker::net::wki::wki_wait_diag_snapshot(waits, ker::net::wki::WKI_WAIT_DIAG_MAX);
+        for (size_t i = 0; i < WAIT_COUNT; ++i) {
+            const auto& wait = waits[i];  // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
+            append_sconst(p, end, "wki_wait entry=");
+            append_hex64(p, end, wait.entry_address);
+            append_sconst(p, end, " state=");
+            append_dec64(p, end, wait.state);
+            append_sconst(p, end, " retirement_pending=");
+            append_bool01(p, end, wait.retirement_pending);
+            append_sconst(p, end, " task=");
+            append_dec64(p, end, wait.task_pid);
+            append_sconst(p, end, " deadline_us=");
+            append_dec64(p, end, wait.deadline_us);
+            append_sconst(p, end, " result=");
+            append_sdec64(p, end, wait.result);
+            append_sconst(p, end, " name=");
+            append_sconst(p, end, wait.diag_name.data());
+            append_sconst(p, end, " callsite=");
+            append_hex64(p, end, wait.diag_callsite);
+            append_sconst(p, end, " arg0=");
+            append_dec64(p, end, wait.diag_arg0);
+            append_sconst(p, end, " arg1=");
+            append_dec64(p, end, wait.diag_arg1);
+            append_sconst(p, end, " resource=");
+            append_dec64(p, end, wait.diag_resource_id);
+            append_sconst(p, end, " op=");
+            append_dec64(p, end, wait.diag_op_id);
+            append_sconst(p, end, " peer=");
+            append_hex16(p, end, wait.diag_peer);
+            append_sconst(p, end, " ch=");
+            append_dec64(p, end, wait.diag_channel);
+            append_sconst(p, end, " cookie=");
+            append_dec64(p, end, wait.diag_cookie);
+            append_char(p, end, '\n');
+        }
+        delete[] waits;
+    } else {
+        append_sconst(p, end, "wki_wait allocation_failed=1\n");
+    }
+
+    auto* channels = new (std::nothrow) ker::net::wki::WkiChannelDiag[ker::net::wki::WKI_CHANNEL_DIAG_MAX];
+    if (channels == nullptr) {
+        append_sconst(p, end, "wki_channel allocation_failed=1\n");
+        *p = '\0';
+        return static_cast<size_t>(p - buf);
+    }
+    size_t const CHANNEL_COUNT = ker::net::wki::wki_channel_diag_snapshot(channels, ker::net::wki::WKI_CHANNEL_DIAG_MAX);
     for (size_t i = 0; i < CHANNEL_COUNT; ++i) {
-        const auto& ch = channels.at(i);
+        const auto& ch = channels[i];  // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
         append_sconst(p, end, "wki_channel peer=");
         append_hex16(p, end, ch.peer_node);
         append_sconst(p, end, " state=");
@@ -3856,6 +4903,8 @@ auto generate_wki_netdiag(char* buf, size_t bufsz) -> size_t {
         append_sconst(p, end, priority_name(ch.priority));
         append_sconst(p, end, " active=");
         append_bool01(p, end, ch.active);
+        append_sconst(p, end, " generation=");
+        append_dec64(p, end, ch.generation);
         append_sconst(p, end, " tx_seq=");
         append_dec64(p, end, ch.tx_seq);
         append_sconst(p, end, " tx_ack=");
@@ -3872,8 +4921,32 @@ auto generate_wki_netdiag(char* buf, size_t bufsz) -> size_t {
         append_dec64(p, end, ch.rx_credits);
         append_sconst(p, end, " retransmit_count=");
         append_dec64(p, end, ch.retransmit_count);
+        append_sconst(p, end, " retransmit_active=");
+        append_bool01(p, end, ch.retransmit_in_progress);
+        append_sconst(p, end, " retransmit_head_seq=");
+        append_dec64(p, end, ch.retransmit_head_seq);
+        append_sconst(p, end, " retransmit_head_type=");
+        append_dec64(p, end, ch.retransmit_head_type);
+        append_sconst(p, end, " retransmit_head_retries=");
+        append_dec64(p, end, ch.retransmit_head_retries);
+        append_sconst(p, end, " retransmit_rto_us=");
+        append_dec64(p, end, ch.retransmit_rto_us);
+        append_sconst(p, end, " retransmit_deadline_us=");
+        append_dec64(p, end, ch.retransmit_deadline_us);
+        append_sconst(p, end, " retransmit_head_send_us=");
+        append_dec64(p, end, ch.retransmit_head_send_time_us);
+        append_sconst(p, end, " fast_retransmit_seq=");
+        append_dec64(p, end, ch.fast_retransmit_seq);
+        append_sconst(p, end, " dup_acks=");
+        append_dec64(p, end, ch.duplicate_ack_count);
         append_sconst(p, end, " reorder_count=");
         append_dec64(p, end, ch.reorder_count);
+        append_sconst(p, end, " reorder_head_seq=");
+        append_dec64(p, end, ch.reorder_head_seq);
+        append_sconst(p, end, " reorder_head_type=");
+        append_dec64(p, end, ch.reorder_head_type);
+        append_sconst(p, end, " dispatch_waiters=");
+        append_dec64(p, end, ch.rx_dispatch_waiter_count);
         append_sconst(p, end, " retransmits=");
         append_dec64(p, end, ch.retransmits);
         append_sconst(p, end, " bytes_tx=");
@@ -3882,12 +4955,17 @@ auto generate_wki_netdiag(char* buf, size_t bufsz) -> size_t {
         append_dec64(p, end, ch.bytes_received);
         append_char(p, end, '\n');
     }
-    if (CHANNEL_COUNT == channels.size()) {
+    if (CHANNEL_COUNT == ker::net::wki::WKI_CHANNEL_DIAG_MAX) {
         append_sconst(p, end, "wki_channel_truncated max=");
-        append_dec64(p, end, channels.size());
+        append_dec64(p, end, ker::net::wki::WKI_CHANNEL_DIAG_MAX);
         append_char(p, end, '\n');
     }
+    delete[] channels;
 
+    // The host runner requires this terminal row. If the bounded append
+    // buffer fills first, the otherwise well-formed prefix is explicitly
+    // incomplete rather than being mistaken for a full state snapshot.
+    append_sconst(p, end, "wki_netdiag_end complete=1\n");
     *p = '\0';
     return static_cast<size_t>(p - buf);
 }
@@ -4537,6 +5615,7 @@ auto procfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
                                pfd->node.type == ProcNodeType::KCONTSTAT_FILE || pfd->node.type == ProcNodeType::KIPCSTAT_FILE ||
                                pfd->node.type == ProcNodeType::WKI_NETDIAG_FILE || pfd->node.type == ProcNodeType::WKI_PIPES_FILE ||
                                pfd->node.type == ProcNodeType::CPU_STAT_FILE);
+        bool const IS_LARGE_WKI = pfd->node.type == ProcNodeType::WKI_CHAOS_FILE || pfd->node.type == ProcNodeType::WKI_NETDIAG_FILE;
         bool const IS_MEMACC =
             (pfd->node.type == ProcNodeType::MEMACC_SUMMARY_FILE || pfd->node.type == ProcNodeType::MEMACC_ZONES_FILE ||
              pfd->node.type == ProcNodeType::MEMACC_PROCS_FILE || pfd->node.type == ProcNodeType::MEMACC_DEAD_FILE ||
@@ -4549,7 +5628,7 @@ auto procfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
              pfd->node.type == ProcNodeType::MEMACC_RECLAIM_FILE_MMAP_CACHE_FILE ||
              pfd->node.type == ProcNodeType::MEMACC_RECLAIM_COORDINATOR_FILE);
         size_t alloc_sz = MAX_PROCFS_BUF;
-        if (IS_MEMACC || IS_RUNTIME_MAP) {
+        if (IS_MEMACC || IS_RUNTIME_MAP || IS_LARGE_WKI) {
             alloc_sz = MAX_MEMACC_BUF;
         } else if (IS_KPERF) {
             alloc_sz = MAX_KPERF_BUF;
@@ -4630,10 +5709,16 @@ auto procfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
                 pfd->content_len = generate_wki_peers(pfd->content, MAX_PROCFS_BUF);
                 break;
             case ProcNodeType::WKI_NETDIAG_FILE:
-                pfd->content_len = generate_wki_netdiag(pfd->content, MAX_KPERF_BUF);
+                pfd->content_len = generate_wki_netdiag(pfd->content, MAX_MEMACC_BUF);
                 break;
             case ProcNodeType::WKI_PIPES_FILE:
                 pfd->content_len = ker::vfs::vfs_generate_local_pipe_diag(pfd->content, MAX_KPERF_BUF);
+                break;
+            case ProcNodeType::WKI_CHAOS_FILE:
+                pfd->content_len = generate_wki_chaos(pfd->content, MAX_MEMACC_BUF);
+                break;
+            case ProcNodeType::WKI_CHAOS_WORKLOAD_FILE:
+                pfd->content_len = ker::net::wki::wki_chaos_workload_snapshot(pfd->content, MAX_PROCFS_BUF);
                 break;
             case ProcNodeType::MEMACC_SUMMARY_FILE:
                 pfd->content_len = generate_memacc_summary(pfd->content, MAX_MEMACC_BUF);
@@ -4976,6 +6061,48 @@ auto procfs_write(File* f, const void* buf, size_t count, size_t /*offset*/) -> 
         return -EINVAL;
     }
     auto* pfd = static_cast<ProcFileData*>(f->private_data);
+    if (pfd->node.type == ProcNodeType::WKI_CHAOS_WORKLOAD_FILE) {
+        if (count == 0) {
+            return 0;
+        }
+        int const RESULT = ker::net::wki::wki_chaos_workload_configure(static_cast<const char*>(buf), count);
+        if (RESULT < 0) {
+            return RESULT;
+        }
+        delete[] pfd->content;
+        pfd->content = nullptr;
+        pfd->content_len = 0;
+        return static_cast<ssize_t>(count);
+    }
+    if (pfd->node.type == ProcNodeType::WKI_CHAOS_FILE) {
+        if (count == 0) {
+            return 0;
+        }
+        const char* command = static_cast<const char*>(buf);
+        bool const ALWAYS_ALLOWED =
+            (count >= 5 && std::memcmp(command, "clear", 5) == 0) || (count >= 7 && std::memcmp(command, "disable", 7) == 0);
+        ker::net::wki::WkiChaosSnapshot snapshot{};
+        if (!ALWAYS_ALLOWED && (!ker::net::wki::wki_chaos_snapshot(&snapshot) || !snapshot.runtime_control_allowed)) {
+            return -EPERM;
+        }
+        int const RESULT = ker::net::wki::wki_chaos_configure(command, count);
+        if (RESULT != ker::net::wki::WKI_OK) {
+            if (RESULT == ker::net::wki::WKI_ERR_BUSY) {
+                return -EBUSY;
+            }
+            if (RESULT == ker::net::wki::WKI_ERR_NOT_FOUND) {
+                return -ENOENT;
+            }
+            if (RESULT == ker::net::wki::WKI_ERR_NO_MEM) {
+                return -ENOSPC;
+            }
+            return -EINVAL;
+        }
+        delete[] pfd->content;
+        pfd->content = nullptr;
+        pfd->content_len = 0;
+        return static_cast<ssize_t>(count);
+    }
     if (pfd->node.type == ProcNodeType::MEMACC_TRACK_PAGE_CALLERS_FILE || pfd->node.type == ProcNodeType::MEMACC_TRACK_KMALLOC_DEBUG_FILE) {
         return procfs_write_memacc_track(pfd->node.type, static_cast<const char*>(buf), count);
     }
@@ -5248,7 +6375,8 @@ auto procfs_fill_stat(File* f, Stat* statbuf, dev_t dev_id) -> int {
                pfd->node.type == ProcNodeType::CWD_LINK || pfd->node.type == ProcNodeType::ROOT_LINK ||
                pfd->node.type == ProcNodeType::FD_LINK) {
         statbuf->st_mode = S_IFLNK | 0777;
-    } else if (pfd->node.type == ProcNodeType::KPERFCTL_FILE || pfd->node.type == ProcNodeType::MEMACC_TRACK_PAGE_CALLERS_FILE ||
+    } else if (pfd->node.type == ProcNodeType::KPERFCTL_FILE || pfd->node.type == ProcNodeType::WKI_CHAOS_FILE ||
+               pfd->node.type == ProcNodeType::WKI_CHAOS_WORKLOAD_FILE || pfd->node.type == ProcNodeType::MEMACC_TRACK_PAGE_CALLERS_FILE ||
                pfd->node.type == ProcNodeType::MEMACC_TRACK_KMALLOC_DEBUG_FILE ||
                pfd->node.type == ProcNodeType::MEMACC_RECLAIM_BUFFER_CACHE_FILE ||
                pfd->node.type == ProcNodeType::MEMACC_RECLAIM_PACKET_POOL_FILE ||
@@ -5553,6 +6681,16 @@ auto procfs_open_path(const char* path, int flags, int mode) -> File* {
     // /proc/wki/pipes
     if (strcmp(path, "wki/pipes") == 0) {
         return make_file(ProcNodeType::WKI_PIPES_FILE, 0, false);
+    }
+
+    // /proc/wki/chaos
+    if (strcmp(path, "wki/chaos") == 0) {
+        return make_file(ProcNodeType::WKI_CHAOS_FILE, 0, false);
+    }
+
+    // /proc/wki/chaos_workload
+    if (strcmp(path, "wki/chaos_workload") == 0) {
+        return make_file(ProcNodeType::WKI_CHAOS_WORKLOAD_FILE, 0, false);
     }
 
     // /proc/memacc structured memory accounting diagnostics

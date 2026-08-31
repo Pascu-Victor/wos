@@ -9,70 +9,15 @@ root privileges are not required once WOS was launched with ``--no-setup``.
 from __future__ import annotations
 
 import argparse
-import json
-import socket
+import sys
 import time
 from pathlib import Path
-from typing import Any
 
+CLUSTER_DIR = Path(__file__).resolve().parents[1] / "cluster"
+if str(CLUSTER_DIR) not in sys.path:
+    sys.path.insert(0, str(CLUSTER_DIR))
 
-class QmpError(RuntimeError):
-    pass
-
-
-class QmpClient:
-    def __init__(self, path: Path, timeout: float):
-        self._socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self._socket.settimeout(timeout)
-        self._socket.connect(str(path))
-        self._stream = self._socket.makefile("rwb", buffering=0)
-        self._events: list[dict[str, Any]] = []
-        greeting = self._read_message()
-        if "QMP" not in greeting:
-            raise QmpError(f"invalid QMP greeting: {greeting!r}")
-        self._next_id = 1
-        self.execute("qmp_capabilities")
-
-    def close(self) -> None:
-        self._stream.close()
-        self._socket.close()
-
-    def _read_message(self) -> dict[str, Any]:
-        raw = self._stream.readline()
-        if not raw:
-            raise QmpError("QMP connection closed")
-        message = json.loads(raw)
-        if not isinstance(message, dict):
-            raise QmpError(f"invalid QMP message: {message!r}")
-        return message
-
-    def execute(self, command: str, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
-        request_id = self._next_id
-        self._next_id += 1
-        request: dict[str, Any] = {"execute": command, "id": request_id}
-        if arguments:
-            request["arguments"] = arguments
-        self._stream.write(json.dumps(request, separators=(",", ":")).encode() + b"\r\n")
-
-        while True:
-            response = self._read_message()
-            if response.get("id") != request_id:
-                if "event" in response:
-                    self._events.append(response)
-                continue
-            if "error" in response:
-                raise QmpError(f"{command} failed: {response['error']!r}")
-            return response
-
-    def wait_for_device_deleted(self, device_id: str, deadline: float) -> None:
-        while time.monotonic() < deadline:
-            message = self._events.pop(0) if self._events else self._read_message()
-            if message.get("event") != "DEVICE_DELETED":
-                continue
-            data = message.get("data", {})
-            if data.get("device") == device_id or data.get("path") == device_id:
-                return
-        raise QmpError(f"timed out waiting for DEVICE_DELETED for {device_id}")
+from qmp import QmpClient, QmpError  # noqa: E402, F401
 
 
 def add_usb_net(client: QmpClient, device_id: str, netdev_id: str, controller_id: str, mac: str) -> None:

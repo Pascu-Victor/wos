@@ -514,14 +514,16 @@ def require_remote_ipc_wait_handshake(source: str) -> None:
             fail(f"epoll-preclosed-hup helper is missing bounded HUP/EOF snippet: {snippet}")
 
 
-def require_remote_ipc_epoll_ctl_add_is_bounded(source: str) -> None:
-    body = parse_test_bodies(source)["test_remote_ipc_epoll_ctl_add"]
+def require_wki_epoll_owner_pin_is_bounded(source: str) -> None:
+    body = parse_test_bodies(source)["test_wki_epoll_owner_pinned_local"]
     for snippet in [
+        "gethostname(local_hostname.data(), local_hostname.size() - 1)",
+        'std::to_array("epoll-owner-local")',
         "waitpid_timeout(PID, &status, REMOTE_IPC_TIMEOUT_MS)",
         "int const READY = epoll_wait(EPFD, &ev, 1, 1000)",
     ]:
         if snippet not in body:
-            fail(f"test_remote_ipc_epoll_ctl_add is missing bounded wait snippet: {snippet}")
+            fail(f"test_wki_epoll_owner_pinned_local is missing bounded/pin snippet: {snippet}")
 
     forbidden = [
         "waitpid(PID, &status, 0)",
@@ -530,7 +532,7 @@ def require_remote_ipc_epoll_ctl_add_is_bounded(source: str) -> None:
     ]
     for snippet in forbidden:
         if snippet in body:
-            fail(f"test_remote_ipc_epoll_ctl_add still uses an unbounded wait: {snippet}")
+            fail(f"test_wki_epoll_owner_pinned_local still uses an unbounded wait: {snippet}")
 
 
 def require_non_waitpid_wake_tests_bound_child_waits(source: str) -> None:
@@ -795,7 +797,7 @@ RAW_IO_TEST_ALLOWLIST = {
     "test_pty_blocking_read_wake",
     "test_pty_cr_progress_write_coalesced",
     "test_pty_ansi_escape_transparency",
-    "test_remote_ipc_epoll_ctl_add",
+    "test_wki_epoll_owner_pinned_local",
     "test_remote_ipc_epoll_pipe_read_then_hup",
     "test_remote_ipc_epoll_wait_pipe_readable",
     "test_remote_ipc_pipe_parent_write",
@@ -945,7 +947,7 @@ def main() -> None:
     require_tcp_loopback_is_deadline_bounded(source)
     require_socket_setup_tests_are_deadline_bounded(source)
     require_remote_ipc_wait_handshake(source)
-    require_remote_ipc_epoll_ctl_add_is_bounded(source)
+    require_wki_epoll_owner_pin_is_bounded(source)
     require_non_waitpid_wake_tests_bound_child_waits(source)
     require_process_waitpid_tests_are_deadline_bounded(source)
     require_non_waitpid_wake_tests_bound_parent_reads(source)

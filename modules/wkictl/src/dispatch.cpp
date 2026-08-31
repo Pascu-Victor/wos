@@ -2,6 +2,7 @@
 
 #include <cstring>
 
+#include "wkictl/chaos.hpp"
 #include "wkictl/cli.hpp"
 #include "wkictl/perf.hpp"
 #include "wkictl/target.hpp"
@@ -33,6 +34,12 @@ auto run_wkictl(int argc, char** argv) -> int {
     }
     if (std::strcmp(argv[1], "perf") == 0) {
         return wkictl::handle_perf(argc, argv);
+    }
+    if (std::strcmp(argv[1], "chaos") == 0) {
+        return wkictl::handle_chaos(argc, argv);
+    }
+    if (std::strcmp(argv[1], "chaos-workload") == 0) {
+        return wkictl::handle_chaos_workload(argc, argv);
     }
     return wkictl::usage();
 }

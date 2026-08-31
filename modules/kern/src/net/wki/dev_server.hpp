@@ -1,10 +1,12 @@
 #pragma once
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <dev/block_device.hpp>
 #include <net/address.hpp>
 #include <net/netdevice.hpp>
+#include <net/wki/blk_ring.hpp>
 #include <net/wki/remotable.hpp>
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
@@ -15,6 +17,8 @@ struct PacketBuffer;
 }  // namespace ker::net
 
 namespace ker::net::wki {
+
+struct WkiChaosBlockKey;
 
 // -----------------------------------------------------------------------------
 // DevServerBinding - one per active remote consumer attachment
@@ -76,6 +80,7 @@ struct DevServerBinding {
     void* blk_zone_ptr = nullptr;
     bool blk_rdma_active = false;
     bool blk_zone_pending = false;               // deferred zone creation (runs outside RX handler)
+    bool blk_attach_ack_pending = false;         // advertised ring ACK waits until server_ready is published
     bool blk_roce = false;                       // true if zone is RoCE-backed (needs explicit sync)
     bool blk_sq_notified = false;                // set by post_handler, cleared after poll
     std::atomic<bool> blk_poll_active{false};    // guard against concurrent blk_ring_server_poll
@@ -148,6 +153,7 @@ struct DevServerBinding {
           blk_zone_ptr(o.blk_zone_ptr),
           blk_rdma_active(o.blk_rdma_active),
           blk_zone_pending(o.blk_zone_pending),
+          blk_attach_ack_pending(o.blk_attach_ack_pending),
           blk_roce(o.blk_roce),
           blk_sq_notified(o.blk_sq_notified),
           blk_poll_active(o.blk_poll_active.load(std::memory_order_relaxed)),
@@ -221,6 +227,7 @@ struct DevServerBinding {
             blk_zone_ptr = o.blk_zone_ptr;
             blk_rdma_active = o.blk_rdma_active;
             blk_zone_pending = o.blk_zone_pending;
+            blk_attach_ack_pending = o.blk_attach_ack_pending;
             blk_roce = o.blk_roce;
             blk_sq_notified = o.blk_sq_notified;
             blk_poll_active.store(o.blk_poll_active.load(std::memory_order_relaxed), std::memory_order_relaxed);
@@ -256,12 +263,56 @@ struct VfsWriteRegionInfo {
     WkiTransport* transport = nullptr;
 };
 
+constexpr size_t WKI_DEV_SERVER_DIAG_MAX = 128;
+
+struct WkiDevServerDiagRow {
+    uint16_t consumer_node = WKI_NODE_INVALID;
+    uint16_t assigned_channel = 0;
+    uint32_t channel_generation = 0;
+    ResourceType resource_type = ResourceType::BLOCK;
+    uint32_t resource_id = 0;
+    ResourceIncarnationToken resource_incarnation = {};
+    uint8_t attach_cookie = 0;
+    uint32_t refs = 0;
+    bool active = false;
+    bool retiring = false;
+    bool epoch_reset_pending = false;
+    bool detach_cleanup_pending = false;
+    bool detach_cleanup_claimed = false;
+    bool block_read_only = false;
+    bool block_writer_lease_owned = false;
+    bool blk_rdma_active = false;
+    bool blk_zone_pending = false;
+    bool blk_roce = false;
+    bool blk_sq_notified = false;
+    bool blk_poll_active = false;
+    uint32_t blk_zone_id = 0;
+    BlkRingGeometry ring_geometry = {};
+    BlkRingIndices ring_indices = {};
+    bool ring_snapshot_stable = false;
+    bool ring_geometry_valid = false;
+    bool ring_indices_valid = false;
+    bool vfs_lane_anchor = false;
+    uint64_t vfs_export_publication_revision = 0;
+    uint64_t vfs_export_revision_seen = 0;
+    bool net_nic_opened = false;
+    uint16_t net_rx_credits = 0;
+};
+
 // -----------------------------------------------------------------------------
 // Public API
 // -----------------------------------------------------------------------------
 
 // Initialize the device server subsystem. Called from wki_init().
 void wki_dev_server_init();
+
+// Bounded diagnostic copy of server-side attachment ownership and RDMA-ring
+// state. Rows are copied under the registry lock and never retain pointers.
+auto wki_dev_server_diag_snapshot(WkiDevServerDiagRow* rows, size_t capacity, size_t* total) -> size_t;
+
+// Deferred test-only block notification delivery. Re-resolves and retains the
+// exact copied binding identity before invoking the normal notification path.
+auto wki_dev_server_chaos_deliver_doorbell(const WkiChaosBlockKey& key) -> bool;
 
 // Detach all bindings for a non-connected peer. The caller must hold that
 // peer's lifecycle lease; the function joins every other binding cleanup owner
@@ -292,17 +343,17 @@ auto wki_dev_server_attach_blocked_by_pending_detach(const WkiHeader* hdr, const
 // Drain ACK-admitted explicit detaches in task context.
 void wki_dev_server_process_pending_detaches();
 
-enum class WkiVfsCloseRxAdmission : uint8_t {
+enum class WkiVfsOpRxAdmission : uint8_t {
     NOT_APPLICABLE,
     DEFERRED,
     RETRY,
 };
 
-// Admit a one-way read-only close into fixed storage and the exact
-// per-channel VFS worker FIFO before reliable RX publishes its ACK. RETRY
-// leaves the frame unconsumed when fixed capacity or a queue lock is busy.
-auto wki_dev_server_admit_async_vfs_close_rx(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len, WkiChannel* rx_channel,
-                                             uint32_t rx_channel_generation) -> WkiVfsCloseRxAdmission;
+// Admit every VFS request into bounded fixed storage and the exact per-channel
+// worker FIFO before reliable RX publishes its ACK. RETRY leaves the frame
+// unconsumed when fixed capacity or an admission lock is busy.
+auto wki_dev_server_admit_vfs_op_rx(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len, WkiChannel* rx_channel,
+                                    uint32_t rx_channel_generation) -> WkiVfsOpRxAdmission;
 void wki_dev_server_notify_deferred_vfs_op(const WkiHeader* hdr);
 
 // Pre-ACK VFS transition admission. Reliable RX acquires this before sequence
@@ -382,7 +433,9 @@ auto wki_dev_server_selftest_binding_lifecycle_flags() -> bool;
 auto wki_dev_server_selftest_attach_ack_failure_defers_cleanup() -> bool;
 auto wki_dev_server_selftest_detach_admission_lifecycle() -> bool;
 auto wki_dev_server_selftest_block_writer_lease_transfer() -> bool;
+auto wki_dev_server_selftest_block_attach_honors_disable_rdma() -> bool;
 auto wki_dev_server_selftest_async_vfs_close_uses_fixed_admission() -> bool;
+auto wki_dev_server_selftest_block_ops_use_fixed_admission() -> bool;
 #endif
 
 // -----------------------------------------------------------------------------

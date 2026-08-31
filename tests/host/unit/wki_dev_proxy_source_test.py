@@ -8,6 +8,10 @@ ROOT = Path(__file__).resolve().parents[3]
 DEV_PROXY_CPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "dev_proxy.cpp"
 DEV_PROXY_HPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "dev_proxy.hpp"
 DEV_SERVER_CPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "dev_server.cpp"
+CHAOS_CPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "chaos.cpp"
+CHAOS_MODEL_CPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "chaos_model.cpp"
+CHAOS_MODEL_HPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "chaos_model.hpp"
+BLK_RING_HPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "blk_ring.hpp"
 WKI_DEV_PROXY_KTEST = ROOT / "modules" / "kern" / "src" / "test" / "wki_dev_proxy_ktest.cpp"
 
 
@@ -186,7 +190,9 @@ def test_rdmaring_sq_space_waits_are_bounded() -> None:
     require_tokens(
         helper_body,
         [
-            "while (blk_sq_full(ring_hdr))",
+            "while (true)",
+            "proxy_ring_snapshot_valid(state, &geometry, &indices)",
+            "blk_ring_next_index(indices.sq_head, geometry.sq_depth)",
             "if (!proxy_block_active(state) || proxy_block_fenced(state))",
             "if (wki_now_us() >= deadline_us)",
             "rdma_drain_cq(state)",
@@ -195,8 +201,8 @@ def test_rdmaring_sq_space_waits_are_bounded() -> None:
         ],
         "bounded RDMA SQ-space wait helper",
     )
-    if source.count("while (blk_sq_full(ring_hdr))") != 1:
-        fail("dev proxy RDMA SQ-space waits must go through wait_for_rdma_sq_space")
+    if "blk_sq_full(" in source or "% ring_hdr->sq_depth" in source:
+        fail("dev proxy RDMA SQ-space waits must not trust peer-owned ring depth")
 
     for function in [
         "remote_block_read_rdma",
@@ -207,7 +213,7 @@ def test_rdmaring_sq_space_waits_are_bounded() -> None:
         "remote_block_bulk_write_rdma",
     ]:
         body = function_body(source, function)
-        if "wait_for_rdma_sq_space(state, ring_hdr, CHANNEL_IDENTITY, DEADLINE)" not in body:
+        if "wait_for_rdma_sq_space(state, CHANNEL_IDENTITY, DEADLINE)" not in body:
             fail(f"{function} must bound SQ-full waits with wait_for_rdma_sq_space")
 
 
@@ -628,20 +634,21 @@ def test_bulk_write_uses_server_pull_and_resume_restores_staging() -> None:
     if corrupting_push in re.sub(r"\s+", " ", write_body):
         fail("bulk write must not overwrite the server ring header with consumer staging data")
 
-    server_poll = function_body(DEV_SERVER_CPP.read_text(), "blk_ring_server_poll")
+    server_poll = re.sub(r"\s+", " ", function_body(DEV_SERVER_CPP.read_text(), "blk_ring_server_poll"))
     require_tokens(
         server_poll,
         [
-            "uint32_t const CONSUMER_RKEY = sqe->data_slot",
-            "rdma_read(binding->blk_rdma_transport, binding->consumer_node, CONSUMER_RKEY, 0, staging,",
-            "ker::dev::block_write(binding->block_dev, sqe->lba, sqe->block_count, staging)",
+            "BlkSqEntry const SQE",
+            "blk_validate_sq_entry(SQE, GEOMETRY)",
+            "rdma_read(binding->blk_rdma_transport, binding->consumer_node, SQE.data_slot, 0, staging, REQUEST.bytes)",
+            "ker::dev::block_write(binding->block_dev, SQE.lba, SQE.block_count, staging)",
         ],
         "bulk-write owner pull",
     )
     require_order(
         server_poll,
-        "rdma_read(binding->blk_rdma_transport, binding->consumer_node, CONSUMER_RKEY, 0, staging,",
-        "ker::dev::block_write(binding->block_dev, sqe->lba, sqe->block_count, staging)",
+        "rdma_read(binding->blk_rdma_transport, binding->consumer_node, SQE.data_slot, 0, staging, REQUEST.bytes)",
+        "ker::dev::block_write(binding->block_dev, SQE.lba, SQE.block_count, staging)",
         "owner pulls consumer staging before block write",
     )
 
@@ -664,6 +671,140 @@ def test_bulk_write_uses_server_pull_and_resume_restores_staging() -> None:
     )
 
 
+def test_block_chaos_hooks_preserve_descriptor_ownership_and_exact_lifetimes() -> None:
+    header = DEV_PROXY_HPP.read_text()
+    source = DEV_PROXY_CPP.read_text()
+    server = DEV_SERVER_CPP.read_text()
+    chaos = CHAOS_CPP.read_text()
+    model = CHAOS_MODEL_CPP.read_text()
+    model_header = CHAOS_MODEL_HPP.read_text()
+    ring = BLK_RING_HPP.read_text()
+
+    require_tokens(
+        header,
+        [
+            "std::atomic<uint32_t> chaos_doorbell_refs{0}",
+            "auto wki_dev_proxy_chaos_deliver_doorbell(const WkiChaosBlockKey& key) -> bool",
+        ],
+        "proxy delayed-doorbell retain",
+    )
+    require_tokens(
+        model_header,
+        [
+            "WKI_CHAOS_MAX_QUEUED_BLOCK_EVENTS = 8",
+            "WKI_CHAOS_BLOCK_SQE_BYTES = sizeof(BlkSqEntry)",
+            "uint64_t delivery_deadline_us = 0",
+        ],
+        "fixed block chaos bounds",
+    )
+    require_tokens(
+        ring,
+        [
+            'static_assert(sizeof(BlkSqEntry) == 24, "BlkSqEntry must be 24 bytes")',
+            "struct BlkSqEntry",
+        ],
+        "unchanged block descriptor ABI",
+    )
+
+    publish = function_body(source, "publish_block_sqe")
+    require_tokens(
+        publish,
+        [
+            "BlkSqEntry published = source",
+            "wki_chaos_block_sqe(",
+            "&published",
+            "sizeof(published)",
+            "*destination = published",
+        ],
+        "copy-before-publish SQE corruption",
+    )
+    require_order(publish, "BlkSqEntry published = source", "wki_chaos_block_sqe(", "SQE local copy")
+    require_order(publish, "wki_chaos_block_sqe(", "*destination = published", "SQE mutation before owned-slot publication")
+    if source.count("publish_block_sqe(state, &sq[SQ_IDX], sqe, SQ_IDX)") != 6:
+        fail("every READ/WRITE/FLUSH/batch/BULK SQE publication must use the chaos copy helper")
+
+    sqe_intercept = function_body(model, "WkiChaosModel::intercept_block_sqe")
+    require_tokens(
+        sqe_intercept,
+        [
+            "matched->sqe_offset >= descriptor_len",
+            "corruption.byte_before = *byte",
+            "*byte ^= matched->sqe_xor",
+            "corruption.byte_after = *byte",
+            "WkiChaosOutcome::CORRUPTED",
+        ],
+        "single-byte bounded SQE mutation trace",
+    )
+    for forbidden in ["new ", "delete", "kern_yield", "kern_sleep", "dbg::log"]:
+        if forbidden in sqe_intercept:
+            fail(f"SQE hot-path intercept must not contain {forbidden!r}")
+
+    block_hook = function_body(chaos, "wki_chaos_block_doorbell")
+    sqe_hook = function_body(chaos, "wki_chaos_block_sqe")
+    for name, body in [("block doorbell", block_hook), ("block SQE", sqe_hook)]:
+        require_tokens(body, ["s_chaos_enabled.load(std::memory_order_relaxed)"], f"{name} disabled fast path")
+        for forbidden in ["new ", "delete", "kern_yield", "kern_sleep", "dbg::log"]:
+            if forbidden in body:
+                fail(f"{name} hook must be allocation/sleep/log free")
+
+    deferred = function_body(source, "wki_dev_proxy_chaos_deliver_doorbell")
+    require_tokens(
+        deferred,
+        [
+            "!proxy_block_fenced(candidate)",
+            "!candidate->cleanup_in_progress",
+            "state->chaos_doorbell_refs.fetch_add(1, std::memory_order_acq_rel)",
+            "tag_in_use(state, key.operation_cookie)",
+            "wki_chaos_block_identity_equal(CURRENT, key)",
+            "state->chaos_doorbell_refs.fetch_sub(1, std::memory_order_acq_rel)",
+        ],
+        "exact proxy delayed-doorbell re-resolution",
+    )
+    if "BlockIoLease" in deferred:
+        fail("delayed proxy doorbell must not deadlock on the submitting I/O's io_lock")
+    require_order(deferred, "s_proxy_lock.lock()", "chaos_doorbell_refs.fetch_add", "retain while identity admission is serialized")
+    require_order(deferred, "chaos_doorbell_refs.fetch_add", "s_proxy_lock.unlock()", "retain before teardown can proceed")
+    require_order(deferred, "wki_chaos_block_identity_equal(CURRENT, key)", "rdma_signal_server_unchecked(state)", "identity fence before signal")
+    require_order(deferred, "rdma_signal_server_unchecked(state)", "chaos_doorbell_refs.fetch_sub", "retain covers notification callback")
+
+    detach = function_body(source, "wki_dev_proxy_detach_block")
+    require_order(detach, "state->cleanup_in_progress = true", "wait_for_block_io_quiescence(state)", "detach fences new retains")
+    require_order(
+        detach,
+        "wait_for_block_io_quiescence(state)",
+        "wait_for_block_chaos_doorbell_quiescence(state)",
+        "I/O owner releases before delayed callback retain drain",
+    )
+    require_order(
+        detach,
+        "wait_for_block_chaos_doorbell_quiescence(state)",
+        "state->rdma_attached = false",
+        "RDMA identity clears only after delayed callbacks drain",
+    )
+
+    server_delivery = function_body(server, "wki_dev_server_chaos_deliver_doorbell")
+    require_tokens(
+        server_delivery,
+        [
+            "retain_binding_locked(&binding)",
+            "wki_chaos_block_identity_equal(CURRENT, key)",
+            "blk_ring_signal_consumer_unchecked(retained)",
+            "release_binding(retained)",
+        ],
+        "server delayed-doorbell binding retention",
+    )
+    require_order(server_delivery, "retain_binding_locked(&binding)", "s_server_lock.unlock_irqrestore", "server retain under registry lock")
+    require_order(server_delivery, "blk_ring_signal_consumer_unchecked(retained)", "release_binding(retained)", "server signal before exact release")
+
+    delivery = function_body(chaos, "deliver_block_doorbell")
+    require_order(
+        delivery,
+        "key.delivery_deadline_us != 0 && wki_now_us() >= key.delivery_deadline_us",
+        "s_block_doorbell_delivery_hook.load",
+        "expired block notification rejected before delivery",
+    )
+
+
 def main() -> None:
     test_lifecycle_flags_are_atomic()
     test_lifecycle_helpers_use_acquire_release()
@@ -680,6 +821,7 @@ def main() -> None:
     test_block_detach_uses_exact_negotiated_incarnation_form()
     test_published_tombstones_are_not_in_the_ingress_index()
     test_bulk_write_uses_server_pull_and_resume_restores_staging()
+    test_block_chaos_hooks_preserve_descriptor_ownership_and_exact_lifetimes()
     print("WKI dev proxy source invariants hold")
 
 

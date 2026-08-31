@@ -883,8 +883,10 @@ TESTD_RUN(test_remote_ipc_epoll_pipe_read_then_hup) {
 }
 TESTD_RUN_END(test_remote_ipc_epoll_pipe_read_then_hup)
 
-// Remote child performs epoll_ctl(ADD) on inherited epoll fd (IPC_EPOLL proxy).
-TESTD_RUN(test_remote_ipc_epoll_ctl_add) {
+// A task that owns an epoll instance must stay on its home node: the interest
+// list contains local File* identities and cannot be exported safely. Verify
+// both that placement policy and the inherited local epoll semantics.
+TESTD_RUN(test_wki_epoll_owner_pinned_local) {
     std::array<int, 2> fds = {-1, -1};
     if (pipe(fds.data()) != 0) {
         fail("remote_epoll_pipe", "pipe failed");
@@ -895,6 +897,14 @@ TESTD_RUN(test_remote_ipc_epoll_ctl_add) {
         close(fds[0]);
         close(fds[1]);
         fail("remote_epoll_create", "epoll_create1 failed");
+        return;
+    }
+    std::array<char, 64> local_hostname{};
+    if (gethostname(local_hostname.data(), local_hostname.size() - 1) != 0) {
+        close(fds[0]);
+        close(fds[1]);
+        close(EPFD);
+        fail("wki_epoll_owner_pin_hostname", "gethostname failed");
         return;
     }
 
@@ -909,9 +919,9 @@ TESTD_RUN(test_remote_ipc_epoll_ctl_add) {
 
         auto exec_path = std::to_array("/usr/bin/testd");
         auto rh_flag = std::to_array("--rh");
-        auto mode_buf = std::to_array("epoll-add");
-        std::array<char*, 6> child_argv = {
-            exec_path.data(), rh_flag.data(), mode_buf.data(), epfd_str.data(), rfd_str.data(), nullptr,
+        auto mode_buf = std::to_array("epoll-owner-local");
+        std::array<char*, 7> child_argv = {
+            exec_path.data(), rh_flag.data(), mode_buf.data(), epfd_str.data(), rfd_str.data(), local_hostname.data(), nullptr,
         };
         execve("/usr/bin/testd", child_argv.data(), nullptr);
         _exit(RH_EXIT_EXEC_FAILED);
@@ -931,14 +941,14 @@ TESTD_RUN(test_remote_ipc_epoll_ctl_add) {
         close(fds[0]);
         close(fds[1]);
         close(EPFD);
-        fail("remote_epoll_ctl_add", "remote epoll child timed out or waitpid failed");
+        fail("wki_epoll_owner_pin", "epoll-owning child timed out or waitpid failed");
         return;
     }
     if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
         close(fds[0]);
         close(fds[1]);
         close(EPFD);
-        fail("remote_epoll_ctl_add", "remote epoll_ctl add failed");
+        fail("wki_epoll_owner_pin", "child migrated or local epoll_ctl failed");
         return;
     }
 
@@ -961,6 +971,6 @@ TESTD_RUN(test_remote_ipc_epoll_ctl_add) {
         fail("remote_epoll_wait", "expected EPOLLIN event on pipe read fd");
         return;
     }
-    TESTD_PASS("remote_epoll_ctl_add");
+    TESTD_PASS("wki_epoll_owner_pinned_local");
 }
-TESTD_RUN_END(test_remote_ipc_epoll_ctl_add)
+TESTD_RUN_END(test_wki_epoll_owner_pinned_local)

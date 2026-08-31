@@ -307,6 +307,41 @@ def test_pending_vfs_mount_prepares_only_the_local_host_directory() -> None:
     )
 
 
+def test_vfs_withdrawal_rearms_live_successor_mounts_after_teardown() -> None:
+    source = REMOTABLE_CPP.read_text()
+
+    rearm = function_body(source, "rearm_live_vfs_mounts_after_withdrawal_locked")
+    require_order(
+        rearm,
+        [
+            "resource.valid",
+            "resource.resource_type != ResourceType::VFS",
+            "wki_peer_get_hostname(resource.node_id)",
+            "build_vfs_mount_path",
+            "queue_vfs_mount_locked(resource.node_id, resource.resource_id, resource.generation, mount_path.data(), true)",
+        ],
+        "withdrawal-triggered VFS successor rearm uses only live exact observations",
+    )
+    for forbidden in ["wki_remote_vfs_mount", "wki_remote_vfs_has_mount", "wki_timer_notify"]:
+        if forbidden in rearm:
+            fail(f"VFS successor rearm must remain a lock-local queue operation: found {forbidden}")
+
+    process = function_body(source, "wki_remotable_process_pending_mounts")
+    require_order(
+        process,
+        [
+            "wki_remote_vfs_unmount_resource_generation(withdrawn.node_id, withdrawn.resource_id, withdrawn.generation)",
+            "processed_vfs_withdrawal = true",
+            "if (processed_vfs_withdrawal)",
+            "s_remotable_lock.lock()",
+            "rearm_live_vfs_mounts_after_withdrawal_locked()",
+            "s_remotable_lock.unlock()",
+            "wki_remote_vfs_mount(pending.node_id, pending.resource_id",
+        ],
+        "old VFS rows are released before bounded successor mount attempts are rearmed",
+    )
+
+
 def test_same_incarnation_block_advert_revives_exact_generation() -> None:
     source = REMOTABLE_CPP.read_text()
 
@@ -357,6 +392,7 @@ def main() -> None:
     test_pending_net_attach_is_generation_and_epoch_fenced()
     test_pending_vfs_mount_waits_for_detach_ack_without_spending_retries()
     test_pending_vfs_mount_prepares_only_the_local_host_directory()
+    test_vfs_withdrawal_rearms_live_successor_mounts_after_teardown()
     test_same_incarnation_block_advert_revives_exact_generation()
     print("WKI remotable source invariants hold")
 

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <net/address.hpp>
 #include <net/wki/wire.hpp>
@@ -61,6 +62,42 @@ struct DiscoveredResource {
     bool valid = false;
 };
 
+constexpr size_t WKI_RESOURCE_DIAG_MAX = 256;
+
+enum class WkiResourceDiagKind : uint8_t {
+    DISCOVERED = 0,
+    PENDING_VFS_MOUNT = 1,
+    PENDING_NET_ATTACH = 2,
+    PENDING_RX = 3,
+};
+
+struct WkiResourceDiagCounts {
+    size_t discovered = 0;
+    size_t pending_vfs_mounts = 0;
+    size_t pending_net_attaches = 0;
+    size_t pending_rx = 0;
+    size_t truncated = 0;
+};
+
+struct WkiResourceDiagRow {
+    WkiResourceDiagKind kind = WkiResourceDiagKind::DISCOVERED;
+    uint16_t node_id = WKI_NODE_INVALID;
+    ResourceType resource_type = ResourceType::CUSTOM;
+    uint32_t resource_id = 0;
+    uint64_t generation = 0;
+    ResourceIncarnationToken owner_incarnation = {};
+    uint8_t flags = 0;
+    bool valid = false;
+    bool force_remount = false;
+    uint8_t retry_count = 0;
+    uint64_t next_attempt_us = 0;
+    MsgType msg_type = MsgType::HELLO;
+    uint16_t channel_id = 0;
+    uint32_t channel_generation = 0;
+    uint32_t sequence = 0;
+    uint16_t payload_len = 0;
+};
+
 enum class WkiRemotableRxAdmission : uint8_t {
     DEFERRED,
     DISCARD,
@@ -93,6 +130,18 @@ auto wki_resource_observation_snapshot(uint16_t node_id, ResourceType type, uint
 auto wki_resource_observation_is_live(uint16_t node_id, ResourceType type, uint32_t resource_id, uint64_t generation,
                                       const ResourceIncarnationToken& owner_incarnation) -> bool;
 
+// Resolve exactly one live bounded observation by owner/type and optional
+// exact advertised name. This copies the complete identity under the registry
+// lock and fails closed if the retained table exceeds the diagnostic bound.
+// A null name matches any resource of the requested type; an empty name is
+// invalid. Returns zero or a negative errno.
+auto wki_resource_resolve_unique(uint16_t node_id, ResourceType type, const char* exact_name, DiscoveredResource* out) -> int;
+
+// Copy one exact live observation with the same fixed table bound used by the
+// unique resolver. Returns zero or a negative errno.
+auto wki_resource_snapshot_exact(uint16_t node_id, ResourceType type, uint32_t resource_id, uint64_t generation, DiscoveredResource* out)
+    -> int;
+
 // Capability/type gate shared by discovery and attach paths.
 auto wki_resource_incarnation_negotiated(uint16_t peer_node, ResourceType type) -> bool;
 
@@ -115,6 +164,11 @@ void wki_resources_rebind_net_for_peer(uint16_t node_id);
 // Iterate all valid discovered resources via callback.
 using ResourceVisitor = void (*)(const DiscoveredResource& res, void* ctx);
 void wki_resource_foreach(ResourceVisitor visitor, void* ctx);
+
+// Copy resource observations and both deferred stages without retaining
+// pointers. The snapshot takes one subsystem lock at a time and never
+// allocates, so procfs can use it as a bounded convergence surface.
+auto wki_resource_diag_snapshot(WkiResourceDiagRow* rows, size_t capacity, WkiResourceDiagCounts* counts) -> size_t;
 
 // Admit reliable resource control traffic into bounded storage before ACK.
 // The caller holds the channel lock; this path cannot allocate or block.

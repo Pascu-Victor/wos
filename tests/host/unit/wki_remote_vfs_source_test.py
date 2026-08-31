@@ -1135,9 +1135,16 @@ def test_shared_io_callers_timeout_or_fallback() -> None:
             "size_t const REQ_FIXED_LEN = OPEN_REQ_BASE_LEN + (send_open_prefetch ? OPEN_PREFETCH_REQ_LEN : 0)",
             "if (send_open_prefetch)",
             "tagged_receive.rkey = state->rdma_bulk_rkey",
+            "vfs_proxy_send_and_wait(state, OP_VFS_OPEN",
+            "wki_roce_region_tagged_write_complete(state->rdma_bulk_rkey, tagged_receive.cookie, open_resp.prefetched_bytes)",
         ],
         "open prefetch shared-slot fallback",
     )
+    open_prefetch_completion = open_body[
+        open_body.index("uint32_t valid_prefetched_bytes = 0") : open_body.index("// Allocate File + RemoteFileContext")
+    ]
+    if "wki_roce_region_wait_tagged_write" in open_prefetch_completion or "VFS_PROXY_OP_TIMEOUT_US" in open_prefetch_completion:
+        fail("post-response optional open prefetch must fall back causally without another timed wait")
 
 
 def test_message_fallback_readahead_targets_small_sequential_reads() -> None:
@@ -3013,8 +3020,32 @@ def test_remote_vfs_channel_identity_survives_pool_slot_reuse() -> None:
     cleanup_body = function_body(source, "wki_remote_vfs_cleanup_for_peer")
     require_tokens(
         cleanup_body,
-        ["(!p->active && !p->epoch_reset_pending)", "deactivate_vfs_proxy_locked(p, cleanup, false)"],
-        "task-context epoch cleanup must consume pre-marked proxies",
+        [
+            "vfs_proxy_requires_peer_cleanup(p, node_id)",
+            "deactivate_vfs_proxy_locked(p, cleanup, false)",
+        ],
+        "task-context peer cleanup must consume active, pre-marked, and in-progress attach proxies",
+    )
+    cleanup_gate_body = function_body(source, "vfs_proxy_requires_peer_cleanup")
+    require_tokens(
+        cleanup_gate_body,
+        [
+            "state->owner_node == node_id",
+            "state->active",
+            "state->epoch_reset_pending",
+            "state->attach_pending.load(std::memory_order_acquire)",
+        ],
+        "remote VFS peer cleanup admission includes pending attach waiters",
+    )
+    require_tokens(
+        source,
+        ["wki_remote_vfs_selftest_peer_cleanup_includes_pending_attach"],
+        "pending remote VFS attach cleanup selftest",
+    )
+    require_tokens(
+        WKI_DEV_PROXY_KTEST.read_text(),
+        ["KTEST(WkiRemoteVfsPeerCleanup, PendingAttachWaitIsIncluded)"],
+        "pending remote VFS attach cleanup KTEST registration",
     )
     require_order(
         cleanup_body,
@@ -3251,17 +3282,19 @@ def test_server_fd_and_consumer_rx_use_exact_channel_identity() -> None:
     if "consumer_node == channel_identity.peer_node_id" in mark_cleanup:
         fail("ordinary binding detach must not close sibling channel generations for the same peer")
 
-    async_close = function_body(dev_server, "wki_dev_server_admit_async_vfs_close_rx")
+    async_close = function_body(dev_server, "wki_dev_server_admit_vfs_op_rx")
     require_order(
         async_close,
         [
             "wki_vfs_close_no_success_response_requested(req_data, req->data_len)",
             "try_queue_pre_admitted_async_close",
-            "WkiVfsCloseRxAdmission::RETRY",
-            "WkiVfsCloseRxAdmission::DEFERRED",
+            "try_queue_pre_admitted_vfs_op",
         ],
         "one-way close fixed work admission precedes reliable ACK",
     )
+    for outcome in ("WkiVfsOpRxAdmission::RETRY", "WkiVfsOpRxAdmission::DEFERRED"):
+        if outcome not in async_close:
+            fail(f"VFS RX admission is missing {outcome}")
     for unsafe in ("operator new", "new ", "vfs_close_file", "dbg::log"):
         if unsafe in async_close:
             fail(f"one-way close RX precommit contains unsafe operation {unsafe!r}")
@@ -3298,14 +3331,14 @@ def test_server_fd_and_consumer_rx_use_exact_channel_identity() -> None:
     require_order(
         rx,
         [
-            "admit_async_vfs_close(msg, hdr, payload, PAYLOAD_LEN, ch, ch->generation)",
-            "VFS_CLOSE_ADMISSION == WkiVfsCloseRxAdmission::RETRY",
+            "admit_vfs_op(msg, hdr, payload, PAYLOAD_LEN, ch, ch->generation)",
+            "VFS_OP_ADMISSION == WkiVfsOpRxAdmission::RETRY",
             "ch->rx_seq++",
         ],
         "in-order async close commits before reliable RX sequence publication",
     )
-    if rx.count("admit_async_vfs_close(") != 2:
-        fail("both direct and reorder reliable RX paths must precommit one-way VFS close")
+    if rx.count("admit_vfs_op(") != 2:
+        fail("both direct and reorder reliable RX paths must precommit every VFS request")
 
     drain_cleanup = function_body(source, "wki_remote_vfs_process_pending_server_fd_cleanup")
     require_order(

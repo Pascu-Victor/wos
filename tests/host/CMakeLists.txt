@@ -21,6 +21,10 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/cluster_setup_test.py
 )
 add_test(
+    NAME wki_chaos_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/wki_chaos_test.py
+)
+add_test(
     NAME xhci_lifecycle_source_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/xhci_lifecycle_source_test.py
 )
@@ -401,6 +405,10 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/wki_remote_vfs_source_test.py
 )
 add_test(
+    NAME wki_chaos_workload_source_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/wki_chaos_workload_source_test.py
+)
+add_test(
     NAME vfs_open_path_scratch_source_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/vfs_open_path_scratch_source_test.py
 )
@@ -525,6 +533,7 @@ set_tests_properties(
     ktest_cov_test
     coverage_summary_test
     cluster_setup_test
+    wki_chaos_test
     xhci_lifecycle_source_test
     wosincident_test
     cross_os_benchmark_suite_test
@@ -620,6 +629,7 @@ set_tests_properties(
     wki_routing_source_test
     wki_remote_compute_source_test
     wki_remote_vfs_source_test
+    wki_chaos_workload_source_test
     vfs_open_path_scratch_source_test
     vfs_mount_lifetime_source_test
     vfs_advisory_lock_source_test
@@ -656,6 +666,16 @@ set_tests_properties(
 wos_add_unit_test(wki_wire_test
     SOURCES     ${CMAKE_CURRENT_SOURCE_DIR}/unit/wki_wire_test.cpp
 )
+
+wos_add_unit_test(wki_block_validation_test
+    SOURCES     ${CMAKE_CURRENT_SOURCE_DIR}/unit/wki_block_validation_test.cpp
+)
+
+wos_add_unit_test(wki_peer_resolver_test
+    SOURCES      ${CMAKE_CURRENT_SOURCE_DIR}/unit/wki_peer_resolver_test.cpp
+    KERN_SOURCES ${WOS_ROOT}/modules/wkictl/src/peer_resolver.cpp
+)
+target_include_directories(wki_peer_resolver_test PRIVATE ${WOS_ROOT}/modules/wkictl/include)
 
 wos_add_unit_test(netd_ra_test
     SOURCES     ${CMAKE_CURRENT_SOURCE_DIR}/unit/netd_ra_test.cpp
@@ -718,6 +738,19 @@ wos_add_unit_test(wki_channel_test
     SOURCES      ${CMAKE_CURRENT_SOURCE_DIR}/unit/wki_channel_test.cpp
     KERN_SOURCES ${WOS_KERN_SRC}/net/wki/channel.cpp
 )
+
+wos_add_unit_test(wki_chaos_model_test
+    SOURCES      ${CMAKE_CURRENT_SOURCE_DIR}/unit/wki_chaos_model_test.cpp
+    KERN_SOURCES ${WOS_KERN_SRC}/net/wki/chaos_model.cpp
+)
+
+# Manual, non-gating microbenchmark. It records the isolated cost of the exact
+# disabled-path shape (one relaxed atomic load, then the original callback)
+# without turning scheduler noise into a timing-dependent test assertion.
+add_executable(wki_chaos_disabled_bench
+    ${CMAKE_CURRENT_SOURCE_DIR}/unit/wki_chaos_disabled_bench.cpp
+)
+target_compile_options(wki_chaos_disabled_bench PRIVATE -O3 -Wall -Wextra)
 
 wos_add_unit_test(wki_peer_liveness_test
     SOURCES     ${CMAKE_CURRENT_SOURCE_DIR}/unit/wki_peer_liveness_test.cpp

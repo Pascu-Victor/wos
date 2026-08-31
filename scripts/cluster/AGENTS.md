@@ -2,8 +2,9 @@
 
 `node_setup.py` is the shared single-node VM layout layer. It owns defaults and
 helpers for per-node QEMU arguments, overlay disks, serial/QEMU logs, TCG/KVM
-mode selection, debug ports, fw_cfg hostname injection, NIC devices, ivshmem
-devices, and `/etc/netdevs` injection.
+mode selection, debug ports, fw_cfg hostname and early NIC-policy injection,
+NIC devices, ivshmem devices, and `/etc/netdevs` injection. The fw_cfg policy
+and rootfs file must be generated from the same normalized NIC assignments.
 
 `cluster_setup.py` should translate cluster topology data into a normalized
 node spec and then call `node_setup`; do not reintroduce a second copy of QEMU

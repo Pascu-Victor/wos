@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <net/wki/remote_ipc.hpp>
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
 
@@ -91,6 +92,11 @@ struct SubmittedTask {
 
     std::array<WkiIpcFdEntry, 16> ipc_fd_map = {};
     uint16_t ipc_fd_count = 0;
+    // Pins for the exact local File identities represented by ipc_fd_map.
+    // These move here before the interruptible TASK_ACCEPT wait so fatal task
+    // cleanup can release them even when the submitter's stack is abandoned.
+    std::array<WkiIpcTaskFdHandoff, 16> ipc_fd_handoff = {};
+    uint16_t handoff_pin_count = 0;
 
     SubmittedTask() = default;
     ~SubmittedTask() {
@@ -124,10 +130,14 @@ struct SubmittedTask {
           pending_proxy_output(o.pending_proxy_output),
           pending_proxy_output_len(o.pending_proxy_output_len),
           ipc_fd_map(o.ipc_fd_map),
-          ipc_fd_count(o.ipc_fd_count) {
+          ipc_fd_count(o.ipc_fd_count),
+          ipc_fd_handoff(o.ipc_fd_handoff),
+          handoff_pin_count(o.handoff_pin_count) {
         o.local_task = nullptr;
         o.pending_proxy_output = nullptr;
         o.pending_proxy_output_len = 0;
+        o.ipc_fd_handoff = {};
+        o.handoff_pin_count = 0;
     }
     auto operator=(SubmittedTask&& o) noexcept -> SubmittedTask& {
         if (this != &o) {
@@ -161,6 +171,10 @@ struct SubmittedTask {
             o.pending_proxy_output_len = 0;
             ipc_fd_map = o.ipc_fd_map;
             ipc_fd_count = o.ipc_fd_count;
+            ipc_fd_handoff = o.ipc_fd_handoff;
+            handoff_pin_count = o.handoff_pin_count;
+            o.ipc_fd_handoff = {};
+            o.handoff_pin_count = 0;
         }
         return *this;
     }
@@ -245,16 +259,31 @@ struct WkiRemoteComputeDiagRow {
     uint16_t peer_node = WKI_NODE_INVALID;
     uint64_t local_pid = 0;
     uint64_t local_task_ptr = 0;
+    uint32_t channel_generation = 0;
+    uint64_t submit_session_epoch = 0;
     bool active = false;
     bool response_pending = false;
     bool complete_pending = false;
+    bool response_waiter_owned = false;
+    bool response_consumer_owned = false;
+    bool complete_waiter_owned = false;
+    bool complete_consumer_owned = false;
     bool proxy_ready = false;
     bool has_local_task = false;
+    bool published = false;
+    bool accept_pending = false;
+    bool discard_completion = false;
+    bool termination_requested = false;
+    bool result_handle_owned = false;
+    bool has_result_owner = false;
+    bool reclaim_requested = false;
     int32_t exit_status = 0;
     uint64_t accepted_age_us = 0;
     uint64_t complete_age_us = 0;
     uint16_t ipc_fd_count = 0;
+    uint16_t ipc_handoff_pin_count = 0;
     uint16_t output_len = 0;
+    uint16_t pending_proxy_output_len = 0;
 };
 
 enum class WkiRemoteSpawnResult : uint8_t {
@@ -299,7 +328,7 @@ auto wki_task_submit_inline(uint16_t target_node, const void* binary, uint32_t b
                             const char* const argv[],  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
                             const char* const envp[],  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
                             const char* cwd, ker::mod::sched::task::Task* local_task, const WkiIpcFdEntry* ipc_fd_map = nullptr,
-                            uint16_t ipc_fd_count = 0) -> uint32_t;
+                            uint16_t ipc_fd_count = 0, WkiIpcTaskFdHandoff* ipc_fd_handoff = nullptr) -> uint32_t;
 
 // Submitter side: submit a task via VFS_REF (path-based delivery).
 // The remote node loads the ELF from its VFS (typically via /wki/<hostname>/... mount).
@@ -308,7 +337,7 @@ auto wki_task_submit_vfs_ref(uint16_t target_node, const char* vfs_path,
                              const char* const argv[],  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
                              const char* const envp[],  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
                              const char* cwd, ker::mod::sched::task::Task* local_task, const WkiIpcFdEntry* ipc_fd_map = nullptr,
-                             uint16_t ipc_fd_count = 0) -> uint32_t;
+                             uint16_t ipc_fd_count = 0, WkiIpcTaskFdHandoff* ipc_fd_handoff = nullptr) -> uint32_t;
 
 // Rich remote placement path used by spawn/exec code that already has the final
 // argv/envp/cwd context. On success, the task is converted into a proxy.
@@ -407,6 +436,7 @@ auto wki_remote_compute_selftest_proxy_wait_completion_respects_publish_fence() 
 auto wki_remote_compute_selftest_task_wait_consumes_completed_row() -> bool;
 auto wki_remote_compute_selftest_task_wait_timeout_preserves_successor() -> bool;
 auto wki_remote_compute_selftest_task_exit_retires_wait_owners() -> bool;
+auto wki_remote_compute_selftest_task_exit_releases_handoff_pins() -> bool;
 auto wki_remote_compute_selftest_submitted_slots_reclaim_safely() -> bool;
 auto wki_remote_compute_selftest_task_id_wrap_is_safe() -> bool;
 auto wki_remote_compute_selftest_load_snapshot_survives_cleanup() -> bool;

@@ -442,6 +442,32 @@ void queue_vfs_mount_locked(uint16_t node_id, uint32_t resource_id, uint64_t res
     g_pending_vfs_mounts.push_back(pending);
 }
 
+// Caller holds s_remotable_lock. A peer restart can publish a successor with
+// the same hostname before the old peer is fenced. The successor's bounded
+// auto-mount attempts may then exhaust on the old mount-table rows. Rearm all
+// live observations only after a withdrawal batch has actually released those
+// rows; the normal worker still skips already-mounted generations and retains
+// its finite retry budget.
+auto rearm_live_vfs_mounts_after_withdrawal_locked() -> size_t {
+    size_t queued = 0;
+    for (const auto& resource : g_discovered) {
+        if (!resource.valid || resource.resource_type != ResourceType::VFS) {
+            continue;
+        }
+
+        const char* hostname = wki_peer_get_hostname(resource.node_id);
+        if (hostname == nullptr || hostname[0] == '\0') {
+            continue;
+        }
+
+        std::array<char, VFS_MOUNT_PATH_LEN> mount_path{};
+        build_vfs_mount_path(mount_path.data(), mount_path.size(), hostname, static_cast<const char*>(resource.name));
+        queue_vfs_mount_locked(resource.node_id, resource.resource_id, resource.generation, mount_path.data(), true);
+        queued++;
+    }
+    return queued;
+}
+
 void defer_vfs_mount_for_detach(PendingVfsMount& pending) {
     pending.next_attempt_us = wki_future_deadline_us(wki_now_us(), VFS_AUTO_MOUNT_RETRY_BASE_US);
 
@@ -879,6 +905,154 @@ auto wki_resource_observation_is_live(uint16_t node_id, ResourceType type, uint3
     ResourceIncarnationToken current = {};
     return wki_resource_observation_snapshot(node_id, type, resource_id, generation, &current) &&
            wki_resource_incarnation_equal(current, owner_incarnation);
+}
+
+auto wki_resource_resolve_unique(uint16_t node_id, ResourceType type, const char* exact_name, DiscoveredResource* out) -> int {
+    if (out == nullptr || node_id == WKI_NODE_INVALID || node_id == WKI_NODE_BROADCAST ||
+        (exact_name != nullptr && exact_name[0] == '\0')) {
+        return -EINVAL;
+    }
+
+    DiscoveredResource result{};
+    size_t matches = 0;
+    s_remotable_lock.lock();
+    if (g_discovered.size() > WKI_RESOURCE_DIAG_MAX) {
+        s_remotable_lock.unlock();
+        return -EOVERFLOW;
+    }
+    for (const auto& resource : g_discovered) {
+        if (!resource.valid || resource.node_id != node_id || resource.resource_type != type ||
+            (exact_name != nullptr && std::strcmp(resource.name, exact_name) != 0)) {
+            continue;
+        }
+        result = resource;
+        matches++;
+        if (matches > 1) {
+            break;
+        }
+    }
+    s_remotable_lock.unlock();
+
+    if (matches == 0) {
+        return -ENOENT;
+    }
+    if (matches != 1) {
+        return -EEXIST;
+    }
+    *out = result;
+    return 0;
+}
+
+auto wki_resource_snapshot_exact(uint16_t node_id, ResourceType type, uint32_t resource_id, uint64_t generation, DiscoveredResource* out)
+    -> int {
+    if (out == nullptr || generation == 0 || node_id == WKI_NODE_INVALID || node_id == WKI_NODE_BROADCAST) {
+        return -EINVAL;
+    }
+
+    DiscoveredResource result{};
+    bool found = false;
+    s_remotable_lock.lock();
+    if (g_discovered.size() > WKI_RESOURCE_DIAG_MAX) {
+        s_remotable_lock.unlock();
+        return -EOVERFLOW;
+    }
+    for (const auto& resource : g_discovered) {
+        if (!resource.valid || resource.node_id != node_id || resource.resource_type != type || resource.resource_id != resource_id ||
+            resource.generation != generation) {
+            continue;
+        }
+        if (found) {
+            s_remotable_lock.unlock();
+            return -EEXIST;
+        }
+        result = resource;
+        found = true;
+    }
+    s_remotable_lock.unlock();
+    if (!found) {
+        return -ENOENT;
+    }
+    *out = result;
+    return 0;
+}
+
+auto wki_resource_diag_snapshot(WkiResourceDiagRow* rows, size_t capacity, WkiResourceDiagCounts* counts) -> size_t {
+    WkiResourceDiagCounts local_counts{};
+    size_t row_count = 0;
+    auto append_row = [&](const WkiResourceDiagRow& row) {
+        if (rows != nullptr && row_count < capacity) {
+            rows[row_count++] = row;  // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
+        } else {
+            local_counts.truncated++;
+        }
+    };
+
+    s_remotable_lock.lock();
+    for (const auto& resource : g_discovered) {
+        local_counts.discovered++;
+        WkiResourceDiagRow row{};
+        row.kind = WkiResourceDiagKind::DISCOVERED;
+        row.node_id = resource.node_id;
+        row.resource_type = resource.resource_type;
+        row.resource_id = resource.resource_id;
+        row.generation = resource.generation;
+        row.owner_incarnation = resource.owner_incarnation;
+        row.flags = resource.flags;
+        row.valid = resource.valid;
+        append_row(row);
+    }
+    for (const auto& pending : g_pending_vfs_mounts) {
+        local_counts.pending_vfs_mounts++;
+        WkiResourceDiagRow row{};
+        row.kind = WkiResourceDiagKind::PENDING_VFS_MOUNT;
+        row.node_id = pending.node_id;
+        row.resource_type = ResourceType::VFS;
+        row.resource_id = pending.resource_id;
+        row.generation = pending.resource_generation;
+        row.valid = true;
+        row.force_remount = pending.force_remount;
+        row.retry_count = pending.retry_count;
+        row.next_attempt_us = pending.next_attempt_us;
+        append_row(row);
+    }
+    for (const auto& pending : g_pending_net_attaches) {
+        local_counts.pending_net_attaches++;
+        WkiResourceDiagRow row{};
+        row.kind = WkiResourceDiagKind::PENDING_NET_ATTACH;
+        row.node_id = pending.node_id;
+        row.resource_type = ResourceType::NET;
+        row.resource_id = pending.resource_id;
+        row.generation = pending.resource_generation;
+        row.valid = true;
+        row.retry_count = pending.retry_count;
+        row.next_attempt_us = pending.next_attempt_us;
+        append_row(row);
+    }
+    s_remotable_lock.unlock();
+
+    uint64_t const IRQF = s_resource_rx_lock.lock_irqsave();
+    local_counts.pending_rx = g_pending_resource_rx_count;
+    size_t slot = g_pending_resource_rx_head;
+    for (size_t i = 0; i < g_pending_resource_rx_count; ++i) {
+        const auto& pending = g_pending_resource_rx.at(slot);
+        WkiResourceDiagRow row{};
+        row.kind = WkiResourceDiagKind::PENDING_RX;
+        row.node_id = pending.hdr.src_node;
+        row.msg_type = pending.type;
+        row.channel_id = pending.hdr.channel_id;
+        row.channel_generation = pending.rx_channel_generation;
+        row.sequence = pending.hdr.seq_num;
+        row.payload_len = pending.payload_len;
+        row.valid = true;
+        append_row(row);
+        slot = (slot + 1U) % g_pending_resource_rx.size();
+    }
+    s_resource_rx_lock.unlock_irqrestore(IRQF);
+
+    if (counts != nullptr) {
+        *counts = local_counts;
+    }
+    return row_count;
 }
 
 void wki_resources_invalidate_for_peer(uint16_t node_id) {
@@ -1541,6 +1715,7 @@ void wki_remotable_process_pending_rx() {
 // -----------------------------------------------------------------------------
 
 void wki_remotable_process_pending_mounts() {
+    bool processed_vfs_withdrawal = false;
     while (true) {
         DiscoveredResource withdrawn = {};
         bool found_withdrawn = false;
@@ -1576,9 +1751,19 @@ void wki_remotable_process_pending_mounts() {
 
         sync_vfs_devfs_resource(withdrawn.node_id, withdrawn.resource_id, withdrawn.generation);
         wki_remote_vfs_unmount_resource_generation(withdrawn.node_id, withdrawn.resource_id, withdrawn.generation);
+        processed_vfs_withdrawal = true;
         log::debug("Deferred VFS withdrawal: node=0x%04x res_id=%u generation=%lu dropped_mounts=%llu replacement=%u", withdrawn.node_id,
                    withdrawn.resource_id, static_cast<unsigned long>(withdrawn.generation),
                    static_cast<unsigned long long>(dropped_pending_mounts), replacement_live ? 1U : 0U);
+    }
+
+    if (processed_vfs_withdrawal) {
+        s_remotable_lock.lock();
+        size_t const REARMED = rearm_live_vfs_mounts_after_withdrawal_locked();
+        s_remotable_lock.unlock();
+        if (REARMED != 0) {
+            log::debug("Rearmed live VFS auto-mounts after withdrawal: resources=%llu", static_cast<unsigned long long>(REARMED));
+        }
     }
 
     while (true) {

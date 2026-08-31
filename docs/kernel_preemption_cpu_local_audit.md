@@ -59,6 +59,7 @@ The classifications have precise meanings:
 - `modules/kern/src/net/loopback.cpp` — **re-read**. The scalar CPU chooses one enqueue operation; later work owns its explicit queue index.
 - `modules/kern/src/net/wki/event.cpp` — **re-read**. CPU is immediate performance-event attribution.
 - `modules/kern/src/net/wki/dev_proxy.cpp` — **re-read / refactored**. CPU values are immediate diagnostics; current task pointers are retained as task identities under existing object locks/references.
+- `modules/kern/src/net/wki/chaos_workload.cpp` — **re-read**. The bounded test-only worker checks the current task's daemon type immediately and does not retain CPU-local state across a migration point.
 - `modules/kern/src/net/wki/wki.cpp` — **re-read**. CPU is immediate WKI performance attribution.
 - `modules/kern/src/platform/dbg/dbg.cpp` — **preemption-protected**. CPU read occurs only in the panic writer after normal scheduling has stopped.
 - `modules/kern/src/platform/dbg/journal.cpp` — **re-read**. Record creation samples CPU into record metadata; no CPU-local pointer is retained.

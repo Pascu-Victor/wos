@@ -188,6 +188,10 @@ KTEST(WkiIpcExportLifetime, CompactionWaitsForBacklogThenFreesExport) {
     KEXPECT_EQ(ker::net::wki::wki_ipc_selftest_export_compaction_frees(), 1);
 }
 
+KTEST(WkiIpcExportLifetime, AcceptedRemoteHandoffTransfersExactFdOwner) {
+    KEXPECT_EQ(ker::net::wki::wki_ipc_selftest_task_fd_handoff_transfers_exact_owner(), 0);
+}
+
 KTEST(WkiIpcExportLifetime, FatalWriteReleasesWorkerAndExportFileReferences) {
     KEXPECT_EQ(ker::net::wki::wki_ipc_selftest_failed_export_write_releases_all_file_refs(), 0);
 }
@@ -212,6 +216,10 @@ KTEST(WkiIpcDevOpWork, LargePayloadBacksExportPipeChunk) {
     KEXPECT_EQ(ker::net::wki::wki_ipc_selftest_large_dev_op_work_backs_pipe_chunk(), 0);
 }
 
+KTEST(WkiIpcDevOpWork, FixedPoolExhaustionBackpressuresAndRecycles) {
+    KEXPECT_EQ(ker::net::wki::wki_ipc_selftest_dev_op_work_pool_is_bounded(), 0);
+}
+
 KTEST(WkiIpcPollWake, WakeDrainsMoreThanOneFixedBatch) { KEXPECT_EQ(ker::net::wki::wki_ipc_selftest_poll_wake_drains_over_capacity(), 0); }
 
 KTEST(WkiIpcPoll, InactiveProxyReportsTerminalReadiness) {
@@ -230,6 +238,10 @@ KTEST(WkiIpcPoll, PendingClosePromotesToHup) { KEXPECT_EQ(ker::net::wki::wki_ipc
 
 KTEST(WkiIpcLifecycle, DiscardRetiresUnattachedDelivery) {
     KEXPECT_EQ(ker::net::wki::wki_ipc_selftest_discard_retires_unattached_delivery(), 0);
+}
+
+KTEST(WkiIpcLifecycle, StoppedPumpPublishesDiscardFence) {
+    KEXPECT_EQ(ker::net::wki::wki_ipc_selftest_stopped_pump_publishes_discard_fence(), 0);
 }
 
 KTEST(WkiIpcEpollClose, CloseDropsLookupReference) { KEXPECT_EQ(ker::net::wki::wki_ipc_selftest_epoll_close_releases_lookup_ref(), 0); }

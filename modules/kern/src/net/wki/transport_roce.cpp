@@ -635,6 +635,10 @@ auto wki_roce_region_reset_received(uint32_t rkey) -> bool { return region_reset
 
 auto wki_roce_region_prepare_tagged_write(uint32_t rkey, uint16_t cookie) -> bool { return region_prepare_tagged_write(rkey, cookie); }
 
+auto wki_roce_region_tagged_write_complete(uint32_t rkey, uint16_t cookie, uint32_t len) -> bool {
+    return len == 0 ? region_is_registered(rkey) : region_tagged_write_received_at_least(rkey, cookie, len);
+}
+
 void wki_roce_region_finish_tagged_write(uint32_t rkey, uint16_t cookie) { region_finish_tagged_write(rkey, cookie); }
 
 auto wki_roce_region_wait_received(uint32_t rkey, uint32_t len, uint64_t timeout_us) -> bool {

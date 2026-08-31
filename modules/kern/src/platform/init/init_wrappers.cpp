@@ -1,5 +1,6 @@
 // Init wrapper functions for the kernel initialization dependency system
 // Each wrapper calls the actual init function from the appropriate module
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <dev/ahci.hpp>
@@ -70,6 +71,35 @@
 #endif
 
 namespace ker::init::fns {
+
+namespace {
+
+auto cmdline_has_token(const char* cmdline, std::string_view token) -> bool {
+    if (cmdline == nullptr || token.empty()) {
+        return false;
+    }
+
+    std::string_view remaining{cmdline};
+    while (!remaining.empty()) {
+        size_t const BEGIN = remaining.find_first_not_of(" \t\r\n");
+        if (BEGIN == std::string_view::npos) {
+            return false;
+        }
+        remaining.remove_prefix(BEGIN);
+        size_t const END = remaining.find_first_of(" \t\r\n");
+        std::string_view const CURRENT = remaining.substr(0, END);
+        if (CURRENT == token) {
+            return true;
+        }
+        if (END == std::string_view::npos) {
+            return false;
+        }
+        remaining.remove_prefix(END);
+    }
+    return false;
+}
+
+}  // namespace
 
 void fb_init() {
     if constexpr (mod::gfx::fb::WOS_HAS_GFX_FB) {
@@ -173,7 +203,16 @@ void cdc_ether_init() { dev::usb::cdc_ether_init(); }
 
 void xhci_init() { dev::usb::xhci_init(); }
 
-void ivshmem_init() { dev::ivshmem::ivshmem_net_init(); }
+void ivshmem_init() {
+    // A single ivshmem PCI function cannot be owned by both netdevice and WKI
+    // transports.  Keep the historical ivshmem-net claim policy unless the
+    // boot explicitly reserves the functions for the phase-6 WKI RDMA probe.
+    if (cmdline_has_token(get_kernel_cmdline(), "wki.ivshmem")) {
+        mod::dbg::log("[WKI] Reserving ivshmem device for WKI RDMA transport");
+        return;
+    }
+    static_cast<void>(dev::ivshmem::ivshmem_net_init());
+}
 
 void pkt_pool_expand() { net::pkt_pool_expand_for_nics(); }
 
@@ -192,18 +231,29 @@ void smt_init() { mod::smt::init(); }
 void epoch_manager_init() { mod::sched::EpochManager::init(); }
 
 void wki_eth_transport_init() {
-    // Prefer config-assigned NIC; fall back to eth1 then eth0
-    auto wki_dev_ref = ker::util::netdevconf::find_device("wki");
-    if (!wki_dev_ref) {
-        wki_dev_ref = net::netdev_find_by_name_ref("eth1");
+    // Claim every config-assigned WKI NIC before initializing the primary.
+    // A routed/multi-homed node may lazily register secondary transports after
+    // RX, but none of those NICs may appear in an earlier resource snapshot.
+    std::array<net::NetDeviceRef, net::MAX_NET_DEVICES> wki_dev_refs{};
+    size_t wki_dev_count = ker::util::netdevconf::find_devices("wki", wki_dev_refs);
+    if (wki_dev_count == 0) {
+        wki_dev_refs.front() = net::netdev_find_by_name_ref("eth1");
     }
-    if (!wki_dev_ref) {
-        wki_dev_ref = net::netdev_find_by_name_ref("eth0");
+    if (!wki_dev_refs.front()) {
+        wki_dev_refs.front() = net::netdev_find_by_name_ref("eth0");
     }
-    if (wki_dev_ref) {
-        net::wki::wki_eth_transport_init(wki_dev_ref.get());
-        net::wki::wki_peer_send_hello_broadcast();
+    if (!wki_dev_refs.front()) {
+        return;
     }
+    if (wki_dev_count == 0) {
+        wki_dev_count = 1;
+    }
+
+    for (size_t i = 0; i < wki_dev_count; ++i) {
+        net::wki::wki_eth_transport_claim(wki_dev_refs.at(i).get());
+    }
+    net::wki::wki_eth_transport_init(wki_dev_refs.front().get());
+    net::wki::wki_peer_send_hello_broadcast();
 }
 
 void wki_ivshmem_transport_init() { net::wki::wki_ivshmem_transport_init(); }

@@ -234,6 +234,15 @@ struct WkiIpcExport {
     WkiIpcExport* pump_next = nullptr;
 };
 
+// Local-only ownership token for the submitter-side fd-table reference.  The
+// wire entry identifies the remote proxy; this token pins the exact File until
+// an accepted remote exec can transfer the shadow task's matching fd ownership
+// to the export.  It is never serialized.
+struct WkiIpcTaskFdHandoff {
+    uint16_t local_fd = UINT16_MAX;
+    ker::vfs::File* file = nullptr;
+};
+
 struct WkiIpcPerfSnapshot {
     uint64_t exports = 0;
     uint64_t proxies = 0;
@@ -271,13 +280,21 @@ enum class WkiIpcDiagKind : uint8_t {
     PROXY = 2,
     EXPORT_BACKLOG = 3,
     PROXY_CLOSE = 4,
+    PENDING_DELIVERY = 5,
+    DEV_OP_WORK = 6,
+    PEER_CLEANUP = 7,
 };
 
 struct WkiIpcDiagCounts {
     size_t exports = 0;
+    size_t active_exports = 0;
     size_t proxies = 0;
+    size_t active_proxies = 0;
     size_t export_backlogs = 0;
     size_t proxy_close_queue = 0;
+    size_t pending_deliveries = 0;
+    size_t dev_op_work = 0;
+    size_t peer_cleanup_slots = 0;
     size_t truncated = 0;
 };
 
@@ -290,7 +307,9 @@ struct WkiIpcDiagRow {
     uint16_t op_id = 0;
     uint16_t msg_size = 0;
     uint32_t attempts = 0;
+    uint32_t sequence = 0;
     int open_flags = 0;
+    int32_t refcount = 0;
     bool active = false;
     bool has_file = false;
     bool pump_running = false;
@@ -299,6 +318,11 @@ struct WkiIpcDiagRow {
     bool write_closed = false;
     bool close_pending = false;
     bool close_has_expected_bytes = false;
+    bool has_pending_wait = false;
+    bool cleanup_active = false;
+    bool fenced = false;
+    bool pipe_rdma_enabled = false;
+    bool pipe_rdma_writer_active = false;
     uint64_t pipe_bytes_received = 0;
     uint64_t proxy_bytes_written = 0;
     uint64_t ring_used = 0;
@@ -308,6 +332,12 @@ struct WkiIpcDiagRow {
     uint64_t backlog_bytes = 0;
     uint64_t backlog_chunks = 0;
     uint64_t close_expected_bytes = 0;
+    uint64_t cleanup_epoch = 0;
+    uint16_t pending_wait_op = 0;
+    uint16_t pending_wait_cookie = 0;
+    uint32_t message_write_credits = 0;
+    int32_t message_write_error = 0;
+    uint32_t message_write_waiters = 0;
 };
 
 // -----------------------------------------------------------------------------
@@ -316,6 +346,20 @@ struct WkiIpcDiagRow {
 
 // Initialize the IPC proxy subsystem. Called from wki_init().
 void wki_ipc_subsystem_init();
+
+enum class WkiIpcDevOpRxAdmission : uint8_t {
+    NOT_APPLICABLE,
+    INLINE,
+    DEFERRED,
+    DISCARD,
+    RETRY,
+};
+
+// Validate and reserve bounded IPC DEV_OP work before reliable RX publishes
+// its ACK. RETRY leaves the frame unconsumed; DEFERRED owns a fixed-pool copy.
+auto wki_ipc_admit_dev_op_rx(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len, WkiChannel* rx_channel,
+                             uint32_t rx_channel_generation) -> WkiIpcDevOpRxAdmission;
+void wki_ipc_notify_deferred_dev_op(const uint8_t* payload, uint16_t payload_len);
 
 // Read a best-effort IPC perf/memory snapshot for /proc and perf tooling.
 void wki_ipc_get_perf_snapshot(WkiIpcPerfSnapshot& out);
@@ -326,7 +370,15 @@ auto wki_ipc_diag_snapshot(WkiIpcDiagRow* rows, size_t capacity, WkiIpcDiagCount
 // Export a task's IPC fds before remote submission.
 // Iterates fd_table, identifies IPC primitives, creates exports.
 // Returns the number of exported fds, fills map_out.
-auto wki_ipc_export_task_fds(ker::mod::sched::task::Task* task, uint16_t target_node, WkiIpcFdEntry* map_out, uint16_t* count_out) -> bool;
+auto wki_ipc_export_task_fds(ker::mod::sched::task::Task* task, uint16_t target_node, WkiIpcFdEntry* map_out, uint16_t* count_out,
+                             WkiIpcTaskFdHandoff* handoff_out = nullptr) -> bool;
+
+// Commit or abandon the local side of an IPC fd handoff.  Commit removes only
+// fd slots that still contain the pinned File and drops their fd-table owner;
+// release drops only the temporary pins, preserving every local fd on failed
+// submission/fallback paths.
+auto wki_ipc_commit_task_fd_handoff(ker::mod::sched::task::Task* task, WkiIpcTaskFdHandoff* handoff, uint16_t count) -> uint16_t;
+void wki_ipc_release_task_fd_handoff(WkiIpcTaskFdHandoff* handoff, uint16_t count);
 
 // Tear down exports created by wki_ipc_export_task_fds() for one submitted task.
 // This is idempotent and is used when submit/cancel/complete cleanup must not
@@ -354,18 +406,21 @@ void wki_ipc_handle_dev_op_resp(uint16_t src_node, uint16_t channel, const uint8
 #ifdef WOS_SELFTEST
 auto wki_ipc_selftest_poll_state_response_refs() -> int;
 auto wki_ipc_selftest_export_compaction_frees() -> int;
+auto wki_ipc_selftest_task_fd_handoff_transfers_exact_owner() -> int;
 auto wki_ipc_selftest_failed_export_write_releases_all_file_refs() -> int;
 auto wki_ipc_selftest_message_pipe_flow_updates_proxy() -> int;
 auto wki_ipc_selftest_cleanup_for_peer_drains_over_capacity() -> int;
 auto wki_ipc_selftest_cleanup_for_peer_drains_deferred_dev_ops() -> int;
 auto wki_ipc_selftest_large_dev_op_work_coallocates_payload() -> int;
 auto wki_ipc_selftest_large_dev_op_work_backs_pipe_chunk() -> int;
+auto wki_ipc_selftest_dev_op_work_pool_is_bounded() -> int;
 auto wki_ipc_selftest_poll_wake_drains_over_capacity() -> int;
 auto wki_ipc_selftest_inactive_proxy_poll_is_terminal() -> int;
 auto wki_ipc_selftest_pty_proxy_poll_is_bidirectional() -> int;
 auto wki_ipc_selftest_pty_close_without_export_queues_pending() -> int;
 auto wki_ipc_selftest_pending_close_promotes_on_poll() -> int;
 auto wki_ipc_selftest_discard_retires_unattached_delivery() -> int;
+auto wki_ipc_selftest_stopped_pump_publishes_discard_fence() -> int;
 auto wki_ipc_selftest_epoll_close_releases_lookup_ref() -> int;
 auto wki_ipc_selftest_nonblocking_pipe_write_view_preserves_source_flags() -> int;
 auto wki_ipc_selftest_export_pipe_write_burst_is_bounded() -> int;
@@ -383,6 +438,11 @@ void wki_ipc_cleanup_for_peer(uint16_t node_id);
 
 // Shared proxy teardown helper for non-pipe proxy fops.
 void wki_ipc_detach_proxy_file(ker::vfs::File* f, ProxyIpcState* proxy);
+
+// Reliably publish a terminal proxy operation before detaching its File.
+// The message is copied into the bounded asynchronous close queue when the
+// reliable transport cannot take ownership immediately.
+void wki_ipc_send_proxy_close(ProxyIpcState* proxy, const uint8_t* msg, uint16_t msg_size, uint32_t resource_id, uint16_t op_id);
 
 // Cancel a locally published proxy control waiter before the caller unwinds.
 // Safe when a send failed before wki_wait_for_op() started sleeping; if a

@@ -164,6 +164,8 @@ wosdbg --tool wosdbg.load_log --arguments '{"path":"perf.jsonl"}'
   typed records. WOSDBG additionally bounds file bytes, line bytes, and record
   count before retaining entries.
 
-For live rootless validation, append `--no-setup` to `bin/wos-ktest` or
-`bin/wos-cluster`; this reuses an existing topology without requiring root
-setup access.
+For live rootless validation and debugging, agents can append `--no-setup` to
+`bin/wos-ktest` or to a `bin/wos-cluster --launch` command. This lets them run
+and debug WOS live without acquiring root access, provided the bridges, TAPs,
+shared-memory topology, and user-owned VM artifacts were configured earlier.
+See `docs/wki_chaos.md` for the deterministic campaign and artifact contract.

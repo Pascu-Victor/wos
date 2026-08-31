@@ -1,0 +1,106 @@
+{
+  "zones": [
+    {
+      "id": "GLOBAL",
+      "debug": false,
+      "mtu": 9000,
+      "nic_model": "virtio-net-pci",
+      "ivshmem": {
+        "enabled": false,
+        "size": "16M",
+        "root_path": "/tmp/wos-wki-chaos-routed-ivshmem",
+        "topology": "full-mesh"
+      },
+      "bridge": {
+        "stp": false,
+        "ip": null
+      },
+      "vm": {
+        "memory": "4G",
+        "cpus": 4,
+        "disk0": "wki-chaos-data/disk.qcow2",
+        "disk1": "wki-chaos-data/mountfs.qcow2"
+      }
+    },
+    {
+      "id": 0,
+      "name": "lan",
+      "nodes": 3,
+      "nic_queues": 2,
+      "vhost": false,
+      "netdev_driver": "dhcp",
+      "bridge": {
+        "ip": "10.10.0.100/24",
+        "dns": "10.10.0.1"
+      },
+      "nodes_config": [
+        {
+          "id": 0,
+          "hostname": "wos-0",
+          "vm": {
+            "overlay_dir": "wki-chaos-data/routed-overlays",
+            "serial_log": "wki-chaos-data/routed-serial-vm0.log",
+            "qemu_log": "wki-chaos-data/routed-qemu-vm0.log",
+            "qmp_socket": "wki-chaos-data/routed-qmp-vm0.sock"
+          }
+        },
+        {
+          "id": 1,
+          "hostname": "wos-1",
+          "vm": {
+            "overlay_dir": "wki-chaos-data/routed-overlays",
+            "serial_log": "wki-chaos-data/routed-serial-vm1.log",
+            "qemu_log": "wki-chaos-data/routed-qemu-vm1.log",
+            "qmp_socket": "wki-chaos-data/routed-qmp-vm1.sock"
+          }
+        },
+        {
+          "id": 2,
+          "hostname": "wos-2",
+          "vm": {
+            "overlay_dir": "wki-chaos-data/routed-overlays",
+            "serial_log": "wki-chaos-data/routed-serial-vm2.log",
+            "qemu_log": "wki-chaos-data/routed-qemu-vm2.log",
+            "qmp_socket": "wki-chaos-data/routed-qmp-vm2.sock"
+          }
+        }
+      ]
+    },
+    {
+      "id": 1,
+      "name": "wki-a",
+      "nodes": 2,
+      "node_ids": [0, 1],
+      "nic_queues": 1,
+      "vhost": false,
+      "netdev_driver": "wki",
+      "qemu_netdev": {
+        "type": "socket-mcast",
+        "address": "239.192.87.1",
+        "port": 47801,
+        "localaddr": "127.0.0.1"
+      },
+      "ivshmem": {
+        "enabled": false
+      }
+    },
+    {
+      "id": 2,
+      "name": "wki-b",
+      "nodes": 2,
+      "node_ids": [1, 2],
+      "nic_queues": 1,
+      "vhost": false,
+      "netdev_driver": "wki",
+      "qemu_netdev": {
+        "type": "socket-mcast",
+        "address": "239.192.87.2",
+        "port": 47802,
+        "localaddr": "127.0.0.1"
+      },
+      "ivshmem": {
+        "enabled": false
+      }
+    }
+  ]
+}

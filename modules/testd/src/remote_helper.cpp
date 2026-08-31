@@ -104,13 +104,18 @@ auto run_remote_helper(int argc, char** argv) -> int {
         close(FD);
         return 0;
     }
-    if (std::strcmp(mode, "epoll-add") == 0) {
-        if (argc < 5) {
+    if (std::strcmp(mode, "epoll-owner-local") == 0) {
+        if (argc < 6) {
             close(FD);
             return 1;
         }
         int const TARGET_FD = parse_int_arg(argv[4]);
         if (TARGET_FD < 0) {
+            close(FD);
+            return 1;
+        }
+        std::array<char, 64> hostname{};
+        if (gethostname(hostname.data(), hostname.size() - 1) != 0 || std::strcmp(hostname.data(), argv[5]) != 0) {
             close(FD);
             return 1;
         }

@@ -4,11 +4,13 @@ Shared single-node VM setup helpers for WOS launch scripts.
 
 The cluster topology code owns bridges, TAP creation, and multi-node layout.
 This module owns the common per-node VM spec: overlay disks, QEMU arguments,
-fw_cfg hostname, NIC device arguments, and per-node mountfs injection.
+fw_cfg hostname/early NIC policy, NIC device arguments, and per-node mountfs
+injection.
 """
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import subprocess
@@ -58,6 +60,49 @@ def merge_section(base: dict, override: dict) -> dict:
     return result
 
 
+def normalize_qemu_netdev(raw: dict, *, queues: int, vhost: bool, where: str) -> dict:
+    if not isinstance(raw, dict):
+        raise ValueError(f"{where} must be an object")
+    required_fields = {"type", "address", "port"}
+    allowed_fields = required_fields | {"localaddr"}
+    if not required_fields.issubset(raw) or not set(raw).issubset(allowed_fields):
+        raise ValueError(
+            f"{where} must contain type, address, and port, with optional localaddr"
+        )
+    if raw["type"] != "socket-mcast":
+        raise ValueError(f"{where}.type must be socket-mcast")
+    address = raw["address"]
+    if not isinstance(address, str):
+        raise ValueError(f"{where}.address must be a multicast IPv4 address")
+    try:
+        parsed = ipaddress.ip_address(address)
+    except ValueError as exc:
+        raise ValueError(f"{where}.address must be a multicast IPv4 address") from exc
+    if parsed.version != 4 or not parsed.is_multicast:
+        raise ValueError(f"{where}.address must be a multicast IPv4 address")
+    port = raw["port"]
+    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+        raise ValueError(f"{where}.port must be an integer in [1, 65535]")
+    localaddr = raw.get("localaddr")
+    if localaddr is not None:
+        if not isinstance(localaddr, str):
+            raise ValueError(f"{where}.localaddr must be an IPv4 address")
+        try:
+            parsed_localaddr = ipaddress.ip_address(localaddr)
+        except ValueError as exc:
+            raise ValueError(f"{where}.localaddr must be an IPv4 address") from exc
+        if parsed_localaddr.version != 4:
+            raise ValueError(f"{where}.localaddr must be an IPv4 address")
+    if isinstance(queues, bool) or int(queues) != 1:
+        raise ValueError(f"{where} requires queues=1")
+    if vhost:
+        raise ValueError(f"{where} requires vhost=false")
+    normalized = {"type": "socket-mcast", "address": str(parsed), "port": port}
+    if localaddr is not None:
+        normalized["localaddr"] = str(parsed_localaddr)
+    return normalized
+
+
 def normalize_node_spec(raw: dict) -> dict:
     """Return a node spec with defaults applied.
 
@@ -73,6 +118,15 @@ def normalize_node_spec(raw: dict) -> dict:
     spec["debug"] = bool(spec.get("debug", False))
     spec["vm"] = merge_section(DEFAULT_VM_CONFIG, spec.get("vm", {}))
     spec["nics"] = [deepcopy(nic) for nic in spec.get("nics", [])]
+    for nic_index, nic in enumerate(spec["nics"]):
+        backend = nic.get("qemu_netdev")
+        if backend is not None:
+            nic["qemu_netdev"] = normalize_qemu_netdev(
+                backend,
+                queues=nic.get("queues", nic.get("nic_queues", 1)),
+                vhost=bool(nic.get("vhost", False)),
+                where=f"nics[{nic_index}].qemu_netdev",
+            )
     spec["ivshmem"] = [deepcopy(dev) for dev in spec.get("ivshmem", [])]
     return spec
 
@@ -91,6 +145,16 @@ def node_hostname(spec: dict) -> str:
 
 def node_debug_enabled(spec: dict, force_debug: bool = False) -> bool:
     return bool(spec.get("debug", False) or force_debug)
+
+
+def netdev_assignments(spec: dict) -> list[tuple[str, str]]:
+    spec = normalize_node_spec(spec)
+    assignments = []
+    for nic_idx, nic in enumerate(spec.get("nics", [])):
+        ifname = nic.get("ifname", f"eth{nic_idx}")
+        driver = nic.get("driver", nic.get("netdev_driver", "unmanaged"))
+        assignments.append((ifname, driver))
+    return assignments
 
 
 def overlay_paths(spec: dict) -> tuple[Path, Path]:
@@ -115,6 +179,25 @@ def qemu_log_path(spec: dict, tcg_level: str | None = None) -> Path:
     if tcg_level is not None:
         return Path(vm_cfg.get("tcg_log", f"qemu-vm{node_id(spec)}-cpu%d.log"))
     return Path(vm_cfg.get("qemu_log", f"qemu-vm{node_id(spec)}.log"))
+
+
+def qmp_socket_path(spec: dict) -> Path | None:
+    """Return the configured QMP socket, including the legacy USB location."""
+    spec = normalize_node_spec(spec)
+    vm_cfg = spec["vm"]
+    configured = vm_cfg.get("qmp_socket")
+    if configured is not None:
+        if not isinstance(configured, str) or not configured:
+            raise ValueError("vm.qmp_socket must be a non-empty path string")
+        return Path(configured)
+
+    usb_hotplug = vm_cfg.get("usb_hotplug", {})
+    if isinstance(usb_hotplug, dict) and usb_hotplug.get("enabled", False):
+        legacy = usb_hotplug.get("qmp_socket", f"qmp-vm{node_id(spec)}.sock")
+        if not isinstance(legacy, str) or not legacy:
+            raise ValueError("vm.usb_hotplug.qmp_socket must be a non-empty path string")
+        return Path(legacy)
+    return None
 
 
 def run_shell(cmd: str, check=True, quiet=False, privileged=False) -> bool:
@@ -203,11 +286,9 @@ def cleanup_node_logs(spec: dict):
     if serial_log.exists():
         serial_log.unlink()
 
-    usb_hotplug = spec["vm"].get("usb_hotplug", {})
-    if isinstance(usb_hotplug, dict) and usb_hotplug.get("enabled", False):
-        qmp_socket = Path(usb_hotplug.get("qmp_socket", f"qmp-vm{nid}.sock"))
-        if qmp_socket.exists() or qmp_socket.is_socket():
-            qmp_socket.unlink()
+    qmp_socket = qmp_socket_path(spec)
+    if qmp_socket is not None and (qmp_socket.exists() or qmp_socket.is_socket()):
+        qmp_socket.unlink()
 
 
 def build_qemu_args(
@@ -279,8 +360,6 @@ def build_qemu_args(
 
     usb_hotplug = vm_cfg.get("usb_hotplug", {})
     if isinstance(usb_hotplug, dict) and usb_hotplug.get("enabled", False):
-        qmp_socket = Path(usb_hotplug.get("qmp_socket", f"qmp-vm{nid}.sock"))
-        qmp_socket.parent.mkdir(parents=True, exist_ok=True)
         xhci_id = str(usb_hotplug.get("controller_id", "xhci"))
         usb2_ports = int(usb_hotplug.get("usb2_ports", 4))
         usb3_ports = int(usb_hotplug.get("usb3_ports", 4))
@@ -288,29 +367,41 @@ def build_qemu_args(
             [
                 "-device",
                 f"qemu-xhci,id={xhci_id},p2={usb2_ports},p3={usb3_ports}",
-                "-qmp",
-                f"unix:{qmp_socket},server=on,wait=off",
             ]
         )
 
+    qmp_socket = qmp_socket_path(spec)
+    if qmp_socket is not None:
+        qmp_socket.parent.mkdir(parents=True, exist_ok=True)
+        args.extend(["-qmp", f"unix:{qmp_socket},server=on,wait=off"])
+
     for nic_idx, nic in enumerate(spec.get("nics", [])):
         nic_model = nic.get("model", nic.get("nic_model", "virtio-net-pci"))
-        tap = nic["tap"]
         mac = nic["mac"]
         num_queues = int(nic.get("queues", nic.get("nic_queues", 1)))
         use_vhost = bool(nic.get("vhost", False))
-        netdev_options = [
-            f"tap,id=net{nic_idx}",
-            f"ifname={tap}",
-            "script=no",
-            "downscript=no",
-        ]
-        if use_vhost:
-            netdev_options.append("vhost=on")
+        backend = nic.get("qemu_netdev")
+        if backend is not None:
+            netdev_options = [
+                f"socket,id=net{nic_idx}",
+                f"mcast={backend['address']}:{backend['port']}",
+            ]
+            if "localaddr" in backend:
+                netdev_options.append(f"localaddr={backend['localaddr']}")
         else:
-            netdev_options.append("vnet_hdr=off")
-        if num_queues > 1:
-            netdev_options.append(f"queues={num_queues}")
+            tap = nic["tap"]
+            netdev_options = [
+                f"tap,id=net{nic_idx}",
+                f"ifname={tap}",
+                "script=no",
+                "downscript=no",
+            ]
+            if use_vhost:
+                netdev_options.append("vhost=on")
+            else:
+                netdev_options.append("vnet_hdr=off")
+            if num_queues > 1:
+                netdev_options.append(f"queues={num_queues}")
 
         device_options = [f"{nic_model},netdev=net{nic_idx}", f"mac={mac}"]
         if nic_model.startswith("virtio-net"):
@@ -331,6 +422,11 @@ def build_qemu_args(
         )
 
     fw_cfg = {"opt/wos/hostname": node_hostname(spec)}
+    assignments = netdev_assignments(spec)
+    if assignments:
+        fw_cfg["opt/wos/netdevs"] = ";".join(
+            f"{ifname} {driver}" for ifname, driver in assignments
+        )
     for entry in spec.get("fw_cfg", []):
         fw_cfg[entry["name"]] = entry["string"]
     for name, value in fw_cfg.items():
@@ -357,16 +453,13 @@ def build_qemu_args(
 
 
 def netdevs_content(spec: dict, generated_by: str = "node_setup.py") -> str:
-    spec = normalize_node_spec(spec)
     lines = [
         f"# /etc/netdevs - generated by {generated_by}",
         "# Format: <ifname> <driver>",
         "# Drivers: wki, dhcp, linklocal, unmanaged",
         "",
     ]
-    for nic_idx, nic in enumerate(spec.get("nics", [])):
-        ifname = nic.get("ifname", f"eth{nic_idx}")
-        driver = nic.get("driver", nic.get("netdev_driver", "unmanaged"))
+    for ifname, driver in netdev_assignments(spec):
         lines.append(f"{ifname} {driver}")
     return "\n".join(lines) + "\n"
 

@@ -6,6 +6,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 IVSHMEM_CPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "transport_ivshmem.cpp"
+INIT_WRAPPERS_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "init" / "init_wrappers.cpp"
 
 
 def fail(message: str) -> None:
@@ -91,9 +92,25 @@ def test_rdma_bitmap_allocation_and_free_are_irq_safe() -> None:
     )
 
 
+def test_explicit_wki_boot_selection_reserves_the_single_ivshmem_device() -> None:
+    source = INIT_WRAPPERS_CPP.read_text()
+    body = function_body(source, "ivshmem_init")
+    require_order(
+        body,
+        [
+            'cmdline_has_token(get_kernel_cmdline(), "wki.ivshmem")',
+            "Reserving ivshmem device for WKI RDMA transport",
+            "return;",
+            "dev::ivshmem::ivshmem_net_init()",
+        ],
+        "single-device ivshmem ownership selection",
+    )
+
+
 def main() -> None:
     test_peer_ready_wait_deadline_is_saturating()
     test_rdma_bitmap_allocation_and_free_are_irq_safe()
+    test_explicit_wki_boot_selection_reserves_the_single_ivshmem_device()
     print("WKI ivshmem source invariants hold")
 
 

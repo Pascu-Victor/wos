@@ -22,6 +22,13 @@ auto wki_peer_find(uint16_t /*node_id*/) -> WkiPeer* { return nullptr; }
 
 auto wki_now_us() -> uint64_t { return 0; }
 
+auto wki_transport_send(WkiTransport* transport, uint16_t neighbor_id, const void* data, uint16_t len) -> int {
+    if (transport == nullptr || transport->tx == nullptr) {
+        return WKI_ERR_TX_FAILED;
+    }
+    return transport->tx(transport, neighbor_id, data, len);
+}
+
 }  // namespace ker::net::wki
 
 // =============================================================================
@@ -48,6 +55,7 @@ TEST(WkiChannel, RtoDefaults) {
     EXPECT_EQ(ch.retransmit_head, nullptr);
     EXPECT_EQ(ch.retransmit_tail, nullptr);
     EXPECT_EQ(ch.retransmit_count, 0u);
+    EXPECT_FALSE(ch.retransmit_in_progress);
 }
 
 TEST(WkiChannel, StatsInitZero) {
@@ -67,6 +75,7 @@ TEST(WkiChannel, DupAckInitZero) {
     WkiChannel ch{};
     EXPECT_EQ(ch.last_dup_ack, 0u);
     EXPECT_EQ(ch.dup_ack_count, 0u);
+    EXPECT_EQ(ch.fast_retransmit_seq, WKI_ACK_NONE);
 }
 
 TEST(WkiChannel, ResetClearsPostFenceReliabilityState) {
@@ -89,8 +98,10 @@ TEST(WkiChannel, ResetClearsPostFenceReliabilityState) {
     ch.srtt_us = 123;
     ch.rttvar_us = 456;
     ch.retransmit_deadline = std::numeric_limits<uint64_t>::max();
+    ch.retransmit_in_progress = true;
     ch.last_dup_ack = 96;
     ch.dup_ack_count = WKI_FAST_RETRANSMIT_THRESH;
+    ch.fast_retransmit_seq = 41;
     ch.bytes_sent = 111;
     ch.bytes_received = 222;
     ch.retransmits = 3;
@@ -105,8 +116,8 @@ TEST(WkiChannel, ResetClearsPostFenceReliabilityState) {
     ch.retransmit_tail = rt;
     ch.retransmit_count = 1;
 
-    auto* ro = new WkiReorderEntry{};
-    ro->data = new uint8_t[2]{};
+    auto* ro = wki_reorder_entry_reserve(2);
+    ASSERT_NE(ro, nullptr);
     ro->len = 2;
     ro->seq = 100;
     ch.reorder_head = ro;
@@ -131,10 +142,12 @@ TEST(WkiChannel, ResetClearsPostFenceReliabilityState) {
     EXPECT_EQ(ch.retransmit_head, nullptr);
     EXPECT_EQ(ch.retransmit_tail, nullptr);
     EXPECT_EQ(ch.retransmit_count, 0u);
+    EXPECT_FALSE(ch.retransmit_in_progress);
     EXPECT_EQ(ch.reorder_head, nullptr);
     EXPECT_EQ(ch.reorder_count, 0u);
     EXPECT_EQ(ch.last_dup_ack, 0u);
     EXPECT_EQ(ch.dup_ack_count, 0u);
+    EXPECT_EQ(ch.fast_retransmit_seq, WKI_ACK_NONE);
     EXPECT_EQ(ch.rto_us, WKI_INITIAL_RTO_US);
     EXPECT_EQ(ch.srtt_us, 0u);
     EXPECT_EQ(ch.rttvar_us, 0u);
@@ -232,6 +245,40 @@ TEST(WkiChannel, HeapRetransmitEntryOwnsContiguousExactFrameStorage) {
 
     wki_retransmit_entry_release(nullptr, entry);
     EXPECT_EQ(wki_retransmit_entry_alloc(WKI_MAX_FRAME_SIZE + 1), nullptr);
+}
+
+TEST(WkiChannel, FixedReorderPoolOwnsMaximumPayloadAndReusesReleasedSlot) {
+    auto* entry = wki_reorder_entry_reserve(WKI_ETH_MAX_PAYLOAD);
+    ASSERT_NE(entry, nullptr);
+    EXPECT_NE(entry->data, nullptr);
+    EXPECT_NE(entry->pool_slot, WKI_REORDER_POOL_INVALID_SLOT);
+    uint16_t const SLOT = entry->pool_slot;
+    entry->data[0] = 0x12;
+    entry->data[WKI_ETH_MAX_PAYLOAD - 1] = 0x34;
+    EXPECT_EQ(entry->data[0], 0x12);
+    EXPECT_EQ(entry->data[WKI_ETH_MAX_PAYLOAD - 1], 0x34);
+    wki_reorder_entry_release(entry);
+
+    auto* reused = wki_reorder_entry_reserve(1);
+    ASSERT_NE(reused, nullptr);
+    EXPECT_EQ(reused->pool_slot, SLOT);
+    wki_reorder_entry_release(reused);
+    EXPECT_EQ(wki_reorder_entry_reserve(static_cast<uint16_t>(WKI_ETH_MAX_PAYLOAD + 1)), nullptr);
+}
+
+TEST(WkiChannel, FixedReorderPoolExhaustionIsBoundedAndRecoverable) {
+    std::array<WkiReorderEntry*, WKI_REORDER_POOL_CAPACITY> entries{};
+    for (auto& entry : entries) {
+        entry = wki_reorder_entry_reserve(0);
+        ASSERT_NE(entry, nullptr);
+    }
+    EXPECT_EQ(wki_reorder_entry_reserve(0), nullptr);
+    for (auto* entry : entries) {
+        wki_reorder_entry_release(entry);
+    }
+    auto* recovered = wki_reorder_entry_reserve(0);
+    ASSERT_NE(recovered, nullptr);
+    wki_reorder_entry_release(recovered);
 }
 
 // =============================================================================

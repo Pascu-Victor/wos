@@ -275,3 +275,42 @@ KTEST(WkiPeerHandshake, RemoteBootEpochDetectsRestart) {
 KTEST(WkiPeerHandshake, BootEpochAdvancesLocalChannelEpoch) {
     KEXPECT_TRUE(ker::net::wki::wki_peer_selftest_boot_epoch_advances_local_channel_epoch());
 }
+
+KTEST(WkiPeerHandshake, InitialChannelEpochFencesPreHandshakeStream) {
+    KEXPECT_TRUE(ker::net::wki::wki_peer_selftest_initial_channel_epoch_fences_pre_handshake_stream());
+}
+
+KTEST(WkiPeerHandshake, InitialEpochObservationPreservesAckedStream) {
+    KEXPECT_TRUE(ker::net::wki::wki_peer_selftest_initial_epoch_observation_preserves_acked_stream());
+}
+
+KTEST(WkiPeerHandshake, FencedHostnameRetiresToNodeIdentity) {
+    KEXPECT_TRUE(ker::net::wki::wki_peer_selftest_fenced_hostname_retires_to_node_identity());
+}
+
+KTEST(WkiPeerHandshake, RoutedHelloClassificationPreservesDirectNeighbors) {
+    WkiHeader header{};
+    header.dst_node = WKI_NODE_BROADCAST;
+    header.hop_ttl = WKI_DEFAULT_TTL;
+    KEXPECT_FALSE(wki_peer_frame_was_forwarded(&header));
+    KEXPECT_EQ(wki_peer_hello_path(&header, true, 2, false), WkiPeerHelloPath::DIRECT);
+
+    header.dst_node = 0x2345;
+    header.hop_ttl = WKI_DEFAULT_TTL;
+    KEXPECT_FALSE(wki_peer_frame_was_forwarded(&header));
+    KEXPECT_EQ(wki_peer_hello_path(&header, true, 1, false), WkiPeerHelloPath::DIRECT);
+
+    // A targeted direct HELLO uses TTL=1 but still has a one-hop SPF route.
+    header.hop_ttl = 1;
+    KEXPECT_TRUE(wki_peer_frame_was_forwarded(&header));
+    KEXPECT_EQ(wki_peer_hello_path(&header, true, 1, true), WkiPeerHelloPath::DIRECT);
+
+    // The same TTL can be the last hop of a long routed path; SPF disambiguates it.
+    KEXPECT_EQ(wki_peer_hello_path(&header, true, 15, false), WkiPeerHelloPath::ROUTED);
+    KEXPECT_EQ(wki_peer_hello_path(&header, false, 15, false), WkiPeerHelloPath::UNRESOLVED);
+
+    header.hop_ttl = WKI_DEFAULT_TTL - 1;
+    KEXPECT_TRUE(wki_peer_frame_was_forwarded(&header));
+    KEXPECT_EQ(wki_peer_hello_path(&header, true, 2, false), WkiPeerHelloPath::ROUTED);
+    KEXPECT_EQ(wki_peer_hello_path(&header, false, 0, false), WkiPeerHelloPath::UNRESOLVED);
+}

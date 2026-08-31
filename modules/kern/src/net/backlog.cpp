@@ -358,6 +358,34 @@ auto backlog_selftest_enqueue_wake_mode_classification() -> bool {
            BATCH_VALID && POST_DRAIN_WAKE_MODE == ker::mod::sched::WakeCpuMode::FORCE &&
            queue.head.load(std::memory_order_relaxed) == &first && queue.depth.load(std::memory_order_relaxed) == 1;
 }
+
+auto backlog_selftest_roce_flow_hash_preserves_frame_order() -> bool {
+    static PacketBuffer first{};
+    static PacketBuffer second{};
+
+    auto prepare = [](PacketBuffer& pkt) {
+        pkt.data = pkt.storage.data() + PKT_HEADROOM;
+        pkt.len = proto::ETH_HLEN + sizeof(wki::WkiHeader);
+        std::memset(pkt.data, 0, pkt.len);
+
+        auto* eth = reinterpret_cast<proto::EthernetHeader*>(pkt.data);
+        eth->src = proto::MacAddress{{0x02, 0x00, 0x00, 0x00, 0x00, 0x01}};
+        eth->dst = proto::MacAddress{{0x02, 0x00, 0x00, 0x00, 0x00, 0x02}};
+        eth->ethertype = htons(proto::ETH_TYPE_WKI_ROCE);
+    };
+    prepare(first);
+    prepare(second);
+
+    uint64_t const EXPECTED_QUEUE = backlog_flow_hash(&first, BACKLOG_SNAPSHOT_MAX_CPUS);
+    auto* payload = second.data + proto::ETH_HLEN;
+    for (size_t i = 0; i < sizeof(wki::WkiHeader); ++i) {
+        payload[i] = static_cast<uint8_t>(i + 1);
+        if (backlog_flow_hash(&second, BACKLOG_SNAPSHOT_MAX_CPUS) != EXPECTED_QUEUE) {
+            return false;
+        }
+    }
+    return true;
+}
 #endif
 
 void backlog_init() {
@@ -440,8 +468,11 @@ auto backlog_flow_hash(PacketBuffer* pkt, uint64_t num_cpus) -> uint64_t {
         h = mix_hash(h, static_cast<uint32_t>(eth->dst.at(i)));
     }
 
-    if ((ETHERTYPE == proto::ETH_TYPE_WKI || ETHERTYPE == proto::ETH_TYPE_WKI_ROCE) &&
-        pkt->len >= sizeof(proto::EthernetHeader) + sizeof(wki::WkiHeader)) {
+    // WKI channels are independent reliable flows and may be spread across
+    // backlog CPUs. RoCE is one ordered raw-Ethernet stream per MAC direction:
+    // parsing its payload as a WkiHeader made fragment offsets/rkeys steer
+    // consecutive RDMA writes and their doorbell to different queues.
+    if (ETHERTYPE == proto::ETH_TYPE_WKI && pkt->len >= sizeof(proto::EthernetHeader) + sizeof(wki::WkiHeader)) {
         const auto* hdr = reinterpret_cast<const wki::WkiHeader*>(pkt->data + sizeof(proto::EthernetHeader));
         h = mix_hash(h, static_cast<uint32_t>(hdr->src_node));
         h = mix_hash(h, static_cast<uint32_t>(hdr->dst_node));

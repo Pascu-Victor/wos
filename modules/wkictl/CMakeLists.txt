@@ -7,9 +7,11 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 set(WKICTL_SOURCES
+    src/chaos.cpp
     src/cli.cpp
     src/dispatch.cpp
     src/main.cpp
+    src/peer_resolver.cpp
     src/perf.cpp
     src/target.cpp
     src/vfs.cpp

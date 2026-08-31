@@ -107,6 +107,10 @@ struct WkiZone {
 // Initialize the zone subsystem. Called from wki_init().
 void wki_zone_init();
 
+// Start the task-context worker that performs allocation-bearing zone-create
+// request/ACK completion after bounded RX admission.
+void wki_zone_worker_start();
+
 // Create a shared memory zone with a peer.
 // Sends ZONE_CREATE_REQ and blocks until ACK (or timeout).
 // Returns WKI_OK on success, negative error code on failure.

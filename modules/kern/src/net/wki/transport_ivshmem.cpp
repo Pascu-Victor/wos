@@ -381,7 +381,7 @@ void ivshmem_wki_irq(uint8_t /*vector*/, void* data) {
         }
 
         if (priv->rx_handler != nullptr) {
-            priv->rx_handler(&s_ivshmem_transport, buf.data(), LEN);
+            priv->rx_handler(&s_ivshmem_transport, buf.data(), LEN, nullptr);
         }
     }
 }

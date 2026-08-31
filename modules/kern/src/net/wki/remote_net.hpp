@@ -108,6 +108,46 @@ struct ProxyNetState {
     std::atomic<bool> retiring{false};
 };
 
+constexpr size_t WKI_REMOTE_NET_DIAG_MAX = WKI_MAX_PEERS;
+
+struct WkiRemoteNetDiagRow {
+    uint16_t owner_node = WKI_NODE_INVALID;
+    uint16_t assigned_channel = 0;
+    uint32_t channel_generation = 0;
+    uint32_t resource_id = 0;
+    uint64_t resource_generation = 0;
+    uint32_t refs = 0;
+    bool detail_complete = false;
+    bool active = false;
+    bool attaching = false;
+    bool netdev_registered = false;
+    bool ever_published = false;
+    bool epoch_reset_pending = false;
+    bool cleanup_started = false;
+    bool cleanup_complete = false;
+    bool retiring = false;
+    bool op_pending = false;
+    uint16_t op_expected_id = 0;
+    uint16_t op_expected_seq = 0;
+    bool op_waiter_owned = false;
+    bool attach_pending = false;
+    bool attach_waiter_owned = false;
+    uint8_t attach_cookie = 0;
+    uint8_t attach_expected_cookie = 0;
+    uint32_t binding_peer_boot_epoch = 0;
+    bool detach_pending = false;
+    bool detach_retry_in_progress = false;
+    uint8_t detach_attach_cookie = 0;
+    uint32_t detach_peer_boot_epoch = 0;
+    uint16_t rx_credits_remaining = 0;
+    uint64_t rx_packets = 0;
+    uint64_t rx_bytes = 0;
+    uint64_t rx_dropped = 0;
+    uint64_t tx_packets = 0;
+    uint64_t tx_bytes = 0;
+    uint64_t tx_dropped = 0;
+};
+
 // -----------------------------------------------------------------------------
 // Public API
 // -----------------------------------------------------------------------------
@@ -122,6 +162,10 @@ auto wki_remote_net_attach(uint16_t owner_node, uint32_t resource_id, const char
 
 // Consumer side: true if a proxy for this remote NIC is already active.
 auto wki_remote_net_has_proxy(uint16_t owner_node, uint32_t resource_id) -> bool;
+
+// Copy every retained proxy row, including inactive tombstones, under the
+// registry lock. No pointer escapes and no allocation is performed.
+auto wki_remote_net_diag_snapshot(WkiRemoteNetDiagRow* rows, size_t capacity, size_t* total) -> size_t;
 
 // Consumer side: detach from a remote NIC
 void wki_remote_net_detach(net::NetDevice* proxy_dev);
