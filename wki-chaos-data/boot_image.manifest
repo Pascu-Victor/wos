@@ -1,0 +1,6 @@
+version	1
+partition	2048	1845247	11044da0-352d-480a-9ef3-f995f3ac3f8b	512
+file	kernel	51594328	c458ea233004b2dbb2831e1b0732bd727a11c00d4a1732ef596ed3ec0815740e	/home/womywomwoo/git/wos/build/modules/kern/wos
+file	limine	175	772f05c9c4e25361bb7be7a39f2423154aef5e58dd172ac70ccc6fb0dfc99a5b	/tmp/tmp.t7rMnHmb2d
+file	bootloader	368640	1dd21bad793cffb98b8cb8fe29d9a73795e6016705a5c9b58091f3d6325745a5	/usr/share/limine/BOOTX64.EFI
+file	initramfs	8617984	0bf6312f38c5130446ff3a43e88e97bf3994e7982124319b62438fca8b5164a0	/home/womywomwoo/git/wos/build/initramfs.cpio

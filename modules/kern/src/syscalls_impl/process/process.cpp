@@ -354,6 +354,11 @@ void snapshot_fpu_state_for_fork(ker::mod::sched::task::Task* parent, ker::mod::
     child->fx_state.initialized = parent->fx_state.initialized;
 }
 
+auto fork_child_return_regs(ker::mod::cpu::GPRegs entry_regs) -> ker::mod::cpu::GPRegs {
+    entry_regs.rax = 0;
+    return entry_regs;
+}
+
 auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     using namespace ker::mod;
 
@@ -376,16 +381,20 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
         return finish_fork(-ENOMEM);
     }
 
+    // Snapshot the syscall-entry register block after any pressure-reclaim
+    // yield, but before fork allocation/COW work can be timer-preempted. A
+    // kernel-mode timer preemption may replace parent->context.regs with the
+    // interrupted kernel context; it must never become the child's user
+    // return state.
+    ker::mod::cpu::GPRegs const FORK_ENTRY_REGS = gpr;
+    parent->context.regs = FORK_ENTRY_REGS;
+
     // --- Allocate child kernel stack ---
     auto const KERNEL_STACK_BASE = alloc_fork_kernel_stack_with_reclaim();
     if (KERNEL_STACK_BASE == 0) {
         return finish_fork(-ENOMEM);
     }
     uint64_t const KERNEL_RSP = KERNEL_STACK_BASE + ker::mod::mm::KERNEL_STACK_SIZE;
-
-    // Save parent's register context after any pressure-reclaim yield; this
-    // snapshot is copied into the child as the fork return frame.
-    parent->context.regs = gpr;
 
     // --- Allocate child Task without the ELF-loading constructor ---
     auto* child = new sched::task::Task{};
@@ -586,8 +595,9 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     per_cpu->cpu_id = cpu::current_cpu();
     child->context.syscall_scratch_area = reinterpret_cast<uint64_t>(per_cpu);
 
-    // Copy parent's register context - child will resume at the same RIP
-    child->context.regs = parent->context.regs;
+    // Resume from the immutable syscall-entry state, not the parent's mutable
+    // scheduler context, which may now describe an in-kernel preemption.
+    child->context.regs = fork_child_return_regs(FORK_ENTRY_REGS);
     child->context.int_no = 0;
     child->context.error_code = 0;
 
@@ -621,9 +631,6 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
                                                             ker::mod::sched::task::SavedFrameOrigin::SYNTHETIC_USER_RETURN);
 
     log_unmapped_child_resume_state(parent, child, return_rip, user_rsp, return_flags);
-
-    // Child returns 0 from fork
-    child->context.regs.rax = 0;
 
     // --- Clone file descriptors ---
     if (!clone_fd_table_shared_checked(parent, child)) {
@@ -1527,6 +1534,24 @@ auto process_selftest_fd_clone_failure_releases_refs() -> bool {
     bool ok = !CLONED && file.refcount.load(std::memory_order_relaxed) == 1 && child.fd_table.lookup(FD) == nullptr;
     parent.fd_table.remove(FD);
     return ok;
+}
+
+auto process_selftest_fork_child_preserves_entry_registers() -> bool {
+    ker::mod::cpu::GPRegs entry_regs{};
+    entry_regs.r15 = 0x00007fff'fffff150ULL;
+    entry_regs.r14 = 0x00007fff'fffff140ULL;
+    entry_regs.r13 = 0x00007fff'fffff130ULL;
+    entry_regs.r12 = 0x00007fff'fffff120ULL;
+    entry_regs.r11 = 0x246;
+    entry_regs.rbp = 0x00007fff'fffff100ULL;
+    entry_regs.rcx = 0x00000000'00401000ULL;
+    entry_regs.rbx = 0x00007fff'fffff0b0ULL;
+    entry_regs.rax = 0x1234;
+
+    ker::mod::cpu::GPRegs const CHILD_REGS = fork_child_return_regs(entry_regs);
+    return CHILD_REGS.r15 == entry_regs.r15 && CHILD_REGS.r14 == entry_regs.r14 && CHILD_REGS.r13 == entry_regs.r13 &&
+           CHILD_REGS.r12 == entry_regs.r12 && CHILD_REGS.r11 == entry_regs.r11 && CHILD_REGS.rbp == entry_regs.rbp &&
+           CHILD_REGS.rcx == entry_regs.rcx && CHILD_REGS.rbx == entry_regs.rbx && CHILD_REGS.rax == 0;
 }
 #endif
 

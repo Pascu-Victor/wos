@@ -7,6 +7,10 @@ KTEST(ProcessFdClone, FailedInsertReleasesFileRef) {
     KEXPECT_TRUE(ker::syscall::process::process_selftest_fd_clone_failure_releases_refs());
 }
 
+KTEST(ProcessFork, ChildPreservesSyscallEntryRegisters) {
+    KEXPECT_TRUE(ker::syscall::process::process_selftest_fork_child_preserves_entry_registers());
+}
+
 KTEST(ProcessGroupExit, CandidateFilterSelectsOnlyLiveUnrequestedSibling) {
     KEXPECT_TRUE(ker::syscall::process::process_selftest_group_exit_candidate_filter());
 }

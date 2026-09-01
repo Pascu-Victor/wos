@@ -4,6 +4,7 @@
 !/bin/**
 **/obj
 **/CMakeFiles
+compile_commands.json
 #qcow images
 *.qcow2
 #log files

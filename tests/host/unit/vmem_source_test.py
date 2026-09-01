@@ -922,6 +922,23 @@ def test_fork_snapshots_all_vm_surfaces_under_one_publication_guard() -> None:
         fail("file mmap clone rollback may block and must not run under the fork publication guard")
 
 
+def test_fork_child_registers_use_immutable_syscall_entry_snapshot() -> None:
+    process = PROCESS_CPP.read_text()
+    fork = function_body(process, "wos_proc_fork")
+    require_ordered_tokens(
+        fork,
+        [
+            "ker::mod::cpu::GPRegs const FORK_ENTRY_REGS = gpr;",
+            "auto const KERNEL_STACK_BASE = alloc_fork_kernel_stack_with_reclaim();",
+            "child->context.regs = fork_child_return_regs(FORK_ENTRY_REGS);",
+            "post_task_balanced(child)",
+        ],
+        "immutable fork syscall-entry register snapshot",
+    )
+    if "child->context.regs = parent->context.regs" in fork:
+        fail("fork child registers must not come from preemptible parent task context")
+
+
 def main() -> None:
     test_munmap_and_mprotect_reject_overflowing_lengths()
     test_nonfixed_mmap_address_selection_is_reserved_before_mapping()
@@ -936,6 +953,7 @@ def main() -> None:
     test_default_writable_anon_mmap_is_demand_paged()
     test_thread_publication_is_serialized_with_shared_vmem_updates()
     test_fork_snapshots_all_vm_surfaces_under_one_publication_guard()
+    test_fork_child_registers_use_immutable_syscall_entry_snapshot()
     print("vmem mmap, owned-frame, and COW invariants hold")
 
 
