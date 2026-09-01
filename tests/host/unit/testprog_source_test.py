@@ -9,6 +9,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[3]
 TESTPROG_MAIN_CPP = ROOT / "modules" / "testprog" / "src" / "main.cpp"
 THREAD_EXIT_STRESS_CPP = ROOT / "modules" / "testprog" / "src" / "thread_exit_stress.cpp"
+XATTR_MATRIX_CPP = ROOT / "modules" / "testprog" / "src" / "xattr_matrix.cpp"
 NETBENCH_CPP = ROOT / "modules" / "testprog" / "src" / "netbench.cpp"
 PERFBENCH_CPP = ROOT / "modules" / "testprog" / "src" / "perfbench.cpp"
 COWBENCH_CPP = ROOT / "modules" / "testprog" / "src" / "cowbench.cpp"
@@ -1588,6 +1589,47 @@ def test_thread_exit_stress_exercises_futex_group_exit() -> None:
     )
 
 
+def test_xattr_matrix_covers_public_and_storage_transitions() -> None:
+    main_source = TESTPROG_MAIN_CPP.read_text()
+    source = XATTR_MATRIX_CPP.read_text()
+    require_tokens(
+        main_source,
+        [
+            '#include "xattr_matrix.hpp"',
+            'std::strcmp(command, "xattr-matrix") == 0',
+            "run_xattr_matrix(argc - 1, argv + 1)",
+        ],
+        "xattr matrix command dispatch",
+    )
+    require_tokens(
+        source,
+        [
+            "XATTR_CREATE",
+            "XATTR_REPLACE",
+            "errno == EEXIST",
+            "errno == ENODATA",
+            "errno == ERANGE",
+            "LARGE_VALUE_SIZE = 64 * 1024",
+            "TREE_ATTRIBUTE_COUNT = 96",
+            "flistxattr(FD, nullptr, 0)",
+            '!list_contains(list, "xfs.parent")',
+            'matrix.expect(false, "DA-tree shrink")',
+            'fremovexattr(FD, "user.large")',
+            '"remote value blocks retired"',
+            "pthread_create(&replace_thread",
+            "pthread_create(&remove_thread",
+            '"concurrent replace/remove errno contract"',
+            "lgetxattr(LINK_PATH.c_str()",
+            "lsetxattr(LINK_PATH.c_str()",
+            "LINK_TARGET.c_str()",
+            'std::strcmp(argv[1], "--expect-set-error") == 0',
+            'setxattr(argv[3], "user.wos-error-probe"',
+            "fremovexattr(FD, \"user.empty\")",
+        ],
+        "xattr public semantics and fork-transition matrix",
+    )
+
+
 def main() -> None:
     test_ping_receive_is_deadline_bounded()
     test_netbench_io_is_deadline_bounded()
@@ -1606,7 +1648,8 @@ def main() -> None:
     test_mandelbench_worker_payload_rle_is_bounded_and_exact()
     test_mandelbench_overlaps_local_compute_with_remote_payload_drain()
     test_thread_exit_stress_exercises_futex_group_exit()
-    print("testprog ping, netbench, suite, perfbench, cowbench, and mandelbench waits are deadline bounded")
+    test_xattr_matrix_covers_public_and_storage_transitions()
+    print("testprog bounded waits and xattr matrix source invariants hold")
 
 
 if __name__ == "__main__":

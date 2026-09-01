@@ -164,6 +164,7 @@ void xfs_log_advance_head(XfsLog* log, uint32_t old_head, uint32_t new_head) {
 
     log->tail_block = old_head;
     log->tail_cycle = log->head_cycle;
+    log->previous_block = old_head * xfs_log_blocks_per_fs_block(log->mount);
     log->head_block = new_head;
     if (new_head < old_head) {
         log->head_cycle++;
@@ -376,6 +377,7 @@ auto xfs_log_find_head_tail(XfsLog* log) -> int {
     bool any_nonzero = false;
     bool found = false;
     uint64_t latest_lsn = 0;
+    uint32_t latest_start_block = UINT32_MAX;
     XfsLoadedLogKind latest_kind = XfsLoadedLogKind::FOREIGN_DIRTY;
     uint32_t latest_next_cycle = 1;
     uint32_t latest_next_block = 0;
@@ -413,6 +415,7 @@ auto xfs_log_find_head_tail(XfsLog* log) -> int {
             if (!found || LSN > latest_lsn) {
                 found = true;
                 latest_lsn = LSN;
+                latest_start_block = static_cast<uint32_t>(START_BYTE / XLOG_HEADER_SIZE);
                 latest_kind = candidate.kind;
                 latest_next_cycle = candidate.next_cycle;
                 latest_next_block = candidate.next_block;
@@ -436,6 +439,7 @@ auto xfs_log_find_head_tail(XfsLog* log) -> int {
         log->head_block = 0;
         log->tail_cycle = 1;
         log->tail_block = 0;
+        log->previous_block = UINT32_MAX;
         log->clean = true;
         return 0;
     }
@@ -444,6 +448,7 @@ auto xfs_log_find_head_tail(XfsLog* log) -> int {
     }
     log->head_cycle = latest_next_cycle;
     log->head_block = latest_next_block;
+    log->previous_block = latest_start_block;
     if (latest_kind == XfsLoadedLogKind::WOS_CLEAN || latest_kind == XfsLoadedLogKind::STANDARD_CLEAN) {
         log->tail_cycle = log->head_cycle;
         log->tail_block = log->head_block;
@@ -633,7 +638,7 @@ auto xfs_log_write_record(XfsLog* log, const uint8_t* body, size_t body_bytes, u
     header.h_len = Be32::from_cpu(static_cast<uint32_t>(body_bytes));
     header.h_lsn = Be64::from_cpu(LSN);
     header.h_tail_lsn = Be64::from_cpu(xfs_log_make_lsn(log, log->tail_cycle, log->tail_block));
-    header.h_prev_block = Be32::from_cpu(log->tail_block * xfs_log_blocks_per_fs_block(log->mount));
+    header.h_prev_block = Be32::from_cpu(log->previous_block);
     header.h_num_logops = Be32::from_cpu(logops);
     header.h_fmt = Be32::from_cpu(XLOG_FMT_LINUX_LE);
     header.h_fs_uuid = log->mount->uuid;
@@ -659,10 +664,63 @@ auto xfs_log_write_record(XfsLog* log, const uint8_t* body, size_t body_bytes, u
     return 0;
 }
 
+auto xfs_log_erase_device(XfsLog* log) -> int {
+    if (log == nullptr || log->mount == nullptr || log->mount->device == nullptr || log->mount->device->block_size == 0) {
+        return -EINVAL;
+    }
+    uint64_t device_start = 0;
+    size_t device_count = 0;
+    int const SPAN_RC = xfs_log_device_span(log, &device_start, &device_count);
+    if (SPAN_RC != 0) {
+        return SPAN_RC;
+    }
+
+    constexpr size_t CLEAR_CHUNK_BYTES = size_t{64} * 1024U;
+    size_t const DEVICE_BLOCK_SIZE = log->mount->device->block_size;
+    size_t const CHUNK_BLOCKS = std::min(device_count, std::max<size_t>(1, CLEAR_CHUNK_BYTES / DEVICE_BLOCK_SIZE));
+    if (CHUNK_BLOCKS == 0 || CHUNK_BLOCKS > SIZE_MAX / DEVICE_BLOCK_SIZE) {
+        return -EOVERFLOW;
+    }
+    auto* zeroes = new (std::nothrow) uint8_t[CHUNK_BLOCKS * DEVICE_BLOCK_SIZE];
+    if (zeroes == nullptr) {
+        return -ENOMEM;
+    }
+    __builtin_memset(zeroes, 0, CHUNK_BLOCKS * DEVICE_BLOCK_SIZE);
+
+    int rc = 0;
+    for (size_t offset = 0; offset < device_count; offset += CHUNK_BLOCKS) {
+        size_t const BLOCKS = std::min(CHUNK_BLOCKS, device_count - offset);
+        rc = ker::dev::block_write(log->mount->device, device_start + offset, BLOCKS, zeroes);
+        if (rc != 0) {
+            break;
+        }
+    }
+    delete[] zeroes;
+    return rc;
+}
+
 auto xfs_log_clear_clean(XfsMountContext* mount, XfsLog* log) -> int {
     if (mount == nullptr || log == nullptr || log->mount != mount) {
         return -EINVAL;
     }
+    // WOS crash-recovery records deliberately use a private body encoding.
+    // Once every covered home image is durable, retire that private history
+    // before publishing the standard XFS unmount operation.  This leaves a
+    // byte-canonical clean log that Linux can inspect without attempting to
+    // interpret private records as multi-header v2 iclogs.
+    int rc = xfs_log_erase_device(log);
+    if (rc == 0) {
+        rc = flush_blockdev(mount->device);
+    }
+    if (rc != 0) {
+        log->clean = false;
+        return rc;
+    }
+    log->head_block = 0;
+    log->tail_block = 0;
+    log->tail_cycle = log->head_cycle;
+    log->previous_block = UINT32_MAX;
+
     std::array<uint8_t, XLOG_HEADER_SIZE> body{};
     // Standard v2 XFS unmount operation. xlog_pack_data replaces the first
     // payload word (oh_tid) with the BE cycle and stores the original word in
@@ -676,7 +734,7 @@ auto xfs_log_clear_clean(XfsMountContext* mount, XfsLog* log) -> int {
     body.at(9) = XLOG_UNMOUNT_TRANS;
     uint16_t const UNMOUNT_MAGIC = XLOG_UNMOUNT_TYPE;
     __builtin_memcpy(body.data() + 12, &UNMOUNT_MAGIC, sizeof(UNMOUNT_MAGIC));
-    int rc = xfs_log_write_record(log, body.data(), body.size(), 1, false, true);
+    rc = xfs_log_write_record(log, body.data(), body.size(), 1, false, true);
     if (rc == 0) {
         rc = flush_blockdev(mount->device);
     }
@@ -780,6 +838,7 @@ auto xfs_log_mount(XfsMountContext* mount) -> int {
     log->sect_size = mount->sect_size;
     log->clean = true;
     log->active = false;
+    log->previous_block = UINT32_MAX;
 
     int const RC = xfs_log_find_head_tail(log);
     if (RC != 0) {

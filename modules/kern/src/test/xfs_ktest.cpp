@@ -14,11 +14,13 @@
 #include <dev/block_device.hpp>
 #include <memory>
 #include <new>
+#include <platform/dbg/dbg.hpp>
 #include <test/fault_block_device.hpp>
 #include <test/fault_block_device_impl.hpp>
 #include <test/ktest.hpp>
 #include <vfs/buffer_cache.hpp>
 #include <vfs/fs/xfs/xfs_alloc.hpp>
+#include <vfs/fs/xfs/xfs_attr.hpp>
 #include <vfs/fs/xfs/xfs_bmap.hpp>
 #include <vfs/fs/xfs/xfs_btree.hpp>
 #include <vfs/fs/xfs/xfs_dir2.hpp>
@@ -475,6 +477,216 @@ auto disposable_dual_xfs_mounts_are_independent() -> bool {
     return verify_and_clean_dual_mount(FIRST_DEVICE) && verify_and_clean_dual_mount(SECOND_DEVICE);
 }
 
+constexpr const char* XATTR_FIXTURE_PATH = "linux-xattr-fixture";
+constexpr const char* XATTR_MUTATION_PATH = "wos-xattr-cow";
+constexpr size_t XATTR_GROWTH_COUNT = 96;
+constexpr size_t XATTR_GROWTH_VALUE_SIZE = 192;
+constexpr size_t XATTR_REMOTE_VALUE_SIZE = 64 * 1024;
+
+struct AttrFragmentMappingGuard {
+    ~AttrFragmentMappingGuard() { ker::vfs::xfs::xfs_selftest_attr_fragment_mappings(false); }
+};
+
+auto xattr_growth_name(size_t index) -> std::array<char, 10> {
+    return {'u',
+            's',
+            'e',
+            'r',
+            '.',
+            'k',
+            static_cast<char>('0' + ((index / 100) % 10)),
+            static_cast<char>('0' + ((index / 10) % 10)),
+            static_cast<char>('0' + (index % 10)),
+            '\0'};
+}
+
+auto xattr_read_matches(ker::vfs::xfs::XfsMountContext* mount, const char* path, const char* name, const uint8_t* expected, size_t size)
+    -> bool {
+    auto value = std::unique_ptr<uint8_t[]>(size == 0 ? nullptr : new (std::nothrow) uint8_t[size]);
+    if (size != 0 && value == nullptr) {
+        return false;
+    }
+    ssize_t const RESULT = ker::vfs::xfs::xfs_getxattr_path(path, name, value.get(), size, mount);
+    return RESULT == static_cast<ssize_t>(size) && (size == 0 || std::memcmp(value.get(), expected, size) == 0);
+}
+
+auto populate_xattr_growth(ker::vfs::xfs::XfsMountContext* mount) -> bool {
+    std::array<uint8_t, XATTR_GROWTH_VALUE_SIZE> value{};
+    for (size_t i = 0; i < XATTR_GROWTH_COUNT; ++i) {
+        value.fill(static_cast<uint8_t>(i));
+        auto const NAME = xattr_growth_name(i);
+        if (ker::vfs::xfs::xfs_setxattr_path(XATTR_MUTATION_PATH, NAME.data(), value.data(), value.size(), 0, mount) != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+auto disposable_xattr_growth_remote_shrink_and_teardown() -> bool {
+    ker::dev::BlockDevice* const DEVICE = ker::dev::block_device_find_by_name("sdb2");
+    if (DEVICE == nullptr) {
+        return false;
+    }
+    ker::vfs::xfs::XfsMountContext* mount = nullptr;
+    if (ker::vfs::xfs::xfs_mount(DEVICE, false, &mount) != 0 || mount == nullptr) {
+        return false;
+    }
+    AttrFragmentMappingGuard fragment_guard{};
+    auto unmount = [&mount]() {
+        if (mount == nullptr) {
+            return true;
+        }
+        int const RC = ker::vfs::xfs::xfs_unmount(mount);
+        if (RC != 0) {
+            ker::vfs::xfs::xfs_unmount_force(mount);
+        }
+        mount = nullptr;
+        return RC == 0;
+    };
+    constexpr std::array<uint8_t, 5> LINUX_VALUE{'l', 'i', 'n', 'u', 'x'};
+    constexpr std::array<uint8_t, 3> WOS_FIXTURE_VALUE{'w', 'o', 's'};
+    constexpr std::array<uint8_t, 4> SF_VALUE{0x53, 0x46, 0x31, 0x30};
+    std::array<uint8_t, LINUX_VALUE.size()> linux_readback{};
+    ssize_t const LINUX_READ_RC =
+        ker::vfs::xfs::xfs_getxattr_path(XATTR_FIXTURE_PATH, "user.linux", linux_readback.data(), linux_readback.size(), mount);
+    int const WOS_SET_RC =
+        LINUX_READ_RC == static_cast<ssize_t>(LINUX_VALUE.size()) && linux_readback == LINUX_VALUE
+            ? ker::vfs::xfs::xfs_setxattr_path(XATTR_FIXTURE_PATH, "user.wos", WOS_FIXTURE_VALUE.data(), WOS_FIXTURE_VALUE.size(), 0, mount)
+            : -ECANCELED;
+    bool const LINUX_REREAD =
+        WOS_SET_RC == 0 && xattr_read_matches(mount, XATTR_FIXTURE_PATH, "user.linux", LINUX_VALUE.data(), LINUX_VALUE.size());
+    if (LINUX_READ_RC != static_cast<ssize_t>(LINUX_VALUE.size()) || linux_readback != LINUX_VALUE || WOS_SET_RC != 0 || !LINUX_REREAD) {
+        ker::mod::dbg::log("[xfs ktest] Linux fixture failure: get=%ld value_ok=%d set=%d reread=%d", static_cast<long>(LINUX_READ_RC),
+                           linux_readback == LINUX_VALUE, WOS_SET_RC, LINUX_REREAD);
+        unmount();
+        return false;
+    }
+
+    static_cast<void>(ker::vfs::xfs::xfs_unlink_path(XATTR_MUTATION_PATH, mount));
+    int open_result = 0;
+    ker::vfs::File* file =
+        ker::vfs::xfs::xfs_open_path(XATTR_MUTATION_PATH, ker::vfs::O_CREAT | ker::vfs::O_EXCL | 1, 0644, mount, &open_result);
+    if (file == nullptr || open_result != 0) {
+        ker::mod::dbg::log("[xfs ktest] mutation create failure: file=%p rc=%d", file, open_result);
+        close_xfs_test_file(file);
+        unmount();
+        return false;
+    }
+    int const CLOSE_RC = close_xfs_test_file(file);
+    int const SF_SET_RC = CLOSE_RC == 0
+                              ? ker::vfs::xfs::xfs_setxattr_path(XATTR_MUTATION_PATH, "user.sf", SF_VALUE.data(), SF_VALUE.size(), 0, mount)
+                              : -ECANCELED;
+    bool const POPULATED = SF_SET_RC == 0 && populate_xattr_growth(mount);
+    if (CLOSE_RC != 0 || SF_SET_RC != 0 || !POPULATED) {
+        ker::mod::dbg::log("[xfs ktest] initial growth failure: close=%d sf_set=%d populated=%d", CLOSE_RC, SF_SET_RC, POPULATED);
+        unmount();
+        return false;
+    }
+
+    auto remote_value = std::unique_ptr<uint8_t[]>(new (std::nothrow) uint8_t[XATTR_REMOTE_VALUE_SIZE]);
+    if (remote_value == nullptr) {
+        unmount();
+        return false;
+    }
+    for (size_t i = 0; i < XATTR_REMOTE_VALUE_SIZE; ++i) {
+        remote_value[i] = static_cast<uint8_t>((i * 37U) ^ (i >> 8U));
+    }
+    ker::vfs::xfs::xfs_selftest_attr_fragment_mappings(true);
+    int const REMOTE_SET_RC =
+        ker::vfs::xfs::xfs_setxattr_path(XATTR_MUTATION_PATH, "user.remote64k", remote_value.get(), XATTR_REMOTE_VALUE_SIZE, 0, mount);
+    if (REMOTE_SET_RC != 0) {
+        ker::mod::dbg::log("[xfs ktest] remote value set failure: rc=%d", REMOTE_SET_RC);
+        unmount();
+        return false;
+    }
+    ker::vfs::xfs::xfs_selftest_attr_fragment_mappings(false);
+    uint8_t format = 0;
+    uint16_t extent_count = 0;
+    bool const FORMAT_QUERIED = ker::vfs::xfs::xfs_selftest_attr_fork_format(XATTR_MUTATION_PATH, mount, &format, &extent_count);
+    bool const REMOTE_MATCHED =
+        xattr_read_matches(mount, XATTR_MUTATION_PATH, "user.remote64k", remote_value.get(), XATTR_REMOTE_VALUE_SIZE);
+    if (!FORMAT_QUERIED || format != ker::vfs::xfs::XFS_DINODE_FMT_BTREE || extent_count == 0 || !REMOTE_MATCHED) {
+        ker::mod::dbg::log("[xfs ktest] fragmented fork failure: queried=%d format=%u extents=%u remote_match=%d", FORMAT_QUERIED, format,
+                           extent_count, REMOTE_MATCHED);
+        unmount();
+        return false;
+    }
+
+    std::array<uint8_t, XATTR_GROWTH_VALUE_SIZE> original{};
+    std::array<uint8_t, XATTR_GROWTH_VALUE_SIZE> cancelled{};
+    original.fill(0);
+    cancelled.fill(0xEE);
+    int const CANCEL_RC =
+        ker::vfs::xfs::xfs_selftest_cancel_setxattr_path(XATTR_MUTATION_PATH, "user.k000", cancelled.data(), cancelled.size(), mount);
+    bool const ROLLBACK_MATCHED = xattr_read_matches(mount, XATTR_MUTATION_PATH, "user.k000", original.data(), original.size());
+    int const REMOTE_REMOVE_RC = ker::vfs::xfs::xfs_removexattr_path(XATTR_MUTATION_PATH, "user.remote64k", mount);
+    bool const REMOVE_FORMAT_QUERIED = ker::vfs::xfs::xfs_selftest_attr_fork_format(XATTR_MUTATION_PATH, mount, &format, &extent_count);
+    if (CANCEL_RC != 0 || !ROLLBACK_MATCHED || REMOTE_REMOVE_RC != 0 || !REMOVE_FORMAT_QUERIED ||
+        format != ker::vfs::xfs::XFS_DINODE_FMT_EXTENTS) {
+        ker::mod::dbg::log("[xfs ktest] rollback/remove failure: cancel=%d rollback_match=%d remove=%d queried=%d format=%u extents=%u",
+                           CANCEL_RC, ROLLBACK_MATCHED, REMOTE_REMOVE_RC, REMOVE_FORMAT_QUERIED, format, extent_count);
+        unmount();
+        return false;
+    }
+    for (size_t i = 0; i < XATTR_GROWTH_COUNT; ++i) {
+        auto const NAME = xattr_growth_name(i);
+        int const REMOVE_RC = ker::vfs::xfs::xfs_removexattr_path(XATTR_MUTATION_PATH, NAME.data(), mount);
+        if (REMOVE_RC != 0) {
+            ker::mod::dbg::log("[xfs ktest] growth remove failure: index=%lu rc=%d", static_cast<unsigned long>(i), REMOVE_RC);
+            unmount();
+            return false;
+        }
+    }
+    bool const SHRINK_FORMAT_QUERIED = ker::vfs::xfs::xfs_selftest_attr_fork_format(XATTR_MUTATION_PATH, mount, &format, &extent_count);
+    bool const SF_MATCHED = xattr_read_matches(mount, XATTR_MUTATION_PATH, "user.sf", SF_VALUE.data(), SF_VALUE.size());
+    int const SYNC_RC = ker::vfs::xfs::xfs_sync_mount(mount);
+    bool const FIRST_UNMOUNTED = unmount();
+    if (!SHRINK_FORMAT_QUERIED || format != ker::vfs::xfs::XFS_DINODE_FMT_LOCAL || !SF_MATCHED || SYNC_RC != 0 || !FIRST_UNMOUNTED) {
+        ker::mod::dbg::log("[xfs ktest] shrink failure: queried=%d format=%u extents=%u sf_match=%d sync=%d unmount=%d",
+                           SHRINK_FORMAT_QUERIED, format, extent_count, SF_MATCHED, SYNC_RC, FIRST_UNMOUNTED);
+        return false;
+    }
+
+    int const REMOUNT_RC = ker::vfs::xfs::xfs_mount(DEVICE, false, &mount);
+    bool const REMOUNT_LINUX = REMOUNT_RC == 0 && mount != nullptr &&
+                               xattr_read_matches(mount, XATTR_FIXTURE_PATH, "user.linux", LINUX_VALUE.data(), LINUX_VALUE.size());
+    bool const REMOUNT_WOS =
+        REMOUNT_LINUX && xattr_read_matches(mount, XATTR_FIXTURE_PATH, "user.wos", WOS_FIXTURE_VALUE.data(), WOS_FIXTURE_VALUE.size());
+    bool const REMOUNT_SF = REMOUNT_WOS && xattr_read_matches(mount, XATTR_MUTATION_PATH, "user.sf", SF_VALUE.data(), SF_VALUE.size());
+    bool const REPOPULATED = REMOUNT_SF && populate_xattr_growth(mount);
+    if (REMOUNT_RC != 0 || mount == nullptr || !REMOUNT_LINUX || !REMOUNT_WOS || !REMOUNT_SF || !REPOPULATED) {
+        ker::mod::dbg::log("[xfs ktest] remount failure: mount=%d linux=%d wos=%d sf=%d repopulated=%d", REMOUNT_RC, REMOUNT_LINUX,
+                           REMOUNT_WOS, REMOUNT_SF, REPOPULATED);
+        unmount();
+        return false;
+    }
+    ker::vfs::xfs::xfs_selftest_attr_fragment_mappings(true);
+    bool const REGREW = ker::vfs::xfs::xfs_setxattr_path(XATTR_MUTATION_PATH, "user.remote64k", remote_value.get(), XATTR_REMOTE_VALUE_SIZE,
+                                                         0, mount) == 0 &&
+                        ker::vfs::xfs::xfs_selftest_attr_fork_format(XATTR_MUTATION_PATH, mount, &format, &extent_count) &&
+                        format == ker::vfs::xfs::XFS_DINODE_FMT_BTREE;
+    ker::vfs::xfs::xfs_selftest_attr_fragment_mappings(false);
+    bool const TORN_DOWN =
+        REGREW && ker::vfs::xfs::xfs_unlink_path(XATTR_MUTATION_PATH, mount) == 0 && ker::vfs::xfs::xfs_sync_mount(mount) == 0;
+    bool const SECOND_UNMOUNTED = unmount();
+    int const READ_ONLY_MOUNT_RC = TORN_DOWN && SECOND_UNMOUNTED ? ker::vfs::xfs::xfs_mount(DEVICE, true, &mount) : -ECANCELED;
+    if (!SECOND_UNMOUNTED || !TORN_DOWN || READ_ONLY_MOUNT_RC != 0 || mount == nullptr) {
+        ker::mod::dbg::log("[xfs ktest] regrow/teardown failure: regrew=%d torn_down=%d unmount=%d ro_mount=%d", REGREW, TORN_DOWN,
+                           SECOND_UNMOUNTED, READ_ONLY_MOUNT_RC);
+        unmount();
+        return false;
+    }
+    uint8_t const DENIED_VALUE = 0x7A;
+    bool const READ_ONLY_DENIED =
+        ker::vfs::xfs::xfs_setxattr_path(XATTR_FIXTURE_PATH, "user.denied", &DENIED_VALUE, 1, 0, mount) == -EROFS &&
+        ker::vfs::xfs::xfs_removexattr_path(XATTR_FIXTURE_PATH, "user.linux", mount) == -EROFS;
+    bool const READ_ONLY_UNMOUNTED = unmount();
+    if (!READ_ONLY_DENIED || !READ_ONLY_UNMOUNTED) {
+        ker::mod::dbg::log("[xfs ktest] read-only failure: denied=%d unmount=%d", READ_ONLY_DENIED, READ_ONLY_UNMOUNTED);
+    }
+    return READ_ONLY_UNMOUNTED && READ_ONLY_DENIED;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -494,6 +706,14 @@ KTEST(XFS, InodeCacheRetentionBoundsHashLoadAndReclaim) { KEXPECT_TRUE(ker::vfs:
 
 KTEST(XFS, TransactionCancelRestoresLinkCount) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_transaction_cancel_restores_nlink()); }
 
+KTEST(XFS, TransactionCancelRestoresAttrFork) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_transaction_cancel_restores_attr_fork()); }
+
+KTEST(XFS, AttrCowPreservesStoredParentHash) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_attr_parent_hash_preserved()); }
+
+KTEST(XFS, AttrCowRejectsIncompleteLeafEntry) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_attr_incomplete_detected()); }
+
+KTEST(XFS, AttrCowLinksSameLevelDaNodes) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_attr_node_sibling_links()); }
+
 KTEST(XFS, TransactionRetiredRangesCommitOnly) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_transaction_retired_ranges_commit_only()); }
 
 KTEST(XFS, TransactionCancelRestoresReplacedBufferAlias) {
@@ -505,6 +725,10 @@ KTEST(XFS, LogRecycledBufferIsDistinct) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selfte
 KTEST(XFS, LogCheckpointIsOrderedAndBounded) { KEXPECT_TRUE(ker::vfs::xfs::xfs_selftest_log_checkpoint_is_ordered_and_bounded()); }
 
 KTEST(XFS, DisposableDualMountNamespaceMutationsAreIndependent) { KEXPECT_TRUE(disposable_dual_xfs_mounts_are_independent()); }
+
+KTEST(XFS, DisposableXattrGrowthRemoteShrinkRollbackRemountAndTeardown) {
+    KEXPECT_TRUE(disposable_xattr_growth_remote_shrink_and_teardown());
+}
 
 KTEST(FaultBlockDevice, VolatileDurableTornWriteAndPowerCutAreDeterministic) {
     auto storage =

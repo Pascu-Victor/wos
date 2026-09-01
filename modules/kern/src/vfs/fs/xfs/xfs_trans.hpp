@@ -94,15 +94,23 @@ struct XfsTransPerAgUndo {
     XfsTransPerAgUndo* next{};
 };
 
-// Deep snapshot of the mutable data-fork state used by block-map updates.
+// Deep snapshot of mutable inode state used by block-map and attr-fork updates.
 struct XfsTransInodeUndo {
     XfsInode* ip{};
     XfsIfork data_fork{};
+    XfsIfork attr_fork{};
     uint64_t size{};
     uint64_t nblocks{};
+    uint64_t atime{};
+    uint64_t mtime{};
+    uint64_t ctime{};
+    uint64_t crtime{};
     uint32_t nextents{};
+    uint16_t anextents{};
     uint16_t mode{};
     uint32_t nlink{};
+    uint8_t forkoff{};
+    bool has_attr_fork{};
     bool dirty{};
     uint64_t dir_generation{};
     uint64_t dir_leaf_index_complete_generation{};
@@ -110,6 +118,7 @@ struct XfsTransInodeUndo {
     std::array<uint64_t, XFS_DIR_NAME_FILTER_WORDS> dir_name_filter{};
     bool dir_name_filter_complete{};
     bool owns_data_fork{};
+    bool owns_attr_fork{};
     XfsTransInodeUndo* next{};
 };
 
@@ -186,6 +195,7 @@ void xfs_trans_cancel(XfsTransaction* tp);
 
 #ifdef WOS_SELFTEST
 auto xfs_selftest_transaction_cancel_restores_nlink() -> bool;
+auto xfs_selftest_transaction_cancel_restores_attr_fork() -> bool;
 auto xfs_selftest_transaction_retired_ranges_commit_only() -> bool;
 auto xfs_selftest_transaction_cancel_restores_replaced_buffer_alias() -> bool;
 #endif

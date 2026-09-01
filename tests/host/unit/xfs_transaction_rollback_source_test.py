@@ -60,6 +60,7 @@ def main() -> None:
     ialloc = (XFS / "xfs_ialloc.cpp").read_text()
     inode = (XFS / "xfs_inode.cpp").read_text()
     dir2 = (XFS / "xfs_dir2.cpp").read_text()
+    attr = (XFS / "xfs_attr.cpp").read_text()
     log = (XFS / "xfs_log.cpp").read_text()
     vfs = (XFS / "xfs_vfs.cpp").read_text()
 
@@ -68,6 +69,9 @@ def main() -> None:
         "struct XfsTransPerAgUndo",
         "struct XfsTransInodeUndo",
         "uint32_t nlink{};",
+        "uint64_t ctime{};",
+        "XfsIfork attr_fork{};",
+        "bool owns_attr_fork{};",
         "bool journal_held{};",
         "auto xfs_trans_capture_buf(XfsTransaction* tp, BufHead* bp) -> int;",
         "auto xfs_trans_capture_perag(XfsTransaction* tp, xfs_agnumber_t agno) -> int;",
@@ -94,6 +98,63 @@ def main() -> None:
     )
     if "undo->ip->nlink = undo->nlink;" not in restore:
         fail("inode cancellation must restore link count")
+    for token in [
+        "xfs_trans_free_ifork(&undo->ip->attr_fork);",
+        "undo->ip->attr_fork = undo->attr_fork;",
+        "undo->ip->anextents = undo->anextents;",
+        "undo->ip->forkoff = undo->forkoff;",
+        "undo->ip->has_attr_fork = undo->has_attr_fork;",
+        "undo->ip->ctime = undo->ctime;",
+    ]:
+        if token not in restore:
+            fail(f"inode cancellation must restore attr fork state: {token}")
+    require_order(
+        function_body(attr, "xfs_attr_set"),
+        ["xfs_trans_capture_inode(tp, ip)", "sf_set(ip, tp"],
+        "xattr set snapshots the inode before shortform mutation",
+    )
+    convert = function_body(attr, "sf_to_leaf_convert")
+    if "bwrite(" in convert:
+        fail("shortform-to-leaf conversion must not bypass WAL with bwrite")
+    require_order(
+        convert,
+        ["xfs_trans_capture_buf(tp, bh)", "__builtin_memset(block, 0, BLK_SIZE)", "xfs_trans_log_buf_full(tp, bh)"],
+        "shortform-to-leaf conversion captures and logs the new block",
+    )
+    remote_store = function_body(attr, "attr_store_remote_value")
+    if "bwrite(" in remote_store:
+        fail("remote value creation must not bypass WAL with bwrite")
+    require_order(
+        remote_store,
+        ["xfs_trans_capture_buf(tp, bh)", "__builtin_memset(bh->data", "attr_remote_compute_crc", "xfs_trans_log_buf_full(tp, bh)"],
+        "remote value blocks are captured, checksummed, and logged",
+    )
+    require_order(
+        function_body(attr, "attr_free_remote_value"),
+        ["xfs_alloc_ensure_freelist_headroom", "xfs_free_extent", "xfs_trans_retire_bdev_range"],
+        "remote mappings are freed with AGFL headroom and commit-time alias retirement",
+    )
+    require_order(
+        function_body(inode, "inactivate_unlinked_inode"),
+        ["xfs_attr_teardown(ip, tp)", "xfs_inode_truncate_data(ip, tp)"],
+        "inode inactivation frees attr blocks before clearing aggregate block accounting",
+    )
+    for token in [
+        "xfs_bmap_build_fork_btree(ip, tp",
+        "xfs_bmap_free_fork_btree(ip, tp",
+        "attrs[i].valueblk = static_cast<xfs_dablk_t>(desc_count + remote_blocks)",
+        "attr_fork_has_incomplete(ip)",
+        "target.hash = entry->hash;",
+        "cow_node_siblings(descs, desc_count",
+    ]:
+        if token not in attr:
+            fail(f"copy-on-write attr fork contract missing {token!r}")
+    permission = function_body(vfs, "check_public_xattr_permission")
+    if "write && (ip->mode & XFS_IFMT) == XFS_IFLNK" not in permission or "return -EPERM;" not in permission:
+        fail("user namespace xattr mutation must reject symlinks")
+    set_public = function_body(vfs, "set_public_xattr_locked")
+    if "size > PUBLIC_XATTR_SIZE_MAX" not in set_public or "return -E2BIG;" not in set_public:
+        fail("public xattr values larger than 64KiB must return E2BIG")
     require_order(
         function_body(trans, "xfs_trans_capture_buf"),
         ["bjournal_hold(bp);", "__builtin_memcpy(undo->before_image"],

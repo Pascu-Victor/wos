@@ -69,6 +69,18 @@ enum class ops : uint64_t {
     FCHOWNAT,              // 60
     FSTAT_CLOSE,           // 61
     METADATA_BATCH,        // 62
+    SETXATTR,              // 63
+    LSETXATTR,             // 64
+    FSETXATTR,             // 65
+    GETXATTR,              // 66
+    LGETXATTR,             // 67
+    FGETXATTR,             // 68
+    LISTXATTR,             // 69
+    LLISTXATTR,            // 70
+    FLISTXATTR,            // 71
+    REMOVEXATTR,           // 72
+    LREMOVEXATTR,          // 73
+    FREMOVEXATTR,          // 74
 
     // Compatibility aliases retained for the installed WOS libc ABI headers.
     open = OPEN,
@@ -134,7 +146,23 @@ enum class ops : uint64_t {
     fchownat = FCHOWNAT,
     fstat_close = FSTAT_CLOSE,
     metadata_batch = METADATA_BATCH,
+    setxattr = SETXATTR,
+    lsetxattr = LSETXATTR,
+    fsetxattr = FSETXATTR,
+    getxattr = GETXATTR,
+    lgetxattr = LGETXATTR,
+    fgetxattr = FGETXATTR,
+    listxattr = LISTXATTR,
+    llistxattr = LLISTXATTR,
+    flistxattr = FLISTXATTR,
+    removexattr = REMOVEXATTR,
+    lremovexattr = LREMOVEXATTR,
+    fremovexattr = FREMOVEXATTR,
 };
+
+constexpr size_t XATTR_NAME_MAX = 255;
+constexpr size_t XATTR_SIZE_MAX = 65536;
+constexpr size_t XATTR_LIST_MAX = 65536;
 
 constexpr uint16_t METADATA_BATCH_VERSION = 1;
 constexpr uint8_t METADATA_BATCH_MAX_ITEMS = 64;

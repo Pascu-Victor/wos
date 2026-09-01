@@ -848,6 +848,111 @@ def test_open_exclusive_create_reports_existing_paths() -> None:
     )
 
 
+def test_wos_xattr_abi_usercopy_and_export_confinement() -> None:
+    kernel_ops = KERNEL_VFS_CALLNUMS.read_text()
+    require_order(
+        kernel_ops,
+        [
+            "METADATA_BATCH,        // 62",
+            "SETXATTR,              // 63",
+            "LSETXATTR,             // 64",
+            "FSETXATTR,             // 65",
+            "GETXATTR,              // 66",
+            "LGETXATTR,             // 67",
+            "FGETXATTR,             // 68",
+            "LISTXATTR,             // 69",
+            "LLISTXATTR,            // 70",
+            "FLISTXATTR,            // 71",
+            "REMOVEXATTR,           // 72",
+            "LREMOVEXATTR,          // 73",
+            "FREMOVEXATTR,          // 74",
+        ],
+        "append-only xattr selector range",
+    )
+    require_tokens(
+        kernel_ops,
+        ["XATTR_NAME_MAX = 255", "XATTR_SIZE_MAX = 65536", "XATTR_LIST_MAX = 65536"],
+        "kernel xattr ABI bounds",
+    )
+
+    syscall_source = KERNEL_SYS_VFS_CPP.read_text()
+    set_dispatch = function_body(syscall_source, r"auto\s+syscall_setxattr\([^{}]*\)\s*->\s*int64_t")
+    require_order(
+        set_dispatch,
+        [
+            "copy_xattr_name_from_user(user_name, name)",
+            "copy_xattr_value_from_user(user_value, SIZE, value)",
+            "raw_flags != static_cast<uint64_t>(static_cast<int64_t>(FLAGS))",
+            "vfs_fsetxattr",
+        ],
+        "xattr set bounded bounce before backend",
+    )
+    require_tokens(
+        function_body(syscall_source, r"auto\s+prepare_xattr_output\([^{}]*\)\s*->\s*int"),
+        ["size > limit", "ensure_writable(*task, user_addr, size)", "new (std::nothrow) uint8_t[size]"],
+        "xattr output preflight",
+    )
+
+    core = KERNEL_VFS_CORE_CPP.read_text()
+    beneath = function_body(core, r"auto\s+dispatch_xattr_beneath\([^{}]*\)\s*->\s*ssize_t")
+    require_order(
+        beneath,
+        [
+            "relative_path[0] == '/'",
+            "canonicalize_path(canonical_root.data()",
+            "root_mount->fs_type == FSType::REMOTE",
+            "canonicalize_path(canonical_path.data()",
+            "!path_prefix_matches(canonical_path.data(), canonical_root.data(), root_len)",
+            ".confinement_root = canonical_root.data()",
+            ".reject_remote_mounts = true",
+            ".reapply_task_root = false",
+            "dispatch_xattr_path(",
+        ],
+        "xattr beneath lexical, absolute-symlink, relative-symlink, and recursive-REMOTE confinement",
+    )
+    symlink_resolver = function_body(core, r"auto\s+resolve_symlinks\([^{}]*\)\s*->\s*int")
+    if symlink_resolver.count("symlink_resolve_path_is_confined") < 3:
+        fail("symlink resolution must re-check export confinement before and after substitutions")
+    require_tokens(
+        symlink_resolver,
+        ["policy->reject_remote_mounts", "mount->fs_type == FSType::REMOTE", "return -EPERM"],
+        "xattr recursive REMOTE mount rejection",
+    )
+    require_tokens(
+        KERNEL_VFS_KTEST_CPP.read_text(),
+        [
+            "KTEST(VFS, XattrBeneathRejectsSymlinkAndRemoteEscape)",
+            '"final_absolute"',
+            '"final_relative"',
+            '"intermediate/child"',
+            '"remote/child"',
+        ],
+        "xattr beneath runtime confinement coverage",
+    )
+
+    strace = STRACE_DECODE_CPP.read_text()
+    for name in [
+        "setxattr",
+        "lsetxattr",
+        "fsetxattr",
+        "getxattr",
+        "lgetxattr",
+        "fgetxattr",
+        "listxattr",
+        "llistxattr",
+        "flistxattr",
+        "removexattr",
+        "lremovexattr",
+        "fremovexattr",
+    ]:
+        require_tokens(strace, [f'return "{name}"'], f"strace {name} decode")
+    syzkaller = SYZKALLER_FS.read_text()
+    require_tokens(
+        syzkaller,
+        ["wos_vfs$setxattr(op const[63]", "wos_vfs$fremovexattr(op const[74]", "xattr_flags = 0, 1, 2"],
+        "syzkaller xattr selector coverage",
+    )
+
 if __name__ == "__main__":
     test_kernel_dirent_types_match_mlibc_public_abi()
     test_git_helper_pipe_cloexec_support_is_preserved_by_mlibc()
@@ -864,4 +969,5 @@ if __name__ == "__main__":
     test_open_create_uses_central_cache_notify_path()
     test_tmpfs_permission_denied_open_runs_close_hook()
     test_open_exclusive_create_reports_existing_paths()
+    test_wos_xattr_abi_usercopy_and_export_confinement()
     print("WOS mlibc VFS source invariants hold")

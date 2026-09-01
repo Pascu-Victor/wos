@@ -51,6 +51,21 @@ auto xfs_readlink_path(const char* fs_path, char* buf, size_t bufsize, XfsMountC
 // Fstat an open file descriptor.
 auto xfs_fstat(File* f, ker::vfs::Stat* statbuf) -> int;
 
+// Extended attributes. Names use the public qualified namespace form
+// (user.*, trusted.*, security.*); internal XFS namespaces are never exposed.
+auto xfs_setxattr_path(const char* fs_path, const char* name, const void* value, size_t size, int flags, XfsMountContext* ctx,
+                       size_t known_fs_path_len = UNKNOWN_XFS_PATH_LEN) -> int;
+auto xfs_fsetxattr(File* f, const char* name, const void* value, size_t size, int flags) -> int;
+auto xfs_getxattr_path(const char* fs_path, const char* name, void* value, size_t size, XfsMountContext* ctx,
+                       size_t known_fs_path_len = UNKNOWN_XFS_PATH_LEN) -> ssize_t;
+auto xfs_fgetxattr(File* f, const char* name, void* value, size_t size) -> ssize_t;
+auto xfs_listxattr_path(const char* fs_path, char* list, size_t size, XfsMountContext* ctx, size_t known_fs_path_len = UNKNOWN_XFS_PATH_LEN)
+    -> ssize_t;
+auto xfs_flistxattr(File* f, char* list, size_t size) -> ssize_t;
+auto xfs_removexattr_path(const char* fs_path, const char* name, XfsMountContext* ctx, size_t known_fs_path_len = UNKNOWN_XFS_PATH_LEN)
+    -> int;
+auto xfs_fremovexattr(File* f, const char* name) -> int;
+
 // Fill stat data from an open XFS file's inode without resolving its path.
 auto xfs_snapshot_file_stat(File* f, ker::vfs::Stat* statbuf) -> int;
 
@@ -106,6 +121,8 @@ auto xfs_selftest_stat_require_directory_uses_dentry_type() -> bool;
 auto xfs_selftest_open_require_directory_uses_dentry_type() -> bool;
 auto xfs_selftest_cached_parent_missing_lookup_stays_negative() -> bool;
 auto xfs_selftest_namespace_mutation_lookup_repairs_stale_negative() -> bool;
+auto xfs_selftest_attr_fork_format(const char* fs_path, XfsMountContext* ctx, uint8_t* format, uint16_t* extent_count) -> bool;
+auto xfs_selftest_cancel_setxattr_path(const char* fs_path, const char* name, const void* value, size_t size, XfsMountContext* ctx) -> int;
 #endif
 
 // Filesystem statistics (statvfs).

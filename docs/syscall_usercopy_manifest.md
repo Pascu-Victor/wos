@@ -208,6 +208,18 @@ than a kernel fault.
 | `VFS` | `FCHOWNAT` | `in` | path C string up to 511 chars | no | none | snapshot before metadata mutation |
 | `VFS` | `FSTAT_CLOSE` | `out` | one fixed Stat plus one fixed integer result | no | none | both outputs preflight before the descriptor is irreversibly closed |
 | `VFS` | `METADATA_BATCH` | `in/out` | header, at most 64 entry records, at most two 511-char paths per item, and 64 result records | second path operation-dependent | per-item status records; syscall copy is atomic | all input paths and the complete result range are snapshotted/preflighted before batch execution |
+| `VFS` | `SETXATTR` | `in` | path up to 511 chars, name up to 255 chars, and value up to 65536 bytes | value yes only for zero size; path/name no | none | complete path/name/value snapshots and flag validation precede mutation |
+| `VFS` | `LSETXATTR` | `in` | path up to 511 chars, name up to 255 chars, and value up to 65536 bytes | value yes only for zero size; path/name no | none | complete path/name/value snapshots and flag validation precede no-follow mutation |
+| `VFS` | `FSETXATTR` | `in` | name up to 255 chars and value up to 65536 bytes | value yes only for zero size; name no | none | complete name/value snapshots and flag validation precede retained-fd mutation |
+| `VFS` | `GETXATTR` | `in/out` | path up to 511 chars, name up to 255 chars, and output up to 65536 bytes | output yes only for zero size; path/name no | none | full output capacity preflight and input snapshots precede lookup; one complete copyout follows success |
+| `VFS` | `LGETXATTR` | `in/out` | path up to 511 chars, name up to 255 chars, and output up to 65536 bytes | output yes only for zero size; path/name no | none | full output capacity preflight and input snapshots precede no-follow lookup; one complete copyout follows success |
+| `VFS` | `FGETXATTR` | `in/out` | name up to 255 chars and output up to 65536 bytes | output yes only for zero size; name no | none | full output capacity preflight and name snapshot precede retained-fd lookup; one complete copyout follows success |
+| `VFS` | `LISTXATTR` | `in/out` | path up to 511 chars and packed output up to 65536 bytes | output yes only for zero size; path no | none | full output capacity preflight and path snapshot precede lookup; packed list copies only after complete success |
+| `VFS` | `LLISTXATTR` | `in/out` | path up to 511 chars and packed output up to 65536 bytes | output yes only for zero size; path no | none | full output capacity preflight and path snapshot precede no-follow lookup; packed list copies only after complete success |
+| `VFS` | `FLISTXATTR` | `out` | packed output up to 65536 bytes | yes only for zero size | none | full output capacity preflight precedes retained-fd lookup; packed list copies only after complete success |
+| `VFS` | `REMOVEXATTR` | `in` | path up to 511 chars and name up to 255 chars | no | none | complete path/name snapshots precede mutation |
+| `VFS` | `LREMOVEXATTR` | `in` | path up to 511 chars and name up to 255 chars | no | none | complete path/name snapshots precede no-follow mutation |
+| `VFS` | `FREMOVEXATTR` | `in` | name up to 255 chars | no | none | complete name snapshot precedes retained-fd mutation |
 
 FCNTL command split: `F_GETLK/F_OFD_GETLK` snapshot one 32-byte flock,
 preflight that same record, run VFS on the kernel record, then copy it back.

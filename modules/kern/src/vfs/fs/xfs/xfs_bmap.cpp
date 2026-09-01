@@ -100,6 +100,28 @@ auto bmdr_root_layout(const XfsInode* ip, size_t root_size, uint16_t numrecs, ui
     return 0;
 }
 
+auto bmdr_root_layout_for_size(size_t root_size, uint16_t numrecs, uint32_t* maxrecs_out) -> int {
+    if (maxrecs_out != nullptr) {
+        *maxrecs_out = 0;
+    }
+    if (root_size < sizeof(XfsBmdrBlock)) {
+        return -EIO;
+    }
+    size_t const CAPACITY = (root_size - sizeof(XfsBmdrBlock)) / (sizeof(XfsBmbtKey) + sizeof(Be64));
+    uint32_t const MAXRECS = CAPACITY > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(CAPACITY);
+    if (MAXRECS == 0 || numrecs > MAXRECS) {
+        return -EIO;
+    }
+    size_t const MIN_SIZE = bmdr_root_min_size(MAXRECS, numrecs);
+    if (MIN_SIZE == SIZE_MAX || root_size < MIN_SIZE) {
+        return -EIO;
+    }
+    if (maxrecs_out != nullptr) {
+        *maxrecs_out = MAXRECS;
+    }
+    return 0;
+}
+
 auto bmdr_key_addr(uint8_t* root, uint16_t idx) -> uint8_t* {
     return root + sizeof(XfsBmdrBlock) + (static_cast<size_t>(idx) * sizeof(XfsBmbtKey));
 }
@@ -731,7 +753,8 @@ auto bmbt_count_root_bytes(XfsInode* ip, const uint8_t* root, size_t root_size, 
     return 0;
 }
 
-auto bmbt_free_root_bytes(XfsInode* ip, XfsTransaction* tp, const uint8_t* root, size_t root_size, uint32_t* freed) -> int {
+auto bmbt_free_root_bytes(XfsInode* ip, XfsTransaction* tp, const uint8_t* root, size_t root_size, uint32_t* freed,
+                          bool capacity_from_root_size = false) -> int {
     if (freed != nullptr) {
         *freed = 0;
     }
@@ -752,7 +775,8 @@ auto bmbt_free_root_bytes(XfsInode* ip, XfsTransaction* tp, const uint8_t* root,
     }
 
     uint32_t root_maxrecs = 0;
-    int rc = bmdr_root_layout(ip, root_size, NUMRECS, &root_maxrecs);
+    int rc = capacity_from_root_size ? bmdr_root_layout_for_size(root_size, NUMRECS, &root_maxrecs)
+                                     : bmdr_root_layout(ip, root_size, NUMRECS, &root_maxrecs);
     if (rc != 0) {
         return rc;
     }
@@ -799,14 +823,17 @@ void fill_bmdr_root(uint8_t* root, uint32_t maxrecs, uint16_t level, uint16_t nu
     }
 }
 
-auto build_bmbt_tree(XfsInode* ip, XfsTransaction* tp, const XfsBmbtIrec* extents, uint32_t extent_count, BmbtRootBuild* out) -> int {
-    if (ip == nullptr || ip->mount == nullptr || tp == nullptr || extents == nullptr || out == nullptr || extent_count == 0) {
+auto build_bmbt_tree(XfsInode* ip, XfsTransaction* tp, const XfsBmbtIrec* extents, uint32_t extent_count, size_t root_size,
+                     BmbtRootBuild* out) -> int {
+    if (ip == nullptr || ip->mount == nullptr || tp == nullptr || extents == nullptr || out == nullptr || extent_count == 0 ||
+        root_size < sizeof(XfsBmdrBlock)) {
         return -EINVAL;
     }
     if (!bmbt_extent_list_is_ordered(extents, extent_count)) {
         return -EINVAL;
     }
-    uint32_t const BMDR_CAPACITY = data_fork_bmdr_capacity(ip);
+    size_t const CAPACITY64 = (root_size - sizeof(XfsBmdrBlock)) / (sizeof(XfsBmbtKey) + sizeof(Be64));
+    uint32_t const BMDR_CAPACITY = CAPACITY64 > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(CAPACITY64);
     if (BMDR_CAPACITY == 0) {
         return -EFBIG;
     }
@@ -957,7 +984,7 @@ auto build_bmbt_tree(XfsInode* ip, XfsTransaction* tp, const XfsBmbtIrec* extent
 
     constexpr uint16_t BMDR_RECS = 1;
     size_t const MIN_ROOT_SIZE = bmdr_root_min_size(BMDR_CAPACITY, BMDR_RECS);
-    size_t const ROOT_SIZE = data_fork_payload_size(ip);
+    size_t const ROOT_SIZE = root_size;
     if (MIN_ROOT_SIZE == SIZE_MAX || ROOT_SIZE < MIN_ROOT_SIZE) {
         cleanup_levels();
         return -EIO;
@@ -1514,7 +1541,7 @@ auto xfs_bmap_add_extent(XfsInode* ip, XfsTransaction* tp, const XfsBmbtIrec& ne
     }
 
     BmbtRootBuild new_root{};
-    rc = build_bmbt_tree(ip, tp, new_extents, new_count, &new_root);
+    rc = build_bmbt_tree(ip, tp, new_extents, new_count, data_fork_payload_size(ip), &new_root);
     if (rc != 0) {
         free_new_extents();
         return rc;
@@ -1564,6 +1591,31 @@ auto xfs_bmap_add_extent(XfsInode* ip, XfsTransaction* tp, const XfsBmbtIrec& ne
 
 auto xfs_bmap_free_btree_blocks(XfsInode* ip, XfsTransaction* tp, uint32_t* freed_blocks) -> int {
     return bmbt_free_fork_blocks(ip, tp, freed_blocks);
+}
+
+auto xfs_bmap_build_fork_btree(XfsInode* ip, XfsTransaction* tp, const XfsBmbtIrec* extents, uint32_t extent_count, size_t root_size,
+                               XfsIforkBtree* out, uint32_t* metadata_blocks) -> int {
+    if (out == nullptr) {
+        return -EINVAL;
+    }
+    BmbtRootBuild built{};
+    int const RC = build_bmbt_tree(ip, tp, extents, extent_count, root_size, &built);
+    if (RC != 0) {
+        return RC;
+    }
+    out->root = built.root;
+    out->root_size = built.root_size;
+    out->level = built.level;
+    out->numrecs = built.numrecs;
+    if (metadata_blocks != nullptr) {
+        *metadata_blocks = built.metadata_blocks;
+    }
+    built.root = nullptr;
+    return 0;
+}
+
+auto xfs_bmap_free_fork_btree(XfsInode* ip, XfsTransaction* tp, const XfsIforkBtree& fork, uint32_t* freed_blocks) -> int {
+    return bmbt_free_root_bytes(ip, tp, fork.root, fork.root_size, freed_blocks, true);
 }
 
 auto xfs_selftest_bmap_insert_merge_cases() -> bool {

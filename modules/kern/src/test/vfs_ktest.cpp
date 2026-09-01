@@ -180,6 +180,44 @@ KTEST(VFS, StatvfsTmpfsPath) {
     KEXPECT_EQ(st.f_frsize, static_cast<unsigned long>(4096));
 }
 
+KTEST(VFS, XattrBeneathRejectsSymlinkAndRemoteEscape) {
+    constexpr const char* EXPORT_ROOT = "/tmp/ktest_xattr_export";
+    constexpr const char* FINAL_ABSOLUTE = "/tmp/ktest_xattr_export/final_absolute";
+    constexpr const char* FINAL_RELATIVE = "/tmp/ktest_xattr_export/final_relative";
+    constexpr const char* INTERMEDIATE = "/tmp/ktest_xattr_export/intermediate";
+    constexpr const char* REMOTE_MOUNT = "/tmp/ktest_xattr_export/remote";
+    constexpr const char* NAME = "user.ktest";
+
+    static_cast<void>(ker::vfs::unmount_filesystem(REMOTE_MOUNT));
+    static_cast<void>(ker::vfs::vfs_unlink(FINAL_ABSOLUTE));
+    static_cast<void>(ker::vfs::vfs_unlink(FINAL_RELATIVE));
+    static_cast<void>(ker::vfs::vfs_unlink(INTERMEDIATE));
+    static_cast<void>(ker::vfs::vfs_rmdir(REMOTE_MOUNT));
+    static_cast<void>(ker::vfs::vfs_rmdir(EXPORT_ROOT));
+    static_cast<void>(ker::vfs::vfs_mkdir("/tmp", 0755));
+    KREQUIRE_EQ(ker::vfs::vfs_mkdir(EXPORT_ROOT, 0755), 0);
+
+    KREQUIRE_EQ(ker::vfs::vfs_symlink("/tmp", FINAL_ABSOLUTE), 0);
+    KREQUIRE_EQ(ker::vfs::vfs_symlink("../ktest_xattr_outside", FINAL_RELATIVE), 0);
+    KREQUIRE_EQ(ker::vfs::vfs_symlink("/tmp", INTERMEDIATE), 0);
+
+    KEXPECT_EQ(ker::vfs::vfs_getxattr_beneath(EXPORT_ROOT, "final_absolute", NAME, nullptr, 0, true), static_cast<ssize_t>(-EPERM));
+    KEXPECT_EQ(ker::vfs::vfs_getxattr_beneath(EXPORT_ROOT, "final_relative", NAME, nullptr, 0, true), static_cast<ssize_t>(-EPERM));
+    KEXPECT_EQ(ker::vfs::vfs_getxattr_beneath(EXPORT_ROOT, "intermediate/child", NAME, nullptr, 0, true), static_cast<ssize_t>(-EPERM));
+    KEXPECT_EQ(ker::vfs::vfs_getxattr_beneath(EXPORT_ROOT, "/absolute", NAME, nullptr, 0, true), static_cast<ssize_t>(-EINVAL));
+
+    KREQUIRE_EQ(ker::vfs::vfs_mkdir(REMOTE_MOUNT, 0755), 0);
+    KREQUIRE_EQ(ker::vfs::mount_filesystem(REMOTE_MOUNT, "remote", nullptr, 0, nullptr, nullptr, nullptr), 0);
+    KEXPECT_EQ(ker::vfs::vfs_getxattr_beneath(EXPORT_ROOT, "remote/child", NAME, nullptr, 0, true), static_cast<ssize_t>(-EPERM));
+
+    KEXPECT_EQ(ker::vfs::unmount_filesystem(REMOTE_MOUNT), 0);
+    KEXPECT_EQ(ker::vfs::vfs_unlink(FINAL_ABSOLUTE), 0);
+    KEXPECT_EQ(ker::vfs::vfs_unlink(FINAL_RELATIVE), 0);
+    KEXPECT_EQ(ker::vfs::vfs_unlink(INTERMEDIATE), 0);
+    KEXPECT_EQ(ker::vfs::vfs_rmdir(REMOTE_MOUNT), 0);
+    KEXPECT_EQ(ker::vfs::vfs_rmdir(EXPORT_ROOT), 0);
+}
+
 KTEST(VFS, UtimensatUpdatesTmpfsTimestamps) {
     ker::vfs::vfs_mkdir("/tmp", 0755);
 

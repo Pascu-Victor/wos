@@ -178,6 +178,9 @@ constexpr uint16_t WKI_CAP_VFS_METADATA_BATCH = 0x0010;
 // Both peers understand the fixed, append-only IPv6 state suffix carried by
 // NET resource adverts, attach ACKs, and state notifications.
 constexpr uint16_t WKI_CAP_NET_IPV6_STATE = 0x0020;
+// Both peers understand the bounded, replay-safe remote xattr transfer
+// protocol carried by OP_VFS_XATTR.
+constexpr uint16_t WKI_CAP_VFS_XATTR = 0x0040;
 
 // Hostname constants
 constexpr size_t WKI_HOSTNAME_MAX = 64;  // Matches Linux HOST_NAME_MAX (including NUL)
@@ -973,6 +976,101 @@ struct VfsMetadataBatchHeader {
 } __attribute__((packed));
 
 static_assert(sizeof(VfsMetadataBatchHeader) == 8);
+
+constexpr uint16_t OP_VFS_XATTR = 0x0417;
+constexpr uint8_t WKI_VFS_XATTR_VERSION = 1;
+constexpr uint16_t WKI_VFS_XATTR_NAME_MAX = 255;
+constexpr uint32_t WKI_VFS_XATTR_DATA_MAX = 65536;
+
+enum class VfsXattrPhase : uint8_t {
+    INVALID = 0,
+    BEGIN = 1,
+    DATA = 2,
+    COMMIT = 3,
+    ABORT = 4,
+};
+
+enum class VfsXattrOperation : uint8_t {
+    INVALID = 0,
+    GET = 1,
+    LIST = 2,
+    SET = 3,
+    REMOVE = 4,
+};
+
+enum class VfsXattrTarget : uint8_t {
+    INVALID = 0,
+    PATH = 1,
+    FD = 2,
+};
+
+// Every phase carries the same explicit identity. Unlike the DEV_OP sequence
+// cookie this identity survives response loss and is suitable for exact
+// mutation replay detection.
+struct VfsXattrPhaseHeader {
+    uint64_t session_id;
+    uint64_t operation_id;
+    uint8_t version;
+    VfsXattrPhase phase;
+    VfsXattrOperation operation;
+    VfsXattrTarget target;
+} __attribute__((packed));
+
+static_assert(sizeof(VfsXattrPhaseHeader) == 20);
+
+// BEGIN is followed by path_len path bytes and name_len name bytes. FD targets
+// have path_len == 0 and identify the already-open remote file with remote_fd.
+struct VfsXattrBeginPayload {
+    VfsXattrPhaseHeader header;
+    int32_t remote_fd;
+    uint32_t data_len;
+    uint32_t flags;
+    uint16_t path_len;
+    uint16_t name_len;
+    uint8_t follow_final_symlink;
+    std::array<uint8_t, 3> reserved;
+} __attribute__((packed));
+
+static_assert(sizeof(VfsXattrBeginPayload) == 40);
+
+// DATA requests and responses use contiguous offsets; chunk_len bytes follow.
+struct VfsXattrDataPayload {
+    VfsXattrPhaseHeader header;
+    uint32_t offset;
+    uint16_t chunk_len;
+    uint16_t reserved;
+} __attribute__((packed));
+
+static_assert(sizeof(VfsXattrDataPayload) == 28);
+
+struct VfsXattrResultPayload {
+    VfsXattrPhaseHeader header;
+    uint32_t data_len;
+    uint32_t transferred;
+} __attribute__((packed));
+
+static_assert(sizeof(VfsXattrResultPayload) == 28);
+
+constexpr auto wki_vfs_xattr_header_valid(const VfsXattrPhaseHeader& header) -> bool {
+    return header.version == WKI_VFS_XATTR_VERSION && header.session_id != 0 && header.operation_id != 0 &&
+           header.phase >= VfsXattrPhase::BEGIN && header.phase <= VfsXattrPhase::ABORT && header.operation >= VfsXattrOperation::GET &&
+           header.operation <= VfsXattrOperation::REMOVE && header.target >= VfsXattrTarget::PATH && header.target <= VfsXattrTarget::FD;
+}
+
+constexpr auto wki_vfs_xattr_begin_valid(const VfsXattrBeginPayload& begin) -> bool {
+    bool const PATH_TARGET = begin.header.target == VfsXattrTarget::PATH;
+    bool const NEEDS_NAME = begin.header.operation != VfsXattrOperation::LIST;
+    bool const CARRIES_DATA = begin.header.operation == VfsXattrOperation::SET || begin.header.operation == VfsXattrOperation::GET ||
+                              begin.header.operation == VfsXattrOperation::LIST;
+    return wki_vfs_xattr_header_valid(begin.header) && begin.header.phase == VfsXattrPhase::BEGIN &&
+           begin.data_len <= WKI_VFS_XATTR_DATA_MAX && begin.name_len <= WKI_VFS_XATTR_NAME_MAX &&
+           (NEEDS_NAME ? begin.name_len != 0 : begin.name_len == 0) && (PATH_TARGET || begin.path_len == 0) &&
+           (PATH_TARGET ? begin.remote_fd == -1 : begin.remote_fd >= 0) && (CARRIES_DATA || begin.data_len == 0) &&
+           begin.follow_final_symlink <= 1 && begin.reserved[0] == 0 && begin.reserved[1] == 0 && begin.reserved[2] == 0;
+}
+
+constexpr size_t WKI_VFS_XATTR_MAX_DATA_CHUNK = WKI_ETH_MAX_PAYLOAD - sizeof(DevOpRespPayload) - sizeof(VfsXattrResultPayload);
+static_assert(WKI_VFS_XATTR_MAX_DATA_CHUNK > 0 && WKI_VFS_XATTR_MAX_DATA_CHUNK <= UINT16_MAX);
 
 // IPC Pipe (0x0700–0x070F) — data moves via wire messages
 constexpr uint16_t OP_PIPE_CLOSE_READ = 0x0700;

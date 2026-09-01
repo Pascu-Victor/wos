@@ -672,7 +672,7 @@ static_assert(sizeof(XfsDir3FreeHdr) == 64);
 constexpr uint8_t XFS_ATTR_LOCAL = (1U << 0);       // attr value stored locally in leaf
 constexpr uint8_t XFS_ATTR_ROOT = (1U << 1);        // attr is in the root (trusted) namespace
 constexpr uint8_t XFS_ATTR_SECURE = (1U << 2);      // attr is in the security namespace
-constexpr uint8_t XFS_ATTR_PARENT = (1U << 5);      // attr is a parent pointer
+constexpr uint8_t XFS_ATTR_PARENT = (1U << 3);      // attr is a parent pointer
 constexpr uint8_t XFS_ATTR_INCOMPLETE = (1U << 7);  // attr is being modified
 
 // Mask for namespace bits only (excluding LOCAL and INCOMPLETE)
@@ -733,9 +733,10 @@ struct XfsAttr3LeafHdr {
     // N largest free regions; raw array is part of the packed on-disk XFS leaf header.
     // NOLINTNEXTLINE(modernize-avoid-c-arrays,cppcoreguidelines-avoid-c-arrays)
     XfsAttrLeafMap freemap[XFS_ATTR_LEAF_MAPSIZE];
+    Be32 pad2;  // 64-bit alignment in the standard v5 on-disk header
     // Followed by XfsAttrLeafEntry[] array
 } __attribute__((packed));
-static_assert(sizeof(XfsAttr3LeafHdr) == 76);
+static_assert(sizeof(XfsAttr3LeafHdr) == 80);
 
 // CRC field is at offsetof(XfsAttr3LeafHdr, info.crc) = sizeof(XfsDaBlkinfo) = 12
 constexpr size_t XFS_ATTR3_LEAF_CRC_OFF = 12;
@@ -794,12 +795,39 @@ struct XfsAttr3RmtHdr {
     Be32 rm_offset;    // byte offset of this block's data within the total value
     Be32 rm_bytes;     // data bytes stored in this block
     Be32 rm_crc;       // CRC of block (with this field set to zero during computation)
+    XfsUuidT rm_uuid;  // filesystem UUID
     Be64 rm_owner;     // owning inode number
     Be64 rm_blkno;     // device block number of this block
     Be64 rm_lsn;       // log sequence number
-    XfsUuidT rm_uuid;  // filesystem UUID
 } __attribute__((packed));
 static_assert(sizeof(XfsAttr3RmtHdr) == 56);
+static_assert(offsetof(XfsAttr3RmtHdr, rm_uuid) == 16);
+static_assert(offsetof(XfsAttr3RmtHdr, rm_owner) == 32);
+static_assert(offsetof(XfsAttr3RmtHdr, rm_blkno) == 40);
+static_assert(offsetof(XfsAttr3RmtHdr, rm_lsn) == 48);
+
+constexpr auto xfs_attr3_rmt_buf_space(size_t block_size) -> size_t {
+    return block_size > sizeof(XfsAttr3RmtHdr) ? block_size - sizeof(XfsAttr3RmtHdr) : 0;
+}
+
+constexpr auto xfs_attr3_rmt_blocks(size_t block_size, size_t value_size) -> size_t {
+    size_t const SPACE = xfs_attr3_rmt_buf_space(block_size);
+    return SPACE == 0 ? 0 : (value_size / SPACE) + (value_size % SPACE != 0 ? 1 : 0);
+}
+
+constexpr size_t XFS_ATTR_LEAF_NAME_ALIGN = 4;
+
+constexpr auto xfs_attr_leaf_entsize_local(size_t namelen, size_t valuelen) -> size_t {
+    return (offsetof(XfsAttrLeafNameLocal, nameval) + namelen + valuelen + XFS_ATTR_LEAF_NAME_ALIGN - 1) & ~(XFS_ATTR_LEAF_NAME_ALIGN - 1);
+}
+
+constexpr auto xfs_attr_leaf_entsize_remote(size_t namelen) -> size_t {
+    // The two bytes after the remote-name flex array are historical on-disk
+    // padding and remain part of the encoded record size.
+    constexpr size_t REMOTE_IMPLICIT_PADDING = 2;
+    return (offsetof(XfsAttrLeafNameRemote, name) + REMOTE_IMPLICIT_PADDING + namelen + XFS_ATTR_LEAF_NAME_ALIGN - 1) &
+           ~(XFS_ATTR_LEAF_NAME_ALIGN - 1);
+}
 
 // ============================================================================
 // Parent Pointer Structures (XFS_SB_FEAT_INCOMPAT_PARENT)

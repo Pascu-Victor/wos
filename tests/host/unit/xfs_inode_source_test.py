@@ -173,7 +173,8 @@ def main() -> None:
         ("if (home_metadata_clean)", "clean marker publication only after successful home sync"),
         ("auto xfs_log_mark_clean_locked(", "locked clean marker publication helper"),
         ("auto xfs_log_clear_clean(", "standard clean-unmount record helper"),
-        ("int rc = xfs_log_write_record(log, body.data(), body.size(), 1, false, true);", "standard clean-unmount record write"),
+        ("int rc = xfs_log_erase_device(log);", "private log history retirement after home sync"),
+        ("rc = xfs_log_write_record(log, body.data(), body.size(), 1, false, true);", "standard clean-unmount record write"),
         ("rc = flush_blockdev(mount->device);", "clean record durability barrier"),
         ("log->clean = false;", "failed publication remains dirty and retryable"),
     ):

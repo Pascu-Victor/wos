@@ -21,6 +21,23 @@ TEST(XfsFormat, AgfSize) { static_assert(sizeof(XfsAgf) == 224); }
 TEST(XfsFormat, AgiSize) { static_assert(sizeof(XfsAgi) == 344); }
 TEST(XfsFormat, BmbtRecSize) { static_assert(sizeof(XfsBmbtRec) == 16); }
 TEST(XfsFormat, AllocRecSize) { static_assert(sizeof(XfsAllocRec) == 8); }
+TEST(XfsFormat, AttrV5Layouts) {
+    EXPECT_EQ(sizeof(XfsAttr3LeafHdr), 80u);
+    EXPECT_EQ(sizeof(XfsAttr3RmtHdr), 56u);
+    EXPECT_EQ(offsetof(XfsAttr3RmtHdr, rm_uuid), 16u);
+    EXPECT_EQ(offsetof(XfsAttr3RmtHdr, rm_owner), 32u);
+    EXPECT_EQ(offsetof(XfsAttr3RmtHdr, rm_blkno), 40u);
+    EXPECT_EQ(offsetof(XfsAttr3RmtHdr, rm_lsn), 48u);
+}
+TEST(XfsFormat, AttrFlagsAndAlignedPayloadSizes) {
+    EXPECT_EQ(XFS_ATTR_PARENT, 1u << 3);
+    EXPECT_EQ(xfs_attr_leaf_entsize_local(1, 1), 8u);
+    EXPECT_EQ(xfs_attr_leaf_entsize_local(5, 7), 16u);
+    EXPECT_EQ(xfs_attr_leaf_entsize_remote(1), 12u);
+    EXPECT_EQ(xfs_attr_leaf_entsize_remote(5), 16u);
+    EXPECT_EQ(xfs_attr3_rmt_buf_space(4096), 4040u);
+    EXPECT_EQ(xfs_attr3_rmt_blocks(4096, 65536), 17u);
+}
 TEST(XfsFormat, LogRecordHeaderMatchesOneBasicBlock) {
     EXPECT_EQ(sizeof(XlogRecHeader), XLOG_HEADER_SIZE);
     EXPECT_EQ(sizeof(XlogRecHeader), static_cast<size_t>(512));

@@ -468,6 +468,45 @@ TEST(WkiWire, VfsMetadataBatchUsesAdditiveBoundedFraming) {
     EXPECT_EQ(sizeof(HelloPayload), 96u);
 }
 
+TEST(WkiWire, VfsXattrUsesVersionedBoundedReplayIdentity) {
+    EXPECT_EQ(WKI_CAP_VFS_XATTR, 0x0040u);
+    EXPECT_EQ(OP_VFS_XATTR, 0x0417u);
+    EXPECT_EQ(WKI_VFS_XATTR_VERSION, 1u);
+    EXPECT_EQ(WKI_VFS_XATTR_NAME_MAX, 255u);
+    EXPECT_EQ(WKI_VFS_XATTR_DATA_MAX, 65536u);
+    EXPECT_EQ(sizeof(VfsXattrPhaseHeader), 20u);
+    EXPECT_EQ(sizeof(VfsXattrBeginPayload), 40u);
+    EXPECT_EQ(sizeof(VfsXattrDataPayload), 28u);
+    EXPECT_EQ(sizeof(VfsXattrResultPayload), 28u);
+    EXPECT_EQ(offsetof(VfsXattrPhaseHeader, session_id), 0u);
+    EXPECT_EQ(offsetof(VfsXattrPhaseHeader, operation_id), 8u);
+    EXPECT_EQ(WKI_VFS_XATTR_MAX_DATA_CHUNK, WKI_ETH_MAX_PAYLOAD - sizeof(DevOpRespPayload) - sizeof(VfsXattrResultPayload));
+    EXPECT_LT(WKI_VFS_XATTR_MAX_DATA_CHUNK, static_cast<size_t>(UINT16_MAX));
+
+    VfsXattrDataPayload hostile_read = {};
+    hostile_read.chunk_len = UINT16_MAX;
+    EXPECT_GT(hostile_read.chunk_len, WKI_VFS_XATTR_MAX_DATA_CHUNK);
+
+    VfsXattrBeginPayload begin = {};
+    begin.header = {.session_id = 1,
+                    .operation_id = 2,
+                    .version = WKI_VFS_XATTR_VERSION,
+                    .phase = VfsXattrPhase::BEGIN,
+                    .operation = VfsXattrOperation::SET,
+                    .target = VfsXattrTarget::PATH};
+    begin.remote_fd = -1;
+    begin.data_len = WKI_VFS_XATTR_DATA_MAX;
+    begin.path_len = 1;
+    begin.name_len = WKI_VFS_XATTR_NAME_MAX;
+    begin.follow_final_symlink = 1;
+    EXPECT_TRUE(wki_vfs_xattr_begin_valid(begin));
+    begin.data_len++;
+    EXPECT_FALSE(wki_vfs_xattr_begin_valid(begin));
+    begin.data_len = 0;
+    begin.header.operation_id = 0;
+    EXPECT_FALSE(wki_vfs_xattr_begin_valid(begin));
+}
+
 TEST(WkiWire, DevAttachAckMatchesExpectedCookie) {
     DevAttachAckPayload ack = {};
     ack.resource_id = 55;

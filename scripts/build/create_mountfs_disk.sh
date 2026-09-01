@@ -89,6 +89,17 @@ part-add /dev/sda p $KTEST_PART_START_SECTOR $KTEST_PART_END_SECTOR
 debug sh "mkfs.xfs -f -m rmapbt=0,reflink=0,inobtcount=0 -n parent=0 /dev/sda2"
 sync
 _EOF_
+    # Reopen the appliance after changing the partition table.  Some
+    # libguestfs kernels keep the pre-part-add geometry for mount(2) until the
+    # disk is reattached even though mkfs.xfs can already open /dev/sda2.
+    wos_qcow_guestfish "seed isolated KTEST XFS fixture" "$DISK" --rw -a "$DISK" <<_EOF_
+run
+mount /dev/sda2 /
+touch /linux-xattr-fixture
+setxattr user.linux linux 5 /linux-xattr-fixture
+umount /
+sync
+_EOF_
 fi
 
 rm -f "$STAGING_TAR"

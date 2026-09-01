@@ -261,6 +261,30 @@ auto subop_name(uint64_t callnum, uint64_t op) -> std::string_view {
                     return "fstat_close";
                 case ker::abi::vfs::ops::METADATA_BATCH:
                     return "metadata_batch";
+                case ker::abi::vfs::ops::SETXATTR:
+                    return "setxattr";
+                case ker::abi::vfs::ops::LSETXATTR:
+                    return "lsetxattr";
+                case ker::abi::vfs::ops::FSETXATTR:
+                    return "fsetxattr";
+                case ker::abi::vfs::ops::GETXATTR:
+                    return "getxattr";
+                case ker::abi::vfs::ops::LGETXATTR:
+                    return "lgetxattr";
+                case ker::abi::vfs::ops::FGETXATTR:
+                    return "fgetxattr";
+                case ker::abi::vfs::ops::LISTXATTR:
+                    return "listxattr";
+                case ker::abi::vfs::ops::LLISTXATTR:
+                    return "llistxattr";
+                case ker::abi::vfs::ops::FLISTXATTR:
+                    return "flistxattr";
+                case ker::abi::vfs::ops::REMOVEXATTR:
+                    return "removexattr";
+                case ker::abi::vfs::ops::LREMOVEXATTR:
+                    return "lremovexattr";
+                case ker::abi::vfs::ops::FREMOVEXATTR:
+                    return "fremovexattr";
                 case ker::abi::vfs::ops::UMOUNT:
                     return "umount";
                 case ker::abi::vfs::ops::DUP:
@@ -506,6 +530,20 @@ auto should_decode_string(uint64_t callnum, uint64_t op, int arg_index) -> bool 
             case ker::abi::vfs::ops::PIVOT_ROOT:
             case ker::abi::vfs::ops::STATVFS:
             case ker::abi::vfs::ops::REALPATH:
+                return arg_index == 0;
+            case ker::abi::vfs::ops::SETXATTR:
+            case ker::abi::vfs::ops::LSETXATTR:
+            case ker::abi::vfs::ops::GETXATTR:
+            case ker::abi::vfs::ops::LGETXATTR:
+            case ker::abi::vfs::ops::REMOVEXATTR:
+            case ker::abi::vfs::ops::LREMOVEXATTR:
+                return arg_index == 0 || arg_index == 1;
+            case ker::abi::vfs::ops::FSETXATTR:
+            case ker::abi::vfs::ops::FGETXATTR:
+            case ker::abi::vfs::ops::FREMOVEXATTR:
+                return arg_index == 1;
+            case ker::abi::vfs::ops::LISTXATTR:
+            case ker::abi::vfs::ops::LLISTXATTR:
                 return arg_index == 0;
             case ker::abi::vfs::ops::FACCESSAT:
             case ker::abi::vfs::ops::UNLINKAT:

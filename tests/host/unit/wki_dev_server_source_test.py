@@ -469,7 +469,7 @@ def test_detach_admission_is_napi_safe_and_cleanup_is_deferred() -> None:
         "binding.detach_cleanup_pending",
         "binding.detach_cleanup_claimed",
         "wait_for_binding_refs_to_drain(item.binding)",
-        "wki_remote_vfs_mark_server_fds_for_channel(item.channel_identity)",
+        "wki_remote_vfs_cleanup_server_fds_for_channel(item.channel_identity)",
         "release_vfs_rdma_buffers(&item.vfs_rdma_buffers)",
         "wki_zone_destroy(item.blk_zone_id)",
         "item.block_dev->remotable->on_remote_detach(item.consumer_node)",
@@ -484,6 +484,12 @@ def test_detach_admission_is_napi_safe_and_cleanup_is_deferred() -> None:
     require_order(
         worker,
         "wait_for_binding_refs_to_drain(item.binding)",
+        "wki_remote_vfs_cleanup_server_fds_for_channel(item.channel_identity)",
+        "detach xattr/File cleanup after binding ref drain",
+    )
+    require_order(
+        worker,
+        "wki_remote_vfs_cleanup_server_fds_for_channel(item.channel_identity)",
         "release_vfs_rdma_buffers(&item.vfs_rdma_buffers)",
         "detach VFS RDMA ref drain",
     )
@@ -1010,7 +1016,7 @@ def test_path_utimens_is_deferred_without_reclassifying_invalidate() -> None:
         if token not in rx_admission:
             fail(f"VFS reliable pre-ACK admission is missing {token}")
 
-    if admission.count("op_id <= OP_VFS_METADATA_BATCH") != 2:
+    if admission.count("op_id <= OP_VFS_XATTR") != 2:
         fail("VFS request and response admission must include path utimens during export rebuild/drain")
 
 
@@ -1038,7 +1044,7 @@ def test_metadata_batch_is_capability_gated_preflighted_and_worker_executed() ->
     if "op_id == OP_VFS_METADATA_BATCH" not in classifier or "OP_VFS_INVALIDATE" in classifier:
         fail("metadata batch must be deferred without classifying invalidation notifications as requests")
     admission = function_body(wki_source, "message_uses_vfs_export_admission")
-    if admission.count("op_id <= OP_VFS_METADATA_BATCH") != 2:
+    if admission.count("op_id <= OP_VFS_XATTR") != 2:
         fail("metadata batch requests and responses must participate in VFS export admission")
     if "WKI_CAP_VFS_METADATA_BATCH" not in function_body(wki_source, "wki_init"):
         fail("metadata batch capability must be advertised in HELLO")

@@ -44,6 +44,7 @@
 #include "thread_exit_stress.hpp"
 #include "usercopy_negative.hpp"
 #include "wki_chaos_workload.hpp"
+#include "xattr_matrix.hpp"
 
 namespace {
 
@@ -663,6 +664,10 @@ auto main(int argc, char** argv, char** envp) -> int {
 
     if (command != nullptr && std::strcmp(command, "usercopy-negative") == 0) {
         return run_usercopy_negative();
+    }
+
+    if (command != nullptr && std::strcmp(command, "xattr-matrix") == 0) {
+        return run_xattr_matrix(argc - 1, argv + 1);
     }
 
     if (command != nullptr && std::strcmp(command, "mandelbench") == 0) {

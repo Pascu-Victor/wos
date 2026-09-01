@@ -452,14 +452,14 @@ auto message_uses_vfs_export_admission(MsgType type, const uint8_t* payload, uin
                 return false;
             }
             auto const* req = reinterpret_cast<const DevOpReqPayload*>(payload);
-            return req->op_id >= OP_VFS_OPEN && req->op_id <= OP_VFS_METADATA_BATCH;
+            return req->op_id >= OP_VFS_OPEN && req->op_id <= OP_VFS_XATTR;
         }
         case MsgType::DEV_OP_RESP: {
             if (payload_len < sizeof(DevOpRespPayload)) {
                 return false;
             }
             auto const* resp = reinterpret_cast<const DevOpRespPayload*>(payload);
-            return resp->op_id >= OP_VFS_OPEN && resp->op_id <= OP_VFS_METADATA_BATCH;
+            return resp->op_id >= OP_VFS_OPEN && resp->op_id <= OP_VFS_XATTR;
         }
         default:
             return false;
@@ -475,8 +475,9 @@ auto admit_vfs_op(MsgType type, const WkiHeader* hdr, const uint8_t* payload, ui
 
     auto const* req = reinterpret_cast<const DevOpReqPayload*>(payload);
     bool const IS_VFS_OP = (req->op_id >= OP_VFS_OPEN && req->op_id <= OP_VFS_READ_BULK) || req->op_id == OP_VFS_UTIMENS ||
-                           req->op_id == OP_VFS_METADATA_BATCH;
-    if (!IS_VFS_OP || sizeof(DevOpReqPayload) + req->data_len > payload_len) {
+                           req->op_id == OP_VFS_METADATA_BATCH || req->op_id == OP_VFS_XATTR;
+    size_t const EXPECTED_LEN = sizeof(DevOpReqPayload) + req->data_len;
+    if (!IS_VFS_OP || (req->op_id == OP_VFS_XATTR ? EXPECTED_LEN != payload_len : EXPECTED_LEN > payload_len)) {
         return WkiVfsOpRxAdmission::NOT_APPLICABLE;
     }
     if (channel->rx_dispatch_seq != hdr->seq_num) {
@@ -1275,7 +1276,8 @@ void wki_init() {
     g_wki.transports = nullptr;
     g_wki.transport_count = 0;
     g_wki.my_lsa_seq = 0;
-    g_wki.capabilities = WKI_CAP_RESOURCE_INCARNATION | WKI_CAP_VFS_MULTI_RDMA_LANES | WKI_CAP_VFS_METADATA_BATCH | WKI_CAP_NET_IPV6_STATE;
+    g_wki.capabilities = WKI_CAP_RESOURCE_INCARNATION | WKI_CAP_VFS_MULTI_RDMA_LANES | WKI_CAP_VFS_METADATA_BATCH | WKI_CAP_NET_IPV6_STATE |
+                         WKI_CAP_VFS_XATTR;
     g_wki.initialized = true;
 
     // Init routing subsystem (LSDB, routing table)

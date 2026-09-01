@@ -50,6 +50,21 @@ wos_vfs$stat(op const[12], path path, buf ptr[out, array[int8, 128]]) int64
 wos_vfs$fstat(op const[13], fd fd, buf ptr[out, array[int8, 128]]) int64
 wos_vfs$fstat_close(op const[61], fd fd, buf ptr[out, array[int8, 144]], stat_result ptr[out, int32]) int64
 
+# --- Extended attributes ---
+
+wos_vfs$setxattr(op const[63], path path, name ptr[in, string], value ptr[in, array[int8]], size len[value], flags flags[xattr_flags]) int64
+wos_vfs$lsetxattr(op const[64], path path, name ptr[in, string], value ptr[in, array[int8]], size len[value], flags flags[xattr_flags]) int64
+wos_vfs$fsetxattr(op const[65], fd fd, name ptr[in, string], value ptr[in, array[int8]], size len[value], flags flags[xattr_flags]) int64
+wos_vfs$getxattr(op const[66], path path, name ptr[in, string], value ptr[out, array[int8, 4096]], size const[4096]) int64
+wos_vfs$lgetxattr(op const[67], path path, name ptr[in, string], value ptr[out, array[int8, 4096]], size const[4096]) int64
+wos_vfs$fgetxattr(op const[68], fd fd, name ptr[in, string], value ptr[out, array[int8, 4096]], size const[4096]) int64
+wos_vfs$listxattr(op const[69], path path, list ptr[out, array[int8, 4096]], size const[4096]) int64
+wos_vfs$llistxattr(op const[70], path path, list ptr[out, array[int8, 4096]], size const[4096]) int64
+wos_vfs$flistxattr(op const[71], fd fd, list ptr[out, array[int8, 4096]], size const[4096]) int64
+wos_vfs$removexattr(op const[72], path path, name ptr[in, string]) int64
+wos_vfs$lremovexattr(op const[73], path path, name ptr[in, string]) int64
+wos_vfs$fremovexattr(op const[74], fd fd, name ptr[in, string]) int64
+
 # --- Dup ---
 
 wos_vfs$dup(op const[15], fd fd) fd
@@ -105,4 +120,5 @@ open_flags = 0, 1, 2, 0x40, 0x200, 0x400, 0x800
 open_mode = 0, 0x1C0, 0x1A4, 0x1ED, 0x1FF
 seek_whence = 0, 1, 2
 access_mode = 0, 1, 2, 4
+xattr_flags = 0, 1, 2
 fs_types = "tmpfs", "xfs", "fat32", "devfs", "procfs"

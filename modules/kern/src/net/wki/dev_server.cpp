@@ -535,7 +535,8 @@ auto detach_all_may_claim_binding(const DevServerBinding& binding, uint16_t node
 }
 
 auto is_vfs_op(uint16_t op_id) -> bool {
-    return (op_id >= OP_VFS_OPEN && op_id <= OP_VFS_READ_BULK) || op_id == OP_VFS_UTIMENS || op_id == OP_VFS_METADATA_BATCH;
+    return (op_id >= OP_VFS_OPEN && op_id <= OP_VFS_READ_BULK) || op_id == OP_VFS_UTIMENS || op_id == OP_VFS_METADATA_BATCH ||
+           op_id == OP_VFS_XATTR;
 }
 
 auto transport_is_roce(const WkiTransport* transport) -> bool {
@@ -1064,6 +1065,12 @@ void run_deferred_vfs_op(void* arg) {
             return;
         }
         if (op->op_id == OP_VFS_METADATA_BATCH && !wki_peer_capability_negotiated(op->hdr.src_node, WKI_CAP_VFS_METADATA_BATCH)) {
+            send_vfs_error_response(op->channel_identity, op->op_id, -EOPNOTSUPP, req_cookie_from_header(&op->hdr));
+            release_binding(RETAINED_BINDING);
+            deferred_vfs_op_release(op);
+            return;
+        }
+        if (op->op_id == OP_VFS_XATTR && !wki_peer_capability_negotiated(op->hdr.src_node, WKI_CAP_VFS_XATTR)) {
             send_vfs_error_response(op->channel_identity, op->op_id, -EOPNOTSUPP, req_cookie_from_header(&op->hdr));
             release_binding(RETAINED_BINDING);
             deferred_vfs_op_release(op);
@@ -1747,7 +1754,8 @@ auto wki_dev_server_admit_vfs_op_rx(const WkiHeader* hdr, const uint8_t* payload
     }
 
     auto const* req = reinterpret_cast<const DevOpReqPayload*>(payload);
-    if (!is_vfs_op(req->op_id) || sizeof(DevOpReqPayload) + req->data_len > payload_len) {
+    size_t const EXPECTED_LEN = sizeof(DevOpReqPayload) + req->data_len;
+    if (!is_vfs_op(req->op_id) || (req->op_id == OP_VFS_XATTR ? EXPECTED_LEN != payload_len : EXPECTED_LEN > payload_len)) {
         return WkiVfsOpRxAdmission::NOT_APPLICABLE;
     }
     const uint8_t* req_data = payload + sizeof(DevOpReqPayload);
@@ -2130,7 +2138,11 @@ void wki_dev_server_process_pending_detaches() {
             auto& item = work.at(i);
             wait_for_binding_refs_to_drain(item.binding);
             if (item.resource_type == ResourceType::VFS) {
-                wki_remote_vfs_mark_server_fds_for_channel(item.channel_identity);
+                // Normal detach owns complete cleanup for this exact channel
+                // generation, including compact/incomplete xattr stages and
+                // retained File* objects. Leaving tombstones here would let
+                // repeated attach/xattr/detach cycles exhaust bounded state.
+                wki_remote_vfs_cleanup_server_fds_for_channel(item.channel_identity);
             }
             release_vfs_rdma_buffers(&item.vfs_rdma_buffers);
             if (item.blk_rdma_active && item.blk_zone_id != 0) {
@@ -3092,7 +3104,8 @@ void handle_dev_op_req(const WkiHeader* hdr, const uint8_t* payload, uint16_t pa
     uint16_t const REQ_DATA_LEN = req->data_len;
 
     // Verify data fits
-    if (sizeof(DevOpReqPayload) + REQ_DATA_LEN > payload_len) {
+    size_t const EXPECTED_LEN = sizeof(DevOpReqPayload) + REQ_DATA_LEN;
+    if (req->op_id == OP_VFS_XATTR ? EXPECTED_LEN != payload_len : EXPECTED_LEN > payload_len) {
         return;
     }
 

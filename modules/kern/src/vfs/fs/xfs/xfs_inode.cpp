@@ -30,6 +30,7 @@
 #include <utility>
 #include <vfs/buffer_cache.hpp>
 #include <vfs/fs/xfs/xfs_alloc.hpp>
+#include <vfs/fs/xfs/xfs_attr.hpp>
 #include <vfs/fs/xfs/xfs_bmap.hpp>
 #include <vfs/fs/xfs/xfs_btree.hpp>
 #include <vfs/fs/xfs/xfs_ialloc.hpp>
@@ -831,7 +832,10 @@ auto inactivate_unlinked_inode(XfsInode* ip) -> int {
         return rc;
     }
 
-    rc = xfs_inode_truncate_data(ip, tp);
+    rc = xfs_attr_teardown(ip, tp);
+    if (rc == 0) {
+        rc = xfs_inode_truncate_data(ip, tp);
+    }
     if (rc != 0) {
         xfs_trans_cancel(tp);
         mod::dbg::logger<"xfs">::error("xfs_inode_release: failed to free data extents for inode %lu rc=%d",

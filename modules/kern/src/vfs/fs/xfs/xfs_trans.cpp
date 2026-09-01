@@ -49,7 +49,7 @@ struct XfsTransactionPool {
 
 XfsTransactionPool transaction_pool{};
 
-void xfs_trans_free_data_fork(XfsIfork* fork) {
+void xfs_trans_free_ifork(XfsIfork* fork) {
     if (fork == nullptr) {
         return;
     }
@@ -77,6 +77,72 @@ void xfs_trans_free_data_fork(XfsIfork* fork) {
     }
 }
 
+auto xfs_trans_clone_ifork(const XfsIfork& source, XfsIfork* destination) -> int {
+    if (destination == nullptr) {
+        return -EINVAL;
+    }
+
+    destination->format = source.format;
+    switch (source.format) {
+        case XFS_DINODE_FMT_LOCAL:
+            destination->local.data = nullptr;
+            destination->local.size = source.local.size;
+            if (source.local.size == 0) {
+                return 0;
+            }
+            if (source.local.data == nullptr) {
+                return -EIO;
+            }
+            destination->local.data = new (std::nothrow) uint8_t[source.local.size];
+            if (destination->local.data == nullptr) {
+                return -ENOMEM;
+            }
+            __builtin_memcpy(destination->local.data, source.local.data, source.local.size);
+            return 0;
+
+        case XFS_DINODE_FMT_EXTENTS:
+            destination->extents.count = source.extents.count;
+            destination->extents.capacity = source.extents.capacity;
+            destination->extents.list = nullptr;
+            if (source.extents.count > source.extents.capacity || (source.extents.count != 0 && source.extents.list == nullptr)) {
+                return -EIO;
+            }
+            if (xfs_ifork_extents_uses_inline(source.extents)) {
+                destination->extents.list = xfs_ifork_extents_inline_data(destination->extents);
+            } else if (source.extents.capacity != 0) {
+                destination->extents.list = new (std::nothrow) XfsBmbtIrec[source.extents.capacity];
+                if (destination->extents.list == nullptr) {
+                    return -ENOMEM;
+                }
+            }
+            for (uint32_t i = 0; i < source.extents.count; ++i) {
+                destination->extents.list[i] = source.extents.list[i];
+            }
+            return 0;
+
+        case XFS_DINODE_FMT_BTREE:
+            destination->btree.level = source.btree.level;
+            destination->btree.numrecs = source.btree.numrecs;
+            destination->btree.root = nullptr;
+            destination->btree.root_size = source.btree.root_size;
+            if (source.btree.root_size == 0) {
+                return 0;
+            }
+            if (source.btree.root == nullptr) {
+                return -EIO;
+            }
+            destination->btree.root = new (std::nothrow) uint8_t[source.btree.root_size];
+            if (destination->btree.root == nullptr) {
+                return -ENOMEM;
+            }
+            __builtin_memcpy(destination->btree.root, source.btree.root, source.btree.root_size);
+            return 0;
+
+        default:
+            return -EOPNOTSUPP;
+    }
+}
+
 void xfs_trans_discard_undo(XfsTransaction* tp) {
     while (tp->buf_undo != nullptr) {
         XfsTransBufUndo* undo = tp->buf_undo;
@@ -99,7 +165,10 @@ void xfs_trans_discard_undo(XfsTransaction* tp) {
         XfsTransInodeUndo* undo = tp->inode_undo;
         tp->inode_undo = undo->next;
         if (undo->owns_data_fork) {
-            xfs_trans_free_data_fork(&undo->data_fork);
+            xfs_trans_free_ifork(&undo->data_fork);
+        }
+        if (undo->owns_attr_fork) {
+            xfs_trans_free_ifork(&undo->attr_fork);
         }
         delete undo;
     }
@@ -150,17 +219,30 @@ void xfs_trans_restore_undo(XfsTransaction* tp) {
         if (undo->ip == nullptr) {
             continue;
         }
-        xfs_trans_free_data_fork(&undo->ip->data_fork);
+        xfs_trans_free_ifork(&undo->ip->data_fork);
         undo->ip->data_fork = undo->data_fork;
         if (undo->ip->data_fork.format == XFS_DINODE_FMT_EXTENTS &&
             undo->data_fork.extents.list == xfs_ifork_extents_inline_data(undo->data_fork.extents)) {
             undo->ip->data_fork.extents.list = xfs_ifork_extents_inline_data(undo->ip->data_fork.extents);
         }
+        xfs_trans_free_ifork(&undo->ip->attr_fork);
+        undo->ip->attr_fork = undo->attr_fork;
+        if (undo->ip->attr_fork.format == XFS_DINODE_FMT_EXTENTS &&
+            undo->attr_fork.extents.list == xfs_ifork_extents_inline_data(undo->attr_fork.extents)) {
+            undo->ip->attr_fork.extents.list = xfs_ifork_extents_inline_data(undo->ip->attr_fork.extents);
+        }
         undo->ip->size = undo->size;
         undo->ip->nblocks = undo->nblocks;
+        undo->ip->atime = undo->atime;
+        undo->ip->mtime = undo->mtime;
+        undo->ip->ctime = undo->ctime;
+        undo->ip->crtime = undo->crtime;
         undo->ip->nextents = undo->nextents;
+        undo->ip->anextents = undo->anextents;
         undo->ip->mode = undo->mode;
         undo->ip->nlink = undo->nlink;
+        undo->ip->forkoff = undo->forkoff;
+        undo->ip->has_attr_fork = undo->has_attr_fork;
         undo->ip->dirty = undo->dirty;
         undo->ip->dir_generation = undo->dir_generation;
         undo->ip->dir_leaf_index_complete_generation = undo->dir_leaf_index_complete_generation;
@@ -171,6 +253,7 @@ void xfs_trans_restore_undo(XfsTransaction* tp) {
             xfs_dentry_cache_invalidate_dir(undo->ip);
         }
         undo->owns_data_fork = false;
+        undo->owns_attr_fork = false;
     }
 }
 
@@ -626,80 +709,52 @@ auto xfs_trans_capture_inode(XfsTransaction* tp, XfsInode* ip) -> int {
         return -ENOMEM;
     }
     undo->ip = ip;
-    undo->data_fork = ip->data_fork;
     undo->size = ip->size;
     undo->nblocks = ip->nblocks;
+    undo->atime = ip->atime;
+    undo->mtime = ip->mtime;
+    undo->ctime = ip->ctime;
+    undo->crtime = ip->crtime;
     undo->nextents = ip->nextents;
+    undo->anextents = ip->anextents;
     undo->mode = ip->mode;
     undo->nlink = ip->nlink;
+    undo->forkoff = ip->forkoff;
+    undo->has_attr_fork = ip->has_attr_fork;
     undo->dirty = ip->dirty;
     undo->dir_generation = ip->dir_generation;
     undo->dir_leaf_index_complete_generation = ip->dir_leaf_index_complete_generation;
     undo->dir_leaf_index_complete = ip->dir_leaf_index_complete;
     undo->dir_name_filter = ip->dir_name_filter;
     undo->dir_name_filter_complete = ip->dir_name_filter_complete;
+    int rc = xfs_trans_clone_ifork(ip->data_fork, &undo->data_fork);
+    if (rc != 0) {
+        delete undo;
+        if (rc == -ENOMEM) {
+            tp->error = rc;
+        }
+        return rc;
+    }
     undo->owns_data_fork = true;
 
-    switch (ip->data_fork.format) {
-        case XFS_DINODE_FMT_LOCAL:
-            undo->data_fork.local.data = nullptr;
-            if (ip->data_fork.local.size != 0) {
-                if (ip->data_fork.local.data == nullptr) {
-                    delete undo;
-                    return -EIO;
-                }
-                undo->data_fork.local.data = new (std::nothrow) uint8_t[ip->data_fork.local.size];
-                if (undo->data_fork.local.data == nullptr) {
-                    delete undo;
-                    tp->error = -ENOMEM;
-                    return -ENOMEM;
-                }
-                __builtin_memcpy(undo->data_fork.local.data, ip->data_fork.local.data, ip->data_fork.local.size);
-            }
-            break;
-        case XFS_DINODE_FMT_EXTENTS:
-            if (ip->data_fork.extents.count > ip->data_fork.extents.capacity ||
-                (ip->data_fork.extents.count != 0 && ip->data_fork.extents.list == nullptr)) {
-                delete undo;
-                return -EIO;
-            }
-            if (xfs_ifork_extents_uses_inline(ip->data_fork.extents)) {
-                undo->data_fork.extents.list = xfs_ifork_extents_inline_data(undo->data_fork.extents);
-            } else {
-                undo->data_fork.extents.list = nullptr;
-                if (ip->data_fork.extents.capacity != 0) {
-                    undo->data_fork.extents.list = new (std::nothrow) XfsBmbtIrec[ip->data_fork.extents.capacity];
-                    if (undo->data_fork.extents.list == nullptr) {
-                        delete undo;
-                        tp->error = -ENOMEM;
-                        return -ENOMEM;
-                    }
-                    for (uint32_t i = 0; i < ip->data_fork.extents.count; ++i) {
-                        undo->data_fork.extents.list[i] = ip->data_fork.extents.list[i];
-                    }
-                }
-            }
-            break;
-        case XFS_DINODE_FMT_BTREE:
-            undo->data_fork.btree.root = nullptr;
-            if (ip->data_fork.btree.root_size != 0) {
-                if (ip->data_fork.btree.root == nullptr) {
-                    delete undo;
-                    return -EIO;
-                }
-                undo->data_fork.btree.root = new (std::nothrow) uint8_t[ip->data_fork.btree.root_size];
-                if (undo->data_fork.btree.root == nullptr) {
-                    delete undo;
-                    tp->error = -ENOMEM;
-                    return -ENOMEM;
-                }
-                __builtin_memcpy(undo->data_fork.btree.root, ip->data_fork.btree.root, ip->data_fork.btree.root_size);
-            }
-            break;
-        default:
-            delete undo;
-            return -EOPNOTSUPP;
+    if (ip->has_attr_fork) {
+        rc = xfs_trans_clone_ifork(ip->attr_fork, &undo->attr_fork);
+    } else {
+        undo->attr_fork.format = XFS_DINODE_FMT_LOCAL;
+        undo->attr_fork.local.data = nullptr;
+        undo->attr_fork.local.size = 0;
+        rc = 0;
     }
+    if (rc != 0) {
+        xfs_trans_free_ifork(&undo->data_fork);
+        undo->owns_data_fork = false;
+        delete undo;
+        if (rc == -ENOMEM) {
+            tp->error = rc;
+        }
+        return rc;
+    }
+    undo->owns_attr_fork = true;
 
     undo->next = tp->inode_undo;
     tp->inode_undo = undo;
@@ -861,6 +916,58 @@ auto xfs_selftest_transaction_cancel_restores_nlink() -> bool {
     inode.dirty = true;
     xfs_trans_cancel(tp);
     return inode.nlink == 2 && !inode.dirty;
+}
+
+auto xfs_selftest_transaction_cancel_restores_attr_fork() -> bool {
+    XfsMountContext mount{};
+    XfsInode inode{};
+    inode.mount = &mount;
+    inode.data_fork.format = XFS_DINODE_FMT_EXTENTS;
+    inode.attr_fork.format = XFS_DINODE_FMT_LOCAL;
+    inode.attr_fork.local.size = 4;
+    inode.attr_fork.local.data = new (std::nothrow) uint8_t[4]{0, 4, 0, 0};
+    inode.has_attr_fork = inode.attr_fork.local.data != nullptr;
+    inode.forkoff = 24;
+    inode.anextents = 0;
+    inode.atime = 11;
+    inode.mtime = 22;
+    inode.ctime = 33;
+    inode.crtime = 44;
+    if (!inode.has_attr_fork) {
+        return false;
+    }
+
+    XfsTransaction* tp = xfs_trans_alloc(&mount);
+    if (tp == nullptr || xfs_trans_capture_inode(tp, &inode) != 0) {
+        if (tp != nullptr) {
+            xfs_trans_cancel(tp);
+        }
+        delete[] inode.attr_fork.local.data;
+        return false;
+    }
+
+    delete[] inode.attr_fork.local.data;
+    inode.attr_fork.format = XFS_DINODE_FMT_EXTENTS;
+    inode.attr_fork.extents.list = xfs_ifork_extents_inline_data(inode.attr_fork.extents);
+    inode.attr_fork.extents.count = 1;
+    inode.attr_fork.extents.capacity = XFS_IFORK_INLINE_EXTENT_CAPACITY;
+    inode.attr_fork.extents.list[0] = {.br_startoff = 0, .br_startblock = 77, .br_blockcount = 1, .br_unwritten = false};
+    inode.forkoff = 16;
+    inode.anextents = 1;
+    inode.nblocks = 1;
+    inode.atime = 111;
+    inode.mtime = 222;
+    inode.ctime = 333;
+    inode.crtime = 444;
+    inode.dirty = true;
+
+    xfs_trans_cancel(tp);
+    bool const OK = inode.has_attr_fork && inode.attr_fork.format == XFS_DINODE_FMT_LOCAL && inode.attr_fork.local.data != nullptr &&
+                    inode.attr_fork.local.size == 4 && inode.attr_fork.local.data[0] == 0 && inode.attr_fork.local.data[1] == 4 &&
+                    inode.forkoff == 24 && inode.anextents == 0 && inode.nblocks == 0 && inode.atime == 11 && inode.mtime == 22 &&
+                    inode.ctime == 33 && inode.crtime == 44 && !inode.dirty;
+    delete[] inode.attr_fork.local.data;
+    return OK;
 }
 
 auto xfs_selftest_transaction_retired_ranges_commit_only() -> bool {

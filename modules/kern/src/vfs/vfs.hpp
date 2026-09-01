@@ -118,6 +118,35 @@ void vfs_prefill_file_stat_snapshot(File* file, const Stat& statbuf);
 auto vfs_statvfs(const char* path, Statvfs* buf) -> int;
 auto vfs_fstatvfs(int fd, Statvfs* buf) -> int;
 
+// Extended attributes. Path operations resolve intermediate symlinks and
+// follow the final symlink only when requested. Other filesystems may return
+// -EOPNOTSUPP.
+auto vfs_setxattr(const char* path, const char* name, const void* value, size_t size, int flags, bool follow_final_symlink) -> int;
+// Beneath variants accept an authorized canonical export root and a relative
+// path. They never apply worker task path policy, reject REMOTE mounts, and
+// confine every intermediate/final symlink resolution to export_root.
+auto vfs_setxattr_beneath(const char* export_root, const char* relative_path, const char* name, const void* value, size_t size, int flags,
+                          bool follow_final_symlink) -> int;
+auto vfs_fsetxattr(int fd, const char* name, const void* value, size_t size, int flags) -> int;
+// File* variants require a retained reference and never consult an fd table.
+// They are safe for deferred server-side work whose task/fd context may differ
+// from that of the request originator.
+auto vfs_fsetxattr_file(File* file, const char* name, const void* value, size_t size, int flags) -> int;
+auto vfs_getxattr(const char* path, const char* name, void* value, size_t size, bool follow_final_symlink) -> ssize_t;
+auto vfs_getxattr_beneath(const char* export_root, const char* relative_path, const char* name, void* value, size_t size,
+                          bool follow_final_symlink) -> ssize_t;
+auto vfs_fgetxattr(int fd, const char* name, void* value, size_t size) -> ssize_t;
+auto vfs_fgetxattr_file(File* file, const char* name, void* value, size_t size) -> ssize_t;
+auto vfs_listxattr(const char* path, char* list, size_t size, bool follow_final_symlink) -> ssize_t;
+auto vfs_listxattr_beneath(const char* export_root, const char* relative_path, char* list, size_t size, bool follow_final_symlink)
+    -> ssize_t;
+auto vfs_flistxattr(int fd, char* list, size_t size) -> ssize_t;
+auto vfs_flistxattr_file(File* file, char* list, size_t size) -> ssize_t;
+auto vfs_removexattr(const char* path, const char* name, bool follow_final_symlink) -> int;
+auto vfs_removexattr_beneath(const char* export_root, const char* relative_path, const char* name, bool follow_final_symlink) -> int;
+auto vfs_fremovexattr(int fd, const char* name) -> int;
+auto vfs_fremovexattr_file(File* file, const char* name) -> int;
+
 // Directory operations
 auto vfs_mkdir(const char* path, int mode) -> int;
 auto vfs_mkdirat(ker::mod::sched::task::Task* task, int dirfd, const char* pathname, int mode) -> int;

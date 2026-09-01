@@ -126,6 +126,12 @@ struct ProxyVfsState {
     uint16_t max_op_size = 0;
     std::atomic<bool> readlink_unsupported{false};
 
+    // A phased xattr transfer stays on one lane and one explicit replay
+    // identity even though each phase uses the ordinary stop-and-wait slot.
+    ker::mod::sys::Mutex xattr_transfer_lock;
+    uint64_t xattr_session_id = 0;
+    uint64_t xattr_next_operation_id = 0;
+
     std::atomic<bool> op_pending{false};
     uint16_t op_expected_id = 0;
     uint16_t op_expected_seq = 0;
@@ -357,6 +363,7 @@ auto wki_remote_vfs_selftest_attach_ack_cookie_fences_stale_completion() -> bool
 
 #ifdef WOS_SELFTEST
 auto wki_remote_vfs_selftest_utimens_wire_path_validation() -> bool;
+auto wki_remote_vfs_selftest_xattr_replay_fencing() -> bool;
 auto wki_remote_vfs_selftest_slot_waiter_fifo() -> bool;
 auto wki_remote_vfs_selftest_stale_cancel_preserves_successor() -> bool;
 auto wki_remote_vfs_selftest_response_claim_retains_waiter_slot() -> bool;
@@ -443,6 +450,18 @@ auto wki_remote_vfs_rename(void* mount_private_data, const char* old_fs_path, co
 
 // Consumer side: readlink on a remote path (for vfs_readlink / resolve_symlinks)
 auto wki_remote_vfs_readlink_path(void* mount_private_data, const char* fs_relative_path, char* buf, size_t bufsize) -> ssize_t;
+
+auto wki_remote_vfs_setxattr(void* mount_private_data, const char* fs_relative_path, const char* name, const void* value, size_t size,
+                             int flags, bool follow_final_symlink) -> int;
+auto wki_remote_vfs_getxattr(void* mount_private_data, const char* fs_relative_path, const char* name, void* value, size_t size,
+                             bool follow_final_symlink) -> ssize_t;
+auto wki_remote_vfs_listxattr(void* mount_private_data, const char* fs_relative_path, char* list, size_t size, bool follow_final_symlink)
+    -> ssize_t;
+auto wki_remote_vfs_removexattr(void* mount_private_data, const char* fs_relative_path, const char* name, bool follow_final_symlink) -> int;
+auto wki_remote_vfs_fsetxattr(ker::vfs::File* file, const char* name, const void* value, size_t size, int flags) -> int;
+auto wki_remote_vfs_fgetxattr(ker::vfs::File* file, const char* name, void* value, size_t size) -> ssize_t;
+auto wki_remote_vfs_flistxattr(ker::vfs::File* file, char* list, size_t size) -> ssize_t;
+auto wki_remote_vfs_fremovexattr(ker::vfs::File* file, const char* name) -> int;
 
 // Consumer side: get the FileOperations for remote VFS files
 auto wki_remote_vfs_get_fops() -> ker::vfs::FileOperations*;

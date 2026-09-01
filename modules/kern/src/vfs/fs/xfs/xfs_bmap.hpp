@@ -47,6 +47,12 @@ auto xfs_bmap_add_extent(XfsInode* ip, XfsTransaction* tp, const XfsBmbtIrec& ne
 // extents themselves are not freed here.
 auto xfs_bmap_free_btree_blocks(XfsInode* ip, XfsTransaction* tp, uint32_t* freed_blocks = nullptr) -> int;
 
+// Build/free a standard BMBT for a non-data fork without temporarily aliasing
+// the inode's data fork. The caller owns the returned root bytes.
+auto xfs_bmap_build_fork_btree(XfsInode* ip, XfsTransaction* tp, const XfsBmbtIrec* extents, uint32_t extent_count, size_t root_size,
+                               XfsIforkBtree* out, uint32_t* metadata_blocks) -> int;
+auto xfs_bmap_free_fork_btree(XfsInode* ip, XfsTransaction* tp, const XfsIforkBtree& fork, uint32_t* freed_blocks = nullptr) -> int;
+
 auto xfs_selftest_bmap_insert_merge_cases() -> bool;
 auto xfs_selftest_bmap_synthetic_btree_lookup() -> bool;
 auto xfs_selftest_bmap_extent_promotion() -> bool;

@@ -28,6 +28,7 @@ struct XfsAttrEntry {
     const uint8_t* value;  // pointer to value bytes
     uint32_t valuelen;     // length of value
     uint8_t flags;         // XFS_ATTR_* namespace flags
+    xfs_dahash_t hash;     // validated stored leaf hash (computed for shortform)
 };
 
 // Callback for iterating attributes.
@@ -53,14 +54,26 @@ auto xfs_attr_list(XfsInode* ip, XfsAttrIterFn fn, void* private_data) -> int;
 // ============================================================================
 
 // Set (create or replace) an extended attribute.
-// Supports inline shortform attrs and single-block leaf attrs in an extents
-// attr fork.  Values that require remote attr blocks or DA-btree mutation
-// return a negative errno.
+// Supports inline shortform attrs, local and remote leaf entries, multi-level
+// DA trees, and extent-list or BMBT attr-fork mappings.
 auto xfs_attr_set(XfsInode* ip, XfsTransaction* tp, const uint8_t* name, uint16_t namelen, const uint8_t* value, uint32_t valuelen,
                   uint8_t flags) -> int;
 
 // Remove an extended attribute.
 // Returns 0 on success, -ENOATTR if not found.
 auto xfs_attr_remove(XfsInode* ip, XfsTransaction* tp, const uint8_t* name, uint16_t namelen, uint8_t flags) -> int;
+
+// Free every attr-fork data/DA/remote/BMBT block during inode inactivation.
+auto xfs_attr_teardown(XfsInode* ip, XfsTransaction* tp) -> int;
+
+#ifdef WOS_SELFTEST
+// Force the copy-on-write builder to retain one mapping record per block. This
+// yields a valid fragmented fork and deterministically exercises BMBT
+// promotion/collapse on the disposable KTEST filesystem.
+void xfs_selftest_attr_fragment_mappings(bool enabled);
+auto xfs_selftest_attr_parent_hash_preserved() -> bool;
+auto xfs_selftest_attr_incomplete_detected() -> bool;
+auto xfs_selftest_attr_node_sibling_links() -> bool;
+#endif
 
 }  // namespace ker::vfs::xfs

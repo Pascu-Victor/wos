@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <cstring>
 #include <dev/pty.hpp>
+#include <memory>
 #include <new>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
@@ -34,6 +35,7 @@ constexpr size_t READLINK_STACK_BUFFER_SIZE = 512;
 constexpr size_t REALPATH_STACK_BUFFER_SIZE = 512;
 constexpr size_t VFS_PATH_BUFFER_SIZE = 512;
 using KernelPath = std::array<char, VFS_PATH_BUFFER_SIZE>;
+using KernelXattrName = std::array<char, ker::abi::vfs::XATTR_NAME_MAX + 1>;
 
 struct MetadataBatchUserEntry {
     const char* path;
@@ -168,6 +170,63 @@ auto copy_path_from_user(uint64_t user_addr, KernelPath& path) -> int {
     return 0;
 }
 
+auto copy_xattr_name_from_user(uint64_t user_addr, KernelXattrName& name) -> int {
+    if (user_addr == 0) {
+        return -EFAULT;
+    }
+    auto* task = ker::mod::sched::get_current_task();
+    if (task == nullptr || task->pagemap == nullptr) {
+        return -EFAULT;
+    }
+    auto const STATUS = ker::mod::sys::usercopy::copy_cstring_from_task_status(*task, user_addr, name.data(), name.size());
+    if (STATUS == ker::mod::sys::usercopy::CStringCopyStatus::FAULT) {
+        return -EFAULT;
+    }
+    if (STATUS == ker::mod::sys::usercopy::CStringCopyStatus::TOO_LONG) {
+        return -ERANGE;
+    }
+    return name[0] == '\0' ? -EINVAL : 0;
+}
+
+auto copy_xattr_value_from_user(uint64_t user_addr, size_t size, std::unique_ptr<uint8_t[]>& value) -> int {
+    if (size > ker::abi::vfs::XATTR_SIZE_MAX) {
+        return -E2BIG;
+    }
+    if (size == 0) {
+        return 0;
+    }
+    if (user_addr == 0) {
+        return -EFAULT;
+    }
+    auto* task = ker::mod::sched::get_current_task();
+    if (task == nullptr || task->pagemap == nullptr || !ker::mod::sys::usercopy::range_valid(user_addr, size)) {
+        return -EFAULT;
+    }
+    value.reset(new (std::nothrow) uint8_t[size]);
+    if (!value) {
+        return -ENOMEM;
+    }
+    return ker::mod::sys::usercopy::copy_from_task(*task, user_addr, value.get(), size) ? 0 : -EFAULT;
+}
+
+auto prepare_xattr_output(uint64_t user_addr, size_t size, size_t limit, std::unique_ptr<uint8_t[]>& output) -> int {
+    if (size > limit) {
+        return -E2BIG;
+    }
+    if (size == 0) {
+        return 0;
+    }
+    if (user_addr == 0) {
+        return -EFAULT;
+    }
+    auto* task = ker::mod::sched::get_current_task();
+    if (task == nullptr || task->pagemap == nullptr || !ker::mod::sys::usercopy::ensure_writable(*task, user_addr, size)) {
+        return -EFAULT;
+    }
+    output.reset(new (std::nothrow) uint8_t[size]);
+    return output ? 0 : -ENOMEM;
+}
+
 auto copy_optional_path_from_user(uint64_t user_addr, KernelPath& path, const char*& kernel_arg) -> int {
     kernel_arg = nullptr;
     if (user_addr == 0) {
@@ -269,11 +328,132 @@ auto copy_wki_rule_to_user(uint32_t index, char* prefix_buf, size_t prefix_buf_s
     }
     return static_cast<int64_t>(RET);
 }
+
+auto syscall_setxattr(ops op, uint64_t target, uint64_t user_name, uint64_t user_value, uint64_t raw_size, uint64_t raw_flags) -> int64_t {
+    KernelXattrName name{};
+    if (int const COPY_RET = copy_xattr_name_from_user(user_name, name); COPY_RET < 0) {
+        return COPY_RET;
+    }
+    size_t const SIZE = static_cast<size_t>(raw_size);
+    std::unique_ptr<uint8_t[]> value;
+    if (int const COPY_RET = copy_xattr_value_from_user(user_value, SIZE, value); COPY_RET < 0) {
+        return COPY_RET;
+    }
+    int const FLAGS = static_cast<int>(raw_flags);
+    if (raw_flags != static_cast<uint64_t>(static_cast<int64_t>(FLAGS))) {
+        return -EINVAL;
+    }
+    if (op == ops::FSETXATTR) {
+        return ker::vfs::vfs_fsetxattr(static_cast<int>(target), name.data(), value.get(), SIZE, FLAGS);
+    }
+    KernelPath path{};
+    if (int const COPY_RET = copy_path_from_user(target, path); COPY_RET < 0) {
+        return COPY_RET;
+    }
+    return ker::vfs::vfs_setxattr(path.data(), name.data(), value.get(), SIZE, FLAGS, op == ops::SETXATTR);
+}
+
+auto syscall_getxattr(ops op, uint64_t target, uint64_t user_name, uint64_t user_value, uint64_t raw_size) -> int64_t {
+    KernelXattrName name{};
+    if (int const COPY_RET = copy_xattr_name_from_user(user_name, name); COPY_RET < 0) {
+        return COPY_RET;
+    }
+    size_t const SIZE = static_cast<size_t>(raw_size);
+    std::unique_ptr<uint8_t[]> output;
+    if (int const RET = prepare_xattr_output(user_value, SIZE, ker::abi::vfs::XATTR_SIZE_MAX, output); RET < 0) {
+        return RET;
+    }
+    ssize_t result = 0;
+    if (op == ops::FGETXATTR) {
+        result = ker::vfs::vfs_fgetxattr(static_cast<int>(target), name.data(), output.get(), SIZE);
+    } else {
+        KernelPath path{};
+        if (int const COPY_RET = copy_path_from_user(target, path); COPY_RET < 0) {
+            return COPY_RET;
+        }
+        result = ker::vfs::vfs_getxattr(path.data(), name.data(), output.get(), SIZE, op == ops::GETXATTR);
+    }
+    if (result < 0) {
+        return result;
+    }
+    if (static_cast<size_t>(result) > SIZE && SIZE != 0) {
+        return -ERANGE;
+    }
+    if (result > 0 && SIZE != 0) {
+        if (int const COPY_RET = copy_buffer_to_user(reinterpret_cast<void*>(user_value), output.get(), static_cast<size_t>(result));
+            COPY_RET < 0) {
+            return COPY_RET;
+        }
+    }
+    return result;
+}
+
+auto syscall_listxattr(ops op, uint64_t target, uint64_t user_list, uint64_t raw_size) -> int64_t {
+    size_t const SIZE = static_cast<size_t>(raw_size);
+    std::unique_ptr<uint8_t[]> output;
+    if (int const RET = prepare_xattr_output(user_list, SIZE, ker::abi::vfs::XATTR_LIST_MAX, output); RET < 0) {
+        return RET;
+    }
+    ssize_t result = 0;
+    if (op == ops::FLISTXATTR) {
+        result = ker::vfs::vfs_flistxattr(static_cast<int>(target), reinterpret_cast<char*>(output.get()), SIZE);
+    } else {
+        KernelPath path{};
+        if (int const COPY_RET = copy_path_from_user(target, path); COPY_RET < 0) {
+            return COPY_RET;
+        }
+        result = ker::vfs::vfs_listxattr(path.data(), reinterpret_cast<char*>(output.get()), SIZE, op == ops::LISTXATTR);
+    }
+    if (result < 0) {
+        return result;
+    }
+    if (static_cast<size_t>(result) > SIZE && SIZE != 0) {
+        return -ERANGE;
+    }
+    if (result > 0 && SIZE != 0) {
+        if (int const COPY_RET = copy_buffer_to_user(reinterpret_cast<void*>(user_list), output.get(), static_cast<size_t>(result));
+            COPY_RET < 0) {
+            return COPY_RET;
+        }
+    }
+    return result;
+}
+
+auto syscall_removexattr(ops op, uint64_t target, uint64_t user_name) -> int64_t {
+    KernelXattrName name{};
+    if (int const COPY_RET = copy_xattr_name_from_user(user_name, name); COPY_RET < 0) {
+        return COPY_RET;
+    }
+    if (op == ops::FREMOVEXATTR) {
+        return ker::vfs::vfs_fremovexattr(static_cast<int>(target), name.data());
+    }
+    KernelPath path{};
+    if (int const COPY_RET = copy_path_from_user(target, path); COPY_RET < 0) {
+        return COPY_RET;
+    }
+    return ker::vfs::vfs_removexattr(path.data(), name.data(), op == ops::REMOVEXATTR);
+}
 }  // namespace
 
 auto sys_vfs(uint64_t op_raw, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) -> int64_t {
     ops op = static_cast<ops>(op_raw);
     switch (op) {
+        case ops::SETXATTR:
+        case ops::LSETXATTR:
+        case ops::FSETXATTR:
+            return syscall_setxattr(op, a1, a2, a3, a4, a5);
+        case ops::GETXATTR:
+        case ops::LGETXATTR:
+        case ops::FGETXATTR:
+            return syscall_getxattr(op, a1, a2, a3, a4);
+        case ops::LISTXATTR:
+        case ops::LLISTXATTR:
+        case ops::FLISTXATTR:
+            return syscall_listxattr(op, a1, a2, a3);
+        case ops::REMOVEXATTR:
+        case ops::LREMOVEXATTR:
+        case ops::FREMOVEXATTR:
+            return syscall_removexattr(op, a1, a2);
         case ops::OPEN: {
             KernelPath path{};
             if (int const COPY_RET = copy_path_from_user(a1, path); COPY_RET < 0) {

@@ -113,6 +113,7 @@ constexpr uint64_t VFS_PROXY_SLOT_WAIT_TIMEOUT_US = VFS_PROXY_OP_TIMEOUT_US;
 // usable mount.  Do not let one unavailable auxiliary binding turn mount
 // startup into several full RPC timeout windows.
 constexpr uint64_t VFS_PROXY_AUX_ATTACH_TIMEOUT_US = 5'000'000;
+std::atomic<uint32_t> g_vfs_xattr_session_counter{1};
 static_assert(sizeof(DevOpReqPayload) <= WKI_ETH_MAX_PAYLOAD);
 static_assert(WKI_ETH_MAX_PAYLOAD <= UINT16_MAX);
 static_assert(WKI_ETH_MAX_PAYLOAD <= ker::mod::mm::KERNEL_STACK_SIZE / 16);
@@ -484,6 +485,116 @@ uint64_t g_vfs_export_revision = 2;                   // NOLINT(cppcoreguideline
 uint64_t g_vfs_export_target_revision = 0;            // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 bool g_vfs_export_rebuild_prepared = false;           // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 bool g_vfs_export_rebuild_accepting_entries = false;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+
+constexpr size_t VFS_XATTR_SERVER_STAGE_COUNT_MAX = 128;
+constexpr size_t VFS_XATTR_SERVER_STAGE_BYTES_MAX = 1024ULL * 1024ULL;
+std::atomic<size_t> g_vfs_xattr_stage_bytes{0};
+
+struct VfsXattrStageKey {
+    uint16_t peer_node_id = WKI_NODE_INVALID;
+    uint16_t channel_id = 0;
+    uint32_t channel_generation = 0;
+
+    auto operator<(const VfsXattrStageKey& other) const -> bool {
+        if (peer_node_id != other.peer_node_id) {
+            return peer_node_id < other.peer_node_id;
+        }
+        if (channel_id != other.channel_id) {
+            return channel_id < other.channel_id;
+        }
+        return channel_generation < other.channel_generation;
+    }
+};
+
+struct VfsXattrServerStage {
+    ~VfsXattrServerStage() {
+        if (file != nullptr) {
+            ker::vfs::vfs_put_file(file);
+        }
+        if (staged_bytes != 0) {
+            g_vfs_xattr_stage_bytes.fetch_sub(staged_bytes, std::memory_order_acq_rel);
+        }
+    }
+
+    VfsXattrPhaseHeader identity = {};
+    uint32_t flags = 0;
+    uint32_t requested_size = 0;
+    uint32_t total = 0;
+    uint32_t staged_bytes = 0;
+    uint32_t transferred = 0;
+    bool follow_final_symlink = false;
+    bool committed = false;
+    int16_t terminal_status = 0;
+    std::array<char, VFS_EXPORT_PATH_LEN> export_root = {};
+    std::array<char, 512> path = {};
+    std::array<char, WKI_VFS_XATTR_NAME_MAX + 1> name = {};
+    std::unique_ptr<uint8_t[]> data;
+    ker::vfs::File* file = nullptr;
+    std::atomic<uint32_t> refs{1};
+};
+
+std::map<VfsXattrStageKey, VfsXattrServerStage*> g_vfs_xattr_stages;
+
+auto vfs_xattr_stage_key(const WkiChannelIdentity& identity) -> VfsXattrStageKey {
+    return {.peer_node_id = identity.peer_node_id, .channel_id = identity.channel_id, .channel_generation = identity.generation};
+}
+
+void retain_vfs_xattr_stage(VfsXattrServerStage* stage) {
+    if (stage != nullptr) {
+        stage->refs.fetch_add(1, std::memory_order_acq_rel);
+    }
+}
+
+void release_vfs_xattr_stage(VfsXattrServerStage* stage) {
+    if (stage != nullptr && stage->refs.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+        delete stage;
+    }
+}
+
+struct VfsXattrStageRefGuard {
+    ~VfsXattrStageRefGuard() { release_vfs_xattr_stage(stage); }
+    VfsXattrServerStage* stage = nullptr;
+};
+
+auto reserve_vfs_xattr_stage_bytes(size_t bytes) -> bool {
+    size_t current = g_vfs_xattr_stage_bytes.load(std::memory_order_acquire);
+    while (bytes <= VFS_XATTR_SERVER_STAGE_BYTES_MAX - current) {
+        if (g_vfs_xattr_stage_bytes.compare_exchange_weak(current, current + bytes, std::memory_order_acq_rel, std::memory_order_acquire)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+auto vfs_xattr_new_begin_status(const VfsXattrServerStage& old, const VfsXattrPhaseHeader& incoming) -> int {
+    if (old.identity.session_id != incoming.session_id || incoming.operation_id <= old.identity.operation_id) {
+        return -ESTALE;
+    }
+    // A higher operation in the channel-bound session abandons an incomplete
+    // transfer. This keeps a lost ABORT from wedging the lane indefinitely.
+    return 0;
+}
+
+void release_vfs_xattr_stage_data(VfsXattrServerStage& stage) {
+    std::unique_ptr<uint8_t[]> retired_data = std::move(stage.data);
+    uint32_t const RETIRED_BYTES = stage.staged_bytes;
+    stage.staged_bytes = 0;
+    // Keep the global charge until the allocation is actually gone so cleanup
+    // and replacement cannot transiently exceed the budget.
+    retired_data.reset();
+    if (RETIRED_BYTES != 0) {
+        g_vfs_xattr_stage_bytes.fetch_sub(RETIRED_BYTES, std::memory_order_acq_rel);
+    }
+}
+
+auto vfs_xattr_data_is_exact_replay(const VfsXattrServerStage& stage, uint32_t offset, const uint8_t* bytes, uint16_t length) -> bool {
+    return bytes != nullptr && offset <= stage.transferred && length <= stage.transferred - offset &&
+           memcmp(stage.data.get() + offset, bytes, length) == 0;
+}
+
+constexpr auto vfs_xattr_transfer_total(bool read_operation, size_t caller_size, uint32_t remote_total) -> uint32_t {
+    return read_operation ? (caller_size == 0 ? 0 : remote_total) : static_cast<uint32_t>(caller_size);
+}
 
 auto vfs_channel_identity_matches(const WkiChannelIdentity& expected, const WkiChannelIdentity& actual) -> bool {
     return expected.channel != nullptr && expected.channel == actual.channel && expected.peer_node_id == actual.peer_node_id &&
@@ -4168,6 +4279,48 @@ void wki_remote_vfs_server_diag_snapshot(WkiRemoteVfsServerDiag* out) {
 }
 
 #ifdef WOS_SELFTEST
+auto wki_remote_vfs_selftest_xattr_replay_fencing() -> bool {
+    VfsXattrServerStage stage{};
+    stage.identity.session_id = 7;
+    stage.identity.operation_id = 9;
+    stage.committed = true;
+
+    VfsXattrPhaseHeader incoming = stage.identity;
+    incoming.operation_id = 10;
+    if (vfs_xattr_new_begin_status(stage, incoming) != 0) {
+        return false;
+    }
+    incoming.operation_id = 9;
+    if (vfs_xattr_new_begin_status(stage, incoming) != -ESTALE) {
+        return false;
+    }
+    incoming.operation_id = 10;
+    incoming.session_id = 8;
+    if (vfs_xattr_new_begin_status(stage, incoming) != -ESTALE) {
+        return false;
+    }
+    incoming.session_id = 7;
+    stage.committed = false;
+    if (vfs_xattr_new_begin_status(stage, incoming) != 0) {
+        return false;
+    }
+
+    stage.data.reset(new (std::nothrow) uint8_t[4]);
+    if (stage.data == nullptr) {
+        return false;
+    }
+    stage.data[0] = 1;
+    stage.data[1] = 2;
+    stage.data[2] = 3;
+    stage.data[3] = 4;
+    stage.transferred = 4;
+    std::array<uint8_t, 2> exact = {2, 3};
+    std::array<uint8_t, 2> changed = {2, 4};
+    return vfs_xattr_transfer_total(true, 0, 4) == 0 && vfs_xattr_transfer_total(true, 4, 4) == 4 &&
+           vfs_xattr_transfer_total(false, 4, 0) == 4 && vfs_xattr_data_is_exact_replay(stage, 1, exact.data(), exact.size()) &&
+           !vfs_xattr_data_is_exact_replay(stage, 1, changed.data(), changed.size());
+}
+
 auto wki_remote_vfs_selftest_utimens_wire_path_validation() -> bool {
     constexpr std::array<uint8_t, 8> SAFE_PATH = {'d', 'i', 'r', '/', '.', '.', 'x', 'x'};
     constexpr std::array<uint8_t, 5> ABSOLUTE_PATH = {'/', 'f', 'i', 'l', 'e'};
@@ -4937,6 +5090,387 @@ void wki_remote_vfs_advertise_exports() {
 // Server Side - VFS Operation Handlers
 // -------------------------------------------------------------------------------
 
+namespace {
+
+auto remote_xattr_name_allowed(const char* name) -> bool {
+    constexpr std::string_view USER_PREFIX = "user.";
+    return name != nullptr && std::string_view(name).starts_with(USER_PREFIX);
+}
+
+void send_vfs_xattr_response(const WkiChannelIdentity& channel_identity, uint16_t request_cookie, const VfsXattrPhaseHeader& identity,
+                             int status, uint32_t total, uint32_t transferred, const uint8_t* bytes = nullptr, uint16_t byte_count = 0) {
+    if (byte_count > WKI_VFS_XATTR_MAX_DATA_CHUNK) {
+        status = -EMSGSIZE;
+        bytes = nullptr;
+        byte_count = 0;
+    }
+    std::array<uint8_t, WKI_ETH_MAX_PAYLOAD> packet{};
+    auto* response = reinterpret_cast<DevOpRespPayload*>(packet.data());
+    response->op_id = OP_VFS_XATTR;
+    response->status = static_cast<int16_t>(status);
+    response->data_len = sizeof(VfsXattrResultPayload) + byte_count;
+    response->reserved = request_cookie;
+    auto* result = reinterpret_cast<VfsXattrResultPayload*>(packet.data() + sizeof(DevOpRespPayload));
+    result->header = identity;
+    result->data_len = total;
+    result->transferred = transferred;
+    if (byte_count != 0 && bytes != nullptr) {
+        memcpy(packet.data() + sizeof(DevOpRespPayload) + sizeof(VfsXattrResultPayload), bytes, byte_count);
+    }
+    static_cast<void>(wki_send_on_channel_identity(channel_identity, MsgType::DEV_OP_RESP, packet.data(),
+                                                   static_cast<uint16_t>(sizeof(DevOpRespPayload) + response->data_len)));
+}
+
+auto vfs_xattr_stage_call_get(VfsXattrServerStage& stage, void* value, size_t size) -> ssize_t {
+    if (stage.identity.target == VfsXattrTarget::FD) {
+        return ker::vfs::vfs_fgetxattr_file(stage.file, stage.name.data(), value, size);
+    }
+    return ker::vfs::vfs_getxattr_beneath(stage.export_root.data(), stage.path.data(), stage.name.data(), value, size,
+                                          stage.follow_final_symlink);
+}
+
+auto vfs_xattr_stage_call_list(VfsXattrServerStage& stage, char* list, size_t size) -> ssize_t {
+    if (stage.identity.target == VfsXattrTarget::FD) {
+        return ker::vfs::vfs_flistxattr_file(stage.file, list, size);
+    }
+    return ker::vfs::vfs_listxattr_beneath(stage.export_root.data(), stage.path.data(), list, size, stage.follow_final_symlink);
+}
+
+auto filter_remote_xattr_list(uint8_t* list, size_t length) -> ssize_t {
+    size_t read_offset = 0;
+    size_t write_offset = 0;
+    while (read_offset < length) {
+        auto const* name = reinterpret_cast<const char*>(list + read_offset);
+        size_t const REMAINING = length - read_offset;
+        size_t const NAME_LEN = strnlen(name, REMAINING);
+        if (NAME_LEN == REMAINING) {
+            return -EIO;
+        }
+        size_t const RECORD_LEN = NAME_LEN + 1;
+        if (remote_xattr_name_allowed(name)) {
+            memmove(list + write_offset, list + read_offset, RECORD_LEN);
+            write_offset += RECORD_LEN;
+        }
+        read_offset += RECORD_LEN;
+    }
+    return static_cast<ssize_t>(write_offset);
+}
+
+auto vfs_xattr_stage_apply_mutation(VfsXattrServerStage& stage) -> int {
+    if (stage.identity.operation == VfsXattrOperation::SET) {
+        if (stage.identity.target == VfsXattrTarget::FD) {
+            return ker::vfs::vfs_fsetxattr_file(stage.file, stage.name.data(), stage.data.get(), stage.total,
+                                                static_cast<int>(stage.flags));
+        }
+        return ker::vfs::vfs_setxattr_beneath(stage.export_root.data(), stage.path.data(), stage.name.data(), stage.data.get(), stage.total,
+                                              static_cast<int>(stage.flags), stage.follow_final_symlink);
+    }
+    if (stage.identity.operation == VfsXattrOperation::REMOVE) {
+        if (stage.identity.target == VfsXattrTarget::FD) {
+            return ker::vfs::vfs_fremovexattr_file(stage.file, stage.name.data());
+        }
+        return ker::vfs::vfs_removexattr_beneath(stage.export_root.data(), stage.path.data(), stage.name.data(),
+                                                 stage.follow_final_symlink);
+    }
+    return 0;
+}
+
+// Runs only from the pre-admitted deferred VFS worker. RX merely copied the
+// bounded frame into a fixed pool and never allocates, blocks, or touches VFS.
+void handle_vfs_xattr_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_identity, const char* export_path, const uint8_t* data,
+                         uint16_t data_len) {
+    uint16_t const COOKIE = static_cast<uint16_t>(hdr->seq_num & UINT16_MAX);
+    if (data_len < sizeof(VfsXattrPhaseHeader)) {
+        VfsXattrPhaseHeader invalid = {};
+        send_vfs_xattr_response(channel_identity, COOKIE, invalid, -EINVAL, 0, 0);
+        return;
+    }
+    VfsXattrPhaseHeader identity = {};
+    memcpy(&identity, data, sizeof(identity));
+    if (!wki_vfs_xattr_header_valid(identity)) {
+        send_vfs_xattr_response(channel_identity, COOKIE, identity, -EINVAL, 0, 0);
+        return;
+    }
+    VfsXattrStageKey const KEY = vfs_xattr_stage_key(channel_identity);
+
+    if (identity.phase == VfsXattrPhase::BEGIN) {
+        if (data_len < sizeof(VfsXattrBeginPayload)) {
+            send_vfs_xattr_response(channel_identity, COOKIE, identity, -EINVAL, 0, 0);
+            return;
+        }
+        VfsXattrBeginPayload begin = {};
+        memcpy(&begin, data, sizeof(begin));
+        size_t const EXPECTED = sizeof(begin) + begin.path_len + begin.name_len;
+        bool const VALID_FLAGS = begin.header.operation == VfsXattrOperation::SET
+                                     ? (begin.flags == 0 || begin.flags == 1 || begin.flags == 2)
+                                     : begin.flags == 0;
+        if (!wki_vfs_xattr_begin_valid(begin) || !VALID_FLAGS || EXPECTED != data_len ||
+            (begin.header.target == VfsXattrTarget::PATH &&
+             !relative_wire_path_has_safe_components(data + sizeof(begin), begin.path_len))) {
+            send_vfs_xattr_response(channel_identity, COOKIE, identity, -EINVAL, 0, 0);
+            return;
+        }
+        std::array<char, 512> relative_path{};
+        if (begin.header.target == VfsXattrTarget::PATH) {
+            size_t const EXPORT_LEN = strlen(export_path);
+            if (EXPORT_LEN == 0 || EXPORT_LEN >= VFS_EXPORT_PATH_LEN || begin.path_len >= relative_path.size()) {
+                send_vfs_xattr_response(channel_identity, COOKIE, identity, -ENAMETOOLONG, 0, 0);
+                return;
+            }
+            memcpy(relative_path.data(), data + sizeof(begin), begin.path_len);
+        }
+        std::array<char, WKI_VFS_XATTR_NAME_MAX + 1> name{};
+        if (begin.name_len != 0) {
+            auto const* wire_name = data + sizeof(begin) + begin.path_len;
+            if (memchr(wire_name, '\0', begin.name_len) != nullptr) {
+                send_vfs_xattr_response(channel_identity, COOKIE, identity, -EINVAL, 0, 0);
+                return;
+            }
+            memcpy(name.data(), wire_name, begin.name_len);
+            if (!remote_xattr_name_allowed(name.data())) {
+                send_vfs_xattr_response(channel_identity, COOKIE, identity, -EOPNOTSUPP, 0, 0);
+                return;
+            }
+        }
+
+        VfsXattrServerStage* prior_stage = nullptr;
+        s_vfs_lock.lock();
+        auto existing = g_vfs_xattr_stages.find(KEY);
+        if (existing != g_vfs_xattr_stages.end()) {
+            auto& old = *existing->second;
+            bool const SAME_ID = old.identity.session_id == identity.session_id && old.identity.operation_id == identity.operation_id;
+            if (SAME_ID) {
+                bool const EXACT = old.identity.operation == identity.operation && old.identity.target == identity.target &&
+                                   old.flags == begin.flags && old.requested_size == begin.data_len &&
+                                   old.follow_final_symlink == (begin.follow_final_symlink != 0) && old.path == relative_path &&
+                                   old.name == name;
+                int const STATUS = EXACT ? old.terminal_status : -EPROTO;
+                uint32_t const TOTAL = old.total;
+                uint32_t const TRANSFERRED = old.transferred;
+                s_vfs_lock.unlock();
+                send_vfs_xattr_response(channel_identity, COOKIE, identity, STATUS, TOTAL, TRANSFERRED);
+                return;
+            }
+            int const TRANSITION_STATUS = vfs_xattr_new_begin_status(old, identity);
+            if (TRANSITION_STATUS != 0) {
+                s_vfs_lock.unlock();
+                send_vfs_xattr_response(channel_identity, COOKIE, identity, TRANSITION_STATUS, 0, 0);
+                return;
+            }
+            prior_stage = existing->second;
+            retain_vfs_xattr_stage(prior_stage);
+        }
+        if (prior_stage == nullptr && g_vfs_xattr_stages.size() >= VFS_XATTR_SERVER_STAGE_COUNT_MAX) {
+            s_vfs_lock.unlock();
+            send_vfs_xattr_response(channel_identity, COOKIE, identity, -EAGAIN, 0, 0);
+            return;
+        }
+        s_vfs_lock.unlock();
+        VfsXattrStageRefGuard const PRIOR_STAGE_GUARD{prior_stage};
+        if (prior_stage != nullptr && prior_stage->staged_bytes != 0) {
+            if (!prior_stage->committed) {
+                prior_stage->terminal_status = -ECANCELED;
+                prior_stage->committed = true;
+            }
+            release_vfs_xattr_stage_data(*prior_stage);
+        }
+
+        auto* stage = new (std::nothrow) VfsXattrServerStage();
+        if (stage == nullptr) {
+            send_vfs_xattr_response(channel_identity, COOKIE, identity, -ENOMEM, 0, 0);
+            return;
+        }
+        stage->identity = identity;
+        stage->flags = begin.flags;
+        stage->requested_size = begin.data_len;
+        stage->follow_final_symlink = begin.follow_final_symlink != 0;
+        if (identity.target == VfsXattrTarget::PATH) {
+            memcpy(stage->export_root.data(), export_path, strlen(export_path) + 1U);
+        }
+        stage->path = relative_path;
+        stage->name = name;
+        if (identity.target == VfsXattrTarget::FD) {
+            s_vfs_lock.lock();
+            RemoteVfsFd* rfd = find_remote_fd(channel_identity, begin.remote_fd);
+            if (rfd != nullptr && rfd->file != nullptr) {
+                stage->file = rfd->file;
+                ker::vfs::vfs_retain_file(stage->file);
+            }
+            s_vfs_lock.unlock();
+            if (stage->file == nullptr) {
+                release_vfs_xattr_stage(stage);
+                send_vfs_xattr_response(channel_identity, COOKIE, identity, -EBADF, 0, 0);
+                return;
+            }
+        }
+
+        ssize_t measured = static_cast<ssize_t>(begin.data_len);
+        if (identity.operation == VfsXattrOperation::GET) {
+            measured = vfs_xattr_stage_call_get(*stage, nullptr, 0);
+        } else if (identity.operation == VfsXattrOperation::LIST) {
+            measured = vfs_xattr_stage_call_list(*stage, nullptr, 0);
+        }
+        if (measured < 0 || static_cast<uint64_t>(measured) > WKI_VFS_XATTR_DATA_MAX) {
+            int const STATUS = measured < 0 ? static_cast<int>(measured) : -E2BIG;
+            release_vfs_xattr_stage(stage);
+            send_vfs_xattr_response(channel_identity, COOKIE, identity, STATUS, 0, 0);
+            return;
+        }
+        stage->total = static_cast<uint32_t>(measured);
+        if (stage->total != 0) {
+            bool const BUDGET_OK = reserve_vfs_xattr_stage_bytes(stage->total);
+            if (!BUDGET_OK) {
+                release_vfs_xattr_stage(stage);
+                send_vfs_xattr_response(channel_identity, COOKIE, identity, -EAGAIN, 0, 0);
+                return;
+            }
+            stage->staged_bytes = stage->total;
+            stage->data.reset(new (std::nothrow) uint8_t[stage->total]);
+            if (stage->data == nullptr) {
+                release_vfs_xattr_stage(stage);
+                send_vfs_xattr_response(channel_identity, COOKIE, identity, -ENOMEM, 0, 0);
+                return;
+            }
+        }
+        if (identity.operation == VfsXattrOperation::GET && stage->total != 0) {
+            measured = vfs_xattr_stage_call_get(*stage, stage->data.get(), stage->total);
+        } else if (identity.operation == VfsXattrOperation::LIST && stage->total != 0) {
+            measured = vfs_xattr_stage_call_list(*stage, reinterpret_cast<char*>(stage->data.get()), stage->total);
+            if (measured >= 0 && static_cast<uint64_t>(measured) <= stage->staged_bytes) {
+                measured = filter_remote_xattr_list(stage->data.get(), static_cast<size_t>(measured));
+            }
+        }
+        if (measured < 0 || static_cast<uint64_t>(measured) > stage->staged_bytes) {
+            if (measured >= 0) {
+                measured = -ERANGE;
+            }
+            release_vfs_xattr_stage(stage);
+            send_vfs_xattr_response(channel_identity, COOKIE, identity, static_cast<int>(measured), 0, 0);
+            return;
+        }
+        if (identity.operation == VfsXattrOperation::GET || identity.operation == VfsXattrOperation::LIST) {
+            stage->total = static_cast<uint32_t>(measured);
+        }
+        uint32_t const TOTAL = stage->total;
+        if (!wki_channel_generation_is_live(channel_identity.channel, channel_identity.peer_node_id, channel_identity.channel_id,
+                                            channel_identity.generation)) {
+            release_vfs_xattr_stage(stage);
+            send_vfs_xattr_response(channel_identity, COOKIE, identity, -ENOTCONN, 0, 0);
+            return;
+        }
+        // Preallocate a possible map node in worker context before taking the
+        // VFS registry spinlock. Replacement and insertion are allocation-free.
+        std::map<VfsXattrStageKey, VfsXattrServerStage*> prepared_stage;
+        prepared_stage.emplace(KEY, stage);
+        auto prepared_node = prepared_stage.extract(KEY);
+        bool installed = false;
+        int install_status = -EBUSY;
+        VfsXattrServerStage* replaced_stage = nullptr;
+        s_vfs_lock.lock();
+        auto current = g_vfs_xattr_stages.find(KEY);
+        if (prior_stage != nullptr && current != g_vfs_xattr_stages.end() && current->second == prior_stage) {
+            current->second = stage;
+            replaced_stage = prior_stage;
+            installed = true;
+        } else if (prior_stage == nullptr && current == g_vfs_xattr_stages.end() &&
+                   g_vfs_xattr_stages.size() < VFS_XATTR_SERVER_STAGE_COUNT_MAX) {
+            installed = g_vfs_xattr_stages.insert(std::move(prepared_node)).inserted;
+        } else if (prior_stage == nullptr && current == g_vfs_xattr_stages.end()) {
+            install_status = -EAGAIN;
+        }
+        s_vfs_lock.unlock();
+        release_vfs_xattr_stage(replaced_stage);
+        if (!installed) {
+            release_vfs_xattr_stage(stage);
+            send_vfs_xattr_response(channel_identity, COOKIE, identity, install_status, 0, 0);
+            return;
+        }
+        send_vfs_xattr_response(channel_identity, COOKIE, identity, 0, TOTAL, 0);
+        return;
+    }
+
+    s_vfs_lock.lock();
+    auto found = g_vfs_xattr_stages.find(KEY);
+    VfsXattrServerStage* stage = found != g_vfs_xattr_stages.end() ? found->second : nullptr;
+    retain_vfs_xattr_stage(stage);
+    VfsXattrStageRefGuard const STAGE_GUARD{stage};
+    if (stage == nullptr || stage->identity.session_id != identity.session_id || stage->identity.operation_id != identity.operation_id ||
+        stage->identity.operation != identity.operation || stage->identity.target != identity.target) {
+        s_vfs_lock.unlock();
+        send_vfs_xattr_response(channel_identity, COOKIE, identity, -ESTALE, 0, 0);
+        return;
+    }
+    s_vfs_lock.unlock();
+
+    if (identity.phase == VfsXattrPhase::DATA) {
+        if (stage->committed) {
+            send_vfs_xattr_response(channel_identity, COOKIE, identity, -ESTALE, stage->total, stage->transferred);
+            return;
+        }
+        if (data_len < sizeof(VfsXattrDataPayload)) {
+            send_vfs_xattr_response(channel_identity, COOKIE, identity, -EINVAL, stage->total, stage->transferred);
+            return;
+        }
+        VfsXattrDataPayload chunk = {};
+        memcpy(&chunk, data, sizeof(chunk));
+        bool const READ = identity.operation == VfsXattrOperation::GET || identity.operation == VfsXattrOperation::LIST;
+        size_t const EXPECTED = sizeof(chunk) + (READ ? 0 : chunk.chunk_len);
+        if (chunk.reserved != 0 || chunk.chunk_len == 0 || chunk.chunk_len > WKI_VFS_XATTR_MAX_DATA_CHUNK || EXPECTED != data_len ||
+            chunk.offset > stage->total || chunk.chunk_len > stage->total - chunk.offset) {
+            send_vfs_xattr_response(channel_identity, COOKIE, identity, -EINVAL, stage->total, stage->transferred);
+            return;
+        }
+        if (READ) {
+            send_vfs_xattr_response(channel_identity, COOKIE, identity, 0, stage->total, chunk.chunk_len, stage->data.get() + chunk.offset,
+                                    chunk.chunk_len);
+            return;
+        }
+        auto const* incoming = data + sizeof(chunk);
+        if (chunk.offset < stage->transferred) {
+            bool const EXACT_REPLAY = vfs_xattr_data_is_exact_replay(*stage, chunk.offset, incoming, chunk.chunk_len);
+            send_vfs_xattr_response(channel_identity, COOKIE, identity, EXACT_REPLAY ? 0 : -EPROTO, stage->total, stage->transferred);
+            return;
+        }
+        if (chunk.offset != stage->transferred) {
+            send_vfs_xattr_response(channel_identity, COOKIE, identity, -EPROTO, stage->total, stage->transferred);
+            return;
+        }
+        memcpy(stage->data.get() + chunk.offset, incoming, chunk.chunk_len);
+        stage->transferred += chunk.chunk_len;
+        send_vfs_xattr_response(channel_identity, COOKIE, identity, 0, stage->total, stage->transferred);
+        return;
+    }
+
+    if (data_len != sizeof(VfsXattrPhaseHeader)) {
+        send_vfs_xattr_response(channel_identity, COOKIE, identity, -EINVAL, stage->total, stage->transferred);
+        return;
+    }
+    if (identity.phase == VfsXattrPhase::COMMIT) {
+        if (!stage->committed) {
+            if (identity.operation == VfsXattrOperation::SET && stage->transferred != stage->total) {
+                send_vfs_xattr_response(channel_identity, COOKIE, identity, -ENODATA, stage->total, stage->transferred);
+                return;
+            }
+            stage->terminal_status = static_cast<int16_t>(vfs_xattr_stage_apply_mutation(*stage));
+            stage->committed = true;
+            release_vfs_xattr_stage_data(*stage);
+        }
+        send_vfs_xattr_response(channel_identity, COOKIE, identity, stage->terminal_status, stage->total, stage->transferred);
+        return;
+    }
+
+    if (!stage->committed) {
+        // Keep a terminal tombstone so the session and monotonic operation
+        // high-water remain bound to this channel generation after ABORT.
+        stage->terminal_status = -ECANCELED;
+        stage->committed = true;
+        release_vfs_xattr_stage_data(*stage);
+    }
+    send_vfs_xattr_response(channel_identity, COOKIE, identity, 0, 0, 0);
+}
+
+}  // namespace
+
 namespace detail {
 
 // NOLINTNEXTLINE(readability-function-size): Protocol opcode dispatcher.
@@ -4974,6 +5508,10 @@ void handle_vfs_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_ident
     };
 
     switch (op_id) {
+        case OP_VFS_XATTR: {
+            handle_vfs_xattr_op(hdr, channel_identity, export_path, data, data_len);
+            break;
+        }
         case OP_VFS_OPEN: {
             // Request: {flags:u32, mode:u32, path_len:u16, path[path_len], optional prefetch_rkey:u32, prefetch_len:u32}
             if (data_len < OPEN_REQ_BASE_LEN) {
@@ -7439,6 +7977,160 @@ auto remote_vfs_stat_on_proxy(ProxyVfsState* state, const char* fs_relative_path
     return STATUS;
 }
 
+auto remote_vfs_xattr_result_matches(const VfsXattrResultPayload& result, const VfsXattrPhaseHeader& expected) -> bool {
+    return wki_vfs_xattr_header_valid(result.header) && result.header.session_id == expected.session_id &&
+           result.header.operation_id == expected.operation_id && result.header.phase == expected.phase &&
+           result.header.operation == expected.operation && result.header.target == expected.target &&
+           result.data_len <= WKI_VFS_XATTR_DATA_MAX && result.transferred <= result.data_len;
+}
+
+auto remote_vfs_xattr_on_proxy(ProxyVfsState* state, VfsXattrOperation operation, VfsXattrTarget target, int32_t remote_fd,
+                               const char* fs_relative_path, const char* name, void* value, size_t size, int flags,
+                               bool follow_final_symlink) -> ssize_t {
+    if (state == nullptr) {
+        return -EINVAL;
+    }
+    if (!state->active) {
+        return -ENOTCONN;
+    }
+    if (size > WKI_VFS_XATTR_DATA_MAX) {
+        return -E2BIG;
+    }
+    // This check must precede operation-id allocation and every possible send.
+    if (!wki_peer_capability_negotiated(state->owner_node, WKI_CAP_VFS_XATTR)) {
+        return -EOPNOTSUPP;
+    }
+
+    size_t const PATH_LEN = target == VfsXattrTarget::PATH && fs_relative_path != nullptr ? strnlen(fs_relative_path, 512) : 0;
+    size_t const NAME_LEN = name != nullptr ? strnlen(name, WKI_VFS_XATTR_NAME_MAX + 1U) : 0;
+    bool const NEEDS_NAME = operation != VfsXattrOperation::LIST;
+    if ((target == VfsXattrTarget::PATH && (fs_relative_path == nullptr || PATH_LEN >= 512)) ||
+        (target == VfsXattrTarget::FD && remote_fd < 0) || (NEEDS_NAME && (NAME_LEN == 0 || NAME_LEN > WKI_VFS_XATTR_NAME_MAX)) ||
+        (!NEEDS_NAME && NAME_LEN != 0) || ((operation == VfsXattrOperation::SET) && size != 0 && value == nullptr) ||
+        ((operation == VfsXattrOperation::GET || operation == VfsXattrOperation::LIST) && size != 0 && value == nullptr)) {
+        return -EINVAL;
+    }
+
+    state->xattr_transfer_lock.lock();
+    if (state->xattr_session_id == 0) {
+        uint32_t session_low = g_vfs_xattr_session_counter.fetch_add(1, std::memory_order_relaxed);
+        if (session_low == 0) {
+            session_low = g_vfs_xattr_session_counter.fetch_add(1, std::memory_order_relaxed);
+        }
+        state->xattr_session_id = (static_cast<uint64_t>(g_wki.local_boot_epoch) << 32U) | session_low;
+        if (state->xattr_session_id == 0) {
+            state->xattr_session_id = session_low;
+        }
+    }
+    uint64_t operation_id = ++state->xattr_next_operation_id;
+    if (operation_id == 0) {
+        operation_id = ++state->xattr_next_operation_id;
+    }
+
+    VfsXattrBeginPayload begin = {};
+    begin.header = {.session_id = state->xattr_session_id,
+                    .operation_id = operation_id,
+                    .version = WKI_VFS_XATTR_VERSION,
+                    .phase = VfsXattrPhase::BEGIN,
+                    .operation = operation,
+                    .target = target};
+    begin.remote_fd = target == VfsXattrTarget::FD ? remote_fd : -1;
+    begin.data_len = static_cast<uint32_t>(size);
+    begin.flags = static_cast<uint32_t>(flags);
+    begin.path_len = static_cast<uint16_t>(PATH_LEN);
+    begin.name_len = static_cast<uint16_t>(NAME_LEN);
+    begin.follow_final_symlink = follow_final_symlink ? 1 : 0;
+
+    std::array<uint8_t, sizeof(VfsXattrBeginPayload) + 512 + WKI_VFS_XATTR_NAME_MAX> begin_buf{};
+    memcpy(begin_buf.data(), &begin, sizeof(begin));
+    if (PATH_LEN != 0) {
+        memcpy(begin_buf.data() + sizeof(begin), fs_relative_path, PATH_LEN);
+    }
+    if (NAME_LEN != 0) {
+        memcpy(begin_buf.data() + sizeof(begin) + PATH_LEN, name, NAME_LEN);
+    }
+
+    VfsXattrResultPayload result = {};
+    uint16_t response_len = 0;
+    int status = vfs_proxy_send_and_wait(state, OP_VFS_XATTR, begin_buf.data(), sizeof(begin) + PATH_LEN + NAME_LEN, &result,
+                                         sizeof(result), &response_len);
+    if (status != 0 || response_len != sizeof(result) || !remote_vfs_xattr_result_matches(result, begin.header)) {
+        if (operation == VfsXattrOperation::SET || operation == VfsXattrOperation::REMOVE) {
+            invalidate_readlink_cache_group(state);
+        }
+        state->xattr_transfer_lock.unlock();
+        return status != 0 ? normalize_proxy_status_for_errno(status) : -EPROTO;
+    }
+
+    uint32_t const TOTAL = result.data_len;
+    bool const READ_OPERATION = operation == VfsXattrOperation::GET || operation == VfsXattrOperation::LIST;
+    if (READ_OPERATION && size != 0 && TOTAL > size) {
+        status = -ERANGE;
+    }
+    uint32_t const TRANSFER_TOTAL = vfs_xattr_transfer_total(READ_OPERATION, size, TOTAL);
+    uint32_t offset = 0;
+    while (status == 0 && offset < TRANSFER_TOTAL) {
+        auto const CHUNK = static_cast<uint16_t>(std::min<size_t>(WKI_VFS_XATTR_MAX_DATA_CHUNK, TRANSFER_TOTAL - offset));
+        VfsXattrDataPayload data = {};
+        data.header = begin.header;
+        data.header.phase = VfsXattrPhase::DATA;
+        data.offset = offset;
+        data.chunk_len = CHUNK;
+        std::array<uint8_t, WKI_ETH_MAX_PAYLOAD> response{};
+        uint16_t chunk_response_len = 0;
+        if (READ_OPERATION) {
+            status = vfs_proxy_send_and_wait(state, OP_VFS_XATTR, reinterpret_cast<const uint8_t*>(&data), sizeof(data), response.data(),
+                                             static_cast<uint16_t>(response.size()), &chunk_response_len);
+            if (status == 0) {
+                if (chunk_response_len != sizeof(VfsXattrResultPayload) + CHUNK) {
+                    status = -EPROTO;
+                } else {
+                    auto const* chunk_result = reinterpret_cast<const VfsXattrResultPayload*>(response.data());
+                    if (!remote_vfs_xattr_result_matches(*chunk_result, data.header) || chunk_result->transferred != CHUNK) {
+                        status = -EPROTO;
+                    } else {
+                        memcpy(static_cast<uint8_t*>(value) + offset, response.data() + sizeof(VfsXattrResultPayload), CHUNK);
+                    }
+                }
+            }
+        } else {
+            status = vfs_proxy_send_and_wait(state, OP_VFS_XATTR, reinterpret_cast<const uint8_t*>(&data), sizeof(data), &result,
+                                             sizeof(result), &response_len, VFS_PROXY_OP_TIMEOUT_US, nullptr,
+                                             static_cast<const uint8_t*>(value) + offset, CHUNK);
+            if (status == 0 && (response_len != sizeof(result) || !remote_vfs_xattr_result_matches(result, data.header) ||
+                                result.transferred != offset + CHUNK)) {
+                status = -EPROTO;
+            }
+        }
+        offset += CHUNK;
+    }
+
+    VfsXattrPhaseHeader terminal = begin.header;
+    terminal.phase = status == 0 ? VfsXattrPhase::COMMIT : VfsXattrPhase::ABORT;
+    VfsXattrResultPayload terminal_result = {};
+    uint16_t terminal_len = 0;
+    int const TERMINAL_STATUS = vfs_proxy_send_and_wait(state, OP_VFS_XATTR, reinterpret_cast<const uint8_t*>(&terminal), sizeof(terminal),
+                                                        &terminal_result, sizeof(terminal_result), &terminal_len);
+    if (status == 0) {
+        status = TERMINAL_STATUS;
+        if (status == 0 && (terminal_len != sizeof(terminal_result) || !remote_vfs_xattr_result_matches(terminal_result, terminal))) {
+            status = -EPROTO;
+        }
+    }
+
+    bool const MUTATION = operation == VfsXattrOperation::SET || operation == VfsXattrOperation::REMOVE;
+    if (MUTATION && status != 0) {
+        // A failure after BEGIN may be post-send ambiguity. Do not manufacture
+        // a new identity or replay the mutation; invalidate conservatively.
+        invalidate_readlink_cache_group(state);
+    }
+    state->xattr_transfer_lock.unlock();
+    if (status != 0) {
+        return normalize_proxy_status_for_errno(status);
+    }
+    return READ_OPERATION ? static_cast<ssize_t>(TOTAL) : 0;
+}
+
 }  // namespace
 
 auto wki_remote_vfs_stat(void* mount_private_data, const char* fs_relative_path, ker::vfs::Stat* statbuf) -> int {
@@ -7452,6 +8144,92 @@ auto wki_remote_vfs_stat(void* mount_private_data, const char* fs_relative_path,
     }
     ProxyLifecycleRefGuard lane_ref_guard(state);
     return remote_vfs_stat_on_proxy(state, fs_relative_path, statbuf);
+}
+
+auto wki_remote_vfs_setxattr(void* mount_private_data, const char* fs_relative_path, const char* name, const void* value, size_t size,
+                             int flags, bool follow_final_symlink) -> int {
+    auto* anchor = static_cast<ProxyVfsState*>(mount_private_data);
+    auto* state = acquire_vfs_proxy_lane(anchor);
+    if (state == nullptr) {
+        return -EINVAL;
+    }
+    ProxyLifecycleRefGuard guard(state);
+    int const STATUS = static_cast<int>(remote_vfs_xattr_on_proxy(state, VfsXattrOperation::SET, VfsXattrTarget::PATH, -1, fs_relative_path,
+                                                                  name, const_cast<void*>(value), size, flags, follow_final_symlink));
+    if (STATUS < 0 && STATUS != -EOPNOTSUPP && STATUS != -EINVAL && STATUS != -ENAMETOOLONG) {
+        // A failure after send is completion-ambiguous. Invalidating the mount
+        // root marks its whole metadata subtree stale and also handles an empty
+        // relative path without manufacturing a trailing slash.
+        ker::vfs::vfs_cache_notify_path_changed(state->local_mount_path.data(), nullptr);
+    }
+    return STATUS;
+}
+
+auto wki_remote_vfs_getxattr(void* mount_private_data, const char* fs_relative_path, const char* name, void* value, size_t size,
+                             bool follow_final_symlink) -> ssize_t {
+    auto* state = acquire_vfs_proxy_lane(static_cast<ProxyVfsState*>(mount_private_data));
+    if (state == nullptr) {
+        return -EINVAL;
+    }
+    ProxyLifecycleRefGuard guard(state);
+    return remote_vfs_xattr_on_proxy(state, VfsXattrOperation::GET, VfsXattrTarget::PATH, -1, fs_relative_path, name, value, size, 0,
+                                     follow_final_symlink);
+}
+
+auto wki_remote_vfs_listxattr(void* mount_private_data, const char* fs_relative_path, char* list, size_t size, bool follow_final_symlink)
+    -> ssize_t {
+    auto* state = acquire_vfs_proxy_lane(static_cast<ProxyVfsState*>(mount_private_data));
+    if (state == nullptr) {
+        return -EINVAL;
+    }
+    ProxyLifecycleRefGuard guard(state);
+    return remote_vfs_xattr_on_proxy(state, VfsXattrOperation::LIST, VfsXattrTarget::PATH, -1, fs_relative_path, nullptr, list, size, 0,
+                                     follow_final_symlink);
+}
+
+auto wki_remote_vfs_removexattr(void* mount_private_data, const char* fs_relative_path, const char* name, bool follow_final_symlink)
+    -> int {
+    auto* state = acquire_vfs_proxy_lane(static_cast<ProxyVfsState*>(mount_private_data));
+    if (state == nullptr) {
+        return -EINVAL;
+    }
+    ProxyLifecycleRefGuard guard(state);
+    int const STATUS = static_cast<int>(remote_vfs_xattr_on_proxy(state, VfsXattrOperation::REMOVE, VfsXattrTarget::PATH, -1,
+                                                                  fs_relative_path, name, nullptr, 0, 0, follow_final_symlink));
+    if (STATUS < 0 && STATUS != -EOPNOTSUPP && STATUS != -EINVAL && STATUS != -ENAMETOOLONG) {
+        ker::vfs::vfs_cache_notify_path_changed(state->local_mount_path.data(), nullptr);
+    }
+    return STATUS;
+}
+
+auto remote_vfs_file_xattr(ker::vfs::File* file, VfsXattrOperation operation, const char* name, void* value, size_t size, int flags)
+    -> ssize_t {
+    if (file == nullptr || file->fops != wki_remote_vfs_get_fops() || file->private_data == nullptr) {
+        return -EINVAL;
+    }
+    auto* ctx = static_cast<RemoteFileContext*>(file->private_data);
+    return remote_vfs_xattr_on_proxy(ctx->proxy, operation, VfsXattrTarget::FD, ctx->remote_fd, nullptr, name, value, size, flags, true);
+}
+
+auto wki_remote_vfs_fsetxattr(ker::vfs::File* file, const char* name, const void* value, size_t size, int flags) -> int {
+    int const STATUS = static_cast<int>(remote_vfs_file_xattr(file, VfsXattrOperation::SET, name, const_cast<void*>(value), size, flags));
+    if (STATUS < 0 && STATUS != -EOPNOTSUPP && STATUS != -EINVAL) {
+        ker::vfs::vfs_cache_notify_file_changed(file);
+    }
+    return STATUS;
+}
+auto wki_remote_vfs_fgetxattr(ker::vfs::File* file, const char* name, void* value, size_t size) -> ssize_t {
+    return remote_vfs_file_xattr(file, VfsXattrOperation::GET, name, value, size, 0);
+}
+auto wki_remote_vfs_flistxattr(ker::vfs::File* file, char* list, size_t size) -> ssize_t {
+    return remote_vfs_file_xattr(file, VfsXattrOperation::LIST, nullptr, list, size, 0);
+}
+auto wki_remote_vfs_fremovexattr(ker::vfs::File* file, const char* name) -> int {
+    int const STATUS = static_cast<int>(remote_vfs_file_xattr(file, VfsXattrOperation::REMOVE, name, nullptr, 0, 0));
+    if (STATUS < 0 && STATUS != -EOPNOTSUPP && STATUS != -EINVAL) {
+        ker::vfs::vfs_cache_notify_file_changed(file);
+    }
+    return STATUS;
 }
 
 auto wki_remote_vfs_metadata_batch(void* mount_private_data, ker::vfs::MetadataBatchOperation operation, uint32_t mode,
@@ -8306,7 +9084,8 @@ void handle_vfs_op_resp(const WkiHeader* hdr, const uint8_t* payload, uint16_t p
     const uint8_t* resp_data = payload + sizeof(DevOpRespPayload);
     uint16_t const RESP_DATA_LEN = resp->data_len;
 
-    if (sizeof(DevOpRespPayload) + RESP_DATA_LEN > payload_len) {
+    size_t const EXPECTED_LEN = sizeof(DevOpRespPayload) + RESP_DATA_LEN;
+    if (resp->op_id == OP_VFS_XATTR ? EXPECTED_LEN != payload_len : EXPECTED_LEN > payload_len) {
         return;
     }
 
@@ -8332,7 +9111,10 @@ void handle_vfs_op_resp(const WkiHeader* hdr, const uint8_t* payload, uint16_t p
     wait_entry = claim_response_waiter_locked(state->op_wait_entry);
     if (wait_entry != nullptr) {
         uint16_t copy_len = 0;
-        if (RESP_DATA_LEN > 0 && state->op_resp_buf != nullptr) {
+        if (resp->op_id == OP_VFS_XATTR && RESP_DATA_LEN > state->op_resp_max) {
+            state->op_resp_len = 0;
+            state->op_status = -EMSGSIZE;
+        } else if (RESP_DATA_LEN > 0 && state->op_resp_buf != nullptr) {
             copy_len = (RESP_DATA_LEN > state->op_resp_max) ? state->op_resp_max : RESP_DATA_LEN;
             memcpy(state->op_resp_buf, resp_data, copy_len);
             state->op_resp_len = copy_len;
@@ -8350,7 +9132,9 @@ void handle_vfs_op_resp(const WkiHeader* hdr, const uint8_t* payload, uint16_t p
         } else {
             state->op_resp_len = 0;
         }
-        state->op_status = resp->status;
+        if (resp->op_id != OP_VFS_XATTR || RESP_DATA_LEN <= state->op_resp_max) {
+            state->op_status = resp->status;
+        }
     }
     // Keep both the operation slot and exact stack-waiter identity published
     // until the result consumer, cancellation, teardown, or task-exit cleanup
@@ -8838,6 +9622,15 @@ void wki_remote_vfs_process_pending_server_fd_cleanup() {
 }
 
 void wki_remote_vfs_cleanup_server_fds_for_channel(const WkiChannelIdentity& channel_identity) {
+    VfsXattrServerStage* stage = nullptr;
+    s_vfs_lock.lock();
+    auto const STAGE_IT = g_vfs_xattr_stages.find(vfs_xattr_stage_key(channel_identity));
+    if (STAGE_IT != g_vfs_xattr_stages.end()) {
+        stage = STAGE_IT->second;
+        g_vfs_xattr_stages.erase(STAGE_IT);
+    }
+    s_vfs_lock.unlock();
+    release_vfs_xattr_stage(stage);
     wki_remote_vfs_mark_server_fds_for_channel(channel_identity);
     wki_remote_vfs_process_pending_server_fd_cleanup();
 }
@@ -8869,9 +9662,19 @@ void wki_remote_vfs_mark_epoch_reset(uint16_t node_id) {
 void wki_remote_vfs_cleanup_for_peer(uint16_t node_id, bool owner_reboot_proven) {
     // Server side: close all remote FDs for this consumer
     std::deque<ker::vfs::File*> files_to_close;
+    std::array<VfsXattrServerStage*, VFS_XATTR_SERVER_STAGE_COUNT_MAX> xattr_stages_to_release{};
+    size_t xattr_stage_release_count = 0;
     std::deque<PendingProxyTeardown> proxies_to_cleanup;
 
     s_vfs_lock.lock();
+    for (auto stage = g_vfs_xattr_stages.begin(); stage != g_vfs_xattr_stages.end();) {
+        if (stage->first.peer_node_id != node_id) {
+            ++stage;
+            continue;
+        }
+        xattr_stages_to_release.at(xattr_stage_release_count++) = stage->second;
+        stage = g_vfs_xattr_stages.erase(stage);
+    }
     for (auto& [fd_id, rfd] : g_remote_fds) {
         static_cast<void>(fd_id);
         if (rfd.consumer_node != node_id) {
@@ -8919,6 +9722,10 @@ void wki_remote_vfs_cleanup_for_peer(uint16_t node_id, bool owner_reboot_proven)
 
     for (const auto& cleanup : proxies_to_cleanup) {
         finish_proxy_teardown_op_waiter(cleanup, -1);
+    }
+
+    for (size_t index = 0; index < xattr_stage_release_count; ++index) {
+        release_vfs_xattr_stage(xattr_stages_to_release.at(index));
     }
 
     for (auto* file : files_to_close) {

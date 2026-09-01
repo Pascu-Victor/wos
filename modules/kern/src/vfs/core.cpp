@@ -11590,6 +11590,378 @@ auto vfs_fstatvfs(int fd, Statvfs* buf) -> int {
     }
 }
 
+namespace {
+
+enum class XattrOperation : uint8_t { SET, GET, LIST, REMOVE };
+
+struct ResolvedXattrPath {
+    std::array<char, MAX_PATH_LEN> path{};
+    size_t path_len{};
+    MountRef mount{};
+};
+
+auto resolve_xattr_path(const char* path, bool follow_final_symlink, bool already_resolved, ResolvedXattrPath* out,
+                        const SymlinkResolvePolicy* policy = nullptr) -> int {
+    if (path == nullptr || out == nullptr) {
+        return -EINVAL;
+    }
+
+    size_t path_len = UNKNOWN_PATH_LEN;
+    if (already_resolved) {
+        if (path[0] != '/') {
+            return -EINVAL;
+        }
+        PathTextScan const SCAN = scan_path_text(path);
+        if (SCAN.path_len == 0 || SCAN.path_len >= out->path.size()) {
+            return SCAN.path_len == 0 ? -ENOENT : -ENAMETOOLONG;
+        }
+        int const COPY_RET = copy_path_string(path, out->path.data(), out->path.size(), SCAN.path_len, &path_len);
+        if (COPY_RET < 0) {
+            return COPY_RET;
+        }
+    } else {
+        int const RESOLVE_RET = resolve_task_path_raw_impl(path, out->path.data(), out->path.size(), true, &path_len);
+        if (RESOLVE_RET < 0) {
+            return RESOLVE_RET;
+        }
+        maybe_ensure_wki_host_root_mount_for_task(ker::mod::sched::get_current_task(), out->path.data());
+    }
+
+    out->mount = find_mount_point(out->path.data(), path_len);
+    MountPoint* mount = out->mount.get();
+    if (mount == nullptr) {
+        return -ENOENT;
+    }
+    if (mount->fs_type == FSType::REMOTE && policy != nullptr && policy->reject_remote_mounts) {
+        return -EPERM;
+    }
+    // The owner resolves remote intermediate/final symlinks beneath the
+    // authorized export root. Avoid a client-side readlink pass and its race;
+    // confinement-aware server dispatch still rejects nested REMOTE mounts.
+    if (mount->fs_type == FSType::REMOTE && policy == nullptr) {
+        out->path_len = path_len;
+        return 0;
+    }
+
+    std::array<char, MAX_PATH_LEN> resolved{};
+    size_t resolved_len = path_len;
+    int const SYMLINK_RET =
+        resolve_symlinks(out->path.data(), resolved.data(), resolved.size(), false, follow_final_symlink, path_len, &resolved_len, policy);
+    if (SYMLINK_RET < 0) {
+        return SYMLINK_RET;
+    }
+    if (!path_text_equal(out->path.data(), path_len, resolved.data(), resolved_len)) {
+        out->path = resolved;
+        path_len = resolved_len;
+        out->mount = find_mount_point(out->path.data(), path_len);
+        mount = out->mount.get();
+        if (mount == nullptr) {
+            return -ENOENT;
+        }
+    }
+    out->path_len = path_len;
+    return 0;
+}
+
+auto dispatch_xattr_path(XattrOperation operation, const char* path, const char* name, void* value, size_t size, int flags,
+                         bool follow_final_symlink, bool already_resolved, const SymlinkResolvePolicy* policy = nullptr) -> ssize_t {
+    ResolvedXattrPath resolved{};
+    if (int const RET = resolve_xattr_path(path, follow_final_symlink, already_resolved, &resolved, policy); RET < 0) {
+        return RET;
+    }
+    MountPoint* mount = resolved.mount.get();
+    if (mount == nullptr) {
+        return -ENOENT;
+    }
+    bool const MUTATION = operation == XattrOperation::SET || operation == XattrOperation::REMOVE;
+    if (MUTATION && mount->read_only) {
+        return -EROFS;
+    }
+
+    ssize_t result = -EOPNOTSUPP;
+    switch (mount->fs_type) {
+        case FSType::XFS: {
+            auto* context = static_cast<ker::vfs::xfs::XfsMountContext*>(mount->private_data);
+            const char* fs_path = strip_mount_prefix(mount, resolved.path.data());
+            size_t const FS_PATH_LEN = strip_mount_prefix_len(mount, resolved.path.data(), resolved.path_len);
+            switch (operation) {
+                case XattrOperation::SET:
+                    result = ker::vfs::xfs::xfs_setxattr_path(fs_path, name, value, size, flags, context, FS_PATH_LEN);
+                    break;
+                case XattrOperation::GET:
+                    result = ker::vfs::xfs::xfs_getxattr_path(fs_path, name, value, size, context, FS_PATH_LEN);
+                    break;
+                case XattrOperation::LIST:
+                    result = ker::vfs::xfs::xfs_listxattr_path(fs_path, static_cast<char*>(value), size, context, FS_PATH_LEN);
+                    break;
+                case XattrOperation::REMOVE:
+                    result = ker::vfs::xfs::xfs_removexattr_path(fs_path, name, context, FS_PATH_LEN);
+                    break;
+            }
+            break;
+        }
+        case FSType::REMOTE: {
+            const char* fs_path = strip_mount_prefix(mount, resolved.path.data());
+            switch (operation) {
+                case XattrOperation::SET:
+                    result = ker::net::wki::wki_remote_vfs_setxattr(mount->private_data, fs_path, name, value, size, flags,
+                                                                    follow_final_symlink);
+                    break;
+                case XattrOperation::GET:
+                    result = ker::net::wki::wki_remote_vfs_getxattr(mount->private_data, fs_path, name, value, size, follow_final_symlink);
+                    break;
+                case XattrOperation::LIST:
+                    result = ker::net::wki::wki_remote_vfs_listxattr(mount->private_data, fs_path, static_cast<char*>(value), size,
+                                                                     follow_final_symlink);
+                    break;
+                case XattrOperation::REMOVE:
+                    result = ker::net::wki::wki_remote_vfs_removexattr(mount->private_data, fs_path, name, follow_final_symlink);
+                    break;
+            }
+            break;
+        }
+        case FSType::TMPFS:
+        case FSType::FAT32:
+        case FSType::DEVFS:
+        case FSType::SOCKET:
+        case FSType::PROCFS:
+            result = -EOPNOTSUPP;
+            break;
+    }
+    if (result >= 0 && MUTATION) {
+        cache_notify_path_data_changed_impl(resolved.path.data(), mount->fs_type);
+    }
+    return result;
+}
+
+auto dispatch_xattr_beneath(XattrOperation operation, const char* export_root, const char* relative_path, const char* name, void* value,
+                            size_t size, int flags, bool follow_final_symlink) -> ssize_t {
+    if (export_root == nullptr || relative_path == nullptr || export_root[0] != '/' || relative_path[0] == '/') {
+        return -EINVAL;
+    }
+    std::array<char, MAX_PATH_LEN> canonical_root{};
+    size_t root_len = UNKNOWN_PATH_LEN;
+    int ret = copy_path_string(export_root, canonical_root.data(), canonical_root.size(), UNKNOWN_PATH_LEN, &root_len);
+    if (ret < 0) {
+        return ret;
+    }
+    ret = canonicalize_path(canonical_root.data(), canonical_root.size());
+    if (ret < 0) {
+        return ret;
+    }
+    root_len = std::strlen(canonical_root.data());
+    auto root_mount_ref = find_mount_point(canonical_root.data(), root_len);
+    MountPoint const* root_mount = root_mount_ref.get();
+    if (root_mount == nullptr) {
+        return -ENOENT;
+    }
+    if (root_mount->fs_type == FSType::REMOTE) {
+        return -EPERM;
+    }
+
+    size_t const RELATIVE_LEN = std::strlen(relative_path);
+    bool const ROOT_IS_SLASH = root_len == 1 && canonical_root[0] == '/';
+    size_t const SEPARATOR_LEN = ROOT_IS_SLASH || RELATIVE_LEN == 0 ? 0 : 1;
+    if (root_len + SEPARATOR_LEN + RELATIVE_LEN >= MAX_PATH_LEN) {
+        return -ENAMETOOLONG;
+    }
+    std::array<char, MAX_PATH_LEN> canonical_path{};
+    std::memcpy(canonical_path.data(), canonical_root.data(), root_len);
+    size_t path_len = root_len;
+    if (SEPARATOR_LEN != 0) {
+        canonical_path[path_len++] = '/';
+    }
+    if (RELATIVE_LEN != 0) {
+        std::memcpy(canonical_path.data() + path_len, relative_path, RELATIVE_LEN);
+        path_len += RELATIVE_LEN;
+    }
+    canonical_path[path_len] = '\0';
+    ret = canonicalize_path(canonical_path.data(), canonical_path.size());
+    if (ret < 0) {
+        return ret;
+    }
+    if (!path_prefix_matches(canonical_path.data(), canonical_root.data(), root_len)) {
+        return -EPERM;
+    }
+
+    SymlinkResolvePolicy const POLICY = {
+        .confinement_root = canonical_root.data(),
+        .confinement_root_len = root_len,
+        .reject_remote_mounts = true,
+        .reapply_task_root = false,
+    };
+    return dispatch_xattr_path(operation, canonical_path.data(), name, value, size, flags, follow_final_symlink, true, &POLICY);
+}
+
+auto dispatch_xattr_file(XattrOperation operation, File* file, const char* name, void* value, size_t size, int flags) -> ssize_t {
+    if (file == nullptr) {
+        return -EBADF;
+    }
+    bool const MUTATION = operation == XattrOperation::SET || operation == XattrOperation::REMOVE;
+    if (MUTATION && file->mount_owner != nullptr && file->mount_owner->read_only) {
+        return -EROFS;
+    }
+
+    ssize_t result = -EOPNOTSUPP;
+    switch (file->fs_type) {
+        case FSType::XFS:
+            switch (operation) {
+                case XattrOperation::SET:
+                    result = ker::vfs::xfs::xfs_fsetxattr(file, name, value, size, flags);
+                    break;
+                case XattrOperation::GET:
+                    result = ker::vfs::xfs::xfs_fgetxattr(file, name, value, size);
+                    break;
+                case XattrOperation::LIST:
+                    result = ker::vfs::xfs::xfs_flistxattr(file, static_cast<char*>(value), size);
+                    break;
+                case XattrOperation::REMOVE:
+                    result = ker::vfs::xfs::xfs_fremovexattr(file, name);
+                    break;
+            }
+            break;
+        case FSType::REMOTE:
+            switch (operation) {
+                case XattrOperation::SET:
+                    result = ker::net::wki::wki_remote_vfs_fsetxattr(file, name, value, size, flags);
+                    break;
+                case XattrOperation::GET:
+                    result = ker::net::wki::wki_remote_vfs_fgetxattr(file, name, value, size);
+                    break;
+                case XattrOperation::LIST:
+                    result = ker::net::wki::wki_remote_vfs_flistxattr(file, static_cast<char*>(value), size);
+                    break;
+                case XattrOperation::REMOVE:
+                    result = ker::net::wki::wki_remote_vfs_fremovexattr(file, name);
+                    break;
+            }
+            break;
+        case FSType::TMPFS:
+        case FSType::FAT32:
+        case FSType::DEVFS:
+        case FSType::SOCKET:
+        case FSType::PROCFS:
+            result = -EOPNOTSUPP;
+            break;
+    }
+    if (result >= 0 && MUTATION) {
+        cache_notify_file_metadata_changed_impl(file);
+    }
+    return result;
+}
+
+}  // namespace
+
+auto vfs_setxattr(const char* path, const char* name, const void* value, size_t size, int flags, bool follow_final_symlink) -> int {
+    return static_cast<int>(
+        dispatch_xattr_path(XattrOperation::SET, path, name, const_cast<void*>(value), size, flags, follow_final_symlink, false));
+}
+
+auto vfs_setxattr_beneath(const char* export_root, const char* relative_path, const char* name, const void* value, size_t size, int flags,
+                          bool follow_final_symlink) -> int {
+    return static_cast<int>(dispatch_xattr_beneath(XattrOperation::SET, export_root, relative_path, name, const_cast<void*>(value), size,
+                                                   flags, follow_final_symlink));
+}
+
+auto vfs_fsetxattr_file(File* file, const char* name, const void* value, size_t size, int flags) -> int {
+    return static_cast<int>(dispatch_xattr_file(XattrOperation::SET, file, name, const_cast<void*>(value), size, flags));
+}
+
+auto vfs_fsetxattr(int fd, const char* name, const void* value, size_t size, int flags) -> int {
+    auto* task = ker::mod::sched::get_current_task();
+    if (task == nullptr) {
+        return -ESRCH;
+    }
+    File* file = vfs_get_file_retain(task, fd);
+    if (file == nullptr) {
+        return -EBADF;
+    }
+    int const RESULT = vfs_fsetxattr_file(file, name, value, size, flags);
+    vfs_put_file(file);
+    return RESULT;
+}
+
+auto vfs_getxattr(const char* path, const char* name, void* value, size_t size, bool follow_final_symlink) -> ssize_t {
+    return dispatch_xattr_path(XattrOperation::GET, path, name, value, size, 0, follow_final_symlink, false);
+}
+
+auto vfs_getxattr_beneath(const char* export_root, const char* relative_path, const char* name, void* value, size_t size,
+                          bool follow_final_symlink) -> ssize_t {
+    return dispatch_xattr_beneath(XattrOperation::GET, export_root, relative_path, name, value, size, 0, follow_final_symlink);
+}
+
+auto vfs_fgetxattr_file(File* file, const char* name, void* value, size_t size) -> ssize_t {
+    return dispatch_xattr_file(XattrOperation::GET, file, name, value, size, 0);
+}
+
+auto vfs_fgetxattr(int fd, const char* name, void* value, size_t size) -> ssize_t {
+    auto* task = ker::mod::sched::get_current_task();
+    if (task == nullptr) {
+        return -ESRCH;
+    }
+    File* file = vfs_get_file_retain(task, fd);
+    if (file == nullptr) {
+        return -EBADF;
+    }
+    ssize_t const RESULT = vfs_fgetxattr_file(file, name, value, size);
+    vfs_put_file(file);
+    return RESULT;
+}
+
+auto vfs_listxattr(const char* path, char* list, size_t size, bool follow_final_symlink) -> ssize_t {
+    return dispatch_xattr_path(XattrOperation::LIST, path, nullptr, list, size, 0, follow_final_symlink, false);
+}
+
+auto vfs_listxattr_beneath(const char* export_root, const char* relative_path, char* list, size_t size, bool follow_final_symlink)
+    -> ssize_t {
+    return dispatch_xattr_beneath(XattrOperation::LIST, export_root, relative_path, nullptr, list, size, 0, follow_final_symlink);
+}
+
+auto vfs_flistxattr_file(File* file, char* list, size_t size) -> ssize_t {
+    return dispatch_xattr_file(XattrOperation::LIST, file, nullptr, list, size, 0);
+}
+
+auto vfs_flistxattr(int fd, char* list, size_t size) -> ssize_t {
+    auto* task = ker::mod::sched::get_current_task();
+    if (task == nullptr) {
+        return -ESRCH;
+    }
+    File* file = vfs_get_file_retain(task, fd);
+    if (file == nullptr) {
+        return -EBADF;
+    }
+    ssize_t const RESULT = vfs_flistxattr_file(file, list, size);
+    vfs_put_file(file);
+    return RESULT;
+}
+
+auto vfs_removexattr(const char* path, const char* name, bool follow_final_symlink) -> int {
+    return static_cast<int>(dispatch_xattr_path(XattrOperation::REMOVE, path, name, nullptr, 0, 0, follow_final_symlink, false));
+}
+
+auto vfs_removexattr_beneath(const char* export_root, const char* relative_path, const char* name, bool follow_final_symlink) -> int {
+    return static_cast<int>(
+        dispatch_xattr_beneath(XattrOperation::REMOVE, export_root, relative_path, name, nullptr, 0, 0, follow_final_symlink));
+}
+
+auto vfs_fremovexattr_file(File* file, const char* name) -> int {
+    return static_cast<int>(dispatch_xattr_file(XattrOperation::REMOVE, file, name, nullptr, 0, 0));
+}
+
+auto vfs_fremovexattr(int fd, const char* name) -> int {
+    auto* task = ker::mod::sched::get_current_task();
+    if (task == nullptr) {
+        return -ESRCH;
+    }
+    File* file = vfs_get_file_retain(task, fd);
+    if (file == nullptr) {
+        return -EBADF;
+    }
+    int const RESULT = vfs_fremovexattr_file(file, name);
+    vfs_put_file(file);
+    return RESULT;
+}
+
 // --- umount ---
 auto vfs_umount(const char* target) -> int {
     // Resolve once for mount-scope invalidation lookup.

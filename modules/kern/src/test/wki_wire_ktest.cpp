@@ -229,6 +229,42 @@ KTEST(WkiWire, VfsMetadataBatchUsesAdditiveBoundedFraming) {
     KEXPECT_EQ(sizeof(HelloPayload), static_cast<size_t>(96));
 }
 
+KTEST(WkiWire, VfsXattrUsesVersionedBoundedReplayIdentity) {
+    using namespace ker::net::wki;
+
+    KEXPECT_EQ(WKI_CAP_VFS_XATTR, static_cast<uint16_t>(0x0040));
+    KEXPECT_EQ(OP_VFS_XATTR, static_cast<uint16_t>(0x0417));
+    KEXPECT_EQ(WKI_VFS_XATTR_VERSION, static_cast<uint8_t>(1));
+    KEXPECT_EQ(WKI_VFS_XATTR_NAME_MAX, static_cast<uint16_t>(255));
+    KEXPECT_EQ(WKI_VFS_XATTR_DATA_MAX, static_cast<uint32_t>(65536));
+    KEXPECT_EQ(sizeof(VfsXattrPhaseHeader), static_cast<size_t>(20));
+    KEXPECT_EQ(sizeof(VfsXattrBeginPayload), static_cast<size_t>(40));
+    KEXPECT_EQ(sizeof(VfsXattrDataPayload), static_cast<size_t>(28));
+    KEXPECT_EQ(sizeof(VfsXattrResultPayload), static_cast<size_t>(28));
+    KEXPECT_TRUE(WKI_VFS_XATTR_MAX_DATA_CHUNK < static_cast<size_t>(UINT16_MAX));
+
+    VfsXattrDataPayload hostile_read = {};
+    hostile_read.chunk_len = UINT16_MAX;
+    KEXPECT_TRUE(hostile_read.chunk_len > WKI_VFS_XATTR_MAX_DATA_CHUNK);
+
+    VfsXattrBeginPayload begin = {};
+    begin.header = {.session_id = 7,
+                    .operation_id = 9,
+                    .version = WKI_VFS_XATTR_VERSION,
+                    .phase = VfsXattrPhase::BEGIN,
+                    .operation = VfsXattrOperation::GET,
+                    .target = VfsXattrTarget::FD};
+    begin.remote_fd = 3;
+    begin.data_len = WKI_VFS_XATTR_DATA_MAX;
+    begin.name_len = 1;
+    KEXPECT_TRUE(wki_vfs_xattr_begin_valid(begin));
+    begin.name_len = WKI_VFS_XATTR_NAME_MAX + 1;
+    KEXPECT_FALSE(wki_vfs_xattr_begin_valid(begin));
+    begin.name_len = 1;
+    begin.reserved[1] = 1;
+    KEXPECT_FALSE(wki_vfs_xattr_begin_valid(begin));
+}
+
 KTEST(WkiWire, DevAttachAckMatchesExpectedCookie) {
     ker::net::wki::DevAttachAckPayload ack = {};
     ack.resource_id = 55;

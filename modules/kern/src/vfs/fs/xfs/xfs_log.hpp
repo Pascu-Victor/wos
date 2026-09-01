@@ -24,10 +24,11 @@ struct XfsLog {
     uint32_t sect_size;       // log sector size
 
     // Current position
-    uint32_t head_cycle;  // current write cycle
-    uint32_t head_block;  // current write position (block)
-    uint32_t tail_cycle;  // oldest active record cycle
-    uint32_t tail_block;  // oldest active record block
+    uint32_t head_cycle;      // current write cycle
+    uint32_t head_block;      // current write position (block)
+    uint32_t tail_cycle;      // oldest active record cycle
+    uint32_t tail_block;      // oldest active record block
+    uint32_t previous_block;  // previous record start (512-byte basic block), or UINT32_MAX
 
     // State
     bool clean;   // true if log is clean (no recovery needed)

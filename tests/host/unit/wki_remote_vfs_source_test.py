@@ -1216,7 +1216,9 @@ def test_message_fallback_readahead_targets_small_sequential_reads() -> None:
     require_order(
         response_body,
         [
-            "if (sizeof(DevOpRespPayload) + RESP_DATA_LEN > payload_len)",
+            "resp->op_id == OP_VFS_XATTR ? EXPECTED_LEN != payload_len : EXPECTED_LEN > payload_len",
+            "resp->op_id == OP_VFS_XATTR && RESP_DATA_LEN > state->op_resp_max",
+            "state->op_status = -EMSGSIZE",
             "copy_len = (RESP_DATA_LEN > state->op_resp_max) ? state->op_resp_max : RESP_DATA_LEN",
             "memcpy(state->op_resp_buf, resp_data, copy_len)",
             "state->op_resp_len = copy_len",
@@ -3398,9 +3400,20 @@ def test_server_fd_and_consumer_rx_use_exact_channel_identity() -> None:
         dev_server,
         [
             "wki_remote_vfs_cleanup_server_fds_for_channel(channel_identity)",
-            "wki_remote_vfs_mark_server_fds_for_channel(item.channel_identity)",
+            "wki_remote_vfs_cleanup_server_fds_for_channel(item.channel_identity)",
         ],
         "ordinary and reconciliation binding teardown close exact server FDs",
+    )
+    channel_cleanup = function_body(source, "wki_remote_vfs_cleanup_server_fds_for_channel")
+    require_order(
+        channel_cleanup,
+        [
+            "g_vfs_xattr_stages.find(vfs_xattr_stage_key(channel_identity))",
+            "g_vfs_xattr_stages.erase(STAGE_IT)",
+            "release_vfs_xattr_stage(stage)",
+            "wki_remote_vfs_process_pending_server_fd_cleanup()",
+        ],
+        "detach cycles release exact-generation xattr stages and retained files",
     )
 
 
@@ -4199,6 +4212,122 @@ def test_metadata_batch_never_replays_after_a_send_attempt() -> None:
     )
 
 
+def test_remote_xattr_is_bounded_replay_safe_and_export_confined() -> None:
+    wire = WIRE_HPP.read_text()
+    remote = REMOTE_VFS_CPP.read_text()
+    server = DEV_SERVER_CPP.read_text()
+    wki = WKI_CPP.read_text()
+    core = VFS_CORE_CPP.read_text()
+
+    require_tokens(
+        wire,
+        [
+            "WKI_CAP_VFS_XATTR = 0x0040",
+            "OP_VFS_XATTR = 0x0417",
+            "struct VfsXattrPhaseHeader",
+            "uint64_t session_id",
+            "uint64_t operation_id",
+            "WKI_VFS_XATTR_NAME_MAX = 255",
+            "WKI_VFS_XATTR_DATA_MAX = 65536",
+            "BEGIN = 1",
+            "DATA = 2",
+            "COMMIT = 3",
+            "ABORT = 4",
+        ],
+        "remote xattr additive wire contract",
+    )
+    require_tokens(
+        wki,
+        [
+            "req->op_id == OP_VFS_XATTR",
+            "g_wki.capabilities = WKI_CAP_RESOURCE_INCARNATION",
+            "WKI_CAP_VFS_XATTR;",
+        ],
+        "remote xattr fixed-pool RX admission and advertisement",
+    )
+    require_tokens(
+        server,
+        [
+            "op_id == OP_VFS_XATTR",
+            "wki_peer_capability_negotiated(op->hdr.src_node, WKI_CAP_VFS_XATTR)",
+            "run_deferred_vfs_op",
+        ],
+        "remote xattr deferred-worker capability gate",
+    )
+    require_tokens(
+        remote,
+        [
+            "VFS_XATTR_SERVER_STAGE_COUNT_MAX = 128",
+            "VFS_XATTR_SERVER_STAGE_BYTES_MAX = 1024ULL * 1024ULL",
+            "std::map<VfsXattrStageKey, VfsXattrServerStage*>",
+            "retain_vfs_xattr_stage(stage)",
+            "VfsXattrStageRefGuard const STAGE_GUARD",
+            "vfs_setxattr_beneath(stage.export_root.data(), stage.path.data()",
+            "vfs_getxattr_beneath(stage.export_root.data(), stage.path.data()",
+            "vfs_listxattr_beneath(stage.export_root.data(), stage.path.data()",
+            "vfs_removexattr_beneath(stage.export_root.data(), stage.path.data()",
+            "remote_xattr_name_allowed",
+            'USER_PREFIX = "user."',
+            "vfs_xattr_data_is_exact_replay",
+            "incoming.operation_id <= old.identity.operation_id",
+            "old.identity.session_id != incoming.session_id",
+            "begin.flags == 0 || begin.flags == 1 || begin.flags == 2",
+            "release_vfs_xattr_stage_data(*stage)",
+            "chunk.chunk_len == 0",
+            "chunk.chunk_len > WKI_VFS_XATTR_MAX_DATA_CHUNK",
+            "static_cast<uint64_t>(measured) > stage->staged_bytes",
+            "g_vfs_xattr_stages.size() < VFS_XATTR_SERVER_STAGE_COUNT_MAX",
+            "invalidate_readlink_cache_group(state)",
+            "vfs_cache_notify_path_changed(state->local_mount_path.data(), nullptr)",
+            "vfs_cache_notify_file_changed",
+        ],
+        "remote xattr bounded staging, exact replay, namespace restriction, confinement, and invalidation",
+    )
+    stage = block_body_after(remote, "struct VfsXattrServerStage")
+    require_tokens(
+        stage,
+        ["ker::vfs::vfs_put_file(file);"],
+        "remote xattr stages release only their retained File reference",
+    )
+    if "vfs_close_file(file)" in stage:
+        fail("remote xattr stage teardown must not destroy a File still owned by the remote-fd table")
+    client = function_body(remote, "remote_vfs_xattr_on_proxy")
+    require_order(
+        client,
+        [
+            "wki_peer_capability_negotiated(state->owner_node, WKI_CAP_VFS_XATTR)",
+            "state->xattr_transfer_lock.lock()",
+            "operation_id = ++state->xattr_next_operation_id",
+            "vfs_proxy_send_and_wait(state, OP_VFS_XATTR",
+        ],
+        "remote xattr rejects unsupported peers before identity allocation and transmission",
+    )
+    require_tokens(
+        client,
+        [
+            "vfs_xattr_transfer_total(READ_OPERATION, size, TOTAL)",
+            "offset < TRANSFER_TOTAL",
+            "normalize_proxy_status_for_errno(status)",
+        ],
+        "remote xattr size probes avoid DATA and transport failures expose only POSIX errno",
+    )
+    require_tokens(
+        core,
+        [
+            "mount->fs_type == FSType::REMOTE && policy == nullptr",
+            "wki_remote_vfs_setxattr(mount->private_data",
+            "wki_remote_vfs_getxattr(mount->private_data",
+            "wki_remote_vfs_listxattr(mount->private_data",
+            "wki_remote_vfs_removexattr(mount->private_data",
+            "wki_remote_vfs_fsetxattr(file",
+            "wki_remote_vfs_fgetxattr(file",
+            "wki_remote_vfs_flistxattr(file",
+            "wki_remote_vfs_fremovexattr(file",
+        ],
+        "VFS core remote xattr path and retained File dispatch",
+    )
+
+
 def main() -> None:
     test_vfs_host_alias_rewrite_is_overlap_safe()
     test_vfs_route_scratch_is_initialized_by_its_producer()
@@ -4242,6 +4371,7 @@ def main() -> None:
     test_invalidate_notify_retains_and_invalidates_complete_mount_group()
     test_export_rebuild_is_revisioned_and_backing_mount_exact()
     test_remote_vfs_mount_lanes_preserve_channel_and_lifetime_affinity()
+    test_remote_xattr_is_bounded_replay_safe_and_export_confined()
     print("WKI remote VFS source invariants hold")
 
 

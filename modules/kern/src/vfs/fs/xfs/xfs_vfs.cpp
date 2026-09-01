@@ -25,6 +25,7 @@
 #include <vfs/file.hpp>
 #include <vfs/file_operations.hpp>
 #include <vfs/fs/xfs/xfs_alloc.hpp>
+#include <vfs/fs/xfs/xfs_attr.hpp>
 #include <vfs/fs/xfs/xfs_bmap.hpp>
 #include <vfs/fs/xfs/xfs_dir2.hpp>
 #include <vfs/fs/xfs/xfs_format.hpp>
@@ -5043,6 +5044,404 @@ auto xfs_fstat(File* f, ker::vfs::Stat* statbuf) -> int {
     fill_stat(xfd->inode, statbuf);
     return 0;
 }
+
+namespace {
+
+constexpr size_t PUBLIC_XATTR_NAME_MAX = 255;
+constexpr size_t PUBLIC_XATTR_SIZE_MAX = 65536;
+constexpr int PUBLIC_XATTR_CREATE = 1;
+constexpr int PUBLIC_XATTR_REPLACE = 2;
+constexpr int XATTR_MISSING = -61;  // ENODATA / ENOATTR
+
+enum class PublicXattrNamespace : uint8_t { USER, TRUSTED, SECURITY };
+
+struct PublicXattrName {
+    const uint8_t* suffix{};
+    uint16_t suffix_len{};
+    uint8_t disk_flags{};
+    PublicXattrNamespace name_space{};
+};
+
+auto parse_public_xattr_name(const char* name, PublicXattrName* out) -> int {
+    if (name == nullptr || out == nullptr) {
+        return -EINVAL;
+    }
+    size_t const NAME_LEN = std::strlen(name);
+    if (NAME_LEN == 0 || NAME_LEN > PUBLIC_XATTR_NAME_MAX) {
+        return -ERANGE;
+    }
+
+    struct NamespacePrefix {
+        const char* text;
+        size_t length;
+        uint8_t disk_flags;
+        PublicXattrNamespace name_space;
+    };
+    constexpr std::array<NamespacePrefix, 3> PREFIXES{{
+        {.text = "user.", .length = 5, .disk_flags = 0, .name_space = PublicXattrNamespace::USER},
+        {.text = "trusted.", .length = 8, .disk_flags = XFS_ATTR_ROOT, .name_space = PublicXattrNamespace::TRUSTED},
+        {.text = "security.", .length = 9, .disk_flags = XFS_ATTR_SECURE, .name_space = PublicXattrNamespace::SECURITY},
+    }};
+    for (auto const& prefix : PREFIXES) {
+        if (NAME_LEN <= prefix.length || std::memcmp(name, prefix.text, prefix.length) != 0) {
+            continue;
+        }
+        size_t const SUFFIX_LEN = NAME_LEN - prefix.length;
+        if (SUFFIX_LEN > UINT8_MAX) {
+            return -ERANGE;
+        }
+        *out = {.suffix = reinterpret_cast<const uint8_t*>(name + prefix.length),
+                .suffix_len = static_cast<uint16_t>(SUFFIX_LEN),
+                .disk_flags = prefix.disk_flags,
+                .name_space = prefix.name_space};
+        return 0;
+    }
+    return -EOPNOTSUPP;
+}
+
+auto check_public_xattr_permission(const XfsInode* ip, PublicXattrNamespace name_space, bool write) -> int {
+    if (ip == nullptr) {
+        return -EINVAL;
+    }
+    auto* task = ker::mod::sched::can_query_current_task() ? ker::mod::sched::get_current_task() : nullptr;
+    if (task == nullptr) {
+        // Backend work such as deferred WKI requests and boot selftests runs
+        // outside a userspace task.  Those trusted kernel callers have no
+        // credentials to check; syscall callers always retain their task and
+        // therefore still take the normal UID/GID permission path below.
+        return 0;
+    }
+    if (name_space != PublicXattrNamespace::USER) {
+        return task->euid == 0 ? 0 : -EPERM;
+    }
+    constexpr uint16_t XFS_IFMT = 0xF000;
+    constexpr uint16_t XFS_IFLNK = 0xA000;
+    if (write && (ip->mode & XFS_IFMT) == XFS_IFLNK) {
+        return -EPERM;
+    }
+    return ker::vfs::vfs_check_permission(ip->mode, ip->uid, ip->gid, write ? 2 : 4);
+}
+
+auto lookup_xattr_path_inode(const char* fs_path, XfsMountContext* ctx, size_t known_fs_path_len) -> XfsInode* {
+    XfsInode* ip = nullptr;
+    int const LOOKUP_RET = xfs_lookup_with_cached_parent(fs_path, ctx, &ip, known_fs_path_len);
+    if (LOOKUP_RET == -EAGAIN || LOOKUP_RET == -EINVAL) {
+        ip = walk_path(ctx, fs_path);
+    }
+    return ip;
+}
+
+auto set_public_xattr_locked(XfsMountContext* ctx, XfsInode* ip, const PublicXattrName& parsed, const void* value, size_t size, int flags)
+    -> int {
+    if (ctx == nullptr || ip == nullptr || (size != 0 && value == nullptr)) {
+        return -EINVAL;
+    }
+    if (size > PUBLIC_XATTR_SIZE_MAX) {
+        return -E2BIG;
+    }
+    if ((flags & ~(PUBLIC_XATTR_CREATE | PUBLIC_XATTR_REPLACE)) != 0 ||
+        (flags & (PUBLIC_XATTR_CREATE | PUBLIC_XATTR_REPLACE)) == (PUBLIC_XATTR_CREATE | PUBLIC_XATTR_REPLACE)) {
+        return -EINVAL;
+    }
+    if (int const PERM_RET = check_public_xattr_permission(ip, parsed.name_space, true); PERM_RET < 0) {
+        return PERM_RET;
+    }
+
+    int const EXISTING = xfs_attr_get(ip, parsed.suffix, parsed.suffix_len, parsed.disk_flags, nullptr, 0);
+    if ((flags & PUBLIC_XATTR_CREATE) != 0 && EXISTING >= 0) {
+        return -EEXIST;
+    }
+    if ((flags & PUBLIC_XATTR_REPLACE) != 0 && EXISTING == XATTR_MISSING) {
+        return XATTR_MISSING;
+    }
+    if (EXISTING < 0 && EXISTING != XATTR_MISSING) {
+        return EXISTING;
+    }
+
+    auto* tp = xfs_trans_alloc(ctx);
+    if (tp == nullptr) {
+        return -ENOMEM;
+    }
+    int const RET = xfs_attr_set(ip, tp, parsed.suffix, parsed.suffix_len, static_cast<const uint8_t*>(value), static_cast<uint32_t>(size),
+                                 parsed.disk_flags);
+    if (RET < 0) {
+        xfs_trans_cancel(tp);
+        return RET;
+    }
+    ip->ctime = xfs_current_timestamp(ip);
+    ip->dirty = true;
+    xfs_trans_log_inode(tp, ip);
+    return xfs_trans_commit(tp) == 0 ? 0 : -EIO;
+}
+
+auto get_public_xattr_locked(XfsInode* ip, const PublicXattrName& parsed, void* value, size_t size) -> ssize_t {
+    if (ip == nullptr || size > PUBLIC_XATTR_SIZE_MAX || (size != 0 && value == nullptr)) {
+        return -EINVAL;
+    }
+    if (int const PERM_RET = check_public_xattr_permission(ip, parsed.name_space, false); PERM_RET < 0) {
+        return PERM_RET;
+    }
+    return xfs_attr_get(ip, parsed.suffix, parsed.suffix_len, parsed.disk_flags, value, static_cast<uint32_t>(size));
+}
+
+struct PublicXattrListContext {
+    char* list{};
+    size_t capacity{};
+    size_t used{};
+    bool privileged{};
+};
+
+auto append_public_xattr_name(const XfsAttrEntry* entry, void* private_data) -> int {
+    if (entry == nullptr || private_data == nullptr || entry->name == nullptr || entry->namelen == 0 ||
+        std::memchr(entry->name, '\0', entry->namelen) != nullptr || (entry->flags & (XFS_ATTR_PARENT | XFS_ATTR_INCOMPLETE)) != 0) {
+        return 0;
+    }
+    auto* context = static_cast<PublicXattrListContext*>(private_data);
+    uint8_t const NAMESPACE = entry->flags & XFS_ATTR_NSP_ONDISK_MASK;
+    const char* prefix = nullptr;
+    size_t prefix_len = 0;
+    if (NAMESPACE == 0) {
+        prefix = "user.";
+        prefix_len = 5;
+    } else if (NAMESPACE == XFS_ATTR_ROOT && context->privileged) {
+        prefix = "trusted.";
+        prefix_len = 8;
+    } else if (NAMESPACE == XFS_ATTR_SECURE && context->privileged) {
+        prefix = "security.";
+        prefix_len = 9;
+    } else {
+        return 0;
+    }
+
+    size_t const ENTRY_SIZE = prefix_len + entry->namelen + 1;
+    if (ENTRY_SIZE > PUBLIC_XATTR_SIZE_MAX - context->used) {
+        return -E2BIG;
+    }
+    if (context->list != nullptr) {
+        if (ENTRY_SIZE > context->capacity - context->used) {
+            return -ERANGE;
+        }
+        char* destination = context->list + context->used;
+        std::memcpy(destination, prefix, prefix_len);
+        std::memcpy(destination + prefix_len, entry->name, entry->namelen);
+        destination[prefix_len + entry->namelen] = '\0';
+    }
+    context->used += ENTRY_SIZE;
+    return 0;
+}
+
+auto list_public_xattrs_locked(XfsInode* ip, char* list, size_t size) -> ssize_t {
+    if (ip == nullptr || size > PUBLIC_XATTR_SIZE_MAX || (size != 0 && list == nullptr)) {
+        return -EINVAL;
+    }
+    if (int const PERM_RET = ker::vfs::vfs_check_permission(ip->mode, ip->uid, ip->gid, 4); PERM_RET < 0) {
+        return PERM_RET;
+    }
+    auto* task = ker::mod::sched::get_current_task();
+    if (task == nullptr) {
+        return -ESRCH;
+    }
+    PublicXattrListContext context{.list = list, .capacity = size, .used = 0, .privileged = task->euid == 0};
+    int const RET = xfs_attr_list(ip, append_public_xattr_name, &context);
+    return RET < 0 ? RET : static_cast<ssize_t>(context.used);
+}
+
+auto remove_public_xattr_locked(XfsMountContext* ctx, XfsInode* ip, const PublicXattrName& parsed) -> int {
+    if (ctx == nullptr || ip == nullptr) {
+        return -EINVAL;
+    }
+    if (int const PERM_RET = check_public_xattr_permission(ip, parsed.name_space, true); PERM_RET < 0) {
+        return PERM_RET;
+    }
+    auto* tp = xfs_trans_alloc(ctx);
+    if (tp == nullptr) {
+        return -ENOMEM;
+    }
+    int const RET = xfs_attr_remove(ip, tp, parsed.suffix, parsed.suffix_len, parsed.disk_flags);
+    if (RET < 0) {
+        xfs_trans_cancel(tp);
+        return RET;
+    }
+    ip->ctime = xfs_current_timestamp(ip);
+    ip->dirty = true;
+    xfs_trans_log_inode(tp, ip);
+    return xfs_trans_commit(tp) == 0 ? 0 : -EIO;
+}
+
+}  // namespace
+
+auto xfs_setxattr_path(const char* fs_path, const char* name, const void* value, size_t size, int flags, XfsMountContext* ctx,
+                       size_t known_fs_path_len) -> int {
+    if (fs_path == nullptr || ctx == nullptr) {
+        return -EINVAL;
+    }
+    if (ctx->read_only) {
+        return -EROFS;
+    }
+    PublicXattrName parsed{};
+    if (int const RET = parse_public_xattr_name(name, &parsed); RET < 0) {
+        return RET;
+    }
+    XfsMetadataGuard metadata_guard(ctx, true, WOS_PERF_CALLSITE());
+    XfsInode* ip = lookup_xattr_path_inode(fs_path, ctx, known_fs_path_len);
+    if (ip == nullptr) {
+        return -ENOENT;
+    }
+    int const RET = set_public_xattr_locked(ctx, ip, parsed, value, size, flags);
+    xfs_inode_release(ip);
+    return RET;
+}
+
+auto xfs_fsetxattr(File* f, const char* name, const void* value, size_t size, int flags) -> int {
+    auto* xfd = f != nullptr ? static_cast<XfsFileData*>(f->private_data) : nullptr;
+    if (xfd == nullptr || xfd->inode == nullptr || xfd->mount == nullptr) {
+        return -EBADF;
+    }
+    if (xfd->mount->read_only) {
+        return -EROFS;
+    }
+    PublicXattrName parsed{};
+    if (int const RET = parse_public_xattr_name(name, &parsed); RET < 0) {
+        return RET;
+    }
+    XfsMetadataGuard metadata_guard(xfd->mount, true, WOS_PERF_CALLSITE());
+    return set_public_xattr_locked(xfd->mount, xfd->inode, parsed, value, size, flags);
+}
+
+auto xfs_getxattr_path(const char* fs_path, const char* name, void* value, size_t size, XfsMountContext* ctx, size_t known_fs_path_len)
+    -> ssize_t {
+    if (fs_path == nullptr || ctx == nullptr) {
+        return -EINVAL;
+    }
+    PublicXattrName parsed{};
+    if (int const RET = parse_public_xattr_name(name, &parsed); RET < 0) {
+        return RET;
+    }
+    XfsMetadataGuard metadata_guard(ctx, true, WOS_PERF_CALLSITE());
+    XfsInode* ip = lookup_xattr_path_inode(fs_path, ctx, known_fs_path_len);
+    if (ip == nullptr) {
+        return -ENOENT;
+    }
+    ssize_t const RET = get_public_xattr_locked(ip, parsed, value, size);
+    xfs_inode_release(ip);
+    return RET;
+}
+
+auto xfs_fgetxattr(File* f, const char* name, void* value, size_t size) -> ssize_t {
+    auto* xfd = f != nullptr ? static_cast<XfsFileData*>(f->private_data) : nullptr;
+    if (xfd == nullptr || xfd->inode == nullptr || xfd->mount == nullptr) {
+        return -EBADF;
+    }
+    PublicXattrName parsed{};
+    if (int const RET = parse_public_xattr_name(name, &parsed); RET < 0) {
+        return RET;
+    }
+    XfsMetadataGuard metadata_guard(xfd->mount, true, WOS_PERF_CALLSITE());
+    return get_public_xattr_locked(xfd->inode, parsed, value, size);
+}
+
+auto xfs_listxattr_path(const char* fs_path, char* list, size_t size, XfsMountContext* ctx, size_t known_fs_path_len) -> ssize_t {
+    if (fs_path == nullptr || ctx == nullptr) {
+        return -EINVAL;
+    }
+    XfsMetadataGuard metadata_guard(ctx, true, WOS_PERF_CALLSITE());
+    XfsInode* ip = lookup_xattr_path_inode(fs_path, ctx, known_fs_path_len);
+    if (ip == nullptr) {
+        return -ENOENT;
+    }
+    ssize_t const RET = list_public_xattrs_locked(ip, list, size);
+    xfs_inode_release(ip);
+    return RET;
+}
+
+auto xfs_flistxattr(File* f, char* list, size_t size) -> ssize_t {
+    auto* xfd = f != nullptr ? static_cast<XfsFileData*>(f->private_data) : nullptr;
+    if (xfd == nullptr || xfd->inode == nullptr || xfd->mount == nullptr) {
+        return -EBADF;
+    }
+    XfsMetadataGuard metadata_guard(xfd->mount, true, WOS_PERF_CALLSITE());
+    return list_public_xattrs_locked(xfd->inode, list, size);
+}
+
+auto xfs_removexattr_path(const char* fs_path, const char* name, XfsMountContext* ctx, size_t known_fs_path_len) -> int {
+    if (fs_path == nullptr || ctx == nullptr) {
+        return -EINVAL;
+    }
+    if (ctx->read_only) {
+        return -EROFS;
+    }
+    PublicXattrName parsed{};
+    if (int const RET = parse_public_xattr_name(name, &parsed); RET < 0) {
+        return RET;
+    }
+    XfsMetadataGuard metadata_guard(ctx, true, WOS_PERF_CALLSITE());
+    XfsInode* ip = lookup_xattr_path_inode(fs_path, ctx, known_fs_path_len);
+    if (ip == nullptr) {
+        return -ENOENT;
+    }
+    int const RET = remove_public_xattr_locked(ctx, ip, parsed);
+    xfs_inode_release(ip);
+    return RET;
+}
+
+auto xfs_fremovexattr(File* f, const char* name) -> int {
+    auto* xfd = f != nullptr ? static_cast<XfsFileData*>(f->private_data) : nullptr;
+    if (xfd == nullptr || xfd->inode == nullptr || xfd->mount == nullptr) {
+        return -EBADF;
+    }
+    if (xfd->mount->read_only) {
+        return -EROFS;
+    }
+    PublicXattrName parsed{};
+    if (int const RET = parse_public_xattr_name(name, &parsed); RET < 0) {
+        return RET;
+    }
+    XfsMetadataGuard metadata_guard(xfd->mount, true, WOS_PERF_CALLSITE());
+    return remove_public_xattr_locked(xfd->mount, xfd->inode, parsed);
+}
+
+#ifdef WOS_SELFTEST
+auto xfs_selftest_attr_fork_format(const char* fs_path, XfsMountContext* ctx, uint8_t* format, uint16_t* extent_count) -> bool {
+    if (fs_path == nullptr || ctx == nullptr || format == nullptr || extent_count == nullptr) {
+        return false;
+    }
+    XfsMetadataGuard metadata_guard(ctx, true, WOS_PERF_CALLSITE());
+    XfsInode* ip = lookup_xattr_path_inode(fs_path, ctx, UNKNOWN_XFS_PATH_LEN);
+    if (ip == nullptr) {
+        return false;
+    }
+    *format = ip->has_attr_fork ? ip->attr_fork.format : XFS_DINODE_FMT_DEV;
+    *extent_count = ip->anextents;
+    xfs_inode_release(ip);
+    return true;
+}
+
+auto xfs_selftest_cancel_setxattr_path(const char* fs_path, const char* name, const void* value, size_t size, XfsMountContext* ctx) -> int {
+    if (fs_path == nullptr || ctx == nullptr || (size != 0 && value == nullptr) || size > PUBLIC_XATTR_SIZE_MAX) {
+        return -EINVAL;
+    }
+    PublicXattrName parsed{};
+    int rc = parse_public_xattr_name(name, &parsed);
+    if (rc != 0) {
+        return rc;
+    }
+    XfsMetadataGuard metadata_guard(ctx, true, WOS_PERF_CALLSITE());
+    XfsInode* ip = lookup_xattr_path_inode(fs_path, ctx, UNKNOWN_XFS_PATH_LEN);
+    if (ip == nullptr) {
+        return -ENOENT;
+    }
+    XfsTransaction* tp = xfs_trans_alloc(ctx);
+    if (tp == nullptr) {
+        xfs_inode_release(ip);
+        return -ENOMEM;
+    }
+    rc = xfs_attr_set(ip, tp, parsed.suffix, parsed.suffix_len, static_cast<const uint8_t*>(value), static_cast<uint32_t>(size),
+                      parsed.disk_flags);
+    xfs_trans_cancel(tp);
+    xfs_inode_release(ip);
+    return rc;
+}
+#endif
 
 auto xfs_snapshot_file_stat(File* f, ker::vfs::Stat* statbuf) -> int {
     if (f == nullptr || statbuf == nullptr) {
