@@ -776,8 +776,9 @@ def test_ipc_dev_ops_are_reserved_before_reliable_ack() -> None:
         "IPC_DEV_OP_ADMISSION == WkiIpcDevOpRxAdmission::RETRY",
         "IPC direct admission result",
     )
+    direct_admission = rx[rx.index("WkiIpcDevOpRxAdmission const IPC_DEV_OP_ADMISSION") :]
     require_order(
-        rx,
+        direct_admission,
         "IPC_DEV_OP_ADMISSION == WkiIpcDevOpRxAdmission::RETRY",
         "ch->rx_seq++",
         "IPC RETRY must precede reliable sequence publication",

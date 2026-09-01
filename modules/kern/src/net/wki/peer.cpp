@@ -27,6 +27,7 @@
 #include <net/wki/routing.hpp>
 #include <net/wki/timer_math.hpp>
 #include <net/wki/transport_eth.hpp>
+#include <net/wki/transport_ivshmem.hpp>
 #include <net/wki/transport_roce.hpp>
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
@@ -37,6 +38,7 @@
 #include <platform/smt/smt.hpp>
 #include <vfs/fs/devfs.hpp>
 
+#include "net/wki/auth.hpp"
 #include "platform/mm/phys.hpp"
 #include "platform/sched/task.hpp"
 #include "platform/sys/spinlock.hpp"
@@ -549,6 +551,8 @@ void wki_peer_send_hello_broadcast() {
     hello.rdma_zone_bitmap = g_wki.rdma_zone_bitmap;
     // V2: include local hostname
     hello.hostname = g_wki.local_hostname;
+    hello.auth_suite = WKI_AUTH_SUITE_HMAC_SHA256_HKDF_SHA256;
+    hello.auth_nonce = g_wki.local_auth_nonce;
     hello_set_boot_epoch(&hello, g_wki.local_boot_epoch);
 
     wki_send_raw(WKI_NODE_BROADCAST, MsgType::HELLO, &hello, sizeof(hello), WKI_FLAG_PRIORITY);
@@ -566,14 +570,17 @@ void wki_peer_send_hello(WkiTransport* transport, uint16_t dst_node) {
     hello.rdma_zone_bitmap = g_wki.rdma_zone_bitmap;
     // V2: include local hostname
     hello.hostname = g_wki.local_hostname;
+    hello.auth_suite = WKI_AUTH_SUITE_HMAC_SHA256_HKDF_SHA256;
+    hello.auth_key_id = wki_auth_peer_key_id(dst_node);
+    hello.auth_nonce = g_wki.local_auth_nonce;
     hello_set_boot_epoch(&hello, g_wki.local_boot_epoch);
+    static_cast<void>(wki_eth_transport_source_mac(transport, hello.mac_addr));
     if (WkiPeer* peer = wki_peer_find(dst_node); peer != nullptr) {
         hello_set_channel_epoch(&hello, peer->local_channel_epoch);
     }
 
     // Build frame manually to use specific transport
-    uint16_t const FRAME_LEN = WKI_HEADER_SIZE + sizeof(HelloPayload);
-    std::array<uint8_t, WKI_HEADER_SIZE + sizeof(HelloPayload)> frame{};
+    std::array<uint8_t, WKI_HEADER_SIZE + sizeof(HelloPayload) + WKI_AUTH_TRAILER_SIZE> frame{};
 
     auto* hdr = reinterpret_cast<WkiHeader*>(frame.data());
     hdr->version_flags = wki_version_flags(WKI_VERSION, WKI_FLAG_PRIORITY);
@@ -593,7 +600,10 @@ void wki_peer_send_hello(WkiTransport* transport, uint16_t dst_node) {
 
     memcpy(frame.data() + WKI_HEADER_SIZE, &hello, sizeof(hello));
 
-    static_cast<void>(wki_transport_send(transport, dst_node, frame.data(), FRAME_LEN));
+    size_t const FRAME_LEN = wki_auth_append_frame(hdr, frame.data(), frame.size());
+    if (FRAME_LEN != 0 && FRAME_LEN <= UINT16_MAX) {
+        static_cast<void>(wki_transport_send(transport, dst_node, frame.data(), static_cast<uint16_t>(FRAME_LEN)));
+    }
 }
 
 void wki_peer_send_routed_hello(uint16_t dst_node) {
@@ -611,6 +621,9 @@ void wki_peer_send_routed_hello(uint16_t dst_node) {
     hello.max_channels = g_wki.max_channels;
     hello.rdma_zone_bitmap = g_wki.rdma_zone_bitmap;
     hello.hostname = g_wki.local_hostname;
+    hello.auth_suite = WKI_AUTH_SUITE_HMAC_SHA256_HKDF_SHA256;
+    hello.auth_key_id = wki_auth_peer_key_id(dst_node);
+    hello.auth_nonce = g_wki.local_auth_nonce;
     hello_set_boot_epoch(&hello, g_wki.local_boot_epoch);
     if (WkiPeer* peer = wki_peer_find(dst_node); peer != nullptr) {
         hello_set_channel_epoch(&hello, peer->local_channel_epoch);
@@ -631,13 +644,46 @@ void wki_peer_send_hello_ack(WkiPeer* peer) {
     ack.rdma_zone_bitmap = g_wki.rdma_zone_bitmap;
     // V2: include local hostname
     ack.hostname = g_wki.local_hostname;
+    ack.auth_suite = WKI_AUTH_SUITE_HMAC_SHA256_HKDF_SHA256;
+    ack.auth_key_id = wki_auth_peer_key_id(peer->node_id);
+    ack.auth_nonce = g_wki.local_auth_nonce;
+    ack.auth_echo_nonce = peer->remote_auth_nonce;
+    ack.auth_echo_channel_epoch = peer->remote_channel_epoch;
     hello_set_boot_epoch(&ack, g_wki.local_boot_epoch);
     hello_set_channel_epoch(&ack, peer->local_channel_epoch);
+    if (peer->is_direct) {
+        static_cast<void>(wki_eth_transport_source_mac(peer->transport, ack.mac_addr));
+    }
 
     wki_send_raw(peer->node_id, MsgType::HELLO_ACK, &ack, sizeof(ack), WKI_FLAG_PRIORITY);
 }
 
-void wki_peer_note_rx_contact(WkiTransport* transport, uint16_t peer_node, const proto::MacAddress& mac) {
+void wki_peer_send_hello_confirm(WkiPeer* peer) {
+    if (peer == nullptr || !peer->auth_session.active) {
+        return;
+    }
+    HelloPayload confirm{};
+    confirm.magic = WKI_HELLO_MAGIC;
+    confirm.protocol_version = WKI_VERSION;
+    confirm.node_id = g_wki.my_node_id;
+    confirm.mac_addr = g_wki.my_mac;
+    confirm.capabilities = g_wki.capabilities;
+    confirm.heartbeat_interval_ms = WKI_DEFAULT_HEARTBEAT_INTERVAL_MS;
+    confirm.max_channels = g_wki.max_channels;
+    confirm.rdma_zone_bitmap = g_wki.rdma_zone_bitmap;
+    confirm.hostname = g_wki.local_hostname;
+    confirm.auth_suite = WKI_AUTH_SUITE_HMAC_SHA256_HKDF_SHA256;
+    confirm.auth_key_id = wki_auth_peer_key_id(peer->node_id);
+    confirm.auth_nonce = g_wki.local_auth_nonce;
+    hello_set_boot_epoch(&confirm, g_wki.local_boot_epoch);
+    hello_set_channel_epoch(&confirm, peer->local_channel_epoch);
+    if (peer->is_direct) {
+        static_cast<void>(wki_eth_transport_source_mac(peer->transport, confirm.mac_addr));
+    }
+    static_cast<void>(wki_send_raw(peer->node_id, MsgType::HELLO_CONFIRM, &confirm, sizeof(confirm), WKI_FLAG_PRIORITY));
+}
+
+void wki_peer_note_rx_contact(WkiTransport* transport, uint16_t peer_node, const proto::MacAddress& mac, bool ethernet_neighbor) {
     if (transport == nullptr || peer_node == WKI_NODE_INVALID || peer_node == WKI_NODE_BROADCAST || peer_node == g_wki.my_node_id) {
         return;
     }
@@ -659,9 +705,7 @@ void wki_peer_note_rx_contact(WkiTransport* transport, uint16_t peer_node, const
     if (peer->transport == nullptr || transport->rdma_capable || !peer->transport->rdma_capable) {
         peer->transport = transport;
     }
-    if (peer->rdma_transport == nullptr) {
-        peer->rdma_transport = transport->rdma_capable ? transport : wki_roce_transport_get();
-    }
+    peer->rdma_transport = nullptr;
     peer->is_direct = true;
     peer->hop_count = 1;
     peer->link_cost = 1;
@@ -677,7 +721,9 @@ void wki_peer_note_rx_contact(WkiTransport* transport, uint16_t peer_node, const
 
     g_wki.peer_lock.unlock();
 
-    wki_eth_neighbor_add(peer_node, mac);
+    if (ethernet_neighbor) {
+        wki_eth_neighbor_add(peer_node, mac);
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -686,7 +732,7 @@ void wki_peer_note_rx_contact(WkiTransport* transport, uint16_t peer_node, const
 
 namespace detail {
 
-void handle_hello(WkiTransport* transport, const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len) {
+void handle_hello(WkiTransport* transport, const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len, bool session_confirmed) {
     if (payload_len < sizeof(HelloPayload)) {
         return;
     }
@@ -759,11 +805,7 @@ void handle_hello(WkiTransport* transport, const WkiHeader* hdr, const uint8_t* 
         if (peer->transport == nullptr || transport->rdma_capable || !peer->transport->rdma_capable) {
             peer->transport = transport;
         }
-        if (transport->rdma_capable) {
-            peer->rdma_transport = transport;
-        } else if (peer->rdma_transport == nullptr) {
-            peer->rdma_transport = wki_roce_transport_get();
-        }
+        peer->rdma_transport = nullptr;
         peer->last_heartbeat = NOW_US;
         peer->last_rx_activity = NOW_US;
         peer->missed_beats = 0;
@@ -792,7 +834,7 @@ void handle_hello(WkiTransport* transport, const WkiHeader* hdr, const uint8_t* 
     remote_channel_epoch = effective_remote_channel_epoch_locked(peer, WIRE_REMOTE_CHANNEL_EPOCH, REMOTE_BOOT_EPOCH);
 
     bool const WAS_FENCED = (peer->state == PeerState::FENCED);
-    if (WAS_FENCED) {
+    if (WAS_FENCED && session_confirmed) {
         peer->retired_hostname = {};
         peer->replacement_node_id.store(WKI_NODE_INVALID, std::memory_order_release);
     }
@@ -829,6 +871,7 @@ void handle_hello(WkiTransport* transport, const WkiHeader* hdr, const uint8_t* 
 
     // V2: Copy hostname from HELLO payload
     peer->hostname = hello->hostname;
+    peer->remote_auth_nonce = hello->auth_nonce;
     peer->hostname[WKI_HOSTNAME_MAX - 1] = '\0';  // ensure NUL-terminated
 
     // V2: Hostname collision detection
@@ -852,12 +895,8 @@ void handle_hello(WkiTransport* transport, const WkiHeader* hdr, const uint8_t* 
         set_fallback_hostname(peer->hostname, peer_node);
     }
 
-    // Select RDMA transport: prefer ivshmem (native doorbell), fall back to RoCE
-    if (transport->rdma_capable) {
-        peer->rdma_transport = transport;  // ivshmem - preferred
-    } else {
-        peer->rdma_transport = wki_roce_transport_get();  // RoCE over Ethernet - fallback
-    }
+    // Secure v3 does not expose unauthenticated direct-memory transports.
+    peer->rdma_transport = nullptr;
 
     // Negotiate heartbeat interval (use smaller of both proposals)
     uint16_t proposed = hello->heartbeat_interval_ms;
@@ -880,10 +919,10 @@ void handle_hello(WkiTransport* transport, const WkiHeader* hdr, const uint8_t* 
     // Track if this is a new connection (state transition to CONNECTED)
     bool newly_connected = false;
 
-    if (WAS_FENCED) {
+    if (WAS_FENCED && session_confirmed) {
         peer->state = PeerState::RECONNECTING;
         log_reconnecting = true;
-    } else if (peer->state == PeerState::UNKNOWN || peer->state == PeerState::HELLO_SENT) {
+    } else if (session_confirmed && (peer->state == PeerState::UNKNOWN || peer->state == PeerState::HELLO_SENT)) {
         peer->state = PeerState::CONNECTED;
         peer->connected_time = wki_now_us();  // Record connection time for grace period
         newly_connected = true;
@@ -950,8 +989,9 @@ void handle_hello(WkiTransport* transport, const WkiHeader* hdr, const uint8_t* 
         resync_connected_peer = !newly_connected && !WAS_FENCED;
     }
 
-    // Send HELLO_ACK
-    wki_peer_send_hello_ack(peer);
+    if (!session_confirmed) {
+        return;
+    }
 
     // If reconnecting, reconcile state and transition to CONNECTED
     if (WAS_FENCED) {
@@ -1070,18 +1110,14 @@ void handle_hello_ack(WkiTransport* transport, const WkiHeader* hdr, const uint8
 
     // V2: Copy hostname from HELLO_ACK payload
     peer->hostname = ack->hostname;
+    peer->remote_auth_nonce = ack->auth_nonce;
     peer->hostname[WKI_HOSTNAME_MAX - 1] = '\0';
     // If peer sent empty hostname, generate a fallback
     if (peer->hostname[0] == '\0') {
         set_fallback_hostname(peer->hostname, peer_node);
     }
 
-    // Select RDMA transport: prefer ivshmem, fall back to RoCE
-    if (transport->rdma_capable) {
-        peer->rdma_transport = transport;
-    } else {
-        peer->rdma_transport = wki_roce_transport_get();
-    }
+    peer->rdma_transport = nullptr;
     peer->last_heartbeat = wki_now_us();
     peer->last_rx_activity = peer->last_heartbeat;
     peer->missed_beats = 0;
@@ -1640,6 +1676,9 @@ void wki_peer_disconnect_impl(WkiPeer* peer, PeerDisconnectKind kind, bool notif
     peer->state = PeerState::FENCED;
     peer->local_channel_epoch = next_channel_epoch(peer->local_channel_epoch);
     peer->lock.unlock();
+    // Close cryptographic admission before any subsystem cleanup can observe
+    // the retired peer generation.
+    wki_auth_retire_peer_session(peer);
 
     // A WOS reboot receives a new random node ID while retaining its logical
     // hostname. Record the old name before retirement, then recognize only an
@@ -2044,6 +2083,11 @@ void drain_pending_epoch_reset_cleanups() {
 }  // namespace
 
 void wki_peer_timer_tick(uint64_t now_us) {
+    // ivshmem-plain has a shared message ring but no reliable doorbell in
+    // rootless file-backed deployments. Keep fallback work bounded and in
+    // task context; an IRQ racing this call is excluded by the transport's
+    // atomic single-drainer guard.
+    static_cast<void>(wki_ivshmem_transport_poll(64));
     if (!g_wki.initialized) {
         return;
     }

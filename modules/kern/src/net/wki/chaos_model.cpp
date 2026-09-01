@@ -127,6 +127,7 @@ auto reliable_message_type(uint8_t raw_type) -> bool {
     switch (static_cast<MsgType>(raw_type)) {
         case MsgType::HELLO:
         case MsgType::HELLO_ACK:
+        case MsgType::HELLO_CONFIRM:
         case MsgType::HEARTBEAT:
         case MsgType::HEARTBEAT_ACK:
         case MsgType::PEER_GOODBYE:

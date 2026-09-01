@@ -4,6 +4,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import struct
 import subprocess
 import sys
 import tempfile
@@ -21,6 +22,8 @@ WKI_CHAOS_CONFIGS = {
     "roce": ROOT / "configs" / "cluster_wki_chaos_roce.json",
 }
 ROUTED_WKI_CHAOS_CONFIG = ROOT / "configs" / "cluster_wki_chaos_routed.json"
+ROOTLESS_WKI_AUTH_CONFIG = ROOT / "configs" / "cluster_wki_auth_rootless.json"
+ROOTLESS_WKI_AUTH_MIXED_CONFIG = ROOT / "configs" / "cluster_wki_auth_mixed_rootless.json"
 BENCHMARK_LAYOUTS = {
     1: [(32, 32768)],
     2: [(16, 16384), (16, 16384)],
@@ -723,6 +726,86 @@ def test_routed_wki_chaos_config_resolves_overlap_and_specs(module) -> None:
         qmp_paths.add(socket_path)
 
 
+def test_rootless_wki_auth_config_has_no_host_link_dependency(module) -> None:
+    config = module.load_config(ROOTLESS_WKI_AUTH_CONFIG)
+    module.validate_cluster_config(config)
+    nodes = module.collect_unique_nodes(config)
+    assert_equal(sorted(nodes), [0, 1, 2], "rootless auth node IDs")
+    for node_id in sorted(nodes):
+        spec = module.cluster_node_spec(node_id, nodes[node_id], config)
+        if not spec["nics"]:
+            raise AssertionError(f"rootless auth node {node_id} has no WKI NIC")
+        for nic in spec["nics"]:
+            backend = nic.get("qemu_netdev")
+            if backend is None or backend.get("type") != "socket-mcast":
+                raise AssertionError(
+                    f"rootless auth node {node_id} retained a host-link NIC: {nic!r}"
+                )
+    # Socket-backed zones are intentionally ignored by the --no-setup host
+    # topology validator, so this must succeed on a machine with no WOS links.
+    module.validate_no_setup_topology(config)
+
+
+def test_rootless_wki_auth_mixed_config_validates_shared_memory(module) -> None:
+    config = module.load_config(ROOTLESS_WKI_AUTH_MIXED_CONFIG)
+    module.validate_cluster_config(config)
+    nodes = module.collect_unique_nodes(config)
+    assert_equal(sorted(nodes), [0, 1], "mixed rootless auth node IDs")
+    for node_id in sorted(nodes):
+        spec = module.cluster_node_spec(node_id, nodes[node_id], config)
+        assert_equal(len(spec["nics"]), 1, f"mixed node {node_id} Ethernet path")
+        assert_equal(len(spec["ivshmem"]), 1, f"mixed node {node_id} ivshmem path")
+        assert_equal(spec["ivshmem"][0]["role"], node_id, f"mixed node {node_id} stable ivshmem role")
+        assert_equal(spec["ivshmem"][0]["peer"], 2 - node_id, f"mixed node {node_id} direct WKI peer")
+        old_prepare = module.node_setup.prepare_node_overlays
+        old_cleanup = module.node_setup.cleanup_node_logs
+        module.node_setup.prepare_node_overlays = lambda _spec, log=print: (
+            Path("disk0-overlay"),
+            Path("disk1-overlay"),
+        )
+        module.node_setup.cleanup_node_logs = lambda _spec: None
+        try:
+            args = module.node_setup.build_qemu_args(spec, log=lambda _line: None)
+        finally:
+            module.node_setup.prepare_node_overlays = old_prepare
+            module.node_setup.cleanup_node_logs = old_cleanup
+        fw_cfg = [args[index + 1] for index, token in enumerate(args) if token == "-fw_cfg"]
+        if "name=opt/wos/wki-ivshmem,string=1" not in fw_cfg:
+            raise AssertionError(f"mixed node {node_id} did not reserve ivshmem for WKI: {fw_cfg!r}")
+        if f"name=opt/wos/wki-ivshmem-role,string={node_id}" not in fw_cfg:
+            raise AssertionError(f"mixed node {node_id} did not publish its stable ivshmem role: {fw_cfg!r}")
+        if f"name=opt/wos/wki-ivshmem-peer,string={2 - node_id}" not in fw_cfg:
+            raise AssertionError(f"mixed node {node_id} did not publish its direct WKI peer: {fw_cfg!r}")
+
+    zone = next(item for item in config["zones"] if item.get("id") != "GLOBAL")
+    with tempfile.TemporaryDirectory() as temporary:
+        temporary_config = json.loads(json.dumps(config))
+        temporary_zone = next(item for item in temporary_config["zones"] if item.get("id") != "GLOBAL")
+        temporary_zone["ivshmem"]["root_path"] = temporary
+        backing = Path(module.ivshmem_file(temporary, temporary_zone, 0, 1))
+
+        try:
+            module.validate_no_setup_topology(temporary_config)
+        except module.NoSetupTopologyError as exc:
+            if f"missing ivshmem backing file {backing}" not in str(exc):
+                raise AssertionError(f"wrong missing mixed backing diagnostic: {exc}") from exc
+        else:
+            raise AssertionError("--no-setup accepted a missing mixed ivshmem backing file")
+
+        backing.parent.mkdir(parents=True, exist_ok=True)
+        backing.write_bytes(b"\0" * (16 * 1024 * 1024))
+        module.validate_no_setup_topology(temporary_config)
+
+        backing.write_bytes(b"short")
+        try:
+            module.validate_no_setup_topology(temporary_config)
+        except module.NoSetupTopologyError as exc:
+            if "expected 16777216" not in str(exc):
+                raise AssertionError(f"wrong mixed backing size diagnostic: {exc}") from exc
+        else:
+            raise AssertionError("--no-setup accepted a truncated mixed ivshmem backing file")
+
+
 def test_socket_multicast_backend_validation_qemu_and_no_setup(module) -> None:
     config = module.load_config(ROUTED_WKI_CHAOS_CONFIG)
     nodes = module.collect_unique_nodes(config)
@@ -982,6 +1065,72 @@ def test_cluster_main_preserves_vm_exit_error_for_incident(module) -> None:
         )
 
 
+def test_wki_auth_provisioning_is_private_pairwise_and_file_backed(module) -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        nodes = {
+            node_id: {
+                "effective": {
+                    "vm": {"overlay_dir": str(root / f"node-{node_id}")},
+                },
+                "zones": [],
+            }
+            for node_id in range(3)
+        }
+        paths = module.provision_wki_auth(nodes)
+        assert_equal(sorted(paths), [0, 1, 2], "credential node set")
+
+        parsed: dict[int, dict[int, tuple[int, int, bytes]]] = {}
+        for node_id, path in paths.items():
+            if path.stat().st_mode & 0o077:
+                raise AssertionError(f"credential file is not private: {path}")
+            blob = path.read_bytes()
+            magic, version, local_node, count, reserved = struct.unpack_from(
+                "<8sHHHH", blob
+            )
+            assert_equal(magic, module.WKI_AUTH_MAGIC, "credential magic")
+            assert_equal(version, module.WKI_AUTH_VERSION, "credential version")
+            assert_equal(local_node, node_id + 1, "stable WKI node identity")
+            assert_equal(count, 2, "pairwise credential count")
+            assert_equal(reserved, 0, "credential reserved field")
+            entries = {}
+            offset = struct.calcsize("<8sHHHH")
+            for _ in range(count):
+                peer, key_id, policy, key = struct.unpack_from("<HHQ32s", blob, offset)
+                offset += struct.calcsize("<HHQ32s")
+                entries[peer - 1] = (key_id, policy, key)
+            assert_equal(offset, len(blob), "exact credential file size")
+            parsed[node_id] = entries
+
+        for left in range(3):
+            for right in range(left + 1, 3):
+                assert_equal(
+                    parsed[left][right],
+                    parsed[right][left],
+                    f"pair {left}-{right} shares one key and policy",
+                )
+        if parsed[0][1][2] == parsed[0][2][2]:
+            raise AssertionError("distinct peer pairs reused a PSK")
+
+        spec = {
+            "id": 0,
+            "hostname": "wos-0",
+            "vm": {"overlay_dir": str(root / "node-0")},
+            "nics": [],
+            "fw_cfg_files": [
+                {"name": "opt/wos/wki-auth", "path": str(paths[0])}
+            ],
+        }
+        args = module.node_setup.build_qemu_args(spec, log=lambda _line: None)
+        fw_cfg = [args[index + 1] for index, value in enumerate(args) if value == "-fw_cfg"]
+        expected = f"name=opt/wos/wki-auth,file={paths[0].resolve()}"
+        if expected not in fw_cfg:
+            raise AssertionError(f"private fw_cfg file missing: {fw_cfg!r}")
+        for _key_id, _policy, key in parsed[0].values():
+            if key.hex() in " ".join(args):
+                raise AssertionError("credential bytes leaked into QEMU argv")
+
+
 def main() -> None:
     module = load_module()
     tests = [
@@ -999,10 +1148,13 @@ def main() -> None:
         test_generic_qmp_socket_is_opt_in_and_independent_of_usb,
         test_wki_chaos_transport_configs_use_isolated_artifacts,
         test_routed_wki_chaos_config_resolves_overlap_and_specs,
+        test_rootless_wki_auth_config_has_no_host_link_dependency,
+        test_rootless_wki_auth_mixed_config_validates_shared_memory,
         test_socket_multicast_backend_validation_qemu_and_no_setup,
         test_launch_one_vm_wraps_overlay_creation_failure_without_popen,
         test_wait_for_launched_vms_reaps_and_reports_nonzero_nodes,
         test_cluster_main_preserves_vm_exit_error_for_incident,
+        test_wki_auth_provisioning_is_private_pairwise_and_file_backed,
     ]
     for test in tests:
         test(module)

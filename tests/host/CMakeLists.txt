@@ -345,6 +345,10 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/wki_ivshmem_source_test.py
 )
 add_test(
+    NAME wki_wireshark_source_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/wki_wireshark_source_test.py
+)
+add_test(
     NAME wki_dev_server_source_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/wki_dev_server_source_test.py
 )
@@ -614,6 +618,7 @@ set_tests_properties(
     wki_timer_source_test
     wki_wait_source_test
     wki_ivshmem_source_test
+    wki_wireshark_source_test
     wki_dev_server_source_test
     wki_dev_proxy_source_test
     wki_detach_retry_source_test
@@ -665,6 +670,22 @@ set_tests_properties(
 
 wos_add_unit_test(wki_wire_test
     SOURCES     ${CMAKE_CURRENT_SOURCE_DIR}/unit/wki_wire_test.cpp
+)
+
+wos_add_unit_test(wki_auth_crypto_test
+    SOURCES      ${CMAKE_CURRENT_SOURCE_DIR}/unit/wki_auth_crypto_test.cpp
+    KERN_SOURCES ${WOS_ROOT}/modules/kern/src/net/wki/auth_crypto.cpp
+)
+
+wos_add_unit_test(wki_auth_protocol_test
+    SOURCES      ${CMAKE_CURRENT_SOURCE_DIR}/unit/wki_auth_protocol_test.cpp
+    KERN_SOURCES ${WOS_ROOT}/modules/kern/src/net/wki/auth_crypto.cpp
+                 ${WOS_ROOT}/modules/kern/src/net/wki/auth_protocol.cpp
+)
+
+wos_add_unit_test(wki_auth_policy_test
+    SOURCES      ${CMAKE_CURRENT_SOURCE_DIR}/unit/wki_auth_policy_test.cpp
+    KERN_SOURCES ${WOS_ROOT}/modules/kern/src/net/wki/auth_policy.cpp
 )
 
 wos_add_unit_test(wki_block_validation_test
@@ -751,6 +772,17 @@ add_executable(wki_chaos_disabled_bench
     ${CMAKE_CURRENT_SOURCE_DIR}/unit/wki_chaos_disabled_bench.cpp
 )
 target_compile_options(wki_chaos_disabled_bench PRIVATE -O3 -Wall -Wextra)
+
+# Manual, non-gating protocol-cost benchmark. It compares the previous
+# software CRC framing work with the authenticated v3 frame tag and reports
+# medians without asserting timing on shared CI hosts.
+add_executable(wki_auth_bench
+    ${CMAKE_CURRENT_SOURCE_DIR}/unit/wki_auth_bench.cpp
+    ${WOS_KERN_SRC}/net/wki/auth_crypto.cpp
+    ${WOS_KERN_SRC}/net/wki/auth_protocol.cpp
+)
+target_include_directories(wki_auth_bench PRIVATE ${WOS_TEST_INCLUDES})
+target_compile_options(wki_auth_bench PRIVATE -O3 -Wall -Wextra)
 
 wos_add_unit_test(wki_peer_liveness_test
     SOURCES     ${CMAKE_CURRENT_SOURCE_DIR}/unit/wki_peer_liveness_test.cpp

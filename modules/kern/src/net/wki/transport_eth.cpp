@@ -35,6 +35,7 @@ auto is_wki_control_reserve_frame(const void* data, uint16_t len) -> bool {
     switch (TYPE) {
         case MsgType::HELLO:
         case MsgType::HELLO_ACK:
+        case MsgType::HELLO_CONFIRM:
             return hdr->channel_id == WKI_CHAN_CONTROL && hdr->payload_len <= sizeof(HelloPayload);
         case MsgType::HEARTBEAT:
         case MsgType::HEARTBEAT_ACK:
@@ -352,6 +353,18 @@ auto eth_rx_needs_peer_contact_update(WkiTransport* transport, const WkiHeader* 
 }
 
 }  // namespace
+
+auto wki_eth_transport_source_mac(const WkiTransport* transport, proto::MacAddress& mac_out) -> bool {
+    if (transport == nullptr || transport->tx != eth_wki_tx) {
+        return false;
+    }
+    auto const* priv = static_cast<const EthTransportPrivate*>(transport->private_data);
+    if (priv == nullptr || priv->netdev == nullptr) {
+        return false;
+    }
+    mac_out = priv->netdev->mac;
+    return true;
+}
 
 void wki_eth_note_rx_contact(WkiTransport* transport, const WkiHeader* header, const proto::MacAddress& src_mac) {
     if (eth_rx_needs_peer_contact_update(transport, header, src_mac)) {

@@ -30,6 +30,7 @@ import json
 import os
 import pwd
 import queue
+import secrets
 import shlex
 import shutil
 import signal
@@ -56,6 +57,9 @@ import wosincident  # noqa: E402
 TOPOLOGY_PROBE_TIMEOUT_SECONDS = 5.0
 MAX_REPORTED_VM_FAILURES = 32
 MAX_CLUSTER_NODE_ID = 255
+WKI_AUTH_MAGIC = b"WKIAUTH\0"
+WKI_AUTH_VERSION = 1
+WKI_AUTH_ALL_POLICY = (1 << 10) - 1
 
 # ---------------------------------------------------------------------------
 # Config loading and resolution
@@ -225,10 +229,6 @@ def validate_cluster_config(config: dict) -> None:
                 vhost=bool(effective.get("vhost", False)),
                 where=f"zone {zone_name(zone)} qemu_netdev",
             )
-            if effective.get("ivshmem", {}).get("enabled", False):
-                raise ValueError(
-                    f"zone {zone_name(zone)} socket-mcast backend requires ivshmem.enabled=false"
-                )
             endpoint = (normalized_backend["address"], normalized_backend["port"])
             prior = socket_endpoints.get(endpoint)
             if prior is not None:
@@ -853,6 +853,31 @@ def inject_into_overlay(
 # ---------------------------------------------------------------------------
 
 
+def setup_ivshmem_backings(zone_cfg: dict, node_ids: list[int], effective: dict) -> None:
+    links = ivshmem_links(zone_cfg, node_ids)
+    if not links:
+        return
+
+    ivshmem_cfg = effective.get("ivshmem", {})
+    root_path = ivshmem_cfg.get("root_path", "/dev/shm")
+    size_str = ivshmem_cfg.get("size", "16M")
+    size_bytes = parse_size(size_str)
+    size_mb = size_bytes // (1024 * 1024)
+
+    for node_a, node_b in links:
+        fpath = ivshmem_file(root_path, zone_cfg, node_a, node_b)
+        # Setup mode already permits privileged topology changes. Recreate the
+        # shared file even for socket-backed NICs so a mixed configuration has
+        # the same clean-start behavior as a TAP-backed one.
+        run(
+            f"dd if=/dev/zero of={fpath} bs=1M count={size_mb} 2>/dev/null",
+            quiet=True,
+            privileged=True,
+        )
+        run(f"chmod 666 {fpath}", quiet=True, privileged=True)
+        print(f"  Created ivshmem: {fpath} ({size_str})")
+
+
 def setup(config: dict):
     validate_cluster_config(config)
     zones = [z for z in config["zones"] if z.get("id") != "GLOBAL"]
@@ -904,6 +929,7 @@ def setup(config: dict):
                 "  Rootless QEMU socket multicast: "
                 f"{backend['address']}:{backend['port']} (no bridge/TAP setup)"
             )
+            setup_ivshmem_backings(zone_cfg, node_ids, effective)
             print()
             continue
 
@@ -1006,25 +1032,7 @@ def setup(config: dict):
                 raise RuntimeError(f"TAP {tap} is not multi_queue but nic_queues={queue_count}")
 
         # Create ivshmem backing files (pre-created so both VMs share the same file)
-        links = ivshmem_links(zone_cfg, node_ids)
-        if links:
-            ivshmem_cfg = effective.get("ivshmem", {})
-            root_path = ivshmem_cfg.get("root_path", "/dev/shm")
-            size_str = ivshmem_cfg.get("size", "16M")
-            size_bytes = parse_size(size_str)
-            size_mb = size_bytes // (1024 * 1024)
-
-            for node_a, node_b in links:
-                fpath = ivshmem_file(root_path, zone_cfg, node_a, node_b)
-                # Always recreate for clean state; use sudo for dd/chmod in case
-                # a previous root-owned file exists
-                run(
-                    f"dd if=/dev/zero of={fpath} bs=1M count={size_mb} 2>/dev/null",
-                    quiet=True,
-                    privileged=True,
-                )
-                run(f"chmod 666 {fpath}", quiet=True, privileged=True)
-                print(f"  Created ivshmem: {fpath} ({size_str})")
+        setup_ivshmem_backings(zone_cfg, node_ids, effective)
 
         print()
 
@@ -1285,6 +1293,21 @@ def validate_no_setup_topology(config: dict) -> None:
         zname = zone_name(zone_cfg)
         node_ids = zone_node_ids(zone_cfg)
         effective = resolve_config(global_cfg, zone_cfg)
+        ivshmem_cfg = effective.get("ivshmem", {})
+        ivshmem_size = parse_size(ivshmem_cfg.get("size", "16M"))
+        ivshmem_root = ivshmem_cfg.get("root_path", "/dev/shm")
+        for node_a, node_b in ivshmem_links(zone_cfg, node_ids):
+            backing = Path(ivshmem_file(ivshmem_root, zone_cfg, node_a, node_b))
+            if not backing.is_file():
+                failures.append(f"missing ivshmem backing file {backing} for zone {zname}")
+                continue
+            if backing.stat().st_size != ivshmem_size:
+                failures.append(
+                    f"ivshmem backing file {backing} for zone {zname} has size "
+                    f"{backing.stat().st_size}, expected {ivshmem_size}"
+                )
+            if not os.access(backing, os.R_OK | os.W_OK):
+                failures.append(f"ivshmem backing file {backing} for zone {zname} is not readable and writable")
         if zone_uses_socket_netdev(global_cfg, zone_cfg):
             continue
         bridge = bridge_name(zone_cfg)
@@ -2264,6 +2287,11 @@ def cluster_node_spec(node_id: int, node_info: dict, config: dict) -> dict:
         "nics": [],
         "ivshmem": [],
     }
+    auth_path = eff.get("wki_auth_file")
+    if auth_path is not None:
+        spec["fw_cfg_files"] = [
+            {"name": "opt/wos/wki-auth", "path": str(auth_path)}
+        ]
 
     for zone_cfg in node_info["zones"]:
         zone_id = zone_cfg["id"]
@@ -2299,10 +2327,60 @@ def cluster_node_spec(node_id: int, node_info: dict, config: dict) -> dict:
                     {
                         "path": ivshmem_file(root_path, zone_cfg, node_a, node_b),
                         "size": size_str,
+                        "role": 0 if node_id == node_a else 1,
+                        "peer": (node_b if node_id == node_a else node_a) + 1,
                     }
                 )
 
     return node_setup.normalize_node_spec(spec)
+
+
+def provision_wki_auth(nodes: dict[int, dict]) -> dict[int, Path]:
+    """Create one private pairwise-PSK table per node for this launch.
+
+    Secrets never enter JSON, argv values, logs, or guest disks. QEMU receives
+    only a file path and reads the mode-0600 blob through fw_cfg.
+    """
+    node_ids = sorted(nodes)
+    if any(node_id < 0 or node_id > MAX_CLUSTER_NODE_ID for node_id in node_ids):
+        raise ValueError("WKI authentication node IDs must be in [0, 255]")
+
+    pair_keys: dict[tuple[int, int], bytes] = {}
+    pair_key_ids: dict[tuple[int, int], int] = {}
+    for key_id, pair in enumerate(combinations(node_ids, 2), start=1):
+        if key_id > 0xFFFF:
+            raise ValueError("too many WKI pairwise credentials")
+        pair_keys[pair] = secrets.token_bytes(32)
+        pair_key_ids[pair] = key_id
+
+    paths: dict[int, Path] = {}
+    for node_id in node_ids:
+        effective = nodes[node_id]["effective"]
+        overlay_dir = Path(effective.get("vm", {}).get("overlay_dir", "cluster-overlays"))
+        overlay_dir.mkdir(parents=True, exist_ok=True)
+        path = overlay_dir / f"wki-auth-vm{node_id}.bin"
+        entries = bytearray()
+        for peer_id in node_ids:
+            if peer_id == node_id:
+                continue
+            pair = (min(node_id, peer_id), max(node_id, peer_id))
+            peer_policy = effective.get("wki_auth", {}).get("peer_policy", {}).get(str(peer_id), WKI_AUTH_ALL_POLICY)
+            if isinstance(peer_policy, bool) or not isinstance(peer_policy, int) or peer_policy <= 0 or peer_policy > WKI_AUTH_ALL_POLICY:
+                raise ValueError(f"node {node_id} WKI policy for peer {peer_id} is invalid")
+            entries.extend(struct.pack("<HHQ32s", peer_id + 1, pair_key_ids[pair], peer_policy, pair_keys[pair]))
+        blob = struct.pack("<8sHHHH", WKI_AUTH_MAGIC, WKI_AUTH_VERSION, node_id + 1, len(node_ids) - 1, 0) + entries
+
+        temporary = path.with_suffix(".tmp")
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.write(descriptor, blob)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        os.replace(temporary, path)
+        os.chmod(path, 0o600)
+        paths[node_id] = path
+    return paths
 
 
 def build_qemu_args(
@@ -2479,6 +2557,9 @@ def launch_guarded(
         print()
 
     nodes = collect_unique_nodes(config)
+    auth_paths = provision_wki_auth(nodes)
+    for node_id, path in auth_paths.items():
+        nodes[node_id]["effective"]["wki_auth_file"] = str(path)
     pids = []
     launch_results: list[LaunchResult] = []
     pids_lock = threading.Lock()

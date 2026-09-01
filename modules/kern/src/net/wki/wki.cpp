@@ -35,6 +35,7 @@
 #include <platform/init/limine_requests.hpp>
 #include <platform/ktime/ktime.hpp>
 #include <platform/perf/perf_events.hpp>
+#include <platform/random/entropy.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
 #include <ranges>
@@ -45,6 +46,7 @@
 #include <vfs/vfs.hpp>
 
 #include "net/packet.hpp"
+#include "net/wki/auth.hpp"
 #include "platform/sys/spinlock.hpp"
 namespace ker::net::wki {
 
@@ -57,6 +59,29 @@ using log = ker::mod::dbg::logger<"wki">;
 WkiState g_wki;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
 namespace {
+
+constexpr size_t WKI_FORWARD_POOL_SIZE = 32;
+struct WkiForwardFrameSlot {
+    std::atomic<bool> claimed{false};
+    std::array<uint8_t, WKI_MAX_FRAME_SIZE> frame{};
+};
+std::array<WkiForwardFrameSlot, WKI_FORWARD_POOL_SIZE> s_forward_frame_pool;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+
+auto forward_frame_claim() -> WkiForwardFrameSlot* {
+    for (auto& slot : s_forward_frame_pool) {
+        bool expected = false;
+        if (slot.claimed.compare_exchange_strong(expected, true, std::memory_order_acquire, std::memory_order_relaxed)) {
+            return &slot;
+        }
+    }
+    return nullptr;
+}
+
+void forward_frame_release(WkiForwardFrameSlot* slot) {
+    if (slot != nullptr) {
+        slot->claimed.store(false, std::memory_order_release);
+    }
+}
 
 // Re-entrancy guard for deferred work kicked by wki_timer_tick().
 // wki_remote_vfs_mount() may spin-wait via wki_spin_yield(), which calls
@@ -707,6 +732,20 @@ void perf_record_transport_stall_locked(WkiChannel* ch, uint64_t now_us) {
 
 }  // namespace
 
+auto wki_send_authenticated_header(WkiTransport* transport, uint16_t next_hop, const WkiHeader& header) -> int {
+    if (transport == nullptr || header.payload_len != 0) {
+        return WKI_ERR_INVALID;
+    }
+    std::array<uint8_t, WKI_HEADER_SIZE + WKI_AUTH_TRAILER_SIZE> frame{};
+    std::memcpy(frame.data(), &header, sizeof(header));
+    auto* wire_header = reinterpret_cast<WkiHeader*>(frame.data());
+    size_t const LENGTH = wki_auth_append_frame(wire_header, frame.data(), frame.size());
+    if (LENGTH != frame.size()) {
+        return WKI_ERR_INVALID;
+    }
+    return wki_transport_send(transport, next_hop, frame.data(), static_cast<uint16_t>(LENGTH));
+}
+
 // -----------------------------------------------------------------------------
 // Time source
 // -----------------------------------------------------------------------------
@@ -1227,19 +1266,6 @@ void resolve_local_hostname() {
     memcpy(local_hostname_data(), cached, len + 1);
 }
 
-auto wki_nonzero_epoch_from_seed(uint64_t seed) -> uint32_t {
-    seed ^= seed >> 30U;
-    seed *= 0xbf58476d1ce4e5b9ULL;
-    seed ^= seed >> 27U;
-    seed *= 0x94d049bb133111ebULL;
-    seed ^= seed >> 31U;
-    auto epoch = static_cast<uint32_t>(seed ^ (seed >> 32U));
-    if (epoch == 0) {
-        epoch = 1;
-    }
-    return epoch;
-}
-
 }  // namespace
 
 // -----------------------------------------------------------------------------
@@ -1253,15 +1279,25 @@ void wki_init() {
 
     wki_chaos_allow_runtime_control(cmdline_has_token(ker::init::get_kernel_cmdline(), "wki.chaos"));
 
-    // Generate a random-ish node ID from lower bits of timestamp
-    // Collision handled during HELLO handshake
-    uint64_t const SEED = ker::mod::time::get_ticks();
-    auto id = static_cast<uint16_t>(SEED ^ (SEED >> 16) ^ (SEED >> 32));
-    if (id == WKI_NODE_INVALID || id == WKI_NODE_BROADCAST) {
-        id = 0x0001;
+    // Secure-only WKI uses the provisioned stable identity. A missing or
+    // malformed credential file leaves WKI unavailable rather than silently
+    // falling back to unauthenticated v2.
+    if (!wki_auth_init()) {
+        ker::mod::dbg::log("[WKI] Authentication provisioning unavailable; WKI disabled");
+        return;
     }
-    g_wki.my_node_id = id;
-    g_wki.local_boot_epoch = wki_nonzero_epoch_from_seed(SEED ^ (static_cast<uint64_t>(id) << 32U));
+
+    uint16_t const ID = wki_auth_local_node_id();
+    g_wki.my_node_id = ID;
+    uint32_t boot_epoch = 0;
+    if (!ker::mod::random::entropy::get_bytes(&boot_epoch, sizeof(boot_epoch)) ||
+        !ker::mod::random::entropy::get_bytes(g_wki.local_auth_nonce.data(), g_wki.local_auth_nonce.size())) {
+        ker::mod::dbg::log("[WKI] Entropy unavailable for authenticated session nonce; WKI disabled");
+        wki_auth_shutdown();
+        g_wki.my_node_id = WKI_NODE_INVALID;
+        return;
+    }
+    g_wki.local_boot_epoch = boot_epoch == 0 ? 1 : boot_epoch;
 
     // V2: Resolve local hostname
     resolve_local_hostname();
@@ -1286,8 +1322,9 @@ void wki_init() {
     // Init zone subsystem (shared memory zones)
     wki_zone_init();
 
-    // Init RoCE RDMA transport (L2, MAC-based GIDs)
-    wki_roce_transport_init();
+    // Direct RoCE and ivshmem RDMA bypass the authenticated WKI record path.
+    // Secure v3 therefore leaves the raw RoCE transport disabled until its own
+    // session-bound record MAC is implemented.
 
     // Init remotable subsystem (device remoting)
     wki_remotable_init();
@@ -1410,6 +1447,7 @@ void wki_shutdown() {
     }
 
     wki_chaos_allow_runtime_control(false);
+    wki_auth_shutdown();
     g_wki.initialized = false;
     ker::mod::dbg::log("[WKI] Shutdown complete");
 }
@@ -1594,6 +1632,7 @@ void channel_init(WkiChannel* ch, uint16_t peer_node, uint16_t chan_id, Priority
         ch->generation = 1;
     }
     ch->active = true;
+    ch->tx_build_in_progress = false;
     ch->tx_seq = 0;
     ch->tx_ack = 0;
     ch->rx_seq = 0;
@@ -1982,7 +2021,7 @@ auto transmit_ack_snapshot(const AckSnapshot& ack) -> int {
         return WKI_ERR_NO_ROUTE;
     }
 
-    int const RET = wki_transport_send(transport, NEXT_HOP, &ack.hdr, WKI_HEADER_SIZE);
+    int const RET = wki_send_authenticated_header(transport, NEXT_HOP, ack.hdr);
     if (RET >= 0) {
         mark_peer_tx_progress(ack.peer);
     }
@@ -2130,10 +2169,14 @@ auto wki_channel_alloc(uint16_t peer_node, PriorityClass priority, WkiChannelIde
     uint16_t next_id = WKI_MAX_CHANNELS;
     for (uint16_t i = WKI_CHAN_DYNAMIC_BASE; i < WKI_CHAN_DYNAMIC_RESERVED_BASE; i++) {
         WkiChannel const* existing = peer->channels.at(i);
-        if (existing == nullptr || !existing->active) {
+        size_t const WORD = i / 64U;
+        uint64_t const BIT = uint64_t{1} << (i % 64U);
+        if ((peer->auth_dynamic_channel_ids_used.at(WORD).load(std::memory_order_relaxed) & BIT) == 0 &&
+            (existing == nullptr || !existing->active)) {
             if (existing != nullptr && !existing->active) {
                 peer->channels.at(i) = nullptr;
             }
+            peer->auth_dynamic_channel_ids_used.at(WORD).fetch_or(BIT, std::memory_order_relaxed);
             next_id = i;
             break;
         }
@@ -2174,6 +2217,13 @@ auto wki_channel_reserve(uint16_t peer_node, uint16_t channel_id, PriorityClass 
             return nullptr;
         }
         peer->channels.at(channel_id) = nullptr;
+    }
+
+    size_t const WORD = channel_id / 64U;
+    uint64_t const BIT = uint64_t{1} << (channel_id % 64U);
+    if ((peer->auth_dynamic_channel_ids_used.at(WORD).fetch_or(BIT, std::memory_order_relaxed) & BIT) != 0) {
+        s_channel_pool_lock.unlock();
+        return nullptr;
     }
 
     WkiChannel* ch = channel_pool_alloc(peer, peer_node, channel_id, priority, WKI_CREDITS_DYNAMIC, identity_out);
@@ -2371,6 +2421,14 @@ auto wki_peer_diag_snapshot(WkiPeerDiag* out, size_t max) -> size_t {
             peer.lock.unlock();
             continue;
         }
+        peer.auth_session.replay_lock.lock();
+        bool const AUTH_ACTIVE = peer.auth_session.active;
+        uint16_t const AUTH_KEY_ID = peer.auth_session.key_id;
+        uint32_t const AUTH_GENERATION = peer.auth_session.generation;
+        uint64_t const AUTH_POLICY = peer.auth_session.policy;
+        uint64_t const AUTH_TX_COUNTER = peer.auth_session.tx_counter.load(std::memory_order_relaxed);
+        uint64_t const AUTH_RX_COUNTER_HIGH = peer.auth_session.rx_counter_high;
+        peer.auth_session.replay_lock.unlock();
         out[count++] = WkiPeerDiag{
             .node_id = peer.node_id,
             .state = peer.state,
@@ -2380,6 +2438,12 @@ auto wki_peer_diag_snapshot(WkiPeerDiag* out, size_t max) -> size_t {
             .local_channel_epoch = peer.local_channel_epoch,
             .remote_channel_epoch = peer.remote_channel_epoch,
             .remote_boot_epoch = peer.remote_boot_epoch,
+            .auth_active = AUTH_ACTIVE,
+            .auth_key_id = AUTH_KEY_ID,
+            .auth_generation = AUTH_GENERATION,
+            .auth_policy = AUTH_POLICY,
+            .auth_tx_counter = AUTH_TX_COUNTER,
+            .auth_rx_counter_high = AUTH_RX_COUNTER_HIGH,
             .replacement_node_id = peer.replacement_node_id.load(std::memory_order_acquire),
             .lifecycle_state = peer.lifecycle_state.load(std::memory_order_acquire),
             .compute_reset_cleanup_pending = peer.compute_reset_cleanup_pending.load(std::memory_order_acquire),
@@ -2485,13 +2549,13 @@ auto wki_send_raw(uint16_t dst_node, MsgType msg_type, const void* payload, uint
         return WKI_ERR_NO_ROUTE;
     }
 
-    uint16_t const FRAME_LEN = WKI_HEADER_SIZE + payload_len;
-    constexpr size_t INLINE_RAW_FRAME_SIZE = WKI_HEADER_SIZE + sizeof(HelloPayload);
+    constexpr size_t INLINE_RAW_FRAME_SIZE = WKI_HEADER_SIZE + sizeof(HelloPayload) + WKI_AUTH_TRAILER_SIZE;
     std::array<uint8_t, INLINE_RAW_FRAME_SIZE> inline_frame{};
     uint8_t* heap_frame = nullptr;
     uint8_t* frame = inline_frame.data();
-    if (FRAME_LEN > inline_frame.size()) {
-        heap_frame = new (std::nothrow) uint8_t[FRAME_LEN];
+    size_t const MAX_FRAME_LEN = WKI_HEADER_SIZE + payload_len + WKI_AUTH_TRAILER_SIZE;
+    if (MAX_FRAME_LEN > inline_frame.size()) {
+        heap_frame = new (std::nothrow) uint8_t[MAX_FRAME_LEN];
         frame = heap_frame;
     }
     if (frame == nullptr) {
@@ -2517,6 +2581,13 @@ auto wki_send_raw(uint16_t dst_node, MsgType msg_type, const void* payload, uint
     if ((payload != nullptr) && payload_len > 0) {
         memcpy(frame + WKI_HEADER_SIZE, payload, payload_len);
     }
+
+    size_t const AUTHENTICATED_LEN = wki_auth_append_frame(hdr, frame, MAX_FRAME_LEN);
+    if (AUTHENTICATED_LEN == 0 || AUTHENTICATED_LEN > UINT16_MAX) {
+        delete[] heap_frame;
+        return WKI_ERR_INVALID;
+    }
+    auto const FRAME_LEN = static_cast<uint16_t>(AUTHENTICATED_LEN);
 
     // CRC32: skip for direct single-hop peers (Ethernet FCS provides integrity)
     WkiPeer const* peer = wki_peer_find(dst_node);
@@ -2632,7 +2703,8 @@ auto wki_send_impl(uint16_t dst_node, uint16_t channel_id, MsgType msg_type, con
     // directly in pkt->data, avoiding the extra memcpy in eth_wki_tx().
     // Use pkt_alloc_tx() to preserve an RX reserve and avoid TX exhausting
     // the global pool, which can starve ACK/heartbeat receive progress.
-    uint16_t const FRAME_LEN = WKI_HEADER_SIZE + wire_payload_len;
+    uint16_t const FRAME_CAPACITY = WKI_HEADER_SIZE + wire_payload_len + WKI_AUTH_TRAILER_SIZE;
+    uint16_t frame_len = FRAME_CAPACITY;
     net::PacketBuffer* pkt = net::pkt_alloc_tx();
     if (pkt == nullptr) {
         return WKI_ERR_NO_MEM;
@@ -2652,7 +2724,8 @@ auto wki_send_impl(uint16_t dst_node, uint16_t channel_id, MsgType msg_type, con
         bool const CHANNEL_REUSED = heap_rt_prepare_attempted && ch->generation != heap_rt_channel_generation;
         bool const EXPECTED_CHANNEL_RETIRED =
             expected_channel != nullptr && (ch != expected_channel || ch->generation != expected_generation);
-        if (!ch->active || ch->peer_node_id != dst_node || ch->channel_id != channel_id || CHANNEL_REUSED || EXPECTED_CHANNEL_RETIRED) {
+        if (!ch->active || ch->peer_node_id != dst_node || ch->channel_id != channel_id || CHANNEL_REUSED || EXPECTED_CHANNEL_RETIRED ||
+            ch->tx_build_in_progress) {
             ch->lock.unlock();
             wki_retransmit_entry_release(ch, heap_rt_entry);
             net::pkt_free(pkt);
@@ -2672,7 +2745,7 @@ auto wki_send_impl(uint16_t dst_node, uint16_t channel_id, MsgType msg_type, con
             return WKI_ERR_NO_CREDITS;
         }
 
-        bool const INLINE_RETRANSMIT_AVAILABLE = wki_channel_has_inline_retransmit_storage(ch, FRAME_LEN);
+        bool const INLINE_RETRANSMIT_AVAILABLE = wki_channel_has_inline_retransmit_storage(ch, frame_len);
         if (heap_rt_entry != nullptr || INLINE_RETRANSMIT_AVAILABLE) {
             use_inline_retransmit = heap_rt_entry == nullptr && INLINE_RETRANSMIT_AVAILABLE;
             break;
@@ -2688,7 +2761,7 @@ auto wki_send_impl(uint16_t dst_node, uint16_t channel_id, MsgType msg_type, con
         heap_rt_channel_generation = ch->generation;
         ch->lock.unlock();
         heap_rt_prepare_attempted = true;
-        heap_rt_entry = wki_retransmit_entry_alloc(FRAME_LEN);
+        heap_rt_entry = wki_retransmit_entry_alloc(frame_len);
         ch->lock.lock();
     }
 
@@ -2736,7 +2809,32 @@ auto wki_send_impl(uint16_t dst_node, uint16_t channel_id, MsgType msg_type, con
 
     copy_wki_payload_segments(frame + WKI_HEADER_SIZE, payload, payload_len, payload_tail, payload_tail_len);
 
-    pkt->len = FRAME_LEN;
+    uint32_t const AUTH_CHANNEL_GENERATION = ch->generation;
+    uint32_t const AUTH_SEQUENCE = ch->tx_seq;
+    ch->tx_build_in_progress = true;
+    ch->lock.unlock();
+    size_t const AUTHENTICATED_LEN = wki_auth_append_frame(hdr, frame, FRAME_CAPACITY);
+    ch->lock.lock();
+    bool const AUTH_CHANNEL_RETIRED = !ch->active || ch->generation != AUTH_CHANNEL_GENERATION || ch->peer_node_id != dst_node ||
+                                      ch->channel_id != channel_id || ch->tx_seq != AUTH_SEQUENCE;
+    if (AUTHENTICATED_LEN == 0 || AUTHENTICATED_LEN > UINT16_MAX) {
+        if (!AUTH_CHANNEL_RETIRED) {
+            ch->tx_build_in_progress = false;
+        }
+        ch->lock.unlock();
+        wki_retransmit_entry_release(ch, heap_rt_entry);
+        net::pkt_free(pkt);
+        return WKI_ERR_INVALID;
+    }
+    if (AUTH_CHANNEL_RETIRED) {
+        ch->lock.unlock();
+        wki_retransmit_entry_release(ch, heap_rt_entry);
+        net::pkt_free(pkt);
+        return WKI_ERR_NOT_FOUND;
+    }
+    ch->tx_build_in_progress = false;
+    frame_len = static_cast<uint16_t>(AUTHENTICATED_LEN);
+    pkt->len = frame_len;
 
     // CRC32: skip for direct single-hop peers (Ethernet FCS provides integrity)
     if (peer->is_direct) {
@@ -2769,9 +2867,9 @@ auto wki_send_impl(uint16_t dst_node, uint16_t channel_id, MsgType msg_type, con
 
     bool notify_timer = false;
     if (rt_entry != nullptr) {
-        memcpy(rt_data, frame, FRAME_LEN);
+        memcpy(rt_data, frame, frame_len);
         rt_entry->data = rt_data;
-        rt_entry->len = FRAME_LEN;
+        rt_entry->len = frame_len;
         rt_entry->seq = ch->tx_seq;
         rt_entry->send_time_us = 0;
         rt_entry->retries = 0;
@@ -3179,6 +3277,59 @@ void finish_pre_admitted_reliable_msg_ordered(WkiChannel* ch, uint32_t generatio
     finish_reliable_dispatch_turn(ch, generation, SEQ);
 }
 
+void send_policy_denial(const WkiHeader& header, const uint8_t* payload, uint16_t payload_length, WkiChannel* channel,
+                        uint32_t generation) {
+    switch (static_cast<MsgType>(header.msg_type)) {
+        case MsgType::TASK_SUBMIT:
+        case MsgType::TASK_SUBMIT_FRAGMENT: {
+            uint32_t task_id = 0;
+            if (payload != nullptr && payload_length >= sizeof(task_id)) {
+                std::memcpy(&task_id, payload, sizeof(task_id));
+            }
+            TaskResponsePayload response{};
+            response.task_id = task_id;
+            response.status = static_cast<uint8_t>(TaskRejectReason::UNAUTHORIZED);
+            static_cast<void>(
+                wki_send_on_channel_generation(header.src_node, channel, generation, MsgType::TASK_REJECT, &response, sizeof(response)));
+            return;
+        }
+        case MsgType::DEV_ATTACH_REQ: {
+            DevAttachAckPayload response{};
+            response.status = static_cast<uint8_t>(DevAttachStatus::ACCESS_DENIED);
+            if (payload != nullptr && payload_length >= sizeof(DevAttachReqPayload)) {
+                auto const* request = reinterpret_cast<const DevAttachReqPayload*>(payload);
+                response.resource_id = request->resource_id;
+            }
+            static_cast<void>(
+                wki_send_on_channel_generation(header.src_node, channel, generation, MsgType::DEV_ATTACH_ACK, &response, sizeof(response)));
+            return;
+        }
+        case MsgType::DEV_OP_REQ: {
+            DevOpRespPayload response{};
+            response.status = -13;
+            response.reserved = static_cast<uint16_t>(header.seq_num);
+            if (payload != nullptr && payload_length >= sizeof(DevOpReqPayload)) {
+                response.op_id = reinterpret_cast<const DevOpReqPayload*>(payload)->op_id;
+            }
+            static_cast<void>(
+                wki_send_on_channel_generation(header.src_node, channel, generation, MsgType::DEV_OP_RESP, &response, sizeof(response)));
+            return;
+        }
+        case MsgType::ZONE_CREATE_REQ: {
+            ZoneCreateAckPayload response{};
+            response.status = static_cast<uint8_t>(ZoneCreateStatus::REJECTED_POLICY);
+            if (payload != nullptr && payload_length >= sizeof(ZoneCreateReqPayload)) {
+                response.zone_id = reinterpret_cast<const ZoneCreateReqPayload*>(payload)->zone_id;
+            }
+            static_cast<void>(wki_send_on_channel_generation(header.src_node, channel, generation, MsgType::ZONE_CREATE_ACK, &response,
+                                                             sizeof(response)));
+            return;
+        }
+        default:
+            return;
+    }
+}
+
 }  // namespace
 
 void wki_rx(WkiTransport* transport, const void* data, uint16_t len, const WkiRxMetadata* metadata) {
@@ -3187,10 +3338,6 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len, const WkiRx
     }
 
     const auto* hdr = static_cast<const WkiHeader*>(data);
-
-    if (metadata != nullptr && metadata->has_src_mac) {
-        wki_eth_note_rx_contact(transport, hdr, metadata->src_mac);
-    }
 
     // Version check
     if (wki_version(hdr->version_flags) != WKI_VERSION) {
@@ -3234,11 +3381,14 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len, const WkiRx
             return;
         }
 
-        // Make a mutable copy to decrement TTL
-        auto* fwd_frame = new (std::nothrow) uint8_t[len];
-        if (fwd_frame == nullptr) {
+        // Forwarding is RX/NAPI context: use the fixed no-grow pool and drop
+        // under pressure rather than allocating or blocking.
+        WkiForwardFrameSlot* slot = forward_frame_claim();
+        if (slot == nullptr || len > slot->frame.size()) {
+            forward_frame_release(slot);
             return;
         }
+        uint8_t* fwd_frame = slot->frame.data();
         memcpy(fwd_frame, data, len);
 
         auto* fwd_hdr = reinterpret_cast<WkiHeader*>(fwd_frame);
@@ -3248,8 +3398,81 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len, const WkiRx
         }
 
         static_cast<void>(wki_transport_send(fwd_transport, NEXT_HOP, fwd_frame, len));
-        delete[] fwd_frame;
+        forward_frame_release(slot);
         return;
+    }
+
+    bool const SHARED_RX_LIFECYCLE = message_allows_shared_rx_peer_lifecycle(hdr->channel_id, msg, payload, PAYLOAD_LEN);
+    bool const USES_RX_LIFECYCLE = message_uses_rx_peer_lifecycle(msg, payload, PAYLOAD_LEN);
+    PeerLifecycleTryLease peer_lifecycle;
+    if (msg != MsgType::HELLO && msg != MsgType::HELLO_ACK && msg != MsgType::HELLO_CONFIRM &&
+        !peer_lifecycle.try_acquire(hdr->src_node, !USES_RX_LIFECYCLE || SHARED_RX_LIFECYCLE)) {
+        return;
+    }
+
+    WkiAuthFrameResult const AUTH_RESULT = wki_auth_verify_frame(hdr, static_cast<const uint8_t*>(data), len);
+    if (AUTH_RESULT == WkiAuthFrameResult::REJECTED) {
+        return;
+    }
+    if (AUTH_RESULT == WkiAuthFrameResult::DISCOVERY_HINT) {
+        if (PAYLOAD_LEN != sizeof(HelloPayload) || transport == nullptr) {
+            return;
+        }
+        auto const* hello = reinterpret_cast<const HelloPayload*>(payload);
+        if (hello->magic != WKI_HELLO_MAGIC || hello->protocol_version != WKI_VERSION || hello->node_id != hdr->src_node) {
+            return;
+        }
+        if (metadata != nullptr && metadata->has_src_mac) {
+            wki_eth_neighbor_add(hello->node_id, metadata->src_mac);
+        }
+        if (g_wki.my_node_id < hello->node_id) {
+            wki_peer_send_hello(transport, hello->node_id);
+        }
+        return;
+    }
+
+    if (msg == MsgType::HELLO || msg == MsgType::HELLO_ACK || msg == MsgType::HELLO_CONFIRM) {
+        if (WkiPeer const* existing = wki_peer_find(hdr->src_node); existing != nullptr) {
+            PeerLifecycleTryLease handshake_lifecycle;
+            if (!handshake_lifecycle.try_acquire(hdr->src_node, true)) {
+                return;
+            }
+            auto const* hello = reinterpret_cast<const HelloPayload*>(payload);
+            if (existing->auth_session.active && existing->remote_auth_nonce != hello->auth_nonce) {
+                return;
+            }
+        }
+    }
+
+    bool const AUTHENTICATED_HELLO = msg == MsgType::HELLO || msg == MsgType::HELLO_ACK || msg == MsgType::HELLO_CONFIRM;
+    if (metadata != nullptr && metadata->has_direct_peer && metadata->direct_peer == hdr->src_node && AUTHENTICATED_HELLO &&
+        hdr->hop_ttl == 1 && PAYLOAD_LEN == sizeof(HelloPayload)) {
+        auto const* hello = reinterpret_cast<const HelloPayload*>(payload);
+        wki_peer_note_rx_contact(transport, hdr->src_node, hello->mac_addr, false);
+    }
+    if (metadata != nullptr && metadata->has_src_mac) {
+        // Discovery hints deliberately do not create peers. A direct
+        // authenticated HELLO therefore has to establish the first contact
+        // before peer.cpp classifies its TTL=1 path. A frame received with
+        // TTL=1 cannot have traversed WKI forwarding, which drops TTL <= 1;
+        // routed HELLOs start at the default TTL and arrive above one. Do not
+        // compare HelloPayload::mac_addr here: it is the node's primary WKI
+        // MAC and intentionally differs from the L2 source on a secondary NIC.
+        if (AUTHENTICATED_HELLO && hdr->hop_ttl == 1) {
+            wki_peer_note_rx_contact(transport, hdr->src_node, metadata->src_mac);
+        } else {
+            wki_eth_note_rx_contact(transport, hdr, metadata->src_mac);
+        }
+    }
+
+    bool const AUTHENTICATED_DUPLICATE = AUTH_RESULT == WkiAuthFrameResult::AUTHENTICATED_DUPLICATE;
+    if (AUTHENTICATED_DUPLICATE && hdr->channel_id == WKI_CHAN_CONTROL && hdr->seq_num == 0 && PAYLOAD_LEN != 0) {
+        return;
+    }
+    bool authorized = true;
+    if (msg != MsgType::HELLO && msg != MsgType::HELLO_ACK && msg != MsgType::HELLO_CONFIRM) {
+        WkiPeer const* authenticated_peer = wki_peer_find(hdr->src_node);
+        authorized = wki_auth_policy_allows(authenticated_peer, msg, payload, PAYLOAD_LEN);
     }
 
     // Inline TASK handlers publish scheduler-visible state, while deferred
@@ -3264,9 +3487,8 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len, const WkiRx
     // admission and drains existing readers before changing session state.
     // Deferred COMPLETE/CANCEL reacquires the exclusive lifecycle gate in its
     // task-context worker before final publication.
-    PeerLifecycleTryLease peer_lifecycle;
-    bool const SHARED_RX_LIFECYCLE = message_allows_shared_rx_peer_lifecycle(hdr->channel_id, msg, payload, PAYLOAD_LEN);
-    if (message_uses_rx_peer_lifecycle(msg, payload, PAYLOAD_LEN) && !peer_lifecycle.try_acquire(hdr->src_node, SHARED_RX_LIFECYCLE)) {
+    if (USES_RX_LIFECYCLE && !peer_lifecycle.owns(hdr->src_node, SHARED_RX_LIFECYCLE) &&
+        !peer_lifecycle.try_acquire(hdr->src_node, SHARED_RX_LIFECYCLE)) {
         return;
     }
     VfsExportRxAdmissionLease vfs_export_admission;
@@ -3280,7 +3502,7 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len, const WkiRx
     bool const RELIABLE_RX_ACCEPTED = reliable_rx_peer_accepts(hdr->src_node);
 
     // Process piggybacked ACK
-    if ((wki_flags(hdr->version_flags) & WKI_FLAG_ACK_PRESENT) != 0 && RELIABLE_RX_ACCEPTED) {
+    if (!AUTHENTICATED_DUPLICATE && (wki_flags(hdr->version_flags) & WKI_FLAG_ACK_PRESENT) != 0 && RELIABLE_RX_ACCEPTED) {
         uint16_t const ACK_CHANNEL_ID = wki_ack_channel_id(*hdr);
         WkiChannel* ch = wki_channel_lookup(hdr->src_node, ACK_CHANNEL_ID);
         if (ch != nullptr) {
@@ -3426,12 +3648,79 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len, const WkiRx
     // Dispatch by message type
     switch (msg) {
         // Unreliable control messages - handled directly
-        case MsgType::HELLO:
-            detail::handle_hello(transport, hdr, payload, PAYLOAD_LEN);
+        case MsgType::HELLO: {
+            WkiPeer const* existing = wki_peer_find(hdr->src_node);
+            bool const SESSION_CURRENT = existing != nullptr && existing->auth_session.active &&
+                                         existing->remote_auth_nonce == reinterpret_cast<const HelloPayload*>(payload)->auth_nonce;
+            detail::handle_hello(transport, hdr, payload, PAYLOAD_LEN, SESSION_CURRENT);
+            if (WkiPeer* peer = wki_peer_find(hdr->src_node); peer != nullptr) {
+                bool session_ready = false;
+                {
+                    PeerLifecycleTryLease install_lifecycle;
+                    if (install_lifecycle.try_acquire(peer->node_id, false)) {
+                        uint32_t const REMOTE_BOOT = wki_hello_boot_epoch(*reinterpret_cast<const HelloPayload*>(payload));
+                        session_ready = SESSION_CURRENT ? wki_auth_install_peer_session(peer, REMOTE_BOOT)
+                                                        : wki_auth_prepare_peer_session(peer, REMOTE_BOOT);
+                    }
+                }
+                if (session_ready) {
+                    wki_peer_send_hello_ack(peer);
+                    if (SESSION_CURRENT) {
+                        wki_lsa_replay_to_peer(peer->node_id);
+                        wki_resource_advertise_to_peer(peer->node_id);
+                    }
+                } else {
+                    wki_peer_fence(peer);
+                }
+            }
             return;
-        case MsgType::HELLO_ACK:
+        }
+        case MsgType::HELLO_ACK: {
             detail::handle_hello_ack(transport, hdr, payload, PAYLOAD_LEN);
+            if (WkiPeer* peer = wki_peer_find(hdr->src_node); peer != nullptr) {
+                bool installed = false;
+                {
+                    PeerLifecycleTryLease install_lifecycle;
+                    installed = install_lifecycle.try_acquire(peer->node_id, false) &&
+                                wki_auth_install_peer_session(peer, wki_hello_boot_epoch(*reinterpret_cast<const HelloPayload*>(payload)));
+                }
+                if (installed) {
+                    wki_peer_send_hello_confirm(peer);
+                    wki_lsa_replay_to_peer(peer->node_id);
+                    wki_resource_advertise_to_peer(peer->node_id);
+                } else {
+                    wki_peer_fence(peer);
+                }
+            }
             return;
+        }
+        case MsgType::HELLO_CONFIRM: {
+            if (PAYLOAD_LEN != sizeof(HelloPayload)) {
+                return;
+            }
+            auto const* confirm = reinterpret_cast<const HelloPayload*>(payload);
+            WkiPeer* peer = wki_peer_find(hdr->src_node);
+            if (peer == nullptr || confirm->magic != WKI_HELLO_MAGIC || confirm->protocol_version != WKI_VERSION ||
+                confirm->node_id != hdr->src_node || confirm->auth_suite != WKI_AUTH_SUITE_HMAC_SHA256_HKDF_SHA256 ||
+                confirm->auth_key_id != wki_auth_peer_key_id(hdr->src_node) || confirm->auth_reserved != 0 ||
+                confirm->auth_nonce != peer->remote_auth_nonce || confirm->capabilities != peer->capabilities ||
+                wki_hello_boot_epoch(*confirm) != peer->remote_boot_epoch ||
+                wki_hello_channel_epoch(*confirm) != peer->remote_channel_epoch) {
+                return;
+            }
+            bool confirmed = AUTH_RESULT == WkiAuthFrameResult::ACCEPTED;
+            if (AUTH_RESULT == WkiAuthFrameResult::PENDING_CONFIRMATION) {
+                PeerLifecycleTryLease confirm_lifecycle;
+                confirmed = confirm_lifecycle.try_acquire(peer->node_id, false) && wki_auth_confirm_peer_session(peer);
+            }
+            if (!confirmed) {
+                return;
+            }
+            detail::handle_hello(transport, hdr, payload, PAYLOAD_LEN, true);
+            wki_lsa_replay_to_peer(peer->node_id);
+            wki_resource_advertise_to_peer(peer->node_id);
+            return;
+        }
         case MsgType::HEARTBEAT:
             detail::handle_heartbeat(hdr, payload, PAYLOAD_LEN);
             return;
@@ -3512,6 +3801,19 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len, const WkiRx
 #endif
 
             if (hdr->seq_num == ch->rx_seq) {
+                if (!authorized) {
+                    ch->rx_seq++;
+                    ch->rx_ack_pending = hdr->seq_num;
+                    ch->ack_pending = true;
+                    ch->ack_pending_since_us = 0;
+                    ch->bytes_received += PAYLOAD_LEN;
+                    uint32_t const RX_CHANNEL_GENERATION = ch->generation;
+                    ch->lock.unlock();
+                    mark_peer_rx_progress(hdr->src_node);
+                    send_policy_denial(*hdr, payload, PAYLOAD_LEN, ch, RX_CHANNEL_GENERATION);
+                    wki_timer_notify();
+                    return;
+                }
                 if (msg == MsgType::DEV_ATTACH_REQ && wki_dev_server_attach_blocked_by_pending_detach(hdr, payload, PAYLOAD_LEN)) {
                     // Keep the reliable frame unconsumed. Its retransmission
                     // may attach only after the old binding cleanup completes.
@@ -3752,7 +4054,7 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len, const WkiRx
                     if (transport != nullptr) {
                         uint16_t const NEXT_HOP = resolve_next_hop(imm_ack_peer);
                         if (NEXT_HOP != WKI_NODE_INVALID) {
-                            tx_ret = wki_transport_send(transport, NEXT_HOP, &imm_ack_hdr, WKI_HEADER_SIZE);
+                            tx_ret = wki_send_authenticated_header(transport, NEXT_HOP, imm_ack_hdr);
                         }
                     }
 
@@ -3769,6 +4071,13 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len, const WkiRx
                 }
 
             } else if (seq_after(hdr->seq_num, ch->rx_seq)) {
+                if (!authorized) {
+                    ch->ack_pending = true;
+                    ch->ack_pending_since_us = 0;
+                    ch->lock.unlock();
+                    wki_timer_notify();
+                    return;
+                }
                 // Out-of-order: buffer in reorder queue, send dup ACK
                 AckSnapshot dup_ack = {};
                 if (drop_stale_reorder_entries_locked(ch)) {
@@ -3961,7 +4270,7 @@ void wki_timer_tick_single(WkiChannel* ch, uint64_t now_us) {
         if (transport != nullptr) {
             uint16_t const NEXT_HOP = resolve_next_hop(ack_peer);
             if (NEXT_HOP != WKI_NODE_INVALID) {
-                tx_ret = wki_transport_send(transport, NEXT_HOP, &ack_hdr, WKI_HEADER_SIZE);
+                tx_ret = wki_send_authenticated_header(transport, NEXT_HOP, ack_hdr);
             }
         }
         ch->lock.lock();
@@ -4113,7 +4422,7 @@ void wki_timer_tick(uint64_t now_us) {
             if (transport != nullptr) {
                 uint16_t const NEXT_HOP = resolve_next_hop(ack_peer);
                 if (NEXT_HOP != WKI_NODE_INVALID) {
-                    tx_ret = wki_transport_send(transport, NEXT_HOP, &ack_hdr, WKI_HEADER_SIZE);
+                    tx_ret = wki_send_authenticated_header(transport, NEXT_HOP, ack_hdr);
                 }
             }
 

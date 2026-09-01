@@ -135,7 +135,7 @@ void wki_channel_send_ack(WkiChannel* ch) {
         return;
     }
 
-    static_cast<void>(wki_transport_send(peer->transport, NEXT_HOP, &ack, WKI_HEADER_SIZE));
+    static_cast<void>(wki_send_authenticated_header(peer->transport, NEXT_HOP, ack));
     ch->ack_pending = false;
     ch->dup_ack_count = 0;
 }

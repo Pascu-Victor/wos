@@ -1,5 +1,5 @@
 -- WKI (WOS Kernel Interconnect) Protocol Dissector for Wireshark
--- Based on WKI Architecture Specification V1
+-- WKI v3 secure-only wire format, including authenticated session trailers.
 --
 -- Installation:
 --   Linux:   ~/.local/lib/wireshark/plugins/wki.lua
@@ -10,9 +10,14 @@
 
 -- Protocol constants
 local WKI_ETHERTYPE = 0x88B7
-local WKI_VERSION = 2
+local WKI_VERSION = 3
 local WKI_HELLO_MAGIC = 0x574B4900 -- "WKI\0"
 local WKI_HEADER_SIZE = 32
+local WKI_V3 = {
+    auth_trailer_size = 40,
+    max_payload = 8914,
+    hello_payload_size = 172,
+}
 local WKI_DOORBELL_IPC_BASE = 0x00070000
 local WKI_DOORBELL_IPC_MASK = 0xFFFF0000
 local WKI_IPC_RESOURCE_MASK = 0x0000FFFF
@@ -42,6 +47,8 @@ local msg_types = {
     [0x09] = "RECONCILE_ACK",
     [0x0A] = "RESOURCE_ADVERT",
     [0x0B] = "RESOURCE_WITHDRAW",
+    [0x0C] = "PEER_GOODBYE",
+    [0x0D] = "HELLO_CONFIRM",
 
     -- Zone management (channel 1)
     [0x20] = "ZONE_CREATE_REQ",
@@ -80,6 +87,7 @@ local msg_types = {
     [0x53] = "TASK_COMPLETE",
     [0x54] = "TASK_CANCEL",
     [0x55] = "LOAD_REPORT",
+    [0x56] = "TASK_SUBMIT_FRAGMENT",
 }
 
 local function get_msg_type_name(msg_type)
@@ -192,6 +200,15 @@ local event_classes = {
 local capabilities = {
     [0x0001] = "RDMA_SUPPORT",
     [0x0002] = "ZONE_SUPPORT",
+    [0x0004] = "RESOURCE_INCARNATION",
+    [0x0008] = "VFS_MULTI_RDMA_LANES",
+    [0x0010] = "VFS_METADATA_BATCH",
+    [0x0020] = "NET_IPV6_STATE",
+    [0x0040] = "VFS_XATTR",
+}
+
+local auth_suites = {
+    [1] = "HMAC-SHA-256 / HKDF-SHA-256",
 }
 
 -- Zone create status
@@ -208,6 +225,8 @@ local dev_attach_status = {
     [2] = "NOT_REMOTABLE",
     [3] = "BUSY",
     [4] = "NO_PASSTHROUGH",
+    [5] = "STALE_RESOURCE",
+    [6] = "ACCESS_DENIED",
 }
 
 -- Task reject reasons
@@ -217,6 +236,7 @@ local task_reject_reasons = {
     [2] = "NO_MEM",
     [3] = "BINARY_NOT_FOUND",
     [4] = "FETCH_FAILED",
+    [5] = "UNAUTHORIZED",
 }
 
 -- Priority classes
@@ -279,8 +299,10 @@ end
 -- Helper: build capabilities string
 local function build_caps_string(caps)
     local parts = {}
-    if bit.band(caps, 0x0001) ~= 0 then table.insert(parts, "RDMA") end
-    if bit.band(caps, 0x0002) ~= 0 then table.insert(parts, "ZONE") end
+    for mask, name in pairs(capabilities) do
+        if bit.band(caps, mask) ~= 0 then table.insert(parts, name) end
+    end
+    table.sort(parts)
     if #parts == 0 then return "none" end
     return table.concat(parts, ", ")
 end
@@ -334,6 +356,26 @@ local pf_hello_hb_interval = ProtoField.uint16("wki.hello.heartbeat_interval", "
 local pf_hello_max_channels = ProtoField.uint16("wki.hello.max_channels", "Max Channels", base.DEC)
 local pf_hello_rdma_zones = ProtoField.uint32("wki.hello.rdma_zones", "RDMA Zone Bitmap", base.HEX)
 local pf_hello_hostname = ProtoField.string("wki.hello.hostname", "Hostname")
+local pf_hello_v3 = {
+    channel_epoch = ProtoField.uint32("wki.hello.channel_epoch", "Channel Epoch", base.DEC),
+    boot_epoch = ProtoField.uint32("wki.hello.boot_epoch", "Boot Epoch", base.DEC),
+    auth_suite = ProtoField.uint16("wki.hello.auth_suite", "Authentication Suite", base.DEC, auth_suites),
+    auth_key_id = ProtoField.uint16("wki.hello.auth_key_id", "Authentication Key ID", base.DEC),
+    auth_nonce = ProtoField.bytes("wki.hello.auth_nonce", "Boot Nonce"),
+    auth_reserved = ProtoField.uint32("wki.hello.auth_reserved", "Authentication Reserved", base.HEX),
+    auth_echo_nonce = ProtoField.bytes("wki.hello.auth_echo_nonce", "Challenge Echo Nonce"),
+    auth_echo_channel_epoch = ProtoField.uint32("wki.hello.auth_echo_channel_epoch",
+        "Challenge Echo Channel Epoch", base.DEC),
+}
+
+-- Protocol fields - v3 authentication trailer
+local pf_auth = {
+    present = ProtoField.bool("wki.auth.present", "Authentication Trailer Present"),
+    discovery_hint = ProtoField.bool("wki.auth.discovery_hint", "Unauthenticated Discovery Hint"),
+    session_id = ProtoField.bytes("wki.auth.session_id", "Session ID"),
+    counter = ProtoField.uint64("wki.auth.counter", "Session Counter", base.DEC),
+    tag = ProtoField.bytes("wki.auth.tag", "HMAC-SHA-256 Tag (128-bit)"),
+}
 
 -- Protocol fields - HEARTBEAT payload
 local pf_hb_timestamp = ProtoField.uint64("wki.heartbeat.timestamp", "Timestamp (ns)", base.DEC)
@@ -547,7 +589,11 @@ wki_proto.fields = {
     -- HELLO
     pf_hello_magic, pf_hello_proto_ver, pf_hello_node_id, pf_hello_mac,
     pf_hello_caps, pf_hello_hb_interval, pf_hello_max_channels, pf_hello_rdma_zones,
-    pf_hello_hostname,
+    pf_hello_v3.channel_epoch, pf_hello_v3.boot_epoch, pf_hello_hostname,
+    pf_hello_v3.auth_suite, pf_hello_v3.auth_key_id, pf_hello_v3.auth_nonce, pf_hello_v3.auth_reserved,
+    pf_hello_v3.auth_echo_nonce, pf_hello_v3.auth_echo_channel_epoch,
+    -- Authentication trailer
+    pf_auth.present, pf_auth.discovery_hint, pf_auth.session_id, pf_auth.counter, pf_auth.tag,
     -- HEARTBEAT
     pf_hb_timestamp, pf_hb_load, pf_hb_mem_free,
     -- LSA
@@ -1217,6 +1263,15 @@ function wki_proto.dissector(buffer, pinfo, tree)
     local hop_ttl = buffer(19, 1):uint()
     local reserved = buffer(28, 4):le_uint()
     local payload_captured_len = math.max(0, math.min(payload_len, length - WKI_HEADER_SIZE))
+    local payload_end = WKI_HEADER_SIZE + payload_len
+    local is_discovery_hint = version == WKI_VERSION and msg_type == 0x01 and dst_node == 0xFFFF
+    local auth_expected = version == WKI_VERSION and not is_discovery_hint
+    local expected_frame_len = payload_end + (auth_expected and WKI_V3.auth_trailer_size or 0)
+    local auth_trailer_present = auth_expected and length >= expected_frame_len
+    local auth_counter = nil
+    if auth_trailer_present then
+        auth_counter = buffer(payload_end + 16, 8):le_uint64()
+    end
     local ack_present = bit.band(flags, 0x08) ~= 0
     local ack_channel_present = bit.band(flags, 0x01) ~= 0
     local ack_channel_id = channel_id
@@ -1226,7 +1281,7 @@ function wki_proto.dissector(buffer, pinfo, tree)
     local ack_channel_name = get_channel_name(ack_channel_id)
     local is_ack_carrier = msg_type == 0x04 and ack_present and payload_len == 0
 
-    if (msg_type == 0x01 or msg_type == 0x02) and payload_captured_len >= 96 then
+    if (msg_type == 0x01 or msg_type == 0x02 or msg_type == 0x0D) and payload_captured_len >= 96 then
         local hello_magic = buffer(WKI_HEADER_SIZE, 4):le_uint()
         if hello_magic == WKI_HELLO_MAGIC then
             local hello_node_id = buffer(WKI_HEADER_SIZE + 6, 2):le_uint()
@@ -1282,6 +1337,11 @@ function wki_proto.dissector(buffer, pinfo, tree)
     if info_suffix ~= nil then
         pinfo.cols.info:append(" " .. info_suffix)
     end
+    if is_discovery_hint then
+        pinfo.cols.info:append(" [Discovery Hint]")
+    elseif auth_counter ~= nil then
+        pinfo.cols.info:append(" auth_ctr=" .. tostring(auth_counter))
+    end
 
     -- =====================================================================
     -- Analysis: retransmit/out-of-order detection, request-response matching
@@ -1321,8 +1381,11 @@ function wki_proto.dissector(buffer, pinfo, tree)
         end
 
         -- Sequence analysis: detect retransmits and out-of-order for reliable messages
-        -- (skip unreliable control messages: HELLO, HELLO_ACK, HEARTBEAT, HEARTBEAT_ACK)
-        if msg_type ~= 0x01 and msg_type ~= 0x02 and msg_type ~= 0x03 and msg_type ~= 0x04 then
+        -- Skip unreliable control messages. HELLO_CONFIRM is authenticated by
+        -- the pending session key but, like the other handshake messages, is
+        -- not carried by a reliable channel.
+        if msg_type ~= 0x01 and msg_type ~= 0x02 and msg_type ~= 0x03 and msg_type ~= 0x04 and
+            msg_type ~= 0x0C and msg_type ~= 0x0D then
             if not stream_state[fwd_key] then
                 stream_state[fwd_key] = { next_seq = seq_num, seen_seqs = {} }
             end
@@ -1455,6 +1518,10 @@ function wki_proto.dissector(buffer, pinfo, tree)
 
     local vf_tree = hdr_tree:add(pf_version_flags, buffer(0, 1))
     vf_tree:add(pf_version, buffer(0, 1))
+    if version ~= WKI_VERSION then
+        vf_tree:add_expert_info(PI_PROTOCOL, PI_WARN,
+            string.format("Unsupported WKI version %d (secure-only dissector expects %d)", version, WKI_VERSION))
+    end
     local flags_tree = vf_tree:add(pf_flags, buffer(0, 1))
     flags_tree:add(pf_flag_ack, buffer(0, 1))
     flags_tree:add(pf_flag_priority, buffer(0, 1))
@@ -1491,6 +1558,10 @@ function wki_proto.dissector(buffer, pinfo, tree)
     end
 
     hdr_tree:add_le(pf_payload_len, buffer(16, 2))
+    if payload_len > WKI_V3.max_payload then
+        hdr_tree:add_expert_info(PI_MALFORMED, PI_WARN,
+            string.format("Payload length %u exceeds WKI v3 maximum %u", payload_len, WKI_V3.max_payload))
+    end
     hdr_tree:add(pf_credits, buffer(18, 1))
     hdr_tree:add(pf_hop_ttl, buffer(19, 1))
     hdr_tree:add_le(pf_src_port, buffer(20, 2))
@@ -1499,6 +1570,28 @@ function wki_proto.dissector(buffer, pinfo, tree)
     local reserved_item = hdr_tree:add_le(pf_reserved, buffer(28, 4))
     if ack_present and ack_channel_present then
         reserved_item:append_text(string.format(" (ack_channel=%s)", ack_channel_name))
+    end
+
+    local auth_present_item = subtree:add(pf_auth.present, auth_trailer_present)
+    auth_present_item:set_generated(true)
+    local discovery_item = subtree:add(pf_auth.discovery_hint, is_discovery_hint)
+    discovery_item:set_generated(true)
+
+    if auth_trailer_present then
+        local auth_buf = buffer(payload_end, WKI_V3.auth_trailer_size)
+        local auth_tree = subtree:add(wki_proto, auth_buf, "Authentication Trailer (WKI v3)")
+        auth_tree:add(pf_auth.session_id, auth_buf(0, 16))
+        auth_tree:add_le(pf_auth.counter, auth_buf(16, 8))
+        auth_tree:add(pf_auth.tag, auth_buf(24, 16))
+    elseif auth_expected then
+        subtree:add_expert_info(PI_MALFORMED, PI_WARN,
+            string.format("Missing or truncated WKI v3 authentication trailer: captured %u, expected %u bytes",
+                length, expected_frame_len))
+    end
+    if version == WKI_VERSION and length ~= expected_frame_len then
+        subtree:add_expert_info(PI_MALFORMED, PI_WARN,
+            string.format("WKI v3 frame length mismatch: captured %u, expected exactly %u bytes", length,
+                expected_frame_len))
     end
 
     -- Analysis subtree
@@ -1572,8 +1665,8 @@ function wki_proto.dissector(buffer, pinfo, tree)
             add_truncation_note(payload_tree, payload_captured_len, payload_len)
         end
 
-        -- HELLO / HELLO_ACK
-        if msg_type == 0x01 or msg_type == 0x02 then
+        -- HELLO / HELLO_ACK / HELLO_CONFIRM share the append-only payload.
+        if msg_type == 0x01 or msg_type == 0x02 or msg_type == 0x0D then
             if payload_captured_len >= 32 then
                 local magic = payload_buf(0, 4):le_uint()
                 payload_tree:add_le(pf_hello_magic, payload_buf(0, 4))
@@ -1587,9 +1680,26 @@ function wki_proto.dissector(buffer, pinfo, tree)
                 payload_tree:add_le(pf_hello_hb_interval, payload_buf(16, 2))
                 payload_tree:add_le(pf_hello_max_channels, payload_buf(18, 2))
                 payload_tree:add_le(pf_hello_rdma_zones, payload_buf(20, 4))
+                payload_tree:add_le(pf_hello_v3.channel_epoch, payload_buf(24, 4))
+                payload_tree:add_le(pf_hello_v3.boot_epoch, payload_buf(28, 4))
                 if payload_captured_len >= 96 then
                     local hostname = payload_buf(32, 64):stringz()
                     payload_tree:add(pf_hello_hostname, payload_buf(32, 64), hostname)
+                end
+                if payload_captured_len >= 136 then
+                    payload_tree:add_le(pf_hello_v3.auth_suite, payload_buf(96, 2))
+                    payload_tree:add_le(pf_hello_v3.auth_key_id, payload_buf(98, 2))
+                    payload_tree:add(pf_hello_v3.auth_nonce, payload_buf(100, 32))
+                    payload_tree:add_le(pf_hello_v3.auth_reserved, payload_buf(132, 4))
+                end
+                if payload_captured_len >= WKI_V3.hello_payload_size then
+                    payload_tree:add(pf_hello_v3.auth_echo_nonce, payload_buf(136, 32))
+                    payload_tree:add_le(pf_hello_v3.auth_echo_channel_epoch, payload_buf(168, 4))
+                end
+                if payload_len ~= WKI_V3.hello_payload_size then
+                    payload_tree:add_expert_info(PI_MALFORMED, PI_WARN,
+                        string.format("WKI v3 handshake payload length is %u, expected %u", payload_len,
+                            WKI_V3.hello_payload_size))
                 end
             end
 
@@ -2146,7 +2256,7 @@ eth_table:add(WKI_ETHERTYPE, wki_proto)
 local udp_table = DissectorTable.get("udp.port")
 udp_table:add(0x88B7, wki_proto)
 
-print("WKI Protocol dissector loaded (EtherType 0x88B7) with statistics support")
+print("WKI v3 authenticated protocol dissector loaded (EtherType 0x88B7) with statistics support")
 
 -- =========================================================================
 -- WKI RoCE RDMA Transport Dissector (EtherType 0x88B8)

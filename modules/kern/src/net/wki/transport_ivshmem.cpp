@@ -1,6 +1,7 @@
 #include "transport_ivshmem.hpp"
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -11,6 +12,7 @@
 #include <net/wki/timer_math.hpp>
 #include <net/wki/wki.hpp>
 #include <platform/dbg/dbg.hpp>
+#include <platform/fw/qemu_fw_cfg.hpp>
 #include <platform/interrupt/gates.hpp>
 #include <platform/sys/spinlock.hpp>
 
@@ -117,12 +119,39 @@ struct IvshmemTransportPrivate {
     uint32_t rdma_size;
 
     WkiRxHandler rx_handler;
+    std::atomic_flag rx_drain_active = ATOMIC_FLAG_INIT;
+    uint16_t direct_peer = WKI_NODE_INVALID;
 };
 
 WkiTransport s_ivshmem_transport;            // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 IvshmemTransportPrivate s_ivshmem_priv;      // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 bool s_ivshmem_initialized = false;          // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 ker::mod::sys::Spinlock s_rdma_bitmap_lock;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+
+auto configured_vm_role() -> int32_t {
+    char value = 0;
+    int const READ = platform::fw::fw_cfg_read_file("opt/wos/wki-ivshmem-role", &value, sizeof(value));
+    return READ == 1 && (value == '0' || value == '1') ? value - '0' : -1;
+}
+
+auto configured_direct_peer() -> uint16_t {
+    std::array<char, 6> value{};
+    int const READ = platform::fw::fw_cfg_read_file("opt/wos/wki-ivshmem-peer", value.data(), value.size() - 1);
+    if (READ <= 0 || static_cast<size_t>(READ) >= value.size()) {
+        return WKI_NODE_INVALID;
+    }
+    uint32_t peer = 0;
+    for (int index = 0; index < READ; ++index) {
+        if (value.at(static_cast<size_t>(index)) < '0' || value.at(static_cast<size_t>(index)) > '9') {
+            return WKI_NODE_INVALID;
+        }
+        peer = (peer * 10U) + static_cast<uint32_t>(value.at(static_cast<size_t>(index)) - '0');
+        if (peer >= WKI_NODE_BROADCAST) {
+            return WKI_NODE_INVALID;
+        }
+    }
+    return peer == 0 ? WKI_NODE_INVALID : static_cast<uint16_t>(peer);
+}
 
 // -----------------------------------------------------------------------------
 // Ring operations
@@ -342,15 +371,12 @@ auto ivshmem_wki_doorbell(WkiTransport* self, uint16_t /*neighbor_id*/, uint32_t
 // IRQ handler - poll RX ring and deliver to WKI
 // -----------------------------------------------------------------------------
 
-void ivshmem_wki_irq(uint8_t /*vector*/, void* data) {
-    auto* priv = static_cast<IvshmemTransportPrivate*>(data);
-    if (priv == nullptr) {
-        return;
+auto drain_rx_ring(IvshmemTransportPrivate* priv, uint16_t budget) -> uint16_t {
+    if (priv == nullptr || budget == 0 || priv->rx_drain_active.test_and_set(std::memory_order_acquire)) {
+        return 0;
     }
 
-    // Acknowledge interrupt
-    priv->regs[IVSHMEM_REG_INTRSTATUS / 4] = priv->regs[IVSHMEM_REG_INTRSTATUS / 4];
-
+    uint16_t processed = 0;
     // D4: Check IRQ forwarding mailbox before draining the ring.
     // Our RX mailbox: if we are VM0, the peer (VM1) writes to slot[1] (VM1->VM0).
     //                 if we are VM1, the peer (VM0) writes to slot[0] (VM0->VM1).
@@ -374,16 +400,35 @@ void ivshmem_wki_irq(uint8_t /*vector*/, void* data) {
 
     // Drain RX ring
     std::array<uint8_t, 8192> buf{};
-    while (true) {
+    while (processed < budget) {
         uint16_t const LEN = ring_read(&priv->rx_ring, buf.data(), static_cast<uint16_t>(buf.size()));
         if (LEN == 0) {
             break;
         }
 
         if (priv->rx_handler != nullptr) {
-            priv->rx_handler(&s_ivshmem_transport, buf.data(), LEN, nullptr);
+            WkiRxMetadata const metadata = {
+                .has_direct_peer = priv->direct_peer != WKI_NODE_INVALID,
+                .direct_peer = priv->direct_peer,
+            };
+            priv->rx_handler(&s_ivshmem_transport, buf.data(), LEN, &metadata);
         }
+        ++processed;
     }
+    priv->rx_drain_active.clear(std::memory_order_release);
+    return processed;
+}
+
+void ivshmem_wki_irq(uint8_t /*vector*/, void* data) {
+    auto* priv = static_cast<IvshmemTransportPrivate*>(data);
+    if (priv == nullptr) {
+        return;
+    }
+
+    // Acknowledge interrupt and use the same single-drainer path as the
+    // task-context fallback.
+    priv->regs[IVSHMEM_REG_INTRSTATUS / 4] = priv->regs[IVSHMEM_REG_INTRSTATUS / 4];
+    static_cast<void>(drain_rx_ring(priv, 64));
 }
 
 }  // namespace
@@ -495,11 +540,14 @@ void wki_ivshmem_transport_init() {
     s_ivshmem_priv.shmem = shmem;
     s_ivshmem_priv.shmem_size = IVSHMEM_SHMEM_SIZE;
     s_ivshmem_priv.rx_handler = nullptr;
+    s_ivshmem_priv.direct_peer = configured_direct_peer();
 
     // Initialize or read shared memory header
     auto* hdr = reinterpret_cast<WkiIvshmemHeader*>(shmem);
 
-    if (hdr->magic != WKI_IVSHMEM_MAGIC) {
+    int32_t const CONFIGURED_ROLE = configured_vm_role();
+    bool const INITIALIZE_HEADER = CONFIGURED_ROLE == 0 || (CONFIGURED_ROLE < 0 && hdr->magic != WKI_IVSHMEM_MAGIC);
+    if (INITIALIZE_HEADER) {
         // First VM: initialize header and ring areas
         memset(hdr, 0, sizeof(WkiIvshmemHeader));
         hdr->magic = WKI_IVSHMEM_MAGIC;
@@ -517,8 +565,19 @@ void wki_ivshmem_transport_init() {
         memset(shmem + hdr->ring0_offset, 0, 8);
         memset(shmem + hdr->ring1_offset, 0, 8);
     } else {
+        if (CONFIGURED_ROLE == 1 && hdr->magic != WKI_IVSHMEM_MAGIC) {
+            constexpr uint64_t HEADER_TIMEOUT_US = 5'000'000;
+            uint64_t const DEADLINE = wki_future_deadline_us(ker::mod::time::get_us(), HEADER_TIMEOUT_US);
+            while (hdr->magic != WKI_IVSHMEM_MAGIC && ker::mod::time::get_us() < DEADLINE) {
+                asm volatile("pause" ::: "memory");
+            }
+            if (hdr->magic != WKI_IVSHMEM_MAGIC) {
+                ker::mod::dbg::log("[WKI] ivshmem: timed out waiting for role-0 header initialization");
+                return;
+            }
+        }
         hdr->peer_ready = 1;
-        s_ivshmem_priv.my_vm_id = 1;
+        s_ivshmem_priv.my_vm_id = CONFIGURED_ROLE >= 0 ? static_cast<uint32_t>(CONFIGURED_ROLE) : 1;
     }
 
     // VM0: poll for peer_ready with 5s timeout
@@ -606,5 +665,7 @@ void wki_ivshmem_transport_init() {
     ker::mod::dbg::log("[WKI] ivshmem RDMA transport initialized (vm_id=%u, rdma=%u KB)", s_ivshmem_priv.my_vm_id,
                        static_cast<uint32_t>(WKI_RDMA_REGION_SIZE / 1024));
 }
+
+auto wki_ivshmem_transport_poll(uint16_t budget) -> uint16_t { return s_ivshmem_initialized ? drain_rx_ring(&s_ivshmem_priv, budget) : 0; }
 
 }  // namespace ker::net::wki

@@ -1,0 +1,65 @@
+{
+  "zones": [
+    {
+      "id": "GLOBAL",
+      "debug": false,
+      "mtu": 9000,
+      "nic_model": "virtio-net-pci",
+      "ivshmem": {
+        "enabled": false,
+        "size": "16M",
+        "root_path": "/tmp/wos-wki-auth-mixed",
+        "topology": "full-mesh"
+      },
+      "bridge": {"stp": false, "ip": null},
+      "vm": {
+        "memory": "4G",
+        "cpus": 4,
+        "disk0": "disk.qcow2",
+        "disk1": "mountfs.qcow2"
+      }
+    },
+    {
+      "id": 0,
+      "name": "wki-mixed",
+      "nodes": 2,
+      "nic_queues": 1,
+      "vhost": false,
+      "netdev_driver": "wki",
+      "qemu_netdev": {
+        "type": "socket-mcast",
+        "address": "239.192.89.4",
+        "port": 47824,
+        "localaddr": "127.0.0.1"
+      },
+      "ivshmem": {
+        "enabled": true,
+        "size": "16M",
+        "root_path": "/tmp/wos-wki-auth-mixed",
+        "topology": "full-mesh"
+      },
+      "nodes_config": [
+        {
+          "id": 0,
+          "hostname": "wos-0",
+          "vm": {
+            "overlay_dir": "wki-chaos-data/auth-mixed-overlays",
+            "serial_log": "wki-chaos-data/auth-mixed-serial-vm0.log",
+            "qemu_log": "wki-chaos-data/auth-mixed-qemu-vm0.log",
+            "qmp_socket": "wki-chaos-data/auth-mixed-qmp-vm0.sock"
+          }
+        },
+        {
+          "id": 1,
+          "hostname": "wos-1",
+          "vm": {
+            "overlay_dir": "wki-chaos-data/auth-mixed-overlays",
+            "serial_log": "wki-chaos-data/auth-mixed-serial-vm1.log",
+            "qemu_log": "wki-chaos-data/auth-mixed-qemu-vm1.log",
+            "qmp_socket": "wki-chaos-data/auth-mixed-qmp-vm1.sock"
+          }
+        }
+      ]
+    }
+  ]
+}

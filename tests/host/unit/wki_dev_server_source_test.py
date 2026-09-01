@@ -1418,7 +1418,7 @@ def test_vfs_two_lane_rdma_keeps_anchor_identity_independent_and_tears_down_regi
         "auto wki_vfs_proxy_attach_mode(",
         "auto wki_vfs_attach_lane_is_anchor(",
         "static_assert(sizeof(DevAttachReqPayload) == 12",
-        "static_assert(sizeof(HelloPayload) == 96",
+        "static_assert(sizeof(HelloPayload) == 172",
     ]:
         if token not in wire:
             fail(f"VFS two-lane RDMA must preserve the attach ABI: missing {token!r}")

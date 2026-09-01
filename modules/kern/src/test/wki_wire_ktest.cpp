@@ -1,4 +1,5 @@
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <net/wki/wire.hpp>
 #include <test/ktest.hpp>
@@ -93,7 +94,7 @@ KTEST(WkiWire, VfsMultiRdmaCapabilityAndAuxFlagPreserveLayouts) {
     KEXPECT_EQ(
         static_cast<uint8_t>(DEV_ATTACH_VFS_AUX_LANE & (DEV_ATTACH_MODE_KIND_MASK | DEV_ATTACH_ACCESS_MASK | DEV_ATTACH_DISABLE_RDMA)),
         static_cast<uint8_t>(0));
-    KEXPECT_EQ(sizeof(HelloPayload), static_cast<size_t>(96));
+    KEXPECT_EQ(sizeof(HelloPayload), static_cast<size_t>(172));
     KEXPECT_EQ(sizeof(DevAttachReqPayload), static_cast<size_t>(12));
 
     uint8_t const ANCHOR_RDMA = wki_vfs_proxy_attach_mode(true, true);
@@ -226,7 +227,7 @@ KTEST(WkiWire, VfsMetadataBatchUsesAdditiveBoundedFraming) {
                  WKI_ETH_MAX_PAYLOAD);
     KEXPECT_TRUE(sizeof(DevOpRespPayload) + sizeof(VfsMetadataBatchHeader) + VFS_METADATA_BATCH_MAX_ITEMS * sizeof(int32_t) <=
                  WKI_ETH_MAX_PAYLOAD);
-    KEXPECT_EQ(sizeof(HelloPayload), static_cast<size_t>(96));
+    KEXPECT_EQ(sizeof(HelloPayload), static_cast<size_t>(172));
 }
 
 KTEST(WkiWire, VfsXattrUsesVersionedBoundedReplayIdentity) {

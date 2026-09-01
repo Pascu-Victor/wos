@@ -5725,13 +5725,16 @@ auto wki_ipc_selftest_export_pipe_write_burst_is_bounded() -> int {
         script.result_count = result_count;
     };
 
-    reset_script({4096, 4096, 754, -EIO}, 3);
+    constexpr ssize_t FINAL_FULL_CHUNK = static_cast<ssize_t>(WKI_IPC_PIPE_DATA_MAX_CHUNK) - 8192;
+    static_assert(FINAL_FULL_CHUNK > 0);
+    reset_script({4096, 4096, FINAL_FULL_CHUNK, -EIO}, 3);
     ssize_t const FULL_RET =
         export_pipe_write_bounded(&file, data.data(), static_cast<uint16_t>(data.size()), WKI_IPC_EXPORT_PIPE_WRITE_BURST_CALLS);
     bool const FULL_VALID = FULL_RET == static_cast<ssize_t>(data.size()) && script.calls == 3 && script.buffers.at(0) == data.data() &&
                             script.buffers.at(1) == data.data() + 4096 && script.buffers.at(2) == data.data() + 8192 &&
-                            script.counts.at(0) == data.size() && script.counts.at(1) == data.size() - 4096 && script.counts.at(2) == 754 &&
-                            script.offsets.at(0) == 23 && script.offsets.at(1) == 23 && script.offsets.at(2) == 23;
+                            script.counts.at(0) == data.size() && script.counts.at(1) == data.size() - 4096 &&
+                            script.counts.at(2) == static_cast<size_t>(FINAL_FULL_CHUNK) && script.offsets.at(0) == 23 &&
+                            script.offsets.at(1) == 23 && script.offsets.at(2) == 23;
 
     reset_script({4096, 904, -EAGAIN, -EIO}, 3);
     ssize_t const PARTIAL_RET =

@@ -59,6 +59,34 @@ void skip_bytes(size_t n) {
 
 }  // namespace
 
+auto fw_cfg_file_size(const char* name, size_t* size_out) -> bool {
+    if (name == nullptr || size_out == nullptr) {
+        return false;
+    }
+
+    outw(FW_CFG_PORT_SEL, FW_CFG_SIGNATURE);
+    std::array<char, 4> sig{};
+    read_bytes(sig.data(), sig.size());
+    if (std::memcmp(sig.data(), FW_CFG_MAGIC.data(), sig.size()) != 0) {
+        return false;
+    }
+
+    outw(FW_CFG_PORT_SEL, FW_CFG_FILE_DIR);
+    uint32_t const COUNT = read_be32();
+    for (uint32_t i = 0; i < COUNT; ++i) {
+        uint32_t const FILE_SIZE = read_be32();
+        static_cast<void>(read_be16());
+        skip_bytes(2);
+        std::array<char, FW_CFG_MAX_NAME> file_name{};
+        read_bytes(file_name.data(), file_name.size());
+        if (std::strcmp(file_name.data(), name) == 0) {
+            *size_out = FILE_SIZE;
+            return true;
+        }
+    }
+    return false;
+}
+
 auto fw_cfg_read_file(const char* name, void* buf, size_t buf_size) -> int {
     if (name == nullptr || buf == nullptr || buf_size == 0) {
         return -1;

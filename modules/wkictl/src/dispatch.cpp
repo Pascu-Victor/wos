@@ -2,6 +2,7 @@
 
 #include <cstring>
 
+#include "wkictl/auth.hpp"
 #include "wkictl/chaos.hpp"
 #include "wkictl/cli.hpp"
 #include "wkictl/perf.hpp"
@@ -25,6 +26,9 @@ auto run_wkictl(int argc, char** argv) -> int {
     }
     if (std::strcmp(argv[1], "wosid") == 0) {
         return wkictl::print_wosid();
+    }
+    if (std::strcmp(argv[1], "auth") == 0) {
+        return wkictl::handle_auth(argc, argv);
     }
     if (std::strcmp(argv[1], "target") == 0) {
         return wkictl::handle_target(argc, argv);

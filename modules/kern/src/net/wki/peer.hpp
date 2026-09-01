@@ -1,7 +1,10 @@
 #pragma once
 
+#include <cstdint>
 #include <net/address.hpp>
 #include <net/wki/wki.hpp>
+
+#include "net/wki/wire.hpp"
 
 namespace ker::net::wki {
 
@@ -22,6 +25,10 @@ void wki_peer_send_routed_hello(uint16_t dst_node);
 
 // Send HELLO_ACK to a specific peer
 void wki_peer_send_hello_ack(WkiPeer* peer);
+
+// Prove possession of the freshly derived traffic key. A HELLO receiver keeps
+// only pending keys until this session-bound confirmation arrives.
+void wki_peer_send_hello_confirm(WkiPeer* peer);
 
 // Ethernet contact learning runs before forwarding. A unicast frame whose
 // default TTL has already been decremented came from a routed origin, not the
@@ -55,7 +62,7 @@ constexpr auto wki_peer_hello_path(const WkiHeader* header, bool route_valid, ui
 
 // Learn a direct peer from any received Ethernet WKI frame so later control
 // traffic is not dropped if HELLO/HELLO_ACK delivery was asymmetric.
-void wki_peer_note_rx_contact(WkiTransport* transport, uint16_t peer_node, const proto::MacAddress& mac);
+void wki_peer_note_rx_contact(WkiTransport* transport, uint16_t peer_node, const proto::MacAddress& mac, bool ethernet_neighbor = true);
 
 // Send a heartbeat to all CONNECTED peers
 void wki_peer_send_heartbeats();

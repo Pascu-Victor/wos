@@ -83,7 +83,8 @@ def test_token_is_published_only_after_retransmit_recovery_exists() -> None:
     require_tokens(
         send_impl,
         [
-            "uint16_t const FRAME_LEN = WKI_HEADER_SIZE + wire_payload_len",
+            "uint16_t const FRAME_CAPACITY = WKI_HEADER_SIZE + wire_payload_len + WKI_AUTH_TRAILER_SIZE",
+            "frame_len = static_cast<uint16_t>(AUTHENTICATED_LEN)",
             "perf_record_transport_begin(dst_node, channel_id, TRACE_CORRELATION, wire_payload_len",
             "hdr->payload_len = wire_payload_len",
             "perf_record_transport_end(dst_node, channel_id, TRACE_CORRELATION, WKI_ERR_NO_MEM, wire_payload_len",
@@ -124,15 +125,15 @@ def test_heap_retransmit_storage_is_prepared_once_outside_channel_lock() -> None
             "ch->tx_credits == 0",
             "heap_rt_channel_generation = ch->generation",
             "ch->lock.unlock()",
-            "heap_rt_entry = wki_retransmit_entry_alloc(FRAME_LEN)",
+            "heap_rt_entry = wki_retransmit_entry_alloc(frame_len)",
             "ch->lock.lock()",
             "rt_data = heap_rt_entry->data",
-            "memcpy(rt_data, frame, FRAME_LEN)",
+            "memcpy(rt_data, frame, frame_len)",
         ],
         "single-allocation retransmit preparation and revalidation",
     )
     assert "new (std::nothrow) WkiRetransmitEntry" not in send_impl
-    assert "new (std::nothrow) uint8_t[FRAME_LEN]" not in send_impl
+    assert "new (std::nothrow) uint8_t[frame_len]" not in send_impl
 
 
 def test_status_is_generation_qualified_and_uses_wrap_safe_cumulative_ack() -> None:
@@ -204,7 +205,7 @@ def test_split_send_validates_and_flattens_before_reliable_publication() -> None
             "net::pkt_alloc_tx()",
             "copy_wki_payload_segments(frame + WKI_HEADER_SIZE",
             "wki_frame_checksum(*hdr, frame + WKI_HEADER_SIZE)",
-            "memcpy(rt_data, frame, FRAME_LEN)",
+            "memcpy(rt_data, frame, frame_len)",
             "ch->tx_seq++",
         ],
         "split send synchronous ownership",

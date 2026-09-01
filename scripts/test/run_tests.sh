@@ -185,6 +185,7 @@ UNIT_TESTS=(
     wki_timer_source_test
     wki_wait_source_test
     wki_ivshmem_source_test
+    wki_wireshark_source_test
     wki_dev_server_source_test
     wki_dev_proxy_source_test
     wki_detach_retry_source_test
@@ -231,6 +232,9 @@ UNIT_TESTS=(
     xfs_shortform_offset_source_test
     xfs_transaction_rollback_source_test
     wki_wire_test
+    wki_auth_crypto_test
+    wki_auth_protocol_test
+    wki_auth_policy_test
     wki_block_validation_test
     wki_peer_resolver_test
     netd_ra_test

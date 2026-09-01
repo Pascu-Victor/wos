@@ -4001,7 +4001,7 @@ def test_capability_gated_vfs_data_lanes_bound_rdma_buffers() -> None:
             "auto wki_vfs_proxy_attach_mode(",
             "auto wki_vfs_attach_lane_is_anchor(",
             "static_assert(sizeof(DevAttachReqPayload) == 12",
-            "static_assert(sizeof(HelloPayload) == 96",
+            "static_assert(sizeof(HelloPayload) == 172",
         ],
         "multi-lane VFS RDMA preserves the existing wire layouts",
     )

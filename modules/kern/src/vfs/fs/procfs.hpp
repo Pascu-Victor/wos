@@ -44,6 +44,7 @@ enum class ProcNodeType : uint8_t {
     WKI_REMOTE_PID_FILE,  // /proc/<pid>/wki_remote_pid -> remote execution PID for this process
     WKI_DIR,              // /proc/wki
     WKI_PEERS_FILE,       // /proc/wki/peers -> WKI topology rows
+    WKI_AUTH_FILE,        // /proc/wki/auth -> non-secret session/policy status
     WKI_NETDIAG_FILE,     // /proc/wki/netdiag -> network packet/listener/channel diagnostics
     WKI_PIPES_FILE,       // /proc/wki/pipes -> local pipe owner diagnostics
     WKI_CHAOS_FILE,       // /proc/wki/chaos -> deterministic WKI fault injection control and trace

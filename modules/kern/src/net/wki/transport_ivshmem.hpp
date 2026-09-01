@@ -9,6 +9,10 @@ namespace ker::net::wki {
 // If a suitable device is found, registers it as a WkiTransport.
 void wki_ivshmem_transport_init();
 
+// Drain a bounded number of message-ring frames from task context. This is a
+// fallback for ivshmem-plain deployments without a usable doorbell interrupt.
+auto wki_ivshmem_transport_poll(uint16_t budget) -> uint16_t;
+
 // Allocate a region from the ivshmem RDMA pool.
 // Returns the offset within the RDMA region, or -1 on failure.
 // The offset can be used as an rkey for RDMA operations.

@@ -37,6 +37,7 @@
 #include <platform/boot/handover.hpp>
 #include <platform/dbg/coredump.hpp>
 #include <platform/dbg/dbg.hpp>
+#include <platform/fw/qemu_fw_cfg.hpp>
 #include <platform/interrupt/gdt.hpp>
 #include <platform/interrupt/idt.hpp>
 #include <platform/ktime/ktime.hpp>
@@ -97,6 +98,11 @@ auto cmdline_has_token(const char* cmdline, std::string_view token) -> bool {
         remaining.remove_prefix(END);
     }
     return false;
+}
+
+auto fw_cfg_flag_enabled(const char* path) -> bool {
+    char value = 0;
+    return path != nullptr && platform::fw::fw_cfg_read_file(path, &value, sizeof(value)) == 1 && value == '1';
 }
 
 }  // namespace
@@ -207,7 +213,7 @@ void ivshmem_init() {
     // A single ivshmem PCI function cannot be owned by both netdevice and WKI
     // transports.  Keep the historical ivshmem-net claim policy unless the
     // boot explicitly reserves the functions for the phase-6 WKI RDMA probe.
-    if (cmdline_has_token(get_kernel_cmdline(), "wki.ivshmem")) {
+    if (cmdline_has_token(get_kernel_cmdline(), "wki.ivshmem") || fw_cfg_flag_enabled("opt/wos/wki-ivshmem")) {
         mod::dbg::log("[WKI] Reserving ivshmem device for WKI RDMA transport");
         return;
     }

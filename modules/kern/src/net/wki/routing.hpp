@@ -61,6 +61,11 @@ void wki_routing_init();
 // own LSDB and recomputes routes after a new sequence is emitted.
 void wki_lsa_generate_and_flood();
 
+// Replay the current local LSA to one newly authenticated direct peer. HELLO
+// handlers run before session installation, so their normal flood cannot use
+// the new session yet.
+void wki_lsa_replay_to_peer(uint16_t peer_node);
+
 // Recompute routing table from LSDB using Dijkstra SPF
 void wki_routing_recompute();
 

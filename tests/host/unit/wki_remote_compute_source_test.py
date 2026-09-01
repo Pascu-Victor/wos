@@ -1242,12 +1242,12 @@ def test_task_submit_envelopes_use_bounded_stack_storage() -> None:
     require_order(
         send_impl,
         "copy_wki_payload_segments(frame + WKI_HEADER_SIZE, payload, payload_len, payload_tail, payload_tail_len)",
-        "memcpy(rt_data, frame, FRAME_LEN)",
+        "memcpy(rt_data, frame, frame_len)",
         "TASK_SUBMIT borrow copied into frame before retransmit ownership",
     )
     require_order(
         send_impl,
-        "memcpy(rt_data, frame, FRAME_LEN)",
+        "memcpy(rt_data, frame, frame_len)",
         "return WKI_OK",
         "TASK_SUBMIT borrow retained synchronously before send returns",
     )
@@ -2213,8 +2213,9 @@ def test_receiver_vfs_ref_submit_uses_bounded_worker_pool() -> None:
         ],
         "reliable compute RX admission results",
     )
+    direct_compute_admission = rx_body[rx_body.index("wki_remote_compute_admit_rx(msg, hdr, payload, PAYLOAD_LEN, ch, ch->generation)") :]
     require_order(
-        rx_body,
+        direct_compute_admission,
         "wki_remote_compute_admit_rx(msg, hdr, payload, PAYLOAD_LEN, ch, ch->generation)",
         "ch->rx_seq++",
         "direct compute admission before reliable consumption",

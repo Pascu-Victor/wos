@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <net/address.hpp>
+#include <net/wki/auth.hpp>
 #include <net/wki/wire.hpp>
 #include <platform/sys/spinlock.hpp>
 
@@ -133,10 +134,13 @@ constexpr uint16_t WKI_NET_RX_CREDITS = 64;
 // -----------------------------------------------------------------------------
 
 // Optional ingress identity copied by the chaos boundary before a transport's
-// receive storage expires. Non-Ethernet transports leave this absent.
+// receive storage expires. Point-to-point transports may provide their
+// provisioned direct WKI peer instead of an Ethernet source MAC.
 struct WkiRxMetadata {
     bool has_src_mac = false;
     proto::MacAddress src_mac = {};
+    bool has_direct_peer = false;
+    uint16_t direct_peer = WKI_NODE_INVALID;
 };
 
 // RX callback type: called by transport when a frame arrives.
@@ -241,6 +245,14 @@ struct WkiPeer {
     uint32_t local_channel_epoch = 0;
     uint32_t remote_channel_epoch = 0;
     uint32_t remote_boot_epoch = 0;
+    std::array<uint8_t, WKI_AUTH_NONCE_SIZE> remote_auth_nonce = {};
+    // Cryptographic identity/session state is peer-owned. The lifecycle gate
+    // prevents replacement or erasure while RX readers verify immutable keys.
+    WkiAuthSession auth_session = {};
+    // Dynamic channel numbers are one-shot within an authenticated session.
+    // A session/epoch rotation clears this bitmap before sequence space can
+    // restart, preventing a captured frame from crossing channel reuse.
+    std::array<std::atomic<uint64_t>, 4> auth_dynamic_channel_ids_used{};
     // Packed lifecycle admission: the high bit is exclusive writer intent and
     // the low bits count admitted RX readers. A single atomic modification
     // order prevents teardown and a new RX handler from both entering.
@@ -324,8 +336,8 @@ struct WkiReorderEntry {
 // Channel - per-peer, per-channel reliability and flow control
 // -----------------------------------------------------------------------------
 
-// Max frame size: WKI header + max Ethernet payload
-constexpr size_t WKI_MAX_FRAME_SIZE = WKI_HEADER_SIZE + WKI_ETH_MAX_PAYLOAD;
+// Max authenticated frame size remains inside the pre-existing jumbo envelope.
+constexpr size_t WKI_MAX_FRAME_SIZE = WKI_HEADER_SIZE + WKI_ETH_MAX_PAYLOAD + WKI_AUTH_TRAILER_SIZE;
 
 struct WkiChannel {
     uint16_t channel_id = 0;
@@ -333,6 +345,8 @@ struct WkiChannel {
     PriorityClass priority = PriorityClass::LATENCY;
     bool active = false;
     uint32_t generation = 0;  // Incremented on each pool-slot allocation.
+    // Serializes the bounded out-of-lock MAC build for one new reliable frame.
+    bool tx_build_in_progress = false;
 
     // Reliability (seq/ack)
     uint32_t tx_seq = 0;           // next seq to send
@@ -466,6 +480,12 @@ struct WkiPeerDiag {
     uint32_t local_channel_epoch = 0;
     uint32_t remote_channel_epoch = 0;
     uint32_t remote_boot_epoch = 0;
+    bool auth_active = false;
+    uint16_t auth_key_id = 0;
+    uint32_t auth_generation = 0;
+    uint64_t auth_policy = 0;
+    uint64_t auth_tx_counter = 0;
+    uint64_t auth_rx_counter_high = 0;
     uint16_t replacement_node_id = WKI_NODE_INVALID;
     uint32_t lifecycle_state = 0;
     bool compute_reset_cleanup_pending = false;
@@ -524,6 +544,7 @@ struct WkiState {
     uint16_t max_channels = WKI_MAX_CHANNELS;
     uint32_t rdma_zone_bitmap = 0;
     uint32_t local_boot_epoch = 1;
+    std::array<uint8_t, WKI_AUTH_NONCE_SIZE> local_auth_nonce = {};
 
     // LSA state
     uint32_t my_lsa_seq = 0;
@@ -627,6 +648,9 @@ auto wki_send_on_channel_identity_split(const WkiChannelIdentity& identity, MsgT
 
 // Send a raw frame (bypasses reliability - used for HELLO, HEARTBEAT)
 auto wki_send_raw(uint16_t dst_node, MsgType msg_type, const void* payload, uint16_t payload_len, uint8_t flags = 0) -> int;
+
+// Send a payload-free authenticated control carrier (standalone ACK paths).
+auto wki_send_authenticated_header(WkiTransport* transport, uint16_t next_hop, const WkiHeader& header) -> int;
 
 // -----------------------------------------------------------------------------
 // Public API - RX Dispatch (called by transport layer)
@@ -835,7 +859,7 @@ auto wki_selftest_split_payload_validation_and_copy() -> bool;
 
 namespace detail {
 
-void handle_hello(WkiTransport* transport, const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len);
+void handle_hello(WkiTransport* transport, const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len, bool session_confirmed);
 void handle_hello_ack(WkiTransport* transport, const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len);
 void handle_heartbeat(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len);
 void handle_heartbeat_ack(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len);

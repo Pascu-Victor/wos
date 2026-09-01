@@ -13,15 +13,29 @@ namespace ker::net::wki {
 
 constexpr uint16_t WKI_ETHERTYPE = 0x88B7;
 constexpr uint16_t WKI_ETHERTYPE_ROCE = 0x88B8;  // RoCE RDMA data frames (L2, MAC-based GIDs)
-constexpr uint8_t WKI_VERSION = 2;
+constexpr uint8_t WKI_VERSION = 3;
 constexpr uint32_t WKI_HELLO_MAGIC = 0x574B4900;  // "WKI\0"
 constexpr uint16_t WKI_NODE_INVALID = 0x0000;
 constexpr uint16_t WKI_NODE_BROADCAST = 0xFFFF;
 constexpr uint8_t WKI_DEFAULT_TTL = 16;
 constexpr size_t WKI_HEADER_SIZE = 32;
 
-// Maximum WKI payload with jumbo frames: 9000 - 14 (eth hdr) - 32 (wki hdr)
-constexpr size_t WKI_ETH_MAX_PAYLOAD = 8954;
+constexpr size_t WKI_AUTH_SESSION_ID_SIZE = 16;
+constexpr size_t WKI_AUTH_TAG_SIZE = 16;
+
+struct WkiAuthTrailer {
+    std::array<uint8_t, WKI_AUTH_SESSION_ID_SIZE> session_id{};
+    uint64_t counter = 0;
+    std::array<uint8_t, WKI_AUTH_TAG_SIZE> tag{};
+} __attribute__((packed));
+
+static_assert(sizeof(WkiAuthTrailer) == 40, "WKI authentication trailer must be 40 bytes");
+
+constexpr size_t WKI_AUTH_TRAILER_SIZE = sizeof(WkiAuthTrailer);
+
+// Keep every authenticated L2 frame within the existing 9000-byte Ethernet
+// envelope: Ethernet header + WKI header + payload + authentication trailer.
+constexpr size_t WKI_ETH_MAX_PAYLOAD = 8954 - WKI_AUTH_TRAILER_SIZE;
 
 // -----------------------------------------------------------------------------
 // Header Flags (lower 4 bits of version_flags byte)
@@ -60,6 +74,7 @@ enum class MsgType : uint8_t {
     RESOURCE_ADVERT = 0x0A,
     RESOURCE_WITHDRAW = 0x0B,
     PEER_GOODBYE = 0x0C,
+    HELLO_CONFIRM = 0x0D,
 
     // Zone management (channel 1)
     ZONE_CREATE_REQ = 0x20,
@@ -181,6 +196,8 @@ constexpr uint16_t WKI_CAP_NET_IPV6_STATE = 0x0020;
 // Both peers understand the bounded, replay-safe remote xattr transfer
 // protocol carried by OP_VFS_XATTR.
 constexpr uint16_t WKI_CAP_VFS_XATTR = 0x0040;
+constexpr uint16_t WKI_AUTH_SUITE_HMAC_SHA256_HKDF_SHA256 = 1;
+constexpr size_t WKI_AUTH_NONCE_SIZE = 32;
 
 // Hostname constants
 constexpr size_t WKI_HOSTNAME_MAX = 64;  // Matches Linux HOST_NAME_MAX (including NUL)
@@ -197,10 +214,30 @@ struct HelloPayload {
     std::array<uint8_t, 8> reserved{};
     // --- V2 extension (offset 32) ---
     std::array<char, WKI_HOSTNAME_MAX> hostname{};  // sender's hostname, UTF-8, NUL-terminated if shorter than WKI_HOSTNAME_MAX
+    // --- V3 authenticated-session extension (offset 96) ---
+    uint16_t auth_suite{};
+    uint16_t auth_key_id{};
+    std::array<uint8_t, WKI_AUTH_NONCE_SIZE> auth_nonce{};
+    uint32_t auth_reserved{};
+    // --- V3 challenge-confirmation extension (offset 136) ---
+    std::array<uint8_t, WKI_AUTH_NONCE_SIZE> auth_echo_nonce{};
+    uint32_t auth_echo_channel_epoch{};
 } __attribute__((packed));
 
-static_assert(sizeof(HelloPayload) == 96, "HelloPayload must be 96 bytes");
+static_assert(sizeof(HelloPayload) == 172, "HelloPayload must be 172 bytes");
 static_assert(offsetof(HelloPayload, hostname) == 32, "HelloPayload hostname offset must stay wire-compatible");
+static_assert(offsetof(HelloPayload, auth_suite) == 96, "HelloPayload v3 extension must be append-only");
+static_assert(offsetof(HelloPayload, auth_echo_nonce) == 136, "HelloPayload confirmation extension must be append-only");
+
+constexpr auto wki_hello_boot_epoch(const HelloPayload& hello) -> uint32_t {
+    return static_cast<uint32_t>(hello.reserved.at(4)) | (static_cast<uint32_t>(hello.reserved.at(5)) << 8U) |
+           (static_cast<uint32_t>(hello.reserved.at(6)) << 16U) | (static_cast<uint32_t>(hello.reserved.at(7)) << 24U);
+}
+
+constexpr auto wki_hello_channel_epoch(const HelloPayload& hello) -> uint32_t {
+    return static_cast<uint32_t>(hello.reserved.at(0)) | (static_cast<uint32_t>(hello.reserved.at(1)) << 8U) |
+           (static_cast<uint32_t>(hello.reserved.at(2)) << 16U) | (static_cast<uint32_t>(hello.reserved.at(3)) << 24U);
+}
 
 // -----------------------------------------------------------------------------
 // HEARTBEAT Payload - 16 bytes
@@ -728,6 +765,7 @@ enum class DevAttachStatus : uint8_t {
     BUSY = 3,
     NO_PASSTHROUGH = 4,
     STALE_RESOURCE = 5,
+    ACCESS_DENIED = 6,
 };
 
 struct DevAttachAckPayload {
@@ -1226,6 +1264,7 @@ enum class TaskRejectReason : uint8_t {
     NO_MEM = 2,
     BINARY_NOT_FOUND = 3,
     FETCH_FAILED = 4,
+    UNAUTHORIZED = 5,
 };
 
 struct TaskResponsePayload {

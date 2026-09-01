@@ -1,0 +1,84 @@
+{
+  "zones": [
+    {
+      "id": "GLOBAL",
+      "debug": false,
+      "mtu": 9000,
+      "nic_model": "virtio-net-pci",
+      "ivshmem": {"enabled": false},
+      "bridge": {"stp": false, "ip": null},
+      "vm": {
+        "memory": "4G",
+        "cpus": 4,
+        "disk0": "disk.qcow2",
+        "disk1": "mountfs.qcow2"
+      }
+    },
+    {
+      "id": 0,
+      "name": "wki-a",
+      "nodes": 2,
+      "node_ids": [0, 1],
+      "nic_queues": 1,
+      "vhost": false,
+      "netdev_driver": "wki",
+      "qemu_netdev": {
+        "type": "socket-mcast",
+        "address": "239.192.89.2",
+        "port": 47822,
+        "localaddr": "127.0.0.1"
+      },
+      "ivshmem": {"enabled": false},
+      "nodes_config": [
+        {
+          "id": 0,
+          "hostname": "wos-0",
+          "vm": {
+            "overlay_dir": "wki-chaos-data/auth-rootless-overlays",
+            "serial_log": "wki-chaos-data/auth-rootless-serial-vm0.log",
+            "qemu_log": "wki-chaos-data/auth-rootless-qemu-vm0.log",
+            "qmp_socket": "wki-chaos-data/auth-rootless-qmp-vm0.sock"
+          }
+        },
+        {
+          "id": 1,
+          "hostname": "wos-1",
+          "vm": {
+            "overlay_dir": "wki-chaos-data/auth-rootless-overlays",
+            "serial_log": "wki-chaos-data/auth-rootless-serial-vm1.log",
+            "qemu_log": "wki-chaos-data/auth-rootless-qemu-vm1.log",
+            "qmp_socket": "wki-chaos-data/auth-rootless-qmp-vm1.sock"
+          }
+        }
+      ]
+    },
+    {
+      "id": 1,
+      "name": "wki-b",
+      "nodes": 2,
+      "node_ids": [1, 2],
+      "nic_queues": 1,
+      "vhost": false,
+      "netdev_driver": "wki",
+      "qemu_netdev": {
+        "type": "socket-mcast",
+        "address": "239.192.89.3",
+        "port": 47823,
+        "localaddr": "127.0.0.1"
+      },
+      "ivshmem": {"enabled": false},
+      "nodes_config": [
+        {
+          "id": 2,
+          "hostname": "wos-2",
+          "vm": {
+            "overlay_dir": "wki-chaos-data/auth-rootless-overlays",
+            "serial_log": "wki-chaos-data/auth-rootless-serial-vm2.log",
+            "qemu_log": "wki-chaos-data/auth-rootless-qemu-vm2.log",
+            "qmp_socket": "wki-chaos-data/auth-rootless-qmp-vm2.sock"
+          }
+        }
+      ]
+    }
+  ]
+}

@@ -422,6 +422,18 @@ def build_qemu_args(
         )
 
     fw_cfg = {"opt/wos/hostname": node_hostname(spec)}
+    if spec.get("ivshmem"):
+        # The generic dmaN driver probes before WKI. Reserve cluster-provisioned
+        # shared-memory devices for the authenticated WKI message transport.
+        fw_cfg["opt/wos/wki-ivshmem"] = "1"
+        role = int(spec["ivshmem"][0].get("role", 0))
+        if role not in (0, 1):
+            raise ValueError("ivshmem role must be 0 or 1")
+        fw_cfg["opt/wos/wki-ivshmem-role"] = str(role)
+        peer = int(spec["ivshmem"][0].get("peer", 0))
+        if peer <= 0 or peer >= 0xFFFF:
+            raise ValueError("ivshmem WKI peer must be in [1, 65534]")
+        fw_cfg["opt/wos/wki-ivshmem-peer"] = str(peer)
     assignments = netdev_assignments(spec)
     if assignments:
         fw_cfg["opt/wos/netdevs"] = ";".join(
@@ -431,6 +443,14 @@ def build_qemu_args(
         fw_cfg[entry["name"]] = entry["string"]
     for name, value in fw_cfg.items():
         args.extend(["-fw_cfg", f"name={name},string={value}"])
+    for entry in spec.get("fw_cfg_files", []):
+        name = entry["name"]
+        path = Path(entry["path"])
+        if not path.is_file():
+            raise ValueError(f"fw_cfg file for {name} does not exist: {path}")
+        if path.stat().st_mode & 0o077:
+            raise ValueError(f"fw_cfg secret file for {name} must be mode 0600: {path}")
+        args.extend(["-fw_cfg", f"name={name},file={path.resolve()}"])
 
     if node_debug_enabled(spec, force_debug=force_debug):
         gdb_port = int(vm_cfg.get("gdb_port", 1234 + nid))

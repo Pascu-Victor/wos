@@ -12,6 +12,7 @@ REMOTABLE_CPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "remotable.c
 REMOTE_VFS_CPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "remote_vfs.cpp"
 ROUTING_CPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "routing.cpp"
 TRANSPORT_ETH_CPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "transport_eth.cpp"
+TRANSPORT_IVSHMEM_CPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "transport_ivshmem.cpp"
 NETDEVCONF_CPP = ROOT / "modules" / "kern" / "src" / "util" / "netdevconf.cpp"
 INIT_WRAPPERS_CPP = ROOT / "modules" / "kern" / "src" / "platform" / "init" / "init_wrappers.cpp"
 WIRE_HPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "wire.hpp"
@@ -156,8 +157,8 @@ def test_hello_boot_epoch_fences_connected_broadcast_restarts() -> None:
     require_order(
         handle_hello,
         "peer_advance_local_channel_epoch(peer)",
-        "wki_peer_send_hello_ack(peer)",
-        "HELLO boot epoch reset must publish a reciprocal channel epoch",
+        "if (!session_confirmed)",
+        "HELLO boot epoch reset must publish a reciprocal channel epoch before confirmation",
     )
     require_order(
         handle_hello,
@@ -211,8 +212,12 @@ def test_hello_boot_epoch_fences_connected_broadcast_restarts() -> None:
         if token not in (ROOT / "modules" / "kern" / "src" / "net" / "wki" / "wki.hpp").read_text():
             fail(f"WKI state is missing {token}")
 
-    if "g_wki.local_boot_epoch = wki_nonzero_epoch_from_seed" not in wki_source:
-        fail("wki_init must assign a nonzero local boot epoch")
+    require_order(
+        function_body(wki_source, "wki_init"),
+        "ker::mod::random::entropy::get_bytes(&boot_epoch",
+        "g_wki.local_boot_epoch = boot_epoch == 0 ? 1 : boot_epoch",
+        "wki_init must assign a hardware-random nonzero local boot epoch",
+    )
 
     ktest_source = WKI_PEER_LIVENESS_KTEST.read_text()
     for token in [
@@ -694,6 +699,32 @@ def test_routed_lsa_peer_identity_handshake_does_not_promote_origin_to_neighbor(
         "forwarded origins must be rejected before direct Ethernet contact learning",
     )
 
+    rx = function_body(wki_source, "wki_rx")
+    for token in [
+        "AUTHENTICATED_HELLO",
+        "hdr->hop_ttl == 1",
+        "wki_peer_note_rx_contact(transport, hdr->src_node, metadata->src_mac)",
+    ]:
+        if token not in rx:
+            fail(f"authenticated TTL=1 HELLO direct-contact proof is missing: {token}")
+    require_order(
+        rx,
+        "wki_auth_verify_frame",
+        "wki_peer_note_rx_contact(transport, hdr->src_node, metadata->src_mac)",
+        "direct contact must be learned only after frame authentication",
+    )
+
+    source_mac = function_body(transport_source, "wki_eth_transport_source_mac")
+    for token in ["transport->tx != eth_wki_tx", "priv->netdev->mac"]:
+        if token not in source_mac:
+            fail(f"direct HELLO source-MAC selection is missing: {token}")
+    direct_hello = function_body(peer_source, "wki_peer_send_hello")
+    if "wki_eth_transport_source_mac(transport, hello.mac_addr)" not in direct_hello:
+        fail("direct HELLO must advertise the selected Ethernet transport MAC")
+    hello_ack = function_body(peer_source, "wki_peer_send_hello_ack")
+    if "wki_eth_transport_source_mac(peer->transport, ack.mac_addr)" not in hello_ack:
+        fail("direct HELLO_ACK must advertise the selected Ethernet transport MAC")
+
     find_transport = function_body(wki_source, "find_transport_for_peer")
     if "peer->is_direct && (peer->transport != nullptr)" not in find_transport:
         fail("a routed peer must not bypass current-SPF next-hop transport selection")
@@ -956,6 +987,129 @@ def test_fenced_logical_successor_terminalizes_old_detach_identity() -> None:
             fail(f"deferred detach identity invalidation is missing {token}")
 
 
+def test_authenticated_hello_requires_session_key_confirmation() -> None:
+    auth = (ROOT / "modules/kern/src/net/wki/auth.cpp").read_text()
+    rx = function_body(WKI_CPP.read_text(), "wki_rx")
+
+    hello_case = rx[rx.index("case MsgType::HELLO:") : rx.index("case MsgType::HELLO_ACK:")]
+    ack_case = rx[rx.index("case MsgType::HELLO_ACK:") : rx.index("case MsgType::HELLO_CONFIRM:")]
+    confirm_case = rx[rx.index("case MsgType::HELLO_CONFIRM:") : rx.index("case MsgType::HEARTBEAT:")]
+
+    require_order(
+        hello_case,
+        "wki_auth_prepare_peer_session(peer",
+        "wki_peer_send_hello_ack(peer)",
+        "a new HELLO must stage responder keys before emitting its challenge response",
+    )
+    if "if (SESSION_CURRENT)" not in hello_case:
+        fail("a pending HELLO must not publish topology or resources before confirmation")
+    for before, after in [
+        ("wki_auth_install_peer_session(peer", "wki_peer_send_hello_confirm(peer)"),
+        ("wki_peer_send_hello_confirm(peer)", "wki_lsa_replay_to_peer(peer->node_id)"),
+    ]:
+        require_order(
+            ack_case,
+            before,
+            after,
+            "the initiator must install the derived key and confirm it before publication",
+        )
+    for before, after in [
+        ("AUTH_RESULT == WkiAuthFrameResult::PENDING_CONFIRMATION", "wki_auth_confirm_peer_session(peer)"),
+        ("wki_auth_confirm_peer_session(peer)", "detail::handle_hello(transport, hdr, payload, PAYLOAD_LEN, true)"),
+        ("detail::handle_hello(transport, hdr, payload, PAYLOAD_LEN, true)", "wki_lsa_replay_to_peer(peer->node_id)"),
+    ]:
+        require_order(
+            confirm_case,
+            before,
+            after,
+            "the responder must verify and promote pending keys before becoming connected",
+        )
+
+    verify = function_body(auth, "wki_auth_verify_frame")
+    for token in [
+        "MsgType::HELLO_CONFIRM",
+        "peer->auth_session.pending",
+        "trailer.session_id == peer->auth_session.pending_session_id",
+        "trailer.counter == 1",
+        "WkiAuthFrameResult::PENDING_CONFIRMATION",
+    ]:
+        if token not in verify:
+            fail(f"pending-session confirmation gate is missing {token}")
+
+    prepare = function_body(auth, "wki_auth_prepare_peer_session")
+    for token in [
+        "peer->auth_session.retired_session_valid",
+        "erase_pending_session(peer->auth_session)",
+        "peer->auth_session.pending = true",
+    ]:
+        if token not in prepare:
+            fail(f"pending-session rollback protection is missing {token}")
+
+    retire = function_body(auth, "wki_auth_retire_peer_session")
+    if "erase_pending_session(peer->auth_session)" not in retire:
+        fail("peer teardown must erase unconfirmed session keys")
+
+
+def test_cluster_ivshmem_ownership_is_selected_before_generic_probe() -> None:
+    ivshmem_init = function_body(INIT_WRAPPERS_CPP.read_text(), "ivshmem_init")
+    for token in [
+        'cmdline_has_token(get_kernel_cmdline(), "wki.ivshmem")',
+        'fw_cfg_flag_enabled("opt/wos/wki-ivshmem")',
+        "return;",
+        "dev::ivshmem::ivshmem_net_init()",
+    ]:
+        if token not in ivshmem_init:
+            fail(f"early WKI ivshmem ownership selection is missing {token}")
+    require_order(
+        ivshmem_init,
+        'fw_cfg_flag_enabled("opt/wos/wki-ivshmem")',
+        "dev::ivshmem::ivshmem_net_init()",
+        "WKI ownership must be decided before the generic ivshmem probe",
+    )
+
+
+def test_ivshmem_direct_identity_is_bounded_and_authenticated() -> None:
+    wki_rx = function_body(WKI_CPP.read_text(), "wki_rx")
+    transport_source = TRANSPORT_IVSHMEM_CPP.read_text()
+    drain = function_body(transport_source, "drain_rx_ring")
+
+    require_order(
+        wki_rx,
+        "wki_version(hdr->version_flags) != WKI_VERSION",
+        "wki_auth_verify_frame",
+        "unsupported wire versions must fail before authentication",
+    )
+    require_order(
+        wki_rx,
+        "wki_auth_verify_frame",
+        "metadata->has_direct_peer",
+        "ivshmem contact metadata must be consumed only after authentication",
+    )
+    for token in [
+        "metadata->direct_peer == hdr->src_node",
+        "AUTHENTICATED_HELLO",
+        "hdr->hop_ttl == 1",
+        "wki_peer_note_rx_contact(transport, hdr->src_node, hello->mac_addr, false)",
+    ]:
+        if token not in wki_rx:
+            fail(f"ivshmem direct-contact proof is missing {token}")
+
+    for token in [
+        "budget == 0",
+        "priv->rx_drain_active.test_and_set(std::memory_order_acquire)",
+        "processed < budget",
+        ".has_direct_peer = priv->direct_peer != WKI_NODE_INVALID",
+        ".direct_peer = priv->direct_peer",
+        "priv->rx_drain_active.clear(std::memory_order_release)",
+    ]:
+        if token not in drain:
+            fail(f"bounded single-drainer ivshmem receive path is missing {token}")
+
+    poll = function_body(transport_source, "wki_ivshmem_transport_poll")
+    if "drain_rx_ring(&s_ivshmem_priv, budget)" not in poll:
+        fail("rootless ivshmem polling must share the bounded IRQ receive path")
+
+
 def main() -> None:
     test_hello_ack_reconnects_fenced_peer_outside_peer_lock()
     test_hello_boot_epoch_fences_connected_broadcast_restarts()
@@ -973,6 +1127,9 @@ def main() -> None:
     test_cross_channel_ack_scan_uses_allocated_range_bounds()
     test_fence_drains_deferred_vfs_bindings_before_remote_fd_cleanup()
     test_fenced_logical_successor_terminalizes_old_detach_identity()
+    test_authenticated_hello_requires_session_key_confirmation()
+    test_cluster_ivshmem_ownership_is_selected_before_generic_probe()
+    test_ivshmem_direct_identity_is_bounded_and_authenticated()
     print("WKI peer source invariants hold")
 
 

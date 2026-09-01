@@ -806,6 +806,8 @@ auto dev_attach_status_to_errno(uint8_t status) -> int {
             return -EOPNOTSUPP;
         case DevAttachStatus::STALE_RESOURCE:
             return -ESTALE;
+        case DevAttachStatus::ACCESS_DENIED:
+            return -EACCES;
     }
     return -EIO;
 }

@@ -13,17 +13,18 @@
 namespace wkictl {
 
 auto usage() -> int {
-    std::println(stderr,
-                 "usage:\n  locally <command> [args...]\n  remotely <command> [args...]\n  anywhere <command> [args...]\n  homeward "
-                 "<command> [args...]\n  on <hostname> "
-                 "<command> [args...]\n  forward "
-                 "[--clear] [--target <auto|local|remote|balanced|hostname>] [--one-shot] "
-                 "[+include_path] [-exclude_path] [--] <command> [args...]\n  wosid\n  wkictl "
-                 "target <show|clear|set>\n  wkictl vfs <list|defaults|clear|add|probe>\n  wkictl perf <show>\n  wkictl chaos "
-                 "<clear|disable|enable|heal|release|rule> [key=value ...]\n  wkictl chaos wait id=<u32> applied=<u32> "
-                 "timeout_ms=<1..300000>\n  chaos rule extras: op=<u16|*> corrupt=<checksum|payload> payload_offset=<u16> "
-                 "payload_xor=<nonzero-u8>\n  wkictl chaos-workload <strict-command> [key=value ...]\n  wkictl chaos-workload "
-                 "compute-publish-wait waiters=1 timeout_ms=<1..300000>\n  wkictl wosid");
+    std::println(
+        stderr,
+        "usage:\n  locally <command> [args...]\n  remotely <command> [args...]\n  anywhere <command> [args...]\n  homeward "
+        "<command> [args...]\n  on <hostname> "
+        "<command> [args...]\n  forward "
+        "[--clear] [--target <auto|local|remote|balanced|hostname>] [--one-shot] "
+        "[+include_path] [-exclude_path] [--] <command> [args...]\n  wosid\n  wkictl "
+        "target <show|clear|set>\n  wkictl auth status\n  wkictl vfs <list|defaults|clear|add|probe>\n  wkictl perf <show>\n  wkictl chaos "
+        "<clear|disable|enable|heal|release|rule> [key=value ...]\n  wkictl chaos wait id=<u32> applied=<u32> "
+        "timeout_ms=<1..300000>\n  chaos rule extras: op=<u16|*> corrupt=<checksum|payload> payload_offset=<u16> "
+        "payload_xor=<nonzero-u8>\n  wkictl chaos-workload <strict-command> [key=value ...]\n  wkictl chaos-workload "
+        "compute-publish-wait waiters=1 timeout_ms=<1..300000>\n  wkictl wosid");
     return 1;
 }
 

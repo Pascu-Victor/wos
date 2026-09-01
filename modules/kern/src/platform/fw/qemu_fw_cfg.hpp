@@ -9,4 +9,8 @@ namespace ker::platform::fw {
 // Maximum name length: 55 chars (QEMU limit).  buf must be at least buf_size bytes.
 auto fw_cfg_read_file(const char* name, void* buf, size_t buf_size) -> int;
 
+// Query a named file without reading it. Exact-size consumers use this before
+// fw_cfg_read_file() so truncation cannot be mistaken for valid provisioning.
+auto fw_cfg_file_size(const char* name, size_t* size_out) -> bool;
+
 }  // namespace ker::platform::fw

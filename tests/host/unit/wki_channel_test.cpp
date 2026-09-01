@@ -29,6 +29,10 @@ auto wki_transport_send(WkiTransport* transport, uint16_t neighbor_id, const voi
     return transport->tx(transport, neighbor_id, data, len);
 }
 
+auto wki_send_authenticated_header(WkiTransport* transport, uint16_t next_hop, const WkiHeader& header) -> int {
+    return wki_transport_send(transport, next_hop, &header, sizeof(header));
+}
+
 }  // namespace ker::net::wki
 
 // =============================================================================

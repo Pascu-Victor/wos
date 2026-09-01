@@ -17,7 +17,15 @@ using namespace ker::net::wki;
 
 TEST(WkiWire, HeaderIs32Bytes) { EXPECT_EQ(sizeof(WkiHeader), 32u); }
 
-TEST(WkiWire, HelloPayloadIs96Bytes) { EXPECT_EQ(sizeof(HelloPayload), 96u); }
+TEST(WkiWire, HelloPayloadIs172Bytes) { EXPECT_EQ(sizeof(HelloPayload), 172u); }
+
+TEST(WkiWire, V3AuthenticationBoundaryIsSecureOnlyAndMtuBounded) {
+    EXPECT_EQ(WKI_VERSION, 3u);
+    EXPECT_EQ(sizeof(WkiAuthTrailer), 40u);
+    EXPECT_EQ(WKI_ETH_MAX_PAYLOAD, 8914u);
+    EXPECT_EQ(14u + WKI_HEADER_SIZE + WKI_ETH_MAX_PAYLOAD + WKI_AUTH_TRAILER_SIZE, 9000u);
+    EXPECT_NE(wki_version_flags(WKI_VERSION, 0), wki_version_flags(2, 0));
+}
 
 TEST(WkiWire, HeartbeatPayloadIs16Bytes) { EXPECT_EQ(sizeof(HeartbeatPayload), 16u); }
 
@@ -151,7 +159,7 @@ TEST(WkiWire, VfsMultiRdmaCapabilityAndAuxFlagPreserveLayouts) {
     EXPECT_EQ(WKI_CAP_VFS_MULTI_RDMA_LANES, 0x0008u);
     EXPECT_EQ(DEV_ATTACH_VFS_AUX_LANE, 0x80u);
     EXPECT_EQ(DEV_ATTACH_VFS_AUX_LANE & (DEV_ATTACH_MODE_KIND_MASK | DEV_ATTACH_ACCESS_MASK | DEV_ATTACH_DISABLE_RDMA), 0);
-    EXPECT_EQ(sizeof(HelloPayload), 96u);
+    EXPECT_EQ(sizeof(HelloPayload), 172u);
     EXPECT_EQ(sizeof(DevAttachReqPayload), 12u);
 
     uint8_t const ANCHOR_RDMA = wki_vfs_proxy_attach_mode(true, true);
@@ -465,7 +473,7 @@ TEST(WkiWire, VfsMetadataBatchUsesAdditiveBoundedFraming) {
               WKI_ETH_MAX_PAYLOAD);
     EXPECT_LE(sizeof(DevOpRespPayload) + sizeof(VfsMetadataBatchHeader) + VFS_METADATA_BATCH_MAX_ITEMS * sizeof(int32_t),
               WKI_ETH_MAX_PAYLOAD);
-    EXPECT_EQ(sizeof(HelloPayload), 96u);
+    EXPECT_EQ(sizeof(HelloPayload), 172u);
 }
 
 TEST(WkiWire, VfsXattrUsesVersionedBoundedReplayIdentity) {

@@ -7,6 +7,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 set(WKICTL_SOURCES
+    src/auth.cpp
     src/chaos.cpp
     src/cli.cpp
     src/dispatch.cpp

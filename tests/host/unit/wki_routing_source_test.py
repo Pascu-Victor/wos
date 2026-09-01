@@ -111,9 +111,60 @@ def test_wki_send_paths_consume_route_snapshots() -> None:
     )
 
 
+def test_new_session_replays_current_lsa_after_key_install() -> None:
+    header = ROUTING_HPP.read_text()
+    routing = ROUTING_CPP.read_text()
+    wki = WKI_CPP.read_text()
+
+    require_tokens(
+        header,
+        ["void wki_lsa_replay_to_peer(uint16_t peer_node);"],
+        "authenticated LSA replay declaration",
+    )
+    replay = function_body(routing, "wki_lsa_replay_to_peer")
+    require_order(
+        replay,
+        [
+            "peer->state != PeerState::CONNECTED || !peer->is_direct",
+            "s_routing_lock.lock()",
+            "lsdb_find(g_wki.my_node_id)",
+            "s_routing_lock.unlock()",
+            "wki_send(peer_node, WKI_CHAN_CONTROL, MsgType::LSA",
+        ],
+        "current LSA replay must snapshot under the routing lock and transmit after unlock",
+    )
+
+    rx = function_body(wki, "wki_rx")
+    if rx.count("wki_lsa_replay_to_peer(peer->node_id);") != 3:
+        fail("current HELLO, HELLO_ACK, and confirmed responder sessions must replay the current LSA")
+    require_order(
+        rx,
+        [
+            "wki_auth_install_peer_session(peer",
+            "if (installed)",
+            "wki_peer_send_hello_confirm(peer)",
+            "wki_lsa_replay_to_peer(peer->node_id)",
+            "wki_resource_advertise_to_peer(peer->node_id)",
+        ],
+        "HELLO_ACK must install and confirm keys before topology or resource replay",
+    )
+    require_order(
+        rx,
+        [
+            "AUTH_RESULT == WkiAuthFrameResult::PENDING_CONFIRMATION",
+            "wki_auth_confirm_peer_session(peer)",
+            "detail::handle_hello(transport, hdr, payload, PAYLOAD_LEN, true)",
+            "wki_lsa_replay_to_peer(peer->node_id)",
+            "wki_resource_advertise_to_peer(peer->node_id)",
+        ],
+        "the responder must promote a confirmed session before topology or resource replay",
+    )
+
+
 def main() -> None:
     test_routing_lookup_returns_locked_snapshot()
     test_wki_send_paths_consume_route_snapshots()
+    test_new_session_replays_current_lsa_after_key_install()
     print("WKI routing source invariants hold")
 
 

@@ -258,6 +258,35 @@ void wki_lsa_generate_and_flood() {
 #endif
 }
 
+void wki_lsa_replay_to_peer(uint16_t peer_node) {
+    WkiPeer const* peer = wki_peer_find(peer_node);
+    if (peer == nullptr || peer->state != PeerState::CONNECTED || !peer->is_direct) {
+        return;
+    }
+
+    constexpr size_t BUF_SIZE = sizeof(LsaPayload) + (WKI_MAX_NEIGHBORS_PER_LSA * sizeof(LsaNeighborEntry));
+    std::array<uint8_t, BUF_SIZE> buf{};
+    uint16_t payload_len = 0;
+
+    s_routing_lock.lock();
+    LsdbEntry const* entry = lsdb_find(g_wki.my_node_id);
+    if (entry != nullptr && entry->valid && entry->num_neighbors <= WKI_MAX_NEIGHBORS_PER_LSA) {
+        auto* lsa = reinterpret_cast<LsaPayload*>(buf.data());
+        lsa->origin_node = entry->origin_node;
+        lsa->lsa_seq = entry->lsa_seq;
+        lsa->num_neighbors = entry->num_neighbors;
+        lsa->rdma_zone_bitmap = entry->rdma_zone_bitmap;
+        std::span<LsaNeighborEntry> const DEST{lsa_neighbors(lsa), lsa->num_neighbors};
+        std::ranges::copy_n(entry->neighbors.begin(), lsa->num_neighbors, DEST.begin());
+        payload_len = static_cast<uint16_t>(sizeof(LsaPayload) + (lsa->num_neighbors * sizeof(LsaNeighborEntry)));
+    }
+    s_routing_lock.unlock();
+
+    if (payload_len != 0) {
+        static_cast<void>(wki_send(peer_node, WKI_CHAN_CONTROL, MsgType::LSA, buf.data(), payload_len));
+    }
+}
+
 // -----------------------------------------------------------------------------
 // LSA reception handler (detail::handle_lsa)
 // -----------------------------------------------------------------------------

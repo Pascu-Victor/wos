@@ -48,6 +48,7 @@
 #include <vfs/stat.hpp>
 #include <vfs/vfs.hpp>
 
+#include "net/wki/auth.hpp"
 #include "net/wki/blk_ring.hpp"
 #include "net/wki/chaos.hpp"
 #include "net/wki/chaos_model.hpp"
@@ -691,6 +692,14 @@ auto procfs_readdir(File* f, DirEntry* buf, size_t count) -> int {
             buf->d_reclen = sizeof(DirEntry);
             buf->d_type = DT_REG;
             std::memcpy(buf->d_name.data(), "chaos_workload", 15);
+            return 0;
+        }
+        if (count == 7) {
+            buf->d_ino = 26;
+            buf->d_off = 8;
+            buf->d_reclen = sizeof(DirEntry);
+            buf->d_type = DT_REG;
+            std::memcpy(buf->d_name.data(), "auth", 5);
             return 0;
         }
         return -ENOENT;
@@ -1879,6 +1888,41 @@ auto generate_wki_peers(char* buf, size_t bufsz) -> size_t {
         append_row(row.hostname, row.node_id, row.state == ker::net::wki::PeerState::CONNECTED, CPUS, LOAD_PCT, LAST_UPDATE, false);
     }
 
+    buf[off] = '\0';
+    return off;
+}
+
+auto generate_wki_auth(char* buf, size_t bufsz) -> size_t {
+    if (bufsz == 0) {
+        return 0;
+    }
+    size_t off = 0;
+    int const HEADER = std::snprintf(
+        buf, bufsz, "protocol secure_only local_node ready\n%u 1 %u %u\npeer active key_id generation policy tx_counter rx_high\n",
+        ker::net::wki::WKI_VERSION, ker::net::wki::wki_auth_local_node_id(), ker::net::wki::wki_auth_ready() ? 1U : 0U);
+    if (HEADER <= 0) {
+        return 0;
+    }
+    off = std::min(static_cast<size_t>(HEADER), bufsz - 1);
+
+    auto* peers = new (std::nothrow) ker::net::wki::WkiPeerDiag[ker::net::wki::WKI_PEER_DIAG_MAX];
+    if (peers == nullptr) {
+        buf[off] = '\0';
+        return off;
+    }
+    size_t const COUNT = ker::net::wki::wki_peer_diag_snapshot(peers, ker::net::wki::WKI_PEER_DIAG_MAX);
+    for (size_t index = 0; index < COUNT && off < bufsz - 1; ++index) {
+        auto const& peer = peers[index];
+        int const LENGTH = std::snprintf(buf + off, bufsz - off, "%u %u %u %u 0x%llx %llu %llu\n", peer.node_id, peer.auth_active ? 1U : 0U,
+                                         peer.auth_key_id, peer.auth_generation, static_cast<unsigned long long>(peer.auth_policy),
+                                         static_cast<unsigned long long>(peer.auth_tx_counter),
+                                         static_cast<unsigned long long>(peer.auth_rx_counter_high));
+        if (LENGTH <= 0) {
+            break;
+        }
+        off += std::min(static_cast<size_t>(LENGTH), bufsz - off - 1);
+    }
+    delete[] peers;
     buf[off] = '\0';
     return off;
 }
@@ -5708,6 +5752,9 @@ auto procfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
             case ProcNodeType::WKI_PEERS_FILE:
                 pfd->content_len = generate_wki_peers(pfd->content, MAX_PROCFS_BUF);
                 break;
+            case ProcNodeType::WKI_AUTH_FILE:
+                pfd->content_len = generate_wki_auth(pfd->content, MAX_PROCFS_BUF);
+                break;
             case ProcNodeType::WKI_NETDIAG_FILE:
                 pfd->content_len = generate_wki_netdiag(pfd->content, MAX_MEMACC_BUF);
                 break;
@@ -6671,6 +6718,10 @@ auto procfs_open_path(const char* path, int flags, int mode) -> File* {
     // /proc/wki/peers
     if (strcmp(path, "wki/peers") == 0) {
         return make_file(ProcNodeType::WKI_PEERS_FILE, 0, false);
+    }
+
+    if (strcmp(path, "wki/auth") == 0) {
+        return make_file(ProcNodeType::WKI_AUTH_FILE, 0, false);
     }
 
     // /proc/wki/netdiag
