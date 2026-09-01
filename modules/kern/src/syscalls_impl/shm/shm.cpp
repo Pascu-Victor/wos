@@ -253,7 +253,7 @@ void rollback_attachment_pages(ker::mod::sched::task::Task* task, const ShmSegme
 
     for (uint64_t i = 0; i < mapped_pages; ++i) {
         uint64_t const PAGE_ADDR = addr + (i * ker::mod::mm::paging::PAGE_SIZE);
-        if (ker::mod::mm::virt::translate(task->pagemap, PAGE_ADDR) == backing_paddr(*segment, i)) {
+        if (ker::mod::sys::usercopy::mapped_physical_address(*task, PAGE_ADDR) == backing_paddr(*segment, i)) {
             ker::mod::mm::virt::unmap_page(task->pagemap, PAGE_ADDR);
         }
     }
@@ -469,7 +469,7 @@ auto shmdt_impl(uint64_t shmaddr) -> uint64_t {
 
     for (uint64_t i = 0; segment != nullptr && i < segment->page_count; ++i) {
         uint64_t const ADDR = DETACHED.addr + (i * ker::mod::mm::paging::PAGE_SIZE);
-        if (ker::mod::mm::virt::translate(task->pagemap, ADDR) == backing_paddr(*segment, i)) {
+        if (ker::mod::sys::usercopy::mapped_physical_address(*task, ADDR) == backing_paddr(*segment, i)) {
             ker::mod::mm::virt::unmap_page(task->pagemap, ADDR);
         }
     }

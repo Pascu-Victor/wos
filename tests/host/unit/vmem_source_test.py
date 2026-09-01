@@ -380,7 +380,7 @@ def test_sysv_shm_publication_respects_vm_reservations_and_guards() -> None:
     )
     require_tokens(
         function_body(shm, "rollback_attachment_pages"),
-        ["translate(task->pagemap, PAGE_ADDR) == backing_paddr(*segment, i)"],
+        ["usercopy::mapped_physical_address(*task, PAGE_ADDR) == backing_paddr(*segment, i)"],
         "SysV SHM rollback must not unmap a replacement publisher's page",
     )
 
@@ -392,7 +392,7 @@ def test_sysv_shm_publication_respects_vm_reservations_and_guards() -> None:
             "g_lock.lock_irqsave();",
             "ShmAttachment const DETACHED = *attachment;",
             "g_lock.unlock_irqrestore(FLAGS);",
-            "translate(task->pagemap, ADDR) == backing_paddr(*segment, i)",
+            "usercopy::mapped_physical_address(*task, ADDR) == backing_paddr(*segment, i)",
             "unmap_page(task->pagemap, ADDR);",
             "g_lock.lock_irqsave();",
             "detach_attachment_locked(*attachment, task);",

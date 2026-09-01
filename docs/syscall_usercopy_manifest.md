@@ -325,6 +325,7 @@ pagemap. Tracer ABI layout and register ordering are unchanged.
 | `PTRACE` | `WRITE_MEM` | `in/out` | fixed MemIo plus checked tracer input and target range of requested size | no | descriptor `transferred` records written prefix | input chunks snapshot before pinned target writes; descriptor preflight precedes transfer |
 | `PTRACE` | `GET_MAPS` | `none` | n/a | n/a | none | currently returns `-ENOSYS` |
 | `PTRACE` | `GET_IMAGES` | `in/out` | fixed ImageList plus at most two fixed ImageRecord outputs | descriptor no; array yes for count query | descriptor count reports total | output preflight precedes record copyout |
+| `PTRACE` | `GET_IMAGE_CATALOG` | `in/out` | fixed 40-byte versioned ImageCatalogList plus at most `runtime::MAX_IMAGES` fixed 352-byte records | descriptor no; array yes for count query | descriptor count and snapshot status report the result | descriptor/version validation and output preflight precede bounded record copyout |
 | `PTRACE` | `GET_REMOTE_INFO` | `out` | one fixed 104-byte RemoteInfo | no | none | builds zero-initialized record before copyout |
 | `PTRACE` | `SET_HW_BREAK` | `in` | one fixed HwBreak | no | none | snapshot/validation precede debug-register mutation |
 | `PTRACE` | `DEL_HW_BREAK` | `in` | one fixed HwBreak | no | none | snapshot/validation precede debug-register mutation |
