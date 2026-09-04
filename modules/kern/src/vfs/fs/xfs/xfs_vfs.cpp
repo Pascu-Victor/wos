@@ -21,6 +21,7 @@
 #include <platform/sched/scheduler.hpp>
 #include <platform/sys/mutex.hpp>
 #include <platform/sys/spinlock.hpp>
+#include <utility>
 #include <vfs/buffer_cache.hpp>
 #include <vfs/file.hpp>
 #include <vfs/file_operations.hpp>
@@ -4076,6 +4077,370 @@ auto xfs_readlink_cached_inode(XfsMountContext* ctx, xfs_ino_t ino, const char* 
 
 }  // namespace
 
+XfsLookupHandle::XfsLookupHandle(XfsLookupHandle&& other) noexcept
+    : mount_(other.mount_),
+      parent_(other.parent_),
+      target_(other.target_),
+      leaf_(other.leaf_),
+      path_(other.path_),
+      leaf_length_(other.leaf_length_),
+      path_length_(other.path_length_),
+      expected_parent_generation_(other.expected_parent_generation_),
+      expected_mutation_sequence_(other.expected_mutation_sequence_),
+      target_existed_(other.target_existed_),
+      root_target_(other.root_target_) {
+    other.mount_ = nullptr;
+    other.parent_ = nullptr;
+    other.target_ = nullptr;
+    other.leaf_length_ = 0;
+    other.path_length_ = 0;
+    other.expected_parent_generation_ = 0;
+    other.expected_mutation_sequence_ = 0;
+    other.target_existed_ = false;
+    other.root_target_ = false;
+}
+
+auto XfsLookupHandle::operator=(XfsLookupHandle&& other) noexcept -> XfsLookupHandle& {
+    if (this != &other) {
+        reset();
+        mount_ = other.mount_;
+        parent_ = other.parent_;
+        target_ = other.target_;
+        leaf_ = other.leaf_;
+        path_ = other.path_;
+        leaf_length_ = other.leaf_length_;
+        path_length_ = other.path_length_;
+        expected_parent_generation_ = other.expected_parent_generation_;
+        expected_mutation_sequence_ = other.expected_mutation_sequence_;
+        target_existed_ = other.target_existed_;
+        root_target_ = other.root_target_;
+        other.mount_ = nullptr;
+        other.parent_ = nullptr;
+        other.target_ = nullptr;
+        other.leaf_length_ = 0;
+        other.path_length_ = 0;
+        other.expected_parent_generation_ = 0;
+        other.expected_mutation_sequence_ = 0;
+        other.target_existed_ = false;
+        other.root_target_ = false;
+    }
+    return *this;
+}
+
+XfsLookupHandle::~XfsLookupHandle() { reset(); }
+
+void XfsLookupHandle::reset() {
+    XfsInode* const TARGET = target_;
+    XfsInode* const PARENT = parent_;
+    mount_ = nullptr;
+    parent_ = nullptr;
+    target_ = nullptr;
+    leaf_length_ = 0;
+    path_length_ = 0;
+    expected_parent_generation_ = 0;
+    expected_mutation_sequence_ = 0;
+    target_existed_ = false;
+    root_target_ = false;
+    xfs_inode_release(TARGET);
+    xfs_inode_release(PARENT);
+}
+
+auto xfs_acquire_lookup(const char* fs_path, XfsMountContext* ctx, XfsLookupHandle* out, size_t known_fs_path_len) -> int {
+    if (fs_path == nullptr || ctx == nullptr || out == nullptr) {
+        return -EINVAL;
+    }
+
+    *out = XfsLookupHandle{};
+    XfsMetadataGuard metadata_guard(ctx, true, WOS_PERF_CALLSITE());
+
+    size_t const INPUT_PATH_LENGTH = known_fs_path_len != UNKNOWN_XFS_PATH_LEN ? known_fs_path_len : std::strlen(fs_path);
+    if (INPUT_PATH_LENGTH == 0 || (INPUT_PATH_LENGTH == 1 && fs_path[0] == '/')) {
+        XfsInode* parent = xfs_root_inode_read(ctx);
+        XfsInode* target = xfs_root_inode_read(ctx);
+        if (parent == nullptr || target == nullptr) {
+            xfs_inode_release_metadata_locked(target);
+            xfs_inode_release_metadata_locked(parent);
+            return -ENOENT;
+        }
+        XfsLookupHandle result{};
+        result.mount_ = ctx;
+        result.parent_ = parent;
+        result.target_ = target;
+        result.path_.front() = '/';
+        result.path_.at(1) = '\0';
+        result.path_length_ = 1;
+        result.expected_parent_generation_ = parent->dir_generation;
+        result.expected_mutation_sequence_ = ctx->mutation_sequence.load(std::memory_order_acquire);
+        result.target_existed_ = true;
+        result.root_target_ = true;
+        *out = std::move(result);
+        return 0;
+    }
+
+    XfsInode* parent = nullptr;
+    const char* name = nullptr;
+    uint16_t name_length = 0;
+    size_t path_length = UNKNOWN_XFS_PATH_LEN;
+    int const PARENT_RET =
+        xfs_find_parent_and_name(fs_path, ctx, &parent, &name, &name_length, nullptr, false, known_fs_path_len, &path_length);
+    if (PARENT_RET != 0) {
+        return PARENT_RET;
+    }
+
+    size_t actual_name_length = 0;
+    while (name[actual_name_length] != '\0') {
+        ++actual_name_length;
+    }
+    if (actual_name_length == 0 || actual_name_length >= XFS_LOOKUP_LEAF_CAPACITY || actual_name_length != name_length ||
+        path_length >= XFS_LOOKUP_PATH_CAPACITY) {
+        xfs_inode_release_metadata_locked(parent);
+        return actual_name_length >= XFS_LOOKUP_LEAF_CAPACITY || path_length >= XFS_LOOKUP_PATH_CAPACITY ? -ENAMETOOLONG : -EINVAL;
+    }
+
+    XfsDirEntry entry{};
+    int const LOOKUP_RET = xfs_dir_lookup_authoritative(parent, name, name_length, &entry);
+    XfsInode* target = nullptr;
+    if (LOOKUP_RET == 0) {
+        target = xfs_inode_read_known_allocated(ctx, entry.ino);
+        if (target == nullptr) {
+            xfs_inode_release_metadata_locked(parent);
+            return -ENOENT;
+        }
+    } else if (LOOKUP_RET != -ENOENT) {
+        xfs_inode_release_metadata_locked(parent);
+        return LOOKUP_RET;
+    }
+
+    XfsLookupHandle result{};
+    result.mount_ = ctx;
+    result.parent_ = parent;
+    result.target_ = target;
+    std::memcpy(result.leaf_.data(), name, actual_name_length);
+    result.leaf_.at(actual_name_length) = '\0';
+    std::memcpy(result.path_.data(), fs_path, path_length);
+    result.path_.at(path_length) = '\0';
+    result.leaf_length_ = name_length;
+    result.path_length_ = path_length;
+    result.expected_parent_generation_ = parent->dir_generation;
+    result.expected_mutation_sequence_ = ctx->mutation_sequence.load(std::memory_order_acquire);
+    result.target_existed_ = target != nullptr;
+    *out = std::move(result);
+    return 0;
+}
+
+auto xfs_acquire_lookup_at_file(File* directory, const char* relative_path, XfsLookupHandle* out) -> int {
+    if (directory == nullptr || out == nullptr) {
+        return -EBADF;
+    }
+    if (relative_path == nullptr || relative_path[0] == '\0' || relative_path[0] == '/') {
+        return -EINVAL;
+    }
+    if (directory->fs_type != FSType::XFS || directory->private_data == nullptr) {
+        return -EBADF;
+    }
+    if (!directory->is_directory) {
+        return -ENOTDIR;
+    }
+
+    auto* xfd = static_cast<XfsFileData*>(directory->private_data);
+    if (xfd->mount == nullptr || xfd->inode == nullptr) {
+        return -EBADF;
+    }
+    std::array<char, XFS_LOOKUP_PATH_CAPACITY> pending{};
+    size_t input_length = 0;
+    while (relative_path[input_length] != '\0') {
+        if (input_length >= pending.size() - 1) {
+            return -ENAMETOOLONG;
+        }
+        pending.at(input_length) = relative_path[input_length];
+        ++input_length;
+    }
+    pending.at(input_length) = '\0';
+
+    *out = XfsLookupHandle{};
+    XfsMetadataGuard metadata_guard(xfd->mount, true, WOS_PERF_CALLSITE());
+
+    XfsInode* current = xfs_inode_read_cached(xfd->mount, xfd->inode->ino);
+    if (current == nullptr || current != xfd->inode) {
+        xfs_inode_release_metadata_locked(current);
+        return -EAGAIN;
+    }
+    if (!xfs_inode_isdir(current)) {
+        xfs_inode_release_metadata_locked(current);
+        return -ENOTDIR;
+    }
+    if (current->nlink == 0) {
+        xfs_inode_release_metadata_locked(current);
+        return -ENOENT;
+    }
+
+    constexpr unsigned MAX_LOOKUP_SYMLINKS = 8;
+    const char* cursor = pending.data();
+    size_t path_length = 0;
+    unsigned symlink_depth = 0;
+    for (;;) {
+        while (*cursor == '/') {
+            ++cursor;
+            ++path_length;
+        }
+        const char* const COMPONENT = cursor;
+        size_t component_length = 0;
+        while (cursor[component_length] != '\0' && cursor[component_length] != '/') {
+            if (component_length >= XFS_LOOKUP_LEAF_CAPACITY - 1 || path_length + component_length >= XFS_LOOKUP_PATH_CAPACITY - 1) {
+                xfs_inode_release_metadata_locked(current);
+                return -ENAMETOOLONG;
+            }
+            ++component_length;
+        }
+        if (component_length == 0) {
+            xfs_inode_release_metadata_locked(current);
+            return -EINVAL;
+        }
+        cursor += component_length;
+        const char* rest = cursor;
+        while (*rest == '/') {
+            ++rest;
+        }
+        bool const FINAL_COMPONENT = *rest == '\0';
+        auto const COMPONENT_LENGTH = static_cast<uint16_t>(component_length);
+
+        XfsDirEntry entry{};
+        int const LOOKUP_RET = xfs_dir_lookup_authoritative(current, COMPONENT, COMPONENT_LENGTH, &entry);
+        XfsInode* target = nullptr;
+        if (LOOKUP_RET == 0) {
+            target = xfs_inode_read_known_allocated(xfd->mount, entry.ino);
+            if (target == nullptr) {
+                xfs_inode_release_metadata_locked(current);
+                return -ENOENT;
+            }
+        } else if (LOOKUP_RET != -ENOENT || !FINAL_COMPONENT) {
+            xfs_inode_release_metadata_locked(current);
+            return LOOKUP_RET;
+        }
+
+        if (!FINAL_COMPONENT) {
+            if (xfs_inode_islnk(target)) {
+                if (symlink_depth == MAX_LOOKUP_SYMLINKS) {
+                    xfs_inode_release_metadata_locked(target);
+                    xfs_inode_release_metadata_locked(current);
+                    return -ELOOP;
+                }
+                ++symlink_depth;
+                std::array<char, XFS_LOOKUP_PATH_CAPACITY> link_target{};
+                int const READ_RESULT = xfs_readlink(target, link_target.data(), link_target.size() - 1);
+                xfs_inode_release_metadata_locked(target);
+                if (READ_RESULT < 0) {
+                    xfs_inode_release_metadata_locked(current);
+                    return READ_RESULT;
+                }
+                size_t const TARGET_LENGTH = static_cast<size_t>(READ_RESULT);
+                if (TARGET_LENGTH == 0) {
+                    xfs_inode_release_metadata_locked(current);
+                    return -ENOENT;
+                }
+                link_target.at(TARGET_LENGTH) = '\0';
+                size_t const REST_LENGTH = std::strlen(rest);
+                bool const NEED_SEPARATOR = REST_LENGTH != 0 && link_target.at(TARGET_LENGTH - 1) != '/';
+                if (TARGET_LENGTH + (NEED_SEPARATOR ? 1 : 0) + REST_LENGTH >= pending.size()) {
+                    xfs_inode_release_metadata_locked(current);
+                    return -ENAMETOOLONG;
+                }
+                std::array<char, XFS_LOOKUP_PATH_CAPACITY> replacement{};
+                std::memcpy(replacement.data(), link_target.data(), TARGET_LENGTH);
+                size_t replacement_length = TARGET_LENGTH;
+                if (NEED_SEPARATOR) {
+                    replacement.at(replacement_length++) = '/';
+                }
+                if (REST_LENGTH != 0) {
+                    std::memcpy(replacement.data() + replacement_length, rest, REST_LENGTH);
+                    replacement_length += REST_LENGTH;
+                }
+                replacement.at(replacement_length) = '\0';
+                bool const ABSOLUTE_TARGET = replacement.front() == '/';
+                pending = replacement;
+                cursor = pending.data();
+                path_length = 0;
+                if (ABSOLUTE_TARGET) {
+                    XfsInode* root = xfs_root_inode_read(xfd->mount);
+                    xfs_inode_release_metadata_locked(current);
+                    if (root == nullptr) {
+                        return -ENOENT;
+                    }
+                    current = root;
+                }
+                while (*cursor == '/') {
+                    ++cursor;
+                    ++path_length;
+                }
+                continue;
+            }
+            if (!xfs_inode_isdir(target)) {
+                xfs_inode_release_metadata_locked(target);
+                xfs_inode_release_metadata_locked(current);
+                return -ENOTDIR;
+            }
+            xfs_inode_release_metadata_locked(current);
+            current = target;
+            cursor = rest;
+            path_length = static_cast<size_t>(cursor - pending.data());
+            continue;
+        }
+
+        XfsLookupHandle result{};
+        result.mount_ = xfd->mount;
+        result.parent_ = current;
+        result.target_ = target;
+        std::memcpy(result.leaf_.data(), COMPONENT, component_length);
+        result.leaf_.at(component_length) = '\0';
+        result.leaf_length_ = COMPONENT_LENGTH;
+        // A dirfd-relative handle intentionally has no textual path identity.
+        // Mutation consumers conservatively invalidate mount path caches.
+        result.path_.front() = '\0';
+        result.path_length_ = 0;
+        result.expected_parent_generation_ = current->dir_generation;
+        result.expected_mutation_sequence_ = xfd->mount->mutation_sequence.load(std::memory_order_acquire);
+        result.target_existed_ = target != nullptr;
+        *out = std::move(result);
+        return 0;
+    }
+}
+
+auto xfs_validate_lookup_locked(const XfsLookupHandle& handle) -> int {
+    XfsMountContext* const MOUNT = handle.mount_;
+    XfsInode* const PARENT = handle.parent_;
+    if (MOUNT == nullptr || PARENT == nullptr || PARENT->mount != MOUNT || !xfs_inode_isdir(PARENT)) {
+        return -EINVAL;
+    }
+    if (MOUNT->mutation_sequence.load(std::memory_order_acquire) != handle.expected_mutation_sequence_ ||
+        PARENT->dir_generation != handle.expected_parent_generation_ || PARENT->nlink == 0) {
+        return -EAGAIN;
+    }
+    if (handle.root_target_) {
+        return handle.target_existed_ && handle.target_ == PARENT ? 0 : -EAGAIN;
+    }
+
+    XfsDirEntry current{};
+    int const LOOKUP_RET = xfs_dir_lookup_authoritative(PARENT, handle.leaf_.data(), handle.leaf_length_, &current);
+    if (!handle.target_existed_) {
+        if (LOOKUP_RET == -ENOENT) {
+            return 0;
+        }
+        return LOOKUP_RET == 0 ? -EAGAIN : LOOKUP_RET;
+    }
+    if (LOOKUP_RET != 0) {
+        return LOOKUP_RET == -ENOENT ? -EAGAIN : LOOKUP_RET;
+    }
+    return handle.target_ != nullptr && current.ino == handle.target_->ino ? 0 : -EAGAIN;
+}
+
+auto xfs_validate_lookup(const XfsLookupHandle& handle) -> int {
+    if (handle.mount() == nullptr) {
+        return -EINVAL;
+    }
+    XfsMetadataGuard metadata_guard(handle.mount(), true, WOS_PERF_CALLSITE());
+    return xfs_validate_lookup_locked(handle);
+}
+
 auto xfs_readlink_path(const char* fs_path, char* buf, size_t bufsize, XfsMountContext* ctx, size_t known_fs_path_len) -> ssize_t {
     if (fs_path == nullptr || buf == nullptr || bufsize == 0 || ctx == nullptr) {
         return -EINVAL;
@@ -6600,6 +6965,793 @@ auto xfs_unlink_path(const char* fs_path, XfsMountContext* ctx, size_t known_fs_
     xfs_inode_release_metadata_locked(parent_ip);
 
     return (rc == 0) ? 0 : -EIO;
+}
+
+namespace {
+
+auto xfs_lookup_target_locked(const XfsLookupHandle& handle, XfsInode** target_out) -> int {
+    int const VALIDATE_RET = xfs_validate_lookup_locked(handle);
+    if (VALIDATE_RET != 0) {
+        return VALIDATE_RET;
+    }
+    if (!handle.target_existed() || handle.target() == nullptr) {
+        return -ENOENT;
+    }
+    *target_out = handle.target();
+    return 0;
+}
+
+auto xfs_validate_lookup_pair_locked(const XfsLookupHandle& source, const XfsLookupHandle& destination) -> int {
+    if (source.mount() == nullptr || destination.mount() == nullptr || source.mount() != destination.mount()) {
+        return -EXDEV;
+    }
+    int const SOURCE_RET = xfs_validate_lookup_locked(source);
+    if (SOURCE_RET != 0) {
+        return SOURCE_RET;
+    }
+    return xfs_validate_lookup_locked(destination);
+}
+
+void xfs_invalidate_lookup_path(const XfsLookupHandle& handle) {
+    if (handle.path_length() == 0) {
+        xfs_path_inode_cache_bump_generation();
+        return;
+    }
+    xfs_path_inode_cache_invalidate_path(handle.mount(), handle.path(), handle.path_length());
+}
+
+}  // namespace
+
+auto xfs_open_lookup(const XfsLookupHandle& handle, int flags, int mode, bool require_directory, int* result_out) -> File* {
+    XfsMountContext* const MOUNT = handle.mount();
+    if (MOUNT == nullptr) {
+        xfs_set_open_result(result_out, -EINVAL);
+        return nullptr;
+    }
+
+    XfsMetadataGuard metadata_guard(MOUNT, true, WOS_PERF_CALLSITE());
+    int const VALIDATE_RET = xfs_validate_lookup_locked(handle);
+    if (VALIDATE_RET != 0) {
+        xfs_set_open_result(result_out, VALIDATE_RET);
+        return nullptr;
+    }
+
+    XfsInode* inode = nullptr;
+    bool created_by_open = false;
+    if (handle.target_existed()) {
+        if ((flags & (ker::vfs::O_CREAT | ker::vfs::O_EXCL)) == (ker::vfs::O_CREAT | ker::vfs::O_EXCL)) {
+            xfs_set_open_result(result_out, -EEXIST);
+            return nullptr;
+        }
+        inode = xfs_inode_read_cached(MOUNT, handle.target()->ino);
+        if (inode == nullptr || inode != handle.target()) {
+            xfs_inode_release_metadata_locked(inode);
+            xfs_set_open_result(result_out, -EAGAIN);
+            return nullptr;
+        }
+    } else {
+        if ((flags & ker::vfs::O_CREAT) == 0) {
+            xfs_set_open_result(result_out, -ENOENT);
+            return nullptr;
+        }
+        if (MOUNT->read_only) {
+            xfs_set_open_result(result_out, -EROFS);
+            return nullptr;
+        }
+
+        XfsTransaction* transaction = xfs_trans_alloc(MOUNT);
+        if (transaction == nullptr) {
+            xfs_set_open_result(result_out, -ENOMEM);
+            return nullptr;
+        }
+        int const FILE_MODE = mode == 0 ? 0666 : mode;
+        uint16_t const INODE_MODE = static_cast<uint16_t>(FILE_MODE & 0xFFF) | 0100000;
+        xfs_ino_t const NEW_INO = xfs_ialloc(MOUNT, transaction, INODE_MODE);
+        if (NEW_INO == NULLFSINO) {
+            xfs_trans_cancel(transaction);
+            xfs_set_open_result(result_out, -ENOSPC);
+            return nullptr;
+        }
+        if (xfs_ialloc_conflicts_with_cached_inode(MOUNT, NEW_INO)) {
+            xfs_trans_cancel(transaction);
+            xfs_set_open_result(result_out, -EIO);
+            return nullptr;
+        }
+
+        auto* new_inode = xfs_inode_alloc_uninitialized_object();
+        if (new_inode == nullptr) {
+            xfs_trans_cancel(transaction);
+            xfs_set_open_result(result_out, -ENOMEM);
+            return nullptr;
+        }
+        new_inode->ino = NEW_INO;
+        new_inode->mount = MOUNT;
+        new_inode->agno = xfs_ino_ag(NEW_INO, MOUNT->agino_log);
+        new_inode->agino = xfs_ag_ino(NEW_INO, MOUNT->agino_log);
+        new_inode->mode = INODE_MODE;
+        new_inode->uid = 0;
+        new_inode->gid = 0;
+        new_inode->nlink = 1;
+        new_inode->size = 0;
+        new_inode->nblocks = 0;
+        new_inode->gen = 0;
+        new_inode->flags = 0;
+        new_inode->flags2 = 0;
+        new_inode->atime = 0;
+        new_inode->mtime = 0;
+        new_inode->ctime = 0;
+        new_inode->crtime = 0;
+        new_inode->data_fork.format = XFS_DINODE_FMT_EXTENTS;
+        new_inode->data_fork.extents.list = nullptr;
+        new_inode->data_fork.extents.count = 0;
+        new_inode->data_fork.extents.capacity = 0;
+        new_inode->forkoff = 0;
+        new_inode->attr_fork.format = XFS_DINODE_FMT_LOCAL;
+        new_inode->attr_fork.local.data = nullptr;
+        new_inode->attr_fork.local.size = 0;
+        new_inode->has_attr_fork = false;
+        new_inode->nextents = 0;
+        new_inode->anextents = 0;
+        new_inode->refcount = 0;
+        new_inode->hash_next = nullptr;
+        new_inode->inactivation_started = false;
+        new_inode->dirty = false;
+        new_inode->dir_generation = 0;
+        new_inode->dir_leaf_index_complete_generation = 0;
+        new_inode->dir_leaf_index_complete = false;
+        for (auto& word : new_inode->dir_name_filter) {
+            word = 0;
+        }
+        new_inode->dir_name_filter_complete = false;
+        xfs_stamp_new_inode(new_inode);
+        xfs_trans_log_inode(transaction, new_inode);
+
+        int result =
+            xfs_dir_addname(handle.parent(), handle.leaf(), handle.leaf_length(), NEW_INO, XFS_DIR3_FT_REG_FILE, transaction, true);
+        if (result != 0) {
+            xfs_trans_cancel(transaction);
+            xfs_inode_free_uncached(new_inode);
+            xfs_set_open_result(result_out, result);
+            return nullptr;
+        }
+        result = xfs_trans_commit(transaction);
+        if (result != 0) {
+            xfs_inode_free_uncached(new_inode);
+            xfs_set_open_result(result_out, -EIO);
+            return nullptr;
+        }
+        result = xfs_inode_cache_new(new_inode);
+        if (result != 0) {
+            mod::dbg::log("[xfs] committed retained-open inode %lu could not enter inode cache: %d", static_cast<unsigned long>(NEW_INO),
+                          result);
+            xfs_inode_free_uncached(new_inode);
+            xfs_set_open_result(result_out, result);
+            return nullptr;
+        }
+        xfs_invalidate_lookup_path(handle);
+        inode = new_inode;
+        created_by_open = true;
+    }
+
+    if (require_directory && !xfs_inode_isdir(inode)) {
+        xfs_inode_release_metadata_locked(inode);
+        xfs_set_open_result(result_out, -ENOTDIR);
+        return nullptr;
+    }
+    int const ACCESS_MODE = flags & 3;
+    if ((ACCESS_MODE == 1 || ACCESS_MODE == 2) && MOUNT->read_only) {
+        xfs_inode_release_metadata_locked(inode);
+        xfs_set_open_result(result_out, -EROFS);
+        return nullptr;
+    }
+
+    Stat opened_stat{};
+    fill_stat(inode, &opened_stat);
+    const char* const HANDLE_PATH = handle.path_length() == 0 ? nullptr : handle.path();
+    metadata_guard.unlock();
+    return xfs_file_from_inode(MOUNT, inode, flags, HANDLE_PATH, handle.path_length(), created_by_open, opened_stat, result_out);
+}
+
+auto xfs_stat_lookup(const XfsLookupHandle& handle, bool require_directory, Stat* statbuf) -> int {
+    if (handle.mount() == nullptr || statbuf == nullptr) {
+        return -EINVAL;
+    }
+    XfsMetadataGuard metadata_guard(handle.mount(), true, WOS_PERF_CALLSITE());
+    XfsInode* target = nullptr;
+    int const LOOKUP_RET = xfs_lookup_target_locked(handle, &target);
+    if (LOOKUP_RET != 0) {
+        return LOOKUP_RET;
+    }
+    if (require_directory && !xfs_inode_isdir(target)) {
+        return -ENOTDIR;
+    }
+    fill_stat(target, statbuf);
+    return 0;
+}
+
+auto xfs_readlink_lookup(const XfsLookupHandle& handle, char* buf, size_t bufsize) -> ssize_t {
+    if (handle.mount() == nullptr || buf == nullptr || bufsize == 0) {
+        return -EINVAL;
+    }
+    XfsMetadataGuard metadata_guard(handle.mount(), true, WOS_PERF_CALLSITE());
+    XfsInode* target = nullptr;
+    int const LOOKUP_RET = xfs_lookup_target_locked(handle, &target);
+    if (LOOKUP_RET != 0) {
+        return LOOKUP_RET;
+    }
+    if (!xfs_inode_islnk(target)) {
+        return -EINVAL;
+    }
+    int const RET = xfs_readlink(target, buf, bufsize);
+    return RET < 0 ? RET : static_cast<ssize_t>(RET);
+}
+
+auto xfs_chmod_lookup(const XfsLookupHandle& handle, int mode, Stat* statbuf) -> int {
+    XfsMountContext* const MOUNT = handle.mount();
+    if (MOUNT == nullptr) {
+        return -EINVAL;
+    }
+    if (MOUNT->read_only) {
+        return -EROFS;
+    }
+    XfsMetadataGuard metadata_guard(MOUNT, true, WOS_PERF_CALLSITE());
+    XfsInode* target = nullptr;
+    int const LOOKUP_RET = xfs_lookup_target_locked(handle, &target);
+    if (LOOKUP_RET != 0) {
+        return LOOKUP_RET;
+    }
+    static constexpr uint16_t XFS_IFMT = 0xF000;
+    static constexpr uint16_t XFS_PERM_MASK = 07777;
+    target->mode = (target->mode & XFS_IFMT) | (static_cast<uint16_t>(mode) & XFS_PERM_MASK);
+    target->dirty = true;
+    XfsTransaction* tp = xfs_trans_alloc(MOUNT);
+    if (tp == nullptr) {
+        return -ENOMEM;
+    }
+    xfs_trans_log_inode(tp, target);
+    int const RET = xfs_trans_commit(tp);
+    if (RET == 0 && statbuf != nullptr) {
+        fill_stat(target, statbuf);
+    }
+    return RET == 0 ? 0 : -EIO;
+}
+
+auto xfs_utimens_lookup(const XfsLookupHandle& handle, const Timespec& atime, const Timespec& mtime, bool set_atime, bool set_mtime,
+                        Stat* statbuf) -> int {
+    XfsMountContext* const MOUNT = handle.mount();
+    if (MOUNT == nullptr) {
+        return -EINVAL;
+    }
+    if (MOUNT->read_only) {
+        return -EROFS;
+    }
+    XfsMetadataGuard metadata_guard(MOUNT, true, WOS_PERF_CALLSITE());
+    XfsInode* target = nullptr;
+    int const LOOKUP_RET = xfs_lookup_target_locked(handle, &target);
+    if (LOOKUP_RET != 0) {
+        return LOOKUP_RET;
+    }
+    return xfs_set_inode_times(MOUNT, target, atime, mtime, set_atime, set_mtime, statbuf);
+}
+
+auto xfs_setxattr_lookup(const XfsLookupHandle& handle, const char* name, const void* value, size_t size, int flags) -> int {
+    XfsMountContext* const MOUNT = handle.mount();
+    if (MOUNT == nullptr) {
+        return -EINVAL;
+    }
+    if (MOUNT->read_only) {
+        return -EROFS;
+    }
+    PublicXattrName parsed{};
+    if (int const RET = parse_public_xattr_name(name, &parsed); RET < 0) {
+        return RET;
+    }
+    XfsMetadataGuard metadata_guard(MOUNT, true, WOS_PERF_CALLSITE());
+    XfsInode* target = nullptr;
+    int const LOOKUP_RET = xfs_lookup_target_locked(handle, &target);
+    return LOOKUP_RET != 0 ? LOOKUP_RET : set_public_xattr_locked(MOUNT, target, parsed, value, size, flags);
+}
+
+auto xfs_getxattr_lookup(const XfsLookupHandle& handle, const char* name, void* value, size_t size) -> ssize_t {
+    if (handle.mount() == nullptr) {
+        return -EINVAL;
+    }
+    PublicXattrName parsed{};
+    if (int const RET = parse_public_xattr_name(name, &parsed); RET < 0) {
+        return RET;
+    }
+    XfsMetadataGuard metadata_guard(handle.mount(), true, WOS_PERF_CALLSITE());
+    XfsInode* target = nullptr;
+    int const LOOKUP_RET = xfs_lookup_target_locked(handle, &target);
+    return LOOKUP_RET != 0 ? LOOKUP_RET : get_public_xattr_locked(target, parsed, value, size);
+}
+
+auto xfs_listxattr_lookup(const XfsLookupHandle& handle, char* list, size_t size) -> ssize_t {
+    if (handle.mount() == nullptr) {
+        return -EINVAL;
+    }
+    XfsMetadataGuard metadata_guard(handle.mount(), true, WOS_PERF_CALLSITE());
+    XfsInode* target = nullptr;
+    int const LOOKUP_RET = xfs_lookup_target_locked(handle, &target);
+    return LOOKUP_RET != 0 ? LOOKUP_RET : list_public_xattrs_locked(target, list, size);
+}
+
+auto xfs_removexattr_lookup(const XfsLookupHandle& handle, const char* name) -> int {
+    XfsMountContext* const MOUNT = handle.mount();
+    if (MOUNT == nullptr) {
+        return -EINVAL;
+    }
+    if (MOUNT->read_only) {
+        return -EROFS;
+    }
+    PublicXattrName parsed{};
+    if (int const RET = parse_public_xattr_name(name, &parsed); RET < 0) {
+        return RET;
+    }
+    XfsMetadataGuard metadata_guard(MOUNT, true, WOS_PERF_CALLSITE());
+    XfsInode* target = nullptr;
+    int const LOOKUP_RET = xfs_lookup_target_locked(handle, &target);
+    return LOOKUP_RET != 0 ? LOOKUP_RET : remove_public_xattr_locked(MOUNT, target, parsed);
+}
+
+auto xfs_mkdir_lookup(const XfsLookupHandle& handle, int mode, Stat* statbuf) -> int {
+    XfsMountContext* const MOUNT = handle.mount();
+    if (MOUNT == nullptr) {
+        return -EINVAL;
+    }
+    if (MOUNT->read_only) {
+        return -EROFS;
+    }
+    XfsMetadataGuard metadata_guard(MOUNT, true, WOS_PERF_CALLSITE());
+    int const VALIDATE_RET = xfs_validate_lookup_locked(handle);
+    if (VALIDATE_RET != 0) {
+        return VALIDATE_RET;
+    }
+    if (handle.target_existed()) {
+        if (statbuf != nullptr && handle.target() != nullptr && xfs_inode_isdir(handle.target())) {
+            fill_stat(handle.target(), statbuf);
+        }
+        return -EEXIST;
+    }
+    XfsInode* const PARENT = handle.parent();
+    if (PARENT->nlink == UINT32_MAX) {
+        return -EMLINK;
+    }
+
+    xfs_ino_t const PARENT_INO = PARENT->ino;
+    int const DIR_MODE = mode == 0 ? 0755 : mode;
+    uint16_t const INODE_MODE = static_cast<uint16_t>(DIR_MODE & 0xFFF) | 0040000;
+    bool const USE_I8 = PARENT_INO > 0xFFFFFFFFULL;
+    size_t const INO_BYTES = USE_I8 ? 8 : 4;
+    size_t const SF_SIZE = 2 + INO_BYTES;
+    auto* new_inode = xfs_inode_alloc_zeroed_object();
+    auto* sf_data = new (std::nothrow) uint8_t[SF_SIZE];
+    if (new_inode == nullptr || sf_data == nullptr) {
+        xfs_inode_free_uncached(new_inode);
+        delete[] sf_data;
+        return -ENOMEM;
+    }
+
+    XfsTransaction* tp = xfs_trans_alloc(MOUNT);
+    if (tp == nullptr) {
+        delete[] sf_data;
+        xfs_inode_free_uncached(new_inode);
+        return -ENOMEM;
+    }
+    xfs_ino_t const NEW_INO = xfs_ialloc(MOUNT, tp, INODE_MODE);
+    if (NEW_INO == NULLFSINO) {
+        xfs_trans_cancel(tp);
+        delete[] sf_data;
+        xfs_inode_free_uncached(new_inode);
+        return -ENOSPC;
+    }
+    if (xfs_ialloc_conflicts_with_cached_inode(MOUNT, NEW_INO)) {
+        xfs_trans_cancel(tp);
+        delete[] sf_data;
+        xfs_inode_free_uncached(new_inode);
+        return -EIO;
+    }
+
+    sf_data[0] = 0;
+    sf_data[1] = USE_I8 ? 1 : 0;
+    if (USE_I8) {
+        for (int i = 7; i >= 0; --i) {
+            sf_data[2 + (7 - i)] = static_cast<uint8_t>((PARENT_INO >> (i * 8)) & 0xFF);
+        }
+    } else {
+        auto const PARENT_32 = static_cast<uint32_t>(PARENT_INO);
+        for (int i = 3; i >= 0; --i) {
+            sf_data[2 + (3 - i)] = static_cast<uint8_t>((PARENT_32 >> (i * 8)) & 0xFF);
+        }
+    }
+
+    new_inode->ino = NEW_INO;
+    new_inode->mount = MOUNT;
+    new_inode->agno = xfs_ino_ag(NEW_INO, MOUNT->agino_log);
+    new_inode->agino = xfs_ag_ino(NEW_INO, MOUNT->agino_log);
+    new_inode->mode = INODE_MODE;
+    new_inode->size = SF_SIZE;
+    new_inode->nlink = 2;
+    new_inode->data_fork.format = XFS_DINODE_FMT_LOCAL;
+    new_inode->data_fork.local.data = sf_data;
+    new_inode->data_fork.local.size = SF_SIZE;
+    xfs_dir_name_filter_init_empty(new_inode);
+    xfs_stamp_new_inode(new_inode);
+    xfs_trans_log_inode(tp, new_inode);
+
+    int rc = xfs_dir_addname(PARENT, handle.leaf(), handle.leaf_length(), NEW_INO, XFS_DIR3_FT_DIR, tp, true);
+    if (rc != 0) {
+        xfs_trans_cancel(tp);
+        xfs_inode_free_uncached(new_inode);
+        return rc;
+    }
+    PARENT->nlink++;
+    PARENT->dirty = true;
+    xfs_trans_log_inode(tp, PARENT);
+    rc = xfs_trans_commit(tp);
+    if (rc != 0) {
+        xfs_inode_free_uncached(new_inode);
+        return rc;
+    }
+    xfs_dentry_cache_invalidate_dir(new_inode);
+    rc = xfs_inode_cache_new(new_inode);
+    if (rc != 0) {
+        mod::dbg::log("[xfs] committed mkdir inode %lu could not enter inode cache: %d", static_cast<unsigned long>(NEW_INO), rc);
+        xfs_inode_free_uncached(new_inode);
+        return rc;
+    }
+    if (statbuf != nullptr) {
+        fill_stat(new_inode, statbuf);
+    }
+    xfs_invalidate_lookup_path(handle);
+    if (handle.path_length() != 0) {
+        xfs_path_inode_cache_store(MOUNT, handle.path(), handle.path_length(), NEW_INO, XFS_DIR3_FT_DIR);
+        xfs_parent_path_cache_store(MOUNT, handle.path(), handle.path_length(), NEW_INO);
+    }
+    xfs_inode_release_metadata_locked(new_inode);
+    return 0;
+}
+
+auto xfs_symlink_lookup(const XfsLookupHandle& handle, const char* target, Stat* statbuf) -> int {
+    XfsMountContext* const MOUNT = handle.mount();
+    if (MOUNT == nullptr || target == nullptr) {
+        return -EINVAL;
+    }
+    if (MOUNT->read_only) {
+        return -EROFS;
+    }
+    size_t target_length = 0;
+    while (target[target_length] != '\0') {
+        ++target_length;
+    }
+    size_t const INLINE_CAPACITY = MOUNT->inode_size > XFS_DINODE_SIZE_V3 ? MOUNT->inode_size - XFS_DINODE_SIZE_V3 : 0;
+    if (target_length > INLINE_CAPACITY) {
+        return -ENAMETOOLONG;
+    }
+
+    XfsMetadataGuard metadata_guard(MOUNT, true, WOS_PERF_CALLSITE());
+    int const VALIDATE_RET = xfs_validate_lookup_locked(handle);
+    if (VALIDATE_RET != 0) {
+        return VALIDATE_RET;
+    }
+    if (handle.target_existed()) {
+        return -EEXIST;
+    }
+    auto* target_data = new (std::nothrow) uint8_t[target_length == 0 ? 1 : target_length];
+    auto* new_inode = xfs_inode_alloc_zeroed_object();
+    if (target_data == nullptr || new_inode == nullptr) {
+        delete[] target_data;
+        xfs_inode_free_uncached(new_inode);
+        return -ENOMEM;
+    }
+    if (target_length != 0) {
+        std::memcpy(target_data, target, target_length);
+    }
+    XfsTransaction* tp = xfs_trans_alloc(MOUNT);
+    if (tp == nullptr) {
+        delete[] target_data;
+        xfs_inode_free_uncached(new_inode);
+        return -ENOMEM;
+    }
+    constexpr uint16_t SYMLINK_MODE = 0120000 | 0777;
+    xfs_ino_t const NEW_INO = xfs_ialloc(MOUNT, tp, SYMLINK_MODE);
+    if (NEW_INO == NULLFSINO) {
+        xfs_trans_cancel(tp);
+        delete[] target_data;
+        xfs_inode_free_uncached(new_inode);
+        return -ENOSPC;
+    }
+    if (xfs_ialloc_conflicts_with_cached_inode(MOUNT, NEW_INO)) {
+        xfs_trans_cancel(tp);
+        delete[] target_data;
+        xfs_inode_free_uncached(new_inode);
+        return -EIO;
+    }
+    new_inode->ino = NEW_INO;
+    new_inode->mount = MOUNT;
+    new_inode->agno = xfs_ino_ag(NEW_INO, MOUNT->agino_log);
+    new_inode->agino = xfs_ag_ino(NEW_INO, MOUNT->agino_log);
+    new_inode->mode = SYMLINK_MODE;
+    new_inode->size = target_length;
+    new_inode->nlink = 1;
+    new_inode->data_fork.format = XFS_DINODE_FMT_LOCAL;
+    new_inode->data_fork.local.data = target_data;
+    new_inode->data_fork.local.size = target_length;
+    xfs_stamp_new_inode(new_inode);
+    xfs_trans_log_inode(tp, new_inode);
+    int rc = xfs_dir_addname(handle.parent(), handle.leaf(), handle.leaf_length(), NEW_INO, XFS_DIR3_FT_SYMLINK, tp, true);
+    if (rc != 0) {
+        xfs_trans_cancel(tp);
+        xfs_inode_free_uncached(new_inode);
+        return rc;
+    }
+    rc = xfs_trans_commit(tp);
+    if (rc != 0) {
+        xfs_inode_free_uncached(new_inode);
+        return -EIO;
+    }
+    rc = xfs_inode_cache_new(new_inode);
+    if (rc != 0) {
+        mod::dbg::log("[xfs] committed symlink inode %lu could not enter inode cache: %d", static_cast<unsigned long>(NEW_INO), rc);
+        xfs_inode_free_uncached(new_inode);
+        return rc;
+    }
+    if (statbuf != nullptr) {
+        fill_stat(new_inode, statbuf);
+    }
+    xfs_invalidate_lookup_path(handle);
+    if (handle.path_length() != 0) {
+        xfs_path_inode_cache_store(MOUNT, handle.path(), handle.path_length(), NEW_INO, XFS_DIR3_FT_SYMLINK);
+    }
+    xfs_inode_release_metadata_locked(new_inode);
+    return 0;
+}
+
+auto xfs_unlink_lookup(const XfsLookupHandle& handle) -> int {
+    XfsMountContext* const MOUNT = handle.mount();
+    if (MOUNT == nullptr) {
+        return -EINVAL;
+    }
+    if (MOUNT->read_only) {
+        return -EROFS;
+    }
+    XfsMetadataGuard metadata_guard(MOUNT, true, WOS_PERF_CALLSITE());
+    XfsInode* target = nullptr;
+    int rc = xfs_lookup_target_locked(handle, &target);
+    if (rc != 0) {
+        return rc;
+    }
+    if (xfs_inode_isdir(target)) {
+        return -EISDIR;
+    }
+    XfsTransaction* tp = xfs_trans_alloc(MOUNT);
+    if (tp == nullptr) {
+        return -ENOMEM;
+    }
+    rc = xfs_trans_capture_inode(tp, target);
+    if (rc != 0) {
+        xfs_trans_cancel(tp);
+        return rc;
+    }
+    rc = xfs_dir_removename(handle.parent(), handle.leaf(), handle.leaf_length(), tp, target->ino);
+    if (rc != 0) {
+        xfs_trans_cancel(tp);
+        return rc;
+    }
+    handle.parent()->dirty = true;
+    xfs_trans_log_inode(tp, handle.parent());
+    if (target->nlink > 0) {
+        target->nlink--;
+    }
+    target->dirty = true;
+    xfs_trans_log_inode(tp, target);
+    rc = xfs_trans_commit(tp);
+    if (rc == 0) {
+        xfs_invalidate_lookup_path(handle);
+    }
+    return rc == 0 ? 0 : -EIO;
+}
+
+auto xfs_rmdir_lookup(const XfsLookupHandle& handle) -> int {
+    XfsMountContext* const MOUNT = handle.mount();
+    if (MOUNT == nullptr) {
+        return -EINVAL;
+    }
+    if (MOUNT->read_only) {
+        return -EROFS;
+    }
+    XfsMetadataGuard metadata_guard(MOUNT, true, WOS_PERF_CALLSITE());
+    XfsInode* directory = nullptr;
+    int rc = xfs_lookup_target_locked(handle, &directory);
+    if (rc != 0) {
+        return rc;
+    }
+    if (!xfs_inode_isdir(directory)) {
+        return -ENOTDIR;
+    }
+    if (handle.parent()->nlink <= 2) {
+        return -EIO;
+    }
+    RmdirDirectoryScan scan{.directory = directory};
+    int const ITERATE_RET = xfs_dir_iterate(directory, scan_indexed_directory_entries, &scan);
+    if (ITERATE_RET < 0 || scan.status != 0) {
+        return ITERATE_RET < 0 ? ITERATE_RET : scan.status;
+    }
+    if (scan.indexed_entry_found) {
+        return -ENOTEMPTY;
+    }
+    XfsTransaction* tp = xfs_trans_alloc(MOUNT);
+    if (tp == nullptr) {
+        return -ENOMEM;
+    }
+    rc = xfs_trans_capture_inode(tp, directory);
+    if (rc != 0) {
+        xfs_trans_cancel(tp);
+        return rc;
+    }
+    rc = xfs_dir_removename(handle.parent(), handle.leaf(), handle.leaf_length(), tp, directory->ino);
+    if (rc != 0) {
+        xfs_trans_cancel(tp);
+        return rc;
+    }
+    handle.parent()->nlink--;
+    handle.parent()->dirty = true;
+    xfs_trans_log_inode(tp, handle.parent());
+    directory->nlink = 0;
+    directory->dirty = true;
+    xfs_trans_log_inode(tp, directory);
+    rc = xfs_trans_commit(tp);
+    if (rc == 0) {
+        xfs_path_inode_cache_bump_generation();
+        xfs_parent_path_cache_purge_all_for_mount(MOUNT);
+    }
+    return rc == 0 ? 0 : -EIO;
+}
+
+auto xfs_link_lookup(const XfsLookupHandle& source, const XfsLookupHandle& destination, Stat* statbuf) -> int {
+    XfsMountContext* const MOUNT = source.mount();
+    if (MOUNT == nullptr || destination.mount() == nullptr) {
+        return -EINVAL;
+    }
+    if (MOUNT != destination.mount()) {
+        return -EXDEV;
+    }
+    if (MOUNT->read_only) {
+        return -EROFS;
+    }
+    XfsMetadataGuard metadata_guard(MOUNT, true, WOS_PERF_CALLSITE());
+    int rc = xfs_validate_lookup_pair_locked(source, destination);
+    if (rc != 0) {
+        return rc;
+    }
+    XfsInode* const TARGET = source.target();
+    if (!source.target_existed() || TARGET == nullptr) {
+        return -ENOENT;
+    }
+    if (xfs_inode_isdir(TARGET)) {
+        return -EPERM;
+    }
+    if (TARGET->nlink == UINT32_MAX) {
+        return -EMLINK;
+    }
+    if (destination.target_existed()) {
+        return -EEXIST;
+    }
+    XfsTransaction* tp = xfs_trans_alloc(MOUNT);
+    if (tp == nullptr) {
+        return -ENOMEM;
+    }
+    rc = xfs_trans_capture_inode(tp, TARGET);
+    if (rc != 0) {
+        xfs_trans_cancel(tp);
+        return rc;
+    }
+    TARGET->nlink++;
+    TARGET->dirty = true;
+    xfs_trans_log_inode(tp, TARGET);
+    uint8_t const FTYPE = xfs_ftype_from_inode(TARGET);
+    rc = xfs_dir_addname(destination.parent(), destination.leaf(), destination.leaf_length(), TARGET->ino, FTYPE, tp, true);
+    if (rc != 0) {
+        xfs_trans_cancel(tp);
+        return rc;
+    }
+    destination.parent()->dirty = true;
+    xfs_trans_log_inode(tp, destination.parent());
+    rc = xfs_trans_commit(tp);
+    if (rc == 0) {
+        if (statbuf != nullptr) {
+            fill_stat(TARGET, statbuf);
+        }
+        if (source.path_length() == 0 || destination.path_length() == 0) {
+            xfs_path_inode_cache_bump_generation();
+        } else {
+            xfs_path_inode_cache_invalidate_path(MOUNT, destination.path(), destination.path_length());
+            xfs_path_inode_cache_store(MOUNT, destination.path(), destination.path_length(), TARGET->ino, FTYPE);
+            xfs_path_inode_cache_store(MOUNT, source.path(), source.path_length(), TARGET->ino, FTYPE);
+        }
+    }
+    return rc == 0 ? 0 : -EIO;
+}
+
+auto xfs_rename_lookup(const XfsLookupHandle& source, const XfsLookupHandle& destination, Stat* statbuf) -> int {
+    XfsMountContext* const MOUNT = source.mount();
+    if (MOUNT == nullptr || destination.mount() == nullptr) {
+        return -EINVAL;
+    }
+    if (MOUNT != destination.mount()) {
+        return -EXDEV;
+    }
+    if (MOUNT->read_only) {
+        return -EROFS;
+    }
+    XfsMetadataGuard metadata_guard(MOUNT, true, WOS_PERF_CALLSITE());
+    int rc = xfs_validate_lookup_pair_locked(source, destination);
+    if (rc != 0) {
+        return rc;
+    }
+    XfsInode* const MOVED = source.target();
+    XfsInode* const DISPLACED = destination.target();
+    if (!source.target_existed() || MOVED == nullptr) {
+        return -ENOENT;
+    }
+    if (destination.target_existed() && DISPLACED == MOVED) {
+        if (statbuf != nullptr) {
+            fill_stat(MOVED, statbuf);
+        }
+        return 0;
+    }
+    XfsTransaction* tp = xfs_trans_alloc(MOUNT);
+    if (tp == nullptr) {
+        return -ENOMEM;
+    }
+    bool purge_parent_path_cache = xfs_inode_isdir(MOVED) || (DISPLACED != nullptr && xfs_inode_isdir(DISPLACED));
+    if (DISPLACED != nullptr) {
+        rc = xfs_trans_capture_inode(tp, DISPLACED);
+        if (rc != 0) {
+            xfs_trans_cancel(tp);
+            return rc;
+        }
+        rc = xfs_dir_removename(destination.parent(), destination.leaf(), destination.leaf_length(), tp, DISPLACED->ino);
+        if (rc != 0) {
+            xfs_trans_cancel(tp);
+            return rc;
+        }
+        if (DISPLACED->nlink > 0) {
+            DISPLACED->nlink--;
+        }
+        DISPLACED->dirty = true;
+        xfs_trans_log_inode(tp, DISPLACED);
+    }
+    uint8_t const FTYPE = xfs_ftype_from_inode(MOVED);
+    rc = xfs_dir_addname(destination.parent(), destination.leaf(), destination.leaf_length(), MOVED->ino, FTYPE, tp);
+    if (rc != 0) {
+        xfs_trans_cancel(tp);
+        return rc;
+    }
+    rc = xfs_dir_removename(source.parent(), source.leaf(), source.leaf_length(), tp, MOVED->ino);
+    if (rc != 0) {
+        xfs_trans_cancel(tp);
+        return rc;
+    }
+    source.parent()->dirty = true;
+    destination.parent()->dirty = true;
+    xfs_trans_log_inode(tp, source.parent());
+    xfs_trans_log_inode(tp, destination.parent());
+    rc = xfs_trans_commit(tp);
+    if (rc == 0) {
+        if (purge_parent_path_cache || source.path_length() == 0 || destination.path_length() == 0) {
+            xfs_path_inode_cache_bump_generation();
+            xfs_parent_path_cache_purge_all_for_mount(MOUNT);
+        } else {
+            xfs_path_inode_cache_invalidate_path(MOUNT, source.path(), source.path_length());
+            xfs_path_inode_cache_invalidate_path(MOUNT, destination.path(), destination.path_length());
+            xfs_path_inode_cache_store(MOUNT, destination.path(), destination.path_length(), MOVED->ino, FTYPE);
+        }
+        if (statbuf != nullptr) {
+            fill_stat(MOVED, statbuf);
+        }
+    }
+    return rc == 0 ? 0 : -EIO;
 }
 
 // ============================================================================

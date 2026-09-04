@@ -24,7 +24,7 @@ def fail(message: str) -> None:
 
 
 def function_body(source: str, name: str) -> str:
-    match = re.search(rf"\b(?:void|auto)\s+{name}\([^)]*\)\s*(?:->\s*[A-Za-z0-9_:<>*]+)?\s*\{{", source)
+    match = re.search(rf"\b(?:void|auto|bool)\s+{name}\([^)]*\)\s*(?:->\s*[A-Za-z0-9_:<>*]+)?\s*\{{", source)
     if match is None:
         fail(f"missing function {name}")
 
@@ -436,53 +436,34 @@ def test_vfs_rename_scratch_is_initialized_by_its_producers() -> None:
     )
 
     renameat = function_body(core, "vfs_renameat")
+    require_order(
+        renameat,
+        [
+            "LookupHandle source{};",
+            "LookupHandle destination{};",
+            "vfs_acquire_lookup(task, olddirfd, oldpath, LookupIntent::RENAME_SOURCE, LookupFollowPolicy::NOFOLLOW_FINAL",
+            "vfs_acquire_lookup(task, newdirfd, newpath, LookupIntent::RENAME_TARGET, LookupFollowPolicy::NOFOLLOW_FINAL",
+            "if (source.mount() != destination.mount())",
+            "return -EXDEV;",
+            "if (source.mount()->fs_type == FSType::REMOTE)",
+            "return consume_rename(source, destination, nullptr);",
+            "vfs_consume_lookup_pair(source, destination, true, consume_rename, nullptr)",
+            "if (result != -EAGAIN || attempt == 3)",
+        ],
+        "vfs_renameat retained source/destination acquisition and bounded commit",
+    )
     require_tokens(
         renameat,
         [
-            "std::array<char, MAX_PATH_LEN> old_resolved __attribute__((uninitialized));",
-            "std::array<char, MAX_PATH_LEN> new_resolved __attribute__((uninitialized));",
+            "ker::vfs::tmpfs::tmpfs_rename_lookup(",
+            "ker::vfs::xfs::xfs_rename_lookup(source_lookup, destination_lookup, &renamed)",
+            "vfs_cache_notify_path_changed(source.path(), destination.path())",
+            "vfs_rename_resolved_paths(source.path(), destination.path(), source.requires_directory(), destination.requires_directory()",
         ],
-        "vfs_renameat producer-owned scratch",
-    )
-    old_resolver = (
-        "resolve_dirfd_task_path_raw_with_absolute_local_fast_path(task, olddirfd, oldpath, old_resolved.data(), old_resolved.size(), true,"
-    )
-    new_resolver = (
-        "resolve_dirfd_task_path_raw_with_absolute_local_fast_path(task, newdirfd, newpath, new_resolved.data(), new_resolved.size(), true,"
-    )
-    old_start = renameat.find(old_resolver)
-    new_start = renameat.find(new_resolver)
-    if old_start < 0 or new_start <= old_start:
-        fail("vfs_renameat must resolve old path before new path")
-    require_order(
-        renameat[old_start:new_start],
-        [
-            old_resolver,
-            "&old_path_requires_directory, &old_resolved_len, &old_resolved_hash)",
-            "if (result < 0)",
-            "return result",
-        ],
-        "vfs_renameat old producer failure gate",
-    )
-    require_order(
-        renameat[new_start:],
-        [
-            new_resolver,
-            "&new_path_requires_directory, &new_resolved_len, &new_resolved_hash)",
-            "if (result < 0)",
-            "return result",
-            "vfs_rename_resolved_paths(old_resolved.data(), new_resolved.data(), old_path_requires_directory, new_path_requires_directory,",
-            "old_resolved_len, new_resolved_len, old_resolved_hash, new_resolved_hash)",
-        ],
-        "vfs_renameat new producer and consumer ordering",
+        "vfs_renameat retained backend and compatibility consumers",
     )
 
-    for body, name, data_uses, total_uses in [
-        (rename, "old_buf", 3, 6),
-        (rename, "new_buf", 3, 6),
-        (renameat, "old_resolved", 2, 4),
-        (renameat, "new_resolved", 2, 4),
-    ]:
+    for body, name, data_uses, total_uses in [(rename, "old_buf", 3, 6), (rename, "new_buf", 3, 6)]:
         if body.count(f"{name}.data()") != data_uses:
             fail(f"{name} must have exactly {data_uses} producer/consumer data uses")
         if len(re.findall(rf"\b{re.escape(name)}\b", body)) != total_uses:
@@ -491,20 +472,12 @@ def test_vfs_rename_scratch_is_initialized_by_its_producers() -> None:
     for legacy in [
         "std::array<char, MAX_PATH_LEN> old_buf;",
         "std::array<char, MAX_PATH_LEN> new_buf;",
-        "std::array<char, MAX_PATH_LEN> old_resolved;",
-        "std::array<char, MAX_PATH_LEN> new_resolved;",
         "old_buf = {};",
         "new_buf = {};",
-        "old_resolved = {};",
-        "new_resolved = {};",
         "old_buf.fill(",
         "new_buf.fill(",
-        "old_resolved.fill(",
-        "new_resolved.fill(",
         "std::memset(old_buf.data()",
         "std::memset(new_buf.data()",
-        "std::memset(old_resolved.data()",
-        "std::memset(new_resolved.data()",
     ]:
         if legacy in rename or legacy in renameat:
             fail(f"VFS rename scratch must not retain a redundant clear: {legacy}")
@@ -1245,20 +1218,21 @@ def test_server_open_reuses_the_open_file_stat_snapshot() -> None:
         [
             "std::array<char, 512> full_path __attribute__((uninitialized));",
             "std::array<char, 512> full_visible_path __attribute__((uninitialized));",
-            "build_full_path(full_path.data(), full_path.size(), export_path",
-            "build_full_path(full_visible_path.data(), full_visible_path.size(), export_name",
+            "prepare_legacy_scalar_path(export_path, export_name",
+            "if (PATH_RET != 0)",
+            "reject_request(static_cast<int16_t>(PATH_RET))",
             "path_crosses_recursive_wki_boundary_direct(full_path.data(), full_visible_path.data())",
-            "ker::vfs::vfs_open_file_resolved(full_path.data()",
+            "ker::vfs::vfs_open_file_resolved_beneath(export_path, full_path.data()",
         ],
         "remote VFS server open full-path production before resolved-open consumption",
     )
     direct_open_path_tokens = [
         "std::array<char, 512> full_path __attribute__((uninitialized));",
         "std::array<char, 512> full_visible_path __attribute__((uninitialized));",
-        "build_full_path(full_path.data(), full_path.size(), export_path",
-        "build_full_path(full_visible_path.data(), full_visible_path.size(), export_name",
+        "prepare_legacy_scalar_path(export_path, export_name",
+        "if (PATH_RET != 0)",
         "path_crosses_recursive_wki_boundary_direct(full_path.data(), full_visible_path.data())",
-        "ker::vfs::vfs_open_file_resolved(full_path.data()",
+        "ker::vfs::vfs_open_file_resolved_beneath(export_path, full_path.data()",
     ]
     for token in direct_open_path_tokens:
         token_pos = open_case.find(token)
@@ -1267,7 +1241,7 @@ def test_server_open_reuses_the_open_file_stat_snapshot() -> None:
     require_order(
         open_case,
         [
-            "ker::vfs::vfs_open_file_resolved(full_path.data()",
+            "ker::vfs::vfs_open_file_resolved_beneath(export_path, full_path.data()",
             "ker::vfs::vfs_fstat_file(file, &open_stat)",
             "open_resp.has_stat = 1",
             "open_resp.stat = open_stat",
@@ -1313,9 +1287,11 @@ def test_server_backing_path_mutations_bypass_worker_task_root() -> None:
     require_order(
         symlink_case,
         [
-            "build_full_path(full_link.data(), full_link.size(), export_path",
-            "path_crosses_recursive_wki_boundary(full_link.data())",
-            "ker::vfs::vfs_symlink_resolved(target_str.data(), full_link.data())",
+            "prepare_legacy_scalar_path(export_path, export_name, LINK_PATH, link_len",
+            "if (PATH_RET != 0)",
+            "reject_request(static_cast<int16_t>(PATH_RET))",
+            "path_crosses_recursive_wki_boundary_direct(full_link.data(), full_visible_link.data())",
+            "ker::vfs::vfs_symlink_resolved_beneath(export_path, target_str.data(), full_link.data())",
         ],
         "server symlink uses its export backing path without worker-root resolution",
     )
@@ -1326,10 +1302,11 @@ def test_server_backing_path_mutations_bypass_worker_task_root() -> None:
     require_order(
         rename_case,
         [
-            "build_full_path(old_full.data(), old_full.size(), export_path",
-            "build_full_path(new_full.data(), new_full.size(), export_path",
-            "path_crosses_recursive_wki_boundary(old_full.data())",
-            "ker::vfs::vfs_rename_resolved(old_full.data(), new_full.data())",
+            "prepare_legacy_scalar_path(export_path, export_name, OLD_PATH, old_len",
+            "prepare_legacy_scalar_path(export_path, export_name, NEW_PATH, new_len",
+            "if (OLD_PATH_RET != 0 || NEW_PATH_RET != 0)",
+            "path_crosses_recursive_wki_boundary_direct(old_full.data(), old_visible.data())",
+            "ker::vfs::vfs_rename_resolved_beneath(export_path, old_full.data(), new_full.data())",
         ],
         "server rename uses export backing paths without worker-root resolution",
     )
@@ -1340,10 +1317,10 @@ def test_server_backing_path_mutations_bypass_worker_task_root() -> None:
     require_order(
         chmod_case,
         [
-            "build_full_path(full_path.data(), full_path.size(), export_path",
-            "build_full_path(full_visible_path.data(), full_visible_path.size(), export_name",
+            "prepare_legacy_scalar_path(export_path, export_name, PATH, path_len",
+            "if (PATH_RET != 0)",
             "path_crosses_recursive_wki_boundary_direct(full_path.data(), full_visible_path.data())",
-            "ker::vfs::vfs_chmod_resolved(full_path.data(), static_cast<int>(mode),",
+            "ker::vfs::vfs_chmod_resolved_beneath(export_path, full_path.data(), static_cast<int>(mode),",
             "(flags & WKI_VFS_CHMOD_FLAG_FOLLOW_FINAL_SYMLINK) != 0",
         ],
         "server chmod uses its export backing path without worker-root resolution",
@@ -1355,8 +1332,11 @@ def test_server_backing_path_mutations_bypass_worker_task_root() -> None:
         header,
         [
             "auto vfs_symlink_resolved(const char* target, const char* linkpath) -> int;",
+            "auto vfs_symlink_resolved_beneath(const char* confinement_root, const char* target, const char* linkpath) -> int;",
             "auto vfs_rename_resolved(const char* oldpath, const char* newpath) -> int;",
+            "auto vfs_rename_resolved_beneath(const char* confinement_root, const char* oldpath, const char* newpath) -> int;",
             "auto vfs_chmod_resolved(const char* path, int mode, bool follow_final_symlink) -> int;",
+            "auto vfs_chmod_resolved_beneath(const char* confinement_root, const char* path, int mode, bool follow_final_symlink) -> int;",
         ],
         "resolved VFS mutation API declarations",
     )
@@ -1460,9 +1440,9 @@ def test_remote_path_utimens_preserves_owner_time_and_routing() -> None:
             "prefix.reserved != 0",
             "EXPECTED_DATA_LEN != data_len",
             "relative_wire_path_has_safe_components(PATH_DATA, prefix.path_len)",
-            "full_path_fits(export_path)",
-            "build_full_path(full_path.data(), full_path.size(), export_path",
-            "build_full_path(full_visible_path.data(), full_visible_path.size(), export_name",
+            "prepare_legacy_scalar_path(export_path, export_name, PATH_DATA, prefix.path_len",
+            "if (PATH_RET != 0)",
+            "reject_request(static_cast<int16_t>(PATH_RET))",
             "path_crosses_recursive_wki_boundary_direct(full_path.data(), full_visible_path.data())",
             "ker::vfs::Timespec{.tv_sec = prefix.atime_sec, .tv_nsec = prefix.atime_nsec}",
             "(prefix.flags & WKI_VFS_UTIMENS_FLAG_TIMES_PRESENT) != 0 ? request_times.data() : nullptr",
@@ -1512,7 +1492,7 @@ def test_remote_path_utimens_preserves_owner_time_and_routing() -> None:
         apply,
         [
             "resolve_policy->reject_remote_mounts && REMOTE_MOUNT",
-            "if (!REMOTE_MOUNT)",
+            "if (!REMOTE_MOUNT && !lookup_symlinks_resolved)",
             "bool const RESOLVE_FINAL_SYMLINK = follow_final_symlink && !skip_final_symlink_probe",
             "resolve_symlinks(path_buffer.data(), resolved_path.data()",
             "mount_ref = find_mount_point(path_buffer.data(), resolved_len)",
@@ -1802,20 +1782,16 @@ def test_server_roce_push_reads_reuse_registered_staging() -> None:
 def test_remote_metadata_scratch_initializes_only_consumed_prefix() -> None:
     source = REMOTE_VFS_CPP.read_text()
 
-    build_calls = list(re.finditer(r"build_full_path\((\w+)\.data\(\)", source))
-    if len(build_calls) != 20:
-        fail(f"expected 20 bounded build_full_path outputs, found {len(build_calls)}")
-    for call in build_calls:
-        name = call.group(1)
-        declaration = f"std::array<char, 512> {name} __attribute__((uninitialized));"
-        declaration_pos = source.rfind(declaration, 0, call.start())
-        if declaration_pos < 0 or call.start() - declaration_pos > 768:
-            fail(f"build_full_path output {name} must be a nearby explicitly uninitialized local")
+    handler = function_body(source, "handle_vfs_op")
+    if handler.count("prepare_legacy_scalar_path(") != 11:
+        fail("every scalar pathname output must use centralized checked preparation")
+    if "build_full_path(" in handler:
+        fail("scalar opcode cases must not bypass centralized component and dual-path admission")
     declaration_counts = {
-        "std::array<char, 512> resolved_path __attribute__((uninitialized));": 1,
         "std::array<char, 512> full_path __attribute__((uninitialized));": 9,
         "std::array<char, 512> full_visible_path __attribute__((uninitialized));": 8,
         "std::array<char, 512> full_link __attribute__((uninitialized));": 1,
+        "std::array<char, 512> full_visible_link __attribute__((uninitialized));": 1,
         "std::array<char, 512> old_full __attribute__((uninitialized));": 1,
         "std::array<char, 512> new_full __attribute__((uninitialized));": 1,
         "std::array<uint8_t, 514> req_stack __attribute__((uninitialized));": 4,
@@ -1830,35 +1806,43 @@ def test_remote_metadata_scratch_initializes_only_consumed_prefix() -> None:
             fail(f"metadata scratch declaration count changed for {declaration}: expected {expected_count}, found {actual_count}")
 
     build = function_body(source, "build_full_path")
-    require_order(build, ["size_t pos = 0", "out[pos] = '\\0'"], "full-path output is terminated after construction")
+    require_order(build, ["out[0] = '\\0'", "size_t const EXPORT_LEN", "out[pos] = '\\0'"], "full-path output is terminated after construction")
     require_tokens(
         build,
         [
-            "if (EXPORT_LEN > 0 && EXPORT_LEN < out_size - 1)",
+            "if (EXPORT_LEN >= out_size)",
+            "return -ENAMETOOLONG",
+            "size_t remaining = out_size - EXPORT_LEN - 1",
+            "if (rel_len > remaining)",
             "memcpy(out, export_path, EXPORT_LEN)",
-            "if (pos + copy_len >= out_size)",
-            "memcpy(out + pos, relative_path, copy_len)",
+            "memcpy(out + pos, relative_path, rel_len)",
         ],
         "bounded full-path construction",
     )
+    prepare = function_body(source, "prepare_legacy_scalar_path")
+    require_order(
+        prepare,
+        [
+            "relative_wire_path_has_safe_components(relative_path, relative_path_len)",
+            "build_full_path(full_path, full_path_size, export_path",
+            "if (BACKING_RET != 0)",
+            "return BACKING_RET",
+            "build_full_path(full_visible_path, full_visible_path_size, export_name",
+        ],
+        "scalar admission validates components and both bounded path views",
+    )
 
-    boundary_start = source.find("bool path_crosses_remote_mount(")
-    boundary_end = source.find("bool path_crosses_remote_mount_direct(", boundary_start)
-    if boundary_start < 0 or boundary_end < 0:
-        fail("missing recursive-mount boundary helpers")
-    boundary = source[boundary_start:boundary_end]
+    boundary = function_body(source, "path_crosses_recursive_wki_boundary_direct")
     require_tokens(
         boundary,
         [
-            "std::array<char, 512> resolved_path __attribute__((uninitialized));",
-            "const char* mount_path = path",
-            "resolve_mount_path(path, resolved_path.data(), resolved_path.size()) == 0",
-            "mount_path = resolved_path.data()",
+            "path_crosses_remote_mount_direct(backing_path)",
+            "path_crosses_recursive_self_alias(visible_path)",
         ],
-        "recursive-mount path scratch",
+        "owner recursive-mount boundary uses already admitted backing and visible paths",
     )
-    require_order(boundary, ["resolve_mount_path(", "mount_path = resolved_path.data()"], "resolved path used only on success")
-    require_order(boundary, ["mount_path = resolved_path.data()", "find_mount_point(mount_path)"], "resolved path built before lookup")
+    if "resolve_mount_path(" in boundary:
+        fail("owner recursive-mount boundary must not re-resolve admitted paths through worker task state")
 
     path_request = [
         "memcpy(req_data, &path_len, sizeof(uint16_t))",
@@ -3154,7 +3138,7 @@ def test_server_bounded_metadata_responses_use_stack_storage() -> None:
         stat_case,
         [
             "ker::vfs::Stat statbuf = {}",
-            "int const RET = ker::vfs::vfs_stat_resolved(full_path.data(), &statbuf)",
+            "int const RET = ker::vfs::vfs_stat_resolved_beneath(export_path, full_path.data(), &statbuf)",
             "std::array<uint8_t, sizeof(DevOpRespPayload) + sizeof(ker::vfs::Stat)> resp_buf",
             "reinterpret_cast<DevOpRespPayload*>(resp_buf.data())",
             "memcpy(resp_buf.data() + sizeof(DevOpRespPayload), &statbuf, sizeof(ker::vfs::Stat))",
@@ -3168,7 +3152,7 @@ def test_server_bounded_metadata_responses_use_stack_storage() -> None:
         readlink_case,
         [
             "std::array<char, 512> target_buf{}",
-            "vfs_readlink_resolved(full_path.data(), target_buf.data(), target_buf.size() - 1)",
+            "vfs_readlink_resolved_beneath(export_path, full_path.data(), target_buf.data(), target_buf.size() - 1)",
             "std::array<uint8_t, sizeof(DevOpRespPayload) + sizeof(uint16_t) + 512> resp_buf",
             "reinterpret_cast<DevOpRespPayload*>(resp_buf.data())",
             "memcpy(resp_buf.data() + sizeof(DevOpRespPayload), &tlen, sizeof(uint16_t))",

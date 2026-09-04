@@ -248,17 +248,17 @@ def test_namespace_mutations_retry_false_enoent_without_namespace_caches() -> No
 def test_xfs_namespace_cache_publication_is_ordered() -> None:
     source = VFS_CORE_CPP.read_text()
     for token in [
-        "ker::mod::sys::Mutex g_xfs_namespace_publication_mutex;",
-        "class XfsNamespacePublicationGuard",
-        "g_xfs_namespace_publication_mutex.lock();",
-        "g_xfs_namespace_publication_mutex.unlock();",
+        "ker::mod::sys::Mutex g_vfs_namespace_publication_mutex;",
+        "std::atomic<uint64_t> g_vfs_namespace_generation{1};",
+        "class VfsNamespacePublicationGuard",
+        "g_vfs_namespace_publication_mutex.lock();",
+        "g_vfs_namespace_publication_mutex.unlock();",
     ]:
         if token not in source:
-            fail(f"VFS must define the XFS namespace publication guard: missing {token}")
+            fail(f"VFS must define the generalized namespace publication guard: missing {token}")
 
     for name in [
         "vfs_open_resolved_for_task",
-        "vfs_open_file_impl",
         "vfs_symlink_resolved_linkpath",
         "vfs_mkdir_resolved_path",
         "vfs_unlink_resolved_path",
@@ -266,13 +266,43 @@ def test_xfs_namespace_cache_publication_is_ordered() -> None:
         "vfs_rename_resolved_paths",
         "vfs_link_resolved_paths",
     ]:
-        if "XfsNamespacePublicationGuard namespace_publication_guard" not in function_body(source, name):
-            fail(f"{name} must order the XFS mutation with its VFS cache publication")
+        if "VfsNamespacePublicationGuard namespace_publication_guard" not in function_body(source, name):
+            fail(f"{name} compatibility path must order local mutation with VFS cache publication")
+
+    acquire = function_body(source, "vfs_acquire_lookup")
+    require_order(
+        acquire,
+        [
+            "g_vfs_namespace_generation.load(std::memory_order_acquire)",
+            "mount_table_generation_snapshot()",
+            "g_vfs_namespace_publication_mutex.lock();",
+            "mount->retiring.load()",
+            "ker::vfs::xfs::xfs_acquire_lookup(",
+            "LookupHandleBuilder::set_backend_binding(candidate",
+            "LookupHandleBuilder::set_mount(candidate, std::move(mount_ref)",
+            "g_vfs_namespace_publication_mutex.unlock();",
+        ],
+        "retained XFS lookup acquisition and publication snapshot",
+    )
+
+    consume = function_body(source, "vfs_consume_lookup")
+    require_order(
+        consume,
+        [
+            "ker::mod::sys::MutexGuard publication_guard(g_vfs_namespace_publication_mutex);",
+            "handle.mount()->retiring.load(std::memory_order_acquire)",
+            "find_mount_point(handle.path(), handle.path_length())",
+            "ker::vfs::xfs::xfs_validate_lookup(*backend)",
+            "int const result = consumer(handle, context);",
+            "g_vfs_namespace_generation.fetch_add(1, std::memory_order_acq_rel);",
+        ],
+        "retained XFS lookup validation, commit, and publication",
+    )
 
     require_order(
         function_body(source, "vfs_unlink_resolved_path"),
         [
-            "XfsNamespacePublicationGuard namespace_publication_guard(mount);",
+            "VfsNamespacePublicationGuard namespace_publication_guard(mount, !namespace_already_locked, true);",
             "xfs_unlink_path(",
             "vfs_cache_notify_path_changed(resolved_path, nullptr);",
             "metadata_cache_store_missing_path_on_current_mount(",

@@ -12,7 +12,9 @@
 
 #include <bits/ssize_t.h>
 
+#include <array>
 #include <cstddef>
+#include <cstdint>
 #include <dev/block_device.hpp>
 #include <platform/mm/swap.hpp>
 #include <vfs/file.hpp>
@@ -23,6 +25,84 @@
 namespace ker::vfs::xfs {
 
 constexpr size_t UNKNOWN_XFS_PATH_LEN = static_cast<size_t>(-1);
+constexpr size_t XFS_LOOKUP_LEAF_CAPACITY = 256;
+constexpr size_t XFS_LOOKUP_PATH_CAPACITY = 512;
+
+// Retains the parent and, when present, final inode observed by one
+// filesystem-relative lookup. The mount must remain alive for the handle's
+// lifetime. Release or destroy the handle without metadata_lock held because
+// the final inode release may perform zero-link inactivation.
+class XfsLookupHandle {
+   public:
+    XfsLookupHandle() = default;
+    XfsLookupHandle(const XfsLookupHandle&) = delete;
+    auto operator=(const XfsLookupHandle&) -> XfsLookupHandle& = delete;
+    XfsLookupHandle(XfsLookupHandle&& other) noexcept;
+    auto operator=(XfsLookupHandle&& other) noexcept -> XfsLookupHandle&;
+    ~XfsLookupHandle();
+
+    auto mount() const -> XfsMountContext* { return mount_; }
+    auto parent() const -> XfsInode* { return parent_; }
+    auto target() const -> XfsInode* { return target_; }
+    auto leaf() const -> const char* { return leaf_.data(); }
+    auto leaf_length() const -> uint16_t { return leaf_length_; }
+    auto path() const -> const char* { return path_.data(); }
+    auto path_length() const -> size_t { return path_length_; }
+    auto expected_parent_generation() const -> uint64_t { return expected_parent_generation_; }
+    auto expected_mutation_sequence() const -> uint64_t { return expected_mutation_sequence_; }
+    auto target_existed() const -> bool { return target_existed_; }
+    auto root_target() const -> bool { return root_target_; }
+    void reset();
+
+   private:
+    friend auto xfs_acquire_lookup(const char* fs_path, XfsMountContext* ctx, XfsLookupHandle* out, size_t known_fs_path_len) -> int;
+    friend auto xfs_acquire_lookup_at_file(File* directory, const char* relative_path, XfsLookupHandle* out) -> int;
+    friend auto xfs_validate_lookup_locked(const XfsLookupHandle& handle) -> int;
+
+    XfsMountContext* mount_ = nullptr;
+    XfsInode* parent_ = nullptr;
+    XfsInode* target_ = nullptr;
+    std::array<char, XFS_LOOKUP_LEAF_CAPACITY> leaf_{};
+    std::array<char, XFS_LOOKUP_PATH_CAPACITY> path_{};
+    uint16_t leaf_length_ = 0;
+    size_t path_length_ = 0;
+    uint64_t expected_parent_generation_ = 0;
+    uint64_t expected_mutation_sequence_ = 0;
+    bool target_existed_ = false;
+    bool root_target_ = false;
+};
+
+// Resolve and retain a parent/final pair atomically under metadata_lock. A
+// missing final component is a successful lookup with target_existed() false.
+auto xfs_acquire_lookup(const char* fs_path, XfsMountContext* ctx, XfsLookupHandle* out, size_t known_fs_path_len = UNKNOWN_XFS_PATH_LEN)
+    -> int;
+
+// Resolve a relative component path from an open XFS directory inode. This
+// deliberately does not consult File::vfs_path or the XFS path caches.
+auto xfs_acquire_lookup_at_file(File* directory, const char* relative_path, XfsLookupHandle* out) -> int;
+
+// Validate a retained lookup immediately before a commit. The locked form
+// requires ctx->metadata_lock; 0 means valid, -EAGAIN requests a fresh lookup,
+// and other negative values report an authoritative directory lookup error.
+auto xfs_validate_lookup_locked(const XfsLookupHandle& handle) -> int;
+auto xfs_validate_lookup(const XfsLookupHandle& handle) -> int;
+
+auto xfs_open_lookup(const XfsLookupHandle& handle, int flags, int mode, bool require_directory, int* result_out = nullptr) -> File*;
+auto xfs_stat_lookup(const XfsLookupHandle& handle, bool require_directory, ker::vfs::Stat* statbuf) -> int;
+auto xfs_readlink_lookup(const XfsLookupHandle& handle, char* buf, size_t bufsize) -> ssize_t;
+auto xfs_chmod_lookup(const XfsLookupHandle& handle, int mode, ker::vfs::Stat* statbuf = nullptr) -> int;
+auto xfs_utimens_lookup(const XfsLookupHandle& handle, const Timespec& atime, const Timespec& mtime, bool set_atime, bool set_mtime,
+                        ker::vfs::Stat* statbuf = nullptr) -> int;
+auto xfs_setxattr_lookup(const XfsLookupHandle& handle, const char* name, const void* value, size_t size, int flags) -> int;
+auto xfs_getxattr_lookup(const XfsLookupHandle& handle, const char* name, void* value, size_t size) -> ssize_t;
+auto xfs_listxattr_lookup(const XfsLookupHandle& handle, char* list, size_t size) -> ssize_t;
+auto xfs_removexattr_lookup(const XfsLookupHandle& handle, const char* name) -> int;
+auto xfs_mkdir_lookup(const XfsLookupHandle& handle, int mode, ker::vfs::Stat* statbuf = nullptr) -> int;
+auto xfs_symlink_lookup(const XfsLookupHandle& handle, const char* target, ker::vfs::Stat* statbuf = nullptr) -> int;
+auto xfs_unlink_lookup(const XfsLookupHandle& handle) -> int;
+auto xfs_rmdir_lookup(const XfsLookupHandle& handle) -> int;
+auto xfs_link_lookup(const XfsLookupHandle& source, const XfsLookupHandle& destination, ker::vfs::Stat* statbuf = nullptr) -> int;
+auto xfs_rename_lookup(const XfsLookupHandle& source, const XfsLookupHandle& destination, ker::vfs::Stat* statbuf = nullptr) -> int;
 
 // Initialize an XFS filesystem on the given block device.
 // Returns a heap-allocated XfsMountContext on success, nullptr on failure.

@@ -114,22 +114,51 @@ def test_tmpfs_file_operations_use_canonical_node() -> None:
         r"auto\s+tmpfs_open_path\(TmpNode\*\s+root,\s*const\s+char\*\s+path,\s*int\s+flags,\s*int\s+mode,\s*int\*\s+result_out\)\s*->\s*ker::vfs::File\*",
         "tmpfs_open_path root",
     )
+    open_node = function_body(
+        source,
+        r"auto\s+tmpfs_open_node_locked\(TmpNode\*\s+entry,\s*int\s+flags,\s*bool\s+require_directory,\s*bool\s+created_by_open,\s*int\*\s+result_out\)\s*->\s*ker::vfs::File\*",
+        "tmpfs_open_node_locked",
+    )
+    open_lookup = function_body(
+        source,
+        r"auto\s+tmpfs_open_lookup\(const\s+TmpfsLookupHandle&\s+handle,\s*int\s+flags,\s*int\s+mode,\s*bool\s+require_directory,\s*int\*\s+result_out\)\s*->\s*ker::vfs::File\*",
+        "tmpfs_open_lookup",
+    )
     read_body = function_body(source, r"auto\s+tmpfs_read\(ker::vfs::File\*\s+f,\s*void\*\s+buf,\s*size_t\s+count,\s*size_t\s+offset\)\s*->\s+ssize_t", "tmpfs_read")
     write_body = function_body(source, r"auto\s+tmpfs_write\(ker::vfs::File\*\s+f,\s*const\s+void\*\s+buf,\s*size_t\s+count,\s*size_t\s+offset\)\s*->\s+ssize_t", "tmpfs_write")
     close_body = function_body(source, r"auto\s+tmpfs_fops_close\(ker::vfs::File\*\s+f\)\s*->\s+int", "tmpfs_fops_close")
     truncate_body = function_body(source, r"auto\s+tmpfs_fops_truncate\(ker::vfs::File\*\s+f,\s*off_t\s+length\)\s*->\s+int", "tmpfs_fops_truncate")
 
     require_order(
-        open_path,
+        open_node,
         [
-            "TmpNode* file_node = tmpfs_canonical_node(node)",
-            "file_node->open_count.fetch_add(1, std::memory_order_relaxed)",
-            "file_node->type == TmpNodeType::FILE",
-            "tmpfs_resize_locked(file_node, 0)",
-            "f->private_data = file_node",
-            "f->is_directory = (file_node->type == TmpNodeType::DIRECTORY)",
+            "TmpNode* const NODE = tmpfs_canonical_node(entry)",
+            "NODE->open_count.fetch_add(1, std::memory_order_relaxed)",
+            "NODE->type == TmpNodeType::FILE",
+            "tmpfs_resize_locked(NODE, 0)",
+            "file->private_data = NODE",
+            "file->is_directory = NODE->type == TmpNodeType::DIRECTORY",
         ],
         "tmpfs open canonical file node",
+    )
+    require_order(
+        open_lookup,
+        [
+            "ker::mod::sys::MutexGuard guard(tmpfs_lock)",
+            "tmpfs_validate_lookup_locked(handle)",
+            "TmpNode* node = handle.target()",
+            "return tmpfs_open_node_locked(node, flags, REQUIRE_DIRECTORY, created_by_open, result_out)",
+        ],
+        "tmpfs retained lookup validates and opens one canonical node",
+    )
+    require_order(
+        open_path,
+        [
+            "tmpfs_lock.lock()",
+            "auto* file = tmpfs_open_node_locked(node, flags, false, created_by_open, result_out)",
+            "tmpfs_lock.unlock()",
+        ],
+        "tmpfs compatibility path shares locked canonical open",
     )
     for body, context in [
         (read_body, "tmpfs read"),
@@ -144,7 +173,7 @@ def test_vfs_link_uses_alias_not_copy() -> None:
     core = CORE_CPP.read_text()
     link_body = function_body(
         core,
-        r"auto\s+vfs_link_resolved_paths\(const\s+char\*\s+old_abs_path,\s*const\s+char\*\s+new_abs_path\)\s*->\s+int",
+        r"auto\s+vfs_link_resolved_paths\(const\s+char\*\s+old_abs_path,\s*const\s+char\*\s+new_abs_path,\s*bool\s+namespace_already_locked\s*=\s*false\)\s*->\s+int",
         "vfs_link_resolved_paths",
     )
     stat_helper = function_body(core, r"void\s+fill_tmpfs_node_stat\(uint32_t\s+dev_id,\s*const\s+ker::vfs::tmpfs::TmpNode\*\s+node,\s*Stat\*\s+statbuf\)", "fill_tmpfs_node_stat")

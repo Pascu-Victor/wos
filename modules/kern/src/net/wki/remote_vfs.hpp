@@ -356,13 +356,16 @@ auto wki_remote_vfs_advertise_exports_to_peer(uint16_t peer_node) -> bool;
 
 // Consumer side: mount a remote VFS at local_mount_path. Automatic mounts pass
 // the exact observed generation; manual callers snapshot the current one.
+using RemoteVfsMountPublisher = int (*)(const char* local_mount_path, void* private_data, ker::vfs::FileOperations* fops, void* context);
 auto wki_remote_vfs_mount(uint16_t owner_node, uint32_t resource_id, const char* local_mount_path,
-                          uint64_t expected_resource_generation = 0) -> int;
+                          uint64_t expected_resource_generation = 0, RemoteVfsMountPublisher publisher = nullptr,
+                          void* publisher_context = nullptr) -> int;
 
 auto wki_remote_vfs_selftest_attach_ack_cookie_fences_stale_completion() -> bool;
 
 #ifdef WOS_SELFTEST
 auto wki_remote_vfs_selftest_utimens_wire_path_validation() -> bool;
+auto wki_remote_vfs_selftest_legacy_scalar_wire_path_admission() -> bool;
 auto wki_remote_vfs_selftest_xattr_replay_fencing() -> bool;
 auto wki_remote_vfs_selftest_slot_waiter_fifo() -> bool;
 auto wki_remote_vfs_selftest_stale_cancel_preserves_successor() -> bool;

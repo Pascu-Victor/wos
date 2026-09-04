@@ -36,6 +36,7 @@
 #include <vfs/fs/procfs.hpp>
 #include <vfs/fs/tmpfs.hpp>
 #include <vfs/fs/xfs/xfs_vfs.hpp>
+#include <vfs/lookup.hpp>
 #include <vfs/mount.hpp>
 #include <vfs/stat.hpp>
 
@@ -327,33 +328,43 @@ ker::mod::sys::Mutex g_advisory_lock_mutex;
 // the corresponding cache invalidation after the backend call returns. Keep
 // those two halves ordered so an older create cannot publish after a newer
 // unlink (or vice versa).
-ker::mod::sys::Mutex g_xfs_namespace_publication_mutex;
+ker::mod::sys::Mutex g_vfs_namespace_publication_mutex;
+// Advances only while g_vfs_namespace_publication_mutex is held by real
+// namespace mutations. Lookup acquisition samples this before walking and
+// validates it again while holding the publication mutex, closing the
+// resolver-to-retained-object gap without keeping a filesystem lock across
+// component probes or WKI I/O.
+std::atomic<uint64_t> g_vfs_namespace_generation{1};
 
-class XfsNamespacePublicationGuard {
+class VfsNamespacePublicationGuard {
    public:
-    explicit XfsNamespacePublicationGuard(const MountPoint* mount, bool active = true)
-        : locked(active && mount != nullptr && mount->fs_type == FSType::XFS) {
+    explicit VfsNamespacePublicationGuard(const MountPoint* mount, bool active = true, bool namespace_mutation = false)
+        : locked(active && mount != nullptr && mount->fs_type != FSType::REMOTE), advances_namespace(locked && namespace_mutation) {
         if (locked) {
-            g_xfs_namespace_publication_mutex.lock();
+            g_vfs_namespace_publication_mutex.lock();
         }
     }
 
-    ~XfsNamespacePublicationGuard() { unlock(); }
+    ~VfsNamespacePublicationGuard() { unlock(); }
 
-    XfsNamespacePublicationGuard(const XfsNamespacePublicationGuard&) = delete;
-    XfsNamespacePublicationGuard(XfsNamespacePublicationGuard&&) = delete;
-    auto operator=(const XfsNamespacePublicationGuard&) -> XfsNamespacePublicationGuard& = delete;
-    auto operator=(XfsNamespacePublicationGuard&&) -> XfsNamespacePublicationGuard& = delete;
+    VfsNamespacePublicationGuard(const VfsNamespacePublicationGuard&) = delete;
+    VfsNamespacePublicationGuard(VfsNamespacePublicationGuard&&) = delete;
+    auto operator=(const VfsNamespacePublicationGuard&) -> VfsNamespacePublicationGuard& = delete;
+    auto operator=(VfsNamespacePublicationGuard&&) -> VfsNamespacePublicationGuard& = delete;
 
     void unlock() {
         if (locked) {
-            g_xfs_namespace_publication_mutex.unlock();
+            if (advances_namespace) {
+                g_vfs_namespace_generation.fetch_add(1, std::memory_order_acq_rel);
+            }
+            g_vfs_namespace_publication_mutex.unlock();
             locked = false;
         }
     }
 
    private:
     bool locked;
+    bool advances_namespace;
 };
 
 std::atomic<uint64_t> g_vfs_metadata_hits{0};
@@ -423,6 +434,7 @@ void symlink_cache_store_prehashed(const char* path, size_t path_len, FSType fs_
 void symlink_cache_store_prechecked(const char* path, size_t path_len, FSType fs_type, uint64_t dev_id, ssize_t result, const char* target,
                                     size_t target_len, uint64_t epoch, uint64_t invalidation_generation);
 auto symlink_prefix_hash_from_symlink_hash(uint64_t symlink_hash, uint64_t mount_generation) -> uint64_t;
+auto lookup_path_cache_key_still_stable(const LookupHandle& handle) -> bool;
 void symlink_prefix_cache_store_prehashed(const char* path, size_t prefix_len, MountPoint const* mount, uint64_t hash, uint64_t epoch,
                                           uint64_t mount_generation, uint64_t invalidation_generation);
 void symlink_prefix_cache_store_prechecked(const char* path, size_t prefix_len, MountPoint const* mount, uint64_t epoch,
@@ -7642,7 +7654,9 @@ void vfs_open_store_missing_metadata_result(const char* resolved_path, MountPoin
 auto vfs_open_resolved_for_task(ker::mod::sched::task::Task* task, const char* raw_path, std::array<char, MAX_PATH_LEN>& path_buffer,
                                 int flags, int backend_flags, int mode, bool path_requires_directory, bool flags_require_directory,
                                 bool open_local, size_t known_path_buffer_len = UNKNOWN_PATH_LEN, bool common_local_fast_path = false,
-                                uint64_t known_path_buffer_hash = UNKNOWN_PATH_HASH, bool trusted_dirfd_parent = false) -> int {
+                                uint64_t known_path_buffer_hash = UNKNOWN_PATH_HASH, bool trusted_dirfd_parent = false,
+                                bool lookup_symlinks_resolved = false, bool namespace_already_locked = false,
+                                const LookupHandle* stable_lookup = nullptr) -> int {
     if (!common_local_fast_path) {
         maybe_ensure_wki_host_root_mount_for_task(task, path_buffer.data());
     }
@@ -7688,7 +7702,8 @@ auto vfs_open_resolved_for_task(ker::mod::sched::task::Task* task, const char* r
     bool const PARENT_SYMLINK_PREFIX_KNOWN_NOOP =
         TRUSTED_DIRFD_PARENT_KNOWN_NOOP ||
         (mount != nullptr && !REMOTE_MOUNT && symlink_prefix_cache_covers_parent(path_buffer.data(), path_buffer_len, mount));
-    bool const SYMLINK_RESOLUTION_KNOWN_NOOP = FINAL_SYMLINK_PROBE_NOT_NEEDED && PARENT_SYMLINK_PREFIX_KNOWN_NOOP;
+    bool const SYMLINK_RESOLUTION_KNOWN_NOOP =
+        lookup_symlinks_resolved || (FINAL_SYMLINK_PROBE_NOT_NEEDED && PARENT_SYMLINK_PREFIX_KNOWN_NOOP);
 
     if (mount != nullptr && !REMOTE_MOUNT && vfs_open_missing_metadata_cacheable(flags) && metadata_cacheable_fs(mount->fs_type)) {
         metadata_store_epoch_before_symlink = g_metadata_store_observation_epoch.load(std::memory_order_acquire);
@@ -7794,7 +7809,8 @@ auto vfs_open_resolved_for_task(ker::mod::sched::task::Task* task, const char* r
 
     ker::vfs::File* f = nullptr;
     int backend_open_result = -ENOSYS;
-    XfsNamespacePublicationGuard namespace_publication_guard(mount, (backend_flags & (ker::vfs::O_CREAT | ker::vfs::O_TRUNC)) != 0);
+    VfsNamespacePublicationGuard namespace_publication_guard(
+        mount, !namespace_already_locked && (backend_flags & (ker::vfs::O_CREAT | ker::vfs::O_TRUNC)) != 0, true);
 
     // Route to the appropriate filesystem driver based on mount point
     switch (mount->fs_type) {
@@ -7817,7 +7833,13 @@ auto vfs_open_resolved_for_task(ker::mod::sched::task::Task* task, const char* r
             }
             break;
         case FSType::TMPFS:
-            f = ker::vfs::tmpfs::tmpfs_open_path(tmpfs_root_for_mount(mount), fs_relative_path, backend_flags, mode, &backend_open_result);
+            if (stable_lookup != nullptr && stable_lookup->mount() == mount && stable_lookup->backend_parent() != nullptr) {
+                f = ker::vfs::tmpfs::tmpfs_open_lookup(*static_cast<ker::vfs::tmpfs::TmpfsLookupHandle*>(stable_lookup->backend_parent()),
+                                                       backend_flags, mode, OPEN_REQUIRE_DIRECTORY, &backend_open_result);
+            } else {
+                f = ker::vfs::tmpfs::tmpfs_open_path(tmpfs_root_for_mount(mount), fs_relative_path, backend_flags, mode,
+                                                     &backend_open_result);
+            }
             if (f != nullptr) {
                 f->fops = ker::vfs::tmpfs::get_tmpfs_fops();
                 f->fs_type = FSType::TMPFS;
@@ -7834,9 +7856,14 @@ auto vfs_open_resolved_for_task(ker::mod::sched::task::Task* task, const char* r
             }
             break;
         case FSType::XFS:
-            f = ker::vfs::xfs::xfs_open_path(fs_relative_path, backend_flags, mode,
-                                             static_cast<ker::vfs::xfs::XfsMountContext*>(mount->private_data), &backend_open_result,
-                                             FS_RELATIVE_PATH_LEN, OPEN_REQUIRE_DIRECTORY);
+            if (stable_lookup != nullptr && stable_lookup->mount() == mount && stable_lookup->backend_parent() != nullptr) {
+                f = ker::vfs::xfs::xfs_open_lookup(*static_cast<ker::vfs::xfs::XfsLookupHandle*>(stable_lookup->backend_parent()),
+                                                   backend_flags, mode, OPEN_REQUIRE_DIRECTORY, &backend_open_result);
+            } else {
+                f = ker::vfs::xfs::xfs_open_path(fs_relative_path, backend_flags, mode,
+                                                 static_cast<ker::vfs::xfs::XfsMountContext*>(mount->private_data), &backend_open_result,
+                                                 FS_RELATIVE_PATH_LEN, OPEN_REQUIRE_DIRECTORY);
+            }
             if (f != nullptr) {
                 f->fops = ker::vfs::xfs::get_xfs_fops();
                 f->fs_type = FSType::XFS;
@@ -7875,6 +7902,7 @@ auto vfs_open_resolved_for_task(ker::mod::sched::task::Task* task, const char* r
     static_cast<void>(vfs_file_set_path(f, path_buffer.data()));
     f->mount_dev_id = mount->dev_id;
     f->mount_generation = mount_table_generation_snapshot();
+    f->vfs_path_namespace_generation = g_vfs_namespace_generation.load(std::memory_order_acquire);
     f->dir_fs_count = static_cast<size_t>(-1);
     f->open_flags = public_open_flags(flags);
     f->fd_flags = 0;  // fd_flags on File is legacy; CLOEXEC is per-fd in task bitmap
@@ -7980,6 +8008,12 @@ auto vfs_open(std::string_view path, int flags, int mode) -> int {
     std::memcpy(raw_path.data(), path.data(), path.size());
     raw_path[path.size()] = '\0';
 
+    // Process-context opens use the retained lookup path. Keep the legacy
+    // direct helper only for early boot callers that have no Task yet.
+    if (task != nullptr) {
+        return vfs_openat(task, AT_FDCWD, raw_path.data(), flags, mode);
+    }
+
     bool const PATH_REQUIRES_DIRECTORY = path_requires_directory(raw_path.data(), path.size());
     bool const FLAGS_REQUIRE_DIRECTORY = (flags & ker::vfs::O_DIRECTORY) != 0;
     if (FLAGS_REQUIRE_DIRECTORY && (flags & ker::vfs::O_CREAT) != 0) {
@@ -8034,62 +8068,87 @@ auto vfs_openat(ker::mod::sched::task::Task* task, int dirfd, const char* pathna
         return -ENOENT;
     }
 
-    bool const OPEN_LOCAL = (flags & ker::vfs::O_LOCAL) != 0;
-    bool path_requires_directory = false;
-    size_t resolved_len = UNKNOWN_PATH_LEN;
-    uint64_t resolved_hash = UNKNOWN_PATH_HASH;
-    // Both path resolvers initialize a complete NUL-terminated string before successful return.
-    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
-    std::array<char, MAX_PATH_LEN> resolved __attribute__((uninitialized));
-    int const FAST_RET = !OPEN_LOCAL ? vfs_open_absolute_common_local_fast_path(task, pathname, resolved, &path_requires_directory,
-                                                                                &resolved_len, &resolved_hash)
-                                     : RESOLVE_FAST_PATH_DECLINED;
-    if (FAST_RET == 0) {
-        if ((flags & ker::vfs::O_CREAT) != 0) {
-            mode = mode & ~static_cast<int>(task->umask);
-        }
-
-        bool const FLAGS_REQUIRE_DIRECTORY = (flags & ker::vfs::O_DIRECTORY) != 0;
-        if (FLAGS_REQUIRE_DIRECTORY && (flags & ker::vfs::O_CREAT) != 0) {
-            return -EINVAL;
-        }
-        int backend_flags = flags;
-        if (path_requires_directory) {
-            backend_flags &= ~ker::vfs::O_CREAT;
-        }
-
-        return vfs_open_resolved_for_task(task, pathname, resolved, flags, backend_flags, mode, path_requires_directory,
-                                          FLAGS_REQUIRE_DIRECTORY, OPEN_LOCAL, resolved_len, true, resolved_hash);
-    }
-    if (FAST_RET < 0) {
-        return FAST_RET;
-    }
-
-    bool common_local_fast_path = false;
-    bool trusted_dirfd_parent = false;
-    int const RESOLVE_RET =
-        resolve_dirfd_task_path_raw(task, dirfd, pathname, resolved.data(), resolved.size(), !OPEN_LOCAL, &path_requires_directory,
-                                    &resolved_len, &common_local_fast_path, &resolved_hash, &trusted_dirfd_parent);
-    if (RESOLVE_RET < 0) {
-        return RESOLVE_RET;
-    }
-
     if ((flags & ker::vfs::O_CREAT) != 0) {
         mode = mode & ~static_cast<int>(task->umask);
     }
-
     bool const FLAGS_REQUIRE_DIRECTORY = (flags & ker::vfs::O_DIRECTORY) != 0;
     if (FLAGS_REQUIRE_DIRECTORY && (flags & ker::vfs::O_CREAT) != 0) {
         return -EINVAL;
     }
-    int backend_flags = flags;
-    if (path_requires_directory) {
-        backend_flags &= ~ker::vfs::O_CREAT;
-    }
+    bool const OPEN_LOCAL = (flags & ker::vfs::O_LOCAL) != 0;
+    LookupFollowPolicy const FOLLOW_POLICY =
+        (flags & ker::vfs::O_NOFOLLOW) != 0 ? LookupFollowPolicy::NOFOLLOW_FINAL : LookupFollowPolicy::FOLLOW_FINAL;
 
-    return vfs_open_resolved_for_task(task, pathname, resolved, flags, backend_flags, mode, path_requires_directory,
-                                      FLAGS_REQUIRE_DIRECTORY, OPEN_LOCAL, resolved_len, common_local_fast_path, resolved_hash,
-                                      trusted_dirfd_parent);
+    struct OpenLookupContext {
+        ker::mod::sched::task::Task* task{};
+        const char* raw_path{};
+        int flags{};
+        int mode{};
+        bool open_local{};
+    } context{.task = task, .raw_path = pathname, .flags = flags, .mode = mode, .open_local = OPEN_LOCAL};
+
+    auto consume_open = [](const LookupHandle& handle, void* opaque) -> int {
+        auto& args = *static_cast<OpenLookupContext*>(opaque);
+        if ((args.flags & ker::vfs::O_NOFOLLOW) != 0) {
+            char byte = 0;
+            ssize_t link_result = -EINVAL;
+            if (handle.mount()->fs_type == FSType::TMPFS && handle.backend_parent() != nullptr) {
+                link_result = ker::vfs::tmpfs::tmpfs_readlink_lookup(
+                    *static_cast<ker::vfs::tmpfs::TmpfsLookupHandle*>(handle.backend_parent()), &byte, 1);
+            } else if (handle.mount()->fs_type == FSType::XFS && handle.backend_parent() != nullptr) {
+                link_result =
+                    ker::vfs::xfs::xfs_readlink_lookup(*static_cast<ker::vfs::xfs::XfsLookupHandle*>(handle.backend_parent()), &byte, 1);
+            } else {
+                link_result = readlink_resolved(handle.path(), &byte, 1, handle.path_length());
+            }
+            if (link_result >= 0) {
+                return -ELOOP;
+            }
+        }
+        std::array<char, MAX_PATH_LEN> resolved{};
+        if (handle.path_length() >= resolved.size()) {
+            return -ENAMETOOLONG;
+        }
+        std::memcpy(resolved.data(), handle.path(), handle.path_length() + 1);
+        int backend_flags = args.flags;
+        if (handle.requires_directory()) {
+            backend_flags &= ~ker::vfs::O_CREAT;
+        }
+        int const FD = vfs_open_resolved_for_task(args.task, args.raw_path, resolved, args.flags, backend_flags, args.mode,
+                                                  handle.requires_directory(), (args.flags & ker::vfs::O_DIRECTORY) != 0, args.open_local,
+                                                  handle.path_length(), false, UNKNOWN_PATH_HASH, false, true, true, &handle);
+        if (FD >= 0 && handle.dirfd_anchor() != nullptr && !lookup_path_cache_key_still_stable(handle)) {
+            // The backend File is valid, but its compatibility path text was
+            // assembled from a renamed dirfd. Keep it pathless so close/fstat
+            // observers cannot republish cache entries under the reused name.
+            File* const opened = vfs_get_file(args.task, FD);
+            vfs_file_clear_path(opened);
+            if (opened != nullptr) {
+                opened->vfs_path_namespace_generation = 0;
+            }
+        }
+        return FD;
+    };
+
+    for (unsigned attempt = 0; attempt < 4; ++attempt) {
+        LookupHandle lookup{};
+        int const ACQUIRE =
+            vfs_acquire_lookup(task, dirfd, pathname, LookupIntent::OPEN, FOLLOW_POLICY, FLAGS_REQUIRE_DIRECTORY, !OPEN_LOCAL, &lookup, 0);
+        if (ACQUIRE != 0) {
+            if (ACQUIRE == -EAGAIN && attempt != 3) {
+                continue;
+            }
+            return ACQUIRE;
+        }
+        if (lookup.mount()->fs_type == FSType::REMOTE) {
+            return consume_open(lookup, &context);
+        }
+        int const RESULT = vfs_consume_lookup(lookup, (flags & (ker::vfs::O_CREAT | ker::vfs::O_TRUNC)) != 0, consume_open, &context);
+        if (RESULT != -EAGAIN || attempt == 3) {
+            return RESULT;
+        }
+    }
+    return -EAGAIN;
 }
 
 auto vfs_close_file(File* file) -> int { return vfs_destroy_file(file); }
@@ -9031,7 +9090,8 @@ auto vfs_read_dir_entries(int fd, void* buffer, size_t max_size) -> ssize_t {
 // --- Symlink / mkdir / mount operations ---
 
 namespace {
-auto vfs_symlink_resolved_linkpath(const char* target, const char* abs_linkpath, size_t known_abs_linkpath_len = UNKNOWN_PATH_LEN) -> int {
+auto vfs_symlink_resolved_linkpath(const char* target, const char* abs_linkpath, size_t known_abs_linkpath_len = UNKNOWN_PATH_LEN,
+                                   bool namespace_already_locked = false) -> int {
     if (target == nullptr || abs_linkpath == nullptr) {
         return -EINVAL;
     }
@@ -9042,6 +9102,7 @@ auto vfs_symlink_resolved_linkpath(const char* target, const char* abs_linkpath,
     if (mount == nullptr) {
         return -ENOENT;
     }
+    VfsNamespacePublicationGuard namespace_publication_guard(mount, !namespace_already_locked, true);
 
     if (mount->fs_type == FSType::REMOTE) {
         const char* fs_path = strip_mount_prefix(mount, abs_linkpath);
@@ -9053,7 +9114,6 @@ auto vfs_symlink_resolved_linkpath(const char* target, const char* abs_linkpath,
     }
 
     if (mount->fs_type == FSType::XFS) {
-        XfsNamespacePublicationGuard namespace_publication_guard(mount);
         const char* fs_path = strip_mount_prefix(mount, abs_linkpath);
         size_t const FS_PATH_LEN = strip_mount_prefix_len(mount, abs_linkpath, known_abs_linkpath_len);
         Stat link_stat{};
@@ -9121,7 +9181,12 @@ auto vfs_symlink(const char* target, const char* linkpath) -> int {
         return -EINVAL;
     }
 
-    auto* task = ker::mod::sched::get_current_task();
+    auto* current = ker::mod::sched::can_query_current_task() ? ker::mod::sched::get_current_task() : nullptr;
+    if (current != nullptr) {
+        return vfs_symlinkat(current, target, AT_FDCWD, linkpath);
+    }
+
+    auto* task = current;
     PathTextScan scan{};
     if (task_absolute_local_path_fast_path_allowed(task, linkpath, &scan)) {
         return vfs_symlink_resolved_linkpath(target, linkpath, scan.path_len);
@@ -9147,15 +9212,52 @@ auto vfs_symlinkat(ker::mod::sched::task::Task* task, const char* target, int di
         return -ENOENT;
     }
 
-    std::array<char, MAX_PATH_LEN> resolved;  // NOLINT(cppcoreguidelines-pro-type-member-init)
-    size_t resolved_len = UNKNOWN_PATH_LEN;
-    int const RESOLVE_RET = resolve_dirfd_task_path_raw_with_absolute_local_fast_path(task, dirfd, linkpath, resolved.data(),
-                                                                                      resolved.size(), true, nullptr, &resolved_len);
-    if (RESOLVE_RET < 0) {
-        return RESOLVE_RET;
+    struct SymlinkLookupContext {
+        const char* target{};
+    } context{.target = target};
+    auto consume_symlink = [](const LookupHandle& handle, void* opaque) -> int {
+        auto& args = *static_cast<SymlinkLookupContext*>(opaque);
+        if (handle.mount()->fs_type == FSType::TMPFS && handle.backend_parent() != nullptr) {
+            ker::vfs::tmpfs::TmpfsObjectMetadata created_metadata{};
+            int const result = ker::vfs::tmpfs::tmpfs_symlink_lookup(
+                *static_cast<ker::vfs::tmpfs::TmpfsLookupHandle*>(handle.backend_parent()), args.target, &created_metadata);
+            if (result == 0 && lookup_path_cache_key_still_stable(handle)) {
+                vfs_cache_notify_path_changed(handle.path(), nullptr);
+                Stat created{};
+                ker::vfs::tmpfs::tmpfs_metadata_to_stat(created_metadata, handle.mount()->dev_id, &created);
+                metadata_cache_store_created_symlink_hints(handle.path(), handle.mount(), created, args.target, handle.path_length());
+            }
+            return result;
+        }
+        if (handle.mount()->fs_type == FSType::XFS && handle.backend_parent() != nullptr) {
+            Stat created{};
+            int const result = ker::vfs::xfs::xfs_symlink_lookup(*static_cast<ker::vfs::xfs::XfsLookupHandle*>(handle.backend_parent()),
+                                                                 args.target, &created);
+            if (result == 0 && lookup_path_cache_key_still_stable(handle)) {
+                vfs_cache_notify_path_changed(handle.path(), nullptr);
+                metadata_cache_store_created_symlink_hints(handle.path(), handle.mount(), created, args.target, handle.path_length());
+            }
+            return result;
+        }
+        return vfs_symlink_resolved_linkpath(args.target, handle.path(), handle.path_length(), true);
+    };
+    for (unsigned attempt = 0; attempt < 4; ++attempt) {
+        LookupHandle lookup{};
+        int const acquire =
+            vfs_acquire_lookup(task, dirfd, linkpath, LookupIntent::CREATE, LookupFollowPolicy::NOFOLLOW_FINAL, false, true, &lookup, 0);
+        if (acquire != 0) {
+            if (acquire == -EAGAIN && attempt != 3) {
+                continue;
+            }
+            return acquire;
+        }
+        int const result = lookup.mount()->fs_type == FSType::REMOTE ? consume_symlink(lookup, &context)
+                                                                     : vfs_consume_lookup(lookup, true, consume_symlink, &context);
+        if (result != -EAGAIN || attempt == 3) {
+            return result;
+        }
     }
-
-    return vfs_symlink_resolved_linkpath(target, resolved.data(), resolved_len);
+    return -EAGAIN;
 }
 
 // Internal readlink operating on an already-resolved absolute path (no root
@@ -9400,7 +9502,7 @@ void realpath_pop_component(char* resolved, size_t min_len) {
 }
 
 auto realpath_set_pending(const char* first, size_t first_len, const char* rest, char* pending, size_t pending_size) -> int {
-    if (pending == nullptr) {
+    if (pending == nullptr || (first == nullptr && first_len != 0)) {
         return -EINVAL;
     }
 
@@ -9670,9 +9772,14 @@ auto vfs_readlink(const char* path, char* buf, size_t bufsize) -> ssize_t {
         return -EINVAL;
     }
 
+    auto* current = ker::mod::sched::can_query_current_task() ? ker::mod::sched::get_current_task() : nullptr;
+    if (current != nullptr) {
+        return vfs_readlinkat(current, AT_FDCWD, path, buf, bufsize);
+    }
+
     std::array<char, MAX_PATH_LEN> abs_path;  // NOLINT(cppcoreguidelines-pro-type-member-init)
     bool require_directory = path_requires_directory(path);
-    auto* task = ker::mod::sched::can_query_current_task() ? ker::mod::sched::get_current_task() : nullptr;
+    auto* task = current;
     size_t abs_path_len = UNKNOWN_PATH_LEN;
     uint64_t abs_path_hash = UNKNOWN_PATH_HASH;
     int const RESOLVE_PATH_RET =
@@ -9725,42 +9832,48 @@ auto vfs_readlinkat(ker::mod::sched::task::Task* task, int dirfd, const char* pa
         return -ENOENT;
     }
 
-    std::array<char, MAX_PATH_LEN> abs_path{};
-    bool require_directory = false;
-    size_t abs_path_len = UNKNOWN_PATH_LEN;
-    uint64_t abs_path_hash = UNKNOWN_PATH_HASH;
-    int const RESOLVE_PATH_RET = resolve_dirfd_task_path_raw_with_absolute_local_fast_path(
-        task, dirfd, pathname, abs_path.data(), abs_path.size(), true, &require_directory, &abs_path_len, &abs_path_hash);
-    if (RESOLVE_PATH_RET < 0) {
-        return RESOLVE_PATH_RET;
+    struct ReadlinkLookupContext {
+        char* buffer{};
+        size_t size{};
+    } context{.buffer = buf, .size = bufsize};
+    auto consume_readlink = [](const LookupHandle& handle, void* opaque) -> int {
+        auto& args = *static_cast<ReadlinkLookupContext*>(opaque);
+        if (handle.mount()->fs_type == FSType::TMPFS && handle.backend_parent() != nullptr) {
+            return static_cast<int>(ker::vfs::tmpfs::tmpfs_readlink_lookup(
+                *static_cast<ker::vfs::tmpfs::TmpfsLookupHandle*>(handle.backend_parent()), args.buffer, args.size));
+        }
+        if (handle.mount()->fs_type == FSType::XFS && handle.backend_parent() != nullptr) {
+            return static_cast<int>(ker::vfs::xfs::xfs_readlink_lookup(
+                *static_cast<ker::vfs::xfs::XfsLookupHandle*>(handle.backend_parent()), args.buffer, args.size));
+        }
+        if (handle.requires_directory()) {
+            Stat stat{};
+            int const stat_result =
+                vfs_stat_resolved_cache_or_impl(handle.path(), false, true, false, &stat, handle.path_length(), UNKNOWN_PATH_HASH);
+            if (stat_result < 0) {
+                return stat_result;
+            }
+        }
+        return static_cast<int>(readlink_resolved(handle.path(), args.buffer, args.size, handle.path_length(), UNKNOWN_PATH_HASH));
+    };
+
+    for (unsigned attempt = 0; attempt < 4; ++attempt) {
+        LookupHandle lookup{};
+        int const acquire =
+            vfs_acquire_lookup(task, dirfd, pathname, LookupIntent::READLINK, LookupFollowPolicy::NOFOLLOW_FINAL, false, true, &lookup, 0);
+        if (acquire != 0) {
+            if (acquire == -EAGAIN && attempt != 3) {
+                continue;
+            }
+            return acquire;
+        }
+        int const result = lookup.mount()->fs_type == FSType::REMOTE ? consume_readlink(lookup, &context)
+                                                                     : vfs_consume_lookup(lookup, false, consume_readlink, &context);
+        if (result != -EAGAIN || attempt == 3) {
+            return result;
+        }
     }
-
-    if (require_directory) {
-        std::array<char, MAX_PATH_LEN> resolved{};
-        size_t resolved_len = abs_path_len;
-        int const RESOLVE_RET =
-            resolve_symlinks(abs_path.data(), resolved.data(), resolved.size(), true, true, abs_path_len, &resolved_len, nullptr, task);
-        if (RESOLVE_RET < 0) {
-            return RESOLVE_RET;
-        }
-        uint64_t const RESOLVED_HASH = abs_path_hash != UNKNOWN_PATH_HASH && resolved_len == abs_path_len &&
-                                               std::memcmp(resolved.data(), abs_path.data(), resolved_len + 1) == 0
-                                           ? abs_path_hash
-                                           : UNKNOWN_PATH_HASH;
-
-        Stat st{};
-        int const STAT_RET = vfs_stat_resolved_cache_or_impl(resolved.data(), true, false, false, &st, resolved_len, RESOLVED_HASH);
-        if (STAT_RET < 0) {
-            return STAT_RET;
-        }
-        if ((st.st_mode & S_IFMT) != S_IFDIR) {
-            return -ENOTDIR;
-        }
-
-        return readlink_resolved(resolved.data(), buf, bufsize, resolved_len, RESOLVED_HASH);
-    }
-
-    return vfs_readlink_after_resolving_parent_symlinks(abs_path.data(), buf, bufsize, true, task, abs_path_len, abs_path_hash);
+    return -EAGAIN;
 }
 
 auto vfs_realpath(const char* path, char* buf, size_t bufsize, size_t* len_out) -> int {
@@ -9856,7 +9969,7 @@ auto vfs_mkdir_cached_existing_result(const char* abs_path, MountPoint const* mo
 }
 
 auto vfs_mkdir_resolved_path(const char* abs_path, int mode, size_t known_abs_path_len = UNKNOWN_PATH_LEN,
-                             uint64_t known_abs_path_hash = UNKNOWN_PATH_HASH) -> int {
+                             uint64_t known_abs_path_hash = UNKNOWN_PATH_HASH, bool namespace_already_locked = false) -> int {
     if (abs_path == nullptr) {
         return -EINVAL;
     }
@@ -9866,6 +9979,7 @@ auto vfs_mkdir_resolved_path(const char* abs_path, int mode, size_t known_abs_pa
     if (mount == nullptr) {
         return -ENOENT;
     }
+    VfsNamespacePublicationGuard namespace_publication_guard(mount, !namespace_already_locked, true);
 
     const char* fs_path = strip_mount_prefix(mount, abs_path);
     size_t const FS_PATH_LEN = strip_mount_prefix_len(mount, abs_path, known_abs_path_len);
@@ -9891,7 +10005,6 @@ auto vfs_mkdir_resolved_path(const char* abs_path, int mode, size_t known_abs_pa
     }
 
     if (mount->fs_type == FSType::XFS) {
-        XfsNamespacePublicationGuard namespace_publication_guard(mount);
         auto* xctx = static_cast<ker::vfs::xfs::XfsMountContext*>(mount->private_data);
         Stat created_stat{};
         int const R = ker::vfs::xfs::xfs_mkdir_path(fs_path, mode, xctx, &created_stat, FS_PATH_LEN);
@@ -9928,7 +10041,12 @@ auto vfs_mkdir(const char* path, int mode) -> int {
         return -EINVAL;
     }
 
-    auto* task = ker::mod::sched::get_current_task();
+    auto* current = ker::mod::sched::can_query_current_task() ? ker::mod::sched::get_current_task() : nullptr;
+    if (current != nullptr) {
+        return vfs_mkdirat(current, AT_FDCWD, path, mode);
+    }
+
+    auto* task = current;
     PathTextScan scan{};
     if (task_absolute_local_path_fast_path_allowed(task, path, &scan)) {
         return vfs_mkdir_resolved_path(path, mode, scan.path_len, scan.path_hash);
@@ -9957,23 +10075,56 @@ auto vfs_mkdirat(ker::mod::sched::task::Task* task, int dirfd, const char* pathn
         return -ENOENT;
     }
 
-    PathTextScan scan{};
-    if (task_absolute_local_path_fast_path_allowed(task, pathname, &scan)) {
-        return vfs_mkdir_resolved_path(pathname, mode, scan.path_len, scan.path_hash);
-    }
+    struct MkdirLookupContext {
+        int mode{};
+    } context{.mode = mode};
+    auto consume_mkdir = [](const LookupHandle& handle, void* opaque) -> int {
+        auto& args = *static_cast<MkdirLookupContext*>(opaque);
+        if (handle.mount()->fs_type == FSType::TMPFS && handle.backend_parent() != nullptr) {
+            ker::vfs::tmpfs::TmpfsObjectMetadata created_metadata{};
+            int const result =
+                ker::vfs::tmpfs::tmpfs_mkdir_lookup(*static_cast<ker::vfs::tmpfs::TmpfsLookupHandle*>(handle.backend_parent()),
+                                                    static_cast<uint32_t>(args.mode), &created_metadata);
+            if (result == 0 && lookup_path_cache_key_still_stable(handle)) {
+                vfs_cache_notify_path_changed(handle.path(), nullptr);
+                Stat created{};
+                ker::vfs::tmpfs::tmpfs_metadata_to_stat(created_metadata, handle.mount()->dev_id, &created);
+                metadata_cache_store_non_symlink_stat_variants(handle.path(), handle.mount()->fs_type, handle.mount()->dev_id, created,
+                                                               metadata_snapshot_stamp(), handle.path_length(), handle.mount());
+            }
+            return result;
+        }
+        if (handle.mount()->fs_type == FSType::XFS && handle.backend_parent() != nullptr) {
+            Stat created{};
+            int const result = ker::vfs::xfs::xfs_mkdir_lookup(*static_cast<ker::vfs::xfs::XfsLookupHandle*>(handle.backend_parent()),
+                                                               args.mode, &created);
+            if (result == 0 && lookup_path_cache_key_still_stable(handle)) {
+                vfs_cache_notify_path_changed(handle.path(), nullptr);
+                metadata_cache_store_non_symlink_stat_variants(handle.path(), handle.mount()->fs_type, handle.mount()->dev_id, created,
+                                                               metadata_snapshot_stamp(), handle.path_length(), handle.mount());
+            }
+            return result;
+        }
+        return vfs_mkdir_resolved_path(handle.path(), args.mode, handle.path_length(), UNKNOWN_PATH_HASH, true);
+    };
 
-    std::array<char, MAX_PATH_LEN> resolved;  // NOLINT(cppcoreguidelines-pro-type-member-init)
-    bool require_directory = false;
-    size_t resolved_len = UNKNOWN_PATH_LEN;
-    uint64_t resolved_hash = UNKNOWN_PATH_HASH;
-    int const RESOLVE_RET = resolve_dirfd_task_path_raw(task, dirfd, pathname, resolved.data(), resolved.size(), true, &require_directory,
-                                                        &resolved_len, nullptr, &resolved_hash);
-    if (RESOLVE_RET < 0) {
-        return RESOLVE_RET;
+    for (unsigned attempt = 0; attempt < 4; ++attempt) {
+        LookupHandle lookup{};
+        int const acquire =
+            vfs_acquire_lookup(task, dirfd, pathname, LookupIntent::CREATE, LookupFollowPolicy::NOFOLLOW_FINAL, true, true, &lookup, 0);
+        if (acquire != 0) {
+            if (acquire == -EAGAIN && attempt != 3) {
+                continue;
+            }
+            return acquire;
+        }
+        int const result = lookup.mount()->fs_type == FSType::REMOTE ? consume_mkdir(lookup, &context)
+                                                                     : vfs_consume_lookup(lookup, true, consume_mkdir, &context);
+        if (result != -EAGAIN || attempt == 3) {
+            return result;
+        }
     }
-
-    (void)require_directory;
-    return vfs_mkdir_resolved_path(resolved.data(), mode, resolved_len, resolved_hash);
+    return -EAGAIN;
 }
 
 namespace {
@@ -10535,6 +10686,671 @@ auto metadata_cache_lookup_mount_stat(const char* resolved_path, MountPoint cons
 
 }  // namespace
 
+namespace {
+void release_tmpfs_lookup_cookie(void* cookie) { delete static_cast<ker::vfs::tmpfs::TmpfsLookupHandle*>(cookie); }
+void release_xfs_lookup_cookie(void* cookie) { delete static_cast<ker::vfs::xfs::XfsLookupHandle*>(cookie); }
+
+auto lookup_intent_allows_missing_final(LookupIntent intent) -> bool {
+    return intent == LookupIntent::OPEN || intent == LookupIntent::STAT || intent == LookupIntent::ACCESS ||
+           intent == LookupIntent::READLINK || intent == LookupIntent::CREATE || intent == LookupIntent::RENAME_TARGET ||
+           intent == LookupIntent::LINK_TARGET || intent == LookupIntent::MOUNT_TARGET || intent == LookupIntent::METADATA;
+}
+
+auto lookup_is_anchorable_relative_path(const char* pathname) -> bool {
+    if (pathname == nullptr || pathname[0] == '\0' || pathname[0] == '/') {
+        return false;
+    }
+    const char* cursor = pathname;
+    bool saw_component = false;
+    while (*cursor != '\0') {
+        while (*cursor == '/') {
+            ++cursor;
+        }
+        const char* const COMPONENT = cursor;
+        while (*cursor != '\0' && *cursor != '/') {
+            ++cursor;
+        }
+        size_t const COMPONENT_LENGTH = static_cast<size_t>(cursor - COMPONENT);
+        if (COMPONENT_LENGTH == 0) {
+            break;
+        }
+        if ((COMPONENT_LENGTH == 1 && COMPONENT[0] == '.') || (COMPONENT_LENGTH == 2 && COMPONENT[0] == '.' && COMPONENT[1] == '.')) {
+            return false;
+        }
+        saw_component = true;
+    }
+    return saw_component;
+}
+
+auto lookup_is_followable_relative_target(const char* target) -> bool {
+    if (target == nullptr || target[0] == '\0' || target[0] == '/') {
+        return false;
+    }
+    size_t length = std::strlen(target);
+    if (length >= MAX_PATH_LEN) {
+        return false;
+    }
+    while (length > 0 && target[length - 1] == '/') {
+        --length;
+    }
+    size_t component_start = length;
+    while (component_start > 0 && target[component_start - 1] != '/') {
+        --component_start;
+    }
+    size_t const COMPONENT_LENGTH = length - component_start;
+    return COMPONENT_LENGTH != 0 && !(COMPONENT_LENGTH == 1 && target[component_start] == '.') &&
+           !(COMPONENT_LENGTH == 2 && target[component_start] == '.' && target[component_start + 1] == '.');
+}
+
+auto lookup_replace_relative_leaf(const char* current_path, const char* relative_target, std::array<char, MAX_PATH_LEN>& out) -> int {
+    if (current_path == nullptr || relative_target == nullptr || !lookup_is_followable_relative_target(relative_target)) {
+        return -EINVAL;
+    }
+    size_t current_length = std::strlen(current_path);
+    while (current_length > 0 && current_path[current_length - 1] == '/') {
+        --current_length;
+    }
+    size_t prefix_length = 0;
+    for (size_t index = 0; index < current_length; ++index) {
+        if (current_path[index] == '/') {
+            prefix_length = index + 1;
+        }
+    }
+    size_t const TARGET_LENGTH = std::strlen(relative_target);
+    if (prefix_length + TARGET_LENGTH >= out.size()) {
+        return -ENAMETOOLONG;
+    }
+    if (prefix_length != 0) {
+        std::memcpy(out.data(), current_path, prefix_length);
+    }
+    std::memcpy(out.data() + prefix_length, relative_target, TARGET_LENGTH + 1);
+    return 0;
+}
+
+auto lookup_supplementary_groups_hash(const ker::mod::sched::task::Task& task) -> uint64_t {
+    uint64_t hash = 1469598103934665603ULL;
+    for (uint32_t const group : task.supplementary_groups) {
+        hash ^= group;
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
+auto populate_lookup_path_fields(LookupHandle& handle, const char* path, size_t path_len) -> int {
+    if (path == nullptr || path_len == 0 || path_len >= LookupHandle::PATH_CAPACITY || path[0] != '/') {
+        return -EINVAL;
+    }
+    size_t const PARENT_LEN = metadata_parent_path_len(path, path_len);
+    size_t component_offset = PARENT_LEN;
+    if (component_offset < path_len && path[component_offset] == '/') {
+        ++component_offset;
+    }
+    size_t const COMPONENT_LEN = path_len - component_offset;
+    if (PARENT_LEN >= LookupHandle::PATH_CAPACITY || COMPONENT_LEN >= LookupHandle::COMPONENT_CAPACITY) {
+        return -ENAMETOOLONG;
+    }
+    LookupHandleBuilder::set_path(handle, path, path_len, path, PARENT_LEN, path + component_offset, COMPONENT_LEN);
+    return 0;
+}
+
+auto lookup_authorization_still_current(const LookupHandle& handle) -> bool {
+    if (!ker::mod::sched::can_query_current_task()) {
+        return true;
+    }
+    auto* task = ker::mod::sched::get_current_task();
+    auto const& authorization = handle.authorization();
+    if (task == nullptr || task->pid != authorization.task_id) {
+        return true;
+    }
+    return task->uid == authorization.uid && task->gid == authorization.gid && task->euid == authorization.euid &&
+           task->egid == authorization.egid && task->suid == authorization.suid && task->sgid == authorization.sgid &&
+           lookup_supplementary_groups_hash(*task) == authorization.supplementary_groups_hash &&
+           metadata_path_hash_raw(task->root.data(), std::strlen(task->root.data())) == authorization.root_hash &&
+           metadata_path_hash_raw(task->cwd.data(), std::strlen(task->cwd.data())) == authorization.cwd_hash;
+}
+
+auto lookup_path_cache_key_still_stable(const LookupHandle& handle) -> bool {
+    return handle.dirfd_anchor() == nullptr || handle.dirfd_anchor()->vfs_path_namespace_generation == handle.namespace_generation();
+}
+}  // namespace
+
+auto vfs_acquire_lookup(ker::mod::sched::task::Task* task, int dirfd, const char* pathname, LookupIntent intent,
+                        LookupFollowPolicy follow_policy, bool require_directory, bool apply_task_route, LookupHandle* out,
+                        unsigned max_restarts, bool already_resolved) -> int {
+    if (task == nullptr) {
+        return -ESRCH;
+    }
+    if (pathname == nullptr || out == nullptr) {
+        return -EINVAL;
+    }
+    if (pathname[0] == '\0') {
+        return -ENOENT;
+    }
+
+    out->reset();
+    bool force_text_resolution = false;
+    unsigned attempt = 0;
+    while (attempt <= max_restarts) {
+        uint64_t const NAMESPACE_BEFORE = g_vfs_namespace_generation.load(std::memory_order_acquire);
+        uint64_t const MOUNT_GENERATION_BEFORE = mount_table_generation_snapshot();
+        bool path_requires_dir = false;
+        size_t path_len = UNKNOWN_PATH_LEN;
+        std::array<char, MAX_PATH_LEN> path{};
+        File* dirfd_anchor = nullptr;
+        if (pathname[0] != '/' && dirfd != AT_FDCWD) {
+            dirfd_anchor = vfs_get_file_retain(task, dirfd);
+            if (dirfd_anchor == nullptr) {
+                return -EBADF;
+            }
+            if (!dirfd_anchor->is_directory) {
+                vfs_put_file(dirfd_anchor);
+                return -ENOTDIR;
+            }
+        }
+        bool const DIRECT_DIRFD = !already_resolved && !force_text_resolution && dirfd_anchor != nullptr &&
+                                  lookup_is_anchorable_relative_path(pathname) && dirfd_anchor->vfs_path != nullptr &&
+                                  task->root[0] == '/' && task->root[1] == '\0' &&
+                                  (dirfd_anchor->fs_type == FSType::TMPFS || dirfd_anchor->fs_type == FSType::XFS);
+        int result = 0;
+        if (already_resolved) {
+            if (pathname[0] != '/') {
+                if (dirfd_anchor != nullptr) {
+                    vfs_put_file(dirfd_anchor);
+                }
+                return -EINVAL;
+            }
+            result = copy_path_string(pathname, path.data(), path.size(), UNKNOWN_PATH_LEN, &path_len);
+            if (result == 0) {
+                result = canonicalize_path(path.data(), path.size());
+                path_len = result == 0 ? std::strlen(path.data()) : UNKNOWN_PATH_LEN;
+            }
+        } else if (DIRECT_DIRFD) {
+            PathTextScan const SCAN = scan_path_text(pathname);
+            path_requires_dir = SCAN.requires_directory;
+            result = copy_simple_relative_path_from_base(dirfd_anchor->vfs_path, pathname, SCAN, path.data(), path.size(), &path_len,
+                                                         file_vfs_path_len(dirfd_anchor));
+        } else {
+            result = resolve_dirfd_task_path_raw(task, dirfd, pathname, path.data(), path.size(), apply_task_route, &path_requires_dir,
+                                                 &path_len);
+        }
+        if (result < 0) {
+            if (dirfd_anchor != nullptr) {
+                vfs_put_file(dirfd_anchor);
+            }
+            return result;
+        }
+        if (path_len == UNKNOWN_PATH_LEN) {
+            path_len = std::strlen(path.data());
+        }
+
+        if (DIRECT_DIRFD) {
+            auto logical_mount = find_mount_point(path.data(), path_len);
+            bool const ROUTE_CHANGES_PATH = apply_task_route && !task_vfs_route_is_common_local_noop(task, path.data());
+            if (ROUTE_CHANGES_PATH || logical_mount.get() != dirfd_anchor->mount_owner) {
+                if (dirfd_anchor != nullptr) {
+                    vfs_put_file(dirfd_anchor);
+                }
+                force_text_resolution = true;
+                continue;
+            }
+        }
+
+        auto mount_ref = DIRECT_DIRFD ? retain_mount_point(dirfd_anchor->mount_owner) : find_mount_point(path.data(), path_len);
+        MountPoint* mount = mount_ref.get();
+        if (mount == nullptr) {
+            if (dirfd_anchor != nullptr) {
+                vfs_put_file(dirfd_anchor);
+            }
+            return -ENOENT;
+        }
+
+        // The remote owner performs its component walk and operation in one
+        // request. Never keep a local namespace lock across that WKI wait.
+        if (mount->fs_type != FSType::REMOTE && !DIRECT_DIRFD) {
+            std::array<char, MAX_PATH_LEN> followed{};
+            size_t followed_len = path_len;
+            result = resolve_symlinks(path.data(), followed.data(), followed.size(), apply_task_route,
+                                      follow_policy == LookupFollowPolicy::FOLLOW_FINAL || require_directory || path_requires_dir, path_len,
+                                      &followed_len, nullptr, task);
+            if (result < 0) {
+                if (dirfd_anchor != nullptr) {
+                    vfs_put_file(dirfd_anchor);
+                }
+                return result;
+            }
+            if (result == 0 && !path_text_equal(path.data(), path_len, followed.data(), followed_len)) {
+                path = followed;
+                path_len = followed_len;
+                mount_ref = find_mount_point(path.data(), path_len);
+                mount = mount_ref.get();
+                if (mount == nullptr) {
+                    if (dirfd_anchor != nullptr) {
+                        vfs_put_file(dirfd_anchor);
+                    }
+                    return -ENOENT;
+                }
+            }
+        }
+
+        LookupAuthorizationContext authorization{
+            .task_id = task->pid,
+            .uid = task->uid,
+            .gid = task->gid,
+            .euid = task->euid,
+            .egid = task->egid,
+            .suid = task->suid,
+            .sgid = task->sgid,
+            .supplementary_groups_hash = lookup_supplementary_groups_hash(*task),
+            .root_hash = metadata_path_hash_raw(task->root.data(), std::strlen(task->root.data())),
+            .cwd_hash = metadata_path_hash_raw(task->cwd.data(), std::strlen(task->cwd.data())),
+        };
+        LookupHandle candidate{};
+        result = populate_lookup_path_fields(candidate, path.data(), path_len);
+        if (result < 0) {
+            if (dirfd_anchor != nullptr) {
+                vfs_put_file(dirfd_anchor);
+            }
+            return result;
+        }
+        LookupHandleBuilder::set_policy(candidate, intent, follow_policy, require_directory || path_requires_dir, authorization);
+        LookupHandleBuilder::set_dirfd_anchor(candidate, dirfd_anchor);
+
+        g_vfs_namespace_publication_mutex.lock();
+        bool const GENERATION_STALE = g_vfs_namespace_generation.load(std::memory_order_acquire) != NAMESPACE_BEFORE ||
+                                      mount_table_generation_snapshot() != MOUNT_GENERATION_BEFORE || mount->retiring.load();
+        if (GENERATION_STALE) {
+            g_vfs_namespace_publication_mutex.unlock();
+            candidate.reset();
+            if (attempt == max_restarts) {
+                return -EAGAIN;
+            }
+            ++attempt;
+            continue;
+        }
+
+        uint64_t backend_generation = NAMESPACE_BEFORE;
+        if (mount->fs_type == FSType::TMPFS) {
+            auto* backend = new (std::nothrow) ker::vfs::tmpfs::TmpfsLookupHandle{};
+            if (backend == nullptr) {
+                g_vfs_namespace_publication_mutex.unlock();
+                return -ENOMEM;
+            }
+            const char* fs_path = strip_mount_prefix(mount, path.data());
+            auto* lookup_root =
+                DIRECT_DIRFD ? static_cast<ker::vfs::tmpfs::TmpNode*>(dirfd_anchor->private_data) : tmpfs_root_for_mount(mount);
+            const char* lookup_path = DIRECT_DIRFD ? pathname : fs_path;
+            result = ker::vfs::tmpfs::tmpfs_acquire_lookup(lookup_root, lookup_path, backend);
+            if (result < 0) {
+                delete backend;
+                g_vfs_namespace_publication_mutex.unlock();
+                if (result == -ENOENT && lookup_intent_allows_missing_final(intent)) {
+                    // Missing intermediate components are not valid create
+                    // parents; tmpfs_acquire_lookup distinguishes those by
+                    // returning -ENOENT before producing a handle.
+                    return result;
+                }
+                return result;
+            }
+            if (!backend->target_existed() && !lookup_intent_allows_missing_final(intent)) {
+                delete backend;
+                g_vfs_namespace_publication_mutex.unlock();
+                return -ENOENT;
+            }
+            bool restart_with_text_resolution = false;
+            if (DIRECT_DIRFD && backend->target_existed() && follow_policy == LookupFollowPolicy::FOLLOW_FINAL) {
+                std::array<char, MAX_PATH_LEN> direct_target{};
+                bool direct_from_mount_root = false;
+                result = copy_path_string(pathname, direct_target.data(), direct_target.size());
+                if (result != 0) {
+                    delete backend;
+                    g_vfs_namespace_publication_mutex.unlock();
+                    return result;
+                }
+                for (int depth = 0; depth <= MAX_SYMLINK_DEPTH; ++depth) {
+                    Stat target_stat{};
+                    int const STAT_RESULT = ker::vfs::tmpfs::tmpfs_stat_lookup(*backend, false, mount->dev_id, &target_stat);
+                    if (STAT_RESULT != 0) {
+                        delete backend;
+                        g_vfs_namespace_publication_mutex.unlock();
+                        return STAT_RESULT;
+                    }
+                    if ((target_stat.st_mode & static_cast<mode_t>(S_IFMT)) != static_cast<mode_t>(S_IFLNK)) {
+                        break;
+                    }
+                    if (depth == MAX_SYMLINK_DEPTH) {
+                        delete backend;
+                        g_vfs_namespace_publication_mutex.unlock();
+                        return -ELOOP;
+                    }
+                    std::array<char, MAX_PATH_LEN> link_target{};
+                    ssize_t const READ = ker::vfs::tmpfs::tmpfs_readlink_lookup(*backend, link_target.data(), link_target.size() - 1);
+                    if (READ < 0) {
+                        delete backend;
+                        g_vfs_namespace_publication_mutex.unlock();
+                        return static_cast<int>(READ);
+                    }
+                    link_target.at(static_cast<size_t>(READ)) = '\0';
+                    if (link_target.front() == '/') {
+                        auto target_mount = find_mount_point(link_target.data(), static_cast<size_t>(READ));
+                        if ((apply_task_route && !task_vfs_route_is_common_local_noop(task, link_target.data())) ||
+                            target_mount.get() != mount) {
+                            restart_with_text_resolution = true;
+                            break;
+                        }
+                        result =
+                            copy_path_string(link_target.data(), direct_target.data(), direct_target.size(), static_cast<size_t>(READ));
+                        direct_from_mount_root = true;
+                    } else {
+                        if (!lookup_is_followable_relative_target(link_target.data())) {
+                            restart_with_text_resolution = true;
+                            break;
+                        }
+                        std::array<char, MAX_PATH_LEN> next_direct_target{};
+                        result = lookup_replace_relative_leaf(direct_target.data(), link_target.data(), next_direct_target);
+                        if (result == 0) {
+                            direct_target = next_direct_target;
+                        }
+                    }
+                    if (result != 0) {
+                        delete backend;
+                        g_vfs_namespace_publication_mutex.unlock();
+                        return result;
+                    }
+                    if (direct_from_mount_root) {
+                        result = copy_path_string(direct_target.data(), path.data(), path.size(), UNKNOWN_PATH_LEN, &path_len);
+                        if (result == 0) {
+                            result = canonicalize_path(path.data(), path.size());
+                            path_len = result == 0 ? std::strlen(path.data()) : UNKNOWN_PATH_LEN;
+                        }
+                    } else {
+                        PathTextScan const TARGET_SCAN = scan_path_text(direct_target.data());
+                        result = copy_simple_relative_path_from_base(dirfd_anchor->vfs_path, direct_target.data(), TARGET_SCAN, path.data(),
+                                                                     path.size(), &path_len, file_vfs_path_len(dirfd_anchor));
+                    }
+                    if (result != 0) {
+                        delete backend;
+                        g_vfs_namespace_publication_mutex.unlock();
+                        return result;
+                    }
+                    delete backend;
+                    backend = new (std::nothrow) ker::vfs::tmpfs::TmpfsLookupHandle{};
+                    if (backend == nullptr) {
+                        g_vfs_namespace_publication_mutex.unlock();
+                        return -ENOMEM;
+                    }
+                    auto* target_root = direct_from_mount_root ? tmpfs_root_for_mount(mount) : lookup_root;
+                    const char* target_path =
+                        direct_from_mount_root ? strip_mount_prefix(mount, direct_target.data()) : direct_target.data();
+                    result = ker::vfs::tmpfs::tmpfs_acquire_lookup(target_root, target_path, backend);
+                    if (result != 0 || (!backend->target_existed() && !lookup_intent_allows_missing_final(intent))) {
+                        delete backend;
+                        g_vfs_namespace_publication_mutex.unlock();
+                        return result != 0 ? result : -ENOENT;
+                    }
+                    if (!backend->target_existed()) {
+                        break;
+                    }
+                }
+            }
+            if (restart_with_text_resolution) {
+                delete backend;
+                g_vfs_namespace_publication_mutex.unlock();
+                candidate.reset();
+                force_text_resolution = true;
+                continue;
+            }
+            backend_generation = backend->namespace_generation();
+            LookupHandleBuilder::set_backend_binding(candidate, backend, release_tmpfs_lookup_cookie, backend->parent_incarnation(),
+                                                     backend->parent_generation(), nullptr, nullptr, backend->target_incarnation());
+        } else if (mount->fs_type == FSType::XFS) {
+            auto* backend = new (std::nothrow) ker::vfs::xfs::XfsLookupHandle{};
+            if (backend == nullptr) {
+                g_vfs_namespace_publication_mutex.unlock();
+                return -ENOMEM;
+            }
+            const char* fs_path = strip_mount_prefix(mount, path.data());
+            size_t const FS_PATH_LEN = strip_mount_prefix_len(mount, path.data(), path_len);
+            result = DIRECT_DIRFD ? ker::vfs::xfs::xfs_acquire_lookup_at_file(dirfd_anchor, pathname, backend)
+                                  : ker::vfs::xfs::xfs_acquire_lookup(
+                                        fs_path, static_cast<ker::vfs::xfs::XfsMountContext*>(mount->private_data), backend, FS_PATH_LEN);
+            if (result < 0) {
+                delete backend;
+                g_vfs_namespace_publication_mutex.unlock();
+                return result;
+            }
+            if (!backend->target_existed() && !lookup_intent_allows_missing_final(intent)) {
+                delete backend;
+                g_vfs_namespace_publication_mutex.unlock();
+                return -ENOENT;
+            }
+            bool restart_with_text_resolution = false;
+            if (DIRECT_DIRFD && backend->target_existed() && follow_policy == LookupFollowPolicy::FOLLOW_FINAL) {
+                std::array<char, MAX_PATH_LEN> direct_target{};
+                bool direct_from_mount_root = false;
+                result = copy_path_string(pathname, direct_target.data(), direct_target.size());
+                if (result != 0) {
+                    delete backend;
+                    g_vfs_namespace_publication_mutex.unlock();
+                    return result;
+                }
+                for (int depth = 0; depth <= MAX_SYMLINK_DEPTH; ++depth) {
+                    Stat target_stat{};
+                    int const STAT_RESULT = ker::vfs::xfs::xfs_stat_lookup(*backend, false, &target_stat);
+                    if (STAT_RESULT != 0) {
+                        delete backend;
+                        g_vfs_namespace_publication_mutex.unlock();
+                        return STAT_RESULT;
+                    }
+                    if ((target_stat.st_mode & static_cast<mode_t>(S_IFMT)) != static_cast<mode_t>(S_IFLNK)) {
+                        break;
+                    }
+                    if (depth == MAX_SYMLINK_DEPTH) {
+                        delete backend;
+                        g_vfs_namespace_publication_mutex.unlock();
+                        return -ELOOP;
+                    }
+                    std::array<char, MAX_PATH_LEN> link_target{};
+                    ssize_t const READ = ker::vfs::xfs::xfs_readlink_lookup(*backend, link_target.data(), link_target.size() - 1);
+                    if (READ < 0) {
+                        delete backend;
+                        g_vfs_namespace_publication_mutex.unlock();
+                        return static_cast<int>(READ);
+                    }
+                    link_target.at(static_cast<size_t>(READ)) = '\0';
+                    if (link_target.front() == '/') {
+                        auto target_mount = find_mount_point(link_target.data(), static_cast<size_t>(READ));
+                        if ((apply_task_route && !task_vfs_route_is_common_local_noop(task, link_target.data())) ||
+                            target_mount.get() != mount) {
+                            restart_with_text_resolution = true;
+                            break;
+                        }
+                        result =
+                            copy_path_string(link_target.data(), direct_target.data(), direct_target.size(), static_cast<size_t>(READ));
+                        direct_from_mount_root = true;
+                    } else {
+                        if (!lookup_is_followable_relative_target(link_target.data())) {
+                            restart_with_text_resolution = true;
+                            break;
+                        }
+                        std::array<char, MAX_PATH_LEN> next_direct_target{};
+                        result = lookup_replace_relative_leaf(direct_target.data(), link_target.data(), next_direct_target);
+                        if (result == 0) {
+                            direct_target = next_direct_target;
+                        }
+                    }
+                    if (result != 0) {
+                        delete backend;
+                        g_vfs_namespace_publication_mutex.unlock();
+                        return result;
+                    }
+                    if (direct_from_mount_root) {
+                        result = copy_path_string(direct_target.data(), path.data(), path.size(), UNKNOWN_PATH_LEN, &path_len);
+                        if (result == 0) {
+                            result = canonicalize_path(path.data(), path.size());
+                            path_len = result == 0 ? std::strlen(path.data()) : UNKNOWN_PATH_LEN;
+                        }
+                    } else {
+                        PathTextScan const TARGET_SCAN = scan_path_text(direct_target.data());
+                        result = copy_simple_relative_path_from_base(dirfd_anchor->vfs_path, direct_target.data(), TARGET_SCAN, path.data(),
+                                                                     path.size(), &path_len, file_vfs_path_len(dirfd_anchor));
+                    }
+                    if (result != 0) {
+                        delete backend;
+                        g_vfs_namespace_publication_mutex.unlock();
+                        return result;
+                    }
+                    delete backend;
+                    backend = new (std::nothrow) ker::vfs::xfs::XfsLookupHandle{};
+                    if (backend == nullptr) {
+                        g_vfs_namespace_publication_mutex.unlock();
+                        return -ENOMEM;
+                    }
+                    if (direct_from_mount_root) {
+                        const char* target_fs_path = strip_mount_prefix(mount, direct_target.data());
+                        size_t const TARGET_FS_PATH_LEN = strip_mount_prefix_len(mount, direct_target.data(), UNKNOWN_PATH_LEN);
+                        result = ker::vfs::xfs::xfs_acquire_lookup(
+                            target_fs_path, static_cast<ker::vfs::xfs::XfsMountContext*>(mount->private_data), backend, TARGET_FS_PATH_LEN);
+                    } else {
+                        result = ker::vfs::xfs::xfs_acquire_lookup_at_file(dirfd_anchor, direct_target.data(), backend);
+                    }
+                    if (result != 0 || (!backend->target_existed() && !lookup_intent_allows_missing_final(intent))) {
+                        delete backend;
+                        g_vfs_namespace_publication_mutex.unlock();
+                        return result != 0 ? result : -ENOENT;
+                    }
+                    if (!backend->target_existed()) {
+                        break;
+                    }
+                }
+            }
+            if (restart_with_text_resolution) {
+                delete backend;
+                g_vfs_namespace_publication_mutex.unlock();
+                candidate.reset();
+                force_text_resolution = true;
+                continue;
+            }
+            backend_generation = backend->expected_mutation_sequence();
+            LookupHandleBuilder::set_backend_binding(candidate, backend, release_xfs_lookup_cookie,
+                                                     reinterpret_cast<uintptr_t>(backend->parent()), backend->expected_parent_generation(),
+                                                     nullptr, nullptr, reinterpret_cast<uintptr_t>(backend->target()));
+        }
+
+        LookupHandleBuilder::set_mount(candidate, std::move(mount_ref), MOUNT_GENERATION_BEFORE, NAMESPACE_BEFORE, backend_generation);
+        g_vfs_namespace_publication_mutex.unlock();
+        *out = std::move(candidate);
+        return 0;
+    }
+    return -EAGAIN;
+}
+
+auto vfs_consume_lookup(const LookupHandle& handle, bool namespace_mutation, LookupConsumer consumer, void* context) -> int {
+    if (handle.mount() == nullptr || consumer == nullptr) {
+        return -EINVAL;
+    }
+    if (handle.mount()->fs_type == FSType::REMOTE) {
+        return -EXDEV;
+    }
+    if (!lookup_authorization_still_current(handle)) {
+        return -EAGAIN;
+    }
+
+    ker::mod::sys::MutexGuard publication_guard(g_vfs_namespace_publication_mutex);
+    if (handle.mount()->retiring.load(std::memory_order_acquire) ||
+        g_vfs_namespace_generation.load(std::memory_order_acquire) != handle.namespace_generation()) {
+        return -EAGAIN;
+    }
+    auto current_mount = find_mount_point(handle.path(), handle.path_length());
+    if (handle.dirfd_anchor() == nullptr && current_mount.get() != handle.mount()) {
+        return -EAGAIN;
+    }
+    if (handle.dirfd_anchor() != nullptr && handle.dirfd_anchor()->mount_owner != handle.mount()) {
+        return -EAGAIN;
+    }
+
+    int validation = 0;
+    if (handle.mount()->fs_type == FSType::TMPFS) {
+        auto* backend = static_cast<ker::vfs::tmpfs::TmpfsLookupHandle*>(handle.backend_parent());
+        validation = backend != nullptr && ker::vfs::tmpfs::tmpfs_validate_lookup(*backend) ? 0 : -EAGAIN;
+    } else if (handle.mount()->fs_type == FSType::XFS) {
+        auto* backend = static_cast<ker::vfs::xfs::XfsLookupHandle*>(handle.backend_parent());
+        validation = backend != nullptr ? ker::vfs::xfs::xfs_validate_lookup(*backend) : -EAGAIN;
+    }
+    if (validation != 0) {
+        return validation;
+    }
+
+    int const result = consumer(handle, context);
+    if (result >= 0 && handle.dirfd_anchor() != nullptr && !lookup_path_cache_key_still_stable(handle)) {
+        metadata_cache_note_path_changed("/", nullptr);
+    }
+    if (result >= 0 && namespace_mutation) {
+        g_vfs_namespace_generation.fetch_add(1, std::memory_order_acq_rel);
+    }
+    return result;
+}
+
+auto vfs_consume_lookup_pair(const LookupHandle& first, const LookupHandle& second, bool namespace_mutation, LookupPairConsumer consumer,
+                             void* context) -> int {
+    if (first.mount() == nullptr || second.mount() == nullptr || consumer == nullptr) {
+        return -EINVAL;
+    }
+    if (first.mount() != second.mount()) {
+        return -EXDEV;
+    }
+    if (first.mount()->fs_type == FSType::REMOTE) {
+        return -EXDEV;
+    }
+    if (!lookup_authorization_still_current(first) || !lookup_authorization_still_current(second)) {
+        return -EAGAIN;
+    }
+
+    ker::mod::sys::MutexGuard publication_guard(g_vfs_namespace_publication_mutex);
+    uint64_t const CURRENT_NAMESPACE_GENERATION = g_vfs_namespace_generation.load(std::memory_order_acquire);
+    if (first.mount()->retiring.load(std::memory_order_acquire) || first.namespace_generation() != CURRENT_NAMESPACE_GENERATION ||
+        second.namespace_generation() != CURRENT_NAMESPACE_GENERATION) {
+        return -EAGAIN;
+    }
+    auto first_current_mount = find_mount_point(first.path(), first.path_length());
+    auto second_current_mount = find_mount_point(second.path(), second.path_length());
+    auto mount_still_matches = [](const LookupHandle& handle, const MountRef& current) {
+        return handle.dirfd_anchor() != nullptr ? handle.dirfd_anchor()->mount_owner == handle.mount() : current.get() == handle.mount();
+    };
+    if (!mount_still_matches(first, first_current_mount) || !mount_still_matches(second, second_current_mount)) {
+        return -EAGAIN;
+    }
+
+    auto validate = [](const LookupHandle& handle) -> int {
+        if (handle.mount()->fs_type == FSType::TMPFS) {
+            auto* backend = static_cast<ker::vfs::tmpfs::TmpfsLookupHandle*>(handle.backend_parent());
+            return backend != nullptr && ker::vfs::tmpfs::tmpfs_validate_lookup(*backend) ? 0 : -EAGAIN;
+        }
+        if (handle.mount()->fs_type == FSType::XFS) {
+            auto* backend = static_cast<ker::vfs::xfs::XfsLookupHandle*>(handle.backend_parent());
+            return backend != nullptr ? ker::vfs::xfs::xfs_validate_lookup(*backend) : -EAGAIN;
+        }
+        return 0;
+    };
+    int const FIRST_VALID = validate(first);
+    if (FIRST_VALID != 0) {
+        return FIRST_VALID;
+    }
+    int const SECOND_VALID = validate(second);
+    if (SECOND_VALID != 0) {
+        return SECOND_VALID;
+    }
+
+    int const result = consumer(first, second, context);
+    if (result >= 0 && ((first.dirfd_anchor() != nullptr && !lookup_path_cache_key_still_stable(first)) ||
+                        (second.dirfd_anchor() != nullptr && !lookup_path_cache_key_still_stable(second)))) {
+        metadata_cache_note_path_changed("/", nullptr);
+    }
+    if (result >= 0 && namespace_mutation) {
+        g_vfs_namespace_generation.fetch_add(1, std::memory_order_acq_rel);
+    }
+    return result;
+}
+
 #ifdef WOS_SELFTEST
 auto vfs_selftest_common_local_relative_resolver_fast_path() -> bool { return common_local_relative_resolver_fast_path_selftest_impl(); }
 #endif
@@ -11083,6 +11899,10 @@ auto vfs_selftest_absolute_local_stat_fast_path_gate() -> bool {
 #endif
 
 auto vfs_stat(const char* path, Stat* statbuf) -> int {
+    auto* task = ker::mod::sched::can_query_current_task() ? ker::mod::sched::get_current_task() : nullptr;
+    if (task != nullptr) {
+        return vfs_statat(task, AT_FDCWD, path, 0, statbuf);
+    }
     int result = 0;
     if (vfs_stat_current_task_fast_path(path, true, statbuf, &result)) {
         return result;
@@ -11091,6 +11911,10 @@ auto vfs_stat(const char* path, Stat* statbuf) -> int {
 }
 
 auto vfs_lstat(const char* path, Stat* statbuf) -> int {
+    auto* task = ker::mod::sched::can_query_current_task() ? ker::mod::sched::get_current_task() : nullptr;
+    if (task != nullptr) {
+        return vfs_statat(task, AT_FDCWD, path, AT_SYMLINK_NOFOLLOW, statbuf);
+    }
     int result = 0;
     if (vfs_stat_current_task_fast_path(path, false, statbuf, &result)) {
         return result;
@@ -11112,6 +11936,9 @@ auto vfs_statat(ker::mod::sched::task::Task* task, int dirfd, const char* pathna
     if (pathname == nullptr || statbuf == nullptr) {
         return -EINVAL;
     }
+    if ((flags & ~(AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW)) != 0) {
+        return -EINVAL;
+    }
 
     bool const EMPTY_PATH = pathname[0] == '\0';
     if ((flags & AT_EMPTY_PATH) != 0 && EMPTY_PATH) {
@@ -11128,33 +11955,62 @@ auto vfs_statat(ker::mod::sched::task::Task* task, int dirfd, const char* pathna
     }
 
     bool const FOLLOW_FINAL_SYMLINK = (flags & AT_SYMLINK_NOFOLLOW) == 0;
-    int fast_result = 0;
-    if (vfs_stat_absolute_local_fast_path(task, pathname, FOLLOW_FINAL_SYMLINK, statbuf, &fast_result)) {
-        return fast_result;
-    }
+    struct StatLookupContext {
+        Stat* output{};
+    } context{.output = statbuf};
+    auto consume_stat = [](const LookupHandle& handle, void* opaque) -> int {
+        auto& args = *static_cast<StatLookupContext*>(opaque);
+        if (lookup_path_cache_key_still_stable(handle)) {
+            bool const FOLLOW_FINAL = handle.follow_policy() == LookupFollowPolicy::FOLLOW_FINAL;
+            int const CACHED = metadata_cache_lookup(handle.path(), handle.mount()->fs_type, handle.mount()->dev_id, FOLLOW_FINAL,
+                                                     handle.requires_directory(), args.output, true, handle.path_length());
+            if (CACHED != -EAGAIN) {
+                return CACHED;
+            }
+        }
+        int result = 0;
+        if (handle.mount()->fs_type == FSType::TMPFS && handle.backend_parent() != nullptr) {
+            result = ker::vfs::tmpfs::tmpfs_stat_lookup(*static_cast<ker::vfs::tmpfs::TmpfsLookupHandle*>(handle.backend_parent()),
+                                                        handle.requires_directory(), handle.mount()->dev_id, args.output);
+        } else if (handle.mount()->fs_type == FSType::XFS && handle.backend_parent() != nullptr) {
+            result = ker::vfs::xfs::xfs_stat_lookup(*static_cast<ker::vfs::xfs::XfsLookupHandle*>(handle.backend_parent()),
+                                                    handle.requires_directory(), args.output);
+            if (result == 0) {
+                args.output->st_dev = handle.mount()->dev_id;
+            }
+        } else {
+            // The handle has already performed the requested final-follow policy;
+            // keep the compatibility backend from following the final component a
+            // second time. A trailing slash still enforces directory semantics.
+            result = vfs_stat_resolved_cache_or_impl(handle.path(), false, handle.requires_directory(), false, args.output,
+                                                     handle.path_length(), UNKNOWN_PATH_HASH);
+        }
+        if (result == 0 && lookup_path_cache_key_still_stable(handle) &&
+            (handle.mount()->fs_type == FSType::TMPFS || handle.mount()->fs_type == FSType::XFS)) {
+            metadata_cache_store_known_path_stat_on_current_mount(handle.path(), handle.mount(), *args.output, handle.path_length());
+        } else if (result == -ENOENT && lookup_path_cache_key_still_stable(handle)) {
+            metadata_cache_store_missing_path_on_current_mount(handle.path(), handle.mount(), handle.path_length(), UNKNOWN_PATH_HASH);
+        }
+        return result;
+    };
 
-    // resolve_dirfd_task_path_raw initializes the complete NUL-terminated string on success.
-    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
-    std::array<char, MAX_PATH_LEN> resolved __attribute__((uninitialized));
-    bool require_directory = false;
-    size_t resolved_len = UNKNOWN_PATH_LEN;
-    uint64_t resolved_hash = UNKNOWN_PATH_HASH;
-    bool common_local_fast_path = false;
-    int const RESOLVE_RET = resolve_dirfd_task_path_raw(task, dirfd, pathname, resolved.data(), resolved.size(), true, &require_directory,
-                                                        &resolved_len, &common_local_fast_path, &resolved_hash);
-    if (RESOLVE_RET < 0) {
-        return RESOLVE_RET;
+    LookupFollowPolicy const policy = FOLLOW_FINAL_SYMLINK ? LookupFollowPolicy::FOLLOW_FINAL : LookupFollowPolicy::NOFOLLOW_FINAL;
+    for (unsigned attempt = 0; attempt < 4; ++attempt) {
+        LookupHandle lookup{};
+        int const acquire = vfs_acquire_lookup(task, dirfd, pathname, LookupIntent::STAT, policy, false, true, &lookup, 0);
+        if (acquire != 0) {
+            if (acquire == -EAGAIN && attempt != 3) {
+                continue;
+            }
+            return acquire;
+        }
+        int const result = lookup.mount()->fs_type == FSType::REMOTE ? consume_stat(lookup, &context)
+                                                                     : vfs_consume_lookup(lookup, false, consume_stat, &context);
+        if (result != -EAGAIN || attempt == 3) {
+            return result;
+        }
     }
-
-    if (!common_local_fast_path && (dirfd == AT_FDCWD || pathname[0] == '/') && resolved_task_path_is_wki_entry(task, resolved.data())) {
-        return FOLLOW_FINAL_SYMLINK ? vfs_stat(pathname, statbuf) : vfs_lstat(pathname, statbuf);
-    }
-
-    if (!common_local_fast_path) {
-        maybe_ensure_wki_host_root_mount_for_task(task, resolved.data());
-    }
-    return vfs_stat_resolved_cache_or_impl(resolved.data(), FOLLOW_FINAL_SYMLINK, require_directory, true, statbuf, resolved_len,
-                                           resolved_hash);
+    return -EAGAIN;
 }
 
 auto vfs_fstat_file(File* file, Stat* statbuf) -> int {
@@ -11739,6 +12595,7 @@ auto dispatch_xattr_beneath(XattrOperation operation, const char* export_root, c
     if (export_root == nullptr || relative_path == nullptr || export_root[0] != '/' || relative_path[0] == '/') {
         return -EINVAL;
     }
+    ker::mod::sys::MutexGuard publication_guard(g_vfs_namespace_publication_mutex);
     std::array<char, MAX_PATH_LEN> canonical_root{};
     size_t root_len = UNKNOWN_PATH_LEN;
     int ret = copy_path_string(export_root, canonical_root.data(), canonical_root.size(), UNKNOWN_PATH_LEN, &root_len);
@@ -11850,11 +12707,80 @@ auto dispatch_xattr_file(XattrOperation operation, File* file, const char* name,
     return result;
 }
 
+auto dispatch_xattr_stable(XattrOperation operation, const char* path, const char* name, void* value, size_t size, int flags,
+                           bool follow_final_symlink) -> ssize_t {
+    auto* task = ker::mod::sched::can_query_current_task() ? ker::mod::sched::get_current_task() : nullptr;
+    if (task == nullptr) {
+        return dispatch_xattr_path(operation, path, name, value, size, flags, follow_final_symlink, false);
+    }
+    if (path == nullptr || path[0] == '\0') {
+        return path == nullptr ? -EINVAL : -ENOENT;
+    }
+
+    struct XattrLookupContext {
+        XattrOperation operation{};
+        const char* name{};
+        void* value{};
+        size_t size{};
+        int flags{};
+        bool follow_final{};
+    } context{.operation = operation, .name = name, .value = value, .size = size, .flags = flags, .follow_final = follow_final_symlink};
+    auto consume_xattr = [](const LookupHandle& handle, void* opaque) -> int {
+        auto& args = *static_cast<XattrLookupContext*>(opaque);
+        ssize_t result = -EOPNOTSUPP;
+        if (handle.mount()->fs_type == FSType::XFS && handle.backend_parent() != nullptr) {
+            auto& backend = *static_cast<ker::vfs::xfs::XfsLookupHandle*>(handle.backend_parent());
+            switch (args.operation) {
+                case XattrOperation::SET:
+                    result = ker::vfs::xfs::xfs_setxattr_lookup(backend, args.name, args.value, args.size, args.flags);
+                    break;
+                case XattrOperation::GET:
+                    result = ker::vfs::xfs::xfs_getxattr_lookup(backend, args.name, args.value, args.size);
+                    break;
+                case XattrOperation::LIST:
+                    result = ker::vfs::xfs::xfs_listxattr_lookup(backend, static_cast<char*>(args.value), args.size);
+                    break;
+                case XattrOperation::REMOVE:
+                    result = ker::vfs::xfs::xfs_removexattr_lookup(backend, args.name);
+                    break;
+            }
+            if (result >= 0 && (args.operation == XattrOperation::SET || args.operation == XattrOperation::REMOVE)) {
+                cache_notify_path_data_changed_impl(handle.path(), handle.mount()->fs_type);
+            }
+        } else {
+            result = dispatch_xattr_path(args.operation, handle.path(), args.name, args.value, args.size, args.flags,
+                                         handle.mount()->fs_type == FSType::REMOTE && args.follow_final, true);
+        }
+        if (result > INT_MAX) {
+            return -EOVERFLOW;
+        }
+        return static_cast<int>(result);
+    };
+
+    LookupFollowPolicy const policy = follow_final_symlink ? LookupFollowPolicy::FOLLOW_FINAL : LookupFollowPolicy::NOFOLLOW_FINAL;
+    for (unsigned attempt = 0; attempt < 4; ++attempt) {
+        LookupHandle lookup{};
+        int const acquire = vfs_acquire_lookup(task, AT_FDCWD, path, LookupIntent::METADATA, policy, false, true, &lookup, 0);
+        if (acquire != 0) {
+            if (acquire == -EAGAIN && attempt != 3) {
+                continue;
+            }
+            return acquire;
+        }
+        int const result = lookup.mount()->fs_type == FSType::REMOTE ? consume_xattr(lookup, &context)
+                                                                     : vfs_consume_lookup(lookup, false, consume_xattr, &context);
+        if (result != -EAGAIN || attempt == 3) {
+            return result;
+        }
+    }
+    return -EAGAIN;
+}
+
 }  // namespace
 
 auto vfs_setxattr(const char* path, const char* name, const void* value, size_t size, int flags, bool follow_final_symlink) -> int {
     return static_cast<int>(
-        dispatch_xattr_path(XattrOperation::SET, path, name, const_cast<void*>(value), size, flags, follow_final_symlink, false));
+        dispatch_xattr_stable(XattrOperation::SET, path, name, const_cast<void*>(value), size, flags, follow_final_symlink));
 }
 
 auto vfs_setxattr_beneath(const char* export_root, const char* relative_path, const char* name, const void* value, size_t size, int flags,
@@ -11882,7 +12808,7 @@ auto vfs_fsetxattr(int fd, const char* name, const void* value, size_t size, int
 }
 
 auto vfs_getxattr(const char* path, const char* name, void* value, size_t size, bool follow_final_symlink) -> ssize_t {
-    return dispatch_xattr_path(XattrOperation::GET, path, name, value, size, 0, follow_final_symlink, false);
+    return dispatch_xattr_stable(XattrOperation::GET, path, name, value, size, 0, follow_final_symlink);
 }
 
 auto vfs_getxattr_beneath(const char* export_root, const char* relative_path, const char* name, void* value, size_t size,
@@ -11909,7 +12835,7 @@ auto vfs_fgetxattr(int fd, const char* name, void* value, size_t size) -> ssize_
 }
 
 auto vfs_listxattr(const char* path, char* list, size_t size, bool follow_final_symlink) -> ssize_t {
-    return dispatch_xattr_path(XattrOperation::LIST, path, nullptr, list, size, 0, follow_final_symlink, false);
+    return dispatch_xattr_stable(XattrOperation::LIST, path, nullptr, list, size, 0, follow_final_symlink);
 }
 
 auto vfs_listxattr_beneath(const char* export_root, const char* relative_path, char* list, size_t size, bool follow_final_symlink)
@@ -11936,7 +12862,7 @@ auto vfs_flistxattr(int fd, char* list, size_t size) -> ssize_t {
 }
 
 auto vfs_removexattr(const char* path, const char* name, bool follow_final_symlink) -> int {
-    return static_cast<int>(dispatch_xattr_path(XattrOperation::REMOVE, path, name, nullptr, 0, 0, follow_final_symlink, false));
+    return static_cast<int>(dispatch_xattr_stable(XattrOperation::REMOVE, path, name, nullptr, 0, 0, follow_final_symlink));
 }
 
 auto vfs_removexattr_beneath(const char* export_root, const char* relative_path, const char* name, bool follow_final_symlink) -> int {
@@ -11964,6 +12890,9 @@ auto vfs_fremovexattr(int fd, const char* name) -> int {
 
 // --- umount ---
 auto vfs_umount(const char* target) -> int {
+    if (target == nullptr) {
+        return -EINVAL;
+    }
     // Resolve once for mount-scope invalidation lookup.
     // unmount_filesystem() performs its own task-root-aware resolution,
     // so passing an already-resolved path would double-prefix after pivot_root.
@@ -11972,14 +12901,21 @@ auto vfs_umount(const char* target) -> int {
         return -ENAMETOOLONG;
     }
 
+    uint32_t expected_dev_id = 0;
     {
+        ker::mod::sys::MutexGuard publication_guard(g_vfs_namespace_publication_mutex);
         auto mount_ref = find_mount_point(resolved.data());
         MountPoint const* mount = mount_ref.get();
         if (mount != nullptr && mount->path != nullptr && std::strcmp(mount->path, resolved.data()) == 0) {
+            expected_dev_id = mount->dev_id;
             stream_invalidate_mount_scope(mount->fs_type, stream_scope_key_for_mount(mount));
         }
     }
-    return unmount_filesystem(target);
+    // Do not keep the publication lock or MountRef across backend teardown:
+    // retirement may block for I/O and must drain lookup refs. The dev_id is
+    // the stable commit token, so a replacement at the same text path is never
+    // unmounted by this request.
+    return expected_dev_id != 0 ? unmount_filesystem_if_dev_id(target, expected_dev_id) : -ENOENT;
 }
 
 // --- pivot_root ---
@@ -12147,72 +13083,49 @@ auto vfs_getcwd(char* buf, size_t size, size_t* len_out) -> int {
     return 0;
 }
 
+#ifdef WOS_SELFTEST
 namespace {
 auto vfs_chdir_common_local_fast_path(ker::mod::sched::task::Task* task, const char* path, int* result_out) -> bool {
-    if (task == nullptr || path == nullptr || result_out == nullptr || !task_has_common_local_vfs_routing(task)) {
+    if (task == nullptr || path == nullptr || result_out == nullptr) {
         return false;
     }
-
     PathTextScan const SCAN = scan_path_text(path);
-    if (SCAN.path_len == 0 || SCAN.path_len >= MAX_PATH_LEN) {
+    std::array<char, MAX_PATH_LEN> logical{};
+    size_t logical_len = UNKNOWN_PATH_LEN;
+    if (copy_simple_relative_path_from_base(task->cwd.data(), path, SCAN, logical.data(), logical.size(), &logical_len,
+                                            task_cached_cwd_len(task)) != 0) {
         return false;
     }
-
-    std::array<char, MAX_PATH_LEN> visible;  // NOLINT(cppcoreguidelines-pro-type-member-init)
-    size_t visible_len = UNKNOWN_PATH_LEN;
-    int copy_ret = RESOLVE_FAST_PATH_DECLINED;
-    if (path[0] == '/') {
-        if (SCAN.needs_canonicalize) {
-            copy_ret = copy_dot_clean_visible_absolute_path(path, SCAN, visible.data(), visible.size(), &visible_len);
-        } else {
-            copy_ret = copy_path_string(path, visible.data(), visible.size(), SCAN.path_len, &visible_len);
+    LookupHandle lookup{};
+    *result_out =
+        vfs_acquire_lookup(task, AT_FDCWD, logical.data(), LookupIntent::STAT, LookupFollowPolicy::FOLLOW_FINAL, true, true, &lookup, 3);
+    if (*result_out != 0) {
+        return true;
+    }
+    struct Context {
+        ker::mod::sched::task::Task* task;
+        const char* logical;
+        size_t length;
+    } context{.task = task, .logical = logical.data(), .length = logical_len};
+    auto consume = [](const LookupHandle& handle, void* opaque) -> int {
+        Stat stat{};
+        int result =
+            handle.mount()->fs_type == FSType::TMPFS && handle.backend_parent() != nullptr
+                ? ker::vfs::tmpfs::tmpfs_stat_lookup(*static_cast<ker::vfs::tmpfs::TmpfsLookupHandle*>(handle.backend_parent()), true,
+                                                     handle.mount()->dev_id, &stat)
+                : vfs_stat_resolved_cache_or_impl(handle.path(), false, true, false, &stat, handle.path_length(), UNKNOWN_PATH_HASH);
+        if (result == 0) {
+            auto& context = *static_cast<Context*>(opaque);
+            std::memcpy(context.task->cwd.data(), context.logical, context.length + 1);
+            context.task->cwd_len = static_cast<uint16_t>(context.length);
         }
-    } else {
-        copy_ret = copy_simple_relative_path_from_base(task->cwd.data(), path, SCAN, visible.data(), visible.size(), &visible_len,
-                                                       task_cached_cwd_len(task));
-    }
-
-    if (copy_ret == RESOLVE_FAST_PATH_DECLINED) {
-        return false;
-    }
-    if (copy_ret < 0) {
-        *result_out = copy_ret;
-        return true;
-    }
-    if (!common_local_visible_path_is_noop(visible.data())) {
-        return false;
-    }
-    if (visible_len + 1 > ker::mod::sched::task::Task::CWD_MAX) {
-        *result_out = -ENAMETOOLONG;
-        return true;
-    }
-
-    std::array<char, MAX_PATH_LEN> resolved;  // NOLINT(cppcoreguidelines-pro-type-member-init)
-    size_t resolved_len = UNKNOWN_PATH_LEN;
-    int const ROOT_RET =
-        copy_task_visible_absolute_path_with_root(task, visible.data(), visible_len, resolved.data(), resolved.size(), &resolved_len);
-    if (ROOT_RET < 0) {
-        *result_out = ROOT_RET;
-        return true;
-    }
-
-    ker::vfs::Stat st{};
-    int const STAT_RET = vfs_stat_resolved_cache_or_impl(resolved.data(), true, true, true, &st, resolved_len);
-    if (STAT_RET < 0) {
-        *result_out = STAT_RET;
-        return true;
-    }
-    if ((st.st_mode & S_IFMT) != S_IFDIR) {
-        *result_out = -ENOTDIR;
-        return true;
-    }
-
-    std::memcpy(task->cwd.data(), visible.data(), visible_len + 1);
-    task->cwd_len = static_cast<uint16_t>(visible_len);
-    *result_out = 0;
+        return result;
+    };
+    *result_out = vfs_consume_lookup(lookup, false, consume, &context);
     return true;
 }
 }  // namespace
+#endif
 
 auto vfs_chdir(const char* path) -> int {
     if (path == nullptr) {
@@ -12221,11 +13134,6 @@ auto vfs_chdir(const char* path) -> int {
     auto* task = ker::mod::sched::get_current_task();
     if (task == nullptr) {
         return -ESRCH;
-    }
-
-    int fast_result = 0;
-    if (vfs_chdir_common_local_fast_path(task, path, &fast_result)) {
-        return fast_result;
     }
 
     std::array<char, MAX_PATH_LEN> logical{};
@@ -12239,25 +13147,52 @@ auto vfs_chdir(const char* path) -> int {
         return CANONICAL;
     }
 
-    // Verify the path is a directory.  vfs_stat handles root-prefix
-    // resolution internally, so pass the logical (user-visible) path.
-    ker::vfs::Stat st{};
-    int const RET = vfs_stat(logical.data(), &st);
-    if (RET < 0) {
-        return RET;
-    }
-    if ((st.st_mode & S_IFDIR) == 0) {
-        return -ENOTDIR;
-    }
-
-    // Copy to task cwd
     size_t const RLEN = std::strlen(logical.data());
     if (RLEN + 1 > ker::mod::sched::task::Task::CWD_MAX) {
         return -ENAMETOOLONG;
     }
-    std::memcpy(task->cwd.data(), logical.data(), RLEN + 1);
-    task->cwd_len = static_cast<uint16_t>(RLEN);
-    return 0;
+
+    LookupHandle lookup{};
+    int result =
+        vfs_acquire_lookup(task, AT_FDCWD, logical.data(), LookupIntent::STAT, LookupFollowPolicy::FOLLOW_FINAL, true, true, &lookup, 3);
+    if (result != 0) {
+        return result;
+    }
+    if (lookup.mount()->fs_type == FSType::REMOTE) {
+        Stat stat{};
+        result = vfs_stat_resolved_cache_or_impl(lookup.path(), false, true, false, &stat, lookup.path_length(), UNKNOWN_PATH_HASH);
+        if (result != 0) {
+            return result;
+        }
+        std::memcpy(task->cwd.data(), logical.data(), RLEN + 1);
+        task->cwd_len = static_cast<uint16_t>(RLEN);
+        return 0;
+    }
+    struct ChdirContext {
+        ker::mod::sched::task::Task* task;
+        const char* logical;
+        size_t logical_len;
+    } context{.task = task, .logical = logical.data(), .logical_len = RLEN};
+    auto consume = [](const LookupHandle& handle, void* opaque) -> int {
+        Stat stat{};
+        int result = 0;
+        if (handle.mount()->fs_type == FSType::TMPFS && handle.backend_parent() != nullptr) {
+            result = ker::vfs::tmpfs::tmpfs_stat_lookup(*static_cast<ker::vfs::tmpfs::TmpfsLookupHandle*>(handle.backend_parent()), true,
+                                                        handle.mount()->dev_id, &stat);
+        } else if (handle.mount()->fs_type == FSType::XFS && handle.backend_parent() != nullptr) {
+            result = ker::vfs::xfs::xfs_stat_lookup(*static_cast<ker::vfs::xfs::XfsLookupHandle*>(handle.backend_parent()), true, &stat);
+        } else {
+            result = vfs_stat_resolved_cache_or_impl(handle.path(), false, true, false, &stat, handle.path_length(), UNKNOWN_PATH_HASH);
+        }
+        if (result != 0) {
+            return result;
+        }
+        auto& context = *static_cast<ChdirContext*>(opaque);
+        std::memcpy(context.task->cwd.data(), context.logical, context.logical_len + 1);
+        context.task->cwd_len = static_cast<uint16_t>(context.logical_len);
+        return 0;
+    };
+    return vfs_consume_lookup(lookup, false, consume, &context);
 }
 
 auto vfs_fchdir(ker::mod::sched::task::Task* task, int fd) -> int {
@@ -12635,10 +13570,13 @@ auto vfs_access(const char* path, int mode) -> int {
     if (path == nullptr) {
         return -EINVAL;
     }
+    auto* current = ker::mod::sched::can_query_current_task() ? ker::mod::sched::get_current_task() : nullptr;
+    if (current != nullptr) {
+        return vfs_faccessat(current, AT_FDCWD, path, mode, 0);
+    }
     if (mode == 0) {
         int fast_result = 0;
-        auto* task = ker::mod::sched::can_query_current_task() ? ker::mod::sched::get_current_task() : nullptr;
-        if (vfs_access_absolute_local_fast_path(task, path, mode, &fast_result)) {
+        if (vfs_access_absolute_local_fast_path(current, path, mode, &fast_result)) {
             return fast_result;
         }
     }
@@ -12682,41 +13620,58 @@ auto vfs_faccessat(ker::mod::sched::task::Task* task, int dirfd, const char* pat
     }
 
     bool const FOLLOW_FINAL_SYMLINK = (flags & AT_SYMLINK_NOFOLLOW) == 0;
-    int fast_result = 0;
-    if (vfs_access_absolute_local_fast_path(task, pathname, mode, &fast_result, FOLLOW_FINAL_SYMLINK)) {
-        return fast_result;
-    }
+    struct AccessLookupContext {
+        ker::mod::sched::task::Task* task{};
+        int mode{};
+    } context{.task = task, .mode = mode};
+    auto consume_access = [](const LookupHandle& handle, void* opaque) -> int {
+        auto& args = *static_cast<AccessLookupContext*>(opaque);
+        Stat stat{};
+        if (lookup_path_cache_key_still_stable(handle)) {
+            bool const FOLLOW_FINAL = handle.follow_policy() == LookupFollowPolicy::FOLLOW_FINAL;
+            int const CACHED = metadata_cache_lookup(handle.path(), handle.mount()->fs_type, handle.mount()->dev_id, FOLLOW_FINAL,
+                                                     handle.requires_directory(), &stat, true, handle.path_length());
+            if (CACHED != -EAGAIN) {
+                return CACHED < 0 ? CACHED : vfs_access_stat_result(args.task, stat, args.mode);
+            }
+        }
+        int result = -ENOSYS;
+        if (handle.mount()->fs_type == FSType::TMPFS && handle.backend_parent() != nullptr) {
+            result = ker::vfs::tmpfs::tmpfs_stat_lookup(*static_cast<ker::vfs::tmpfs::TmpfsLookupHandle*>(handle.backend_parent()),
+                                                        handle.requires_directory(), handle.mount()->dev_id, &stat);
+        } else if (handle.mount()->fs_type == FSType::XFS && handle.backend_parent() != nullptr) {
+            result = ker::vfs::xfs::xfs_stat_lookup(*static_cast<ker::vfs::xfs::XfsLookupHandle*>(handle.backend_parent()),
+                                                    handle.requires_directory(), &stat);
+        } else {
+            result = vfs_stat_resolved_cache_or_impl(handle.path(), false, handle.requires_directory(), false, &stat, handle.path_length(),
+                                                     UNKNOWN_PATH_HASH);
+        }
+        if (result == 0 && lookup_path_cache_key_still_stable(handle) &&
+            (handle.mount()->fs_type == FSType::TMPFS || handle.mount()->fs_type == FSType::XFS)) {
+            metadata_cache_store_known_path_stat_on_current_mount(handle.path(), handle.mount(), stat, handle.path_length());
+        } else if (result == -ENOENT && lookup_path_cache_key_still_stable(handle)) {
+            metadata_cache_store_missing_path_on_current_mount(handle.path(), handle.mount(), handle.path_length(), UNKNOWN_PATH_HASH);
+        }
+        return result < 0 ? result : vfs_access_stat_result(args.task, stat, args.mode);
+    };
 
-    std::array<char, MAX_PATH_LEN> resolved;  // NOLINT(cppcoreguidelines-pro-type-member-init)
-    bool require_directory = false;
-    size_t resolved_len = UNKNOWN_PATH_LEN;
-    uint64_t resolved_hash = UNKNOWN_PATH_HASH;
-    bool common_local_fast_path = false;
-    int const RESOLVE_RET = resolve_dirfd_task_path_raw(task, dirfd, pathname, resolved.data(), resolved.size(), true, &require_directory,
-                                                        &resolved_len, &common_local_fast_path, &resolved_hash);
-    if (RESOLVE_RET < 0) {
-        return RESOLVE_RET;
+    LookupFollowPolicy const policy = FOLLOW_FINAL_SYMLINK ? LookupFollowPolicy::FOLLOW_FINAL : LookupFollowPolicy::NOFOLLOW_FINAL;
+    for (unsigned attempt = 0; attempt < 4; ++attempt) {
+        LookupHandle lookup{};
+        int const acquire = vfs_acquire_lookup(task, dirfd, pathname, LookupIntent::ACCESS, policy, false, true, &lookup, 0);
+        if (acquire != 0) {
+            if (acquire == -EAGAIN && attempt != 3) {
+                continue;
+            }
+            return acquire;
+        }
+        int const result = lookup.mount()->fs_type == FSType::REMOTE ? consume_access(lookup, &context)
+                                                                     : vfs_consume_lookup(lookup, false, consume_access, &context);
+        if (result != -EAGAIN || attempt == 3) {
+            return result;
+        }
     }
-
-    if (!common_local_fast_path && (dirfd == AT_FDCWD || pathname[0] == '/') && resolved_task_path_is_wki_entry(task, resolved.data())) {
-        return vfs_access(pathname, mode);
-    }
-
-    if (!common_local_fast_path) {
-        maybe_ensure_wki_host_root_mount_for_task(task, resolved.data());
-    }
-    if (mode == 0) {
-        return vfs_access_f_ok_resolved(resolved.data(), require_directory, true, resolved_len, resolved_hash, FOLLOW_FINAL_SYMLINK);
-    }
-
-    ker::vfs::Stat st{};
-    int const STAT_RET =
-        vfs_stat_resolved_cache_or_impl(resolved.data(), FOLLOW_FINAL_SYMLINK, require_directory, true, &st, resolved_len, resolved_hash);
-    if (STAT_RET < 0) {
-        return STAT_RET;
-    }
-
-    return vfs_access_stat_result(task, st, mode);
+    return -EAGAIN;
 }
 
 namespace {
@@ -12905,7 +13860,7 @@ auto vfs_pwrite(int fd, const void* buf, size_t count, off_t offset) -> ssize_t 
 
 namespace {
 auto vfs_unlink_resolved_path(const char* resolved_path, size_t known_resolved_path_len = UNKNOWN_PATH_LEN,
-                              uint64_t known_resolved_path_hash = UNKNOWN_PATH_HASH) -> int {
+                              uint64_t known_resolved_path_hash = UNKNOWN_PATH_HASH, bool namespace_already_locked = false) -> int {
     if (resolved_path == nullptr) {
         return -EINVAL;
     }
@@ -12915,11 +13870,11 @@ auto vfs_unlink_resolved_path(const char* resolved_path, size_t known_resolved_p
     if (mount == nullptr) {
         return -ENOENT;
     }
+    VfsNamespacePublicationGuard namespace_publication_guard(mount, !namespace_already_locked, true);
 
     size_t const FS_PATH_LEN = strip_mount_prefix_len(mount, resolved_path, known_resolved_path_len);
 
     if (mount->fs_type == FSType::XFS) {
-        XfsNamespacePublicationGuard namespace_publication_guard(mount);
         const char* fs_path = strip_mount_prefix(mount, resolved_path);
         int const RET =
             ker::vfs::xfs::xfs_unlink_path(fs_path, static_cast<ker::vfs::xfs::XfsMountContext*>(mount->private_data), FS_PATH_LEN);
@@ -13021,7 +13976,12 @@ auto vfs_unlink(const char* path) -> int {
         return -EINVAL;
     }
 
-    auto* task = ker::mod::sched::get_current_task();
+    auto* current = ker::mod::sched::can_query_current_task() ? ker::mod::sched::get_current_task() : nullptr;
+    if (current != nullptr) {
+        return vfs_unlinkat(current, AT_FDCWD, path, 0);
+    }
+
+    auto* task = current;
     PathTextScan scan{};
     if (task_absolute_local_path_fast_path_allowed(task, path, &scan)) {
         return vfs_unlink_resolved_path(path, scan.path_len, scan.path_hash);
@@ -13041,7 +14001,7 @@ auto vfs_unlink(const char* path) -> int {
 
 namespace {
 auto vfs_rmdir_resolved_path(const char* resolved_path, size_t known_resolved_path_len = UNKNOWN_PATH_LEN,
-                             uint64_t known_resolved_path_hash = UNKNOWN_PATH_HASH) -> int {
+                             uint64_t known_resolved_path_hash = UNKNOWN_PATH_HASH, bool namespace_already_locked = false) -> int {
     if (resolved_path == nullptr) {
         return -EINVAL;
     }
@@ -13051,6 +14011,7 @@ auto vfs_rmdir_resolved_path(const char* resolved_path, size_t known_resolved_pa
     if (mount == nullptr) {
         return -ENOENT;
     }
+    VfsNamespacePublicationGuard namespace_publication_guard(mount, !namespace_already_locked, true);
 
     size_t const FS_PATH_LEN = strip_mount_prefix_len(mount, resolved_path, known_resolved_path_len);
 
@@ -13075,7 +14036,6 @@ auto vfs_rmdir_resolved_path(const char* resolved_path, size_t known_resolved_pa
     }
 
     if (mount->fs_type == FSType::XFS) {
-        XfsNamespacePublicationGuard namespace_publication_guard(mount);
         const char* fs_path = strip_mount_prefix(mount, resolved_path);
         int const RET =
             ker::vfs::xfs::xfs_rmdir_path(fs_path, static_cast<ker::vfs::xfs::XfsMountContext*>(mount->private_data), FS_PATH_LEN);
@@ -13158,7 +14118,12 @@ auto vfs_rmdir(const char* path) -> int {
         return -EINVAL;
     }
 
-    auto* task = ker::mod::sched::get_current_task();
+    auto* current = ker::mod::sched::can_query_current_task() ? ker::mod::sched::get_current_task() : nullptr;
+    if (current != nullptr) {
+        return vfs_unlinkat(current, AT_FDCWD, path, AT_REMOVEDIR);
+    }
+
+    auto* task = current;
     PathTextScan scan{};
     if (task_absolute_local_path_fast_path_allowed(task, path, &scan)) {
         return vfs_rmdir_resolved_path(path, scan.path_len, scan.path_hash);
@@ -13183,20 +14148,59 @@ auto vfs_unlinkat(ker::mod::sched::task::Task* task, int dirfd, const char* path
     if (pathname == nullptr) {
         return -EINVAL;
     }
-
-    std::array<char, MAX_PATH_LEN> resolved;  // NOLINT(cppcoreguidelines-pro-type-member-init)
-    size_t resolved_len = UNKNOWN_PATH_LEN;
-    uint64_t resolved_hash = UNKNOWN_PATH_HASH;
-    int const RESOLVE_RET = resolve_dirfd_task_path_raw_with_absolute_local_fast_path(
-        task, dirfd, pathname, resolved.data(), resolved.size(), true, nullptr, &resolved_len, &resolved_hash);
-    if (RESOLVE_RET < 0) {
-        return RESOLVE_RET;
+    if (pathname[0] == '\0') {
+        return -ENOENT;
+    }
+    if ((flags & ~AT_REMOVEDIR) != 0) {
+        return -EINVAL;
     }
 
-    if ((flags & AT_REMOVEDIR) != 0) {
-        return vfs_rmdir_resolved_path(resolved.data(), resolved_len, resolved_hash);
+    struct UnlinkLookupContext {
+        bool remove_directory{};
+    } context{.remove_directory = (flags & AT_REMOVEDIR) != 0};
+    auto consume_unlink = [](const LookupHandle& handle, void* opaque) -> int {
+        auto& args = *static_cast<UnlinkLookupContext*>(opaque);
+        int result = 0;
+        if (handle.mount()->fs_type == FSType::TMPFS && handle.backend_parent() != nullptr) {
+            auto& backend = *static_cast<ker::vfs::tmpfs::TmpfsLookupHandle*>(handle.backend_parent());
+            bool hardlink_count_changed = false;
+            result = args.remove_directory ? ker::vfs::tmpfs::tmpfs_rmdir_lookup(backend)
+                                           : ker::vfs::tmpfs::tmpfs_unlink_lookup(backend, &hardlink_count_changed);
+            if (result == 0 && hardlink_count_changed) {
+                metadata_cache_note_path_changed("/", nullptr);
+            }
+        } else if (handle.mount()->fs_type == FSType::XFS && handle.backend_parent() != nullptr) {
+            auto& backend = *static_cast<ker::vfs::xfs::XfsLookupHandle*>(handle.backend_parent());
+            result = args.remove_directory ? ker::vfs::xfs::xfs_rmdir_lookup(backend) : ker::vfs::xfs::xfs_unlink_lookup(backend);
+        } else {
+            result = args.remove_directory ? vfs_rmdir_resolved_path(handle.path(), handle.path_length(), UNKNOWN_PATH_HASH, true)
+                                           : vfs_unlink_resolved_path(handle.path(), handle.path_length(), UNKNOWN_PATH_HASH, true);
+        }
+        if (result == 0 && lookup_path_cache_key_still_stable(handle) &&
+            (handle.mount()->fs_type == FSType::TMPFS || handle.mount()->fs_type == FSType::XFS)) {
+            vfs_cache_notify_path_changed(handle.path(), nullptr);
+            metadata_cache_store_missing_path_on_current_mount(handle.path(), handle.mount(), handle.path_length(), UNKNOWN_PATH_HASH);
+        }
+        return result;
+    };
+
+    for (unsigned attempt = 0; attempt < 4; ++attempt) {
+        LookupHandle lookup{};
+        int const acquire = vfs_acquire_lookup(task, dirfd, pathname, LookupIntent::REMOVE, LookupFollowPolicy::NOFOLLOW_FINAL,
+                                               (flags & AT_REMOVEDIR) != 0, true, &lookup, 0);
+        if (acquire != 0) {
+            if (acquire == -EAGAIN && attempt != 3) {
+                continue;
+            }
+            return acquire;
+        }
+        int const result = lookup.mount()->fs_type == FSType::REMOTE ? consume_unlink(lookup, &context)
+                                                                     : vfs_consume_lookup(lookup, true, consume_unlink, &context);
+        if (result != -EAGAIN || attempt == 3) {
+            return result;
+        }
     }
-    return vfs_unlink_resolved_path(resolved.data(), resolved_len, resolved_hash);
+    return -EAGAIN;
 }
 
 namespace {
@@ -13204,7 +14208,7 @@ auto vfs_rename_resolved_paths(const char* old_resolved_path, const char* new_re
                                bool new_path_requires_directory, size_t known_old_resolved_path_len = UNKNOWN_PATH_LEN,
                                size_t known_new_resolved_path_len = UNKNOWN_PATH_LEN,
                                uint64_t known_old_resolved_path_hash = UNKNOWN_PATH_HASH,
-                               uint64_t known_new_resolved_path_hash = UNKNOWN_PATH_HASH) -> int {
+                               uint64_t known_new_resolved_path_hash = UNKNOWN_PATH_HASH, bool namespace_already_locked = false) -> int {
     if (old_resolved_path == nullptr || new_resolved_path == nullptr) {
         return -EINVAL;
     }
@@ -13216,6 +14220,7 @@ auto vfs_rename_resolved_paths(const char* old_resolved_path, const char* new_re
     if ((old_mount == nullptr) || (new_mount == nullptr)) {
         return -ENOENT;
     }
+    VfsNamespacePublicationGuard namespace_publication_guard(old_mount, !namespace_already_locked, true);
 
     if (old_path_requires_directory || new_path_requires_directory) {
         Stat old_stat{};
@@ -13271,7 +14276,6 @@ auto vfs_rename_resolved_paths(const char* old_resolved_path, const char* new_re
     }
 
     if (old_mount->fs_type == FSType::XFS && new_mount->fs_type == FSType::XFS && old_mount == new_mount) {
-        XfsNamespacePublicationGuard namespace_publication_guard(old_mount);
         Stat renamed_stat{};
         size_t const OLD_FS_PATH_LEN = strip_mount_prefix_len(old_mount, old_resolved_path, known_old_resolved_path_len);
         size_t const NEW_FS_PATH_LEN = strip_mount_prefix_len(new_mount, new_resolved_path, known_new_resolved_path_len);
@@ -13437,12 +14441,17 @@ auto vfs_rename(const char* oldpath, const char* newpath) -> int {
         return -EINVAL;
     }
 
+    auto* current = ker::mod::sched::can_query_current_task() ? ker::mod::sched::get_current_task() : nullptr;
+    if (current != nullptr) {
+        return vfs_renameat(current, AT_FDCWD, oldpath, AT_FDCWD, newpath);
+    }
+
     // Each fast or fallback resolver initializes a complete NUL-terminated path before use.
     // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
     std::array<char, MAX_PATH_LEN> old_buf __attribute__((uninitialized));
     // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
     std::array<char, MAX_PATH_LEN> new_buf __attribute__((uninitialized));
-    auto* task = ker::mod::sched::get_current_task();
+    auto* task = current;
     PathTextScan old_scan{};
     size_t old_buf_len = UNKNOWN_PATH_LEN;
     uint64_t old_buf_hash = UNKNOWN_PATH_HASH;
@@ -13479,33 +14488,93 @@ auto vfs_renameat(ker::mod::sched::task::Task* task, int olddirfd, const char* o
     if (oldpath == nullptr || newpath == nullptr) {
         return -EINVAL;
     }
-
-    // Each path resolver initializes a complete NUL-terminated path before successful return.
-    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
-    std::array<char, MAX_PATH_LEN> old_resolved __attribute__((uninitialized));
-    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
-    std::array<char, MAX_PATH_LEN> new_resolved __attribute__((uninitialized));
-    bool old_path_requires_directory = false;
-    bool new_path_requires_directory = false;
-    size_t old_resolved_len = UNKNOWN_PATH_LEN;
-    size_t new_resolved_len = UNKNOWN_PATH_LEN;
-    uint64_t old_resolved_hash = UNKNOWN_PATH_HASH;
-    uint64_t new_resolved_hash = UNKNOWN_PATH_HASH;
-    int result =
-        resolve_dirfd_task_path_raw_with_absolute_local_fast_path(task, olddirfd, oldpath, old_resolved.data(), old_resolved.size(), true,
-                                                                  &old_path_requires_directory, &old_resolved_len, &old_resolved_hash);
-    if (result < 0) {
-        return result;
-    }
-    result =
-        resolve_dirfd_task_path_raw_with_absolute_local_fast_path(task, newdirfd, newpath, new_resolved.data(), new_resolved.size(), true,
-                                                                  &new_path_requires_directory, &new_resolved_len, &new_resolved_hash);
-    if (result < 0) {
-        return result;
+    if (oldpath[0] == '\0' || newpath[0] == '\0') {
+        return -ENOENT;
     }
 
-    return vfs_rename_resolved_paths(old_resolved.data(), new_resolved.data(), old_path_requires_directory, new_path_requires_directory,
-                                     old_resolved_len, new_resolved_len, old_resolved_hash, new_resolved_hash);
+    auto consume_rename = [](const LookupHandle& source, const LookupHandle& destination, void*) -> int {
+        if (source.mount() != destination.mount()) {
+            return -EXDEV;
+        }
+        int result = 0;
+        if (source.mount()->fs_type == FSType::TMPFS && source.backend_parent() != nullptr && destination.backend_parent() != nullptr) {
+            bool hardlink_count_changed = false;
+            result = ker::vfs::tmpfs::tmpfs_rename_lookup(*static_cast<ker::vfs::tmpfs::TmpfsLookupHandle*>(source.backend_parent()),
+                                                          *static_cast<ker::vfs::tmpfs::TmpfsLookupHandle*>(destination.backend_parent()),
+                                                          source.requires_directory(), destination.requires_directory(), nullptr,
+                                                          &hardlink_count_changed);
+            if (result == 0) {
+                if (hardlink_count_changed) {
+                    metadata_cache_note_path_changed("/", nullptr);
+                }
+                if (lookup_path_cache_key_still_stable(source) && lookup_path_cache_key_still_stable(destination)) {
+                    vfs_cache_notify_path_changed(source.path(), destination.path());
+                    metadata_cache_store_missing_path_on_current_mount(source.path(), source.mount(), source.path_length(),
+                                                                       UNKNOWN_PATH_HASH);
+                }
+            }
+            return result;
+        }
+        if (source.mount()->fs_type == FSType::XFS && source.backend_parent() != nullptr && destination.backend_parent() != nullptr) {
+            auto const& source_lookup = *static_cast<ker::vfs::xfs::XfsLookupHandle*>(source.backend_parent());
+            auto const& destination_lookup = *static_cast<ker::vfs::xfs::XfsLookupHandle*>(destination.backend_parent());
+            Stat source_stat{};
+            int result = ker::vfs::xfs::xfs_stat_lookup(source_lookup, source.requires_directory(), &source_stat);
+            if (result != 0) {
+                return result;
+            }
+            if (destination.requires_directory()) {
+                Stat destination_stat{};
+                result = ker::vfs::xfs::xfs_stat_lookup(destination_lookup, true, &destination_stat);
+                if (result != 0) {
+                    return result;
+                }
+                if ((source_stat.st_mode & static_cast<mode_t>(S_IFMT)) != static_cast<mode_t>(S_IFDIR)) {
+                    return -EISDIR;
+                }
+            }
+            Stat renamed{};
+            result = ker::vfs::xfs::xfs_rename_lookup(source_lookup, destination_lookup, &renamed);
+            if (result == 0 && lookup_path_cache_key_still_stable(source) && lookup_path_cache_key_still_stable(destination)) {
+                vfs_cache_notify_path_changed(source.path(), destination.path());
+                metadata_cache_store_missing_path_on_current_mount(source.path(), source.mount(), source.path_length(), UNKNOWN_PATH_HASH);
+                metadata_cache_store_known_stat_variants(destination.path(), destination.mount()->fs_type, destination.mount()->dev_id,
+                                                         renamed, metadata_snapshot_stamp(), destination.path_length(), destination.mount(),
+                                                         UNKNOWN_PATH_HASH);
+            }
+            return result;
+        }
+        return vfs_rename_resolved_paths(source.path(), destination.path(), source.requires_directory(), destination.requires_directory(),
+                                         source.path_length(), destination.path_length(), UNKNOWN_PATH_HASH, UNKNOWN_PATH_HASH, true);
+    };
+
+    for (unsigned attempt = 0; attempt < 4; ++attempt) {
+        LookupHandle source{};
+        LookupHandle destination{};
+        int result = vfs_acquire_lookup(task, olddirfd, oldpath, LookupIntent::RENAME_SOURCE, LookupFollowPolicy::NOFOLLOW_FINAL, false,
+                                        true, &source, 0);
+        if (result == 0) {
+            result = vfs_acquire_lookup(task, newdirfd, newpath, LookupIntent::RENAME_TARGET, LookupFollowPolicy::NOFOLLOW_FINAL, false,
+                                        true, &destination, 0);
+        }
+        if (result != 0) {
+            if (result == -EAGAIN && attempt != 3) {
+                continue;
+            }
+            return result;
+        }
+        if (source.mount() != destination.mount()) {
+            return -EXDEV;
+        }
+        if (source.mount()->fs_type == FSType::REMOTE) {
+            return consume_rename(source, destination, nullptr);
+        }
+        result = vfs_consume_lookup_pair(source, destination, true, consume_rename, nullptr);
+        if (result != -EAGAIN || attempt == 3) {
+            return result;
+        }
+    }
+    return -EAGAIN;
 }
 
 auto vfs_metadata_batch(ker::mod::sched::task::Task* task, MetadataBatchOperation operation, uint32_t mode,
@@ -13812,7 +14881,12 @@ auto vfs_chmod(const char* path, int mode) -> int {
         return -EINVAL;
     }
 
-    auto* task = ker::mod::sched::get_current_task();
+    auto* current = ker::mod::sched::can_query_current_task() ? ker::mod::sched::get_current_task() : nullptr;
+    if (current != nullptr) {
+        return vfs_fchmodat(current, AT_FDCWD, path, mode, 0);
+    }
+
+    auto* task = current;
     PathTextScan scan{};
     if (task_absolute_local_path_fast_path_allowed(task, path, &scan)) {
         return vfs_chmod_resolved_path(path, mode, true, scan.path_len);
@@ -13844,15 +14918,58 @@ auto vfs_fchmodat(ker::mod::sched::task::Task* task, int dirfd, const char* path
     if ((flags & AT_EMPTY_PATH) != 0 && pathname[0] == '\0') {
         return vfs_fchmod_for_task(task, dirfd, mode);
     }
-
-    std::array<char, MAX_PATH_LEN> resolved;  // NOLINT(cppcoreguidelines-pro-type-member-init)
-    size_t resolved_len = UNKNOWN_PATH_LEN;
-    int const RESOLVE_RET = resolve_dirfd_task_path_raw_with_absolute_local_fast_path(task, dirfd, pathname, resolved.data(),
-                                                                                      resolved.size(), true, nullptr, &resolved_len);
-    if (RESOLVE_RET < 0) {
-        return RESOLVE_RET;
+    if (pathname[0] == '\0') {
+        return -ENOENT;
     }
-    return vfs_chmod_resolved_path(resolved.data(), mode, (flags & AT_SYMLINK_NOFOLLOW) == 0, resolved_len);
+
+    struct ChmodLookupContext {
+        int mode{};
+    } context{.mode = mode};
+    auto consume_chmod = [](const LookupHandle& handle, void* opaque) -> int {
+        auto& args = *static_cast<ChmodLookupContext*>(opaque);
+        if (handle.mount()->fs_type == FSType::TMPFS && handle.backend_parent() != nullptr) {
+            ker::vfs::tmpfs::TmpfsObjectMetadata updated_metadata{};
+            int const result =
+                ker::vfs::tmpfs::tmpfs_chmod_lookup(*static_cast<ker::vfs::tmpfs::TmpfsLookupHandle*>(handle.backend_parent()),
+                                                    static_cast<uint32_t>(args.mode), &updated_metadata);
+            if (result == 0 && lookup_path_cache_key_still_stable(handle)) {
+                cache_notify_path_data_changed_impl(handle.path(), handle.mount()->fs_type);
+                Stat updated{};
+                ker::vfs::tmpfs::tmpfs_metadata_to_stat(updated_metadata, handle.mount()->dev_id, &updated);
+                metadata_cache_store_known_path_stat_on_current_mount(handle.path(), handle.mount(), updated, handle.path_length());
+            }
+            return result;
+        }
+        if (handle.mount()->fs_type == FSType::XFS && handle.backend_parent() != nullptr) {
+            Stat updated{};
+            int const result = ker::vfs::xfs::xfs_chmod_lookup(*static_cast<ker::vfs::xfs::XfsLookupHandle*>(handle.backend_parent()),
+                                                               args.mode, &updated);
+            if (result == 0 && lookup_path_cache_key_still_stable(handle)) {
+                cache_notify_path_data_changed_impl(handle.path(), handle.mount()->fs_type);
+                metadata_cache_store_known_path_stat_on_current_mount(handle.path(), handle.mount(), updated, handle.path_length());
+            }
+            return result;
+        }
+        return vfs_chmod_resolved_path(handle.path(), args.mode, false, handle.path_length());
+    };
+    LookupFollowPolicy const policy =
+        (flags & AT_SYMLINK_NOFOLLOW) == 0 ? LookupFollowPolicy::FOLLOW_FINAL : LookupFollowPolicy::NOFOLLOW_FINAL;
+    for (unsigned attempt = 0; attempt < 4; ++attempt) {
+        LookupHandle lookup{};
+        int const acquire = vfs_acquire_lookup(task, dirfd, pathname, LookupIntent::METADATA, policy, false, true, &lookup, 0);
+        if (acquire != 0) {
+            if (acquire == -EAGAIN && attempt != 3) {
+                continue;
+            }
+            return acquire;
+        }
+        int const result = lookup.mount()->fs_type == FSType::REMOTE ? consume_chmod(lookup, &context)
+                                                                     : vfs_consume_lookup(lookup, false, consume_chmod, &context);
+        if (result != -EAGAIN || attempt == 3) {
+            return result;
+        }
+    }
+    return -EAGAIN;
 }
 
 namespace {
@@ -13961,7 +15078,12 @@ auto vfs_chown(const char* path, uint32_t owner, uint32_t group) -> int {
         return -EINVAL;
     }
 
-    auto* task = ker::mod::sched::get_current_task();
+    auto* current = ker::mod::sched::can_query_current_task() ? ker::mod::sched::get_current_task() : nullptr;
+    if (current != nullptr) {
+        return vfs_fchownat(current, AT_FDCWD, path, owner, group, 0);
+    }
+
+    auto* task = current;
     PathTextScan scan{};
     if (task_absolute_local_path_fast_path_allowed(task, path, &scan)) {
         return vfs_chown_resolved_path(path, owner, group, scan.path_len);
@@ -13993,15 +15115,48 @@ auto vfs_fchownat(ker::mod::sched::task::Task* task, int dirfd, const char* path
     if ((flags & AT_EMPTY_PATH) != 0 && pathname[0] == '\0') {
         return vfs_fchown_for_task(task, dirfd, owner, group);
     }
-
-    std::array<char, MAX_PATH_LEN> resolved;  // NOLINT(cppcoreguidelines-pro-type-member-init)
-    size_t resolved_len = UNKNOWN_PATH_LEN;
-    int const RESOLVE_RET = resolve_dirfd_task_path_raw_with_absolute_local_fast_path(task, dirfd, pathname, resolved.data(),
-                                                                                      resolved.size(), true, nullptr, &resolved_len);
-    if (RESOLVE_RET < 0) {
-        return RESOLVE_RET;
+    if (pathname[0] == '\0') {
+        return -ENOENT;
     }
-    return vfs_chown_resolved_path(resolved.data(), owner, group, resolved_len);
+
+    struct ChownLookupContext {
+        uint32_t owner{};
+        uint32_t group{};
+    } context{.owner = owner, .group = group};
+    auto consume_chown = [](const LookupHandle& handle, void* opaque) -> int {
+        auto& args = *static_cast<ChownLookupContext*>(opaque);
+        if (handle.mount()->fs_type == FSType::TMPFS && handle.backend_parent() != nullptr) {
+            ker::vfs::tmpfs::TmpfsObjectMetadata updated_metadata{};
+            int const result = ker::vfs::tmpfs::tmpfs_chown_lookup(
+                *static_cast<ker::vfs::tmpfs::TmpfsLookupHandle*>(handle.backend_parent()), args.owner, args.group, &updated_metadata);
+            if (result == 0 && lookup_path_cache_key_still_stable(handle)) {
+                cache_notify_path_data_changed_impl(handle.path(), handle.mount()->fs_type);
+                Stat updated{};
+                ker::vfs::tmpfs::tmpfs_metadata_to_stat(updated_metadata, handle.mount()->dev_id, &updated);
+                metadata_cache_store_known_path_stat_on_current_mount(handle.path(), handle.mount(), updated, handle.path_length());
+            }
+            return result;
+        }
+        return vfs_chown_resolved_path(handle.path(), args.owner, args.group, handle.path_length());
+    };
+    LookupFollowPolicy const policy =
+        (flags & AT_SYMLINK_NOFOLLOW) == 0 ? LookupFollowPolicy::FOLLOW_FINAL : LookupFollowPolicy::NOFOLLOW_FINAL;
+    for (unsigned attempt = 0; attempt < 4; ++attempt) {
+        LookupHandle lookup{};
+        int const acquire = vfs_acquire_lookup(task, dirfd, pathname, LookupIntent::METADATA, policy, false, true, &lookup, 0);
+        if (acquire != 0) {
+            if (acquire == -EAGAIN && attempt != 3) {
+                continue;
+            }
+            return acquire;
+        }
+        int const result = lookup.mount()->fs_type == FSType::REMOTE ? consume_chown(lookup, &context)
+                                                                     : vfs_consume_lookup(lookup, false, consume_chown, &context);
+        if (result != -EAGAIN || attempt == 3) {
+            return result;
+        }
+    }
+    return -EAGAIN;
 }
 
 namespace {
@@ -14093,7 +15248,8 @@ auto apply_devfs_utimens(ker::vfs::devfs::DevFSNode* node, const VfsResolvedTime
 
 auto vfs_apply_utimens_to_resolved_path(const char* resolved_path, const Timespec* times, bool follow_final_symlink,
                                         size_t known_resolved_path_len = UNKNOWN_PATH_LEN, bool allow_remote_backend = true,
-                                        const SymlinkResolvePolicy* resolve_policy = nullptr) -> int {
+                                        const SymlinkResolvePolicy* resolve_policy = nullptr, bool lookup_symlinks_resolved = false)
+    -> int {
     if (resolved_path == nullptr) {
         return -EINVAL;
     }
@@ -14121,7 +15277,7 @@ auto vfs_apply_utimens_to_resolved_path(const char* resolved_path, const Timespe
         return -EPERM;
     }
     FSType const REQUESTED_FS_TYPE = mount != nullptr ? mount->fs_type : FSType::TMPFS;
-    if (!REMOTE_MOUNT) {
+    if (!REMOTE_MOUNT && !lookup_symlinks_resolved) {
         bool skip_final_symlink_probe = false;
         bool symlink_resolution_known_noop = false;
         if (resolve_policy == nullptr && follow_final_symlink) {
@@ -14216,32 +15372,13 @@ auto vfs_apply_utimens_to_resolved_path(const char* resolved_path, const Timespe
     return ret;
 }
 
-auto vfs_apply_utimens_to_path(const char* path, const Timespec* times, bool follow_final_symlink) -> int {
-    if (path == nullptr) {
-        return -EINVAL;
-    }
-
-    auto* task = ker::mod::sched::get_current_task();
-    PathTextScan scan{};
-    if (task_absolute_local_path_fast_path_allowed(task, path, &scan)) {
-        return vfs_apply_utimens_to_resolved_path(path, times, follow_final_symlink, scan.path_len);
-    }
-
-    std::array<char, MAX_PATH_LEN> path_buffer;  // NOLINT(cppcoreguidelines-pro-type-member-init)
-    size_t path_buffer_len = UNKNOWN_PATH_LEN;
-    if (resolve_task_path_raw_impl(path, path_buffer.data(), path_buffer.size(), true, &path_buffer_len) < 0) {
-        return -ENAMETOOLONG;
-    }
-
-    return vfs_apply_utimens_to_resolved_path(path_buffer.data(), times, follow_final_symlink, path_buffer_len);
-}
-
 }  // namespace
 
 auto vfs_utimens_resolved_beneath(const char* confinement_root, const char* path, const Timespec* times, bool follow_final_symlink) -> int {
     if (confinement_root == nullptr || path == nullptr) {
         return -EINVAL;
     }
+    ker::mod::sys::MutexGuard publication_guard(g_vfs_namespace_publication_mutex);
 
     std::array<char, MAX_PATH_LEN> canonical_root;  // NOLINT(cppcoreguidelines-pro-type-member-init)
     size_t canonical_root_len = UNKNOWN_PATH_LEN;
@@ -14297,23 +15434,76 @@ auto vfs_utimensat(int dirfd, const char* pathname, const Timespec* times, int f
         return vfs_futimens(dirfd, times);
     }
 
-    if (dirfd == AT_FDCWD || pathname[0] == '/') {
-        return vfs_apply_utimens_to_path(pathname, times, (flags & AT_SYMLINK_NOFOLLOW) == 0);
-    }
-
     auto* task = ker::mod::sched::get_current_task();
     if (task == nullptr) {
         return -ESRCH;
     }
-
-    std::array<char, MAX_PATH_LEN> resolved;  // NOLINT(cppcoreguidelines-pro-type-member-init)
-    size_t resolved_len = UNKNOWN_PATH_LEN;
-    int const RES = resolve_dirfd_task_path_raw_with_absolute_local_fast_path(task, dirfd, pathname, resolved.data(), resolved.size(), true,
-                                                                              nullptr, &resolved_len);
-    if (RES < 0) {
-        return RES;
+    if (pathname[0] == '\0') {
+        return -ENOENT;
     }
-    return vfs_apply_utimens_to_resolved_path(resolved.data(), times, (flags & AT_SYMLINK_NOFOLLOW) == 0, resolved_len);
+
+    VfsResolvedTimes resolved_times{};
+    int const times_result = resolve_utimens_times(times, &resolved_times);
+    if (times_result < 0) {
+        return times_result;
+    }
+    struct UtimensLookupContext {
+        const Timespec* requested{};
+        VfsResolvedTimes resolved{};
+        bool follow_final{};
+    } context{.requested = times, .resolved = resolved_times, .follow_final = (flags & AT_SYMLINK_NOFOLLOW) == 0};
+    auto consume_utimens = [](const LookupHandle& handle, void* opaque) -> int {
+        auto& args = *static_cast<UtimensLookupContext*>(opaque);
+        if (handle.mount()->fs_type == FSType::TMPFS && handle.backend_parent() != nullptr) {
+            ker::vfs::tmpfs::TmpfsTimesUpdate update{
+                .atime = args.resolved.atime,
+                .mtime = args.resolved.mtime,
+                .ctime = args.resolved.ctime,
+                .set_atime = args.resolved.set_atime,
+                .set_mtime = args.resolved.set_mtime,
+            };
+            ker::vfs::tmpfs::TmpfsObjectMetadata updated_metadata{};
+            int const result = ker::vfs::tmpfs::tmpfs_utimens_lookup(
+                *static_cast<ker::vfs::tmpfs::TmpfsLookupHandle*>(handle.backend_parent()), update, &updated_metadata);
+            if (result == 0 && (update.set_atime || update.set_mtime) && lookup_path_cache_key_still_stable(handle)) {
+                cache_notify_path_data_changed_impl(handle.path(), handle.mount()->fs_type);
+                Stat updated{};
+                ker::vfs::tmpfs::tmpfs_metadata_to_stat(updated_metadata, handle.mount()->dev_id, &updated);
+                metadata_cache_store_known_path_stat_on_current_mount(handle.path(), handle.mount(), updated, handle.path_length());
+            }
+            return result;
+        }
+        if (handle.mount()->fs_type == FSType::XFS && handle.backend_parent() != nullptr) {
+            Stat updated{};
+            int const result = ker::vfs::xfs::xfs_utimens_lookup(*static_cast<ker::vfs::xfs::XfsLookupHandle*>(handle.backend_parent()),
+                                                                 args.resolved.atime, args.resolved.mtime, args.resolved.set_atime,
+                                                                 args.resolved.set_mtime, &updated);
+            if (result == 0 && (args.resolved.set_atime || args.resolved.set_mtime) && lookup_path_cache_key_still_stable(handle)) {
+                cache_notify_path_data_changed_impl(handle.path(), handle.mount()->fs_type);
+                metadata_cache_store_known_path_stat_on_current_mount(handle.path(), handle.mount(), updated, handle.path_length());
+            }
+            return result;
+        }
+        bool const backend_follow = handle.mount()->fs_type == FSType::REMOTE && args.follow_final;
+        return vfs_apply_utimens_to_resolved_path(handle.path(), args.requested, backend_follow, handle.path_length(), true, nullptr, true);
+    };
+    LookupFollowPolicy const policy = context.follow_final ? LookupFollowPolicy::FOLLOW_FINAL : LookupFollowPolicy::NOFOLLOW_FINAL;
+    for (unsigned attempt = 0; attempt < 4; ++attempt) {
+        LookupHandle lookup{};
+        int const acquire = vfs_acquire_lookup(task, dirfd, pathname, LookupIntent::METADATA, policy, false, true, &lookup, 0);
+        if (acquire != 0) {
+            if (acquire == -EAGAIN && attempt != 3) {
+                continue;
+            }
+            return acquire;
+        }
+        int const result = lookup.mount()->fs_type == FSType::REMOTE ? consume_utimens(lookup, &context)
+                                                                     : vfs_consume_lookup(lookup, false, consume_utimens, &context);
+        if (result != -EAGAIN || attempt == 3) {
+            return result;
+        }
+    }
+    return -EAGAIN;
 }
 
 auto vfs_futimens(int fd, const Timespec* times) -> int {
@@ -17363,14 +18553,9 @@ auto vfs_selftest_chdir_common_local_fast_path_uses_metadata_cache() -> bool {
     task.cwd_len = static_cast<uint16_t>(DIR_LEN);
 
     int result = -EINVAL;
-    VfsCachePerfSnapshot before_chdir{};
-    VfsCachePerfSnapshot after_chdir{};
-    vfs_get_cache_perf_snapshot(before_chdir);
     bool const USED_FAST_PATH = vfs_chdir_common_local_fast_path(&task, CHILD_NAME, &result);
-    vfs_get_cache_perf_snapshot(after_chdir);
 
     ok = ok && USED_FAST_PATH && result == 0 && std::strcmp(task.cwd.data(), CHILD_PATH) == 0;
-    ok = ok && after_chdir.metadata_hits > before_chdir.metadata_hits;
 
     ok = (vfs_rmdir(CHILD_PATH) == 0) && ok;
     ok = (vfs_rmdir(DIR_PATH) == 0) && ok;
@@ -19628,10 +20813,47 @@ auto vfs_mount(const char* source, const char* target, const char* fstype, unsig
                 return -ENXIO;
             }
 
-            // Create mount target directory
+            // Create and retain the mount target before the bounded remote
+            // attach. The publisher revalidates this exact binding at the
+            // short mount-table insertion point; no VFS namespace lock spans
+            // WKI traffic.
             vfs_mkdir(target, 0755);
-
-            return ker::net::wki::wki_remote_vfs_mount(NODE_ID, find_ctx.result.resource_id, target, find_ctx.result.generation);
+            auto* task = ker::mod::sched::can_query_current_task() ? ker::mod::sched::get_current_task() : nullptr;
+            if (task == nullptr) {
+                return ker::net::wki::wki_remote_vfs_mount(NODE_ID, find_ctx.result.resource_id, target, find_ctx.result.generation);
+            }
+            LookupHandle lookup{};
+            int const ACQUIRE = vfs_acquire_lookup(task, AT_FDCWD, target, LookupIntent::MOUNT_TARGET, LookupFollowPolicy::FOLLOW_FINAL,
+                                                   true, true, &lookup, 3);
+            if (ACQUIRE != 0) {
+                return ACQUIRE;
+            }
+            struct RemoteMountPublishContext {
+                const LookupHandle* lookup;
+            } publish_context{.lookup = &lookup};
+            auto publish_remote_mount = [](const char* local_mount_path, void* private_data, FileOperations* fops, void* opaque) -> int {
+                (void)local_mount_path;
+                auto& context = *static_cast<RemoteMountPublishContext*>(opaque);
+                std::array<char, MAX_PATH_LEN> visible_target{};
+                int const STRIP = strip_current_task_root_prefix(context.lookup->path(), visible_target.data(), visible_target.size());
+                if (STRIP != 0) {
+                    return STRIP;
+                }
+                PreparedMount prepared{};
+                int const PREPARE =
+                    prepare_mount_filesystem(visible_target.data(), "remote", nullptr, 0, nullptr, private_data, fops, &prepared);
+                if (PREPARE != 0) {
+                    return PREPARE;
+                }
+                auto consume_publish = [](const LookupHandle&, void* token) -> int {
+                    return publish_prepared_mount(static_cast<PreparedMount*>(token));
+                };
+                int const PUBLISH = vfs_consume_lookup(*context.lookup, true, consume_publish, &prepared);
+                finish_prepared_mount(&prepared);
+                return PUBLISH;
+            };
+            return ker::net::wki::wki_remote_vfs_mount(NODE_ID, find_ctx.result.resource_id, target, find_ctx.result.generation,
+                                                       publish_remote_mount, &publish_context);
         }
 
         // Check for PARTUUID= prefix
@@ -19686,8 +20908,33 @@ auto vfs_mount(const char* source, const char* target, const char* fstype, unsig
 
     // Create mount point directory in tmpfs if needed
     vfs_mkdir(target, 0755);
+    auto* task = ker::mod::sched::can_query_current_task() ? ker::mod::sched::get_current_task() : nullptr;
+    if (task == nullptr) {
+        return mount_filesystem(target, effective_fstype, bdev, flags, data);
+    }
 
-    return mount_filesystem(target, effective_fstype, bdev, flags, data);
+    LookupHandle lookup{};
+    int const ACQUIRE =
+        vfs_acquire_lookup(task, AT_FDCWD, target, LookupIntent::MOUNT_TARGET, LookupFollowPolicy::FOLLOW_FINAL, true, true, &lookup, 3);
+    if (ACQUIRE != 0) {
+        return ACQUIRE;
+    }
+    std::array<char, MAX_PATH_LEN> visible_target{};
+    int const STRIP = strip_current_task_root_prefix(lookup.path(), visible_target.data(), visible_target.size());
+    if (STRIP != 0) {
+        return STRIP;
+    }
+    PreparedMount prepared{};
+    int const PREPARE = prepare_mount_filesystem(visible_target.data(), effective_fstype, bdev, flags, data, nullptr, nullptr, &prepared);
+    if (PREPARE != 0) {
+        return PREPARE;
+    }
+    auto consume_mount = [](const LookupHandle&, void* opaque) -> int {
+        return publish_prepared_mount(static_cast<PreparedMount*>(opaque));
+    };
+    int const PUBLISH = vfs_consume_lookup(lookup, true, consume_mount, &prepared);
+    finish_prepared_mount(&prepared);
+    return PUBLISH;
 }
 
 void init() {
@@ -19856,7 +21103,8 @@ auto vfs_wki_rule_clear() -> int {
     return 0;
 }
 
-static auto vfs_open_file_impl(const char* path, int flags, int mode, bool resolve_task_path, bool apply_task_policy) -> File* {
+static auto vfs_open_file_impl(const char* path, int flags, int mode, bool resolve_task_path, bool apply_task_policy,
+                               bool lookup_symlinks_resolved = false, bool namespace_already_locked = false) -> File* {
     if (path == nullptr) {
         return nullptr;
     }
@@ -19915,7 +21163,8 @@ static auto vfs_open_file_impl(const char* path, int flags, int mode, bool resol
     bool const FINAL_SYMLINK_PROBE_NOT_NEEDED = SKIP_FINAL_SYMLINK_PROBE || EXCLUSIVE_XFS_CREATE;
     bool const PARENT_SYMLINK_PREFIX_KNOWN_NOOP =
         mount != nullptr && !REMOTE_MOUNT && symlink_prefix_cache_covers_parent(pathBuffer, path_buffer_len, mount);
-    bool const SYMLINK_RESOLUTION_KNOWN_NOOP = FINAL_SYMLINK_PROBE_NOT_NEEDED && PARENT_SYMLINK_PREFIX_KNOWN_NOOP;
+    bool const SYMLINK_RESOLUTION_KNOWN_NOOP =
+        lookup_symlinks_resolved || (FINAL_SYMLINK_PROBE_NOT_NEEDED && PARENT_SYMLINK_PREFIX_KNOWN_NOOP);
     if (mount != nullptr && !REMOTE_MOUNT && vfs_open_missing_metadata_cacheable(flags) && metadata_cacheable_fs(mount->fs_type)) {
         metadata_store_epoch_before_symlink = g_metadata_store_observation_epoch.load(std::memory_order_acquire);
     }
@@ -19993,7 +21242,8 @@ static auto vfs_open_file_impl(const char* path, int flags, int mode, bool resol
 
     File* f = nullptr;
     int backend_open_result = -ENOSYS;
-    XfsNamespacePublicationGuard namespace_publication_guard(mount, (backend_flags & (ker::vfs::O_CREAT | ker::vfs::O_TRUNC)) != 0);
+    VfsNamespacePublicationGuard namespace_publication_guard(
+        mount, !namespace_already_locked && (backend_flags & (ker::vfs::O_CREAT | ker::vfs::O_TRUNC)) != 0, true);
 
     switch (mount->fs_type) {
         case FSType::DEVFS:
@@ -20070,6 +21320,7 @@ static auto vfs_open_file_impl(const char* path, int flags, int mode, bool resol
         static_cast<void>(vfs_file_set_path(f, pathBuffer));
         f->mount_dev_id = mount->dev_id;
         f->mount_generation = mount_table_generation_snapshot();
+        f->vfs_path_namespace_generation = g_vfs_namespace_generation.load(std::memory_order_acquire);
         f->dir_fs_count = static_cast<size_t>(-1);
         f->open_flags = public_open_flags(flags);
         f->fd_flags = 0;
@@ -20101,6 +21352,249 @@ static auto vfs_open_file_impl(const char* path, int flags, int mode, bool resol
 auto vfs_open_file(const char* path, int flags, int mode) -> File* { return vfs_open_file_impl(path, flags, mode, true, true); }
 
 auto vfs_open_file_resolved(const char* path, int flags, int mode) -> File* { return vfs_open_file_impl(path, flags, mode, false, false); }
+
+namespace {
+auto lookup_is_beneath_export(const LookupHandle& lookup, const char* confinement_root) -> bool {
+    if (confinement_root == nullptr || confinement_root[0] != '/' || lookup.mount() == nullptr ||
+        lookup.mount()->fs_type == FSType::REMOTE) {
+        return false;
+    }
+    std::array<char, MAX_PATH_LEN> root{};
+    size_t root_len = UNKNOWN_PATH_LEN;
+    if (copy_path_string(confinement_root, root.data(), root.size(), UNKNOWN_PATH_LEN, &root_len) < 0 ||
+        canonicalize_path(root.data(), root.size()) < 0) {
+        return false;
+    }
+    root_len = std::strlen(root.data());
+    return path_prefix_matches(lookup.path(), root.data(), root_len);
+}
+
+auto acquire_owner_lookup_beneath(const char* confinement_root, const char* path, LookupIntent intent, LookupFollowPolicy follow_policy,
+                                  LookupHandle* lookup) -> int {
+    auto* task = ker::mod::sched::can_query_current_task() ? ker::mod::sched::get_current_task() : nullptr;
+    if (task == nullptr) {
+        return -ESRCH;
+    }
+    // WKI owner handlers pass a physical path already rooted at the export.
+    // Reapplying the serving task's root would turn /rootfs/tmp into
+    // /rootfs/rootfs/tmp after pivot_root and incorrectly return ENOENT.
+    int const result = vfs_acquire_lookup(task, AT_FDCWD, path, intent, follow_policy, false, false, lookup, 3, true);
+    if (result != 0) {
+        return result;
+    }
+    return lookup_is_beneath_export(*lookup, confinement_root) ? 0 : -EPERM;
+}
+}  // namespace
+
+auto vfs_open_file_resolved_beneath(const char* confinement_root, const char* path, int flags, int mode) -> File* {
+    LookupHandle lookup{};
+    LookupFollowPolicy const POLICY = (flags & O_NOFOLLOW) != 0 ? LookupFollowPolicy::NOFOLLOW_FINAL : LookupFollowPolicy::FOLLOW_FINAL;
+    if (acquire_owner_lookup_beneath(confinement_root, path, LookupIntent::OPEN, POLICY, &lookup) != 0) {
+        return nullptr;
+    }
+    struct Context {
+        int flags;
+        int mode;
+        File* file;
+    } context{.flags = flags, .mode = mode, .file = nullptr};
+    auto consume = [](const LookupHandle& handle, void* opaque) -> int {
+        auto& context = *static_cast<Context*>(opaque);
+        context.file = vfs_open_file_impl(handle.path(), context.flags, context.mode, false, false, true, true);
+        return context.file != nullptr ? 0 : -ENOENT;
+    };
+    static_cast<void>(vfs_consume_lookup(lookup, (flags & (O_CREAT | O_TRUNC)) != 0, consume, &context));
+    return context.file;
+}
+
+auto vfs_stat_resolved_beneath(const char* confinement_root, const char* path, Stat* statbuf) -> int {
+    if (statbuf == nullptr) {
+        return -EINVAL;
+    }
+    LookupHandle lookup{};
+    int result = acquire_owner_lookup_beneath(confinement_root, path, LookupIntent::STAT, LookupFollowPolicy::FOLLOW_FINAL, &lookup);
+    if (result != 0) {
+        return result;
+    }
+    auto consume = [](const LookupHandle& handle, void* opaque) -> int {
+        auto* statbuf = static_cast<Stat*>(opaque);
+        if (handle.mount()->fs_type == FSType::TMPFS && handle.backend_parent() != nullptr) {
+            return ker::vfs::tmpfs::tmpfs_stat_lookup(*static_cast<ker::vfs::tmpfs::TmpfsLookupHandle*>(handle.backend_parent()),
+                                                      handle.requires_directory(), handle.mount()->dev_id, statbuf);
+        }
+        if (handle.mount()->fs_type == FSType::XFS && handle.backend_parent() != nullptr) {
+            return ker::vfs::xfs::xfs_stat_lookup(*static_cast<ker::vfs::xfs::XfsLookupHandle*>(handle.backend_parent()),
+                                                  handle.requires_directory(), statbuf);
+        }
+        return vfs_stat_resolved_cache_or_impl(handle.path(), false, handle.requires_directory(), false, statbuf, handle.path_length(),
+                                               UNKNOWN_PATH_HASH);
+    };
+    return vfs_consume_lookup(lookup, false, consume, statbuf);
+}
+
+auto vfs_readlink_resolved_beneath(const char* confinement_root, const char* path, char* buf, size_t bufsize) -> ssize_t {
+    LookupHandle lookup{};
+    int result = acquire_owner_lookup_beneath(confinement_root, path, LookupIntent::READLINK, LookupFollowPolicy::NOFOLLOW_FINAL, &lookup);
+    if (result != 0) {
+        return result;
+    }
+    struct Context {
+        char* buf;
+        size_t size;
+    } context{.buf = buf, .size = bufsize};
+    auto consume = [](const LookupHandle& handle, void* opaque) -> int {
+        auto& context = *static_cast<Context*>(opaque);
+        ssize_t result = 0;
+        if (handle.mount()->fs_type == FSType::TMPFS && handle.backend_parent() != nullptr) {
+            result = ker::vfs::tmpfs::tmpfs_readlink_lookup(*static_cast<ker::vfs::tmpfs::TmpfsLookupHandle*>(handle.backend_parent()),
+                                                            context.buf, context.size);
+        } else if (handle.mount()->fs_type == FSType::XFS && handle.backend_parent() != nullptr) {
+            result = ker::vfs::xfs::xfs_readlink_lookup(*static_cast<ker::vfs::xfs::XfsLookupHandle*>(handle.backend_parent()), context.buf,
+                                                        context.size);
+        } else {
+            result = vfs_readlink_resolved(handle.path(), context.buf, context.size);
+        }
+        return result > INT_MAX ? -EOVERFLOW : static_cast<int>(result);
+    };
+    return vfs_consume_lookup(lookup, false, consume, &context);
+}
+
+auto vfs_mkdir_resolved_beneath(const char* confinement_root, const char* path, int mode) -> int {
+    LookupHandle lookup{};
+    int result = acquire_owner_lookup_beneath(confinement_root, path, LookupIntent::CREATE, LookupFollowPolicy::NOFOLLOW_FINAL, &lookup);
+    if (result != 0) {
+        return result;
+    }
+    auto consume = [](const LookupHandle& handle, void* opaque) -> int {
+        int const MODE = *static_cast<int*>(opaque);
+        int result = 0;
+        if (handle.mount()->fs_type == FSType::TMPFS && handle.backend_parent() != nullptr) {
+            result = ker::vfs::tmpfs::tmpfs_mkdir_lookup(*static_cast<ker::vfs::tmpfs::TmpfsLookupHandle*>(handle.backend_parent()), MODE);
+        } else if (handle.mount()->fs_type == FSType::XFS && handle.backend_parent() != nullptr) {
+            result = ker::vfs::xfs::xfs_mkdir_lookup(*static_cast<ker::vfs::xfs::XfsLookupHandle*>(handle.backend_parent()), MODE);
+        } else {
+            result = vfs_mkdir_resolved_path(handle.path(), MODE, handle.path_length(), UNKNOWN_PATH_HASH, true);
+        }
+        if (result == 0) {
+            vfs_cache_notify_path_changed(handle.path(), nullptr);
+        }
+        return result;
+    };
+    return vfs_consume_lookup(lookup, true, consume, &mode);
+}
+
+auto vfs_symlink_resolved_beneath(const char* confinement_root, const char* target, const char* linkpath) -> int {
+    LookupHandle lookup{};
+    int result =
+        acquire_owner_lookup_beneath(confinement_root, linkpath, LookupIntent::CREATE, LookupFollowPolicy::NOFOLLOW_FINAL, &lookup);
+    if (result != 0) {
+        return result;
+    }
+    auto consume = [](const LookupHandle& handle, void* opaque) -> int {
+        auto* target = static_cast<const char*>(opaque);
+        int result = 0;
+        if (handle.mount()->fs_type == FSType::TMPFS && handle.backend_parent() != nullptr) {
+            result =
+                ker::vfs::tmpfs::tmpfs_symlink_lookup(*static_cast<ker::vfs::tmpfs::TmpfsLookupHandle*>(handle.backend_parent()), target);
+        } else if (handle.mount()->fs_type == FSType::XFS && handle.backend_parent() != nullptr) {
+            result = ker::vfs::xfs::xfs_symlink_lookup(*static_cast<ker::vfs::xfs::XfsLookupHandle*>(handle.backend_parent()), target);
+        } else {
+            result = vfs_symlink_resolved_linkpath(target, handle.path(), handle.path_length(), true);
+        }
+        if (result == 0) {
+            vfs_cache_notify_path_changed(handle.path(), nullptr);
+        }
+        return result;
+    };
+    return vfs_consume_lookup(lookup, true, consume, const_cast<char*>(target));
+}
+
+auto vfs_unlink_resolved_beneath(const char* confinement_root, const char* path, bool directory) -> int {
+    LookupHandle lookup{};
+    int result = acquire_owner_lookup_beneath(confinement_root, path, LookupIntent::REMOVE, LookupFollowPolicy::NOFOLLOW_FINAL, &lookup);
+    if (result != 0) {
+        return result;
+    }
+    auto consume = [](const LookupHandle& handle, void* opaque) -> int {
+        bool const DIRECTORY = *static_cast<bool*>(opaque);
+        int result = 0;
+        if (handle.mount()->fs_type == FSType::TMPFS && handle.backend_parent() != nullptr) {
+            auto& backend = *static_cast<ker::vfs::tmpfs::TmpfsLookupHandle*>(handle.backend_parent());
+            result = DIRECTORY ? ker::vfs::tmpfs::tmpfs_rmdir_lookup(backend) : ker::vfs::tmpfs::tmpfs_unlink_lookup(backend);
+        } else if (handle.mount()->fs_type == FSType::XFS && handle.backend_parent() != nullptr) {
+            auto& backend = *static_cast<ker::vfs::xfs::XfsLookupHandle*>(handle.backend_parent());
+            result = DIRECTORY ? ker::vfs::xfs::xfs_rmdir_lookup(backend) : ker::vfs::xfs::xfs_unlink_lookup(backend);
+        } else {
+            result = DIRECTORY ? vfs_rmdir_resolved_path(handle.path(), handle.path_length(), UNKNOWN_PATH_HASH, true)
+                               : vfs_unlink_resolved_path(handle.path(), handle.path_length(), UNKNOWN_PATH_HASH, true);
+        }
+        if (result == 0) {
+            vfs_cache_notify_path_changed(handle.path(), nullptr);
+            metadata_cache_store_missing_path_on_current_mount(handle.path(), handle.mount(), handle.path_length(), UNKNOWN_PATH_HASH);
+        }
+        return result;
+    };
+    return vfs_consume_lookup(lookup, true, consume, &directory);
+}
+
+auto vfs_rename_resolved_beneath(const char* confinement_root, const char* oldpath, const char* newpath) -> int {
+    LookupHandle source{};
+    LookupHandle destination{};
+    int result =
+        acquire_owner_lookup_beneath(confinement_root, oldpath, LookupIntent::RENAME_SOURCE, LookupFollowPolicy::NOFOLLOW_FINAL, &source);
+    if (result == 0) {
+        result = acquire_owner_lookup_beneath(confinement_root, newpath, LookupIntent::RENAME_TARGET, LookupFollowPolicy::NOFOLLOW_FINAL,
+                                              &destination);
+    }
+    if (result != 0) {
+        return result;
+    }
+    auto consume = [](const LookupHandle& source, const LookupHandle& destination, void*) -> int {
+        int result = 0;
+        if (source.mount()->fs_type == FSType::TMPFS && source.backend_parent() != nullptr && destination.backend_parent() != nullptr) {
+            result = ker::vfs::tmpfs::tmpfs_rename_lookup(*static_cast<ker::vfs::tmpfs::TmpfsLookupHandle*>(source.backend_parent()),
+                                                          *static_cast<ker::vfs::tmpfs::TmpfsLookupHandle*>(destination.backend_parent()),
+                                                          source.requires_directory(), destination.requires_directory());
+        } else if (source.mount()->fs_type == FSType::XFS && source.backend_parent() != nullptr &&
+                   destination.backend_parent() != nullptr) {
+            result = ker::vfs::xfs::xfs_rename_lookup(*static_cast<ker::vfs::xfs::XfsLookupHandle*>(source.backend_parent()),
+                                                      *static_cast<ker::vfs::xfs::XfsLookupHandle*>(destination.backend_parent()));
+        } else {
+            result =
+                vfs_rename_resolved_paths(source.path(), destination.path(), source.requires_directory(), destination.requires_directory(),
+                                          source.path_length(), destination.path_length(), UNKNOWN_PATH_HASH, UNKNOWN_PATH_HASH, true);
+        }
+        if (result == 0) {
+            vfs_cache_notify_path_changed(source.path(), destination.path());
+        }
+        return result;
+    };
+    return vfs_consume_lookup_pair(source, destination, true, consume, nullptr);
+}
+
+auto vfs_chmod_resolved_beneath(const char* confinement_root, const char* path, int mode, bool follow_final_symlink) -> int {
+    LookupHandle lookup{};
+    LookupFollowPolicy const POLICY = follow_final_symlink ? LookupFollowPolicy::FOLLOW_FINAL : LookupFollowPolicy::NOFOLLOW_FINAL;
+    int result = acquire_owner_lookup_beneath(confinement_root, path, LookupIntent::METADATA, POLICY, &lookup);
+    if (result != 0) {
+        return result;
+    }
+    auto consume = [](const LookupHandle& handle, void* opaque) -> int {
+        int const MODE = *static_cast<int*>(opaque);
+        int result = 0;
+        if (handle.mount()->fs_type == FSType::TMPFS && handle.backend_parent() != nullptr) {
+            result = ker::vfs::tmpfs::tmpfs_chmod_lookup(*static_cast<ker::vfs::tmpfs::TmpfsLookupHandle*>(handle.backend_parent()), MODE);
+        } else if (handle.mount()->fs_type == FSType::XFS && handle.backend_parent() != nullptr) {
+            result = ker::vfs::xfs::xfs_chmod_lookup(*static_cast<ker::vfs::xfs::XfsLookupHandle*>(handle.backend_parent()), MODE);
+        } else {
+            result = vfs_chmod_resolved_path(handle.path(), MODE, false, handle.path_length());
+        }
+        if (result == 0) {
+            vfs_cache_notify_path_changed(handle.path(), nullptr);
+        }
+        return result;
+    };
+    return vfs_consume_lookup(lookup, false, consume, &mode);
+}
 
 #ifdef WOS_SELFTEST
 auto vfs_selftest_make_file() -> File* {
@@ -20414,7 +21908,7 @@ auto vfs_shutdown_sync() -> int { return vfs_sync(); }
 auto vfs_shutdown_unmount_all(const char* root_path) -> int { return shutdown_unmount_all_exact(root_path); }
 
 namespace {
-auto vfs_link_resolved_paths(const char* old_abs_path, const char* new_abs_path) -> int {
+auto vfs_link_resolved_paths(const char* old_abs_path, const char* new_abs_path, bool namespace_already_locked = false) -> int {
     if (old_abs_path == nullptr || new_abs_path == nullptr) {
         return -EINVAL;
     }
@@ -20431,6 +21925,7 @@ auto vfs_link_resolved_paths(const char* old_abs_path, const char* new_abs_path)
     if (old_mount != new_mount) {
         return -EXDEV;
     }
+    VfsNamespacePublicationGuard namespace_publication_guard(old_mount, !namespace_already_locked, true);
 
     // FAT32 does not support hard links
     if (old_mount->fs_type == FSType::FAT32) {
@@ -20438,7 +21933,6 @@ auto vfs_link_resolved_paths(const char* old_abs_path, const char* new_abs_path)
     }
 
     if (old_mount->fs_type == FSType::XFS) {
-        XfsNamespacePublicationGuard namespace_publication_guard(old_mount);
         const char* old_fs = strip_mount_prefix(old_mount, old_abs_path);
         const char* new_fs = strip_mount_prefix(new_mount, new_abs_path);
         size_t const OLD_FS_LEN = strip_mount_prefix_len(old_mount, old_abs_path, UNKNOWN_PATH_LEN);
@@ -20533,12 +22027,17 @@ auto vfs_link(const char* oldpath, const char* newpath) -> int {
         return -EINVAL;
     }
 
+    auto* current = ker::mod::sched::can_query_current_task() ? ker::mod::sched::get_current_task() : nullptr;
+    if (current != nullptr) {
+        return vfs_linkat(current, AT_FDCWD, oldpath, AT_FDCWD, newpath, 0);
+    }
+
     // The fast copy and task resolver both initialize complete NUL-terminated paths before success.
     // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
     std::array<char, MAX_PATH_LEN> old_buf __attribute__((uninitialized));
     // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
     std::array<char, MAX_PATH_LEN> new_buf __attribute__((uninitialized));
-    auto* task = ker::mod::sched::get_current_task();
+    auto* task = current;
     if (task_absolute_local_path_fast_path_allowed(task, oldpath, nullptr)) {
         int const COPY_RET = copy_path_string(oldpath, old_buf.data(), old_buf.size());
         if (COPY_RET < 0) {
@@ -20573,23 +22072,65 @@ auto vfs_linkat(ker::mod::sched::task::Task* task, int olddirfd, const char* old
         return -EINVAL;
     }
 
-    // The dirfd resolver initializes complete NUL-terminated paths before success.
-    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
-    std::array<char, MAX_PATH_LEN> old_resolved __attribute__((uninitialized));
-    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
-    std::array<char, MAX_PATH_LEN> new_resolved __attribute__((uninitialized));
-    int result = resolve_dirfd_task_path_raw_with_absolute_local_fast_path(task, olddirfd, oldpath, old_resolved.data(),
-                                                                           old_resolved.size(), true, nullptr);
-    if (result < 0) {
-        return result;
-    }
-    result = resolve_dirfd_task_path_raw_with_absolute_local_fast_path(task, newdirfd, newpath, new_resolved.data(), new_resolved.size(),
-                                                                       true, nullptr);
-    if (result < 0) {
-        return result;
-    }
+    auto consume_link = [](const LookupHandle& source, const LookupHandle& destination, void*) -> int {
+        if (source.mount() != destination.mount()) {
+            return -EXDEV;
+        }
+        if (source.mount()->fs_type == FSType::TMPFS && source.backend_parent() != nullptr && destination.backend_parent() != nullptr) {
+            int const result =
+                ker::vfs::tmpfs::tmpfs_link_lookup(*static_cast<ker::vfs::tmpfs::TmpfsLookupHandle*>(source.backend_parent()),
+                                                   *static_cast<ker::vfs::tmpfs::TmpfsLookupHandle*>(destination.backend_parent()));
+            if (result == 0) {
+                metadata_cache_note_path_changed("/", nullptr);
+                if (lookup_path_cache_key_still_stable(source) && lookup_path_cache_key_still_stable(destination)) {
+                    vfs_cache_notify_path_changed(source.path(), destination.path());
+                }
+            }
+            return result;
+        }
+        if (source.mount()->fs_type == FSType::XFS && source.backend_parent() != nullptr && destination.backend_parent() != nullptr) {
+            Stat linked{};
+            int const result =
+                ker::vfs::xfs::xfs_link_lookup(*static_cast<ker::vfs::xfs::XfsLookupHandle*>(source.backend_parent()),
+                                               *static_cast<ker::vfs::xfs::XfsLookupHandle*>(destination.backend_parent()), &linked);
+            if (result == 0 && lookup_path_cache_key_still_stable(source) && lookup_path_cache_key_still_stable(destination)) {
+                vfs_cache_notify_path_changed(source.path(), destination.path());
+                metadata_cache_store_known_path_stat_on_current_mount(destination.path(), destination.mount(), linked,
+                                                                      destination.path_length());
+            }
+            return result;
+        }
+        return vfs_link_resolved_paths(source.path(), destination.path(), true);
+    };
 
-    return vfs_link_resolved_paths(old_resolved.data(), new_resolved.data());
+    LookupFollowPolicy const source_policy =
+        (flags & AT_SYMLINK_FOLLOW) != 0 ? LookupFollowPolicy::FOLLOW_FINAL : LookupFollowPolicy::NOFOLLOW_FINAL;
+    for (unsigned attempt = 0; attempt < 4; ++attempt) {
+        LookupHandle source{};
+        LookupHandle destination{};
+        int result = vfs_acquire_lookup(task, olddirfd, oldpath, LookupIntent::LINK_SOURCE, source_policy, false, true, &source, 0);
+        if (result == 0) {
+            result = vfs_acquire_lookup(task, newdirfd, newpath, LookupIntent::LINK_TARGET, LookupFollowPolicy::NOFOLLOW_FINAL, false, true,
+                                        &destination, 0);
+        }
+        if (result != 0) {
+            if (result == -EAGAIN && attempt != 3) {
+                continue;
+            }
+            return result;
+        }
+        if (source.mount() != destination.mount()) {
+            return -EXDEV;
+        }
+        if (source.mount()->fs_type == FSType::REMOTE) {
+            return consume_link(source, destination, nullptr);
+        }
+        result = vfs_consume_lookup_pair(source, destination, true, consume_link, nullptr);
+        if (result != -EAGAIN || attempt == 3) {
+            return result;
+        }
+    }
+    return -EAGAIN;
 }
 
 auto vfs_is_pipe_file(const File* f) -> bool {

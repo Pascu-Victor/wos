@@ -96,7 +96,7 @@ def test_mount_path_scratch_is_fully_produced_before_use() -> None:
     canonicalize = function_body(source, "canonicalize_mount_path")
     apply_root = function_body(source, "apply_current_task_root_prefix")
     resolve = function_body(source, "resolve_mount_path")
-    mount = function_body(source, "mount_filesystem")
+    mount = function_body(source, "prepare_mount_filesystem")
     unmount = function_body(source, "unmount_filesystem_impl")
 
     components_decl = "std::array<const char*, MAX_MOUNT_COMPONENTS> components __attribute__((uninitialized));"
@@ -107,7 +107,7 @@ def test_mount_path_scratch_is_fully_produced_before_use() -> None:
     require_only_uninitialized_array(canonicalize, "components", components_decl, "canonical component scratch")
     require_only_uninitialized_array(canonicalize, "result", result_decl, "canonical result scratch")
     require_only_uninitialized_array(resolve, "logical", logical_decl, "logical mount scratch")
-    require_only_uninitialized_array(mount, "resolved", resolved_decl, "mount resolver output")
+    require_only_uninitialized_array(mount, "resolved", resolved_decl, "prepared mount resolver output")
     require_only_uninitialized_array(unmount, "resolved", resolved_decl, "unmount resolver output")
 
     require_sequence(
@@ -332,37 +332,36 @@ def test_unmount_retires_in_table_then_drains_before_destroy() -> None:
 
 def test_mount_initialization_reserves_exact_path() -> None:
     source = MOUNT_CPP.read_text()
-    mount_body = function_body(source, "mount_filesystem")
+    prepare_body = function_body(source, "prepare_mount_filesystem")
+    publish_body = function_body(source, "publish_prepared_mount")
     required = [
         "std::array<MountInitialization, MAX_MOUNT_INITIALIZATIONS> mount_initializations{}",
         "mount_path_initializing_locked",
-        "MountInitializationReservation initialization_reservation",
-        "initialization_reservation.acquire(mount->path, PIVOT_EPOCH)",
-        "initialization_reservation.active_locked()",
-        "initialization_reservation.commit_locked()",
+        "MountInitializationReservation reservation{}",
+        "state->reservation.acquire(mount->path, PIVOT_EPOCH)",
+        "state->reservation.active_locked()",
+        "state->reservation.commit_locked()",
     ]
-    missing = [token for token in required if token not in source and token not in mount_body]
+    missing = [token for token in required if token not in source and token not in prepare_body and token not in publish_body]
     if missing:
         fail("same-path mount initialization reservation is missing: " + ", ".join(missing))
-    require_order(mount_body, "initialization_reservation.acquire", "fat32_init_device", "reserve before FAT initialization")
-    require_order(mount_body, "initialization_reservation.acquire", "xfs_vfs_init_device", "reserve before XFS recovery")
-    require_order(mount_body, "mounts.push_back(mount)", "initialization_reservation.commit_locked()", "publish before reservation release")
+    require_order(prepare_body, "state->reservation.acquire", "fat32_init_device", "reserve before FAT initialization")
+    require_order(prepare_body, "state->reservation.acquire", "xfs_vfs_init_device", "reserve before XFS recovery")
+    require_order(publish_body, "mounts.push_back(mount)", "state->reservation.commit_locked()", "publish before reservation release")
 
 
 def test_remote_mount_is_configured_atomically() -> None:
-    mount_body = function_body(MOUNT_CPP.read_text(), "mount_filesystem")
-    required = [
-        "mount->private_data = initial_private_data",
-        "mount->fops = initial_fops",
-        "MountInitializationReservation initialization_reservation",
-        "mount_path_occupied_locked(mount->path)",
-        "mounts.push_back(mount)",
-    ]
-    missing = [token for token in required if token not in mount_body]
+    source = MOUNT_CPP.read_text()
+    prepare_body = function_body(source, "prepare_mount_filesystem")
+    publish_body = function_body(source, "publish_prepared_mount")
+    prepare_required = ["mount->private_data = initial_private_data", "mount->fops = initial_fops"]
+    publish_required = ["state->reservation.active_locked()", "mount_path_occupied_locked(mount->path)", "mounts.push_back(mount)"]
+    missing = [token for token in prepare_required if token not in prepare_body]
+    missing.extend(token for token in publish_required if token not in publish_body)
     if missing:
         fail("remote mount publication is missing atomic owner/path tokens: " + ", ".join(missing))
-    require_order(mount_body, "mount->private_data = initial_private_data", "mounts.push_back(mount)", "owner before publication")
-    require_order(mount_body, "mount_path_occupied_locked(mount->path)", "mounts.push_back(mount)", "duplicate rejection")
+    require_order(prepare_body, "mount->private_data = initial_private_data", "mount->fops = initial_fops", "remote owner setup")
+    require_order(publish_body, "mount_path_occupied_locked(mount->path)", "mounts.push_back(mount)", "duplicate rejection")
 
     remote_mount = function_body(REMOTE_VFS_CPP.read_text(), "mount_vfs_proxy_lane")
     if 'mount_filesystem(local_mount_path, "remote", nullptr, 0, nullptr, state, &g_remote_vfs_fops)' not in remote_mount:
@@ -374,7 +373,8 @@ def test_remote_mount_is_configured_atomically() -> None:
 def test_writable_block_mount_holds_lease_until_destroy() -> None:
     header = MOUNT_HPP.read_text()
     source = MOUNT_CPP.read_text()
-    mount_body = function_body(source, "mount_filesystem")
+    prepare_body = function_body(source, "prepare_mount_filesystem")
+    publish_body = function_body(source, "publish_prepared_mount")
     destroy_body = function_body(source, "destroy_mount")
 
     if "ker::dev::BlockWriterLease block_writer_lease{};" not in header:
@@ -385,12 +385,13 @@ def test_writable_block_mount_holds_lease_until_destroy() -> None:
         "destroy_mount(mount, true)",
         "mounts.push_back(mount)",
     ]
-    missing = [token for token in required if token not in mount_body]
+    missing = [token for token in required if token not in prepare_body and token not in publish_body]
     if missing:
         fail("writable block mount lease lifecycle is missing: " + ", ".join(missing))
-    require_order(mount_body, "mount->block_writer_lease.try_acquire", "fat32_init_device", "lease before FAT initialization")
-    require_order(mount_body, "mount->block_writer_lease.try_acquire", "xfs_vfs_init_device", "lease before XFS initialization")
-    require_order(mount_body, "mount->block_writer_lease.try_acquire", "mounts.push_back(mount)", "lease before mount publication")
+    require_order(prepare_body, "mount->block_writer_lease.try_acquire", "fat32_init_device", "lease before FAT initialization")
+    require_order(prepare_body, "mount->block_writer_lease.try_acquire", "xfs_vfs_init_device", "lease before XFS initialization")
+    if source.find("mount->block_writer_lease.try_acquire") >= source.find("mounts.push_back(mount)"):
+        fail("lease before mount publication: writer lease must precede mount-table insertion")
     if "destroy_mount_storage(mount)" not in destroy_body:
         fail("destroy_mount() must release MountPoint storage and its writer lease after backend teardown")
     if "block_writer_lease.release" in source:
@@ -399,7 +400,8 @@ def test_writable_block_mount_holds_lease_until_destroy() -> None:
 
 def test_pivot_rewrites_are_transactional_and_gate_publication() -> None:
     source = MOUNT_CPP.read_text()
-    mount_body = function_body(source, "mount_filesystem")
+    prepare_body = function_body(source, "prepare_mount_filesystem")
+    publish_body = function_body(source, "publish_prepared_mount")
     wait_body = function_body(source, "wait_for_stable_mount_pivot_epoch")
     remap_body = function_body(source, "remap_mounts_for_pivot")
     rebase_body = function_body(source, "rebase_wki_mounts_for_new_root")
@@ -420,8 +422,10 @@ def test_pivot_rewrites_are_transactional_and_gate_publication() -> None:
     missing = [token for token in wait_required if token not in wait_body]
     if missing:
         fail("odd pivot epoch wait is unsafe outside yieldable task context: " + ", ".join(missing))
-    if "mount_pivot_epoch.load(std::memory_order_acquire) != PIVOT_EPOCH" not in mount_body:
-        fail("mount_filesystem() must reject a path resolved in an older pivot epoch")
+    pivot_check = "mount_pivot_epoch.load(std::memory_order_acquire) != PIVOT_EPOCH"
+    publish_pivot_check = "mount_pivot_epoch.load(std::memory_order_acquire) != state->pivot_epoch"
+    if pivot_check not in prepare_body or publish_pivot_check not in publish_body:
+        fail("prepared mount publication must reject a path resolved in an older pivot epoch")
     if remap_body.count("mount_has_active_refs_locked") < 2 or "return -EBUSY;" not in remap_body:
         fail("remap_mounts_for_pivot() must fail instead of rewriting paths with active refs")
     required_remap = [
@@ -505,15 +509,20 @@ def test_pivot_prepares_wki_before_mount_remap() -> None:
 def test_vfs_umount_invalidates_only_exact_mount() -> None:
     body = function_body(CORE_CPP.read_text(), "vfs_umount")
     required = [
+        "ker::mod::sys::MutexGuard publication_guard(g_vfs_namespace_publication_mutex);",
         "auto mount_ref = find_mount_point(resolved.data());",
         "std::strcmp(mount->path, resolved.data()) == 0",
+        "expected_dev_id = mount->dev_id;",
         "stream_invalidate_mount_scope(mount->fs_type, stream_scope_key_for_mount(mount));",
-        "return unmount_filesystem(target);",
+        "unmount_filesystem_if_dev_id(target, expected_dev_id)",
     ]
     missing = [token for token in required if token not in body]
     if missing:
         fail("vfs_umount() must invalidate stream scope only for exact mount targets: " + ", ".join(missing))
     require_order(body, "std::strcmp(mount->path, resolved.data()) == 0", "stream_invalidate_mount_scope", "exact umount invalidation")
+    require_order(body, "expected_dev_id = mount->dev_id;", "unmount_filesystem_if_dev_id(target, expected_dev_id)", "stable unmount identity")
+    if "return unmount_filesystem(target);" in body:
+        fail("vfs_umount() must not retire a replacement mount by pathname alone")
 
 
 def test_vfs_mount_resolves_dev_source_symlinks() -> None:

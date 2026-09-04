@@ -421,6 +421,10 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/vfs_mount_lifetime_source_test.py
 )
 add_test(
+    NAME vfs_lookup_contract_source_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/vfs_lookup_contract_source_test.py
+)
+add_test(
     NAME vfs_advisory_lock_source_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/vfs_advisory_lock_source_test.py
 )
@@ -637,6 +641,7 @@ set_tests_properties(
     wki_chaos_workload_source_test
     vfs_open_path_scratch_source_test
     vfs_mount_lifetime_source_test
+    vfs_lookup_contract_source_test
     vfs_advisory_lock_source_test
     xfs_metadata_lock_source_test
     xfs_metadata_source_test
@@ -718,6 +723,10 @@ wos_add_unit_test(kernel_preemption_policy_test
 
 wos_add_unit_test(scheduler_transition_model_test
     SOURCES     ${CMAKE_CURRENT_SOURCE_DIR}/unit/scheduler_transition_model_test.cpp
+)
+
+wos_add_unit_test(vfs_lookup_model_test
+    SOURCES     ${CMAKE_CURRENT_SOURCE_DIR}/unit/vfs_lookup_model_test.cpp
 )
 
 wos_add_unit_test(wos_abi_parity_test

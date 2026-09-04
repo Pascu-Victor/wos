@@ -687,35 +687,70 @@ auto relative_wire_path_has_safe_components(const uint8_t* path, size_t path_len
     return true;
 }
 
-// Build full absolute path from export_path + relative_path
-void build_full_path(char* out, size_t out_size, const char* export_path, const char* relative_path, uint16_t rel_len) {
+// Build full absolute path from export_path + relative_path without silently
+// changing the requested name. Owner-side admission treats truncation as an
+// error before confinement checks or filesystem calls.
+auto build_full_path(char* out, size_t out_size, const char* export_path, const char* relative_path, size_t rel_len) -> int {
+    if (out == nullptr || out_size == 0 || export_path == nullptr || (relative_path == nullptr && rel_len != 0)) {
+        return -EINVAL;
+    }
+    out[0] = '\0';
+
     size_t const EXPORT_LEN = strlen(export_path);
-
-    // Copy export path
-    size_t pos = 0;
-    if (EXPORT_LEN > 0 && EXPORT_LEN < out_size - 1) {
-        memcpy(out, export_path, EXPORT_LEN);
-        pos = EXPORT_LEN;
+    if (EXPORT_LEN >= out_size) {
+        return -ENAMETOOLONG;
+    }
+    size_t const SEPARATOR_LEN = EXPORT_LEN > 0 && export_path[EXPORT_LEN - 1] != '/' && rel_len > 0 ? 1U : 0U;
+    size_t remaining = out_size - EXPORT_LEN - 1;
+    if (SEPARATOR_LEN > remaining) {
+        return -ENAMETOOLONG;
+    }
+    remaining -= SEPARATOR_LEN;
+    if (rel_len > remaining) {
+        return -ENAMETOOLONG;
     }
 
-    // Add separator if needed
-    if (pos > 0 && out[pos - 1] != '/' && rel_len > 0) {
-        if (pos < out_size - 1) {
-            out[pos++] = '/';
-        }
+    memcpy(out, export_path, EXPORT_LEN);
+    size_t pos = EXPORT_LEN;
+    if (SEPARATOR_LEN != 0) {
+        out[pos++] = '/';
     }
-
-    // Copy relative path
-    size_t copy_len = rel_len;
-    if (pos + copy_len >= out_size) {
-        copy_len = out_size - pos - 1;
+    if (rel_len != 0) {
+        memcpy(out + pos, relative_path, rel_len);
+        pos += rel_len;
     }
-    if (copy_len > 0) {
-        memcpy(out + pos, relative_path, copy_len);
-        pos += copy_len;
-    }
-
     out[pos] = '\0';
+    return 0;
+}
+
+auto exact_relative_wire_path(const uint8_t* data, size_t data_len, size_t path_offset, size_t path_len) -> const uint8_t* {
+    if (data == nullptr || path_offset > data_len || path_len != data_len - path_offset) {
+        return nullptr;
+    }
+    const uint8_t* const PATH = data + path_offset;
+    return relative_wire_path_has_safe_components(PATH, path_len) ? PATH : nullptr;
+}
+
+auto wire_payload_has_optional_exact_suffix(size_t data_len, size_t body_end, size_t suffix_len) -> bool {
+    return data_len == body_end || (body_end <= data_len && suffix_len == data_len - body_end);
+}
+
+auto wire_symlink_target_is_representable(const uint8_t* target, size_t target_len, size_t buffer_capacity) -> bool {
+    return target != nullptr && target_len < buffer_capacity && std::memchr(target, '\0', target_len) == nullptr;
+}
+
+auto prepare_legacy_scalar_path(const char* export_path, const char* export_name, const uint8_t* relative_path, size_t relative_path_len,
+                                char* full_path, size_t full_path_size, char* full_visible_path, size_t full_visible_path_size) -> int {
+    if (!relative_wire_path_has_safe_components(relative_path, relative_path_len)) {
+        return -EINVAL;
+    }
+    int const BACKING_RET =
+        build_full_path(full_path, full_path_size, export_path, reinterpret_cast<const char*>(relative_path), relative_path_len);
+    if (BACKING_RET != 0) {
+        return BACKING_RET;
+    }
+    return build_full_path(full_visible_path, full_visible_path_size, export_name, reinterpret_cast<const char*>(relative_path),
+                           relative_path_len);
 }
 
 void build_export_name(char* out, size_t out_size, const char* export_path) {
@@ -831,26 +866,6 @@ auto read_local_file_windowed(ker::vfs::File* local_file, void* buf, size_t len,
     return static_cast<ssize_t>(total_read);
 }
 
-// Check if the resolved server-side path would cross into a REMOTE (WKI proxy) mount.
-// This prevents recursive proxying: e.g. a client reads /wki/nodeA/wki/nodeB/... which
-// would cause the server to proxy through its own WKI mounts, creating a chain that
-// times out or loops.
-bool path_crosses_remote_mount(const char* path) {
-    if (path == nullptr) {
-        return false;
-    }
-
-    std::array<char, 512> resolved_path __attribute__((uninitialized));  // NOLINT(cppcoreguidelines-pro-type-member-init)
-    const char* mount_path = path;
-    if (ker::vfs::resolve_mount_path(path, resolved_path.data(), resolved_path.size()) == 0) {
-        mount_path = resolved_path.data();
-    }
-
-    auto mount_ref = ker::vfs::find_mount_point(mount_path);
-    auto* mp = mount_ref.get();
-    return mp != nullptr && mp->fs_type == ker::vfs::FSType::REMOTE;
-}
-
 bool path_crosses_remote_mount_direct(const char* path) {
     if (path == nullptr) {
         return false;
@@ -876,10 +891,6 @@ bool path_crosses_recursive_self_alias(const char* path) {
     std::snprintf(self_prefix.data(), self_prefix.size(), "/wki/%s", g_wki.local_hostname.data());
     size_t const SELF_PREFIX_LEN = std::strlen(self_prefix.data());
     return std::strncmp(path, self_prefix.data(), SELF_PREFIX_LEN) == 0 && (path[SELF_PREFIX_LEN] == '\0' || path[SELF_PREFIX_LEN] == '/');
-}
-
-bool path_crosses_recursive_wki_boundary(const char* path) {
-    return path_crosses_remote_mount(path) || path_crosses_recursive_self_alias(path);
 }
 
 bool path_crosses_recursive_wki_boundary_direct(const char* backing_path, const char* visible_path) {
@@ -4338,6 +4349,46 @@ auto wki_remote_vfs_selftest_utimens_wire_path_validation() -> bool {
            !relative_wire_path_has_safe_components(NUL_PATH.data(), NUL_PATH.size());
 }
 
+auto wki_remote_vfs_selftest_legacy_scalar_wire_path_admission() -> bool {
+    constexpr std::array<uint8_t, 8> SAFE_PATH = {'d', 'i', 'r', '/', 'f', 'i', 'l', 'e'};
+    constexpr std::array<uint8_t, 5> ABSOLUTE_PATH = {'/', 'f', 'i', 'l', 'e'};
+    constexpr std::array<uint8_t, 3> DOT_PATH = {'a', '/', '.'};
+    constexpr std::array<uint8_t, 4> DOT_DOT_PATH = {'a', '/', '.', '.'};
+    constexpr std::array<uint8_t, 5> NUL_PATH = {'f', 'i', '\0', 'l', 'e'};
+    constexpr std::array<uint8_t, 4> NUL_TARGET = {'a', '\0', 'b', 'c'};
+
+    if (exact_relative_wire_path(SAFE_PATH.data(), SAFE_PATH.size(), 0, SAFE_PATH.size()) != SAFE_PATH.data() ||
+        exact_relative_wire_path(SAFE_PATH.data(), SAFE_PATH.size(), 0, SAFE_PATH.size() - 1) != nullptr ||
+        exact_relative_wire_path(SAFE_PATH.data(), SAFE_PATH.size() - 1, 0, SAFE_PATH.size()) != nullptr ||
+        exact_relative_wire_path(ABSOLUTE_PATH.data(), ABSOLUTE_PATH.size(), 0, ABSOLUTE_PATH.size()) != nullptr ||
+        exact_relative_wire_path(DOT_PATH.data(), DOT_PATH.size(), 0, DOT_PATH.size()) != nullptr ||
+        exact_relative_wire_path(DOT_DOT_PATH.data(), DOT_DOT_PATH.size(), 0, DOT_DOT_PATH.size()) != nullptr ||
+        exact_relative_wire_path(NUL_PATH.data(), NUL_PATH.size(), 0, NUL_PATH.size()) != nullptr ||
+        !wire_payload_has_optional_exact_suffix(10, 10, 8) || !wire_payload_has_optional_exact_suffix(18, 10, 8) ||
+        wire_payload_has_optional_exact_suffix(11, 10, 8) || wire_payload_has_optional_exact_suffix(17, 10, 8) ||
+        !wire_symlink_target_is_representable(SAFE_PATH.data(), SAFE_PATH.size(), 512) ||
+        wire_symlink_target_is_representable(NUL_TARGET.data(), NUL_TARGET.size(), 512)) {
+        return false;
+    }
+
+    std::array<uint8_t, 504> long_path{};
+    long_path.fill('x');
+    std::array<char, 512> full_path{};
+    std::array<char, 512> visible_path{};
+    if (prepare_legacy_scalar_path("/export", "/view", long_path.data(), 503, full_path.data(), full_path.size(), visible_path.data(),
+                                   visible_path.size()) != 0 ||
+        std::strlen(full_path.data()) != full_path.size() - 1 ||
+        prepare_legacy_scalar_path("/export", "/view", long_path.data(), long_path.size(), full_path.data(), full_path.size(),
+                                   visible_path.data(), visible_path.size()) != -ENAMETOOLONG) {
+        return false;
+    }
+
+    std::array<char, 512> full_export{};
+    full_export.fill('e');
+    full_export.back() = '\0';
+    return build_full_path(full_path.data(), full_path.size(), full_export.data(), "x", 1) == -ENAMETOOLONG;
+}
+
 auto wki_remote_vfs_selftest_multi_rdma_lane_selection() -> bool {
     WkiTransport transport{};
     transport.name = "wki-roce";
@@ -5508,6 +5559,13 @@ void handle_vfs_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_ident
         }
         static_cast<void>(wki_send_on_channel_identity(channel_identity, MsgType::DEV_OP_RESP, resp_buf, resp_len));
     };
+    auto reject_request = [&](int16_t status) {
+        DevOpRespPayload resp = {};
+        resp.op_id = op_id;
+        resp.status = status;
+        resp.data_len = 0;
+        send_simple_resp(resp);
+    };
 
     switch (op_id) {
         case OP_VFS_XATTR: {
@@ -5534,19 +5592,16 @@ void handle_vfs_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_ident
             memcpy(&path_len, data + 8, sizeof(uint16_t));
 
             size_t const OPEN_PATH_END = OPEN_REQ_BASE_LEN + static_cast<size_t>(path_len);
-            if (data_len < OPEN_PATH_END) {
-                DevOpRespPayload resp = {};
-                resp.op_id = OP_VFS_OPEN;
-                resp.status = -1;
-                resp.data_len = 0;
-                resp.reserved = REQ_COOKIE;
-                static_cast<void>(wki_send_on_channel_identity(channel_identity, MsgType::DEV_OP_RESP, &resp, sizeof(resp)));
+            bool const HAS_PREFETCH = data_len == OPEN_PATH_END + OPEN_PREFETCH_REQ_LEN;
+            if (!wire_payload_has_optional_exact_suffix(data_len, OPEN_PATH_END, OPEN_PREFETCH_REQ_LEN) ||
+                !relative_wire_path_has_safe_components(data + OPEN_REQ_BASE_LEN, path_len)) {
+                reject_request(-EINVAL);
                 break;
             }
 
             uint32_t prefetch_rkey = 0;
             uint32_t prefetch_len = 0;
-            if (data_len >= OPEN_PATH_END + OPEN_PREFETCH_REQ_LEN) {
+            if (HAS_PREFETCH) {
                 memcpy(&prefetch_rkey, data + OPEN_PATH_END, sizeof(uint32_t));
                 memcpy(&prefetch_len, data + OPEN_PATH_END + sizeof(uint32_t), sizeof(uint32_t));
                 prefetch_len = std::min<uint32_t>(prefetch_len, VFS_RDMA_BULK_SIZE);
@@ -5555,9 +5610,12 @@ void handle_vfs_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_ident
             // Build full path: export_path + "/" + relative_path
             std::array<char, 512> full_path __attribute__((uninitialized));          // NOLINT(cppcoreguidelines-pro-type-member-init)
             std::array<char, 512> full_visible_path __attribute__((uninitialized));  // NOLINT(cppcoreguidelines-pro-type-member-init)
-            build_full_path(full_path.data(), full_path.size(), export_path, reinterpret_cast<const char*>(data + 10), path_len);
-            build_full_path(full_visible_path.data(), full_visible_path.size(), export_name, reinterpret_cast<const char*>(data + 10),
-                            path_len);
+            int const PATH_RET = prepare_legacy_scalar_path(export_path, export_name, data + OPEN_REQ_BASE_LEN, path_len, full_path.data(),
+                                                            full_path.size(), full_visible_path.data(), full_visible_path.size());
+            if (PATH_RET != 0) {
+                reject_request(static_cast<int16_t>(PATH_RET));
+                break;
+            }
 
             // Block recursive proxying: don't let a remote client traverse into our WKI mounts
             if (path_crosses_recursive_wki_boundary_direct(full_path.data(), full_visible_path.data())) {
@@ -5574,7 +5632,8 @@ void handle_vfs_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_ident
             // context happened to receive the packet.
             perf_record_vfs_server_begin(SERVER_OP, hdr->src_node, channel_id, CORRELATION, CALLSITE);
             uint64_t const LOCAL_STARTED_US = wki_now_us();
-            ker::vfs::File* file = ker::vfs::vfs_open_file_resolved(full_path.data(), static_cast<int>(flags), static_cast<int>(mode));
+            ker::vfs::File* file =
+                ker::vfs::vfs_open_file_resolved_beneath(export_path, full_path.data(), static_cast<int>(flags), static_cast<int>(mode));
             if (file == nullptr) {
                 perf_record_vfs_server_end(SERVER_OP, hdr->src_node, channel_id, CORRELATION, -1,
                                            static_cast<uint32_t>(wki_now_us() - LOCAL_STARTED_US), 0, CALLSITE);
@@ -6058,20 +6117,20 @@ void handle_vfs_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_ident
             uint16_t path_len = 0;
             memcpy(&path_len, data, sizeof(uint16_t));
 
-            if (data_len < 2 + path_len) {
-                DevOpRespPayload resp = {};
-                resp.op_id = OP_VFS_STAT;
-                resp.status = -1;
-                resp.data_len = 0;
-                send_simple_resp(resp);
+            const uint8_t* const PATH = exact_relative_wire_path(data, data_len, sizeof(uint16_t), path_len);
+            if (PATH == nullptr) {
+                reject_request(-EINVAL);
                 break;
             }
 
             std::array<char, 512> full_path __attribute__((uninitialized));          // NOLINT(cppcoreguidelines-pro-type-member-init)
             std::array<char, 512> full_visible_path __attribute__((uninitialized));  // NOLINT(cppcoreguidelines-pro-type-member-init)
-            build_full_path(full_path.data(), full_path.size(), export_path, reinterpret_cast<const char*>(data + 2), path_len);
-            build_full_path(full_visible_path.data(), full_visible_path.size(), export_name, reinterpret_cast<const char*>(data + 2),
-                            path_len);
+            int const PATH_RET = prepare_legacy_scalar_path(export_path, export_name, PATH, path_len, full_path.data(), full_path.size(),
+                                                            full_visible_path.data(), full_visible_path.size());
+            if (PATH_RET != 0) {
+                reject_request(static_cast<int16_t>(PATH_RET));
+                break;
+            }
 
             if (path_crosses_recursive_wki_boundary_direct(full_path.data(), full_visible_path.data())) {
                 DevOpRespPayload resp = {};
@@ -6085,7 +6144,7 @@ void handle_vfs_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_ident
             ker::vfs::Stat statbuf = {};
             perf_record_vfs_server_begin(SERVER_OP, hdr->src_node, channel_id, CORRELATION, CALLSITE);
             uint64_t const LOCAL_STARTED_US = wki_now_us();
-            int const RET = ker::vfs::vfs_stat_resolved(full_path.data(), &statbuf);
+            int const RET = ker::vfs::vfs_stat_resolved_beneath(export_path, full_path.data(), &statbuf);
             perf_record_vfs_server_end(SERVER_OP, hdr->src_node, channel_id, CORRELATION, RET,
                                        static_cast<uint32_t>(wki_now_us() - LOCAL_STARTED_US), (RET == 0) ? sizeof(ker::vfs::Stat) : 0,
                                        CALLSITE);
@@ -6125,20 +6184,20 @@ void handle_vfs_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_ident
             memcpy(&mode, data, sizeof(uint32_t));
             memcpy(&path_len, data + 4, sizeof(uint16_t));
 
-            if (data_len < 6 + path_len) {
-                DevOpRespPayload resp = {};
-                resp.op_id = OP_VFS_MKDIR;
-                resp.status = -1;
-                resp.data_len = 0;
-                send_simple_resp(resp);
+            const uint8_t* const PATH = exact_relative_wire_path(data, data_len, 6, path_len);
+            if (PATH == nullptr) {
+                reject_request(-EINVAL);
                 break;
             }
 
             std::array<char, 512> full_path __attribute__((uninitialized));          // NOLINT(cppcoreguidelines-pro-type-member-init)
             std::array<char, 512> full_visible_path __attribute__((uninitialized));  // NOLINT(cppcoreguidelines-pro-type-member-init)
-            build_full_path(full_path.data(), full_path.size(), export_path, reinterpret_cast<const char*>(data + 6), path_len);
-            build_full_path(full_visible_path.data(), full_visible_path.size(), export_name, reinterpret_cast<const char*>(data + 6),
-                            path_len);
+            int const PATH_RET = prepare_legacy_scalar_path(export_path, export_name, PATH, path_len, full_path.data(), full_path.size(),
+                                                            full_visible_path.data(), full_visible_path.size());
+            if (PATH_RET != 0) {
+                reject_request(static_cast<int16_t>(PATH_RET));
+                break;
+            }
 
             if (path_crosses_recursive_wki_boundary_direct(full_path.data(), full_visible_path.data())) {
                 DevOpRespPayload resp = {};
@@ -6149,7 +6208,7 @@ void handle_vfs_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_ident
                 break;
             }
 
-            int const RET = ker::vfs::vfs_mkdir(full_visible_path.data(), static_cast<int>(mode));
+            int const RET = ker::vfs::vfs_mkdir_resolved_beneath(export_path, full_path.data(), static_cast<int>(mode));
 
             DevOpRespPayload resp = {};
             resp.op_id = OP_VFS_MKDIR;
@@ -6174,21 +6233,20 @@ void handle_vfs_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_ident
             uint16_t path_len = 0;
             memcpy(&path_len, data, sizeof(uint16_t));
 
-            if (data_len < 2 + path_len) {
-                DevOpRespPayload resp = {};
-                resp.op_id = OP_VFS_READLINK;
-                resp.status = -1;
-                resp.data_len = 0;
-                resp.reserved = REQ_COOKIE;
-                static_cast<void>(wki_send_on_channel_identity(channel_identity, MsgType::DEV_OP_RESP, &resp, sizeof(resp)));
+            const uint8_t* const PATH = exact_relative_wire_path(data, data_len, sizeof(uint16_t), path_len);
+            if (PATH == nullptr) {
+                reject_request(-EINVAL);
                 break;
             }
 
             std::array<char, 512> full_path __attribute__((uninitialized));          // NOLINT(cppcoreguidelines-pro-type-member-init)
             std::array<char, 512> full_visible_path __attribute__((uninitialized));  // NOLINT(cppcoreguidelines-pro-type-member-init)
-            build_full_path(full_path.data(), full_path.size(), export_path, reinterpret_cast<const char*>(data + 2), path_len);
-            build_full_path(full_visible_path.data(), full_visible_path.size(), export_name, reinterpret_cast<const char*>(data + 2),
-                            path_len);
+            int const PATH_RET = prepare_legacy_scalar_path(export_path, export_name, PATH, path_len, full_path.data(), full_path.size(),
+                                                            full_visible_path.data(), full_visible_path.size());
+            if (PATH_RET != 0) {
+                reject_request(static_cast<int16_t>(PATH_RET));
+                break;
+            }
 
             if (path_crosses_recursive_wki_boundary_direct(full_path.data(), full_visible_path.data())) {
                 DevOpRespPayload resp = {};
@@ -6204,7 +6262,8 @@ void handle_vfs_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_ident
             std::array<char, 512> target_buf{};
             perf_record_vfs_server_begin(SERVER_OP, hdr->src_node, channel_id, CORRELATION, CALLSITE);
             uint64_t const LOCAL_STARTED_US = wki_now_us();
-            ssize_t const TARGET_LEN = ker::vfs::vfs_readlink_resolved(full_path.data(), target_buf.data(), target_buf.size() - 1);
+            ssize_t const TARGET_LEN =
+                ker::vfs::vfs_readlink_resolved_beneath(export_path, full_path.data(), target_buf.data(), target_buf.size() - 1);
             perf_record_vfs_server_end(
                 SERVER_OP, hdr->src_node, channel_id, CORRELATION, (TARGET_LEN >= 0) ? 0 : static_cast<int32_t>(TARGET_LEN),
                 static_cast<uint32_t>(wki_now_us() - LOCAL_STARTED_US), (TARGET_LEN > 0) ? static_cast<uint64_t>(TARGET_LEN) : 0, CALLSITE);
@@ -6253,38 +6312,36 @@ void handle_vfs_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_ident
             uint16_t target_len = 0;
             memcpy(&target_len, data, sizeof(uint16_t));
 
-            if (data_len < 4 + target_len) {
-                DevOpRespPayload resp = {};
-                resp.op_id = OP_VFS_SYMLINK;
-                resp.status = -1;
-                resp.data_len = 0;
-                send_simple_resp(resp);
+            if (target_len > data_len - 4) {
+                reject_request(-EINVAL);
                 break;
             }
 
             uint16_t link_len = 0;
             memcpy(&link_len, data + 2 + target_len, sizeof(uint16_t));
 
-            if (data_len < 4 + target_len + link_len) {
-                DevOpRespPayload resp = {};
-                resp.op_id = OP_VFS_SYMLINK;
-                resp.status = -1;
-                resp.data_len = 0;
-                send_simple_resp(resp);
+            size_t const LINK_OFFSET = 4 + static_cast<size_t>(target_len);
+            const uint8_t* const LINK_PATH = exact_relative_wire_path(data, data_len, LINK_OFFSET, link_len);
+            if (LINK_PATH == nullptr || !wire_symlink_target_is_representable(data + sizeof(uint16_t), target_len, 512)) {
+                reject_request(target_len >= 512 ? -ENAMETOOLONG : -EINVAL);
                 break;
             }
 
             // Null-terminate target
             std::array<char, 512> target_str{};
-            size_t const COPY_TLEN = std::min<size_t>(target_len, target_str.size() - 1);
-            memcpy(target_str.data(), data + 2, COPY_TLEN);
+            memcpy(target_str.data(), data + 2, target_len);
 
             // Build full link path
-            std::array<char, 512> full_link __attribute__((uninitialized));  // NOLINT(cppcoreguidelines-pro-type-member-init)
-            build_full_path(full_link.data(), full_link.size(), export_path, reinterpret_cast<const char*>(data + 4 + target_len),
-                            link_len);
+            std::array<char, 512> full_link __attribute__((uninitialized));          // NOLINT(cppcoreguidelines-pro-type-member-init)
+            std::array<char, 512> full_visible_link __attribute__((uninitialized));  // NOLINT(cppcoreguidelines-pro-type-member-init)
+            int const PATH_RET = prepare_legacy_scalar_path(export_path, export_name, LINK_PATH, link_len, full_link.data(),
+                                                            full_link.size(), full_visible_link.data(), full_visible_link.size());
+            if (PATH_RET != 0) {
+                reject_request(static_cast<int16_t>(PATH_RET));
+                break;
+            }
 
-            if (path_crosses_recursive_wki_boundary(full_link.data())) {
+            if (path_crosses_recursive_wki_boundary_direct(full_link.data(), full_visible_link.data())) {
                 DevOpRespPayload resp = {};
                 resp.op_id = OP_VFS_SYMLINK;
                 resp.status = -EPERM;
@@ -6293,7 +6350,7 @@ void handle_vfs_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_ident
                 break;
             }
 
-            int const RET = ker::vfs::vfs_symlink_resolved(target_str.data(), full_link.data());
+            int const RET = ker::vfs::vfs_symlink_resolved_beneath(export_path, target_str.data(), full_link.data());
 
             DevOpRespPayload resp = {};
             resp.op_id = OP_VFS_SYMLINK;
@@ -6320,20 +6377,20 @@ void handle_vfs_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_ident
 
             uint16_t path_len = 0;
             memcpy(&path_len, data, sizeof(uint16_t));
-            if (data_len < 2 + path_len) {
-                DevOpRespPayload resp = {};
-                resp.op_id = OP_VFS_UNLINK;
-                resp.status = -1;
-                resp.data_len = 0;
-                send_simple_resp(resp);
+            const uint8_t* const PATH = exact_relative_wire_path(data, data_len, sizeof(uint16_t), path_len);
+            if (PATH == nullptr) {
+                reject_request(-EINVAL);
                 break;
             }
 
             std::array<char, 512> full_path __attribute__((uninitialized));          // NOLINT(cppcoreguidelines-pro-type-member-init)
             std::array<char, 512> full_visible_path __attribute__((uninitialized));  // NOLINT(cppcoreguidelines-pro-type-member-init)
-            build_full_path(full_path.data(), full_path.size(), export_path, reinterpret_cast<const char*>(data + 2), path_len);
-            build_full_path(full_visible_path.data(), full_visible_path.size(), export_name, reinterpret_cast<const char*>(data + 2),
-                            path_len);
+            int const PATH_RET = prepare_legacy_scalar_path(export_path, export_name, PATH, path_len, full_path.data(), full_path.size(),
+                                                            full_visible_path.data(), full_visible_path.size());
+            if (PATH_RET != 0) {
+                reject_request(static_cast<int16_t>(PATH_RET));
+                break;
+            }
 
             if (path_crosses_recursive_wki_boundary_direct(full_path.data(), full_visible_path.data())) {
                 DevOpRespPayload resp = {};
@@ -6344,7 +6401,7 @@ void handle_vfs_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_ident
                 break;
             }
 
-            int const RET = ker::vfs::vfs_unlink(full_visible_path.data());
+            int const RET = ker::vfs::vfs_unlink_resolved_beneath(export_path, full_path.data(), false);
 
             DevOpRespPayload resp = {};
             resp.op_id = OP_VFS_UNLINK;
@@ -6367,20 +6424,20 @@ void handle_vfs_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_ident
 
             uint16_t path_len = 0;
             memcpy(&path_len, data, sizeof(uint16_t));
-            if (data_len < 2 + path_len) {
-                DevOpRespPayload resp = {};
-                resp.op_id = OP_VFS_RMDIR;
-                resp.status = -1;
-                resp.data_len = 0;
-                send_simple_resp(resp);
+            const uint8_t* const PATH = exact_relative_wire_path(data, data_len, sizeof(uint16_t), path_len);
+            if (PATH == nullptr) {
+                reject_request(-EINVAL);
                 break;
             }
 
             std::array<char, 512> full_path __attribute__((uninitialized));          // NOLINT(cppcoreguidelines-pro-type-member-init)
             std::array<char, 512> full_visible_path __attribute__((uninitialized));  // NOLINT(cppcoreguidelines-pro-type-member-init)
-            build_full_path(full_path.data(), full_path.size(), export_path, reinterpret_cast<const char*>(data + 2), path_len);
-            build_full_path(full_visible_path.data(), full_visible_path.size(), export_name, reinterpret_cast<const char*>(data + 2),
-                            path_len);
+            int const PATH_RET = prepare_legacy_scalar_path(export_path, export_name, PATH, path_len, full_path.data(), full_path.size(),
+                                                            full_visible_path.data(), full_visible_path.size());
+            if (PATH_RET != 0) {
+                reject_request(static_cast<int16_t>(PATH_RET));
+                break;
+            }
 
             if (path_crosses_recursive_wki_boundary_direct(full_path.data(), full_visible_path.data())) {
                 DevOpRespPayload resp = {};
@@ -6391,7 +6448,7 @@ void handle_vfs_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_ident
                 break;
             }
 
-            int const RET = ker::vfs::vfs_rmdir(full_visible_path.data());
+            int const RET = ker::vfs::vfs_unlink_resolved_beneath(export_path, full_path.data(), true);
 
             DevOpRespPayload resp = {};
             resp.op_id = OP_VFS_RMDIR;
@@ -6414,42 +6471,41 @@ void handle_vfs_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_ident
 
             uint16_t old_len = 0;
             memcpy(&old_len, data, sizeof(uint16_t));
-            if (data_len < 4 + old_len) {
-                DevOpRespPayload resp = {};
-                resp.op_id = OP_VFS_RENAME;
-                resp.status = -1;
-                resp.data_len = 0;
-                send_simple_resp(resp);
+            if (old_len > data_len - 4) {
+                reject_request(-EINVAL);
                 break;
             }
 
             uint16_t new_len = 0;
             memcpy(&new_len, data + 2 + old_len, sizeof(uint16_t));
-            if (data_len < 4 + old_len + new_len) {
-                DevOpRespPayload resp = {};
-                resp.op_id = OP_VFS_RENAME;
-                resp.status = -1;
-                resp.data_len = 0;
-                send_simple_resp(resp);
+            const uint8_t* const OLD_PATH = data + sizeof(uint16_t);
+            size_t const NEW_PATH_OFFSET = 4 + static_cast<size_t>(old_len);
+            const uint8_t* const NEW_PATH = exact_relative_wire_path(data, data_len, NEW_PATH_OFFSET, new_len);
+            if (NEW_PATH == nullptr || !relative_wire_path_has_safe_components(OLD_PATH, old_len)) {
+                reject_request(-EINVAL);
                 break;
             }
 
-            std::array<char, 512> old_full __attribute__((uninitialized));  // NOLINT(cppcoreguidelines-pro-type-member-init)
-            build_full_path(old_full.data(), old_full.size(), export_path, reinterpret_cast<const char*>(data + 2), old_len);
-
-            std::array<char, 512> new_full __attribute__((uninitialized));  // NOLINT(cppcoreguidelines-pro-type-member-init)
-            build_full_path(new_full.data(), new_full.size(), export_path, reinterpret_cast<const char*>(data + 4 + old_len), new_len);
-
-            if (path_crosses_recursive_wki_boundary(old_full.data()) || path_crosses_recursive_wki_boundary(new_full.data())) {
-                DevOpRespPayload resp = {};
-                resp.op_id = OP_VFS_RENAME;
-                resp.status = -EPERM;
-                resp.data_len = 0;
-                send_simple_resp(resp);
+            std::array<char, 512> old_full __attribute__((uninitialized));     // NOLINT(cppcoreguidelines-pro-type-member-init)
+            std::array<char, 512> new_full __attribute__((uninitialized));     // NOLINT(cppcoreguidelines-pro-type-member-init)
+            std::array<char, 512> old_visible __attribute__((uninitialized));  // NOLINT(cppcoreguidelines-pro-type-member-init)
+            std::array<char, 512> new_visible __attribute__((uninitialized));  // NOLINT(cppcoreguidelines-pro-type-member-init)
+            int const OLD_PATH_RET = prepare_legacy_scalar_path(export_path, export_name, OLD_PATH, old_len, old_full.data(),
+                                                                old_full.size(), old_visible.data(), old_visible.size());
+            int const NEW_PATH_RET = prepare_legacy_scalar_path(export_path, export_name, NEW_PATH, new_len, new_full.data(),
+                                                                new_full.size(), new_visible.data(), new_visible.size());
+            if (OLD_PATH_RET != 0 || NEW_PATH_RET != 0) {
+                reject_request(static_cast<int16_t>(OLD_PATH_RET != 0 ? OLD_PATH_RET : NEW_PATH_RET));
                 break;
             }
 
-            int const RET = ker::vfs::vfs_rename_resolved(old_full.data(), new_full.data());
+            if (path_crosses_recursive_wki_boundary_direct(old_full.data(), old_visible.data()) ||
+                path_crosses_recursive_wki_boundary_direct(new_full.data(), new_visible.data())) {
+                reject_request(-EPERM);
+                break;
+            }
+
+            int const RET = ker::vfs::vfs_rename_resolved_beneath(export_path, old_full.data(), new_full.data());
 
             DevOpRespPayload resp = {};
             resp.op_id = OP_VFS_RENAME;
@@ -6476,20 +6532,20 @@ void handle_vfs_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_ident
             memcpy(&mode, data, sizeof(uint32_t));
             memcpy(&flags, data + 4, sizeof(uint8_t));
             memcpy(&path_len, data + 5, sizeof(uint16_t));
-            if ((flags & ~WKI_VFS_CHMOD_FLAG_FOLLOW_FINAL_SYMLINK) != 0 || data_len < 7 + path_len) {
-                DevOpRespPayload resp = {};
-                resp.op_id = OP_VFS_CHMOD;
-                resp.status = -1;
-                resp.data_len = 0;
-                send_simple_resp(resp);
+            const uint8_t* const PATH = exact_relative_wire_path(data, data_len, 7, path_len);
+            if ((flags & ~WKI_VFS_CHMOD_FLAG_FOLLOW_FINAL_SYMLINK) != 0 || PATH == nullptr) {
+                reject_request(-EINVAL);
                 break;
             }
 
             std::array<char, 512> full_path __attribute__((uninitialized));          // NOLINT(cppcoreguidelines-pro-type-member-init)
             std::array<char, 512> full_visible_path __attribute__((uninitialized));  // NOLINT(cppcoreguidelines-pro-type-member-init)
-            build_full_path(full_path.data(), full_path.size(), export_path, reinterpret_cast<const char*>(data + 7), path_len);
-            build_full_path(full_visible_path.data(), full_visible_path.size(), export_name, reinterpret_cast<const char*>(data + 7),
-                            path_len);
+            int const PATH_RET = prepare_legacy_scalar_path(export_path, export_name, PATH, path_len, full_path.data(), full_path.size(),
+                                                            full_visible_path.data(), full_visible_path.size());
+            if (PATH_RET != 0) {
+                reject_request(static_cast<int16_t>(PATH_RET));
+                break;
+            }
 
             if (path_crosses_recursive_wki_boundary_direct(full_path.data(), full_visible_path.data())) {
                 DevOpRespPayload resp = {};
@@ -6502,8 +6558,8 @@ void handle_vfs_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_ident
 
             perf_record_vfs_server_begin(SERVER_OP, hdr->src_node, channel_id, CORRELATION, CALLSITE);
             uint64_t const LOCAL_STARTED_US = wki_now_us();
-            int const RET = ker::vfs::vfs_chmod_resolved(full_path.data(), static_cast<int>(mode),
-                                                         (flags & WKI_VFS_CHMOD_FLAG_FOLLOW_FINAL_SYMLINK) != 0);
+            int const RET = ker::vfs::vfs_chmod_resolved_beneath(export_path, full_path.data(), static_cast<int>(mode),
+                                                                 (flags & WKI_VFS_CHMOD_FLAG_FOLLOW_FINAL_SYMLINK) != 0);
             perf_record_vfs_server_end(SERVER_OP, hdr->src_node, channel_id, CORRELATION, RET,
                                        static_cast<uint32_t>(wki_now_us() - LOCAL_STARTED_US), 0, CALLSITE);
 
@@ -6530,14 +6586,8 @@ void handle_vfs_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_ident
             constexpr uint8_t KNOWN_FLAGS = WKI_VFS_UTIMENS_FLAG_FOLLOW_FINAL_SYMLINK | WKI_VFS_UTIMENS_FLAG_TIMES_PRESENT;
             size_t const EXPECTED_DATA_LEN = sizeof(prefix) + static_cast<size_t>(prefix.path_len);
             const uint8_t* const PATH_DATA = data + sizeof(prefix);
-            auto full_path_fits = [&prefix](const char* base) {
-                size_t const BASE_LEN = strlen(base);
-                size_t const SEPARATOR_LEN = BASE_LEN > 0 && base[BASE_LEN - 1] != '/' && prefix.path_len > 0 ? 1U : 0U;
-                return BASE_LEN + SEPARATOR_LEN + static_cast<size_t>(prefix.path_len) < 512U;
-            };
             if ((prefix.flags & ~KNOWN_FLAGS) != 0 || prefix.reserved != 0 || EXPECTED_DATA_LEN != data_len ||
-                !relative_wire_path_has_safe_components(PATH_DATA, prefix.path_len) || !full_path_fits(export_path) ||
-                !full_path_fits(export_name)) {
+                !relative_wire_path_has_safe_components(PATH_DATA, prefix.path_len)) {
                 DevOpRespPayload resp = {};
                 resp.op_id = OP_VFS_UTIMENS;
                 resp.status = -EINVAL;
@@ -6548,9 +6598,12 @@ void handle_vfs_op(const WkiHeader* hdr, const WkiChannelIdentity& channel_ident
 
             std::array<char, 512> full_path __attribute__((uninitialized));          // NOLINT(cppcoreguidelines-pro-type-member-init)
             std::array<char, 512> full_visible_path __attribute__((uninitialized));  // NOLINT(cppcoreguidelines-pro-type-member-init)
-            build_full_path(full_path.data(), full_path.size(), export_path, reinterpret_cast<const char*>(PATH_DATA), prefix.path_len);
-            build_full_path(full_visible_path.data(), full_visible_path.size(), export_name, reinterpret_cast<const char*>(PATH_DATA),
-                            prefix.path_len);
+            int const PATH_RET = prepare_legacy_scalar_path(export_path, export_name, PATH_DATA, prefix.path_len, full_path.data(),
+                                                            full_path.size(), full_visible_path.data(), full_visible_path.size());
+            if (PATH_RET != 0) {
+                reject_request(static_cast<int16_t>(PATH_RET));
+                break;
+            }
 
             if (path_crosses_recursive_wki_boundary_direct(full_path.data(), full_visible_path.data())) {
                 DevOpRespPayload resp = {};
@@ -7053,7 +7106,7 @@ static_assert(vfs_proxy_lane_count_for_mount("/wki/wos-1/tmp/") == VFS_PROXY_DEF
 
 auto mount_vfs_proxy_lane(uint16_t owner_node, uint32_t resource_id, const char* local_mount_path, uint64_t resource_generation,
                           const ResourceIncarnationToken& owner_incarnation, uint32_t binding_peer_boot_epoch, uint64_t mount_group_id,
-                          uint8_t lane_index, bool lane_anchor) -> int {
+                          uint8_t lane_index, bool lane_anchor, RemoteVfsMountPublisher publisher, void* publisher_context) -> int {
     if (local_mount_path == nullptr) {
         return -EINVAL;
     }
@@ -7355,7 +7408,9 @@ auto mount_vfs_proxy_lane(uint16_t owner_node, uint32_t resource_id, const char*
     // Create the mount point with "remote" fstype.  Lane zero is already
     // selectable, so a task that resolves the just-published row cannot wait
     // behind the bounded auxiliary attach sequence below.
-    int const MOUNT_RET = ker::vfs::mount_filesystem(local_mount_path, "remote", nullptr, 0, nullptr, state, &g_remote_vfs_fops);
+    int const MOUNT_RET = publisher != nullptr
+                              ? publisher(local_mount_path, state, &g_remote_vfs_fops, publisher_context)
+                              : ker::vfs::mount_filesystem(local_mount_path, "remote", nullptr, 0, nullptr, state, &g_remote_vfs_fops);
     if (MOUNT_RET != 0) {
         ker::mod::dbg::log("[WKI] Remote VFS mount failed at %s", local_mount_path);
         discard_failed_attached_proxy(state);
@@ -7407,7 +7462,7 @@ auto mount_vfs_proxy_lane(uint16_t owner_node, uint32_t resource_id, const char*
     uint8_t const TARGET_LANE_COUNT = vfs_proxy_lane_count_for_mount(local_mount_path);
     for (uint8_t lane_index = 1; lane_index < TARGET_LANE_COUNT; ++lane_index) {
         int const LANE_RET = mount_vfs_proxy_lane(owner_node, resource_id, local_mount_path, RESOURCE_GENERATION, owner_incarnation,
-                                                  BINDING_PEER_BOOT_EPOCH, mount_group_id, lane_index, false);
+                                                  BINDING_PEER_BOOT_EPOCH, mount_group_id, lane_index, false, nullptr, nullptr);
         if (LANE_RET != 0) {
             ker::mod::dbg::log("[WKI] Remote VFS auxiliary lane unavailable: node=0x%04x res_id=%u lane=%u ret=%d", owner_node, resource_id,
                                lane_index, LANE_RET);
@@ -7449,8 +7504,8 @@ auto mount_vfs_proxy_lane(uint16_t owner_node, uint32_t resource_id, const char*
 
 }  // namespace
 
-auto wki_remote_vfs_mount(uint16_t owner_node, uint32_t resource_id, const char* local_mount_path, uint64_t expected_resource_generation)
-    -> int {
+auto wki_remote_vfs_mount(uint16_t owner_node, uint32_t resource_id, const char* local_mount_path, uint64_t expected_resource_generation,
+                          RemoteVfsMountPublisher publisher, void* publisher_context) -> int {
     if (local_mount_path == nullptr) {
         return -EINVAL;
     }
@@ -7476,7 +7531,7 @@ auto wki_remote_vfs_mount(uint16_t owner_node, uint32_t resource_id, const char*
     s_vfs_lock.unlock();
 
     return mount_vfs_proxy_lane(owner_node, resource_id, local_mount_path, RESOURCE_GENERATION, owner_incarnation, BINDING_PEER_BOOT_EPOCH,
-                                mount_group_id, 0, true);
+                                mount_group_id, 0, true, publisher, publisher_context);
 }
 
 namespace {
@@ -8975,8 +9030,14 @@ void handle_vfs_invalidate_notify(const WkiHeader* hdr, const uint8_t* payload, 
 
     auto invalidate_path = [&](const char* rel_path, uint16_t rel_len) {
         std::array<char, 512> full_path __attribute__((uninitialized));  // NOLINT(cppcoreguidelines-pro-type-member-init)
-        build_full_path(full_path.data(), full_path.size(), group.local_mount_path.data(), rel_path, rel_len);
-        ker::vfs::vfs_cache_notify_invalidate_path(full_path.data());
+        if (relative_wire_path_has_safe_components(reinterpret_cast<const uint8_t*>(rel_path), rel_len) &&
+            build_full_path(full_path.data(), full_path.size(), group.local_mount_path.data(), rel_path, rel_len) == 0) {
+            ker::vfs::vfs_cache_notify_invalidate_path(full_path.data());
+        } else {
+            // A malformed or oversized notification cannot name one safe
+            // cache entry. Invalidate the whole remote mount scope instead.
+            ker::vfs::vfs_cache_notify_invalidate_path(group.local_mount_path.data());
+        }
     };
 
     const char* old_rel = reinterpret_cast<const char*>(payload + 4);

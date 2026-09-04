@@ -841,22 +841,24 @@ void handle_vfs_metadata_batch_op(const WkiHeader* hdr, const WkiChannelIdentity
                     break;
                 case VfsMetadataBatchOperation::CREATE_CLOSE: {
                     constexpr int OPEN_WRONLY = 1;
-                    ker::vfs::File* file = ker::vfs::vfs_open_file_resolved(
-                        first_backing.data(), OPEN_WRONLY | ker::vfs::O_CREAT | ker::vfs::O_EXCL, static_cast<int>(batch_header.mode));
+                    ker::vfs::File* file = ker::vfs::vfs_open_file_resolved_beneath(export_path, first_backing.data(),
+                                                                                    OPEN_WRONLY | ker::vfs::O_CREAT | ker::vfs::O_EXCL,
+                                                                                    static_cast<int>(batch_header.mode));
                     item_status = file != nullptr ? static_cast<int32_t>(ker::vfs::vfs_close_file(file)) : -ENOENT;
                     break;
                 }
                 case VfsMetadataBatchOperation::STAT_FOLLOW:
-                    item_status = static_cast<int32_t>(ker::vfs::vfs_stat_resolved(first_backing.data(), &statbuf));
+                    item_status = static_cast<int32_t>(ker::vfs::vfs_stat_resolved_beneath(export_path, first_backing.data(), &statbuf));
                     break;
                 case VfsMetadataBatchOperation::UNLINK:
-                    item_status = static_cast<int32_t>(ker::vfs::vfs_unlink_resolved(first_backing.data()));
+                    item_status = static_cast<int32_t>(ker::vfs::vfs_unlink_resolved_beneath(export_path, first_backing.data(), false));
                     break;
                 case VfsMetadataBatchOperation::RENAME: {
                     std::array<char, VFS_METADATA_BATCH_PATH_BUFFER_SIZE> second_backing{};
                     static_cast<void>(vfs_metadata_batch_build_full_path(second_backing.data(), second_backing.size(), export_path,
                                                                          data + entry.second_offset, entry.second_len));
-                    item_status = static_cast<int32_t>(ker::vfs::vfs_rename_resolved(first_backing.data(), second_backing.data()));
+                    item_status = static_cast<int32_t>(
+                        ker::vfs::vfs_rename_resolved_beneath(export_path, first_backing.data(), second_backing.data()));
                     break;
                 }
             }

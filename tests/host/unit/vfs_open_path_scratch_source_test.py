@@ -2219,28 +2219,37 @@ def test_statat_scratch_is_initialized_by_dirfd_resolver() -> None:
     fast_resolver = function_body(core, "resolve_dirfd_task_path_raw_common_local_fast_path")
     selftest = function_body(core, "vfs_selftest_statat_root_cwd_relative_paths")
 
-    declaration = "std::array<char, MAX_PATH_LEN> resolved __attribute__((uninitialized));"
-    require_only_uninitialized_array(statat, "resolved", declaration, "statat resolved-path scratch")
     require_order(
         statat,
         [
-            "vfs_stat_absolute_local_fast_path(task, pathname, FOLLOW_FINAL_SYMLINK, statbuf, &fast_result)",
-            "return fast_result",
-            declaration,
-            "int const RESOLVE_RET = resolve_dirfd_task_path_raw(task, dirfd, pathname, resolved.data(), resolved.size(), true,",
-            "if (RESOLVE_RET < 0)",
-            "return RESOLVE_RET",
-            "resolved_task_path_is_wki_entry(task, resolved.data())",
-            "maybe_ensure_wki_host_root_mount_for_task(task, resolved.data())",
-            "vfs_stat_resolved_cache_or_impl(resolved.data()",
+            "LookupFollowPolicy const policy = FOLLOW_FINAL_SYMLINK ? LookupFollowPolicy::FOLLOW_FINAL : LookupFollowPolicy::NOFOLLOW_FINAL;",
+            "for (unsigned attempt = 0; attempt < 4; ++attempt)",
+            "LookupHandle lookup{};",
+            "vfs_acquire_lookup(task, dirfd, pathname, LookupIntent::STAT, policy, false, true, &lookup, 0)",
+            "lookup.mount()->fs_type == FSType::REMOTE ? consume_stat(lookup, &context)",
+            "vfs_consume_lookup(lookup, false, consume_stat, &context)",
+            "if (result != -EAGAIN || attempt == 3)",
         ],
-        "statat resolved-path producer and consumer ordering",
+        "statat retained lookup and bounded consume ordering",
     )
-    failure = block_body_after(statat[statat.find("if (RESOLVE_RET < 0)") :], "if (RESOLVE_RET < 0)")
-    if failure.strip() != "return RESOLVE_RET;":
-        fail("statat must return before consuming failed resolved-path output")
-    if len(re.findall(r"\bresolved\b", statat)) != 6:
-        fail("statat resolved-path scratch has an unexpected producer or consumer")
+    require_order(
+        statat,
+        [
+            "vfs_get_file_retain(task, dirfd)",
+            "vfs_fstat_file(file, statbuf)",
+            "vfs_put_file(file)",
+        ],
+        "statat AT_EMPTY_PATH retained file lifetime",
+    )
+    require_order(
+        statat,
+        [
+            "ker::vfs::tmpfs::tmpfs_stat_lookup(",
+            "ker::vfs::xfs::xfs_stat_lookup(",
+            "vfs_stat_resolved_cache_or_impl(handle.path()",
+        ],
+        "statat retained backend identities and compatibility fallback",
+    )
 
     if len(re.findall(r"\bout\b", resolver)) != 16 or len(re.findall(r"\boutsize\b", resolver)) != 7:
         fail("dirfd resolver destination flow changed; re-audit for redundant whole-buffer clearing")
@@ -2433,29 +2442,25 @@ def test_open_path_scratch_is_initialized_by_its_producers() -> None:
     require_order(
         openat_body,
         [
-            "std::array<char, MAX_PATH_LEN> resolved __attribute__((uninitialized));",
-            "int const FAST_RET",
-            "vfs_open_absolute_common_local_fast_path(task, pathname, resolved, &path_requires_directory,",
-            "if (FAST_RET == 0)",
-            "vfs_open_resolved_for_task(task, pathname, resolved",
-            "if (FAST_RET < 0)",
-            "int const RESOLVE_RET",
-            "resolve_dirfd_task_path_raw(task, dirfd, pathname, resolved.data(), resolved.size(), !OPEN_LOCAL, &path_requires_directory,",
-            "if (RESOLVE_RET < 0)",
-            "return RESOLVE_RET",
-            "vfs_open_resolved_for_task(task, pathname, resolved",
+            "LookupFollowPolicy const FOLLOW_POLICY",
+            "LookupHandle lookup{};",
+            "vfs_acquire_lookup(task, dirfd, pathname, LookupIntent::OPEN, FOLLOW_POLICY, FLAGS_REQUIRE_DIRECTORY, !OPEN_LOCAL, &lookup, 0)",
+            "if (lookup.mount()->fs_type == FSType::REMOTE)",
+            "return consume_open(lookup, &context);",
+            "vfs_consume_lookup(lookup, (flags & (ker::vfs::O_CREAT | ker::vfs::O_TRUNC)) != 0, consume_open, &context)",
+            "if (RESULT != -EAGAIN || attempt == 3)",
         ],
-        "vfs_openat scratch producer and consumer ordering",
+        "vfs_openat retained lookup and bounded consume ordering",
     )
-    forbid(
+    require_order(
         openat_body,
         [
-            "std::array<char, MAX_PATH_LEN> resolved;",
             "std::array<char, MAX_PATH_LEN> resolved{};",
-            "resolved.fill(",
-            "std::memset(resolved.data()",
+            "std::memcpy(resolved.data(), handle.path(), handle.path_length() + 1);",
+            "vfs_open_resolved_for_task(args.task, args.raw_path, resolved",
+            "&handle)",
         ],
-        "vfs_openat redundant scratch initialization",
+        "vfs_openat retained handle path consumption",
     )
 
     resolved_open_body = function_body(core, "vfs_open_resolved_for_task")
@@ -2665,6 +2670,7 @@ def test_create_remove_path_scratch_is_initialized_by_task_resolver() -> None:
     cases = [
         (
             "vfs_mkdir",
+            "return vfs_mkdirat(current, AT_FDCWD, path, mode);",
             "abs_path",
             "std::array<char, MAX_PATH_LEN> abs_path __attribute__((uninitialized));",
             "size_t abs_path_len = UNKNOWN_PATH_LEN;",
@@ -2675,6 +2681,7 @@ def test_create_remove_path_scratch_is_initialized_by_task_resolver() -> None:
         ),
         (
             "vfs_unlink",
+            "return vfs_unlinkat(current, AT_FDCWD, path, 0);",
             "path_buf",
             "std::array<char, MAX_PATH_LEN> path_buf __attribute__((uninitialized));",
             "size_t path_buf_len = UNKNOWN_PATH_LEN;",
@@ -2685,6 +2692,7 @@ def test_create_remove_path_scratch_is_initialized_by_task_resolver() -> None:
         ),
         (
             "vfs_rmdir",
+            "return vfs_unlinkat(current, AT_FDCWD, path, AT_REMOVEDIR);",
             "path_buf",
             "std::array<char, MAX_PATH_LEN> path_buf __attribute__((uninitialized));",
             "size_t path_buf_len = UNKNOWN_PATH_LEN;",
@@ -2696,7 +2704,7 @@ def test_create_remove_path_scratch_is_initialized_by_task_resolver() -> None:
     ]
     expected_scratch_uses = {"vfs_mkdir": 4, "vfs_unlink": 3, "vfs_rmdir": 4}
 
-    for function, scratch, declaration, length_init, hash_init, producer_gate, failure_return, consumer in cases:
+    for function, retained_delegate, scratch, declaration, length_init, hash_init, producer_gate, failure_return, consumer in cases:
         body = function_body(core, function)
         require_only_uninitialized_array(body, scratch, declaration, f"{function} resolver scratch")
         require_order(
@@ -2704,7 +2712,10 @@ def test_create_remove_path_scratch_is_initialized_by_task_resolver() -> None:
             [
                 "if (path == nullptr)",
                 "return -EINVAL",
-                "auto* task = ker::mod::sched::get_current_task();",
+                "auto* current = ker::mod::sched::can_query_current_task() ? ker::mod::sched::get_current_task() : nullptr;",
+                "if (current != nullptr)",
+                retained_delegate,
+                "auto* task = current;",
                 "PathTextScan scan{};",
                 "if (task_absolute_local_path_fast_path_allowed(task, path, &scan))",
                 declaration,
@@ -2856,9 +2867,11 @@ def test_link_path_scratch_is_initialized_by_its_producers() -> None:
     require_order(
         link,
         [
+            "auto* current = ker::mod::sched::can_query_current_task() ? ker::mod::sched::get_current_task() : nullptr;",
+            "if (current != nullptr)",
+            "return vfs_linkat(current, AT_FDCWD, oldpath, AT_FDCWD, newpath, 0);",
             link_declarations["old_buf"],
             link_declarations["new_buf"],
-            "auto* task = ker::mod::sched::get_current_task();",
             old_fast_header,
             "int const COPY_RET = copy_path_string(oldpath, old_buf.data(), old_buf.size());",
             old_slow_header,
@@ -2888,57 +2901,33 @@ def test_link_path_scratch_is_initialized_by_its_producers() -> None:
     ):
         fail("link path scratch producer failures must return before the final consumer")
 
-    linkat_declarations = {
-        "old_resolved": "std::array<char, MAX_PATH_LEN> old_resolved __attribute__((uninitialized));",
-        "new_resolved": "std::array<char, MAX_PATH_LEN> new_resolved __attribute__((uninitialized));",
-    }
-    for scratch, declaration in linkat_declarations.items():
-        require_only_uninitialized_array(linkat, scratch, declaration, f"linkat {scratch} scratch")
-        if (
-            len(re.findall(rf"\b{re.escape(scratch)}\b", linkat)) != 4
-            or linkat.count(f"{scratch}.data()") != 2
-            or linkat.count(f"{scratch}.size()") != 1
-            or f"{scratch}[" in linkat
-        ):
-            fail(f"linkat {scratch} scratch has an unexpected producer or consumer")
-
-    old_resolver_call = """int result = resolve_dirfd_task_path_raw_with_absolute_local_fast_path(task, olddirfd, oldpath, old_resolved.data(),
-                                                                           old_resolved.size(), true, nullptr);"""
-    new_resolver_call = """result = resolve_dirfd_task_path_raw_with_absolute_local_fast_path(task, newdirfd, newpath, new_resolved.data(), new_resolved.size(),
-                                                                       true, nullptr);"""
-    result_failure_gate = "if (result < 0)"
-    result_failure = "return result;"
     require_order(
         linkat,
         [
-            linkat_declarations["old_resolved"],
-            linkat_declarations["new_resolved"],
-            old_resolver_call,
-            result_failure_gate,
-            result_failure,
-            new_resolver_call,
-            result_failure_gate,
-            result_failure,
-            "return vfs_link_resolved_paths(old_resolved.data(), new_resolved.data());",
+            "LookupFollowPolicy const source_policy",
+            "for (unsigned attempt = 0; attempt < 4; ++attempt)",
+            "LookupHandle source{};",
+            "LookupHandle destination{};",
+            "vfs_acquire_lookup(task, olddirfd, oldpath, LookupIntent::LINK_SOURCE, source_policy, false, true, &source, 0)",
+            "vfs_acquire_lookup(task, newdirfd, newpath, LookupIntent::LINK_TARGET, LookupFollowPolicy::NOFOLLOW_FINAL",
+            "if (source.mount() != destination.mount())",
+            "return -EXDEV;",
+            "if (source.mount()->fs_type == FSType::REMOTE)",
+            "return consume_link(source, destination, nullptr);",
+            "vfs_consume_lookup_pair(source, destination, true, consume_link, nullptr)",
+            "if (result != -EAGAIN || attempt == 3)",
         ],
-        "linkat scratch producer, failure gate, and consumer ordering",
+        "linkat retained source/destination and bounded consume ordering",
     )
-    old_call_pos = linkat.find(old_resolver_call)
-    old_gate_pos = linkat.find(result_failure_gate, old_call_pos + len(old_resolver_call))
-    new_call_pos = linkat.find(new_resolver_call, old_gate_pos + len(result_failure_gate))
-    new_gate_pos = linkat.find(result_failure_gate, new_call_pos + len(new_resolver_call))
-    if (
-        old_call_pos < 0
-        or old_gate_pos < 0
-        or new_call_pos < 0
-        or new_gate_pos < 0
-        or linkat[old_call_pos + len(old_resolver_call) : old_gate_pos].strip()
-        or linkat[new_call_pos + len(new_resolver_call) : new_gate_pos].strip()
-        or block_body_after(linkat[old_gate_pos:], result_failure_gate).strip() != result_failure
-        or block_body_after(linkat[new_gate_pos:], result_failure_gate).strip() != result_failure
-        or "goto" in linkat
-    ):
-        fail("linkat resolver failures must return before consuming either scratch path")
+    require_order(
+        linkat,
+        [
+            "ker::vfs::tmpfs::tmpfs_link_lookup(",
+            "ker::vfs::xfs::xfs_link_lookup(",
+            "vfs_link_resolved_paths(source.path(), destination.path(), true)",
+        ],
+        "linkat retained backend identities and compatibility consumer",
+    )
 
 
 if __name__ == "__main__":

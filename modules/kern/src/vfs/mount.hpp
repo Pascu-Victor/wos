@@ -60,7 +60,20 @@ class MountRef {
     MountPoint* mount_{nullptr};
 };
 
+// Opaque two-phase mount construction. Filesystem/device initialization is
+// performed by prepare_mount_filesystem() without a VFS namespace lock.
+// publish_prepared_mount() only inserts the already initialized row and is
+// therefore safe to call from a retained-lookup consumer. The caller must
+// always call finish_prepared_mount(), whether publication succeeds or not.
+struct PreparedMount {
+    void* state{};
+};
+
 // Mount point management
+auto prepare_mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevice* device, unsigned long flags, const char* data,
+                              void* initial_private_data, FileOperations* initial_fops, PreparedMount* out) -> int;
+auto publish_prepared_mount(PreparedMount* prepared) -> int;
+void finish_prepared_mount(PreparedMount* prepared);
 auto mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevice* device, unsigned long flags = 0,
                       const char* data = nullptr, void* initial_private_data = nullptr, FileOperations* initial_fops = nullptr) -> int;
 auto unmount_filesystem(const char* path) -> int;
@@ -68,11 +81,16 @@ auto unmount_filesystem(const char* path) -> int;
 // owner. This prevents deferred teardown from removing a replacement mounted
 // later at the same path.
 auto unmount_filesystem_if_private_data(const char* path, const void* expected_private_data) -> int;
+auto unmount_filesystem_if_dev_id(const char* path, uint32_t expected_dev_id) -> int;
 // Unmount the mount owned by private_data without re-resolving a path. This is
 // stable across pivot/rebase and is the preferred deferred-teardown identity.
 auto unmount_filesystem_by_private_data(const void* expected_private_data) -> int;
 auto shutdown_unmount_all_exact(const char* root_path) -> int;
 auto find_mount_point(const char* path, size_t known_path_len = UNKNOWN_MOUNT_PATH_LEN) -> MountRef;
+// Retain this exact published mount identity without resolving its pathname.
+// Used by dirfd-relative lookup, where the directory's historical VFS path may
+// have been renamed since the File was opened.
+auto retain_mount_point(MountPoint* mount) -> MountRef;
 auto mount_table_generation_snapshot() -> uint64_t;
 auto mounted_block_device_overlaps(const ker::dev::BlockDevice* device) -> bool;
 auto configure_mount_point_exact(const char* path, FSType expected_type, void* private_data, FileOperations* fops) -> bool;

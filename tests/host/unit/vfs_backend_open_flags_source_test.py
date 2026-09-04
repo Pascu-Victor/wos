@@ -33,8 +33,16 @@ def test_tmpfs_open_preserves_flags() -> None:
     require(source, "f->open_flags = open_flags;", "tmpfs root open flags")
     if source.count("create_root_file_with_flags(root, flags)") < 2:
         fail("tmpfs root opens must pass caller flags into create_root_file_with_flags")
-    require(source, "f->open_flags = flags;", "tmpfs non-root open flags")
-    require(source, "f->fd_flags = 0;", "tmpfs fd flags")
+    require(
+        source,
+        "auto tmpfs_open_node_locked(TmpNode* entry, int flags, bool require_directory, bool created_by_open, int* result_out)",
+        "tmpfs retained-node open helper",
+    )
+    require(source, "TmpNode* const NODE = tmpfs_canonical_node(entry);", "tmpfs canonical retained open node")
+    require(source, "file->open_flags = flags;", "tmpfs non-root open flags")
+    require(source, "file->fd_flags = 0;", "tmpfs fd flags")
+    if source.count("tmpfs_open_node_locked(") < 3:
+        fail("tmpfs path and retained-lookup opens must share the flag-preserving node helper")
 
 
 def test_procfs_open_preserves_flags() -> None:

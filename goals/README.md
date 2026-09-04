@@ -43,7 +43,7 @@ an explicit pause/block rule.
 | 15  | [Randomized and hardened userspace layouts](15-userspace-address-space-hardening.md) | ELF/exec, VM, TLS, ptrace/debugging                         | 01, 04, 11 on loader/VM/ABI surfaces          | Done        |
 | 16  | [PREEMPT_NOBLOCK default kernel preemption](16-preempt-noblock-kernel-preemption.md) | timer preemption, kernel frames, migration, return assembly | 03 or 04 on shared scheduler/Task transitions | Done        |
 | 17  | [Fault-safe anonymous memory swap](17-anonymous-memory-swap.md)                      | VM faults, PTEs, COW, reclaim, swap                         | 15 and allocator/VM rewrites                  | Done        |
-| 18  | [Stable transactional VFS pathwalk](18-stable-vfs-pathwalk.md)                      | pathwalk, mounts, namespace mutation, remote VFS             | 26 and broad VFS/remote-VFS changes           | Not started |
+| 18  | [Stable transactional VFS pathwalk](18-stable-vfs-pathwalk.md)                      | pathwalk, mounts, namespace mutation, remote VFS             | 26 and broad VFS/remote-VFS changes           | Done        |
 | 19  | [Immutable credentials and least privilege](19-immutable-credentials-least-privilege.md) | credentials, authorization, init, WKI identity            | 22 on Task/ServiceSpec; 18 on VFS policy      | Not started |
 | 20  | [IOMMU-backed DMA ownership](20-iommu-dma-ownership.md)                              | ACPI/PCI, DMA, AHCI, xHCI, NICs                              | 25 on ivshmem; 30 on AHCI/DMA                 | Not started |
 | 21  | [Modern kernel self-protection](21-kernel-self-protection.md)                        | linker/boot, W^X, KASLR, SMEP/SMAP, stacks                  | 16 and entry/return or VM rewrites            | Not started |
@@ -64,8 +64,8 @@ an explicit pause/block rule.
 The portfolio `Status` column is the canonical goal-selection filter. Do not
 select, reload, or rescan a row marked `Done`; its completion record and current
 source remain available only for later regression work. Completed goals are
-currently 01 through 16 and 32. Select only a row whose status is `Not started`
-(or a future explicit in-progress state). Goals 17 through 31 are the unfinished
+currently 01 through 18 and 32. Select only a row whose status is `Not started`
+(or a future explicit in-progress state). Goals 19 through 31 are the unfinished
 portfolio produced from local-source reconnaissance on 2026-09-03.
 
 ## How to use a goal

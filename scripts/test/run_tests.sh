@@ -204,6 +204,7 @@ UNIT_TESTS=(
     wki_chaos_workload_source_test
     vfs_open_path_scratch_source_test
     vfs_mount_lifetime_source_test
+    vfs_lookup_contract_source_test
     vfs_advisory_lock_source_test
     xfs_metadata_lock_source_test
     xfs_metadata_source_test
@@ -242,6 +243,7 @@ UNIT_TESTS=(
     migration_guard_test
     kernel_preemption_policy_test
     scheduler_transition_model_test
+    vfs_lookup_model_test
     kernel_vsnprintf_test
     wki_routing_test
     data_struct_test

@@ -5,6 +5,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <platform/dbg/dbg.hpp>
+#include <platform/sched/task.hpp>
 #include <test/ktest.hpp>
 #include <vfs/file.hpp>
 #include <vfs/file_operations.hpp>
@@ -20,6 +22,220 @@
 // current task.
 //
 // All test paths are under /tmp/ktest_* to avoid colliding with real content.
+
+namespace {
+
+auto create_empty_vfs_file(const char* path) -> bool {
+    ker::vfs::File* file = ker::vfs::vfs_open_file(path, ker::vfs::O_CREAT | ker::vfs::O_EXCL | 1, 0644);
+    if (file == nullptr) {
+        return false;
+    }
+    return ker::vfs::vfs_close_file(file) == 0;
+}
+
+auto close_task_vfs_fd(ker::mod::sched::task::Task& task, int fd) -> bool {
+    ker::vfs::File* file = ker::vfs::vfs_get_file(&task, fd);
+    if (file == nullptr || ker::vfs::vfs_release_fd(&task, fd) != 0) {
+        return false;
+    }
+    ker::vfs::vfs_put_file(file);
+    return true;
+}
+
+auto renamed_dirfd_keeps_directory_identity_after_path_reuse() -> bool {
+    constexpr const char* OLD_DIR = "/tmp/ktest_stable_dirfd_old";
+    constexpr const char* MOVED_DIR = "/tmp/ktest_stable_dirfd_moved";
+    constexpr const char* OLD_CHILD = "/tmp/ktest_stable_dirfd_old/child";
+    constexpr const char* MOVED_CHILD = "/tmp/ktest_stable_dirfd_moved/child";
+    constexpr const char* OLD_NESTED_DIR = "/tmp/ktest_stable_dirfd_old/nested";
+    constexpr const char* MOVED_NESTED_DIR = "/tmp/ktest_stable_dirfd_moved/nested";
+    constexpr const char* OLD_NESTED_CHILD = "/tmp/ktest_stable_dirfd_old/nested/child";
+    constexpr const char* MOVED_NESTED_CHILD = "/tmp/ktest_stable_dirfd_moved/nested/child";
+    constexpr const char* MOVED_CREATED = "/tmp/ktest_stable_dirfd_moved/created";
+    constexpr const char* MOVED_RENAMED = "/tmp/ktest_stable_dirfd_moved/renamed";
+    constexpr const char* MOVED_LINK = "/tmp/ktest_stable_dirfd_moved/link";
+
+    ker::vfs::vfs_unlink(MOVED_LINK);
+    ker::vfs::vfs_unlink(MOVED_RENAMED);
+    ker::vfs::vfs_unlink(MOVED_CREATED);
+    ker::vfs::vfs_unlink(MOVED_CHILD);
+    ker::vfs::vfs_unlink(OLD_CHILD);
+    ker::vfs::vfs_unlink(MOVED_NESTED_CHILD);
+    ker::vfs::vfs_unlink(OLD_NESTED_CHILD);
+    ker::vfs::vfs_rmdir(MOVED_NESTED_DIR);
+    ker::vfs::vfs_rmdir(OLD_NESTED_DIR);
+    ker::vfs::vfs_rmdir(MOVED_DIR);
+    ker::vfs::vfs_rmdir(OLD_DIR);
+    ker::vfs::vfs_mkdir("/tmp", 0755);
+
+    unsigned stage = 1;
+    bool ok = ker::vfs::vfs_mkdir(OLD_DIR, 0755) == 0 && create_empty_vfs_file(OLD_CHILD) &&
+              ker::vfs::vfs_mkdir(OLD_NESTED_DIR, 0755) == 0 && create_empty_vfs_file(OLD_NESTED_CHILD);
+    ker::mod::sched::task::Task task{};
+    std::memcpy(task.root.data(), "/", 2);
+    std::memcpy(task.cwd.data(), "/", 2);
+    ker::vfs::File* directory = ok ? ker::vfs::vfs_open_file(OLD_DIR, ker::vfs::O_DIRECTORY, 0) : nullptr;
+    int const DIR_FD = directory != nullptr ? ker::vfs::vfs_alloc_fd(&task, directory) : -1;
+    ok = ok && directory != nullptr && DIR_FD >= 0;
+
+    // Rename the opened directory, then reuse its former pathname for a
+    // different directory containing a same-named child. Relative operations
+    // must stay attached to the opened object, not its historical path text.
+    if (ok) {
+        stage = 2;
+        ok = ker::vfs::vfs_rename(OLD_DIR, MOVED_DIR) == 0 && ker::vfs::vfs_mkdir(OLD_DIR, 0755) == 0 && create_empty_vfs_file(OLD_CHILD) &&
+             ker::vfs::vfs_mkdir(OLD_NESTED_DIR, 0755) == 0 && create_empty_vfs_file(OLD_NESTED_CHILD);
+    }
+
+    ker::vfs::Stat retained{};
+    ker::vfs::Stat moved{};
+    ker::vfs::Stat replacement{};
+    if (ok) {
+        stage = 3;
+        ok = ker::vfs::vfs_statat(&task, DIR_FD, "child", 0, &retained) == 0 && ker::vfs::vfs_stat(MOVED_CHILD, &moved) == 0 &&
+             ker::vfs::vfs_stat(OLD_CHILD, &replacement) == 0 && retained.st_ino == moved.st_ino && retained.st_ino != replacement.st_ino;
+    }
+
+    int child_fd = -1;
+    if (ok) {
+        stage = 4;
+        child_fd = ker::vfs::vfs_openat(&task, DIR_FD, "child", 0, 0);
+        ok = child_fd >= 0;
+    }
+    if (child_fd >= 0) {
+        ok = close_task_vfs_fd(task, child_fd) && ok;
+    }
+
+    ker::vfs::Stat retained_nested{};
+    ker::vfs::Stat moved_nested{};
+    ker::vfs::Stat replacement_nested{};
+    if (ok) {
+        stage = 5;
+        ok = ker::vfs::vfs_statat(&task, DIR_FD, "nested/child", 0, &retained_nested) == 0 &&
+             ker::vfs::vfs_stat(MOVED_NESTED_CHILD, &moved_nested) == 0 && ker::vfs::vfs_stat(OLD_NESTED_CHILD, &replacement_nested) == 0 &&
+             retained_nested.st_ino == moved_nested.st_ino && retained_nested.st_ino != replacement_nested.st_ino;
+    }
+
+    int created_fd = -1;
+    if (ok) {
+        stage = 6;
+        created_fd = ker::vfs::vfs_openat(&task, DIR_FD, "created", ker::vfs::O_CREAT | ker::vfs::O_EXCL | 1, 0600);
+        ok = created_fd >= 0;
+    }
+    if (created_fd >= 0) {
+        ok = close_task_vfs_fd(task, created_fd) && ok;
+    }
+    if (ok) {
+        stage = 7;
+        ker::vfs::Stat created{};
+        int const MOVED_CREATED_STAT = ker::vfs::vfs_stat(MOVED_CREATED, &created);
+        int const OLD_CREATED_STAT = ker::vfs::vfs_stat("/tmp/ktest_stable_dirfd_old/created", &created);
+        ok = MOVED_CREATED_STAT == 0 && OLD_CREATED_STAT == -ENOENT;
+        if (!ok) {
+            ker::mod::dbg::log("stable dirfd created placement failed moved=%d old=%d", MOVED_CREATED_STAT, OLD_CREATED_STAT);
+        }
+    }
+    if (ok) {
+        stage = 8;
+        ok = ker::vfs::vfs_renameat(&task, DIR_FD, "created", DIR_FD, "renamed") == 0;
+    }
+    if (ok) {
+        stage = 9;
+        ok = ker::vfs::vfs_symlinkat(&task, "nested/child", DIR_FD, "link") == 0;
+    }
+    if (ok) {
+        stage = 10;
+        std::array<char, 16> target{};
+        ssize_t const READ = ker::vfs::vfs_readlinkat(&task, DIR_FD, "link", target.data(), target.size());
+        ok = READ == static_cast<ssize_t>(sizeof("nested/child") - 1) &&
+             std::memcmp(target.data(), "nested/child", sizeof("nested/child") - 1) == 0;
+    }
+    int followed_link_fd = -1;
+    if (ok) {
+        stage = 11;
+        followed_link_fd = ker::vfs::vfs_openat(&task, DIR_FD, "link", 0, 0);
+        ok = followed_link_fd >= 0;
+    }
+    if (followed_link_fd >= 0) {
+        ok = close_task_vfs_fd(task, followed_link_fd) && ok;
+    }
+    if (ok) {
+        stage = 12;
+        ok = ker::vfs::vfs_unlinkat(&task, DIR_FD, "link", 0) == 0 && ker::vfs::vfs_unlinkat(&task, DIR_FD, "renamed", 0) == 0;
+    }
+
+    if (DIR_FD >= 0) {
+        ok = ker::vfs::vfs_release_fd(&task, DIR_FD) == 0 && ok;
+    }
+    if (directory != nullptr) {
+        ker::vfs::vfs_put_file(directory);
+    }
+    ok = task.fd_table.empty() && ok;
+
+    ker::vfs::vfs_unlink(MOVED_LINK);
+    ker::vfs::vfs_unlink(MOVED_RENAMED);
+    ker::vfs::vfs_unlink(MOVED_CREATED);
+    int const MOVED_CHILD_CLEANUP = ker::vfs::vfs_unlink(MOVED_CHILD);
+    int const OLD_CHILD_CLEANUP = ker::vfs::vfs_unlink(OLD_CHILD);
+    int const MOVED_NESTED_CHILD_CLEANUP = ker::vfs::vfs_unlink(MOVED_NESTED_CHILD);
+    int const OLD_NESTED_CHILD_CLEANUP = ker::vfs::vfs_unlink(OLD_NESTED_CHILD);
+    int const MOVED_NESTED_DIR_CLEANUP = ker::vfs::vfs_rmdir(MOVED_NESTED_DIR);
+    int const OLD_NESTED_DIR_CLEANUP = ker::vfs::vfs_rmdir(OLD_NESTED_DIR);
+    int const MOVED_DIR_CLEANUP = ker::vfs::vfs_rmdir(MOVED_DIR);
+    int const OLD_DIR_CLEANUP = ker::vfs::vfs_rmdir(OLD_DIR);
+    bool const CLEANUP_OK = MOVED_CHILD_CLEANUP == 0 && OLD_CHILD_CLEANUP == 0 && MOVED_NESTED_CHILD_CLEANUP == 0 &&
+                            OLD_NESTED_CHILD_CLEANUP == 0 && MOVED_NESTED_DIR_CLEANUP == 0 && OLD_NESTED_DIR_CLEANUP == 0 &&
+                            MOVED_DIR_CLEANUP == 0 && OLD_DIR_CLEANUP == 0;
+    if (!ok || !CLEANUP_OK) {
+        ker::mod::dbg::log("stable dirfd selftest failed stage=%u cleanup=%d,%d,%d,%d,%d,%d,%d,%d", stage, MOVED_CHILD_CLEANUP,
+                           OLD_CHILD_CLEANUP, MOVED_NESTED_CHILD_CLEANUP, OLD_NESTED_CHILD_CLEANUP, MOVED_NESTED_DIR_CLEANUP,
+                           OLD_NESTED_DIR_CLEANUP, MOVED_DIR_CLEANUP, OLD_DIR_CLEANUP);
+    }
+    return ok && CLEANUP_OK;
+}
+
+auto symlink_rename_replacement_publishes_whole_binding() -> bool {
+    constexpr const char* TARGET_A = "/tmp/ktest_lookup_target_a";
+    constexpr const char* TARGET_B = "/tmp/ktest_lookup_target_b";
+    constexpr const char* LIVE_LINK = "/tmp/ktest_lookup_live_link";
+    constexpr const char* NEXT_LINK = "/tmp/ktest_lookup_next_link";
+    constexpr unsigned ITERATIONS = 16;
+
+    ker::vfs::vfs_unlink(NEXT_LINK);
+    ker::vfs::vfs_unlink(LIVE_LINK);
+    ker::vfs::vfs_unlink(TARGET_B);
+    ker::vfs::vfs_unlink(TARGET_A);
+    ker::vfs::vfs_mkdir("/tmp", 0755);
+
+    bool ok = create_empty_vfs_file(TARGET_A) && create_empty_vfs_file(TARGET_B) && ker::vfs::vfs_symlink(TARGET_A, LIVE_LINK) == 0;
+    std::array<ker::vfs::Stat, 2> targets{};
+    ok = ok && ker::vfs::vfs_stat(TARGET_A, &targets[0]) == 0 && ker::vfs::vfs_stat(TARGET_B, &targets[1]) == 0;
+
+    for (unsigned iteration = 0; ok && iteration < ITERATIONS; ++iteration) {
+        unsigned const TARGET_INDEX = iteration & 1U;
+        const char* target = TARGET_INDEX == 0 ? TARGET_A : TARGET_B;
+        ok = ker::vfs::vfs_symlink(target, NEXT_LINK) == 0 && ker::vfs::vfs_rename(NEXT_LINK, LIVE_LINK) == 0;
+
+        std::array<char, 64> link_text{};
+        ssize_t const READ = ker::vfs::vfs_readlink(LIVE_LINK, link_text.data(), link_text.size());
+        size_t const TARGET_LENGTH = std::strlen(target);
+        ker::vfs::Stat followed{};
+        ker::vfs::Stat nofollow{};
+        ok = ok && READ == static_cast<ssize_t>(TARGET_LENGTH) && std::memcmp(link_text.data(), target, TARGET_LENGTH) == 0 &&
+             ker::vfs::vfs_stat(LIVE_LINK, &followed) == 0 && followed.st_ino == targets[TARGET_INDEX].st_ino &&
+             ker::vfs::vfs_lstat(LIVE_LINK, &nofollow) == 0 &&
+             (nofollow.st_mode & static_cast<mode_t>(ker::vfs::S_IFMT)) == static_cast<mode_t>(ker::vfs::S_IFLNK) &&
+             ker::vfs::vfs_lstat(NEXT_LINK, &nofollow) == -ENOENT;
+    }
+
+    int const NEXT_CLEANUP = ker::vfs::vfs_unlink(NEXT_LINK);
+    int const LIVE_CLEANUP = ker::vfs::vfs_unlink(LIVE_LINK);
+    int const TARGET_B_CLEANUP = ker::vfs::vfs_unlink(TARGET_B);
+    int const TARGET_A_CLEANUP = ker::vfs::vfs_unlink(TARGET_A);
+    return ok && (NEXT_CLEANUP == 0 || NEXT_CLEANUP == -ENOENT) && LIVE_CLEANUP == 0 && TARGET_B_CLEANUP == 0 && TARGET_A_CLEANUP == 0;
+}
+
+}  // namespace
 
 KTEST(VFS, OpenFdInstallFailureClosesFile) { KEXPECT_TRUE(ker::vfs::vfs_selftest_fd_install_failure_closes_file()); }
 
@@ -79,6 +295,8 @@ KTEST(VFS, FchdirChangesSuppliedTaskCwd) { KEXPECT_TRUE(ker::vfs::vfs_selftest_f
 
 KTEST(VFS, UnlinkatRenameatDirfdMutations) { KEXPECT_TRUE(ker::vfs::vfs_selftest_unlinkat_renameat_dirfd_mutations()); }
 
+KTEST(VFS, RenamedDirfdKeepsDirectoryIdentityAfterPathReuse) { KEXPECT_TRUE(renamed_dirfd_keeps_directory_identity_after_path_reuse()); }
+
 KTEST(VFS, RenameSeedsMetadataCache) { KEXPECT_TRUE(ker::vfs::vfs_selftest_rename_seeds_metadata_cache()); }
 
 KTEST(VFS, MetadataCacheRejectsStaleNegativeStore) { KEXPECT_TRUE(ker::vfs::vfs_selftest_metadata_cache_rejects_stale_negative_store()); }
@@ -122,6 +340,8 @@ KTEST(VFS, ReadlinkatDirfdReadsRelativeSymlink) { KEXPECT_TRUE(ker::vfs::vfs_sel
 KTEST(VFS, ReadlinkFollowsIntermediateSymlink) { KEXPECT_TRUE(ker::vfs::vfs_selftest_readlink_follows_intermediate_symlink()); }
 
 KTEST(VFS, SymlinkatDirfdCreatesRelativeSymlink) { KEXPECT_TRUE(ker::vfs::vfs_selftest_symlinkat_dirfd_creates_relative_symlink()); }
+
+KTEST(VFS, SymlinkRenameReplacementPublishesWholeBinding) { KEXPECT_TRUE(symlink_rename_replacement_publishes_whole_binding()); }
 
 KTEST(VFS, LinkatDirfdCreatesRelativeHardlink) { KEXPECT_TRUE(ker::vfs::vfs_selftest_linkat_dirfd_creates_relative_hardlink()); }
 

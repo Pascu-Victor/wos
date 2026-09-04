@@ -72,6 +72,7 @@ auto vfs_open_file(const char* path, int flags, int mode) -> File*;
 // Open an already resolved absolute backing path without consulting the current
 // task's root or WKI routing policy.
 auto vfs_open_file_resolved(const char* path, int flags, int mode) -> File*;
+auto vfs_open_file_resolved_beneath(const char* confinement_root, const char* path, int flags, int mode) -> File*;
 // Close and destroy a File* that was opened without FD allocation.
 auto vfs_close_file(File* file) -> int;
 auto vfs_close(int fd) -> int;
@@ -88,16 +89,19 @@ auto vfs_symlink(const char* target, const char* linkpath) -> int;
 // Create a symlink at an already-resolved absolute backing path without
 // consulting the current task's root or WKI routing policy.
 auto vfs_symlink_resolved(const char* target, const char* linkpath) -> int;
+auto vfs_symlink_resolved_beneath(const char* confinement_root, const char* target, const char* linkpath) -> int;
 auto vfs_symlinkat(ker::mod::sched::task::Task* task, const char* target, int dirfd, const char* linkpath) -> int;
 auto vfs_readlink(const char* path, char* buf, size_t bufsize) -> ssize_t;
 auto vfs_readlinkat(ker::mod::sched::task::Task* task, int dirfd, const char* pathname, char* buf, size_t bufsize) -> ssize_t;
 auto vfs_readlink_resolved(const char* path, char* buf, size_t bufsize) -> ssize_t;
+auto vfs_readlink_resolved_beneath(const char* confinement_root, const char* path, char* buf, size_t bufsize) -> ssize_t;
 auto vfs_realpath(const char* path, char* buf, size_t bufsize, size_t* len_out = nullptr) -> int;
 
 // Stat operations
 auto vfs_stat(const char* path, Stat* statbuf) -> int;
 auto vfs_lstat(const char* path, Stat* statbuf) -> int;
 auto vfs_stat_resolved(const char* path, Stat* statbuf) -> int;
+auto vfs_stat_resolved_beneath(const char* confinement_root, const char* path, Stat* statbuf) -> int;
 auto vfs_statat(ker::mod::sched::task::Task* task, int dirfd, const char* pathname, int flags, Stat* statbuf) -> int;
 auto vfs_fstat(int fd, Stat* statbuf) -> int;
 // Stat an already-open file without allocating an FD or consulting task state.
@@ -150,6 +154,7 @@ auto vfs_fremovexattr_file(File* file, const char* name) -> int;
 // Directory operations
 auto vfs_mkdir(const char* path, int mode) -> int;
 auto vfs_mkdirat(ker::mod::sched::task::Task* task, int dirfd, const char* pathname, int mode) -> int;
+auto vfs_mkdir_resolved_beneath(const char* confinement_root, const char* path, int mode) -> int;
 
 // Mount operations (called from userspace via syscall)
 auto vfs_mount(const char* source, const char* target, const char* fstype, unsigned long flags = 0, const char* data = nullptr) -> int;
@@ -188,9 +193,11 @@ auto vfs_rename(const char* oldpath, const char* newpath) -> int;
 // Rename between already-resolved absolute backing paths without consulting
 // the current task's root or WKI routing policy.
 auto vfs_rename_resolved(const char* oldpath, const char* newpath) -> int;
+auto vfs_rename_resolved_beneath(const char* confinement_root, const char* oldpath, const char* newpath) -> int;
 // Unlink an already-resolved absolute backing path without consulting the
 // current task's root or WKI routing policy.
 auto vfs_unlink_resolved(const char* path) -> int;
+auto vfs_unlink_resolved_beneath(const char* confinement_root, const char* path, bool directory) -> int;
 auto vfs_renameat(ker::mod::sched::task::Task* task, int olddirfd, const char* oldpath, int newdirfd, const char* newpath) -> int;
 
 // Execute one uniform metadata operation over an already bounded item set.
@@ -207,6 +214,7 @@ auto vfs_chmod(const char* path, int mode) -> int;
 // Change permissions on an already-resolved absolute backing path without
 // consulting the current task's root or WKI routing policy.
 auto vfs_chmod_resolved(const char* path, int mode, bool follow_final_symlink) -> int;
+auto vfs_chmod_resolved_beneath(const char* confinement_root, const char* path, int mode, bool follow_final_symlink) -> int;
 auto vfs_fchmod(int fd, int mode) -> int;
 auto vfs_fchmodat(ker::mod::sched::task::Task* task, int dirfd, const char* pathname, int mode, int flags) -> int;
 auto vfs_chown(const char* path, uint32_t owner, uint32_t group) -> int;

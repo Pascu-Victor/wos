@@ -23,6 +23,8 @@ constexpr int O_EXCL = 0200;
 constexpr int O_TRUNC = 01000;
 // O_DIRECTORY: fail open unless the resolved path is a directory.
 constexpr int O_DIRECTORY = 0200000;
+// O_NOFOLLOW: reject a final symlink while still following intermediate links.
+constexpr int O_NOFOLLOW = 0400000;
 // O_APPEND: writes always go to end of file (Linux value)
 constexpr int O_APPEND = 02000;
 // O_NOTIFY_CACHE_CHANGE: reserve file-cache invalidation notifications for this open.
@@ -70,6 +72,10 @@ struct File {
     bool close_may_change_metadata = false;
     uint32_t mount_dev_id = 0;
     uint64_t mount_generation = 0;
+    // Namespace generation at which vfs_path named this opened object. A
+    // dirfd-relative consumer may publish cache hints under that historical
+    // text only while this still matches its retained lookup generation.
+    uint64_t vfs_path_namespace_generation = 0;
     // One ownership pin per File object, independent of descriptor-table
     // references. The backend close hook must finish before this pin is
     // released so mount-private data stays live through final close.

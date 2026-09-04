@@ -81,6 +81,10 @@ KTEST(WkiRemoteVfsUtimens, WirePathValidationRejectsEscapes) {
     KEXPECT_TRUE(ker::net::wki::wki_remote_vfs_selftest_utimens_wire_path_validation());
 }
 
+KTEST(WkiRemoteVfsLegacyScalar, RejectsUnsafeInexactAndOverflowingPaths) {
+    KEXPECT_TRUE(ker::net::wki::wki_remote_vfs_selftest_legacy_scalar_wire_path_admission());
+}
+
 KTEST(WkiRemoteVfsXattr, ReplayIdentityAndDataAreExact) { KEXPECT_TRUE(ker::net::wki::wki_remote_vfs_selftest_xattr_replay_fencing()); }
 
 KTEST(WkiRemoteVfsProxySlot, WaitersRemainFifo) { KEXPECT_TRUE(ker::net::wki::wki_remote_vfs_selftest_slot_waiter_fifo()); }

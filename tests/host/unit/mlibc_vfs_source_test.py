@@ -552,7 +552,7 @@ def test_utimensat_reaches_real_vfs_timestamp_updates() -> None:
 
     path_body = function_body(
         vfs_core,
-        r"auto\s+vfs_apply_utimens_to_resolved_path\(const\s+char\*\s+resolved_path,\s*const\s+Timespec\*\s+times,\s*bool\s+follow_final_symlink,\s*size_t\s+known_resolved_path_len\s*=\s*UNKNOWN_PATH_LEN,\s*bool\s+allow_remote_backend\s*=\s*true,\s*const\s+SymlinkResolvePolicy\*\s+resolve_policy\s*=\s*nullptr\)\s*->\s*int",
+        r"auto\s+vfs_apply_utimens_to_resolved_path\(const\s+char\*\s+resolved_path,\s*const\s+Timespec\*\s+times,\s*bool\s+follow_final_symlink,\s*size_t\s+known_resolved_path_len\s*=\s*UNKNOWN_PATH_LEN,\s*bool\s+allow_remote_backend\s*=\s*true,\s*const\s+SymlinkResolvePolicy\*\s+resolve_policy\s*=\s*nullptr,\s*bool\s+lookup_symlinks_resolved\s*=\s*false\)\s*->\s*int",
     )
     require_tokens(
         path_body,
@@ -564,7 +564,7 @@ def test_utimensat_reaches_real_vfs_timestamp_updates() -> None:
             "fs_path, resolved_times.atime, resolved_times.mtime",
             "case FSType::FAT32:",
             "changed = false;",
-            "if (!REMOTE_MOUNT)",
+            "if (!REMOTE_MOUNT && !lookup_symlinks_resolved)",
             "bool const RESOLVE_FINAL_SYMLINK = follow_final_symlink && !skip_final_symlink_probe;",
             "resolve_symlinks(path_buffer.data(), resolved_path.data()",
             "cache_notify_path_data_changed_impl(path_buffer.data(), mount->fs_type)",
@@ -581,11 +581,17 @@ def test_utimensat_reaches_real_vfs_timestamp_updates() -> None:
         [
             "constexpr int ALLOWED_FLAGS = AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH;",
             "return vfs_futimens(dirfd, times);",
-            "return vfs_apply_utimens_to_path(pathname, times, (flags & AT_SYMLINK_NOFOLLOW) == 0);",
-            "resolve_dirfd_task_path_raw_with_absolute_local_fast_path(task, dirfd, pathname, resolved.data(), resolved.size(), true",
-            "&resolved_len);",
+            "VfsResolvedTimes resolved_times{};",
+            "int const times_result = resolve_utimens_times(times, &resolved_times);",
+            "LookupHandle lookup{};",
+            "vfs_acquire_lookup(task, dirfd, pathname, LookupIntent::METADATA, policy, false, true, &lookup, 0)",
+            "ker::vfs::tmpfs::tmpfs_utimens_lookup(",
+            "ker::vfs::xfs::xfs_utimens_lookup(",
+            "lookup.mount()->fs_type == FSType::REMOTE ? consume_utimens(lookup, &context)",
+            "vfs_consume_lookup(lookup, false, consume_utimens, &context)",
+            "if (result != -EAGAIN || attempt == 3)",
         ],
-        "kernel vfs utimensat dirfd and empty-path handling",
+        "kernel vfs utimensat retained lookup, backend commit, and empty-path handling",
     )
 
     futimens_body = function_body(vfs_core, r"auto\s+vfs_futimens\(int\s+fd,\s*const\s+Timespec\*\s+times\)\s*->\s*int")
@@ -744,7 +750,7 @@ def test_open_create_uses_central_cache_notify_path() -> None:
     for pattern, context in [
         (r"auto\s+vfs_open_resolved_for_task\([^{}]*\)\s*->\s*int", "vfs_open_resolved_for_task"),
         (
-            r"static\s+auto\s+vfs_open_file_impl\(const\s+char\*\s+path,\s*int\s+flags,\s*int\s+mode,\s*bool\s+resolve_task_path,\s*bool\s+apply_task_policy\)\s*->\s*File\*",
+            r"static\s+auto\s+vfs_open_file_impl\(const\s+char\*\s+path,\s*int\s+flags,\s*int\s+mode,\s*bool\s+resolve_task_path,\s*bool\s+apply_task_policy,\s*bool\s+lookup_symlinks_resolved\s*=\s*false,\s*bool\s+namespace_already_locked\s*=\s*false\)\s*->\s*File\*",
             "vfs_open_file_impl",
         ),
     ]:
@@ -767,15 +773,26 @@ def test_open_create_uses_central_cache_notify_path() -> None:
         tmpfs,
         r"auto\s+tmpfs_open_path\(TmpNode\*\s+root,\s*const\s+char\*\s+path,\s*int\s+flags,\s*int\s+mode,\s*int\*\s+result_out\)\s*->\s*ker::vfs::File\*",
     )
+    tmpfs_open_node = function_body(
+        tmpfs,
+        r"auto\s+tmpfs_open_node_locked\(TmpNode\*\s+entry,\s*int\s+flags,\s*bool\s+require_directory,\s*bool\s+created_by_open,\s*int\*\s+result_out\)\s*->\s*ker::vfs::File\*",
+    )
     require_tokens(
         tmpfs_open,
         [
             "bool created_by_open = false;",
             "created_by_open = node != nullptr;",
-            "f->open_create_result_known = (flags & O_CREAT) != 0;",
-            "f->created_by_open = created_by_open;",
+            "tmpfs_open_node_locked(node, flags, false, created_by_open, result_out)",
         ],
-        "tmpfs open-create result hints",
+        "tmpfs compatibility open-create result production",
+    )
+    require_tokens(
+        tmpfs_open_node,
+        [
+            "file->open_create_result_known = (flags & O_CREAT) != 0;",
+            "file->created_by_open = created_by_open;",
+        ],
+        "tmpfs shared retained-node open-create result hints",
     )
 
 
@@ -801,13 +818,13 @@ def test_tmpfs_permission_denied_open_runs_close_hook() -> None:
 
     tmpfs_open = function_body(
         tmpfs,
-        r"auto\s+tmpfs_open_path\(TmpNode\*\s+root,\s*const\s+char\*\s+path,\s*int\s+flags,\s*int\s+mode,\s*int\*\s+result_out\)\s*->\s*ker::vfs::File\*",
+        r"auto\s+tmpfs_open_node_locked\(TmpNode\*\s+entry,\s*int\s+flags,\s*bool\s+require_directory,\s*bool\s+created_by_open,\s*int\*\s+result_out\)\s*->\s*ker::vfs::File\*",
     )
     tmpfs_close = function_body(tmpfs, r"auto\s+tmpfs_fops_close\(ker::vfs::File\*\s+f\)\s*->\s*int")
     require_tokens(
         tmpfs_open,
-        ["node->open_count.fetch_add(1, std::memory_order_relaxed)"],
-        "tmpfs open count increment",
+        ["NODE->open_count.fetch_add(1, std::memory_order_relaxed)"],
+        "tmpfs retained canonical-node open count increment",
     )
     require_tokens(
         tmpfs_close,
@@ -835,6 +852,10 @@ def test_open_exclusive_create_reports_existing_paths() -> None:
         tmpfs,
         r"auto\s+tmpfs_open_path\(TmpNode\*\s+root,\s*const\s+char\*\s+path,\s*int\s+flags,\s*int\s+mode,\s*int\*\s+result_out\)\s*->\s*ker::vfs::File\*",
     )
+    tmpfs_open_node = function_body(
+        tmpfs,
+        r"auto\s+tmpfs_open_node_locked\(TmpNode\*\s+entry,\s*int\s+flags,\s*bool\s+require_directory,\s*bool\s+created_by_open,\s*int\*\s+result_out\)\s*->\s*ker::vfs::File\*",
+    )
     require_order(
         tmpfs_open,
         [
@@ -842,9 +863,18 @@ def test_open_exclusive_create_reports_existing_paths() -> None:
             "node != nullptr && !created_by_open && (flags & (O_CREAT | O_EXCL)) == (O_CREAT | O_EXCL)",
             "tmpfs_lock.unlock();",
             "tmpfs_set_open_result(result_out, -EEXIST);",
-            "TmpNode* file_node = tmpfs_canonical_node(node);",
+            "tmpfs_open_node_locked(node, flags, false, created_by_open, result_out)",
         ],
         "tmpfs atomic exclusive create",
+    )
+    require_order(
+        tmpfs_open_node,
+        [
+            "TmpNode* const NODE = tmpfs_canonical_node(entry);",
+            "NODE->open_count.fetch_add(1, std::memory_order_relaxed);",
+            "file->private_data = NODE;",
+        ],
+        "tmpfs exclusive open publishes the validated canonical node",
     )
 
 

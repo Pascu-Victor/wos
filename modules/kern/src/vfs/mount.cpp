@@ -731,6 +731,14 @@ auto destroy_mount(MountPoint* mount, bool force = false) -> int {
     return 0;
 }
 
+struct PreparedMountState {
+    MountPoint* mount{};
+    MountInitializationReservation reservation{};
+    uint64_t pivot_epoch{};
+    size_t mount_count_after_insert{};
+    bool published{};
+};
+
 void wait_for_mount_refs_to_drain(MountPoint* mount) {
     if (mount == nullptr) {
         return;
@@ -913,6 +921,13 @@ void put_mount_point(MountPoint* mount) {
     }
 }
 
+auto retain_mount_point(MountPoint* mount) -> MountRef {
+    mount_lock.lock();
+    MountPoint* const RETAINED = mount_index_locked(mount) != MOUNT_INDEX_NONE && retain_mount_locked(mount) ? mount : nullptr;
+    mount_lock.unlock();
+    return MountRef{RETAINED};
+}
+
 auto retain_mount_for_open_file(MountPoint* mount) -> bool {
     if (mount == nullptr) {
         return false;
@@ -1079,10 +1094,10 @@ auto mounted_block_device_overlaps(const ker::dev::BlockDevice* device) -> bool 
     }
 }
 
-auto mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevice* device, unsigned long flags, const char* data,
-                      void* initial_private_data, FileOperations* initial_fops) -> int {
+auto prepare_mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevice* device, unsigned long flags, const char* data,
+                              void* initial_private_data, FileOperations* initial_fops, PreparedMount* out) -> int {
     (void)flags;
-    if (path == nullptr || fstype == nullptr) {
+    if (path == nullptr || fstype == nullptr || out == nullptr || out->state != nullptr) {
         vfs_debug_log("mount_filesystem: invalid arguments\n");
         return -EINVAL;
     }
@@ -1117,23 +1132,36 @@ auto mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevic
     }
     mount_lock.unlock();
 
-    auto* mount = new MountPoint;
+    auto* state = new (std::nothrow) PreparedMountState;
+    if (state == nullptr) {
+        return -ENOMEM;
+    }
+    auto* mount = new (std::nothrow) MountPoint;
+    if (mount == nullptr) {
+        delete state;
+        return -ENOMEM;
+    }
+    state->mount = mount;
+    state->pivot_epoch = PIVOT_EPOCH;
 
     // Copy resolved path and fstype into kernel heap.
     size_t const PATH_LEN = std::strlen(resolved.data());
     auto* path_copy = new char[PATH_LEN + 1];
     if (path_copy == nullptr) {
         static_cast<void>(destroy_mount(mount, true));
+        state->mount = nullptr;
+        delete state;
         return -ENOMEM;
     }
     std::memcpy(path_copy, resolved.data(), PATH_LEN + 1);
     mount->path = path_copy;
     mount->path_len = PATH_LEN;
 
-    MountInitializationReservation initialization_reservation;
-    int const RESERVATION_RET = initialization_reservation.acquire(mount->path, PIVOT_EPOCH);
+    int const RESERVATION_RET = state->reservation.acquire(mount->path, PIVOT_EPOCH);
     if (RESERVATION_RET != 0) {
         static_cast<void>(destroy_mount(mount, true));
+        state->mount = nullptr;
+        delete state;
         return RESERVATION_RET;
     }
 
@@ -1141,6 +1169,8 @@ auto mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevic
     auto* fstype_copy = new char[FSTYPE_LEN + 1];
     if (fstype_copy == nullptr) {
         static_cast<void>(destroy_mount(mount, true));
+        state->mount = nullptr;
+        delete state;
         return -ENOMEM;
     }
     std::memcpy(fstype_copy, fstype, FSTYPE_LEN + 1);
@@ -1157,6 +1187,8 @@ auto mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevic
         !mount->block_writer_lease.try_acquire(device, ker::dev::BlockWriterLeaseOwner::LOCAL_MOUNT)) {
         vfs_debug_log("mount_filesystem: block device has a remote writer lease\n");
         static_cast<void>(destroy_mount(mount, true));
+        state->mount = nullptr;
+        delete state;
         return -EBUSY;
     }
 
@@ -1166,6 +1198,8 @@ auto mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevic
         if (device == nullptr) {
             vfs_debug_log("mount_filesystem: FAT32 requires a block device\n");
             static_cast<void>(destroy_mount(mount, true));
+            state->mount = nullptr;
+            delete state;
             return -EINVAL;
         }
 
@@ -1188,6 +1222,8 @@ auto mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevic
         if (context == nullptr) {
             vfs_debug_log("mount_filesystem: FAT32 initialization failed\n");
             static_cast<void>(destroy_mount(mount, true));
+            state->mount = nullptr;
+            delete state;
             return -EIO;
         }
 
@@ -1207,6 +1243,8 @@ auto mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevic
                 ker::vfs::tmpfs::tmpfs_free_node(root);
             }
             static_cast<void>(destroy_mount(mount, true));
+            state->mount = nullptr;
+            delete state;
             return tmpfs_error != 0 ? tmpfs_error : -ENOMEM;
         }
         mount->fops = ker::vfs::tmpfs::get_tmpfs_fops();
@@ -1226,12 +1264,16 @@ auto mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevic
         if (device == nullptr) {
             vfs_debug_log("mount_filesystem: XFS requires a block device\n");
             static_cast<void>(destroy_mount(mount, true));
+            state->mount = nullptr;
+            delete state;
             return -EINVAL;
         }
         auto* xfs_ctx = ker::vfs::xfs::xfs_vfs_init_device(device);
         if (xfs_ctx == nullptr) {
             vfs_debug_log("mount_filesystem: XFS initialization failed\n");
             static_cast<void>(destroy_mount(mount, true));
+            state->mount = nullptr;
+            delete state;
             return -EIO;
         }
         mount->private_data = xfs_ctx;
@@ -1239,59 +1281,103 @@ auto mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevic
     } else {
         vfs_debug_log("mount_filesystem: unknown filesystem type\n");
         static_cast<void>(destroy_mount(mount, true));
+        state->mount = nullptr;
+        delete state;
         return -ENODEV;
     }
 
-    size_t mount_count_after_insert = 0;
+    out->state = state;
+    return 0;
+}
+
+auto publish_prepared_mount(PreparedMount* prepared) -> int {
+    if (prepared == nullptr || prepared->state == nullptr) {
+        return -EINVAL;
+    }
+    auto* state = static_cast<PreparedMountState*>(prepared->state);
+    MountPoint* const mount = state->mount;
+    if (mount == nullptr || state->published) {
+        return -EINVAL;
+    }
+
     mount_lock.lock();
-    if (mount_pivot_epoch.load(std::memory_order_acquire) != PIVOT_EPOCH) {
+    if (mount_pivot_epoch.load(std::memory_order_acquire) != state->pivot_epoch) {
         mount_lock.unlock();
         vfs_debug_log("mount_filesystem: pivot namespace changed before publication\n");
-        static_cast<void>(destroy_mount(mount, true));
         return -EBUSY;
     }
-    if (!initialization_reservation.active_locked() || mount_path_occupied_locked(mount->path)) {
+    if (!state->reservation.active_locked() || mount_path_occupied_locked(mount->path)) {
         mount_lock.unlock();
         vfs_debug_log("mount_filesystem: mount path already occupied before publication\n");
-        static_cast<void>(destroy_mount(mount, true));
         return -EBUSY;
     }
     if (!mounts.push_back(mount)) {
         mount_lock.unlock();
         vfs_debug_log("mount_filesystem: mount table full (OOM)\n");
-        static_cast<void>(destroy_mount(mount, true));
         return -ENOMEM;
     }
     mount->dev_id = next_dev_id++;
     if (mount->fs_type == FSType::XFS && mount->private_data != nullptr) {
         static_cast<ker::vfs::xfs::XfsMountContext*>(mount->private_data)->dev_id = mount->dev_id;
     }
-    initialization_reservation.commit_locked();
+    state->reservation.commit_locked();
     bump_mount_generation_locked();
-    mount_count_after_insert = mounts.size();
+    state->mount_count_after_insert = mounts.size();
+    state->published = true;
     mount_lock.unlock();
-
-    vfs_debug_log("mount_filesystem: mounted ");
-    vfs_debug_log(fstype);
-    vfs_debug_log(" at ");
-    vfs_debug_log(path);
-    vfs_debug_log("\n");
-
-    ker::mod::perf::record_container_stat(0, 0, ker::mod::perf::PerfSubsystem::MOUNT_TABLE, 0, ker::mod::perf::PERF_FLAG_CT_INSERT,
-                                          static_cast<int64_t>(mount_count_after_insert), 0, 0);
-
-    // Emit WKI storage mount event (if WKI is active)
-    if (ker::net::wki::g_wki.initialized) {
-        ker::net::wki::wki_event_publish(ker::net::wki::EVENT_CLASS_STORAGE, ker::net::wki::EVENT_STORAGE_MOUNT, path,
-                                         static_cast<uint16_t>(std::strlen(path) + 1));
-        ker::net::wki::wki_resource_advertise_all();
-    }
 
     return 0;
 }
 
+void finish_prepared_mount(PreparedMount* prepared) {
+    if (prepared == nullptr || prepared->state == nullptr) {
+        return;
+    }
+    auto* state = static_cast<PreparedMountState*>(prepared->state);
+    prepared->state = nullptr;
+    MountPoint* const mount = state->mount;
+    if (!state->published) {
+        static_cast<void>(destroy_mount(mount, true));
+        state->mount = nullptr;
+        delete state;
+        return;
+    }
+
+    vfs_debug_log("mount_filesystem: mounted ");
+    vfs_debug_log(mount->fstype);
+    vfs_debug_log(" at ");
+    vfs_debug_log(mount->path);
+    vfs_debug_log("\n");
+
+    ker::mod::perf::record_container_stat(0, 0, ker::mod::perf::PerfSubsystem::MOUNT_TABLE, 0, ker::mod::perf::PERF_FLAG_CT_INSERT,
+                                          static_cast<int64_t>(state->mount_count_after_insert), 0, 0);
+
+    // Emit WKI storage mount event (if WKI is active)
+    if (ker::net::wki::g_wki.initialized) {
+        ker::net::wki::wki_event_publish(ker::net::wki::EVENT_CLASS_STORAGE, ker::net::wki::EVENT_STORAGE_MOUNT, mount->path,
+                                         static_cast<uint16_t>(mount->path_len + 1));
+        ker::net::wki::wki_resource_advertise_all();
+    }
+
+    state->mount = nullptr;
+    delete state;
+}
+
+auto mount_filesystem(const char* path, const char* fstype, ker::dev::BlockDevice* device, unsigned long flags, const char* data,
+                      void* initial_private_data, FileOperations* initial_fops) -> int {
+    PreparedMount prepared{};
+    int const PREPARE = prepare_mount_filesystem(path, fstype, device, flags, data, initial_private_data, initial_fops, &prepared);
+    if (PREPARE != 0) {
+        return PREPARE;
+    }
+    int const PUBLISH = publish_prepared_mount(&prepared);
+    finish_prepared_mount(&prepared);
+    return PUBLISH;
+}
+
 namespace {
-auto unmount_filesystem_impl(const char* path, const void* expected_private_data, bool require_private_data_match) -> int {
+auto unmount_filesystem_impl(const char* path, const void* expected_private_data, bool require_private_data_match,
+                             uint32_t expected_dev_id = 0, bool require_dev_id_match = false) -> int {
     if (path == nullptr) {
         return -EINVAL;
     }
@@ -1318,7 +1404,8 @@ auto unmount_filesystem_impl(const char* path, const void* expected_private_data
             MountPoint* mp = mounts.at(i);
             bool const PATH_MATCHES = mp != nullptr && mp->path != nullptr && std::strcmp(resolved.data(), mp->path) == 0;
             bool const OWNER_MATCHES = !require_private_data_match || (mp != nullptr && mp->private_data == expected_private_data);
-            if (!PATH_MATCHES || !OWNER_MATCHES) {
+            bool const DEV_ID_MATCHES = !require_dev_id_match || (mp != nullptr && mp->dev_id == expected_dev_id);
+            if (!PATH_MATCHES || !OWNER_MATCHES || !DEV_ID_MATCHES) {
                 continue;
             }
             if (mp->retiring.load(std::memory_order_acquire)) {
@@ -1366,6 +1453,13 @@ auto unmount_filesystem_if_private_data(const char* path, const void* expected_p
         return -EINVAL;
     }
     return unmount_filesystem_impl(path, expected_private_data, true);
+}
+
+auto unmount_filesystem_if_dev_id(const char* path, uint32_t expected_dev_id) -> int {
+    if (expected_dev_id == 0) {
+        return -EINVAL;
+    }
+    return unmount_filesystem_impl(path, nullptr, false, expected_dev_id, true);
 }
 
 auto unmount_filesystem_by_private_data(const void* expected_private_data) -> int {

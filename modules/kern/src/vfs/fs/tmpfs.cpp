@@ -18,8 +18,8 @@
 #include <platform/mm/swap.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sys/mutex.hpp>
-#include <platform/sys/spinlock.hpp>
 #include <util/smallvec.hpp>
+#include <utility>
 #include <vfs/file.hpp>
 #include <vfs/stat.hpp>
 
@@ -74,14 +74,16 @@ constexpr uint64_t NS_PER_SEC = 1000000000ULL;
 
 namespace {
 TmpNode* root_node = nullptr;                   // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-ker::mod::sys::Spinlock tmpfs_lock;             // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+ker::mod::sys::Mutex tmpfs_lock;                // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 ker::mod::sys::Mutex tmpfs_node_registry_lock;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 ker::util::SmallVec<TmpNode*, 64> tmpfs_nodes;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 std::atomic<uint64_t> tmpfs_resident_pages{0};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 std::atomic<uint64_t> tmpfs_reclaim_node_cursor{0};
 std::atomic<bool> tmpfs_shrinker_registered{false};
 std::atomic<bool> tmpfs_swap_consumer_registered{false};
-uint64_t tmpfs_node_registry_generation{};  // Guarded by tmpfs_node_registry_lock.
+uint64_t tmpfs_node_registry_generation{};                  // Guarded by tmpfs_node_registry_lock.
+std::atomic<uint64_t> tmpfs_next_node_incarnation{1};       // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::atomic<uint64_t> tmpfs_namespace_generation_value{1};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 }  // namespace
 
 // --- Internal helpers ---
@@ -103,6 +105,14 @@ void stamp_new_node(TmpNode* node) {
     node->atime = NOW;
     node->mtime = NOW;
     node->ctime = NOW;
+}
+
+void assign_node_incarnation(TmpNode* node) {
+    if (node == nullptr) {
+        return;
+    }
+    node->incarnation = tmpfs_next_node_incarnation.fetch_add(1, std::memory_order_relaxed);
+    node->directory_generation = 1;
 }
 
 void touch_modified(TmpNode* node) {
@@ -677,6 +687,9 @@ void add_child(TmpNode* parent, TmpNode* child) {
     }
     parent->children_live_count++;
     child->parent = parent;
+    child->unlinked = false;
+    parent->directory_generation++;
+    tmpfs_namespace_generation_value.fetch_add(1, std::memory_order_release);
     touch_modified(parent);
 }
 
@@ -776,6 +789,7 @@ auto create_root_node_internal() -> TmpNode* {
     copy_name(node->name, "/");
     node->type = TmpNodeType::DIRECTORY;
     node->mode = 0755;
+    assign_node_incarnation(node);
     stamp_new_node(node);
     register_tmp_node(node);
     return node;
@@ -784,6 +798,10 @@ auto create_root_node_internal() -> TmpNode* {
 
 void tmpfs_free_node(TmpNode* node) {
     if (node == nullptr) {
+        return;
+    }
+    if (node->lookup_ref_count.load(std::memory_order_acquire) != 0) {
+        node->unlinked = true;
         return;
     }
     ker::mod::sys::MutexGuard guard(node->io_lock);
@@ -850,6 +868,7 @@ auto tmpfs_mkdir(TmpNode* parent, const char* name) -> TmpNode* {
     node->type = TmpNodeType::DIRECTORY;
     node->mount = parent->mount;
     node->mode = 0755;
+    assign_node_incarnation(node);
     stamp_new_node(node);
     register_tmp_node(node);
     add_child(parent, node);
@@ -869,6 +888,7 @@ auto tmpfs_create_file(TmpNode* parent, const char* name, uint32_t create_mode) 
     node->type = TmpNodeType::FILE;
     node->mount = parent->mount;
     node->mode = create_mode & 07777;
+    assign_node_incarnation(node);
     stamp_new_node(node);
     register_tmp_node(node);
     add_child(parent, node);
@@ -888,6 +908,7 @@ auto tmpfs_create_symlink(TmpNode* parent, const char* name, const char* target)
     node->type = TmpNodeType::SYMLINK;
     node->mount = parent->mount;
     node->mode = 0777;
+    assign_node_incarnation(node);
     stamp_new_node(node);
     // Allocate and copy the symlink target
     size_t target_len = 0;
@@ -927,6 +948,7 @@ auto tmpfs_create_hardlink(TmpNode* parent, const char* name, TmpNode* target) -
     node->mtime = canonical->mtime;
     node->ctime = canonical->ctime;
     node->hardlink_target = canonical;
+    assign_node_incarnation(node);
     node->link_count.store(0, std::memory_order_relaxed);
 
     register_tmp_node(node);
@@ -959,6 +981,9 @@ auto tmpfs_detach_child(TmpNode* parent, TmpNode* child) -> bool {
             parent->children_live_count--;
         }
         child->parent = nullptr;
+        parent->directory_generation++;
+        tmpfs_namespace_generation_value.fetch_add(1, std::memory_order_release);
+        touch_modified(parent);
 
         if (parent->open_count.load(std::memory_order_acquire) == 0) {
             while (parent->children_count > 0 && parent->children[parent->children_count - 1] == nullptr) {
@@ -983,13 +1008,15 @@ void tmpfs_drop_detached_node(TmpNode* node) {
         last_link = PREV <= 1;
     }
 
+    node->unlinked = true;
     if (node != canonical) {
         tmpfs_free_node(node);
     }
 
     if (canonical != nullptr && last_link) {
         canonical->unlinked = true;
-        if (canonical->open_count.load(std::memory_order_acquire) == 0) {
+        if (canonical->open_count.load(std::memory_order_acquire) == 0 &&
+            canonical->lookup_ref_count.load(std::memory_order_acquire) == 0) {
             tmpfs_free_node(canonical);
         }
     }
@@ -997,6 +1024,665 @@ void tmpfs_drop_detached_node(TmpNode* node) {
 
 auto tmpfs_directory_is_empty(const TmpNode* dir) -> bool {
     return dir != nullptr && dir->type == TmpNodeType::DIRECTORY && dir->children_live_count == 0;
+}
+
+namespace {
+void tmpfs_retain_node_locked(TmpNode* node) {
+    if (node != nullptr) {
+        node->lookup_ref_count.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+auto tmpfs_node_can_be_freed_locked(const TmpNode* node) -> bool {
+    if (node == nullptr || !node->unlinked || node->open_count.load(std::memory_order_acquire) != 0 ||
+        node->lookup_ref_count.load(std::memory_order_acquire) != 0) {
+        return false;
+    }
+    if (node->type == TmpNodeType::DIRECTORY || node->hardlink_target != nullptr) {
+        return true;
+    }
+    return node->link_count.load(std::memory_order_acquire) == 0;
+}
+
+void tmpfs_release_node_ref_locked(TmpNode* node) {
+    if (node == nullptr) {
+        return;
+    }
+    uint32_t const PREV = node->lookup_ref_count.fetch_sub(1, std::memory_order_acq_rel);
+    if (PREV == 1 && tmpfs_node_can_be_freed_locked(node)) {
+        tmpfs_free_node(node);
+    }
+}
+
+}  // namespace
+
+auto TmpfsNodeRef::acquire_locked(TmpNode* node) -> TmpfsNodeRef {
+    if (node == nullptr) {
+        return {};
+    }
+    TmpNode* canonical = tmpfs_canonical_node(node);
+    tmpfs_retain_node_locked(node);
+    if (canonical != node) {
+        tmpfs_retain_node_locked(canonical);
+    }
+    return {node, canonical};
+}
+
+TmpfsNodeRef::TmpfsNodeRef(TmpfsNodeRef&& other) noexcept : node_(other.node_), canonical_(other.canonical_) {
+    other.node_ = nullptr;
+    other.canonical_ = nullptr;
+}
+
+auto TmpfsNodeRef::operator=(TmpfsNodeRef&& other) noexcept -> TmpfsNodeRef& {
+    if (this != &other) {
+        reset();
+        node_ = other.node_;
+        canonical_ = other.canonical_;
+        other.node_ = nullptr;
+        other.canonical_ = nullptr;
+    }
+    return *this;
+}
+
+TmpfsNodeRef::~TmpfsNodeRef() { reset(); }
+
+void TmpfsNodeRef::reset() {
+    if (node_ == nullptr) {
+        return;
+    }
+    ker::mod::sys::MutexGuard guard(tmpfs_lock);
+    TmpNode* const NODE = node_;
+    TmpNode* const CANONICAL = canonical_;
+    node_ = nullptr;
+    canonical_ = nullptr;
+    tmpfs_release_node_ref_locked(NODE);
+    if (CANONICAL != NODE) {
+        tmpfs_release_node_ref_locked(CANONICAL);
+    }
+}
+
+auto tmpfs_acquire_node(TmpNode* node) -> TmpfsNodeRef {
+    ker::mod::sys::MutexGuard guard(tmpfs_lock);
+    return TmpfsNodeRef::acquire_locked(node);
+}
+
+auto tmpfs_acquire_lookup(TmpNode* root, const char* path, TmpfsLookupHandle* out) -> int {
+    if (root == nullptr || path == nullptr || out == nullptr) {
+        return -EINVAL;
+    }
+
+    *out = TmpfsLookupHandle{};
+    TmpfsLookupHandle result{};
+    ker::mod::sys::MutexGuard guard(tmpfs_lock);
+    constexpr size_t LOOKUP_PATH_CAPACITY = 512;
+    constexpr unsigned MAX_LOOKUP_SYMLINKS = 8;
+    std::array<char, LOOKUP_PATH_CAPACITY> pending{};
+    size_t input_length = 0;
+    while (path[input_length] != '\0') {
+        if (input_length >= pending.size() - 1) {
+            return -ENAMETOOLONG;
+        }
+        pending.at(input_length) = path[input_length];
+        ++input_length;
+    }
+    pending.at(input_length) = '\0';
+
+    TmpNode* current = root;
+    const char* cursor = pending.data();
+    unsigned symlink_depth = 0;
+    while (*cursor == '/') {
+        ++cursor;
+    }
+    if (*cursor == '\0') {
+        result.parent_ = TmpfsNodeRef::acquire_locked(root);
+        result.target_ = TmpfsNodeRef::acquire_locked(root);
+        result.parent_incarnation_ = root->incarnation;
+        result.parent_generation_ = root->directory_generation;
+        result.namespace_generation_ = tmpfs_namespace_generation_locked();
+        result.target_incarnation_ = root->incarnation;
+        result.target_existed_ = true;
+        result.root_target_ = true;
+        *out = std::move(result);
+        return 0;
+    }
+
+    for (;;) {
+        std::array<char, TMPFS_NAME_MAX> component{};
+        size_t component_len = 0;
+        while (cursor[component_len] != '\0' && cursor[component_len] != '/') {
+            if (component_len >= component.size() - 1) {
+                return -ENAMETOOLONG;
+            }
+            component.at(component_len) = cursor[component_len];
+            ++component_len;
+        }
+        component.at(component_len) = '\0';
+        cursor += component_len;
+        while (*cursor == '/') {
+            ++cursor;
+        }
+
+        bool const FINAL_COMPONENT = *cursor == '\0';
+        if (FINAL_COMPONENT) {
+            if (current->type != TmpNodeType::DIRECTORY) {
+                return -ENOTDIR;
+            }
+            TmpNode* target = tmpfs_lookup(current, component.data());
+            result.parent_ = TmpfsNodeRef::acquire_locked(current);
+            result.target_ = TmpfsNodeRef::acquire_locked(target);
+            result.name_ = component;
+            result.parent_incarnation_ = current->incarnation;
+            result.parent_generation_ = current->directory_generation;
+            result.namespace_generation_ = tmpfs_namespace_generation_locked();
+            result.target_incarnation_ = target != nullptr ? target->incarnation : 0;
+            result.target_existed_ = target != nullptr;
+            *out = std::move(result);
+            return 0;
+        }
+
+        if (kstrcmp(component.data(), ".") == 0) {
+            continue;
+        }
+        if (kstrcmp(component.data(), "..") == 0) {
+            if (current->parent != nullptr) {
+                current = current->parent;
+            }
+            continue;
+        }
+        if (current->type != TmpNodeType::DIRECTORY) {
+            return -ENOTDIR;
+        }
+        TmpNode* child = tmpfs_lookup(current, component.data());
+        if (child == nullptr) {
+            return -ENOENT;
+        }
+        TmpNode* const CANONICAL_CHILD = tmpfs_canonical_node(child);
+        if (CANONICAL_CHILD != nullptr && CANONICAL_CHILD->type == TmpNodeType::SYMLINK) {
+            if (CANONICAL_CHILD->symlink_target == nullptr || CANONICAL_CHILD->symlink_target[0] == '\0') {
+                return -ENOENT;
+            }
+            if (symlink_depth == MAX_LOOKUP_SYMLINKS) {
+                return -ELOOP;
+            }
+            ++symlink_depth;
+
+            size_t target_length = 0;
+            while (CANONICAL_CHILD->symlink_target[target_length] != '\0') {
+                ++target_length;
+            }
+            size_t const REST_LENGTH = std::strlen(cursor);
+            bool const NEED_SEPARATOR = target_length != 0 && REST_LENGTH != 0 && CANONICAL_CHILD->symlink_target[target_length - 1] != '/';
+            if (target_length + (NEED_SEPARATOR ? 1 : 0) + REST_LENGTH >= pending.size()) {
+                return -ENAMETOOLONG;
+            }
+            std::array<char, LOOKUP_PATH_CAPACITY> replacement{};
+            std::memcpy(replacement.data(), CANONICAL_CHILD->symlink_target, target_length);
+            size_t replacement_length = target_length;
+            if (NEED_SEPARATOR) {
+                replacement.at(replacement_length++) = '/';
+            }
+            if (REST_LENGTH != 0) {
+                std::memcpy(replacement.data() + replacement_length, cursor, REST_LENGTH);
+                replacement_length += REST_LENGTH;
+            }
+            replacement.at(replacement_length) = '\0';
+            bool const ABSOLUTE_TARGET = replacement.front() == '/';
+            pending = replacement;
+            cursor = pending.data();
+            if (ABSOLUTE_TARGET) {
+                current = root->mount != nullptr && root->mount->root != nullptr ? root->mount->root : root;
+            }
+            while (*cursor == '/') {
+                ++cursor;
+            }
+            continue;
+        }
+        current = child;
+    }
+}
+
+auto tmpfs_validate_lookup_locked(const TmpfsLookupHandle& handle) -> bool {
+    TmpNode* const PARENT = handle.parent_.get();
+    if (PARENT == nullptr || PARENT->type != TmpNodeType::DIRECTORY || PARENT->unlinked ||
+        PARENT->incarnation != handle.parent_incarnation_ || PARENT->directory_generation != handle.parent_generation_ ||
+        tmpfs_namespace_generation_locked() != handle.namespace_generation_) {
+        return false;
+    }
+    if (handle.root_target_) {
+        TmpNode* const TARGET = handle.target_.get();
+        return TARGET == PARENT && TARGET->incarnation == handle.target_incarnation_ && TARGET->parent == nullptr;
+    }
+    TmpNode* const CURRENT = tmpfs_lookup(PARENT, handle.name_.data());
+    if (!handle.target_existed_) {
+        return CURRENT == nullptr;
+    }
+    return CURRENT == handle.target_.get() && CURRENT != nullptr && CURRENT->incarnation == handle.target_incarnation_;
+}
+
+auto tmpfs_validate_lookup(const TmpfsLookupHandle& handle) -> bool {
+    ker::mod::sys::MutexGuard guard(tmpfs_lock);
+    return tmpfs_validate_lookup_locked(handle);
+}
+
+auto tmpfs_namespace_generation_locked() -> uint64_t { return tmpfs_namespace_generation_value.load(std::memory_order_acquire); }
+
+auto tmpfs_namespace_generation() -> uint64_t {
+    ker::mod::sys::MutexGuard guard(tmpfs_lock);
+    return tmpfs_namespace_generation_locked();
+}
+
+namespace {
+
+auto tmpfs_lookup_target_locked(const TmpfsLookupHandle& handle, TmpNode** entry_out, TmpNode** canonical_out) -> int {
+    if (!tmpfs_validate_lookup_locked(handle)) {
+        return -EAGAIN;
+    }
+    TmpNode* const ENTRY = handle.target();
+    if (!handle.target_existed() || ENTRY == nullptr) {
+        return -ENOENT;
+    }
+    TmpNode* const CANONICAL = tmpfs_canonical_node(ENTRY);
+    if (CANONICAL == nullptr) {
+        return -ENOENT;
+    }
+    if (entry_out != nullptr) {
+        *entry_out = ENTRY;
+    }
+    if (canonical_out != nullptr) {
+        *canonical_out = CANONICAL;
+    }
+    return 0;
+}
+
+void tmpfs_fill_metadata_locked(const TmpNode* node, TmpfsObjectMetadata* out) {
+    if (out == nullptr) {
+        return;
+    }
+    auto const* canonical = tmpfs_canonical_node(node);
+    if (canonical == nullptr) {
+        *out = {};
+        return;
+    }
+    *out = {
+        .type = canonical->type,
+        .inode = reinterpret_cast<uintptr_t>(canonical),
+        .size = canonical->size,
+        .link_count = tmpfs_link_count(canonical),
+        .mode = canonical->mode,
+        .uid = canonical->uid,
+        .gid = canonical->gid,
+        .atime = canonical->atime,
+        .mtime = canonical->mtime,
+        .ctime = canonical->ctime,
+    };
+}
+
+void tmpfs_metadata_to_stat_impl(const TmpfsObjectMetadata& metadata, uint32_t dev_id, Stat* out) {
+    if (out == nullptr) {
+        return;
+    }
+    std::memset(out, 0, sizeof(*out));
+    out->st_dev = dev_id;
+    out->st_ino = static_cast<ino_t>(metadata.inode);
+    out->st_nlink = metadata.link_count;
+    out->st_uid = metadata.uid;
+    out->st_gid = metadata.gid;
+    out->st_size = static_cast<off_t>(metadata.size);
+    out->st_blksize = DEFAULT_TMPFS_BLOCK_SIZE;
+    out->st_blocks = static_cast<blkcnt_t>((metadata.size + 511) / 512);
+    out->st_atim = metadata.atime;
+    out->st_mtim = metadata.mtime;
+    out->st_ctim = metadata.ctime;
+    switch (metadata.type) {
+        case TmpNodeType::FILE:
+            out->st_mode = S_IFREG | metadata.mode;
+            break;
+        case TmpNodeType::DIRECTORY:
+            out->st_mode = S_IFDIR | metadata.mode;
+            break;
+        case TmpNodeType::SYMLINK:
+            out->st_mode = S_IFLNK | metadata.mode;
+            break;
+    }
+}
+
+void tmpfs_fill_stat_locked(const TmpNode* node, uint32_t dev_id, Stat* out) {
+    TmpfsObjectMetadata metadata{};
+    tmpfs_fill_metadata_locked(node, &metadata);
+    tmpfs_metadata_to_stat_impl(metadata, dev_id, out);
+}
+
+auto tmpfs_lookup_precedes(const TmpfsLookupHandle& left, const TmpfsLookupHandle& right) -> bool {
+    if (left.parent_incarnation() != right.parent_incarnation()) {
+        return left.parent_incarnation() < right.parent_incarnation();
+    }
+    return kstrcmp(left.name(), right.name()) <= 0;
+}
+
+auto tmpfs_validate_pair_locked(const TmpfsLookupHandle& left, const TmpfsLookupHandle& right) -> bool {
+    if (tmpfs_lookup_precedes(left, right)) {
+        return tmpfs_validate_lookup_locked(left) && tmpfs_validate_lookup_locked(right);
+    }
+    return tmpfs_validate_lookup_locked(right) && tmpfs_validate_lookup_locked(left);
+}
+
+auto tmpfs_tree_root_locked(TmpNode* node) -> TmpNode* {
+    for (size_t depth = 0; node != nullptr && node->parent != nullptr && depth < 1024; ++depth) {
+        node = node->parent;
+    }
+    return node != nullptr && node->parent == nullptr ? node : nullptr;
+}
+
+auto tmpfs_same_tree_locked(TmpNode* left, TmpNode* right) -> bool {
+    return tmpfs_tree_root_locked(left) != nullptr && tmpfs_tree_root_locked(left) == tmpfs_tree_root_locked(right);
+}
+
+}  // namespace
+
+void tmpfs_metadata_to_stat(const TmpfsObjectMetadata& metadata, uint32_t dev_id, Stat* out) {
+    tmpfs_metadata_to_stat_impl(metadata, dev_id, out);
+}
+
+auto tmpfs_lookup_metadata(const TmpfsLookupHandle& handle, bool require_directory, TmpfsObjectMetadata* out) -> int {
+    if (out == nullptr) {
+        return -EINVAL;
+    }
+    ker::mod::sys::MutexGuard guard(tmpfs_lock);
+    TmpNode* canonical = nullptr;
+    int const RET = tmpfs_lookup_target_locked(handle, nullptr, &canonical);
+    if (RET < 0) {
+        return RET;
+    }
+    if (require_directory && canonical->type != TmpNodeType::DIRECTORY) {
+        return -ENOTDIR;
+    }
+    tmpfs_fill_metadata_locked(canonical, out);
+    return 0;
+}
+
+auto tmpfs_stat_lookup(const TmpfsLookupHandle& handle, bool require_directory, uint32_t dev_id, Stat* out) -> int {
+    if (out == nullptr) {
+        return -EINVAL;
+    }
+    ker::mod::sys::MutexGuard guard(tmpfs_lock);
+    TmpNode* canonical = nullptr;
+    int const RET = tmpfs_lookup_target_locked(handle, nullptr, &canonical);
+    if (RET < 0) {
+        return RET;
+    }
+    if (require_directory && canonical->type != TmpNodeType::DIRECTORY) {
+        return -ENOTDIR;
+    }
+    tmpfs_fill_stat_locked(canonical, dev_id, out);
+    return 0;
+}
+
+auto tmpfs_readlink_lookup(const TmpfsLookupHandle& handle, char* buf, size_t bufsize) -> ssize_t {
+    if (buf == nullptr || bufsize == 0) {
+        return -EINVAL;
+    }
+    ker::mod::sys::MutexGuard guard(tmpfs_lock);
+    TmpNode* canonical = nullptr;
+    int const RET = tmpfs_lookup_target_locked(handle, nullptr, &canonical);
+    if (RET < 0) {
+        return RET;
+    }
+    if (canonical->type != TmpNodeType::SYMLINK || canonical->symlink_target == nullptr) {
+        return -EINVAL;
+    }
+    size_t len = 0;
+    while (canonical->symlink_target[len] != '\0') {
+        ++len;
+    }
+    size_t const TO_COPY = std::min(len, bufsize);
+    std::memcpy(buf, canonical->symlink_target, TO_COPY);
+    return static_cast<ssize_t>(TO_COPY);
+}
+
+auto tmpfs_create_lookup(const TmpfsLookupHandle& handle, uint32_t mode, TmpfsObjectMetadata* out) -> int {
+    ker::mod::sys::MutexGuard guard(tmpfs_lock);
+    if (!tmpfs_validate_lookup_locked(handle)) {
+        return -EAGAIN;
+    }
+    if (handle.target_existed()) {
+        return -EEXIST;
+    }
+    TmpNode* const NODE = tmpfs_create_file(handle.parent(), handle.name(), mode & 07777);
+    if (NODE == nullptr) {
+        return -ENOMEM;
+    }
+    tmpfs_fill_metadata_locked(NODE, out);
+    return 0;
+}
+
+auto tmpfs_mkdir_lookup(const TmpfsLookupHandle& handle, uint32_t mode, TmpfsObjectMetadata* out) -> int {
+    ker::mod::sys::MutexGuard guard(tmpfs_lock);
+    if (!tmpfs_validate_lookup_locked(handle)) {
+        return -EAGAIN;
+    }
+    if (handle.target_existed()) {
+        return -EEXIST;
+    }
+    TmpNode* const NODE = tmpfs_mkdir(handle.parent(), handle.name());
+    if (NODE == nullptr) {
+        return -ENOMEM;
+    }
+    NODE->mode = mode & 07777;
+    tmpfs_fill_metadata_locked(NODE, out);
+    return 0;
+}
+
+auto tmpfs_symlink_lookup(const TmpfsLookupHandle& handle, const char* target, TmpfsObjectMetadata* out) -> int {
+    if (target == nullptr) {
+        return -EINVAL;
+    }
+    ker::mod::sys::MutexGuard guard(tmpfs_lock);
+    if (!tmpfs_validate_lookup_locked(handle)) {
+        return -EAGAIN;
+    }
+    if (handle.target_existed()) {
+        // The legacy tmpfs symlink path reports a generic failure for both an
+        // existing destination and allocation failure.
+        return -1;
+    }
+    TmpNode* const NODE = tmpfs_create_symlink(handle.parent(), handle.name(), target);
+    if (NODE == nullptr) {
+        // Preserve the legacy tmpfs symlink branch's generic allocation error.
+        return -1;
+    }
+    tmpfs_fill_metadata_locked(NODE, out);
+    return 0;
+}
+
+auto tmpfs_unlink_lookup(const TmpfsLookupHandle& handle, bool* hardlink_count_changed) -> int {
+    if (hardlink_count_changed != nullptr) {
+        *hardlink_count_changed = false;
+    }
+    ker::mod::sys::MutexGuard guard(tmpfs_lock);
+    TmpNode* entry = nullptr;
+    int const RET = tmpfs_lookup_target_locked(handle, &entry, nullptr);
+    if (RET < 0) {
+        return RET;
+    }
+    if (entry->type == TmpNodeType::DIRECTORY) {
+        return -EISDIR;
+    }
+    bool const LINK_COUNT_CHANGED = tmpfs_link_count(entry) > 1;
+    if (!tmpfs_detach_child(handle.parent(), entry)) {
+        return -ENOENT;
+    }
+    tmpfs_drop_detached_node(entry);
+    if (hardlink_count_changed != nullptr) {
+        *hardlink_count_changed = LINK_COUNT_CHANGED;
+    }
+    return 0;
+}
+
+auto tmpfs_rmdir_lookup(const TmpfsLookupHandle& handle) -> int {
+    ker::mod::sys::MutexGuard guard(tmpfs_lock);
+    TmpNode* entry = nullptr;
+    int const RET = tmpfs_lookup_target_locked(handle, &entry, nullptr);
+    if (RET < 0) {
+        return RET;
+    }
+    if (entry->type != TmpNodeType::DIRECTORY) {
+        return -ENOTDIR;
+    }
+    if (!tmpfs_directory_is_empty(entry)) {
+        return -ENOTEMPTY;
+    }
+    if (!tmpfs_detach_child(handle.parent(), entry)) {
+        return -ENOENT;
+    }
+    entry->unlinked = true;
+    if (entry->open_count.load(std::memory_order_acquire) == 0) {
+        tmpfs_free_node(entry);
+    }
+    return 0;
+}
+
+auto tmpfs_chmod_lookup(const TmpfsLookupHandle& handle, uint32_t mode, TmpfsObjectMetadata* out) -> int {
+    ker::mod::sys::MutexGuard guard(tmpfs_lock);
+    TmpNode* canonical = nullptr;
+    int const RET = tmpfs_lookup_target_locked(handle, nullptr, &canonical);
+    if (RET < 0) {
+        return RET;
+    }
+    canonical->mode = mode & 07777;
+    tmpfs_fill_metadata_locked(canonical, out);
+    return 0;
+}
+
+auto tmpfs_chown_lookup(const TmpfsLookupHandle& handle, uint32_t owner, uint32_t group, TmpfsObjectMetadata* out) -> int {
+    ker::mod::sys::MutexGuard guard(tmpfs_lock);
+    TmpNode* canonical = nullptr;
+    int const RET = tmpfs_lookup_target_locked(handle, nullptr, &canonical);
+    if (RET < 0) {
+        return RET;
+    }
+    if (std::cmp_not_equal(owner, -1)) {
+        canonical->uid = owner;
+    }
+    if (std::cmp_not_equal(group, -1)) {
+        canonical->gid = group;
+    }
+    tmpfs_fill_metadata_locked(canonical, out);
+    return 0;
+}
+
+auto tmpfs_utimens_lookup(const TmpfsLookupHandle& handle, const TmpfsTimesUpdate& times, TmpfsObjectMetadata* out) -> int {
+    ker::mod::sys::MutexGuard guard(tmpfs_lock);
+    TmpNode* canonical = nullptr;
+    int const RET = tmpfs_lookup_target_locked(handle, nullptr, &canonical);
+    if (RET < 0) {
+        return RET;
+    }
+    if (times.set_atime) {
+        canonical->atime = times.atime;
+    }
+    if (times.set_mtime) {
+        canonical->mtime = times.mtime;
+    }
+    if (times.set_atime || times.set_mtime) {
+        canonical->ctime = times.ctime;
+    }
+    tmpfs_fill_metadata_locked(canonical, out);
+    return 0;
+}
+
+auto tmpfs_link_lookup(const TmpfsLookupHandle& source, const TmpfsLookupHandle& destination, TmpfsObjectMetadata* out) -> int {
+    ker::mod::sys::MutexGuard guard(tmpfs_lock);
+    if (!tmpfs_validate_pair_locked(source, destination)) {
+        return -EAGAIN;
+    }
+    TmpNode* const SOURCE_ENTRY = source.target();
+    TmpNode* const SOURCE = tmpfs_canonical_node(SOURCE_ENTRY);
+    if (!source.target_existed() || SOURCE == nullptr) {
+        return -ENOENT;
+    }
+    if (!tmpfs_same_tree_locked(source.parent(), destination.parent())) {
+        return -EXDEV;
+    }
+    if (SOURCE->type == TmpNodeType::DIRECTORY) {
+        return -EPERM;
+    }
+    if (destination.target_existed()) {
+        return -EEXIST;
+    }
+    TmpNode* const LINK = tmpfs_create_hardlink(destination.parent(), destination.name(), SOURCE);
+    if (LINK == nullptr) {
+        return -ENOMEM;
+    }
+    tmpfs_fill_metadata_locked(SOURCE, out);
+    return 0;
+}
+
+auto tmpfs_rename_lookup(const TmpfsLookupHandle& source, const TmpfsLookupHandle& destination, bool source_requires_directory,
+                         bool destination_requires_directory, TmpfsObjectMetadata* out, bool* replaced_hardlink_count_changed) -> int {
+    if (replaced_hardlink_count_changed != nullptr) {
+        *replaced_hardlink_count_changed = false;
+    }
+    ker::mod::sys::MutexGuard guard(tmpfs_lock);
+    if (!tmpfs_validate_pair_locked(source, destination)) {
+        return -EAGAIN;
+    }
+    TmpNode* const SOURCE = source.target();
+    TmpNode* const DESTINATION = destination.target();
+    if (!source.target_existed() || SOURCE == nullptr) {
+        return -ENOENT;
+    }
+    if (!tmpfs_same_tree_locked(source.parent(), destination.parent())) {
+        return -EXDEV;
+    }
+    if (source_requires_directory && SOURCE->type != TmpNodeType::DIRECTORY) {
+        return -ENOTDIR;
+    }
+    if (destination_requires_directory) {
+        if (!destination.target_existed() || DESTINATION == nullptr) {
+            return -ENOENT;
+        }
+        if (DESTINATION->type != TmpNodeType::DIRECTORY) {
+            return -ENOTDIR;
+        }
+        if (SOURCE->type != TmpNodeType::DIRECTORY) {
+            return -EISDIR;
+        }
+    }
+    if (DESTINATION == SOURCE) {
+        tmpfs_fill_metadata_locked(SOURCE, out);
+        return 0;
+    }
+
+    bool link_count_changed = false;
+    if (DESTINATION != nullptr) {
+        if (DESTINATION->type == TmpNodeType::DIRECTORY && !tmpfs_directory_is_empty(DESTINATION)) {
+            return -ENOTEMPTY;
+        }
+        link_count_changed = DESTINATION->type != TmpNodeType::DIRECTORY && tmpfs_link_count(DESTINATION) > 1;
+        if (!tmpfs_detach_child(destination.parent(), DESTINATION)) {
+            return -ENOENT;
+        }
+        if (DESTINATION->type == TmpNodeType::DIRECTORY) {
+            DESTINATION->unlinked = true;
+            if (DESTINATION->open_count.load(std::memory_order_acquire) == 0) {
+                tmpfs_free_node(DESTINATION);
+            }
+        } else {
+            tmpfs_drop_detached_node(DESTINATION);
+        }
+    }
+    if (!tmpfs_detach_child(source.parent(), SOURCE)) {
+        return -ENOENT;
+    }
+    copy_name(SOURCE->name, destination.name());
+    if (!tmpfs_attach_child(destination.parent(), SOURCE)) {
+        return -EIO;
+    }
+    tmpfs_fill_metadata_locked(SOURCE, out);
+    if (replaced_hardlink_count_changed != nullptr) {
+        *replaced_hardlink_count_changed = link_count_changed;
+    }
+    return 0;
 }
 
 namespace {
@@ -1321,7 +2007,87 @@ void tmpfs_set_open_result(int* result_out, int result) {
         *result_out = result;
     }
 }
+
+// Caller holds tmpfs_lock and has already established the final dentry.
+auto tmpfs_open_node_locked(TmpNode* entry, int flags, bool require_directory, bool created_by_open, int* result_out) -> ker::vfs::File* {
+    if (entry == nullptr) {
+        tmpfs_set_open_result(result_out, -ENOENT);
+        return nullptr;
+    }
+    if ((flags & ker::vfs::O_NOFOLLOW) != 0 && entry->type == TmpNodeType::SYMLINK) {
+        tmpfs_set_open_result(result_out, -ELOOP);
+        return nullptr;
+    }
+    TmpNode* const NODE = tmpfs_canonical_node(entry);
+    if (NODE == nullptr) {
+        tmpfs_set_open_result(result_out, -ENOENT);
+        return nullptr;
+    }
+    if (require_directory && NODE->type != TmpNodeType::DIRECTORY) {
+        tmpfs_set_open_result(result_out, -ENOTDIR);
+        return nullptr;
+    }
+
+    NODE->open_count.fetch_add(1, std::memory_order_relaxed);
+    if ((flags & ker::vfs::O_TRUNC) != 0 && NODE->type == TmpNodeType::FILE) {
+        ker::mod::sys::MutexGuard io_guard(NODE->io_lock);
+        int const TRUNCATE_RET = tmpfs_resize_locked(NODE, 0);
+        if (TRUNCATE_RET < 0) {
+            NODE->open_count.fetch_sub(1, std::memory_order_acq_rel);
+            tmpfs_set_open_result(result_out, TRUNCATE_RET);
+            return nullptr;
+        }
+    }
+
+    auto* file = new File;
+    if (file == nullptr) {
+        NODE->open_count.fetch_sub(1, std::memory_order_acq_rel);
+        tmpfs_set_open_result(result_out, -ENOMEM);
+        return nullptr;
+    }
+    file->private_data = NODE;
+    file->fd = -1;
+    file->pos = 0;
+    file->is_directory = NODE->type == TmpNodeType::DIRECTORY;
+    file->fs_type = FSType::TMPFS;
+    file->refcount = 1;
+    file->open_flags = flags;
+    file->fd_flags = 0;
+    file->open_create_result_known = (flags & O_CREAT) != 0;
+    file->created_by_open = created_by_open;
+    tmpfs_set_open_result(result_out, 0);
+    return file;
+}
 }  // namespace
+
+auto tmpfs_open_lookup(const TmpfsLookupHandle& handle, int flags, int mode, bool require_directory, int* result_out) -> ker::vfs::File* {
+    ker::mod::sys::MutexGuard guard(tmpfs_lock);
+    if (!tmpfs_validate_lookup_locked(handle)) {
+        tmpfs_set_open_result(result_out, -EAGAIN);
+        return nullptr;
+    }
+
+    TmpNode* node = handle.target();
+    bool created_by_open = false;
+    if (!handle.target_existed()) {
+        if ((flags & O_CREAT) == 0) {
+            tmpfs_set_open_result(result_out, -ENOENT);
+            return nullptr;
+        }
+        node = tmpfs_create_file(handle.parent(), handle.name(), static_cast<uint32_t>(mode) & 07777);
+        if (node == nullptr) {
+            tmpfs_set_open_result(result_out, -ENOMEM);
+            return nullptr;
+        }
+        created_by_open = true;
+    } else if ((flags & (O_CREAT | O_EXCL)) == (O_CREAT | O_EXCL)) {
+        tmpfs_set_open_result(result_out, -EEXIST);
+        return nullptr;
+    }
+
+    bool const REQUIRE_DIRECTORY = require_directory || (flags & ker::vfs::O_DIRECTORY) != 0;
+    return tmpfs_open_node_locked(node, flags, REQUIRE_DIRECTORY, created_by_open, result_out);
+}
 
 auto tmpfs_open_path(TmpNode* root, const char* path, int flags, int mode, int* result_out) -> ker::vfs::File* {
     // mode is now used for O_CREAT
@@ -1406,47 +2172,9 @@ auto tmpfs_open_path(TmpNode* root, const char* path, int flags, int mode, int* 
         tmpfs_set_open_result(result_out, -EEXIST);
         return nullptr;
     }
-    TmpNode* file_node = tmpfs_canonical_node(node);
-    if (file_node != nullptr) {
-        file_node->open_count.fetch_add(1, std::memory_order_relaxed);
-    }
+    auto* file = tmpfs_open_node_locked(node, flags, false, created_by_open, result_out);
     tmpfs_lock.unlock();
-
-    if (file_node == nullptr) {
-        tmpfs_set_open_result(result_out, -ENOENT);
-        return nullptr;
-    }
-
-    if ((flags & ker::vfs::O_TRUNC) != 0 && file_node->type == TmpNodeType::FILE) {
-        int truncate_ret = 0;
-        {
-            ker::mod::sys::MutexGuard guard(file_node->io_lock);
-            truncate_ret = tmpfs_resize_locked(file_node, 0);
-        }
-        int const TRUNCATE_RET = truncate_ret;
-        if (TRUNCATE_RET < 0) {
-            uint32_t const PREV = file_node->open_count.fetch_sub(1, std::memory_order_acq_rel);
-            if (PREV == 1 && file_node->unlinked) {
-                tmpfs_free_node(file_node);
-            }
-            tmpfs_set_open_result(result_out, TRUNCATE_RET);
-            return nullptr;
-        }
-    }
-
-    auto* f = new File;
-    f->private_data = file_node;
-    f->fd = -1;
-    f->pos = 0;
-    f->is_directory = (file_node->type == TmpNodeType::DIRECTORY);
-    f->fs_type = FSType::TMPFS;
-    f->refcount = 1;
-    f->open_flags = flags;
-    f->fd_flags = 0;
-    f->open_create_result_known = (flags & O_CREAT) != 0;
-    f->created_by_open = created_by_open;
-    tmpfs_set_open_result(result_out, 0);
-    return f;
+    return file;
 }
 
 auto tmpfs_open_path(const char* path, int flags, int mode, int* result_out) -> ker::vfs::File* {
@@ -1595,9 +2323,10 @@ auto tmpfs_fops_close(ker::vfs::File* f) -> int {
         f->private_data = nullptr;
         return 0;
     }
-    uint32_t const PREV = node->open_count.fetch_sub(1, std::memory_order_acq_rel);
-    if (PREV == 1 && node->unlinked) {
-        // Last close of an unlinked node — free it now
+    ker::mod::sys::MutexGuard guard(tmpfs_lock);
+    node->open_count.fetch_sub(1, std::memory_order_acq_rel);
+    if (tmpfs_node_can_be_freed_locked(node)) {
+        // Last open/lookup reference to an unlinked node — free it now.
         tmpfs_free_node(node);
     }
     f->private_data = nullptr;
