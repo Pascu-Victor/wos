@@ -8,7 +8,8 @@ diagnostic CMake options enabled and the kernel command line set from
 Preserve the isolation contract:
 
 - Build directory: `build-ktest/`
-- Generated data and disks: `ktest-data/`
+- Generated data and disks: `ktest-data/` (`build.state_root`; all mutable
+  port, staging, tool-output, and image paths stay below it)
 - Target sysroot: `ktest-data/sysroot`
 - mlibc, BusyBox, Dropbear, GNU make, and CPython build/install roots under `ktest-data/`
 

@@ -24,6 +24,10 @@ NINJA_BUILD="${WOS_NINJA_BUILD_DIR:-$B/ninja-build}"
 TARGET_ARCH="${WOS_TARGET_ARCH:-x86_64-pc-wos}"
 WOS_NINJA_STRIP="${WOS_NINJA_STRIP:-0}"
 
+if wos_source_strict_enabled; then
+    wos_materialize_locked_git ninja "$NINJA_SRC"
+fi
+
 export PATH="$HOST/bin:$PATH"
 export LD_LIBRARY_PATH="$HOST/lib"
 export NINJA_STATUS="[%f/%t %e] "

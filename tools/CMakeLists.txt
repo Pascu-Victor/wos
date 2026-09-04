@@ -11,9 +11,14 @@ unset(ENV{LDFLAGS})
 
 # Resolve workspace root and path entries to remove from host compiler discovery.
 get_filename_component(WOS_WORKSPACE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
-set(WOS_TARGET_TOOLCHAIN_BIN "${WOS_WORKSPACE_ROOT}/toolchain/sysroot/bin")
-set(WOS_HOST_TOOLCHAIN_BIN "${WOS_WORKSPACE_ROOT}/toolchain/host/bin")
-set(WOS_HOST_TOOLS_BIN "${WOS_WORKSPACE_ROOT}/tools/build/bin")
+set(WOS_TARGET_TOOLCHAIN_BIN "${WOS_WORKSPACE_ROOT}/toolchain/sysroot/bin" CACHE PATH
+    "Target-toolchain bin directory excluded from host tool discovery")
+set(WOS_HOST_TOOLCHAIN_BIN "${WOS_WORKSPACE_ROOT}/toolchain/host/bin" CACHE PATH
+    "Host-toolchain bin directory excluded from host tool discovery")
+set(WOS_HOST_TOOLS_BIN "${WOS_WORKSPACE_ROOT}/tools/build/bin" CACHE PATH
+    "Host-tools bin directory excluded from host tool discovery")
+set(WOS_TOOLS_OUTPUT_DIR "${WOS_WORKSPACE_ROOT}/tools/build/bin" CACHE PATH
+    "Runtime output directory for host-side WOS tools")
 
 # Reconstruct a clean host PATH so find_program() does not pick the target compiler
 # from nearby overlaid paths.
@@ -108,10 +113,13 @@ add_compile_options(-fdiagnostics-color=always)
 
 add_subdirectory("${WOS_WORKSPACE_ROOT}/shared/telemetry" "${CMAKE_CURRENT_BINARY_DIR}/shared/telemetry")
 
-# Set the runtime output directory for all targets to build/bin directory
-set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/build/bin)
-set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_DEBUG ${CMAKE_SOURCE_DIR}/build/bin)
-set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_RELEASE ${CMAKE_SOURCE_DIR}/build/bin)
+# Keep the legacy tools/build/bin default while allowing isolated root builds
+# to place host tools entirely inside their selected mutable state root.
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${WOS_TOOLS_OUTPUT_DIR})
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_DEBUG ${WOS_TOOLS_OUTPUT_DIR})
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_RELEASE ${WOS_TOOLS_OUTPUT_DIR})
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO ${WOS_TOOLS_OUTPUT_DIR})
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_MINSIZEREL ${WOS_TOOLS_OUTPUT_DIR})
 
 # Include all subdirectories that contain CMakeLists.txt files
 # Exclude any directories named "build"

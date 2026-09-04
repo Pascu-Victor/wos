@@ -80,6 +80,7 @@ download_nasm_source() {
         wos_download_file "NASM $NASM_VERSION source" "$archive" "$NASM_TARBALL_URLS" "$NASM_DOWNLOAD_ATTEMPTS"
     fi
 
+    wos_verify_locked_archive "$archive"
     echo "$NASM_TARBALL_SHA256  $archive" | sha256sum -c - >&2
     wos_remove_tree "$tmp_dest"
     wos_remove_tree "$dest"
@@ -328,6 +329,9 @@ require_file "$HOST/bin/llvm-strip" "Run tools/host-toolchain.sh first."
 require_file "$TARGET_SYSROOT/lib/libc.so" "Build mlibc before building NASM."
 require_file "$TARGET_SYSROOT/lib/Scrt1.o" "Build mlibc startup objects before building NASM."
 
+if wos_source_strict_enabled; then
+    wos_materialize_locked_git nasm "$NASM_SRC"
+fi
 NASM_SOURCE_DIR="$(resolve_nasm_source)"
 require_file "$NASM_SOURCE_DIR/configure" "NASM source is missing generated configure."
 require_file "$NASM_SOURCE_DIR/autoconf/helpers/config.guess" "NASM source is missing config.guess."

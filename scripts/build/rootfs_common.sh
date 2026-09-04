@@ -13,11 +13,22 @@ ROOTFS_SYSROOT_DIR="${WOS_SYSROOT_PATH:-}"
 ROOTFS_BUSYBOX_INSTALL_DIR="${WOS_BUSYBOX_INSTALL_DIR:-}"
 ROOTFS_CONTENT_MANIFEST="/etc/wos-rootfs-manifest.tsv"
 ROOTFS_MANIFEST_HASH_LIMIT_BYTES="${WOS_ROOTFS_MANIFEST_HASH_LIMIT_BYTES:-16777216}"
+ROOTFS_REPRODUCIBLE=0
+case "${WOS_REPRODUCIBLE_BUILD:-0}" in
+    1|ON|on|TRUE|true|YES|yes)
+        ROOTFS_REPRODUCIBLE=1
+        ;;
+esac
 case "$ROOTFS_MANIFEST_HASH_LIMIT_BYTES" in
     ''|*[!0-9]*)
         ROOTFS_MANIFEST_HASH_LIMIT_BYTES=16777216
         ;;
 esac
+if [ "$ROOTFS_REPRODUCIBLE" = "1" ]; then
+    # A reproducible rootfs manifest is a content authority.  Do not fall back
+    # to host-dependent mtimes for large or hard-linked inputs.
+    ROOTFS_MANIFEST_HASH_LIMIT_BYTES=0
+fi
 
 rootfs_default_staging_parent() {
     local repo="$1"
@@ -82,7 +93,8 @@ rootfs_write_content_manifest() {
                 mode=$(stat -c %a "$entry")
                 size=$(stat -c %s "$entry")
                 links=$(stat -c %h "$entry")
-                if [ "${WOS_ROOTFS_MANIFEST_FORCE_HASH:-0}" = "1" ] ||
+                if [ "$ROOTFS_REPRODUCIBLE" = "1" ] ||
+                   [ "${WOS_ROOTFS_MANIFEST_FORCE_HASH:-0}" = "1" ] ||
                    { [ "$links" -le 1 ] && [ "$size" -le "$ROOTFS_MANIFEST_HASH_LIMIT_BYTES" ]; }; then
                     hash=$(sha256sum -b "$entry" | awk '{print $1}')
                     identity="$hash"
@@ -410,7 +422,12 @@ EOF
         printf '%s' "wos" > "$ROOTFS_STAGING/etc/hostname"
     fi
 
-    if [ -f "/usr/share/zoneinfo/Etc/UTC" ]; then
+    if [ "$ROOTFS_REPRODUCIBLE" = "1" ]; then
+        # The normal developer image follows the host's installed tzdata.  A
+        # strict build must not acquire an undeclared host file, so use the
+        # canonical target path and let the shipped tzdata package own it.
+        rootfs_symlink_entry "/usr/share/zoneinfo/Etc/UTC" "/etc/localtime"
+    elif [ -f "/usr/share/zoneinfo/Etc/UTC" ]; then
         tz_source="/usr/share/zoneinfo/Etc/UTC"
     elif [ -f "/usr/share/zoneinfo/UTC" ]; then
         tz_source="/usr/share/zoneinfo/UTC"
@@ -451,12 +468,14 @@ rootfs_stage_root_home() {
     : > "$authorized_keys"
 
     ssh_pubkey=""
-    for keyfile in ~/.ssh/id_ed25519.pub ~/.ssh/id_rsa.pub ~/.ssh/id_ecdsa.pub; do
-        if [ -f "$keyfile" ]; then
-            ssh_pubkey="$keyfile"
-            break
-        fi
-    done
+    if [ "$ROOTFS_REPRODUCIBLE" != "1" ]; then
+        for keyfile in ~/.ssh/id_ed25519.pub ~/.ssh/id_rsa.pub ~/.ssh/id_ecdsa.pub; do
+            if [ -f "$keyfile" ]; then
+                ssh_pubkey="$keyfile"
+                break
+            fi
+        done
+    fi
 
     rootfs_append_authorized_keys "$repo_authorized_keys" "$authorized_keys"
     if [ -n "$ssh_pubkey" ]; then

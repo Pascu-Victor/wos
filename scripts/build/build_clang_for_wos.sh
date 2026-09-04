@@ -50,6 +50,10 @@ CLANG_VERSION="${WOS_CLANG_VERSION:-22}"
 HOST_PYTHON="${HOST_PYTHON:-$(command -v python3)}"
 WOS_CMAKE_COMMAND="${WOS_CMAKE_COMMAND:-cmake}"
 
+if wos_source_strict_enabled; then
+    wos_materialize_locked_git llvm-project "${LLVM_SRC%/llvm}"
+fi
+
 export NINJA_STATUS="[%f/%t %e] "
 export PATH="$HOST/bin:$PATH"
 export LD_LIBRARY_PATH="$HOST/lib"

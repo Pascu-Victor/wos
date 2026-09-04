@@ -73,6 +73,7 @@ download_ncurses_source() {
         wos_download_file "ncurses $NCURSES_VERSION source" "$archive" "$NCURSES_TARBALL_URLS" "$NCURSES_DOWNLOAD_ATTEMPTS"
     fi
 
+    wos_verify_locked_archive "$archive"
     echo "$NCURSES_TARBALL_SHA256  $archive" | sha256sum -c - >&2
     wos_remove_tree "$tmp_dest"
     wos_remove_tree "$dest"
@@ -83,6 +84,12 @@ download_ncurses_source() {
 
 resolve_ncurses_source() {
     local fallback_src="$NCURSES_BUILD/src/ncurses-$NCURSES_VERSION"
+
+    if wos_source_strict_enabled; then
+        wos_materialize_locked_archive_tree "ncurses-$NCURSES_VERSION.tar.gz" "$fallback_src"
+        printf '%s\n' "$fallback_src"
+        return 0
+    fi
 
     if [ -f "$NCURSES_SRC/configure" ]; then
         printf '%s\n' "$NCURSES_SRC"

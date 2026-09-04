@@ -1,15 +1,32 @@
 {
     "build": {
         "dir": "build-ktest",
+        "state_root": "ktest-data",
         "sysroot": "ktest-data/sysroot",
         "mlibc_build": "ktest-data/mlibc-build",
+        "mlibc_conformance_stage": "ktest-data/mlibc-conformance-stage",
+        "libcxx_build": "ktest-data/libcxx-build",
         "busybox_build": "ktest-data/busybox-build",
         "busybox_install": "ktest-data/busybox-install",
         "dropbear_build": "ktest-data/dropbear-build",
         "make_build": "ktest-data/make-build",
         "bash_build": "ktest-data/bash-build",
+        "zlib_build": "ktest-data/zlib-build",
+        "openssl_build": "ktest-data/openssl-build",
+        "curl_build": "ktest-data/curl-build",
+        "git_build": "ktest-data/git-build",
+        "clang_build": "ktest-data/clang-wos-build",
+        "ninja_build": "ktest-data/ninja-build",
+        "cmake_host_build": "ktest-data/cmake-host-build",
+        "cmake_host_install": "ktest-data/host",
         "cmake_build": "ktest-data/cmake-wos-build",
-        "python_build": "ktest-data/python-build"
+        "python_build": "ktest-data/python-build",
+        "meson_build": "ktest-data/meson-build",
+        "nasm_build": "ktest-data/nasm-build",
+        "ncurses_build": "ktest-data/ncurses-build",
+        "nano_build": "ktest-data/nano-build",
+        "doom_ascii_build": "ktest-data/doom-ascii-build",
+        "tools_output": "ktest-data/tools/bin"
     },
     "package": {
         "kernel_cmdline": "--selftest"

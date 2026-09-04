@@ -23,6 +23,10 @@ DB_SRC="$B/src/dropbear"
 DB_BUILD="${WOS_DROPBEAR_BUILD_DIR:-$B/dropbear-build}"
 HOST_SYSTEM="$(uname -s 2>/dev/null || printf unknown)"
 
+if wos_source_strict_enabled; then
+    wos_materialize_locked_git dropbear "$DB_SRC"
+fi
+
 if [ ! -d "$DB_SRC" ]; then
     echo "ERROR: dropbear source directory not found at $DB_SRC"
     echo "Run tools/bootstrap.sh first to bootstrap the toolchain."

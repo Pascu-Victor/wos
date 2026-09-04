@@ -231,6 +231,30 @@ option(WOS_USERSPACE_COVERAGE "Enable LLVM source-based coverage instrumentation
 option(WOS_USERSPACE_NO_AVX "Build WOS userspace without AVX for FPU-state diagnostics" OFF)
 option(WOS_DYNAMIC_USERSPACE_PIE "Build dynamic WOS userspace executables as PIE" ON)
 option(WOS_DYNAMIC_USERSPACE_NO_PLT "Use GOT calls instead of PLT stubs for dynamic WOS userspace executables" OFF)
+option(WOS_REPRODUCIBLE_BUILD "Enable deterministic build and packaging behavior" OFF)
+
+if(WOS_REPRODUCIBLE_BUILD)
+    # Map both roots explicitly.  The binary tree may be nested below the
+    # source tree, so list it first to retain a distinct stable identity.
+    set(WOS_REPRODUCIBLE_PREFIX_MAP_OPTIONS
+        "-ffile-prefix-map=${CMAKE_BINARY_DIR}=/wos/build"
+        "-fdebug-prefix-map=${CMAKE_BINARY_DIR}=/wos/build"
+        "-fmacro-prefix-map=${CMAKE_BINARY_DIR}=/wos/build"
+        "-ffile-prefix-map=${WOS_REPO_ROOT}=/wos/src"
+        "-fdebug-prefix-map=${WOS_REPO_ROOT}=/wos/src"
+        "-fmacro-prefix-map=${WOS_REPO_ROOT}=/wos/src"
+    )
+    if(WOS_STATE_ROOT)
+        list(PREPEND WOS_REPRODUCIBLE_PREFIX_MAP_OPTIONS
+            "-ffile-prefix-map=${WOS_STATE_ROOT}=/wos/state"
+            "-fdebug-prefix-map=${WOS_STATE_ROOT}=/wos/state"
+            "-fmacro-prefix-map=${WOS_STATE_ROOT}=/wos/state"
+        )
+    endif()
+    add_compile_options(
+        "$<$<OR:$<COMPILE_LANGUAGE:C>,$<COMPILE_LANGUAGE:CXX>>:${WOS_REPRODUCIBLE_PREFIX_MAP_OPTIONS}>"
+    )
+endif()
 
 set(WOS_SYSROOT_COMPILE_OPTIONS "--sysroot=${SYSROOT_PATH}")
 if(WOS_NATIVE_SYSTEM_BUILD AND WOS_SYSROOT_PATH STREQUAL "${WOS_NATIVE_INSTALLED_SYSROOT_PATH}")

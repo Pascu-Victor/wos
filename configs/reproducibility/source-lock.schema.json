@@ -1,0 +1,136 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://wos.invalid/schemas/source-lock.v1.json",
+  "title": "WOS source lock",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "generatedBy",
+    "workspace",
+    "gitSources",
+    "archives",
+    "patches",
+    "generatedInputs"
+  ],
+  "properties": {
+    "$schema": { "type": "string" },
+    "schemaVersion": { "const": 1 },
+    "generatedBy": { "type": "string", "minLength": 1 },
+    "workspace": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "license"],
+      "properties": {
+        "source": { "type": "string", "minLength": 1 },
+        "license": { "type": "string", "minLength": 1 }
+      }
+    },
+    "gitSources": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/gitSource" }
+    },
+    "archives": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/archive" }
+    },
+    "patches": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/fileInput" }
+    },
+    "generatedInputs": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/fileInput" }
+    }
+  },
+  "$defs": {
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._+-]*$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "gitObject": {
+      "type": "string",
+      "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$"
+    },
+    "relativePath": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$)).+$"
+    },
+    "gitSource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "urls", "commit", "license"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "path": { "$ref": "#/$defs/relativePath" },
+        "urls": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "commit": { "$ref": "#/$defs/gitObject" },
+        "treeSha256": { "$ref": "#/$defs/sha256" },
+        "license": { "type": "string", "minLength": 1 },
+        "role": { "type": "string", "minLength": 1 },
+        "storeRequired": { "type": "boolean" },
+        "allowedOverlays": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["path", "sha256"],
+            "properties": {
+              "path": { "$ref": "#/$defs/relativePath" },
+              "sha256": { "$ref": "#/$defs/sha256" }
+            }
+          }
+        }
+      }
+    },
+    "archive": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "filename", "version", "urls", "sha256", "license"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "filename": { "type": "string", "pattern": "^[^/]+$" },
+        "version": { "type": "string", "minLength": 1 },
+        "urls": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "license": { "type": "string", "minLength": 1 },
+        "localCandidates": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/relativePath" }
+        },
+        "alternativeGitSourceId": { "$ref": "#/$defs/id" },
+        "storeRequired": { "type": "boolean" }
+      }
+    },
+    "fileInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "path", "sha256"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "path": { "$ref": "#/$defs/relativePath" },
+        "source": { "type": "string", "minLength": 1 },
+        "license": { "type": "string", "minLength": 1 },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "appliesTo": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/id" }
+        },
+        "description": { "type": "string" }
+      }
+    }
+  }
+}

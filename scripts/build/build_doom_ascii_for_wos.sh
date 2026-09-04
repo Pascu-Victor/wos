@@ -25,6 +25,10 @@ DOOM_ASCII_WORK="$DOOM_ASCII_BUILD/work"
 DOOM_ASCII_WOS_PATCH="$WORKSPACE_ROOT/toolchain/patches/doom-ascii/wos-clean-exit.patch"
 WOS_DOOM_ASCII_STRIP="${WOS_DOOM_ASCII_STRIP:-0}"
 
+if wos_source_strict_enabled; then
+    wos_materialize_locked_git doom-ascii "$DOOM_ASCII_SRC"
+fi
+
 require_file() {
     local path="$1"
     local hint="$2"

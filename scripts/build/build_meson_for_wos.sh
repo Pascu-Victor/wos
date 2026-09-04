@@ -48,6 +48,7 @@ download_meson_source() {
         wos_download_file "Meson $MESON_COMMIT source" "$archive" "$MESON_TARBALL_URLS" "$MESON_DOWNLOAD_ATTEMPTS"
     fi
 
+    wos_verify_locked_archive "$archive"
     echo "$MESON_TARBALL_SHA256  $archive" | sha256sum -c - >&2
     wos_remove_tree "$tmp_dest"
     wos_remove_tree "$dest"
@@ -58,6 +59,12 @@ download_meson_source() {
 
 resolve_meson_source() {
     local fallback_src="$MESON_BUILD/src/meson-$MESON_COMMIT"
+
+    if wos_source_strict_enabled; then
+        wos_materialize_locked_archive_tree "meson-$MESON_COMMIT.tar.gz" "$fallback_src"
+        printf '%s\n' "$fallback_src"
+        return 0
+    fi
 
     if [ -f "$MESON_SRC/meson.py" ] && [ -d "$MESON_SRC/mesonbuild" ]; then
         printf '%s\n' "$MESON_SRC"

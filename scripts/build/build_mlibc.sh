@@ -39,6 +39,10 @@ CROSS_FILE="$MLIBC_BUILD/x86_64-pc-wos-mlibc.txt"
 MLIBC_BUILD_TESTS="$(normalize_bool "${WOS_MLIBC_BUILD_TESTS:-0}")"
 MLIBC_BUILD_HOST_TESTS="$(normalize_bool "${WOS_MLIBC_BUILD_HOST_TESTS:-0}")"
 
+if wos_source_strict_enabled; then
+    wos_materialize_locked_git mlibc "$MLIBC_SRC"
+fi
+
 if [ ! -d "$MLIBC_SRC" ]; then
     echo "ERROR: mlibc source directory not found at $MLIBC_SRC"
     echo "Run tools/bootstrap.sh first to bootstrap the toolchain."

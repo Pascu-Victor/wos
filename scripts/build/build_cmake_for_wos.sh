@@ -26,6 +26,10 @@ TARGET_ARCH="${WOS_TARGET_ARCH:-x86_64-pc-wos}"
 WOS_CMAKE_FOR_WOS_LAZY_BINDING="${WOS_CMAKE_FOR_WOS_LAZY_BINDING:-0}"
 WOS_CMAKE_FOR_WOS_STRIP="${WOS_CMAKE_FOR_WOS_STRIP:-0}"
 
+if wos_source_strict_enabled; then
+    wos_materialize_locked_git cmake "$CMAKE_SRC"
+fi
+
 export NINJA_STATUS="[%f/%t %e] "
 export PATH="$HOST/bin:$PATH"
 export LD_LIBRARY_PATH="$HOST/lib"

@@ -111,9 +111,12 @@ UNIT_TESTS=(
     ktest_manifest_test
     runtime_test_audit_test
     toolchain_bootstrap_source_test
+    source_lock_test
     selfhost_benchmark_source_test
     rootfs_source_test
     image_source_test
+    build_isolation_test
+    wos_artifacts_test
     modules_cmake_source_test
     qcow_common_source_test
     testd_manifest_test

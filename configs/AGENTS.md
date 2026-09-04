@@ -8,6 +8,7 @@ top-level `build`, `package`, and `node` sections, with `node.vm` and
 KTEST defaults should remain isolated from the normal WOS VM:
 
 - `build.dir`: `build-ktest`
+- `build.state_root`: `ktest-data`
 - `build.sysroot`: `ktest-data/sysroot`
 - `node.vm.disk0`: `ktest-data/disk.qcow2`
 - `node.vm.disk1`: `ktest-data/mountfs.qcow2`

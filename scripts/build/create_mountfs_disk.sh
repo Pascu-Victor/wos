@@ -27,6 +27,18 @@ cd "$WOS_ROOT"
 
 CWD="$WOS_ROOT"
 DISK="${WOS_ROOTFS_DISK:-mountfs.qcow2}"
+ROOTFS_MTIME="${SOURCE_DATE_EPOCH:-0}"
+ROOTFS_FS_UUID="${WOS_ROOTFS_UUID:-59f84530-5e3b-4f5b-a230-c9d7da79d107}"
+ROOTFS_DISK_GUID="${WOS_ROOTFS_DISK_GUID:-de866036-2a89-46ee-bb7b-759061bca10b}"
+ROOTFS_PART_GUID="${WOS_ROOTFS_PARTUUID:-73ec8526-3d1b-4f16-9f08-36b0e40e410e}"
+KTEST_FS_UUID="${WOS_KTEST_XFS_UUID:-7f0afcd4-7342-4961-8d48-e91780568871}"
+KTEST_PART_GUID="${WOS_KTEST_XFS_PARTUUID:-2e50edc2-5df6-47eb-857a-031c50df51db}"
+ROOTFS_REPRODUCIBLE=0
+case "${WOS_REPRODUCIBLE_BUILD:-0}" in
+    1|ON|on|TRUE|true|YES|yes)
+        ROOTFS_REPRODUCIBLE=1
+        ;;
+esac
 
 # shellcheck disable=SC1091
 source "$CWD/scripts/build/rootfs_common.sh"
@@ -63,14 +75,29 @@ rootfs_stage_tree "$CWD" "$STAGING"
 # Stage a tarball with root:root ownership and correct permissions.
 chmod 700 "$STAGING/root/.ssh"
 test -f "$STAGING/root/.ssh/authorized_keys" && chmod 600 "$STAGING/root/.ssh/authorized_keys"
-tar cf "$STAGING_TAR" --owner=0 --group=0 --numeric-owner -C "$STAGING" .
+case "$ROOTFS_MTIME" in
+    ''|*[!0-9]*)
+        echo "ERROR: SOURCE_DATE_EPOCH must be a non-negative integer" >&2
+        exit 1
+        ;;
+esac
+if [ "$ROOTFS_REPRODUCIBLE" = "1" ]; then
+    find "$STAGING" -exec touch -h -d "@$ROOTFS_MTIME" {} +
+    tar cf "$STAGING_TAR" \
+        --sort=name --mtime="@$ROOTFS_MTIME" --clamp-mtime \
+        --owner=0 --group=0 --numeric-owner -C "$STAGING" .
+else
+    tar cf "$STAGING_TAR" --owner=0 --group=0 --numeric-owner -C "$STAGING" .
+fi
 
 echo "Creating GPT partition and XFS filesystem"
 wos_qcow_guestfish "create partitioned XFS rootfs qcow image" "$DISK" --rw -a "$DISK" <<_EOF_
 run
 part-init /dev/sda gpt
+part-set-disk-guid /dev/sda $ROOTFS_DISK_GUID
 part-add /dev/sda p $PART_START_SECTOR $PART_END_SECTOR
-debug sh "mkfs.xfs -f -m rmapbt=0,reflink=0,inobtcount=0 -n parent=0 /dev/sda1"
+part-set-gpt-guid /dev/sda 1 $ROOTFS_PART_GUID
+debug sh "mkfs.xfs -f -m rmapbt=0,reflink=0,inobtcount=0,uuid=$ROOTFS_FS_UUID -n parent=0 /dev/sda1"
 sync
 mount /dev/sda1 /
 tar-in $STAGING_TAR /
@@ -86,7 +113,8 @@ if [ "${WOS_KTEST_SECOND_XFS:-0}" = "1" ]; then
     wos_qcow_guestfish "add isolated KTEST secondary XFS partition" "$DISK" --rw -a "$DISK" <<_EOF_
 run
 part-add /dev/sda p $KTEST_PART_START_SECTOR $KTEST_PART_END_SECTOR
-debug sh "mkfs.xfs -f -m rmapbt=0,reflink=0,inobtcount=0 -n parent=0 /dev/sda2"
+part-set-gpt-guid /dev/sda 2 $KTEST_PART_GUID
+debug sh "mkfs.xfs -f -m rmapbt=0,reflink=0,inobtcount=0,uuid=$KTEST_FS_UUID -n parent=0 /dev/sda2"
 sync
 _EOF_
     # Reopen the appliance after changing the partition table.  Some

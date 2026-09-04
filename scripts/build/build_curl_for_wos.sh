@@ -85,6 +85,7 @@ download_curl_source() {
         download_curl_tarball "$archive"
     fi
 
+    wos_verify_locked_archive "$archive"
     echo "$CURL_TARBALL_SHA256  $archive" | sha256sum -c - >&2
     wos_remove_tree "$tmp_dest"
     wos_remove_tree "$dest"
@@ -95,6 +96,12 @@ download_curl_source() {
 
 resolve_curl_source() {
     local fallback_src="$CURL_BUILD/src/curl-$CURL_VERSION"
+
+    if wos_source_strict_enabled; then
+        wos_materialize_locked_archive_tree "curl-$CURL_VERSION.tar.xz" "$fallback_src"
+        printf '%s\n' "$fallback_src"
+        return 0
+    fi
 
     if [ -f "$CURL_SRC/configure" ]; then
         printf '%s\n' "$CURL_SRC"

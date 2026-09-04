@@ -35,6 +35,10 @@ PYTHON_LIBRESSL_SIGALGS_COMPAT_HEADER="${WOS_PYTHON_LIBRESSL_SIGALGS_COMPAT_HEAD
 WOS_PYTHON_STRIP="${WOS_PYTHON_STRIP:-0}"
 HOST_SYSTEM="$(uname -s 2>/dev/null || printf unknown)"
 
+if wos_source_strict_enabled; then
+    wos_materialize_locked_git python "$PYTHON_SRC"
+fi
+
 export PATH="$HOST/bin:$PATH"
 export LD_LIBRARY_PATH="$HOST/lib"
 

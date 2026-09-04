@@ -67,6 +67,7 @@ download_make_source() {
         wos_download_file "GNU make $MAKE_VERSION source" "$archive" "$MAKE_TARBALL_URLS" "$MAKE_DOWNLOAD_ATTEMPTS"
     fi
 
+    wos_verify_locked_archive "$archive"
     echo "$MAKE_TARBALL_SHA256  $archive" | sha256sum -c - >&2
     wos_remove_tree "$tmp_dest"
     wos_remove_tree "$dest"
@@ -77,6 +78,12 @@ download_make_source() {
 
 resolve_make_source() {
     local fallback_src="$MAKE_BUILD/src/make-$MAKE_VERSION"
+
+    if wos_source_strict_enabled; then
+        wos_materialize_locked_archive_tree "make-$MAKE_VERSION.tar.gz" "$fallback_src"
+        printf '%s\n' "$fallback_src"
+        return 0
+    fi
 
     if [ -f "$MAKE_SRC/configure" ] || [ -f "$MAKE_SRC/bootstrap" ]; then
         printf '%s\n' "$MAKE_SRC"

@@ -297,6 +297,88 @@ wos_refresh_file_mtime() {
     mv "$tmp" "$file"
 }
 
+wos_source_strict_enabled() {
+    case "${WOS_SOURCE_MODE:-}" in
+        offline|strict)
+            return 0
+            ;;
+        ""|developer|online)
+            ;;
+        *)
+            echo "ERROR: WOS_SOURCE_MODE must be developer, online, strict, or offline." >&2
+            return 2
+            ;;
+    esac
+
+    case "${WOS_SOURCE_STRICT:-0}" in
+        1|ON|on|TRUE|true|YES|yes)
+            return 0
+            ;;
+        0|OFF|off|FALSE|false|NO|no|"")
+            return 1
+            ;;
+        *)
+            echo "ERROR: WOS_SOURCE_STRICT must be a boolean value." >&2
+            return 2
+            ;;
+    esac
+}
+
+wos_source_lock_path() {
+    printf '%s\n' "${WOS_SOURCE_LOCK:-$WORKSPACE_ROOT/configs/reproducibility/source-lock.v1.json}"
+}
+
+wos_source_store_path() {
+    local store="${WOS_SOURCE_STORE:-}"
+    if [ -z "$store" ]; then
+        echo "ERROR: strict source mode requires WOS_SOURCE_STORE." >&2
+        return 1
+    fi
+    printf '%s\n' "$store"
+}
+
+wos_source_lock_tool() {
+    printf '%s\n' "${WOS_SOURCE_LOCK_TOOL:-$WORKSPACE_ROOT/scripts/build/source_lock.py}"
+}
+
+wos_verify_locked_archive() {
+    local archive="$1"
+    local strict_status=0
+    wos_source_strict_enabled || strict_status=$?
+    if [ "$strict_status" -eq 1 ]; then
+        return 0
+    fi
+    [ "$strict_status" -eq 0 ] || return "$strict_status"
+    python3 "$(wos_source_lock_tool)" --lock "$(wos_source_lock_path)" \
+        verify-archive --file "$archive" --filename "${archive##*/}"
+}
+
+wos_materialize_locked_git() {
+    local source_id="$1"
+    local destination="$2"
+    local strict_status=0
+    wos_source_strict_enabled || strict_status=$?
+    if [ "$strict_status" -eq 1 ]; then
+        return 1
+    fi
+    [ "$strict_status" -eq 0 ] || return "$strict_status"
+    python3 "$(wos_source_lock_tool)" --lock "$(wos_source_lock_path)" \
+        materialize-git --store "$(wos_source_store_path)" \
+        --id "$source_id" --destination "$destination"
+}
+
+wos_materialize_locked_archive_tree() {
+    local filename="$1"
+    local destination="$2"
+    if ! wos_source_strict_enabled; then
+        echo "ERROR: locked archive trees require strict source mode." >&2
+        return 1
+    fi
+    python3 "$(wos_source_lock_tool)" --lock "$(wos_source_lock_path)" \
+        materialize-archive-tree --store "$(wos_source_store_path)" \
+        --filename "$filename" --destination "$destination" --strip-components 1
+}
+
 wos_download_file() {
     local label="$1"
     local dest="$2"
@@ -312,6 +394,18 @@ wos_download_file() {
     local distdir="${WOS_SOURCE_DISTDIR:-}"
     local candidate
     local basename
+    local strict_status=0
+
+    wos_source_strict_enabled || strict_status=$?
+    if [ "$strict_status" -eq 0 ]; then
+        basename="${dest##*/}"
+        echo "Materializing locked $label from the offline source store..." >&2
+        python3 "$(wos_source_lock_tool)" --lock "$(wos_source_lock_path)" \
+            materialize-archive --store "$(wos_source_store_path)" \
+            --filename "$basename" --destination "$dest"
+        return $?
+    fi
+    [ "$strict_status" -eq 1 ] || return "$strict_status"
 
     case "$attempts" in
         ''|*[!0-9]*|0)
@@ -462,6 +556,7 @@ wos_fetch_meson_git_subproject() {
     local current
     local low_speed_limit="${WOS_GIT_HTTP_LOW_SPEED_LIMIT:-1}"
     local low_speed_time="${WOS_GIT_HTTP_LOW_SPEED_TIME:-60}"
+    local strict_status=0
 
     if [ ! -f "$wrap" ]; then
         echo "ERROR: missing Meson wrap file: $wrap" >&2
@@ -475,6 +570,12 @@ wos_fetch_meson_git_subproject() {
         echo "ERROR: Meson wrap '$wrap' must provide url and revision" >&2
         return 1
     fi
+
+    wos_source_strict_enabled || strict_status=$?
+    if [ "$strict_status" -eq 0 ]; then
+        wos_materialize_locked_git "mlibc-$subproject" "$dest" || return 1
+    fi
+    [ "$strict_status" -eq 0 ] || [ "$strict_status" -eq 1 ] || return "$strict_status"
     case "$low_speed_limit" in
         ''|*[!0-9]*)
             echo "ERROR: WOS_GIT_HTTP_LOW_SPEED_LIMIT must be a non-negative integer, got '$low_speed_limit'" >&2

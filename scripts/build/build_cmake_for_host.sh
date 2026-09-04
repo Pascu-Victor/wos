@@ -43,19 +43,29 @@ require_file() {
 }
 
 ensure_cmake_source() {
+    if wos_source_strict_enabled; then
+        wos_materialize_locked_git cmake "$CMAKE_SRC"
+        return 0
+    fi
     if [ -f "$CMAKE_SRC/CMakeLists.txt" ]; then
         return 0
     fi
 
     if [ -d "$WORKSPACE_ROOT/.git" ]; then
-        git -C "$WORKSPACE_ROOT" submodule update --init toolchain/src/cmake || true
+        if ! wos_source_strict_enabled; then
+            git -C "$WORKSPACE_ROOT" submodule update --init toolchain/src/cmake || true
+        fi
     fi
     if [ -f "$CMAKE_SRC/CMakeLists.txt" ]; then
         return 0
     fi
 
     mkdir -p "$B/src"
-    git clone --branch=wos-support https://github.com/Pascu-Victor/CMake.git "$CMAKE_SRC"
+    if wos_source_strict_enabled; then
+        wos_materialize_locked_git cmake "$CMAKE_SRC"
+    else
+        git clone --branch=wos-support https://github.com/Pascu-Victor/CMake.git "$CMAKE_SRC"
+    fi
 }
 
 host_build_triple() {

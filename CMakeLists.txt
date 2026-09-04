@@ -4,6 +4,145 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "WOS build type" FORCE)
 endif()
 set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS Debug Release RelWithDebInfo MinSizeRel)
+option(WOS_REPRODUCIBLE_BUILD "Enable deterministic build and packaging behavior" OFF)
+set(SOURCE_DATE_EPOCH "0" CACHE STRING "Timestamp used for reproducible generated artifacts")
+set(WOS_SOURCE_MODE "developer" CACHE STRING "Source policy: developer, online, strict, or offline")
+set_property(CACHE WOS_SOURCE_MODE PROPERTY STRINGS developer online strict offline)
+set(WOS_SOURCE_LOCK "${CMAKE_SOURCE_DIR}/configs/reproducibility/source-lock.v1.json" CACHE FILEPATH
+    "Pinned WOS source/toolchain lock")
+set(WOS_SOURCE_STORE "" CACHE PATH "Verified content-addressed source store")
+set(WOS_PRESEEDED_ARTIFACT_MANIFEST "" CACHE FILEPATH
+    "Hash manifest authorizing reuse of preseeded toolchain artifacts")
+
+if(WOS_SOURCE_MODE STREQUAL "strict" OR WOS_SOURCE_MODE STREQUAL "offline")
+    if(NOT WOS_SOURCE_STORE)
+        message(FATAL_ERROR "WOS_SOURCE_MODE=${WOS_SOURCE_MODE} requires WOS_SOURCE_STORE")
+    endif()
+    execute_process(
+        COMMAND python3 ${CMAKE_SOURCE_DIR}/scripts/build/source_lock.py
+                --lock ${WOS_SOURCE_LOCK} validate
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        RESULT_VARIABLE WOS_SOURCE_LOCK_VALIDATE_RESULT
+        ERROR_VARIABLE WOS_SOURCE_LOCK_VALIDATE_ERROR
+    )
+    if(NOT WOS_SOURCE_LOCK_VALIDATE_RESULT EQUAL 0)
+        message(FATAL_ERROR "WOS source lock validation failed: ${WOS_SOURCE_LOCK_VALIDATE_ERROR}")
+    endif()
+    execute_process(
+        COMMAND python3 ${CMAKE_SOURCE_DIR}/scripts/build/source_lock.py
+                --lock ${WOS_SOURCE_LOCK} verify-workspace
+                --workspace ${CMAKE_SOURCE_DIR}
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        RESULT_VARIABLE WOS_SOURCE_WORKSPACE_RESULT
+        ERROR_VARIABLE WOS_SOURCE_WORKSPACE_ERROR
+    )
+    if(NOT WOS_SOURCE_WORKSPACE_RESULT EQUAL 0)
+        message(FATAL_ERROR "WOS locked workspace validation failed: ${WOS_SOURCE_WORKSPACE_ERROR}")
+    endif()
+    set(FETCHCONTENT_FULLY_DISCONNECTED ON CACHE BOOL
+        "Disable FetchContent network access under the strict WOS source policy" FORCE)
+elseif(NOT WOS_SOURCE_MODE STREQUAL "developer" AND NOT WOS_SOURCE_MODE STREQUAL "online")
+    message(FATAL_ERROR "WOS_SOURCE_MODE must be developer, online, strict, or offline")
+endif()
+
+# Keep the normal developer layout unchanged by default.  Reproducibility and
+# automation jobs can opt into one state root so every mutable toolchain, port,
+# staging, and image path is kept out of the source tree and other build roots.
+set(WOS_STATE_ROOT "" CACHE PATH "Optional isolated root for mutable WOS build state")
+if(WOS_STATE_ROOT)
+    cmake_path(ABSOLUTE_PATH WOS_STATE_ROOT
+        BASE_DIRECTORY "${CMAKE_SOURCE_DIR}"
+        NORMALIZE
+        OUTPUT_VARIABLE WOS_STATE_ROOT_ABSOLUTE
+    )
+    set(WOS_STATE_ROOT "${WOS_STATE_ROOT_ABSOLUTE}" CACHE PATH
+        "Optional isolated root for mutable WOS build state" FORCE)
+endif()
+
+function(wos_state_path_default output_var legacy_path isolated_name)
+    if(WOS_STATE_ROOT)
+        set(${output_var} "${WOS_STATE_ROOT}/${isolated_name}" PARENT_SCOPE)
+    else()
+        set(${output_var} "${legacy_path}" PARENT_SCOPE)
+    endif()
+endfunction()
+
+wos_state_path_default(WOS_SYSROOT_PATH_DEFAULT "${CMAKE_SOURCE_DIR}/toolchain/sysroot" "sysroot")
+wos_state_path_default(WOS_MLIBC_BUILD_DIR_DEFAULT "${CMAKE_SOURCE_DIR}/toolchain/mlibc-build" "mlibc-build")
+wos_state_path_default(WOS_MLIBC_CONFORMANCE_STAGE_DIR_DEFAULT "${CMAKE_BINARY_DIR}/mlibc-conformance-stage" "mlibc-conformance-stage")
+wos_state_path_default(WOS_LIBCXX_BUILD_DIR_DEFAULT "${CMAKE_SOURCE_DIR}/toolchain/libcxx-build" "libcxx-build")
+wos_state_path_default(WOS_BUSYBOX_BUILD_DIR_DEFAULT "${CMAKE_SOURCE_DIR}/toolchain/busybox-build" "busybox-build")
+wos_state_path_default(WOS_BUSYBOX_INSTALL_DIR_DEFAULT "${CMAKE_SOURCE_DIR}/toolchain/busybox-install" "busybox-install")
+wos_state_path_default(WOS_DROPBEAR_BUILD_DIR_DEFAULT "${CMAKE_SOURCE_DIR}/toolchain/dropbear-build" "dropbear-build")
+wos_state_path_default(WOS_MAKE_BUILD_DIR_DEFAULT "${CMAKE_SOURCE_DIR}/toolchain/make-build" "make-build")
+wos_state_path_default(WOS_BASH_BUILD_DIR_DEFAULT "${CMAKE_SOURCE_DIR}/toolchain/bash-build" "bash-build")
+wos_state_path_default(WOS_ZLIB_BUILD_DIR_DEFAULT "${CMAKE_SOURCE_DIR}/toolchain/zlib-build" "zlib-build")
+wos_state_path_default(WOS_OPENSSL_BUILD_DIR_DEFAULT "${CMAKE_SOURCE_DIR}/toolchain/openssl-build" "openssl-build")
+wos_state_path_default(WOS_CURL_BUILD_DIR_DEFAULT "${CMAKE_SOURCE_DIR}/toolchain/curl-build" "curl-build")
+wos_state_path_default(WOS_GIT_BUILD_DIR_DEFAULT "${CMAKE_SOURCE_DIR}/toolchain/git-build" "git-build")
+wos_state_path_default(WOS_CLANG_FOR_WOS_BUILD_DIR_DEFAULT "${CMAKE_SOURCE_DIR}/toolchain/clang-wos-build" "clang-wos-build")
+wos_state_path_default(WOS_NINJA_BUILD_DIR_DEFAULT "${CMAKE_SOURCE_DIR}/toolchain/ninja-build" "ninja-build")
+wos_state_path_default(WOS_CMAKE_FOR_HOST_BUILD_DIR_DEFAULT "${CMAKE_SOURCE_DIR}/toolchain/cmake-host-build" "cmake-host-build")
+wos_state_path_default(WOS_CMAKE_FOR_HOST_INSTALL_DIR_DEFAULT "${CMAKE_SOURCE_DIR}/toolchain/host" "host")
+wos_state_path_default(WOS_CMAKE_FOR_WOS_BUILD_DIR_DEFAULT "${CMAKE_SOURCE_DIR}/toolchain/cmake-wos-build" "cmake-wos-build")
+wos_state_path_default(WOS_PYTHON_BUILD_DIR_DEFAULT "${CMAKE_SOURCE_DIR}/toolchain/python-build" "python-build")
+wos_state_path_default(WOS_MESON_BUILD_DIR_DEFAULT "${CMAKE_SOURCE_DIR}/toolchain/meson-build" "meson-build")
+wos_state_path_default(WOS_NASM_BUILD_DIR_DEFAULT "${CMAKE_SOURCE_DIR}/toolchain/nasm-build" "nasm-build")
+wos_state_path_default(WOS_NCURSES_BUILD_DIR_DEFAULT "${CMAKE_SOURCE_DIR}/toolchain/ncurses-build" "ncurses-build")
+wos_state_path_default(WOS_NANO_BUILD_DIR_DEFAULT "${CMAKE_SOURCE_DIR}/toolchain/nano-build" "nano-build")
+wos_state_path_default(WOS_DOOM_ASCII_BUILD_DIR_DEFAULT "${CMAKE_SOURCE_DIR}/toolchain/doom-ascii-build" "doom-ascii-build")
+wos_state_path_default(WOS_TOOLS_OUTPUT_DIR_DEFAULT "${CMAKE_SOURCE_DIR}/tools/build/bin" "tools/bin")
+wos_state_path_default(WOS_BOOT_DISK_DEFAULT "${CMAKE_SOURCE_DIR}/disk.qcow2" "disk.qcow2")
+wos_state_path_default(WOS_ROOTFS_DISK_DEFAULT "${CMAKE_SOURCE_DIR}/mountfs.qcow2" "mountfs.qcow2")
+
+set(WOS_HOST_TOOLCHAIN_PATH "${CMAKE_SOURCE_DIR}/toolchain/host" CACHE PATH
+    "Host toolchain used for Linux cross-builds")
+set(WOS_SYSROOT_PATH "${WOS_SYSROOT_PATH_DEFAULT}" CACHE PATH "WOS target sysroot")
+set(WOS_MLIBC_BUILD_DIR "${WOS_MLIBC_BUILD_DIR_DEFAULT}" CACHE PATH "mlibc build directory")
+set(WOS_MLIBC_CONFORMANCE_STAGE_DIR "${WOS_MLIBC_CONFORMANCE_STAGE_DIR_DEFAULT}" CACHE PATH "Staged WOS mlibc conformance payload")
+set(WOS_LIBCXX_BUILD_DIR "${WOS_LIBCXX_BUILD_DIR_DEFAULT}" CACHE PATH "libc++ build directory")
+set(WOS_BUSYBOX_BUILD_DIR "${WOS_BUSYBOX_BUILD_DIR_DEFAULT}" CACHE PATH "BusyBox build directory")
+set(WOS_BUSYBOX_INSTALL_DIR "${WOS_BUSYBOX_INSTALL_DIR_DEFAULT}" CACHE PATH "BusyBox install staging directory")
+set(WOS_BUSYBOX_CONFIG "${CMAKE_SOURCE_DIR}/configs/busybox/wos_full.config" CACHE FILEPATH "Resolved BusyBox WOS config")
+set(WOS_DROPBEAR_BUILD_DIR "${WOS_DROPBEAR_BUILD_DIR_DEFAULT}" CACHE PATH "Dropbear build directory")
+set(WOS_MAKE_BUILD_DIR "${WOS_MAKE_BUILD_DIR_DEFAULT}" CACHE PATH "GNU make build directory")
+set(WOS_MAKE_SOURCE_DIR "${CMAKE_SOURCE_DIR}/toolchain/src/make" CACHE PATH "GNU make source directory")
+set(WOS_BASH_BUILD_DIR "${WOS_BASH_BUILD_DIR_DEFAULT}" CACHE PATH "Bash build directory")
+set(WOS_BASH_SOURCE_DIR "${CMAKE_SOURCE_DIR}/toolchain/src/bash" CACHE PATH "Bash source directory")
+set(WOS_ZLIB_BUILD_DIR "${WOS_ZLIB_BUILD_DIR_DEFAULT}" CACHE PATH "zlib build directory")
+set(WOS_ZLIB_SOURCE_DIR "${CMAKE_SOURCE_DIR}/toolchain/src/zlib" CACHE PATH "zlib source directory")
+set(WOS_OPENSSL_BUILD_DIR "${WOS_OPENSSL_BUILD_DIR_DEFAULT}" CACHE PATH "OpenSSL build directory")
+set(WOS_OPENSSL_SOURCE_DIR "${CMAKE_SOURCE_DIR}/toolchain/src/openssl" CACHE PATH "OpenSSL source directory")
+set(WOS_CURL_BUILD_DIR "${WOS_CURL_BUILD_DIR_DEFAULT}" CACHE PATH "curl build directory")
+set(WOS_CURL_SOURCE_DIR "${CMAKE_SOURCE_DIR}/toolchain/src/curl" CACHE PATH "curl source directory")
+set(WOS_GIT_BUILD_DIR "${WOS_GIT_BUILD_DIR_DEFAULT}" CACHE PATH "Native WOS Git build directory")
+set(WOS_GIT_SOURCE_DIR "${CMAKE_SOURCE_DIR}/toolchain/src/git" CACHE PATH "Git source directory")
+set(WOS_CLANG_FOR_WOS_BUILD_DIR "${WOS_CLANG_FOR_WOS_BUILD_DIR_DEFAULT}" CACHE PATH "Native WOS clang build directory")
+set(WOS_NINJA_BUILD_DIR "${WOS_NINJA_BUILD_DIR_DEFAULT}" CACHE PATH "Native WOS Ninja build directory")
+set(WOS_CMAKE_FOR_HOST_BUILD_DIR "${WOS_CMAKE_FOR_HOST_BUILD_DIR_DEFAULT}" CACHE PATH "Host CMake build directory")
+set(WOS_CMAKE_FOR_HOST_INSTALL_DIR "${WOS_CMAKE_FOR_HOST_INSTALL_DIR_DEFAULT}" CACHE PATH "Host CMake install prefix")
+set(WOS_CMAKE_FOR_WOS_BUILD_DIR "${WOS_CMAKE_FOR_WOS_BUILD_DIR_DEFAULT}" CACHE PATH "Native WOS CMake build directory")
+set(WOS_PYTHON_SOURCE_DIR "${CMAKE_SOURCE_DIR}/toolchain/src/python" CACHE PATH "CPython source directory")
+set(WOS_PYTHON_BUILD_DIR "${WOS_PYTHON_BUILD_DIR_DEFAULT}" CACHE PATH "Native WOS Python build directory")
+set(WOS_MESON_SOURCE_DIR "${CMAKE_SOURCE_DIR}/toolchain/src/meson" CACHE PATH "Meson source directory")
+set(WOS_MESON_BUILD_DIR "${WOS_MESON_BUILD_DIR_DEFAULT}" CACHE PATH "Native WOS Meson staging directory")
+set(WOS_NASM_SOURCE_DIR "${CMAKE_SOURCE_DIR}/toolchain/src/nasm" CACHE PATH "NASM source directory")
+set(WOS_NASM_BUILD_DIR "${WOS_NASM_BUILD_DIR_DEFAULT}" CACHE PATH "Native WOS NASM build directory")
+set(WOS_NCURSES_SOURCE_DIR "${CMAKE_SOURCE_DIR}/toolchain/src/ncurses" CACHE PATH "ncurses source directory")
+set(WOS_NCURSES_BUILD_DIR "${WOS_NCURSES_BUILD_DIR_DEFAULT}" CACHE PATH "Native WOS ncurses build directory")
+set(WOS_NANO_SOURCE_DIR "${CMAKE_SOURCE_DIR}/toolchain/src/nano" CACHE PATH "GNU nano source directory")
+set(WOS_NANO_BUILD_DIR "${WOS_NANO_BUILD_DIR_DEFAULT}" CACHE PATH "Native WOS nano build directory")
+set(WOS_DOOM_ASCII_SOURCE_DIR "${CMAKE_SOURCE_DIR}/toolchain/src/doom-ascii" CACHE PATH "Doom ASCII source directory")
+set(WOS_DOOM_ASCII_BUILD_DIR "${WOS_DOOM_ASCII_BUILD_DIR_DEFAULT}" CACHE PATH "Native WOS Doom ASCII build directory")
+set(WOS_TOOLS_OUTPUT_DIR "${WOS_TOOLS_OUTPUT_DIR_DEFAULT}" CACHE PATH "Runtime output directory for host-side WOS tools")
+set(WOS_BOOT_DISK "${WOS_BOOT_DISK_DEFAULT}" CACHE FILEPATH "WOS boot disk image")
+set(WOS_ROOTFS_DISK "${WOS_ROOTFS_DISK_DEFAULT}" CACHE FILEPATH "WOS rootfs disk image")
+
+if(WOS_SOURCE_MODE STREQUAL "strict" OR WOS_SOURCE_MODE STREQUAL "offline")
+    set_property(DIRECTORY PROPERTY RULE_LAUNCH_CUSTOM
+        "${CMAKE_SOURCE_DIR}/scripts/build/run_with_source_policy.sh '${WOS_SOURCE_MODE}' '${WOS_SOURCE_LOCK}' '${WOS_SOURCE_STORE}' '${WOS_PRESEEDED_ARTIFACT_MANIFEST}' '${WOS_SYSROOT_PATH}' '${WOS_BUSYBOX_INSTALL_DIR}'"
+    )
+endif()
 
 option(WOS_BUILD_LINUX_BENCHMARKS "Build Linux host benchmark binaries alongside WOS artifacts" OFF)
 set(WOS_TOOLS_BUILD_TYPE Release CACHE STRING "Build type for host-side WOS tools")
@@ -87,6 +226,10 @@ if(WOS_BUILD_HOST_TOOLS)
             -DCMAKE_BUILD_TYPE=${WOS_TOOLS_BUILD_TYPE}
             -DWOS_BUILD_LINUX_BENCHMARKS=${WOS_BUILD_LINUX_BENCHMARKS}
             -DWOS_BUILD_WOSDBG=${WOS_BUILD_WOSDBG}
+            -DWOS_TARGET_TOOLCHAIN_BIN=${WOS_SYSROOT_PATH}/bin
+            -DWOS_HOST_TOOLCHAIN_BIN=${WOS_HOST_TOOLCHAIN_PATH}/bin
+            -DWOS_HOST_TOOLS_BIN=${WOS_TOOLS_OUTPUT_DIR}
+            -DWOS_TOOLS_OUTPUT_DIR=${WOS_TOOLS_OUTPUT_DIR}
             ${WOS_TOOLS_CCACHE_CMAKE_ARGS}
         BUILD_COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR}/tools ${WOS_TOOLS_BUILD_PARALLEL_ARGS}
         INSTALL_COMMAND ""
@@ -114,45 +257,6 @@ add_subdirectory(modules)
 # Toolchain / external build targets
 # ---------------------------------------------------------------------------
 
-set(WOS_SYSROOT_PATH "${CMAKE_SOURCE_DIR}/toolchain/sysroot" CACHE PATH "WOS target sysroot")
-set(WOS_MLIBC_BUILD_DIR "${CMAKE_SOURCE_DIR}/toolchain/mlibc-build" CACHE PATH "mlibc build directory")
-set(WOS_MLIBC_CONFORMANCE_STAGE_DIR "${CMAKE_BINARY_DIR}/mlibc-conformance-stage" CACHE PATH "Staged WOS mlibc conformance payload")
-set(WOS_LIBCXX_BUILD_DIR "${CMAKE_SOURCE_DIR}/toolchain/libcxx-build" CACHE PATH "libc++ build directory")
-set(WOS_BUSYBOX_BUILD_DIR "${CMAKE_SOURCE_DIR}/toolchain/busybox-build" CACHE PATH "BusyBox build directory")
-set(WOS_BUSYBOX_INSTALL_DIR "${CMAKE_SOURCE_DIR}/toolchain/busybox-install" CACHE PATH "BusyBox install staging directory")
-set(WOS_BUSYBOX_CONFIG "${CMAKE_SOURCE_DIR}/configs/busybox/wos_full.config" CACHE FILEPATH "Resolved BusyBox WOS config")
-set(WOS_DROPBEAR_BUILD_DIR "${CMAKE_SOURCE_DIR}/toolchain/dropbear-build" CACHE PATH "Dropbear build directory")
-set(WOS_MAKE_BUILD_DIR "${CMAKE_SOURCE_DIR}/toolchain/make-build" CACHE PATH "GNU make build directory")
-set(WOS_MAKE_SOURCE_DIR "${CMAKE_SOURCE_DIR}/toolchain/src/make" CACHE PATH "GNU make source directory")
-set(WOS_BASH_BUILD_DIR "${CMAKE_SOURCE_DIR}/toolchain/bash-build" CACHE PATH "Bash build directory")
-set(WOS_BASH_SOURCE_DIR "${CMAKE_SOURCE_DIR}/toolchain/src/bash" CACHE PATH "Bash source directory")
-set(WOS_ZLIB_BUILD_DIR "${CMAKE_SOURCE_DIR}/toolchain/zlib-build" CACHE PATH "zlib build directory")
-set(WOS_ZLIB_SOURCE_DIR "${CMAKE_SOURCE_DIR}/toolchain/src/zlib" CACHE PATH "zlib source directory")
-set(WOS_OPENSSL_BUILD_DIR "${CMAKE_SOURCE_DIR}/toolchain/openssl-build" CACHE PATH "OpenSSL build directory")
-set(WOS_OPENSSL_SOURCE_DIR "${CMAKE_SOURCE_DIR}/toolchain/src/openssl" CACHE PATH "OpenSSL source directory")
-set(WOS_CURL_BUILD_DIR "${CMAKE_SOURCE_DIR}/toolchain/curl-build" CACHE PATH "curl build directory")
-set(WOS_CURL_SOURCE_DIR "${CMAKE_SOURCE_DIR}/toolchain/src/curl" CACHE PATH "curl source directory")
-set(WOS_GIT_BUILD_DIR "${CMAKE_SOURCE_DIR}/toolchain/git-build" CACHE PATH "Native WOS Git build directory")
-set(WOS_GIT_SOURCE_DIR "${CMAKE_SOURCE_DIR}/toolchain/src/git" CACHE PATH "Git source directory")
-set(WOS_CLANG_FOR_WOS_BUILD_DIR "${CMAKE_SOURCE_DIR}/toolchain/clang-wos-build" CACHE PATH "Native WOS clang build directory")
-set(WOS_NINJA_BUILD_DIR "${CMAKE_SOURCE_DIR}/toolchain/ninja-build" CACHE PATH "Native WOS Ninja build directory")
-set(WOS_CMAKE_FOR_HOST_BUILD_DIR "${CMAKE_SOURCE_DIR}/toolchain/cmake-host-build" CACHE PATH "Host CMake build directory")
-set(WOS_CMAKE_FOR_HOST_INSTALL_DIR "${CMAKE_SOURCE_DIR}/toolchain/host" CACHE PATH "Host CMake install prefix")
-set(WOS_CMAKE_FOR_WOS_BUILD_DIR "${CMAKE_SOURCE_DIR}/toolchain/cmake-wos-build" CACHE PATH "Native WOS CMake build directory")
-set(WOS_PYTHON_SOURCE_DIR "${CMAKE_SOURCE_DIR}/toolchain/src/python" CACHE PATH "CPython source directory")
-set(WOS_PYTHON_BUILD_DIR "${CMAKE_SOURCE_DIR}/toolchain/python-build" CACHE PATH "Native WOS Python build directory")
-set(WOS_MESON_SOURCE_DIR "${CMAKE_SOURCE_DIR}/toolchain/src/meson" CACHE PATH "Meson source directory")
-set(WOS_MESON_BUILD_DIR "${CMAKE_SOURCE_DIR}/toolchain/meson-build" CACHE PATH "Native WOS Meson staging directory")
-set(WOS_NASM_SOURCE_DIR "${CMAKE_SOURCE_DIR}/toolchain/src/nasm" CACHE PATH "NASM source directory")
-set(WOS_NASM_BUILD_DIR "${CMAKE_SOURCE_DIR}/toolchain/nasm-build" CACHE PATH "Native WOS NASM build directory")
-set(WOS_NCURSES_SOURCE_DIR "${CMAKE_SOURCE_DIR}/toolchain/src/ncurses" CACHE PATH "ncurses source directory")
-set(WOS_NCURSES_BUILD_DIR "${CMAKE_SOURCE_DIR}/toolchain/ncurses-build" CACHE PATH "Native WOS ncurses build directory")
-set(WOS_NANO_SOURCE_DIR "${CMAKE_SOURCE_DIR}/toolchain/src/nano" CACHE PATH "GNU nano source directory")
-set(WOS_NANO_BUILD_DIR "${CMAKE_SOURCE_DIR}/toolchain/nano-build" CACHE PATH "Native WOS nano build directory")
-set(WOS_DOOM_ASCII_SOURCE_DIR "${CMAKE_SOURCE_DIR}/toolchain/src/doom-ascii" CACHE PATH "Doom ASCII source directory")
-set(WOS_DOOM_ASCII_BUILD_DIR "${CMAKE_SOURCE_DIR}/toolchain/doom-ascii-build" CACHE PATH "Native WOS Doom ASCII build directory")
-set(WOS_BOOT_DISK "${CMAKE_SOURCE_DIR}/disk.qcow2" CACHE FILEPATH "WOS boot disk image")
-set(WOS_ROOTFS_DISK "${CMAKE_SOURCE_DIR}/mountfs.qcow2" CACHE FILEPATH "WOS rootfs disk image")
 option(WOS_SKIP_LIBCXX_INSTALL "Skip the libc++ install target; useful when an isolated sysroot is pre-seeded" OFF)
 set(WOS_BUILD_MLIBC_CONFORMANCE_DEFAULT ON)
 if(WOS_NATIVE_SYSTEM_BUILD)
@@ -260,6 +364,7 @@ else()
     add_custom_command(
         OUTPUT ${MLIBC_STAMP}
         COMMAND ${CMAKE_COMMAND} -E env
+                WOS_HOST_TOOLCHAIN_ROOT=${WOS_HOST_TOOLCHAIN_PATH}
                 WOS_SYSROOT_PATH=${WOS_SYSROOT_PATH}
                 WOS_MLIBC_BUILD_DIR=${WOS_MLIBC_BUILD_DIR}
                 ${WOS_BUILD_SCRIPTS_DIR}/build_mlibc.sh ${CMAKE_BUILD_TYPE}
@@ -287,6 +392,7 @@ if(WOS_BUILD_MLIBC_CONFORMANCE)
     add_custom_command(
         OUTPUT ${MLIBC_CONFORMANCE_STAMP}
         COMMAND ${CMAKE_COMMAND} -E env
+                WOS_HOST_TOOLCHAIN_ROOT=${WOS_HOST_TOOLCHAIN_PATH}
                 WOS_SYSROOT_PATH=${WOS_SYSROOT_PATH}
                 WOS_MLIBC_BUILD_DIR=${WOS_MLIBC_BUILD_DIR}
                 WOS_MLIBC_BUILD_TESTS=1
@@ -334,6 +440,7 @@ else()
     add_custom_command(
         OUTPUT ${LIBCXX_STAMP}
         COMMAND ${CMAKE_COMMAND} -E env
+                WOS_HOST_TOOLCHAIN_ROOT=${WOS_HOST_TOOLCHAIN_PATH}
                 WOS_LIBCXX_BUILD_DIR=${LIBCXX_BUILD_DIR}
                 ${WOS_BUILD_SCRIPTS_DIR}/build_libcxx_for_wos.sh
         COMMAND ${CMAKE_COMMAND} -E touch ${LIBCXX_STAMP}
@@ -360,6 +467,7 @@ else()
     add_custom_command(
         OUTPUT ${BUSYBOX_STAMP}
         COMMAND ${CMAKE_COMMAND} -E env
+                WOS_HOST_TOOLCHAIN_ROOT=${WOS_HOST_TOOLCHAIN_PATH}
                 WOS_SYSROOT_PATH=${WOS_SYSROOT_PATH}
                 WOS_BUSYBOX_BUILD_DIR=${WOS_BUSYBOX_BUILD_DIR}
                 WOS_BUSYBOX_INSTALL_DIR=${WOS_BUSYBOX_INSTALL_DIR}
@@ -387,6 +495,7 @@ else()
     add_custom_command(
         OUTPUT ${DROPBEAR_STAMP}
         COMMAND ${CMAKE_COMMAND} -E env
+                WOS_HOST_TOOLCHAIN_ROOT=${WOS_HOST_TOOLCHAIN_PATH}
                 WOS_SYSROOT_PATH=${WOS_SYSROOT_PATH}
                 WOS_DROPBEAR_BUILD_DIR=${WOS_DROPBEAR_BUILD_DIR}
                 ${WOS_BUILD_SCRIPTS_DIR}/build_dropbear.sh
@@ -412,6 +521,7 @@ else()
     add_custom_command(
         OUTPUT ${GNU_MAKE_STAMP}
         COMMAND ${CMAKE_COMMAND} -E env
+                WOS_HOST_TOOLCHAIN_ROOT=${WOS_HOST_TOOLCHAIN_PATH}
                 WOS_SYSROOT_PATH=${WOS_SYSROOT_PATH}
                 WOS_MAKE_BUILD_DIR=${WOS_MAKE_BUILD_DIR}
                 WOS_MAKE_SOURCE_DIR=${WOS_MAKE_SOURCE_DIR}
@@ -439,6 +549,7 @@ if(WOS_BUILD_BASH_FOR_WOS)
         add_custom_command(
             OUTPUT ${BASH_FOR_WOS_STAMP}
             COMMAND ${CMAKE_COMMAND} -E env
+                    WOS_HOST_TOOLCHAIN_ROOT=${WOS_HOST_TOOLCHAIN_PATH}
                     WOS_SYSROOT_PATH=${WOS_SYSROOT_PATH}
                     WOS_BASH_BUILD_DIR=${WOS_BASH_BUILD_DIR}
                     WOS_BASH_SOURCE_DIR=${WOS_BASH_SOURCE_DIR}
@@ -471,6 +582,7 @@ if(WOS_BUILD_CURL_FOR_WOS OR WOS_BUILD_GIT_FOR_WOS)
         add_custom_command(
             OUTPUT ${ZLIB_FOR_WOS_STAMP}
             COMMAND ${CMAKE_COMMAND} -E env
+                    WOS_HOST_TOOLCHAIN_ROOT=${WOS_HOST_TOOLCHAIN_PATH}
                     WOS_SYSROOT_PATH=${WOS_SYSROOT_PATH}
                     WOS_ZLIB_BUILD_DIR=${WOS_ZLIB_BUILD_DIR}
                     WOS_ZLIB_SOURCE_DIR=${WOS_ZLIB_SOURCE_DIR}
@@ -503,6 +615,7 @@ if(WOS_BUILD_OPENSSL_FOR_WOS OR WOS_BUILD_CURL_FOR_WOS OR WOS_BUILD_GIT_FOR_WOS)
         add_custom_command(
             OUTPUT ${OPENSSL_FOR_WOS_STAMP}
             COMMAND ${CMAKE_COMMAND} -E env
+                    WOS_HOST_TOOLCHAIN_ROOT=${WOS_HOST_TOOLCHAIN_PATH}
                     WOS_SYSROOT_PATH=${WOS_SYSROOT_PATH}
                     WOS_OPENSSL_BUILD_DIR=${WOS_OPENSSL_BUILD_DIR}
                     WOS_OPENSSL_SOURCE_DIR=${WOS_OPENSSL_SOURCE_DIR}
@@ -536,6 +649,7 @@ if(WOS_BUILD_CURL_FOR_WOS OR WOS_BUILD_GIT_FOR_WOS)
         add_custom_command(
             OUTPUT ${CURL_FOR_WOS_STAMP}
             COMMAND ${CMAKE_COMMAND} -E env
+                    WOS_HOST_TOOLCHAIN_ROOT=${WOS_HOST_TOOLCHAIN_PATH}
                     WOS_SYSROOT_PATH=${WOS_SYSROOT_PATH}
                     WOS_CURL_BUILD_DIR=${WOS_CURL_BUILD_DIR}
                     WOS_CURL_SOURCE_DIR=${WOS_CURL_SOURCE_DIR}
@@ -577,6 +691,7 @@ if(WOS_BUILD_GIT_FOR_WOS)
         add_custom_command(
             OUTPUT ${GIT_FOR_WOS_STAMP}
             COMMAND ${CMAKE_COMMAND} -E env
+                    WOS_HOST_TOOLCHAIN_ROOT=${WOS_HOST_TOOLCHAIN_PATH}
                     WOS_SYSROOT_PATH=${WOS_SYSROOT_PATH}
                     WOS_GIT_BUILD_DIR=${WOS_GIT_BUILD_DIR}
                     WOS_GIT_SOURCE_DIR=${WOS_GIT_SOURCE_DIR}
@@ -614,6 +729,7 @@ if(WOS_BUILD_CMAKE_FOR_HOST)
     add_custom_command(
         OUTPUT ${CMAKE_FOR_HOST_STAMP}
         COMMAND ${CMAKE_COMMAND} -E env
+                WOS_HOST_TOOLCHAIN_ROOT=${WOS_HOST_TOOLCHAIN_PATH}
                 WOS_CMAKE_FOR_HOST_BUILD_DIR=${WOS_CMAKE_FOR_HOST_BUILD_DIR}
                 WOS_CMAKE_FOR_HOST_INSTALL_DIR=${WOS_CMAKE_FOR_HOST_INSTALL_DIR}
                 ${WOS_BUILD_SCRIPTS_DIR}/build_cmake_for_host.sh
@@ -670,6 +786,7 @@ if(WOS_BUILD_CLANG_FOR_WOS)
         add_custom_command(
             OUTPUT ${CLANG_FOR_WOS_STAMP}
             COMMAND ${CMAKE_COMMAND} -E env
+                    WOS_HOST_TOOLCHAIN_ROOT=${WOS_HOST_TOOLCHAIN_PATH}
                     WOS_SYSROOT_PATH=${WOS_SYSROOT_PATH}
                     WOS_CLANG_FOR_WOS_BUILD_DIR=${WOS_CLANG_FOR_WOS_BUILD_DIR}
                     ${WOS_BUILD_SCRIPTS_DIR}/build_clang_for_wos.sh
@@ -709,6 +826,7 @@ if(WOS_BUILD_NINJA_FOR_WOS)
         add_custom_command(
             OUTPUT ${NINJA_FOR_WOS_STAMP}
             COMMAND ${CMAKE_COMMAND} -E env
+                    WOS_HOST_TOOLCHAIN_ROOT=${WOS_HOST_TOOLCHAIN_PATH}
                     WOS_SYSROOT_PATH=${WOS_SYSROOT_PATH}
                     WOS_NINJA_BUILD_DIR=${WOS_NINJA_BUILD_DIR}
                     ${WOS_BUILD_SCRIPTS_DIR}/build_ninja_for_wos.sh
@@ -746,6 +864,7 @@ if(WOS_BUILD_CMAKE_FOR_WOS)
         add_custom_command(
             OUTPUT ${CMAKE_FOR_WOS_STAMP}
             COMMAND ${CMAKE_COMMAND} -E env
+                    WOS_HOST_TOOLCHAIN_ROOT=${WOS_HOST_TOOLCHAIN_PATH}
                     WOS_SYSROOT_PATH=${WOS_SYSROOT_PATH}
                     WOS_CMAKE_FOR_WOS_BUILD_DIR=${WOS_CMAKE_FOR_WOS_BUILD_DIR}
                     ${WOS_BUILD_SCRIPTS_DIR}/build_cmake_for_wos.sh
@@ -784,6 +903,7 @@ if(WOS_BUILD_PYTHON_FOR_WOS)
         add_custom_command(
             OUTPUT ${PYTHON_FOR_WOS_STAMP}
             COMMAND ${CMAKE_COMMAND} -E env
+                    WOS_HOST_TOOLCHAIN_ROOT=${WOS_HOST_TOOLCHAIN_PATH}
                     WOS_SYSROOT_PATH=${WOS_SYSROOT_PATH}
                     WOS_PYTHON_BUILD_DIR=${WOS_PYTHON_BUILD_DIR}
                     WOS_PYTHON_SOURCE_DIR=${WOS_PYTHON_SOURCE_DIR}
@@ -826,6 +946,7 @@ if(WOS_BUILD_MESON_FOR_WOS)
         add_custom_command(
             OUTPUT ${MESON_FOR_WOS_STAMP}
             COMMAND ${CMAKE_COMMAND} -E env
+                    WOS_HOST_TOOLCHAIN_ROOT=${WOS_HOST_TOOLCHAIN_PATH}
                     WOS_SYSROOT_PATH=${WOS_SYSROOT_PATH}
                     WOS_MESON_SOURCE_DIR=${WOS_MESON_SOURCE_DIR}
                     WOS_MESON_BUILD_DIR=${WOS_MESON_BUILD_DIR}
@@ -860,6 +981,7 @@ if(WOS_BUILD_NASM_FOR_WOS)
         add_custom_command(
             OUTPUT ${NASM_FOR_WOS_STAMP}
             COMMAND ${CMAKE_COMMAND} -E env
+                    WOS_HOST_TOOLCHAIN_ROOT=${WOS_HOST_TOOLCHAIN_PATH}
                     WOS_SYSROOT_PATH=${WOS_SYSROOT_PATH}
                     WOS_NASM_SOURCE_DIR=${WOS_NASM_SOURCE_DIR}
                     WOS_NASM_BUILD_DIR=${WOS_NASM_BUILD_DIR}
@@ -894,6 +1016,7 @@ if(WOS_BUILD_NCURSES_FOR_WOS OR WOS_BUILD_NANO_FOR_WOS)
         add_custom_command(
             OUTPUT ${NCURSES_FOR_WOS_STAMP}
             COMMAND ${CMAKE_COMMAND} -E env
+                    WOS_HOST_TOOLCHAIN_ROOT=${WOS_HOST_TOOLCHAIN_PATH}
                     WOS_SYSROOT_PATH=${WOS_SYSROOT_PATH}
                     WOS_NCURSES_SOURCE_DIR=${WOS_NCURSES_SOURCE_DIR}
                     WOS_NCURSES_BUILD_DIR=${WOS_NCURSES_BUILD_DIR}
@@ -935,6 +1058,7 @@ if(WOS_BUILD_NANO_FOR_WOS)
         add_custom_command(
             OUTPUT ${NANO_FOR_WOS_STAMP}
             COMMAND ${CMAKE_COMMAND} -E env
+                    WOS_HOST_TOOLCHAIN_ROOT=${WOS_HOST_TOOLCHAIN_PATH}
                     WOS_SYSROOT_PATH=${WOS_SYSROOT_PATH}
                     WOS_NANO_SOURCE_DIR=${WOS_NANO_SOURCE_DIR}
                     WOS_NANO_BUILD_DIR=${WOS_NANO_BUILD_DIR}
@@ -976,6 +1100,7 @@ if(WOS_BUILD_DOOM_ASCII_FOR_WOS)
         add_custom_command(
             OUTPUT ${DOOM_ASCII_FOR_WOS_STAMP}
             COMMAND ${CMAKE_COMMAND} -E env
+                    WOS_HOST_TOOLCHAIN_ROOT=${WOS_HOST_TOOLCHAIN_PATH}
                     WOS_SYSROOT_PATH=${WOS_SYSROOT_PATH}
                     WOS_DOOM_ASCII_SOURCE_DIR=${WOS_DOOM_ASCII_SOURCE_DIR}
                     WOS_DOOM_ASCII_BUILD_DIR=${WOS_DOOM_ASCII_BUILD_DIR}
@@ -1031,7 +1156,9 @@ if(WOS_BUILD_DISK_IMAGES)
                 WOS_SYSROOT_PATH=${WOS_SYSROOT_PATH}
                 WOS_BUSYBOX_INSTALL_DIR=${WOS_BUSYBOX_INSTALL_DIR}
                 WOS_ROOTFS_DISK=${WOS_ROOTFS_DISK}
-                bash -c "if [ -f '${WOS_ROOTFS_DISK}' ]\; then '${WOS_BUILD_SCRIPTS_DIR}/sync_rootfs.sh'\; else '${WOS_BUILD_SCRIPTS_DIR}/create_mountfs_disk.sh'\; fi"
+                WOS_REPRODUCIBLE_BUILD=${WOS_REPRODUCIBLE_BUILD}
+                SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}
+                ${WOS_BUILD_SCRIPTS_DIR}/update_mountfs_disk.sh
         COMMAND ${CMAKE_COMMAND} -E touch ${MOUNTFS_STAMP}
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
         COMMENT "Syncing rootfs disk..."
@@ -1042,6 +1169,7 @@ if(WOS_BUILD_DISK_IMAGES)
             ${WOS_BUILD_SCRIPTS_DIR}/rootfs_delta.py
             ${WOS_BUILD_SCRIPTS_DIR}/rootfs_qcow_xfs_delta.py
             ${WOS_BUILD_SCRIPTS_DIR}/sync_rootfs.sh
+            ${WOS_BUILD_SCRIPTS_DIR}/update_mountfs_disk.sh
             ${CMAKE_SOURCE_DIR}/configs/system.conf
             ${CMAKE_SOURCE_DIR}/configs/wos-services.conf
             ${CMAKE_SOURCE_DIR}/configs/vfstab
@@ -1117,6 +1245,8 @@ if(WOS_BUILD_DISK_IMAGES)
                 WOS_BUSYBOX_INSTALL_DIR=${WOS_BUSYBOX_INSTALL_DIR}
                 WOS_BOOT_DISK=${WOS_BOOT_DISK}
                 WOS_ROOTFS_DISK=${WOS_ROOTFS_DISK}
+                WOS_REPRODUCIBLE_BUILD=${WOS_REPRODUCIBLE_BUILD}
+                SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}
                 ${WOS_BUILD_SCRIPTS_DIR}/make_image.sh
         COMMAND ${CMAKE_COMMAND} -E touch ${BOOT_IMAGE_STAMP}
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
@@ -1250,3 +1380,88 @@ endif()
 if(WOS_BUILD_GIT_FOR_WOS)
     add_dependencies(wos_full git_for_wos)
 endif()
+
+# --- source authority and build attestations ------------------------------
+set(WOS_ATTESTATION_DIR "${CMAKE_BINARY_DIR}/attestation" CACHE PATH
+    "Output directory for WOS provenance and SPDX documents")
+add_custom_target(wos_source_lock_check
+    COMMAND python3 ${CMAKE_SOURCE_DIR}/scripts/build/source_lock.py
+            --lock ${WOS_SOURCE_LOCK} validate
+    COMMAND python3 ${CMAKE_SOURCE_DIR}/scripts/build/source_lock.py
+            --lock ${WOS_SOURCE_LOCK} verify-workspace
+            --workspace ${CMAKE_SOURCE_DIR}
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    COMMENT "Validating the pinned WOS source/toolchain set..."
+    VERBATIM
+)
+
+set(WOS_ATTEST_ARTIFACT_ARGS
+    --artifact kernel=$<TARGET_FILE:wos>
+    --artifact init=$<TARGET_FILE:init>
+    --artifact testprog=$<TARGET_FILE:testprog>
+    --artifact testd=$<TARGET_FILE:testd>
+    --artifact netd=$<TARGET_FILE:netd>
+    --artifact httpd=$<TARGET_FILE:httpd>
+    --artifact debugserver=$<TARGET_FILE:debugserver>
+    --artifact perf=$<TARGET_FILE:perf>
+    --artifact top=$<TARGET_FILE:top>
+    --artifact memacc=$<TARGET_FILE:memacc>
+    --artifact journal=$<TARGET_FILE:journal>
+    --artifact libjournal=$<TARGET_FILE:journal_lib>
+    --artifact wkictl=$<TARGET_FILE:wkictl>
+    --artifact powerctl=$<TARGET_FILE:powerctl>
+    --artifact servicectl=$<TARGET_FILE:servicectl>
+    --artifact renderbench=$<TARGET_FILE:renderbench>
+    --artifact strace=$<TARGET_FILE:strace>
+    --artifact sftpserver=$<TARGET_FILE:sftpserver>
+    --artifact sysroot=${WOS_SYSROOT_PATH}
+)
+set(WOS_ATTEST_ROOT_ARGS
+    --root workspace=${CMAKE_SOURCE_DIR}
+    --root build=${CMAKE_BINARY_DIR}
+)
+if(WOS_STATE_ROOT)
+    list(APPEND WOS_ATTEST_ROOT_ARGS --root state=${WOS_STATE_ROOT})
+endif()
+if(WOS_BUILD_DISK_IMAGES)
+    list(APPEND WOS_ATTEST_ARTIFACT_ARGS
+        --artifact initramfs=${INITRAMFS_OUTPUT}
+        --artifact boot-disk=${WOS_BOOT_DISK}
+        --artifact rootfs-disk=${WOS_ROOTFS_DISK}
+    )
+endif()
+
+file(GENERATE OUTPUT "${CMAKE_BINARY_DIR}/wos-attested-command.json" CONTENT
+    "[[\"${CMAKE_COMMAND}\",\"--build\",\"/wos/build\",\"--target\",\"wos_full\"]]\n"
+)
+add_custom_target(wos_attest
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${WOS_ATTESTATION_DIR}
+    COMMAND ${CMAKE_COMMAND} -E env
+            SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}
+            WOS_SOURCE_MODE=${WOS_SOURCE_MODE}
+            python3 ${CMAKE_SOURCE_DIR}/scripts/build/wos_artifacts.py provenance
+            --lock ${WOS_SOURCE_LOCK}
+            --source-root ${CMAKE_SOURCE_DIR}
+            ${WOS_ATTEST_ROOT_ARGS}
+            --command-json ${CMAKE_BINARY_DIR}/wos-attested-command.json
+            --env SOURCE_DATE_EPOCH
+            --env WOS_SOURCE_MODE
+            --tool cmake=${CMAKE_COMMAND}
+            --tool clang=${WOS_HOST_TOOLCHAIN_PATH}/bin/clang
+            ${WOS_ATTEST_ARTIFACT_ARGS}
+            --output ${WOS_ATTESTATION_DIR}/provenance.json
+    COMMAND ${CMAKE_COMMAND} -E env SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}
+            python3 ${CMAKE_SOURCE_DIR}/scripts/build/wos_artifacts.py sbom
+            --lock ${WOS_SOURCE_LOCK}
+            ${WOS_ATTEST_ROOT_ARGS}
+            ${WOS_ATTEST_ARTIFACT_ARGS}
+            --output ${WOS_ATTESTATION_DIR}/sbom.spdx.json
+    COMMAND python3 ${CMAKE_SOURCE_DIR}/scripts/build/wos_artifacts.py
+            validate provenance ${WOS_ATTESTATION_DIR}/provenance.json
+    COMMAND python3 ${CMAKE_SOURCE_DIR}/scripts/build/wos_artifacts.py
+            validate sbom ${WOS_ATTESTATION_DIR}/sbom.spdx.json --strict
+    DEPENDS wos_full wos_source_lock_check
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    COMMENT "Writing validated WOS provenance and SPDX 2.3 SBOM..."
+    VERBATIM
+)

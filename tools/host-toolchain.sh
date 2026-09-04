@@ -52,8 +52,24 @@ esac
 mkdir -p $B/src
 cd $B/src
 
-[ ! -d mlibc ] && git clone --depth=1 --branch=wos-support https://github.com/Pascu-Victor/mlibc.git
-[ ! -d llvm-project ] && git clone --depth=1 --branch=wos https://github.com/Pascu-Victor/llvm-project.git
+if wos_source_strict_enabled; then
+    wos_materialize_locked_git mlibc "$B/src/mlibc"
+    wos_materialize_locked_git llvm-project "$B/src/llvm-project"
+fi
+if [ ! -d mlibc ]; then
+    if wos_source_strict_enabled; then
+        wos_materialize_locked_git mlibc "$B/src/mlibc"
+    else
+        git clone --depth=1 --branch=wos-support https://github.com/Pascu-Victor/mlibc.git
+    fi
+fi
+if [ ! -d llvm-project ]; then
+    if wos_source_strict_enabled; then
+        wos_materialize_locked_git llvm-project "$B/src/llvm-project"
+    else
+        git clone --depth=1 --branch=wos https://github.com/Pascu-Victor/llvm-project.git
+    fi
+fi
 
 WOS_BUILD_CLANG_TIDY_CACHE=0
 case "$WOS_HOST_CLANG_TIDY_CACHE" in
@@ -79,7 +95,9 @@ if [ "$WOS_BUILD_CLANG_TIDY_CACHE" -eq 1 ] && ! command -v go >/dev/null 2>&1; t
 fi
 
 if [ "$WOS_BUILD_CLANG_TIDY_CACHE" -eq 1 ]; then
-    if [ -d clang-tidy-cache ] || git clone --depth=1 https://github.com/williamfligor/clang-tidy-cache.git; then
+    if wos_source_strict_enabled; then
+        wos_materialize_locked_git clang-tidy-cache "$B/src/clang-tidy-cache"
+    elif [ -d clang-tidy-cache ] || git clone --depth=1 https://github.com/williamfligor/clang-tidy-cache.git; then
         :
     else
         echo "WARNING: clang-tidy-cache clone failed; continuing without this optional helper." >&2

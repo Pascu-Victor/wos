@@ -26,6 +26,10 @@ BB_SHARED_DIR="$BB_BUILD/0_lib"
 BB_KBUILD_TOOLS="$BB_BUILD/wos-kbuild-tools"
 
 BB_SRC="$B/src/busybox"
+if wos_source_strict_enabled; then
+    wos_materialize_locked_git busybox "$BB_SRC"
+fi
+
 if [ ! -d "$BB_SRC" ]; then
     echo "ERROR: busybox source directory not found at $BB_SRC"
     echo "Run tools/bootstrap.sh first to bootstrap sources."

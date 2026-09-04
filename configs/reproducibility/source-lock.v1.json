@@ -1,0 +1,378 @@
+{
+  "$schema": "source-lock.schema.json",
+  "schemaVersion": 1,
+  "generatedBy": "scripts/build/source_lock.py",
+  "workspace": {
+    "source": "https://github.com/Pascu-Victor/wos.git",
+    "license": "Apache-2.0"
+  },
+  "gitSources": [
+    {
+      "id": "limine",
+      "path": "modules/extern/limine",
+      "urls": ["https://github.com/limine-bootloader/limine.git"],
+      "commit": "d33fb37a911738f7786e313065a81ffa79800403",
+      "treeSha256": "a22de336a40fe5798ea0d9228d05c83cd07d56784655bccc7886708311e90b90",
+      "license": "BSD-2-Clause",
+      "role": "boot protocol headers"
+    },
+    {
+      "id": "llvm-project",
+      "path": "toolchain/src/llvm-project",
+      "urls": ["https://github.com/Pascu-Victor/llvm-project.git"],
+      "commit": "02f6b2fa43468f3c695ac20c185f331a28d57786",
+      "treeSha256": "a7fe1fde97592335608fb7a5ad4bc04e292662c2c1f47af4d1f933325f528fd7",
+      "license": "Apache-2.0 WITH LLVM-exception",
+      "role": "host and target compiler runtimes"
+    },
+    {
+      "id": "mlibc",
+      "path": "toolchain/src/mlibc",
+      "urls": ["https://github.com/Pascu-Victor/mlibc.git"],
+      "commit": "17fdb933d0ab5624ef027efb2bc5473744c10713",
+      "treeSha256": "55f78f5649a6e09f14513457ea484dcea10e170e9cfbc8b33ae5900aa4890131",
+      "license": "MIT",
+      "role": "WOS libc"
+    },
+    {
+      "id": "dropbear",
+      "path": "toolchain/src/dropbear",
+      "urls": ["https://github.com/Pascu-Victor/dropbear.git"],
+      "commit": "2183fd364769021321f26c8d15a4fef3404043d7",
+      "treeSha256": "dfbef19a5e1d777235cb2532f9caffdd8feedd943ed39de79933e65a81a4253a",
+      "license": "MIT AND BSD-2-Clause AND Public-Domain",
+      "role": "SSH userspace"
+    },
+    {
+      "id": "busybox",
+      "path": "toolchain/src/busybox",
+      "urls": ["https://github.com/Pascu-Victor/busybox.git"],
+      "commit": "1a5a194bc692cbfcdb16a31395476c5c131f6834",
+      "treeSha256": "946d92c935cbb8c1cb97ac065af06234f05848402f38a88a1096530f421d7a45",
+      "license": "GPL-2.0-only",
+      "role": "base userspace"
+    },
+    {
+      "id": "wiremcp",
+      "path": "tools/wireshark/WireMCP",
+      "urls": ["https://github.com/0xKoda/WireMCP.git"],
+      "commit": "7f45f8b2b4adeb76be8c6227eefb38533fdd6b1e",
+      "treeSha256": "64dc20604fc24c1487b3614c8b30dcee4721c70be8bdc8a703e090727d9533df",
+      "license": "MIT",
+      "role": "Wireshark host integration"
+    },
+    {
+      "id": "cmake",
+      "path": "toolchain/src/cmake",
+      "urls": ["https://github.com/Pascu-Victor/CMake.git"],
+      "commit": "952ea1dd5bdecdcbe65907cbdd9bec8f6f49edb8",
+      "treeSha256": "fcf5f45b88b301c7d72c3526509f7a0b6943cd8b2809b2d5827b64d3514178af",
+      "license": "BSD-3-Clause",
+      "role": "host and target build tool"
+    },
+    {
+      "id": "ninja",
+      "path": "toolchain/src/ninja",
+      "urls": ["https://github.com/Pascu-Victor/ninja.git"],
+      "commit": "96a44de024d9450e547cc98a86032a48c5ac42fd",
+      "treeSha256": "d9e3cdb12ac9b2a8de3276e082f96cf269d27aaef18bb9437fac0a6d997f71a4",
+      "license": "Apache-2.0",
+      "role": "target build tool"
+    },
+    {
+      "id": "python",
+      "path": "toolchain/src/python",
+      "urls": ["https://github.com/Pascu-Victor/cpython.git"],
+      "commit": "5ae5aba9fecf61c9af1573d7b608dd035b2eb8d9",
+      "treeSha256": "e3e44fa14b446cb7e66eb3d3cef97bbb0c2d5e325b4cebee055235a26c124694",
+      "license": "Python-2.0",
+      "role": "target interpreter"
+    },
+    {
+      "id": "nasm",
+      "path": "toolchain/src/nasm",
+      "urls": ["https://github.com/Pascu-Victor/nasm.git"],
+      "commit": "dfbf339025439736eefb2346f5d1550dc2e50897",
+      "treeSha256": "d04843ee3ae53a00bef36ba84a8de8f795b760b9d7ee7ad653262d829c5d85d0",
+      "license": "BSD-2-Clause",
+      "role": "target assembler"
+    },
+    {
+      "id": "clang-tidy-cache",
+      "path": "toolchain/src/clang-tidy-cache",
+      "urls": ["https://github.com/williamfligor/clang-tidy-cache.git"],
+      "commit": "36dc3b03b99a0d8fafacab8ad16a5b4dd2136650",
+      "treeSha256": "6472bf2df2f32ae13c0600d1e74046a5bf03afe42e844e2993c8597c82c37535",
+      "license": "MIT",
+      "role": "optional host build cache"
+    },
+    {
+      "id": "git",
+      "path": "toolchain/src/git",
+      "urls": ["https://github.com/Pascu-Victor/git.git"],
+      "commit": "de52f113d4ab707ad8aadc227ad223ab3ff6820c",
+      "treeSha256": "d48e756dc6d1efb4acd1c6c2392cd4865fe3d2eff7ba8d20901c8c9aae078294",
+      "license": "GPL-2.0-only",
+      "role": "target version control"
+    },
+    {
+      "id": "doom-ascii",
+      "path": "toolchain/src/doom-ascii",
+      "urls": ["https://github.com/wojciech-graj/doom-ascii.git"],
+      "commit": "b5188d7c9c4da6c81264a7803e8725ac3df2cfea",
+      "treeSha256": "96125f420dd2ac1141ad7a327e24631b20a96a14ff23a7a6cfe305d2b5225556",
+      "license": "GPL-2.0-or-later",
+      "role": "target demo port"
+    },
+    {
+      "id": "git-sha1collisiondetection",
+      "urls": ["https://github.com/cr-marcstevens/sha1collisiondetection.git"],
+      "commit": "855827c583bc30645ba427885caa40c5b81764d2",
+      "license": "MIT",
+      "role": "nested Git submodule with update=none",
+      "storeRequired": false
+    },
+    {
+      "id": "mlibc-freestnd-c-hdrs",
+      "path": "toolchain/src/mlibc/subprojects/freestnd-c-hdrs",
+      "urls": ["https://github.com/osdev0/freestnd-c-hdrs.git"],
+      "commit": "d33711241b46ecb8f2ad33927fcefdcb3ac0162e",
+      "treeSha256": "361cea2635dd01aef6b6f2a23b57748cbfd6ddf9291d3da1c8583092b199cffb",
+      "license": "BSD-2-Clause",
+      "role": "mlibc Meson fallback",
+      "allowedOverlays": [
+        {"path": "meson.build", "sha256": "3ffa0eaec1abaae5ceb7957b3737c07b0c35505218df3effc8ea3ea4150cdbde"},
+        {"path": ".meson-subproject-wrap-hash.txt", "sha256": "a64f5c3d6d199166129b396dbb575ca64408ee17206496a1340cb6537657e5b2"}
+      ]
+    },
+    {
+      "id": "mlibc-freestnd-cxx-hdrs",
+      "path": "toolchain/src/mlibc/subprojects/freestnd-cxx-hdrs",
+      "urls": ["https://github.com/osdev0/freestnd-cxx-hdrs.git"],
+      "commit": "a6b351e0ab3e74e5789b01fa1447e4cd62373da7",
+      "treeSha256": "d9ce3cfeb2905ab6df6c2b6302a491b03bd04f6389a9ba945161e82798bbc800",
+      "license": "BSD-2-Clause",
+      "role": "mlibc Meson fallback",
+      "allowedOverlays": [
+        {"path": "meson.build", "sha256": "5f8e85d648f3d1fb3f81473e1ce2c84d1e108a2056df5c86dbb735d285f56150"},
+        {"path": ".meson-subproject-wrap-hash.txt", "sha256": "4beb7deef98a2702d0c7a26f2dae89bd740d4e6385539931a4e534a7f0b458a8"}
+      ]
+    },
+    {
+      "id": "mlibc-frigg",
+      "path": "toolchain/src/mlibc/subprojects/frigg",
+      "urls": ["https://github.com/managarm/frigg.git"],
+      "commit": "58fb2ab734934cf4b245f833797ab5eeefeb60c0",
+      "treeSha256": "0254b3214321affccf7d66fa4b8d0fe7145db45ba3a160f42b85cf517d6472ad",
+      "license": "MIT",
+      "role": "mlibc Meson fallback"
+    },
+    {
+      "id": "mlibc-libsmarter",
+      "path": "toolchain/src/mlibc/subprojects/libsmarter",
+      "urls": ["https://github.com/managarm/libsmarter.git"],
+      "commit": "f7d061bc37d485418344452c7ceb28d5df3ba85d",
+      "treeSha256": "2305ea6bc95e954eb7bf8d51310d89def5fda24b90ec6a6ae00b5ef787d04e78",
+      "license": "MIT",
+      "role": "mlibc Meson fallback",
+      "allowedOverlays": [
+        {"path": ".meson-subproject-wrap-hash.txt", "sha256": "0655c7c28a780b8a48e5aadd0931c5fd0f801f92b55c8fc12db670da291c7c4a"}
+      ]
+    },
+    {
+      "id": "mlibc-bragi",
+      "urls": ["https://github.com/managarm/bragi.git"],
+      "commit": "523b86efac124b0d749eed201df0c7ea9f87ee17",
+      "license": "MIT",
+      "role": "latent mlibc Meson fallback",
+      "storeRequired": false
+    },
+    {
+      "id": "googletest",
+      "urls": ["https://github.com/google/googletest.git"],
+      "commit": "b514bdc898e2951020cbdca1304b75f5950d1f59",
+      "license": "BSD-3-Clause",
+      "role": "host unit tests",
+      "storeRequired": false
+    }
+  ],
+  "archives": [
+    {
+      "id": "gnu-make",
+      "filename": "make-4.4.1.tar.gz",
+      "version": "4.4.1",
+      "urls": ["https://ftp.gnu.org/gnu/make/make-4.4.1.tar.gz"],
+      "sha256": "dd16fb1d67bfab79a72f5e8390735c49e3e8e70b4945a15ab1f81ddb78658fb3",
+      "license": "GPL-3.0-or-later",
+      "localCandidates": ["toolchain/make-build/src/make-4.4.1.tar.gz"]
+    },
+    {
+      "id": "bash",
+      "filename": "bash-5.3.tar.gz",
+      "version": "5.3",
+      "urls": ["https://ftp.gnu.org/gnu/bash/bash-5.3.tar.gz"],
+      "sha256": "0d5cd86965f869a26cf64f4b71be7b96f90a3ba8b3d74e27e8e9d9d5550f31ba",
+      "license": "GPL-3.0-or-later",
+      "localCandidates": ["toolchain/bash-build/src/bash-5.3.tar.gz", "ktest-data/bash-build/src/bash-5.3.tar.gz"]
+    },
+    {
+      "id": "zlib",
+      "filename": "zlib-1.3.1.tar.gz",
+      "version": "1.3.1",
+      "urls": ["https://zlib.net/fossils/zlib-1.3.1.tar.gz"],
+      "sha256": "9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23",
+      "license": "Zlib",
+      "localCandidates": ["toolchain/zlib-build/src/zlib-1.3.1.tar.gz"]
+    },
+    {
+      "id": "libressl",
+      "filename": "libressl-4.3.2.tar.gz",
+      "version": "4.3.2",
+      "urls": ["https://ftp.openbsd.org/pub/OpenBSD/LibreSSL/libressl-4.3.2.tar.gz"],
+      "sha256": "edf01aee24c65d69e6a9efcb9d44bcda682ff9d4f3bbbd95e794e1dfa90847b5",
+      "license": "ISC AND BSD-3-Clause",
+      "localCandidates": ["toolchain/openssl-build/src/libressl-4.3.2.tar.gz"]
+    },
+    {
+      "id": "curl",
+      "filename": "curl-8.20.0.tar.xz",
+      "version": "8.20.0",
+      "urls": ["https://curl.se/download/curl-8.20.0.tar.xz"],
+      "sha256": "63fe2dc148ba0ceae89922ef838f7e5c946272c2e78b7c59fab4b79d3ce2b896",
+      "license": "curl",
+      "localCandidates": ["toolchain/curl-build/src/curl-8.20.0.tar.xz"]
+    },
+    {
+      "id": "meson",
+      "filename": "meson-b300d9578fe62c721afbf4e5c4672ad0c94cb96c.tar.gz",
+      "version": "b300d9578fe62c721afbf4e5c4672ad0c94cb96c",
+      "urls": ["https://github.com/Pascu-Victor/meson/archive/b300d9578fe62c721afbf4e5c4672ad0c94cb96c.tar.gz"],
+      "sha256": "afd1b4b8debff255cdf793f46a059559d9f1c3d14549371f34a9c008bf797620",
+      "license": "Apache-2.0",
+      "localCandidates": ["toolchain/meson-build/src/meson-b300d9578fe62c721afbf4e5c4672ad0c94cb96c.tar.gz"]
+    },
+    {
+      "id": "nasm-release",
+      "filename": "nasm-3.02rc9.tar.xz",
+      "version": "3.02rc9",
+      "urls": ["https://www.nasm.us/pub/nasm/releasebuilds/3.02rc9/nasm-3.02rc9.tar.xz"],
+      "sha256": "1802d091f4b2c1b3f61ab9d9fca323b8da7674c1ced7d5b770e77604d9c7925b",
+      "license": "BSD-2-Clause",
+      "localCandidates": [],
+      "alternativeGitSourceId": "nasm"
+    },
+    {
+      "id": "ncurses",
+      "filename": "ncurses-6.6.tar.gz",
+      "version": "6.6",
+      "urls": ["https://ftp.gnu.org/pub/gnu/ncurses/ncurses-6.6.tar.gz"],
+      "sha256": "355b4cbbed880b0381a04c46617b7656e362585d52e9cf84a67e2009b749ff11",
+      "license": "X11",
+      "localCandidates": ["toolchain/ncurses-build/src/ncurses-6.6.tar.gz"]
+    },
+    {
+      "id": "nano",
+      "filename": "nano-9.1.tar.xz",
+      "version": "9.1",
+      "urls": ["https://www.nano-editor.org/dist/latest/nano-9.1.tar.xz"],
+      "sha256": "5f47764274cb7532349ce0aa20ec10f1e8e851a6e9fa3eb66812c43d196db042",
+      "license": "GPL-3.0-or-later",
+      "localCandidates": ["toolchain/nano-build/src/nano-9.1.tar.xz"]
+    }
+  ],
+  "patches": [
+    {
+      "id": "doom-ascii-wos-clean-exit",
+      "path": "toolchain/patches/doom-ascii/wos-clean-exit.patch",
+      "source": "workspace:toolchain/patches/doom-ascii/wos-clean-exit.patch",
+      "license": "Apache-2.0",
+      "sha256": "54bdce3ae6d6086e4e3c75c5bdae35923555827d888b88fa368ff5810d91b0c2",
+      "appliesTo": ["doom-ascii"]
+    }
+  ],
+  "generatedInputs": [
+    {"id":"configs-busybox-wos-full.config","path":"configs/busybox/wos_full.config","source":"workspace:configs/busybox/wos_full.config","license":"Apache-2.0","sha256":"b623432778c22cc060deb84628caf60576912e91fe208b4c1443f79582a20c90"},
+    {"id":"configs-disks.conf","path":"configs/disks.conf","source":"workspace:configs/disks.conf","license":"Apache-2.0","sha256":"a64ed302b2f4dadaaa6903f3a5b28f42181e00c03dcebd5fbafd0c755d4bd114"},
+    {"id":"configs-drive-srv-duck.glb","path":"configs/drive/srv/Duck.glb","source":"workspace:configs/drive/srv/Duck.glb","license":"NOASSERTION","sha256":"65bf938f54d6073e619e76e007820bbf980cdc3dc0daec0d94830ffc4ae54ab5"},
+    {"id":"configs-drive-srv-bee.txt","path":"configs/drive/srv/bee.txt","source":"workspace:configs/drive/srv/bee.txt","license":"Apache-2.0","sha256":"87516fea26a1753384e479118a9e65b3f476bcfe28a627dc3c508d6529bc5eff"},
+    {"id":"configs-drive-srv-cat.gif","path":"configs/drive/srv/cat.gif","source":"workspace:configs/drive/srv/cat.gif","license":"NOASSERTION","sha256":"00406d0c57f56b679cad69a5a6191e79faadd49d730468949d86132c052ff811"},
+    {"id":"configs-drive-srv-coproc.sh","path":"configs/drive/srv/coproc.sh","source":"workspace:configs/drive/srv/coproc.sh","license":"Apache-2.0","sha256":"e270a2410fa7a065af3c5ffc1aa298431cfe5d2afeb7a4d17e34e2b85f91ad2a"},
+    {"id":"configs-drive-srv-index.html","path":"configs/drive/srv/index.html","source":"workspace:configs/drive/srv/index.html","license":"Apache-2.0","sha256":"60d32bfc7e39bc580af8c7f53a4f72423efded454dfba96295877a80c639d092"},
+    {"id":"configs-drive-srv-perf.sh","path":"configs/drive/srv/perf.sh","source":"workspace:configs/drive/srv/perf.sh","license":"Apache-2.0","sha256":"215dd9f6e9f88a7e95056b5b92082df74b58d34014e7dd6af7e0d51040ddd341"},
+    {"id":"configs-drive-srv-tests-command-matrix.sh","path":"configs/drive/srv/tests/command_matrix.sh","source":"workspace:configs/drive/srv/tests/command_matrix.sh","license":"Apache-2.0","sha256":"34c0df23a3b85fe52d800303b3d86387629cb0971373a51964050478ef35b0d2"},
+    {"id":"configs-drive-srv-tests-test1.txt","path":"configs/drive/srv/tests/test1.txt","source":"workspace:configs/drive/srv/tests/test1.txt","license":"Apache-2.0","sha256":"2c8b08da5ce60398e1f19af0e5dccc744df274b826abe585eaba68c525434806"},
+    {"id":"configs-drive-srv-tests-test2.txt","path":"configs/drive/srv/tests/test2.txt","source":"workspace:configs/drive/srv/tests/test2.txt","license":"Apache-2.0","sha256":"27dd8ed44a83ff94d557f9fd0412ed5a8cbca69ea04922d88c01184a07300a5a"},
+    {"id":"configs-drive-srv-tests-test3.txt","path":"configs/drive/srv/tests/test3.txt","source":"workspace:configs/drive/srv/tests/test3.txt","license":"Apache-2.0","sha256":"f6936912184481f5edd4c304ce27c5a1a827804fc7f329f43d273b8621870776"},
+    {"id":"configs-drive-srv-tests-validate.sh","path":"configs/drive/srv/tests/validate.sh","source":"workspace:configs/drive/srv/tests/validate.sh","license":"Apache-2.0","sha256":"0fed61866012481a928e07f5a9e5989bb6498f24e6397c3914273941a6fc019c"},
+    {"id":"configs-drive-srv-tracebench-index.html","path":"configs/drive/srv/tracebench/index.html","source":"workspace:configs/drive/srv/tracebench/index.html","license":"Apache-2.0","sha256":"814654f8132bb932ef4bf50acf8ddae1f81341a0b28769d10c4e0f097b53c394"},
+    {"id":"configs-drive-srv-wos-userland-suite.sh","path":"configs/drive/srv/wos_userland_suite.sh","source":"workspace:configs/drive/srv/wos_userland_suite.sh","license":"Apache-2.0","sha256":"5d748710ad31d9709319cad5a6a2d5e1fe0f6908f1d6fcc1e401e7573792cb16"},
+    {"id":"configs-netdevs.conf","path":"configs/netdevs.conf","source":"workspace:configs/netdevs.conf","license":"Apache-2.0","sha256":"030da714091d3b376890e6a7ed904b2c72475f57d71016cb97a818a2287ab599"},
+    {"id":"configs-rootfs-aliases.tsv","path":"configs/rootfs/aliases.tsv","source":"workspace:configs/rootfs/aliases.tsv","license":"Apache-2.0","sha256":"33b0e7a00679e6cf25c57fff2cbe855052ad17d9e855a0970d81736b7daaf33e"},
+    {"id":"configs-rootfs-etc-gitconfig","path":"configs/rootfs/etc/gitconfig","source":"workspace:configs/rootfs/etc/gitconfig","license":"Apache-2.0","sha256":"326cfe05e04a495ec27e4115203306884bd72e734ab51c75f674aea7f2295ad2"},
+    {"id":"configs-rootfs-etc-hosts","path":"configs/rootfs/etc/hosts","source":"workspace:configs/rootfs/etc/hosts","license":"Apache-2.0","sha256":"cdf02898f2afde3cbd6f4c176c228fd88ea154a2b82e17bc1940e2114c689b76"},
+    {"id":"configs-rootfs-etc-inputrc","path":"configs/rootfs/etc/inputrc","source":"workspace:configs/rootfs/etc/inputrc","license":"Apache-2.0","sha256":"5208b9d088e01b9ca80198ae51c4816e8c84f98b23a2afa5dfa1e7b56d231bf1"},
+    {"id":"configs-rootfs-etc-nanorc","path":"configs/rootfs/etc/nanorc","source":"workspace:configs/rootfs/etc/nanorc","license":"Apache-2.0","sha256":"5dbc9e9b8ee1342368d38188ca9f7eb4cb9b2492b09dec534a44ac1afb815db7"},
+    {"id":"configs-rootfs-etc-protocols","path":"configs/rootfs/etc/protocols","source":"workspace:configs/rootfs/etc/protocols","license":"Apache-2.0","sha256":"c6c00daa96186b1aa2c7d7ac0184c043b6d215354fd228b0f961b2e246cc7449"},
+    {"id":"configs-rootfs-etc-resolv.conf","path":"configs/rootfs/etc/resolv.conf","source":"workspace:configs/rootfs/etc/resolv.conf","license":"Apache-2.0","sha256":"df773ee918778a42b6f24caa77443445b667942263248e6125fd5df3c7a5a254"},
+    {"id":"configs-rootfs-etc-services","path":"configs/rootfs/etc/services","source":"workspace:configs/rootfs/etc/services","license":"Apache-2.0","sha256":"dd6d5f9a449d093d5975ad56ddf0120cb41a66bde346e581f70bd5e0237356ec"},
+    {"id":"configs-rootfs-etc-termcap","path":"configs/rootfs/etc/termcap","source":"workspace:configs/rootfs/etc/termcap","license":"Apache-2.0","sha256":"140d1c946143ad78cb63d9154f65d8c4f9d9b482f5cd3d3afa4b9f32fac1c176"},
+    {"id":"configs-rootfs-root-wos-showcase-00-wki-map.sh","path":"configs/rootfs/root/wos-showcase/00-wki-map.sh","source":"workspace:configs/rootfs/root/wos-showcase/00-wki-map.sh","license":"Apache-2.0","sha256":"f27d71b91055afa850fe394b791e429df5c84e4f2daab21949e19d1a611b82d8"},
+    {"id":"configs-rootfs-root-wos-showcase-10-placement-hop.sh","path":"configs/rootfs/root/wos-showcase/10-placement-hop.sh","source":"workspace:configs/rootfs/root/wos-showcase/10-placement-hop.sh","license":"Apache-2.0","sha256":"657b2f059108cbdca00b5eb262a24645398de7dd2216df186ccb3dc65de9d055"},
+    {"id":"configs-rootfs-root-wos-showcase-20-forward-vfs.sh","path":"configs/rootfs/root/wos-showcase/20-forward-vfs.sh","source":"workspace:configs/rootfs/root/wos-showcase/20-forward-vfs.sh","license":"Apache-2.0","sha256":"c95ca5ef79b9be52edf0ab7f53725b29432f3c4faf1ede7bc6bb212f9f640521"},
+    {"id":"configs-rootfs-root-wos-showcase-30-bench-wki.sh","path":"configs/rootfs/root/wos-showcase/30-bench-wki.sh","source":"workspace:configs/rootfs/root/wos-showcase/30-bench-wki.sh","license":"Apache-2.0","sha256":"4f5538388acaf9feafac72cab3ba17c9d7ed9e28025385be6e3c6ca3bc6668ea"},
+    {"id":"configs-rootfs-root-wos-showcase-40-live-cpp-distributed.sh","path":"configs/rootfs/root/wos-showcase/40-live-cpp-distributed.sh","source":"workspace:configs/rootfs/root/wos-showcase/40-live-cpp-distributed.sh","license":"Apache-2.0","sha256":"e09ba0539e2ec7a1ae5e7c13d34d0dc7b4eac1ca936d3aa721b8005705b5a41d"},
+    {"id":"configs-rootfs-root-wos-showcase-50-fixed-resource-workloads.sh","path":"configs/rootfs/root/wos-showcase/50-fixed-resource-workloads.sh","source":"workspace:configs/rootfs/root/wos-showcase/50-fixed-resource-workloads.sh","license":"Apache-2.0","sha256":"60f15b2f59b6f2853386abd0c626d6821b0e762a8e28a8f097e5383aa05a6b01"},
+    {"id":"configs-rootfs-root-wos-showcase-fixed-resource-workloads.py","path":"configs/rootfs/root/wos-showcase/fixed_resource_workloads.py","source":"workspace:configs/rootfs/root/wos-showcase/fixed_resource_workloads.py","license":"Apache-2.0","sha256":"84fe1b48c848187e20f14fcc949f3ab9669ed1d67ab2b5a5185b3cfd78ccdb0d"},
+    {"id":"configs-rootfs-root-wos-showcase-live-cpp-demo.cpp","path":"configs/rootfs/root/wos-showcase/live-cpp-demo.cpp","source":"workspace:configs/rootfs/root/wos-showcase/live-cpp-demo.cpp","license":"Apache-2.0","sha256":"aa52bc6a7f7f5b58904b6c1d06fb7f813c8567c97470fbe4161a4e691a60c726"},
+    {"id":"configs-rootfs-root-wos-showcase-metadata-bench.py","path":"configs/rootfs/root/wos-showcase/metadata_bench.py","source":"workspace:configs/rootfs/root/wos-showcase/metadata_bench.py","license":"Apache-2.0","sha256":"ad5df618b4cb614a289914d6242ea193939bbf45777268de906f507e19b624ef"},
+    {"id":"configs-rootfs-root-wos-showcase-run-all.sh","path":"configs/rootfs/root/wos-showcase/run-all.sh","source":"workspace:configs/rootfs/root/wos-showcase/run-all.sh","license":"Apache-2.0","sha256":"2add4513037059683d5fa5046ec79e063dd9f3980f975391e3bf40b98a8c60b6"},
+    {"id":"configs-rootfs-root-wos-showcase-showcase-common.sh","path":"configs/rootfs/root/wos-showcase/showcase-common.sh","source":"workspace:configs/rootfs/root/wos-showcase/showcase-common.sh","license":"Apache-2.0","sha256":"9ba7ff62ac13661bb9fdb543ed8710e6b1331d282e2e121e2b84a16202cbb3a5"},
+    {"id":"configs-rootfs-usr-share-games-doom-doom2.wad","path":"configs/rootfs/usr/share/games/doom/doom2.wad","source":"workspace:configs/rootfs/usr/share/games/doom/doom2.wad","license":"NOASSERTION","sha256":"8ac958e284f85ba1ebdd56030ff1c7eadefc0993bf21a8ef72d6fab959d51a4c"},
+    {"id":"configs-system.conf","path":"configs/system.conf","source":"workspace:configs/system.conf","license":"Apache-2.0","sha256":"a5f29f1f478e196bf9eb471465673f9db390049efc8dcf2473468eeabbbd3816"},
+    {"id":"configs-vfstab","path":"configs/vfstab","source":"workspace:configs/vfstab","license":"Apache-2.0","sha256":"bd3c77fb4421c284244f06a06e32cfcf44e364fe6f34a5dc98c895d2bc6d0b3b"},
+    {"id":"configs-wos-services.conf","path":"configs/wos-services.conf","source":"workspace:configs/wos-services.conf","license":"Apache-2.0","sha256":"a7a2b89535c1ad42ac83243836987907607368a6aeba8daf3936a2b68a762b39"},
+    {"id":"modules-kern-limine.conf","path":"modules/kern/limine.conf","source":"workspace:modules/kern/limine.conf","license":"Apache-2.0","sha256":"b42f583b8a71baefcc7b2a2193f06fddaaf6cc6d3bcf6d703a7cd9fe65f81272"},
+    {"id":"scripts-build-build-bash-for-wos.sh","path":"scripts/build/build_bash_for_wos.sh","source":"workspace:scripts/build/build_bash_for_wos.sh","license":"Apache-2.0","sha256":"299751943d9266929807da7d908fa461a1f48d04ab2b20d25be49683c4fcc7de"},
+    {"id":"scripts-build-build-busybox.sh","path":"scripts/build/build_busybox.sh","source":"workspace:scripts/build/build_busybox.sh","license":"Apache-2.0","sha256":"43caeb32a1927c22a6a9cac18b3202639e4ba6c5f755f9323488bdb99c6f5813"},
+    {"id":"scripts-build-build-clang-for-wos.sh","path":"scripts/build/build_clang_for_wos.sh","source":"workspace:scripts/build/build_clang_for_wos.sh","license":"Apache-2.0","sha256":"f0c0a3debeaeeb42551d2f6aeceeeb3ddf0a898ff2642ed37d9c78b96276543d"},
+    {"id":"scripts-build-build-cmake-for-host.sh","path":"scripts/build/build_cmake_for_host.sh","source":"workspace:scripts/build/build_cmake_for_host.sh","license":"Apache-2.0","sha256":"fdd0352b0ba7ba809b54ba3171b3219f72a4e7ba6bf447f5ced5f127eeac668b"},
+    {"id":"scripts-build-build-cmake-for-wos.sh","path":"scripts/build/build_cmake_for_wos.sh","source":"workspace:scripts/build/build_cmake_for_wos.sh","license":"Apache-2.0","sha256":"df5084c5c2b6edc5a463525c15ce9371703f16cbf1242ef51b76f9b068d94960"},
+    {"id":"scripts-build-build-curl-for-wos.sh","path":"scripts/build/build_curl_for_wos.sh","source":"workspace:scripts/build/build_curl_for_wos.sh","license":"Apache-2.0","sha256":"dec48985a98108e5e3fa16a6bdc3e28bacda372ff5d87776e9444cd9dd6147c6"},
+    {"id":"scripts-build-build-doom-ascii-for-wos.sh","path":"scripts/build/build_doom_ascii_for_wos.sh","source":"workspace:scripts/build/build_doom_ascii_for_wos.sh","license":"Apache-2.0","sha256":"815e52d79b4673a2283a524a9b1a355ca7fa1c930c66a97efc5315fe94b0a564"},
+    {"id":"scripts-build-build-dropbear.sh","path":"scripts/build/build_dropbear.sh","source":"workspace:scripts/build/build_dropbear.sh","license":"Apache-2.0","sha256":"9f9bd48cc5e512bbb7e2237f8e9b957af203034638d0fef5b9e903545971ff6c"},
+    {"id":"scripts-build-build-git-for-wos.sh","path":"scripts/build/build_git_for_wos.sh","source":"workspace:scripts/build/build_git_for_wos.sh","license":"Apache-2.0","sha256":"8f6a09e28f6b2f347cb43cc694035aebf18bab30d8151eb59195ca8939d0f771"},
+    {"id":"scripts-build-build-kern.sh","path":"scripts/build/build_kern.sh","source":"workspace:scripts/build/build_kern.sh","license":"Apache-2.0","sha256":"d5fc762b8dfbddba6fcaf4c97b78c9c44d8ce08467dfd85d414942f6c1aeeb68"},
+    {"id":"scripts-build-build-libcxx-for-wos.sh","path":"scripts/build/build_libcxx_for_wos.sh","source":"workspace:scripts/build/build_libcxx_for_wos.sh","license":"Apache-2.0","sha256":"d66140273cf0ac84076927acec04770afe5924fa388fbc01f49abf2cad5baa4c"},
+    {"id":"scripts-build-build-make.sh","path":"scripts/build/build_make.sh","source":"workspace:scripts/build/build_make.sh","license":"Apache-2.0","sha256":"414613adf9fca8d88124a89eb356aa64ee36d092a561a61378b8ce093adc8b2b"},
+    {"id":"scripts-build-build-meson-for-wos.sh","path":"scripts/build/build_meson_for_wos.sh","source":"workspace:scripts/build/build_meson_for_wos.sh","license":"Apache-2.0","sha256":"608b603329e46b326fa847c8ca1c0ec18a538f5f585dd429ef82358f8b8188f7"},
+    {"id":"scripts-build-build-mlibc.sh","path":"scripts/build/build_mlibc.sh","source":"workspace:scripts/build/build_mlibc.sh","license":"Apache-2.0","sha256":"93cf74c6b7624ef4dc8b5c5cab92030edcc4ecadc9c7c1d41b01ded73a15e850"},
+    {"id":"scripts-build-build-nano-for-wos.sh","path":"scripts/build/build_nano_for_wos.sh","source":"workspace:scripts/build/build_nano_for_wos.sh","license":"Apache-2.0","sha256":"352dda7bf326d6ad0f5b2962b1ca4fb7ddf83b2fb80b266d86a09ff97432968a"},
+    {"id":"scripts-build-build-nasm-for-wos.sh","path":"scripts/build/build_nasm_for_wos.sh","source":"workspace:scripts/build/build_nasm_for_wos.sh","license":"Apache-2.0","sha256":"1f02d9c9ce162e8048735f9dda879b484e46e9f49f7d2a952cf7febc30f9c23b"},
+    {"id":"scripts-build-build-ncurses-for-wos.sh","path":"scripts/build/build_ncurses_for_wos.sh","source":"workspace:scripts/build/build_ncurses_for_wos.sh","license":"Apache-2.0","sha256":"ea4b57757979b0901c68367a766a5b66cdfb755479d81a607c1a18c355451f36"},
+    {"id":"scripts-build-build-ninja-for-wos.sh","path":"scripts/build/build_ninja_for_wos.sh","source":"workspace:scripts/build/build_ninja_for_wos.sh","license":"Apache-2.0","sha256":"c80ffd7a136da026b66b8d6dc6974f1cfbdf136923caf3a20f4db0a9c7afeae1"},
+    {"id":"scripts-build-build-openssl-for-wos.sh","path":"scripts/build/build_openssl_for_wos.sh","source":"workspace:scripts/build/build_openssl_for_wos.sh","license":"Apache-2.0","sha256":"471c0a6fcadc21d7496dfe8f675215bbb5e2f1691ad289d99d64e8a6c86e23e1"},
+    {"id":"scripts-build-build-python-for-wos.sh","path":"scripts/build/build_python_for_wos.sh","source":"workspace:scripts/build/build_python_for_wos.sh","license":"Apache-2.0","sha256":"9a03be9a4450cf08abd23838694b56d56bc6000384bf76a627f781d352b565e6"},
+    {"id":"scripts-build-build-zlib-for-wos.sh","path":"scripts/build/build_zlib_for_wos.sh","source":"workspace:scripts/build/build_zlib_for_wos.sh","license":"Apache-2.0","sha256":"977499a2f72b9fad604e0c23519d6890ae1b7f4625e104857b1111161f75fd78"},
+    {"id":"scripts-build-check-headers.sh","path":"scripts/build/check_headers.sh","source":"workspace:scripts/build/check_headers.sh","license":"Apache-2.0","sha256":"ced96f185d0262de06e819673528721c8233f691ecf95a07f7171738b5126774"},
+    {"id":"scripts-build-create-mountfs-disk.sh","path":"scripts/build/create_mountfs_disk.sh","source":"workspace:scripts/build/create_mountfs_disk.sh","license":"Apache-2.0","sha256":"0f0abc4c610d05c7def035170bed76228ef33bab9440f223a915e03670f6ad7c"},
+    {"id":"scripts-build-extract-partuuid.py","path":"scripts/build/extract_partuuid.py","source":"workspace:scripts/build/extract_partuuid.py","license":"Apache-2.0","sha256":"a651ef1102ac017443150dda9f6ae610a7c47ee6f6d8d2def26a59cafc79523c"},
+    {"id":"scripts-build-make-image.sh","path":"scripts/build/make_image.sh","source":"workspace:scripts/build/make_image.sh","license":"Apache-2.0","sha256":"e4baa71645eecfdc330e92fd8dfa7ba19539fd493e0b3895566cc5cf0f1e1fdf"},
+    {"id":"scripts-build-make-initramfs.sh","path":"scripts/build/make_initramfs.sh","source":"workspace:scripts/build/make_initramfs.sh","license":"Apache-2.0","sha256":"c72b49971c73fcd2f4ef28f6900ce08eefd13176b3a7642228982bca5b994e1c"},
+    {"id":"scripts-build-ninja-with-jobs.sh","path":"scripts/build/ninja_with_jobs.sh","source":"workspace:scripts/build/ninja_with_jobs.sh","license":"Apache-2.0","sha256":"a7d0c04461834aea58067ff584576e32bcbfd17735a898c308a05223370294b7"},
+    {"id":"scripts-build-qcow-common.sh","path":"scripts/build/qcow_common.sh","source":"workspace:scripts/build/qcow_common.sh","license":"Apache-2.0","sha256":"21be2bdd5cd4c982f6de0fccee5d66a724fa7f51b6222150f2deaf13de11f653"},
+    {"id":"scripts-build-rootfs-common.sh","path":"scripts/build/rootfs_common.sh","source":"workspace:scripts/build/rootfs_common.sh","license":"Apache-2.0","sha256":"4ac59954d8dd890bcf378682dbdb8c0a97f1d7d5610ab9ad9b5708587af31ea6"},
+    {"id":"scripts-build-rootfs-delta.py","path":"scripts/build/rootfs_delta.py","source":"workspace:scripts/build/rootfs_delta.py","license":"Apache-2.0","sha256":"9a4a13acfbf3f8dfeceb5a6195fc3658c4e2ea530e55585320c82ee5017325fa"},
+    {"id":"scripts-build-rootfs-qcow-xfs-delta.py","path":"scripts/build/rootfs_qcow_xfs_delta.py","source":"workspace:scripts/build/rootfs_qcow_xfs_delta.py","license":"Apache-2.0","sha256":"d751c44fd4b6969bdcaf18d34e17c9d5e7cb21aa78a571d864aec980963736cd"},
+    {"id":"scripts-build-sync-rootfs.sh","path":"scripts/build/sync_rootfs.sh","source":"workspace:scripts/build/sync_rootfs.sh","license":"Apache-2.0","sha256":"6dd8550873fc1cb4740bdd8ec7a58436c3d907bef4d431d1836f81d6a0975b9f"},
+    {"id":"cmakelists.txt","path":"CMakeLists.txt","source":"workspace:CMakeLists.txt","license":"Apache-2.0","sha256":"5f0150922187bb659b1f5b2b4efa25b9498159ad105189ecbd1838f4b4b843d5"},
+    {"id":"modules-cmakelists.txt","path":"modules/CMakeLists.txt","source":"workspace:modules/CMakeLists.txt","license":"Apache-2.0","sha256":"1dc50cf6bda1185514ba9db4bc58dc23ff45e64d767f25bb05bb066d1bb3bdae"},
+    {"id":"tools-cmakelists.txt","path":"tools/CMakeLists.txt","source":"workspace:tools/CMakeLists.txt","license":"Apache-2.0","sha256":"d79e21d091934b6762a4bb5e5f6b600170035f9dab0dd6aff97cfde710906b64"},
+    {"id":"tools-ccache-env.sh","path":"tools/ccache_env.sh","source":"workspace:tools/ccache_env.sh","license":"Apache-2.0","sha256":"b6c490ff8a1436fa37bd2ef6120993c4cf1e3d75b72cec1bb63b6c1b3c200329"},
+    {"id":"tools-host-toolchain.sh","path":"tools/host-toolchain.sh","source":"workspace:tools/host-toolchain.sh","license":"Apache-2.0","sha256":"2446a1c669ff5b2360b1eb0d84572a0956a992bfceb1fb991f13356ccac01150"},
+    {"id":"tools-wos-toolchain.sh","path":"tools/wos-toolchain.sh","source":"workspace:tools/wos-toolchain.sh","license":"Apache-2.0","sha256":"6d9494dfaff8a5c8b32c3abb31a44542addb7dabe7faf94df76f3c65b51ab604"},
+    {"id":"scripts-build-source-lock.py","path":"scripts/build/source_lock.py","source":"workspace:scripts/build/source_lock.py","license":"Apache-2.0","sha256":"24c849608dc07c16c731edd32b5c082a7918eb1455d477e1454f84ac8eb026cf"},
+    {"id":"scripts-build-wos-artifacts.py","path":"scripts/build/wos_artifacts.py","source":"workspace:scripts/build/wos_artifacts.py","license":"Apache-2.0","sha256":"5a0a2421a90faf7ddd33f64fce403949964abf9f8c0e912d80a4186d66512b79"},
+    {"id":"scripts-build-run-with-source-policy.sh","path":"scripts/build/run_with_source_policy.sh","source":"workspace:scripts/build/run_with_source_policy.sh","license":"Apache-2.0","sha256":"2cbf1a69ce32f5dff6b0dc8121b9dd08709c0173154bd7b8ff3b9e0f4b1102cf"},
+    {"id":"scripts-build-update-mountfs-disk.sh","path":"scripts/build/update_mountfs_disk.sh","source":"workspace:scripts/build/update_mountfs_disk.sh","license":"Apache-2.0","sha256":"ca04565499d541f02ef684a809eb567dace96f8361482db7aad056845d16eeb9"}
+  ]
+}

@@ -14,6 +14,8 @@ or VM images.
 Default KTEST roots:
 
 - `build-ktest/`
+- `ktest-data/` (`build.state_root`; all mutable port, staging, tool-output,
+  and image paths must stay below it)
 - `ktest-data/sysroot`
 - `ktest-data/mlibc-build`
 - `ktest-data/busybox-build`

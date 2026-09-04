@@ -33,6 +33,26 @@ SYSROOT=$B/sysroot
 HOST_SYSTEM="$(uname -s 2>/dev/null || printf unknown)"
 export WOS_HOST_TOOLCHAIN_ROOT="$HOST"
 export NINJA_STATUS="[%f/%t %e] "
+
+# Strict source mode validates existing checkouts and materializes missing
+# ones from the verified local store before any legacy clone fallback can run.
+if wos_source_strict_enabled; then
+    while read -r source_id source_path; do
+        wos_materialize_locked_git "$source_id" "$B/src/$source_path"
+    done <<'EOF'
+llvm-project llvm-project
+mlibc mlibc
+busybox busybox
+dropbear dropbear
+ninja ninja
+cmake cmake
+nasm nasm
+python python
+git git
+doom-ascii doom-ascii
+EOF
+fi
+
 if [ "$HOST_SYSTEM" = WOS ]; then
     export WOS_DISTRIBUTED_COMPILER_STAGE_BASE="${WOS_DISTRIBUTED_COMPILER_STAGE_BASE:-$(dirname "$WORKSPACE_ROOT")}"
     if [ -z "${WOS_DISTRIBUTED_COMPILER_RETAINED_ROOTS:-}" ]; then

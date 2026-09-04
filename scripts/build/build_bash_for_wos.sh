@@ -75,6 +75,7 @@ download_bash_source() {
         wos_download_file "Bash $BASH_VERSION source" "$archive" "$BASH_TARBALL_URLS" "$BASH_DOWNLOAD_ATTEMPTS"
     fi
 
+    wos_verify_locked_archive "$archive"
     echo "$BASH_TARBALL_SHA256  $archive" | sha256sum -c - >&2
     wos_remove_tree "$tmp_dest"
     wos_remove_tree "$dest"
@@ -85,6 +86,12 @@ download_bash_source() {
 
 resolve_bash_source() {
     local fallback_src="$BASH_BUILD/src/bash-$BASH_VERSION"
+
+    if wos_source_strict_enabled; then
+        wos_materialize_locked_archive_tree "bash-$BASH_VERSION.tar.gz" "$fallback_src"
+        printf '%s\n' "$fallback_src"
+        return 0
+    fi
 
     if [ -f "$BASH_SRC/configure" ]; then
         printf '%s\n' "$BASH_SRC"

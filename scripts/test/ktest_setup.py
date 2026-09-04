@@ -101,6 +101,37 @@ BUILD_TARGETS = [
 ]
 
 DEFAULT_SOURCE_SYSROOT = ROOT / "toolchain" / "sysroot"
+DEFAULT_HOST_TOOLCHAIN = ROOT / "toolchain" / "host"
+
+ROOT_CMAKE_PATH_OPTIONS = {
+    "sysroot": "WOS_SYSROOT_PATH",
+    "mlibc_build": "WOS_MLIBC_BUILD_DIR",
+    "mlibc_conformance_stage": "WOS_MLIBC_CONFORMANCE_STAGE_DIR",
+    "libcxx_build": "WOS_LIBCXX_BUILD_DIR",
+    "busybox_build": "WOS_BUSYBOX_BUILD_DIR",
+    "busybox_install": "WOS_BUSYBOX_INSTALL_DIR",
+    "dropbear_build": "WOS_DROPBEAR_BUILD_DIR",
+    "make_build": "WOS_MAKE_BUILD_DIR",
+    "bash_build": "WOS_BASH_BUILD_DIR",
+    "zlib_build": "WOS_ZLIB_BUILD_DIR",
+    "openssl_build": "WOS_OPENSSL_BUILD_DIR",
+    "curl_build": "WOS_CURL_BUILD_DIR",
+    "git_build": "WOS_GIT_BUILD_DIR",
+    "clang_build": "WOS_CLANG_FOR_WOS_BUILD_DIR",
+    "ninja_build": "WOS_NINJA_BUILD_DIR",
+    "cmake_host_build": "WOS_CMAKE_FOR_HOST_BUILD_DIR",
+    "cmake_host_install": "WOS_CMAKE_FOR_HOST_INSTALL_DIR",
+    "cmake_build": "WOS_CMAKE_FOR_WOS_BUILD_DIR",
+    "python_build": "WOS_PYTHON_BUILD_DIR",
+    "meson_build": "WOS_MESON_BUILD_DIR",
+    "nasm_build": "WOS_NASM_BUILD_DIR",
+    "ncurses_build": "WOS_NCURSES_BUILD_DIR",
+    "nano_build": "WOS_NANO_BUILD_DIR",
+    "doom_ascii_build": "WOS_DOOM_ASCII_BUILD_DIR",
+    "tools_output": "WOS_TOOLS_OUTPUT_DIR",
+    "boot_disk": "WOS_BOOT_DISK",
+    "rootfs_disk": "WOS_ROOTFS_DISK",
+}
 
 
 def print_command(cmd: list[str]):
@@ -148,16 +179,44 @@ def abs_path(path: Path) -> Path:
 
 
 def build_roots(raw_config: dict) -> dict[str, Path]:
+    build_cfg = raw_config.get("build", {})
+    state_root = abs_path(Path(build_cfg.get("state_root", "ktest-data")))
+
+    def state_path(key: str, leaf: str) -> Path:
+        configured = build_cfg.get(key)
+        return abs_path(Path(configured)) if configured is not None else state_root / leaf
+
+    raw_node = raw_config.get("node", raw_config)
+    vm_cfg = raw_node.get("vm", {})
     return {
-        "sysroot": abs_path(path_from_build_config(raw_config, "sysroot", "ktest-data/sysroot")),
-        "mlibc_build": abs_path(path_from_build_config(raw_config, "mlibc_build", "ktest-data/mlibc-build")),
-        "busybox_build": abs_path(path_from_build_config(raw_config, "busybox_build", "ktest-data/busybox-build")),
-        "busybox_install": abs_path(path_from_build_config(raw_config, "busybox_install", "ktest-data/busybox-install")),
-        "dropbear_build": abs_path(path_from_build_config(raw_config, "dropbear_build", "ktest-data/dropbear-build")),
-        "make_build": abs_path(path_from_build_config(raw_config, "make_build", "ktest-data/make-build")),
-        "bash_build": abs_path(path_from_build_config(raw_config, "bash_build", "ktest-data/bash-build")),
-        "cmake_build": abs_path(path_from_build_config(raw_config, "cmake_build", "ktest-data/cmake-wos-build")),
-        "python_build": abs_path(path_from_build_config(raw_config, "python_build", "ktest-data/python-build")),
+        "state_root": state_root,
+        "sysroot": state_path("sysroot", "sysroot"),
+        "mlibc_build": state_path("mlibc_build", "mlibc-build"),
+        "mlibc_conformance_stage": state_path("mlibc_conformance_stage", "mlibc-conformance-stage"),
+        "libcxx_build": state_path("libcxx_build", "libcxx-build"),
+        "busybox_build": state_path("busybox_build", "busybox-build"),
+        "busybox_install": state_path("busybox_install", "busybox-install"),
+        "dropbear_build": state_path("dropbear_build", "dropbear-build"),
+        "make_build": state_path("make_build", "make-build"),
+        "bash_build": state_path("bash_build", "bash-build"),
+        "zlib_build": state_path("zlib_build", "zlib-build"),
+        "openssl_build": state_path("openssl_build", "openssl-build"),
+        "curl_build": state_path("curl_build", "curl-build"),
+        "git_build": state_path("git_build", "git-build"),
+        "clang_build": state_path("clang_build", "clang-wos-build"),
+        "ninja_build": state_path("ninja_build", "ninja-build"),
+        "cmake_host_build": state_path("cmake_host_build", "cmake-host-build"),
+        "cmake_host_install": state_path("cmake_host_install", "host"),
+        "cmake_build": state_path("cmake_build", "cmake-wos-build"),
+        "python_build": state_path("python_build", "python-build"),
+        "meson_build": state_path("meson_build", "meson-build"),
+        "nasm_build": state_path("nasm_build", "nasm-build"),
+        "ncurses_build": state_path("ncurses_build", "ncurses-build"),
+        "nano_build": state_path("nano_build", "nano-build"),
+        "doom_ascii_build": state_path("doom_ascii_build", "doom-ascii-build"),
+        "tools_output": state_path("tools_output", "tools/bin"),
+        "boot_disk": abs_path(Path(vm_cfg["disk0"])) if "disk0" in vm_cfg else state_root / "disk.qcow2",
+        "rootfs_disk": abs_path(Path(vm_cfg["disk1"])) if "disk1" in vm_cfg else state_root / "mountfs.qcow2",
     }
 
 
@@ -188,23 +247,19 @@ def configure_build(
         "-B",
         str(build_dir),
         ".",
-        f"-DWOS_SYSROOT_PATH={roots['sysroot']}",
-        f"-DWOS_MLIBC_BUILD_DIR={roots['mlibc_build']}",
-        f"-DWOS_BUSYBOX_BUILD_DIR={roots['busybox_build']}",
-        f"-DWOS_BUSYBOX_INSTALL_DIR={roots['busybox_install']}",
-        f"-DWOS_DROPBEAR_BUILD_DIR={roots['dropbear_build']}",
-        f"-DWOS_MAKE_BUILD_DIR={roots['make_build']}",
-        f"-DWOS_BASH_BUILD_DIR={roots['bash_build']}",
-        f"-DWOS_CMAKE_FOR_WOS_BUILD_DIR={roots['cmake_build']}",
-        f"-DWOS_PYTHON_BUILD_DIR={roots['python_build']}",
+        f"-DWOS_STATE_ROOT={roots['state_root']}",
+        f"-DWOS_HOST_TOOLCHAIN_PATH={DEFAULT_HOST_TOOLCHAIN}",
+        *(f"-D{cmake_name}={roots[root_name]}" for root_name, cmake_name in ROOT_CMAKE_PATH_OPTIONS.items()),
         "-DCMAKE_C_FLAGS:STRING=",
         "-DCMAKE_CXX_FLAGS:STRING=",
         "-DCMAKE_EXE_LINKER_FLAGS:STRING=",
         "-DCMAKE_SHARED_LINKER_FLAGS:STRING=",
         "-DCMAKE_MODULE_LINKER_FLAGS:STRING=",
         "-DWOS_BUILD_BASH_FOR_WOS=ON",
+        "-DWOS_BUILD_CMAKE_FOR_HOST=OFF",
         "-DWOS_BUILD_PYTHON_FOR_WOS=ON",
         "-DWOS_BUILD_MLIBC_CONFORMANCE=ON",
+        "-DWOS_BUILD_HOST_TOOLS=OFF",
         "-DWOS_SKIP_LIBCXX_INSTALL=ON",
         *diagnostic_cmake_options(fast, ubtrap),
         *extra_cmake_options,
@@ -216,10 +271,9 @@ def build_artifacts(build_dir: Path):
     run_command(["cmake", "--build", str(build_dir), "--target", *BUILD_TARGETS], env=isolated_build_env())
 
 
-def package_disks(spec: dict, build_dir: Path, roots: dict[str, Path], kernel_cmdline: str):
-    vm_cfg = spec["vm"]
-    boot_disk = Path(vm_cfg.get("disk0", "ktest-data/disk.qcow2"))
-    rootfs_disk = Path(vm_cfg.get("disk1", "ktest-data/mountfs.qcow2"))
+def package_disks(build_dir: Path, roots: dict[str, Path], kernel_cmdline: str):
+    boot_disk = roots["boot_disk"]
+    rootfs_disk = roots["rootfs_disk"]
 
     env = os.environ.copy()
     env["WOS_BUILD_DIR"] = str(build_dir)
@@ -376,7 +430,7 @@ def main() -> int:
 
         if not args.no_package:
             seed_isolated_sysroot(roots["sysroot"], False)
-            package_disks(spec, build_dir, roots, kernel_cmdline)
+            package_disks(build_dir, roots, kernel_cmdline)
 
         if args.no_launch:
             cluster_setup.ensure_sudo()

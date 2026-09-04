@@ -24,6 +24,10 @@ GIT_WORK="$GIT_BUILD/work"
 WOS_GIT_STRIP="${WOS_GIT_STRIP:-0}"
 WOS_GIT_OPT_FLAGS="${WOS_GIT_OPT_FLAGS:--O2}"
 
+if wos_source_strict_enabled; then
+    wos_materialize_locked_git git "$GIT_SRC"
+fi
+
 export PATH="$HOST/bin:$PATH"
 export LD_LIBRARY_PATH="$HOST/lib"
 

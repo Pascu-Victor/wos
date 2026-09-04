@@ -76,6 +76,7 @@ download_libressl_source() {
         wos_download_file "LibreSSL $LIBRESSL_VERSION source" "$archive" "$LIBRESSL_TARBALL_URLS" "$LIBRESSL_DOWNLOAD_ATTEMPTS"
     fi
 
+    wos_verify_locked_archive "$archive"
     echo "$LIBRESSL_TARBALL_SHA256  $archive" | sha256sum -c - >&2
     wos_remove_tree "$tmp_dest"
     wos_remove_tree "$dest"
@@ -86,6 +87,12 @@ download_libressl_source() {
 
 resolve_tls_source() {
     local fallback_src="$TLS_BUILD/src/libressl-$LIBRESSL_VERSION"
+
+    if wos_source_strict_enabled; then
+        wos_materialize_locked_archive_tree "libressl-$LIBRESSL_VERSION.tar.gz" "$fallback_src"
+        printf '%s\n' "$fallback_src"
+        return 0
+    fi
 
     if [ -f "$TLS_SRC/configure" ]; then
         printf '%s\n' "$TLS_SRC"

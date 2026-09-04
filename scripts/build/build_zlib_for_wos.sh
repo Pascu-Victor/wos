@@ -58,6 +58,7 @@ download_zlib_source() {
         wos_download_file "zlib $ZLIB_VERSION source" "$archive" "$ZLIB_TARBALL_URLS" "$ZLIB_DOWNLOAD_ATTEMPTS"
     fi
 
+    wos_verify_locked_archive "$archive"
     echo "$ZLIB_TARBALL_SHA256  $archive" | sha256sum -c - >&2
     wos_remove_tree "$tmp_dest"
     wos_remove_tree "$dest"
@@ -68,6 +69,12 @@ download_zlib_source() {
 
 resolve_zlib_source() {
     local fallback_src="$ZLIB_BUILD/src/zlib-$ZLIB_VERSION"
+
+    if wos_source_strict_enabled; then
+        wos_materialize_locked_archive_tree "zlib-$ZLIB_VERSION.tar.gz" "$fallback_src"
+        printf '%s\n' "$fallback_src"
+        return 0
+    fi
 
     if [ -f "$ZLIB_SRC/configure" ]; then
         printf '%s\n' "$ZLIB_SRC"

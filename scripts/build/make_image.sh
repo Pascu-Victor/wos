@@ -15,7 +15,15 @@ BOOT_IMAGE_MANIFEST="${WOS_BOOT_IMAGE_MANIFEST:-$BUILD_DIR/boot_image.manifest}"
 BOOT_PART_START_SECTOR=2048
 BOOT_PART_END_SECTOR=1845247
 BOOT_PART_GUID="${WOS_BOOT_PARTUUID:-11044da0-352d-480a-9ef3-f995f3ac3f8b}"
+BOOT_DISK_GUID="${WOS_BOOT_DISK_GUID:-2f5c25aa-aa6f-49a4-ad4c-f69ca1388a72}"
+BOOT_FAT_SERIAL="${WOS_BOOT_FAT_SERIAL:-574f5301}"
 SECTOR_SIZE=512
+BOOT_REPRODUCIBLE=0
+case "${WOS_REPRODUCIBLE_BUILD:-0}" in
+    1|ON|on|TRUE|true|YES|yes)
+        BOOT_REPRODUCIBLE=1
+        ;;
+esac
 
 # shellcheck source=scripts/build/qcow_common.sh
 source "$CWD/scripts/build/qcow_common.sh"
@@ -82,6 +90,7 @@ create_boot_disk_guestfish() {
     wos_qcow_guestfish "create partitioned boot qcow image" "$BOOT_DISK" --rw -a "$BOOT_DISK" <<_EOF_
 run
 part-init /dev/sda gpt
+part-set-disk-guid /dev/sda $BOOT_DISK_GUID
 part-add /dev/sda p $BOOT_PART_START_SECTOR $BOOT_PART_END_SECTOR
 part-set-gpt-guid /dev/sda 1 $BOOT_PART_GUID
 mkfs fat /dev/sda1
@@ -138,10 +147,10 @@ create_boot_disk_fast() {
 
     truncate -s 1G "$BOOT_RAW"
     sgdisk --clear --new=1:$BOOT_PART_START_SECTOR:$BOOT_PART_END_SECTOR --typecode=1:ef00 --change-name=1:WOSBOOT \
-        --partition-guid=1:"$BOOT_PART_GUID" "$BOOT_RAW" >/dev/null
+        --disk-guid="$BOOT_DISK_GUID" --partition-guid=1:"$BOOT_PART_GUID" "$BOOT_RAW" >/dev/null
 
     truncate -s "$part_size_bytes" "$BOOT_FAT"
-    mformat -i "$BOOT_FAT" -F -v WOSBOOT ::
+    mformat -i "$BOOT_FAT" -F -N "$BOOT_FAT_SERIAL" -v WOSBOOT ::
     if [ "$populate" -eq 1 ]; then
         mmd -i "$BOOT_FAT" ::/EFI
         mmd -i "$BOOT_FAT" ::/EFI/BOOT
@@ -181,8 +190,8 @@ write_boot_payload_manifest() {
     local manifest="$1"
 
     {
-        printf 'version\t1\n'
-        printf 'partition\t%s\t%s\t%s\t%s\n' "$BOOT_PART_START_SECTOR" "$BOOT_PART_END_SECTOR" "$BOOT_PART_GUID" "$SECTOR_SIZE"
+        printf 'version\t2\n'
+        printf 'partition\t%s\t%s\t%s\t%s\t%s\t%s\n' "$BOOT_PART_START_SECTOR" "$BOOT_PART_END_SECTOR" "$BOOT_PART_GUID" "$BOOT_DISK_GUID" "$BOOT_FAT_SERIAL" "$SECTOR_SIZE"
         boot_manifest_file_entry kernel "$KERNEL_COPY"
         boot_manifest_file_entry limine "$LIMINE_CONF"
         boot_manifest_file_entry bootloader "$BOOTLOADER"
@@ -209,7 +218,18 @@ fi
 
 # Phase 2: Create the boot disk with the final initramfs contents.  Prefer the
 # mtools path to avoid libguestfs appliance startup for the small FAT boot disk.
-if [ "${WOS_BOOT_IMAGE_LEGACY_GUESTFS:-0}" = "1" ] || ! create_boot_disk_fast 1; then
+if [ "$BOOT_REPRODUCIBLE" = "1" ] && [ "${WOS_BOOT_IMAGE_LEGACY_GUESTFS:-0}" = "1" ]; then
+    echo "ERROR: reproducible boot images require the deterministic mtools backend" >&2
+    exit 1
+fi
+if [ "${WOS_BOOT_IMAGE_LEGACY_GUESTFS:-0}" = "1" ]; then
+    echo "  boot image: falling back to libguestfs boot disk population"
+    create_boot_disk_guestfish 1
+elif ! create_boot_disk_fast 1; then
+    if [ "$BOOT_REPRODUCIBLE" = "1" ]; then
+        echo "ERROR: reproducible boot images require sgdisk, mtools, qemu-img, dd, and truncate" >&2
+        exit 1
+    fi
     echo "  boot image: falling back to libguestfs boot disk population"
     create_boot_disk_guestfish 1
 fi

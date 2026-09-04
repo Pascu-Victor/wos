@@ -65,6 +65,10 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/toolchain_bootstrap_source_test.py
 )
 add_test(
+    NAME source_lock_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/source_lock_test.py
+)
+add_test(
     NAME selfhost_benchmark_source_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/selfhost_benchmark_source_test.py
 )
@@ -75,6 +79,14 @@ add_test(
 add_test(
     NAME image_source_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/image_source_test.py
+)
+add_test(
+    NAME build_isolation_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/build_isolation_test.py
+)
+add_test(
+    NAME wos_artifacts_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/wos_artifacts_test.py
 )
 add_test(
     NAME modules_cmake_source_test
@@ -552,9 +564,12 @@ set_tests_properties(
     ktest_manifest_test
     runtime_test_audit_test
     toolchain_bootstrap_source_test
+    source_lock_test
     selfhost_benchmark_source_test
     rootfs_source_test
     image_source_test
+    build_isolation_test
+    wos_artifacts_test
     modules_cmake_source_test
     qcow_common_source_test
     testd_manifest_test
