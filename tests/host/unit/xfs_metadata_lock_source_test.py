@@ -535,6 +535,7 @@ def main() -> None:
     test_metadata_mutators_are_serialized()
     test_sync_flush_is_serialized_after_inode_writeback()
     test_xfs_namespace_cache_publication_is_ordered()
+    test_namespace_mutations_retry_false_enoent_without_namespace_caches()
     test_reused_directory_inode_starts_with_fresh_dentry_generation()
     test_known_absent_create_hint_requires_xfs_proof()
     test_create_repairs_only_unreachable_indexed_entries()

@@ -44,7 +44,7 @@ def test_backend_catalog_is_the_only_tool_dispatch_contract() -> None:
         service_header,
         [
             "static QJsonObject tool_catalog()",
-            "QJsonObject invoke_tool(const QString& name, const QJsonObject& args)",
+            "QJsonObject invoke_tool(const QString& name, const QJsonObject& args, const QString& owner_id = {})",
         ],
         "frontend-neutral backend contract",
     )
@@ -85,7 +85,7 @@ def test_backend_catalog_is_the_only_tool_dispatch_contract() -> None:
         mcp_source,
         [
             'return DebugAnalysisService::tool_catalog();',
-            'analysis->invoke_tool(params["name"].toString(), params["arguments"].toObject())',
+            'analysis->invoke_tool(params["name"].toString(), params["arguments"].toObject(), owner)',
         ],
         "thin MCP adapter",
     )
@@ -153,7 +153,7 @@ def test_cli_and_gui_use_the_shared_contract() -> None:
         server,
         [
             "DebugAnalysisService::tool_catalog()",
-            "analysis_service->invoke_tool(name, DOCUMENT.object())",
+            "analysis_service->invoke_tool(name, DOCUMENT.object(), \"gui\")",
         ],
         "GUI server adapter",
     )

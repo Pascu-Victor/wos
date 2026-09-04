@@ -2615,7 +2615,7 @@ auto xfs_selftest_directory_lookup_seeds_parent_path_cache() -> bool {
     constexpr xfs_ino_t PARENT_INO = 100;
     constexpr xfs_ino_t CHILD_INO = 101;
     auto* parent_data = new (std::nothrow) uint8_t[32];
-    auto* child_data = new (std::nothrow) uint8_t[6];
+    auto* child_data = new (std::nothrow) uint8_t[sizeof(XfsDir2SfHdr)];
     auto* parent = new (std::nothrow) XfsInode{};
     auto* child = new (std::nothrow) XfsInode{};
     if (parent_data == nullptr || child_data == nullptr || parent == nullptr || child == nullptr) {
@@ -2645,7 +2645,7 @@ auto xfs_selftest_directory_lookup_seeds_parent_path_cache() -> bool {
     ino_ptr[2] = static_cast<uint8_t>((CHILD_INO >> 8U) & 0xffU);
     ino_ptr[3] = static_cast<uint8_t>(CHILD_INO & 0xffU);
 
-    std::memset(child_data, 0, 6);
+    std::memset(child_data, 0, sizeof(XfsDir2SfHdr));
     auto* child_hdr = reinterpret_cast<XfsDir2SfHdr*>(child_data);
     child_hdr->i8count = 0;
     child_hdr->parent.at(3) = static_cast<uint8_t>(PARENT_INO);
@@ -3087,7 +3087,7 @@ auto xfs_selftest_readlink_path_uses_dentry_type() -> bool {
     xfs_path_inode_cache_bump_generation();
 
     auto* data = new (std::nothrow) uint8_t[64];
-    auto* dir_data = new (std::nothrow) uint8_t[6];
+    auto* dir_data = new (std::nothrow) uint8_t[sizeof(XfsDir2SfHdr)];
     if (data == nullptr || dir_data == nullptr) {
         delete[] data;
         delete[] dir_data;
@@ -3128,7 +3128,7 @@ auto xfs_selftest_readlink_path_uses_dentry_type() -> bool {
     dir_ino_ptr[2] = static_cast<uint8_t>((DIR_INO >> 8U) & 0xffU);
     dir_ino_ptr[3] = static_cast<uint8_t>(DIR_INO & 0xffU);
 
-    std::memset(dir_data, 0, 6);
+    std::memset(dir_data, 0, sizeof(XfsDir2SfHdr));
     auto* dir_hdr = reinterpret_cast<XfsDir2SfHdr*>(dir_data);
     dir_hdr->i8count = 0;
     dir_hdr->parent.at(3) = static_cast<uint8_t>(ROOT_INO);
@@ -5850,11 +5850,11 @@ auto xfs_selftest_cached_parent_missing_lookup_stays_negative() -> bool {
     xfs_parent_path_cache_purge_all_for_mount(&mount);
 
     constexpr xfs_ino_t PARENT_INO = 100;
-    auto* data = new (std::nothrow) uint8_t[6];
+    auto* data = new (std::nothrow) uint8_t[sizeof(XfsDir2SfHdr)];
     if (data == nullptr) {
         return false;
     }
-    std::memset(data, 0, 6);
+    std::memset(data, 0, sizeof(XfsDir2SfHdr));
     auto* hdr = reinterpret_cast<XfsDir2SfHdr*>(data);
     hdr->count = 0;
     hdr->i8count = 0;

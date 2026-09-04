@@ -1,0 +1,104 @@
+{
+  "schemaVersion": 1,
+  "manifestVersion": "wos-semantic-mutations-v1",
+  "mutants": [
+    {
+      "id": "scheduler-handoff-preempt-depth",
+      "domain": "scheduler",
+      "target": "modules/kern/src/platform/sched/preemption_policy.hpp",
+      "search": "return !ownership_changes || outgoing_preempt_depth == 0;",
+      "replacement": "return true;",
+      "expectedCount": 1,
+      "testTarget": "kernel_preemption_policy_test",
+      "testFilter": "KernelPreemptionPolicy.OwnershipCommitRejectsDisabledOutgoingTask",
+      "timeoutSeconds": 180,
+      "invariantRules": [
+        "scheduler-process-critical"
+      ]
+    },
+    {
+      "id": "mm-free-count-accounting",
+      "domain": "mm",
+      "target": "modules/kern/src/platform/mm/page_alloc.cpp",
+      "search": "free_count -= BLOCK_SIZE;",
+      "replacement": "free_count += BLOCK_SIZE;",
+      "expectedCount": 1,
+      "testTarget": "physical_balance_test",
+      "testFilter": "PhysicalBalanceTest.AllocationTransferSplitAndFreeRemainExact",
+      "timeoutSeconds": 300,
+      "invariantRules": [
+        "mm-critical"
+      ]
+    },
+    {
+      "id": "vfs-failed-writeback-dirty-state",
+      "domain": "vfs",
+      "target": "modules/kern/src/vfs/buffer_cache.cpp",
+      "search": "if (RC == 0 && (bh->flags & BH_DIRTY) != 0 && bh->dirty_epoch == writeback_dirty_epoch) {",
+      "replacement": "if (RC != 0 && (bh->flags & BH_DIRTY) != 0 && bh->dirty_epoch == writeback_dirty_epoch) {",
+      "expectedCount": 1,
+      "testTarget": "buffer_cache_test",
+      "testFilter": "BufferCacheTest.FailedBwriteMarksCleanBufferDirtyForRetry",
+      "timeoutSeconds": 300,
+      "invariantRules": [
+        "vfs-storage-critical"
+      ]
+    },
+    {
+      "id": "network-tcp-send-credit",
+      "domain": "network",
+      "target": "modules/kern/src/net/proto/tcp.hpp",
+      "search": "return cb->snd_wnd - IN_FLIGHT;",
+      "replacement": "return cb->snd_wnd;",
+      "expectedCount": 1,
+      "testTarget": "tcp_test",
+      "testFilter": "TcpSendCredit.ShrinksWithInFlightBytes",
+      "timeoutSeconds": 180,
+      "invariantRules": [
+        "network-critical"
+      ]
+    },
+    {
+      "id": "wki-ack-window-fence",
+      "domain": "wki",
+      "target": "modules/kern/src/net/wki/channel.cpp",
+      "search": "return !seq_after(ack_next, ch->tx_seq);",
+      "replacement": "return true;",
+      "expectedCount": 1,
+      "testTarget": "wki_channel_test",
+      "testFilter": "WkiChannel.AckNextMustNotAdvancePastTransmittedSeq",
+      "timeoutSeconds": 300,
+      "invariantRules": [
+        "wki-critical"
+      ]
+    },
+    {
+      "id": "block-transfer-end-boundary",
+      "domain": "block",
+      "target": "modules/kern/src/net/wki/blk_ring.hpp",
+      "search": "return lba <= total_blocks && block_count <= total_blocks - lba;",
+      "replacement": "return lba <= total_blocks && block_count < total_blocks - lba;",
+      "expectedCount": 1,
+      "testTarget": "wki_block_validation_test",
+      "testFilter": "WkiBlockValidation.TransferBoundariesRejectOverflowAndOutOfRangeRequests",
+      "timeoutSeconds": 180,
+      "invariantRules": [
+        "block-critical"
+      ]
+    },
+    {
+      "id": "device-xhci-stale-generation",
+      "domain": "device-lifetime",
+      "target": "modules/kern/src/dev/usb/xhci_request.hpp",
+      "search": "auto& record = records_.at(handle.index);\n        if (record.generation.load(std::memory_order_acquire) != handle.generation) {",
+      "replacement": "auto& record = records_.at(handle.index);\n        if (false && record.generation.load(std::memory_order_acquire) != handle.generation) {",
+      "expectedCount": 1,
+      "testTarget": "xhci_request_test",
+      "testFilter": "XhciRequestGeneration.ReleasedSlotRejectsEveryStaleHandleOperation",
+      "timeoutSeconds": 180,
+      "invariantRules": [
+        "device-lifetime-critical"
+      ]
+    }
+  ]
+}

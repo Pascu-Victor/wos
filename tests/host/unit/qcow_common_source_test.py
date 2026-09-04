@@ -160,3 +160,11 @@ def test_libguestfs_prepare_uses_writable_runtime_dir() -> None:
         read_only_runtime.chmod(0o700)
         if result.returncode != 0:
             fail(result.stdout + result.stderr)
+
+
+if __name__ == "__main__":
+    test_wos_qcow_run_preserves_failed_command_status()
+    test_wos_qcow_run_rejects_logged_libguestfs_errors()
+    test_libguestfs_prepare_exports_tmpdir_for_supermin()
+    test_libguestfs_prepare_uses_writable_runtime_dir()
+    print("qcow common helper source invariants hold")

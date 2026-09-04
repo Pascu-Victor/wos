@@ -17,6 +17,8 @@
 #                                           #            data_struct_fuzz
 #                                           #   minutes: duration (default: 5)
 #   wos-test fuzz all [min]                 # run every fuzz target sequentially
+#   wos-test mutation [id|domain ...]       # run isolated semantic mutants
+#   wos-test inventory                      # materialize the invariant inventory
 #   wos-test clean                          # remove build directory
 #   wos-test list                           # list available test & fuzz targets
 #   wos-test report                         # show summary of last results
@@ -97,6 +99,7 @@ timestamp() { date '+%Y-%m-%d_%H%M%S'; }
 FUZZ_TARGETS=(wki_wire_fuzz data_struct_fuzz tcp_fuzz xfs_format_fuzz wki_routing_fuzz slab_fuzz telemetry_fuzz perf_data_fuzz)
 UNIT_TESTS=(
     host_test_manifest_test
+    semantic_regression_test
     ktest_cov_test
     coverage_summary_test
     cluster_setup_test
@@ -240,6 +243,8 @@ UNIT_TESTS=(
     wki_auth_protocol_test
     wki_auth_policy_test
     wki_block_validation_test
+    xhci_request_test
+    fault_script_test
     wki_peer_resolver_test
     netd_ra_test
     saved_frame_class_test
@@ -424,6 +429,24 @@ do_fuzz_single() {
 }
 
 # ---------------------------------------------------------------------------
+# Semantic invariant inventory and isolated mutation evidence
+# ---------------------------------------------------------------------------
+do_inventory() {
+    local output="$RESULTS_DIR/semantic-regression/invariant-inventory.json"
+    info "Auditing and materializing semantic invariant inventory"
+    python3 "$WOS_ROOT/scripts/test/semantic_regression.py" audit \
+        --inventory-output "$output"
+    ok "Invariant inventory: $output"
+}
+
+do_mutation() {
+    info "Running isolated, buildable semantic mutants"
+    python3 "$WOS_ROOT/scripts/test/semantic_regression.py" mutate "$@" \
+        --report "$RESULTS_DIR/semantic-regression/mutation-report.json"
+    ok "Mutation report: $RESULTS_DIR/semantic-regression/mutation-report.json"
+}
+
+# ---------------------------------------------------------------------------
 # Fuzz results analysis
 # ---------------------------------------------------------------------------
 fuzz_report() {
@@ -558,6 +581,8 @@ case "$cmd" in
     configure)  do_configure ;;
     test)       do_test ;;
     fuzz)       do_fuzz "$@" ;;
+    mutation)   do_mutation "$@" ;;
+    inventory)  do_inventory ;;
     report)     do_report ;;
     clean)      do_clean ;;
     list)       list_targets ;;

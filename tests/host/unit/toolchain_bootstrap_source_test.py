@@ -2810,6 +2810,9 @@ def test_mlibc_nameser_parser_does_not_panic_on_dns_packets() -> None:
 
 
 if __name__ == "__main__":
+    test_busybox_less_honors_git_raw_color_pager_options()
+    test_host_toolchain_lldb_python_bindings_are_opt_in()
+    test_mlibc_wrap_dependencies_are_prefetched_with_retries()
     test_compiler_rt_runs_real_cmake_checks_without_forced_response_files()
     test_compiler_rt_sanitizers_are_built_after_mlibc()
     test_native_wos_compiler_rt_does_not_link_with_workspace_sysroot()

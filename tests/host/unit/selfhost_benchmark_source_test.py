@@ -3196,6 +3196,8 @@ def test_selfhost_report_comparator_checks_clone_build_and_total() -> None:
 
 
 if __name__ == "__main__":
+    test_selfhost_cluster_profile_is_single_large_vm()
+    test_selfhost_runner_locks_workdir_before_replacing_it()
     test_selfhost_runner_covers_acceptance_flow()
     test_wos_bootstrap_distributes_only_compiler_processes()
     test_wos_toolchain_stages_sources_before_distributed_compiles()

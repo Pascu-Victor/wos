@@ -1,0 +1,289 @@
+{
+  "schemaVersion": 1,
+  "inventoryVersion": "wos-semantic-invariants-v1",
+  "discovery": {
+    "globs": [
+      "tests/host/unit/*_source_test.py"
+    ]
+  },
+  "defaults": {
+    "classification": "implementation-shape-debt",
+    "risk": "high",
+    "targetTier": "host-source",
+    "migrationStatus": "planned",
+    "owner": "subsystem-owner",
+    "replacementTests": [],
+    "mutationIds": []
+  },
+  "rules": [
+    {
+      "id": "scheduler-process-critical",
+      "paths": [
+        "tests/host/unit/scheduler_source_test.py",
+        "tests/host/unit/kernel_preemption_cpu_local_audit_test.py",
+        "tests/host/unit/waitpid_source_test.py",
+        "tests/host/unit/exec_source_test.py",
+        "tests/host/unit/futex_source_test.py",
+        "tests/host/unit/signal*_source_test.py",
+        "tests/host/unit/poll_deadline_source_test.py"
+      ],
+      "classification": "implementation-shape-debt",
+      "risk": "critical",
+      "targetTier": "host-model",
+      "migrationStatus": "mutant-killed",
+      "owner": "scheduler-process",
+      "replacementTests": [
+        "host-model:kernel_preemption_policy_test",
+        "host-model:scheduler_transition_model_test"
+      ],
+      "mutationIds": [
+        "scheduler-handoff-preempt-depth"
+      ]
+    },
+    {
+      "id": "mm-critical",
+      "paths": [
+        "tests/host/unit/phys_source_test.py",
+        "tests/host/unit/reclaim_source_test.py",
+        "tests/host/unit/vmem_source_test.py",
+        "tests/host/unit/tlb_shootdown_source_test.py",
+        "tests/host/unit/kasan_bootstrap_source_test.py",
+        "tests/host/unit/tmpfs_swap_source_test.py"
+      ],
+      "classification": "implementation-shape-debt",
+      "risk": "critical",
+      "targetTier": "host-shim",
+      "migrationStatus": "mutant-killed",
+      "owner": "memory-management",
+      "replacementTests": [
+        "host-shim:physical_balance_test",
+        "host-model:reclaim_policy_test",
+        "host-model:anonymous_swap_state_test"
+      ],
+      "mutationIds": [
+        "mm-free-count-accounting"
+      ]
+    },
+    {
+      "id": "vfs-storage-critical",
+      "paths": [
+        "tests/host/unit/vfs*_source_test.py",
+        "tests/host/unit/xfs*_source_test.py",
+        "tests/host/unit/tmpfs*_source_test.py",
+        "tests/host/unit/buffer_cache_source_test.py"
+      ],
+      "classification": "implementation-shape-debt",
+      "risk": "critical",
+      "targetTier": "host-shim",
+      "migrationStatus": "mutant-killed",
+      "owner": "vfs-storage",
+      "replacementTests": [
+        "host-model:vfs_lookup_model_test",
+        "host-shim:buffer_cache_test",
+        "host-unit:xfs_log_codec_test"
+      ],
+      "mutationIds": [
+        "vfs-failed-writeback-dirty-state"
+      ]
+    },
+    {
+      "id": "network-critical",
+      "paths": [
+        "tests/host/unit/tcp*_source_test.py",
+        "tests/host/unit/socket*_source_test.py",
+        "tests/host/unit/net*_source_test.py",
+        "tests/host/unit/udp*_source_test.py",
+        "tests/host/unit/virtio_net_source_test.py"
+      ],
+      "classification": "implementation-shape-debt",
+      "risk": "critical",
+      "targetTier": "host-unit",
+      "migrationStatus": "mutant-killed",
+      "owner": "network",
+      "replacementTests": [
+        "host-unit:tcp_test",
+        "host-unit:net_checksum_test",
+        "host-unit:netd_ra_test"
+      ],
+      "mutationIds": [
+        "network-tcp-send-credit"
+      ]
+    },
+    {
+      "id": "wki-critical",
+      "paths": [
+        "tests/host/unit/wki*_source_test.py",
+        "tests/host/unit/devfs_wki_lifetime_source_test.py"
+      ],
+      "classification": "implementation-shape-debt",
+      "risk": "critical",
+      "targetTier": "host-shim",
+      "migrationStatus": "mutant-killed",
+      "owner": "wki",
+      "replacementTests": [
+        "host-shim:wki_channel_test",
+        "host-model:wki_chaos_model_test",
+        "host-unit:wki_event_test"
+      ],
+      "mutationIds": [
+        "wki-ack-window-fence"
+      ]
+    },
+    {
+      "id": "block-critical",
+      "paths": [
+        "tests/host/unit/block_device_source_test.py"
+      ],
+      "classification": "implementation-shape-debt",
+      "risk": "critical",
+      "targetTier": "host-unit",
+      "migrationStatus": "mutant-killed",
+      "owner": "block-io",
+      "replacementTests": [
+        "host-unit:wki_block_validation_test",
+        "host-shim:buffer_cache_test"
+      ],
+      "mutationIds": [
+        "block-transfer-end-boundary"
+      ]
+    },
+    {
+      "id": "device-lifetime-critical",
+      "paths": [
+        "tests/host/unit/xhci_lifecycle_source_test.py",
+        "tests/host/unit/virtio_net_source_test.py",
+        "tests/host/unit/devfs_wki_lifetime_source_test.py"
+      ],
+      "classification": "implementation-shape-debt",
+      "risk": "critical",
+      "targetTier": "host-model",
+      "migrationStatus": "mutant-killed",
+      "owner": "device-lifetime",
+      "replacementTests": [
+        "host-model:xhci_request_test"
+      ],
+      "mutationIds": [
+        "device-xhci-stale-generation"
+      ]
+    },
+    {
+      "id": "retained-static-contracts",
+      "paths": [
+        "tests/host/unit/*abi*_source_test.py",
+        "tests/host/unit/*manifest*_source_test.py",
+        "tests/host/unit/*docs_source_test.py",
+        "tests/host/unit/modules_cmake_source_test.py",
+        "tests/host/unit/rootfs_source_test.py",
+        "tests/host/unit/image_source_test.py",
+        "tests/host/unit/toolchain_bootstrap_source_test.py",
+        "tests/host/unit/wki_wireshark_source_test.py"
+      ],
+      "classification": "policy",
+      "risk": "medium",
+      "targetTier": "host-source",
+      "migrationStatus": "retained-static",
+      "owner": "build-abi-policy",
+      "rationale": "The asserted artifact, schema, manifest, ABI declaration, or packaging text is itself the compatibility surface.",
+      "replacementTests": [],
+      "mutationIds": []
+    }
+  ],
+  "tiers": {
+    "host-source": {
+      "budgetSeconds": 120,
+      "owner": "test-infrastructure",
+      "evidence": "CTest label host;source"
+    },
+    "host-unit": {
+      "budgetSeconds": 1800,
+      "owner": "subsystem-owner",
+      "evidence": "CTest label host;unit"
+    },
+    "host-model": {
+      "budgetSeconds": 300,
+      "owner": "model-owner",
+      "evidence": "Pure deterministic state-model target"
+    },
+    "host-shim": {
+      "budgetSeconds": 1800,
+      "owner": "subsystem-owner",
+      "evidence": "Production source compiled with bounded host shims"
+    },
+    "fuzz": {
+      "budgetSeconds": 300,
+      "owner": "subsystem-owner",
+      "evidence": "Bounded libFuzzer run and retained corpus"
+    },
+    "ktest": {
+      "budgetSeconds": 3600,
+      "owner": "kernel-owner",
+      "evidence": "Isolated bin/wos-ktest --no-setup log audited against source"
+    },
+    "testd": {
+      "budgetSeconds": 7200,
+      "owner": "userspace-owner",
+      "evidence": "TESTD log audited against source manifest"
+    },
+    "multi-node": {
+      "budgetSeconds": 7200,
+      "owner": "distributed-owner",
+      "evidence": "Rootless wos-cluster --no-setup scenario artifact"
+    },
+    "hardware-user": {
+      "budgetSeconds": 7200,
+      "owner": "user",
+      "evidence": "Explicit user-run hardware trace; never substituted by a host model"
+    }
+  },
+  "fixtures": {
+    "allocation-failure": [
+      "tests/host/kern_shim/test/fault_script.hpp",
+      "modules/kern/src/test/fault_block_device.hpp",
+      "tests/host/unit/buffer_cache_test.cpp"
+    ],
+    "cancellation": [
+      "tests/host/kern_shim/test/fault_script.hpp",
+      "modules/kern/src/test/fault_block_device.hpp",
+      "tests/host/unit/xhci_request_test.cpp"
+    ],
+    "timeout": [
+      "tests/host/kern_shim/test/fault_script.hpp",
+      "tests/host/unit/xhci_request_test.cpp",
+      "modules/kern/src/test/wki_wait_ktest.cpp"
+    ],
+    "disconnect": [
+      "tests/host/kern_shim/test/fault_script.hpp",
+      "modules/kern/src/net/wki/chaos_model.hpp",
+      "tests/host/unit/wki_chaos_model_test.cpp"
+    ],
+    "stale-generation": [
+      "tests/host/kern_shim/test/fault_script.hpp",
+      "modules/kern/src/platform/mm/anonymous_swap_state.hpp",
+      "tests/host/unit/xhci_request_test.cpp"
+    ],
+    "reorder": [
+      "tests/host/kern_shim/test/fault_script.hpp",
+      "modules/kern/src/net/wki/chaos_model.hpp",
+      "tests/host/unit/wki_chaos_model_test.cpp"
+    ],
+    "duplicate-completion": [
+      "tests/host/kern_shim/test/fault_script.hpp",
+      "tests/host/unit/xhci_request_test.cpp",
+      "tests/host/unit/wki_channel_test.cpp"
+    ],
+    "concurrent-teardown": [
+      "tests/host/kern_shim/test/fault_script.hpp",
+      "tests/host/unit/buffer_cache_test.cpp",
+      "tests/host/unit/xhci_request_test.cpp"
+    ]
+  },
+  "requiredDomains": [
+    "scheduler",
+    "mm",
+    "vfs",
+    "network",
+    "wki",
+    "block",
+    "device-lifetime"
+  ]
+}

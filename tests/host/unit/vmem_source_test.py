@@ -951,6 +951,7 @@ def main() -> None:
     test_user_memory_pressure_does_not_enter_fatal_oom()
     test_kasan_excluded_lazy_file_snapshot_is_unpoisoned_after_unlock()
     test_default_writable_anon_mmap_is_demand_paged()
+    test_file_mmap_cache_is_sharded_without_changing_page_ownership()
     test_thread_publication_is_serialized_with_shared_vmem_updates()
     test_fork_snapshots_all_vm_surfaces_under_one_publication_guard()
     test_fork_child_registers_use_immutable_syscall_entry_snapshot()

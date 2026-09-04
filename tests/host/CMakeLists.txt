@@ -9,6 +9,10 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/host_test_manifest_test.py
 )
 add_test(
+    NAME semantic_regression_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/semantic_regression_test.py
+)
+add_test(
     NAME ktest_cov_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/ktest_cov_test.py
 )
@@ -550,6 +554,7 @@ add_test(
 )
 set_tests_properties(
     host_test_manifest_test
+    semantic_regression_test
     ktest_cov_test
     coverage_summary_test
     cluster_setup_test
@@ -710,6 +715,14 @@ wos_add_unit_test(wki_auth_policy_test
 
 wos_add_unit_test(wki_block_validation_test
     SOURCES     ${CMAKE_CURRENT_SOURCE_DIR}/unit/wki_block_validation_test.cpp
+)
+
+wos_add_unit_test(xhci_request_test
+    SOURCES     ${CMAKE_CURRENT_SOURCE_DIR}/unit/xhci_request_test.cpp
+)
+
+wos_add_unit_test(fault_script_test
+    SOURCES     ${CMAKE_CURRENT_SOURCE_DIR}/unit/fault_script_test.cpp
 )
 
 wos_add_unit_test(wki_peer_resolver_test

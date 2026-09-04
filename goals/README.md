@@ -49,7 +49,7 @@ an explicit pause/block rule.
 | 21  | [Modern kernel self-protection](21-kernel-self-protection.md)                        | linker/boot, W^X, KASLR, SMEP/SMAP, stacks                  | 16 and entry/return or VM rewrites            | Not started |
 | 22  | [Kernel-enforced resource governance](22-kernel-resource-governance.md)              | rlimits, Task, VM/VFS, init, remote compute                  | 19 on Task/ServiceSpec; 28 on job quotas      | Not started |
 | 23  | [Reproducible offline builds](23-reproducible-offline-builds.md)                      | toolchain, CMake, sysroots, images, SBOM                     | broad build/image/cluster script changes      | Done        |
-| 24  | [Semantic regression and mutation testing](24-semantic-regression-platform.md)       | host tests, models, KTEST, faults, fuzzing                   | broad structural refactors in tested paths    | Not started |
+| 24  | [Semantic regression and mutation testing](24-semantic-regression-platform.md)       | host tests, models, KTEST, faults, fuzzing                   | broad structural refactors in tested paths    | Done        |
 | 25  | [Secure session-bound WKI RDMA](25-secure-wki-rdma.md)                               | WKI auth, RoCE, ivshmem, zones, fast paths                   | 20 on ivshmem; 26 on remote VFS               | Not started |
 | 26  | [Owner-authoritative remote VFS coherency](26-remote-vfs-coherency-locking.md)        | remote VFS, caches, append, advisory locks                   | 18 and 25 on shared VFS/wire surfaces         | Not started |
 | 27  | [Loop-free bounded WKI routing](27-wki-routing-convergence.md)                        | WKI LSA/LSDB, RX, SPF, route publication                     | other peer/routing/wire protocol rewrites     | Not started |
@@ -64,9 +64,10 @@ an explicit pause/block rule.
 The portfolio `Status` column is the canonical goal-selection filter. Do not
 select, reload, or rescan a row marked `Done`; its completion record and current
 source remain available only for later regression work. Completed goals are
-currently 01 through 18 and 32. Select only a row whose status is `Not started`
-(or a future explicit in-progress state). Goals 19 through 31 are the unfinished
-portfolio produced from local-source reconnaissance on 2026-09-03.
+currently 01 through 18, 23, 24, and 32. Select only a row whose status is `Not
+started` (or a future explicit in-progress state). Goals 19 through 22 and 25
+through 31 are the unfinished portfolio produced from local-source
+reconnaissance on 2026-09-03.
 
 ## How to use a goal
 
