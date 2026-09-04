@@ -19,7 +19,9 @@
 #include <QJsonDocument>
 #include <QProcess>
 #include <QRegularExpression>
+#include <QSaveFile>
 #include <QSet>
+#include <QTemporaryDir>
 #include <QTextStream>
 #include <QTimer>
 #include <QUrl>
@@ -39,6 +41,8 @@
 #include "coredump_memory.h"
 #include "coredump_parser.h"
 #include "elf_symbol_resolver.h"
+#include "live_protocol.h"
+#include "live_session_manager.h"
 #include "log_entry.h"
 #include "log_processor.h"
 #include "telemetry_log.h"
@@ -783,16 +787,562 @@ auto source_with_llvm_symbolizer(const QString& object_path, uint64_t object_rel
 
 }  // namespace
 
-DebugAnalysisService::DebugAnalysisService(QObject* parent) : QObject(parent) {}
+DebugAnalysisService::DebugAnalysisService(QObject* parent) : QObject(parent) {
+    auto* lease_timer = new QTimer(this);
+    lease_timer->setInterval(1000);
+    connect(lease_timer, &QTimer::timeout, this, [this]() {
+        if (live_sessions) {
+            (void)live_sessions->sweep_expired();
+        }
+    });
+    lease_timer->start();
+    connect(QCoreApplication::instance(), &QCoreApplication::aboutToQuit, this, &DebugAnalysisService::shutdown_live_sessions);
+}
 
-void DebugAnalysisService::set_config(const Config& new_config) { config = const_cast<Config*>(&new_config); }
+DebugAnalysisService::~DebugAnalysisService() { shutdown_live_sessions(); }
+
+void DebugAnalysisService::set_config(const Config& new_config) {
+    shutdown_live_sessions();
+    config = const_cast<Config*>(&new_config);
+    live_sessions = std::make_unique<wosdbg::live::LiveSessionManager>(new_config.get_live_settings(), allowed_roots());
+}
 
 void DebugAnalysisService::reload_config() {
     ConfigService::instance().reload();
     config = &ConfigService::instance().get_mutable_config();
+    shutdown_live_sessions();
+    live_sessions = std::make_unique<wosdbg::live::LiveSessionManager>(config->get_live_settings(), allowed_roots());
 }
 
 auto DebugAnalysisService::tool_error(const QString& message) -> QJsonObject { return QJsonObject{{"ok", false}, {"error", message}}; }
+
+namespace {
+
+auto live_error_json(const std::exception& error) -> QJsonObject {
+    if (const auto* live_error = dynamic_cast<const wosdbg::live::LiveSessionError*>(&error)) {
+        return QJsonObject{{"ok", false}, {"errorCode", live_error->code_string()}, {"error", live_error->message()}};
+    }
+    if (const auto* protocol_error = dynamic_cast<const wosdbg::live::ProtocolError*>(&error)) {
+        return QJsonObject{{"ok", false},
+                           {"errorCode", "protocol_failure"},
+                           {"protocolErrorCode", static_cast<int>(protocol_error->code())},
+                           {"error", protocol_error->message()}};
+    }
+    return QJsonObject{{"ok", false}, {"errorCode", "internal_error"}, {"error", QString::fromUtf8(error.what())}};
+}
+
+auto live_owner(const QString& owner_id) -> QString { return owner_id.isEmpty() ? QStringLiteral("local") : owner_id.left(160); }
+
+auto live_target_ids(const QJsonObject& args) -> QStringList {
+    QStringList result;
+    for (const auto& value : args["targetIds"].toArray()) {
+        if (value.isString() && !value.toString().isEmpty()) {
+            result.append(value.toString());
+        }
+    }
+    if (result.isEmpty() && !args["targetId"].toString().isEmpty()) {
+        result.append(args["targetId"].toString());
+    }
+    result.removeDuplicates();
+    return result;
+}
+
+}  // namespace
+
+auto DebugAnalysisService::discover_live_targets() -> QJsonObject {
+    if (!live_sessions) {
+        return QJsonObject{{"ok", false}, {"errorCode", "disabled"}, {"error", "Live debugging is not configured"}};
+    }
+    try {
+        return live_sessions->discover_targets();
+    } catch (const std::exception& error) {
+        return live_error_json(error);
+    }
+}
+
+auto DebugAnalysisService::list_live_targets() const -> QJsonObject {
+    if (!live_sessions) {
+        return QJsonObject{{"ok", false}, {"errorCode", "disabled"}, {"error", "Live debugging is not configured"}};
+    }
+    try {
+        return live_sessions->list_targets();
+    } catch (const std::exception& error) {
+        return live_error_json(error);
+    }
+}
+
+auto DebugAnalysisService::open_live_session(const QJsonObject& args, const QString& owner_id) -> QJsonObject {
+    if (!live_sessions) {
+        return QJsonObject{{"ok", false}, {"errorCode", "disabled"}, {"error", "Live debugging is not configured"}};
+    }
+    if (args["authority"].toString() != "pause-read" || args["confirmation"].toString() != "PAUSE_ALLOWLISTED_TARGETS") {
+        return QJsonObject{{"ok", false},
+                           {"errorCode", "authority_required"},
+                           {"error", "Opening a pause lease requires authority=pause-read and confirmation=PAUSE_ALLOWLISTED_TARGETS"}};
+    }
+    const QString audit_id = args["auditId"].toString().trimmed();
+    if (audit_id.isEmpty() || audit_id.toUtf8().size() > 160) {
+        return QJsonObject{{"ok", false}, {"errorCode", "invalid_argument"}, {"error", "auditId is empty or too long"}};
+    }
+    try {
+        return live_sessions->open_session(live_target_ids(args), live_owner(owner_id), audit_id, args["leaseMs"].toInt());
+    } catch (const std::exception& error) {
+        return live_error_json(error);
+    }
+}
+
+auto DebugAnalysisService::list_live_sessions(const QString& owner_id) const -> QJsonObject {
+    if (!live_sessions) {
+        return QJsonObject{{"ok", false}, {"errorCode", "disabled"}, {"error", "Live debugging is not configured"}};
+    }
+    try {
+        return live_sessions->list_sessions(live_owner(owner_id));
+    } catch (const std::exception& error) {
+        return live_error_json(error);
+    }
+}
+
+auto DebugAnalysisService::get_live_session(const QJsonObject& args, const QString& owner_id) const -> QJsonObject {
+    if (!live_sessions) {
+        return QJsonObject{{"ok", false}, {"errorCode", "disabled"}, {"error", "Live debugging is not configured"}};
+    }
+    try {
+        return live_sessions->session_status(args["sessionId"].toString(), args["leaseToken"].toString(), live_owner(owner_id));
+    } catch (const std::exception& error) {
+        return live_error_json(error);
+    }
+}
+
+auto DebugAnalysisService::renew_live_session(const QJsonObject& args, const QString& owner_id) -> QJsonObject {
+    if (!live_sessions) {
+        return QJsonObject{{"ok", false}, {"errorCode", "disabled"}, {"error", "Live debugging is not configured"}};
+    }
+    try {
+        return live_sessions->renew(args["sessionId"].toString(), args["leaseToken"].toString(), live_owner(owner_id),
+                                    args["leaseMs"].toInt());
+    } catch (const std::exception& error) {
+        return live_error_json(error);
+    }
+}
+
+auto DebugAnalysisService::close_live_session(const QJsonObject& args, const QString& owner_id) -> QJsonObject {
+    if (!live_sessions) {
+        return QJsonObject{{"ok", false}, {"errorCode", "disabled"}, {"error", "Live debugging is not configured"}};
+    }
+    try {
+        return live_sessions->close(args["sessionId"].toString(), args["leaseToken"].toString(), live_owner(owner_id));
+    } catch (const std::exception& error) {
+        return live_error_json(error);
+    }
+}
+
+auto DebugAnalysisService::read_live_registers(const QJsonObject& args, const QString& owner_id) -> QJsonObject {
+    if (!live_sessions) {
+        return QJsonObject{{"ok", false}, {"errorCode", "disabled"}, {"error", "Live debugging is not configured"}};
+    }
+    try {
+        return live_sessions->read_registers(args["sessionId"].toString(), args["leaseToken"].toString(), live_owner(owner_id),
+                                             args["targetId"].toString());
+    } catch (const std::exception& error) {
+        return live_error_json(error);
+    }
+}
+
+auto DebugAnalysisService::read_live_memory(const QJsonObject& args, const QString& owner_id) -> QJsonObject {
+    if (!live_sessions) {
+        return QJsonObject{{"ok", false}, {"errorCode", "disabled"}, {"error", "Live debugging is not configured"}};
+    }
+    const auto ADDRESS = parse_address_value(args["address"]);
+    if (!ADDRESS.has_value()) {
+        return QJsonObject{{"ok", false}, {"errorCode", "invalid_argument"}, {"error", "Invalid live memory address"}};
+    }
+    const bool CONFIRM_SENSITIVE = args["confirmation"].toString() == "READ_SENSITIVE_LIVE_MEMORY";
+    try {
+        return live_sessions->read_memory(args["sessionId"].toString(), args["leaseToken"].toString(), live_owner(owner_id),
+                                          args["targetId"].toString(), *ADDRESS, args["length"].toInt(), CONFIRM_SENSITIVE);
+    } catch (const std::exception& error) {
+        return live_error_json(error);
+    }
+}
+
+auto DebugAnalysisService::backtrace_live(const QJsonObject& args, const QString& owner_id) -> QJsonObject {
+    if (!live_sessions) {
+        return QJsonObject{{"ok", false}, {"errorCode", "disabled"}, {"error", "Live debugging is not configured"}};
+    }
+    try {
+        return live_sessions->frame_pointer_backtrace(args["sessionId"].toString(), args["leaseToken"].toString(), live_owner(owner_id),
+                                                      args["targetId"].toString(), bounded_int(args, "maxFrames", 32, 1, 128));
+    } catch (const std::exception& error) {
+        return live_error_json(error);
+    }
+}
+
+auto DebugAnalysisService::resolve_live_address(const QJsonObject& args, const QString& owner_id) -> QJsonObject {
+    if (!live_sessions) {
+        return QJsonObject{{"ok", false}, {"errorCode", "disabled"}, {"error", "Live debugging is not configured"}};
+    }
+    const auto ADDRESS = parse_address_value(args["address"]);
+    if (!ADDRESS.has_value()) {
+        return QJsonObject{{"ok", false}, {"errorCode", "invalid_argument"}, {"error", "Invalid live address"}};
+    }
+    try {
+        return live_sessions->resolve_address(args["sessionId"].toString(), args["leaseToken"].toString(), live_owner(owner_id),
+                                              args["targetId"].toString(), *ADDRESS);
+    } catch (const std::exception& error) {
+        return live_error_json(error);
+    }
+}
+
+auto DebugAnalysisService::get_live_source(const QJsonObject& args, const QString& owner_id) -> QJsonObject {
+    if (!live_sessions) {
+        return QJsonObject{{"ok", false}, {"errorCode", "disabled"}, {"error", "Live debugging is not configured"}};
+    }
+    const auto address = parse_address_value(args["address"]);
+    if (!address) {
+        return QJsonObject{{"ok", false}, {"errorCode", "invalid_argument"}, {"error", "Invalid live source address"}};
+    }
+    const QString session_id = args["sessionId"].toString();
+    const QString token = args["leaseToken"].toString();
+    const QString owner = live_owner(owner_id);
+    const QString target_id = args["targetId"].toString();
+    try {
+        const QJsonObject resolved = live_sessions->resolve_address(session_id, token, owner, target_id, *address);
+        const QJsonObject sources = live_sessions->capture_sources(session_id, token, owner);
+        QString symbol_path;
+        for (const QJsonValue& value : sources["targets"].toArray()) {
+            if (value.toObject()["id"].toString() == target_id) {
+                symbol_path = value.toObject()["symbolPath"].toString();
+                break;
+            }
+        }
+        const auto object_address = parse_address_value(resolved["objectAddress"]);
+        if (symbol_path.isEmpty() || !object_address || !is_path_allowed(symbol_path)) {
+            return QJsonObject{{"ok", false}, {"errorCode", "symbols_quarantined"}, {"error", "Verified source image is unavailable"}};
+        }
+        const QJsonObject source = source_with_llvm_symbolizer(symbol_path, *object_address);
+        return QJsonObject{{"ok", true},
+                           {"format", "wosdbg-live"},
+                           {"version", 1},
+                           {"targetId", target_id},
+                           {"address", resolved["address"]},
+                           {"symbol", resolved["symbol"]},
+                           {"source", source},
+                           {"verified", true}};
+    } catch (const std::exception& error) {
+        return live_error_json(error);
+    }
+}
+
+auto DebugAnalysisService::inspect_live_pte(const QJsonObject& args, const QString& owner_id) -> QJsonObject {
+    if (!live_sessions) {
+        return QJsonObject{{"ok", false}, {"errorCode", "disabled"}, {"error", "Live debugging is not configured"}};
+    }
+    const auto address = parse_address_value(args["address"]);
+    if (!address) {
+        return QJsonObject{{"ok", false}, {"errorCode", "invalid_argument"}, {"error", "Invalid live PTE address"}};
+    }
+    try {
+        return live_sessions->inspect_pte(args["sessionId"].toString(), args["leaseToken"].toString(), live_owner(owner_id),
+                                          args["targetId"].toString(), *address);
+    } catch (const std::exception& error) {
+        return live_error_json(error);
+    }
+}
+
+auto DebugAnalysisService::get_live_transcript(const QJsonObject& args, const QString& owner_id) const -> QJsonObject {
+    if (!live_sessions) {
+        return QJsonObject{{"ok", false}, {"errorCode", "disabled"}, {"error", "Live debugging is not configured"}};
+    }
+    const bool INCLUDE_PAYLOADS = args["includeSensitivePayloads"].toBool(false);
+    const bool CONFIRM_SENSITIVE = args["confirmation"].toString() == "INCLUDE_SENSITIVE_LIVE_DATA";
+    try {
+        return live_sessions->transcript(args["sessionId"].toString(), args["leaseToken"].toString(), live_owner(owner_id),
+                                         INCLUDE_PAYLOADS, CONFIRM_SENSITIVE);
+    } catch (const std::exception& error) {
+        return live_error_json(error);
+    }
+}
+
+auto DebugAnalysisService::verify_live_transcript(const QJsonObject& args) const -> QJsonObject {
+    const QJsonObject transcript = args["transcript"].toObject();
+    if (transcript["format"].toString() != "wosdbg-live-transcript" || transcript["version"].toInt(-1) != 1 ||
+        !transcript["records"].isArray()) {
+        return QJsonObject{{"ok", false}, {"errorCode", "invalid_transcript"}, {"error", "Unsupported live transcript schema"}};
+    }
+    const QJsonArray records = transcript["records"].toArray();
+    if (records.size() > 4096) {
+        return QJsonObject{{"ok", false}, {"errorCode", "limit_exceeded"}, {"error", "Transcript has too many records"}};
+    }
+    qint64 expected_sequence = 1;
+    bool payloads_available = true;
+    for (const QJsonValue& value : records) {
+        if (!value.isObject()) {
+            return QJsonObject{{"ok", false}, {"errorCode", "invalid_transcript"}, {"error", "Transcript record is not an object"}};
+        }
+        const QJsonObject record = value.toObject();
+        if (record["sequence"].toInteger(-1) != expected_sequence++) {
+            return QJsonObject{{"ok", false}, {"errorCode", "invalid_transcript"}, {"error", "Transcript sequence is not contiguous"}};
+        }
+        if (!record.contains("payload")) {
+            payloads_available = false;
+            continue;
+        }
+        if (record["payloadEncoding"].toString() != "base64") {
+            return QJsonObject{{"ok", false}, {"errorCode", "invalid_transcript"}, {"error", "Transcript payload encoding is invalid"}};
+        }
+        const auto decoded =
+            QByteArray::fromBase64Encoding(record["payload"].toString().toLatin1(), QByteArray::AbortOnBase64DecodingErrors);
+        if (!decoded || decoded.decoded.size() != record["payloadBytes"].toInteger(-1) ||
+            QString::fromLatin1(QCryptographicHash::hash(*decoded, QCryptographicHash::Sha256).toHex()) !=
+                record["payloadSha256"].toString()) {
+            return QJsonObject{{"ok", false}, {"errorCode", "integrity_failure"}, {"error", "Transcript payload integrity check failed"}};
+        }
+    }
+    const QByteArray canonical = QJsonDocument(transcript).toJson(QJsonDocument::Compact);
+    if (canonical.size() > 1024 * 1024) {
+        return QJsonObject{{"ok", false}, {"errorCode", "limit_exceeded"}, {"error", "Transcript exceeds the replay bound"}};
+    }
+    const QString digest =
+        QString("sha256:%1").arg(QString::fromLatin1(QCryptographicHash::hash(canonical, QCryptographicHash::Sha256).toHex()));
+    if (digest != args["digest"].toString()) {
+        return QJsonObject{{"ok", false}, {"errorCode", "integrity_failure"}, {"error", "Transcript digest does not match"}};
+    }
+    return QJsonObject{{"ok", true},
+                       {"format", "wosdbg-live-transcript-replay"},
+                       {"version", 1},
+                       {"digest", digest},
+                       {"recordCount", records.size()},
+                       {"payloadsAvailable", payloads_available},
+                       {"deterministic", true}};
+}
+
+auto DebugAnalysisService::capture_live_incident(const QJsonObject& args, const QString& owner_id) -> QJsonObject {
+    if (!live_sessions) {
+        return QJsonObject{{"ok", false}, {"errorCode", "disabled"}, {"error", "Live debugging is not configured"}};
+    }
+    if (args["confirmation"].toString() != "CAPTURE_LIVE_INCIDENT") {
+        return QJsonObject{{"ok", false},
+                           {"errorCode", "authority_required"},
+                           {"error", "Live incident capture requires confirmation=CAPTURE_LIVE_INCIDENT"}};
+    }
+    const QString session_id = args["sessionId"].toString();
+    const QString lease_token = args["leaseToken"].toString();
+    const QString owner = live_owner(owner_id);
+    const QString output = QFileInfo(args["output"].toString()).absoluteFilePath();
+    const QFileInfo output_info(output);
+    if (args["output"].toString().isEmpty() || QFileInfo::exists(output) || !is_path_allowed(output_info.absolutePath())) {
+        return QJsonObject{
+            {"ok", false}, {"errorCode", "unsafe_path"}, {"error", "Incident output must be a new path below an allowed root"}};
+    }
+
+    QJsonObject status;
+    QJsonObject sources;
+    QJsonObject transcript;
+    try {
+        status = live_sessions->session_status(session_id, lease_token, owner);
+        sources = live_sessions->capture_sources(session_id, lease_token, owner);
+        transcript = live_sessions->transcript(session_id, lease_token, owner, false, false);
+    } catch (const std::exception& error) {
+        return live_error_json(error);
+    }
+
+    QString script;
+    const QStringList script_candidates = {
+        QDir::current().absoluteFilePath("bin/wos-incident"),
+        QDir(QCoreApplication::applicationDirPath()).absoluteFilePath("../../../bin/wos-incident"),
+    };
+    for (const QString& candidate : script_candidates) {
+        const QString canonical = QFileInfo(candidate).canonicalFilePath();
+        if (!canonical.isEmpty() && QFileInfo(canonical).isExecutable() && is_path_allowed(canonical)) {
+            script = canonical;
+            break;
+        }
+    }
+    if (script.isEmpty()) {
+        return QJsonObject{{"ok", false}, {"errorCode", "capture_failed"}, {"error", "bin/wos-incident is unavailable"}};
+    }
+    const QString repo_root = QFileInfo(script).absoluteDir().absoluteFilePath("..");
+    QTemporaryDir temporary(QDir(repo_root).absoluteFilePath(".wosdbg-live-capture-XXXXXX"));
+    if (!temporary.isValid()) {
+        return QJsonObject{{"ok", false}, {"errorCode", "capture_failed"}, {"error", "Cannot create private capture staging"}};
+    }
+    QFile::setPermissions(temporary.path(), QFileDevice::ReadOwner | QFileDevice::WriteOwner | QFileDevice::ExeOwner);
+    auto write_json = [&](const QString& name, const QJsonObject& value) -> QString {
+        const QString path = QDir(temporary.path()).filePath(name);
+        QSaveFile file(path);
+        file.setDirectWriteFallback(false);
+        if (!file.open(QIODevice::WriteOnly)) {
+            return {};
+        }
+        const QByteArray bytes = QJsonDocument(value).toJson(QJsonDocument::Compact);
+        if (bytes.size() > 8 * 1024 * 1024 || file.write(bytes) != bytes.size() || !file.commit()) {
+            return {};
+        }
+        QFile::setPermissions(path, QFileDevice::ReadOwner | QFileDevice::WriteOwner);
+        return path;
+    };
+    auto unix_ns = []() {
+        return QString::number(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+    };
+
+    QJsonArray topology_nodes;
+    QJsonArray captures;
+    QStringList evidence;
+    for (const QJsonValue& target_value : status["targets"].toArray()) {
+        const QJsonObject target = target_value.toObject();
+        const QString target_id = target["id"].toString();
+        topology_nodes.append(QJsonObject{{"nodeId", target["nodeId"]}, {"hostname", target_id}});
+        const QString started = unix_ns();
+        QJsonObject registers;
+        QJsonObject backtrace;
+        try {
+            registers = live_sessions->read_registers(session_id, lease_token, owner, target_id);
+            backtrace = live_sessions->frame_pointer_backtrace(session_id, lease_token, owner, target_id, 32);
+        } catch (const std::exception& error) {
+            registers = live_error_json(error);
+            backtrace = registers;
+        }
+        QJsonObject capture{{"targetId", target_id},
+                            {"nodeId", target["nodeId"]},
+                            {"captureStartedUnixNs", started},
+                            {"captureFinishedUnixNs", unix_ns()},
+                            {"complete", registers["ok"].toBool(false) && backtrace["ok"].toBool(false)},
+                            {"registers", registers},
+                            {"backtrace", backtrace}};
+        captures.append(capture);
+        const QString register_path = write_json(QString("register-%1.json").arg(target_id), capture);
+        if (register_path.isEmpty()) {
+            return QJsonObject{{"ok", false}, {"errorCode", "capture_failed"}, {"error", "Cannot stage register evidence"}};
+        }
+        evidence << QString("register-snapshot=%1").arg(register_path);
+    }
+
+    const QJsonArray memory_ranges = args["memoryRanges"].toArray();
+    if (memory_ranges.size() > 16) {
+        return QJsonObject{{"ok", false}, {"errorCode", "limit_exceeded"}, {"error", "Too many live memory ranges"}};
+    }
+    for (int index = 0; index < memory_ranges.size(); ++index) {
+        const QJsonObject range = memory_ranges[index].toObject();
+        const auto address = parse_address_value(range["address"]);
+        if (!address) {
+            return QJsonObject{{"ok", false}, {"errorCode", "invalid_argument"}, {"error", "Invalid memory range address"}};
+        }
+        QJsonObject memory;
+        try {
+            memory = live_sessions->read_memory(session_id, lease_token, owner, range["targetId"].toString(), *address,
+                                                range["length"].toInt(), true);
+        } catch (const std::exception& error) {
+            return live_error_json(error);
+        }
+        memory["captureUnixNs"] = unix_ns();
+        const QString memory_path = write_json(QString("memory-%1.json").arg(index), memory);
+        if (memory_path.isEmpty()) {
+            return QJsonObject{{"ok", false}, {"errorCode", "capture_failed"}, {"error", "Cannot stage memory evidence"}};
+        }
+        evidence << QString("memory-snapshot=%1").arg(memory_path);
+    }
+
+    QJsonObject capture_config{{"format", "wosdbg-live"},
+                               {"version", 1},
+                               {"state", "snapshot"},
+                               {"session", status},
+                               {"captureSources", sources},
+                               {"topology", QJsonObject{{"nodes", topology_nodes}, {"zones", QJsonArray{}}}},
+                               {"captures", captures},
+                               {"clock", QJsonObject{{"domain", "host-realtime"},
+                                                     {"quality", "host-sequential-snapshots"},
+                                                     {"globalGuestOrderAvailable", false},
+                                                     {"complete", captures.size() == status["targetCount"].toInt()}}}};
+    const QString config_path = write_json("live-session.json", capture_config);
+    const QString transcript_path = write_json("live-transcript.json", transcript);
+    if (config_path.isEmpty() || transcript_path.isEmpty()) {
+        return QJsonObject{{"ok", false}, {"errorCode", "capture_failed"}, {"error", "Cannot stage live session evidence"}};
+    }
+    evidence << QString("live-session=%1").arg(config_path) << QString("live-transcript=%1").arg(transcript_path);
+
+    for (const QJsonValue& target_value : sources["targets"].toArray()) {
+        const QJsonObject target = target_value.toObject();
+        if (!target["symbolPath"].toString().isEmpty()) {
+            evidence << QString("binary=%1").arg(target["symbolPath"].toString());
+        }
+        int log_index = 0;
+        for (const QJsonValue& log_value : target["logPaths"].toArray()) {
+            evidence << QString("%1=%2").arg(log_index++ == 0 ? "serial-log" : "qemu-log", log_value.toString());
+        }
+    }
+    const QJsonArray coredumps = args["coredumpPaths"].toArray();
+    if (coredumps.size() > 32) {
+        return QJsonObject{{"ok", false}, {"errorCode", "limit_exceeded"}, {"error", "Too many coredump paths"}};
+    }
+    for (const QJsonValue& value : coredumps) {
+        const QString path = QFileInfo(value.toString()).absoluteFilePath();
+        const QFileInfo info(path);
+        if (!info.isFile() || info.isSymLink() || !is_path_allowed(path)) {
+            return QJsonObject{{"ok", false}, {"errorCode", "unsafe_path"}, {"error", "Coredump path is not an allowlisted regular file"}};
+        }
+        evidence << QString("coredump=%1").arg(path);
+    }
+
+    QStringList process_args{"capture", "--kind", "live", "--config", config_path, "--output", output};
+    if (args["archive"].toBool(false)) {
+        process_args << "--archive";
+    }
+    for (const QString& item : evidence) {
+        process_args << "--live-evidence" << item;
+    }
+    QProcess process;
+    process.setWorkingDirectory(repo_root);
+    process.start(script, process_args);
+    if (!process.waitForStarted(3000) || !process.waitForFinished(60000)) {
+        process.kill();
+        process.waitForFinished(1000);
+        return QJsonObject{{"ok", false}, {"errorCode", "capture_timeout"}, {"error", "Live incident writer timed out"}};
+    }
+    const QByteArray stdout_bytes = process.readAllStandardOutput().left(K_MAX_CAPTURED_PROCESS_OUTPUT);
+    const QByteArray stderr_bytes = process.readAllStandardError().left(K_MAX_CAPTURED_PROCESS_OUTPUT);
+    if (process.exitStatus() != QProcess::NormalExit || process.exitCode() != 0) {
+        return QJsonObject{{"ok", false},
+                           {"errorCode", "capture_failed"},
+                           {"exitCode", process.exitCode()},
+                           {"stdout", QString::fromUtf8(stdout_bytes)},
+                           {"stderr", QString::fromUtf8(stderr_bytes)}};
+    }
+    QJsonObject reopened = load_incident(QJsonObject{{"path", output}, {"loadEvidence", true}});
+    if (!reopened["ok"].toBool(false)) {
+        return QJsonObject{{"ok", false},
+                           {"errorCode", "reopen_failed"},
+                           {"output", output},
+                           {"writerOutput", QString::fromUtf8(stdout_bytes)},
+                           {"reopen", reopened}};
+    }
+    return QJsonObject{{"ok", true},
+                       {"format", "wosdbg-live-incident-capture"},
+                       {"version", 1},
+                       {"output", output},
+                       {"clockQuality", "host-sequential-snapshots"},
+                       {"globalGuestOrderAvailable", false},
+                       {"targetCount", captures.size()},
+                       {"reopened", reopened}};
+}
+
+auto DebugAnalysisService::close_live_sessions_for_owner(const QString& owner_id) -> QJsonObject {
+    if (!live_sessions) {
+        return QJsonObject{{"ok", true}, {"closed", 0}};
+    }
+    try {
+        return live_sessions->close_owner(live_owner(owner_id));
+    } catch (const std::exception& error) {
+        return live_error_json(error);
+    }
+}
+
+void DebugAnalysisService::shutdown_live_sessions() {
+    if (live_sessions) {
+        live_sessions->shutdown();
+        live_sessions.reset();
+    }
+}
 
 auto DebugAnalysisService::status() const -> QJsonObject {
     const Config& cfg = (config != nullptr) ? *config : ConfigService::instance().get_config();
@@ -816,6 +1366,15 @@ auto DebugAnalysisService::status() const -> QJsonObject {
                                      {"loading", session->loading}});
     }
 
+    QJsonObject live_status{{"enabled", false}};
+    if (live_sessions) {
+        try {
+            live_status = live_sessions->list_sessions();
+        } catch (const std::exception& error) {
+            live_status = live_error_json(error);
+        }
+    }
+
     return QJsonObject{
         {"ok", true},
         {"cwd", QDir::currentPath()},
@@ -823,6 +1382,7 @@ auto DebugAnalysisService::status() const -> QJsonObject {
         {"logSessions", logs},
         {"coredumpSessions", dumps},
         {"incidentSessions", incidents},
+        {"live", live_status},
         {"limits", QJsonObject{{"maxEntries", cfg.get_mcp_settings().max_entries},
                                {"maxHits", cfg.get_mcp_settings().max_hits},
                                {"maxMemoryBytes", cfg.get_mcp_settings().max_memory_bytes},

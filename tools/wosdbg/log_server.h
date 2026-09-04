@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QDir>
+#include <QHostAddress>
 #include <QObject>
 #include <QTcpServer>
 #include <QTcpSocket>
@@ -14,7 +15,7 @@ class LogServer : public QObject {
     Q_OBJECT
 
    public:
-    explicit LogServer(quint16 port, QObject* parent = nullptr);
+    explicit LogServer(const QHostAddress& bind_address, quint16 port, QObject* parent = nullptr);
     ~LogServer();
 
     [[nodiscard]] bool is_listening() const { return tcp_server->isListening(); }

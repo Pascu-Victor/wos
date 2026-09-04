@@ -26,7 +26,7 @@
 #include "mcp_http_server.h"
 #include "protocol.h"
 
-LogServer::LogServer(quint16 port, QObject* parent)
+LogServer::LogServer(const QHostAddress& bind_address, quint16 port, QObject* parent)
     : QObject(parent),
       tcp_server(new QTcpServer(this)),
 
@@ -37,7 +37,7 @@ LogServer::LogServer(quint16 port, QObject* parent)
     analysis_service->set_config(config);
     mcp_server->set_allowed_cidrs(config.get_mcp_settings().allowed_cidrs);
 
-    if (!tcp_server->listen(QHostAddress::Any, port)) {
+    if (bind_address.isNull() || !tcp_server->listen(bind_address, port)) {
         qCritical() << "Server failed to start:" << tcp_server->errorString();
     } else {
         qInfo() << "Server listening on port" << port;
@@ -127,6 +127,7 @@ void LogServer::on_new_connection() {
 
 void LogServer::on_client_disconnected() {
     qInfo() << "Client disconnected";
+    (void)analysis_service->close_live_sessions_for_owner("gui");
     clientSocket->deleteLater();
     clientSocket = nullptr;
 }
@@ -147,6 +148,13 @@ void LogServer::on_ready_read() {
 
         if (in.status() != QDataStream::Ok) {
             in.rollbackTransaction();
+            return;
+        }
+
+        constexpr quint32 MAX_GUI_FRAME_BYTES = 1024 * 1024;
+        if (size == 0 || size > MAX_GUI_FRAME_BYTES) {
+            send_error("GUI request frame exceeds the configured bound");
+            clientSocket->disconnectFromHost();
             return;
         }
 
@@ -411,7 +419,7 @@ void LogServer::process_message(MessageType type, QDataStream& in) {
             if (!DOCUMENT.isObject()) {
                 send_tool_result(request_id, QJsonObject{{"ok", false}, {"error", "Tool arguments must be a JSON object"}});
             } else {
-                send_tool_result(request_id, analysis_service->invoke_tool(name, DOCUMENT.object()));
+                send_tool_result(request_id, analysis_service->invoke_tool(name, DOCUMENT.object(), "gui"));
             }
             break;
         }

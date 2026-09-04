@@ -184,3 +184,50 @@ sequence), and reports:
 
 This distinction matters: WOSDBG does not invent a global order for logs that
 do not contain comparable timestamps.
+
+## Bounded live debugging
+
+Live targets are disabled by default and configured under `live` in
+`wosdbg.json`; see [CONFIG.md](CONFIG.md). Launchers publish a local runtime
+descriptor while debug VMs are alive. Rootless launches use the existing
+topology and append `--no-setup`:
+
+```sh
+bin/wos-ktest --no-build --no-package --no-setup --debug-node
+bin/wos-cluster --config configs/cluster_wki_auth_rootless.json \
+  --launch --no-setup --debug-node 0 --debug-node 1 --debug-node 2
+```
+
+After enabling the matching runtime descriptor, use one stateful batch (or the
+same MCP/GUI session) to discover, open, inspect, and close a lease:
+
+```json
+{
+  "calls": [
+    {"id":"targets","tool":"discover_live_targets","arguments":{}},
+    {"id":"open","tool":"open_live_session","arguments":{
+      "targetIds":["qemu-node-0"],"authority":"pause-read",
+      "auditId":"incident-2026-09-03","confirmation":"PAUSE_ALLOWLISTED_TARGETS"}},
+    {"id":"regs","tool":"read_live_registers","arguments":{
+      "sessionId":"$open.sessionId","leaseToken":"$open.leaseToken","targetId":"qemu-node-0"}},
+    {"id":"close","tool":"close_live_session","arguments":{
+      "sessionId":"$open.sessionId","leaseToken":"$open.leaseToken"}}
+  ]
+}
+```
+
+QMP is the pause authority for QEMU: WOSDBG records initial state and never
+resumes a VM that was already paused. Reads use a typed GDB-RSP subset; no tool
+accepts raw packets, raw QMP, a guest command, or a host shell. Symbols are used
+only when the target image catalog and configured local ELF build IDs match.
+Every operation, memory response, transcript, target count, and lease has a
+configured bound. Transcript payloads are hashed/redacted unless explicitly
+requested with the documented sensitive-data confirmation.
+
+`get_live_source` and `inspect_live_pte` use only build-ID-verified kernel
+symbols; the PTE walk reads at most one x86-64 paging chain through WOS's HHDM.
+`capture_live_incident` takes `confirmation=CAPTURE_LIVE_INCIDENT`, records
+per-target host timestamps without claiming guest-global ordering, atomically
+publishes the bounded evidence, and reopens it through the ordinary incident
+loader. `verify_live_transcript` recomputes the canonical transcript digest and,
+when payloads were explicitly exported, every record payload digest.

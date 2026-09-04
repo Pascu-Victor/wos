@@ -137,7 +137,12 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        LogServer server(port);
+        const QHostAddress BIND_ADDRESS(host);
+        if (BIND_ADDRESS.isNull()) {
+            qCritical() << "Invalid server bind address:" << host;
+            return 1;
+        }
+        LogServer server(BIND_ADDRESS, port);
         if (!server.is_listening()) {
             qCritical() << "Failed to start server on" << host << ":" << port;
             return 1;
@@ -184,7 +189,7 @@ int main(int argc, char* argv[]) {
 
     // Standalone Mode (Local Pair)
     // Start server on localhost with ephemeral port
-    auto* server = new LogServer(0, app.get());
+    auto* server = new LogServer(QHostAddress::LocalHost, 0, app.get());
     if (!server->is_listening()) {  // 0 = ephemeral port
         qCritical() << "Failed to start internal server";
         return 1;

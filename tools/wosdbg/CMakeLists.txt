@@ -66,6 +66,10 @@ add_executable(wosdbg
     log_client.cpp
     debug_analysis_service.h
     debug_analysis_service.cpp
+    live_protocol.h
+    live_protocol.cpp
+    live_session_manager.h
+    live_session_manager.cpp
     debug_cli.h
     debug_cli.cpp
     debug_tool_panel.h
@@ -243,6 +247,14 @@ if(BUILD_TESTING)
                 --wosdbg $<TARGET_FILE:wosdbg>
     )
     set_tests_properties(wosdbg_telemetry_jsonl_semantic_test PROPERTIES TIMEOUT 120)
+    add_test(
+        NAME wosdbg_live_cli_semantic_test
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/live_cli_semantic_test.py
+                --wosdbg $<TARGET_FILE:wosdbg>
+                --require-live-tools
+    )
+    set_tests_properties(wosdbg_live_cli_semantic_test PROPERTIES TIMEOUT 120)
 endif()
 
 option(WOSDBG_BUILD_FUZZERS "Build bounded WOSDBG parser fuzz targets" OFF)

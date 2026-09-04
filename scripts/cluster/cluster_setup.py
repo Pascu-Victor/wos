@@ -60,6 +60,11 @@ MAX_CLUSTER_NODE_ID = 255
 WKI_AUTH_MAGIC = b"WKIAUTH\0"
 WKI_AUTH_VERSION = 1
 WKI_AUTH_ALL_POLICY = (1 << 10) - 1
+LIVE_DEBUG_DESCRIPTOR_FORMAT = "wosdbg-live"
+LIVE_DEBUG_DESCRIPTOR_VERSION = 1
+LIVE_DEBUG_DESCRIPTOR_MAX_BYTES = 1024 * 1024
+DEFAULT_LIVE_DEBUG_DESCRIPTOR = Path("cluster-overlays/live-debug.json")
+DEFAULT_KERNEL_SYMBOL_PATH = Path("build/modules/kern/wos")
 
 # ---------------------------------------------------------------------------
 # Config loading and resolution
@@ -1149,6 +1154,122 @@ class LaunchConflictError(RuntimeError):
 def cluster_launch_lock_path() -> Path:
     """Return the per-user, host-wide lock shared by all WOS launch modes."""
     return Path(tempfile.gettempdir()) / f"wos-cluster-{os.getuid()}.lock"
+
+
+def absolute_runtime_path(path: str | Path) -> Path:
+    resolved = Path(path).expanduser()
+    if not resolved.is_absolute():
+        resolved = repo_root() / resolved
+    return resolved.resolve()
+
+
+def atomic_write_live_debug_descriptor(path: str | Path, payload: dict) -> Path:
+    """Atomically publish one private, bounded runtime descriptor."""
+    resolved = absolute_runtime_path(path)
+    resolved.parent.mkdir(parents=True, exist_ok=True)
+    encoded = (
+        json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode()
+    if len(encoded) > LIVE_DEBUG_DESCRIPTOR_MAX_BYTES:
+        raise ValueError("live-debug descriptor exceeds the 1 MiB limit")
+
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{resolved.name}.", suffix=".tmp", dir=resolved.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "wb") as output:
+            descriptor = -1
+            output.write(encoded)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, resolved)
+        directory = os.open(resolved.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+    return resolved
+
+
+def remove_live_debug_descriptor(
+    path: str | Path, launch_nonce: str | None = None
+) -> bool:
+    """Remove a descriptor, optionally only when it still belongs to a launch."""
+    resolved = absolute_runtime_path(path)
+    if launch_nonce is None:
+        try:
+            resolved.unlink()
+            return True
+        except FileNotFoundError:
+            return False
+
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(resolved, flags)
+    except (FileNotFoundError, OSError):
+        return False
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_size > LIVE_DEBUG_DESCRIPTOR_MAX_BYTES
+        ):
+            return False
+        encoded = bytearray()
+        while len(encoded) <= opened.st_size:
+            chunk = os.read(descriptor, min(65536, opened.st_size + 1 - len(encoded)))
+            if not chunk:
+                break
+            encoded.extend(chunk)
+        if len(encoded) != opened.st_size:
+            return False
+        try:
+            payload = json.loads(encoded)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return False
+        if payload.get("launchNonce") != launch_nonce:
+            return False
+        try:
+            current = resolved.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        if (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino):
+            return False
+        resolved.unlink()
+        return True
+    finally:
+        os.close(descriptor)
+
+
+def process_start_ticks(pid: int, proc_root: Path = Path("/proc")) -> int:
+    """Return Linux /proc/PID/stat field 22 without being confused by comm."""
+    raw = (proc_root / str(pid) / "stat").read_text(encoding="utf-8")
+    comm_end = raw.rfind(")")
+    if comm_end < 0:
+        raise RuntimeError(f"cannot read process start identity for pid {pid}")
+    fields = raw[comm_end + 1 :].split()
+    if len(fields) <= 19:
+        raise RuntimeError(f"incomplete process start identity for pid {pid}")
+    start_ticks = int(fields[19])
+    if start_ticks <= 0:
+        raise RuntimeError(f"invalid process start identity for pid {pid}")
+    return start_ticks
+
+
+def host_boot_id() -> str:
+    value = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
+    if not value or len(value) > 128:
+        raise RuntimeError("host boot identity is unavailable")
+    return value
 
 
 def find_running_wos_qemus(proc_root: Path = Path("/proc")) -> list[tuple[int, str]]:
@@ -2419,6 +2540,96 @@ class LaunchResult:
     lines: list[str]
 
 
+def build_live_debug_descriptor(
+    config: dict,
+    nodes: dict[int, dict],
+    launch_results: list[LaunchResult],
+    *,
+    launch_nonce: str,
+    topology_kind: str,
+    config_path: str | Path,
+    build_dir: str | Path,
+    symbol_path: str | Path,
+    tcg_level: str | None,
+    debug_nodes: set[int] | None,
+) -> dict:
+    """Build the normalized runtime topology after every QEMU has started."""
+    by_node = {result.node_id: result for result in launch_results}
+    normalized_nodes = []
+    targets = []
+    resolved_symbol = absolute_runtime_path(symbol_path)
+    for node_id in sorted(nodes):
+        result = by_node.get(node_id)
+        if result is None:
+            raise RuntimeError(f"VM{node_id} is absent from live-debug descriptor")
+        spec = cluster_node_spec(node_id, nodes[node_id], config)
+        is_debug = node_setup.node_debug_enabled(spec) or (
+            debug_nodes is not None and node_id in debug_nodes
+        )
+        if is_debug:
+            spec["debug"] = True
+        hostname = node_setup.node_hostname(spec)
+        normalized_nodes.append({"nodeId": node_id, "hostname": hostname})
+
+        qmp_socket = node_setup.qmp_socket_path(spec)
+        if is_debug and qmp_socket is None:
+            raise RuntimeError(f"VM{node_id} debug launch has no QMP socket")
+        serial_log = absolute_runtime_path(node_setup.serial_log_path(spec))
+        qemu_log = absolute_runtime_path(
+            node_setup.qemu_log_path(spec, tcg_level=tcg_level)
+        )
+        vm_cfg = spec["vm"]
+        targets.append(
+            {
+                "id": f"qemu-node-{node_id}",
+                "nodeId": node_id,
+                "hostname": hostname,
+                "transport": "qemu",
+                "host": "127.0.0.1",
+                "port": (
+                    int(vm_cfg.get("gdb_port", 1234 + node_id)) if is_debug else None
+                ),
+                "pid": result.process.pid,
+                "processStartTicks": str(process_start_ticks(result.process.pid)),
+                "qmpSocket": (
+                    str(absolute_runtime_path(qmp_socket))
+                    if qmp_socket is not None
+                    else None
+                ),
+                "symbolPath": str(resolved_symbol),
+                "logPaths": [str(serial_log), str(qemu_log)],
+                "debug": is_debug,
+            }
+        )
+
+    zones = []
+    for zone in config.get("zones", []):
+        if zone.get("id") == "GLOBAL":
+            continue
+        zones.append(
+            {
+                "id": zone["id"],
+                "name": zone_name(zone),
+                "nodeIds": zone_node_ids(zone),
+            }
+        )
+
+    return {
+        "format": LIVE_DEBUG_DESCRIPTOR_FORMAT,
+        "version": LIVE_DEBUG_DESCRIPTOR_VERSION,
+        "state": "running",
+        "launchNonce": launch_nonce,
+        "kind": topology_kind,
+        "createdUnixNs": str(time.time_ns()),
+        "configPath": str(absolute_runtime_path(config_path)),
+        "buildDir": str(absolute_runtime_path(build_dir)),
+        "symbolPath": str(resolved_symbol),
+        "bootId": host_boot_id(),
+        "topology": {"nodes": normalized_nodes, "zones": zones},
+        "targets": targets,
+    }
+
+
 class VmExitError(RuntimeError):
     def __init__(self, failures: list[tuple[int, int]]):
         self.failures = sorted(failures)
@@ -2531,6 +2742,11 @@ def launch(
     tcg_level: str | None = None,
     debug_nodes: set[int] | None = None,
     skip_setup: bool = False,
+    live_debug_descriptor: str | Path | None = DEFAULT_LIVE_DEBUG_DESCRIPTOR,
+    topology_kind: str = "cluster",
+    config_path: str | Path = "configs/cluster.json",
+    build_dir: str | Path = "build",
+    symbol_path: str | Path = DEFAULT_KERNEL_SYMBOL_PATH,
 ):
     """Setup topology unless requested otherwise, then launch VMs."""
     with cluster_launch_guard():
@@ -2539,6 +2755,11 @@ def launch(
             tcg_level=tcg_level,
             debug_nodes=debug_nodes,
             skip_setup=skip_setup,
+            live_debug_descriptor=live_debug_descriptor,
+            topology_kind=topology_kind,
+            config_path=config_path,
+            build_dir=build_dir,
+            symbol_path=symbol_path,
         )
 
 
@@ -2547,8 +2768,23 @@ def launch_guarded(
     tcg_level: str | None = None,
     debug_nodes: set[int] | None = None,
     skip_setup: bool = False,
+    live_debug_descriptor: str | Path | None = DEFAULT_LIVE_DEBUG_DESCRIPTOR,
+    topology_kind: str = "cluster",
+    config_path: str | Path = "configs/cluster.json",
+    build_dir: str | Path = "build",
+    symbol_path: str | Path = DEFAULT_KERNEL_SYMBOL_PATH,
 ):
     """Launch VMs while the caller holds the cluster launch guard."""
+    descriptor_path = (
+        absolute_runtime_path(live_debug_descriptor)
+        if live_debug_descriptor is not None
+        else None
+    )
+    launch_nonce = secrets.token_hex(16)
+    if descriptor_path is not None:
+        # The launch guard and running-QEMU probe prove that an old descriptor
+        # cannot still represent a live WOS topology.
+        remove_live_debug_descriptor(descriptor_path)
     if skip_setup:
         validate_no_setup_topology(config)
         print("=== Skipping cluster topology setup (--no-setup) ===\n")
@@ -2609,60 +2845,84 @@ def launch_guarded(
         stopping.set()
         print("\n=== Shutting down cluster ===")
         stop_all_vms()
+        if descriptor_path is not None:
+            remove_live_debug_descriptor(descriptor_path, launch_nonce)
         print("=== Cluster stopped ===")
         sys.exit(0)
 
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
 
-    max_workers = len(nodes)
-    futures = {}
     try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {
-                executor.submit(
-                    launch_one_vm,
-                    node_id,
-                    nodes[node_id],
-                    config,
-                    tcg_level,
-                    debug_nodes,
-                    pids,
-                    pids_lock,
-                    stopping,
-                ): node_id
-                for node_id in sorted(nodes.keys())
-            }
+        max_workers = len(nodes)
+        futures = {}
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {
+                    executor.submit(
+                        launch_one_vm,
+                        node_id,
+                        nodes[node_id],
+                        config,
+                        tcg_level,
+                        debug_nodes,
+                        pids,
+                        pids_lock,
+                        stopping,
+                    ): node_id
+                    for node_id in sorted(nodes.keys())
+                }
 
-            try:
-                for future in concurrent.futures.as_completed(futures):
-                    result = future.result()
-                    launch_results.append(result)
-                    for line in result.lines:
+                try:
+                    for future in concurrent.futures.as_completed(futures):
+                        result = future.result()
+                        launch_results.append(result)
+                        for line in result.lines:
+                            print(line)
+                except LaunchError as exc:
+                    stopping.set()
+                    for line in exc.lines:
                         print(line)
-            except LaunchError as exc:
-                stopping.set()
-                for line in exc.lines:
-                    print(line)
-                print(f"ERROR: {exc}", file=sys.stderr)
-                for future in futures:
-                    future.cancel()
-                stop_all_vms()
-                raise
-            except KeyboardInterrupt:
-                shutdown(None, None)
-    except KeyboardInterrupt:
-        shutdown(None, None)
+                    print(f"ERROR: {exc}", file=sys.stderr)
+                    for future in futures:
+                        future.cancel()
+                    stop_all_vms()
+                    raise
+                except KeyboardInterrupt:
+                    shutdown(None, None)
+        except KeyboardInterrupt:
+            shutdown(None, None)
 
-    print(f"\n=== {len(pids)} VMs launched ===")
-    print("Press Ctrl+C to stop all VMs.\n", flush=True)
+        if descriptor_path is not None:
+            descriptor = build_live_debug_descriptor(
+                config,
+                nodes,
+                launch_results,
+                launch_nonce=launch_nonce,
+                topology_kind=topology_kind,
+                config_path=config_path,
+                build_dir=build_dir,
+                symbol_path=symbol_path,
+                tcg_level=tcg_level,
+                debug_nodes=debug_nodes,
+            )
+            atomic_write_live_debug_descriptor(descriptor_path, descriptor)
+            print(f"Live-debug descriptor: {descriptor_path}")
 
-    # Wait for and reap all VMs. A nonzero QEMU status is a failed source run,
-    # so launchers must not mark the resulting incident complete.
-    try:
-        wait_for_launched_vms(launch_results)
-    except KeyboardInterrupt:
-        shutdown(None, None)
+        print(f"\n=== {len(pids)} VMs launched ===")
+        print("Press Ctrl+C to stop all VMs.\n", flush=True)
+
+        # Wait for and reap all VMs. A nonzero QEMU status is a failed source
+        # run, so launchers must not mark the resulting incident complete.
+        try:
+            wait_for_launched_vms(launch_results)
+        except KeyboardInterrupt:
+            shutdown(None, None)
+    finally:
+        stopping.set()
+        stop_all_vms()
+        if descriptor_path is not None:
+            remove_live_debug_descriptor(descriptor_path, launch_nonce)
 
 
 # ---------------------------------------------------------------------------
@@ -2745,6 +3005,15 @@ def main():
         help="Coverage run manifest to import into the incident; may be repeated",
     )
     parser.add_argument(
+        "--live-debug-descriptor",
+        default=str(DEFAULT_LIVE_DEBUG_DESCRIPTOR),
+        metavar="PATH",
+        help=(
+            "Publish the private live WOSDBG runtime descriptor at PATH while "
+            f"VMs run (default: {DEFAULT_LIVE_DEBUG_DESCRIPTOR})"
+        ),
+    )
+    parser.add_argument(
         "--config", default="configs/cluster.json", help="Config file path"
     )
     args = parser.parse_args()
@@ -2786,6 +3055,7 @@ def main():
     elif args.teardown:
         try:
             with cluster_launch_guard(reject_running_qemus=False):
+                remove_live_debug_descriptor(args.live_debug_descriptor)
                 # Cache sudo credentials once upfront for privileged network operations.
                 ensure_sudo()
                 teardown(config)
@@ -2818,6 +3088,11 @@ def main():
                         tcg_level=args.tcg,
                         debug_nodes=set(args.debug_node) if args.debug_node else None,
                         skip_setup=args.no_setup,
+                        live_debug_descriptor=args.live_debug_descriptor,
+                        topology_kind="cluster",
+                        config_path=config_path,
+                        build_dir="build",
+                        symbol_path=DEFAULT_KERNEL_SYMBOL_PATH,
                     )
                 run_complete = True
             except (

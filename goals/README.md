@@ -17,6 +17,10 @@ The contracts follow OpenAI's [six-part Goal pattern](https://developers.openai.
 
 Every file contains a copy-pastable `/goal` command and the expanded execution
 contract behind it. These files do not activate Goal Mode by themselves.
+OpenAI's shorter [Follow a goal guide](https://learn.chatgpt.com/use-cases/follow-goals)
+describes the same core contract: one objective and stopping condition, inputs
+to read first, concrete evidence commands/artifacts, checkpointed progress, and
+an explicit pause/block rule.
 
 ## Portfolio
 
@@ -38,20 +42,38 @@ contract behind it. These files do not activate Goal Mode by themselves.
 | 14  | [Declarative bounded init supervisor](14-declarative-init-supervisor.md)             | PID 1, service lifecycle, shutdown                          | other init/service ownership rewrites         | Done        |
 | 15  | [Randomized and hardened userspace layouts](15-userspace-address-space-hardening.md) | ELF/exec, VM, TLS, ptrace/debugging                         | 01, 04, 11 on loader/VM/ABI surfaces          | Done        |
 | 16  | [PREEMPT_NOBLOCK default kernel preemption](16-preempt-noblock-kernel-preemption.md) | timer preemption, kernel frames, migration, return assembly | 03 or 04 on shared scheduler/Task transitions | Done        |
+| 17  | [Fault-safe anonymous memory swap](17-anonymous-memory-swap.md)                      | VM faults, PTEs, COW, reclaim, swap                         | 15 and allocator/VM rewrites                  | Not started |
+| 18  | [Stable transactional VFS pathwalk](18-stable-vfs-pathwalk.md)                      | pathwalk, mounts, namespace mutation, remote VFS             | 26 and broad VFS/remote-VFS changes           | Not started |
+| 19  | [Immutable credentials and least privilege](19-immutable-credentials-least-privilege.md) | credentials, authorization, init, WKI identity            | 22 on Task/ServiceSpec; 18 on VFS policy      | Not started |
+| 20  | [IOMMU-backed DMA ownership](20-iommu-dma-ownership.md)                              | ACPI/PCI, DMA, AHCI, xHCI, NICs                              | 25 on ivshmem; 30 on AHCI/DMA                 | Not started |
+| 21  | [Modern kernel self-protection](21-kernel-self-protection.md)                        | linker/boot, W^X, KASLR, SMEP/SMAP, stacks                  | 16 and entry/return or VM rewrites            | Not started |
+| 22  | [Kernel-enforced resource governance](22-kernel-resource-governance.md)              | rlimits, Task, VM/VFS, init, remote compute                  | 19 on Task/ServiceSpec; 28 on job quotas      | Not started |
+| 23  | [Reproducible offline builds](23-reproducible-offline-builds.md)                      | toolchain, CMake, sysroots, images, SBOM                     | broad build/image/cluster script changes      | Not started |
+| 24  | [Semantic regression and mutation testing](24-semantic-regression-platform.md)       | host tests, models, KTEST, faults, fuzzing                   | broad structural refactors in tested paths    | Not started |
+| 25  | [Secure session-bound WKI RDMA](25-secure-wki-rdma.md)                               | WKI auth, RoCE, ivshmem, zones, fast paths                   | 20 on ivshmem; 26 on remote VFS               | Not started |
+| 26  | [Owner-authoritative remote VFS coherency](26-remote-vfs-coherency-locking.md)        | remote VFS, caches, append, advisory locks                   | 18 and 25 on shared VFS/wire surfaces         | Not started |
+| 27  | [Loop-free bounded WKI routing](27-wki-routing-convergence.md)                        | WKI LSA/LSDB, RX, SPF, route publication                     | other peer/routing/wire protocol rewrites     | Not started |
+| 28  | [Durable reconnectable remote jobs](28-durable-remote-jobs.md)                        | remote compute, streams, reconnect, result retention         | 19 identity; 22 quotas; compute rewrites      | Not started |
+| 29  | [Production TCP congestion and loss recovery](29-tcp-congestion-loss-recovery.md)    | TCP sender, ACK/SACK, timers, impairment tests               | 31 on shared timer paths; broad TCP rewrites  | Not started |
+| 30  | [Asynchronous multi-queue block I/O](30-asynchronous-block-io.md)                    | block API, AHCI, buffer cache, XFS, swap, proxy              | 20 on DMA/AHCI; 25 on remote block            | Not started |
+| 31  | [High-resolution timekeeping and timers](31-high-resolution-timekeeping.md)           | TSC/RTC/NTP, timer queues, signals, libc                     | 16 scheduler timers; 29 TCP timers            | Not started |
+| 32  | [Live multi-node WOSDBG control plane](32-live-wosdbg-control-plane.md)               | WOSDBG, QMP/gdb, debugserver, incident capture               | 21 symbolization; debugserver rewrites        | Done        |
 
 ## Status authority
 
 The portfolio `Status` column is the canonical goal-selection filter. Do not
 select, reload, or rescan a row marked `Done`; its completion record and current
 source remain available only for later regression work. Completed goals are
-currently 01, 02, 03, 04, 05, 06, 07, 08, 11, 12, 13, 14, 15, and 16. Select only a row whose status is `Not started` (or a
-future explicit in-progress state).
+currently 01 through 16 and 32. Select only a row whose status is `Not started`
+(or a future explicit in-progress state). Goals 17 through 31 are the unfinished
+portfolio produced from local-source reconnaissance on 2026-09-03.
 
 ## How to use a goal
 
 1. Skip every portfolio row marked `Done`, then re-read the current local source
    and path-specific instructions for the selected unfinished goal. The evidence
-   below was collected on 2026-08-08 and may become stale in this fast-moving
+   for goals 01–16 was collected beginning on 2026-08-08; goals 17–32 were
+   investigated on 2026-09-03. Any of it may become stale in this fast-moving
    repository.
 2. Use a dedicated thread and preferably a dedicated worktree for one goal.
 3. Paste that file's `/goal` block. Do not turn the week estimate into a token or

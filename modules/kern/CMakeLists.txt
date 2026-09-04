@@ -143,7 +143,7 @@ target_compile_options(${KERNEL} PRIVATE
     "$<$<COMPILE_LANGUAGE:C>:${WOS_KERNEL_C_CXX_OPTIONS};-fno-exceptions>"
     "$<$<COMPILE_LANGUAGE:CXX>:${WOS_KERNEL_C_CXX_OPTIONS};${WOS_KERNEL_CXX_OPTIONS}>"
 )
-target_link_options(${KERNEL} PRIVATE -static -Wl,--no-dynamic-linker -fno-lto)
+target_link_options(${KERNEL} PRIVATE -static -Wl,--no-dynamic-linker -Wl,--build-id=sha1 -fno-lto)
 
 set(WOS_KERNEL_STRICT_C_CXX_WARNING_OPTIONS
     -Wall

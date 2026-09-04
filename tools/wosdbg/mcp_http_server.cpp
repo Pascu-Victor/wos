@@ -26,6 +26,11 @@
 
 namespace {
 
+constexpr qsizetype K_MAX_HTTP_HEADER_BYTES = 64 * 1024;
+constexpr qsizetype K_MAX_HTTP_BODY_BYTES = 1024 * 1024;
+constexpr qsizetype K_MAX_HTTP_BUFFER_BYTES = K_MAX_HTTP_HEADER_BYTES + K_MAX_HTTP_BODY_BYTES + 4;
+constexpr qsizetype K_MAX_MCP_SESSIONS = 128;
+
 auto status_text(int status) -> QByteArray {
     switch (status) {
         case 200:
@@ -105,6 +110,11 @@ auto McpHttpServer::start(const QString& bind_address, quint16 port) -> bool {
 }
 
 void McpHttpServer::stop() {
+    if (analysis != nullptr) {
+        for (const auto& session_id : sessions.keys()) {
+            (void)analysis->close_live_sessions_for_owner("mcp:" + QString::fromLatin1(session_id));
+        }
+    }
     for (auto* socket : buffers.keys()) {
         unregister_socket(socket);
         socket->disconnectFromHost();
@@ -231,6 +241,9 @@ void McpHttpServer::remove_session(const QByteArray& session_id) {
         listener->disconnectFromHost();
         listener->deleteLater();
     }
+    if (analysis != nullptr) {
+        (void)analysis->close_live_sessions_for_owner("mcp:" + QString::fromLatin1(session_id));
+    }
     sessions.erase(session_it);
 }
 
@@ -292,6 +305,11 @@ void McpHttpServer::on_ready_read() {
         return;
     }
     buffers[socket].append(socket->readAll());
+    if (buffers[socket].size() > K_MAX_HTTP_BUFFER_BYTES) {
+        send_raw(socket, "Request too large", "text/plain", 400, default_protocol_version());
+        buffers.remove(socket);
+        return;
+    }
     while (buffers.contains(socket)) {
         auto request = parse_http_request(socket);
         if (!request) {
@@ -363,6 +381,10 @@ void McpHttpServer::on_ready_read() {
             }
 
             const QByteArray CREATED = create_session_id();
+            if (sessions.size() >= K_MAX_MCP_SESSIONS) {
+                send_json(socket, json_rpc_error(QJsonValue(), -32000, "MCP session limit reached"), 400, RESPONSE_PROTOCOL);
+                return;
+            }
             sessions.insert(CREATED, SessionState{.id = CREATED, .last_event_id = {}, .next_event_id = 1, .listeners = {}});
             register_listener(CREATED, socket);
             send_sse_headers(socket, RESPONSE_PROTOCOL, CREATED);
@@ -413,7 +435,7 @@ void McpHttpServer::on_ready_read() {
             if (has_session(REQUEST_SESSION_ID) && response_session.isEmpty()) {
                 response_session = REQUEST_SESSION_ID;
             }
-            return QByteArray{};
+            return REQUEST_SESSION_ID;
         };
 
         auto handle_request = [&](const QJsonValue& request_value, QJsonArray& responses) -> void {
@@ -473,7 +495,7 @@ void McpHttpServer::on_ready_read() {
                 }
             }
 
-            auto response = handle_json_rpc(request_object);
+            auto response = handle_json_rpc(request_object, "mcp:" + QString::fromLatin1(*ACTIVE_SESSION));
             if (!response.isEmpty()) {
                 responses.append(response);
             }
@@ -515,6 +537,15 @@ auto McpHttpServer::parse_http_request(QTcpSocket* socket) -> std::optional<McpH
     QByteArray& buffer = buffers[socket];
     int header_end = buffer.indexOf("\r\n\r\n");
     if (header_end < 0) {
+        if (buffer.size() > K_MAX_HTTP_HEADER_BYTES) {
+            send_raw(socket, "Request headers too large", "text/plain", 400, default_protocol_version());
+            buffers.remove(socket);
+        }
+        return std::nullopt;
+    }
+    if (header_end > K_MAX_HTTP_HEADER_BYTES) {
+        send_raw(socket, "Request headers too large", "text/plain", 400, default_protocol_version());
+        buffers.remove(socket);
         return std::nullopt;
     }
     QByteArray header = buffer.left(header_end);
@@ -529,7 +560,8 @@ auto McpHttpServer::parse_http_request(QTcpSocket* socket) -> std::optional<McpH
     HttpRequest request;
     request.method = QString::fromLatin1(request_line[0]);
     request.path = QString::fromLatin1(request_line[1]).split('?').first();
-    int content_length = 0;
+    qsizetype content_length = 0;
+    bool saw_content_length = false;
     for (int i = 1; i < lines.size(); ++i) {
         QByteArray line = lines[i].trimmed();
         if (line.isEmpty()) {
@@ -542,11 +574,19 @@ auto McpHttpServer::parse_http_request(QTcpSocket* socket) -> std::optional<McpH
         QByteArray key = line.left(colon).trimmed().toLower();
         QByteArray value = line.mid(colon + 1).trimmed();
         if (key == "content-length") {
-            content_length = value.toInt();
+            bool ok = false;
+            const qlonglong PARSED_LENGTH = value.toLongLong(&ok);
+            if (saw_content_length || !ok || PARSED_LENGTH < 0 || PARSED_LENGTH > K_MAX_HTTP_BODY_BYTES) {
+                send_raw(socket, "Invalid Content-Length", "text/plain", 400, default_protocol_version());
+                buffers.remove(socket);
+                return std::nullopt;
+            }
+            saw_content_length = true;
+            content_length = static_cast<qsizetype>(PARSED_LENGTH);
         }
         request.headers[QString::fromLatin1(key)] = value;
     }
-    int body_start = header_end + 4;
+    const qsizetype body_start = header_end + 4;
     if (buffer.size() < body_start + content_length) {
         return std::nullopt;
     }
@@ -628,14 +668,14 @@ auto McpHttpServer::json_rpc_result(const QJsonValue& id, const QJsonObject& res
     return QJsonObject{{"jsonrpc", "2.0"}, {"id", id}, {"result", result}};
 }
 
-auto McpHttpServer::handle_json_rpc(const QJsonObject& request) -> QJsonObject {
+auto McpHttpServer::handle_json_rpc(const QJsonObject& request, const QString& owner) -> QJsonObject {
     QJsonValue id = request.value("id");
     QString method = request.value("method").toString();
     if (method.isEmpty()) {
         return json_rpc_error(id, -32600, "Invalid Request");
     }
     QJsonObject params = request.value("params").toObject();
-    QJsonObject result = handle_method(method, params);
+    QJsonObject result = handle_method(method, params, owner);
     if (!request.contains("id")) {
         return {};
     }
@@ -646,7 +686,7 @@ auto McpHttpServer::handle_json_rpc(const QJsonObject& request) -> QJsonObject {
     return json_rpc_result(id, result);
 }
 
-auto McpHttpServer::handle_method(const QString& method, const QJsonObject& params) -> QJsonObject {
+auto McpHttpServer::handle_method(const QString& method, const QJsonObject& params, const QString& owner) -> QJsonObject {
     if (method == "initialize") {
         const QString REQUESTED_PROTOCOL = params.value("protocolVersion").toString();
         const QString PROTOCOL = negotiated_protocol_version(REQUESTED_PROTOCOL);
@@ -669,7 +709,7 @@ auto McpHttpServer::handle_method(const QString& method, const QJsonObject& para
         return DebugAnalysisService::tool_catalog();
     }
     if (method == "tools/call") {
-        return call_tool(params);
+        return call_tool(params, owner);
     }
     if (method == "resources/list") {
         return QJsonObject{{"resources", analysis->list_resources()}};
@@ -694,6 +734,110 @@ auto DebugAnalysisService::tool_catalog() -> QJsonObject {
     };
     QJsonArray tools{
         QJsonObject{{"name", "wosdbg.status"}, {"description", "Show server status and active sessions."}, {"inputSchema", schema({})}},
+        QJsonObject{{"name", "wosdbg.discover_live_targets"},
+                    {"description", "Reload bounded allowlisted live targets from configuration and versioned runtime descriptors."},
+                    {"inputSchema", schema({})}},
+        QJsonObject{{"name", "wosdbg.list_live_targets"},
+                    {"description", "List configured live targets and their read-only capabilities without connecting."},
+                    {"inputSchema", schema({})}},
+        QJsonObject{{"name", "wosdbg.open_live_session"},
+                    {"description",
+                     "Open an owner-bound, expiring read-only live session. QEMU targets acquire all pause leases atomically and "
+                     "resume every WOSDBG-paused node on failure or close."},
+                    {"inputSchema", schema({{"targetIds", QJsonObject{{"type", "array"}, {"items", QJsonObject{{"type", "string"}}}}},
+                                            {"targetId", QJsonObject{{"type", "string"}}},
+                                            {"leaseMs", QJsonObject{{"type", "integer"}}},
+                                            {"authority", QJsonObject{{"type", "string"}}},
+                                            {"auditId", QJsonObject{{"type", "string"}}},
+                                            {"confirmation", QJsonObject{{"type", "string"}}}},
+                                           {"authority", "auditId", "confirmation"})}},
+        QJsonObject{{"name", "wosdbg.list_live_sessions"},
+                    {"description", "List live sessions owned by this frontend connection."},
+                    {"inputSchema", schema({})}},
+        QJsonObject{
+            {"name", "wosdbg.get_live_session"},
+            {"description", "Return versioned state, target identity, capability, lease, and cleanup information."},
+            {"inputSchema", schema({{"sessionId", QJsonObject{{"type", "string"}}}, {"leaseToken", QJsonObject{{"type", "string"}}}},
+                                   {"sessionId", "leaseToken"})}},
+        QJsonObject{{"name", "wosdbg.renew_live_session"},
+                    {"description", "Renew an owner-bound live pause lease within the configured maximum."},
+                    {"inputSchema", schema({{"sessionId", QJsonObject{{"type", "string"}}},
+                                            {"leaseToken", QJsonObject{{"type", "string"}}},
+                                            {"leaseMs", QJsonObject{{"type", "integer"}}}},
+                                           {"sessionId", "leaseToken"})}},
+        QJsonObject{
+            {"name", "wosdbg.close_live_session"},
+            {"description", "Close a live session and resume only targets whose pause transition it owns."},
+            {"inputSchema", schema({{"sessionId", QJsonObject{{"type", "string"}}}, {"leaseToken", QJsonObject{{"type", "string"}}}},
+                                   {"sessionId", "leaseToken"})}},
+        QJsonObject{{"name", "wosdbg.read_live_registers"},
+                    {"description", "Read the target-described register set from a paused live target."},
+                    {"inputSchema", schema({{"sessionId", QJsonObject{{"type", "string"}}},
+                                            {"leaseToken", QJsonObject{{"type", "string"}}},
+                                            {"targetId", QJsonObject{{"type", "string"}}}},
+                                           {"sessionId", "leaseToken", "targetId"})}},
+        QJsonObject{{"name", "wosdbg.read_live_memory"},
+                    {"description",
+                     "Read bounded live memory. Requires confirmation=READ_SENSITIVE_LIVE_MEMORY because memory may contain secrets."},
+                    {"inputSchema", schema({{"sessionId", QJsonObject{{"type", "string"}}},
+                                            {"leaseToken", QJsonObject{{"type", "string"}}},
+                                            {"targetId", QJsonObject{{"type", "string"}}},
+                                            {"address", QJsonObject{{"type", "string"}}},
+                                            {"length", QJsonObject{{"type", "integer"}}},
+                                            {"confirmation", QJsonObject{{"type", "string"}}}},
+                                           {"sessionId", "leaseToken", "targetId", "address", "length", "confirmation"})}},
+        QJsonObject{{"name", "wosdbg.backtrace_live"},
+                    {"description", "Produce a bounded frame-pointer backtrace using only build-ID-verified symbols."},
+                    {"inputSchema", schema({{"sessionId", QJsonObject{{"type", "string"}}},
+                                            {"leaseToken", QJsonObject{{"type", "string"}}},
+                                            {"targetId", QJsonObject{{"type", "string"}}},
+                                            {"maxFrames", QJsonObject{{"type", "integer"}}}},
+                                           {"sessionId", "leaseToken", "targetId"})}},
+        QJsonObject{{"name", "wosdbg.resolve_live_address"},
+                    {"description", "Resolve one live address only against a build-ID-verified target image."},
+                    {"inputSchema", schema({{"sessionId", QJsonObject{{"type", "string"}}},
+                                            {"leaseToken", QJsonObject{{"type", "string"}}},
+                                            {"targetId", QJsonObject{{"type", "string"}}},
+                                            {"address", QJsonObject{{"type", "string"}}}},
+                                           {"sessionId", "leaseToken", "targetId", "address"})}},
+        QJsonObject{{"name", "wosdbg.get_live_source"},
+                    {"description", "Resolve bounded source context using only the target's build-ID-verified local image."},
+                    {"inputSchema", schema({{"sessionId", QJsonObject{{"type", "string"}}},
+                                            {"leaseToken", QJsonObject{{"type", "string"}}},
+                                            {"targetId", QJsonObject{{"type", "string"}}},
+                                            {"address", QJsonObject{{"type", "string"}}}},
+                                           {"sessionId", "leaseToken", "targetId", "address"})}},
+        QJsonObject{{"name", "wosdbg.inspect_live_pte"},
+                    {"description", "Walk one WOS x86-64 page-table mapping through the bounded read-only RSP adapter."},
+                    {"inputSchema", schema({{"sessionId", QJsonObject{{"type", "string"}}},
+                                            {"leaseToken", QJsonObject{{"type", "string"}}},
+                                            {"targetId", QJsonObject{{"type", "string"}}},
+                                            {"address", QJsonObject{{"type", "string"}}}},
+                                           {"sessionId", "leaseToken", "targetId", "address"})}},
+        QJsonObject{{"name", "wosdbg.get_live_transcript"},
+                    {"description",
+                     "Return a bounded deterministic transcript with payloads redacted by default. Sensitive payloads require "
+                     "confirmation=INCLUDE_SENSITIVE_LIVE_DATA."},
+                    {"inputSchema", schema({{"sessionId", QJsonObject{{"type", "string"}}},
+                                            {"leaseToken", QJsonObject{{"type", "string"}}},
+                                            {"includeSensitivePayloads", QJsonObject{{"type", "boolean"}}},
+                                            {"confirmation", QJsonObject{{"type", "string"}}}},
+                                           {"sessionId", "leaseToken"})}},
+        QJsonObject{{"name", "wosdbg.verify_live_transcript"},
+                    {"description", "Deterministically validate and replay the bounded transcript schema without contacting a target."},
+                    {"inputSchema", schema({{"transcript", QJsonObject{{"type", "object"}}}, {"digest", QJsonObject{{"type", "string"}}}},
+                                           {"transcript", "digest"})}},
+        QJsonObject{{"name", "wosdbg.capture_live_incident"},
+                    {"description",
+                     "Capture a coordinated leased-target snapshot and atomically publish and reopen a bounded WOS incident bundle."},
+                    {"inputSchema", schema({{"sessionId", QJsonObject{{"type", "string"}}},
+                                            {"leaseToken", QJsonObject{{"type", "string"}}},
+                                            {"output", QJsonObject{{"type", "string"}}},
+                                            {"archive", QJsonObject{{"type", "boolean"}}},
+                                            {"memoryRanges", QJsonObject{{"type", "array"}}},
+                                            {"coredumpPaths", QJsonObject{{"type", "array"}}},
+                                            {"confirmation", QJsonObject{{"type", "string"}}}},
+                                           {"sessionId", "leaseToken", "output", "confirmation"})}},
         QJsonObject{{"name", "wosdbg.extract_coredumps"},
                     {"description", "Run the existing WOS coredump extraction flow."},
                     {"inputSchema", schema({{"cluster", QJsonObject{{"type", "boolean"}}}})}},
@@ -1046,10 +1190,42 @@ auto McpHttpServer::tool_result(const QJsonObject& payload) -> QJsonObject {
         {"content", QJsonArray{text_content(text)}}, {"structuredContent", payload}, {"isError", !payload["ok"].toBool(true)}};
 }
 
-auto DebugAnalysisService::invoke_tool(const QString& name, const QJsonObject& args) -> QJsonObject {
+auto DebugAnalysisService::invoke_tool(const QString& name, const QJsonObject& args, const QString& owner_id) -> QJsonObject {
     QJsonObject payload;
     if (name == "wosdbg.status") {
         payload = status();
+    } else if (name == "wosdbg.discover_live_targets") {
+        payload = discover_live_targets();
+    } else if (name == "wosdbg.list_live_targets") {
+        payload = list_live_targets();
+    } else if (name == "wosdbg.open_live_session") {
+        payload = open_live_session(args, owner_id);
+    } else if (name == "wosdbg.list_live_sessions") {
+        payload = list_live_sessions(owner_id);
+    } else if (name == "wosdbg.get_live_session") {
+        payload = get_live_session(args, owner_id);
+    } else if (name == "wosdbg.renew_live_session") {
+        payload = renew_live_session(args, owner_id);
+    } else if (name == "wosdbg.close_live_session") {
+        payload = close_live_session(args, owner_id);
+    } else if (name == "wosdbg.read_live_registers") {
+        payload = read_live_registers(args, owner_id);
+    } else if (name == "wosdbg.read_live_memory") {
+        payload = read_live_memory(args, owner_id);
+    } else if (name == "wosdbg.backtrace_live") {
+        payload = backtrace_live(args, owner_id);
+    } else if (name == "wosdbg.resolve_live_address") {
+        payload = resolve_live_address(args, owner_id);
+    } else if (name == "wosdbg.get_live_source") {
+        payload = get_live_source(args, owner_id);
+    } else if (name == "wosdbg.inspect_live_pte") {
+        payload = inspect_live_pte(args, owner_id);
+    } else if (name == "wosdbg.get_live_transcript") {
+        payload = get_live_transcript(args, owner_id);
+    } else if (name == "wosdbg.verify_live_transcript") {
+        payload = verify_live_transcript(args);
+    } else if (name == "wosdbg.capture_live_incident") {
+        payload = capture_live_incident(args, owner_id);
     } else if (name == "wosdbg.extract_coredumps") {
         payload = extract_coredumps(args);
     } else if (name == "wosdbg.list_logs") {
@@ -1136,6 +1312,6 @@ auto DebugAnalysisService::invoke_tool(const QString& name, const QJsonObject& a
     return payload;
 }
 
-auto McpHttpServer::call_tool(const QJsonObject& params) const -> QJsonObject {
-    return tool_result(analysis->invoke_tool(params["name"].toString(), params["arguments"].toObject()));
+auto McpHttpServer::call_tool(const QJsonObject& params, const QString& owner) const -> QJsonObject {
+    return tool_result(analysis->invoke_tool(params["name"].toString(), params["arguments"].toObject(), owner));
 }

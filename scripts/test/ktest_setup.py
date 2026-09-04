@@ -324,6 +324,15 @@ def main() -> int:
         metavar="PATH",
         help="Coverage run manifest to import into the incident; may be repeated",
     )
+    parser.add_argument(
+        "--live-debug-descriptor",
+        default="ktest-data/live-debug.json",
+        metavar="PATH",
+        help=(
+            "Publish the private live WOSDBG runtime descriptor at PATH while "
+            "the VM runs (default: ktest-data/live-debug.json)"
+        ),
+    )
     args = parser.parse_args()
     if args.no_setup and (args.teardown or args.no_launch or args.build_only):
         parser.error("--no-setup is only valid when launching")
@@ -344,8 +353,10 @@ def main() -> int:
     cluster_config = node_setup.cluster_config_from_node_spec(spec)
 
     if args.teardown:
-        cluster_setup.ensure_sudo()
-        cluster_setup.teardown(cluster_config)
+        with cluster_setup.cluster_launch_guard(reject_running_qemus=False):
+            cluster_setup.remove_live_debug_descriptor(args.live_debug_descriptor)
+            cluster_setup.ensure_sudo()
+            cluster_setup.teardown(cluster_config)
         return 0
 
     incident_snapshots = (
@@ -381,6 +392,11 @@ def main() -> int:
             tcg_level=args.tcg,
             debug_nodes=debug_nodes,
             skip_setup=args.no_setup,
+            live_debug_descriptor=args.live_debug_descriptor,
+            topology_kind="ktest",
+            config_path=config_path,
+            build_dir=build_dir,
+            symbol_path=build_dir / "modules/kern/wos",
         )
         run_complete = True
         return 0

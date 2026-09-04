@@ -13,6 +13,7 @@ PHDRS
     headers PT_PHDR PHDRS;
     text    PT_LOAD FILEHDR PHDRS;
     rodata  PT_LOAD;
+    note    PT_NOTE FLAGS(4);
     data    PT_LOAD;
 }
 
@@ -38,6 +39,12 @@ SECTIONS
     .rodata : {
         *(.rodata .rodata.*)
     } :rodata
+
+    /* Keep only the deterministic GNU build identity. Runtime image catalogs
+     * consume its PT_NOTE to prove that host symbols match the live kernel. */
+    .note.gnu.build-id : {
+        KEEP(*(.note.gnu.build-id))
+    } :rodata :note
 
     /* In-kernel self-test registry (populated by KTEST() macro, iterated by run_all()) */
     .ktests : {
@@ -91,13 +98,14 @@ SECTIONS
     . = ALIGN(CONSTANT(MAXPAGESIZE));
     PROVIDE(__kernel_end = .);
 
-    /* Discard .note.* and .eh_frame* since they may cause issues on some hosts. */
+    /* Discard non-identity notes and .eh_frame* since they may cause issues on some hosts. */
     /* Also discard the program interpreter section since we do not need one. This is */
     /* more or less equivalent to the --no-dynamic-linker linker flag, except that it */
     /* works with ld.gold. */
     /DISCARD/ : {
         *(.eh_frame*)
-        *(.note .note.*)
+        *(.note)
+        *(.note.*)
         *(.interp)
     }
 }

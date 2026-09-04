@@ -42,6 +42,22 @@ Use [wosdbg.json.example](wosdbg.json.example) as the complete starting point:
     "maxIncidentArchiveBytes": "268435456",
     "maxIncidentPathLength": 512,
     "maxIncidentPathDepth": 24
+  },
+  "live": {
+    "enabled": false,
+    "allowMutations": false,
+    "allowedHosts": ["127.0.0.1", "::1"],
+    "runtimeDescriptors": [
+      "cluster-overlays/live-debug.json",
+      "ktest-data/live-debug.json"
+    ],
+    "maxTargets": 16,
+    "maxSessions": 8,
+    "operationTimeoutMs": 3000,
+    "leaseMs": 30000,
+    "maxMemoryBytes": 4096,
+    "maxTranscriptBytes": 1048576,
+    "targets": []
   }
 }
 ```
@@ -89,6 +105,43 @@ reports missing/mismatched symbols.
 Do not expose MCP beyond loopback without deliberately configuring both
 `bindAddress` and `allowedCidrs`. Files outside the effective roots described
 above are rejected by analysis operations.
+
+## Live targets and leases
+
+Live debugging is disabled unless `live.enabled` is true. Runtime descriptors
+are local mode-0600 files produced while `wos-cluster` or `wos-ktest` owns the
+corresponding VMs. WOSDBG accepts only version 1 descriptors below an effective
+allowed root, validates the recorded process identity, and connects only to
+literal loopback RSP endpoints and local QMP sockets. Static `targets` use the
+same schema and checks and are useful for an explicitly tunneled guest
+debugserver. Opening a session is itself an audited pause operation and requires
+`authority=pause-read`, a non-empty `auditId`, and
+`confirmation=PAUSE_ALLOWLISTED_TARGETS`. No register/memory write, breakpoint,
+step, continue, raw RSP/QMP, or command-execution tool is exposed;
+`allowMutations=false` remains the default and reserved gate for any future
+bounded mutation capability. A static target uses this shape:
+
+```json
+{
+  "id": "debugserver-httpd",
+  "nodeId": "0",
+  "transport": "debugserver",
+  "host": "127.0.0.1",
+  "port": 2159,
+  "symbolPath": "build/modules/httpd/httpd",
+  "expectedBuildId": "0123456789abcdef",
+  "logPaths": ["serial-vm0.log"]
+}
+```
+
+Tool arguments select an `id`; they cannot supply a host, port, socket, symbol
+file, or raw QMP/RSP command. QEMU sessions query run state through QMP and
+resume only a running-to-paused transition owned by that lease. Session close,
+frontend-owner cleanup, timeout, process exit, and partial multi-node failure
+all unwind owned leases. Memory and raw transcript payloads require explicit
+sensitive-data confirmations and remain bounded. `allowMutations` is reserved
+and currently grants no write, breakpoint, kill, shell, or arbitrary-command
+capability.
 
 See [README.md](README.md) for GUI, CLI, MCP, batch workflows, and the full
 capability map.

@@ -76,6 +76,37 @@ only ASCII letters, digits, `.`, `_`, and `-`. Wildcards, whitespace, control
 characters, quoting characters, backslashes, and other guest paths are rejected.
 Fetches have a timeout and an OS-enforced file-size limit.
 
+WOSDBG live sessions can also atomically hand exact bounded evidence to the
+same writer. Pass the launcher's version-1 runtime descriptor as the live
+configuration so its nodes populate the incident topology and its exact log and
+symbol paths form the auxiliary-evidence allowlist. The writer never walks an
+input directory:
+
+```sh
+bin/wos-incident capture --kind live \
+  --config cluster-overlays/live-debug.json \
+  --live-evidence live-session=.wosdbg-live/session.json \
+  --live-evidence live-transcript=.wosdbg-live/transcript.json \
+  --live-evidence register-snapshot=.wosdbg-live/registers.json \
+  --live-evidence memory-snapshot=.wosdbg-live/memory.bin \
+  --live-evidence serial-log=cluster-overlays/serial-vm0.log \
+  --live-evidence qemu-log=cluster-overlays/qemu-vm0.log \
+  --live-evidence binary=build/modules/kern/wos \
+  --output test-results/live.wosincident
+```
+
+Each source must be a stable regular file below the repository capture root;
+symlinks, traversal, sensitive filename classes, mutation, truncation, and
+oversize input are rejected. A live `serial-log`, `qemu-log`, or `binary` must
+exactly match a target `logPaths` or `symbolPath` entry in the descriptor. An
+explicit local `coredump` must retain the strict `*_coredump.bin` basename.
+Every member has a SHA-256 digest; ELF binaries also carry a detected GNU build
+ID when available and are checked against a descriptor-declared build ID.
+Coredumps are associated with an included conventional program binary when the
+basename permits an exact match. Live memory, coredumps, and raw protocol
+transcripts are opaque sensitive evidence and are not made safe to share by
+text redaction.
+
 ## Collection boundary
 
 The collector clamps requested member-count, per-file, total-byte, and

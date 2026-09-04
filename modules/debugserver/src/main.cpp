@@ -31,13 +31,15 @@
 #include <print>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace {
 
 constexpr uint16_t DEFAULT_PORT = 2159;
-constexpr size_t MAX_PACKET = 4096;
+constexpr size_t MAX_PACKET = 8192;
 constexpr size_t MAX_THREADS = 128;
+constexpr size_t MAX_IMAGE_CATALOG_RECORDS = 32;
 constexpr uint64_t MAX_MEM_READ = 4096;
 constexpr uint8_t X86_INT3 = 0xcc;
 constexpr int DEBUGSERVER_PACKET_IO_TIMEOUT_MS = 30000;
@@ -90,6 +92,12 @@ struct HardwareBreakpoint {
     uint64_t kind = 0;
     ker::abi::ptrace::hw_break_type type = ker::abi::ptrace::hw_break_type::EXECUTE;
     uint32_t slot = 0;
+};
+
+struct ImageCatalogSnapshot {
+    std::vector<ker::abi::ptrace::ImageCatalogRecord> images;
+    ker::abi::ptrace::image_snapshot_status status = ker::abi::ptrace::image_snapshot_status::UNAVAILABLE;
+    bool catalog_v1 = false;
 };
 
 struct Session {
@@ -391,6 +399,9 @@ auto parse_hex_u64(std::string_view text, uint64_t& value) -> bool {
         if (DECODED_HEX < 0) {
             return false;
         }
+        if (value > (UINT64_MAX - static_cast<uint64_t>(DECODED_HEX)) / 16U) {
+            return false;
+        }
         value = (value << 4U) | static_cast<uint64_t>(DECODED_HEX);
     }
     return true;
@@ -622,7 +633,8 @@ auto read_memory_packet(Session& session, std::string_view packet) -> std::strin
     }
     uint64_t addr = 0;
     uint64_t len = 0;
-    if (!parse_hex_u64(packet.substr(1, COMMA - 1), addr) || !parse_hex_u64(packet.substr(COMMA + 1), len) || len > MAX_MEM_READ) {
+    if (!parse_hex_u64(packet.substr(1, COMMA - 1), addr) || !parse_hex_u64(packet.substr(COMMA + 1), len) || len > MAX_MEM_READ ||
+        addr > UINT64_MAX - len) {
         return "E22";
     }
     std::vector<uint8_t> buffer(static_cast<size_t>(len));
@@ -640,7 +652,8 @@ auto write_memory_hex_packet(Session& session, std::string_view packet) -> std::
     }
     uint64_t addr = 0;
     uint64_t len = 0;
-    if (!parse_hex_u64(packet.substr(1, COMMA - 1), addr) || !parse_hex_u64(packet.substr(COMMA + 1, COLON - COMMA - 1), len)) {
+    if (!parse_hex_u64(packet.substr(1, COMMA - 1), addr) || !parse_hex_u64(packet.substr(COMMA + 1, COLON - COMMA - 1), len) ||
+        len > MAX_MEM_READ || addr > UINT64_MAX - len) {
         return "E22";
     }
     std::vector<uint8_t> buffer(static_cast<size_t>(len));
@@ -674,7 +687,8 @@ auto write_memory_binary_packet(Session& session, std::string_view packet) -> st
     }
     uint64_t addr = 0;
     uint64_t len = 0;
-    if (!parse_hex_u64(packet.substr(1, COMMA - 1), addr) || !parse_hex_u64(packet.substr(COMMA + 1, COLON - COMMA - 1), len)) {
+    if (!parse_hex_u64(packet.substr(1, COMMA - 1), addr) || !parse_hex_u64(packet.substr(COMMA + 1, COLON - COMMA - 1), len) ||
+        len > MAX_MEM_READ || addr > UINT64_MAX - len) {
         return "E22";
     }
     std::vector<uint8_t> buffer;
@@ -693,14 +707,14 @@ auto get_legacy_images(Session& session, std::vector<ker::abi::ptrace::ImageCata
     };
     int64_t result = ker::process::ptrace(static_cast<uint64_t>(ker::abi::ptrace::request::GET_IMAGES), session.pid, 0,
                                           reinterpret_cast<uint64_t>(&list));
-    if (result == -ENOSPC && list.count > legacy.size()) {
+    if (result == -ENOSPC && list.count > legacy.size() && list.count <= MAX_IMAGE_CATALOG_RECORDS) {
         legacy.assign(list.count, ker::abi::ptrace::ImageRecord{});
         list.images = legacy.data();
         list.capacity = legacy.size();
         result = ker::process::ptrace(static_cast<uint64_t>(ker::abi::ptrace::request::GET_IMAGES), session.pid, 0,
                                       reinterpret_cast<uint64_t>(&list));
     }
-    if (result < 0) {
+    if (result < 0 || list.count > MAX_IMAGE_CATALOG_RECORDS) {
         images.clear();
         return false;
     }
@@ -719,35 +733,95 @@ auto get_legacy_images(Session& session, std::vector<ker::abi::ptrace::ImageCata
     return true;
 }
 
-auto get_images(Session& session, std::vector<ker::abi::ptrace::ImageCatalogRecord>& images) -> bool {
-    images.assign(8, ker::abi::ptrace::ImageCatalogRecord{});
+auto get_image_snapshot(Session& session, ImageCatalogSnapshot& snapshot) -> bool {
+    snapshot = {};
+    snapshot.images.assign(8, ker::abi::ptrace::ImageCatalogRecord{});
     ker::abi::ptrace::ImageCatalogList list{
         .version = ker::abi::ptrace::IMAGE_CATALOG_VERSION,
         .record_size = sizeof(ker::abi::ptrace::ImageCatalogRecord),
-        .images = images.data(),
-        .capacity = images.size(),
+        .images = snapshot.images.data(),
+        .capacity = snapshot.images.size(),
         .count = 0,
         .snapshot_status = ker::abi::ptrace::image_snapshot_status::UNAVAILABLE,
         .reserved = 0,
     };
     int64_t result = ker::process::ptrace(static_cast<uint64_t>(ker::abi::ptrace::request::GET_IMAGE_CATALOG), session.pid, 0,
                                           reinterpret_cast<uint64_t>(&list));
-    if (result == -ENOSPC && list.count > images.size()) {
-        images.assign(list.count, ker::abi::ptrace::ImageCatalogRecord{});
-        list.images = images.data();
-        list.capacity = images.size();
+    if (result == -ENOSPC && list.count > snapshot.images.size() && list.count <= MAX_IMAGE_CATALOG_RECORDS) {
+        snapshot.images.assign(list.count, ker::abi::ptrace::ImageCatalogRecord{});
+        list.images = snapshot.images.data();
+        list.capacity = snapshot.images.size();
         result = ker::process::ptrace(static_cast<uint64_t>(ker::abi::ptrace::request::GET_IMAGE_CATALOG), session.pid, 0,
                                       reinterpret_cast<uint64_t>(&list));
     }
     if (result == -EINVAL || result == -ENOSYS) {
-        return get_legacy_images(session, images);
+        return get_legacy_images(session, snapshot.images);
     }
-    if (result < 0 || (list.snapshot_status != ker::abi::ptrace::image_snapshot_status::COMPLETE &&
-                       list.snapshot_status != ker::abi::ptrace::image_snapshot_status::STATIC_IMAGE)) {
+    if (result < 0 || list.count > MAX_IMAGE_CATALOG_RECORDS) {
+        snapshot.images.clear();
+        return false;
+    }
+    snapshot.images.resize(std::min(list.count, snapshot.images.size()));
+    snapshot.status = list.snapshot_status;
+    snapshot.catalog_v1 = true;
+    return true;
+}
+
+auto get_images(Session& session, std::vector<ker::abi::ptrace::ImageCatalogRecord>& images) -> bool {
+    ImageCatalogSnapshot snapshot;
+    if (!get_image_snapshot(session, snapshot) ||
+        (snapshot.catalog_v1 && snapshot.status != ker::abi::ptrace::image_snapshot_status::COMPLETE &&
+         snapshot.status != ker::abi::ptrace::image_snapshot_status::STATIC_IMAGE)) {
         images.clear();
         return false;
     }
-    images.resize(std::min(list.count, images.size()));
+    images = std::move(snapshot.images);
+    return true;
+}
+
+auto image_snapshot_status_name(ker::abi::ptrace::image_snapshot_status status) -> std::string_view {
+    switch (status) {
+        case ker::abi::ptrace::image_snapshot_status::COMPLETE:
+            return "complete";
+        case ker::abi::ptrace::image_snapshot_status::STATIC_IMAGE:
+            return "static-image";
+        case ker::abi::ptrace::image_snapshot_status::UNAVAILABLE:
+            return "unavailable";
+        case ker::abi::ptrace::image_snapshot_status::INCONSISTENT:
+            return "inconsistent";
+        case ker::abi::ptrace::image_snapshot_status::TRUNCATED:
+            return "truncated";
+    }
+    return "unknown";
+}
+
+auto image_path(const ker::abi::ptrace::ImageCatalogRecord& image) -> std::string_view;
+
+auto wos_images_json(Session& session, std::string& out) -> bool {
+    ImageCatalogSnapshot snapshot;
+    if (!get_image_snapshot(session, snapshot)) {
+        return false;
+    }
+
+    auto const RECORD_SIZE =
+        static_cast<uint32_t>(snapshot.catalog_v1 ? sizeof(ker::abi::ptrace::ImageCatalogRecord) : sizeof(ker::abi::ptrace::ImageRecord));
+    out = std::format(
+        R"json({{"format":"wos-image-catalog","version":1,"source":"{}","recordSize":{},"snapshotStatus":"{}","snapshotStatusCode":{},"count":{},"images":[)json",
+        snapshot.catalog_v1 ? "get-image-catalog" : "get-images-legacy", RECORD_SIZE, image_snapshot_status_name(snapshot.status),
+        static_cast<uint32_t>(snapshot.status), snapshot.images.size());
+    for (size_t i = 0; i < snapshot.images.size(); ++i) {
+        auto const& image = snapshot.images.at(i);
+        size_t const BUILD_ID_SIZE = std::min<size_t>(image.build_id_size, ker::abi::ptrace::ImageCatalogRecord::BUILD_ID_LEN);
+        if (i != 0) {
+            out.push_back(',');
+        }
+        out += std::format(
+            R"json({{"pathHex":"{}","loadBase":"0x{:x}","imageStart":"0x{:x}","imageEnd":"0x{:x}","textAddress":"0x{:x}","textSize":"0x{:x}","entry":"0x{:x}","dynamicAddress":"0x{:x}","flags":"0x{:x}","buildIdSize":{},"buildId":"{}"}})json",
+            hex_bytes(image_path(image).data(), image_path(image).size()), image.load_base, image.image_start, image.image_end,
+            image.text_addr, image.text_size, image.entry, image.dynamic_addr, image.flags, BUILD_ID_SIZE,
+            hex_bytes(image.build_id, BUILD_ID_SIZE));
+    }
+    out += "]}";
     return true;
 }
 
@@ -828,12 +902,26 @@ auto read_qxfer(std::string_view packet, std::string_view object, std::string_vi
         return "E22";
     }
     size_t const START = static_cast<size_t>(offset);
-    size_t const COUNT = std::min(static_cast<size_t>(length), content.size() - START);
-    bool const LAST = START + COUNT >= content.size();
-    std::string out;
-    out.reserve(COUNT + 1);
-    out.push_back(LAST ? 'l' : 'm');
-    out.append(content.substr(START, COUNT));
+    size_t const COUNT = static_cast<size_t>(std::min<uint64_t>(length, content.size() - START));
+    std::string out(1, 'm');
+    out.reserve(std::min(MAX_PACKET, COUNT + 1));
+    size_t consumed = 0;
+    while (consumed < COUNT) {
+        uint8_t const BYTE = static_cast<uint8_t>(content[START + consumed]);
+        bool const ESCAPE = BYTE == '$' || BYTE == '#' || BYTE == '}' || BYTE == '*';
+        size_t const ENCODED_SIZE = ESCAPE ? 2 : 1;
+        if (out.size() > MAX_PACKET - ENCODED_SIZE) {
+            break;
+        }
+        if (ESCAPE) {
+            out.push_back('}');
+            out.push_back(static_cast<char>(BYTE ^ 0x20U));
+        } else {
+            out.push_back(static_cast<char>(BYTE));
+        }
+        ++consumed;
+    }
+    out.front() = START + consumed >= content.size() ? 'l' : 'm';
     return out;
 }
 
@@ -1236,8 +1324,8 @@ auto handle_packet(Session& session, std::string_view packet) -> std::string {
         return handle_vcont(session, packet);
     }
     if (packet.starts_with("qSupported")) {
-        return "PacketSize=1000;QStartNoAckMode+;native-signals+;qXfer:features:read+;qXfer:libraries-svr4:read+;qThreadStopInfo+;"
-               "vContSupported+";
+        return "PacketSize=2000;QStartNoAckMode+;native-signals+;qXfer:features:read+;qXfer:libraries-svr4:read+;"
+               "qXfer:wos-images:read+;qThreadStopInfo+;vContSupported+";
     }
     if (packet == "QStartNoAckMode") {
         session.no_ack = true;
@@ -1269,6 +1357,13 @@ auto handle_packet(Session& session, std::string_view packet) -> std::string {
     }
     if (packet.starts_with("qXfer:libraries-svr4:read::")) {
         return read_qxfer(packet, "libraries-svr4", "", libraries_svr4_xml(session));
+    }
+    if (packet.starts_with("qXfer:wos-images:read::")) {
+        std::string catalog;
+        if (!wos_images_json(session, catalog)) {
+            return "E01";
+        }
+        return read_qxfer(packet, "wos-images", "", catalog);
     }
     if (packet == "qfThreadInfo") {
         std::array<uint64_t, MAX_THREADS> tids{};

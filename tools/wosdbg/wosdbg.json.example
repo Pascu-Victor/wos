@@ -41,5 +41,21 @@
         "maxIncidentArchiveBytes": "268435456",
         "maxIncidentPathLength": 512,
         "maxIncidentPathDepth": 24
+    },
+    "live": {
+        "enabled": false,
+        "allowMutations": false,
+        "allowedHosts": ["127.0.0.1", "::1"],
+        "runtimeDescriptors": [
+            "cluster-overlays/live-debug.json",
+            "ktest-data/live-debug.json"
+        ],
+        "maxTargets": 16,
+        "maxSessions": 8,
+        "operationTimeoutMs": 3000,
+        "leaseMs": 30000,
+        "maxMemoryBytes": 4096,
+        "maxTranscriptBytes": 1048576,
+        "targets": []
     }
 }

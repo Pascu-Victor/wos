@@ -59,9 +59,9 @@ class McpHttpServer : public QObject {
                          const QByteArray& protocol_version = {}, const QByteArray& session_id = {}, bool close_connection = true);
     static void send_sse_headers(QTcpSocket* socket, const QByteArray& protocol_version = {}, const QByteArray& session_id = {});
     static void send_sse_event(QTcpSocket* socket, const QByteArray& event_id, const QByteArray& event, const QByteArray& data = {});
-    [[nodiscard]] auto handle_json_rpc(const QJsonObject& request) -> QJsonObject;
-    [[nodiscard]] auto handle_method(const QString& method, const QJsonObject& params) -> QJsonObject;
-    [[nodiscard]] auto call_tool(const QJsonObject& params) const -> QJsonObject;
+    [[nodiscard]] auto handle_json_rpc(const QJsonObject& request, const QString& owner) -> QJsonObject;
+    [[nodiscard]] auto handle_method(const QString& method, const QJsonObject& params, const QString& owner) -> QJsonObject;
+    [[nodiscard]] auto call_tool(const QJsonObject& params, const QString& owner) const -> QJsonObject;
     [[nodiscard]] static auto json_rpc_error(const QJsonValue& id, int code, const QString& message) -> QJsonObject;
     [[nodiscard]] static auto json_rpc_result(const QJsonValue& id, const QJsonObject& result) -> QJsonObject;
     [[nodiscard]] static auto tool_result(const QJsonObject& payload) -> QJsonObject;

@@ -14,11 +14,13 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QRegularExpression>
+#include <QSet>
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
 #include <stdexcept>
+#include <utility>
 
 Config::Config() { load_defaults(); }
 
@@ -109,6 +111,11 @@ bool Config::load_from_file(const QString& file_path) {
     } else {
         mcp_settings = McpSettings{};
     }
+    if (root.contains("live") && root["live"].isObject()) {
+        live_settings = parse_live_settings(root["live"].toObject());
+    } else {
+        live_settings = LiveSettings{};
+    }
 
     return true;
 }
@@ -138,6 +145,7 @@ bool Config::save_to_file(const QString& file_path) const {
     root["binaries"] = binaries_array;
 
     root["mcp"] = serialize_mcp_settings(mcp_settings);
+    root["live"] = serialize_live_settings(live_settings);
 
     QJsonDocument doc(root);
 
@@ -201,6 +209,7 @@ QString Config::resolve_path(const QString& path) const {
 void Config::load_defaults() {
     address_lookups.clear();
     mcp_settings = McpSettings{};
+    live_settings = LiveSettings{};
 
     // Add some common default lookups that might be useful
     // These are examples and can be customized based on typical use cases
@@ -375,6 +384,108 @@ QJsonObject Config::serialize_mcp_settings(const McpSettings& settings) {
     obj["maxIncidentPathLength"] = settings.max_incident_path_length;
     obj["maxIncidentPathDepth"] = settings.max_incident_path_depth;
     return obj;
+}
+
+LiveSettings Config::parse_live_settings(const QJsonObject& obj) const {
+    LiveSettings settings;
+    settings.enabled = obj["enabled"].toBool(false);
+    // Kept in the schema so a future mutation implementation cannot become
+    // enabled merely by upgrading WOSDBG.  No current tool consumes it.
+    settings.allow_mutations = obj["allowMutations"].toBool(false);
+    if (obj["allowedHosts"].isArray()) {
+        settings.allowed_hosts.clear();
+        for (const auto& value : obj["allowedHosts"].toArray()) {
+            const QString HOST = value.toString().trimmed();
+            if (!HOST.isEmpty() && !settings.allowed_hosts.contains(HOST)) {
+                settings.allowed_hosts.append(HOST);
+            }
+        }
+    }
+    settings.max_targets = std::clamp(obj["maxTargets"].toInt(settings.max_targets), 1, 64);
+    settings.max_sessions = std::clamp(obj["maxSessions"].toInt(settings.max_sessions), 1, 32);
+    settings.operation_timeout_ms = std::clamp(obj["operationTimeoutMs"].toInt(settings.operation_timeout_ms), 100, 30000);
+    settings.lease_ms = std::clamp(obj["leaseMs"].toInt(settings.lease_ms), 1000, 300000);
+    settings.max_memory_bytes = std::clamp(obj["maxMemoryBytes"].toInt(settings.max_memory_bytes), 16, 1024 * 1024);
+    settings.max_transcript_bytes = std::clamp(obj["maxTranscriptBytes"].toInt(settings.max_transcript_bytes), 4096, 16 * 1024 * 1024);
+    for (const auto& value : obj["runtimeDescriptors"].toArray()) {
+        if (value.isString()) {
+            const QString PATH = resolve_path(value.toString());
+            if (!PATH.isEmpty() && !settings.runtime_descriptors.contains(PATH)) {
+                settings.runtime_descriptors.append(PATH);
+            }
+        }
+    }
+
+    QSet<QString> ids;
+    const QJsonArray TARGETS = obj["targets"].toArray();
+    for (const auto& value : TARGETS) {
+        if (!value.isObject() || std::cmp_greater_equal(settings.targets.size(), settings.max_targets)) {
+            continue;
+        }
+        const QJsonObject TARGET_OBJ = value.toObject();
+        LiveTargetSettings target;
+        target.id = TARGET_OBJ["id"].toString().trimmed();
+        target.node_id = TARGET_OBJ["nodeId"].toVariant().toString().trimmed();
+        target.transport = TARGET_OBJ["transport"].toString("qemu").trimmed().toLower();
+        target.host = TARGET_OBJ["host"].toString("127.0.0.1").trimmed();
+        const int PORT = TARGET_OBJ["port"].toInt();
+        target.port = PORT > 0 && PORT <= 65535 ? static_cast<quint16>(PORT) : 0;
+        target.qmp_socket = resolve_path(TARGET_OBJ["qmpSocket"].toString());
+        target.symbol_path = resolve_path(TARGET_OBJ["symbolPath"].toString());
+        target.expected_build_id = TARGET_OBJ["expectedBuildId"].toString().trimmed().toLower();
+        for (const auto& path : TARGET_OBJ["logPaths"].toArray()) {
+            if (path.isString()) {
+                target.log_paths.append(resolve_path(path.toString()));
+            }
+        }
+
+        static const QRegularExpression SAFE_ID("^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$");
+        const bool VALID_ENDPOINT = target.port != 0 && settings.allowed_hosts.contains(target.host);
+        const bool VALID_TRANSPORT = target.transport == "qemu" || target.transport == "debugserver";
+        const bool VALID_QMP = target.transport != "qemu" || !target.qmp_socket.isEmpty();
+        if (!SAFE_ID.match(target.id).hasMatch() || ids.contains(target.id) || !VALID_ENDPOINT || !VALID_TRANSPORT || !VALID_QMP) {
+            qWarning() << "Invalid or duplicate live target" << target.id << "- skipping";
+            continue;
+        }
+        ids.insert(target.id);
+        target.log_paths.removeDuplicates();
+        settings.targets.push_back(std::move(target));
+    }
+    return settings;
+}
+
+QJsonObject Config::serialize_live_settings(const LiveSettings& settings) {
+    QJsonArray targets;
+    for (const auto& target : settings.targets) {
+        QJsonArray log_paths;
+        for (const auto& path : target.log_paths) {
+            log_paths.append(path);
+        }
+        targets.append(QJsonObject{{"id", target.id},
+                                   {"nodeId", target.node_id},
+                                   {"transport", target.transport},
+                                   {"host", target.host},
+                                   {"port", static_cast<int>(target.port)},
+                                   {"qmpSocket", target.qmp_socket},
+                                   {"symbolPath", target.symbol_path},
+                                   {"expectedBuildId", target.expected_build_id},
+                                   {"logPaths", log_paths}});
+    }
+    QJsonArray runtime_descriptors;
+    for (const auto& path : settings.runtime_descriptors) {
+        runtime_descriptors.append(path);
+    }
+    return QJsonObject{{"enabled", settings.enabled},
+                       {"allowMutations", settings.allow_mutations},
+                       {"allowedHosts", QJsonArray::fromStringList(settings.allowed_hosts)},
+                       {"maxTargets", settings.max_targets},
+                       {"maxSessions", settings.max_sessions},
+                       {"operationTimeoutMs", settings.operation_timeout_ms},
+                       {"leaseMs", settings.lease_ms},
+                       {"maxMemoryBytes", settings.max_memory_bytes},
+                       {"maxTranscriptBytes", settings.max_transcript_bytes},
+                       {"runtimeDescriptors", runtime_descriptors},
+                       {"targets", targets}};
 }
 
 // ConfigService implementation

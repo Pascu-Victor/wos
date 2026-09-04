@@ -58,6 +58,34 @@ struct McpSettings {
     int max_incident_path_depth = 24;
 };
 
+// Live debugging is deliberately opt-in.  Endpoints can only be selected from
+// this configuration; tool arguments never supply arbitrary hosts or sockets.
+struct LiveTargetSettings {
+    QString id;
+    QString node_id;
+    QString transport = "qemu";  // qemu (QMP + RSP) or debugserver (RSP)
+    QString host = "127.0.0.1";
+    quint16 port = 0;
+    QString qmp_socket;
+    QString symbol_path;
+    QString expected_build_id;
+    QStringList log_paths;
+};
+
+struct LiveSettings {
+    bool enabled = false;
+    bool allow_mutations = false;
+    QStringList allowed_hosts = {"127.0.0.1", "::1"};
+    int max_targets = 16;
+    int max_sessions = 8;
+    int operation_timeout_ms = 3000;
+    int lease_ms = 30000;
+    int max_memory_bytes = 4096;
+    int max_transcript_bytes = 1024 * 1024;
+    QStringList runtime_descriptors;
+    std::vector<LiveTargetSettings> targets;
+};
+
 class Config {
    public:
     Config();
@@ -100,6 +128,7 @@ class Config {
 
     [[nodiscard]] const McpSettings& get_mcp_settings() const { return mcp_settings; }
     McpSettings& get_mutable_mcp_settings() { return mcp_settings; }
+    [[nodiscard]] const LiveSettings& get_live_settings() const { return live_settings; }
 
     // Get default configuration
     void load_defaults();
@@ -112,6 +141,7 @@ class Config {
     QString coredump_directory = "./coredumps";
     std::vector<BinaryMapping> binary_mappings;
     McpSettings mcp_settings;
+    LiveSettings live_settings;
     QString config_base_dir;  // Directory containing the config file, for resolving relative paths
 
     // Helper functions for JSON parsing
@@ -121,6 +151,8 @@ class Config {
     [[nodiscard]] static QJsonObject serialize_address_lookup(const AddressLookup& lookup);
     [[nodiscard]] McpSettings parse_mcp_settings(const QJsonObject& obj) const;
     static QJsonObject serialize_mcp_settings(const McpSettings& settings);
+    [[nodiscard]] LiveSettings parse_live_settings(const QJsonObject& obj) const;
+    static QJsonObject serialize_live_settings(const LiveSettings& settings);
 };
 
 // Global configuration instance

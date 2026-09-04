@@ -182,7 +182,7 @@ def qemu_log_path(spec: dict, tcg_level: str | None = None) -> Path:
 
 
 def qmp_socket_path(spec: dict) -> Path | None:
-    """Return the configured QMP socket, including the legacy USB location."""
+    """Return the configured QMP socket, including debug and legacy USB defaults."""
     spec = normalize_node_spec(spec)
     vm_cfg = spec["vm"]
     configured = vm_cfg.get("qmp_socket")
@@ -197,6 +197,12 @@ def qmp_socket_path(spec: dict) -> Path | None:
         if not isinstance(legacy, str) or not legacy:
             raise ValueError("vm.usb_hotplug.qmp_socket must be a non-empty path string")
         return Path(legacy)
+
+    # Live debug sessions use QMP for bounded pause/resume ownership.  Keep
+    # QMP opt-in for ordinary nodes, but guarantee it for every debug node.
+    if node_debug_enabled(spec):
+        overlay_dir = Path(vm_cfg.get("overlay_dir", "cluster-overlays"))
+        return overlay_dir / f"qmp-vm{node_id(spec)}.sock"
     return None
 
 
@@ -303,6 +309,8 @@ def build_qemu_args(
     "full" = TCG+CPU state.
     """
     spec = normalize_node_spec(spec)
+    if force_debug:
+        spec["debug"] = True
     vm_cfg = spec["vm"]
     nid = node_id(spec)
 
@@ -461,13 +469,16 @@ def build_qemu_args(
         args.extend(
             [
                 "-chardev",
-                f"socket,id=debugger,port={debugcon_port},host=0.0.0.0,server=on,wait=off,telnet=on",
+                f"socket,id=debugger,port={debugcon_port},host=127.0.0.1,server=on,wait=off,telnet=on",
                 "-device",
                 "isa-debugcon,iobase=0x402,chardev=debugger",
             ]
         )
-        args.extend(["-monitor", f"tcp:0.0.0.0:{monitor_port},server,nowait"])
-        log(f"  [VM{nid}] DEBUG: gdb=127.0.0.1:{gdb_port} debugcon={debugcon_port} monitor={monitor_port}")
+        args.extend(["-monitor", f"tcp:127.0.0.1:{monitor_port},server,nowait"])
+        log(
+            f"  [VM{nid}] DEBUG: gdb=127.0.0.1:{gdb_port} "
+            f"debugcon=127.0.0.1:{debugcon_port} monitor=127.0.0.1:{monitor_port}"
+        )
 
     return args
 

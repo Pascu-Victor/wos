@@ -21,12 +21,16 @@
 #include "log_entry.h"
 
 class Config;
+namespace wosdbg::live {
+class LiveSessionManager;
+}
 
 class DebugAnalysisService : public QObject {
     Q_OBJECT
 
    public:
     explicit DebugAnalysisService(QObject* parent = nullptr);
+    ~DebugAnalysisService() override;
 
     void set_config(const Config& new_config);
     void reload_config();
@@ -34,7 +38,26 @@ class DebugAnalysisService : public QObject {
     // Canonical frontend-neutral capability contract. MCP, CLI, and GUI all
     // enumerate and invoke tools through these two methods.
     [[nodiscard]] static QJsonObject tool_catalog();
-    [[nodiscard]] QJsonObject invoke_tool(const QString& name, const QJsonObject& args);
+    [[nodiscard]] QJsonObject invoke_tool(const QString& name, const QJsonObject& args, const QString& owner_id = {});
+
+    [[nodiscard]] QJsonObject discover_live_targets();
+    [[nodiscard]] QJsonObject list_live_targets() const;
+    [[nodiscard]] QJsonObject open_live_session(const QJsonObject& args, const QString& owner_id);
+    [[nodiscard]] QJsonObject list_live_sessions(const QString& owner_id) const;
+    [[nodiscard]] QJsonObject get_live_session(const QJsonObject& args, const QString& owner_id) const;
+    [[nodiscard]] QJsonObject renew_live_session(const QJsonObject& args, const QString& owner_id);
+    [[nodiscard]] QJsonObject close_live_session(const QJsonObject& args, const QString& owner_id);
+    [[nodiscard]] QJsonObject read_live_registers(const QJsonObject& args, const QString& owner_id);
+    [[nodiscard]] QJsonObject read_live_memory(const QJsonObject& args, const QString& owner_id);
+    [[nodiscard]] QJsonObject backtrace_live(const QJsonObject& args, const QString& owner_id);
+    [[nodiscard]] QJsonObject resolve_live_address(const QJsonObject& args, const QString& owner_id);
+    [[nodiscard]] QJsonObject get_live_source(const QJsonObject& args, const QString& owner_id);
+    [[nodiscard]] QJsonObject inspect_live_pte(const QJsonObject& args, const QString& owner_id);
+    [[nodiscard]] QJsonObject get_live_transcript(const QJsonObject& args, const QString& owner_id) const;
+    [[nodiscard]] QJsonObject verify_live_transcript(const QJsonObject& args) const;
+    [[nodiscard]] QJsonObject capture_live_incident(const QJsonObject& args, const QString& owner_id);
+    [[nodiscard]] QJsonObject close_live_sessions_for_owner(const QString& owner_id);
+    void shutdown_live_sessions();
 
     [[nodiscard]] QJsonObject status() const;
     static auto list_logs() -> QJsonObject;
@@ -249,4 +272,5 @@ class DebugAnalysisService : public QObject {
     QHash<QString, std::shared_ptr<DumpSession>> dump_sessions;
     QHash<QString, std::shared_ptr<IncidentSession>> incident_sessions;
     uint64_t incident_session_sequence = 0;
+    std::unique_ptr<wosdbg::live::LiveSessionManager> live_sessions;
 };

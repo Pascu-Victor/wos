@@ -53,6 +53,28 @@ DEFAULT_MAX_METADATA_BYTES = 8 * 1024 * 1024
 DEFAULT_MAX_MANIFEST_BYTES = 1024 * 1024
 LIVE_FETCH_TIMEOUT_SECONDS = 45.0
 
+LIVE_EVIDENCE_KINDS = frozenset(
+    {
+        "live-session",
+        "live-transcript",
+        "register-snapshot",
+        "memory-snapshot",
+        "serial-log",
+        "qemu-log",
+        "coredump",
+        "binary",
+    }
+)
+
+LIVE_SESSION_EVIDENCE_KINDS = frozenset(
+    {
+        "live-session",
+        "live-transcript",
+        "register-snapshot",
+        "memory-snapshot",
+    }
+)
+
 ALLOWED_KINDS = {
     "config",
     "serial-log",
@@ -62,7 +84,7 @@ ALLOWED_KINDS = {
     "coverage-log",
     "coredump",
     "binary",
-}
+} | LIVE_EVIDENCE_KINDS
 TEXT_KINDS = {
     "config",
     "serial-log",
@@ -711,6 +733,283 @@ def _absolute(path: Path, repo_root: Path) -> Path:
     return path if path.is_absolute() else repo_root / path
 
 
+def _parse_live_evidence(value: str) -> tuple[str, Path]:
+    kind, separator, raw_path = value.partition("=")
+    if not separator or not kind or not raw_path:
+        raise IncidentError("live evidence must use KIND=PATH")
+    if kind not in LIVE_EVIDENCE_KINDS:
+        allowed = ", ".join(sorted(LIVE_EVIDENCE_KINDS))
+        raise IncidentError(
+            f"unsupported live evidence kind {kind!r}; expected {allowed}"
+        )
+    if "\x00" in raw_path:
+        raise IncidentError("live evidence path contains a NUL byte")
+    return kind, Path(raw_path)
+
+
+def _live_evidence_argument(value: str) -> tuple[str, Path]:
+    try:
+        return _parse_live_evidence(value)
+    except IncidentError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
+def _normalize_live_evidence(
+    evidence: Iterable[tuple[str, Path]], repo_root: Path
+) -> list[tuple[str, Path, str]]:
+    normalized: list[tuple[str, Path, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for entry in evidence:
+        try:
+            kind, raw_path = entry
+        except (TypeError, ValueError) as exc:
+            raise IncidentError(
+                "live evidence entries must be (kind, path) pairs"
+            ) from exc
+        if kind not in LIVE_EVIDENCE_KINDS:
+            allowed = ", ".join(sorted(LIVE_EVIDENCE_KINDS))
+            raise IncidentError(
+                f"unsupported live evidence kind {kind!r}; expected {allowed}"
+            )
+        source = _absolute(Path(raw_path), repo_root)
+        identity = (kind, str(_lexical_absolute(source, repo_root)))
+        if identity in seen:
+            continue
+        seen.add(identity)
+        normalized.append((kind, source, _safe_component(source.name)))
+
+    normalized.sort(key=lambda item: (item[0], str(item[1]), item[2]))
+    return normalized
+
+
+def _lexical_absolute(path: Path, repo_root: Path) -> Path:
+    """Normalize a path without resolving a possibly hostile symlink."""
+    return Path(os.path.abspath(_absolute(path, repo_root)))
+
+
+def _live_node_id(value: Any) -> int:
+    if isinstance(value, bool):
+        raise IncidentError("live topology nodeId must be an integer")
+    if isinstance(value, int):
+        node_id = value
+    elif isinstance(value, str) and re.fullmatch(r"0|[1-9][0-9]{0,8}", value):
+        node_id = int(value)
+    else:
+        raise IncidentError("live topology nodeId must be an integer")
+    if node_id < 0 or node_id > 999_999_999:
+        raise IncidentError("live topology nodeId is outside the supported range")
+    return node_id
+
+
+def _live_documents(config: dict[str, Any]) -> list[dict[str, Any]]:
+    documents = [config]
+    for key in ("runtimeDescriptor", "session", "captureSources"):
+        value = config.get(key)
+        if isinstance(value, dict):
+            documents.append(value)
+    for document in documents:
+        if "format" not in document and "version" not in document:
+            continue
+        if (
+            document.get("format") != "wosdbg-live"
+            or document.get("version") != 1
+        ):
+            raise IncidentError("live config must use the wosdbg-live version-1 schema")
+    return documents
+
+
+@dataclass(frozen=True)
+class LiveCaptureMetadata:
+    topology: dict[str, Any]
+    logs: dict[str, tuple[str, int]]
+    binaries: dict[str, tuple[int | None, str | None]]
+    snapshot: dict[str, Any]
+
+
+def _live_capture_metadata(
+    config: dict[str, Any], repo_root: Path, limits: CaptureLimits
+) -> LiveCaptureMetadata:
+    """Extract bounded topology and exact source allowlists from live v1 JSON."""
+    documents = _live_documents(config)
+    target_values: list[dict[str, Any]] = []
+    topology_values: list[dict[str, Any]] = []
+    for document in documents:
+        topology = document.get("topology")
+        if isinstance(topology, dict):
+            nodes = topology.get("nodes")
+            if not isinstance(nodes, list):
+                raise IncidentError("live topology.nodes must be an array")
+            if len(nodes) > limits.max_members:
+                raise IncidentError("live topology exceeds the incident member limit")
+            for node in nodes:
+                if not isinstance(node, dict):
+                    raise IncidentError("live topology node must be an object")
+                topology_values.append(node)
+        targets = document.get("targets")
+        if targets is not None:
+            if not isinstance(targets, list):
+                raise IncidentError("live targets must be an array")
+            if len(targets) > limits.max_members:
+                raise IncidentError("live targets exceed the incident member limit")
+            for target in targets:
+                if not isinstance(target, dict):
+                    raise IncidentError("live target must be an object")
+                target_values.append(target)
+
+    nodes: dict[int, dict[str, Any]] = {}
+
+    def add_node(value: dict[str, Any]) -> int:
+        node_id = _live_node_id(value.get("nodeId", value.get("id")))
+        current = nodes.get(node_id)
+        hostname = value.get(
+            "hostname",
+            current["hostname"] if current is not None else f"wos-{node_id}",
+        )
+        if not isinstance(hostname, str) or HOST_RE.fullmatch(hostname) is None:
+            raise IncidentError("live topology hostname is invalid")
+        candidate = {
+            "debug": bool(value.get("debug", False)),
+            "hostname": hostname,
+            "id": node_id,
+            "nics": [],
+        }
+        if current is None:
+            nodes[node_id] = candidate
+        elif current["hostname"] != hostname:
+            raise IncidentError("live topology repeats a nodeId inconsistently")
+        elif candidate["debug"]:
+            current["debug"] = True
+        return node_id
+
+    for node in topology_values:
+        add_node(node)
+    for target in target_values:
+        node_id = add_node(target)
+        if bool(target.get("debug", False)) or "pauseMode" in target:
+            nodes[node_id]["debug"] = True
+
+    if len(nodes) > limits.max_members:
+        raise IncidentError("live topology exceeds the incident member limit")
+
+    captures_value = config.get("captures", [])
+    if not isinstance(captures_value, list) or len(captures_value) > limits.max_members:
+        raise IncidentError("live captures must be a bounded array")
+    captures: list[dict[str, Any]] = []
+    for capture in captures_value:
+        if not isinstance(capture, dict):
+            raise IncidentError("live capture entry must be an object")
+        target_id = capture.get("targetId")
+        if not isinstance(target_id, str) or re.fullmatch(
+            r"[A-Za-z0-9._-]{1,128}", target_id
+        ) is None:
+            raise IncidentError("live capture targetId is invalid")
+        entry: dict[str, Any] = {
+            "targetId": target_id,
+            "complete": bool(capture.get("complete", False)),
+        }
+        if "nodeId" in capture:
+            entry["nodeId"] = _live_node_id(capture["nodeId"])
+        for source_key, destination_key in (
+            ("captureStartedUnixNs", "startedUnixNs"),
+            ("captureFinishedUnixNs", "finishedUnixNs"),
+        ):
+            value = capture.get(source_key)
+            if value is not None:
+                if not isinstance(value, str) or re.fullmatch(r"[0-9]{1,24}", value) is None:
+                    raise IncidentError("live capture timestamp is invalid")
+                entry[destination_key] = value
+        captures.append(entry)
+    captures.sort(key=lambda item: (item.get("nodeId", -1), item["targetId"]))
+
+    clock_value = config.get("clock", {})
+    if not isinstance(clock_value, dict):
+        raise IncidentError("live capture clock must be an object")
+    clock = {
+        "quality": str(clock_value.get("quality", "unavailable"))[:64],
+        "globalGuestOrderAvailable": bool(
+            clock_value.get("globalGuestOrderAvailable", False)
+        ),
+        "complete": bool(clock_value.get("complete", False)),
+    }
+    domain = clock_value.get("domain")
+    if isinstance(domain, str) and re.fullmatch(r"[A-Za-z0-9._-]{1,64}", domain):
+        clock["domain"] = domain
+
+    state = config.get("state", "unavailable")
+    if not isinstance(state, str) or re.fullmatch(r"[A-Za-z0-9._-]{1,32}", state) is None:
+        raise IncidentError("live capture state is invalid")
+    snapshot = {
+        "format": "wosdbg-live",
+        "version": 1,
+        "state": state,
+        "captureCount": len(captures),
+        "completeCount": sum(1 for capture in captures if capture["complete"]),
+        "captures": captures,
+        "clock": clock,
+    }
+
+    logs: dict[str, tuple[str, int]] = {}
+    binaries: dict[str, tuple[int | None, str | None]] = {}
+    for target in target_values:
+        node_id = _live_node_id(target.get("nodeId", target.get("id")))
+        log_paths = target.get("logPaths", [])
+        if not isinstance(log_paths, list) or len(log_paths) > limits.max_members:
+            raise IncidentError("live target logPaths must be a bounded array")
+        for index, raw_path in enumerate(log_paths):
+            if not isinstance(raw_path, str) or not raw_path or "\x00" in raw_path:
+                raise IncidentError("live target log path is invalid")
+            path = _lexical_absolute(Path(raw_path), repo_root)
+            basename = path.name.lower()
+            if basename.startswith("serial-") or "serial" in basename:
+                evidence_kind = "serial-log"
+            elif basename.startswith("qemu-") or "qemu" in basename:
+                evidence_kind = "qemu-log"
+            else:
+                evidence_kind = "serial-log" if index == 0 else "qemu-log"
+            key = str(path)
+            previous = logs.get(key)
+            if previous is not None and previous != (evidence_kind, node_id):
+                raise IncidentError("live descriptor repeats a log path inconsistently")
+            logs[key] = (evidence_kind, node_id)
+
+        raw_symbol = target.get("symbolPath")
+        if raw_symbol is None:
+            continue
+        if not isinstance(raw_symbol, str) or not raw_symbol or "\x00" in raw_symbol:
+            raise IncidentError("live target symbolPath is invalid")
+        declared_build_id = target.get(
+            "localBuildId", target.get("expectedBuildId")
+        )
+        if declared_build_id in {None, ""}:
+            declared_build_id = None
+        elif not isinstance(declared_build_id, str) or re.fullmatch(
+            r"[0-9a-fA-F]{2,128}", declared_build_id
+        ) is None:
+            raise IncidentError("live target build ID is invalid")
+        else:
+            declared_build_id = declared_build_id.lower()
+        key = str(_lexical_absolute(Path(raw_symbol), repo_root))
+        candidate = (node_id, declared_build_id)
+        previous = binaries.get(key)
+        if previous is not None:
+            if previous[1] != declared_build_id:
+                raise IncidentError(
+                    "live descriptor repeats a symbol path with inconsistent build IDs"
+                )
+            candidate = (
+                previous[0] if previous[0] == node_id else None,
+                declared_build_id,
+            )
+        binaries[key] = candidate
+
+    return LiveCaptureMetadata(
+        topology={"nodes": [nodes[node_id] for node_id in sorted(nodes)]},
+        logs=logs,
+        binaries=binaries,
+        snapshot=snapshot,
+    )
+
+
 def _node_log_paths(
     spec: dict[str, Any],
     *,
@@ -1281,6 +1580,7 @@ def capture_incident(
     profile: str | None = None,
     coverage_manifests: Iterable[Path] = (),
     live_coredumps: Iterable[str] = (),
+    live_evidence: Iterable[tuple[str, Path]] = (),
     snapshots: dict[str, SourceSnapshot] | None = None,
     run_complete: bool = True,
     run_error: str | None = None,
@@ -1289,10 +1589,20 @@ def capture_incident(
     created_utc: str | None = None,
 ) -> dict[str, Any]:
     """Capture an incident and atomically publish it at ``output``."""
-    if kind not in {"ktest", "cluster"}:
-        raise IncidentError("incident source kind must be 'ktest' or 'cluster'")
+    if kind not in {"ktest", "cluster", "live"}:
+        raise IncidentError(
+            "incident source kind must be 'ktest', 'cluster', or 'live'"
+        )
     limits = limits.effective()
     repo_root = repo_root.resolve()
+    evidence = _normalize_live_evidence(live_evidence, repo_root)
+    live_metadata = (
+        _live_capture_metadata(config, repo_root, limits)
+        if kind == "live"
+        else LiveCaptureMetadata(
+            topology={"nodes": []}, logs={}, binaries={}, snapshot={}
+        )
+    )
     output = _absolute(output, repo_root)
     output.parent.mkdir(parents=True, exist_ok=True)
     if os.path.lexists(output):
@@ -1327,11 +1637,100 @@ def capture_incident(
             redact=False,
         )
 
+        # Live artifacts are individually named inputs.  Descriptor-derived
+        # logs and binaries must exactly match their version-1 allowlist entry;
+        # local coredumps retain the same strict basename boundary as fetched
+        # guest coredumps.  The caller never controls a bundle member path or an
+        # input directory walk.
+        live_binary_members: dict[str, str] = {}
+        for index, (evidence_kind, source, safe_name) in enumerate(evidence):
+            node_id = None
+            clock_domain = None
+            declared_build_id = None
+            source_key = str(_lexical_absolute(source, repo_root))
+            if evidence_kind in {"serial-log", "qemu-log"}:
+                allowed_log = live_metadata.logs.get(source_key)
+                if allowed_log is None or allowed_log[0] != evidence_kind:
+                    raise IncidentError(
+                        f"{evidence_kind} is absent from the live descriptor allowlist"
+                    )
+                node_id = allowed_log[1]
+                suffix = (
+                    "boot-monotonic"
+                    if evidence_kind == "serial-log"
+                    else "qemu-process"
+                )
+                clock_domain = f"node-{node_id}-{suffix}"
+            elif evidence_kind == "binary":
+                allowed_binary = live_metadata.binaries.get(source_key)
+                if allowed_binary is None:
+                    raise IncidentError(
+                        "binary is absent from the live descriptor allowlist"
+                    )
+                node_id, declared_build_id = allowed_binary
+            elif evidence_kind == "coredump":
+                if (
+                    LIVE_COREDUMP_NAME_RE.fullmatch(source.name) is None
+                    or len(source.name.encode("utf-8")) > 255
+                ):
+                    raise IncidentError(
+                        "live coredump evidence must name one *_coredump.bin file"
+                    )
+                if len(live_metadata.topology["nodes"]) == 1:
+                    node_id = live_metadata.topology["nodes"][0]["id"]
+
+            if evidence_kind == "binary":
+                destination = f"binaries/live/{index:03d}-{safe_name}"
+            elif evidence_kind in {"serial-log", "qemu-log"}:
+                destination = (
+                    f"nodes/node-{node_id}/live/{index:03d}-{safe_name}"
+                )
+            elif evidence_kind == "coredump":
+                node_component = "unknown" if node_id is None else str(node_id)
+                destination = (
+                    f"live/node-{node_component}/coredumps/{index:03d}-{safe_name}"
+                )
+            else:
+                destination = f"live/{evidence_kind}/{index:03d}-{safe_name}"
+
+            member = builder.add_file(
+                source,
+                destination,
+                kind=evidence_kind,
+                required=True,
+                allow_truncate=False,
+                node_id=node_id,
+                detect_build_id=evidence_kind == "binary",
+                clock_domain=clock_domain,
+            )
+            if member is not None and evidence_kind == "binary":
+                logical_name = source.stem
+                live_binary_members[logical_name] = member["path"]
+                if source.name == "wos":
+                    live_binary_members["kernel"] = member["path"]
+                actual_build_id = member.get("buildId")
+                if declared_build_id is not None:
+                    if actual_build_id is None:
+                        builder.error(
+                            "build-id-missing",
+                            _source_name(source),
+                            "live binary lacks its descriptor-declared build ID",
+                            required=True,
+                        )
+                    elif actual_build_id != declared_build_id:
+                        builder.error(
+                            "build-id-mismatch",
+                            _source_name(source),
+                            "live binary build ID does not match the descriptor",
+                            required=True,
+                        )
+
         # Preserve symbol-bearing executables before large text logs consume the
         # total-byte budget.  This list is fixed rather than recursive.
         build_dir = _absolute(build_dir, repo_root)
-        binary_members: dict[str, str] = {}
-        for logical_name, relative in BINARY_CANDIDATES:
+        binary_members: dict[str, str] = dict(live_binary_members)
+        binary_candidates = () if kind == "live" else BINARY_CANDIDATES
+        for logical_name, relative in binary_candidates:
             source = build_dir / relative
             try:
                 source.lstat()
@@ -1452,6 +1851,17 @@ def capture_incident(
             )
         )
         effective_profile = profile or detect_build_profile(build_dir)
+        capture_metadata: dict[str, Any] = {
+            "complete": run_complete and not builder.required_error,
+            "errors": builder.errors,
+            "redactions": builder.redactions,
+            "truncatedMembers": sorted(
+                member["path"] for member in builder.members if member["truncated"]
+            ),
+        }
+        if kind == "live":
+            capture_metadata["liveSnapshot"] = live_metadata.snapshot
+
         manifest: dict[str, Any] = {
             "format": INCIDENT_FORMAT,
             "version": INCIDENT_VERSION,
@@ -1464,14 +1874,7 @@ def capture_incident(
                 "profile": effective_profile,
                 "configMember": config_member,
             },
-            "capture": {
-                "complete": run_complete and not builder.required_error,
-                "errors": builder.errors,
-                "redactions": builder.redactions,
-                "truncatedMembers": sorted(
-                    member["path"] for member in builder.members if member["truncated"]
-                ),
-            },
+            "capture": capture_metadata,
             "limits": {
                 "maxMembers": limits.max_members,
                 "maxFileBytes": limits.max_file_bytes,
@@ -1480,7 +1883,11 @@ def capture_incident(
                 "maxManifestBytes": DEFAULT_MAX_MANIFEST_BYTES,
             },
             "clocks": _clock_manifest(builder.members),
-            "topology": topology_manifest(node_specs),
+            "topology": (
+                live_metadata.topology
+                if kind == "live" and live_metadata.topology["nodes"]
+                else topology_manifest(node_specs)
+            ),
             "members": builder.members,
         }
         identity_payload = dict(manifest)
@@ -1562,6 +1969,8 @@ def _load_regular_json(path: Path, *, repo_root: Path) -> dict[str, Any]:
 
 
 def _cli_node_specs(kind: str, config: dict[str, Any]) -> list[dict[str, Any]]:
+    if kind == "live":
+        return []
     if kind == "ktest":
         return [node_setup.normalize_node_spec(config)]
     import cluster_setup
@@ -1581,7 +1990,9 @@ def main(argv: list[str] | None = None) -> int:
     capture_parser = subparsers.add_parser(
         "capture", help="Capture current WOS run artifacts"
     )
-    capture_parser.add_argument("--kind", choices=("ktest", "cluster"), required=True)
+    capture_parser.add_argument(
+        "--kind", choices=("ktest", "cluster", "live"), required=True
+    )
     capture_parser.add_argument("--config", help="Source VM/cluster config")
     capture_parser.add_argument("--build-dir", help="Matching CMake build directory")
     capture_parser.add_argument("--profile", help="Build profile override")
@@ -1604,6 +2015,18 @@ def main(argv: list[str] | None = None) -> int:
         metavar="HOST:/tmp/NAME_coredump.bin",
         help="Fetch one explicit live tmpfs coredump over the existing SFTP helper",
     )
+    capture_parser.add_argument(
+        "--live-evidence",
+        action="append",
+        default=[],
+        type=_live_evidence_argument,
+        metavar="KIND=PATH",
+        help=(
+            "Capture one exact regular live artifact; descriptor-allowlisted "
+            "serial-log, qemu-log, and binary plus strict local coredump inputs "
+            "are supported; may be repeated"
+        ),
+    )
     capture_parser.add_argument("--max-members", type=int, default=DEFAULT_MAX_MEMBERS)
     capture_parser.add_argument(
         "--max-file-bytes", type=int, default=DEFAULT_MAX_FILE_BYTES
@@ -1613,16 +2036,23 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    config_default = (
-        "configs/node_ktest.json" if args.kind == "ktest" else "configs/cluster.json"
-    )
-    config_path = _absolute(Path(args.config or config_default), ROOT)
-    config = _load_regular_json(config_path, repo_root=ROOT)
+    config_default = {
+        "ktest": "configs/node_ktest.json",
+        "cluster": "configs/cluster.json",
+    }.get(args.kind)
+    if args.config is None and config_default is None:
+        config_path = ROOT / "live-session.json"
+        config = {}
+    else:
+        config_path = _absolute(Path(args.config or config_default), ROOT)
+        config = _load_regular_json(config_path, repo_root=ROOT)
     node_specs = _cli_node_specs(args.kind, config)
     if args.build_dir:
         build_dir = Path(args.build_dir)
     elif args.kind == "ktest":
         build_dir = Path(config.get("build", {}).get("dir", "build-ktest"))
+    elif args.kind == "live" and isinstance(config.get("buildDir"), str):
+        build_dir = Path(config["buildDir"])
     else:
         build_dir = Path("build")
     manifest = capture_incident(
@@ -1636,6 +2066,7 @@ def main(argv: list[str] | None = None) -> int:
         profile=args.profile,
         coverage_manifests=[Path(path) for path in args.coverage_manifest],
         live_coredumps=args.live_coredump,
+        live_evidence=args.live_evidence,
         repo_root=ROOT,
         limits=CaptureLimits(
             max_members=args.max_members,

@@ -112,7 +112,12 @@ def test_public_entrypoint_and_help(module) -> None:
         timeout=10,
     )
     assert_equal(result.returncode, 0, "wos-incident capture --help")
-    for flag in ("--archive", "--coverage-manifest", "--live-coredump"):
+    for flag in (
+        "--archive",
+        "--coverage-manifest",
+        "--live-coredump",
+        "--live-evidence",
+    ):
         if flag not in result.stdout:
             raise AssertionError(f"public help is missing {flag}")
 
@@ -813,6 +818,528 @@ def test_append_growth_is_truncated_and_limits_are_loader_compatible(module) -> 
         assert_equal(oversized_output.exists(), False, "oversized manifest output")
 
 
+def test_live_evidence_is_exact_deterministic_and_loader_compatible(module) -> None:
+    with tempfile.TemporaryDirectory(prefix="wosincident-live-test-") as temporary:
+        tmp = Path(temporary)
+        sources = tmp / "evidence"
+        sources.mkdir()
+        evidence = [
+            ("live-session", sources / "session.json"),
+            ("live-transcript", sources / "transcript.jsonl"),
+            ("register-snapshot", sources / "registers.json"),
+            ("memory-snapshot", sources / "memory.bin"),
+        ]
+        payloads = {
+            "session.json": b'{"version":1,"session":"stable"}\n',
+            "transcript.jsonl": b'{"seq":1,"request":"read"}\n',
+            "registers.json": b'{"rip":"0xffffffff80001000"}\n',
+            "memory.bin": bytes(range(64)),
+        }
+        for _, path in evidence:
+            path.write_bytes(payloads[path.name])
+
+        def capture_live(output: Path, entries, *, archive: bool):
+            return module.capture_incident(
+                output=output,
+                archive=archive,
+                kind="live",
+                config={},
+                config_path=tmp / "live-session.json",
+                node_specs=[],
+                build_dir=tmp / "unused-build",
+                live_evidence=entries,
+                repo_root=tmp,
+                created_utc="2026-08-09T00:00:00Z",
+            )
+
+        directory = tmp / "live.wosincident"
+        archive_a = tmp / "live-a.wosincident"
+        archive_b = tmp / "live-b.wosincident"
+        manifest = capture_live(directory, evidence, archive=False)
+        archived_a = capture_live(archive_a, reversed(evidence), archive=True)
+        archived_b = capture_live(archive_b, evidence, archive=True)
+
+        assert_equal(manifest["source"]["kind"], "live", "live source kind")
+        assert_equal(manifest["capture"]["complete"], True, "live capture status")
+        assert_equal(manifest["topology"], {"nodes": []}, "live topology")
+        assert_equal(
+            manifest["clocks"],
+            {"quality": "unavailable", "domains": []},
+            "live clock declaration",
+        )
+        members = [
+            member
+            for member in manifest["members"]
+            if member["kind"] in module.LIVE_EVIDENCE_KINDS
+        ]
+        assert_equal(len(members), 4, "live member count")
+        assert_equal(
+            {member["kind"] for member in members},
+            module.LIVE_SESSION_EVIDENCE_KINDS,
+            "live member kinds",
+        )
+        for member in members:
+            data = (directory / member["path"]).read_bytes()
+            assert_equal(data, payloads[member["sourceName"]], "exact live evidence")
+            assert_equal(member["required"], True, "required live evidence")
+            assert_equal(member["truncated"], False, "untruncated live evidence")
+            if not member["path"].startswith(f"live/{member['kind']}/"):
+                raise AssertionError(f"unsafe live destination: {member!r}")
+
+        persisted = (directory / "manifest.json").read_text()
+        if str(tmp) in persisted:
+            raise AssertionError("live manifest leaked an absolute host path")
+        assert_equal(
+            manifest["incidentId"], archived_a["incidentId"], "live order identity"
+        )
+        assert_equal(
+            archived_a["incidentId"],
+            archived_b["incidentId"],
+            "repeat live identity",
+        )
+        assert_equal(
+            archive_a.read_bytes(), archive_b.read_bytes(), "deterministic live archive"
+        )
+
+        # When a locally built debugger is present, exercise the actual reopen
+        # boundary in addition to the writer-side v1 manifest assertions.
+        wosdbg = ROOT / "tools" / "build" / "bin" / "wosdbg"
+        if wosdbg.is_file() and os.access(wosdbg, os.X_OK):
+            result = subprocess.run(
+                [
+                    str(wosdbg),
+                    "--tool",
+                    "validate_incident",
+                    "--arguments",
+                    json.dumps({"path": str(directory)}),
+                ],
+                cwd=tmp,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+            if result.returncode not in {0, 1}:
+                raise AssertionError(
+                    "WOSDBG live incident reopen returned "
+                    f"{result.returncode}: {result.stderr}"
+                )
+            validation = json.loads(result.stdout)
+            if validation.get("valid") is not True:
+                raise AssertionError(f"WOSDBG live validation failed: {validation!r}")
+
+
+def test_live_evidence_rejects_kinds_and_unsafe_sources(module) -> None:
+    for value in (
+        "coverage-artifact=artifact.bin",
+        "unknown=artifact.bin",
+        "live-session",
+        "=artifact.bin",
+        "live-session=",
+    ):
+        try:
+            module._parse_live_evidence(value)
+        except module.IncidentError:
+            pass
+        else:
+            raise AssertionError(f"invalid live evidence argument accepted: {value!r}")
+
+    with tempfile.TemporaryDirectory(prefix="wosincident-live-safe-test-") as temporary:
+        tmp = Path(temporary)
+        root = tmp / "root"
+        nested = root / "nested"
+        nested.mkdir(parents=True)
+        outside = tmp / "outside.bin"
+        outside.write_bytes(b"outside")
+        real = root / "real.bin"
+        real.write_bytes(b"symlink target")
+        symlink = root / "link.bin"
+        symlink.symlink_to(real)
+        oversized = root / "oversized.bin"
+        oversized.write_bytes(b"x" * 65)
+        forbidden = root / "private.pem"
+        forbidden.write_bytes(b"private")
+
+        output = tmp / "unsafe-live.wosincident"
+        manifest = module.capture_incident(
+            output=output,
+            archive=False,
+            kind="live",
+            config={},
+            config_path=root / "live-session.json",
+            node_specs=[],
+            build_dir=root / "unused-build",
+            live_evidence=[
+                ("live-session", nested / ".." / ".." / outside.name),
+                ("live-transcript", symlink),
+                ("register-snapshot", forbidden),
+                ("memory-snapshot", oversized),
+            ],
+            repo_root=root,
+            limits=module.CaptureLimits(
+                max_members=16,
+                max_file_bytes=64,
+                max_total_bytes=256,
+            ),
+            created_utc="2026-08-09T00:00:00Z",
+        )
+        assert_equal(manifest["capture"]["complete"], False, "unsafe live status")
+        assert_equal(
+            {error["code"] for error in manifest["capture"]["errors"]},
+            {"forbidden", "outside-root", "size-limit", "unsafe-type"},
+            "unsafe live rejection codes",
+        )
+        if any(
+            member["kind"] in module.LIVE_EVIDENCE_KINDS
+            for member in manifest["members"]
+        ):
+            raise AssertionError("unsafe live evidence entered the bundle")
+        if str(tmp) in (output / "manifest.json").read_text():
+            raise AssertionError("unsafe live errors leaked an absolute host path")
+
+        rejected_output = tmp / "bad-kind.wosincident"
+        try:
+            module.capture_incident(
+                output=rejected_output,
+                archive=False,
+                kind="live",
+                config={},
+                config_path=root / "live-session.json",
+                node_specs=[],
+                build_dir=root / "unused-build",
+                live_evidence=[("binary", real)],
+                repo_root=root,
+            )
+        except module.IncidentError:
+            pass
+        else:
+            raise AssertionError("non-allowlisted live binary was accepted")
+        assert_equal(rejected_output.exists(), False, "rejected live output")
+
+
+def test_live_descriptor_populates_topology_and_allowlisted_evidence(module) -> None:
+    with tempfile.TemporaryDirectory(prefix="wosincident-live-v1-test-") as temporary:
+        tmp = Path(temporary)
+        sources = tmp / "runtime"
+        sources.mkdir()
+        serial = sources / "serial-vm7.log"
+        qemu = sources / "qemu-vm7.log"
+        binary = sources / "testprog"
+        coredump = sources / "testprog_123_coredump.bin"
+        transcript = sources / "transcript.json"
+        registers = sources / "registers.json"
+        memory = sources / "memory.bin"
+        serial.write_text("[0.100] live node\n")
+        qemu.write_text("qemu live\n")
+        binary.write_bytes(b"ELF-live-testprog")
+        coredump.write_bytes(b"WOSCOREDUMP")
+        transcript.write_text('{"records":[]}\n')
+        registers.write_text('{"rip":"0x1000"}\n')
+        memory.write_bytes(bytes(range(32)))
+
+        descriptor = {
+            "format": "wosdbg-live",
+            "version": 1,
+            "state": "snapshot",
+            "topology": {
+                "nodes": [
+                    {"nodeId": "7", "hostname": "qemu-node-7"},
+                    {"nodeId": "8", "hostname": "qemu-node-8"},
+                ],
+                "zones": [],
+            },
+            "session": {
+                "format": "wosdbg-live",
+                "version": 1,
+                "sessionId": "redacted-in-fixture",
+                "targets": [
+                    {
+                        "id": "qemu-node-7",
+                        "nodeId": "7",
+                        "pauseMode": "qmp-lease",
+                    },
+                    {
+                        "id": "qemu-node-8",
+                        "nodeId": "8",
+                        "pauseMode": "qmp-lease",
+                    },
+                ],
+            },
+            "captureSources": {
+                "format": "wosdbg-live",
+                "version": 1,
+                "targets": [
+                    {
+                        "id": "qemu-node-7",
+                        "nodeId": "7",
+                        "logPaths": [str(serial), str(qemu)],
+                        "symbolPath": str(binary),
+                        "localBuildId": "aabbccdd",
+                    },
+                    {
+                        "id": "qemu-node-8",
+                        "nodeId": "8",
+                        "logPaths": [],
+                        "symbolPath": str(binary),
+                        "localBuildId": "aabbccdd",
+                    },
+                ],
+            },
+            "captures": [
+                {
+                    "targetId": "qemu-node-7",
+                    "nodeId": "7",
+                    "captureStartedUnixNs": "1770000000000000000",
+                    "captureFinishedUnixNs": "1770000000000001000",
+                    "complete": True,
+                },
+                {
+                    "targetId": "qemu-node-8",
+                    "nodeId": "8",
+                    "captureStartedUnixNs": "1770000000000002000",
+                    "captureFinishedUnixNs": "1770000000000003000",
+                    "complete": False,
+                },
+            ],
+            "clock": {
+                "domain": "host-realtime",
+                "quality": "host-sequential-snapshots",
+                "globalGuestOrderAvailable": False,
+                "complete": False,
+            },
+        }
+        descriptor_path = sources / "live-debug.json"
+        descriptor_path.write_text(json.dumps(descriptor))
+        evidence = [
+            ("live-transcript", transcript),
+            ("register-snapshot", registers),
+            ("memory-snapshot", memory),
+            ("serial-log", serial),
+            ("qemu-log", qemu),
+            ("coredump", coredump),
+            ("binary", binary),
+            ("binary", binary),
+        ]
+
+        old_read_build_id = module._read_build_id
+        module._read_build_id = lambda path: (
+            "aabbccdd" if Path(path).name.endswith("testprog") else None
+        )
+        try:
+            output = tmp / "live-v1.wosincident"
+            manifest = module.capture_incident(
+                output=output,
+                archive=False,
+                kind="live",
+                config=descriptor,
+                config_path=descriptor_path,
+                node_specs=[],
+                build_dir=tmp / "build",
+                live_evidence=evidence,
+                repo_root=tmp,
+                created_utc="2026-08-09T00:00:00Z",
+            )
+        finally:
+            module._read_build_id = old_read_build_id
+
+        assert_equal(
+            manifest["topology"],
+            {
+                "nodes": [
+                    {
+                        "debug": True,
+                        "hostname": "qemu-node-7",
+                        "id": 7,
+                        "nics": [],
+                    },
+                    {
+                        "debug": True,
+                        "hostname": "qemu-node-8",
+                        "id": 8,
+                        "nics": [],
+                    },
+                ]
+            },
+            "runtime descriptor topology",
+        )
+        members = {member["kind"]: member for member in manifest["members"]}
+        for kind in (
+            "live-transcript",
+            "register-snapshot",
+            "memory-snapshot",
+            "serial-log",
+            "qemu-log",
+            "coredump",
+            "binary",
+        ):
+            if kind not in members:
+                raise AssertionError(f"live descriptor evidence omitted {kind}")
+            member = members[kind]
+            data = (output / member["path"]).read_bytes()
+            assert_equal(
+                hashlib.sha256(data).hexdigest(),
+                member["sha256"],
+                f"live {kind} integrity",
+            )
+            assert_equal(member["truncated"], False, f"live {kind} truncation")
+        assert_equal(members["serial-log"]["nodeId"], 7, "serial node")
+        assert_equal(
+            members["serial-log"]["clockDomain"],
+            "node-7-boot-monotonic",
+            "serial clock",
+        )
+        assert_equal(members["qemu-log"]["nodeId"], 7, "qemu node")
+        assert_equal(members["binary"]["buildId"], "aabbccdd", "binary build ID")
+        assert_equal(
+            members["coredump"]["binary"],
+            members["binary"]["path"],
+            "coredump binary association",
+        )
+        assert_equal(manifest["capture"]["complete"], True, "live v1 capture")
+        assert_equal(
+            manifest["capture"]["liveSnapshot"],
+            {
+                "format": "wosdbg-live",
+                "version": 1,
+                "state": "snapshot",
+                "captureCount": 2,
+                "completeCount": 1,
+                "captures": [
+                    {
+                        "targetId": "qemu-node-7",
+                        "nodeId": 7,
+                        "startedUnixNs": "1770000000000000000",
+                        "finishedUnixNs": "1770000000000001000",
+                        "complete": True,
+                    },
+                    {
+                        "targetId": "qemu-node-8",
+                        "nodeId": 8,
+                        "startedUnixNs": "1770000000000002000",
+                        "finishedUnixNs": "1770000000000003000",
+                        "complete": False,
+                    },
+                ],
+                "clock": {
+                    "domain": "host-realtime",
+                    "quality": "host-sequential-snapshots",
+                    "globalGuestOrderAvailable": False,
+                    "complete": False,
+                },
+            },
+            "live capture manifest metadata",
+        )
+
+        wosdbg = ROOT / "tools" / "build" / "bin" / "wosdbg"
+        if wosdbg.is_file() and os.access(wosdbg, os.X_OK):
+            result = subprocess.run(
+                [
+                    str(wosdbg),
+                    "--tool",
+                    "validate_incident",
+                    "--arguments",
+                    json.dumps({"path": str(output)}),
+                ],
+                cwd=tmp,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+            validation = json.loads(result.stdout)
+            manifest_issues = [
+                issue
+                for issue in validation.get("issues", [])
+                if str(issue.get("code", "")).startswith("manifest_")
+            ]
+            if validation.get("ok") is not True or manifest_issues:
+                raise AssertionError(
+                    f"WOSDBG live descriptor validation failed: {validation!r}"
+                )
+
+
+def test_live_descriptor_rejects_unlisted_artifact_paths(module) -> None:
+    with tempfile.TemporaryDirectory(prefix="wosincident-live-policy-test-") as temporary:
+        tmp = Path(temporary)
+        allowed_log = tmp / "serial-vm0.log"
+        other_log = tmp / "serial-other.log"
+        allowed_binary = tmp / "wos"
+        other_binary = tmp / "other"
+        for path in (allowed_log, other_log, allowed_binary, other_binary):
+            path.write_bytes(b"data")
+        config = {
+            "format": "wosdbg-live",
+            "version": 1,
+            "topology": {"nodes": [{"nodeId": 0, "hostname": "wos-0"}]},
+            "targets": [
+                {
+                    "nodeId": 0,
+                    "hostname": "wos-0",
+                    "logPaths": [str(allowed_log)],
+                    "symbolPath": str(allowed_binary),
+                }
+            ],
+        }
+        for index, evidence in enumerate(
+            [
+                [("serial-log", other_log)],
+                [("binary", other_binary)],
+                [("coredump", tmp / "arbitrary.bin")],
+            ]
+        ):
+            if evidence[0][0] == "coredump":
+                evidence[0][1].write_bytes(b"data")
+            output = tmp / f"rejected-{index}.wosincident"
+            try:
+                module.capture_incident(
+                    output=output,
+                    archive=False,
+                    kind="live",
+                    config=config,
+                    config_path=tmp / "live.json",
+                    node_specs=[],
+                    build_dir=tmp / "build",
+                    live_evidence=evidence,
+                    repo_root=tmp,
+                )
+            except module.IncidentError:
+                pass
+            else:
+                raise AssertionError(f"unlisted live artifact was accepted: {evidence}")
+            assert_equal(output.exists(), False, "rejected live artifact output")
+
+
+def test_live_evidence_cli_captures_one_explicit_file(module) -> None:
+    with tempfile.TemporaryDirectory(prefix="wosincident-live-cli-test-") as temporary:
+        output = Path(temporary) / "cli-live.wosincident"
+        source = ROOT / "scripts" / "debug" / "wosincident.py"
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            status = module.main(
+                [
+                    "capture",
+                    "--kind",
+                    "live",
+                    "--live-evidence",
+                    f"live-session={source}",
+                    "--output",
+                    str(output),
+                ]
+            )
+        assert_equal(status, 0, "live evidence CLI status")
+        manifest = json.loads((output / "manifest.json").read_text())
+        assert_equal(manifest["source"]["kind"], "live", "CLI live source")
+        live_members = [
+            member for member in manifest["members"] if member["kind"] == "live-session"
+        ]
+        assert_equal(len(live_members), 1, "CLI live member count")
+        assert_equal(
+            (output / live_members[0]["path"]).read_bytes(),
+            source.read_bytes(),
+            "CLI exact live evidence",
+        )
+
+
 def test_launcher_help_exposes_capture_hooks(_module) -> None:
     for command in (
         [str(ROOT / "bin" / "wos-ktest"), "--help"],
@@ -847,6 +1374,11 @@ def main() -> None:
         test_sftp_batch_paths_are_quoted_and_controls_are_rejected,
         test_builder_enforces_member_total_path_and_special_file_limits,
         test_append_growth_is_truncated_and_limits_are_loader_compatible,
+        test_live_evidence_is_exact_deterministic_and_loader_compatible,
+        test_live_evidence_rejects_kinds_and_unsafe_sources,
+        test_live_descriptor_populates_topology_and_allowlisted_evidence,
+        test_live_descriptor_rejects_unlisted_artifact_paths,
+        test_live_evidence_cli_captures_one_explicit_file,
         test_launcher_help_exposes_capture_hooks,
     ]
     for test in tests:

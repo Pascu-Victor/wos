@@ -38,6 +38,7 @@ static constexpr uint32_t SHT_NOTE = 7;
 static constexpr uint32_t SHT_DYNSYM = 11;
 static constexpr uint32_t NT_GNU_BUILD_ID = 3;
 static constexpr uint64_t SHF_ALLOC = 0x2;
+static constexpr uint8_t STT_OBJECT = 1;
 static constexpr uint8_t STT_FUNC = 2;
 static constexpr uint8_t STT_NOTYPE = 0;
 
@@ -354,7 +355,10 @@ std::unique_ptr<SymbolTable> parse_elf_symtab(const uint8_t* elf, size_t len) {
         sym_off += entsize;
 
         uint8_t stt = st_info & 0xF;
-        if (stt != STT_FUNC && stt != STT_NOTYPE) {
+        // Data symbols are required for verified live inspection of kernel
+        // state such as the HHDM offset. Their declared sizes also keep the
+        // nearest-symbol resolver from attributing unrelated addresses.
+        if (stt != STT_FUNC && stt != STT_OBJECT && stt != STT_NOTYPE) {
             continue;
         }
         if (st_value == 0) {

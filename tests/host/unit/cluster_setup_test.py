@@ -15,6 +15,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[3]
 CLUSTER_SETUP = ROOT / "scripts" / "cluster" / "cluster_setup.py"
 CLUSTER_DIR = CLUSTER_SETUP.parent
+KTEST_SETUP = ROOT / "scripts" / "test" / "ktest_setup.py"
 USB_HOTPLUG = ROOT / "scripts" / "test" / "usb_hotplug_stress.py"
 WKI_CHAOS_CONFIGS = {
     "ethernet": ROOT / "configs" / "cluster_wki_chaos.json",
@@ -614,6 +615,320 @@ def test_generic_qmp_socket_is_opt_in_and_independent_of_usb(module) -> None:
         raise AssertionError("generic QMP unexpectedly enabled xHCI")
 
 
+def test_debug_nodes_get_qmp_and_loopback_only_debug_sockets(module) -> None:
+    node_setup = module.node_setup
+    with tempfile.TemporaryDirectory() as temporary:
+        state = Path(temporary)
+        debug_spec = {
+            "id": 4,
+            "vm": {"overlay_dir": str(state)},
+        }
+        assert_equal(
+            node_setup.qmp_socket_path(debug_spec),
+            None,
+            "ordinary node QMP remains opt-in",
+        )
+
+        old_prepare = node_setup.prepare_node_overlays
+        old_cleanup = node_setup.cleanup_node_logs
+        node_setup.prepare_node_overlays = lambda _spec, log=print: (
+            state / "disk0-overlay",
+            state / "disk1-overlay",
+        )
+        node_setup.cleanup_node_logs = lambda _spec: None
+        try:
+            args = node_setup.build_qemu_args(
+                debug_spec,
+                force_debug=True,
+                log=lambda _line: None,
+            )
+        finally:
+            node_setup.prepare_node_overlays = old_prepare
+            node_setup.cleanup_node_logs = old_cleanup
+
+        qmp = state / "qmp-vm4.sock"
+        qmp_index = args.index(f"unix:{qmp},server=on,wait=off")
+        assert_equal(args[qmp_index - 1], "-qmp", "forced debug QMP option")
+        for expected in (
+            "tcp:127.0.0.1:1238",
+            "socket,id=debugger,port=23460,host=127.0.0.1,server=on,wait=off,telnet=on",
+            "tcp:127.0.0.1:3006,server,nowait",
+        ):
+            if expected not in args:
+                raise AssertionError(f"missing loopback debug endpoint {expected!r}")
+        if "0.0.0.0" in " ".join(args):
+            raise AssertionError("debug QEMU arguments expose a wildcard TCP bind")
+
+
+def test_live_debug_descriptor_is_private_atomic_and_nonce_owned(module) -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        path = Path(temporary) / "state" / "live.json"
+        first = {
+            "format": module.LIVE_DEBUG_DESCRIPTOR_FORMAT,
+            "version": module.LIVE_DEBUG_DESCRIPTOR_VERSION,
+            "state": "running",
+            "launchNonce": "first",
+        }
+        second = dict(first, launchNonce="second")
+
+        resolved = module.atomic_write_live_debug_descriptor(path, first)
+        assert_equal(resolved, path.resolve(), "resolved descriptor path")
+        assert_equal(path.stat().st_mode & 0o777, 0o600, "private descriptor mode")
+        assert_equal(json.loads(path.read_text()), first, "first descriptor payload")
+
+        module.atomic_write_live_debug_descriptor(path, second)
+        if module.remove_live_debug_descriptor(path, "first"):
+            raise AssertionError("old launch nonce removed a newer descriptor")
+        assert_equal(
+            json.loads(path.read_text()), second, "new descriptor survived old cleanup"
+        )
+        assert_equal(
+            module.remove_live_debug_descriptor(path, "second"),
+            True,
+            "owning launch removes descriptor",
+        )
+        if path.exists():
+            raise AssertionError("owned descriptor remained after cleanup")
+        leftovers = list(path.parent.glob(f".{path.name}.*.tmp"))
+        assert_equal(leftovers, [], "atomic descriptor temporary cleanup")
+
+
+def test_live_debug_descriptor_schema_and_process_identity(module) -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        config = sample_config()
+        config["zones"][0]["vm"] = {
+            "overlay_dir": str(root / "overlays"),
+            "serial_log": str(root / "serial-vm0.log"),
+            "qemu_log": str(root / "qemu-vm0.log"),
+        }
+        nodes = module.collect_unique_nodes(config)
+
+        class FakeProcess:
+            def __init__(self, pid):
+                self.pid = pid
+
+        results = [
+            module.LaunchResult(
+                node_id=node_id, process=FakeProcess(9000 + node_id), lines=[]
+            )
+            for node_id in sorted(nodes)
+        ]
+        old_start_ticks = module.process_start_ticks
+        old_boot_id = module.host_boot_id
+        module.process_start_ticks = lambda pid: pid + 100
+        module.host_boot_id = lambda: "test-boot-id"
+        try:
+            descriptor = module.build_live_debug_descriptor(
+                config,
+                nodes,
+                results,
+                launch_nonce="0123456789abcdef",
+                topology_kind="cluster",
+                config_path=root / "cluster.json",
+                build_dir=root / "build",
+                symbol_path=root / "build/modules/kern/wos",
+                tcg_level=None,
+                debug_nodes={1},
+            )
+        finally:
+            module.process_start_ticks = old_start_ticks
+            module.host_boot_id = old_boot_id
+
+        for key, expected in (
+            ("format", "wosdbg-live"),
+            ("version", 1),
+            ("state", "running"),
+            ("launchNonce", "0123456789abcdef"),
+            ("kind", "cluster"),
+            ("bootId", "test-boot-id"),
+        ):
+            assert_equal(descriptor[key], expected, f"descriptor {key}")
+        assert_equal(
+            descriptor["topology"]["nodes"],
+            [
+                {"nodeId": 0, "hostname": "wos-0"},
+                {"nodeId": 1, "hostname": "wos-1"},
+            ],
+            "normalized descriptor nodes",
+        )
+        targets = {target["nodeId"]: target for target in descriptor["targets"]}
+        assert_equal(targets[0]["port"], None, "non-debug target has no GDB port")
+        assert_equal(
+            targets[0]["qmpSocket"], None, "non-debug target has no implicit QMP"
+        )
+        assert_equal(targets[1]["host"], "127.0.0.1", "debug GDB host")
+        assert_equal(targets[1]["port"], 1235, "debug GDB port")
+        assert_equal(targets[1]["processStartTicks"], "9101", "process identity")
+        expected_qmp = (root / "overlays/qmp-vm1.sock").resolve()
+        assert_equal(Path(targets[1]["qmpSocket"]), expected_qmp, "debug QMP path")
+        for key in ("configPath", "buildDir", "symbolPath"):
+            if not Path(descriptor[key]).is_absolute():
+                raise AssertionError(f"descriptor {key} is not absolute")
+        for target in targets.values():
+            if any(not Path(path).is_absolute() for path in target["logPaths"]):
+                raise AssertionError(f"target log path is not absolute: {target!r}")
+
+        proc_root = root / "proc"
+        process_dir = proc_root / "77"
+        process_dir.mkdir(parents=True)
+        fields = ["S", *("0" for _ in range(18)), "424242"]
+        (process_dir / "stat").write_text(f"77 (qemu ) worker) {' '.join(fields)}\n")
+        assert_equal(
+            module.process_start_ticks(77, proc_root),
+            424242,
+            "comm-safe /proc start identity",
+        )
+
+
+def test_launch_lifecycle_publishes_then_removes_descriptor(module) -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        descriptor_path = root / "live.json"
+        config = sample_config()
+        config["zones"][0]["vm"] = {"overlay_dir": str(root / "overlays")}
+        observed = []
+
+        class FakeProcess:
+            def __init__(self, pid):
+                self.pid = pid
+                self.returncode = 0
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self, timeout=None):
+                if timeout is not None:
+                    raise AssertionError("completed fake process used a timeout")
+                observed.append(json.loads(descriptor_path.read_text()))
+                return self.returncode
+
+        def fake_launch_one_vm(
+            node_id,
+            _node_info,
+            _config,
+            _tcg_level,
+            _debug_nodes,
+            processes,
+            processes_lock,
+            _stopping,
+        ):
+            process = FakeProcess(7000 + node_id)
+            with processes_lock:
+                processes.append(process)
+            return module.LaunchResult(node_id=node_id, process=process, lines=[])
+
+        old_setup = module.setup
+        old_provision = module.provision_wki_auth
+        old_launch_one_vm = module.launch_one_vm
+        old_start_ticks = module.process_start_ticks
+        old_boot_id = module.host_boot_id
+        old_sigint = module.signal.getsignal(module.signal.SIGINT)
+        old_sigterm = module.signal.getsignal(module.signal.SIGTERM)
+        module.setup = lambda _config: None
+        module.provision_wki_auth = lambda _nodes: {}
+        module.launch_one_vm = fake_launch_one_vm
+        module.process_start_ticks = lambda pid: pid + 50
+        module.host_boot_id = lambda: "lifecycle-boot"
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                module.launch_guarded(
+                    config,
+                    debug_nodes={0},
+                    live_debug_descriptor=descriptor_path,
+                    config_path=root / "cluster.json",
+                    build_dir=root / "build",
+                    symbol_path=root / "build/modules/kern/wos",
+                )
+        finally:
+            module.setup = old_setup
+            module.provision_wki_auth = old_provision
+            module.launch_one_vm = old_launch_one_vm
+            module.process_start_ticks = old_start_ticks
+            module.host_boot_id = old_boot_id
+            module.signal.signal(module.signal.SIGINT, old_sigint)
+            module.signal.signal(module.signal.SIGTERM, old_sigterm)
+
+        assert_equal(len(observed), 2, "each live VM observed the published descriptor")
+        assert_equal(observed[0]["state"], "running", "published lifecycle state")
+        if descriptor_path.exists():
+            raise AssertionError("normal VM exit left a live-debug descriptor")
+
+
+def test_partial_launch_failure_removes_stale_descriptor(module) -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        descriptor_path = Path(temporary) / "live.json"
+        module.atomic_write_live_debug_descriptor(
+            descriptor_path,
+            {
+                "format": "wosdbg-live",
+                "version": 1,
+                "state": "running",
+                "launchNonce": "stale",
+            },
+        )
+        nodes = {0: {"effective": {}, "zones": []}}
+
+        def fail_launch(node_id, *_args, **_kwargs):
+            raise module.LaunchError(node_id, [], RuntimeError("synthetic failure"))
+
+        old_setup = module.setup
+        old_collect = module.collect_unique_nodes
+        old_provision = module.provision_wki_auth
+        old_launch_one_vm = module.launch_one_vm
+        old_sigint = module.signal.getsignal(module.signal.SIGINT)
+        old_sigterm = module.signal.getsignal(module.signal.SIGTERM)
+        module.setup = lambda _config: None
+        module.collect_unique_nodes = lambda _config: nodes
+        module.provision_wki_auth = lambda _nodes: {}
+        module.launch_one_vm = fail_launch
+        try:
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(
+                io.StringIO()
+            ):
+                try:
+                    module.launch_guarded(
+                        {"zones": [{"id": "GLOBAL"}]},
+                        live_debug_descriptor=descriptor_path,
+                    )
+                except module.LaunchError:
+                    pass
+                else:
+                    raise AssertionError("synthetic partial launch failure was accepted")
+        finally:
+            module.setup = old_setup
+            module.collect_unique_nodes = old_collect
+            module.provision_wki_auth = old_provision
+            module.launch_one_vm = old_launch_one_vm
+            module.signal.signal(module.signal.SIGINT, old_sigint)
+            module.signal.signal(module.signal.SIGTERM, old_sigterm)
+
+        if descriptor_path.exists():
+            raise AssertionError("partial launch failure left a stale descriptor")
+
+
+def test_cluster_and_ktest_help_expose_descriptor_override(module) -> None:
+    for script, default_path in (
+        (CLUSTER_SETUP, "cluster-overlays/live-debug.json"),
+        (KTEST_SETUP, "ktest-data/live-debug.json"),
+    ):
+        result = subprocess.run(
+            [sys.executable, str(script), "--help"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+        assert_equal(result.returncode, 0, f"{script.name} help exit")
+        compact_help = "".join(result.stdout.split())
+        for expected in ("--live-debug-descriptor", default_path):
+            if expected not in compact_help:
+                raise AssertionError(
+                    f"{script.name} help omits {expected!r}: {result.stdout!r}"
+                )
+
+
 def test_wki_chaos_transport_configs_use_isolated_artifacts(module) -> None:
     expected_nodes = {"ethernet": 3, "ivshmem": 2, "roce": 2}
     qmp_paths: set[str] = set()
@@ -1146,6 +1461,12 @@ def main() -> None:
         test_node_overlay_creation_failure_aborts_launch_prep,
         test_usb_hotplug_qemu_args_and_qmp_device_shape,
         test_generic_qmp_socket_is_opt_in_and_independent_of_usb,
+        test_debug_nodes_get_qmp_and_loopback_only_debug_sockets,
+        test_live_debug_descriptor_is_private_atomic_and_nonce_owned,
+        test_live_debug_descriptor_schema_and_process_identity,
+        test_launch_lifecycle_publishes_then_removes_descriptor,
+        test_partial_launch_failure_removes_stale_descriptor,
+        test_cluster_and_ktest_help_expose_descriptor_override,
         test_wki_chaos_transport_configs_use_isolated_artifacts,
         test_routed_wki_chaos_config_resolves_overlap_and_specs,
         test_rootless_wki_auth_config_has_no_host_link_dependency,
