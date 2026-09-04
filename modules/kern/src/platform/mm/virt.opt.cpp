@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <cstdint>
 #include <cstring>
 #include <platform/acpi/apic/apic.hpp>
@@ -37,6 +38,7 @@
 #include "platform/mm/phys.hpp"
 #include "platform/mm/reclaim.hpp"
 #include "platform/mm/reclaim_policy.hpp"
+#include "platform/mm/swap.hpp"
 #include "platform/sched/threading.hpp"
 #include "syscalls_impl/vmem/sys_vmem.hpp"
 #include "util/hcf.hpp"
@@ -57,6 +59,79 @@ sys::Spinlock cow_pte_lock;
 // Serializes leaf publication/removal with usercopy frame pin acquisition.
 // Never hold this across allocation, fault resolution, memcpy, or shootdown.
 sys::Spinlock user_mapping_pin_lock;
+
+enum class AnonymousSwapRuntimeState : uint8_t {
+    PAGEOUT,
+    SWAPPED,
+    PAGEIN,
+    FAILED,
+};
+
+struct AnonymousSwapObject {
+    swap::SwapSlot slot{};
+    uint32_t mapping_refs{};  // Serialized by cow_pte_lock.
+};
+
+struct AnonymousSwapMapping {
+    PageTable* pagemap{};
+    vaddr_t vaddr{};
+    AnonymousSwapRuntimeState state{AnonymousSwapRuntimeState::PAGEOUT};
+    AnonymousSwapObject* object{};
+    void* frame{};  // Extra pageout pin or unpublished pagein destination.
+    uint64_t original_raw{};
+    uint64_t frozen_raw{};
+    uint64_t generation{};
+    int error{};
+    bool pagein_queued{};
+    bool cancelled{};
+    // The first fault holds the pagemap read-side lifetime gate from queue
+    // publication through worker completion.  Teardown/fork therefore joins
+    // queued work as well as I/O already in progress.
+    size_t pagein_access_gate{static_cast<size_t>(-1)};
+    sched::task::Task* waiters{};
+    AnonymousSwapMapping* next{};
+};
+
+struct AnonymousSwapAtomicStats {
+    std::atomic<uint64_t> resident_candidates{};
+    std::atomic<uint64_t> swapped_pages{};
+    std::atomic<uint64_t> pageout_inflight{};
+    std::atomic<uint64_t> pagein_inflight{};
+    std::atomic<uint64_t> pageout_attempts{};
+    std::atomic<uint64_t> pageout_successes{};
+    std::atomic<uint64_t> pageout_failures{};
+    std::atomic<uint64_t> pagein_attempts{};
+    std::atomic<uint64_t> pagein_successes{};
+    std::atomic<uint64_t> pagein_failures{};
+    std::atomic<uint64_t> pagein_corruption{};
+    std::atomic<uint64_t> pageout_latency_us{};
+    std::atomic<uint64_t> pageout_latency_max_us{};
+    std::atomic<uint64_t> pagein_latency_us{};
+    std::atomic<uint64_t> pagein_latency_max_us{};
+};
+
+constexpr size_t ANONYMOUS_PAGEIN_QUEUE_CAPACITY = 256;
+constexpr size_t ANONYMOUS_RECLAIM_MAX_RANGES = 64;
+sys::Spinlock anonymous_pagein_queue_lock;
+std::array<AnonymousSwapMapping*, ANONYMOUS_PAGEIN_QUEUE_CAPACITY> anonymous_pagein_queue{};
+size_t anonymous_pagein_queue_head{};
+size_t anonymous_pagein_queue_tail{};
+size_t anonymous_pagein_queue_count{};
+AnonymousSwapMapping* anonymous_swap_mappings{};  // Serialized by cow_pte_lock.
+AnonymousSwapAtomicStats anonymous_swap_stats{};
+std::atomic<uint64_t> anonymous_swap_generation{1};
+std::atomic<uint64_t> anonymous_reclaim_cursor{};
+std::atomic<bool> anonymous_swap_shrinker_registered{};
+std::atomic<bool> anonymous_swap_worker_started{};
+std::atomic<sched::task::Task*> anonymous_swap_worker_task{};
+
+auto pte_raw(const paging::PageTableEntry& entry) -> uint64_t;
+auto pte_from_raw(uint64_t raw) -> paging::PageTableEntry;
+auto is_reserved_leaf(const PageTableEntry& entry) -> bool;
+auto leaf_entry(PageTable* root, vaddr_t vaddr) -> PageTableEntry*;
+void owned_frame_track_fresh_normal_mapping(PageTable* pagemap, vaddr_t vaddr, paddr_t paddr, uint64_t flags);
+void owned_frame_untrack_leaf(PageTable* pagemap, vaddr_t vaddr, const PageTableEntry& entry);
+void flush_pagemap_after_update(PageTable* pagemap, vaddr_t vaddr, bool reload_cr3);
 
 // Page-table roots are shared by user threads and CLONE_VM tasks, so a Task's
 // local close flag alone cannot protect the tree from last-publisher teardown.
@@ -672,6 +747,774 @@ auto alloc_cow_destination_page(bool full_overwrite) -> void* {
         std::memset(PAGE, 0, paging::PAGE_SIZE);
     }
     return PAGE;
+}
+
+void anonymous_swap_add(std::atomic<uint64_t>& counter, uint64_t amount = 1) {
+    uint64_t value = counter.load(std::memory_order_relaxed);
+    while (value != UINT64_MAX) {
+        uint64_t const UPDATED = amount > UINT64_MAX - value ? UINT64_MAX : value + amount;
+        if (counter.compare_exchange_weak(value, UPDATED, std::memory_order_relaxed, std::memory_order_relaxed)) {
+            return;
+        }
+    }
+}
+
+void anonymous_swap_update_max(std::atomic<uint64_t>& counter, uint64_t candidate) {
+    uint64_t value = counter.load(std::memory_order_relaxed);
+    while (value < candidate && !counter.compare_exchange_weak(value, candidate, std::memory_order_relaxed, std::memory_order_relaxed)) {
+    }
+}
+
+auto anonymous_swap_enabled() -> bool {
+    static std::atomic<int> enabled{-1};
+    int cached = enabled.load(std::memory_order_acquire);
+    if (cached >= 0) {
+        return cached != 0;
+    }
+    bool const VALUE = cmdline_has_token(ker::init::get_kernel_cmdline(), "vmem.anon_swap=on");
+    int expected = -1;
+    if (enabled.compare_exchange_strong(expected, VALUE ? 1 : 0, std::memory_order_acq_rel, std::memory_order_acquire) && VALUE) {
+        log::info("private anonymous swap enabled by cmdline");
+    }
+    return VALUE;
+}
+
+auto next_anonymous_swap_generation() -> uint64_t {
+    uint64_t generation = anonymous_swap_generation.fetch_add(1, std::memory_order_relaxed);
+    if (generation == 0 || generation == UINT64_MAX) {
+        generation = anonymous_swap_generation.fetch_add(1, std::memory_order_relaxed);
+    }
+    return generation;
+}
+
+auto find_anonymous_swap_mapping_locked(PageTable* pagemap, vaddr_t vaddr) -> AnonymousSwapMapping* {
+    for (auto* mapping = anonymous_swap_mappings; mapping != nullptr; mapping = mapping->next) {
+        if (mapping->pagemap == pagemap && mapping->vaddr == vaddr) {
+            return mapping;
+        }
+    }
+    return nullptr;
+}
+
+void insert_anonymous_swap_mapping_locked(AnonymousSwapMapping* mapping) {
+    mapping->next = anonymous_swap_mappings;
+    anonymous_swap_mappings = mapping;
+}
+
+void remove_anonymous_swap_mapping_locked(AnonymousSwapMapping* mapping) {
+    AnonymousSwapMapping** link = &anonymous_swap_mappings;
+    while (*link != nullptr) {
+        if (*link == mapping) {
+            *link = mapping->next;
+            mapping->next = nullptr;
+            return;
+        }
+        link = &(*link)->next;
+    }
+}
+
+auto anonymous_swap_marker_raw(uint64_t resident_raw) -> uint64_t {
+    constexpr uint64_t PRESERVED = paging::PAGE_WRITE | paging::PAGE_USER | paging::PAGE_COW | paging::PAGE_NX;
+    return (resident_raw & PRESERVED) | paging::PAGE_RESERVED;
+}
+
+auto anonymous_pagein_enqueue(AnonymousSwapMapping* mapping) -> bool {
+    uint64_t const FLAGS = anonymous_pagein_queue_lock.lock_irqsave();
+    if (anonymous_pagein_queue_count == anonymous_pagein_queue.size()) {
+        anonymous_pagein_queue_lock.unlock_irqrestore(FLAGS);
+        return false;
+    }
+    anonymous_pagein_queue.at(anonymous_pagein_queue_tail) = mapping;
+    anonymous_pagein_queue_tail = (anonymous_pagein_queue_tail + 1) % anonymous_pagein_queue.size();
+    ++anonymous_pagein_queue_count;
+    anonymous_pagein_queue_lock.unlock_irqrestore(FLAGS);
+    return true;
+}
+
+auto anonymous_pagein_dequeue() -> AnonymousSwapMapping* {
+    uint64_t const FLAGS = anonymous_pagein_queue_lock.lock_irqsave();
+    if (anonymous_pagein_queue_count == 0) {
+        anonymous_pagein_queue_lock.unlock_irqrestore(FLAGS);
+        return nullptr;
+    }
+    auto* mapping = anonymous_pagein_queue.at(anonymous_pagein_queue_head);
+    anonymous_pagein_queue.at(anonymous_pagein_queue_head) = nullptr;
+    anonymous_pagein_queue_head = (anonymous_pagein_queue_head + 1) % anonymous_pagein_queue.size();
+    --anonymous_pagein_queue_count;
+    anonymous_pagein_queue_lock.unlock_irqrestore(FLAGS);
+    return mapping;
+}
+
+void release_anonymous_swap_object(AnonymousSwapObject* object) {
+    if (object == nullptr) {
+        return;
+    }
+    static_cast<void>(swap::free_slot(object->slot));
+    delete object;
+}
+
+auto detach_anonymous_swap_object_locked(AnonymousSwapMapping* mapping) -> AnonymousSwapObject* {
+    if (mapping == nullptr || mapping->object == nullptr) {
+        return nullptr;
+    }
+    auto* object = mapping->object;
+    mapping->object = nullptr;
+    if (object->mapping_refs != 0) {
+        --object->mapping_refs;
+    }
+    return object->mapping_refs == 0 ? object : nullptr;
+}
+
+auto detach_anonymous_swap_waiters_locked(AnonymousSwapMapping* mapping) -> sched::task::Task* {
+    auto* waiters = mapping != nullptr ? mapping->waiters : nullptr;
+    if (mapping != nullptr) {
+        mapping->waiters = nullptr;
+    }
+    for (auto* task = waiters; task != nullptr; task = task->anonymous_swap_wait_next) {
+        task->anonymous_swap_wait_mapping = nullptr;
+        task->anonymous_swap_completion_generation.store(task->anonymous_swap_wait_generation, std::memory_order_release);
+    }
+    return waiters;
+}
+
+void wake_anonymous_swap_waiters(sched::task::Task* waiters) {
+    while (waiters != nullptr) {
+        auto* task = waiters;
+        waiters = task->anonymous_swap_wait_next;
+        task->anonymous_swap_wait_next = nullptr;
+        sched::wake_task_from_event(task);
+        task->release();
+    }
+}
+
+enum class AnonymousSwapFaultDisposition : uint8_t {
+    NOT_TRACKED,
+    RESOLVED,
+    PARK,
+    FAILED,
+};
+
+auto probe_anonymous_swap_fault_locked(sched::task::Task* task, vaddr_t vaddr, const paging::PageFault& fault, uint64_t& wait_generation)
+    -> AnonymousSwapFaultDisposition {
+    auto* mapping = find_anonymous_swap_mapping_locked(task->pagemap, vaddr);
+    if (mapping == nullptr) {
+        return AnonymousSwapFaultDisposition::NOT_TRACKED;
+    }
+    if (mapping->state == AnonymousSwapRuntimeState::FAILED || mapping->cancelled || mapping->error < 0) {
+        return AnonymousSwapFaultDisposition::FAILED;
+    }
+    if (mapping->state == AnonymousSwapRuntimeState::PAGEOUT) {
+        return AnonymousSwapFaultDisposition::RESOLVED;
+    }
+    bool const WRITABLE = (mapping->original_raw & (paging::PAGE_WRITE | paging::PAGE_COW)) != 0U;
+    if ((mapping->original_raw & paging::PAGE_USER) == 0U || (fault.writable != 0U && !WRITABLE) ||
+        (fault.fetch != 0U && (mapping->original_raw & paging::PAGE_NX) != 0U)) {
+        return AnonymousSwapFaultDisposition::FAILED;
+    }
+
+    if (!mapping->pagein_queued) {
+        size_t access_gate = USER_PAGEMAP_ACCESS_GATE_NONE;
+        if (!acquire_user_pagemap_access(mapping->pagemap, false, access_gate)) {
+            return AnonymousSwapFaultDisposition::FAILED;
+        }
+        mapping->generation = next_anonymous_swap_generation();
+        mapping->pagein_queued = true;
+        mapping->pagein_access_gate = access_gate;
+        if (!anonymous_pagein_enqueue(mapping)) {
+            mapping->pagein_queued = false;
+            mapping->pagein_access_gate = USER_PAGEMAP_ACCESS_GATE_NONE;
+            release_user_pagemap_access(access_gate);
+            mapping->error = -EAGAIN;
+            return AnonymousSwapFaultDisposition::FAILED;
+        }
+        anonymous_swap_add(anonymous_swap_stats.pagein_attempts);
+        auto* const WORKER = anonymous_swap_worker_task.load(std::memory_order_acquire);
+        if (WORKER != nullptr) {
+            sched::wake_task_from_event(WORKER);
+        }
+    }
+
+    if (task->anonymous_swap_wait_mapping != nullptr || !task->try_acquire()) {
+        return AnonymousSwapFaultDisposition::FAILED;
+    }
+    wait_generation = mapping->generation;
+    task->anonymous_swap_wait_mapping = mapping;
+    task->anonymous_swap_wait_generation = wait_generation;
+    task->anonymous_swap_completion_generation.store(0, std::memory_order_relaxed);
+    task->anonymous_swap_wait_next = mapping->waiters;
+    mapping->waiters = task;
+    return AnonymousSwapFaultDisposition::PARK;
+}
+
+auto probe_anonymous_swap_fault(sched::task::Task* task, vaddr_t vaddr, const paging::PageFault& fault, uint64_t& wait_generation)
+    -> AnonymousSwapFaultDisposition {
+    if (task == nullptr || task->pagemap == nullptr) {
+        return AnonymousSwapFaultDisposition::NOT_TRACKED;
+    }
+    uint64_t const PAGE_VADDR = page_align_down(vaddr);
+    uint64_t const FLAGS = cow_pte_lock.lock_irqsave();
+    auto const RESULT = probe_anonymous_swap_fault_locked(task, PAGE_VADDR, fault, wait_generation);
+    cow_pte_lock.unlock_irqrestore(FLAGS);
+    return RESULT;
+}
+
+void service_anonymous_pagein(AnonymousSwapMapping* mapping) {
+    if (mapping == nullptr) {
+        return;
+    }
+    uint64_t const STARTED_US = time::get_us();
+    size_t const ACCESS_GATE = mapping->pagein_access_gate;
+    bool const ACCESS = ACCESS_GATE != USER_PAGEMAP_ACCESS_GATE_NONE;
+    void* page = nullptr;
+    swap::SwapSlot slot{};
+    uint64_t generation = 0;
+    bool should_read = false;
+
+    if (ACCESS) {
+        page = phys::page_alloc_full_overwrite_page_with_reclaim_may_fail(PhysicalPageOwner::USER_PRIVATE_MAPPING, "anon-swapin");
+    }
+    {
+        uint64_t const FLAGS = cow_pte_lock.lock_irqsave();
+        mapping->pagein_access_gate = USER_PAGEMAP_ACCESS_GATE_NONE;
+        if (ACCESS && page != nullptr && mapping->pagein_queued && !mapping->cancelled &&
+            mapping->state == AnonymousSwapRuntimeState::SWAPPED && mapping->object != nullptr) {
+            mapping->state = AnonymousSwapRuntimeState::PAGEIN;
+            mapping->frame = page;
+            slot = mapping->object->slot;
+            generation = mapping->generation;
+            should_read = true;
+            anonymous_swap_stats.swapped_pages.fetch_sub(1, std::memory_order_relaxed);
+            anonymous_swap_add(anonymous_swap_stats.pagein_inflight);
+        }
+        cow_pte_lock.unlock_irqrestore(FLAGS);
+    }
+
+    int result = page == nullptr ? -ENOMEM : -ECANCELED;
+    if (should_read) {
+        result = swap::read_slot(slot, page);
+    }
+    AnonymousSwapObject* object_to_release = nullptr;
+    sched::task::Task* waiters = nullptr;
+    bool installed = false;
+    bool delete_mapping_after = false;
+    {
+        uint64_t const FLAGS = cow_pte_lock.lock_irqsave();
+        if (should_read && mapping->state == AnonymousSwapRuntimeState::PAGEIN && mapping->generation == generation &&
+            mapping->frame == page) {
+            PageTableEntry* entry = leaf_entry(mapping->pagemap, mapping->vaddr);
+            bool const CURRENT = entry != nullptr && entry->present == 0 && is_reserved_leaf(*entry);
+            if (result == 0 && CURRENT && !mapping->cancelled) {
+                uint64_t const PIN_FLAGS = user_mapping_pin_lock.lock_irqsave();
+                uint64_t const PADDR = reinterpret_cast<paddr_t>(addr::get_phys_pointer(reinterpret_cast<vaddr_t>(page)));
+                uint64_t const RAW = (mapping->original_raw & ~PTE_FRAME_MASK) | (PADDR & PTE_FRAME_MASK) | paging::PAGE_PRESENT;
+                *entry = pte_from_raw(RAW);
+                owned_frame_track_fresh_normal_mapping(mapping->pagemap, mapping->vaddr, PADDR, RAW);
+                user_mapping_pin_lock.unlock_irqrestore(PIN_FLAGS);
+                mapping->frame = nullptr;
+                mapping->pagein_queued = false;
+                object_to_release = detach_anonymous_swap_object_locked(mapping);
+                waiters = detach_anonymous_swap_waiters_locked(mapping);
+                remove_anonymous_swap_mapping_locked(mapping);
+                delete_mapping_after = true;
+                installed = true;
+                anonymous_swap_add(anonymous_swap_stats.pagein_successes);
+            } else if (mapping->cancelled || !CURRENT) {
+                mapping->frame = nullptr;
+                mapping->pagein_queued = false;
+                object_to_release = detach_anonymous_swap_object_locked(mapping);
+                waiters = detach_anonymous_swap_waiters_locked(mapping);
+                remove_anonymous_swap_mapping_locked(mapping);
+                delete_mapping_after = true;
+            } else {
+                mapping->frame = nullptr;
+                mapping->pagein_queued = false;
+                object_to_release = detach_anonymous_swap_object_locked(mapping);
+                waiters = detach_anonymous_swap_waiters_locked(mapping);
+                mapping->state = AnonymousSwapRuntimeState::FAILED;
+                mapping->error = result < 0 ? result : -EIO;
+                anonymous_swap_add(anonymous_swap_stats.pagein_failures);
+                if (result == -EILSEQ) {
+                    anonymous_swap_add(anonymous_swap_stats.pagein_corruption);
+                }
+            }
+            anonymous_swap_stats.pagein_inflight.fetch_sub(1, std::memory_order_relaxed);
+        } else {
+            mapping->pagein_queued = false;
+            waiters = detach_anonymous_swap_waiters_locked(mapping);
+            if (mapping->cancelled) {
+                object_to_release = detach_anonymous_swap_object_locked(mapping);
+                remove_anonymous_swap_mapping_locked(mapping);
+                delete_mapping_after = true;
+            } else if (mapping->state == AnonymousSwapRuntimeState::SWAPPED) {
+                object_to_release = detach_anonymous_swap_object_locked(mapping);
+                mapping->state = AnonymousSwapRuntimeState::FAILED;
+                mapping->error = result < 0 ? result : -EIO;
+                anonymous_swap_stats.swapped_pages.fetch_sub(1, std::memory_order_relaxed);
+                anonymous_swap_add(anonymous_swap_stats.pagein_failures);
+            }
+        }
+        cow_pte_lock.unlock_irqrestore(FLAGS);
+    }
+
+    if (installed) {
+        flush_pagemap_after_update(mapping->pagemap, mapping->vaddr, false);
+    }
+    if (page != nullptr && !installed) {
+        std::memset(page, 0, paging::PAGE_SIZE);
+        phys::page_ref_dec(page);
+    }
+    release_anonymous_swap_object(object_to_release);
+    wake_anonymous_swap_waiters(waiters);
+    if (ACCESS) {
+        release_user_pagemap_access(ACCESS_GATE);
+    }
+    uint64_t const FINISHED_US = time::get_us();
+    uint64_t const ELAPSED = FINISHED_US >= STARTED_US ? FINISHED_US - STARTED_US : 0;
+    anonymous_swap_add(anonymous_swap_stats.pagein_latency_us, ELAPSED);
+    anonymous_swap_update_max(anonymous_swap_stats.pagein_latency_max_us, ELAPSED);
+    if (delete_mapping_after) {
+        delete mapping;
+    }
+}
+
+[[noreturn]] void anonymous_pagein_worker_main() {
+    for (;;) {
+        auto* mapping = anonymous_pagein_dequeue();
+        if (mapping == nullptr) {
+            sched::kern_block();
+            continue;
+        }
+        service_anonymous_pagein(mapping);
+    }
+}
+
+struct AnonymousPageoutCandidate {
+    PageTable* pagemap{};
+    vaddr_t vaddr{};
+    void* frame{};
+    uint64_t raw{};
+    uint64_t prot{};
+    size_t access_gate{USER_PAGEMAP_ACCESS_GATE_NONE};
+};
+
+enum class AnonymousCandidateDisposition : uint8_t {
+    NONE,
+    AGED,
+    SELECTED,
+};
+
+auto snapshot_anonymous_candidate(sched::task::Task* task, uint64_t cursor, AnonymousPageoutCandidate& out)
+    -> AnonymousCandidateDisposition {
+    if (task == nullptr) {
+        return AnonymousCandidateDisposition::NONE;
+    }
+    PageTable* const PAGEMAP = task->pagemap;
+    size_t access_gate = USER_PAGEMAP_ACCESS_GATE_NONE;
+    if (PAGEMAP == nullptr || !acquire_user_pagemap_access(PAGEMAP, false, access_gate) || task->pagemap != PAGEMAP) {
+        release_user_pagemap_access(access_gate);
+        return AnonymousCandidateDisposition::NONE;
+    }
+
+    std::array<sched::task::LazyVmemRange, ANONYMOUS_RECLAIM_MAX_RANGES> ranges{};
+    size_t range_count = 0;
+    uint64_t const RANGE_FLAGS = task->lazy_vmem_lock.lock_irqsave();
+    for (const auto& range : task->lazy_vmem_ranges) {
+        constexpr uint64_t MAP_SHARED = 0x01;
+        if (range_count == ranges.size()) {
+            break;
+        }
+        if (range.kind == sched::task::LazyVmemKind::ANONYMOUS && range.start < range.end && (range.flags & MAP_SHARED) == 0) {
+            ranges.at(range_count++) = range;
+        }
+    }
+    task->lazy_vmem_lock.unlock_irqrestore(RANGE_FLAGS);
+    if (range_count == 0) {
+        release_user_pagemap_access(access_gate);
+        return AnonymousCandidateDisposition::NONE;
+    }
+
+    auto const& range = ranges.at(static_cast<size_t>(cursor % range_count));
+    uint64_t const PAGE_COUNT = (range.end - range.start) / paging::PAGE_SIZE;
+    if (PAGE_COUNT == 0) {
+        release_user_pagemap_access(access_gate);
+        return AnonymousCandidateDisposition::NONE;
+    }
+    vaddr_t const VADDR = range.start + (((cursor / range_count) % PAGE_COUNT) * paging::PAGE_SIZE);
+
+    bool aged = false;
+    bool selected = false;
+    uint64_t const PTE_FLAGS = cow_pte_lock.lock_irqsave();
+    uint64_t const LAZY_FLAGS = task->lazy_vmem_lock.lock_irqsave();
+    bool range_current = false;
+    uint64_t prot = 0;
+    for (const auto& candidate : task->lazy_vmem_ranges) {
+        if (candidate.kind == sched::task::LazyVmemKind::ANONYMOUS && VADDR >= candidate.start && VADDR < candidate.end &&
+            (candidate.flags & 0x01ULL) == 0) {
+            range_current = true;
+            prot = candidate.prot;
+            break;
+        }
+    }
+    uint64_t const PIN_FLAGS = user_mapping_pin_lock.lock_irqsave();
+    PageTableEntry* entry = range_current ? leaf_entry(PAGEMAP, VADDR) : nullptr;
+    if (entry != nullptr && entry->present != 0 && entry->user != 0 && (pte_raw(*entry) & paging::PAGE_SHARED) == 0U &&
+        find_anonymous_swap_mapping_locked(PAGEMAP, VADDR) == nullptr) {
+        if (entry->accessed != 0) {
+            entry->accessed = 0;
+            aged = true;
+        } else {
+            uint64_t const PHYS = static_cast<uint64_t>(entry->frame) << paging::PAGE_SHIFT;
+            void* const FRAME = reinterpret_cast<void*>(addr::get_virt_pointer(PHYS));
+            phys::PageLookupHint lookup{};
+            if (phys::page_ref_get(FRAME, &lookup) == 1) {
+                phys::page_ref_inc(FRAME, &lookup);
+                out = {
+                    .pagemap = PAGEMAP, .vaddr = VADDR, .frame = FRAME, .raw = pte_raw(*entry), .prot = prot, .access_gate = access_gate};
+                selected = true;
+            }
+        }
+    }
+    user_mapping_pin_lock.unlock_irqrestore(PIN_FLAGS);
+    task->lazy_vmem_lock.unlock_irqrestore(LAZY_FLAGS);
+    cow_pte_lock.unlock_irqrestore(PTE_FLAGS);
+
+    if (aged) {
+        flush_pagemap_after_update(PAGEMAP, VADDR, false);
+    }
+    if (!selected) {
+        release_user_pagemap_access(access_gate);
+    }
+    if (selected) {
+        return AnonymousCandidateDisposition::SELECTED;
+    }
+    return aged ? AnonymousCandidateDisposition::AGED : AnonymousCandidateDisposition::NONE;
+}
+
+auto pageout_anonymous_candidate(AnonymousPageoutCandidate& candidate) -> bool {
+    anonymous_swap_add(anonymous_swap_stats.pageout_attempts);
+    auto* object = new AnonymousSwapObject{};
+    auto* mapping = new AnonymousSwapMapping{};
+    if (object == nullptr || mapping == nullptr) {
+        delete object;
+        delete mapping;
+        phys::page_ref_dec(candidate.frame);
+        release_user_pagemap_access(candidate.access_gate);
+        anonymous_swap_add(anonymous_swap_stats.pageout_failures);
+        return false;
+    }
+    int result = swap::allocate_slot(&object->slot);
+    if (result < 0) {
+        delete object;
+        delete mapping;
+        phys::page_ref_dec(candidate.frame);
+        release_user_pagemap_access(candidate.access_gate);
+        anonymous_swap_add(anonymous_swap_stats.pageout_failures);
+        return false;
+    }
+    object->mapping_refs = 1;
+    mapping->pagemap = candidate.pagemap;
+    mapping->vaddr = candidate.vaddr;
+    mapping->state = AnonymousSwapRuntimeState::PAGEOUT;
+    mapping->object = object;
+    mapping->frame = candidate.frame;
+    mapping->original_raw = candidate.raw;
+    mapping->generation = next_anonymous_swap_generation();
+
+    bool published = false;
+    bool froze_writable_mapping = false;
+    {
+        uint64_t const FLAGS = cow_pte_lock.lock_irqsave();
+        uint64_t const PIN_FLAGS = user_mapping_pin_lock.lock_irqsave();
+        PageTableEntry* entry = leaf_entry(candidate.pagemap, candidate.vaddr);
+        if (entry != nullptr && entry->present != 0 &&
+            (static_cast<uint64_t>(entry->frame) << paging::PAGE_SHIFT) ==
+                reinterpret_cast<uint64_t>(addr::get_phys_pointer(reinterpret_cast<uint64_t>(candidate.frame))) &&
+            find_anonymous_swap_mapping_locked(candidate.pagemap, candidate.vaddr) == nullptr) {
+            mapping->original_raw = pte_raw(*entry);
+            mapping->frozen_raw = mapping->original_raw;
+            if ((mapping->frozen_raw & paging::PAGE_WRITE) != 0U) {
+                mapping->frozen_raw &= ~paging::PAGE_WRITE;
+                mapping->frozen_raw |= paging::PAGE_COW;
+                *entry = pte_from_raw(mapping->frozen_raw);
+                froze_writable_mapping = true;
+            }
+            insert_anonymous_swap_mapping_locked(mapping);
+            published = true;
+            anonymous_swap_add(anonymous_swap_stats.pageout_inflight);
+        }
+        user_mapping_pin_lock.unlock_irqrestore(PIN_FLAGS);
+        cow_pte_lock.unlock_irqrestore(FLAGS);
+    }
+    if (!published) {
+        release_anonymous_swap_object(object);
+        delete mapping;
+        phys::page_ref_dec(candidate.frame);
+        release_user_pagemap_access(candidate.access_gate);
+        anonymous_swap_add(anonymous_swap_stats.pageout_failures);
+        return false;
+    }
+
+    if (froze_writable_mapping) {
+        flush_pagemap_after_update(candidate.pagemap, candidate.vaddr, false);
+    }
+
+    uint64_t const STARTED_US = time::get_us();
+    result = swap::write_slot(object->slot, candidate.frame);
+    bool committed = false;
+    bool restored = false;
+    AnonymousSwapObject* object_to_release = nullptr;
+    {
+        uint64_t const FLAGS = cow_pte_lock.lock_irqsave();
+        uint64_t const PIN_FLAGS = user_mapping_pin_lock.lock_irqsave();
+        PageTableEntry* entry = leaf_entry(candidate.pagemap, candidate.vaddr);
+        bool const SAME_FRAME = entry != nullptr && entry->present != 0 && pte_raw(*entry) == mapping->frozen_raw &&
+                                (static_cast<uint64_t>(entry->frame) << paging::PAGE_SHIFT) ==
+                                    reinterpret_cast<uint64_t>(addr::get_phys_pointer(reinterpret_cast<uint64_t>(candidate.frame)));
+        if (result == 0 && SAME_FRAME && !mapping->cancelled) {
+            owned_frame_untrack_leaf(candidate.pagemap, candidate.vaddr, *entry);
+            *entry = pte_from_raw(anonymous_swap_marker_raw(mapping->original_raw));
+            mapping->state = AnonymousSwapRuntimeState::SWAPPED;
+            mapping->frame = nullptr;
+            committed = true;
+            anonymous_swap_add(anonymous_swap_stats.swapped_pages);
+            anonymous_swap_add(anonymous_swap_stats.pageout_successes);
+        } else {
+            if (result < 0 && SAME_FRAME && !mapping->cancelled && mapping->frozen_raw != mapping->original_raw) {
+                *entry = pte_from_raw(mapping->original_raw);
+                restored = true;
+            }
+            remove_anonymous_swap_mapping_locked(mapping);
+            object_to_release = detach_anonymous_swap_object_locked(mapping);
+            mapping->frame = nullptr;
+            anonymous_swap_add(anonymous_swap_stats.pageout_failures);
+        }
+        anonymous_swap_stats.pageout_inflight.fetch_sub(1, std::memory_order_relaxed);
+        user_mapping_pin_lock.unlock_irqrestore(PIN_FLAGS);
+        cow_pte_lock.unlock_irqrestore(FLAGS);
+    }
+
+    if (committed) {
+        flush_pagemap_after_update(candidate.pagemap, candidate.vaddr, false);
+        // PTE mapping ownership and the pageout pin are distinct references.
+        phys::page_ref_dec(candidate.frame);
+        phys::page_ref_dec(candidate.frame);
+    } else {
+        if (restored) {
+            flush_pagemap_after_update(candidate.pagemap, candidate.vaddr, false);
+        }
+        phys::page_ref_dec(candidate.frame);
+        release_anonymous_swap_object(object_to_release);
+        delete mapping;
+    }
+    release_user_pagemap_access(candidate.access_gate);
+    uint64_t const FINISHED_US = time::get_us();
+    uint64_t const ELAPSED = FINISHED_US >= STARTED_US ? FINISHED_US - STARTED_US : 0;
+    anonymous_swap_add(anonymous_swap_stats.pageout_latency_us, ELAPSED);
+    anonymous_swap_update_max(anonymous_swap_stats.pageout_latency_max_us, ELAPSED);
+    return committed;
+}
+
+auto anonymous_swap_reclaim_count(void* /*context*/, const reclaim::ReclaimRequest& /*request*/) -> reclaim::ReclaimCount {
+    if (!anonymous_swap_enabled()) {
+        return {};
+    }
+    swap::SwapStats stats{};
+    swap::get_stats(&stats);
+    uint64_t const FREE_SLOTS = stats.free_bytes / paging::PAGE_SIZE;
+    uint64_t const TASKS = sched::get_active_task_count();
+    uint64_t const RECLAIMABLE = std::min<uint64_t>(FREE_SLOTS, TASKS * 32);
+    uint64_t const UNRECLAIMABLE = TASKS != 0 && FREE_SLOTS == 0 ? TASKS : 0U;
+    return {.reclaimable = RECLAIMABLE, .unreclaimable = UNRECLAIMABLE};
+}
+
+auto anonymous_swap_reclaim_scan(void* /*context*/, const reclaim::ReclaimRequest& request) -> reclaim::ReclaimScanResult {
+    uint64_t const PAGE_BUDGET = std::min(request.budget_units, request.target_pages);
+    uint64_t const SCAN_BUDGET = request.scan_budget_units;
+    reclaim::ReclaimScanResult result{};
+    uint32_t const TASK_COUNT = sched::get_active_task_count();
+    if (PAGE_BUDGET == 0 || SCAN_BUDGET == 0 || TASK_COUNT == 0 || !anonymous_swap_enabled()) {
+        return result;
+    }
+
+    uint64_t const START = anonymous_reclaim_cursor.fetch_add(SCAN_BUDGET, std::memory_order_relaxed);
+    while (result.scanned < SCAN_BUDGET && result.reclaimed < PAGE_BUDGET) {
+        uint64_t const CURSOR = START + result.scanned;
+        auto* task = sched::get_active_task_at_safe(static_cast<uint32_t>(CURSOR % TASK_COUNT));
+        ++result.scanned;
+        if (task == nullptr) {
+            continue;
+        }
+        AnonymousPageoutCandidate candidate{};
+        auto disposition = snapshot_anonymous_candidate(task, CURSOR / TASK_COUNT, candidate);
+        if (disposition == AnonymousCandidateDisposition::AGED) {
+            // Give the owner a scheduling opportunity after the TLB flush. A
+            // hot page sets Accessed again and receives another chance; a cold
+            // page remains clear and can be selected on this bounded revisit.
+            sched::kern_yield();
+            disposition = snapshot_anonymous_candidate(task, CURSOR / TASK_COUNT, candidate);
+        }
+        task->release();
+        if (disposition == AnonymousCandidateDisposition::SELECTED) {
+            anonymous_swap_add(anonymous_swap_stats.resident_candidates);
+            if (pageout_anonymous_candidate(candidate)) {
+                ++result.reclaimed;
+            }
+        }
+    }
+    result.has_more = swap::swap_available();
+    return result;
+}
+
+auto migrate_anonymous_swap_area(void* /*context*/, uint32_t area_id) -> int {
+    for (;;) {
+        AnonymousSwapMapping* target = nullptr;
+        PageTable* target_pagemap = nullptr;
+        vaddr_t target_vaddr = 0;
+        size_t access_gate = USER_PAGEMAP_ACCESS_GATE_NONE;
+        bool wait_for_inflight = false;
+        {
+            uint64_t const COW_FLAGS = cow_pte_lock.lock_irqsave();
+            for (auto* mapping = anonymous_swap_mappings; mapping != nullptr; mapping = mapping->next) {
+                if (mapping->object == nullptr || mapping->object->slot.area != area_id) {
+                    continue;
+                }
+                if (mapping->state != AnonymousSwapRuntimeState::SWAPPED || mapping->pagein_queued) {
+                    wait_for_inflight = true;
+                    break;
+                }
+                if (!acquire_user_pagemap_access(mapping->pagemap, false, access_gate)) {
+                    wait_for_inflight = true;
+                    break;
+                }
+                mapping->generation = next_anonymous_swap_generation();
+                mapping->pagein_queued = true;
+                mapping->pagein_access_gate = access_gate;
+                anonymous_swap_add(anonymous_swap_stats.pagein_attempts);
+                target = mapping;
+                target_pagemap = mapping->pagemap;
+                target_vaddr = mapping->vaddr;
+                break;
+            }
+            cow_pte_lock.unlock_irqrestore(COW_FLAGS);
+        }
+
+        if (target != nullptr) {
+            service_anonymous_pagein(target);
+            int error = 0;
+            uint64_t const COW_FLAGS = cow_pte_lock.lock_irqsave();
+            auto* remaining = find_anonymous_swap_mapping_locked(target_pagemap, target_vaddr);
+            if (remaining != nullptr && remaining->state == AnonymousSwapRuntimeState::FAILED) {
+                error = remaining->error < 0 ? remaining->error : -EIO;
+            }
+            cow_pte_lock.unlock_irqrestore(COW_FLAGS);
+            if (error < 0) {
+                return error;
+            }
+            continue;
+        }
+        if (!wait_for_inflight) {
+            return 0;
+        }
+        sched::kern_yield();
+    }
+}
+
+auto clone_anonymous_swap_mappings(PageTable* src, PageTable* dst) -> bool {
+    uint64_t last_vaddr = 0;
+    bool have_last = false;
+    for (;;) {
+        auto* child = new AnonymousSwapMapping{};
+        if (child == nullptr) {
+            return false;
+        }
+
+        bool found = false;
+        {
+            uint64_t const COW_FLAGS = cow_pte_lock.lock_irqsave();
+            AnonymousSwapMapping* source = nullptr;
+            for (auto* candidate = anonymous_swap_mappings; candidate != nullptr; candidate = candidate->next) {
+                if (candidate->pagemap != src || (have_last && candidate->vaddr <= last_vaddr)) {
+                    continue;
+                }
+                if (source == nullptr || candidate->vaddr < source->vaddr) {
+                    source = candidate;
+                }
+            }
+            if (source != nullptr &&
+                (source->state == AnonymousSwapRuntimeState::SWAPPED || source->state == AnonymousSwapRuntimeState::FAILED) &&
+                !source->pagein_queued) {
+                uint64_t raw = source->original_raw;
+                if ((raw & paging::PAGE_WRITE) != 0U || (raw & paging::PAGE_COW) != 0U) {
+                    raw &= ~paging::PAGE_WRITE;
+                    raw |= paging::PAGE_COW;
+                    source->original_raw = raw;
+                    if (auto* parent_entry = leaf_entry(src, source->vaddr);
+                        parent_entry != nullptr && parent_entry->present == 0 && is_reserved_leaf(*parent_entry)) {
+                        *parent_entry = pte_from_raw(anonymous_swap_marker_raw(raw));
+                    }
+                }
+
+                *child = *source;
+                child->pagemap = dst;
+                child->waiters = nullptr;
+                child->next = nullptr;
+                child->pagein_queued = false;
+                child->pagein_access_gate = USER_PAGEMAP_ACCESS_GATE_NONE;
+                child->cancelled = false;
+                if (child->object != nullptr) {
+                    ++child->object->mapping_refs;
+                }
+                if (auto* child_entry = leaf_entry(dst, child->vaddr);
+                    child_entry != nullptr && child_entry->present == 0 && is_reserved_leaf(*child_entry)) {
+                    *child_entry = pte_from_raw(anonymous_swap_marker_raw(raw));
+                }
+                insert_anonymous_swap_mapping_locked(child);
+                if (child->state == AnonymousSwapRuntimeState::SWAPPED) {
+                    anonymous_swap_add(anonymous_swap_stats.swapped_pages);
+                }
+                last_vaddr = source->vaddr;
+                have_last = true;
+                found = true;
+            }
+            cow_pte_lock.unlock_irqrestore(COW_FLAGS);
+        }
+
+        if (!found) {
+            delete child;
+            return true;
+        }
+    }
+}
+
+void purge_anonymous_swap_mappings(PageTable* pagemap) {
+    for (;;) {
+        AnonymousSwapMapping* victim = nullptr;
+        AnonymousSwapObject* object = nullptr;
+        {
+            uint64_t const COW_FLAGS = cow_pte_lock.lock_irqsave();
+            for (auto* mapping = anonymous_swap_mappings; mapping != nullptr; mapping = mapping->next) {
+                if (mapping->pagemap == pagemap) {
+                    victim = mapping;
+                    break;
+                }
+            }
+            if (victim != nullptr) {
+                // Pagemap exclusive ownership proves pageout/pagein has
+                // relinquished its read-side gate before teardown gets here.
+                if (victim->state == AnonymousSwapRuntimeState::SWAPPED) {
+                    anonymous_swap_stats.swapped_pages.fetch_sub(1, std::memory_order_relaxed);
+                }
+                remove_anonymous_swap_mapping_locked(victim);
+                object = detach_anonymous_swap_object_locked(victim);
+            }
+            cow_pte_lock.unlock_irqrestore(COW_FLAGS);
+        }
+        if (victim == nullptr) {
+            return;
+        }
+        release_anonymous_swap_object(object);
+        delete victim;
+    }
 }
 
 paging::PageTable* kernel_pagemap;
@@ -2608,7 +3451,7 @@ void switch_pagemap(sched::task::Task* t) {
     note_active_pagemap(t->pagemap);
 }
 
-auto pagefault_handler(uint64_t control_register, gates::InterruptFrame& frame, ker::mod::cpu::GPRegs& /*gpr*/) -> bool {
+auto pagefault_handler(uint64_t control_register, gates::InterruptFrame& frame, ker::mod::cpu::GPRegs& gpr) -> bool {
     PageFault const PAGEFAULT = paging::create_page_fault(frame.err_code, true);
 
 #ifdef WOS_KASAN
@@ -2626,6 +3469,24 @@ auto pagefault_handler(uint64_t control_register, gates::InterruptFrame& frame, 
     // syscall copy paths writing into a not-yet-backed user stack page.
     if (PAGEFAULT.present == 0U && control_register < 0x0000800000000000ULL) {
         auto* current_task = sched::get_current_task();
+        uint64_t wait_generation = 0;
+        auto const SWAP_FAULT = probe_anonymous_swap_fault(current_task, control_register, PAGEFAULT, wait_generation);
+        if (SWAP_FAULT == AnonymousSwapFaultDisposition::PARK) {
+            while (current_task->anonymous_swap_completion_generation.load(std::memory_order_acquire) != wait_generation) {
+                auto const WAIT = sched::place_task_in_wait_queue_if_pending(gpr, frame, current_task->anonymous_swap_completion_generation,
+                                                                             wait_generation);
+                if (WAIT == sched::ExceptionWaitResult::PARKED) {
+                    return true;
+                }
+            }
+            return translate(current_task->pagemap, page_align_down(control_register)) != PADDR_INVALID;
+        }
+        if (SWAP_FAULT == AnonymousSwapFaultDisposition::RESOLVED) {
+            return true;
+        }
+        if (SWAP_FAULT == AnonymousSwapFaultDisposition::FAILED) {
+            return false;
+        }
         if (handle_lazy_vmem_fault(current_task, control_register, PAGEFAULT, frame.rip, frame.rsp)) {
             return true;
         }
@@ -3015,6 +3876,68 @@ bool ensure_user_page_writable(sched::task::Task* task, vaddr_t vaddr) { return 
 
 bool ensure_user_page_mapped(sched::task::Task* task, vaddr_t vaddr) { return ensure_user_page_mapped_for_task(task, vaddr); }
 
+#ifdef WOS_SELFTEST
+bool selftest_anonymous_swap_pageout(PageTable* pagemap, vaddr_t vaddr) {
+    vaddr = page_align_down(vaddr);
+    AnonymousPageoutCandidate candidate{};
+    if (pagemap == nullptr || !acquire_user_pagemap_access(pagemap, false, candidate.access_gate)) {
+        return false;
+    }
+    candidate.pagemap = pagemap;
+    candidate.vaddr = vaddr;
+
+    uint64_t const COW_FLAGS = cow_pte_lock.lock_irqsave();
+    uint64_t const PIN_FLAGS = user_mapping_pin_lock.lock_irqsave();
+    PageTableEntry* entry = leaf_entry(pagemap, vaddr);
+    if (entry != nullptr && entry->present != 0 && entry->user != 0 && (pte_raw(*entry) & paging::PAGE_SHARED) == 0U &&
+        find_anonymous_swap_mapping_locked(pagemap, vaddr) == nullptr) {
+        uint64_t const PHYS = static_cast<uint64_t>(entry->frame) << paging::PAGE_SHIFT;
+        candidate.frame = reinterpret_cast<void*>(addr::get_virt_pointer(PHYS));
+        candidate.raw = pte_raw(*entry);
+        phys::page_ref_inc(candidate.frame);
+    }
+    user_mapping_pin_lock.unlock_irqrestore(PIN_FLAGS);
+    cow_pte_lock.unlock_irqrestore(COW_FLAGS);
+    if (candidate.frame == nullptr) {
+        release_user_pagemap_access(candidate.access_gate);
+        return false;
+    }
+    return pageout_anonymous_candidate(candidate);
+}
+
+bool selftest_anonymous_swap_pagein(PageTable* pagemap, vaddr_t vaddr) {
+    vaddr = page_align_down(vaddr);
+    AnonymousSwapMapping* mapping = nullptr;
+    size_t access_gate = USER_PAGEMAP_ACCESS_GATE_NONE;
+    uint64_t const COW_FLAGS = cow_pte_lock.lock_irqsave();
+    mapping = find_anonymous_swap_mapping_locked(pagemap, vaddr);
+    if (mapping != nullptr && mapping->state == AnonymousSwapRuntimeState::SWAPPED && !mapping->pagein_queued &&
+        acquire_user_pagemap_access(pagemap, false, access_gate)) {
+        mapping->generation = next_anonymous_swap_generation();
+        mapping->pagein_queued = true;
+        mapping->pagein_access_gate = access_gate;
+        anonymous_swap_add(anonymous_swap_stats.pagein_attempts);
+    } else {
+        mapping = nullptr;
+    }
+    cow_pte_lock.unlock_irqrestore(COW_FLAGS);
+    if (mapping == nullptr) {
+        release_user_pagemap_access(access_gate);
+        return false;
+    }
+    service_anonymous_pagein(mapping);
+    return translate(pagemap, vaddr) != PADDR_INVALID;
+}
+
+bool selftest_anonymous_swap_is_swapped(PageTable* pagemap, vaddr_t vaddr) {
+    uint64_t const COW_FLAGS = cow_pte_lock.lock_irqsave();
+    auto* mapping = find_anonymous_swap_mapping_locked(pagemap, page_align_down(vaddr));
+    bool const SWAPPED = mapping != nullptr && mapping->state == AnonymousSwapRuntimeState::SWAPPED;
+    cow_pte_lock.unlock_irqrestore(COW_FLAGS);
+    return SWAPPED;
+}
+#endif
+
 auto collect_user_memory_stats(PageTable* page_table) -> UserMemoryStats {
     UserMemoryStats stats{};
     if (page_table == nullptr) {
@@ -3090,7 +4013,91 @@ auto collect_user_memory_stats(PageTable* page_table) -> UserMemoryStats {
         }
     }
 
+    // Reserved PTEs contribute to virtual_pages above; the side table
+    // distinguishes demand-zero reservations from evicted anonymous pages.
+    uint64_t const COW_FLAGS = cow_pte_lock.lock_irqsave();
+    for (auto* mapping = anonymous_swap_mappings; mapping != nullptr; mapping = mapping->next) {
+        if (mapping->pagemap != page_table) {
+            continue;
+        }
+        if (mapping->state == AnonymousSwapRuntimeState::SWAPPED) {
+            ++stats.swapped_pages;
+        } else if (mapping->state == AnonymousSwapRuntimeState::PAGEOUT || mapping->state == AnonymousSwapRuntimeState::PAGEIN) {
+            ++stats.swap_inflight_pages;
+        }
+    }
+    cow_pte_lock.unlock_irqrestore(COW_FLAGS);
+
     return stats;
+}
+
+void get_anonymous_swap_stats_snapshot(AnonymousSwapStatsSnapshot& out) {
+    out = {
+        .resident_candidates = anonymous_swap_stats.resident_candidates.load(std::memory_order_relaxed),
+        .swapped_pages = anonymous_swap_stats.swapped_pages.load(std::memory_order_relaxed),
+        .pageout_inflight = anonymous_swap_stats.pageout_inflight.load(std::memory_order_relaxed),
+        .pagein_inflight = anonymous_swap_stats.pagein_inflight.load(std::memory_order_relaxed),
+        .pageout_attempts = anonymous_swap_stats.pageout_attempts.load(std::memory_order_relaxed),
+        .pageout_successes = anonymous_swap_stats.pageout_successes.load(std::memory_order_relaxed),
+        .pageout_failures = anonymous_swap_stats.pageout_failures.load(std::memory_order_relaxed),
+        .pagein_attempts = anonymous_swap_stats.pagein_attempts.load(std::memory_order_relaxed),
+        .pagein_successes = anonymous_swap_stats.pagein_successes.load(std::memory_order_relaxed),
+        .pagein_failures = anonymous_swap_stats.pagein_failures.load(std::memory_order_relaxed),
+        .pagein_corruption = anonymous_swap_stats.pagein_corruption.load(std::memory_order_relaxed),
+        .pageout_latency_us = anonymous_swap_stats.pageout_latency_us.load(std::memory_order_relaxed),
+        .pageout_latency_max_us = anonymous_swap_stats.pageout_latency_max_us.load(std::memory_order_relaxed),
+        .pagein_latency_us = anonymous_swap_stats.pagein_latency_us.load(std::memory_order_relaxed),
+        .pagein_latency_max_us = anonymous_swap_stats.pagein_latency_max_us.load(std::memory_order_relaxed),
+    };
+}
+
+void register_anonymous_swap_shrinker() {
+    bool expected = false;
+    if (!anonymous_swap_shrinker_registered.compare_exchange_strong(expected, true, std::memory_order_acq_rel, std::memory_order_acquire)) {
+        return;
+    }
+    swap::SwapConsumer const CONSUMER{
+        .name = "anonymous_vmem",
+        .context = nullptr,
+        .migrate_area = migrate_anonymous_swap_area,
+    };
+    if (!swap::register_consumer(CONSUMER)) {
+        anonymous_swap_shrinker_registered.store(false, std::memory_order_release);
+        log::error("failed to register anonymous swapoff consumer");
+        return;
+    }
+    reclaim::Shrinker const SHRINKER{
+        .name = "anonymous_swap",
+        .unit = reclaim::ReclaimUnit::PAGES,
+        .scan_unit = reclaim::ReclaimUnit::PAGES,
+        .rank = 6,
+        .min_priority = reclaim::ReclaimPriority::LOW,
+        .capabilities = reclaim::RECLAIM_MAY_BLOCK | reclaim::RECLAIM_MAY_IO | reclaim::RECLAIM_MAY_ALLOCATE,
+        .max_batch_units = 32,
+        .max_scan_units = 4096,
+        .count = anonymous_swap_reclaim_count,
+        .scan = anonymous_swap_reclaim_scan,
+    };
+    if (!reclaim::register_shrinker(SHRINKER)) {
+        anonymous_swap_shrinker_registered.store(false, std::memory_order_release);
+    }
+}
+
+void start_anonymous_swap_worker() {
+    if (!anonymous_swap_enabled()) {
+        return;
+    }
+    bool expected = false;
+    if (!anonymous_swap_worker_started.compare_exchange_strong(expected, true, std::memory_order_acq_rel, std::memory_order_acquire)) {
+        return;
+    }
+    auto* worker = sched::task::Task::create_kernel_thread("anon_swapin", anonymous_pagein_worker_main);
+    if (worker == nullptr) {
+        anonymous_swap_worker_started.store(false, std::memory_order_release);
+        return;
+    }
+    anonymous_swap_worker_task.store(worker, std::memory_order_release);
+    (void)sched::post_task_for_cpu(0, worker);
 }
 
 void init_pagemap() {
@@ -3629,23 +4636,79 @@ void unmap_page(PageTable* page_table, vaddr_t vaddr) {
     selftest_require_mutable_pagemap_root(page_table, "unmap-page", vaddr);
 #endif
 
+    vaddr = page_align_down(vaddr);
+    AnonymousSwapObject* object_to_release = nullptr;
+    AnonymousSwapMapping* mapping_to_delete = nullptr;
+    uint64_t const COW_LOCK_FLAGS = cow_pte_lock.lock_irqsave();
+    auto* swap_mapping = find_anonymous_swap_mapping_locked(page_table, vaddr);
+    if (swap_mapping != nullptr) {
+        swap_mapping->cancelled = true;
+        if (swap_mapping->state == AnonymousSwapRuntimeState::SWAPPED && !swap_mapping->pagein_queued) {
+            remove_anonymous_swap_mapping_locked(swap_mapping);
+            object_to_release = detach_anonymous_swap_object_locked(swap_mapping);
+            mapping_to_delete = swap_mapping;
+            anonymous_swap_stats.swapped_pages.fetch_sub(1, std::memory_order_relaxed);
+        } else if (swap_mapping->state == AnonymousSwapRuntimeState::FAILED) {
+            remove_anonymous_swap_mapping_locked(swap_mapping);
+            object_to_release = detach_anonymous_swap_object_locked(swap_mapping);
+            mapping_to_delete = swap_mapping;
+        }
+    }
+
     uint64_t const PIN_LOCK_FLAGS = user_mapping_pin_lock.lock_irqsave();
     PageTableEntry* entry = leaf_entry(page_table, vaddr);
     if (entry == nullptr) {
         user_mapping_pin_lock.unlock_irqrestore(PIN_LOCK_FLAGS);
+        cow_pte_lock.unlock_irqrestore(COW_LOCK_FLAGS);
+        release_anonymous_swap_object(object_to_release);
+        delete mapping_to_delete;
         return;
     }
 
     PageTableEntry const OLD_ENTRY = *entry;
     if (OLD_ENTRY.present == 0 && !is_reserved_leaf(OLD_ENTRY)) {
         user_mapping_pin_lock.unlock_irqrestore(PIN_LOCK_FLAGS);
+        cow_pte_lock.unlock_irqrestore(COW_LOCK_FLAGS);
+        release_anonymous_swap_object(object_to_release);
+        delete mapping_to_delete;
         return;
     }
     owned_frame_untrack_leaf(page_table, vaddr, OLD_ENTRY);
     *entry = paging::purge_page_table_entry();
     user_mapping_pin_lock.unlock_irqrestore(PIN_LOCK_FLAGS);
+    cow_pte_lock.unlock_irqrestore(COW_LOCK_FLAGS);
     flush_pagemap_after_update(page_table, vaddr, false);
     drop_present_leaf_ref(OLD_ENTRY);
+    release_anonymous_swap_object(object_to_release);
+    delete mapping_to_delete;
+}
+
+auto protect_anonymous_swap_page(PageTable* page_table, vaddr_t vaddr, uint64_t flags) -> bool {
+    if (page_table == nullptr) {
+        return false;
+    }
+    vaddr = page_align_down(vaddr);
+    uint64_t const COW_FLAGS = cow_pte_lock.lock_irqsave();
+    auto* mapping = find_anonymous_swap_mapping_locked(page_table, vaddr);
+    if (mapping == nullptr || mapping->state == AnonymousSwapRuntimeState::PAGEOUT) {
+        cow_pte_lock.unlock_irqrestore(COW_FLAGS);
+        return false;
+    }
+
+    uint64_t updated = flags & ~PTE_FRAME_MASK;
+    if ((mapping->original_raw & paging::PAGE_COW) != 0U) {
+        updated |= paging::PAGE_COW;
+        updated &= ~paging::PAGE_WRITE;
+    }
+    mapping->original_raw = updated;
+    PageTableEntry* entry = leaf_entry(page_table, vaddr);
+    if (entry != nullptr && entry->present == 0 && is_reserved_leaf(*entry)) {
+        uint64_t const PIN_FLAGS = user_mapping_pin_lock.lock_irqsave();
+        *entry = pte_from_raw(anonymous_swap_marker_raw(updated));
+        user_mapping_pin_lock.unlock_irqrestore(PIN_FLAGS);
+    }
+    cow_pte_lock.unlock_irqrestore(COW_FLAGS);
+    return true;
 }
 
 namespace {
@@ -4979,6 +6042,7 @@ auto create_destroy_user_space_budget_state(PageTable* pagemap, uint64_t owner_p
     }
 
     state->access_gate_index = begin_user_pagemap_exclusive(pagemap);
+    purge_anonymous_swap_mappings(pagemap);
     owned_frame_purge_pagemap(pagemap);
     state->pagemap = pagemap;
     state->owner_pid = owner_pid;
@@ -5062,6 +6126,7 @@ void destroy_user_space(PageTable* pagemap, uint64_t owner_pid, const char* owne
         return;
     }
     UserPagemapExclusiveScope teardown_scope(pagemap);
+    purge_anonymous_swap_mappings(pagemap);
     owned_frame_purge_pagemap(pagemap);
     DestroyUserSpaceCallStats stats{};
 #ifdef ELF_DEBUG
@@ -5334,6 +6399,13 @@ auto deep_copy_user_pagemap_cow(PageTable* src, PageTable* dst) -> bool {
                 }
             }
         }
+    }
+
+    // The source lifetime gate also joins queued/in-flight swap work. Clone
+    // stable side-table leaves only after the ordinary page-table walk has
+    // created the child's reserved marker entries.
+    if (!clone_anonymous_swap_mappings(src, dst)) {
+        return false;
     }
 
     // Flush TLB for the source (parent) since we modified its PTEs.

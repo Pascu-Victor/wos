@@ -753,6 +753,15 @@ struct Task {
     // under the RQ lock in deferred_task_switch to avoid lost wakeups.
     std::atomic<bool> wakeup_pending{false};
 
+    // Intrusive, allocation-free anonymous-swap fault waiter. The VM side
+    // publishes/removes these fields under its page-state lock. Completion is
+    // task-owned so a worker may retire the page-state record before the
+    // scheduler resolves the completion-before-park race.
+    void* anonymous_swap_wait_mapping{};
+    Task* anonymous_swap_wait_next{};
+    uint64_t anonymous_swap_wait_generation{};
+    std::atomic<uint64_t> anonymous_swap_completion_generation{};
+
     // Coalesce concurrent cross-CPU reschedule requests behind one queue
     // transition leader. A task may be woken simultaneously by unrelated
     // event producers targeting different CPUs; distinct target runqueue

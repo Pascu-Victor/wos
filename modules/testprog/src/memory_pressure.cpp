@@ -14,6 +14,19 @@
 namespace {
 
 constexpr size_t PAGE_SIZE = 4096;
+constexpr uint64_t FNV_OFFSET = 1469598103934665603ULL;
+constexpr uint64_t FNV_PRIME = 1099511628211ULL;
+
+auto pressure_byte(size_t offset) -> uint8_t {
+    uint64_t const PAGE = offset / PAGE_SIZE;
+    uint64_t const IN_PAGE = offset % PAGE_SIZE;
+    return static_cast<uint8_t>((PAGE * 131U) ^ (IN_PAGE * 17U) ^ (PAGE >> 8U) ^ 0xA5U);
+}
+
+void hash_byte(uint64_t& hash, uint8_t byte) {
+    hash ^= byte;
+    hash *= FNV_PRIME;
+}
 
 auto parse_size(const char* text, uint64_t& out) -> bool {
     if (text == nullptr || *text == '\0') {
@@ -105,17 +118,33 @@ auto run_memory_pressure(int argc, char** argv) -> int {
         return 1;
     }
 
-    auto* region = static_cast<uint8_t*>(mapping);
-    for (size_t offset = 0; offset < bytes; offset += PAGE_SIZE) {
-        region[offset] = static_cast<uint8_t>((offset / PAGE_SIZE) & 0xffU);
+    auto* region = static_cast<volatile uint8_t*>(mapping);
+    uint64_t expected_hash = FNV_OFFSET;
+    for (size_t offset = 0; offset < bytes; ++offset) {
+        uint8_t const VALUE = pressure_byte(offset);
+        region[offset] = VALUE;
+        hash_byte(expected_hash, VALUE);
     }
-    std::println(R"({{"event":"memory_pressure_ready","bytes":{},"pages":{},"hold_seconds":{}}})", static_cast<uint64_t>(bytes),
-                 static_cast<uint64_t>(bytes / PAGE_SIZE), hold_seconds);
+    std::println(R"({{"event":"memory_pressure_ready","bytes":{},"pages":{},"hold_seconds":{},"hash":"{:016x}"}})",
+                 static_cast<uint64_t>(bytes), static_cast<uint64_t>(bytes / PAGE_SIZE), hold_seconds, expected_hash);
     std::fflush(stdout);
 
     timespec remaining{.tv_sec = static_cast<time_t>(hold_seconds), .tv_nsec = 0};
     while (nanosleep(&remaining, &remaining) != 0 && errno == EINTR) {
     }
+
+    uint64_t actual_hash = FNV_OFFSET;
+    size_t mismatches = 0;
+    for (size_t offset = 0; offset < bytes; ++offset) {
+        uint8_t const VALUE = region[offset];
+        hash_byte(actual_hash, VALUE);
+        if (VALUE != pressure_byte(offset)) {
+            ++mismatches;
+        }
+    }
+    std::println(R"({{"event":"memory_pressure_verified","bytes":{},"pages":{},"hash":"{:016x}","mismatches":{}}})",
+                 static_cast<uint64_t>(bytes), static_cast<uint64_t>(bytes / PAGE_SIZE), actual_hash, static_cast<uint64_t>(mismatches));
+    std::fflush(stdout);
 
     if (munmap(mapping, bytes) != 0) {
         std::println(stderr, "memory-pressure: munmap failed errno={}", errno);
@@ -123,5 +152,5 @@ auto run_memory_pressure(int argc, char** argv) -> int {
     }
     std::println(R"({{"event":"memory_pressure_released","bytes":{},"pages":{}}})", static_cast<uint64_t>(bytes),
                  static_cast<uint64_t>(bytes / PAGE_SIZE));
-    return 0;
+    return mismatches == 0 && actual_hash == expected_hash ? 0 : 1;
 }

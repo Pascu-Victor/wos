@@ -16,7 +16,6 @@
 #include <new>
 #include <platform/dbg/dbg.hpp>
 #include <test/fault_block_device.hpp>
-#include <test/fault_block_device_impl.hpp>
 #include <test/ktest.hpp>
 #include <vfs/buffer_cache.hpp>
 #include <vfs/fs/xfs/xfs_alloc.hpp>

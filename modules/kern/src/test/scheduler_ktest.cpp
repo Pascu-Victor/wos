@@ -23,6 +23,7 @@ static constexpr uint32_t WEIGHT_NICE_N5 = 3121;  // nice=-5 (higher prio)
 namespace ker::mod::sched {
 auto scheduler_selftest_transition_validator_detects_corruption() -> bool;
 auto scheduler_selftest_handoff_preserves_runnable_event_token() -> bool;
+auto scheduler_selftest_exception_wait_token_closes_prepark_race() -> bool;
 auto scheduler_selftest_reserved_wake_precedes_handoff_commit() -> bool;
 auto scheduler_selftest_concurrent_reschedule_requests_are_serialized() -> bool;
 auto scheduler_selftest_runtime_delta_saturates() -> bool;
@@ -340,6 +341,10 @@ KTEST(SchedulerWake, RemoteExecProxyPreservesDeferredSwitch) {
 
 KTEST(SchedulerHandoff, RunnableEventTokenSurvivesCommit) {
     KEXPECT_TRUE(ker::mod::sched::scheduler_selftest_handoff_preserves_runnable_event_token());
+}
+
+KTEST(SchedulerHandoff, ExceptionWaitTokenClosesPreparkRace) {
+    KEXPECT_TRUE(ker::mod::sched::scheduler_selftest_exception_wait_token_closes_prepark_race());
 }
 
 KTEST(SchedulerHandoff, ReservedWakePrecedesCommit) {

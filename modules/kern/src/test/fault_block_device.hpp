@@ -64,6 +64,8 @@ class FaultBlockDevice final {
 
     void clear_history();
     void clear_fault();
+    void set_unavailable(int error = -ENODEV);
+    void clear_unavailable();
 
     // Arm a one-shot fault for the exact one-based occurrence of operation.
     // TORN_PREFIX is meaningful only for writes: the requested prefix becomes
@@ -75,6 +77,17 @@ class FaultBlockDevice final {
     // operation_index. This models a bounded persistent failure through a
     // caller's retry loop while keeping every failed index reproducible.
     auto fail_operations(FaultBlockOperation operation, uint64_t operation_index, uint64_t operation_count, int error = -EIO) -> bool;
+
+    // Copy an exact prefix into the caller's read buffer and then fail.  This
+    // is the synchronous block ABI's deterministic representation of a short
+    // read: partial transfer is observable in history, but success is never
+    // reported for an incomplete page.
+    auto fail_read_prefix(uint64_t operation_index, size_t prefix_bytes, int error = -EIO) -> bool;
+
+    // Complete a read successfully after flipping one byte in the returned
+    // data.  Integrity-aware consumers must reject this independently of the
+    // transport result.
+    auto corrupt_read(uint64_t operation_index, size_t byte_offset, uint8_t xor_mask = 1) -> bool;
 
     // Arm by the absolute one-based history index instead of an operation-
     // local index. This is useful when a complete baseline trace is replayed.
@@ -103,6 +116,10 @@ class FaultBlockDevice final {
         int error{};
         FaultBlockWriteMode write_mode{FaultBlockWriteMode::FAIL_BEFORE_IO};
         size_t torn_prefix_bytes{};
+        size_t read_prefix_bytes{};
+        size_t corrupt_byte_offset{};
+        uint8_t corrupt_xor_mask{};
+        bool corrupt_read{};
         bool armed{};
     };
 
@@ -131,6 +148,7 @@ class FaultBlockDevice final {
     uint64_t global_operation_count_{};
     uint64_t durability_generation_{};
     uint64_t power_cut_count_{};
+    int unavailable_error_{};
     bool valid_{};
     bool history_overflowed_{};
 };

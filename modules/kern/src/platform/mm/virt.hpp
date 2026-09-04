@@ -41,6 +41,26 @@ struct UserMemoryStats {
     uint64_t resident_pages;
     uint64_t shared_pages;
     uint64_t page_table_pages;
+    uint64_t swapped_pages;
+    uint64_t swap_inflight_pages;
+};
+
+struct AnonymousSwapStatsSnapshot {
+    uint64_t resident_candidates;
+    uint64_t swapped_pages;
+    uint64_t pageout_inflight;
+    uint64_t pagein_inflight;
+    uint64_t pageout_attempts;
+    uint64_t pageout_successes;
+    uint64_t pageout_failures;
+    uint64_t pagein_attempts;
+    uint64_t pagein_successes;
+    uint64_t pagein_failures;
+    uint64_t pagein_corruption;
+    uint64_t pageout_latency_us;
+    uint64_t pageout_latency_max_us;
+    uint64_t pagein_latency_us;
+    uint64_t pagein_latency_max_us;
 };
 
 struct UserPagePin {
@@ -144,6 +164,9 @@ bool is_page_mapped_or_reserved(PageTable* page_table, vaddr_t vaddr);
 void unify_page_flags(PageTable* page_table, vaddr_t vaddr, uint64_t flags);
 void map_range(PageTable* page_table, Range range, uint64_t flags, uint64_t offset = 0);
 void unmap_page(PageTable* page_table, vaddr_t vaddr);
+// Updates protection metadata for a non-resident anonymous leaf without
+// faulting it in. Returns true when the page is tracked by anonymous swap.
+[[nodiscard]] auto protect_anonymous_swap_page(PageTable* page_table, vaddr_t vaddr, uint64_t flags) -> bool;
 
 void switch_to_kernel_pagemap();
 PageTable* get_kernel_pagemap();
@@ -210,12 +233,20 @@ bool selftest_kernel_page_table_frame(const void* ptr);
 // Models the teardown/fork writer side of the shared-pagemap gate and proves
 // an IRQ/scheduler-style mapped pin fails closed instead of waiting or walking.
 bool selftest_user_pagemap_exclusive_rejects_mapped_pin(PageTable* pagemap);
+// Deterministic task-context hooks used by KTEST to exercise the real PTE,
+// refcount, swap-backend, and teardown paths without inducing allocator OOM.
+bool selftest_anonymous_swap_pageout(PageTable* pagemap, vaddr_t vaddr);
+bool selftest_anonymous_swap_pagein(PageTable* pagemap, vaddr_t vaddr);
+bool selftest_anonymous_swap_is_swapped(PageTable* pagemap, vaddr_t vaddr);
 #endif
 auto install_lazy_file_page_if_current(sched::task::Task* task, const sched::task::LazyVmemRange& range, vaddr_t page_vaddr,
                                        paddr_t page_paddr, uint64_t page_flags) -> LazyFilePageInstallResult;
 bool ensure_user_page_writable(sched::task::Task* task, vaddr_t vaddr);
 bool ensure_user_page_mapped(sched::task::Task* task, vaddr_t vaddr);
 auto collect_user_memory_stats(PageTable* page_table) -> UserMemoryStats;
+void get_anonymous_swap_stats_snapshot(AnonymousSwapStatsSnapshot& out);
+void register_anonymous_swap_shrinker();
+void start_anonymous_swap_worker();
 auto get_destroy_user_space_stats(uint64_t cpu_no) -> DestroyUserSpaceStats;
 auto create_destroy_user_space_budget_state(PageTable* pagemap, uint64_t owner_pid = 0, const char* owner_name = nullptr,
                                             const char* reason = nullptr) -> DestroyUserSpaceBudgetState*;

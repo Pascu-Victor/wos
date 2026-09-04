@@ -145,7 +145,7 @@ def test_tmpfs_page_model_keeps_sparse_pages_and_swaps_cold_resident_pages() -> 
     require_order(evict_body, "swap::write_slot(slot, page.data)", "phys::page_free(page.data)", "tmpfs evicts only after swap write")
 
 
-def test_swap_backings_are_local_block_or_xfs_and_swapoff_checks_use() -> None:
+def test_swap_backings_are_local_block_or_xfs_and_swapoff_drains_use() -> None:
     swap = SWAP_CPP.read_text()
     xfs = XFS_CPP.read_text()
 
@@ -156,10 +156,12 @@ def test_swap_backings_are_local_block_or_xfs_and_swapoff_checks_use() -> None:
             "vfs_open_file(path, O_RDWR | ker::vfs::O_LOCAL | ker::vfs::O_NO_CACHE, 0)",
             "file->fs_type != ker::vfs::FSType::XFS",
             "xfs_collect_swap_extents(file, &extents, &extent_count)",
-            "area->used_pages != 0",
-            "return -EBUSY;",
+            "area->state = AreaState::DRAINING;",
+            "consumers[i].migrate_area(consumers[i].context, area_id)",
+            "migration_ret < 0 || area->used_pages != 0",
+            "area->state = AreaState::ACTIVE;",
         ],
-        "swap backing validation and swapoff busy behavior",
+        "swap backing validation and transactional swapoff draining",
     )
     require_tokens(
         xfs,
@@ -261,7 +263,7 @@ def test_init_fstab_and_proc_meminfo_consume_swap_stats() -> None:
 if __name__ == "__main__":
     test_mount_data_and_tmpfs_size_cap_are_wired()
     test_tmpfs_page_model_keeps_sparse_pages_and_swaps_cold_resident_pages()
-    test_swap_backings_are_local_block_or_xfs_and_swapoff_checks_use()
+    test_swap_backings_are_local_block_or_xfs_and_swapoff_drains_use()
     test_swapon_swapoff_are_appended_kernel_and_mlibc_abi_ops()
     test_init_fstab_and_proc_meminfo_consume_swap_stats()
     print("tmpfs swap source invariants hold")

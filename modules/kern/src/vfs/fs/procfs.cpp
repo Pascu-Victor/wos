@@ -758,8 +758,8 @@ auto procfs_readdir(File* f, DirEntry* buf, size_t count) -> int {
     }
 
     if (pfd->node.type == ProcNodeType::MEMACC_RECLAIM_DIR) {
-        constexpr std::array<const char*, 5> ENTRIES{
-            "buffer_cache", "packet_pool", "xfs_inode", "file_mmap_cache", "coordinator",
+        constexpr std::array<const char*, 6> ENTRIES{
+            "buffer_cache", "packet_pool", "xfs_inode", "file_mmap_cache", "anonymous_swap", "coordinator",
         };
         size_t const INDEX = count - 2;
         if (INDEX >= ENTRIES.size()) {
@@ -845,6 +845,9 @@ auto generate_status(uint64_t pid, char* buf, size_t bufsz, bool thread_view) ->
     append(" kB");
     append("\nVmRSS:\t");
     append_int(MEM.resident_pages * (ker::mod::mm::paging::PAGE_SIZE / KIB));
+    append(" kB");
+    append("\nVmSwap:\t");
+    append_int(MEM.swapped_pages * (ker::mod::mm::paging::PAGE_SIZE / KIB));
     append(" kB");
     append("\nRssShmem:\t");
     append_int(MEM.shared_pages * (ker::mod::mm::paging::PAGE_SIZE / KIB));
@@ -2680,6 +2683,8 @@ struct MemaccProcessTotals {
     uint64_t kernel_task_count;
     uint64_t virtual_bytes;
     uint64_t resident_bytes;
+    uint64_t swapped_bytes;
+    uint64_t swap_inflight_bytes;
     uint64_t shared_bytes;
     uint64_t pte_bytes;
     uint64_t code_bytes;
@@ -2726,6 +2731,9 @@ auto collect_memacc_process_totals() -> MemaccProcessTotals {
             ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;
             auto const LAYOUT = task_memacc_layout_locked(*task);
             add_process_totals(totals, ker::mod::mm::memacc::collect_user_memory_breakdown(task->pagemap, LAYOUT));
+            auto const SWAP_MEM = ker::mod::mm::virt::collect_user_memory_stats(task->pagemap);
+            totals.swapped_bytes += pages_to_bytes(SWAP_MEM.swapped_pages);
+            totals.swap_inflight_bytes += pages_to_bytes(SWAP_MEM.swap_inflight_pages);
         }
         task->release();
     }
@@ -2764,6 +2772,8 @@ auto generate_memacc_summary(char* buf, size_t bufsz) -> size_t {
     ker::mod::mm::dyn::kmalloc::KmallocTrackedTotals kmalloc{};
     ker::mod::mm::dyn::kmalloc::get_tracked_alloc_breakdown(kmalloc);
     auto const KMALLOC_DEBUG = ker::mod::mm::dyn::kmalloc::debug_info_stats();
+    ker::mod::mm::virt::AnonymousSwapStatsSnapshot anonymous_swap{};
+    ker::mod::mm::virt::get_anonymous_swap_stats_snapshot(anonymous_swap);
 
     uint64_t const KMALLOC_BYTES = kmalloc.medium_bytes + kmalloc.large_bytes;
     uint64_t const KMALLOC_DEBUG_BYTES = KMALLOC_DEBUG.block_bytes;
@@ -2808,6 +2818,8 @@ auto generate_memacc_summary(char* buf, size_t bufsz) -> size_t {
     append_memacc_dec(p, end, "kernel_tasks", PROC.kernel_task_count);
     append_memacc_dec(p, end, "process_virtual_bytes", PROC.virtual_bytes);
     append_memacc_dec(p, end, "process_rss_bytes", PROC.resident_bytes);
+    append_memacc_dec(p, end, "process_swap_bytes", PROC.swapped_bytes);
+    append_memacc_dec(p, end, "process_swap_inflight_bytes", PROC.swap_inflight_bytes);
     append_memacc_dec(p, end, "process_shared_bytes", PROC.shared_bytes);
     append_memacc_dec(p, end, "process_pte_bytes", PROC.pte_bytes);
     append_memacc_dec(p, end, "process_code_bytes", PROC.code_bytes);
@@ -2824,6 +2836,24 @@ auto generate_memacc_summary(char* buf, size_t bufsz) -> size_t {
     append_memacc_dec(p, end, "logical_kmalloc_debug_pool_bytes", KMALLOC_DEBUG_BYTES);
     append_memacc_dec(p, end, "logical_mini_slab_bytes", MINI_BYTES);
     append_memacc_dec(p, end, "logical_cache_bytes", LOGICAL_CACHE_BYTES);
+    append_char(p, end, '\n');
+
+    append_sconst(p, end, "anonymous_swap");
+    append_memacc_dec(p, end, "resident_candidates", anonymous_swap.resident_candidates);
+    append_memacc_dec(p, end, "swapped_pages", anonymous_swap.swapped_pages);
+    append_memacc_dec(p, end, "pageout_inflight", anonymous_swap.pageout_inflight);
+    append_memacc_dec(p, end, "pagein_inflight", anonymous_swap.pagein_inflight);
+    append_memacc_dec(p, end, "pageout_attempts", anonymous_swap.pageout_attempts);
+    append_memacc_dec(p, end, "pageout_successes", anonymous_swap.pageout_successes);
+    append_memacc_dec(p, end, "pageout_failures", anonymous_swap.pageout_failures);
+    append_memacc_dec(p, end, "pagein_attempts", anonymous_swap.pagein_attempts);
+    append_memacc_dec(p, end, "pagein_successes", anonymous_swap.pagein_successes);
+    append_memacc_dec(p, end, "pagein_failures", anonymous_swap.pagein_failures);
+    append_memacc_dec(p, end, "pagein_corruption", anonymous_swap.pagein_corruption);
+    append_memacc_dec(p, end, "pageout_latency_us", anonymous_swap.pageout_latency_us);
+    append_memacc_dec(p, end, "pageout_latency_max_us", anonymous_swap.pageout_latency_max_us);
+    append_memacc_dec(p, end, "pagein_latency_us", anonymous_swap.pagein_latency_us);
+    append_memacc_dec(p, end, "pagein_latency_max_us", anonymous_swap.pagein_latency_max_us);
     append_char(p, end, '\n');
 
     for (const auto& descriptor : ker::mod::mm::phys::physical_owner_descriptors()) {
@@ -2942,6 +2972,7 @@ auto generate_memacc_procs(char* buf, size_t bufsz) -> size_t {
             ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;
             auto const LAYOUT = task_memacc_layout_locked(*task);
             auto const MEM = ker::mod::mm::memacc::collect_user_memory_breakdown(task->pagemap, LAYOUT);
+            auto const SWAP_MEM = ker::mod::mm::virt::collect_user_memory_stats(task->pagemap);
             append_sconst(p, end, "proc");
             append_memacc_dec(p, end, "pid", task->pid);
             append_memacc_dec(p, end, "ppid", task->parent_pid);
@@ -2955,6 +2986,8 @@ auto generate_memacc_procs(char* buf, size_t bufsz) -> size_t {
             append_memacc_str(p, end, "cmd", task_command_name(task));
             append_memacc_dec(p, end, "virt_bytes", pages_to_bytes(MEM.virtual_pages));
             append_memacc_dec(p, end, "rss_bytes", pages_to_bytes(MEM.resident_pages));
+            append_memacc_dec(p, end, "swap_bytes", pages_to_bytes(SWAP_MEM.swapped_pages));
+            append_memacc_dec(p, end, "swap_inflight_bytes", pages_to_bytes(SWAP_MEM.swap_inflight_pages));
             append_memacc_dec(p, end, "shr_bytes", pages_to_bytes(MEM.shared_pages));
             append_memacc_dec(p, end, "pte_bytes", pages_to_bytes(MEM.page_table_pages));
             append_memacc_dec(p, end, "code_bytes", pages_to_bytes(MEM.code_pages));
@@ -3482,6 +3515,24 @@ auto generate_memacc_reclaim_file_mmap_cache(char* buf, size_t bufsz) -> size_t 
     append_memacc_dec(p, end, "pages", CACHE.pages);
     append_memacc_dec(p, end, "bytes", CACHE.bytes);
     append_memacc_dec(p, end, "capacity_pages", CACHE.capacity_pages);
+    append_char(p, end, '\n');
+    *p = '\0';
+    return static_cast<size_t>(p - buf);
+}
+
+auto generate_memacc_reclaim_anonymous_swap(char* buf, size_t bufsz) -> size_t {
+    char* p = buf;
+    char const* end = buf + bufsz - 1;
+    ker::mod::mm::virt::AnonymousSwapStatsSnapshot stats{};
+    ker::mod::mm::virt::get_anonymous_swap_stats_snapshot(stats);
+    append_sconst(p, end, "reclaim");
+    append_memacc_str(p, end, "name", "anonymous_swap");
+    append_memacc_dec(p, end, "resident_candidates", stats.resident_candidates);
+    append_memacc_dec(p, end, "swapped_pages", stats.swapped_pages);
+    append_memacc_dec(p, end, "pageout_inflight", stats.pageout_inflight);
+    append_memacc_dec(p, end, "pagein_inflight", stats.pagein_inflight);
+    append_memacc_dec(p, end, "pageout_successes", stats.pageout_successes);
+    append_memacc_dec(p, end, "pagein_successes", stats.pagein_successes);
     append_char(p, end, '\n');
     *p = '\0';
     return static_cast<size_t>(p - buf);
@@ -5670,6 +5721,7 @@ auto procfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
              pfd->node.type == ProcNodeType::MEMACC_RECLAIM_PACKET_POOL_FILE ||
              pfd->node.type == ProcNodeType::MEMACC_RECLAIM_XFS_INODE_FILE ||
              pfd->node.type == ProcNodeType::MEMACC_RECLAIM_FILE_MMAP_CACHE_FILE ||
+             pfd->node.type == ProcNodeType::MEMACC_RECLAIM_ANONYMOUS_SWAP_FILE ||
              pfd->node.type == ProcNodeType::MEMACC_RECLAIM_COORDINATOR_FILE);
         size_t alloc_sz = MAX_PROCFS_BUF;
         if (IS_MEMACC || IS_RUNTIME_MAP || IS_LARGE_WKI) {
@@ -5812,6 +5864,9 @@ auto procfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
                 break;
             case ProcNodeType::MEMACC_RECLAIM_FILE_MMAP_CACHE_FILE:
                 pfd->content_len = generate_memacc_reclaim_file_mmap_cache(pfd->content, MAX_PROCFS_BUF);
+                break;
+            case ProcNodeType::MEMACC_RECLAIM_ANONYMOUS_SWAP_FILE:
+                pfd->content_len = generate_memacc_reclaim_anonymous_swap(pfd->content, MAX_PROCFS_BUF);
                 break;
             case ProcNodeType::MEMACC_RECLAIM_COORDINATOR_FILE:
                 pfd->content_len = generate_memacc_reclaim_coordinator(pfd->content, MAX_MEMACC_BUF);
@@ -6103,6 +6158,25 @@ auto procfs_write_memacc_reclaim_file_mmap_cache(const char* s, size_t count) ->
     return static_cast<ssize_t>(count);
 }
 
+auto procfs_write_memacc_reclaim_anonymous_swap(const char* s, size_t count) -> ssize_t {
+    if (count == 0) {
+        return 0;
+    }
+
+    uint64_t max_pages = 0;
+    if (procfs_command_equals(s, count, "drop") || procfs_command_equals(s, count, "all")) {
+        max_pages = UINT64_MAX;
+    } else if (procfs_command_equals(s, count, "status")) {
+        return static_cast<ssize_t>(count);
+    } else if (!procfs_parse_u64_trimmed(s, count, max_pages) || max_pages == 0) {
+        return -EINVAL;
+    }
+    if (!procfs_request_explicit_reclaim("anonymous_swap", max_pages, max_pages)) {
+        return -EBUSY;
+    }
+    return static_cast<ssize_t>(count);
+}
+
 auto procfs_write(File* f, const void* buf, size_t count, size_t /*offset*/) -> ssize_t {
     if (f == nullptr || f->private_data == nullptr || buf == nullptr) {
         return -EINVAL;
@@ -6164,6 +6238,9 @@ auto procfs_write(File* f, const void* buf, size_t count, size_t /*offset*/) -> 
     }
     if (pfd->node.type == ProcNodeType::MEMACC_RECLAIM_FILE_MMAP_CACHE_FILE) {
         return procfs_write_memacc_reclaim_file_mmap_cache(static_cast<const char*>(buf), count);
+    }
+    if (pfd->node.type == ProcNodeType::MEMACC_RECLAIM_ANONYMOUS_SWAP_FILE) {
+        return procfs_write_memacc_reclaim_anonymous_swap(static_cast<const char*>(buf), count);
     }
     if (pfd->node.type != ProcNodeType::KPERFCTL_FILE) {
         return -EPERM;
@@ -6428,7 +6505,8 @@ auto procfs_fill_stat(File* f, Stat* statbuf, dev_t dev_id) -> int {
                pfd->node.type == ProcNodeType::MEMACC_RECLAIM_BUFFER_CACHE_FILE ||
                pfd->node.type == ProcNodeType::MEMACC_RECLAIM_PACKET_POOL_FILE ||
                pfd->node.type == ProcNodeType::MEMACC_RECLAIM_XFS_INODE_FILE ||
-               pfd->node.type == ProcNodeType::MEMACC_RECLAIM_FILE_MMAP_CACHE_FILE) {
+               pfd->node.type == ProcNodeType::MEMACC_RECLAIM_FILE_MMAP_CACHE_FILE ||
+               pfd->node.type == ProcNodeType::MEMACC_RECLAIM_ANONYMOUS_SWAP_FILE) {
         statbuf->st_mode = S_IFREG | 0644;
     } else {
         statbuf->st_mode = S_IFREG | 0444;
@@ -6801,6 +6879,9 @@ auto procfs_open_path(const char* path, int flags, int mode) -> File* {
     }
     if (strcmp(path, "memacc/reclaim/file_mmap_cache") == 0) {
         return make_file(ProcNodeType::MEMACC_RECLAIM_FILE_MMAP_CACHE_FILE, 0, false);
+    }
+    if (strcmp(path, "memacc/reclaim/anonymous_swap") == 0) {
+        return make_file(ProcNodeType::MEMACC_RECLAIM_ANONYMOUS_SWAP_FILE, 0, false);
     }
     if (strcmp(path, "memacc/reclaim/coordinator") == 0) {
         return make_file(ProcNodeType::MEMACC_RECLAIM_COORDINATOR_FILE, 0, false);

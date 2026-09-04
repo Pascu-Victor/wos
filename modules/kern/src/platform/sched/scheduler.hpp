@@ -489,6 +489,19 @@ void request_gc_memory_pressure();                                         // Re
 auto reclaim_memory_pressure() -> uint32_t;                                // Synchronously run one exclusive pressure-GC pass when safe
 void start_gc_worker();                                                    // Start scheduler GC daemon after init task creation
 void request_local_timer_recheck();                                        // Arm a local timer tick after a new current-task deadline
+enum class ExceptionWaitResult : uint8_t {
+    COMPLETION_WON,
+    PARKED,
+};
+
+// Conditionally park the current task from an exception frame.  The producer
+// publishes completion by storing expected_generation in completion_token and
+// then wakes the task normally.  Any other token value means the operation is
+// still pending.  The token must remain alive until this call returns after
+// any park.
+[[nodiscard]] auto place_task_in_wait_queue_if_pending(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& frame,
+                                                       const std::atomic<uint64_t>& completion_token, uint64_t expected_generation)
+    -> ExceptionWaitResult;
 void place_task_in_wait_queue(ker::mod::cpu::GPRegs& gpr,
                               ker::mod::gates::InterruptFrame& frame);  // Move current task to wait queue with context saved
 extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr,

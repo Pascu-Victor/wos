@@ -3458,6 +3458,7 @@ void init() {
     mm::virt::init_tlb_shootdown();
     register_scheduler_gc_shrinker();
     ker::syscall::vmem::file_mmap_cache_register_shrinker();
+    mm::virt::register_anonymous_swap_shrinker();
 }
 
 void setup_queues() {
@@ -3477,6 +3478,7 @@ void setup_queues() {
     mm::virt::init_tlb_shootdown();
     register_scheduler_gc_shrinker();
     ker::syscall::vmem::file_mmap_cache_register_shrinker();
+    mm::virt::register_anonymous_swap_shrinker();
 }
 
 void percpu_init() {
@@ -5617,6 +5619,97 @@ extern "C" void deferred_task_switch(ker::mod::cpu::GPRegs* gpr_ptr, [[maybe_unu
 // ============================================================================
 // placeTaskInWaitQueue - block current task on I/O
 // ============================================================================
+
+namespace {
+[[nodiscard]] auto exception_wait_is_pending_locked(task::Task* current_task, const std::atomic<uint64_t>& completion_token,
+                                                    uint64_t expected_generation) -> bool {
+    bool const COMPLETED = completion_token.load(std::memory_order_acquire) == expected_generation;
+    bool const WOKE = current_task->wakeup_pending.exchange(false, std::memory_order_acquire);
+    return !COMPLETED && !WOKE;
+}
+}  // namespace
+
+auto place_task_in_wait_queue_if_pending(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& frame,
+                                         const std::atomic<uint64_t>& completion_token, uint64_t expected_generation)
+    -> ExceptionWaitResult {
+    auto* current_task = get_current_task();
+    if (current_task == nullptr || run_queues == nullptr) {
+        return ExceptionWaitResult::COMPLETION_WON;
+    }
+
+    bool parked = false;
+    task::Task* next_task = run_queues->this_cpu_locked([current_task, &gpr, &frame, &completion_token, expected_generation,
+                                                         &parked](RunQueue* rq) -> task::Task* {
+        // Completion producers wake through the scheduler.  Their token
+        // publication can race before this lock; their wake can race
+        // after it.  Checking both while current-task ownership is stable
+        // closes both sides without changing the generic ptrace wait path.
+        if (rq->current_task != current_task || !exception_wait_is_pending_locked(current_task, completion_token, expected_generation)) {
+            return nullptr;
+        }
+
+        current_task->context.regs = gpr;
+        current_task->context.frame = frame;
+        sys::context_switch::record_saved_frame_class(current_task, current_task->context.frame, task::SavedFrameOrigin::INTERRUPT);
+        if (current_task->type == task::TaskType::PROCESS) {
+            sys::context_switch::save_fpu_state(current_task);
+        }
+
+        uint64_t const NOW_US = time::get_us();
+        if (rq->runnable_heap.contains(current_task)) {
+            (void)transition_detach_runnable_locked(rq, current_task);
+        }
+        current_task->last_run_us = current_task->slice_used_ns / 1000U;
+        current_task->perf_wait_callsite = current_task->context.frame.rip;
+        current_task->last_sleep_start_us = NOW_US;
+        transition_make_waiting_locked(rq, current_task);
+        parked = true;
+
+        if (rq->runnable_heap.size == 0) {
+            return nullptr;
+        }
+        int64_t const AVG = compute_avg_vruntime(rq);
+        task::Task* next = rq->runnable_heap.pick_best_eligible(AVG);
+        reserve_handoff_task_locked(rq, next, NOW_US);
+        return next;
+    });
+
+    if (!parked) {
+        return ExceptionWaitResult::COMPLETION_WON;
+    }
+
+    if (next_task != nullptr && next_task->type != task::TaskType::IDLE) {
+        bool const FIRST_RUN_DAEMON = next_task->type == task::TaskType::DAEMON && !next_task->has_run;
+        prepare_first_run_daemon(next_task, "conditional-exception-wait");
+        if (!sys::context_switch::switch_to(gpr, frame, next_task)) {
+            dbg::log("conditional exception wait: switchTo failed, entering idle");
+            auto* rq = run_queues->this_cpu();
+            clear_handoff_task(next_task);
+            enter_idle_loop(rq);
+        } else {
+            record_local_proc_first_run(next_task, WOS_PERF_CALLSITE());
+            next_task->has_run = true;
+            // Unlike IRQ32, a page-fault exception normally returns through the
+            // generic IDT epilogue.  That epilogue cannot restore RSP for a
+            // same-CPL kernel target, so returning here after patching frame
+            // would run the daemon continuation on the faulting process's
+            // kernel stack.  Complete the handoff through the context-switch
+            // return path, which rebuilds the iret frame on the saved target
+            // stack (or starts a brand-new daemon on its own stack).
+            if (FIRST_RUN_DAEMON) {
+                wos_start_kernel_thread(next_task->context.frame.rsp, next_task->kthread_entry);
+                __builtin_unreachable();
+            }
+            wos_deferred_task_switch_return(&gpr, &frame);
+            __builtin_unreachable();
+        }
+    } else {
+        auto* rq = run_queues->this_cpu();
+        enter_idle_loop(rq);
+    }
+
+    return ExceptionWaitResult::PARKED;
+}
 
 void place_task_in_wait_queue(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& frame) {
     auto* current_task = get_current_task();
@@ -8500,6 +8593,25 @@ auto scheduler_selftest_handoff_preserves_runnable_event_token() -> bool {
     requeue_woken_outgoing_task_locked(&rq, &outgoing, 1);
 
     return outgoing.sched_queue == task::Task::sched_queue::RUNNABLE && outgoing.wakeup_pending.load(std::memory_order_acquire);
+}
+
+auto scheduler_selftest_exception_wait_token_closes_prepark_race() -> bool {
+    task::Task waiter{};
+    std::atomic<uint64_t> completion_token{40};
+
+    waiter.wakeup_pending.store(false, std::memory_order_relaxed);
+    if (!exception_wait_is_pending_locked(&waiter, completion_token, 41)) {
+        return false;
+    }
+
+    completion_token.store(41, std::memory_order_release);
+    if (exception_wait_is_pending_locked(&waiter, completion_token, 41)) {
+        return false;
+    }
+
+    completion_token.store(40, std::memory_order_relaxed);
+    waiter.wakeup_pending.store(true, std::memory_order_release);
+    return !exception_wait_is_pending_locked(&waiter, completion_token, 41) && !waiter.wakeup_pending.load(std::memory_order_acquire);
 }
 
 auto scheduler_selftest_reserved_wake_precedes_handoff_commit() -> bool {

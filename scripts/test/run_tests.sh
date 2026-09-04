@@ -261,6 +261,7 @@ UNIT_TESTS=(
     buffer_cache_test
     physical_balance_test
     reclaim_policy_test
+    anonymous_swap_state_test
     vmem_source_test
 )
 

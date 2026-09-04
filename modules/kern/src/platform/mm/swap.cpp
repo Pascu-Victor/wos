@@ -1,5 +1,6 @@
 #include "swap.hpp"
 
+#include <array>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
@@ -7,6 +8,7 @@
 #include <dev/block_device.hpp>
 #include <platform/mm/paging.hpp>
 #include <platform/sys/mutex.hpp>
+#include <util/crc32c.hpp>
 #include <util/smallvec.hpp>
 #include <vfs/file.hpp>
 #include <vfs/fs/devfs.hpp>
@@ -19,23 +21,40 @@ namespace {
 
 constexpr size_t MAX_SWAP_NAME = 256;
 constexpr uint32_t MAX_SWAP_AREAS = 32;
+constexpr size_t MAX_SWAP_CONSUMERS = 8;
 constexpr size_t PAGE_SIZE = ker::mod::mm::paging::PAGE_SIZE;
+constexpr uint64_t NO_FREE_SLOT = UINT64_MAX;
+
+enum class SlotState : uint8_t { FREE, RESERVED, STORED, RETIRED };
+enum class AreaState : uint8_t { ACTIVE, DRAINING };
+
+struct SlotMetadata {
+    uint64_t generation{};
+    uint64_t next_free = NO_FREE_SLOT;
+    uint32_t checksum{};
+    SlotState state = SlotState::FREE;
+    bool io_in_flight{};
+};
 
 struct SwapArea {
     uint32_t id{};
     char* name{};
     SwapExtent* extents{};
     size_t extent_count{};
-    uint8_t* used{};
+    SlotMetadata* slots{};
+    uint64_t free_head = NO_FREE_SLOT;
     uint64_t total_pages{};
     uint64_t free_pages{};
     uint64_t used_pages{};
-    bool active{};
+    AreaState state = AreaState::ACTIVE;
+    ker::vfs::File* backing_file{};
 };
 
-ker::mod::sys::Mutex g_swap_lock;                // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-ker::util::SmallVec<SwapArea*, 4> g_swap_areas;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-uint32_t g_next_area_id = 1;                     // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+ker::mod::sys::Mutex g_swap_lock;                               // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+ker::util::SmallVec<SwapArea*, 4> g_swap_areas;                 // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+std::array<SwapConsumer, MAX_SWAP_CONSUMERS> g_swap_consumers;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+size_t g_swap_consumer_count{};                                 // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+uint32_t g_next_area_id = 1;                                    // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
 auto copy_name(const char* name) -> char* {
     if (name == nullptr) {
@@ -60,7 +79,10 @@ void destroy_area(SwapArea* area) {
     }
     delete[] area->name;
     delete[] area->extents;
-    delete[] area->used;
+    delete[] area->slots;
+    if (area->backing_file != nullptr) {
+        ker::vfs::vfs_close_file(area->backing_file);
+    }
     delete area;
 }
 
@@ -87,9 +109,24 @@ auto slot_to_extent_locked(SwapArea* area, uint64_t slot, SwapExtent* out) -> bo
     return false;
 }
 
+auto slot_metadata_locked(SwapArea* area, SwapSlot slot, SlotMetadata** out) -> int {
+    if (area == nullptr || out == nullptr || slot.index >= area->total_pages) {
+        return -EINVAL;
+    }
+    SlotMetadata& metadata = area->slots[slot.index];
+    if (metadata.generation != slot.generation) {
+        return -ESTALE;
+    }
+    if (metadata.state == SlotState::FREE || metadata.state == SlotState::RETIRED) {
+        return -EINVAL;
+    }
+    *out = &metadata;
+    return 0;
+}
+
 auto find_area_locked(uint32_t area_id) -> SwapArea* {
     for (auto* area : g_swap_areas) {
-        if (area != nullptr && area->active && area->id == area_id) {
+        if (area != nullptr && area->id == area_id) {
             return area;
         }
     }
@@ -101,16 +138,16 @@ auto find_area_by_name_locked(const char* name) -> SwapArea* {
         return nullptr;
     }
     for (auto* area : g_swap_areas) {
-        if (area != nullptr && area->active && area->name != nullptr && std::strcmp(area->name, name) == 0) {
+        if (area != nullptr && area->name != nullptr && std::strcmp(area->name, name) == 0) {
             return area;
         }
     }
     return nullptr;
 }
 
-auto activate_extents_locked(const char* name, const SwapExtent* extents, size_t extent_count) -> int {
-    if (name == nullptr || extents == nullptr || extent_count == 0 || g_swap_areas.size() >= MAX_SWAP_AREAS ||
-        find_area_by_name_locked(name) != nullptr) {
+auto activate_extents_locked(const char* name, const SwapExtent* extents, size_t extent_count, ker::vfs::File* backing_file) -> int {
+    if (name == nullptr || std::strlen(name) >= MAX_SWAP_NAME || extents == nullptr || extent_count == 0 ||
+        g_swap_areas.size() >= MAX_SWAP_AREAS || find_area_by_name_locked(name) != nullptr) {
         return -EINVAL;
     }
 
@@ -118,6 +155,15 @@ auto activate_extents_locked(const char* name, const SwapExtent* extents, size_t
     for (size_t i = 0; i < extent_count; ++i) {
         if (!block_device_usable_for_swap(extents[i].device) || extents[i].page_count == 0 ||
             total_pages > UINT64_MAX - extents[i].page_count) {
+            return -EINVAL;
+        }
+        uint64_t const BLOCKS_PER_PAGE = PAGE_SIZE / extents[i].device->block_size;
+        if (extents[i].page_count > UINT64_MAX / BLOCKS_PER_PAGE) {
+            return -EINVAL;
+        }
+        uint64_t const EXTENT_BLOCKS = extents[i].page_count * BLOCKS_PER_PAGE;
+        if (extents[i].start_block > extents[i].device->total_blocks ||
+            EXTENT_BLOCKS > extents[i].device->total_blocks - extents[i].start_block) {
             return -EINVAL;
         }
         total_pages += extents[i].page_count;
@@ -132,28 +178,42 @@ auto activate_extents_locked(const char* name, const SwapExtent* extents, size_t
     }
     area->name = copy_name(name);
     area->extents = new SwapExtent[extent_count];
-    area->used = new uint8_t[static_cast<size_t>(total_pages)];
-    if (area->name == nullptr || area->extents == nullptr || area->used == nullptr) {
+    area->slots = new SlotMetadata[static_cast<size_t>(total_pages)];
+    if (area->name == nullptr || area->extents == nullptr || area->slots == nullptr) {
         destroy_area(area);
         return -ENOMEM;
     }
     for (size_t i = 0; i < extent_count; ++i) {
         area->extents[i] = extents[i];
     }
-    std::memset(area->used, 0, static_cast<size_t>(total_pages));
+    for (uint64_t i = 0; i < total_pages; ++i) {
+        area->slots[i].next_free = i + 1 < total_pages ? i + 1 : NO_FREE_SLOT;
+    }
+    area->free_head = 0;
     area->extent_count = extent_count;
     area->total_pages = total_pages;
     area->free_pages = total_pages;
     area->used_pages = 0;
-    area->active = true;
-    area->id = g_next_area_id++;
-    if (area->id == UINT32_MAX) {
-        area->id = g_next_area_id++;
+    area->state = AreaState::ACTIVE;
+    area->id = 0;
+    for (uint32_t attempt = 0; attempt <= MAX_SWAP_AREAS; ++attempt) {
+        uint32_t const CANDIDATE = g_next_area_id++;
+        if (CANDIDATE != 0 && CANDIDATE != UINT32_MAX && find_area_locked(CANDIDATE) == nullptr) {
+            area->id = CANDIDATE;
+            break;
+        }
+    }
+    if (area->id == 0) {
+        destroy_area(area);
+        return -EOVERFLOW;
     }
     if (!g_swap_areas.push_back(area)) {
         destroy_area(area);
         return -ENOMEM;
     }
+    // Ownership transfers only after every fallible activation step. Keeping
+    // the open file pins its mount and XFS private state until swapoff.
+    area->backing_file = backing_file;
     return 0;
 }
 
@@ -178,8 +238,8 @@ auto activate_block_device(ker::dev::BlockDevice* device, const char* name) -> i
     if (ker::vfs::mounted_block_device_overlaps(device)) {
         return -EBUSY;
     }
-    uint64_t const BYTES = device->total_blocks * device->block_size;
-    uint64_t const PAGES = BYTES / PAGE_SIZE;
+    uint64_t const BLOCKS_PER_PAGE = PAGE_SIZE / device->block_size;
+    uint64_t const PAGES = device->total_blocks / BLOCKS_PER_PAGE;
     if (PAGES == 0) {
         return -EINVAL;
     }
@@ -189,7 +249,7 @@ auto activate_block_device(ker::dev::BlockDevice* device, const char* name) -> i
 
 auto activate_extents(const char* name, const SwapExtent* extents, size_t extent_count) -> int {
     ker::mod::sys::MutexGuard guard(g_swap_lock);
-    return activate_extents_locked(name, extents, extent_count);
+    return activate_extents_locked(name, extents, extent_count, nullptr);
 }
 
 auto swapon_path(const char* path, int flags) -> int {
@@ -216,10 +276,16 @@ auto swapon_path(const char* path, int flags) -> int {
     size_t extent_count = 0;
     int ret = ker::vfs::xfs::xfs_collect_swap_extents(file, &extents, &extent_count);
     if (ret == 0) {
-        ret = activate_extents(path, extents, extent_count);
+        ker::mod::sys::MutexGuard guard(g_swap_lock);
+        ret = activate_extents_locked(path, extents, extent_count, file);
+        if (ret == 0) {
+            file = nullptr;
+        }
     }
     delete[] extents;
-    ker::vfs::vfs_close_file(file);
+    if (file != nullptr) {
+        ker::vfs::vfs_close_file(file);
+    }
     return ret;
 }
 
@@ -227,27 +293,64 @@ auto swapoff_path(const char* path) -> int {
     if (path == nullptr || path[0] == '\0') {
         return -EINVAL;
     }
-    ker::mod::sys::MutexGuard guard(g_swap_lock);
-    for (size_t i = 0; i < g_swap_areas.size(); ++i) {
-        auto* area = g_swap_areas.at(i);
-        if (area == nullptr || area->name == nullptr || std::strcmp(area->name, path) != 0) {
-            continue;
+    uint32_t area_id = 0;
+    std::array<SwapConsumer, MAX_SWAP_CONSUMERS> consumers{};
+    size_t consumer_count = 0;
+    {
+        ker::mod::sys::MutexGuard guard(g_swap_lock);
+        auto* area = find_area_by_name_locked(path);
+        if (area == nullptr) {
+            return -ENOENT;
         }
-        if (area->used_pages != 0) {
+        if (area->state == AreaState::DRAINING) {
             return -EBUSY;
         }
-        area->active = false;
-        g_swap_areas.remove_at(i);
-        destroy_area(area);
-        return 0;
+        area->state = AreaState::DRAINING;
+        area_id = area->id;
+        consumer_count = g_swap_consumer_count;
+        for (size_t i = 0; i < consumer_count; ++i) {
+            consumers[i] = g_swap_consumers[i];
+        }
     }
-    return -ENOENT;
+
+    int migration_ret = 0;
+    for (size_t i = 0; i < consumer_count; ++i) {
+        migration_ret = consumers[i].migrate_area(consumers[i].context, area_id);
+        if (migration_ret < 0) {
+            break;
+        }
+    }
+
+    SwapArea* removed_area = nullptr;
+    {
+        ker::mod::sys::MutexGuard guard(g_swap_lock);
+        for (size_t i = 0; i < g_swap_areas.size(); ++i) {
+            auto* area = g_swap_areas.at(i);
+            if (area == nullptr || area->id != area_id) {
+                continue;
+            }
+            if (migration_ret < 0 || area->used_pages != 0) {
+                area->state = AreaState::ACTIVE;
+                return migration_ret < 0 ? migration_ret : -EBUSY;
+            }
+            g_swap_areas.remove_at(i);
+            removed_area = area;
+            break;
+        }
+    }
+    if (removed_area == nullptr) {
+        return -ENOENT;
+    }
+    // Backend close may perform I/O; the area is no longer discoverable and
+    // the swap mutex must not be held while releasing the VFS mount pin.
+    destroy_area(removed_area);
+    return 0;
 }
 
 auto swap_available() -> bool {
     ker::mod::sys::MutexGuard guard(g_swap_lock);
     for (auto* area : g_swap_areas) {
-        if (area != nullptr && area->active && area->free_pages != 0) {
+        if (area != nullptr && area->state == AreaState::ACTIVE && area->free_pages != 0) {
             return true;
         }
     }
@@ -260,19 +363,27 @@ auto allocate_slot(SwapSlot* out) -> int {
     }
     ker::mod::sys::MutexGuard guard(g_swap_lock);
     for (auto* area : g_swap_areas) {
-        if (area == nullptr || !area->active || area->free_pages == 0) {
+        if (area == nullptr || area->state != AreaState::ACTIVE || area->free_pages == 0) {
             continue;
         }
-        for (uint64_t i = 0; i < area->total_pages; ++i) {
-            if (area->used[i] != 0) {
-                continue;
-            }
-            area->used[i] = 1;
-            area->free_pages--;
-            area->used_pages++;
-            *out = SwapSlot{.area = area->id, .index = i};
-            return 0;
+        uint64_t const INDEX = area->free_head;
+        if (INDEX == NO_FREE_SLOT || INDEX >= area->total_pages) {
+            return -EIO;
         }
+        SlotMetadata& metadata = area->slots[INDEX];
+        if (metadata.state != SlotState::FREE || metadata.generation == UINT64_MAX) {
+            return metadata.generation == UINT64_MAX ? -EOVERFLOW : -EIO;
+        }
+        area->free_head = metadata.next_free;
+        metadata.next_free = NO_FREE_SLOT;
+        metadata.generation++;
+        metadata.checksum = 0;
+        metadata.state = SlotState::RESERVED;
+        metadata.io_in_flight = false;
+        area->free_pages--;
+        area->used_pages++;
+        *out = SwapSlot{.area = area->id, .index = INDEX, .generation = metadata.generation};
+        return 0;
     }
     return -ENOSPC;
 }
@@ -283,10 +394,18 @@ auto free_slot(SwapSlot slot) -> int {
     }
     ker::mod::sys::MutexGuard guard(g_swap_lock);
     auto* area = find_area_locked(slot.area);
-    if (area == nullptr || slot.index >= area->total_pages || area->used[slot.index] == 0) {
-        return -EINVAL;
+    SlotMetadata* metadata = nullptr;
+    int const LOOKUP_RET = slot_metadata_locked(area, slot, &metadata);
+    if (LOOKUP_RET < 0) {
+        return LOOKUP_RET;
     }
-    area->used[slot.index] = 0;
+    if (metadata->io_in_flight) {
+        return -EBUSY;
+    }
+    metadata->state = SlotState::FREE;
+    metadata->checksum = 0;
+    metadata->next_free = area->free_head;
+    area->free_head = slot.index;
     area->free_pages++;
     area->used_pages--;
     return 0;
@@ -300,14 +419,39 @@ auto write_slot(SwapSlot slot, const void* page) -> int {
     {
         ker::mod::sys::MutexGuard guard(g_swap_lock);
         auto* area = find_area_locked(slot.area);
-        if (area == nullptr || slot.index >= area->total_pages || area->used[slot.index] == 0 ||
-            !slot_to_extent_locked(area, slot.index, &extent)) {
-            return -EINVAL;
+        SlotMetadata* metadata = nullptr;
+        int const LOOKUP_RET = slot_metadata_locked(area, slot, &metadata);
+        if (LOOKUP_RET < 0) {
+            return LOOKUP_RET;
         }
+        if (metadata->io_in_flight) {
+            return -EBUSY;
+        }
+        if (!slot_to_extent_locked(area, slot.index, &extent)) {
+            return -EIO;
+        }
+        metadata->state = SlotState::RESERVED;
+        metadata->checksum = 0;
+        metadata->io_in_flight = true;
     }
+    uint32_t const CHECKSUM = ker::util::crc32c_compute(page, PAGE_SIZE);
     size_t const BLOCKS = PAGE_SIZE / extent.device->block_size;
     int const RET = ker::dev::block_write(extent.device, extent.start_block, BLOCKS, page);
-    return RET == 0 ? 0 : -EIO;
+    {
+        ker::mod::sys::MutexGuard guard(g_swap_lock);
+        auto* area = find_area_locked(slot.area);
+        SlotMetadata* metadata = nullptr;
+        int const LOOKUP_RET = slot_metadata_locked(area, slot, &metadata);
+        if (LOOKUP_RET < 0 || !metadata->io_in_flight) {
+            return LOOKUP_RET < 0 ? LOOKUP_RET : -EIO;
+        }
+        metadata->io_in_flight = false;
+        if (RET == 0) {
+            metadata->checksum = CHECKSUM;
+            metadata->state = SlotState::STORED;
+        }
+    }
+    return RET;
 }
 
 auto read_slot(SwapSlot slot, void* page) -> int {
@@ -315,17 +459,46 @@ auto read_slot(SwapSlot slot, void* page) -> int {
         return -EINVAL;
     }
     SwapExtent extent{};
+    uint32_t expected_checksum = 0;
     {
         ker::mod::sys::MutexGuard guard(g_swap_lock);
         auto* area = find_area_locked(slot.area);
-        if (area == nullptr || slot.index >= area->total_pages || area->used[slot.index] == 0 ||
-            !slot_to_extent_locked(area, slot.index, &extent)) {
-            return -EINVAL;
+        SlotMetadata* metadata = nullptr;
+        int const LOOKUP_RET = slot_metadata_locked(area, slot, &metadata);
+        if (LOOKUP_RET < 0) {
+            return LOOKUP_RET;
         }
+        if (metadata->state != SlotState::STORED) {
+            return -ENODATA;
+        }
+        if (metadata->io_in_flight) {
+            return -EBUSY;
+        }
+        if (!slot_to_extent_locked(area, slot.index, &extent)) {
+            return -EIO;
+        }
+        expected_checksum = metadata->checksum;
+        metadata->io_in_flight = true;
     }
     size_t const BLOCKS = PAGE_SIZE / extent.device->block_size;
-    int const RET = ker::dev::block_read(extent.device, extent.start_block, BLOCKS, page);
-    return RET == 0 ? 0 : -EIO;
+    int ret = ker::dev::block_read(extent.device, extent.start_block, BLOCKS, page);
+    if (ret == 0 && ker::util::crc32c_compute(page, PAGE_SIZE) != expected_checksum) {
+        ret = -EILSEQ;
+    }
+    if (ret < 0) {
+        std::memset(page, 0, PAGE_SIZE);
+    }
+    {
+        ker::mod::sys::MutexGuard guard(g_swap_lock);
+        auto* area = find_area_locked(slot.area);
+        SlotMetadata* metadata = nullptr;
+        int const LOOKUP_RET = slot_metadata_locked(area, slot, &metadata);
+        if (LOOKUP_RET < 0 || !metadata->io_in_flight) {
+            return LOOKUP_RET < 0 ? LOOKUP_RET : -EIO;
+        }
+        metadata->io_in_flight = false;
+    }
+    return ret;
 }
 
 void get_stats(SwapStats* out) {
@@ -335,7 +508,7 @@ void get_stats(SwapStats* out) {
     SwapStats stats{};
     ker::mod::sys::MutexGuard guard(g_swap_lock);
     for (auto* area : g_swap_areas) {
-        if (area == nullptr || !area->active) {
+        if (area == nullptr || area->state != AreaState::ACTIVE) {
             continue;
         }
         stats.active_areas++;
@@ -344,6 +517,24 @@ void get_stats(SwapStats* out) {
         stats.used_bytes += area->used_pages * PAGE_SIZE;
     }
     *out = stats;
+}
+
+auto register_consumer(const SwapConsumer& consumer) -> bool {
+    if (consumer.name == nullptr || consumer.name[0] == '\0' || consumer.migrate_area == nullptr) {
+        return false;
+    }
+    ker::mod::sys::MutexGuard guard(g_swap_lock);
+    for (size_t i = 0; i < g_swap_consumer_count; ++i) {
+        SwapConsumer const& current = g_swap_consumers[i];
+        if (current.context == consumer.context && current.migrate_area == consumer.migrate_area) {
+            return true;
+        }
+    }
+    if (g_swap_consumer_count == MAX_SWAP_CONSUMERS) {
+        return false;
+    }
+    g_swap_consumers[g_swap_consumer_count++] = consumer;
+    return true;
 }
 
 }  // namespace ker::mod::mm::swap

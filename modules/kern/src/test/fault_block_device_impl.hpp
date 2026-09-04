@@ -1,7 +1,6 @@
 #pragma once
 
-// Deterministic block-device fault model included by xfs_ktest.cpp.
-#pragma once
+// Deterministic block-device fault model compiled by fault_block_device_ktest.cpp.
 
 #include <algorithm>
 #include <cerrno>
@@ -56,6 +55,7 @@ void FaultBlockDevice::reset(uint8_t value) {
     global_operation_count_ = 0;
     durability_generation_ = 0;
     power_cut_count_ = 0;
+    unavailable_error_ = 0;
     history_overflowed_ = false;
 }
 
@@ -83,6 +83,10 @@ void FaultBlockDevice::clear_history() {
 }
 
 void FaultBlockDevice::clear_fault() { fault_ = {}; }
+
+void FaultBlockDevice::set_unavailable(int error) { unavailable_error_ = normalized_error(error); }
+
+void FaultBlockDevice::clear_unavailable() { unavailable_error_ = 0; }
 
 auto FaultBlockDevice::fail_operation(FaultBlockOperation operation, uint64_t operation_index, int error, FaultBlockWriteMode write_mode,
                                       size_t torn_prefix_bytes) -> bool {
@@ -115,6 +119,45 @@ auto FaultBlockDevice::fail_operations(FaultBlockOperation operation, uint64_t o
         .error = normalized_error(error),
         .write_mode = FaultBlockWriteMode::FAIL_BEFORE_IO,
         .torn_prefix_bytes = 0,
+        .armed = true,
+    };
+    return true;
+}
+
+auto FaultBlockDevice::fail_read_prefix(uint64_t operation_index, size_t prefix_bytes, int error) -> bool {
+    if (!valid_ || operation_index == 0) {
+        return false;
+    }
+    fault_ = {
+        .operation = FaultBlockOperation::READ,
+        .operation_index = operation_index,
+        .operation_count = 1,
+        .global_index = 0,
+        .error = normalized_error(error),
+        .write_mode = FaultBlockWriteMode::FAIL_BEFORE_IO,
+        .torn_prefix_bytes = 0,
+        .read_prefix_bytes = prefix_bytes,
+        .armed = true,
+    };
+    return true;
+}
+
+auto FaultBlockDevice::corrupt_read(uint64_t operation_index, size_t byte_offset, uint8_t xor_mask) -> bool {
+    if (!valid_ || operation_index == 0 || xor_mask == 0) {
+        return false;
+    }
+    fault_ = {
+        .operation = FaultBlockOperation::READ,
+        .operation_index = operation_index,
+        .operation_count = 1,
+        .global_index = 0,
+        .error = 0,
+        .write_mode = FaultBlockWriteMode::FAIL_BEFORE_IO,
+        .torn_prefix_bytes = 0,
+        .read_prefix_bytes = 0,
+        .corrupt_byte_offset = byte_offset,
+        .corrupt_xor_mask = xor_mask,
+        .corrupt_read = true,
         .armed = true,
     };
     return true;
@@ -177,9 +220,26 @@ auto FaultBlockDevice::read(uint64_t block, size_t count, void* buffer) -> int {
         return -EINVAL;
     }
 
+    if (unavailable_error_ != 0) {
+        record(FaultBlockOperation::READ, OPERATION_INDEX, block, count, 0, unavailable_error_);
+        return unavailable_error_;
+    }
+
     FaultPlan plan{};
     if (consume_fault(FaultBlockOperation::READ, OPERATION_INDEX, global_operation_count_, &plan)) {
-        record(FaultBlockOperation::READ, OPERATION_INDEX, block, count, 0, plan.error);
+        if (plan.corrupt_read) {
+            std::memcpy(buffer, volatile_.data() + offset, bytes);
+            if (plan.corrupt_byte_offset < bytes) {
+                static_cast<uint8_t*>(buffer)[plan.corrupt_byte_offset] ^= plan.corrupt_xor_mask;
+            }
+            record(FaultBlockOperation::READ, OPERATION_INDEX, block, count, bytes, 0);
+            return 0;
+        }
+        size_t const TRANSFERRED = std::min(bytes, plan.read_prefix_bytes);
+        if (TRANSFERRED != 0) {
+            std::memcpy(buffer, volatile_.data() + offset, TRANSFERRED);
+        }
+        record(FaultBlockOperation::READ, OPERATION_INDEX, block, count, TRANSFERRED, plan.error);
         return plan.error;
     }
 
@@ -195,6 +255,11 @@ auto FaultBlockDevice::write(uint64_t block, size_t count, const void* buffer) -
     if (buffer == nullptr || !checked_range(block, count, &offset, &bytes)) {
         record(FaultBlockOperation::WRITE, OPERATION_INDEX, block, count, 0, -EINVAL);
         return -EINVAL;
+    }
+
+    if (unavailable_error_ != 0) {
+        record(FaultBlockOperation::WRITE, OPERATION_INDEX, block, count, 0, unavailable_error_);
+        return unavailable_error_;
     }
 
     FaultPlan plan{};
@@ -215,6 +280,10 @@ auto FaultBlockDevice::write(uint64_t block, size_t count, const void* buffer) -
 
 auto FaultBlockDevice::flush() -> int {
     uint64_t const OPERATION_INDEX = next_operation_index(FaultBlockOperation::FLUSH);
+    if (unavailable_error_ != 0) {
+        record(FaultBlockOperation::FLUSH, OPERATION_INDEX, 0, 0, 0, unavailable_error_);
+        return unavailable_error_;
+    }
     FaultPlan plan{};
     if (consume_fault(FaultBlockOperation::FLUSH, OPERATION_INDEX, global_operation_count_, &plan)) {
         record(FaultBlockOperation::FLUSH, OPERATION_INDEX, 0, 0, 0, plan.error);

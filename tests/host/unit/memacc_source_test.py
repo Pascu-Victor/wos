@@ -272,6 +272,7 @@ def test_pressure_reclaim_is_real_and_preserves_network_reserve() -> None:
             "PKT_POOL_DIAGNOSTIC_GROW_MAX",
             "pkt_pool_populate_reclaimable",
             '"memacc/reclaim/file_mmap_cache"',
+            '"memacc/reclaim/anonymous_swap"',
             '"memacc/reclaim/xfs_inode"',
             '"memacc/reclaim/coordinator"',
             '"zone_watermark"',
@@ -306,6 +307,7 @@ def test_pressure_reclaim_is_real_and_preserves_network_reserve() -> None:
         ("procfs_write_memacc_reclaim_packet_pool", "packet_pool", "pkt_pool_reclaim_free("),
         ("procfs_write_memacc_reclaim_xfs_inode", "xfs_inode", "xfs_icache_reclaim_for_pressure("),
         ("procfs_write_memacc_reclaim_file_mmap_cache", "file_mmap_cache", "file_mmap_cache_reclaim("),
+        ("procfs_write_memacc_reclaim_anonymous_swap", "anonymous_swap", "anonymous_swap_reclaim_scan("),
     ):
         body = function_body(procfs, writer)
         require_tokens(body, ["procfs_request_explicit_reclaim", f'"{shrinker}"'], f"{shrinker} targeted coordinator write")

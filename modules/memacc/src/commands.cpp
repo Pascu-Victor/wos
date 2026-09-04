@@ -157,7 +157,7 @@ auto normalize_feature(std::string_view feature) -> std::string {
 void usage() {
     std::printf(
         "usage: memacc [dump [--full]|summary|procs|proc <pid>|kernel|allocs|raw [file]|watch [-n sec]|track <feature> <action>|reclaim "
-        "<buffer_cache|packet_pool|xfs_inode|file_mmap_cache> [target|grow=N]]\n");
+        "<buffer_cache|packet_pool|xfs_inode|file_mmap_cache|anonymous_swap> [target|grow=N]]\n");
 }
 
 auto run_dump(int argc, char** argv) -> int {
@@ -215,7 +215,7 @@ auto run_allocs(int argc, char** argv) -> int {
 auto run_raw(int argc, char** argv) -> int {
     std::string file = argc >= 3 ? argv[2] : "summary";
     if (file == "all") {
-        constexpr std::array<std::string_view, 15> FILES{"summary",
+        constexpr std::array<std::string_view, 16> FILES{"summary",
                                                          "zones",
                                                          "procs",
                                                          "dead",
@@ -229,6 +229,7 @@ auto run_raw(int argc, char** argv) -> int {
                                                          "reclaim/packet_pool",
                                                          "reclaim/xfs_inode",
                                                          "reclaim/file_mmap_cache",
+                                                         "reclaim/anonymous_swap",
                                                          "reclaim/coordinator"};
         for (auto one : FILES) {
             auto text = read_file(memacc_path(one));
@@ -294,6 +295,8 @@ auto run_reclaim(int argc, char** argv) -> int {
         target = "xfs_inode";
     } else if (target_arg == "file_mmap_cache" || target_arg == "file_mmap" || target_arg == "mmap_cache") {
         target = "file_mmap_cache";
+    } else if (target_arg == "anonymous_swap" || target_arg == "anon_swap" || target_arg == "swap") {
+        target = "anonymous_swap";
     } else {
         std::printf("memacc: unknown reclaim target '%s'\n", argv[2]);
         return 1;
@@ -388,13 +391,20 @@ auto run_reclaim(int argc, char** argv) -> int {
                     static_cast<unsigned long long>(BEFORE_IDLE), static_cast<unsigned long long>(AFTER_IDLE),
                     static_cast<unsigned long long>(FREED), static_cast<unsigned long long>(get_u64(*after, "retain_limit")),
                     static_cast<unsigned long long>(get_u64(*after, "reclaim_victims")));
-    } else {
+    } else if (target == "file_mmap_cache") {
         uint64_t const BEFORE_PAGES = before != nullptr ? get_u64(*before, "pages") : 0;
         uint64_t const AFTER_PAGES = get_u64(*after, "pages");
         uint64_t const FREED = BEFORE_PAGES >= AFTER_PAGES ? BEFORE_PAGES - AFTER_PAGES : 0;
         std::printf("file_mmap_cache before=%llu pages after=%llu pages released=%llu pages capacity=%llu pages\n",
                     static_cast<unsigned long long>(BEFORE_PAGES), static_cast<unsigned long long>(AFTER_PAGES),
                     static_cast<unsigned long long>(FREED), static_cast<unsigned long long>(get_u64(*after, "capacity_pages")));
+    } else {
+        uint64_t const BEFORE_SWAPPED = before != nullptr ? get_u64(*before, "swapped_pages") : 0;
+        uint64_t const AFTER_SWAPPED = get_u64(*after, "swapped_pages");
+        uint64_t const ADDED = AFTER_SWAPPED >= BEFORE_SWAPPED ? AFTER_SWAPPED - BEFORE_SWAPPED : 0;
+        std::printf("anonymous_swap before=%llu pages after=%llu pages paged_out=%llu pages pagein_successes=%llu\n",
+                    static_cast<unsigned long long>(BEFORE_SWAPPED), static_cast<unsigned long long>(AFTER_SWAPPED),
+                    static_cast<unsigned long long>(ADDED), static_cast<unsigned long long>(get_u64(*after, "pagein_successes")));
     }
     return 0;
 }

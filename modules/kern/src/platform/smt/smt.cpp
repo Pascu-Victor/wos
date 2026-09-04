@@ -870,6 +870,7 @@ void start_smt(boot::HandoverModules& modules, uint64_t kernel_rsp) {
     create_init_tasks(modules);
     sched::start_gc_worker();
     mm::reclaim::start_worker();
+    mm::virt::start_anonymous_swap_worker();
 
     // Start the TCP timer as a kernel thread (DAEMON) instead of running it in interrupt context
     ker::net::proto::tcp_timer_thread_start();

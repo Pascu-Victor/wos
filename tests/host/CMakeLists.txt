@@ -846,6 +846,10 @@ wos_add_unit_test(reclaim_policy_test
     SOURCES      ${CMAKE_CURRENT_SOURCE_DIR}/unit/reclaim_policy_test.cpp
 )
 
+wos_add_unit_test(anonymous_swap_state_test
+    SOURCES      ${CMAKE_CURRENT_SOURCE_DIR}/unit/anonymous_swap_state_test.cpp
+)
+
 wos_add_unit_test(telemetry_test
     SOURCES      ${CMAKE_CURRENT_SOURCE_DIR}/unit/telemetry_test.cpp
 )

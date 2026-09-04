@@ -148,7 +148,7 @@ def test_watermarks_and_background_reclaim_are_order_aware() -> None:
     )
 
 
-def test_all_seven_shrinkers_register_in_stable_rank_order() -> None:
+def test_all_eight_shrinkers_register_in_stable_rank_order() -> None:
     descriptors = [
         ("platform/mm/virt.opt.cpp", "kernel_vmap", 0),
         ("platform/sched/scheduler.cpp", "scheduler_gc", 1),
@@ -156,7 +156,8 @@ def test_all_seven_shrinkers_register_in_stable_rank_order() -> None:
         ("syscalls_impl/vmem/sys_vmem.cpp", "file_mmap_cache", 3),
         ("vfs/fs/xfs/xfs_inode.cpp", "xfs_inode", 4),
         ("net/packet.cpp", "packet_pool", 5),
-        ("vfs/fs/tmpfs.cpp", "tmpfs", 6),
+        ("platform/mm/virt.opt.cpp", "anonymous_swap", 6),
+        ("vfs/fs/tmpfs.cpp", "tmpfs", 7),
     ]
     for relative, name, rank in descriptors:
         source = (KERN / relative).read_text()
@@ -235,7 +236,7 @@ def main() -> None:
     test_explicit_reclaim_is_deferred_to_the_safe_worker()
     test_context_recursion_and_no_progress_guards_are_enforced()
     test_watermarks_and_background_reclaim_are_order_aware()
-    test_all_seven_shrinkers_register_in_stable_rank_order()
+    test_all_eight_shrinkers_register_in_stable_rank_order()
     test_allocator_is_decoupled_and_boot_hooks_are_safe()
     test_ktest_surface_covers_policy_failure_modes()
     print("unified reclaim source invariants hold")

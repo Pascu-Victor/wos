@@ -1436,7 +1436,13 @@ void release_mmap_reservation_locked(ker::mod::sched::task::Task* task, uint64_t
 
 // Convert protection flags to page table flags
 auto prot_to_page_flags(uint64_t prot) -> uint64_t {
-    uint64_t flags = ker::mod::mm::paging::PAGE_PRESENT | ker::mod::mm::paging::PAGE_USER;
+    uint64_t flags = ker::mod::mm::paging::PAGE_PRESENT;
+
+    // A present supervisor-only leaf is WOS's reversible PROT_NONE encoding.
+    // Leaving PAGE_USER set would allow reads despite a zero protection mask.
+    if (prot != 0) {
+        flags |= ker::mod::mm::paging::PAGE_USER;
+    }
 
     if ((prot & ker::abi::vmem::PROT_WRITE) != 0) {
         flags |= ker::mod::mm::paging::PAGE_WRITE;
@@ -2508,6 +2514,9 @@ auto sys_vmem(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4) -
 
                 for (uint64_t current_vaddr = OCCUPIED.start; current_vaddr < OCCUPIED.end;
                      current_vaddr += ker::mod::mm::paging::PAGE_SIZE) {
+                    if (ker::mod::mm::virt::protect_anonymous_swap_page(task->pagemap, current_vaddr, page_flags)) {
+                        continue;
+                    }
                     if (ker::mod::mm::virt::is_page_mapped(task->pagemap, current_vaddr)) {
                         ker::mod::mm::virt::unify_page_flags(task->pagemap, current_vaddr, page_flags);
                     } else if (ker::mod::mm::virt::is_page_reserved(task->pagemap, current_vaddr) &&

@@ -16,6 +16,7 @@
 #include <platform/mm/phys.hpp>
 #include <platform/mm/reclaim.hpp>
 #include <platform/mm/swap.hpp>
+#include <platform/sched/scheduler.hpp>
 #include <platform/sys/mutex.hpp>
 #include <platform/sys/spinlock.hpp>
 #include <util/smallvec.hpp>
@@ -79,6 +80,8 @@ ker::util::SmallVec<TmpNode*, 64> tmpfs_nodes;  // NOLINT(cppcoreguidelines-avoi
 std::atomic<uint64_t> tmpfs_resident_pages{0};  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 std::atomic<uint64_t> tmpfs_reclaim_node_cursor{0};
 std::atomic<bool> tmpfs_shrinker_registered{false};
+std::atomic<bool> tmpfs_swap_consumer_registered{false};
+uint64_t tmpfs_node_registry_generation{};  // Guarded by tmpfs_node_registry_lock.
 }  // namespace
 
 // --- Internal helpers ---
@@ -259,6 +262,9 @@ void register_tmp_node(TmpNode* node) {
     if (node->reclaim_registered && node->resident_pages != 0) {
         tmpfs_resident_pages.fetch_add(node->resident_pages, std::memory_order_relaxed);
     }
+    if (node->reclaim_registered) {
+        tmpfs_node_registry_generation++;
+    }
 }
 
 void unregister_tmp_node(TmpNode* node) {
@@ -270,6 +276,7 @@ void unregister_tmp_node(TmpNode* node) {
         static_cast<void>(tmpfs_nodes.remove(node));
         tmpfs_resident_pages.fetch_sub(node->resident_pages, std::memory_order_relaxed);
         node->reclaim_registered = false;
+        tmpfs_node_registry_generation++;
     }
 }
 
@@ -474,7 +481,7 @@ void register_tmpfs_shrinker() {
         .name = "tmpfs",
         .unit = ker::mod::mm::reclaim::ReclaimUnit::PAGES,
         .scan_unit = ker::mod::mm::reclaim::ReclaimUnit::PAGES,
-        .rank = 6,
+        .rank = 7,
         .min_priority = ker::mod::mm::reclaim::ReclaimPriority::CRITICAL,
         .capabilities =
             ker::mod::mm::reclaim::RECLAIM_MAY_BLOCK | ker::mod::mm::reclaim::RECLAIM_MAY_IO | ker::mod::mm::reclaim::RECLAIM_MAY_ALLOCATE,
@@ -529,7 +536,11 @@ auto ensure_page_resident_locked(TmpNode* node, size_t page_index, TmpPage** out
             ker::mod::mm::phys::page_free(data);
             return RET;
         }
-        static_cast<void>(ker::mod::mm::swap::free_slot(page.swap_slot));
+        int const FREE_RET = ker::mod::mm::swap::free_slot(page.swap_slot);
+        if (FREE_RET < 0) {
+            ker::mod::mm::phys::page_free(data);
+            return FREE_RET;
+        }
     } else {
         std::memset(data, 0, DEFAULT_TMPFS_BLOCK_SIZE);
         node->charged_pages++;
@@ -543,6 +554,88 @@ auto ensure_page_resident_locked(TmpNode* node, size_t page_index, TmpPage** out
     }
     *out_page = &page;
     return 0;
+}
+
+auto migrate_node_swap_area_locked(TmpNode* node, uint32_t area_id) -> int {
+    if (node == nullptr || node->type != TmpNodeType::FILE || tmpfs_canonical_node(node) != node) {
+        return 0;
+    }
+    for (size_t i = 0; i < node->page_count; ++i) {
+        TmpPage& page = node->pages[i];
+        if (page.state != TmpPageState::SWAPPED || !ker::mod::mm::swap::slot_valid(page.swap_slot) || page.swap_slot.area != area_id) {
+            continue;
+        }
+        TmpPage* resident = nullptr;
+        int const RET = ensure_page_resident_locked(node, i, &resident);
+        if (RET < 0) {
+            return RET;
+        }
+    }
+    return 0;
+}
+
+auto migrate_tmpfs_swap_area(void*, uint32_t area_id) -> int {
+    for (;;) {
+        size_t index = 0;
+        bool saw_busy_node = false;
+        uint64_t registry_generation = 0;
+        {
+            ker::mod::sys::MutexGuard guard(tmpfs_node_registry_lock);
+            registry_generation = tmpfs_node_registry_generation;
+        }
+
+        for (;;) {
+            TmpNode* node = nullptr;
+            bool done = false;
+            tmpfs_node_registry_lock.lock();
+            if (index < tmpfs_nodes.size()) {
+                node = tmpfs_nodes.at(index++);
+                if (node != nullptr && !node->io_lock.try_lock()) {
+                    node = nullptr;
+                    saw_busy_node = true;
+                }
+            } else {
+                done = true;
+            }
+            tmpfs_node_registry_lock.unlock();
+            if (done) {
+                break;
+            }
+            if (node == nullptr) {
+                continue;
+            }
+            int const RET = migrate_node_swap_area_locked(node, area_id);
+            node->io_lock.unlock();
+            if (RET < 0) {
+                return RET;
+            }
+        }
+
+        bool registry_stable = false;
+        {
+            ker::mod::sys::MutexGuard guard(tmpfs_node_registry_lock);
+            registry_stable = registry_generation == tmpfs_node_registry_generation;
+        }
+        if (!saw_busy_node && registry_stable) {
+            return 0;
+        }
+        ker::mod::sched::kern_yield();
+    }
+}
+
+void register_tmpfs_swap_consumer() {
+    bool expected = false;
+    if (!tmpfs_swap_consumer_registered.compare_exchange_strong(expected, true, std::memory_order_acq_rel, std::memory_order_acquire)) {
+        return;
+    }
+    ker::mod::mm::swap::SwapConsumer const CONSUMER{
+        .name = "tmpfs",
+        .context = nullptr,
+        .migrate_area = migrate_tmpfs_swap_area,
+    };
+    if (!ker::mod::mm::swap::register_consumer(CONSUMER)) {
+        tmpfs_swap_consumer_registered.store(false, std::memory_order_release);
+    }
 }
 
 // Grow the children slot array of a directory node if needed.
@@ -1063,6 +1156,7 @@ void register_tmpfs() {
         root_node = create_root_node_internal();
     }
     register_tmpfs_shrinker();
+    register_tmpfs_swap_consumer();
 }
 
 auto create_root_node() -> TmpNode* { return create_root_node_internal(); }
