@@ -50,6 +50,15 @@ using log = ker::mod::dbg::logger<"wki">;
 namespace {
 constexpr uint32_t WKI_PEER_LIFECYCLE_WRITER = uint32_t{1} << 31U;
 constexpr uint32_t WKI_PEER_LIFECYCLE_READERS = WKI_PEER_LIFECYCLE_WRITER - 1U;
+
+auto lifecycle_current_task() -> mod::sched::task::Task* {
+    return mod::sched::can_query_current_task() ? mod::sched::get_current_task() : nullptr;
+}
+
+auto lifecycle_owned_by_task(const WkiPeer* peer, const mod::sched::task::Task* task) -> bool {
+    return peer != nullptr && task != nullptr && peer->lifecycle_owner.load(std::memory_order_acquire) == task &&
+           peer->lifecycle_state.load(std::memory_order_acquire) == WKI_PEER_LIFECYCLE_WRITER;
+}
 }  // namespace
 
 auto wki_peer_lifecycle_try_acquire(WkiPeer* peer) -> bool {
@@ -57,8 +66,12 @@ auto wki_peer_lifecycle_try_acquire(WkiPeer* peer) -> bool {
         return false;
     }
     uint32_t expected = 0;
-    return peer->lifecycle_state.compare_exchange_strong(expected, WKI_PEER_LIFECYCLE_WRITER, std::memory_order_acq_rel,
-                                                         std::memory_order_acquire);
+    if (!peer->lifecycle_state.compare_exchange_strong(expected, WKI_PEER_LIFECYCLE_WRITER, std::memory_order_acq_rel,
+                                                       std::memory_order_acquire)) {
+        return false;
+    }
+    peer->lifecycle_owner.store(lifecycle_current_task(), std::memory_order_release);
+    return true;
 }
 
 auto wki_peer_lifecycle_acquire(WkiPeer* peer) -> bool {
@@ -78,11 +91,13 @@ auto wki_peer_lifecycle_acquire(WkiPeer* peer) -> bool {
     while ((peer->lifecycle_state.load(std::memory_order_acquire) & WKI_PEER_LIFECYCLE_READERS) != 0) {
         ker::mod::sched::kern_yield();
     }
+    peer->lifecycle_owner.store(lifecycle_current_task(), std::memory_order_release);
     return true;
 }
 
 void wki_peer_lifecycle_release(WkiPeer* peer) {
     if (peer != nullptr) {
+        peer->lifecycle_owner.store(nullptr, std::memory_order_release);
         peer->lifecycle_state.store(0, std::memory_order_release);
     }
 }
@@ -106,6 +121,16 @@ void wki_peer_lifecycle_rx_release(WkiPeer* peer) {
         peer->lifecycle_state.fetch_sub(1, std::memory_order_release);
     }
 }
+
+auto wki_peer_lifecycle_owned_by_current_task(const WkiPeer* peer) -> bool {
+    return lifecycle_owned_by_task(peer, lifecycle_current_task());
+}
+
+#ifdef WOS_SELFTEST
+auto wki_selftest_peer_lifecycle_owned_by_task(const WkiPeer* peer, const mod::sched::task::Task* task) -> bool {
+    return lifecycle_owned_by_task(peer, task);
+}
+#endif
 
 namespace {
 constexpr size_t HELLO_CHANNEL_EPOCH_OFFSET = 0;
@@ -701,6 +726,17 @@ void wki_peer_note_rx_contact(WkiTransport* transport, uint16_t peer_node, const
         }
     }
 
+    // Ordinary RX may already retain a shared lifecycle lease. Its ingress
+    // contact refresh is advisory: never upgrade/wait for that reader here.
+    // Authenticated HELLO handlers supply the authoritative identity and retry
+    // discovery when a concurrent TX reader defers this observation. A newly
+    // allocated bootstrap peer has no readers, so its first contact proceeds.
+    PeerLifecycleGuard contact_lifecycle;
+    if (!wki_peer_lifecycle_owned_by_current_task(peer) && !contact_lifecycle.try_acquire(peer)) {
+        g_wki.peer_lock.unlock();
+        return;
+    }
+
     peer->mac = mac;
     if (peer->transport == nullptr || transport->rdma_capable || !peer->transport->rdma_capable) {
         peer->transport = transport;
@@ -784,7 +820,7 @@ void handle_hello(WkiTransport* transport, const WkiHeader* hdr, const uint8_t* 
     uint32_t const WIRE_REMOTE_CHANNEL_EPOCH = hello_channel_epoch(hello);
     uint32_t remote_channel_epoch = 0;
     RoutingEntry route{};
-    bool const ROUTE_VALID = wki_routing_lookup(peer_node, &route) && route.valid;
+    bool const ROUTE_VALID = wki_routing_lookup(peer_node, &route, true) && route.valid;
     bool peer_is_direct = false;
 
     g_wki.peer_lock.lock();
@@ -800,6 +836,11 @@ void handle_hello(WkiTransport* transport, const WkiHeader* hdr, const uint8_t* 
     // already connected, refresh contact state but do not make every node ACK.
     if (peer != nullptr && IS_BROADCAST_HELLO && peer->state == PeerState::CONNECTED && peer->is_direct &&
         hello_boot_epoch_matches_peer(peer, REMOTE_BOOT_EPOCH)) {
+        PeerLifecycleGuard contact_lifecycle;
+        if (!contact_lifecycle.try_acquire(peer)) {
+            g_wki.peer_lock.unlock();
+            return;
+        }
         uint64_t const NOW_US = wki_now_us();
         peer->mac = hello->mac_addr;
         if (peer->transport == nullptr || transport->rdma_capable || !peer->transport->rdma_capable) {
@@ -1058,7 +1099,7 @@ void handle_hello_ack(WkiTransport* transport, const WkiHeader* hdr, const uint8
     uint32_t const REMOTE_BOOT_EPOCH = hello_boot_epoch(ack);
     uint32_t remote_channel_epoch = 0;
     RoutingEntry route{};
-    bool const ROUTE_VALID = wki_routing_lookup(peer_node, &route) && route.valid;
+    bool const ROUTE_VALID = wki_routing_lookup(peer_node, &route, true) && route.valid;
     bool peer_is_direct = false;
 
     g_wki.peer_lock.lock();
@@ -1882,11 +1923,9 @@ void handle_fence_notify(const WkiHeader* /*hdr*/, const uint8_t* payload, uint1
         }
     }
 
-    // Invalidate the fenced node's LSDB entry and recompute routes.
-    // The fencing node will also flood an updated LSA without the fenced peer,
-    // but proactive invalidation avoids stale routes in the interim.
-    wki_routing_invalidate_node(fn->fenced_node);
-    wki_routing_recompute();
+    // A third-party suspicion can disagree with our healthy local heartbeat.
+    // Only the deferred, locally confirmed disconnect may terminally invalidate
+    // this origin's routes; the notifier advertises its own lost edge via LSA.
 }
 
 void handle_peer_goodbye(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len) {
@@ -2406,6 +2445,7 @@ auto wki_next_periodic_deadline_us(uint64_t now_us) -> uint64_t {
 
 void wki_timer_thread_start() {
     wki_deferred_work_thread_start();
+    wki_routing_thread_start();
 
     auto* task = mod::sched::task::Task::create_kernel_thread("wki_timer", wki_timer_thread);
     if (task == nullptr) {

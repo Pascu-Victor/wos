@@ -478,12 +478,22 @@ def test_fence_notify_rejects_invalid_targets_before_routing() -> None:
     require_order(
         handle_body,
         guard,
-        "wki_routing_invalidate_node(fn->fenced_node)",
-        "FENCE_NOTIFY target validation before route invalidation",
+        "queue_pending_fence_notify(*fn)",
+        "FENCE_NOTIFY target validation before deferred admission",
     )
-    guarded_tail = handle_body[handle_body.find(guard) : handle_body.find("wki_routing_invalidate_node(fn->fenced_node)")]
+    guarded_tail = handle_body[handle_body.find(guard) : handle_body.find("queue_pending_fence_notify(*fn)")]
     if "return;" not in guarded_tail:
-        fail("handle_fence_notify invalid target guard must return before route invalidation")
+        fail("handle_fence_notify invalid target guard must return before queueing")
+    if "wki_routing_invalidate_node(" in handle_body:
+        fail("third-party suspicion must not terminally invalidate a locally healthy origin")
+    require_order(
+        drain_body,
+        "!local_observation_confirms_fence(fenced_peer, NOW_US)",
+        "wki_peer_disconnect_impl(fenced_peer, PeerDisconnectKind::FENCE, false)",
+        "deferred third-party fence requires local confirmation",
+    )
+    if "wki_routing_invalidate_node(fenced_id)" not in function_body(source, "wki_peer_disconnect_impl"):
+        fail("locally confirmed disconnect must still invalidate origin routes")
 
 
 def test_shutdown_uses_graceful_goodbye_not_fence() -> None:
@@ -659,7 +669,7 @@ def test_forwarding_recomputes_checksum_after_ttl_decrement() -> None:
     require_order(
         body,
         "fwd_hdr->checksum = wki_frame_checksum(*fwd_hdr, fwd_frame + WKI_HEADER_SIZE)",
-        "wki_transport_send(fwd_transport, NEXT_HOP, fwd_frame, len)",
+        "route.send(fwd_frame, len)",
         "forwarding must transmit only after checksum refresh",
     )
 
@@ -679,16 +689,16 @@ def test_routed_lsa_peer_identity_handshake_does_not_promote_origin_to_neighbor(
         if token not in routed_hello:
             fail(f"routed HELLO must reuse the established identity payload and raw routed send: {token}")
 
-    handle_lsa = function_body(routing_source, "handle_lsa")
+    worker = function_body(routing_source, "routing_worker")
     require_order(
-        handle_lsa,
-        "wki_routing_recompute();",
-        "probe_routed_peer(lsa->origin_node);",
-        "LSA must compute SPF before probing the far endpoint identity",
+        worker,
+        "compute_and_publish();",
+        "probe_routed_peers(NOW);",
+        "the routing worker must publish SPF before probing the far endpoint identity",
     )
-    timer = function_body(routing_source, "wki_routing_timer_tick")
-    for token in ["ROUTED_HELLO_PROBE_INTERVAL_US", "probe_routed_peer(probe_nodes.at(i))"]:
-        if token not in timer:
+    probes = function_body(routing_source, "probe_routed_peers")
+    for token in ["ROUTED_HELLO_PROBE_INTERVAL_US", "PROBE_BUDGET", "wki_peer_send_routed_hello(route.dst_node)"]:
+        if token not in probes:
             fail(f"lost routed HELLOs must have a bounded periodic retry: {token}")
 
     contact = function_body(transport_source, "eth_rx_needs_peer_contact_update")
@@ -725,9 +735,23 @@ def test_routed_lsa_peer_identity_handshake_does_not_promote_origin_to_neighbor(
     if "wki_eth_transport_source_mac(peer->transport, ack.mac_addr)" not in hello_ack:
         fail("direct HELLO_ACK must advertise the selected Ethernet transport MAC")
 
-    find_transport = function_body(wki_source, "find_transport_for_peer")
-    if "peer->is_direct && (peer->transport != nullptr)" not in find_transport:
-        fail("a routed peer must not bypass current-SPF next-hop transport selection")
+    resolve = function_body(wki_source, "ResolvedRoute::resolve")
+    for token in ["peer->is_direct && (peer->state != PeerState::FENCED || allow_fenced_handshake)",
+                  "wki_routing_lookup(dst_node, &route, allow_discovery)"]:
+        if token not in resolve:
+            fail(f"a routed peer must not bypass current-SPF next-hop transport selection: {token}")
+    if "peer->next_hop" in resolve:
+        fail("a withdrawn SPF route must not use cached peer next-hop fallback")
+    handshake = function_body(wki_source, "routing_handshake_message")
+    for token in ["type == MsgType::HELLO", "type == MsgType::HELLO_ACK", "type == MsgType::HELLO_CONFIRM"]:
+        if token not in handshake:
+            fail(f"fenced direct peers require authenticated handshake recovery: {token}")
+    for forbidden in ["MsgType::LSA", "MsgType::HEARTBEAT", "MsgType::DEV_OP"]:
+        if forbidden in handshake:
+            fail("fenced peer exception must not admit topology/service messages")
+    raw = function_body(wki_source, "wki_send_raw")
+    if "route.resolve(dst_node, routing_discovery_message(msg_type), routing_handshake_message(msg_type))" not in raw:
+        fail("raw HELLO replies must carry their fenced-handshake route exception")
 
     for handler_name in ["handle_hello", "handle_hello_ack"]:
         handler = function_body(peer_source, handler_name)
@@ -810,7 +834,7 @@ def test_ipc_data_acks_after_ordered_dispatch() -> None:
         "bool const IMM_ACK = ((ch->priority == PriorityClass::LATENCY || ch->channel_id == WKI_CHAN_IPC_DATA) && ch->ack_pending);",
         "wki_dispatch_reliable_msg_ordered(ch, RX_CHANNEL_GENERATION, msg, hdr, payload, PAYLOAD_LEN);",
         "wki_dispatch_reliable_msg_ordered(ch, RO_CHANNEL_GENERATION, RO_MSG, &RO_HDR, ro_data, RO_LEN);",
-        "complete_ack_transmit_for_generation_locked(ch, imm_ack_generation, imm_ack_num, tx_ret, notify_timer);",
+        "complete_ack_transmit_for_generation_locked(ch, imm_ack_generation, imm_ack_num, TX_RET, notify_timer);",
     ]
     missing = [token for token in required if token not in body]
     if missing:
@@ -830,7 +854,7 @@ def test_ipc_data_acks_after_ordered_dispatch() -> None:
     require_order(
         body,
         "bool const IMM_ACK = ((ch->priority == PriorityClass::LATENCY || ch->channel_id == WKI_CHAN_IPC_DATA) && ch->ack_pending);",
-        "complete_ack_transmit_for_generation_locked(ch, imm_ack_generation, imm_ack_num, tx_ret, notify_timer);",
+        "complete_ack_transmit_for_generation_locked(ch, imm_ack_generation, imm_ack_num, TX_RET, notify_timer);",
         "IPC_DATA immediate ACK completion must follow the post-dispatch ACK decision",
     )
 
@@ -1110,7 +1134,49 @@ def test_ivshmem_direct_identity_is_bounded_and_authenticated() -> None:
         fail("rootless ivshmem polling must share the bounded IRQ receive path")
 
 
+def test_tx_borrows_only_current_task_completed_writer() -> None:
+    source = PEER_CPP.read_text()
+    owner = function_body(source, "lifecycle_owned_by_task")
+    for token in ["peer != nullptr", "task != nullptr", "peer->lifecycle_owner.load(std::memory_order_acquire) == task",
+                  "peer->lifecycle_state.load(std::memory_order_acquire) == WKI_PEER_LIFECYCLE_WRITER"]:
+        if token not in owner:
+            fail(f"TX writer borrowing must require an exact completed owner: {token}")
+    acquire = function_body(source, "wki_peer_lifecycle_acquire")
+    require_order(acquire, "& WKI_PEER_LIFECYCLE_READERS", "peer->lifecycle_owner.store(lifecycle_current_task()",
+                  "writer ownership must be published only after reader drain")
+    release = function_body(source, "wki_peer_lifecycle_release")
+    require_order(release, "peer->lifecycle_owner.store(nullptr", "peer->lifecycle_state.store(0",
+                  "clear ownership before making the lifecycle gate available")
+    rx = function_body(source, "wki_peer_lifecycle_rx_try_acquire")
+    if "lifecycle_owned_by_task" in rx or "lifecycle_owned_by_current_task" in rx:
+        fail("borrowing TX must not allow nested RX to mutate an exclusive writer's state")
+    if "BorrowRequiresExactFullyAdmittedWriter" not in WKI_PEER_LIVENESS_KTEST.read_text():
+        fail("missing executable KTEST for exact writer ownership borrowing")
+
+
+def test_advisory_contact_refresh_respects_tx_lifecycle() -> None:
+    source = PEER_CPP.read_text()
+    contact = function_body(source, "wki_peer_note_rx_contact")
+    require_order(contact, "peer = wki_peer_alloc(peer_node)", "PeerLifecycleGuard contact_lifecycle",
+                  "first authenticated contact must still allocate the bootstrap peer before acquiring its empty gate")
+    require_order(contact, "wki_peer_lifecycle_owned_by_current_task(peer)", "peer->mac = mac",
+                  "contact identity writes require the caller's exact writer or fresh exclusive admission")
+    require_order(contact, "!contact_lifecycle.try_acquire(peer)", "peer->mac = mac",
+                  "ordinary shared RX must skip advisory contact writes while TX readers retain identity")
+    if "contact_lifecycle.acquire(" in contact:
+        fail("shared RX contact refresh must never synchronously upgrade/wait for its own reader")
+    for name, identity_write in [("handle_hello", "peer->mac = hello->mac_addr"),
+                                 ("handle_hello_ack", "peer->mac = ack->mac_addr")]:
+        handler = function_body(source, name)
+        require_order(handler, ".try_acquire(peer)", identity_write,
+                      f"{name} must still publish authoritative authenticated contact under exclusive admission")
+    if "peer->is_direct = true" not in contact:
+        fail("bootstrap authenticated contact must still mark a proven direct peer")
+
+
 def main() -> None:
+    test_advisory_contact_refresh_respects_tx_lifecycle()
+    test_tx_borrows_only_current_task_completed_writer()
     test_hello_ack_reconnects_fenced_peer_outside_peer_lock()
     test_hello_boot_epoch_fences_connected_broadcast_restarts()
     test_connected_epoch_reset_retires_vfs_before_channel_reuse()

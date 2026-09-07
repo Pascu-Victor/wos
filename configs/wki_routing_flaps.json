@@ -1,0 +1,255 @@
+{
+  "format": "wos.wki-chaos-scenario",
+  "version": 1,
+  "name": "goal27-short-flaps",
+  "nodes": [
+    {
+      "id": "0",
+      "host": "10.10.0.235"
+    },
+    {
+      "id": "1",
+      "host": "10.10.0.234"
+    },
+    {
+      "id": "2",
+      "host": "10.10.0.233",
+      "nics": {
+        "wki": "net1"
+      },
+      "qmp_socket": "wki-chaos-data/routing-qmp-vm2.sock"
+    }
+  ],
+  "events": [
+    {
+      "id": "baseline0",
+      "phase": "snapshot",
+      "operation": {
+        "kind": "snapshot",
+        "node": "0",
+        "label": "baseline0",
+        "timeout_ms": 5000
+      }
+    },
+    {
+      "id": "baseline1",
+      "phase": "snapshot",
+      "operation": {
+        "kind": "snapshot",
+        "node": "1",
+        "label": "baseline1",
+        "timeout_ms": 5000
+      }
+    },
+    {
+      "id": "baseline2",
+      "phase": "snapshot",
+      "operation": {
+        "kind": "snapshot",
+        "node": "2",
+        "label": "baseline2",
+        "timeout_ms": 5000
+      }
+    },
+    {
+      "id": "flap0-down",
+      "phase": "fault",
+      "operation": {
+        "kind": "qmp",
+        "node": "2",
+        "command": "set_link",
+        "nic": "wki",
+        "up": false,
+        "timeout_ms": 5000
+      }
+    },
+    {
+      "id": "flap0-down-wait",
+      "phase": "fault",
+      "operation": {
+        "kind": "guest",
+        "node": "1",
+        "role": "control",
+        "argv": [
+          "/usr/bin/sleep",
+          "2"
+        ],
+        "timeout_ms": 5000
+      }
+    },
+    {
+      "id": "flap0-up",
+      "phase": "heal",
+      "operation": {
+        "kind": "qmp",
+        "node": "2",
+        "command": "set_link",
+        "nic": "wki",
+        "up": true,
+        "timeout_ms": 5000
+      }
+    },
+    {
+      "id": "flap0-up-wait",
+      "phase": "heal",
+      "operation": {
+        "kind": "guest",
+        "node": "1",
+        "role": "control",
+        "argv": [
+          "/usr/bin/sleep",
+          "2"
+        ],
+        "timeout_ms": 5000
+      }
+    },
+    {
+      "id": "flap1-down",
+      "phase": "fault",
+      "operation": {
+        "kind": "qmp",
+        "node": "2",
+        "command": "set_link",
+        "nic": "wki",
+        "up": false,
+        "timeout_ms": 5000
+      }
+    },
+    {
+      "id": "flap1-down-wait",
+      "phase": "fault",
+      "operation": {
+        "kind": "guest",
+        "node": "1",
+        "role": "control",
+        "argv": [
+          "/usr/bin/sleep",
+          "2"
+        ],
+        "timeout_ms": 5000
+      }
+    },
+    {
+      "id": "flap1-up",
+      "phase": "heal",
+      "operation": {
+        "kind": "qmp",
+        "node": "2",
+        "command": "set_link",
+        "nic": "wki",
+        "up": true,
+        "timeout_ms": 5000
+      }
+    },
+    {
+      "id": "flap1-up-wait",
+      "phase": "heal",
+      "operation": {
+        "kind": "guest",
+        "node": "1",
+        "role": "control",
+        "argv": [
+          "/usr/bin/sleep",
+          "2"
+        ],
+        "timeout_ms": 5000
+      }
+    },
+    {
+      "id": "flap2-down",
+      "phase": "fault",
+      "operation": {
+        "kind": "qmp",
+        "node": "2",
+        "command": "set_link",
+        "nic": "wki",
+        "up": false,
+        "timeout_ms": 5000
+      }
+    },
+    {
+      "id": "flap2-down-wait",
+      "phase": "fault",
+      "operation": {
+        "kind": "guest",
+        "node": "1",
+        "role": "control",
+        "argv": [
+          "/usr/bin/sleep",
+          "2"
+        ],
+        "timeout_ms": 5000
+      }
+    },
+    {
+      "id": "flap2-up",
+      "phase": "heal",
+      "operation": {
+        "kind": "qmp",
+        "node": "2",
+        "command": "set_link",
+        "nic": "wki",
+        "up": true,
+        "timeout_ms": 5000
+      }
+    },
+    {
+      "id": "flap2-up-wait",
+      "phase": "heal",
+      "operation": {
+        "kind": "guest",
+        "node": "1",
+        "role": "control",
+        "argv": [
+          "/usr/bin/sleep",
+          "2"
+        ],
+        "timeout_ms": 5000
+      }
+    },
+    {
+      "id": "settle",
+      "phase": "heal",
+      "operation": {
+        "kind": "guest",
+        "node": "1",
+        "role": "control",
+        "argv": [
+          "/usr/bin/sleep",
+          "75"
+        ],
+        "timeout_ms": 80000
+      }
+    },
+    {
+      "id": "healed0",
+      "phase": "snapshot",
+      "operation": {
+        "kind": "snapshot",
+        "node": "0",
+        "label": "healed0",
+        "timeout_ms": 5000
+      }
+    },
+    {
+      "id": "healed1",
+      "phase": "snapshot",
+      "operation": {
+        "kind": "snapshot",
+        "node": "1",
+        "label": "healed1",
+        "timeout_ms": 5000
+      }
+    },
+    {
+      "id": "healed2",
+      "phase": "snapshot",
+      "operation": {
+        "kind": "snapshot",
+        "node": "2",
+        "label": "healed2",
+        "timeout_ms": 5000
+      }
+    }
+  ]
+}

@@ -60,6 +60,7 @@
 #include "net/wki/remote_ipc.hpp"
 #include "net/wki/remote_net.hpp"
 #include "net/wki/remote_vfs.hpp"
+#include "net/wki/routing.hpp"
 #include "net/wki/wire.hpp"
 #include "net/wki/wki.hpp"
 #include "platform/mm/paging.hpp"
@@ -4867,6 +4868,71 @@ auto generate_wki_netdiag(char* buf, size_t bufsz) -> size_t {  // NOLINT(readab
         append_sconst(p, end, "wki_vfs_proxy_truncated max=");
         append_dec64(p, end, vfs_proxies.size());
         append_char(p, end, '\n');
+    }
+
+    // Routing counters are copied before formatting. No routing lock crosses
+    // buffer output or allocation; existing diagnostic rows remain unchanged.
+    auto const ROUTING = ker::net::wki::wki_routing_diag_snapshot();
+    append_sconst(p, end, "wki_routing version=1 now_us=");
+    append_dec64(p, end, ker::net::wki::wki_now_us());
+    append_sconst(p, end, " accepted=");
+    append_dec64(p, end, ROUTING.accepted);
+    append_sconst(p, end, " malformed=");
+    append_dec64(p, end, ROUTING.malformed);
+    append_sconst(p, end, " stale=");
+    append_dec64(p, end, ROUTING.stale);
+    append_sconst(p, end, " full=");
+    append_dec64(p, end, ROUTING.full);
+    append_sconst(p, end, " coalesced=");
+    append_dec64(p, end, ROUTING.coalesced);
+    append_sconst(p, end, " computations=");
+    append_dec64(p, end, ROUTING.computations);
+    append_sconst(p, end, " obsolete=");
+    append_dec64(p, end, ROUTING.obsolete);
+    append_sconst(p, end, " publications=");
+    append_dec64(p, end, ROUTING.publications);
+    append_sconst(p, end, " flood_retries=");
+    append_dec64(p, end, ROUTING.flood_retries);
+    append_sconst(p, end, " max_rx_us=");
+    append_dec64(p, end, ROUTING.max_rx_us);
+    append_sconst(p, end, " max_spf_us=");
+    append_dec64(p, end, ROUTING.max_spf_us);
+    append_sconst(p, end, " leases_expired=");
+    append_dec64(p, end, ROUTING.leases_expired);
+    append_sconst(p, end, " lease_rejected=");
+    append_dec64(p, end, ROUTING.lease_rejected);
+    append_sconst(p, end, " lease_requests=");
+    append_dec64(p, end, ROUTING.lease_requests);
+    append_sconst(p, end, " lease_responses=");
+    append_dec64(p, end, ROUTING.lease_responses);
+    append_char(p, end, '\n');
+
+    auto* routes = new (std::nothrow) ker::net::wki::RoutingEntry[ker::net::wki::WKI_MAX_PEERS];
+    if (routes != nullptr) {
+        size_t const ROUTE_COUNT = ker::net::wki::wki_routing_snapshot(routes, ker::net::wki::WKI_MAX_PEERS);
+        for (size_t i = 0; i < ROUTE_COUNT; ++i) {
+            const auto& route = routes[i];  // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic)
+            append_sconst(p, end, "wki_route dst=");
+            append_hex16(p, end, route.dst_node);
+            append_sconst(p, end, " next_hop=");
+            append_hex16(p, end, route.next_hop);
+            append_sconst(p, end, " cost=");
+            append_dec64(p, end, route.cost);
+            append_sconst(p, end, " hops=");
+            append_dec64(p, end, route.hop_count);
+            append_sconst(p, end, " generation=");
+            append_dec64(p, end, route.publication_generation);
+            append_sconst(p, end, " hop_boot_epoch=");
+            append_dec64(p, end, route.next_hop_boot_epoch);
+            append_sconst(p, end, " hop_auth_generation=");
+            append_dec64(p, end, route.next_hop_auth_generation);
+            append_sconst(p, end, " lease_expires_us=");
+            append_dec64(p, end, route.lease_expires_us);
+            append_char(p, end, '\n');
+        }
+        delete[] routes;
+    } else {
+        append_sconst(p, end, "wki_route allocation_failed=1\n");
     }
 
     auto* peers = new (std::nothrow) ker::net::wki::WkiPeerDiag[ker::net::wki::WKI_PEER_DIAG_MAX];

@@ -196,6 +196,9 @@ constexpr uint16_t WKI_CAP_NET_IPV6_STATE = 0x0020;
 // Both peers understand the bounded, replay-safe remote xattr transfer
 // protocol carried by OP_VFS_XATTR.
 constexpr uint16_t WKI_CAP_VFS_XATTR = 0x0040;
+// Receiver-challenged, origin/session-bound routing leases. Opt-in until mixed
+// version verification completes; the existing LSA prefix remains unchanged.
+constexpr uint16_t WKI_CAP_ROUTING_LEASE = 0x0080;
 constexpr uint16_t WKI_AUTH_SUITE_HMAC_SHA256_HKDF_SHA256 = 1;
 constexpr size_t WKI_AUTH_NONCE_SIZE = 32;
 
@@ -282,6 +285,53 @@ inline auto lsa_neighbors(const LsaPayload* lsa) -> const LsaNeighborEntry* {
 }
 
 inline size_t lsa_total_size(const LsaPayload* lsa) { return sizeof(LsaPayload) + (lsa->num_neighbors * sizeof(LsaNeighborEntry)); }
+
+constexpr uint32_t WKI_LSA_LEASE_MAGIC = 0x574C5341;  // "WLSA"
+constexpr uint8_t WKI_LSA_LEASE_VERSION = 1;
+constexpr uint8_t WKI_LSA_LEASE_WITHDRAWN = 0x01;
+constexpr uint32_t WKI_LSA_LEASE_MAX_AGE_MS = 30'000;
+
+// Appended after the unchanged LsaNeighborEntry array. Token zero is a
+// discovery hint; only an origin-authenticated reply to our nonzero challenge
+// may establish a service lease. Relaying this suffix never renews that lease.
+struct LsaLeaseSuffix {
+    uint32_t magic = WKI_LSA_LEASE_MAGIC;
+    uint8_t version = WKI_LSA_LEASE_VERSION;
+    uint8_t flags = 0;
+    uint16_t reserved = 0;
+    uint32_t boot_epoch = 0;
+    std::array<uint8_t, WKI_AUTH_NONCE_SIZE> origin_nonce{};
+    uint64_t token = 0;
+    uint32_t age_ms = 0;
+} __attribute__((packed));
+static_assert(sizeof(LsaLeaseSuffix) == 56);
+static_assert(sizeof(LsaPayload) == 12);
+
+// MsgType::LSA_ACK is a lease challenge only when both endpoints negotiate
+// WKI_CAP_ROUTING_LEASE. Responses use LSA plus LsaLeaseSuffix.
+struct LsaLeaseRequest {
+    uint32_t magic = WKI_LSA_LEASE_MAGIC;
+    uint8_t version = WKI_LSA_LEASE_VERSION;
+    uint8_t flags = 0;
+    uint16_t reserved = 0;
+    uint64_t token = 0;
+} __attribute__((packed));
+static_assert(sizeof(LsaLeaseRequest) == 16);
+
+inline auto wki_lsa_lease_suffix_valid(LsaLeaseSuffix const& suffix, uint16_t neighbors) -> bool {
+    bool nonce_present = false;
+    for (auto byte : suffix.origin_nonce) {
+        nonce_present = nonce_present || byte != 0;
+    }
+    return suffix.magic == WKI_LSA_LEASE_MAGIC && suffix.version == WKI_LSA_LEASE_VERSION && suffix.reserved == 0 &&
+           (suffix.flags & ~WKI_LSA_LEASE_WITHDRAWN) == 0 && suffix.boot_epoch != 0 && nonce_present &&
+           suffix.age_ms <= WKI_LSA_LEASE_MAX_AGE_MS && ((suffix.flags & WKI_LSA_LEASE_WITHDRAWN) == 0 || neighbors == 0);
+}
+
+inline auto wki_lsa_lease_request_valid(LsaLeaseRequest const& request) -> bool {
+    return request.magic == WKI_LSA_LEASE_MAGIC && request.version == WKI_LSA_LEASE_VERSION && request.flags == 0 &&
+           request.reserved == 0 && request.token != 0;
+}
 
 // -----------------------------------------------------------------------------
 // FENCE_NOTIFY Payload - 8 bytes

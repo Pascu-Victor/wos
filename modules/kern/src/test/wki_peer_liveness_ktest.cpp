@@ -262,6 +262,39 @@ KTEST(WkiPeerLifecycle, WriterIntentSurvivesAdmittedReaderDrain) {
     KEXPECT_EQ(peer.lifecycle_state.load(std::memory_order_acquire), 0U);
 }
 
+KTEST(WkiPeerLifecycle, BorrowRequiresExactFullyAdmittedWriter) {
+    WkiPeer peer{};
+    ker::mod::sched::task::Task owner{};
+    ker::mod::sched::task::Task other{};
+
+    // Boot KTEST has no running task. Feed the production ownership predicate
+    // explicit real task identities while exercising the actual atomic gate.
+    KEXPECT_FALSE(wki_selftest_peer_lifecycle_owned_by_task(nullptr, &owner));
+    KEXPECT_FALSE(wki_selftest_peer_lifecycle_owned_by_task(&peer, nullptr));
+    KEXPECT_FALSE(wki_selftest_peer_lifecycle_owned_by_task(&peer, &owner));
+    peer.lifecycle_state.store(WKI_PEER_LIFECYCLE_TEST_WRITER, std::memory_order_release);
+    KEXPECT_FALSE(wki_selftest_peer_lifecycle_owned_by_task(&peer, &owner));
+
+    peer.lifecycle_owner.store(&owner, std::memory_order_release);
+    KEXPECT_TRUE(wki_selftest_peer_lifecycle_owned_by_task(&peer, &owner));
+    KEXPECT_FALSE(wki_selftest_peer_lifecycle_owned_by_task(&peer, &other));
+    // A same-task inline NAPI/TX nested call borrows ownership without adding
+    // a reader. It must never grant the RX reader admission gate itself.
+    KEXPECT_TRUE(wki_selftest_peer_lifecycle_owned_by_task(&peer, &owner));
+    KEXPECT_FALSE(wki_peer_lifecycle_rx_try_acquire(&peer));
+    KEXPECT_EQ(peer.lifecycle_state.load(std::memory_order_acquire), WKI_PEER_LIFECYCLE_TEST_WRITER);
+
+    peer.lifecycle_state.store(WKI_PEER_LIFECYCLE_TEST_WRITER | 1U, std::memory_order_release);
+    KEXPECT_FALSE(wki_selftest_peer_lifecycle_owned_by_task(&peer, &owner));
+    wki_peer_lifecycle_rx_release(&peer);
+    wki_peer_lifecycle_release(&peer);
+    KEXPECT_NULL(peer.lifecycle_owner.load(std::memory_order_acquire));
+    KEXPECT_FALSE(wki_selftest_peer_lifecycle_owned_by_task(&peer, &owner));
+    KEXPECT_TRUE(wki_peer_lifecycle_rx_try_acquire(&peer));
+    KEXPECT_FALSE(wki_selftest_peer_lifecycle_owned_by_task(&peer, &owner));
+    wki_peer_lifecycle_rx_release(&peer);
+}
+
 KTEST(WkiPeerHandshake, HelloAckReconnectsFencedPeerState) { KEXPECT_TRUE(ker::net::wki::wki_peer_selftest_hello_ack_state_transition()); }
 
 KTEST(WkiPeerHandshake, HelloEpochWordsAreIndependent) {

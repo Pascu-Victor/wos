@@ -257,6 +257,10 @@ struct WkiPeer {
     // the low bits count admitted RX readers. A single atomic modification
     // order prevents teardown and a new RX handler from both entering.
     std::atomic<uint32_t> lifecycle_state{0};
+    // Published only once an exclusive writer has drained all readers. A
+    // synchronous TX on that same task may borrow the writer's existing gate;
+    // this never grants RX admission or permits borrowing pending intent.
+    std::atomic<mod::sched::task::Task*> lifecycle_owner{nullptr};
     // HELLO RX retires exact channel/session state synchronously, then asks the
     // task-context timer worker to terminalize work bound to that retired
     // generation.
@@ -611,6 +615,7 @@ void wki_peer_lifecycle_release(WkiPeer* peer);
 // readers fail while an exclusive owner is pending or active.
 auto wki_peer_lifecycle_rx_try_acquire(WkiPeer* peer) -> bool;
 void wki_peer_lifecycle_rx_release(WkiPeer* peer);
+auto wki_peer_lifecycle_owned_by_current_task(const WkiPeer* peer) -> bool;
 
 // -----------------------------------------------------------------------------
 // Public API - Sending
@@ -850,6 +855,7 @@ auto wki_wait_diag_snapshot(WkiWaitDiag* out, size_t max) -> size_t;
 void wki_selftest_wait_list_link(WkiWaitEntry* entry);
 auto wki_selftest_wait_list_contains(WkiWaitEntry const* entry) -> bool;
 auto wki_selftest_reliable_rx_peer_state_accepts(PeerState state) -> bool;
+auto wki_selftest_peer_lifecycle_owned_by_task(const WkiPeer* peer, const mod::sched::task::Task* task) -> bool;
 auto wki_selftest_split_payload_validation_and_copy() -> bool;
 #endif
 
@@ -864,6 +870,7 @@ void handle_hello_ack(WkiTransport* transport, const WkiHeader* hdr, const uint8
 void handle_heartbeat(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len);
 void handle_heartbeat_ack(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len);
 void handle_lsa(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len);
+void handle_lsa_ack(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len);
 void handle_fence_notify(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len);
 void handle_peer_goodbye(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len);
 

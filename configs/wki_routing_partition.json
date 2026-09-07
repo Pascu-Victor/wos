@@ -1,0 +1,23 @@
+{
+  "format":"wos.wki-chaos-scenario", "version":1, "name":"goal27-partition-heal",
+  "nodes":[
+    {"id":"0","host":"10.10.0.235"},
+    {"id":"1","host":"10.10.0.234"},
+    {"id":"2","host":"10.10.0.233","nics":{"wki":"net1"},"qmp_socket":"wki-chaos-data/routing-qmp-vm2.sock"}
+  ],
+  "events":[
+    {"id":"baseline0","phase":"snapshot","operation":{"kind":"snapshot","node":"0","label":"baseline0","timeout_ms":5000}},
+    {"id":"baseline1","phase":"snapshot","operation":{"kind":"snapshot","node":"1","label":"baseline1","timeout_ms":5000}},
+    {"id":"baseline2","phase":"snapshot","operation":{"kind":"snapshot","node":"2","label":"baseline2","timeout_ms":5000}},
+    {"id":"partition","phase":"fault","operation":{"kind":"qmp","node":"2","command":"set_link","nic":"wki","up":false,"timeout_ms":5000}},
+    {"id":"expire","phase":"fault","operation":{"kind":"guest","node":"1","role":"control","argv":["/usr/bin/sleep","35"],"timeout_ms":40000}},
+    {"id":"partition0","phase":"snapshot","operation":{"kind":"snapshot","node":"0","label":"partition0","timeout_ms":5000}},
+    {"id":"partition1","phase":"snapshot","operation":{"kind":"snapshot","node":"1","label":"partition1","timeout_ms":5000}},
+    {"id":"partition2","phase":"snapshot","operation":{"kind":"snapshot","node":"2","label":"partition2","timeout_ms":5000}},
+    {"id":"heal","phase":"heal","operation":{"kind":"qmp","node":"2","command":"set_link","nic":"wki","up":true,"timeout_ms":5000}},
+    {"id":"settle","phase":"heal","operation":{"kind":"guest","node":"1","role":"control","argv":["/usr/bin/sleep","75"],"timeout_ms":80000}},
+    {"id":"healed0","phase":"snapshot","operation":{"kind":"snapshot","node":"0","label":"healed0","timeout_ms":5000}},
+    {"id":"healed1","phase":"snapshot","operation":{"kind":"snapshot","node":"1","label":"healed1","timeout_ms":5000}},
+    {"id":"healed2","phase":"snapshot","operation":{"kind":"snapshot","node":"2","label":"healed2","timeout_ms":5000}}
+  ]
+}

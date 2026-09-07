@@ -8,11 +8,78 @@
 #include <cstdint>
 #include <cstring>
 #include <net/wki/routing.hpp>
+#include <net/wki/routing_model.hpp>
 #include <net/wki/wire.hpp>
 
 using namespace ker::net::wki;
 
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
+    if (size >= sizeof(LsaLeaseRequest)) {
+        LsaLeaseRequest request{};
+        memcpy(&request, data, sizeof(request));
+        volatile bool valid = wki_lsa_lease_request_valid(request);
+        (void)valid;
+    }
+    if (size >= sizeof(LsaLeaseSuffix)) {
+        LsaLeaseSuffix suffix{};
+        memcpy(&suffix, data, sizeof(suffix));
+        volatile bool valid = wki_lsa_lease_suffix_valid(suffix, data[0]);
+        (void)valid;
+    }
+
+    // Exercise the production SPF with bounded, fuzz-generated topology. The
+    // old payload-layout checks below never invoked the routing algorithm.
+    if (size >= 8) {
+        constexpr size_t CAPACITY = 8;
+        std::array<LsdbEntry, CAPACITY> entries{};
+        size_t cursor = 0;
+        for (size_t i = 0; i < CAPACITY; ++i) {
+            auto& entry = entries[i];
+            entry.valid = true;
+            entry.origin_node = static_cast<uint16_t>(i + 1);
+            for (size_t j = 0; j < CAPACITY; ++j) {
+                uint8_t const BYTE = data[cursor++ % size];
+                if (i != j && (BYTE & 1U) != 0) {
+                    entry.neighbors[entry.num_neighbors++] = {
+                        .node_id = static_cast<uint16_t>(j + 1), .link_cost = static_cast<uint16_t>(BYTE >> 1U), .transport_mtu = 1500};
+                }
+            }
+        }
+        std::array<std::array<RoutingEntry, CAPACITY>, CAPACITY> tables{};
+        for (size_t i = 0; i < CAPACITY; ++i) {
+            if (!routing_model::compute(static_cast<uint16_t>(i + 1), entries, tables[i])) {
+                __builtin_trap();
+            }
+        }
+        for (size_t source = 0; source < CAPACITY; ++source) {
+            for (auto const& initial : tables[source]) {
+                if (!initial.valid) {
+                    continue;
+                }
+                size_t current = source;
+                uint32_t last_cost = UINT32_MAX;
+                size_t steps = 0;
+                while (current + 1 != initial.dst_node) {
+                    if (current >= CAPACITY || ++steps >= CAPACITY) {
+                        __builtin_trap();
+                    }
+                    RoutingEntry const* selected = nullptr;
+                    for (auto const& route : tables[current]) {
+                        if (route.valid && route.dst_node == initial.dst_node) {
+                            selected = &route;
+                            break;
+                        }
+                    }
+                    if (selected == nullptr || selected->cost >= last_cost || selected->next_hop == 0) {
+                        __builtin_trap();
+                    }
+                    last_cost = selected->cost;
+                    current = selected->next_hop - 1;
+                }
+            }
+        }
+    }
+
     // --- LSA payload parsing with variable-length neighbors ---
     if (size >= sizeof(LsaPayload)) {
         uint8_t buf[sizeof(LsaPayload) + WKI_MAX_NEIGHBORS_PER_LSA * sizeof(LsaNeighborEntry)];

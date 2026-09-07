@@ -312,8 +312,106 @@ void notify_deferred_work() {
     }
 }
 
-auto find_transport_for_peer(uint16_t dst_node) -> WkiTransport*;
-auto resolve_next_hop(uint16_t dst_node) -> uint16_t;
+// One copied routing generation selects both the neighbor and transport.
+// Registry admission keeps that transport alive until the bounded TX ends.
+class ResolvedRoute {
+   public:
+    ResolvedRoute() = default;
+    ResolvedRoute(const ResolvedRoute&) = delete;
+    auto operator=(const ResolvedRoute&) -> ResolvedRoute& = delete;
+    ~ResolvedRoute() {
+        if (leased_transport != nullptr) {
+            leased_transport->chaos_in_flight.fetch_sub(1, std::memory_order_release);
+        }
+        wki_peer_lifecycle_rx_release(leased_hop);
+        wki_peer_lifecycle_rx_release(leased_origin);
+    }
+
+    auto resolve(uint16_t dst_node, bool allow_discovery = false, bool allow_fenced_handshake = false) -> bool;
+    [[nodiscard]] auto transport() const -> WkiTransport* { return leased_transport; }
+    [[nodiscard]] auto next_hop() const -> uint16_t { return route.next_hop; }
+    [[nodiscard]] auto direct() const -> bool { return route.hop_count == 1; }
+
+    auto send(const void* frame, uint16_t len) const -> int {
+        // The copied route can expire or be invalidated while its caller
+        // builds/authenticates a frame. Admission is immediately before
+        // transport submission; an admitted transport can finish afterward.
+        if (!tx_deadline_live()) {
+            return WKI_ERR_NO_ROUTE;
+        }
+        return wki_transport_send(transport(), next_hop(), frame, len);
+    }
+
+    auto send_pkt(net::PacketBuffer* pkt) const -> int {
+        if (!tx_deadline_live()) {
+            // Match wki_transport_send_pkt's unconditional ownership transfer.
+            // Reliable callers still retain their independent retransmit copy.
+            net::pkt_free(pkt);
+            return WKI_ERR_NO_ROUTE;
+        }
+        return wki_transport_send_pkt(transport(), next_hop(), pkt);
+    }
+
+   private:
+    [[nodiscard]] auto tx_deadline_live() const -> bool {
+        if (route.publication_generation != 0) {
+            return wki_routing_snapshot_current(route.publication_generation, route.lease_expires_us);
+        }
+        return route.lease_expires_us == UINT64_MAX || wki_now_us() < route.lease_expires_us;
+    }
+
+    auto admit_origin(WkiPeer* peer) -> bool {
+        if (peer == nullptr) {
+            return false;
+        }
+        if (wki_peer_lifecycle_rx_try_acquire(peer)) {
+            leased_origin = peer;
+        } else if (!wki_peer_lifecycle_owned_by_current_task(peer)) {
+            return false;
+        }
+        admitted_origin = peer;
+        return true;
+    }
+
+    auto admit_hop(WkiPeer* peer) -> bool {
+        if (peer == admitted_origin) {
+            return true;
+        }
+        if (wki_peer_lifecycle_rx_try_acquire(peer)) {
+            leased_hop = peer;
+            return true;
+        }
+        // Synchronous replies/tracked sends can already own this peer's
+        // exclusive gate. A nested TX returns before that task's writer guard
+        // releases, so borrowing adds no reader and never releases its owner.
+        return wki_peer_lifecycle_owned_by_current_task(peer);
+    }
+
+    RoutingEntry route{};
+    WkiTransport* leased_transport = nullptr;
+    WkiPeer* leased_hop = nullptr;
+    WkiPeer* leased_origin = nullptr;
+    WkiPeer* admitted_origin = nullptr;
+};
+
+auto send_routed_frame(uint16_t dst_node, const void* frame, uint16_t len) -> int;
+
+auto routing_discovery_message(MsgType type) -> bool {
+    switch (type) {
+        case MsgType::HELLO:
+        case MsgType::HELLO_ACK:
+        case MsgType::HELLO_CONFIRM:
+        case MsgType::LSA:
+        case MsgType::LSA_ACK:
+            return true;
+        default:
+            return false;
+    }
+}
+
+auto routing_handshake_message(MsgType type) -> bool {
+    return type == MsgType::HELLO || type == MsgType::HELLO_ACK || type == MsgType::HELLO_CONFIRM;
+}
 
 auto perf_current_pid() -> uint64_t { return 0; }
 
@@ -733,8 +831,16 @@ void perf_record_transport_stall_locked(WkiChannel* ch, uint64_t now_us) {
 }  // namespace
 
 auto wki_send_authenticated_header(WkiTransport* transport, uint16_t next_hop, const WkiHeader& header) -> int {
-    if (transport == nullptr || header.payload_len != 0) {
+    // Keep the existing API for channel callers, but never trust their cached
+    // transport/next-hop pair after an SPF publication or withdrawal.
+    static_cast<void>(transport);
+    static_cast<void>(next_hop);
+    ResolvedRoute route;
+    if (header.payload_len != 0) {
         return WKI_ERR_INVALID;
+    }
+    if (!route.resolve(header.dst_node)) {
+        return WKI_ERR_NO_ROUTE;
     }
     std::array<uint8_t, WKI_HEADER_SIZE + WKI_AUTH_TRAILER_SIZE> frame{};
     std::memcpy(frame.data(), &header, sizeof(header));
@@ -743,7 +849,7 @@ auto wki_send_authenticated_header(WkiTransport* transport, uint16_t next_hop, c
     if (LENGTH != frame.size()) {
         return WKI_ERR_INVALID;
     }
-    return wki_transport_send(transport, next_hop, frame.data(), static_cast<uint16_t>(LENGTH));
+    return route.send(frame.data(), static_cast<uint16_t>(LENGTH));
 }
 
 // -----------------------------------------------------------------------------
@@ -1314,6 +1420,11 @@ void wki_init() {
     g_wki.my_lsa_seq = 0;
     g_wki.capabilities = WKI_CAP_RESOURCE_INCARNATION | WKI_CAP_VFS_MULTI_RDMA_LANES | WKI_CAP_VFS_METADATA_BATCH | WKI_CAP_NET_IPV6_STATE |
                          WKI_CAP_VFS_XATTR;
+    // Keep the new receiver-challenged routing lease protocol opt-in until
+    // mixed-version convergence has been exercised on a live mesh.
+    if (cmdline_has_token(ker::init::get_kernel_cmdline(), "wki.routing_lease")) {
+        g_wki.capabilities |= WKI_CAP_ROUTING_LEASE;
+    }
     g_wki.initialized = true;
 
     // Init routing subsystem (LSDB, routing table)
@@ -2011,17 +2122,7 @@ auto transmit_ack_snapshot(const AckSnapshot& ack) -> int {
         return WKI_ERR_NO_ROUTE;
     }
 
-    WkiTransport* transport = find_transport_for_peer(ack.peer);
-    if (transport == nullptr) {
-        return WKI_ERR_NO_ROUTE;
-    }
-
-    uint16_t const NEXT_HOP = resolve_next_hop(ack.peer);
-    if (NEXT_HOP == WKI_NODE_INVALID) {
-        return WKI_ERR_NO_ROUTE;
-    }
-
-    int const RET = wki_send_authenticated_header(transport, NEXT_HOP, ack.hdr);
+    int const RET = wki_send_authenticated_header(nullptr, WKI_NODE_INVALID, ack.hdr);
     if (RET >= 0) {
         mark_peer_tx_progress(ack.peer);
     }
@@ -2472,64 +2573,100 @@ auto wki_peer_diag_snapshot(WkiPeerDiag* out, size_t max) -> size_t {
 // -----------------------------------------------------------------------------
 namespace {
 
-auto find_transport_for_peer(uint16_t dst_node) -> WkiTransport* {
-    // For direct peers, use their stored transport
-    WkiPeer const* peer = wki_peer_find(dst_node);
-    if ((peer != nullptr) && peer->is_direct && (peer->transport != nullptr)) {
-        return peer->transport;
+auto ResolvedRoute::resolve(uint16_t dst_node, bool allow_discovery, bool allow_fenced_handshake) -> bool {
+    if (leased_transport != nullptr || leased_hop != nullptr || admitted_origin != nullptr || dst_node == WKI_NODE_INVALID ||
+        dst_node == WKI_NODE_BROADCAST) {
+        return false;
     }
 
-    // For routed peers, prefer the current SPF result over the peer's cached
-    // next hop so a route change also selects the new ingress/egress NIC.
-    RoutingEntry route = {};
-    if (wki_routing_lookup(dst_node, &route) && route.valid && route.next_hop != WKI_NODE_INVALID) {
-        WkiPeer const* hop = wki_peer_find(route.next_hop);
-        if ((hop != nullptr) && (hop->transport != nullptr)) {
-            return hop->transport;
+    // Direct contact serves authenticated discovery before a routing lease is
+    // active. With leases enabled, even direct service traffic needs an
+    // unexpired published route; a known peer alone cannot bypass expiry.
+    bool const REQUIRE_LEASE = (g_wki.capabilities & WKI_CAP_ROUTING_LEASE) != 0 && !allow_discovery;
+    g_wki.peer_lock.lock();
+    WkiPeer* peer = wki_peer_find(dst_node);
+    // Pin the service origin before copying its published route. Session
+    // installation holds this peer's writer through synchronous invalidation,
+    // so a routed next hop cannot hide an origin transition from this send.
+    // Discovery may bootstrap an origin that has no peer/session yet.
+    if (!allow_discovery && !admit_origin(peer)) {
+        g_wki.peer_lock.unlock();
+        return false;
+    }
+    if (peer != nullptr && peer->is_direct && !REQUIRE_LEASE) {
+        if (!admit_hop(peer)) {
+            g_wki.peer_lock.unlock();
+            return false;
+        }
+        peer->lock.lock();
+        // A fenced direct peer must exchange authenticated HELLO/ACK/CONFIRM
+        // before it can become CONNECTED again. Ordinary routing discovery
+        // (LSA/LSA_ACK) and service traffic cannot use this exception.
+        if (peer->is_direct && (peer->state != PeerState::FENCED || allow_fenced_handshake) && peer->transport != nullptr) {
+            route.dst_node = dst_node;
+            route.next_hop = dst_node;
+            route.hop_count = 1;
+            route.transport = peer->transport;
+            route.valid = true;
+        }
+        peer->lock.unlock();
+        if (!route.valid) {
+            g_wki.peer_lock.unlock();
+            return false;
+        }
+    }
+    g_wki.peer_lock.unlock();
+
+    if (!route.valid) {
+        if (!wki_routing_lookup(dst_node, &route, allow_discovery) || !route.valid || route.next_hop == WKI_NODE_INVALID ||
+            route.transport == nullptr) {
+            return false;
+        }
+        g_wki.peer_lock.lock();
+        WkiPeer* hop = wki_peer_find(route.next_hop);
+        bool current = false;
+        // Every next hop is retained before its peer/session identity is read.
+        // Admission never waits for another task's writer or reader drain.
+        if (hop != nullptr && admit_hop(hop)) {
+            hop->lock.lock();
+            hop->auth_session.replay_lock.lock();
+            current = hop->is_direct && hop->state == PeerState::CONNECTED && hop->transport == route.transport &&
+                      hop->remote_boot_epoch == route.next_hop_boot_epoch && hop->auth_session.active &&
+                      hop->auth_session.generation == route.next_hop_auth_generation;
+            hop->auth_session.replay_lock.unlock();
+            hop->lock.unlock();
+        }
+        g_wki.peer_lock.unlock();
+        if (!current) {
+            return false;
         }
     }
 
-    // A recompute also caches the last next hop on an established routed peer.
-    // Retain that fallback so reliable retransmits survive a transient route
-    // withdrawal and can resume when the same physical neighbor heals.
-    if ((peer != nullptr) && peer->next_hop != WKI_NODE_INVALID) {
-        WkiPeer const* hop = wki_peer_find(peer->next_hop);
-        if ((hop != nullptr) && (hop->transport != nullptr)) {
-            return hop->transport;
+    // Compare registry addresses before dereferencing the captured pointer:
+    // unregister may have removed and freed a transport since the snapshot.
+    // Unregister unlinks under this lock, then waits on chaos_in_flight.
+    g_wki.transport_lock.lock();
+    for (WkiTransport* transport = g_wki.transports; transport != nullptr; transport = transport->next) {
+        if (transport == route.transport && !transport->chaos_unregistering.load(std::memory_order_acquire)) {
+            transport->chaos_in_flight.fetch_add(1, std::memory_order_acq_rel);
+            leased_transport = transport;
+            break;
         }
     }
-
-    // For broadcast (HELLO), use the first transport
-    if (dst_node == WKI_NODE_BROADCAST) {
-        return g_wki.transports;
-    }
-
-    return nullptr;
+    g_wki.transport_lock.unlock();
+    return leased_transport != nullptr;
 }
 
-auto resolve_next_hop(uint16_t dst_node) -> uint16_t {
-    if (dst_node == WKI_NODE_BROADCAST) {
-        return dst_node;
+auto send_routed_frame(uint16_t dst_node, const void* frame, uint16_t len) -> int {
+    if (frame == nullptr || len < WKI_HEADER_SIZE) {
+        return WKI_ERR_INVALID;
     }
-
-    // Direct peer check
-    WkiPeer const* peer = wki_peer_find(dst_node);
-    if ((peer != nullptr) && peer->is_direct) {
-        return dst_node;
-    }
-
-    // Routing table (populated by Dijkstra SPF)
-    RoutingEntry route = {};
-    if (wki_routing_lookup(dst_node, &route) && route.valid) {
-        return route.next_hop;
-    }
-
-    // Peer table fallback (next_hop set during routing recompute)
-    if ((peer != nullptr) && peer->next_hop != WKI_NODE_INVALID) {
-        return peer->next_hop;
-    }
-
-    return WKI_NODE_INVALID;
+    WkiHeader header{};
+    std::memcpy(&header, frame, sizeof(header));
+    ResolvedRoute route;
+    auto const TYPE = static_cast<MsgType>(header.msg_type);
+    return route.resolve(dst_node, routing_discovery_message(TYPE), routing_handshake_message(TYPE)) ? route.send(frame, len)
+                                                                                                     : WKI_ERR_NO_ROUTE;
 }
 
 }  // namespace
@@ -2539,13 +2676,9 @@ auto wki_send_raw(uint16_t dst_node, MsgType msg_type, const void* payload, uint
         return WKI_ERR_INVALID;
     }
 
-    WkiTransport* transport = find_transport_for_peer(dst_node);
-    if (transport == nullptr) {
-        return WKI_ERR_NO_ROUTE;
-    }
-
-    uint16_t const NEXT_HOP = resolve_next_hop(dst_node);
-    if (NEXT_HOP == WKI_NODE_INVALID && dst_node != WKI_NODE_BROADCAST) {
+    ResolvedRoute route;
+    if (dst_node != WKI_NODE_BROADCAST &&
+        !route.resolve(dst_node, routing_discovery_message(msg_type), routing_handshake_message(msg_type))) {
         return WKI_ERR_NO_ROUTE;
     }
 
@@ -2590,8 +2723,7 @@ auto wki_send_raw(uint16_t dst_node, MsgType msg_type, const void* payload, uint
     auto const FRAME_LEN = static_cast<uint16_t>(AUTHENTICATED_LEN);
 
     // CRC32: skip for direct single-hop peers (Ethernet FCS provides integrity)
-    WkiPeer const* peer = wki_peer_find(dst_node);
-    if (peer != nullptr && peer->is_direct) {
+    if (route.direct()) {
         hdr->checksum = 0;
     } else {
         hdr->checksum = wki_frame_checksum(*hdr, frame + WKI_HEADER_SIZE);
@@ -2604,18 +2736,26 @@ auto wki_send_raw(uint16_t dst_node, MsgType msg_type, const void* payload, uint
         // different L2 networks (e.g. data bridge vs WKI bridge) all receive
         // the HELLO / broadcast message.
         ret = WKI_ERR_NO_ROUTE;
+        std::array<WkiTransport*, WKI_MAX_TRANSPORTS> transports{};
+        size_t count = 0;
         g_wki.transport_lock.lock();
-        WkiTransport* t = g_wki.transports;
-        while (t != nullptr) {
+        for (WkiTransport* t = g_wki.transports; t != nullptr && count < transports.size(); t = t->next) {
+            if (!t->chaos_unregistering.load(std::memory_order_acquire)) {
+                t->chaos_in_flight.fetch_add(1, std::memory_order_acq_rel);
+                transports.at(count++) = t;
+            }
+        }
+        g_wki.transport_lock.unlock();
+        for (size_t i = 0; i < count; ++i) {
+            WkiTransport* t = transports.at(i);
             int const R = wki_transport_send(t, WKI_NODE_BROADCAST, frame, FRAME_LEN);
             if (R >= 0) {
                 ret = WKI_OK;
             }
-            t = t->next;
+            t->chaos_in_flight.fetch_sub(1, std::memory_order_release);
         }
-        g_wki.transport_lock.unlock();
     } else {
-        ret = wki_transport_send(transport, NEXT_HOP, frame, FRAME_LEN);
+        ret = route.send(frame, FRAME_LEN);
         if (ret < 0) {
             ret = WKI_ERR_TX_FAILED;
         } else {
@@ -2689,13 +2829,8 @@ auto wki_send_impl(uint16_t dst_node, uint16_t channel_id, MsgType msg_type, con
         return WKI_ERR_NOT_FOUND;
     }
 
-    WkiTransport* transport = find_transport_for_peer(dst_node);
-    if (transport == nullptr) {
-        return WKI_ERR_NO_ROUTE;
-    }
-
-    uint16_t const NEXT_HOP = resolve_next_hop(dst_node);
-    if (NEXT_HOP == WKI_NODE_INVALID) {
+    ResolvedRoute route;
+    if (!route.resolve(dst_node, routing_discovery_message(msg_type), routing_handshake_message(msg_type))) {
         return WKI_ERR_NO_ROUTE;
     }
 
@@ -2837,7 +2972,7 @@ auto wki_send_impl(uint16_t dst_node, uint16_t channel_id, MsgType msg_type, con
     pkt->len = frame_len;
 
     // CRC32: skip for direct single-hop peers (Ethernet FCS provides integrity)
-    if (peer->is_direct) {
+    if (route.direct()) {
         hdr->checksum = 0;  // RX path skips validation when checksum == 0
     } else {
         hdr->checksum = wki_frame_checksum(*hdr, frame + WKI_HEADER_SIZE);
@@ -2896,7 +3031,7 @@ auto wki_send_impl(uint16_t dst_node, uint16_t channel_id, MsgType msg_type, con
     // Zero-copy transmit: pkt already has the WKI frame at pkt->data,
     // transport just prepends link header and sends.  Transport takes
     // ownership of pkt (frees on error).
-    int const RET = wki_transport_send_pkt(transport, NEXT_HOP, pkt);
+    int const RET = route.send_pkt(pkt);
     bool const INITIAL_TX_FAILED = RET < 0;
 
     if (rt_entry != nullptr) {
@@ -3102,6 +3237,9 @@ void wki_dispatch_reliable_msg(WkiChannel* rx_channel, uint32_t rx_channel_gener
     switch (type) {
         case MsgType::LSA:
             detail::handle_lsa(hdr, payload, payload_len);
+            break;
+        case MsgType::LSA_ACK:
+            detail::handle_lsa_ack(hdr, payload, payload_len);
             break;
         case MsgType::FENCE_NOTIFY:
             detail::handle_fence_notify(hdr, payload, payload_len);
@@ -3370,14 +3508,8 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len, const WkiRx
             return;
         }
 
-        // Find next hop
-        uint16_t const NEXT_HOP = resolve_next_hop(hdr->dst_node);
-        if (NEXT_HOP == WKI_NODE_INVALID) {
-            return;  // no route
-        }
-
-        WkiTransport* fwd_transport = find_transport_for_peer(NEXT_HOP);
-        if (fwd_transport == nullptr) {
+        ResolvedRoute route;
+        if (!route.resolve(hdr->dst_node, routing_discovery_message(msg), routing_handshake_message(msg))) {
             return;
         }
 
@@ -3397,7 +3529,7 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len, const WkiRx
             fwd_hdr->checksum = wki_frame_checksum(*fwd_hdr, fwd_frame + WKI_HEADER_SIZE);
         }
 
-        static_cast<void>(wki_transport_send(fwd_transport, NEXT_HOP, fwd_frame, len));
+        static_cast<void>(route.send(fwd_frame, len));
         forward_frame_release(slot);
         return;
     }
@@ -3613,20 +3745,13 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len, const WkiRx
             }
 
             if (retransmit_snapshot_present(fast_retransmit)) {
-                int tx_ret = -1;
-                WkiTransport* transport = find_transport_for_peer(fast_retransmit.peer);
-                if (transport != nullptr) {
-                    uint16_t const NEXT_HOP = resolve_next_hop(fast_retransmit.peer);
-                    if (NEXT_HOP != WKI_NODE_INVALID) {
-                        tx_ret = wki_transport_send(transport, NEXT_HOP, fast_retransmit.data, fast_retransmit.len);
-                    }
-                }
+                int const TX_RET = send_routed_frame(fast_retransmit.peer, fast_retransmit.data, fast_retransmit.len);
 
                 ch->lock.lock();
                 if (ch->active && ch->generation == fast_retransmit.generation && ch->retransmit_head != nullptr &&
                     ch->retransmit_head->seq == fast_retransmit.seq) {
                     uint64_t const NOW = wki_now_us();
-                    if (tx_ret >= 0) {
+                    if (TX_RET >= 0) {
                         WkiRetransmitEntry* rt = ch->retransmit_head;
                         rt->retries++;
                         rt->send_time_us = NOW;
@@ -3661,6 +3786,9 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len, const WkiRx
                         uint32_t const REMOTE_BOOT = wki_hello_boot_epoch(*reinterpret_cast<const HelloPayload*>(payload));
                         session_ready = SESSION_CURRENT ? wki_auth_install_peer_session(peer, REMOTE_BOOT)
                                                         : wki_auth_prepare_peer_session(peer, REMOTE_BOOT);
+                        if (session_ready && SESSION_CURRENT) {
+                            wki_routing_peer_session_changed(peer->node_id);
+                        }
                     }
                 }
                 if (session_ready) {
@@ -3683,6 +3811,9 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len, const WkiRx
                     PeerLifecycleTryLease install_lifecycle;
                     installed = install_lifecycle.try_acquire(peer->node_id, false) &&
                                 wki_auth_install_peer_session(peer, wki_hello_boot_epoch(*reinterpret_cast<const HelloPayload*>(payload)));
+                    if (installed) {
+                        wki_routing_peer_session_changed(peer->node_id);
+                    }
                 }
                 if (installed) {
                     wki_peer_send_hello_confirm(peer);
@@ -3712,6 +3843,9 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len, const WkiRx
             if (AUTH_RESULT == WkiAuthFrameResult::PENDING_CONFIRMATION) {
                 PeerLifecycleTryLease confirm_lifecycle;
                 confirmed = confirm_lifecycle.try_acquire(peer->node_id, false) && wki_auth_confirm_peer_session(peer);
+                if (confirmed) {
+                    wki_routing_peer_session_changed(peer->node_id);
+                }
             }
             if (!confirmed) {
                 return;
@@ -4049,18 +4183,11 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len, const WkiRx
 
                 // TX outside the lock to avoid deadlock with RX interrupt
                 if (IMM_ACK) {
-                    int tx_ret = -1;
-                    WkiTransport* transport = find_transport_for_peer(imm_ack_peer);
-                    if (transport != nullptr) {
-                        uint16_t const NEXT_HOP = resolve_next_hop(imm_ack_peer);
-                        if (NEXT_HOP != WKI_NODE_INVALID) {
-                            tx_ret = wki_send_authenticated_header(transport, NEXT_HOP, imm_ack_hdr);
-                        }
-                    }
+                    int const TX_RET = wki_send_authenticated_header(nullptr, WKI_NODE_INVALID, imm_ack_hdr);
 
                     ch->lock.lock();
-                    complete_ack_transmit_for_generation_locked(ch, imm_ack_generation, imm_ack_num, tx_ret, notify_timer);
-                    if (tx_ret >= 0) {
+                    complete_ack_transmit_for_generation_locked(ch, imm_ack_generation, imm_ack_num, TX_RET, notify_timer);
+                    if (TX_RET >= 0) {
                         mark_peer_tx_progress(imm_ack_peer);
                     }
                     ch->lock.unlock();
@@ -4235,18 +4362,11 @@ void wki_timer_tick_single(WkiChannel* ch, uint64_t now_us) {
     }
 
     if (retransmit_snapshot_present(retransmit)) {
-        int tx_ret = -1;
-        WkiTransport* transport = find_transport_for_peer(retransmit.peer);
-        if (transport != nullptr) {
-            uint16_t const NEXT_HOP = resolve_next_hop(retransmit.peer);
-            if (NEXT_HOP != WKI_NODE_INVALID) {
-                tx_ret = wki_transport_send(transport, NEXT_HOP, retransmit.data, retransmit.len);
-            }
-        }
+        int const TX_RET = send_routed_frame(retransmit.peer, retransmit.data, retransmit.len);
         ch->lock.lock();
         if (ch->active && ch->generation == retransmit.generation && ch->retransmit_head != nullptr &&
             ch->retransmit_head->seq == retransmit.seq) {
-            if (tx_ret >= 0) {
+            if (TX_RET >= 0) {
                 WkiRetransmitEntry* rt = ch->retransmit_head;
                 rt->retries++;
                 rt->send_time_us = now_us;
@@ -4265,18 +4385,11 @@ void wki_timer_tick_single(WkiChannel* ch, uint64_t now_us) {
     }
 
     if (do_ack) {
-        int tx_ret = -1;
-        WkiTransport* transport = find_transport_for_peer(ack_peer);
-        if (transport != nullptr) {
-            uint16_t const NEXT_HOP = resolve_next_hop(ack_peer);
-            if (NEXT_HOP != WKI_NODE_INVALID) {
-                tx_ret = wki_send_authenticated_header(transport, NEXT_HOP, ack_hdr);
-            }
-        }
+        int const TX_RET = wki_send_authenticated_header(nullptr, WKI_NODE_INVALID, ack_hdr);
         ch->lock.lock();
         bool notify_timer = false;
-        complete_ack_transmit_for_generation_locked(ch, ack_generation, ack_num, tx_ret, notify_timer);
-        if (tx_ret >= 0) {
+        complete_ack_transmit_for_generation_locked(ch, ack_generation, ack_num, TX_RET, notify_timer);
+        if (TX_RET >= 0) {
             mark_peer_tx_progress(ack_peer);
         }
         ch->lock.unlock();
@@ -4386,19 +4499,12 @@ void wki_timer_tick(uint64_t now_us) {
         }
 
         if (retransmit_snapshot_present(retransmit)) {
-            int tx_ret = -1;
-            WkiTransport* transport = find_transport_for_peer(retransmit.peer);
-            if (transport != nullptr) {
-                uint16_t const NEXT_HOP = resolve_next_hop(retransmit.peer);
-                if (NEXT_HOP != WKI_NODE_INVALID) {
-                    tx_ret = wki_transport_send(transport, NEXT_HOP, retransmit.data, retransmit.len);
-                }
-            }
+            int const TX_RET = send_routed_frame(retransmit.peer, retransmit.data, retransmit.len);
 
             ch->lock.lock();
             if (ch->active && ch->generation == retransmit.generation && ch->retransmit_head != nullptr &&
                 ch->retransmit_head->seq == retransmit.seq) {
-                if (tx_ret >= 0) {
+                if (TX_RET >= 0) {
                     WkiRetransmitEntry* rt = ch->retransmit_head;
                     rt->retries++;
                     rt->send_time_us = now_us;
@@ -4417,19 +4523,12 @@ void wki_timer_tick(uint64_t now_us) {
         }
 
         if (do_ack) {
-            int tx_ret = -1;
-            WkiTransport* transport = find_transport_for_peer(ack_peer);
-            if (transport != nullptr) {
-                uint16_t const NEXT_HOP = resolve_next_hop(ack_peer);
-                if (NEXT_HOP != WKI_NODE_INVALID) {
-                    tx_ret = wki_send_authenticated_header(transport, NEXT_HOP, ack_hdr);
-                }
-            }
+            int const TX_RET = wki_send_authenticated_header(nullptr, WKI_NODE_INVALID, ack_hdr);
 
             ch->lock.lock();
             bool notify_timer = false;
-            complete_ack_transmit_for_generation_locked(ch, ack_generation, ack_num, tx_ret, notify_timer);
-            if (tx_ret >= 0) {
+            complete_ack_transmit_for_generation_locked(ch, ack_generation, ack_num, TX_RET, notify_timer);
+            if (TX_RET >= 0) {
                 mark_peer_tx_progress(ack_peer);
             }
             ch->lock.unlock();
