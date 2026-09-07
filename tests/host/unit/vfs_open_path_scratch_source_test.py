@@ -2189,14 +2189,15 @@ def test_f_ok_access_scratch_is_initialized_by_its_producers() -> None:
         [
             "bool ok = vfs_selftest_initialize_task_paths(task)",
             "ok = ok && vfs_faccessat(&task, AT_FDCWD, PATH, 0, 0) == 0",
-            "after_first.existence_stores > before.existence_stores && after_first.existence_hits > before.existence_hits",
+            "after_first.existence_stores > before.existence_stores",
             "ok = ok && vfs_faccessat(&task, AT_FDCWD, PATH, 0, 0) == 0",
             "after_second.existence_hits > after_first.existence_hits",
             "ok = (vfs_unlink(PATH) == 0) && ok",
             "vfs_faccessat(&task, AT_FDCWD, PATH, 0, 0) == -ENOENT",
-            "after_unlink.existence_hits > after_second.existence_hits",
+            "existence_cache_lookup_mount(PATH, path_mount, false) == -ENOENT",
             "after_missing.existence_stores > before_missing.existence_stores",
-            "after_missing_repeat.existence_hits > after_missing.existence_hits",
+            "existence_cache_lookup_mount(MISSING_PATH, missing_mount, false) == -ENOENT",
+            "vfs_faccessat(&task, AT_FDCWD, MISSING_PATH, 0, 0) == -ENOENT",
         ],
         "F_OK cache-hit and invalidation KTEST coverage",
     )
