@@ -149,8 +149,47 @@ def test_dispatch_wrappers_and_servicectl_are_integrated() -> None:
     require(aliases, "build/modules/servicectl/servicectl\t/usr/bin/servicectl", "servicectl rootfs alias")
 
 
+def test_service_resources_preserve_privilege_lock_and_restart_boundaries() -> None:
+    from tlb_shootdown_source_test import function_body as any_body
+
+    source = (ROOT / "modules/kern/src/platform/sched/service_resource.cpp").read_text()
+    resource = (ROOT / "modules/kern/src/platform/sched/resource.cpp").read_text()
+    init = (ROOT / "modules/init/src/services.cpp").read_text()
+    configure = function_body(source, "syscall_service_configure")
+    select = function_body(source, "syscall_service_select")
+    read = function_body(source, "syscall_service_read")
+    if not (configure.index("if (!is_init(caller))") < configure.index("copy_value_from_task") <
+            configure.index("validate_configuration(config)") < configure.index("service_lock.lock_irqsave()")):
+        fail("service configuration must authenticate, snapshot and validate before locking")
+    require(configure, "if (service.configured)", "immutable service configuration")
+    require(configure, "result = -EEXIST", "service configuration cannot reset CPU accounting")
+    require(select, "if (!is_init(caller))", "PID1-only service selection")
+    require(select, "caller->selected_child_service = service_abi::NO_SELECTION", "failed selection clears stale policy")
+    require(select, "state.admit_start()", "restart admission retains cumulative CPU usage")
+    if not (read.index("caller->euid != 0") < read.index("service_lock.lock_irqsave()") <
+            read.rindex("service_lock.unlock_irqrestore(FLAGS)") < read.index("copy_value_to_task")):
+        fail("service status must check privilege and release every lock before usercopy")
+    for body in [configure[configure.index("service_lock.lock_irqsave()"):], select,
+                 read[read.index("service_lock.lock_irqsave()"):read.rindex("service_lock.unlock_irqrestore(FLAGS)")],
+                 any_body(source, "charge_service_cpu")]:
+        for forbidden in ["new ", "ker::vfs", "ker::net", "kern_yield", "log::", "copy_value_from_task", "copy_value_to_task"]:
+            if forbidden in body:
+                fail(f"service critical section must remain bounded and nonblocking: {forbidden}")
+    cpu = any_body(resource, "charge_cpu")
+    if cpu.index("resource_lock.unlock_irqrestore(FLAGS)") > cpu.index("charge_service_cpu"):
+        fail("CPU accounting must not invert service -> process resource lock order")
+    spawn = init[init.index("auto spawn_service("):init.index("void begin_network_probe(")]
+    if not (spawn.index("service_resource_select(service)") < spawn.index("ker::process::fork()") <
+            spawn.index("if (PID != 0)") < spawn.rindex("service_resource_select(resource_abi::NO_SELECTION)")):
+        fail("init must select before fork and clear selection on every parent result")
+    require(spawn, "fatal = ker::process::service_resource_select(resource_abi::NO_SELECTION) != 0",
+            "failed WKI setup must clear service selection")
+    require(SERVICectl.read_text(), "print_resource_status(index)", "detailed status exposes persistent usage")
+
+
 if __name__ == "__main__":
     test_fixed_abi_is_mirrored_and_append_only()
     test_broker_authenticates_and_keeps_usercopy_outside_lock()
     test_dispatch_wrappers_and_servicectl_are_integrated()
+    test_service_resources_preserve_privilege_lock_and_restart_boundaries()
     print("init-control ABI, broker, and servicectl invariants hold")

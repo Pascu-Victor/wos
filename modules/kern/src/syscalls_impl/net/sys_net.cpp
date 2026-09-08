@@ -28,6 +28,7 @@
 #include <span>
 #include <string_view>
 #include <utility>
+#include <vfs/fd_reservation.hpp>
 #include <vfs/file.hpp>
 #include <vfs/vfs.hpp>
 
@@ -688,7 +689,7 @@ auto fd_to_file(uint64_t fd_num) -> FileHandle {
 }
 
 // Allocate fd for a socket using VFS helpers
-auto allocate_socket_fd(ker::net::Socket* sock) -> int {
+auto allocate_socket_fd(ker::net::Socket* sock, ker::vfs::FdReservation& descriptor) -> int {
     auto* task = ker::mod::sched::get_current_task();
     if (task == nullptr) {
         return -1;
@@ -707,7 +708,7 @@ auto allocate_socket_fd(ker::net::Socket* sock) -> int {
     file->fs_type = ker::vfs::FSType::SOCKET;
     file->refcount = 1;
 
-    int const FD = ker::vfs::vfs_alloc_fd(task, file);
+    int const FD = descriptor.install(file);
     if (FD < 0) {
         delete file;
         return -1;
@@ -1139,6 +1140,10 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                 return static_cast<uint64_t>(-EPROTONOSUPPORT);
             }
 
+            ker::vfs::FdReservation descriptor(ker::mod::sched::get_current_task());
+            if (descriptor.result() < 0) {
+                return static_cast<uint64_t>(descriptor.result());
+            }
             auto* sock = ker::net::socket_create(DOMAIN, TYPE, PROTOCOL);
             if (sock == nullptr) {
                 return static_cast<uint64_t>(-ENOMEM);
@@ -1150,7 +1155,7 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                 sock->owner_pid = task->pid;
             }
 
-            int const FD = allocate_socket_fd(sock);
+            int const FD = allocate_socket_fd(sock, descriptor);
             if (FD < 0) {
                 ker::net::socket_destroy(sock);
                 return static_cast<uint64_t>(-EMFILE);
@@ -1227,6 +1232,10 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
                     return static_cast<uint64_t>(-EFAULT);
                 }
             }
+            ker::vfs::FdReservation descriptor(task);
+            if (descriptor.result() < 0) {
+                return static_cast<uint64_t>(descriptor.result());
+            }
             ker::net::Socket* new_sock = nullptr;
             int const RESULT = run_socket_call<int>(handle.file, sock, 0, [&](int) {
                 return sock->proto_ops->accept(sock, &new_sock, WANTS_ADDRESS ? address.data() : nullptr,
@@ -1246,7 +1255,7 @@ uint64_t sys_net(uint64_t op, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4
             // Set owner PID on accepted socket for wake_socket()
             new_sock->owner_pid = task->pid;
 
-            int const NEW_FD = allocate_socket_fd(new_sock);
+            int const NEW_FD = allocate_socket_fd(new_sock, descriptor);
             if (NEW_FD < 0) {
                 ker::net::socket_destroy(new_sock);
                 return static_cast<uint64_t>(-EMFILE);

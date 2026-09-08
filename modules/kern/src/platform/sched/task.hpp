@@ -12,9 +12,14 @@
 #include <platform/mm/paging.hpp>
 // #include <platform/sys/context_switch.hpp>
 #include <platform/interrupt/gates.hpp>
+#include <platform/sched/fd_table.hpp>
 #include <platform/sched/frame_class.hpp>
 #include <platform/sched/migration_guard.hpp>
 #include <platform/sched/preemption_diagnostics.hpp>
+#include <platform/sched/resource_lifetime.hpp>
+#include <platform/sched/resource_model.hpp>
+#include <platform/sched/resource_process.hpp>
+#include <platform/sched/service_resource.hpp>
 #include <platform/sched/threading.hpp>
 #include <platform/sys/spinlock.hpp>
 #include <util/radix_tree.hpp>
@@ -23,7 +28,14 @@
 
 namespace ker::vfs {
 struct File;
+class FdReservation;
 }  // namespace ker::vfs
+
+namespace ker::net::wki {
+class IpcFdSnapshot;
+class WkiIpcSubmissionGuard;
+class TaskSubmitBuffer;
+}  // namespace ker::net::wki
 
 namespace ker::loader::elf {
 struct ElfFileView;
@@ -69,97 +81,6 @@ struct LazyVmemRange {
     int64_t file_ctime_nsec = 0;
 };
 using LazyVmemRangeVec = ker::util::SmallVec<LazyVmemRange, 8>;
-
-template <size_t Capacity>
-class FixedFdTable {
-   public:
-    FixedFdTable() = default;
-
-    FixedFdTable(const FixedFdTable&) = delete;
-    auto operator=(const FixedFdTable&) -> FixedFdTable& = delete;
-
-    FixedFdTable(FixedFdTable&&) = delete;
-    auto operator=(FixedFdTable&&) -> FixedFdTable& = delete;
-
-    [[nodiscard]] auto insert(uint64_t key, void* value) -> bool {
-        if (key >= Capacity) {
-            return false;
-        }
-
-        void*& slot = slot_at(static_cast<size_t>(key));
-        if (slot == nullptr && value != nullptr) {
-            ++m_size;
-        } else if (slot != nullptr && value == nullptr) {
-            --m_size;
-        }
-        slot = value;
-        return true;
-    }
-
-    auto remove(uint64_t key) -> void* {
-        if (key >= Capacity) {
-            return nullptr;
-        }
-
-        void*& slot = slot_at(static_cast<size_t>(key));
-        void* const old = slot;
-        if (old != nullptr) {
-            slot = nullptr;
-            --m_size;
-        }
-        return old;
-    }
-
-    [[nodiscard]] auto lookup(uint64_t key) const -> void* {
-        if (key >= Capacity) {
-            return nullptr;
-        }
-        return slot_at(static_cast<size_t>(key));
-    }
-
-    [[nodiscard]] auto find_first_unset_below(uint64_t start_key, uint64_t limit) const -> uint64_t {
-        if (start_key >= limit || start_key >= Capacity) {
-            return UINT64_MAX;
-        }
-
-        uint64_t const SEARCH_LIMIT = limit < Capacity ? limit : Capacity;
-        for (uint64_t key = start_key; key < SEARCH_LIMIT; ++key) {
-            if (slot_at(static_cast<size_t>(key)) == nullptr) {
-                return key;
-            }
-        }
-        return UINT64_MAX;
-    }
-
-    template <typename Fn>
-    void for_each(const Fn& fn) const {
-        for (size_t i = 0; i < Capacity; ++i) {
-            void* const value = slot_at(i);
-            if (value != nullptr) {
-                fn(static_cast<uint64_t>(i), value);
-            }
-        }
-    }
-
-    [[nodiscard]] auto size() const -> size_t { return m_size; }
-    [[nodiscard]] auto empty() const -> bool { return m_size == 0; }
-
-   private:
-    [[nodiscard]] auto slot_at(size_t index) -> void*& {
-        // Capacity-bound callers validate keys before indexing the table.
-        // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
-        return m_slots[index];
-    }
-
-    [[nodiscard]] auto slot_at(size_t index) const -> void* {
-        // Capacity-bound callers validate keys before indexing the table.
-        // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
-        return m_slots[index];
-    }
-
-    std::array<void*, Capacity> m_slots{};
-    size_t m_size{};
-};
 
 enum class TaskType : uint8_t {
     DAEMON,
@@ -290,6 +211,7 @@ struct Task {
     auto operator=(const Task&) -> Task& = delete;
     auto operator=(Task&&) -> Task& = delete;
     Task(const char* name, uint64_t elf_start, size_t elf_size, uint64_t kernel_rsp, TaskType type);
+    auto initialize_process_image(const uint8_t* elf_data, size_t elf_size) -> bool;
     auto initialize_process_image(const ker::loader::elf::ElfFileView& elf, const ker::loader::elf::ElfLoadOptions& options) -> bool;
 
     // Factory for kernel threads (DAEMON tasks).
@@ -584,6 +506,7 @@ struct Task {
     gates::InterruptFrame ptrace_syscall_frame{};
 
     // Process time accounting (microseconds).
+    std::atomic<bool> cpu_accounting_finalized{false};
     uint64_t start_time_us{};               // Wall-clock time when task was created
     uint64_t user_time_us{};                // Cumulative user-mode CPU time
     uint64_t system_time_us{};              // Cumulative kernel-mode CPU time
@@ -684,6 +607,26 @@ struct Task {
     // use an unpublished-process destruction path, even after it is detached.
     std::atomic<bool> scheduler_published{false};
     mod::sys::Spinlock fd_table_lock;
+    // Process-wide policy; userspace threads access the retained owner task.
+    resource::State resources{FD_TABLE_SIZE};
+    mod::sys::Spinlock resource_lock;
+    resource::LifetimeOwner resource_owner;
+    std::atomic<uint64_t> resource_thread_owners{0};
+    std::atomic<uint64_t> resource_cpu_threads{0};
+    bool resource_cpu_admission_closed = false;  // resource_lock
+    ker::net::wki::IpcFdSnapshot* pending_wki_fd_snapshots = nullptr;
+    ker::net::wki::WkiIpcSubmissionGuard* pending_wki_submissions = nullptr;
+    ker::net::wki::TaskSubmitBuffer* pending_wki_submit_buffers = nullptr;
+    resource::ProcessCharge process_charge;
+    resource::ServiceMember service_member;
+    uint64_t selected_child_service = ker::abi::service_resource::NO_SELECTION;
+    resource::ProcessReservation* pending_process_reservations = nullptr;
+    // CPU exhaustion is delivered only at a safe user-return boundary, never
+    // while resuming an interrupted syscall that may still hold kernel locks.
+    std::atomic<uint64_t> pending_cpu_signals{0};
+    // Stack-backed reservation nodes, canceled before fatal syscall exit
+    // abandons the stack. Only this task's execution context mutates the list.
+    ker::vfs::FdReservation* pending_fd_reservations = nullptr;
     uint16_t program_header_count = 0;     // Number of program headers (AT_PHNUM)
     uint16_t program_header_ent_size = 0;  // Size of each program header entry (AT_PHENT)
 
@@ -734,6 +677,9 @@ struct Task {
     // status/accounting are stable, and waitpid may reap while later memory
     // cleanup continues.
     std::atomic<bool> exit_notify_ready{false};
+    // Accepted asynchronous core output can publish CORE/FSIZE observations
+    // after waitability. Each contributor also retains this Task's lifetime.
+    std::atomic<uint32_t> resource_deferred_observations{0};
     std::atomic<bool> zombie_resources_reclaiming{false};
     std::atomic<bool> zombie_resources_reclaimed{false};
     // True while deferred_task_switch owns the live syscall stack and is

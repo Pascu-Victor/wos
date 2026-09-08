@@ -300,6 +300,14 @@ def main() -> None:
     require_atomic_per_origin_protocol(virt)
     require_generation_publication_is_quiescent(virt)
     require_cooperative_service_remains_raw_context_safe(virt)
+    require_bounded_cooperative_service(function_body(virt, "service_user_pagemap_gate_wait"), "user pagemap gate wait", True)
+    reader = function_body(virt, "acquire_user_pagemap_access")
+    teardown_wait = reader[reader.index("while (gate.teardown.load"):reader.index("uint32_t readers")]
+    if "service_user_pagemap_gate_wait(service_spins);" not in teardown_wait:
+        fail("user pagemap readers must service TLB acknowledgements while awaiting the exclusive holder")
+    exclusive = function_body(virt, "begin_user_pagemap_exclusive")
+    if exclusive.count("service_user_pagemap_gate_wait(service_spins);") != 2:
+        fail("both exclusive acquisition and reader drain must service TLB acknowledgements")
     require_irq_masked_raw_waits_service_shootdowns(spinlock, page_alloc, phys, serial)
     require_flush_helper_reaches_remote_cpus(virt)
     require_mapping_mutations_use_shootdown(virt)

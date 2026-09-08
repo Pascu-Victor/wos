@@ -33,6 +33,8 @@
 #include <platform/sched/frame_class.hpp>
 #include <platform/sched/preemption_diagnostics.hpp>
 #include <platform/sched/preemption_policy.hpp>
+#include <platform/sched/resource.hpp>
+#include <platform/sched/resource_as.hpp>
 #include <platform/sched/task.hpp>
 #include <platform/smt/smt.hpp>
 #include <platform/sys/usercopy.hpp>
@@ -155,11 +157,13 @@ auto proc_task_state_label(char state) -> const char* {
 struct ProcTaskStats {
     uint64_t user_time_us{};
     uint64_t system_time_us{};
+    uint64_t child_user_time_us{};
+    uint64_t child_system_time_us{};
     uint64_t thread_count{1};
     char state{'S'};
 };
 
-auto collect_proc_task_stats(const ProcTask& task, bool thread_view) -> ProcTaskStats {
+auto collect_proc_task_stats(ProcTask& task, bool thread_view) -> ProcTaskStats {
     ProcTaskStats stats{
         .user_time_us = task.user_time_us,
         .system_time_us = task.system_time_us,
@@ -170,10 +174,16 @@ auto collect_proc_task_stats(const ProcTask& task, bool thread_view) -> ProcTask
         return stats;
     }
 
+    ker::mod::sched::resource::CpuObservation observed{};
+    if (ker::mod::sched::resource::copy_cpu_observation(task, observed)) {
+        stats.user_time_us = observed.user_time_us;
+        stats.system_time_us = observed.system_time_us;
+        stats.child_user_time_us = observed.child_user_time_us;
+        stats.child_system_time_us = observed.child_system_time_us;
+    }
+    // Registry membership determines live state/count, never lifetime CPU.
     uint64_t const GROUP_PID = ker::mod::sched::task::process_pid(task);
     uint64_t thread_count = 0;
-    uint64_t user_time_us = 0;
-    uint64_t system_time_us = 0;
     bool any_running = false;
     bool any_blocked = false;
     bool any_sleeping = false;
@@ -191,8 +201,6 @@ auto collect_proc_task_stats(const ProcTask& task, bool thread_view) -> ProcTask
         }
 
         thread_count++;
-        user_time_us += candidate->user_time_us;
-        system_time_us += candidate->system_time_us;
         char const STATE = proc_task_state_char(*candidate);
         any_running = any_running || STATE == 'R';
         any_blocked = any_blocked || STATE == 'D';
@@ -205,8 +213,6 @@ auto collect_proc_task_stats(const ProcTask& task, bool thread_view) -> ProcTask
         return stats;
     }
 
-    stats.user_time_us = user_time_us;
-    stats.system_time_us = system_time_us;
     stats.thread_count = thread_count;
     if (any_running) {
         stats.state = 'R';
@@ -631,6 +637,16 @@ auto procfs_readdir(File* f, DirEntry* buf, size_t count) -> int {
             std::memcpy(buf->d_name.data(), "images", 7);
             return 0;
         }
+        bool const IS_LIMITS_ENTRY =
+            (pfd->node.type == ProcNodeType::PID_DIR && count == 16) || (pfd->node.type == ProcNodeType::TASK_TID_DIR && count == 15);
+        if (IS_LIMITS_ENTRY) {
+            buf->d_ino = 28;
+            buf->d_off = count + 1;
+            buf->d_reclen = sizeof(DirEntry);
+            buf->d_type = DT_REG;
+            std::memcpy(buf->d_name.data(), "limits", 7);
+            return 0;
+        }
         return -ENOENT;  // No more entries
     }
 
@@ -1022,8 +1038,10 @@ auto generate_stat(uint64_t pid, char* buf, size_t bufsz, bool thread_view) -> s
     append(" ");
     append_int(STATS.system_time_us / 10000);  // stime
     append(" ");
-    append("0 ");  // cutime (children)
-    append("0 ");  // cstime (children)
+    append_int(STATS.child_user_time_us / 10000);
+    append(" ");
+    append_int(STATS.child_system_time_us / 10000);
+    append(" ");
 
     // priority nice num_threads itrealvalue starttime
     append_int(static_cast<uint64_t>(20 + task->sched_nice));  // priority
@@ -5759,11 +5777,134 @@ auto generate_version(char* buf, size_t bufsz) -> size_t {
 
 // --- FileOperations ---
 
+auto procfs_read_limits(ProcFileData& data, void* buf, size_t count, size_t offset) -> ssize_t {
+    using namespace ker::mod::sched::resource;
+    ker::mod::sys::MutexGuard content_guard(data.limits_content_lock);
+    std::array<Usage, ker::abi::resource::COUNT> snapshot{};
+    {
+        auto* subject = ker::mod::sched::find_task_by_pid_safe(data.node.pid);
+        if (subject == nullptr) {
+            return -ESRCH;
+        }
+        int error = 0;
+        {
+            Owner owner(subject);
+            auto* process = owner.get();
+            auto* caller = ker::mod::sched::get_current_task();
+            if (process == nullptr || caller == nullptr) {
+                error = -ESRCH;
+            } else if (caller->euid != 0 && ker::mod::sched::task::process_pid(*caller) != process->pid) {
+                error = -EACCES;
+            } else if (data.content == nullptr) {
+                uint64_t const FD_FLAGS = process->fd_table_lock.lock_irqsave();
+                uint64_t const FLAGS = process->resource_lock.lock_irqsave();
+                auto& fd = process->resources.entries[static_cast<unsigned>(Id::NOFILE)];
+                fd.current = process->fd_table.size() + process->fd_table.reserved_count();
+                fd.peak = std::max(fd.peak, fd.current);
+                snapshot = process->resources.entries;
+                process->resource_lock.unlock_irqrestore(FLAGS);
+                process->fd_table_lock.unlock_irqrestore(FD_FLAGS);
+                // Completed VM transactions publish AS observations. Do not
+                // acquire the VM mutex here: file mmap may read procfs while
+                // already holding it, including this File's content mutex.
+                copy_address_space_observation(*subject, snapshot[static_cast<unsigned>(Id::AS)]);
+                copy_process_observation(*subject, snapshot[static_cast<unsigned>(Id::NPROC)]);
+            }
+        }
+        subject->release();
+        if (error != 0) {
+            return error;
+        }
+    }
+    if (data.content == nullptr) {
+        constexpr size_t CAPACITY = 4096;
+        data.content = new (std::nothrow) char[CAPACITY];
+        if (data.content == nullptr) {
+            return -ENOMEM;
+        }
+        size_t off = 0;
+        auto append = [&](const char* text) {
+            while (*text != '\0' && off + 1 < CAPACITY) {
+                data.content[off++] = *text++;
+            }
+        };
+        auto number = [&](uint64_t value, bool limit = false) {
+            if (limit && value == INFINITY_VALUE) {
+                append("infinity");
+            } else {
+                std::array<char, 24> digits{};
+                int_to_str(value, digits.data(), digits.size());
+                append(digits.data());
+            }
+        };
+        struct Row {
+            Id id;
+            const char* name;
+            const char* units;
+            bool enforced;
+        };
+        constexpr std::array<Row, 7> ROWS{{
+            {Id::CPU, "CPU", "seconds", true},
+            {Id::FSIZE, "FSIZE", "bytes", true},
+            {Id::STACK, "STACK", "bytes", true},
+            {Id::CORE, "CORE", "bytes", true},
+            {Id::NPROC, "NPROC", "tasks", true},
+            {Id::NOFILE, "NOFILE", "descriptors", true},
+            {Id::AS, "AS", "bytes", true},
+        }};
+        append("Resource Soft Hard Current Peak Denied Reason Units Enforcement\n");
+        for (auto const& row : ROWS) {
+            auto const& entry = snapshot[static_cast<unsigned>(row.id)];
+            append(row.name);
+            append(" ");
+            number(entry.limit.soft, true);
+            append(" ");
+            number(entry.limit.hard, true);
+            append(" ");
+            number(entry.current);
+            append(" ");
+            number(entry.peak);
+            append(" ");
+            number(entry.denied);
+            append(" ");
+            switch (entry.reason) {
+                case Denial::NONE:
+                    append("none");
+                    break;
+                case Denial::HARD_LIMIT:
+                    append("hard_limit");
+                    break;
+                case Denial::SOFT_LIMIT:
+                    append("soft_limit");
+                    break;
+                case Denial::OVERFLOW:
+                    append("overflow");
+                    break;
+            }
+            append(" ");
+            append(row.units);
+            append(row.enforced ? " enforced\n" : " pending\n");
+        }
+        data.content[off] = '\0';
+        data.content_len = off;
+    }
+    if (offset >= data.content_len) {
+        return 0;
+    }
+    count = std::min(count, data.content_len - offset);
+    std::memcpy(buf, data.content + offset, count);
+    return static_cast<ssize_t>(count);
+}
+
 auto procfs_read(File* f, void* buf, size_t count, size_t offset) -> ssize_t {
     if (f == nullptr || f->private_data == nullptr) {
         return -EINVAL;
     }
     auto* pfd = static_cast<ProcFileData*>(f->private_data);
+
+    if (pfd->node.type == ProcNodeType::LIMITS_FILE) {
+        return procfs_read_limits(*pfd, buf, count, offset);
+    }
 
     // Lazily generate content
     if (pfd->content == nullptr) {
@@ -6381,7 +6522,12 @@ auto procfs_lseek(File* f, off_t offset, int whence) -> off_t {
             new_pos = f->pos + offset;
             break;  // SEEK_CUR
         case 2:
-            new_pos = static_cast<off_t>(pfd->content_len) + offset;
+            if (pfd->node.type == ProcNodeType::LIMITS_FILE) {
+                ker::mod::sys::MutexGuard content_guard(pfd->limits_content_lock);
+                new_pos = static_cast<off_t>(pfd->content_len) + offset;
+            } else {
+                new_pos = static_cast<off_t>(pfd->content_len) + offset;
+            }
             break;  // SEEK_END
         default:
             return -EINVAL;
@@ -6754,6 +6900,9 @@ auto procfs_open_path(const char* path, int flags, int mode) -> File* {
         if (strncmp(task_sub, "fd/", 3) == 0) {
             return make_fd_link(TID_VALUE, task_sub + 3);
         }
+        if (strcmp(task_sub, "limits") == 0) {
+            return make_file(ProcNodeType::LIMITS_FILE, TID_VALUE, false);
+        }
         if (strcmp(task_sub, "status") == 0) {
             return make_file(ProcNodeType::STATUS_FILE, TID_VALUE, false, true);
         }
@@ -6977,6 +7126,9 @@ auto procfs_open_path(const char* path, int flags, int mode) -> File* {
         return make_fd_link(SELF_PID, path + 8);
     }
     // /proc/self/status
+    if (strcmp(path, "self/limits") == 0) {
+        return make_file(ProcNodeType::LIMITS_FILE, SELF_PID, false);
+    }
     if (strcmp(path, "self/status") == 0) {
         return make_file(ProcNodeType::STATUS_FILE, SELF_PID, false);
     }
@@ -7085,6 +7237,9 @@ auto procfs_open_path(const char* path, int flags, int mode) -> File* {
     if (strncmp(sub, "fd/", 3) == 0) {
         return make_fd_link(static_cast<uint64_t>(PID), sub + 3);
     }
+    if (strcmp(sub, "limits") == 0) {
+        return make_file(ProcNodeType::LIMITS_FILE, static_cast<uint64_t>(PID), false);
+    }
     if (strcmp(sub, "status") == 0) {
         return make_file(ProcNodeType::STATUS_FILE, static_cast<uint64_t>(PID), false);
     }
@@ -7115,6 +7270,25 @@ auto procfs_open_path(const char* path, int flags, int mode) -> File* {
 
     return nullptr;  // Unknown procfs path
 }
+
+#ifdef WOS_SELFTEST
+auto selftest_cpu_observation() -> bool {
+    ProcTask process{};
+    process.pid = 0x7B42;
+    process.type = ker::mod::sched::task::TaskType::PROCESS;
+    process.user_time_us = 3;
+    process.system_time_us = 5;
+    process.child_user_time_us = 90000;
+    process.child_system_time_us = 110000;
+    static_cast<void>(process.resources.charge_cpu(100000, 70000));
+    // This task is absent from the live registry, like retained post-exit
+    // metadata. Process history must survive, while thread view stays local.
+    auto const GROUP = collect_proc_task_stats(process, false);
+    auto const THREAD = collect_proc_task_stats(process, true);
+    return GROUP.user_time_us == 70000 && GROUP.system_time_us == 30000 && GROUP.child_user_time_us == 90000 &&
+           GROUP.child_system_time_us == 110000 && THREAD.user_time_us == 3 && THREAD.system_time_us == 5;
+}
+#endif
 
 void procfs_init() {
     if (g_procfs_creation_epoch_ns == 0) {

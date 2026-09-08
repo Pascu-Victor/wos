@@ -11,6 +11,7 @@
 #include <cstring>
 #include <deque>
 #include <dev/pty.hpp>
+#include <iterator>
 #include <net/socket.hpp>
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
@@ -26,6 +27,7 @@
 #include <syscalls_impl/futex/futex.hpp>
 #include <utility>
 #include <vfs/epoll.hpp>
+#include <vfs/fd_reservation.hpp>
 #include <vfs/file.hpp>
 #include <vfs/file_operations.hpp>
 #include <vfs/fs/devfs.hpp>
@@ -300,11 +302,80 @@ bool g_ipc_initialized = false;
 ker::mod::sys::Spinlock s_ipc_lock;
 
 // Server-side (home node) exports
-std::deque<WkiIpcExport*> g_ipc_exports;
+// Non-owning intrusive membership. Publication/erasure cannot allocate, and
+// registry links are independent of the pump queue and retirement chain.
+template <typename Entry>
+class IpcRegistry {
+   public:
+    class Iterator {
+       public:
+        using value_type = Entry*;
+        using difference_type = std::ptrdiff_t;
+        using iterator_category = std::forward_iterator_tag;
+        using iterator_concept = std::forward_iterator_tag;
+        Iterator() = default;
+        explicit Iterator(Entry* value) : current(value) {}
+        auto operator*() const -> Entry* { return current; }
+        auto operator++() -> Iterator& {
+            current = current->registry_next;
+            return *this;
+        }
+        auto operator++(int) -> Iterator {
+            Iterator old = *this;
+            ++*this;
+            return old;
+        }
+        auto operator==(const Iterator&) const -> bool = default;
+
+       private:
+        Entry* current = nullptr;
+    };
+    IpcRegistry() = default;
+    IpcRegistry(const IpcRegistry&) = delete;
+    auto operator=(const IpcRegistry&) -> IpcRegistry& = delete;
+    auto begin() const -> Iterator { return Iterator(head); }
+    auto end() const -> Iterator { return Iterator(); }
+    auto size() const -> size_t { return count; }
+    void push_back(Entry* exp) {
+        if (exp == nullptr) return;
+        exp->registry_previous = tail;
+        exp->registry_next = nullptr;
+        if (tail != nullptr)
+            tail->registry_next = exp;
+        else
+            head = exp;
+        tail = exp;
+        ++count;
+    }
+    auto erase(Iterator position) -> Iterator {
+        auto* exp = *position;
+        if (exp == nullptr) return end();
+        auto* next = exp->registry_next;
+        if (exp->registry_previous != nullptr)
+            exp->registry_previous->registry_next = next;
+        else
+            head = next;
+        if (next != nullptr)
+            next->registry_previous = exp->registry_previous;
+        else
+            tail = exp->registry_previous;
+        exp->registry_next = nullptr;
+        exp->registry_previous = nullptr;
+        --count;
+        return Iterator(next);
+    }
+
+   private:
+    Entry* head = nullptr;
+    Entry* tail = nullptr;
+    size_t count = 0;
+};
+using IpcExportRegistry = IpcRegistry<WkiIpcExport>;
+IpcExportRegistry g_ipc_exports;
 uint32_t g_next_ipc_resource_id = 0x7000;
 
 // Client-side (remote node) proxies — tracked for cleanup
-std::deque<ProxyIpcState*> g_ipc_proxies;
+IpcRegistry<ProxyIpcState> g_ipc_proxies;
 
 std::atomic<uint64_t> g_proxy_write_payload_bytes{0};
 std::atomic<uint64_t> g_proxy_write_no_credit_waits{0};
@@ -352,6 +423,8 @@ auto ipc_selftest_file_close(ker::vfs::File* /*file*/) -> int {
     g_ipc_file_selftest_closes.fetch_add(1, std::memory_order_relaxed);
     return 0;
 }
+
+std::atomic<int> g_ipc_accept_selftest_reads{0};
 
 ker::vfs::FileOperations g_ipc_selftest_file_ops = {
     .vfs_open = nullptr,
@@ -408,6 +481,8 @@ struct PendingPipeDelivery {
 std::deque<PendingPipeDelivery*> g_pending_pipe_deliveries;
 
 struct ExportPipeWriteBacklog {
+    ExportPipeWriteBacklog* registry_previous = nullptr;
+    ExportPipeWriteBacklog* registry_next = nullptr;
     WkiIpcExport* exp = nullptr;
     uint32_t resource_id = 0;
     std::deque<PendingPipeChunk> chunks;
@@ -419,7 +494,7 @@ struct ExportPipeWriteBacklog {
     bool persistent_for_rdma = false;
 };
 
-std::deque<ExportPipeWriteBacklog*> g_export_pipe_write_backlogs;
+IpcRegistry<ExportPipeWriteBacklog> g_export_pipe_write_backlogs;
 constexpr size_t WKI_IPC_EXPORT_PIPE_FLUSH_WORKER_COUNT = 4;
 constexpr size_t WKI_IPC_EXPORT_PIPE_WRITE_BURST_CALLS = 3;
 std::array<std::deque<ExportPipeWriteBacklog*>, WKI_IPC_EXPORT_PIPE_FLUSH_WORKER_COUNT> g_export_pipe_write_flush_queues;
@@ -940,7 +1015,7 @@ auto export_can_retire_locked(const WkiIpcExport* exp) -> bool {
     if (exp == nullptr) {
         return true;
     }
-    if (exp->active && exp->file != nullptr) {
+    if ((exp->active && exp->file != nullptr) || exp->pipe_write_in_flight) {
         return false;
     }
     return !export_has_write_backlog_locked(exp) && !export_has_pipe_pump_slot_locked(exp);
@@ -966,13 +1041,31 @@ auto compact_inactive_exports_locked() -> WkiIpcExport* {
     return retired;
 }
 
+// The selected RoCE transport unregisters under its region lock and does not
+// park. Revoke the key before freeing its backing memory, including abandoned
+// private preparation. No IPC lock may be held by callers.
+void release_export_pipe_rdma(WkiIpcExport& exp) {
+    if (exp.pipe_rdma_rkey != 0 && exp.pipe_rdma_transport != nullptr && exp.pipe_rdma_transport->rdma_unregister_region != nullptr) {
+        static_cast<void>(
+            exp.pipe_rdma_transport->rdma_unregister_region(exp.pipe_rdma_transport, exp.pipe_rdma_rkey, exp.pipe_rdma_region_size));
+    }
+    exp.pipe_rdma_rkey = 0;
+    exp.pipe_rdma_enabled = false;
+    exp.pipe_rdma_transport = nullptr;
+    auto* region = exp.pipe_rdma_region;
+    exp.pipe_rdma_region = nullptr;
+    exp.pipe_rdma_region_size = 0;
+    exp.pipe_rdma_capacity = 0;
+    delete[] region;
+}
+
 void free_retired_exports(WkiIpcExport* retired) {
     while (retired != nullptr) {
         auto* next = retired->pump_next;
         retired->pump_next = nullptr;
         auto* file = retired->file;
         retired->file = nullptr;
-        delete[] retired->pipe_rdma_region;
+        release_export_pipe_rdma(*retired);
         ipc_release_file_ref(file);
 #ifdef WOS_SELFTEST
         g_ipc_export_selftest_frees.fetch_add(1, std::memory_order_relaxed);
@@ -1313,6 +1406,11 @@ auto export_pipe_write_nonblocking(ker::vfs::File* file, const uint8_t* data, ui
     ker::vfs::File pipe_write_view{};
     ker::vfs::File* write_file = file;
     if (IS_PIPE) {
+        // Only actual remote output may grow the source pipe. Submission
+        // preparation and rejection must leave its capacity untouched. The
+        // deferred caller owns File lifetime and holds no IPC/FD lock here;
+        // optional allocation failure retains normal bounded-pipe behavior.
+        static_cast<void>(ker::vfs::vfs_pipe_reserve_capacity(file, WKI_IPC_EXPORT_PIPE_CAPACITY));
         init_nonblocking_pipe_write_view(pipe_write_view, *file);
         write_file = &pipe_write_view;
     }
@@ -1351,6 +1449,22 @@ auto mark_export_pipe_write_closed(uint32_t resource_id, uint64_t expected_bytes
 
     wake_export_pipe_write_flush_worker(FLUSH_SHARD);
     return true;
+}
+
+// Called under s_ipc_lock after the sole shard worker returns from VFS.
+// Detachment may have removed backlog ownership while the worker pinned the
+// exporter/ring. Finish that retirement before dropping the independent File
+// reference; never resolve the old owner through a possibly detached backlog.
+auto finish_export_pipe_write_locked(ExportPipeWriteBacklog* backlog, WkiIpcExport* owner, ker::vfs::File* file, WkiIpcExport** retired)
+    -> WkiIpcExport* {
+    owner->pipe_write_in_flight = false;
+    auto* exp = backlog->exp;
+    if (exp != owner || !exp->active || exp->file != file) {
+        erase_export_pipe_write_backlog_locked(backlog);
+        *retired = compact_inactive_exports_locked();
+        return nullptr;
+    }
+    return exp;
 }
 
 [[noreturn]] void export_pipe_write_flush_thread_loop(size_t shard) {
@@ -1444,17 +1558,20 @@ auto mark_export_pipe_write_closed(uint32_t resource_id, uint64_t expected_bytes
             }
             continue;
         }
+        exp->pipe_write_in_flight = true;
+        WkiIpcExport* const WRITE_OWNER = exp;
         s_ipc_lock.unlock_irqrestore(irqf);
 
         ssize_t const WRITE_RET = export_pipe_write_nonblocking(file, data_ptr, remaining);
 
+        WkiIpcExport* retired = nullptr;
         irqf = s_ipc_lock.lock_irqsave();
-        exp = backlog->exp;
-        if (exp == nullptr || !exp->active || exp->file != file) {
-            erase_export_pipe_write_backlog_locked(backlog);
+        exp = finish_export_pipe_write_locked(backlog, WRITE_OWNER, file, &retired);
+        if (exp == nullptr) {
             s_ipc_lock.unlock_irqrestore(irqf);
-            ipc_release_file_ref(file);
             free_export_pipe_write_backlog(backlog);
+            free_retired_exports(retired);
+            ipc_release_file_ref(file);
             continue;
         }
 
@@ -1866,7 +1983,7 @@ auto ipc_pipe_rdma_transport_for_peer(uint16_t peer_node) -> WkiTransport* {
         return nullptr;
     }
     if (!transport->rdma_capable || transport->rdma_register_region == nullptr || transport->rdma_read == nullptr ||
-        transport->rdma_write == nullptr || transport->doorbell == nullptr) {
+        transport->rdma_write == nullptr || transport->doorbell == nullptr || transport->rdma_unregister_region == nullptr) {
         return nullptr;
     }
     return transport;
@@ -2602,7 +2719,7 @@ auto queue_export_pipe_rdma_flush(uint16_t src_node, uint32_t resource_id) -> bo
     auto* exp = find_export_by_resource_id(resource_id);
     if (exp != nullptr && exp->active && exp->consumer_node == src_node && exp->pipe_rdma_enabled) {
         auto* backlog = find_export_pipe_write_backlog_locked(exp);
-        if (backlog != nullptr) {
+        if (backlog != nullptr && backlog->persistent_for_rdma) {
             queue_export_pipe_write_flush_locked(backlog);
             shard = export_pipe_write_backlog_shard(backlog);
             wake = true;
@@ -2616,70 +2733,41 @@ auto queue_export_pipe_rdma_flush(uint16_t src_node, uint32_t resource_id) -> bo
     return wake;
 }
 
-void setup_export_pipe_rdma(WkiIpcExport* exp, uint16_t target_node, WkiIpcFdEntry& entry) {
-    if (!WKI_IPC_PIPE_RDMA_DOORBELL_ENABLED || exp == nullptr || exp->res_type != ResourceType::IPC_PIPE ||
-        exp->resource_id > WKI_IPC_RESOURCE_MASK) {
+// Both output objects are owned by IpcFdSnapshot until final publication.
+// Never put a private backlog in a global registry or queue across registration.
+void prepare_export_pipe_rdma(WkiIpcExport& exp, ExportPipeWriteBacklog*& backlog, WkiTransport* transport, int fail_at = -1) {
+    if (transport == nullptr || transport->rdma_register_region == nullptr || transport->rdma_unregister_region == nullptr ||
+        exp.res_type != ResourceType::IPC_PIPE || exp.resource_id > WKI_IPC_RESOURCE_MASK)
         return;
+    if (fail_at == 0) return;
+    backlog = new (std::nothrow) ExportPipeWriteBacklog();
+    if (backlog == nullptr) return;
+    if (fail_at != 1) exp.pipe_rdma_region = new (std::nothrow) uint8_t[WKI_IPC_PIPE_RDMA_TOTAL_SIZE];
+    if (exp.pipe_rdma_region != nullptr) {
+        exp.pipe_rdma_region_size = WKI_IPC_PIPE_RDMA_TOTAL_SIZE;
+        exp.pipe_rdma_capacity = WKI_IPC_PIPE_RDMA_CAPACITY;
+        exp.pipe_rdma_transport = transport;
+        std::fill_n(exp.pipe_rdma_region, WKI_IPC_PIPE_RDMA_TOTAL_SIZE, uint8_t{0});
+        auto* header = reinterpret_cast<WkiPipeSharedRegion*>(exp.pipe_rdma_region);
+        header->head.store(0, std::memory_order_relaxed);
+        header->tail.store(0, std::memory_order_relaxed);
+        header->credits.store(WKI_IPC_PIPE_RDMA_CAPACITY, std::memory_order_relaxed);
+        header->capacity = WKI_IPC_PIPE_RDMA_CAPACITY;
+        header->flags = 0;
+        // Write the key directly into the recovery-owned exporter. The current
+        // RoCE callback publishes that key under its lock and does not park.
+        int const RESULT = transport->rdma_register_region(transport, reinterpret_cast<uint64_t>(exp.pipe_rdma_region),
+                                                           exp.pipe_rdma_region_size, &exp.pipe_rdma_rkey);
+        if (RESULT == WKI_OK && exp.pipe_rdma_rkey != 0) {
+            exp.pipe_rdma_enabled = true;
+            backlog->exp = &exp;
+            backlog->resource_id = exp.resource_id;
+            return;
+        }
     }
-
-    auto* transport = ipc_pipe_rdma_transport_for_peer(target_node);
-    if (transport == nullptr) {
-        return;
-    }
-
-    uint64_t irqf = s_ipc_lock.lock_irqsave();
-    auto* backlog = ensure_export_pipe_write_backlog_locked(exp);
-    if (backlog == nullptr) {
-        s_ipc_lock.unlock_irqrestore(irqf);
-        return;
-    }
-    s_ipc_lock.unlock_irqrestore(irqf);
-
-    auto* region = new (std::nothrow) uint8_t[WKI_IPC_PIPE_RDMA_TOTAL_SIZE];
-    if (region == nullptr) {
-        irqf = s_ipc_lock.lock_irqsave();
-        erase_export_pipe_write_backlog_locked(backlog);
-        s_ipc_lock.unlock_irqrestore(irqf);
-        free_export_pipe_write_backlog(backlog);
-        return;
-    }
-    std::fill_n(region, WKI_IPC_PIPE_RDMA_TOTAL_SIZE, uint8_t{0});
-
-    auto* header = reinterpret_cast<WkiPipeSharedRegion*>(region);
-    header->head.store(0, std::memory_order_relaxed);
-    header->tail.store(0, std::memory_order_relaxed);
-    header->credits.store(WKI_IPC_PIPE_RDMA_CAPACITY, std::memory_order_relaxed);
-    header->capacity = WKI_IPC_PIPE_RDMA_CAPACITY;
-    header->flags = 0;
-
-    uint32_t rkey = 0;
-    int const REG_RET = transport->rdma_register_region(transport, reinterpret_cast<uint64_t>(region), WKI_IPC_PIPE_RDMA_TOTAL_SIZE, &rkey);
-    if (REG_RET != WKI_OK || rkey == 0) {
-        irqf = s_ipc_lock.lock_irqsave();
-        erase_export_pipe_write_backlog_locked(backlog);
-        s_ipc_lock.unlock_irqrestore(irqf);
-        free_export_pipe_write_backlog(backlog);
-        delete[] region;
-        return;
-    }
-
-    size_t shard = 0;
-    irqf = s_ipc_lock.lock_irqsave();
-    exp->pipe_rdma_enabled = true;
-    exp->pipe_rdma_region = region;
-    exp->pipe_rdma_region_size = WKI_IPC_PIPE_RDMA_TOTAL_SIZE;
-    exp->pipe_rdma_capacity = WKI_IPC_PIPE_RDMA_CAPACITY;
-    exp->pipe_rdma_rkey = rkey;
-    exp->pipe_rdma_transport = transport;
-
-    backlog->persistent_for_rdma = true;
-    queue_export_pipe_write_flush_locked(backlog);
-    shard = export_pipe_write_backlog_shard(backlog);
-    s_ipc_lock.unlock_irqrestore(irqf);
-
-    wake_export_pipe_write_flush_worker(shard);
-    entry.rdma_rkey = rkey;
-    entry.rdma_offset = WKI_IPC_PIPE_RDMA_CAPACITY;
+    release_export_pipe_rdma(exp);
+    delete backlog;
+    backlog = nullptr;
 }
 
 auto proxy_ring_used_bytes(const ProxyIpcState* proxy) -> uint64_t {
@@ -3095,22 +3183,29 @@ void init_pipe_pump_workers() {
     }
 }
 
-void start_pipe_pump(WkiIpcExport* exp) {
-    if (exp == nullptr) {
-        return;
-    }
+// Caller holds s_ipc_lock. Claim exactly once and only for the accepting peer.
+// The caller must reserve a queue/worker slot before dropping the lock.
+auto claim_accepted_pipe_pump_locked(uint32_t resource_id, uint16_t consumer_node) -> WkiIpcExport* {
+    auto* exp = find_export_by_resource_id(resource_id);
+    if (exp == nullptr || !exp->active || exp->file == nullptr || exp->consumer_node != consumer_node || !exp->pump_pending_accept ||
+        exp->pump_queued || exp->pump_running.load(std::memory_order_acquire))
+        return nullptr;
+    exp->pump_pending_accept = false;
+    return exp;
+}
 
+void start_pipe_pump(uint32_t resource_id, uint16_t consumer_node) {
     PipePumpArg* slot_arg = nullptr;
     PumpFn pump_fn = nullptr;
     ker::mod::sched::task::Task* task = nullptr;
     const auto* pump_fn_it = G_PUMP_FNS.begin();
     {
         uint64_t const IRQF = s_ipc_lock.lock_irqsave();
-        if (!exp->active || exp->file == nullptr || exp->pump_queued || exp->pump_running.load(std::memory_order_acquire)) {
+        auto* exp = claim_accepted_pipe_pump_locked(resource_id, consumer_node);
+        if (exp == nullptr) {
             s_ipc_lock.unlock_irqrestore(IRQF);
             return;
         }
-
         for (auto& pump_arg : g_pump_args) {
             if (pump_arg.exp.load(std::memory_order_acquire) == nullptr) {
                 slot_arg = &pump_arg;
@@ -3123,43 +3218,34 @@ void start_pipe_pump(WkiIpcExport* exp) {
             }
             ++pump_fn_it;
         }
-
         if (slot_arg == nullptr || pump_fn == nullptr) {
             enqueue_pipe_pump_locked(exp);
-#ifdef WKI_IPC_DEBUG
-            ker::mod::dbg::log("[WKI] IPC pump queued: resource_id=%u", exp->resource_id);
-#endif
             s_ipc_lock.unlock_irqrestore(IRQF);
             return;
         }
         s_ipc_lock.unlock_irqrestore(IRQF);
     }
-
     if (task == nullptr) {
         task = create_pipe_pump_worker(*slot_arg, pump_fn);
         uint64_t const IRQF = s_ipc_lock.lock_irqsave();
-        if (task == nullptr) {
-            if (slot_arg->exp.load(std::memory_order_acquire) == exp) {
-                exp->pump_task = nullptr;
+        // A new worker may already have retired its exporter. Read only the
+        // current slot under lock; never dereference the old raw pointer here.
+        auto* current = slot_arg->exp.load(std::memory_order_acquire);
+        if (current != nullptr && current->resource_id == resource_id && current->consumer_node == consumer_node) {
+            if (task == nullptr) {
+                current->pump_task = nullptr;
                 slot_arg->exp.store(nullptr, std::memory_order_release);
-                if (exp->active && exp->file != nullptr) {
-                    exp->pump_running.store(false, std::memory_order_release);
-                    enqueue_pipe_pump_locked(exp);
-                } else {
-                    exp->pump_running.store(false, std::memory_order_release);
-                }
+                current->pump_running.store(false, std::memory_order_release);
+                if (current->active && current->file != nullptr) enqueue_pipe_pump_locked(current);
+            } else if (current->active && current->pump_running.load(std::memory_order_acquire)) {
+                current->pump_task = task;
+            } else {
+                release_pipe_pump_slot_locked(*slot_arg, current);
             }
-            s_ipc_lock.unlock_irqrestore(IRQF);
-            return;
-        }
-        if (slot_arg->exp.load(std::memory_order_acquire) == exp && exp->active && exp->pump_running.load(std::memory_order_acquire)) {
-            exp->pump_task = task;
-        } else {
-            release_pipe_pump_slot_locked(*slot_arg, exp);
         }
         s_ipc_lock.unlock_irqrestore(IRQF);
+        if (task == nullptr) return;
     }
-
     ker::mod::sched::kern_wake(task);
 }
 
@@ -3797,10 +3883,13 @@ void wki_ipc_cleanup_exported_fds(const WkiIpcFdEntry* map, uint16_t count, uint
         wake_all_export_pipe_write_flush_workers();
     }
 
+    // Retired objects no longer own Files. Free them before a last File put
+    // can park; single-entry submission cancellation then carries no abandoned
+    // retired chain across that callback.
+    free_retired_exports(retired_exports);
     for (auto* file : std::span(released_files.data(), released_file_count)) {
         ipc_release_file_ref(file);
     }
-    free_retired_exports(retired_exports);
     for (uint32_t resource_id : std::span(direct_discards.data(), direct_discard_count)) {
         schedule_pending_pipe_discard(consumer_node, resource_id);
     }
@@ -4111,125 +4200,291 @@ void wki_ipc_proxy_wake_poll_waiters(ProxyIpcState* proxy) {
 // Public API: Export task fds for remote submission
 // =============================================================================
 
+WkiIpcSubmissionGuard::WkiIpcSubmissionGuard(ker::mod::sched::task::Task* source, const WkiIpcFdEntry* map, WkiIpcTaskFdHandoff* handoff,
+                                             uint16_t& count, uint16_t consumer)
+    : source(source), map(map), handoff(handoff), count(count), consumer(consumer) {
+    arm();
+}
+WkiIpcSubmissionGuard::~WkiIpcSubmissionGuard() { cancel(); }
+
+void WkiIpcSubmissionGuard::arm() {
+    if (owns) return;
+    owns = true;
+    handoff_cursor = 0;
+    export_cursor = 0;
+    executor = ker::mod::sched::can_query_current_task() ? ker::mod::sched::get_current_task() : source;
+    if (executor == nullptr) executor = source;
+    if (executor == nullptr) return;
+    next = executor->pending_wki_submissions;
+    if (next != nullptr) next->previous = this;
+    executor->pending_wki_submissions = this;
+}
+
+void WkiIpcSubmissionGuard::disarm() {
+    owns = false;
+    if (executor != nullptr) {
+        if (previous != nullptr)
+            previous->next = next;
+        else
+            executor->pending_wki_submissions = next;
+        if (next != nullptr) next->previous = previous;
+    }
+    executor = nullptr;
+    previous = nullptr;
+    next = nullptr;
+}
+
+void WkiIpcSubmissionGuard::cancel() {
+    // Clear one ownership before any put/cleanup that may block. Remaining
+    // entries stay reachable if fatal exit re-enters and abandons this frame.
+    uint16_t const COUNT = std::min<uint16_t>(count, 16);
+    while (owns && handoff != nullptr && handoff_cursor < COUNT) {
+        auto& entry = handoff[handoff_cursor++];
+        auto* file = entry.file;
+        entry = {};
+        if (file != nullptr) ipc_release_file_ref(file);
+    }
+    while (owns && map != nullptr && export_cursor < COUNT) {
+        auto const entry = map[export_cursor++];
+        wki_ipc_cleanup_exported_fds(&entry, 1, consumer);
+    }
+    disarm();
+}
+
+void wki_ipc_cancel_submission_guards(ker::mod::sched::task::Task& executor) {
+    while (executor.pending_wki_submissions != nullptr) executor.pending_wki_submissions->cancel();
+}
+
+class IpcFdSnapshot {
+   public:
+    explicit IpcFdSnapshot(ker::mod::sched::task::Task& source) {
+        executor = ker::mod::sched::can_query_current_task() ? ker::mod::sched::get_current_task() : &source;
+        if (executor == nullptr) executor = &source;
+        next = executor->pending_wki_fd_snapshots;
+        if (next != nullptr) next->previous = this;
+        executor->pending_wki_fd_snapshots = this;
+        uint64_t const FLAGS = source.fd_table_lock.lock_irqsave();
+        source.fd_table.for_each([&](uint64_t fd, void* value) {
+            if (value == nullptr || source.get_fd_cloexec(static_cast<unsigned>(fd))) return;
+            auto* file = static_cast<ker::vfs::File*>(value);
+            file->refcount.fetch_add(1, std::memory_order_acq_rel);
+            files[fd] = file;
+        });
+        source.fd_table_lock.unlock_irqrestore(FLAGS);
+    }
+    ~IpcFdSnapshot() { cancel(); }
+    IpcFdSnapshot(const IpcFdSnapshot&) = delete;
+    auto operator=(const IpcFdSnapshot&) -> IpcFdSnapshot& = delete;
+    auto prepare_exports(uint16_t count, int fail_at = -1) -> int {
+        if (count > prepared_exports.size()) return -EINVAL;
+        for (unsigned i = 0; i < count; ++i) {
+            if (static_cast<int>(i) == fail_at) return -ENOMEM;
+            prepared_exports[i] = new (std::nothrow) WkiIpcExport();
+            if (prepared_exports[i] == nullptr) return -ENOMEM;
+        }
+        return 0;
+    }
+    void cancel() {
+        // These objects have never entered the registry or acquired File
+        // ownership. Keep private preparation reachable from fatal cleanup.
+        for (auto& slot : prepared_backlogs) {
+            auto* backlog = slot;
+            slot = nullptr;
+            delete backlog;
+        }
+        for (auto& slot : prepared_exports) {
+            auto* exp = slot;
+            slot = nullptr;
+            if (exp == nullptr) continue;
+            release_export_pipe_rdma(*exp);
+            delete exp;
+#ifdef WOS_SELFTEST
+            g_ipc_export_selftest_frees.fetch_add(1, std::memory_order_relaxed);
+#endif
+        }
+        // Keep the node reachable while puts may block. A fatal exit can
+        // re-enter cleanup and drain the remaining pins without double puts.
+        for (auto& slot : files) {
+            auto* file = slot;
+            slot = nullptr;
+            if (file != nullptr) ipc_release_file_ref(file);
+        }
+        if (executor == nullptr) return;
+        if (previous != nullptr)
+            previous->next = next;
+        else
+            executor->pending_wki_fd_snapshots = next;
+        if (next != nullptr) next->previous = previous;
+        executor = nullptr;
+        previous = nullptr;
+        next = nullptr;
+    }
+    std::array<ker::vfs::File*, ker::mod::sched::task::Task::FD_TABLE_SIZE> files{};
+    std::array<WkiIpcExport*, 16> prepared_exports{};
+    std::array<ExportPipeWriteBacklog*, 16> prepared_backlogs{};
+
+   private:
+    ker::mod::sched::task::Task* executor = nullptr;
+    IpcFdSnapshot* previous = nullptr;
+    IpcFdSnapshot* next = nullptr;
+};
+
+void wki_ipc_cancel_fd_snapshots(ker::mod::sched::task::Task& executor) {
+    while (executor.pending_wki_fd_snapshots != nullptr) executor.pending_wki_fd_snapshots->cancel();
+}
+
+namespace {
+constexpr uint16_t MAX_SUBMIT_IPC_FDS = 16;
+struct IpcFdExportPlan {
+    std::array<ResourceType, ker::mod::sched::task::Task::FD_TABLE_SIZE> types{};
+    std::array<bool, ker::mod::sched::task::Task::FD_TABLE_SIZE> pump_on_accept{};
+    uint16_t count = 0;
+    uint8_t stdio_mask = 0;
+};
+
+auto plan_ipc_fd_export(const IpcFdSnapshot& snapshot, IpcFdExportPlan& plan) -> int {
+    IpcFdExportPlan candidate;
+    candidate.types.fill(ResourceType::CUSTOM);
+    std::array<const void*, MAX_SUBMIT_IPC_FDS> pty_identities{};
+    size_t pty_identity_count = 0;
+    for (unsigned fd = 0; fd < snapshot.files.size(); ++fd) {
+        auto* file = snapshot.files[fd];
+        if (file == nullptr) continue;
+        if (fd < 3) candidate.stdio_mask |= static_cast<uint8_t>(1U << fd);
+        ResourceType type = ResourceType::CUSTOM;
+        if (ker::vfs::vfs_is_pipe_file(file)) {
+            type = ResourceType::IPC_PIPE;
+        } else if (ker::vfs::vfs_is_socket_file(file)) {
+            type = ResourceType::IPC_SOCKET;
+        } else if (ker::vfs::vfs_is_epoll_file(file)) {
+            // An epoll interest list retains local File pointers and callbacks.
+            return -ENOTSUP;
+        } else if (should_proxy_tty_like_file(file)) {
+            type = ResourceType::IPC_PTY;
+        } else {
+            // The legacy null/capture fallback cannot preserve ordinary file
+            // I/O or enforce a subsequent FSIZE reduction on regular output.
+            if (fd >= 3 || file->fs_type != ker::vfs::FSType::DEVFS) return -ENOTSUP;
+            continue;
+        }
+        if (candidate.count == MAX_SUBMIT_IPC_FDS) return -ENOTSUP;
+        candidate.types[fd] = type;
+        candidate.pump_on_accept[fd] =
+            type == ResourceType::IPC_SOCKET || (type == ResourceType::IPC_PIPE && ipc_fd_access_mode(file->open_flags) == 0);
+        if (type == ResourceType::IPC_PTY) {
+            const void* identity = file->fops == ker::vfs::devfs::get_devfs_fops() ? ker::dev::pty::pty_file_identity_key(file) : nullptr;
+            if (identity == nullptr) identity = file;
+            bool seen = false;
+            for (size_t i = 0; i < pty_identity_count; ++i) seen |= pty_identities[i] == identity;
+            // The snapshot is ordered by FD; choose the first (lowest) alias.
+            if (!seen) {
+                pty_identities[pty_identity_count++] = identity;
+                candidate.pump_on_accept[fd] = true;
+            }
+        }
+        ++candidate.count;
+    }
+    plan = candidate;
+    return 0;
+}
+}  // namespace
+
 auto wki_ipc_export_task_fds(ker::mod::sched::task::Task* task, uint16_t target_node, WkiIpcFdEntry* map_out, uint16_t* count_out,
-                             WkiIpcTaskFdHandoff* handoff_out) -> bool {
+                             WkiIpcTaskFdHandoff* handoff_out, uint8_t* stdio_mask_out) -> int {
+    if (count_out != nullptr) *count_out = 0;
+    if (stdio_mask_out != nullptr) *stdio_mask_out = 0;
     if (task == nullptr || map_out == nullptr || count_out == nullptr) {
-        return false;
+        return -EINVAL;
     }
 
     uint16_t count = 0;
-    constexpr uint16_t MAX_IPC_FDS = 16;
-    struct DeferredPtyPump {
-        const void* identity = nullptr;
-        uint64_t fd = UINT64_MAX;
-        WkiIpcExport* exp = nullptr;
-    };
-    std::array<DeferredPtyPump, MAX_IPC_FDS> deferred_pty_pumps = {};
-    size_t deferred_pty_pump_count = 0;
-
-    task->fd_table.for_each([&](uint64_t fd_key, void* val) {
-        if (val == nullptr || count >= MAX_IPC_FDS) {
-            return;
-        }
-        auto* file = static_cast<ker::vfs::File*>(val);
-
-        ResourceType res_type = ResourceType::CUSTOM;
-        if (ker::vfs::vfs_is_pipe_file(file)) {
-            res_type = ResourceType::IPC_PIPE;
-        } else if (ker::vfs::vfs_is_socket_file(file)) {
-            res_type = ResourceType::IPC_SOCKET;
-        } else if (ker::vfs::vfs_is_epoll_file(file)) {
-            res_type = ResourceType::IPC_EPOLL;
-        } else if (should_proxy_tty_like_file(file)) {
-            res_type = ResourceType::IPC_PTY;
-        } else {
-            return;
-        }
+    IpcFdSnapshot snapshot(*task);
+    IpcFdExportPlan plan;
+    int const ADMISSION = plan_ipc_fd_export(snapshot, plan);
+    if (ADMISSION != 0) return ADMISSION;
+    int const PREPARATION = snapshot.prepare_exports(plan.count);
+    if (PREPARATION != 0) return PREPARATION;
+    std::array<WkiIpcFdEntry, MAX_SUBMIT_IPC_FDS> entries{};
+    auto* rdma_transport = ipc_pipe_rdma_transport_for_peer(target_node);
+    // IDs may be consumed by an abandoned preparation, but no endpoint or
+    // handoff File ownership is visible until every entry is ready.
+    uint64_t irqf = s_ipc_lock.lock_irqsave();
+    for (uint16_t i = 0; i < plan.count; ++i) snapshot.prepared_exports[i]->resource_id = allocate_ipc_resource_id();
+    s_ipc_lock.unlock_irqrestore(irqf);
+    for (uint64_t fd_key = 0; fd_key < snapshot.files.size(); ++fd_key) {
+        auto* file = snapshot.files[fd_key];
+        if (file == nullptr) continue;
+        ResourceType const res_type = plan.types[fd_key];
+        if (res_type == ResourceType::CUSTOM) continue;
         uint16_t const ACCESS_MODE = ipc_fd_access_mode(file->open_flags);
-
-        uint64_t const IRQF = s_ipc_lock.lock_irqsave();
-        uint32_t const RESOURCE_ID = allocate_ipc_resource_id();
-
-        auto* exp = new WkiIpcExport();
-        exp->active = true;
-        exp->resource_id = RESOURCE_ID;
+        auto* exp = snapshot.prepared_exports[count];
+        exp->pump_pending_accept = plan.pump_on_accept[fd_key];
         exp->res_type = res_type;
+        exp->consumer_node = target_node;
+        exp->assigned_channel = WKI_CHAN_RESOURCE;
+        auto& entry = entries[count];
+        entry.local_fd = static_cast<uint16_t>(fd_key);
+        entry.res_type = static_cast<uint16_t>(res_type);
+        entry.resource_id = exp->resource_id;
+        entry.home_node = g_wki.my_node_id;
+        entry.reserved1 = ipc_fd_export_open_flags(file->open_flags);
+        if (res_type == ResourceType::IPC_PIPE && ACCESS_MODE != 0) {
+            prepare_export_pipe_rdma(*exp, snapshot.prepared_backlogs[count], rdma_transport);
+            entry.rdma_rkey = exp->pipe_rdma_rkey;
+            entry.rdma_offset = exp->pipe_rdma_capacity;
+            exp->message_write_flow_control = !exp->pipe_rdma_enabled;
+            if (exp->message_write_flow_control) entry.reserved1 |= WKI_IPC_FD_FLAG_PIPE_FLOW_CONTROL;
+        }
+        ++count;
+    }
+
+    // All publication is bounded and nonallocating. No private/global exporter
+    // pointer is dereferenced after the registry lock is released.
+    irqf = s_ipc_lock.lock_irqsave();
+    for (uint16_t i = 0; i < count; ++i) {
+        auto* exp = snapshot.prepared_exports[i];
+        snapshot.prepared_exports[i] = nullptr;
+        auto* file = snapshot.files[entries[i].local_fd];
         exp->file = file;
+        exp->active = true;
         file->refcount.fetch_add(1, std::memory_order_relaxed);
         if (handoff_out != nullptr) {
             file->refcount.fetch_add(1, std::memory_order_acq_rel);
-            handoff_out[count] = WkiIpcTaskFdHandoff{.local_fd = static_cast<uint16_t>(fd_key), .file = file};
+            handoff_out[i] = WkiIpcTaskFdHandoff{.local_fd = entries[i].local_fd, .file = file};
         }
-        exp->consumer_node = target_node;
-        exp->assigned_channel = WKI_CHAN_RESOURCE;
-
         g_ipc_exports.push_back(exp);
-        s_ipc_lock.unlock_irqrestore(IRQF);
-
-        if (res_type == ResourceType::IPC_PIPE && ACCESS_MODE != 0) {
-            static_cast<void>(ker::vfs::vfs_pipe_reserve_capacity(file, WKI_IPC_EXPORT_PIPE_CAPACITY));
-        }
-
-        bool const NEEDS_DATA_PUMP = (res_type == ResourceType::IPC_PIPE && ACCESS_MODE == 0) || res_type == ResourceType::IPC_SOCKET;
-        if (NEEDS_DATA_PUMP) {
-            start_pipe_pump(exp);
-        } else if (res_type == ResourceType::IPC_PTY) {
-            void const* identity = nullptr;
-            if (file->fops == ker::vfs::devfs::get_devfs_fops()) {
-                identity = ker::dev::pty::pty_file_identity_key(file);
-            }
-            if (identity == nullptr) {
-                identity = static_cast<const void*>(file);
-            }
-
-            bool found = false;
-            for (size_t i = 0; i < deferred_pty_pump_count; ++i) {
-                auto& candidate = deferred_pty_pumps.at(i);
-                if (candidate.identity != identity) {
-                    continue;
-                }
-                found = true;
-                if (fd_key < candidate.fd) {
-                    candidate.fd = fd_key;
-                    candidate.exp = exp;
-                }
-                break;
-            }
-
-            if (!found && deferred_pty_pump_count < deferred_pty_pumps.size()) {
-                auto& candidate = deferred_pty_pumps.at(deferred_pty_pump_count++);
-                candidate.identity = identity;
-                candidate.fd = fd_key;
-                candidate.exp = exp;
-            }
-        }
-
-        auto& entry = map_out[count];
-        entry.local_fd = static_cast<uint16_t>(fd_key);
-        entry.res_type = static_cast<uint16_t>(res_type);
-        entry.resource_id = RESOURCE_ID;
-        entry.home_node = g_wki.my_node_id;
-        entry.reserved1 = ipc_fd_export_open_flags(file->open_flags);
-        entry.rdma_rkey = 0;
-        entry.rdma_offset = 0;
-        if (res_type == ResourceType::IPC_PIPE && ACCESS_MODE != 0) {
-            setup_export_pipe_rdma(exp, target_node, entry);
-            if (entry.rdma_rkey == 0) {
-                exp->message_write_flow_control = true;
-                entry.reserved1 |= WKI_IPC_FD_FLAG_PIPE_FLOW_CONTROL;
-            }
-        }
-        count++;
-    });
-
-    for (size_t i = 0; i < deferred_pty_pump_count; ++i) {
-        if (deferred_pty_pumps.at(i).exp != nullptr) {
-            start_pipe_pump(deferred_pty_pumps.at(i).exp);
-        }
+        auto* backlog = snapshot.prepared_backlogs[i];
+        snapshot.prepared_backlogs[i] = nullptr;
+        if (backlog != nullptr) g_export_pipe_write_backlogs.push_back(backlog);
+        map_out[i] = entries[i];
     }
-
+    if (stdio_mask_out != nullptr) *stdio_mask_out = plan.stdio_mask;
     *count_out = count;
-    return count > 0;
+    s_ipc_lock.unlock_irqrestore(irqf);
+
+    return 0;
+}
+
+void wki_ipc_activate_task_fds(const WkiIpcFdEntry* map, uint16_t count, uint16_t consumer_node) {
+    if (map == nullptr || count > MAX_SUBMIT_IPC_FDS || consumer_node == WKI_NODE_INVALID) return;
+    for (const auto& entry : std::span(map, count)) {
+        bool wake = false;
+        size_t shard = 0;
+        uint64_t const IRQF = s_ipc_lock.lock_irqsave();
+        auto* exp = find_export_by_resource_id(entry.resource_id);
+        if (exp != nullptr && exp->consumer_node == consumer_node && exp->pipe_rdma_enabled) {
+            auto* backlog = find_export_pipe_write_backlog_locked(exp);
+            if (backlog != nullptr && !backlog->persistent_for_rdma) {
+                backlog->persistent_for_rdma = true;
+                queue_export_pipe_write_flush_locked(backlog);
+                shard = export_pipe_write_backlog_shard(backlog);
+                wake = true;
+            }
+        }
+        s_ipc_lock.unlock_irqrestore(IRQF);
+        if (wake) wake_export_pipe_write_flush_worker(shard);
+        start_pipe_pump(entry.resource_id, consumer_node);
+    }
 }
 
 void wki_ipc_release_task_fd_handoff(WkiIpcTaskFdHandoff* handoff, uint16_t count) {
@@ -4260,6 +4515,7 @@ auto wki_ipc_commit_task_fd_handoff(ker::mod::sched::task::Task* task, WkiIpcTas
             if (task->fd_table.lookup(entry.local_fd) == entry.file) {
                 removed = static_cast<ker::vfs::File*>(task->fd_table.remove(entry.local_fd));
                 task->clear_fd_cloexec(entry.local_fd);
+                ker::vfs::fd_usage_changed_locked(*task);
             }
             task->fd_table_lock.unlock_irqrestore(IRQF);
         }
@@ -4341,27 +4597,42 @@ auto wki_ipc_find_pipe_affinity_node(const ker::mod::sched::task::Task* task, ui
 
 namespace {
 
-struct IpcProxyFdInstallResult {
-    bool inserted = false;
+struct PreparedIpcImport {
+    uint16_t fd = 0;
+    ker::vfs::File* file = nullptr;
+    ProxyIpcState* proxy = nullptr;
     ker::vfs::File* existing = nullptr;
 };
 
-auto install_ipc_proxy_file(ker::mod::sched::task::Task* task, uint16_t fd, ker::vfs::File* proxy_file) -> IpcProxyFdInstallResult {
-    if (task == nullptr || proxy_file == nullptr || fd >= ker::mod::sched::task::Task::FD_TABLE_SIZE) {
-        return {};
+auto install_ipc_proxy_files(ker::mod::sched::task::Task& task, std::span<PreparedIpcImport> imports) -> bool {
+    uint64_t const IRQF = task.fd_table_lock.lock_irqsave();
+    for (auto const& entry : imports) {
+        if (task.fd_table.reserved(entry.fd)) {
+            task.fd_table_lock.unlock_irqrestore(IRQF);
+            return false;
+        }
     }
-
-    uint64_t const IRQF = task->fd_table_lock.lock_irqsave();
-    auto* existing = static_cast<ker::vfs::File*>(task->fd_table.lookup(fd));
+    for (size_t i = 0; i < imports.size(); ++i) {
+        auto& entry = imports[i];
+        entry.existing = static_cast<ker::vfs::File*>(task.fd_table.lookup(entry.fd));
+        bool injected_failure = false;
 #ifdef WOS_SELFTEST
-    if (g_ipc_selftest_force_attach_insert_failure.load(std::memory_order_relaxed)) {
-        task->fd_table_lock.unlock_irqrestore(IRQF);
-        return IpcProxyFdInstallResult{.inserted = false, .existing = existing};
-    }
+        // Fail at the final entry so multi-FD tests exercise actual rollback.
+        injected_failure = g_ipc_selftest_force_attach_insert_failure.load(std::memory_order_relaxed) && i + 1 == imports.size();
 #endif
-    bool const INSERTED = task->fd_table.insert(fd, proxy_file);
-    task->fd_table_lock.unlock_irqrestore(IRQF);
-    return IpcProxyFdInstallResult{.inserted = INSERTED, .existing = existing};
+        if (injected_failure || !task.fd_table.insert(entry.fd, entry.file)) {
+            for (size_t j = 0; j < i; ++j) {
+                // Validated fixed-table indices, no reservations and same lock.
+                static_cast<void>(task.fd_table.insert(imports[j].fd, imports[j].existing));
+            }
+            task.fd_table_lock.unlock_irqrestore(IRQF);
+            return false;
+        }
+    }
+    for (auto const& entry : imports) task.clear_fd_cloexec(entry.fd);
+    ker::vfs::fd_usage_changed_locked(task);
+    task.fd_table_lock.unlock_irqrestore(IRQF);
+    return true;
 }
 
 void free_uninstalled_ipc_proxy_file(ker::vfs::File* proxy_file, ProxyIpcState* proxy) {
@@ -4381,21 +4652,38 @@ void free_uninstalled_ipc_proxy_file(ker::vfs::File* proxy_file, ProxyIpcState* 
 
 }  // namespace
 
-void wki_ipc_attach_task_fds(ker::mod::sched::task::Task* task, const WkiIpcFdEntry* map, uint16_t count) {
-    if (task == nullptr || map == nullptr || count == 0) {
-        return;
+auto wki_ipc_attach_task_fds(ker::mod::sched::task::Task* task, const WkiIpcFdEntry* map, uint16_t count) -> bool {
+    constexpr size_t MAX_IMPORTS = 16;
+    if (task == nullptr || count > MAX_IMPORTS || (count != 0 && map == nullptr)) return false;
+    if (count == 0) return true;
+    for (size_t i = 0; i < count; ++i) {
+        auto const& entry = map[i];
+        auto const type = static_cast<ResourceType>(entry.res_type);
+        if (entry.local_fd >= ker::mod::sched::task::Task::FD_TABLE_SIZE ||
+            (type != ResourceType::IPC_PIPE && type != ResourceType::IPC_SOCKET && type != ResourceType::IPC_EPOLL &&
+             type != ResourceType::IPC_PTY))
+            return false;
+        for (size_t j = 0; j < i; ++j)
+            if (map[j].local_fd == entry.local_fd) return false;
     }
+    std::array<PreparedIpcImport, MAX_IMPORTS> prepared{};
+    size_t prepared_count = 0;
+    auto abandon = [&]() {
+        for (size_t i = 0; i < prepared_count; ++i) free_uninstalled_ipc_proxy_file(prepared[i].file, prepared[i].proxy);
+        return false;
+    };
 
     for (const auto& entry : std::span(map, count)) {
-        if (entry.local_fd >= ker::mod::sched::task::Task::FD_TABLE_SIZE) {
-            continue;
-        }
+        auto& staged = prepared[prepared_count++];
+        staged.fd = entry.local_fd;
 
         auto const RES_TYPE = static_cast<ResourceType>(entry.res_type);
         int const OPEN_FLAGS = ipc_fd_import_open_flags(entry.reserved1);
         uint16_t const ACCESS_MODE = ipc_fd_access_mode(OPEN_FLAGS);
 
-        auto* proxy = new ProxyIpcState();
+        auto* proxy = new (std::nothrow) ProxyIpcState();
+        staged.proxy = proxy;
+        if (proxy == nullptr) return abandon();
         proxy->active = true;
         proxy->res_type = RES_TYPE;
         proxy->home_node = entry.home_node;
@@ -4407,15 +4695,14 @@ void wki_ipc_attach_task_fds(ker::mod::sched::task::Task* task, const WkiIpcFdEn
         // Allocate receive storage only for endpoints whose fops can consume it.
         if (proxy->can_receive_data) {
             constexpr uint32_t PIPE_RING_CAPACITY = WKI_PROXY_PIPE_RING_SIZE;
-            auto* rb = new uint8_t[PIPE_RING_CAPACITY];
+            auto* rb = new (std::nothrow) uint8_t[PIPE_RING_CAPACITY];
             if (rb != nullptr) {
                 // RX copies every readable byte before publishing ring_head, so
                 // free ring capacity does not need eager initialization.
                 proxy->ring_buf = rb;
                 proxy->ring_capacity = PIPE_RING_CAPACITY;
             } else {
-                ker::mod::dbg::log("[WKI] IPC proxy ring allocation failed: fd=%u res_id=%u cap=%u", entry.local_fd, entry.resource_id,
-                                   PIPE_RING_CAPACITY);
+                return abandon();
             }
             proxy->ring_head.store(0, std::memory_order_relaxed);
             proxy->ring_tail.store(0, std::memory_order_relaxed);
@@ -4424,7 +4711,9 @@ void wki_ipc_attach_task_fds(ker::mod::sched::task::Task* task, const WkiIpcFdEn
         }
 
         // Replace the fd's file with proxy file
-        auto* proxy_file = new ker::vfs::File();
+        auto* proxy_file = new (std::nothrow) ker::vfs::File();
+        staged.file = proxy_file;
+        if (proxy_file == nullptr) return abandon();
         proxy_file->fd = static_cast<int>(entry.local_fd);
         proxy_file->private_data = proxy;
         proxy_file->pos = 0;
@@ -4465,7 +4754,8 @@ void wki_ipc_attach_task_fds(ker::mod::sched::task::Task* task, const WkiIpcFdEn
             // Allocate a local EpollInstance so kernel epoll_ctl / epoll_pwait work
             // transparently on this fd.  EpollInstance MUST be at offset 0 in
             // ProxyEpollFile so the cast in epoll_ctl is valid.
-            auto* epf = new ProxyEpollFile();
+            auto* epf = new (std::nothrow) ProxyEpollFile();
+            if (epf == nullptr) return abandon();
             epf->inst.count = 0;
             epf->inst.interests.fill({});
             epf->resource_id = proxy->resource_id;
@@ -4480,16 +4770,18 @@ void wki_ipc_attach_task_fds(ker::mod::sched::task::Task* task, const WkiIpcFdEn
         } else {
             proxy_file->fops = &g_proxy_pipe_read_fops;
         }
+    }
 
-        IpcProxyFdInstallResult const INSTALL = install_ipc_proxy_file(task, entry.local_fd, proxy_file);
-        if (!INSTALL.inserted) {
-            free_uninstalled_ipc_proxy_file(proxy_file, proxy);
-            continue;
-        }
-        if (INSTALL.existing != nullptr) {
-            ker::vfs::vfs_put_file(INSTALL.existing);
-        }
+    // All imported numbers were inherited at the sender. A later NOFILE
+    // lowering cannot revoke them; the fixed capacity and reservations still
+    // constrain this all-or-none publication.
+    if (!install_ipc_proxy_files(*task, std::span(prepared.data(), prepared_count))) return abandon();
 
+    // The unpublished Task now owns every File. Register all proxies before
+    // releasing replaced Files, whose close operations can block.
+    for (size_t i = 0; i < prepared_count; ++i) {
+        auto const& entry = map[i];
+        auto* proxy = prepared[i].proxy;
         bool pending_write_closed = false;
         PendingPipeDelivery* dropped_pending = nullptr;
         uint64_t const IRQF = s_ipc_lock.lock_irqsave();
@@ -4518,6 +4810,10 @@ void wki_ipc_attach_task_fds(ker::mod::sched::task::Task* task, const WkiIpcFdEn
                            entry.resource_id, entry.home_node);
 #endif
     }
+    for (size_t i = 0; i < prepared_count; ++i) {
+        if (prepared[i].existing != nullptr) ker::vfs::vfs_put_file(prepared[i].existing);
+    }
+    return true;
 }
 
 // =============================================================================
@@ -4898,6 +5194,654 @@ auto wki_ipc_selftest_export_compaction_frees() -> int {
     return FREES_AFTER - FREES_BEFORE;
 }
 
+auto wki_ipc_selftest_rdma_write_survives_detachment() -> int {
+    constexpr uint16_t PEER = 0x7B26;
+    constexpr std::array<uint8_t, 4> BYTES{0x91, 0x27, 0x35, 0xA4};
+    bool ok = true;
+    for (bool peer_cleanup : {false, true}) {
+        struct Script {
+            uint8_t* region = nullptr;
+            std::array<uint8_t, 4> output{};
+            unsigned writes = 0;
+            unsigned closes = 0;
+            unsigned revoked = 0;
+            bool valid_revoke = true;
+        } script;
+        WkiTransport transport{};
+        transport.private_data = &script;
+        transport.rdma_register_region = [](WkiTransport* self, uint64_t address, uint32_t, uint32_t* key) -> int {
+            auto& state = *static_cast<Script*>(self->private_data);
+            state.region = reinterpret_cast<uint8_t*>(address);
+            *key = 0x7B26;
+            return WKI_OK;
+        };
+        transport.rdma_unregister_region = [](WkiTransport* self, uint32_t key, uint32_t size) -> int {
+            auto& state = *static_cast<Script*>(self->private_data);
+            ++state.revoked;
+            auto* header = reinterpret_cast<WkiPipeSharedRegion*>(state.region);
+            state.valid_revoke &= key == 0x7B26 && size == WKI_IPC_PIPE_RDMA_TOTAL_SIZE && header->capacity == WKI_IPC_PIPE_RDMA_CAPACITY;
+            return WKI_OK;
+        };
+        ker::vfs::FileOperations operations{};
+        operations.vfs_write = [](ker::vfs::File* file, const void* data, size_t size, size_t) -> ssize_t {
+            auto& state = *static_cast<Script*>(file->private_data);
+            ++state.writes;
+            if (size != state.output.size()) return -EINVAL;
+            std::memcpy(state.output.data(), data, size);
+            return static_cast<ssize_t>(size);
+        };
+        operations.vfs_close = [](ker::vfs::File* file) -> int {
+            ++static_cast<Script*>(file->private_data)->closes;
+            return 0;
+        };
+        auto* exp = new (std::nothrow) WkiIpcExport{};
+        auto* file = new (std::nothrow) ker::vfs::File{};
+        if (exp == nullptr || file == nullptr) {
+            delete exp;
+            delete file;
+            return -ENOMEM;
+        }
+        exp->resource_id = 0x7B26;
+        exp->res_type = ResourceType::IPC_PIPE;
+        ExportPipeWriteBacklog* backlog = nullptr;
+        prepare_export_pipe_rdma(*exp, backlog, &transport);
+        if (!exp->pipe_rdma_enabled) {
+            delete backlog;
+            release_export_pipe_rdma(*exp);
+            delete exp;
+            delete file;
+            return -ENOMEM;
+        }
+        file->refcount.store(2, std::memory_order_release);  // Export plus deferred writer.
+        file->fops = &operations;
+        file->private_data = &script;
+        exp->file = file;
+        exp->active = true;
+        exp->consumer_node = PEER;
+        auto* data = exp->pipe_rdma_region + sizeof(WkiPipeSharedRegion);
+        std::memcpy(data, BYTES.data(), BYTES.size());
+        WkiIpcFdEntry entry{.resource_id = exp->resource_id};
+        uint64_t flags = s_ipc_lock.lock_irqsave();
+        size_t const BEFORE = g_ipc_exports.size();
+        g_ipc_exports.push_back(exp);
+        g_export_pipe_write_backlogs.push_back(backlog);
+        exp->pipe_write_in_flight = true;
+        s_ipc_lock.unlock_irqrestore(flags);
+        if (peer_cleanup)
+            wki_ipc_cleanup_for_peer(PEER);
+        else
+            wki_ipc_cleanup_exported_fds(&entry, 1, PEER);
+        flags = s_ipc_lock.lock_irqsave();
+        ok &= !exp->active && exp->file == nullptr && backlog->exp == nullptr && !export_can_retire_locked(exp);
+        s_ipc_lock.unlock_irqrestore(flags);
+        ok &= script.revoked == 0 && script.closes == 0 && file->refcount.load() == 1;
+        // Use the real deferred write helper with the still-pinned RDMA bytes
+        // after production cleanup detached both registry ownership links.
+        ok &= export_pipe_write_nonblocking(file, data, BYTES.size()) == static_cast<ssize_t>(BYTES.size());
+        ok &= script.writes == 1 && script.output == BYTES;
+        WkiIpcExport* retired = nullptr;
+        flags = s_ipc_lock.lock_irqsave();
+        ok &= finish_export_pipe_write_locked(backlog, exp, file, &retired) == nullptr && retired == exp;
+        ok &= g_ipc_exports.size() == BEFORE;
+        s_ipc_lock.unlock_irqrestore(flags);
+        free_export_pipe_write_backlog(backlog);
+        free_retired_exports(retired);
+        ipc_release_file_ref(file);
+        wki_ipc_cleanup_for_peer(PEER);
+        ok &= script.valid_revoke && script.revoked == 1 && script.closes == 1;
+    }
+    return ok ? 0 : -EIO;
+}
+
+auto wki_ipc_selftest_accepted_handoff_cancellation() -> int {
+    ker::mod::sched::task::Task task{};
+    struct Script {
+        ker::mod::sched::task::Task* executor;
+        unsigned closes = 0;
+    } script{.executor = &task};
+    ker::vfs::FileOperations operations{};
+    operations.vfs_close = [](ker::vfs::File* file) -> int {
+        auto& state = *static_cast<Script*>(file->private_data);
+        ++state.closes;
+        wki_ipc_cancel_submission_guards(*state.executor);
+        return 0;
+    };
+    std::array<WkiIpcTaskFdHandoff, 2> handoff{};
+    uint16_t count = 0;
+    WkiIpcSubmissionGuard accepted(&task, nullptr, handoff.data(), count, WKI_NODE_INVALID);
+    for (uint16_t i = 0; i < handoff.size(); ++i) {
+        auto* file = new (std::nothrow) ker::vfs::File{};
+        if (file == nullptr) {
+            accepted.cancel();
+            for (uint16_t j = 0; j < i; ++j) {
+                auto* existing = static_cast<ker::vfs::File*>(task.fd_table.remove(j));
+                ipc_release_file_ref(existing);
+            }
+            return -ENOMEM;
+        }
+        file->fops = &operations;
+        file->private_data = &script;
+        file->refcount.store(2, std::memory_order_release);
+        static_cast<void>(task.fd_table.insert(i, file));
+        task.set_fd_cloexec(i);
+        handoff[i] = {.local_fd = i, .file = file};
+        ++count;
+    }
+    ker::vfs::fd_usage_changed_locked(task);
+    // The first last-put simulates fatal cleanup before the next commit. Its
+    // callback returns only in this test, exposing any duplicate/lost reference.
+    uint16_t const COMMITTED = wki_ipc_commit_task_fd_handoff(&task, handoff.data(), count);
+    auto* remaining = static_cast<ker::vfs::File*>(task.fd_table.lookup(1));
+    bool const OK = COMMITTED == 1 && script.closes == 1 && task.fd_table.lookup(0) == nullptr && !task.get_fd_cloexec(0) &&
+                    remaining != nullptr && remaining->refcount.load() == 1 && task.get_fd_cloexec(1) && handoff[0].file == nullptr &&
+                    handoff[1].file == nullptr && task.pending_wki_submissions == nullptr;
+    if (remaining != nullptr) {
+        task.fd_table.remove(1);
+        ipc_release_file_ref(remaining);
+    }
+    return OK && script.closes == 2 ? 0 : -EIO;
+}
+
+auto wki_ipc_selftest_pipe_growth_waits_for_write() -> int {
+    constexpr uint16_t PEER = 0x7B25;
+    ker::mod::sched::task::Task task{};
+    std::array<int, 2> descriptors{-1, -1};
+    ker::vfs::LocalPipePerfSnapshot initial{};
+    ker::vfs::vfs_get_local_pipe_perf_snapshot(initial);
+    int const CREATE = ker::vfs::vfs_selftest_create_pipe(task, descriptors.data());
+    if (CREATE != 0) return CREATE;
+    auto* reader = static_cast<ker::vfs::File*>(task.fd_table.lookup(descriptors[0]));
+    auto* writer = static_cast<ker::vfs::File*>(task.fd_table.lookup(descriptors[1]));
+    writer->refcount.fetch_add(1, std::memory_order_acq_rel);
+    task.set_fd_cloexec(static_cast<unsigned>(descriptors[0]));
+    constexpr std::array<uint8_t, 3> PREFIX{0x51, 0x52, 0x53};
+    constexpr std::array<uint8_t, 2> SUFFIX{0x61, 0x62};
+    bool ok = writer->fops->vfs_write(writer, PREFIX.data(), PREFIX.size(), 0) == static_cast<ssize_t>(PREFIX.size());
+    ker::vfs::LocalPipePerfSnapshot before{};
+    ker::vfs::vfs_get_local_pipe_perf_snapshot(before);
+    std::array<WkiIpcFdEntry, 16> map{};
+    std::array<WkiIpcTaskFdHandoff, 16> handoff{};
+    uint16_t count = 0;
+    uint8_t mask = 0;
+    WkiIpcSubmissionGuard guard(&task, map.data(), handoff.data(), count, PEER);
+    ok &= wki_ipc_export_task_fds(&task, PEER, map.data(), &count, handoff.data(), &mask) == 0 && count == 1;
+    ker::vfs::LocalPipePerfSnapshot prepared{};
+    ker::vfs::vfs_get_local_pipe_perf_snapshot(prepared);
+    ok &= prepared.capacity_bytes == before.capacity_bytes && prepared.buffered_bytes == before.buffered_bytes;
+    guard.cancel();
+    ker::vfs::LocalPipePerfSnapshot rejected{};
+    ker::vfs::vfs_get_local_pipe_perf_snapshot(rejected);
+    ok &= rejected.capacity_bytes == before.capacity_bytes && rejected.buffered_bytes == before.buffered_bytes &&
+          task.fd_table.lookup(descriptors[1]) == writer && writer->refcount.load() == 2;
+    count = 0;
+    guard.arm();
+    ok &= wki_ipc_export_task_fds(&task, PEER, map.data(), &count, handoff.data(), &mask) == 0 && count == 1;
+    ok &= wki_ipc_commit_task_fd_handoff(&task, handoff.data(), count) == 1;
+    wki_ipc_activate_task_fds(map.data(), count, PEER);
+    ok &= export_pipe_write_nonblocking(writer, SUFFIX.data(), 0) == 0 && export_pipe_write_nonblocking(writer, nullptr, 1) == -EBADF;
+    ker::vfs::LocalPipePerfSnapshot no_write{};
+    ker::vfs::vfs_get_local_pipe_perf_snapshot(no_write);
+    ok &= no_write.capacity_bytes == before.capacity_bytes;
+    ok &= export_pipe_write_nonblocking(writer, SUFFIX.data(), SUFFIX.size()) == static_cast<ssize_t>(SUFFIX.size());
+    ker::vfs::LocalPipePerfSnapshot grown{};
+    ker::vfs::vfs_get_local_pipe_perf_snapshot(grown);
+    ok &= grown.capacity_bytes == initial.capacity_bytes + WKI_IPC_EXPORT_PIPE_CAPACITY;
+    ok &= export_pipe_write_nonblocking(writer, SUFFIX.data(), SUFFIX.size()) == static_cast<ssize_t>(SUFFIX.size());
+    ker::vfs::LocalPipePerfSnapshot repeated{};
+    ker::vfs::vfs_get_local_pipe_perf_snapshot(repeated);
+    ok &= repeated.capacity_bytes == grown.capacity_bytes;
+    std::array<uint8_t, 7> data{};
+    ok &= reader->fops->vfs_read(reader, data.data(), data.size(), 0) == static_cast<ssize_t>(data.size());
+    ok &= data == std::array<uint8_t, 7>{0x51, 0x52, 0x53, 0x61, 0x62, 0x61, 0x62};
+    guard.cancel();
+    for (int descriptor : descriptors) {
+        auto* file = static_cast<ker::vfs::File*>(task.fd_table.remove(descriptor));
+        ipc_release_file_ref(file);
+    }
+    ipc_release_file_ref(writer);
+    wki_ipc_cleanup_for_peer(PEER);
+    ker::vfs::LocalPipePerfSnapshot final{};
+    ker::vfs::vfs_get_local_pipe_perf_snapshot(final);
+    ok &= final.active_pipes == initial.active_pipes && final.capacity_bytes == initial.capacity_bytes &&
+          final.buffered_bytes == initial.buffered_bytes;
+    return ok ? 0 : -EIO;
+}
+
+auto wki_ipc_selftest_submission_guard_cancellation() -> int {
+    constexpr uint16_t PEER = 0x7B24;
+    bool ok = true;
+    for (uint16_t number : {uint16_t{1}, uint16_t{16}}) {
+        ker::mod::sched::task::Task task{};
+        auto* file = new (std::nothrow) ker::vfs::File{};
+        if (file == nullptr) return -ENOMEM;
+        file->fs_type = ker::vfs::FSType::SOCKET;
+        file->fops = &g_ipc_selftest_file_ops;
+        file->refcount.store(number, std::memory_order_release);
+        for (uint16_t i = 0; i < number; ++i) static_cast<void>(task.fd_table.insert(i, file));
+        std::array<WkiIpcFdEntry, 16> map{};
+        std::array<WkiIpcTaskFdHandoff, 16> handoff{};
+        uint16_t count = 0;
+        uint8_t mask = 0;
+        uint64_t flags = s_ipc_lock.lock_irqsave();
+        size_t const BEFORE = g_ipc_exports.size();
+        s_ipc_lock.unlock_irqrestore(flags);
+        {
+            WkiIpcSubmissionGuard outer(&task, map.data(), handoff.data(), count, PEER);
+            ok &= task.pending_wki_submissions == &outer;
+            // Empty/pre-publication cancellation, followed by retry re-arm.
+            wki_ipc_cancel_submission_guards(task);
+            ok &= task.pending_wki_submissions == nullptr;
+            outer.arm();
+            ok &= wki_ipc_export_task_fds(&task, PEER, map.data(), &count, handoff.data(), &mask) == 0 && count == number;
+            ok &= file->refcount.load(std::memory_order_acquire) == 3 * number;
+            {
+                // The direct submitter takes ownership before disarming its
+                // caller. Fatal cleanup must find the inner guard alone.
+                WkiIpcSubmissionGuard inner(&task, map.data(), handoff.data(), count, PEER);
+                outer.disarm();
+                ok &= task.pending_wki_submissions == &inner;
+                wki_ipc_cancel_submission_guards(task);
+                ok &= task.pending_wki_submissions == nullptr;
+            }
+            ok &= file->refcount.load(std::memory_order_acquire) == number;
+            for (uint16_t i = 0; i < number; ++i) ok &= handoff[i].file == nullptr && task.fd_table.lookup(i) == file;
+            // A disarmed outer destructor cannot reclaim the same identities.
+        }
+        flags = s_ipc_lock.lock_irqsave();
+        ok &= g_ipc_exports.size() == BEFORE;
+        s_ipc_lock.unlock_irqrestore(flags);
+        ok &= file->refcount.load(std::memory_order_acquire) == number;
+        for (uint16_t i = 0; i < number; ++i) {
+            task.fd_table.remove(i);
+            ipc_release_file_ref(file);
+        }
+        wki_ipc_cleanup_for_peer(PEER);
+    }
+    return ok ? 0 : -EIO;
+}
+
+auto wki_ipc_selftest_submission_guard_reentrant_put() -> int {
+    ker::mod::sched::task::Task task{};
+    struct Script {
+        ker::mod::sched::task::Task* executor;
+        unsigned closes = 0;
+    } script{.executor = &task};
+    ker::vfs::FileOperations operations{};
+    operations.vfs_close = [](ker::vfs::File* file) -> int {
+        auto& state = *static_cast<Script*>(file->private_data);
+        ++state.closes;
+        wki_ipc_cancel_submission_guards(*state.executor);
+        return 0;
+    };
+    std::array<WkiIpcTaskFdHandoff, 2> handoff{};
+    uint16_t count = 0;
+    {
+        WkiIpcSubmissionGuard guard(&task, nullptr, handoff.data(), count, WKI_NODE_INVALID);
+        for (auto& entry : handoff) {
+            auto* file = new (std::nothrow) ker::vfs::File{};
+            if (file == nullptr) return -ENOMEM;
+            file->fops = &operations;
+            file->private_data = &script;
+            file->refcount.store(1, std::memory_order_release);
+            entry.file = file;
+            ++count;
+        }
+        guard.cancel();
+        if (task.pending_wki_submissions != nullptr || handoff[0].file != nullptr || handoff[1].file != nullptr) return -EIO;
+    }
+    return script.closes == 2 ? 0 : -EIO;
+}
+
+auto wki_ipc_selftest_private_rdma_preparation_unwinds() -> int {
+    struct Script {
+        WkiIpcExport* exp = nullptr;
+        int result = WKI_OK;
+        uint32_t key = 0x7C22;
+        unsigned registered = 0;
+        unsigned unregistered = 0;
+        bool ok = true;
+    };
+    ker::mod::sched::task::Task task{};
+    bool ok = true;
+    for (int phase = 0; phase < 7; ++phase) {
+        Script script;
+        if (phase == 2 || phase == 4) script.result = WKI_ERR_NO_MEM;
+        if (phase == 2 || phase == 3) script.key = 0;
+        WkiTransport transport{};
+        transport.private_data = &script;
+        transport.rdma_register_region = [](WkiTransport* self, uint64_t address, uint32_t size, uint32_t* key) -> int {
+            auto& state = *static_cast<Script*>(self->private_data);
+            ++state.registered;
+            state.ok &= address == reinterpret_cast<uint64_t>(state.exp->pipe_rdma_region) && size == WKI_IPC_PIPE_RDMA_TOTAL_SIZE;
+            state.ok &= key == &state.exp->pipe_rdma_rkey;
+            auto* header = reinterpret_cast<WkiPipeSharedRegion*>(address);
+            state.ok &= header->head.load() == 0 && header->tail.load() == 0 && header->credits.load() == WKI_IPC_PIPE_RDMA_CAPACITY;
+            // Exercise the retirement inspection exactly at the callback
+            // boundary: neither object may be discoverable or queued yet.
+            uint64_t const FLAGS = s_ipc_lock.lock_irqsave();
+            state.ok &= !std::ranges::any_of(g_ipc_exports, [&](auto* entry) { return entry == state.exp; });
+            state.ok &= find_export_pipe_write_backlog_locked(state.exp) == nullptr;
+            s_ipc_lock.unlock_irqrestore(FLAGS);
+            *key = state.key;
+            return state.result;
+        };
+        transport.rdma_unregister_region = [](WkiTransport* self, uint32_t key, uint32_t size) -> int {
+            auto& state = *static_cast<Script*>(self->private_data);
+            ++state.unregistered;
+            // KASan also catches revocation after the memory has been freed.
+            auto* header = reinterpret_cast<WkiPipeSharedRegion*>(state.exp->pipe_rdma_region);
+            state.ok &= key == state.key && size == WKI_IPC_PIPE_RDMA_TOTAL_SIZE && header != nullptr;
+            if (header != nullptr) state.ok &= header->capacity == WKI_IPC_PIPE_RDMA_CAPACITY;
+            return WKI_OK;
+        };
+        {
+            IpcFdSnapshot snapshot(task);
+            if (snapshot.prepare_exports(1) != 0) return -ENOMEM;
+            auto* exp = snapshot.prepared_exports[0];
+            script.exp = exp;
+            exp->resource_id = 0x7D22;
+            exp->res_type = ResourceType::IPC_PIPE;
+            prepare_export_pipe_rdma(*exp, snapshot.prepared_backlogs[0], &transport, phase < 2 ? phase : -1);
+            bool const SUCCESS = phase >= 5;
+            ok &= exp->pipe_rdma_enabled == SUCCESS;
+            ok &= (snapshot.prepared_backlogs[0] != nullptr) == SUCCESS;
+            if (SUCCESS) {
+                auto* backlog = snapshot.prepared_backlogs[0];
+                ok &= backlog->exp == exp && !backlog->queued && !backlog->persistent_for_rdma;
+                ok &= exp->pipe_rdma_rkey == script.key;
+            } else {
+                ok &= exp->pipe_rdma_region == nullptr && exp->pipe_rdma_rkey == 0 && exp->pipe_rdma_transport == nullptr;
+            }
+            if (phase == 6) {
+                // Transfer ownership exactly as publication does, then use the
+                // production retirement/free path to revoke a committed ring.
+                auto* backlog = snapshot.prepared_backlogs[0];
+                uint64_t const FLAGS = s_ipc_lock.lock_irqsave();
+                snapshot.prepared_exports[0] = nullptr;
+                snapshot.prepared_backlogs[0] = nullptr;
+                g_ipc_exports.push_back(exp);
+                g_export_pipe_write_backlogs.push_back(backlog);
+                ok &= !export_can_retire_locked(exp);
+                erase_export_pipe_write_backlog_locked(backlog);
+                auto* retired = compact_inactive_exports_locked();
+                s_ipc_lock.unlock_irqrestore(FLAGS);
+                ok &= retired == exp;
+                free_export_pipe_write_backlog(backlog);
+                free_retired_exports(retired);
+            }
+            wki_ipc_cancel_fd_snapshots(task);
+            ok &= task.pending_wki_fd_snapshots == nullptr && snapshot.prepared_exports[0] == nullptr &&
+                  snapshot.prepared_backlogs[0] == nullptr;
+        }
+        ok &= script.ok && script.registered == (phase < 2 ? 0U : 1U) && script.unregistered == (phase >= 4 ? 1U : 0U);
+    }
+    return ok ? 0 : -EIO;
+}
+
+auto wki_ipc_selftest_private_export_allocation_unwinds() -> int {
+    ker::mod::sched::task::Task task{};
+    auto* file = new (std::nothrow) ker::vfs::File{};
+    if (file == nullptr) return -ENOMEM;
+    file->refcount.store(1, std::memory_order_release);
+    file->fops = &g_ipc_selftest_file_ops;
+    static_cast<void>(task.fd_table.insert(0, file));
+    uint64_t flags = s_ipc_lock.lock_irqsave();
+    size_t const BEFORE = g_ipc_exports.size();
+    s_ipc_lock.unlock_irqrestore(flags);
+    bool ok = true;
+    for (int fail_at : {0, 1, 15, -1}) {
+        int const FREES_BEFORE = g_ipc_export_selftest_frees.load(std::memory_order_acquire);
+        unsigned const ALLOCATED = fail_at < 0 ? 16U : static_cast<unsigned>(fail_at);
+        {
+            IpcFdSnapshot snapshot(task);
+            ok &= snapshot.prepare_exports(16, fail_at) == (fail_at < 0 ? 0 : -ENOMEM);
+            unsigned prepared = 0;
+            for (auto* exp : snapshot.prepared_exports) {
+                if (exp != nullptr) {
+                    ++prepared;
+                    ok &= exp->file == nullptr && exp->registry_previous == nullptr && exp->registry_next == nullptr;
+                }
+            }
+            ok &= prepared == ALLOCATED && file->refcount.load(std::memory_order_acquire) == 2;
+            wki_ipc_cancel_fd_snapshots(task);
+            ok &= task.pending_wki_fd_snapshots == nullptr && file->refcount.load(std::memory_order_acquire) == 1;
+            for (auto* exp : snapshot.prepared_exports) ok &= exp == nullptr;
+        }
+        ok &= g_ipc_export_selftest_frees.load(std::memory_order_acquire) - FREES_BEFORE == static_cast<int>(ALLOCATED);
+    }
+    flags = s_ipc_lock.lock_irqsave();
+    ok &= g_ipc_exports.size() == BEFORE;
+    s_ipc_lock.unlock_irqrestore(flags);
+    ok &= task.fd_table.lookup(0) == file;
+    task.fd_table.remove(0);
+    ipc_release_file_ref(file);
+    return ok ? 0 : -EIO;
+}
+
+auto wki_ipc_selftest_intrusive_export_registry() -> int {
+    // More than the cleanup batch size must remain a valid population.
+    std::array<WkiIpcExport, WKI_IPC_MAX_EXPORTS + 3> entries{};
+    IpcExportRegistry registry;
+    bool ok = registry.begin() == registry.end() && registry.size() == 0;
+    for (size_t i = 0; i < entries.size(); ++i) {
+        entries[i].resource_id = static_cast<uint32_t>(i + 1);
+        registry.push_back(&entries[i]);
+    }
+    ok &= registry.size() == entries.size();
+    size_t index = 0;
+    for (auto* exp : registry) ok &= exp == &entries[index++];
+    ok &= index == entries.size();
+    ok &= std::ranges::any_of(registry, [](const auto* exp) { return exp->resource_id == WKI_IPC_MAX_EXPORTS + 3; });
+    // Unlink a middle node, the head, then the tail; all links must clear.
+    auto next = registry.erase(IpcExportRegistry::Iterator(&entries[1]));
+    ok &= *next == &entries[2] && entries[0].registry_next == &entries[2] && entries[2].registry_previous == &entries[0];
+    registry.erase(registry.begin());
+    ok &= *registry.begin() == &entries[2] && entries[2].registry_previous == nullptr;
+    next = registry.erase(IpcExportRegistry::Iterator(&entries.back()));
+    ok &= next == registry.end() && entries[entries.size() - 2].registry_next == nullptr;
+    ok &= entries[0].registry_next == nullptr && entries[1].registry_previous == nullptr && entries[1].registry_next == nullptr &&
+          entries.back().registry_previous == nullptr && registry.size() == entries.size() - 3;
+    // Erase while iterating, then reuse a retired object without touching its
+    // independent pump/retirement link.
+    for (auto it = registry.begin(); it != registry.end();) it = registry.erase(it);
+    ok &= registry.size() == 0 && registry.begin() == registry.end();
+    entries[0].pump_next = &entries[1];
+    registry.push_back(&entries[0]);
+    ok &= registry.size() == 1 && *registry.begin() == &entries[0];
+    registry.erase(registry.begin());
+    ok &= registry.begin() == registry.end() && entries[0].pump_next == &entries[1];
+    return ok ? 0 : -EIO;
+}
+
+auto wki_ipc_selftest_pumps_wait_for_acceptance() -> int {
+    constexpr uint16_t PEER = 0x7B22;
+    ker::mod::sched::task::Task task{};
+    auto* file = new (std::nothrow) ker::vfs::File{};
+    if (file == nullptr) return -ENOMEM;
+    auto ops = g_ipc_selftest_file_ops;
+    ops.vfs_read = [](ker::vfs::File*, void*, size_t, size_t) -> ssize_t {
+        g_ipc_accept_selftest_reads.fetch_add(1, std::memory_order_acq_rel);
+        return 0;
+    };
+    file->fops = &ops;
+    file->fs_type = ker::vfs::FSType::SOCKET;
+    file->refcount.store(1, std::memory_order_release);
+    static_cast<void>(task.fd_table.insert(0, file));
+    int const READS_BEFORE = g_ipc_accept_selftest_reads.load(std::memory_order_acquire);
+    std::array<WkiIpcFdEntry, MAX_SUBMIT_IPC_FDS> map{};
+    uint16_t count = 0;
+    uint8_t mask = 0;
+    bool ok = wki_ipc_export_task_fds(&task, PEER, map.data(), &count, nullptr, &mask) == 0;
+    ok &= count == 1 && mask == 1;
+    if (count != 1) {
+        task.fd_table.remove(0);
+        ipc_release_file_ref(file);
+        return -EIO;
+    }
+    wki_ipc_activate_task_fds(map.data(), count, PEER + 1);
+    uint64_t flags = s_ipc_lock.lock_irqsave();
+    auto* exp = find_export_by_resource_id(map[0].resource_id);
+    ok &= exp != nullptr && exp->pump_pending_accept && !exp->pump_queued && !exp->pump_running.load(std::memory_order_acquire) &&
+          exp->pump_task == nullptr && !export_has_pipe_pump_slot_locked(exp);
+    s_ipc_lock.unlock_irqrestore(flags);
+    // Rejected submission retires an unaccepted exporter without a read or
+    // loss of the original FD's sole ownership reference.
+    wki_ipc_cleanup_exported_fds(map.data(), count, PEER);
+    flags = s_ipc_lock.lock_irqsave();
+    ok &= find_export_by_resource_id(map[0].resource_id) == nullptr;
+    s_ipc_lock.unlock_irqrestore(flags);
+    ok &= g_ipc_accept_selftest_reads.load(std::memory_order_acquire) == READS_BEFORE && task.fd_table.lookup(0) == file &&
+          file->refcount.load(std::memory_order_acquire) == 1;
+    // Claim itself is peer-scoped and idempotent. Keep the exporter under the
+    // lock here so no test worker consumes its deliberately synthetic socket.
+    count = 0;
+    ok &= wki_ipc_export_task_fds(&task, PEER, map.data(), &count, nullptr, &mask) == 0 && count == 1;
+    flags = s_ipc_lock.lock_irqsave();
+    exp = find_export_by_resource_id(map[0].resource_id);
+    ok &= claim_accepted_pipe_pump_locked(map[0].resource_id, PEER + 1) == nullptr;
+    ok &= exp != nullptr && claim_accepted_pipe_pump_locked(map[0].resource_id, PEER) == exp && !exp->pump_pending_accept;
+    ok &= claim_accepted_pipe_pump_locked(map[0].resource_id, PEER) == nullptr;
+    s_ipc_lock.unlock_irqrestore(flags);
+    wki_ipc_cleanup_exported_fds(map.data(), count, PEER);
+    // Lowest FD selects the sole pump for aliased PTY File identity.
+    ops.vfs_isatty = [](ker::vfs::File*) -> bool { return true; };
+    file->fs_type = ker::vfs::FSType::DEVFS;
+    file->refcount.fetch_add(1, std::memory_order_acq_rel);
+    static_cast<void>(task.fd_table.insert(2, file));
+    {
+        IpcFdSnapshot snapshot(task);
+        IpcFdExportPlan plan;
+        ok &= plan_ipc_fd_export(snapshot, plan) == 0 && plan.count == 2 && plan.pump_on_accept[0] && !plan.pump_on_accept[2];
+    }
+    task.fd_table.remove(2);
+    ipc_release_file_ref(file);
+    task.fd_table.remove(0);
+    ipc_release_file_ref(file);
+    return ok ? 0 : -EIO;
+}
+
+auto wki_ipc_selftest_export_admission_is_atomic() -> int {
+    ker::mod::sched::task::Task task{};
+    auto* files = new (std::nothrow) std::array<ker::vfs::File, 17>{};
+    if (files == nullptr) return -ENOMEM;
+    for (auto& file : *files) {
+        file.fs_type = ker::vfs::FSType::SOCKET;
+        file.refcount.store(1, std::memory_order_release);
+    }
+    bool ok = true;
+    for (unsigned count : {0U, 1U, 16U, 17U}) {
+        for (unsigned i = 0; i < count; ++i) static_cast<void>(task.fd_table.insert(i + 3, &(*files)[i]));
+        {
+            IpcFdSnapshot snapshot(task);
+            IpcFdExportPlan plan;
+            int const RESULT = plan_ipc_fd_export(snapshot, plan);
+            ok &= count <= MAX_SUBMIT_IPC_FDS ? RESULT == 0 && plan.count == count : RESULT == -ENOTSUP;
+        }
+        for (unsigned i = 0; i < count; ++i) {
+            ok &= (*files)[i].refcount.load(std::memory_order_acquire) == 1;
+            task.fd_table.remove(i + 3);
+        }
+    }
+    for (unsigned i = 0; i < files->size(); ++i) static_cast<void>(task.fd_table.insert(i + 3, &(*files)[i]));
+    constexpr unsigned NOFILE = static_cast<unsigned>(ker::abi::resource::Id::NOFILE);
+    task.resources.commit_extent(NOFILE, files->size());
+    ok &= task.resources.set(NOFILE, {0, 0}, true, task.FD_TABLE_SIZE) == 0;
+    std::array<WkiIpcFdEntry, MAX_SUBMIT_IPC_FDS> map{};
+    std::array<WkiIpcTaskFdHandoff, MAX_SUBMIT_IPC_FDS> handoff{};
+    for (auto& entry : map) entry.resource_id = 0xBAD22;
+    for (auto& entry : handoff) entry.local_fd = UINT16_MAX;
+    uint16_t count = 99;
+    uint8_t mask = UINT8_MAX;
+    uint64_t flags = s_ipc_lock.lock_irqsave();
+    size_t const EXPORTS_BEFORE = g_ipc_exports.size();
+    s_ipc_lock.unlock_irqrestore(flags);
+    ok &= wki_ipc_export_task_fds(&task, 0x7222, map.data(), &count, handoff.data(), &mask) == -ENOTSUP;
+    ok &= count == 0 && mask == 0 && task.fd_table.size() == 17;
+    ok &= task.resources.entries[NOFILE].current == 17 && task.resources.entries[NOFILE].peak == 17 &&
+          task.resources.entries[NOFILE].denied == 0;
+    flags = s_ipc_lock.lock_irqsave();
+    ok &= g_ipc_exports.size() == EXPORTS_BEFORE;
+    s_ipc_lock.unlock_irqrestore(flags);
+    for (const auto& entry : map) ok &= entry.resource_id == 0xBAD22;
+    for (const auto& entry : handoff) ok &= entry.local_fd == UINT16_MAX && entry.file == nullptr;
+    for (unsigned i = 0; i < files->size(); ++i) {
+        ok &= task.fd_table.lookup(i + 3) == &(*files)[i] && (*files)[i].refcount.load(std::memory_order_acquire) == 1;
+        task.fd_table.remove(i + 3);
+    }
+    // Regular stdio cannot be captured safely even with initial FSIZE infinity:
+    // the receiver may later lower its limit. Non-stdio files cannot disappear.
+    (*files)[0].fs_type = ker::vfs::FSType::TMPFS;
+    for (unsigned fd : {0U, 1U, 2U, 3U}) {
+        static_cast<void>(task.fd_table.insert(fd, &(*files)[0]));
+        {
+            IpcFdSnapshot snapshot(task);
+            IpcFdExportPlan plan;
+            ok &= plan_ipc_fd_export(snapshot, plan) == -ENOTSUP;
+        }
+        task.set_fd_cloexec(fd);
+        {
+            IpcFdSnapshot snapshot(task);
+            IpcFdExportPlan plan;
+            ok &= plan_ipc_fd_export(snapshot, plan) == 0 && plan.count == 0 && plan.stdio_mask == 0;
+        }
+        task.clear_fd_cloexec(fd);
+        task.fd_table.remove(fd);
+    }
+    // A proxy epoll also retains local callback state and cannot be dropped.
+    (*files)[0].fops = &g_proxy_epoll_fops;
+    static_cast<void>(task.fd_table.insert(3, &(*files)[0]));
+    {
+        IpcFdSnapshot snapshot(task);
+        IpcFdExportPlan plan;
+        ok &= plan_ipc_fd_export(snapshot, plan) == -ENOTSUP;
+    }
+    task.fd_table.remove(3);
+    delete files;
+    return ok ? 0 : -EIO;
+}
+
+auto wki_ipc_selftest_fd_snapshot_lifetime_and_cloexec() -> int {
+    ker::mod::sched::task::Task task{};
+    std::array<ker::vfs::File*, 3> files{};
+    for (auto& file : files) {
+        file = new (std::nothrow) ker::vfs::File{};
+        if (file == nullptr) {
+            for (auto* allocated : files) delete allocated;
+            return -ENOMEM;
+        }
+        file->fops = &g_ipc_selftest_file_ops;
+        file->fs_type = ker::vfs::FSType::DEVFS;
+        file->refcount.store(1, std::memory_order_release);
+    }
+    static_cast<void>(task.fd_table.insert(0, files[0]));
+    static_cast<void>(task.fd_table.insert(1, files[1]));
+    task.set_fd_cloexec(1);
+    int const BEFORE = g_ipc_file_selftest_closes.load(std::memory_order_acquire);
+    std::array<WkiIpcFdEntry, 16> map{};
+    uint16_t count = 99;
+    uint8_t mask = UINT8_MAX;
+    // These are non-IPC Files: export owns no resources, but must still
+    // preserve stdin and filter CLOEXEC stdout in its submission metadata.
+    int const RESULT = wki_ipc_export_task_fds(&task, WKI_NODE_INVALID, map.data(), &count, nullptr, &mask);
+    bool ok = RESULT == 0 && count == 0 && mask == 1;
+    {
+        IpcFdSnapshot snapshot(task);
+        ok &= snapshot.files[0] == files[0] && snapshot.files[1] == nullptr;
+        ok &= files[0]->refcount.load(std::memory_order_acquire) == 2;
+        ok &= files[1]->refcount.load(std::memory_order_acquire) == 1;
+        static_cast<void>(task.fd_table.insert(0, files[2]));
+        ipc_release_file_ref(files[0]);
+        ok &= snapshot.files[0] == files[0] && files[0]->refcount.load(std::memory_order_acquire) == 1;
+        wki_ipc_cancel_fd_snapshots(task);
+        ok &= task.pending_wki_fd_snapshots == nullptr && snapshot.files[0] == nullptr;
+        ok &= g_ipc_file_selftest_closes.load(std::memory_order_acquire) - BEFORE == 1;
+    }
+    ipc_release_file_ref(static_cast<ker::vfs::File*>(task.fd_table.remove(0)));
+    ipc_release_file_ref(static_cast<ker::vfs::File*>(task.fd_table.remove(1)));
+    ok &= g_ipc_file_selftest_closes.load(std::memory_order_acquire) - BEFORE == 3;
+    return ok ? 0 : -EIO;
+}
+
 auto wki_ipc_selftest_task_fd_handoff_transfers_exact_owner() -> int {
     constexpr uint16_t FD = 9;
     int const CLOSES_BEFORE = g_ipc_file_selftest_closes.load(std::memory_order_acquire);
@@ -4915,10 +5859,13 @@ auto wki_ipc_selftest_task_fd_handoff_transfers_exact_owner() -> int {
         return -ENOMEM;
     }
     task.set_fd_cloexec(FD);
+    constexpr unsigned NOFILE = static_cast<unsigned>(ker::abi::resource::Id::NOFILE);
+    task.resources.commit_extent(NOFILE, 1);
 
     WkiIpcTaskFdHandoff exact_handoff{.local_fd = FD, .file = exact};
     uint16_t const EXACT_COMMITTED = wki_ipc_commit_task_fd_handoff(&task, &exact_handoff, 1);
-    bool const EXACT_REMOVED = task.fd_table.lookup(FD) == nullptr && !task.get_fd_cloexec(FD) && exact_handoff.file == nullptr;
+    bool const EXACT_REMOVED = task.fd_table.lookup(FD) == nullptr && !task.get_fd_cloexec(FD) && exact_handoff.file == nullptr &&
+                               task.resources.entries[NOFILE].current == 0 && task.resources.entries[NOFILE].peak == 1;
 
     auto* pinned = new (std::nothrow) ker::vfs::File{};
     auto* replacement = new (std::nothrow) ker::vfs::File{};
@@ -5844,7 +6791,9 @@ auto wki_ipc_selftest_write_only_pipe_omits_receive_ring() -> int {
     entries.at(1).reserved1 = ipc_fd_export_open_flags(1 | WKI_IPC_O_NONBLOCK);
 
     int const PROXY_FREES_BEFORE = g_ipc_proxy_selftest_frees.load(std::memory_order_acquire);
-    wki_ipc_attach_task_fds(&task, entries.data(), static_cast<uint16_t>(entries.size()));
+    constexpr unsigned NOFILE = static_cast<unsigned>(ker::abi::resource::Id::NOFILE);
+    bool const LOWERED = task.resources.set(NOFILE, {0, 256}, true, 256) == 0;
+    bool const IMPORTED = wki_ipc_attach_task_fds(&task, entries.data(), static_cast<uint16_t>(entries.size()));
 
     auto* read_file = static_cast<ker::vfs::File*>(task.fd_table.lookup(READ_FD));
     auto* write_file = static_cast<ker::vfs::File*>(task.fd_table.lookup(WRITE_FD));
@@ -5866,13 +6815,14 @@ auto wki_ipc_selftest_write_only_pipe_omits_receive_ring() -> int {
         s_ipc_lock.unlock_irqrestore(IRQF);
     }
 
-    bool const ATTACH_OK = read_file != nullptr && write_file != nullptr && read_proxy != nullptr && write_proxy != nullptr &&
-                           read_file->fops == &g_proxy_pipe_read_fops && write_file->fops == &g_proxy_pipe_write_fops &&
-                           read_file->open_flags == WKI_IPC_O_NONBLOCK && write_file->open_flags == (1 | WKI_IPC_O_NONBLOCK) &&
-                           read_proxy->can_receive_data && read_proxy->ring_buf != nullptr &&
-                           read_proxy->ring_capacity == WKI_PROXY_PIPE_RING_SIZE && !write_proxy->can_receive_data &&
-                           write_proxy->ring_buf == nullptr && write_proxy->ring_capacity == 0 && !READ_DEFERRED && !read_drop &&
-                           !WRITE_DEFERRED && write_drop && PENDING_DATA_REJECTED && PENDING_CLOSE_REJECTED && !pending_left;
+    bool const ATTACH_OK =
+        LOWERED && IMPORTED && task.resources.entries[NOFILE].current == 2 && task.resources.entries[NOFILE].peak == 2 &&
+        task.resources.entries[NOFILE].denied == 0 && read_file != nullptr && write_file != nullptr && read_proxy != nullptr &&
+        write_proxy != nullptr && read_file->fops == &g_proxy_pipe_read_fops && write_file->fops == &g_proxy_pipe_write_fops &&
+        read_file->open_flags == WKI_IPC_O_NONBLOCK && write_file->open_flags == (1 | WKI_IPC_O_NONBLOCK) && read_proxy->can_receive_data &&
+        read_proxy->ring_buf != nullptr && read_proxy->ring_capacity == WKI_PROXY_PIPE_RING_SIZE && !write_proxy->can_receive_data &&
+        write_proxy->ring_buf == nullptr && write_proxy->ring_capacity == 0 && !READ_DEFERRED && !read_drop && !WRITE_DEFERRED &&
+        write_drop && PENDING_DATA_REJECTED && PENDING_CLOSE_REJECTED && !pending_left;
 
     auto detach = [&](uint16_t fd) {
         auto* removed = static_cast<ker::vfs::File*>(task.fd_table.remove(fd));
@@ -5907,15 +6857,38 @@ auto wki_ipc_selftest_attach_insert_failure_preserves_existing_fd() -> int {
         return -ENOMEM;
     }
 
+    auto* second = new (std::nothrow) ker::vfs::File{};
+    if (second == nullptr) {
+        static_cast<void>(task.fd_table.remove(FD));
+        ker::vfs::vfs_put_file(existing);
+        return -ENOMEM;
+    }
+    second->fd = FD + 1;
+    second->fops = &g_ipc_selftest_file_ops;
+    second->refcount.store(1, std::memory_order_release);
+    if (!task.fd_table.insert(FD + 1, second)) {
+        delete second;
+        static_cast<void>(task.fd_table.remove(FD));
+        ker::vfs::vfs_put_file(existing);
+        return -ENOMEM;
+    }
+    task.set_fd_cloexec(FD);
+    task.set_fd_cloexec(FD + 1);
+    constexpr unsigned NOFILE = static_cast<unsigned>(ker::abi::resource::Id::NOFILE);
+    task.resources.commit_extent(NOFILE, 2);
     WkiIpcFdEntry entry = {};
     entry.local_fd = FD;
     entry.res_type = static_cast<uint16_t>(ResourceType::IPC_EPOLL);
     entry.resource_id = RESOURCE_ID;
     entry.home_node = WKI_NODE_INVALID;
 
+    std::array<WkiIpcFdEntry, 2> entries{entry, entry};
+    bool const DUPLICATE_REJECTED = !wki_ipc_attach_task_fds(&task, entries.data(), entries.size());
+    entries[1].local_fd = FD + 1;
+    entries[1].resource_id = RESOURCE_ID + 1;
     int const PROXY_FREES_BEFORE = g_ipc_proxy_selftest_frees.load(std::memory_order_acquire);
     g_ipc_selftest_force_attach_insert_failure.store(true, std::memory_order_release);
-    wki_ipc_attach_task_fds(&task, &entry, 1);
+    bool const REJECTED = !wki_ipc_attach_task_fds(&task, entries.data(), entries.size());
     g_ipc_selftest_force_attach_insert_failure.store(false, std::memory_order_release);
 
     auto* after = static_cast<ker::vfs::File*>(task.fd_table.lookup(FD));
@@ -5923,7 +6896,7 @@ auto wki_ipc_selftest_attach_insert_failure_preserves_existing_fd() -> int {
     {
         uint64_t const IRQF = s_ipc_lock.lock_irqsave();
         for (auto const* proxy : g_ipc_proxies) {
-            if (proxy != nullptr && proxy->resource_id == RESOURCE_ID) {
+            if (proxy != nullptr && (proxy->resource_id == RESOURCE_ID || proxy->resource_id == RESOURCE_ID + 1)) {
                 found_proxy = true;
                 break;
             }
@@ -5932,12 +6905,16 @@ auto wki_ipc_selftest_attach_insert_failure_preserves_existing_fd() -> int {
     }
     int const PROXY_FREES_AFTER = g_ipc_proxy_selftest_frees.load(std::memory_order_acquire);
 
+    bool const INTACT = task.fd_table.lookup(FD + 1) == second && task.get_fd_cloexec(FD) && task.get_fd_cloexec(FD + 1) &&
+                        task.resources.entries[NOFILE].current == 2 && task.resources.entries[NOFILE].peak == 2;
+    auto* removed_second = static_cast<ker::vfs::File*>(task.fd_table.remove(FD + 1));
+    if (removed_second == second) ker::vfs::vfs_put_file(second);
     auto* removed = static_cast<ker::vfs::File*>(task.fd_table.remove(FD));
     if (removed == existing) {
         ker::vfs::vfs_put_file(existing);
     }
 
-    if (after != existing || found_proxy || PROXY_FREES_AFTER - PROXY_FREES_BEFORE != 1) {
+    if (!REJECTED || !DUPLICATE_REJECTED || !INTACT || after != existing || found_proxy || PROXY_FREES_AFTER - PROXY_FREES_BEFORE != 2) {
         return -EIO;
     }
     return 0;

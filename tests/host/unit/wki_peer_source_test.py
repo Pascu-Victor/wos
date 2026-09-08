@@ -1017,6 +1017,17 @@ def test_authenticated_hello_requires_session_key_confirmation() -> None:
 
     hello_case = rx[rx.index("case MsgType::HELLO:") : rx.index("case MsgType::HELLO_ACK:")]
     ack_case = rx[rx.index("case MsgType::HELLO_ACK:") : rx.index("case MsgType::HELLO_CONFIRM:")]
+    for branch in (hello_case, ack_case):
+        busy = branch.index("if (!install_lifecycle.try_acquire(peer->node_id, false))")
+        returned = branch.index("return;", busy)
+        install = branch.index("wki_auth_install_peer_session")
+        if not busy < returned < install:
+            fail("busy discovery lifecycle must defer before auth installation or fencing")
+        if "wki_peer_fence" in branch[busy:returned]:
+            fail("lifecycle contention is not authentication failure")
+        if "wki_peer_fence(peer)" not in branch[install:]:
+            fail("actual discovery authentication failure must still fence")
+
     confirm_case = rx[rx.index("case MsgType::HELLO_CONFIRM:") : rx.index("case MsgType::HEARTBEAT:")]
 
     require_order(

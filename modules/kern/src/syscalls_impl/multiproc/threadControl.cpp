@@ -15,6 +15,7 @@
 #include <platform/sys/context_switch.hpp>
 #include <platform/sys/signal.hpp>
 #include <platform/sys/usercopy.hpp>
+#include <vfs/fd_reservation.hpp>
 #include <vfs/vfs.hpp>
 
 #include "abi/callnums/multiproc.h"
@@ -120,6 +121,8 @@ auto publish_thread_tid_to_tcb(mod::sched::task::Task* parent, uint64_t tcb_va, 
         }
     }
     task->exit_in_progress = true;
+    ker::vfs::cancel_fd_reservations(*task);
+    mod::sched::resource::cancel_process_reservations(*task);
     ker::syscall::log::sys_log_cleanup_for_task(task);
     release_thread_fd_refs(task);
     // A thread can create a process too. Detach WKI's raw subject pointer
@@ -131,6 +134,9 @@ auto publish_thread_tid_to_tcb(mod::sched::task::Task* parent, uint64_t tcb_va, 
     ker::net::wki::wki_wait_cleanup_for_task(task);
     ker::syscall::futex::futex_wait_cleanup_for_task(task);
     ker::syscall::process::child_events::cancel_wait(*task);
+    task->process_charge.release();
+    mod::sched::finalize_current_task_cpu_accounting();
+    task->resource_owner.finish_cpu();
     task->has_exited = true;
     task->exit_status = 0;
     task->exit_notify_ready.store(true, std::memory_order_release);
@@ -180,6 +186,10 @@ auto thread_control(abi::multiproc::threadControlOps op, uint64_t arg1, uint64_t
                 return static_cast<uint64_t>(-EINVAL);
             }
             ker::syscall::process::exit_current_if_process_exit_requested();
+            mod::sched::resource::ProcessReservation process_reservation(parent, parent->uid);
+            if (process_reservation.result() < 0) {
+                return static_cast<uint64_t>(process_reservation.result());
+            }
             uint64_t tid_user_addr = 0;
             if (__builtin_add_overflow(tcb_va, MLIBC_TCB_TID_OFFSET, &tid_user_addr) ||
                 !mod::sys::usercopy::range_valid(tid_user_addr, sizeof(int)) ||
@@ -217,7 +227,7 @@ auto thread_control(abi::multiproc::threadControlOps op, uint64_t arg1, uint64_t
                 }
                 mod::sys::signal::sync_task_signal_mask_cache_mapped(t);
 
-                bool const POSTED = mod::sched::post_task_for_cpu(TARGET_CPU, t);
+                bool const POSTED = process_reservation.attach(*t) && mod::sched::post_task_for_cpu(TARGET_CPU, t);
                 if (!POSTED) {
                     (void)publish_thread_tid_to_tcb(parent, tcb_va, 0);
                     mod::sched::task::destroy_unpublished_user_thread(t);

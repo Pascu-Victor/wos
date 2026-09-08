@@ -1,0 +1,53 @@
+# Two-node fixture: install on wos-0 and target the capable wos-1 peer.
+# Start/restart these after WKI peer discovery has completed.
+
+[service resource-remote-finite]
+exec=/usr/bin/on
+arg=/usr/bin/on
+arg=wos-1
+arg=/bin/true
+depends=dropbear
+type=oneshot
+class=normal
+priority=0
+environment=init
+readiness=exit-success
+readiness-timeout-ms=5000
+restart=never
+backoff-initial-ms=10
+backoff-max-ms=10
+restart-budget=16
+restart-window-ms=60000
+stable-run-ms=60000
+stop-term-ms=1000
+stop-kill-ms=1000
+drain-timeout-ms=1000
+stdio=journal
+enable=always
+limit-cpu=2:2
+limit-core=0:0
+
+[service resource-remote-fallback]
+exec=/usr/bin/remotely
+arg=/usr/bin/remotely
+arg=/bin/true
+depends=dropbear
+type=oneshot
+class=normal
+priority=0
+environment=init
+readiness=exit-success
+readiness-timeout-ms=5000
+restart=never
+backoff-initial-ms=10
+backoff-max-ms=10
+restart-budget=16
+restart-window-ms=60000
+stable-run-ms=60000
+stop-term-ms=1000
+stop-kill-ms=1000
+drain-timeout-ms=1000
+stdio=journal
+enable=always
+limit-cpu=2:2
+limit-core=0:0

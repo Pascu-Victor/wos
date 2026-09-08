@@ -88,6 +88,7 @@ local msg_types = {
     [0x54] = "TASK_CANCEL",
     [0x55] = "LOAD_REPORT",
     [0x56] = "TASK_SUBMIT_FRAGMENT",
+    [0x57] = "TASK_SERVICE_REPORT",
 }
 
 local function get_msg_type_name(msg_type)

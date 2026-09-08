@@ -458,7 +458,37 @@ def test_sigpending_is_wired_through_wos_sysdeps() -> None:
     )
 
 
+def test_cpu_exhaustion_waits_for_safe_user_return() -> None:
+    source = SIGNAL_CPP.read_text()
+    helper = function_body(source, "deliver_cpu_limits_at_user_return")
+    require_tokens(helper, ["task != sched::get_current_task()", "pending_cpu_signals.exchange(0",
+                            "wos_proc_exit_signal(WOS_SIGKILL)"], "CPU delivery owns the current user return")
+    require_tokens(helper, ["pending_cpu_signals.fetch_and(~SOFT_MASK", "& SOFT_MASK"],
+                   "incoming user handoff must transfer soft events without consuming hard expiry")
+    committed = function_body(source, "exit_current_on_cpu_limit_user_handoff")
+    require_tokens(committed, ["task_owns_current_kernel_stack(task)", ".deliver_signals",
+                               "saved_frame_class_is_valid(task, task->context.frame)"],
+                   "hard handoff expiry requires own stack and a validated user return")
+    if "in_signal_handler" in committed:
+        fail("CPU hard expiry must not defer for an active signal handler")
+    unsafe = function_body(source, "exit_current_on_pending_fatal_default_signal")
+    if "pending_cpu_signals" in unsafe or "deliver_cpu_limits_at_user_return" in unsafe:
+        fail("kernel-stack fatal handoff must not consume deferred CPU events")
+    for name in ("check_pending_signals_interrupt", "check_pending_signals_handoff"):
+        body = function_body(source, name)
+        gate = body.index("if (!interrupt_frame_is_user_return(task, frame))")
+        delivery = body.index("deliver_cpu_limits_at_user_return(task)")
+        handler = body.index("if (task->in_signal_handler)")
+        if not gate < delivery < handler:
+            fail(f"{name} must gate CPU delivery on user return and enforce hard expiry during handlers")
+    charge_source = (ROOT / "modules/kern/src/platform/sched/resource.cpp").read_text()
+    charge = function_body(charge_source, "charge_cpu")
+    if "signal_add_pending_mask" in charge or "find_task" in charge:
+        fail("IRQ CPU charging must buffer signals without registry lookup or early fatal delivery")
+
+
 if __name__ == "__main__":
+    test_cpu_exhaustion_waits_for_safe_user_return()
     test_syscall_signal_delivery_updates_live_gs_scratch()
     test_signal_iret_preserves_restored_user_r11()
     test_coredump_file_is_private_writable_and_truncated()

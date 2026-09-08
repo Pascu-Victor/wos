@@ -53,8 +53,8 @@ stdio=inherit
 enable=always
 ```
 
-Every non-conditional scalar field in the table below is required exactly once.
-Conditional fields follow the rules in the table; `arg`, `env`, and `depends`
+Fields marked `1` in the table are required exactly once. Conditional and
+optional fields follow their listed cardinality; `arg`, `env`, and `depends`
 are the only repeatable fields.
 
 | Key | Cardinality | Accepted value or bound | Meaning |
@@ -82,6 +82,33 @@ are the only repeatable fields.
 | `stdio` | 1 | `inherit`, `null`, `journal` | Child standard-stream policy. |
 | `enable` | 1 | `always`, `disabled`, `path-exists`, `path-missing` | Initial enablement policy. |
 | `enable-path` | Conditional | Safe absolute path, at most 255 bytes | Required for either path condition; forbidden otherwise. |
+| `limit-cpu` | 0–1 | `soft:hard`, seconds | Per-process CPU limit and persistent service CPU ceiling. |
+| `limit-fsize` | 0–1 | `soft:hard`, bytes | File endpoint limit. |
+| `limit-stack` | 0–1 | `soft:hard`, bytes | Automatic stack backing bound. |
+| `limit-core` | 0–1 | `soft:hard`, bytes | Complete binary core size. |
+| `limit-nproc` | 0–1 | `soft:hard`, tasks | Node real-UID population bound, including threads. |
+| `limit-nofile` | 0–1 | `soft:hard`, at most `256:256` | Descriptor-number bound. |
+| `limit-as` | 0–1 | `soft:hard`, bytes | Occupied user virtual address-space bound. |
+
+Limit values are unsigned decimal integers or `infinity`; internal spaces,
+negative values, overflow, duplicate fields and soft greater than hard are
+rejected. Defaults are `256:256` for NOFILE and `infinity:infinity` for the
+others. For example, `limit-nofile=32:64` and `limit-as=134217728:134217728`
+allow 32 descriptors and 128 MiB of user virtual space. Zero is accepted, even
+when it prevents the configured executable from starting.
+
+PID 1 configures fixed kernel service slots once, then selects a slot around
+fork. Kernel inheritance applies these limits before child publication and
+exec; PID 1 keeps its own policy. Descendants inherit the process limits and
+service affiliation. Ordinary soft/hard privilege rules still apply, while
+the configured service CPU ceiling cannot be raised by a service process.
+Each CPU accounting event also charges that persistent service record. CPU
+exhaustion therefore survives exec, automatic or manual restart, stable-run
+resets and restart-window rollover. An exhausted hard CPU ceiling refuses a
+new generation with `EDQUOT`; resetting the service counter requires reboot.
+These are service defaults and a CPU ceiling, without arbitrary process-group
+quotas. See [resource governance](resource_governance.md) for each resource's
+enforcement and observation semantics.
 
 Global limits are 32 KiB per manifest, 512 bytes per physical line, 16 services,
 and 31 bytes per service name. A service name starts with an ASCII
@@ -242,6 +269,16 @@ sequence, service state/readiness, PID, process group, generation, restart
 count, last wait status, and last error. Targeted status also prints at most
 four ordered transition records, oldest first. A read before PID 1 publishes
 its first complete snapshot fails with `EAGAIN`.
+
+For root, targeted status also displays configured limits, current usage,
+peaks, denial counts and reasons. CPU totals include every affiliated process
+and previous generation. Other rows show the maximum current per-process
+observation, lifetime maximum peak and summed denial counters. Those counters
+survive process destruction and restart; NPROC observations retain their real-UID
+meaning. Nonroot callers retain access to the original public status/history.
+The resource snapshot uses an additive version-1 ABI, independent of the
+unchanged init-control snapshot. A status/history read and its resource read
+are individually coherent observations taken at separate times.
 
 Start, stop, and restart submission requires effective UID 0. The kernel
 authenticates the calling task and overwrites sender PID/effective UID; the CLI

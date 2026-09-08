@@ -1,6 +1,25 @@
 #include <net/wki/remote_compute.hpp>
 #include <test/ktest.hpp>
 
+KTEST(WkiRemoteCompute, SubmissionErrorsPreserveErrno) { KEXPECT_TRUE(ker::net::wki::wki_remote_compute_selftest_submission_errors()); }
+
+KTEST(WkiRemoteCompute, StdioPresenceAndAtomicRollback) {
+    KEXPECT_TRUE(ker::net::wki::wki_remote_compute_selftest_stdio_presence_and_rollback());
+}
+
+KTEST(WkiRemoteCompute, CloseOnExecCommitPreservesOtherDescriptors) {
+    KEXPECT_TRUE(ker::net::wki::wki_remote_compute_selftest_cloexec_commit_preserves_other_fds());
+}
+KTEST(WkiRemoteCompute, ResourceCompletionPreservesSessionAndEarlyOwnership) {
+    KEXPECT_TRUE(ker::net::wki::wki_remote_compute_selftest_resource_completion_is_session_scoped());
+}
+KTEST(WkiRemoteCompute, ResourceRejectionPreservesSessionAndDenials) {
+    KEXPECT_TRUE(ker::net::wki::wki_remote_compute_selftest_resource_rejection_is_session_scoped());
+}
+KTEST(WkiRemoteCompute, ServiceCompletionAndReportsCountOnce) {
+    KEXPECT_TRUE(ker::net::wki::wki_remote_compute_selftest_service_completion_counts_once());
+}
+
 KTEST(WkiRemoteCompute, PeerCleanupMarksUnreadyProxyFailure) {
     KEXPECT_TRUE(ker::net::wki::wki_remote_compute_selftest_cleanup_marks_unready_proxy_failure());
 }
@@ -75,4 +94,31 @@ KTEST(WkiRemoteCompute, SubmitCancelIsSessionScoped) {
 
 KTEST(WkiRemoteCompute, ExitReadyCompletionWakeIsExact) {
     KEXPECT_TRUE(ker::net::wki::wki_remote_compute_selftest_exit_ready_completion_wake_is_exact());
+}
+
+KTEST(WkiComputeOwnership, FailedSubmitRestoresGuard) {
+    KEXPECT_TRUE(ker::net::wki::wki_remote_compute_selftest_failed_submit_restores_guard());
+}
+
+KTEST(WkiComputeOwnership, SlotAllocationFailurePreservesInput) {
+    KEXPECT_TRUE(ker::net::wki::wki_remote_compute_selftest_slot_allocation_failure());
+}
+
+KTEST(WkiComputeOwnership, SubmitBuffersFollowExecutor) {
+    KEXPECT_TRUE(ker::net::wki::wki_remote_compute_selftest_submit_buffers_follow_executor());
+}
+
+KTEST(WkiComputeOwnership, RunningRegistryCompactsStably) {
+    KEXPECT_TRUE(ker::net::wki::wki_remote_compute_selftest_running_registry_compacts_stably());
+}
+KTEST(WkiComputeOwnership, RunningPublicationFailureUnwinds) {
+    KEXPECT_TRUE(ker::net::wki::wki_remote_compute_selftest_running_publication_failure_unwinds());
+}
+
+KTEST(WkiComputeOwnership, CompletionQueuePreservesOwnership) {
+    KEXPECT_TRUE(ker::net::wki::wki_remote_compute_selftest_completion_queue_preserves_ownership());
+}
+
+KTEST(WkiRemoteCompute, ServiceReportTransportAndRootRetirement) {
+    KEXPECT_TRUE(ker::net::wki::wki_remote_compute_selftest_service_report_transport());
 }

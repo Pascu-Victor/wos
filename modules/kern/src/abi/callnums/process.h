@@ -53,6 +53,12 @@ enum class procmgmt_ops : uint64_t {
     INIT_CONTROL_RECEIVE = 45,
     INIT_STATUS_PUBLISH = 46,
     INIT_STATUS_READ = 47,
+    GETRLIMIT = 48,
+    SETRLIMIT = 49,
+    RESOURCE_USAGE = 50,
+    SERVICE_RESOURCE_CONFIGURE = 51,
+    SERVICE_RESOURCE_SELECT = 52,
+    SERVICE_RESOURCE_READ = 53,
 };
 
 enum class SpawnFdActionType : uint32_t {

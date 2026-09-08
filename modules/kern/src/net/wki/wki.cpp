@@ -452,6 +452,9 @@ auto reliable_rx_peer_accepts(uint16_t src_node) -> bool {
     return peer != nullptr && reliable_rx_peer_state_accepts(peer->state);
 }
 
+// Service reports only merge into retained submission rows under the compute
+// lock, which also serializes peer retirement. They create no session state
+// and do not need the exclusive lifecycle lease used by submission handlers.
 auto message_uses_compute_lifecycle(MsgType type) -> bool {
     switch (type) {
         case MsgType::TASK_SUBMIT:
@@ -1419,7 +1422,12 @@ void wki_init() {
     g_wki.transport_count = 0;
     g_wki.my_lsa_seq = 0;
     g_wki.capabilities = WKI_CAP_RESOURCE_INCARNATION | WKI_CAP_VFS_MULTI_RDMA_LANES | WKI_CAP_VFS_METADATA_BATCH | WKI_CAP_NET_IPV6_STATE |
-                         WKI_CAP_VFS_XATTR;
+                         WKI_CAP_VFS_XATTR | WKI_CAP_RESOURCE_LIMITS;
+    // Mixed-version diagnostic profile: local enforcement remains enabled,
+    // and compute admission still refuses execution without negotiation.
+    if (cmdline_has_token(ker::init::get_kernel_cmdline(), "wki.resource_limits_off")) {
+        g_wki.capabilities &= static_cast<uint16_t>(~WKI_CAP_RESOURCE_LIMITS);
+    }
     // Keep the new receiver-challenged routing lease protocol opt-in until
     // mixed-version convergence has been exercised on a live mesh.
     if (cmdline_has_token(ker::init::get_kernel_cmdline(), "wki.routing_lease")) {
@@ -3333,6 +3341,9 @@ void wki_dispatch_reliable_msg(WkiChannel* rx_channel, uint32_t rx_channel_gener
         case MsgType::TASK_REJECT:
             detail::handle_task_reject(hdr, payload, payload_len, rx_channel, rx_channel_generation);
             break;
+        case MsgType::TASK_SERVICE_REPORT:
+            detail::handle_task_service_report(hdr, payload, payload_len, rx_channel, rx_channel_generation);
+            break;
         case MsgType::TASK_COMPLETE:
             detail::handle_task_complete(hdr, payload, payload_len, rx_channel, rx_channel_generation);
             break;
@@ -3782,13 +3793,16 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len, const WkiRx
                 bool session_ready = false;
                 {
                     PeerLifecycleTryLease install_lifecycle;
-                    if (install_lifecycle.try_acquire(peer->node_id, false)) {
-                        uint32_t const REMOTE_BOOT = wki_hello_boot_epoch(*reinterpret_cast<const HelloPayload*>(payload));
-                        session_ready = SESSION_CURRENT ? wki_auth_install_peer_session(peer, REMOTE_BOOT)
-                                                        : wki_auth_prepare_peer_session(peer, REMOTE_BOOT);
-                        if (session_ready && SESSION_CURRENT) {
-                            wki_routing_peer_session_changed(peer->node_id);
-                        }
+                    if (!install_lifecycle.try_acquire(peer->node_id, false)) {
+                        // Discovery is retried periodically. A busy lifecycle
+                        // writer/reader is not an authentication failure.
+                        return;
+                    }
+                    uint32_t const REMOTE_BOOT = wki_hello_boot_epoch(*reinterpret_cast<const HelloPayload*>(payload));
+                    session_ready = SESSION_CURRENT ? wki_auth_install_peer_session(peer, REMOTE_BOOT)
+                                                    : wki_auth_prepare_peer_session(peer, REMOTE_BOOT);
+                    if (session_ready && SESSION_CURRENT) {
+                        wki_routing_peer_session_changed(peer->node_id);
                     }
                 }
                 if (session_ready) {
@@ -3809,8 +3823,10 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len, const WkiRx
                 bool installed = false;
                 {
                     PeerLifecycleTryLease install_lifecycle;
-                    installed = install_lifecycle.try_acquire(peer->node_id, false) &&
-                                wki_auth_install_peer_session(peer, wki_hello_boot_epoch(*reinterpret_cast<const HelloPayload*>(payload)));
+                    if (!install_lifecycle.try_acquire(peer->node_id, false)) {
+                        return;
+                    }
+                    installed = wki_auth_install_peer_session(peer, wki_hello_boot_epoch(*reinterpret_cast<const HelloPayload*>(payload)));
                     if (installed) {
                         wki_routing_peer_session_changed(peer->node_id);
                     }
@@ -3907,6 +3923,7 @@ void wki_rx(WkiTransport* transport, const void* data, uint16_t len, const WkiRx
         case MsgType::TASK_REJECT:
         case MsgType::TASK_COMPLETE:
         case MsgType::TASK_CANCEL:
+        case MsgType::TASK_SERVICE_REPORT:
         case MsgType::LOAD_REPORT: {
             if (!RELIABLE_RX_ACCEPTED) {
                 return;

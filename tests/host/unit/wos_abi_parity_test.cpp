@@ -16,6 +16,8 @@
 #include "modules/kern/src/abi/callnums/time.h"
 #include "modules/kern/src/abi/callnums/vfs.h"
 #include "modules/kern/src/abi/callnums/vmem.h"
+#include "modules/kern/src/abi/resource.hpp"
+#include "modules/kern/src/abi/service_resource.hpp"
 #undef ker
 
 #define ker libc_ker
@@ -30,6 +32,8 @@
 #include "toolchain/src/mlibc/sysdeps/wos/include/callnums/vfs.h"
 #include "toolchain/src/mlibc/sysdeps/wos/include/callnums/vmem.h"
 #include "toolchain/src/mlibc/sysdeps/wos/include/sys/callnums.h"
+#include "toolchain/src/mlibc/sysdeps/wos/include/sys/resource_policy.h"
+#include "toolchain/src/mlibc/sysdeps/wos/include/sys/service_resource.h"
 #undef ker
 
 template <typename Enum>
@@ -194,6 +198,9 @@ PROCESS_OP(INIT_CONTROL_SUBMIT);
 PROCESS_OP(INIT_CONTROL_RECEIVE);
 PROCESS_OP(INIT_STATUS_PUBLISH);
 PROCESS_OP(INIT_STATUS_READ);
+PROCESS_OP(GETRLIMIT);
+PROCESS_OP(SETRLIMIT);
+PROCESS_OP(RESOURCE_USAGE);
 #undef PROCESS_OP
 
 using KernelSpawnActionType = kernel_ker::abi::process::SpawnFdActionType;
@@ -447,3 +454,31 @@ ABI_ENUM_EQUAL(KernelVmem::SWAPON, LibcVmem::SWAPON);
 ABI_ENUM_EQUAL(KernelVmem::SWAPOFF, LibcVmem::SWAPOFF);
 
 TEST(WosAbiParity, CompileTimeContractsHold) { SUCCEED(); }
+
+static_assert(sizeof(kernel_ker::abi::resource::Limit) == sizeof(libc_ker::abi::resource::Limit));
+static_assert(sizeof(kernel_ker::abi::resource::Usage) == sizeof(libc_ker::abi::resource::Usage));
+static_assert(kernel_ker::abi::resource::VERSION == libc_ker::abi::resource::VERSION);
+static_assert(kernel_ker::abi::resource::INFINITY_VALUE == libc_ker::abi::resource::INFINITY_VALUE);
+
+static_assert(static_cast<unsigned>(kernel_ker::abi::resource::Denial::HARD_LIMIT) ==
+              static_cast<unsigned>(libc_ker::abi::resource::Denial::HARD_LIMIT));
+
+ABI_ENUM_EQUAL(KernelProcessOp::SERVICE_RESOURCE_CONFIGURE, LibcProcessOp::SERVICE_RESOURCE_CONFIGURE);
+ABI_ENUM_EQUAL(KernelProcessOp::SERVICE_RESOURCE_SELECT, LibcProcessOp::SERVICE_RESOURCE_SELECT);
+ABI_ENUM_EQUAL(KernelProcessOp::SERVICE_RESOURCE_READ, LibcProcessOp::SERVICE_RESOURCE_READ);
+namespace kernel_service = kernel_ker::abi::service_resource;
+namespace libc_service = libc_ker::abi::service_resource;
+static_assert(kernel_service::ACCOUNTING_INCOMPLETE == libc_service::ACCOUNTING_INCOMPLETE);
+ABI_TYPE_EQUAL(kernel_service::Configuration, libc_service::Configuration);
+ABI_TYPE_EQUAL(kernel_service::Snapshot, libc_service::Snapshot);
+ABI_OFFSET_EQUAL(kernel_service::Configuration, libc_service::Configuration, limits);
+ABI_OFFSET_EQUAL(kernel_service::Snapshot, libc_service::Snapshot, cpu_time_us);
+ABI_OFFSET_EQUAL(kernel_service::Snapshot, libc_service::Snapshot, usage);
+ABI_VALUE_EQUAL(kernel_service::VERSION, libc_service::VERSION);
+ABI_VALUE_EQUAL(kernel_service::NO_SELECTION, libc_service::NO_SELECTION);
+static_assert([] {
+    for (unsigned i = 0; i < kernel_service::RESOURCE_COUNT; ++i) {
+        if (static_cast<unsigned>(kernel_service::RESOURCE_IDS[i]) != static_cast<unsigned>(libc_service::RESOURCE_IDS[i])) return false;
+    }
+    return kernel_service::RESOURCE_COUNT == libc_service::RESOURCE_COUNT;
+}());

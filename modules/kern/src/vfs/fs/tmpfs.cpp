@@ -16,6 +16,7 @@
 #include <platform/mm/phys.hpp>
 #include <platform/mm/reclaim.hpp>
 #include <platform/mm/swap.hpp>
+#include <platform/sched/file_growth.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sys/mutex.hpp>
 #include <util/smallvec.hpp>
@@ -2228,8 +2229,22 @@ auto tmpfs_write(ker::vfs::File* f, const void* buf, size_t count, size_t offset
     if (n == nullptr) {
         return -EBADF;
     }
+    if (n->type != TmpNodeType::FILE) {
+        return -EISDIR;
+    }
+    ker::mod::sched::resource::FileGrowth growth;
     ker::mod::sys::MutexGuard guard(n->io_lock);
-    return tmpfs_write_locked(n, buf, count, offset);
+    if (!growth.bound_write(offset, count)) {
+        return -EFBIG;
+    }
+    if (count == 0) {
+        return 0;
+    }
+    ssize_t const RET = tmpfs_write_locked(n, buf, count, offset);
+    if (RET > 0) {
+        growth.committed(n->size);
+    }
+    return RET;
 }
 
 auto tmpfs_write_append(ker::vfs::File* f, const void* buf, size_t count, size_t* offset_out) -> ssize_t {
@@ -2240,9 +2255,19 @@ auto tmpfs_write_append(ker::vfs::File* f, const void* buf, size_t count, size_t
     if (n == nullptr) {
         return -EBADF;
     }
+    if (n->type != TmpNodeType::FILE) {
+        return -EISDIR;
+    }
+    ker::mod::sched::resource::FileGrowth growth;
     ker::mod::sys::MutexGuard guard(n->io_lock);
     size_t const OFFSET = n->size;
-    ssize_t const RET = tmpfs_write_locked(n, buf, count, OFFSET);
+    if (!growth.bound_write(OFFSET, count)) {
+        return -EFBIG;
+    }
+    ssize_t const RET = count == 0 ? 0 : tmpfs_write_locked(n, buf, count, OFFSET);
+    if (RET > 0) {
+        growth.committed(n->size);
+    }
     if (RET >= 0 && offset_out != nullptr) {
         *offset_out = OFFSET;
     }
@@ -2492,9 +2517,17 @@ auto tmpfs_fops_truncate(ker::vfs::File* f, off_t length) -> int {
     if (length < 0) {
         return -EINVAL;
     }
-    ker::mod::sys::MutexGuard guard(n->io_lock);
+    ker::mod::sched::resource::FileGrowth growth;
     auto const NEW_SIZE = static_cast<size_t>(length);
-    return tmpfs_resize_locked(n, NEW_SIZE);
+    if (!growth.allow_resize(NEW_SIZE)) {
+        return -EFBIG;
+    }
+    ker::mod::sys::MutexGuard guard(n->io_lock);
+    int const RET = tmpfs_resize_locked(n, NEW_SIZE);
+    if (RET == 0) {
+        growth.committed(n->size);
+    }
+    return RET;
 }
 
 ker::vfs::FileOperations tmpfs_fops_instance = {

@@ -29,6 +29,16 @@ struct ClaimedEvent {
     sched_task::ChildEventAudience audience{sched_task::ChildEventAudience::PARENT};
 };
 
+struct ReapedCpuTimes {
+    uint64_t user_time_us{};
+    uint64_t system_time_us{};
+};
+
+// Serialized with wait-event consumption and remote completion. Callers must
+// hold the Task lifetime, and no runqueue/WKI/resource lock.
+[[nodiscard]] auto read_reaped_cpu_times(const sched_task::Task& process) -> ReapedCpuTimes;
+void add_reaped_cpu_times(sched_task::Task& process, uint64_t user_us, uint64_t system_us);
+
 struct Diagnostics {
     uint64_t registered_selector{};
     uint64_t owned_event_count{};
@@ -95,6 +105,7 @@ void release_claim(sched_task::Task& waiter, const ClaimedEvent& claimed);
 [[nodiscard]] auto diagnostics(sched_task::Task& task) -> Diagnostics;
 
 #ifdef WOS_SELFTEST
+[[nodiscard]] auto selftest_exit_includes_retired_thread_cpu() -> bool;
 [[nodiscard]] auto selftest_publish_and_registration_ordering() -> bool;
 [[nodiscard]] auto selftest_claim_retry_nowait_and_single_winner() -> bool;
 [[nodiscard]] auto selftest_waiter_handoff_and_subject_serialization() -> bool;

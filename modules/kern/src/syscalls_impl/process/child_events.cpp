@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <platform/sched/resource.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
 #include <platform/sys/spinlock.hpp>
@@ -141,6 +142,15 @@ void publish_subject_claim_locked(ChildEvent& event) {
     event.process_group = effective_process_group(subject);
     event.user_time_us = sched_task::task_rusage_user_time_us(subject);
     event.system_time_us = sched_task::task_rusage_system_time_us(subject);
+    if (kind == ChildEventKind::EXIT && !subject.is_thread && subject.type == sched_task::TaskType::PROCESS) {
+        // Production exit has drained CPU contributors and frozen accounting.
+        // Lifecycle -> resource is bounded; no resource holder enters lifecycle.
+        uint64_t const CPU_FLAGS = subject.resource_lock.lock_irqsave();
+        event.user_time_us = ker::mod::sched::resource::saturating_cpu_add(subject.resources.cpu_user_time_us, subject.child_user_time_us);
+        event.system_time_us =
+            ker::mod::sched::resource::saturating_cpu_add(subject.resources.cpu_system_time_us, subject.child_system_time_us);
+        subject.resource_lock.unlock_irqrestore(CPU_FLAGS);
+    }
     event.status = status;
     event.kind = kind;
     event.audience = audience;
@@ -487,6 +497,20 @@ auto selector_for_current_process_group(Task& process) -> uint64_t {
     uint64_t const PROCESS_GROUP = effective_process_group(process);
     g_lifecycle_lock.unlock_irqrestore(FLAGS);
     return selector_for_process_group(PROCESS_GROUP);
+}
+
+auto read_reaped_cpu_times(const Task& process) -> ReapedCpuTimes {
+    uint64_t const FLAGS = g_lifecycle_lock.lock_irqsave();
+    ReapedCpuTimes const RESULT{process.child_user_time_us, process.child_system_time_us};
+    g_lifecycle_lock.unlock_irqrestore(FLAGS);
+    return RESULT;
+}
+
+void add_reaped_cpu_times(Task& process, uint64_t user_us, uint64_t system_us) {
+    uint64_t const FLAGS = g_lifecycle_lock.lock_irqsave();
+    process.child_user_time_us = ker::mod::sched::resource::saturating_cpu_add(process.child_user_time_us, user_us);
+    process.child_system_time_us = ker::mod::sched::resource::saturating_cpu_add(process.child_system_time_us, system_us);
+    g_lifecycle_lock.unlock_irqrestore(FLAGS);
 }
 
 void update_process_group(Task& process, uint64_t process_group) {
@@ -1008,8 +1032,8 @@ auto commit_claim(Task& owner, Task& waiter, const ClaimedEvent& claimed, bool k
             SUBJECT->child_parent = nullptr;
             SUBJECT->parent_pid = 0;
             update_unparented_membership_locked(*SUBJECT);
-            owner.child_user_time_us += claimed.user_time_us;
-            owner.child_system_time_us += claimed.system_time_us;
+            owner.child_user_time_us = ker::mod::sched::resource::saturating_cpu_add(owner.child_user_time_us, claimed.user_time_us);
+            owner.child_system_time_us = ker::mod::sched::resource::saturating_cpu_add(owner.child_system_time_us, claimed.system_time_us);
             SUBJECT->release();
             owner.release();
             reaped = true;
@@ -1077,6 +1101,34 @@ void initialize_fixture(Task& task, uint64_t pid, uint64_t process_group = 0) {
 
 }  // namespace
 
+auto selftest_exit_includes_retired_thread_cpu() -> bool {
+    Task parent{};
+    Task child{};
+    initialize_fixture(parent, 0x8150);
+    initialize_fixture(child, 0x8151);
+    child.state.store(sched_task::TaskState::ACTIVE);
+    static_cast<void>(child.resources.charge_cpu(100, 70));
+    child.child_user_time_us = 13;
+    child.child_system_time_us = 17;
+    {
+        Task thread{};
+        thread.type = child.type;
+        thread.is_thread = true;
+        thread.owner_pid = child.pid;
+        if (!ker::mod::sched::resource::bind_thread_owner(thread, child)) return false;
+        ker::mod::sched::resource::charge_cpu(&thread, 200, 140);
+    }
+    child.state.store(sched_task::TaskState::EXITING);
+    if (!begin_publication(parent, child) || !commit_publication(child) || !publish_exit(child)) return false;
+    ClaimedEvent claimed{};
+    bool const CLAIMED = claim_or_register(parent, parent, child.pid, 0, false, claimed) == ProbeResult::CLAIMED;
+    bool const CORRECT =
+        CLAIMED && claimed.user_time_us == 223 && claimed.system_time_us == 107 && child.resource_thread_owners.load() == 0;
+    bool const REAPED = CLAIMED && commit_claim(parent, parent, claimed, false);
+    bool const DUPLICATE_REJECTED = !commit_claim(parent, parent, claimed, false);
+    return CORRECT && REAPED && DUPLICATE_REJECTED && parent.child_user_time_us == 223 && parent.child_system_time_us == 107;
+}
+
 auto selftest_publish_and_registration_ordering() -> bool {
     Task parent{};
     Task waiter{};
@@ -1088,6 +1140,7 @@ auto selftest_publish_and_registration_ordering() -> bool {
     child.exit_status = 0x3400;
     child.user_time_us = 71;
     child.system_time_us = 29;
+    static_cast<void>(child.resources.charge_cpu(100, 71));
 
     if (!begin_publication(parent, child) || !commit_publication(child)) {
         abort_publication(child);
@@ -1275,6 +1328,7 @@ auto selftest_ptrace_exit_preserves_parent_event() -> bool {
     initialize_fixture(child, 0x8402);
     child.exit_status = 0x9A00;
     child.user_time_us = 17;
+    static_cast<void>(child.resources.charge_cpu(17, 17));
 
     if (!begin_publication(parent, child) || !commit_publication(child) || !attach_tracer(child, tracer) || !publish_exit(child)) {
         abort_publication(child);

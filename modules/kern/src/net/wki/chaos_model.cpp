@@ -170,6 +170,7 @@ auto reliable_message_type(uint8_t raw_type) -> bool {
         case MsgType::TASK_CANCEL:
         case MsgType::LOAD_REPORT:
         case MsgType::TASK_SUBMIT_FRAGMENT:
+        case MsgType::TASK_SERVICE_REPORT:
             return true;
     }
     return false;

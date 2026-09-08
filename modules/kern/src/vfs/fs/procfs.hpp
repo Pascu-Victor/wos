@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <platform/sys/mutex.hpp>
 #include <vfs/file.hpp>
 #include <vfs/file_operations.hpp>
 #include <vfs/stat.hpp>
@@ -71,6 +72,7 @@ enum class ProcNodeType : uint8_t {
     MEMACC_RECLAIM_FILE_MMAP_CACHE_FILE,
     MEMACC_RECLAIM_ANONYMOUS_SWAP_FILE,
     MEMACC_RECLAIM_COORDINATOR_FILE,
+    LIMITS_FILE,  // /proc/<pid>/limits and task aliases
 };
 
 struct ProcNode {
@@ -84,6 +86,7 @@ struct ProcFileData {
     ProcNode node;
     char* content;  // generated content (lazily allocated)
     size_t content_len;
+    ker::mod::sys::Mutex limits_content_lock;
 };
 
 // Initialize and mount procfs at /proc
@@ -101,4 +104,7 @@ auto procfs_fill_stat(File* f, Stat* statbuf, dev_t dev_id) -> int;
 // Get procfs FileOperations
 auto get_procfs_fops() -> FileOperations*;
 
+#ifdef WOS_SELFTEST
+auto selftest_cpu_observation() -> bool;
+#endif
 }  // namespace ker::vfs::procfs

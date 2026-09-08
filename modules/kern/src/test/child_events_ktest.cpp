@@ -24,3 +24,5 @@ KTEST(ChildEvents, StopContinueOrderAndBackpressure) { KEXPECT_TRUE(child_events
 KTEST(ChildEvents, ParentEventTransfer) { KEXPECT_TRUE(child_events::selftest_parent_event_transfer()); }
 
 KTEST(ChildEvents, ParentExitDiscardsWithoutReaper) { KEXPECT_TRUE(child_events::selftest_parent_exit_discards_without_reaper()); }
+
+KTEST(ChildEvents, ExitIncludesRetiredThreadCpu) { KEXPECT_TRUE(child_events::selftest_exit_includes_retired_thread_cpu()); }

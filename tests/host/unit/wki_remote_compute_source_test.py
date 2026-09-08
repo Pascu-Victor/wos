@@ -3,6 +3,8 @@
 import re
 from pathlib import Path
 
+from exec_source_test import function_body as multiline_function_body
+
 
 ROOT = Path(__file__).resolve().parents[3]
 REMOTE_COMPUTE_CPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "remote_compute.cpp"
@@ -133,7 +135,9 @@ def test_proxy_wait_completion_respects_waitpid_publish_fence() -> None:
         "SNAPSHOT_PRESERVED",
         "RETRY_IS_SAME_EVENT",
         "REJECTED_STALE_SPECIFIC_WAIT",
-        "parent.child_user_time_us == proxy.user_time_us",
+        "parent.child_user_time_us == 351",
+        "parent.child_system_time_us == 588",
+        "merge_proxy_resource_completion(proxy, BASELINE, completion)",
     ]:
         if snippet not in source:
             fail(f"remote-compute KTEST selftest is missing child-event coverage: {snippet}")
@@ -504,12 +508,12 @@ def test_submitted_task_slots_are_indexed_and_reclaimed() -> None:
         [
             "constexpr size_t WKI_SUBMITTED_TASK_INDEX_BUCKETS = 1024",
             "struct SubmittedTaskSlot",
-            "std::deque<SubmittedTaskSlot> g_submitted_tasks",
+            "SubmittedTaskSlot* s_submitted_task_head = nullptr",
             "std::array<SubmittedTaskSlot*, WKI_SUBMITTED_TASK_INDEX_BUCKETS>",
             "SubmittedTaskSlot* s_submitted_task_free = nullptr",
             "size_t s_submitted_task_count = 0",
             "auto find_submitted_task_slot_locked(uint32_t task_id) -> SubmittedTaskSlot*",
-            "auto publish_submitted_task_locked(SubmittedTask&& task) -> SubmittedTask*",
+            "auto publish_submitted_task_locked(SubmittedTask&& task, int* error_out = nullptr, bool fail_allocation = false) -> SubmittedTask*",
             "auto allocate_submitted_task_id_locked() -> uint32_t",
         ],
         "stable indexed submitted-task slots",
@@ -574,7 +578,7 @@ def test_submitted_task_slots_are_indexed_and_reclaimed() -> None:
                 "allocate_submitted_task_id_locked()",
                 "st.result_handle_owned = true",
                 "st.result_owner_task = ker::mod::sched::get_current_task()",
-                "publish_submitted_task_locked(std::move(st))",
+                "publish_submitted_task_locked(std::move(st), &publication_error)",
                 "task_ptr->response_consumer_wait_entry = &wait",
                 "discarded_output = consume_submitted_task_result_locked(task_ptr)",
                 "delete[] discarded_output",
@@ -1165,8 +1169,8 @@ def test_task_submit_envelopes_use_bounded_stack_storage() -> None:
                 "auto const MSG_LEN = static_cast<uint16_t>(TOTAL)",
                 "ipc_fd_count != 0 && ipc_fd_map == nullptr",
                 "std::array<uint8_t, WKI_ETH_MAX_PAYLOAD> small_buf __attribute__((uninitialized));",
-                "std::unique_ptr<uint8_t[]> large_buf",
-                "uint8_t* const BUF = large_buf != nullptr ? large_buf.get() : small_buf.data()",
+                "TaskSubmitBuffer large_buf(local_task",
+                "uint8_t* const BUF = large_buf.data() != nullptr ? large_buf.data() : small_buf.data()",
                 "reinterpret_cast<TaskSubmitPayload*>(BUF)",
                 "uint8_t* cursor = BUF + sizeof(TaskSubmitPayload)",
                 "send_task_submit_payload(target_node, SUBMIT_CHANNEL, TASK_ID, BUF, MSG_LEN)",
@@ -1258,6 +1262,29 @@ def test_task_submit_envelopes_use_bounded_stack_storage() -> None:
     )
 
 
+def test_completion_queue_allocation_and_retry_preserve_ownership() -> None:
+    source = REMOTE_COMPUTE_CPP.read_text()
+    queue = function_body(source, "queue_pending_completion_locked")
+    require_tokens(queue, ["new (std::nothrow) PendingTaskCompletion(info)", "if (completion == nullptr) return false;"], "checked completion allocation")
+    require_order(queue, "if (completion == nullptr)", "append_pending_completion_locked(completion)", "no failed publication")
+    append = function_body(source, "append_pending_completion_locked")
+    if "new " in append:
+        raise AssertionError("completion retry must reuse its node without allocation")
+    collector = function_body(source, "wki_remote_compute_check_completions")
+    require_tokens(collector, ["if (!queue_pending_completion_locked(PendingTaskCompletion", "std::unique_ptr<PendingTaskCompletion> pending(pop_pending_completion_locked())", "append_pending_completion_locked(pending.release())"], "completion ownership")
+    failure = collector[collector.index("if (!queue_pending_completion_locked"):collector.index("release_running_root_locked(rt)")]
+    require_tokens(failure, ["continue;"], "allocation failure retains running ownership")
+    for forbidden in ["rt.task->release()", "delete rt.output", "rt.output = nullptr", "rt.active = false"]:
+        if forbidden in failure:
+            raise AssertionError("failed completion allocation consumed receiver ownership")
+    require_order(collector, "queue_pending_completion_locked", "release_running_root_locked(rt)", "durable completion before monitor release")
+    require_tokens(function_body(source, "release_running_root_locked"), ["rt.task->release()", "rt.root_completion_queued = true", "rt.active = rt.service_accounting != nullptr"], "independent report lifetime")
+    retry = collector[collector.index("append_pending_completion_locked(pending.release())"):]
+    log = retry[retry.index("TASK_COMPLETE send deferred:"):retry.index("continue;", retry.index("TASK_COMPLETE send deferred:"))]
+    if "info." in log:
+        raise AssertionError("retry log reads node after ownership transfer")
+
+
 def test_task_completion_uses_bounded_stack_storage() -> None:
     source = REMOTE_COMPUTE_CPP.read_text()
 
@@ -1276,13 +1303,13 @@ def test_task_completion_uses_bounded_stack_storage() -> None:
             "complete->task_id = info.task_id",
             "complete->exit_status = info.exit_status",
             "complete->output_len = OUT_LEN",
-            "complete->reserved = 0",
+            "complete->reserved = RESOURCE_LEN",
             "memcpy(buf.data() + sizeof(TaskCompletePayload), info.output->data.data(), OUT_LEN)",
             "MsgType::TASK_COMPLETE, buf.data(), MSG_LEN",
         ],
         "stack-backed TASK_COMPLETE frame",
     )
-    require_order(completion, "complete->reserved = 0", "memcpy(buf.data()", "completion header before output")
+    require_order(completion, "complete->reserved = RESOURCE_LEN", "memcpy(buf.data()", "completion header before output")
     require_order(completion, "memcpy(buf.data()", "MsgType::TASK_COMPLETE, buf.data(), MSG_LEN", "completion build before send")
     require_order(
         completion,
@@ -1559,16 +1586,13 @@ def test_remote_stdio_capture_is_write_only_and_non_tty() -> None:
     if "return false;" not in capture_isatty:
         fail("remote stdout/stderr capture must not report tty semantics")
 
-    exec_body = function_body(source, "finish_remote_exec_task")
-    for snippet in [
-        "stdin_file->open_flags = 0;",
-        "stdin_file->fs_type = ker::vfs::FSType::TMPFS;",
-        "capture_file->open_flags = 1;",
-        "capture_file->fs_type = ker::vfs::FSType::TMPFS;",
-        "(void)new_task->fd_table.insert(fd_idx, capture_file)",
-    ]:
-        if snippet not in exec_body:
-            fail(f"remote stdio capture must preserve VFS access modes: {snippet}")
+    body = function_body(source, "install_remote_stdio")
+    require_tokens(body, ["file->open_flags = fd == 0 ? 0 : 1", "file->fs_type = ker::vfs::FSType::TMPFS",
+                          "file->fops = fd == 0 ? &g_stdin_null_fops : &g_capture_fops",
+                          "if ((stdio_mask & (1U << fd)) == 0) continue", "task.fd_table.remove(previous)"],
+                   "inherited stdio presence, access modes and rollback")
+    require_order(body, "new (std::nothrow)", "task.fd_table_lock.lock_irqsave()", "allocate before FD lock")
+    require_order(body, "task.fd_table.insert(", "ker::vfs::fd_usage_changed_locked(task)", "observe only committed inherited FDs")
 
 
 def test_large_vfs_ref_exec_keeps_a_file_backed_source() -> None:
@@ -1599,7 +1623,7 @@ def test_large_vfs_ref_exec_keeps_a_file_backed_source() -> None:
         [
             "vfs_result.buffer == nullptr && vfs_result.file == nullptr",
             "elf_file = vfs_result.file",
-            "elf_file != nullptr ? exec_elf_file(elf_file, binary_len, elf_file_stat)",
+            "exec_elf_file(elf_file, binary_len, elf_file_stat, submitted_resources, SUBMITTED_UID, stdio_mask)",
         ],
         "large VFS_REF file-backed execution",
     )
@@ -1625,12 +1649,12 @@ def test_submitted_vfs_policy_is_active_during_elf_construction() -> None:
     require_order(
         body,
         "if (!submit_vfs_identity.policy_valid())",
-        "ExecResult const EXEC = elf_file != nullptr",
+        "ExecResult const EXEC =",
         "submitted policy validation before ELF construction",
     )
     require_order(
         body,
-        "ExecResult const EXEC = elf_file != nullptr",
+        "ExecResult const EXEC =",
         "submit_vfs_identity.transfer_vfs_rules_to(new_task)",
         "validated policy transfer after ELF construction",
     )
@@ -1678,7 +1702,7 @@ def test_controller_descendants_default_to_local_placement() -> None:
             "node_id = wki_peer_find_by_hostname(short_target.data())",
             "if (node_id == g_wki.my_node_id)",
             'log_spawn_diag(task, WkiRemoteSpawnResult::LOCAL, "explicit-local-target")',
-            "return WkiRemoteSpawnResult::LOCAL",
+            "return finish_placement(WkiRemoteSpawnResult::LOCAL)",
         ],
         "exact-first .wos target fallback and launcher-self local placement",
     )
@@ -1696,8 +1720,117 @@ def test_controller_descendants_default_to_local_placement() -> None:
     )
 
 
+def test_submission_errors_and_ipc_suffix_framing() -> None:
+    source = REMOTE_COMPUTE_CPP.read_text()
+    prepare = function_body(source, "prepare_submitted_resources")
+    require_tokens(prepare, ["submit_context + submit_context_len - IPC_BYTES", "ipc_data + index * sizeof(entry)",
+                             "fallback_mask &=", "(*stdio_mask & BIT) == 0"], "IPC suffix excludes optional VFS policy")
+    for name in ["wki_task_submit_inline", "wki_task_submit_vfs_ref"]:
+        body = multiline_function_body(source, name)
+        require_tokens(body, ["*error_out = 0", "*error_out = error", "task_transport_errno(SEND_RET)",
+                              "task_transport_errno(WAIT_RC)", "task_rejection_errno(accept_status)"], "specific submit errno")
+        require_order(body, "cleanup_submit_ipc()", "fail_submit(task_transport_errno(SEND_RET))",
+                      "release ownership before reporting send failure")
+    placement = function_body(source, "wki_try_remote_spawn")
+    require_tokens(placement, ["&placement_error", "*spec.error_out =", "CAN_RETRY_INLINE", "placement_error = -EAGAIN"],
+                   "preserve placement error and admission failure")
+    exec_source = PROCESS_EXEC_CPP.read_text()
+    for name in ["wos_proc_exec_impl", "wos_proc_execve_impl"]:
+        body = multiline_function_body(exec_source, name)
+        require_tokens(body, [".error_out = &remote_error", "return static_cast<uint64_t>(remote_error)"], "raw syscall preserves negative errno")
+
+
+def test_resource_contract_preserves_baseline_and_completion_ownership() -> None:
+    source = REMOTE_COMPUTE_CPP.read_text()
+    for name in ["wki_task_submit_inline", "wki_task_submit_vfs_ref"]:
+        body = multiline_function_body(source, name)
+        require_tokens(body, ["wki_peer_capability_negotiated(target_node, WKI_CAP_RESOURCE_LIMITS)",
+                              "snapshot_task_resources(local_task, *resources)", "st.resource_baseline = resources",
+                              "copy_submit_identity_data(cursor, local_task, resources)"],
+                       "negotiated submission uses one retained resource baseline")
+        require_order(body, "snapshot_task_resources(", "s_compute_lock.lock()", "snapshot outside compute lock")
+    complete = function_body(source, "handle_task_complete")
+    require_order(complete, "resource_contract::decode(", "s_compute_lock.lock()", "aligned decode before compute lock")
+    require_order(complete, "resource_contract::valid_completion(", "take_local_task_ref()", "validate baseline before ownership transfer")
+    require_tokens(complete, ["task->resource_completion = resource_completion", "task->active = false"], "retain terminal resource record")
+    finalize = function_body(source, "finalize_proxy_task")
+    require_order(finalize, "transition_state(", "merge_proxy_resource_completion(", "one winning finalizer merges usage")
+    service_source = (ROOT / "modules/kern/src/platform/sched/service_resource.cpp").read_text()
+    guard_release = re.search(r"ServiceResourceMerge::~ServiceResourceMerge\(\)\s*\{([^}]*)\}", service_source)
+    if guard_release is None:
+        fail("missing service observation guard destructor")
+    require_order(guard_release.group(1), "resource_lock.unlock_irqrestore(", "service_lock.unlock_irqrestore(", "service observation guard releases locks in reverse order")
+    require_order(finalize, "merge_proxy_resource_completion(", "child_events::publish_exit(", "resource accounting before child event")
+    merge = function_body(source, "merge_proxy_resource_completion")
+    require_tokens(merge, ["if (!merged) return false;", "completion.cpu_user_time_us - baseline.cpu_user_time_us",
+                           "completion.cpu_system_time_us - baseline.cpu_system_time_us", "completion.reaped_user_time_us",
+                           "completion.reaped_system_time_us"], "validated exact remote CPU modes and child deltas")
+    require_order(merge, "ServiceResourceMerge observation_guard(proxy)", "resource_contract::merge_completion(", "service snapshots serialized with task merge")
+    require_order(merge, "resource_contract::merge_completion(", "observation_guard.exclude_reported_denials()", "only successful task merge can exclude report-counted denials")
+    require_tokens(merge, ["if (merged && SERVICE_REPORTS)", "if (!SERVICE_REPORTS)"], "service report flag selects one accounting path")
+    collector = function_body(source, "wki_remote_compute_check_completions")
+    require_tokens(collector, ["resources->reaped_user_time_us = task->child_user_time_us",
+                              "resources->reaped_system_time_us = task->child_system_time_us"], "stable reaped CPU completion deltas")
+    require_tokens(collector, ["running_remote_task_accounting_ready(rt, *task)", "resource_contract::snapshot(task->resources)",
+                              "info.resources.has_value()", "complete->reserved = RESOURCE_LEN"], "stable receiver completion snapshot")
+    readiness = function_body(source, "running_remote_task_accounting_ready")
+    require_tokens(readiness, ["exit_notify_ready.load(std::memory_order_acquire)", "task.has_exited",
+                               "resource_cpu_threads.load(std::memory_order_acquire) == 0",
+                               "resource_deferred_observations.load(std::memory_order_acquire) == 0"],
+                   "completed CPU and deferred core observations before snapshot")
+    if "resource_thread_owners.load" in collector + readiness:
+        fail("completion must not depend on thread metadata GC")
+    require_order(finalize, "cleanup_proxy_resources(proxy)", "proxy->exit_notify_ready.store", "proxy cleanup before receiver completion")
+    require_order(finalize, "proxy->process_charge.release()", "proxy->exit_notify_ready.store", "proxy UID release before receiver completion")
+    for name in ["wki_try_remote_spawn", "wki_proxy_task_blocked"]:
+        body = function_body(source, name)
+        require_tokens(body, ["resource_baseline =", "resource_completion =", "resource_completion ? &*resource_completion : nullptr"],
+                       "early completion retains both resource records")
+
+
+def test_resource_rejection_preserves_admission_observations() -> None:
+    source = REMOTE_COMPUTE_CPP.read_text()
+    destroy = function_body(source, "destroy_unpublished_remote_process")
+    require_order(destroy, "*failure_observations = task->resources", "destroy_owned_unpublished_process(",
+                  "retain admission observations before unpublished child destruction")
+    require_order(destroy, "resource_lock.unlock_irqrestore(", "destroy_owned_unpublished_process(",
+                  "teardown callbacks outside resource lock")
+    submit = function_body(source, "handle_task_submit_work")
+    for call in re.findall(r"destroy_unpublished_remote_process\([^;]+;", submit):
+        if "&submitted_resources" not in call:
+            fail(f"receiver rejection teardown loses observations: {call}")
+    require_tokens(submit, ["resource_observations_valid", "resource_contract::snapshot(submitted_resources)",
+                            "discard_unpublished_running_task(current_task, worker_task_ref, rt, &submitted_resources)"],
+                   "validated contract observations survive every rejection teardown")
+    file_exec = function_body((ROOT / "modules/kern/src/syscalls_impl/process/exec.cpp").read_text(), "create_file_backed_process_task")
+    require_order(file_exec, "*failure_observations = new_task->resources", "destroy_owned_unpublished_process(",
+                  "file-backed admission observation output precedes destruction")
+    reject = function_body(source, "handle_task_reject")
+    require_order(reject, "resource_contract::decode(", "s_compute_lock.lock()", "decode outside compute lock")
+    require_order(reject, "resource_contract::valid_rejection(", "claim_and_clear_waiter_locked(",
+                  "invalid rejection cannot consume the response waiter")
+    require_order(reject, "claim_and_clear_waiter_locked(", "resource_contract::merge_rejection(",
+                  "one response claimant merges admission observations")
+    require_order(reject, "resource_contract::merge_rejection(", "response_pending.store(false",
+                  "observations precede response publication")
+
+
 def test_receiver_child_owner_spans_interpreter_output_and_publication() -> None:
     source = REMOTE_COMPUTE_CPP.read_text()
+    submit_body = function_body(source, "handle_task_submit_work")
+    require_order(submit_body, "resource_submission_admission(", "prepare_submitted_resources(", "receiver requires negotiated contract before decode or fetch")
+    require_order(submit_body, "prepare_submitted_resources(", "load_elf_from_vfs_path(",
+                  "receiver resource validation before executable fetch")
+    prepare_body = function_body(source, "prepare_submitted_resources")
+    require_order(prepare_body, "IDENTITY_END > submit_context_len - IPC_BYTES", "resource_contract::decode(",
+                  "resource suffix bounds before typed decode")
+    require_tokens(prepare_body, ["resource_contract::restore(", "resource_contract::cpu_exhausted(record)",
+                                  "TaskRejectReason::RESOURCE_INVALID", "TaskRejectReason::RESOURCE_CPU"],
+                   "receiver policy and CPU admission")
+    placement = function_body(source, "wki_try_remote_spawn")
+    require_order(placement, "if (tid == 0)", "close_proxy_fd_table(task, true)", "CLOEXEC close only after submit acceptance")
+    require_order(placement, "close_proxy_fd_table(task, true)", "bool const NEEDS_PROXY_PUBLICATION",
+                  "potentially blocking CLOEXEC cleanup before proxy identity/publication")
     exec_body = function_body(source, "exec_elf_buffer")
     require_order(
         exec_body,
@@ -1714,21 +1847,27 @@ def test_receiver_child_owner_spans_interpreter_output_and_publication() -> None
     require_order(
         exec_body,
         "complete_unpublished_process_construction(new_task)",
-        "finish_remote_exec_task(new_task)",
+        "finish_remote_exec_task(new_task, stdio_mask, resources)",
         "receiver must finish the owned interpreter stage before output setup",
     )
     require_tokens(
         exec_body,
         [
-            "new_task->thread == nullptr || new_task->pagemap == nullptr || new_task->entry == 0",
+            "!new_task->initialize_process_image(elf_buffer, binary_len)",
             'panic_handler("WKI remote compute: cannot publish receiver child recovery ownership")',
-            'destroy_unpublished_remote_process(OWNER, new_task, nullptr, "wki-exec-construction")',
-            'destroy_unpublished_remote_process(OWNER, new_task, nullptr, "wki-exec-interpreter")',
+            'destroy_unpublished_remote_process(OWNER, new_task, nullptr, "wki-exec-construction", &resources)',
+            'destroy_unpublished_remote_process(OWNER, new_task, nullptr, "wki-exec-interpreter", &resources)',
         ],
         "receiver construction failure ownership",
     )
     if "release_unpublished_process(" in exec_body:
         fail("exec_elf_buffer must return with the receiver child owner slot intact")
+    require_order(exec_body, "ProcessReservation process_reservation(resources, real_uid)",
+                  'kernel_stack_alloc("wki_exec_kstack")', "receiver NPROC admission before kernel stack")
+    require_order(exec_body, "new_task->resources = resources", "initialize_process_image(elf_buffer, binary_len)",
+                  "receiver policy before image/stack allocation")
+    require_order(exec_body, "process_reservation.attach(*new_task)", "initialize_process_image(elf_buffer, binary_len)",
+                  "receiver population charge before image/stack allocation")
 
     boot_read = function_body(TASK_CPP.read_text(), "read_boot_file_fully")
     require_order(
@@ -1747,8 +1886,8 @@ def test_receiver_child_owner_spans_interpreter_output_and_publication() -> None
     work_body = function_body(source, "handle_task_submit_work")
     require_order(
         work_body,
-        "ExecResult const EXEC = elf_file != nullptr",
-        "g_running_remote_tasks.push_back(rt)",
+        "ExecResult const EXEC =",
+        "publish_running_task_locked(rt)",
         "receiver child ownership must cover output and prepublication monitor setup",
     )
     require_order(
@@ -1970,7 +2109,7 @@ def test_receiver_vfs_ref_submit_uses_bounded_worker_pool() -> None:
             "rt.published = false",
             "rt.accept_pending = false",
             "rt.submit_session_epoch = session.epoch",
-            "g_running_remote_tasks.push_back(rt)",
+            "publish_running_task_locked(rt)",
             "bool const POSTED = ker::mod::sched::post_task_balanced(new_task)",
             "published_row->published = true",
             "published_row->accept_pending = send_accept",
@@ -1979,10 +2118,10 @@ def test_receiver_vfs_ref_submit_uses_bounded_worker_pool() -> None:
         ],
         "final submit session, cancellation, publication, and accept fence",
     )
-    publication_block = work_body[work_body.find("g_running_remote_tasks.push_back(rt)") :]
+    publication_block = work_body[work_body.find("publish_running_task_locked(rt)") :]
     require_order(
         publication_block,
-        "g_running_remote_tasks.push_back(rt)",
+        "publish_running_task_locked(rt)",
         "s_compute_lock.unlock()",
         "running row must be published before releasing the compute lock",
     )
@@ -2081,9 +2220,9 @@ def test_receiver_vfs_ref_submit_uses_bounded_worker_pool() -> None:
             "running_remote_task_completion_eligible(rt)",
             "wki_send_on_channel_generation(",
             "info.submitter_node, info.submit_rx_channel, info.submit_rx_channel_generation, MsgType::TASK_COMPLETE",
-            "g_pending_task_completions.push_back(info)",
+            "append_pending_completion_locked(pending.release())",
             "delete rt.output",
-            "rt.task->release()",
+            "release_running_root_locked(rt)",
         ],
         "retired peer output capture release after task exit",
     )
@@ -2189,7 +2328,7 @@ def test_receiver_vfs_ref_submit_uses_bounded_worker_pool() -> None:
         ["MsgType::TASK_SUBMIT", "MsgType::TASK_ACCEPT", "MsgType::TASK_REJECT"],
         "inline TASK handlers use peer lifecycle gate",
     )
-    if "MsgType::TASK_COMPLETE" in lifecycle_body or "MsgType::TASK_CANCEL" in lifecycle_body:
+    if any(message in lifecycle_body for message in ["MsgType::TASK_COMPLETE", "MsgType::TASK_CANCEL", "MsgType::TASK_SERVICE_REPORT"]):
         fail("deferred COMPLETE/CANCEL admission must not stall behind a task-context lifecycle holder")
     require_order(
         function_body(wki, "wki_rx"),
@@ -2278,7 +2417,7 @@ def test_receiver_vfs_ref_submit_uses_bounded_worker_pool() -> None:
             "if (proxy_ready && !st->active)",
             "completed_output = st->pending_proxy_output",
             "st->pending_proxy_output = nullptr",
-            "finalize_proxy_task(completed_proxy_ref, completed_exit_status, completed_output, completed_output_len, tid)",
+            "finalize_proxy_task(completed_proxy_ref, completed_exit_status, completed_output, completed_output_len, tid,",
             "delete[] completed_output",
         ],
         "spawn-side immediate completion consumes owned early output",
@@ -2513,6 +2652,64 @@ def test_remote_task_exit_wakes_exact_completion_monitor() -> None:
     )
 
 
+def test_receiver_tracking_failure_unwinds_before_scheduler_publication() -> None:
+    source = REMOTE_COMPUTE_CPP.read_text()
+    require_tokens(source, ["using RunningRemoteTasks = ker::util::SmallVec<RunningRemoteTask, 16>"], "checked receiver registry")
+    compact = function_body(source, "compact_running_remote_tasks_locked")
+    require_tokens(compact, ["size_t retained = 0", "g_running_remote_tasks[retained] = g_running_remote_tasks[i]", "pop_back()"],
+                   "stable linear compaction")
+    if "remove_at" in compact:
+        fail("receiver compaction cannot shift the full tail once per retired row")
+    publish = function_body(source, "publish_running_task_locked")
+    require_tokens(publish, ["return !fail_allocation && g_running_remote_tasks.push_back(task)"], "propagate checked growth failure")
+    start = source.index("if (!publish_running_task_locked(rt))")
+    end = source.index("post_task_balanced(new_task)", start)
+    failure = source[start:end]
+    require_order(failure, "s_compute_lock.unlock()", "discard_unpublished_running_task(", "teardown outside compute lock")
+    require_tokens(failure, ["TaskRejectReason::NO_MEM", "send_submit_response(MsgType::TASK_REJECT, reject)", "return;"],
+                   "reject allocation failure before scheduler publication")
+    discard = function_body(source, "discard_unpublished_running_task")
+    require_order(discard, "worker_ref->release()", "destroy_unpublished_remote_process(", "drop worker ref before exclusive teardown")
+    require_order(discard, "child->release()", "destroy_unpublished_remote_process(", "drop unpublished monitor ref before exclusive teardown")
+
+
+def test_submit_wire_buffers_are_cancelled_with_executor() -> None:
+    source = REMOTE_COMPUTE_CPP.read_text()
+    begin = source.index("class TaskSubmitBuffer {")
+    end = source.index("// Storage", begin)
+    buffer = source[begin:end]
+    require_order(buffer, "executor->pending_wki_submit_buffers = this", "new (std::nothrow) uint8_t[size]", "track allocation before it can be abandoned")
+    require_order(buffer, "bytes = nullptr", "delete[] owned", "clear before deallocation")
+    require_tokens(buffer, ["if (size == 0) return", "if (bytes == nullptr) cancel()", "previous->next = next", "next->previous = previous"],
+                   "zero, failed and nested buffer cleanup")
+    for name in ["wki_task_submit_inline", "wki_task_submit_vfs_ref"]:
+        body = multiline_function_body(source, name)
+        require_order(body, "TaskSubmitBuffer large_buf(local_task", "send_task_submit_payload(", "own frame through send/wait")
+        require_tokens(body, ["MSG_LEN > small_buf.size() ? MSG_LEN : 0", "large_buf.data() == nullptr"], "small frame stays on stack and heap failure reports")
+        if "std::unique_ptr<uint8_t[]> large_buf" in body:
+            fail("fatal stack abandonment must not rely on a local unique_ptr")
+    cleanup = function_body(source, "wki_remote_compute_cleanup_for_task")
+    require_order(cleanup, "pending_wki_submit_buffers->cancel()", "s_compute_lock.lock()", "free abandoned frames outside compute lock")
+
+
+def test_publication_reports_checked_allocation_failure() -> None:
+    source = REMOTE_COMPUTE_CPP.read_text()
+    publish = function_body(source, "publish_submitted_task_locked")
+    require_order(publish, "new (std::nothrow) SubmittedTaskSlot{}", "slot->task = std::move(task)", "allocate before consuming unpublished input")
+    require_order(publish, "*error_out = -ENOMEM", "slot->task = std::move(task)", "failed allocation preserves input")
+    require_tokens(publish, ["*error_out = -EINVAL", "s_submitted_task_tail->storage_next = slot", "++s_submitted_task_storage_count"],
+                   "stable checked slot growth")
+    if "std::deque<SubmittedTaskSlot>" in source or "g_submitted_tasks.emplace_back()" in source:
+        fail("submission slot storage must expose allocation failure")
+    for name in ["wki_task_submit_inline", "wki_task_submit_vfs_ref"]:
+        body = multiline_function_body(source, name)
+        begin = body.index("if (published == nullptr)")
+        end = body.index("remember_submitted_ipc_handoff(*published", begin)
+        failure = body[begin:end]
+        require_order(failure, "st.reset_local_task_ref()", "cleanup_submit_ipc()", "release unpublished Task ref before blocking cleanup")
+        require_tokens(failure, ["fail_submit(publication_error)"], "report publication errno")
+
+
 def test_accepted_remote_spawn_commits_ipc_fd_ownership() -> None:
     source = REMOTE_COMPUTE_CPP.read_text()
     body = function_body(source, "wki_try_remote_spawn")
@@ -2520,15 +2717,15 @@ def test_accepted_remote_spawn_commits_ipc_fd_ownership() -> None:
         body,
         [
             "std::array<WkiIpcTaskFdHandoff, 16> ipc_fd_handoff",
-            "wki_ipc_export_task_fds(task, best_node, ipc_fd_map.data(), &ipc_fd_count, ipc_fd_handoff.data())",
-            "wki_ipc_release_task_fd_handoff(ipc_fd_handoff.data(), ipc_fd_count)",
+            "wki_ipc_export_task_fds(task, best_node, ipc_fd_map.data(), &ipc_fd_count, ipc_fd_handoff.data(), &stdio_mask)",
+            "ipc_guard.cancel()",
             "ipc_fd_count, ipc_fd_handoff.data()",
         ],
         "remote IPC fd ownership handoff",
     )
     fallback = body.find("if (vfs_ref_submit_attempted)")
     reexport = body.find("wki_ipc_export_task_fds", fallback)
-    release = body.find("wki_ipc_release_task_fd_handoff", fallback)
+    release = body.find("ipc_guard.cancel()", fallback)
     if fallback < 0 or release < fallback or reexport < release:
         fail("VFS_REF fallback must release old identity pins before re-export")
     failed_start = body.find("if (tid == 0) {")
@@ -2536,12 +2733,7 @@ def test_accepted_remote_spawn_commits_ipc_fd_ownership() -> None:
     if failed_start < 0 or failed_end < 0:
         fail("remote submission failure block is missing")
     failed = body[failed_start:failed_end]
-    require_order(
-        failed,
-        "wki_ipc_cleanup_exported_fds(ipc_fd_map.data(), ipc_fd_count, best_node)",
-        "wki_ipc_release_task_fd_handoff(ipc_fd_handoff.data(), ipc_fd_count)",
-        "failed remote submission cleanup",
-    )
+    require_tokens(failed, ["ipc_guard.cancel()"], "failed remote submission cleanup")
     if "wki_ipc_commit_task_fd_handoff" in body:
         fail("remote spawn must not keep accepted handoff pins on its interruptible caller stack")
 
@@ -2553,18 +2745,18 @@ def test_accepted_remote_spawn_commits_ipc_fd_ownership() -> None:
         require_tokens(
             submit,
             [
-                "remember_submitted_ipc_handoff(st, ipc_fd_handoff, ipc_fd_count)",
-                "publish_submitted_task_locked(std::move(st))",
+                "remember_submitted_ipc_handoff(*published, ipc_fd_handoff, ipc_fd_count)",
+                "publish_submitted_task_locked(std::move(st), &publication_error)",
                 "wki_wait_for_op(&wait",
                 "take_submitted_ipc_handoff_locked(task_ptr)",
                 "wki_ipc_commit_task_fd_handoff(local_task, handoff_cleanup.handoff.data(), handoff_cleanup.count)",
-                "release_submitted_ipc_handoff(handoff_cleanup)",
+                "restore_submitted_ipc_preparation_locked(*task_ptr, ipc_fd_handoff, ipc_fd_count, ipc_guard)",
             ],
             f"durable {mode} IPC fd handoff",
         )
         require_order(
             submit,
-            "remember_submitted_ipc_handoff(st, ipc_fd_handoff, ipc_fd_count)",
+            "remember_submitted_ipc_handoff(*published, ipc_fd_handoff, ipc_fd_count)",
             "wki_wait_for_op(&wait",
             f"{mode} identity pins must move to the submitted row before the interruptible wait",
         )
@@ -2589,6 +2781,30 @@ def test_accepted_remote_spawn_commits_ipc_fd_ownership() -> None:
     )
 
 
+
+def test_service_report_transport_retains_only_reporting_state() -> None:
+    source = REMOTE_COMPUTE_CPP.read_text()
+    spawn = function_body(source, "wki_try_remote_spawn")
+    require_order(spawn, "service_remote_admission(*task)", "wki_ipc_export_task_fds", "finite service policy before FD side effects")
+    require_order(spawn, "wki_peer_capability_negotiated(best_node, WKI_CAP_RESOURCE_LIMITS)", "wki_ipc_export_task_fds", "resource negotiation before exports")
+    for name in ["wki_task_submit_inline", "wki_task_submit_vfs_ref"]:
+        body = multiline_function_body(source, name)
+        require_order(body, "return fail_submit(-ESRCH)", "snapshot_task_resources", "direct API requires policy owner")
+        require_order(body, "return fail_submit(-ENOTSUP)", "snapshot_task_resources", "direct API requires negotiated policy")
+    accept = function_body(source, "handle_task_accept")
+    if "cancel_service_report" in accept:
+        fail("TASK_ACCEPT must retain the report destination")
+    require_tokens(function_body(source, "handle_task_reject"), ["cancel_service_report(false)"], "confirmed rejection ends reporting without false incompleteness")
+    require_tokens(function_body(source, "submitted_task_can_reclaim_locked"), ["!task.service_report_pending"], "report owns row independently of result")
+    report = function_body(source, "handle_task_service_report")
+    require_order(report, "service_contract::decode", "s_compute_lock.lock()", "wire framing before locking")
+    require_tokens(report, ["find_submitted_task_any", "task->target_node == hdr->src_node", "task->submit_channel == rx_channel", "task->submit_channel_generation == rx_channel_generation", "task->service_report.apply", "ServiceReportResult::APPLIED", "reclaim_submitted_task_if_safe_locked"], "session-scoped final report")
+    cancel = function_body(source, "handle_task_cancel")
+    require_order(cancel, "if (rt->root_completion_queued)", "find_task_by_pid_safe", "no PID reuse after root completion")
+    sender = function_body(source, "send_service_reports")
+    require_tokens(sender, ["rt.service_report_inflight", "rt.service_report_sequence", "OBSERVATION.pending_remote_children == 0", "MsgType::TASK_SERVICE_REPORT", "RESULT == WKI_OK", "find_running_task(report.task_id, session)"], "bounded report retry with session revalidation")
+    require_tokens(function_body(source, "wki_remote_compute_selftest_service_report_transport"), ["handle_task_accept", "handle_task_reject", "handle_task_service_report", "fail_submitted_tasks_for_peer", "release_running_root_locked"], "real handler and lifetime regression coverage")
+
 def main() -> None:
     test_peer_cleanup_marks_all_targeted_submits_terminal_failure()
     test_proxy_wait_completion_respects_waitpid_publish_fence()
@@ -2598,6 +2814,7 @@ def main() -> None:
     test_task_exit_retires_remote_compute_wait_owners()
     test_submit_send_failure_keeps_stack_waiter_exit_discoverable()
     test_task_submit_envelopes_use_bounded_stack_storage()
+    test_completion_queue_allocation_and_retry_preserve_ownership()
     test_task_completion_uses_bounded_stack_storage()
     test_proxy_waiting_publication_is_transactional()
     test_remote_load_procfs_uses_locked_snapshot()
@@ -2613,12 +2830,19 @@ def main() -> None:
     test_large_vfs_ref_exec_keeps_a_file_backed_source()
     test_submitted_vfs_policy_is_active_during_elf_construction()
     test_controller_descendants_default_to_local_placement()
+    test_submission_errors_and_ipc_suffix_framing()
+    test_resource_contract_preserves_baseline_and_completion_ownership()
     test_receiver_child_owner_spans_interpreter_output_and_publication()
+    test_resource_rejection_preserves_admission_observations()
     test_receiver_vfs_ref_submit_uses_bounded_worker_pool()
     test_remote_proxy_signals_never_make_the_local_frame_runnable()
     test_submitted_proxy_rows_hold_task_lifetime_until_finalization()
     test_remote_task_exit_wakes_exact_completion_monitor()
     test_accepted_remote_spawn_commits_ipc_fd_ownership()
+    test_publication_reports_checked_allocation_failure()
+    test_submit_wire_buffers_are_cancelled_with_executor()
+    test_receiver_tracking_failure_unwinds_before_scheduler_publication()
+    test_service_report_transport_retains_only_reporting_state()
     print("WKI remote compute source invariants hold")
 
 

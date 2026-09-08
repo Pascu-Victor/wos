@@ -11,6 +11,7 @@
 #include <deque>
 #include <iterator>
 #include <net/wki/remote_compute.hpp>
+#include <new>
 #include <platform/loader/debug_info.hpp>
 #include <platform/loader/elf_loader.hpp>
 #include <platform/loader/gdb_interface.hpp>
@@ -21,6 +22,8 @@
 #include <platform/mm/user_layout.hpp>
 #include <platform/mm/virt.hpp>
 #include <platform/sched/frame_class.hpp>
+#include <platform/sched/resource.hpp>
+#include <platform/sched/resource_as.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sys/context_switch.hpp>
 #include <platform/sys/mutex.hpp>
@@ -608,6 +611,7 @@ auto complete_unpublished_process_construction(Task* task) -> bool {
         .lazy_file_ranges = nullptr,
         .debug_registry_pid = 0,
         .image_role = mm::user_layout::ImageRole::INTERPRETER,
+        .policy_owner = task,
     };
     loader::elf::ElfLoadResult const INTERP_RESULT =
         loader::elf::load_elf(interp_buf, interp_size, task->pagemap, task->pid, "ld.so", INTERP_OPTIONS);
@@ -622,6 +626,7 @@ auto complete_unpublished_process_construction(Task* task) -> bool {
     task->interp_vaddr_start = INTERP_RESULT.image_start;
     task->interp_vaddr_end = INTERP_RESULT.image_end;
     task->pending_interp_path.fill('\0');
+    (void)resource::observe_address_space(*task);
     return true;
 }
 
@@ -968,14 +973,6 @@ Task::Task(const char* name, uint64_t elf_start, size_t elf_size, uint64_t kerne
     this->cpu = cpu::current_cpu();
     this->context.syscall_kernel_stack = kernel_rsp;
 
-    auto fail_process_construction = [&]() {
-        // Leave every acquired resource attached to the now fully constructed
-        // Task. The creator's unpublished-owner path can then tear it down
-        // without guessing which constructor stage succeeded.
-        this->entry = 0;
-        this->context.frame.rip = 0;
-    };
-
     this->pid = sched::task::get_next_pid();
     // POSIX: default process group = own pid (processes start in their own group)
     if (this->pgid == 0) {
@@ -993,30 +990,45 @@ Task::Task(const char* name, uint64_t elf_start, size_t elf_size, uint64_t kerne
         return;
     }
 
+    static_cast<void>(initialize_process_image(reinterpret_cast<const uint8_t*>(elf_start), elf_size));
+}
+
+auto Task::initialize_process_image(const uint8_t* elf_data, size_t elf_size) -> bool {
+    if (type != TaskType::PROCESS || pagemap == nullptr || thread != nullptr || entry != 0 || elf_data == nullptr) {
+        return false;
+    }
+    auto fail_process_construction = [&]() {
+        // Leave every acquired resource attached to the now fully constructed
+        // Task. The creator's unpublished-owner path can then tear it down
+        // without guessing which constructor stage succeeded.
+        this->entry = 0;
+        this->context.frame.rip = 0;
+    };
+
     // Add compiler memory barrier to ensure elfStart is fully visible
     __asm__ volatile("mfence" ::: "memory");
 
-    auto const* elf_data = reinterpret_cast<const uint8_t*>(elf_start);
     ker::loader::elf::TlsModule actual_tls_info{};
     if (!loader::elf::inspect_tls(elf_data, elf_size, actual_tls_info)) {
         dbg::log("ERROR: Invalid bounded ELF source for task %s (size=%zu)", name, elf_size);
         fail_process_construction();
-        return;
+        return false;
     }
 
     this->thread =
-        threading::create_thread(ker::mod::mm::USER_STACK_SIZE, actual_tls_info.tls_size, this->pagemap, this->pid, actual_tls_info);
+        threading::create_thread(ker::mod::mm::USER_STACK_SIZE, actual_tls_info.tls_size, this->pagemap, this->pid, actual_tls_info, this);
     if (this->thread == nullptr) {
         dbg::log("Failed to create thread for task %s - OOM", name);
         // Preserve the pagemap for unpublished-process cleanup.
         this->entry = 0;
-        return;
+        return false;
     }
+    threading::record_stack_usage(*this);
     uint64_t mmap_cursor = 0;
     if (!mm::user_layout::choose_mmap_cursor(mmap_cursor)) {
         dbg::log("Failed to seed mmap placement for task %s", name);
         fail_process_construction();
-        return;
+        return false;
     }
     this->mmap_next.store(mmap_cursor, std::memory_order_relaxed);
 
@@ -1024,17 +1036,18 @@ Task::Task(const char* name, uint64_t elf_start, size_t elf_size, uint64_t kerne
     // This must be in kernel memory, not user memory! The user's gsbase/TLS is separate.
     // After swapgs in syscall entry: GS_BASE will point to this kernel scratch area.
     auto* per_cpu = new cpu::PerCpu();
-    per_cpu->syscall_stack = kernel_rsp;
+    per_cpu->syscall_stack = context.syscall_kernel_stack;
     per_cpu->cpu_id = cpu::current_cpu();
     this->context.syscall_scratch_area = reinterpret_cast<uint64_t>(per_cpu);
 
     this->context.frame.rsp = this->thread->stack;
 
-    loader::elf::ElfLoadResult elf_result = loader::elf::load_elf(elf_data, elf_size, this->pagemap, this->pid, this->name);
+    loader::elf::ElfLoadOptions const LOAD_OPTIONS{.policy_owner = this};
+    loader::elf::ElfLoadResult elf_result = loader::elf::load_elf(elf_data, elf_size, this->pagemap, this->pid, this->name, LOAD_OPTIONS);
     if (elf_result.entry_point == 0) {
         dbg::log("Failed to load ELF for task %s", name);
         fail_process_construction();
-        return;
+        return false;
     }
     this->entry = elf_result.entry_point;
     this->context.frame.rip = elf_result.entry_point;
@@ -1055,7 +1068,7 @@ Task::Task(const char* name, uint64_t elf_start, size_t elf_size, uint64_t kerne
         if (INTERP_LEN >= this->pending_interp_path.size()) {
             dbg::log("Interpreter path is too long for task %s", name);
             fail_process_construction();
-            return;
+            return false;
         }
         std::memcpy(this->pending_interp_path.data(), INTERP_PATH, INTERP_LEN + 1);
     }
@@ -1082,6 +1095,8 @@ Task::Task(const char* name, uint64_t elf_start, size_t elf_size, uint64_t kerne
             dbg::log("Failed to translate SafeStack TLS vaddr %x for PID %x", DEST_VADDR, this->pid);
         }
     }
+    (void)resource::observe_address_space(*this);
+    return true;
 }
 
 auto Task::initialize_process_image(const ker::loader::elf::ElfFileView& elf, const ker::loader::elf::ElfLoadOptions& options) -> bool {
@@ -1094,11 +1109,12 @@ auto Task::initialize_process_image(const ker::loader::elf::ElfFileView& elf, co
         dbg::log("Invalid file-backed ELF for task %s", name);
         return false;
     }
-    thread = threading::create_thread(ker::mod::mm::USER_STACK_SIZE, TLS_INFO.tls_size, pagemap, pid, TLS_INFO);
+    thread = threading::create_thread(ker::mod::mm::USER_STACK_SIZE, TLS_INFO.tls_size, pagemap, pid, TLS_INFO, this);
     if (thread == nullptr) {
         dbg::log("Failed to create thread for task %s - OOM", name);
         return false;
     }
+    threading::record_stack_usage(*this);
     uint64_t mmap_cursor = 0;
     if (!mm::user_layout::choose_mmap_cursor(mmap_cursor)) {
         dbg::log("Failed to seed mmap placement for task %s", name);
@@ -1115,7 +1131,9 @@ auto Task::initialize_process_image(const ker::loader::elf::ElfFileView& elf, co
     context.syscall_scratch_area = reinterpret_cast<uint64_t>(per_cpu);
     context.frame.rsp = thread->stack;
 
-    loader::elf::ElfLoadResult const ELF_RESULT = loader::elf::load_elf(elf, pagemap, pid, name, options);
+    auto load_options = options;
+    load_options.policy_owner = this;
+    loader::elf::ElfLoadResult const ELF_RESULT = loader::elf::load_elf(elf, pagemap, pid, name, load_options);
     if (ELF_RESULT.entry_point == 0) {
         dbg::log("Failed to load file-backed ELF for task %s", name);
         return false;
@@ -1158,6 +1176,7 @@ auto Task::initialize_process_image(const ker::loader::elf::ElfFileView& elf, co
             *dest_ptr = thread->safestack_ptr_value;
         }
     }
+    (void)resource::observe_address_space(*this);
     return true;
 }
 
@@ -1349,6 +1368,11 @@ Task* Task::create_user_thread(Task* parent, uint64_t tcb_vaddr, uint64_t user_s
     t->itimer_real_expire_us = 0;
     t->itimer_real_interval_us = 0;
 
+    if (!resource::bind_thread_owner(*t, *parent)) {
+        destroy_unpublished_user_thread(t);
+        return nullptr;
+    }
+    (void)resource::observe_address_space(*t);
     return t;
 }
 
@@ -1365,7 +1389,11 @@ Task* Task::create_kernel_thread(const char* name, void (*entry_func)()) {
     }
     uint64_t const KERNEL_RSP = stack_base + ker::mod::mm::KERNEL_STACK_SIZE;
 
-    auto* task = new Task(name, 0, 0, KERNEL_RSP, TaskType::DAEMON);
+    auto* task = new (std::nothrow) Task(name, 0, 0, KERNEL_RSP, TaskType::DAEMON);
+    if (task == nullptr) {
+        mm::phys::page_free(reinterpret_cast<void*>(stack_base));
+        return nullptr;
+    }
     task->kthread_entry = entry_func;
     task->context.frame.rip = reinterpret_cast<uint64_t>(wos_kernel_thread_trampoline);
     task->context.regs.rdi = reinterpret_cast<uint64_t>(entry_func);

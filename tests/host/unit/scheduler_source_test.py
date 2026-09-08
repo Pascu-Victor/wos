@@ -35,7 +35,7 @@ def fail(message: str) -> None:
 
 def function_body(source: str, name: str) -> str:
     match = re.search(
-        rf"(?:\[\[[^\]]+\]\]\s+)*(?:inline\s+)?(?:auto|bool|void|Thread\*|uint32_t)\s+{name}\([^)]*\)\s*(?:->\s*[A-Za-z0-9_:<>,\s*&]+)?\s*\{{",
+        rf"(?:\[\[[^\]]+\]\]\s+)*(?:inline\s+)?(?:auto|bool|void|Task\*|Thread\*|uint32_t)\s+{name}\([^)]*\)\s*(?:->\s*[A-Za-z0-9_:<>,\s*&]+)?\s*\{{",
         source,
         flags=re.DOTALL,
     )
@@ -504,6 +504,29 @@ def test_user_thread_tcbs_publish_nonzero_tid_before_user_execution() -> None:
     )
 
 
+def test_cpu_limit_charge_does_not_double_count_syscalls() -> None:
+    source = SCHEDULER_CPP.read_text()
+    charge = function_body(source, "charge_syscall_time_until")
+    require_tokens(charge, ["resource::charge_cpu(task, ELAPSED_US)"], "syscall CPU policy charge")
+    runtime = function_body(source, "account_task_runtime_delta")
+    require_order(runtime, "consume_precharged_syscall_time(task, delta_us)", "resource::charge_cpu(task, UNCHARGED_US, user_us)",
+                  "timer policy charge must subtract already charged syscall time")
+    commit = function_body(source, "commit_handoff_task_at_return_boundary")
+    require_order(commit, "transition_commit_handoff_locked(rq, task)",
+                  "sys::signal::exit_current_on_cpu_limit_user_handoff()",
+                  "CPU hard handoff expiry must follow own-stack ownership commit")
+    require_tokens(commit, ["if (task != outgoing)"], "CPU handoff gate must only use incoming saved context")
+    thread = function_body(TASK_CPP.read_text(), "Task::create_user_thread")
+    require_order(thread, "resource::bind_thread_owner(*t, *parent)", "return t;", "thread must bind policy before publication")
+
+
+def test_idle_picker_prunes_invalid_candidates() -> None:
+    source = SCHEDULER_CPP.read_text()
+    idle = source.split("// ---- Idle path:", 1)[1].split("// ---- Running task path:", 1)[0]
+    require_tokens(idle, ["pick_best_eligible_for_switch_locked(rq, AVG, nullptr)"],
+                   "idle pick must remove invalid candidates with normal transition bookkeeping")
+
+
 def test_default_user_stack_reservation_covers_native_toolchain_links() -> None:
     mm_header = MM_HPP.read_text()
     match = re.search(r"USER_STACK_SIZE\s*=\s*(0x[0-9A-Fa-f]+|\d+)", mm_header)
@@ -518,13 +541,14 @@ def test_default_user_stack_reservation_covers_native_toolchain_links() -> None:
         create_thread_body,
         [
             "thread->stack_phys_ptr = 0;",
-            "ensure_stack_backing(thread, page_table, STACK_TOP - INITIAL_STACK_BYTES, STACK_TOP)",
+            "ensure_stack_backing(thread, page_table, STACK_TOP - INITIAL_STACK_BYTES, STACK_TOP, policy_owner)",
         ],
         "large user stacks must remain lazily backed",
     )
     require_tokens(
         threading_source,
-        ["bool handle_lazy_stack_fault(Thread* thread, mm::paging::PageTable* page_table, uint64_t fault_addr, uint64_t rsp)"],
+        ["bool handle_lazy_stack_fault(Thread* thread, mm::paging::PageTable* page_table, uint64_t fault_addr, uint64_t rsp,",
+         "task::Task* policy_owner)"],
         "large user stacks must retain lazy fault backing",
     )
 
@@ -598,8 +622,38 @@ def test_scheduler_does_not_own_waitpid_repair_engine() -> None:
         fail(f"scheduler must not own waitpid completion/repair state: {', '.join(present)}")
 
 
+def test_only_active_syscalls_can_defer_rescheduling_to_syscall_exit() -> None:
+    body = function_body(CONTEXT_SWITCH_CPP.read_text(), "defer_process_reschedule_to_syscall_exit")
+    require_order(body, "task->syscall_account_start_us == 0", "task->deferred_task_switch = true",
+                  "timer and completed-return callbacks cannot create an unserviceable syscall deferral")
+    require_order(body, "stack_belongs_to_task(task, rsp)", "task->deferred_task_switch = true",
+                  "syscall deferral still requires the current task's stack")
+
+
+def test_process_cpu_observation_preserves_lifetime() -> None:
+    resource = (ROOT / "modules/kern/src/platform/sched/resource.cpp").read_text()
+    snapshot = function_body(resource, "copy_cpu_observation")
+    require_tokens(snapshot, ["subject.resource_owner.get()", "process->resources.cpu_user_time_us", "process->resources.cpu_system_time_us"], "persistent CPU owner")
+    require_order(snapshot, "resource_lock.unlock_irqrestore", "read_reaped_cpu_times", "no nested resource/lifecycle locks")
+    for forbidden in ["find_task_by_pid", "new ", "copy_value_to_task"]:
+        if forbidden in snapshot:
+            fail("CPU snapshot must borrow existing owner without allocation or usercopy")
+    time = (ROOT / "modules/kern/src/syscalls_impl/time/time.cpp").read_text()
+    require_tokens(time, ["copy_cpu_observation(*task, observed)", "process_cpu_times(*task, process_times)", "task_cpu_time_us(*task)"], "process and thread clock scope")
+    if "get_active_task" in time:
+        fail("process clock cannot discard reclaimed-thread CPU history")
+    proc = function_body(PROCFS_CPP.read_text(), "collect_proc_task_stats")
+    require_tokens(proc, ["copy_cpu_observation(task, observed)", "stats.child_user_time_us = observed.child_user_time_us"], "procfs process CPU snapshot")
+    if "candidate->user_time_us" in proc or "candidate->system_time_us" in proc:
+        fail("live registry scan must not supply process lifetime CPU")
+
+
 def main() -> None:
+    test_process_cpu_observation_preserves_lifetime()
     architecture_tests = (
+        test_only_active_syscalls_can_defer_rescheduling_to_syscall_exit,
+        test_cpu_limit_charge_does_not_double_count_syscalls,
+        test_idle_picker_prunes_invalid_candidates,
         test_scheduler_wait_check_arm_halt_is_irq_atomic,
         test_classified_restore_policy_owns_validation_and_return_boundaries,
         test_context_switch_updates_tss_rsp0_to_task_stack,

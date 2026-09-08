@@ -1132,6 +1132,9 @@ if(WOS_BUILD_DISK_IMAGES)
         $<TARGET_FILE:wos>
         $<TARGET_FILE:init>
         $<TARGET_FILE:testprog>
+        $<TARGET_FILE:resource_exec_probe>
+        $<TARGET_FILE:resource_core_probe>
+        $<TARGET_FILE:resource_stack_probe>
         $<TARGET_FILE:testd>
         $<TARGET_FILE:netd>
         $<TARGET_FILE:httpd>

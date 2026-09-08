@@ -364,6 +364,7 @@ void vfs_cache_notify_acknowledge_file(File* file);
 #ifdef WOS_SELFTEST
 auto vfs_selftest_fd_install_failure_closes_file() -> bool;
 auto vfs_selftest_dup2_replace_preserves_newfd_on_failure() -> bool;
+auto vfs_selftest_create_pipe(ker::mod::sched::task::Task& task, int* descriptors) -> int;
 auto vfs_selftest_pipe_failure_unwinds() -> bool;
 auto vfs_selftest_pipe_flags() -> bool;
 auto vfs_selftest_anonymous_fstat_snapshot_hits() -> bool;

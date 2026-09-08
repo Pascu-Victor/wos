@@ -88,6 +88,22 @@ enum class EnablementKind : uint8_t {
     PATH_MISSING,
 };
 
+constexpr size_t SERVICE_RESOURCE_COUNT = 7;
+// Matches the supported kernel resource IDs, in the status display order.
+constexpr std::array<uint32_t, SERVICE_RESOURCE_COUNT> SERVICE_RESOURCE_IDS{0, 1, 3, 4, 6, 7, 9};
+constexpr std::array<std::string_view, SERVICE_RESOURCE_COUNT> SERVICE_RESOURCE_NAMES{"cpu",   "fsize",  "stack", "core",
+                                                                                      "nproc", "nofile", "as"};
+struct ServiceResourceLimit {
+    uint64_t soft{UINT64_MAX};
+    uint64_t hard{UINT64_MAX};
+};
+
+constexpr auto default_service_resource_limits() -> std::array<ServiceResourceLimit, SERVICE_RESOURCE_COUNT> {
+    std::array<ServiceResourceLimit, SERVICE_RESOURCE_COUNT> limits{};
+    limits.at(5) = {256, 256};
+    return limits;
+}
+
 struct ServiceSpec {
     FixedString<MAX_SERVICE_NAME_BYTES> name{};
     FixedString<MAX_PATH_BYTES> executable{};
@@ -96,6 +112,7 @@ struct ServiceSpec {
     std::array<FixedString<MAX_SERVICE_NAME_BYTES>, MAX_DEPENDENCIES> dependency_names{};
     FixedString<MAX_INTERFACE_NAME_BYTES> readiness_interface{};
     FixedString<MAX_PATH_BYTES> enablement_path{};
+    std::array<ServiceResourceLimit, SERVICE_RESOURCE_COUNT> resource_limits{default_service_resource_limits()};
 
     uint8_t argument_count{};
     uint8_t environment_count{};

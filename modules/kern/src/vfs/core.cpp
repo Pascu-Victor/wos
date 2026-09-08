@@ -40,6 +40,7 @@
 #include <vfs/mount.hpp>
 #include <vfs/stat.hpp>
 
+#include "fd_reservation.hpp"
 #include "file.hpp"
 #include "fs/devfs.hpp"
 #include "fs/fat32.hpp"
@@ -3134,6 +3135,7 @@ auto vfs_take_fd_locked(ker::mod::sched::task::Task* task, int fd) -> File* {
     }
 
     task->fd_table.remove(static_cast<uint64_t>(fd));
+    fd_usage_changed_locked(*task);
     task->clear_fd_cloexec(static_cast<unsigned>(fd));
     return file;
 }
@@ -3143,7 +3145,7 @@ auto vfs_find_free_fd_below_limit_locked(ker::mod::sched::task::Task* task, uint
         return UINT64_MAX;
     }
 
-    return task->fd_table.find_first_unset_below(start, ker::mod::sched::task::Task::FD_TABLE_SIZE);
+    return task->fd_table.find_first_unset_below(start, fd_limit_locked(*task));
 }
 
 auto clamp_io_count(ssize_t result, size_t requested) -> ssize_t {
@@ -7668,6 +7670,11 @@ auto vfs_open_resolved_for_task(ker::mod::sched::task::Task* task, const char* r
         return -ESRCH;
     }
 
+    FdReservation descriptor(task);
+    if (descriptor.result() < 0) {
+        return descriptor.result();
+    }
+
     size_t path_buffer_len = known_path_buffer_len != UNKNOWN_PATH_LEN ? known_path_buffer_len : std::strlen(path_buffer.data());
     uint64_t path_buffer_hash = (known_path_buffer_hash != UNKNOWN_PATH_HASH && known_path_buffer_len != UNKNOWN_PATH_LEN)
                                     ? known_path_buffer_hash
@@ -7716,7 +7723,10 @@ auto vfs_open_resolved_for_task(ker::mod::sched::task::Task* task, const char* r
                 vfs_put_file(fd_link_file);
                 return -ENOTDIR;
             }
-            int const FD = vfs_install_open_file(task, fd_link_file);
+            int const FD = descriptor.install(fd_link_file, (flags & ker::vfs::O_CLOEXEC) != 0);
+            if (FD < 0) {
+                vfs_put_file(fd_link_file);
+            }
             if (FD < 0) {
                 return FD;
             }
@@ -7952,7 +7962,10 @@ auto vfs_open_resolved_for_task(ker::mod::sched::task::Task* task, const char* r
     metadata_cache_store_opened_file_stat_or_hints(f, mount);
     namespace_publication_guard.unlock();
 
-    int const FD = vfs_install_open_file(task, f);
+    int const FD = descriptor.install(f, (flags & ker::vfs::O_CLOEXEC) != 0);
+    if (FD < 0) {
+        vfs_put_file(f);
+    }
     if (FD < 0) {
         return FD;
     }
@@ -8589,6 +8602,10 @@ auto vfs_alloc_fd(ker::mod::sched::task::Task* task, struct File* file) -> int {
     if (INSERTED) {
         table_task->clear_fd_cloexec(static_cast<unsigned>(SLOT));
     }
+    if (!INSERTED) {
+        fd_limit_denied_locked(*table_task);
+    }
+    fd_usage_changed_locked(*table_task);
     size_t const FD_COUNT = table_task->fd_table.size();
     table_task->fd_table_lock.unlock_irqrestore(IRQF);
 
@@ -8667,6 +8684,7 @@ auto vfs_release_fd(ker::mod::sched::task::Task* task, int fd) -> int {
 
     uint64_t const IRQF = table_task->fd_table_lock.lock_irqsave();
     table_task->fd_table.remove(static_cast<uint64_t>(fd));
+    fd_usage_changed_locked(*table_task);
     table_task->clear_fd_cloexec(static_cast<unsigned>(fd));
     size_t const FD_COUNT = table_task->fd_table.size();
     table_task->fd_table_lock.unlock_irqrestore(IRQF);
@@ -13048,7 +13066,19 @@ auto vfs_dup2(int oldfd, int newfd, int flags) -> int {
     }
 
     uint64_t const IRQF = table_task->fd_table_lock.lock_irqsave();
+    if (static_cast<uint64_t>(newfd) >= fd_limit_locked(*table_task)) {
+        fd_limit_denied_locked(*table_task);
+        table_task->fd_table_lock.unlock_irqrestore(IRQF);
+        vfs_put_file(f);
+        return -EBADF;
+    }
+    if (table_task->fd_table.reserved(static_cast<uint64_t>(newfd))) {
+        table_task->fd_table_lock.unlock_irqrestore(IRQF);
+        vfs_put_file(f);
+        return -EBUSY;
+    }
     VfsDup2ReplaceResult const REPLACE = vfs_replace_fd_for_dup2_locked(table_task, newfd, f, (flags & ker::vfs::O_CLOEXEC) != 0);
+    fd_usage_changed_locked(*table_task);
     table_task->fd_table_lock.unlock_irqrestore(IRQF);
 
     if (!REPLACE.inserted) {
@@ -15631,11 +15661,21 @@ auto vfs_fcntl(int fd, int cmd, uint64_t arg, VfsFlockAbi* flock) -> int {
             }
 
             uint64_t const IRQF = table_task->fd_table_lock.lock_irqsave();
+            if (arg >= fd_limit_locked(*table_task)) {
+                fd_limit_denied_locked(*table_task);
+                table_task->fd_table_lock.unlock_irqrestore(IRQF);
+                vfs_put_file(f);
+                return -EINVAL;
+            }
             uint64_t const SLOT = vfs_find_free_fd_below_limit_locked(table_task, arg);
             bool const INSERTED = SLOT != UINT64_MAX && table_task->fd_table.insert(SLOT, f);
             if (INSERTED) {
                 table_task->clear_fd_cloexec(static_cast<unsigned>(SLOT));
             }
+            if (!INSERTED) {
+                fd_limit_denied_locked(*table_task);
+            }
+            fd_usage_changed_locked(*table_task);
             table_task->fd_table_lock.unlock_irqrestore(IRQF);
             if (!INSERTED) {
                 vfs_put_file(f);
@@ -15719,11 +15759,21 @@ auto vfs_fcntl(int fd, int cmd, uint64_t arg, VfsFlockAbi* flock) -> int {
             }
 
             uint64_t const IRQF = table_task->fd_table_lock.lock_irqsave();
+            if (arg >= fd_limit_locked(*table_task)) {
+                fd_limit_denied_locked(*table_task);
+                table_task->fd_table_lock.unlock_irqrestore(IRQF);
+                vfs_put_file(f);
+                return -EINVAL;
+            }
             uint64_t const SLOT = vfs_find_free_fd_below_limit_locked(table_task, arg);
             bool const INSERTED = SLOT != UINT64_MAX && table_task->fd_table.insert(SLOT, f);
             if (INSERTED) {
                 table_task->set_fd_cloexec(static_cast<unsigned>(SLOT));
             }
+            if (!INSERTED) {
+                fd_limit_denied_locked(*table_task);
+            }
+            fd_usage_changed_locked(*table_task);
             table_task->fd_table_lock.unlock_irqrestore(IRQF);
             if (!INSERTED) {
                 vfs_put_file(f);
@@ -16387,6 +16437,15 @@ auto vfs_pipe_for_task(ker::mod::sched::task::Task* task, int pipefd[2],
         return -EINVAL;
     }
 
+    FdReservation read_descriptor(task);
+    if (read_descriptor.result() < 0) {
+        return read_descriptor.result();
+    }
+    FdReservation write_descriptor(task);
+    if (write_descriptor.result() < 0) {
+        return write_descriptor.result();
+    }
+
     // Keep a moderate default capacity so simple producer/consumer pipelines do
     // not bounce through the scheduler every 4 KiB.
 #ifdef WOS_SELFTEST
@@ -16933,42 +16992,21 @@ auto vfs_pipe_for_task(ker::mod::sched::task::Task* task, int pipefd[2],
     ps->write_file = wf;
 
 #ifdef WOS_SELFTEST
-    if (pipe_selftest_should_fail(PipeSelftestFailStage::READ_FD)) {
+    if (pipe_selftest_should_fail(PipeSelftestFailStage::READ_FD) || pipe_selftest_should_fail(PipeSelftestFailStage::WRITE_FD)) {
         delete rf;
         delete wf;
         pipe_destroy_unregistered_state(ps);
         return -EMFILE;
     }
 #endif
-    int const RFD = vfs_alloc_fd(task, rf);
-    if (RFD < 0) {
+    int const RFD = read_descriptor.result();
+    int const WFD = write_descriptor.result();
+    int const INSTALL = read_descriptor.install_pair(write_descriptor, rf, wf, (flags & ker::vfs::O_CLOEXEC) != 0);
+    if (INSTALL < 0) {
         delete rf;
         delete wf;
         pipe_destroy_unregistered_state(ps);
-        return RFD;
-    }
-
-#ifdef WOS_SELFTEST
-    if (pipe_selftest_should_fail(PipeSelftestFailStage::WRITE_FD)) {
-        vfs_release_fd(task, RFD);
-        delete rf;
-        delete wf;
-        pipe_destroy_unregistered_state(ps);
-        return -EMFILE;
-    }
-#endif
-    int const WFD = vfs_alloc_fd(task, wf);
-    if (WFD < 0) {
-        vfs_release_fd(task, RFD);
-        delete rf;
-        delete wf;
-        pipe_destroy_unregistered_state(ps);
-        return WFD;
-    }
-
-    if ((flags & ker::vfs::O_CLOEXEC) != 0) {
-        static_cast<void>(vfs_set_fd_cloexec_for_task(task, RFD, true));
-        static_cast<void>(vfs_set_fd_cloexec_for_task(task, WFD, true));
+        return INSTALL;
     }
 
     pipefd[0] = RFD;
@@ -17287,6 +17325,10 @@ auto pipe_close_fake_task_fd(ker::mod::sched::task::Task& task, int fd) -> bool 
     }
     vfs_put_file(file);
     return true;
+}
+
+auto vfs_selftest_create_pipe(ker::mod::sched::task::Task& task, int* descriptors) -> int {
+    return vfs_pipe_for_task(&task, descriptors, O_NONBLOCK);
 }
 
 auto vfs_selftest_pipe_failure_unwinds() -> bool {

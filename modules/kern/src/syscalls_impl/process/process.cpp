@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstring>
 #include <iterator>
+#include <platform/sched/resource_as.hpp>
 #include <utility>
 
 #include "abi/callnums/process.h"
@@ -27,6 +28,7 @@
 #include "platform/perf/perf_events.hpp"
 #include "platform/power/power.hpp"
 #include "platform/sched/frame_class.hpp"
+#include "platform/sched/resource.hpp"
 #include "platform/sched/scheduler.hpp"
 #include "platform/sched/task.hpp"
 #include "platform/sched/threading.hpp"
@@ -126,6 +128,12 @@ auto clone_fd_table_shared_checked(ker::mod::sched::task::Task* parent, ker::mod
         return false;
     }
 
+    ker::mod::sched::resource::Owner fd_owner(parent);
+    parent = fd_owner.get();
+    if (parent == nullptr) {
+        return false;
+    }
+
     bool ok = true;
     uint64_t const IRQF = parent->fd_table_lock.lock_irqsave();
     parent->fd_table.for_each([&](uint64_t key, void* val) {
@@ -147,6 +155,7 @@ auto clone_fd_table_shared_checked(ker::mod::sched::task::Task* parent, ker::mod
             ok = false;
         }
     });
+    child->fd_cloexec = parent->fd_cloexec;
     parent->fd_table_lock.unlock_irqrestore(IRQF);
     return ok;
 }
@@ -377,6 +386,10 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
         return static_cast<uint64_t>(result);
     };
 
+    sched::resource::ProcessReservation process_reservation(parent, parent->uid);
+    if (process_reservation.result() < 0) {
+        return finish_fork(process_reservation.result());
+    }
     if (!throttle_fork_for_reclaim_pressure(WOS_PERF_CALLSITE())) {
         return finish_fork(-ENOMEM);
     }
@@ -401,6 +414,11 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     if (child == nullptr) {
         mm::phys::page_free(reinterpret_cast<void*>(KERNEL_STACK_BASE));
         return finish_fork(-ENOMEM);
+    }
+    if (!sched::resource::inherit(*child, *parent)) {
+        mm::phys::page_free(reinterpret_cast<void*>(KERNEL_STACK_BASE));
+        delete child;
+        return finish_fork(-ESRCH);
     }
     snapshot_fpu_state_for_fork(parent, child);
 
@@ -558,6 +576,8 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
         return finish_fork(-ENOMEM);
     }
 
+    (void)sched::resource::observe_address_space(*child);
+
     // --- Clone thread metadata ---
     // The child shares the same user-space layout (stack, TLS) via COW.
     // Allocate a Thread struct for the child that mirrors the parent's.
@@ -581,6 +601,7 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
         child_thread->tls_phys_ptr = 0;
         child_thread->stack_phys_ptr = 0;
         child->thread = child_thread;
+        sched::threading::record_stack_usage(*child);
         ker::mod::sys::signal::sync_task_signal_mask_cache(child);
     } else {
         child->thread = nullptr;
@@ -648,8 +669,6 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
         return finish_fork(-ENOMEM);
     }
 
-    child->fd_cloexec = parent->fd_cloexec;
-
     // Establish authoritative process ownership before either scheduler or
     // legacy WKI placement can make the child visible.
     if (!child_events::begin_publication(*parent, *child)) {
@@ -669,7 +688,7 @@ auto wos_proc_fork(ker::mod::cpu::GPRegs& gpr) -> uint64_t {
     }
 
     // --- Enqueue child ---
-    if (!sched::post_task_balanced(child)) {
+    if (!process_reservation.attach(*child) || !sched::post_task_balanced(child)) {
         child_events::abort_publication(*child);
         // Undo FD refcount increments
         release_cloned_fd_table_refs(child);
@@ -1031,6 +1050,10 @@ auto wos_proc_clone_vm(uint64_t args_addr) -> uint64_t {
         return static_cast<uint64_t>(-EFAULT);
     }
 
+    sched::resource::ProcessReservation process_reservation(parent, parent->uid);
+    if (process_reservation.result() < 0) {
+        return static_cast<uint64_t>(process_reservation.result());
+    }
     uint64_t child_fsbase = parent->thread != nullptr ? parent->thread->fsbase : 0;
     if (args.newtls != 0) {
         child_fsbase = args.newtls;
@@ -1049,6 +1072,12 @@ auto wos_proc_clone_vm(uint64_t args_addr) -> uint64_t {
     if (child == nullptr) {
         mm::phys::page_free(reinterpret_cast<void*>(KERNEL_STACK_BASE));
         return static_cast<uint64_t>(-ENOMEM);
+    }
+
+    if (!sched::resource::inherit(*child, *parent)) {
+        mm::phys::page_free(reinterpret_cast<void*>(KERNEL_STACK_BASE));
+        delete child;
+        return static_cast<uint64_t>(-ESRCH);
     }
 
     auto cleanup_child = [&]() {
@@ -1146,6 +1175,7 @@ auto wos_proc_clone_vm(uint64_t args_addr) -> uint64_t {
     }
     parent->shares_user_pagemap.store(true, std::memory_order_release);
     child->shares_user_pagemap.store(true, std::memory_order_release);
+    (void)sched::resource::observe_address_space(*child);
 
     auto* child_thread = new sched::threading::Thread();
     if (child_thread == nullptr) {
@@ -1193,14 +1223,13 @@ auto wos_proc_clone_vm(uint64_t args_addr) -> uint64_t {
         cleanup_child();
         return static_cast<uint64_t>(-ENOMEM);
     }
-    child->fd_cloexec = parent->fd_cloexec;
 
     if (!child_events::begin_publication(*parent, *child)) {
         cleanup_child();
         return static_cast<uint64_t>(-ENOMEM);
     }
 
-    if (!sched::post_task_balanced(child)) {
+    if (!process_reservation.attach(*child) || !sched::post_task_balanced(child)) {
         cleanup_child();
         return static_cast<uint64_t>(-ENOMEM);
     }
@@ -1560,6 +1589,18 @@ auto personality(uint64_t persona) -> uint64_t { return wos_proc_personality(per
 auto process(abi::process::procmgmt_ops op, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6, ker::mod::cpu::GPRegs& gpr)
     -> uint64_t {
     switch (op) {
+        case abi::process::procmgmt_ops::GETRLIMIT:
+            return ker::mod::sched::resource::syscall_limit(a2, a3, a4, false);
+        case abi::process::procmgmt_ops::SETRLIMIT:
+            return ker::mod::sched::resource::syscall_limit(a2, a3, a4, true);
+        case abi::process::procmgmt_ops::RESOURCE_USAGE:
+            return ker::mod::sched::resource::syscall_limit(a2, a3, a4, false, true);
+        case abi::process::procmgmt_ops::SERVICE_RESOURCE_CONFIGURE:
+            return ker::mod::sched::resource::syscall_service_configure(a2);
+        case abi::process::procmgmt_ops::SERVICE_RESOURCE_SELECT:
+            return ker::mod::sched::resource::syscall_service_select(a2);
+        case abi::process::procmgmt_ops::SERVICE_RESOURCE_READ:
+            return ker::mod::sched::resource::syscall_service_read(a2, a3, a4);
         case abi::process::procmgmt_ops::EXIT:
             wos_proc_exit(static_cast<int>(a2));
             __builtin_unreachable();
@@ -1696,7 +1737,8 @@ auto process(abi::process::procmgmt_ops op, uint64_t a2, uint64_t a3, uint64_t a
             auto new_uid = static_cast<uint32_t>(a2);
             if (task->euid == 0) {
                 // Privileged: set all three
-                task->uid = new_uid;
+                int const TRANSFER = ker::mod::sched::resource::change_real_uid(*task, new_uid);
+                if (TRANSFER < 0) return static_cast<uint64_t>(TRANSFER);
                 task->euid = new_uid;
                 task->suid = new_uid;
             } else if (new_uid == task->uid || new_uid == task->suid) {

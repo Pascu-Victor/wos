@@ -25,4 +25,8 @@ void init();
 void try_write_for_task(ker::mod::sched::task::Task* task, const ker::mod::cpu::GPRegs& gpr, const ker::mod::gates::InterruptFrame& frame,
                         uint64_t cr2, uint64_t cr3, uint64_t cpu_id);
 
+#ifdef WOS_SELFTEST
+auto selftest_budget_admission() -> bool;
+#endif
+
 }  // namespace ker::mod::dbg::coredump

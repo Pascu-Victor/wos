@@ -339,13 +339,15 @@ void create_init_tasks(boot::HandoverModules& mod_struct) {
 
     for (uint64_t i = 0; i < mod_struct.count; i++) {
         const auto& module = mod_struct.modules[i];
+        sched::resource::ProcessReservation process_reservation(nullptr, 0);
         uint64_t const TASK_KERNEL_RSP = allocate_kernel_stack_top("init-task-stack");
         auto* new_task = new sched::task::Task(module.name, reinterpret_cast<uint64_t>(module.entry), module.size, TASK_KERNEL_RSP,
                                                sched::task::TaskType::PROCESS);
 
         // The pre-scheduler boot path cannot receive a fatal task handoff, but
         // it must still run the PT_INTERP stage split out of Task construction.
-        if (new_task == nullptr || !sched::task::complete_unpublished_process_construction(new_task) || new_task->thread == nullptr ||
+        if (new_task == nullptr || !process_reservation.attach(*new_task) ||
+            !sched::task::complete_unpublished_process_construction(new_task) || new_task->thread == nullptr ||
             new_task->pagemap == nullptr || new_task->entry == 0) {
             dbg::log("FATAL: Failed to create handover task %s", module.name);
             hcf();

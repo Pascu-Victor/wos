@@ -20,6 +20,7 @@
 #include <platform/mm/paging.hpp>
 #include <platform/mm/phys.hpp>
 #include <platform/mm/virt.hpp>
+#include <platform/sched/resource.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
 #include <vfs/vfs.hpp>
@@ -339,7 +340,8 @@ auto phys_to_hhdm_checked(uint64_t phys_addr) -> void* {
 }
 
 // Snapshot of all data needed to write a coredump, captured at exception time.
-// No heap allocation, no locks. Physical page reads happen via HHDM in the coredump task.
+// No heap allocation. Policy admission uses a bounded resource lock outside
+// page capture; physical page reads happen via HHDM in the coredump task.
 struct CoreDumpRequest {
     ker::mod::cpu::GPRegs gpr;
     ker::mod::gates::InterruptFrame frame;
@@ -409,6 +411,8 @@ struct CoreDumpRequest {
     ker::vfs::File* exec_image_file;  // stolen retained reference for file-backed executable streaming
     uint64_t exec_image_size;
     uint64_t user_rsp;
+    uint64_t output_size = 0;
+    ker::mod::sched::task::Task* resource_owner = nullptr;  // retained after complete-size admission
     std::array<PinnedCoreDumpPage, MAX_PINNED_USER_PAGES> pinned_pages{};
     size_t pinned_page_count = 0;
     uint64_t timestamp;
@@ -421,6 +425,61 @@ struct CoreDumpRequest {
     std::array<char, ker::mod::sched::task::Task::WKI_TARGET_HOSTNAME_MAX> wki_target_hostname{};
     std::array<char, ker::mod::sched::task::Task::WKI_TARGET_HOSTNAME_MAX> wki_submitter_hostname{};
 };
+
+auto planned_output_size(const CoreDumpRequest& req, uint64_t& size) -> bool {
+    using ker::mod::sched::resource::add_extent;
+    size = sizeof(CoreDumpHeader);
+    uint64_t const ELF_SIZE = req.exec_image_file != nullptr ? req.exec_image_size : req.elf_buffer != nullptr ? req.elf_buffer_size : 0;
+    return req.pinned_page_count <= MAX_PINNED_USER_PAGES && req.runtime_image_count <= req.runtime_images.size() &&
+           add_extent(size, req.pinned_page_count, sizeof(CoreDumpSegment)) &&
+           add_extent(size, req.runtime_image_count, sizeof(CoreDumpModule)) &&
+           add_extent(size, req.pinned_page_count, ker::mod::mm::paging::PAGE_SIZE) && add_extent(size, ELF_SIZE, 1);
+}
+
+// Called only from a CPL3 exception path, where no kernel lock is held.
+// A null output pointer performs the cheap pre-capture zero-limit check.
+auto admit_dump(ker::mod::sched::task::Task& task, uint64_t size, bool size_valid, ker::mod::sched::task::Task** retained_owner) -> bool {
+    using namespace ker::mod::sched::resource;
+    constexpr unsigned CORE = static_cast<unsigned>(Id::CORE);
+    constexpr unsigned FSIZE = static_cast<unsigned>(Id::FSIZE);
+    Owner owner(&task);
+    auto* process = owner.get();
+    if (process == nullptr) {
+        return false;
+    }
+    uint64_t const FLAGS = process->resource_lock.lock_irqsave();
+    bool admitted = false;
+    if (!size_valid) {
+        process->resources.deny(CORE, Denial::OVERFLOW);
+    } else {
+        admitted = process->resources.admit_extent(CORE, size) && process->resources.admit_extent(FSIZE, size);
+        if (admitted && retained_owner != nullptr) {
+            admitted = process->try_acquire();
+            if (admitted) {
+                *retained_owner = process;
+                process->resource_deferred_observations.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    }
+    process->resource_lock.unlock_irqrestore(FLAGS);
+    return admitted;
+}
+
+void finish_dump_observation(CoreDumpRequest& req, bool written) {
+    auto* process = req.resource_owner;
+    if (process == nullptr) {
+        return;
+    }
+    if (written) {
+        uint64_t const FLAGS = process->resource_lock.lock_irqsave();
+        process->resources.commit_extent(static_cast<unsigned>(ker::abi::resource::Id::CORE), req.output_size);
+        process->resources.commit_extent(static_cast<unsigned>(ker::abi::resource::Id::FSIZE), req.output_size);
+        process->resource_lock.unlock_irqrestore(FLAGS);
+    }
+    req.resource_owner = nullptr;
+    process->resource_deferred_observations.fetch_sub(1, std::memory_order_release);
+    process->release();
+}
 
 auto page_level_shift(int level) -> uint64_t {
     return static_cast<uint64_t>(ker::mod::mm::paging::PAGE_SHIFT) + (9ULL * static_cast<uint64_t>(level - 1));
@@ -599,7 +658,7 @@ std::atomic<uint32_t> g_write_seq{0};
 uint32_t g_consume_cursor{0};  // only touched by coredump task
 ker::mod::sched::task::Task* g_coredump_task{nullptr};
 
-void perform_coredump(const CoreDumpRequest& req);
+auto perform_coredump(const CoreDumpRequest& req) -> bool;
 
 [[noreturn]] void coredump_task_fn() {
     while (true) {
@@ -618,7 +677,8 @@ void perform_coredump(const CoreDumpRequest& req);
             // but this makes the invariant explicit and handles any edge cases.)
             ker::mod::mm::virt::switch_to_kernel_pagemap();
 
-            perform_coredump(req);
+            bool const WRITTEN = perform_coredump(req);
+            finish_dump_observation(req, WRITTEN);
             release_pinned_user_pages(req);
 
             // The exception path transferred exclusive ownership of a private
@@ -659,7 +719,11 @@ void perform_coredump(const CoreDumpRequest& req);
     }
 }
 
-void perform_coredump(const CoreDumpRequest& req) {
+auto perform_coredump(const CoreDumpRequest& req) -> bool {
+    uint64_t planned_size = 0;
+    if (!planned_output_size(req, planned_size) || planned_size != req.output_size) {
+        return false;
+    }
     std::array<char, 48> prog{};
     sanitize_name(req.name.data(), prog.data(), prog.size());
 
@@ -685,7 +749,7 @@ void perform_coredump(const CoreDumpRequest& req) {
     int const FD = ker::vfs::vfs_open(path.data(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
     if (FD < 0) {
         log::error("failed to open %s", path.data());
-        return;
+        return false;
     }
 
     constexpr uint64_t PAGE = ker::mod::mm::paging::PAGE_SIZE;
@@ -887,7 +951,9 @@ void perform_coredump(const CoreDumpRequest& req) {
         log::info("wrote %s", path.data());
     } else {
         log::error("failed while writing %s", path.data());
+        static_cast<void>(ker::vfs::vfs_unlink(path.data()));
     }
+    return ok;
 }
 
 }  // namespace
@@ -905,6 +971,10 @@ void init() {
 void try_write_for_task(ker::mod::sched::task::Task* task, const ker::mod::cpu::GPRegs& gpr, const ker::mod::gates::InterruptFrame& frame,
                         uint64_t cr2, uint64_t cr3, uint64_t cpu_id) {
     if (task == nullptr || g_coredump_task == nullptr || task->dumpable == 0) {
+        return;
+    }
+
+    if (!admit_dump(*task, 1, true, nullptr)) {
         return;
     }
 
@@ -1072,6 +1142,22 @@ void try_write_for_task(ker::mod::sched::task::Task* task, const ker::mod::cpu::
     pin_user_page_for_coredump(req, task->pagemap, cr2, SegmentType::FAULT_PAGE);
     pin_stack_window_for_coredump(req, task->pagemap, frame.rsp);
     pin_user_page_for_coredump(req, task->pagemap, gpr.rbp, SegmentType::STACK_PAGE);
+    req.resource_owner = nullptr;
+    uint64_t output_size = 0;
+    bool const SIZE_VALID = planned_output_size(req, output_size);
+    if (!admit_dump(*task, output_size, SIZE_VALID, &req.resource_owner)) {
+        release_pinned_user_pages(req);
+        // These references still belong to Task: nothing has been stolen yet.
+        req.elf_buffer = nullptr;
+        req.elf_buffer_size = 0;
+        req.exec_image_file = nullptr;
+        req.exec_image_size = 0;
+        req.task_ptr = nullptr;
+        task->release();
+        slot->state.store(CoreDumpSlotState::EMPTY, std::memory_order_release);
+        return;
+    }
+    req.output_size = output_size;
     task->elf_buffer = nullptr;
     task->elf_buffer_size = 0;
     task->is_elf_buffer_shared = false;
@@ -1083,5 +1169,44 @@ void try_write_for_task(ker::mod::sched::task::Task* task, const ker::mod::cpu::
     slot->state.store(CoreDumpSlotState::READY, std::memory_order_release);
     ker::mod::sched::kern_wake(g_coredump_task);
 }
+
+#ifdef WOS_SELFTEST
+auto selftest_budget_admission() -> bool {
+    using namespace ker::mod::sched::resource;
+    constexpr unsigned CORE = static_cast<unsigned>(Id::CORE);
+    constexpr unsigned FSIZE = static_cast<unsigned>(Id::FSIZE);
+    ker::mod::sched::task::Task task{};
+    CoreDumpRequest req{};
+    req.elf_buffer = reinterpret_cast<uint8_t*>(1);
+    req.elf_buffer_size = 123;
+    req.pinned_page_count = 2;
+    req.runtime_image_count = 1;
+    uint64_t size = 0;
+    bool ok = planned_output_size(req, size) && size == sizeof(CoreDumpHeader) + 2 * sizeof(CoreDumpSegment) + sizeof(CoreDumpModule) +
+                                                            2 * ker::mod::mm::paging::PAGE_SIZE + 123;
+    ok = ok && task.resources.set(CORE, {0, INFINITY_VALUE}, true, 256) == 0 && !admit_dump(task, 1, true, nullptr);
+    ok = ok && task.resources.set(CORE, {size - 1, INFINITY_VALUE}, true, 256) == 0 && !admit_dump(task, size, true, &req.resource_owner) &&
+         req.resource_owner == nullptr && task.ref_count.load() == 1 && task.resource_deferred_observations.load() == 0;
+    ok = ok && task.resources.set(CORE, {size, INFINITY_VALUE}, true, 256) == 0 && admit_dump(task, size, true, &req.resource_owner) &&
+         req.resource_owner == &task && task.ref_count.load() == 2 && task.resource_deferred_observations.load() == 1;
+    req.output_size = size;
+    ok = ok && task.resources.set(CORE, {0, INFINITY_VALUE}, true, 256) == 0;
+    finish_dump_observation(req, true);
+    finish_dump_observation(req, true);  // cleared ownership cannot finish twice
+    ok = ok && task.ref_count.load() == 1 && task.resources.entries[CORE].current == size && task.resources.entries[CORE].peak == size &&
+         task.resources.entries[CORE].denied == 2 && task.resource_deferred_observations.load() == 0;
+    ok = ok && task.resources.set(CORE, {INFINITY_VALUE, INFINITY_VALUE}, true, 256) == 0 &&
+         task.resources.set(FSIZE, {size - 1, INFINITY_VALUE}, true, 256) == 0 && !admit_dump(task, size, true, &req.resource_owner) &&
+         req.resource_owner == nullptr;
+    req.elf_buffer_size = UINT64_MAX;
+    ok = ok && !planned_output_size(req, size);
+    ok =
+        ok && task.resources.set(FSIZE, {INFINITY_VALUE, INFINITY_VALUE}, true, 256) == 0 && admit_dump(task, 1, true, &req.resource_owner);
+    uint64_t const PREVIOUS = task.resources.entries[CORE].current;
+    finish_dump_observation(req, false);
+    return ok && task.ref_count.load() == 1 && task.resource_deferred_observations.load() == 0 &&
+           task.resources.entries[CORE].current == PREVIOUS;
+}
+#endif
 
 }  // namespace ker::mod::dbg::coredump

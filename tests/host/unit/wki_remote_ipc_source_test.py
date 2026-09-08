@@ -5,6 +5,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[3]
+REMOTE_COMPUTE_CPP = ROOT / "modules/kern/src/net/wki/remote_compute.cpp"
 REMOTE_IPC_CPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "remote_ipc.cpp"
 REMOTE_IPC_SOCKET_CPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "remote_ipc_socket.cpp"
 REMOTE_IPC_HPP = ROOT / "modules" / "kern" / "src" / "net" / "wki" / "remote_ipc.hpp"
@@ -323,9 +324,9 @@ def test_pipe_fd_open_flags_preserve_nonblocking_access_mode() -> None:
     export_required = [
         "uint16_t const ACCESS_MODE = ipc_fd_access_mode(file->open_flags)",
         "if (res_type == ResourceType::IPC_PIPE && ACCESS_MODE != 0)",
-        "bool const NEEDS_DATA_PUMP = (res_type == ResourceType::IPC_PIPE && ACCESS_MODE == 0) || res_type == ResourceType::IPC_SOCKET",
+        "exp->pump_pending_accept = plan.pump_on_accept[fd_key]",
         "entry.reserved1 = ipc_fd_export_open_flags(file->open_flags)",
-        "setup_export_pipe_rdma(exp, target_node, entry)",
+        "prepare_export_pipe_rdma(*exp, snapshot.prepared_backlogs[count], rdma_transport)",
     ]
     missing = [token for token in export_required if token not in export_body]
     if missing:
@@ -442,7 +443,7 @@ def test_write_only_pipe_proxy_omits_receive_ring() -> None:
         "uint16_t const ACCESS_MODE = ipc_fd_access_mode(OPEN_FLAGS)",
         "proxy->can_receive_data = ipc_proxy_can_receive_data(RES_TYPE, ACCESS_MODE)",
         "if (proxy->can_receive_data)",
-        "new uint8_t[PIPE_RING_CAPACITY]",
+        "new (std::nothrow) uint8_t[PIPE_RING_CAPACITY]",
         "else if (!proxy->can_receive_data)",
         "take_pending_pipe_delivery_locked(entry.home_node, entry.resource_id)",
         "free_pending_pipe_delivery(dropped_pending)",
@@ -450,7 +451,7 @@ def test_write_only_pipe_proxy_omits_receive_ring() -> None:
     missing = [token for token in attach_required if token not in attach_body]
     if missing:
         fail("IPC attach must allocate only usable receive rings and discard unreachable early data: " + ", ".join(missing))
-    require_order(attach_body, "uint16_t const ACCESS_MODE", "auto* proxy = new ProxyIpcState", "IPC proxy access classification")
+    require_order(attach_body, "uint16_t const ACCESS_MODE", "auto* proxy = new (std::nothrow) ProxyIpcState", "IPC proxy access classification")
     require_order(attach_body, "take_pending_pipe_delivery_locked", "free_pending_pipe_delivery(dropped_pending)", "pending data cleanup")
     if "std::fill_n(rb, PIPE_RING_CAPACITY" in attach_body:
         fail("IPC receive rings must not zero free capacity that remains unpublished")
@@ -570,37 +571,194 @@ def test_pty_export_data_can_write_from_deferred_worker_without_backlog() -> Non
     )
 
 
+def test_export_snapshot_pins_and_cloexec_are_safe() -> None:
+    source = REMOTE_IPC_CPP.read_text()
+    start = source.index("explicit IpcFdSnapshot(")
+    end = source.index("~IpcFdSnapshot()", start)
+    ctor = source[start:end]
+    require_order(ctor, "fd_table_lock.lock_irqsave()", "source.get_fd_cloexec(", "snapshot flags under FD lock")
+    require_order(ctor, "refcount.fetch_add(", "fd_table_lock.unlock_irqrestore(", "pin File before unlocking FD table")
+    if "new " in ctor or "ipc_release_file_ref(" in ctor:
+        fail("snapshot capture cannot allocate or release Files while holding FD lock")
+    export = function_body(source, "wki_ipc_export_task_fds")
+    if "task->fd_table.for_each" in export or "IpcFdSnapshot snapshot(*task)" not in export:
+        fail("IPC export must traverse a retained non-CLOEXEC snapshot")
+    handoff = function_body(source, "wki_ipc_commit_task_fd_handoff")
+    require_order(handoff, "fd_usage_changed_locked(*task)", "fd_table_lock.unlock_irqrestore(",
+                  "handoff FD observation remains within the removal transaction")
+    compute = REMOTE_COMPUTE_CPP.read_text()
+    cleanup = function_body(compute, "wki_remote_compute_cleanup_for_task")
+    require_order(cleanup, "wki_ipc_cancel_fd_snapshots(*exiting_task)", "s_compute_lock.lock()",
+                  "fatal snapshot cleanup before compute lock acquisition")
+
+
+def test_export_registry_publication_cannot_allocate() -> None:
+    source = REMOTE_IPC_CPP.read_text()
+    begin = source.index("class IpcRegistry {")
+    end = source.index("IpcExportRegistry g_ipc_exports", begin)
+    registry = source[begin:end]
+    if "new " in registry or "delete " in registry or "std::deque" in registry or "pump_next" in registry:
+        fail("export membership must neither allocate/free nor share the pump retirement link")
+    for token in ["registry_previous", "registry_next", "auto erase(", "auto begin()", "auto end()", "auto size()"]:
+        if token not in registry:
+            fail("intrusive registry contract missing: " + token)
+    if "IpcRegistry<ProxyIpcState> g_ipc_proxies" not in source:
+        fail("proxy publication after FD install cannot allocate registry storage")
+    task = (ROOT / "modules/kern/src/platform/sched/task.cpp").read_text()
+    begin = task.index("Task* Task::create_kernel_thread(")
+    end = task.index("void Task::load_context", begin)
+    worker = task[begin:end]
+    require_order(worker, "new (std::nothrow) Task", "if (task == nullptr)", "check worker allocation")
+    require_order(worker, "mm::phys::page_free(reinterpret_cast<void*>(stack_base))", "task->kthread_entry",
+                  "unwind unowned kernel stack before dereferencing failed worker")
+
+
+def test_submission_guard_covers_preparation_and_failure_transfer() -> None:
+    source = REMOTE_IPC_CPP.read_text()
+    begin = source.index("void WkiIpcSubmissionGuard::cancel()")
+    end = source.index("void wki_ipc_cancel_submission_guards(", begin)
+    cancel = source[begin:end]
+    require_order(cancel, "entry = {}", "ipc_release_file_ref(file)", "clear ownership before reentrant File put")
+    require_order(cancel, "export_cursor++", "wki_ipc_cleanup_exported_fds(&entry, 1, consumer)", "drain one tracked export per cleanup")
+    require_order(cancel, "wki_ipc_cleanup_exported_fds(", "disarm()", "remain linked through blocking cleanup")
+    cleanup = function_body(source, "wki_ipc_cleanup_exported_fds")
+    require_order(cleanup, "free_retired_exports(retired_exports)", "ipc_release_file_ref(file)", "free detached object before last File put")
+    compute = REMOTE_COMPUTE_CPP.read_text()
+    cleanup = function_body(compute, "wki_remote_compute_cleanup_for_task")
+    require_order(cleanup, "wki_ipc_cancel_submission_guards(*exiting_task)", "wki_ipc_cancel_fd_snapshots(*exiting_task)", "cancel publication before dropping snapshot pins")
+    from exec_source_test import function_body as multiline_body
+    placement = multiline_body(compute, "wki_try_remote_spawn")
+    require_order(placement, "WkiIpcSubmissionGuard ipc_guard(", "wki_ipc_export_task_fds(", "track before export publication")
+    for name in ["wki_task_submit_inline", "wki_task_submit_vfs_ref"]:
+        body = multiline_body(compute, name)
+        require_order(body, "WkiIpcSubmissionGuard ipc_guard(", "preparation->disarm()", "adopt before abandoning outer guard")
+        require_order(body, "publish_submitted_task_locked(std::move(st), &publication_error)", "remember_submitted_ipc_handoff(*published", "durable row before pin transfer")
+        require_order(body, "remember_submitted_ipc_handoff(*published", "ipc_guard.disarm()", "row owns pins before guard disarms")
+        if body.count("restore_submitted_ipc_preparation_locked(*task_ptr") != 3:
+            fail("send failure, timeout and rejection must return ownership to tracked guard")
+    restore = function_body(compute, "restore_submitted_ipc_preparation_locked")
+    require_order(restore, "handoff[i] = submitted.ipc_fd_handoff[i]", "submitted.handoff_pin_count = 0", "restore exact pins before emptying row")
+    require_order(restore, "submitted.ipc_fd_count = 0", "guard.arm()", "one owner after restoration")
+
+
+def test_deferred_rdma_write_pins_retirement() -> None:
+    source = REMOTE_IPC_CPP.read_text()
+    predicate = function_body(source, "export_can_retire_locked")
+    if "exp->pipe_write_in_flight" not in predicate:
+        fail("retirement must respect a deferred writer's ring pointer")
+    begin = source.index("[[noreturn]] void export_pipe_write_flush_thread_loop(")
+    end = source.index("[[noreturn]] void export_pipe_write_flush_thread_0()", begin)
+    worker = source[begin:end]
+    require_order(worker, "exp->pipe_write_in_flight = true", "ssize_t const WRITE_RET = export_pipe_write_nonblocking(", "pin before unlocked VFS write")
+    require_order(worker, "ssize_t const WRITE_RET = export_pipe_write_nonblocking(", "finish_export_pipe_write_locked(backlog, WRITE_OWNER, file, &retired)", "release original owner only after VFS returns")
+    finish = function_body(source, "finish_export_pipe_write_locked")
+    require_order(finish, "owner->pipe_write_in_flight = false", "compact_inactive_exports_locked()", "writer completes deferred retirement")
+    require_order(finish, "erase_export_pipe_write_backlog_locked(backlog)", "compact_inactive_exports_locked()", "detach backlog before final retirement")
+
+
+def test_rdma_preparation_is_private_and_revoked_before_free() -> None:
+    source = REMOTE_IPC_CPP.read_text()
+    body = function_body(source, "prepare_export_pipe_rdma")
+    for forbidden in ["g_ipc_exports", "g_export_pipe_write_backlogs", "queue_export_pipe_write_flush_locked", "s_ipc_lock", "wake_"]:
+        if forbidden in body:
+            fail("private RDMA preparation cannot publish or queue: " + forbidden)
+    require_order(body, "exp.pipe_rdma_transport = transport", "transport->rdma_register_region(", "recovery metadata before callback")
+    if "&exp.pipe_rdma_rkey" not in body:
+        fail("registered key must stay in recovery-owned exporter")
+    release = function_body(source, "release_export_pipe_rdma")
+    require_order(release, "rdma_unregister_region(", "delete[] region", "revoke before backing memory free")
+    if "release_export_pipe_rdma(*retired)" not in function_body(source, "free_retired_exports"):
+        fail("committed export retirement must revoke registered memory")
+    export = function_body(source, "wki_ipc_export_task_fds")
+    require_order(export, "prepare_export_pipe_rdma(", "g_ipc_exports.push_back(exp)", "finish preparation before publishing any export")
+    tail = export[export.index("g_ipc_exports.push_back(exp)"):]
+    if "new " in tail or "reserve_capacity(" in tail or "rdma_register_region(" in tail:
+        fail("publication cannot allocate or invoke preparation callbacks")
+    tail = tail[tail.index("s_ipc_lock.unlock_irqrestore(irqf)"):]
+    if "exp->" in tail or "backlog->" in tail:
+        fail("published pointer cannot survive registry unlock")
+    if "IpcRegistry<ExportPipeWriteBacklog> g_export_pipe_write_backlogs" not in source:
+        fail("prepared backlog publication cannot allocate registry storage")
+
+
+def test_export_admission_precedes_side_effects() -> None:
+    source = REMOTE_IPC_CPP.read_text()
+    plan = function_body(source, "plan_ipc_fd_export")
+    for token in ["candidate.count == MAX_SUBMIT_IPC_FDS", "return -ENOTSUP", "fd >= 3", "FSType::DEVFS",
+                  "vfs_is_epoll_file(file)"]:
+        if token not in plan:
+            fail("complete retained FD admission missing: " + token)
+    if "new " in plan or "s_ipc_lock" in plan or "start_pipe_pump" in plan:
+        fail("FD admission must not publish or allocate exports")
+    export = function_body(source, "wki_ipc_export_task_fds")
+    for effect in ["allocate_ipc_resource_id()"]:
+        require_order(export, "if (ADMISSION != 0) return ADMISSION", effect, "all FD admission before side effects")
+    require_order(export, "snapshot.prepare_exports(plan.count)", "s_ipc_lock.lock_irqsave()", "prepare all heap objects before publication")
+    require_order(export, "if (PREPARATION != 0) return PREPARATION", "g_ipc_exports.push_back(exp)", "allocation failure cannot leave registry entries")
+    if "new " in export:
+        fail("export publication must transfer already prepared objects")
+    if "count < MAX_IPC_FDS" in export or "return count > 0" in export:
+        fail("export cannot silently truncate or conflate no IPC with failure")
+    placement = function_body(REMOTE_COMPUTE_CPP.read_text(), "wki_try_remote_spawn")
+    if placement.count('"fd-export-admission"') != 2:
+        fail("both first export and inline retry must preserve admission failure")
+
+
+def test_pumps_activate_only_after_accepted_handoff() -> None:
+    source = REMOTE_IPC_CPP.read_text()
+    export = function_body(source, "wki_ipc_export_task_fds")
+    if "start_pipe_pump(" in export or "enqueue_pipe_pump_locked(" in export:
+        fail("unaccepted export must not consume source input")
+    if "vfs_pipe_reserve_capacity(" in export:
+        fail("submission preparation cannot grow a source pipe")
+    write = function_body(source, "export_pipe_write_nonblocking")
+    require_order(write, "return -EBADF", "vfs_pipe_reserve_capacity(", "invalid writes cannot grow pipe")
+    require_order(write, "if (len == 0)", "vfs_pipe_reserve_capacity(", "zero writes cannot grow pipe")
+    claim = function_body(source, "claim_accepted_pipe_pump_locked")
+    for token in ["find_export_by_resource_id(resource_id)", "exp->consumer_node != consumer_node", "!exp->pump_pending_accept",
+                  "exp->pump_pending_accept = false"]:
+        if token not in claim:
+            fail("accepted activation must be peer-scoped and idempotent: " + token)
+    start = function_body(source, "start_pipe_pump")
+    require_order(start, "s_ipc_lock.lock_irqsave()", "claim_accepted_pipe_pump_locked(", "claim under registry lock")
+    after_creation = start[start.index("task = create_pipe_pump_worker("):]
+    if "exp->" in after_creation:
+        fail("activation cannot dereference an exporter retained across worker creation")
+    require_order(after_creation, "s_ipc_lock.lock_irqsave()", "slot_arg->exp.load(", "resolve current owned slot under lock")
+    from exec_source_test import function_body as multiline_body
+    compute = REMOTE_COMPUTE_CPP.read_text()
+    for name in ["wki_task_submit_inline", "wki_task_submit_vfs_ref"]:
+        body = multiline_body(compute, name)
+        require_order(body, "task_rejection_errno(accept_status)", "wki_ipc_activate_task_fds(", "reject before activation")
+        require_order(body, "handoff_cleanup.count = 0", "wki_ipc_activate_task_fds(", "consume temporary pins before blocking activation")
+        require_order(body, "WkiIpcSubmissionGuard accepted_handoff(", "handoff_cleanup = take_submitted_ipc_handoff_locked(task_ptr)",
+                      "accepted pins remain reachable from fatal cleanup before row ownership transfers")
+
+
+
 def test_attach_fd_install_is_transactional() -> None:
     remote_ipc = REMOTE_IPC_CPP.read_text()
-    install_body = function_body(remote_ipc, "install_ipc_proxy_file")
+    install_body = function_body(remote_ipc, "install_ipc_proxy_files")
     attach_body = function_body(remote_ipc, "wki_ipc_attach_task_fds")
-
-    install_required = [
-        "task->fd_table_lock.lock_irqsave()",
-        "task->fd_table.lookup(fd)",
-        "task->fd_table.insert(fd, proxy_file)",
-        "IpcProxyFdInstallResult{.inserted = INSERTED, .existing = existing}",
-    ]
-    missing = [token for token in install_required if token not in install_body]
-    if missing:
-        fail("IPC attach fd install must be a locked replace operation: " + ", ".join(missing))
-
-    attach_required = [
-        "entry.local_fd >= ker::mod::sched::task::Task::FD_TABLE_SIZE",
-        "IpcProxyFdInstallResult const INSTALL = install_ipc_proxy_file(task, entry.local_fd, proxy_file)",
-        "free_uninstalled_ipc_proxy_file(proxy_file, proxy)",
-        "ker::vfs::vfs_put_file(INSTALL.existing)",
-        "g_ipc_proxies.push_back(proxy)",
-    ]
-    missing = [token for token in attach_required if token not in attach_body]
-    if missing:
-        fail("IPC attach must cleanly handle proxy fd install failure: " + ", ".join(missing))
-    if "task->fd_table.remove(entry.local_fd)" in attach_body:
-        fail("IPC attach must not remove the old fd before the proxy insert succeeds")
-    if "static_cast<void>(task->fd_table.insert(entry.local_fd, proxy_file))" in attach_body:
-        fail("IPC attach must not ignore proxy fd insert failure")
-    require_order(attach_body, "IpcProxyFdInstallResult const INSTALL", "ker::vfs::vfs_put_file(INSTALL.existing)", "attach replacement")
-    require_order(attach_body, "IpcProxyFdInstallResult const INSTALL", "g_ipc_proxies.push_back(proxy)", "attach registration")
+    for token in ["task.fd_table_lock.lock_irqsave()", "task.fd_table.reserved(entry.fd)",
+                  "task.fd_table.insert(entry.fd, entry.file)",
+                  "task.fd_table.insert(imports[j].fd, imports[j].existing)",
+                  "ker::vfs::fd_usage_changed_locked(task)"]:
+        if token not in install_body:
+            fail("IPC batch installation or rollback missing: " + token)
+    if "new " in install_body or "vfs_put_file(" in install_body or "s_ipc_lock" in install_body:
+        fail("IPC descriptor commit must not allocate, close files, or nest the IPC lock")
+    for token in ["count > MAX_IMPORTS", "map[j].local_fd == entry.local_fd",
+                  "free_uninstalled_ipc_proxy_file(prepared[i].file, prepared[i].proxy)",
+                  "if (!install_ipc_proxy_files(", "return abandon()",
+                  "ker::vfs::vfs_put_file(prepared[i].existing)", "g_ipc_proxies.push_back(proxy)"]:
+        if token not in attach_body:
+            fail("IPC batch preparation/publication missing: " + token)
+    require_order(attach_body, "map[j].local_fd == entry.local_fd", "new (std::nothrow) ProxyIpcState",
+                  "validate all inherited descriptors before allocation")
+    require_order(attach_body, "install_ipc_proxy_files(", "g_ipc_proxies.push_back(proxy)", "batch before proxy registration")
+    require_order(attach_body, "g_ipc_proxies.push_back(proxy)", "vfs_put_file(prepared[i].existing)",
+                  "publish all proxy ownership before potentially blocking old-file closes")
 
 
 def test_dev_op_response_cookies_fence_stale_waiters() -> None:
@@ -1063,7 +1221,7 @@ def test_remote_exec_fd_handoff_transfers_only_the_pinned_owner() -> None:
     export_body = function_body(remote_ipc, "wki_ipc_export_task_fds")
     for snippet in [
         "file->refcount.fetch_add(1, std::memory_order_acq_rel)",
-        "handoff_out[count] = WkiIpcTaskFdHandoff",
+        "handoff_out[i] = WkiIpcTaskFdHandoff",
     ]:
         if snippet not in export_body:
             fail(f"IPC export must pin exact local fd identity before remote submit: {snippet!r}")
@@ -1134,6 +1292,13 @@ def main() -> None:
     test_pipe_affinity_ignores_write_only_shared_output_endpoints()
     test_write_only_pipe_proxy_omits_receive_ring()
     test_pty_export_data_can_write_from_deferred_worker_without_backlog()
+    test_export_snapshot_pins_and_cloexec_are_safe()
+    test_export_registry_publication_cannot_allocate()
+    test_rdma_preparation_is_private_and_revoked_before_free()
+    test_deferred_rdma_write_pins_retirement()
+    test_submission_guard_covers_preparation_and_failure_transfer()
+    test_export_admission_precedes_side_effects()
+    test_pumps_activate_only_after_accepted_handoff()
     test_attach_fd_install_is_transactional()
     test_dev_op_response_cookies_fence_stale_waiters()
     test_peer_cleanup_drains_deferred_dev_op_work()

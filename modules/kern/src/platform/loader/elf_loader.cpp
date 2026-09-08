@@ -3,6 +3,8 @@
 #include <extern/elf-em.h>
 #include <extern/elf.h>
 
+#include <cerrno>
+
 // #define ELF_DEBUG  // Enable ELF loading debug output
 
 #include <algorithm>
@@ -11,6 +13,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <platform/sched/resource_as.hpp>
 #include <vector>
 
 #include "abi/callnums/vmem.h"
@@ -1315,6 +1318,62 @@ auto loader_owned_ranges_are_available(const ElfFile& elf, ker::mod::mm::virt::P
            (STRING_BYTES == 0 || mod::mm::user_layout::range_is_free(pagemap, DEBUG_STRING_TABLE_VADDR, STRING_BYTES));
 }
 
+auto reserve_image_address_space(const ElfFile& elf, mod::mm::virt::PageTable* pagemap, const ElfLoadOptions& options,
+                                 const DebugMetadataPlan& metadata, bool primary) -> bool {
+    uint64_t bytes = 0;
+    // source_is_valid already proves PT_LOAD byte intervals do not overlap.
+    // Rounded intervals can therefore share only their first/last page. Count
+    // each shared boundary once, without allocating or changing header order.
+    for (Elf64_Half i = 0; i < elf.elf_head.e_phnum; ++i) {
+        uint64_t start = 0;
+        uint64_t end = 0;
+        if (!load_page_range(*program_header_at(elf, i), start, end)) {
+            continue;
+        }
+        bool first_counted = false;
+        bool last_counted = false;
+        uint64_t const LAST = end - mod::mm::virt::PAGE_SIZE;
+        for (Elf64_Half j = 0; j < i; ++j) {
+            uint64_t other_start = 0;
+            uint64_t other_end = 0;
+            if (!load_page_range(*program_header_at(elf, j), other_start, other_end)) {
+                continue;
+            }
+            first_counted = first_counted || (other_start <= start && start < other_end);
+            last_counted = last_counted || (LAST != start && other_start <= LAST && LAST < other_end);
+        }
+        uint64_t const UNIQUE_BYTES =
+            end - start - (static_cast<uint64_t>(first_counted) + static_cast<uint64_t>(last_counted)) * mod::mm::virt::PAGE_SIZE;
+        if (!checked_add(bytes, UNIQUE_BYTES, bytes)) {
+            return false;
+        }
+    }
+    if (primary && elf.elf_head.e_type == ET_EXEC) {
+        uint64_t header_size = 0;
+        if (!checked_page_align_up(sizeof(Elf64_Ehdr) + static_cast<uint64_t>(elf.elf_head.e_phnum) * sizeof(Elf64_Phdr), header_size) ||
+            !checked_add(bytes, header_size, bytes)) {
+            return false;
+        }
+    }
+    if (metadata.install && (!checked_add(bytes, metadata.section_headers_pages * mod::mm::virt::PAGE_SIZE, bytes) ||
+                             !checked_add(bytes, metadata.string_table_pages * mod::mm::virt::PAGE_SIZE, bytes))) {
+        return false;
+    }
+    if (!mod::sched::resource::admit_address_space(options.policy_owner, pagemap, bytes)) {
+        return false;
+    }
+    // Lazy PT_LOAD pages must occupy VA before they have physical backing.
+    // Metadata/header copies are eagerly installed by the same transaction.
+    for (Elf64_Half i = 0; i < elf.elf_head.e_phnum; ++i) {
+        uint64_t start = 0;
+        uint64_t end = 0;
+        if (load_page_range(*program_header_at(elf, i), start, end)) {
+            mod::mm::virt::reserve_page_range(pagemap, start + elf.load_base, (end - start) / mod::mm::virt::PAGE_SIZE);
+        }
+    }
+    return true;
+}
+
 auto runtime_image_extent(const ElfFile& elf, uint64_t& start, uint64_t& end) -> bool {
     LoadImageExtent extent{};
     return load_image_extent(elf, extent) && checked_add(elf.load_base, extent.min_vaddr, start) &&
@@ -1535,6 +1594,10 @@ auto load_elf_impl(ElfFile elf_file, ker::mod::mm::virt::PageTable* pagemap, uin
             mod::dbg::log("ERROR: Fixed ELF-header copy range collides with an existing mapping (pid=%d)", pid);
             return {.entry_point = 0, .program_header_addr = 0, .elf_header_addr = 0};
         }
+    }
+
+    if (!reserve_image_address_space(elf_file, pagemap, options, debug_metadata_plan, IS_PRIMARY_IMAGE)) {
+        return {.error = -ENOMEM};
     }
 
     // The main image owns the PID-scoped debug row. PT_INTERP loads pass

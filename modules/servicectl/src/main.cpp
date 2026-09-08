@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <initializer_list>
 
 namespace {
 
@@ -136,6 +137,50 @@ void print_history(const init_abi::ServiceStatus& service) {
     }
 }
 
+auto print_resource_status(uint32_t slot) -> int {
+    namespace abi = ker::abi::service_resource;
+    abi::Snapshot snapshot{};
+    int64_t const RESULT = ker::process::service_resource_read(slot, &snapshot);
+    if (RESULT < 0) return report_syscall_error("read service resource usage", RESULT);
+    if (snapshot.size != sizeof(snapshot) || snapshot.version != abi::VERSION || snapshot.slot != slot) {
+        std::fprintf(stderr, "servicectl: kernel returned an unsupported resource snapshot\n");
+        return 1;
+    }
+    constexpr const char* NAMES[abi::RESOURCE_COUNT] = {"CPU", "FSIZE", "STACK", "CORE", "NPROC", "NOFILE", "AS"};
+    std::printf("  resources: cpu-us=%llu live-processes=%llu (CPU spans service restarts)\n",
+                static_cast<unsigned long long>(snapshot.cpu_time_us), static_cast<unsigned long long>(snapshot.live_processes));
+    if ((snapshot.flags & abi::ACCOUNTING_INCOMPLETE) != 0)
+        std::printf("  Remote accounting is incomplete; cumulative usage totals are lower bounds.\n");
+    std::printf("  Resource Soft Hard Current Peak Denied Reason\n");
+    for (unsigned i = 0; i < abi::RESOURCE_COUNT; ++i) {
+        auto const& usage = snapshot.usage[i];
+        std::printf("  %s ", NAMES[i]);
+        for (auto const value : {usage.limit.soft, usage.limit.hard}) {
+            if (value == ker::abi::resource::INFINITY_VALUE)
+                std::printf("infinity ");
+            else
+                std::printf("%llu ", static_cast<unsigned long long>(value));
+        }
+        const char* reason = "none";
+        switch (usage.reason) {
+            case ker::abi::resource::Denial::NONE:
+                break;
+            case ker::abi::resource::Denial::SOFT_LIMIT:
+                reason = "soft_limit";
+                break;
+            case ker::abi::resource::Denial::HARD_LIMIT:
+                reason = "hard_limit";
+                break;
+            case ker::abi::resource::Denial::OVERFLOW:
+                reason = "overflow";
+                break;
+        }
+        std::printf("%llu %llu %llu %s\n", static_cast<unsigned long long>(usage.current), static_cast<unsigned long long>(usage.peak),
+                    static_cast<unsigned long long>(usage.denied), reason);
+    }
+    return 0;
+}
+
 auto show_status(const char* requested_service) -> int {
     init_abi::StatusSnapshot status{};
     int64_t const RESULT = ker::process::init_status_read(&status);
@@ -157,6 +202,7 @@ auto show_status(const char* requested_service) -> int {
             print_service(service);
             if (requested_service != nullptr) {
                 print_history(service);
+                if (geteuid() == 0 && print_resource_status(index) != 0) return 1;
             }
             found = true;
         }

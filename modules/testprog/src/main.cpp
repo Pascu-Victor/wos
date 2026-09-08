@@ -41,6 +41,7 @@
 #include "memory_pressure.hpp"
 #include "netbench.hpp"
 #include "perfbench.hpp"
+#include "resource_limits.hpp"
 #include "thread_exit_stress.hpp"
 #include "usercopy_negative.hpp"
 #include "wki_chaos_workload.hpp"
@@ -664,6 +665,10 @@ auto main(int argc, char** argv, char** envp) -> int {
 
     if (command != nullptr && std::strcmp(command, "usercopy-negative") == 0) {
         return run_usercopy_negative();
+    }
+
+    if (command != nullptr && std::strcmp(command, "resource-limits") == 0) {
+        return run_resource_limits(argc - 2, argv + 2);
     }
 
     if (command != nullptr && std::strcmp(command, "xattr-matrix") == 0) {

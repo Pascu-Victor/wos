@@ -120,6 +120,12 @@ alignment, overflow, and ownership validation before page-table mutation.
 | `PROCESS` | `INIT_CONTROL_RECEIVE` | `out` | one fixed 128-byte versioned request | no | destination prefix may be written on fault; the request remains queued | snapshots the oldest request under lock, copies out without the lock, and dequeues only after complete copyout |
 | `PROCESS` | `INIT_STATUS_PUBLISH` | `in` | one fixed 4160-byte versioned snapshot with at most 16 services and four transitions per service | no | none | copies, validates, and sanitizes the complete snapshot before atomically replacing status under lock |
 | `PROCESS` | `INIT_STATUS_READ` | `out` | one fixed 4160-byte versioned snapshot | no | destination prefix may be written on fault; broker state is unchanged | snapshots complete status under lock, then performs one copyout without the lock |
+| `PROCESS` | `GETRLIMIT` | `out` | one fixed 16-byte limit, ABI version 1 | no | destination prefix may be written on fault; policy is unchanged | snapshots under resource lock and releases owner reference before copyout |
+| `PROCESS` | `SETRLIMIT` | `in` | one fixed 16-byte limit, ABI version 1 | no | none | complete copyin and validation precede atomic policy update |
+| `PROCESS` | `RESOURCE_USAGE` | `out` | one fixed 48-byte usage record, ABI version 1 | no | destination prefix may be written on fault; counters are unchanged | snapshots under resource lock and releases owner reference before copyout |
+| `PROCESS` | `SERVICE_RESOURCE_CONFIGURE` | `in` | one fixed 208-byte version-1 configuration with seven limits | no | none | authenticates PID 1, copies and validates before publishing one previously empty service slot |
+| `PROCESS` | `SERVICE_RESOURCE_SELECT` | `none` | n/a | n/a | none | PID 1 selects the policy for child inheritance; failure clears the previous selection |
+| `PROCESS` | `SERVICE_RESOURCE_READ` | `out` | one fixed 448-byte version-1 snapshot with seven usage rows | no | destination prefix may be written on fault; counters are unchanged | root-only snapshot is assembled under the service/resource locks and copied after releasing them |
 
 Command details: `PR_SET_NAME` consumes exactly 16 bytes into a kernel buffer;
 `PR_GET_NAME` produces exactly 16 bytes. `PR_GET_PDEATHSIG` produces one

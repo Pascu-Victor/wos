@@ -289,7 +289,7 @@ def test_exit_signal_and_ptrace_are_event_producers() -> None:
         exit_body,
         [
             "child_events::prepare_process_exit(*current_task)",
-            "ker::mod::sched::finish_syscall_accounting()",
+            "ker::mod::sched::finalize_current_task_cpu_accounting()",
             "current_task->has_exited = true",
             "current_task->exit_notify_ready.store(true, std::memory_order_release)",
             "child_events::publish_exit(*current_task)",
@@ -297,8 +297,19 @@ def test_exit_signal_and_ptrace_are_event_producers() -> None:
         ],
         "local process exit event publication",
     )
-    require_order(exit_body, "ker::mod::sched::finish_syscall_accounting()", "child_events::publish_exit", "accounting before exit snapshot")
+    require_order(exit_body, "ker::mod::sched::finalize_current_task_cpu_accounting()", "child_events::publish_exit", "accounting before exit snapshot")
     require_order(exit_body, "child_events::publish_exit", "release_exiting_user_address_space", "exit event before heavy cleanup")
+    require_order(exit_body, "close_thread_cpu_admission", "request_thread_group_exit", "close admission before sibling scan")
+    require_order(exit_body, "resource_cpu_threads.load", "TaskState::EXITING", "drain CPU contributions while leader schedulable")
+    if "resource_thread_owners.load" in exit_body:
+        fail("process exit must not wait for thread metadata GC")
+    thread_source = (ROOT / "modules/kern/src/syscalls_impl/multiproc/threadControl.cpp").read_text()
+    thread_exit = function_body(thread_source, "wos_thread_exit_current")
+    require_order(thread_exit, "process_charge.release()", "finalize_current_task_cpu_accounting()", "retire UID charge before final CPU slice")
+    require_order(thread_exit, "finalize_current_task_cpu_accounting()", "resource_owner.finish_cpu()", "freeze CPU before retiring contribution")
+    require_order(thread_exit, "resource_owner.finish_cpu()", "exit_notify_ready.store", "thread accounting before exit readiness")
+
+
     forbid_tokens(exit_source, ["complete_exit_wait", "notify_parent_after_exit_ready", "awaitee_on_exit"], "producer-side wait completion")
 
     signal = SIGNAL_CPP.read_text()

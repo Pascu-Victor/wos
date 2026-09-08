@@ -15,6 +15,7 @@
 #include <platform/mm/paging.hpp>
 #include <platform/mm/phys.hpp>
 #include <platform/mm/virt.hpp>
+#include <platform/sched/resource_as.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
 #include <platform/sched/threading.hpp>
@@ -370,6 +371,7 @@ auto shmat_impl(int shmid, uint64_t shmaddr, int shmflg) -> uint64_t {
     // This sleepable publication mutex must precede g_lock. Page-table
     // construction may reclaim/yield, so g_lock is released before mapping.
     ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;
+    ker::mod::sched::resource::AddressSpaceObservation observation(task);
     uint64_t const FLAGS = g_lock.lock_irqsave();
     auto* segment = find_segment_by_id(shmid);
     if (segment == nullptr || segment->marked_destroy) {
@@ -404,6 +406,11 @@ auto shmat_impl(int shmid, uint64_t shmaddr, int shmflg) -> uint64_t {
         !range_is_free(task, ADDR, SIZE)) {
         abandon_attachment_publication(attachment);
         return to_errno(EINVAL);
+    }
+
+    if (!ker::mod::sched::resource::admit_address_space(task, task->pagemap, SIZE)) {
+        abandon_attachment_publication(attachment);
+        return to_errno(ENOMEM);
     }
 
     uint64_t page_flags = ker::mod::mm::paging::PAGE_PRESENT | ker::mod::mm::paging::PAGE_USER | ker::mod::mm::paging::PAGE_SHARED;
@@ -456,6 +463,7 @@ auto shmdt_impl(uint64_t shmaddr) -> uint64_t {
     }
 
     ker::syscall::vmem::SharedVmemPublicationGuard publication_guard;
+    ker::mod::sched::resource::AddressSpaceObservation observation(task);
     uint64_t const FLAGS = g_lock.lock_irqsave();
     auto* attachment = find_attachment(process_pid_for_task(task), shmaddr);
     if (attachment == nullptr) {

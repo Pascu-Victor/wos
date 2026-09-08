@@ -1,8 +1,10 @@
 #include <extern/elf.h>
 
 #include <array>
+#include <cerrno>
 #include <cstdint>
 #include <cstring>
+#include <platform/sched/task.hpp>
 
 #include "platform/loader/debug_info.hpp"
 #include "platform/loader/elf_loader.hpp"
@@ -515,4 +517,73 @@ KTEST(AddressSpace, FixedExecutableCannotOverlapLoaderOwnedArenas) {
 
     auto debug_collision = make_executable_fixture(ET_EXEC, 0x700000000000ULL);
     KEXPECT_EQ(load_fixture(debug_collision, 0xA51026).entry_point, 0U);
+}
+
+KTEST(AddressSpace, ResourceAdmissionDeduplicatesSharedLoadBoundary) {
+    constexpr uint64_t PID = 0x722001;
+    auto fixture = make_executable_fixture(ET_EXEC, 0x400000);
+    fixture.program_headers.at(0).p_filesz = 0x800;
+    fixture.program_headers.at(0).p_memsz = 0x800;
+    fixture.program_headers.at(2) = fixture.program_headers.at(0);
+    fixture.program_headers.at(2).p_offset = 0x800;
+    fixture.program_headers.at(2).p_vaddr += 0x800;
+    fixture.program_headers.at(2).p_paddr += 0x800;
+    fixture.program_header_count = 3;
+    sync_fixture(fixture);
+    ker::mod::sched::task::Task owner{};
+    constexpr unsigned AS = static_cast<unsigned>(ker::abi::resource::Id::AS);
+    elf::ElfLoadOptions const OPTIONS{.policy_owner = &owner};
+    auto result = load_with_temporary_pagemap(PID, [&](virt::PageTable* root) {
+        KEXPECT_EQ(owner.resources.set(AS, {8191, UINT64_MAX}, true, 256), 0);
+        auto denied = elf::load_elf(fixture.bytes.data(), fixture.bytes.size(), root, PID, "resource-elf-test", OPTIONS);
+        KEXPECT_EQ(denied.entry_point, 0);
+        KEXPECT_EQ(denied.error, -ENOMEM);
+        uint64_t bytes = 0;
+        KEXPECT_TRUE(virt::count_user_virtual_bytes(root, 0, 0x0000800000000000ULL, bytes));
+        KEXPECT_EQ(bytes, 0);
+        KEXPECT_EQ(owner.resources.entries[AS].denied, 1);
+        KEXPECT_EQ(owner.resources.set(AS, {8192, UINT64_MAX}, true, 256), 0);
+        auto accepted = elf::load_elf(fixture.bytes.data(), fixture.bytes.size(), root, PID, "resource-elf-test", OPTIONS);
+        KEXPECT_TRUE(virt::count_user_virtual_bytes(root, 0, 0x0000800000000000ULL, bytes));
+        KEXPECT_EQ(bytes, 8192);
+        return accepted;
+    });
+    KEXPECT_NE(result.entry_point, 0);
+}
+
+KTEST(AddressSpace, LazyElfPagesReserveAddressSpaceBeforeFault) {
+    constexpr uint64_t PID = 0x722002;
+    auto fixture = make_executable_fixture(ET_DYN, 0);
+    fixture.program_headers.at(0).p_filesz = 2 * paging::PAGE_SIZE;
+    fixture.program_headers.at(0).p_memsz = 2 * paging::PAGE_SIZE;
+    sync_fixture(fixture);
+    std::array<uint8_t, 2 * paging::PAGE_SIZE> bytes{};
+    std::memcpy(bytes.data(), fixture.bytes.data(), fixture.bytes.size());
+    ker::mod::sched::task::Task owner{};
+    constexpr unsigned AS = static_cast<unsigned>(ker::abi::resource::Id::AS);
+    elf::ElfLazyLoadRangeVec ranges;
+    elf::ElfLoadOptions const OPTIONS{
+        .register_special_symbols = false,
+        .lazy_file_ranges = &ranges,
+        .image_role = layout::ImageRole::INTERPRETER,
+        .policy_owner = &owner,
+    };
+    auto result = load_with_temporary_pagemap(PID, [&](virt::PageTable* root) {
+        KEXPECT_EQ(owner.resources.set(AS, {8191, UINT64_MAX}, true, 256), 0);
+        auto denied = elf::load_elf(bytes.data(), bytes.size(), root, PID, "resource-lazy-test", OPTIONS);
+        KEXPECT_EQ(denied.entry_point, 0);
+        KEXPECT_EQ(denied.error, -ENOMEM);
+        KEXPECT_TRUE(ranges.empty());
+        KEXPECT_EQ(owner.resources.set(AS, {8192, UINT64_MAX}, true, 256), 0);
+        auto accepted = elf::load_elf(bytes.data(), bytes.size(), root, PID, "resource-lazy-test", OPTIONS);
+        KEXPECT_FALSE(ranges.empty());
+        KEXPECT_TRUE(virt::is_page_reserved(root, accepted.image_start + paging::PAGE_SIZE));
+        KEXPECT_TRUE(virt::is_page_mapped(root, accepted.image_start));
+        KEXPECT_FALSE(virt::is_page_mapped(root, accepted.image_start + paging::PAGE_SIZE));
+        uint64_t mapped_bytes = 0;
+        KEXPECT_TRUE(virt::count_user_virtual_bytes(root, 0, 0x0000800000000000ULL, mapped_bytes));
+        KEXPECT_EQ(mapped_bytes, 8192);
+        return accepted;
+    });
+    KEXPECT_NE(result.entry_point, 0);
 }

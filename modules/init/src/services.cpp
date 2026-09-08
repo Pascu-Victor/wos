@@ -29,6 +29,7 @@
 namespace {
 
 namespace control_abi = ker::abi::init_control;
+namespace resource_abi = ker::abi::service_resource;
 using init_log = wos::journal<"init">;
 using namespace std::string_view_literals;
 using namespace wos::init;
@@ -46,6 +47,14 @@ constexpr uint64_t FAILED_RUNTIME_SHUTDOWN_MS = 2000;
 constexpr uint32_t INIT_WKI_TARGET_FLAGS = ker::process::WKI_TARGET_FLAG_LOCAL | ker::process::WKI_TARGET_FLAG_NOINHERIT;
 constexpr uint32_t SERVICE_WKI_TARGET_FLAGS = ker::process::WKI_TARGET_FLAG_LOCAL;
 constexpr size_t MAX_RUNTIME_ENVIRONMENT = MAX_ENVIRONMENT + 5 + 1;
+static_assert(SERVICE_RESOURCE_COUNT == resource_abi::RESOURCE_COUNT);
+static_assert(MAX_SERVICES == resource_abi::MAX_SERVICES);
+static_assert([] {
+    for (size_t i = 0; i < SERVICE_RESOURCE_COUNT; ++i) {
+        if (SERVICE_RESOURCE_IDS.at(i) != static_cast<uint32_t>(resource_abi::RESOURCE_IDS[i])) return false;
+    }
+    return true;
+}());
 
 enum class ChildFailureStage : int32_t {
     PROCESS_GROUP = 1,
@@ -588,8 +597,18 @@ auto spawn_service(uint8_t service, uint32_t generation, int32_t& failure, bool&
         return false;
     }
 
+    int64_t const RESOURCE_RESULT = ker::process::service_resource_select(service);
+    if (RESOURCE_RESULT < 0) {
+        failure = positive_error(RESOURCE_RESULT);
+        close_fd(exec_pipe.at(PIPE_READ));
+        close_fd(exec_pipe.at(PIPE_WRITE));
+        close_fd(output_pipe.at(PIPE_READ));
+        close_fd(output_pipe.at(PIPE_WRITE));
+        return false;
+    }
     int64_t const TARGET_RESULT = ker::process::setwkitarget(nullptr, 0, SERVICE_WKI_TARGET_FLAGS);
     if (TARGET_RESULT < 0) {
+        fatal = ker::process::service_resource_select(resource_abi::NO_SELECTION) != 0;
         failure = positive_error(TARGET_RESULT);
         close_fd(exec_pipe.at(PIPE_READ));
         close_fd(exec_pipe.at(PIPE_WRITE));
@@ -602,7 +621,8 @@ auto spawn_service(uint8_t service, uint32_t generation, int32_t& failure, bool&
     int64_t const PID = ker::process::fork();
     bool parent_target_restored = true;
     if (PID != 0) {
-        parent_target_restored = restore_init_wki_target();
+        bool const RESOURCE_RESTORED = ker::process::service_resource_select(resource_abi::NO_SELECTION) == 0;
+        parent_target_restored = restore_init_wki_target() && RESOURCE_RESTORED;
     }
 
     if (PID == 0) {
@@ -659,7 +679,7 @@ auto spawn_service(uint8_t service, uint32_t generation, int32_t& failure, bool&
     };
 
     if (!parent_target_restored) {
-        init_log::critical("init supervisor: PID 1 WKI target restoration failed after forking %s; failing closed", spec.name.c_str());
+        init_log::critical("init supervisor: PID 1 spawn policy restoration failed after forking %s; failing closed", spec.name.c_str());
         (void)ker::process::kill(PID, SIGKILL);
         retain_cleanup_child();
         failure = EPERM;
@@ -1318,6 +1338,22 @@ auto start_service_supervisor() -> bool {
     }
 
     for (uint8_t service = 0; service < runtime.manifest.service_count; ++service) {
+        auto const& spec = runtime.manifest.services.at(service);
+        resource_abi::Configuration config{};
+        config.size = sizeof(config);
+        config.version = resource_abi::VERSION;
+        config.slot = service;
+        std::memcpy(config.name, spec.name.c_str(), spec.name.length + 1);
+        for (size_t i = 0; i < SERVICE_RESOURCE_COUNT; ++i) {
+            config.limits[i] = {spec.resource_limits.at(i).soft, spec.resource_limits.at(i).hard};
+        }
+        int64_t const RESULT = ker::process::service_resource_configure(&config);
+        if (RESULT < 0) {
+            runtime.failed = true;
+            init_log::critical("init supervisor: resource policy for %s failed: %lld", spec.name.c_str(), static_cast<long long>(RESULT));
+            publish_status(runtime.now_ms);
+            return false;
+        }
         runtime.enablement.at(service) = resolve_enablement(runtime.manifest.services.at(service));
     }
     SupervisorResult const INITIALIZED =

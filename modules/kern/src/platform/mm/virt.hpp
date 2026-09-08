@@ -244,6 +244,10 @@ auto install_lazy_file_page_if_current(sched::task::Task* task, const sched::tas
 bool ensure_user_page_writable(sched::task::Task* task, vaddr_t vaddr);
 bool ensure_user_page_mapped(sched::task::Task* task, vaddr_t vaddr);
 auto collect_user_memory_stats(PageTable* page_table) -> UserMemoryStats;
+// Logical user VA, including non-present reservations. Caller serializes
+// mapping publication or owns an unpublished root. Bounds must be page aligned.
+// A root teardown collision fails closed without blocking or allocating.
+auto count_user_virtual_bytes(PageTable* page_table, uint64_t start, uint64_t end, uint64_t& bytes) -> bool;
 void get_anonymous_swap_stats_snapshot(AnonymousSwapStatsSnapshot& out);
 void register_anonymous_swap_shrinker();
 void start_anonymous_swap_worker();

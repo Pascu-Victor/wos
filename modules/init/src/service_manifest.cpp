@@ -85,6 +85,33 @@ auto parse_u32(std::string_view value, uint32_t& out) -> bool {
     return true;
 }
 
+auto parse_resource_value(std::string_view value, uint64_t& out) -> bool {
+    if (value == "infinity") {
+        out = UINT64_MAX;
+        return true;
+    }
+    if (value.empty()) return false;
+    uint64_t result = 0;
+    for (char const c : value) {
+        if (c < '0' || c > '9') return false;
+        uint64_t const DIGIT = static_cast<uint64_t>(c - '0');
+        if (result > (UINT64_MAX - DIGIT) / 10) return false;
+        result = result * 10 + DIGIT;
+    }
+    out = result;
+    return true;
+}
+
+auto parse_resource_limit(std::string_view value, ServiceResourceLimit& out) -> bool {
+    size_t const COLON = value.find(':');
+    if (COLON == std::string_view::npos) return false;
+    ServiceResourceLimit result{};
+    if (!parse_resource_value(value.substr(0, COLON), result.soft) || !parse_resource_value(value.substr(COLON + 1), result.hard))
+        return false;
+    out = result;
+    return true;
+}
+
 auto parse_i32(std::string_view value, int32_t& out) -> bool {
     if (value.empty()) {
         return false;
@@ -174,6 +201,20 @@ auto parse_service_field(ServiceSpec& service, uint64_t& fields, std::string_vie
         }
         return true;
     };
+
+    if (key.starts_with("limit-")) {
+        for (size_t index = 0; index < SERVICE_RESOURCE_COUNT; ++index) {
+            if (key.substr(6) != SERVICE_RESOURCE_NAMES.at(index)) continue;
+            if (!scalar(uint64_t{1} << (21 + index))) return false;
+            if (!parse_resource_limit(value, service.resource_limits.at(index))) {
+                error = ManifestParseError::INVALID_VALUE;
+                return false;
+            }
+            return true;
+        }
+        error = ManifestParseError::UNKNOWN_FIELD;
+        return false;
+    }
 
     if (key == "exec") {
         return fixed(service.executable, FIELD_EXEC);
@@ -571,6 +612,12 @@ auto validate_service_manifest(ServiceManifest& manifest, ServiceTopology& topol
         auto& service = manifest.services.at(i);
         service.dependency_mask = 0;
         service.dependent_mask = 0;
+        for (size_t index = 0; index < SERVICE_RESOURCE_COUNT; ++index) {
+            auto const& limit = service.resource_limits.at(index);
+            if (limit.soft > limit.hard || (SERVICE_RESOURCE_IDS.at(index) == 7 && limit.hard > 256)) {
+                return validation_failure(ManifestValidationError::INVALID_RANGE, i);
+            }
+        }
         if (!safe_service_name(service.name.view())) {
             return validation_failure(ManifestValidationError::INVALID_NAME, i);
         }

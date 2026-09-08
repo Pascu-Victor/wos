@@ -26,6 +26,7 @@
 #include <platform/dbg/dbg.hpp>
 #include <platform/mm/mm.hpp>
 #include <platform/perf/perf_events.hpp>
+#include <platform/sched/file_growth.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
 #include <platform/sys/mutex.hpp>
@@ -3871,7 +3872,7 @@ auto remote_vfs_read(ker::vfs::File* f, void* buf, size_t count, size_t offset) 
     return total_read;
 }
 
-auto remote_vfs_write(ker::vfs::File* f, const void* buf, size_t count, size_t offset) -> ssize_t {
+auto remote_vfs_write_impl(ker::vfs::File* f, const void* buf, size_t count, size_t offset) -> ssize_t {
     if (f == nullptr || f->private_data == nullptr || buf == nullptr) {
         return -EINVAL;
     }
@@ -3971,6 +3972,29 @@ auto remote_vfs_write(ker::vfs::File* f, const void* buf, size_t count, size_t o
     }
 
     return total_written;
+}
+
+auto remote_vfs_write(ker::vfs::File* f, const void* buf, size_t count, size_t offset) -> ssize_t {
+    if (f == nullptr || f->private_data == nullptr || (buf == nullptr && count != 0)) {
+        return -EINVAL;
+    }
+    if (f->is_directory) {
+        return -EISDIR;
+    }
+    ker::mod::sched::resource::FileGrowth growth;
+    if (!growth.bound_write(offset, count)) {
+        return -EFBIG;
+    }
+    if (count == 0) {
+        return 0;
+    }
+    ssize_t const RET = remote_vfs_write_impl(f, buf, count, offset);
+    if (RET > 0) {
+        // Includes data accepted into write-behind, whose exact-offset tail
+        // remains owned even if a later flush fails.
+        growth.committed(offset + static_cast<uint64_t>(RET));
+    }
+    return RET;
 }
 
 auto remote_vfs_lseek(ker::vfs::File* f, off_t offset, int whence) -> off_t {
@@ -4178,7 +4202,7 @@ auto remote_vfs_readlink(ker::vfs::File* f, char* buf, size_t bufsize) -> ssize_
 }
 
 // V2: Remote truncate
-auto remote_vfs_truncate(ker::vfs::File* f, off_t length) -> int {
+auto remote_vfs_truncate_impl(ker::vfs::File* f, off_t length) -> int {
     if (f == nullptr || f->private_data == nullptr) {
         return -EBADF;
     }
@@ -4210,6 +4234,21 @@ auto remote_vfs_truncate(ker::vfs::File* f, off_t length) -> int {
     memcpy(req.data() + 4, &len64, sizeof(int64_t));
 
     int const RET = vfs_proxy_send_and_wait(ctx->proxy, OP_VFS_TRUNCATE, req.data(), 12, nullptr, 0);
+    return RET;
+}
+
+auto remote_vfs_truncate(ker::vfs::File* f, off_t length) -> int {
+    if (length < 0) {
+        return -EINVAL;
+    }
+    ker::mod::sched::resource::FileGrowth growth;
+    if (!growth.allow_resize(static_cast<uint64_t>(length))) {
+        return -EFBIG;
+    }
+    int const RET = remote_vfs_truncate_impl(f, length);
+    if (RET == 0) {
+        growth.committed(static_cast<uint64_t>(length));
+    }
     return RET;
 }
 

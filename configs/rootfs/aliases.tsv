@@ -9,6 +9,8 @@ copy	configs/rootfs/etc/nanorc	/etc/nanorc
 copy	configs/rootfs/etc/gitconfig	/etc/gitconfig
 copy	configs/wos-services.conf	/etc/wos-services.conf
 copy	build/modules/testprog/testprog	/usr/bin/testprog
+copy	build/modules/testprog/resource_exec_probe	/usr/libexec/wos-resource-exec-probe
+copy	build/modules/testprog/resource_core_probe	/usr/libexec/wos-resource-core-probe
 copy	build/modules/testd/testd	/usr/bin/testd
 copy	build/modules/perf/perf	/usr/bin/perf
 copy	build/modules/top/top	/usr/bin/top
@@ -121,3 +123,5 @@ symlink	/usr/bin/llvm-addr2line	/usr/bin/addr2line
 copy	build/modules/httpd/httpd	/usr/sbin/httpd
 copy	build/modules/netd/netd	/usr/sbin/netd
 copy	build/modules/journal/journal	/usr/sbin/journald
+
+copy	build/modules/testprog/resource_stack_probe	/usr/libexec/wos-resource-stack-probe

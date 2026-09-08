@@ -151,16 +151,16 @@ def require_sparse_exec_reads(source: str) -> None:
 
 
 def require_callers_use_sparse_reader(source: str) -> None:
-    if source.count("read_exec_image_for_loader(FD, elf_buffer") < 2:
+    if source.count("read_exec_image_for_loader(exec_file, elf_buffer") < 2:
         fail("both exec and execve must read executable images through the sparse reader")
-    if "read_exec_image_for_loader(INTERP_FD, interp_buf" not in source:
+    if "read_exec_image_for_loader(interp_file, interp_buf" not in source:
         fail("PT_INTERP load must use the sparse reader")
     if "INTERP_PATH, false, INTERP_LAZY_FILE_SEGMENTS" not in source:
         fail("PT_INTERP load must not read static-only relocation metadata")
 
     forbidden = [
-        "read_file_fully(FD, elf_buffer",
-        "read_file_fully(INTERP_FD, interp_buf",
+        "read_file_fully(exec_file, elf_buffer",
+        "read_file_fully(interp_file, interp_buf",
         "BYTES_READ != FILE_SIZE",
     ]
     for snippet in forbidden:
@@ -173,12 +173,12 @@ def require_callers_use_sparse_reader(source: str) -> None:
         fail("ELF_READ perf summary must report actual bytes read")
 
     for snippet in [
-        "vfs::File* exec_file = vfs::vfs_get_file_retain(task, FD)",
+        "vfs::File* exec_file = vfs::vfs_open_file(exec_path, 0, 0)",
         "release_exec_file_once",
         "ElfLoadOptions const MAIN_LOAD_OPTIONS",
         ".lazy_file_ranges = EXEC_LAZY_FILE_SEGMENTS ? &main_loader_lazy_ranges : nullptr",
         "append_exec_lazy_file_ranges(new_lazy_ranges, main_loader_lazy_ranges, exec_file, exec_stat)",
-        "vfs::File* interp_file = vfs::vfs_get_file_retain(task, INTERP_FD)",
+        "vfs::File* interp_file = vfs::vfs_open_file(INTERP_PATH, interp_open_flags, 0)",
         "append_exec_lazy_file_ranges(new_lazy_ranges, interp_loader_lazy_ranges, interp_file, interp_stat)",
         "swap_exec_lazy_ranges(task, new_lazy_ranges, old_lazy_ranges)",
         "new_lazy_ranges_published = true",
@@ -366,10 +366,16 @@ def require_bounded_contiguous_loader(loader_source: str) -> None:
         "parse_elf(const uint8_t* base, uint64_t size, ElfFile& elf)",
         "inspect_tls(const uint8_t* data, size_t size, TlsModule& out)",
         "load_elf(interp_buf, interp_size",
-        "reinterpret_cast<uint64_t>(elf_buffer), binary_len, KERNEL_RSP",
+        "new_task->initialize_process_image(elf_buffer, binary_len)",
     ]:
         if snippet not in header + loader_source + task_source + remote_source:
             fail(f"bounded ELF length propagation missing: {snippet}")
+    file_body = function_body(EXEC_CPP.read_text(), "create_file_backed_process_task")
+    ordered = ["claim_unpublished_process(OWNER, new_task)", "new_task->resources = resources",
+               "new_task->uid = real_uid", "reservation.attach(*new_task)", "initialize_process_image(prepared_elf.view"]
+    positions = [file_body.find(token) for token in ordered]
+    if any(position < 0 for position in positions) or positions != sorted(positions):
+        fail("file-backed receiver must own the child and apply policy/population before image initialization")
 
 
 def require_remote_execfn_auxv() -> None:

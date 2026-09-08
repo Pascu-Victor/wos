@@ -8,6 +8,7 @@
 #include <ctime>
 #include <platform/ktime/ktime.hpp>
 #include <platform/rtc/rtc.hpp>
+#include <platform/sched/resource.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
 #include <platform/sys/usercopy.hpp>
@@ -37,32 +38,22 @@ constexpr uint64_t WOS_CLK_TCK = 100;
 // Convert microseconds to clock ticks (CLK_TCK = 100, so 1 tick = 10000 us)
 auto us_to_ticks(uint64_t us) -> uint64_t { return us / (1000000 / WOS_CLK_TCK); }
 
-auto task_cpu_time_ns(ker::mod::sched::task::Task* task) -> uint64_t {
-    if (task == nullptr) {
-        return 0;
-    }
-    return (task->user_time_us + task->system_time_us) * 1000ULL;
+auto cpu_us_to_timespec(uint64_t cpu_us) -> timespec {
+    return timespec{.tv_sec = static_cast<long>(cpu_us / USEC_PER_SEC), .tv_nsec = static_cast<long>((cpu_us % USEC_PER_SEC) * 1000ULL)};
 }
 
-auto process_cpu_time_ns(ker::mod::sched::task::Task* current) -> uint64_t {
-    if (current == nullptr) {
-        return 0;
-    }
+auto task_cpu_time_us(const ker::mod::sched::task::Task& task) -> uint64_t {
+    return ker::mod::sched::resource::saturating_cpu_add(task.user_time_us, task.system_time_us);
+}
 
-    uint64_t const PROCESS_PID = ker::mod::sched::task::process_pid(*current);
-    uint64_t total_ns = 0;
-    uint32_t const TASK_COUNT = ker::mod::sched::get_active_task_count();
-    for (uint32_t i = 0; i < TASK_COUNT; ++i) {
-        auto* task = ker::mod::sched::get_active_task_at_safe(i);
-        if (task == nullptr) {
-            continue;
-        }
-        if (ker::mod::sched::task::same_thread_group(*task, PROCESS_PID)) {
-            total_ns += task_cpu_time_ns(task);
-        }
-        task->release();
-    }
-    return total_ns;
+auto process_cpu_times(ker::mod::sched::task::Task& task, tms& result) -> bool {
+    ker::mod::sched::resource::CpuObservation observed{};
+    if (!ker::mod::sched::resource::copy_cpu_observation(task, observed)) return false;
+    result.tms_utime = static_cast<clock_t>(us_to_ticks(observed.user_time_us));
+    result.tms_stime = static_cast<clock_t>(us_to_ticks(observed.system_time_us));
+    result.tms_cutime = static_cast<clock_t>(us_to_ticks(observed.child_user_time_us));
+    result.tms_cstime = static_cast<clock_t>(us_to_ticks(observed.child_system_time_us));
+    return true;
 }
 
 auto relative_timespec_to_us(const struct timespec& ts, uint64_t& out_us) -> bool {
@@ -144,16 +135,12 @@ auto sys_time_get(uint64_t op, uint64_t arg1, uint64_t arg2) -> uint64_t {
                 ts.tv_sec = static_cast<long>(EPOCH_NS / 1000000000ULL);
                 ts.tv_nsec = static_cast<long>(EPOCH_NS % 1000000000ULL);
             } else if (CLOCK_ID == 2) {
-                uint64_t const CPU_NS = process_cpu_time_ns(task);
-                ts.tv_sec = static_cast<long>(CPU_NS / 1000000000ULL);
-                ts.tv_nsec = static_cast<long>(CPU_NS % 1000000000ULL);
+                ker::mod::sched::resource::CpuObservation observed{};
+                if (!ker::mod::sched::resource::copy_cpu_observation(*task, observed)) return static_cast<uint64_t>(-ESRCH);
+                ts = cpu_us_to_timespec(ker::mod::sched::resource::saturating_cpu_add(observed.user_time_us, observed.system_time_us));
             } else if (CLOCK_ID == 3) {
-                // CLOCK_THREAD_CPUTIME_ID: kernel-tracked on-CPU time for this task.
-                // user_time_us + system_time_us are accumulated by the scheduler's
-                // timer tick handler (process_tasks) each time this task is current.
-                uint64_t const CPU_NS = task_cpu_time_ns(task);
-                ts.tv_sec = static_cast<long>(CPU_NS / 1000000000ULL);
-                ts.tv_nsec = static_cast<long>(CPU_NS % 1000000000ULL);
+                // Thread clock remains this task's own scheduled time.
+                ts = cpu_us_to_timespec(task_cpu_time_us(*task));
             } else {
                 // CLOCK_MONOTONIC (and any other id): TSC nanoseconds since boot
                 uint64_t mono_ns = 0;
@@ -212,10 +199,7 @@ auto sys_time_get(uint64_t op, uint64_t arg1, uint64_t arg2) -> uint64_t {
             }
 
             tms process_times{};
-            process_times.tms_utime = static_cast<clock_t>(us_to_ticks(task->user_time_us));
-            process_times.tms_stime = static_cast<clock_t>(us_to_ticks(task->system_time_us));
-            process_times.tms_cutime = static_cast<clock_t>(us_to_ticks(task->child_user_time_us));
-            process_times.tms_cstime = static_cast<clock_t>(us_to_ticks(task->child_system_time_us));
+            if (!process_cpu_times(*task, process_times)) return static_cast<uint64_t>(-ESRCH);
             auto const ELAPSED = static_cast<clock_t>(us_to_ticks(ker::mod::time::get_us()));
             if ((arg1 != 0 && !ker::mod::sys::usercopy::copy_value_to_task(*task, arg1, process_times)) ||
                 (arg2 != 0 && !ker::mod::sys::usercopy::copy_value_to_task(*task, arg2, ELAPSED))) {
@@ -299,5 +283,35 @@ auto sys_time_get(uint64_t op, uint64_t arg1, uint64_t arg2) -> uint64_t {
             return static_cast<uint64_t>(-1);
     }
 }
+
+#ifdef WOS_SELFTEST
+auto selftest_cpu_observation() -> bool {
+    namespace resource = ker::mod::sched::resource;
+    ker::mod::sched::task::Task process{};
+    process.pid = 0x7B41;
+    process.type = ker::mod::sched::task::TaskType::PROCESS;
+    static_cast<void>(process.resources.charge_cpu(100000, 70000));
+    process.child_user_time_us = 90000;
+    process.child_system_time_us = 110000;
+    ker::mod::sched::task::Task thread{};
+    thread.type = process.type;
+    thread.is_thread = true;
+    thread.owner_pid = process.pid;
+    thread.user_time_us = 11;
+    thread.system_time_us = 13;
+    if (!resource::bind_thread_owner(thread, process)) return false;
+    tms observed{};
+    bool ok = process_cpu_times(thread, observed) && observed.tms_utime == 7 && observed.tms_stime == 3 && observed.tms_cutime == 9 &&
+              observed.tms_cstime == 11 && task_cpu_time_us(thread) == 24;
+    auto const MAXIMUM = cpu_us_to_timespec(UINT64_MAX);
+    ok &= MAXIMUM.tv_sec == static_cast<long>(UINT64_MAX / USEC_PER_SEC) &&
+          MAXIMUM.tv_nsec == static_cast<long>((UINT64_MAX % USEC_PER_SEC) * 1000ULL);
+    auto const ORDINARY = cpu_us_to_timespec(1234567);
+    ok &= ORDINARY.tv_sec == 1 && ORDINARY.tv_nsec == 234567000;
+    thread.user_time_us = UINT64_MAX;
+    ok &= task_cpu_time_us(thread) == UINT64_MAX;
+    return ok;
+}
+#endif
 
 }  // namespace ker::syscall::time

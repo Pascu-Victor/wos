@@ -25,6 +25,7 @@
 #include <platform/mm/swap.hpp>
 #include <platform/mm/virt.hpp>
 #include <platform/perf/perf_events.hpp>
+#include <platform/sched/resource_as.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sched/task.hpp>
 #include <platform/sched/threading.hpp>
@@ -1709,6 +1710,7 @@ auto anon_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags) 
     // metadata, cursor publication, and every rollback in one fork-visible
     // transaction.
     SharedVmemPublicationGuard publication_guard;
+    ker::mod::sched::resource::AddressSpaceObservation observation(task);
 
     // Find a free virtual address range
     uint64_t vaddr = 0;
@@ -1726,7 +1728,13 @@ auto anon_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags) 
             return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EINVAL);
         }
         vaddr = hint;
+        if (!ker::mod::sched::resource::admit_address_space(task, task->pagemap, size, hint, size)) {
+            return static_cast<uint64_t>(-ker::abi::vmem::VMEM_ENOMEM);
+        }
     } else {
+        if (!ker::mod::sched::resource::admit_address_space(task, task->pagemap, size)) {
+            return static_cast<uint64_t>(-ker::abi::vmem::VMEM_ENOMEM);
+        }
         uint64_t const RESERVE_RET = reserve_free_mmap_range_locked(task, size, hint, vaddr);
         if (RESERVE_RET != 0) {
             if (RESERVE_RET == ker::abi::vmem::VMEM_ENOMEM) {
@@ -1875,6 +1883,7 @@ auto anon_free(uint64_t addr, uint64_t size) -> uint64_t {
     // Fork must observe either the complete mapping or the complete removal,
     // including file-range and lazy-range metadata.
     SharedVmemPublicationGuard publication_guard;
+    ker::mod::sched::resource::AddressSpaceObservation observation(task);
     if (overlaps_kernel_managed_user_layout_locked(task, addr, size)) {
         return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EINVAL);
     }
@@ -1949,6 +1958,7 @@ auto file_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags, 
     // Keep reservation, page-table construction, lazy/file metadata, and
     // rollback indivisible with respect to fork's address-space snapshot.
     SharedVmemPublicationGuard publication_guard;
+    ker::mod::sched::resource::AddressSpaceObservation observation(task);
 
     uint64_t vaddr = 0;
     bool const IS_FIXED = ((flags & ker::abi::vmem::MAP_FIXED) != 0) && hint != 0;
@@ -1963,7 +1973,13 @@ auto file_allocate(uint64_t hint, uint64_t size, uint64_t prot, uint64_t flags, 
             return static_cast<uint64_t>(-ker::abi::vmem::VMEM_EINVAL);
         }
         vaddr = hint;
+        if (!ker::mod::sched::resource::admit_address_space(task, task->pagemap, size, hint, size)) {
+            return static_cast<uint64_t>(-ker::abi::vmem::VMEM_ENOMEM);
+        }
     } else {
+        if (!ker::mod::sched::resource::admit_address_space(task, task->pagemap, size)) {
+            return static_cast<uint64_t>(-ker::abi::vmem::VMEM_ENOMEM);
+        }
         uint64_t const RESERVE_RET = reserve_free_mmap_range_locked(task, size, hint, vaddr);
         if (RESERVE_RET != 0) {
             return -RESERVE_RET;
@@ -2429,6 +2445,7 @@ auto anon_mremap(uint64_t old_addr, uint64_t old_size, uint64_t new_size, uint64
 
     auto const FREE_RESULT = anon_free(old_addr, OLD_SIZE);
     if (static_cast<int64_t>(FREE_RESULT) < 0) {
+        (void)anon_free(NEW_ADDR, NEW_SIZE);
         return FREE_RESULT;
     }
     return NEW_ADDR;

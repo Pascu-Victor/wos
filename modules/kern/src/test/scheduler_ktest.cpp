@@ -26,9 +26,12 @@ auto scheduler_selftest_handoff_preserves_runnable_event_token() -> bool;
 auto scheduler_selftest_exception_wait_token_closes_prepark_race() -> bool;
 auto scheduler_selftest_reserved_wake_precedes_handoff_commit() -> bool;
 auto scheduler_selftest_concurrent_reschedule_requests_are_serialized() -> bool;
+auto scheduler_selftest_final_cpu_slice_freezes_accounting() -> bool;
+auto scheduler_selftest_resource_cpu_split_matches_task() -> bool;
 auto scheduler_selftest_runtime_delta_saturates() -> bool;
 auto scheduler_selftest_migration_policy_preserves_hot_process_migration() -> bool;
 auto scheduler_selftest_heap_scan_removal_repairs_stale_index() -> bool;
+auto scheduler_selftest_exited_heap_root_cannot_starve_idle_work() -> bool;
 auto scheduler_selftest_load_balance_nudge_needs_process_backlog() -> bool;
 auto scheduler_selftest_idle_steal_scan_expands_for_large_backlog() -> bool;
 auto scheduler_selftest_effectively_idle_current_accepts_rebalance_probe() -> bool;
@@ -544,4 +547,16 @@ KTEST(Sched, RunHeapOrder) {
         KEXPECT_TRUE(heap.remove(t));
     }
     KEXPECT_EQ(static_cast<int>(heap.size), 0);
+}
+
+KTEST(Sched, ExitedHeapRootCannotStarveIdleWorker) {
+    KEXPECT_TRUE(ker::mod::sched::scheduler_selftest_exited_heap_root_cannot_starve_idle_work());
+}
+
+KTEST(SchedulerRuntime, ResourceCpuSplitMatchesTask) {
+    KEXPECT_TRUE(ker::mod::sched::scheduler_selftest_resource_cpu_split_matches_task());
+}
+
+KTEST(SchedulerRuntime, FinalCpuSliceFreezesAccounting) {
+    KEXPECT_TRUE(ker::mod::sched::scheduler_selftest_final_cpu_slice_freezes_accounting());
 }

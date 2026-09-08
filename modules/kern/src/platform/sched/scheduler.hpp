@@ -437,6 +437,9 @@ auto find_task_by_pid_safe(uint64_t pid) -> task::Task*;  // Find task by PID wi
 // Atomically claim a child's exit status and retire DEAD tasks from the dense
 // active scan index without waiting for heavyweight GC teardown.
 auto task_has_live_pagemap_sibling(task::Task* subject) -> bool;
+// Shared-VM publication is serialized by the caller. Update each publisher's
+// logical AS current/peak without allocating a task snapshot.
+void record_address_space_usage(task::Task* subject, mm::paging::PageTable* root, uint64_t bytes);
 void set_task_nice(task::Task* task, int nice);               // Update task weight safely on its run queue
 auto signal_process_group(uint64_t pgid, int sig) -> size_t;  // Send signal to all live tasks in a process group
 auto signal_controlling_tty(int controlling_tty, int sig) -> size_t;
@@ -522,6 +525,7 @@ auto get_load_average_snapshot() -> LoadAverageSnapshot;
 bool has_run_queues();
 void begin_syscall_accounting();
 void finish_syscall_accounting();
+void finalize_current_task_cpu_accounting();
 [[nodiscard]] auto pause_syscall_accounting() -> bool;
 void resume_syscall_accounting();
 

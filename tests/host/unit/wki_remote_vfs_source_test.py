@@ -2037,7 +2037,17 @@ def test_write_behind_storage_grows_in_allocator_shaped_classes() -> None:
         "remote VFS write-behind temporary growth",
     )
 
-    write_body = function_body(source, "remote_vfs_write")
+    require_order(
+        function_body(source, "remote_vfs_write"),
+        ["FileGrowth growth", "growth.bound_write(offset, count)", "remote_vfs_write_impl(f, buf, count, offset)"],
+        "file-size admission must precede all remote write side effects",
+    )
+    require_order(
+        function_body(source, "remote_vfs_truncate"),
+        ["FileGrowth growth", "growth.allow_resize", "remote_vfs_truncate_impl(f, length)"],
+        "file-size admission must precede remote truncate flushes and mutations",
+    )
+    write_body = function_body(source, "remote_vfs_write_impl")
     require_order(
         write_body,
         [
@@ -2067,8 +2077,8 @@ def test_write_behind_storage_grows_in_allocator_shaped_classes() -> None:
 
     for function_name in [
         "remote_vfs_read",
-        "remote_vfs_write",
-        "remote_vfs_truncate",
+        "remote_vfs_write_impl",
+        "remote_vfs_truncate_impl",
         "remote_vfs_fsync_file",
         "wki_remote_vfs_fstat",
     ]:
@@ -2105,7 +2115,7 @@ def test_write_behind_storage_grows_in_allocator_shaped_classes() -> None:
         "remote VFS read flush-before-operation serialization",
     )
     require_order(
-        function_body(source, "remote_vfs_truncate"),
+        function_body(source, "remote_vfs_truncate_impl"),
         [
             "ker::mod::sys::MutexGuard io_guard(ctx->io_lock)",
             "consume_remote_file_cache_invalidation(ctx)",
@@ -3915,10 +3925,10 @@ def test_remote_vfs_mount_lanes_preserve_channel_and_lifetime_affinity() -> None
     for function_name in [
         "remote_vfs_close",
         "remote_vfs_read",
-        "remote_vfs_write",
+        "remote_vfs_write_impl",
         "remote_vfs_lseek",
         "remote_vfs_readdir",
-        "remote_vfs_truncate",
+        "remote_vfs_truncate_impl",
         "remote_vfs_fsync_file",
     ]:
         body = function_body(source, function_name)
@@ -4225,7 +4235,7 @@ def test_remote_xattr_is_bounded_replay_safe_and_export_confined() -> None:
         [
             "req->op_id == OP_VFS_XATTR",
             "g_wki.capabilities = WKI_CAP_RESOURCE_INCARNATION",
-            "WKI_CAP_VFS_XATTR;",
+            "WKI_CAP_VFS_XATTR | WKI_CAP_RESOURCE_LIMITS;",
         ],
         "remote xattr fixed-pool RX admission and advertisement",
     )

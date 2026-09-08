@@ -349,14 +349,18 @@ auto defer_process_reschedule_to_syscall_exit() -> bool {
     }
 
     auto* task = sched::get_current_task();
-    if (task == nullptr || task->type != sched::task::TaskType::PROCESS || task->deferred_task_switch || task->is_voluntary_blocked() ||
-        task->wants_block) {
+    if (task == nullptr || task->type != sched::task::TaskType::PROCESS || task->syscall_account_start_us == 0 ||
+        task->deferred_task_switch || task->is_voluntary_blocked() || task->wants_block) {
         return false;
     }
 
     // Same-CPU event wakes from syscalls only need to yield at the syscall
-    // return boundary. Avoid arming a one-tick APIC timer while the process is
-    // deep on its syscall stack; daemon hlt/yield paths still use the timer.
+    // return boundary. Accounting must still be active: a process-owned stack
+    // also hosts late return/handoff callbacks after the deferred-switch gate.
+    // Deferring there can strand a USER_RETURN task with a transition flag and
+    // prevent every future timer preemption. Finished/paused syscalls use the
+    // existing timer-poke fallback. Avoid arming that one-tick timer deep in
+    // an active syscall; daemon hlt/yield paths still use the timer.
     uint64_t rsp = 0;
     asm volatile("mov %%rsp, %0" : "=r"(rsp)::"memory");
     if (!stack_belongs_to_task(task, rsp)) {

@@ -11,6 +11,10 @@
 #include <platform/mm/virt.hpp>
 #include <util/smallvec.hpp>
 
+namespace ker::mod::sched::task {
+struct Task;
+}
+
 namespace ker::loader::elf {
 
 // TLS module information
@@ -41,6 +45,7 @@ struct ElfLoadResult {
     static constexpr unsigned INTERP_PATH_MAX = 256;
     char interp_path[INTERP_PATH_MAX] = {};  // NOLINT: c-string ABI consumed by exec/task paths.
     bool has_interp = false;                 // true if PT_INTERP was found
+    int error = 0;                           // Internal negative errno when admission fails.
 };
 
 struct ElfLazyLoadRange {
@@ -61,6 +66,7 @@ struct ElfLoadOptions {
     // synthetic identifier and rekey them only when the new image commits.
     uint64_t debug_registry_pid = 0;
     ker::mod::mm::user_layout::ImageRole image_role = ker::mod::mm::user_layout::ImageRole::MAIN;
+    ker::mod::sched::task::Task* policy_owner = nullptr;
 };
 
 // Exact, positional read used by file-backed ELF views. Implementations must

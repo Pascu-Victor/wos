@@ -76,9 +76,10 @@ def require_address_and_option_snapshots(source: str) -> None:
     accept = case_body(source, "ACCEPT")
     preflight = accept.find("usercopy::ensure_writable")
     effect = accept.find("return sock->proto_ops->accept")
-    install = accept.find("allocate_socket_fd(new_sock)")
+    install = accept.find("allocate_socket_fd(new_sock, descriptor)")
+    reserve = accept.find("ker::vfs::FdReservation descriptor(task)")
     output = accept.find("usercopy::copy_to_task", effect)
-    if min(preflight, effect, output, install) < 0 or not (preflight < effect < output < install):
+    if min(preflight, reserve, effect, output, install) < 0 or not (preflight < reserve < effect < output < install):
         fail("accept must preflight outputs, accept, copy results, then publish the fd")
 
     get_option = case_body(source, "GETSOCKOPT")

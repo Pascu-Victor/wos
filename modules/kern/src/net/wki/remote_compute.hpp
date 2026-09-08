@@ -5,8 +5,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <net/wki/remote_ipc.hpp>
+#include <net/wki/resource_contract.hpp>
+#include <net/wki/service_contract.hpp>
 #include <net/wki/wire.hpp>
 #include <net/wki/wki.hpp>
+#include <optional>
 
 #include "platform/sched/task.hpp"
 
@@ -89,6 +92,16 @@ struct SubmittedTask {
     // task/File pointer across the compute lock.
     uint8_t* pending_proxy_output = nullptr;
     uint16_t pending_proxy_output_len = 0;
+    std::optional<TaskResourceSnapshot> resource_baseline;
+    std::optional<TaskResourceSnapshot> resource_completion;
+    ker::mod::sched::resource::ServiceReportTarget service_report;
+    bool service_report_pending = false;
+    bool submission_started = false;
+
+    void cancel_service_report(bool incomplete = true) {
+        service_report.cancel(incomplete);
+        service_report_pending = false;
+    }
 
     std::array<WkiIpcFdEntry, 16> ipc_fd_map = {};
     uint16_t ipc_fd_count = 0;
@@ -129,10 +142,17 @@ struct SubmittedTask {
           reclaim_requested(o.reclaim_requested),
           pending_proxy_output(o.pending_proxy_output),
           pending_proxy_output_len(o.pending_proxy_output_len),
+          resource_baseline(o.resource_baseline),
+          resource_completion(o.resource_completion),
+          service_report(std::move(o.service_report)),
+          service_report_pending(o.service_report_pending),
+          submission_started(o.submission_started),
           ipc_fd_map(o.ipc_fd_map),
           ipc_fd_count(o.ipc_fd_count),
           ipc_fd_handoff(o.ipc_fd_handoff),
           handoff_pin_count(o.handoff_pin_count) {
+        o.service_report_pending = false;
+        o.submission_started = false;
         o.local_task = nullptr;
         o.pending_proxy_output = nullptr;
         o.pending_proxy_output_len = 0;
@@ -167,6 +187,13 @@ struct SubmittedTask {
             delete[] pending_proxy_output;
             pending_proxy_output = o.pending_proxy_output;
             pending_proxy_output_len = o.pending_proxy_output_len;
+            resource_baseline = o.resource_baseline;
+            resource_completion = o.resource_completion;
+            service_report = std::move(o.service_report);
+            service_report_pending = o.service_report_pending;
+            submission_started = o.submission_started;
+            o.service_report_pending = false;
+            o.submission_started = false;
             o.pending_proxy_output = nullptr;
             o.pending_proxy_output_len = 0;
             ipc_fd_map = o.ipc_fd_map;
@@ -223,6 +250,12 @@ struct RunningRemoteTask {
     bool accept_pending = false;
     bool discard_completion = false;
     bool termination_requested = false;
+    bool resource_contract = false;
+    bool root_completion_queued = false;
+    bool service_report_inflight = false;
+    uint64_t service_report_sequence = 0;
+    uint64_t service_report_attempt_us = 0;
+    ker::mod::sched::resource::RemoteServiceAccounting* service_accounting = nullptr;
     uint32_t task_id = 0;
     uint16_t submitter_node = WKI_NODE_INVALID;
     uint64_t local_pid = 0;
@@ -306,6 +339,8 @@ struct WkiRemoteSpawnSpec {
     const char* const* argv = nullptr;
     const char* const* envp = nullptr;
     const char* cwd = nullptr;
+    // Optional synchronous result: negative errno on FAILED, zero otherwise.
+    int* error_out = nullptr;
 };
 
 struct WkiSharedElfCacheStats {
@@ -323,21 +358,23 @@ struct WkiSharedElfCacheStats {
 void wki_remote_compute_init();
 
 // Submitter side: submit a task with inline binary.
-// Returns task_id on success, 0 on failure.
+// Returns task_id on success, 0 on failure; optional error_out is zero or negative errno.
 auto wki_task_submit_inline(uint16_t target_node, const void* binary, uint32_t binary_len,
                             const char* const argv[],  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
                             const char* const envp[],  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
                             const char* cwd, ker::mod::sched::task::Task* local_task, const WkiIpcFdEntry* ipc_fd_map = nullptr,
-                            uint16_t ipc_fd_count = 0, WkiIpcTaskFdHandoff* ipc_fd_handoff = nullptr) -> uint32_t;
+                            uint16_t ipc_fd_count = 0, WkiIpcTaskFdHandoff* ipc_fd_handoff = nullptr, uint8_t stdio_mask = UINT8_MAX,
+                            int* error_out = nullptr, WkiIpcSubmissionGuard* preparation = nullptr) -> uint32_t;
 
 // Submitter side: submit a task via VFS_REF (path-based delivery).
 // The remote node loads the ELF from its VFS (typically via /wki/<hostname>/... mount).
-// Returns task_id on success, 0 on failure.
+// Returns task_id on success, 0 on failure; optional error_out is zero or negative errno.
 auto wki_task_submit_vfs_ref(uint16_t target_node, const char* vfs_path,
                              const char* const argv[],  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
                              const char* const envp[],  // NOLINT(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
                              const char* cwd, ker::mod::sched::task::Task* local_task, const WkiIpcFdEntry* ipc_fd_map = nullptr,
-                             uint16_t ipc_fd_count = 0, WkiIpcTaskFdHandoff* ipc_fd_handoff = nullptr) -> uint32_t;
+                             uint16_t ipc_fd_count = 0, WkiIpcTaskFdHandoff* ipc_fd_handoff = nullptr, uint8_t stdio_mask = UINT8_MAX,
+                             int* error_out = nullptr, WkiIpcSubmissionGuard* preparation = nullptr) -> uint32_t;
 
 // Rich remote placement path used by spawn/exec code that already has the final
 // argv/envp/cwd context. On success, the task is converted into a proxy.
@@ -436,6 +473,9 @@ auto wki_remote_compute_selftest_proxy_wait_completion_respects_publish_fence() 
 auto wki_remote_compute_selftest_task_wait_consumes_completed_row() -> bool;
 auto wki_remote_compute_selftest_task_wait_timeout_preserves_successor() -> bool;
 auto wki_remote_compute_selftest_task_exit_retires_wait_owners() -> bool;
+auto wki_remote_compute_selftest_submit_buffers_follow_executor() -> bool;
+auto wki_remote_compute_selftest_slot_allocation_failure() -> bool;
+auto wki_remote_compute_selftest_failed_submit_restores_guard() -> bool;
 auto wki_remote_compute_selftest_task_exit_releases_handoff_pins() -> bool;
 auto wki_remote_compute_selftest_submitted_slots_reclaim_safely() -> bool;
 auto wki_remote_compute_selftest_task_id_wrap_is_safe() -> bool;
@@ -446,8 +486,19 @@ auto wki_remote_compute_selftest_automatic_policy_is_workload_agnostic() -> bool
 auto wki_remote_compute_selftest_submit_policy_scope_restores_worker() -> bool;
 auto wki_remote_compute_selftest_receiver_system_paths_are_local_by_default() -> bool;
 auto wki_remote_compute_selftest_submit_context_lengths_are_checked() -> bool;
+auto wki_remote_compute_selftest_resource_context_before_fetch() -> bool;
+auto wki_remote_compute_selftest_submission_errors() -> bool;
+auto wki_remote_compute_selftest_cloexec_commit_preserves_other_fds() -> bool;
+auto wki_remote_compute_selftest_stdio_presence_and_rollback() -> bool;
+auto wki_remote_compute_selftest_resource_completion_is_session_scoped() -> bool;
+auto wki_remote_compute_selftest_service_report_transport() -> bool;
+auto wki_remote_compute_selftest_resource_rejection_is_session_scoped() -> bool;
+auto wki_remote_compute_selftest_service_completion_counts_once() -> bool;
 auto wki_remote_compute_selftest_submit_fragment_boundaries() -> bool;
 auto wki_remote_compute_selftest_submit_worker_count_is_bounded() -> bool;
+auto wki_remote_compute_selftest_completion_queue_preserves_ownership() -> bool;
+auto wki_remote_compute_selftest_running_registry_compacts_stably() -> bool;
+auto wki_remote_compute_selftest_running_publication_failure_unwinds() -> bool;
 auto wki_remote_compute_selftest_accept_retry_is_fair() -> bool;
 auto wki_remote_compute_selftest_submit_cancel_is_session_scoped() -> bool;
 auto wki_remote_compute_selftest_rx_admission_is_bounded() -> bool;
@@ -467,6 +518,8 @@ void handle_task_submit(const WkiHeader* hdr, const uint8_t* payload, uint16_t p
 // Submitter side: handle accept/reject response
 void handle_task_accept(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len, WkiChannel* rx_channel,
                         uint32_t rx_channel_generation);
+void handle_task_service_report(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len, WkiChannel* rx_channel,
+                                uint32_t rx_channel_generation);
 void handle_task_reject(const WkiHeader* hdr, const uint8_t* payload, uint16_t payload_len, WkiChannel* rx_channel,
                         uint32_t rx_channel_generation);
 

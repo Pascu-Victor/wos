@@ -140,7 +140,7 @@ def test_inode_io_lock_precedes_metadata_lock() -> None:
     source = XFS_VFS_CPP.read_text()
     checks = [
         ("xfs_vfs_close", "MutexGuard guard(xfd->inode->io_lock)", "XfsMetadataGuard metadata_guard(xfd->mount"),
-        ("xfs_vfs_truncate", "MutexGuard guard(ip->io_lock)", "XfsMetadataGuard metadata_guard(ctx"),
+        ("xfs_vfs_truncate_impl", "MutexGuard guard(ip->io_lock)", "XfsMetadataGuard metadata_guard(ctx"),
         ("xfs_fsync", "MutexGuard guard(xfd->inode->io_lock)", "XfsMetadataGuard metadata_guard(xfd->mount"),
     ]
     for name, inode_lock, metadata_lock in checks:

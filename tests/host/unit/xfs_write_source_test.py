@@ -199,7 +199,7 @@ def main() -> None:
         "std::memcpy(dst + total_read, bp->data, chunk)",
         "full-block reads must consume the authoritative cached span",
     )
-    truncate_start = source.find("auto xfs_vfs_truncate(File* f")
+    truncate_start = source.find("auto xfs_vfs_truncate_impl(File* f")
     truncate_end = source.find("// ============================================================================\n// FileOperations vtable", truncate_start)
     if truncate_start < 0 or truncate_end < 0:
         fail("could not isolate xfs_vfs_truncate body")

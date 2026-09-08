@@ -114,6 +114,7 @@ enum class MsgType : uint8_t {
     TASK_CANCEL = 0x54,
     LOAD_REPORT = 0x55,
     TASK_SUBMIT_FRAGMENT = 0x56,
+    TASK_SERVICE_REPORT = 0x57,
 };
 
 // -----------------------------------------------------------------------------
@@ -199,6 +200,9 @@ constexpr uint16_t WKI_CAP_VFS_XATTR = 0x0040;
 // Receiver-challenged, origin/session-bound routing leases. Opt-in until mixed
 // version verification completes; the existing LSA prefix remains unchanged.
 constexpr uint16_t WKI_CAP_ROUTING_LEASE = 0x0080;
+// Resourcev2 admission/completion and version1 subtree service reports. Both
+// endpoints require this capability for remote compute execution.
+constexpr uint16_t WKI_CAP_RESOURCE_LIMITS = 0x0100;
 constexpr uint16_t WKI_AUTH_SUITE_HMAC_SHA256_HKDF_SHA256 = 1;
 constexpr size_t WKI_AUTH_NONCE_SIZE = 32;
 
@@ -1315,11 +1319,17 @@ enum class TaskRejectReason : uint8_t {
     BINARY_NOT_FOUND = 3,
     FETCH_FAILED = 4,
     UNAUTHORIZED = 5,
+    RESOURCE_NPROC = 6,
+    RESOURCE_UNSUPPORTED = 7,
+    RESOURCE_INVALID = 8,
+    RESOURCE_CPU = 9,
 };
 
 struct TaskResponsePayload {
     uint32_t task_id;
     uint8_t status;  // TaskRejectReason (0 = accepted)
+    // TASK_REJECT resource suffix length, little endian in bytes 0..1;
+    // byte 2 remains zero. All bytes zero for ACCEPT and legacy rejection.
     std::array<uint8_t, 3> reserved;
     uint64_t remote_pid;  // PID on executing node (if accepted)
 } __attribute__((packed));
@@ -1334,9 +1344,10 @@ struct TaskCompletePayload {
     uint32_t task_id;
     int32_t exit_status;
     uint16_t output_len;
-    uint16_t reserved;
-    // Followed by output_len bytes of captured output
+    uint16_t reserved;  // Resource suffix length (0 or sizeof(TaskResourceSnapshot)), capability-gated.
+    // Followed by output_len bytes of captured output, then resource suffix.
 } __attribute__((packed));
+static_assert(sizeof(TaskCompletePayload) == 12);
 
 // -----------------------------------------------------------------------------
 // TASK_CANCEL Payload - 8 bytes

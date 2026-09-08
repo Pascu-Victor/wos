@@ -13,10 +13,12 @@
 #include <platform/mm/virt.hpp>
 #include <platform/perf/perf_events.hpp>
 #include <platform/sched/epoch.hpp>
+#include <platform/sched/resource.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sys/context_switch.hpp>
 #include <platform/sys/signal.hpp>
 #include <util/hcf.hpp>
+#include <vfs/fd_reservation.hpp>
 #include <vfs/vfs.hpp>
 
 #include "child_events.hpp"
@@ -185,6 +187,10 @@ namespace {
         log::error("process exit without current task: status=%d wait_status=%d", status, wait_status);
         hcf();
     }
+    if (!ker::mod::sched::resource::close_thread_cpu_admission(*current_task)) [[unlikely]] {
+        ker::mod::dbg::panic_handler("process exit: missing CPU owner");
+        hcf();
+    }
     request_thread_group_exit(current_task, status, wait_status);
     if (current_task->is_thread) {
         ker::syscall::multiproc::wos_thread_exit_current();
@@ -210,6 +216,8 @@ namespace {
         }
     }
     current_task->exit_in_progress = true;
+    ker::vfs::cancel_fd_reservations(*current_task);
+    ker::mod::sched::resource::cancel_process_reservations(*current_task);
     ker::syscall::log::sys_log_cleanup_for_task(current_task);
 
 #ifdef EXIT_DEBUG
@@ -226,6 +234,12 @@ namespace {
     // process's wait registrations, and detach its tracees while the task may
     // still safely perform registry lookups and scheduler wakes.
     child_events::prepare_process_exit(*current_task);
+
+    // No new CPU contributions can bind after the close gate above. Siblings
+    // finish their cleanup/accounting independently of later Task reclamation.
+    while (current_task->resource_cpu_threads.load(std::memory_order_acquire) != 0) {
+        ker::mod::sched::kern_yield();
+    }
 
     // Close all open file descriptors and free ELF buffer before waking waiters.
     // This ensures files written by the exiting process are fully committed to
@@ -288,7 +302,8 @@ namespace {
     // Memory barrier to ensure state change is visible to all CPUs.
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-    ker::mod::sched::finish_syscall_accounting();
+    ker::mod::sched::finalize_current_task_cpu_accounting();
+    current_task->process_charge.release();
     current_task->has_exited = true;
     current_task->exit_notify_ready.store(true, std::memory_order_release);
     if (!child_events::publish_exit(*current_task)) {

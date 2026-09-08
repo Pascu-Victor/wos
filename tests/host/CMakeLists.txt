@@ -4,6 +4,13 @@
 
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
+wos_add_unit_test(resource_model_test
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/resource_model_test.cpp
+)
+wos_add_unit_test(wki_resource_contract_test
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/wki_resource_contract_test.cpp
+)
+
 add_test(
     NAME host_test_manifest_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/host_test_manifest_test.py

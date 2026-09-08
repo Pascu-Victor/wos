@@ -18,6 +18,7 @@
 #include <platform/mm/paging.hpp>
 #include <platform/mm/swap.hpp>
 #include <platform/perf/perf_events.hpp>
+#include <platform/sched/file_growth.hpp>
 #include <platform/sched/scheduler.hpp>
 #include <platform/sys/mutex.hpp>
 #include <platform/sys/spinlock.hpp>
@@ -1938,11 +1939,21 @@ auto xfs_vfs_write(File* f, const void* buf, size_t count, size_t offset) -> ssi
         return -EBADF;
     }
 
+    ker::mod::sched::resource::FileGrowth growth;
+    if (!growth.bound_write(offset, count)) {
+        return -EFBIG;
+    }
+    if (count == 0) {
+        return 0;
+    }
     bool throttle_after_unlock = false;
     ssize_t ret = 0;
     {
         ker::mod::sys::MutexGuard guard(xfd->inode->io_lock);
         ret = xfs_vfs_write_locked(f, buf, count, offset, throttle_after_unlock);
+        if (ret > 0) {
+            growth.committed(xfd->inode->size);
+        }
     }
     if (throttle_after_unlock) {
         throttle_dirty_buffer_cache(xfd->mount->device);
@@ -2274,7 +2285,7 @@ auto xfs_vfs_readlink(File* f, char* buf, size_t bufsize) -> ssize_t {
 // Truncate
 // ============================================================================
 
-auto xfs_vfs_truncate(File* f, off_t length) -> int {
+auto xfs_vfs_truncate_impl(File* f, off_t length) -> int {
     if (f == nullptr) {
         return -EBADF;
     }
@@ -2363,6 +2374,21 @@ auto xfs_vfs_truncate(File* f, off_t length) -> int {
     xfs_trans_log_inode(tp, ip);
     int const RET = xfs_trans_commit(tp);
     return (RET == 0) ? 0 : -EIO;
+}
+
+auto xfs_vfs_truncate(File* f, off_t length) -> int {
+    if (length < 0) {
+        return -EINVAL;
+    }
+    ker::mod::sched::resource::FileGrowth growth;
+    if (!growth.allow_resize(static_cast<uint64_t>(length))) {
+        return -EFBIG;
+    }
+    int const RET = xfs_vfs_truncate_impl(f, length);
+    if (RET == 0) {
+        growth.committed(static_cast<uint64_t>(length));
+    }
+    return RET;
 }
 
 // ============================================================================
@@ -3501,13 +3527,20 @@ auto xfs_write_append(File* f, const void* buf, size_t count, size_t* offset_out
         return -EBADF;
     }
 
+    ker::mod::sched::resource::FileGrowth growth;
     bool throttle_after_unlock = false;
     size_t offset = 0;
     ssize_t ret = 0;
     {
         ker::mod::sys::MutexGuard guard(xfd->inode->io_lock);
         offset = static_cast<size_t>(xfd->inode->size);
-        ret = xfs_vfs_write_locked(f, buf, count, offset, throttle_after_unlock);
+        if (!growth.bound_write(offset, count)) {
+            return -EFBIG;
+        }
+        ret = count == 0 ? 0 : xfs_vfs_write_locked(f, buf, count, offset, throttle_after_unlock);
+        if (ret > 0) {
+            growth.committed(xfd->inode->size);
+        }
     }
     if (throttle_after_unlock) {
         throttle_dirty_buffer_cache(xfd->mount->device);

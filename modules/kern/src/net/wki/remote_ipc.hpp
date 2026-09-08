@@ -122,6 +122,9 @@ static_assert(sizeof(WkiIpcSharedRegion) == sizeof(WkiEpollSharedRegion), "WkiIp
 constexpr uint32_t WKI_PROXY_PIPE_RING_SIZE = 1024 * 1024;  // 1 MB local ring buffer
 
 struct ProxyIpcState {
+    // Registry membership only, guarded by s_ipc_lock.
+    ProxyIpcState* registry_previous = nullptr;
+    ProxyIpcState* registry_next = nullptr;
     std::atomic<bool> active{false};
     ResourceType res_type = ResourceType::CUSTOM;
     uint16_t home_node = WKI_NODE_INVALID;
@@ -208,6 +211,9 @@ constexpr auto wki_ipc_response_matches_pending(uint16_t response_op, uint16_t r
 // -----------------------------------------------------------------------------
 
 struct WkiIpcExport {
+    // Registry membership only; guarded by s_ipc_lock, distinct from pump_next.
+    WkiIpcExport* registry_previous = nullptr;
+    WkiIpcExport* registry_next = nullptr;
     bool active = false;
     uint32_t resource_id = 0;
     ResourceType res_type = ResourceType::CUSTOM;
@@ -216,6 +222,9 @@ struct WkiIpcExport {
     uint16_t consumer_node = WKI_NODE_INVALID;
     uint64_t pipe_bytes_received = 0;
     bool message_write_flow_control = false;
+    // The sole backlog shard worker pins exporter/ring storage while its VFS
+    // write uses an RDMA data pointer outside s_ipc_lock. Guarded by that lock.
+    bool pipe_write_in_flight = false;
 
     // Optional proxy-write RDMA receive ring.  This is intentionally separate
     // from the local pipe backlog so bulk bytes can arrive without consuming
@@ -227,7 +236,8 @@ struct WkiIpcExport {
     uint32_t pipe_rdma_rkey = 0;
     WkiTransport* pipe_rdma_transport = nullptr;
 
-    // Server-side pump state
+    // Server-side pump state; pending acceptance is protected by s_ipc_lock.
+    bool pump_pending_accept = false;
     std::atomic<bool> pump_running{false};
     ker::mod::sched::task::Task* pump_task = nullptr;
     bool pump_queued = false;
@@ -242,6 +252,35 @@ struct WkiIpcTaskFdHandoff {
     uint16_t local_fd = UINT16_MAX;
     ker::vfs::File* file = nullptr;
 };
+
+// Executor-linked ownership from export preparation through SubmittedTask
+// publication. The arrays/count outlive this guard; export updates count under
+// the IPC lock. Disarming transfers ownership without invalidating wire data.
+class WkiIpcSubmissionGuard {
+   public:
+    WkiIpcSubmissionGuard(ker::mod::sched::task::Task* source, const WkiIpcFdEntry* map, WkiIpcTaskFdHandoff* handoff, uint16_t& count,
+                          uint16_t consumer);
+    ~WkiIpcSubmissionGuard();
+    WkiIpcSubmissionGuard(const WkiIpcSubmissionGuard&) = delete;
+    auto operator=(const WkiIpcSubmissionGuard&) -> WkiIpcSubmissionGuard& = delete;
+    void arm();
+    void cancel();
+    void disarm();
+
+   private:
+    ker::mod::sched::task::Task* source;
+    ker::mod::sched::task::Task* executor = nullptr;
+    const WkiIpcFdEntry* map;
+    WkiIpcTaskFdHandoff* handoff;
+    uint16_t& count;
+    uint16_t consumer;
+    uint16_t handoff_cursor = 0;
+    uint16_t export_cursor = 0;
+    bool owns = false;
+    WkiIpcSubmissionGuard* previous = nullptr;
+    WkiIpcSubmissionGuard* next = nullptr;
+};
+void wki_ipc_cancel_submission_guards(ker::mod::sched::task::Task& executor);
 
 struct WkiIpcPerfSnapshot {
     uint64_t exports = 0;
@@ -368,10 +407,18 @@ void wki_ipc_get_perf_snapshot(WkiIpcPerfSnapshot& out);
 auto wki_ipc_diag_snapshot(WkiIpcDiagRow* rows, size_t capacity, WkiIpcDiagCounts* counts) -> size_t;
 
 // Export a task's IPC fds before remote submission.
-// Iterates fd_table, identifies IPC primitives, creates exports.
-// Returns the number of exported fds, fills map_out.
+// Retains a non-CLOEXEC snapshot, identifies IPC primitives, creates exports.
+// Returns zero on success or negative errno with count_out zero on admission
+// failure. A successful empty set also has count zero. Optional
+// stdio_mask_out receives presence bits0..2 from that same snapshot, including
+// non-IPC descriptors represented by receiver fallback files.
 auto wki_ipc_export_task_fds(ker::mod::sched::task::Task* task, uint16_t target_node, WkiIpcFdEntry* map_out, uint16_t* count_out,
-                             WkiIpcTaskFdHandoff* handoff_out = nullptr) -> bool;
+                             WkiIpcTaskFdHandoff* handoff_out = nullptr, uint8_t* stdio_mask_out = nullptr) -> int;
+// Call only after TASK_ACCEPT and after consuming temporary handoff pins.
+// Starts selected read pumps by peer/resource identity; duplicate calls are inert.
+void wki_ipc_activate_task_fds(const WkiIpcFdEntry* map, uint16_t count, uint16_t consumer_node);
+// ACTIVE task-exit phase, outside compute/IPC/FD locks; releases snapshot pins.
+void wki_ipc_cancel_fd_snapshots(ker::mod::sched::task::Task& executor);
 
 // Commit or abandon the local side of an IPC fd handoff.  Commit removes only
 // fd slots that still contain the pinned File and drops their fd-table owner;
@@ -391,7 +438,8 @@ auto wki_ipc_find_pipe_affinity_node(const ker::mod::sched::task::Task* task, ui
 
 // Attach IPC proxy fds on the remote task after TASK_SUBMIT.
 // Replaces File::fops with proxy fops for each IPC fd.
-void wki_ipc_attach_task_fds(ker::mod::sched::task::Task* task, const WkiIpcFdEntry* map, uint16_t count);
+// Returns false without changing any descriptor or publishing any proxy.
+auto wki_ipc_attach_task_fds(ker::mod::sched::task::Task* task, const WkiIpcFdEntry* map, uint16_t count) -> bool;
 
 // Doorbell RX handler — called from ISR when IPC doorbell arrives.
 // Returns true when the doorbell matched a live IPC RDMA pipe export.
@@ -407,6 +455,17 @@ void wki_ipc_handle_dev_op_resp(uint16_t src_node, uint16_t channel, const uint8
 auto wki_ipc_selftest_poll_state_response_refs() -> int;
 auto wki_ipc_selftest_export_compaction_frees() -> int;
 auto wki_ipc_selftest_task_fd_handoff_transfers_exact_owner() -> int;
+auto wki_ipc_selftest_rdma_write_survives_detachment() -> int;
+auto wki_ipc_selftest_accepted_handoff_cancellation() -> int;
+auto wki_ipc_selftest_pipe_growth_waits_for_write() -> int;
+auto wki_ipc_selftest_submission_guard_cancellation() -> int;
+auto wki_ipc_selftest_submission_guard_reentrant_put() -> int;
+auto wki_ipc_selftest_private_rdma_preparation_unwinds() -> int;
+auto wki_ipc_selftest_private_export_allocation_unwinds() -> int;
+auto wki_ipc_selftest_intrusive_export_registry() -> int;
+auto wki_ipc_selftest_pumps_wait_for_acceptance() -> int;
+auto wki_ipc_selftest_export_admission_is_atomic() -> int;
+auto wki_ipc_selftest_fd_snapshot_lifetime_and_cloexec() -> int;
 auto wki_ipc_selftest_failed_export_write_releases_all_file_refs() -> int;
 auto wki_ipc_selftest_message_pipe_flow_updates_proxy() -> int;
 auto wki_ipc_selftest_cleanup_for_peer_drains_over_capacity() -> int;

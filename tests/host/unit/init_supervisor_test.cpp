@@ -3,6 +3,8 @@
 #include <array>
 #include <cerrno>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
 #include <initializer_list>
 #include <string>
 #include <string_view>
@@ -215,6 +217,75 @@ auto replace_once(std::string input, std::string_view from, std::string_view to)
         input.replace(offset, from.size(), to);
     }
     return input;
+}
+
+TEST(InitServiceManifest, ResourceLimitsRetainDefaultsAndAcceptEverySupportedResource) {
+    auto manifest = parsed_valid_manifest();
+    for (size_t index = 0; index < wos::init::SERVICE_RESOURCE_COUNT; ++index) {
+        uint64_t const EXPECTED = wos::init::SERVICE_RESOURCE_IDS.at(index) == 7 ? 256 : UINT64_MAX;
+        EXPECT_EQ(manifest.services.at(0).resource_limits.at(index).soft, EXPECTED);
+        EXPECT_EQ(manifest.services.at(0).resource_limits.at(index).hard, EXPECTED);
+    }
+    for (size_t index = 0; index < wos::init::SERVICE_RESOURCE_COUNT; ++index) {
+        for (std::string_view value : {"0:0"sv, "0:1"sv, "1:1"sv, "255:256"sv, "256:256"sv}) {
+            std::string input(VALID_MANIFEST);
+            input += "limit-" + std::string(wos::init::SERVICE_RESOURCE_NAMES.at(index)) + "=" + std::string(value) + "\n";
+            ASSERT_TRUE(parse_service_manifest(std::span(input.data(), input.size()), manifest));
+            ServiceTopology topology{};
+            EXPECT_TRUE(validate_service_manifest(manifest, topology));
+            auto const& limit = manifest.services.at(manifest.service_count - 1).resource_limits.at(index);
+            EXPECT_EQ(limit.soft, std::stoull(std::string(value.substr(0, value.find(':')))));
+            EXPECT_EQ(limit.hard, std::stoull(std::string(value.substr(value.find(':') + 1))));
+        }
+        if (wos::init::SERVICE_RESOURCE_IDS.at(index) == 7) continue;
+        std::string input(VALID_MANIFEST);
+        input += "limit-" + std::string(wos::init::SERVICE_RESOURCE_NAMES.at(index)) + "=18446744073709551615:infinity\n";
+        ASSERT_TRUE(parse_service_manifest(std::span(input.data(), input.size()), manifest));
+        ServiceTopology topology{};
+        EXPECT_TRUE(validate_service_manifest(manifest, topology));
+        EXPECT_EQ(manifest.services.at(manifest.service_count - 1).resource_limits.at(index).soft, UINT64_MAX);
+        EXPECT_EQ(manifest.services.at(manifest.service_count - 1).resource_limits.at(index).hard, UINT64_MAX);
+    }
+}
+
+TEST(InitServiceManifest, ResourceLimitsRejectMalformedDuplicateAndOutOfRangePolicies) {
+    for (std::string_view value : {""sv, "1"sv, "1:"sv, ":1"sv, "1:2:3"sv, "-1:2"sv, "1:infinite"sv, "1: 2"sv,
+                                   "18446744073709551616:infinity"sv, "1:18446744073709551616"sv}) {
+        std::string input = std::string(VALID_MANIFEST) + "limit-as=" + std::string(value) + "\n";
+        ServiceManifest manifest{};
+        EXPECT_EQ(parse_service_manifest(std::span(input.data(), input.size()), manifest).error, ManifestParseError::INVALID_VALUE);
+    }
+    for (std::string_view fields :
+         {"limit-as=2:1\n"sv, "limit-as=infinity:1\n"sv, "limit-nofile=257:257\n"sv, "limit-nofile=1:infinity\n"sv}) {
+        std::string input = std::string(VALID_MANIFEST) + std::string(fields);
+        ServiceManifest manifest{};
+        ASSERT_TRUE(parse_service_manifest(std::span(input.data(), input.size()), manifest));
+        ServiceTopology topology{};
+        EXPECT_EQ(validate_service_manifest(manifest, topology).error, ManifestValidationError::INVALID_RANGE);
+    }
+    std::string input = std::string(VALID_MANIFEST) + "limit-cpu=1:2\nlimit-cpu=2:3\n";
+    ServiceManifest manifest{};
+    EXPECT_EQ(parse_service_manifest(std::span(input.data(), input.size()), manifest).error, ManifestParseError::DUPLICATE_FIELD);
+    input = std::string(VALID_MANIFEST) + "limit-unknown=1:2\n";
+    EXPECT_EQ(parse_service_manifest(std::span(input.data(), input.size()), manifest).error, ManifestParseError::UNKNOWN_FIELD);
+}
+
+TEST(InitServiceManifest, DisposableResourceServiceFixtureIsValid) {
+    auto const ROOT = std::filesystem::path(__FILE__).parent_path().parent_path().parent_path().parent_path();
+    std::ifstream base(ROOT / "configs/wos-services.conf");
+    std::ifstream extra(ROOT / "tests/fixtures/resource_governance_services.fragment");
+    ASSERT_TRUE(base.good() && extra.good());
+    std::string input(std::istreambuf_iterator<char>{base}, {});
+    input += '\n';
+    input.append(std::istreambuf_iterator<char>{extra}, {});
+    ServiceManifest manifest{};
+    ASSERT_TRUE(parse_service_manifest(std::span(input.data(), input.size()), manifest));
+    ServiceTopology topology{};
+    ASSERT_TRUE(validate_service_manifest(manifest, topology));
+    EXPECT_NE(find_service(manifest, "resource-policy"), INVALID_SERVICE_ID);
+    EXPECT_NE(find_service(manifest, "resource-cpu-restart"), INVALID_SERVICE_ID);
+    EXPECT_EQ(manifest.services.at(find_service(manifest, "resource-nproc-zero")).resource_limits.at(4).soft, 0);
+    EXPECT_EQ(manifest.services.at(find_service(manifest, "resource-as-denied")).resource_limits.at(6).soft, 0);
 }
 
 TEST(InitServiceManifest, ParsesConditionalOneshotAndBuildsDeterministicDag) {

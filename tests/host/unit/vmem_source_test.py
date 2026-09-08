@@ -939,7 +939,34 @@ def test_fork_child_registers_use_immutable_syscall_entry_snapshot() -> None:
         fail("fork child registers must not come from preemptible parent task context")
 
 
+def test_as_admission_precedes_mapping_mutation() -> None:
+    source = SYS_VMEM_CPP.read_text()
+    for name in ("anon_allocate", "file_allocate"):
+        body = function_body(source, name)
+        require_order(body, "SharedVmemPublicationGuard publication_guard", "admit_address_space(task, task->pagemap, size",
+                      "AS admission must serialize with shared-root publishers")
+        require_order(body, "admit_address_space(task, task->pagemap, size, hint, size)", "release_fixed_mmap_range_locked",
+                      "AS denial must preserve MAP_FIXED source mappings")
+        require_order(body, "admit_address_space(task, task->pagemap, size))", "reserve_free_mmap_range_locked",
+                      "AS denial must precede nonfixed VA reservation")
+        require_tokens(body, ["AddressSpaceObservation observation(task)"], "AS observes commit/rollback before publication unlock")
+    attach = function_body(SHM_CPP.read_text(), "shmat_impl")
+    require_order(attach, "admit_address_space(task, task->pagemap, SIZE)", "uint64_t mapped_pages",
+                  "AS shm denial must precede mapping references")
+    require_tokens(attach, ["abandon_attachment_publication(attachment)"], "shm denial returns segment pin")
+    remap = function_body(source, "anon_mremap")
+    require_tokens(remap, ["(void)anon_free(NEW_ADDR, NEW_SIZE)"], "failed remap finalization releases destination")
+    walk = function_body(VIRT_CPP.read_text(), "count_user_virtual_bytes")
+    require_ordered_tokens(walk, ["sched::PreemptGuard guard", "acquire_user_pagemap_access", "count_virtual_bytes_in_table",
+                                 "release_user_pagemap_access"], "AS walk root pins cannot survive fatal handoff")
+    proc = (ROOT / "modules/kern/src/vfs/fs/procfs.cpp").read_text()
+    limits = function_body(proc, "procfs_read_limits")
+    if "SharedVmemPublicationGuard" in limits:
+        fail("procfs limits cannot recursively acquire the VM publication mutex during file mmap")
+
+
 def main() -> None:
+    test_as_admission_precedes_mapping_mutation()
     test_munmap_and_mprotect_reject_overflowing_lengths()
     test_nonfixed_mmap_address_selection_is_reserved_before_mapping()
     test_kernel_managed_initial_layout_cannot_be_replaced()

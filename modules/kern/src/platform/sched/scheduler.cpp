@@ -12,6 +12,7 @@
 #include <cstring>
 #include <new>  // NOLINT(misc-include-cleaner): placement new declares the RunQueue selftest storage lifetime.
 #include <platform/perf/perf_events.hpp>
+#include <platform/sched/resource.hpp>
 #include <platform/sys/spinlock.hpp>
 #include <platform/sys/usercopy.hpp>
 #include <platform/sys/userspace.hpp>
@@ -2147,6 +2148,9 @@ void commit_handoff_task_at_return_boundary() {
         insert_into_dead_list(outgoing);
     }
 
+    if (task != outgoing) {
+        sys::signal::exit_current_on_cpu_limit_user_handoff();
+    }
     sys::signal::exit_current_on_pending_fatal_default_signal();
 }
 
@@ -3303,7 +3307,8 @@ auto account_runtime_slice(RunQueue* rq, task::Task* task, uint64_t now_us, uint
 }
 
 auto charge_syscall_time_until(task::Task* task, uint64_t now_us, bool finish) -> bool {
-    if (task == nullptr || task->type != task::TaskType::PROCESS || task->syscall_account_start_us == 0) {
+    if (task == nullptr || task->type != task::TaskType::PROCESS || task->syscall_account_start_us == 0 ||
+        task->cpu_accounting_finalized.load(std::memory_order_acquire)) {
         return false;
     }
 
@@ -3312,13 +3317,15 @@ auto charge_syscall_time_until(task::Task* task, uint64_t now_us, bool finish) -
         uint64_t const ELAPSED_US = now_us - START_US;
         task->system_time_us += ELAPSED_US;
         task->precharged_syscall_time_us += ELAPSED_US;
+        resource::charge_cpu(task, ELAPSED_US);
     }
     task->syscall_account_start_us = finish ? 0 : now_us;
     return true;
 }
 
 void account_task_runtime_delta(task::Task* task, uint64_t now_us, uint64_t delta_us, bool in_kernel_mode, bool charge_running_time) {
-    if (task == nullptr || task->type == task::TaskType::IDLE || delta_us == 0) {
+    if (task == nullptr || task->type == task::TaskType::IDLE || delta_us == 0 ||
+        task->cpu_accounting_finalized.load(std::memory_order_acquire)) {
         return;
     }
 
@@ -3328,27 +3335,38 @@ void account_task_runtime_delta(task::Task* task, uint64_t now_us, uint64_t delt
         return;
     }
 
+    uint64_t user_us = 0;
     if (!in_kernel_mode) {
-        task->user_time_us += UNCHARGED_US;
-        return;
-    }
-
-    if (task->type == task::TaskType::PROCESS && task->syscall_account_start_us != 0) {
+        user_us = UNCHARGED_US;
+    } else if (task->type == task::TaskType::PROCESS && task->syscall_account_start_us != 0) {
         uint64_t active_syscall_us = 0;
         if (now_us > task->syscall_account_start_us) {
             active_syscall_us = std::min(now_us - task->syscall_account_start_us, UNCHARGED_US);
         }
         if (active_syscall_us != 0) {
-            task->system_time_us += active_syscall_us;
             task->syscall_account_start_us = now_us;
         }
-        if (UNCHARGED_US > active_syscall_us) {
-            task->user_time_us += UNCHARGED_US - active_syscall_us;
-        }
-        return;
+        user_us = UNCHARGED_US - active_syscall_us;
     }
+    // Use the same classification for Task statistics and inherited process
+    // policy, after removing time already charged at syscall boundaries.
+    resource::charge_cpu(task, UNCHARGED_US, user_us);
+    task->user_time_us += user_us;
+    task->system_time_us += UNCHARGED_US - user_us;
+}
 
-    task->system_time_us += UNCHARGED_US;
+// The current runqueue is locked and local interrupts are masked. Flush the
+// remaining slice while syscall_account_start_us still describes its split.
+void finalize_task_cpu_locked(RunQueue* rq, task::Task* subject, uint64_t now_us) {
+    if (subject == nullptr || subject->type != task::TaskType::PROCESS || subject->cpu_accounting_finalized.load(std::memory_order_acquire))
+        return;
+    if (now_us > rq->last_tick_us) {
+        uint64_t const DELTA = now_us - rq->last_tick_us;
+        rq->last_tick_us = now_us;
+        static_cast<void>(account_runtime_slice(rq, subject, now_us, DELTA, true, true));
+    }
+    static_cast<void>(charge_syscall_time_until(subject, now_us, true));
+    subject->cpu_accounting_finalized.store(true, std::memory_order_release);
 }
 
 }  // namespace
@@ -3804,10 +3822,18 @@ void begin_syscall_accounting() {
         return;
     }
     auto* task = get_current_task();
-    if (task == nullptr || task->type != task::TaskType::PROCESS) {
+    if (task == nullptr || task->type != task::TaskType::PROCESS || task->cpu_accounting_finalized.load(std::memory_order_acquire)) {
         return;
     }
     task->syscall_account_start_us = time::get_us();
+}
+
+void finalize_current_task_cpu_accounting() {
+    if (!can_query_current_task()) return;
+    static_cast<void>(run_queues->this_cpu_locked([](RunQueue* rq) -> bool {
+        finalize_task_cpu_locked(rq, rq->current_task, time::get_us());
+        return true;
+    }));
 }
 
 void finish_syscall_accounting() {
@@ -3829,7 +3855,8 @@ void resume_syscall_accounting() {
         return;
     }
     auto* task = get_current_task();
-    if (task == nullptr || task->type != task::TaskType::PROCESS || task->syscall_account_start_us != 0) {
+    if (task == nullptr || task->type != task::TaskType::PROCESS || task->syscall_account_start_us != 0 ||
+        task->cpu_accounting_finalized.load(std::memory_order_acquire)) {
         return;
     }
     task->syscall_account_start_us = time::get_us();
@@ -4570,7 +4597,10 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
                 }
             }
             int64_t const AVG = compute_avg_vruntime(rq);
-            auto* t = rq->runnable_heap.pick_best_eligible(AVG);
+            // An exited candidate can remain until lifecycle cleanup catches up.
+            // Use the same pruning as running-task selection so it cannot
+            // indefinitely hide healthy work behind an invalid heap root.
+            auto* t = pick_best_eligible_for_switch_locked(rq, AVG, nullptr);
             if (t == nullptr) {
                 return nullptr;
             }
@@ -6208,6 +6238,26 @@ auto task_has_live_pagemap_sibling(task::Task* subject) -> bool {
         }
     }
     return false;
+}
+
+void record_address_space_usage(task::Task* subject, mm::paging::PageTable* root, uint64_t bytes) {
+    auto record = [root, bytes](task::Task* candidate) {
+        if (candidate == nullptr || candidate->type != task::TaskType::PROCESS || candidate->pagemap != root) {
+            return;
+        }
+        uint64_t const FLAGS = candidate->resource_lock.lock_irqsave();
+        candidate->resources.commit_extent(static_cast<unsigned>(abi::resource::Id::AS), bytes);
+        candidate->resource_lock.unlock_irqrestore(FLAGS);
+    };
+    if (subject != nullptr && subject->shares_user_pagemap.load(std::memory_order_acquire)) {
+        uint64_t const FLAGS = global_task_registry_lock.lock_irqsave();
+        for (uint32_t i = 0; i < active_task_count; ++i) {
+            record(active_task_slot(i));
+        }
+        global_task_registry_lock.unlock_irqrestore(FLAGS);
+    }
+    // This also covers an unpublished process absent from the registry.
+    record(subject);
 }
 
 auto get_active_task_count() -> uint32_t {
@@ -8750,6 +8800,48 @@ auto scheduler_selftest_concurrent_reschedule_requests_are_serialized() -> bool 
            !target.reschedule_in_progress.load(std::memory_order_acquire);
 }
 
+auto scheduler_selftest_final_cpu_slice_freezes_accounting() -> bool {
+    RunQueue rq{};
+    task::Task subject{};
+    subject.type = task::TaskType::PROCESS;
+    rq.last_tick_us = 100;
+    rq.irq_uncharged_us.store(10);
+    subject.syscall_account_start_us = 150;
+    bool ok = charge_syscall_time_until(&subject, 170, false);
+    finalize_task_cpu_locked(&rq, &subject, 200);
+    ok &= subject.cpu_accounting_finalized.load() && subject.syscall_account_start_us == 0 && subject.resources.cpu_time_us == 90 &&
+          subject.resources.cpu_user_time_us == 40 && subject.resources.cpu_system_time_us == 50 && subject.user_time_us == 40 &&
+          subject.system_time_us == 50 && rq.last_tick_us == 200;
+    finalize_task_cpu_locked(&rq, &subject, 300);
+    account_task_runtime_delta(&subject, 400, 100, true, true);
+    ok &= !charge_syscall_time_until(&subject, 400, true);
+    resource::charge_cpu(&subject, 100);
+    return ok && subject.resources.cpu_time_us == 90 && subject.user_time_us == 40 && subject.system_time_us == 50 &&
+           rq.last_tick_us == 200;
+}
+
+auto scheduler_selftest_resource_cpu_split_matches_task() -> bool {
+    task::Task subject{};
+    subject.type = task::TaskType::PROCESS;
+    // 70us user, 30us kernel, then a syscall partially precharged at exit.
+    account_task_runtime_delta(&subject, 100, 70, false, true);
+    account_task_runtime_delta(&subject, 130, 30, true, true);
+    subject.syscall_account_start_us = 150;
+    bool ok = charge_syscall_time_until(&subject, 170, false);
+    account_task_runtime_delta(&subject, 190, 60, true, true);
+    ok &= subject.user_time_us == 90 && subject.system_time_us == 70 && subject.resources.cpu_time_us == 160 &&
+          subject.resources.cpu_user_time_us == 90 && subject.resources.cpu_system_time_us == 70 &&
+          subject.precharged_syscall_time_us == 0 && subject.syscall_account_start_us == 190;
+    // A wholly precharged tick adds nothing; blocked time also stays uncharged.
+    ok &= charge_syscall_time_until(&subject, 200, true);
+    account_task_runtime_delta(&subject, 200, 10, true, true);
+    account_task_runtime_delta(&subject, 210, 10, false, false);
+    ok &= subject.user_time_us == 90 && subject.system_time_us == 80 && subject.resources.cpu_time_us == 170 &&
+          subject.resources.cpu_user_time_us == 90 && subject.resources.cpu_system_time_us == 80 &&
+          subject.precharged_syscall_time_us == 0 && subject.syscall_account_start_us == 0;
+    return ok;
+}
+
 auto scheduler_selftest_runtime_delta_saturates() -> bool {
     bool const REGULAR_US_TO_NS = runtime_delta_ns_from_us(1234) == 1'234'000ULL;
     bool const HUGE_US_TO_NS_SATURATES = runtime_delta_ns_from_us(UINT64_MAX) == UINT64_MAX;
@@ -8871,6 +8963,41 @@ auto scheduler_selftest_heap_scan_removal_repairs_stale_index() -> bool {
     bool const LOAD_PROCESS_OK = rq.cached_load_process.load(std::memory_order_relaxed) == 16;
 
     return REMOVED && VICTIM_DETACHED && HEAP_SIZE_OK && TOTAL_WEIGHT_OK && LOAD_DEFAULT_OK && LOAD_PROCESS_OK;
+}
+
+auto scheduler_selftest_exited_heap_root_cannot_starve_idle_work() -> bool {
+    auto* rq = new RunQueue{};
+    auto* exited = new task::Task{};
+    auto* worker = new task::Task{};
+    if (rq == nullptr || exited == nullptr || worker == nullptr) {
+        delete rq;
+        delete exited;
+        delete worker;
+        return false;
+    }
+    for (auto* t : {exited, worker}) {
+        t->type = task::TaskType::DAEMON;
+        t->pid = t == exited ? 1 : 2;
+        t->pagemap = mm::virt::get_kernel_pagemap();
+        t->context.syscall_kernel_stack = 0xffff800000010000ULL;
+        t->context.syscall_scratch_area = 0xffff800000020000ULL;
+        t->heap_index = -1;
+        t->sched_weight = 128;
+        t->vruntime = 0;
+        t->vdeadline = t == exited ? 1 : 2;
+    }
+    bool const PUBLISHED =
+        publish_runnable_task_locked(rq, exited, "idle-prune-test") && publish_runnable_task_locked(rq, worker, "idle-prune-test");
+    exited->state.store(task::TaskState::EXITING, std::memory_order_relaxed);
+    exited->has_exited = true;
+    exited->pagemap = nullptr;
+    auto* picked = pick_best_eligible_for_switch_locked(rq, 0, nullptr);
+    bool const OK = PUBLISHED && picked == worker && rq->runnable_heap.size == 1 && exited->heap_index == -1 &&
+                    exited->sched_queue == task::Task::sched_queue::NONE && rq->total_weight == 128 && rq->runnable_heap.contains(worker);
+    delete rq;
+    delete exited;
+    delete worker;
+    return OK;
 }
 
 auto scheduler_selftest_load_balance_nudge_needs_process_backlog() -> bool {

@@ -127,6 +127,18 @@ auto subop_name(uint64_t callnum, uint64_t op) -> std::string_view {
                     return "init_status_publish";
                 case ker::abi::process::procmgmt_ops::INIT_STATUS_READ:
                     return "init_status_read";
+                case ker::abi::process::procmgmt_ops::GETRLIMIT:
+                    return "getrlimit";
+                case ker::abi::process::procmgmt_ops::SETRLIMIT:
+                    return "setrlimit";
+                case ker::abi::process::procmgmt_ops::RESOURCE_USAGE:
+                    return "resource_usage";
+                case ker::abi::process::procmgmt_ops::SERVICE_RESOURCE_CONFIGURE:
+                    return "service_resource_configure";
+                case ker::abi::process::procmgmt_ops::SERVICE_RESOURCE_SELECT:
+                    return "service_resource_select";
+                case ker::abi::process::procmgmt_ops::SERVICE_RESOURCE_READ:
+                    return "service_resource_read";
                 case ker::abi::process::procmgmt_ops::WAITPID:
                     return "waitpid";
                 case ker::abi::process::procmgmt_ops::GETPID:

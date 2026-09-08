@@ -31,6 +31,7 @@ set(SOURCES
     src/memory_pressure.cpp
     src/netbench.cpp
     src/perfbench.cpp
+    src/resource_limits.cpp
     src/thread_exit_stress.cpp
     src/usercopy_negative.cpp
     src/wki_chaos_workload.cpp
@@ -44,6 +45,15 @@ set(SOURCES
 
 # Create executable
 add_executable(testprog ${SOURCES})
+
+# A static entrypoint is needed to test exec with RLIMIT_NOFILE=0: a dynamic
+# linker's own library opens correctly consume user descriptors.
+foreach(probe IN ITEMS resource_exec_probe resource_core_probe resource_stack_probe)
+    add_executable(${probe} src/${probe}.cpp)
+    target_compile_options(${probe} PRIVATE -ffreestanding -fno-builtin -fno-exceptions -fno-rtti -fno-stack-protector -fno-pie)
+    target_link_options(${probe} PRIVATE -nostdlib -static -Wl,-no-pie -Wl,-e,_start -Wl,--no-dynamic-linker)
+    add_dependencies(testprog ${probe})
+endforeach()
 
 if(WOS_MANDELBENCH_DEBUG)
     target_compile_definitions(testprog PRIVATE MANDELBENCH_DEBUG=1)

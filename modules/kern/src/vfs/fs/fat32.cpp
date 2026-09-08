@@ -13,6 +13,7 @@
 #include <net/wki/blk_ring.hpp>
 #include <net/wki/dev_proxy.hpp>
 #include <platform/ktime/ktime.hpp>
+#include <platform/sched/file_growth.hpp>
 #include <vfs/file.hpp>
 #include <vfs/file_operations.hpp>
 #include <vfs/stat.hpp>
@@ -1481,6 +1482,14 @@ auto fat32_write(File* f, const void* buf, size_t count, size_t offset) -> ssize
         return -EROFS;
     }
 
+    ker::mod::sched::resource::FileGrowth growth;
+    if (!growth.bound_write(offset, count)) {
+        return -EFBIG;
+    }
+    if (count == 0) {
+        return 0;
+    }
+
     // Calculate starting cluster and offset within cluster
     size_t const CLUSTER_SIZE = static_cast<size_t>(ctx->bytes_per_sector) * ctx->sectors_per_cluster;
     uint32_t cluster_offset = offset / CLUSTER_SIZE;
@@ -1604,6 +1613,7 @@ auto fat32_write(File* f, const void* buf, size_t count, size_t offset) -> ssize
     log::debug("fat32_write: wrote %zu bytes, new file size: 0x%x", bytes_written, node->file_size);
 #endif
 
+    growth.committed(node->file_size);
     return static_cast<ssize_t>(bytes_written);
 }
 
@@ -2147,7 +2157,7 @@ static auto free_cluster_chain(FAT32MountContext* ctx, uint32_t start_cluster) -
 }
 
 // Truncate/extend a FAT32 file
-static auto fat32_truncate(File* f, off_t length) -> int {
+static auto fat32_truncate_impl(File* f, off_t length) -> int {
     if (f == nullptr || f->private_data == nullptr) {
         return -EINVAL;
     }
@@ -2257,6 +2267,24 @@ static auto fat32_truncate(File* f, off_t length) -> int {
     flush_fat_table(ctx);
     ker::dev::block_flush(ctx->device);
     return 0;
+}
+
+static auto fat32_truncate(File* f, off_t length) -> int {
+    if (length < 0) {
+        return -EINVAL;
+    }
+    ker::mod::sched::resource::FileGrowth growth;
+    if (!growth.allow_resize(static_cast<uint64_t>(length))) {
+        return -EFBIG;
+    }
+    if (static_cast<uint64_t>(length) > UINT32_MAX) {
+        return -EFBIG;
+    }
+    int const RET = fat32_truncate_impl(f, length);
+    if (RET == 0) {
+        growth.committed(static_cast<uint64_t>(length));
+    }
+    return RET;
 }
 
 // Walk a path to find the parent directory node and final component name.

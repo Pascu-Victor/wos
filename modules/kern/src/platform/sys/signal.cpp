@@ -146,8 +146,8 @@ auto ensure_signal_frame_destination(Task& task, uint64_t frame_addr) -> bool {
     }
 
     uint64_t const FRAME_END = frame_addr + sizeof(ker::mod::sys::signal::SignalFrame);
-    if (task_stack_contains(task, frame_addr, FRAME_END) &&
-        !ker::mod::sched::threading::ensure_stack_backing(task.thread, task.pagemap, frame_addr, FRAME_END)) {
+    if (ker::mod::sched::threading::has_automatic_stack(task.thread) && task_stack_contains(task, frame_addr, FRAME_END) &&
+        !ker::mod::sched::threading::ensure_stack_backing(task.thread, task.pagemap, frame_addr, FRAME_END, &task)) {
         return false;
     }
 
@@ -477,6 +477,38 @@ auto handle_handoff_non_user_signal_action(Task* task, int signo, unsigned idx, 
 
 }  // namespace
 
+namespace {
+void deliver_cpu_limits_at_user_return(Task* task) {
+    if (task != sched::get_current_task()) {
+        // The incoming USER_RETURN frame is already validated. Prepare a soft
+        // handler on that frame now; hard expiry must wait until assembly has
+        // moved to this task's own kernel stack and committed ownership.
+        constexpr uint64_t SOFT_MASK = uint64_t{1} << 23;
+        task->signal_add_pending_mask(task->pending_cpu_signals.fetch_and(~SOFT_MASK, std::memory_order_acq_rel) & SOFT_MASK);
+        return;
+    }
+    uint64_t const PENDING = task->pending_cpu_signals.exchange(0, std::memory_order_acq_rel);
+    if ((PENDING & (uint64_t{1} << (WOS_SIGKILL - 1))) != 0) {
+        // This gate is reached only after completed syscall work or with a
+        // validated user-return frame. Hard CPU expiry is uncatchable even
+        // when userspace is currently inside a looping SIGXCPU handler.
+        ker::syscall::process::wos_proc_exit_signal(WOS_SIGKILL);
+        __builtin_unreachable();
+    }
+    task->signal_add_pending_mask(PENDING);
+}
+}  // namespace
+
+void exit_current_on_cpu_limit_user_handoff() {
+    auto* task = sched::get_current_task();
+    if (task == nullptr || task->type != sched::task::TaskType::PROCESS || !task_owns_current_kernel_stack(task) ||
+        !sched::task::saved_frame_restore_policy(task->context.saved_frame_class).deliver_signals ||
+        !context_switch::saved_frame_class_is_valid(task, task->context.frame)) {
+        return;
+    }
+    deliver_cpu_limits_at_user_return(task);
+}
+
 void exit_current_on_pending_fatal_default_signal() {
     auto* task = sched::get_current_task();
     if (task == nullptr || task->type != sched::task::TaskType::PROCESS || task->exit_in_progress || task->has_exited ||
@@ -517,6 +549,7 @@ extern "C" auto check_pending_signals(uint8_t* stack_base) -> uint64_t {
         return 0;
     }
 
+    deliver_cpu_limits_at_user_return(task);
     if (!resume_job_control_for_pending_signal(task)) {
         park_current_job_control_stop(*task);
     }
@@ -695,6 +728,8 @@ void check_pending_signals_interrupt(cpu::GPRegs& gpr, gates::InterruptFrame& fr
 
     ker::syscall::process::exit_current_if_process_exit_requested();
 
+    deliver_cpu_limits_at_user_return(task);
+
     if (task->in_signal_handler) {
         return;
     }
@@ -859,6 +894,8 @@ void check_pending_signals_handoff(sched::task::Task* task, cpu::GPRegs& gpr, ga
         return;
     }
 
+    deliver_cpu_limits_at_user_return(task);
+
     if (task->in_signal_handler) {
         return;
     }
@@ -935,6 +972,8 @@ void check_pending_signals_deferred(sched::task::Task* task, DeferredSignalDeliv
         !context_switch::saved_frame_class_is_valid(task, task->context.frame)) {
         return;
     }
+
+    deliver_cpu_limits_at_user_return(task);
 
     if (task->in_signal_handler) {
         return;

@@ -191,6 +191,9 @@ KTEST(WkiIpcExportLifetime, CompactionWaitsForBacklogThenFreesExport) {
 KTEST(WkiIpcExportLifetime, AcceptedRemoteHandoffTransfersExactFdOwner) {
     KEXPECT_EQ(ker::net::wki::wki_ipc_selftest_task_fd_handoff_transfers_exact_owner(), 0);
 }
+KTEST(WkiIpcExportLifetime, SnapshotPinsSurviveReplacementAndFatalCancellation) {
+    KEXPECT_EQ(ker::net::wki::wki_ipc_selftest_fd_snapshot_lifetime_and_cloexec(), 0);
+}
 
 KTEST(WkiIpcExportLifetime, FatalWriteReleasesWorkerAndExportFileReferences) {
     KEXPECT_EQ(ker::net::wki::wki_ipc_selftest_failed_export_write_releases_all_file_refs(), 0);
@@ -276,4 +279,34 @@ KTEST(WkiIpcDevOpResp, ResponseKeepsSlotBusyUntilConsumed) {
 
 KTEST(WkiIpcDevOpResp, ResponseUsesHomeNodeIdentity) {
     KEXPECT_EQ(ker::net::wki::wki_ipc_selftest_dev_op_response_uses_home_node_identity(), 0);
+}
+
+KTEST(WkiIpcExportLifetime, AdmissionRejectsWithoutSideEffects) {
+    KEXPECT_EQ(ker::net::wki::wki_ipc_selftest_export_admission_is_atomic(), 0);
+}
+
+KTEST(WkiIpcExportLifetime, PumpsWaitForAcceptance) { KEXPECT_EQ(ker::net::wki::wki_ipc_selftest_pumps_wait_for_acceptance(), 0); }
+
+KTEST(WkiIpcExportLifetime, RegistryPublicationDoesNotAllocate) {
+    KEXPECT_EQ(ker::net::wki::wki_ipc_selftest_intrusive_export_registry(), 0);
+}
+
+KTEST(WkiIpcExportLifetime, PrivateAllocationFailureUnwinds) {
+    KEXPECT_EQ(ker::net::wki::wki_ipc_selftest_private_export_allocation_unwinds(), 0);
+}
+
+KTEST(WkiIpcExportLifetime, PrivateRdmaPreparationUnwinds) {
+    KEXPECT_EQ(ker::net::wki::wki_ipc_selftest_private_rdma_preparation_unwinds(), 0);
+}
+
+KTEST(WkiIpcExportLifetime, SubmissionGuardCancellation) { KEXPECT_EQ(ker::net::wki::wki_ipc_selftest_submission_guard_cancellation(), 0); }
+KTEST(WkiIpcExportLifetime, SubmissionGuardReentrantPut) {
+    KEXPECT_EQ(ker::net::wki::wki_ipc_selftest_submission_guard_reentrant_put(), 0);
+}
+
+KTEST(WkiIpcExportLifetime, AcceptedHandoffCancellation) { KEXPECT_EQ(ker::net::wki::wki_ipc_selftest_accepted_handoff_cancellation(), 0); }
+KTEST(WkiIpcExportLifetime, PipeGrowthWaitsForWrite) { KEXPECT_EQ(ker::net::wki::wki_ipc_selftest_pipe_growth_waits_for_write(), 0); }
+
+KTEST(WkiIpcExportLifetime, RdmaWriteSurvivesDetachment) {
+    KEXPECT_EQ(ker::net::wki::wki_ipc_selftest_rdma_write_survives_detachment(), 0);
 }

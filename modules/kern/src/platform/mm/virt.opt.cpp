@@ -151,6 +151,16 @@ std::array<UserPagemapAccessGate, USER_PAGEMAP_ACCESS_GATE_COUNT> user_pagemap_a
     return (reinterpret_cast<uintptr_t>(pagemap) >> 12U) & (USER_PAGEMAP_ACCESS_GATE_COUNT - 1U);
 }
 
+void service_user_pagemap_gate_wait(uint64_t& service_spins) {
+    // A pinned reader may be resolving COW and waiting for our TLB ack while
+    // fork drains readers. With IF masked neither the reader nor exclusive
+    // waiter can rely on an IPI interrupt to break that dependency cycle.
+    ++service_spins;
+    if ((service_spins & 0xFFU) == 0U && !sched::interrupts_enabled()) {
+        service_pending_tlb_shootdowns();
+    }
+}
+
 [[nodiscard]] auto acquire_user_pagemap_access(PageTable* pagemap, bool wait_for_teardown, size_t& gate_index) -> bool {
     gate_index = USER_PAGEMAP_ACCESS_GATE_NONE;
     if (pagemap == nullptr) {
@@ -159,11 +169,13 @@ std::array<UserPagemapAccessGate, USER_PAGEMAP_ACCESS_GATE_COUNT> user_pagemap_a
 
     size_t const INDEX = user_pagemap_access_gate_index(pagemap);
     auto& gate = user_pagemap_access_gates.at(INDEX);
+    uint64_t service_spins = 0;
     for (;;) {
         while (gate.teardown.load(std::memory_order_acquire)) {
             if (!wait_for_teardown) {
                 return false;
             }
+            service_user_pagemap_gate_wait(service_spins);
             asm volatile("pause" ::: "memory");
         }
 
@@ -198,11 +210,14 @@ void release_user_pagemap_access(size_t gate_index) {
     size_t const INDEX = user_pagemap_access_gate_index(pagemap);
     auto& gate = user_pagemap_access_gates.at(INDEX);
     bool expected = false;
+    uint64_t service_spins = 0;
     while (!gate.teardown.compare_exchange_weak(expected, true, std::memory_order_acq_rel, std::memory_order_acquire)) {
         expected = false;
+        service_user_pagemap_gate_wait(service_spins);
         asm volatile("pause" ::: "memory");
     }
     while (gate.readers.load(std::memory_order_acquire) != 0) {
+        service_user_pagemap_gate_wait(service_spins);
         asm volatile("pause" ::: "memory");
     }
     return INDEX;
@@ -3491,7 +3506,8 @@ auto pagefault_handler(uint64_t control_register, gates::InterruptFrame& frame, 
             return true;
         }
         if (current_task != nullptr && current_task->pagemap != nullptr && current_task->thread != nullptr &&
-            sched::threading::handle_lazy_stack_fault(current_task->thread, current_task->pagemap, control_register, frame.rsp)) {
+            sched::threading::handle_lazy_stack_fault(current_task->thread, current_task->pagemap, control_register, frame.rsp,
+                                                      current_task)) {
             return true;
         }
     }
@@ -3937,6 +3953,54 @@ bool selftest_anonymous_swap_is_swapped(PageTable* pagemap, vaddr_t vaddr) {
     return SWAPPED;
 }
 #endif
+
+namespace {
+auto count_virtual_bytes_in_table(PageTable* table, unsigned level, uint64_t base, uint64_t start, uint64_t end) -> uint64_t {
+    unsigned const SHIFT = paging::PAGE_SHIFT + 9 * (level - 1);
+    uint64_t const STRIDE = uint64_t{1} << SHIFT;
+    uint64_t bytes = 0;
+    size_t const FIRST = static_cast<size_t>((start - base) >> SHIFT);
+    size_t const LAST = static_cast<size_t>((end - 1 - base) >> SHIFT);
+    for (size_t i = FIRST; i <= LAST; ++i) {
+        uint64_t const RAW = pte_raw(entry_at(table, i));
+        uint64_t const ENTRY_START = base + i * STRIDE;
+        uint64_t const LOW = std::max(start, ENTRY_START);
+        uint64_t const HIGH = std::min(end, ENTRY_START + STRIDE);
+        bool const PRESENT = (RAW & paging::PAGE_PRESENT) != 0;
+        if (level == 1 || (PRESENT && level < 4 && (RAW & (uint64_t{1} << 7)) != 0)) {
+            // Lower-half supervisor leaves can be resident PROT_NONE. They
+            // still occupy user VA; kernel mappings live in the upper half.
+            if (PRESENT || (RAW & paging::PAGE_RESERVED) != 0) {
+                bytes += HIGH - LOW;
+            }
+        } else if (PRESENT) {
+            auto* child = reinterpret_cast<PageTable*>(addr::get_virt_pointer(RAW & 0x000ffffffffff000ULL));
+            bytes += count_virtual_bytes_in_table(child, level - 1, ENTRY_START, LOW, HIGH);
+        }
+    }
+    return bytes;
+}
+}  // namespace
+
+auto count_user_virtual_bytes(PageTable* page_table, uint64_t start, uint64_t end, uint64_t& bytes) -> bool {
+    bytes = 0;
+    if (page_table == nullptr || start > end || end > 0x0000800000000000ULL || ((start | end) & (paging::PAGE_SIZE - 1)) != 0) {
+        return false;
+    }
+    if (start == end) {
+        return true;
+    }
+    // The bounded walk cannot block; keep its root pin out of non-unwinding
+    // fatal syscall handoffs. Timer accounting remains active.
+    sched::PreemptGuard guard;
+    size_t gate = USER_PAGEMAP_ACCESS_GATE_NONE;
+    if (!acquire_user_pagemap_access(page_table, false, gate)) {
+        return false;
+    }
+    bytes = count_virtual_bytes_in_table(page_table, 4, 0, start, end);
+    release_user_pagemap_access(gate);
+    return true;
+}
 
 auto collect_user_memory_stats(PageTable* page_table) -> UserMemoryStats {
     UserMemoryStats stats{};

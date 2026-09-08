@@ -98,6 +98,7 @@ timestamp() { date '+%Y-%m-%d_%H%M%S'; }
 
 FUZZ_TARGETS=(wki_wire_fuzz data_struct_fuzz tcp_fuzz xfs_format_fuzz wki_routing_fuzz slab_fuzz telemetry_fuzz perf_data_fuzz)
 UNIT_TESTS=(
+    resource_model_test
     host_test_manifest_test
     semantic_regression_test
     ktest_cov_test
