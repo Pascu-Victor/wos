@@ -24,6 +24,7 @@ set(SOURCES
     src/aslr_hardening.cpp
     src/asan_crasher.cpp
     src/cowbench.cpp
+    src/credentials.cpp
     src/fsbench.cpp
     src/ipv6_net.cpp
     src/ipv6_ra.cpp

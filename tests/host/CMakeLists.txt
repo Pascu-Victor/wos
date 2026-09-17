@@ -28,6 +28,11 @@ wos_add_unit_test(file_content_match_test
 wos_add_unit_test(credential_model_test
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/credential_model_test.cpp
 )
+add_test(
+    NAME credential_policy_audit_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/credential_policy_audit_test.py
+)
+set_tests_properties(credential_policy_audit_test PROPERTIES LABELS "host;source")
 
 wos_add_unit_test(resource_model_test
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/resource_model_test.cpp

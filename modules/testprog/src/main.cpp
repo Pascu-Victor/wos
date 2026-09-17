@@ -33,6 +33,7 @@
 #include "asan_crasher.hpp"
 #include "aslr_hardening.hpp"
 #include "cowbench.hpp"
+#include "credentials.hpp"
 #include "fsbench.hpp"
 #include "ipv6_net.hpp"
 #include "ipv6_ra.hpp"
@@ -665,6 +666,10 @@ auto main(int argc, char** argv, char** envp) -> int {
 
     if (command != nullptr && std::strcmp(command, "usercopy-negative") == 0) {
         return run_usercopy_negative();
+    }
+
+    if (command != nullptr && std::strcmp(command, "credentials") == 0) {
+        return run_credentials(argc - 2, argv + 2);
     }
 
     if (command != nullptr && std::strcmp(command, "resource-limits") == 0) {

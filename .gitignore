@@ -56,3 +56,5 @@ configs/rootfs/root/.ssh/authorized_keys
 
 # local long-running agent goal contracts
 /goals/
+
+wki-chaos-data/

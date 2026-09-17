@@ -2,6 +2,13 @@
 # Start/restart these after WKI peer discovery has completed.
 
 [service resource-remote-finite]
+user=root
+group=root
+supplementary-groups=none
+umask=0022
+authority-ceiling=65535
+no-new-privileges=no
+service-privileges=none
 exec=/usr/bin/on
 arg=/usr/bin/on
 arg=wos-1
@@ -28,6 +35,13 @@ limit-cpu=2:2
 limit-core=0:0
 
 [service resource-remote-fallback]
+user=root
+group=root
+supplementary-groups=none
+umask=0022
+authority-ceiling=65535
+no-new-privileges=no
+service-privileges=none
 exec=/usr/bin/remotely
 arg=/usr/bin/remotely
 arg=/bin/true

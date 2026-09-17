@@ -1,6 +1,13 @@
 # Append to configs/wos-services.conf only in a disposable validation VM.
 
 [service resource-policy]
+user=root
+group=root
+supplementary-groups=none
+umask=0022
+authority-ceiling=65535
+no-new-privileges=no
+service-privileges=none
 exec=/usr/bin/testprog
 arg=/usr/bin/testprog
 arg=resource-limits
@@ -32,6 +39,13 @@ limit-nofile=8:8
 limit-as=134217728:134217728
 
 [service resource-nproc-zero]
+user=root
+group=root
+supplementary-groups=none
+umask=0022
+authority-ceiling=65535
+no-new-privileges=no
+service-privileges=none
 exec=/usr/bin/testprog
 arg=/usr/bin/testprog
 arg=resource-limits
@@ -57,6 +71,13 @@ enable=always
 limit-nproc=0:0
 
 [service resource-as-denied]
+user=root
+group=root
+supplementary-groups=none
+umask=0022
+authority-ceiling=65535
+no-new-privileges=no
+service-privileges=none
 exec=/usr/bin/testprog
 arg=/usr/bin/testprog
 arg=resource-limits
@@ -82,6 +103,13 @@ enable=always
 limit-as=0:infinity
 
 [service resource-cpu-restart]
+user=root
+group=root
+supplementary-groups=none
+umask=0022
+authority-ceiling=65535
+no-new-privileges=no
+service-privileges=none
 exec=/usr/bin/testprog
 arg=/usr/bin/testprog
 arg=resource-limits
