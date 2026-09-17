@@ -2,46 +2,54 @@
 
 #include <QJsonArray>
 #include <QJsonObject>
-#include <QSet>
 #include <QWidget>
 
 class QLabel;
 class QComboBox;
 class QLineEdit;
-class QPlainTextEdit;
 class QPushButton;
+class QTreeWidget;
+class QHBoxLayout;
 class LogClient;
+class ToolArgumentsForm;
+class ToolResultView;
 
-// Schema-driven GUI for the same catalog used by MCP and CLI. Adding a backend
-// tool automatically makes it available here without frontend code changes.
+// Human workflow over the same catalog/dispatcher used by MCP and CLI.
 class DebugToolPanel final : public QWidget {
     Q_OBJECT
-
    public:
     explicit DebugToolPanel(LogClient* client, QWidget* parent = nullptr);
+    void select_tool(const QString& name, const QJsonObject& arguments = {});
 
-   private slots:
-    void on_catalog_received(const QJsonArray& tools);
-    void on_tool_result(quint64 request_id, const QJsonObject& result);
+   private:
     void rebuild_tool_list();
     void show_selected_tool();
     void execute_selected_tool();
-    void copy_result() const;
-
-   private:
+    void update_run_state();
+    void remember_context(const QJsonObject& result);
+    void rebuild_followups();
+    void on_tool_result(quint64 request_id, const QJsonObject& result);
     [[nodiscard]] QJsonObject selected_tool() const;
     [[nodiscard]] QJsonObject suggested_arguments(const QJsonObject& tool) const;
-    void remember_context(const QJsonObject& result);
 
     LogClient* client;
     QJsonArray catalog;
     QJsonObject context;
-    QSet<quint64> pending_requests;
+    quint64 pending_request = 0;
+    QString pending_tool;
+    QString result_tool;
+    QJsonObject pending_arguments;
+    QString requested_tool = "wosdbg.load_incident";
+    QJsonObject requested_arguments;
+    QString form_tool;
     QLineEdit* filter_edit;
-    QComboBox* tool_combo;
+    QTreeWidget* tool_tree;
+    QComboBox* context_combo;
+    QLabel* title_label;
     QLabel* description_label;
-    QPlainTextEdit* schema_edit;
-    QPlainTextEdit* arguments_edit;
-    QPlainTextEdit* result_edit;
+    QLabel* status_label;
+    ToolArgumentsForm* arguments_form;
+    ToolResultView* result_view;
     QPushButton* execute_button;
+    QHBoxLayout* followups;
 };

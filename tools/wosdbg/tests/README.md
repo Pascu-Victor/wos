@@ -1,5 +1,36 @@
 # WOSDBG incident assurance fixtures
 
+`wosdbg_workspace_semantic_test` exercises the real main window: stationary
+outer navigation while switching dock layouts; evidence discovery; linked crash
+register/code/memory views; native disabled/enable/attach states; exact addresses;
+internal lease credentials; disconnect cleanup; bounded delayed log fetches;
+warm scrolling, cold jumps, cache eviction, and filter-response fencing.
+It also checks that live enablement requires confirmation and leaves the
+persistent configuration unchanged. The existing live suite checks that enabling
+an already-enabled manager does not break an active lease.
+
+```sh
+cmake --build build/tools --target wosdbg wosdbg_ui_semantic_test wosdbg_workspace_semantic_test
+QT_QPA_PLATFORM=offscreen tools/build/bin/wosdbg_workspace_semantic_test /tmp/wosdbg-workspace
+ctest --test-dir build/tools/wosdbg --output-on-failure
+```
+
+The optional workspace-test argument is a PNG filename prefix for welcome,
+crash, attach, and buffered-scroll screenshots. Tests use temporary settings and
+local fake peers, never a WOS VM. Desktop interaction and real-target checks
+must still be performed by the user.
+
+The `wosdbg_ui_semantic_test` CTest target also exercises the complete built
+catalog through offscreen Qt widgets: optional-argument omission versus explicit
+false, confirmations, exact 64-bit address strings, nested memory ranges,
+bounded and sorted evidence tables, follow-up context, asynchronous request
+identity, and disconnect cleanup. It uses a local fixture socket, not a VM.
+Build with `cmake --build build/tools --target wosdbg wosdbg_ui_semantic_test`
+and run `ctest --test-dir build/tools/wosdbg --output-on-failure`.
+An optional third executable argument saves a PNG of the analysis panel for
+visual inspection. MCP parity assertions also verify bounded summary text and
+the preserved structured result/error contract.
+
 This directory contains a deterministic, generated `.wosincident` corpus and
 an end-to-end CLI/MCP/GUI-wire semantic/security test. Nothing under this directory is
 a checked-in generated bundle: tests create compact fixtures in a disposable

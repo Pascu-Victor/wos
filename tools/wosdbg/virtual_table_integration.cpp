@@ -28,6 +28,8 @@ auto VirtualTableIntegration::initialize_virtual_table(QemuLogViewer* viewer, Lo
 
     // Set model
     virtual_view->setVirtualModel(model);
+    virtual_view->setRangeLoader([client](int first, int count) { client->prefetch_rows(first, count); },
+                                 [client](int first, int count) { return client->rows_ready(first, count); });
 
     // Configure appearance
     virtual_view->horizontalHeader()->resizeSection(0, 60);         // Line
@@ -55,12 +57,7 @@ auto VirtualTableIntegration::create_data_provider(LogClient* client) -> std::fu
         const LogEntry* entry = client->get_entry(row);
         if (!entry) {
             // Data not available yet (loading)
-            if (row < 5) {
-                qDebug() << "VirtualTableIntegration: Entry not found for row" << row;
-            }
             out_cells.clear();
-            out_cells.push_back(QString::number(row + 1));  // Line number
-            out_cells.emplace_back("Loading...");
             out_bg_color = Qt::black;
             return;
         }
@@ -112,28 +109,8 @@ void VirtualTableIntegration::format_row_data(const LogEntry* entry, std::vector
     // Assembly
     out_cells.push_back(QString::fromStdString(entry->assembly));
 
-    // Background color based on type
-    switch (entry->type) {
-        case EntryType::INSTRUCTION:
-            out_bg_color = QColor(9, 19, 9);  // Dark green
-            break;
-        case EntryType::INTERRUPT:
-            out_bg_color = QColor(19, 9, 9);  // Dark red
-            break;
-        case EntryType::REGISTER:
-            out_bg_color = QColor(9, 9, 19);  // Dark blue
-            break;
-        case EntryType::BLOCK:
-            out_bg_color = QColor(19, 19, 9);  // Dark yellow
-            break;
-        case EntryType::SEPARATOR:
-            out_bg_color = QColor(13, 13, 13);  // Dark gray
-            break;
-        case EntryType::OTHER:
-        default:
-            out_bg_color = QColor(8, 8, 8);  // Darker gray
-            break;
-    }
+    // Let the view palette and alternating rows supply readable backgrounds in every theme.
+    out_bg_color = Qt::transparent;
 }
 
 #include "moc_virtual_table_integration.cpp"  // NOLINT

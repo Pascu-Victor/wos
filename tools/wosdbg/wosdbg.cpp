@@ -24,7 +24,14 @@
 #include <qtreewidget.h>
 #include <qwidget.h>
 
+#include <QActionGroup>
+#include <QClipboard>
+#include <QDialog>
 #include <QDir>
+#include <QMenuBar>
+#include <QSettings>
+#include <QStatusBar>
+#include <QTabWidget>
 #include <algorithm>
 #include <climits>
 #include <cstdint>
@@ -37,6 +44,7 @@
 #include <vector>
 
 #include "config.h"
+#include "debugger_workspace.h"
 #include "log_client.h"
 #include "log_entry.h"
 #include "virtual_table.h"
@@ -463,6 +471,10 @@ class SyntaxHighlightDelegate : public QStyledItemDelegate {
     explicit SyntaxHighlightDelegate(QObject* parent = nullptr) : QStyledItemDelegate(parent) { setup_formats(); }
 
     void paint(QPainter* painter, const QStyleOptionViewItem& option, const QModelIndex& index) const override {
+        if (option.palette.base().color().lightness() > 128 || (option.state & QStyle::State_Selected)) {
+            QStyledItemDelegate::paint(painter, option, index);
+            return;
+        }
         int column = index.column();
 
         if (column == 3 || column == 5) {  // Function and Assembly columns (updated indices)
@@ -762,10 +774,15 @@ QemuLogViewer::QemuLogViewer(LogClient* client, QWidget* parent)
     current_selected_interrupt.clear();
     current_interrupt_index = -1;
 
-    client->request_mcp_server_status();
+    connect(client, &LogClient::connected, client, &LogClient::request_mcp_server_status);
+    if (client->is_connected()) {
+        client->request_mcp_server_status();
+    }
 }
 
 QemuLogViewer::~QemuLogViewer() {
+    QSettings settings("WOS", "WOSDBG");
+    settings.setValue("window/geometry", saveGeometry());
     // Qt manages QTableWidgetItem cleanup automatically
     // LogProcessor now manages QProcess objects internally
     // No manual cleanup needed
@@ -816,24 +833,35 @@ void QemuLogViewer::cancel_search() {
     }
 }
 
-void QemuLogViewer::setup_dark_theme() {
-    // Use system theme detection
-    QPalette palette = QApplication::palette();
-    bool is_dark_theme = palette.color(QPalette::Window).lightness() < 128;
-
-    if (!is_dark_theme) {
-        // If system is not dark, apply our dark theme for better code viewing
-        is_dark_theme = true;
-    }
-
-    if (is_dark_theme) {
-        apply_theme("dark");
-    }
-    // If not dark theme, use default system styling
-}
+void QemuLogViewer::setup_dark_theme() { apply_theme(QSettings("WOS", "WOSDBG").value("appearance/theme", "dark").toString()); }
 
 void QemuLogViewer::apply_theme(const QString& theme_name) {
+    static const QPalette SYSTEM_PALETTE = QApplication::palette();
     QString style_sheet;
+    QPalette palette = QApplication::style()->standardPalette();
+    if (theme_name == "system") {
+        palette = SYSTEM_PALETTE;
+    } else if (theme_name == "dark" || theme_name == "high-contrast") {
+        const bool contrast = theme_name == "high-contrast";
+        palette.setColor(QPalette::Window, QColor(contrast ? "#000000" : "#25282e"));
+        palette.setColor(QPalette::WindowText, QColor("#eef0f4"));
+        palette.setColor(QPalette::Base, QColor(contrast ? "#000000" : "#1d2025"));
+        palette.setColor(QPalette::AlternateBase, QColor(contrast ? "#111111" : "#292e36"));
+        palette.setColor(QPalette::Text, QColor("#eef0f4"));
+        palette.setColor(QPalette::Button, QColor(contrast ? "#111111" : "#343a44"));
+        palette.setColor(QPalette::ButtonText, QColor("#eef0f4"));
+        palette.setColor(QPalette::Highlight, QColor(contrast ? "#ffff00" : "#315d91"));
+        palette.setColor(QPalette::HighlightedText, QColor(contrast ? "#000000" : "#ffffff"));
+        palette.setColor(QPalette::PlaceholderText, QColor("#a3aab5"));
+        palette.setColor(QPalette::Mid, QColor(contrast ? "#ffffff" : "#414751"));
+        palette.setColor(QPalette::Light, QColor(contrast ? "#ffffff" : "#414751"));
+        palette.setColor(QPalette::Dark, QColor(contrast ? "#ffffff" : "#191c21"));
+        palette.setColor(QPalette::Disabled, QPalette::Text, QColor("#8d929b"));
+        palette.setColor(QPalette::Disabled, QPalette::ButtonText, QColor("#8d929b"));
+    }
+    // Qt stylesheet palette() expressions use the application palette, including dialogs.
+    QApplication::setPalette(palette);
+    setPalette(palette);
 
     if (theme_name == "dark") {
         style_sheet = get_dark_theme_css();
@@ -843,6 +871,27 @@ void QemuLogViewer::apply_theme(const QString& theme_name) {
         style_sheet = get_high_contrast_theme_css();
     }
 
+    style_sheet += R"(
+        QLabel#debuggerTitle { font-size: 17px; font-weight: 600; }
+        QLabel#welcomeTitle { font-size: 27px; font-weight: 600; padding-bottom: 12px; }
+        QLabel#paneHeading { font-size: 11px; font-weight: 600; padding: 7px 8px; }
+        QLabel#crashSummary { padding: 12px; border: 1px solid palette(mid); border-radius: 4px; }
+        QLabel#debuggerNotice { padding: 10px; border-left: 3px solid #d9a441; background: palette(alternate-base); }
+        QWidget#debuggerWorkspace QPushButton { padding: 7px 12px; min-height: 20px; }
+        QWidget#debuggerWorkspace QLineEdit { padding: 7px; }
+        QTabWidget#workspaceTabs > QTabBar::tab { padding: 11px 22px; min-width: 150px; }
+        QTabWidget#workspaceTabs > QTabBar::tab:selected { border-bottom: 2px solid #4b9ee8; }
+        QSplitter::handle { background: palette(window); }
+        QSplitter::handle:hover { background: palette(highlight); }
+        QTableWidget { selection-background-color: palette(highlight); selection-color: palette(highlighted-text); }
+        QWidget#debuggerWorkspace QTableWidget { background: palette(base); alternate-background-color: palette(alternate-base); border: 0; }
+        QWidget#debuggerWorkspace QTableWidget::item { padding: 3px 6px; border: 0; }
+        QWidget#debuggerWorkspace QHeaderView::section { background: palette(window); border: 0; border-bottom: 1px solid palette(mid); padding: 7px 6px; }
+        QWidget#debuggerWorkspace QTabWidget::pane { border: 0; }
+        QWidget#debuggerWorkspace QTabBar::tab { background: palette(window); border: 0; }
+        QWidget#debuggerWorkspace QTabBar::tab:selected { border-bottom: 2px solid #4b9ee8; }
+        QTabWidget#workspaceTabs::pane { border: 0; }
+    )";
     setStyleSheet(style_sheet);
 }
 
@@ -872,12 +921,6 @@ QString QemuLogViewer::get_dark_theme_css() {
         QComboBox::drop-down {
             border: none;
             width: 20px;
-        }
-
-        QComboBox::down-arrow {
-            width: 12px;
-            height: 12px;
-            border: none;
         }
 
         QComboBox QAbstractItemView {
@@ -927,18 +970,21 @@ QString QemuLogViewer::get_dark_theme_css() {
             spacing: 5px;
         }
 
-        QCheckBox::indicator {
-            width: 16px;
-            height: 16px;
-            background-color: #404040;
-            border: 1px solid #555555;
-            border-radius: 3px;
+        QTreeWidget, QPlainTextEdit {
+            background-color: #1d2025;
+            alternate-background-color: #292e36;
+            color: #eef0f4;
+            selection-background-color: #315d91;
+            selection-color: #ffffff;
+            border: 1px solid #474d57;
         }
-
-        QCheckBox::indicator:checked {
-            background-color: #1e3a5f;
-            border: 1px solid #1e3a5f;
-        }
+        QTreeWidget::item { padding: 5px 3px; }
+        QMenuBar, QMenu { background-color: #25282e; color: #eef0f4; }
+        QMenuBar::item:selected, QMenu::item:selected { background-color: #315d91; }
+        QTabBar::tab { background-color: #343a44; color: #eef0f4; padding: 9px 16px; }
+        QTabBar::tab:selected { background-color: #315d91; }
+        QTabWidget::pane { border: 1px solid #474d57; }
+        QPushButton#run_analysis:enabled { background-color: #315d91; border-color: #6c9ed4; }
 
         QTableWidget {
             background-color: #1a1a1a;
@@ -1140,18 +1186,25 @@ QString QemuLogViewer::get_high_contrast_theme_css() {
 
 void QemuLogViewer::setup_ui() {
     setWindowTitle("wosdbg - WOS Debugger");
-    setMinimumSize(1200, 800);
-    resize(1600, 1000);
+    setMinimumSize(960, 680);
+    resize(1440, 960);
+    viewer_window = new QMainWindow(this);
+    viewer_window->setObjectName("evidenceViewer");
+    viewer_window->setWindowFlags(Qt::Widget);
 
     setup_toolbar();
     setup_main_content();
     setup_coredump_panels();
     setup_tool_panel();
+    setup_menus();
+    restoreGeometry(QSettings("WOS", "WOSDBG").value("window/geometry").toByteArray());
 }
 
 void QemuLogViewer::setup_toolbar() {
-    toolbar = addToolBar("Main");
+    toolbar = viewer_window->addToolBar("Main");
+    toolbar->setObjectName("mainToolbar");
     toolbar->setMovable(false);
+    auto* file_toolbar = toolbar;
 
     // File selector
     toolbar->addWidget(new QLabel("Log File:"));
@@ -1165,11 +1218,17 @@ void QemuLogViewer::setup_toolbar() {
 
     toolbar->addSeparator();
 
+    // Keep search/navigation and interrupt filters on separate recoverable rows.
+    viewer_window->addToolBarBreak();
+    toolbar = viewer_window->addToolBar("Search and navigation");
+    toolbar->setObjectName("searchToolbar");
+    toolbar->setProperty("viewerOnly", true);
     // Search controls
     toolbar->addWidget(new QLabel("Search:"));
     search_edit = new QLineEdit();
     search_edit->setPlaceholderText("Search addresses, functions, assembly... (Enter: next, Shift+Enter: prev, Esc: cancel)");
-    search_edit->setMinimumWidth(300);
+    search_edit->setMinimumWidth(180);
+    search_edit->setClearButtonEnabled(true);
     toolbar->addWidget(search_edit);
 
     regex_checkbox = new QCheckBox("Regex");
@@ -1201,6 +1260,10 @@ void QemuLogViewer::setup_toolbar() {
 
     toolbar->addSeparator();
 
+    viewer_window->addToolBarBreak();
+    toolbar = viewer_window->addToolBar("Interrupt filters");
+    toolbar->setObjectName("interruptToolbar");
+    toolbar->setProperty("viewerOnly", true);
     // Interrupt filter dropdown
     toolbar->addWidget(new QLabel("Interrupts:"));
     interrupt_filter_combo = new QComboBox();
@@ -1228,11 +1291,12 @@ void QemuLogViewer::setup_toolbar() {
     progress_bar = new QProgressBar();
     progress_bar->setVisible(false);
     progress_bar->setMaximumWidth(200);
-    toolbar->addWidget(progress_bar);
+    statusBar()->addPermanentWidget(progress_bar);
 
     status_label = new QLabel("Ready");
-    toolbar->addWidget(status_label);
+    statusBar()->addWidget(status_label, 1);
 
+    toolbar = file_toolbar;
     toolbar->addSeparator();
 
     // Coredump controls
@@ -1246,7 +1310,7 @@ void QemuLogViewer::setup_toolbar() {
     connect(extract_btn, &QPushButton::clicked, this, &QemuLogViewer::extract_coredumps);
     toolbar->addWidget(extract_btn);
 
-    auto* refresh_dumps_btn = new QPushButton("🔄");
+    auto* refresh_dumps_btn = new QPushButton("Refresh dumps");
     refresh_dumps_btn->setToolTip("Refresh coredump list");
     connect(refresh_dumps_btn, &QPushButton::clicked, this, &QemuLogViewer::refresh_coredumps);
     toolbar->addWidget(refresh_dumps_btn);
@@ -1262,7 +1326,7 @@ void QemuLogViewer::setup_toolbar() {
 void QemuLogViewer::setup_main_content() {
     // Central widget: log table only
     auto* central_widget = new QWidget();
-    setCentralWidget(central_widget);
+    viewer_window->setCentralWidget(central_widget);
     auto* layout = new QVBoxLayout(central_widget);
     layout->setContentsMargins(0, 0, 0, 0);
 
@@ -1278,7 +1342,7 @@ void QemuLogViewer::setup_main_content() {
     interrupts_dock = new QDockWidget("Interrupts", this);
     interrupts_dock->setWidget(interrupts_panel);
     interrupts_dock->setAllowedAreas(Qt::LeftDockWidgetArea | Qt::RightDockWidgetArea);
-    addDockWidget(Qt::LeftDockWidgetArea, interrupts_dock);
+    viewer_window->addDockWidget(Qt::LeftDockWidgetArea, interrupts_dock);
 
     // --- Hex bytes (bottom dock) ---
     hex_view = new QTextEdit();
@@ -1289,7 +1353,7 @@ void QemuLogViewer::setup_main_content() {
     hex_dock = new QDockWidget("Hex Bytes", this);
     hex_dock->setWidget(hex_view);
     hex_dock->setAllowedAreas(Qt::AllDockWidgetAreas);
-    addDockWidget(Qt::BottomDockWidgetArea, hex_dock);
+    viewer_window->addDockWidget(Qt::BottomDockWidgetArea, hex_dock);
 
     // --- Disassembly (right dock) ---
     disassembly_view = new QTextEdit();
@@ -1300,7 +1364,7 @@ void QemuLogViewer::setup_main_content() {
     disassembly_dock = new QDockWidget("Disassembly", this);
     disassembly_dock->setWidget(disassembly_view);
     disassembly_dock->setAllowedAreas(Qt::AllDockWidgetAreas);
-    addDockWidget(Qt::RightDockWidgetArea, disassembly_dock);
+    viewer_window->addDockWidget(Qt::RightDockWidgetArea, disassembly_dock);
 
     // --- Interrupt details (right dock, stacked below disassembly) ---
     details_pane = new QTextBrowser();
@@ -1313,10 +1377,10 @@ void QemuLogViewer::setup_main_content() {
     details_dock = new QDockWidget("Interrupt Details", this);
     details_dock->setWidget(details_pane);
     details_dock->setAllowedAreas(Qt::AllDockWidgetAreas);
-    addDockWidget(Qt::RightDockWidgetArea, details_dock);
+    viewer_window->addDockWidget(Qt::RightDockWidgetArea, details_dock);
 
     // Stack disassembly and details vertically in the right dock area
-    splitDockWidget(disassembly_dock, details_dock, Qt::Vertical);
+    viewer_window->splitDockWidget(disassembly_dock, details_dock, Qt::Vertical);
 }
 
 void QemuLogViewer::setup_table() {
@@ -1509,7 +1573,9 @@ void QemuLogViewer::on_file_ready(int total_lines) {
     status_label->setText(QString("Loaded %1 lines").arg(total_lines));
 
     // Request interrupts
-    client->request_interrupts();
+    if (client->is_connected() && total_lines > 0) {
+        client->request_interrupts();
+    }
 }
 
 void QemuLogViewer::on_file_list_received(const QStringList& files) {
@@ -2399,11 +2465,11 @@ void QemuLogViewer::setup_coredump_panels() {
     browser_dock = new QDockWidget("Coredump Browser", this);
     browser_dock->setWidget(coredump_browser);
     browser_dock->setAllowedAreas(Qt::LeftDockWidgetArea | Qt::RightDockWidgetArea);
-    addDockWidget(Qt::LeftDockWidgetArea, browser_dock);
+    viewer_window->addDockWidget(Qt::LeftDockWidgetArea, browser_dock);
 
     // Tab the coredump browser with the interrupts panel
     if (interrupts_dock) {
-        tabifyDockWidget(interrupts_dock, browser_dock);
+        viewer_window->tabifyDockWidget(interrupts_dock, browser_dock);
         interrupts_dock->raise();  // Show interrupts tab by default
     }
 
@@ -2423,14 +2489,14 @@ void QemuLogViewer::setup_coredump_panels() {
 
     // --- Register panel (right dock) ---
     register_panel = new CoredumpRegisterPanel(this);
-    addDockWidget(Qt::RightDockWidgetArea, register_panel);
+    viewer_window->addDockWidget(Qt::RightDockWidgetArea, register_panel);
     register_panel->hide();  // Hidden until a coredump is loaded
     connect(register_panel, &CoredumpRegisterPanel::address_clicked, this, &QemuLogViewer::on_coredump_address_clicked);
 
     // --- Segment panel (right dock, tabified with registers) ---
     segment_panel = new CoredumpSegmentPanel(this);
-    addDockWidget(Qt::RightDockWidgetArea, segment_panel);
-    tabifyDockWidget(register_panel, segment_panel);
+    viewer_window->addDockWidget(Qt::RightDockWidgetArea, segment_panel);
+    viewer_window->tabifyDockWidget(register_panel, segment_panel);
     segment_panel->hide();
 
     connect(segment_panel, &CoredumpSegmentPanel::dump_segment_requested, this, [this](int /*idx*/, uint64_t vaStart, uint64_t vaEnd) {
@@ -2441,44 +2507,235 @@ void QemuLogViewer::setup_coredump_panels() {
 
     // --- ELF info panel (right dock, tabified) ---
     elf_panel = new CoredumpElfPanel(this);
-    addDockWidget(Qt::RightDockWidgetArea, elf_panel);
-    tabifyDockWidget(segment_panel, elf_panel);
+    viewer_window->addDockWidget(Qt::RightDockWidgetArea, elf_panel);
+    viewer_window->tabifyDockWidget(segment_panel, elf_panel);
     elf_panel->hide();
 
     // --- Disassembly panel (right dock, tabified with ELF panel) ---
     disasm_panel = new CoredumpDisasmPanel(this);
-    addDockWidget(Qt::RightDockWidgetArea, disasm_panel);
-    tabifyDockWidget(elf_panel, disasm_panel);
+    viewer_window->addDockWidget(Qt::RightDockWidgetArea, disasm_panel);
+    viewer_window->tabifyDockWidget(elf_panel, disasm_panel);
     disasm_panel->hide();
     connect(disasm_panel, &CoredumpDisasmPanel::address_clicked, this, &QemuLogViewer::on_coredump_address_clicked);
 
     // --- Memory/Stack panel (bottom dock, tabbed with hex bytes) ---
     memory_panel = new CoredumpMemoryPanel(this);
-    addDockWidget(Qt::BottomDockWidgetArea, memory_panel);
+    viewer_window->addDockWidget(Qt::BottomDockWidgetArea, memory_panel);
     memory_panel->hide();
     connect(memory_panel, &CoredumpMemoryPanel::address_clicked, this, &QemuLogViewer::on_coredump_address_clicked);
 
     // Tab memory panel with hex bytes dock
     if (hex_dock) {
-        tabifyDockWidget(hex_dock, memory_panel);
+        viewer_window->tabifyDockWidget(hex_dock, memory_panel);
         hex_dock->raise();  // Show hex bytes tab by default
     }
 }
 
 void QemuLogViewer::setup_tool_panel() {
-    tool_panel = new DebugToolPanel(client, this);
-    tool_dock = new QDockWidget("Analysis Tools", this);
-    tool_dock->setObjectName("analysisToolsDock");
-    tool_dock->setWidget(tool_panel);
-    tool_dock->setAllowedAreas(Qt::AllDockWidgetAreas);
-    addDockWidget(Qt::BottomDockWidgetArea, tool_dock);
-    if (details_dock) {
-        tabifyDockWidget(details_dock, tool_dock);
+    advanced_dialog = new QDialog(this);
+    advanced_dialog->setWindowTitle("Advanced analysis · complete capability catalog");
+    advanced_dialog->resize(1200, 800);
+    auto* advanced_layout = new QVBoxLayout(advanced_dialog);
+    tool_panel = new DebugToolPanel(client, advanced_dialog);
+    advanced_layout->addWidget(tool_panel);
+    debugger_workspace = new DebuggerWorkspace(client, this);
+    workspace_tabs = new QTabWidget(this);
+    workspace_tabs->setObjectName("workspaceTabs");
+    workspace_tabs->setDocumentMode(true);
+    workspace_tabs->addTab(debugger_workspace, "Debugger");
+    workspace_tabs->addTab(viewer_window, "Execution log / local coredump");
+    setCentralWidget(workspace_tabs);
+    connect(debugger_workspace, &DebuggerWorkspace::advanced_requested, this, [this](const QString& tool, const QJsonObject& args) {
+        const QString selected_tool = !tool.isEmpty()               ? tool
+                                      : args.contains("dumpId")     ? "get_crash_summary"
+                                      : args.contains("sessionId")  ? "get_live_session"
+                                      : args.contains("incidentId") ? "summarize_incident"
+                                                                    : "status";
+        tool_panel->select_tool(selected_tool, args);
+        advanced_dialog->show();
+        advanced_dialog->raise();
+        advanced_dialog->activateWindow();
+    });
+    connect(debugger_workspace, &DebuggerWorkspace::log_requested, this, [this](const QString& path) {
+        if (!file_selector->isEnabled()) {
+            status_label->setText("A log is still loading. Open another log after it finishes.");
+            return;
+        }
+        workspace_tabs->setCurrentIndex(1);
+        const bool unchanged = file_selector->currentText() == path;
+        const int index = file_selector->findText(path);
+        if (index < 0) {
+            file_selector->addItem(path);
+        }
+        file_selector->setCurrentText(path);
+        // currentTextChanged selects the file; do not enqueue the same load twice.
+        if (unchanged && client->get_total_lines() == 0) {
+            on_file_selected(path);
+        }
+    });
+    connect(file_selector, &QComboBox::activated, this, [this]() {
+        workspace_tabs->setCurrentIndex(1);
+        if (client->get_total_lines() == 0 && file_selector->isEnabled()) {
+            on_file_selected(file_selector->currentText());
+        }
+    });
+}
+
+void QemuLogViewer::setup_menus() {
+    auto* file = menuBar()->addMenu("&File");
+    auto choose = [this](const QString& name) {
+        tool_panel->select_tool(name, debugger_workspace->context());
+        advanced_dialog->show();
+        advanced_dialog->raise();
+        advanced_dialog->activateWindow();
+    };
+    file->addAction("Open &coredump…", QKeySequence::Open, this, [this]() {
+        workspace_tabs->setCurrentIndex(0);
+        debugger_workspace->choose_file("coredump");
+    });
+    file->addAction("Open &incident…", this, [this]() {
+        workspace_tabs->setCurrentIndex(0);
+        debugger_workspace->choose_file("incident");
+    });
+    file->addAction("Open &log…", this, [this]() { debugger_workspace->choose_file("log"); });
+    file->addSeparator();
+    file->addAction("Open local coredump in viewer…", this, [this]() {
+        const QString path =
+            QFileDialog::getOpenFileName(this, "Open coredump", ConfigService::instance().get_config().get_coredump_directory());
+        if (!path.isEmpty()) {
+            open_coredump(path);
+        }
+    });
+    file->addAction("Coredump directory…", this, &QemuLogViewer::browse_coredump_directory);
+    file->addAction("Refresh logs and coredumps", QKeySequence::Refresh, this, [this]() {
+        client->request_file_list();
+        refresh_coredumps();
+    });
+    file->addSeparator();
+    file->addAction("&Quit", QKeySequence::Quit, this, &QWidget::close);
+
+    auto* view = menuBar()->addMenu("&View");
+    view->addAction("Debugger", QKeySequence("Ctrl+1"), this, [this]() { workspace_tabs->setCurrentIndex(0); });
+    view->addAction("Log and coredump viewer", QKeySequence("Ctrl+2"), this, [this]() { workspace_tabs->setCurrentIndex(1); });
+    view->addSeparator();
+    auto* panels = view->addMenu("Panels");
+    for (auto* dock : findChildren<QDockWidget*>()) {
+        if (dock->objectName().isEmpty()) {
+            dock->setObjectName(dock->windowTitle());
+        }
+        auto* action = dock->toggleViewAction();
+        panels->addAction(action);
+        connect(action, &QAction::triggered, this, [this, dock](bool checked) {
+            if (checked) {
+                workspace_tabs->setCurrentIndex(1);
+                dock->show();
+                dock->raise();
+            }
+        });
     }
-    auto* toggle_action = tool_dock->toggleViewAction();
-    toggle_action->setText("Tools");
-    toggle_action->setToolTip("Open the complete shared MCP / CLI / GUI analysis toolset");
-    toolbar->addAction(toggle_action);
+    auto* bars = view->addMenu("Toolbars");
+    for (auto* bar : findChildren<QToolBar*>()) {
+        bars->addAction(bar->toggleViewAction());
+    }
+    const QByteArray default_layout = viewer_window->saveState();
+    view->addAction("Reset viewer layout", this, [this, default_layout]() {
+        viewer_window->restoreState(default_layout);
+        workspace_tabs->setCurrentIndex(1);
+        interrupts_dock->show();
+        browser_dock->show();
+        hex_dock->show();
+        disassembly_dock->show();
+        details_dock->show();
+        for (auto* bar : findChildren<QToolBar*>()) {
+            bar->show();
+        }
+    });
+    auto* appearance = view->addMenu("Appearance");
+    auto* theme_group = new QActionGroup(this);
+    for (const QString& theme : {"dark", "light", "high-contrast", "system"}) {
+        auto* action = appearance->addAction(theme);
+        action->setCheckable(true);
+        action->setChecked(theme == QSettings("WOS", "WOSDBG").value("appearance/theme", "dark").toString());
+        theme_group->addAction(action);
+        connect(action, &QAction::triggered, this, [this, theme]() {
+            apply_theme(theme);
+            QSettings("WOS", "WOSDBG").setValue("appearance/theme", theme);
+        });
+    }
+    auto* analyze = menuBar()->addMenu("&Analyze");
+    auto* analyze_current = analyze->addAction("Analyze coredump from viewer…", this, [this]() {
+        workspace_tabs->setCurrentIndex(0);
+        debugger_workspace->open_path("coredump", current_coredump_path);
+    });
+    analyze_current->setToolTip("Open this coredump in the analysis backend. Adjust the path if connected to a different host.");
+    connect(analyze, &QMenu::aboutToShow, this,
+            [this, analyze_current]() { analyze_current->setEnabled(!current_coredump_path.isEmpty()); });
+    analyze->addSeparator();
+    const QList<QPair<QString, QString>> actions{
+        {"Crash summary", "get_crash_summary"},     {"Backtrace", "backtrace_coredump"},
+        {"Memory", "get_memory_context"},           {"Executable integrity", "analyze_elf_integrity"},
+        {"Incident summary", "summarize_incident"}, {"Distributed timeline", "build_distributed_timeline"},
+        {"Page-table inspection", "inspect_pte"}};
+    for (const auto& action : actions) {
+        analyze->addAction(action.first, this, [this, choose, name = action.second]() {
+            if (name == "get_crash_summary" || name == "backtrace_coredump" || name == "get_memory_context") {
+                workspace_tabs->setCurrentIndex(0);
+                debugger_workspace->focus_view(name);
+            } else {
+                choose(name);
+            }
+        });
+    }
+    analyze->addSeparator();
+    analyze->addAction("Advanced analysis…", QKeySequence("Ctrl+Shift+P"), this, [this]() {
+        advanced_dialog->show();
+        advanced_dialog->raise();
+        advanced_dialog->activateWindow();
+    });
+    auto* debug = menuBar()->addMenu("&Debug");
+    debug->addAction("Attach to target…", this, [this]() {
+        workspace_tabs->setCurrentIndex(0);
+        debugger_workspace->show_targets();
+    });
+    auto* agent = menuBar()->addMenu("A&gent");
+    agent->addAction("Start / stop MCP", this, &QemuLogViewer::on_mcp_toggle);
+    auto* copy_endpoint = agent->addAction("Copy MCP endpoint", this, [this]() {
+        if (mcp_running) {
+            QApplication::clipboard()->setText(mcp_endpoint);
+        }
+    });
+    connect(agent, &QMenu::aboutToShow, this, [this, copy_endpoint]() { copy_endpoint->setEnabled(mcp_running); });
+    agent->addAction("Connection and usage…", this, [this]() {
+        QMessageBox box(this);
+        box.setWindowTitle("Agent access");
+        box.setTextFormat(Qt::PlainText);
+        box.setText(mcp_running ? "MCP is running at " + mcp_endpoint : "MCP is stopped. Use Agent → Start / stop MCP to enable it.");
+        box.setInformativeText(
+            "Connect your agent to the HTTP /mcp endpoint. Tools return concise text and complete structured evidence.\n\n"
+            "Without MCP, use wosdbg --list-tools, --tool NAME --arguments JSON, or --batch FILE. Batch calls preserve sessions.\n\n"
+            "Paths and sessions belong to the connected backend. The Human Analysis workspace uses that same backend.");
+        box.exec();
+    });
+    auto* help = menuBar()->addMenu("&Help");
+    help->addAction("Getting started", this, [this]() {
+        QMessageBox::information(this, "WOSDBG",
+                                 "1. Open an incident, log, or coredump from File.\n"
+                                 "2. Double-click stack frames or registers to follow addresses into code and memory.\n"
+                                 "3. Use Debug → Attach to target for confirmed live inspection.\n"
+                                 "4. Advanced analysis contains specialist operations and the full tool catalog.\n\n"
+                                 "View → Panels restores closed local-viewer panels.\n"
+                                 "Ctrl+1: Debugger · Ctrl+2: Viewer · Ctrl+O: Open coredump · Ctrl+Shift+P: Advanced");
+    });
+    auto* find = new QAction(this);
+    find->setShortcut(QKeySequence::Find);
+    addAction(find);
+    connect(find, &QAction::triggered, this, [this]() {
+        if (workspace_tabs->currentIndex() == 0) {
+            debugger_workspace->findChild<QLineEdit*>("evidenceFilter")->setFocus();
+        } else {
+            search_edit->setFocus();
+        }
+    });
 }
 
 void QemuLogViewer::open_coredump(const QString& file_path) {
@@ -2490,6 +2747,8 @@ void QemuLogViewer::open_coredump(const QString& file_path) {
     }
 
     current_core_dump = std::move(dump);
+    current_coredump_path = file_path;
+    workspace_tabs->setCurrentIndex(1);
 
     // Resolve symbols from filename + config
     resolve_symbols_for_coredump();
@@ -2559,6 +2818,7 @@ void QemuLogViewer::close_coredump() {
     disasm_panel->hide();
 
     current_core_dump.reset();
+    current_coredump_path.clear();
     core_dump_symtab.reset();
     core_dump_sections.reset();
     embedded_symtab.reset();

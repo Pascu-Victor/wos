@@ -80,7 +80,7 @@ loaded modules when available.
 ## MCP and analysis safety bounds
 
 The `mcp` object also supplies bounds and roots to the shared analysis backend,
-so they apply to MCP, CLI, and the GUI Analysis Tools dock:
+so they apply to MCP, CLI, and the GUI debugger and advanced analyses:
 
 - `bindAddress`, `port`: default MCP listener.
 - `allowedCidrs`: clients permitted to reach MCP. Loopback is the safe default.
@@ -108,7 +108,20 @@ above are rejected by analysis operations.
 
 ## Live targets and leases
 
-Live debugging is disabled unless `live.enabled` is true. Runtime descriptors
+Live debugging starts disabled unless `live.enabled` is true. A user can opt in
+for the current backend process through **Debug → Attach → Enable live debugging**.
+The shared `enable_live_debugging` operation requires
+`confirmation=ENABLE_CONFIGURED_LIVE_TARGETS`; it does not persist settings,
+connect to a target, or pause a VM. The optional `profile` is `configured`
+(default), `cluster` (`cluster-overlays/live-debug.json`), or `ktest`
+(`ktest-data/live-debug.json`), relative to the backend configuration directory.
+Preset discovery validates the descriptor before replacing a disabled manager.
+An enabled manager is never replaced, so existing leases remain intact.
+Process-local enablement applies to all authorized frontends connected to that
+backend; `enabled: false` is a startup default, not an immutable administrative
+deny rule. The endpoint allowlist, roots, read limits, and pause confirmations
+continue to apply. No arbitrary endpoints or descriptor paths are accepted in
+tool arguments. Runtime descriptors
 are local mode-0600 files produced while `wos-cluster` or `wos-ktest` owns the
 corresponding VMs. WOSDBG accepts only version 1 descriptors below an effective
 allowed root, validates the recorded process identity, and connects only to
@@ -145,3 +158,11 @@ capability.
 
 See [README.md](README.md) for GUI, CLI, MCP, batch workflows, and the full
 capability map.
+
+## Local GUI preferences
+
+The GUI stores appearance and window geometry in Qt's per-user `WOS/WOSDBG`
+settings. These preferences do not change `wosdbg.json` or backend analysis
+policy. Evidence suggestions and lease tokens are held only in memory and are
+cleared when the backend disconnects. Clearing suggestions does not close a
+live lease; use the explicit close action.

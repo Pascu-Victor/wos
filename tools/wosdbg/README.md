@@ -3,8 +3,8 @@
 WOSDBG is the host-side WOS log and coredump debugger. It has one stateful
 analysis backend and three equivalent tool interfaces:
 
-- **GUI:** interactive log/coredump views plus the schema-driven **Analysis
-  Tools** dock.
+- **GUI:** a debugger workspace with linked machine-state views, an evidence
+  browser, and a guided live-attach screen. Specialist tools live in Advanced Analysis.
 - **CLI:** JSON commands and state-preserving batch workflows for agents or
   scripts that do not have MCP connected.
 - **MCP:** HTTP MCP endpoint for an MCP-capable agent.
@@ -33,17 +33,74 @@ Run:
 tools/build/bin/wosdbg
 ```
 
-The existing log table and coredump panels remain available. Open **Tools** in
-the toolbar to show the **Analysis Tools** dock. It lists the complete shared
-catalog, displays each JSON input schema, prepares required arguments, runs the
-selected tool asynchronously against the active backend, and shows copyable
-structured JSON. Successful `load_log`, `open_coredump`, and `load_incident`
-calls are remembered so later tools receive the active `logId`, `dumpId`, or
-`incidentId`.
+Start in **Debugger**. Double-click a file in the evidence sidebar, or use
+**File → Open coredump**, **Open incident**, or **Open log**. Coredumps open
+directly into a crash summary, call stack, registers, disassembly, memory, source,
+and modules. Double-click a register or frame to follow its address into code
+and memory; right-click for navigation and copy actions. Back/forward buttons
+retain address history. Choose **Fault context** or **Saved context** to inspect
+the corresponding captured register set. No tool names, session IDs, or JSON
+are required for these workflows.
 
-The GUI can also start or stop MCP with **MCP On/Off**. In remote GUI mode, tool
-calls run on the connected WOSDBG server, so its configured roots and sessions
-apply.
+**Debug → Attach to target** opens target discovery and selection. If live access
+is off, choose **Configured targets**, **Running WOS cluster**, or **Isolated
+KTEST VM**, then **Enable live debugging**. The latter two use the standard
+runtime descriptors relative to the backend configuration directory; they do
+not scan endpoints or launch VMs. Enablement is an explicit, process-local
+choice shared by all connected frontends. An already-enabled manager and its
+leases are never replaced; restart the backend to select another preset.
+
+Select a target and choose **Attach and pause**. Confirm with an inspection
+reason. The debugger shows registers and a call stack, the remaining pause
+lease, **Extend pause**, and **Detach / release pause**. Detach releases only
+pauses acquired by WOSDBG. Lease expiry and disconnect clear live context.
+Raw memory reads require separate confirmation. Credentials are held internally,
+not displayed as form fields. Stepping, writes, and breakpoints are not supported.
+
+**Advanced analysis** (Ctrl+Shift+P) retains the complete tool catalog for
+specialist operations, including executable integrity, WKI and remote-exec
+analysis, incident validation, and full structured exports. It opens separately
+from the main debugger layout, with the current evidence context preselected.
+
+Inputs use file/folder pickers, text and numeric fields, choice menus, toggles,
+and add/remove controls for lists and memory ranges. Fields marked `*` are
+required. Check an optional field to include it; unchecked fields are omitted
+so backend defaults remain intact, including booleans whose default is true.
+Live pause, sensitive memory, transcript export, and incident capture use
+explicit confirmation checkboxes, never preselected confirmations. Exported
+transcript objects can be imported from a document without editing JSON.
+
+Results show a summary and expandable evidence. Select an evidence list for a
+sortable, filterable table; select rows to reuse their session, path, target,
+or address in a follow-up action. The evidence selector remembers up to 32
+session entries in memory, including paired live session IDs and lease tokens.
+**Clear context** forgets suggestions; it does not close backend sessions.
+In Advanced Analysis, use **Close live session** to release its live session. Disconnection clears form
+context. Tables page through returned data in groups of 500 rows with up to 32
+columns; double-click a row to inspect all its fields. Tree list previews show
+up to 500 items. **JSON / export** preserves every field returned by the backend. Backend scan
+and response limits still apply. **Tool schema** is available for developers.
+
+The **Execution log / local coredump** workspace retains the dedicated register, memory,
+disassembly, ELF, interrupt, and execution-log panels. **View → Panels** restores
+closed panels; **Reset viewer layout** restores their layout. Search and
+interrupt controls have separate toolbar rows. Appearance and window geometry
+are remembered locally. **Analyze → Analyze coredump from viewer** prepares the
+current viewer file for backend inspection (the path must also exist on the backend).
+Workspace navigation stays outside the dock layout, so switching pages does not
+move its tabs. Log scrolling uses aligned 1,024-row chunks, at most four in-flight
+requests, several thousand rows of read-ahead, and a bounded cache. Cold jumps
+retain the previous complete view with a loading banner until the requested rows
+are ready; retained rows cannot be clicked as if they belonged to the new offset.
+Formatted rows are cached only when complete, and scrolling never suspends loading.
+Shortcuts: **Ctrl+1** Debugger, **Ctrl+2** Viewer,
+**Ctrl+O** Open coredump, **Ctrl+F** search, **Alt+Left/Right** address history,
+**Ctrl+Shift+P** Advanced analysis, **Ctrl+Enter** run an advanced analysis.
+
+Use **Agent** to start/stop MCP, copy its endpoint, or read connection guidance.
+In remote GUI mode, analysis paths and sessions belong to the connected backend.
+File pickers browse the local machine; enter the backend path when those hosts
+differ. **Open local coredump in viewer** explicitly uses the local viewer.
 
 ## CLI
 
@@ -51,6 +108,14 @@ List the authoritative catalog:
 
 ```sh
 tools/build/bin/wosdbg --list-tools
+```
+
+For concise discovery, list names and short descriptions first, then request
+only the schema you need. Neither command invokes an analysis operation:
+
+```sh
+tools/build/bin/wosdbg --list-tools --brief
+tools/build/bin/wosdbg --tool-help analyze_coredump
 ```
 
 Invoke any tool; the `wosdbg.` prefix is optional:
@@ -142,6 +207,21 @@ as `--list-tools`, plus resource listing, templates, and reads. Binding,
 allowed CIDRs, allowed filesystem roots, and response bounds come from the
 `mcp` section of `wosdbg.json`. Keep the default loopback/CIDR restrictions
 unless remote access is intentional.
+
+MCP initialization includes a short workflow guide. Tool definitions include
+readable titles, category metadata, effect annotations, parameter guidance, and
+enumerated choices. Each call returns a bounded text summary (at most 2,500
+characters) and the complete original object in `structuredContent`; `isError`
+still follows the backend's `ok` field. Text no longer duplicates the full JSON
+payload. Clients that previously parsed JSON from `content[0].text` must read
+`structuredContent` instead. CLI JSON results and GUI wire results are unchanged.
+
+For first-pass crash triage, use `get_crash_summary` or
+`analyze_coredump` with `mode=compact`, then request specific registers, memory,
+source, or integrity evidence. Reuse opened session IDs, request bounded pages,
+and inspect degradation, truncation, and clock-quality fields before drawing
+conclusions. Pair live `sessionId` and `leaseToken` from the same open operation
+and close the lease when finished.
 
 ## Capabilities
 

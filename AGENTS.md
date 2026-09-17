@@ -158,9 +158,10 @@ equivalent interfaces:
 - JSON CLI for agents without MCP: start with
   `tools/build/bin/wosdbg --list-tools`, invoke with `--tool NAME --arguments
   JSON`, and use `--batch FILE` for stateful multi-call workflows.
-- GUI for interactive work: open the **Analysis Tools** dock to enumerate and
-  invoke the same catalog; the existing log and coredump panels remain useful
-  for manual navigation.
+- GUI for interactive work: use the **Debugger** workspace for linked crash
+  inspection and guided live attachment. **Advanced analysis** (Ctrl+Shift+P)
+  enumerates the complete shared catalog; the separate execution-log/local
+  coredump workspace retains the specialized viewer panels.
 
 Do not treat MCP as the only complete interface. The GUI, CLI, and MCP call
 `DebugAnalysisService::tool_catalog()` / `invoke_tool()`, so tool additions

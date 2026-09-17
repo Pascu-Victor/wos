@@ -23,6 +23,7 @@
 #include <string_view>
 
 #include "debug_analysis_service.h"
+#include "tool_presentation.h"
 
 namespace {
 
@@ -699,6 +700,12 @@ auto McpHttpServer::handle_method(const QString& method, const QJsonObject& para
         }
         return QJsonObject{{"protocolVersion", PROTOCOL},
                            {"serverInfo", QJsonObject{{"name", "wosdbg"}, {"version", "2.0"}}},
+                           {"instructions",
+                            "Start with status, list_logs, list_coredumps, or list_live_targets. Open evidence once and reuse "
+                            "its logId/dumpId/incidentId. Use get_crash_summary or analyze_coredump(mode=compact) for first-pass "
+                            "triage; request bounded detail only as needed. Tool text is a short summary; structuredContent "
+                            "contains complete evidence, errors and truncation flags. Live sessions require explicit pause "
+                            "confirmation; reuse the matching sessionId/leaseToken and close the lease when finished."},
                            {"capabilities", QJsonObject{{"tools", QJsonObject{{"listChanged", false}}},
                                                         {"resources", QJsonObject{{"subscribe", false}, {"listChanged", false}}}}}};
     }
@@ -733,6 +740,18 @@ auto DebugAnalysisService::tool_catalog() -> QJsonObject {
         return QJsonObject{{"type", "object"}, {"properties", properties}, {"required", required}};
     };
     QJsonArray tools{
+        QJsonObject{{"name", "wosdbg.enable_live_debugging"},
+                    {"description",
+                     "Explicitly enable configured live targets for this backend process. Does not connect, pause, "
+                     "change endpoint allowlists, or persist configuration. Requires confirmation=ENABLE_CONFIGURED_LIVE_TARGETS."},
+                    {"inputSchema",
+                     schema({{"confirmation", QJsonObject{{"type", "string"}}},
+                             {"profile", QJsonObject{{"type", "string"},
+                                                     {"enum", QJsonArray{"configured", "cluster", "ktest"}},
+                                                     {"description",
+                                                      "Configured targets (default), or the standard cluster/KTEST runtime descriptor "
+                                                      "relative to the config directory. Existing enabled sessions are not replaced."}}}},
+                            {"confirmation"})}},
         QJsonObject{{"name", "wosdbg.status"}, {"description", "Show server status and active sessions."}, {"inputSchema", schema({})}},
         QJsonObject{{"name", "wosdbg.discover_live_targets"},
                     {"description", "Reload bounded allowlisted live targets from configuration and versioned runtime descriptors."},
@@ -1181,11 +1200,14 @@ auto DebugAnalysisService::tool_catalog() -> QJsonObject {
                                             {"contextLines", QJsonObject{{"type", "integer"}}}},
                                            {"path", "line"})}},
     };
+    for (qsizetype index = 0; index < tools.size(); ++index) {
+        tools[index] = wosdbg::describe_tool(tools[index].toObject());
+    }
     return QJsonObject{{"tools", tools}};
 }
 
 auto McpHttpServer::tool_result(const QJsonObject& payload) -> QJsonObject {
-    QString text = QString::fromUtf8(QJsonDocument(payload).toJson(QJsonDocument::Indented));
+    const QString text = wosdbg::result_summary(payload);
     return QJsonObject{
         {"content", QJsonArray{text_content(text)}}, {"structuredContent", payload}, {"isError", !payload["ok"].toBool(true)}};
 }
@@ -1194,6 +1216,8 @@ auto DebugAnalysisService::invoke_tool(const QString& name, const QJsonObject& a
     QJsonObject payload;
     if (name == "wosdbg.status") {
         payload = status();
+    } else if (name == "wosdbg.enable_live_debugging") {
+        payload = enable_live_debugging(args);
     } else if (name == "wosdbg.discover_live_targets") {
         payload = discover_live_targets();
     } else if (name == "wosdbg.list_live_targets") {

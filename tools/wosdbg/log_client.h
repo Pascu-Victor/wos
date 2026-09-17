@@ -6,6 +6,7 @@
 #include <QTcpSocket>
 #include <QTimer>
 #include <map>
+#include <set>
 #include <vector>
 
 #include "config.h"
@@ -24,6 +25,8 @@ class LogClient : public QObject {
     // Returns pointer to entry if available, nullptr otherwise.
     // If nullptr, it triggers a fetch for a chunk around this line.
     const LogEntry* get_entry(int line_index);
+    void prefetch_rows(int first, int count);
+    [[nodiscard]] bool rows_ready(int first, int count) const;
 
     [[nodiscard]] const QStringList& get_file_list() const { return file_list; }
     [[nodiscard]] const Config& get_config() const { return config; }
@@ -64,7 +67,6 @@ class LogClient : public QObject {
     void on_connected();
     void on_ready_read();
     void on_socket_error(QAbstractSocket::SocketError socket_error);
-    void process_pending_requests();
 
    private:
     QTcpSocket* socket;
@@ -76,9 +78,12 @@ class LogClient : public QObject {
     std::map<int, LogEntry> cache;
 
     // Request management
-    std::vector<std::pair<int, int>> pending_requests;  // start, count
-    QTimer request_timer;
     bool initial_load_pending{false};
+    bool initial_filter_pending{false};
+    int view_changes{0};
+    int viewport_first{0};
+    int viewport_count{1};
+    std::set<int> in_flight;
     quint64 next_tool_request_id{1};
 
     void process_message(MessageType type, QDataStream& in);

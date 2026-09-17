@@ -41,6 +41,7 @@ class DebugAnalysisService : public QObject {
     [[nodiscard]] QJsonObject invoke_tool(const QString& name, const QJsonObject& args, const QString& owner_id = {});
 
     [[nodiscard]] QJsonObject discover_live_targets();
+    [[nodiscard]] QJsonObject enable_live_debugging(const QJsonObject& args);
     [[nodiscard]] QJsonObject list_live_targets() const;
     [[nodiscard]] QJsonObject open_live_session(const QJsonObject& args, const QString& owner_id);
     [[nodiscard]] QJsonObject list_live_sessions(const QString& owner_id) const;

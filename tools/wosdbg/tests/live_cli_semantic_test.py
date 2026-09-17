@@ -514,7 +514,10 @@ class FakeQmp:
                 except OSError:
                     return
                 with connection:
-                    self._serve_connection(connection)
+                    # close() wakes accept() with an immediately closed socket.
+                    # Do not send a QMP greeting to that teardown-only connection.
+                    if not self._stop.is_set():
+                        self._serve_connection(connection)
         except BaseException as error:  # propagated by close()
             self.error = error
 
@@ -608,6 +611,7 @@ def run_happy(binary: Path, build_id: str, timeout: float) -> None:
                 call("discover", "discover_live_targets"),
                 call("listed", "list_live_targets"),
                 call("open", "open_live_session", open_arguments(targetIds=["vm0"], leaseMs=4000)),
+                call("enable_again", "enable_live_debugging", {"confirmation": "ENABLE_CONFIGURED_LIVE_TARGETS"}),
                 call(
                     "registers",
                     "read_live_registers",

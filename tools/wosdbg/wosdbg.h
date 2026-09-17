@@ -57,6 +57,9 @@ class VirtualTableView;
 class VirtualTableModel;
 class LogClient;
 class DebugToolPanel;
+class DebuggerWorkspace;
+class QDialog;
+class QTabWidget;
 
 // Coredump panel forward declarations
 class CoredumpBrowser;
@@ -140,7 +143,10 @@ class QemuLogViewer : public QMainWindow {
     QDockWidget* disassembly_dock = nullptr;
     QDockWidget* details_dock = nullptr;
     QDockWidget* browser_dock = nullptr;  // Coredump browser dock (stored for tabification)
-    QDockWidget* tool_dock = nullptr;
+    QTabWidget* workspace_tabs = nullptr;
+    QMainWindow* viewer_window = nullptr;
+    DebuggerWorkspace* debugger_workspace = nullptr;
+    QDialog* advanced_dialog = nullptr;
 
     // Search functionality
     std::vector<int> search_matches;
@@ -183,6 +189,7 @@ class QemuLogViewer : public QMainWindow {
     static QString get_light_theme_css();
     static QString get_high_contrast_theme_css();
     void setup_ui();
+    void setup_menus();
     void setup_toolbar();
     void setup_main_content();
     void setup_table();
@@ -248,6 +255,7 @@ class QemuLogViewer : public QMainWindow {
 
     // Coredump state
     std::unique_ptr<wosdbg::CoreDump> current_core_dump;
+    QString current_coredump_path;
     std::unique_ptr<wosdbg::SymbolTable> core_dump_symtab;
     std::unique_ptr<wosdbg::SectionMap> core_dump_sections;
     // Additional symbol sources (kernel, embedded ELF, etc.)

@@ -860,6 +860,50 @@ auto DebugAnalysisService::discover_live_targets() -> QJsonObject {
     }
 }
 
+auto DebugAnalysisService::enable_live_debugging(const QJsonObject& args) -> QJsonObject {
+    if (args["confirmation"].toString() != "ENABLE_CONFIGURED_LIVE_TARGETS") {
+        return QJsonObject{{"ok", false},
+                           {"errorCode", "authority_required"},
+                           {"error", "Explicit confirmation is required to enable configured live targets"}};
+    }
+    // Never replace an enabled manager: doing so would terminate existing pause leases.
+    const auto current = list_live_targets();
+    if (current["errorCode"].toString() != "disabled") {
+        return current;
+    }
+    if (!config) {
+        return tool_error("No backend configuration is loaded");
+    }
+    auto settings = config->get_live_settings();
+    settings.enabled = true;
+    const QString profile = args["profile"].toString("configured");
+    if (profile == "cluster" || profile == "ktest") {
+        // Named project presets, never caller-supplied sockets, hosts, or arbitrary descriptors.
+        const QString descriptor =
+            config->resolve_path(profile == "cluster" ? "cluster-overlays/live-debug.json" : "ktest-data/live-debug.json");
+        if (!QFileInfo::exists(descriptor)) {
+            return QJsonObject{
+                {"ok", false},
+                {"errorCode", "target_not_found"},
+                {"error", "Start the " + profile +
+                              " debug VM workflow first, then enable live debugging again. Its runtime descriptor is not present."}};
+        }
+        settings.runtime_descriptors = QStringList{descriptor};
+        settings.targets.clear();
+    } else if (profile != "configured") {
+        return tool_error("Unknown live profile; choose configured, cluster, or ktest");
+    }
+    try {
+        auto candidate = std::make_unique<wosdbg::live::LiveSessionManager>(settings, allowed_roots());
+        const auto discovered = candidate->discover_targets();
+        live_sessions = std::move(candidate);
+        // Process-local opt-in only. Endpoint allowlists, limits, and the config file are unchanged.
+        return discovered;
+    } catch (const std::exception& error) {
+        return live_error_json(error);
+    }
+}
+
 auto DebugAnalysisService::list_live_targets() const -> QJsonObject {
     if (!live_sessions) {
         return QJsonObject{{"ok", false}, {"errorCode", "disabled"}, {"error", "Live debugging is not configured"}};

@@ -23,12 +23,18 @@
 
 LogClient::LogClient(QObject* parent) : QObject(parent), socket(new QTcpSocket(this)) {
     connect(socket, &QTcpSocket::connected, this, &LogClient::on_connected);
+    connect(socket, &QTcpSocket::disconnected, this, [this]() {
+        cache.clear();
+        in_flight.clear();
+        total_lines = 0;
+        view_changes = 0;
+        initial_load_pending = false;
+        initial_filter_pending = false;
+        emit file_ready(0);
+        emit disconnected();
+    });
     connect(socket, &QTcpSocket::readyRead, this, &LogClient::on_ready_read);
     connect(socket, &QTcpSocket::errorOccurred, this, &LogClient::on_socket_error);
-
-    request_timer.setSingleShot(true);
-    request_timer.setInterval(50);  // Debounce requests
-    connect(&request_timer, &QTimer::timeout, this, &LogClient::process_pending_requests);
 }
 
 LogClient::~LogClient() { socket->disconnectFromHost(); }
@@ -100,11 +106,16 @@ void LogClient::process_message(MessageType type, QDataStream& in) {
             in >> total_lines;
             qDebug() << "Client received FileReady: totalLines=" << total_lines;
             cache.clear();
+            in_flight.clear();
+            view_changes = std::max(0, view_changes - 1);
+            if (view_changes) {
+                break;
+            }
 
             if (total_lines > 0) {
                 initial_load_pending = true;
                 // Request first chunk immediately to avoid flashing
-                request_data(0, 2000);
+                prefetch_rows(0, 1);
             } else {
                 emit file_ready(total_lines);
             }
@@ -119,6 +130,15 @@ void LogClient::process_message(MessageType type, QDataStream& in) {
         case MessageType::ERROR: {
             QString msg;
             in >> msg;
+            if (view_changes) {
+                view_changes = 0;
+                in_flight.clear();
+                cache.clear();
+                total_lines = 0;
+                initial_load_pending = false;
+                initial_filter_pending = false;
+                emit file_ready(0);
+            }
             emit error_occurred(msg);
             break;
         }
@@ -130,16 +150,27 @@ void LogClient::process_message(MessageType type, QDataStream& in) {
             for (quint32 i = 0; i < count; ++i) {
                 LogEntry entry;
                 in >> entry;
-                cache[start_line + i] = entry;
+                if (!view_changes && std::abs(start_line + static_cast<int>(i) - viewport_first) < 8192) {
+                    cache[start_line + i] = std::move(entry);
+                }
                 // if (i == 0) qDebug() << "First entry assembly:" << QString::fromStdString(entry.assembly);
             }
 
-            if (initial_load_pending) {
+            in_flight.erase(start_line);
+            if (view_changes) {
+                break;
+            }
+            if (initial_load_pending && rows_ready(0, std::min(total_lines, 128))) {
                 initial_load_pending = false;
                 emit file_ready(total_lines);
             }
+            if (initial_filter_pending && rows_ready(0, std::min(total_lines, 128))) {
+                initial_filter_pending = false;
+                emit filter_applied(total_lines);
+            }
 
             emit data_received(start_line, count);
+            prefetch_rows(viewport_first, viewport_count);
             break;
         }
         case MessageType::SEARCH_RESPONSE: {
@@ -173,7 +204,17 @@ void LogClient::process_message(MessageType type, QDataStream& in) {
         case MessageType::SET_FILTER_RESPONSE: {
             in >> total_lines;
             cache.clear();
-            emit filter_applied(total_lines);
+            in_flight.clear();
+            view_changes = std::max(0, view_changes - 1);
+            if (view_changes) {
+                break;
+            }
+            initial_filter_pending = total_lines > 0;
+            if (initial_filter_pending) {
+                prefetch_rows(0, 1);
+            } else {
+                emit filter_applied(total_lines);
+            }
             break;
         }
         case MessageType::ROW_FOR_LINE_RESPONSE: {
@@ -216,6 +257,7 @@ void LogClient::process_message(MessageType type, QDataStream& in) {
 void LogClient::select_file(const QString& filename) { send_select_file(filename); }
 
 void LogClient::set_filter(bool hide_structural, const QString& interrupt_filter) {
+    ++view_changes;
     QByteArray block;
     QDataStream out(&block, QIODevice::WriteOnly);
     out.setVersion(QDataStream::Qt_6_0);
@@ -266,6 +308,9 @@ void LogClient::request_open_source_file(const QString& file, int line) {
 }
 
 void LogClient::send_select_file(const QString& filename) {
+    ++view_changes;
+    initial_load_pending = false;
+    initial_filter_pending = false;
     QByteArray block;
     QDataStream out(&block, QIODevice::WriteOnly);
     out.setVersion(QDataStream::Qt_6_0);
@@ -281,53 +326,45 @@ const LogEntry* LogClient::get_entry(int line_index) {
         return &it->second;
     }
 
-    // Request data
-    // Check if already pending?
-    // For simplicity, just add to pending requests and debounce
-    // Fetch a larger chunk to handle scrolling (500 before, 1500 after)
-    int start = std::max(0, line_index - 500);
-    int count = 2000;
-    pending_requests.emplace_back(start, count);
-    if (!request_timer.isActive()) {
-        request_timer.start();
-    }
+    prefetch_rows(line_index, 1);
 
     return nullptr;
 }
 
-void LogClient::process_pending_requests() {
-    if (pending_requests.empty()) {
-        return;
+bool LogClient::rows_ready(int first, int count) const {
+    if (view_changes) {
+        return false;
     }
-
-    // Merge overlapping requests?
-    // For now, just send them.
-    // Optimization: Merge contiguous ranges.
-
-    std::ranges::sort(pending_requests);
-
-    std::vector<std::pair<int, int>> merged;
-    if (!pending_requests.empty()) {
-        merged.push_back(pending_requests[0]);
-        for (size_t i = 1; i < pending_requests.size(); ++i) {
-            auto& last = merged.back();
-            auto& curr = pending_requests[i];
-
-            if (curr.first <= last.first + last.second) {
-                // Overlap or adjacent
-                int new_end = std::max(last.first + last.second, curr.first + curr.second);
-                last.second = new_end - last.first;
-            } else {
-                merged.push_back(curr);
-            }
+    for (int row = first; row < first + count; ++row) {
+        if (!cache.contains(row)) {
+            return false;
         }
     }
+    return true;
+}
 
-    for (const auto& req : merged) {
-        request_data(req.first, req.second);
+void LogClient::prefetch_rows(int first, int count) {
+    if (view_changes || total_lines <= 0 || !is_connected()) {
+        return;
     }
-
-    pending_requests.clear();
+    viewport_first = std::clamp(first, 0, total_lines - 1);
+    viewport_count = std::clamp(count, 1, 1024);
+    // Aligned, deduplicated windows. Visible data takes priority over read-ahead.
+    constexpr int chunk = 1024;
+    const int anchor = viewport_first / chunk * chunk;
+    for (int offset : {0, 1, -1, 2, -2, 3}) {
+        const int start = anchor + offset * chunk;
+        if (start < 0 || start >= total_lines || in_flight.size() >= 4) {
+            continue;
+        }
+        const int length = std::min(chunk, total_lines - start);
+        if (!in_flight.contains(start) && !rows_ready(start, length)) {
+            in_flight.insert(start);
+            request_data(start, length);
+        }
+    }
+    cache.erase(cache.begin(), cache.lower_bound(std::max(0, viewport_first - 8191)));
+    cache.erase(cache.lower_bound(viewport_first + 8192), cache.end());
 }
 
 void LogClient::request_data(int start_line, int count) {

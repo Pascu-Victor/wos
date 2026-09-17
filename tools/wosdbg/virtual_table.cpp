@@ -12,6 +12,8 @@
 #include <qtpreprocessorsupport.h>
 #include <qwidget.h>
 
+#include <QEvent>
+#include <QPainter>
 #include <QtCore/QDebug>
 #include <QtGui/QColor>
 #include <QtWidgets/QScrollBar>
@@ -109,7 +111,7 @@ void VirtualRowCache::updateLRUOrder(int logical_row) {
 // ============================================================================
 
 VirtualTableModel::VirtualTableModel(int total_rows, QStringList headers, QObject* parent)
-    : QAbstractTableModel(parent), columnHeaders(std::move(headers)), totalRowCount(total_rows), cache(500) {}
+    : QAbstractTableModel(parent), columnHeaders(std::move(headers)), totalRowCount(total_rows), cache(2048) {}
 
 int VirtualTableModel::rowCount(const QModelIndex& parent) const {
     if (parent.isValid()) {
@@ -135,9 +137,6 @@ QVariant VirtualTableModel::data(const QModelIndex& index, int role) const {
     const VirtualRowCache::CachedRow* cached_row = cache.getRow(index.row());
 
     if (!cached_row || !cached_row->isValid) {
-        if (index.row() < 5) {
-            qDebug() << "VirtualTableModel::data: Row" << index.row() << "not in cache or invalid";
-        }
         return {};
     }
 
@@ -149,7 +148,7 @@ QVariant VirtualTableModel::data(const QModelIndex& index, int role) const {
             return {};
         }
         case Qt::BackgroundRole: {
-            return cached_row->backgroundColor;
+            return cached_row->backgroundColor.alpha() == 0 ? QVariant{} : QVariant(cached_row->backgroundColor);
         }
         case Qt::TextAlignmentRole: {
             return static_cast<int>(Qt::AlignLeft | Qt::AlignVCenter);
@@ -196,11 +195,12 @@ void VirtualTableModel::invalidateRows(int start_row, int end_row) {
     emit dataChanged(index(start_row, 0), index(end_row, columnCount() - 1));
 }
 
-void VirtualTableModel::setCacheSize(size_t new_size) {
-    cache.clear();
-    VirtualRowCache new_cache(new_size);
-    // Can't directly reassign, so we recreate with move semantics
-    // This is a limitation of the current design; could be improved with pimpl
+void VirtualTableModel::setCacheSize(size_t new_size) { cache = VirtualRowCache(std::max<size_t>(1, new_size)); }
+
+void VirtualTableModel::prepareRows(int first, int last) const {
+    for (int row = std::max(0, first); row <= std::min(last, totalRowCount - 1); ++row) {
+        ensureRowLoaded(row);
+    }
 }
 
 void VirtualTableModel::resetModel() {
@@ -232,16 +232,9 @@ void VirtualTableModel::ensureRowLoaded(int logical_row) const {
         QColor bg_color = Qt::transparent;
         dataProvider(logical_row, cells, bg_color);
 
-        if (logical_row < 5) {
-            qDebug() << "VirtualTableModel::ensureRowLoaded: Provider returned" << cells.size() << "cells for row" << logical_row;
-        }
-
-        // Cast away const to fill cache
-        const_cast<VirtualTableModel*>(this)->cache.setRow(logical_row, cells, bg_color);
-
-        // Debug logging for first few rows
-        if (logical_row < 5) {
-            qDebug() << "VirtualTableModel loaded row" << logical_row << "cells:" << cells.size();
+        // A missing row must never become a cached, partially populated row.
+        if (cells.size() == static_cast<size_t>(columnHeaders.size())) {
+            const_cast<VirtualTableModel*>(this)->cache.setRow(logical_row, cells, bg_color);
         }
     }
 }
@@ -257,17 +250,17 @@ VirtualTableView::VirtualTableView(QWidget* parent) : QTableView(parent) {
     setShowGrid(false);
     setWordWrap(false);
 
-    scrollDebounceTimer = new QTimer(this);
-    scrollDebounceTimer->setSingleShot(true);
-    scrollDebounceTimer->setInterval(50);
-    connect(scrollDebounceTimer, &QTimer::timeout, this, &VirtualTableView::updateVisibleRows);
-
+    setVerticalScrollMode(QAbstractItemView::ScrollPerItem);
     connect(verticalScrollBar(), &QScrollBar::valueChanged, this, &VirtualTableView::onVerticalScrollBarValueChanged);
 }
 
 void VirtualTableView::setVirtualModel(VirtualTableModel* model) {
     virtualModel = model;
     setModel(model);
+    connect(model, &QAbstractItemModel::modelReset, this, [this]() {
+        completeFrame = QPixmap();
+        updateVisibleRows();
+    });
 }
 
 void VirtualTableView::scrollToLogicalRow(int row, QAbstractItemView::ScrollHint hint) {
@@ -276,29 +269,15 @@ void VirtualTableView::scrollToLogicalRow(int row, QAbstractItemView::ScrollHint
     }
 
     // Ensure the row is loaded
-    virtualModel->invalidateRows(row, row);
+    if (fetchRows) {
+        fetchRows(row, 128);
+    }
 
     // Scroll to make it visible
     scrollTo(virtualModel->index(row, 0), hint);
 }
 
-int VirtualTableView::getViewportStartRow() const {
-    if (!virtualModel) {
-        return 0;
-    }
-
-    // Find first visible row
-    int row = 0;
-    int accumulated_height = 0;
-    int viewport_top = verticalScrollBar()->value();
-
-    while (row < virtualModel->rowCount() && accumulated_height < viewport_top) {
-        accumulated_height += rowHeight(row);
-        row++;
-    }
-
-    return row;
-}
+int VirtualTableView::getViewportStartRow() const { return std::max(0, rowAt(0)); }
 
 void VirtualTableView::resizeEvent(QResizeEvent* event) {
     QTableView::resizeEvent(event);
@@ -307,22 +286,12 @@ void VirtualTableView::resizeEvent(QResizeEvent* event) {
 
 void VirtualTableView::scrollContentsBy(int dx, int dy) {
     QTableView::scrollContentsBy(dx, dy);
-    if (dy != 0) {
-        if (virtualModel) {
-            virtualModel->setLoadingEnabled(false);
-        }
-        scrollDebounceTimer->stop();
-        scrollDebounceTimer->start();
-    }
+    updateVisibleRows();
 }
 
 void VirtualTableView::onVerticalScrollBarValueChanged(int value) {
     Q_UNUSED(value)
-    if (virtualModel) {
-        virtualModel->setLoadingEnabled(false);
-    }
-    scrollDebounceTimer->stop();
-    scrollDebounceTimer->start();
+    updateVisibleRows();
 }
 
 void VirtualTableView::updateVisibleRows() {
@@ -330,17 +299,7 @@ void VirtualTableView::updateVisibleRows() {
         return;
     }
 
-    virtualModel->setLoadingEnabled(true);
-
     int current_start = getViewportStartRow();
-
-    // Always update if we are here, because the timer fired meaning we stopped scrolling
-    // or we need to refresh.
-    // if (currentStart == lastVisibleRowStart) {
-    //    return;
-    // }
-
-    lastVisibleRowStart = current_start;
 
     // Calculate how many rows are visible
     int viewport_height = viewport()->height();
@@ -355,13 +314,67 @@ void VirtualTableView::updateVisibleRows() {
     }
 
     // Pre-load visible rows plus some buffer rows
-    int buffer_size = visible_row_count / 2;  // Load 50% extra on each side
+    if (fetchRows) {
+        fetchRows(current_start, visible_row_count);
+    }
+    int buffer_size = 128;
     int start_preload = std::max(0, current_start - buffer_size);
     int end_preload = std::min(virtualModel->rowCount() - 1, current_start + visible_row_count + buffer_size);
 
     // Trigger loading
-    virtualModel->invalidateRows(start_preload, end_preload);
+    virtualModel->prepareRows(start_preload, end_preload);
 
     // Force a repaint of the viewport to ensure new data is drawn
     viewport()->update();
+}
+
+void VirtualTableView::setRangeLoader(std::function<void(int, int)> fetch, std::function<bool(int, int)> ready) {
+    fetchRows = std::move(fetch);
+    rowsReady = std::move(ready);
+}
+
+void VirtualTableView::paintEvent(QPaintEvent* event) {
+    const int first = getViewportStartRow();
+    const int last = rowAt(viewport()->height() - 1);
+    const int count = virtualModel ? std::max(0, (last < 0 ? virtualModel->rowCount() - 1 : last) - first + 1) : 0;
+    if (fetchRows && count) {
+        fetchRows(first, count);
+    }
+    awaitingRows = rowsReady && count && !rowsReady(first, count);
+    if (awaitingRows) {
+        QPainter painter(viewport());
+        painter.fillRect(viewport()->rect(), palette().base());
+        if (!completeFrame.isNull()) {
+            painter.drawPixmap(0, 0, completeFrame);
+        }
+        const QRect banner(12, 12, std::min(460, viewport()->width() - 24), 42);
+        painter.fillRect(banner, palette().window());
+        painter.setPen(palette().color(QPalette::Text));
+        painter.drawRect(banner);
+        painter.drawText(banner.adjusted(12, 0, -12, 0), Qt::AlignVCenter,
+                         QString("Loading rows %1–%2 · previous view held").arg(first + 1).arg(first + count));
+        return;
+    }
+    QTableView::paintEvent(event);
+    if (!capturing && !captureQueued) {
+        captureQueued = true;
+        QTimer::singleShot(0, this, [this]() {
+            captureQueued = false;
+            if (awaitingRows || !isVisible()) {
+                return;
+            }
+            capturing = true;
+            completeFrame = viewport()->grab();
+            capturing = false;
+        });
+    }
+}
+
+bool VirtualTableView::viewportEvent(QEvent* event) {
+    // The retained frame is explicitly stale; it must not select rows at the new offset.
+    if (awaitingRows && (event->type() == QEvent::MouseButtonPress || event->type() == QEvent::MouseButtonDblClick ||
+                         event->type() == QEvent::ContextMenu)) {
+        return true;
+    }
+    return QTableView::viewportEvent(event);
 }

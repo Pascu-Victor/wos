@@ -66,6 +66,10 @@ int main(int argc, char* argv[]) {
 
     QCommandLineOption list_tools_option("list-tools", "List the canonical analysis tool catalog as JSON");
     parser.addOption(list_tools_option);
+    QCommandLineOption brief_option("brief", "With --list-tools, return a compact discovery index without input schemas");
+    parser.addOption(brief_option);
+    QCommandLineOption tool_help_option("tool-help", "Show the complete schema for one tool without invoking it", "name");
+    parser.addOption(tool_help_option);
 
     QCommandLineOption tool_option("tool", "Invoke one analysis tool (the wosdbg. prefix is optional)", "name");
     parser.addOption(tool_option);
@@ -111,6 +115,8 @@ int main(int argc, char* argv[]) {
         return run_debug_cli(analysis, DebugCliOptions{.list_tools = parser.isSet(list_tools_option),
                                                        .list_resources = parser.isSet(list_resources_option),
                                                        .list_resource_templates = parser.isSet(list_resource_templates_option),
+                                                       .brief = parser.isSet(brief_option),
+                                                       .tool_help = parser.value(tool_help_option),
                                                        .tool_name = parser.value(tool_option),
                                                        .arguments_json = parser.value(arguments_option),
                                                        .batch_path = parser.value(batch_option),

@@ -220,8 +220,31 @@ auto run_batch(DebugAnalysisService& analysis, const QString& path) -> int {
 }  // namespace
 
 auto run_debug_cli(DebugAnalysisService& analysis, const DebugCliOptions& options) -> int {
+    if (!options.tool_help.isEmpty()) {
+        const QString name = options.tool_help.startsWith("wosdbg.") ? options.tool_help : "wosdbg." + options.tool_help;
+        for (const auto& value : DebugAnalysisService::tool_catalog()["tools"].toArray()) {
+            const auto tool = value.toObject();
+            if (tool["name"].toString() == name) {
+                write_json(tool, stdout);
+                return 0;
+            }
+        }
+        return fail("Unknown tool: " + name);
+    }
     if (options.list_tools) {
-        write_json(DebugAnalysisService::tool_catalog(), stdout);
+        QJsonObject catalog = DebugAnalysisService::tool_catalog();
+        if (options.brief) {
+            QJsonArray index;
+            for (const auto& value : catalog["tools"].toArray()) {
+                const auto tool = value.toObject();
+                index.append(QJsonObject{{"name", tool["name"]},
+                                         {"title", tool["title"]},
+                                         {"category", tool["_meta"].toObject()["org.wosdbg/category"]},
+                                         {"description", tool["description"].toString().section(". ", 0, 0)}});
+            }
+            catalog["tools"] = index;
+        }
+        write_json(catalog, stdout);
         return 0;
     }
     if (options.list_resources) {

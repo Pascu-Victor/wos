@@ -930,6 +930,14 @@ def mcp_rpc(
 def mcp_tool_payload(result: dict[str, Any], tool: str) -> dict[str, Any]:
     payload = result.get("structuredContent")
     require(isinstance(payload, dict), f"MCP {tool} result has no structuredContent object")
+    content = result.get("content")
+    require(isinstance(content, list) and len(content) == 1 and content[0].get("type") == "text",
+            f"MCP {tool} lacks its concise text summary")
+    text = content[0].get("text", "")
+    require(isinstance(text, str) and len(text) <= 2500 and "structuredContent" in text,
+            f"MCP {tool} summary is unbounded or fails to point to complete evidence")
+    require(result.get("isError") == (payload.get("ok", True) is False),
+            f"MCP {tool} error indicator disagrees with structured evidence")
     return payload
 
 
@@ -997,6 +1005,7 @@ def check_runtime_interface_parity(binary: Path, fixture_root: Path, timeout: fl
             timeout,
         )
         require(initialized.get("protocolVersion") == MCP_PROTOCOL_VERSION, "MCP negotiated an unexpected protocol version")
+        require("structuredContent" in initialized.get("instructions", ""), "MCP lacks agent usage guidance")
         mcp_catalog_value = mcp_rpc(mcp_port, session, 2, "tools/list", {}, timeout)
 
         gui = GuiWireClient(gui_port, timeout)

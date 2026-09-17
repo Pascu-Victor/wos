@@ -1,6 +1,7 @@
 #ifndef VIRTUAL_TABLE_H
 #define VIRTUAL_TABLE_H
 
+#include <QPixmap>
 #include <QtCore/QAbstractTableModel>
 #include <QtCore/QTimer>
 #include <QtWidgets/QTableView>
@@ -112,6 +113,7 @@ class VirtualTableModel : public QAbstractTableModel {
      * Set cache size
      */
     void setCacheSize(size_t newSize);
+    void prepareRows(int first, int last) const;
 
     /**
      * Manually reset the model (clear all data)
@@ -162,18 +164,25 @@ class VirtualTableView : public QTableView {
      * Get current viewport scroll position
      */
     int getViewportStartRow() const;
+    void setRangeLoader(std::function<void(int, int)> fetch, std::function<bool(int, int)> ready);
 
    protected:
     void resizeEvent(QResizeEvent* event) override;
     void scrollContentsBy(int dx, int dy) override;
+    void paintEvent(QPaintEvent* event) override;
+    bool viewportEvent(QEvent* event) override;
 
    private slots:
     void onVerticalScrollBarValueChanged(int value);
 
    private:
     VirtualTableModel* virtualModel = nullptr;
-    QTimer* scrollDebounceTimer = nullptr;
-    int lastVisibleRowStart = -1;
+    std::function<void(int, int)> fetchRows;
+    std::function<bool(int, int)> rowsReady;
+    QPixmap completeFrame;
+    bool capturing = false;
+    bool captureQueued = false;
+    bool awaitingRows = false;
 
     void updateVisibleRows();
 };

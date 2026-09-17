@@ -55,8 +55,9 @@ pkg_check_modules(CAPSTONE REQUIRED capstone>=4.0)
 pkg_check_modules(LIBARCHIVE REQUIRED libarchive)
 
 # Add main executable
-add_executable(wosdbg
-    main.cpp
+add_library(wosdbg_core STATIC
+    debugger_workspace.h
+    debugger_workspace.cpp
     wosdbg.h
     wosdbg.cpp
     log_processor.cpp
@@ -74,6 +75,12 @@ add_executable(wosdbg
     debug_cli.cpp
     debug_tool_panel.h
     debug_tool_panel.cpp
+    tool_arguments_form.h
+    tool_arguments_form.cpp
+    tool_result_view.h
+    tool_result_view.cpp
+    tool_presentation.h
+    tool_presentation.cpp
     mcp_http_server.h
     mcp_http_server.cpp
     config.h
@@ -106,6 +113,9 @@ add_executable(wosdbg
     capstone_disasm.cpp
 )
 
+add_executable(wosdbg main.cpp)
+target_link_libraries(wosdbg PRIVATE wosdbg_core)
+
 
 # Find LLVM for demangling support
 find_package(LLVM REQUIRED CONFIG)
@@ -121,7 +131,7 @@ add_executable(wosdbg_worker
 )
 
 # Link libraries for main executable
-target_link_libraries(wosdbg
+target_link_libraries(wosdbg_core PUBLIC
     Qt6::Core
     Qt6::Widgets
     Qt6::Network
@@ -146,7 +156,7 @@ target_link_libraries(wosdbg_worker
 )
 
 # Include directories for main executable
-target_include_directories(wosdbg PRIVATE
+target_include_directories(wosdbg_core PUBLIC
     ${CAPSTONE_INCLUDE_DIRS}
     ${LIBARCHIVE_INCLUDE_DIRS}
     ${LLVM_INCLUDE_DIRS}
@@ -160,7 +170,7 @@ target_include_directories(wosdbg_worker PRIVATE
 )
 
 # Compiler definitions for main executable
-target_compile_definitions(wosdbg PRIVATE
+target_compile_definitions(wosdbg_core PUBLIC
     ${CAPSTONE_CFLAGS_OTHER}
 )
 
@@ -200,15 +210,18 @@ set(RELEASE_COMPILE_OPTIONS
 # Apply compiler options based on build type
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
     target_compile_options(wosdbg PRIVATE ${DEBUG_COMPILE_OPTIONS})
+    target_compile_options(wosdbg_core PRIVATE ${DEBUG_COMPILE_OPTIONS})
     target_compile_options(wosdbg_worker PRIVATE ${DEBUG_COMPILE_OPTIONS})
 else()
     target_compile_options(wosdbg PRIVATE ${RELEASE_COMPILE_OPTIONS})
+    target_compile_options(wosdbg_core PRIVATE ${RELEASE_COMPILE_OPTIONS})
     target_compile_options(wosdbg_worker PRIVATE ${RELEASE_COMPILE_OPTIONS})
 endif()
 
 # Enable interprocedural optimization for Release builds
 if(CMAKE_BUILD_TYPE STREQUAL "Release")
     set_property(TARGET wosdbg PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
+    set_property(TARGET wosdbg_core PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
     set_property(TARGET wosdbg_worker PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
 endif()
 
@@ -232,6 +245,18 @@ install(FILES "${CMAKE_CURRENT_BINARY_DIR}/wosdbg.desktop"
 include(CTest)
 if(BUILD_TESTING)
     find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    add_executable(wosdbg_workspace_semantic_test tests/workspace_semantic_test.cpp)
+    target_include_directories(wosdbg_workspace_semantic_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(wosdbg_workspace_semantic_test PRIVATE wosdbg_core)
+    add_test(NAME wosdbg_workspace_semantic_test COMMAND wosdbg_workspace_semantic_test)
+    set_tests_properties(wosdbg_workspace_semantic_test PROPERTIES TIMEOUT 60 ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QT_FORCE_STDERR_LOGGING=1")
+    add_executable(wosdbg_ui_semantic_test
+        tests/ui_semantic_test.cpp
+    )
+    target_include_directories(wosdbg_ui_semantic_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(wosdbg_ui_semantic_test PRIVATE wosdbg_core)
+    add_test(NAME wosdbg_ui_semantic_test COMMAND wosdbg_ui_semantic_test $<TARGET_FILE:wosdbg>)
+    set_tests_properties(wosdbg_ui_semantic_test PROPERTIES TIMEOUT 60 ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QT_FORCE_STDERR_LOGGING=1")
     add_test(
         NAME wosdbg_incident_cli_semantic_test
         COMMAND ${Python3_EXECUTABLE}

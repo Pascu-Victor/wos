@@ -8,6 +8,8 @@ struct DebugCliOptions {
     bool list_tools = false;
     bool list_resources = false;
     bool list_resource_templates = false;
+    bool brief = false;
+    QString tool_help;
     QString tool_name;
     QString arguments_json;
     QString batch_path;
