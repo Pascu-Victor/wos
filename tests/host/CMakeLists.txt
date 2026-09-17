@@ -7,11 +7,17 @@ find_package(Python3 COMPONENTS Interpreter REQUIRED)
 wos_add_unit_test(time_arithmetic_test
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/time_arithmetic_test.cpp
 )
+wos_add_unit_test(timer_queue_test
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/timer_queue_test.cpp
+)
 wos_add_unit_test(clocksource_policy_test
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/clocksource_policy_test.cpp
 )
 wos_add_unit_test(wall_clock_test
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/wall_clock_test.cpp
+)
+wos_add_unit_test(interval_timer_model_test
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/interval_timer_model_test.cpp
 )
 
 wos_add_unit_test(device_registry_test
