@@ -58,6 +58,49 @@ an explicit pause/block rule.
 | 30  | [Asynchronous multi-queue block I/O](30-asynchronous-block-io.md)                    | block API, AHCI, buffer cache, XFS, swap, proxy              | 20 on DMA/AHCI; 25 on remote block            | Not started |
 | 31  | [High-resolution timekeeping and timers](31-high-resolution-timekeeping.md)           | TSC/RTC/NTP, timer queues, signals, libc                     | 16 scheduler timers; 29 TCP timers            | Not started |
 | 32  | [Live multi-node WOSDBG control plane](32-live-wosdbg-control-plane.md)               | WOSDBG, QMP/gdb, debugserver, incident capture               | 21 symbolization; debugserver rewrites        | Done        |
+| 33 | [Native WOS hardware virtualization](33-native-hypervisor.md) | Intel VMX/EPT, AMD SVM/NPT, common VM ABI | 36, 38, 40 on VM/MM/Task state | Not started |
+| 34 | [Linux guest virtual machine monitor](34-linux-guest-virtual-machine-monitor.md) | libwosvirt, per-VM VMM, vmmd/vmctl, Linux boot/devices | 33 until VM ABI stabilizes; 35 on VMM control | Not started |
+| 35 | [WKI distributed virtualization](35-wki-distributed-virtualization.md) | VM identity/control, executor placement, remote devices | 25, 28, 36–38 on WKI and service state | Not started |
+| 36 | [VM checkpoints and live migration](36-wki-vm-checkpoint-migration.md) | dirty tracking, device quiescence, state transfer, ownership | 33, 35, 38, 40 on VM/MM/wire state | Not started |
+| 37 | [Replicated VM volumes](37-wki-replicated-vm-volumes.md) | durable quorum log, block leases, snapshots, recovery | 20, 25, 30 on block transport; 35–38 on WKI | Not started |
+| 38 | [Disaggregated guest memory](38-wki-disaggregated-guest-memory.md) | remote RAM providers, EPT/NPT cache, page ownership | 25 on transport; 33, 36, 40 on MM/EPT/NPT | Not started |
+| 39 | [Isolated service compartments](39-isolated-service-compartments.md) | mount/PID/IPC namespaces, lifecycle, authority, launcher | 19 on credentials; 26 on VFS policy | Not started |
+| 40 | [NUMA placement and safe large pages](40-numa-memory-locality.md) | SRAT/SLIT, CPU domains, page policy, compound lifetime | 33, 36, 38 on VM/MM/Task state | Not started |
+
+## New platform goals: 33–40
+
+The [local virtualization manual corpus](../docs/virtualization-manuals.md)
+provides pinned source downloads, Docling PDF text and offline search. Check its
+manifest for missing sources before treating a reference as available.
+
+Goals 33–40 were investigated on 2026-09-08. Read the
+[reconnaissance, source map, dependencies and stale-guidance findings](RECONNAISSANCE-33-40.md)
+for their architectural basis. Each new contract includes its own copyable
+`/goal` prompt, acceptance criteria, scope limits, checkpoints, subagent roles,
+validation requirements and blocked stop rule.
+
+The distributed hypervisor program is **33 → 34 → 35**, followed by migration
+(36), replicated disk integration (37), and remote guest RAM (38). Storage work
+for 37 can start independently; its final guest acceptance needs 35. Goal 39
+adds native service compartments; goal 40 adds NUMA placement and safe large
+pages. Dependencies are explicit in the individual files; these are separate
+large outcomes, not a single unbounded “improve WOS” run.
+
+**Both Intel VMX/EPT and AMD SVM/NPT are mandatory support targets**, using one
+common userspace API and machine model. Read the
+[virtualization architecture and userspace contract](VIRTUALIZATION-ARCHITECTURE.md)
+for `libwosvirt`, per-VM `wos-vmm`, `vmmd`, `vmctl`, guest boot, run/exit handling,
+virtual devices and the WKI bridge. Vendor hardware validation is required for
+both; implementing one backend does not complete the goals. Same-vendor live
+migration is required for each backend; cross-vendor live migration remains
+explicitly rejected until separately implemented and validated.
+
+The platform includes
+remote execution and devices, migration, storage resilience and RAM pooling;
+splitting one guest's vCPUs concurrently across physical hosts requires a
+further memory-consistency design and is not promised by these contracts.
+Each goal targets approximately 168–336 hours of continuous primary-agent work
+with bounded subagents, without treating time spent as proof of completion.
 
 ## Status authority
 
@@ -84,8 +127,10 @@ older enumeration of unfinished goals.
    Re-run it whenever the design or file set materially changes.
 6. Keep an iteration ledger: hypothesis, patch, focused evidence, regressions,
    next action. Never broaden into unrelated cleanup merely to keep working.
-7. WOS runtime debugging can be run rootlessly by appending `--no-setup` to
-   `wos-ktest` or `wos-cluster`. Physical-hardware checks remain user-run.
+7. Under the current agent instructions, kernel/cluster runtime execution and
+   debugging are user-run. Prepare isolated fixtures and exact commands, then
+   analyze the supplied logs while continuing independent work. The existence
+   of a rootless `--no-setup` option does not change this instruction.
 
 ## Portfolio rules
 
