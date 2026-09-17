@@ -77,7 +77,8 @@ enum class ProcNodeType : uint8_t {
     MEMACC_RECLAIM_FILE_MMAP_CACHE_FILE,
     MEMACC_RECLAIM_ANONYMOUS_SWAP_FILE,
     MEMACC_RECLAIM_COORDINATOR_FILE,
-    LIMITS_FILE,  // /proc/<pid>/limits and task aliases
+    LIMITS_FILE,       // /proc/<pid>/limits and task aliases
+    TIMEKEEPING_FILE,  // /proc/timekeeping -> clocksource and wall-clock discipline
 };
 
 struct ProcNode {

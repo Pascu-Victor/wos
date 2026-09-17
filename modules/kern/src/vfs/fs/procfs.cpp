@@ -21,6 +21,7 @@
 #include <optional>
 #include <platform/dbg/dbg.hpp>
 #include <platform/ktime/ktime.hpp>
+#include <platform/ktime/process_timer.hpp>
 #include <platform/loader/runtime_images.hpp>
 #include <platform/mm/addr.hpp>
 #include <platform/mm/dyn/kmalloc.hpp>
@@ -40,6 +41,7 @@
 #include <platform/sched/task.hpp>
 #include <platform/security/authorization.hpp>
 #include <platform/smt/smt.hpp>
+#include <platform/sys/context_switch.hpp>
 #include <platform/sys/usercopy.hpp>
 #include <string_view>
 #include <syscalls_impl/process/child_events.hpp>
@@ -104,6 +106,7 @@ constexpr auto diagnostic_access(ProcNodeType type) -> DiagnosticAccess {
         case ProcNodeType::MAPS_FILE:
         case ProcNodeType::IMAGES_FILE:
         case ProcNodeType::UPTIME_FILE:
+        case ProcNodeType::TIMEKEEPING_FILE:
         case ProcNodeType::CPU_STAT_FILE:
         case ProcNodeType::LOADAVG_FILE:
         case ProcNodeType::MEMINFO_FILE:
@@ -213,6 +216,7 @@ enum class ProcRootReaddirIndex : uint8_t {
     MEMINFO,
     WKI,
     MEMACC,
+    TIMEKEEPING,
     FIRST_PID,
 };
 
@@ -600,6 +604,14 @@ auto procfs_readdir(File* f, DirEntry* buf, size_t count) -> int {
             buf->d_reclen = sizeof(DirEntry);
             buf->d_type = DT_REG;
             std::memcpy(buf->d_name.data(), "mounts", 7);
+            return 0;
+        }
+        if (count == proc_root_readdir_index(ProcRootReaddirIndex::TIMEKEEPING)) {
+            buf->d_ino = proc_root_readdir_index(ProcRootReaddirIndex::TIMEKEEPING);
+            buf->d_off = proc_root_readdir_next_index(ProcRootReaddirIndex::TIMEKEEPING);
+            buf->d_reclen = sizeof(DirEntry);
+            buf->d_type = DT_REG;
+            std::memcpy(buf->d_name.data(), "timekeeping", 12);
             return 0;
         }
         if (count == proc_root_readdir_index(ProcRootReaddirIndex::UPTIME)) {
@@ -1759,6 +1771,30 @@ auto generate_mounts_for_task(ProcTask* task, char* buf, size_t bufsz) -> ssize_
     if (!vfs_root_metadata_current(task, root)) return -EAGAIN;
     buf[off] = '\0';
     return static_cast<ssize_t>(off);
+}
+
+auto generate_timekeeping(char* buf, size_t bufsz) -> size_t {
+    auto const SOURCE = ker::mod::tsc::get_status();
+    auto const WALL = ker::mod::rtc::status();
+    auto const TIMERS = ker::mod::time::process_timer::status();
+    auto const NOW = ker::mod::time::get_monotonic_ns();
+    int const LENGTH = snprintf(
+        buf, bufsz,
+        "version=1\nsource=%s\ninvariant_tsc=%u\nfrequency_hz=%llu\nresolution_ns=%llu\n"
+        "conversion_multiplier=%llu\nconversion_divisor=%llu\ncalibration_spread_ppm=%llu\nwatchdog_deviation_ns=%llu\n"
+        "rtc_valid=%u\nwall_steps=%llu\nwall_slews=%llu\nwall_rejected=%llu\nwall_pending_ns=%lld\nslew_limit_ppm=500\n"
+        "process_timer_real_depth=%llu\nprocess_timer_wake_depth=%llu\nprocess_timer_expirations=%llu\n"
+        "process_timer_late_us_max=%llu\nprocess_timer_work_budget=%llu\nclockevent=x2apic-oneshot\n",
+        ker::mod::tsc::state_name(SOURCE.state), SOURCE.invariant_tsc ? 1U : 0U, static_cast<unsigned long long>(SOURCE.frequency_hz),
+        static_cast<unsigned long long>(SOURCE.resolution_ns), static_cast<unsigned long long>(SOURCE.conversion_multiplier),
+        static_cast<unsigned long long>(SOURCE.conversion_divisor), static_cast<unsigned long long>(SOURCE.calibration_spread_ppm),
+        static_cast<unsigned long long>(SOURCE.watchdog_deviation_ns), WALL.rtc_valid ? 1U : 0U,
+        static_cast<unsigned long long>(WALL.steps), static_cast<unsigned long long>(WALL.slews),
+        static_cast<unsigned long long>(WALL.rejected), static_cast<long long>(WALL.correction_ns - WALL.applied(NOW)),
+        static_cast<unsigned long long>(TIMERS.real_depth), static_cast<unsigned long long>(TIMERS.wake_depth),
+        static_cast<unsigned long long>(TIMERS.expirations), static_cast<unsigned long long>(TIMERS.max_late_us),
+        static_cast<unsigned long long>(TIMERS.work_budget));
+    return LENGTH <= 0 || bufsz == 0 ? 0 : std::min(static_cast<size_t>(LENGTH), bufsz - 1);
 }
 
 // Generate content for /proc/uptime
@@ -5597,6 +5633,8 @@ auto generate_kcpustat(char* buf, size_t bufsz) -> size_t {
     for (uint64_t c = 0; c < cpu_count; ++c) {
         auto s = ker::mod::perf::get_cpu_stats(static_cast<uint32_t>(c));
         auto sched = ker::mod::sched::get_scheduler_trace_stats(c);
+        auto const TIMERS = ker::mod::sched::get_run_queue_stats(c);
+        auto const CLOCKEVENT = ker::mod::sys::context_switch::clockevent_status(c);
         auto mm_destroy = ker::mod::mm::virt::get_destroy_user_space_stats(c);
         ker::mod::mm::phys::PageRefStatsSnapshot ref_stats{};
         ker::mod::mm::phys::PageCacheStatsSnapshot page_cache_stats{};
@@ -5668,6 +5706,30 @@ auto generate_kcpustat(char* buf, size_t bufsz) -> size_t {
         append_dec64(p, end, sched.wait_list_scan_max);
         append_sconst(p, end, " timer_wake=");
         append_dec64(p, end, sched.timer_expired_wakeups);
+        append_sconst(p, end, " timer_queue_depth=");
+        append_dec64(p, end, TIMERS.timer_queue_depth);
+        append_sconst(p, end, " timer_extractions=");
+        append_dec64(p, end, TIMERS.timer_extractions);
+        append_sconst(p, end, " timer_budget_exhaustions=");
+        append_dec64(p, end, TIMERS.timer_budget_exhaustions);
+        append_sconst(p, end, " timer_late_us_max=");
+        append_dec64(p, end, TIMERS.timer_late_us_max);
+        append_sconst(p, end, " timer_irq_budget=");
+        append_dec64(p, end, TIMERS.timer_irq_budget);
+        append_sconst(p, end, " clockevent_initialized=");
+        append_dec64(p, end, CLOCKEVENT.initialized ? 1 : 0);
+        append_sconst(p, end, " clockevent_sample_ticks=");
+        append_dec64(p, end, CLOCKEVENT.calibration.sample_ticks);
+        append_sconst(p, end, " clockevent_sample_us=");
+        append_dec64(p, end, CLOCKEVENT.calibration.sample_us);
+        append_sconst(p, end, " clockevent_resolution_ns=");
+        append_dec64(p, end, CLOCKEVENT.calibration.resolution_ns());
+        append_sconst(p, end, " clockevent_min_us=");
+        append_dec64(p, end, CLOCKEVENT.calibration.minimum_delay_us());
+        append_sconst(p, end, " clockevent_max_us=");
+        append_dec64(p, end, CLOCKEVENT.calibration.maximum_delay_us());
+        append_sconst(p, end, " clockevent_quantum_us=");
+        append_dec64(p, end, CLOCKEVENT.quantum_us);
         append_sconst(p, end, " gc_pass=");
         append_dec64(p, end, sched.gc_passes_triggered);
         append_sconst(p, end, " gc_reclaim=");
@@ -6215,6 +6277,9 @@ auto procfs_read_with_credentials(const ker::mod::security::Snapshot& credential
                 break;
             case ProcNodeType::UPTIME_FILE:
                 pfd->content_len = generate_uptime(pfd->content, MAX_PROCFS_BUF);
+                break;
+            case ProcNodeType::TIMEKEEPING_FILE:
+                pfd->content_len = generate_timekeeping(pfd->content, MAX_PROCFS_BUF);
                 break;
             case ProcNodeType::CPU_STAT_FILE:
                 pfd->content_len = generate_cpu_stat(pfd->content, MAX_KPERF_BUF);
@@ -7527,6 +7592,9 @@ auto procfs_lookup_path_as(const char* path, uint64_t caller_pid, int flags, Pro
     }
 
     // /proc/uptime
+    if (strcmp(path, "timekeeping") == 0) {
+        return make_file(ProcNodeType::TIMEKEEPING_FILE, 0, false);
+    }
     if (strcmp(path, "uptime") == 0) {
         return make_file(ProcNodeType::UPTIME_FILE, 0, false);
     }
