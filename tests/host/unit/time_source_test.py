@@ -54,7 +54,7 @@ def require_order(source: str, *snippets: str) -> None:
 def test_setitimer_timevals_are_checked_and_saturating() -> None:
     source = TIME_CPP.read_text()
     helper_body = function_body(source, "relative_timeval_to_us")
-    setitimer_body = case_body(source, "case ker::abi::sys_time_ops::SETITIMER:")
+    setitimer_body = function_body(source, "set_itimer")
 
     require_order(
         helper_body,
@@ -68,16 +68,15 @@ def test_setitimer_timevals_are_checked_and_saturating() -> None:
     )
     require_order(
         setitimer_body,
-        "copy_value_from_task(*task, arg2, new_value)",
+        "copy_value_from_task(task, new_address, new_value)",
         "uint64_t new_val_us = 0",
         "uint64_t new_interval_us = 0",
         "relative_timeval_to_us(new_value.it_value, new_val_us)",
         "relative_timeval_to_us(new_value.it_interval, new_interval_us)",
         "return static_cast<uint64_t>(-EINVAL)",
-        "if (new_val_us == 0)",
-        "task->itimer_real_expire_us = deadline_from_now_us(new_val_us)",
-        "task->itimer_real_interval_us = new_interval_us",
-        "ker::mod::sched::request_local_timer_recheck()",
+        "ensure_writable(task, old_address, sizeof(Itimerval))",
+        "ker::mod::time::process_timer::set(task, which, {new_val_us, new_interval_us}, &previous)",
+        "copy_value_to_task(task, old_address, to_itimerval(previous))",
     )
 
     forbidden = [
@@ -92,18 +91,18 @@ def test_setitimer_timevals_are_checked_and_saturating() -> None:
 
 def test_time_syscalls_use_common_usercopy() -> None:
     source = TIME_CPP.read_text()
-    body = function_body(source, "sys_time_get")
+    body = function_body(source, "sys_time_get") + function_body(source, "set_itimer")
 
     required = [
         "copy_value_to_task(*task, arg1, tv)",
         "copy_value_to_task(*task, arg1, ts)",
         "copy_value_from_task(*task, arg1, req)",
-        "copy_value_to_task(*task, arg2, REMAINING)",
+        "ensure_writable(*task, arg2, sizeof(timespec))",
         "ensure_writable(*task, arg1, sizeof(tms))",
         "ensure_writable(*task, arg2, sizeof(clock_t))",
         "copy_value_to_task(*task, arg1, process_times)",
         "copy_value_to_task(*task, arg2, ELAPSED)",
-        "copy_value_from_task(*task, arg2, new_value)",
+        "copy_value_from_task(task, new_address, new_value)",
         "copy_value_to_task(*task, arg2, current_value)",
     ]
     for snippet in required:
@@ -147,10 +146,24 @@ def test_sntp_preserves_fractional_time_and_uses_four_timestamps() -> None:
         fail("SNTP still truncates clock corrections to whole seconds")
 
 
+def test_native_sleep_contract() -> None:
+    source = TIME_CPP.read_text()
+    sleep = function_body(source, "sleep_until")
+    require_order(sleep, "has_interrupting_signal_pending()", "copy_value_to_task(task, remaining_address, REMAINING)",
+                  "-EINTR", "preemptible_syscall_park")
+    if "deferred_task_switch" in case_body(source, "case ker::abi::sys_time_ops::NANOSLEEP:"):
+        fail("nanosleep must resume in syscall context to publish remaining time")
+    kernel = (ROOT / "modules/kern/src/abi/callnums/time.h").read_text()
+    libc = (ROOT / "toolchain/src/mlibc/sysdeps/wos/include/callnums/time.h").read_text()
+    if kernel != libc:
+        fail("time ABI header mirrors differ")
+
+
 def main() -> None:
     test_setitimer_timevals_are_checked_and_saturating()
     test_time_syscalls_use_common_usercopy()
     test_sntp_preserves_fractional_time_and_uses_four_timestamps()
+    test_native_sleep_contract()
     print("time syscall arithmetic and full-precision SNTP invariants hold")
 
 

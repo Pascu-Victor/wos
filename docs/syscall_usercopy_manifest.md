@@ -142,10 +142,13 @@ than a kernel fault.
 | --- | --- | --- | --- | --- | --- | --- |
 | `TIME` | `GETTIMEOFDAY` | `out` | one fixed timeval | no | none | computes kernel value before one copyout |
 | `TIME` | `CLOCK_GETTIME` | `out` | one fixed timespec | no | none | computes kernel value before one copyout |
-| `TIME` | `NANOSLEEP` | `in/out` | one required timespec plus optional remaining timespec | remaining yes; request no | none | snapshots request and initializes requested output before scheduling sleep |
+| `TIME` | `NANOSLEEP` | `in/out` | one required timespec plus optional remaining timespec | remaining yes; request no | none | snapshots request and preflights remaining output; resumed syscall copies remaining time only on interruption |
 | `TIME` | `TIMES` | `out` | optional fixed tms plus optional clock value | both yes | none | preflights all requested outputs before either copyout |
 | `TIME` | `SETITIMER` | `in` | one fixed itimerval | no | none | snapshots and validates before timer mutation |
 | `TIME` | `GETITIMER` | `out` | one fixed itimerval | no | none | builds record before one copyout |
+| `TIME` | `CLOCK_GETRES` | `out` | one optional fixed timespec | yes | none | validates clock selector even for null output; builds resolution before one copyout |
+| `TIME` | `CLOCK_NANOSLEEP` | `in/out` | one versioned 32-byte ClockSleepRequest plus optional remaining timespec | remaining yes; request no | none | snapshots request and validates version/clock/flags; preflights relative remaining output; copies remaining only on interrupted relative sleep |
+| `TIME` | `SETITIMER_V1` | `in/out` | versioned 24-byte SetItimerRequest, one input itimerval and optional previous itimerval | previous yes; request/new no | none | snapshots request and input; validates version/reserved/which/timevals; preflights previous output; replaces canonical process timer and captures old state under one lock, then checked copyout |
 
 ## VFS
 

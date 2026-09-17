@@ -233,10 +233,15 @@ auto subop_name(uint64_t callnum, uint64_t op) -> std::string_view {
                     return "nanosleep";
                 case ker::abi::sys_time_ops::TIMES:
                     return "times";
+                case ker::abi::sys_time_ops::SETITIMER_V1:
                 case ker::abi::sys_time_ops::SETITIMER:
                     return "setitimer";
                 case ker::abi::sys_time_ops::GETITIMER:
                     return "getitimer";
+                case ker::abi::sys_time_ops::CLOCK_GETRES:
+                    return "clock_getres";
+                case ker::abi::sys_time_ops::CLOCK_NANOSLEEP:
+                    return "clock_nanosleep";
             }
             break;
         case ker::abi::callnums::vfs:

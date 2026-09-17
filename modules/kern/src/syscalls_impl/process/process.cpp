@@ -1087,6 +1087,18 @@ auto wos_proc_sigaction(int signum, uint64_t act_ptr, uint64_t oldact_ptr) -> ui
             handler.restorer = act.restorer;
         }
         task->publish_signal_handler(IDX, handler);
+        uint64_t const SIGNAL_BIT = uint64_t{1} << IDX;
+        if (handler.handler == 1 && (sched::task::Task::TIMER_SIGNALS & SIGNAL_BIT) != 0) {
+            // An expiry may have sampled the old disposition before publication.
+            // Serialize its pending store with this discard. The action mutex
+            // also excludes handler restoration until discard has finished.
+            // Keep claim reservations intact: commit observes the cleared bit
+            // and abandons delivery, then releases its own reservation.
+            auto* owner = task->credential_owner();
+            uint64_t const FLAGS = owner->resource_lock.lock_irqsave();
+            owner->timer_sig_pending.fetch_and(~SIGNAL_BIT, std::memory_order_acq_rel);
+            owner->resource_lock.unlock_irqrestore(FLAGS);
+        }
     }
 
     return 0;

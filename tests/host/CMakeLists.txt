@@ -7,6 +7,9 @@ find_package(Python3 COMPONENTS Interpreter REQUIRED)
 wos_add_unit_test(time_arithmetic_test
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/time_arithmetic_test.cpp
 )
+wos_add_unit_test(time_abi_math_test
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/time_abi_math_test.cpp
+)
 wos_add_unit_test(timer_queue_test
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/timer_queue_test.cpp
 )

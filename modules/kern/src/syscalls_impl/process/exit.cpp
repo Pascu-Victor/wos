@@ -10,6 +10,7 @@
 #include <platform/asm/cpu.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/ktime/ktime.hpp>
+#include <platform/ktime/process_timer.hpp>
 #include <platform/mm/virt.hpp>
 #include <platform/perf/perf_events.hpp>
 #include <platform/sched/epoch.hpp>
@@ -219,6 +220,7 @@ namespace {
         ker::mod::dbg::panic_handler("process exit: missing CPU owner");
         hcf();
     }
+    ker::mod::time::process_timer::close(*current_task->credential_owner());
     request_thread_group_exit(current_task, status, wait_status);
     if (current_task->is_thread) {
         ker::syscall::multiproc::wos_thread_exit_current();
@@ -492,7 +494,7 @@ void retire_exec_siblings(ker::mod::sched::task::Task& executor) {
         if (ker::mod::sched::resource::close_idle_thread_cpu_admission(*owner)) {
             wos_proc_exit(0);
         }
-        ker::mod::sched::preemptible_syscall_park("thread_exit", ker::mod::time::get_us() + 10000);
+        ker::mod::sched::preemptible_syscall_park("thread_exit", ker::mod::sched::saturating_deadline_us(ker::mod::time::get_us(), 10000));
     }
 }
 

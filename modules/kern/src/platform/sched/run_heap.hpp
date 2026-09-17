@@ -53,8 +53,8 @@ struct RunHeap {
 
 static_assert(sizeof(RunHeap::EntryStorage) == sizeof(task::Task*) * PER_CPU_HEAP_CAP, "RunHeap storage must stay pointer-dense");
 
-// Intrusive singly-linked list for wait queue and dead list.
-// Uses Task::schedNext pointer - zero allocations.
+// Intrusive doubly-linked list for wait queue and dead list.
+// Exact owner identity permits O(1) removal without a foreign-list scan.
 // No ordering, just a bag of parked tasks.
 struct IntrusiveTaskList {
     task::Task* head{};
@@ -65,7 +65,7 @@ struct IntrusiveTaskList {
     // Prepend task to list. O(1).
     void push(task::Task* t);
 
-    // Remove a specific task. O(n) scan.
+    // Remove a specific task. O(1), after checking exact list ownership.
     // Returns false if task was not found.
     bool remove(task::Task* t);
 

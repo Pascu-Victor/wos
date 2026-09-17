@@ -12,6 +12,8 @@
 #include <platform/mm/paging.hpp>
 // #include <platform/sys/context_switch.hpp>
 #include <platform/interrupt/gates.hpp>
+#include <platform/ktime/interval_timer_model.hpp>
+#include <platform/ktime/timer_queue.hpp>
 #include <platform/sched/fd_table.hpp>
 #include <platform/sched/frame_class.hpp>
 #include <platform/sched/job_control.hpp>
@@ -56,6 +58,10 @@ class PreparedNativeExecImage;
 class ExecRequestArguments;
 struct WorkerExecHandoff;
 }  // namespace ker::syscall::process
+
+namespace ker::mod::sched {
+struct IntrusiveTaskList;
+}
 
 namespace ker::mod::sched::task {
 
@@ -463,6 +469,11 @@ struct Task {
     // Signal state.
     std::atomic<uint64_t> sig_pending{0};  // Bit N = signal N+1 is pending, signals 1-64
     std::atomic<uint64_t> sig_pending_claimed{0};
+    // Process-directed interval signals live on the retained canonical owner,
+    // including while its main thread is alive but masks the signal.
+    std::atomic<uint64_t> timer_sig_pending{0};
+    std::atomic<uint64_t> timer_sig_claimed{0};
+    static constexpr uint64_t TIMER_SIGNALS = (uint64_t{1} << 13) | (uint64_t{1} << 25) | (uint64_t{1} << 26);
     std::atomic<bool> main_thread_retired{false};
     std::atomic<uint64_t> sig_mask{0};             // Bitmask of blocked signals
     std::atomic<uint64_t> sig_mask_seq{0};         // Monotonic version mirrored into the userspace TCB cache.
@@ -490,13 +501,18 @@ struct Task {
 
     [[nodiscard]] auto signal_delivery_pending_bits() const -> uint64_t {
         auto* owner = retired_signal_owner();
-        return signal_pending_bits() | (owner != nullptr ? owner->signal_pending_bits() & RETIRED_SHARED_SIGNALS : 0);
+        auto* timer_owner = credential_owner();
+        return signal_pending_bits() | (owner != nullptr ? owner->signal_pending_bits() & RETIRED_SHARED_SIGNALS : 0) |
+               (timer_owner != nullptr ? timer_owner->timer_sig_pending.load(std::memory_order_acquire) & TIMER_SIGNALS : 0);
     }
 
     [[nodiscard]] auto signal_deliverable_bits(std::memory_order order = std::memory_order_acquire) const -> uint64_t {
         uint64_t pending = signal_pending_bits(order) & ~sig_pending_claimed.load(order);
         if (auto* owner = retired_signal_owner(); owner != nullptr) {
             pending |= owner->signal_pending_bits(order) & ~owner->sig_pending_claimed.load(order) & RETIRED_SHARED_SIGNALS;
+        }
+        if (auto* owner = credential_owner(); owner != nullptr) {
+            pending |= owner->timer_sig_pending.load(order) & ~owner->timer_sig_claimed.load(order) & TIMER_SIGNALS;
         }
         return pending & ~signal_mask_bits(order);
     }
@@ -508,7 +524,11 @@ struct Task {
         }
         auto* owner = credential_owner();
         if (retired_signal_owner() != nullptr && (mask & RETIRED_SHARED_SIGNALS) != 0) {
-            return SignalPendingClaim::acquire(owner->sig_pending, owner->sig_pending_claimed, mask);
+            auto retired = SignalPendingClaim::acquire(owner->sig_pending, owner->sig_pending_claimed, mask);
+            if (retired) return retired;
+        }
+        if (owner != nullptr && (mask & TIMER_SIGNALS) != 0) {
+            return SignalPendingClaim::acquire(owner->timer_sig_pending, owner->timer_sig_claimed, mask);
         }
         return {};
     }
@@ -639,8 +659,6 @@ struct Task {
     uint64_t precharged_syscall_time_us{};  // Syscall time already charged before the next scheduler tick
 
     // ITIMER_REAL state (microseconds, 0 = not armed).
-    uint64_t itimer_real_expire_us{};    // Absolute HPET time when SIGALRM fires (0 = disarmed)
-    uint64_t itimer_real_interval_us{};  // Reload interval after expiry (0 = one-shot)
 
     // EEVDF scheduling fields.
     int64_t vruntime{};   // Cumulative weighted CPU time consumed
@@ -671,6 +689,9 @@ struct Task {
 
     // Intrusive list pointer for wait queue and dead list (zero allocations).
     Task* sched_next{};
+    Task* sched_previous{};
+    std::atomic<IntrusiveTaskList*> sched_list_owner{nullptr};
+    time::TimerNode wait_timer{};
     alignas(8) std::atomic<uint64_t> death_epoch{0};  // Epoch when task became DEAD
 
     // File descriptor table for the task (per-process model).
@@ -870,6 +891,14 @@ struct Task {
     // Process-wide policy; userspace threads access the retained owner task.
     resource::State resources{FD_TABLE_SIZE};
     mod::sys::Spinlock resource_lock;
+    // Canonical process timer state uses resource_lock. Queue links below use
+    // the timer service lock; every queued/in-flight item retains this owner.
+    time::interval::ProcessTimers interval_timers;
+    time::TimerNode interval_real_timer;
+    Task* interval_wake_prev = nullptr;
+    Task* interval_wake_next = nullptr;
+    bool interval_wake_queued = false;
+    std::atomic<uint32_t> interval_work_refs{0};
     resource::LifetimeOwner resource_owner;
     // resource_lock protects the process barrier. Destruction order matters:
     // detach membership before destroying the barrier or releasing the owner.

@@ -12,6 +12,7 @@
 #include <iterator>
 #include <new>
 #include <platform/dbg/journal.hpp>
+#include <platform/ktime/process_timer.hpp>
 
 #include "mod/io/serial/serial.hpp"
 #include "net/proto/ndp.hpp"
@@ -878,6 +879,10 @@ void start_smt(boot::HandoverModules& modules, uint64_t kernel_rsp) {
         dbg::panic_handler("unable to start journal module publisher");
     }
     sched::start_gc_worker();
+    if (!time::process_timer::init()) {
+        dbg::panic_handler("unable to start process timer worker");
+        hcf();
+    }
     mm::reclaim::start_worker();
     mm::virt::start_anonymous_swap_worker();
 

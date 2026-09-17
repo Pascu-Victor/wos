@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <ctime>
 #include <platform/ktime/ktime.hpp>
+#include <platform/ktime/process_timer.hpp>
 #include <platform/rtc/rtc.hpp>
 #include <platform/sched/resource.hpp>
 #include <platform/sched/scheduler.hpp>
@@ -16,6 +17,7 @@
 
 #include "abi/callnums/time.h"
 #include "platform/dbg/dbg.hpp"
+#include "time_math.hpp"
 
 namespace ker::syscall::time {
 
@@ -28,8 +30,6 @@ struct Itimerval {
     struct timeval it_value;
 };
 
-constexpr int ITIMER_REAL = 0;
-constexpr long NSEC_PER_SEC = 1000000000L;
 constexpr uint64_t USEC_PER_SEC = 1000000ULL;
 
 // CLK_TCK for times() return values - must match userspace sysconf(_SC_CLK_TCK)
@@ -56,22 +56,6 @@ auto process_cpu_times(ker::mod::sched::task::Task& task, tms& result) -> bool {
     return true;
 }
 
-auto relative_timespec_to_us(const struct timespec& ts, uint64_t& out_us) -> bool {
-    out_us = 0;
-    if (ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= NSEC_PER_SEC) {
-        return false;
-    }
-
-    auto const NSEC_US = (static_cast<uint64_t>(ts.tv_nsec) + 999ULL) / 1000ULL;
-    auto const SEC = static_cast<uint64_t>(ts.tv_sec);
-    if (SEC > (UINT64_MAX - NSEC_US) / USEC_PER_SEC) {
-        return false;
-    }
-
-    out_us = (SEC * USEC_PER_SEC) + NSEC_US;
-    return true;
-}
-
 auto relative_timeval_to_us(const struct timeval& tv, uint64_t& out_us) -> bool {
     out_us = 0;
     if (tv.tv_sec < 0 || tv.tv_usec < 0) {
@@ -92,12 +76,56 @@ auto relative_timeval_to_us(const struct timeval& tv, uint64_t& out_us) -> bool 
     return true;
 }
 
-auto deadline_from_now_us(uint64_t sleep_us) -> uint64_t {
-    uint64_t const NOW_US = ker::mod::time::get_us();
-    if (UINT64_MAX - NOW_US < sleep_us) {
-        return UINT64_MAX;
+auto to_itimerval(ker::mod::time::interval::Value value) -> Itimerval {
+    return {.it_interval = {.tv_sec = static_cast<long>(value.interval_us / USEC_PER_SEC),
+                            .tv_usec = static_cast<long>(value.interval_us % USEC_PER_SEC)},
+            .it_value = {.tv_sec = static_cast<long>(value.remaining_us / USEC_PER_SEC),
+                         .tv_usec = static_cast<long>(value.remaining_us % USEC_PER_SEC)}};
+}
+
+auto set_itimer(ker::mod::sched::task::Task& task, int which, uint64_t new_address, uint64_t old_address) -> uint64_t {
+    if (which < 0 || which > 2) return static_cast<uint64_t>(-EINVAL);
+    Itimerval new_value{};
+    if (!ker::mod::sys::usercopy::copy_value_from_task(task, new_address, new_value)) return static_cast<uint64_t>(-EFAULT);
+    uint64_t new_val_us = 0;
+    uint64_t new_interval_us = 0;
+    if (!relative_timeval_to_us(new_value.it_value, new_val_us) || !relative_timeval_to_us(new_value.it_interval, new_interval_us)) {
+        return static_cast<uint64_t>(-EINVAL);
     }
-    return NOW_US + sleep_us;
+    if (old_address != 0 && !ker::mod::sys::usercopy::ensure_writable(task, old_address, sizeof(Itimerval))) {
+        return static_cast<uint64_t>(-EFAULT);
+    }
+    ker::mod::time::interval::Value previous{};
+    int const RESULT = ker::mod::time::process_timer::set(task, which, {new_val_us, new_interval_us}, &previous);
+    if (RESULT != 0) return static_cast<uint64_t>(RESULT);
+    if (old_address != 0 && !ker::mod::sys::usercopy::copy_value_to_task(task, old_address, to_itimerval(previous))) {
+        return static_cast<uint64_t>(-EFAULT);
+    }
+    return 0;
+}
+
+auto sleep_until(ker::mod::sched::task::Task& task, int clock_id, uint32_t flags, uint64_t requested_ns, uint64_t remaining_address)
+    -> uint64_t {
+    bool const ABSOLUTE = (flags & ker::abi::TIME_SLEEP_ABSTIME) != 0;
+    bool const REALTIME = ABSOLUTE && clock_id == 0;
+    uint64_t const DEADLINE = ABSOLUTE ? requested_ns : math::add(ker::mod::time::get_monotonic_ns(), requested_ns);
+    for (;;) {
+        uint64_t const MONO_NS = ker::mod::time::get_monotonic_ns();
+        uint64_t const NOW_NS = REALTIME ? ker::mod::rtc::get_epoch_ns() : MONO_NS;
+        if (NOW_NS >= DEADLINE) return 0;
+        uint64_t const REMAINING_NS = DEADLINE - NOW_NS;
+        if (task.has_interrupting_signal_pending()) {
+            if (!ABSOLUTE && remaining_address != 0) {
+                timespec const REMAINING{.tv_sec = static_cast<long>(REMAINING_NS / math::NSEC_PER_SEC),
+                                         .tv_nsec = static_cast<long>(REMAINING_NS % math::NSEC_PER_SEC)};
+                if (!ker::mod::sys::usercopy::copy_value_to_task(task, remaining_address, REMAINING)) {
+                    return static_cast<uint64_t>(-EFAULT);
+                }
+            }
+            return static_cast<uint64_t>(-EINTR);
+        }
+        ker::mod::sched::preemptible_syscall_park("nanosleep", math::park_deadline_us(MONO_NS, REMAINING_NS, REALTIME));
+    }
 }
 
 }  // namespace
@@ -141,16 +169,13 @@ auto sys_time_get(uint64_t op, uint64_t arg1, uint64_t arg2) -> uint64_t {
             } else if (CLOCK_ID == 3) {
                 // Thread clock remains this task's own scheduled time.
                 ts = cpu_us_to_timespec(task_cpu_time_us(*task));
-            } else {
-                // CLOCK_MONOTONIC (and any other id): TSC nanoseconds since boot
-                uint64_t mono_ns = 0;
-                if (ker::mod::tsc::get_hz() != 0) {
-                    mono_ns = ker::mod::tsc::get_ns();
-                } else {
-                    mono_ns = ker::mod::time::get_us() * 1000ULL;
-                }
+            } else if (CLOCK_ID == 1) {
+                // CLOCK_MONOTONIC uses the same clock as scheduler deadlines.
+                uint64_t const mono_ns = ker::mod::time::get_monotonic_ns();
                 ts.tv_sec = static_cast<long>(mono_ns / 1000000000ULL);
                 ts.tv_nsec = static_cast<long>(mono_ns % 1000000000ULL);
+            } else {
+                return static_cast<uint64_t>(-EINVAL);
             }
             return ker::mod::sys::usercopy::copy_value_to_task(*task, arg1, ts) ? 0 : static_cast<uint64_t>(-EFAULT);
         }
@@ -164,27 +189,42 @@ auto sys_time_get(uint64_t op, uint64_t arg1, uint64_t arg2) -> uint64_t {
             if (!ker::mod::sys::usercopy::copy_value_from_task(*task, arg1, req)) {
                 return static_cast<uint64_t>(-EFAULT);
             }
-            uint64_t sleep_us = 0;
-            if (!relative_timespec_to_us(req, sleep_us)) {
+            uint64_t sleep_ns = 0;
+            if (!math::to_ns(req.tv_sec, req.tv_nsec, sleep_ns)) return static_cast<uint64_t>(-EINVAL);
+            if (arg2 != 0 && !ker::mod::sys::usercopy::ensure_writable(*task, arg2, sizeof(timespec))) {
+                return static_cast<uint64_t>(-EFAULT);
+            }
+            return sleep_until(*task, 1, 0, sleep_ns, arg2);
+        }
+
+        case ker::abi::sys_time_ops::CLOCK_GETRES: {
+            int const CLOCK_ID = static_cast<int>(arg2);
+            if (!math::valid_clock(CLOCK_ID)) return static_cast<uint64_t>(-EINVAL);
+            if (arg1 == 0) return 0;
+            auto* task = ker::mod::sched::get_current_task();
+            if (task == nullptr) return static_cast<uint64_t>(-EFAULT);
+            uint64_t const RESOLUTION_NS = CLOCK_ID >= 2 ? 1000 : ker::mod::tsc::get_resolution_ns();
+            timespec const RESOLUTION{.tv_sec = static_cast<long>(RESOLUTION_NS / math::NSEC_PER_SEC),
+                                      .tv_nsec = static_cast<long>(RESOLUTION_NS % math::NSEC_PER_SEC)};
+            return ker::mod::sys::usercopy::copy_value_to_task(*task, arg1, RESOLUTION) ? 0 : static_cast<uint64_t>(-EFAULT);
+        }
+
+        case ker::abi::sys_time_ops::CLOCK_NANOSLEEP: {
+            if (arg2 != ker::abi::TIME_SLEEP_VERSION) return static_cast<uint64_t>(-EINVAL);
+            auto* task = ker::mod::sched::get_current_task();
+            if (task == nullptr || arg1 == 0) return static_cast<uint64_t>(-EFAULT);
+            ker::abi::ClockSleepRequest request{};
+            if (!ker::mod::sys::usercopy::copy_value_from_task(*task, arg1, request)) return static_cast<uint64_t>(-EFAULT);
+            if (!math::sleep_clock(request.clock_id) || (request.flags & ~ker::abi::TIME_SLEEP_ABSTIME) != 0) {
                 return static_cast<uint64_t>(-EINVAL);
             }
-            if (arg2 != 0) {
-                timespec const REMAINING{};
-                if (!ker::mod::sys::usercopy::copy_value_to_task(*task, arg2, REMAINING)) {
-                    return static_cast<uint64_t>(-EFAULT);
-                }
+            uint64_t requested_ns = 0;
+            if (!math::to_ns(request.seconds, request.nanoseconds, requested_ns)) return static_cast<uint64_t>(-EINVAL);
+            if ((request.flags & ker::abi::TIME_SLEEP_ABSTIME) == 0 && request.remaining_address != 0 &&
+                !ker::mod::sys::usercopy::ensure_writable(*task, request.remaining_address, sizeof(timespec))) {
+                return static_cast<uint64_t>(-EFAULT);
             }
-            if (sleep_us > 0) {
-                // Set wake deadline and use deferred_task_switch to properly block
-                // (move to wait list). The timer tick wakeup scan will reschedule us
-                // once wake_at_us is reached.
-                task->wake_at_us = deadline_from_now_us(sleep_us);
-                task->set_wait_channel("nanosleep");
-                task->deferred_task_switch = true;
-                // Return 0 now - syscall exit path sees deferred_task_switch=true,
-                // moves task to wait list, switches to next task.
-            }
-            return 0;
+            return sleep_until(*task, request.clock_id, request.flags, requested_ns, request.remaining_address);
         }
 
         case ker::abi::sys_time_ops::TIMES: {
@@ -209,78 +249,34 @@ auto sys_time_get(uint64_t op, uint64_t arg1, uint64_t arg2) -> uint64_t {
         }
 
         case ker::abi::sys_time_ops::SETITIMER: {
-            // arg1 = which (as uintptr_t), arg2 = const itimerval* new_value
-            // old_value is not passed through this 2-arg path; mlibc reads it
-            // via getitimer before calling setitimer if it needs the old value.
             auto* task = ker::mod::sched::get_current_task();
-            if (task == nullptr) {
-                return static_cast<uint64_t>(-ESRCH);
-            }
+            if (task == nullptr) return static_cast<uint64_t>(-ESRCH);
+            return set_itimer(*task, static_cast<int>(arg1), arg2, 0);
+        }
 
-            int const WHICH = static_cast<int>(arg1);
-            if (WHICH != ITIMER_REAL) {
-                return static_cast<uint64_t>(-EINVAL);
-            }
-
-            if (arg2 == 0) {
-                return static_cast<uint64_t>(-EFAULT);
-            }
-            Itimerval new_value{};
-            if (!ker::mod::sys::usercopy::copy_value_from_task(*task, arg2, new_value)) {
-                return static_cast<uint64_t>(-EFAULT);
-            }
-
-            uint64_t new_val_us = 0;
-            uint64_t new_interval_us = 0;
-            if (!relative_timeval_to_us(new_value.it_value, new_val_us) ||
-                !relative_timeval_to_us(new_value.it_interval, new_interval_us)) {
-                return static_cast<uint64_t>(-EINVAL);
-            }
-
-            if (new_val_us == 0) {
-                task->itimer_real_expire_us = 0;
-                task->itimer_real_interval_us = 0;
-            } else {
-                task->itimer_real_expire_us = deadline_from_now_us(new_val_us);
-                task->itimer_real_interval_us = new_interval_us;
-                ker::mod::sched::request_local_timer_recheck();
-            }
-            return 0;
+        case ker::abi::sys_time_ops::SETITIMER_V1: {
+            if (arg2 != ker::abi::TIME_ITIMER_VERSION) return static_cast<uint64_t>(-EINVAL);
+            auto* task = ker::mod::sched::get_current_task();
+            if (task == nullptr) return static_cast<uint64_t>(-ESRCH);
+            ker::abi::SetItimerRequest request{};
+            if (!ker::mod::sys::usercopy::copy_value_from_task(*task, arg1, request)) return static_cast<uint64_t>(-EFAULT);
+            if (request.reserved != 0) return static_cast<uint64_t>(-EINVAL);
+            return set_itimer(*task, request.which, request.new_value_address, request.old_value_address);
         }
 
         case ker::abi::sys_time_ops::GETITIMER: {
-            // arg1 = which (as uintptr_t), arg2 = itimerval* curr_value
             auto* task = ker::mod::sched::get_current_task();
-            if (task == nullptr) {
-                return static_cast<uint64_t>(-ESRCH);
-            }
-
-            int const WHICH = static_cast<int>(arg1);
-            if (WHICH != ITIMER_REAL) {
-                return static_cast<uint64_t>(-EINVAL);
-            }
-
-            if (arg2 == 0) {
-                return static_cast<uint64_t>(-EFAULT);
-            }
-
-            uint64_t const NOW_US = ker::mod::time::get_us();
-            uint64_t remain_us = 0;
-            if (task->itimer_real_expire_us != 0 && task->itimer_real_expire_us > NOW_US) {
-                remain_us = task->itimer_real_expire_us - NOW_US;
-            }
-
-            Itimerval current_value{};
-            current_value.it_value.tv_sec = static_cast<long>(remain_us / 1000000ULL);
-            current_value.it_value.tv_usec = static_cast<long>(remain_us % 1000000ULL);
-            current_value.it_interval.tv_sec = static_cast<long>(task->itimer_real_interval_us / 1000000ULL);
-            current_value.it_interval.tv_usec = static_cast<long>(task->itimer_real_interval_us % 1000000ULL);
+            if (task == nullptr) return static_cast<uint64_t>(-ESRCH);
+            ker::mod::time::interval::Value current{};
+            int const RESULT = ker::mod::time::process_timer::get(*task, static_cast<int>(arg1), current);
+            if (RESULT != 0) return static_cast<uint64_t>(RESULT);
+            Itimerval const current_value = to_itimerval(current);
             return ker::mod::sys::usercopy::copy_value_to_task(*task, arg2, current_value) ? 0 : static_cast<uint64_t>(-EFAULT);
         }
 
         default:
             log::error("invalid op %llu", static_cast<unsigned long long>(op));
-            return static_cast<uint64_t>(-1);
+            return static_cast<uint64_t>(-ENOSYS);
     }
 }
 

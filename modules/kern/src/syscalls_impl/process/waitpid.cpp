@@ -87,7 +87,7 @@ namespace events = ker::syscall::process::child_events;
     using namespace ker::net::wki;
     uint64_t handle = 0;
     bool committing = false;
-    uint64_t admission_deadline = ker::mod::time::get_us() + WKI_OP_TIMEOUT_US;
+    uint64_t admission_deadline = ker::mod::sched::saturating_deadline_us(ker::mod::time::get_us(), WKI_OP_TIMEOUT_US);
     for (;;) {
         auto result = handle == 0 ? wki_child_wait_begin(owner, waiter, pid, options, handle) : wki_child_wait_poll(waiter, handle);
         if (result.state == WkiChildWaitState::LOCAL) return std::nullopt;
@@ -116,7 +116,7 @@ namespace events = ker::syscall::process::child_events;
             handle = 0;
             if (result.state == WkiChildWaitState::EMPTY) {
                 if ((options & events::OPTION_NOHANG) != 0) return 0;
-                admission_deadline = ker::mod::time::get_us() + WKI_OP_TIMEOUT_US;
+                admission_deadline = ker::mod::sched::saturating_deadline_us(ker::mod::time::get_us(), WKI_OP_TIMEOUT_US);
             } else if (committing || result.error != -EAGAIN)
                 return static_cast<uint64_t>(result.error);
         }
@@ -126,7 +126,8 @@ namespace events = ker::syscall::process::child_events;
         }
         uint64_t const NOW = ker::mod::time::get_us();
         if (handle == 0 && NOW >= admission_deadline) return static_cast<uint64_t>(-ETIMEDOUT);
-        ker::mod::sched::preemptible_syscall_park("waitpid", sched_task::WaitChannelKind::WAITPID, NOW + (handle == 0 ? 10000 : 1000));
+        ker::mod::sched::preemptible_syscall_park("waitpid", sched_task::WaitChannelKind::WAITPID,
+                                                  ker::mod::sched::saturating_deadline_us(NOW, handle == 0 ? 10000 : 1000));
     }
 }
 

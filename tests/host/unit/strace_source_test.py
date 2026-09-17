@@ -278,7 +278,16 @@ def test_strace_names_init_control_syscalls() -> None:
         )
 
 
+def test_strace_time_operation_names_cover_abi() -> None:
+    abi = (ROOT / "modules/kern/src/abi/callnums/time.h").read_text()
+    decode = (STRACE_SOURCE_DIR / "decode.cpp").read_text()
+    for operation in re.findall(r"^\s+([A-Z_][A-Z_0-9]*)\s*=\s*\d+,", abi, re.MULTILINE):
+        if f"case ker::abi::sys_time_ops::{operation}:" not in decode:
+            fail(f"time ABI operation {operation} has no strace decoder")
+
+
 def main() -> None:
+    test_strace_time_operation_names_cover_abi()
     test_strace_startup_wait_is_deadline_bounded()
     test_strace_proxy_startup_cleanup_reaps_tracee()
     test_strace_tracee_is_pinned_local_before_startup_stop()

@@ -95,6 +95,37 @@ KTEST(SignalPending, RetiredOwnerOccurrenceSurvivesRecipientAbandonment) {
     owner->signal_pending_store(0);
 }
 
+KTEST(SignalPending, ProcessTimerSignalCanReachWorkerBeforeLeaderRetirement) {
+    using Task = ker::mod::sched::task::Task;
+    auto owner = std::make_unique<Task>();
+    auto worker = std::make_unique<Task>();
+    auto sibling = std::make_unique<Task>();
+    owner->type = worker->type = sibling->type = ker::mod::sched::task::TaskType::PROCESS;
+    owner->pid = 0x7B79;
+    worker->is_thread = sibling->is_thread = true;
+    worker->owner_pid = sibling->owner_pid = owner->pid;
+    KREQUIRE_TRUE(ker::mod::sched::resource::bind_thread_owner(*worker, *owner));
+    KREQUIRE_TRUE(ker::mod::sched::resource::bind_thread_owner(*sibling, *owner));
+    constexpr uint64_t ALARM = uint64_t{1} << 13;
+    owner->signal_mask_store(ALARM);
+    owner->timer_sig_pending.store(ALARM);
+    KEXPECT_EQ(owner->signal_deliverable_bits(), 0U);
+    KEXPECT_EQ(worker->signal_delivery_pending_bits(), ALARM);
+    {
+        auto preparation = worker->claim_signal_for_delivery(ALARM);
+        KEXPECT_TRUE(static_cast<bool>(preparation));
+        KEXPECT_EQ(sibling->signal_deliverable_bits(), 0U);
+    }
+    worker.reset();
+    KEXPECT_EQ(sibling->signal_deliverable_bits(), ALARM);
+    KEXPECT_TRUE(sibling->consume_signal_for_delivery(ALARM));
+    KEXPECT_EQ(owner->timer_sig_pending.load(), 0U);
+    KEXPECT_FALSE(owner->consume_signal_for_delivery(ALARM));
+    owner->main_thread_retired.store(true);
+    owner->timer_sig_pending.store(ALARM);
+    KEXPECT_TRUE(sibling->consume_signal_for_delivery(ALARM));
+}
+
 KTEST(SignalPending, LocalAndSharedOccurrencesRemainSeparate) {
     using Task = ker::mod::sched::task::Task;
     auto owner = std::make_unique<Task>();

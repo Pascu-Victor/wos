@@ -1592,8 +1592,6 @@ Task* Task::create_user_thread(Task* parent, uint64_t tcb_vaddr, uint64_t user_s
     t->child_system_time_us = 0;
     t->syscall_account_start_us = 0;
     t->precharged_syscall_time_us = 0;
-    t->itimer_real_expire_us = 0;
-    t->itimer_real_interval_us = 0;
 
     if (!resource::bind_thread_owner(*t, *parent)) {
         destroy_unpublished_user_thread(t);

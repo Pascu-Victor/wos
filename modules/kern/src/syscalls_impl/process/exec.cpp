@@ -27,6 +27,7 @@
 #include <platform/dbg/dbg.hpp>
 #include <platform/init/limine_requests.hpp>
 #include <platform/ktime/ktime.hpp>
+#include <platform/ktime/process_timer.hpp>
 #include <platform/loader/debug_info.hpp>
 #include <platform/loader/elf_loader.hpp>
 #include <platform/mm/mm.hpp>
@@ -1670,6 +1671,14 @@ auto prepare_remote_exec_owner(ker::mod::sched::task::Task& owner, void* context
         };
     }
     if (!plan.admission.quiesce(owner)) return -EAGAIN;
+    {
+        // The remote wire contract has no interval timer state. Admission
+        // excludes new setters while this snapshot rejects a lossy transfer.
+        uint64_t const FLAGS = owner.resource_lock.lock_irqsave();
+        bool const TIMERS_ACTIVE = ker::mod::time::process_timer::has_active_locked(owner);
+        owner.resource_lock.unlock_irqrestore(FLAGS);
+        if (TIMERS_ACTIVE) return -EBUSY;
+    }
     // Detached wait commits must publish their observation before the exec snapshot.
     if (!ker::net::wki::wki_child_wait_quiesce(owner)) return -EAGAIN;
     // An already-entered credential syscall may have finished during quiesce.

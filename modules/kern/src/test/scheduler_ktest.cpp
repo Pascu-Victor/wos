@@ -28,6 +28,7 @@ auto scheduler_selftest_transition_validator_detects_corruption() -> bool;
 auto scheduler_selftest_handoff_preserves_runnable_event_token() -> bool;
 auto scheduler_selftest_exception_wait_token_closes_prepark_race() -> bool;
 auto scheduler_selftest_reserved_wake_precedes_handoff_commit() -> bool;
+auto scheduler_selftest_wait_timer_index_transfer_and_budget() -> bool;
 auto scheduler_selftest_concurrent_reschedule_requests_are_serialized() -> bool;
 auto scheduler_selftest_final_cpu_slice_freezes_accounting() -> bool;
 auto scheduler_selftest_resource_cpu_split_matches_task() -> bool;
@@ -361,6 +362,10 @@ KTEST(SchedulerHandoff, ReservedWakePrecedesCommit) {
     KEXPECT_TRUE(ker::mod::sched::scheduler_selftest_reserved_wake_precedes_handoff_commit());
 }
 
+KTEST(SchedulerTimers, WaitIndexTransferAndBudget) {
+    KEXPECT_TRUE(ker::mod::sched::scheduler_selftest_wait_timer_index_transfer_and_budget());
+}
+
 KTEST(SchedulerWake, ConcurrentRescheduleRequestsAreSerialized) {
     KEXPECT_TRUE(ker::mod::sched::scheduler_selftest_concurrent_reschedule_requests_are_serialized());
 }
@@ -506,6 +511,8 @@ KTEST(SchedulerTransitionModel, NegativeInvariantChecksAreDetected) {
 
 KTEST(SchedulerTransitionValidator, DetectsAndClearsCorruption) {
     KEXPECT_TRUE(ker::mod::sched::scheduler_selftest_transition_validator_detects_corruption());
+    // Reusing the fixture must clear intrusive ownership as well as list heads.
+    KEXPECT_TRUE(ker::mod::sched::scheduler_selftest_transition_validator_detects_corruption());
 }
 
 KTEST(ContextSwitch, RepairsStaleProcessSyscallResume) {
@@ -520,6 +527,7 @@ KTEST(ContextSwitch, RepairsStaleProcessSyscallResume) {
 // Task embeds a 512-byte FxState; keeping these off the stack is also safer.
 static constexpr int HEAP_TEST_N = 5;
 static ker::mod::sched::task::Task g_heap_tasks[HEAP_TEST_N];  // NOLINT
+static ker::mod::sched::task::Task g_list_tasks[3];            // NOLINT
 
 KTEST(Sched, RunHeapOrder) {
     using namespace ker::mod::sched;
@@ -554,6 +562,32 @@ KTEST(Sched, RunHeapOrder) {
         KEXPECT_TRUE(heap.remove(t));
     }
     KEXPECT_EQ(static_cast<int>(heap.size), 0);
+}
+
+KTEST(Sched, IntrusiveWaitListOwnershipAndUnlink) {
+    using namespace ker::mod::sched;
+    // Task is large; keep this independent list test off the kernel stack.
+    auto& first = g_list_tasks[0];
+    auto& middle = g_list_tasks[1];
+    auto& last = g_list_tasks[2];
+    IntrusiveTaskList list{};
+    IntrusiveTaskList foreign{};
+    list.push(&last);
+    list.push(&middle);
+    list.push(&first);
+    KEXPECT_EQ(list.count, 3U);
+    KEXPECT_FALSE(foreign.remove(&middle));
+    KEXPECT_TRUE(list.remove(&middle));
+    KEXPECT_TRUE(first.sched_next == &last);
+    KEXPECT_TRUE(last.sched_previous == &first);
+    KEXPECT_TRUE(middle.sched_list_owner.load(std::memory_order_acquire) == nullptr);
+    KEXPECT_TRUE(list.pop() == &first);
+    KEXPECT_TRUE(last.sched_previous == nullptr);
+    KEXPECT_TRUE(list.remove(&last));
+    KEXPECT_TRUE(list.head == nullptr);
+    KEXPECT_EQ(list.count, 0U);
+    foreign.push(&middle);
+    KEXPECT_TRUE(foreign.pop() == &middle);
 }
 
 KTEST(Sched, ExitedHeapRootCannotStarveIdleWorker) {

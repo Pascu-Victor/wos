@@ -248,7 +248,7 @@ task::Task* RunHeap::pick_best_eligible(int64_t avg_vruntime) {
 }
 
 // ============================================================================
-// IntrusiveTaskList - singly-linked, zero-allocation
+// IntrusiveTaskList - doubly-linked, zero-allocation
 // ============================================================================
 
 void IntrusiveTaskList::init() {
@@ -257,7 +257,7 @@ void IntrusiveTaskList::init() {
 }
 
 void IntrusiveTaskList::push(task::Task* t) {
-    if (t == nullptr) {
+    if (t == nullptr || t->sched_list_owner.load(std::memory_order_acquire) != nullptr) {
         return;
     }
 
@@ -271,24 +271,25 @@ void IntrusiveTaskList::push(task::Task* t) {
 #endif
 
     t->sched_next = head;
+    t->sched_previous = nullptr;
+    if (head != nullptr) head->sched_previous = t;
     head = t;
+    t->sched_list_owner.store(this, std::memory_order_release);
     count++;
 }
 
 bool IntrusiveTaskList::remove(task::Task* t) {
-    task::Task** prev = &head;
-    task::Task* cur = head;
-    while (cur != nullptr) {
-        if (cur == t) {
-            *prev = cur->sched_next;
-            cur->sched_next = nullptr;
-            count--;
-            return true;
-        }
-        prev = &cur->sched_next;
-        cur = cur->sched_next;
-    }
-    return false;
+    if (t == nullptr || t->sched_list_owner.load(std::memory_order_acquire) != this) return false;
+    if (t->sched_previous != nullptr)
+        t->sched_previous->sched_next = t->sched_next;
+    else
+        head = t->sched_next;
+    if (t->sched_next != nullptr) t->sched_next->sched_previous = t->sched_previous;
+    t->sched_next = nullptr;
+    t->sched_previous = nullptr;
+    t->sched_list_owner.store(nullptr, std::memory_order_release);
+    --count;
+    return true;
 }
 
 task::Task* IntrusiveTaskList::find_by_pid(uint64_t pid) const {
@@ -307,9 +308,7 @@ task::Task* IntrusiveTaskList::pop() {
         return nullptr;
     }
     task::Task* t = head;
-    head = t->sched_next;
-    t->sched_next = nullptr;
-    count--;
+    static_cast<void>(remove(t));
     return t;
 }
 

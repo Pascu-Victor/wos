@@ -31,6 +31,7 @@ static constexpr uint32_t MAX_PIDS = (1 << 24);
 struct RunQueue {
     RunHeap runnable_heap{};        // EEVDF min-heap of runnable tasks (keyed on vdeadline)
     IntrusiveTaskList wait_list{};  // Tasks blocked on I/O or events (waitpid, socket recv)
+    time::TimerQueue wait_timers{time::TimerDispatch::SYNCHRONOUS};
     IntrusiveTaskList dead_list{};  // Dead tasks awaiting epoch-based GC
 
     task::Task* current_task{nullptr};  // Task whose stack is currently executing on this CPU
@@ -92,6 +93,9 @@ struct RunQueue {
     std::atomic<uint64_t> wait_list_scan_passes;
     std::atomic<uint64_t> wait_list_scan_max;
     std::atomic<uint64_t> timer_expired_wakeups;
+    std::atomic<uint64_t> wait_timer_extractions{0};
+    std::atomic<uint64_t> wait_timer_budget_exhaustions{0};
+    std::atomic<uint64_t> wait_timer_late_us_max{0};
     std::atomic<uint64_t> gc_passes_triggered;
     std::atomic<uint64_t> gc_tasks_reclaimed;
     std::atomic<uint64_t> gc_work_us_total;
@@ -633,6 +637,11 @@ struct RunQueueStats {
     uint64_t active_task_count;   // runnable_heap.size
     uint64_t expired_task_count;  // deadList.count
     uint64_t wait_queue_count;    // waitList.count
+    uint64_t timer_queue_depth{};
+    uint64_t timer_extractions{};
+    uint64_t timer_budget_exhaustions{};
+    uint64_t timer_late_us_max{};
+    uint64_t timer_irq_budget{16};
 };
 auto get_run_queue_stats(uint64_t cpu_no) -> RunQueueStats;
 auto get_scheduler_trace_stats(uint64_t cpu_no) -> SchedulerTraceStats;

@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <optional>
 #include <platform/ktime/ktime.hpp>
+#include <platform/ktime/process_timer.hpp>
 #include <platform/sched/resource_as.hpp>
 #include <platform/sched/resource_model.hpp>
 #include <platform/sched/scheduler.hpp>
@@ -208,7 +209,9 @@ void charge_cpu(task::Task* subject, uint64_t elapsed_us, uint64_t user_us) {
     }
     uint64_t const FLAGS = process->resource_lock.lock_irqsave();
     auto const ACTION = process->resources.charge_cpu(elapsed_us, user_us);
+    bool const TIMER_EXPIRED = time::process_timer::charge_locked(*process);
     process->resource_lock.unlock_irqrestore(FLAGS);
+    if (TIMER_EXPIRED) time::process_timer::notify(*process);
     auto const SERVICE_ACTION = charge_service_cpu(*process, elapsed_us);
     if (ACTION == CpuAction::HARD_KILL || SERVICE_ACTION == CpuAction::HARD_KILL) {
         subject->pending_cpu_signals.fetch_or(uint64_t{1} << 8, std::memory_order_release);  // SIGKILL 9

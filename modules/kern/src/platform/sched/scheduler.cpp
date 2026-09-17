@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <cstring>
 #include <new>  // NOLINT(misc-include-cleaner): placement new declares the RunQueue selftest storage lifetime.
+#include <platform/ktime/timer_queue.hpp>
 #include <platform/perf/perf_events.hpp>
 #include <platform/sched/resource.hpp>
 #include <platform/security/terminal.hpp>
@@ -1830,16 +1831,6 @@ inline auto deferred_switch_is_sched_yield(const task::Task* t) -> bool {
     return t->wait_channel_kind == task::WaitChannelKind::GENERIC && std::strcmp(t->wait_channel, "sched_yield") == 0;
 }
 
-inline auto min_nonzero_deadline(uint64_t lhs, uint64_t rhs) -> uint64_t {
-    if (lhs == 0) {
-        return rhs;
-    }
-    if (rhs == 0) {
-        return lhs;
-    }
-    return std::min(lhs, rhs);
-}
-
 inline void update_relaxed_max(std::atomic<uint64_t>& slot, uint64_t value) {
     uint64_t observed = slot.load(std::memory_order_relaxed);
     while (value > observed && !slot.compare_exchange_weak(observed, value, std::memory_order_relaxed, std::memory_order_relaxed)) {
@@ -1851,29 +1842,11 @@ inline auto task_wait_deadline_us(task::Task const* t) -> uint64_t {
         return 0;
     }
 
-    return min_nonzero_deadline(t->wake_at_us, t->itimer_real_expire_us);
+    return t->wake_at_us;
 }
 
 inline auto wait_list_contains_locked(RunQueue* rq, task::Task const* t) -> bool {
-    if (rq == nullptr || t == nullptr) {
-        return false;
-    }
-    for (task::Task const* cur = rq->wait_list.head; cur != nullptr; cur = cur->sched_next) {
-        if (cur == t) {
-            return true;
-        }
-    }
-    return false;
-}
-
-inline void note_wait_deadline_locked(RunQueue* rq, task::Task const* t) {
-    uint64_t const DEADLINE_US = task_wait_deadline_us(t);
-    if (rq == nullptr || DEADLINE_US == 0) {
-        return;
-    }
-    if (rq->next_wait_deadline_us == 0 || DEADLINE_US < rq->next_wait_deadline_us) {
-        rq->next_wait_deadline_us = DEADLINE_US;
-    }
+    return rq != nullptr && t != nullptr && t->sched_list_owner.load(std::memory_order_acquire) == &rq->wait_list;
 }
 
 inline void recompute_wait_deadline_locked(RunQueue* rq) {
@@ -1881,10 +1854,47 @@ inline void recompute_wait_deadline_locked(RunQueue* rq) {
         return;
     }
     uint64_t next_deadline = 0;
-    for (task::Task const* cur = rq->wait_list.head; cur != nullptr; cur = cur->sched_next) {
-        next_deadline = min_nonzero_deadline(next_deadline, task_wait_deadline_us(cur));
-    }
+    static_cast<void>(rq->wait_timers.next_deadline(next_deadline));
     rq->next_wait_deadline_us = next_deadline;
+}
+
+// The synchronous index returns the task context under this runqueue's lock;
+// it never invokes this marker or publishes a deferred token.
+void wait_timer_marker([[maybe_unused]] void* context) {}
+
+auto pop_wait_timer_locked(RunQueue* rq, uint64_t now_us) -> task::Task* {
+    time::TimerInvocation expired{};
+    if (!rq->wait_timers.pop_due(now_us, expired)) {
+        return nullptr;
+    }
+    auto* subject = static_cast<task::Task*>(expired.context);
+    rq->wait_timer_extractions.fetch_add(1, std::memory_order_relaxed);
+    update_relaxed_max(rq->wait_timer_late_us_max, now_us - subject->wait_timer.deadline());
+    return subject;
+}
+
+void note_wait_timer_batch_locked(RunQueue* rq, uint64_t now_us, uint64_t extracted) {
+    // Legacy scan fields now count inspected due roots, preserving the names
+    // consumed by existing perf readers while bounding the work they report.
+    rq->wait_list_scan_iterations.fetch_add(extracted, std::memory_order_relaxed);
+    rq->wait_list_scan_passes.fetch_add(1, std::memory_order_relaxed);
+    update_relaxed_max(rq->wait_list_scan_max, extracted);
+    uint64_t next = 0;
+    if (extracted == PENDING_WAKE_LIMIT && rq->wait_timers.next_deadline(next) && next <= now_us) {
+        rq->wait_timer_budget_exhaustions.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+inline void note_wait_deadline_locked(RunQueue* rq, task::Task* t) {
+    if (rq == nullptr || t == nullptr) {
+        return;
+    }
+    static_cast<void>(rq->wait_timers.cancel(t->wait_timer));
+    uint64_t const DEADLINE_US = task_wait_deadline_us(t);
+    if (wait_list_contains_locked(rq, t) && DEADLINE_US != 0 && !rq->wait_timers.arm_at(t->wait_timer, DEADLINE_US, wait_timer_marker, t)) {
+        dbg::panic_handler("scheduler: wait timer ownership or generation exhausted");
+    }
+    recompute_wait_deadline_locked(rq);
 }
 
 inline void transition_attach_wait_locked(RunQueue* rq, task::Task* t) {
@@ -1900,9 +1910,9 @@ inline auto transition_detach_wait_locked(RunQueue* rq, task::Task* t, Transitio
     if (rq == nullptr || t == nullptr) {
         return false;
     }
-    uint64_t const OLD_DEADLINE_US = task_wait_deadline_us(t);
     bool const REMOVED = rq->wait_list.remove(t);
-    if (REMOVED && OLD_DEADLINE_US != 0 && OLD_DEADLINE_US <= rq->next_wait_deadline_us) {
+    if (REMOVED) {
+        static_cast<void>(rq->wait_timers.cancel(t->wait_timer));
         recompute_wait_deadline_locked(rq);
     }
     return REMOVED;
@@ -2037,8 +2047,8 @@ inline auto publish_reserved_task_wakeup_locked(RunQueue* rq, task::Task* task) 
     // task WAITING after the stale current-task observation returns.
     task->wants_block = false;
     task->wake_at_us = 0;
-    if (rq != nullptr && WAKE.wake_at_us != 0 && WAKE.wake_at_us <= rq->next_wait_deadline_us) {
-        recompute_wait_deadline_locked(rq);
+    if (wait_list_contains_locked(rq, task)) {
+        note_wait_deadline_locked(rq, task);
     }
     task->wakeup_pending.store(true, std::memory_order_release);
     return WAKE;
@@ -3090,7 +3100,7 @@ auto deferred_return_needs_local_timer_locked(RunQueue* rq, task::Task* return_t
         return true;
     }
 
-    return rq->next_wait_deadline_us != 0 || return_task->itimer_real_expire_us != 0;
+    return rq->next_wait_deadline_us != 0;
 }
 
 void arm_local_timer_after_deferred_switch(task::Task* return_task) {
@@ -4662,46 +4672,37 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
     MigrationGuard migration_guard;
     EpochGuard epoch_guard;
 
-    // Wake any tasks sleeping via nanosleep whose deadline has passed.
-    // Scan this CPU's wait list; tasks with wakeAtUs != 0 are timer sleeps.
-    // Also arm ITIMER_REAL for blocked tasks so signal-driven interfaces
-    // like ping can wake from a blocking recvfrom().
-    PendingWakeList signal_wake{};
+    // Extract a bounded prefix of due timers from this CPU's deadline index.
+    // Wait-list removal is O(1); unrelated untimed waiters are never scanned.
     PendingWakeList futex_timeout_cleanup{};
-    uint32_t signal_wake_count = 0;
     uint32_t futex_timeout_cleanup_count = 0;
     uint64_t const WAIT_SCAN_NOW_US = time::get_us();
     {
-        run_queues->this_cpu_locked_void([WAIT_SCAN_NOW_US, &signal_wake, &signal_wake_count, &futex_timeout_cleanup,
-                                          &futex_timeout_cleanup_count](RunQueue* rq) {
+        run_queues->this_cpu_locked_void([WAIT_SCAN_NOW_US, &futex_timeout_cleanup, &futex_timeout_cleanup_count](RunQueue* rq) {
             bool const TIMED_SCAN = rq->next_wait_deadline_us != 0 && WAIT_SCAN_NOW_US >= rq->next_wait_deadline_us;
             if (!TIMED_SCAN) {
                 return;
             }
-            // Collect tasks to wake (can't modify list while iterating)
+            // The synchronous index cannot leak callback tokens across this
+            // lock. EpochGuard retains task storage through post-lock cleanup.
             PendingWakeList to_wake{};
             uint32_t wake_count = 0;
             uint64_t scan_iterations = 0;
-            task::Task* t = rq->wait_list.head;
-            while (t != nullptr) {
-                scan_iterations++;
-                if (wake_count < PENDING_WAKE_LIMIT && t->wake_at_us != 0 && WAIT_SCAN_NOW_US >= t->wake_at_us) {
-                    pending_wake_slot(to_wake, wake_count++) = t;
-                } else if (t->itimer_real_expire_us != 0 && WAIT_SCAN_NOW_US >= t->itimer_real_expire_us &&
-                           signal_wake_count < PENDING_WAKE_LIMIT) {
-                    t->signal_add_pending_mask(1ULL << (14 - 1));  // SIGALRM = 14
-                    if (t->itimer_real_interval_us != 0) {
-                        t->itimer_real_expire_us = saturating_deadline_us(WAIT_SCAN_NOW_US, t->itimer_real_interval_us);
-                    } else {
-                        t->itimer_real_expire_us = 0;
-                    }
-                    pending_wake_slot(signal_wake, signal_wake_count++) = t;
+            while (scan_iterations < PENDING_WAKE_LIMIT) {
+                auto* t = pop_wait_timer_locked(rq, WAIT_SCAN_NOW_US);
+                if (t == nullptr) {
+                    break;
                 }
-                t = t->sched_next;
+                scan_iterations++;
+                if (t->wake_at_us != 0 && WAIT_SCAN_NOW_US >= t->wake_at_us) {
+                    pending_wake_slot(to_wake, wake_count++) = t;
+                } else {
+                    // A continue/reserved wake can clear the public deadline
+                    // before removing wait membership. Refresh this stale key.
+                    note_wait_deadline_locked(rq, t);
+                }
             }
-            rq->wait_list_scan_iterations.fetch_add(scan_iterations, std::memory_order_relaxed);
-            rq->wait_list_scan_passes.fetch_add(1, std::memory_order_relaxed);
-            update_relaxed_max(rq->wait_list_scan_max, scan_iterations);
+            note_wait_timer_batch_locked(rq, WAIT_SCAN_NOW_US, scan_iterations);
             for (uint32_t i = 0; i < wake_count; i++) {
                 task::Task* w = pending_wake_slot(to_wake, i);
                 transition_detach_wait_locked(rq, w);
@@ -4740,10 +4741,6 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
     for (uint32_t i = 0; i < futex_timeout_cleanup_count; ++i) {
         ker::syscall::futex::futex_wait_cleanup_for_task(pending_wake_slot(futex_timeout_cleanup, i));
     }
-    for (uint32_t i = 0; i < signal_wake_count; ++i) {
-        wake_task_for_signal(pending_wake_slot(signal_wake, i));
-    }
-
     auto* rq = run_queues->this_cpu();
     auto* current_task = rq->current_task;
     panic_if_task_reserved_on_other_cpu(current_task, "timer-current");
@@ -4925,16 +4922,6 @@ void process_tasks(ker::mod::cpu::GPRegs& gpr, ker::mod::gates::InterruptFrame& 
         if (!current_task->is_voluntary_blocked()) {
             perf::record_sample(static_cast<uint32_t>(cpu::current_cpu()), current_task->pid, current_task->context.frame.rip,
                                 !IN_KERNEL_MODE, compute_avg_vruntime(rq) - current_task->vruntime);
-        }
-
-        // ITIMER_REAL expiry check - fire SIGALRM and reload or disarm
-        if (current_task->itimer_real_expire_us != 0 && NOW_US >= current_task->itimer_real_expire_us) {
-            current_task->signal_add_pending_mask(1ULL << (14 - 1));  // SIGALRM = 14
-            if (current_task->itimer_real_interval_us != 0) {
-                current_task->itimer_real_expire_us = saturating_deadline_us(NOW_US, current_task->itimer_real_interval_us);
-            } else {
-                current_task->itimer_real_expire_us = 0;
-            }
         }
 
         // Update vruntime if task is in the heap
@@ -7865,7 +7852,12 @@ auto get_run_queue_stats(uint64_t cpu_no) -> RunQueueStats {
         }
         return {.active_task_count = rq->runnable_heap.size,
                 .expired_task_count = rq->dead_list.count,
-                .wait_queue_count = rq->wait_list.count};
+                .wait_queue_count = rq->wait_list.count,
+                .timer_queue_depth = rq->wait_timers.size(),
+                .timer_extractions = rq->wait_timer_extractions.load(std::memory_order_relaxed),
+                .timer_budget_exhaustions = rq->wait_timer_budget_exhaustions.load(std::memory_order_relaxed),
+                .timer_late_us_max = rq->wait_timer_late_us_max.load(std::memory_order_relaxed),
+                .timer_irq_budget = PENDING_WAKE_LIMIT};
     });
 }
 
@@ -8018,12 +8010,6 @@ auto get_scheduler_timer_decision_for_this_cpu(uint64_t now_us) -> SchedulerTime
         if (rq->next_wait_deadline_us != 0) {
             next_deadline_us = rq->next_wait_deadline_us;
             deadline_reason = SchedulerTimerArmReason::WAIT_DEADLINE;
-        }
-
-        if (CURRENT != nullptr && CURRENT->itimer_real_expire_us != 0 &&
-            (next_deadline_us == 0 || CURRENT->itimer_real_expire_us < next_deadline_us)) {
-            next_deadline_us = CURRENT->itimer_real_expire_us;
-            deadline_reason = SchedulerTimerArmReason::ITIMER;
         }
 
         if (next_deadline_us == 0) {
@@ -8791,6 +8777,10 @@ auto scheduler_selftest_transition_validator_detects_corruption() -> bool {
     auto& runnable = scheduler_transition_validator_selftest_runnable;
     auto& waiting = scheduler_transition_validator_selftest_waiting;
 
+    // A previous invocation leaves the fixture's waiting task attached. Drain
+    // its links and timer association before resetting the empty list heads.
+    transition_detach_all_wait_locked(&rq, &waiting);
+    transition_detach_all_wait_locked(&rq, &runnable);
     rq.runnable_heap.init();
     rq.wait_list.init();
     rq.dead_list.init();
@@ -8916,6 +8906,57 @@ auto scheduler_selftest_reserved_wake_precedes_handoff_commit() -> bool {
            rq.runnable_heap.contains(&outgoing) && !wait_list_contains_locked(&rq, &outgoing) && !outgoing.wants_block &&
            outgoing.wake_at_us == 0 && rq.next_wait_deadline_us == 0 && !outgoing.is_voluntary_blocked() &&
            outgoing.wait_channel_kind == task::WaitChannelKind::NONE && !outgoing.wakeup_pending.load(std::memory_order_acquire);
+}
+
+auto scheduler_selftest_wait_timer_index_transfer_and_budget() -> bool {
+    // Keep isolated KTEST RunQueue/Task storage off the kernel stack.
+    auto* source = new (std::nothrow) RunQueue{};
+    auto* destination = new (std::nothrow) RunQueue{};
+    auto* tasks = new (std::nothrow) task::Task[32];
+    if (source == nullptr || destination == nullptr || tasks == nullptr) {
+        delete[] tasks;
+        delete destination;
+        delete source;
+        return false;
+    }
+    for (size_t i = 0; i < 32; ++i) {
+        tasks[i].wake_at_us = 100 + i;
+        transition_attach_wait_locked(source, &tasks[i]);
+    }
+    bool ok = source->wait_timers.size() == 32 && source->next_wait_deadline_us == 100;
+    ok = transition_detach_wait_locked(source, &tasks[16]) && ok;
+    transition_attach_wait_locked(destination, &tasks[16]);
+    ok = destination->next_wait_deadline_us == 116 && source->wait_timers.size() == 31 && ok;
+    size_t extracted = 0;
+    while (extracted < PENDING_WAKE_LIMIT) {
+        auto* subject = pop_wait_timer_locked(source, 200);
+        if (subject == nullptr) {
+            break;
+        }
+        ok = subject == &tasks[extracted] && ok;
+        ok = transition_detach_wait_locked(source, subject) && ok;
+        ++extracted;
+    }
+    note_wait_timer_batch_locked(source, 200, extracted);
+    ok = extracted == PENDING_WAKE_LIMIT && source->wait_list.count == 15 && source->next_wait_deadline_us == 117 && ok;
+    ok = source->wait_timer_extractions.load(std::memory_order_relaxed) == PENDING_WAKE_LIMIT &&
+         source->wait_timer_budget_exhaustions.load(std::memory_order_relaxed) == 1 &&
+         source->wait_timer_late_us_max.load(std::memory_order_relaxed) == 100 && ok;
+    source->current_task = &tasks[17];
+    static_cast<void>(publish_reserved_task_wakeup_locked(source, &tasks[17]));
+    ok = wait_list_contains_locked(source, &tasks[17]) && source->next_wait_deadline_us == 118 &&
+         tasks[17].wait_timer.state() == time::TimerState::IDLE && ok;
+    source->current_task = nullptr;
+    for (size_t i = 0; i < 32; ++i) {
+        static_cast<void>(transition_detach_wait_locked(source, &tasks[i]));
+        static_cast<void>(transition_detach_wait_locked(destination, &tasks[i]));
+    }
+    ok = source->wait_timers.size() == 0 && destination->wait_timers.size() == 0 && source->next_wait_deadline_us == 0 &&
+         destination->next_wait_deadline_us == 0 && ok;
+    delete[] tasks;
+    delete destination;
+    delete source;
+    return ok;
 }
 
 auto scheduler_selftest_concurrent_reschedule_requests_are_serialized() -> bool {

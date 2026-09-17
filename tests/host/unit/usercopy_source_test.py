@@ -408,12 +408,14 @@ def require_fixed_size_time_and_shm_usercopy() -> None:
     time = TIME_CPP.read_text()
     shm = SHM_CPP.read_text()
 
-    time_body = function_body(time, "sys_time_get")
+    time_body = function_body(time, "sys_time_get") + function_body(time, "set_itimer")
     for snippet in [
         "copy_value_to_task(*task, arg1, tv)",
         "copy_value_to_task(*task, arg1, ts)",
         "copy_value_from_task(*task, arg1, req)",
-        "copy_value_from_task(*task, arg2, new_value)",
+        "copy_value_from_task(task, new_address, new_value)",
+        "ensure_writable(task, old_address, sizeof(Itimerval))",
+        "copy_value_to_task(task, old_address, to_itimerval(previous))",
         "copy_value_to_task(*task, arg2, current_value)",
     ]:
         if snippet not in time_body:
