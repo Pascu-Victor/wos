@@ -30,9 +30,9 @@ import hashlib
 import pickle
 import re
 import shlex
+import struct
 import subprocess
 import sys
-import tempfile
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -254,21 +254,41 @@ def elf_symbol_addresses(elf: str, symbol_names: set[str]) -> dict[str, int]:
 
 def elf_text_fingerprint(elf: str) -> TextFingerprint:
     symbols = elf_symbol_addresses(elf, {"__kernel_text_start", "__kernel_text_end"})
-    with tempfile.TemporaryDirectory(prefix="ktest-cov-") as tmp_dir:
-        text_path = Path(tmp_dir) / "text.bin"
-        subprocess.run(
-            ["llvm-objcopy", f"--dump-section", f".text={text_path}", elf],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        text_bytes = text_path.read_bytes()
+    text_start = symbols["__kernel_text_start"]
+    text_end = symbols["__kernel_text_end"]
+    # The linker can insert alignment padding between __kernel_text_start
+    # and .text. Hash the exact loaded range that the kernel hashes, including
+    # those bytes, rather than assuming the symbols bound the section payload.
+    text_bytes = elf_load_bytes(elf, text_start, text_end)
 
     return TextFingerprint(
-        text_start=symbols["__kernel_text_start"],
-        text_end=symbols["__kernel_text_end"],
+        text_start=text_start,
+        text_end=text_end,
         text_fnv64=fnv1a64(text_bytes),
     )
+
+
+def elf_load_bytes(elf: str, start: int, end: int) -> bytes:
+    data = Path(elf).read_bytes()
+    if len(data) < 64 or data[:6] != b"\x7fELF\x02\x01":
+        raise ValueError(f"{elf}: expected a little-endian ELF64 image")
+    phoff = struct.unpack_from("<Q", data, 32)[0]
+    phentsize, phnum = struct.unpack_from("<HH", data, 54)
+    if phentsize < 56 or phoff + phentsize * phnum > len(data):
+        raise ValueError(f"{elf}: invalid program header table")
+    if end <= start:
+        raise ValueError(f"{elf}: invalid kernel text range")
+    for index in range(phnum):
+        kind, _, offset, vaddr, _, filesz, _, _ = struct.unpack_from(
+            "<IIQQQQQQ", data, phoff + index * phentsize
+        )
+        if kind == 1 and vaddr <= start and end <= vaddr + filesz:
+            first = offset + start - vaddr
+            last = offset + end - vaddr
+            if offset + filesz > len(data):
+                raise ValueError(f"{elf}: truncated load segment")
+            return data[first:last]
+    raise ValueError(f"{elf}: kernel text range is not backed by a load segment")
 
 
 def validate_log_elf_match(log_fingerprint: TextFingerprint | None, elf: str, allow_mismatch: bool, require_fingerprint: bool) -> None:
@@ -305,8 +325,8 @@ def validate_not_truncated(truncated: bool, allow_truncated: bool) -> None:
         return
 
     message = (
-        "KCOV buffer filled during selftests; coverage data may be truncated. "
-        "Increase the KTEST VM memory or reduce the selected selftest scope before treating coverage as complete."
+        "KCOV reported dropped PCs during selftests; coverage data is incomplete. "
+        "Rebuild and rerun wos-ktest to use text-bitmap collection if this log came from the old raw-PC buffer."
     )
     if allow_truncated:
         print(f"WARNING: {message}", file=sys.stderr)

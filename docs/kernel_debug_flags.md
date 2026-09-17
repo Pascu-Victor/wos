@@ -73,6 +73,16 @@ enabled here until the target supports them.
 | `WOS_MANDELBENCH_DEBUG` | `OFF` | `modules/testprog/CMakeLists.txt` | `MANDELBENCH_DEBUG=1` or `0` | Verbose mandelbench CPU and WKI render instrumentation in `testprog`. | Adds extra benchmark logging and can distort renderbench/testprog timings. |
 | `WOS_UASAN` | `OFF` | `modules/CMakeLists.txt` | `WOS_UASAN=1` | AddressSanitizer instrumentation for WOS userspace module targets, excluding the kernel. The WOS compiler-rt build installs ASAN runtime archives, and procfs exposes `/proc/<pid>/maps` for runtime map discovery. | Requires a rebuilt WOS toolchain with ASAN compiler-rt support, or a compatible runtime directory passed through `WOS_UASAN_RUNTIME_DIR`. Adds shadow-memory/runtime overhead and can expose target-runtime integration gaps; it is less mature than kernel KASAN. |
 
+## KTEST Coverage
+
+KTEST coverage records a set of PCs in a bitmap with one bit per byte of
+kernel text. Repeated visits do not consume additional space, so long selftest
+runs do not need a larger VM to avoid filling a raw-PC trace buffer. The
+`wos-ktest-cov` fingerprint hashes the exact loaded range between the kernel
+text symbols, including linker alignment padding. Existing logs with
+`KCOV_TRUNCATED` still need a fresh `wos-ktest` run for complete coverage;
+the report tool continues to reject dropped PCs and mismatched ELFs by default.
+
 ## KCOV-Off Behavior
 
 `WOS_KCOV=OFF` is a normal build mode:

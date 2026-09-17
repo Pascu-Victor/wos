@@ -58,6 +58,10 @@ static_assert(offsetof(ker::sanitizer::kcov::KcovBuffer, count) == 8, "kcov buff
 static_assert(offsetof(ker::sanitizer::kcov::KcovBuffer, capacity) == 16, "kcov buffer capacity offset changed");
 static_assert(offsetof(ker::sanitizer::kcov::KcovBuffer, enabled) == 24, "kcov buffer enabled offset changed");
 static_assert(offsetof(ker::sanitizer::kcov::KcovBuffer, truncated) == 25, "kcov buffer truncated offset changed");
+static_assert(offsetof(ker::sanitizer::kcov::KcovBuffer, bitmap) == 32, "kcov buffer bitmap offset changed");
+static_assert(offsetof(ker::sanitizer::kcov::KcovBuffer, text_start) == 40, "kcov buffer text_start offset changed");
+static_assert(offsetof(ker::sanitizer::kcov::KcovBuffer, text_bytes) == 48, "kcov buffer text_bytes offset changed");
+static_assert(offsetof(ker::sanitizer::kcov::KcovBuffer, active_writers) == 56, "kcov buffer active_writers offset changed");
 #ifdef WOS_KCOV_PANIC_TRACE
 extern "C" PanicTraceRing wos_kcov_panic_rings[KCOV_PANIC_TRACE_CPU_COUNT]{};
 #endif
@@ -144,26 +148,79 @@ __attribute__((no_sanitize("coverage"))) int alloc_buffer(size_t num_entries) {
     buf->capacity = ALLOC_BYTES / sizeof(uint64_t);
     buf->enabled = false;
     buf->truncated = false;
-    wos_kcov_current_buffer = buf;
+    __atomic_store_n(&wos_kcov_current_buffer, buf, __ATOMIC_RELEASE);
+    return 0;
+}
+
+__attribute__((no_sanitize("coverage"))) int alloc_text_bitmap(uintptr_t text_start, uintptr_t text_end) {
+    if (text_end <= text_start) {
+        return -1;
+    }
+    uint64_t const TEXT_BYTES = text_end - text_start;
+    uint64_t const BITMAP_BYTES = round_up_to_page((TEXT_BYTES / 8) + (TEXT_BYTES % 8 != 0));
+    if (BITMAP_BYTES == 0) {
+        return -1;
+    }
+    auto* buf = new (std::nothrow) KcovBuffer{};
+    if (buf == nullptr) {
+        return -1;
+    }
+    buf->bitmap = static_cast<uint64_t*>(
+        ker::mod::mm::phys::page_alloc_may_fail(ker::mod::mm::PhysicalPageOwner::KCOV_BUFFER, BITMAP_BYTES, "kcov_bitmap"));
+    if (buf->bitmap == nullptr) {
+        delete buf;
+        return -1;
+    }
+    buf->text_start = text_start;
+    buf->text_bytes = TEXT_BYTES;
+    buf->capacity = TEXT_BYTES;
+    __atomic_store_n(&wos_kcov_current_buffer, buf, __ATOMIC_RELEASE);
     return 0;
 }
 
 __attribute__((no_sanitize("coverage"))) void enable() {
     if (wos_kcov_current_buffer != nullptr) {
-        wos_kcov_current_buffer->enabled = true;
+        __atomic_store_n(&wos_kcov_current_buffer->enabled, true, __ATOMIC_RELEASE);
     }
 }
 
 __attribute__((no_sanitize("coverage"))) void disable() {
     if (wos_kcov_current_buffer != nullptr) {
-        wos_kcov_current_buffer->enabled = false;
+        auto* buf = wos_kcov_current_buffer;
+        __atomic_store_n(&buf->enabled, false, __ATOMIC_SEQ_CST);
+        if (buf->bitmap != nullptr) {
+            // The callback increments before rechecking enabled. Late arrivals
+            // cannot write; admitted writers finish before we inspect the bits.
+            while (__atomic_load_n(&buf->active_writers, __ATOMIC_SEQ_CST) != 0) {
+                asm volatile("pause");
+            }
+            buf->count = 0;
+            uint64_t const WORDS = (buf->text_bytes / 64) + (buf->text_bytes % 64 != 0);
+            for (uint64_t i = 0; i < WORDS; ++i) {
+                for (uint64_t bits = buf->bitmap[i]; bits != 0; bits &= bits - 1) {
+                    ++buf->count;
+                }
+            }
+        }
     }
 }
 
 __attribute__((no_sanitize("coverage"))) void reset() {
     if (wos_kcov_current_buffer != nullptr) {
+        bool const WAS_ENABLED = __atomic_load_n(&wos_kcov_current_buffer->enabled, __ATOMIC_ACQUIRE);
+        if (wos_kcov_current_buffer->bitmap != nullptr) {
+            disable();
+            auto* buf = wos_kcov_current_buffer;
+            uint64_t const WORDS = (buf->text_bytes / 64) + (buf->text_bytes % 64 != 0);
+            for (uint64_t i = 0; i < WORDS; ++i) {
+                buf->bitmap[i] = 0;
+            }
+        }
         wos_kcov_current_buffer->count = 0;
         wos_kcov_current_buffer->truncated = false;
+        if (WAS_ENABLED) {
+            enable();
+        }
     }
 }
 

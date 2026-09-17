@@ -5,6 +5,10 @@ bits 64
 %assign KCOV_BUFFER_CAPACITY_OFFSET 16
 %assign KCOV_BUFFER_ENABLED_OFFSET 24
 %assign KCOV_BUFFER_TRUNCATED_OFFSET 25
+%assign KCOV_BUFFER_BITMAP_OFFSET 32
+%assign KCOV_BUFFER_TEXT_START_OFFSET 40
+%assign KCOV_BUFFER_TEXT_BYTES_OFFSET 48
+%assign KCOV_BUFFER_ACTIVE_WRITERS_OFFSET 56
 
 %assign KCOV_PANIC_TRACE_CPU_COUNT 256
 %assign KCOV_PANIC_TRACE_ENTRIES 128
@@ -54,6 +58,10 @@ __sanitizer_cov_trace_pc:
     cmp byte [rax + KCOV_BUFFER_ENABLED_OFFSET], 0
     je .ret
 
+    mov rdx, [rax + KCOV_BUFFER_BITMAP_OFFSET]
+    test rdx, rdx
+    jnz .bitmap
+
     mov rcx, [rax + KCOV_BUFFER_COUNT_OFFSET]
     cmp rcx, [rax + KCOV_BUFFER_CAPACITY_OFFSET]
     jae .truncated
@@ -69,4 +77,31 @@ __sanitizer_cov_trace_pc:
 .truncated:
     mov byte [rax + KCOV_BUFFER_TRUNCATED_OFFSET], 1
     ret
+
+.bitmap:
+    sub r11, [rax + KCOV_BUFFER_TEXT_START_OFFSET]
+    cmp r11, [rax + KCOV_BUFFER_TEXT_BYTES_OFFSET]
+    jae .bitmap_admit
+    ; Almost every callback repeats an already-seen PC. The bitmap stays
+    ; allocated, so a read-only hit needs neither writer admission nor an RMW.
+    bt qword [rdx], r11
+    jc .ret
+.bitmap_admit:
+    ; No locks that can deadlock on interrupt reentry, allocation, or calls.
+    ; disable() closes admission and waits for admitted writers to finish.
+    lock inc qword [rax + KCOV_BUFFER_ACTIVE_WRITERS_OFFSET]
+    cmp byte [rax + KCOV_BUFFER_ENABLED_OFFSET], 0
+    je .bitmap_done
+
+    cmp r11, [rax + KCOV_BUFFER_TEXT_BYTES_OFFSET]
+    jae .bitmap_invalid
+    lock bts qword [rdx], r11
+.bitmap_done:
+    lock dec qword [rax + KCOV_BUFFER_ACTIVE_WRITERS_OFFSET]
+    ret
+
+.bitmap_invalid:
+    ; Never silently claim complete coverage if a PC is outside the map.
+    mov byte [rax + KCOV_BUFFER_TRUNCATED_OFFSET], 1
+    jmp .bitmap_done
 %endif

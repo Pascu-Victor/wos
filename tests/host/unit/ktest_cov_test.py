@@ -45,6 +45,57 @@ def test_parse_fingerprint(module):
     assert_equal(module.parse_kcov_elf_line("not a fingerprint"), None, "non-fingerprint line")
 
 
+def test_fingerprint_includes_linker_padding(module):
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        root = Path(tmp_dir)
+        script = root / "padded.ld"
+        script.write_text("""
+PHDRS { text PT_LOAD FILEHDR PHDRS; }
+SECTIONS {
+    . = 0x400000 + SIZEOF_HEADERS;
+    __kernel_text_start = .;
+    .text ALIGN(256) : { *(.text .text.*) } :text
+    __kernel_text_end = .;
+    /DISCARD/ : { *(.note*) *(.eh_frame*) }
+}
+""")
+        src = root / "entry.c"
+        src.write_text("void fixture_entry(void) {}\n")
+        elf = root / "padded.elf"
+        subprocess.run([
+            "cc", "-ffreestanding", "-fno-builtin", "-nostdlib", "-static",
+            str(src), f"-Wl,-T,{script}", "-Wl,-e,fixture_entry", "-o", str(elf),
+        ], check=True)
+        fp = module.elf_text_fingerprint(str(elf))
+        data = elf.read_bytes()
+        expected = data[fp.text_start - 0x400000:fp.text_end - 0x400000]
+        assert_equal(fp.text_fnv64, module.fnv1a64(expected), "exact loaded text hash")
+        if fp.text_start >= 0x400100:
+            raise AssertionError("fixture has no alignment gap")
+        if fp.text_fnv64 == module.fnv1a64(data[0x100:fp.text_end - 0x400000]):
+            raise AssertionError("fingerprint still hashes only the .text payload")
+        module.validate_log_elf_match(fp, str(elf), False, True)
+
+        # A changed padding byte must still fail identity checking.
+        changed = bytearray(data)
+        changed[fp.text_start - 0x400000] ^= 1
+        elf.write_bytes(changed)
+        with contextlib.redirect_stderr(io.StringIO()):
+            try:
+                module.validate_log_elf_match(fp, str(elf), False, True)
+            except SystemExit as exc:
+                assert_equal(exc.code, 2, "changed load bytes rejected")
+            else:
+                raise AssertionError("changed ELF was accepted")
+        for start, end in [(0, 1), (fp.text_end, fp.text_start)]:
+            try:
+                module.elf_load_bytes(str(elf), start, end)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("invalid/unmapped text range was accepted")
+
+
 def test_extract_latest_kcov_block(module):
     log = """\
 [0.001] INFO kcov_elf: text_start=0x10 text_end=0x20 text_fnv64=0x30
@@ -291,7 +342,7 @@ def test_truncation_validation(module):
 
     with contextlib.redirect_stderr(io.StringIO()) as stderr:
         module.validate_not_truncated(True, allow_truncated=True)
-    if "may be truncated" not in stderr.getvalue():
+    if "KCOV reported dropped PCs" not in stderr.getvalue():
         raise AssertionError("truncation warning not emitted")
 
 
@@ -414,8 +465,8 @@ def test_main_rejects_mismatched_fingerprint():
                 "-static",
                 str(src),
                 "-Wl,-e,wos_ktest_cov_fixture_entry",
-                "-Wl,--defsym,__kernel_text_start=0x10",
-                "-Wl,--defsym,__kernel_text_end=0x20",
+                "-Wl,--defsym,__kernel_text_start=ADDR(.text)",
+                "-Wl,--defsym,__kernel_text_end=ADDR(.text)+SIZEOF(.text)",
                 "-o",
                 str(elf),
             ],
@@ -445,6 +496,7 @@ def main():
     module = load_module()
     tests = [
         test_parse_fingerprint,
+        test_fingerprint_includes_linker_padding,
         test_extract_latest_kcov_block,
         test_extract_latest_kcov_report_tracks_truncation,
         test_extract_latest_kcov_report_rejects_incomplete_latest_block,
@@ -463,6 +515,7 @@ def main():
     for test in tests:
         test(module)
     test_main_rejects_mismatched_fingerprint()
+    subprocess.run([sys.executable, str(Path(__file__).with_name("kcov_runtime_test.py"))], check=True)
     print(f"{len(tests) + 1} ktest_cov tests passed")
 
 
