@@ -119,6 +119,10 @@ add_test(
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/rootfs_source_test.py
 )
 add_test(
+    NAME rootfs_directory_policy_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/rootfs_directory_policy_test.py
+)
+add_test(
     NAME image_source_test
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/image_source_test.py
 )
@@ -885,9 +889,17 @@ target_include_directories(renderbench_options_test PRIVATE
     ${WOS_ROOT}/modules/testprog/src
 )
 
+add_test(
+    NAME init_session_runtime_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/init_session_runtime_test.py
+)
+set_tests_properties(init_session_runtime_test PROPERTIES LABELS "host;runtime")
+
 wos_add_unit_test(init_supervisor_test
     SOURCES      ${CMAKE_CURRENT_SOURCE_DIR}/unit/init_supervisor_test.cpp
     KERN_SOURCES ${WOS_ROOT}/modules/init/src/service_manifest.cpp
+                 ${WOS_ROOT}/modules/init/src/service_identity.cpp
+                 ${WOS_ROOT}/modules/init/src/service_state.cpp
                  ${WOS_ROOT}/modules/init/src/supervisor_model.cpp
 )
 target_include_directories(init_supervisor_test PRIVATE

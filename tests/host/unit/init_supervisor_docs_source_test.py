@@ -98,8 +98,9 @@ def main() -> None:
         runtime,
         [
             "FD_CLOEXEC",
-            "setpgid(0, 0)",
-            "setpgid(PID, PID)",
+            "ker::process::setsid()",
+            "await_session_admission(exec_pipe.at(PIPE_WRITE), session_ack.at(PIPE_READ))",
+            "slot.session_admitted",
             "kill(-slot.pgid",
             "waitpid(-1, &status, WNOHANG",
             "OUTPUT_READ_BYTES_PER_TICK = 4096",

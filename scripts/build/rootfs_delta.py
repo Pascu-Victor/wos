@@ -107,6 +107,9 @@ class RootfsDelta:
     def add_dir(self, target: str, mode: int = 0o755) -> None:
         target = self.normalize_target(target)
         if target == "/":
+            # Track its mode without making the filesystem root a removable
+            # managed path.
+            self.entries[target] = Entry(target, "dir", mode, 0, 0, "", "dir")
             return
         self.add_parent_dirs(target)
         self.entries[target] = Entry(target, "dir", mode, 0, 0, "", "dir")
@@ -242,9 +245,14 @@ class RootfsDelta:
                 self.add_source(source, f"{target_dir}/{source.name}")
 
     def collect_generated_etc(self) -> None:
-        self.add_dir("/etc/dropbear")
-        self.add_generated_file("/etc/passwd", b"root:!:0:0:root:/root:/bin/bash\n")
-        self.add_generated_file("/etc/group", b"root:x:0:root\n")
+        self.add_dir("/etc/dropbear", 0o700)
+        self.add_generated_file("/etc/passwd", b"root:!:0:0:root:/root:/bin/bash\n"
+                                b"httpd:!:100:100:HTTP server:/nonexistent:/bin/false\n"
+                                b"journald:!:101:101:Journal daemon:/nonexistent:/bin/false\n"
+                                b"netd:!:102:102:Network daemon:/nonexistent:/bin/false\n"
+                                b"keygen:!:103:103:Host key generator:/nonexistent:/bin/false\n"
+                                b"sshd:!:104:104:SSH network worker:/nonexistent:/bin/false\n")
+        self.add_generated_file("/etc/group", b"root:x:0:root\nhttpd:x:100:\njournald:x:101:\nnetd:x:102:\nkeygen:x:103:\nsshd:x:104:\n")
         self.add_generated_file(
             "/etc/profile",
             b'export USER="${USER:-root}"\n'
@@ -312,8 +320,10 @@ class RootfsDelta:
         self.add_generated_file("/srv/test.bin", b"Binary test data 1234567890ABCDEF")
 
     def collect_misc(self) -> None:
+        self.add_dir("/")
         for directory in ("/home", "/dev/pts", "/tmp", "/run", "/var/log/journal", "/oldroot"):
             self.add_dir(directory)
+        self.add_dir("/var/log/journal", 0o700)
         self.add_link("/lib", "usr/lib")
         self.add_link("/bin", "usr/bin")
         self.add_link("/sbin", "usr/sbin")
@@ -421,7 +431,7 @@ class RootfsDelta:
 
     def write_path_lists(self, changed: set[str]) -> None:
         self.changed_paths.write_text("\n".join(sorted(changed)) + ("\n" if changed else ""), encoding="utf-8")
-        tar_entries = [path.lstrip("/") for path in sorted(changed)]
+        tar_entries = [path.lstrip("/") or "." for path in sorted(changed)]
         self.tar_paths.write_text("\n".join(tar_entries) + ("\n" if tar_entries else ""), encoding="utf-8")
 
     def run(self) -> None:

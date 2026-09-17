@@ -34,12 +34,22 @@ enum FieldBit : uint64_t {
     FIELD_ENABLEMENT = 1ULL << 18,
     FIELD_READINESS_INTERFACE = 1ULL << 19,
     FIELD_ENABLEMENT_PATH = 1ULL << 20,
+    FIELD_USER = 1ULL << 28,
+    FIELD_GROUP = 1ULL << 29,
+    FIELD_SUPPLEMENTARY = 1ULL << 30,
+    FIELD_UMASK = 1ULL << 31,
+    FIELD_AUTHORITY = 1ULL << 32,
+    FIELD_NO_NEW_PRIVILEGES = 1ULL << 33,
+    FIELD_SERVICE_PRIVILEGES = 1ULL << 34,
+    FIELD_PRIVATE_STATE = 1ULL << 35,
+    FIELD_RUNTIME_STATE = 1ULL << 36,
 };
 
 constexpr uint64_t REQUIRED_FIELDS = FIELD_EXEC | FIELD_ARGUMENT | FIELD_TYPE | FIELD_CLASS | FIELD_PRIORITY | FIELD_ENVIRONMENT_PROFILE |
                                      FIELD_READINESS | FIELD_READINESS_TIMEOUT | FIELD_RESTART | FIELD_BACKOFF_INITIAL | FIELD_BACKOFF_MAX |
                                      FIELD_RESTART_BUDGET | FIELD_RESTART_WINDOW | FIELD_STABLE_RUN | FIELD_STOP_TERM | FIELD_STOP_KILL |
-                                     FIELD_DRAIN_TIMEOUT | FIELD_STDIO | FIELD_ENABLEMENT;
+                                     FIELD_DRAIN_TIMEOUT | FIELD_STDIO | FIELD_ENABLEMENT | FIELD_USER | FIELD_GROUP | FIELD_SUPPLEMENTARY |
+                                     FIELD_UMASK | FIELD_AUTHORITY | FIELD_NO_NEW_PRIVILEGES | FIELD_SERVICE_PRIVILEGES;
 
 constexpr uint32_t MAX_READINESS_TIMEOUT_MS = 10U * 60U * 1000U;
 constexpr uint32_t MAX_BACKOFF_MS = 60U * 60U * 1000U;
@@ -201,6 +211,111 @@ auto parse_service_field(ServiceSpec& service, uint64_t& fields, std::string_vie
         }
         return true;
     };
+
+    if (key == "user") return fixed(service.identity.user, FIELD_USER);
+    if (key == "group") return fixed(service.identity.group, FIELD_GROUP);
+    if (key == "supplementary-groups") {
+        if (!scalar(FIELD_SUPPLEMENTARY)) return false;
+        if (value == "none") return true;
+        while (!value.empty()) {
+            size_t const END = value.find(',');
+            auto const NAME = value.substr(0, END);
+            if (!safe_service_name(NAME) || service.identity.supplementary_count == MAX_SERVICE_GROUPS) {
+                error = ManifestParseError::INVALID_VALUE;
+                return false;
+            }
+            for (size_t i = 0; i < service.identity.supplementary_count; ++i) {
+                if (service.identity.supplementary_groups[i].view() == NAME) {
+                    error = ManifestParseError::INVALID_VALUE;
+                    return false;
+                }
+            }
+            service.identity.supplementary_groups[service.identity.supplementary_count++].assign(NAME);
+            if (END == std::string_view::npos) return true;
+            value.remove_prefix(END + 1);
+        }
+        error = ManifestParseError::INVALID_VALUE;
+        return false;
+    }
+    if (key == "umask") {
+        if (!scalar(FIELD_UMASK)) return false;
+        uint16_t mask = 0;
+        if (value.size() < 3 || value.size() > 4) {
+            error = ManifestParseError::INVALID_VALUE;
+            return false;
+        }
+        for (char c : value) {
+            if (c < '0' || c > '7') {
+                error = ManifestParseError::INVALID_VALUE;
+                return false;
+            }
+            mask = static_cast<uint16_t>(mask * 8 + c - '0');
+        }
+        if (mask > 0777) {
+            error = ManifestParseError::INVALID_VALUE;
+            return false;
+        }
+        service.identity.mask = mask;
+        return true;
+    }
+    if (key == "authority-ceiling") {
+        if (!scalar(FIELD_AUTHORITY)) return false;
+        uint32_t ceiling = 0;
+        if (!parse_u32(value, ceiling) || ceiling > SERVICE_AUTHORITY_ALL) {
+            error = ManifestParseError::INVALID_VALUE;
+            return false;
+        }
+        service.identity.authority_ceiling = ceiling;
+        return true;
+    }
+    if (key == "runtime-state") {
+        if (!scalar(FIELD_RUNTIME_STATE)) return false;
+        if (value != "none" && value != "netd") {
+            error = ManifestParseError::INVALID_VALUE;
+            return false;
+        }
+        service.runtime_state = value == "netd" ? ServiceSpec::RuntimeState::NETD : ServiceSpec::RuntimeState::NONE;
+        return true;
+    }
+    if (key == "private-state") {
+        if (!scalar(FIELD_PRIVATE_STATE)) return false;
+        if (value != "none" && value != "journal" && value != "keygen") {
+            error = ManifestParseError::INVALID_VALUE;
+            return false;
+        }
+        service.private_state = value == "journal"  ? ServiceSpec::PrivateState::JOURNAL
+                                : value == "keygen" ? ServiceSpec::PrivateState::KEYGEN
+                                                    : ServiceSpec::PrivateState::NONE;
+        return true;
+    }
+    if (key == "service-privileges") {
+        if (!scalar(FIELD_SERVICE_PRIVILEGES)) return false;
+        if (value == "none") return true;
+        uint64_t mask = 0;
+        for (;;) {
+            auto const END = value.find(',');
+            auto const NAME = value.substr(0, END);
+            uint64_t const BIT = NAME == "journal-read" ? 1 : (NAME == "network-admin" ? 2 : 0);
+            if (BIT == 0 || (mask & BIT) != 0) {
+                error = ManifestParseError::INVALID_VALUE;
+                return false;
+            }
+            mask |= BIT;
+            if (END == std::string_view::npos) break;
+            value.remove_prefix(END + 1);
+        }
+        service.identity.service_privileges = mask;
+        return true;
+    }
+    if (key == "no-new-privileges") {
+        if (!scalar(FIELD_NO_NEW_PRIVILEGES)) return false;
+        if (value != "yes" && value != "no") {
+            error = ManifestParseError::INVALID_VALUE;
+            return false;
+        }
+        service.identity.no_new_privileges = value == "yes";
+        return true;
+    }
 
     if (key.starts_with("limit-")) {
         for (size_t index = 0; index < SERVICE_RESOURCE_COUNT; ++index) {
@@ -608,8 +723,29 @@ auto validate_service_manifest(ServiceManifest& manifest, ServiceTopology& topol
     }
     topology.service_count = manifest.service_count;
 
+    bool netd_state_seen = false;
+    bool keygen_state_seen = false;
     for (uint8_t i = 0; i < manifest.service_count; ++i) {
         auto& service = manifest.services.at(i);
+        if (service.runtime_state != ServiceSpec::RuntimeState::NONE) {
+            if (netd_state_seen || service.runtime_state != ServiceSpec::RuntimeState::NETD ||
+                service.service_class != ServiceClass::NETWORK_PROVIDER || !service.identity.no_new_privileges ||
+                service.identity.service_privileges != 2 || service.identity.authority_ceiling != service_privilege_ceiling(2))
+                return validation_failure(ManifestValidationError::INVALID_IDENTITY, i);
+            netd_state_seen = true;
+        }
+        if (service.private_state == ServiceSpec::PrivateState::KEYGEN) {
+            if (keygen_state_seen || service.type != ServiceType::ONESHOT || service.service_class != ServiceClass::NORMAL ||
+                !service.identity.no_new_privileges || service.identity.authority_ceiling != 0 ||
+                service.identity.service_privileges != 0 || service.identity.supplementary_count != 0 || service.identity.mask != 0077 ||
+                service.environment_profile != EnvironmentProfile::EMPTY)
+                return validation_failure(ManifestValidationError::INVALID_IDENTITY, i);
+            keygen_state_seen = true;
+        } else if (service.private_state != ServiceSpec::PrivateState::NONE &&
+                   (service.private_state != ServiceSpec::PrivateState::JOURNAL || service.service_class != ServiceClass::JOURNAL ||
+                    !service.identity.no_new_privileges || service.identity.service_privileges != 1 ||
+                    service.identity.authority_ceiling != service_privilege_ceiling(1)))
+            return validation_failure(ManifestValidationError::INVALID_IDENTITY, i);
         service.dependency_mask = 0;
         service.dependent_mask = 0;
         for (size_t index = 0; index < SERVICE_RESOURCE_COUNT; ++index) {
@@ -617,6 +753,19 @@ auto validate_service_manifest(ServiceManifest& manifest, ServiceTopology& topol
             if (limit.soft > limit.hard || (SERVICE_RESOURCE_IDS.at(index) == 7 && limit.hard > 256)) {
                 return validation_failure(ManifestValidationError::INVALID_RANGE, i);
             }
+        }
+        if (!safe_service_name(service.identity.user.view()) || !safe_service_name(service.identity.group.view()) ||
+            service.identity.supplementary_count > MAX_SERVICE_GROUPS || service.identity.mask > 0777 ||
+            !valid_service_authority(0, service.identity.no_new_privileges, service.identity.authority_ceiling,
+                                     service.identity.service_privileges)) {
+            return validation_failure(ManifestValidationError::INVALID_IDENTITY, i);
+        }
+        for (size_t group = 0; group < service.identity.supplementary_count; ++group) {
+            if (!safe_service_name(service.identity.supplementary_groups[group].view()))
+                return validation_failure(ManifestValidationError::INVALID_IDENTITY, i);
+            for (size_t previous = 0; previous < group; ++previous)
+                if (service.identity.supplementary_groups[group].view() == service.identity.supplementary_groups[previous].view())
+                    return validation_failure(ManifestValidationError::INVALID_IDENTITY, i);
         }
         if (!safe_service_name(service.name.view())) {
             return validation_failure(ManifestValidationError::INVALID_NAME, i);

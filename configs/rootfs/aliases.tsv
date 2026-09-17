@@ -2,7 +2,8 @@
 copy	configs/rootfs/etc/services	/etc/services
 copy	configs/rootfs/etc/protocols	/etc/protocols
 copy	configs/rootfs/etc/hosts	/etc/hosts
-copy	configs/rootfs/etc/resolv.conf	/etc/resolv.conf
+copy	configs/rootfs/etc/resolv.conf	/etc/netd-resolv.conf
+symlink	/run/netd/resolv.conf	/etc/resolv.conf
 copy	configs/rootfs/etc/inputrc	/etc/inputrc
 copy	configs/rootfs/etc/termcap	/etc/termcap
 copy	configs/rootfs/etc/nanorc	/etc/nanorc

@@ -46,8 +46,8 @@ def test_init_stdio_preserves_vfs_access_modes() -> None:
     for snippet in [
         "constexpr int STDIN_OPEN_FLAGS = 0;",
         "constexpr int STDOUT_OPEN_FLAGS = 1;",
-        'ker::vfs::devfs::devfs_open_path("/dev/console", STDIN_OPEN_FLAGS, 0)',
-        'ker::vfs::devfs::devfs_open_path("/dev/console", STDOUT_OPEN_FLAGS, 0)',
+        'ker::vfs::devfs::devfs_open_path(ker::mod::security::Snapshot::bootstrap_root(), "/dev/console", STDIN_OPEN_FLAGS, 0)',
+        'ker::vfs::devfs::devfs_open_path(ker::mod::security::Snapshot::bootstrap_root(), "/dev/console", STDOUT_OPEN_FLAGS, 0)',
     ]:
         if snippet not in body:
             fail(f"init stdio setup must preserve VFS access modes: {snippet}")
@@ -55,7 +55,7 @@ def test_init_stdio_preserves_vfs_access_modes() -> None:
     require_order(
         body,
         [
-            'ker::vfs::devfs::devfs_open_path("/dev/console", STDIN_OPEN_FLAGS, 0)',
+            'ker::vfs::devfs::devfs_open_path(ker::mod::security::Snapshot::bootstrap_root(), "/dev/console", STDIN_OPEN_FLAGS, 0)',
             "(void)new_task->fd_table.insert(0, console_stdin);",
         ],
         "init stdin open mode must be selected before fd publication",
@@ -63,7 +63,7 @@ def test_init_stdio_preserves_vfs_access_modes() -> None:
     require_order(
         body,
         [
-            'ker::vfs::devfs::devfs_open_path("/dev/console", STDOUT_OPEN_FLAGS, 0)',
+            'ker::vfs::devfs::devfs_open_path(ker::mod::security::Snapshot::bootstrap_root(), "/dev/console", STDOUT_OPEN_FLAGS, 0)',
             "(void)new_task->fd_table.insert(1, console_stdout);",
         ],
         "init stdout open mode must be selected before fd publication",
@@ -71,7 +71,7 @@ def test_init_stdio_preserves_vfs_access_modes() -> None:
     require_order(
         body,
         [
-            'ker::vfs::devfs::devfs_open_path("/dev/console", STDOUT_OPEN_FLAGS, 0)',
+            'ker::vfs::devfs::devfs_open_path(ker::mod::security::Snapshot::bootstrap_root(), "/dev/console", STDOUT_OPEN_FLAGS, 0)',
             "(void)new_task->fd_table.insert(2, console_stderr);",
         ],
         "init stderr open mode must be selected before fd publication",

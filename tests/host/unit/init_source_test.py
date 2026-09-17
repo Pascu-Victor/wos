@@ -63,7 +63,7 @@ def test_manifest_load_and_failed_mode_are_bounded() -> None:
         [
             'SERVICE_MANIFEST_PATH[] = "/etc/wos-services.conf"',
             "std::array<char, MAX_MANIFEST_BYTES> manifest_bytes",
-            "while (size < runtime.manifest_bytes.size())",
+            "while (size < bytes.size())",
             "read_extra = ::read(FD, &extra, 1)",
             "parse_service_manifest",
             "validate_service_manifest",
@@ -81,15 +81,30 @@ def test_manifest_load_and_failed_mode_are_bounded() -> None:
         start_body,
         [
             "restore_init_wki_target()",
-            "read_manifest(manifest_size)",
+            "read_configuration(SERVICE_MANIFEST_PATH, runtime.manifest_bytes, manifest_size)",
             "parse_service_manifest",
             "validate_service_manifest",
+            "parse_service_accounts",
+            "resolve_service_identity",
+            "service_resource_configure",
             "initialize_supervisor",
             "advance_model(runtime.now_ms)",
             "publish_status(runtime.now_ms)",
         ],
         "manifest validation precedes service actions and status publication",
     )
+
+
+def test_service_identity_checks_precede_exec() -> None:
+    source = SERVICES_CPP.read_text()
+    read_body = function_body(source, "read_configuration")
+    require_order(read_body, ["O_NOFOLLOW", "::fstat", "S_ISREG", "status.st_uid != 0", "status.st_mode & 0022", "::read"], "trusted service configuration")
+    spawn = function_body(source, "spawn_service")
+    require_order(spawn, ["if (PID == 0)", "PRIORITY_RESULT", "child_setup_stdio", "apply_service_identity", "IDENTITY_ERROR != 0",
+                          "ChildFailureStage::IDENTITY", "ker::process::execve"], "fail-closed child identity drop")
+    require_tokens(source, ["::setgroups", "::setgid(value)", "::setuid(value)",
+                            "::getresuid", "::getresgid", "::getgroups", "Control::GET_NO_NEW_PRIVILEGES",
+                            "Control::GET_AUTHORITY_CEILING", "::umask(identity.mask) != identity.mask"], "identity syscall verification")
 
 
 def test_spawn_has_exec_report_pgid_wki_and_fixed_vectors() -> None:
@@ -120,16 +135,27 @@ def test_spawn_has_exec_report_pgid_wki_and_fixed_vectors() -> None:
             "ker::process::setwkitarget(nullptr, 0, SERVICE_WKI_TARGET_FLAGS)",
             "ker::process::fork()",
             "restore_init_wki_target()",
-            "ker::process::setpgid(0, 0)",
-            "ker::process::setpgid(PID, PID)",
-            "ker::process::getpgid(PID)",
-            "OBSERVED_PGID != PID",
+            "ker::process::setsid()",
+            "await_session_admission",
+            "create_session_ack",
+            "slot.session_admitted = false",
             "retain_cleanup_child()",
             "ker::process::setpriority(PRIO_PROCESS, 0, spec.priority)",
             "ker::process::execve(spec.executable.c_str(), arguments.data(), environment.data())",
         ],
         "generation-owned child setup",
     )
+    assert "ker::process::setpgid(" not in spawn_body
+    require_order(spawn_body, ["ker::process::setsid()", "await_session_admission(",
+                              "apply_service_identity(", "ker::process::execve("], "session precedes service execution")
+    report = function_body(source, "process_exec_report")
+    require_order(report, ["ker::process::getsid(slot.pid) == slot.pid", "ker::process::getpgid(slot.pid) == slot.pid",
+                           "slot.session_admitted = true", "::write(slot.session_ack.at(PIPE_WRITE)",
+                           "close_session_ack(slot.session_ack)"], "verified session before ACK and reader retirement")
+    require_tokens(report, ["!slot.session_admitted", "READ == 0 && slot.session_admitted"], "ready and EOF admission")
+    signal = function_body(source, "signal_service_group")
+    require_order(signal, ["!slot.session_admitted", "close_session_ack(slot.session_ack)",
+                           "ker::process::kill(slot.pid, signal)", "ker::process::kill(-slot.pgid, signal)"], "startup cleanup boundary")
     require_order(
         spawn_body,
         [
@@ -229,14 +255,57 @@ def test_pivot_root_retries_transient_busy_mount_refs() -> None:
     )
 
 
+def test_fstab_retries_only_transient_mount_lookup_failures() -> None:
+    source = (ROOT / "modules/init/src/fstab.cpp").read_text()
+    retry = function_body(source, "mount_with_retry")
+    assert retry.index("parse_mount_options(") < retry.index("wos::init::retry_mount(")
+    assert "if (PARSE_RESULT != 0) return PARSE_RESULT;" in retry
+    require_tokens(retry, ["wos::init::retry_mount(", "ker::abi::vfs::mount(source, target, type, parsed.flags, parsed.data.data())",
+                           "nanosleep(&SLEEP, nullptr)", "wos::init::MOUNT_RETRY_MS"], "fresh syscall per retry")
+    require_tokens(source, ["mount_with_retry(cpuno, REQUIRED_TMP_SOURCE, path, REQUIRED_TMP_FSTYPE)",
+                            "mount_with_retry(CPUNO, device.data(), mountpoint.data(), fstype.data(), mount_options)"],
+                   "all init mount sites use bounded retry")
+    if source.count("ker::abi::vfs::mount(") != 1:
+        fail("init mount bypasses bounded stale-lookup retry")
+
+
+def test_fstab_rejects_incomplete_policy_before_mounting() -> None:
+    source = (ROOT / "modules/init/src/fstab.cpp").read_text()
+    body = function_body(source, "mount_filesystems")
+    require_order(body, ["read_complete_fstab(", "if (BYTES_READ < 0)", "while (*line_start", "parse_fstab_field(p, options)",
+                         "if (DEVICE_RESULT > 0 && MOUNTPOINT_RESULT > 0 && FSTYPE_RESULT > 0 && OPTIONS_RESULT >= 0)",
+                         "ker::vmem::swapon", "ker::abi::vfs::mkdir(mountpoint.data()", "mount_with_retry(CPUNO"],
+                  "complete table and field admission before fstab side effects")
+    rejected = body.split("if (BYTES_READ < 0)", 1)[1].split("if (BYTES_READ == 0)", 1)[0]
+    assert "return;" in rejected
+    assert "continue;" not in body  # swap rows must reach shared line advancement
+
+
 def main() -> None:
+    test_fstab_rejects_incomplete_policy_before_mounting()
+    test_fstab_retries_only_transient_mount_lookup_failures()
     test_pivot_root_retries_transient_busy_mount_refs()
     test_manifest_load_and_failed_mode_are_bounded()
+    test_service_identity_checks_precede_exec()
     test_spawn_has_exec_report_pgid_wki_and_fixed_vectors()
     test_tick_owns_reaping_exec_order_drains_probes_and_control()
     test_root_init_drives_common_supervisor_without_hardcoded_services()
     print("init declarative supervisor source invariants hold")
 
 
+def test_private_state_is_prepared_before_resources_or_services():
+    source = SERVICES_CPP.read_text()
+    startup = function_body(source, "start_service_supervisor")
+    require_order(startup, ["parse_service_accounts", "resolve_service_identity", "prepare_private_journal_state", "service_resource_configure", "initialize_supervisor"], "private state startup ordering")
+    state = (ROOT / "modules/init/src/service_state.cpp").read_text()
+    require_tokens(state, ["O_NOFOLLOW", "AT_SYMLINK_NOFOLLOW", "scanned > 4", '"wos.journal"', '"wos.journal.1"', "seen[index]", "validate_private_state_owners", "fchown"], "bounded journal state")
+    require_tokens(function_body(state, "prepare_keygen_state_at"),
+                   ['"dropbear_rsa_host_key"', '"dropbear_rsa_host_key.pub"', "prepare_flat_private_state_at"], "reserved key namespace")
+    require_order(startup, ["resolve_service_identity", "prepare_private_keygen_state", "initialize_supervisor"], "key state startup ordering")
+    body = function_body(state, "prepare_flat_private_state_at")
+    require_order(body, ["fstatat", "validate_private_state_owners(preflight", "openat", "metadata(files", "closedir", "fchmod(directory, 0700)", "change_private_state_owners"], "state validation before effects")
+
+
 if __name__ == "__main__":
+    test_private_state_is_prepared_before_resources_or_services()
     main()

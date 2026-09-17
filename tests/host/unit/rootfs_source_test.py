@@ -128,6 +128,8 @@ def main() -> None:
         "writable=on,allow-other=off",
         "xfs_db",
         "write core.size",
+        "write core.uid 0",
+        "write core.gid 0",
         "write core.mode",
         "crc -r",
         "grew to",

@@ -3,6 +3,7 @@
 #include <abi-bits/resource.h>
 #include <callnums/sys_log.h>
 #include <fcntl.h>
+#include <grp.h>
 #include <signal.h>  // NOLINT(modernize-deprecated-headers): WOS signal constants live here.
 #include <sys/init_control.h>
 #include <sys/logging.h>
@@ -20,10 +21,13 @@
 #include <limits>
 #include <span>
 #include <string_view>
+#include <utility>
 
 #include "env.h"
 #include "network.h"
+#include "service_identity.h"
 #include "service_manifest.h"
+#include "service_state.h"
 #include "supervisor_model.h"
 
 namespace {
@@ -62,6 +66,8 @@ enum class ChildFailureStage : int32_t {
     PRIORITY = 3,
     STDIO = 4,
     EXEC = 5,
+    IDENTITY = 6,
+    SESSION_READY = 7,
 };
 
 struct ExecFailureReport {
@@ -76,6 +82,8 @@ struct RuntimeService {
     int64_t pgid{-1};
     uint32_t generation{};
     int exec_report_fd{-1};
+    std::array<int, 2> session_ack{-1, -1};
+    bool session_admitted{};
     int output_fd{-1};
     NetworkProbe probe{};
     std::array<char, OUTPUT_LINE_BYTES> output_line{};
@@ -95,6 +103,9 @@ struct RuntimeService {
 
 struct SupervisorRuntime {
     ServiceManifest manifest{};
+    ServiceAccounts accounts{};
+    std::array<ResolvedServiceIdentity, MAX_SERVICES> identities{};
+    std::array<char, MAX_ACCOUNT_FILE_BYTES> passwd_bytes{}, group_bytes{};
     ServiceTopology topology{};
     SupervisorModel model{};
     std::array<EnablementResult, MAX_SERVICES> enablement{};
@@ -220,12 +231,92 @@ auto create_parent_read_pipe(std::array<int, 2>& pipefd) -> bool {
     return true;
 }
 
+// Keep both parent endpoints until admission. Retaining a reader makes the
+// bounded ACK write safe from SIGPIPE even when the child exits concurrently.
+auto create_session_ack(std::array<int, 2>& pipefd) -> bool {
+    if (::pipe(pipefd.data()) != 0) {
+        return false;
+    }
+    if (!move_above_standard_io(pipefd.at(PIPE_READ)) || !move_above_standard_io(pipefd.at(PIPE_WRITE)) ||
+        !set_close_on_exec(pipefd.at(PIPE_READ)) || !set_close_on_exec(pipefd.at(PIPE_WRITE)) || !set_nonblocking(pipefd.at(PIPE_WRITE))) {
+        int const ERROR = errno;
+        close_fd(pipefd.at(PIPE_READ));
+        close_fd(pipefd.at(PIPE_WRITE));
+        errno = ERROR;
+        return false;
+    }
+    return true;
+}
+
+void close_session_ack(std::array<int, 2>& pipefd) {
+    close_fd(pipefd.at(PIPE_WRITE));
+    close_fd(pipefd.at(PIPE_READ));
+}
+
 auto positive_error(int64_t result) -> int32_t {
     if (result < 0 && result >= -static_cast<int64_t>(std::numeric_limits<int32_t>::max())) {
         return static_cast<int32_t>(-result);
     }
     return errno != 0 ? errno : EIO;
 }
+
+struct ChildIdentityOperations {
+    using Control = ker::abi::process::CredentialControl;
+    static auto control(Control operation, uint64_t value = 0) -> int64_t {
+        return ker::process::prctl(static_cast<int>(operation), value, 0, 0, 0);
+    }
+    auto no_new_privileges() -> int {
+        auto const RESULT = control(Control::SET_NO_NEW_PRIVILEGES, 1);
+        return RESULT < 0 ? positive_error(RESULT) : 0;
+    }
+    auto service_privileges(uint64_t value) -> int {
+        auto const RESULT = control(Control::SET_SERVICE_PRIVILEGES, value);
+        return RESULT < 0 ? positive_error(RESULT) : 0;
+    }
+    auto groups(std::span<const uint32_t> values) -> int {
+        std::array<gid_t, MAX_SERVICE_GROUPS> ids{};
+        for (size_t i = 0; i < values.size(); ++i) ids.at(i) = values[i];
+        return ::setgroups(values.size(), ids.data()) == 0 ? 0 : errno;
+    }
+    // The forked init child retains SET_GID/SET_UID until these permanent drops.
+    auto gid(uint32_t value) -> int { return ::setgid(value) == 0 ? 0 : errno; }
+    auto uid(uint32_t value) -> int { return ::setuid(value) == 0 ? 0 : errno; }
+    auto mask(uint16_t value) -> int {
+        (void)::umask(value);
+        return 0;
+    }
+    auto ceiling(uint64_t value) -> int {
+        auto const RESULT = control(Control::DROP_AUTHORITY_CEILING, value);
+        return RESULT < 0 ? positive_error(RESULT) : 0;
+    }
+    auto verify(const ResolvedServiceIdentity& identity) -> int {
+        uid_t real_uid{}, effective_uid{}, saved_uid{};
+        gid_t real_gid{}, effective_gid{}, saved_gid{};
+        if (::getresuid(&real_uid, &effective_uid, &saved_uid) != 0 || ::getresgid(&real_gid, &effective_gid, &saved_gid) != 0)
+            return errno;
+        if (real_uid != identity.uid || effective_uid != identity.uid || saved_uid != identity.uid || real_gid != identity.gid ||
+            effective_gid != identity.gid || saved_gid != identity.gid)
+            return EPERM;
+        std::array<gid_t, MAX_SERVICE_GROUPS> ids{};
+        int const COUNT = ::getgroups(ids.size(), ids.data());
+        if (COUNT < 0) return errno;
+        if (static_cast<size_t>(COUNT) != identity.group_count) return EPERM;
+        for (size_t i = 0; i < identity.group_count; ++i)
+            if (ids.at(i) != identity.groups.at(i)) return EPERM;
+        if (control(Control::GET_NO_NEW_PRIVILEGES) != static_cast<int64_t>(identity.no_new_privileges) ||
+            control(Control::GET_AUTHORITY_CEILING) != static_cast<int64_t>(identity.authority_ceiling) ||
+            control(Control::GET_SERVICE_PRIVILEGES) !=
+                static_cast<int64_t>(identity.service_privileges |
+                                     (identity.no_new_privileges ? ker::abi::process::SERVICE_PRIVILEGES_LOCKED : 0)) ||
+            ::umask(identity.mask) != identity.mask)
+            return EPERM;
+        return 0;
+    }
+};
+static_assert(SERVICE_AUTHORITY_ALL == ker::abi::process::CREDENTIAL_AUTHORITY_ALL);
+static_assert(SERVICE_PRIVILEGE_ALL == ker::abi::process::SERVICE_PRIVILEGE_ALL);
+static_assert(service_privilege_ceiling(1) == ker::abi::process::service_privilege_ceiling(1));
+static_assert(service_privilege_ceiling(2) == ker::abi::process::service_privilege_ceiling(2));
 
 [[noreturn]] void report_child_failure(int fd, ChildFailureStage stage, int32_t error) {
     ExecFailureReport const REPORT{
@@ -239,6 +330,26 @@ auto positive_error(int64_t result) -> int32_t {
     (void)written;
     ker::process::exit(127);
     __builtin_unreachable();
+}
+
+void await_session_admission(int report_fd, int ack_fd) {
+    ExecFailureReport const READY{.stage = ChildFailureStage::SESSION_READY, .error = 0};
+    ssize_t written = ::write(report_fd, &READY, sizeof(READY));
+    while (written < 0 && errno == EINTR) {
+        written = ::write(report_fd, &READY, sizeof(READY));
+    }
+    if (!std::cmp_equal(written, sizeof(READY))) {
+        report_child_failure(report_fd, ChildFailureStage::PROCESS_GROUP, written < 0 ? errno : EIO);
+    }
+    char acknowledgement = 0;
+    ssize_t received = ::read(ack_fd, &acknowledgement, sizeof(acknowledgement));
+    while (received < 0 && errno == EINTR) {
+        received = ::read(ack_fd, &acknowledgement, sizeof(acknowledgement));
+    }
+    (void)::close(ack_fd);
+    if (received != 1 || acknowledgement != 'A') {
+        report_child_failure(report_fd, ChildFailureStage::PROCESS_GROUP, received < 0 ? errno : EIO);
+    }
 }
 
 auto environment_key(std::string_view entry) -> std::string_view {
@@ -470,13 +581,29 @@ void process_exec_report(uint8_t service, uint64_t now_ms) {
         return;
     }
 
+    if (std::cmp_equal(READ, sizeof(report)) && report.stage == ChildFailureStage::SESSION_READY && report.error == 0) {
+        bool const VALID = !slot.session_admitted && !slot.leader_reaped && slot.pid > 1 && slot.session_ack.at(PIPE_READ) >= 0 &&
+                           slot.session_ack.at(PIPE_WRITE) >= 0 && ker::process::getsid(slot.pid) == slot.pid &&
+                           ker::process::getpgid(slot.pid) == slot.pid;
+        if (VALID) {
+            slot.session_admitted = true;
+            char const ACK = 'A';
+            ssize_t const WRITTEN = ::write(slot.session_ack.at(PIPE_WRITE), &ACK, sizeof(ACK));
+            close_session_ack(slot.session_ack);
+            if (WRITTEN == 1) {
+                return;  // The later CLOEXEC EOF, not READY, reports exec success.
+            }
+        }
+        report = {.stage = ChildFailureStage::PROCESS_GROUP, .error = EIO};
+    }
+    close_session_ack(slot.session_ack);
     close_fd(slot.exec_report_fd);
     slot.exec_resolved = true;
     SupervisorEvent event{
         .service = service,
         .generation = slot.generation,
     };
-    if (READ == 0) {
+    if (READ == 0 && slot.session_admitted) {
         event.kind = SupervisorEventKind::EXEC_SUCCEEDED;
         slot.last_error = 0;
     } else {
@@ -500,11 +627,19 @@ void signal_service_group(const SupervisorAction& action, int signal) {
     if (action.service >= runtime.manifest.service_count) {
         return;
     }
-    auto const& slot = runtime.services.at(action.service);
+    auto& slot = runtime.services.at(action.service);
     if (slot.generation != action.generation || slot.pgid <= 1 || slot.quiescence_reported) {
         return;
     }
 
+    if (!slot.session_admitted) {
+        // The child cannot exec until ACK; no service descendants exist yet.
+        close_session_ack(slot.session_ack);
+        if (!slot.leader_reaped && slot.pid > 1) {
+            (void)ker::process::kill(slot.pid, signal);
+        }
+        return;
+    }
     if (!slot.leader_reaped) {
         if (slot.pid <= 1 || ker::process::getpgid(slot.pid) != slot.pgid) {
             init_log::warn("init supervisor: refusing stale group signal for %s generation %u",
@@ -553,7 +688,8 @@ auto spawn_service(uint8_t service, uint32_t generation, int32_t& failure, bool&
     auto& slot = runtime.services.at(service);
     auto const& spec = runtime.manifest.services.at(service);
     fatal = false;
-    if (!slot.quiescence_reported || slot.pid > 0 || slot.pgid > 0 || slot.exec_report_fd >= 0 || slot.output_fd >= 0) {
+    if (!slot.quiescence_reported || slot.pid > 0 || slot.pgid > 0 || slot.exec_report_fd >= 0 || slot.output_fd >= 0 ||
+        slot.session_ack.at(PIPE_READ) >= 0 || slot.session_ack.at(PIPE_WRITE) >= 0) {
         failure = EBUSY;
         return false;
     }
@@ -597,6 +733,16 @@ auto spawn_service(uint8_t service, uint32_t generation, int32_t& failure, bool&
         return false;
     }
 
+    std::array<int, 2> session_ack{-1, -1};
+    if (!create_session_ack(session_ack)) {
+        failure = errno;
+        close_fd(exec_pipe.at(PIPE_READ));
+        close_fd(exec_pipe.at(PIPE_WRITE));
+        close_fd(output_pipe.at(PIPE_READ));
+        close_fd(output_pipe.at(PIPE_WRITE));
+        return false;
+    }
+
     int64_t const RESOURCE_RESULT = ker::process::service_resource_select(service);
     if (RESOURCE_RESULT < 0) {
         failure = positive_error(RESOURCE_RESULT);
@@ -604,6 +750,7 @@ auto spawn_service(uint8_t service, uint32_t generation, int32_t& failure, bool&
         close_fd(exec_pipe.at(PIPE_WRITE));
         close_fd(output_pipe.at(PIPE_READ));
         close_fd(output_pipe.at(PIPE_WRITE));
+        close_session_ack(session_ack);
         return false;
     }
     int64_t const TARGET_RESULT = ker::process::setwkitarget(nullptr, 0, SERVICE_WKI_TARGET_FLAGS);
@@ -614,6 +761,7 @@ auto spawn_service(uint8_t service, uint32_t generation, int32_t& failure, bool&
         close_fd(exec_pipe.at(PIPE_WRITE));
         close_fd(output_pipe.at(PIPE_READ));
         close_fd(output_pipe.at(PIPE_WRITE));
+        close_session_ack(session_ack);
         return false;
     }
     runtime.init_wki_target_valid = false;
@@ -626,14 +774,16 @@ auto spawn_service(uint8_t service, uint32_t generation, int32_t& failure, bool&
     }
 
     if (PID == 0) {
+        (void)::close(session_ack.at(PIPE_WRITE));
         (void)::close(exec_pipe.at(PIPE_READ));
         if (spec.stdio == StdioPolicy::JOURNAL) {
             child_setup_stdio(spec, output_pipe, exec_pipe.at(PIPE_WRITE));
         }
-        int64_t const PGID_RESULT = ker::process::setpgid(0, 0);
+        int64_t const PGID_RESULT = ker::process::setsid();
         if (PGID_RESULT < 0) {
             report_child_failure(exec_pipe.at(PIPE_WRITE), ChildFailureStage::PROCESS_GROUP, positive_error(PGID_RESULT));
         }
+        await_session_admission(exec_pipe.at(PIPE_WRITE), session_ack.at(PIPE_READ));
         int64_t const CHILD_TARGET_RESULT = ker::process::setwkitarget(nullptr, 0, SERVICE_WKI_TARGET_FLAGS);
         if (CHILD_TARGET_RESULT < 0) {
             report_child_failure(exec_pipe.at(PIPE_WRITE), ChildFailureStage::WKI_TARGET, positive_error(CHILD_TARGET_RESULT));
@@ -644,6 +794,11 @@ auto spawn_service(uint8_t service, uint32_t generation, int32_t& failure, bool&
         }
         if (spec.stdio != StdioPolicy::JOURNAL) {
             child_setup_stdio(spec, output_pipe, exec_pipe.at(PIPE_WRITE));
+        }
+        ChildIdentityOperations identity_operations{};
+        int const IDENTITY_ERROR = apply_service_identity(runtime.identities.at(service), identity_operations);
+        if (IDENTITY_ERROR != 0) {
+            report_child_failure(exec_pipe.at(PIPE_WRITE), ChildFailureStage::IDENTITY, IDENTITY_ERROR);
         }
         int64_t const EXEC_RESULT = ker::process::execve(spec.executable.c_str(), arguments.data(), environment.data());
         report_child_failure(exec_pipe.at(PIPE_WRITE), ChildFailureStage::EXEC, positive_error(EXEC_RESULT));
@@ -656,10 +811,12 @@ auto spawn_service(uint8_t service, uint32_t generation, int32_t& failure, bool&
         fatal = !parent_target_restored;
         close_fd(exec_pipe.at(PIPE_READ));
         close_fd(output_pipe.at(PIPE_READ));
+        close_session_ack(session_ack);
         return false;
     }
 
     auto retain_cleanup_child = [&]() {
+        close_session_ack(session_ack);
         close_fd(exec_pipe.at(PIPE_READ));
         close_fd(output_pipe.at(PIPE_READ));
         slot.pid = PID;
@@ -687,24 +844,14 @@ auto spawn_service(uint8_t service, uint32_t generation, int32_t& failure, bool&
         return false;
     }
 
-    int64_t const PARENT_PGID_RESULT = ker::process::setpgid(PID, PID);
-    int64_t const OBSERVED_PGID = ker::process::getpgid(PID);
-    if (OBSERVED_PGID != PID) {
-        init_log::error("init supervisor: could not isolate %s pid %lld into its own process group (setpgid=%lld observed=%lld)",
-                        spec.name.c_str(), static_cast<long long>(PID), static_cast<long long>(PARENT_PGID_RESULT),
-                        static_cast<long long>(OBSERVED_PGID));
-        (void)ker::process::kill(PID, SIGKILL);
-        retain_cleanup_child();
-        failure = OBSERVED_PGID < 0 ? positive_error(OBSERVED_PGID) : (PARENT_PGID_RESULT < 0 ? positive_error(PARENT_PGID_RESULT) : EPERM);
-        return false;
-    }
-
     if (slot.ever_spawned) {
         ++slot.restart_count;
     }
     slot.ever_spawned = true;
     slot.pid = PID;
     slot.pgid = PID;
+    slot.session_ack = session_ack;
+    slot.session_admitted = false;
     slot.generation = generation;
     slot.exec_report_fd = exec_pipe.at(PIPE_READ);
     exec_pipe.at(PIPE_READ) = -1;
@@ -879,6 +1026,7 @@ void reap_children(uint64_t now_ms) {
         slot.pid = -1;
         slot.leader_reaped = true;
         if (slot.cleanup_only) {
+            close_session_ack(slot.session_ack);
             close_fd(slot.exec_report_fd);
             close_service_output(SERVICE, true);
             network_probe_close(slot.probe);
@@ -1148,16 +1296,22 @@ void publish_status(uint64_t now_ms) {
     runtime.last_status_publish_error = RESULT;
 }
 
-auto read_manifest(size_t& size) -> bool {
+auto read_configuration(const char* path, std::span<char> bytes, size_t& size) -> bool {
     size = 0;
-    int const FD = ::open(SERVICE_MANIFEST_PATH, O_RDONLY | O_CLOEXEC);
+    int const FD = ::open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
     if (FD < 0) {
-        init_log::critical("init supervisor: unable to open %s: errno=%d", SERVICE_MANIFEST_PATH, errno);
+        init_log::critical("init supervisor: unable to open %s: errno=%d", path, errno);
         return false;
     }
 
-    while (size < runtime.manifest_bytes.size()) {
-        ssize_t const READ = ::read(FD, runtime.manifest_bytes.data() + size, runtime.manifest_bytes.size() - size);
+    struct stat status{};
+    if (::fstat(FD, &status) != 0 || !S_ISREG(status.st_mode) || status.st_uid != 0 || (status.st_mode & 0022) != 0) {
+        (void)::close(FD);
+        init_log::critical("init supervisor: untrusted configuration %s", path);
+        return false;
+    }
+    while (size < bytes.size()) {
+        ssize_t const READ = ::read(FD, bytes.data() + size, bytes.size() - size);
         if (READ > 0) {
             size += static_cast<size_t>(READ);
             continue;
@@ -1171,7 +1325,7 @@ auto read_manifest(size_t& size) -> bool {
         }
         int const ERROR = errno;
         (void)::close(FD);
-        init_log::critical("init supervisor: failed reading %s: errno=%d", SERVICE_MANIFEST_PATH, ERROR);
+        init_log::critical("init supervisor: failed reading %s: errno=%d", path, ERROR);
         return false;
     }
 
@@ -1183,12 +1337,12 @@ auto read_manifest(size_t& size) -> bool {
     int const ERROR = errno;
     (void)::close(FD);
     if (read_extra > 0) {
-        init_log::critical("init supervisor: %s exceeds %llu-byte manifest limit", SERVICE_MANIFEST_PATH,
-                           static_cast<unsigned long long>(runtime.manifest_bytes.size()));
+        init_log::critical("init supervisor: %s exceeds %llu-byte configuration limit", path,
+                           static_cast<unsigned long long>(bytes.size()));
         return false;
     }
     if (read_extra < 0) {
-        init_log::critical("init supervisor: failed checking %s size: errno=%d", SERVICE_MANIFEST_PATH, ERROR);
+        init_log::critical("init supervisor: failed checking %s size: errno=%d", path, ERROR);
         return false;
     }
     return true;
@@ -1247,6 +1401,7 @@ void force_stop_phase(bool journal_phase) {
         signal_service_group(ACTION, SIGKILL);
         network_probe_close(slot.probe);
         close_service_output(service, true);
+        close_session_ack(slot.session_ack);
         close_fd(slot.exec_report_fd);
         slot.exec_resolved = true;
     }
@@ -1312,7 +1467,7 @@ auto start_service_supervisor() -> bool {
     }
 
     size_t manifest_size = 0;
-    if (!read_manifest(manifest_size)) {
+    if (!read_configuration(SERVICE_MANIFEST_PATH, runtime.manifest_bytes, manifest_size)) {
         runtime.failed = true;
         publish_status(runtime.now_ms);
         return false;
@@ -1335,6 +1490,52 @@ auto start_service_supervisor() -> bool {
                            static_cast<unsigned>(VALIDATION.related_service));
         publish_status(runtime.now_ms);
         return false;
+    }
+
+    size_t passwd_size = 0, group_size = 0;
+    if (!read_configuration("/etc/passwd", runtime.passwd_bytes, passwd_size) ||
+        !read_configuration("/etc/group", runtime.group_bytes, group_size) ||
+        !parse_service_accounts(std::string_view(runtime.passwd_bytes.data(), passwd_size),
+                                std::string_view(runtime.group_bytes.data(), group_size), runtime.accounts)) {
+        runtime.failed = true;
+        init_log::critical("init supervisor: invalid service account database; failing closed");
+        publish_status(runtime.now_ms);
+        return false;
+    }
+    for (uint8_t service = 0; service < runtime.manifest.service_count; ++service) {
+        if (!resolve_service_identity(runtime.manifest.services.at(service).identity, runtime.accounts, runtime.identities.at(service))) {
+            runtime.failed = true;
+            init_log::critical("init supervisor: invalid identity for %s; failing closed",
+                               runtime.manifest.services.at(service).name.c_str());
+            publish_status(runtime.now_ms);
+            return false;
+        }
+    }
+
+    for (uint8_t service = 0; service < runtime.manifest.service_count; ++service) {
+        auto const& spec = runtime.manifest.services.at(service);
+        if (spec.runtime_state == ServiceSpec::RuntimeState::NETD) {
+            auto const& identity = runtime.identities.at(service);
+            int const ERROR = prepare_netd_runtime_state(identity.uid, identity.gid);
+            if (ERROR != 0) {
+                runtime.failed = true;
+                init_log::critical("init supervisor: netd runtime state for %s failed: %d", spec.name.c_str(), ERROR);
+                publish_status(runtime.now_ms);
+                return false;
+            }
+        }
+        if (spec.private_state != ServiceSpec::PrivateState::NONE) {
+            auto const& identity = runtime.identities.at(service);
+            int const ERROR = spec.private_state == ServiceSpec::PrivateState::KEYGEN
+                                  ? prepare_private_keygen_state(identity.uid, identity.gid)
+                                  : prepare_private_journal_state(identity.uid, identity.gid);
+            if (ERROR != 0) {
+                runtime.failed = true;
+                init_log::critical("init supervisor: private state for %s failed: %d", spec.name.c_str(), ERROR);
+                publish_status(runtime.now_ms);
+                return false;
+            }
+        }
     }
 
     for (uint8_t service = 0; service < runtime.manifest.service_count; ++service) {

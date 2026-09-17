@@ -7,6 +7,8 @@ set(CXXFILES
     src/init.cpp
     src/fstab.cpp
     src/network.cpp
+    src/service_identity.cpp
+    src/service_state.cpp
     src/service_manifest.cpp
     src/services.cpp
     src/shutdown.cpp

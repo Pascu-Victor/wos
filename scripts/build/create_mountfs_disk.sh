@@ -114,6 +114,12 @@ if [ "${WOS_KTEST_SECOND_XFS:-0}" = "1" ]; then
 run
 part-add /dev/sda p $KTEST_PART_START_SECTOR $KTEST_PART_END_SECTOR
 part-set-gpt-guid /dev/sda 2 $KTEST_PART_GUID
+sync
+_EOF_
+    # Reattach before formatting too: the appliance can retain its old device
+    # nodes after part-add, leaving /dev/sda2 unavailable to mkfs.xfs.
+    wos_qcow_guestfish "format isolated KTEST secondary XFS partition" "$DISK" --rw -a "$DISK" <<_EOF_
+run
 debug sh "mkfs.xfs -f -m rmapbt=0,reflink=0,inobtcount=0,uuid=$KTEST_FS_UUID -n parent=0 /dev/sda2"
 sync
 _EOF_

@@ -211,8 +211,9 @@ def parse_int_field(output: str, name: str, *, base: int = 10) -> int:
     return int(value, base)
 
 
-def read_inode_info(partition_file: Path, target: str) -> InodeInfo:
-    reject_xfs_db_path(target)
+def read_inode_info(partition_file: Path, target: str, *, allow_root: bool = False) -> InodeInfo:
+    if target != "/" or not allow_root:
+        reject_xfs_db_path(target)
     output = xfs_db(
         partition_file,
         [
@@ -304,6 +305,8 @@ def copy_regular_file(partition_file: Path, source: Path, target: str, mode: int
         [
             f"path {target}",
             f"write core.size {size}",
+            "write core.uid 0",
+            "write core.gid 0",
             f"write core.mode 0{(XFS_REGULAR_MODE | mode):o}",
             "crc -r",
         ],
@@ -312,10 +315,13 @@ def copy_regular_file(partition_file: Path, source: Path, target: str, mode: int
 
 
 def verify_existing_directory(partition_file: Path, target: str, mode: int) -> None:
-    info = read_inode_info(partition_file, target)
+    info = read_inode_info(partition_file, target, allow_root=True)
     if not stat.S_ISDIR(info.mode):
         raise RuntimeError(f"{target} exists but is not a directory")
-    xfs_db(partition_file, [f"path {target}", f"write core.mode 0{(0o040000 | mode):o}", "crc -r"], write=True)
+    # Managed entries have root:root ownership in full images and staged tar
+    # deltas, regardless of either the host staging owner or the old inode.
+    xfs_db(partition_file, [f"path {target}", "write core.uid 0", "write core.gid 0",
+                            f"write core.mode 0{(0o040000 | mode):o}", "crc -r"], write=True)
 
 
 def changed_relpaths(paths_file: Path) -> list[str]:
@@ -337,7 +343,7 @@ def apply_delta(args: argparse.Namespace) -> int:
         with QcowPartitionFuse(disk, partition, Path(temp)) as partition_file:
             for rel in relpaths:
                 source = staging / rel
-                target = "/" + rel
+                target = "/" if rel == "." else "/" + rel
                 if source.is_symlink():
                     raise RuntimeError(f"{target} is a symlink delta; recreate mountfs.qcow2")
                 if source.is_dir():

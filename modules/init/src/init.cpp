@@ -141,7 +141,7 @@ auto main(int argc, char** argv) -> int {
 
     ker::abi::vfs::mkdir("/var", 0755);
     ker::abi::vfs::mkdir("/var/log", 0755);
-    ker::abi::vfs::mkdir("/var/log/journal", 0755);
+    ker::abi::vfs::mkdir("/var/log/journal", 0700);
     if (!start_service_supervisor()) {
         init_log::critical("init[%llu]: service supervisor initialization failed; PID 1 remains alive for reaping and shutdown",
                            static_cast<unsigned long long>(CPUNO));

@@ -71,6 +71,7 @@ rootfs_write_content_manifest() {
     # so rootfs sync does not read gigabytes just to prove they are unchanged.
     (
         cd "$ROOTFS_STAGING"
+        printf '/\tD\t%s\t\t\t\n' "$(stat -c %a .)"
         find . -mindepth 1 ! -path ".${ROOTFS_CONTENT_MANIFEST}" -print0 | sort -z | while IFS= read -r -d '' entry; do
             local hash
             local identity
@@ -366,13 +367,24 @@ rootfs_stage_etc() {
     local tz_source=""
 
     mkdir -p "$ROOTFS_STAGING/etc/dropbear"
+    chmod 0700 "$ROOTFS_STAGING/etc/dropbear"
 
     cat > "$ROOTFS_STAGING/etc/passwd" <<'EOF'
 root:!:0:0:root:/root:/bin/bash
+httpd:!:100:100:HTTP server:/nonexistent:/bin/false
+journald:!:101:101:Journal daemon:/nonexistent:/bin/false
+netd:!:102:102:Network daemon:/nonexistent:/bin/false
+keygen:!:103:103:Host key generator:/nonexistent:/bin/false
+sshd:!:104:104:SSH network worker:/nonexistent:/bin/false
 EOF
 
     cat > "$ROOTFS_STAGING/etc/group" <<'EOF'
 root:x:0:root
+httpd:x:100:
+journald:x:101:
+netd:x:102:
+keygen:x:103:
+sshd:x:104:
 EOF
 
     cat > "$ROOTFS_STAGING/etc/profile" <<'EOF'
@@ -509,6 +521,7 @@ rootfs_stage_misc_dirs() {
     mkdir -p "$ROOTFS_STAGING/tmp"
     mkdir -p "$ROOTFS_STAGING/run"
     mkdir -p "$ROOTFS_STAGING/var/log/journal"
+    chmod 0700 "$ROOTFS_STAGING/var/log/journal"
     mkdir -p "$ROOTFS_STAGING/oldroot"
 }
 
@@ -559,6 +572,8 @@ rootfs_stage_tree() {
     ROOTFS_CHANGED=1
 
     mkdir -p "$ROOTFS_STAGING"
+    # mktemp creates staging as 0700; the installed filesystem root is public.
+    chmod 0755 "$ROOTFS_STAGING"
     : > "$ROOTFS_MANAGED_TMP"
 
     rootfs_stage_sysroot_libs

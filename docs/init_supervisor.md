@@ -32,6 +32,13 @@ syntax.
 version=1
 
 [service example]
+user=root
+group=root
+supplementary-groups=none
+umask=0022
+authority-ceiling=65535
+no-new-privileges=no
+service-privileges=none
 exec=/usr/bin/example
 arg=/usr/bin/example
 type=daemon
@@ -59,6 +66,15 @@ are the only repeatable fields.
 
 | Key | Cardinality | Accepted value or bound | Meaning |
 | --- | --- | --- | --- |
+| `user` | 1 | Account name, at most 31 bytes | Real, effective, and saved UID resolved from `/etc/passwd`. |
+| `group` | 1 | Group name, at most 31 bytes | Real, effective, and saved GID resolved from `/etc/group`. |
+| `supplementary-groups` | 1 | `none` or at most 8 comma-separated group names | Exact replacement, with no inherited or implicit membership. |
+| `umask` | 1 | Three or four octal digits, 0000–0777 | Child creation mask. |
+| `authority-ceiling` | 1 | Decimal 0–65535 | Restricts the existing 16 authority domains and bounds explicit service grants. |
+| `runtime-state` | 0 or 1 | `none` (default), `netd` | Prepare fresh owned resolver state; at most one network provider with NNP, grant2 and ceiling4096. |
+| `private-state` | 0 or 1 | `none` (default), `journal`, `keygen` | Validate and prepare a reserved flat namespace before services start; each state requires its narrow service profile. |
+| `service-privileges` | 1 | `none`, `journal-read`, `network-admin`, or both comma-separated | Fixed, sealed operation grants; duplicate or unknown names reject startup. |
+| `no-new-privileges` | 1 | `yes`, `no` | Irreversibly suppress set-ID privilege gain on exec. |
 | `exec` | 1 | Safe absolute path, at most 255 bytes | Executable passed to `execve`; no path search occurs. |
 | `arg` | 1–16 | Nonempty printable value, at most 255 bytes | Ordered argument vector. The first `arg` must equal `exec`. |
 | `env` | 0–16 | `KEY=VALUE`, at most 255 bytes | Extra environment entry. Keys must be unique and use C identifier spelling. |
@@ -142,10 +158,10 @@ The default manifest preserves the existing WOS paths and priorities:
 
 | Service | Type/class | Priority | Readiness | Restart | Enablement | Direct dependencies | Stdio |
 | --- | --- | ---: | --- | --- | --- | --- | --- |
-| `journald` | daemon/journal | 10 | immediate, 5 s | never | always | none | inherit |
+| `journald` | daemon/journal | 10 | immediate, 5 s | never | always | none | null |
 | `dropbear-keygen` | oneshot/normal | 0 | successful exit, 30 s | on failure | path missing: Dropbear RSA key | journald | journal |
-| `netd` | daemon/network provider | 0 | nonzero IPv4 on `eth0`, 180 s | on failure | always | journald | inherit |
-| `httpd` | daemon/network consumer | 10 | immediate, 5 s | on failure | always | netd | inherit |
+| `netd` | daemon/network provider | 0 | nonzero IPv4 on `eth0`, 180 s | on failure | always | journald | null |
+| `httpd` | daemon/network consumer | 10 | immediate, 5 s | on failure | always | netd | null |
 | `dropbear` | daemon/network consumer | -5 | immediate, 5 s | on failure | always | netd, dropbear-keygen | journal |
 | `testd` | oneshot/normal | 0 | successful exit, 5 s | never | disabled | netd, httpd, dropbear | inherit |
 
@@ -155,6 +171,52 @@ a 2 s output drain deadline. `testd` remains explicitly disabled; its readiness
 dependencies replace the former fixed ten-second settle delay if an operator
 enables it in a deliberate image variant or starts it explicitly for the
 current boot.
+
+All services must declare the seven identity fields above. Version 1 manifests
+without them fail closed. Before configuring resources or launching any service,
+init opens the manifest and both account files with `O_NOFOLLOW` and checks that
+they are regular, root-owned, and not group/world writable. Each account file is
+limited to 16 KiB, 512 bytes per line, and 32 entries. Passwd/group fields and
+numeric IDs must be valid; duplicate names/IDs, unknown members, missing primary
+groups, and unresolved declared accounts reject startup. Account files end with
+a newline. User and group names begin with an ASCII letter or underscore and
+continue with letters, digits, underscores, or hyphens.
+
+After fork, the child creates a new session and reports readiness over the
+private result pipe. It waits for PID 1 to verify SID=PGID=child PID and send one
+ACK byte before proceeding. PID 1 polls this handshake without blocking and
+never races the child with parent-directed setpgid. The child then establishes
+placement, priority and standard streams, applies NNP, installs and seals the
+declared service privileges, supplementary groups, all three GIDs, all
+three UIDs, umask, and the authority ceiling. It verifies the final values before
+exec. WOS privileged `setgid`/`setuid` set all three IDs; init uses these
+supported calls and checks the resulting saved IDs explicitly. Any failed step
+reports an identity-stage error through the existing exec
+pipe and exits without launching service code. PID 1 keeps its credentials.
+Nonroot service declarations require NNP and a ceiling exactly matching the
+service privileges: journal-read requires 16384, network-admin requires 4096,
+both require 20480, and none requires zero. Root declarations with privileges
+also require NNP and the matching ceiling bits. NNP services seal their grant
+set, including an empty set, before dropping IDs. Legacy root services with NNP
+`no` and privileges `none` skip installation. Initial nonzero installation
+requires root INIT_CONTROL and the matching root authority; later requests can
+only reduce the sealed set. Reducing the ceiling disables the matching grant.
+Journal-read does not grant access to other kernel diagnostics.
+
+The shipped HTTPD uses locked UID/GID 100 (`httpd`), no supplementary groups,
+umask 0077, an empty environment, null standard streams, NNP, and zero authority.
+Its health/info and permitted file reads remain available; `/api/mount` returns
+403 before creating directories or launching a process, and listings omit the
+mount form. Root-owned private files remain protected by filesystem permissions.
+Journald uses locked UID/GID101, NNP, journal-read, ceiling16384 and private state
+prepared by init as described below. Netd uses locked UID/GID102, NNP, sealed
+network-admin, ceiling4096, umask0077, no supplementary groups, empty environment
+and null streams. Key generation uses locked UID/GID103 (`keygen`), no
+supplementary groups, umask0077, NNP, a sealed empty grant set, zero authority and
+an empty environment. Dropbear and disabled testd still declare root/root,
+umask0022, full authority and NNP disabled; their reductions remain pending.
+Root and the four service accounts are generated deterministically; service
+accounts use `/nonexistent` and `/bin/false`.
 
 ## Lifecycle and readiness
 
@@ -224,11 +286,16 @@ The model alone cannot prove the following runtime properties. They are
 mandatory PID 1 integration invariants and require live evidence:
 
 - PID 1 is the single reap owner for every supervisor child. Each service
-  generation records the service PID and process group, and group signalling is
-  fenced by the current generation so a reused PID cannot be signalled.
+  generation records the service PID and process group. Before session admission,
+  cleanup targets only the child, which cannot yet exec service descendants.
+  After admission, group signalling is fenced by the current generation and
+  verified process group.
 - Spawn success and `execve` success are distinct. A bounded close-on-exec
-  result channel reports child setup/exec errno; EOF means exec succeeded, and
-  PID 1 processes this channel before reaping each tick. Exit status 127 is not
+  result channel first carries session readiness, then child setup/exec errno;
+  EOF resolves exec success only after session admission. PID 1 processes this
+  channel before reaping each tick. Missing, duplicate or invalid readiness fails
+  startup. The ACK writer is nonblocking and retains a read endpoint until its
+  one-byte write completes, preventing SIGPIPE if the child dies concurrently. Exit status 127 is not
   sufficient evidence by itself.
 - WOS placement remains `LOCAL` for service children while PID 1 retains
   `LOCAL | NOINHERIT`. Fork/exec setup must not expose a runnable child with the
@@ -270,7 +337,7 @@ count, last wait status, and last error. Targeted status also prints at most
 four ordered transition records, oldest first. A read before PID 1 publishes
 its first complete snapshot fails with `EAGAIN`.
 
-For root, targeted status also displays configured limits, current usage,
+For root with retained `RESOURCE_LIMIT` authority, targeted status also displays configured limits, current usage,
 peaks, denial counts and reasons. CPU totals include every affiliated process
 and previous generation. Other rows show the maximum current per-process
 observation, lifetime maximum peak and summed denial counters. Those counters
@@ -280,8 +347,9 @@ The resource snapshot uses an additive version-1 ABI, independent of the
 unchanged init-control snapshot. A status/history read and its resource read
 are individually coherent observations taken at separate times.
 
-Start, stop, and restart submission requires effective UID 0. The kernel
-authenticates the calling task and overwrites sender PID/effective UID; the CLI
+Start, stop, and restart submission requires effective UID 0 and retained
+`INIT_CONTROL` authority. The kernel uses one immutable credential snapshot to
+authorize the request and stamp its effective UID, and stamps the process PID; the CLI
 is not the authorization boundary. PID 1 alone receives requests and publishes
 status. The fixed mailbox holds 16 requests, so a full mailbox returns
 `EAGAIN`; all four operations are nonblocking.
@@ -471,3 +539,103 @@ completion also requires no zombie or orphaned drain. A deliberately exhausted
 shutdown/drain case instead requires the explicit non-restartable abandoned
 failure with its identity retained for diagnosis. VM logs and status history
 are required before marking the live portion complete.
+
+The disposable `tests/fixtures/service_identity_services.fragment` runs
+`testprog credentials service-policy` under the HTTPD identity, including a
+root-owned set-ID copy at `/usr/bin/identity-setid-probe` (mode 06755).
+Create that copy only in the disposable VM image before appending the fixture.
+Both probes must report zero failures and successful one-shot readiness. They
+check the final IDs, groups, umask, NNP and authority ceiling, restoration
+denials, mount/init-control denial, private key protection, and NNP suppression
+of set-ID exec. The fixture is not part of the normal service manifest.
+
+
+Journald now declares `private-state=journal`, locked UID/GID101 (`journald`),
+NNP, journal-read only, ceiling16384, umask0077, empty environment and null stdio.
+The optional private-state selector also accepts keygen, described below; journal
+requires the unique journal class and this narrow privilege profile. Images
+stage the private directory as root-owned0700. Before configuring resources or
+starting any service, trusted init walks root/var/log without symlinks or
+writable parents, validates the retained journal directory and its complete
+flat namespace, and transfers active/archive ownership to the declared account.
+Only wos.journal and wos.journal.1 are permitted. Existing files must be regular,
+0600, single-link and root:root or already owned by the service; the directory
+must be0700 with one of those owners. Files transfer before the directory.
+Denied preflight leaves ownership/content unchanged; operational failure rolls
+back prior ownership changes and aborts startup (EIO if rollback also fails).
+This is an exclusive startup operation, not a concurrent or crash-atomic chown.
+Unknown entries, links, special files and foreign ownership fail startup.
+Existing state contents are preserved, and the daemon creates new files only
+after init has permanently dropped its credentials. The host staging tree is
+never chowned. Dropbear and disabled testd await their own drops.
+
+
+### Netd runtime resolver state
+
+Netd declares `runtime-state=netd`. After all account resolution and before any
+service launch, init validates root-owned, non-writable root/run/etc ancestors,
+reads the bounded regular root-owned `/etc/netd-resolv.conf` seed without following
+symlinks, and creates a fresh `/run/.netd-init` staging directory. It writes the
+seed, assigns file mode0644 and directory mode0755 and UID/GID102, then publishes
+`/run/netd` by rename. Preexisting staging/final paths reject startup; failures
+remove only newly created state. This is exclusive early startup, not a general
+concurrent migration facility. `/run` is tmpfs; supervisor restarts retain the
+state, and each boot creates it anew. The default seed contains resolver options
+only, matching the previous initial configuration.
+
+The root-owned `/etc/resolv.conf` symlink points to `/run/netd/resolv.conf`.
+Netd validates its owned directory and existing regular, single-link file,
+creates its temporary file exclusively without following symlinks, checks writes,
+sets mode0644, then renames through the retained directory descriptor. A stale
+owned, single-link regular temporary file can be discarded after interruption;
+symlinks, hardlinks, unexpected permissions and special files are rejected.
+Unrelated users can read the published resolver but cannot replace it or write
+in `/etc`. Network administration is the daemon's only delegated control grant.
+
+
+Host-key generation declares `private-state=keygen`. Only one service may own
+this state, and its profile must be a normal oneshot with NNP, no grants,
+ceiling0, no supplementary groups, umask0077 and an empty environment. Init
+resolves the locked keygen account before preparing `/etc/dropbear` through
+retained nofollow descriptors. Root and `/etc` must be root:root directories
+without group/world write access. The complete bounded key namespace may
+contain only `dropbear_rsa_host_key` and its optional `.pub` file, each regular,
+0600, single-link and owned by root:root or keygen. Unknown entries, links,
+special files, unsafe permissions and foreign ownership abort startup.
+
+Full and incremental images stage the key directory root:root0700 without
+changing existing keys. Init transfers its allowed files before the directory.
+A legacy root:root0755 directory is tightened only after complete preflight;
+failed ownership migration restores earlier ownership and the directory mode,
+returning EIO if rollback itself fails. An already keygen-owned directory must
+be0700. No service starts before state preparation succeeds. This is an
+exclusive startup transaction, not a concurrent or crash-atomic migration.
+
+Real `dropbearkey` runs after irreversible identity restrictions and creates
+private files within its owned directory. The existing-key enablement rule,
+RSA arguments, readiness dependency and journal output remain unchanged. The
+key generator receives no kernel authority; the login server still requires a
+separate design for authenticated user switching and session authority.
+
+Disposable validation uses `service_keygen_state.cpp` with init's actual state
+adapter for preflight, legacy-mode migration, denied ownership rollback and
+content preservation. `service_keygen_policy.c`, installed root:root06755 as a
+temporary keygen executable, checks21 restrictions before executing the real
+key generator. `service_keygen_boot.py` retains the original key and digest
+inside the guest, stages missing-key generation, restores the production
+manifest/key, and verifies unchanged contents across restart. None of these
+fixtures is installed by the production manifest. Native validation passed15
+state checks and21 identity/denial checks, generated a new RSA key, restored
+SSH availability, and preserved the original key across the production reboot.
+
+
+Session-isolation qualification: Normal Build WOS passed. The host runtime
+harness executes the actual init admission/cleanup functions with real pipes
+and controlled process/model boundaries; all 12 scenarios passed. All 42 host
+supervisor/account/private-state tests also passed. In a disposable live VM,
+journald, netd, HTTPD and Dropbear each had SID=PGID=their own PID. Four HTTPD
+replacements and a stop/start cycle preserved those identities and returned PID
+1 to its original descriptor set. The keygen oneshot was already satisfied and
+testd was disabled in that run; their session startup was not separately
+exercised. These service boundaries preserve the POSIX same-session SIGCONT
+exception while denying the exception across isolated root/nonroot sessions.

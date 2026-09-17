@@ -5,12 +5,16 @@
 #include <sys/logging.h>
 #include <sys/vfs.h>
 #include <sys/vmem.h>
+#include <time.h>  // NOLINT(modernize-deprecated-headers): WOS POSIX sleep declarations live here.
 
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 
+#include "fstab_parse.h"
+#include "mount_options.h"
+#include "mount_retry.h"
 #include "sys/multiproc.h"
 
 namespace {
@@ -23,21 +27,28 @@ constexpr const char* REQUIRED_TMP_FSTYPE = "tmpfs";
 constexpr const char* REQUIRED_RUN_PATH = "/run";
 using init_log = wos::journal<"init">;
 
-auto parse_field(const char*& cursor, std::array<char, FIELD_MAX>& out) -> bool {
-    size_t field_index = 0;
-    while (*cursor != '\0' && *cursor != ' ' && *cursor != '\t' && field_index < out.size() - 1) {
-        out.at(field_index++) = *cursor++;
-    }
-    out.at(field_index) = '\0';
-    return out.front() != '\0';
-}
-
 auto is_required_tmp_mountpoint(const char* mountpoint) -> bool { return std::strcmp(mountpoint, REQUIRED_TMP_PATH) == 0; }
+
+auto mount_with_retry(uint64_t cpuno, const char* source, const char* target, const char* type, const char* options = nullptr) -> int {
+    wos::init::MountOptions parsed;
+    int const PARSE_RESULT = wos::init::parse_mount_options(options != nullptr ? options : "", parsed);
+    if (PARSE_RESULT != 0) return PARSE_RESULT;
+    return wos::init::retry_mount([&]() { return ker::abi::vfs::mount(source, target, type, parsed.flags, parsed.data.data()); },
+                                  [&](unsigned attempt) {
+                                      if (attempt == 1 || attempt % 10 == 0) {
+                                          init_log::warn("init[%llu]: mount namespace changed at %s (attempt %u/%u), retrying",
+                                                         static_cast<unsigned long long>(cpuno), target, attempt,
+                                                         wos::init::MOUNT_MAX_ATTEMPTS);
+                                      }
+                                      timespec const SLEEP{.tv_sec = 0, .tv_nsec = wos::init::MOUNT_RETRY_MS * 1000000L};
+                                      nanosleep(&SLEEP, nullptr);
+                                  });
+}
 
 auto mount_required_tmpfs_at(uint64_t cpuno, const char* path) -> bool {
     ker::abi::vfs::mkdir(path, DIR_MODE);
 
-    int const RET = ker::abi::vfs::mount(REQUIRED_TMP_SOURCE, path, REQUIRED_TMP_FSTYPE);
+    int const RET = mount_with_retry(cpuno, REQUIRED_TMP_SOURCE, path, REQUIRED_TMP_FSTYPE);
     if (RET == 0) {
         init_log::info("init[%llu]: mounted required tmpfs at %s", static_cast<unsigned long long>(cpuno), path);
         return true;
@@ -69,10 +80,17 @@ void mount_filesystems() {
     }
 
     std::array<char, FSTAB_BUF_SIZE> fstab_buf{};
-    ssize_t const BYTES_READ = ker::abi::vfs::read(FSTAB_FD, fstab_buf.data(), FSTAB_BUF_SIZE - 1);
+    ssize_t const BYTES_READ = wos::init::read_complete_fstab(
+        fstab_buf, [&](char* buffer, size_t capacity) { return ker::abi::vfs::read(FSTAB_FD, buffer, capacity); });
     ker::abi::vfs::close(FSTAB_FD);
 
-    if (BYTES_READ <= 0) {
+    if (BYTES_READ < 0) {
+        init_log::error("init[%llu]: rejected incomplete or invalid /etc/fstab: error %ld", static_cast<unsigned long long>(CPUNO),
+                        static_cast<long>(BYTES_READ));
+        ensure_required_tmpfs();
+        return;
+    }
+    if (BYTES_READ == 0) {
         init_log::info("init[%llu]: /etc/fstab is empty", static_cast<unsigned long long>(CPUNO));
         ensure_required_tmpfs();
         return;
@@ -107,7 +125,7 @@ void mount_filesystems() {
             std::array<char, FIELD_MAX> options{};
 
             // Parse device field
-            bool const HAS_DEVICE = parse_field(p, device);
+            int const DEVICE_RESULT = wos::init::parse_fstab_field(p, device);
 
             // Skip whitespace
             while (*p == ' ' || *p == '\t') {
@@ -115,7 +133,7 @@ void mount_filesystems() {
             }
 
             // Parse mountpoint field
-            bool const HAS_MOUNTPOINT = parse_field(p, mountpoint);
+            int const MOUNTPOINT_RESULT = wos::init::parse_fstab_field(p, mountpoint);
 
             // Skip whitespace
             while (*p == ' ' || *p == '\t') {
@@ -123,14 +141,14 @@ void mount_filesystems() {
             }
 
             // Parse fstype field
-            bool const HAS_FSTYPE = parse_field(p, fstype);
+            int const FSTYPE_RESULT = wos::init::parse_fstab_field(p, fstype);
 
             while (*p == ' ' || *p == '\t') {
                 p++;
             }
-            bool const HAS_OPTIONS = parse_field(p, options);
+            int const OPTIONS_RESULT = wos::init::parse_fstab_field(p, options);
 
-            if (HAS_DEVICE && HAS_MOUNTPOINT && HAS_FSTYPE) {
+            if (DEVICE_RESULT > 0 && MOUNTPOINT_RESULT > 0 && FSTYPE_RESULT > 0 && OPTIONS_RESULT >= 0) {
                 if (std::strcmp(fstype.data(), "swap") == 0) {
                     int64_t const RET = ker::vmem::swapon(device.data(), 0);
                     if (RET == 0) {
@@ -139,28 +157,30 @@ void mount_filesystems() {
                         init_log::error("init[%llu]: failed to enable swap on %s: error %ld", static_cast<unsigned long long>(CPUNO),
                                         device.data(), static_cast<long>(RET));
                     }
-                    continue;
-                }
-
-                // Create mount point directory
-                ker::abi::vfs::mkdir(mountpoint.data(), DIR_MODE);
-
-                // Mount filesystem
-                const char* mount_options = HAS_OPTIONS ? options.data() : nullptr;
-                int const RET = ker::abi::vfs::mount(device.data(), mountpoint.data(), fstype.data(), 0, mount_options);
-                if (RET == 0) {
-                    init_log::info("init[%llu]: mounted %s at %s (%s)", static_cast<unsigned long long>(CPUNO), device.data(),
-                                   mountpoint.data(), fstype.data());
-                    if (std::strcmp(fstype.data(), REQUIRED_TMP_FSTYPE) == 0 && is_required_tmp_mountpoint(mountpoint.data())) {
-                        required_tmpfs_mounted = true;
-                    }
-                    if (std::strcmp(fstype.data(), REQUIRED_TMP_FSTYPE) == 0 && std::strcmp(mountpoint.data(), REQUIRED_RUN_PATH) == 0) {
-                        required_runfs_mounted = true;
-                    }
                 } else {
-                    init_log::error("init[%llu]: failed to mount %s at %s (%s): error %d", static_cast<unsigned long long>(CPUNO),
-                                    device.data(), mountpoint.data(), fstype.data(), RET);
+                    // Create mount point directory
+                    ker::abi::vfs::mkdir(mountpoint.data(), DIR_MODE);
+
+                    // Mount filesystem
+                    const char* mount_options = OPTIONS_RESULT > 0 ? options.data() : nullptr;
+                    int const RET = mount_with_retry(CPUNO, device.data(), mountpoint.data(), fstype.data(), mount_options);
+                    if (RET == 0) {
+                        init_log::info("init[%llu]: mounted %s at %s (%s)", static_cast<unsigned long long>(CPUNO), device.data(),
+                                       mountpoint.data(), fstype.data());
+                        if (std::strcmp(fstype.data(), REQUIRED_TMP_FSTYPE) == 0 && is_required_tmp_mountpoint(mountpoint.data())) {
+                            required_tmpfs_mounted = true;
+                        }
+                        if (std::strcmp(fstype.data(), REQUIRED_TMP_FSTYPE) == 0 &&
+                            std::strcmp(mountpoint.data(), REQUIRED_RUN_PATH) == 0) {
+                            required_runfs_mounted = true;
+                        }
+                    } else {
+                        init_log::error("init[%llu]: failed to mount %s at %s (%s): error %d", static_cast<unsigned long long>(CPUNO),
+                                        device.data(), mountpoint.data(), fstype.data(), RET);
+                    }
                 }
+            } else {
+                init_log::error("init[%llu]: rejected fstab row with missing or overlong fields", static_cast<unsigned long long>(CPUNO));
             }
         }
 

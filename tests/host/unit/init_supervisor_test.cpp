@@ -1,18 +1,106 @@
+#include <fcntl.h>
 #include <gtest/gtest.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
+#include <algorithm>
 #include <array>
 #include <cerrno>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <initializer_list>
 #include <string>
 #include <string_view>
 
+#include "fstab_parse.h"
+#include "mount_options.h"
+#include "mount_retry.h"
+#include "service_identity.h"
 #include "service_manifest.h"
+#include "service_state.h"
 #include "supervisor_model.h"
 
 namespace {
+
+TEST(InitFstabParsing, CompleteFieldsPreservePolicyAndRejectTruncatedSuffixes) {
+    std::array<char, 256> output{};
+    std::string input = std::string(248, 'x') + ",nosuid next";
+    const char* cursor = input.c_str();
+    ASSERT_EQ(wos::init::parse_fstab_field(cursor, output), 1);
+    EXPECT_STREQ(cursor, " next");
+    wos::init::MountOptions options;
+    ASSERT_EQ(wos::init::parse_mount_options(output.data(), options), 0);
+    EXPECT_EQ(options.flags, MS_NOSUID);
+    auto const before = output;
+    input = std::string(249, 'x') + ",nosuid next";
+    cursor = input.c_str();
+    EXPECT_EQ(wos::init::parse_fstab_field(cursor, output), -E2BIG);
+    EXPECT_EQ(output, before);
+    EXPECT_STREQ(cursor, " next");
+    ++cursor;
+    ASSERT_EQ(wos::init::parse_fstab_field(cursor, output), 1);
+    EXPECT_STREQ(output.data(), "next");
+    EXPECT_EQ(wos::init::parse_fstab_field(cursor, output), 0);
+}
+
+TEST(InitFstabParsing, FullInputAdmissionHandlesShortReadsAndRejectsLostPolicy) {
+    std::array<char, 4096> output{};
+    auto load = [&](std::string_view input) {
+        size_t offset = 0;
+        return wos::init::read_complete_fstab(output, [&](char* buffer, size_t capacity) -> ssize_t {
+            size_t count = std::min({capacity, input.size() - offset, size_t{7}});
+            std::memcpy(buffer, input.data() + offset, count);
+            offset += count;
+            return static_cast<ssize_t>(count);
+        });
+    };
+    std::string const boundary = std::string(4088, 'x') + ",nosuid";
+    ASSERT_EQ(load(boundary), 4095);
+    EXPECT_EQ(std::string_view(output.data()), boundary);
+    EXPECT_EQ(load("x" + boundary), -E2BIG);
+    EXPECT_EQ(load(std::string_view("x\0,nosuid", 9)), -EINVAL);
+    EXPECT_EQ(load(""), 0);
+    EXPECT_EQ(wos::init::read_complete_fstab(output, [](char*, size_t) -> ssize_t { return -EIO; }), -EIO);
+    EXPECT_EQ(wos::init::read_complete_fstab(output,
+                                             [](char* buffer, size_t capacity) -> ssize_t {
+                                                 if (capacity == 1) return -EIO;
+                                                 std::memset(buffer, 'x', capacity);
+                                                 return static_cast<ssize_t>(capacity);
+                                             }),
+              -EIO);
+}
+
+TEST(InitMountOptions, SeparatesNosuidAndPreservesBackendOptions) {
+    wos::init::MountOptions parsed;
+    ASSERT_EQ(wos::init::parse_mount_options("defaults,nosuid,size=16M", parsed), 0);
+    EXPECT_EQ(parsed.flags, MS_NOSUID);
+    EXPECT_STREQ(parsed.data.data(), "defaults,size=16M");
+    ASSERT_EQ(wos::init::parse_mount_options("nosuid,suid,size=32M", parsed), 0);
+    EXPECT_EQ(parsed.flags, 0UL);
+    EXPECT_STREQ(parsed.data.data(), "size=32M");
+    ASSERT_EQ(wos::init::parse_mount_options("suid,nosuid", parsed), 0);
+    EXPECT_EQ(parsed.flags, MS_NOSUID);
+    EXPECT_STREQ(parsed.data.data(), "");
+    ASSERT_EQ(wos::init::parse_mount_options("nosuidx,xnosuid,suid=1", parsed), 0);
+    EXPECT_EQ(parsed.flags, 0UL);
+    EXPECT_STREQ(parsed.data.data(), "nosuidx,xnosuid,suid=1");
+}
+
+TEST(InitMountOptions, BoundedInputPreservesOutputOnFailure) {
+    wos::init::MountOptions parsed;
+    ASSERT_EQ(wos::init::parse_mount_options("nosuid,size=1M", parsed), 0);
+    auto const before = parsed;
+    EXPECT_EQ(wos::init::parse_mount_options(std::string(256, 'x'), parsed), -E2BIG);
+    EXPECT_EQ(parsed.flags, before.flags);
+    EXPECT_EQ(parsed.data, before.data);
+    ASSERT_EQ(wos::init::parse_mount_options(std::string(255, 'x'), parsed), 0);
+    EXPECT_EQ(std::strlen(parsed.data.data()), 255U);
+    ASSERT_EQ(wos::init::parse_mount_options("", parsed), 0);
+    EXPECT_EQ(parsed.flags, 0UL);
+    EXPECT_STREQ(parsed.data.data(), "");
+}
 
 using namespace std::string_view_literals;
 using wos::init::EnablementKind;
@@ -51,6 +139,13 @@ using wos::init::validate_service_manifest;
 constexpr std::string_view VALID_MANIFEST = R"MANIFEST(version=1
 
 [service journald]
+user=root
+group=root
+supplementary-groups=none
+umask=0022
+authority-ceiling=65535
+no-new-privileges=no
+service-privileges=none
 exec=/sbin/journald
 arg=/sbin/journald
 type=daemon
@@ -72,6 +167,13 @@ stdio=inherit
 enable=always
 
 [service dropbear-keygen]
+user=root
+group=root
+supplementary-groups=none
+umask=0022
+authority-ceiling=65535
+no-new-privileges=no
+service-privileges=none
 exec=/bin/dropbearkey
 arg=/bin/dropbearkey
 arg=-t
@@ -99,6 +201,13 @@ enable=path-missing
 enable-path=/etc/dropbear/dropbear_rsa_host_key
 
 [service netd]
+user=root
+group=root
+supplementary-groups=none
+umask=0022
+authority-ceiling=65535
+no-new-privileges=no
+service-privileges=none
 exec=/sbin/netd
 arg=/sbin/netd
 type=daemon
@@ -122,6 +231,13 @@ stdio=inherit
 enable=always
 
 [service httpd]
+user=root
+group=root
+supplementary-groups=none
+umask=0022
+authority-ceiling=65535
+no-new-privileges=no
+service-privileges=none
 exec=/sbin/httpd
 arg=/sbin/httpd
 type=daemon
@@ -144,6 +260,13 @@ stdio=inherit
 enable=always
 
 [service dropbear]
+user=root
+group=root
+supplementary-groups=none
+umask=0022
+authority-ceiling=65535
+no-new-privileges=no
+service-privileges=none
 exec=/bin/dropbear
 arg=/bin/dropbear
 arg=-r
@@ -171,6 +294,13 @@ stdio=journal
 enable=always
 
 [service testd]
+user=root
+group=root
+supplementary-groups=none
+umask=0022
+authority-ceiling=65535
+no-new-privileges=no
+service-privileges=none
 exec=/usr/bin/testd
 arg=/usr/bin/testd
 type=oneshot
@@ -274,15 +404,20 @@ TEST(InitServiceManifest, DisposableResourceServiceFixtureIsValid) {
     auto const ROOT = std::filesystem::path(__FILE__).parent_path().parent_path().parent_path().parent_path();
     std::ifstream base(ROOT / "configs/wos-services.conf");
     std::ifstream extra(ROOT / "tests/fixtures/resource_governance_services.fragment");
-    ASSERT_TRUE(base.good() && extra.good());
+    std::ifstream remote(ROOT / "tests/fixtures/resource_governance_remote_services.fragment");
+    ASSERT_TRUE(base.good() && extra.good() && remote.good());
     std::string input(std::istreambuf_iterator<char>{base}, {});
     input += '\n';
     input.append(std::istreambuf_iterator<char>{extra}, {});
+    input += '\n';
+    input.append(std::istreambuf_iterator<char>{remote}, {});
     ServiceManifest manifest{};
     ASSERT_TRUE(parse_service_manifest(std::span(input.data(), input.size()), manifest));
     ServiceTopology topology{};
     ASSERT_TRUE(validate_service_manifest(manifest, topology));
     EXPECT_NE(find_service(manifest, "resource-policy"), INVALID_SERVICE_ID);
+    EXPECT_NE(find_service(manifest, "resource-remote-finite"), INVALID_SERVICE_ID);
+    EXPECT_NE(find_service(manifest, "resource-remote-fallback"), INVALID_SERVICE_ID);
     EXPECT_NE(find_service(manifest, "resource-cpu-restart"), INVALID_SERVICE_ID);
     EXPECT_EQ(manifest.services.at(find_service(manifest, "resource-nproc-zero")).resource_limits.at(4).soft, 0);
     EXPECT_EQ(manifest.services.at(find_service(manifest, "resource-as-denied")).resource_limits.at(6).soft, 0);
@@ -1105,4 +1240,616 @@ TEST_F(SupervisorModelTest, NoSpawnOrActionAppearsAfterShutdownCompletes) {
     EXPECT_EQ(model.services.at(netd).generation, 0U);
 }
 
+TEST(InitServiceIdentity, DisposableServiceProbeFixtureUsesTheRestrictedAccount) {
+    auto const ROOT = std::filesystem::path(__FILE__).parent_path().parent_path().parent_path().parent_path();
+    std::ifstream base(ROOT / "configs/wos-services.conf");
+    std::ifstream extra(ROOT / "tests/fixtures/service_identity_services.fragment");
+    ASSERT_TRUE(base.good());
+    ASSERT_TRUE(extra.good());
+    std::string input((std::istreambuf_iterator<char>(base)), std::istreambuf_iterator<char>());
+    input += std::string((std::istreambuf_iterator<char>(extra)), std::istreambuf_iterator<char>());
+    ServiceManifest manifest{};
+    ASSERT_TRUE(parse_service_manifest(std::span(input.data(), input.size()), manifest));
+    ServiceTopology topology{};
+    ASSERT_TRUE(validate_service_manifest(manifest, topology));
+    EXPECT_EQ(manifest.service_count, 8);
+    for (size_t index : {6U, 7U}) {
+        auto const& policy = manifest.services[index].identity;
+        EXPECT_EQ(policy.user.view(), "httpd");
+        EXPECT_EQ(policy.group.view(), "httpd");
+        EXPECT_EQ(policy.supplementary_count, 0);
+        EXPECT_EQ(policy.mask, 0077);
+        EXPECT_EQ(policy.authority_ceiling, 0U);
+        EXPECT_TRUE(policy.no_new_privileges);
+    }
+}
+
+constexpr auto PASSWD_ACCOUNTS = "root:!:0:0:root:/root:/bin/bash\nhttpd:!:100:100:HTTP:/nonexistent:/bin/false\n"sv;
+constexpr auto GROUP_ACCOUNTS = "root:x:0:root\nhttpd:x:100:\nreaders:x:101:httpd\n"sv;
+
+auto http_identity() -> wos::init::ServiceIdentityPolicy {
+    wos::init::ServiceIdentityPolicy policy{};
+    policy.user.assign("httpd");
+    policy.group.assign("httpd");
+    policy.mask = 0077;
+    policy.no_new_privileges = true;
+    return policy;
+}
+
+TEST(InitServiceIdentity, ManifestRequiresEachIdentityFieldWithoutRootFallback) {
+    for (auto field : {"user=root\n"sv, "group=root\n"sv, "supplementary-groups=none\n"sv, "umask=0022\n"sv, "authority-ceiling=65535\n"sv,
+                       "no-new-privileges=no\n"sv, "service-privileges=none\n"sv}) {
+        std::string input(VALID_MANIFEST);
+        input.erase(input.find(field), field.size());
+        ServiceManifest manifest{};
+        EXPECT_EQ(parse_service_manifest(std::span(input.data(), input.size()), manifest).error,
+                  ManifestParseError::MISSING_REQUIRED_FIELD);
+    }
+}
+
+TEST(InitServiceIdentity, ManifestRejectsInvalidOrDuplicatePolicies) {
+    for (auto pair : {std::pair{"umask=0022"sv, "umask=888"sv},
+                      {"umask=0022", "umask=1000"},
+                      {"umask=0022", "umask=22"},
+                      {"authority-ceiling=65535", "authority-ceiling=65536"},
+                      {"authority-ceiling=65535", "authority-ceiling=-1"},
+                      {"no-new-privileges=no", "no-new-privileges=true"},
+                      {"supplementary-groups=none", "supplementary-groups=root,root"},
+                      {"supplementary-groups=none", "supplementary-groups=root,"},
+                      {"supplementary-groups=none", "supplementary-groups=a,b,c,d,e,f,g,h,i"}}) {
+        auto input = replace_once(std::string(VALID_MANIFEST), pair.first, pair.second);
+        ServiceManifest manifest{};
+        EXPECT_EQ(parse_service_manifest(std::span(input.data(), input.size()), manifest).error, ManifestParseError::INVALID_VALUE);
+    }
+    for (auto field : {"user=root\n", "group=root\n", "supplementary-groups=none\n", "umask=0022\n", "authority-ceiling=65535\n",
+                       "no-new-privileges=no\n", "service-privileges=none\n"}) {
+        auto input = std::string(VALID_MANIFEST) + field;
+        ServiceManifest manifest{};
+        EXPECT_EQ(parse_service_manifest(std::span(input.data(), input.size()), manifest).error, ManifestParseError::DUPLICATE_FIELD);
+    }
+}
+
+TEST(InitServiceIdentity, AccountsAreStrictBoundedAndPublishedOnlyOnSuccess) {
+    using namespace wos::init;
+    ServiceAccounts accounts{};
+    ASSERT_TRUE(parse_service_accounts(PASSWD_ACCOUNTS, GROUP_ACCOUNTS, accounts));
+    EXPECT_EQ(accounts.user_count, 2U);
+    EXPECT_EQ(accounts.group_count, 3U);
+    for (auto passwd :
+         {""sv, "root:!:0:0:root:/root:/bin/bash"sv, "root:!:-1:0:r:/root:/bin/bash\n"sv, "root:!:4294967295:0:r:/root:/bin/bash\n"sv,
+          "root:!:4294967296:0:r:/root:/bin/bash\n"sv, "root:!:0:0:r:/root:/bin/bash:extra\n"sv, "root:!:0:4:r:/root:/bin/bash\n"sv,
+          "root:!:0:0:r:relative:/bin/bash\n"sv, "root:!:0:0:r:/root:/bin/bash\r\n"sv}) {
+        EXPECT_FALSE(parse_service_accounts(passwd, GROUP_ACCOUNTS, accounts));
+        EXPECT_EQ(accounts.user_count, 2U);
+        EXPECT_EQ(accounts.users[1].uid, 100U);
+    }
+    for (auto group :
+         {""sv, "root:x:0:root\nhttpd:x:100:missing\n"sv, "root:x:0:root\nhttpd:x:100:httpd,\n"sv, "root:x:0:root\nhttpd:x:4294967295:\n"sv,
+          "root:x:0:root\nhttpd:x:100:root\nhttpd:x:101:\n"sv, "root:x:0:root\nhttpd:x:0:\n"sv}) {
+        EXPECT_FALSE(parse_service_accounts(PASSWD_ACCOUNTS, group, accounts));
+        EXPECT_EQ(accounts.group_count, 3U);
+    }
+    EXPECT_FALSE(parse_service_accounts(std::string(PASSWD_ACCOUNTS) + "another:!:0:0:r:/root:/bin/false\n", GROUP_ACCOUNTS, accounts));
+    EXPECT_FALSE(parse_service_accounts(std::string(PASSWD_ACCOUNTS) + "httpd:!:101:100:r:/root:/bin/false\n", GROUP_ACCOUNTS, accounts));
+    EXPECT_FALSE(parse_service_accounts(std::string(MAX_ACCOUNT_FILE_BYTES + 1, '\n'), GROUP_ACCOUNTS, accounts));
+    EXPECT_FALSE(parse_service_accounts("#" + std::string(MAX_MANIFEST_LINE_BYTES, 'x') + "\n" + std::string(PASSWD_ACCOUNTS),
+                                        GROUP_ACCOUNTS, accounts));
+    std::string many_users(PASSWD_ACCOUNTS);
+    for (size_t i = 0; i < MAX_SERVICE_ACCOUNTS; ++i)
+        many_users += "u" + std::to_string(i) + ":!:" + std::to_string(200 + i) + ":0:r:/root:/bin/false\n";
+    EXPECT_FALSE(parse_service_accounts(many_users, GROUP_ACCOUNTS, accounts));
+}
+
+TEST(InitServiceIdentity, ResolveExactDeclaredGroupsAndRejectUnknownOrUnsafePolicy) {
+    using namespace wos::init;
+    ServiceAccounts accounts{};
+    ASSERT_TRUE(parse_service_accounts(PASSWD_ACCOUNTS, GROUP_ACCOUNTS, accounts));
+    auto policy = http_identity();
+    ResolvedServiceIdentity identity{};
+    ASSERT_TRUE(resolve_service_identity(policy, accounts, identity));
+    EXPECT_EQ(identity.uid, 100U);
+    EXPECT_EQ(identity.gid, 100U);
+    EXPECT_EQ(identity.group_count, 0U);  // Database membership is never implicitly inherited.
+    EXPECT_EQ(identity.mask, 0077);
+    EXPECT_EQ(identity.authority_ceiling, 0U);
+    EXPECT_TRUE(identity.no_new_privileges);
+    policy.supplementary_count = 1;
+    policy.supplementary_groups[0].assign("readers");
+    ASSERT_TRUE(resolve_service_identity(policy, accounts, identity));
+    EXPECT_EQ(identity.group_count, 1U);
+    EXPECT_EQ(identity.groups[0], 101U);
+    policy.supplementary_groups[0].assign("missing");
+    EXPECT_FALSE(resolve_service_identity(policy, accounts, identity));
+    EXPECT_EQ(identity.group_count, 1U);
+    EXPECT_EQ(identity.groups[0], 101U);
+    policy = http_identity();
+    policy.no_new_privileges = false;
+    EXPECT_FALSE(resolve_service_identity(policy, accounts, identity));
+    policy = http_identity();
+    policy.authority_ceiling = 1;
+    EXPECT_FALSE(resolve_service_identity(policy, accounts, identity));
+    policy = http_identity();
+    policy.user.assign("missing");
+    EXPECT_FALSE(resolve_service_identity(policy, accounts, identity));
+    policy = http_identity();
+    policy.group.assign("missing");
+    EXPECT_FALSE(resolve_service_identity(policy, accounts, identity));
+    policy = http_identity();
+    policy.supplementary_count = MAX_SERVICE_GROUPS + 1;
+    EXPECT_FALSE(resolve_service_identity(policy, accounts, identity));
+    policy = http_identity();
+    accounts.user_count = MAX_SERVICE_ACCOUNTS + 1;
+    EXPECT_FALSE(resolve_service_identity(policy, accounts, identity));
+}
+
+struct IdentityOperationsProbe {
+    int fail_at{}, calls{};
+    std::string order{};
+    auto step(char name) -> int {
+        order += name;
+        return ++calls == fail_at ? EACCES : 0;
+    }
+    auto no_new_privileges() -> int { return step('n'); }
+    auto service_privileges(uint64_t value) -> int {
+        EXPECT_EQ(value, 0U);
+        return step('s');
+    }
+    auto groups(std::span<const uint32_t> values) -> int {
+        EXPECT_TRUE(values.empty());
+        return step('g');
+    }
+    auto gid(uint32_t value) -> int {
+        EXPECT_EQ(value, 100U);
+        return step('G');
+    }
+    auto uid(uint32_t value) -> int {
+        EXPECT_EQ(value, 100U);
+        return step('U');
+    }
+    auto mask(uint16_t value) -> int {
+        EXPECT_EQ(value, 0077);
+        return step('m');
+    }
+    auto ceiling(uint64_t value) -> int {
+        EXPECT_EQ(value, 0U);
+        return step('c');
+    }
+    auto verify(const wos::init::ResolvedServiceIdentity&) -> int { return step('v'); }
+};
+
+TEST(InitServiceIdentity, EveryDropFailureStopsBeforeLaterOperations) {
+    using namespace wos::init;
+    ServiceAccounts accounts{};
+    ResolvedServiceIdentity identity{};
+    ASSERT_TRUE(parse_service_accounts(PASSWD_ACCOUNTS, GROUP_ACCOUNTS, accounts));
+    ASSERT_TRUE(resolve_service_identity(http_identity(), accounts, identity));
+    constexpr auto ORDER = "nsgGUmcv"sv;
+    for (int fail = 1; fail <= 8; ++fail) {
+        IdentityOperationsProbe probe{.fail_at = fail};
+        EXPECT_EQ(apply_service_identity(identity, probe), EACCES);
+        EXPECT_EQ(probe.order, ORDER.substr(0, fail));
+    }
+    IdentityOperationsProbe success{};
+    EXPECT_EQ(apply_service_identity(identity, success), 0);
+    EXPECT_EQ(success.order, ORDER);
+    identity.valid = false;
+    IdentityOperationsProbe invalid{};
+    EXPECT_EQ(apply_service_identity(identity, invalid), EINVAL);
+    EXPECT_EQ(invalid.calls, 0);
+}
+
+TEST(InitServiceIdentity, DeclaredServicePrivilegesAreStrictAndBoundedByCeiling) {
+    using namespace wos::init;
+    for (auto value :
+         {"", "root", "journal-read,", "network-admin,network-admin", "none,journal-read", "journal-read,network-admin,journal-read"}) {
+        auto input = replace_once(std::string(VALID_MANIFEST), "service-privileges=none", std::string("service-privileges=") + value);
+        ServiceManifest manifest{};
+        EXPECT_EQ(parse_service_manifest(std::span(input.data(), input.size()), manifest).error, ManifestParseError::INVALID_VALUE);
+    }
+    ServiceAccounts accounts{};
+    ASSERT_TRUE(parse_service_accounts(PASSWD_ACCOUNTS, GROUP_ACCOUNTS, accounts));
+    for (uint64_t mask : {1U, 2U, 3U}) {
+        auto policy = http_identity();
+        policy.service_privileges = mask;
+        policy.authority_ceiling = service_privilege_ceiling(mask);
+        ResolvedServiceIdentity identity{};
+        ASSERT_TRUE(resolve_service_identity(policy, accounts, identity));
+        EXPECT_EQ(identity.service_privileges, mask);
+        EXPECT_EQ(identity.authority_ceiling, service_privilege_ceiling(mask));
+        policy.authority_ceiling |= 1;
+        EXPECT_FALSE(resolve_service_identity(policy, accounts, identity));
+        policy.authority_ceiling = 0;
+        EXPECT_FALSE(resolve_service_identity(policy, accounts, identity));
+        policy.authority_ceiling = service_privilege_ceiling(mask);
+        policy.no_new_privileges = false;
+        EXPECT_FALSE(resolve_service_identity(policy, accounts, identity));
+        policy.user.assign("root");
+        EXPECT_FALSE(resolve_service_identity(policy, accounts, identity));
+        policy.no_new_privileges = true;
+        EXPECT_TRUE(resolve_service_identity(policy, accounts, identity));
+        policy.service_privileges = 4;
+        EXPECT_FALSE(resolve_service_identity(policy, accounts, identity));
+    }
+    for (auto value : {"journal-read", "network-admin", "journal-read,network-admin", "network-admin,journal-read"}) {
+        auto input = replace_once(std::string(VALID_MANIFEST), "service-privileges=none", std::string("service-privileges=") + value);
+        input = replace_once(input, "no-new-privileges=no", "no-new-privileges=yes");
+        ServiceManifest manifest{};
+        ASSERT_TRUE(parse_service_manifest(std::span(input.data(), input.size()), manifest));
+        ServiceTopology topology{};
+        EXPECT_TRUE(validate_service_manifest(manifest, topology));
+    }
+}
+
+TEST(InitServiceIdentity, DelegatedServiceFixturesHaveExactOperationCeilings) {
+    auto const ROOT = std::filesystem::path(__FILE__).parent_path().parent_path().parent_path().parent_path();
+    std::ifstream base(ROOT / "configs/wos-services.conf");
+    std::ifstream extra(ROOT / "tests/fixtures/service_privilege_services.fragment");
+    ASSERT_TRUE(base.good());
+    ASSERT_TRUE(extra.good());
+    std::string input((std::istreambuf_iterator<char>(base)), std::istreambuf_iterator<char>());
+    input += std::string((std::istreambuf_iterator<char>(extra)), std::istreambuf_iterator<char>());
+    ServiceManifest manifest{};
+    ASSERT_TRUE(parse_service_manifest(std::span(input.data(), input.size()), manifest));
+    ServiceTopology topology{};
+    ASSERT_TRUE(validate_service_manifest(manifest, topology));
+    ASSERT_EQ(manifest.service_count, 8U);
+    wos::init::ServiceAccounts accounts{};
+    ASSERT_TRUE(wos::init::parse_service_accounts(PASSWD_ACCOUNTS, GROUP_ACCOUNTS, accounts));
+    for (size_t index : {6U, 7U}) {
+        auto const& policy = manifest.services[index].identity;
+        wos::init::ResolvedServiceIdentity identity{};
+        ASSERT_TRUE(wos::init::resolve_service_identity(policy, accounts, identity));
+        EXPECT_EQ(identity.uid, 100U);
+        EXPECT_EQ(identity.service_privileges, index - 5);
+        EXPECT_EQ(identity.authority_ceiling, wos::init::service_privilege_ceiling(index - 5));
+        EXPECT_TRUE(identity.no_new_privileges);
+    }
+}
+
+TEST(InitPrivateState, PreflightRejectsAllUnsafeMetadataBeforeOwnershipChanges) {
+    using namespace wos::init;
+    std::array<PrivateStateInode, 3> plan{{{1, 0, 0, 0100600, 1, false}, {2, 0, 0, 0100600, 1, false}, {3, 0, 0, 0040700, 2, true}}};
+    for (unsigned variant = 0; variant < 8; ++variant) {
+        auto bad = plan;
+        if (variant == 0) bad[1].uid = 999;
+        if (variant == 1) bad[1].gid = 999;
+        if (variant == 2) bad[1].links = 2;
+        if (variant == 3) bad[1].mode = 0120600;
+        if (variant == 4) bad[1].mode = 0100644;
+        if (variant == 5) bad[2].mode = 0040755;
+        if (variant == 6) bad[2].directory = false;
+        if (variant == 7) bad[0].fd = -1;
+        unsigned writes = 0;
+        EXPECT_EQ(change_private_state_owners(bad, 101, 101,
+                                              [&](int, uint32_t, uint32_t) {
+                                                  ++writes;
+                                                  return 0;
+                                              }),
+                  EPERM);
+        EXPECT_EQ(writes, 0U);
+    }
+    unsigned writes = 0;
+    EXPECT_EQ(change_private_state_owners(plan, 0, 101,
+                                          [&](int, uint32_t, uint32_t) {
+                                              ++writes;
+                                              return 0;
+                                          }),
+              EINVAL);
+    EXPECT_EQ(writes, 0U);
+}
+
+TEST(InitPrivateState, MigrationPublishesDirectoryLastAndRollsBackFailedWrites) {
+    using namespace wos::init;
+    std::array<PrivateStateInode, 3> plan{{{1, 0, 0, 0100600, 1, false}, {2, 0, 0, 0100600, 1, false}, {3, 0, 0, 0040700, 2, true}}};
+    for (int fail = 0; fail <= 3; ++fail) {
+        std::array<uint32_t, 3> owners{};
+        std::string order;
+        auto change = [&](int fd, uint32_t uid, uint32_t gid) {
+            EXPECT_EQ(uid, gid);
+            order += static_cast<char>((uid == 0 ? 'a' : 'A') + fd - 1);
+            if (uid != 0 && fd == fail) return EACCES;
+            owners[fd - 1] = uid;
+            return 0;
+        };
+        EXPECT_EQ(change_private_state_owners(plan, 101, 101, change), fail ? EACCES : 0);
+        EXPECT_EQ(owners, (fail ? std::array<uint32_t, 3>{0, 0, 0} : std::array<uint32_t, 3>{101, 101, 101}));
+        EXPECT_EQ(order, fail == 0 ? "ABC" : (fail == 1 ? "A" : (fail == 2 ? "ABa" : "ABCba")));
+    }
+    EXPECT_EQ(change_private_state_owners(plan, 101, 101, [](int fd, uint32_t uid, uint32_t) { return fd == 2 || uid == 0 ? EACCES : 0; }),
+              EIO);
+}
+
+TEST(InitPrivateState, RetainedDirectoryRejectsUnexpectedLinksAndSpecialFiles) {
+    using namespace wos::init;
+    std::array<char, 64> path{};
+    std::strcpy(path.data(), "/tmp/wos-init-private-state-XXXXXX");
+    ASSERT_NE(::mkdtemp(path.data()), nullptr);
+    std::filesystem::path base(path.data());
+    int const DIR = ::open(path.data(), O_RDONLY | O_DIRECTORY);
+    ASSERT_GE(DIR, 0);
+    auto prepare = [&] {
+        ::lseek(DIR, 0, SEEK_SET);
+        return prepare_journal_state_at(DIR, ::getuid(), ::getgid());
+    };
+    EXPECT_EQ(prepare(), 0);
+    int fd = ::openat(DIR, "wos.journal", O_CREAT | O_EXCL | O_WRONLY, 0600);
+    ASSERT_GE(fd, 0);
+    ASSERT_EQ(::write(fd, "preserved", 9), 9);
+    ::close(fd);
+    EXPECT_EQ(prepare(), 0);
+    ASSERT_EQ(::symlinkat("wos.journal", DIR, "wos.journal.1"), 0);
+    EXPECT_NE(prepare(), 0);
+    ASSERT_EQ(::unlinkat(DIR, "wos.journal.1", 0), 0);
+    ASSERT_EQ(::linkat(DIR, "wos.journal", DIR, "wos.journal.1", 0), 0);
+    EXPECT_EQ(prepare(), EPERM);
+    ASSERT_EQ(::unlinkat(DIR, "wos.journal.1", 0), 0);
+    ASSERT_EQ(::mkfifoat(DIR, "wos.journal.1", 0600), 0);
+    EXPECT_EQ(prepare(), EPERM);
+    ASSERT_EQ(::unlinkat(DIR, "wos.journal.1", 0), 0);
+    fd = ::openat(DIR, "unexpected", O_CREAT | O_EXCL | O_WRONLY, 0600);
+    ASSERT_GE(fd, 0);
+    ::close(fd);
+    EXPECT_EQ(prepare(), EPERM);
+    ASSERT_EQ(::unlinkat(DIR, "unexpected", 0), 0);
+    EXPECT_EQ(prepare(), 0);
+    std::ifstream content(base / "wos.journal");
+    std::string text((std::istreambuf_iterator<char>(content)), std::istreambuf_iterator<char>());
+    EXPECT_EQ(text, "preserved");
+    ::close(DIR);
+    std::filesystem::remove_all(base);
+}
+
+TEST(InitRuntimeState, PublishesSeedOnlyAfterCompletePreparation) {
+    using namespace wos::init;
+    std::array<char, 64> path{};
+    std::strcpy(path.data(), "/tmp/wos-init-runtime-state-XXXXXX");
+    ASSERT_NE(::mkdtemp(path.data()), nullptr);
+    int const DIR = ::open(path.data(), O_RDONLY | O_DIRECTORY);
+    ASSERT_GE(DIR, 0);
+    std::string const SEED = "options timeout:2 attempts:4\n";
+    auto prepare = [&](uint32_t uid) { return prepare_netd_state_at(DIR, uid, ::getgid(), std::span(SEED.data(), SEED.size())); };
+    EXPECT_EQ(prepare(0), EINVAL);
+    struct stat state{};
+    EXPECT_EQ(::fstatat(DIR, "netd", &state, AT_SYMLINK_NOFOLLOW), -1);
+    // A non-root host cannot transfer to a foreign UID. Failure must remove only
+    // this attempt's fresh staging directory and leave publication absent.
+    if (::getuid() != 0) {
+        // A sandbox user namespace may not map the foreign UID, producing
+        // EINVAL before the ordinary unprivileged EPERM ownership check.
+        int const DENIED = prepare(::getuid() + 1);
+        EXPECT_TRUE(DENIED == EPERM || DENIED == EINVAL);
+        EXPECT_EQ(::fstatat(DIR, ".netd-init", &state, AT_SYMLINK_NOFOLLOW), -1);
+        EXPECT_EQ(::fstatat(DIR, "netd", &state, AT_SYMLINK_NOFOLLOW), -1);
+    }
+    ASSERT_EQ(prepare(::getuid()), 0);
+    ASSERT_EQ(::fstatat(DIR, "netd", &state, AT_SYMLINK_NOFOLLOW), 0);
+    EXPECT_EQ(state.st_mode, S_IFDIR | 0755);
+    EXPECT_EQ(state.st_uid, ::getuid());
+    EXPECT_EQ(state.st_gid, ::getgid());
+    ASSERT_EQ(::fstatat(DIR, "netd/resolv.conf", &state, AT_SYMLINK_NOFOLLOW), 0);
+    EXPECT_EQ(state.st_mode, S_IFREG | 0644);
+    EXPECT_EQ(state.st_uid, ::getuid());
+    EXPECT_EQ(state.st_nlink, 1U);
+    std::ifstream input(std::filesystem::path(path.data()) / "netd/resolv.conf");
+    EXPECT_EQ(std::string(std::istreambuf_iterator<char>(input), {}), SEED);
+    EXPECT_EQ(prepare(::getuid()), EEXIST);
+    EXPECT_EQ(::fstatat(DIR, ".netd-init", &state, AT_SYMLINK_NOFOLLOW), -1);
+    ::close(DIR);
+    std::filesystem::remove_all(path.data());
+}
+
+TEST(InitRuntimeState, RejectsExistingNamespaceAndOversizedSeed) {
+    using namespace wos::init;
+    std::array<char, 64> path{};
+    std::strcpy(path.data(), "/tmp/wos-init-runtime-denial-XXXXXX");
+    ASSERT_NE(::mkdtemp(path.data()), nullptr);
+    int const DIR = ::open(path.data(), O_RDONLY | O_DIRECTORY);
+    ASSERT_GE(DIR, 0);
+    std::string const SEED = "seed";
+    auto prepare = [&] { return prepare_netd_state_at(DIR, ::getuid(), ::getgid(), std::span(SEED.data(), SEED.size())); };
+    ASSERT_EQ(::symlinkat("sentinel", DIR, "netd"), 0);
+    EXPECT_EQ(prepare(), EEXIST);
+    ASSERT_EQ(::unlinkat(DIR, "netd", 0), 0);
+    ASSERT_EQ(::mkdirat(DIR, ".netd-init", 0700), 0);
+    EXPECT_EQ(prepare(), EEXIST);
+    ASSERT_EQ(::unlinkat(DIR, ".netd-init", AT_REMOVEDIR), 0);
+    std::array<char, 4097> oversized{};
+    EXPECT_EQ(prepare_netd_state_at(DIR, ::getuid(), ::getgid(), oversized), EINVAL);
+    EXPECT_EQ(prepare_netd_state_at(DIR, ::getuid(), ::getgid(), {}), EINVAL);
+    EXPECT_TRUE(std::filesystem::is_empty(path.data()));
+    ::close(DIR);
+    std::filesystem::remove_all(path.data());
+}
+
+TEST(InitRuntimeState, DeclarationRequiresUniqueNarrowNetworkProfile) {
+    auto const ROOT = std::filesystem::path(__FILE__).parent_path().parent_path().parent_path().parent_path();
+    std::ifstream file(ROOT / "configs/wos-services.conf");
+    std::string const INPUT(std::istreambuf_iterator<char>{file}, {});
+    for (const char* replacement : {"unknown", "netd\nruntime-state=netd", "netd\nruntime-state=none"}) {
+        auto input = replace_once(INPUT, "runtime-state=netd", std::string("runtime-state=") + replacement);
+        ServiceManifest manifest{};
+        EXPECT_FALSE(parse_service_manifest(std::span(input.data(), input.size()), manifest));
+    }
+    for (unsigned variant = 0; variant < 6; ++variant) {
+        ServiceManifest manifest{};
+        ASSERT_TRUE(parse_service_manifest(std::span(INPUT.data(), INPUT.size()), manifest));
+        auto& netd = manifest.services[find_service(manifest, "netd")];
+        if (variant == 0) netd.service_class = wos::init::ServiceClass::NORMAL;
+        if (variant == 1) netd.identity.service_privileges = 3;
+        if (variant == 2) netd.identity.authority_ceiling = 65535;
+        if (variant == 3) netd.identity.no_new_privileges = false;
+        if (variant == 4) netd.runtime_state = static_cast<wos::init::ServiceSpec::RuntimeState>(2);
+        if (variant == 5) manifest.services[find_service(manifest, "httpd")].runtime_state = netd.runtime_state;
+        ServiceTopology topology{};
+        EXPECT_EQ(validate_service_manifest(manifest, topology).error, ManifestValidationError::INVALID_IDENTITY);
+    }
+}
+
+TEST(InitPrivateState, DeclarationRequiresNarrowJournalProfile) {
+    auto const ROOT = std::filesystem::path(__FILE__).parent_path().parent_path().parent_path().parent_path();
+    std::ifstream file(ROOT / "configs/wos-services.conf");
+    std::string const INPUT((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    for (auto replacement : {"root", "/var/log/journal", "journal,none"}) {
+        auto input = replace_once(INPUT, "private-state=journal", std::string("private-state=") + replacement);
+        ServiceManifest manifest{};
+        EXPECT_EQ(parse_service_manifest(std::span(input.data(), input.size()), manifest).error, ManifestParseError::INVALID_VALUE);
+    }
+    for (unsigned variant = 0; variant < 5; ++variant) {
+        ServiceManifest manifest{};
+        ASSERT_TRUE(parse_service_manifest(std::span(INPUT.data(), INPUT.size()), manifest));
+        auto& journal = manifest.services[0];
+        if (variant == 0) journal.service_class = wos::init::ServiceClass::NORMAL;
+        if (variant == 1) journal.identity.service_privileges = 3;
+        if (variant == 2) journal.identity.authority_ceiling = 65535;
+        if (variant == 3) journal.identity.no_new_privileges = false;
+        if (variant == 4) journal.private_state = static_cast<wos::init::ServiceSpec::PrivateState>(2);
+        ServiceTopology topology{};
+        EXPECT_EQ(validate_service_manifest(manifest, topology).error, ManifestValidationError::INVALID_IDENTITY);
+    }
+}
+
+TEST(InitPrivateState, KeygenNamespaceRejectsUnsafeEntriesWithoutChangingData) {
+    using namespace wos::init;
+    std::array<char, 64> path{};
+    std::strcpy(path.data(), "/tmp/wos-init-keygen-state-XXXXXX");
+    ASSERT_NE(::mkdtemp(path.data()), nullptr);
+    std::filesystem::path base(path.data());
+    int const DIR = ::open(path.data(), O_RDONLY | O_DIRECTORY);
+    ASSERT_GE(DIR, 0);
+    auto prepare = [&] {
+        ::lseek(DIR, 0, SEEK_SET);
+        return prepare_keygen_state_at(DIR, ::getuid(), ::getgid());
+    };
+    EXPECT_EQ(prepare(), 0);
+    int fd = ::openat(DIR, "dropbear_rsa_host_key", O_CREAT | O_EXCL | O_WRONLY, 0600);
+    ASSERT_GE(fd, 0);
+    ASSERT_EQ(::write(fd, "synthetic-key", 13), 13);
+    ::close(fd);
+    EXPECT_EQ(prepare(), 0);
+    ASSERT_EQ(::symlinkat("dropbear_rsa_host_key", DIR, "dropbear_rsa_host_key.pub"), 0);
+    EXPECT_NE(prepare(), 0);
+    ASSERT_EQ(::unlinkat(DIR, "dropbear_rsa_host_key.pub", 0), 0);
+    ASSERT_EQ(::linkat(DIR, "dropbear_rsa_host_key", DIR, "dropbear_rsa_host_key.pub", 0), 0);
+    EXPECT_EQ(prepare(), EPERM);
+    ASSERT_EQ(::unlinkat(DIR, "dropbear_rsa_host_key.pub", 0), 0);
+    ASSERT_EQ(::mkfifoat(DIR, "dropbear_rsa_host_key.pub", 0600), 0);
+    EXPECT_EQ(prepare(), EPERM);
+    ASSERT_EQ(::unlinkat(DIR, "dropbear_rsa_host_key.pub", 0), 0);
+    ASSERT_EQ(::fchmodat(DIR, "dropbear_rsa_host_key", 0644, 0), 0);
+    EXPECT_EQ(prepare(), EPERM);
+    ASSERT_EQ(::fchmodat(DIR, "dropbear_rsa_host_key", 0600, 0), 0);
+    fd = ::openat(DIR, "unexpected", O_CREAT | O_EXCL | O_WRONLY, 0600);
+    ASSERT_GE(fd, 0);
+    ::close(fd);
+    EXPECT_EQ(prepare(), EPERM);
+    ASSERT_EQ(::unlinkat(DIR, "unexpected", 0), 0);
+    if (::getuid() != 0) {
+        ASSERT_EQ(::fchmod(DIR, 0755), 0);
+        EXPECT_EQ(prepare(), EPERM);
+        ASSERT_EQ(::fchmod(DIR, 0700), 0);
+    }
+    EXPECT_EQ(prepare(), 0);
+    struct stat state{};
+    ASSERT_EQ(::fstatat(DIR, "dropbear_rsa_host_key", &state, AT_SYMLINK_NOFOLLOW), 0);
+    EXPECT_EQ(state.st_uid, ::getuid());
+    EXPECT_EQ(state.st_mode, S_IFREG | 0600);
+    std::ifstream content(base / "dropbear_rsa_host_key");
+    std::string text((std::istreambuf_iterator<char>(content)), std::istreambuf_iterator<char>());
+    EXPECT_EQ(text, "synthetic-key");
+    ::close(DIR);
+    std::filesystem::remove_all(base);
+}
+
+TEST(InitPrivateState, KeygenRequiresOneNarrowOneshotProfile) {
+    auto const ROOT = std::filesystem::path(__FILE__).parent_path().parent_path().parent_path().parent_path();
+    std::ifstream file(ROOT / "configs/wos-services.conf");
+    std::string const INPUT((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    for (unsigned variant = 0; variant < 9; ++variant) {
+        ServiceManifest manifest{};
+        ASSERT_TRUE(parse_service_manifest(std::span(INPUT.data(), INPUT.size()), manifest));
+        auto& keygen = manifest.services[1];
+        ASSERT_EQ(keygen.private_state, wos::init::ServiceSpec::PrivateState::KEYGEN);
+        if (variant == 0) keygen.type = ServiceType::DAEMON;
+        if (variant == 1) keygen.service_class = ServiceClass::JOURNAL;
+        if (variant == 2) keygen.identity.authority_ceiling = 1;
+        if (variant == 3) keygen.identity.no_new_privileges = false;
+        if (variant == 4) keygen.identity.service_privileges = 1;
+        if (variant == 5) keygen.identity.supplementary_count = 1;
+        if (variant == 6) keygen.identity.mask = 0022;
+        if (variant == 7) keygen.environment_profile = wos::init::EnvironmentProfile::INIT;
+        if (variant == 8) manifest.services[2] = keygen;
+        ServiceTopology topology{};
+        EXPECT_EQ(validate_service_manifest(manifest, topology).error, ManifestValidationError::INVALID_IDENTITY);
+    }
+}
+
 }  // namespace
+
+TEST(InitMountRetry, RetriesStaleLookupsUntilPublicationSucceeds) {
+    unsigned calls = 0;
+    unsigned pauses = 0;
+    EXPECT_EQ(wos::init::retry_mount([&]() { return ++calls < 4 ? -EAGAIN : 0; },
+                                     [&](unsigned attempt) {
+                                         ++pauses;
+                                         EXPECT_EQ(attempt, calls);
+                                     }),
+              0);
+    EXPECT_EQ(calls, 4U);
+    EXPECT_EQ(pauses, 3U);
+}
+
+TEST(InitMountRetry, PermanentErrorsAndSuccessNeverRetry) {
+    for (int result : {0, -EACCES, -EPERM, -EBUSY, -ENOENT, -ENOMEM, -EIO, -ESHUTDOWN, 1}) {
+        unsigned calls = 0;
+        EXPECT_EQ(wos::init::retry_mount(
+                      [&]() {
+                          ++calls;
+                          return result;
+                      },
+                      [](unsigned) { ADD_FAILURE() << "unexpected retry"; }),
+                  result);
+        EXPECT_EQ(calls, 1U);
+    }
+}
+
+TEST(InitMountRetry, ExhaustionIsBoundedWithoutAPauseAfterTheFinalAttempt) {
+    unsigned calls = 0;
+    unsigned pauses = 0;
+    EXPECT_EQ(wos::init::retry_mount(
+                  [&]() {
+                      ++calls;
+                      return -EAGAIN;
+                  },
+                  [&](unsigned attempt) {
+                      ++pauses;
+                      EXPECT_EQ(attempt, calls);
+                  }),
+              -EAGAIN);
+    EXPECT_EQ(calls, wos::init::MOUNT_MAX_ATTEMPTS);
+    EXPECT_EQ(pauses, wos::init::MOUNT_MAX_ATTEMPTS - 1);
+}
+
+TEST(InitMountRetry, PermanentDenialAfterChurnStopsImmediately) {
+    unsigned calls = 0;
+    unsigned pauses = 0;
+    EXPECT_EQ(wos::init::retry_mount([&]() { return ++calls < 3 ? -EAGAIN : -EACCES; }, [&](unsigned) { ++pauses; }), -EACCES);
+    EXPECT_EQ(calls, 3U);
+    EXPECT_EQ(pauses, 2U);
+}
+
+TEST(InitSupervisor, MountOptionsKeepOrderedReadonlyPolicy) {
+    wos::init::MountOptions parsed;
+    ASSERT_EQ(wos::init::parse_mount_options("defaults,ro,nosuid,size=16M", parsed), 0);
+    EXPECT_EQ(parsed.flags, MS_RDONLY | MS_NOSUID);
+    EXPECT_STREQ(parsed.data.data(), "defaults,size=16M");
+    ASSERT_EQ(wos::init::parse_mount_options("ro,rw,nosuid,suid", parsed), 0);
+    EXPECT_EQ(parsed.flags, 0UL);
+    EXPECT_STREQ(parsed.data.data(), "");
+    ASSERT_EQ(wos::init::parse_mount_options("rw,ro,suid,nosuid,ro=1,xro", parsed), 0);
+    EXPECT_EQ(parsed.flags, MS_RDONLY | MS_NOSUID);
+    EXPECT_STREQ(parsed.data.data(), "ro=1,xro");
+    auto const before = parsed;
+    EXPECT_EQ(wos::init::parse_mount_options(std::string(256, 'r'), parsed), -E2BIG);
+    EXPECT_EQ(parsed.flags, before.flags);
+    EXPECT_EQ(parsed.data, before.data);
+}

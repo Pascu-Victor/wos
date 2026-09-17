@@ -104,7 +104,34 @@ constexpr auto default_service_resource_limits() -> std::array<ServiceResourceLi
     return limits;
 }
 
+constexpr size_t MAX_SERVICE_GROUPS = 8;
+constexpr uint64_t SERVICE_AUTHORITY_ALL = 65535;
+constexpr uint64_t SERVICE_PRIVILEGE_ALL = 3;
+constexpr auto service_privilege_ceiling(uint64_t mask) -> uint64_t {
+    return ((mask & 1U) != 0 ? uint64_t{1} << 14 : 0) | ((mask & 2U) != 0 ? uint64_t{1} << 12 : 0);
+}
+constexpr auto valid_service_authority(uint32_t uid, bool nnp, uint64_t ceiling, uint64_t privileges) -> bool {
+    if (ceiling > SERVICE_AUTHORITY_ALL || privileges > SERVICE_PRIVILEGE_ALL || (privileges != 0 && !nnp)) return false;
+    auto const REQUIRED = service_privilege_ceiling(privileges);
+    return uid != 0 ? nnp && ceiling == REQUIRED : (ceiling & REQUIRED) == REQUIRED;
+}
+struct ServiceIdentityPolicy {
+    FixedString<MAX_SERVICE_NAME_BYTES> user{};
+    FixedString<MAX_SERVICE_NAME_BYTES> group{};
+    std::array<FixedString<MAX_SERVICE_NAME_BYTES>, MAX_SERVICE_GROUPS> supplementary_groups{};
+    uint8_t supplementary_count{};
+    uint16_t mask{};
+    uint64_t authority_ceiling{};
+    bool no_new_privileges{};
+    uint64_t service_privileges{};
+};
+
 struct ServiceSpec {
+    enum class PrivateState : uint8_t { NONE, JOURNAL, KEYGEN };
+    PrivateState private_state{};
+    enum class RuntimeState : uint8_t { NONE, NETD };
+    RuntimeState runtime_state{};
+    ServiceIdentityPolicy identity{};
     FixedString<MAX_SERVICE_NAME_BYTES> name{};
     FixedString<MAX_PATH_BYTES> executable{};
     std::array<FixedString<MAX_ARGUMENT_BYTES>, MAX_ARGUMENTS> arguments{};
@@ -202,6 +229,7 @@ enum class ManifestValidationError : uint8_t {
     DEPENDENCY_CYCLE,
     JOURNAL_INVARIANT,
     NETWORK_INVARIANT,
+    INVALID_IDENTITY,
 };
 
 struct ManifestValidationResult {
