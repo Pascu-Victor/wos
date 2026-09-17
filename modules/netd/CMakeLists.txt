@@ -13,6 +13,7 @@ set(CXXFILES
     src/ra_worker.cpp
     src/recv.cpp
     src/resolver.cpp
+    src/resolver_file.cpp
     src/time.cpp
     ../journal/src/journal_lib.cpp
 )

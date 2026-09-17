@@ -339,5 +339,39 @@ def main() -> None:
     print("journal ABI, CLI, daemon, and libjournal source checks passed")
 
 
+def test_journal_diagnostic_authority_precedes_output_and_waiter_effects() -> None:
+    source = (ROOT / "modules/kern/src/platform/dbg/journal.cpp").read_text()
+    for name, effect in [("read_records_with_credentials", "s_lock.lock_irqsave()"),
+                         ("poll_check_with_credentials", "s_lock.lock_irqsave()"),
+                         ("poll_register_waiter_with_credentials", "s_lock.lock_irqsave()")]:
+        body = function_body(source, name)
+        if body.index("authorize_read(caller)") > body.index(effect):
+            fail(f"{name} must authorize before journal state")
+    opened = function_body(source, "journal_open_with_credentials")
+    require_tokens(opened, ['(file->open_flags & 3) != 1', 'authorize_read(caller)', 'return -EACCES'], "journal readable open authority")
+    if opened.index("authorize_read(caller)") > opened.index("file->pos = NO_SEQUENCE"):
+        fail("denied journal open must preserve cursor")
+    read = function_body(source, "read_records_with_credentials")
+    if read.index("authorize_read(caller)") > read.index("RECORD_COUNT"):
+        fail("even short journal reads must authorize")
+    require_tokens(function_body(source, "poll_check_with_credentials"),
+                   ["EPOLLERR_VALUE | (events & EPOLLOUT_VALUE)"], "revoked poll readiness")
+    for name in ("read_records", "poll_check", "poll_register_waiter"):
+        require_tokens(function_body(source, name), ["caller_credentials()"], "fresh per-operation journal credentials")
+    require_tokens(function_body(source, "authorize_read"),
+                   ["authorize_journal_read(caller)"], "central journal policy")
+    main = JOURNAL_MAIN.read_text()
+    private = function_body(main, "private_journal_fd")
+    require_tokens(private, ["fstat(fd", "state.st_uid != geteuid()", "S_ISREG", "state.st_nlink != 1", "fchmod(fd, directory ? 0700 : 0600)"], "retained persistence identity")
+    require_tokens(function_body(main, "open_private_journal_file"),
+                   ["O_CREAT | O_WRONLY | O_APPEND | O_NOFOLLOW, 0600", "private_journal_fd("], "private journal file creation")
+    require_tokens(function_body(main, "prepare_private_journal_directory"),
+                   ["O_DIRECTORY | O_NOFOLLOW", "JOURNAL_FILE_OLD", "private_journal_fd(archive)"], "private directory and archive")
+    prepare = function_body(main, "prepare_private_journal_directory")
+    assert prepare.index('open("/var/log/journal"') < prepare.index("errno == ENOENT") < prepare.index('mkdir("/var/log/journal"')
+    require_tokens(function_body(main, "run_daemon"), ["prepare_private_journal_directory()"], "persistence preparation")
+
+
 if __name__ == "__main__":
+    test_journal_diagnostic_authority_precedes_output_and_waiter_effects()
     main()

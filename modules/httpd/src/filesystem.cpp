@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <format>
@@ -167,7 +168,7 @@ auto generate_directory_listing(const std::string& fs_path, std::string_view url
     html += "</h1>\r\n";
 
     html += "<table>\r\n";
-    html += "<tr><th>Name</th><th>Mode</th><th>Owner</th><th>Size</th><th>Type</th><th></th></tr>\r\n";
+    html += "<tr><th>Name</th><th>Mode</th><th>Owner</th><th>Size</th><th>Type</th></tr>\r\n";
 
     if (url_path != "/" && url_path.size() > 1) {
         std::string parent = std::string(url_path);
@@ -182,12 +183,12 @@ auto generate_directory_listing(const std::string& fs_path, std::string_view url
         }
         html += "<tr><td><span class='icon'>📁</span><a href=\"";
         html += parent;
-        html += "\">..</a></td><td>-</td><td>-</td><td class='size'>-</td><td class='type'>Parent Directory</td><td></td></tr>\r\n";
+        html += "\">..</a></td><td>-</td><td>-</td><td class='size'>-</td><td class='type'>Parent Directory</td></tr>\r\n";
     }
 
     DIR* dir = opendir(fs_path.c_str());
     if (dir == nullptr) {
-        html += "<tr><td colspan='3'>Error reading directory</td></tr>\r\n";
+        html += "<tr><td colspan='5'>Error reading directory</td></tr>\r\n";
     } else {
         struct DirEntry {
             std::string name;
@@ -297,21 +298,8 @@ auto generate_directory_listing(const std::string& fs_path, std::string_view url
             html += "</td><td class='type'>";
             if (ent.is_blk) {
                 html += "Block Device";
-                html += "</td><td>";
-                html += "<form method='POST' action='/api/mount' style='display:inline;margin:0;'>";
-                html += "<input type='hidden' name='device' value='";
-                html += url;
-                html += "'/>";
-                html += "<input type='text' name='path' placeholder='/mnt/disk' style='width:120px;margin-right:4px;'/>";
-                html += "<select name='fstype' style='margin-right:4px;'>";
-                html += "<option value='fat32' selected>fat32</option>";
-                html += "<option value='tmpfs'>tmpfs</option>";
-                html += "</select>";
-                html += "<button type='submit'>Mount</button>";
-                html += "</form>";
             } else {
                 html += ent.is_dir ? "Directory" : get_mime_type(ent.name);
-                html += "</td><td>";
             }
             html += "</td></tr>\r\n";
         }
@@ -328,8 +316,9 @@ auto generate_directory_listing(const std::string& fs_path, std::string_view url
 auto serve_file(int client_fd, const std::string& fs_path, std::string_view url_path, uint64_t tid, uint64_t pid) -> bool {
     struct stat st{};
     if (stat(fs_path.c_str(), &st) != 0) {
-        log_message("httpd[t:{},p:{}]: File not found: {}", tid, pid, fs_path);
-        send_all(client_fd, HTTP_404_RESPONSE.data(), HTTP_404_RESPONSE.size());
+        auto const RESPONSE = errno == EACCES || errno == EPERM ? HTTP_403_RESPONSE : HTTP_404_RESPONSE;
+        log_message("httpd[t:{},p:{}]: File unavailable: {}", tid, pid, fs_path);
+        send_all(client_fd, RESPONSE.data(), RESPONSE.size());
         return false;
     }
 
@@ -358,8 +347,9 @@ auto serve_file(int client_fd, const std::string& fs_path, std::string_view url_
 
     int const FD = open(fs_path.c_str(), O_RDONLY);
     if (FD < 0) {
+        auto const RESPONSE = errno == EACCES || errno == EPERM ? HTTP_403_RESPONSE : HTTP_500_RESPONSE;
         log_message("httpd[t:{},p:{}]: Failed to open file: {}", tid, pid, fs_path);
-        send_all(client_fd, HTTP_500_RESPONSE.data(), HTTP_500_RESPONSE.size());
+        send_all(client_fd, RESPONSE.data(), RESPONSE.size());
         return false;
     }
 

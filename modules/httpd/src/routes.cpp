@@ -2,9 +2,7 @@
 
 #include <sys/multiproc.h>
 #include <sys/process.h>
-#include <sys/vfs.h>
 
-#include <array>
 #include <cstdint>
 #include <format>
 #include <string>
@@ -16,7 +14,6 @@
 #include "httpd/request.hpp"
 #include "httpd/response.hpp"
 #include "httpd/socket_io.hpp"
-#include "httpd/time.hpp"
 
 namespace httpd {
 
@@ -39,75 +36,7 @@ void handle_request(int client_fd, std::string_view request) {
     auto method = parse_request_method(request);
 
     if (method == "POST" && decoded_path == "/api/mount") {
-        auto body = parse_request_body(request);
-        auto device = get_form_field(body, "device");
-        auto mount_path = get_form_field(body, "path");
-        auto fstype = get_form_field(body, "fstype");
-        if (fstype.empty()) {
-            fstype = "fat32";
-        }
-
-        if (device.empty() || mount_path.empty()) {
-            constexpr std::string_view ERR_BODY =
-                "<html><head><title>Mount Error</title></head><body>"
-                "<h1>Error</h1><p>Missing device or path parameter.</p>"
-                "<hr><p><a href=\"/dev/\">Back to /dev/</a></p>"
-                "<p><em>WOS-httpd/1.0</em></p></body></html>\r\n";
-            send_response(client_fd, 400, "Bad Request", "text/html; charset=utf-8", ERR_BODY.data(), ERR_BODY.size());
-            return;
-        }
-
-        ker::abi::vfs::mkdir(mount_path.c_str(), 0755);
-
-        std::array<const char*, 6> argv = {"/bin/mount", "-t", fstype.c_str(), device.c_str(), mount_path.c_str(), nullptr};
-        constexpr std::array<const char*, 1> ENVP = {nullptr};
-        auto exec_res = ker::process::exec("/bin/mount", argv.data(), ENVP.data());
-
-        if (exec_res == 0) {
-            log_message("httpd[t:{},p:{}]: Failed to exec for mount {} at {}", tid, pid, device, mount_path);
-            std::string result_html;
-            result_html.reserve(512);
-            result_html += "<html><head><title>Mount Error</title></head><body>";
-            result_html += "<h1>Error</h1><p>Failed to fork mount process for <b>";
-            result_html += device;
-            result_html += "</b> at <b>";
-            result_html += mount_path;
-            result_html += "</b></p>";
-            result_html += "<hr><p><a href=\"/dev/\">Back to /dev/</a></p>";
-            result_html += "<p><em>WOS-httpd/1.0</em></p></body></html>\r\n";
-            send_response(client_fd, 500, "Internal Server Error", "text/html; charset=utf-8", result_html.data(), result_html.size());
-            return;
-        }
-
-        int32_t exit_code = 0;
-        bool const MOUNT_COMPLETED = wait_for_child_timeout(static_cast<int64_t>(exec_res), &exit_code, MOUNT_CHILD_TIMEOUT_MS);
-
-        if (MOUNT_COMPLETED && exit_code == 0) {
-            log_message("httpd[t:{},p:{}]: Mounted {} at {} ({})", tid, pid, device, mount_path, fstype);
-            auto redirect = std::format(
-                "HTTP/1.1 303 See Other\r\n"
-                "Location: {}/\r\n"
-                "Connection: close\r\n"
-                "Server: WOS-httpd/1.0\r\n"
-                "\r\n",
-                mount_path);
-            send_all(client_fd, redirect.data(), redirect.size());
-        } else {
-            log_message("httpd[t:{},p:{}]: Failed to mount {} at {} ({}): status {}", tid, pid, device, mount_path, fstype, exit_code);
-            std::string result_html;
-            result_html.reserve(512);
-            result_html += "<html><head><title>Mount Error</title></head><body>";
-            result_html += "<h1>Error</h1><p>Failed to mount <b>";
-            result_html += device;
-            result_html += "</b> at <b>";
-            result_html += mount_path;
-            result_html += "</b> (status ";
-            result_html += std::to_string(exit_code);
-            result_html += ")</p>";
-            result_html += "<hr><p><a href=\"/dev/\">Back to /dev/</a></p>";
-            result_html += "<p><em>WOS-httpd/1.0</em></p></body></html>\r\n";
-            send_response(client_fd, 500, "Internal Server Error", "text/html; charset=utf-8", result_html.data(), result_html.size());
-        }
+        send_all(client_fd, HTTP_403_RESPONSE.data(), HTTP_403_RESPONSE.size());
         return;
     }
 

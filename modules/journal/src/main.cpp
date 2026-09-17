@@ -2,6 +2,7 @@
 #include <bits/off_t.h>
 #include <bits/ssize_t.h>
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <time.h>  // NOLINT(modernize-deprecated-headers): mlibc exposes POSIX nanosleep here.
 #include <unistd.h>
 
@@ -373,8 +374,48 @@ void load_records_from_fd(int fd, std::vector<JournalRecord>& records, bool* inv
     }
 }
 
+// Validate the retained inode before granting it diagnostic contents. A path
+// owned by another user, a hardlink or a special file cannot become our log.
+auto private_journal_fd(int fd, bool directory = false) -> int {
+    if (fd < 0) return -1;
+    struct stat state{};
+    if (fstat(fd, &state) != 0 || state.st_uid != geteuid() ||
+        (directory ? !S_ISDIR(state.st_mode) : (!S_ISREG(state.st_mode) || state.st_nlink != 1))) {
+        close(fd);
+        errno = EPERM;
+        return -1;
+    }
+    if (fchmod(fd, directory ? 0700 : 0600) != 0) {
+        int const ERROR = errno;
+        close(fd);
+        errno = ERROR;
+        return -1;
+    }
+    return fd;
+}
+
+auto prepare_private_journal_directory() -> bool {
+    // Init may have prepared a service-owned directory below a root-owned
+    // parent. Reading that directory must not require parent write permission.
+    int directory = open("/var/log/journal", O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+    if (directory < 0 && errno == ENOENT) {
+        if (mkdir("/var/log/journal", 0700) != 0 && errno != EEXIST) return false;
+        directory = open("/var/log/journal", O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+    }
+    int const DIR = private_journal_fd(directory, true);
+    if (DIR < 0) return false;
+    close(DIR);
+    int archive = open(JOURNAL_FILE_OLD, O_RDONLY | O_NOFOLLOW);
+    if (archive < 0) return errno == ENOENT;
+    archive = private_journal_fd(archive);
+    if (archive < 0) return false;
+    return close(archive) == 0;
+}
+
+auto open_private_journal_file() -> int { return private_journal_fd(open(JOURNAL_FILE, O_CREAT | O_WRONLY | O_APPEND | O_NOFOLLOW, 0600)); }
+
 auto open_journal_file_append() -> int {
-    int fd = open(JOURNAL_FILE, O_CREAT | O_WRONLY | O_APPEND, 0644);
+    int fd = open_private_journal_file();
     if (fd < 0) {
         return fd;
     }
@@ -383,7 +424,7 @@ auto open_journal_file_append() -> int {
         close(fd);
         unlink(JOURNAL_FILE_OLD);
         rename(JOURNAL_FILE, JOURNAL_FILE_OLD);
-        fd = open(JOURNAL_FILE, O_CREAT | O_WRONLY | O_APPEND, 0644);
+        fd = open_private_journal_file();
     }
     if (fd >= 0) {
         lseek(fd, 0, SEEK_END);
@@ -405,6 +446,7 @@ auto persist_record(int& fd, const JournalRecord& rec) -> bool {
 }
 
 auto run_daemon() -> int {
+    if (!prepare_private_journal_directory()) return 1;
     int const DEV = open(JOURNAL_DEVICE, O_RDONLY);
     if (DEV < 0) {
         return 1;

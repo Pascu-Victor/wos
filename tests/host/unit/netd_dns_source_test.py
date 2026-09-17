@@ -103,7 +103,7 @@ def test_dhcp_dns_option_parses_all_addresses() -> None:
 
 def test_resolv_conf_writes_every_dns_server() -> None:
     source = read_netd_source()
-    writer = function_body(source, "write_resolv_conf")
+    writer = function_body(source, "write_resolv_conf_at")
     require_order(
         writer,
         [
@@ -123,8 +123,10 @@ def test_resolv_conf_writes_every_dns_server() -> None:
 def test_rootfs_seeds_resolv_conf_for_netd_rewrite() -> None:
     aliases = ROOTFS_ALIASES.read_text()
     resolv_conf = ROOTFS_RESOLV_CONF.read_text()
-    if "copy\tconfigs/rootfs/etc/resolv.conf\t/etc/resolv.conf" not in aliases:
-        fail("rootfs manifest must seed /etc/resolv.conf so netd can rewrite it without creating a new /etc entry")
+    if "copy\tconfigs/rootfs/etc/resolv.conf\t/etc/netd-resolv.conf" not in aliases:
+        fail("rootfs manifest must retain a trusted seed for runtime resolver initialization")
+    if "symlink\t/run/netd/resolv.conf\t/etc/resolv.conf" not in aliases:
+        fail("public resolver path must point into netd-owned runtime state")
     if '# Managed by netd via DHCP\n' not in resolv_conf:
         fail("seed resolv.conf should match netd ownership marker")
     if 'options timeout:2 attempts:4\n' not in resolv_conf:

@@ -775,6 +775,13 @@ wos_add_unit_test(netd_ra_test
 )
 target_include_directories(netd_ra_test PRIVATE ${WOS_ROOT}/modules/netd/include)
 
+wos_add_unit_test(netd_resolver_test
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/unit/netd_resolver_test.cpp
+    KERN_SOURCES ${WOS_ROOT}/modules/netd/src/resolver_file.cpp
+                 ${WOS_ROOT}/modules/netd/src/dhcp.cpp
+)
+target_include_directories(netd_resolver_test PRIVATE ${WOS_ROOT}/modules/netd/include)
+
 wos_add_unit_test(saved_frame_class_test
     SOURCES     ${CMAKE_CURRENT_SOURCE_DIR}/unit/saved_frame_class_test.cpp
 )

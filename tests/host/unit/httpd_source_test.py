@@ -274,21 +274,16 @@ def test_httpd_mount_child_wait_is_deadline_bounded() -> None:
     if "ker::process::waitpid(pid, status, 0, nullptr)" in wait_body:
         fail("httpd wait_for_child_timeout must not use a blocking waitpid")
 
-    handle_request_body = function_body(source, "handle_request")
-    require_tokens(
-        handle_request_body,
-        [
-            "wait_for_child_timeout(static_cast<int64_t>(exec_res), &exit_code, MOUNT_CHILD_TIMEOUT_MS)",
-            "MOUNT_COMPLETED && exit_code == 0",
-        ],
-        "httpd /api/mount bounded wait",
-    )
-    forbidden = "ker::process::waitpid(static_cast<int64_t>(exec_res), &exit_code, 0, nullptr)"
-    if forbidden in handle_request_body:
-        fail("httpd /api/mount must not block indefinitely on mount child")
 
 
-def test_httpd_mount_spawn_failure_and_fd_inheritance_are_guarded() -> None:
+def test_httpd_file_permissions_report_forbidden() -> None:
+    source = httpd_source()
+    serve = function_body(source, "serve_file")
+    require_tokens(serve, ["errno == EACCES || errno == EPERM ? HTTP_403_RESPONSE : HTTP_404_RESPONSE",
+                           "errno == EACCES || errno == EPERM ? HTTP_403_RESPONSE : HTTP_500_RESPONSE"], "HTTP permission denial status")
+
+
+def test_httpd_mount_denial_and_fd_inheritance_are_guarded() -> None:
     source = httpd_source()
     cloexec_body = function_body(source, "set_fd_cloexec_best_effort")
     require_tokens(
@@ -301,16 +296,13 @@ def test_httpd_mount_spawn_failure_and_fd_inheritance_are_guarded() -> None:
     )
 
     handle_request_body = function_body(source, "handle_request")
-    require_tokens(
-        handle_request_body,
-        [
-            "auto exec_res = ker::process::exec",
-            "if (exec_res == 0)",
-        ],
-        "httpd /api/mount exec failure handling",
-    )
-    if "exec_res < 0" in handle_request_body:
-        fail("WOS exec returns 0 on failure; httpd must not check exec_res < 0")
+    route = handle_request_body.split('if (method == "POST" && decoded_path == "/api/mount") {', 1)[1].split("}", 1)[0]
+    require_tokens(route, ["HTTP_403_RESPONSE", "return;"], "read-only HTTP mount denial")
+    for forbidden in ["ker::process::exec", "mkdir(", "get_form_field("]:
+        if forbidden in handle_request_body:
+            fail(f"HTTP mount denial must precede any mutation: {forbidden}")
+    if "<form method='POST'" in source:
+        fail("read-only HTTP listings must not offer a mount operation")
 
     run_server_body = function_body(source, "run_server")
     require_tokens(
@@ -331,8 +323,9 @@ def main() -> None:
     test_httpd_request_path_uses_deadline_helpers()
     test_httpd_request_framing_is_complete_and_bounded()
     test_httpd_mount_child_wait_is_deadline_bounded()
-    test_httpd_mount_spawn_failure_and_fd_inheritance_are_guarded()
-    print("httpd client socket and mount child waits are deadline bounded")
+    test_httpd_file_permissions_report_forbidden()
+    test_httpd_mount_denial_and_fd_inheritance_are_guarded()
+    print("httpd socket deadlines, descriptor policy and read-only mount denial hold")
 
 
 if __name__ == "__main__":
