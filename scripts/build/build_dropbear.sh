@@ -223,6 +223,8 @@ cat > "$LOCALOPTIONS_TMP" <<'EOF'
 #define SFTPSERVER_PATH "/usr/libexec/sftp-server"
 #define DROPBEAR_PATH_SSH_PROGRAM "/usr/bin/dbclient"
 #define DROPBEAR_SMALL_CODE 0
+#define DROPBEAR_SVR_KEX_BROKER 1
+#define DROPBEAR_SVR_BROKER_USER "sshd"
 #define DEFAULT_RECV_WINDOW (1024 * 1024)
 #define RECV_MAX_PAYLOAD_LEN (128 * 1024)
 #define TRANS_MAX_PAYLOAD_LEN (64 * 1024)
@@ -250,7 +252,8 @@ write_dropbear_config_site
 export CONFIG_SITE="$DB_BUILD/config.site"
 
 # Configure if not yet configured
-if [ ! -f "$DB_BUILD/Makefile" ] || [ "$DB_BUILD/config.site" -nt "$DB_BUILD/Makefile" ]; then
+if [ ! -f "$DB_BUILD/Makefile" ] || [ "$DB_BUILD/config.site" -nt "$DB_BUILD/Makefile" ] ||
+    [ "$DB_SRC/Makefile.in" -nt "$DB_BUILD/Makefile" ]; then
     echo "Configuring dropbear for WOS..."
     DROPBEAR_CONFIGURE_BUILD_ARGS=()
     DROPBEAR_CONFIGURE_CACHE_ARGS=()
