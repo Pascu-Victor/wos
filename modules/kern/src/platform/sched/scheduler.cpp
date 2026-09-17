@@ -1103,9 +1103,8 @@ inline auto validate_transition_boundary_locked(RunQueue* rq, TransitionPhase ph
 // Must not conflict with device driver IRQ allocations.
 uint8_t wake_ipi_vector = 0;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
-// Cached APIC timer tick count for the idle timer.
-uint32_t idle_timer_ticks = 0;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
-constexpr uint64_t IDLE_TIMER_CALIBRATION_US = 10'000;
+// Preserve the idle recheck horizon independently of the calibration interval.
+constexpr uint64_t IDLE_TIMER_MAX_DELTA_US = 10'000;
 constexpr uint64_t IDLE_REBALANCE_PROBE_US = 2'000;
 constexpr uint32_t SCHED_GC_RECLAIM_BUDGET = 32;
 constexpr uint64_t SCHED_GC_WORK_BUDGET_US = 500;
@@ -3123,16 +3122,8 @@ void arm_local_timer_after_deferred_switch(task::Task* return_task) {
 }
 
 auto idle_timer_ticks_for_delta_us(uint64_t delta_us) -> uint64_t {
-    if (idle_timer_ticks == 0) {
-        idle_timer_ticks = apic::calibrate_timer(IDLE_TIMER_CALIBRATION_US);
-    }
-
-    delta_us = std::min<uint64_t>(delta_us, IDLE_TIMER_CALIBRATION_US);
-    uint64_t ticks = (static_cast<uint64_t>(idle_timer_ticks) * delta_us) / IDLE_TIMER_CALIBRATION_US;
-    if (ticks == 0) {
-        ticks = 1;
-    }
-    return ticks;
+    delta_us = std::min<uint64_t>(delta_us, IDLE_TIMER_MAX_DELTA_US);
+    return sys::context_switch::clockevent_ticks_for_delta_us(delta_us);
 }
 
 void arm_idle_timer_locked(RunQueue* rq) {
@@ -5356,6 +5347,7 @@ void start_scheduler() {
 
     auto* rq = run_queues->this_cpu();
     mm::virt::note_tlb_shootdown_cpu_online();
+    sys::context_switch::initialize_clockevent_for_this_cpu();
 
     // Wait for a real (non-idle) task in the heap.
     // CRITICAL: Use lock for the initial check to prevent double-scheduling.

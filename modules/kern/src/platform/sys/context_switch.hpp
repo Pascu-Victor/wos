@@ -5,6 +5,7 @@ extern "C" void jump_to_next_task_no_save();
 #include <cstdint>
 #include <platform/asm/cpu.hpp>
 #include <platform/interrupt/gates.hpp>
+#include <platform/ktime/clockevent.hpp>
 #include <platform/sched/frame_class.hpp>
 #include <platform/sched/task.hpp>
 namespace ker::mod::sys::context_switch {
@@ -19,6 +20,13 @@ void validate_handoff_stack_ownership(const sched::task::Task* outgoing, const s
 // and caller should fall back to idle loop
 auto switch_to(cpu::GPRegs& gpr, gates::InterruptFrame& frame, sched::task::Task* next_task) -> bool;
 void start_sched_timer();
+// Startup-only; calibrates without arming a scheduler interrupt and is safe
+// before the first task exists. Never call while holding a runqueue lock.
+void initialize_clockevent_for_this_cpu();
+// Caller masks local interrupts through the subsequent APIC programming.
+auto clockevent_ticks_for_delta_us(uint64_t delta_us) -> uint32_t;
+// Calibration is immutable after release-published per-CPU initialization.
+auto clockevent_status(uint64_t cpu_no) -> time::ClockeventStatus;
 auto request_reschedule() -> bool;
 auto can_request_local_reschedule() -> bool;
 

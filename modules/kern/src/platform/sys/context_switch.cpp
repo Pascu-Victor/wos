@@ -9,6 +9,7 @@
 #include <platform/asm/msr.hpp>
 #include <platform/dbg/dbg.hpp>
 #include <platform/init/limine_requests.hpp>
+#include <platform/ktime/clockevent.hpp>
 #include <platform/ktime/ktime.hpp>
 #include <platform/sched/epoch.hpp>
 #include <platform/sched/frame_class.hpp>
@@ -1271,10 +1272,18 @@ auto switch_to(cpu::GPRegs& gpr, gates::InterruptFrame& frame, sched::task::Task
 }
 
 namespace {
-long timer_quantum;
 constexpr uint64_t SCHED_TIMER_QUANTUM_US = 4000;
-uint64_t timer_quantum_us = SCHED_TIMER_QUANTUM_US;
-constexpr uint64_t APIC_TIMER_MAX_COUNT = 0xFFFFFFFFULL;
+struct LocalClockevent {
+    time::ClockeventCalibration calibration{};
+    uint64_t quantum_us{};
+    std::atomic<bool> initialized{false};
+};
+std::array<LocalClockevent, desc::gdt::MAX_CPUS> local_clockevents{};
+
+auto current_timer_quantum() -> uint32_t {
+    auto const STATUS = clockevent_status(cpu::current_cpu());
+    return STATUS.initialized ? STATUS.calibration.ticks_for_delay_us(STATUS.quantum_us) : 0;
+}
 
 // Tick counter for periodic epoch advancement and garbage collection
 std::atomic<uint64_t> timer_tick_count{0};
@@ -1428,24 +1437,23 @@ inline auto hot_task_tracker_slot(uint64_t cpu_no) -> HotTaskTracker& {
     return hot_task_trackers[static_cast<size_t>(cpu_no)];
 }
 
-auto scheduler_timer_ticks_for_delta_us(uint64_t delta_us) -> uint64_t {
-    if (delta_us == 0 || timer_quantum <= 0) {
-        return 1;
-    }
-
-    auto const QUANTUM_TICKS = static_cast<uint64_t>(timer_quantum);
-    uint64_t const MAX_DELTA_US = (APIC_TIMER_MAX_COUNT / QUANTUM_TICKS) * timer_quantum_us;
-    if (MAX_DELTA_US == 0) {
-        return APIC_TIMER_MAX_COUNT;
-    }
-    uint64_t const CLAMPED_DELTA_US = (MAX_DELTA_US != 0 && delta_us > MAX_DELTA_US) ? MAX_DELTA_US : delta_us;
-    uint64_t ticks = ((QUANTUM_TICKS * CLAMPED_DELTA_US) + (timer_quantum_us - 1)) / timer_quantum_us;
-    if (ticks == 0) {
-        ticks = 1;
-    }
-    return std::min(ticks, APIC_TIMER_MAX_COUNT);
-}
+auto scheduler_timer_ticks_for_delta_us(uint64_t delta_us) -> uint64_t { return clockevent_ticks_for_delta_us(delta_us); }
 }  // namespace
+
+auto clockevent_status(uint64_t cpu_no) -> time::ClockeventStatus {
+    if (cpu_no >= local_clockevents.size()) {
+        return {};
+    }
+    auto const& local = local_clockevents[static_cast<size_t>(cpu_no)];
+    if (!local.initialized.load(std::memory_order_acquire)) {
+        return {};
+    }
+    return {.calibration = local.calibration, .quantum_us = local.quantum_us, .initialized = true};
+}
+
+auto clockevent_ticks_for_delta_us(uint64_t delta_us) -> uint32_t {
+    return clockevent_status(cpu::current_cpu()).calibration.ticks_for_delay_us(delta_us);
+}
 
 extern "C" void wos_discard_abandoned_return_fpu_state() {
     // A non-returning exit can be entered from the final timer handoff commit
@@ -1591,7 +1599,7 @@ extern "C" void wos_sched_timer(void* stack_ptr) {
     validate_timer_stack(*frame_ptr, *gpr_ptr, sched::get_current_task());
     if (scheduler_timer_should_bypass_for_inflate_diag(*frame_ptr)) {
         sched::note_scheduler_timer_arm();
-        apic::one_shot_timer(timer_quantum);
+        apic::one_shot_timer(current_timer_quantum());
         return;
     }
     auto* const LIVE_TASK = sched::get_current_task();
@@ -1635,7 +1643,7 @@ extern "C" void wos_sched_timer(void* stack_ptr) {
     if (TIMER_DECISION.arm) {
         sched::note_scheduler_timer_arm();
         uint64_t const TICKS = TIMER_DECISION.use_deadline_delta ? scheduler_timer_ticks_for_delta_us(TIMER_DECISION.deadline_delta_us)
-                                                                 : static_cast<uint64_t>(timer_quantum);
+                                                                 : current_timer_quantum();
         apic::one_shot_timer(TICKS);
     } else {
         sched::note_scheduler_timer_disarm();
@@ -1773,17 +1781,38 @@ extern "C" void wos_jump_to_next_task_no_save(void* stack_ptr) {
     validate_saved_frame_for_restore(return_task, *frame_ptr, "exit-return");
 }
 
-void start_sched_timer() {
-    uint64_t requested_quantum_us = SCHED_TIMER_QUANTUM_US;
-    if (cmdline_token_uint_value(ker::init::get_kernel_cmdline(), "sched.timer_quantum_us", requested_quantum_us) &&
-        requested_quantum_us != 0) {
-        timer_quantum_us = requested_quantum_us;
-    } else {
-        timer_quantum_us = SCHED_TIMER_QUANTUM_US;
+void initialize_clockevent_for_this_cpu() {
+    auto const CPU = cpu::current_cpu();
+    if (CPU >= local_clockevents.size()) {
+        return;
     }
-    timer_quantum = apic::calibrate_timer(timer_quantum_us);  // default 4ms (matches Linux CFS typical quantum)
+    uint64_t flags = 0;
+    asm volatile("pushfq; pop %0; cli" : "=r"(flags) : : "memory");
+    auto& local = local_clockevents[static_cast<size_t>(CPU)];
+    if (!local.initialized.load(std::memory_order_acquire)) {
+        uint64_t requested_quantum_us = SCHED_TIMER_QUANTUM_US;
+        if (cmdline_token_uint_value(ker::init::get_kernel_cmdline(), "sched.timer_quantum_us", requested_quantum_us) &&
+            requested_quantum_us != 0) {
+            local.quantum_us = requested_quantum_us;
+        } else {
+            local.quantum_us = SCHED_TIMER_QUANTUM_US;
+        }
+        // A fixed calibration interval avoids unbounded boot delay or counter
+        // exhaustion from a large requested scheduling quantum.
+        local.calibration = {.sample_ticks = apic::calibrate_timer(SCHED_TIMER_QUANTUM_US), .sample_us = SCHED_TIMER_QUANTUM_US};
+        // Calibration enables LVT_TIMER. Leave it disarmed until a valid idle
+        // or task stack is published; bootstrap may have no first task yet.
+        apic::one_shot_timer(0);
+        local.initialized.store(true, std::memory_order_release);
+    }
+    asm volatile("push %0; popfq" : : "r"(flags) : "memory", "cc");
+}
+
+void start_sched_timer() {
+    // start_scheduler keeps IF masked until the final task-stack handoff.
+    initialize_clockevent_for_this_cpu();
     sched::note_scheduler_timer_arm();
-    apic::one_shot_timer(timer_quantum);
+    apic::one_shot_timer(std::max<uint32_t>(current_timer_quantum(), 1));
 }
 
 auto request_reschedule() -> bool {
@@ -1810,12 +1839,15 @@ auto request_reschedule() -> bool {
                 static_cast<unsigned long long>(rsp),
                 task != nullptr ? static_cast<unsigned long long>(task->context.syscall_kernel_stack) : 0ULL);
         }
-        if (timer_quantum != 0) {
+        uint64_t flags = 0;
+        asm volatile("pushfq; pop %0; cli" : "=r"(flags) : : "memory");
+        uint32_t const QUANTUM = current_timer_quantum();
+        if (QUANTUM != 0) {
             sched::note_scheduler_timer_arm();
-            apic::one_shot_timer(timer_quantum);
-            return true;
+            apic::one_shot_timer(QUANTUM);
         }
-        return false;
+        asm volatile("push %0; popfq" : : "r"(flags) : "memory", "cc");
+        return QUANTUM != 0;
     }
     sched::note_local_reschedule_timer_poke();
     apic::one_shot_timer(1);
